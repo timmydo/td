@@ -10,7 +10,7 @@ use std::sync::Arc;
 use td_mime::work::{Charge, Meter, Stop};
 
 pub const INPUT_BYTES: usize = 4096;
-pub const OUTPUT_BYTES: usize = 4096;
+pub const OUTPUT_BYTES: usize = 16 * 1024;
 pub struct Scratch<'a> {
     pub input: &'a mut [u8],
     pub output: &'a mut [u8],

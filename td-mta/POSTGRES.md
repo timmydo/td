@@ -4938,3 +4938,22 @@ preserves Body state and permits fenced recovery. The trusted immutable-source
 boundary remains explicit, as do separate connection/body-work admission and
 the maximum-message throughput limitation in section 155. Production dispatch
 remains inactive.
+
+## 178. TLS-sized body output cells
+
+The bounded body adapter accumulates 16384 encoded bytes before a full-cell
+write, matching the existing TLS plaintext ceiling. Its source cell remains
+4096 bytes and each codec poll remains limited to 256 transitions. Exact
+partial-write offsets, pre/post deadlines and work charges remain unchanged.
+Every write attempt and flush still performs its existing fresh live Body
+check. Full cells can require up to fourfold fewer successful writes than
+4096-byte cells; Pending/partial writes and flushes prevent a universal
+fourfold check-count claim.
+
+Paired TLS tests cross CRLF over the input boundary and a dot-stuffed line
+start over the output boundary, retaining a partial final cell. The native
+composed relay fixture transfers a 64000-byte immutable body, checks exact
+dot transparency and its sole terminator, and persists the actual final reply
+under the original ten-second cap and existing meters. This is a bounded
+larger-message qualification, not a maximum-32-MiB throughput claim. Full
+per-write database connections and evidence reads remain as in section 155.

@@ -1,6 +1,6 @@
 use super::{deadline, relay_wire as wire, sql, Fixture, PASSWORD};
 use std::sync::{Arc, Mutex};
-use td_crypto::TrustStore;
+use td_crypto::{Crypto, Digest, Provider, TrustStore};
 use td_mta::{
     clock::RuntimeClock,
     ids::SubmissionId,
@@ -44,11 +44,28 @@ pub(super) fn exercise(
         (113, false, 0, 14),
         (114, true, 0, 0),
         (115, true, 0, 0),
+        (143, false, 0, 0),
     ] {
         let submission = SubmissionId::from_bytes([n; 16]);
         let sub = format!("decode('{submission}','hex')");
         let src = format!("decode('{source}','hex')");
         sql(fixture,&format!("INSERT INTO td_mta.submissions SELECT account,{sub},email_id,thread_id,identity_id,transmitted_blob_id,reverse_path,send_at,expires_at,1,NULL,0,NULL,changed FROM td_mta.submissions WHERE id={src}; INSERT INTO td_mta.submission_routes SELECT account,{sub},submitting_profile,route_name,destination FROM td_mta.submission_routes WHERE submission_id={src}; INSERT INTO td_mta.recipients SELECT account,{sub},0,'0@example.test',1,0,NULL,0,NULL,0,send_at,NULL,NULL,0,'',changed FROM td_mta.submissions WHERE id={sub}"));
+        let large_expected = if n == 143 {
+            let source = format!(".{}\r\n", "x".repeat(997)).repeat(64);
+            assert_eq!(source.len(), 64_000);
+            let mut hash = Provider.sha256().unwrap();
+            hash.update(source.as_bytes()).unwrap();
+            let digest = hash
+                .finish()
+                .unwrap()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            sql(fixture, &format!("INSERT INTO td_mta.blob_ids SELECT account,id FROM td_mta.submissions WHERE id={sub}; INSERT INTO td_mta.blobs SELECT account,id,64000,decode('{digest}','hex'),0,changed,1 FROM td_mta.submissions WHERE id={sub}; INSERT INTO td_mta.blob_chunks SELECT account,id,0,convert_to(repeat('.'||repeat('x',997)||chr(13)||chr(10),64),'UTF8') FROM td_mta.submissions WHERE id={sub}; UPDATE td_mta.submissions SET transmitted_blob_id=id WHERE id={sub}"));
+            Some(format!("..{}\r\n", "x".repeat(997)).repeat(64).into_bytes())
+        } else {
+            None
+        };
         if data_case >= 4 {
             sql(fixture,&format!("UPDATE td_mta.submissions SET recipient_count=2 WHERE id={sub}; INSERT INTO td_mta.recipients SELECT account,{sub},1,'1@example.test',1,0,NULL,0,NULL,0,send_at,NULL,NULL,0,'',changed FROM td_mta.submissions WHERE id={sub}"));
         }
@@ -115,7 +132,7 @@ pub(super) fn exercise(
             if data_case >= 4 { 2 } else { 1 }
         );
         let (session, mut peer) = wire::authenticated(fixture, clock.clone(), cap);
-        let (start, body_request, ordinal, rcpt) = if matches!(n, 95 | 96 | 114 | 115) {
+        let (start, body_request, ordinal, rcpt) = if matches!(n, 95 | 96 | 114 | 115 | 143) {
             let completed = wire::accepted_body(published, session, &mut peer, cap, &mut database);
             let ready = completed.reserve_body(&mut database).ok().unwrap();
             let body_request = ready.dispatch().clone();
@@ -680,13 +697,15 @@ pub(super) fn exercise(
         };
         assert_eq!(body_request.attempt(), attempt);
         assert!(start.check_current(&mut database).unwrap() <= prepared_limit);
-        let occupied = worker.reserve_final(attempt, cap, &mut database).unwrap();
-        assert_eq!(
-            start.check_current(&mut database),
-            Err(dispatch::Error::Admission(td_mta::ports::Error::Busy))
-        );
-        drop(occupied);
-        start.check_current(&mut database).unwrap();
+        if n != 143 {
+            let occupied = worker.reserve_final(attempt, cap, &mut database).unwrap();
+            assert_eq!(
+                start.check_current(&mut database),
+                Err(dispatch::Error::Admission(td_mta::ports::Error::Busy))
+            );
+            drop(occupied);
+            start.check_current(&mut database).unwrap();
+        }
         let mut transferred = Vec::new();
         let handoff = attempts::with_body(
             &runtime,
@@ -912,6 +931,11 @@ pub(super) fn exercise(
                 .count(),
             1
         );
+        if let Some(mut expected) = large_expected {
+            expected.extend_from_slice(b".\r\n");
+            assert_eq!(transferred, expected);
+            eprintln!("native bound relay: 64000 source bytes accepted within original cap");
+        }
         let final_value =
             phases::accepted(claim, generation, attempt, &[ordinal], "250 queued").unwrap();
         assert_eq!(
@@ -921,6 +945,9 @@ pub(super) fn exercise(
         assert_eq!(pending.attempt().unwrap(), None);
         drop(peer.into_buffers().unwrap());
         sql(fixture,&format!("DELETE FROM td_mta.recipients WHERE submission_id={sub}; DELETE FROM td_mta.submissions WHERE id={sub}"));
+        if n == 143 {
+            sql(fixture, &format!("DELETE FROM td_mta.blobs WHERE id={sub}; DELETE FROM td_mta.blob_ids WHERE id={sub}"));
+        }
     }
     owners::renew(request, trust, deadline(), claim, generation).unwrap();
 }

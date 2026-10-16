@@ -112,6 +112,25 @@ fn relay_body_streams_exact_transparency_and_flushes_without_terminator() {
         long.extend_from_slice(b".line\r\n..next\r\nnormal\r\n");
         long_expected.extend_from_slice(b"..line\r\n...next\r\nnormal\r\n");
     }
+    // CR/LF straddles the source cell; the doubled dot straddles the TLS cell.
+    let mut boundary = Vec::new();
+    for _ in 0..4 {
+        boundary.extend_from_slice(&[b'x'; 998]);
+        boundary.extend_from_slice(b"\r\n");
+    }
+    boundary.extend_from_slice(&[b'y'; 95]);
+    boundary.extend_from_slice(b"\r\n");
+    assert_eq!(&boundary[4095..4097], b"\r\n");
+    for _ in 0..12 {
+        boundary.extend_from_slice(&[b'x'; 998]);
+        boundary.extend_from_slice(b"\r\n");
+    }
+    boundary.extend_from_slice(&[b'z'; 284]);
+    boundary.extend_from_slice(b"\r\n");
+    assert_eq!(boundary.len(), 16383);
+    let mut boundary_expected = boundary.clone();
+    boundary.extend_from_slice(b".edge\r\nlast\r\n");
+    boundary_expected.extend_from_slice(b"..edge\r\nlast\r\n");
     for (plain, expected, body) in [
         (b"".as_slice(), b"".as_slice(), Body::SevenBit),
         (b".\r\n", b"..\r\n", Body::SevenBit),
@@ -122,6 +141,11 @@ fn relay_body_streams_exact_transparency_and_flushes_without_terminator() {
         ),
         (b"\xff\r\n.\x80\r\n", b"\xff\r\n..\x80\r\n", Body::EightBit),
         (long.as_slice(), long_expected.as_slice(), Body::SevenBit),
+        (
+            boundary.as_slice(),
+            boundary_expected.as_slice(),
+            Body::SevenBit,
+        ),
     ] {
         for chunk in [1, 4096] {
             let (session, mut peer) = relay_auth_tests::authenticated_with_advertisement(

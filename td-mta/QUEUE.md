@@ -225,8 +225,9 @@ the retained TLS EHLO capability; this does not prove which MAIL command was
 sent. These are trusted runtime obligations, not capabilities minted by a
 body-reader implementation or the body-transfer constructor.
 
-Each turn reads at most one 4096-byte source cell, performs one bounded DATA
-codec poll, or attempts one TLS operation. Source implementations must bound
+Encoded output accumulates in one 16384-byte caller cell, matching the TLS
+plaintext write ceiling. Each turn reads at most one 4096-byte source cell,
+performs one bounded DATA codec poll, or attempts one TLS operation. Source implementations must bound
 their own I/O by the original deadline. Short nonzero reads continue from the
 exact returned offset; early EOF, oversized reads, length drift, malformed
 framing and work/time refusal abort the transport. Completion consumes the
