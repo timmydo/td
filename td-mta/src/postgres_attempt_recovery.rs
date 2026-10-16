@@ -252,7 +252,13 @@ pub fn publish(
             if number(state.try_get(1).map_err(|_| Error::Integrity)?)? > old {
                 return Err(Error::Integrity);
             }
-            let next = old.checked_add(1).ok_or(Error::Capacity)?;
+            let next = crate::postgres_sequence::next(client, account, old)
+                .await
+                .map_err(|error| match error {
+                    crate::postgres_sequence::Error::Capacity => Error::Capacity,
+                    crate::postgres_sequence::Error::Integrity => Error::Integrity,
+                    crate::postgres_sequence::Error::Database => Error::Database,
+                })?;
             let rows=client.query("SELECT expires_at,completed_at,changed FROM td_mta.submissions WHERE account=$1 AND id=$2 FOR UPDATE", &[&account,&submission]).await.map_err(|_|Error::Database)?;
             let row = rows.first().ok_or(Error::Integrity)?;
             let expires: i64 = row.try_get(0).map_err(|_| Error::Integrity)?;

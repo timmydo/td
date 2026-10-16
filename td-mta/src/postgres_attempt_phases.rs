@@ -412,7 +412,13 @@ pub fn publish(
             }
             let row = client.query_one("SELECT a.sequence,a.floor,s.changed,s.completed_at,s.expires_at FROM td_mta.accounts a JOIN td_mta.submissions s ON s.account=a.id WHERE a.id=$1 AND s.id=$2 FOR UPDATE OF s", &[&account,&submission]).await.map_err(|_| Error::Database)?;
             let old = number(row.try_get(0).map_err(|_| Error::Integrity)?)?;
-            let next = old.checked_add(1).ok_or(Error::Capacity)?;
+            let next = crate::postgres_sequence::next(client, account, old)
+                .await
+                .map_err(|error| match error {
+                    crate::postgres_sequence::Error::Capacity => Error::Capacity,
+                    crate::postgres_sequence::Error::Integrity => Error::Integrity,
+                    crate::postgres_sequence::Error::Database => Error::Database,
+                })?;
             let completed: Option<i64> = row.try_get(3).map_err(|_| Error::Integrity)?;
             let expires: i64 = row.try_get(4).map_err(|_| Error::Integrity)?;
             if number(row.try_get(1).map_err(|_| Error::Integrity)?)? > old

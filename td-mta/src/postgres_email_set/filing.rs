@@ -167,7 +167,13 @@ pub(super) async fn apply(
     if draft.is_none() && mailboxes.is_empty() {
         return Ok((old, results));
     }
-    let next = old.checked_add(1).ok_or(Error::Capacity)?;
+    let next = crate::postgres_sequence::next(client, account, old)
+        .await
+        .map_err(|error| match error {
+            crate::postgres_sequence::Error::Capacity => Error::Capacity,
+            crate::postgres_sequence::Error::Integrity => Error::Integrity,
+            crate::postgres_sequence::Error::Database => Error::Database,
+        })?;
     let changed = next.to_be_bytes();
     if let Some((source, destination)) = patch.movement {
         if client

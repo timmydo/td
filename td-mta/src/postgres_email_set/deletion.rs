@@ -127,7 +127,13 @@ pub(super) async fn apply(
     if deleted.is_empty() {
         return Ok((old, results));
     }
-    let next = old.checked_add(1).ok_or(Error::Capacity)?;
+    let next = crate::postgres_sequence::next(client, account, old)
+        .await
+        .map_err(|error| match error {
+            crate::postgres_sequence::Error::Capacity => Error::Capacity,
+            crate::postgres_sequence::Error::Integrity => Error::Integrity,
+            crate::postgres_sequence::Error::Database => Error::Database,
+        })?;
     let changed = next.to_be_bytes();
     let mailbox_rows = client.query("SELECT m.mailbox_id,b.changed,bool_and(m.changed<=$3) FROM td_mta.memberships m LEFT JOIN td_mta.mailboxes b ON b.account=m.account AND b.id=m.mailbox_id WHERE m.account=$1 AND m.email_id=ANY($2::bytea[]) GROUP BY m.mailbox_id,b.changed ORDER BY m.mailbox_id LIMIT 257", &[&account,&deleted,&before.as_slice()]).await.map_err(|_| Error::Database)?;
     if mailbox_rows.len() > crate::postgres_mailboxes::MAX_MAILBOXES {

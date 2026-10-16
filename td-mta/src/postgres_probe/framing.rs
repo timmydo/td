@@ -40,7 +40,8 @@ impl Input {
 
     pub(super) fn mutations() -> Self {
         Self {
-            frames: 1024,
+            // Account admission, statement closes and COMMIT share this allowance.
+            frames: 1088,
             ..Self::new()
         }
     }
@@ -248,7 +249,7 @@ mod tests {
     #[test]
     fn mutation_budget_is_finite_and_keeps_authentication_and_byte_limits() {
         let mut input = Input::mutations();
-        for _ in 0..1024 {
+        for _ in 0..1088 {
             assert!(input.accept(&frame(b'N', b"\0")).is_ok());
         }
         assert!(input.accept(&frame(b'N', b"\0")).is_err());

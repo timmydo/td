@@ -572,7 +572,13 @@ fn publish_record(
                 let next = if plans.is_empty() {
                     old
                 } else {
-                    old.checked_add(1).ok_or(Error::Capacity)?
+                    crate::postgres_sequence::next(client, account.as_bytes().as_slice(), old)
+                        .await
+                        .map_err(|error| match error {
+                            crate::postgres_sequence::Error::Capacity => Error::Capacity,
+                            crate::postgres_sequence::Error::Integrity => Error::Integrity,
+                            crate::postgres_sequence::Error::Database => Error::Database,
+                        })?
                 };
                 if next != old {
                     let changed = ids(&plans, |_| true)?;

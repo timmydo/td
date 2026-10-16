@@ -300,7 +300,13 @@ pub fn publish(
             if number(state.try_get(1).map_err(|_| Error::Integrity)?)? > old {
                 return Err(Error::Integrity);
             }
-            let next = old.checked_add(1).ok_or(Error::Capacity)?;
+            let next = crate::postgres_sequence::next(client, account, old)
+                .await
+                .map_err(|error| match error {
+                    crate::postgres_sequence::Error::Capacity => Error::Capacity,
+                    crate::postgres_sequence::Error::Integrity => Error::Integrity,
+                    crate::postgres_sequence::Error::Database => Error::Database,
+                })?;
             let rows=client.query("SELECT s.send_at,s.expires_at,s.recipient_count,s.completed_at,s.changed FROM td_mta.submissions s JOIN td_mta.submission_routes r ON r.account=s.account AND r.submission_id=s.id WHERE s.account=$1 AND s.id=$2 AND r.route_name=$3 AND r.destination=$4 FOR UPDATE OF s", &[&account,&submission,&binding.route().name(),&binding.route().destination().as_slice()]).await.map_err(|_|Error::Database)?;
             let row = rows.first().ok_or(Error::Missing)?;
             let send_at: i64 = row.try_get(0).map_err(|_| Error::Integrity)?;

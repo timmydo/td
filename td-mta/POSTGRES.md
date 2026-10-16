@@ -1289,7 +1289,7 @@ unchanged.
 The original ten-second operation ceiling covers every connection, validation
 and transaction; none renews it. A lost COMMIT response is indeterminate.
 The publication transaction uses the bounded mutation transport profile
-(1024 input frames, 1 MiB input, 128 KiB output), including schema ledger
+(1088 input frames, 1 MiB input, 128 KiB output), including schema ledger
 qualification and COMMIT. Receipt inspection and passive observation retain
 the smaller probe profile.
 Keep the exact retained change and resolve/retry it, never generate another
@@ -1412,7 +1412,7 @@ Emails share a Mailbox; Thread history is unchanged. Receipt results, history,
 flags and state commit together. The 1024-receipt account limit covers both
 single and batch operations. Lost COMMIT recovery retains the full result.
 
-The closed mutation worker admits 1024 input frames, one MiB total input,
+The closed mutation worker admits 1088 input frames, one MiB total input,
 128 KiB per frame and 128 KiB output. Both single-Email and batch publication
 use this worker. Other workers retain their own bounds;
 SCRAM qualification and the original ten-second maximum deadline are unchanged.
@@ -1471,7 +1471,7 @@ quota charges, the next full-u64 account sequence and the retained outcome in
 one synchronous transaction. It creates no Email or Thread. Blob IDs remain
 permanently reserved. Chunks are at most 64 KiB, sent in batches of eight;
 no database parameter carries a whole maximum-size message. The closed upload
-worker admits 40 MiB output and the mutation worker's one MiB/1024-frame input
+worker admits 40 MiB output and the mutation worker's one MiB/1088-frame input
 budget, including the same authentication/per-frame checks. Its original
 ten-second deadline covers the complete publication operation.
 
@@ -1684,7 +1684,7 @@ checked before reauthorizing a fresh write. Owner-side inspection waits
 behind account publication; lost COMMIT response remains indeterminate until
 resolved with that same operation. Each account retains at most 1024 receipts;
 expiry/reclamation remains part of cutover work. Folder transactions have a
-one-MiB output ceiling for bounded names and a one-MiB/1024-frame input budget.
+one-MiB output ceiling for bounded names and a one-MiB/1088-frame input budget.
 Preparation, publication and replay do not enable PostgreSQL serving.
 
 
@@ -2055,8 +2055,8 @@ resolve an earlier uncertain publication still retains that uncertainty when
 qualification refuses; refusal does not prove the earlier operation rolled
 back. Schema initialization and grants remain explicit owner operations.
 
-Runtime connections use at least the existing 1024-frame mutation allowance
-to include qualification and the operation in one budget. Larger existing
+Runtime connections use at least 1024 frames to include qualification and
+the operation in one budget; mutation workers admit 1088 frames. Larger existing
 frame budgets, byte budgets, per-frame/authentication caps and output budgets
 are unchanged; qualification does not replenish any allowance. The original
 absolute deadline covers connection setup, qualification and application work.
@@ -3441,7 +3441,7 @@ This schema preparation changes no dispatch behavior or runtime admission.
 ## 122. Account-bootstrap mutation budget
 
 Account creation uses the existing bounded mutation connection allowance:
-1024 input frames, one MiB aggregate input and 128 KiB output, with unchanged
+1088 input frames, one MiB aggregate input and 128 KiB output, with unchanged
 per-frame, authentication and deadline limits. Its schema-ledger inspection
 and bootstrap writes share that allowance. The ordinary 128-frame probe
 allowance no longer fits this operation at schema version 25; exhausting it
@@ -3920,3 +3920,26 @@ receipts remain passive: neither authorizes more SMTP output, renews a lease
 or acquires the separate final-outcome capacity required before terminator
 handoff. Current transport/ownership fencing and runtime activation remain
 separate work. No SQL, schema or persisted phase semantics change here.
+
+## 141. Shared account sequence admission
+
+Every state-changing account publisher uses one shared next-sequence check
+inside its existing account transaction. After acquiring the account row in
+the established lock order, it rereads the exact sequence and floor under
+that lock, refuses a stale observation or invalid floor, and computes the
+next unsigned 64-bit value with checked arithmetic. Exhaustion refuses the
+whole mutation; no signed PostgreSQL integer conversion or wrap is allowed.
+No-op mailbox/Email updates and already-completed cancellation preserve their
+sequence. Historical receipt validation does not allocate another sequence.
+
+The additional bounded query uses the same connection, original deadline and
+protocol ceilings. It commits nothing by itself and retains no lock beyond
+the caller's transaction. This consolidates the admission point needed for
+future durable result reservations; it does not yet reserve headroom or enable
+SMTP terminator handoff. Route revisions, configuration generations and other
+independent counters retain their existing checked arithmetic.
+
+The shared account-sequence query adds a bounded round trip to a changing
+publication. Mutation workers allow 1088 frames, including fixed headroom for
+statement-close and COMMIT responses, so the maximum Email deletion batch fits; aggregate bytes, per-frame/authentication limits, output
+allowances and the original deadline remain unchanged.

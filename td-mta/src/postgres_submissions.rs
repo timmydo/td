@@ -368,7 +368,13 @@ pub fn publish(
             if input.expected().is_some_and(|expected| expected != old) {
                 return Err(Error::State);
             }
-            let next = old.checked_add(1).ok_or(Error::Capacity)?;
+            let next = crate::postgres_sequence::next(client, account, old)
+                .await
+                .map_err(|error| match error {
+                    crate::postgres_sequence::Error::Capacity => Error::Capacity,
+                    crate::postgres_sequence::Error::Integrity => Error::Integrity,
+                    crate::postgres_sequence::Error::Database => Error::Database,
+                })?;
             let count: i64 = client.query_one("SELECT count(*) FROM (SELECT 1 FROM td_mta.submission_receipts WHERE account=$1 LIMIT $2) bounded",
                 &[&account, &MAX_RECEIPTS]).await.map_err(|_| Error::Database)?.try_get(0).map_err(|_| Error::Integrity)?;
             if count >= MAX_RECEIPTS {

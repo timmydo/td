@@ -382,7 +382,13 @@ fn publish_inner(
                 let recipients = client.query("SELECT ordinal,address,state,uncertain,attempt_id,attempt_count,last_attempt_at,phase,next_attempt_at,rcpt_reply,data_reply,reason,diagnostic,changed FROM td_mta.recipients WHERE account=$1 AND submission_id=$2 ORDER BY ordinal LIMIT 1001 FOR UPDATE", &[&account,&submission]).await.map_err(|_|Error::Database)?;
                 let plan = snapshot::reserve(before, &recipients, old, now, budget)?;
                 let next = if plan.changed {
-                    old.checked_add(1).ok_or(Error::Capacity)?
+                    crate::postgres_sequence::next(client, account, old)
+                        .await
+                        .map_err(|error| match error {
+                            crate::postgres_sequence::Error::Capacity => Error::Capacity,
+                            crate::postgres_sequence::Error::Integrity => Error::Integrity,
+                            crate::postgres_sequence::Error::Database => Error::Database,
+                        })?
                 } else {
                     old
                 };

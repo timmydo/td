@@ -417,7 +417,13 @@ pub fn publish(
             let next = if ids.is_empty() {
                 old
             } else {
-                old.checked_add(1).ok_or(Error::Capacity)?
+                crate::postgres_sequence::next(client, account_bytes, old)
+                    .await
+                    .map_err(|error| match error {
+                        crate::postgres_sequence::Error::Capacity => Error::Capacity,
+                        crate::postgres_sequence::Error::Integrity => Error::Integrity,
+                        crate::postgres_sequence::Error::Database => Error::Database,
+                    })?
             };
             if !ids.is_empty() {
                 let collision:bool=client.query_one("SELECT EXISTS(SELECT 1 FROM td_mta.mailboxes WHERE account=$1 AND id=ANY($2::bytea[])) OR EXISTS(SELECT 1 FROM td_mta.changes WHERE account=$1 AND kind=1 AND object=ANY($2::bytea[]))", &[&account_bytes,&ids]).await.map_err(|_|Error::Database)?.try_get(0).map_err(|_|Error::Integrity)?;
