@@ -1442,6 +1442,25 @@ lookup results, never permanent recipient failures. The owner must match the
 network peer, retain the original configured TLS identity and treat TTL zero
 as usable only for the current lookup, without caching it.
 
+The prepared `dns_transport` exchange runs synchronously on the fixed
+resolver worker against a caller-admitted numeric server. A connected UDP
+socket filters the peer; at most 16 datagrams are considered. Queries omit
+EDNS, so a receive cell of 513 bytes detects and refuses oversized UDP
+responses. Only a response matching the full question may request TCP
+fallback. Drop UDP before opening one TCP connection to that same endpoint;
+write the length-prefixed query and read exactly one length-prefixed response,
+refusing early EOF, invalid framing and another truncation indication.
+
+Every operation shares the original runtime clock, job deadline, work meter
+and remaining CNAME allowance. Blocking socket waits use the earlier job or
+meter deadline with a one-second idle cap; partial progress never renews the
+total. Check time before and after I/O and parsing. Standard socket calls
+retain the host-kernel failure boundary, rather than promising recovery from
+an arbitrarily stalled kernel. The caller supplies an unpredictable query ID.
+This exchange does not yet activate the Resolver port, cache, configured-name
+selection or worker admission; those owners must preserve the original TLS
+identity, chain TTL and alias allowance across queries.
+
 No design can promise survival of arbitrary dependency panic, kernel OOM kill,
 or storage failure. Do not use catch_unwind as storage recovery. An unexpected
 worker failure makes health fail and the service stop accepting new mutations;

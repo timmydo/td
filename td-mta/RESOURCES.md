@@ -4951,3 +4951,16 @@ the original lookup deadline and cross-packet CNAME totals belong to the
 resolver owner. The decoder enforces the supplied remaining alias allowance
 (up to eight) on both incomplete chains and terminal address results; it
 cannot reset or grant that allowance.
+
+The prepared DNS transport borrows the existing 65535-byte packet cell,
+keeps a 271-byte query and at most a 273-byte TCP query frame, and uses the
+answer decoder's bounded arrays. It allocates no per-query heap storage and
+has at most one socket live: UDP closes before TCP fallback. A lookup attempts
+at most 16 UDP receives of 513 bytes; TCP reads use at most 16 KiB per call
+under the original total deadline and work meter. Every socket I/O attempt
+precharges a record and its requested byte extent, including repeated partial
+operations; each query send also charges output bytes. Each parse reserves
+2560 record units for one framing pass and up to nine answer scans, while
+individual names retain their fixed byte/hop bounds. Capacity refusal and
+clock expiry stop the exchange without another network attempt. These cells
+belong to the existing fixed resolver reservation, not each waiting job.
