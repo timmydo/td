@@ -1418,6 +1418,30 @@ transaction/question matching, answer and CNAME limits, TTL handling, cache
 ownership and UDP/TCP deadlines remain the resolver owner's responsibility;
 the wire helper performs no lookup and supplies no authenticated identity.
 
+The prepared `dns_reply` decoder matches the response bit, standard opcode,
+reserved Z bit, transaction ID and complete single IN A/AAAA question before
+accepting even a truncated-response indication. A nontruncated packet must
+frame exactly, with at most 256 records across all sections. Known IN address
+and CNAME records are structurally checked even outside the answer section;
+unknown records remain opaque. An unsolicited OPT record is refused because
+the corresponding query advertises no EDNS, preventing an extended error code
+from being silently ignored. AD/CD bits grant no DNS authentication claim.
+
+Only answer-section addresses reachable from the question through at most
+eight CNAME hops contribute a result. Each call accepts the original chain's
+remaining allowance, never more than eight, and enforces it through terminal
+address results. Subtract the consumed hops before following an incomplete
+chain; a zero allowance still admits a direct address answer. At most 16
+distinct addresses survive;
+duplicates still lower the minimum chain/address TTL. A TTL with its high bit
+set becomes zero. Conflicting CNAME targets, CNAME/address coexistence and
+alias cycles refuse. An incomplete chain returns its last name, consumed hops
+and minimum TTL for the resolver owner to continue under the original global
+hop/deadline budget. Truncation, header error codes and no-data remain passive
+lookup results, never permanent recipient failures. The owner must match the
+network peer, retain the original configured TLS identity and treat TTL zero
+as usable only for the current lookup, without caching it.
+
 No design can promise survival of arbitrary dependency panic, kernel OOM kill,
 or storage failure. Do not use catch_unwind as storage recovery. An unexpected
 worker failure makes health fail and the service stop accepting new mutations;

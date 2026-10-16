@@ -4938,3 +4938,16 @@ hops bound one call. Packet input is at most 65535 bytes. These values belong
 to the resolver's existing question/name/cursor partition, not one new
 reservation per waiting lookup. Network work and its original deadline are
 outside this pure wire helper.
+
+The prepared DNS answer decoder uses at most 256 16-byte record descriptors
+(4 KiB), nine fixed canonical-name slots for cycle detection, and a fixed
+16-address result. Its returned value is compile-time capped at 384 bytes.
+These arrays belong to the existing resolver question/name/alias/result
+partition; packet bytes remain borrowed from the 64 KiB packet reservation.
+There is no heap allocation or recursion. One call frames at most 256 records
+and scans the answer descriptors at most nine times; each name decode retains
+the wire helper's expanded-byte and compression-hop limits. Network admission,
+the original lookup deadline and cross-packet CNAME totals belong to the
+resolver owner. The decoder enforces the supplied remaining alias allowance
+(up to eight) on both incomplete chains and terminal address results; it
+cannot reset or grant that allowance.
