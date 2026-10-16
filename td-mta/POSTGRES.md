@@ -4608,8 +4608,9 @@ returns only a passive receipt. A known failure releases Pending; the caller
 retains an operation clone for explicit retry.
 
 Unknown COMMIT leaves the exact recovery operation in the same single Pending
-owner used by dispatch and phase publication. All new dispatch, phase,
-recovery and final-capacity work stays blocked. Settlement prepays fresh work
+owner used by dispatch, phase and route-failure publication (section 184).
+All new dispatch, phase, recovery, route-failure and final-capacity work
+stays blocked. Settlement prepays fresh work
 and uses the caller's independent settlement slots to inspect that exact
 receipt; absence or error retains custody, and only a found receipt clears it.
 Settlement never republishes or creates continuing SMTP authority. This is a
@@ -5167,3 +5168,50 @@ Pending remain unchanged and buffers return. Existing envelope/deadline
 refusals remain covered. Compile-fail examples pin external split refusal.
 This is preparation for the eventual runtime; no relay scheduling or backend
 activation is enabled.
+
+## 184. Ordered retirement of a failed Prepared attempt
+
+PreparedResult.into_failed consumes pre-MAIL authority into a non-cloneable
+FailedPrepared continuation. The caller first closes all failed transport and
+classifies the actual remote failure. Local capacity, cancellation and invalid
+configuration are not automatically remote Network or Auth failures. This
+owner derives both the route-health change and one interrupted-recovery
+request from its private Dispatch; it accepts no replacement claim, fence,
+attempt or recovery operation. Preparation failures retain passive custody.
+Both requests exist before either publication starts.
+
+Each step runs at most one bounded publication or exact receipt inspection.
+Health must complete before recovery retires recipients. A known failure
+retains that publication stage for explicit retry. An unknown health or
+recovery COMMIT moves the exact request into the existing Pending barrier
+and switches the continuation permanently to receipt inspection for that
+stage. Missing receipts and errors never permit republication. A validated
+health receipt advances to recovery; only validated recovery completion
+returns the combined passive outcome. Repeated completed steps do no I/O.
+
+The continuation never accepts public Settlement data as authority. It
+inspects its own retained request and matches an occupied Pending slot by
+private request identity, not merely attempt ID; another operation refuses
+Busy. If ordinary Pending.settle already found a receipt and cleared the
+slot, the continuation reinstalls its exact request and inspects it again.
+Empty Pending proves neither success nor rollback. Inspection and matching
+slot clearance occur under the existing Pending mutex. No second pending
+queue is introduced.
+
+After transport is fenced, passive steps may receive fresh bounded deadlines
+and work even when the original SMTP cap has expired. Runtime admission,
+the supplied and meter deadlines, the ten-second connection ceiling and
+ordinary ownership/selection/expiry fences still apply. Publication uses
+ordinary capacity; inspection uses a separately reserved settlement pool,
+which must not alias the ordinary pool. No Prepared owner, session or
+transport permission can be reconstructed from this continuation.
+
+Native PostgreSQL/TLS cases cover actual AUTH refusal and its repair hold,
+Network backoff, TLS repair hold, settlement after SMTP expiry, known health
+and recovery rollback, delayed commits and missing receipts, generic
+settlement followed by exact reinspection, budget/deadline/slot refusal,
+ordinary-slot occupancy during inspection, unrelated Pending preservation,
+and recovery expiry hold. They assert health before retirement, one health
+count and one recovery sequence change, retained Prepared on early failures,
+and candidate refusal by backoff/repair after retirement. This activates
+no scheduler or PostgreSQL backend and changes no schema.

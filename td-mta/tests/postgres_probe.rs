@@ -11809,6 +11809,8 @@ mod cancel_worker;
 #[path = "postgres_probe/cancel_jmap.rs"]
 mod cancel_jmap;
 
+#[path = "postgres_probe/prepared_failure.rs"]
+mod prepared_failure;
 #[path = "postgres_probe/queue_candidates.rs"]
 mod queue_candidates;
 

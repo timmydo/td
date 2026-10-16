@@ -81,7 +81,8 @@ pub(super) fn authenticated(
     cap: Deadline,
     policies: &Policies,
 ) -> (auth::Session<Buffer>, Peer) {
-    authenticate(fixture, clock, cap, Some(policies), false)
+    let (result, peer) = authenticate(fixture, clock, cap, Some(policies), false, false);
+    (result.ok().unwrap(), peer)
 }
 pub(super) fn mismatched(
     fixture: &Fixture,
@@ -89,7 +90,17 @@ pub(super) fn mismatched(
     cap: Deadline,
     rotated: bool,
 ) -> (auth::Session<Buffer>, Peer) {
-    authenticate(fixture, clock, cap, None, rotated)
+    let (result, peer) = authenticate(fixture, clock, cap, None, rotated, false);
+    (result.ok().unwrap(), peer)
+}
+pub(super) fn refused(
+    fixture: &Fixture,
+    clock: Arc<RuntimeClock>,
+    cap: Deadline,
+    policies: &Policies,
+) -> (auth::Refusal<Buffer>, Peer) {
+    let (result, peer) = authenticate(fixture, clock, cap, Some(policies), false, true);
+    (result.err().unwrap(), peer)
 }
 fn authenticate(
     fixture: &Fixture,
@@ -97,7 +108,8 @@ fn authenticate(
     cap: Deadline,
     policies: Option<&Policies>,
     rotated: bool,
-) -> (auth::Session<Buffer>, Peer) {
+    refuse: bool,
+) -> (Result<auth::Session<Buffer>, auth::Refusal<Buffer>>, Peer) {
     let password = if rotated {
         "rotated-password"
     } else {
@@ -284,7 +296,11 @@ certificate = "public"
             } else {
                 b"AHJlbGF5LXVzZXIAZGF0YWJhc2UtcGFzc3dvcmQ=\r\n".as_slice()
             },
-            b"235 authenticated\r\n",
+            if refuse {
+                b"535 credentials refused\r\n".as_slice()
+            } else {
+                b"235 authenticated\r\n".as_slice()
+            },
         ),
     ];
     let mut round = 0;
@@ -299,9 +315,10 @@ certificate = "public"
                 round += 1;
             }
         }
-        match exchange.advance().ok().unwrap() {
-            auth::Progress::Pending(next) => exchange = next,
-            auth::Progress::Ready(session) => break session,
+        match exchange.advance() {
+            Ok(auth::Progress::Pending(next)) => exchange = next,
+            Ok(auth::Progress::Ready(session)) => break Ok(session),
+            Err(error) => break Err(error),
         }
         std::thread::yield_now();
     };

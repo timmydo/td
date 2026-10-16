@@ -52,6 +52,9 @@ pub struct Recovery {
     positive_replies: Vec<String>,
 }
 impl Recovery {
+    pub(crate) fn same_request(&self, other: &Self) -> bool {
+        self.operation == other.operation && self.digest == other.digest
+    }
     pub(crate) fn attempt(&self) -> AttemptId {
         self.attempt
     }

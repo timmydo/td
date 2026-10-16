@@ -9,6 +9,7 @@ use crate::{
     postgres_attempts::{self as attempts, Dispatch},
     postgres_probe::{Mode, Request, BODY_CHECK_TURNS},
     postgres_read::{ReadPermit, ReadSlots},
+    postgres_route_health as health,
     postgres_route_owners::Claim,
     queue_clock::Guard,
 };
@@ -17,6 +18,10 @@ use std::{
     time::{Duration, Instant},
 };
 use td_crypto::TrustStore;
+
+#[path = "postgres_prepared_failure.rs"]
+mod failure;
+pub use failure::{FailedPrepared, FailureOutcome};
 
 const ATTEMPT_IO: u64 = 2 * 1024 * 1024 + 192 * 1024;
 const PHASE_IO: u64 = 3 * 1024 * 1024 + 128 * 1024;
@@ -34,6 +39,7 @@ pub enum Error {
     Publication(attempts::Error),
     Phase(phases::Error),
     Recovery(recovery::Error),
+    RouteFailure(health::Error),
 }
 impl From<ports::Error> for Error {
     fn from(error: ports::Error) -> Self {
@@ -107,6 +113,7 @@ enum Operation {
     Dispatch(Box<Dispatch>),
     Phase(Change),
     Recovery(Box<recovery::Recovery>),
+    RouteFailure(Box<health::Change>),
 }
 impl Operation {
     fn attempt(&self) -> AttemptId {
@@ -114,6 +121,7 @@ impl Operation {
             Self::Dispatch(value) => value.attempt(),
             Self::Phase(value) => value.attempt(),
             Self::Recovery(value) => value.attempt(),
+            Self::RouteFailure(value) => value.attempt(),
         }
     }
 }
@@ -123,6 +131,7 @@ pub enum Settlement {
     Dispatch(attempts::Outcome),
     Phase(phases::Outcome),
     Recovery(recovery::Outcome),
+    RouteFailure(health::Outcome),
 }
 impl Pending {
     pub fn attempt(&self) -> Result<Option<AttemptId>, Error> {
@@ -142,12 +151,20 @@ impl Pending {
         meter: &mut Meter,
     ) -> Result<Option<Settlement>, Error> {
         let mut pending = self.operation.try_lock().map_err(|_| ports::Error::Busy)?;
+        Self::settle_locked(&mut pending, connection, until, meter)
+    }
+    fn settle_locked(
+        pending: &mut Option<Operation>,
+        connection: &Connection<'_, '_>,
+        until: Deadline,
+        meter: &mut Meter,
+    ) -> Result<Option<Settlement>, Error> {
         let Some(operation) = pending.as_ref() else {
             return Ok(None);
         };
         let io = match operation {
             Operation::Dispatch(_) => ATTEMPT_IO,
-            Operation::Phase(_) | Operation::Recovery(_) => PHASE_IO,
+            Operation::Phase(_) | Operation::Recovery(_) | Operation::RouteFailure(_) => PHASE_IO,
         };
         let limit = connection.admit(until, meter, io)?;
         let _slot = connection.slots.acquire().map_err(|_| ports::Error::Busy)?;
@@ -166,6 +183,11 @@ impl Pending {
                 recovery::inspect(connection.request, connection.trust, limit, value)
                     .map_err(Error::Recovery)?
                     .map(Settlement::Recovery)
+            }
+            Operation::RouteFailure(value) => {
+                health::inspect(connection.request, connection.trust, limit, value)
+                    .map_err(Error::RouteFailure)?
+                    .map(Settlement::RouteFailure)
             }
         };
         if outcome.is_some() {

@@ -56,6 +56,13 @@ pub struct Dispatch {
     retry: bool,
 }
 impl Dispatch {
+    pub(crate) fn route_failure(
+        &self,
+        failure: crate::postgres_route_health::Failure,
+    ) -> Result<crate::postgres_route_health::Change, crate::postgres_route_health::Error> {
+        crate::postgres_route_health::prepare(&self.claim, self.generation, self.attempt, failure)
+    }
+
     pub(crate) fn relay_policy(&self) -> Option<crate::ports::TlsPolicyId> {
         self.claim.binding().relay_policy()
     }

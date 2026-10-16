@@ -5243,3 +5243,17 @@ only its ID and borrowed payload; the Binding owns no lease, credential copy
 or extra TLS allocation. Claim/Dispatch clones retain this fixed passive identity. MAIL
 compares it before command construction without I/O, allocation or new work
 admission. Existing live database and wire checks retain their original cost.
+
+FailedPrepared retains bounded passive custody for one Prepared attempt.
+Cold preparation derives one health change and one empty-positive-reply
+Recovery from the retained Dispatch. Its health stage holds both immutable
+requests, with the health change boxed once during preparation; its recovery stage retains only Recovery and the fixed health
+outcome. Unknown publication additionally owns one boxed request in the
+existing Pending slot; native inspection/publication may clone that bounded
+request. It allocates no message-sized body or reply collection.
+Each publication and inspection prepays PHASE_IO (3 MiB + 128 KiB) and 4096
+records before connecting, using the supplied/meter deadline and ten-second
+cap. Publication acquires one ordinary slot; inspection acquires one slot
+from a separate settlement pool. No slot survives a step. Historical
+reinspection does not renew SMTP work or bypass an outstanding Pending
+operation. Completed outcomes are fixed-size and return without I/O.

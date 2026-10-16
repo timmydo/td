@@ -54,6 +54,14 @@ pub struct Change {
     failure: Failure,
     digest: [u8; 32],
 }
+impl Change {
+    pub(crate) fn attempt(&self) -> AttemptId {
+        self.attempt
+    }
+    pub(crate) fn same_request(&self, other: &Self) -> bool {
+        self.attempt == other.attempt && self.digest == other.digest
+    }
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct State {
     pub revision: u64,

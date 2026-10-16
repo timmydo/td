@@ -297,6 +297,7 @@ pub(super) fn exercise(
     super::native_data_exchange::exercise(
         fixture, request, trust, claim, generation, source, policies,
     );
+    super::prepared_failure::exercise(fixture, request, trust, claim, generation, source, policies);
     super::dispatch_recovery::exercise(fixture, request, trust, claim, generation, source);
     super::dispatch_worker::exercise(fixture, request, trust, claim, generation, source);
     for n in 0..70 {
