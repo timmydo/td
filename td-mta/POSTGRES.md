@@ -3227,3 +3227,28 @@ batch proceeding through DATA, 100 distinct maximum-length refusals,
 rollback, delayed COMMIT settlement, conflicting replay, attempt retirement
 and final completion. MAIL and DATA-command refusals, transport failures,
 retry dispatch and final-outcome capacity admission remain separate work.
+
+## 114. Durable MAIL and DATA-command refusals
+
+Schema 23 adds at most 1024 command-refusal receipts per account. A negative
+MAIL reply covers the complete original Prepared batch, clears prior RCPT
+history and stores the real refusal as DATA history. It cannot follow a
+partially settled RCPT batch. A negative DATA-command reply instead binds the
+accepted RCPT subset and its actual positive replies; it replaces both prior
+reply fields without claiming that Body or AcceptancePossible occurred.
+Other Prepared recipients remain owned until separately settled. Body and
+DATA-command refusal are mutually exclusive for the entire attempt, even
+after the Body recipients finish; outstanding RCPT refusals may still settle.
+
+Both operations reuse the current policy/route/attempt fence, temporary retry
+jitter and expiry hold, prior uncertainty latch, terminal completion and
+failure-notice handling. Exact retained input binds the receipt, including
+positive RCPT text. Neither command refusal introduces uncertainty or permits
+another SMTP transmission. Unknown COMMIT settles historically.
+
+The PostgreSQL fixture exercises temporary and permanent outcomes for both
+commands, maximum reply sizes, stale owners, MAIL subset refusal, old-reply
+replacement, partial RCPT settlement, rollback, expiry holds, permanent
+results after expiry, delayed COMMIT, conflicting replay and completion.
+Transport failures, retry dispatch, capacity reservation and production relay
+activation remain separate work.
