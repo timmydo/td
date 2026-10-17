@@ -1293,6 +1293,13 @@ POSTGRES.md section 185 owns its custody and failure contract. AUTH refusals
 may expose an isolated complete peer rejection code; partial, multiline,
 malformed or current-cell-tailed input supplies no such classification.
 Only actual 535 selects this connector's Auth repair continuation.
+The inert single-attempt driver consumes that opaque connector and composes
+bound MAIL, ordered RCPT, DATA, verified-source Body and final publication.
+It retains closed phase-specific evidence and passive interruption custody
+on failure; callers settle actual replies and unknown Pending before any
+recovery. It does not select jobs, schedule retries or activate PostgreSQL.
+POSTGRES.md §186 specifies the handoff and its bounded qualification.
+
 
 Credential cells and caller strings must not enter logs; no secure-erasure
 claim is made for caller scratch or native TLS buffers.

@@ -5264,3 +5264,42 @@ AUTH refusal followed by health-before-recovery settlement.
 Setup adds no scheduler or backend activation. The eight-turn Body allowance
 and ten-second native job cap still require qualification for maximum-sized
 messages and backpressure before the relay runtime can be called usable.
+
+
+## 186. One bounded configured relay attempt
+
+The inert postgres_relay_attempt driver consumes ConnectedPrepared and runs
+bound MAIL, ordered RCPT, DATA, immutable source transfer, Possible and final
+publication on the caller's admitted worker. The same wire/database meters
+and reusable command/body cells span the attempt. Source work and its separate
+two-slot pool remain explicit. Source completion stays inside the existing
+private sink until snapshot postvalidation releases final authority.
+
+Only durable actual MAIL, DATA or final results return Completed. All other
+stops close transport and return the existing phase-specific evidence owner
+plus passive interruption custody retained from the connector's private
+Dispatch. No caller can substitute a session, attempt or live phase owner.
+The driver neither settles failures nor invents remote-health classifications.
+
+Stopped is a trusted runtime handoff, not an automatic recovery instruction.
+Preserve and publish actual negative/final evidence and inspect any unknown
+Pending first. RCPT uses its positive-reply-aware interruption conversion;
+DATA planning and Body failures use their corresponding evidence-aware
+conversions. Discard generic fallback if settlement retires the attempt.
+Otherwise it addresses only unresolved durable state. Durable Possible stays
+uncertain even when source postvalidation fails before a terminator is sent.
+
+Pending turns sleep at most five milliseconds under the captured upper cap;
+the next existing phase advance owns any tighter deadline and exact refusal
+evidence. The driver adds no fresh budgets, renewed deadlines, connection
+pool, thread, scheduler, retry or backend activation. The eight-turn Body
+qualification and maximum-message/backpressure limitations remain unchanged.
+
+Native configured fixtures exercise both TLS modes with one wire meter from
+setup through final delivery: 64,000-byte mixed-recipient success, bounded
+144,000-byte Body refusal, mixed RCPT interruption preserving the unanswered
+recipient, immutable-reader failure after Possible with no terminator, and
+an unknown final commit retaining actual reply evidence for inspection.
+They assert exact durable recipient outcomes, empty Pending after settlement,
+and returned ordinary/source pool capacity. These cases qualify the bounded
+driver, not maximum-sized messages or arbitrary peer backpressure.

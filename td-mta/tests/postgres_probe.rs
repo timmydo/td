@@ -11829,6 +11829,8 @@ mod dispatch_worker;
 
 #[path = "postgres_probe/native_final_handoff.rs"]
 mod native_final_handoff;
+#[path = "postgres_probe/native_relay_attempt.rs"]
+mod native_relay_attempt;
 #[path = "postgres_probe/native_relay_connect.rs"]
 mod native_relay_connect;
 #[path = "postgres_probe/relay_wire.rs"]

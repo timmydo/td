@@ -5283,3 +5283,20 @@ Numeric dialing retains its two-record/address charge and two-second/address
 ceiling. Fresh native envelope checks keep their existing ATTEMPT_IO and
 4096-record precharge; no slot survives into socket work. The connector runs
 on the caller's admitted worker and creates no thread or queue.
+
+
+The inert single-attempt driver retains one bounded passive Dispatch clone
+before consuming ConnectedPrepared. Its terminal enum owns the existing
+phase-specific evidence inline and has a 16 KiB compiled ceiling with boxed
+TLS wire arrays. It introduces no body copy or per-command reply allocation;
+existing envelope, reply, source and final reservations remain responsible
+for their storage. Command/body scratch is borrowed and reused only after
+the preceding owner releases it.
+
+Wire and database meters span the entire attempt without replenishment.
+Immutable source work and two independent source slots remain explicit.
+Existing advances charge their work; the driver adds no second charge.
+Pending polling waits at most five milliseconds under the retained upper
+cap; each phase still checks its possibly tighter deadline before work.
+This bounded driver does not qualify maximum-body throughput or arbitrary
+backpressure, and the eight-credit Body allowance remains unchanged.

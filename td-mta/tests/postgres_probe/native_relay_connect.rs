@@ -56,6 +56,33 @@ impl Setup {
         >,
         wire::Peer,
     ) {
+        self.connect_with_work(
+            prepared,
+            clock,
+            cap,
+            database,
+            &mut wire::meter(cap),
+            refuse,
+            revoke,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn connect_with_work<'w, 'a, 'r>(
+        &self,
+        prepared: dispatch::PreparedResult<'w, 'a, 'r>,
+        clock: Arc<RuntimeClock>,
+        cap: Deadline,
+        database: &mut Meter,
+        work: &mut Meter,
+        refuse: bool,
+        revoke: Option<&Fixture>,
+    ) -> (
+        Result<
+            connect::ConnectedPrepared<'w, 'a, 'r, wire::Buffer>,
+            connect::Refusal<'w, 'a, 'r, wire::Buffer>,
+        >,
+        wire::Peer,
+    ) {
         thread::scope(|scope| {
             let dns = scope.spawn(|| {
                 for _ in 0..2 {
@@ -73,7 +100,7 @@ impl Setup {
                 }
             });
             let server = scope.spawn(|| self.peer(clock.clone(), cap, refuse, revoke));
-            let result = call(prepared, &self.profile, database, wire::meter(cap));
+            let result = call_with_work(prepared, &self.profile, database, work);
             dns.join().unwrap();
             (result, server.join().unwrap())
         })
@@ -213,6 +240,17 @@ fn call<'w, 'a, 'r>(
     connect::ConnectedPrepared<'w, 'a, 'r, wire::Buffer>,
     connect::Refusal<'w, 'a, 'r, wire::Buffer>,
 > {
+    call_with_work(prepared, profile, database, &mut wire)
+}
+fn call_with_work<'w, 'a, 'r>(
+    prepared: dispatch::PreparedResult<'w, 'a, 'r>,
+    profile: &PublishedProfile,
+    database: &mut Meter,
+    wire: &mut Meter,
+) -> Result<
+    connect::ConnectedPrepared<'w, 'a, 'r, wire::Buffer>,
+    connect::Refusal<'w, 'a, 'r, wire::Buffer>,
+> {
     let (mut input, mut first, mut second, mut third, mut command) =
         ([0; 512], [0; 512], [0; 512], [0; 512], [0; 512]);
     let (mut plain, mut encoded, mut dns) = (
@@ -238,7 +276,7 @@ fn call<'w, 'a, 'r>(
             dns: &mut dns,
         },
         SystemEntropy::try_new().unwrap(),
-        &mut wire,
+        wire,
         database,
     );
     assert_eq!(pool.available(), 1);
@@ -359,6 +397,15 @@ pub(super) fn exercise(
             grant.generation,
             source,
             &setup.policies,
+            &setup,
+        );
+        super::native_relay_attempt::exercise(
+            fixture,
+            request,
+            trust,
+            &claim,
+            grant.generation,
+            source,
             &setup,
         );
         failures(

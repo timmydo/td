@@ -117,6 +117,15 @@ pub struct MailRefusal<'w, 'a, 'r, B: TlsWireStorage> {
     pub closed: ClosedInterruption,
 }
 impl<'w, 'a, 'r, B: TlsWireStorage> ConnectedPrepared<'w, 'a, 'r, B> {
+    pub(crate) fn driver_context(&self) -> (ClosedInterruption, std::time::Instant) {
+        (
+            ClosedInterruption {
+                dispatch: self.passive.dispatch.clone(),
+            },
+            self.plan.work_limit(),
+        )
+    }
+
     pub fn begin_mail<'m>(
         self,
         mode: Body,
