@@ -116,6 +116,27 @@ impl Control {
                 (old != 4).then_some(next)
             });
     }
+    /// Drive the shared lifecycle when HTTPS is the only network owner.
+    pub fn wait_with_ready(&self, ready: impl FnOnce() -> Result<(), Error>) -> Result<(), Error> {
+        if self.stop_requested() {
+            return Ok(());
+        }
+        if let Err(error) = ready() {
+            self.fail();
+            return Err(error);
+        }
+        self.transition(1);
+        while !self.stop_requested() {
+            std::thread::sleep(SCAN);
+        }
+        self.transition(3);
+        if self.state() == State::Failed {
+            Err(Error::WriterStopped)
+        } else {
+            Ok(())
+        }
+    }
+
     pub fn fail(&self) {
         self.state.store(4, Ordering::Release);
         self.stop();

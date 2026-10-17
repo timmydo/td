@@ -82,6 +82,7 @@ impl Endpoint {
         &self,
         control: &Control,
         finished: &AtomicBool,
+        mailbox_access: bool,
         devices: Option<&Devices<'_, '_>>,
     ) -> io::Result<()> {
         let mut retry_at = Instant::now();
@@ -96,7 +97,7 @@ impl Endpoint {
             match self.listener.accept() {
                 Ok((mut stream, _)) => {
                     // One private operator request; neither storage nor SMTP waits on it.
-                    let _ = exchange(&mut stream, control, devices);
+                    let _ = exchange(&mut stream, control, devices, mailbox_access);
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     std::thread::sleep(TURN);
@@ -211,6 +212,7 @@ fn exchange(
     stream: &mut UnixStream,
     control: &Control,
     devices: Option<&Devices<'_, '_>>,
+    mailbox_access: bool,
 ) -> io::Result<()> {
     let start = Instant::now();
     let mut bytes = [0; 256];
@@ -232,7 +234,7 @@ fn exchange(
         }
         _ => b"INVALID\n",
     };
-    if devices.is_some() {
+    if mailbox_access {
         send(stream, start, b"HTTPS ")?;
     }
     send(stream, start, response)
@@ -421,7 +423,7 @@ mod tests {
             let (mut client, mut server) = UnixStream::pair().unwrap();
             client.write_all(request).unwrap();
             client.shutdown(std::net::Shutdown::Write).unwrap();
-            exchange(&mut server, &control, None).unwrap();
+            exchange(&mut server, &control, None, false).unwrap();
             let mut bytes = [0; 16];
             assert_eq!(
                 line(&mut client, Instant::now(), &mut bytes, false).unwrap(),
@@ -456,7 +458,7 @@ mod tests {
         let (mut client, mut server) = UnixStream::pair().unwrap();
         client.write_all(&[b'x'; 256]).unwrap();
         client.shutdown(std::net::Shutdown::Write).unwrap();
-        assert!(exchange(&mut server, &Control::default(), None).is_err());
+        assert!(exchange(&mut server, &Control::default(), None, false).is_err());
     }
 
     #[test]
@@ -464,7 +466,7 @@ mod tests {
         let (mut client, mut server) = UnixStream::pair().unwrap();
         let control = Control::default();
         std::thread::scope(|scope| {
-            let worker = scope.spawn(|| exchange(&mut server, &control, None));
+            let worker = scope.spawn(|| exchange(&mut server, &control, None, false));
             client.write_all(b"STOP\n").unwrap();
             client
                 .set_read_timeout(Some(Duration::from_millis(100)))

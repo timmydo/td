@@ -1,3 +1,4 @@
+#![deny(unsafe_code)]
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 use std::{
     fs::{self, File},
@@ -14,6 +15,9 @@ use td_mta::postgres_probe::{probe, Error, Request};
 
 #[path = "support/tls_certificate_fixture.rs"]
 mod certificate;
+
+#[path = "support/termination_sender.rs"]
+mod termination_sender;
 
 #[path = "support/postgres_mail_client.rs"]
 mod mail_client;
@@ -2465,7 +2469,17 @@ fn real_postgres_smtp_worker_preserves_starttls_receipts() {
     exercise_configuration(ConfigurationExercise::ReceivingTls);
 }
 
+#[path = "postgres_probe/serving.rs"]
+mod serving;
+
+#[test]
+#[ignore = "real local PostgreSQL tools required"]
+fn real_postgres_executable_receives_and_serves_database_profiles() {
+    exercise_configuration(ConfigurationExercise::Serving);
+}
+
 enum ConfigurationExercise {
+    Serving,
     ReceivingTls,
     ReceivingTransport,
     ReceivingOwner,
@@ -2570,7 +2584,9 @@ certificate = "public"
     );
     let mut https_socket = matches!(
         exercise,
-        ConfigurationExercise::Client | ConfigurationExercise::SendClient
+        ConfigurationExercise::Client
+            | ConfigurationExercise::SendClient
+            | ConfigurationExercise::Serving
     )
     .then(|| TcpListener::bind("127.0.0.1:0").unwrap());
     let desktop = if let Some(socket) = &https_socket {
@@ -2589,7 +2605,16 @@ certificate = "public"
     } else {
         desktop
     };
-    let cloud = desktop.clone()
+    let cloud_source = if matches!(exercise, ConfigurationExercise::Serving) {
+        desktop
+            .split("[listener \"https\"]")
+            .next()
+            .unwrap()
+            .to_owned()
+    } else {
+        desktop.clone()
+    };
+    let cloud = cloud_source
         + r#"[listener "smtp"]
 kind = "direct_smtp"
 bind = "0.0.0.0:25"
@@ -2600,7 +2625,9 @@ per_peer_limit = 1
 "#;
     let mut smtp_socket = matches!(
         exercise,
-        ConfigurationExercise::ReceivingTransport | ConfigurationExercise::ReceivingTls
+        ConfigurationExercise::ReceivingTransport
+            | ConfigurationExercise::ReceivingTls
+            | ConfigurationExercise::Serving
     )
     .then(|| TcpListener::bind("127.0.0.1:0").unwrap());
     let cloud = if let Some(socket) = &smtp_socket {
@@ -2608,7 +2635,9 @@ per_peer_limit = 1
     } else {
         cloud
     };
-    let cloud_roles = if matches!(exercise, ConfigurationExercise::Submissions) {
+    let cloud_roles = if matches!(exercise, ConfigurationExercise::Serving) {
+        1
+    } else if matches!(exercise, ConfigurationExercise::Submissions) {
         7
     } else {
         3
@@ -2963,7 +2992,9 @@ per_peer_limit = 1
                 desktop_file.to_str().unwrap(),
                 "--instance",
                 "cloud",
-                if cloud_roles == 7 {
+                if cloud_roles == 1 {
+                    "receive"
+                } else if cloud_roles == 7 {
                     "receive,jmap,relay"
                 } else {
                     "receive,jmap"
@@ -3113,6 +3144,16 @@ per_peer_limit = 1
     } else {
         &request
     };
+    if matches!(exercise, ConfigurationExercise::Serving) {
+        create_runtime_login(&fixture);
+        grant_runtime_mail(&fixture);
+        serving::exercise(
+            &fixture,
+            smtp_socket.take().unwrap(),
+            https_socket.take().unwrap(),
+        );
+        return;
+    }
     for (name, roles) in [("desktop", 2), ("cloud", cloud_roles)] {
         let mut domain = GenerationSet::<TlsPolicies>::at_startup();
         let prepared = runtime::load(
@@ -3167,7 +3208,9 @@ per_peer_limit = 1
         );
         if name == "desktop" {
             match exercise {
-                ConfigurationExercise::Client | ConfigurationExercise::SendClient => {}
+                ConfigurationExercise::Client
+                | ConfigurationExercise::SendClient
+                | ConfigurationExercise::Serving => {}
                 ConfigurationExercise::Submissions => {
                     exercise_submission_input(&fixture, &request, &trust, prepared.binding(), true)
                 }

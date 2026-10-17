@@ -231,11 +231,7 @@ impl Service<'_, '_, '_> {
             return Err(Error::Forbidden.into());
         }
         let exchange = Exchange {
-            capabilities: &[
-                crate::jmap_request::CORE,
-                crate::jmap_request::MAIL,
-                crate::jmap_request::SUBMISSION,
-            ],
+            capabilities: self.session.capabilities(),
             resources: self.resources,
             session: self.session,
             response_maximum: self.response_maximum,

@@ -108,7 +108,7 @@ fn scan(root: &Path, path: &Path) {
             }
             _ => assert_eq!(words(&source, "signal_sys"), 0, "{relative}"),
         }
-        if relative == "td-mta/tests/store_verify_cli.rs" {
+        if relative == "td-mta/tests/postgres_probe.rs" {
             assert_eq!(
                 source
                     .matches("#[path = \"support/termination_sender.rs\"]\nmod termination_sender;")
@@ -116,6 +116,8 @@ fn scan(root: &Path, path: &Path) {
                 1
             );
             assert_eq!(source.matches("#![deny(unsafe_code)]").count(), 1);
+        } else if relative == "td-mta/tests/postgres_probe/serving.rs" {
+            assert_eq!(words(&source, "termination_sender"), 1);
         } else {
             assert_eq!(words(&source, "termination_sender"), 0, "{relative}");
         }

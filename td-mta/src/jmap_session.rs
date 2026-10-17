@@ -31,6 +31,7 @@ pub struct Concurrency {
 /// and td-mail read/flag/move/folder contracts before exposing this document.
 /// It conveys no authentication.
 pub struct Session {
+    submission: bool,
     concurrency: Concurrency,
     bytes: Vec<u8>,
     state: [u8; 64],
@@ -173,10 +174,20 @@ impl Session {
         let length = out.len();
         bytes.truncate(length);
         Ok(Self {
+            submission,
             bytes,
             state,
             concurrency,
         })
+    }
+    /// The request parser accepts exactly the capabilities in this document.
+    pub fn capabilities(&self) -> &'static [&'static str] {
+        use crate::jmap_request::{CORE, MAIL, SUBMISSION};
+        if self.submission {
+            &[CORE, MAIL, SUBMISSION]
+        } else {
+            &[CORE, MAIL]
+        }
     }
     pub fn concurrency(&self) -> Concurrency {
         self.concurrency
@@ -323,6 +334,8 @@ mod tests {
         .unwrap();
         let value = td_json::parse_slice(send.bytes()).unwrap();
         let capability = crate::jmap_request::SUBMISSION;
+        assert!(send.capabilities().contains(&capability));
+        assert!(!read.capabilities().contains(&capability));
         assert!(value["capabilities"].get(capability).is_some());
         let id = "a07070707070707070707070707070707";
         let settings = &value["accounts"][id]["accountCapabilities"][capability];

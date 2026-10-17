@@ -1762,206 +1762,38 @@ mapping above; a later service worker running these stages keeps that
 the stream's, reused for text decoding as M04b3b requires.
 
 
-## Foreground receiving profile
+## Foreground PostgreSQL service
 
-`td-mta serve --smtp-only --config PATH` activates direct IPv4 SMTP
-receiving and STARTTLS into an initialized account store. The explicit
-profile flag is required: bare `serve` refuses with exit two. The complete
-configuration schema is unchanged, including its required HTTPS and relay
-settings. All referenced inputs are checked through the same single load as
-`config check`, but HTTPS and outbound delivery are inactive. Gateway,
-fixture, HTTP-01 and IPv6 SMTP listeners refuse before storage is opened.
-Mailbox-access also refuses IPv6 HTTPS listeners until the audited socket
-adapter is available.
-ACME-managed material remains unavailable. This profile has no reload,
-file logging, JMAP or outbound queue worker.
+`td-mta serve --connection-file PATH --profile NAME --runtime PATH
+--scratch PATH` starts the named database profile. Each option is required
+once; the old `--config`, `--smtp-only` and `--mailbox-access` serving forms
+are removed. POSTGRES.md owns connection-file protection, primary/schema
+qualification and profile selection. Serving uses a dedicated non-owner
+runtime login and refuses the owner credential, maintenance barriers,
+unsupported schemas, unavailable databases and invalid profiles before
+opening listeners. It never creates or upgrades the schema.
 
-Provision `[paths] data`, `runtime`, `logs`, and `data/ingress` as separate
-existing mode-0700 directories owned by the same dedicated non-root service
-UID. The ingress directory is beneath data; the three configured roots retain
-the schema's non-overlap rule. Run `store init --root DATA --account ID`
-once before serving. The database stays directly in DATA; no implicit
-initialization, migration or relocation occurs. Run the executable as that
-service UID; the safe-std stable-path deployment contract still applies.
-Root ownership checks do not verify the running process UID.
+Receive and JMAP roles use the PostgreSQL SMTP, authentication, read and
+mutation adapters. A JMAP-only instance needs no SMTP listener. Relay roles
+remain refused until the relay loop is connected. Configuration reload is
+not yet active: a changed selection fences old operations and requires
+restart. The JMAP session advertises Mail, not Submission.
 
-Cold storage startup has a fixed 600-second deadline; native SQLite/kernel
-I/O retain their documented interruption limitations. Startup retains the
-database and ingress locks, opens SQLite with the
-configured read-view count, requires exactly the configured account and its
-Inbox, discards abandoned ingress inputs, and reconciles database quotas.
-Only this receiving profile's owners run; no auxiliary log/cache/sort usage
-is created or imported. The runtime root holds the private control endpoint
-below; the
-log root is checked and retained but otherwise unused. Configured direct
-listeners bind only after cold
-storage setup. No client is accepted until the existing receiving runtime
-validates all settings and starts both fixed workers. The admitted direct
-certificate-chain validity window is checked before readiness, on every
-network scan and immediately before admitting a new session. Invalid UTC or
-a clock jump outside that window fails health and stops new admission;
-workers abandon queued work without a final reply. Already committed mail
-remains durable, and existing final replies retain their bounded allowance.
-The runtime reports a TLS failure. A supervisor
-may restart after an operator replaces expired material.
+Runtime and scratch are explicit host-local paths, owned by the service
+user with mode 0700. Each instance has its own paths. The runtime control
+socket and, for JMAP, disposable request/response spool retain their own
+local locks. There is no database-directory lock, SQLite open, ingress
+file spool or private device registry in the serving path. PostgreSQL owns
+mail, credentials and configuration; SMTP stages bounded DATA in memory.
+The shared fixed workers retain their existing limits and deadlines.
 
-One flushed JSON line reports `command: "serve"`, `status: "ready"`,
-`profile: "smtp-only"`, the number of SMTP listeners and false flags for
-`https`, `outbound` and `reload`, with `signal_drain: true`. It is receiving readiness,
-not v1 whole-service health. Startup/runtime errors use the same redacted
-stage, fixed error code and optional target/detail shape as `config.check`,
-with command `serve` and exit one (invalid arguments: exit two). Failure to
-write readiness stops the workers before accepting clients. Output must be
-consumed by the supervisor; this is not a per-message logging channel.
-
-The process stays in the foreground. Process-directed SIGTERM and SIGINT
-request the same orderly shutdown as the private stop command below.
-Serve leaves inherited signal behavior in place during configuration and
-cold storage recovery. Immediately before binding the control endpoint and
-creating workers, it blocks both signals; all workers inherit that mask. Its control worker consumes pending
-requests without an asynchronous handler, including during accept backoff.
-A status/stop exchange can delay observation by its two-second deadline;
-a device command additionally waits for the registry mutex, durable file and
-directory publication, then a fresh two-second reply window. Publication has
-no cancellable deadline, so signal observation can wait for native storage
-I/O. Ordinary polling adds at most one 100-millisecond turn.
-A request arriving concurrently with readiness can race that announcement,
-just as a private stop request can. Repeated requests remain idempotent;
-they do not turn into forced termination. A successful drain exits zero.
-Both signals become stop requests even if the launcher ignored them; no
-signal is re-raised on exit. Supervisors using on-failure do not restart
-a clean signal stop. Wait for process exit.
-
-SIGKILL remains abrupt and relies on SQLite recovery. A message followed by
-final SMTP 250 survives restart. Incomplete DATA may leave a disposable
-slot after abrupt termination, which the next locked startup removes. A
-sender without final acceptance must retry; a commit whose reply was lost
-can consequently be delivered again, as in normal SMTP. Process tests cover
-accepted-mail recovery after SIGKILL and orderly SIGTERM/SIGINT stops with
-idle and incomplete DATA sessions, successful exit and socket/spool cleanup.
-
-### Local receiver control
-
-`td-mta status --json --runtime PATH` queries the foreground receiver.
-`td-mta stop --runtime PATH` requests its existing orderly shutdown. PATH is
-`[paths] runtime`; neither command loads configuration or certificates, so an
-operator can still query or stop a receiver after its configuration changes.
-Both commands require the same private-root policy as serve. Run them as the
-service user. The directory permissions establish local authority; there is
-no network administration listener or authorization inferred from SMTP.
-
-The runtime root may contain at most 89 UTF-8 bytes, leaving room for the
-socket basename and terminator in Linux's 108-byte Unix socket address.
-Serve checks this profile-specific limit before storage recovery; the general
-config checker does not apply it. Status and stop enforce the same limit.
-Serve holds runtime/LOCK and binds runtime/smtp-control.sock mode 0600 before
-announcing readiness. Startup removes a stale socket only after taking that
-lock and only if its type and owner match. A regular file, symlink or foreign
-socket owner refuses unchanged. Clean teardown removes only the socket inode
-this process bound. Setup arms that inode cleanup before setting permissions
-and nonblocking mode. If even the first post-bind metadata read fails, the
-unidentified socket remains for the next locked startup to recover safely.
-Namespace changes during service are unsupported, as for
-the existing private store roots. Clients verify socket type, owner and mode.
-
-One additional fixed worker serves one local request at a time. Request
-storage is 256 bytes; STATUS and STOP responses fit 16 bytes. Both commands
-end with LF, then the client closes its write half. The mailbox-access profile
-also accepts DEVICE CREATE followed by a space and bounded label, DEVICE
-REVOKE followed by a space and canonical ID, or DEVICE LIST, each ending in
-LF and write EOF. Device JSON responses have a 12 KiB cap and secret-bearing
-buffers are cleared on retirement. The
-server reads through that EOF before acting, so trailing bytes cannot change
-meaning with stream fragmentation. Malformed requests never stop the receiver.
-STATUS/STOP and request intake retain a two-second exchange deadline. Device
-replies get a fresh two-second write window after publication, and device
-clients wait up to thirty seconds for the reply. A slow local client can make
-queued control clients time out, but cannot delay SMTP or storage workers.
-A device publication can block in file/directory sync; the socket deadline
-does not cancel a kernel operation already running. A publication failure
-retires the registry, marks the combined profile failed and initiates orderly
-shutdown. Restart recovers the durable registry before HTTPS can serve again.
-HTTPS authentication uses nonblocking registry locking and keeps its header
-deadlines during that publication. An uncertain/lost device receipt is
-resolved through device list and revocation, never by redisclosing passwords.
-The fixed control worker polls every 100 milliseconds;
-local connection aborts retry, and transient descriptor/memory pressure backs
-off accepts for five seconds without stopping mail service. This worker is
-in addition to smtp_receiving's two storage/TLS workers; it has no per-client
-threads and makes no new whole-service resource claim.
-Client socket connection uses the local kernel's connect behavior; after
-connection the deadlines above apply.
-
-Status returns schema-1 command JSON with command status, status ok, profile
-smtp-only or mailbox-access, state starting/ready/stopping/stopped/failed and a
-ready boolean. Mailbox-access prefixes private status/stop wire replies with
-HTTPS and a space; the client reports that profile explicitly.
-The endpoint starts after cold storage recovery, so status and stop are not
-available during that phase. An absent/refused endpoint reports not-running;
-other I/O failures remain io. There is a brief starting-to-ready transition
-after the readiness line, which observers may poll. These are receiving
-lifecycle observations, not the full v1 health snapshot,
-queue metrics or proof that the next delivery can be admitted. Unimplemented
-metrics are not reported as zero. Without `--require-ready`, successful
-queries exit zero regardless of the observed lifecycle. Add `--require-ready`
-immediately after `--json`
-for a supervisor probe: exit zero only for state ready, exit one for every
-other lifecycle. The JSON is identical in both modes, including status ok
-when the query succeeded but receiving is not ready. The probe is one
-observation, not a wait or a guarantee about subsequent admission. Fixed
-redacted errors exit one and malformed arguments exit two.
-OBSERVABILITY.md's version-1 health envelope remains a
-separate future service status surface.
-
-Stop returns schema-1 command JSON with command stop, status requested and
-the active profile. Acknowledgement means the stop flag was set, not that all
-work or disk I/O has finished. The receiver stops new admissions, gives
-existing sessions its five-second protocol allowance, and joins its workers.
-Already committed replies retain their final-reply allowance. A native store
-operation already executing can delay the join; this is not a hard wall-clock
-process-exit promise. A control worker failure also requests shutdown and
-makes serve exit with a redacted failure. Main teardown signals and joins the
-control worker, including during unwinding. SIGTERM and SIGINT use this
-same stop flag. The process fixture queries status, recovers a stale socket after
-kill, requests stop with a connected SMTP client, observes 421, and verifies
-clean process exit, socket cleanup and durable accepted mail.
-
-### Mailbox-access profile
-
-`td-mta serve --mailbox-access --config PATH` activates the same SMTP receiver
-and configured HTTPS listeners with file-provisioned TLS identities. Provision
-`data/devices` mode 0700 under the same service owner and create an initial
-device offline before starting. The registry must exist and validate; startup
-does not silently initialize it. The profile has no public administration
-HTTP route. Authenticated `/.well-known/jmap` exposes Core and the read-only Mail
-profile supported by td-mail. Mailbox listing, received-date message listing,
-message and thread reads, original-message and direct attachment downloads
-are active. Search, flags, filing changes, deletion and sending remain
-unimplemented and return explicit errors.
-Authenticated POST `/jmap/upload/{accountId}` now streams binary uploads into
-the configured account, with one upload at a time, bounded framing and a
-JSON durable receipt. It shares the app-password registry and storage quota
-coordinator. Quota pressure reclaims oldest unreferenced uploads before body
-admission.
-
-Run `td-mta device create --runtime PATH --label LABEL`, `device list --runtime
-PATH`, or `device revoke --runtime PATH --id ID` for the running profile.
-These use its private control socket and current in-memory verifier store.
-Offline --root/--account forms still require the main store lock to be free.
-The create receipt contains the generated password exactly once. Listings
-contain only IDs, including revoked IDs. No password is a command-line input.
-Success receipts use schema 1, command device.create/device.list/device.revoke,
-status ok and the operation's data; failures carry fixed stage/error codes.
-
-The ready announcement and status report profile mailbox-access. Readiness
-waits for both SMTP initialization and HTTPS's bound certificate checks and
-network/TLS/body workers. Core and read-only Mail methods, EventSource and
-authenticated discovery are available. Stop, SIGTERM and SIGINT use the same shared
-stop flag. HTTPS closes
-its exchanges and joins its TLS and body workers; an upload publication
-already underway settles before shutdown returns. SMTP preserves its normal
-drain and known committed replies. Outbound delivery, reload and ACME
-remain inactive in both profiles.
+`status --json [--require-ready] --runtime PATH` observes the instance;
+`stop --runtime PATH` and SIGTERM/SIGINT request orderly drain. Control
+socket device operations are unavailable; use the PostgreSQL device
+commands, whose changes are checked by fresh authentication and mutations.
+Readiness follows startup of all selected network workers. Outbound relay,
+automatic restart recovery of uncertain in-memory operations and full
+restore activation are not claimed by this increment.
 
 ### Response retention admission
 

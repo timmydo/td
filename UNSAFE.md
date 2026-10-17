@@ -3658,12 +3658,12 @@ production allocator or production unsafe permission is introduced.
 ## T3. td-mta — test-only termination sender
 
 `tests/support/termination_sender.rs` is included only by the
-`store_verify_cli` process test, whose root denies unsafe code. Its one
+`postgres_probe` process test, whose root denies unsafe code. Its one
 function-scoped allowance contains two architecture-selected instructions,
 x86-64 `kill(62)` or aarch64 `kill(129)`. The safe function borrows the
 fixture's retained Child, derives its positive PID, and accepts only an enum
 selecting SIGINT or SIGTERM. There is no process-group or arbitrary-PID API,
 FFI, pointer, descriptor adoption or signal handler. Tests call it only on
-a child that answered SMTP, before reaping it; the guard kills/reaps that
+a serving child that reported readiness, before reaping it; the guard kills/reaps that
 same child on failure. The exact source and sole inclusion are pinned by
 confinement tests. It is absent from every production binary and library.

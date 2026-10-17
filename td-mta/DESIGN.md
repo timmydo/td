@@ -1,9 +1,11 @@
 # td-mta: personal mail service
 
-[POSTGRES.md](POSTGRES.md) owns the agreed multi-instance PostgreSQL
-replacement target and atomic cutover boundary. Until that cutover, the
-SQLite/file-backed implementation and its contracts below remain active.
-PostgreSQL support and distributed delivery are not yet implemented.
+[POSTGRES.md](POSTGRES.md) owns the multi-instance PostgreSQL replacement.
+The active serve command now uses PostgreSQL for configuration, credentials
+and mail. CONFIG.md documents its current receive/JMAP roles. Remaining
+SQLite/local-store library and operator contracts below are legacy removal
+work, not an alternative serving backend. Replacement may span tested
+commits; no deployed SQLite service or existing data migration is required.
 
 ## 1. Status and scope
 

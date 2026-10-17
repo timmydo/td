@@ -3,7 +3,9 @@
 ## Status and precedence
 
 This is the agreed replacement target, not implemented PostgreSQL support.
-The current executable and STORAGE.md still describe SQLite. This document
+The serving executable uses PostgreSQL; legacy local-store commands and
+SQLite library code are being removed incrementally. STORAGE.md still
+describes that legacy library. This document
 supersedes the single-process, file-configuration and SQLite choices for the
 replacement workstream; it does not relax the current implementation's
 invariants before cutover. This precedence applies to all routed mail
@@ -320,15 +322,19 @@ mailbox or claim cloud qualification from a local mock.
 
 1. This contract and dependency/driver evaluation, including TLS and bounded
    I/O integration. Obtain explicit approval before adding a driver closure.
-2. Inert PostgreSQL bootstrap/schema/storage foundations with real local
-   database tests. Keep the current executable working while replacements
-   are prepared; no selectable production dual backend is introduced.
-3. One atomic production cutover of configuration, credentials, body/metadata
-   storage, runtime coordinators and operational commands. Remove SQLite code,
-   dependency/pins, private device files, exclusive-store assumptions and
-   obsolete SQLite qualification in the same landing. Update STORAGE,
-   CONFIG/SCHEMA, ADMISSION/RESOURCES, QUEUE, FORMAT, API and conformance documents to
-   the actual implemented interfaces. Existing data need not be migrated.
+2. PostgreSQL bootstrap/schema/storage foundations with real local database
+   tests.
+3. Replace active configuration, credentials, body/metadata storage, runtime
+   coordinators and operational commands with PostgreSQL. This service has
+   no production deployment to preserve: replacement may span independently
+   tested commits and need not be an atomic landing. Remove SQLite code,
+   dependencies/pins, private device files, exclusive-store assumptions and
+   obsolete SQLite qualification as their consumers are replaced. Do not
+   introduce a selectable production dual backend or migrate existing data.
+   Update the routed contracts to describe each implemented replacement.
+   Prior references below to an atomic cutover do not require preserving the
+   SQLite executable or completing all operational tooling before wiring
+   PostgreSQL serving.
 4. Activate distributed relay and complete td-mail sending on the replacement
    backend under the ownership contract above. Incomplete roles stay refused.
 5. Add one-way Stalwart import, preserving raw bytes, folder membership,
@@ -6094,3 +6100,14 @@ cover multiple batches, exact row bounds, retired rows, account isolation,
 corrupt sequences, deliberate event-completeness exclusions and a concurrent
 commit after snapshot capture. The authenticated changes fixture qualifies
 the shared decoder through normal transaction-aligned paging.
+
+## 211. PostgreSQL foreground service
+
+The active serve command loads and validates the selected database profile
+and uses PostgreSQL SMTP storage, HTTPS authentication and JMAP adapters.
+CONFIG.md owns syntax and local runtime/scratch placement. Receive and JMAP
+roles are supported, including a JMAP-only instance; relay remains refused.
+The SQLite serving coordinator and device registry are removed from startup.
+Legacy local-store commands/library code remain pending removal and are not
+selectable serving backends. This is incremental replacement, not a live
+migration or a complete release qualification claim.

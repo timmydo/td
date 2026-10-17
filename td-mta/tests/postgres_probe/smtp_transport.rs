@@ -24,7 +24,7 @@ use td_mta::{
 
 trait Duplex: Read + Write {}
 impl<T: Read + Write> Duplex for T {}
-struct TlsDriver(TlsIo<TcpTransport, Box<[u8; TLS_WIRE_BYTES]>>);
+pub(super) struct TlsDriver(TlsIo<TcpTransport, Box<[u8; TLS_WIRE_BYTES]>>);
 fn io_error(error: td_mta::ports::Error) -> std::io::Error {
     let kind = match error {
         td_mta::ports::Error::Tls => std::io::ErrorKind::ConnectionAborted,
@@ -87,13 +87,19 @@ impl Write for TlsDriver {
     }
 }
 fn upgrade(stream: TcpStream, clock: Arc<RuntimeClock>, ca: &[u8]) -> (TlsDriver, i64) {
+    upgrade_protocol(stream, clock, ca, td_crypto::TlsProtocol::Smtp)
+}
+pub(super) fn upgrade_protocol(
+    stream: TcpStream,
+    clock: Arc<RuntimeClock>,
+    ca: &[u8],
+    protocol: td_crypto::TlsProtocol,
+) -> (TlsDriver, i64) {
     let trust = td_crypto::TrustStore::from_pem(ca).unwrap();
     let tls_clock = Arc::new(td_crypto::ClockHandle::new(TlsClockSource::new(
         clock.clone(),
     )));
-    let config = Arc::new(
-        td_crypto::ClientConfig::new(&trust, tls_clock, td_crypto::TlsProtocol::Smtp).unwrap(),
-    );
+    let config = Arc::new(td_crypto::ClientConfig::new(&trust, tls_clock, protocol).unwrap());
     let session = td_crypto::TlsSession::client(config, "localhost").unwrap();
     let now = clock.sample().unwrap().monotonic;
     let mut io = TlsIo::new(
