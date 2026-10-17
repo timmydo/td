@@ -5845,6 +5845,12 @@ lock. No independent audit reports are joined. A private metadata helper
 begins and retains that transaction; only the outer audit acknowledges
 ROLLBACK and checks the final original deadline after dropping its worker.
 
+After canonical metadata passes, the same transaction rejects duplicate
+non-null mailbox roles within this account. A single EXISTS query groups
+roles under C collation and returns one boolean; unassigned roles and other
+accounts do not conflict. This adds role uniqueness, not registry membership
+or full mailbox-policy validation, and retains no client-side role collection.
+
 The caller supplies trusted UTC, metadata row/parent limits and aggregate
 body count/byte limits. Body enumeration is account-scoped, ascending blob
 ID keyset pagination with one manifest at a time. It includes manifests with
@@ -5855,17 +5861,18 @@ identity must match on every body. Aggregate limits are checked before each
 body is read. Verified body totals must agree with both metadata blob count
 and the audited usage totals before a report can succeed.
 
-The report contains historical canonical metadata, counters and verified
-body totals only. All section 202 exclusions remain: mailbox-role policy,
+The report contains historical canonical metadata, role uniqueness, counters
+and verified body totals. Role registry membership, other mailbox policy,
 configuration, credentials, retained operation/delivery receipts and change
-history are not certified. This is not a complete PostgreSQL semantic audit,
+history remain uncertified. This is not a complete PostgreSQL semantic audit,
 restore approval, delivery permission or service admission. Failure returns
 no partial report and performs no repair; all original connection budgets
 remain in force. Native coverage checks each component's refusal, unowned
 and empty bodies, aggregate limits and a concurrent-change oracle: while the
 metadata scan is blocked after snapshot capture, another session commits
-body corruption, incorrect usage and a new sequence. The in-flight audit
-sees only its old consistent snapshot; fresh audits refuse the new damage.
+body corruption, incorrect usage, a duplicate mailbox role and a new sequence.
+The in-flight audit sees only its old consistent snapshot; fresh audits refuse
+the new damage. Null roles and duplicates in another account do not conflict.
 
 ## 204. Explicit bounded account audit command
 
@@ -5881,8 +5888,8 @@ transport refusal permits another address, with no renewed deadline.
 
 Successful schema-1 JSON reports account, epoch, sequence and history floor,
 metadata row count, verified blob/byte totals and the five usage counters.
-`canonical_metadata_verified`, `counters_consistent` and
-`body_digests_verified` are true for that historical snapshot only;
+`canonical_metadata_verified`, `mailbox_roles_unique`, `counters_consistent`
+and `body_digests_verified` are true for that historical snapshot only;
 `semantic_verified:false` preserves all section 203 exclusions. The report
 never approves restore or serving and grants no current authority. This
 PostgreSQL command retains the ordinary ten-second ceiling, independently of

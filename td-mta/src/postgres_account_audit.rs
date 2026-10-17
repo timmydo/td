@@ -1,4 +1,4 @@
-//! Compose historical canonical metadata, usage and body verification.
+//! Audit canonical metadata, mailbox-role uniqueness, usage and bodies.
 use crate::{
     format::Table,
     ids::{AccountId, BlobId, StoreEpoch},
@@ -26,7 +26,8 @@ pub enum Error {
     Capacity,
     Database,
 }
-/// One historical snapshot; excludes policy, credentials, history and receipts.
+/// Historical only; excludes role registry, configuration, credentials,
+/// history and retained receipts.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Report {
     metadata: CompleteMetadata,
@@ -49,7 +50,7 @@ impl Report {
     }
 }
 
-/// Check canonical metadata, all five counters and every declared body in one
+/// Check canonical metadata, role uniqueness, counters and every body in one
 /// read-only primary snapshot. This is not restore or service admission.
 pub fn inspect(
     request: &Request<'_>,
@@ -64,6 +65,19 @@ pub fn inspect(
         let metadata =
             postgres_metadata_audit::audit(worker, epoch, account, utc_ms, limits.metadata)
                 .map_err(Error::Metadata)?;
+        let duplicate_roles = worker
+            .run(move |client| {
+                Box::pin(async move {
+                    client.query_one("SELECT EXISTS (SELECT 1 FROM td_mta.mailboxes WHERE account=$1 AND role IS NOT NULL GROUP BY role COLLATE \"C\" HAVING count(*)>1)", &[&account.as_bytes().as_slice()]).await
+                })
+            })
+            .map_err(Error::Connection)?
+            .map_err(|_| Error::Database)?
+            .try_get::<_, bool>(0)
+            .map_err(|_| Error::Integrity)?;
+        if duplicate_roles {
+            return Err(Error::Integrity);
+        }
         let usage = worker
             .run(move |client| {
                 Box::pin(async move { postgres_usage_audit::audit(client, account).await })

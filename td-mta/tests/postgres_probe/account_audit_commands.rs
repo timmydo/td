@@ -95,6 +95,7 @@ fn real_postgres_account_audit_command_reports_one_snapshot_without_repair() {
     }
     for key in [
         "canonical_metadata_verified",
+        "mailbox_roles_unique",
         "counters_consistent",
         "body_digests_verified",
     ] {
@@ -105,6 +106,19 @@ fn real_postgres_account_audit_command_reports_one_snapshot_without_repair() {
             .get("semantic_verified")
             .and_then(td_json::Json::as_bool),
         Some(false)
+    );
+    sql(&fixture,"INSERT INTO td_mta.mailboxes SELECT account,decode(repeat('09',16),'hex'),'Duplicate',NULL,role,0,1,changed FROM td_mta.mailboxes WHERE role='inbox'");
+    assert!(invoke(epoch, "1", 1).contains("account-integrity"));
+    assert_eq!(
+        sql(
+            &fixture,
+            "SELECT count(*) FROM td_mta.mailboxes WHERE role='inbox'"
+        ),
+        "2"
+    );
+    sql(
+        &fixture,
+        "DELETE FROM td_mta.mailboxes WHERE id=decode(repeat('09',16),'hex')",
     );
     assert!(invoke(epoch, "0", 1).contains("body-limit"));
     assert!(invoke(StoreEpoch::from_bytes([0; 16]), "1", 1).contains("epoch-mismatch"));

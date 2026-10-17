@@ -5457,6 +5457,10 @@ after that pass releases its buffers, one manifest and one eight-chunk body
 batch are retained at a time. Caller aggregate count/byte bounds are checked
 before each body's verification; each body still has the 32-MiB maximum.
 Counters, captured identity and historical totals are constant-size state.
+Mailbox-role uniqueness adds one account-scoped aggregate returning one
+boolean within this same snapshot and original protocol/deadline budget.
+The existing statement timeout bounds server grouping; the client retains no
+role list or account-sized collection.
 
 The explicit limits can be larger than the finite worker can finish. Such an
 account refuses without a partial report. Every pass, body digest, aggregate
