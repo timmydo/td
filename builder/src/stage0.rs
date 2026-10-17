@@ -571,6 +571,27 @@ pub(crate) fn provision_cc(env: &ProvisionEnv) -> Result<String, ProvisionErr> {
     ))
 }
 
+/// Preserve the selected compiler, but name a cc alias as gcc when PATH
+/// exposes the same executable named gcc there. Shared dispatchers such as
+/// ccache must retain cc: their invoked name can select a different compiler.
+/// Rust infers linker behavior from the driver name: cc enables bundled LLD,
+/// bypassing a host GCC's linker setup.
+/// Keep the discovered profile path rather than a canonical store generation.
+pub(crate) fn host_cc(path: &str) -> Option<PathBuf> {
+    let gcc = find_in_path(path, "gcc");
+    let Some(cc) = find_in_path(path, "cc") else {
+        return gcc;
+    };
+    if let Some(gcc) = gcc {
+        if let (Ok(cc_target), Ok(gcc_target)) = (cc.canonicalize(), gcc.canonicalize()) {
+            if cc_target == gcc_target && cc_target.file_name().is_some_and(|name| name == "gcc") {
+                return Some(gcc);
+            }
+        }
+    }
+    Some(cc)
+}
+
 /// The default target on hosts other than td. Its
 /// rust-std (`rust-std-x86_64-unknown-linux-musl`) ships the self-contained musl
 /// `libc.a` + crt objects, so a `+crt-static` build links a pure-`std` binary
@@ -730,8 +751,7 @@ pub(crate) fn bootstrap_stage0(
         .ok_or_else(|| format!("no rustc on the provisioned toolchain PATH ({bootpath})"))?;
     // Links the HOST build script only; `cc` may not exist by that name (a guix
     // profile exposes only `gcc`), so pin gcc/cc explicitly as the host linker.
-    let cc = find_in_path(&bootpath, "cc")
-        .or_else(|| find_in_path(&bootpath, "gcc"))
+    let cc = host_cc(&bootpath)
         .ok_or_else(|| format!("no cc/gcc on the provisioned toolchain PATH ({bootpath})"))?;
     let host_triple = rustc_host_triple(&rustc)?;
     let target = control_plane_target(penv);
@@ -1108,9 +1128,7 @@ fn build_recipe_eval(root: &Path, base: &Path, penv: &ProvisionEnv) -> Result<Pa
     let ccpath = provision_cc(penv).map_err(|error| error.tagged())?;
     let cargo = find_in_path(&rustpath, "cargo").ok_or("no provisioned cargo")?;
     let rustc = find_in_path(&rustpath, "rustc").ok_or("no provisioned rustc")?;
-    let cc = find_in_path(&ccpath, "cc")
-        .or_else(|| find_in_path(&ccpath, "gcc"))
-        .ok_or("no provisioned C compiler")?;
+    let cc = host_cc(&ccpath).ok_or("no provisioned C compiler")?;
     let host = rustc_host_triple(&rustc)?;
     let target = control_plane_target(penv);
     let flags = control_plane_flags(penv, &cc)?;
@@ -1811,8 +1829,66 @@ mod tests {
         let mut env = base_env();
         env.search_path = format!("{}:{}", local.display(), tools.display());
         let path = provision_cc(&env).unwrap();
-        assert_eq!(find_in_path(&path, "cc"), Some(local.join("cc")));
+        assert_eq!(host_cc(&path), Some(tools.join("gcc")));
         assert_eq!(find_in_path(&path, "ar"), Some(tools.join("ar")));
+    }
+
+    #[test]
+    fn host_cc_keeps_a_distinct_compiler_and_handles_gcc_only() {
+        let owned = crate::test_temp::TempDir::new("host-cc-selection").unwrap();
+        let local = owned.path().join("local");
+        let tools = owned.path().join("tools");
+        exec_file(&local.join("cc"));
+        exec_file(&tools.join("gcc"));
+        let path = format!("{}:{}", local.display(), tools.display());
+        assert_eq!(host_cc(&path), Some(local.join("cc")));
+        assert_eq!(host_cc(&tools.to_string_lossy()), Some(tools.join("gcc")));
+        assert_eq!(host_cc(&local.to_string_lossy()), Some(local.join("cc")));
+        assert_eq!(host_cc(""), None);
+    }
+
+    #[test]
+    fn host_cc_keeps_basename_dispatchers_and_clang_aliases() {
+        let owned = crate::test_temp::TempDir::new("host-cc-dispatch").unwrap();
+        let tools = owned.path().join("tools");
+        for name in ["ccache", "clang"] {
+            let aliases = owned.path().join(name);
+            std::fs::create_dir(&aliases).unwrap();
+            exec_file(&tools.join(name));
+            for alias in ["cc", "gcc"] {
+                std::os::unix::fs::symlink(tools.join(name), aliases.join(alias)).unwrap();
+            }
+            assert_eq!(
+                host_cc(&aliases.to_string_lossy()),
+                Some(aliases.join("cc"))
+            );
+        }
+    }
+
+    #[test]
+    fn host_cc_preserves_profile_paths_and_explicit_toolchain_isolation() {
+        let owned = crate::test_temp::TempDir::new("host-cc-profile").unwrap();
+        let tools = owned.path().join("tools");
+        let profile = owned.path().join("profile/bin");
+        let local = owned.path().join("local");
+        exec_file(&tools.join("gcc"));
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::create_dir(&local).unwrap();
+        std::os::unix::fs::symlink(tools.join("gcc"), profile.join("gcc")).unwrap();
+        std::os::unix::fs::symlink(profile.join("gcc"), local.join("cc")).unwrap();
+        let mut env = base_env();
+        env.search_path = format!("{}:{}", local.display(), profile.display());
+        assert_eq!(
+            host_cc(&provision_cc(&env).unwrap()),
+            Some(profile.join("gcc"))
+        );
+        let explicit = owned.path().join("explicit");
+        exec_file(&explicit.join("bin/cc"));
+        env.cc_home = Some(explicit.to_string_lossy().into_owned());
+        assert_eq!(
+            host_cc(&provision_cc(&env).unwrap()),
+            Some(explicit.join("bin/cc"))
+        );
     }
 
     #[test]

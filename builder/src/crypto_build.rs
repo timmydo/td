@@ -129,7 +129,8 @@ pub(crate) fn run(root: &Path, action: &str, manifest: &str) -> Result<()> {
     let cargo = find(&rustpath, "cargo")?;
     let rustc = find(&rustpath, "rustc")?;
     let rustdoc = find(&rustpath, "rustdoc")?;
-    let cc = find(&ccpath, "cc").or_else(|_| find(&ccpath, "gcc"))?;
+    let cc = crate::stage0::host_cc(&ccpath)
+        .ok_or("crypto build requires cc or gcc in provisioned toolchain")?;
     let ar = find(&ccpath, "ar")?;
     let host = crate::stage0::rustc_host_triple(&rustc)?;
     if !matches!(

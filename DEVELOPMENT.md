@@ -826,7 +826,16 @@ profile's `gcc` is sufficient; similarly `c++` may point to `g++`. Prefer the
 stable profile path over a store generation that garbage collection can
 remove. PATH-based host control-plane provisioning retains that tool PATH so
 binutils need not live beside a compiler alias. An explicit `TD_CC_HOME`
-still restricts provisioning to that toolchain's `bin` directory. The reviewer
+still restricts provisioning to that toolchain's `bin` directory. When the
+selected `cc` and the provisioned PATH's `gcc` resolve to the same executable
+whose basename is `gcc`, host build preparation invokes the discovered `gcc`
+path. Aliases for shared dispatchers such as ccache retain `cc`, since their
+invoked name can select different underlying compilers. Rust selects linker
+behavior from the driver name: a `cc` alias enables bundled LLD, which can
+bypass Guix's GNU linker runtime-path setup and produce executables that need
+`LD_LIBRARY_PATH`. Naming that same driver `gcc` retains the host's setup,
+including for children that clear their environment. A distinct `cc` remains
+selected; no compiler version or store path is pinned. The reviewer
 does not set CC or rewrite linker configuration, and
 td-agent has no private compiler forwarder. The controller preserves validated
 parent compiler selections and header/library search paths. C and Rust

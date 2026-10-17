@@ -34,8 +34,7 @@ pub(crate) fn tools(root: &Path) -> Result<Tools, String> {
         Err(crate::stage0::ProvisionErr::Unavailable(m))
         | Err(crate::stage0::ProvisionErr::Broken(m)) => return Err(m),
     };
-    let cc = crate::stage0::find_in_path(&ccpath, "cc")
-        .or_else(|| crate::stage0::find_in_path(&ccpath, "gcc"))
+    let cc = crate::stage0::host_cc(&ccpath)
         .ok_or_else(|| format!("no cc or gcc under the provisioned C toolchain ({ccpath})"))?;
     let ar = crate::stage0::find_in_path(&ccpath, "ar");
     let triple = crate::stage0::rustc_host_triple(&rustc)?;

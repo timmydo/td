@@ -264,7 +264,7 @@ pub(crate) fn host_cargo_bin(
         eprintln!("td-builder check: static {bin}: no rustc on the provisioned rust toolchain — skipping host build");
         return None;
     };
-    let Some(cc) = find_in_frags(&ccpath, "cc").or_else(|| find_in_frags(&ccpath, "gcc")) else {
+    let Some(cc) = crate::stage0::host_cc(&ccpath) else {
         eprintln!("td-builder check: static {bin}: no cc/gcc on the provisioned C toolchain — skipping host build");
         return None;
     };
