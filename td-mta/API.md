@@ -1,5 +1,9 @@
 # Store and runtime boundaries
 
+POSTGRES.md owns active database serving and administration. SQLite-specific
+interfaces below remain legacy library contracts pending deletion; local
+store, backup/restore and file-backed credential commands are removed.
+
 This normative M02c2 contract accompanies the compiling interfaces in
 src/ports.rs and the state codecs in src/sync.rs. Interfaces do not supply a
 store, network runtime, cryptographic provider or allocation/durability proof.
@@ -6558,9 +6562,8 @@ Empty accounts can complete under zero limits. This is neither a
 physical/index-consistency check nor full store verification: an offline
 coordinator must establish physical integrity separately and combine
 metadata and body results for the same snapshot. The primitive alone enables
-no command or service activation. The separate offline selected-account
-`store verify` command composes these stages as specified in STORAGE.md;
-it does not enable serving.
+no command or service activation. The former local `store verify` command
+is removed; POSTGRES.md owns database inspection commands.
 
 account_checks::combine(metadata, bodies) binds completed metadata and
 body reports only when their complete ViewIdentity values match and the
@@ -7017,10 +7020,9 @@ Inbox MailboxId. One schema transaction commits the account at sequence
 one, its canonical Inbox and the mailbox's Created change, so no committed
 store holds that account without an Inbox. The caller supplies the account
 it routes to and draws the epoch and Inbox ID from entropy. `create` keeps
-its existing empty-store behavior. The installed `store init` command
-composes this with a fresh SystemEntropy epoch and Inbox ID; STORAGE.md
-owns its rows, failure progress and output. It grants no serving,
-configuration or credential setup.
+its existing empty-store behavior. This legacy library primitive has no
+installed command; PostgreSQL account initialization is specified in
+POSTGRES.md.
 
 ### Offline account enumeration and verification
 
@@ -7032,14 +7034,8 @@ allowance and validates each fixed-width ID. The owned IDs are historical
 observations; the method does not retain a snapshot or stabilize subsequent
 account views. An offline caller must quiesce mutations separately.
 
-The installed `store verify` command requires exactly one of `--account ID`
-and `--all`. The latter combines whole physical validation with the existing
-current metadata/body checks for every enumerated account, under one retained
-root lock and absolute deadline. It reports database scope and aggregate counts
-only after all passes finish, including zero-account stores. Account views
-reuse one scratch buffer sequentially; each retains its own existing
-maintenance allowance. STORAGE.md owns output fields, errors and limits.
-This grants no retained-history replay, repair or service activation.
+Local verification commands are removed. This enumeration API remains
+only in the legacy SQLite library pending deletion.
 
 ### Offline SQLite snapshot primitive
 
@@ -7057,11 +7053,8 @@ backup acknowledgement. Both can leave artifacts for explicit offline
 inspection, and both consume the engine. STORAGE.md owns recovery of the
 brief two-link publication state, original clock handoff and filesystem
 limits. This offline storage primitive grants no online backup, quota
-reservation, body-integrity or service-activation claim. The separate offline
-`backup` command exposes its database-only copy and failure phases as specified
-in STORAGE.md. Opening a
-snapshot permits offline inspection; restoring it for service requires a
-fresh epoch.
+reservation, body-integrity or service-activation claim. The former local
+backup command is removed.
 
 IndexStore::renew_epoch(self, entropy: &mut dyn ports::Entropy,
 deadline: Deadline) -> Result<Self, CommitError> supplies that low-level
@@ -7079,12 +7072,8 @@ stored data and account endpoints/floors remain unchanged.
 
 STORAGE.md owns the original scope, entropy freshness and synchronous
 cleanup limits. This primitive grants no restore authorization,
-verification, resource admission or service activation. The separate stopped
-`restore` command composes durable no-replace copy, whole-database current
-metadata/body checks and fresh epoch renewal under both root locks, then
-checkpoints before completion. STORAGE.md defines its historical receipt and
-conservative progress on failure. It does not start service, reconcile
-external delivery outcomes or restore separate credentials/configuration.
+verification, resource admission or service activation. The former local
+restore command is removed.
 
 ### Disposable prepared ingress inputs
 

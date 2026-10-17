@@ -3,7 +3,7 @@
 [POSTGRES.md](POSTGRES.md) owns the multi-instance PostgreSQL replacement.
 The active serve command now uses PostgreSQL for configuration, credentials
 and mail. CONFIG.md documents its current receive/JMAP roles. Remaining
-SQLite/local-store library and operator contracts below are legacy removal
+SQLite/local-store library contracts below are legacy removal
 work, not an alternative serving backend. Replacement may span tested
 commits; no deployed SQLite service or existing data migration is required.
 
@@ -179,13 +179,11 @@ its tests in one named child directory. The previous nested response module
 tree is removed in the same change.
 
 Use `td-mta/` for the service library and installed binary named `td-mta`.
-The packaging entry point supports `--version`, `--help`, `config check`
-of an operator file and its protected inputs, foreground
-`serve --smtp-only` for direct IPv4 receiving (CONFIG.md), offline
-`store init` of a new store holding one account and its Inbox, offline
-`store verify` for an explicitly selected account or all accounts,
-stopped-database `backup`, and verified fresh-epoch `restore` to a fresh
-destination. STORAGE.md owns their scope and machine-readable results. Other commands arrive with their implementations.
+The executable serves named PostgreSQL profiles and provides PostgreSQL
+schema, account, credential and configuration commands. CONFIG.md owns
+foreground serving and local status/stop; POSTGRES.md owns database
+administration. Local SQLite initialization, verification, backup/restore,
+file-configuration checks and file-backed device commands are removed.
 Its direct
 dependencies are the local `td-civil`, `td-crypto`, `td-header`, `td-html`,
 `td-json`, `td-mime`
@@ -193,8 +191,8 @@ and `td-nfc` crates, plus the approved private rusqlite dependency with
 bundled SQLite and the approved private tokio-postgres 0.7.18 closure
 with default features disabled. The sole test-only dependency is std-only
 `td-fs`, which owns disposable fixture directories. POSTGRES.md section 8
-owns the inert TLS/SCRAM connection probe; no PostgreSQL serving backend is
-active. POSTGRES.md owns activation and atomic SQLite removal. Its private SCRAM
+owns the TLS/SCRAM connection probe and PostgreSQL serving contract.
+The remaining SQLite library is pending deletion. Its private SCRAM
 cryptography/Unicode preparation do not replace td-crypto or td-mime.
 Application protocols, configuration and scheduling use std
 plus the local libraries; store_fs/index.rs alone owns native SQL. There is
@@ -1603,33 +1601,24 @@ runtime protocol admission remains pending. The service
 uses logical quotas and handles disk-full/write/sync failures; it does not
 measure or promise physical free space before admission.
 
-Planned commands, with stable JSON output and exit codes:
+Current commands use stable JSON output and exit codes:
 
 | Command | Contract |
 | --- | --- |
-| `config check` | Offline syntax, references, permission, and resource validation; implemented for file inputs, no ACME state |
-| `config show --redacted` | Effective values, defaults, and configuration generation |
-| `serve` | Foreground service, no daemonization |
-| `status --json`, `doctor --json` | Full health planned; current status requires --runtime and reports SMTP-only lifecycle; --require-ready makes its exit code a readiness probe |
-| `stop --runtime PATH` | Request orderly shutdown through the private receiving control socket |
-| `dns-plan` | Expected records and MTA-STS policy; no DNS changes |
-| `reload` | Validate candidate, report bounded pending issuance if needed, then atomically install or retain old config; SCHEMA.md owns cancellation/deadline rules |
-| `queue list`, `queue inspect ID` | Paginated status and redacted reasons |
-| `queue retry ID`, `queue cancel ID` | Named, transactional operation; never repeat accepted recipients |
-| `device create --label LABEL`, `device revoke --id ID`, `device list` | Local credential administration |
-| `store layout`, `store inspect`, `store changes`, `store export` | Bounded read-only decoding/export under local administrator authority |
-| `store init` | Offline creation of a new store with one account and its Inbox; never replaces a store |
-| `store verify`, `store repair` | Read-only verification; explicit offline repair with a manifest |
-| `backup`, `restore`, `migrate` | Bounded, resumable tools using the storage contract |
+| `postgres config-import`, `postgres config-check`, `postgres config-select` | Validate, store and select database configuration |
+| `serve --connection-file PATH --profile NAME --runtime PATH --scratch PATH` | Foreground PostgreSQL receive/JMAP service |
+| `status --json --runtime PATH` | Selected service lifecycle; `--require-ready` makes its exit code a readiness probe |
+| `stop --runtime PATH` | Request orderly shutdown through the private control socket |
+| `postgres device-create`, `postgres device-revoke`, `postgres device-list` | Database credential administration |
+| `postgres schema-init`, `postgres schema-inspect`, `postgres schema-upgrade` | Explicit database schema administration |
+| `postgres account-init`, `postgres account-inspect` | Account initialization and inspection |
 
-Online mutations go through a private Unix control socket and the single
-writer. The SMTP-only profile implements status and stop in CONFIG.md; broader
-service control remains planned. The socket directory's permissions establish
-administrator authority;
-there is no public administration HTTP API. Offline mutating commands require
-the exclusive store lock. Readiness checks do not contact Migadu or a CA.
-`doctor` network probes, if later added, require an explicit opt-in and cannot
-send email. Configuration checks never expose supplied secrets in errors.
+POSTGRES.md specifies arguments and the remaining database commands. The
+private Unix control socket carries status and stop only; database changes
+use authenticated PostgreSQL connections. Its directory permissions establish
+local control authority. There is no public administration HTTP API.
+Physical backup and recovery use PostgreSQL tooling. Readiness does not
+contact Migadu or a CA. Configuration errors do not echo supplied secrets.
 
 Listener address changes, data-root changes, and pool sizing require restart.
 Aliases, device revocations, and validated certificates can reload. Revocation
@@ -1646,13 +1635,9 @@ v1 does not accept operator-chosen weak passwords. A device record binds an
 account, label, stable ID, creation/revocation state, and verifier. Labels are
 untrusted display strings. Bound authentication work globally and by peer.
 
-The first credential increment provides offline `device create` and `device
-revoke` commands. Both hold the main store lock, require its sole account,
-and separately lock an operator-provisioned private `devices/` directory.
-The mailbox-access profile provides online control-socket administration
-with --runtime in place of --root and --account. Offline commands cannot
-race either running profile. Device storage
-and publication are specified in STORAGE.md, "Device credentials".
+Device creation, listing and revocation use the PostgreSQL commands in
+POSTGRES.md. Every serving instance observes the same database registry;
+no local credential files or control-socket credential commands are active.
 
 Accept HTTP Basic authentication only over verified server HTTPS from clients;
 td-mta presents the certificate and the client verifies it. Credentials do not

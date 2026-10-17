@@ -2,9 +2,9 @@
 
 ## Status and precedence
 
-This is the agreed replacement target, not implemented PostgreSQL support.
-The serving executable uses PostgreSQL; legacy local-store commands and
-SQLite library code are being removed incrementally. STORAGE.md still
+The serving executable and administration commands use PostgreSQL. Legacy
+local-store, backup/restore, file-configuration and device commands are
+removed. Remaining SQLite library code is being deleted incrementally. STORAGE.md still
 describes that legacy library. This document
 supersedes the single-process, file-configuration and SQLite choices for the
 replacement workstream; it does not relax the current implementation's

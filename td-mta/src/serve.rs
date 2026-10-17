@@ -333,7 +333,7 @@ pub(super) fn run(options: Options) -> Result<(), ConfigFailure> {
                     .name("smtp-control".into())
                     .spawn_scoped(scope, || {
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            endpoint.run(&control, &finished, mailbox_access, None)
+                            endpoint.run(&control, &finished, mailbox_access)
                         }));
                         if !matches!(result, Ok(Ok(()))) {
                             control.stop();

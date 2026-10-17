@@ -330,29 +330,25 @@ and each SHA-256, mail-format, PEM/identity/trust, entropy, provider-constructio
 TLS, mail clock/TCP/TLS transport and configuration-stack smoke case in its own
 process.
 Before those component probes, a separate namespace mounts only `td-mta`
-and the new `td-mta-cli-smoke` test executable. The latter is the existing
-`store_verify_cli` suite compiled with `TD_MTA_PORTABLE_CLI=1`: only this
-test binary selects `/artifacts/td-mta` instead of Cargo's build path.
-Production code has no environment override. The suite requires a non-root
-UID and owned private tmpfs ancestors, sets their strict modes, and checks
-the exact root and artifact directory inventories. The mounted paths contain
-only the two executables, private `/tmp`, minimal `/dev` and private `/proc`.
-No td helper is installed or mounted there; host-sandbox's builder init
-remains PID 1 and is visible through `/proc`. The outer test supervisor
-invokes host-sandbox and enforces a 120-second deadline and a 64 KiB
-collected-output limit, requires the complete 19-test unfiltered passing
-summary, and fails on timeout. Namespace teardown removes remaining processes.
-The ordinary host Cargo wrapper clears the portable compile-time switch.
-This runtime fixture does not apply the host test runner's data-memory cap.
+and the `td-mta-cli-smoke` test executable. The latter is the `operator_cli`
+suite compiled with `TD_MTA_PORTABLE_CLI=1`: only this test binary selects
+`/artifacts/td-mta` instead of Cargo's build path. Production code has no
+environment override. No td helper is installed or mounted there;
+host-sandbox's builder init remains PID 1 and is visible through `/proc`.
+The outer test supervisor invokes host-sandbox and enforces a 120-second
+deadline and a 64 KiB collected-output limit, requires the complete
+three-test unfiltered passing summary, and fails on timeout. Namespace
+teardown removes remaining processes. The ordinary host Cargo wrapper
+clears the portable compile-time switch. This runtime fixture does not
+apply the host test runner's data-memory cap.
 
-These process tests exercise protected config inputs, initialization,
-verification, backup/restore, direct SMTP acceptance and nonlocal refusal,
-kill during unfinished DATA, recovery of accepted mail and abandoned ingress,
-private status/stop and fixed error output against the exact retained
-executable. They use generated fixture configuration and locally generated TLS
-material, with private loopback and no deployment endpoint. The tests do not
-qualify a production supervisor, certificate renewal, STARTTLS delivery at
-the process boundary or full v1 operation. The runtime/debug companion pair
+The three process tests check the PostgreSQL serving help, refusal of
+removed local-store commands, and required serving/control arguments
+against the exact retained executable. They do not start a database or
+qualify serving. The separate native PostgreSQL executable fixture checks
+SMTP delivery, HTTPS device authentication and revocation, control stop,
+restart and SIGTERM/SIGINT shutdown against a real database. That native
+fixture is not a portable-runtime result. The runtime/debug companion pair
 is qualified separately as described above.
 
 The component-probe namespace has no compiler, root-data file, loader or

@@ -8,22 +8,17 @@ use std::{
         net::{UnixListener, UnixStream},
     },
     path::PathBuf,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Mutex,
-    },
+    sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
 use td_mta::{
-    ports::Clock,
     smtp_receiving::{Control, State},
-    store_fs::{DeviceStore, LockedRoot, PrivateRoot},
+    store_fs::{LockedRoot, PrivateRoot},
 };
 
 const NAME: &str = "smtp-control.sock";
 const TURN: Duration = Duration::from_millis(100);
 const EXCHANGE: Duration = Duration::from_secs(2);
-const DEVICE_WAIT: Duration = Duration::from_secs(30);
 
 pub(super) struct Endpoint {
     listener: UnixListener,
@@ -83,7 +78,6 @@ impl Endpoint {
         control: &Control,
         finished: &AtomicBool,
         mailbox_access: bool,
-        devices: Option<&Devices<'_, '_>>,
     ) -> io::Result<()> {
         let mut retry_at = Instant::now();
         while !finished.load(Ordering::Acquire) {
@@ -97,7 +91,7 @@ impl Endpoint {
             match self.listener.accept() {
                 Ok((mut stream, _)) => {
                     // One private operator request; neither storage nor SMTP waits on it.
-                    let _ = exchange(&mut stream, control, devices, mailbox_access);
+                    let _ = exchange(&mut stream, control, mailbox_access);
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     std::thread::sleep(TURN);
@@ -208,18 +202,10 @@ fn send(stream: &mut UnixStream, start: Instant, mut bytes: &[u8]) -> io::Result
     }
     Ok(())
 }
-fn exchange(
-    stream: &mut UnixStream,
-    control: &Control,
-    devices: Option<&Devices<'_, '_>>,
-    mailbox_access: bool,
-) -> io::Result<()> {
+fn exchange(stream: &mut UnixStream, control: &Control, mailbox_access: bool) -> io::Result<()> {
     let start = Instant::now();
     let mut bytes = [0; 256];
     let request = line(stream, start, &mut bytes, true)?;
-    if request.starts_with(b"DEVICE ") {
-        return device_exchange(stream, request, devices, control);
-    }
     let response: &[u8] = match request {
         b"STATUS\n" => match control.state() {
             State::Starting => b"STARTING\n",
@@ -289,116 +275,6 @@ fn connect(runtime: &str) -> Result<(PrivateRoot, UnixStream), ConfigFailure> {
     let stream = UnixStream::connect(&path).map_err(io_failure)?;
     Ok((root, stream))
 }
-const DEVICE_REPLY_BYTES: usize = 12 * 1024;
-struct DeviceReply(Vec<u8>);
-impl DeviceReply {
-    fn failure(&mut self, command: &str, error: super::Failure) -> io::Result<()> {
-        self.0.fill(0);
-        std::hint::black_box(&mut self.0);
-        self.0.clear();
-        super::failure(&mut self.0, command, error)
-    }
-}
-impl Drop for DeviceReply {
-    fn drop(&mut self) {
-        self.0.fill(0);
-        std::hint::black_box(&mut self.0);
-    }
-}
-pub(super) struct Devices<'a, 'r> {
-    pub store: &'a Mutex<DeviceStore<'r>>,
-    pub clock: &'a dyn Clock,
-}
-fn device_exchange(
-    stream: &mut UnixStream,
-    request: &[u8],
-    devices: Option<&Devices<'_, '_>>,
-    control: &Control,
-) -> io::Result<()> {
-    let operation = super::device::Operation::parse(request);
-    let command = operation
-        .as_ref()
-        .map_or("device", |operation| operation.name());
-    let mut reply = DeviceReply(Vec::with_capacity(DEVICE_REPLY_BYTES));
-    let result = (|| {
-        let operation = operation.as_ref().ok_or(super::Failure {
-            stage: "arguments",
-            code: "invalid-arguments",
-        })?;
-        let devices = devices.ok_or(super::Failure {
-            stage: "devices",
-            code: "inactive",
-        })?;
-        let mut store = devices.store.lock().map_err(|_| super::Failure {
-            stage: "devices",
-            code: "unavailable",
-        })?;
-        let now = devices
-            .clock
-            .sample()
-            .map_err(|error| super::adapter("clock", error))?
-            .utc_ms;
-        let now = u64::try_from(now).map_err(|_| super::Failure {
-            stage: "clock",
-            code: "invalid",
-        })?;
-        let result = super::device::apply(&mut store, operation, now, &mut reply.0);
-        if store.device_ids().is_err() {
-            control.fail();
-        }
-        result
-    })();
-    if let Err(error) = result {
-        reply.failure(command, error)?;
-    }
-    if reply.0.len() > DEVICE_REPLY_BYTES {
-        return Err(io::ErrorKind::InvalidData.into());
-    }
-    send(stream, Instant::now(), &reply.0)
-}
-pub(super) fn device_request(
-    runtime: &str,
-    operation: &super::device::Operation,
-    output: &mut impl Write,
-) -> Result<bool, ConfigFailure> {
-    let request = operation
-        .wire()
-        .ok_or_else(|| config_failure("arguments", "invalid-arguments"))?;
-    let (_root, mut stream) = connect(runtime)?;
-    let start = Instant::now();
-    send(&mut stream, start, request.as_bytes()).map_err(io_failure)?;
-    stream
-        .shutdown(std::net::Shutdown::Write)
-        .map_err(io_failure)?;
-    let mut reply = DeviceReply(vec![0; DEVICE_REPLY_BYTES + 1]);
-    let reply = line_with_limit(&mut stream, Instant::now(), &mut reply.0, true, DEVICE_WAIT)
-        .map_err(io_failure)?;
-    if reply.len() > DEVICE_REPLY_BYTES {
-        return Err(config_failure("control", "invalid-response"));
-    }
-    let ok = format!(
-        "{{\"schema\":1,\"command\":\"{}\",\"status\":\"ok\",",
-        operation.name()
-    );
-    let failed = format!(
-        "{{\"schema\":1,\"command\":\"{}\",\"status\":\"error\",",
-        operation.name()
-    );
-    let success = if reply.starts_with(ok.as_bytes()) {
-        true
-    } else if reply.starts_with(failed.as_bytes()) {
-        false
-    } else {
-        return Err(config_failure("control", "invalid-response"));
-    };
-    if !reply.ends_with(b"}\n") || reply.iter().filter(|byte| **byte == b'\n').count() != 1 {
-        return Err(config_failure("control", "invalid-response"));
-    }
-    output.write_all(reply).map_err(io_failure)?;
-    output.flush().map_err(io_failure)?;
-    Ok(success)
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -423,7 +299,7 @@ mod tests {
             let (mut client, mut server) = UnixStream::pair().unwrap();
             client.write_all(request).unwrap();
             client.shutdown(std::net::Shutdown::Write).unwrap();
-            exchange(&mut server, &control, None, false).unwrap();
+            exchange(&mut server, &control, false).unwrap();
             let mut bytes = [0; 16];
             assert_eq!(
                 line(&mut client, Instant::now(), &mut bytes, false).unwrap(),
@@ -433,32 +309,11 @@ mod tests {
     }
 
     #[test]
-    fn device_error_replaces_provisional_success() {
-        let mut reply =
-            DeviceReply(b"{\"schema\":1,\"status\":\"ok\",\"secret\":\"partial".to_vec());
-        reply
-            .failure(
-                "device.list",
-                super::super::Failure {
-                    stage: "devices",
-                    code: "unavailable",
-                },
-            )
-            .unwrap();
-        let value = td_json::parse_slice(&reply.0).unwrap();
-        assert_eq!(
-            value.get("status").and_then(td_json::Json::as_str),
-            Some("error")
-        );
-        assert!(!reply.0.windows(7).any(|bytes| bytes == b"partial"));
-    }
-
-    #[test]
     fn private_protocol_refuses_oversized_input() {
         let (mut client, mut server) = UnixStream::pair().unwrap();
         client.write_all(&[b'x'; 256]).unwrap();
         client.shutdown(std::net::Shutdown::Write).unwrap();
-        assert!(exchange(&mut server, &Control::default(), None, false).is_err());
+        assert!(exchange(&mut server, &Control::default(), false).is_err());
     }
 
     #[test]
@@ -466,7 +321,7 @@ mod tests {
         let (mut client, mut server) = UnixStream::pair().unwrap();
         let control = Control::default();
         std::thread::scope(|scope| {
-            let worker = scope.spawn(|| exchange(&mut server, &control, None, false));
+            let worker = scope.spawn(|| exchange(&mut server, &control, false));
             client.write_all(b"STOP\n").unwrap();
             client
                 .set_read_timeout(Some(Duration::from_millis(100)))

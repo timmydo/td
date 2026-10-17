@@ -548,14 +548,14 @@ pub(crate) fn build_inner() -> Result<()> {
     command.args([
         "--release",
         "--test",
-        "store_verify_cli",
+        "operator_cli",
         "--no-run",
         "--message-format=json-render-diagnostics",
     ]);
     command.env("TD_MTA_PORTABLE_CLI", "1");
     command_record(&command, "mail-cli-build", &mut receipt)?;
     let output = bounded_output(&mut command, "mail-cli-build", 8 * 1024 * 1024, 1200)?;
-    let cli = executable(&output, "store_verify_cli", ArtifactKind::IntegrationTest)?;
+    let cli = executable(&output, "operator_cli", ArtifactKind::IntegrationTest)?;
     let mut command = cargo("test", "td-crypto");
     command.args([
         "--release",
@@ -1696,10 +1696,10 @@ fn cli_evidence(output: &str) -> Result<()> {
         .ok_or("portable CLI test summary missing")?;
     if summaries.next().is_some()
         || !summary.starts_with(
-            "test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;",
+            "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;",
         )
     {
-        return Err("portable CLI suite did not pass all 19 tests".into());
+        return Err("portable CLI suite did not pass all 3 tests".into());
     }
     Ok(())
 }
@@ -1746,7 +1746,7 @@ pub(crate) fn runtime_inner() -> Result<()> {
     })?;
     cli_evidence(&output)?;
     println!(
-        "portable CLI: all 19 store/configuration and receiving/recovery/control tests passed with no helper installed ({:.2}s, {} output bytes)",
+        "portable CLI: all 3 PostgreSQL operator argument tests passed with no helper installed ({:.2}s, {} output bytes)",
         started.elapsed().as_secs_f64(),
         output.len()
     );
@@ -3302,11 +3302,11 @@ mod tests {
 
     #[test]
     fn cli_summary_requires_complete_unfiltered_suite() {
-        let good = "test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1s\n";
+        let good = "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1s\n";
         assert!(cli_evidence(good).is_ok());
         for bad in [
             String::new(),
-            good.replace("19 passed", "0 passed"),
+            good.replace("3 passed", "0 passed"),
             good.replace("0 ignored", "1 ignored"),
             good.replace("0 filtered out", "1 filtered out"),
             good.replace("ok.", "FAILED."),

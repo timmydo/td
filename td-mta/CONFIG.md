@@ -1,9 +1,9 @@
 # td-mta configuration
 
-The inert selected-profile structural loader is specified in
+The selected-profile structural loader is specified in
 [POSTGRES.md §15](POSTGRES.md#15-prepared-instance-role-validation).
 Its role-aware listener and local-MX rules apply only to PreparedProfile;
-the legacy file loader and serving contracts below retain their requirements.
+the source parser retains its structural requirements.
 
 ## Scope
 
@@ -14,8 +14,9 @@ additionally builds checked resource plans. [SCHEMA.md](SCHEMA.md) specifies
 the complete operator schema and snapshot partitions. `config::load::read`
 owns whole-reader structural loading, with the portable stack qualification
 below. `config::material` decodes bounded signature and relay-password bytes.
-`operator_files` opens protected inputs and `config check` composes every
-loading stage, as specified below. Effective output, publication and the
+`operator_files` remains the protected-file library. PostgreSQL configuration
+import/check composes database profiles and versioned materials as specified
+in POSTGRES.md. Effective output, publication and the
 remaining CLI stay M04b3/M19 work as assigned in IMPLEMENTATION.md.
 A syntactically accepted statement is not a valid service configuration.
 DESIGN.md §6 owns the administration contract; RESOURCES.md owns the aggregate
@@ -1727,40 +1728,10 @@ are not atomic against a hostile namespace writer, std does not verify the
 process UID, and bounded reading, not metadata length, enforces each raw
 limit.
 
-`td-mta config check --config PATH` composes the stages a service start
-needs before touching the store. It protected-opens and structurally loads
-the file, validates `[paths] data` as a PrivateRoot and binds its owner. It
-then materializes text, prepares complete TLS policies with private keys
-opened as secrets and other provider inputs as public, and validates the
-identity preimage into a discarding sink. It contacts no network, reads
-no service state, locks nothing and publishes nothing; the prepared tables
-are dropped. ACME chains and keys are service state, so a configuration
-naming an ACME profile refuses with `acme-material-unavailable`. Run it
-as the service user; a privileged check is not a substitute. The runtime
-and log roots are not opened; `serve` owns their checks.
-
-Schema-1 JSON success is `{"schema":1,"command":"config.check",
-"status":"ok","inputs":N}`, where N counts distinct opened identities.
-A refusal has `status: "error"`, a `stage` (`arguments`,
-`configuration-file`, `configuration`, `data-root`, `input`, `text`, `tls`
-or `identities`) and a fixed `error` code. Input refusals add `target`, the
-role name (`text-signature`, `html-signature`, `relay-password`,
-`relay-ca`, `acme-ca`, `certificate-chain`, `certificate-key` or
-`gateway-ca`). A provider refusal names the most recently read role as a
-hint, not attribution: a chain/key pair can fail on either, and a
-refusal after reading, such as a name the certificate does not cover,
-still names that role. Text-stage refusals of the arena or
-inventory carry the active role, if any. Structural refusals add `detail`,
-the loader's fixed-code text with section, field and physical location.
-Exit status is 0 on success, 2 for arguments and 1 otherwise. No output
-names a path or echoes input bytes.
-
-This production reader/finalizer/provider instance runs on the process
-main thread under its RLIMIT_STACK, not the qualified control-worker
-mapping above; a later service worker running these stages keeps that
-256 KiB reservation and its own stack assessment. The scratch buffer is
-the stream's, reused for text decoding as M04b3b requires.
-
+The local `config check --config` command is removed. Use `postgres
+config-import` and `postgres config-check` for database-backed configuration
+and material validation; POSTGRES.md specifies their protected input files,
+version identifiers, deadlines and redacted errors.
 
 ## Foreground PostgreSQL service
 
@@ -1835,7 +1806,7 @@ a sole read-only account and its Mail primary-account mapping. Submission
 remains unadvertised. The event_streams limit defaults to two and
 must be nonzero for mailbox-access. The resource plan already requires it
 strictly below https_connections, reserving capacity for other requests. The
-profile-neutral config check permits zero for SMTP-only; mailbox-access
+profile-neutral resource planner permits zero for receive-only profiles; mailbox-access
 startup additionally validates Core-specific admission. EventSource GET uses
 the Session URL template and an independent stream ceiling within the shared
 HTTPS/per-peer connection caps. These streams currently emit requested pings
