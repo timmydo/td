@@ -5486,3 +5486,13 @@ exclusive advisory lock and one synchronous commit. The transaction's idle
 timeout remains ten seconds; existing statement and transport bounds apply.
 Inspection acknowledges read-only rollback and checks the final deadline.
 Mutation uncertainty and the same-epoch retry contract are in POSTGRES 206.
+
+## PostgreSQL retained-history audit
+
+The inert canonical history audit retains at most 128 native change rows,
+one cursor and scalar counts. It uses the existing body-worker 128-MiB input,
+8192-frame and 512-KiB output ceilings and original ten-second deadline,
+including account capture, all keyset reads and acknowledged rollback.
+Each accepted row spends the explicit total row allowance; failure returns
+no partial report. Retired rows count against that allowance. No full history
+vector, live-object index, body buffer or new worker budget is introduced.

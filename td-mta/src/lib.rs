@@ -251,6 +251,7 @@ pub mod submission_request;
 
 mod device_credentials;
 
+mod postgres_change_row;
 pub mod postgres_changes;
 pub mod postgres_configuration;
 pub mod postgres_configuration_store;
@@ -258,6 +259,7 @@ pub mod postgres_delivery_body;
 pub mod postgres_devices;
 pub mod postgres_drafts;
 pub mod postgres_email_set;
+pub mod postgres_history_audit;
 mod postgres_publication;
 pub mod postgres_receiving;
 pub mod postgres_smtp_receiving;

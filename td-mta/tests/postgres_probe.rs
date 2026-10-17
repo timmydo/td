@@ -11951,3 +11951,6 @@ mod blob_audit_commands;
 
 #[path = "postgres_probe/metadata_audit_commands.rs"]
 mod metadata_audit_commands;
+
+#[path = "postgres_probe/history_audit.rs"]
+mod history_audit;

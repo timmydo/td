@@ -1,9 +1,9 @@
 //! Authenticated change pages from one bounded primary snapshot.
 use crate::{
     device_credentials::Presented,
-    format::{ObjectType, Sequence},
+    format::ObjectType,
     jmap_changes::{self, History, Page},
-    ports::{self, Change, ChangeAction, ChangeCursor, ChangeRecord, ChangeStep, ViewIdentity},
+    ports::{self, ChangeCursor, ChangeRecord, ChangeStep, ViewIdentity},
     postgres_devices,
     postgres_probe::{self, Request, Worker},
     postgres_runtime_profile::Binding,
@@ -117,21 +117,15 @@ impl History for View<'_> {
             let account = self.identity.account;
             let maximum = self.identity.committed_sequence;
             let batch=self.worker.run(|client|Box::pin(async move {
-                let rows=client.query("SELECT sequence,operation,action,object FROM td_mta.changes WHERE account=$1 AND kind=$2 AND (sequence,operation)>($3,$4) ORDER BY sequence,operation LIMIT 128", &[&account.as_bytes().as_slice(),&i64::from(kind.tag()),&after.sequence.number().to_be_bytes().as_slice(),&i64::from(after.operation)]).await.map_err(|_|database_error())?;
+                let rows=client.query("SELECT sequence,operation,action,object,kind FROM td_mta.changes WHERE account=$1 AND kind=$2 AND (sequence,operation)>($3,$4) ORDER BY sequence,operation LIMIT 128", &[&account.as_bytes().as_slice(),&i64::from(kind.tag()),&after.sequence.number().to_be_bytes().as_slice(),&i64::from(after.operation)]).await.map_err(|_|database_error())?;
                 let mut batch=VecDeque::new();
                 batch.try_reserve_exact(rows.len()).map_err(|_|ports::Error::Capacity)?;
                 let mut previous=after;
                 for row in rows {
-                    let sequence=decode_sequence(row.try_get(0).map_err(|_|ports::Error::Corrupt)?)?;
-                    let operation:i64=row.try_get(1).map_err(|_|ports::Error::Corrupt)?;
-                    let operation=u32::try_from(operation).ok().filter(|value|*value<4096).ok_or(ports::Error::Corrupt)?;
-                    let action=match row.try_get::<_,i64>(2).map_err(|_|ports::Error::Corrupt)? {
-                        1=>ChangeAction::Created,2=>ChangeAction::Updated,3=>ChangeAction::Destroyed,_=>return Err(ports::Error::Corrupt),
-                    };
-                    let id:&[u8]=row.try_get(3).map_err(|_|ports::Error::Corrupt)?;
-                    if sequence>maximum || (sequence,operation)<=(previous.sequence,previous.operation) { return Err(ports::Error::Corrupt); }
-                    let cursor=ChangeCursor { sequence,operation };
-                    batch.push_back(ChangeRecord { cursor,change:Change { kind,id:id.try_into().map_err(|_|ports::Error::Corrupt)?,action } });
+                    let record=crate::postgres_change_row::read(&row)?;
+                    let cursor=record.cursor;
+                    if record.change.kind!=kind || cursor.sequence>maximum || (cursor.sequence,cursor.operation)<=(previous.sequence,previous.operation) { return Err(ports::Error::Corrupt); }
+                    batch.push_back(record);
                     previous=cursor;
                 }
                 Ok(batch)
@@ -145,11 +139,6 @@ impl History for View<'_> {
             None => ChangeStep::Complete,
         })
     }
-}
-fn decode_sequence(bytes: &[u8]) -> Result<Sequence, ports::Error> {
-    Ok(Sequence::from_u64(u64::from_be_bytes(
-        bytes.try_into().map_err(|_| ports::Error::Corrupt)?,
-    )))
 }
 fn database_error() -> ports::Error {
     ports::Error::Io {

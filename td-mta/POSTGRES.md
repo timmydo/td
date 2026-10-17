@@ -6059,3 +6059,38 @@ row/parent bounds, malformed mailbox refusal without repair, strict arguments
 and successful canonical checks despite invalid body digests, inconsistent
 usage counters and duplicate mailbox roles. Those exclusions are deliberate;
 the composed account-audit command supplies the broader checks in section 203.
+
+## 210. Historical canonical retained-history audit
+
+`postgres_history_audit::inspect` checks all physically retained change
+rows for one explicit epoch/account in one primary REPEATABLE READ,
+READ ONLY snapshot under the shared migration lock. It captures the account
+endpoint and history floor before scanning, requires floor <= endpoint and
+accepts an explicit total row limit. Zero is valid only when no rows remain.
+There is no command, device authorization or serving activation in this
+increment.
+
+The audit and authenticated change reader share one canonical row decoder:
+exact eight-byte nonzero unsigned sequence, operation 0..4095, supported
+Mailbox/Thread/Email/EmailSubmission kind, Created/Updated/Destroyed action
+and exact sixteen-byte object ID. Identity changes refuse. Both consumers
+check strict cursor order and the captured committed endpoint. Account
+keyset batches contain at most 128 rows, never a complete retained history.
+
+Rows at or below the floor may await physical reclamation and are valid.
+The audit validates them too and reports their count separately. A success
+reports only the captured identity and total/retired row counts after
+acknowledged ROLLBACK and a final original-deadline check. It does not prove
+that events are complete, actions match live objects, operation ordinals are
+contiguous, transaction history can reconstruct current state, or retained
+receipts are valid. No body, metadata, credential, restore or serving
+certificate follows. Separate reports are separate snapshots.
+
+The existing body-worker wire/frame ceilings and ten-second deadline cover
+the entire scan; a caller row allowance does not renew them. Exhaustion,
+malformed rows, future or zero sequences, wrong epoch, missing account or
+database failure refuse without repair or a partial report. Native fixtures
+cover multiple batches, exact row bounds, retired rows, account isolation,
+corrupt sequences, deliberate event-completeness exclusions and a concurrent
+commit after snapshot capture. The authenticated changes fixture qualifies
+the shared decoder through normal transaction-aligned paging.
