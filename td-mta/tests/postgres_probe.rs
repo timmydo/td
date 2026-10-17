@@ -11942,3 +11942,6 @@ mod runtime_barrier;
 
 #[path = "postgres_probe/maintenance.rs"]
 mod maintenance;
+
+#[path = "postgres_probe/maintenance_commands.rs"]
+mod maintenance_commands;

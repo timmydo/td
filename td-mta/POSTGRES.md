@@ -5910,9 +5910,9 @@ operations retain their original finite limits and migration locks. Owner
 Preparation schema inspection remains available while the barrier is set;
 `runtime-check` remains a runtime qualification and refuses maintenance.
 
-This enforcement foundation introduces no barrier entry/release command,
-epoch renewal, delivery quarantine or recovery approval. Section 206 specifies
-the owner entry API. Owner transitions hold the exclusive migration lock and
+Runtime qualification performs no entry, release, epoch renewal, delivery
+quarantine or recovery approval. Sections 206 and 207 specify owner entry.
+Owner transitions hold the exclusive migration lock and
 require external fencing of old instances and SMTP egress; shared locks prevent
 them from racing qualified database operations. A database flag cannot establish
 external fencing or decide duplicate-delivery risk. Recovery must not clear
@@ -5932,7 +5932,8 @@ owner recovery transition protocol.
 entry. The caller must provide the expected store epoch and explicitly
 attest that all old instances and SMTP egress are externally stopped/fenced.
 The typed attestation records a caller obligation; PostgreSQL cannot prove
-it. These preparation APIs have no production startup or command routing.
+it. Section 207 exposes explicit preparation commands; production startup
+is unchanged.
 
 Entry forces READ COMMITTED and synchronous commit, acquires the exclusive
 transaction migration lock before checking the complete current ledger, and
@@ -5964,3 +5965,32 @@ Native tests cover exact ownership, extra runtime grants, wrong epochs,
 shared/exclusive lock contention, unchanged mail and ledger state, repeated
 entry, missing state, a deferred-COMMIT timeout resolved at the
 same epoch, and stale retry refusal after a fixture-simulated epoch change.
+
+## 207. Explicit owner maintenance commands
+
+`postgres maintenance-inspect --connection-file PATH --epoch HEX` observes
+the owner barrier. `postgres maintenance-enter` requires the same arguments
+and the explicit `--instances-and-smtp-fenced` flag. The flag attests that
+all old instances and SMTP egress are externally stopped/fenced; it neither
+performs nor proves fencing. Duplicate, unknown and missing arguments refuse
+before opening the protected connection file. Inspection rejects that flag.
+No release, force, profile selector or epoch-generation option exists.
+
+Both commands use section 206's owner and expected-epoch checks, the existing
+protected bootstrap loader and one original DNS/connection deadline. Only a
+transport failure before any COMMIT attempt permits another resolved address;
+indeterminate entry is not silently replayed. Retain the exact epoch after
+uncertainty and inspect or repeat at that epoch as section 206 specifies.
+
+Schema-1 JSON reports the expected epoch, historical blocked state and
+`recovery_verified:false`. Errors use fixed codes without SQL, credentials or
+body contents; operation failures preserve the expected epoch in output.
+`indeterminate-inspect-maintenance` requires explicit outcome resolution.
+A false observation does not authorize opening service, and successful entry
+neither rotates an epoch nor quarantines deliveries or validates recovery.
+The commands expose preparation only and leave production startup unchanged.
+
+The native process fixture covers strict fencing arguments, owner refusal,
+epoch mismatch, initial/entered/repeated observations, preserved ledger epoch
+and refusal without repair after a missing singleton. Section 206's API
+fixture separately covers lost COMMIT acknowledgement and lock contention.

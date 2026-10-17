@@ -13,6 +13,7 @@ mod configuration;
 mod device_create;
 mod device_list;
 mod device_revoke;
+mod maintenance;
 mod material;
 mod selection;
 mod usage;
@@ -79,6 +80,9 @@ fn arguments(operation: Operation, mut args: impl Iterator<Item = OsString>) -> 
 
 pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<ExitCode> {
     let command = args.next();
+    if let Some(operation) = command.as_deref().and_then(maintenance::Operation::parse) {
+        return maintenance::run(operation, args);
+    }
     if command.as_deref() == Some(OsStr::new("account-audit")) {
         return audit::run(args);
     }
