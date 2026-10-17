@@ -22,12 +22,12 @@ enum Phase {
     Closed,
 }
 impl Windows {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(turns: usize) -> Self {
         Self(Arc::new(Mutex::new(State {
             bytes: INPUT,
             output: OUTPUT,
             frames: FRAMES,
-            left: super::BODY_CHECK_TURNS,
+            left: turns,
             phase: Phase::First,
             failed: false,
         })))
@@ -104,7 +104,7 @@ mod tests {
 
     #[test]
     fn authentication_and_first_turn_share_the_initial_window() {
-        let windows = Windows::new();
+        let windows = Windows::new(super::super::BODY_CHECK_TURNS);
         windows.input(INPUT - 1).unwrap();
         windows.output(OUTPUT - 1).unwrap();
         windows.begin().unwrap();
@@ -117,7 +117,7 @@ mod tests {
 
     #[test]
     fn only_completed_turns_admit_the_next_finite_window() {
-        let windows = Windows::new();
+        let windows = Windows::new(super::super::BODY_CHECK_TURNS);
         for _ in 0..super::super::BODY_CHECK_TURNS {
             windows.begin().unwrap();
             windows.input(INPUT).unwrap();
@@ -130,7 +130,7 @@ mod tests {
         }
         assert!(windows.begin().is_err());
         assert!(windows.input(0).is_err());
-        let windows = Windows::new();
+        let windows = Windows::new(super::super::BODY_CHECK_TURNS);
         windows.begin().unwrap();
         assert!(windows.begin().is_err());
         assert!(windows.finish().is_err());
@@ -138,17 +138,17 @@ mod tests {
 
     #[test]
     fn idle_messages_consume_the_closed_window_and_failure_is_terminal() {
-        let windows = Windows::new();
+        let windows = Windows::new(super::super::BODY_CHECK_TURNS);
         windows.begin().unwrap();
         windows.input(INPUT - 1).unwrap();
         windows.finish().unwrap();
         windows.input(1).unwrap();
         assert!(windows.input(1).is_err());
         assert!(windows.begin().is_err());
-        let windows = Windows::new();
+        let windows = Windows::new(super::super::BODY_CHECK_TURNS);
         assert!(windows.admit_output(OUTPUT + 1).is_err());
         assert!(windows.begin().is_err());
-        let windows = Windows::new();
+        let windows = Windows::new(super::super::BODY_CHECK_TURNS);
         windows.fail();
         assert!(windows.begin().is_err());
     }

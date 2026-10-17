@@ -7,7 +7,7 @@ use crate::{
     postgres_attempt_phases::{self as phases, Change},
     postgres_attempt_recovery as recovery,
     postgres_attempts::{self as attempts, Dispatch},
-    postgres_probe::{Mode, Request, BODY_CHECK_TURNS},
+    postgres_probe::{BodyBudget, Mode, Request},
     postgres_read::{ReadPermit, ReadSlots},
     postgres_route_health as health,
     postgres_route_owners::Claim,
@@ -1433,7 +1433,9 @@ impl<'w, 'a, 'r> BodyPlan<'w, 'a, 'r> {
     pub(crate) fn reserve_checks(
         self,
         meter: &mut Meter,
+        length: u64,
     ) -> Result<BodyTransferPlan<'w, 'a, 'r>, Error> {
+        let budget = BodyBudget::for_source(length)?;
         let worker = self.body.worker;
         let pending = worker
             .pending
@@ -1446,10 +1448,14 @@ impl<'w, 'a, 'r> BodyPlan<'w, 'a, 'r> {
         if Instant::now() >= self.work_limit() {
             return Err(ports::Error::Deadline.into());
         }
-        let turns = u64::try_from(BODY_CHECK_TURNS).map_err(|_| ports::Error::Capacity)?;
         let limit = worker
             .connection
-            .admit_work(self.body.until, meter, BODY_CHECK_IO * turns, 4096 * turns)?
+            .admit_work(
+                self.body.until,
+                meter,
+                budget.io_charge(),
+                budget.record_charge(),
+            )?
             .min(self.work_limit());
         let permit = worker
             .connection
@@ -1463,13 +1469,14 @@ impl<'w, 'a, 'r> BodyPlan<'w, 'a, 'r> {
             &self.body.body,
             worker.connection.clock.clone(),
             worker.guard.clone(),
+            budget,
         )
         .map_err(Error::Phase)?;
         Ok(BodyTransferPlan {
             checks,
             permit,
             plan: self,
-            remaining: BODY_CHECK_TURNS,
+            remaining: budget.turns(),
             limit,
         })
     }

@@ -65,7 +65,7 @@ pub fn begin<'m, 'w, 'a, 'r, B: TlsWireStorage>(
     wire: &'m mut Meter,
     database: &'m mut Meter,
 ) -> Result<Exchange<'m, 'w, 'a, 'r, B>, Refusal<B>> {
-    let plan = match plan.reserve_checks(database) {
+    let plan = match plan.reserve_checks(database, source.len()) {
         Ok(plan) => plan,
         Err(error) => {
             return Err(Refusal {

@@ -50,12 +50,12 @@ impl Input {
         }
     }
 
-    pub(super) fn body_checks() -> Self {
+    pub(super) fn body_checks(budget: super::BodyBudget) -> Self {
         let single = Self::mutations();
         Self {
-            window: Some(Windows::new()),
-            bytes: super::BODY_CHECK_TURNS * single.bytes,
-            frames: super::BODY_CHECK_TURNS * single.frames,
+            window: Some(Windows::new(budget.turns())),
+            bytes: budget.input(),
+            frames: budget.frames(),
             ..single
         }
     }
@@ -316,31 +316,39 @@ mod tests {
 
     #[test]
     fn retained_body_checks_bound_a_hostile_first_turn_and_never_replenish() {
-        let mut input = Input::body_checks();
+        let mut input = Input::body_checks(super::super::BodyBudget::test_turns(8).unwrap());
         for _ in 0..1088 {
             assert!(input.accept(&frame(b'N', b"\0")).is_ok());
         }
         assert!(input.accept(&frame(b'N', b"\0")).is_err());
         assert!(input.accept(&authenticated()).is_err());
         let packet = frame(b'D', &[0; 128 * 1024 - 4]);
-        let mut input = Input::body_checks();
+        let mut input = Input::body_checks(super::super::BodyBudget::test_turns(8).unwrap());
         for _ in 0..7 {
             assert!(input.accept(&packet).is_ok());
         }
         assert!(input.accept(&packet).is_err());
         assert!(input.accept(&[]).is_err());
-        assert!(Input::body_checks().accept(&frame(b'Z', b"I")).is_err());
-        assert!(Input::body_checks()
-            .accept(&frame(b'R', &0u32.to_be_bytes()))
-            .is_err());
-        assert!(Input::body_checks()
-            .accept(&frame(b'D', &[0; 128 * 1024]))
-            .is_err());
+        assert!(
+            Input::body_checks(super::super::BodyBudget::test_turns(8).unwrap())
+                .accept(&frame(b'Z', b"I"))
+                .is_err()
+        );
+        assert!(
+            Input::body_checks(super::super::BodyBudget::test_turns(8).unwrap())
+                .accept(&frame(b'R', &0u32.to_be_bytes()))
+                .is_err()
+        );
+        assert!(
+            Input::body_checks(super::super::BodyBudget::test_turns(8).unwrap())
+                .accept(&frame(b'D', &[0; 128 * 1024]))
+                .is_err()
+        );
     }
 
     #[test]
     fn retained_windows_preserve_authentication_and_monotonic_totals() {
-        let mut input = Input::body_checks();
+        let mut input = Input::body_checks(super::super::BodyBudget::test_turns(8).unwrap());
         let window = input.window().unwrap();
         input.accept(&authenticated()).unwrap();
         for turn in 0..super::super::BODY_CHECK_TURNS {
@@ -364,7 +372,7 @@ mod tests {
     fn retained_windows_keep_fragmented_parser_state_and_terminal_failures() {
         let bytes = frame(b'N', b"fragmented");
         for split in 1..bytes.len() {
-            let mut input = Input::body_checks();
+            let mut input = Input::body_checks(super::super::BodyBudget::test_turns(8).unwrap());
             let window = input.window().unwrap();
             input.accept(&authenticated()).unwrap();
             window.begin().unwrap();

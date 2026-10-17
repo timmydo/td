@@ -5211,21 +5211,28 @@ rollback of transaction-scoped migration and row locks before returning.
 Standalone dispatch checks charge one fresh connection per Body check;
 retaining the low-level validator supplies no slot or work admission.
 
-The bound Body transport instead prepays eight validation turns: 9 MiB I/O
-and 32768 records before opening one retained ordinary connection. Its profile
-caps total input at 8 MiB, output at 512 KiB and frames at 8704; the original
-per-frame/authentication limits remain. Each turn also admits at most 1 MiB
-input, 64 KiB output and 1088 frames, with authentication charged to the first
-window. Only acknowledged rollback permits a later window, and available idle
-traffic consumes the preceding window. At most eight windows are granted;
+The bound Body transport prepays source-sized validation work before opening
+one retained ordinary connection. For actual verified length L <= 32 MiB,
+E = L + floor(L/3) bounds encoded output. The check count is 2 * ceil(E/16384)
+plus one flush and eight extra partial/Pending I/O attempts. Each cell
+reserves acceptance and a TLS-record tail drain under the 16 KiB socket cap. Each check
+prepays 1 MiB plus 128 KiB I/O and 4096 records; checked arithmetic derives
+cumulative 1 MiB input, 64 KiB output and 1088 frames per admitted check.
+At 32 MiB this is 5471 checks, 6154.875 MiB I/O, 22409216 records, 5471 MiB
+input, 341.9375 MiB output and 5952448 frames. These are work counters, not
+memory allocations, and make no maximum-message throughput guarantee.
+
+Each turn independently permits at most 1 MiB input, 64 KiB output and 1088
+frames. Authentication consumes the first window; available idle traffic
+consumes the preceding window. Only acknowledged rollback permits a later
+window. Its finite grant count matches the source-derived check count;
 protocol failure permanently refuses further grants. Aggregate counters
-continue decreasing across all windows. A separate eight-credit counter caps
-attempted checks, including Pending writes and flushes. No aggregate counter
-or credit is replenished. Every turn checks the original meter/deadline and Pending and
-performs complete qualification plus live validation. The earliest limit
-carries into Possible and final custody. The connection closes before its
-ReadPermit is released, including before Possible needs the second slot.
-This reserves work, not guaranteed body progress or maximum-message capacity.
+continue decreasing across all windows. The separate dispatch credit counter
+also consumes Pending writes and flushes. No aggregate counter, credit or
+meter is replenished. Every turn checks Pending and the original shrinking
+deadline and performs full qualification plus live validation. Earliest
+limits carry into Possible and final custody. Connection closure precedes
+ReadPermit release, including before Possible needs the second slot.
 
 Bound immutable-source admission prepays 131 MiB I/O and 32768 records before
 opening the snapshot or either fresh attempt admission. This covers their
@@ -5307,4 +5314,5 @@ with runnable work proceed without that polling delay. The phase hint
 borrows existing state and adds no storage. Each advance still checks its
 possibly tighter deadline before work.
 This bounded driver does not qualify maximum-body throughput or arbitrary
-backpressure, and the eight-credit Body allowance remains unchanged.
+backpressure. Source-sized Body admission still refuses on finite credit,
+work or original deadline exhaustion.

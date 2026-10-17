@@ -174,17 +174,17 @@ fn run(
         let job_limit = clock.deadline_instant(cap).unwrap();
         // Configured DNS/TLS/AUTH adds native authority checks before MAIL.
         // Reserve the complete path up front; never refill between phases.
-        let mut database = if setup.is_some() {
+        let mut database = if n == 144 {
+            wire::meter(cap)
+        } else {
             td_mta::admission::work::Meter::new(
                 cap,
                 td_mta::admission::work::Charge {
                     io_bytes: 128 * 1024 * 1024,
-                    records: 131072,
+                    records: 262144,
                     ..Default::default()
                 },
             )
-        } else {
-            wire::meter(cap)
         };
         let published = worker
             .publish_prepared(
@@ -842,11 +842,14 @@ fn run(
                 if matches!(n, 145 | 146 | 154) {
                     use td_mta::admission::work::{Charge, Meter};
                     let before = sql(fixture, "SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE application_name='td-mta-postgres'");
+                    let length: u64 = sql(fixture, &format!("SELECT b.length FROM td_mta.submissions s JOIN td_mta.blobs b ON b.account=s.account AND b.id=s.transmitted_blob_id WHERE s.id={sub}")).parse().unwrap();
+                    assert!((1..=12288).contains(&length));
                     let mut short = Meter::new(
                         cap,
                         Charge {
-                            io_bytes: 9 * 1024 * 1024 - u64::from(matches!(n, 145 | 154)),
-                            records: 32768 - u64::from(n == 146),
+                            io_bytes: 11 * (1024 * 1024 + 128 * 1024)
+                                - u64::from(matches!(n, 145 | 154)),
+                            records: 11 * 4096 - u64::from(n == 146),
                             ..Default::default()
                         },
                     );
@@ -878,17 +881,27 @@ fn run(
                     }
                     return Err(refusal);
                 }
-                let mut exchange = start
-                    .begin(
-                        body::Scratch {
-                            input: &mut input,
-                            output: &mut output,
-                        },
-                        &mut work,
-                        &mut database,
-                    )
-                    .ok()
-                    .unwrap();
+                let exchange = start.begin(
+                    body::Scratch {
+                        input: &mut input,
+                        output: &mut output,
+                    },
+                    &mut work,
+                    &mut database,
+                );
+                let mut exchange = match exchange {
+                    Ok(exchange) => exchange,
+                    Err(refusal) if n == 144 => {
+                        assert_eq!(
+                            refusal.error,
+                            transfer::Error::Publication(dispatch::Error::Admission(
+                                td_mta::ports::Error::Capacity
+                            ))
+                        );
+                        return Err(refusal);
+                    }
+                    Err(refusal) => panic!("native body admission refused: {:?}", refusal.error),
+                };
                 // Competing work has its own meter; it cannot consume the
                 // message's prepaid validation allowance.
                 assert!(matches!(

@@ -2,7 +2,7 @@ use super::{deadline, native_relay_connect::Setup, relay_wire as wire, sql, Fixt
 use std::{
     sync::{Arc, Mutex},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use td_crypto::{Crypto, Digest, Provider, TrustStore};
 use td_mta::{
@@ -29,14 +29,28 @@ pub(super) fn exercise(
     source: SubmissionId,
     setup: &Setup,
 ) {
-    for n in [173u8, 174, 175, 176, 177] {
+    for n in [173u8, 174, 175, 176, 177, 178] {
         let submission = SubmissionId::from_bytes([n; 16]);
         let sub = format!("decode('{submission}','hex')");
         let src = format!("decode('{source}','hex')");
-        let lines = if n == 174 { 144 } else { 64 };
+        let lines = match n {
+            174 => 144,
+            178 => 333334,
+            _ => 64,
+        };
         let count = if n == 175 { 3 } else { 2 };
         let last = count - 1;
-        let body = format!(".{}\r\n", "x".repeat(997)).repeat(lines);
+        let (body, body_sql) = if n == 178 {
+            (
+                ".\r\n".repeat(lines),
+                format!("repeat('.'||chr(13)||chr(10),{lines})"),
+            )
+        } else {
+            (
+                format!(".{}\r\n", "x".repeat(997)).repeat(lines),
+                format!("repeat('.'||repeat('x',997)||chr(13)||chr(10),{lines})"),
+            )
+        };
         let length = body.len();
         let chunks = length.div_ceil(65536);
         let mut hash = Provider.sha256().unwrap();
@@ -47,7 +61,7 @@ pub(super) fn exercise(
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect::<String>();
-        sql(fixture,&format!("INSERT INTO td_mta.submissions SELECT account,{sub},email_id,thread_id,identity_id,transmitted_blob_id,reverse_path,send_at,expires_at,{count},NULL,0,NULL,changed FROM td_mta.submissions WHERE id={src}; INSERT INTO td_mta.submission_routes SELECT account,{sub},submitting_profile,route_name,destination FROM td_mta.submission_routes WHERE submission_id={src}; INSERT INTO td_mta.recipients SELECT account,{sub},i,i::text||'@example.test',1,0,NULL,0,NULL,0,send_at,NULL,NULL,0,'',changed FROM td_mta.submissions CROSS JOIN generate_series(0,{last}) i WHERE id={sub}; INSERT INTO td_mta.blob_ids SELECT account,id FROM td_mta.submissions WHERE id={sub}; INSERT INTO td_mta.blobs SELECT account,id,{length},decode('{digest}','hex'),0,changed,{chunks} FROM td_mta.submissions WHERE id={sub}; INSERT INTO td_mta.blob_chunks SELECT account,id,i,substring(convert_to(repeat('.'||repeat('x',997)||chr(13)||chr(10),{lines}),'UTF8') from i*65536+1 for 65536) FROM td_mta.submissions CROSS JOIN generate_series(0,{chunks}-1) i WHERE id={sub}; UPDATE td_mta.submissions SET transmitted_blob_id=id WHERE id={sub}"));
+        sql(fixture,&format!("INSERT INTO td_mta.submissions SELECT account,{sub},email_id,thread_id,identity_id,transmitted_blob_id,reverse_path,send_at,expires_at,{count},NULL,0,NULL,changed FROM td_mta.submissions WHERE id={src}; INSERT INTO td_mta.submission_routes SELECT account,{sub},submitting_profile,route_name,destination FROM td_mta.submission_routes WHERE submission_id={src}; INSERT INTO td_mta.recipients SELECT account,{sub},i,i::text||'@example.test',1,0,NULL,0,NULL,0,send_at,NULL,NULL,0,'',changed FROM td_mta.submissions CROSS JOIN generate_series(0,{last}) i WHERE id={sub}; INSERT INTO td_mta.blob_ids SELECT account,id FROM td_mta.submissions WHERE id={sub}; INSERT INTO td_mta.blobs SELECT account,id,{length},decode('{digest}','hex'),0,changed,{chunks} FROM td_mta.submissions WHERE id={sub}; INSERT INTO td_mta.blob_chunks SELECT account,id,i,substring(convert_to({body_sql},'UTF8') from i*65536+1 for 65536) FROM td_mta.submissions CROSS JOIN generate_series(0,{chunks}-1) i WHERE id={sub}; UPDATE td_mta.submissions SET transmitted_blob_id=id WHERE id={sub}"));
         let reverse = sql(
             fixture,
             &format!("SELECT reverse_path FROM td_mta.submissions WHERE id={sub}"),
@@ -94,11 +108,16 @@ pub(super) fn exercise(
         let mut database = Meter::new(
             cap,
             Charge {
-                io_bytes: 128 * 1024 * 1024,
-                records: 131072,
+                io_bytes: if n == 178 { 256 } else { 128 } * 1024 * 1024,
+                records: match n {
+                    174 => 131072,
+                    178 => 1048576,
+                    _ => 262144,
+                },
                 ..Default::default()
             },
         );
+        let started = Instant::now();
         let prepared = worker
             .publish_prepared(
                 claim,
@@ -180,14 +199,11 @@ pub(super) fn exercise(
                     let mut bytes = [0; 16384];
                     match peer.read(&mut bytes) {
                         Ok(IoProgress::Bytes(size)) => received.extend_from_slice(&bytes[..size]),
-                        Ok(IoProgress::Closed) | Err(_) => {
-                            assert!(matches!(n, 174 | 176));
-                            break;
-                        }
+                        Ok(IoProgress::Closed) | Err(_) => break,
                         Ok(IoProgress::Pending) => {}
                     }
                     if received.ends_with(b"\r\n.\r\n") {
-                        assert!(matches!(n, 173 | 177));
+                        assert!(matches!(n, 173 | 177 | 178));
                         if n == 177 {
                             let answer_at =
                                 clock.deadline_instant(cap).unwrap() - Duration::from_millis(1500);
@@ -221,14 +237,36 @@ pub(super) fn exercise(
             );
             (result, server.join().unwrap())
         });
-        if n == 173 {
-            let done = result.ok().unwrap();
+        if matches!(n, 173 | 178) {
+            let done = result.unwrap_or_else(|stopped| {
+                let error = match stopped.evidence {
+                    attempt_driver::Evidence::Mail(value) => format!("MAIL {:?}", value.error),
+                    attempt_driver::Evidence::Rcpt { error, .. } => format!("RCPT {error:?}"),
+                    attempt_driver::Evidence::Data(value) => format!("DATA {:?}", value.error),
+                    attempt_driver::Evidence::Body(value) => format!("Body {:?}", value.error),
+                    attempt_driver::Evidence::Source(value) => format!("source {:?}", value.error),
+                    attempt_driver::Evidence::Final(value) => format!("final {:?}", value.error),
+                };
+                panic!(
+                    "native attempt {n} stopped after {:?}, {} body bytes: {error}",
+                    started.elapsed(),
+                    transferred.len()
+                );
+            });
             assert_eq!(done.stage, attempt_driver::Stage::Final);
             assert_eq!(done.outcome.attempt, attempt);
             assert_eq!(done.outcome.recipients, 1);
             drop(done.buffers.unwrap());
-            let expected = format!("..{}\r\n", "x".repeat(997)).repeat(lines) + ".\r\n";
+            let expected = if n == 178 {
+                "..\r\n".repeat(lines)
+            } else {
+                format!("..{}\r\n", "x".repeat(997)).repeat(lines)
+            } + ".\r\n";
             assert_eq!(transferred, expected.as_bytes());
+            if n == 178 {
+                assert!(started.elapsed() < Duration::from_secs(10));
+                eprintln!("native source-sized relay: {length} source bytes, {} encoded bytes, {:?} elapsed", expected.len() - 3, started.elapsed());
+            }
         } else if n == 177 {
             let stopped = result.err().unwrap();
             let attempt_driver::Evidence::Final(failure) = stopped.evidence else {
@@ -313,6 +351,7 @@ pub(super) fn exercise(
             assert!(!transferred.windows(5).any(|v| v == b"\r\n.\r\n"));
             assert!(pending.attempt().unwrap().is_none());
             if n == 174 {
+                assert!(transferred.is_empty());
                 assert_eq!(sql(fixture, &format!("SELECT phase FROM td_mta.recipients WHERE submission_id={sub} AND ordinal=0")), "2");
             }
             let value = stopped.interruption.prepare().ok().unwrap();
@@ -331,7 +370,7 @@ pub(super) fn exercise(
             assert_eq!(sql(fixture, &format!("SELECT rcpt_reply IS NULL FROM td_mta.recipients WHERE submission_id={sub} AND ordinal=2")), "t");
         }
         assert!(pending.attempt().unwrap().is_none());
-        if matches!(n, 173 | 177) {
+        if matches!(n, 173 | 177 | 178) {
             assert_eq!(sql(fixture, &format!("SELECT state,phase,data_reply FROM td_mta.recipients WHERE submission_id={sub} AND ordinal=0")), "4|4|250 queued");
         }
         assert_eq!(

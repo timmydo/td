@@ -2,7 +2,7 @@
 use super::{capacity, number, receipt, valid_reply, Change, Error, Fields, Observation};
 use crate::{
     ports::Clock,
-    postgres_probe::{self, Mode, Request},
+    postgres_probe::{self, BodyBudget, Mode, Request},
     postgres_route_owners as owners,
     queue_clock::Guard,
 };
@@ -70,7 +70,7 @@ impl BodyChecks {
         clock: Arc<dyn Clock>,
         guard: Arc<Mutex<Guard>>,
     ) -> Result<Self, Error> {
-        Self::open_profile(request, trust, deadline, value, clock, guard, false)
+        Self::open_profile(request, trust, deadline, value, clock, guard, None)
     }
     pub(crate) fn transfer(
         request: &Request<'_>,
@@ -79,8 +79,9 @@ impl BodyChecks {
         value: &Change,
         clock: Arc<dyn Clock>,
         guard: Arc<Mutex<Guard>>,
+        budget: BodyBudget,
     ) -> Result<Self, Error> {
-        Self::open_profile(request, trust, deadline, value, clock, guard, true)
+        Self::open_profile(request, trust, deadline, value, clock, guard, Some(budget))
     }
     fn open_profile(
         request: &Request<'_>,
@@ -89,12 +90,12 @@ impl BodyChecks {
         value: &Change,
         clock: Arc<dyn Clock>,
         guard: Arc<Mutex<Guard>>,
-        retained: bool,
+        budget: Option<BodyBudget>,
     ) -> Result<Self, Error> {
         if value.inner.phase != 2 {
             return Err(Error::Integrity);
         }
-        let worker = postgres_probe::body_check_worker(request, trust, deadline, retained)
+        let worker = postgres_probe::body_check_worker(request, trust, deadline, budget)
             .map_err(Error::Connection)?;
         Ok(Self {
             worker: Some(worker),

@@ -67,7 +67,8 @@ const QUERY: &str = "SELECT pg_catalog.current_setting('server_version_num'), \
     pg_catalog.current_setting('transaction_read_only'), \
     pg_catalog.current_setting('fsync'), pg_catalog.current_setting('full_page_writes')";
 pub(crate) const MAX_DURATION: Duration = Duration::from_secs(10);
-pub(crate) const BODY_CHECK_TURNS: usize = 8;
+#[cfg(test)]
+const BODY_CHECK_TURNS: usize = 8;
 
 /// Connect, authenticate, inspect primary/durability settings, and close.
 /// One bounded worker owns every future; no Tokio runtime or background task.
@@ -267,12 +268,11 @@ pub(crate) fn body_check_worker(
     request: &Request<'_>,
     trust: &TrustStore,
     deadline: Instant,
-    retained: bool,
+    budget: Option<BodyBudget>,
 ) -> Result<Worker, Error> {
-    let (output, input) = if retained {
-        (BODY_CHECK_TURNS * 64 * 1024, Input::body_checks())
-    } else {
-        (64 * 1024, Input::mutations())
+    let (output, input) = match budget {
+        Some(budget) => (budget.output(), Input::body_checks(budget)),
+        None => (64 * 1024, Input::mutations()),
     };
     connect_authenticated(request, trust, deadline, output, input)
 }
@@ -715,6 +715,8 @@ fn progress(result: Result<FlushProgress, crate::ports::Error>) -> Poll<io::Resu
     }
 }
 
+mod body_budget;
+pub(crate) use body_budget::BodyBudget;
 mod framing;
 mod windows;
 use framing::Input;
@@ -817,7 +819,9 @@ mod tests {
             },
             true,
         );
-        io.input = Some(Input::body_checks());
+        io.input = Some(Input::body_checks(
+            BodyBudget::test_turns(BODY_CHECK_TURNS as u64).unwrap(),
+        ));
         io.output_left = BODY_CHECK_TURNS * 64 * 1024;
         let window = io.input.as_ref().unwrap().window().unwrap();
         window.begin().unwrap();

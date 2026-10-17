@@ -5052,46 +5052,54 @@ not a scheduler or maximum-body throughput.
 ## 181. Prepaid Body-transfer validation connection
 
 Starting the bound Body transport consumes BodyPlan into a private retained
-owner. Before connecting, it charges 9 MiB I/O and 32768 records: eight times
-the standalone Body-check allowance, including its margins. One ordinary
-ReadPermit remains held for the validation connection's lifetime, separately
-from the plan's existing final-result permit. The original Body/meter cap can
-only tighten; neither connection establishment nor a successful turn renews it.
+owner. Its admission uses the verified source's actual length L, bounded by
+32 MiB, rather than the caller's maximum. A valid CRLF source expands to at
+most E = L + floor(L/3) bytes under dot transparency. The finite check count
+is 2 * ceil(E/16384) + 1 flush + 8 additional I/O attempts. Each cell
+reserves plaintext acceptance and a separate TLS-record tail drain: the
+16 KiB socket write cap is smaller than a full encrypted record. The extra
+attempts cover further partial or Pending writes/flushes, not retries or
+guaranteed progress.
+Every attempted write or flush consumes a check, including those that make
+no progress. Unused allowance is not returned.
 
-The retained profile admits at most 8 MiB cumulative PostgreSQL input, 512 KiB
-output and 8704 frames. Per-frame and authentication limits are unchanged.
-A separate per-turn window admits at most 1 MiB input, 64 KiB output and
-1088 frames, including authentication in the first window. Available idle
-traffic is drained against the preceding window before the next is granted.
-Only an acknowledged rollback permits another window; at most eight windows
-can be granted, and any protocol failure permanently refuses further grants.
-Parser state and authentication survive window boundaries. The connection
-aggregate counters only decrease, independently of the per-turn windows.
-A separate eight-credit counter bounds attempted checks. Each write or
-flush spends a credit, checks Pending and the original meter/deadline, then
-performs the full section 180 transaction with fresh qualification and live
-fences. No aggregate counter, credit or meter allowance is replenished. The
-ninth check refuses before SQL; no hidden reconnect is available. Partial
-writes and backpressure can consume credits without useful SMTP progress.
+Before connecting, admission prepays that count times 1 MiB plus 128 KiB I/O
+and 4096 records. Checked arithmetic derives the same count's cumulative
+PostgreSQL input (1 MiB each), output (64 KiB each) and frames (1088 each).
+A 32 MiB source admits at most 5471 checks: 6154.875 MiB I/O and 22409216
+records. These are finite work counters, not resident-memory reservations.
+One ordinary ReadPermit covers the retained validator separately from final
+capacity. The original Body/meter cap only tightens; no connection, turn or
+window renews it.
 
-Failure closes SMTP and drops the validator before releasing its connection
-permit. On body completion, the retained owner explicitly drops its checker,
-then releases that permit, then publishes Possible through the original plan.
-It carries the earliest observed limit into publication and final custody.
-This order leaves the second slot available when final capacity already holds
-the first. Ordinary standalone Body/Possible checks retain their profiles.
+Each turn additionally admits at most 1 MiB input, 64 KiB output and 1088
+frames, with authentication included in the first window. Available idle
+traffic drains against the preceding window before the next is granted.
+Only acknowledged rollback permits a later window, and the finite source
+budget bounds grants independently of the dispatch check counter. Parser
+state and authentication survive boundaries. Aggregate counters only
+decrease, and protocol failure permanently refuses further grants.
 
-Native qualification preserves the two-slot pool and original 64 MiB/100000
-record message meters. The 64000-byte composed transfer observes the same idle
-validator backend across multiple checks and completes final publication.
-A competing reservation cannot take the retained slot. A 144000-byte case
-requiring more than eight output cells stops with Capacity, no terminator,
-Body still durable, Pending empty and both local slots returned. One byte or
-record short of the prepaid admission refuses before a validator connection
-opens. Existing standalone checks exercise cumulative protocol exhaustion,
-lock release and changed policy/privileges; the source snapshot separately
-retains its own migration lock while body reading is active. This is bounded
-connection reuse, not maximum-32-MiB throughput or production activation.
+Each write or flush spends a credit, checks Pending and the original
+meter/deadline, then performs the full section 180 transaction with fresh
+qualification and live fences. Exhaustion refuses before SQL or new SMTP
+output; no hidden reconnect, counter replenishment or deadline extension is
+available. Failure closes SMTP and drops the validator before releasing its
+permit. On body completion that order precedes Possible publication, leaving
+the second slot available beside the final reservation. The earliest limit
+carries into Possible and final custody. Standalone Body/Possible profiles
+are unchanged.
+
+Native fixtures preserve the two-slot pool, 64000-byte transfers and the same
+idle validator across checks. A near-worst-case 1000002-byte dot/CRLF source
+exercises 1333336 encoded bytes under the original ten-second job limit, with
+initial database budgets covering all phases and no replenishment. Separate
+144000-byte cases deliberately lack the complete prepaid admission: they
+stop before body output with Capacity, Body durable, Pending empty and slots
+returned. One byte or record short of admission refuses before connecting.
+The source snapshot separately retains its own migration lock while reading.
+This qualifies bounded transfers, not maximum-32-MiB throughput, arbitrary
+backpressure or production activation.
 
 ## 182. Bound immutable source and explicit source admission
 
@@ -5267,7 +5275,7 @@ cases prove foreign-domain publication refusal, policy mismatch and empty
 work before DNS/TCP, ownership expiry before AUTH with no credential output,
 blocked SQL under shorter setup and MAIL-entry wire deadlines, and actual
 AUTH refusal followed by health-before-recovery settlement.
-Setup adds no scheduler or backend activation. The eight-turn Body allowance
+Setup adds no scheduler or backend activation. The source-sized Body allowance
 and ten-second native job cap still require qualification for maximum-sized
 messages and backpressure before the relay runtime can be called usable.
 
@@ -5301,11 +5309,12 @@ work afterward; pure source/codec turns and completed writes leading back
 to encoding proceed immediately. This phase hint is crate-private and
 supplies no authority. The next existing phase advance owns any tighter
 deadline and exact refusal evidence. The driver adds no fresh budgets, renewed deadlines, connection
-pool, thread, scheduler, retry or backend activation. The eight-turn Body
-qualification and maximum-message/backpressure limitations remain unchanged.
+pool, thread, scheduler, retry or backend activation. Source-sized Body
+admission retains the maximum-message/backpressure limitations in section 181.
 
 Native configured fixtures exercise both TLS modes with one wire meter from
-setup through final delivery: 64,000-byte mixed-recipient success, bounded
+setup through final delivery: 64,000-byte mixed-recipient success, a
+1,000,002-byte near-worst-case dot/CRLF source, prepaid
 144,000-byte Body refusal, mixed RCPT interruption preserving the unanswered
 recipient, immutable-reader failure after Possible with no terminator, and
 an unknown final commit retaining actual reply evidence for inspection.
