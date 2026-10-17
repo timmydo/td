@@ -17,7 +17,7 @@ struct Options {
     account: account::Options,
     limits: audit::Limits,
 }
-fn unsigned(value: &str) -> Option<u64> {
+pub(super) fn unsigned(value: &str) -> Option<u64> {
     if value.is_empty() || value.len() > 20 || !value.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }

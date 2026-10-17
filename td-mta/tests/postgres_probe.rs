@@ -11948,3 +11948,6 @@ mod maintenance_commands;
 
 #[path = "postgres_probe/blob_audit_commands.rs"]
 mod blob_audit_commands;
+
+#[path = "postgres_probe/metadata_audit_commands.rs"]
+mod metadata_audit_commands;

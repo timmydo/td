@@ -16,6 +16,7 @@ mod device_list;
 mod device_revoke;
 mod maintenance;
 mod material;
+mod metadata_audit;
 mod selection;
 mod usage;
 
@@ -83,6 +84,9 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<ExitCode> {
     let command = args.next();
     if let Some(operation) = command.as_deref().and_then(maintenance::Operation::parse) {
         return maintenance::run(operation, args);
+    }
+    if command.as_deref() == Some(OsStr::new("metadata-audit")) {
+        return metadata_audit::run(args);
     }
     if command.as_deref() == Some(OsStr::new("blob-audit")) {
         return blob_audit::run(args);

@@ -6028,3 +6028,34 @@ No invocation changes rows or grants device or serving authority.
 The native command fixture checks exact report fields, account isolation,
 missing rows, wrong epochs, corrupt and empty body digests, argument refusal
 and absence of repair or credential output.
+
+## 209. Explicit historical canonical metadata audit command
+
+`postgres metadata-audit --connection-file PATH --epoch HEX --account ID
+--max-rows N --max-parent-reads N` exposes section 202's canonical metadata
+verifier independently of body and usage checks. Every flag is required
+exactly once. Limits use unsigned ASCII decimal with at most twenty digits
+and must fit u64; zero is valid and can cause a bounded scan refusal. Unknown,
+duplicate, missing and malformed arguments refuse before protected-file
+access. Body-limit flags belong to account-audit and are refused here.
+
+One trusted UTC sample supplies lease-reference policy. DNS and verification
+share the original ten-second deadline; explicit logical limits do not renew
+worker wire or time budgets. Only pre-connection transport failures permit
+address fallback. Failure emits fixed categories without SQL or secrets and
+never changes a row or returns a partial success report.
+
+Success JSON schema 1 identifies epoch, account, sequence, history floor,
+canonical row count and mailbox count. `canonical_metadata_verified:true`
+means the shared canonical row/reference/forest/recipient checks passed in
+one historical snapshot. `body_digests_verified:false` and
+`semantic_verified:false` preserve the narrower scope: body bytes, counters,
+mailbox-role uniqueness/registry, credentials, configuration, retained history
+and operation/delivery receipts are not certified. No serving or restore
+authority follows, and separate reports cannot be combined into one snapshot.
+
+The native command fixture checks report fields, account/epoch refusal,
+row/parent bounds, malformed mailbox refusal without repair, strict arguments
+and successful canonical checks despite invalid body digests, inconsistent
+usage counters and duplicate mailbox roles. Those exclusions are deliberate;
+the composed account-audit command supplies the broader checks in section 203.
