@@ -20,6 +20,7 @@ const LABELS: &[&str] = &[
     "Archive",
     "Delete",
     "Move",
+    "Attachments",
     "Links",
     "HTML",
     keys::BUTTON,
@@ -32,6 +33,7 @@ const KEYS: &[Key] = &[
     Key::Char('a'),
     Key::Char('d'),
     Key::Char('m'),
+    Key::Char('A'),
     Key::Char('b'),
     Key::Char('h'),
     Key::Char('?'),
@@ -40,8 +42,8 @@ const URL_LABELS: &[&str] = &["Open", "Cancel"];
 const URL_KEYS: &[Key] = &[Key::Enter, Key::Escape];
 const MOVE_LABELS: &[&str] = &["Move", "Cancel"];
 const MOVE_KEYS: &[Key] = &[Key::Enter, Key::Escape];
-const ATTACHMENT_LABELS: &[&str] = &["Cancel"];
-const ATTACHMENT_KEYS: &[Key] = &[Key::Escape];
+const ATTACHMENT_LABELS: &[&str] = &["Open", "Cancel"];
+const ATTACHMENT_KEYS: &[Key] = &[Key::Enter, Key::Escape];
 
 fn format_size(bytes: u64) -> String {
     if bytes < 1024 {
@@ -147,6 +149,7 @@ pub struct EmailView {
     next_write_op_id: u64,
     pending_write_ops: HashMap<u64, PendingWriteOp>,
     attachment_picking: bool,
+    attachment_cursor: usize,
     show_all_headers: bool,
     raw_headers_cache: HashMap<String, String>,
     raw_headers_loading: bool,
@@ -195,6 +198,7 @@ impl EmailView {
             next_write_op_id: 1,
             pending_write_ops: HashMap::new(),
             attachment_picking: false,
+            attachment_cursor: 0,
             show_all_headers: false,
             raw_headers_cache: HashMap::new(),
             raw_headers_loading: false,
@@ -320,7 +324,7 @@ impl EmailView {
                     let type_str = att.r#type.as_deref().unwrap_or("application/octet-stream");
                     lines.push(format!("  [{}] {} ({}, {})", i + 1, name, type_str, size));
                 }
-                lines.push("  Press A then 1..9 to download or open".to_string());
+                lines.push("  Press A to choose an attachment to download or open".to_string());
             }
         }
 
@@ -647,6 +651,37 @@ impl EmailView {
         if let Some(ref error) = self.error {
             return Body::message(error.clone());
         }
+        if self.attachment_picking {
+            return Body::List {
+                total: self.attachment_count(),
+                selected: self.attachment_cursor,
+                row: Box::new(move |index| {
+                    let Some(att) = self
+                        .email
+                        .as_ref()
+                        .and_then(|email| email.attachments.as_ref())
+                        .and_then(|attachments| attachments.get(index))
+                    else {
+                        return Row::default();
+                    };
+                    Row {
+                        label: format!(
+                            "[{}] {}",
+                            index + 1,
+                            strip_newlines(att.name.as_deref().unwrap_or("unnamed"))
+                        ),
+                        meta: format!(
+                            "{} {}",
+                            strip_newlines(
+                                att.r#type.as_deref().unwrap_or("application/octet-stream")
+                            ),
+                            att.size.map(format_size).unwrap_or_default()
+                        ),
+                        marked: false,
+                    }
+                }),
+            };
+        }
         if self.url_picking {
             return Body::List {
                 total: self.urls.len(),
@@ -697,14 +732,15 @@ impl EmailView {
             )
         } else if self.attachment_picking {
             format!(
-                "Pick attachment [1-{}] or any key to cancel",
+                "Attachment {}/{} | Up/Down:navigate RET:open Esc:cancel",
+                self.attachment_cursor + 1,
                 self.attachment_count()
             )
         } else if self.pending_reply_all.is_some() || self.pending_forward {
             "Loading reply data... | q:back".to_string()
         } else {
             let att_hint = if self.attachment_count() > 0 {
-                " A:attach"
+                " A:attachments"
             } else {
                 ""
             };
@@ -751,15 +787,38 @@ impl View for EmailView {
         }
     }
 
-    fn handle_key(&mut self, key: Key, _page: usize) -> ViewAction {
-        // Attachment picking mode: waiting for digit
+    fn handle_key(&mut self, key: Key, page: usize) -> ViewAction {
         if self.attachment_picking {
-            self.attachment_picking = false;
-            if let Key::Char(c @ '1'..='9') = key {
-                let index = (c as usize) - ('1' as usize);
-                self.download_attachment(index);
-            } else {
-                self.status_message = Some("Cancelled".to_string());
+            let last = self.attachment_count().saturating_sub(1);
+            self.attachment_cursor = self.attachment_cursor.min(last);
+            match key {
+                Key::Escape | Key::Char('q') => self.attachment_picking = false,
+                Key::Char('n') | Key::Char('j') | Key::Down | Key::ScrollDown => {
+                    self.attachment_cursor = self.attachment_cursor.saturating_add(1).min(last);
+                }
+                Key::Char('p') | Key::Char('k') | Key::Up | Key::ScrollUp => {
+                    self.attachment_cursor = self.attachment_cursor.saturating_sub(1);
+                }
+                Key::PageDown | Key::Char(' ') => {
+                    self.attachment_cursor =
+                        self.attachment_cursor.saturating_add(page.max(1)).min(last);
+                }
+                Key::PageUp => {
+                    self.attachment_cursor = self.attachment_cursor.saturating_sub(page.max(1));
+                }
+                Key::Home => self.attachment_cursor = 0,
+                Key::End => self.attachment_cursor = last,
+                Key::Click(index) if index < self.attachment_count() => {
+                    self.attachment_cursor = index;
+                    self.attachment_picking = false;
+                    self.download_attachment(index);
+                }
+                Key::Enter if self.attachment_count() > 0 => {
+                    self.attachment_picking = false;
+                    self.download_attachment(self.attachment_cursor);
+                }
+                Key::Char('?') => return ViewAction::ShowKeys,
+                _ => {}
             }
             return ViewAction::Continue;
         }
@@ -964,11 +1023,10 @@ impl View for EmailView {
                 let count = self.attachment_count();
                 if count == 0 {
                     self.status_message = Some("No attachments".to_string());
-                } else if count == 1 {
-                    self.download_attachment(0);
                 } else {
                     self.attachment_picking = true;
-                    self.status_message = Some(format!("Download attachment [1-{}]:", count));
+                    self.attachment_cursor = 0;
+                    self.status_message = None;
                 }
                 ViewAction::Continue
             }
@@ -1273,6 +1331,144 @@ mod tests {
         let (arrived, text) = shown_text(&view, 60);
         assert_ne!(toggled, arrived, "the raw headers arrived");
         assert!(text.contains("X-Mailer: td-mail"), "{text}");
+    }
+
+    fn attachment_view(count: usize) -> (EmailView, mpsc::Receiver<BackendCommand>) {
+        let (mut view, rx) = loaded_view("plain body");
+        let mut email = make_email("e1", "Attachments", "plain body");
+        email.attachments = Some(
+            (1..=count)
+                .map(|n| crate::jmap::types::BodyPart {
+                    part_id: n.to_string(),
+                    blob_id: Some(format!("blob-{n}")),
+                    name: Some(format!("attachment-{n}.pdf")),
+                    r#type: Some("application/pdf".to_string()),
+                    size: Some(2048),
+                })
+                .collect(),
+        );
+        view.on_response(&BackendResponse::EmailBody {
+            id: "e1".to_string(),
+            result: Box::new(Ok(email)),
+        });
+        (view, rx)
+    }
+
+    #[test]
+    fn attachment_selector_opens_the_twelfth_attachment_with_keyboard_or_pointer() {
+        for pointer in [false, true] {
+            let (mut view, rx) = attachment_view(12);
+            assert!(shown_text(&view, 120).1.contains("Press A to choose"));
+            let scene = view.scene();
+            let action = scene
+                .labels
+                .iter()
+                .position(|label| *label == "Attachments")
+                .unwrap();
+            let key = *scene.keys.get(action).unwrap();
+            drop(scene);
+            view.handle_key(key, 5);
+            {
+                let scene = view.scene();
+                assert_eq!(scene.labels, &["Open", "Cancel"]);
+                let Body::List {
+                    total,
+                    selected,
+                    row,
+                } = scene.body
+                else {
+                    panic!("attachments must be selectable rows");
+                };
+                assert_eq!((total, selected), (12, 0));
+                assert_eq!(row(11).label, "[12] attachment-12.pdf");
+                assert_eq!(row(11).meta, "application/pdf 2.0 KB");
+            }
+            // Digits never dispatch attachment 1 while trying to reach 12.
+            view.handle_key(Key::Char('1'), 5);
+            view.handle_key(Key::Char('2'), 5);
+            assert!(rx.try_recv().is_err());
+            assert!(view.attachment_picking);
+            if pointer {
+                view.handle_key(Key::Click(11), 5);
+            } else {
+                for _ in 0..11 {
+                    view.handle_key(Key::Down, 5);
+                }
+                assert_eq!(view.attachment_cursor, 11);
+                view.handle_key(Key::Enter, 5);
+            }
+            assert!(!view.attachment_picking);
+            assert!(
+                matches!(rx.try_recv().unwrap(), BackendCommand::DownloadAttachment {
+                blob_id, name, content_type,
+            } if blob_id == "blob-12" && name == "attachment-12.pdf" && content_type == "application/pdf")
+            );
+            assert!(rx.try_recv().is_err());
+            assert!(matches!(view.scene().body, Body::Text { .. }));
+        }
+    }
+
+    #[test]
+    fn attachment_selector_navigation_is_bounded_and_cancel_sends_nothing() {
+        let (mut view, rx) = attachment_view(12);
+        view.handle_key(Key::Char('A'), 5);
+        for (key, selected) in [
+            (Key::Up, 0),
+            (Key::PageDown, 5),
+            (Key::PageDown, 10),
+            (Key::PageDown, 11),
+            (Key::ScrollDown, 11),
+            (Key::PageUp, 6),
+            (Key::ScrollUp, 5),
+            (Key::Home, 0),
+            (Key::End, 11),
+            (Key::Char('k'), 10),
+            (Key::Char('j'), 11),
+            (Key::Char('p'), 10),
+            (Key::Char('n'), 11),
+            (Key::Click(12), 11),
+        ] {
+            view.handle_key(key, 5);
+            assert_eq!(view.attachment_cursor, selected, "{key:?}");
+            assert!(view.attachment_picking);
+        }
+        view.handle_key(Key::Escape, 5);
+        assert!(!view.attachment_picking);
+        view.handle_key(Key::Char('A'), 5);
+        assert_eq!(view.attachment_cursor, 0);
+        view.handle_key(Key::Char('q'), 5);
+        assert!(!view.attachment_picking);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn attachment_selector_handles_empty_single_and_missing_blob_messages() {
+        let (mut empty, rx) = attachment_view(0);
+        empty.handle_key(Key::Char('A'), 5);
+        assert!(!empty.attachment_picking);
+        assert_eq!(empty.status_message.as_deref(), Some("No attachments"));
+        assert!(rx.try_recv().is_err());
+
+        let (mut single, rx) = attachment_view(1);
+        single.handle_key(Key::Char('A'), 5);
+        assert!(single.attachment_picking);
+        assert!(rx.try_recv().is_err());
+        single
+            .email
+            .as_mut()
+            .unwrap()
+            .attachments
+            .as_mut()
+            .unwrap()
+            .get_mut(0)
+            .unwrap()
+            .blob_id = None;
+        single.handle_key(Key::Enter, 5);
+        assert_eq!(
+            single.status_message.as_deref(),
+            Some("Attachment has no blob ID")
+        );
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

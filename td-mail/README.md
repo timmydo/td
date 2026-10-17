@@ -18,6 +18,16 @@
 - Supports optional mail rules and retention policies.
 - Provides `--cli` NDJSON mode for integrations and automation.
 
+## Reading attachments
+
+Press A or click Attachments in a message to open its attachment list.
+Each row shows the filename, content type and size. Use Up/Down (or
+j/k or n/p), the mouse wheel, PageUp/PageDown, or Home/End to select any
+attachment, including attachments numbered 10 and above. Enter or Open
+downloads the selected attachment through the existing open/save flow;
+clicking a row does the same. Escape, q or Cancel returns to the message.
+Number keys do not open attachments.
+
 ## Local drafts
 
 Compose, reply and forward retain `.eml` drafts in

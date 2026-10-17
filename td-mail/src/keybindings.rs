@@ -159,7 +159,11 @@ pub const EMAIL_VIEW: Table = Table {
         ("a", "archive", "Archive message"),
         ("d", "delete", "Delete message (move to trash)"),
         ("m", "move", "Move to mailbox (interactive picker)"),
-        ("A", "attachment", "Download or open an attachment"),
+        (
+            "A",
+            "attachment",
+            "Choose an attachment to download or open",
+        ),
         ("b", "browse_urls", "Browse URLs found in message body"),
         (
             "1..9",
