@@ -5675,8 +5675,41 @@ service. An already recorded operation still resolves after a newer selection
 or material expiry, while a changed request using its ID conflicts. Missing
 receipt observations do not authorize a replacement operation.
 
-This adds a bounded recovery representation for administrative clients; it
-does not introduce configuration activation commands or select production
-PostgreSQL serving. The real PostgreSQL fixture reconstructs an uncertain
+This supplies the bounded recovery representation used by section 198’s
+explicit preparation commands. It does not select production PostgreSQL
+serving. The real PostgreSQL fixture reconstructs an uncertain
 operation before settlement, rejects altered custody against its receipt and
 reconstructs historical requests after newer selection and material expiry.
+
+## 198. Explicit selection request preparation and settlement commands
+
+`td-mta postgres config-selection-prepare --connection-file PATH --epoch HEX
+--version HEX --generation N` rereads and validates the immutable source
+version, prepares one random operation and prints section 197's public request
+as 178 hexadecimal characters in JSON. Preparation performs no selection
+write. Retain that request before any publication; the expected generation is
+explicit, with zero meaning the initially unselected database.
+
+`td-mta postgres config-select --connection-file PATH --request HEX` decodes
+and publishes exactly that request. `td-mta postgres config-selection-inspect
+--connection-file PATH --request HEX` resolves its retained receipt under the
+existing policy-row lock. The public request may be supplied as an argument;
+it contains no password, source text or private material. Malformed length,
+non-hex input and duplicate or mixed operation arguments refuse. The protected
+connection file and ordinary bounded DNS/TLS/SCRAM rules still apply.
+
+A recorded result prints the operation, historical generation and version.
+Inspection can return `recorded:false`; that observation is not permission to
+replace the operation. Publication uncertainty reports
+`indeterminate-retain-request` and stops without automatic retry. Resolve or
+explicitly retry the original retained request, never prepare a replacement
+from an absence observation. Historical receipts remain resolvable after a
+newer selection or expired material, while new publication revalidates the
+version and compares the expected generation. An altered request using a
+recorded operation ID conflicts.
+
+These commands operate on the preparation database. They do not activate a
+listener, runtime generation or PostgreSQL production backend. Receipt success
+does not assert that its version is still selected or that current materials
+are usable. The finite 1024-receipt ceiling and lack of pruning remain exact;
+these commands add no receipt-retention or automatic deployment policy.

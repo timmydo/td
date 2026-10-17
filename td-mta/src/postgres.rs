@@ -13,6 +13,7 @@ mod device_create;
 mod device_list;
 mod device_revoke;
 mod material;
+mod selection;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Operation {
@@ -76,6 +77,9 @@ fn arguments(operation: Operation, mut args: impl Iterator<Item = OsString>) -> 
 
 pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<ExitCode> {
     let command = args.next();
+    if let Some(operation) = command.as_deref().and_then(selection::Operation::parse) {
+        return selection::run(operation, args);
+    }
     if let Some(operation) = command.as_deref().and_then(account::Operation::parse) {
         return account::run(operation, args);
     }

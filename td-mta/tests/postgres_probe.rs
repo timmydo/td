@@ -3014,7 +3014,13 @@ per_peer_limit = 1
         Some(runtime::Error::Unselected)
     );
     assert_eq!(empty_domain.available(), 2);
-    let first = selection::prepare(epoch, 0, version, &candidate).unwrap();
+    let first = if matches!(exercise, ConfigurationExercise::Flags) {
+        let change = selection_commands::prepare(&fixture, &connection, epoch, version);
+        selection_commands::absent(&fixture, &connection, change);
+        change
+    } else {
+        selection::prepare(epoch, 0, version, &candidate).unwrap()
+    };
     assert_eq!(
         selection::inspect(&request, &trust, deadline(), first).unwrap(),
         None
@@ -3048,6 +3054,9 @@ per_peer_limit = 1
     drop(input);
     wait_command(&mut blocker);
     let selected = selection::publish(&request, &trust, deadline(), first).unwrap();
+    if matches!(exercise, ConfigurationExercise::Flags) {
+        selection_commands::recorded(&fixture, &connection, first, 1);
+    }
     assert_eq!(selected.generation, 1);
     assert_eq!(selected.version, version);
     assert_eq!(
@@ -3366,22 +3375,34 @@ per_peer_limit = 1
     // A historical receipt is not overwritten by a later selected generation.
     let retained_first = first.encode();
     let first = selection::Change::decode(&retained_first).unwrap();
+    if matches!(exercise, ConfigurationExercise::Flags) {
+        selection_commands::recorded(&fixture, &connection, first, 1);
+    }
     assert_eq!(
         selection::publish(&request, &trust, deadline(), first).unwrap(),
         selected
     );
-    sql(&fixture, "CREATE FUNCTION public.delay_selection_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_catalog.pg_sleep(3); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_selection AFTER INSERT ON td_mta.config_selection_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_selection_commit()");
+    let delay = if matches!(exercise, ConfigurationExercise::Flags) {
+        11
+    } else {
+        3
+    };
+    sql(&fixture, &format!("CREATE FUNCTION public.delay_selection_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_catalog.pg_sleep({delay}); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_selection AFTER INSERT ON td_mta.config_selection_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_selection_commit()"));
     let uncertain = selection::prepare(epoch, 2, version, &candidate).unwrap();
     let retained_uncertain = uncertain.encode();
-    assert_eq!(
-        selection::publish(
-            &request,
-            &trust,
-            Instant::now() + Duration::from_secs(2),
-            uncertain
-        ),
-        Err(selection::Error::Indeterminate)
-    );
+    if matches!(exercise, ConfigurationExercise::Flags) {
+        selection_commands::uncertain(&fixture, &connection, uncertain);
+    } else {
+        assert_eq!(
+            selection::publish(
+                &request,
+                &trust,
+                Instant::now() + Duration::from_secs(2),
+                uncertain
+            ),
+            Err(selection::Error::Indeterminate)
+        );
+    }
     thread::sleep(Duration::from_secs(5));
     sql(
         &fixture,
@@ -3392,6 +3413,9 @@ per_peer_limit = 1
         .unwrap()
         .unwrap();
     assert_eq!(landed.generation, 3);
+    if matches!(exercise, ConfigurationExercise::Flags) {
+        selection_commands::recorded(&fixture, &connection, uncertain, 3);
+    }
     let mut altered = retained_uncertain;
     altered[57] ^= 1;
     let altered = selection::Change::decode(&altered).unwrap();
@@ -3474,6 +3498,9 @@ per_peer_limit = 1
         Err(selection::Error::Configuration(_))
     ));
     let first = selection::Change::decode(&retained_first).unwrap();
+    if matches!(exercise, ConfigurationExercise::Flags) {
+        selection_commands::recorded(&fixture, &connection, first, 1);
+    }
     assert_eq!(
         selection::inspect(&request, &trust, deadline(), first).unwrap(),
         Some(selected)
@@ -11878,3 +11905,6 @@ mod device_creation;
 
 #[path = "postgres_probe/account_admin.rs"]
 mod account_admin;
+
+#[path = "postgres_probe/selection_commands.rs"]
+mod selection_commands;
