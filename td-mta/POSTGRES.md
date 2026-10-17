@@ -5865,3 +5865,30 @@ and empty bodies, aggregate limits and a concurrent-change oracle: while the
 metadata scan is blocked after snapshot capture, another session commits
 body corruption, incorrect usage and a new sequence. The in-flight audit
 sees only its old consistent snapshot; fresh audits refuse the new damage.
+
+## 204. Explicit bounded account audit command
+
+`postgres account-audit --connection-file PATH --epoch HEX --account ID
+--max-rows N --max-parent-reads N --max-blobs N --max-bytes N` invokes section
+203's composed historical audit. Every bound is required, unsigned decimal
+with at most 20 ASCII digits and checked u64 range; zero is allowed. Duplicate,
+unknown, incomplete and malformed options refuse before opening the protected
+connection file. There is no profile, all-accounts, force or repair option.
+The command samples trusted process wall time once for metadata policy and
+shares one DNS/connection/operation deadline across address attempts. Only
+transport refusal permits another address, with no renewed deadline.
+
+Successful schema-1 JSON reports account, epoch, sequence and history floor,
+metadata row count, verified blob/byte totals and the five usage counters.
+`canonical_metadata_verified`, `counters_consistent` and
+`body_digests_verified` are true for that historical snapshot only;
+`semantic_verified:false` preserves all section 203 exclusions. The report
+never approves restore or serving and grants no current authority. This
+PostgreSQL command retains the ordinary ten-second ceiling, independently of
+the old local-store verify command's maintenance timeout.
+
+Fixed error codes distinguish missing accounts, epochs, aggregate body
+limits, metadata checks, usage integrity, body checks and database failures.
+No SQL error text, credentials or body content is printed. The process
+fixture verifies JSON values, absent-account and epoch refusals, decimal and
+aggregate bounds, counter/body corruption and preservation of damaged rows.

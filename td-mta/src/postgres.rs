@@ -8,6 +8,7 @@ use std::{
 use td_mta::{postgres_input::Loaded, postgres_probe, postgres_resolver, postgres_schema};
 
 mod account;
+mod audit;
 mod configuration;
 mod device_create;
 mod device_list;
@@ -78,6 +79,9 @@ fn arguments(operation: Operation, mut args: impl Iterator<Item = OsString>) -> 
 
 pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<ExitCode> {
     let command = args.next();
+    if command.as_deref() == Some(OsStr::new("account-audit")) {
+        return audit::run(args);
+    }
     if command.as_deref() == Some(OsStr::new("usage-inspect")) {
         return usage::run(args);
     }

@@ -11923,3 +11923,6 @@ mod metadata_audit;
 
 #[path = "postgres_probe/account_audit.rs"]
 mod account_audit;
+
+#[path = "postgres_probe/account_audit_commands.rs"]
+mod account_audit_commands;
