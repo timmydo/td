@@ -203,7 +203,11 @@ fn command(
         .args(["-smp", "2", "-m", "4096"])
         .args(["-no-reboot", "-no-user-config", "-monitor", "none"])
         .args(["-vga", "none", "-device", "virtio-vga"])
-        .args(["-device", "virtio-tablet-pci", "-nic", "none"])
+        .args(["-device", "virtio-tablet-pci"])
+        // The same outbound-only SLIRP NIC as qemu-boot-net: DHCP and DNS
+        // from QEMU, no inbound forward. qemu-boot-live proves offline install.
+        .args(["-netdev", QEMU_USER_NETDEV])
+        .args(["-device", QEMU_USER_NET_DEVICE])
         .arg("-serial")
         .arg(serial)
         .arg("-drive")
@@ -282,7 +286,7 @@ mod tests {
                 .iter()
                 .any(|arg| arg.contains("id=destination") && !arg.contains("readonly=on")));
             assert!(!args.iter().any(|arg| arg == "-kernel" || arg == "-initrd"));
-            assert!(args.windows(2).any(|pair| pair == ["-nic", "none"]));
+            assert_user_network(&args);
             assert_eq!(args.iter().filter(|arg| arg.contains(HELD_ISO)).count(), 1);
         }
         let installed = command(qemu, code, vars, disk, serial, &["tcg"], None);
@@ -292,6 +296,7 @@ mod tests {
             .collect();
         assert!(!args.iter().any(|arg| arg.contains("/proc/self/fd/0")));
         assert!(args.windows(2).any(|pair| pair == ["-boot", "order=c"]));
+        assert_user_network(&args);
 
         let fallback = command(qemu, code, vars, disk, serial, &["kvm", "tcg"], None);
         let args: Vec<_> = fallback
@@ -304,5 +309,18 @@ mod tests {
             .filter_map(|pair| pair.get(1).cloned())
             .collect();
         assert_eq!(accelerators, ["kvm,kernel-irqchip=split", "tcg"]);
+    }
+
+    fn assert_user_network(args: &[String]) {
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["-netdev", QEMU_USER_NETDEV]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["-device", QEMU_USER_NET_DEVICE]));
+        assert_eq!(args.iter().filter(|arg| *arg == "-netdev").count(), 1);
+        assert!(!args
+            .iter()
+            .any(|arg| arg == "-nic" || arg == "-net" || arg.contains("hostfwd")));
     }
 }

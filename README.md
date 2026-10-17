@@ -270,7 +270,9 @@ To boot a retained ISO interactively with a disposable destination disk:
 
 The first command attaches the ISO as optical media; `--usb` tests the same
 image as USB mass storage. QEMU opens the ISO read-only and creates a private
-16 GiB sparse destination. After the first VM exits, type `boot` to start the
+16 GiB sparse destination. Both VMs get an outbound-only QEMU user-mode
+network with DHCP; its gateway, 10.0.2.2, reaches services on this host's
+loopback. After the first VM exits, type `boot` to start the
 destination alone with fresh UEFI variables, or press Enter to stop. Inspect both
 sessions manually; QEMU exit status alone does not prove installation worked.
 The disk is removed when the command exits normally. Scratch files default to

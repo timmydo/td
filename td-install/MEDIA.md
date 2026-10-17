@@ -166,8 +166,14 @@ and host QEMU with a graphical host display. Optical attachment is the default;
 a regular file and
 passes that held read-only descriptor through QEMU's standard input, which
 QEMU opens as `/proc/self/fd/0`. Path replacement after admission cannot
-redirect it to another file. The media is read-only, networking is disabled and
-the sole writable destination is a fresh private 16 GiB sparse raw file.
+redirect it to another file. The media is read-only and the sole writable
+destination is a fresh private 16 GiB sparse raw file. Both boots attach
+`qemu-boot-net`'s user-mode NIC: virtio-net with QEMU's DHCP and DNS
+forwarder and no inbound forward, so the guest reaches the host's network
+as an outbound client, and its gateway address reaches services on the
+host's loopback. Host QEMU must therefore include user-mode (slirp)
+networking. The installer still downloads nothing; `qemu-boot-live`,
+which attaches no NIC, is the offline-installation evidence.
 The runner tries KVM on x86-64 when `/dev/kvm` opens read-write, then falls
 back to software emulation if KVM initialization fails. `TD_QEMU_ACCEL=tcg`
 forces emulation; `TD_QEMU_ACCEL=kvm` requires usable KVM. Firmware variables
