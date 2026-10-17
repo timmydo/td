@@ -5446,3 +5446,19 @@ and deadline exhaustion can refuse before logical limits; success requires
 all shared passes, acknowledged rollback and the final deadline check. The
 report covers canonical field/reference, mailbox-chain and recipient-coverage
 checks only, with the exclusions in POSTGRES section 202.
+
+## PostgreSQL composed account audit
+
+The combined account audit shares one existing body-worker connection across
+metadata, counter aggregation and body enumeration. Its 128-MiB input,
+8192-frame, 512-KiB output and original ten-second deadline limits do not
+reset between components or blobs. Metadata memory is as specified above;
+after that pass releases its buffers, one manifest and one eight-chunk body
+batch are retained at a time. Caller aggregate count/byte bounds are checked
+before each body's verification; each body still has the 32-MiB maximum.
+Counters, captured identity and historical totals are constant-size state.
+
+The explicit limits can be larger than the finite worker can finish. Such an
+account refuses without a partial report. Every pass, body digest, aggregate
+comparison, acknowledged rollback and final deadline check must complete;
+there is no continuation or maintenance-time extension in this increment.

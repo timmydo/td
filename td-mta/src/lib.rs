@@ -124,6 +124,7 @@ pub mod operator_files;
 pub mod outbound_dial;
 pub mod ownership;
 pub mod ports;
+pub mod postgres_account_audit;
 pub mod postgres_accounts;
 pub mod postgres_attempt_phases;
 pub mod postgres_attempt_recovery;

@@ -11920,3 +11920,6 @@ mod blob_audit;
 
 #[path = "postgres_probe/metadata_audit.rs"]
 mod metadata_audit;
+
+#[path = "postgres_probe/account_audit.rs"]
+mod account_audit;

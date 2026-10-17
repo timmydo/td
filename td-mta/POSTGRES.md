@@ -5833,3 +5833,35 @@ Failures close the connection and perform no repair. Native PostgreSQL
 coverage exercises every table, compound cursor order, malformed rows,
 mailbox cycles, recipient coverage, SMTP receipt framing, caller bounds,
 account isolation and the explicit body/counter exclusions.
+
+## 203. One-snapshot canonical account audit
+
+`postgres_account_audit::inspect` composes section 202's shared canonical
+metadata sweep, section 199's five usage-counter comparisons and section
+201's body verifier for every live blob manifest. They use the same primary
+REPEATABLE READ, READ ONLY transaction, expected epoch and shared migration
+lock. No independent audit reports are joined. A private metadata helper
+begins and retains that transaction; only the outer audit acknowledges
+ROLLBACK and checks the final original deadline after dropping its worker.
+
+The caller supplies trusted UTC, metadata row/parent limits and aggregate
+body count/byte limits. Body enumeration is account-scoped, ascending blob
+ID keyset pagination with one manifest at a time. It includes manifests with
+no Email, lease or submission owner and checks zero-length body digests.
+Every manifest passes the existing extent, changed-sequence and actual chunk
+count checks before the shared streaming verifier checks all bytes. Captured
+identity must match on every body. Aggregate limits are checked before each
+body is read. Verified body totals must agree with both metadata blob count
+and the audited usage totals before a report can succeed.
+
+The report contains historical canonical metadata, counters and verified
+body totals only. All section 202 exclusions remain: mailbox-role policy,
+configuration, credentials, retained operation/delivery receipts and change
+history are not certified. This is not a complete PostgreSQL semantic audit,
+restore approval, delivery permission or service admission. Failure returns
+no partial report and performs no repair; all original connection budgets
+remain in force. Native coverage checks each component's refusal, unowned
+and empty bodies, aggregate limits and a concurrent-change oracle: while the
+metadata scan is blocked after snapshot capture, another session commits
+body corruption, incorrect usage and a new sequence. The in-flight audit
+sees only its old consistent snapshot; fresh audits refuse the new damage.
