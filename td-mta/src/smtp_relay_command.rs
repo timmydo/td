@@ -37,7 +37,7 @@ pub struct Exchange<'a, B: TlsWireStorage> {
     deadline: Deadline,
     meter: &'a mut Meter,
     phase: Phase,
-    read_progress: bool,
+    transport_progress: bool,
     input: &'a mut [u8],
     command: &'a [u8],
     reply: NormalizedReplyReader<'a>,
@@ -157,7 +157,7 @@ impl<'a, B: TlsWireStorage> Exchange<'a, B> {
                 deadline,
                 meter,
                 phase: Phase::Write(0),
-                read_progress: false,
+                transport_progress: false,
                 input,
                 command,
                 reply,
@@ -167,12 +167,12 @@ impl<'a, B: TlsWireStorage> Exchange<'a, B> {
     pub(crate) fn writes_pending(&self) -> bool {
         matches!(self.phase, Phase::Write(_) | Phase::Flush)
     }
-    pub(crate) fn read_progress(&self) -> bool {
-        self.read_progress
+    pub(crate) fn transport_progress(&self) -> bool {
+        self.transport_progress
     }
     /// At most one TLS operation and 512 received bytes parsed per turn.
     pub fn advance(mut self) -> Result<Progress<'a, B>, Refusal<'a, B>> {
-        self.read_progress = false;
+        self.transport_progress = false;
         let mut complete = false;
         let result = (|| {
             let now = check(self.clock.as_ref(), self.deadline, self.meter)?;
@@ -226,6 +226,7 @@ impl<'a, B: TlsWireStorage> Exchange<'a, B> {
                         } else {
                             Phase::Write(next)
                         };
+                        self.transport_progress = true;
                     }
                     _ => return Err(Error::Invalid),
                 }
@@ -234,6 +235,7 @@ impl<'a, B: TlsWireStorage> Exchange<'a, B> {
             Phase::Flush => {
                 if self.session.connection_mut().flush()? == FlushProgress::Complete {
                     self.phase = Phase::Read;
+                    self.transport_progress = true;
                 }
                 Ok(false)
             }
@@ -259,7 +261,7 @@ impl<'a, B: TlsWireStorage> Exchange<'a, B> {
                         if progress.complete {
                             self.reply.finish()?;
                         }
-                        self.read_progress = true;
+                        self.transport_progress = true;
                         Ok(progress.complete)
                     }
                     IoProgress::Closed => Err(Error::Tls),

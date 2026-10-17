@@ -5317,13 +5317,14 @@ This bounded driver does not qualify maximum-body throughput or arbitrary
 backpressure. Source-sized Body admission still refuses on finite credit,
 work or original deadline exhaustion.
 
-MAIL/RCPT/DATA command owners carry one private per-turn read-progress
-boolean. A validated positive-length reply read allows immediate bounded
-continuation; the next advance resets it, so idle reads still wait. Parsing
-retains its 512-byte/one-TLS-operation turn and original meter/deadline
-checks. Write/flush waits and fresh database authority checks are unchanged.
-This pacing change alone does not qualify full-recipient throughput; the
-configured retained-envelope fixture below covers the combined path.
+MAIL/RCPT/DATA command owners carry one private per-turn transport-progress
+boolean. Validated positive-length command writes or reply reads, and
+completed flushes, allow immediate bounded continuation. Each advance resets
+the hint, so Pending operations still wait. Parsing retains its 512-byte/
+one-TLS-operation turn and original meter/deadline checks. Fresh database
+authority checks before writes/flushes and their finite prepaid turn counts
+are unchanged. The configured retained-envelope fixture below covers the
+combined path; final DATA terminator pacing remains unchanged.
 
 
 Standalone passive EnvelopeChecks::open uses the existing fixed

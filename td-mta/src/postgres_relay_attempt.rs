@@ -109,7 +109,7 @@ pub fn drive<'w, 'a, 'r, B: TlsWireStorage>(
     let accepted = loop {
         match exchange.advance() {
             Ok(mail::Progress::Pending(next)) => {
-                if !next.read_progress() {
+                if !next.transport_progress() {
                     wait(limit);
                 }
                 exchange = next;
@@ -151,7 +151,7 @@ pub fn drive<'w, 'a, 'r, B: TlsWireStorage>(
         loop {
             match exchange.advance() {
                 Ok(rcpt::Progress::Pending(next)) => {
-                    if !next.read_progress() {
+                    if !next.transport_progress() {
                         wait(limit);
                     }
                     exchange = next;
@@ -194,7 +194,7 @@ pub fn drive<'w, 'a, 'r, B: TlsWireStorage>(
     let ready = loop {
         match exchange.advance() {
             Ok(data::Progress::Pending(next)) => {
-                if !next.read_progress() {
+                if !next.transport_progress() {
                     wait(limit);
                 }
                 exchange = next;

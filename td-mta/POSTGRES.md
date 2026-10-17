@@ -5326,10 +5326,11 @@ They assert exact durable recipient outcomes, empty Pending after settlement,
 and returned ordinary/source pool capacity. These cases qualify the bounded
 driver, not maximum-sized messages or arbitrary peer backpressure.
 
-Successful partial MAIL/RCPT/DATA reply reads immediately continue through
-the existing bounded advance operation. A private per-turn progress hint
-resets before each advance and is set only for validated positive-length
-reads. Idle reads, writes and flushes retain their existing polling waits.
+Successful MAIL/RCPT/DATA command writes, completed flushes and partial
+reply reads immediately continue through the existing bounded advance
+operation. A private per-turn progress hint resets before each advance and
+is set only for validated positive-length writes or reads, or a completed
+flush. Pending writes, flushes and reads retain their existing polling waits.
 Every advance keeps its before/after deadline checks, per-turn work charge,
 one TLS operation and at most 512 parsed bytes. Fresh authority checks
 before every attempted command write/flush remain unchanged. The hint grants
@@ -5419,3 +5420,19 @@ publication evidence is still retained. The configured full-attempt fixture
 also exercises the 100-recipient boundary and maximal normalized RCPT text
 under the original cap. SQLite remains active; this adds no production relay
 scheduler or backend cutover.
+
+## 189. Productive command output pacing
+
+The configured driver also skips its fixed polling delay after a command
+write reports validated progress or a flush completes. The next bounded
+advance still performs its fresh database authority check before any further
+write or flush. Partial writes consume the existing finite validation-turn
+allowance; no-progress attempts still wait. Every turn retains the original
+meter and before/after deadline checks, with no additional transport call.
+At 100 recipients this removes the fixed waits after the 204 ordinary
+MAIL/RCPT/DATA write and flush turns. It does not extend the ten-second cap
+or change final DATA terminator custody or pacing.
+
+The paired TLS test drives successful command output, an idle reply turn,
+a productive partial reply and another idle turn, proving that the hint
+resets rather than carrying output or read progress into an idle operation.

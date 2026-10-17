@@ -167,8 +167,8 @@ impl<'w, 'a, 'r, B: TlsWireStorage> Cursor<'w, 'a, 'r, B> {
     }
 }
 impl<'m, 'w, 'a, 'r, B: TlsWireStorage> Exchange<'m, 'w, 'a, 'r, B> {
-    pub(crate) fn read_progress(&self) -> bool {
-        self.command.read_progress()
+    pub(crate) fn transport_progress(&self) -> bool {
+        self.command.transport_progress()
     }
     pub fn advance(mut self) -> Result<Progress<'m, 'w, 'a, 'r, B>, Refusal<'w, 'a, 'r, B>> {
         if Instant::now() >= self.limit {

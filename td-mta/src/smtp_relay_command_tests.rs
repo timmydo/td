@@ -490,7 +490,7 @@ fn complete_reply_survives_post_read_expiry_without_session() {
 }
 
 #[test]
-fn productive_partial_reply_then_idle_turn_resets_pacing_hint() {
+fn productive_output_and_partial_reply_reset_pacing_hint_on_idle() {
     let _serial = serial();
     let material = Material::new();
     let (session, mut peer) = relay_auth_tests::authenticated(&material);
@@ -506,7 +506,26 @@ fn productive_partial_reply_then_idle_turn_resets_pacing_hint() {
     )
     .ok()
     .unwrap();
-    assert!(!owner.read_progress());
+    assert!(!owner.transport_progress());
+    let mut output_turns = 0;
+    for _ in 0..100_000 {
+        if !owner.writes_pending() {
+            break;
+        }
+        owner = match owner.advance() {
+            Ok(Progress::Pending(next)) => next,
+            _ => panic!("command output must retain reply custody"),
+        };
+        output_turns += usize::from(owner.transport_progress());
+        std::thread::yield_now();
+    }
+    assert!(!owner.writes_pending());
+    assert!(output_turns >= 2);
+    owner = match owner.advance() {
+        Ok(Progress::Pending(next)) => next,
+        _ => panic!("absent reply must remain pending"),
+    };
+    assert!(!owner.transport_progress());
     let command = b"RCPT TO:<test@example.test>\r\n";
     let partial = b"250-first\r\n";
     let mut received = Vec::new();
@@ -532,7 +551,7 @@ fn productive_partial_reply_then_idle_turn_resets_pacing_hint() {
             Ok(Progress::Pending(next)) => next,
             _ => panic!("incomplete reply must retain command custody"),
         };
-        if owner.read_progress() {
+        if owner.transport_progress() {
             assert_eq!(sent, partial.len());
             productive = true;
             break;
@@ -544,7 +563,7 @@ fn productive_partial_reply_then_idle_turn_resets_pacing_hint() {
         Ok(Progress::Pending(next)) => next,
         _ => panic!("idle partial reply must remain pending"),
     };
-    assert!(!owner.read_progress());
+    assert!(!owner.transport_progress());
     let reply = drive(owner, &mut peer, b"", b"250 done\r\n", 512, false)
         .ok()
         .unwrap();
