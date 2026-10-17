@@ -4787,8 +4787,10 @@ BODY=8BITMIME only when the session retained the negotiated capability. It
 borrows the caller's original wire and database meters through the exchange.
 
 Every write and flush turn first rechecks the exact untouched Prepared envelope
-through the original owner. Its local cap may only shorten. Database locks and
-connections do not span transport calls. Each turn uses the existing bounded
+through the original owner. Its local cap may only shorten. Database locks
+never span transport calls. Direct low-level plans close each observation
+connection; configured attempts retain the admitted validator in section 188.
+Each turn uses the existing bounded
 command parser and wire budget; before/after transport checks remain in force.
 The pause/takeover and already-buffered-byte boundary in section 4 is unchanged.
 
@@ -5255,7 +5257,9 @@ deadline first tightens retained Prepared custody before database admission;
 MAIL entry likewise tightens it before its native check. Fresh native
 authority checks run before resolution, after resolution before dialing,
 before AUTH and before entering MAIL. No database connection or lock survives
-an authority check into network work. A fence is an observation, not a claim
+an authority check into DNS, dialing, TLS or AUTH work. After the final MAIL
+entry observation, section 188 admits the retained envelope validator; its
+transactions and locks still end before every SMTP transport call. A fence is an observation, not a claim
 that remote SMTP output and database revocation are atomic.
 
 Successful setup returns opaque ConnectedPrepared. Its session and MailPlan
@@ -5330,8 +5334,8 @@ Every advance keeps its before/after deadline checks, per-turn work charge,
 one TLS operation and at most 512 parsed bytes. Fresh authority checks
 before every attempted command write/flush remain unchanged. The hint grants
 no transport or publication authority and cannot carry progress into an
-idle turn. Full-recipient throughput under the original job cap remains
-unqualified; removing reply-read waits alone does not establish it.
+idle turn. Removing reply-read waits alone does not establish full-recipient
+throughput; section 188 qualifies the combined retained-validation path.
 
 
 ## 187. Retained untouched-envelope observations
@@ -5353,15 +5357,65 @@ accepted as transport authority. No transaction, migration lock or row lock
 spans returned control. Authentication persists, but authority does not.
 
 The original deadline only shrinks. Input bytes, protocol frames and output
-bytes are cumulative over the connection: 1 MiB, 1088 frames and 64 KiB,
-respectively. No successful turn renews them. Validation, protocol, rollback
+bytes in standalone EnvelopeChecks::open are cumulative over the connection:
+1 MiB, 1088 frames and 64 KiB, respectively. No successful turn renews them.
+The configured bound profile in section 188 prepays finite per-turn windows
+within a separate aggregate ceiling. Validation, protocol, rollback
 or expiry failure closes permanently, including after later database repair.
-The caller owns work admission and connection capacity. This foundation does
-not retain a connection in SMTP plans, add a scheduler, activate PostgreSQL,
-or qualify full-recipient throughput.
+The caller owns work admission and connection capacity. This passive API
+neither supplies SMTP authority nor adds a scheduler or activates PostgreSQL.
 
 Native tests exercise 100 selected Prepared recipients, backend reuse, idle
 ROLLBACK state, independently obtainable conflicting locks, selected-policy,
 role, privilege, recipient-phase and owner-generation fences, fresh address
 observations, cumulative exhaustion, original expiry, and backend termination
 after the last live clock observation but before acknowledged rollback.
+
+
+## 188. Prepaid configured envelope validation
+
+ConnectedPrepared::begin_mail first tightens its deadline and performs the
+existing fresh standalone observation. It then prepays one finite envelope
+validation profile and reserves one ordinary ReadPermit before entering MAIL.
+The thread-bound validator follows successful MAIL, ordered RCPT and DATA
+custody. Direct low-level plans retain their standalone observation behavior;
+all configured attempts use this retained path. Authentication persists, but
+every attempted command write or flush still runs the complete fresh checks
+from section 187, compares every admitted envelope field and acknowledges
+ROLLBACK before transport. No transaction or database lock spans SMTP I/O.
+
+For N selected recipients, admission covers 2*(N+2)+8 checks: write and flush
+for MAIL, each RCPT and DATA, plus eight additional partial/Pending attempts.
+N is checked against the existing 1..=100 attempt bound. Each check has at most
+1 MiB protocol input, 64 KiB output and 1088 frames. The first includes
+connection authentication; available idle traffic consumes the previous
+window before the next one starts. Only acknowledged successful rollback
+closes a window. Aggregate counters and the finite turn count never refill.
+These are the same checked budget and protocol-window implementation used by
+Body validation, with independently derived envelope and source profiles.
+
+Prepayment charges each check 1 MiB+128 KiB I/O and 4096 records. At 100
+recipients this is 212 turns, 238.5 MiB I/O and 868352 records; the protocol
+ceilings are 212 MiB input, 13.25 MiB output and 230656 frames. These are
+cumulative work bounds, not retained allocations. Each attempted check still
+checks Pending and both original and current meter deadlines, consumes one
+credit and only tightens the local cap. Failure permanently closes the
+retained validation state; it cannot reconnect or fall back to standalone
+checks. No deadline or meter is renewed.
+
+The worker is destroyed before its ordinary permit is released. Closure
+precedes negative command publication, actual 354 publication, Body/source
+admission and every passive failure/evidence handoff. Successful positive
+RCPT custody alone may carry the validator into DATA. Partial RCPT results,
+421, explicit close, planning failures and failed DATA custody retain evidence
+without retaining the validation connection or permit. Existing final-result
+and source reservations remain independent.
+
+Native fixtures exercise repeated backend identity and idle ROLLBACK after
+MAIL and RCPT, independent conflicting migration/row locks, exact one-byte
+and one-record-short prepayment refusal before MAIL output, and DATA outcomes
+while another ordinary slot is held. Both slots must be reusable while failed
+publication evidence is still retained. The configured full-attempt fixture
+also exercises the 100-recipient boundary and maximal normalized RCPT text
+under the original cap. SQLite remains active; this adds no production relay
+scheduler or backend cutover.

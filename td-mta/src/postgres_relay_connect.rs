@@ -141,6 +141,7 @@ impl<'w, 'a, 'r, B: TlsWireStorage> ConnectedPrepared<'w, 'a, 'r, B> {
         if let Err(error) = plan
             .restrict_deadline(wire.deadline())
             .and_then(|()| plan.check_current(database))
+            .and_then(|_| plan.reserve_checks(database))
         {
             return Err(MailRefusal {
                 failure: mail::Refusal {

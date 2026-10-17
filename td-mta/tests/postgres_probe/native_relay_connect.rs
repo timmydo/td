@@ -12,7 +12,7 @@ use std::{
 };
 use td_crypto::{SystemEntropy, TrustStore};
 use td_mta::{
-    admission::work::Meter,
+    admission::work::{Charge, Meter},
     clock::RuntimeClock,
     generations::GenerationSet,
     ids::{BootId, StoreEpoch, SubmissionId},
@@ -399,6 +399,16 @@ pub(super) fn exercise(
             &setup.policies,
             &setup,
         );
+        super::native_data_exchange::exercise(
+            fixture,
+            request,
+            trust,
+            &claim,
+            grant.generation,
+            source,
+            &setup.policies,
+            Some(&setup),
+        );
         super::native_relay_attempt::exercise(
             fixture,
             request,
@@ -440,7 +450,7 @@ fn failures(
     source: SubmissionId,
     setup: &Setup,
 ) {
-    for n in [167, 168, 170, 171, 172, 169] {
+    for n in [167, 168, 170, 171, 172, 189, 190, 169] {
         let submission = SubmissionId::from_bytes([n; 16]);
         let sub = format!("decode('{submission}','hex')");
         let src = format!("decode('{source}','hex')");
@@ -549,6 +559,65 @@ fn failures(
             ));
             drop(peer.into_buffers().unwrap());
             failure
+        } else if matches!(n, 189 | 190) {
+            let attempt = prepared.attempt();
+            let (connected, mut peer) =
+                setup.connect(prepared, clock.clone(), cap, &mut database, false, None);
+            let connected = connected.ok().unwrap();
+            let final_observation = 2 * 1024 * 1024 + 192 * 1024;
+            let validation_io = 14 * (1024 * 1024 + 128 * 1024);
+            let mut short = Meter::new(
+                cap,
+                Charge {
+                    io_bytes: final_observation + validation_io - u64::from(n == 189),
+                    records: 4096 + 14 * 4096 - u64::from(n == 190),
+                    ..Default::default()
+                },
+            );
+            let (mut input, mut line, mut reply, mut command) =
+                ([0; 512], [0; 512], [0; 4096], [0; 512]);
+            let mut work = wire::meter(cap);
+            let failure = connected
+                .begin_mail(
+                    td_mta::smtp_data_encode::Body::SevenBit,
+                    td_mta::smtp_relay_command::Scratch {
+                        input: &mut input,
+                        line: &mut line,
+                        reply: &mut reply,
+                        command: &mut command,
+                    },
+                    &mut work,
+                    &mut short,
+                )
+                .err()
+                .unwrap();
+            assert_eq!(
+                failure.failure.error,
+                td_mta::postgres_relay_mail::Error::Publication(dispatch::Error::Admission(
+                    ports::Error::Capacity
+                ))
+            );
+            assert!(failure.failure.retained.is_none());
+            assert!(!matches!(
+                peer.read(&mut [0; 512]),
+                Ok(IoProgress::Bytes(_))
+            ));
+            drop(peer.into_buffers().unwrap());
+            let first = worker
+                .reserve_final(attempt, cap, &mut wire::meter(cap))
+                .unwrap();
+            let second = worker
+                .reserve_final(attempt, cap, &mut wire::meter(cap))
+                .unwrap();
+            drop((first, second));
+            connect::Refusal {
+                stage: connect::Stage::Admission,
+                error: connect::Error::Publication(dispatch::Error::Admission(
+                    ports::Error::Capacity,
+                )),
+                closed: connect::Closed::Interrupted(failure.closed),
+                buffers: failure.failure.buffers,
+            }
         } else if n == 169 || n == 170 {
             if n == 170 {
                 sql(

@@ -7,7 +7,7 @@ use crate::{
     postgres_attempt_phases::{self as phases, Change},
     postgres_attempt_recovery as recovery,
     postgres_attempts::{self as attempts, Dispatch},
-    postgres_probe::{BodyBudget, Mode, Request},
+    postgres_probe::{Mode, Request, ValidationBudget},
     postgres_read::{ReadPermit, ReadSlots},
     postgres_route_health as health,
     postgres_route_owners::Claim,
@@ -580,6 +580,7 @@ impl<'w, 'a, 'r> PreparedResult<'w, 'a, 'r> {
         Ok(EnvelopePlan {
             prepared: self,
             envelope,
+            validation: EnvelopeValidationState::Standalone,
         })
     }
     /// After actual 354, consume this exact Prepared identity into new Body
@@ -675,6 +676,23 @@ impl<'w, 'a, 'r> PreparedResult<'w, 'a, 'r> {
 pub struct EnvelopePlan<'w, 'a, 'r> {
     prepared: PreparedResult<'w, 'a, 'r>,
     envelope: attempts::Envelope,
+    validation: EnvelopeValidationState<'w>,
+}
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Inline validation custody avoids another per-attempt allocation."
+)]
+enum EnvelopeValidationState<'w> {
+    Standalone,
+    Retained(EnvelopeValidation<'w>),
+    Closed,
+}
+const _: () = assert!(std::mem::size_of::<EnvelopeValidationState<'static>>() <= 1024);
+// Field order closes the backend before returning its ordinary slot.
+struct EnvelopeValidation<'w> {
+    checks: attempts::EnvelopeChecks,
+    _permit: ReadPermit<'w>,
+    remaining: usize,
 }
 impl<'w, 'a, 'r> EnvelopePlan<'w, 'a, 'r> {
     /// Reserve ordered reply storage for this exact admitted attempt batch.
@@ -747,19 +765,110 @@ impl<'w, 'a, 'r> EnvelopePlan<'w, 'a, 'r> {
     }
     /// Applies only while the complete batch remains untouched Prepared.
     pub fn check_current(&mut self, meter: &mut Meter) -> Result<Instant, Error> {
-        let (current, limit) = self.prepared.observe_envelope(meter)?;
+        let result = self.check_envelope(meter);
+        if result.is_err() && !matches!(self.validation, EnvelopeValidationState::Standalone) {
+            self.close_checks();
+        }
+        result
+    }
+    fn check_envelope(&mut self, meter: &mut Meter) -> Result<Instant, Error> {
+        let (current, limit) = match &mut self.validation {
+            EnvelopeValidationState::Standalone => self.prepared.observe_envelope(meter)?,
+            EnvelopeValidationState::Closed => return Err(ports::Error::Forbidden.into()),
+            EnvelopeValidationState::Retained(validation) => {
+                let worker = self.prepared.worker;
+                let pending = worker
+                    .pending
+                    .operation
+                    .try_lock()
+                    .map_err(|_| ports::Error::Busy)?;
+                if pending.is_some() {
+                    return Err(ports::Error::Busy.into());
+                }
+                if Instant::now() >= self.prepared.limit {
+                    return Err(ports::Error::Deadline.into());
+                }
+                validation.remaining = validation
+                    .remaining
+                    .checked_sub(1)
+                    .ok_or(ports::Error::Capacity)?;
+                self.prepared.limit = self.prepared.limit.min(worker.connection.admit_work(
+                    self.prepared.until,
+                    meter,
+                    0,
+                    0,
+                )?);
+                validation
+                    .checks
+                    .check_until(self.prepared.limit)
+                    .map_err(Error::Publication)?
+            }
+        };
         if current != self.envelope {
             return Err(Error::Publication(attempts::Error::Integrity));
         }
         self.prepared.limit = self.prepared.limit.min(limit);
+        if Instant::now() >= self.prepared.limit {
+            return Err(ports::Error::Deadline.into());
+        }
         Ok(self.prepared.limit)
+    }
+    fn reserve_checks(&mut self, meter: &mut Meter) -> Result<(), Error> {
+        if !matches!(self.validation, EnvelopeValidationState::Standalone) {
+            return Err(ports::Error::Forbidden.into());
+        }
+        let budget = ValidationBudget::for_envelope(self.envelope.recipients.len())?;
+        let worker = self.prepared.worker;
+        let pending = worker
+            .pending
+            .operation
+            .try_lock()
+            .map_err(|_| ports::Error::Busy)?;
+        if pending.is_some() {
+            return Err(ports::Error::Busy.into());
+        }
+        if Instant::now() >= self.prepared.limit {
+            return Err(ports::Error::Deadline.into());
+        }
+        let limit = self.prepared.limit.min(worker.connection.admit_work(
+            self.prepared.until,
+            meter,
+            budget.io_charge(),
+            budget.record_charge(),
+        )?);
+        let permit = worker
+            .connection
+            .slots
+            .acquire()
+            .map_err(|_| ports::Error::Busy)?;
+        let checks = attempts::EnvelopeChecks::transfer(
+            worker.connection.request,
+            worker.connection.trust,
+            limit,
+            &self.prepared.published.dispatch,
+            worker.connection.clock.clone(),
+            worker.guard.clone(),
+            budget,
+        )
+        .map_err(Error::Publication)?;
+        self.prepared.limit = limit;
+        self.validation = EnvelopeValidationState::Retained(EnvelopeValidation {
+            checks,
+            _permit: permit,
+            remaining: budget.turns(),
+        });
+        Ok(())
+    }
+    fn close_checks(&mut self) {
+        self.validation = EnvelopeValidationState::Closed;
     }
     /// The caller still owns actual 354, matching session and accepted replies.
     pub fn publish_body(
-        self,
+        mut self,
         accepted: &[(u32, &str)],
         meter: &mut Meter,
     ) -> Result<(BodyResult<'w, 'a, 'r>, Dispatch), Error> {
+        self.close_checks();
         self.prepared.publish_body(accepted, meter)
     }
 }
@@ -771,6 +880,9 @@ pub struct MailPlan<'w, 'a, 'r> {
     reply: phases::CommandReply,
 }
 impl<'w, 'a, 'r> MailPlan<'w, 'a, 'r> {
+    pub(crate) fn reserve_checks(&mut self, meter: &mut Meter) -> Result<(), Error> {
+        self.envelope.reserve_checks(meter)
+    }
     pub(crate) fn restrict_deadline(
         &mut self,
         until: td_mime::time::Deadline,
@@ -779,9 +891,10 @@ impl<'w, 'a, 'r> MailPlan<'w, 'a, 'r> {
     }
 
     pub(crate) fn into_failed(
-        self,
+        mut self,
         failure: crate::postgres_route_health::Failure,
     ) -> FailedPrepared<'w, 'a, 'r> {
+        self.envelope.close_checks();
         self.envelope.prepared.into_failed(failure)
     }
 
@@ -820,10 +933,11 @@ impl<'w, 'a, 'r> MailPlan<'w, 'a, 'r> {
     /// Retain the genuine refusal before attempting database admission. Failure
     /// keeps that exact reply even when the original deadline has elapsed.
     pub fn record_refusal(
-        self,
+        mut self,
         reply: &str,
         meter: &mut Meter,
     ) -> Result<phases::Outcome, CommandFailure<'w, 'a, 'r>> {
+        self.envelope.close_checks();
         let value = self.reply.finish(reply).map_err(|error| CommandFailure {
             error: Error::Phase(error),
             retained: None,
@@ -900,7 +1014,8 @@ impl<'w, 'a, 'r> RcptDataPlan<'w, 'a, 'r> {
     pub(crate) fn work_limit(&self) -> Instant {
         self.data.envelope.prepared.limit
     }
-    pub(crate) fn fenced(self, error: Error) -> RcptBodyFailure<'w, 'a, 'r> {
+    pub(crate) fn fenced(mut self, error: Error) -> RcptBodyFailure<'w, 'a, 'r> {
+        self.data.envelope.close_checks();
         RcptBodyFailure {
             error,
             retained: self,
@@ -914,6 +1029,7 @@ impl<'w, 'a, 'r> RcptDataPlan<'w, 'a, 'r> {
         reply: &str,
         meter: &mut Meter,
     ) -> Result<(BodyResult<'w, 'a, 'r>, Dispatch), RcptBodyFailure<'w, 'a, 'r>> {
+        self.data.envelope.close_checks();
         let result = self.try_body(reply, meter);
         match result {
             Ok((outcome, limit)) if Instant::now() < limit => {
@@ -1124,6 +1240,10 @@ impl<'w, 'a, 'r> RcptFailure<'w, 'a, 'r> {
     }
 }
 impl<'w, 'a, 'r> RcptResult<'w, 'a, 'r> {
+    pub(crate) fn fenced(mut self) -> Self {
+        self.envelope.close_checks();
+        self
+    }
     pub fn attempt(&self) -> AttemptId {
         self.envelope.attempt()
     }
@@ -1149,13 +1269,14 @@ impl<'w, 'a, 'r> RcptResult<'w, 'a, 'r> {
             }),
             Err(error) => Err(RcptFailure {
                 error,
-                retained: self,
+                retained: self.fenced(),
             }),
         }
     }
     /// Consume only after closing/fencing the matching SMTP session. These
     /// passive requests preserve evidence but never renew transport deadlines.
-    pub fn into_interruption(self) -> Result<RcptInterruption, RcptFailure<'w, 'a, 'r>> {
+    pub fn into_interruption(mut self) -> Result<RcptInterruption, RcptFailure<'w, 'a, 'r>> {
+        self.envelope.close_checks();
         let recovery = (|| {
             if self.evidence.is_complete() && self.evidence.accepted().is_empty() {
                 Ok(None)
@@ -1177,7 +1298,7 @@ impl<'w, 'a, 'r> RcptResult<'w, 'a, 'r> {
             }),
             Err(error) => Err(RcptFailure {
                 error,
-                retained: self,
+                retained: self.fenced(),
             }),
         }
     }
@@ -1215,10 +1336,11 @@ impl<'w, 'a, 'r> DataPlan<'w, 'a, 'r> {
     /// Only actual normalized 354 may consume the retained subset into Body.
     /// No replacement recipient list, reply evidence or deadline is accepted.
     pub fn publish_body(
-        self,
+        mut self,
         reply: &str,
         meter: &mut Meter,
     ) -> Result<(BodyResult<'w, 'a, 'r>, Dispatch), Error> {
+        self.envelope.close_checks();
         if !valid_data_reply(reply) {
             return Err(ports::Error::Invalid.into());
         }
@@ -1238,7 +1360,8 @@ impl<'w, 'a, 'r> DataPlan<'w, 'a, 'r> {
             })?
             .publish(meter)
     }
-    fn retain_refusal(self, reply: &str) -> Result<RetainedCommand<'w, 'a, 'r>, Error> {
+    fn retain_refusal(mut self, reply: &str) -> Result<RetainedCommand<'w, 'a, 'r>, Error> {
+        self.envelope.close_checks();
         let value = self.reply.finish(reply).map_err(Error::Phase)?;
         let prepared = self.envelope.prepared;
         Ok(RetainedCommand {
@@ -1435,7 +1558,7 @@ impl<'w, 'a, 'r> BodyPlan<'w, 'a, 'r> {
         meter: &mut Meter,
         length: u64,
     ) -> Result<BodyTransferPlan<'w, 'a, 'r>, Error> {
-        let budget = BodyBudget::for_source(length)?;
+        let budget = ValidationBudget::for_source(length)?;
         let worker = self.body.worker;
         let pending = worker
             .pending

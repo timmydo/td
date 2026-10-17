@@ -50,7 +50,7 @@ impl Input {
         }
     }
 
-    pub(super) fn body_checks(budget: super::BodyBudget) -> Self {
+    pub(super) fn validation_checks(budget: super::ValidationBudget) -> Self {
         let single = Self::mutations();
         Self {
             window: Some(Windows::new(budget.turns())),
@@ -256,7 +256,7 @@ mod tests {
     }
 
     #[test]
-    fn body_budget_is_finite_and_preserves_frame_and_authentication_limits() {
+    fn validation_budget_is_finite_and_preserves_frame_and_authentication_limits() {
         let mut input = Input::body();
         for _ in 0..8192 {
             assert!(input.accept(&frame(b'N', b"\0")).is_ok());
@@ -316,31 +316,33 @@ mod tests {
 
     #[test]
     fn retained_body_checks_bound_a_hostile_first_turn_and_never_replenish() {
-        let mut input = Input::body_checks(super::super::BodyBudget::test_turns(8).unwrap());
+        let mut input =
+            Input::validation_checks(super::super::ValidationBudget::test_turns(8).unwrap());
         for _ in 0..1088 {
             assert!(input.accept(&frame(b'N', b"\0")).is_ok());
         }
         assert!(input.accept(&frame(b'N', b"\0")).is_err());
         assert!(input.accept(&authenticated()).is_err());
         let packet = frame(b'D', &[0; 128 * 1024 - 4]);
-        let mut input = Input::body_checks(super::super::BodyBudget::test_turns(8).unwrap());
+        let mut input =
+            Input::validation_checks(super::super::ValidationBudget::test_turns(8).unwrap());
         for _ in 0..7 {
             assert!(input.accept(&packet).is_ok());
         }
         assert!(input.accept(&packet).is_err());
         assert!(input.accept(&[]).is_err());
         assert!(
-            Input::body_checks(super::super::BodyBudget::test_turns(8).unwrap())
+            Input::validation_checks(super::super::ValidationBudget::test_turns(8).unwrap())
                 .accept(&frame(b'Z', b"I"))
                 .is_err()
         );
         assert!(
-            Input::body_checks(super::super::BodyBudget::test_turns(8).unwrap())
+            Input::validation_checks(super::super::ValidationBudget::test_turns(8).unwrap())
                 .accept(&frame(b'R', &0u32.to_be_bytes()))
                 .is_err()
         );
         assert!(
-            Input::body_checks(super::super::BodyBudget::test_turns(8).unwrap())
+            Input::validation_checks(super::super::ValidationBudget::test_turns(8).unwrap())
                 .accept(&frame(b'D', &[0; 128 * 1024]))
                 .is_err()
         );
@@ -348,7 +350,8 @@ mod tests {
 
     #[test]
     fn retained_windows_preserve_authentication_and_monotonic_totals() {
-        let mut input = Input::body_checks(super::super::BodyBudget::test_turns(8).unwrap());
+        let mut input =
+            Input::validation_checks(super::super::ValidationBudget::test_turns(8).unwrap());
         let window = input.window().unwrap();
         input.accept(&authenticated()).unwrap();
         for turn in 0..super::super::BODY_CHECK_TURNS {
@@ -372,7 +375,8 @@ mod tests {
     fn retained_windows_keep_fragmented_parser_state_and_terminal_failures() {
         let bytes = frame(b'N', b"fragmented");
         for split in 1..bytes.len() {
-            let mut input = Input::body_checks(super::super::BodyBudget::test_turns(8).unwrap());
+            let mut input =
+                Input::validation_checks(super::super::ValidationBudget::test_turns(8).unwrap());
             let window = input.window().unwrap();
             input.accept(&authenticated()).unwrap();
             window.begin().unwrap();

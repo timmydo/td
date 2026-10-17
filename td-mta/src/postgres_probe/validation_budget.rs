@@ -1,10 +1,14 @@
-//! Source-sized, finite retained Body validation admission.
-use crate::{limits::MAX_MESSAGE_BYTES, ports::Error, smtp_relay_body::OUTPUT_BYTES};
+//! Finite retained validation admission for an envelope or source body.
+use crate::{
+    limits::{MAX_MESSAGE_BYTES, OUTBOUND_RECIPIENT_BATCH},
+    ports::Error,
+    smtp_relay_body::OUTPUT_BYTES,
+};
 
 // Additional attempts cover partial writes or Pending writes/flushes, not retries.
 const EXTRA_IO_TURNS: u64 = 8;
 #[derive(Clone, Copy)]
-pub(crate) struct BodyBudget {
+pub(crate) struct ValidationBudget {
     turns: usize,
     input: usize,
     output: usize,
@@ -12,7 +16,14 @@ pub(crate) struct BodyBudget {
     io: u64,
     records: u64,
 }
-impl BodyBudget {
+impl ValidationBudget {
+    pub(crate) fn for_envelope(recipients: usize) -> Result<Self, Error> {
+        if !(1..=OUTBOUND_RECIPIENT_BATCH).contains(&recipients) {
+            return Err(Error::Capacity);
+        }
+        let commands = u64::try_from(recipients).map_err(|_| Error::Capacity)? + 2;
+        Self::from_turns(2 * commands + EXTRA_IO_TURNS)
+    }
     pub(crate) fn for_source(length: u64) -> Result<Self, Error> {
         if length > MAX_MESSAGE_BYTES as u64 {
             return Err(Error::Capacity);
@@ -73,6 +84,20 @@ impl BodyBudget {
 mod tests {
     use super::*;
     #[test]
+    fn envelope_admission_covers_commands_and_finite_backpressure() {
+        assert_eq!(ValidationBudget::for_envelope(1).unwrap().turns(), 14);
+        let max = ValidationBudget::for_envelope(100).unwrap();
+        assert_eq!(max.turns(), 212);
+        assert_eq!(max.input(), 222_298_112);
+        assert_eq!(max.output(), 13_893_632);
+        assert_eq!(max.frames(), 230_656);
+        assert_eq!(max.io_charge(), 250_085_376);
+        assert_eq!(max.record_charge(), 868_352);
+        for invalid in [0, 101, usize::MAX] {
+            assert!(ValidationBudget::for_envelope(invalid).is_err());
+        }
+    }
+    #[test]
     fn source_admission_accounts_for_worst_transparency_and_finite_backpressure() {
         for (length, cells) in [
             (0, 0),
@@ -85,19 +110,19 @@ mod tests {
             (33_554_432, 2731),
         ] {
             assert_eq!(
-                BodyBudget::for_source(length).unwrap().turns(),
+                ValidationBudget::for_source(length).unwrap().turns(),
                 2 * cells + 1 + 8
             );
         }
-        let max = BodyBudget::for_source(MAX_MESSAGE_BYTES as u64).unwrap();
+        let max = ValidationBudget::for_source(MAX_MESSAGE_BYTES as u64).unwrap();
         assert_eq!(max.turns(), 5471);
         assert_eq!(max.input(), 5_736_759_296);
         assert_eq!(max.output(), 358_547_456);
         assert_eq!(max.frames(), 5_952_448);
         assert_eq!(max.io_charge(), 6_453_854_208);
         assert_eq!(max.record_charge(), 22_409_216);
-        assert!(BodyBudget::for_source(MAX_MESSAGE_BYTES as u64 + 1).is_err());
-        assert!(BodyBudget::for_source(u64::MAX).is_err());
-        assert!(BodyBudget::from_turns(u64::MAX).is_err());
+        assert!(ValidationBudget::for_source(MAX_MESSAGE_BYTES as u64 + 1).is_err());
+        assert!(ValidationBudget::for_source(u64::MAX).is_err());
+        assert!(ValidationBudget::from_turns(u64::MAX).is_err());
     }
 }

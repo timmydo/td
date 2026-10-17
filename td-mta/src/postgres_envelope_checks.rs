@@ -2,7 +2,7 @@
 use super::{check_locked, Dispatch, Envelope, Error, Observation};
 use crate::{
     ports::Clock,
-    postgres_probe::{self, Mode, Request},
+    postgres_probe::{self, Mode, Request, ValidationBudget},
     postgres_route_owners as owners,
     queue_clock::Guard,
 };
@@ -36,7 +36,29 @@ impl EnvelopeChecks {
         clock: Arc<dyn Clock>,
         guard: Arc<Mutex<Guard>>,
     ) -> Result<Self, Error> {
-        let worker = postgres_probe::validation_worker(request, trust, deadline, None)
+        Self::open_profile(request, trust, deadline, value, clock, guard, None)
+    }
+    pub(crate) fn transfer(
+        request: &Request<'_>,
+        trust: &TrustStore,
+        deadline: Instant,
+        value: &Dispatch,
+        clock: Arc<dyn Clock>,
+        guard: Arc<Mutex<Guard>>,
+        budget: ValidationBudget,
+    ) -> Result<Self, Error> {
+        Self::open_profile(request, trust, deadline, value, clock, guard, Some(budget))
+    }
+    fn open_profile(
+        request: &Request<'_>,
+        trust: &TrustStore,
+        deadline: Instant,
+        value: &Dispatch,
+        clock: Arc<dyn Clock>,
+        guard: Arc<Mutex<Guard>>,
+        budget: Option<ValidationBudget>,
+    ) -> Result<Self, Error> {
+        let worker = postgres_probe::validation_worker(request, trust, deadline, budget)
             .map_err(Error::Connection)?;
         Ok(Self {
             worker: Some(worker),
@@ -47,6 +69,10 @@ impl EnvelopeChecks {
             failed: None,
             _thread: PhantomData,
         })
+    }
+    pub(crate) fn check_until(&mut self, limit: Instant) -> Result<(Envelope, Instant), Error> {
+        self.limit = self.limit.min(limit);
+        self.check()
     }
     pub fn check(&mut self) -> Result<(Envelope, Instant), Error> {
         if let Some(error) = self.failed {
@@ -64,6 +90,7 @@ impl EnvelopeChecks {
         worker
             .constrain_deadline(self.limit)
             .map_err(Error::Connection)?;
+        worker.begin_validation_turn().map_err(Error::Connection)?;
         let value = self.value.clone();
         let observation = self.observation.clone();
         let mode = self.mode;
@@ -104,6 +131,7 @@ impl EnvelopeChecks {
         if Instant::now() >= limit {
             return Err(Error::NotDue);
         }
+        worker.finish_validation_turn().map_err(Error::Connection)?;
         self.limit = self.limit.min(limit);
         Ok((envelope, self.limit))
     }

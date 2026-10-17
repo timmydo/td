@@ -2,7 +2,7 @@
 use super::{capacity, number, receipt, valid_reply, Change, Error, Fields, Observation};
 use crate::{
     ports::Clock,
-    postgres_probe::{self, BodyBudget, Mode, Request},
+    postgres_probe::{self, Mode, Request, ValidationBudget},
     postgres_route_owners as owners,
     queue_clock::Guard,
 };
@@ -79,7 +79,7 @@ impl BodyChecks {
         value: &Change,
         clock: Arc<dyn Clock>,
         guard: Arc<Mutex<Guard>>,
-        budget: BodyBudget,
+        budget: ValidationBudget,
     ) -> Result<Self, Error> {
         Self::open_profile(request, trust, deadline, value, clock, guard, Some(budget))
     }
@@ -90,7 +90,7 @@ impl BodyChecks {
         value: &Change,
         clock: Arc<dyn Clock>,
         guard: Arc<Mutex<Guard>>,
-        budget: Option<BodyBudget>,
+        budget: Option<ValidationBudget>,
     ) -> Result<Self, Error> {
         if value.inner.phase != 2 {
             return Err(Error::Integrity);
@@ -127,7 +127,7 @@ impl BodyChecks {
         worker
             .constrain_deadline(self.limit)
             .map_err(Error::Connection)?;
-        worker.begin_body_turn().map_err(Error::Connection)?;
+        worker.begin_validation_turn().map_err(Error::Connection)?;
         let value = self.value.inner.clone();
         let observation = Observation {
             clock: self.observation.clock.clone(),
@@ -171,7 +171,7 @@ impl BodyChecks {
         if Instant::now() >= limit {
             return Err(Error::ExpiryHold);
         }
-        worker.finish_body_turn().map_err(Error::Connection)?;
+        worker.finish_validation_turn().map_err(Error::Connection)?;
         self.limit = self.limit.min(limit);
         Ok(self.limit)
     }

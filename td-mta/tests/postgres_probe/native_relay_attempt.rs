@@ -29,7 +29,7 @@ pub(super) fn exercise(
     source: SubmissionId,
     setup: &Setup,
 ) {
-    for n in [173u8, 174, 175, 176, 177, 178] {
+    for n in [173u8, 174, 175, 176, 177, 178, 179] {
         let submission = SubmissionId::from_bytes([n; 16]);
         let sub = format!("decode('{submission}','hex')");
         let src = format!("decode('{source}','hex')");
@@ -38,7 +38,11 @@ pub(super) fn exercise(
             178 => 333334,
             _ => 64,
         };
-        let count = if n == 175 { 3 } else { 2 };
+        let count = match n {
+            175 => 3,
+            179 => 100,
+            _ => 2,
+        };
         let last = count - 1;
         let (body, body_sql) = if n == 178 {
             (
@@ -108,10 +112,16 @@ pub(super) fn exercise(
         let mut database = Meter::new(
             cap,
             Charge {
-                io_bytes: if n == 178 { 256 } else { 128 } * 1024 * 1024,
+                io_bytes: match n {
+                    178 => 256,
+                    179 => 1024,
+                    _ => 128,
+                } * 1024
+                    * 1024,
                 records: match n {
                     174 => 131072,
                     178 => 1048576,
+                    179 => 2097152,
                     _ => 262144,
                 },
                 ..Default::default()
@@ -170,20 +180,33 @@ pub(super) fn exercise(
                     format!("MAIL FROM:<{reverse}>\r\n").as_bytes(),
                     b"250 sender\r\n",
                 );
-                script(
-                    &mut peer,
-                    &clock,
-                    cap,
-                    b"RCPT TO:<0@example.test>\r\n",
-                    b"250 recipient\r\n",
-                );
-                script(
-                    &mut peer,
-                    &clock,
-                    cap,
-                    b"RCPT TO:<1@example.test>\r\n",
-                    b"550 refused\r\n",
-                );
+                if n == 179 {
+                    for ordinal in 0..count {
+                        let (reply, _) = maximum_reply(ordinal);
+                        script(
+                            &mut peer,
+                            &clock,
+                            cap,
+                            format!("RCPT TO:<{ordinal}@example.test>\r\n").as_bytes(),
+                            reply.as_bytes(),
+                        );
+                    }
+                } else {
+                    script(
+                        &mut peer,
+                        &clock,
+                        cap,
+                        b"RCPT TO:<0@example.test>\r\n",
+                        b"250 recipient\r\n",
+                    );
+                    script(
+                        &mut peer,
+                        &clock,
+                        cap,
+                        b"RCPT TO:<1@example.test>\r\n",
+                        b"550 refused\r\n",
+                    );
+                }
                 if n == 175 {
                     script(&mut peer, &clock, cap, b"RCPT TO:<2@example.test>\r\n", b"");
                     while peer.close().unwrap() == FlushProgress::Pending {
@@ -203,7 +226,7 @@ pub(super) fn exercise(
                         Ok(IoProgress::Pending) => {}
                     }
                     if received.ends_with(b"\r\n.\r\n") {
-                        assert!(matches!(n, 173 | 177 | 178));
+                        assert!(matches!(n, 173 | 177 | 178 | 179));
                         if n == 177 {
                             let answer_at =
                                 clock.deadline_instant(cap).unwrap() - Duration::from_millis(1500);
@@ -235,9 +258,23 @@ pub(super) fn exercise(
                 &source_slots,
                 td_mta::postgres_body::MAX_BODY_BYTES,
             );
+            if let Err(stopped) = &result {
+                let error = match &stopped.evidence {
+                    attempt_driver::Evidence::Mail(value) => format!("MAIL {:?}", value.error),
+                    attempt_driver::Evidence::Rcpt { error, .. } => format!("RCPT {error:?}"),
+                    attempt_driver::Evidence::Data(value) => format!("DATA {:?}", value.error),
+                    attempt_driver::Evidence::Body(value) => format!("Body {:?}", value.error),
+                    attempt_driver::Evidence::Source(value) => format!("source {:?}", value.error),
+                    attempt_driver::Evidence::Final(value) => format!("final {:?}", value.error),
+                };
+                eprintln!(
+                    "native attempt {n} stopped after {:?}: {error}",
+                    started.elapsed()
+                );
+            }
             (result, server.join().unwrap())
         });
-        if matches!(n, 173 | 178) {
+        if matches!(n, 173 | 178 | 179) {
             let done = result.unwrap_or_else(|stopped| {
                 let error = match stopped.evidence {
                     attempt_driver::Evidence::Mail(value) => format!("MAIL {:?}", value.error),
@@ -255,7 +292,7 @@ pub(super) fn exercise(
             });
             assert_eq!(done.stage, attempt_driver::Stage::Final);
             assert_eq!(done.outcome.attempt, attempt);
-            assert_eq!(done.outcome.recipients, 1);
+            assert_eq!(done.outcome.recipients, if n == 179 { 100 } else { 1 });
             drop(done.buffers.unwrap());
             let expected = if n == 178 {
                 "..\r\n".repeat(lines)
@@ -263,9 +300,9 @@ pub(super) fn exercise(
                 format!("..{}\r\n", "x".repeat(997)).repeat(lines)
             } + ".\r\n";
             assert_eq!(transferred, expected.as_bytes());
-            if n == 178 {
+            if matches!(n, 178 | 179) {
                 assert!(started.elapsed() < Duration::from_secs(10));
-                eprintln!("native source-sized relay: {length} source bytes, {} encoded bytes, {:?} elapsed", expected.len() - 3, started.elapsed());
+                eprintln!("native bounded relay: {count} recipients, {length} source bytes, {} encoded bytes, {:?} elapsed", expected.len() - 3, started.elapsed());
             }
         } else if n == 177 {
             let stopped = result.err().unwrap();
@@ -370,18 +407,36 @@ pub(super) fn exercise(
             assert_eq!(sql(fixture, &format!("SELECT rcpt_reply IS NULL FROM td_mta.recipients WHERE submission_id={sub} AND ordinal=2")), "t");
         }
         assert!(pending.attempt().unwrap().is_none());
-        if matches!(n, 173 | 177 | 178) {
+        if matches!(n, 173 | 177 | 178 | 179) {
             assert_eq!(sql(fixture, &format!("SELECT state,phase,data_reply FROM td_mta.recipients WHERE submission_id={sub} AND ordinal=0")), "4|4|250 queued");
         }
-        assert_eq!(
-            sql(
-                fixture,
-                &format!(
+        if n == 179 {
+            assert_eq!(sql(fixture, &format!("SELECT count(*) FROM td_mta.recipients WHERE submission_id={sub} AND state=4 AND phase=4 AND data_reply='250 queued' AND octet_length(rcpt_reply)=4096")), "100");
+            let expected = (0..count)
+                .map(|ordinal| {
+                    let (_, reply) = maximum_reply(ordinal);
+                    let mut hash = Provider.sha256().unwrap();
+                    hash.update(reply.as_bytes()).unwrap();
+                    hash.finish()
+                        .unwrap()
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            assert_eq!(sql(fixture, &format!("SELECT string_agg(encode(sha256(convert_to(rcpt_reply,'UTF8')),'hex'),',' ORDER BY ordinal)='{expected}' FROM td_mta.recipients WHERE submission_id={sub}")), "t");
+        } else {
+            assert_eq!(
+                sql(
+                    fixture,
+                    &format!(
                     "SELECT state FROM td_mta.recipients WHERE submission_id={sub} AND ordinal=1"
                 )
-            ),
-            "5"
-        );
+                ),
+                "5"
+            );
+        }
         for pool in [&slots, &source_slots] {
             let checked = dispatch::Dispatches {
                 connection: dispatch::Connection {
@@ -404,7 +459,9 @@ pub(super) fn exercise(
         }
 
         assert_eq!(sql(fixture,&format!("SELECT count(*) FROM td_mta.submission_attempts WHERE attempt_id=decode('{attempt}','hex') AND active")),"0");
-        assert_eq!(sql(fixture,&format!("SELECT rcpt_reply FROM td_mta.recipients WHERE submission_id={sub} AND ordinal=1")),"550 refused");
+        if n != 179 {
+            assert_eq!(sql(fixture,&format!("SELECT rcpt_reply FROM td_mta.recipients WHERE submission_id={sub} AND ordinal=1")),"550 refused");
+        }
         drop(peer.into_buffers().unwrap());
         sql(fixture,&format!("DELETE FROM td_mta.recipients WHERE submission_id={sub}; DELETE FROM td_mta.submissions WHERE id={sub}; DELETE FROM td_mta.blobs WHERE id={sub}; DELETE FROM td_mta.blob_ids WHERE id={sub}"));
     }
@@ -439,4 +496,29 @@ fn script(
         }
         thread::sleep(Duration::from_millis(1));
     }
+}
+
+fn maximum_reply(ordinal: u32) -> (String, String) {
+    let mut bodies = vec![format!("A{ordinal:03}{}", "x".repeat(502))];
+    for byte in b'B'..=b'H' {
+        bodies.push(format!("{}{}", char::from(byte), "x".repeat(505)));
+    }
+    bodies.push(format!("I{}", "x".repeat(35)));
+    let expected = format!("250 {}", bodies.join(" "));
+    assert_eq!(expected.len(), 4096);
+    let mut wire = String::new();
+    for (index, body) in bodies.iter().enumerate() {
+        let separator = if index + 1 == bodies.len() { ' ' } else { '-' };
+        let line = format!("250{separator}{body}\r\n");
+        assert!(line.len() <= 512);
+        wire.push_str(&line);
+    }
+    assert_eq!(wire.len(), 4138);
+    let (mut line, mut cell) = ([0; 512], [0; 4096]);
+    let mut parser = td_mta::smtp_wire::NormalizedReplyReader::new(&mut line, &mut cell).unwrap();
+    let result = parser.feed(wire.as_bytes()).unwrap();
+    assert!(result.complete);
+    assert_eq!(result.consumed, wire.len());
+    assert_eq!(parser.value(), Some(expected.as_str()));
+    (wire, expected)
 }

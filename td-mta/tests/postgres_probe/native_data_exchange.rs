@@ -14,6 +14,7 @@ use td_mta::{
     queue_clock::Guard,
     smtp_relay_command::Scratch,
 };
+#[allow(clippy::too_many_arguments)]
 pub(super) fn exercise(
     fixture: &Fixture,
     request: &Request<'_>,
@@ -22,9 +23,14 @@ pub(super) fn exercise(
     generation: u64,
     source: SubmissionId,
     policies: &wire::Policies,
+    setup: Option<&super::native_relay_connect::Setup>,
 ) {
     for n in 134..=142 {
-        let submission = SubmissionId::from_bytes([n; 16]);
+        if setup.is_some() && n == 139 {
+            continue;
+        }
+        let id = if setup.is_some() { n + 46 } else { n };
+        let submission = SubmissionId::from_bytes([id; 16]);
         let sub = format!("decode('{submission}','hex')");
         let src = format!("decode('{source}','hex')");
         sql(fixture,&format!("INSERT INTO td_mta.submissions SELECT account,{sub},email_id,thread_id,identity_id,transmitted_blob_id,reverse_path,send_at,expires_at,1,NULL,0,NULL,changed FROM td_mta.submissions WHERE id={src}; INSERT INTO td_mta.submission_routes SELECT account,{sub},submitting_profile,route_name,destination FROM td_mta.submission_routes WHERE submission_id={src}; INSERT INTO td_mta.recipients SELECT account,{sub},0,'0@example.test',1,0,NULL,0,NULL,0,send_at,NULL,NULL,0,'',changed FROM td_mta.submissions WHERE id={sub}"));
@@ -64,7 +70,18 @@ pub(super) fn exercise(
             pending: &pending,
         };
         let cap = wire::until(&clock);
-        let mut database = wire::meter(cap);
+        let mut database = if setup.is_some() {
+            td_mta::admission::work::Meter::new(
+                cap,
+                td_mta::admission::work::Charge {
+                    io_bytes: 128 * 1024 * 1024,
+                    records: 262144,
+                    ..Default::default()
+                },
+            )
+        } else {
+            wire::meter(cap)
+        };
         let published = worker
             .publish_prepared(
                 claim,
@@ -77,14 +94,34 @@ pub(super) fn exercise(
                 &mut database,
             )
             .unwrap();
-        let published = published
-            .admit_envelope(&mut database)
-            .unwrap()
-            .reserve_mail()
-            .unwrap();
         let attempt = published.attempt();
-        let (session, mut peer) = wire::authenticated(fixture, clock.clone(), cap, policies);
-        let accepted = wire::accepted_mail(published, session, &mut peer, cap, &mut database);
+        let (accepted, mut peer) = if let Some(setup) = setup {
+            let sender = sql(
+                fixture,
+                &format!("SELECT reverse_path FROM td_mta.submissions WHERE id={sub}"),
+            );
+            let (connected, mut peer) =
+                setup.connect(published, clock.clone(), cap, &mut database, false, None);
+            let accepted = wire::accepted_configured(
+                connected.ok().unwrap(),
+                &sender,
+                fixture,
+                &mut peer,
+                cap,
+                &mut database,
+            );
+            (accepted, peer)
+        } else {
+            let published = published
+                .admit_envelope(&mut database)
+                .unwrap()
+                .reserve_mail()
+                .unwrap();
+            let (session, mut peer) = wire::authenticated(fixture, clock.clone(), cap, policies);
+            let accepted = wire::accepted_mail(published, session, &mut peer, cap, &mut database);
+            (accepted, peer)
+        };
+        let backend = setup.map(|_| super::body_checks::backend(fixture));
         let (first, _) = wire::rcpt_command(
             wire::RcptStart::Mail(accepted),
             &mut peer,
@@ -109,6 +146,20 @@ pub(super) fn exercise(
             wire::RcptStep::Ready(done) => done,
             _ => panic!("mixed RCPT did not complete"),
         };
+        if let Some(pid) = &backend {
+            assert_eq!(super::body_checks::backend(fixture), *pid);
+            assert_eq!(
+                sql(
+                    fixture,
+                    &format!(
+                        "SELECT state||'|'||query FROM pg_catalog.pg_stat_activity WHERE pid={pid}"
+                    )
+                ),
+                "idle|ROLLBACK"
+            );
+            assert!(sql(fixture, &format!("BEGIN; SELECT pg_catalog.pg_try_advisory_xact_lock({}); SELECT id FROM td_mta.accounts FOR UPDATE NOWAIT; SELECT singleton FROM td_mta.config_selection FOR UPDATE NOWAIT; SELECT account FROM td_mta.route_owners FOR UPDATE NOWAIT; ROLLBACK", td_mta::postgres_schema::MIGRATION_KEY)).lines().any(|line| line == "t"));
+        }
+        let other_slot = setup.map(|_| worker.reserve_final(attempt, cap, &mut database).unwrap());
         let trigger = match n {
             136 => Some("attempt_rcpt_receipts"),
             137 => Some("attempt_phase_receipts"),
@@ -189,6 +240,17 @@ pub(super) fn exercise(
             assert_eq!(sent, response.len());
         }
         drop(held);
+        drop(other_slot);
+        if let Some(pid) = &backend {
+            super::body_checks::closed(fixture, pid);
+            let first = worker
+                .reserve_final(attempt, cap, &mut wire::meter(cap))
+                .unwrap();
+            let second = worker
+                .reserve_final(attempt, cap, &mut wire::meter(cap))
+                .unwrap();
+            drop((first, second));
+        }
         if let Some(table) = trigger {
             sql(
                 fixture,

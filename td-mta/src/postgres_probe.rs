@@ -268,10 +268,10 @@ pub(crate) fn validation_worker(
     request: &Request<'_>,
     trust: &TrustStore,
     deadline: Instant,
-    budget: Option<BodyBudget>,
+    budget: Option<ValidationBudget>,
 ) -> Result<Worker, Error> {
     let (output, input) = match budget {
-        Some(budget) => (budget.output(), Input::body_checks(budget)),
+        Some(budget) => (budget.output(), Input::validation_checks(budget)),
         None => (64 * 1024, Input::mutations()),
     };
     connect_authenticated(request, trust, deadline, output, input)
@@ -361,7 +361,7 @@ fn connect_authenticated(
     } else {
         input
     };
-    let body_window = input.window();
+    let validation_window = input.window();
     let connector = Connector {
         session,
         clock,
@@ -389,7 +389,7 @@ fn connect_authenticated(
         waker,
         failed: None,
         activity,
-        body_window,
+        validation_window,
     })
 }
 
@@ -400,17 +400,17 @@ pub(crate) struct Worker {
     waker: Waker,
     failed: Option<Error>,
     activity: Arc<AtomicBool>,
-    body_window: Option<windows::Windows>,
+    validation_window: Option<windows::Windows>,
 }
 impl Worker {
-    pub(crate) fn begin_body_turn(&mut self) -> Result<(), Error> {
-        self.body_window
+    pub(crate) fn begin_validation_turn(&mut self) -> Result<(), Error> {
+        self.validation_window
             .as_ref()
             .map_or(Ok(()), |window| window.begin())
             .map_err(|_| Error::Database)
     }
-    pub(crate) fn finish_body_turn(&mut self) -> Result<(), Error> {
-        self.body_window
+    pub(crate) fn finish_validation_turn(&mut self) -> Result<(), Error> {
+        self.validation_window
             .as_ref()
             .map_or(Ok(()), |window| window.finish())
             .map_err(|_| Error::Database)
@@ -715,8 +715,8 @@ fn progress(result: Result<FlushProgress, crate::ports::Error>) -> Poll<io::Resu
     }
 }
 
-mod body_budget;
-pub(crate) use body_budget::BodyBudget;
+mod validation_budget;
+pub(crate) use validation_budget::ValidationBudget;
 mod framing;
 mod windows;
 use framing::Input;
@@ -819,8 +819,8 @@ mod tests {
             },
             true,
         );
-        io.input = Some(Input::body_checks(
-            BodyBudget::test_turns(BODY_CHECK_TURNS as u64).unwrap(),
+        io.input = Some(Input::validation_checks(
+            ValidationBudget::test_turns(BODY_CHECK_TURNS as u64).unwrap(),
         ));
         io.output_left = BODY_CHECK_TURNS * 64 * 1024;
         let window = io.input.as_ref().unwrap().window().unwrap();

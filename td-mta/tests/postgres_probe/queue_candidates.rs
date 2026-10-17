@@ -295,7 +295,7 @@ pub(super) fn exercise(
         fixture, request, trust, claim, generation, source, policies,
     );
     super::native_data_exchange::exercise(
-        fixture, request, trust, claim, generation, source, policies,
+        fixture, request, trust, claim, generation, source, policies, None,
     );
     super::prepared_failure::exercise(fixture, request, trust, claim, generation, source, policies);
     super::dispatch_recovery::exercise(fixture, request, trust, claim, generation, source);

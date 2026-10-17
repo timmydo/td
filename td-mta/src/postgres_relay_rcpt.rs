@@ -53,7 +53,7 @@ impl<'w, 'a, 'r, B: TlsWireStorage> Completed<'w, 'a, 'r, B> {
     pub fn close(self) -> Closed<'w, 'a, 'r, B> {
         Closed {
             buffers: self.session.into_buffers(),
-            evidence: Ok(self.result),
+            evidence: Ok(self.result.fenced()),
         }
     }
 }
@@ -151,7 +151,7 @@ impl<'w, 'a, 'r, B: TlsWireStorage> Cursor<'w, 'a, 'r, B> {
                 Err(Refusal {
                     error,
                     closed: Closed {
-                        evidence: self.plan.finish(),
+                        evidence: self.plan.finish().map(RcptResult::fenced),
                         buffers,
                     },
                 })
@@ -161,7 +161,7 @@ impl<'w, 'a, 'r, B: TlsWireStorage> Cursor<'w, 'a, 'r, B> {
     pub fn close(self) -> Closed<'w, 'a, 'r, B> {
         let buffers = self.session.into_buffers();
         Closed {
-            evidence: self.plan.finish(),
+            evidence: self.plan.finish().map(RcptResult::fenced),
             buffers,
         }
     }
@@ -198,7 +198,7 @@ impl<'m, 'w, 'a, 'r, B: TlsWireStorage> Exchange<'m, 'w, 'a, 'r, B> {
                 Err(Refusal {
                     error,
                     closed: Closed {
-                        evidence: self.plan.finish(),
+                        evidence: self.plan.finish().map(RcptResult::fenced),
                         buffers,
                     },
                 })
@@ -221,7 +221,7 @@ impl<'m, 'w, 'a, 'r, B: TlsWireStorage> Exchange<'m, 'w, 'a, 'r, B> {
                     return Err(Refusal {
                         error,
                         closed: Closed {
-                            evidence: self.plan.finish(),
+                            evidence: self.plan.finish().map(RcptResult::fenced),
                             buffers,
                         },
                     });
@@ -229,7 +229,7 @@ impl<'m, 'w, 'a, 'r, B: TlsWireStorage> Exchange<'m, 'w, 'a, 'r, B> {
                 if reply.code() == Ok(421) {
                     let buffers = reply.into_buffers();
                     return Ok(Progress::Closed(Closed {
-                        evidence: self.plan.finish(),
+                        evidence: self.plan.finish().map(RcptResult::fenced),
                         buffers,
                     }));
                 }
@@ -239,7 +239,7 @@ impl<'m, 'w, 'a, 'r, B: TlsWireStorage> Exchange<'m, 'w, 'a, 'r, B> {
                     return Err(Refusal {
                         error: Error::Protocol(ports::Error::Deadline),
                         closed: Closed {
-                            evidence: self.plan.finish(),
+                            evidence: self.plan.finish().map(RcptResult::fenced),
                             buffers,
                         },
                     });
@@ -265,7 +265,7 @@ impl<'m, 'w, 'a, 'r, B: TlsWireStorage> Exchange<'m, 'w, 'a, 'r, B> {
                 };
                 if result.evidence().accepted().is_empty() {
                     return Ok(Progress::Closed(Closed {
-                        evidence: Ok(result),
+                        evidence: Ok(result.fenced()),
                         buffers: reply.into_buffers(),
                     }));
                 }
@@ -280,7 +280,7 @@ impl<'m, 'w, 'a, 'r, B: TlsWireStorage> Exchange<'m, 'w, 'a, 'r, B> {
     pub fn close(self) -> Closed<'w, 'a, 'r, B> {
         let buffers = self.command.into_buffers();
         Closed {
-            evidence: self.plan.finish(),
+            evidence: self.plan.finish().map(RcptResult::fenced),
             buffers,
         }
     }

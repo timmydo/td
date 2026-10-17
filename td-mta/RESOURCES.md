@@ -5322,10 +5322,11 @@ boolean. A validated positive-length reply read allows immediate bounded
 continuation; the next advance resets it, so idle reads still wait. Parsing
 retains its 512-byte/one-TLS-operation turn and original meter/deadline
 checks. Write/flush waits and fresh database authority checks are unchanged.
-This pacing change does not qualify full-recipient throughput.
+This pacing change alone does not qualify full-recipient throughput; the
+configured retained-envelope fixture below covers the combined path.
 
 
-The passive retained EnvelopeChecks foundation uses the existing fixed
+Standalone passive EnvelopeChecks::open uses the existing fixed
 1 MiB input, 1088-frame and 64 KiB output connection profile. All counters
 span authentication and successive fresh validation transactions without
 refill. Each check reuses the standalone bounded envelope parser and returns
@@ -5333,4 +5334,24 @@ at most 100 recipient observations. The original deadline only tightens;
 any validation, protocol, cleanup or expiry failure permanently drops the
 backend. The owner remains thread-bound and supplies no connection permit
 or work budget itself. Native fixtures verify the aggregate limits and
-lock release, not SMTP integration or full-recipient throughput.
+lock release. Configured SMTP admission is accounted for below.
+
+
+Configured MAIL entry prepays retained envelope checks for 2*(N+2)+8 turns,
+where N is the admitted 1..=100 recipient subset. The shared validation budget
+charges each turn 1 MiB+128 KiB I/O and 4096 records and limits its PostgreSQL
+protocol to 1 MiB input, 64 KiB output and 1088 frames. Authentication shares
+the first window; idle messages consume the preceding window. At 100
+recipients, 212 turns charge 238.5 MiB I/O and 868352 records, with aggregate
+212 MiB input, 13.25 MiB output and 230656 frames. These counters do not
+allocate those byte totals. No turn, counter, deadline or meter replenishes.
+
+One ordinary ReadPermit covers the thread-bound envelope validator through
+configured MAIL/RCPT/DATA. Its inline custody has a compiled 1 KiB ceiling;
+protocol/provider allocations remain separately bounded. Every fresh
+transaction acknowledges rollback
+before transport; only the connection survives. Its connection closes before
+permit release and before negative/positive DATA publication, Body/source
+admission or passive evidence handoff. Original Pending, identity, policy,
+ownership, clock and deadline checks remain mandatory on every output turn.
+Direct low-level envelope observations retain their existing per-call profile.

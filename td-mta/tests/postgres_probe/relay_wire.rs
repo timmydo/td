@@ -413,6 +413,62 @@ pub(super) fn accepted_mail<'w, 'a, 'r>(
     }
 }
 
+/// Drive bound MAIL and return its same-session positive handoff.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn accepted_configured<'w, 'a, 'r>(
+    connected: td_mta::postgres_relay_connect::ConnectedPrepared<'w, 'a, 'r, Buffer>,
+    sender: &str,
+    fixture: &Fixture,
+    peer: &mut Peer,
+    cap: Deadline,
+    database: &mut Meter,
+) -> td_mta::postgres_relay_mail::Accepted<'w, 'a, 'r, Buffer> {
+    use td_mta::{postgres_relay_mail as mail, smtp_data_encode::Body};
+    let expected = format!("MAIL FROM:<{}>\r\n", sender);
+    let mut input = [0; 512];
+    let mut line = [0; 512];
+    let mut reply = [0; 4096];
+    let mut output = [0; 512];
+    let mut network = meter(cap);
+    let mut exchange = connected
+        .begin_mail(
+            Body::SevenBit,
+            command::Scratch {
+                input: &mut input,
+                line: &mut line,
+                reply: &mut reply,
+                command: &mut output,
+            },
+            &mut network,
+            database,
+        )
+        .ok()
+        .unwrap();
+    let mut script = Script::new(expected.as_bytes(), b"250 sender\r\n");
+    let mut backend = None;
+    loop {
+        script.turn(peer);
+        match exchange.advance() {
+            Ok(mail::Progress::Pending(next)) => {
+                let pid = super::body_checks::backend(fixture);
+                if let Some(previous) = &backend {
+                    assert_eq!(&pid, previous);
+                }
+                assert_eq!(super::sql(fixture, &format!("SELECT state||'|'||query FROM pg_catalog.pg_stat_activity WHERE pid={pid}")), "idle|ROLLBACK");
+                backend = Some(pid);
+                exchange = next;
+            }
+            Ok(mail::Progress::Accepted(accepted)) => {
+                script.complete();
+                return accepted;
+            }
+            Ok(mail::Progress::Rejected(_)) => panic!("unexpected MAIL rejection"),
+            Err(failure) => panic!("bound MAIL failed: {:?}", failure.error),
+        }
+        std::thread::yield_now();
+    }
+}
+
 use td_mta::postgres_relay_rcpt as rcpt;
 #[allow(
     clippy::large_enum_variant,
