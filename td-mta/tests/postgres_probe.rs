@@ -11853,3 +11853,6 @@ mod expiry_admission;
 
 #[path = "postgres_probe/device_listing.rs"]
 mod device_listing;
+
+#[path = "postgres_probe/device_revocation.rs"]
+mod device_revocation;

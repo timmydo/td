@@ -9,6 +9,7 @@ use td_mta::{postgres_input::Loaded, postgres_probe, postgres_resolver, postgres
 
 mod configuration;
 mod device_list;
+mod device_revoke;
 mod material;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -73,6 +74,9 @@ fn arguments(operation: Operation, mut args: impl Iterator<Item = OsString>) -> 
 
 pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<ExitCode> {
     let command = args.next();
+    if command.as_deref() == Some(OsStr::new("device-revoke")) {
+        return device_revoke::run(args);
+    }
     if command.as_deref() == Some(OsStr::new("device-list")) {
         return device_list::run(args);
     }

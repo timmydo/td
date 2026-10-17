@@ -930,8 +930,8 @@ with a fixed golden vector and malformed-token/entropy-failure tests.
 
 Version 4 adds an owner-private devices table. The postgres_devices module
 provides explicit owner-side preparation and publication APIs, plus a cold
-credential check. Creation and revocation remain preparation APIs; section 193
-adds explicit read-only registry inspection. Runtime device
+credential check. Creation remains a preparation API; sections 193 and 194
+add explicit registry inspection and revocation commands. Runtime device
 privileges, HTTP authentication and authorization inside admitted mail
 snapshots/transactions remain cutover work. The existing file registry
 remains production authority until then.
@@ -5570,3 +5570,31 @@ The native fixture exercises the API and actual command with a role lacking
 salt/verifier read privileges, Unicode and quoted labels, revoked entries,
 empty and foreign accounts, stale epoch, malformed metadata, exact capacity
 and overflow refusal. Device enumeration leaves account sequences unchanged.
+
+## 194. Explicit administrative device revocation
+
+`td-mta postgres device-revoke --connection-file PATH --epoch HEX
+--account ID --device ID` publishes one owner-side revocation in the
+preparation database. The protected connection input, fresh DNS resolution,
+verified TLS/SCRAM and overall ten-second worker deadline are the same as
+other explicit preparation commands. It grants no mail serving authority
+and does not change the active file registry or backend selection.
+
+The command samples checked UTC milliseconds and prepares one random
+revocation operation before address attempts. It retains that exact value
+through transport fallback. The existing account write fence, expected
+epoch and immutable receipt rules in section 21 apply. Success names the
+public epoch, account, device and current invocation's operation ID, with
+`recorded` or `already-revoked`. The latter does not claim that the current
+operation has a durable receipt: the prior revocation remains unchanged.
+No password, verifier, digest or database credential is printed.
+
+A possible COMMIT without a known response reports the fixed error
+`indeterminate-inspect-device` and does not retry or claim success. The
+operator can inspect the named device with `device-list`; absence of a
+revocation in a snapshot does not settle an outstanding COMMIT. A later
+explicit revoke of that same device is safe: the account fence serializes
+with the original operation and either records a revocation or observes
+the retained prior one. It cannot identify the original operation's receipt
+and never creates a replacement credential. Process loss has no automatic
+retry or on-disk operation recovery. No creation command is introduced.
