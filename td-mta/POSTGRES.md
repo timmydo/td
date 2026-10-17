@@ -5769,3 +5769,29 @@ repair, force or all-accounts option. The command never prints credentials,
 body bytes or native database error text, and never changes counters or
 account sequence. The native process fixture checks JSON values, fixed
 refusals, malformed options and persistence of deliberately corrupted usage.
+
+## 201. Historical single-blob integrity audit
+
+`postgres_blob_audit::inspect` verifies one explicitly named account/blob in
+one finite read-only primary REPEATABLE READ snapshot under the expected store
+epoch and shared migration lock. The caller supplies trusted administrative
+connection access, not a device password. This is an inert verification
+component, never a download or device authorization path; it returns only
+public manifest metadata and the snapshot account sequence/floor.
+
+The existing body reader checks manifest bounds, changed sequence, exact
+chunk count, ordered contiguous ordinals, chunk extents and the complete
+SHA-256, including the empty body digest. It uses the existing 32-MiB body
+ceiling and eight-chunk batches, not a message-sized buffer. The original
+connection budgets and deadline cover metadata, all body reads and an
+acknowledged ROLLBACK; a final deadline check precedes success. Missing rows,
+wrong epochs, corrupt manifests/bytes, database failures and timeouts refuse.
+Failure closes the private worker and never repairs any row.
+
+A successful result certifies only this body's historical snapshot. It does
+not check counters, owning Email/submission/lease references, other metadata,
+configuration, credentials or retained receipts. It provides no current quota
+or serving authority, complete-store certificate or restore approval. The
+native PostgreSQL fixture checks corrupt bytes and extents, ordinal gaps,
+manifest/sequence inconsistency, empty bodies, account isolation and absence
+of device credentials while pinning the narrower verification scope.

@@ -5416,3 +5416,14 @@ numeric overflow and any deadline or query failure refuse rather than return
 a partial report. Read-only snapshot rollback and the final clock check must
 finish before success. No runtime pool reservation or full semantic-check
 coverage is claimed by this administrative preparation operation.
+
+## PostgreSQL single-body audit
+
+The cold administrative `postgres_blob_audit` component reuses the bounded
+body worker and verifier: at most 32 MiB of body data per invocation, read in
+batches of up to eight 64-KiB chunks under one original finite connection
+budget and deadline. Manifest selection returns at most two rows. It retains
+one chunk batch, digest state and public metadata; no complete message buffer
+or body bytes escape. Success follows acknowledged snapshot rollback and a
+final deadline check. This is historical single-body verification, not whole
+store verification, resource admission or restore authority.

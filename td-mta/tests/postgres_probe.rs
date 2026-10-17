@@ -11914,3 +11914,6 @@ mod usage_audit;
 
 #[path = "postgres_probe/usage_commands.rs"]
 mod usage_commands;
+
+#[path = "postgres_probe/blob_audit.rs"]
+mod blob_audit;
