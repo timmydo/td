@@ -930,8 +930,8 @@ with a fixed golden vector and malformed-token/entropy-failure tests.
 
 Version 4 adds an owner-private devices table. The postgres_devices module
 provides explicit owner-side preparation and publication APIs, plus a cold
-credential check. Creation remains a preparation API; sections 193 and 194
-add explicit registry inspection and revocation commands. Runtime device
+credential check. Sections 193 through 195 add explicit registry inspection,
+revocation and creation commands. Runtime device
 privileges, HTTP authentication and authorization inside admitted mail
 snapshots/transactions remain cutover work. The existing file registry
 remains production authority until then.
@@ -5598,3 +5598,31 @@ with the original operation and either records a revocation or observes
 the retained prior one. It cannot identify the original operation's receipt
 and never creates a replacement credential. Process loss has no automatic
 retry or on-disk operation recovery. No creation command is introduced.
+
+## 195. Explicit administrative device creation
+
+`td-mta postgres device-create --connection-file PATH --epoch HEX
+--account ID --label LABEL` creates one owner-side preparation credential.
+The protected connection input, fresh DNS, TLS/SCRAM, ten-second worker and
+expected epoch rules match other explicit preparation commands. The label
+retains the registry's 128-byte UTF-8 limit and control-character refusal.
+The command takes checked UTC milliseconds and prepares one Creation before
+address attempts. The existing 256-record ceiling includes revoked devices.
+
+Only confirmed creation success prints the password, once, in the local JSON
+receipt together with its public device identity. The guarded password is
+written directly in its fixed hex-dot-hex encoding, without a temporary
+String. The database receives only its salted verifier. No database password,
+salt, verifier or request digest is printed. Output remains the operator's
+local credential receipt and must be retained before leaving the terminal.
+
+A failed publication prints only the fixed error category and public epoch,
+account and generated device ID. A possible COMMIT without a known response
+reports `indeterminate-inspect-and-revoke-device`; the command does not retry,
+print the password or generate a replacement credential. Inspect and revoke
+that named device using sections 193 and 194. A read showing no record does
+not settle an outstanding transaction. Process or output loss after success
+can leave an undisclosed credential: inspect the account registry and revoke
+it before explicitly creating another. The label is not a unique operation
+identity, and rerunning creation is never recovery of the original password.
+No on-disk recovery, serving admission or file-registry change is introduced.

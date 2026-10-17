@@ -11856,3 +11856,6 @@ mod device_listing;
 
 #[path = "postgres_probe/device_revocation.rs"]
 mod device_revocation;
+
+#[path = "postgres_probe/device_creation.rs"]
+mod device_creation;
