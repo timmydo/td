@@ -32,12 +32,12 @@ impl Operation {
         }
     }
 }
-struct Options {
-    connection: String,
-    epoch: StoreEpoch,
-    account: AccountId,
+pub(super) struct Options {
+    pub(super) connection: String,
+    pub(super) epoch: StoreEpoch,
+    pub(super) account: AccountId,
 }
-fn arguments(mut args: impl Iterator<Item = OsString>) -> Option<Options> {
+pub(super) fn arguments(mut args: impl Iterator<Item = OsString>) -> Option<Options> {
     let (mut connection, mut epoch, mut account) = (None, None, None);
     while let Some(flag) = args.next() {
         let value = args.next()?.into_string().ok()?;

@@ -11911,3 +11911,6 @@ mod selection_commands;
 
 #[path = "postgres_probe/usage_audit.rs"]
 mod usage_audit;
+
+#[path = "postgres_probe/usage_commands.rs"]
+mod usage_commands;

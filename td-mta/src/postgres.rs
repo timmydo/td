@@ -14,6 +14,7 @@ mod device_list;
 mod device_revoke;
 mod material;
 mod selection;
+mod usage;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Operation {
@@ -77,6 +78,9 @@ fn arguments(operation: Operation, mut args: impl Iterator<Item = OsString>) -> 
 
 pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<ExitCode> {
     let command = args.next();
+    if command.as_deref() == Some(OsStr::new("usage-inspect")) {
+        return usage::run(args);
+    }
     if let Some(operation) = command.as_deref().and_then(selection::Operation::parse) {
         return selection::run(operation, args);
     }

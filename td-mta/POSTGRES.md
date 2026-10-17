@@ -5745,3 +5745,27 @@ credentials, configuration or delivery outcomes, and cannot authorize restore
 or serving. The native fixture deliberately demonstrates that matching counters
 can coexist with a damaged body. It also checks account isolation, zero-length
 manifests, expired leases, shared queue references and refusal without repair.
+
+## 200. Explicit historical usage inspection command
+
+`postgres usage-inspect --connection-file PATH --epoch HEX --account ID`
+loads the protected owner-side connection file and invokes section 199's
+read-only counter audit for one explicit account and store epoch. It shares
+one DNS/connection/operation deadline across resolved-address attempts; only
+transport refusal permits another address. No profile is selected or served.
+
+Successful schema-1 JSON reports the account, epoch, snapshot sequence and
+history floor, plus `body_bytes`, `blob_count`, `upload_bytes`, `queue_bytes`
+and `queue_submissions`. `counters_consistent:true` describes that historical
+snapshot only. `semantic_verified:false` explicitly preserves the narrower
+scope: this command checks no body digests, metadata graph, retained receipts,
+configuration, credentials or restore safety. Success supplies no quota or
+serving authority and does not imply the counters remain current.
+
+Missing accounts, wrong epochs, absent or inconsistent counters, database
+failures and deadlines refuse with fixed error codes. Duplicate, missing and
+unknown arguments refuse before loading the connection file. There is no
+repair, force or all-accounts option. The command never prints credentials,
+body bytes or native database error text, and never changes counters or
+account sequence. The native process fixture checks JSON values, fixed
+refusals, malformed options and persistence of deliberately corrupted usage.
