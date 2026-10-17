@@ -5214,9 +5214,14 @@ retaining the low-level validator supplies no slot or work admission.
 The bound Body transport instead prepays eight validation turns: 9 MiB I/O
 and 32768 records before opening one retained ordinary connection. Its profile
 caps total input at 8 MiB, output at 512 KiB and frames at 8704; the original
-per-frame/authentication limits remain. A separate eight-credit counter caps
-attempted checks, including Pending writes and flushes. No counter or credit
-is replenished. Every turn checks the original meter/deadline and Pending and
+per-frame/authentication limits remain. Each turn also admits at most 1 MiB
+input, 64 KiB output and 1088 frames, with authentication charged to the first
+window. Only acknowledged rollback permits a later window, and available idle
+traffic consumes the preceding window. At most eight windows are granted;
+protocol failure permanently refuses further grants. Aggregate counters
+continue decreasing across all windows. A separate eight-credit counter caps
+attempted checks, including Pending writes and flushes. No aggregate counter
+or credit is replenished. Every turn checks the original meter/deadline and Pending and
 performs complete qualification plus live validation. The earliest limit
 carries into Possible and final custody. The connection closes before its
 ReadPermit is released, including before Possible needs the second slot.

@@ -1,5 +1,8 @@
 //! Bound input before the driver's codec allocates or authenticates.
+use super::windows::Windows;
+
 pub(super) struct Input {
+    window: Option<Windows>,
     prefix: [u8; 9],
     used: usize,
     target: usize,
@@ -13,6 +16,7 @@ pub(super) struct Input {
 impl Input {
     pub(super) fn new() -> Self {
         Self {
+            window: None,
             prefix: [0; 9],
             used: 0,
             target: 5,
@@ -49,9 +53,36 @@ impl Input {
     pub(super) fn body_checks() -> Self {
         let single = Self::mutations();
         Self {
+            window: Some(Windows::new()),
             bytes: super::BODY_CHECK_TURNS * single.bytes,
             frames: super::BODY_CHECK_TURNS * single.frames,
             ..single
+        }
+    }
+
+    pub(super) fn window(&self) -> Option<Windows> {
+        self.window.clone()
+    }
+
+    pub(super) fn admit_output(&self, bytes: usize) -> Result<(), ()> {
+        if self.failed {
+            return Err(());
+        }
+        self.window
+            .as_ref()
+            .map_or(Ok(()), |window| window.admit_output(bytes))
+    }
+
+    pub(super) fn output(&self, bytes: usize) -> Result<(), ()> {
+        self.window
+            .as_ref()
+            .map_or(Ok(()), |window| window.output(bytes))
+    }
+
+    pub(super) fn fail(&mut self) {
+        self.failed = true;
+        if let Some(window) = &self.window {
+            window.fail();
         }
     }
 
@@ -91,12 +122,17 @@ impl Input {
             return Err(());
         }
         let result = self.consume(input);
-        self.failed = result.is_err();
+        if result.is_err() {
+            self.fail();
+        }
         result
     }
 
     fn consume(&mut self, mut input: &[u8]) -> Result<(), ()> {
         self.bytes = self.bytes.checked_sub(input.len()).ok_or(())?;
+        if let Some(window) = &self.window {
+            window.input(input.len())?;
+        }
         while !input.is_empty() {
             if self.body != 0 {
                 let take = self.body.min(input.len());
@@ -123,6 +159,9 @@ impl Input {
             ) as usize;
             if self.target == 5 {
                 self.frames = self.frames.checked_sub(1).ok_or(())?;
+                if let Some(window) = &self.window {
+                    window.frame()?;
+                }
                 if !(4..=128 * 1024).contains(&length) {
                     return Err(());
                 }
@@ -163,7 +202,7 @@ impl Input {
 }
 
 #[cfg(test)]
-#[allow(clippy::indexing_slicing)]
+#[allow(clippy::indexing_slicing, clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -278,14 +317,14 @@ mod tests {
     #[test]
     fn retained_body_checks_bound_a_hostile_first_turn_and_never_replenish() {
         let mut input = Input::body_checks();
-        for _ in 0..8704 {
+        for _ in 0..1088 {
             assert!(input.accept(&frame(b'N', b"\0")).is_ok());
         }
         assert!(input.accept(&frame(b'N', b"\0")).is_err());
         assert!(input.accept(&authenticated()).is_err());
         let packet = frame(b'D', &[0; 128 * 1024 - 4]);
         let mut input = Input::body_checks();
-        for _ in 0..63 {
+        for _ in 0..7 {
             assert!(input.accept(&packet).is_ok());
         }
         assert!(input.accept(&packet).is_err());
@@ -297,6 +336,52 @@ mod tests {
         assert!(Input::body_checks()
             .accept(&frame(b'D', &[0; 128 * 1024]))
             .is_err());
+    }
+
+    #[test]
+    fn retained_windows_preserve_authentication_and_monotonic_totals() {
+        let mut input = Input::body_checks();
+        let window = input.window().unwrap();
+        input.accept(&authenticated()).unwrap();
+        for turn in 0..super::super::BODY_CHECK_TURNS {
+            window.begin().unwrap();
+            let used = if turn == 0 { 5 } else { 0 };
+            for _ in used..1088 {
+                input.accept(&frame(b'N', b"\0")).unwrap();
+            }
+            window.finish().unwrap();
+            assert_eq!(input.authentication, 4);
+            assert_eq!(
+                input.frames,
+                (super::super::BODY_CHECK_TURNS - turn - 1) * 1088
+            );
+        }
+        assert!(window.begin().is_err());
+        assert!(input.accept(&frame(b'N', b"\0")).is_err());
+    }
+
+    #[test]
+    fn retained_windows_keep_fragmented_parser_state_and_terminal_failures() {
+        let bytes = frame(b'N', b"fragmented");
+        for split in 1..bytes.len() {
+            let mut input = Input::body_checks();
+            let window = input.window().unwrap();
+            input.accept(&authenticated()).unwrap();
+            window.begin().unwrap();
+            input.accept(&bytes[..split]).unwrap();
+            window.finish().unwrap();
+            // Idle bytes remain charged to the preceding window.
+            input.accept(&[]).unwrap();
+            window.begin().unwrap();
+            input.accept(&bytes[split..]).unwrap();
+            assert_eq!(input.frames, super::super::BODY_CHECK_TURNS * 1088 - 6);
+            assert_eq!(input.authentication, 4);
+            assert_eq!(input.body, 0);
+            assert_eq!(input.used, 0);
+            window.finish().unwrap();
+            assert!(input.accept(&frame(b'R', &0u32.to_be_bytes())).is_err());
+            assert!(window.begin().is_err());
+        }
     }
 
     #[test]

@@ -48,8 +48,9 @@ pub fn check_current_body(
 }
 
 /// A thread-bound, passive Body validator. Each successful turn acknowledges
-/// rollback before returning. All protocol counters and the original deadline
-/// span the entire connection; any refusal closes it permanently. The caller
+/// rollback before returning. Aggregate counters and the original deadline
+/// span the connection; retained transfers also bound each turn. Any refusal
+/// closes the connection permanently. The caller
 /// owns connection capacity and work admission. This is not SMTP authority.
 pub struct BodyChecks {
     worker: Option<postgres_probe::Worker>,
@@ -125,6 +126,7 @@ impl BodyChecks {
         worker
             .constrain_deadline(self.limit)
             .map_err(Error::Connection)?;
+        worker.begin_body_turn().map_err(Error::Connection)?;
         let value = self.value.inner.clone();
         let observation = Observation {
             clock: self.observation.clock.clone(),
@@ -168,6 +170,7 @@ impl BodyChecks {
         if Instant::now() >= limit {
             return Err(Error::ExpiryHold);
         }
+        worker.finish_body_turn().map_err(Error::Connection)?;
         self.limit = self.limit.min(limit);
         Ok(self.limit)
     }

@@ -5060,11 +5060,17 @@ only tighten; neither connection establishment nor a successful turn renews it.
 
 The retained profile admits at most 8 MiB cumulative PostgreSQL input, 512 KiB
 output and 8704 frames. Per-frame and authentication limits are unchanged.
-The full profile is prepaid because even the first turn may consume all of
-it. A separate eight-credit counter bounds attempted checks. Each write or
+A separate per-turn window admits at most 1 MiB input, 64 KiB output and
+1088 frames, including authentication in the first window. Available idle
+traffic is drained against the preceding window before the next is granted.
+Only an acknowledged rollback permits another window; at most eight windows
+can be granted, and any protocol failure permanently refuses further grants.
+Parser state and authentication survive window boundaries. The connection
+aggregate counters only decrease, independently of the per-turn windows.
+A separate eight-credit counter bounds attempted checks. Each write or
 flush spends a credit, checks Pending and the original meter/deadline, then
 performs the full section 180 transaction with fresh qualification and live
-fences. No protocol counter, credit or meter allowance is replenished. The
+fences. No aggregate counter, credit or meter allowance is replenished. The
 ninth check refuses before SQL; no hidden reconnect is available. Partial
 writes and backpressure can consume credits without useful SMTP progress.
 

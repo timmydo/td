@@ -361,6 +361,7 @@ fn connect_authenticated(
     } else {
         input
     };
+    let body_window = input.window();
     let connector = Connector {
         session,
         clock,
@@ -388,6 +389,7 @@ fn connect_authenticated(
         waker,
         failed: None,
         activity,
+        body_window,
     })
 }
 
@@ -398,8 +400,21 @@ pub(crate) struct Worker {
     waker: Waker,
     failed: Option<Error>,
     activity: Arc<AtomicBool>,
+    body_window: Option<windows::Windows>,
 }
 impl Worker {
+    pub(crate) fn begin_body_turn(&mut self) -> Result<(), Error> {
+        self.body_window
+            .as_ref()
+            .map_or(Ok(()), |window| window.begin())
+            .map_err(|_| Error::Database)
+    }
+    pub(crate) fn finish_body_turn(&mut self) -> Result<(), Error> {
+        self.body_window
+            .as_ref()
+            .map_or(Ok(()), |window| window.finish())
+            .map_err(|_| Error::Database)
+    }
     pub(crate) fn constrain_deadline(&mut self, deadline: Instant) -> Result<(), Error> {
         self.deadline = self.deadline.min(deadline);
         self.check()
@@ -656,13 +671,29 @@ impl<T: Transport + Unpin> AsyncWrite for Io<T> {
         if bytes.is_empty() {
             return Poll::Ready(Ok(0));
         }
-        if bytes.len() > this.output_left {
+        if bytes.len() > this.output_left
+            || this
+                .input
+                .as_ref()
+                .is_some_and(|input| input.admit_output(bytes.len()).is_err())
+        {
+            if let Some(input) = &mut this.input {
+                input.fail();
+            }
             this.transport.abort();
             return Poll::Ready(Err(refused()));
         }
         match this.transport.write(bytes) {
             Ok(IoProgress::Bytes(count)) if count <= bytes.len() => {
                 this.output_left -= count;
+                if this
+                    .input
+                    .as_ref()
+                    .is_some_and(|input| input.output(count).is_err())
+                {
+                    this.transport.abort();
+                    return Poll::Ready(Err(refused()));
+                }
                 Poll::Ready(Ok(count))
             }
             Ok(IoProgress::Pending) => Poll::Pending,
@@ -685,6 +716,7 @@ fn progress(result: Result<FlushProgress, crate::ports::Error>) -> Poll<io::Resu
 }
 
 mod framing;
+mod windows;
 use framing::Input;
 
 #[cfg(test)]
@@ -744,6 +776,78 @@ mod tests {
         activity.store(false, Ordering::Relaxed);
         assert_eq!(network.read(&mut byte), Ok(IoProgress::Pending));
         assert!(!activity.load(Ordering::Relaxed));
+    }
+
+    struct WindowTransport {
+        pending: bool,
+        calls: usize,
+        aborted: bool,
+    }
+    impl Transport for WindowTransport {
+        fn read(&mut self, _: &mut [u8]) -> Result<IoProgress, crate::ports::Error> {
+            Ok(IoProgress::Pending)
+        }
+        fn write(&mut self, bytes: &[u8]) -> Result<IoProgress, crate::ports::Error> {
+            self.calls += 1;
+            if self.pending {
+                self.pending = false;
+                Ok(IoProgress::Pending)
+            } else {
+                Ok(IoProgress::Bytes(bytes.len().min(1)))
+            }
+        }
+        fn flush(&mut self) -> Result<FlushProgress, crate::ports::Error> {
+            Ok(FlushProgress::Complete)
+        }
+        fn close(&mut self) -> Result<FlushProgress, crate::ports::Error> {
+            Ok(FlushProgress::Complete)
+        }
+        fn abort(&mut self) {
+            self.aborted = true;
+        }
+    }
+
+    #[test]
+    fn retained_output_charges_actual_progress_and_refuses_before_transport() {
+        let mut io = Io::new(
+            WindowTransport {
+                pending: true,
+                calls: 0,
+                aborted: false,
+            },
+            true,
+        );
+        io.input = Some(Input::body_checks());
+        io.output_left = BODY_CHECK_TURNS * 64 * 1024;
+        let window = io.input.as_ref().unwrap().window().unwrap();
+        window.begin().unwrap();
+        window.output(64 * 1024 - 2).unwrap();
+        let waker = Waker::from(Arc::new(WorkerWake(thread::current())));
+        let mut context = Context::from_waker(&waker);
+        assert!(Pin::new(&mut io)
+            .poll_write(&mut context, b"ab")
+            .is_pending());
+        assert_eq!(io.output_left, BODY_CHECK_TURNS * 64 * 1024);
+        assert!(matches!(
+            Pin::new(&mut io).poll_write(&mut context, b"ab"),
+            Poll::Ready(Ok(1))
+        ));
+        assert!(matches!(
+            Pin::new(&mut io).poll_write(&mut context, b"b"),
+            Poll::Ready(Ok(1))
+        ));
+        assert_eq!(io.output_left, BODY_CHECK_TURNS * 64 * 1024 - 2);
+        window.finish().unwrap();
+        window.begin().unwrap();
+        window.output(64 * 1024 - 1).unwrap();
+        assert!(matches!(
+            Pin::new(&mut io).poll_write(&mut context, b"ab"),
+            Poll::Ready(Err(_))
+        ));
+        assert_eq!(io.transport.calls, 3);
+        assert!(io.transport.aborted);
+        assert!(window.finish().is_err());
+        assert!(window.begin().is_err());
     }
 
     #[test]
