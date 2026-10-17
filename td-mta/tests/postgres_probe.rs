@@ -11859,3 +11859,6 @@ mod device_revocation;
 
 #[path = "postgres_probe/device_creation.rs"]
 mod device_creation;
+
+#[path = "postgres_probe/account_admin.rs"]
+mod account_admin;

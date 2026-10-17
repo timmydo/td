@@ -1185,6 +1185,9 @@ its final deadline before returning. A retried publication that finds a
 matching retained receipt succeeds even if its last poll crosses the local
 deadline.
 
+Section 196 exposes initialization and retained receipt inspection as
+explicit administrative commands.
+
 These explicit owner operations neither activate account policy nor bypass
 future account limits, authorization, quota or mutation fences. Configuration
 activation must separately bind its declared accounts to existing prepared
@@ -5626,3 +5629,28 @@ can leave an undisclosed credential: inspect the account registry and revoke
 it before explicitly creating another. The label is not a unique operation
 identity, and rerunning creation is never recovery of the original password.
 No on-disk recovery, serving admission or file-registry change is introduced.
+
+## 196. Explicit administrative account bootstrap
+
+`td-mta postgres account-init --connection-file PATH --epoch HEX --account
+ID` prepares one random Inbox identity before bounded address attempts and
+uses section 27's atomic account bootstrap. A confirmed publication prints
+its public epoch/account/Inbox receipt. The protected connection input,
+fresh DNS, TLS/SCRAM and ten-second operation deadline match other explicit
+preparation commands. Initialization neither activates account policy nor
+admits a serving backend.
+
+A publication failure reports only a fixed error and the attempted public
+tuple. An outstanding COMMIT reports `indeterminate-inspect-account` and
+stops without retrying. `td-mta postgres account-inspect --connection-file
+PATH --epoch HEX --account ID` reads the retained bootstrap receipt, not
+current Inbox contents, sequence or serving authority. Absence cannot settle
+an outstanding original transaction; let it finish before interpreting a
+missing receipt. A stored receipt can be compared with the attempted tuple.
+
+A fresh initialization invocation generates a different Inbox identity and
+conflicts with a preexisting bootstrap receipt. An account lacking a receipt
+also refuses initialization. Neither command resets, repairs or adopts an
+existing account. Lost process output is recovered by inspecting the named
+account's retained receipt, not by blindly repeating initialization. Account
+retirement, import and serving configuration remain separate operations.

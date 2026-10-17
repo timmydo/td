@@ -7,6 +7,7 @@ use std::{
 };
 use td_mta::{postgres_input::Loaded, postgres_probe, postgres_resolver, postgres_schema};
 
+mod account;
 mod configuration;
 mod device_create;
 mod device_list;
@@ -75,6 +76,9 @@ fn arguments(operation: Operation, mut args: impl Iterator<Item = OsString>) -> 
 
 pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<ExitCode> {
     let command = args.next();
+    if let Some(operation) = command.as_deref().and_then(account::Operation::parse) {
+        return account::run(operation, args);
+    }
     if command.as_deref() == Some(OsStr::new("device-create")) {
         return device_create::run(args);
     }
