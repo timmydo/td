@@ -232,10 +232,25 @@ pub(crate) async fn lock_and_inspect(client: &Client) -> Result<Receipt, Error> 
 // Caller has begun a transaction; its acknowledged rollback releases this
 // lock together with every row lock before the next transport turn.
 pub(crate) async fn lock_transaction_and_inspect(client: &Client) -> Result<Receipt, Error> {
+    lock_transaction(client, false).await
+}
+
+// Owner maintenance calls this before any ledger or barrier observation.
+pub(crate) async fn lock_exclusive_transaction_and_inspect(
+    client: &Client,
+) -> Result<Receipt, Error> {
+    lock_transaction(client, true).await
+}
+
+async fn lock_transaction(client: &Client, exclusive: bool) -> Result<Receipt, Error> {
     version(client).await?;
     let locked: bool = client
         .query_one(
-            "SELECT pg_catalog.pg_try_advisory_xact_lock_shared($1)",
+            if exclusive {
+                "SELECT pg_catalog.pg_try_advisory_xact_lock($1)"
+            } else {
+                "SELECT pg_catalog.pg_try_advisory_xact_lock_shared($1)"
+            },
             &[&MIGRATION_KEY],
         )
         .await

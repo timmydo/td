@@ -11939,3 +11939,6 @@ mod account_audit_commands;
 
 #[path = "postgres_probe/runtime_barrier.rs"]
 mod runtime_barrier;
+
+#[path = "postgres_probe/maintenance.rs"]
+mod maintenance;

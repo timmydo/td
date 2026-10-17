@@ -5470,3 +5470,15 @@ booleans. The same connection input/frame/output and original deadline limits
 cover it; no budget is renewed. It retains no barrier cache or permit. Missing,
 blocked or unreadable state refuses qualification; existing finite operations
 and external network fencing remain separate, as specified in POSTGRES 205.
+
+## PostgreSQL owner maintenance entry
+
+Owner inspection and entry use the existing schema worker's one-MiB input,
+1024-frame and 64-KiB output limits with the original ten-second maximum
+deadline. The bounded migration ledger, one owner-check row and at most two
+barrier rows are the only materialized results. No budget resets, queues,
+background tasks or barrier permits are introduced. Entry uses a nonwaiting
+exclusive advisory lock and one synchronous commit. The transaction's idle
+timeout remains ten seconds; existing statement and transport bounds apply.
+Inspection acknowledges read-only rollback and checks the final deadline.
+Mutation uncertainty and the same-epoch retry contract are in POSTGRES 206.

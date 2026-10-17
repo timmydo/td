@@ -145,6 +145,7 @@ mod postgres_http_upload_receive;
 pub mod postgres_http_uploads;
 pub mod postgres_input;
 pub mod postgres_mailboxes;
+pub mod postgres_maintenance;
 pub mod postgres_materials;
 pub mod postgres_metadata_audit;
 pub mod postgres_probe;

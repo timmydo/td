@@ -5910,11 +5910,11 @@ operations retain their original finite limits and migration locks. Owner
 Preparation schema inspection remains available while the barrier is set;
 `runtime-check` remains a runtime qualification and refuses maintenance.
 
-This increment supplies enforcement only. It introduces no supported barrier
-entry/release command, epoch renewal, delivery quarantine or recovery approval.
-A future owner transition must hold the exclusive migration lock and require
-external fencing of old instances and SMTP egress; shared locks prevent it
-from racing qualified database operations. A database flag cannot establish
+This enforcement foundation introduces no barrier entry/release command,
+epoch renewal, delivery quarantine or recovery approval. Section 206 specifies
+the owner entry API. Owner transitions hold the exclusive migration lock and
+require external fencing of old instances and SMTP egress; shared locks prevent
+them from racing qualified database operations. A database flag cannot establish
 external fencing or decide duplicate-delivery risk. Recovery must not clear
 this barrier until its separately specified quarantine, credential/configuration
 and semantic-state requirements are satisfied.
@@ -5925,3 +5925,42 @@ migration. Native coverage includes upgrade from version 27 with obstruction
 rollback, blocked/missing runtime refusal, owner inspection and rejection of
 runtime write privilege. Fixture-only SQL toggles do not implement the future
 owner recovery transition protocol.
+
+## 206. Monotone owner maintenance entry
+
+`postgres_maintenance` adds bounded owner inspection and one-way barrier
+entry. The caller must provide the expected store epoch and explicitly
+attest that all old instances and SMTP egress are externally stopped/fenced.
+The typed attestation records a caller obligation; PostgreSQL cannot prove
+it. These preparation APIs have no production startup or command routing.
+
+Entry forces READ COMMITTED and synchronous commit, acquires the exclusive
+transaction migration lock before checking the complete current ledger, and
+requires the authenticated session user to own the schema, ledger and barrier
+tables. A runtime credential cannot enter maintenance even if somebody has
+incorrectly granted it barrier UPDATE. Any shared or exclusive migration-lock
+holder makes entry refuse busy; it does not wait for or cancel live work.
+The singleton must exist and be well-formed. Entry never inserts missing
+state or changes the epoch, mail, configuration, credentials or receipts.
+
+The only supported transition is false to true. At the same epoch, observing
+true is already success and performs no UPDATE. Unacknowledged COMMIT is
+indeterminate, not rollback. Resolve it by inspection or repetition using the
+same expected epoch. Inspection holds a shared migration lock, so an original
+in-flight entry remains busy until it commits or rolls back. A false
+observation permits only the same monotone entry, not runtime activation.
+An acknowledged COMMIT remains known even if completing it crosses the
+caller deadline; a read/no-op result requires the final deadline check.
+
+No supported release exists. A future release MUST atomically renew the
+store epoch with clearing the barrier, in addition to completing recovery's
+quarantine, credential/configuration and semantic-state requirements. This
+prevents an old entry retry from reblocking a reopened store. Direct owner
+SQL that clears the barrier without renewal violates this protocol. Barrier
+entry alone supplies no epoch renewal, delivery quarantine, resend decision,
+backup/restore verification or authority to open service.
+
+Native tests cover exact ownership, extra runtime grants, wrong epochs,
+shared/exclusive lock contention, unchanged mail and ledger state, repeated
+entry, missing state, a deferred-COMMIT timeout resolved at the
+same epoch, and stale retry refusal after a fixture-simulated epoch change.
