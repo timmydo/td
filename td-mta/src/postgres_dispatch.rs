@@ -40,6 +40,7 @@ pub enum Error {
     Phase(phases::Error),
     Recovery(recovery::Error),
     RouteFailure(health::Error),
+    Candidates(crate::postgres_queue_candidates::Error),
 }
 impl From<ports::Error> for Error {
     fn from(error: ports::Error) -> Self {
@@ -213,6 +214,48 @@ pub struct Dispatches<'a, 'r> {
     pub pending: &'a Pending,
 }
 impl<'a, 'r> Dispatches<'a, 'r> {
+    /// One admitted page of passive due-work hints. Publication must still
+    /// recheck the queue clock, policy, ownership and exact recipient state.
+    pub fn candidates(
+        &self,
+        claim: &Claim,
+        generation: u64,
+        kind: crate::postgres_queue_candidates::Kind,
+        after: Option<crate::postgres_queue_candidates::Cursor>,
+        until: Deadline,
+        meter: &mut Meter,
+    ) -> Result<crate::postgres_queue_candidates::Page, Error> {
+        let pending = self
+            .pending
+            .operation
+            .try_lock()
+            .map_err(|_| ports::Error::Busy)?;
+        if pending.is_some() {
+            return Err(ports::Error::Busy.into());
+        }
+        let limit = self
+            .connection
+            .admit(until, meter, 1024 * 1024 + 128 * 1024)?;
+        let _slot = self
+            .connection
+            .slots
+            .acquire()
+            .map_err(|_| ports::Error::Busy)?;
+        let page = crate::postgres_queue_candidates::scan(
+            self.connection.request,
+            self.connection.trust,
+            limit,
+            claim,
+            generation,
+            kind,
+            after,
+        )
+        .map_err(Error::Candidates)?;
+        if Instant::now() >= limit {
+            return Err(ports::Error::Deadline.into());
+        }
+        Ok(page)
+    }
     pub fn publish(
         &self,
         claim: &Claim,

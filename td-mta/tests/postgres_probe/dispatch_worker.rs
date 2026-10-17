@@ -105,6 +105,8 @@ pub(super) fn exercise(
         guard: worker.guard.clone(),
         pending: &pending,
     };
+    candidate_admission(fixture, &worker, &forbidden, claim, generation);
+    owners::renew(request, trust, deadline(), claim, generation).unwrap();
     assert_eq!(
         forbidden
             .publish_prepared(claim, generation, input(10_000, false), &mut meter())
@@ -156,6 +158,22 @@ pub(super) fn exercise(
     assert_eq!(success.outcome().ordinals, vec![0, 1]);
     assert_eq!(success.attempt(), success.outcome().attempt);
     assert_eq!(success.envelope().recipients.len(), 2);
+    assert_eq!(pending.attempt().unwrap(), None);
+    assert_eq!(
+        worker
+            .candidates(
+                claim,
+                generation,
+                td_mta::postgres_queue_candidates::Kind::Fresh,
+                None,
+                until(10_000),
+                &mut meter()
+            )
+            .map(|_| ()),
+        Err(Error::Candidates(
+            td_mta::postgres_queue_candidates::Error::Busy
+        ))
+    );
     assert_eq!(pending.attempt().unwrap(), None);
     let mut empty = Meter::new(until(10_000), Charge::default());
     assert_eq!(
@@ -410,6 +428,19 @@ pub(super) fn exercise(
         Err(Error::Publication(attempts::Error::Indeterminate))
     );
     let attempt = pending.attempt().unwrap().unwrap();
+    for kind in [
+        td_mta::postgres_queue_candidates::Kind::Fresh,
+        td_mta::postgres_queue_candidates::Kind::Retry,
+        td_mta::postgres_queue_candidates::Kind::Expiry,
+    ] {
+        assert_eq!(
+            worker
+                .candidates(claim, generation, kind, None, until(10_000), &mut meter())
+                .map(|_| ()),
+            Err(Error::Admission(ports::Error::Busy))
+        );
+        assert_eq!(pending.attempt().unwrap(), Some(attempt));
+    }
     assert_eq!(
         success.check_current(&mut meter()),
         Err(Error::Admission(ports::Error::Busy))
@@ -620,4 +651,225 @@ pub(super) fn exercise(
     assert_eq!(sql(fixture, &format!("SELECT active FROM td_mta.submission_attempts WHERE attempt_id=decode('{attempt}','hex')")), "f");
     sql(fixture,&format!("DELETE FROM td_mta.recipients WHERE submission_id={sub}; DELETE FROM td_mta.submissions WHERE id={sub}"));
     owners::renew(request, trust, deadline(), claim, generation).unwrap();
+}
+
+fn candidate_admission(
+    fixture: &Fixture,
+    worker: &dispatch::Dispatches<'_, '_>,
+    forbidden: &dispatch::Dispatches<'_, '_>,
+    claim: &Claim,
+    generation: u64,
+) {
+    use td_mta::postgres_queue_candidates::{self as candidates, Kind};
+    let clock = &worker.connection.clock;
+    let until = |ms| Deadline::after(clock.sample().unwrap().monotonic, ms).unwrap();
+    let budget = |io_bytes, records| {
+        Meter::new(
+            until(10_000),
+            Charge {
+                io_bytes,
+                records,
+                ..Default::default()
+            },
+        )
+    };
+    let io = 1024 * 1024 + 128 * 1024;
+    let sequence = sql(
+        fixture,
+        "SELECT encode(sequence,'hex') FROM td_mta.accounts",
+    );
+    let expected = candidates::scan(
+        worker.connection.request,
+        worker.connection.trust,
+        deadline(),
+        claim,
+        generation,
+        Kind::Fresh,
+        None,
+    )
+    .unwrap();
+    let mut exact = budget(io, 4096);
+    let page = worker
+        .candidates(
+            claim,
+            generation,
+            Kind::Fresh,
+            None,
+            until(10_000),
+            &mut exact,
+        )
+        .unwrap();
+    assert_eq!(page.candidates, expected.candidates);
+    assert_eq!(page.next, expected.next);
+    assert!(page.observed_at >= expected.observed_at);
+    assert_eq!(
+        worker
+            .candidates(
+                claim,
+                generation,
+                Kind::Fresh,
+                None,
+                until(10_000),
+                &mut exact
+            )
+            .map(|_| ()),
+        Err(Error::Admission(ports::Error::Capacity))
+    );
+    for (bytes, records) in [(io - 1, 4096), (io, 4095)] {
+        assert_eq!(
+            worker
+                .candidates(
+                    claim,
+                    generation,
+                    Kind::Fresh,
+                    None,
+                    until(10_000),
+                    &mut budget(bytes, records)
+                )
+                .map(|_| ()),
+            Err(Error::Admission(ports::Error::Capacity))
+        );
+    }
+    assert_eq!(
+        worker
+            .candidates(
+                claim,
+                generation,
+                Kind::Fresh,
+                None,
+                until(0),
+                &mut budget(io, 4096)
+            )
+            .map(|_| ()),
+        Err(Error::Admission(ports::Error::Deadline))
+    );
+    let mut expired = Meter::new(
+        until(0),
+        Charge {
+            io_bytes: io,
+            records: 4096,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        worker
+            .candidates(
+                claim,
+                generation,
+                Kind::Fresh,
+                None,
+                until(10_000),
+                &mut expired
+            )
+            .map(|_| ()),
+        Err(Error::Admission(ports::Error::Deadline))
+    );
+    assert_eq!(
+        forbidden
+            .candidates(
+                claim,
+                generation,
+                Kind::Fresh,
+                None,
+                until(10_000),
+                &mut budget(io, 4096)
+            )
+            .map(|_| ()),
+        Err(Error::Admission(ports::Error::Forbidden))
+    );
+    assert_eq!(
+        worker
+            .candidates(
+                claim,
+                generation + 1,
+                Kind::Fresh,
+                None,
+                until(10_000),
+                &mut budget(io, 4096)
+            )
+            .map(|_| ()),
+        Err(Error::Candidates(candidates::Error::Owner(
+            owners::Error::Stale
+        )))
+    );
+    {
+        let cursor = page.next.unwrap();
+        assert_eq!(
+            worker
+                .candidates(
+                    claim,
+                    generation,
+                    Kind::Retry,
+                    Some(cursor),
+                    until(10_000),
+                    &mut budget(io, 4096)
+                )
+                .map(|_| ()),
+            Err(Error::Candidates(candidates::Error::Cursor))
+        );
+        let expected = candidates::scan(
+            worker.connection.request,
+            worker.connection.trust,
+            deadline(),
+            claim,
+            generation,
+            Kind::Fresh,
+            Some(cursor),
+        )
+        .unwrap();
+        let next = worker
+            .candidates(
+                claim,
+                generation,
+                Kind::Fresh,
+                Some(cursor),
+                until(10_000),
+                &mut budget(io, 4096),
+            )
+            .unwrap();
+        assert_eq!(next.candidates, expected.candidates);
+        assert_eq!(next.next, expected.next);
+    }
+    let attempt = td_mta::ids::AttemptId::from_bytes([222; 16]);
+    let final_budget = || budget(4 * 1024 * 1024, 8192);
+    let held = worker
+        .reserve_final(attempt, until(10_000), &mut final_budget())
+        .unwrap();
+    assert_eq!(
+        worker
+            .candidates(
+                claim,
+                generation,
+                Kind::Fresh,
+                None,
+                until(10_000),
+                &mut budget(io, 4096)
+            )
+            .map(|_| ()),
+        Err(Error::Admission(ports::Error::Busy))
+    );
+    drop(held);
+    worker
+        .candidates(
+            claim,
+            generation,
+            Kind::Fresh,
+            None,
+            until(10_000),
+            &mut budget(io, 4096),
+        )
+        .unwrap();
+    drop(
+        worker
+            .reserve_final(attempt, until(10_000), &mut final_budget())
+            .unwrap(),
+    );
+    assert_eq!(worker.pending.attempt().unwrap(), None);
+    assert_eq!(
+        sql(
+            fixture,
+            "SELECT encode(sequence,'hex') FROM td_mta.accounts"
+        ),
+        sequence
+    );
 }

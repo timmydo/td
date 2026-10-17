@@ -5436,3 +5436,31 @@ or change final DATA terminator custody or pacing.
 The paired TLS test drives successful command output, an idle reply turn,
 a productive partial reply and another idle turn, proving that the hint
 resets rather than carrying output or read progress into an idle operation.
+
+
+## 190. Admitted route-candidate discovery
+
+Dispatches::candidates wraps the existing route scanner in the same bounded
+worker admission as attempt publication. Only Runtime connections enter;
+Pending must be empty and its nonblocking operation guard spans the read.
+Each page prepays 1 MiB+128 KiB protocol I/O and 4096 records, reserves one
+ordinary ReadPermit, and uses the minimum of the supplied deadline, current
+meter deadline and ten-second operation cap. Slot or work exhaustion refuses
+without waiting, and successful reads must still finish before that cap.
+The database connection closes before the slot returns. No read installs,
+clears or settles a Pending operation.
+
+Fresh, retry and expiry pages retain the scanner's existing policy, ownership,
+route-health, active-attempt, ordering and cursor rules. Pages contain at most
+64 passive hints, not reservations or SMTP authority. A new scheduling pass
+still restarts pagination. Candidate timestamps do not update or bypass the
+persistent queue-clock guard; Prepared/expiry publication must independently
+recheck the clock, current policy, owner and exact durable state. No scheduler,
+transport or production backend is activated.
+
+The native dispatch fixture compares admitted pages with the standalone
+scanner and checks one-byte/one-record-short and nonrenewing exact budgets,
+expired input/meter deadlines, preparation-mode refusal, stale ownership,
+cursor binding, slot exhaustion/reclamation and unchanged account state.
+An existing delayed Prepared COMMIT verifies all three scan kinds refuse
+while the exact unresolved operation remains in Pending.

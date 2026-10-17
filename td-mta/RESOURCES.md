@@ -5356,3 +5356,13 @@ permit release and before negative/positive DATA publication, Body/source
 admission or passive evidence handoff. Original Pending, identity, policy,
 ownership, clock and deadline checks remain mandatory on every output turn.
 Direct low-level envelope observations retain their existing per-call profile.
+
+
+Route-candidate pages through Dispatches prepay 1 MiB+128 KiB I/O and 4096
+records and hold one ordinary read slot for the bounded query. The existing
+mailbox protocol profile bounds input to 1 MiB, output to 64 KiB and Runtime
+frames to 1024; at most 64 returned hints survive. Original input/meter and
+ten-second operation caps apply, with no waiting queue or retained connection.
+The shared Pending guard excludes another dispatch operation for that read;
+receipt settlement remains on independently admitted capacity. Candidate
+observations do not change queue-clock admission or grant SMTP permission.
