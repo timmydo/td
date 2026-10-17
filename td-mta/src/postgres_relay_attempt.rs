@@ -215,11 +215,14 @@ pub fn drive<'w, 'a, 'r, B: TlsWireStorage>(
     let completed = ready.with_source(source_slots, source_work, maximum, |source| {
         let mut exchange = source.begin(scratch.body(), wire, database)?;
         loop {
+            let was_io = exchange.writes_pending();
             match exchange.advance()? {
                 data::SourceProgress::Pending(next) => exchange = next,
                 data::SourceProgress::Ready => return Ok(()),
             }
-            wait(limit);
+            if was_io && exchange.writes_pending() {
+                wait(limit);
+            }
         }
     });
     let completed = match completed {

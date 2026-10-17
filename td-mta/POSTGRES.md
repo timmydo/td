@@ -5289,9 +5289,12 @@ conversions. Discard generic fallback if settlement retires the attempt.
 Otherwise it addresses only unresolved durable state. Durable Possible stays
 uncertain even when source postvalidation fails before a terminator is sent.
 
-Pending turns sleep at most five milliseconds under the captured upper cap;
-the next existing phase advance owns any tighter deadline and exact refusal
-evidence. The driver adds no fresh budgets, renewed deadlines, connection
+Pending commands sleep at most five milliseconds under the captured upper
+cap. Body transfer waits only when a Write/Flush turn still has Write/Flush
+work afterward; pure source/codec turns and completed writes leading back
+to encoding proceed immediately. This phase hint is crate-private and
+supplies no authority. The next existing phase advance owns any tighter
+deadline and exact refusal evidence. The driver adds no fresh budgets, renewed deadlines, connection
 pool, thread, scheduler, retry or backend activation. The eight-turn Body
 qualification and maximum-message/backpressure limitations remain unchanged.
 

@@ -5296,7 +5296,10 @@ the preceding owner releases it.
 Wire and database meters span the entire attempt without replenishment.
 Immutable source work and two independent source slots remain explicit.
 Existing advances charge their work; the driver adds no second charge.
-Pending polling waits at most five milliseconds under the retained upper
-cap; each phase still checks its possibly tighter deadline before work.
+Pending commands and repeated body Write/Flush turns wait at most five
+milliseconds under the retained upper cap. Source reads and codec turns
+with runnable work proceed without that polling delay. The phase hint
+borrows existing state and adds no storage. Each advance still checks its
+possibly tighter deadline before work.
 This bounded driver does not qualify maximum-body throughput or arbitrary
 backpressure, and the eight-credit Body allowance remains unchanged.

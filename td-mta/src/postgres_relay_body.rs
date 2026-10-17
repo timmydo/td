@@ -78,6 +78,10 @@ pub fn begin<'m, 'w, 'a, 'r, B: TlsWireStorage>(
         .map(|inner| Exchange { inner })
 }
 impl<'m, 'w, 'a, 'r, B: TlsWireStorage> Exchange<'m, 'w, 'a, 'r, B> {
+    pub(crate) fn writes_pending(&self) -> bool {
+        self.inner.exchange.writes_pending()
+    }
+
     pub fn advance(self) -> Result<Progress<'m, 'w, 'a, 'r, B>, Refusal<B>> {
         match self.inner.advance()? {
             State::Pending(inner) => Ok(Progress::Pending(Self { inner })),

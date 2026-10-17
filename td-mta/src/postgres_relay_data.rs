@@ -209,6 +209,10 @@ pub enum SourceProgress<'m, 'w, 'a, 'r, B: TlsWireStorage> {
     Ready,
 }
 impl<'m, 'w, 'a, 'r, B: TlsWireStorage> SourceExchange<'m, 'w, 'a, 'r, B> {
+    pub(crate) fn writes_pending(&self) -> bool {
+        self.inner.writes_pending()
+    }
+
     pub fn advance(self) -> Result<SourceProgress<'m, 'w, 'a, 'r, B>, transfer::Refusal<B>> {
         match self.inner.advance()? {
             transfer::Progress::Pending(inner) => Ok(SourceProgress::Pending(Self {
