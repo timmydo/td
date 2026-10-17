@@ -26,6 +26,7 @@ const ROLE: &str = "SELECT current_user=session_user AND r.rolcanlogin
 
 const TABLES: &[(&str, Access)] = &[
     ("schema_migrations", Access::Read),
+    ("runtime_barrier", Access::Read),
     ("config_materials", Access::Read),
     ("config_material_chunks", Access::Read),
     ("config_versions", Access::Read),
@@ -119,6 +120,7 @@ pub enum Error {
     Schema(postgres_schema::Error),
     Role,
     Privileges,
+    Maintenance,
     Database,
 }
 
@@ -181,6 +183,20 @@ pub(crate) async fn qualify(client: &Client) -> Result<(), Error> {
         if !allowed {
             return Err(Error::Privileges);
         }
+    }
+    let rows = client
+        .query(
+            "SELECT singleton,blocked FROM td_mta.runtime_barrier LIMIT 2",
+            &[],
+        )
+        .await
+        .map_err(|_| Error::Database)?;
+    let row = rows.first().ok_or(Error::Maintenance)?;
+    if rows.len() != 1
+        || !row.try_get::<_, bool>(0).map_err(|_| Error::Database)?
+        || row.try_get::<_, bool>(1).map_err(|_| Error::Database)?
+    {
+        return Err(Error::Maintenance);
     }
     Ok(())
 }

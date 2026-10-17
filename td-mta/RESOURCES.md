@@ -5462,3 +5462,11 @@ The explicit limits can be larger than the finite worker can finish. Such an
 account refuses without a partial report. Every pass, body digest, aggregate
 comparison, acknowledged rollback and final deadline check must complete;
 there is no continuation or maintenance-time extension in this increment.
+
+## PostgreSQL runtime maintenance refusal
+
+Common runtime qualification adds one query returning at most two rows of two
+booleans. The same connection input/frame/output and original deadline limits
+cover it; no budget is renewed. It retains no barrier cache or permit. Missing,
+blocked or unreadable state refuses qualification; existing finite operations
+and external network fencing remain separate, as specified in POSTGRES 205.

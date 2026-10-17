@@ -167,6 +167,9 @@ fn check(loaded: &Loaded, operation: Operation) -> Result<Outcome, (&'static str
                         }
                         Error::Schema(error) => AttemptError::from(error),
                         Error::Role => AttemptError::Failed("runtime", "owner-or-privileged-role"),
+                        Error::Maintenance => {
+                            AttemptError::Failed("runtime", "maintenance-barrier")
+                        }
                         Error::Privileges => {
                             AttemptError::Failed("runtime", "incorrect-data-privileges")
                         }
@@ -253,6 +256,7 @@ fn classify(error: postgres_schema::Error) -> (&'static str, &'static str) {
                 postgres_probe::Error::RuntimeSchema => "runtime-schema-qualification",
                 postgres_probe::Error::RuntimeRole => "runtime-owner-or-privileged-role",
                 postgres_probe::Error::RuntimePrivileges => "runtime-data-privileges",
+                postgres_probe::Error::RuntimeMaintenance => "maintenance-barrier",
                 postgres_probe::Error::Transport => "transport",
             },
         ),

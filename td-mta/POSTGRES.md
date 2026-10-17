@@ -2020,7 +2020,7 @@ privileges refuse. Column grants are checked as well as table grants.
 
 Provision the dedicated login through PostgreSQL/provider administration;
 keep its password out of argv. For a fresh `td_mta_runtime` login, the owner
-can grant the schema-18 privileges atomically as follows:
+can grant the current schema privileges atomically as follows:
 
 ```sql
 BEGIN;
@@ -2028,7 +2028,8 @@ GRANT USAGE ON SCHEMA td_mta TO td_mta_runtime;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA td_mta
     TO td_mta_runtime;
 REVOKE INSERT, UPDATE, DELETE ON
-    td_mta.schema_migrations, td_mta.config_materials,
+    td_mta.schema_migrations, td_mta.runtime_barrier,
+    td_mta.config_materials,
     td_mta.config_material_chunks, td_mta.config_versions,
     td_mta.config_version_chunks, td_mta.config_selection,
     td_mta.config_selection_receipts, td_mta.account_bootstraps,
@@ -5892,3 +5893,35 @@ limits, metadata checks, usage integrity, body checks and database failures.
 No SQL error text, credentials or body content is printed. The process
 fixture verifies JSON values, absent-account and epoch refusals, decimal and
 aggregate bounds, counter/body corruption and preservation of damaged rows.
+
+## 205. Runtime maintenance refusal foundation
+
+Migration 28 adds the owner-controlled `runtime_barrier` singleton, initially
+unblocked. The dedicated runtime role has SELECT only on this table, and the
+exact privilege qualification rejects broader column/table write authority.
+After role and privilege checks, common runtime qualification requires exactly
+one `(singleton=true, blocked=false)` row. A blocked or missing singleton
+refuses with the distinct maintenance error; query/type failures also refuse.
+
+This check applies to each new Runtime connection and the existing retained
+validators' per-turn runtime qualification. It does not revoke already-admitted
+network I/O or make a previously captured snapshot see newer rows. Existing
+operations retain their original finite limits and migration locks. Owner
+Preparation schema inspection remains available while the barrier is set;
+`runtime-check` remains a runtime qualification and refuses maintenance.
+
+This increment supplies enforcement only. It introduces no supported barrier
+entry/release command, epoch renewal, delivery quarantine or recovery approval.
+A future owner transition must hold the exclusive migration lock and require
+external fencing of old instances and SMTP egress; shared locks prevent it
+from racing qualified database operations. A database flag cannot establish
+external fencing or decide duplicate-delivery risk. Recovery must not clear
+this barrier until its separately specified quarantine, credential/configuration
+and semantic-state requirements are satisfied.
+
+Prior migration bytes/checksums remain unchanged. Upgrade is atomic, preserves
+store epoch and existing state, and initializes the singleton only in the new
+migration. Native coverage includes upgrade from version 27 with obstruction
+rollback, blocked/missing runtime refusal, owner inspection and rejection of
+runtime write privilege. Fixture-only SQL toggles do not implement the future
+owner recovery transition protocol.
