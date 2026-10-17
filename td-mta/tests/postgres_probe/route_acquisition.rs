@@ -167,6 +167,19 @@ pub(super) fn exercise(
         worker.acquire_route(historical.clone(), until(10_000), &mut work()),
         Err(Error::Admission(ports::Error::Busy))
     );
+    assert_eq!(
+        worker.expire(
+            td_mta::postgres_queue_expiry::prepare(
+                uncertain,
+                4,
+                SubmissionId::from_bytes([211; 16]),
+            )
+            .unwrap(),
+            until(10_000),
+            &mut work(),
+        ),
+        Err(Error::Admission(ports::Error::Busy))
+    );
     for kind in [Kind::Fresh, Kind::Retry, Kind::Expiry] {
         assert_eq!(
             worker

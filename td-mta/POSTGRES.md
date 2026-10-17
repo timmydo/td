@@ -5478,7 +5478,7 @@ definite failure clear custody; an unknown COMMIT retains the exact claim.
 No further scan, attempt, phase or acquisition can pass that barrier.
 
 Pending::identity replaces its attempt-only accessor with a closed identity
-sum: Attempt or RouteClaim. Existing attempt publication, recovery and route
+sum: Attempt, RouteClaim or Expiry. Existing attempt publication, recovery and route
 failure identities are unchanged. Pending::settle uses independently admitted
 capacity to inspect the retained claim receipt, with no acquisition replay.
 Absence and errors preserve custody; a matching receipt clears it and returns
@@ -5494,3 +5494,39 @@ COMMIT. All candidate kinds and further worker publication refuse while the
 claim remains unresolved. Removing the receipt temporarily proves absence
 cannot clear Pending; restoration permits inspection-only settlement. These
 cases preserve account sequence and leave both slot pools reusable.
+
+## 192. Admitted expiry and retained uncertainty
+
+`Dispatches::expire` brings one prepared queue-expiry operation under the
+relay worker's existing Runtime, original deadline, work-meter, ordinary-slot
+and Pending admission. The caller must close its route's SMTP transport
+before expiry, including the current owner's attempt. This worker entry point
+activates no scheduler and grants no transport authority.
+
+Admission prepays the existing receipt inspection and possible publication
+connection ceilings. The shared Pending slot takes the exact owned Expiry
+before SQL; its public identity is `Identity::Expiry(SubmissionExpiryId)`.
+Known publication or historical replay returns the outcome and clears
+custody; definite failure clears custody; an unknown COMMIT retains the
+operation and excludes every further worker operation. Independent settlement
+capacity can inspect only that exact receipt. Absence and errors retain the
+barrier; `Settlement::Expiry` clears it only on a matching historical outcome.
+Settlement never retries publication or changes recipient state.
+
+The underlying expiry transaction retains fresh policy and owner fencing,
+explicit queue-clock confirmation after the real five-minute stability hold,
+process-local and database-wide spacing, at most 100 recipients, current
+attempt reservation handling, uncertainty preservation and one account
+sequence change. Admission does not confirm or replace the shared clock
+guard. Every expiry clock-guard access uses nonblocking lock acquisition;
+contention refuses as Clock(Invalid) without waiting for another holder. Historical receipt replay may settle during a new clock hold because
+it cannot perform another expiry mutation.
+
+The native submission fixture starts a real runtime clock and database-UTC
+guard during setup, waits out any remaining hold while renewing the current route lease,
+then explicitly confirms
+it before the expiry exercise. It drives the existing delayed-COMMIT expiry
+through this worker, including absent-receipt retention, separate settlement
+capacity, blocked worker operations, pre-SQL admission refusals, unconfirmed
+clock refusal, historical replay, nonrenewing budgets and reclaimed slots.
+The existing recipient-state and sequence assertions remain in force.

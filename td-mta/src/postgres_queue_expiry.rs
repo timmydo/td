@@ -188,7 +188,7 @@ pub fn publish(
                 .await
                 .map_err(Error::Owner)?;
             let mut token = guard
-                .lock()
+                .try_lock()
                 .map_err(|_| Error::Clock(queue_clock::Error::Invalid))?
                 .admit_expiry(sample(clock.as_ref(), timestamp)?)
                 .map_err(Error::Clock)?;
@@ -356,7 +356,7 @@ pub fn publish(
                 .await
                 .map_err(Error::Owner)?;
             guard
-                .lock()
+                .try_lock()
                 .map_err(|_| Error::Clock(queue_clock::Error::Invalid))?
                 .validate_expiry(&mut token, sample(clock.as_ref(), published)?)
                 .map_err(Error::Clock)?;
@@ -397,7 +397,7 @@ pub fn publish(
                 .await
                 .map_err(Error::Owner)?;
             guard
-                .lock()
+                .try_lock()
                 .map_err(|_| Error::Clock(queue_clock::Error::Invalid))?
                 .validate_expiry(&mut token, sample(clock.as_ref(), final_time)?)
                 .map_err(Error::Clock)?;

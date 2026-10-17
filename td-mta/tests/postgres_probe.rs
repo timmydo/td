@@ -26,6 +26,7 @@ struct Fixture {
     server: Option<Child>,
     port: u16,
     ca: Vec<u8>,
+    queue_runtime: Option<queue_expiry::Runtime>,
 }
 impl Fixture {
     fn new() -> Self {
@@ -43,6 +44,7 @@ impl Fixture {
             server: None,
             port,
             ca: Vec::new(),
+            queue_runtime: None,
         };
         fs::write(fixture.root.join("password"), PASSWORD).unwrap();
         fixture.run(
@@ -2484,7 +2486,10 @@ fn exercise_configuration(exercise: ConfigurationExercise) {
         postgres_materials::{self as materials, Kind, Version},
         postgres_schema,
     };
-    let fixture = Fixture::new();
+    let mut fixture = Fixture::new();
+    if matches!(exercise, ConfigurationExercise::Submissions) {
+        fixture.queue_runtime = Some(queue_expiry::Runtime::new(&fixture));
+    }
     let trust = TrustStore::from_pem(&fixture.ca).unwrap();
     let request = fixture.request();
     let epoch = postgres_schema::initialize(&request, &trust, deadline())
@@ -11842,3 +11847,6 @@ mod native_data_exchange;
 
 #[path = "postgres_probe/route_acquisition.rs"]
 mod route_acquisition;
+
+#[path = "postgres_probe/expiry_admission.rs"]
+mod expiry_admission;

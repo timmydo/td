@@ -5373,7 +5373,20 @@ one receipt connection and at most one mutation connection, using one ordinary
 slot sequentially. Their existing protocol ceilings remain 1 MiB input per
 connection, 64/128 KiB output and Runtime 1024/1088 frames respectively.
 The shared Pending enum retains one bounded Claim only after admission; its
-identity distinguishes an attempt from a route-claim operation. Settlement
+identity distinguishes attempt, route-claim and expiry operations. Settlement
 prepays the same conservative work bound on independently supplied slots,
 performs receipt inspection only and retains the claim on absence or error.
 No waiting queue, connection retention or transport authority is added.
+
+The admitted queue-expiry worker uses the same two-connection conservative
+prepayment as route acquisition: two MiB input plus 192 KiB output and 4096
+records. Receipt inspection and possible publication run sequentially under
+one ordinary permit and the original deadline capped at ten seconds. Their
+Runtime frame ceilings remain 1024 and 1088. The exact bounded Expiry occupies
+one shared Pending slot after admission; unknown COMMIT retains it until
+inspect-only settlement finds its receipt. Settlement uses independently
+reserved capacity, conservatively prepays the same work and never renews the
+original publication or SMTP budget. An expiry outcome is historical only.
+The existing confirmed clock guard, spacing and 100-recipient transaction
+limit remain mandatory; this admission layer neither confirms the clock nor
+allocates an unbounded queue of expiry operations.

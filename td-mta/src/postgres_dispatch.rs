@@ -1,13 +1,14 @@
-//! Bounded attempt and phase publication custody for a trusted relay worker.
+//! Bounded queue-operation publication custody for a trusted relay worker.
 use crate::{
     admission::work::{Charge, Meter, Stop},
     clock::RuntimeClock,
-    ids::{AttemptId, RouteClaimId, SubmissionId},
+    ids::{AttemptId, RouteClaimId, SubmissionExpiryId, SubmissionId},
     ports::{self, Clock, Deadline},
     postgres_attempt_phases::{self as phases, Change},
     postgres_attempt_recovery as recovery,
     postgres_attempts::{self as attempts, Dispatch},
     postgres_probe::{Mode, Request, ValidationBudget},
+    postgres_queue_expiry as expiry,
     postgres_read::{ReadPermit, ReadSlots},
     postgres_route_health as health,
     postgres_route_owners::{self as owners, Claim},
@@ -19,6 +20,8 @@ use std::{
 };
 use td_crypto::TrustStore;
 
+#[path = "postgres_dispatch_expiry.rs"]
+mod expiration;
 #[path = "postgres_prepared_failure.rs"]
 mod failure;
 #[path = "postgres_dispatch_routes.rs"]
@@ -44,6 +47,7 @@ pub enum Error {
     RouteFailure(health::Error),
     Candidates(crate::postgres_queue_candidates::Error),
     Owner(owners::Error),
+    Expiry(expiry::Error),
 }
 impl From<ports::Error> for Error {
     fn from(error: ports::Error) -> Self {
@@ -108,7 +112,7 @@ impl Connection<'_, '_> {
     }
 }
 /// Retain for the relay worker's lifetime. An unresolved COMMIT blocks another
-/// acquisition, attempt or phase; settlement only inspects the exact receipt.
+/// acquisition, attempt, phase or expiry; settlement inspects the exact receipt.
 #[derive(Default)]
 pub struct Pending {
     operation: Mutex<Option<Operation>>,
@@ -119,12 +123,14 @@ enum Operation {
     Recovery(Box<recovery::Recovery>),
     RouteFailure(Box<health::Change>),
     RouteClaim(Box<Claim>),
+    Expiry(Box<expiry::Expiry>),
 }
-/// Exact unresolved work identity; neither variant grants transport authority.
+/// Exact unresolved work identity; no variant grants transport authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Identity {
     Attempt(AttemptId),
     RouteClaim(RouteClaimId),
+    Expiry(SubmissionExpiryId),
 }
 impl Operation {
     fn identity(&self) -> Identity {
@@ -134,6 +140,7 @@ impl Operation {
             Self::Recovery(value) => Identity::Attempt(value.attempt()),
             Self::RouteFailure(value) => Identity::Attempt(value.attempt()),
             Self::RouteClaim(value) => Identity::RouteClaim(value.operation()),
+            Self::Expiry(value) => Identity::Expiry(value.operation()),
         }
     }
 }
@@ -145,6 +152,7 @@ pub enum Settlement {
     Recovery(recovery::Outcome),
     RouteFailure(health::Outcome),
     RouteClaim(owners::Grant),
+    Expiry(expiry::Outcome),
 }
 impl Pending {
     pub fn identity(&self) -> Result<Option<Identity>, Error> {
@@ -176,7 +184,7 @@ impl Pending {
             return Ok(None);
         };
         let io = match operation {
-            Operation::Dispatch(_) | Operation::RouteClaim(_) => ATTEMPT_IO,
+            Operation::Dispatch(_) | Operation::RouteClaim(_) | Operation::Expiry(_) => ATTEMPT_IO,
             Operation::Phase(_) | Operation::Recovery(_) | Operation::RouteFailure(_) => PHASE_IO,
         };
         let limit = connection.admit(until, meter, io)?;
@@ -201,6 +209,11 @@ impl Pending {
                 health::inspect(connection.request, connection.trust, limit, value)
                     .map_err(Error::RouteFailure)?
                     .map(Settlement::RouteFailure)
+            }
+            Operation::Expiry(value) => {
+                expiry::inspect(connection.request, connection.trust, limit, value)
+                    .map_err(Error::Expiry)?
+                    .map(Settlement::Expiry)
             }
             Operation::RouteClaim(value) => {
                 owners::inspect(connection.request, connection.trust, limit, value)

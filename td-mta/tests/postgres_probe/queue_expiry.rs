@@ -16,6 +16,75 @@ use td_mta::{
     postgres_route_owners::{self as owners, Claim},
     queue_clock::Guard,
 };
+pub(super) struct Runtime {
+    pub clock: Arc<td_mta::clock::RuntimeClock>,
+    pub guard: Arc<Mutex<Guard>>,
+    stable_at: u64,
+}
+impl Runtime {
+    fn sample(&self, fixture: &Fixture) -> Time {
+        Time {
+            utc_ms: sql(
+                fixture,
+                "SELECT (extract(epoch FROM clock_timestamp())*1000)::bigint",
+            )
+            .parse()
+            .unwrap(),
+            monotonic: self.clock.sample().unwrap().monotonic,
+        }
+    }
+    pub(super) fn new(fixture: &Fixture) -> Self {
+        let clock = Arc::new(td_mta::clock::RuntimeClock::new());
+        let sample = Time {
+            utc_ms: sql(
+                fixture,
+                "SELECT (extract(epoch FROM clock_timestamp())*1000)::bigint",
+            )
+            .parse()
+            .unwrap(),
+            monotonic: clock.sample().unwrap().monotonic,
+        };
+        Self {
+            clock,
+            guard: Arc::new(Mutex::new(Guard::new(sample).unwrap())),
+            stable_at: sample.monotonic.0 + 300_000,
+        }
+    }
+    fn confirm(
+        &self,
+        fixture: &Fixture,
+        request: &Request<'_>,
+        trust: &TrustStore,
+        claim: &Claim,
+        generation: u64,
+    ) {
+        let now = self.clock.sample().unwrap().monotonic.0;
+        if now < self.stable_at {
+            eprintln!(
+                "waiting {}ms for the real queue clock hold",
+                self.stable_at - now
+            );
+        }
+        loop {
+            let now = self.clock.sample().unwrap().monotonic.0;
+            if now >= self.stable_at {
+                break;
+            }
+            owners::renew(request, trust, deadline(), claim, generation).unwrap();
+            thread::sleep(Duration::from_millis((self.stable_at - now).min(10_000)));
+        }
+
+        assert!(
+            self.guard
+                .lock()
+                .unwrap()
+                .confirm(self.sample(fixture))
+                .unwrap()
+                .expiry
+        );
+    }
+}
+
 struct TestClock {
     start: Instant,
     expire_on_sample: AtomicU64,
@@ -72,6 +141,11 @@ pub(super) fn exercise(
     generation: u64,
     submission: SubmissionId,
 ) {
+    fixture
+        .queue_runtime
+        .as_ref()
+        .unwrap()
+        .confirm(fixture, request, trust, claim, generation);
     owners::renew(request, trust, deadline(), claim, generation).unwrap();
     let value = expiry::prepare(claim, generation, submission).unwrap();
     let (clock, guard) = confirmed(fixture);
@@ -178,27 +252,9 @@ pub(super) fn exercise(
 
     thread::sleep(Duration::from_millis(1100));
     sql(fixture,"CREATE FUNCTION public.delay_expiry() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(3); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_expiry AFTER INSERT ON td_mta.submission_expiry_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_expiry()");
-    assert_eq!(
-        expiry::publish(
-            request,
-            trust,
-            Instant::now() + Duration::from_millis(1500),
-            &value,
-            clock.clone(),
-            guard.clone()
-        ),
-        Err(expiry::Error::Indeterminate)
+    let first = super::expiry_admission::exercise(
+        fixture, request, trust, claim, generation, submission, &value,
     );
-    thread::sleep(Duration::from_secs(4));
-    let first = expiry::publish(
-        request,
-        trust,
-        deadline(),
-        &value,
-        clock.clone(),
-        guard.clone(),
-    )
-    .unwrap();
     assert_eq!(first.recipients, 2);
     assert_eq!(
         sql(
