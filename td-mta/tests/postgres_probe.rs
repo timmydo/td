@@ -11917,3 +11917,6 @@ mod usage_commands;
 
 #[path = "postgres_probe/blob_audit.rs"]
 mod blob_audit;
+
+#[path = "postgres_probe/metadata_audit.rs"]
+mod metadata_audit;

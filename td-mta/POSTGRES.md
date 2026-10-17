@@ -5795,3 +5795,41 @@ or serving authority, complete-store certificate or restore approval. The
 native PostgreSQL fixture checks corrupt bytes and extents, ordinal gaps,
 manifest/sequence inconsistency, empty bodies, account isolation and absence
 of device credentials while pinning the narrower verification scope.
+
+## 202. Historical canonical metadata audit
+
+`postgres_metadata_audit::inspect` runs the shared `metadata_sweep` against
+all eleven canonical PostgreSQL metadata tables in one owner-side primary
+REPEATABLE READ, READ ONLY transaction. The expected epoch and shared
+migration lock precede the snapshot. The caller supplies trusted UTC and
+explicit row/parent-read limits; no device credential or serving profile is
+required. The private adapter cannot escape the worker or expose history
+reads. It refuses `next_change`; this is no change-history certificate.
+
+Account-scoped keyset reads return one row, in decoded `Key::compare` order.
+Compound text and import keys use their logical SQL column tuples and C
+collation, not transient length-prefixed encodings. PostgreSQL fields become
+shared typed rows and pass their canonical encoder/decoder and key checks.
+SMTP origins additionally read at most 1001 ordered receipt recipients,
+refusing count disagreement, ordinal gaps, excess or malformed receipt data.
+Receipt rows on a non-SMTP Email also refuse. Every canonical changed sequence
+must be no later than the captured account sequence; sequences retain all
+64 bits. Parent lookups stay in the same snapshot and account.
+
+The existing shared checks enforce local row rules, direct owning references,
+rooted mailbox chains and exact submission recipient coverage. Their report
+retains the snapshot identity and counts. It does not add policy checks that
+those shared checks lack (for example uniqueness of mailbox roles), audit
+usage counters, body bytes, credentials, configuration, retained operation or
+delivery receipts, or change history. No whole-store, restore, serving or
+current authority follows. Independently collected body/counter reports must
+not be presented as one consistent account snapshot.
+
+The existing body-worker budgets and original ten-second deadline cover the
+complete sweep and acknowledged ROLLBACK. Success also checks the original
+deadline after worker destruction. Logical sweep bounds never renew wire or
+time budgets; a large account may refuse without a partial success report.
+Failures close the connection and perform no repair. Native PostgreSQL
+coverage exercises every table, compound cursor order, malformed rows,
+mailbox cycles, recipient coverage, SMTP receipt framing, caller bounds,
+account isolation and the explicit body/counter exclusions.

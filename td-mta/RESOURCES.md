@@ -5427,3 +5427,22 @@ one chunk batch, digest state and public metadata; no complete message buffer
 or body bytes escape. Success follows acknowledged snapshot rollback and a
 final deadline check. This is historical single-body verification, not whole
 store verification, resource admission or restore authority.
+
+## PostgreSQL canonical metadata audit
+
+The owner-side metadata sweep uses one existing body worker: 128 MiB total
+plaintext input, 8192 inbound frames, 512 KiB output and the original deadline
+capped at ten seconds. No limit renews between lookups. One keyset/exact query
+retains at most one canonical SQL row. An Email lookup also retains at most
+1001 receipt rows (at most 254 address bytes each); shared receipt encoding
+refuses beyond 1000 recipients or 32768 encoded bytes. The client additionally
+holds one shared MAX_VALUE_BYTES buffer, a MAX_KEY_BYTES buffer, fixed sweep
+state and a 32768-byte receipt encoding buffer. Parameter/key strings are
+bounded by canonical key limits. No account-sized collection is retained.
+
+Caller row bounds apply independently to each shared pass; parent reads have
+one separate bound. SQL statements retain their finite server timeout. Wire
+and deadline exhaustion can refuse before logical limits; success requires
+all shared passes, acknowledged rollback and the final deadline check. The
+report covers canonical field/reference, mailbox-chain and recipient-coverage
+checks only, with the exclusions in POSTGRES section 202.
