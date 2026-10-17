@@ -930,7 +930,8 @@ with a fixed golden vector and malformed-token/entropy-failure tests.
 
 Version 4 adds an owner-private devices table. The postgres_devices module
 provides explicit owner-side preparation and publication APIs, plus a cold
-credential check. No serving or command path calls them yet. Runtime device
+credential check. Creation and revocation remain preparation APIs; section 193
+adds explicit read-only registry inspection. Runtime device
 privileges, HTTP authentication and authorization inside admitted mail
 snapshots/transactions remain cutover work. The existing file registry
 remains production authority until then.
@@ -5530,3 +5531,42 @@ through this worker, including absent-receipt retention, separate settlement
 capacity, blocked worker operations, pre-SQL admission refusals, unconfirmed
 clock refusal, historical replay, nonrenewing budgets and reclaimed slots.
 The existing recipient-state and sequence assertions remain in force.
+
+## 193. Bounded administrative device listing
+
+`postgres_devices::list` reads one account's complete device registry,
+including revoked rows, under a fresh repeatable-read, read-only snapshot.
+It validates the primary, current schema and expected store epoch while
+retaining the session migration lock, distinguishes an absent account from
+an empty registry, and acknowledges rollback before returning a successful
+result. Every path closes the connection. No account
+write fence is taken and no mail sequence, credential or receipt is changed.
+
+The query selects only ID, label, creation time and revocation time, ordered
+by ID. It never requests passwords, salts, verifiers or request digests.
+At most 257 rows are fetched so a registry exceeding the existing 256-device
+ceiling is refused without a truncated success. IDs, labels and nonnegative
+timestamps are validated before any result is returned. The returned public
+metadata is historical and cannot authorize authentication or a mail operation.
+
+The explicit preparation command is:
+
+```text
+td-mta postgres device-list --connection-file PATH --epoch HEX --account ID
+```
+
+It uses the protected connection-file loader, verified TLS/SCRAM, fresh
+bounded DNS resolution and the existing shared ten-second connection/operation
+deadline. Database credentials must have the required schema/account and
+metadata-column read privileges. The command grants none. The syntactic
+bootstrap profile placeholder selects no running profile. JSON output binds
+the expected epoch and account and contains the four public fields for each
+device, with escaped labels and nullable revoked_at. Errors report fixed
+categories without connection inputs or provider diagnostics. This supplies
+inspection after lost creation output; it neither recovers a password nor
+creates, revokes, authenticates or activates a credential or service.
+
+The native fixture exercises the API and actual command with a role lacking
+salt/verifier read privileges, Unicode and quoted labels, revoked entries,
+empty and foreign accounts, stale epoch, malformed metadata, exact capacity
+and overflow refusal. Device enumeration leaves account sequences unchanged.

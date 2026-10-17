@@ -15,6 +15,10 @@ use std::{
 use td_crypto::{Crypto, Digest, Entropy, Provider, SystemEntropy, TrustStore};
 use tokio_postgres::Client;
 
+#[path = "postgres_device_list.rs"]
+mod listing;
+pub use listing::{list, DeviceSummary};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
     Schema(postgres_schema::Error),

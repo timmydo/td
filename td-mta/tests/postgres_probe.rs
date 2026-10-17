@@ -11850,3 +11850,6 @@ mod route_acquisition;
 
 #[path = "postgres_probe/expiry_admission.rs"]
 mod expiry_admission;
+
+#[path = "postgres_probe/device_listing.rs"]
+mod device_listing;
