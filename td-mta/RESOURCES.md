@@ -5403,3 +5403,16 @@ A successful snapshot acknowledges rollback; every connection closes before
 command output. No
 connection pool, response spool, retained credential or serving authority is
 created by enumeration.
+
+### PostgreSQL usage-counter audit
+
+The explicit historical account usage audit uses the ordinary owner-side
+probe: one connection, a ten-second absolute deadline, 128 inbound frames,
+one MiB total plaintext input and 64 KiB output. Queries return at most two
+account/usage rows and one aggregate row; no body or metadata collection is
+materialized by the client. Five fixed counters and one view identity form
+the result. Server statement timeouts bound the aggregate scans;
+numeric overflow and any deadline or query failure refuse rather than return
+a partial report. Read-only snapshot rollback and the final clock check must
+finish before success. No runtime pool reservation or full semantic-check
+coverage is claimed by this administrative preparation operation.

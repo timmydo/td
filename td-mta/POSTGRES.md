@@ -5713,3 +5713,35 @@ listener, runtime generation or PostgreSQL production backend. Receipt success
 does not assert that its version is still selected or that current materials
 are usable. The finite 1024-receipt ceiling and lack of pruning remain exact;
 these commands add no receipt-retention or automatic deployment policy.
+
+## 199. Historical account usage audit
+
+`postgres_usage_audit::inspect` compares the five stored account-usage counters
+with durable rows in one finite, read-only REPEATABLE READ primary snapshot.
+It checks the expected epoch under the shared schema barrier, captures the
+account sequence/floor, distinguishes a missing account from a missing usage
+row, and acknowledges ROLLBACK before the final deadline check. The returned
+identity and counts are historical observations, not quota admission or policy
+and device authorization. No account row lock, write or repair is performed.
+
+Body bytes and blob count include every live blob manifest, including a
+zero-length blob. Upload bytes count each manifest with an existing lease;
+expired but unreclaimed leases still count. Queue bytes count each manifest
+referenced as a transmitted blob by a submission, once even if several
+submissions reference it. Queue submission count includes every durable
+submission, including completed ones retained in the database. Reserved blob
+IDs without a live manifest contribute nothing. These are the same durable
+categories used by publication accounting and the initial usage migration.
+
+A mismatch in any counter, missing usage row, malformed sequence or negative
+result refuses the audit. Aggregate overflow or query failure also refuses;
+there is no truncation or inferred correction. The normal finite probe and
+statement bounds apply, as detailed in RESOURCES. A large account that cannot
+be checked within those bounds has no successful audit result.
+
+This is one component for future semantic verification. It does not validate
+body digests, metadata references, mailbox graphs, operation receipts,
+credentials, configuration or delivery outcomes, and cannot authorize restore
+or serving. The native fixture deliberately demonstrates that matching counters
+can coexist with a damaged body. It also checks account isolation, zero-length
+manifests, expired leases, shared queue references and refusal without repair.

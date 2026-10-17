@@ -11908,3 +11908,6 @@ mod account_admin;
 
 #[path = "postgres_probe/selection_commands.rs"]
 mod selection_commands;
+
+#[path = "postgres_probe/usage_audit.rs"]
+mod usage_audit;

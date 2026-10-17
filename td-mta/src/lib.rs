@@ -259,6 +259,7 @@ pub mod postgres_receiving;
 pub mod postgres_smtp_receiving;
 pub mod postgres_smtp_storage;
 pub mod postgres_uploads;
+pub mod postgres_usage_audit;
 
 mod mailbox_name;
 pub mod postgres_mailbox_create;
