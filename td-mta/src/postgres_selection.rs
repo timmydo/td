@@ -15,6 +15,10 @@ use std::{
 };
 use td_crypto::{Crypto, Digest, Entropy, Provider, SystemEntropy, TrustStore};
 
+#[path = "postgres_selection_retained.rs"]
+mod retained;
+pub use retained::RETAINED_BYTES;
+
 pub const MAX_RECEIPTS: i64 = 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -72,22 +76,39 @@ pub fn prepare(
     SystemEntropy::try_new()
         .and_then(|mut rng| rng.fill(&mut id))
         .map_err(|_| Error::Crypto)?;
+    retained(
+        epoch,
+        ConfigurationSelectionId::from_bytes(id),
+        expected,
+        version,
+        *candidate.digest(),
+    )
+}
+
+fn retained(
+    epoch: StoreEpoch,
+    operation: ConfigurationSelectionId,
+    expected: u64,
+    version: Version,
+    source_digest: [u8; 32],
+) -> Result<Change, Error> {
+    expected.checked_add(1).ok_or(Error::Capacity)?;
     let mut hash = Provider.sha256().map_err(|_| Error::Crypto)?;
     for part in [
         b"td-mta PostgreSQL selection v1\0".as_slice(),
         epoch.as_bytes().as_slice(),
         &expected.to_be_bytes(),
         version.as_bytes().as_slice(),
-        candidate.digest().as_slice(),
+        source_digest.as_slice(),
     ] {
         hash.update(part).map_err(|_| Error::Crypto)?;
     }
     Ok(Change {
         epoch,
-        operation: ConfigurationSelectionId::from_bytes(id),
+        operation,
         expected,
         version,
-        source_digest: *candidate.digest(),
+        source_digest,
         request_digest: hash.finish().map_err(|_| Error::Crypto)?,
     })
 }

@@ -1313,9 +1313,9 @@ does not assert that version is still selected. At most 1024 receipts can be
 published, checked under the same singleton lock. There is no receipt expiry
 or pruning API yet; capacity refusal preserves existing outcomes. This finite
 preparation limit needs an explicit retention/retry policy before runtime
-administration activation. Changes currently survive only in the caller’s
-retained typed object; a durable encoding is required before administration
-can recover that object across process restart.
+administration activation. Section 197 supplies a fixed public encoding
+for retaining the same change across process restart; callers must persist
+it before publication. Encoding support does not activate administration.
 
 Selected-source reads capture a passive generation/version, then verify the
 immutable source bytes and all profiles/materials. A concurrent publication
@@ -5654,3 +5654,29 @@ also refuses initialization. Neither command resets, repairs or adopts an
 existing account. Lost process output is recovered by inspecting the named
 account's retained receipt, not by blindly repeating initialization. Account
 retirement, import and serving configuration remain separate operations.
+
+## 197. Process-independent selection request custody
+
+`postgres_selection::Change::encode` produces exactly 89 public bytes:
+format version 1, 16-byte epoch, 16-byte operation ID, eight-byte big-endian
+expected generation, 16-byte configuration version and 32-byte source digest.
+`Change::decode` requires that exact length/version, refuses an exhausted
+generation and recomputes the domain-separated request digest internally.
+It does not retain caller-supplied request-digest bytes. Persist the encoded
+change before first publication and retain the same bytes across uncertainty.
+The encoding contains neither configuration source nor credential material.
+
+These are custody bytes, not an authenticated credential or a success receipt.
+Changing the operation ID asks for another operation; changing any request
+field changes its derived digest. Owner database credentials, stored receipt
+comparison, expected generation and current source/material validation keep
+their existing roles. Decoding cannot establish publication or authorize
+service. An already recorded operation still resolves after a newer selection
+or material expiry, while a changed request using its ID conflicts. Missing
+receipt observations do not authorize a replacement operation.
+
+This adds a bounded recovery representation for administrative clients; it
+does not introduce configuration activation commands or select production
+PostgreSQL serving. The real PostgreSQL fixture reconstructs an uncertain
+operation before settlement, rejects altered custody against its receipt and
+reconstructs historical requests after newer selection and material expiry.

@@ -3364,12 +3364,15 @@ per_peer_limit = 1
         2
     );
     // A historical receipt is not overwritten by a later selected generation.
+    let retained_first = first.encode();
+    let first = selection::Change::decode(&retained_first).unwrap();
     assert_eq!(
         selection::publish(&request, &trust, deadline(), first).unwrap(),
         selected
     );
     sql(&fixture, "CREATE FUNCTION public.delay_selection_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_catalog.pg_sleep(3); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_selection AFTER INSERT ON td_mta.config_selection_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_selection_commit()");
     let uncertain = selection::prepare(epoch, 2, version, &candidate).unwrap();
+    let retained_uncertain = uncertain.encode();
     assert_eq!(
         selection::publish(
             &request,
@@ -3384,10 +3387,22 @@ per_peer_limit = 1
         &fixture,
         "DROP TRIGGER delay_selection ON td_mta.config_selection_receipts",
     );
+    let uncertain = selection::Change::decode(&retained_uncertain).unwrap();
     let landed = selection::inspect(&request, &trust, deadline(), uncertain)
         .unwrap()
         .unwrap();
     assert_eq!(landed.generation, 3);
+    let mut altered = retained_uncertain;
+    altered[57] ^= 1;
+    let altered = selection::Change::decode(&altered).unwrap();
+    assert_eq!(
+        selection::inspect(&request, &trust, deadline(), altered),
+        Err(selection::Error::Conflict)
+    );
+    assert_eq!(
+        selection::publish(&request, &trust, deadline(), altered),
+        Err(selection::Error::Conflict)
+    );
     let settled = selection::publish(&request, &trust, deadline(), uncertain).unwrap();
     assert_eq!(settled, landed);
     assert_eq!(settled.generation, 3);
@@ -3458,6 +3473,7 @@ per_peer_limit = 1
         selection::publish(&request, &trust, deadline(), refused),
         Err(selection::Error::Configuration(_))
     ));
+    let first = selection::Change::decode(&retained_first).unwrap();
     assert_eq!(
         selection::inspect(&request, &trust, deadline(), first).unwrap(),
         Some(selected)
