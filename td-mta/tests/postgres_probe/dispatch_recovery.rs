@@ -5,6 +5,7 @@ use std::{
     time::Duration,
 };
 use td_crypto::TrustStore;
+use td_mta::postgres_dispatch::Identity;
 use td_mta::{
     admission::work::{Charge, Meter},
     clock::RuntimeClock,
@@ -152,14 +153,17 @@ pub(super) fn exercise(
             Err(Error::Admission(ports::Error::Busy))
         );
         drop(occupied);
-        assert_eq!(pending.attempt().unwrap(), None);
+        assert_eq!(pending.identity().unwrap(), None);
         let outcome = if delayed {
             sql(fixture,"CREATE FUNCTION public.delay_recovery_worker() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(3); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_recovery_worker AFTER INSERT ON td_mta.attempt_recovery_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_recovery_worker()");
             assert_eq!(
                 worker.publish_recovery(value.clone(), until(1500), &mut meter()),
                 Err(Error::Recovery(recovery::Error::Indeterminate))
             );
-            assert_eq!(pending.attempt().unwrap(), Some(attempt));
+            assert_eq!(
+                pending.identity().unwrap(),
+                Some(Identity::Attempt(attempt))
+            );
             assert_eq!(
                 worker.publish_recovery(value.clone(), until(10_000), &mut meter()),
                 Err(Error::Admission(ports::Error::Busy))
@@ -209,7 +213,10 @@ pub(super) fn exercise(
                 pending.settle(&settle, until(10_000), &mut meter()),
                 Err(Error::Recovery(recovery::Error::Conflict))
             );
-            assert_eq!(pending.attempt().unwrap(), Some(attempt));
+            assert_eq!(
+                pending.identity().unwrap(),
+                Some(Identity::Attempt(attempt))
+            );
             sql(fixture, &format!("DELETE FROM td_mta.attempt_recovery_receipts WHERE operation=decode('{operation}','hex')"));
             assert_eq!(
                 pending
@@ -217,7 +224,10 @@ pub(super) fn exercise(
                     .unwrap(),
                 None
             );
-            assert_eq!(pending.attempt().unwrap(), Some(attempt));
+            assert_eq!(
+                pending.identity().unwrap(),
+                Some(Identity::Attempt(attempt))
+            );
             sql(fixture,"INSERT INTO td_mta.attempt_recovery_receipts SELECT * FROM public.recovery_worker_receipt; DROP TABLE public.recovery_worker_receipt");
             let before = sql(
                 fixture,
@@ -248,7 +258,7 @@ pub(super) fn exercise(
                 worker.publish_recovery(value.clone(), until(10_000), &mut meter()),
                 Err(Error::Recovery(recovery::Error::Database))
             );
-            assert_eq!(pending.attempt().unwrap(), None);
+            assert_eq!(pending.identity().unwrap(), None);
             sql(
                 fixture,
                 "DROP TRIGGER reject_recovery_worker ON td_mta.attempt_recovery_receipts",
@@ -267,7 +277,7 @@ pub(super) fn exercise(
         };
         assert_eq!(outcome.attempt, attempt);
         assert_eq!(outcome.recipients, 2);
-        assert_eq!(pending.attempt().unwrap(), None);
+        assert_eq!(pending.identity().unwrap(), None);
         assert_eq!(
             worker
                 .publish_recovery(value, until(10_000), &mut meter())

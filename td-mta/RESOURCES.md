@@ -5366,3 +5366,14 @@ ten-second operation caps apply, with no waiting queue or retained connection.
 The shared Pending guard excludes another dispatch operation for that read;
 receipt settlement remains on independently admitted capacity. Candidate
 observations do not change queue-clock admission or grant SMTP permission.
+
+
+Worker route acquisition prepays 2 MiB+192 KiB I/O and 4096 records across
+one receipt connection and at most one mutation connection, using one ordinary
+slot sequentially. Their existing protocol ceilings remain 1 MiB input per
+connection, 64/128 KiB output and Runtime 1024/1088 frames respectively.
+The shared Pending enum retains one bounded Claim only after admission; its
+identity distinguishes an attempt from a route-claim operation. Settlement
+prepays the same conservative work bound on independently supplied slots,
+performs receipt inspection only and retains the claim on absence or error.
+No waiting queue, connection retention or transport authority is added.

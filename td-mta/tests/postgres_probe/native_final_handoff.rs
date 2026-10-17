@@ -1,6 +1,7 @@
 use super::{deadline, relay_wire as wire, sql, Fixture, PASSWORD};
 use std::sync::{Arc, Mutex};
 use td_crypto::{Crypto, Digest, Provider, TrustStore};
+use td_mta::postgres_dispatch::Identity;
 use td_mta::{
     clock::RuntimeClock,
     ids::SubmissionId,
@@ -337,7 +338,7 @@ fn run(
                     );
                     assert_eq!(sql(fixture,&format!("SELECT state,rcpt_reply IS NULL,data_reply FROM td_mta.recipients WHERE submission_id={sub}")), "5|t|550 sender refused");
                 }
-                assert_eq!(pending.attempt().unwrap(), None);
+                assert_eq!(pending.identity().unwrap(), None);
                 drop(peer.into_buffers().unwrap());
                 sql(fixture,&format!("DELETE FROM td_mta.recipients WHERE submission_id={sub}; DELETE FROM td_mta.submissions WHERE id={sub}"));
                 continue;
@@ -432,7 +433,7 @@ fn run(
                 }
                 assert_eq!(sql(fixture,&format!("SELECT state,rcpt_reply,data_reply FROM td_mta.recipients WHERE submission_id={sub} ORDER BY ordinal")), if data_case == 5 { "5|550 recipient refused|\n5|550 recipient refused|" } else { "3|250 recipient|\n3||" });
                 assert_eq!(sql(fixture,&format!("SELECT active FROM td_mta.submission_attempts WHERE attempt_id=decode('{attempt}','hex')")), "f");
-                assert_eq!(pending.attempt().unwrap(), None);
+                assert_eq!(pending.identity().unwrap(), None);
                 drop(peer.into_buffers().unwrap());
                 sql(fixture,&format!("DELETE FROM td_mta.recipients WHERE submission_id={sub}; DELETE FROM td_mta.submissions WHERE id={sub}"));
                 continue;
@@ -468,7 +469,10 @@ fn run(
                     assert_eq!(failure.attempt(), Some(attempt));
                     let evidence = failure.into_evidence().unwrap();
                     assert!(evidence.refusal.is_some());
-                    assert_eq!(pending.attempt().unwrap(), Some(attempt));
+                    assert_eq!(
+                        pending.identity().unwrap(),
+                        Some(Identity::Attempt(attempt))
+                    );
                     let until = wire::until(&clock);
                     let mut settlement = wire::meter(until);
                     assert_eq!(
@@ -492,7 +496,7 @@ fn run(
                             Some(dispatch::Settlement::Phase(outcome)) => outcome,
                             other => panic!("expected RCPT settlement, got {other:?}"),
                         };
-                    assert_eq!(pending.attempt().unwrap(), None);
+                    assert_eq!(pending.identity().unwrap(), None);
                     let replay = worker
                         .publish_phase(evidence.refusal.unwrap(), until, &mut settlement)
                         .unwrap();
@@ -514,7 +518,7 @@ fn run(
                     );
                     assert_eq!(sql(fixture,&format!("SELECT state,rcpt_reply,data_reply FROM td_mta.recipients WHERE submission_id={sub} ORDER BY ordinal")), "5|250 recipient|550 data refused\n5|550 recipient refused|");
                     assert_eq!(sql(fixture,&format!("SELECT active FROM td_mta.submission_attempts WHERE attempt_id=decode('{attempt}','hex')")), "f");
-                    assert_eq!(pending.attempt().unwrap(), None);
+                    assert_eq!(pending.identity().unwrap(), None);
                     drop(peer.into_buffers().unwrap());
                     sql(fixture,&format!("DELETE FROM td_mta.recipients WHERE submission_id={sub}; DELETE FROM td_mta.submissions WHERE id={sub}"));
                     continue;
@@ -532,7 +536,7 @@ fn run(
                     dispatch::Error::Phase(phases::Error::Database)
                 );
                 assert_eq!(failure.attempt(), Some(attempt));
-                assert_eq!(pending.attempt().unwrap(), None);
+                assert_eq!(pending.identity().unwrap(), None);
                 assert_eq!(sql(fixture,&format!("SELECT state,rcpt_reply,data_reply FROM td_mta.recipients WHERE submission_id={sub} ORDER BY ordinal")), if matches!(data_case, 7 | 9) { "2||\n2||" } else { "2||\n5|550 recipient refused|" });
                 sql(
                     fixture,
@@ -594,7 +598,7 @@ fn run(
                 assert_eq!(sql(fixture,&format!("SELECT state,rcpt_reply,data_reply FROM td_mta.recipients WHERE submission_id={sub} ORDER BY ordinal")), "5|250 recipient|550 data refused\n5|550 recipient refused|");
                 assert_eq!(sql(fixture,&format!("SELECT active FROM td_mta.submission_attempts WHERE attempt_id=decode('{attempt}','hex')")), "f");
                 assert_eq!(sql(fixture,&format!("SELECT count(*) FROM td_mta.attempt_rcpt_receipts WHERE attempt_id=decode('{attempt}','hex')")), "1");
-                assert_eq!(pending.attempt().unwrap(), None);
+                assert_eq!(pending.identity().unwrap(), None);
                 drop(peer.into_buffers().unwrap());
                 sql(fixture,&format!("DELETE FROM td_mta.recipients WHERE submission_id={sub}; DELETE FROM td_mta.submissions WHERE id={sub}"));
                 continue;
@@ -651,7 +655,10 @@ fn run(
                     let until = wire::until(&clock);
                     let mut settlement = wire::meter(until);
                     if data_case == 14 {
-                        assert_eq!(pending.attempt().unwrap(), Some(attempt));
+                        assert_eq!(
+                            pending.identity().unwrap(),
+                            Some(Identity::Attempt(attempt))
+                        );
                         assert_eq!(
                             worker.publish_recovery(
                                 interruption.recovery.as_ref().unwrap().clone(),
@@ -691,7 +698,7 @@ fn run(
                         );
                         assert_eq!(sql(fixture,&format!("SELECT state,rcpt_reply,data_reply FROM td_mta.recipients WHERE submission_id={sub} ORDER BY ordinal")), if data_case == 12 { "2||\n2||" } else { "2||\n5|550 recipient refused|" });
                     }
-                    assert_eq!(pending.attempt().unwrap(), None);
+                    assert_eq!(pending.identity().unwrap(), None);
                     if let Some(refusal) = interruption.refusal {
                         worker
                             .publish_phase(refusal, until, &mut settlement)
@@ -702,7 +709,7 @@ fn run(
                         .unwrap();
                     assert_eq!(sql(fixture,&format!("SELECT state,rcpt_reply,data_reply FROM td_mta.recipients WHERE submission_id={sub} ORDER BY ordinal")), "3|250 recipient|\n5|550 recipient refused|");
                     assert_eq!(sql(fixture,&format!("SELECT active FROM td_mta.submission_attempts WHERE attempt_id=decode('{attempt}','hex')")), "f");
-                    assert_eq!(pending.attempt().unwrap(), None);
+                    assert_eq!(pending.identity().unwrap(), None);
                     drop(peer.into_buffers().unwrap());
                     sql(fixture,&format!("DELETE FROM td_mta.recipients WHERE submission_id={sub}; DELETE FROM td_mta.submissions WHERE id={sub}"));
                     continue;
@@ -760,7 +767,7 @@ fn run(
                         Some(outcome)
                     );
                     assert_eq!(sql(fixture,&format!("SELECT state,rcpt_reply,data_reply FROM td_mta.recipients WHERE submission_id={sub}")), "5|250 recipient|550 data refused");
-                    assert_eq!(pending.attempt().unwrap(), None);
+                    assert_eq!(pending.identity().unwrap(), None);
                     drop(peer.into_buffers().unwrap());
                     sql(fixture,&format!("DELETE FROM td_mta.recipients WHERE submission_id={sub}; DELETE FROM td_mta.submissions WHERE id={sub}"));
                     continue;
@@ -1100,7 +1107,7 @@ fn run(
                 ),
                 if matches!(n, 152 | 155) { "3" } else { "2" }
             );
-            assert_eq!(pending.attempt().unwrap(), None);
+            assert_eq!(pending.identity().unwrap(), None);
             let first = worker
                 .reserve_final(attempt, cap, &mut wire::meter(cap))
                 .unwrap();
@@ -1313,7 +1320,10 @@ fn run(
                             dispatch::Error::Phase(phases::Error::Indeterminate)
                         );
                         let evidence = retained.into_evidence().unwrap();
-                        assert_eq!(pending.attempt().unwrap(), Some(attempt));
+                        assert_eq!(
+                            pending.identity().unwrap(),
+                            Some(Identity::Attempt(attempt))
+                        );
                         let until = wire::until(&clock);
                         let mut settlement = wire::meter(until);
                         assert_eq!(
@@ -1334,7 +1344,7 @@ fn run(
                                 Some(dispatch::Settlement::Phase(outcome)) => outcome,
                                 other => panic!("expected final settlement, got {other:?}"),
                             };
-                        assert_eq!(pending.attempt().unwrap(), None);
+                        assert_eq!(pending.identity().unwrap(), None);
                         let first = worker
                             .reserve_final(attempt, until, &mut settlement)
                             .unwrap();
@@ -1377,7 +1387,7 @@ fn run(
             phases::inspect(&runtime, trust, deadline(), &final_value).unwrap(),
             Some(outcome)
         );
-        assert_eq!(pending.attempt().unwrap(), None);
+        assert_eq!(pending.identity().unwrap(), None);
         drop(peer.into_buffers().unwrap());
         sql(fixture,&format!("DELETE FROM td_mta.recipients WHERE submission_id={sub}; DELETE FROM td_mta.submissions WHERE id={sub}"));
         if n == 143 {

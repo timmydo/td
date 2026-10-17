@@ -5,6 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 use td_crypto::{Crypto, Digest, Provider, TrustStore};
+use td_mta::postgres_dispatch::Identity;
 use td_mta::{
     admission::work::{Charge, Meter},
     clock::RuntimeClock,
@@ -317,7 +318,10 @@ pub(super) fn exercise(
             );
             drop(failure.buffers.unwrap());
             let evidence = failure.retained.unwrap().into_evidence().unwrap();
-            assert_eq!(pending.attempt().unwrap(), Some(attempt));
+            assert_eq!(
+                pending.identity().unwrap(),
+                Some(Identity::Attempt(attempt))
+            );
             // Dropping the owned trigger waits for its transaction to finish.
             sql(fixture,"DROP TRIGGER delay_driver_final ON td_mta.attempt_acceptance_receipts; DROP FUNCTION public.delay_driver_final()");
             let settlement_slots = ReadSlots::new(1).unwrap();
@@ -386,7 +390,7 @@ pub(super) fn exercise(
             }
             drop(failure.buffers.unwrap());
             assert!(!transferred.windows(5).any(|v| v == b"\r\n.\r\n"));
-            assert!(pending.attempt().unwrap().is_none());
+            assert!(pending.identity().unwrap().is_none());
             if n == 174 {
                 assert!(transferred.is_empty());
                 assert_eq!(sql(fixture, &format!("SELECT phase FROM td_mta.recipients WHERE submission_id={sub} AND ordinal=0")), "2");
@@ -406,7 +410,7 @@ pub(super) fn exercise(
             assert_eq!(sql(fixture, &format!("SELECT rcpt_reply FROM td_mta.recipients WHERE submission_id={sub} AND ordinal=0")), "250 recipient");
             assert_eq!(sql(fixture, &format!("SELECT rcpt_reply IS NULL FROM td_mta.recipients WHERE submission_id={sub} AND ordinal=2")), "t");
         }
-        assert!(pending.attempt().unwrap().is_none());
+        assert!(pending.identity().unwrap().is_none());
         if matches!(n, 173 | 177 | 178 | 179) {
             assert_eq!(sql(fixture, &format!("SELECT state,phase,data_reply FROM td_mta.recipients WHERE submission_id={sub} AND ordinal=0")), "4|4|250 queued");
         }

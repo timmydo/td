@@ -718,7 +718,7 @@ fn failures(
                     .is_some());
             }
         }
-        assert!(pending.attempt().unwrap().is_none());
+        assert!(pending.identity().unwrap().is_none());
         assert_eq!(sql(fixture,&format!("SELECT count(*) FROM td_mta.submission_attempts WHERE submission_id={sub} AND active")), "0");
         sql(fixture,&format!("DELETE FROM td_mta.recipients WHERE submission_id={sub}; DELETE FROM td_mta.submissions WHERE id={sub}"));
     }

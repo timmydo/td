@@ -160,7 +160,7 @@ pub(super) fn exercise(
                     ),
                     "1"
                 );
-                assert_eq!(pending.attempt().unwrap(), None);
+                assert_eq!(pending.identity().unwrap(), None);
             }
         } else {
             let mut exchange = begin.ok().unwrap();
@@ -292,7 +292,7 @@ pub(super) fn exercise(
                 "5|550 sender refused"
             );
         }
-        assert_eq!(pending.attempt().unwrap(), None);
+        assert_eq!(pending.identity().unwrap(), None);
         assert_eq!(sql(fixture,&format!("SELECT active FROM td_mta.submission_attempts WHERE attempt_id=decode('{attempt}','hex')")),"f");
         sql(fixture,&format!("DELETE FROM td_mta.recipients WHERE submission_id={sub}; DELETE FROM td_mta.submissions WHERE id={sub}"));
     }

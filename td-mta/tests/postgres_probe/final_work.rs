@@ -228,7 +228,7 @@ pub(super) fn exercise(
     );
     assert_eq!(outcome.attempt, attempt);
     assert_eq!(outcome.recipients, 1);
-    assert_eq!(worker.pending.attempt().unwrap(), None);
+    assert_eq!(worker.pending.identity().unwrap(), None);
     drop(other);
     let duplicate = roomy
         .reserve_final_result(

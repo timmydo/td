@@ -5,6 +5,7 @@ use std::{
     time::Duration,
 };
 use td_crypto::TrustStore;
+use td_mta::postgres_dispatch::Identity;
 use td_mta::{
     admission::work::{Charge, Meter},
     clock::RuntimeClock,
@@ -170,7 +171,7 @@ pub(super) fn exercise(
                 Err(Error::Admission(ports::Error::Busy))
             );
             drop(held);
-            assert_eq!(pending.attempt().unwrap(), None);
+            assert_eq!(pending.identity().unwrap(), None);
             sql(fixture,"CREATE FUNCTION public.reject_failed_health() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture refusal'; END $$; CREATE TRIGGER reject_failed_health BEFORE INSERT ON td_mta.route_health_receipts FOR EACH ROW EXECUTE FUNCTION public.reject_failed_health()");
             assert_eq!(
                 failed.step(until(10_000), &mut meter(), &settlement),
@@ -205,7 +206,10 @@ pub(super) fn exercise(
                 failed.step(until(1500), &mut meter(), &settlement),
                 Err(Error::RouteFailure(health::Error::Indeterminate))
             );
-            assert_eq!(pending.attempt().unwrap(), Some(attempt));
+            assert_eq!(
+                pending.identity().unwrap(),
+                Some(Identity::Attempt(attempt))
+            );
             occupied = Some(
                 capacity
                     .reserve_final(attempt, until(10_000), &mut meter())
@@ -216,7 +220,10 @@ pub(super) fn exercise(
                 failed.step(until(10_000), &mut empty, &settlement),
                 Err(Error::Admission(ports::Error::Capacity))
             );
-            assert_eq!(pending.attempt().unwrap(), Some(attempt));
+            assert_eq!(
+                pending.identity().unwrap(),
+                Some(Identity::Attempt(attempt))
+            );
             let held_settlement = settlement_capacity
                 .reserve_final(attempt, until(10_000), &mut meter())
                 .unwrap();
@@ -224,13 +231,19 @@ pub(super) fn exercise(
                 failed.step(until(10_000), &mut meter(), &settlement),
                 Err(Error::Admission(ports::Error::Busy))
             );
-            assert_eq!(pending.attempt().unwrap(), Some(attempt));
+            assert_eq!(
+                pending.identity().unwrap(),
+                Some(Identity::Attempt(attempt))
+            );
             drop(held_settlement);
             assert_eq!(
                 failed.step(until(0), &mut meter(), &settlement),
                 Err(Error::Admission(ports::Error::Deadline))
             );
-            assert_eq!(pending.attempt().unwrap(), Some(attempt));
+            assert_eq!(
+                pending.identity().unwrap(),
+                Some(Identity::Attempt(attempt))
+            );
             assert_eq!(
                 worker.publish_recovery(
                     recovery::interrupted(claim, generation, attempt).unwrap(),
@@ -264,7 +277,10 @@ pub(super) fn exercise(
                 failed.step(until(10_000), &mut meter(), &settlement),
                 Err(Error::RouteFailure(health::Error::Conflict))
             );
-            assert_eq!(pending.attempt().unwrap(), Some(attempt));
+            assert_eq!(
+                pending.identity().unwrap(),
+                Some(Identity::Attempt(attempt))
+            );
             sql(
                 fixture,
                 &format!("DELETE FROM td_mta.route_health_receipts WHERE operation={key}"),
@@ -275,7 +291,10 @@ pub(super) fn exercise(
                     .unwrap(),
                 None
             );
-            assert_eq!(pending.attempt().unwrap(), Some(attempt));
+            assert_eq!(
+                pending.identity().unwrap(),
+                Some(Identity::Attempt(attempt))
+            );
             sql(fixture, "INSERT INTO td_mta.route_health_receipts SELECT * FROM public.failed_health_receipt; DROP TABLE public.failed_health_receipt");
             assert!(matches!(
                 pending
@@ -283,7 +302,7 @@ pub(super) fn exercise(
                     .unwrap(),
                 Some(dispatch::Settlement::RouteFailure(_))
             ));
-            assert_eq!(pending.attempt().unwrap(), None);
+            assert_eq!(pending.identity().unwrap(), None);
         }
         assert_eq!(
             failed
@@ -345,12 +364,18 @@ pub(super) fn exercise(
                 failed.step(until(1500), &mut meter(), &settlement),
                 Err(Error::Recovery(recovery::Error::Indeterminate))
             );
-            assert_eq!(pending.attempt().unwrap(), Some(attempt));
+            assert_eq!(
+                pending.identity().unwrap(),
+                Some(Identity::Attempt(attempt))
+            );
             assert_eq!(
                 failed.step(until(0), &mut meter(), &settlement),
                 Err(Error::Admission(ports::Error::Deadline))
             );
-            assert_eq!(pending.attempt().unwrap(), Some(attempt));
+            assert_eq!(
+                pending.identity().unwrap(),
+                Some(Identity::Attempt(attempt))
+            );
             thread::sleep(Duration::from_secs(4));
             sql(
                 fixture,
@@ -361,7 +386,10 @@ pub(super) fn exercise(
                 failed.step(until(10_000), &mut meter(), &settlement),
                 Err(Error::Recovery(recovery::Error::Conflict))
             );
-            assert_eq!(pending.attempt().unwrap(), Some(attempt));
+            assert_eq!(
+                pending.identity().unwrap(),
+                Some(Identity::Attempt(attempt))
+            );
             sql(
                 fixture,
                 &format!("DELETE FROM td_mta.attempt_recovery_receipts WHERE attempt_id={key}"),
@@ -372,7 +400,10 @@ pub(super) fn exercise(
                     .unwrap(),
                 None
             );
-            assert_eq!(pending.attempt().unwrap(), Some(attempt));
+            assert_eq!(
+                pending.identity().unwrap(),
+                Some(Identity::Attempt(attempt))
+            );
             sql(fixture, "INSERT INTO td_mta.attempt_recovery_receipts SELECT * FROM public.failed_recovery_receipt; DROP TABLE public.failed_recovery_receipt");
             assert!(matches!(
                 pending
@@ -404,13 +435,18 @@ pub(super) fn exercise(
                     td_mta::postgres_attempts::Error::Indeterminate
                 ))
             );
-            let other_attempt = pending.attempt().unwrap().unwrap();
+            let Identity::Attempt(other_attempt) = pending.identity().unwrap().unwrap() else {
+                panic!("expected pending attempt");
+            };
             assert_ne!(other_attempt, attempt);
             assert_eq!(
                 failed.step(until(10_000), &mut meter(), &settlement),
                 Err(Error::Admission(ports::Error::Busy))
             );
-            assert_eq!(pending.attempt().unwrap(), Some(other_attempt));
+            assert_eq!(
+                pending.identity().unwrap(),
+                Some(Identity::Attempt(other_attempt))
+            );
             thread::sleep(Duration::from_secs(4));
             assert!(matches!(
                 pending
@@ -459,7 +495,7 @@ pub(super) fn exercise(
             outcome.health.state.repair_generation.is_some(),
             matches!(n, 160 | 163)
         );
-        assert_eq!(pending.attempt().unwrap(), None);
+        assert_eq!(pending.identity().unwrap(), None);
         let before = sql(
             fixture,
             "SELECT encode(sequence,'hex') FROM td_mta.accounts",

@@ -10376,19 +10376,7 @@ fn exercise_route_owners(
     owners::release(request, trust, deadline(), &third, takeover.generation).unwrap();
     sql(fixture,"CREATE FUNCTION public.delay_owner() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(3); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_owner AFTER INSERT ON td_mta.route_owner_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_owner()");
     let uncertain = owners::prepare(relay, boot).unwrap();
-    assert_eq!(
-        owners::acquire(
-            request,
-            trust,
-            Instant::now() + Duration::from_millis(1500),
-            &uncertain
-        ),
-        Err(owners::Error::Indeterminate)
-    );
-    thread::sleep(Duration::from_secs(4));
-    let recovered = owners::inspect(request, trust, deadline(), &uncertain)
-        .unwrap()
-        .unwrap();
+    let recovered = route_acquisition::exercise(fixture, request, trust, relay, &first, &uncertain);
     assert_eq!(recovered.generation, 4);
     assert_eq!(
         owners::acquire(request, trust, deadline(), &uncertain).unwrap(),
@@ -11851,3 +11839,6 @@ mod native_rcpt_exchange;
 
 #[path = "postgres_probe/native_data_exchange.rs"]
 mod native_data_exchange;
+
+#[path = "postgres_probe/route_acquisition.rs"]
+mod route_acquisition;

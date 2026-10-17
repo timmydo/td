@@ -2,7 +2,7 @@
 use crate::{
     admission::work::{Charge, Meter, Stop},
     clock::RuntimeClock,
-    ids::{AttemptId, SubmissionId},
+    ids::{AttemptId, RouteClaimId, SubmissionId},
     ports::{self, Clock, Deadline},
     postgres_attempt_phases::{self as phases, Change},
     postgres_attempt_recovery as recovery,
@@ -10,7 +10,7 @@ use crate::{
     postgres_probe::{Mode, Request, ValidationBudget},
     postgres_read::{ReadPermit, ReadSlots},
     postgres_route_health as health,
-    postgres_route_owners::Claim,
+    postgres_route_owners::{self as owners, Claim},
     queue_clock::Guard,
 };
 use std::{
@@ -21,6 +21,8 @@ use td_crypto::TrustStore;
 
 #[path = "postgres_prepared_failure.rs"]
 mod failure;
+#[path = "postgres_dispatch_routes.rs"]
+mod routes;
 pub use failure::{FailedPrepared, FailureOutcome};
 
 const ATTEMPT_IO: u64 = 2 * 1024 * 1024 + 192 * 1024;
@@ -41,6 +43,7 @@ pub enum Error {
     Recovery(recovery::Error),
     RouteFailure(health::Error),
     Candidates(crate::postgres_queue_candidates::Error),
+    Owner(owners::Error),
 }
 impl From<ports::Error> for Error {
     fn from(error: ports::Error) -> Self {
@@ -105,7 +108,7 @@ impl Connection<'_, '_> {
     }
 }
 /// Retain for the relay worker's lifetime. An unresolved COMMIT blocks another
-/// attempt or phase; settlement only inspects the exact receipt, never republishes it.
+/// acquisition, attempt or phase; settlement only inspects the exact receipt.
 #[derive(Default)]
 pub struct Pending {
     operation: Mutex<Option<Operation>>,
@@ -115,14 +118,22 @@ enum Operation {
     Phase(Change),
     Recovery(Box<recovery::Recovery>),
     RouteFailure(Box<health::Change>),
+    RouteClaim(Box<Claim>),
+}
+/// Exact unresolved work identity; neither variant grants transport authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Identity {
+    Attempt(AttemptId),
+    RouteClaim(RouteClaimId),
 }
 impl Operation {
-    fn attempt(&self) -> AttemptId {
+    fn identity(&self) -> Identity {
         match self {
-            Self::Dispatch(value) => value.attempt(),
-            Self::Phase(value) => value.attempt(),
-            Self::Recovery(value) => value.attempt(),
-            Self::RouteFailure(value) => value.attempt(),
+            Self::Dispatch(value) => Identity::Attempt(value.attempt()),
+            Self::Phase(value) => Identity::Attempt(value.attempt()),
+            Self::Recovery(value) => Identity::Attempt(value.attempt()),
+            Self::RouteFailure(value) => Identity::Attempt(value.attempt()),
+            Self::RouteClaim(value) => Identity::RouteClaim(value.operation()),
         }
     }
 }
@@ -133,15 +144,16 @@ pub enum Settlement {
     Phase(phases::Outcome),
     Recovery(recovery::Outcome),
     RouteFailure(health::Outcome),
+    RouteClaim(owners::Grant),
 }
 impl Pending {
-    pub fn attempt(&self) -> Result<Option<AttemptId>, Error> {
+    pub fn identity(&self) -> Result<Option<Identity>, Error> {
         Ok(self
             .operation
             .try_lock()
             .map_err(|_| ports::Error::Busy)?
             .as_ref()
-            .map(Operation::attempt))
+            .map(Operation::identity))
     }
     /// Use independently reserved settlement slots. Absence and every error
     /// retain custody. A receipt is historical and cannot authorize SMTP.
@@ -164,7 +176,7 @@ impl Pending {
             return Ok(None);
         };
         let io = match operation {
-            Operation::Dispatch(_) => ATTEMPT_IO,
+            Operation::Dispatch(_) | Operation::RouteClaim(_) => ATTEMPT_IO,
             Operation::Phase(_) | Operation::Recovery(_) | Operation::RouteFailure(_) => PHASE_IO,
         };
         let limit = connection.admit(until, meter, io)?;
@@ -189,6 +201,11 @@ impl Pending {
                 health::inspect(connection.request, connection.trust, limit, value)
                     .map_err(Error::RouteFailure)?
                     .map(Settlement::RouteFailure)
+            }
+            Operation::RouteClaim(value) => {
+                owners::inspect(connection.request, connection.trust, limit, value)
+                    .map_err(Error::Owner)?
+                    .map(Settlement::RouteClaim)
             }
         };
         if outcome.is_some() {

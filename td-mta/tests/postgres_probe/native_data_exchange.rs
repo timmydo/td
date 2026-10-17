@@ -339,7 +339,7 @@ pub(super) fn exercise(
             _ => "0|3|250 first|\n1|5|550 second|",
         };
         assert_eq!(sql(fixture,&format!("SELECT ordinal,state,rcpt_reply,coalesce(data_reply,'') FROM td_mta.recipients WHERE submission_id={sub} ORDER BY ordinal")),expected);
-        assert_eq!(pending.attempt().unwrap(), None);
+        assert_eq!(pending.identity().unwrap(), None);
         assert_eq!(sql(fixture,&format!("SELECT active FROM td_mta.submission_attempts WHERE attempt_id=decode('{attempt}','hex')")),"f");
         sql(fixture,&format!("DELETE FROM td_mta.recipients WHERE submission_id={sub}; DELETE FROM td_mta.submissions WHERE id={sub}"));
     }

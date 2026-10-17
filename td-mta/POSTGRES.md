@@ -5464,3 +5464,33 @@ expired input/meter deadlines, preparation-mode refusal, stale ownership,
 cursor binding, slot exhaustion/reclamation and unchanged account state.
 An existing delayed Prepared COMMIT verifies all three scan kinds refuse
 while the exact unresolved operation remains in Pending.
+
+
+## 191. Admitted route acquisition and retained uncertainty
+
+Dispatches::acquire_route admits one exact prepared Claim through the worker's
+Runtime-only connection, original input/meter deadline and ten-second cap.
+It prepays 2 MiB+192 KiB I/O and 4096 records for receipt inspection and
+possible publication, reserving one ordinary slot across both sequential
+connections. Admission refusal installs no Pending operation. The claim then
+moves into the shared Pending guard before database work. Known success and
+definite failure clear custody; an unknown COMMIT retains the exact claim.
+No further scan, attempt, phase or acquisition can pass that barrier.
+
+Pending::identity replaces its attempt-only accessor with a closed identity
+sum: Attempt or RouteClaim. Existing attempt publication, recovery and route
+failure identities are unchanged. Pending::settle uses independently admitted
+capacity to inspect the retained claim receipt, with no acquisition replay.
+Absence and errors preserve custody; a matching receipt clears it and returns
+Settlement::RouteClaim. The grant is historical evidence only, even when
+returned by a known acquisition. Fresh current-owner and attempt admission
+must still precede SMTP, and an expired or released receipt cannot revive an
+owner. Known committed results are not converted into deadline refusals.
+
+The native route-owner fixture exercises short and nonrenewing budgets,
+expired input/meter deadlines, mode refusal, ordinary/settlement slot pressure,
+known stale receipt replay, definite busy refusal and delayed acquisition
+COMMIT. All candidate kinds and further worker publication refuse while the
+claim remains unresolved. Removing the receipt temporarily proves absence
+cannot clear Pending; restoration permits inspection-only settlement. These
+cases preserve account sequence and leave both slot pools reusable.

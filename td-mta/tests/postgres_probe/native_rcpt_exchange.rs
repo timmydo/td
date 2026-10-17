@@ -223,7 +223,7 @@ pub(super) fn exercise(
             _ => "0|250 first|t\n1||t",
         };
         assert_eq!(sql(fixture,&format!("SELECT ordinal,rcpt_reply,data_reply IS NULL FROM td_mta.recipients WHERE submission_id={sub} ORDER BY ordinal")),expected);
-        assert_eq!(pending.attempt().unwrap(), None);
+        assert_eq!(pending.identity().unwrap(), None);
         assert_eq!(sql(fixture,&format!("SELECT active FROM td_mta.submission_attempts WHERE attempt_id=decode('{attempt}','hex')")),"f");
         sql(fixture,&format!("DELETE FROM td_mta.recipients WHERE submission_id={sub}; DELETE FROM td_mta.submissions WHERE id={sub}"));
     }

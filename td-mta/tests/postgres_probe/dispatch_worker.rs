@@ -5,6 +5,7 @@ use std::{
     time::Duration,
 };
 use td_crypto::TrustStore;
+use td_mta::postgres_dispatch::Identity;
 use td_mta::{
     admission::work::{Charge, Meter},
     clock::RuntimeClock,
@@ -149,7 +150,7 @@ pub(super) fn exercise(
             td_mta::queue_clock::Error::Unstable
         )))
     );
-    assert_eq!(pending.attempt().unwrap(), None);
+    assert_eq!(pending.identity().unwrap(), None);
     let mut success = worker
         .publish_prepared(claim, generation, input(5000, false), &mut meter())
         .unwrap()
@@ -158,7 +159,7 @@ pub(super) fn exercise(
     assert_eq!(success.outcome().ordinals, vec![0, 1]);
     assert_eq!(success.attempt(), success.outcome().attempt);
     assert_eq!(success.envelope().recipients.len(), 2);
-    assert_eq!(pending.attempt().unwrap(), None);
+    assert_eq!(pending.identity().unwrap(), None);
     assert_eq!(
         worker
             .candidates(
@@ -174,7 +175,7 @@ pub(super) fn exercise(
             td_mta::postgres_queue_candidates::Error::Busy
         ))
     );
-    assert_eq!(pending.attempt().unwrap(), None);
+    assert_eq!(pending.identity().unwrap(), None);
     let mut empty = Meter::new(until(10_000), Charge::default());
     assert_eq!(
         success.check_current(&mut empty),
@@ -237,7 +238,7 @@ pub(super) fn exercise(
         worker.publish_phase(body.clone(), until(10_000), &mut empty),
         Err(Error::Admission(ports::Error::Capacity))
     );
-    assert_eq!(pending.attempt().unwrap(), None);
+    assert_eq!(pending.identity().unwrap(), None);
     let stale = phases::body(
         claim,
         generation + 1,
@@ -249,7 +250,7 @@ pub(super) fn exercise(
         worker.publish_phase(stale, until(10_000), &mut meter()),
         Err(Error::Phase(phases::Error::Owner(owners::Error::Stale)))
     );
-    assert_eq!(pending.attempt().unwrap(), None);
+    assert_eq!(pending.identity().unwrap(), None);
     let accepted = &[(0, "250 first"), (1, "250 second")];
     assert!(matches!(
         forbidden.publish_body(
@@ -403,7 +404,7 @@ pub(super) fn exercise(
     drop(released);
     assert_eq!(published.attempt, success.outcome().attempt);
     assert_eq!(published.recipients, 2);
-    assert_eq!(pending.attempt().unwrap(), None);
+    assert_eq!(pending.identity().unwrap(), None);
     assert_eq!(
         worker
             .publish_phase(body, until(10_000), &mut meter())
@@ -427,7 +428,9 @@ pub(super) fn exercise(
             .map(|_| ()),
         Err(Error::Publication(attempts::Error::Indeterminate))
     );
-    let attempt = pending.attempt().unwrap().unwrap();
+    let Identity::Attempt(attempt) = pending.identity().unwrap().unwrap() else {
+        panic!("expected pending attempt");
+    };
     for kind in [
         td_mta::postgres_queue_candidates::Kind::Fresh,
         td_mta::postgres_queue_candidates::Kind::Retry,
@@ -439,7 +442,10 @@ pub(super) fn exercise(
                 .map(|_| ()),
             Err(Error::Admission(ports::Error::Busy))
         );
-        assert_eq!(pending.attempt().unwrap(), Some(attempt));
+        assert_eq!(
+            pending.identity().unwrap(),
+            Some(Identity::Attempt(attempt))
+        );
     }
     assert_eq!(
         success.check_current(&mut meter()),
@@ -478,13 +484,19 @@ pub(super) fn exercise(
         pending.settle(&settle, until(0), &mut meter()),
         Err(Error::Admission(ports::Error::Deadline))
     );
-    assert_eq!(pending.attempt().unwrap(), Some(attempt));
+    assert_eq!(
+        pending.identity().unwrap(),
+        Some(Identity::Attempt(attempt))
+    );
     let mut empty = Meter::new(until(10_000), Charge::default());
     assert_eq!(
         pending.settle(&settle, until(10_000), &mut empty),
         Err(Error::Admission(ports::Error::Capacity))
     );
-    assert_eq!(pending.attempt().unwrap(), Some(attempt));
+    assert_eq!(
+        pending.identity().unwrap(),
+        Some(Identity::Attempt(attempt))
+    );
     // Absence is not proof that the original commit cannot still complete.
     sql(fixture,&format!("CREATE TABLE public.dispatch_worker_receipt AS SELECT * FROM td_mta.submission_attempts WHERE attempt_id=decode('{attempt}','hex'); DELETE FROM td_mta.submission_attempts WHERE attempt_id=decode('{attempt}','hex')"));
     assert_eq!(
@@ -493,7 +505,10 @@ pub(super) fn exercise(
             .unwrap(),
         None
     );
-    assert_eq!(pending.attempt().unwrap(), Some(attempt));
+    assert_eq!(
+        pending.identity().unwrap(),
+        Some(Identity::Attempt(attempt))
+    );
     sql(fixture,"INSERT INTO td_mta.submission_attempts SELECT * FROM public.dispatch_worker_receipt; DROP TABLE public.dispatch_worker_receipt");
     let sequence = sql(
         fixture,
@@ -515,7 +530,7 @@ pub(super) fn exercise(
         ),
         sequence
     );
-    assert_eq!(pending.attempt().unwrap(), None);
+    assert_eq!(pending.identity().unwrap(), None);
     assert_eq!(
         pending
             .settle(&settle, until(10_000), &mut meter())
@@ -538,7 +553,10 @@ pub(super) fn exercise(
             .map(|_| ()),
         Err(Error::Phase(phases::Error::Indeterminate))
     );
-    assert_eq!(pending.attempt().unwrap(), Some(attempt));
+    assert_eq!(
+        pending.identity().unwrap(),
+        Some(Identity::Attempt(attempt))
+    );
     assert!(matches!(
         worker.publish_body(
             claim,
@@ -569,7 +587,10 @@ pub(super) fn exercise(
         pending.settle(&settle, until(0), &mut meter()),
         Err(Error::Admission(ports::Error::Deadline))
     );
-    assert_eq!(pending.attempt().unwrap(), Some(attempt));
+    assert_eq!(
+        pending.identity().unwrap(),
+        Some(Identity::Attempt(attempt))
+    );
     let mut empty = Meter::new(until(10_000), Charge::default());
     assert_eq!(
         pending.settle(&settle, until(10_000), &mut empty),
@@ -582,7 +603,10 @@ pub(super) fn exercise(
             .unwrap(),
         None
     );
-    assert_eq!(pending.attempt().unwrap(), Some(attempt));
+    assert_eq!(
+        pending.identity().unwrap(),
+        Some(Identity::Attempt(attempt))
+    );
     sql(fixture,"INSERT INTO td_mta.attempt_phase_receipts SELECT * FROM public.phase_worker_receipt; DROP TABLE public.phase_worker_receipt");
     let sequence = sql(
         fixture,
@@ -604,7 +628,7 @@ pub(super) fn exercise(
         ),
         sequence
     );
-    assert_eq!(pending.attempt().unwrap(), None);
+    assert_eq!(pending.identity().unwrap(), None);
     assert!(matches!(
         worker.publish_body(
             claim,
@@ -864,7 +888,7 @@ fn candidate_admission(
             .reserve_final(attempt, until(10_000), &mut final_budget())
             .unwrap(),
     );
-    assert_eq!(worker.pending.attempt().unwrap(), None);
+    assert_eq!(worker.pending.identity().unwrap(), None);
     assert_eq!(
         sql(
             fixture,
