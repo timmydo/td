@@ -488,3 +488,67 @@ fn complete_reply_survives_post_read_expiry_without_session() {
         drop(peer.into_buffers().unwrap());
     }
 }
+
+#[test]
+fn productive_partial_reply_then_idle_turn_resets_pacing_hint() {
+    let _serial = serial();
+    let material = Material::new();
+    let (session, mut peer) = relay_auth_tests::authenticated(&material);
+    let mut cells = Cells::new();
+    let mut work = meter();
+    let mut owner = Exchange::new(
+        session,
+        Command::RcptTo("test@example.test"),
+        cells.scratch(),
+        material.source.clone(),
+        cap(),
+        &mut work,
+    )
+    .ok()
+    .unwrap();
+    assert!(!owner.read_progress());
+    let command = b"RCPT TO:<test@example.test>\r\n";
+    let partial = b"250-first\r\n";
+    let mut received = Vec::new();
+    let mut sent = 0;
+    let mut productive = false;
+    for _ in 0..100_000 {
+        if received.len() < command.len() {
+            let mut input = [0; LINE_BYTES];
+            if let IoProgress::Bytes(n) = peer.read(&mut input).unwrap() {
+                received.extend_from_slice(&input[..n]);
+            }
+            assert!(command.starts_with(&received));
+        }
+        if received.len() == command.len() {
+            if sent < partial.len() {
+                if let IoProgress::Bytes(n) = peer.write(&partial[sent..]).unwrap() {
+                    sent += n;
+                }
+            }
+            peer.flush().unwrap();
+        }
+        owner = match owner.advance() {
+            Ok(Progress::Pending(next)) => next,
+            _ => panic!("incomplete reply must retain command custody"),
+        };
+        if owner.read_progress() {
+            assert_eq!(sent, partial.len());
+            productive = true;
+            break;
+        }
+        std::thread::yield_now();
+    }
+    assert!(productive);
+    owner = match owner.advance() {
+        Ok(Progress::Pending(next)) => next,
+        _ => panic!("idle partial reply must remain pending"),
+    };
+    assert!(!owner.read_progress());
+    let reply = drive(owner, &mut peer, b"", b"250 done\r\n", 512, false)
+        .ok()
+        .unwrap();
+    assert_eq!(reply.text().unwrap(), "250 first done");
+    drop(reply.into_session().into_buffers().unwrap());
+    drop(peer.into_buffers().unwrap());
+}

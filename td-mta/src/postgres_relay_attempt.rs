@@ -108,7 +108,12 @@ pub fn drive<'w, 'a, 'r, B: TlsWireStorage>(
     };
     let accepted = loop {
         match exchange.advance() {
-            Ok(mail::Progress::Pending(next)) => exchange = next,
+            Ok(mail::Progress::Pending(next)) => {
+                if !next.read_progress() {
+                    wait(limit);
+                }
+                exchange = next;
+            }
             Ok(mail::Progress::Accepted(accepted)) => break accepted,
             Ok(mail::Progress::Rejected(done)) => {
                 return Ok(Completed {
@@ -124,7 +129,6 @@ pub fn drive<'w, 'a, 'r, B: TlsWireStorage>(
                 })
             }
         }
-        wait(limit);
     };
     let mut start = RcptStart::Mail(accepted);
     let recipients = 'recipients: loop {
@@ -146,7 +150,12 @@ pub fn drive<'w, 'a, 'r, B: TlsWireStorage>(
         };
         loop {
             match exchange.advance() {
-                Ok(rcpt::Progress::Pending(next)) => exchange = next,
+                Ok(rcpt::Progress::Pending(next)) => {
+                    if !next.read_progress() {
+                        wait(limit);
+                    }
+                    exchange = next;
+                }
                 Ok(rcpt::Progress::Next(cursor)) => {
                     start = RcptStart::Cursor(cursor);
                     continue 'recipients;
@@ -171,7 +180,6 @@ pub fn drive<'w, 'a, 'r, B: TlsWireStorage>(
                     })
                 }
             }
-            wait(limit);
         }
     };
     let mut exchange = match data::begin(recipients, scratch.command(), wire, database) {
@@ -185,7 +193,12 @@ pub fn drive<'w, 'a, 'r, B: TlsWireStorage>(
     };
     let ready = loop {
         match exchange.advance() {
-            Ok(data::Progress::Pending(next)) => exchange = next,
+            Ok(data::Progress::Pending(next)) => {
+                if !next.read_progress() {
+                    wait(limit);
+                }
+                exchange = next;
+            }
             Ok(data::Progress::Ready(done)) => break done,
             Ok(data::Progress::Rejected(done)) => {
                 return Ok(Completed {
@@ -201,7 +214,6 @@ pub fn drive<'w, 'a, 'r, B: TlsWireStorage>(
                 })
             }
         }
-        wait(limit);
     };
     let ready = match ready.reserve_body(database) {
         Ok(ready) => ready,

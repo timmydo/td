@@ -5316,3 +5316,10 @@ possibly tighter deadline before work.
 This bounded driver does not qualify maximum-body throughput or arbitrary
 backpressure. Source-sized Body admission still refuses on finite credit,
 work or original deadline exhaustion.
+
+MAIL/RCPT/DATA command owners carry one private per-turn read-progress
+boolean. A validated positive-length reply read allows immediate bounded
+continuation; the next advance resets it, so idle reads still wait. Parsing
+retains its 512-byte/one-TLS-operation turn and original meter/deadline
+checks. Write/flush waits and fresh database authority checks are unchanged.
+This pacing change does not qualify full-recipient throughput.

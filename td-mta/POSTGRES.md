@@ -5321,3 +5321,14 @@ an unknown final commit retaining actual reply evidence for inspection.
 They assert exact durable recipient outcomes, empty Pending after settlement,
 and returned ordinary/source pool capacity. These cases qualify the bounded
 driver, not maximum-sized messages or arbitrary peer backpressure.
+
+Successful partial MAIL/RCPT/DATA reply reads immediately continue through
+the existing bounded advance operation. A private per-turn progress hint
+resets before each advance and is set only for validated positive-length
+reads. Idle reads, writes and flushes retain their existing polling waits.
+Every advance keeps its before/after deadline checks, per-turn work charge,
+one TLS operation and at most 512 parsed bytes. Fresh authority checks
+before every attempted command write/flush remain unchanged. The hint grants
+no transport or publication authority and cannot carry progress into an
+idle turn. Full-recipient throughput under the original job cap remains
+unqualified; removing reply-read waits alone does not establish it.
