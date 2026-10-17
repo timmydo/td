@@ -5776,8 +5776,9 @@ refusals, malformed options and persistence of deliberately corrupted usage.
 `postgres_blob_audit::inspect` verifies one explicitly named account/blob in
 one finite read-only primary REPEATABLE READ snapshot under the expected store
 epoch and shared migration lock. The caller supplies trusted administrative
-connection access, not a device password. This is an inert verification
-component, never a download or device authorization path; it returns only
+connection access, not a device password. The preparation command in
+section 208 exposes this verification component, never a download or device
+authorization path; it returns only
 public manifest metadata and the snapshot account sequence/floor.
 
 The existing body reader checks manifest bounds, changed sequence, exact
@@ -6001,3 +6002,29 @@ The native process fixture covers strict fencing arguments, owner refusal,
 epoch mismatch, initial/entered/repeated observations, preserved ledger epoch
 and refusal without repair after a missing singleton. Section 206's API
 fixture separately covers lost COMMIT acknowledgement and lock contention.
+
+## 208. Explicit historical single-blob audit command
+
+`postgres blob-audit --connection-file PATH --epoch HEX --account ID
+--blob ID` invokes section 201's existing bounded verifier. All four flags
+are required exactly once. Unknown, duplicate, missing and malformed
+arguments refuse before opening the protected connection file. The command
+has no repair, download or profile option.
+
+Address resolution and body verification share the original ten-second
+deadline. Only pre-connection transport failure permits another resolved
+address; database or body failures do not renew work. The existing 32-MiB
+body ceiling, bounded chunk batches and worker byte/frame ceilings apply.
+
+Success JSON schema 1 identifies the epoch, account, blob, captured account
+sequence/history floor, verified byte count and manifest creation time.
+`body_digest_verified:true` describes that body's historical snapshot;
+`semantic_verified:false` excludes counters, references, other metadata,
+credentials, configuration and restore approval. No body bytes are emitted.
+Missing account or blob returns the same fixed `blob-not-found` code.
+Other failures retain fixed codes without SQL, database messages or secrets.
+No invocation changes rows or grants device or serving authority.
+
+The native command fixture checks exact report fields, account isolation,
+missing rows, wrong epochs, corrupt and empty body digests, argument refusal
+and absence of repair or credential output.
