@@ -5332,3 +5332,36 @@ before every attempted command write/flush remain unchanged. The hint grants
 no transport or publication authority and cannot carry progress into an
 idle turn. Full-recipient throughput under the original job cap remains
 unqualified; removing reply-read waits alone does not establish it.
+
+
+## 187. Retained untouched-envelope observations
+
+The passive EnvelopeChecks owner authenticates one thread-bound connection
+for observations of an exact active Prepared attempt. Each check starts a
+new READ COMMITTED transaction, obtains the transaction-scoped migration
+lock, inspects schema and store epoch, requalifies Runtime role/privileges,
+and locks selected policy and account state. It then runs the same complete
+envelope-validation implementation as standalone observations: live route
+ownership, queue clock, health, active receipt, submission and all selected
+recipient fields, followed by a fresh expiry observation.
+
+A successful turn acknowledges ROLLBACK and checks the resulting conservative
+local deadline before returning. The returned envelope is fresh passive
+evidence; its caller must compare it with the admitted envelope before any
+SMTP action. A valid address change is observable, not cached or silently
+accepted as transport authority. No transaction, migration lock or row lock
+spans returned control. Authentication persists, but authority does not.
+
+The original deadline only shrinks. Input bytes, protocol frames and output
+bytes are cumulative over the connection: 1 MiB, 1088 frames and 64 KiB,
+respectively. No successful turn renews them. Validation, protocol, rollback
+or expiry failure closes permanently, including after later database repair.
+The caller owns work admission and connection capacity. This foundation does
+not retain a connection in SMTP plans, add a scheduler, activate PostgreSQL,
+or qualify full-recipient throughput.
+
+Native tests exercise 100 selected Prepared recipients, backend reuse, idle
+ROLLBACK state, independently obtainable conflicting locks, selected-policy,
+role, privilege, recipient-phase and owner-generation fences, fresh address
+observations, cumulative exhaustion, original expiry, and backend termination
+after the last live clock observation but before acknowledged rollback.

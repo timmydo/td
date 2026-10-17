@@ -262,9 +262,9 @@ pub(crate) fn body_worker(
     connect_worker(request, trust, deadline, 512 * 1024, Input::body())
 }
 
-// Only BodyChecks may use this worker: every exposed turn qualifies schema
+// Only retained validators use this worker: every exposed turn qualifies schema
 // and Runtime access under its own transaction-scoped migration lock.
-pub(crate) fn body_check_worker(
+pub(crate) fn validation_worker(
     request: &Request<'_>,
     trust: &TrustStore,
     deadline: Instant,

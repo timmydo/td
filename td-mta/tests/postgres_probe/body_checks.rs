@@ -139,7 +139,7 @@ pub(super) fn exercise(
     quiet(fixture);
     cleanup_failure(fixture, request, trust, change, clock, guard);
 }
-fn quiet(fixture: &Fixture) {
+pub(super) fn quiet(fixture: &Fixture) {
     let stop = deadline();
     while sql(
         fixture,
@@ -150,7 +150,7 @@ fn quiet(fixture: &Fixture) {
         thread::sleep(Duration::from_millis(1));
     }
 }
-fn backend(fixture: &Fixture) -> String {
+pub(super) fn backend(fixture: &Fixture) -> String {
     let pid = sql(
         fixture,
         "SELECT pid FROM pg_catalog.pg_stat_activity WHERE application_name='td-mta-postgres'",
@@ -158,7 +158,7 @@ fn backend(fixture: &Fixture) -> String {
     pid.parse::<u32>().unwrap();
     pid
 }
-fn closed(fixture: &Fixture, pid: &str) {
+pub(super) fn closed(fixture: &Fixture, pid: &str) {
     let stop = deadline();
     while sql(
         fixture,
@@ -172,11 +172,11 @@ fn closed(fixture: &Fixture, pid: &str) {
         thread::sleep(Duration::from_millis(1));
     }
 }
-struct CleanupClock {
-    inner: Arc<dyn Clock>,
-    samples: AtomicUsize,
-    reached: SyncSender<()>,
-    proceed: Mutex<Receiver<()>>,
+pub(super) struct CleanupClock {
+    pub(super) inner: Arc<dyn Clock>,
+    pub(super) samples: AtomicUsize,
+    pub(super) reached: SyncSender<()>,
+    pub(super) proceed: Mutex<Receiver<()>>,
 }
 impl Clock for CleanupClock {
     fn sample(&self) -> Result<Time, td_mta::ports::Error> {

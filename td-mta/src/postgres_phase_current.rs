@@ -95,7 +95,7 @@ impl BodyChecks {
         if value.inner.phase != 2 {
             return Err(Error::Integrity);
         }
-        let worker = postgres_probe::body_check_worker(request, trust, deadline, budget)
+        let worker = postgres_probe::validation_worker(request, trust, deadline, budget)
             .map_err(Error::Connection)?;
         Ok(Self {
             worker: Some(worker),

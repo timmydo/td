@@ -10443,6 +10443,8 @@ mod attempt_refusal;
 mod attempt_retry;
 #[path = "postgres_probe/body_checks.rs"]
 mod body_checks;
+#[path = "postgres_probe/envelope_checks.rs"]
+mod envelope_checks;
 #[path = "postgres_probe/final_capacity.rs"]
 mod final_capacity;
 #[path = "postgres_probe/final_work.rs"]
@@ -10564,6 +10566,8 @@ fn exercise_dispatch(
         td_mta::postgres_attempt_recovery::publish(request, trust, deadline(), &current_recovery),
         Err(td_mta::postgres_attempt_recovery::Error::CurrentOwner)
     );
+    owners::renew(request, trust, deadline(), &claim, owner.generation).unwrap();
+    envelope_checks::exercise(fixture, request, trust, &value);
     attempt_phases::exercise(
         fixture,
         request,

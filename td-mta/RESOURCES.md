@@ -5323,3 +5323,14 @@ continuation; the next advance resets it, so idle reads still wait. Parsing
 retains its 512-byte/one-TLS-operation turn and original meter/deadline
 checks. Write/flush waits and fresh database authority checks are unchanged.
 This pacing change does not qualify full-recipient throughput.
+
+
+The passive retained EnvelopeChecks foundation uses the existing fixed
+1 MiB input, 1088-frame and 64 KiB output connection profile. All counters
+span authentication and successive fresh validation transactions without
+refill. Each check reuses the standalone bounded envelope parser and returns
+at most 100 recipient observations. The original deadline only tightens;
+any validation, protocol, cleanup or expiry failure permanently drops the
+backend. The owner remains thread-bound and supplies no connection permit
+or work budget itself. Native fixtures verify the aggregate limits and
+lock release, not SMTP integration or full-recipient throughput.
