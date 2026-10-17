@@ -224,11 +224,11 @@ fn native_post_read_expiry_withholds_progress_and_retires_the_pin() {
         // Grammar validation, then request first input.
         assert_eq!(cursor.poll(Tick(1)), Ok(Status::Yield));
         assert_eq!(cursor.poll(Tick(1)), Ok(Status::Yield));
-        // The pin takes two pre-check samples and two around read_at;
-        // the fourth sample expires after the read copied bytes.
+        // The fixture checks twice per fence: two before read_at and
+        // two on each side of the copy. Expire on its first post-read sample.
         timer
             .expire_at
-            .store(timer.calls.load(Ordering::Relaxed) + 4, Ordering::Relaxed);
+            .store(timer.calls.load(Ordering::Relaxed) + 5, Ordering::Relaxed);
         let error = Error::Policy(PolicyError::Deadline);
         assert_eq!(cursor.poll(Tick(1)), Err(error));
         assert_eq!(cursor.poll(Tick(1)), Err(error));

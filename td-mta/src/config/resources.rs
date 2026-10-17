@@ -419,7 +419,7 @@ mod tests {
         assert_eq!(actual.admission().work().request_seconds, 600);
         assert_eq!(actual.timeouts().execution_seconds(), 600);
         assert_eq!(actual.timeouts().limits().minimum_rate, 32768);
-        assert_eq!(actual.resources().total_bytes(), 133_285_120);
+        assert_eq!(actual.resources().total_bytes(), 78_365_952);
     }
     #[test]
     fn duplicates_keep_first_location_and_poison_candidate() {
@@ -639,8 +639,6 @@ mod tests {
             &[
                 "body_bytes",
                 "blob_count",
-                "database_bytes",
-                "wal_bytes",
                 "response_bytes",
                 "response_total_bytes",
                 "cache_bytes",
@@ -661,7 +659,6 @@ mod tests {
                 "commit_io_bytes",
                 "commit_records",
                 "checkpoint_seconds",
-                "checkpoint_io_bytes",
                 "gc_drain_seconds",
                 "gc_seconds",
                 "gc_io_bytes",
@@ -730,7 +727,6 @@ mod tests {
     fn fixed_fields_cross_section_keys_and_noninteger_values_are_refused() {
         for key in [
             "outbound_deliveries",
-            "sqlite_heap_bytes",
             "transaction_bytes",
             "transaction_operations",
             "body_bytes",

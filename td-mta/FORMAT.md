@@ -1,7 +1,7 @@
 # Store application format registry
 
 This is the normative application-byte companion to [STORAGE.md](STORAGE.md).
-SQLite owns physical pages, WAL, transactions and recovery. The allocation-free
+PostgreSQL owns physical pages, WAL, transactions and recovery. The allocation-free
 scalar, key, row and operation codecs define only bounded transient application
 values. The physical schema persists explicit SQL columns, never encoded row
 payloads or canonical-key shadow blobs. STORAGE.md owns that physical schema.
@@ -13,7 +13,7 @@ Offsets are zero-based decimal byte offsets, never native Rust layouts.
 `u16`, `u32`, `u64`, `i64` mean fixed-width little-endian integers. `be32`
 means big-endian u32. `ID` is 16 opaque bytes. `H` is a 32-byte SHA-256
 digest. Hash input is exactly the stated bytes, without implicit domain text,
-alignment, terminators or padding. SQLite identifies its own physical containers. No digest is a credential or protection against a store writer.
+alignment, terminators or padding. PostgreSQL identifies its own physical containers. No digest is a credential or protection against a store writer.
 
 `bytes(N)` is `u32 length` followed by that many bytes, at most N. `text(N)`
 also requires UTF-8; N counts bytes, not Unicode characters. A presence or
@@ -80,7 +80,7 @@ Mailbox and Email namespaces must remain different mappings. Invalid source
 IDs are reported, never silently truncated or replaced with a digest.
 
 Keyword raw bytes are capped at 255. A shorter nonempty keyword key is another
-well-formed key, not evidence of a truncated record; the SQLite record extent supplies that evidence. Header-ID keys use the parsed bytes specified
+well-formed key, not evidence of a truncated record; the PostgreSQL record extent supplies that evidence. Header-ID keys use the parsed bytes specified
 in STORAGE section 3; framing does not implement the header parser. Length
 prefixes remain little-endian even in keys. Their byte order is canonical
 serialization, independent of the logical field ordering used by store
@@ -286,6 +286,6 @@ thread assignment, cache, SMTP receipt, or export time enters this digest.
 
 format_operations and format_rows exercise literal application values and
 rejections; inline scalar/key tests pin numeric and primary-key encodings.
-Actual SQLite transaction and single-BLOB body tests exercise persistence
+Actual PostgreSQL transaction and immutable body-chunk tests exercise persistence
 separately.
-A row codec does not establish SQLite integrity, authorization or durability.
+A row codec does not establish PostgreSQL integrity, authorization or durability.

@@ -53,7 +53,7 @@ pub struct Progress {
 /// 4096 retained bytes per turn. All turns retain the original clock, deadline
 /// and work meter; no transmission allowance is renewed here. Any output-time
 /// refusal requires aborting the HTTP exchange, never emitting a second body.
-pub struct Encoder<'q, 'state, 'c, 's, 'r, 'sr, 'a, P> {
+pub struct Encoder<'q, 'state, 'c, 's, 'sr, 'a> {
     responses: &'q Responses,
     created: Option<&'q super::creation_ids::CreationIds>,
     created_entry: usize,
@@ -61,7 +61,7 @@ pub struct Encoder<'q, 'state, 'c, 's, 'r, 'sr, 'a, P> {
     created_seed: Option<td_json::arena::Object<'q>>,
     state: &'state str,
     output_started: &'q mut bool,
-    retention: &'q mut ResponseRetention<'c, 's, 'r, 'sr, 'a, P>,
+    retention: &'q mut ResponseRetention<'c, 's, 'sr, 'a>,
     phase: Phase,
     entry: usize,
     literal_offset: usize,
@@ -75,17 +75,17 @@ pub struct Encoder<'q, 'state, 'c, 's, 'r, 'sr, 'a, P> {
     output: bool,
     failure: Option<Error>,
 }
-impl<P> std::fmt::Debug for Encoder<'_, '_, '_, '_, '_, '_, '_, P> {
+impl std::fmt::Debug for Encoder<'_, '_, '_, '_, '_, '_> {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         out.write_str("Encoder { .. }")
     }
 }
-impl<'q, 'state, 'c, 's, 'r, 'sr, 'a, P> Encoder<'q, 'state, 'c, 's, 'r, 'sr, 'a, P> {
+impl<'q, 'state, 'c, 's, 'sr, 'a> Encoder<'q, 'state, 'c, 's, 'sr, 'a> {
     pub(super) fn new(
         responses: &'q Responses,
         created: Option<&'q super::creation_ids::CreationIds>,
         state: &'state str,
-        retention: &'q mut ResponseRetention<'c, 's, 'r, 'sr, 'a, P>,
+        retention: &'q mut ResponseRetention<'c, 's, 'sr, 'a>,
         output_started: &'q mut bool,
     ) -> Self {
         Self {
@@ -479,9 +479,9 @@ mod tests {
 
     fn with_response(input: &str, state: &str, width: usize) -> Vec<u8> {
         let mut body = Vec::new();
-        resolution::tests::run(|coordinator, spool, _, _| {
+        resolution::tests::run(|coordinator, _, _| {
             let retention = coordinator
-                .retain_response(spool, Deadline::after(Tick(0), 100).unwrap())
+                .retain_response(Deadline::after(Tick(0), 100).unwrap())
                 .unwrap();
             let mut preflight = response::Preflight::new(
                 dispatch::tests::request(input),
@@ -555,9 +555,9 @@ mod tests {
     }
     #[test]
     fn wrong_phase_and_fresh_output_admission_are_terminal() {
-        resolution::tests::run(|coordinator, spool, _, clock| {
+        resolution::tests::run(|coordinator, _, clock| {
             let retention = coordinator
-                .retain_response(spool, Deadline::after(Tick(0), 100).unwrap())
+                .retain_response(Deadline::after(Tick(0), 100).unwrap())
                 .unwrap();
             let mut preflight = response::Preflight::new(
                 dispatch::tests::request(r#"{"using":[],"methodCalls":[]}"#),
@@ -593,9 +593,9 @@ mod tests {
     }
     #[test]
     fn count_skips_retained_reads_but_output_refuses_a_missing_body() {
-        resolution::tests::run(|coordinator, spool, files, _| {
+        resolution::tests::run(|coordinator, files, _| {
             let retention = coordinator
-                .retain_response(spool, Deadline::after(Tick(0), 100).unwrap())
+                .retain_response(Deadline::after(Tick(0), 100).unwrap())
                 .unwrap();
             let input =
                 r#"{"using":["urn:ietf:params:jmap:core"],"methodCalls":[["Core/echo",{},"a"]]}"#;
@@ -633,9 +633,9 @@ mod tests {
     }
     #[test]
     fn complete_output_still_requires_fresh_final_admission() {
-        resolution::tests::run(|coordinator, spool, _, clock| {
+        resolution::tests::run(|coordinator, _, clock| {
             let retention = coordinator
-                .retain_response(spool, Deadline::after(Tick(0), 100).unwrap())
+                .retain_response(Deadline::after(Tick(0), 100).unwrap())
                 .unwrap();
             let mut preflight = response::Preflight::new(
                 dispatch::tests::request(r#"{"using":[],"methodCalls":[]}"#),
@@ -676,9 +676,9 @@ mod tests {
     }
     #[test]
     fn count_capacity_is_sticky_and_partial_output_cannot_restart() {
-        resolution::tests::run(|coordinator, spool, _, clock| {
+        resolution::tests::run(|coordinator, _, clock| {
             let mut retention = coordinator
-                .retain_response(spool, Deadline::after(Tick(0), 100).unwrap())
+                .retain_response(Deadline::after(Tick(0), 100).unwrap())
                 .unwrap();
             let responses =
                 Responses::new(dispatch::tests::request(r#"{"using":[],"methodCalls":[]}"#));

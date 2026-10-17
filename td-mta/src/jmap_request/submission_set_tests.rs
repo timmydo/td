@@ -463,8 +463,8 @@ fn args_mut(request: &mut td_json::Json) -> &mut td_json::Json {
 fn output_capacity_and_wrong_typed_overlays_refuse_before_effects() {
     for shadow in [false, true] {
         let service = Service::new(0, 0);
-        crate::jmap_request::resolution::tests::run(|coordinator, spool, _, _| {
-            let mut retention = coordinator.retain_response(spool, deadline(100)).unwrap();
+        crate::jmap_request::resolution::tests::run(|coordinator, _, _| {
+            let mut retention = coordinator.retain_response(deadline(100)).unwrap();
             let mut created = super::super::super::creation_ids::CreationIds::default();
             if shadow {
                 let slot = created.prepare(b"draft", &mut 10000, || Ok(())).unwrap();

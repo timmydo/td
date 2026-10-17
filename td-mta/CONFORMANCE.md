@@ -305,97 +305,35 @@ account data type. The live stream still produces pings only; this read
 profile does not claim Mail StateChange events. The real-client fixture below
 qualifies the request-driven td-mail flow independently of passive SSE tests.
 
-## Mailbox/query worker evidence
+## Mailbox query availability
 
-The opt-in retained dispatcher now exercises native Mailbox/query filtering,
-external sorting, tree rules, anchor adjustment, configured paging, totals,
-query state and result references into Mailbox/get. Its fixture includes a
-300-row merge, empty accounts, full filter validation before scans, distinct
-text limits, account/view pressure and execution expiry. This is worker-level
-evidence. The real-client fixture below separately covers live discovery and
-the initial read flow; it does not qualify every Mailbox/query combination.
+The PostgreSQL dispatcher currently returns unknownMethod for Mailbox/query
+and Mailbox/queryChanges. The removed local-store query tests do not qualify
+this backend. Mailbox/get supplies the mailbox discovery used by td-mail.
 
-## Real td-mail read evidence
+## Native real-client gate
 
-The native crypto-cargo test wrapper builds td-mail and a td-net test
-executable from this checkout, then requires the ignored mail_client_tests
-fixture to pass. It runs td-mail's actual CLI/backend and td-fetch's Unix
-protocol, HTTP and TLS implementation against the native td-mta HTTPS driver,
-credential registry and SQLite coordinator. The private CA enters only the
-fetch test build as a replacement TLS configuration with a private trust root.
-The fixture uses production fetch limits and allows loopback for its local
-server. It does not qualify the production root set or TLS configuration.
+The native crypto-cargo wrapper builds this checkout's td-mail and td-net
+fetch test executables. It requires the PostgreSQL read/download, plain-text
+send and actual foreground-service fixtures to pass. Set
+`TD_MTA_TEST_POSTGRES_BIN` to an absolute directory containing PostgreSQL 17
+`initdb`, `postgres`, `pg_ctl` and `psql`. Each fixture owns its disposable
+cluster and process cleanup; it contacts no public endpoint.
 
-Four committed messages cover plain text, HTML-only preview and body text
-beyond that preview, a
-binary base64 attachment and an interpretation refusal. The client discovers
-the Mail account, lists Inbox and all four messages, reads two ordered members of a thread, downloads
-the attachment using the server-emitted locator, exports the refused message
-using its original blob ID with exact bytes, and receives exactly HTTP 401 after
-credential revocation. The refused message remains visibly unreadable.
-
-This is a small native read fixture, not the full M22/M24 release oracle.
-SMTP receipt/recovery have their own fixtures; this case seeds native commits.
-It qualifies seen/star flags, archive/trash/restore and queued flag/move
-recovery. Permanent deletion is qualified below. Other mutations, search, submission,
-Mail state events, large
-mailbox latency and whole-service RSS are not qualified here. Existing worker/client fixtures retain
-separate coverage of bounded large queries and 300-message thread batching.
-
-A repeated real-client run exposed HTTP 429 during a rapid thread read after
-listing and downloads. td-mail now honors bounded short Retry-After delays
-for GETs and explicit read batches; mutation requests are never replayed.
-The same bounded retry covers HTTP 503 at the API/download worker handoff,
-using a one-second delay when the server supplies no Retry-After.
-The server's authentication rate limits remain unchanged.
-
-The queued flag/archive recovery fixture allows at most three explicit
-connect attempts, accepting a retry only when the client log identifies
-HTTP 429 or 503 as the replay refusal. A following read fences
-that attempt but does not prove its entire durable queue drained. Qualification
-requires the committed keyword and membership state. Native observation retries
-only Busy under one fixed phase deadline. The client transport never
-automatically retries mutation requests. Replay currently resumes on connect,
-backend start or cache reopen; a transient refusal can require reconnecting.
-
-The root-folder creation fixture qualifies only td-mail's name-only request
-and id-only created result. Successful IDs also enter the request-local
-creation map; creation references are not yet resolved. Defaulted mailbox
-properties, counts and rights arrive through the following Mailbox/get.
-Explicit parentId (including null), role and other properties are refused.
-This is not a general JMAP Mailbox/set conformance claim.
-
-The same real td-mail HTTPS fixture now permanently deletes the attachment
-message and the two members of a shared thread. It checks committed Email and
-last-owner Blob absence, preserves the Thread until its final Email is removed,
-and retries an already absent ID. The same three-attempt reconnect helper
-requires a logged 429/503 before retrying and a fixed deadline for Busy-only
-native observation. Completion also requires no client replay-refusal log after
-the fenced attempt, including the already-absent retry, so server-side removal
-alone cannot hide a rejected response. This does not qualify
-structured Email creation, submission or sending.
+The private CA enters only the existing fetch test process. This establishes
+client/server compatibility for the flows described below, not production
+root-set, managed-provider, maximum-load or full release qualification.
 
 ## Plain-text Email creation evidence
 
-The native HTTPS fixture now creates a Drafts folder and a singleton
-plain-text Email from td-mail's structured field shape. It retrieves the
-message, checks draft/seen flags, mailbox, subject, Message-ID, Bcc and body
-text, then downloads the exact-size stored message and destroys it. Stale
-ifInState and unsupported attachment creation are refused without another
-creation. Dispatcher fixtures cover mixed writes, multiple creations,
-unsupported result-reference creation, wrong account, output capacity,
-known commits with cleanup failures, and indeterminate outcomes. Device
-policy fixtures pin the fresh live-device guard and revocation refusal.
-
-This qualifies plain-text draft storage through HTTPS, not the complete
-real td-mail send flow. That client also needs Submission capability,
-creation-ID resolution, submission history and success filing. Successful
-Email and Mailbox creation IDs now merge into the response envelope when
-the request supplied createdIds. Dispatcher fixtures cover seed replacement,
-failed creations, partial folder results, omitted and empty maps, and narrow
-output chunks. Attachments are refused, and
-sending remains unavailable. The existing real td-mail read fixture runs
-unchanged beside this endpoint fixture.
+The PostgreSQL real-client send fixture below exercises plain-text draft
+creation, submission history and success filing through the prepared HTTPS
+backend. The removed local-store draft/device-policy fixtures are not
+qualification for this backend. The foreground service currently advertises
+mailbox access without Submission; relay scheduling remains unavailable.
+Shared creation-ID and response-envelope tests continue to cover bounded
+encoding, seed replacement, partial results and output failures. Attachment
+creation remains unsupported.
 
 ## Prepared PostgreSQL real-client fixture
 
@@ -411,10 +349,9 @@ permanent Email deletion,
 decoded attachment download and raw-message download with the real client. Authentication and API/download work run on the fixed HTTPS
 workers. Its private CA enters only the existing test-only fetch process.
 
-This is an explicit PostgreSQL qualification command, separate from the
-SQLite native fixture. It does not activate a production PostgreSQL service
-or qualify folder deletion, submission, cloud-provider
-failover or managed-database deployment. Process and file cleanup belong to
+This PostgreSQL fixture is part of the native gate. It does not qualify
+folder deletion, cloud-provider failover or managed-database deployment.
+The separate send and executable-service cases cover their named flows. Process and file cleanup belong to
 the fixture; no public endpoint is contacted.
 
 The separate `real_postgres_http_drafts_create_read_and_settle` fixture drives

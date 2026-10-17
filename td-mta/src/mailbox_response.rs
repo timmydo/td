@@ -6,8 +6,7 @@ use crate::{
         row::{MailboxRow, Row},
     },
     ids::MailboxId,
-    ports::{Error, ReadView, ViewIdentity},
-    store_fs::IndexReadView,
+    ports::{Error, ViewIdentity},
     wire,
 };
 
@@ -94,47 +93,6 @@ pub struct Rights {
     pub may_rename: bool,
     pub may_delete: bool,
     pub may_submit: bool,
-}
-
-/// Return a complete object length, or None for an absent mailbox.
-/// Caller scratch and output are provisional until this succeeds. Required
-/// counts must come from mailbox_counts or mailbox_counts_many on this view;
-/// identity checks catch accidental cross-view/account/object substitution.
-/// This passive projection does not authorize access or advertise Mail.
-pub fn encode(
-    view: &mut IndexReadView<'_, '_>,
-    id: MailboxId,
-    projection: Projection,
-    rights: Rights,
-    counts: Option<&MailboxCounts>,
-    scratch: &mut [u8],
-    output: &mut [u8],
-) -> Result<Option<usize>, Error> {
-    view.check_snapshot()?;
-    if let Some(counts) = counts {
-        if counts.identity != view.identity() || counts.mailbox != id {
-            return Err(Error::Invalid);
-        }
-    }
-    let Some((row, _)) = view.get(Key::Mailbox(id), scratch)? else {
-        return Ok(None);
-    };
-    let Row::Mailbox(row) = row else {
-        return Err(Error::Corrupt);
-    };
-    let length = encode_object(
-        Object {
-            identity: view.identity(),
-            id,
-            row,
-            counts,
-        },
-        projection,
-        rights,
-        output,
-    )?;
-    view.check_snapshot()?;
-    Ok(Some(length))
 }
 
 /// Project passive values without storage access. The caller must keep its

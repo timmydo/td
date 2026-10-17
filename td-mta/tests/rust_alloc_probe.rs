@@ -23,16 +23,8 @@ mod compose_text;
 
 // Compile filesystem and checker sources with their cfg(test) fixtures.
 // Filesystem fixtures need no production exception for the mapped test identity.
-use td_mta::metadata_sweep;
-#[cfg(test)]
-use td_mta::sync;
+use td_mta::{bounded, config, format, ids, limits, ownership, ports, store_paths, wire};
 pub use td_mta::{mailbox_sweep, reference_sweep};
-#[path = "../src/account_checks.rs"]
-#[allow(unused)] // Match the source-recompiled filesystem report types.
-mod account_checks;
-use td_mta::{
-    bounded, config, external_sort, format, ids, limits, ownership, ports, store_paths, wire,
-};
 #[path = "../src/admission.rs"]
 #[allow(unused)] // Keep quota/work helpers in this measured source compilation.
 mod admission;
@@ -52,19 +44,9 @@ use recipient_sweep as measured_recipient_sweep;
 #[allow(unused)]
 mod measured_reference_sweep;
 pub use td_mta::smtp_wire;
-#[path = "../src/device_credentials.rs"]
-mod device_credentials;
-#[path = "../src/mailbox_name.rs"]
-mod mailbox_name;
-#[path = "../src/receiving_headers.rs"]
-mod receiving_headers;
-#[path = "../src/smtp_session.rs"]
-#[allow(unused)] // Keep the receiving context with the recompiled storage core.
-mod smtp_session;
 #[path = "../src/store_fs.rs"]
 #[allow(unused)] // Second compilation; the library build remains the lint authority.
 pub mod store_fs;
-use td_mta::{email_response, mailbox_response};
 
 // Expand at this root to retain production child paths and restricted visibility.
 include!("../src/mime_probe_modules.rs");
@@ -156,18 +138,11 @@ fn hot_paths() {
 
 fn store_paths() {
     use td_mta::store_paths::{Name, RootEntry};
-    for entry in [
-        RootEntry::Database,
-        RootEntry::Wal,
-        RootEntry::SharedMemory,
-        RootEntry::Lock,
-    ] {
-        let name = Name::root(black_box(entry)).unwrap();
-        black_box(name.as_bytes().unwrap());
-        black_box(name.as_str().unwrap());
-        black_box(name.as_path().unwrap());
-        black_box(name.as_c_str().unwrap());
-    }
+    let name = Name::root(black_box(RootEntry::Lock)).unwrap();
+    black_box(name.as_bytes().unwrap());
+    black_box(name.as_str().unwrap());
+    black_box(name.as_path().unwrap());
+    black_box(name.as_c_str().unwrap());
 }
 
 fn tls_clients() {
@@ -12457,13 +12432,7 @@ fn retained_requested_source_bound_properties() {
 fn main() {
     allocation_counter::Counters::verify_model();
     forwarding();
-    if let Some(mode) = std::env::args()
-        .nth(1)
-        .and_then(|argument| sqlite_body_scenario::Mode::from_argument(&argument))
-    {
-        sqlite_body(mode);
-        return;
-    }
+
     if std::env::args()
         .nth(1)
         .is_some_and(|arg| arg == "--mime-only")
@@ -13024,45 +12993,6 @@ fn mailbox_parent_walks() {
         assert_eq!(result.err(), expected);
     }
     assert_eq!(COUNTERS.snapshot(), before, "mailbox parent walk allocated");
-}
-
-#[path = "support/sqlite_body_scenario.rs"]
-mod sqlite_body_scenario;
-
-fn sqlite_body(mode: sqlite_body_scenario::Mode) {
-    let phases = mode.phases();
-    let scenario = mode.scenario();
-    let prefix = if mode == sqlite_body_scenario::Mode::Body {
-        "sqlite"
-    } else {
-        scenario
-    };
-
-    let mut samples = vec![COUNTERS.snapshot(); phases.len()];
-    let mut slots = samples.iter_mut();
-    let observe = || *slots.next().unwrap() = COUNTERS.snapshot();
-    sqlite_body_scenario::run(mode, observe);
-    assert!(slots.next().is_none());
-    assert!(samples.iter().all(|s| !s.invalid));
-    let baseline = *samples.first().unwrap();
-    for sample in &samples {
-        assert!(
-            sample.peak.saturating_sub(baseline.live) <= 2 * 1024 * 1024,
-            "streamed body exceeded Rust requested-byte envelope"
-        );
-    }
-    assert_eq!(
-        samples.last().unwrap().live,
-        baseline.live,
-        "SQLite teardown retained Rust allocations"
-    );
-    for (phase, s) in phases.iter().zip(samples) {
-        println!(
-            "{prefix}-rust {phase} {} {} {} {} {} {} {}",
-            s.alloc, s.zeroed, s.realloc, s.free, s.failed, s.live, s.peak
-        );
-    }
-    println!("{scenario}-allocation-v1: rust passed");
 }
 
 #[path = "../src/transmitted_headers.rs"]

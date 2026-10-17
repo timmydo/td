@@ -4,7 +4,7 @@
 use crate::sandbox::{self, Bind};
 use std::fs;
 use std::io;
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, ExitStatus};
 
@@ -13,8 +13,10 @@ pub const ENV: &str = "TD_TEST_TRUSTED_ROOT";
 pub fn enabled(value: Option<&std::ffi::OsStr>) -> io::Result<bool> {
     match value {
         None => Ok(false),
-        Some(value) if value == "1" => Ok(true),
-        Some(_) => Err(io::Error::other("TD_TEST_TRUSTED_ROOT must be absent or 1")),
+        Some(value) if value == "1" || value == "private" => Ok(true),
+        Some(_) => Err(io::Error::other(
+            "TD_TEST_TRUSTED_ROOT must be absent or 1 or private",
+        )),
     }
 }
 
@@ -174,7 +176,11 @@ pub fn run(program: &str, args: &[String]) -> io::Result<ExitStatus> {
             .map_err(|_| io::Error::other("non-UTF-8 test environment value"))?;
         env.push((key, value));
     }
-    let mut child_args = vec!["test-root-child".into(), text(&program)?];
+    let mut child_args = vec!["test-root-child".into()];
+    if std::env::var_os(ENV).is_some_and(|value| value == "private") {
+        child_args.push("--private-directories".into());
+    }
+    child_args.push(text(&program)?);
     child_args.extend_from_slice(args);
     sandbox::host_shell(
         &text(&supervisor)?,
@@ -200,6 +206,18 @@ pub fn exit_code(status: ExitStatus) -> ExitCode {
 
 /// Namespace PID 1 supervises an ordinary child, preserving default signals.
 pub fn child(args: &[String]) -> ExitCode {
+    let args = if args
+        .first()
+        .is_some_and(|arg| arg == "--private-directories")
+    {
+        if let Err(error) = private_directories() {
+            eprintln!("td-builder test-root-child: private directories: {error}");
+            return ExitCode::FAILURE;
+        }
+        args.get(1..).unwrap_or_default()
+    } else {
+        args
+    };
     let Some((program, rest)) = args.split_first() else {
         eprintln!("td-builder test-root-child: missing test executable");
         return ExitCode::FAILURE;
@@ -213,6 +231,18 @@ pub fn child(args: &[String]) -> ExitCode {
     }
 }
 
+fn private_directories() -> io::Result<()> {
+    let owner = crate::sys::getuid();
+    for path in ["/", "/tmp"] {
+        let metadata = fs::symlink_metadata(path)?;
+        if owner == 0 || !metadata.is_dir() || metadata.uid() != owner {
+            return Err(io::Error::other("fixture directories must be caller-owned"));
+        }
+    }
+    fs::set_permissions("/", fs::Permissions::from_mode(0o755))?;
+    fs::set_permissions("/tmp", fs::Permissions::from_mode(0o700))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -224,6 +254,7 @@ mod tests {
     fn opt_in_is_explicit_and_invalid_values_fail_closed() {
         assert!(!enabled(None).unwrap());
         assert!(enabled(Some("1".as_ref())).unwrap());
+        assert!(enabled(Some("private".as_ref())).unwrap());
         for value in ["", "0", "true", "yes"] {
             assert!(enabled(Some(value.as_ref())).is_err());
         }
@@ -346,7 +377,16 @@ mod tests {
             for path in ["/", "/tmp"] {
                 let metadata = fs::metadata(path).unwrap();
                 assert_eq!(metadata.uid(), uid);
-                assert_eq!(metadata.mode() & 0o1777, 0o1777);
+                let expected = if mode == "private" {
+                    if path == "/" {
+                        0o755
+                    } else {
+                        0o700
+                    }
+                } else {
+                    0o1777
+                };
+                assert_eq!(metadata.mode() & 0o1777, expected);
             }
             assert!(std::env::var_os(ENV).is_none());
             assert_eq!(std::env::var("TMPDIR").unwrap(), "/tmp");
@@ -388,7 +428,7 @@ mod tests {
         let runner = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/release/td-builder");
         let ambient = crate::sys::get_rlimit(crate::sys::RLIMIT_DATA).unwrap();
         let limits = crate::run_capped::effective_limits(32 * 1024 * 1024, ambient);
-        for (mode, expected) in [("ok", 0), ("exit", 23), ("signal", 143)] {
+        for (mode, expected) in [("ok", 0), ("exit", 23), ("signal", 143), ("private", 0)] {
             let dir = Scratch::new().unwrap();
             let output = Command::new(&runner)
                 .arg("run-capped")
@@ -399,7 +439,7 @@ mod tests {
                     "--nocapture",
                 ])
                 .current_dir(&dir.0)
-                .env(ENV, "1")
+                .env(ENV, if mode == "private" { "private" } else { "1" })
                 .env("TD_RUN_CAPPED_MIB", "32")
                 .env("TD_TEST_ROOT_PROBE", mode)
                 .env("TD_TEST_ROOT_CWD", &dir.0)

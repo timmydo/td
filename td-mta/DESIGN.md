@@ -1,129 +1,27 @@
 # td-mta: personal mail service
 
-[POSTGRES.md](POSTGRES.md) owns the multi-instance PostgreSQL replacement.
-The active serve command now uses PostgreSQL for configuration, credentials
-and mail. CONFIG.md documents its current receive/JMAP roles. Remaining
-SQLite/local-store library contracts below are legacy removal
-work, not an alternative serving backend. Replacement may span tested
-commits; no deployed SQLite service or existing data migration is required.
+[POSTGRES.md](POSTGRES.md) owns the active PostgreSQL backend and
+multi-instance authority model. [STORAGE.md](STORAGE.md) owns the local runtime
+and response scratch. PostgreSQL is the sole mail and configuration store.
 
 ## 1. Status and scope
 
-This is the normative target for a new service, not a claim that it exists.
-`IMPLEMENTATION.md` divides it into independently reviewable increments.
-The only supported mail client is td-mail. CONFORMANCE.md defines the
-client compatibility scope and activation evidence; generic RFC completeness
-is not a milestone requirement. Expose only flows the service implements and
-return explicit errors for unsupported calls.
-The v1 release requires the acceptance evidence in section 15.
+The foreground service receives SMTP and serves the implemented td-mail JMAP
+flows from named database profiles. It retains fixed transport workers,
+bounded requests, database snapshots and verified immutable body readers.
+Relay service activation remains incomplete and is explicitly refused.
+[CONFIG.md](CONFIG.md) describes startup; [CONFORMANCE.md](CONFORMANCE.md)
+states supported client flows and qualification limits. The v1 release still
+requires section 15's evidence; functioning receive/JMAP service is not a
+claim that every target feature below is implemented.
 
-The M01 library skeleton provides typed local IDs, configuration versioning and
-checked resource planning only. [RESOURCES.md](RESOURCES.md) records the
-current planner and component observations; section 5 owns resource policy.
-[CONFORMANCE.md](CONFORMANCE.md) inventories the unimplemented JMAP
-contract and current client calls. The receiving session and native Inbox
-delivery adapter are implemented; transcript tests bind acceptance to
-reopened mail. A nonblocking receiving driver now connects session
-input, reply flushing, worker handoffs, deadlines and bounded closure to
-transports. Receiving STARTTLS now joins the driver to an actual TLS
-handshake. The foreground `serve --smtp-only` profile now activates direct IPv4
-SMTP with those fixed workers, protected configuration and existing
-account storage. CONFIG.md documents its explicit capability limits.
-
-Checked scalar/key/row and operation codecs define bounded application
-values in [FORMAT.md](FORMAT.md). Its complete batch decoder binds exact
-encoded input to caller-reserved offset slots without copying row data;
-the SQLite writer consumes that binding through its shared commit path.
-Typed and encoded object commits and history pruning require a captured
-store epoch as well as the expected account sequence. A stale epoch
-refuses before body reads or SQL writes, including after restore
-preserves the endpoint under a fresh epoch. Device credential and live
-transport verification remain separate. Native upload and receiving jobs
-share the owning coordinator, quota ledger and commit effects.
-Optional commit completions retain durable outcomes separately from
-database/WAL observations under the original writer scope; general mutation
-coordination and runtime scheduling remain service work.
-SQLite owns relational metadata, immutable
-body BLOBs, atomic transactions, native indexes, WAL snapshots and crash
-recovery. The store_fs adapter verifies streamed bodies inside their metadata
-transaction and retains the read snapshot through MIME processing. A fixed
-connection pool,
-closed SQL, native heap/page ceilings and monotonic operation bounds constrain
-the core. [STORAGE.md](STORAGE.md) owns these implemented boundaries.
-The custom journal/checkpoint/replay engine has been removed atomically.
-Protocol authorization, full mutation policy, the full operational suite, native
-resource and complete crash/fault release qualification, and full service
-activation remain unimplemented. Direct SMTP activation is described below.
-Mailbox-parent, reference and recipient validators remain reusable. SQLite
-commits check final recipient coverage and queue-state aggregates for affected
-submissions under the original bounded transaction scope.
-Committed bodies need no separate file publication. The separate IngressSpool
-primitive supplies bounded disposable SMTP/JMAP
-ingress files, full per-slot quotas and cleanup under its own root lock.
-Prepared inputs feed the synchronous SQLite core; protocol admission,
-authorization and acknowledgement coordination remain service work.
-
-[WIRE.md](WIRE.md) pins implemented wire-ID and
-MIME-part locator codecs separately from the future protocol handlers.
-[API.md](API.md) defines the compiling M02c2 adapter contracts and implemented
-state codecs; [QUEUE.md](QUEUE.md) freezes future queue/restart/JMAP semantics.
-[POLICY.md](POLICY.md) freezes message interpretation, threading and queries;
-[Unicode data](../td-mime/UNICODE.md) pins approved Unicode data and bounded normalization;
-[leap-second inputs](../td-mime/leap-seconds/README.md) pins approved IANA leap data;
-[CASES.md](CASES.md) names the protocol acceptance oracles still to implement.
-M04's `bounded` and `ownership` modules provide caller-owned buffer/queue/slot
-primitives. Its `admission` module validates disk/work settings and derived
-capacity requirements and supplies charged work meters, timer budgets and
-fixed logical leases with grouped quota checks and effect tickets.
-Physical free-space accounting is absent; logical reservations cannot
-promise successful I/O. SQLite owns native commit/checkpoint state; service
-coordination must reconcile provisional ingress staging, indeterminate commits,
-logical quotas and physical database/WAL usage before activating client
-mutation admission. These admission helpers do not instantiate service pools,
-perform live disk I/O or
-implement protocol handlers.
-
-M07d1 supplies an exclusively owned nonblocking TCP stream adapter and shared
-runtime/TLS clock conversion, as specified in API.md §1.2. M07d2 composes
-opaque shared TLS sessions with preallocated borrowed or owned record/tail
-buffers and fixed deadlines (API.md §1.3). Local facade and TCP fixtures cover bounded progress,
-backpressure, close and terminal failures. These foundations
-do not open listeners, dial endpoints, admit slots or activate serving paths.
-
-The initial deployment is one person's approximately 1 GB of mail, multiple
-domains, and explicit aliases on each domain pointing into one account's
-mailbox store. Account IDs remain explicit in every storage and authorization
-interface; v1 need not provide shared accounts or delegated access.
-Configuration validation rejects a second account and any alias targeting it.
-
-The service receives Internet SMTP for local recipients, stores and serves
-mail through JMAP, and submits outgoing messages through a configured smart
-host. It also supports receiving from an upstream gateway MX. It ships as
-one executable with all executable dependencies statically linked against
-musl for x86-64 Linux 5.6 or newer. Files for
-configuration, secrets, trust, and mail remain external. The standalone
-aarch64 cross-build uses the same data formats and interfaces;
-`td-crypto/PORTABLE.md` distinguishes its compilation evidence from native
-runtime qualification. Supporting that host does not port the td system image.
-
-Included in v1:
-
-- SMTP reception, STARTTLS, durable local delivery, and explicit aliases.
-- JMAP Core, Mail, and Submission behavior used by td-mail, including
-  attachment upload/download, MIME construction, text search, threading,
-  and submission reconciliation.
-- Durable smart-host queue, retry, cancellation, and failure visibility.
-- HTTPS with per-device application passwords and automatic ACME renewal.
-- File configuration, inspectable mail storage, bounded rolling logs,
-  machine-readable administration, migration, backup, and recovery tools.
-
-Deferred: SPF, DKIM, DMARC verification and catch-all delivery. Excluded from
-v1: IMAP, POP, public SMTP submission, direct-to-recipient-MX outbound delivery,
-external forwarding, plus addressing, Sieve, vacation replies, spam scoring,
-antivirus, calendars, contacts, webmail, clustering, and attachment-content
-indexing. MIME attachment metadata remains searchable where JMAP requires it.
-An inbound message is not authenticated merely because its transport uses TLS.
-V1 must report sender authentication as not evaluated, never as passed.
+The SQLite backend, local-store administration and file-backed device registry
+are removed. No production cutover or data migration is required.
+[FORMAT.md](FORMAT.md) owns transient application encodings, [WIRE.md](WIRE.md)
+owns wire identifiers and [QUEUE.md](QUEUE.md) owns submission policy.
+Shared MIME, header, reference and recipient validation remain independent of
+storage. [RESOURCES.md](RESOURCES.md) records planning and component evidence;
+[ADMISSION.md](ADMISSION.md) records bounded work and response retention.
 
 ## 2. Invariants and trust boundaries
 
@@ -143,7 +41,7 @@ V1 must report sender authentication as not evaluated, never as passed.
    the rule to lengths, counters, conversions, locks, and thread creation.
 7. Cryptographic primitives and TLS come from the narrowly reviewed provider;
    application protocols use std and td-owned interfaces. Metadata storage
-   uses the explicitly admitted private SQLite boundary. No shell subprocesses
+   uses the explicitly admitted private PostgreSQL boundary. No shell subprocesses
    implement mail, certificates, configuration, or administration.
 8. Protocol tests run offline against local fixtures. Neither Migadu nor a
    public CA nor the deployment host is a test endpoint.
@@ -187,15 +85,14 @@ file-configuration checks and file-backed device commands are removed.
 Its direct
 dependencies are the local `td-civil`, `td-crypto`, `td-header`, `td-html`,
 `td-json`, `td-mime`
-and `td-nfc` crates, plus the approved private rusqlite dependency with
-bundled SQLite and the approved private tokio-postgres 0.7.18 closure
+and `td-nfc` crates, plus the approved private tokio-postgres 0.7.18 closure
 with default features disabled. The sole test-only dependency is std-only
 `td-fs`, which owns disposable fixture directories. POSTGRES.md section 8
 owns the TLS/SCRAM connection probe and PostgreSQL serving contract.
-The remaining SQLite library is pending deletion. Its private SCRAM
+The driver's private SCRAM
 cryptography/Unicode preparation do not replace td-crypto or td-mime.
 Application protocols, configuration and scheduling use std
-plus the local libraries; store_fs/index.rs alone owns native SQL. There is
+plus the local libraries; the private PostgreSQL adapters own SQL. There is
 no separate runtime package or td-net helper executable.
 `td-crypto/DESIGN.md` owns the shared crypto/TLS API and private backend; `td-crypto/TLS.md`
 specifies the TLS policy and session contract. ClientConfig, ServerConfig,
@@ -1067,8 +964,8 @@ The backend admission and gate contract lives in td-crypto/DESIGN.md. All
 three packages stay in the test roster. The user approved Rustls with AWS-LC;
 M03b1 records exact transitive pins, features, licenses, roots and rationale;
 M03b2 pins the portable native inputs. The separate, user-approved private
-SQLite storage closure is pinned in td-crypto/DEPENDENCIES.md and
-STORAGE.md. No external async runtime, web framework, mail parser,
+PostgreSQL storage closure is pinned in td-crypto/DEPENDENCIES.md and
+POSTGRES.md. No external async runtime, web framework, mail parser,
 serialization or ACME framework rides along.
 The backend increment demonstrates static musl linking and bounded TLS
 behavior before consumers depend on it; exact versions belong in the
@@ -1351,10 +1248,8 @@ cache sizes and scheduling quanta are implementation choices to validate
 against progress, fairness and measured workloads. RESOURCES.md records the
 current proposal and implemented limits. Its byte partitions and TLS
 allowances are planning estimates, not mandatory per-component ceilings.
-The existing Limits::plan validation and native SQLite caps remain implemented
-behavior; this design change does not relax them. Replacing the speculative
-planner is a separate atomic code/configuration change, not a prerequisite
-for functional storage work. Maintenance must share bounded capacity with
+Limits::plan retains its process planning validation. PostgreSQL owns server
+heap, WAL and page resources; the process ledger does not bound that server. Maintenance must share bounded capacity with
 live work and preserve foreground progress.
 
 Event-source streams hold connection slots but no storage read view between
@@ -1394,7 +1289,7 @@ Initial default ceilings (validated together at startup):
 | JMAP object IDs per get/set / query page | 256 / 256 |
 | JSON nesting / parser tokens per request | 32 / 32768 |
 | Combined resident index cache | 4 MiB |
-| Storage read views | 2, each with bounded row/key/cursor scratch and a SQLite snapshot |
+| Storage read views | 2, each with bounded row/key/cursor scratch and a database snapshot |
 | Bodies retained by upload leases | 128 MiB per account, expiry after 24 hours |
 | Retained submission storage | 256 MiB and 1000 submissions |
 | Maintenance sort scratch on disk | 64 MiB per account |
@@ -1596,8 +1491,8 @@ Create secret/mail files as 0600 and private directories as 0700, without a
 permissive creation window. Never derive a filesystem pathname from a mailbox
 name, address, attachment filename, or arbitrary client ID.
 STORAGE.md defines the std path checks, deployment identity and stable-path
-assumptions. Std writer locking and atomic SQLite body/metadata commits are implemented;
-runtime protocol admission remains pending. The service
+assumptions. Local locks protect runtime and response scratch only. Database
+transactions own durable publication. The service
 uses logical quotas and handles disk-full/write/sync failures; it does not
 measure or promise physical free space before admission.
 
@@ -1678,64 +1573,20 @@ Use bundled reviewed public roots for outbound TLS, with an explicit protected
 CA-file override for local tests/private gateways. A root-data update is a
 reviewed artifact update. A test trust override must not disable verification.
 
-## 8. On-disk store and crash consistency
+## 8. Durable storage and crash consistency
 
-[STORAGE.md](STORAGE.md) owns the explicit relational schema, immutable body
-BLOBs, commit ordering, snapshots, checkpoints and operational boundaries.
-SQLite stores exact message/upload/transmission bytes together with names,
-membership, flags, IDs, threading, envelopes, submissions and history.
-Parsed-body/search caches are rebuildable; bodies and metadata are authoritative.
+[POSTGRES.md](POSTGRES.md) owns schema, transactions, snapshot custody,
+commit uncertainty, recovery and database administration. Immutable bodies and
+metadata are published together. Full length and digest verification grants
+body custody only within the original live snapshot. Passive historical audit
+reports grant neither current freshness nor body-read authority.
 
-A body and its metadata commit atomically through WAL with synchronous
-FULL. Each blob row holds one immutable body BLOB. Retained incremental
-handles stream at most 64 KiB per call under a 32 MiB hard message/upload
-limit, without a whole-body memory buffer. Existing read transactions
-preserve old body snapshots after deletion. Native foreign keys enforce
-ownership; an expired lease retains its blob until explicit
-transactional removal. An uncertain COMMIT retires writes until
-reopen/recovery. Never acknowledge before COMMIT succeeds. Preserve
-transmission bytes independently of visible email lifetime. A stopped
-checkpointed database backup captures both bytes and metadata. The
-consuming IndexStore::backup primitive closes all native connections,
-copies through caller-owned 64 KiB scratch under retained source and
-destination locks, and publishes without replacement only after file sync.
-Its receipt follows destination directory sync; explicit failure phases
-keep partial artifacts distinguishable from successful backups. STORAGE.md
-owns the bounded copy and offline recovery contract. The offline `backup`
-CLI exposes this database-only copy without semantic verification or
-restore authority; it does not include configuration or credentials. The
-offline restore command verifies the copied database and renews its epoch
-before completion. It neither starts service nor reconciles external
-delivery outcomes; activation and consistent service configuration remain
-separate. Old schemas are refused; no data migration is required. Startup
-validates the closed schema and store identity without a full integrity
-scan. Explicit validate_integrity maintenance runs SQLite's full
-database/index consistency and foreign-key checks and the per-Email
-anchor-cardinality scan specified in STORAGE.md; integrity_check also
-validates the body-length CHECK constraint; body pins still require exact
-length/digest verification. The synchronous IndexReadView::verify_bodies
-primitive verifies every enumerated body for one account view under
-explicit count/byte limits and the original snapshot, deadline and VM
-fuel. Explicit cold maintenance_view captures the same pooled snapshot
-with one finite full-maintenance VM allowance; ordinary views retain their
-smaller cap. Neither scope renews while verification runs. Its historical
-completion report grants no body custody or current freshness.
-account_checks::combine binds historical metadata/body results only for
-matching full view identities and Blob counts; physical completeness and
-full verification remain separate offline-coordinator requirements.
-IndexReadView::verify_account drives bounded metadata and body checks and
-their report guard on one captured view, reusing caller scratch. Explicit
-metadata/body limits and caller-supplied trusted UTC govern admission; all
-stages spend the original deadline and VM allowance. Failure returns no
-combined report. The historical result retains the same separate physical,
-custody and activation requirements. SQLite recovery may read the full
-bounded WAL, and checkpoint may copy the entire bounded database in a
-synchronous native call. Neither promises interruption at the application
-deadline. Native resource and complete crash/fault qualification remain v1
-release requirements under sections 5 and 15. Incremental receiving activation does
-not require the complete release matrix; it must test its changed durability,
-admission and lifecycle boundaries. Full domain mutation policy and service
-deployment remain separate.
+[STORAGE.md](STORAGE.md) owns process-local locks and disposable response
+files. No local mail database, body directory, backup command or migration
+interface remains. Operators use PostgreSQL backup and restore facilities;
+restore/epoch and uncertain external delivery requirements remain governed by
+POSTGRES.md. Tests exercise real database and process failures, but do not
+claim full power-loss, managed-provider or whole-service resource qualification.
 
 ## 9. SMTP receiving and message representation
 
@@ -1744,8 +1595,8 @@ turn. Pending replies require an explicit flush acknowledgement; reservation,
 body writes and publication require separate trusted driver results before
 input resumes. A final DATA 250 follows only a successful commit result for
 the routed account. An indeterminate result closes without a final reply.
-A supplied result alone is not durability proof. The native
-StoreCoordinator now reserves ingress, replaces Return-Path, generates
+A supplied result alone is not durability proof. PostgreSQL receiving
+stages bounded ingress, replaces Return-Path, generates
 Received from trusted connection facts, resolves immutable threads and
 publishes one Inbox email with its body, envelope and history in one
 transaction. A delivery job owns its connection authorization adapter,
@@ -1758,7 +1609,7 @@ connect actual outcomes to the session and verify reopened mail. The
 receiving network driver additionally exercises real local TCP delivery
 and reopened storage. The direct receiving runtime described below
 connects these adapters with fixed workers on caller-bound listeners.
-The `serve --smtp-only` command activates direct receiving. The engine binds
+The `serve` command activates direct receiving for receive profiles. The engine binds
 routing for its lifetime, accepts only configured recipients, retains accepted
 envelope spellings, and exposes one account for one atomic delivery. It
 advertises SIZE, 8BITMIME and
@@ -2693,34 +2544,10 @@ invalid header, exhausted budget, deadline or clock failure. The transmitted
 copy and all queue rows still require separate admission and atomic publication.
 
 
-The inert native `StoreCoordinator::create_submission` worker freezes an
-immediate td-mail submission from one verified Email blob. Its trusted policy
-guard binds account, device, configuration generation and one configured
-identity address. Initial authorization selects the source; a fresh guard
-must match before publication and remains held through COMMIT. A changed
-source Email, store epoch or requested state refuses. No JMAP submission
-capability or SMTP worker is enabled by this entry point.
-
-The original meter covers whole-body integrity verification, root-header
-collection, implicit-envelope derivation, the Bcc-stripped private spool copy,
-row preparation and the native publication reread. One bounded header arena
-is shared by derivation and copying under the same retained native pin.
-Configured limits bound both the original message and outgoing copy, headers
-and at most 1000 unique recipients; original and phase deadlines never reset.
-No coordinator lock or authorization guard crosses body verification/copying.
-
-Logical body bytes, one blob, queue bytes and one submission are reserved
-before staging. The entire checked transaction fits the native operation and
-byte limits, and physical database/WAL space is reserved before publication.
-The new blob, immutable submission identity, all initially Queued recipients
-and the submission-created change commit together. Fresh UTC sendAt and
-checked five-day expiresAt are encoded before that transaction. Live and
-retained-history collision checks protect generated submission IDs; blobs
-use their live identity check. Known commits survive accounting or staging
-cleanup errors in the returned completion. Failures release private staging
-and reservations; indeterminate effects stop admission for recovery. The
-original Email, Bcc, mailbox membership and flags remain intact; the JMAP
-consumer owns later on-success Email/set hooks and response retention.
+PostgreSQL submission admission, source verification, transmitted-copy
+publication and durable receipt settlement are specified in POSTGRES.md.
+The shared header and envelope algorithms above do not grant publication
+authority. Relay process scheduling remains separate from these transactions.
 
 ## Request-local creation map
 
@@ -2757,7 +2584,6 @@ storage, for future fresh body/method authorization. Ordinary responses and
 EventSource clear them with the original credential head before output;
 other client retirement also clears them. A successful device ID is
 only the initial observation; mutations and body admission keep their existing
-fresh authorization boundaries. The local verifier remains active until the
-atomic PostgreSQL cutover. The backend contract requires bounded completion
+fresh authorization boundaries. The PostgreSQL verifier owns the database-backed device check. The backend contract requires bounded completion
 under the supplied deadline. Service shutdown joins the verifier along with
 the existing workers; database lookup must never run on the network reactor.

@@ -30,7 +30,7 @@ pub(crate) fn manifest_pin(name: &str, text: &str) -> Result<(), String> {
     let expected = match name {
         "td-civil" => "434e8c6ab3f8d304ce8c090478324e4e1398e39561395b0c7a59bf4cdc20b1ca",
         "td-crypto" => "7ca2d70176ddb80083ff07de51465e8194fd01e4e4d435201444f11ed997c308",
-        "td-mta" => "9336bb259abb880758f60432bb149a2eb87f6b18d6a0ffdd81ca74207a317214",
+        "td-mta" => "6bed948bad62c65afc0b87e6ea9cd2e69f95caceeaf3f77b5074c2914c21e915",
         "td-fs" => "1ac91f7a8baf01070f9f51fbf6f625b637e96894174dda1dc4c1ce0e9b6ef401",
         "td-header" => "4e8dd9a6be096e9ffa65cbb26e71a8f3ec8a9c32c9d83211a1c490a43508aac9",
         "td-html" => "e4c924efdc7deab65fcc5cfa64bd5349935d5f3094e4310125ddb173af0b1c14",
@@ -50,7 +50,7 @@ pub(crate) fn lock_pin(name: &str, text: &str) -> Result<(), String> {
     let expected = match name {
         "td-civil" => "d05684e2af245c0a796e154148ced1bc85ea08d9f31799d65a4fe1a62b7fc66a",
         "td-crypto" => "499bfd9b6780ca6cc7df5c928a16d7397c43b61bbde1d164d532c494c530514b",
-        "td-mta" => "483fd0add9ad3c51057753234b788423d3616eaf89ef988ffe5e77aba60ccb10",
+        "td-mta" => "cba1a048acec452a57c7088cb1c114a860c235fcf77abbefaad52fea66bfe831",
         "td-fs" => "d907e7d97198344c058b8403d2a07c08174081bcd8af0f4d9e276c0131766fe2",
         "td-header" => "2862fd9186d5cdef3d645af0b43dee9f77ba51beee5d98219e5aae30db11eabc",
         "td-html" => "5bc92c6117fc17c612004a1b025a6ad42171c3d185d9af7eb47dd13a9168e8e3",
@@ -163,15 +163,6 @@ webpki-roots v1.0.8|
 zeroize v1.9.0|alloc,default
 ";
 
-const SQLITE_ACTIVE: &str = "bitflags v2.13.2|
-fallible-iterator v0.3.0|alloc,default
-fallible-streaming-iterator v0.1.9|
-libsqlite3-sys v0.38.2|bundled,bundled_bindings,cc,default,min_sqlite_version_3_34_1,pkg-config,vcpkg
-rusqlite v0.40.2|blob,bundled,hooks,limits,modern_sqlite
-smallvec v1.16.2|
-vcpkg v0.2.15|
-";
-
 const POSTGRES_ACTIVE: &str = "async-trait v0.1.92 (proc-macro)|
 base64 v0.22.1|alloc,default,std
 block-buffer v0.12.1|
@@ -213,6 +204,7 @@ rand_core v0.10.1|
 scopeguard v1.2.0|
 sha2 v0.11.1|alloc,default,oid
 siphasher v1.0.4|default,std
+smallvec v1.16.2|
 socket2 v0.6.5|all
 stringprep v0.1.5|
 syn v3.0.9|clone-impls,full,parsing,printing,proc-macro,visit-mut
@@ -237,7 +229,6 @@ pub(crate) fn active_graph(root: &Path, name: &str, output: &str) -> Result<(), 
     let mut expected: BTreeSet<String> = ACTIVE.lines().map(str::to_owned).collect();
     let mut local = vec!["td-crypto"];
     if name == "td-mta" {
-        expected.extend(SQLITE_ACTIVE.lines().map(str::to_owned));
         expected.extend(POSTGRES_ACTIVE.lines().map(str::to_owned));
         local.extend([
             "td-civil",
@@ -267,8 +258,6 @@ pub(crate) fn active_graph(root: &Path, name: &str, output: &str) -> Result<(), 
     }
     Ok(())
 }
-
-pub(crate) const SQLITE_DEPENDENCY: &str = "rusqlite = { version = \"=0.40.2\", default-features = false, features = [\"blob\", \"bundled\", \"hooks\", \"limits\"] }";
 
 pub(crate) const POSTGRES_DEPENDENCIES: &[&str] = &[
     "tokio-postgres = { version = \"=0.7.18\", default-features = false }",
@@ -479,7 +468,7 @@ mod tests {
         let nfc = root.join("td-nfc").canonicalize().unwrap();
         let mime = root.join("td-mime").canonicalize().unwrap();
         let mailgraph = format!(
-            "{graph}{SQLITE_ACTIVE}{POSTGRES_ACTIVE}td-civil v0.1.0 ({})|\ntd-mta v0.1.0 ({})|\ntd-json v0.1.0 ({})|\ntd-header v0.1.0 ({})|\ntd-html v0.1.0 ({})|\ntd-nfc v0.1.0 ({})|\ntd-mime v0.1.0 ({})|\n",
+            "{graph}{POSTGRES_ACTIVE}td-civil v0.1.0 ({})|\ntd-mta v0.1.0 ({})|\ntd-json v0.1.0 ({})|\ntd-header v0.1.0 ({})|\ntd-html v0.1.0 ({})|\ntd-nfc v0.1.0 ({})|\ntd-mime v0.1.0 ({})|\n",
             civil.display(),
             mail.display(),
             json.display(),
@@ -498,14 +487,20 @@ mod tests {
         assert!(active_graph(&root, "td-crypto", &format!("{graph}{POSTGRES_ACTIVE}")).is_err());
         assert!(active_graph(&root, "td-other", &mailgraph).is_err());
         for bad in [
-            mailgraph.replace("rusqlite v0.40.2|blob,bundled,hooks,limits,modern_sqlite", "rusqlite v0.40.2|blob,bundled,hooks,limits,load_extension,modern_sqlite"),
-            mailgraph.replace("libsqlite3-sys v0.38.2|bundled,bundled_bindings,cc,default,min_sqlite_version_3_34_1,pkg-config,vcpkg", "libsqlite3-sys v0.38.2|default,pkg-config,vcpkg"),
-            mailgraph.replace("rusqlite v0.40.2", "rusqlite v0.40.1"),
             mailgraph.replace("smallvec v1.16.2|\n", ""),
             mailgraph.replace("tokio-postgres v0.7.18|\n", ""),
-            mailgraph.replace("tokio-postgres v0.7.18|", "tokio-postgres v0.7.18|default,runtime"),
-            mailgraph.replace("tokio v1.53.3|bytes,default,io-util,sync", "tokio v1.53.3|bytes,default,io-util,net,rt,sync,time"),
-            mailgraph.replace("postgres-protocol v0.6.12|default", "postgres-protocol v0.6.11|default"),
+            mailgraph.replace(
+                "tokio-postgres v0.7.18|",
+                "tokio-postgres v0.7.18|default,runtime",
+            ),
+            mailgraph.replace(
+                "tokio v1.53.3|bytes,default,io-util,sync",
+                "tokio v1.53.3|bytes,default,io-util,net,rt,sync,time",
+            ),
+            mailgraph.replace(
+                "postgres-protocol v0.6.12|default",
+                "postgres-protocol v0.6.11|default",
+            ),
             format!("{mailgraph}postgres-native-tls v0.5.0|\n"),
         ] {
             assert!(active_graph(&root, "td-mta", &bad).is_err());

@@ -62,7 +62,7 @@ pub struct SubmissionAccess<'a> {
     pub device: DeviceId,
     pub state: DataState,
 }
-impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
+impl Worker<'_, '_, '_, '_, '_> {
     pub(super) fn submission_set(
         &mut self,
         call: super::super::Invocation<'_>,

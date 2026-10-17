@@ -8,8 +8,8 @@ use crate::{
     admission::work::Meter,
     bounded::TextBuffer,
     store_fs::{
-        MailboxAuthorization, MailboxCreateCompletion, MailboxCreateRequest, MailboxCreateResult,
-        StoreCoordinator, UploadError, MAX_MAILBOX_CREATES,
+        MailboxCreateCompletion, MailboxCreateRequest, MailboxCreateResult, UploadError,
+        MAX_MAILBOX_CREATES,
     },
     sync::{DataState, DataType},
     wire,
@@ -24,34 +24,13 @@ pub trait MailboxMutator {
         meter: &mut Meter,
     ) -> Result<MailboxCreateCompletion, UploadError>;
 }
-struct FolderEntropy(Option<td_crypto::SystemEntropy>);
-impl td_crypto::Entropy for FolderEntropy {
-    fn fill(&mut self, output: &mut [u8]) -> Result<(), td_crypto::Error> {
-        if self.0.is_none() {
-            self.0 = Some(td_crypto::SystemEntropy::try_new()?);
-        }
-        self.0
-            .as_mut()
-            .ok_or(td_crypto::Error::Entropy)?
-            .fill(output)
-    }
-}
-impl<P: MailboxAuthorization> MailboxMutator for StoreCoordinator<'_, '_, P> {
-    fn create_mailboxes(
-        &self,
-        request: MailboxCreateRequest<'_>,
-        meter: &mut Meter,
-    ) -> Result<MailboxCreateCompletion, UploadError> {
-        let mut entropy = FolderEntropy(None);
-        self.create_mailboxes(&td_crypto::Provider, &mut entropy, request, meter)
-    }
-}
+
 struct Creation {
     key: Name,
     name: String,
     slot: usize,
 }
-impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
+impl Worker<'_, '_, '_, '_, '_> {
     pub(super) fn mailbox_set(
         &mut self,
         arguments: Range<u64>,
@@ -297,7 +276,3 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
         Ok(Some(name))
     }
 }
-
-#[cfg(test)]
-#[path = "mailbox_set_tests.rs"]
-mod tests;

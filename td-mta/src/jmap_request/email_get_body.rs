@@ -1,10 +1,9 @@
 //! Bounded per-message composition over one verified account snapshot.
 use super::{storage, Error, Selection, Worker};
 use crate::{
-    admission::work::{Charge, Meter},
+    admission::work::Meter,
     blob_structure,
     body_value_options::Options,
-    ids::BlobId,
     limits::Limits,
     mime_body_lists::Node,
     mime_part_headers::{self, label_json},
@@ -12,7 +11,7 @@ use crate::{
     mime_structure::{self, Part},
     nfc::{HeaderBudget, Scratch},
     ports::{BlobReader, Clock, Tick},
-    store_fs::{IndexReadView, PinnedBlob},
+    store_fs::PinnedBlob,
 };
 
 pub(super) fn buffer<T: Default + Clone>(count: usize) -> Result<Vec<T>, Error> {
@@ -119,38 +118,6 @@ fn reborrow<'a, 'v, 'c, 'b: 'a, 'o: 'a>(
         remaining: r.remaining,
         header_bytes: r.header_bytes,
     }
-}
-pub(super) fn write<P>(
-    worker: &mut Worker<'_, '_, '_, '_, '_, '_, P>,
-    view: &mut IndexReadView<'_, '_>,
-    blob: BlobId,
-    limits: &Limits,
-    selection: (&Selection, Options),
-    clock: &dyn Clock,
-    work: &mut Meter,
-) -> Result<(), Error> {
-    let crypto = td_crypto::Provider;
-    let mut input = view
-        .open_blob_input(&crypto, blob, limits.message_bytes as u64)
-        .map_err(storage)?;
-    let mut chunk = [0; 4096];
-    while input.position() < input.len() {
-        worker.check()?;
-        work.charge(
-            now(clock)?,
-            Charge {
-                io_bytes: chunk.len() as u64,
-                records: 1,
-                ..Charge::default()
-            },
-        )
-        .map_err(mime)?;
-        if input.read(&mut chunk).map_err(storage)? == 0 {
-            return Err(Error::State);
-        }
-    }
-    let mut pin = input.finish().map_err(storage)?;
-    write_verified(worker, &mut pin, limits, selection, clock, work)
 }
 
 /// Emit the existing Email MIME/header members from verified snapshot custody.
@@ -574,7 +541,7 @@ pub trait Output {
     fn check(&mut self) -> Result<(), Error>;
     fn append(&mut self, bytes: &[u8]) -> Result<(), Error>;
 }
-impl<P> Output for Worker<'_, '_, '_, '_, '_, '_, P> {
+impl Output for Worker<'_, '_, '_, '_, '_> {
     fn check(&mut self) -> Result<(), Error> {
         if self
             .retention

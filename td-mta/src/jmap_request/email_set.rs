@@ -10,9 +10,8 @@ use crate::{
     ids::{EmailId, MailboxId},
     ports,
     store_fs::{
-        EmailDestroyCompletion, EmailDestroyRequest, EmailUpdate, EmailUpdateAuthorization,
-        EmailUpdateCompletion, EmailUpdateRequest, EmailUpdateResult, StoreCoordinator,
-        UploadError, MAX_EMAIL_UPDATES,
+        EmailDestroyCompletion, EmailDestroyRequest, EmailUpdate, EmailUpdateCompletion,
+        EmailUpdateRequest, EmailUpdateResult, UploadError, MAX_EMAIL_UPDATES,
     },
     sync::{DataState, DataType},
 };
@@ -34,22 +33,7 @@ pub trait EmailMutator {
         Err(ports::Error::Forbidden.into())
     }
 }
-impl<P: EmailUpdateAuthorization> EmailMutator for StoreCoordinator<'_, '_, P> {
-    fn update(
-        &self,
-        request: EmailUpdateRequest<'_>,
-        meter: &mut Meter,
-    ) -> Result<EmailUpdateCompletion, UploadError> {
-        self.update_emails(&td_crypto::Provider, request, meter)
-    }
-    fn destroy(
-        &self,
-        request: EmailDestroyRequest<'_>,
-        meter: &mut Meter,
-    ) -> Result<EmailDestroyCompletion, UploadError> {
-        self.destroy_emails(&td_crypto::Provider, request, meter)
-    }
-}
+
 struct Update {
     name: Name,
     value: EmailUpdate,
@@ -68,7 +52,7 @@ pub(super) fn failure(error: UploadError, conditional: bool) -> Error {
         UploadError::Format(_) => Error::State,
     }
 }
-impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
+impl Worker<'_, '_, '_, '_, '_> {
     pub(super) fn email_set(
         &mut self,
         arguments: Range<u64>,
@@ -358,10 +342,6 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
             .map_err(Error::Storage)
     }
 }
-
-#[cfg(test)]
-#[path = "email_set_tests.rs"]
-mod tests;
 
 #[path = "email_destroy.rs"]
 mod email_destroy;

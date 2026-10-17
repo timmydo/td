@@ -37,12 +37,6 @@ pub use email_get::{
 mod get_ids;
 #[path = "mailbox_get.rs"]
 mod mailbox_get;
-#[path = "mailbox_query.rs"]
-mod mailbox_query;
-#[path = "mailbox_query_args.rs"]
-mod mailbox_query_args;
-#[path = "mailbox_query_filter.rs"]
-mod mailbox_query_filter;
 #[path = "object_changes.rs"]
 mod object_changes;
 #[path = "push.rs"]
@@ -88,14 +82,14 @@ impl std::error::Error for Error {}
 /// Indexed complete arguments and their exclusively owned retention file.
 /// Successful creation IDs and the captured Session state remain available for the
 /// final envelope writer. No API/Session or Core capability is activated here.
-pub struct Completed<'state, 'c, 's, 'r, 'sr, 'a, P> {
+pub struct Completed<'state, 'c, 's, 'sr, 'a> {
     responses: result_index::Responses,
     created: super::creation_ids::CreationIds,
     state: &'state str,
     output_started: bool,
-    retention: ResponseRetention<'c, 's, 'r, 'sr, 'a, P>,
+    retention: ResponseRetention<'c, 's, 'sr, 'a>,
 }
-impl<'state, 'c, 's, 'r, 'sr, 'a, P> Completed<'state, 'c, 's, 'r, 'sr, 'a, P> {
+impl<'state, 'c, 's, 'sr, 'a> Completed<'state, 'c, 's, 'sr, 'a> {
     pub fn responses(&self) -> &result_index::Responses {
         &self.responses
     }
@@ -107,7 +101,7 @@ impl<'state, 'c, 's, 'r, 'sr, 'a, P> Completed<'state, 'c, 's, 'r, 'sr, 'a, P> {
     }
     pub fn encoder(
         &mut self,
-    ) -> Result<super::wire::Encoder<'_, 'state, 'c, 's, 'r, 'sr, 'a, P>, super::wire::Error> {
+    ) -> Result<super::wire::Encoder<'_, 'state, 'c, 's, 'sr, 'a>, super::wire::Error> {
         if self.output_started {
             return Err(super::wire::Error::State);
         }
@@ -130,25 +124,25 @@ impl<'state, 'c, 's, 'r, 'sr, 'a, P> Completed<'state, 'c, 's, 'r, 'sr, 'a, P> {
 /// Refusal drops the request arenas; allocation recycling is not promised.
 /// Read-only fixtures use this entry; runtime dispatch requires a device.
 #[cfg(test)]
-pub fn run<'state, 'c, 's, 'r, 'sr, 'a, P>(
+pub fn run<'state, 'c, 's, 'sr, 'a>(
     plan: response::Plan<'state>,
-    retention: ResponseRetention<'c, 's, 'r, 'sr, 'a, P>,
+    retention: ResponseRetention<'c, 's, 'sr, 'a>,
     execution: ports::Deadline,
     account: AccountId,
-) -> Result<Completed<'state, 'c, 's, 'r, 'sr, 'a, P>, Error> {
+) -> Result<Completed<'state, 'c, 's, 'sr, 'a>, Error> {
     run_inner(plan, retention, execution, account, Profile::default())
 }
 
 /// Email-only mutation fixture; runtime uses the complete mail-access profile.
 #[cfg(test)]
-pub fn run_with_email_updates<'state, 'c, 's, 'r, 'sr, 'a, P>(
+pub fn run_with_email_updates<'state, 'c, 's, 'sr, 'a>(
     plan: response::Plan<'state>,
-    retention: ResponseRetention<'c, 's, 'r, 'sr, 'a, P>,
+    retention: ResponseRetention<'c, 's, 'sr, 'a>,
     execution: ports::Deadline,
     account: AccountId,
     device: crate::ids::DeviceId,
     flags: &dyn EmailMutator,
-) -> Result<Completed<'state, 'c, 's, 'r, 'sr, 'a, P>, Error> {
+) -> Result<Completed<'state, 'c, 's, 'sr, 'a>, Error> {
     run_inner(
         plan,
         retention,
@@ -162,14 +156,14 @@ pub fn run_with_email_updates<'state, 'c, 's, 'r, 'sr, 'a, P>(
 }
 /// Prepared singleton Email/set. Refuse mixed requests before any effect;
 /// this path has no native read adapter or draft implementation.
-pub fn run_with_postgres_updates<'state, 'c, 's, 'r, 'sr, 'a, P>(
+pub fn run_with_postgres_updates<'state, 'c, 's, 'sr, 'a>(
     plan: response::Plan<'state>,
-    retention: ResponseRetention<'c, 's, 'r, 'sr, 'a, P>,
+    retention: ResponseRetention<'c, 's, 'sr, 'a>,
     execution: ports::Deadline,
     account: AccountId,
     device: crate::ids::DeviceId,
     flags: &dyn EmailMutator,
-) -> Result<Completed<'state, 'c, 's, 'r, 'sr, 'a, P>, Error> {
+) -> Result<Completed<'state, 'c, 's, 'sr, 'a>, Error> {
     let request = plan.request().map_err(|_| Error::State)?;
     if request.call_count() != 1
         || request
@@ -192,14 +186,14 @@ pub fn run_with_postgres_updates<'state, 'c, 's, 'r, 'sr, 'a, P>(
 }
 /// Prepared singleton Mailbox/set. Refuse mixed requests before any effect;
 /// this path has no native read adapter or draft implementation.
-pub fn run_with_postgres_mailboxes<'state, 'c, 's, 'r, 'sr, 'a, P>(
+pub fn run_with_postgres_mailboxes<'state, 'c, 's, 'sr, 'a>(
     plan: response::Plan<'state>,
-    retention: ResponseRetention<'c, 's, 'r, 'sr, 'a, P>,
+    retention: ResponseRetention<'c, 's, 'sr, 'a>,
     execution: ports::Deadline,
     account: AccountId,
     device: crate::ids::DeviceId,
     mailboxes: &dyn MailboxMutator,
-) -> Result<Completed<'state, 'c, 's, 'r, 'sr, 'a, P>, Error> {
+) -> Result<Completed<'state, 'c, 's, 'sr, 'a>, Error> {
     let request = plan.request().map_err(|_| Error::State)?;
     if request.call_count() != 1
         || request
@@ -223,12 +217,12 @@ pub fn run_with_postgres_mailboxes<'state, 'c, 's, 'r, 'sr, 'a, P>(
 /// Prepared singleton submission creation or cancellation, with creation filing.
 /// The caller supplies freshly authenticated Submission state and the same
 /// clock used by response retention. Mixed draft/send batches remain refused.
-pub fn run_with_postgres_submissions<'state, 'c, 's, 'r, 'sr, 'a, P>(
+pub fn run_with_postgres_submissions<'state, 'c, 's, 'sr, 'a>(
     plan: response::Plan<'state>,
-    retention: ResponseRetention<'c, 's, 'r, 'sr, 'a, P>,
+    retention: ResponseRetention<'c, 's, 'sr, 'a>,
     execution: ports::Deadline,
     access: SubmissionAccess<'_>,
-) -> Result<Completed<'state, 'c, 's, 'r, 'sr, 'a, P>, Error> {
+) -> Result<Completed<'state, 'c, 's, 'sr, 'a>, Error> {
     let request = plan.request().map_err(|_| Error::State)?;
     if access.state.kind != crate::sync::DataType::Submission
         || request.call_count() != 1
@@ -252,14 +246,14 @@ pub fn run_with_postgres_submissions<'state, 'c, 's, 'r, 'sr, 'a, P>(
 }
 /// td-mail's ordered draft creation followed by submission and optional filing.
 /// Both operations spend one original request budget; they are not atomic.
-pub fn run_with_postgres_send<'state, 'c, 's, 'r, 'sr, 'a, P>(
+pub fn run_with_postgres_send<'state, 'c, 's, 'sr, 'a>(
     plan: response::Plan<'state>,
-    retention: ResponseRetention<'c, 's, 'r, 'sr, 'a, P>,
+    retention: ResponseRetention<'c, 's, 'sr, 'a>,
     execution: ports::Deadline,
     access: SubmissionAccess<'_>,
     drafts: &dyn DraftCreator,
     flags: &dyn EmailMutator,
-) -> Result<Completed<'state, 'c, 's, 'r, 'sr, 'a, P>, Error> {
+) -> Result<Completed<'state, 'c, 's, 'sr, 'a>, Error> {
     let request = plan.request().map_err(|_| Error::State)?;
     let mut calls = request.calls();
     if access.state.kind != crate::sync::DataType::Submission
@@ -308,15 +302,15 @@ pub struct DraftAccess<'a> {
     pub state: Option<crate::sync::DataState>,
 }
 /// Prepared singleton Email/set with freshly authenticated state for drafts.
-pub fn run_with_postgres_mail_access<'state, 'c, 's, 'r, 'sr, 'a, P>(
+pub fn run_with_postgres_mail_access<'state, 'c, 's, 'sr, 'a>(
     plan: response::Plan<'state>,
-    retention: ResponseRetention<'c, 's, 'r, 'sr, 'a, P>,
+    retention: ResponseRetention<'c, 's, 'sr, 'a>,
     execution: ports::Deadline,
     state: crate::sync::DataState,
     device: crate::ids::DeviceId,
     creator: &dyn DraftCreator,
     flags: &dyn EmailMutator,
-) -> Result<Completed<'state, 'c, 's, 'r, 'sr, 'a, P>, Error> {
+) -> Result<Completed<'state, 'c, 's, 'sr, 'a>, Error> {
     let request = plan.request().map_err(|_| Error::State)?;
     if state.kind != crate::sync::DataType::Email
         || request.call_count() != 1
@@ -344,15 +338,15 @@ pub fn run_with_postgres_mail_access<'state, 'c, 's, 'r, 'sr, 'a, P>(
     )
 }
 /// Authenticated td-mail mutations, including root-folder creation.
-pub fn run_with_mail_access<'state, 'c, 's, 'r, 'sr, 'a, P>(
+pub fn run_with_mail_access<'state, 'c, 's, 'sr, 'a>(
     plan: response::Plan<'state>,
-    retention: ResponseRetention<'c, 's, 'r, 'sr, 'a, P>,
+    retention: ResponseRetention<'c, 's, 'sr, 'a>,
     execution: ports::Deadline,
     account: AccountId,
     device: crate::ids::DeviceId,
     mutations: &(impl EmailMutator + MailboxMutator),
     drafts: Option<&dyn DraftCreator>,
-) -> Result<Completed<'state, 'c, 's, 'r, 'sr, 'a, P>, Error> {
+) -> Result<Completed<'state, 'c, 's, 'sr, 'a>, Error> {
     run_inner(
         plan,
         retention,
@@ -375,13 +369,13 @@ pub fn run_with_mail_access<'state, 'c, 's, 'r, 'sr, 'a, P>(
 }
 /// Prepared identity read fixture; runtime integration requires a device.
 #[cfg(test)]
-pub fn run_with_identities<'state, 'c, 's, 'r, 'sr, 'a, P>(
+pub fn run_with_identities<'state, 'c, 's, 'sr, 'a>(
     plan: response::Plan<'state>,
-    retention: ResponseRetention<'c, 's, 'r, 'sr, 'a, P>,
+    retention: ResponseRetention<'c, 's, 'sr, 'a>,
     execution: ports::Deadline,
     account: AccountId,
     identities: &crate::identity_catalog::Catalog,
-) -> Result<Completed<'state, 'c, 's, 'r, 'sr, 'a, P>, Error> {
+) -> Result<Completed<'state, 'c, 's, 'sr, 'a>, Error> {
     run_inner(
         plan,
         retention,
@@ -398,14 +392,14 @@ pub fn run_with_identities<'state, 'c, 's, 'r, 'sr, 'a, P>(
 /// the response owner's clock; its execution instant tightens SQL as well as
 /// response work. Core, Mailbox/get, Email/get and Email/query are connected here;
 /// production activation is a separate cutover.
-pub fn run_with_postgres_read<'state, 'c, 's, 'r, 'sr, 'a, P>(
+pub fn run_with_postgres_read<'state, 'c, 's, 'sr, 'a>(
     plan: response::Plan<'state>,
-    retention: ResponseRetention<'c, 's, 'r, 'sr, 'a, P>,
+    retention: ResponseRetention<'c, 's, 'sr, 'a>,
     execution: ports::Deadline,
     snapshot: &mut crate::postgres_read::Snapshot<'_>,
     clock: &crate::clock::RuntimeClock,
     email_updates: bool,
-) -> Result<Completed<'state, 'c, 's, 'r, 'sr, 'a, P>, Error> {
+) -> Result<Completed<'state, 'c, 's, 'sr, 'a>, Error> {
     snapshot
         .constrain_deadline(
             clock
@@ -571,13 +565,13 @@ fn postgres_read_error(error: crate::postgres_read::Error) -> Error {
     }
 }
 
-fn run_inner<'state, 'c, 's, 'r, 'sr, 'a, P>(
+fn run_inner<'state, 'c, 's, 'sr, 'a>(
     plan: response::Plan<'state>,
-    mut retention: ResponseRetention<'c, 's, 'r, 'sr, 'a, P>,
+    mut retention: ResponseRetention<'c, 's, 'sr, 'a>,
     execution: ports::Deadline,
     account: AccountId,
     profile: Profile<'_>,
-) -> Result<Completed<'state, 'c, 's, 'r, 'sr, 'a, P>, Error> {
+) -> Result<Completed<'state, 'c, 's, 'sr, 'a>, Error> {
     let Profile {
         flags,
         mailboxes,
@@ -728,8 +722,8 @@ struct Resolved {
     value: usize,
     range: Range<u64>,
 }
-struct Worker<'io, 'c, 's, 'r, 'sr, 'a, P> {
-    retention: &'io mut ResponseRetention<'c, 's, 'r, 'sr, 'a, P>,
+struct Worker<'io, 'c, 's, 'sr, 'a> {
+    retention: &'io mut ResponseRetention<'c, 's, 'sr, 'a>,
     execution: ports::Deadline,
     optional_end: u64,
     created: super::creation_ids::CreationIds,
@@ -744,7 +738,7 @@ struct Worker<'io, 'c, 's, 'r, 'sr, 'a, P> {
     submissions: Option<SubmissionAccess<'io>>,
     implicit: Option<(&'static str, Range<u64>)>,
 }
-impl<P> super::children::Source for Worker<'_, '_, '_, '_, '_, '_, P> {
+impl super::children::Source for Worker<'_, '_, '_, '_, '_> {
     fn check(&mut self) -> Result<(), Error> {
         Worker::check(self)
     }
@@ -754,7 +748,7 @@ impl<P> super::children::Source for Worker<'_, '_, '_, '_, '_, '_, P> {
             .map_err(Error::Storage)
     }
 }
-impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
+impl Worker<'_, '_, '_, '_, '_> {
     fn check(&mut self) -> Result<(), Error> {
         if !self
             .retention
@@ -964,18 +958,7 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
         } else if name == "Email/query" {
             self.email_query(start..end, responses.request().envelope.query_page)
         } else if name == "Mailbox/query" || name == "Mailbox/queryChanges" {
-            let limits = &responses.request().envelope;
-            self.mailbox_query(
-                start..end,
-                limits.query_page,
-                limits.query_depth,
-                limits.query_nodes,
-                if name == "Mailbox/queryChanges" {
-                    mailbox_query_args::Mode::Changes
-                } else {
-                    mailbox_query_args::Mode::Query
-                },
-            )
+            Err(Error::UnknownMethod)
         } else if name == "Mailbox/get" {
             self.mailbox_get(start..end, responses.request().envelope.maximum_objects)
         } else {
@@ -1227,9 +1210,9 @@ pub(super) mod tests {
     ) -> Result<Vec<Reply>, Error> {
         let mut replies = Vec::new();
         let mut failure = None;
-        resolution::tests::run(|coordinator, spool, _, clock| {
+        resolution::tests::run(|coordinator, _, clock| {
             let deadline = Deadline::after(Tick(0), 100).unwrap();
-            let mut retention = coordinator.retain_response(spool, deadline).unwrap();
+            let mut retention = coordinator.retain_response(deadline).unwrap();
             let mut plan = response::Preflight::new(
                 request_with_limits(input, limits),
                 "session-1",
@@ -1460,9 +1443,9 @@ pub(super) mod tests {
     }
     #[test]
     fn reference_phase_expiry_cancels_its_unpublished_tail() {
-        resolution::tests::run(|coordinator, spool, _, clock| {
+        resolution::tests::run(|coordinator, _, clock| {
             let mut retention = coordinator
-                .retain_response(spool, Deadline::after(Tick(0), 100).unwrap())
+                .retain_response(Deadline::after(Tick(0), 100).unwrap())
                 .unwrap();
             let source = format!(r#"{{"x":[{}]}}"#, vec!["1"; 100].join(","));
             retention.append(source.as_bytes()).unwrap();
@@ -1886,9 +1869,9 @@ pub(super) mod tests {
     }
     #[test]
     fn blob_copy_walk_checks_execution_during_retained_array_scan() {
-        resolution::tests::run(|coordinator, spool, _, clock| {
+        resolution::tests::run(|coordinator, _, clock| {
             let until = Deadline::after(Tick(0), 100).unwrap();
-            let mut retention = coordinator.retain_response(spool, until).unwrap();
+            let mut retention = coordinator.retain_response(until).unwrap();
             let ids = vec!["\"blob\""; 256].join(",");
             let arguments =
                 format!(r#"{{"fromAccountId":"foreign","accountId":"foreign","blobIds":[{ids}]}}"#);

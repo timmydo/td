@@ -1,8 +1,8 @@
 # Store and runtime boundaries
 
-POSTGRES.md owns active database serving and administration. SQLite-specific
-interfaces below remain legacy library contracts pending deletion; local
-store, backup/restore and file-backed credential commands are removed.
+POSTGRES.md owns active database serving, snapshots, mutations and
+administration. STORAGE.md owns process-local response scratch. Shared codecs,
+MIME readers and passive result types below grant no database authority.
 
 This normative M02c2 contract accompanies the compiling interfaces in
 src/ports.rs and the state codecs in src/sync.rs. Interfaces do not supply a
@@ -6529,324 +6529,34 @@ publication, native allocation and stack/RSS remain unqualified.
 
 ## 2. Read views and change history
 
-store_fs::IndexStore owns a locked root, one serialized SQLite writer and
-one to eight cold reader connections. create requires a fresh database;
-open validates the physical files, closed schema, database header and
-store epoch before accepting metadata. It does not run a full database
-integrity or foreign-key scan at startup. SQLite checks pages as accessed;
-the separate validate_integrity(deadline) maintenance operation runs
-integrity_check(1), foreign_key_check and a global scan of per-Email
-anchor cardinality under an explicit deadline and a finite VM allowance
-sized for the physical database cap. Duplicate anchors for one
-account/Email return Corrupt; one Message-ID may still name several
-Emails. The physical check verifies index/table agreement before the
-indexed domain scan and stops after the first physical error; its work may
-be O(N log N). The row CHECK constraint requires each BLOB's actual length
-to equal its declared length; integrity_check validates this and a
-mismatch returns Corrupt. This is not digest or full domain verification.
-Complete body verification still precedes a body pin. create and open both
-borrow LockedRoot exclusively for the owner's lifetime, preventing
-independent owners from bypassing its transaction/checkpoint fence.
+`postgres_read::Snapshot` retains the account, epoch, selected configuration,
+original deadline and one immutable database snapshot. Reads and change pages
+remain subject to the original connection/work budget; failures are sticky.
+`jmap_changes::History` provides bounded transaction-aligned change windows.
+POSTGRES.md specifies read slots, reference authorization and final publication
+checks. No local database view or process-wide mail-store lock remains.
 
-IndexReadView::verify_bodies(crypto, BodyCheckLimits, scratch) performs
-synchronous declared-body verification for one captured account view.
-The caller supplies a fixed 64 KiB scratch buffer and explicit blob-count
-and total declared-byte ceilings, admitted before each body opens. Each
-row is enumerated through the same view, streamed and finished through
-PinnedBlobInput. Original snapshot, deadline and VM fuel cover the whole
-pass without renewal. Any failure returns no completion report.
-CompleteBodies has private identity, blob-count and byte-count fields
-with read-only accessors. It reports historical completion for that
-ViewIdentity; it grants neither body-pin custody nor current freshness.
-Empty accounts can complete under zero limits. This is neither a
-physical/index-consistency check nor full store verification: an offline
-coordinator must establish physical integrity separately and combine
-metadata and body results for the same snapshot. The primitive alone enables
-no command or service activation. The former local `store verify` command
-is removed; POSTGRES.md owns database inspection commands.
-
-account_checks::combine(metadata, bodies) binds completed metadata and
-body reports only when their complete ViewIdentity values match and the
-metadata reference pass's Blob count equals the verified-body count.
-Identity mismatch returns account_checks::Error::Identity; count mismatch
-returns BlobCount. It performs no I/O and renews no work scope.
-CompleteChecks retains both reports behind private fields with read-only
-identity/metadata/bodies accessors. It remains historical data: matching
-old WAL results may combine after a writer commits, while cross-snapshot
-pairs refuse even when their counts match. It is neither physical/full
-store verification nor a body pin, freshness proof or authorization.
-
-IndexReadView::verify_account(crypto, utc_ms, AccountCheckLimits, scratch)
-drives metadata_sweep to completion, verifies all declared bodies, then
-combines both reports from that same view. Limits carry the existing
-metadata row/parent-read ceilings and body count/byte ceilings. Caller
-scratch is reused first as the metadata value buffer and then for body
-streaming, with one fixed metadata key buffer. The caller supplies the
-trusted UTC value for metadata policy; this method does not sample or
-authenticate UTC. Original snapshot, deadline and captured VM allowance
-cover all stages without renewal. AccountCheckError identifies Metadata,
-Bodies or Reports failure and preserves its error source; any failure
-returns no combined report. Empty accounts can complete under zero
-limits. This synchronous account check does not perform physical
-maintenance, acquire a fresh view, grant custody or activate a CLI. Its
-CompleteChecks result retains the historical limitations above.
-
-PinnedBlobInput checks actual BLOB length when opening and retains one
-incremental native handle through finish and completed random reads. The
-complete digest must match before finish grants a pin. Body owners are
-worker-local; BlobReader requires no Send bound. Unborrowed IndexReadView
-remains Send + Sync. Handle close precedes release of the view borrow; a
-forgotten handle or close failure retires the pool slot.
-
-IndexStore::maintenance_view(account, deadline) captures the same pooled
-IndexReadView with the finite full-maintenance VM ceiling instead of the
-ordinary 8000000-step allowance. That allowance is installed once,
-before BEGIN and endpoint capture, under the original writer-acquisition
-clock and supplied deadline. Metadata/body checks consume it without
-renewal. It shares ordinary pool limits, snapshot ownership and cleanup;
-returning the slot does not raise the next ordinary view's allowance.
-This cold verification API is not a physical scan, new body pin or
-promise of maximum-database completion. No protocol or CLI path is
-activated by it.
-
-view captures a real SQLite WAL read transaction under the writer mutex.
-ViewIdentity contains account, epoch, committed_sequence and history_floor.
-Later commits remain invisible. get and next decode bounded typed rows into
-caller buffers; next follows strictly increasing decoded `Key::compare`
-order. The cursor encoding transports the fields without determining their
-order. Missing rows return None; insufficient buffers return Capacity.
-Bad rows return Corrupt.
-Detached rows borrow the caller buffers and confer no body or view ownership.
-
-next_change reads the native kind/sequence/operation index through the
-captured endpoint. Below-floor cursors return HistoryLost; above-end
-cursors return Invalid. Matching entries retain action and operation
-order. The SQL adapter returns Record or Complete; it needs no
-replay-only Advanced step. Identity changes are refused. A view retains
-its original monotonic deadline and VM fuel; clock/VM-budget failure or
-reversed time is sticky. Snapshot-loss refusal is shared by metadata
-reads, body-input operations and completed pin reads/freshness checks.
-Checks before and after work preserve a sticky error; a replacement
-transaction cannot revive the old identity. Drop ends the read
-transaction before returning its connection; snapshot loss or failed
-rollback retires the slot.
-
-IndexStore::prune_history accepts HistoryPruneRequest (account, captured
-store epoch, expected endpoint, inclusive through sequence, max_rows,
-deadline). Under the writer fence and original native scope, it compares
-the captured epoch before row-limit validation, WAL admission or SQL.
-Mismatch returns Rejected(Conflict) without changing the floor/history
-or stopping a healthy writer. Writer/clock refusals retain precedence.
-Capture the epoch with the state used to select retention; do not replace
-a stale epoch with the live one to admit an old plan. A restored copy can
-retain the endpoint but have a different epoch. Matching requests
-atomically retire complete sequences and delete a bounded prefix of
-retired rows.
-HistoryPruned reports the unchanged endpoint, new floor, removed count and
-whether retired rows remain. Repeating the same floor continues cleanup.
-At a nonzero floor, only the completed-sequence cursor (operation u32::MAX)
-is accepted; other operation cursors return HistoryLost to signal potentially
-lost changes. Older captured views retain their original floor and history.
-CommitError preserves rejected versus indeterminate
-outcomes. [STORAGE.md](STORAGE.md) owns exact bounds and caller obligations;
-this low-level helper supplies no retention policy or authorization.
-
-IndexReadView::thread_anchor(message_id, value) resolves an already parsed
-Message-ID to optional (EmailId, ThreadId) metadata in the captured view.
-It uses caller scratch for the selected Email row; format::MAX_VALUE_BYTES
-(65536 bytes) suffices for every valid row. No match returns None;
-invalid input, insufficient scratch, corruption and native failures remain
-errors. STORAGE.md owns byte matching, duplicate selection and resource
-bounds. The result grants no body pin or mutation authority.
-
-IndexReadView::logical_usage returns account-scoped LogicalUsage with its
-captured ViewIdentity. IndexStore::usage_fence supplies whole-store totals
-while retaining the cold writer fence, plus verified StoreFileUsage.
-UsageFence::initialize_leases consumes it to construct the existing ledger
-from captured totals and trusted AuxiliaryUsage. LedgerInitError preserves
-store and logical-admission failures. [STORAGE.md](STORAGE.md) owns counting,
-retained ownership, native bounds and initialization requirements.
-
-IndexReadView::open_blob_input takes the crypto provider, blob ID and byte
-ceiling. The snapshot supplies the BlobRow, account, original clock and
-deadline. Complete length/digest/EOF verification yields PinnedBlob random
-reads from the same SQLite snapshot. The input and completed pin borrow the
-view, preventing slot release until that borrow ends. A caller
-cannot renew the deadline by supplying another clock or duration.
-
-checkpoint takes the writer fence and refuses while any view is held. A
-successful SQLite WAL TRUNCATE plus root sync permits further bounded writes.
-The fixed WAL ceiling is 17280796224 bytes; recovery can reread that entire
-WAL, and a checkpoint can copy up to the 8 GiB database ceiling. These native
-operations cannot be interrupted at an application chunk boundary. Deadline
-checks before and after do not promise a 60-second checkpoint or a 2 GiB I/O
-ceiling. STORAGE.md records x86-64 GNU near-ceiling WAL crash recovery and
-checkpoint with a small database. The full 8 GiB database checkpoint,
-normal WAL-admission scheduling, portable qualification, and combined
-service resources remain pending.
-Blob deletion is part of the metadata transaction; existing views retain the
-old body through WAL. Committed bodies need no external-file collector.
-Provisional ingress preparation is implemented by the separate IngressSpool
-primitive; protocol admission and acknowledgement remain service
-responsibilities. The core does not implement online backup, retention
-scheduling or runtime slot arbitration.
-
-`metadata_sweep::Sweep` composes reference_sweep, mailbox_sweep and
-recipient_sweep over one supplied view with finite Limits { rows,
-parent_reads }. Each advance runs one child turn, at most one next and
-two gets; the caller admits the lookups and checks its deadline. The row
-allowance applies independently to all three passes; parent gets share
-one separate allowance. Failures are terminal, and ChangedView covers
-movement before or during any pass. A final identity-checked advance
-reconciles the reference pass's mailbox/submission/recipient counts
-against the later passes before granting CompleteMetadata, which retains
-all three receipts. Repeated completion checks identity without I/O.
-This is a metadata composition; physical completeness, body verification,
-anchor cardinality, actual pins and activation remain external.
+`store_fs::PinnedBlob` borrows a fully verified immutable PostgreSQL body.
+Its length, digest and identity are passive facts; the retained source owns
+the live snapshot and deadline. MIME consumers keep that borrow until their
+owners are dropped. Failure retires the pin even if a callback swallows it.
+The shared body-reader interface does not construct or reopen storage.
 
 ## 3. Reserve, stage, commit
 
-The existing ports::Store trait is the future authenticated service boundary;
-IndexStore is its low-level persistence core, not an implementation of device
-authorization or the complete reservation coordinator. Access still requires
-account, trusted principal and current configuration. Recheck revocation and
-permissions at commit. Named SMTP, queue and maintenance principals retain
-only their authorized operation rights. Queue outcome recording uses its
-durable attempt fence even if credentials change after transmission.
+PostgreSQL adapters own account quota reservations, current authorization,
+operation identity, durable receipts and commit settlement. Their prepared
+inputs grant no publication authority. A known commit remains known even if
+local response cleanup fails. An uncertain commit remains uncertain until its
+receipt is settled; it cannot be retried blindly or reported as success.
+POSTGRES.md specifies each mutation's exact checks and ownership transitions.
 
-Reserve body, operation, response and category capacity before accepting
-responsibility. ReservationId retains coordinator instance, slot and checked
-generation. Linear logical effect tickets prevent double reconciliation;
-physical I/O can still fail. The future authenticated port calls provisional
-body completion StagedBlob; finishing staging never establishes durability.
-Only the SQLite transaction publishes authoritative bodies and references.
-The port's begin_blob, BlobWriter::finish and StagedBlob are contracts for a
-future coordinator; they are not implemented by the standalone IngressSpool.
-That adapter must bind prepared ownership to authenticated reservations before
-SMTP/JMAP ingress is activated. The future coordinator must keep
-slow peers outside the global writer while they deliver their messages.
-
-IndexStore::commit_with_files and commit_batch_with_files return a
-non-Clone CommitCompletion with outcome(), files(), writer_stopped() and
-is_sequence_conflict(). Both use the existing object transaction.
-CommitFileUsage distinguishes Unchanged before storage-changing SQL,
-Measured(StoreFileUsage) and Unavailable(Error), retaining a known durable
-outcome separately from accounting refusal. Capture runs under the writer
-mutex and original scope; it performs no cold account scan or checkpoint.
-Only a healthy, accounted endpoint mismatch before body reads reports
-is_sequence_conflict; another Conflict alone cannot authorize a replan.
-The receipt retains no writer fence after return and supplies no ledger or
-account authority. STORAGE.md owns exact proof/capture rules; the trusted
-coordinator must serialize mutations/maintenance through reconciliation
-and stop admission on missing physical accounting, even for known success.
-
-`format::batch::Batch::decode` validates the entire encoded TransactionInput
-using caller-reserved offset slots and retains immutable original bytes.
-Indexed `get` returns a reborrowed locally valid Operation, never a copied
-row arena. FORMAT.md owns exact framing, limits and provisional-output rules.
-This synchronous codec grants no reservation or account authority; caller
-work/deadline admission and the authenticated Store adapter remain separate.
-IndexStore::commit_batch accepts a borrowed complete Batch through the same
-transaction path as the typed operation slice. [STORAGE.md](STORAGE.md#atomic-body-and-metadata-commit)
-owns encoded replay, admission lifetime and prepared-source requirements.
-
-IndexStore::commit accepts Crypto, CommitRequest, a bounded Operation slice
-and a mutable slice of BlobSource { id, source: &mut dyn std::io::Read }.
-CommitRequest carries account, captured store epoch, expected sequence,
-UTC validation time and one monotonic deadline. Under the writer fence,
-both typed and encoded commits compare the request epoch to the opened
-store before operation/source processing, WAL admission or SQL writes.
-A mismatch returns Rejected(Conflict) without reading a body or retiring
-writes. Capture this epoch with the state used to plan the request; do
-not replace a stale epoch with the current one merely to permit a retry.
-A fresh restore keeps account sequences but changes epoch, so old requests
-cannot commit against an equal restored endpoint. The ordinary expected
-sequence comparison remains inside BEGIN IMMEDIATE. Writer/clock refusal
-can precede either comparison. This is optimistic store identity checking,
-not account authorization, policy revocation or quota reconciliation.
-Every fresh BlobRow requires a matching source with
-exact length, digest and EOF; a supplied source matches exactly one Blob PUT.
-A 32 MiB hard maximum applies before reading;
-I/O steps are at most 64 KiB. A permanent SQLite registry prevents deleted
-blob ID reuse. One zeroblob is inserted per body, filled through a retained
-writable incremental handle inside the transaction, and closed before COMMIT.
-Body bytes never enter encoded metadata buffers. Readers retain one read-only
-incremental handle in their captured snapshot.
-Native page allocation and durable finalization are synchronous,
-with checks before/after but no guarantee of interruption inside a native
-operation. The core holds the global writer while consuming the source. Its
-Read trait cannot enforce deadlines inside an arbitrary implementation:
-callers must supply prepared sources with bounded synchronous reads, not
-untrusted network streams. IngressSpool supplies one such prepared source.
-It is temporary preparation,
-not a durability or protocol-admission claim of this low-level API.
-
-The serialized transaction checks the expected sequence, applies
-operations in caller order, validates final owning references and parent
-chains, records changes and updates the unsigned account sequence.
-Change actions agree with pre/post existence; a native unique index
-refuses duplicate object changes. Repeated row keys take their last
-effect. ThreadAnchor cardinality violations return Conflict; prepared
-source bytes may already have been consumed. STORAGE.md owns this final
-state check and its scope. Final recipient coverage, individual queue
-state and submission completion/notification/cancellation aggregates are
-checked once per affected submission before COMMIT, including groups
-changed only by recipient deletion. InFlight/Body and
-InFlight/AcceptancePossible require positive RCPT and absent DATA
-replies; Prepared may retain previous replies. This checks stored shape,
-not current reply provenance. Indexed point/successor reads reuse writer
-scratch and the original deadline/VM fuel. Inconsistent groups reject
-with Conflict; native deadline, capacity and I/O errors retain their
-classifications.
-Before row writes, surviving Email PUTs preserve the thread ID from the
-original account row. A final replacement with a different thread returns
-Conflict even if both threads exist. Repeated keys and DELETE/reinsert
-cannot bypass this comparison; final deletion and new Email rows have no
-assignment comparison. Initial threading, anchor maintenance, ID allocation
-and mutation authorization remain service work. STORAGE.md owns the shared
-bounded history scan.
-Before row writes, a final DELETE of an existing Submission requires a
-completion timestamp in its original row. Intermediate completion PUTs or
-DELETE/reinsert cannot replace that prior commit. Missing original
-completion returns Conflict; completed deletion still needs service
-retention/category/administrator authorization.
-Before row writes, surviving queue PUTs preserve STORAGE.md's immutable
-identity, uncertainty, attempt-history and failure-notice fields against
-the original rows. Existing None notices cannot advance directly to
-Stored; Pending must commit first. An already completed submission with
-None must retain None. An existing None-to-Pending update also refuses a
-final Canceled recipient PUT for that submission; STORAGE.md defines the
-scan bound and the initially consistent group requirement. A present
-completedAt also retains its exact original value across surviving
-submission PUTs, including whole-group cancellation; initial completion
-does not impose timestamp chronology. STORAGE.md defines reply retention
-outside active attempts, RCPT retention after an active attempt reaches
-Body, both-reply retention on cancellation, and the empty-diagnostic
-requirement on attempt-count advances. It also defines count/ID
-progression, eligible-source/Prepared-entry checks, adjacent active phase
-advances, and acceptance/cancellation and DATA-reply requirements for
-certain outcomes from existing AcceptancePossible attempts. Remaining
-outcome transitions, other reply updates, phase changes outside InFlight
-and transport ordering still require coordinator validation.
-Terminal recipients cannot regain dispatch obligations or a new attempt;
-Accepted/Canceled remain in their states, Failed can only remain
-Failed or join a valid whole-group cancellation, and terminal OutcomeUnknown
-remains terminal OutcomeUnknown. Terminal phase, uncertainty and reply
-history remain fixed; only Failed-to-Canceled can change the reason.
-Repeated keys use their final effect, including DELETE then PUT. Violations
-return Conflict before streaming a body. Full historical transition checks,
-caller authorization, worker fencing and complete changed-object coverage
-remain the coordinator's responsibility.
-
-COMMIT with synchronous FULL precedes success. CommitError::Rejected means
-the pre-COMMIT check or a deferred-constraint/busy refusal rejected the
-transaction and rollback completed; failed rollback additionally retires
-writes. A successful FULL COMMIT plus autocommit reports its durable sequence
-even when the deadline expires during completion. Other COMMIT errors are
-Indeterminate and stop writes until reopen/recovery. New read snapshots
-remain available. Never report an ordinary retryable method error for an
-uncertain external effect. Response notification can fail after durable
-commit; the service still needs idempotence/result-retention reconciliation.
+`ResponseCoordinator` owns process-local `RequestSpool` retention only.
+The dispatcher reserves complete response capacity before mutation and keeps
+prior completed methods when a later method fails. Failed cleanup retains
+its file slot and quota. STORAGE.md and ADMISSION.md specify the custody,
+original work/deadline and prepaid-output rules. These files are disposable
+response scratch, not mail storage or a second durable quota authority.
 
 ## 4. Opaque state strings
 
@@ -6993,7 +6703,7 @@ without a suitable standard SetError uses serverPartialFail and requires
 resync; never replace known effects with method-level serverUnavailable or
 serverFail. RFC 8620 §5.3 does not enumerate those generic method failures
 as SetErrors. ADMISSION.md specifies the exact retained-response behavior.
-Reserve response capacity before mutation. An indeterminate SQLite commit outcome
+Reserve response capacity before mutation. An indeterminate PostgreSQL commit outcome
 follows section 3, never a guessed result.
 
 SMTP rejects unavailable admission with temporary status before DATA and
@@ -7007,106 +6717,11 @@ future adapter and protocol suites must prove these operational mappings.
 Sources: [JMAP Core, RFC 8620 §5](https://www.rfc-editor.org/rfc/rfc8620.html#section-5)
 and [JMAP Mail, RFC 8621](https://www.rfc-editor.org/rfc/rfc8621.html).
 
-Native body-read work and the exclusive validate_integrity
-maintenance fence are specified in STORAGE.md section 2. Logical MIME byte
-meters do not measure SQLite copying. Full integrity maintenance refuses a
-stopped writer; new view capture and commits return Busy during its scan.
-
-### Offline receiving store initialization
-
-`IndexStore::create_with_inbox(root, epoch, account, inbox, clock, views,
-deadline)` takes the same arguments as `create` plus one AccountId and the
-Inbox MailboxId. One schema transaction commits the account at sequence
-one, its canonical Inbox and the mailbox's Created change, so no committed
-store holds that account without an Inbox. The caller supplies the account
-it routes to and draws the epoch and Inbox ID from entropy. `create` keeps
-its existing empty-store behavior. This legacy library primitive has no
-installed command; PostgreSQL account initialization is specified in
-POSTGRES.md.
-
-### Offline account enumeration and verification
-
-`IndexStore::account_ids(deadline: Deadline) -> Result<Vec<AccountId>, Error>`
-reads the full account table in ID order under the writer fence, refusing a
-stopped writer, deadline/work failure or more than the existing 128-account
-limit. No partial list is returned. It retains the ordinary native VM
-allowance and validates each fixed-width ID. The owned IDs are historical
-observations; the method does not retain a snapshot or stabilize subsequent
-account views. An offline caller must quiesce mutations separately.
-
-Local verification commands are removed. This enumeration API remains
-only in the legacy SQLite library pending deletion.
-
-### Offline SQLite snapshot primitive
-
-IndexStore::backup consumes the engine and accepts a fresh destination
-LockedRoot, one original Deadline and caller-owned [u8; 65536] scratch.
-It checkpoints, explicitly closes all native connections, and copies one
-exact database snapshot under both retained root locks. It returns
-BackupReceipt { epoch, bytes } only after file sync, no-replace publication,
-partial-name removal and destination directory sync. BackupError::Unpublished
-means this invocation did not attempt final-name publication;
-IncompletePublication means publication was attempted, the final name may
-exist, and cleanup or durability is unproven. This includes failed hard-link
-calls whose filesystem effects may be uncertain. Neither failure grants successful
-backup acknowledgement. Both can leave artifacts for explicit offline
-inspection, and both consume the engine. STORAGE.md owns recovery of the
-brief two-link publication state, original clock handoff and filesystem
-limits. This offline storage primitive grants no online backup, quota
-reservation, body-integrity or service-activation claim. The former local
-backup command is removed.
-
-IndexStore::renew_epoch(self, entropy: &mut dyn ports::Entropy,
-deadline: Deadline) -> Result<Self, CommitError> supplies that low-level
-epoch replacement. It consumes the engine on every outcome, refuses a
-forgotten-view marker, reserves existing WAL headroom and makes one
-16-byte fill from an admitted warmed entropy source. A candidate equal
-to the current epoch returns Rejected(Conflict); a failed fill discards
-the whole candidate. Native clock/deadline failure after fill takes
-precedence over its returned entropy error. A conditional update
-verifies the persisted old epoch, then uses the ordinary commit
-classifier. Known success returns the owner with the new durable epoch;
-no error returns an owner. The caller retains the root and may reopen to
-establish persisted state, especially after Indeterminate. All other
-stored data and account endpoints/floors remain unchanged.
-
-STORAGE.md owns the original scope, entropy freshness and synchronous
-cleanup limits. This primitive grants no restore authorization,
-verification, resource admission or service activation. The former local
-restore command is removed.
-
-### Disposable prepared ingress inputs
-
-store_fs::IngressSpool::open borrows an ingress-only LockedRoot exclusively,
-a validated ResourcePlan and original startup clock/deadline. It validates
-and cleans the bounded canonical namespace before accepting any new files.
-SpoolCapacity derives full message reservations from configured SMTP/HTTPS
-slot counts; SpoolStatus reports occupied/retired counts and reserved bytes.
-These are temporary logical disk bounds and confer no durable store quota.
-
-begin reserves a complete slot, then creates its file and incremental digest.
-SpoolWriter::write accepts at most 64 KiB and refuses beyond message_bytes
-before writing; any failure is sticky. Consuming finish checks file metadata,
-EOF and original admission, finalizes SHA-256 and rewinds to return SpoolInput.
-Input owns the reservation and File until explicit discard or Drop. Its Read
-implementation returns at most 64 KiB, retains the original deadline, and
-makes read/seek failures terminal; failure retains their original typed error
-when Read reports an I/O kind. Rewind does not renew admission. It can be
-borrowed directly as BlobSource.source. Account, blob ID and BlobRow
-metadata are passive caller data, not authenticated permissions or durability.
-
-Explicit discard closes the descriptor and removes only the owned inode
-before releasing credit. Failed cleanup retains the complete charge until
-quiescent restart cleanup. STORAGE.md owns exact file permissions, crash
-artifacts, error semantics and the separation from SQLite authority. Existing
-ports::BlobWriter::finish still returns passive StagedBlob and requires the
-future coordinator to retain the concrete prepared owner; IngressSpool does
-not falsely implement that contract by returning metadata without its file.
-
 ## Bounded Mailbox object projection
 
-`mailbox_response::encode` reads one Mailbox row from a retained
-IndexReadView and emits its selected object properties into caller storage.
+`mailbox_response::encode_object` accepts one caller-supplied Mailbox row
+and emits its selected object properties into caller storage. The PostgreSQL
+adapter owns the retained snapshot and checks it around encoding.
 Projection::all selects all eleven standard properties; id_only selects
 just id. include accepts only exact standard property names, makes duplicate
 selection idempotent, and rejects unknown names without changing the
@@ -7123,7 +6738,7 @@ mailbox_counts_many on the same retained view. The complete ViewIdentity
 and MailboxId must match, including
 account, epoch, endpoint and history floor. These public scalar counts are
 not unforgeable provenance; the trusted caller remains responsible for
-obtaining them from the storage reader. An absent mailbox returns None.
+obtaining them from the storage reader. The caller handles an absent mailbox before constructing Object.
 When no count property is selected, counts need not be computed.
 
 The typed row reader checks the mailbox. Check the original snapshot again
@@ -7158,7 +6773,7 @@ still emits id. Result references use the common retained argument resolver.
 
 One account read view supplies the response state, rows and counts. Count
 queries batch at most MAX_MAILBOX_COUNTS selected IDs per scan under that
-view's original deadline and cumulative SQLite work allowance. No count query
+view's original deadline and cumulative database work allowance. No count query
 runs when no count property is selected. POLICY.md owns personal-account
 rights. Each completed object streams into the existing response reservation;
 check the same snapshot once more before publishing the complete method.
@@ -7180,7 +6795,7 @@ All scans and repeated comparisons retain the enclosing work/time checks.
 ## Retained change-page cursor
 
 jmap_changes::Cursor folds history for one explicitly selected data type
-from an existing IndexReadView. The supplied DataState must match account,
+through its History interface, implemented by the PostgreSQL read view. The supplied DataState must match account,
 epoch and requested type, be at or above the retained history floor, and
 not exceed the captured endpoint. Invalid scope/history and an atomic first
 transaction too large for the requested page return CannotCalculateChanges.
@@ -7255,7 +6870,7 @@ outer retention failures remain terminal.
 
 ## Retained thread member windows
 
-IndexReadView::thread_emails returns an optional ThreadEmails window for a
+The PostgreSQL read view's thread_emails returns an optional ThreadEmails window for a
 typed Thread ID in the original account snapshot. An absent thread returns
 None; an existing empty thread returns an empty window. This is a storage
 row-existence distinction, not a claim that an empty thread is a visible
@@ -7359,9 +6974,9 @@ comparing only sequences is invalid. matches_current compares all fields
 with current trusted metadata and the compiled interpretation version, but
 still does not compare query arguments or establish authority. Consumer
 admission tests must cover each
-mismatch before a delta-producing consumer is enabled. The retained
-Mailbox/queryChanges handler validates arguments and refuses without decoding
-a state: the policy continues to require refusal. Query inputs must obey the
+mismatch before a delta-producing consumer is enabled. The current
+PostgreSQL dispatcher has no Mailbox/queryChanges handler and returns
+unknownMethod. Query inputs must obey the
 stable-result and interpretation-version contract in POLICY.md section 4.2;
 this token cannot enforce visibility, index or time-dependent semantics.
 
@@ -7433,21 +7048,6 @@ scalar sequences differ. For example, precomposed j-caron does not match
 capital J plus combining caron here. Decoders must not silently introduce
 normalization or folding that changes the specified matching policy.
 
-## Quota-charged sort scratch
-
-StoreCoordinator::retain_sort takes the shared RequestSpool, a nonzero
-maximum byte count and the original deadline. It returns SortRetention,
-whose append/seal/read_at operations expose only a sealed prefix. reset
-truncates its whole file and retires old offsets while preserving the
-reservation, deadline and work meter. Accessors expose length, sealed_len, cap and sticky
-failure without granting a descriptor or path. Each I/O operation is bounded
-to 64 KiB. SortError uses the shared retention store/ledger error surface.
-
-discard or drop proves file removal before refunding SortBytes. All sort
-files share the existing filesystem slots with responses; at most 24 slots admit sorts,
-leaving eight unavailable to sorts. Their bytes use a separate quota bucket. ADMISSION.md owns accounting,
-cleanup uncertainty and the cumulative multi-file job requirements. No
-sorting algorithm, query admission or client-visible publication is added.
 ## Streaming filter logic
 
 filter_logic::Evaluation combines every condition result through bounded
@@ -7529,38 +7129,6 @@ scratch reads/writes and one potential source record before each source step
 (including its end/skip result); additional source I/O is adapter-owned.
 Control-only transitions charge work but no scratch I/O bytes.
 
-## Native sort adapter
-
-StoreCoordinator::sort_job returns a SortWorkspace and NativeSortJob for a
-trusted SortSource. Borrow the workspace's run/head slices into Sorter, then
-poll with the native job. The workspace cannot be resized, and its resident
-permit stays held while a sorter borrows its buffers. SortSource::next may
-yield Skipped after one excluded candidate; the source and comparator charge
-additional work through the original SortWork object. NativeSortJob keeps
-source errors, ignored charge errors and storage/deadline failures sticky.
-
-The caller passes only its own completed sorter output to read_output, which
-returns bounded records from the exact sealed
-result while retaining the original job budget. source_mut permits the
-caller's final retained-view validation; it must never replace the source's
-view, account or authority. Dropping the native job cleans both files, while
-dropping the workspace frees buffers before admitting another workspace.
-ADMISSION.md owns the single-workspace and cumulative-meter policy. No query
-method or discovery capability is enabled by this adapter.
-
-read_output validates scratch bounds and sealed length, not completion
-provenance. Because Output is public metadata, trusted callers must not forge
-it, use another job's coordinates or substitute a sealed intermediate run.
-The query activation tests must enforce that final-completion call sequence.
-
-Drop the sorter and its workspace on completion or failure, before streaming
-output, to release resident admission promptly. The single workspace imposes
-service-wide contention; there is no fairness or waiting guarantee. Every
-work charge also tries coordinator state without blocking. Contention returns
-terminal Busy even within an admitted job; callers propagate it rather than
-retrying with a renewed budget. Engine admission is per fixed record, never
-for an entire resident run. On any read_output error, discard its destination
-buffer: an I/O or post-read freshness failure may follow buffer mutation.
 
 ## Mailbox query paths
 
@@ -7620,57 +7188,9 @@ fail internally instead of spinning or discarding an item.
 
 ## Retained Mailbox/query dispatch
 
-The opt-in Mail dispatcher evaluates Mailbox/query against one native account
-snapshot. It accepts the standard parent/name/role/role-presence/subscription
-conditions and all AND/OR/NOT forms, validates every branch before scanning
-mailboxes, and implements the POLICY.md sort, tree, anchor and paging rules.
-Unsupported properties/operators/collations or compiled filter complexity
-return unsupportedFilter/unsupportedSort; wrong JSON types return
-invalidArguments. Text-operand admission compares decoded strings exactly,
-so repeated operands do not consume distinct-operand slots. Null filtering
-matches all rows. Empty Boolean operands retain their specified truth values.
-
-One native sort job owns the original deadline, cumulative work meter and
-both whole-file reservations. Its source yields between retained JSON scanner
-turns, distinct-text comparisons, account scans, parent lookups and predicate
-steps. A single filter frame allocation is reused across candidate and ancestor
-evaluation. During validation at most 64 distinct bounded decoded text operands and
-one pending operand are retained; these are dropped before account scanning. Nested ranges are reread
-under the same charged job, never under renewed per-filter budgets.
-
-Each scratch record holds a bounded root-to-self ID chain. Flat queries use
-one ID; tree queries validate paths before sorting. Comparisons inspect at most
-32 ID pairs and fetch at most two sibling rows; the original comparator policy
-supplies field ordering and final ID ties. Ancestors remain first regardless
-of direction. filterAsTree evaluates the whole predicate for the candidate and
-every ancestor. Counts and paging follow complete filtering and sorting, with
-no account-sized resident ID vector or SQL sort temporary.
-
-Output coordinates come only from this job's successful Sorter completion.
-Drop filter frames and sort run/head buffers before reading the sealed output;
-keep file reservations and the native view through anchor search and page
-serialization. Missing anchors fail even for limit=0. Include the selected
-limit when omitted/null or clamped; calculateTotal counts the whole result,
-including with a zero requested limit. The query state captures the original
-view and current interpretation version; canCalculateChanges is false.
-Fresh native snapshot and execution checks precede response publication;
-the existing HTTPS response boundary retains final credential authorization.
-No Mail discovery advertisement or td-mail interoperability claim is added.
-
-Filter validation follows native view and workspace admission. Temporary
-pressure can therefore precede a filter-shape error; there is no uncharged
-validation allocation or internal retry. The source retains its bounded row,
-arguments and one scratch record while reading output. A failed job drops its
-source/filter before the workspace binding releases its permit.
-
-The original request retention meter remains authoritative across methods.
-If that meter or its outer deadline fails, the entire batch terminates without
-publishing a response; it is never replenished to encode later calls. A query
-job's separate work refusal can return storageWorkLimit and allow later calls
-while request custody is still healthy. No precedence between those cumulative
-meters is promised. An anchor sum outside JMAP's safe integer range produces
-an empty page positioned at the result end, keeping the response integer
-representable without refusing an otherwise valid out-of-range query.
+The PostgreSQL dispatcher currently returns unknownMethod for this method.
+The former local-store implementation has been removed. Mailbox/get remains
+available for mailbox discovery; no query or query-delta support is claimed.
 
 ## Retained Email/changes dispatch
 
@@ -7696,27 +7216,9 @@ writer invariants such as each Email retaining a mailbox membership.
 
 ## Retained Mailbox/queryChanges refusal
 
-The opt-in Mail dispatcher validates standard queryChanges argument shapes,
-account scope, comparator semantics and the complete retained Mailbox filter.
-It then returns cannotCalculateChanges as POLICY.md requires, including for
-the current queryState and maxChanges=0. No state token is treated as authority,
-no old result is reconstructed and no partial delta is emitted. sinceQueryState
-must be a string but is not decoded when no state can yield a supported delta.
-
-Filter validation shares the single native query workspace and original job
-meter, then refuses before the first mailbox scan. As for Mailbox/query,
-view/workspace pressure can precede filter-semantic errors. The refusal drops
-all job and workspace custody, so later methods remain eligible. Query-only
-position/anchor/anchorOffset/limit/tree arguments are not standard
-queryChanges arguments and are rejected. No live Mail capability is advertised by this method.
-
-This handler deliberately reports malformed argument or unsupported filter/
-comparator errors before its normal cannotCalculateChanges refusal, preserving
-the shared decoder classifications. Before any future delta support, define
-how tree-query semantics are bound to state, since the standard queryChanges
-arguments do not carry the tree flags; the current tokens claim no such delta
-reconstruction. Refusal allocates the fixed query workspace and bounded filter
-frames, not a result array sized to query_page or json_tokens.
+The PostgreSQL dispatcher currently returns unknownMethod for this method.
+The former local-store implementation has been removed. Mailbox/get remains
+available for mailbox discovery; no query or query-delta support is claimed.
 
 ## Passive Email property recognition
 

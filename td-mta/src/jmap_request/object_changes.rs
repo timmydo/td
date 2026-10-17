@@ -45,7 +45,7 @@ pub(super) fn changes(error: jmap_changes::Error) -> Error {
         jmap_changes::Error::Invalid | jmap_changes::Error::Incomplete => Error::State,
     }
 }
-impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
+impl Worker<'_, '_, '_, '_, '_> {
     pub(super) fn object_changes(
         &mut self,
         arguments: Range<u64>,
@@ -80,31 +80,14 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
         self.check()?;
         let mut read = self.read.take();
         let result = (|| {
-            let mut native = None;
-            let page = if let Some(view) = read.as_mut() {
-                view.changes(kind.data_type(), since, maximum, &mut || {
-                    if self.retention.admit_before(self.execution)? {
-                        Ok(())
-                    } else {
-                        Err(crate::ports::Error::Deadline)
-                    }
-                })?
-            } else {
-                let view = self
-                    .retention
-                    .method_view(self.account, self.execution)
-                    .map_err(storage)?;
-                let view = native.insert(view);
-                let mut cursor = jmap_changes::Cursor::new(view, kind.data_type(), since, maximum)
-                    .map_err(changes)?;
-                loop {
-                    self.check()?;
-                    if cursor.poll().map_err(changes)? {
-                        break;
-                    }
+            let view = read.as_mut().ok_or(Error::State)?;
+            let page = view.changes(kind.data_type(), since, maximum, &mut || {
+                if self.retention.admit_before(self.execution)? {
+                    Ok(())
+                } else {
+                    Err(crate::ports::Error::Deadline)
                 }
-                cursor.finish().map_err(changes)?
-            };
+            })?;
             let start = self.retention.len();
             self.append(br#"{"accountId":"#)?;
             self.push_id(&account)?;
@@ -157,9 +140,7 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
             if let Some(view) = read.as_mut() {
                 view.check()?;
             }
-            if let Some(view) = native.as_mut() {
-                view.check_snapshot().map_err(storage)?;
-            }
+
             self.check()?;
             let end = self.retention.publish().map_err(Error::Storage)?;
             Ok(start..end)
@@ -236,15 +217,3 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
         }
     }
 }
-
-#[cfg(test)]
-#[path = "mailbox_changes_tests.rs"]
-mod tests;
-
-#[cfg(test)]
-#[path = "thread_changes_tests.rs"]
-mod thread_tests;
-
-#[cfg(test)]
-#[path = "email_changes_tests.rs"]
-mod email_tests;

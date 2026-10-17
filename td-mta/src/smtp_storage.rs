@@ -6,9 +6,9 @@ use crate::{
     smtp_session::Session,
 };
 use std::{net::IpAddr, sync::Arc};
-
-#[path = "smtp_storage_native.rs"]
-pub mod native;
+pub fn trace_allowance(hostname: &str) -> Result<usize, Error> {
+    crate::receiving_headers::trace_allowance(hostname)
+}
 
 pub struct Begin<'a, 'cfg> {
     pub account: AccountId,

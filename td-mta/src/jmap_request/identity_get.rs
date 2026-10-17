@@ -1,10 +1,10 @@
 //! The default visible Identity/get projection consumed by td-mail.
-use super::{get_ids::Requested, mailbox_get::storage, push::Children, Error, Worker};
-use crate::{ids::IdentityId, ports::ReadView, sync::IdentityState};
+use super::{get_ids::Requested, push::Children, Error, Worker};
+use crate::{ids::IdentityId, sync::IdentityState};
 use std::ops::Range;
 use td_json::scan;
 
-impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
+impl Worker<'_, '_, '_, '_, '_> {
     pub(super) fn identity_get(
         &mut self,
         arguments: Range<u64>,
@@ -35,20 +35,7 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
             return Err(Error::State);
         }
         self.check()?;
-        let mut view = if self.read.is_none() {
-            Some(
-                self.retention
-                    .method_view(self.account, self.execution)
-                    .map_err(storage)?,
-            )
-        } else {
-            None
-        };
-        let identity = match (self.read.as_ref(), view.as_ref()) {
-            (Some(read), None) => read.identity(),
-            (None, Some(view)) => view.identity(),
-            _ => return Err(Error::State),
-        };
+        let identity = self.read.as_ref().ok_or(Error::State)?.identity();
         let state = catalog.state(identity).map_err(|_| Error::State)?;
         if all {
             if catalog.ids().len() > maximum {
@@ -90,9 +77,7 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
         self.append(br#"],"notFound":["#)?;
         self.get_not_found(&requested)?;
         self.append(b"]}")?;
-        if let Some(view) = view.as_mut() {
-            view.check_snapshot().map_err(storage)?;
-        }
+
         if let Some(read) = self.read.as_mut() {
             read.check()?;
         }
@@ -101,7 +86,3 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
         Ok(start..end)
     }
 }
-
-#[cfg(test)]
-#[path = "identity_get_tests.rs"]
-mod tests;

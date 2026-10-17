@@ -23,12 +23,6 @@ impl std::error::Error for Error {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RootEntry {
-    Database,
-    Wal,
-    SharedMemory,
-    BackupPartial,
-    Devices,
-    DevicesPending,
     Lock,
 }
 
@@ -52,12 +46,6 @@ impl Name {
     }
     pub fn root(entry: RootEntry) -> Result<Self, Error> {
         let text = match entry {
-            RootEntry::Database => "metadata.sqlite3",
-            RootEntry::Wal => "metadata.sqlite3-wal",
-            RootEntry::SharedMemory => "metadata.sqlite3-shm",
-            RootEntry::BackupPartial => "metadata.sqlite3.backup-partial",
-            RootEntry::Devices => "records.v1",
-            RootEntry::DevicesPending => "records.v1.pending",
             RootEntry::Lock => "LOCK",
         };
         Self::encode(format_args!("{text}"))

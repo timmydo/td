@@ -1,29 +1,24 @@
 //! Retained Thread/get over one original snapshot.
-use super::{get_ids::Requested, mailbox_get::storage, push::Children, Error, Worker};
+use super::{push::Children, Error, Worker};
 use crate::{
-    format::{key::Key, Table},
     ids::ThreadId,
-    ports::ReadView,
-    store_fs::MAX_THREAD_EMAILS,
+    ports::MAX_THREAD_EMAILS,
     sync::{DataState, DataType},
     wire,
 };
 use std::ops::Range;
 use td_json::scan;
-enum View<'v, 's, 'r> {
-    Native(&'v mut crate::store_fs::IndexReadView<'s, 'r>),
+enum View<'v> {
     Postgres(&'v mut dyn super::MailRead),
 }
-impl View<'_, '_, '_> {
+impl View<'_> {
     fn identity(&self) -> crate::ports::ViewIdentity {
         match self {
-            Self::Native(view) => view.identity(),
             Self::Postgres(view) => view.identity(),
         }
     }
     fn check(&mut self) -> Result<(), Error> {
         match self {
-            Self::Native(view) => view.check_snapshot().map_err(storage),
             Self::Postgres(view) => view.check(),
         }
     }
@@ -34,14 +29,11 @@ impl View<'_, '_, '_> {
         maximum: usize,
     ) -> Result<Option<crate::ports::ThreadEmails>, Error> {
         match self {
-            Self::Native(view) => view
-                .thread_emails(thread, after, maximum, &mut [])
-                .map_err(storage),
             Self::Postgres(view) => view.thread_emails(thread, after, maximum),
         }
     }
 }
-impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
+impl Worker<'_, '_, '_, '_, '_> {
     pub(super) fn thread_get(
         &mut self,
         arguments: Range<u64>,
@@ -85,56 +77,10 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
         }
         let mut read = self.read.take();
         let result = (|| {
-            let mut native;
-            let mut view = match read.as_mut() {
-                Some(view) => View::Postgres(super::reborrow_read(&mut **view)),
-                None => {
-                    native = self
-                        .retention
-                        .method_view(self.account, self.execution)
-                        .map_err(storage)?;
-                    View::Native(&mut native)
-                }
-            };
-            if let View::Native(view) = &mut view {
-                if all {
-                    let mut after = None::<[u8; 16]>;
-                    let mut key = [0; 16];
-                    while let Some(record) = view
-                        .next(
-                            Table::Threads,
-                            after.as_ref().map(|bytes| bytes.as_slice()),
-                            &mut key,
-                            &mut [],
-                        )
-                        .map_err(storage)?
-                    {
-                        self.check()?;
-                        let Key::Thread(id) = record.key else {
-                            return Err(Error::State);
-                        };
-                        after = Some(*id.as_bytes());
-                        let page = view
-                            .thread_emails(id, None, 1, &mut [])
-                            .map_err(storage)?
-                            .ok_or(Error::State)?;
-                        if page.emails.is_empty() {
-                            if page.has_more {
-                                return Err(Error::State);
-                            }
-                            continue;
-                        }
-                        if requested.len() == maximum {
-                            return Err(Error::RequestTooLarge);
-                        }
-                        requested.push(Requested {
-                            name: None,
-                            id: Some(id),
-                            found: false,
-                        });
-                    }
-                }
-            }
+            let mut view = View::Postgres(super::reborrow_read(
+                &mut **read.as_mut().ok_or(Error::State)?,
+            ));
+
             let identity = view.identity();
             let mut state_bytes = [0; DataState::WIRE_BYTES];
             let state = DataState {
@@ -228,7 +174,3 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
         result
     }
 }
-
-#[cfg(test)]
-#[path = "thread_get_tests.rs"]
-pub(super) mod tests;

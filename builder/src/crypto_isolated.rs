@@ -822,134 +822,6 @@ const NATIVE_WRAPPERS: &[&str] = &[
 ];
 const NATIVE_SUCCESS: &str = "native-allocation-probe-v1: forwarding provider diagnostic passed\n";
 
-const SQLITE_BODY_PHASES: &[&str] = &[
-    "baseline",
-    "opened",
-    "writing",
-    "committed",
-    "verified",
-    "reopened",
-    "rolled_back",
-    "dropped",
-];
-
-const SQLITE_ACCOUNT_PHASES: &[&str] = &[
-    "baseline",
-    "opened",
-    "writing",
-    "committed",
-    "verified",
-    "account_verified",
-    "reopened",
-    "rolled_back",
-    "dropped",
-];
-
-const SQLITE_BACKUP_PHASES: &[&str] = &[
-    "baseline",
-    "opened",
-    "writing",
-    "committed",
-    "verified",
-    "account_verified",
-    "backed_up",
-    "source_verified",
-    "restored_verified",
-    "dropped",
-];
-
-const SQLITE_EPOCH_PHASES: &[&str] = &[
-    "baseline",
-    "opened",
-    "writing",
-    "committed",
-    "verified",
-    "account_verified",
-    "backed_up",
-    "source_verified",
-    "restored_verified",
-    "epoch_renewed",
-    "epoch_reopened",
-    "source_preserved",
-    "dropped",
-];
-
-const SQLITE_OVERLAPPING_PHASES: &[&str] = &[
-    "baseline",
-    "opened",
-    "writing",
-    "committed",
-    "verified",
-    "account_verified",
-    "backed_up",
-    "source_verified",
-    "restored_verified",
-    "epoch_renewed",
-    "epoch_reopened",
-    "source_preserved",
-    "pools_verified",
-    "dropped",
-];
-
-const SQLITE_PRUNED_OVERLAPPING_PHASES: &[&str] = &[
-    "baseline",
-    "opened",
-    "writing",
-    "committed",
-    "verified",
-    "account_verified",
-    "backed_up",
-    "source_verified",
-    "restored_verified",
-    "epoch_renewed",
-    "epoch_reopened",
-    "source_preserved",
-    "pools_pruned",
-    "pools_verified",
-    "dropped",
-];
-
-fn sqlite_evidence(output: &str, native: bool, scenario: &str) -> Result<()> {
-    let (prefix, phases) = match scenario {
-        "sqlite-body" => ("sqlite", SQLITE_BODY_PHASES),
-        "sqlite-account" => ("sqlite-account", SQLITE_ACCOUNT_PHASES),
-        "sqlite-backup" => ("sqlite-backup", SQLITE_BACKUP_PHASES),
-        "sqlite-epoch" => ("sqlite-epoch", SQLITE_EPOCH_PHASES),
-        "sqlite-multi-account" => ("sqlite-multi-account", SQLITE_EPOCH_PHASES),
-        "sqlite-overlapping-accounts" => ("sqlite-overlapping-accounts", SQLITE_OVERLAPPING_PHASES),
-        "sqlite-pruned-overlapping-accounts" => (
-            "sqlite-pruned-overlapping-accounts",
-            SQLITE_PRUNED_OVERLAPPING_PHASES,
-        ),
-        _ => return Err("unknown SQLite observation scenario".into()),
-    };
-    let domain = if native { "native" } else { "rust" };
-    let width = if native { 9 } else { 7 };
-    let mut lines = output.lines();
-    for phase in phases {
-        let prefix = format!("{prefix}-{domain} {phase} ");
-        let row = lines
-            .next()
-            .and_then(|line| line.strip_prefix(&prefix))
-            .ok_or("missing or reordered SQLite allocation phase")?;
-        let columns: Vec<&str> = row.split(' ').collect();
-        if columns.len() != width
-            || columns.iter().any(|value| {
-                value.is_empty()
-                    || !value.bytes().all(|b| b.is_ascii_digit())
-                    || value.parse::<usize>().is_err()
-            })
-        {
-            return Err("invalid SQLite allocation measurement".into());
-        }
-    }
-    let success = format!("{scenario}-allocation-v1: {domain} passed");
-    if lines.next() != Some(success.as_str()) || lines.next().is_some() || !output.ends_with('\n') {
-        return Err("invalid SQLite allocation completion".into());
-    }
-    Ok(())
-}
-
 fn tls_allocation_evidence(output: &str, native: bool) -> Result<()> {
     let phases = [
         "baseline",
@@ -1210,13 +1082,6 @@ fn rss_symbols(symbols: &str, probe: bool) -> Result<()> {
 fn rss_evidence(output: &str, scenario: &str) -> Result<()> {
     let phases: &[&str] = match scenario {
         "control" => &["baseline", "touched", "dropped"],
-        "sqlite-body" => SQLITE_BODY_PHASES,
-        "sqlite-account" => SQLITE_ACCOUNT_PHASES,
-        "sqlite-backup" => SQLITE_BACKUP_PHASES,
-        "sqlite-epoch" => SQLITE_EPOCH_PHASES,
-        "sqlite-multi-account" => SQLITE_EPOCH_PHASES,
-        "sqlite-overlapping-accounts" => SQLITE_OVERLAPPING_PHASES,
-        "sqlite-pruned-overlapping-accounts" => SQLITE_PRUNED_OVERLAPPING_PHASES,
         "client" => &[
             "baseline",
             "config",
@@ -1318,48 +1183,6 @@ fn rss_evidence(output: &str, scenario: &str) -> Result<()> {
         || !output.ends_with('\n')
     {
         return Err("invalid RSS completion".into());
-    }
-    Ok(())
-}
-
-fn sqlite_stack_evidence(output: &str, scenario: &str) -> Result<()> {
-    if !matches!(
-        scenario,
-        "sqlite-body"
-            | "sqlite-account"
-            | "sqlite-backup"
-            | "sqlite-epoch"
-            | "sqlite-multi-account"
-            | "sqlite-overlapping-accounts"
-            | "sqlite-pruned-overlapping-accounts"
-    ) {
-        return Err("unknown SQLite stack scenario".into());
-    }
-    let mut lines = output.lines();
-    let mut previous = None;
-    for phase in ["before", "after"] {
-        let prefix = format!("{scenario}_stack_{phase}_mapping_bytes=");
-        let value = lines
-            .next()
-            .and_then(|line| line.strip_prefix(&prefix))
-            .ok_or("missing or reordered SQLite stack mapping")?;
-        if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
-            return Err("invalid SQLite stack mapping".into());
-        }
-        let bytes = value
-            .parse::<usize>()
-            .map_err(|_| "SQLite stack mapping overflows")?;
-        if bytes == 0 || bytes > 256 * 1024 || previous.is_some_and(|old| old != bytes) {
-            return Err("SQLite stack mapping exceeds its ceiling or changed".into());
-        }
-        previous = Some(bytes);
-    }
-    let completion = format!("{scenario}-stack-v1: passed");
-    if lines.next() != Some(completion.as_str())
-        || lines.next().is_some()
-        || !output.ends_with('\n')
-    {
-        return Err("invalid SQLite stack completion".into());
     }
     Ok(())
 }
@@ -2106,53 +1929,8 @@ pub(crate) fn runtime_inner() -> Result<()> {
         }
     }
 
-    for (native, path) in [
-        (false, "/artifacts/td-mta-rust-allocation-probe"),
-        (true, "/artifacts/td-mta-native-allocation-probe"),
-    ] {
-        for (scenario, argument) in [
-            ("sqlite-body", "--sqlite-body"),
-            ("sqlite-account", "--sqlite-account"),
-            ("sqlite-backup", "--sqlite-backup"),
-            ("sqlite-epoch", "--sqlite-epoch"),
-            ("sqlite-multi-account", "--sqlite-multi-account"),
-            (
-                "sqlite-overlapping-accounts",
-                "--sqlite-overlapping-accounts",
-            ),
-            (
-                "sqlite-pruned-overlapping-accounts",
-                "--sqlite-pruned-overlapping-accounts",
-            ),
-        ] {
-            let mut command = Command::new(path);
-            command.arg(argument).env_clear().stdin(Stdio::null());
-            crate::host_bin::arm_check_child(&mut command);
-            let domain = if native { "native" } else { "rust" };
-            let name = format!("{scenario}-allocation-{domain}");
-            let output = bounded_output(&mut command, &name, 8192, 300)?;
-            sqlite_evidence(&output, native, scenario)?;
-            for line in output.lines() {
-                println!("portable SQLite allocation diagnostic: {line}");
-            }
-        }
-    }
-
     for (scenario, argument) in [
         ("control", None),
-        ("sqlite-body", Some("--sqlite-body")),
-        ("sqlite-account", Some("--sqlite-account")),
-        ("sqlite-backup", Some("--sqlite-backup")),
-        ("sqlite-epoch", Some("--sqlite-epoch")),
-        ("sqlite-multi-account", Some("--sqlite-multi-account")),
-        (
-            "sqlite-overlapping-accounts",
-            Some("--sqlite-overlapping-accounts"),
-        ),
-        (
-            "sqlite-pruned-overlapping-accounts",
-            Some("--sqlite-pruned-overlapping-accounts"),
-        ),
         ("client", Some("--tls-clients")),
         ("handshake", Some("--tls-handshake")),
         ("entropy", Some("--entropy-workers")),
@@ -2170,50 +1948,10 @@ pub(crate) fn runtime_inner() -> Result<()> {
         }
         crate::host_bin::arm_check_child(&mut command);
         let name = format!("rss-probe-{scenario}");
-        let timeout = if matches!(
-            scenario,
-            "sqlite-body"
-                | "sqlite-account"
-                | "sqlite-backup"
-                | "sqlite-epoch"
-                | "sqlite-multi-account"
-                | "sqlite-overlapping-accounts"
-                | "sqlite-pruned-overlapping-accounts"
-        ) {
-            300
-        } else {
-            30
-        };
-        let output = bounded_output(&mut command, &name, 8192, timeout)?;
+        let output = bounded_output(&mut command, &name, 8192, 30)?;
         rss_evidence(&output, scenario)?;
         for line in output.lines() {
             println!("portable RSS diagnostic (KiB): {line}");
-        }
-    }
-
-    for (scenario, argument) in [
-        ("sqlite-body", "--sqlite-body-stack"),
-        ("sqlite-account", "--sqlite-account-stack"),
-        ("sqlite-backup", "--sqlite-backup-stack"),
-        ("sqlite-epoch", "--sqlite-epoch-stack"),
-        ("sqlite-multi-account", "--sqlite-multi-account-stack"),
-        (
-            "sqlite-overlapping-accounts",
-            "--sqlite-overlapping-accounts-stack",
-        ),
-        (
-            "sqlite-pruned-overlapping-accounts",
-            "--sqlite-pruned-overlapping-accounts-stack",
-        ),
-    ] {
-        let mut command = Command::new("/artifacts/td-mta-rss-probe");
-        command.arg(argument).env_clear().stdin(Stdio::null());
-        crate::host_bin::arm_check_child(&mut command);
-        let name = format!("{scenario}-stack");
-        let output = bounded_output(&mut command, &name, 8192, 300)?;
-        sqlite_stack_evidence(&output, scenario)?;
-        for line in output.lines() {
-            println!("portable SQLite stack diagnostic: {line}");
         }
     }
 
@@ -2521,60 +2259,6 @@ mod tests {
         }
         assert!(rss_evidence(good.trim_end(), "control").is_err());
         assert!(rss_evidence(&good.replace("-v2:", "-v1:"), "control").is_err());
-    }
-
-    #[test]
-    fn sqlite_rss_requires_all_phases_and_exact_scenario() {
-        let cases: &[(&str, &[&str])] = &[
-            ("sqlite-body", SQLITE_BODY_PHASES),
-            ("sqlite-account", SQLITE_ACCOUNT_PHASES),
-            ("sqlite-backup", SQLITE_BACKUP_PHASES),
-            ("sqlite-epoch", SQLITE_EPOCH_PHASES),
-            ("sqlite-multi-account", SQLITE_EPOCH_PHASES),
-            ("sqlite-overlapping-accounts", SQLITE_OVERLAPPING_PHASES),
-            (
-                "sqlite-pruned-overlapping-accounts",
-                SQLITE_PRUNED_OVERLAPPING_PHASES,
-            ),
-        ];
-        for &(scenario, phases) in cases {
-            let records: Vec<_> = phases
-                .iter()
-                .map(|phase| format!("rss {scenario} {phase} 100\n"))
-                .collect();
-            let footer = format!("rss-observation-v2: {scenario} passed\n");
-            let output = records.concat() + &footer;
-            assert!(rss_evidence(&output, scenario).is_ok());
-            for &(other, _) in cases {
-                if other != scenario {
-                    assert!(rss_evidence(&output, other).is_err());
-                }
-            }
-            for record in &records {
-                assert!(rss_evidence(&output.replacen(record, "", 1), scenario).is_err());
-                assert!(rss_evidence(
-                    &output.replacen(record, &(record.clone() + record), 1),
-                    scenario
-                )
-                .is_err());
-            }
-            let mut reordered = records.clone();
-            reordered.swap(0, 1);
-            assert!(rss_evidence(&(reordered.concat() + &footer), scenario).is_err());
-            for bad in [
-                output.replace(" 100\n", " 0\n"),
-                output.replace(" 100\n", " -1\n"),
-                output.replace(" 100\n", " 18446744073709551616\n"),
-                output.replace(" 100\n", " 100 1\n"),
-                output.replace("passed", "failed"),
-                output.replace("-v2:", "-v1:"),
-                output.replace(&footer, ""),
-                format!("{output}extra\n"),
-            ] {
-                assert!(rss_evidence(&bad, scenario).is_err());
-            }
-            assert!(rss_evidence(output.trim_end(), scenario).is_err());
-        }
     }
 
     #[test]
@@ -3054,71 +2738,6 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_stack_requires_bounded_unchanged_mapping_and_exact_scenario() {
-        for scenario in [
-            "sqlite-body",
-            "sqlite-account",
-            "sqlite-backup",
-            "sqlite-epoch",
-            "sqlite-multi-account",
-            "sqlite-overlapping-accounts",
-            "sqlite-pruned-overlapping-accounts",
-        ] {
-            let before = format!("{scenario}_stack_before_mapping_bytes=");
-            let after = format!("{scenario}_stack_after_mapping_bytes=");
-            let completion = format!("{scenario}-stack-v1: passed\n");
-            for bytes in [4096, 256 * 1024] {
-                let output = format!("{before}{bytes}\n{after}{bytes}\n{completion}");
-                assert!(sqlite_stack_evidence(&output, scenario).is_ok());
-                for other in [
-                    "sqlite-body",
-                    "sqlite-account",
-                    "sqlite-backup",
-                    "sqlite-epoch",
-                    "sqlite-multi-account",
-                    "sqlite-overlapping-accounts",
-                    "sqlite-pruned-overlapping-accounts",
-                ] {
-                    if other != scenario {
-                        assert!(sqlite_stack_evidence(&output, other).is_err());
-                    }
-                }
-                assert!(sqlite_stack_evidence(&output, "unknown").is_err());
-                for bad in [
-                    String::new(),
-                    output.trim_end().to_owned(),
-                    format!("{output}extra\n"),
-                    output.replace(&before, &after),
-                    output.replace(&format!("{before}{bytes}\n"), ""),
-                    output.replace(&format!("{after}{bytes}\n"), ""),
-                    output.replace(
-                        &format!("{before}{bytes}\n"),
-                        &format!("{before}{bytes}\n{before}{bytes}\n"),
-                    ),
-                    output.replace(
-                        &format!("{after}{bytes}\n"),
-                        &format!("{after}{bytes}\n{after}{bytes}\n"),
-                    ),
-                    output.replace(&completion, ""),
-                    output.replace(&completion, &completion.repeat(2)),
-                    output.replace(&format!("{after}{bytes}"), &format!("{after}1")),
-                    output.replace(&format!("{before}{bytes}"), &format!("{before}+{bytes}")),
-                    output.replace(
-                        &format!("{before}{bytes}"),
-                        &format!("{before}184467440737095516160"),
-                    ),
-                ] {
-                    assert!(sqlite_stack_evidence(&bad, scenario).is_err(), "{bad}");
-                }
-            }
-            for bytes in [0, 256 * 1024 + 1] {
-                let output = format!("{before}{bytes}\n{after}{bytes}\n{completion}");
-                assert!(sqlite_stack_evidence(&output, scenario).is_err());
-            }
-        }
-    }
-
-    #[test]
     fn allocation_probe_requires_symbols_and_exact_completion() {
         let counter = "000 b rust_alloc_probe_TD_MTA_ALLOCATION_COUNTERS";
         assert!(allocation_symbols(counter, true).is_ok());
@@ -3143,97 +2762,6 @@ mod tests {
         }
         assert!(allocation_evidence(&format!("{ALLOCATION_SUCCESS}{ALLOCATION_SUCCESS}")).is_err());
         assert!(allocation_evidence(&format!("{ALLOCATION_SUCCESS}failed\n")).is_err());
-    }
-
-    #[test]
-    fn sqlite_measurements_require_every_phase_and_exact_scenario_completion() {
-        for (scenario, prefix, phases) in [
-            ("sqlite-body", "sqlite", SQLITE_BODY_PHASES),
-            ("sqlite-account", "sqlite-account", SQLITE_ACCOUNT_PHASES),
-            ("sqlite-backup", "sqlite-backup", SQLITE_BACKUP_PHASES),
-            ("sqlite-epoch", "sqlite-epoch", SQLITE_EPOCH_PHASES),
-            (
-                "sqlite-multi-account",
-                "sqlite-multi-account",
-                SQLITE_EPOCH_PHASES,
-            ),
-            (
-                "sqlite-overlapping-accounts",
-                "sqlite-overlapping-accounts",
-                SQLITE_OVERLAPPING_PHASES,
-            ),
-            (
-                "sqlite-pruned-overlapping-accounts",
-                "sqlite-pruned-overlapping-accounts",
-                SQLITE_PRUNED_OVERLAPPING_PHASES,
-            ),
-        ] {
-            for native in [false, true] {
-                let domain = if native { "native" } else { "rust" };
-                let columns = if native {
-                    "1 2 3 4 5 6 7 8 9"
-                } else {
-                    "1 2 3 4 5 6 7"
-                };
-                let mut output = String::new();
-                let mut rss = String::new();
-                for phase in phases {
-                    output.push_str(&format!("{prefix}-{domain} {phase} {columns}\n"));
-                    rss.push_str(&format!("rss {scenario} {phase} 123\n"));
-                }
-                output.push_str(&format!("{scenario}-allocation-v1: {domain} passed\n"));
-                rss.push_str(&format!("rss-observation-v2: {scenario} passed\n"));
-                assert!(sqlite_evidence(&output, native, scenario).is_ok());
-                assert!(rss_evidence(&rss, scenario).is_ok());
-                for other in [
-                    "sqlite-body",
-                    "sqlite-account",
-                    "sqlite-backup",
-                    "sqlite-epoch",
-                    "sqlite-multi-account",
-                    "sqlite-overlapping-accounts",
-                    "sqlite-pruned-overlapping-accounts",
-                ] {
-                    if other != scenario {
-                        assert!(sqlite_evidence(&output, native, other).is_err());
-                        assert!(rss_evidence(&rss, other).is_err());
-                    }
-                }
-                assert!(sqlite_evidence(&output, native, "unknown").is_err());
-                for phase in phases {
-                    let allocation_row = format!("{prefix}-{domain} {phase} {columns}\n");
-                    let rss_row = format!("rss {scenario} {phase} 123\n");
-                    for replacement in [String::new(), allocation_row.repeat(2)] {
-                        assert!(sqlite_evidence(
-                            &output.replace(&allocation_row, &replacement),
-                            native,
-                            scenario
-                        )
-                        .is_err());
-                    }
-                    for replacement in [String::new(), rss_row.repeat(2)] {
-                        assert!(
-                            rss_evidence(&rss.replace(&rss_row, &replacement), scenario).is_err()
-                        );
-                    }
-                }
-                for bad in [
-                    output.replace("writing", "opened"),
-                    output.replace("1 2", "-1 2"),
-                    output.replace(columns, "1"),
-                    output.trim_end().to_owned(),
-                    format!("{output}extra\n"),
-                    output.replace("verified", "missing"),
-                    output.replace(&format!("{scenario}-allocation-v1"), "wrong-allocation-v1"),
-                ] {
-                    assert!(sqlite_evidence(&bad, native, scenario).is_err());
-                }
-                assert!(sqlite_evidence(&output, !native, scenario).is_err());
-                assert!(rss_evidence(&rss.replace("writing", "opened"), scenario).is_err());
-                assert!(rss_evidence(&rss.replace("verified", "missing"), scenario).is_err());
-                assert!(rss_evidence(&format!("{rss}extra\n"), scenario).is_err());
-            }
-        }
     }
 
     #[test]

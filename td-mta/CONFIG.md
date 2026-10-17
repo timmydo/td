@@ -227,7 +227,7 @@ inputs consumed by RESOURCES.md and ADMISSION.md's planners. The supported v1
 key vocabulary is listed below and pinned by an independent test oracle.
 Adding a declaration must reconcile that vocabulary and this schema. The
 Limits declaration separates configurable values from fixed storage and
-execution constants. Fixed SQLite heap and transaction sizes/counts and the single outbound
+execution constants. Fixed transaction sizes/counts and the single outbound
 worker are not operator keys; spelling them in a file is an unknown-field
 error even when the supplied value equals the constant.
 
@@ -243,9 +243,9 @@ error even when the supplied value equals the constant.
 
 The default and compiled maximum `memory_budget_bytes` are 134217728
 (128 MiB). The default `index_cache_bytes` is 4194304 (4 MiB). Together they
-fund the checked RESOURCES.md ledger, including the fixed 34 MiB WAL-index
-mapping allowance outside SQLite's 16 MiB requested-heap limit. These are
-reservations, not measured RSS limits. A smaller explicit
+fund the checked process ledger in RESOURCES.md. PostgreSQL server memory,
+WAL and pages are outside that ledger. These reservations are not measured
+RSS limits. A smaller explicit
 budget is accepted only when the complete configured plan fits it; changing
 the budget alone does not change connection counts. DESIGN section 5 treats
 RSS figures as provisional goals and the ledger as existing planner behavior;
@@ -253,14 +253,11 @@ replacing this configuration rule requires a separate atomic code change.
 
 ### `[disk]`
 
-`body_bytes`, `blob_count`, `database_bytes`, `wal_bytes`,
+`body_bytes`, `blob_count`,
 `response_bytes`, `response_total_bytes`, `cache_bytes`, `cold_bytes`.
 These are logical quotas; physical free-space settings are not supported.
-database_bytes must equal the combined SQLite body/metadata ceiling of
-8589934592 bytes (8 GiB). wal_bytes must cover the fixed conservative
-17280796224-byte core bound; increasing the logical reservation does not
-enlarge it. Logical body_bytes is at most 4 GiB and blob_count at most 1000000.
-Native heap and transaction metadata limits remain fixed. message_bytes
+Logical body_bytes is at most 4 GiB and blob_count at most 1000000.
+Transaction metadata limits remain fixed. message_bytes
 has a 32 MiB hard maximum and may be reduced; it bounds complete encoded
 messages and upload bytes, not decoded attachment size alone.
 
@@ -269,7 +266,7 @@ messages and upload bytes, not decoded attachment size alone.
 `foreground_seconds`, `foreground_io_bytes`, `foreground_records`,
 `changes_seconds`, `changes_io_bytes`, `changes_records`, `request_seconds`,
 `commit_seconds`, `commit_io_bytes`, `commit_records`, `checkpoint_seconds`,
-`checkpoint_io_bytes`, `gc_drain_seconds`, `gc_seconds`, `gc_io_bytes`,
+`gc_drain_seconds`, `gc_seconds`, `gc_io_bytes`,
 `gc_records`, `gc_blobs`, `backup_seconds`, `backup_io_bytes`,
 `admission_seconds`.
 

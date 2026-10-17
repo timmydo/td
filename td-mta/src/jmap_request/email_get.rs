@@ -10,10 +10,9 @@ use crate::{
     body_value_options::Options,
     email_property::{Field, Property},
     email_response::Stored,
-    format::{key::Key, Table},
     ids::EmailId,
     limits::Limits,
-    ports::{Clock, ReadView},
+    ports::Clock,
     sync::{DataState, DataType},
 };
 use std::ops::Range;
@@ -138,20 +137,17 @@ pub(super) struct BodyProjection<'a> {
     pub clock: &'a dyn Clock,
     pub work: &'a mut Meter,
 }
-enum View<'v, 's, 'r> {
-    Native(&'v mut crate::store_fs::IndexReadView<'s, 'r>),
+enum View<'v> {
     Postgres(&'v mut dyn super::MailRead),
 }
-impl View<'_, '_, '_> {
+impl View<'_> {
     fn identity(&self) -> crate::ports::ViewIdentity {
         match self {
-            Self::Native(view) => view.identity(),
             Self::Postgres(view) => view.identity(),
         }
     }
     fn check_snapshot(&mut self) -> Result<(), Error> {
         match self {
-            Self::Native(view) => view.check_snapshot().map_err(storage),
             Self::Postgres(view) => view.check(),
         }
     }
@@ -161,7 +157,6 @@ impl View<'_, '_, '_> {
         row: &mut [u8],
     ) -> Result<Option<crate::email_response::EmailMetadata>, Error> {
         match self {
-            Self::Native(view) => view.email_metadata(id, row).map_err(storage),
             Self::Postgres(view) => view
                 .email_metadata(id, row)
                 .map_err(super::postgres_read_error),
@@ -175,10 +170,6 @@ impl View<'_, '_, '_> {
         sink: impl FnMut(&[u8]) -> Result<(), crate::ports::Error>,
     ) -> Result<bool, Error> {
         match self {
-            Self::Native(view) => {
-                crate::email_response::write_members(&mut **view, id, selected, row, sink, false)
-                    .map_err(storage)
-            }
             Self::Postgres(view) => {
                 crate::email_response::write_members(&mut **view, id, selected, row, sink, false)
                     .map_err(super::postgres_read_error)
@@ -186,7 +177,7 @@ impl View<'_, '_, '_> {
         }
     }
 }
-impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
+impl Worker<'_, '_, '_, '_, '_> {
     pub(super) fn email_get(
         &mut self,
         range: Range<u64>,
@@ -238,17 +229,9 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
         }
         let mut read = self.read.take();
         let result = (|| {
-            let mut native;
-            let mut view = match read.as_mut() {
-                Some(view) => View::Postgres(super::reborrow_read(&mut **view)),
-                None => {
-                    native = self
-                        .retention
-                        .method_view(self.account, self.execution)
-                        .map_err(storage)?;
-                    View::Native(&mut native)
-                }
-            };
+            let mut view = View::Postgres(super::reborrow_read(
+                &mut **read.as_mut().ok_or(Error::State)?,
+            ));
             let mut row = body::buffer(crate::format::MAX_VALUE_BYTES)?;
             if all {
                 match &mut view {
@@ -267,36 +250,6 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
                         }
                         for id in page.ids {
                             self.check()?;
-                            requested.push(Requested {
-                                name: None,
-                                id: Some(id),
-                                found: false,
-                            });
-                        }
-                    }
-                    View::Native(view) => {
-                        let mut after = None::<[u8; 16]>;
-                        let mut key = [0; 16];
-                        loop {
-                            self.check()?;
-                            let Some(record) = view
-                                .next(
-                                    Table::Emails,
-                                    after.as_ref().map(|v| v.as_slice()),
-                                    &mut key,
-                                    &mut row,
-                                )
-                                .map_err(storage)?
-                            else {
-                                break;
-                            };
-                            let Key::Email(id) = record.key else {
-                                return Err(Error::State);
-                            };
-                            if requested.len() == limits.objects_per_method {
-                                return Err(Error::RequestTooLarge);
-                            }
-                            after = Some(*id.as_bytes());
                             requested.push(Requested {
                                 name: None,
                                 id: Some(id),
@@ -350,15 +303,6 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
                 }
                 if selected.body() || !selected.headers.is_empty() {
                     let result = match &mut view {
-                        View::Native(view) => body::write(
-                            self,
-                            view,
-                            metadata.blob,
-                            limits,
-                            (&selected, options),
-                            clock.as_ref(),
-                            &mut work,
-                        ),
                         View::Postgres(view) => {
                             if metadata.size > limits.message_bytes as u64 {
                                 return Err(Error::StorageCapacity);
@@ -419,7 +363,3 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
         result
     }
 }
-
-#[cfg(test)]
-#[path = "email_get_tests.rs"]
-mod tests;

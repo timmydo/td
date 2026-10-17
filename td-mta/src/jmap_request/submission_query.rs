@@ -8,7 +8,7 @@ use crate::{
 use std::ops::Range;
 use td_json::scan;
 
-impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
+impl Worker<'_, '_, '_, '_, '_> {
     pub(super) fn submission_query(
         &mut self,
         range: Range<u64>,

@@ -1,7 +1,6 @@
 //! Service foundations and direct SMTP receiving; no automatic listener activation.
 #![forbid(unsafe_code)]
 
-pub mod account_checks;
 pub mod admission;
 pub use td_mime::body_charset;
 pub mod blob_body_json;
@@ -71,7 +70,6 @@ pub mod http_request;
 pub mod https;
 pub mod https_api;
 pub mod https_download;
-pub mod https_draft;
 mod https_exchange;
 pub mod https_upload;
 pub mod identity_catalog;

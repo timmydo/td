@@ -879,7 +879,11 @@ markers fail setup; errors identify the marker path. The marker is not
 parsed to add Git administrative directory mounts; existing ambient mounts
 may expose those directories. This matches the editor's trusted-owner plus
 sticky ancestor policy; components requiring mode-0755 root or forbidding
-all shared write bits must not use this fixture unchanged. An internal
+all shared write bits use the explicit `TD_TEST_TRUSTED_ROOT=private` mode.
+That mode makes only the disposable namespace root mode 0755 and its `/tmp`
+mode 0700, after checking both belong to the non-root caller. The native
+PostgreSQL mail fixtures use this mode for protected connection files and
+service directories. Host directory permissions remain unchanged. An internal
 builder supervisor
 is namespace PID 1 and starts the test as an ordinary child, preserving its
 default signal dispositions. The extra user/mount/PID namespaces are nested
@@ -970,8 +974,12 @@ binary and td-net unit-test executable offline. Native source preparation
 warms both locked external closures; each build verifies its archived inputs.
 Cargo artifact records identify the helper executables inside the selected
 target directory. Ambient TD_MTA_TEST_MAIL and TD_MTA_TEST_FETCH cannot replace
-them. After ordinary tests, the wrapper runs the exact ignored real-client
-case and requires a positive passing libtest summary as well as exit success.
+them. After ordinary tests, the wrapper runs the exact ignored PostgreSQL read,
+plain-text send and foreground-service cases. Each requires a positive passing
+libtest summary and exit success. Host preparation must provide PostgreSQL 17
+and set TD_MTA_TEST_POSTGRES_BIN to the absolute directory containing initdb,
+postgres, pg_ctl and psql. The fixtures own disposable clusters; no existing
+database service or public endpoint is required.
 
 td-mta/CONFORMANCE.md records what this native client fixture proves. Its
 private root certificate enters only the isolated fetch test process behind

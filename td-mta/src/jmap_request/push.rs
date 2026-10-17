@@ -6,7 +6,22 @@ use td_json::{arena, scan};
 
 const STRING_BYTES: usize = 1538;
 
-impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
+impl Worker<'_, '_, '_, '_, '_> {
+    pub(super) fn query_boolean(&mut self, item: &Item) -> Result<bool, Error> {
+        if item.kind != scan::Kind::Boolean {
+            return Err(Error::InvalidArguments);
+        }
+        let mut first = [0];
+        self.check()?;
+        self.retention
+            .read_at(item.range.start, &mut first)
+            .map_err(Error::Storage)?;
+        match first.first() {
+            Some(b't') => Ok(true),
+            Some(b'f') => Ok(false),
+            _ => Err(Error::State),
+        }
+    }
     pub(super) fn push_string(&mut self, item: &Item) -> Result<Name, Error> {
         if item.kind != scan::Kind::String {
             return Err(Error::InvalidArguments);
@@ -50,7 +65,7 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
     }
 }
 
-impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
+impl Worker<'_, '_, '_, '_, '_> {
     pub(super) fn push_method(
         &mut self,
         name: &str,
@@ -193,7 +208,7 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
     }
 }
 
-impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
+impl Worker<'_, '_, '_, '_, '_> {
     pub(super) fn blob_copy(&mut self, arguments: Range<u64>) -> Result<Range<u64>, Error> {
         let mut fields = Children::new(arguments, scan::Kind::Object)?;
         let mut source = None;

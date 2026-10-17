@@ -1,13 +1,11 @@
 //! Authenticated immutable downloads on the fixed HTTPS body worker.
 use crate::{
-    admission::timers::{self, TimeoutPlan},
+    admission::timers,
     bounded::TextBuffer,
     http_request::{decode_uri_component, QUANTUM},
     https_exchange::Sender,
     ids::{AccountId, BlobId, DeviceId},
-    ports::{BlobReader, Clock, Deadline, Error, Transport},
-    smtp_receiving::Control,
-    store_fs::{BlobAuthorization, BlobReadRequest, StoreCoordinator},
+    ports::{BlobReader, Deadline, Error},
     wire,
 };
 
@@ -86,57 +84,9 @@ pub enum Failure {
     Started(Error),
 }
 
-pub(crate) struct Settings<'a> {
-    pub maximum: u64,
-    pub limits: &'a crate::limits::Limits,
-}
 #[path = "https_download_part.rs"]
 mod part;
 
-pub(crate) fn send<P: BlobAuthorization>(
-    coordinator: &StoreCoordinator<'_, '_, P>,
-    settings: Settings<'_>,
-    request: Request<'_>,
-    transport: &mut dyn Transport,
-    control: &Control,
-    clock: &dyn Clock,
-    timeouts: &TimeoutPlan,
-) -> Result<(), Failure> {
-    let mut sender = Sender::new(transport, control, clock, timeouts, request.deadline)
-        .map_err(Failure::Before)?;
-    let started_at = sender.last;
-    let target = request.target;
-    let result = coordinator.with_authorized_blob_pin(
-        &td_crypto::Provider,
-        BlobReadRequest {
-            account: target.account,
-            device: request.device,
-            id: target.blob,
-            maximum: settings.maximum,
-            deadline: request.deadline,
-        },
-        |body, work| {
-            send_verified(
-                body,
-                work,
-                target,
-                settings.limits,
-                started_at,
-                request.deadline,
-                &mut sender,
-            )
-        },
-    );
-    result.map_err(|error| {
-        if sender.started {
-            Failure::Started(error)
-        } else {
-            Failure::Before(error)
-        }
-    })
-}
-
-/// The caller owns verified custody, fresh authorization and the original work.
 pub(crate) fn send_verified(
     body: &mut crate::store_fs::PinnedBlob<'_, '_>,
     work: &mut crate::admission::work::Meter,
@@ -214,6 +164,10 @@ pub(crate) fn send_verified(
 mod tests {
     use super::*;
     use crate::ports::{FlushProgress, IoProgress, Tick};
+    use crate::{
+        ports::{Clock, Transport},
+        smtp_receiving::Control,
+    };
     use std::sync::atomic::{AtomicU64, Ordering};
     fn url(name: &str, media: &str) -> String {
         format!(

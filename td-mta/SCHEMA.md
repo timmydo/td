@@ -5,10 +5,9 @@ The inert selected-profile structural loader is specified in
 Its role-aware listener and local-MX rules apply only to PreparedProfile;
 the legacy file loader and serving contracts below retain their requirements.
 
-[POSTGRES.md](POSTGRES.md) owns the agreed multi-instance PostgreSQL
-replacement target and atomic cutover boundary. Until that cutover, the
-SQLite/file-backed implementation and its contracts below remain active.
-PostgreSQL support and distributed delivery are not yet implemented.
+[POSTGRES.md](POSTGRES.md) owns active PostgreSQL storage and configuration.
+Receive/JMAP serving is implemented. Relay process integration remains
+incomplete and is refused; there is no alternative local database backend.
 
 ## Status and ownership
 

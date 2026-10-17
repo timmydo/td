@@ -9,23 +9,19 @@ pub enum Kind {
     UploadBytes,
     QueueBytes,
     QueueSubmissions,
-    DatabaseBytes,
-    WalBytes,
     SortBytes,
     ResponseBytes,
     CacheBytes,
     LogBytes,
     ColdBytes,
 }
-pub const COUNT: usize = 12;
+pub const COUNT: usize = 10;
 pub const ALL: [Kind; COUNT] = [
     Kind::BodyBytes,
     Kind::BlobCount,
     Kind::UploadBytes,
     Kind::QueueBytes,
     Kind::QueueSubmissions,
-    Kind::DatabaseBytes,
-    Kind::WalBytes,
     Kind::SortBytes,
     Kind::ResponseBytes,
     Kind::CacheBytes,
@@ -91,8 +87,6 @@ impl Quotas {
                 plan.upload_bytes(),
                 plan.queue_bytes(),
                 plan.queue_submissions(),
-                d.database_bytes,
-                d.wal_bytes,
                 plan.sort_bytes(),
                 d.response_total_bytes,
                 d.cache_bytes,
@@ -160,47 +154,6 @@ impl Quotas {
         self.pending = next;
         Ok(())
     }
-    pub(super) fn without_bodies(&self, bytes: u64, count: u64) -> Result<Self, Error> {
-        let mut next = self.clone();
-        next.used.subtract(Kind::BodyBytes, bytes)?;
-        next.used.subtract(Kind::BlobCount, count)?;
-        Ok(next)
-    }
-    pub(super) fn without_expired_upload(
-        &self,
-        length: u64,
-        body_removed: bool,
-    ) -> Result<Self, Error> {
-        let mut next = self.clone();
-        next.used.subtract(Kind::UploadBytes, length)?;
-        if body_removed {
-            next.used.subtract(Kind::BodyBytes, length)?;
-            next.used.subtract(Kind::BlobCount, 1)?;
-        }
-        Ok(next)
-    }
-    pub(super) fn replace_physical(
-        &mut self,
-        reserved: Usage,
-        database_bytes: u64,
-        wal_bytes: u64,
-    ) -> Result<(), Error> {
-        let mut next = self.clone();
-        for (kind, measured) in [
-            (Kind::DatabaseBytes, database_bytes),
-            (Kind::WalBytes, wal_bytes),
-        ] {
-            next.pending.subtract(kind, reserved.get(kind)?)?;
-            let previous = next.used.get(kind)?;
-            next.used.subtract(kind, previous)?;
-            next.used.add(kind, measured)?;
-            if add(measured, next.pending.get(kind)?, "physical usage")? > next.caps.get(kind)? {
-                return Err(Error::Inconsistent("measured physical usage exceeds quota"));
-            }
-        }
-        *self = next;
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -225,8 +178,6 @@ mod tests {
         .plan()?;
         let plan = DiskLimits {
             blob_count: 250003,
-            database_bytes: super::super::DATABASE_BYTES,
-            wal_bytes: 20 * super::super::GIB,
             response_total_bytes: 270 * MIB,
             cache_bytes: 140 * MIB,
             cold_bytes: 18 * MIB,
@@ -239,18 +190,8 @@ mod tests {
         )?;
         let quotas = Quotas::new(&plan, Usage::default()).map_err(|_| "invalid fixture caps")?;
         let expected = [
-            4294967296,
-            250003,
-            138412032,
-            272629760,
-            1003,
-            8589934592,
-            21474836480,
-            71303168,
-            283115520,
-            146800640,
-            66060288,
-            18874368,
+            4294967296, 250003, 138412032, 272629760, 1003, 71303168, 283115520, 146800640,
+            66060288, 18874368,
         ];
         for (kind, cap) in ALL.into_iter().zip(expected) {
             assert_eq!(quotas.caps().get(kind)?, cap, "{kind:?}");

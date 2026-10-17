@@ -2,15 +2,13 @@
 
 ## Status and precedence
 
-The serving executable and administration commands use PostgreSQL. Legacy
-local-store, backup/restore, file-configuration and device commands are
-removed. Remaining SQLite library code is being deleted incrementally. STORAGE.md still
-describes that legacy library. This document
-supersedes the single-process, file-configuration and SQLite choices for the
-replacement workstream; it does not relax the current implementation's
-invariants before cutover. This precedence applies to all routed mail
-documents, including CONFIG, RESOURCES, API and FORMAT. Protocol scope remains
-the flows used by td-mail.
+The serving executable and administration commands use PostgreSQL. The
+embedded database, local configuration and device registry are removed.
+STORAGE.md owns the remaining local runtime and response scratch. This
+document owns durable mail/configuration authority and database concurrency;
+protocol scope remains the flows used by td-mail. Receive and JMAP serving
+are active; relay process activation remains incomplete and is refused by
+serve. No deployed data migration or runtime integration protocol is required.
 
 The deployment is one personal account with several cooperating td-mta
 processes: a cloud VM can receive and relay mail while a local machine serves
@@ -57,7 +55,7 @@ A protected Unix-domain socket can be a separately explicit local transport,
 with authenticated database login and trusted socket-directory ownership.
 It does not silently replace a failed TLS connection. Initial authentication
 is PostgreSQL password/SCRAM over verified TLS; cloud identity-token login is
-not required for the first cutover. Resolve the configured writer endpoint
+not required for the initial runtime integration. Resolve the configured writer endpoint
 again on reconnect, within bounded DNS and connection deadlines.
 
 Startup connects, verifies writable-primary status and supported schema,
@@ -332,7 +330,7 @@ mailbox or claim cloud qualification from a local mock.
    obsolete SQLite qualification as their consumers are replaced. Do not
    introduce a selectable production dual backend or migrate existing data.
    Update the routed contracts to describe each implemented replacement.
-   Prior references below to an atomic cutover do not require preserving the
+   Prior references below to an runtime integration do not require preserving the
    SQLite executable or completing all operational tooling before wiring
    PostgreSQL serving.
 4. Activate distributed relay and complete td-mail sending on the replacement
@@ -594,7 +592,7 @@ New initialization applies all eighteen in
 one transaction. PUBLIC grants are revoked; inherited
 schema/relation grants to other roles refuse initialization and roll back.
 Explicit runtime grants and configuration-driven service admission remain
-cutover work.
+runtime integration work.
 
 `postgres_schema::upgrade` uses an explicit owner credential and the same
 exclusive transaction migration lock. It validates all existing checksums
@@ -866,9 +864,7 @@ to these new entry points.
 
 ## 19. Prepared mail relations
 
-Schema version 3 adds explicit mail relations, with no serving adapter
-or mail write command yet. Existing SQLite tables remain production
-authority until the atomic cutover. Schema initialization, inspection,
+Schema version 3 adds explicit mail relations. Schema initialization, inspection,
 upgrade and material operations now require a UTF8 database (a different
 encoding reports the fixed unsupported-version-or-checksum refusal);
 text columns use the built-in C collation so byte ordering does not
@@ -916,11 +912,10 @@ publication checks or cloud-provider qualification.
 
 The private device_credentials module owns the existing v1 app-password
 format and salted verifier construction for reuse by the PostgreSQL device
-adapter. The current file registry now calls that same implementation;
-there is no second verifier format or new authentication authority.
-DeviceStore's public password/error types and limits remain re-exported
-from store_fs. Registry publication, duplicate-ID refusal, capacity,
-revocation and current-policy locking remain at the storage boundary.
+adapter. The file registry is removed. Credential types and limits stay in
+the private shared implementation; PostgreSQL exposes Creation::password()
+and its own error type. Registry publication, duplicate-ID refusal, capacity,
+revocation and current-policy locking belong to PostgreSQL transactions.
 
 Generation yields an opaque password separately from ID, salt and verifier.
 Parsing yields a private, non-Debug presented credential so a future database
@@ -937,10 +932,9 @@ with a fixed golden vector and malformed-token/entropy-failure tests.
 Version 4 adds an owner-private devices table. The postgres_devices module
 provides explicit owner-side preparation and publication APIs, plus a cold
 credential check. Sections 193 through 195 add explicit registry inspection,
-revocation and creation commands. Runtime device
-privileges, HTTP authentication and authorization inside admitted mail
-snapshots/transactions remain cutover work. The existing file registry
-remains production authority until then.
+revocation and creation commands. Runtime HTTP authentication and admitted
+mail snapshots/transactions use this database registry; there is no local
+file credential authority.
 
 Prepare Creation once before publishing: it owns the password separately
 from the ID, salt, verifier, label, timestamp and request digest. Only the
@@ -1024,9 +1018,9 @@ Managed ACME requests have no explicit immutable version and refuse here;
 future ACME publication must supply its own fenced database mapping. The
 adapter does not admit a complete shared/profile generation, select an active
 pointer, grant runtime database privileges or open service admission. The
-legacy filesystem loader remains production authority until the atomic
-cutover. Database version references are used only through this explicit
-prepared-profile adapter, never through the legacy serving path.
+foreground service composes this adapter into its database profile loader
+before admitting listeners. Database version references are the runtime
+material source; the old file-configuration serving path is removed.
 
 ## 23. Shared/profile source composition
 
@@ -1121,8 +1115,8 @@ Only this closed configuration worker has 4 MiB aggregate input/output and
 512 input frames, enough for a full candidate. Per-frame 128 KiB and the
 SCRAM sequence remain unchanged, as do default, material and schema worker
 budgets. This is a finite cold operation, not persistent service transport
-or native-allocation qualification. Runtime privileges, activation and the
-atomic SQLite/file-authority replacement remain separate requirements.
+or native-allocation qualification. Runtime privileges and service activation are enforced by the runtime
+boundaries described below.
 
 ## 26. Operator configuration preparation
 
@@ -1167,8 +1161,7 @@ Schema version 6 adds owner-private account_bootstraps receipts. The inert
 postgres_accounts boundary prepares one retained epoch/account/Inbox tuple,
 then atomically inserts account sequence one and floor zero, the shared
 INITIAL_INBOX contents, its Mailbox Created history at sequence one/operation
-one, and the receipt. The default row is shared with the existing SQLite
-bootstrap so both produce the same logical initial state. No existing
+one, and the receipt. No existing
 account is reset, populated from configuration or granted serving authority.
 
 Publication holds the shared migration lock and verifies the epoch before
@@ -1211,7 +1204,7 @@ transaction. The shared device verifier runs inside that transaction, before
 account state and mailbox contents are read. A revoked or wrong-account token
 returns no mailbox data. A revocation after snapshot admission may allow that
 bounded observation to finish; its returned device ID grants no later authority.
-Configuration/profile admission and runtime credentials remain cutover work.
+Configuration/profile admission and runtime credentials remain runtime integration work.
 
 The result owns at most 256 mailbox rows, in binary ID order, with account
 sequence/floor and total/unread Email and Thread counts from the same snapshot.
@@ -1241,7 +1234,7 @@ not grant authority: it verifies the primary/schema barrier and app password
 inside one read-only repeatable-read transaction before resolving that Email's
 body. Only an Email in that account admits a body; upload leases and standalone
 transmission blobs remain outside this operation. Configuration/role admission
-and bounded runtime pools are still cutover work.
+and bounded runtime pools are still runtime integration work.
 
 Before callback admission it validates the captured account sequence/floor,
 Email/Thread/Blob references and change positions, length and chunk count. It
@@ -1368,7 +1361,7 @@ repeated profile preparation, account inspection and final observation.
 The source candidate is discarded before the final check; retained text and
 TLS objects belong to the caller's cold control worker. Reusable connection
 pools, publication, live refresh and full resource qualification remain
-cutover work.
+runtime integration work.
 
 
 ## 32. Retained single-Email flag writes
@@ -1400,7 +1393,7 @@ A missing receipt never authorizes a new operation identity after uncertainty.
 COMMIT loss returns Indeterminate and requires retaining the original Change.
 At 1024 receipts per account fresh operations refuse; there is no pruning or
 unbounded recovery promise. Runtime retention/retry policy and bulk JMAP
-mapping remain cutover work. All calls retain finite worker/deadline limits.
+mapping remain runtime integration work. All calls retain finite worker/deadline limits.
 An inspection that crosses its deadline refuses absence/errors, but preserves
 a confirmed historical receipt as known success.
 
@@ -1436,7 +1429,7 @@ The closed mutation worker admits 1088 input frames, one MiB total input,
 use this worker. Other workers retain their own bounds;
 SCRAM qualification and the original ten-second maximum deadline are unchanged.
 The finite larger frame count covers the two result sets and protocol overhead.
-Production JMAP dispatch and serving retention remain cutover work; this API
+Production JMAP dispatch and serving retention remain runtime integration work; this API
 is not a public authentication endpoint.
 
 ## 34. Shared logical quota policy
@@ -1460,7 +1453,7 @@ reservations against the selected limits before accepting more work.
 
 This closes conflicting instance policy before shared accounting is activated.
 It does not yet implement database quota counters, reservations, publication,
-reclamation or serving. Those remain prerequisites for the atomic cutover.
+reclamation or serving. Those remain prerequisites for the runtime integration.
 
 ## 35. Retained upload publication and shared usage
 
@@ -1508,9 +1501,7 @@ retry lifetimes are defined together.
 Body and upload byte charges and the blob count advance atomically, with no
 process-local fallback. Lowered limits refuse additional publication when any
 current usage exceeds its cap. Logical counters do not reserve server disk.
-Runtime ingress reservations, cleanup with fenced reclaim, HTTPS download
-dispatch, SMTP publication and serving activation
-remain cutover work. This API does not make the SQLite/file-backed server use PostgreSQL.
+
 
 ## 36. Authenticated blob downloads
 
@@ -1573,7 +1564,7 @@ credential revocation without authorizing a new write. Lost COMMIT response
 requires retaining and resolving that same operation. Failure before commit
 rolls back bodies, ID reservation, metadata, usage and receipt together.
 This remains a cold storage API: HTTP dispatch, sender-identity policy,
-submission, runtime admission and the atomic production cutover remain work.
+submission, runtime admission and the runtime integration remain work.
 
 
 ## 38. Authenticated change-history pages
@@ -1585,8 +1576,7 @@ then binds the account sequence and retained history floor. State tokens
 convey no authority. Wrong account/epoch, future or pruned state refuses.
 
 The existing `jmap_changes` transaction-aligned merger now accepts a small
-history-source interface; the SQLite source keeps its existing checks and
-semantics. PostgreSQL seeks the native account/kind/sequence/operation index
+history-source interface. PostgreSQL seeks the native account/kind/sequence/operation index
 in batches of at most 128 rows. Each row validates ordering, sequence,
 operation, action and object identity. The merger preserves whole sequence
 groups, folds repeated object changes and rejects a first group exceeding
@@ -1605,7 +1595,7 @@ forever. Other connection/deadline failures still refuse the whole page;
 no partial results escape or resume on a different snapshot.
 Authorization and policy are admitted at snapshot start; the finite read
 may finish after concurrent revocation. HTTP dispatch and runtime connection
-admission remain part of the production cutover.
+admission remain part of the runtime integration.
 
 
 ## 39. Shared Email read snapshots
@@ -1634,8 +1624,7 @@ Concurrent writes or retirement cannot splice new metadata or body bytes into
 an admitted read. Current profile/device authority is checked at admission;
 revocation does not extend or invalidate an already admitted finite snapshot.
 The existing read-worker byte/frame caps apply across all methods and bodies,
-without replenishment. This API adds no runtime listener, pool or backend
-selection; production dispatch and atomic SQLite removal remain pending.
+without replenishment. This snapshot grants no independent listener or publication authority.
 
 ## 40. Snapshot-bound Email query pages
 
@@ -1657,16 +1646,14 @@ operations retire the view even if callers swallow the error.
 
 Server statement limits and the original worker deadline bound sorting,
 counting and offset work; worker byte/frame limits remain shared across the
-whole view. No retained cursor or backend activation is introduced. Production
-JMAP dispatch and the atomic replacement remain pending.
+whole view. The PostgreSQL Email/query dispatcher uses this read boundary.
 
 ## 41. Snapshot-bound thread member windows
 
 `postgres_read::Snapshot::thread_emails` reads one thread's members in
 ascending received-date and Email-ID order, strictly after an optional
 coordinate. Shared passive `ports::ThreadEmail` and `ThreadEmails` values
-also serve the existing SQLite reader; its algorithm is unchanged. The
-window ceiling remains 256 members plus one validated overflow row.
+carry no storage authority. The window ceiling remains 256 members plus one validated overflow row.
 
 An absent stored thread returns `None`; an empty stored thread returns an
 empty window, leaving the existing JMAP rule that hides empty threads to the
@@ -1680,8 +1667,7 @@ Thread/get without activating PostgreSQL production dispatch.
 
 Schema version 12 adds `mailbox_create_receipts`. The
 `postgres_mailbox_create` adapter prepares at most 256 root-folder names,
-using the same bounded NFC/control/noncharacter validator as the existing
-SQLite adapter. Invalid names become the existing empty-name marker before
+using the shared bounded NFC/control/noncharacter validator. Invalid names become the existing empty-name marker before
 retaining and hashing the canonical request. Preparation retains random
 operation/object IDs and no device password. It runs outside the transaction
 under the selected profile's work limits and original deadline.
@@ -1702,7 +1688,7 @@ The complete receipt binds the canonical request and generated IDs and is
 checked before reauthorizing a fresh write. Owner-side inspection waits
 behind account publication; lost COMMIT response remains indeterminate until
 resolved with that same operation. Each account retains at most 1024 receipts;
-expiry/reclamation remains part of cutover work. Folder transactions have a
+expiry/reclamation remains part of runtime integration work. Folder transactions have a
 one-MiB output ceiling for bounded names and a one-MiB/1088-frame input budget.
 Preparation, publication and replay do not enable PostgreSQL serving.
 
@@ -1766,18 +1752,16 @@ Lost COMMIT response remains indeterminate until the same retained operation
 resolves. Historical receipts remain inspectable after later policy change,
 revocation, object deletion or body retirement. This does not grant a fresh
 write or a new body read. Reclamation of retained leases, submissions and
-operation receipts remains cutover work.
+operation receipts remains runtime integration work.
 
 ## 45. Shared receiving header preparation
 
 The storage-independent `receiving_headers` module owns the existing bounded
 root-header retention, Return-Path removal, supplied trace insertion and
-Message-ID/References/In-Reply-To selection used by receiving. The SQLite
-delivery adapter now consumes it through an explicit error mapping. Its
+Message-ID/References/In-Reply-To selection used by receiving. Its
 64 KiB output turns, source bounds, deadline checks and original work-meter
 charges are unchanged. The module grants no recipient, gateway or publication
-authority and performs no database access. PostgreSQL receiving publication
-and runtime integration remain cutover work.
+authority and performs no database access. PostgreSQL receiving owns publication and runtime authorization.
 
 ## 46. Retained SMTP receiving publication
 
@@ -1785,8 +1769,7 @@ Schema version 13 adds `receiving_receipts`. The owner-side `postgres_receiving`
 adapter prepares completed decoded DATA outside its write transaction. The
 trusted connection owner supplies envelope/socket facts and must already have
 admitted the peer, gateway and recipient routes under the selected profile.
-Passive receipt facts confer no authority. This increment opens no listener and
-does not replace the production SQLite receiving path.
+Passive receipt facts confer no authority. The receiving service supplies this trusted connection owner.
 
 Preparation validates bounded SMTP metadata, complete CRLF lines of at most
 1000 bytes, the selected message ceiling and a root-header ceiling of at most
@@ -1811,7 +1794,7 @@ Lost COMMIT responses are indeterminate. Inspect/replay waits behind the prior
 account publisher and uses the retained operation/digest; known success stays
 success after policy replacement. This is internal delivery recovery, not
 cross-session SMTP deduplication. Runtime connection/gateway authorization,
-ingress reservations, retention/reclamation and activation remain cutover work.
+ingress reservations, retention/reclamation and activation remain runtime integration work.
 
 ## 47. Verified submission input preparation
 
@@ -1866,7 +1849,7 @@ mismatch refuses replay. Historical success survives later revocation, source
 deletion or configuration replacement. Deleting the source after enqueueing
 does not cancel delivery or retire its separately owned outgoing body.
 Runtime admission, receipt reclamation, dispatch, fenced multi-instance queue
-ownership and activation remain cutover work.
+ownership and activation remain runtime integration work.
 
 ## 49. Selected named-route evidence
 
@@ -2000,7 +1983,7 @@ cap. No SMTP, scheduler or retry dispatcher is activated by this worker.
 `postgres runtime-check --connection-file PATH` checks the current schema and
 one dedicated runtime login's effective data privileges. It closes the
 connection before returning and neither grants privileges nor activates a
-profile. Startup/reconnect integration remains cutover work; a successful
+profile. Startup/reconnect integration remains runtime integration work; a successful
 cold check is not authority for a later connection.
 
 The initial runtime login must be separate from the owner, have no role
@@ -2098,7 +2081,7 @@ bytes only, not a device ID, cached verifier result or authorization grant.
 The existing local `basic` adapter uses this same parser and still checks the
 local registry before returning a device ID.
 
-At PostgreSQL cutover the bounded HTTPS request worker may retain this owner
+At PostgreSQL runtime integration the bounded HTTPS request worker may retain this owner
 for that request only, borrowing its password for fresh primary snapshot and
 publication checks. It must not cache the owner across requests or replace
 those checks with the result of earlier authentication. TLS, configured-origin
@@ -2142,7 +2125,7 @@ PostgreSQL read failures retain their typed errors; sink/format errors use
 `postgres_read::Error::Output` and do not imply database publication.
 The same-snapshot fixture exercises stored output across a concurrent Email
 removal, a later absent object, multi-page keywords and a refusing output sink.
-Service admission remains part of the atomic cutover.
+Service admission remains part of the runtime integration.
 
 ## 60. Worker-owned read views and fixed admission slots
 
@@ -2188,20 +2171,17 @@ The compatibility `with_blob` entry delegates to it. The download fixture
 checks pin identity/digest alongside its original empty, multi-chunk and
 maximum-body replay and cross-device/revocation refusals.
 
-The shared pin still lives at its existing `store_fs` API path during
-preparation, so root-header, MIME structure, body-value and attachment
-readers need no parser changes or replacement authority interface. Its local
-variant retains the same incremental SQLite handle, verification clock and
-drop custody. The PostgreSQL variant borrows the verified chunk reader;
-it adds no body copy, renewed work meter or deadline. Both representations
-are preparation plumbing, not a selectable production backend. The atomic
-cutover removes the local variant and relocates the surviving boundary.
+The shared `store_fs::PinnedBlob` borrows a verified PostgreSQL chunk reader.
+Root-header, MIME structure, body-value and attachment readers retain that
+borrow through their original request scope. There is no local-database
+variant, body copy, renewed work meter or renewed deadline. Unit MIME tests
+use a bounded memory implementation of the same verified-source interface.
 
 The real read fixture collects root headers through the existing MIME
 reader after another connection deletes the source Email/body. It checks
 pin identity/digest, original body bytes, sticky expiry even when swallowed
-by the callback, and refusal to grant a pin for corrupt bytes. The existing
-MIME/allocation fixtures continue to qualify the local representation.
+by the callback, and refusal to grant a pin for corrupt bytes. The shared MIME fixtures use bounded memory sources; real PostgreSQL
+fixtures separately qualify database custody.
 
 ## 62. Shared verified Email MIME projection
 
@@ -2230,7 +2210,7 @@ this shared projection. The PostgreSQL snapshot fixture invokes it after a
 concurrent source deletion and checks subject/address, decoded preview/text,
 body lists and locator output, plus a refusing response sink. Full native
 validation still exercises the real td-mail client against the active local
-service. PostgreSQL protocol/service activation remains the atomic cutover.
+service. PostgreSQL protocol/service activation remains the runtime integration.
 
 ## 63. HTTPS authentication off the network reactor
 
@@ -2260,10 +2240,10 @@ The handoff copies no secret and allocates no credential storage. Completion
 clears the owner before close, drain or refusal handling, including failed
 backend calls. EventSource retains its existing credential-free contract.
 
-The active local backend still uses its device registry guard. The HTTPS
-fixture checks the presented password against the observed device on the
-body worker for all three operations, including its second-device requests.
-This handoff prepares PostgreSQL operation adapters without activating them.
+The active PostgreSQL backend authenticates at this operation boundary. The
+HTTPS framing fixture checks the presented password against the observed
+device on the body worker for all three operations, including second-device
+requests; PostgreSQL fixtures separately prove database revocation fences.
 
 ## 65. PostgreSQL HTTPS authentication adapter
 
@@ -2283,9 +2263,9 @@ Malformed and inactive/wrong credentials return no device; configuration,
 schema, privilege and connection failures remain service errors, not invalid
 password observations. Errors carry no endpoint, secret or provider text.
 
-This adapter remains inactive until the atomic service cutover supplies its
+This adapter remains inactive until the runtime integration supplies its
 bootstrap, binding and shared clock. Service readiness/backoff and independent
-health/settlement capacity remain cutover obligations. The real PostgreSQL
+health/settlement capacity remain runtime integration obligations. The real PostgreSQL
 read fixture checks valid, malformed, wrong and revoked credentials, expired
 deadlines, rejection of owner credentials and subsequent successful lookup.
 A held table lock checks concurrent Busy refusal, finite lock failure and
@@ -2293,27 +2273,23 @@ in-flight deadline expiry, followed by successful lookup after release.
 
 ## 66. Response retention without a mail database
 
-The prepared `ResponseCoordinator` owns one cold, empty RequestSpool and a
-process-local response quota ledger. Construction consumes the spool and
-refuses occupied or retired slots; it opens no mail database and grants no
-mail authority. Its only reservation surface is response bytes. PostgreSQL
-remains responsible for durable quotas; the local ledger cannot reserve
-bodies, uploads or delivery responsibility.
+`ResponseCoordinator` owns one cold, empty RequestSpool and a process-local
+response quota ledger. Construction consumes the spool and refuses occupied
+or retired slots; it opens no mail database and grants no mail authority.
+Its only reservation surface is response bytes. PostgreSQL remains
+responsible for durable quotas; the local ledger cannot reserve bodies,
+uploads or delivery responsibility.
 
-Both the active local StoreCoordinator and this prepared owner use the same
-retention implementation: full-cap reservation before file creation, original
-work/deadline accounting, prepaid mutation output, and unlink-before-credit
-cleanup. Failed cleanup retains the full charge and retires the slot; ledger
-failure stops admission. The prepared owner refuses the legacy native-view
-and external-sort hooks. PostgreSQL method adapters must supply their own
-authenticated snapshots and bounded queries rather than accidentally opening
-a local view.
+Retention reserves the full cap before file creation, preserves original
+work/deadline accounting and prepaid mutation output, and unlinks before
+returning quota credit. Failed cleanup retains the full charge and retires
+the slot; ledger failure stops admission. Legacy native-view and external-sort
+hooks are removed. PostgreSQL method adapters supply their authenticated
+snapshots and bounded queries.
 
-The existing Core dispatcher runs against this owner without constructing a
-mail database. Fixtures cover complete echo output, quota saturation, prepaid
-output, successful cleanup, replacement-file uncertainty and sticky clock
-failure. Production still supplies the local coordinator until atomic cutover;
-the temporary owner enum and legacy hooks are preparation plumbing.
+The active service supplies this coordinator to the dispatcher. Fixtures
+cover complete echo output, quota saturation, prepaid output, successful
+cleanup, replacement-file uncertainty and sticky clock failure.
 
 ## 67. Prepared PostgreSQL Mailbox/get dispatch
 
@@ -2322,7 +2298,7 @@ snapshot and a response retention owner. Core/echo and connected Mail methods
 use the existing whole-request admission, argument parser, result references,
 method-error handling and retained response encoder. Unconnected methods return
 unknownMethod at this preparation boundary; they never fall through to the
-local database. Production remains on the existing backend until cutover.
+local database. The active service uses this backend.
 
 Mailbox/get obtains bounded names, hierarchy and counts from that snapshot,
 uses its identity for state, and uses the shared object encoder. Explicit
@@ -2400,7 +2376,7 @@ remain anchored to their existing start points.
 
 This prepares the PostgreSQL HTTP backend to reuse the exact request and
 response path. The helper owns no database authority and selects no backend;
-production service construction remains unchanged pending atomic cutover.
+the active receive/JMAP service constructs these owners.
 
 ## 72. Reserved fresh runtime reads
 
@@ -2422,7 +2398,7 @@ runtime integration. This entry prepares HTTP workers; it activates no role.
 
 `postgres_http_api::Service` connects the fixed HTTPS body-worker interface
 to the shared bounded HTTP framing and PostgreSQL read dispatcher. It remains
-inert until the atomic cutover. Its prepared Session, profile binding and
+inert until the runtime integration. Its prepared Session, profile binding and
 resource plan must agree; HTTPS, response retention and dispatch share one
 RuntimeClock. It implements Core/echo, Mailbox/get, Email/query and Email/get;
 uploads, mutations and EventSource remain unsupported here.
@@ -2472,7 +2448,7 @@ execution deadline and output allowance cover every page.
 
 Omitted or null IDs are refused as invalidArguments on this prepared path;
 td-mail supplies explicit IDs, and account-wide thread enumeration is outside
-this increment. Production remains on the local backend until atomic cutover.
+this increment. The active receive/JMAP service uses the PostgreSQL backend.
 The real-client PostgreSQL fixture also retrieves the delivered message by
 its thread ID and checks the returned ID and body.
 
@@ -2549,7 +2525,7 @@ then releases the flag-write fence. Absence, deadline, DNS or database failure
 preserves the original Change and fence. A confirmed success survives a late
 local deadline poll. The caller must retain the returned outcome as required
 by its own recovery workflow. Production scheduling, restart persistence and
-receipt reclamation remain cutover requirements.
+receipt reclamation remain runtime integration requirements.
 
 The real-client fixture checks absence does not clear uncertainty. A second
 prepared owner loses a COMMIT acknowledgement to a deadline and later settles
@@ -2615,7 +2591,7 @@ writes. Receipt settlement uses separately admitted capacity and never retries
 creation with a new identity. Absence and errors preserve the owner; confirmed
 outcomes survive local expiry. The encompassing prepared mutation owner keeps
 both operation families across requests. Restart persistence, settlement
-scheduling and receipt reclamation remain required before production cutover.
+scheduling and receipt reclamation remain required before runtime integration.
 
 Mailbox completion exposes only the original epoch and sequence, without a
 fabricated snapshot identity. The real td-mail fixture creates Archive, rejects
@@ -2658,7 +2634,7 @@ parsing or composition; the original request meter funds decoding, composition,
 hashing and prepaid publication work. A foreground database slot is reserved
 before DNS. No app password survives the synchronous call. Other mutation
 families retain their independent bounded owners. Runtime memory-plan
-qualification and durable restart ownership remain production cutover work.
+qualification and durable restart ownership remain runtime integration work.
 
 Uncertain COMMIT retains the original Draft and blocks new draft creation.
 Settlement uses separately admitted database capacity to inspect that exact
@@ -2781,7 +2757,7 @@ local-file fallback or second representation is introduced.
 
 Prepared read dispatch serves Identity/get through its freshly authenticated
 PostgreSQL snapshot and checks that snapshot before publishing the result.
-It does not open a local SQLite view. Account, epoch, selected configuration
+Account, epoch, selected configuration
 and deadline remain bound to that snapshot, while identity state depends on
 the visible configuration digest rather than the mail sequence. Catalog
 handles alone confer no live authorization.
@@ -2827,7 +2803,7 @@ at most 1024 returned IDs plus one lookahead, an optional same-snapshot total,
 and account/epoch/sequence/interpretation-bound Submission query state. The
 original read slot, SQL worker, authenticated snapshot and absolute deadline
 remain in force; a failure poisons the view. No JMAP dispatch, capability,
-recipient status projection or production PostgreSQL cutover is activated.
+recipient status projection or PostgreSQL service activation is activated.
 
 ## 93. Prepared td-mail submission-get projection
 
@@ -2870,13 +2846,12 @@ against receivedAt. Repeated date bounds intersect; foreign mailbox IDs and
 empty time windows match nothing. Distinct local mailbox conditions refuse rather
 than guessing their multi-membership intersection. Unknown filters, nested
 operators and non-AND operators refuse; malformed shapes and dates refuse.
-The active SQLite dispatcher retains its mailbox-only filter support.
 
 The same snapshot filters both the optional total and ordered page, preserving
 account isolation, receivedAt/EmailId ordering, lookahead and the original
 SQL deadline. The date decoder is shared with submission queries, including
 its numeric-position checks. This is an inert PostgreSQL read preparation;
-it does not enable Submission or the production backend cutover.
+it does not enable Submission or the runtime integration.
 
 ## 96. Prepared singleton submission mutation
 
@@ -2915,14 +2890,14 @@ Submission or activate the production PostgreSQL backend.
 
 ## 98. Prepared HTTP submission dispatch
 
-The inert PostgreSQL HTTP adapter admits the Submission capability and
+The PostgreSQL HTTP adapter can admit the Submission capability and
 routes a singleton EmailSubmission/set or td-mail's draft-and-submit batch
 to the prepared mutation dispatcher. It releases its fresh authenticated
 snapshot before mutations, retains the original response owner and deadline,
 and uses the shared pending owners for draft, submission and filing. Read
 requests can use Identity/get and submission reconciliation through the same
-admission path. Session metadata and the active SQLite HTTP adapter remain
-unchanged; production activation still requires atomic backend cutover.
+admission path. The active receive/JMAP service does not yet advertise
+Submission; the explicit real-client sending fixture qualifies this adapter.
 
 ## 99. Prepared plain-text sending Session and real-client qualification
 
@@ -2940,7 +2915,7 @@ and isolated fetch processes. A deliberately failed local draft retirement
 leaves td-mail's send record in place; its next attempt reconciles through
 submission query/get and retires the draft without adding a submission.
 Queue rows retain the desktop submitting profile's smarthost route. No SMTP
-relay, attachments, cloud-provider failover or production cutover is claimed.
+relay, attachments, cloud-provider failover or runtime integration is claimed.
 
 
 ## 100. Caller-funded upload preparation
@@ -2995,9 +2970,8 @@ blob download. An uncertain COMMIT returns an internal uncertain response
 whose bytes cannot be serialized. The HTTPS owner retires only that exchange
 without final success or temporary-failure output; the retained operation
 continues to fence uploads until settlement. Reads and the service remain
-available. SQLite confirmed responses retain their existing behavior.
-This remains prepared integration: production cutover, attachment composition,
-and resource/recovery activation are separate requirements.
+available. Attachment composition and complete recovery qualification remain
+separate requirements.
 
 
 ## 103. Caller-funded receiving preparation
@@ -3040,7 +3014,7 @@ the operation fenced. Passive SMTP receipt facts confer no peer, gateway or
 recipient authority: the trusted connection owner still owes those checks.
 
 This remains prepared integration. SMTP ingress/transport wiring, durable
-restart custody, maintenance and production backend cutover are not activated.
+restart custody, maintenance and runtime integration are not activated.
 The PostgreSQL runtime-role fixture covers known success, rollback, delayed
 COMMIT, refusal while pending, historical settlement, absent-receipt retention
 and stale-policy refusal.
@@ -3056,12 +3030,10 @@ deadline, retry and shutdown state machine. A known durable result remains
 separate from cleanup/accounting stop flags; uncertain publication still
 retires the active service under the existing production policy.
 
-The native adapter preserves current coordinator readiness, spool capacity,
-authorization guards, contention mappings and completion behavior. Production
-continues to construct only that adapter. This is a storage interface for the
-PostgreSQL cutover, not a new SMTP feature or an activated PostgreSQL listener.
-Existing real SMTP/TLS, storage refusal and shutdown fixtures exercise the
-same production adapter through the new boundary.
+The foreground service constructs the PostgreSQL adapter behind this
+interface. Its readiness, ingress capacity, authorization fences, contention
+mappings and completion behavior are exercised by the PostgreSQL worker and
+executable fixtures. The old local storage adapter is removed.
 
 
 ## 106. Fresh receiving readiness
@@ -3102,9 +3074,9 @@ facts; no gateway authority is inferred from message content.
 Known publication yields the account, epoch and sequence required for SMTP's
 final success reply. Unknown COMMIT retains the original operation in the
 publication owner, stops this backend and produces no final SMTP receipt.
-Historical settlement does not automatically restart this backend. Production
-still constructs only native storage; aggregate runtime admission, durable
-restart custody and atomic backend cutover remain separate work. The runtime
+Historical settlement does not automatically restart this backend. The
+foreground service constructs this PostgreSQL storage adapter; durable restart
+custody for uncertain operations remains a separate requirement. The runtime
 PostgreSQL fixture drives the SMTP session through admission, DATA and commit,
 including discarded ingress, sticky refusal, generation/clock mismatch,
 single ingress capacity, success, delayed COMMIT and historical settlement.
@@ -3675,7 +3647,7 @@ it retained. Confirmation releases it without credentials or a transport
 callback, including after device revocation. Neither password nor callback
 survives the foreground call. These are internal owner APIs, not a public
 settlement endpoint; production dispatch, relay-worker ownership/restart
-custody and atomic backend cutover remain separate work.
+custody and runtime integration remain separate work.
 
 ## 131. Borrowed cancellation patch decoding
 
@@ -3912,7 +3884,7 @@ process-lifetime pending custody, runtime clock/guard sharing and scheduler
 admission. No client-controlled address, credential or route enters this API;
 the supplied Claim binds current policy and the prepared route. Connection
 credentials are borrowed for each call and are not retained with the attempt.
-Production scheduler wiring and backend cutover remain separate work.
+Production scheduler wiring and runtime integration remain separate work.
 
 The real PostgreSQL fixture checks preparation-mode refusal, exhausted work,
 original deadlines, startup retry hold, fresh publication and envelope access,
@@ -5429,8 +5401,7 @@ and one-record-short prepayment refusal before MAIL output, and DATA outcomes
 while another ordinary slot is held. Both slots must be reusable while failed
 publication evidence is still retained. The configured full-attempt fixture
 also exercises the 100-recipient boundary and maximal normalized RCPT text
-under the original cap. SQLite remains active; this adds no production relay
-scheduler or backend cutover.
+under the original cap. Relay process scheduling remains unimplemented.
 
 ## 189. Productive command output pacing
 
@@ -5587,8 +5558,8 @@ and overflow refusal. Device enumeration leaves account sequences unchanged.
 --account ID --device ID` publishes one owner-side revocation in the
 preparation database. The protected connection input, fresh DNS resolution,
 verified TLS/SCRAM and overall ten-second worker deadline are the same as
-other explicit preparation commands. It grants no mail serving authority
-and does not change the active file registry or backend selection.
+other explicit administration commands. The committed revocation is visible
+to the active PostgreSQL authentication and operation fences.
 
 The command samples checked UTC milliseconds and prepares one random
 revocation operation before address attempts. It retains that exact value
@@ -6107,7 +6078,6 @@ The active serve command loads and validates the selected database profile
 and uses PostgreSQL SMTP storage, HTTPS authentication and JMAP adapters.
 CONFIG.md owns syntax and local runtime/scratch placement. Receive and JMAP
 roles are supported, including a JMAP-only instance; relay remains refused.
-The SQLite serving coordinator and device registry are removed from startup.
-Legacy local-store commands/library code remain pending removal and are not
-selectable serving backends. This is incremental replacement, not a live
-migration or a complete release qualification claim.
+The embedded backend, local-store commands and file-backed device registry
+are removed. This is not a live migration or a complete release qualification
+claim.

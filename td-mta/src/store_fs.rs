@@ -7,40 +7,12 @@ use std::{
     path::Path,
 };
 
-#[path = "store_fs/devices.rs"]
-mod devices;
-pub use crate::device_credentials::{
-    DeviceError, DevicePassword, DEVICE_CAPACITY, DEVICE_LABEL_BYTES,
-};
-pub use devices::DeviceStore;
-
-#[path = "store_fs/index.rs"]
-mod index;
-pub use index::{
-    smtp_trace_allowance, AuxiliaryUsage, BackupError, BackupReceipt, BlobAuthorization,
-    BlobReadRequest, BlobSource, CommitCompletion, CommitError, CommitFileUsage, CommitRequest,
-    Delivery, DeliveryAuthorization, DeliveryCompletion, DeliveryError, DeliveryGuard,
-    DeliveryPeer, DeliveryRequest, DraftAuthorization, DraftCompletion, DraftRequest,
-    EmailDestroyCompletion, EmailDestroyRequest, EmailDestroyResult, EmailMetadata, EmailUpdate,
-    EmailUpdateAuthorization, EmailUpdateCompletion, EmailUpdateRequest, EmailUpdateResult,
-    EmailValues, HistoryPruneRequest, HistoryPruned, IndexReadView, IndexStore, LedgerInitError,
-    LogicalUsage, MailboxAuthorization, MailboxCounts, MailboxCreateCompletion,
-    MailboxCreateRequest, MailboxCreateResult, NativeSortJob, ResponseCoordinator, ResponseError,
-    ResponseRetention, SortError, SortRetention, SortSource, SortWork, SortWorkspace,
-    StoreCoordinator, StoreFileUsage, StoreLogicalUsage, SubmissionAuthorization,
-    SubmissionCompletion, SubmissionError, SubmissionGuard, SubmissionRequest, ThreadEmail,
-    ThreadEmails, Upload, UploadAttempt, UploadAuthorization, UploadCleanup, UploadCompletion,
-    UploadError, UploadGuard, UploadMaintenance, UploadRequest, UploadSweepDisposition, UsageFence,
-    MAX_EMAIL_DESTROYS, MAX_EMAIL_UPDATES, MAX_EMAIL_VALUES, MAX_MAILBOX_COUNTS,
-    MAX_MAILBOX_CREATES, MAX_THREAD_EMAILS,
-};
-#[path = "store_fs/body_verify.rs"]
-mod body_verify;
-pub use body_verify::{BodyCheckLimits, CompleteBodies};
-
-#[path = "store_fs/account_verify.rs"]
-mod account_verify;
-pub use account_verify::{AccountCheckError, AccountCheckLimits};
+#[path = "store_fs/mutations.rs"]
+mod mutations;
+pub use mutations::*;
+#[path = "store_fs/response_retention.rs"]
+mod response_retention;
+pub use response_retention::{ResponseCoordinator, ResponseError, ResponseRetention};
 
 #[path = "store_fs/pinned.rs"]
 mod pinned;
@@ -91,12 +63,8 @@ fn cleanup_temporary(
 
 #[cfg(test)]
 pub use pinned::with_pinned_fixture;
+pub use pinned::PinnedBlob;
 pub(crate) use pinned::VerifiedSource;
-pub use pinned::{PinnedBlob, PinnedBlobInput};
-
-#[path = "store_fs/spool.rs"]
-mod spool;
-pub use spool::{IngressSpool, SpoolCapacity, SpoolInput, SpoolStatus, SpoolWriter};
 
 #[path = "store_fs/request_spool.rs"]
 mod request_spool;
@@ -354,7 +322,7 @@ fn trusted_owner(owner: u32, service: u32) -> bool {
 }
 
 /// Maximum bytes copied by one body read or write step.
-pub const MAX_FILE_STEP_BYTES: usize = crate::limits::SQLITE_BODY_CHUNK_BYTES;
+pub const MAX_FILE_STEP_BYTES: usize = crate::limits::BODY_CHUNK_BYTES;
 
 #[cfg(test)]
 pub fn with_probe_root(run: impl FnOnce(&mut LockedRoot)) {
@@ -397,9 +365,7 @@ pub(crate) mod tests {
         pub(crate) fn new() -> Self {
             Self::sized(false)
         }
-        pub(super) fn maximum_root() -> Self {
-            Self::sized(true)
-        }
+
         fn sized(maximum: bool) -> Self {
             static NEXT: AtomicU64 = AtomicU64::new(0);
             let base = fs::canonicalize(std::env::temp_dir()).unwrap();

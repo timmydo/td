@@ -108,20 +108,6 @@ fn observe<const N: usize>(scenario: &str, phases: [&str; N], run: impl FnOnce(&
 }
 
 fn main() {
-    if let Some(mode) = std::env::args()
-        .nth(1)
-        .and_then(|argument| sqlite_stack_scenario::from_argument(&argument))
-    {
-        sqlite_stack_scenario::run(mode);
-        return;
-    }
-    if let Some(mode) = std::env::args()
-        .nth(1)
-        .and_then(|argument| sqlite_body_scenario::Mode::from_argument(&argument))
-    {
-        sqlite_body(mode);
-        return;
-    }
     match std::env::args().nth(1).as_deref() {
         Some("--tls-clients") => observe("client", tls_allocation_scenario::PHASES, |f| {
             tls_allocation_scenario::run(f)
@@ -172,81 +158,3 @@ mod tls_generation_scenario;
 
 #[path = "support/tls_remote_chain_scenario.rs"]
 mod tls_remote_chain_scenario;
-
-use td_mta::metadata_sweep;
-#[cfg(test)]
-use td_mta::sync;
-pub use td_mta::{mailbox_sweep, reference_sweep};
-#[path = "../src/account_checks.rs"]
-#[allow(unused)] // Match the source-recompiled filesystem report types.
-mod account_checks;
-#[path = "../src/admission.rs"]
-#[allow(unused)] // Keep private ledger transitions with the recompiled storage core.
-mod admission;
-use td_mta::{
-    bounded, compose_text, config, external_sort, format, ids, limits, mailbox_parents, ownership,
-    ports, row_references, store_paths,
-};
-#[path = "../src/recipient_sweep.rs"]
-#[allow(dead_code)]
-mod recipient_sweep;
-#[path = "support/sqlite_body_scenario.rs"]
-mod sqlite_body_scenario;
-#[path = "support/sqlite_stack_scenario.rs"]
-mod sqlite_stack_scenario;
-pub use td_mta::smtp_wire;
-#[path = "../src/device_credentials.rs"]
-mod device_credentials;
-#[path = "../src/mailbox_name.rs"]
-mod mailbox_name;
-#[path = "../src/receiving_headers.rs"]
-mod receiving_headers;
-#[path = "../src/smtp_session.rs"]
-#[allow(unused)] // Keep the receiving context with the recompiled storage core.
-mod smtp_session;
-#[path = "../src/store_fs.rs"]
-#[allow(unused)]
-pub mod store_fs;
-use td_mta::{email_response, mailbox_response};
-
-fn sqlite_body(mode: sqlite_body_scenario::Mode) {
-    let phases = mode.phases();
-    let scenario = mode.scenario();
-
-    let mut observer = Observer::new();
-    let mut samples = vec![0; phases.len()];
-    let mut slots = samples.iter_mut();
-    let observe = || *slots.next().unwrap() = observer.sample();
-    sqlite_body_scenario::run(mode, observe);
-    assert!(slots.next().is_none());
-    let baseline = *samples.first().unwrap();
-    for rss in &samples {
-        // Sampled anonymous/file-backed process RSS, not a transient peak proof.
-        assert!(
-            rss.saturating_sub(baseline) <= 24 * 1024,
-            "32 MiB streamed body grew observed RSS by more than 24 MiB"
-        );
-    }
-    for (phase, rss) in phases.iter().zip(samples) {
-        println!("rss {scenario} {phase} {rss}");
-    }
-    println!("rss-observation-v2: {scenario} passed");
-}
-
-use td_mta::{header_select, mime_headers};
-
-#[path = "../src/transmitted_headers.rs"]
-#[allow(unused)] // Keep the coordinator with its source-recompiled native pin and meter.
-mod transmitted_headers;
-
-#[path = "../src/transmitted_copy.rs"]
-#[allow(unused)] // Keep the coordinator with its source-recompiled native pin and meter.
-mod transmitted_copy;
-
-#[path = "../src/submission_envelope.rs"]
-#[allow(unused)] // Keep the coordinator with its source-recompiled native pin and meter.
-mod submission_envelope;
-
-#[path = "../src/root_headers.rs"]
-#[allow(unused)] // Keep the coordinator with its source-recompiled native pin and meter.
-mod root_headers;

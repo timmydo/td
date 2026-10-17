@@ -60,8 +60,8 @@ value-pinned loop-device requests, which reach a freshly formatted volume
 through the disk claim the installer already holds.
 The twenty-second, `td-mta`, retains a safe library and adds one binary-only
 Linux termination-signal instruction boundary, for x86-64 and aarch64.
-Safe std owns database-path and lock operations; §22 also records the
-admitted private SQLite upstream FFI. The crypto admission
+Safe std owns local scratch-path and lock operations; §22 also records the
+admitted private PostgreSQL dependency boundary. The crypto admission
 is specified in [td-crypto/DESIGN.md](td-crypto/DESIGN.md). Test allocators
 remain separate. The twenty-third, `td-open`, compiles §12's module to send one
 file's descriptor to the portal and adopts none.
@@ -197,7 +197,7 @@ one.
 | 19 | `td-ui` | `recvmsg(2)`, `sendmsg(2)`, `fcntl(2)` pinned to `F_DUPFD_CLOEXEC` for the shared Wayland client transport and to `F_GETFL` and `F_SETFL` for the clipboard destination owner, `poll(2)` over exactly the connection's stream and its waker, `ioctl(2)` with five value-pinned PTY requests for the terminal's device, `setsid(2)` for a PTY child; plus one scoped descriptor adoption and one scoped pre-exec hook — see [§19](#19-td-ui--the-shared-wayland-client-transport) |
 | 20 | `td-taskmgr` | `pidfd_send_signal(2)`, retained procfs process directories, named signals or a fixed signal-zero self probe |
 | 21 | `td-install` | `ioctl(2)` with two value-pinned loop requests, `LOOP_CTL_GET_FREE` and `LOOP_CONFIGURE` — see [§21](#21-td-install--publishing-through-a-loop-over-the-claim) |
-| 22 | `td-mta` | binary-only `rt_sigprocmask(2)` with SIG_BLOCK and `rt_sigtimedwait(2)` with zero timeout, both pinned to SIGINT/SIGTERM; see [§22](#22-td-mta--termination-signals-and-private-sqlite-backend) |
+| 22 | `td-mta` | binary-only `rt_sigprocmask(2)` with SIG_BLOCK and `rt_sigtimedwait(2)` with zero timeout, both pinned to SIGINT/SIGTERM; see [§22](#22-td-mta--termination-signals-and-private-postgresql-backend) |
 | 23 | `td-open` | the shared `recvmsg(2)`, `sendmsg(2)`, `close(2)` module of §12, called only to send one descriptor; no adoption or disposal call — see [§23](#23-td-open--one-descriptor-to-the-portal) |
 
 The control-plane exception (`builder/src/sys.rs`) is described under The
@@ -3432,7 +3432,7 @@ detached it; the read-back reports that case rather than hiding it. Any
 further syscall, request, configured field or flag, caller, or allowance
 amends this section and `td-install/DESIGN.md`.
 
-## 22. `td-mta` — termination signals and private SQLite backend
+## 22. `td-mta` — termination signals and private PostgreSQL backend
 
 The library forbids `unsafe_code`. The binary denies it with exactly one
 function-scoped allowance in `signal_sys.rs`. Its private four-argument
@@ -3468,28 +3468,14 @@ separate signal sender. Both architectures require execution qualification.
 Filesystem operations use safe std APIs under STORAGE.md's stable-path
 contract. The separate test executables retain T1/T2/T3 below.
 
-The user-approved private rusqlite 0.40.2/libsqlite3-sys 0.38.2 closure
-contains upstream unsafe FFI and bundled SQLite 3.53.2 C, including its Unix
-VFS. Exact manifests, archives, lock and active features are pinned by
-builder/src/crypto_policy.rs. The owned consumers are store_fs/index.rs and its private
-index/relational.rs and index/relational/read.rs adapters. The schema-only
-index/relational/schema.rs supplies closed statements. They use rusqlite's
-safe API with bounded body-chunk inserts and indexed reads. Native connections, callbacks, SQL and backend
-types do not cross the mail port boundary. This SQLite admission adds no
-td-owned FFI, scoped allowance or syscall. Source-built bundled linking, disabled
-extension loading, fixed native heap/allocation limits and closed queries
-are specified in td-mta/STORAGE.md. This named backend admission does not
-permit new owned unsafe code or qualify native heap/stack/RSS by itself.
-
-The user-approved private tokio-postgres 0.7.18 closure also contains
+The user-approved private tokio-postgres 0.7.18 closure contains
 upstream unsafe and platform FFI, including its buffer, synchronization,
 entropy and operating-system support crates. Exact manifests, lock and
 active features are pinned by builder/src/crypto_policy.rs; the inventory
 is in td-crypto/DEPENDENCIES.md. Tokio runtime, network and time drivers
-are disabled. This inert dependency admission adds no td-owned unsafe,
-FFI, scoped allowance or syscall, and no PostgreSQL connector is active.
-Future safe adapters must retain the bounded I/O and authentication
-boundary in td-mta/POSTGRES.md; this admission does not permit new owned
+are disabled. This dependency admission adds no td-owned unsafe,
+FFI, scoped allowance or syscall. The safe adapters retain the bounded I/O
+and authentication boundary in td-mta/POSTGRES.md; this admission does not permit new owned
 unsafe code or establish runtime resource qualification.
 
 ## 23. `td-open` — one descriptor to the portal

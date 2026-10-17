@@ -38,7 +38,7 @@ impl SubmissionCanceler for RouteCancellation<'_> {
             })
     }
 }
-impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
+impl Worker<'_, '_, '_, '_, '_> {
     pub(super) fn submission_cancel(
         &mut self,
         access: SubmissionAccess<'_>,

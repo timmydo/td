@@ -1,9 +1,8 @@
 # Submission and relay contract
 
-[POSTGRES.md](POSTGRES.md) owns the agreed multi-instance PostgreSQL
-replacement target and atomic cutover boundary. Until that cutover, the
-SQLite/file-backed implementation and its contracts below remain active.
-PostgreSQL support and distributed delivery are not yet implemented.
+[POSTGRES.md](POSTGRES.md) owns active PostgreSQL storage and configuration.
+Receive/JMAP serving is implemented. Relay process integration remains
+incomplete and is refused; there is no alternative local database backend.
 
 This document is normative for M16/M17 and administration. FORMAT.md owns
 bytes; this document owns allowed states and transitions. It does not enable
@@ -99,13 +98,13 @@ final-view consistency check: retained replies do not establish transition
 history, worker identity or a valid fence. Those remain transaction/dispatcher
 obligations. Queue errors identify the submission and optional recipient ordinal.
 
-SQLite commits reuse that state validator for every submission affected by
+PostgreSQL publication reuses that state validator for every submission affected by
 submission or recipient PUT/DELETE, checking exact final ordinal coverage
 with indexed reads before COMMIT. A group inconsistency rolls back the entire
 transaction. The core also preserves existing immutable
 submission/envelope identity, the uncertainty latch, retained attempt history
 and one-way failure-notice state, plus an already-present completedAt, as
-specified in STORAGE.md. For an existing submission, None cannot advance
+specified in POSTGRES.md. For an existing submission, None cannot advance
 directly to Stored: Pending must commit first. An already completed
 submission with None must retain None. With an initially consistent group,
 first cancellation cannot introduce Pending: a final Canceled recipient
@@ -261,8 +260,8 @@ terminator handoff; the prepared BodySent boundary remains closed. The local
 connection/work allowance and preallocated reply evidence are specified in
 POSTGRES.md §§143–144; both remain passive and require separate live ownership.
 
-If a SQLite COMMIT has an indeterminate I/O result, stop the writer and
-reopen for SQLite recovery. Read the durable transaction state before retry;
+If PostgreSQL COMMIT has an indeterminate result, retain the pending
+operation and settle its durable receipt before retry, as POSTGRES.md specifies;
 the worker must not append an alternative result or continue transmitting
 after losing its durable phase fence. A crash between remote acceptance and
 local durability is inherently ambiguous. Retries use identical transmitted

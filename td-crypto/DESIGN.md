@@ -32,8 +32,7 @@ td-mta (library and packaging executable)
   -> td-json (std-only bounded JSON string framing)
   -> td-mime (std-only MIME/header/charset/Unicode implementation)
   -> td-nfc (std-only bounded canonical composition)
-  -> rusqlite (private bundled SQLite body/metadata backend)
-  -> tokio-postgres (private replacement preparation, runtime disabled)
+  -> tokio-postgres (private PostgreSQL backend, runtime disabled)
   -> td-crypto (td-owned API and private backend)
        -> rustls + aws-lc-rs + reviewed root data
 ```
@@ -43,29 +42,22 @@ admission, td-mta is this crate's only permitted roster consumer. The common
 gate must reject other direct or transitive consumers; the engine workspace
 and other std-only roster crates cannot inherit its external closure.
 
-The mail crate also has the explicitly approved private rusqlite 0.40.2
-closure with bundled SQLite 3.53.2. td-crypto does not consume SQLite.
-The mail lock also admits the user-approved tokio-postgres 0.7.18 closure
-with default features disabled, preparing the POSTGRES.md replacement. Its
-SCRAM authentication uses private hmac/sha2, stringprep and rand; md-5 also
-compiles in the upstream protocol crate, but no database authentication is
-activated by dependency admission. Future connection policy must refuse
-legacy authentication. These implementations stay inside the private mail
-driver and do not widen this crate's API or TLS provider. Tokio supplies I/O
-traits and synchronization only; its runtime/net/time features are absent.
-No other roster consumer is admitted.
-The common offline vendor uses the td-mta lock's union of crypto, SQLite and
-PostgreSQL sources, checking every archive checksum; td-crypto's selected 19-package
-normal/build graph is unchanged. Mail adds 61 selected packages beyond the crypto graph: seven for SQLite
-and 54 for PostgreSQL, listed in DEPENDENCIES.md, with no other roster
-consumer. The exact direct
-manifest and active graph are pinned alongside the existing crypto policy.
-Mail's STORAGE.md owns native SQL, limits, filesystem and recovery semantics.
-The shared host and portable drivers force bundled linking and reviewed
-LIBSQLITE3_FLAGS; ambient LIBSQLITE3_/SQLITE_/SQLITE3_ controls are refused.
-No pkg-config fallback, extension loading, bindgen or external database tool
-is selected. Native SQLite heap/stack/RSS and target qualification are new
-mail obligations, not established by earlier crypto-only measurements.
+The mail lock admits the user-approved tokio-postgres 0.7.18 closure
+with default features disabled. SCRAM authentication uses private hmac/sha2,
+stringprep and rand; md-5 compiles in the upstream protocol crate, but mail's
+connection policy refuses legacy database authentication. These implementations
+stay inside the private mail driver and do not widen this crate's API or TLS
+provider. Tokio supplies I/O traits and synchronization only; its runtime,
+net and time features are absent. No other roster consumer is admitted.
+
+The common offline vendor uses the mail lock's union of crypto and PostgreSQL
+sources, checking every archive checksum. Crypto's selected 19-package graph
+is unchanged; mail adds the 55 selected PostgreSQL packages listed in
+DEPENDENCIES.md. Exact manifests, locks and active features are pinned in the
+shared policy. Mail's POSTGRES.md owns SQL and database resource semantics;
+STORAGE.md owns local runtime and response scratch. Native mail qualification
+requires independently installed PostgreSQL binaries; these host test tools
+are not inputs to a target artifact.
 
 `td-crypto` does not depend on td-mta, its identifiers, configuration grammar,
 mail protocols, storage, logging, workers or service administration. Its own

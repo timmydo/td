@@ -1493,7 +1493,7 @@ fn real_postgres_mail_schema_bounds_references_and_rollback() {
     let digest = "decode(repeat('00',32),'hex')";
     sql(&fixture, &format!("INSERT INTO td_mta.accounts VALUES ({a},{max},{high}),({b},{zero},{zero}); INSERT INTO td_mta.blob_ids VALUES ({a},{a}),({a},{b})"));
     assert_eq!(sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='td_mta' AND c.relkind='r' AND c.relpersistence<>'p'"), "0");
-    assert_eq!(sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='td_mta' AND c.relkind='r'"), "48");
+    assert_eq!(sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='td_mta' AND c.relkind='r'"), "49");
     // Each expected refusal rolls back its own subtransaction. An unexpected
     // success raises a different SQLSTATE and fails psql with ON_ERROR_STOP.
     let refuse = |statement: String, state: &str| {
@@ -6179,7 +6179,12 @@ fn exercise_http_read(
     let responses =
         ResponseCoordinator::new(spool, &disk, &mut states, &mut cells, clock.clone()).unwrap();
     let slots = td_mta::postgres_read::ReadSlots::new(2).unwrap();
-    let session = td_mta::jmap_session::Session::mail_access(
+    let prepare_session = if drafts {
+        td_mta::jmap_session::Session::mail_submission
+    } else {
+        td_mta::jmap_session::Session::mail_access
+    };
+    let session = prepare_session(
         td_mta::config::endpoint::Origin::parse("https://localhost").unwrap(),
         td_mta::config::identities::AccountView {
             id: binding.account(),
@@ -8622,7 +8627,7 @@ fn exercise_receiving(
     let mut packed = vec![0; td_mta::format::row::MAX_RECEIPT_BYTES];
     let many = ReceiptRecipients::encode(&addresses, &mut packed).unwrap();
     let mut large = b"\r\n".to_vec();
-    let allowance = td_mta::store_fs::smtp_trace_allowance("mail.example.test").unwrap();
+    let allowance = td_mta::smtp_storage::trace_allowance("mail.example.test").unwrap();
     let limit = binding.upload_maximum().min(32 * 1024 * 1024) - allowance;
     let mut line = vec![b'x'; 998];
     line.extend_from_slice(b"\r\n");

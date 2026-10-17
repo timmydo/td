@@ -17,15 +17,14 @@ Direct inputs are Rustls 0.23.45 (std, TLS 1.2, AWS-LC), aws-lc-rs 1.18.1
 Rustls owns TLS, webpki validates certificates, pki-types represents their
 private backend forms; aws-lc-rs/sys supplies native crypto (AWS-LC 5.7.0).
 The remaining active packages are their build tools or small internal support
-libraries. The mail crate additionally selects private rusqlite 0.40.2
-(blob, bundled, hooks, limits) and its bundled SQLite 3.53.2 source. The crypto
-crate does not select SQLite. No async runtime is selected.
+libraries. Mail additionally selects the private PostgreSQL closure below.
+No async runtime is selected.
 
 The host native build uses the provisioned C compiler, assembler and archiver,
 plus the crate's pregenerated assembly and GNU/musl bindings. The forced
 host wrapper applies the x86-64 baseline, generic tuning, retained frame
 pointers, -g1 debug information and deterministic file-prefix mappings to
-both AWS-LC and SQLite C compilation. These flags do not change the selected
+AWS-LC C compilation. These flags do not change the selected
 dependency graph; host checks do not qualify the portable artifact. The build
 runs no Perl, Go, NASM, CMake or bindgen generator. The compatible versions, sysroots and
 runtime libraries for the portable build remain M03b2's pinned input set.
@@ -84,52 +83,17 @@ artifact packaging must retain all applicable notices, including root data.
 | windows_x86_64_msvc | 0.52.6 | inactive | MIT OR Apache-2.0 |
 | zeroize | 1.9.0 | active | Apache-2.0 OR MIT |
 
-The following seven packages are active only for td-mta. Bundled SQLite
-uses libsqlite3-sys's checked source archive and pregenerated bindings;
-its native notices remain inside that archive. License strings are the
-upstream package declarations, including their original slash spelling.
-
-| Package | Version | Selected graph | Upstream license expression |
-| --- | --- | --- | --- |
-| bitflags | 2.13.2 | mail only | MIT OR Apache-2.0 |
-| fallible-iterator | 0.3.0 | mail only | MIT/Apache-2.0 |
-| fallible-streaming-iterator | 0.1.9 | mail only | MIT/Apache-2.0 |
-| libsqlite3-sys | 0.38.2 | mail only | MIT |
-| rusqlite | 0.40.2 | mail only | MIT |
-| smallvec | 1.16.2 | mail only | MIT OR Apache-2.0 |
-| vcpkg | 0.2.15 | mail build support | MIT/Apache-2.0 |
-
-The shared offline vendor is prepared from the full mail lock; crypto's active
-graph remains unchanged. Both drivers force LIBSQLITE3_SYS_USE_PKG_CONFIG=0
-and reviewed native flags: OMIT_LOAD_EXTENSION, TEMP_STORE=3, MAX_MEMORY=16 MiB,
-MAX_ALLOCATION_SIZE=9 MiB, MAX_LENGTH=33558528, MAX_SQL_LENGTH=8192,
-MAX_PAGE_COUNT=2097152 and DEFAULT_CACHE_SIZE=-128. Ambient SQLite selection
-controls fail before Cargo. pkg-config/vcpkg support crates compile without
-selecting system SQLite. The same C frame-pointer/debug/remapping policy
-applies to the bundled amalgamation. Host tests establish neither an isolated
-portable SQLite build nor native maximum-input resource qualification.
-
-Bodies use one BLOB per row and the safe incremental BLOB API. The blob
-feature adds no packages. The native value ceiling covers a 32 MiB body
-plus bounded row overhead. Spilling and the 8 GiB combined page ceiling are
-specified in mail STORAGE.md.
-The individual allocation cap accommodates SQLite's contiguous checkpoint
-iterator: at the admitted maximum WAL it requests 8429736 bytes on x86-64,
-inside the unchanged shared 16 MiB heap. Mail [STORAGE.md](../td-mta/STORAGE.md)
-owns the calculation and explicit large-WAL refusal/truncation qualification.
-
-## PostgreSQL replacement preparation
+## PostgreSQL backend
 
 The user approved tokio-postgres plus its transitive dependencies. The driver
 pin is 0.7.18 with default features disabled and no optional integrations.
-Tokio 1.53.3 is also directly pinned with only io-util, for the upcoming
+Tokio 1.53.3 is also directly pinned with only io-util, for the
 private stream adapter; it adds no feature beyond the driver's closure.
-The mail lock adds 74 registry packages; 52 newly locked packages are active
+The mail lock adds 76 registry packages; 53 newly locked packages are active
 on x86-64 Linux. Previously locked cfg-if 1.0.5 and getrandom 0.4.3 also become
 active for mail only. Crypto's original selected graph is unchanged. The
 active-graph guard separately rejects driver version drift, Tokio runtime/
-net/time activation and a separate native-TLS connector. The existing SQLite
-backend stays active until the atomic replacement; there is no runtime switch.
+net/time activation and a separate native-TLS connector. PostgreSQL is the only mail backend.
 
 Tokio provides AsyncRead/AsyncWrite and synchronization without an executor,
 reactor or timer. bytes/futures/tokio-util support protocol buffering; phf,
@@ -158,6 +122,7 @@ manifest, lock and selected features are pinned by crypto_policy.rs.
 | --- | --- | --- | --- |
 | async-trait | 0.1.92 | active | MIT OR Apache-2.0 |
 | base64 | 0.22.1 | active | MIT OR Apache-2.0 |
+| bitflags | 2.13.2 | inactive | MIT OR Apache-2.0 |
 | block-buffer | 0.12.1 | active | MIT OR Apache-2.0 |
 | bumpalo | 3.20.3 | inactive | MIT OR Apache-2.0 |
 | byteorder | 1.5.0 | active | Unlicense OR MIT |
@@ -206,6 +171,7 @@ manifest, lock and selected features are pinned by crypto_policy.rs.
 | sha2 | 0.11.1 | active | MIT OR Apache-2.0 |
 | siphasher | 1.0.4 | active | MIT OR Apache-2.0 |
 | slab | 0.4.12 | inactive | MIT |
+| smallvec | 1.16.2 | active | MIT OR Apache-2.0 |
 | socket2 | 0.6.5 | active | MIT OR Apache-2.0 |
 | stringprep | 0.1.5 | active | MIT/Apache-2.0 |
 | syn | 3.0.9 | active | MIT OR Apache-2.0 |

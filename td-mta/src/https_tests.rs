@@ -8,7 +8,6 @@ use crate::{
     limits::Limits,
     ports::{Deadline, FlushProgress, Handshake, IoProgress, TlsTransport, Transport},
     smtp_receiving::Control,
-    store_fs::{tests::Fixture, DeviceStore},
     transport::TcpTransport,
 };
 use std::{
@@ -123,10 +122,7 @@ fn base64(bytes: &[u8]) -> String {
 #[test]
 fn https_enforces_auth_origin_framing_revocation_and_idle_deadlines() {
     let _serial = serial();
-    let fixture = Fixture::new();
-    let mut root = fixture.locked();
-    let mut devices =
-        DeviceStore::open_or_create(&mut root, AccountId::from_bytes([0xaa; 16])).unwrap();
+    let mut devices = TestCredentials::new(AccountId::from_bytes([0xaa; 16]));
     let (id, password) = devices
         .create(
             "client",
@@ -140,13 +136,13 @@ fn https_enforces_auth_origin_framing_revocation_and_idle_deadlines() {
     *last = if *last == b'0' { b'1' } else { b'0' };
     let incorrect = base64(&[b"private-user:".as_slice(), &incorrect].concat());
     let devices = Mutex::new(devices);
-    struct Delayed<'a, 'r> {
-        inner: &'a Mutex<DeviceStore<'r>>,
+    struct Delayed<'a> {
+        inner: &'a Mutex<TestCredentials>,
         armed: AtomicBool,
         entered: AtomicBool,
         released: AtomicBool,
     }
-    impl http_auth::Authenticator for Delayed<'_, '_> {
+    impl http_auth::Authenticator for Delayed<'_> {
         fn authenticate(
             &self,
             password: &[u8],
@@ -438,579 +434,6 @@ fn https_enforces_auth_origin_framing_revocation_and_idle_deadlines() {
 }
 
 #[test]
-fn https_uploads_commit_real_bodies_and_recheck_revocation() {
-    struct Credentials<'a, 'r> {
-        inner: &'a dyn crate::https_upload::Backend,
-        devices: &'a Mutex<DeviceStore<'r>>,
-        calls: AtomicU64,
-    }
-    impl Credentials<'_, '_> {
-        fn check(&self, credentials: &http_auth::BasicCredentials, device: DeviceId, bit: u64) {
-            assert_eq!(std::thread::current().name(), Some("https-body"));
-            assert_eq!(
-                self.devices
-                    .lock()
-                    .unwrap()
-                    .authenticate(credentials.password())
-                    .unwrap(),
-                Some(device)
-            );
-            self.calls.fetch_or(bit, Ordering::Relaxed);
-        }
-    }
-    impl crate::https_upload::Backend for Credentials<'_, '_> {
-        fn account(&self) -> AccountId {
-            self.inner.account()
-        }
-        fn session(&self) -> Option<&crate::jmap_session::Session> {
-            self.inner.session()
-        }
-        fn event_snapshot(
-            &self,
-            device: DeviceId,
-            deadline: Deadline,
-        ) -> Result<crate::jmap_events::Snapshot, Error> {
-            self.inner.event_snapshot(device, deadline)
-        }
-        fn receive(
-            &self,
-            request: crate::https_upload::Request<'_>,
-            transport: &mut dyn Transport,
-            control: &Control,
-        ) -> Result<crate::https_upload::Response, Error> {
-            self.check(request.credentials, request.device, 1);
-            self.inner.receive(request, transport, control)
-        }
-        fn api(
-            &self,
-            request: crate::https_api::Request<'_>,
-            transport: &mut dyn Transport,
-            control: &Control,
-        ) -> Result<(), crate::https_download::Failure> {
-            self.check(request.credentials, request.device, 2);
-            self.inner.api(request, transport, control)
-        }
-        fn download(
-            &self,
-            request: crate::https_download::Request<'_>,
-            transport: &mut dyn Transport,
-            control: &Control,
-        ) -> Result<(), crate::https_download::Failure> {
-            self.check(request.credentials, request.device, 4);
-            self.inner.download(request, transport, control)
-        }
-    }
-    use crate::{
-        admission::logical::Cell,
-        format::{key::Key, row::Row},
-        http_auth::DevicePolicy,
-        ids::{BlobId, StoreEpoch},
-        ownership::SlotState,
-        ports::ReadView,
-        store_fs::{AuxiliaryUsage, IndexStore, IngressSpool, StoreCoordinator},
-        wire,
-    };
-    let _serial = serial();
-    let account = AccountId::from_bytes([0xaa; 16]);
-    let device_fixture = Fixture::new();
-    let mut device_root = device_fixture.locked();
-    let mut registry = DeviceStore::open_or_create(&mut device_root, account).unwrap();
-    let (device, password) = registry
-        .create(
-            "upload",
-            1,
-            &mut td_crypto::SystemEntropy::try_new().unwrap(),
-        )
-        .unwrap();
-    let authorization = base64(&[b"private-user:".as_slice(), password.expose()].concat());
-    let devices = Mutex::new(registry);
-    let material = Material::new();
-    let socket = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = socket.local_addr().unwrap();
-    let origin_text = format!("https://localhost:{}", address.port());
-    let source = source(false)
-        .replace("https://localhost", &origin_text)
-        .replace("127.0.0.1:443", &address.to_string());
-    let lease = material.published(&source);
-    let resolved = resolved(&source);
-    let resource = Limits {
-        message_bytes: 131072,
-        event_streams: 1,
-        header_bytes: 512,
-        ..Limits::default()
-    }
-    .plan()
-    .unwrap();
-    let admission = DiskLimits::default()
-        .plan(&resource, WorkLimits::default(), ViewMode::OnlineBackground)
-        .unwrap();
-    let timeouts = NetworkLimits::default().plan(&admission).unwrap();
-    let clock = Arc::new(Now(Instant::now(), AtomicU64::new(0)));
-    let until = Deadline::after(clock.sample().unwrap().monotonic, 600_000).unwrap();
-    let data_fixture = Fixture::new();
-    let spool_fixture = Fixture::new();
-    let mut root = data_fixture.locked();
-    let mut spool_root = spool_fixture.locked();
-    let store = IndexStore::create(
-        &mut root,
-        StoreEpoch::from_bytes([3; 16]),
-        clock.clone(),
-        2,
-        until,
-    )
-    .unwrap();
-    store.create_account(account, until).unwrap();
-    let spool = IngressSpool::open(&mut spool_root, &resource, clock.clone(), until).unwrap();
-    let mut states = [const { SlotState::EMPTY }; 4];
-    let mut cells = [const { Cell::EMPTY }; 4];
-    let coordinator = StoreCoordinator::new(
-        store,
-        &admission,
-        AuxiliaryUsage {
-            sort_bytes: 0,
-            response_bytes: 0,
-            cache_bytes: 0,
-            log_bytes: 0,
-            cold_bytes: 0,
-        },
-        &mut states,
-        &mut cells,
-        DevicePolicy::new(&devices, clock.as_ref(), 1),
-        until,
-    )
-    .unwrap();
-    let uploads = crate::https_upload::Service {
-        resources: &resource,
-        coordinator: &coordinator,
-        spool: &spool,
-        account,
-        maximum: 131072,
-        clock: clock.as_ref(),
-        timeouts: &timeouts,
-    };
-    let response_fixture = Fixture::new();
-    let mut response_root = response_fixture.locked();
-    let request_spool =
-        crate::store_fs::RequestSpool::open(&mut response_root, clock.clone(), until).unwrap();
-    let session = crate::jmap_session::Session::mail_access(
-        Origin::parse(&origin_text).unwrap(),
-        crate::config::identities::AccountView {
-            id: account,
-            username: "private-user",
-            name: "Private",
-        },
-        &resource,
-        crate::jmap_session::Concurrency {
-            uploads: 1,
-            requests: 1,
-        },
-    )
-    .unwrap();
-    let api = crate::https_api::Service {
-        transfers: &uploads,
-        drafts: &uploads,
-        coordinator: &coordinator,
-        spool: &request_spool,
-        policy: DevicePolicy::new(&devices, clock.as_ref(), 1),
-        resources: &resource,
-        session: &session,
-        response_maximum: admission.disk().response_bytes,
-        clock: clock.as_ref(),
-        timeouts: &timeouts,
-    };
-    let api = Credentials {
-        inner: &api,
-        devices: &devices,
-        calls: AtomicU64::new(0),
-    };
-    let handshakes = HandshakePool::new(2).unwrap();
-    let ready = AtomicBool::new(false);
-    let control = Control::default();
-    let encoded_attachment = "QUFB".repeat(30000);
-    let decoded_attachment = "AAA".repeat(30000);
-    let mime = concat!(
-        "Content-Type: multipart/mixed; boundary=x\r\n\r\n",
-        "--x\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename*=utf-8''report%20%E2%98%83.bin\r\nContent-Transfer-Encoding: base64\r\n\r\nSGVsbG8=\r\n",
-        "--x\r\nContent-Type: text/plain\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\nline=0Aend\r\n",
-        "--x\r\nContent-Type: application/octet-stream\r\n\r\n\r\n--x--\r\n"
-    );
-    let mime = mime.replace("SGVsbG8=", &encoded_attachment);
-    let mime = mime.as_str();
-    let mime_length = format!("Content-Length: {}", mime.len());
-    let mut published = Vec::new();
-    let mut account_wire = [0; wire::IdKind::WIRE_BYTES];
-    let account_wire = wire::encode_id(account, &mut account_wire).unwrap();
-    resolved
-        .candidate()
-        .with_graph(|records, graph| {
-            let rows = records.view(graph).unwrap().listeners().unwrap();
-            let row = (0..rows.len())
-                .filter_map(|i| rows.listener(i).unwrap())
-                .find(|r| r.kind == Kind::Https)
-                .unwrap();
-            let listeners = [BoundListener::new(socket, row, &lease).unwrap()];
-            let mut server = Https {
-                uploads: Some(&api),
-                listeners: &listeners,
-                policies: &lease,
-                handshakes: &handshakes,
-                authentication: &devices,
-                origin: Origin::parse(&origin_text).unwrap(),
-                username: "private-user",
-                resources: &resource,
-                timeouts: &timeouts,
-                clock: clock.clone(),
-                ready: &ready,
-            };
-            let zero_events = Limits { event_streams: 0, ..*resource.limits() }.plan().unwrap();
-            server.resources = &zero_events;
-            assert_eq!(server.run(&Control::default()), Err(Error::Invalid));
-            server.resources = &resource;
-            std::thread::scope(|scope| {
-                let worker = scope.spawn(|| server.run(&control));
-                let stop = Stop(&control);
-                wait(|| ready.load(Ordering::Acquire));
-                let discovered = discovery_cases(address, &lease, clock.clone(), &authorization, session.bytes(), &devices);
-                let api_url = discovered["apiUrl"].as_str().unwrap();
-                let upload_url = discovered["uploadUrl"].as_str().unwrap().replace("{accountId}", account_wire);
-                let download_template = discovered["downloadUrl"].as_str().unwrap();
-                api_cases(address, &lease, clock.clone(), &authorization, account_wire, session.state().unwrap(), &resource, &devices, api_url);
-                draft_api_cases(address, &lease, clock.clone(), &authorization, account_wire, api_url, download_template);
-                assert_eq!(request_spool.status().occupied_slots, 0);
-                assert_eq!(coordinator.used(crate::admission::quota::Kind::ResponseBytes).unwrap(), 0);
-                let large = "x".repeat(65537);
-                for (framing, body, expected) in [
-                    ("Content-Length: 65537", large.as_str(), large.as_str()),
-                    ("Content-Length: 4", "body", "body"),
-                    ("Content-Length: 0", "", ""),
-                    (mime_length.as_str(), mime, mime),
-                    (
-                        "Transfer-Encoding: chunked",
-                        "2\r\nab\r\n2\r\ncd\r\n0\r\n\r\n",
-                        "abcd",
-                    ),
-                ] {
-                    let mut wire = client(address, &lease, clock.clone());
-                    let request = format!(
-                        "POST {upload_url} HTTP/1.1\r\n\
-                Host: localhost:{}\r\n\
-                Authorization: Basic {authorization}\r\n\
-                Content-Type: text/plain; charset=\"utf-8\"\r\n\
-                {framing}\r\n\
-                \r\n\
-                {body}",
-                        address.port()
-                    );
-                    let request = if body.is_empty() {
-                        request.replace("Content-Type: text/plain; charset=\"utf-8\"\r\n", "")
-                    } else {
-                        request
-                    };
-                    if body.is_empty() || body.len() > 16 {
-                        send(&mut wire, request.as_bytes());
-                    } else {
-                        let split = request.len() - body.len() + 1;
-                        send(&mut wire, &request.as_bytes()[..split]);
-                        for byte in request.as_bytes()[split..].chunks(1) {
-                            std::thread::sleep(Duration::from_millis(10));
-                            send(&mut wire, byte);
-                        }
-                    }
-                    let (status, body) = upload_reply(&mut wire);
-                    assert_eq!(status, 200, "{body}");
-                    let json = td_json::parse(&body).unwrap();
-                    assert_eq!(json["accountId"].as_str(), Some(account_wire));
-                    assert_eq!(
-                        json["type"].as_str(),
-                        Some(if expected.is_empty() {
-                            "application/octet-stream"
-                        } else {
-                            "text/plain; charset=\"utf-8\""
-                        })
-                    );
-                    assert_eq!(json["size"].as_u64(), Some(expected.len() as u64));
-                    let id = wire::Id::parse(json["blobId"].as_str().unwrap())
-                        .unwrap()
-                        .local::<BlobId>()
-                        .unwrap();
-                    published.push((id, expected.as_bytes().to_vec()));
-                    wire.abort();
-                    std::thread::sleep(Duration::from_millis(20));
-                    clock.1.fetch_add(2000, Ordering::Relaxed);
-                    let blob = json["blobId"].as_str().unwrap();
-                    let mut download = client(address, &lease, clock.clone());
-                    let target = download_template.replace("{accountId}", account_wire).replace("{blobId}", blob).replace("{name}", "report%20%E2%98%83.txt").replace("{type}", "text%2Fplain%3B%20charset%3Dutf-8");
-                    let head = format!("GET {target} HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: Basic {authorization}\r\n\r\n", address.port());
-                    send(&mut download, head.as_bytes());
-                    std::thread::sleep(Duration::from_millis(50));
-                    let (status, headers, bytes) = full_reply(&mut download);
-                    assert_eq!(status, 200);
-                    assert_eq!(bytes, expected);
-                    assert!(headers.contains("Content-Type: text/plain; charset=utf-8\r\n"));
-                    assert!(headers.contains("filename*=UTF-8''%72%65%70%6F%72%74%20%E2%98%83%2E%74%78%74"));
-                    assert!(!headers.contains(&authorization));
-                    download.abort();
-                    std::thread::sleep(Duration::from_millis(20));
-                    if expected == mime {
-                        use crate::wire::{PartLocator, TransferEncoding};
-                        let encoded = mime.find(&encoded_attachment).unwrap() as u64;
-                        let qp = mime.find("line=0Aend").unwrap() as u64;
-                        let empty = mime.rfind("\r\n--x--").unwrap() as u64;
-                        let cases = [
-                            (encoded, encoded_attachment.len() as u64, TransferEncoding::Base64, 200, decoded_attachment.as_str()),
-                            (qp, 10, TransferEncoding::QuotedPrintable, 200, "line\nend"),
-                            (empty, 0, TransferEncoding::Identity, 200, ""),
-                            (encoded + 1, 7, TransferEncoding::Base64, 404, ""),
-                            (encoded, encoded_attachment.len() as u64, TransferEncoding::Identity, 404, ""),
-                            ((mime.find("\r\n\r\n").unwrap() + 4) as u64, (mime.len() - mime.find("\r\n\r\n").unwrap() - 4) as u64, TransferEncoding::Identity, 404, ""),
-                            (mime.len() as u64, 1, TransferEncoding::Identity, 404, ""),
-                        ];
-                        for (offset, length, encoding, expected_status, decoded) in cases {
-                            clock.1.fetch_add(2000, Ordering::Relaxed);
-                            let locator = PartLocator { parent: id, offset, length, encoding };
-                            let mut encoded_id = [0; PartLocator::WIRE_BYTES];
-                            let part_id = locator.encode(&mut encoded_id).unwrap();
-                            let mut download = client(address, &lease, clock.clone());
-                            let target = download_template.replace("{accountId}", account_wire).replace("{blobId}", part_id).replace("{name}", "part.bin").replace("{type}", "application%2Foctet-stream");
-                            send(&mut download, format!("GET {target} HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: Basic {authorization}\r\n\r\n", address.port()).as_bytes());
-                            let (status, headers, bytes) = full_reply(&mut download);
-                            assert_eq!(status, expected_status, "part {offset}/{length}: {bytes}");
-                            if status == 200 {
-                                assert_eq!(bytes, decoded);
-                                assert!(headers.contains(&format!("Content-Length: {}\r\n", decoded.len())));
-                            }
-                            download.abort();
-                            std::thread::sleep(Duration::from_millis(20));
-                        }
-                    }
-                }
-                for (method, target, length, status) in [
-                    ("POST", format!("/jmap/upload/{account_wire}"), 131073, 413),
-                    ("POST", "/jmap/upload/absent".into(), 0, 404),
-                    ("GET", format!("/jmap/upload/{account_wire}"), 0, 405),
-                ] {
-                    let mut wire = client(address, &lease, clock.clone());
-                    let head = format!(
-                        "{method} {target} HTTP/1.1\r\n\
-                Host: localhost:{}\r\n\
-                Authorization: Basic {authorization}\r\n\
-                Content-Length: {length}\r\n\
-                Expect: 100-continue\r\n\
-                \r\n\
-                ",
-                        address.port()
-                    );
-                    send(&mut wire, head.as_bytes());
-                    assert_eq!(upload_reply(&mut wire).0, status);
-                    wire.abort();
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                for (media, length, sent_body, status) in [
-                    ("x".repeat(1025), 0, String::new(), 431),
-                    (String::new(), 0, String::new(), 400),
-                    ("application/octet-stream".into(), 131073, "x".repeat(33), 413),
-                ] {
-                    clock.1.fetch_add(1000, Ordering::Relaxed);
-                    let mut wire = client(address, &lease, clock.clone());
-                    let head = format!(
-                        "POST /jmap/upload/{account_wire} HTTP/1.1\r\n\
-                         Host: localhost:{}\r\n\
-                         Authorization: Basic {authorization}\r\n\
-                         Content-Type: {media}\r\n\
-                         Content-Length: {length}\r\n\r\n{sent_body}",
-                        address.port()
-                    );
-                    send(&mut wire, head.as_bytes());
-                    assert_eq!(upload_reply(&mut wire).0, status);
-                    wire.abort();
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                clock.1.fetch_add(1000, Ordering::Relaxed);
-
-                for (method, target, fields, status) in [
-                    ("GET", format!("/jmap/download/{account_wire}/absent/a?type=text%2Fplain"), "", 404),
-                    ("GET", "/jmap/download/absent/absent/a?type=text%2Fplain".into(), "", 404),
-                    ("GET", format!("/jmap/download/a{}/b{}/a?type=text%2Fplain", "bb".repeat(16), "11".repeat(16)), "", 404),
-                    ("POST", format!("/jmap/download/{account_wire}/absent/a?type=text%2Fplain"), "", 405),
-                    ("GET", format!("/jmap/download/{account_wire}/absent/a?type=text%2Fplain"), "Content-Length: 1\r\n", 400),
-                ] {
-                    clock.1.fetch_add(2000, Ordering::Relaxed);
-                    let mut rejected = client(address, &lease, clock.clone());
-                    send(&mut rejected, format!("{method} {target} HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: Basic {authorization}\r\n{fields}\r\n", address.port()).as_bytes());
-                    let (actual, headers, _) = full_reply(&mut rejected);
-                    assert_eq!(actual, status);
-                    if status == 405 {
-                        assert!(headers.contains("Allow: GET"));
-                    }
-                    rejected.abort();
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                let mut wire = client(address, &lease, clock.clone());
-                let head = format!(
-                    "POST /jmap/upload/{account_wire} HTTP/1.1\r\n\
-                Host: localhost:{}\r\n\
-                Authorization: Basic {authorization}\r\n\
-                Content-Length: 4\r\n\
-                Expect: 100-continue\r\n\
-                \r\n\
-                ",
-                    address.port()
-                );
-                assert!(request(&mut wire, head.as_bytes()).starts_with("HTTP/1.1 100 Continue"));
-                let mut concurrent = client(address, &lease, clock.clone());
-                send(&mut concurrent, head.as_bytes());
-                assert_eq!(upload_reply(&mut concurrent).0, 429);
-                concurrent.abort();
-                std::thread::sleep(Duration::from_millis(20));
-                let mut blocked = client(address, &lease, clock.clone());
-                send(&mut blocked, format!("GET /jmap/download/{account_wire}/absent/a?type=text%2Fplain HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: Basic {authorization}\r\n\r\n", address.port()).as_bytes());
-                assert_eq!(upload_reply(&mut blocked).0, 429);
-                blocked.abort();
-                std::thread::sleep(Duration::from_millis(30));
-                let mut api_blocked = client(address, &lease, clock.clone());
-                send(&mut api_blocked, format!(
-                    "POST /jmap/api HTTP/1.1\r\nHost: localhost:{}\r\n\
-                     Authorization: Basic {authorization}\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{{}}",
-                    address.port()
-                ).as_bytes());
-                assert_eq!(upload_reply(&mut api_blocked).0, 503);
-                api_blocked.abort();
-                devices.lock().unwrap().revoke(device, 2).unwrap();
-                send(&mut wire, b"lost");
-                assert_eq!(upload_reply(&mut wire).0, 403);
-                wire.abort();
-                std::thread::sleep(Duration::from_millis(20));
-                clock.1.fetch_add(1000, Ordering::Relaxed);
-                let (_, second) = devices
-                    .lock()
-                    .unwrap()
-                    .create(
-                        "cancel",
-                        3,
-                        &mut td_crypto::SystemEntropy::try_new().unwrap(),
-                    )
-                    .unwrap();
-                let second = base64(&[b"private-user:".as_slice(), second.expose()].concat());
-                let mut blob_wire = [0; wire::IdKind::WIRE_BYTES];
-                let blob_wire = wire::encode_id(published[0].0, &mut blob_wire).unwrap();
-                for (credential, status) in [(&authorization, 401), (&second, 404)] {
-                    clock.1.fetch_add(2000, Ordering::Relaxed);
-                    let mut denied = client(address, &lease, clock.clone());
-                    send(&mut denied, format!("GET /jmap/download/{account_wire}/{blob_wire}/a?type=text%2Fplain HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: Basic {credential}\r\n\r\n", address.port()).as_bytes());
-                    assert_eq!(upload_reply(&mut denied).0, status);
-                    denied.abort();
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                let mut cancelled = client(address, &lease, clock.clone());
-                let cancel_head = head.replace(&authorization, &second);
-                assert!(request(&mut cancelled, cancel_head.as_bytes())
-                    .starts_with("HTTP/1.1 100 Continue"));
-                let mut event_shutdown = client(address, &lease, clock.clone());
-                let event_head = format!("GET /jmap/events?types=*&closeafter=no&ping=0 HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: Basic {second}\r\n\r\n", address.port());
-                assert!(request(&mut event_shutdown, event_head.as_bytes()).starts_with("HTTP/1.1 200 OK"));
-                drop(stop);
-                worker.join().unwrap().unwrap();
-                cancelled.abort();
-                finish_event(&mut event_shutdown);
-            });
-        })
-        .unwrap();
-    assert_eq!(api.calls.load(Ordering::Relaxed), 7);
-    assert_eq!(spool.status().unwrap().occupied_slots, 0);
-    assert_eq!(
-        coordinator
-            .used(crate::admission::quota::Kind::BodyBytes)
-            .unwrap(),
-        65545 + mime.len() as u64
-    );
-    assert_eq!(
-        coordinator
-            .used(crate::admission::quota::Kind::UploadBytes)
-            .unwrap(),
-        65545 + mime.len() as u64
-    );
-    drop(coordinator);
-    let store = IndexStore::open(&mut root, clock, 2, until).unwrap();
-    store.validate_integrity(until).unwrap();
-    let mut view = store.view(account, until).unwrap();
-    let mut after: Option<BlobId> = None;
-    let mut count = 0;
-    loop {
-        let mut key = [0; 16];
-        let mut row = [0; 128];
-        let Some(record) = view
-            .next(
-                crate::format::Table::Blobs,
-                after.as_ref().map(|id| id.as_bytes().as_slice()),
-                &mut key,
-                &mut row,
-            )
-            .unwrap()
-        else {
-            break;
-        };
-        let Key::Blob(id) = record.key else {
-            panic!("unexpected blob key");
-        };
-        after = Some(id);
-        count += 1;
-    }
-    assert_eq!(count, published.len());
-    for (id, expected) in published {
-        let mut row = [0; 128];
-        assert!(
-            matches!(view.get(Key::Lease(id), &mut row).unwrap().unwrap().0, Row::Lease(lease) if lease.device == device)
-        );
-        let mut input = view
-            .open_blob_input(&td_crypto::Provider, id, 131072)
-            .unwrap();
-        let mut bytes = vec![0; expected.len()];
-        let mut read = 0;
-        while read < bytes.len() {
-            let n = input.read(&mut bytes[read..]).unwrap();
-            assert!(n > 0);
-            read += n;
-        }
-        assert_eq!(bytes, expected);
-        input.finish().unwrap();
-    }
-}
-
-fn upload_reply(client: &mut impl Transport) -> (u16, String) {
-    let (status, _, body) = full_reply(client);
-    (status, body)
-}
-fn full_reply(client: &mut impl Transport) -> (u16, String, String) {
-    let mut bytes = Vec::new();
-    let mut scratch = [0; 1024];
-    wait(|| {
-        match client.read(&mut scratch).unwrap() {
-            IoProgress::Bytes(n) => bytes.extend_from_slice(&scratch[..n]),
-            IoProgress::Pending => (),
-            IoProgress::Closed => panic!("upload closed before complete response"),
-        }
-        let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") else {
-            return false;
-        };
-        let head = std::str::from_utf8(&bytes[..end]).unwrap();
-        let length: usize = head
-            .lines()
-            .find_map(|line| line.strip_prefix("Content-Length: "))
-            .unwrap()
-            .parse()
-            .unwrap();
-        bytes.len() == end + 4 + length
-    });
-    let response = String::from_utf8(bytes).unwrap();
-    let (head, body) = response.split_once("\r\n\r\n").unwrap();
-    (
-        head.split_whitespace().nth(1).unwrap().parse().unwrap(),
-        head.to_owned(),
-        body.to_owned(),
-    )
-}
-
-#[test]
 fn stopped_upload_receipt_retires_after_expiry_or_shutdown() {
     for late in [false, true] {
         stopped_upload_receipt(Some(late));
@@ -1046,10 +469,8 @@ fn stopped_upload_receipt(late: Option<bool>) {
         }
     }
     let _serial = serial();
-    let fixture = Fixture::new();
-    let mut root = fixture.locked();
     let account = AccountId::from_bytes([0xaa; 16]);
-    let mut devices = DeviceStore::open_or_create(&mut root, account).unwrap();
+    let mut devices = TestCredentials::new(account);
     let (_, password) = devices
         .create("late", 1, &mut td_crypto::SystemEntropy::try_new().unwrap())
         .unwrap();
@@ -1197,10 +618,8 @@ fn download_failures_release_shared_slot_and_shutdown_joins_streaming() {
         }
     }
     let _serial = serial();
-    let fixture = Fixture::new();
-    let mut root = fixture.locked();
     let account = AccountId::from_bytes([0xaa; 16]);
-    let mut devices = DeviceStore::open_or_create(&mut root, account).unwrap();
+    let mut devices = TestCredentials::new(account);
     let (_, password) = devices
         .create("late", 1, &mut td_crypto::SystemEntropy::try_new().unwrap())
         .unwrap();
@@ -1323,523 +742,83 @@ fn download_failures_release_shared_slot_and_shutdown_joins_streaming() {
         .unwrap();
 }
 
-#[allow(clippy::too_many_arguments)]
-fn api_cases(
-    address: std::net::SocketAddr,
-    lease: &GenerationLease<TlsPolicies>,
-    clock: Arc<Now>,
-    authorization: &str,
-    account: &str,
-    state: &str,
-    resources: &crate::limits::ResourcePlan,
-    devices: &Mutex<DeviceStore<'_>>,
-    api_url: &str,
-) {
-    let calls = format!(
-        r##"{{"using":["urn:ietf:params:jmap:core"],"createdIds":{{"seed":"seed-id"}},"methodCalls":[
-        ["Core/echo",{{"x":"hello"}},"a"],
-        ["Core/echo",{{"#x":{{"resultOf":"a","name":"Core/echo","path":"/x"}}}},"b"],
-        ["PushSubscription/get",{{}},"c"],
-        ["PushSubscription/set",{{"create":{{"new":{{}}}}}},"d"],
-        ["Blob/copy",{{"fromAccountId":"{account}","accountId":"{account}","blobIds":[]}},"e"],
-        ["No/method",{{}},"f"]]}}"##
-    );
-    let long = format!(
-        r#"{{"using":["urn:ietf:params:jmap:core"],"methodCalls":[["Core/echo",{{"long":"{}"}},"a"]]}}"#,
-        "x".repeat(65537)
-    );
-    let too_many = format!(
-        r#"{{"using":["urn:ietf:params:jmap:core"],"methodCalls":[{}]}}"#,
-        vec![r#"["Core/echo",{},"a"]"#; resources.limits().json_methods + 1].join(",")
-    );
-    for (body, chunked, status, problem_type) in [
-        (calls.as_str(), false, 200, ""),
-        (calls.as_str(), true, 200, ""),
-        (long.as_str(), false, 200, ""),
-        ("{", false, 400, "notJSON"),
-        ("[]", false, 400, "notRequest"),
-        (
-            r#"{"using":["urn:unknown"],"methodCalls":[]}"#,
-            false,
-            400,
-            "unknownCapability",
-        ),
-        (too_many.as_str(), false, 400, "limit"),
-    ] {
-        clock.1.fetch_add(2000, Ordering::Relaxed);
-        let mut wire = client(address, lease, clock.clone());
-        let framing = if chunked {
-            "Transfer-Encoding: chunked".to_owned()
-        } else {
-            format!("Content-Length: {}", body.len())
-        };
-        let interim = if chunked {
-            "Expect: 100-continue\r\n"
-        } else {
-            ""
-        };
-        let head = format!("POST {api_url} HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: Basic {authorization}\r\nContent-Type: application/json; charset=utf-8\r\n{framing}\r\n{interim}\r\n", address.port());
-        let body_wire = if chunked {
-            format!("{:x}\r\n{body}\r\n0\r\n\r\n", body.len())
-        } else {
-            body.to_owned()
-        };
-        if chunked {
-            assert!(request(&mut wire, head.as_bytes()).starts_with("HTTP/1.1 100 Continue"));
-            send(&mut wire, body_wire.as_bytes());
-        } else {
-            send(&mut wire, format!("{head}{body_wire}").as_bytes());
-        }
-        let (actual, headers, reply) = full_reply(&mut wire);
-        assert_eq!(actual, status, "{reply}");
-        assert!(headers.contains("X-Content-Type-Options: nosniff"));
-        let json = td_json::parse(&reply).unwrap();
-        if status == 200 {
-            assert_eq!(json["sessionState"].as_str(), Some(state));
-            if body == long {
-                assert_eq!(
-                    json["methodResponses"][0][1]["long"].as_str(),
-                    Some("x".repeat(65537).as_str())
-                );
-            } else {
-                assert_eq!(json["methodResponses"][1][1]["x"].as_str(), Some("hello"));
-                assert_eq!(
-                    json["methodResponses"][2][1]["list"]
-                        .as_array()
-                        .unwrap()
-                        .len(),
-                    0
-                );
-                assert_eq!(
-                    json["methodResponses"][3][1]["notCreated"]["new"]["type"].as_str(),
-                    Some("forbidden")
-                );
-                assert_eq!(
-                    json["methodResponses"][4][1]["type"].as_str(),
-                    Some("invalidArguments")
-                );
-                assert_eq!(
-                    json["methodResponses"][5][1]["type"].as_str(),
-                    Some("unknownMethod")
-                );
-                assert_eq!(json["createdIds"]["seed"].as_str(), Some("seed-id"));
-            }
-        } else {
-            assert!(headers.contains("Content-Type: application/problem+json"));
-            assert_eq!(
-                json["type"].as_str(),
-                Some(format!("urn:ietf:params:jmap:error:{problem_type}").as_str())
-            );
-            if problem_type == "limit" {
-                assert_eq!(json["limit"].as_str(), Some("maxCallsInRequest"));
-            }
-        }
-        finish_api(&mut wire);
-    }
-    for (method, media, length, status) in [
-        ("GET", "application/json", 0, 405),
-        ("POST", "text/plain", 0, 415),
-        (
-            "POST",
-            "application/json",
-            resources.limits().json_bytes + 1,
-            400,
-        ),
-    ] {
-        clock.1.fetch_add(2000, Ordering::Relaxed);
-        let mut wire = client(address, lease, clock.clone());
-        let head = format!("{method} {api_url} HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: Basic {authorization}\r\nContent-Type: {media}\r\nContent-Length: {length}\r\nExpect: 100-continue\r\n\r\n", address.port());
-        send(&mut wire, head.as_bytes());
-        let (actual, _, body) = full_reply(&mut wire);
-        assert_eq!(actual, status);
-        if status == 400 {
-            assert_eq!(
-                td_json::parse(&body).unwrap()["limit"].as_str(),
-                Some("maxSizeRequest")
-            );
-        }
-        finish_api(&mut wire);
-    }
-    clock.1.fetch_add(2000, Ordering::Relaxed);
-    let head = format!(
-        "POST {api_url} HTTP/1.1\r\nHost: localhost:{}\r\n\
-         Authorization: Basic {authorization}\r\nContent-Type: application/json\r\n\
-         Content-Length: 2\r\nExpect: 100-continue\r\n\r\n",
-        address.port()
-    );
-    let mut held = client(address, lease, clock.clone());
-    assert!(request(&mut held, head.as_bytes()).starts_with("HTTP/1.1 100 Continue"));
-    let mut busy = client(address, lease, clock.clone());
-    send(&mut busy, head.as_bytes());
-    let (status, headers, body) = full_reply(&mut busy);
-    assert_eq!(status, 429);
-    assert!(headers.contains("application/problem+json"));
-    assert_eq!(
-        td_json::parse(&body).unwrap()["limit"].as_str(),
-        Some("maxConcurrentRequests")
-    );
-    finish_api(&mut busy);
-    let mut binary = client(address, lease, clock.clone());
-    send(&mut binary, format!("POST /jmap/upload/{account} HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: Basic {authorization}\r\nContent-Type: text/plain\r\nContent-Length: 0\r\n\r\n", address.port()).as_bytes());
-    assert_eq!(full_reply(&mut binary).0, 503);
-    finish_api(&mut binary);
-    send(&mut held, b"{}");
-    assert_eq!(upload_reply(&mut held).0, 400);
-    finish_api(&mut held);
-
-    clock.1.fetch_add(2000, Ordering::Relaxed);
-    let mut oversized = client(address, lease, clock.clone());
-    assert!(request(
-        &mut oversized,
-        head.replace("Content-Length: 2", "Transfer-Encoding: chunked")
-            .as_bytes()
-    )
-    .starts_with("HTTP/1.1 100 Continue"));
-    send(
-        &mut oversized,
-        format!("{:x}\r\n", resources.limits().json_bytes + 1).as_bytes(),
-    );
-    let (status, _, body) = full_reply(&mut oversized);
-    assert_eq!(status, 400);
-    assert_eq!(
-        td_json::parse(&body).unwrap()["limit"].as_str(),
-        Some("maxSizeRequest")
-    );
-    finish_api(&mut oversized);
-
-    clock.1.fetch_add(2000, Ordering::Relaxed);
-    let (device, password) = devices
-        .lock()
-        .unwrap()
-        .create(
-            "api-revoke",
-            1,
-            &mut td_crypto::SystemEntropy::try_new().unwrap(),
-        )
-        .unwrap();
-    let temporary = base64(&[b"private-user:".as_slice(), password.expose()].concat());
-    let mut revoked = client(address, lease, clock.clone());
-    assert!(request(
-        &mut revoked,
-        head.replace(authorization, &temporary).as_bytes()
-    )
-    .starts_with("HTTP/1.1 100 Continue"));
-    devices.lock().unwrap().revoke(device, 2).unwrap();
-    send(&mut revoked, b"{}");
-    assert_eq!(upload_reply(&mut revoked).0, 403);
-    finish_api(&mut revoked);
-
-    clock.1.fetch_add(2000, Ordering::Relaxed);
-    let mut idle = client(address, lease, clock.clone());
-    assert!(request(&mut idle, head.as_bytes()).starts_with("HTTP/1.1 100 Continue"));
-    clock.1.fetch_add(16000, Ordering::Relaxed);
-    assert_eq!(upload_reply(&mut idle).0, 503);
-    finish_api(&mut idle);
+struct TestCredentials {
+    account: AccountId,
+    credential: Option<crate::device_credentials::Credential>,
 }
-
-fn finish_api(wire: &mut impl Transport) {
-    let mut bytes = [0; 1024];
-    wait(|| match wire.read(&mut bytes) {
-        Ok(IoProgress::Pending) => false,
-        Ok(IoProgress::Closed) | Err(_) => true,
-        other => panic!("unexpected bytes after complete API response: {other:?}"),
-    });
-    wire.abort();
-}
-
-fn discovery_cases(
-    address: std::net::SocketAddr,
-    lease: &GenerationLease<TlsPolicies>,
-    clock: Arc<Now>,
-    authorization: &str,
-    session: &[u8],
-    devices: &Mutex<DeviceStore<'_>>,
-) -> td_json::Json {
-    let mut discovered = None;
-    for (target, host, status) in [
-        (
-            "/.well-known/jmap".to_owned(),
-            format!("localhost:{}", address.port()),
-            200,
-        ),
-        (
-            format!("HTTPS://LOCALHOST:{}/.well-known/jmap", address.port()),
-            "other.example".to_owned(),
-            200,
-        ),
-        (
-            format!("https://localhost:{}?x=1", address.port()),
-            format!("localhost:{}", address.port()),
-            404,
-        ),
-        (
-            "/?x=1".to_owned(),
-            format!("localhost:{}", address.port()),
-            404,
-        ),
-        (
-            "https://other.example/.well-known/jmap".to_owned(),
-            format!("localhost:{}", address.port()),
-            421,
-        ),
-        (
-            format!("http://localhost:{}/.well-known/jmap", address.port()),
-            format!("localhost:{}", address.port()),
-            421,
-        ),
-    ] {
-        clock.1.fetch_add(2000, Ordering::Relaxed);
-        let mut wire = client(address, lease, clock.clone());
-        send(&mut wire, format!("GET {target} HTTP/1.1\r\nHost: {host}\r\nAuthorization: Basic {authorization}\r\n\r\n").as_bytes());
-        let (actual, headers, body) = full_reply(&mut wire);
-        assert_eq!(actual, status);
-        if status == 200 {
-            assert_eq!(body.as_bytes(), session);
-            assert!(headers
-                .lines()
-                .any(|line| line == "Content-Type: application/json"));
-            let json = td_json::parse(&body).unwrap();
-            assert!(json["capabilities"]["urn:ietf:params:jmap:core"]
-                .as_obj()
-                .is_some());
-            assert_eq!(json["capabilities"].as_obj().unwrap().len(), 2);
-            assert!(json["capabilities"]["urn:ietf:params:jmap:mail"]
-                .as_obj()
-                .is_some());
-            discovered = Some(json);
+impl TestCredentials {
+    fn new(account: AccountId) -> Self {
+        Self {
+            account,
+            credential: None,
         }
-        finish_event(&mut wire);
     }
-    let discovered = discovered.unwrap();
-    let event_template = discovered["eventSourceUrl"].as_str().unwrap();
-    let api_url = discovered["apiUrl"].as_str().unwrap();
-    let event_head = |auth: &str, ping: u64| {
-        let target = event_template
-            .replace("{types}", "%2A")
-            .replace("{closeafter}", "state")
-            .replace("{ping}", &ping.to_string());
-        format!("GET {target} HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: Basic {auth}\r\nLast-Event-ID: unknown\r\n\r\n", address.port())
-    };
-    clock.1.fetch_add(2000, Ordering::Relaxed);
-    let (device, password) = devices
-        .lock()
-        .unwrap()
-        .create(
-            "events",
-            1,
-            &mut td_crypto::SystemEntropy::try_new().unwrap(),
-        )
-        .unwrap();
-    let temporary = base64(&[b"private-user:".as_slice(), password.expose()].concat());
-    let mut stream = client(address, lease, clock.clone());
-    let headers = request(&mut stream, event_head(&temporary, 1).as_bytes());
-    assert!(headers.starts_with("HTTP/1.1 200 OK"));
-    assert!(headers.contains("Content-Type: text/event-stream"));
-    assert!(!headers.contains("Content-Length:"));
+    fn create(
+        &mut self,
+        _: &str,
+        _: u64,
+        entropy: &mut impl td_crypto::Entropy,
+    ) -> Result<(DeviceId, crate::device_credentials::DevicePassword), Error> {
+        let (credential, password) = crate::device_credentials::generate(self.account, entropy)
+            .map_err(|_| Error::Invalid)?;
+        let id = credential.id;
+        self.credential = Some(credential);
+        Ok((id, password))
+    }
+    fn revoke(&mut self, id: DeviceId, _: u64) -> Result<(), Error> {
+        if self.credential.as_ref().map(|c| c.id) != Some(id) {
+            return Err(Error::NotFound);
+        }
+        self.credential = None;
+        Ok(())
+    }
+}
+impl http_auth::Authenticator for Mutex<TestCredentials> {
+    fn authenticate(&self, password: &[u8], _: Deadline) -> Result<Option<DeviceId>, Error> {
+        let registry = self.try_lock().map_err(|_| Error::Busy)?;
+        let Some(credential) = &registry.credential else {
+            return Ok(None);
+        };
+        let Some(presented) = crate::device_credentials::Presented::parse(password) else {
+            return Ok(None);
+        };
+        Ok((presented.id() == credential.id
+            && presented
+                .matches(registry.account, &credential.salt, &credential.verifier)
+                .map_err(|_| Error::Invalid)?)
+        .then_some(credential.id))
+    }
+}
+fn upload_reply(client: &mut impl Transport) -> (u16, String) {
+    let (status, _, body) = full_reply(client);
+    (status, body)
+}
+fn full_reply(client: &mut impl Transport) -> (u16, String, String) {
+    let mut bytes = Vec::new();
     let mut scratch = [0; 1024];
-    assert!(matches!(
-        stream.read(&mut scratch).unwrap(),
-        IoProgress::Pending
-    ));
-    clock.1.fetch_add(2000, Ordering::Relaxed);
-    let mut ping = Vec::new();
     wait(|| {
-        match stream.read(&mut scratch).unwrap() {
-            IoProgress::Bytes(n) => ping.extend_from_slice(&scratch[..n]),
+        match client.read(&mut scratch).unwrap() {
+            IoProgress::Bytes(n) => bytes.extend_from_slice(&scratch[..n]),
             IoProgress::Pending => (),
-            IoProgress::Closed => panic!("event stream closed before ping"),
+            IoProgress::Closed => panic!("upload closed before complete response"),
         }
-        ping.ends_with(b"\n\n")
+        let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") else {
+            return false;
+        };
+        let head = std::str::from_utf8(&bytes[..end]).unwrap();
+        let length: usize = head
+            .lines()
+            .find_map(|line| line.strip_prefix("Content-Length: "))
+            .unwrap()
+            .parse()
+            .unwrap();
+        bytes.len() == end + 4 + length
     });
-    assert_eq!(ping, b"event: ping\ndata: {\"interval\":1}\n\n");
-    {
-        // Registry contention must not block the reactor's origin refusals.
-        let guard = devices.lock().unwrap();
-        let mut probe = client(address, lease, clock.clone());
-        send(
-            &mut probe,
-            b"GET /.well-known/jmap HTTP/1.1\r\nHost: foreign.example\r\n\r\n",
-        );
-        assert_eq!(full_reply(&mut probe).0, 421);
-        finish_event(&mut probe);
-        drop(guard);
-    }
-    let mut excess = client(address, lease, clock.clone());
-    send(&mut excess, event_head(authorization, 0).as_bytes());
-    assert_eq!(full_reply(&mut excess).0, 429);
-    finish_event(&mut excess);
-    let mut api = client(address, lease, clock.clone());
-    let body = r#"{"using":["urn:ietf:params:jmap:core"],"methodCalls":[["Core/echo",{},"a"]]}"#;
-    send(&mut api, format!("POST {api_url} HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: Basic {authorization}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", address.port(), body.len()).as_bytes());
-    assert_eq!(full_reply(&mut api).0, 200);
-    finish_event(&mut api);
-    devices.lock().unwrap().revoke(device, 2).unwrap();
-    finish_event(&mut stream);
-    clock.1.fetch_add(2000, Ordering::Relaxed);
-    let mut silent = client(address, lease, clock.clone());
-    assert!(
-        request(&mut silent, event_head(authorization, 0).as_bytes())
-            .starts_with("HTTP/1.1 200 OK")
-    );
-    // Complete another exchange so the reactor has acknowledged the SSE header
-    // flush before moving the synthetic clock beyond its output-stall window.
-    for advance in [0, 31000] {
-        clock.1.fetch_add(advance, Ordering::Relaxed);
-        let mut probe = client(address, lease, clock.clone());
-        send(&mut probe, format!("GET /.well-known/jmap HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: Basic {authorization}\r\n\r\n", address.port()).as_bytes());
-        assert_eq!(full_reply(&mut probe).0, 200);
-        finish_event(&mut probe);
-    }
-    assert!(matches!(
-        silent.read(&mut scratch).unwrap(),
-        IoProgress::Pending
-    ));
-    silent.abort();
-    // Discovery remains independently available while the reactor retires EOF.
-    for (method, target, framing, status) in [
-        ("POST", "/.well-known/jmap", "", 405),
-        ("GET", "/.well-known/jmap", "Content-Length: 1\r\n", 400),
-        (
-            "GET",
-            "/jmap/events?types=*&closeafter=no&ping=bad",
-            "",
-            400,
-        ),
-        ("POST", "/jmap/events?types=*&closeafter=no&ping=0", "", 405),
-        (
-            "GET",
-            "/jmap/events?types=*&closeafter=no&ping=0",
-            "Expect: 100-continue\r\n",
-            400,
-        ),
-    ] {
-        clock.1.fetch_add(2000, Ordering::Relaxed);
-        let mut wire = client(address, lease, clock.clone());
-        send(&mut wire, format!("{method} {target} HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: Basic {authorization}\r\n{framing}\r\n", address.port()).as_bytes());
-        let (actual, headers, _) = full_reply(&mut wire);
-        assert_eq!(actual, status);
-        if status == 405 {
-            assert!(headers.contains("Allow: GET"));
-        }
-        finish_event(&mut wire);
-    }
-    discovered
-}
-fn finish_event(wire: &mut impl Transport) {
-    let mut scratch = [0; 1024];
-    wait(|| match wire.read(&mut scratch) {
-        Ok(IoProgress::Pending) => false,
-        Ok(IoProgress::Closed) | Err(_) => true,
-        _ => false,
-    });
-    wire.abort();
-}
-
-fn draft_api_cases(
-    address: std::net::SocketAddr,
-    lease: &GenerationLease<TlsPolicies>,
-    clock: Arc<Now>,
-    authorization: &str,
-    account: &str,
-    api_url: &str,
-    download_template: &str,
-) {
-    use crate::jmap_request::{CORE, MAIL};
-    let post = |calls: td_json::Json| {
-        clock.1.fetch_add(2000, Ordering::Relaxed);
-        let body = td_json::json!({"using":[CORE, MAIL],"methodCalls":calls}).to_string();
-        let mut wire = client(address, lease, clock.clone());
-        let head = format!("POST {api_url} HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: Basic {authorization}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", address.port(), body.len());
-        send(&mut wire, head.as_bytes());
-        let (status, _, body) = full_reply(&mut wire);
-        assert_eq!(status, 200, "{body}");
-        finish_api(&mut wire);
-        td_json::parse(&body).unwrap()
-    };
-    let folders = post(
-        td_json::json!([["Mailbox/set",{"accountId":account,"create":{"drafts":{"name":"Drafts"}}},"folder"]]),
-    );
-    let mailbox = folders["methodResponses"][0][1]["created"]["drafts"]["id"]
-        .as_str()
-        .unwrap();
-    let draft = td_json::json!({
-        "mailboxIds":{mailbox:true},"keywords":{"$draft":true,"$seen":true},
-        "from":[{"name":"Sender","email":"sender@example.test"}],
-        "to":[{"name":null,"email":"recipient@example.test"}],
-        "bcc":[{"name":null,"email":"hidden@example.test"}],
-        "subject":"HTTPS draft", "messageId":["https-draft@example.test"],
-        "sentAt":"2026-10-13T12:00:59Z",
-        "textBody":[{"partId":"text","type":"text/plain"}],
-        "bodyValues":{"text":{"value":"line one\nline two","isEncodingProblem":false,"isTruncated":false}}
-    });
-    let created = post(
-        td_json::json!([["Email/set",{"accountId":account,"create":{"draft":draft.clone()}},"create"],["Core/echo",{"after":true},"after"]]),
-    );
-    assert!(created["methodResponses"][1][1]["after"].is_true());
-    let result = &created["methodResponses"][0][1];
-    let object = &result["created"]["draft"];
-    let email = object["id"].as_str().unwrap();
-    let blob = object["blobId"].as_str().unwrap();
-    assert!(object["threadId"].as_str().unwrap().starts_with('t'));
-    assert_ne!(result["oldState"], result["newState"]);
-    let retrieved = post(
-        td_json::json!([["Email/get",{"accountId":account,"ids":[email],"properties":["id","subject","messageId","bcc","bodyValues","textBody","keywords","mailboxIds"],"fetchTextBodyValues":true},"read"]]),
-    );
-    let message = &retrieved["methodResponses"][0][1]["list"][0];
-    assert_eq!(message["subject"].as_str(), Some("HTTPS draft"));
-    assert_eq!(
-        message["messageId"][0].as_str(),
-        Some("https-draft@example.test")
-    );
-    assert_eq!(
-        message["bcc"][0]["email"].as_str(),
-        Some("hidden@example.test")
-    );
-    assert!(message["keywords"]["$draft"].is_true());
-    assert!(message["keywords"]["$seen"].is_true());
-    assert!(message["mailboxIds"][mailbox].is_true());
-    let part = message["textBody"][0]["partId"].as_str().unwrap();
-    let text = message["bodyValues"][part]["value"].as_str().unwrap();
-    assert!(text.contains("line one") && text.contains("line two"));
-    let stale = post(
-        td_json::json!([["Email/set",{"accountId":account,"ifInState":result["oldState"].clone(),"create":{"stale":draft.clone()}},"stale"]]),
-    );
-    assert_eq!(
-        stale["methodResponses"][0][1]["type"].as_str(),
-        Some("stateMismatch")
-    );
-    let bad = draft.to_string();
-    let bad = td_json::parse(&format!(
-        "{},\"attachments\":[{{\"blobId\":\"{blob}\"}}]}}",
-        bad.strip_suffix('}').unwrap()
-    ))
-    .unwrap();
-    let refused =
-        post(td_json::json!([["Email/set",{"accountId":account,"create":{"bad":bad}},"bad"]]));
-    let refused = &refused["methodResponses"][0][1];
-    assert_eq!(
-        refused["notCreated"]["bad"]["properties"][0].as_str(),
-        Some("attachments")
-    );
-    assert_eq!(refused["oldState"], refused["newState"]);
-    clock.1.fetch_add(2000, Ordering::Relaxed);
-    let url = download_template
-        .replace("{accountId}", account)
-        .replace("{blobId}", blob)
-        .replace("{name}", "draft.eml")
-        .replace("{type}", "message/rfc822");
-    let mut wire = client(address, lease, clock.clone());
-    send(&mut wire, format!("GET {url} HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: Basic {authorization}\r\n\r\n",address.port()).as_bytes());
-    let (status, _, raw) = full_reply(&mut wire);
-    assert_eq!(status, 200);
-    assert_eq!(raw.len() as u64, object["size"].as_u64().unwrap());
-    assert!(raw.contains("Bcc:") && raw.contains("<hidden@example.test>"));
-    assert!(raw.contains("Message-ID:\r\n <https-draft@example.test>"));
-    finish_api(&mut wire);
-    let removed =
-        post(td_json::json!([["Email/set",{"accountId":account,"destroy":[email]},"remove"]]));
-    assert_eq!(
-        removed["methodResponses"][0][1]["destroyed"][0].as_str(),
-        Some(email)
-    );
+    let response = String::from_utf8(bytes).unwrap();
+    let (head, body) = response.split_once("\r\n\r\n").unwrap();
+    (
+        head.split_whitespace().nth(1).unwrap().parse().unwrap(),
+        head.to_owned(),
+        body.to_owned(),
+    )
 }

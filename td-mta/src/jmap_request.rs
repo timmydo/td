@@ -209,8 +209,6 @@ impl<'a, 'c> Validation<'a, 'c> {
                 limits.json_methods,
                 limits.objects_per_method,
                 limits.query_page,
-                limits.json_depth,
-                limits.json_tokens,
                 *limits,
             ),
         })
@@ -298,8 +296,6 @@ impl<'c> OwnedValidation<'c> {
                     limits.json_methods,
                     limits.objects_per_method,
                     limits.query_page,
-                    limits.json_depth,
-                    limits.json_tokens,
                     *limits,
                 ),
             }),
@@ -467,8 +463,6 @@ struct Envelope {
     maximum_calls: usize,
     maximum_objects: usize,
     query_page: usize,
-    query_depth: usize,
-    query_nodes: usize,
     stage: Stage,
     raw_using: Option<usize>,
     raw_calls: Option<usize>,
@@ -484,8 +478,6 @@ impl Envelope {
         maximum_calls: usize,
         maximum_objects: usize,
         query_page: usize,
-        query_depth: usize,
-        query_nodes: usize,
         mail_limits: crate::limits::Limits,
     ) -> Self {
         Self {
@@ -493,8 +485,6 @@ impl Envelope {
             maximum_calls,
             maximum_objects,
             query_page,
-            query_depth,
-            query_nodes,
             stage: Stage::Strings {
                 token: 0,
                 offset: 0,

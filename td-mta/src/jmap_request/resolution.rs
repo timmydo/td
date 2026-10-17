@@ -48,8 +48,8 @@ enum Phase {
 /// and disk cap. The dispatcher separately enforces its execution deadline.
 /// Drop cancels unfinished output; any rollback fault remains sticky in the
 /// borrowed retention owner. Explicit cancel reports that fault to the caller.
-pub struct Resolution<'io, 'path, 'c, 's, 'r, 'sr, 'a, P> {
-    retention: &'io mut ResponseRetention<'c, 's, 'r, 'sr, 'a, P>,
+pub struct Resolution<'io, 'path, 'c, 's, 'sr, 'a> {
+    retention: &'io mut ResponseRetention<'c, 's, 'sr, 'a>,
     walker: Walker<'path>,
     source: Range<u64>,
     read: u64,
@@ -64,14 +64,14 @@ pub struct Resolution<'io, 'path, 'c, 's, 'r, 'sr, 'a, P> {
     settled: bool,
     failure: Option<Error>,
 }
-impl<P> fmt::Debug for Resolution<'_, '_, '_, '_, '_, '_, '_, P> {
+impl fmt::Debug for Resolution<'_, '_, '_, '_, '_, '_> {
     fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
         out.write_str("Resolution { .. }")
     }
 }
-impl<'io, 'path, 'c, 's, 'r, 'sr, 'a, P> Resolution<'io, 'path, 'c, 's, 'r, 'sr, 'a, P> {
+impl<'io, 'path, 'c, 's, 'sr, 'a> Resolution<'io, 'path, 'c, 's, 'sr, 'a> {
     pub fn new(
-        retention: &'io mut ResponseRetention<'c, 's, 'r, 'sr, 'a, P>,
+        retention: &'io mut ResponseRetention<'c, 's, 'sr, 'a>,
         source: Range<u64>,
         path: &'path str,
         max_output: u64,
@@ -267,7 +267,7 @@ impl<'io, 'path, 'c, 's, 'r, 'sr, 'a, P> Resolution<'io, 'path, 'c, 's, 'r, 'sr,
         self.retention.rollback_tail().map_err(Error::Store)
     }
 }
-impl<P> Drop for Resolution<'_, '_, '_, '_, '_, '_, '_, P> {
+impl Drop for Resolution<'_, '_, '_, '_, '_, '_> {
     fn drop(&mut self) {
         let _ = self.rollback();
     }
@@ -279,11 +279,10 @@ pub(super) mod tests {
     use super::*;
     use crate::{
         admission::{logical::Cell as LeaseCell, DiskLimits, ViewMode, WorkLimits},
-        ids::StoreEpoch,
         limits::Limits,
         ownership::SlotState,
         ports::{Clock, Deadline, Tick, Time},
-        store_fs::{tests::Fixture, AuxiliaryUsage, IndexStore, RequestSpool, StoreCoordinator},
+        store_fs::{tests::Fixture, RequestSpool, ResponseCoordinator},
     };
     use std::{
         fs,
@@ -315,11 +314,7 @@ pub(super) mod tests {
     fn deadline() -> Deadline {
         Deadline::after(Tick(0), 100).unwrap()
     }
-    pub(crate) fn run(
-        test: impl FnOnce(&StoreCoordinator<'_, '_, ()>, &RequestSpool<'_>, &Fixture, &Timer),
-    ) {
-        let fixture = Fixture::new();
-        let mut root = fixture.locked();
+    pub(crate) fn run(test: impl FnOnce(&ResponseCoordinator<'_, '_>, &Fixture, &Timer)) {
         let files = Fixture::new();
         let mut file_root = files.locked();
         let clock = Arc::new(Timer(AtomicU64::new(1), AtomicU64::new(0)));
@@ -342,36 +337,14 @@ pub(super) mod tests {
             ViewMode::OnlineBackground,
         )
         .unwrap();
-        let store = IndexStore::create(
-            &mut root,
-            StoreEpoch::from_bytes([7; 16]),
-            clock.clone(),
-            2,
-            deadline(),
-        )
-        .unwrap();
         let mut states = [const { SlotState::EMPTY }; 4];
         let mut cells = [const { LeaseCell::EMPTY }; 4];
-        let coordinator = StoreCoordinator::new(
-            store,
-            &plan,
-            AuxiliaryUsage {
-                sort_bytes: 0,
-                response_bytes: 0,
-                cache_bytes: 0,
-                log_bytes: 0,
-                cold_bytes: 0,
-            },
-            &mut states,
-            &mut cells,
-            (),
-            deadline(),
-        )
-        .unwrap();
-        test(&coordinator, &spool, &files, &clock);
+        let coordinator =
+            ResponseCoordinator::new(spool, &plan, &mut states, &mut cells, clock.clone()).unwrap();
+        test(&coordinator, &files, &clock);
     }
     fn resolve_value(
-        response: &mut ResponseRetention<'_, '_, '_, '_, '_, ()>,
+        response: &mut ResponseRetention<'_, '_, '_, '_>,
         source: std::ops::Range<u64>,
         path: &str,
     ) -> Result<std::ops::Range<u64>, crate::jmap_request::resolution::Error> {
@@ -388,8 +361,8 @@ pub(super) mod tests {
     }
     #[test]
     fn retained_pointer_expansion_publishes_exact_values_in_the_same_file() {
-        run(|coordinator, spool, _, _| {
-            let mut response = coordinator.retain_response(spool, deadline()).unwrap();
+        run(|coordinator, _, _| {
+            let mut response = coordinator.retain_response(deadline()).unwrap();
             response.append(b"{}").unwrap();
             let source = br#"{"list":[{"ids":["m2","m1"]},{"ids":["m3"]}]}"#;
             response.append(source).unwrap();
@@ -412,8 +385,8 @@ pub(super) mod tests {
     #[test]
     fn invalid_late_reference_and_capacity_failure_discard_only_their_tail() {
         use crate::jmap_request::{pointer, resolution};
-        run(|coordinator, spool, _, _| {
-            let mut response = coordinator.retain_response(spool, deadline()).unwrap();
+        run(|coordinator, _, _| {
+            let mut response = coordinator.retain_response(deadline()).unwrap();
             let source = br#"[{"x":1},{}]"#;
             response.append(source).unwrap();
             response.publish().unwrap();
@@ -427,8 +400,8 @@ pub(super) mod tests {
             assert_eq!(response.failure(), None);
             resolve_value(&mut response, 0..source.len() as u64, "").unwrap();
         });
-        run(|coordinator, spool, _, _| {
-            let mut response = coordinator.retain_response(spool, deadline()).unwrap();
+        run(|coordinator, _, _| {
+            let mut response = coordinator.retain_response(deadline()).unwrap();
             let source = format!("\"{}\"", "x".repeat(40000));
             response.append(source.as_bytes()).unwrap();
             response.publish().unwrap();
@@ -449,8 +422,8 @@ pub(super) mod tests {
     fn resolution_cancel_drop_and_incomplete_finish_preserve_published_source() {
         use crate::jmap_request::resolution::{Error, Resolution};
         for how in 0..3 {
-            run(|coordinator, spool, _, _| {
-                let mut response = coordinator.retain_response(spool, deadline()).unwrap();
+            run(|coordinator, _, _| {
+                let mut response = coordinator.retain_response(deadline()).unwrap();
                 let source = format!("[{}]", vec![r#"{"x":1}"#; 100].join(","));
                 response.append(source.as_bytes()).unwrap();
                 response.publish().unwrap();
@@ -474,8 +447,8 @@ pub(super) mod tests {
     #[test]
     fn cpu_only_resolution_turns_keep_original_deadline() {
         use crate::jmap_request::resolution::{Error, Resolution};
-        run(|coordinator, spool, _, clock| {
-            let mut response = coordinator.retain_response(spool, deadline()).unwrap();
+        run(|coordinator, _, clock| {
+            let mut response = coordinator.retain_response(deadline()).unwrap();
             response.append(b"{}").unwrap();
             response.publish().unwrap();
             let path = format!("/{}", "x".repeat(2000));
@@ -492,8 +465,8 @@ pub(super) mod tests {
     }
     #[test]
     fn expansion_ceiling_preserves_mandatory_space() {
-        run(|coordinator, spool, _, _| {
-            let mut response = coordinator.retain_response(spool, deadline()).unwrap();
+        run(|coordinator, _, _| {
+            let mut response = coordinator.retain_response(deadline()).unwrap();
             response.append(b"[1,2,3]").unwrap();
             response.publish().unwrap();
             let mut resolution = Resolution::new(&mut response, 0..7, "/*", 4).unwrap();
@@ -516,12 +489,12 @@ pub(super) mod tests {
             response.append(br#"{"type":"serverFail"}"#).unwrap();
             response.publish().unwrap();
         });
-        assert!(std::mem::size_of::<Resolution<'_, '_, '_, '_, '_, '_, '_, ()>>() <= 24 * 1024);
+        assert!(std::mem::size_of::<Resolution<'_, '_, '_, '_, '_, '_>>() <= 24 * 1024);
     }
     #[test]
     fn invalid_scratch_and_truncated_array_never_publish_partial_output() {
-        run(|coordinator, spool, _, _| {
-            let mut response = coordinator.retain_response(spool, deadline()).unwrap();
+        run(|coordinator, _, _| {
+            let mut response = coordinator.retain_response(deadline()).unwrap();
             response.append(b"[1,2]").unwrap();
             response.publish().unwrap();
             let mut resolution = Resolution::new(&mut response, 0..5, "/*", u64::MAX).unwrap();
@@ -531,8 +504,8 @@ pub(super) mod tests {
             assert_eq!(response.len(), 5);
             assert_eq!(response.published_len(), 5);
         });
-        run(|coordinator, spool, _, _| {
-            let mut response = coordinator.retain_response(spool, deadline()).unwrap();
+        run(|coordinator, _, _| {
+            let mut response = coordinator.retain_response(deadline()).unwrap();
             response.append(b"[1,2").unwrap();
             response.publish().unwrap();
             assert!(matches!(
@@ -545,8 +518,8 @@ pub(super) mod tests {
     }
     #[test]
     fn cancellation_reports_prior_cleanup_failure() {
-        run(|coordinator, spool, _, clock| {
-            let mut response = coordinator.retain_response(spool, deadline()).unwrap();
+        run(|coordinator, _, clock| {
+            let mut response = coordinator.retain_response(deadline()).unwrap();
             response.append(b"[1,2]").unwrap();
             response.publish().unwrap();
             let mut resolution = Resolution::new(&mut response, 0..5, "/*", u64::MAX).unwrap();
@@ -562,8 +535,8 @@ pub(super) mod tests {
     #[test]
     fn completion_stays_unpublished_until_fresh_finish_admission() {
         for how in 0..3 {
-            run(|coordinator, spool, _, clock| {
-                let mut response = coordinator.retain_response(spool, deadline()).unwrap();
+            run(|coordinator, _, clock| {
+                let mut response = coordinator.retain_response(deadline()).unwrap();
                 response.append(b"{}").unwrap();
                 response.publish().unwrap();
                 let mut resolution = Resolution::new(&mut response, 0..2, "", u64::MAX).unwrap();
@@ -598,8 +571,8 @@ pub(super) mod tests {
     }
     #[test]
     fn copy_phase_io_failure_keeps_the_tail_unpublished() {
-        run(|coordinator, spool, files, _| {
-            let mut response = coordinator.retain_response(spool, deadline()).unwrap();
+        run(|coordinator, files, _| {
+            let mut response = coordinator.retain_response(deadline()).unwrap();
             response.append(b"[1]").unwrap();
             response.publish().unwrap();
             let mut resolution = Resolution::new(&mut response, 0..3, "/*", 32).unwrap();
@@ -627,8 +600,8 @@ pub(super) mod tests {
     #[test]
     fn resolution_binds_published_extent_and_io_failures_stay_storage_errors() {
         use crate::jmap_request::resolution::{Error, Resolution};
-        run(|coordinator, spool, files, _| {
-            let mut response = coordinator.retain_response(spool, deadline()).unwrap();
+        run(|coordinator, files, _| {
+            let mut response = coordinator.retain_response(deadline()).unwrap();
             response.append(b"{}").unwrap();
             assert!(matches!(
                 Resolution::new(&mut response, 0..2, "", u64::MAX),

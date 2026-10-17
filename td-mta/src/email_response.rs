@@ -4,7 +4,6 @@ use crate::{
     email_property::Field,
     ids::{BlobId, EmailId, MailboxId, ThreadId},
     ports::{Error, ViewIdentity},
-    store_fs::IndexReadView,
     wire,
 };
 pub const MAX_EMAIL_VALUES: usize = 256;
@@ -51,35 +50,6 @@ pub trait Source {
         after: Option<&str>,
         maximum: usize,
     ) -> Result<EmailValues<String>, Self::Error>;
-}
-impl Source for IndexReadView<'_, '_> {
-    type Error = Error;
-    fn check_snapshot(&mut self) -> Result<(), Error> {
-        IndexReadView::check_snapshot(self)
-    }
-    fn email_metadata(
-        &mut self,
-        email: EmailId,
-        scratch: &mut [u8],
-    ) -> Result<Option<EmailMetadata>, Error> {
-        IndexReadView::email_metadata(self, email, scratch)
-    }
-    fn email_mailboxes(
-        &mut self,
-        email: EmailId,
-        after: Option<MailboxId>,
-        maximum: usize,
-    ) -> Result<EmailValues<MailboxId>, Error> {
-        IndexReadView::email_mailboxes(self, email, after, maximum)
-    }
-    fn email_keywords(
-        &mut self,
-        email: EmailId,
-        after: Option<&str>,
-        maximum: usize,
-    ) -> Result<EmailValues<String>, Error> {
-        IndexReadView::email_keywords(self, email, after, maximum)
-    }
 }
 
 /// Maximum bytes in one provisional sink callback.

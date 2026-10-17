@@ -1,4 +1,4 @@
-//! Prepared direct-SMTP DATA storage; production still selects native storage.
+//! PostgreSQL DATA storage on the fixed SMTP worker.
 use crate::{
     admission::work::{Charge, Meter, Stop},
     clock::RuntimeClock,

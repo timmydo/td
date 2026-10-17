@@ -3,8 +3,6 @@ use crate::limits::ResourcePlan;
 
 pub const MIB: u64 = 1 << 20;
 pub const GIB: u64 = 1 << 30;
-pub const DATABASE_BYTES: u64 = crate::limits::SQLITE_DATABASE_BYTES;
-pub const WAL_BYTES: u64 = crate::limits::SQLITE_WAL_BYTES;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -66,8 +64,6 @@ pub mod work;
 settings! { DiskLimits {
     body_bytes: 4 * GIB, 1, 4 * GIB;
     blob_count: 250000, 1, 1000000;
-    database_bytes: DATABASE_BYTES, 1, DATABASE_BYTES;
-    wal_bytes: WAL_BYTES, 1, 32 * GIB;
     response_bytes: 128 * MIB, 1, GIB;
     response_total_bytes: 256 * MIB, 1, 4 * GIB;
     cache_bytes: 128 * MIB, 1024, GIB;
@@ -86,7 +82,6 @@ settings! { WorkLimits {
     commit_io_bytes: 256 * MIB, 256 * MIB, 16 * 256 * MIB;
     commit_records: 250000, 250000, 16 * 250000;
     checkpoint_seconds: 60, 60, 16 * 60;
-    checkpoint_io_bytes: DATABASE_BYTES, DATABASE_BYTES, 16 * DATABASE_BYTES;
     gc_drain_seconds: 30, 30, 16 * 30;
     gc_seconds: 120, 120, 16 * 120;
     gc_io_bytes: 8 * GIB, 8 * GIB, 16 * 8 * GIB;
@@ -176,14 +171,6 @@ impl DiskLimits {
         work.validate()?;
         let limits = resources.limits();
         require(
-            self.database_bytes == DATABASE_BYTES,
-            "database quota must equal SQLite page ceiling",
-        )?;
-        require(
-            self.wal_bytes >= WAL_BYTES,
-            "WAL quota must fit bounded transaction overlap",
-        )?;
-        require(
             self.body_bytes >= widen(limits.message_bytes, "message bytes")?,
             "raw quota must fit one maximum message",
         )?;
@@ -236,27 +223,6 @@ impl DiskLimits {
 mod tests {
     use super::*;
     use crate::limits::Limits;
-    #[test]
-    fn sqlite_page_and_wal_caps_are_independently_admitted() {
-        let resources = crate::limits::Limits::default().plan().unwrap();
-        assert!(DiskLimits::default()
-            .plan(&resources, WorkLimits::default(), ViewMode::ForegroundOnly)
-            .is_ok());
-        let disk = DiskLimits {
-            database_bytes: DATABASE_BYTES - 1,
-            ..DiskLimits::default()
-        };
-        assert!(disk
-            .plan(&resources, WorkLimits::default(), ViewMode::ForegroundOnly)
-            .is_err());
-        let disk = DiskLimits {
-            wal_bytes: WAL_BYTES - 1,
-            ..DiskLimits::default()
-        };
-        assert!(disk
-            .plan(&resources, WorkLimits::default(), ViewMode::ForegroundOnly)
-            .is_err());
-    }
 
     #[test]
     fn retained_response_view_and_sort_admission_boundaries(
@@ -380,27 +346,18 @@ mod tests {
             })
         ));
         let minimum = DiskLimits {
-            database_bytes: DATABASE_BYTES,
             cache_bytes: 1024,
             ..DiskLimits::default()
         };
         assert!(minimum
             .plan(&resources, WorkLimits::default(), ViewMode::ForegroundOnly)
             .is_ok());
-        for disk in [
-            DiskLimits {
-                database_bytes: DATABASE_BYTES - 1,
-                ..minimum
-            },
-            DiskLimits {
-                cache_bytes: 1023,
-                ..minimum
-            },
-        ] {
-            assert!(disk
-                .plan(&resources, WorkLimits::default(), ViewMode::ForegroundOnly)
-                .is_err());
+        assert!(DiskLimits {
+            cache_bytes: 1023,
+            ..minimum
         }
+        .plan(&resources, WorkLimits::default(), ViewMode::ForegroundOnly)
+        .is_err());
         assert_eq!(add(u64::MAX, 1, "test"), Err(Error::Overflow("test")));
         assert_eq!(mul(u64::MAX, 2, "test"), Err(Error::Overflow("test")));
         Ok(())

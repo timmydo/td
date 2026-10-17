@@ -20,13 +20,6 @@ fn check(name: &Name, expected: &str) {
 }
 
 #[test]
-fn generated_database_layout_has_only_fixed_root_names() {
-    for (entry, text) in [
-        (RootEntry::Database, "metadata.sqlite3"),
-        (RootEntry::Wal, "metadata.sqlite3-wal"),
-        (RootEntry::SharedMemory, "metadata.sqlite3-shm"),
-        (RootEntry::Lock, "LOCK"),
-    ] {
-        check(&Name::root(entry).unwrap(), text);
-    }
+fn runtime_layout_has_only_fixed_root_names() {
+    check(&Name::root(RootEntry::Lock).unwrap(), "LOCK");
 }

@@ -11,7 +11,7 @@ pub(super) struct Requested<T> {
     pub(super) id: Option<T>,
     pub(super) found: bool,
 }
-impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
+impl Worker<'_, '_, '_, '_, '_> {
     pub(super) fn get_ids<T: LocalId + Eq>(
         &mut self,
         ids: Option<Item>,

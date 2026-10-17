@@ -9,16 +9,12 @@ pub const DEVICE_LABEL_BYTES: usize = 128;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeviceError {
     Invalid,
-    Capacity,
-    NotFound,
     Unavailable,
 }
 impl std::fmt::Display for DeviceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::Invalid => "invalid device record",
-            Self::Capacity => "device capacity exhausted",
-            Self::NotFound => "device not found",
             Self::Unavailable => "device registry unavailable",
         })
     }

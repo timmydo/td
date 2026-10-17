@@ -47,7 +47,9 @@ impl Client {
             Command::new(std::env::var_os("TD_MTA_TEST_MAIL").unwrap())
                 .arg("--cli")
                 .arg(format!("--config={}", config.display()))
-                .env("XDG_RUNTIME_DIR", root)
+                // Keep Unix socket names below sun_path even in long worktrees.
+                .current_dir(root)
+                .env("XDG_RUNTIME_DIR", ".")
                 .env("HOME", state)
                 .env("XDG_CONFIG_HOME", state.join("config"))
                 .env("XDG_STATE_HOME", state.join("state"))
@@ -260,7 +262,8 @@ pub(super) fn exercise(
                 "--nocapture",
             ])
             .env("TD_TEST_FETCH_ROOT", fixture.root.join("root.der"))
-            .env("TD_TEST_FETCH_SOCKET", &fetch_socket)
+            .current_dir(&runtime)
+            .env("TD_TEST_FETCH_SOCKET", "td-fetch/socket")
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .spawn()

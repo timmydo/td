@@ -1,8 +1,7 @@
 //! Transaction-aligned change pages from one retained account view.
 use crate::{
     format::{Sequence, MAX_TRANSACTION_OPERATIONS},
-    ports::{self, Change, ChangeAction, ChangeCursor, ChangeStep, ReadView, ViewIdentity},
-    store_fs::IndexReadView,
+    ports::{self, Change, ChangeAction, ChangeCursor, ChangeStep, ViewIdentity},
     sync::{DataState, DataType},
 };
 
@@ -44,21 +43,6 @@ pub trait History {
         after: ChangeCursor,
         kind: crate::format::ObjectType,
     ) -> Result<ChangeStep, ports::Error>;
-}
-impl History for IndexReadView<'_, '_> {
-    fn history_identity(&self) -> ViewIdentity {
-        ReadView::identity(self)
-    }
-    fn check_history(&mut self) -> Result<(), ports::Error> {
-        self.check_snapshot()
-    }
-    fn read_change(
-        &mut self,
-        after: ChangeCursor,
-        kind: crate::format::ObjectType,
-    ) -> Result<ChangeStep, ports::Error> {
-        ReadView::next_change(self, after, kind)
-    }
 }
 
 /// One poll reads at most one history record. The service must charge each
@@ -260,7 +244,3 @@ impl<'v, V: History> Cursor<'v, V> {
         })
     }
 }
-
-#[cfg(test)]
-#[path = "jmap_changes_tests.rs"]
-mod tests;

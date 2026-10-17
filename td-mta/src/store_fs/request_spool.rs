@@ -47,7 +47,7 @@ impl<'r> RequestSpool<'r> {
         clock: std::sync::Arc<dyn ports::Clock>,
         deadline: ports::Deadline,
     ) -> Result<Self, ports::Error> {
-        let mut scope = super::spool::Scope::new(clock, deadline)?;
+        let mut scope = Scope::new(clock, deadline)?;
         let owner = root.root.directory.metadata()?.uid();
         let spool = Self {
             root,
@@ -215,9 +215,6 @@ pub(crate) struct Temporary<'s, 'r> {
     cleaned: Option<Result<(), ports::Error>>,
 }
 impl<'s, 'r> Temporary<'s, 'r> {
-    pub(crate) fn spool(&self) -> &'s RequestSpool<'r> {
-        self.spool
-    }
     pub(crate) fn create(&mut self) -> Result<(), ports::Error> {
         let mut path = [0; MAX_PATH_BYTES];
         let file = OpenOptions::new()
@@ -283,6 +280,49 @@ impl<'s, 'r> Temporary<'s, 'r> {
 impl Drop for Temporary<'_, '_> {
     fn drop(&mut self) {
         let _ = self.cleanup();
+    }
+}
+
+struct Scope {
+    clock: std::sync::Arc<dyn ports::Clock>,
+    deadline: ports::Deadline,
+    last: ports::Tick,
+    failed: Option<ports::Error>,
+}
+impl Scope {
+    fn new(
+        clock: std::sync::Arc<dyn ports::Clock>,
+        deadline: ports::Deadline,
+    ) -> Result<Self, ports::Error> {
+        let last = clock.sample()?.monotonic;
+        let mut scope = Self {
+            clock,
+            deadline,
+            last,
+            failed: None,
+        };
+        scope.check()?;
+        Ok(scope)
+    }
+    fn fail<T>(&mut self, error: ports::Error) -> Result<T, ports::Error> {
+        let first = *self.failed.get_or_insert(error);
+        Err(first)
+    }
+    fn check(&mut self) -> Result<(), ports::Error> {
+        if let Some(error) = self.failed {
+            return Err(error);
+        }
+        let result = self.clock.sample().and_then(|now| {
+            if now.monotonic < self.last {
+                return Err(ports::Error::Invalid);
+            }
+            self.last = now.monotonic;
+            if self.deadline.expired(now.monotonic) {
+                return Err(ports::Error::Deadline);
+            }
+            Ok(())
+        });
+        result.or_else(|error| self.fail(error))
     }
 }
 

@@ -2,20 +2,14 @@
 use crate::{
     admission::timers::{self, TimeoutPlan},
     bounded::TextBuffer,
-    http_auth::DevicePolicy,
     http_request::{self, BodyReader, Framing, QUANTUM},
-    https_download::Failure,
     https_exchange::Sender,
-    https_upload,
-    ids::{AccountId, DeviceId},
+    ids::DeviceId,
     jmap_request::{self, dispatch, response},
     jmap_session::Session,
     limits::ResourcePlan,
-    ports::{Clock, Deadline, Error, IoProgress, Transport},
-    smtp_receiving::Control,
-    store_fs::{
-        BlobAuthorization, RequestSpool, ResponseError, ResponseRetention, StoreCoordinator,
-    },
+    ports::{Deadline, Error, IoProgress},
+    store_fs::{ResponseError, ResponseRetention},
 };
 use std::{thread, time::Duration};
 use td_json::arena;
@@ -27,19 +21,6 @@ pub struct Request<'a> {
     pub prefix: &'a [u8],
     pub expect_continue: bool,
     pub deadline: Deadline,
-}
-
-pub struct Service<'s, 'r, 'a, 'sr, 'd, P> {
-    pub transfers: &'s dyn https_upload::Backend,
-    pub drafts: &'s dyn dispatch::DraftCreator,
-    pub coordinator: &'s StoreCoordinator<'r, 'a, P>,
-    pub spool: &'s RequestSpool<'sr>,
-    pub policy: DevicePolicy<'s, 'd>,
-    pub resources: &'s ResourcePlan,
-    pub session: &'s Session,
-    pub response_maximum: u64,
-    pub clock: &'s dyn Clock,
-    pub timeouts: &'s TimeoutPlan,
 }
 
 #[derive(Debug)]
@@ -86,130 +67,6 @@ fn buffer<T: Clone>(length: usize, value: T) -> Result<Box<[T]>, Error> {
     bytes.resize(length, value);
     Ok(bytes.into_boxed_slice())
 }
-impl<
-        P: crate::store_fs::EmailUpdateAuthorization + crate::store_fs::MailboxAuthorization + Sync,
-    > https_upload::Backend for Service<'_, '_, '_, '_, '_, P>
-{
-    fn account(&self) -> AccountId {
-        self.transfers.account()
-    }
-    fn session(&self) -> Option<&Session> {
-        Some(self.session)
-    }
-    fn event_snapshot(
-        &self,
-        device: DeviceId,
-        deadline: Deadline,
-    ) -> Result<crate::jmap_events::Snapshot, Error> {
-        drop(
-            self.policy
-                .authorize_blob(self.transfers.account(), device, deadline)?,
-        );
-        crate::jmap_events::Snapshot::new(self.transfers.account(), &[], None)
-    }
-    fn receive(
-        &self,
-        request: https_upload::Request<'_>,
-        transport: &mut dyn Transport,
-        control: &Control,
-    ) -> Result<https_upload::Response, Error> {
-        self.transfers.receive(request, transport, control)
-    }
-    fn download(
-        &self,
-        request: crate::https_download::Request<'_>,
-        transport: &mut dyn Transport,
-        control: &Control,
-    ) -> Result<(), Failure> {
-        self.transfers.download(request, transport, control)
-    }
-    fn api(
-        &self,
-        request: Request<'_>,
-        transport: &mut dyn Transport,
-        control: &Control,
-    ) -> Result<(), Failure> {
-        let mut sender = Sender::new(
-            transport,
-            control,
-            self.clock,
-            self.timeouts,
-            request.deadline,
-        )
-        .map_err(Failure::Before)?;
-        let result = self.execute(&request, &mut sender);
-        // All temporary response owners have now dropped and settled their ledger.
-        if self.coordinator.admission_stopped() {
-            return Err(if sender.started {
-                Failure::Started(Error::WriterStopped)
-            } else {
-                Failure::Before(Error::WriterStopped)
-            });
-        }
-        let result = match result {
-            Ok(()) => Ok(()),
-            Err(ApiError::Request(error)) => problem(&mut sender, error),
-            Err(ApiError::Io(error)) => Err(error),
-        };
-        result.map_err(|error| {
-            if sender.started {
-                Failure::Started(error)
-            } else {
-                Failure::Before(error)
-            }
-        })
-    }
-}
-impl<P: crate::store_fs::EmailUpdateAuthorization + crate::store_fs::MailboxAuthorization>
-    Service<'_, '_, '_, '_, '_, P>
-{
-    fn execute(&self, request: &Request<'_>, sender: &mut Sender<'_>) -> Result<(), ApiError> {
-        let exchange = Exchange {
-            capabilities: &[jmap_request::CORE, jmap_request::MAIL],
-            resources: self.resources,
-            session: self.session,
-            response_maximum: self.response_maximum,
-            timeouts: self.timeouts,
-        };
-        let start = exchange.begin(request, sender)?;
-        let mut retention = self
-            .coordinator
-            .retain_response(self.spool, sender.deadline)
-            .map_err(response_error)?;
-        let (plan, execution) =
-            exchange.receive(request, sender, start, &mut retention, |deadline| {
-                drop(self.policy.authorize_blob(
-                    self.transfers.account(),
-                    request.device,
-                    deadline,
-                )?);
-                Ok(())
-            })?;
-        let device = request.device;
-        retention.admit_work_turn()?;
-        drop(
-            self.policy
-                .authorize_blob(self.transfers.account(), device, sender.deadline)?,
-        );
-        let complete = dispatch::run_with_mail_access(
-            plan,
-            retention,
-            execution,
-            self.transfers.account(),
-            device,
-            self.coordinator,
-            Some(self.drafts),
-        )
-        .map_err(|error| {
-            ApiError::Io(match error {
-                dispatch::Error::Storage(error) => error,
-                _ => Error::Capacity,
-            })
-        })?;
-        send_response(complete, sender)
-    }
-}
-
 /// Shared bounded HTTP/JMAP framing. Storage admission and fresh authorization
 /// remain with the backend that owns the response and dispatch snapshot.
 pub(crate) struct Exchange<'a> {
@@ -240,12 +97,12 @@ impl<'a> Exchange<'a> {
         jmap_request::Request::validate_resources(self.resources).map_err(ApiError::Request)?;
         Ok(start)
     }
-    pub(crate) fn receive<'c, 's, 'r, 'sr, 'data, P>(
+    pub(crate) fn receive<'c, 's, 'sr, 'data>(
         &self,
         request: &Request<'_>,
         sender: &mut Sender<'_>,
         start: crate::ports::Tick,
-        retention: &mut ResponseRetention<'c, 's, 'r, 'sr, 'data, P>,
+        retention: &mut ResponseRetention<'c, 's, 'sr, 'data>,
         authorize: impl FnOnce(Deadline) -> Result<(), Error>,
     ) -> Result<(response::Plan<'a>, Deadline), ApiError> {
         let limits = self.resources.limits();
@@ -393,8 +250,8 @@ impl<'a> Exchange<'a> {
         Ok((plan.finish().map_err(|_| Error::Capacity)?, execution))
     }
 }
-pub(crate) fn send_response<P>(
-    mut complete: dispatch::Completed<'_, '_, '_, '_, '_, '_, P>,
+pub(crate) fn send_response(
+    mut complete: dispatch::Completed<'_, '_, '_, '_, '_>,
     sender: &mut Sender<'_>,
 ) -> Result<(), ApiError> {
     let mut output = [0; QUANTUM];

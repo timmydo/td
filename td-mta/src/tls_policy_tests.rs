@@ -11,8 +11,6 @@ mod gateway_process_tests;
 mod https_tests;
 #[path = "tls_policy_io_tests.rs"]
 mod io_tests;
-#[path = "mail_client_tests.rs"]
-mod mail_client_tests;
 #[path = "smtp_relay_auth_tests.rs"]
 mod relay_auth_tests;
 #[path = "smtp_relay_body_tests.rs"]
@@ -21,8 +19,6 @@ pub(crate) mod relay_body_tests;
 mod relay_command_tests;
 #[path = "smtp_relay_ehlo_tests.rs"]
 mod relay_ehlo_tests;
-#[path = "smtp_receiving_tests.rs"]
-mod smtp_receiving_tests;
 #[path = "smtp_starttls_tests.rs"]
 mod smtp_starttls_tests;
 #[path = "tls_stack_tests.rs"]
@@ -137,7 +133,6 @@ impl Clock for SwitchClock {
     }
 }
 struct Material {
-    ca_der: Vec<u8>,
     chain: Vec<u8>,
     key: Vec<u8>,
     ca: Vec<u8>,
@@ -168,7 +163,6 @@ impl Material {
         let key = pem("PRIVATE KEY", &leaf[..l]);
         let source = Arc::new(SwitchClock(AtomicBool::new(false)));
         Self {
-            ca_der,
             chain,
             key,
             ca,

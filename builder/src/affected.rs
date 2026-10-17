@@ -3840,7 +3840,10 @@ fn preflight_host(root: &Path) -> Option<Vec<u8>> {
             (k.starts_with("CARGO_") || k.starts_with("RUST")) && !volatile(k)
                 || matches!(
                     k.as_str(),
-                    "TD_CC_HOME" | "TD_RUN_CAPPED_MIB" | "TD_RUST_HOME"
+                    "TD_CC_HOME"
+                        | "TD_RUN_CAPPED_MIB"
+                        | "TD_RUST_HOME"
+                        | "TD_MTA_TEST_POSTGRES_BIN"
                 )
         })
         .collect();
@@ -4456,8 +4459,7 @@ fn manifest_path_dependencies(
         if !is_dev
             && ((name == "td-crypto" && crate::crypto_policy::DEPENDENCIES.contains(&line))
                 || (name == "td-mta"
-                    && (line == crate::crypto_policy::SQLITE_DEPENDENCY
-                        || crate::crypto_policy::POSTGRES_DEPENDENCIES.contains(&line))))
+                    && crate::crypto_policy::POSTGRES_DEPENDENCIES.contains(&line)))
         {
             continue;
         }
@@ -4588,10 +4590,7 @@ fn refuse_cargo_config_overrides(root: &Path, roster: &[GateCrate]) -> Result<()
             let table = segment.trim_matches(['"', '\'']).trim();
             // Cargo applies [env] after the wrapper checks its inherited
             // environment. Reserve every native mail control for the wrapper.
-            if ["AWS_LC_SYS_", "LIBSQLITE3_", "SQLITE_", "SQLITE3_"]
-                .iter()
-                .any(|prefix| line.contains(prefix))
-            {
+            if ["AWS_LC_SYS_"].iter().any(|prefix| line.contains(prefix)) {
                 return Err(format!("{name} sets a reserved native mail build control"));
             }
             if matches!(table, "paths" | "patch" | "source" | "include") {
@@ -5240,6 +5239,8 @@ fn crate_reader_graph(root: &Path, roster: &[GateCrate]) -> Result<CrateReaderGr
             if names_crate_dir(&text, &read.name)
                 || manifest_names(&manifest, &read.name)
                 || (reader.native_compositor_tests && read.name == "td-compositor")
+                // The isolated mail gate builds this client for PostgreSQL fixtures.
+                || (reader.name == "td-mta" && read.name == "td-mail")
             {
                 if let Some((_, readers)) = out.iter_mut().find(|(n, _)| *n == read.name) {
                     push_unique(readers, &reader.name);

@@ -9,7 +9,7 @@ struct Destroy {
     name: Name,
     local: Option<EmailId>,
 }
-impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
+impl Worker<'_, '_, '_, '_, '_> {
     pub(super) fn email_destroy(
         &mut self,
         range: Range<u64>,

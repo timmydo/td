@@ -1,12 +1,12 @@
 //! One literal plain-text draft per td-mail Email/set call.
-use super::{email_set::failure, mailbox_get::storage, push::Name, Error, Worker};
+use super::{email_set::failure, push::Name, Error, Worker};
 use crate::{
     admission::work::Meter,
     bounded::TextBuffer,
     draft_input,
     format::Sequence,
     ids::{AccountId, DeviceId, StoreEpoch},
-    ports::{self, ReadView},
+    ports,
     store_fs::{CommitError, DraftCompletion, UploadError},
     sync::{DataState, DataType},
     wire,
@@ -37,7 +37,7 @@ pub trait DraftCreator: Sync {
         meter: &mut Meter,
     ) -> Result<DraftCompletion, DraftError>;
 }
-impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
+impl Worker<'_, '_, '_, '_, '_> {
     pub(super) fn email_create(
         &mut self,
         create: Value<'_>,
@@ -68,22 +68,7 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
             .try_reserve_exact(bound)
             .map_err(|_| Error::ResponseCapacity)?;
         output.resize(bound, 0);
-        let before = match access.state {
-            Some(state) => state,
-            None => {
-                let view = self
-                    .retention
-                    .method_view(self.account, self.execution)
-                    .map_err(storage)?;
-                let identity = view.identity();
-                DataState {
-                    account: self.account,
-                    epoch: identity.epoch,
-                    kind: DataType::Email,
-                    sequence: identity.committed_sequence,
-                }
-            }
-        };
+        let before = access.state.ok_or(Error::State)?;
         if before.account != self.account || before.kind != DataType::Email {
             return Err(Error::State);
         }
@@ -202,7 +187,3 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
         })().map_err(|error| if error == Error::State { Error::ServerPartialFail } else { error })
     }
 }
-
-#[cfg(test)]
-#[path = "email_create_tests.rs"]
-mod tests;

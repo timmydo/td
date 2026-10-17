@@ -1,5 +1,5 @@
 //! Canonical bounded metadata keys, values and operation input codecs.
-//! SQLite owns metadata persistence; raw message files own body bytes.
+//! PostgreSQL owns metadata and immutable body persistence.
 use std::fmt;
 
 pub mod batch;

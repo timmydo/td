@@ -280,8 +280,6 @@ pub struct DiskBudget {
     /// Logical quota increases, including pins on an already existing blob.
     pub upload_bytes: u64,
     pub queue_bytes: u64,
-    pub database_bytes: u64,
-    pub wal_bytes: u64,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReservationSize {
@@ -414,7 +412,7 @@ impl StagedBlob {
 pub trait BlobWriter: Send {
     /// All-or-error: no caller retry of the same chunk after an error.
     fn write(&mut self, bytes: &[u8]) -> Result<(), Error>;
-    /// Finish provisional staging. Only the later SQLite commit is durable.
+    /// Finish provisional staging. Only the later database commit is durable.
     fn finish(self) -> Result<StagedBlob, Error>;
 }
 
@@ -593,7 +591,6 @@ mod crypto_boundary_tests {
             [
                 r#"tokio = { version = "=1.53.3", default-features = false, features = ["io-util"] }"#,
                 r#"tokio-postgres = { version = "=0.7.18", default-features = false }"#,
-                r#"rusqlite = { version = "=0.40.2", default-features = false, features = ["blob", "bundled", "hooks", "limits"] }"#,
                 r#"td-civil = { path = "../td-civil" }"#,
                 r#"td-crypto = { path = "../td-crypto" }"#,
                 r#"td-header = { path = "../td-header" }"#,
