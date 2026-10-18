@@ -11,11 +11,16 @@
 
 use crate::cryptsetup::{self, Resilience};
 use crate::luks2::{self, Header, Kind, Metadata, UpgradeView, Volume, JSON_AREA_LEN};
-use crate::protected::{Fido2, FidoRole, Lockout, Shape, Token, TpmPin, FIELD_LEN};
-use crate::token::MAX_SLOT;
+use crate::pin::PinPcrs;
+use crate::protected::{
+    Fido2, FidoRole, Lockout, Shape, Token, TpmPin, FIELD_LEN, MAX_CREDENTIAL_ID,
+    MAX_PIN_PRIVATE_BYTES, MAX_PIN_PUBLIC_BYTES,
+};
+use crate::token::{Role, MAX_SLOT};
 use std::ffi::OsString;
 use std::fmt;
 use std::path::Path;
+use td_tpm::SealedObject;
 
 /// LUKS2 holds token numbers 0 to 31.
 const TOKEN_NUMBERS: usize = MAX_SLOT as usize + 1;
@@ -237,6 +242,14 @@ pub enum Refusal {
     /// cryptsetup's own metadata could not be read or does not agree with
     /// the header the plan was computed from.
     Metadata(String),
+    /// Phase 1 over a header that is not converged: device-bound, keyslot 0
+    /// and one other the one device-bound token names, every keyslot
+    /// `luks2`, no reencryption, a data segment identity, and no protected
+    /// token but pending fido2 ones.
+    NotConverged,
+    /// Phase 1 enrolls 0 to 2 new keys, at least one in the FIDO2 shape,
+    /// each a pending token of the shape's role.
+    NewKeys,
 }
 
 impl fmt::Display for Refusal {
@@ -279,6 +292,10 @@ impl fmt::Display for Refusal {
             ),
             Self::Token(error) => write!(f, "the token to import: {error}"),
             Self::Metadata(error) => f.write_str(error),
+            Self::NotConverged => {
+                f.write_str("the LUKS2 header is not a converged device-bound one")
+            }
+            Self::NewKeys => f.write_str("the upgrade's new keys do not fit its shape"),
         }
     }
 }
@@ -833,6 +850,120 @@ pub fn cancel(view: &UpgradeView) -> Result<Plan, Refusal> {
     steps.extend(pending.into_iter().map(|token| Step::RemoveToken { token }));
     Ok(Plan {
         view: header.metadata(),
+        volume: Some(view.volume.clone()),
+        steps,
+    })
+}
+
+/// The most new keys phase 1 enrolls.
+const NEW_KEYS: usize = 2;
+
+/// Phase 1's checks (ENCRYPTION.md "Re-encrypting upgrade", phase 1;
+/// DESIGN.md "Upgrade plans"), before the storage worker presents its
+/// review: the header is converged, `count` new keys fit `shape`, and
+/// every plan the upgrade will make fits the JSON area. The bound is every
+/// later plan's growth taken at once, each token at its largest and none
+/// shrunk by a removal: phase 1's imports, then the boot's reencryption, a
+/// keyslot per new key, the marker and, in the TPM shape, the tpm-pin
+/// protector and the lockout token. It returns that bound, which must
+/// leave the area's last byte.
+pub fn phase_one_fits(view: &UpgradeView, shape: Shape, count: usize) -> Result<usize, Refusal> {
+    let header = &view.header;
+    let volume = &view.volume;
+    let ([(_, bound)], [0, slot]) = (header.tokens.as_slice(), header.keyslots.as_slice()) else {
+        return Err(Refusal::NotConverged);
+    };
+    let converged = header.kind() == Kind::DeviceBound
+        && bound.role() == Role::DeviceBound
+        && bound.keyslot() == *slot
+        && header.orphans.is_empty()
+        && header.foreign.is_empty()
+        && !volume.reencryption
+        && volume.segment.is_some()
+        && volume.luks2 == header.keyslots;
+    if !converged {
+        return Err(Refusal::NotConverged);
+    }
+    if count > NEW_KEYS || (shape == Shape::Fido2 && count == 0) {
+        return Err(Refusal::NewKeys);
+    }
+    let keyed = Some(MAX_SLOT);
+    let key = imported(&Token::Fido2(Fido2 {
+        keyslot: keyed,
+        role: FidoRole::Recovery,
+        credential: vec![0; MAX_CREDENTIAL_ID],
+        salt: [0; FIELD_LEN],
+        x: [0; FIELD_LEN],
+        y: [0; FIELD_LEN],
+    }))?;
+    let mut growth = count * (key + KEYSLOT_JSON)
+        + imported(&Token::Upgrade {
+            shape,
+            from: [0; FIELD_LEN],
+        })?
+        + REENCRYPT_JSON
+        + imported(&Token::RecoveryKey { keyslot: keyed })?;
+    if shape == Shape::Tpm {
+        let mut pin = 0;
+        for pcrs in [PinPcrs::Selector, PinPcrs::SecureBoot] {
+            pin = pin.max(imported(&Token::TpmPin(TpmPin {
+                keyslot: keyed,
+                pcrs,
+                primary: [0; crate::pin::PRIMARY_NAME_LEN],
+                salt: [0; crate::pin::SALT_LEN],
+                sealed: SealedObject {
+                    public: vec![0; MAX_PIN_PUBLIC_BYTES],
+                    private: vec![0; MAX_PIN_PRIVATE_BYTES],
+                },
+            }))?);
+        }
+        growth += KEYSLOT_JSON + pin + LOCKOUT_JSON + TOKEN_ENTRY;
+    }
+    let bytes = view.json_len.saturating_add(growth);
+    if bytes >= JSON_AREA_LEN {
+        return Err(Refusal::TooLarge { bytes });
+    }
+    Ok(bytes)
+}
+
+/// Phase 1's header commits over the re-read view (DESIGN.md "Upgrade
+/// plans"): `phase_one_fits` again, then the removal of each pending token
+/// a crashed phase 1 left, each new key's pending token as the lowest
+/// free number, and last the `td-upgrade` token naming `shape` and the
+/// view's data segment identity. The storage worker writes the selector
+/// between the removals and the first import.
+pub fn phase_one(view: &UpgradeView, shape: Shape, keys: &[Fido2]) -> Result<Plan, Refusal> {
+    phase_one_fits(view, shape, keys.len())?;
+    let role = match shape {
+        Shape::Tpm => FidoRole::Recovery,
+        Shape::Fido2 => FidoRole::Primary,
+    };
+    if keys
+        .iter()
+        .any(|key| key.keyslot.is_some() || key.role != role)
+    {
+        return Err(Refusal::NewKeys);
+    }
+    let from = view.volume.segment.ok_or(Refusal::NoSegment)?;
+    let mut steps: Vec<Step> = pending(&view.header)
+        .into_iter()
+        .map(|token| Step::RemoveToken { token })
+        .collect();
+    let tokens = keys
+        .iter()
+        .map(|key| Token::Fido2(key.clone()))
+        .chain([Token::Upgrade { shape, from }]);
+    for token in tokens {
+        // Within the bound `phase_one_fits` took, or refused here.
+        token.encode().map_err(Refusal::Token)?;
+        steps.push(Step::ImportToken {
+            token,
+            id: None,
+            replace: false,
+        });
+    }
+    Ok(Plan {
+        view: view.header.metadata(),
         volume: Some(view.volume.clone()),
         steps,
     })

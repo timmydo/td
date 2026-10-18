@@ -1588,9 +1588,9 @@ states remains governed by [ENCRYPTION.md](ENCRYPTION.md).
 
 Fixed by [ENCRYPTION.md](ENCRYPTION.md) increment 8e's documentation
 commit before its code, and the upgrade and its cancellation by 8f's.
-`storage_operation.rs` implements the selector update and the disk
-proof's keyslot test; the upgrade and its cancellation are not yet
-implemented. td-authd refuses every
+`storage_operation.rs` implements the selector update, the disk
+proof's keyslot test, the upgrade's phase 1 and its cancellation; the
+upgrade boot is the selector's. td-authd refuses every
 storage operation in a production build until that document's item 9,
 and starts a disk proof's worker only in builds that decode the proof,
 test builds until then. The worker
@@ -1682,64 +1682,67 @@ consent time holds no I/O.
 - **Upgrade** (tag 17; ENCRYPTION.md "Re-encrypting upgrade", phase 1).
   The volume byte must be `01` and the ID the baseline's. Before its
   first `10` the worker reads the header again through td-protector's
-  `read_upgrade` (`20` if it is gone or the reader now refuses it) and
-  requires, through td-protector's `upgrade::phase_one_fits` with the
-  shape and count, that the header the upgrade will grow fits its area
-  and that it is converged (`21` otherwise): of kind
-  device-bound, keyslot 0 and exactly one other keyslot, which the one
-  device-bound token names, no reencryption, a data segment identity,
-  and no token but that device-bound token and pending fido2 tokens a
-  crashed phase 1 left, whose removal its commit round begins with; a
-  token of another type is refused, since the reencryption would wipe
-  its keyslot. For the TPM shape it then opens the TPM, reads its PCRs,
-  requiring a SHA-256 bank, and reads `TPM_PT_PERMANENT` without
-  authorization through td-tpm's `dictionary_attack`, requiring
-  `lockoutAuthSet` clear (`27` otherwise, its detail `01` no TPM or no
-  answer, `02` no SHA-256 bank, `03` the lockout authorization set),
-  since a device-bound volume holds no lockout token that could prove a
-  set one; this is the upgrade's one TPM read, and no TPM write follows.
-  Then it makes the selector update's reads and checks (`23`, `24`) for
-  the direct form, preparing the selector with
-  `etc/td/boot-measurement`, as ENCRYPTION.md's selector update says for
-  the upgrade. After the review's `11` it runs each new key's ceremony
-  as td-fido's `fido_disk::create_stepped` over root-admitted devices:
-  creation, proof, repeat, identify probe and no-PIN probe, each phase's
-  client data hashing that step's own description, which the worker
-  presents (`10`) before the key needs it and root admits; the
-  exclusion list is the credentials of the operation's earlier keys and
-  of the header's fido2 tokens that name a keyslot, none on a converged
-  header: a crashed phase 1's pending tokens are on their way out, and
-  excluding them would refuse the very key the person runs phase 1
-  again with. A credential ID over 255 bytes is refused before the
-  proof's PIN. The derived passphrase is zeroed
-  unused: phase 1 writes no secret, and the upgrade boot derives it
-  again. After the last step's `11` it sends `12` only with 120 seconds
-  of its deadline left (`08` otherwise); after root's `13`, before any
-  write, it re-reads the header, the standing and the ESP as the
-  selector update does (`28`), and td-protector's `upgrade::phase_one`
-  plans the header commits from the re-read view (`28` should it refuse
-  what `phase_one_fits` admitted, since the header changed), confirmed
-  against cryptsetup's own metadata (`Plan::confirm`; `28` when they
-  disagree),
-  so the imports land where td's copy of the header expects and `from`
-  is the identity cryptsetup also reads. Its writes, in order, each a
+  `read_upgrade` (`20` if it is gone or the reader now refuses it, `28`
+  if it is not the header the baseline read) and requires, through
+  td-protector's `upgrade::phase_one_fits` with the shape and count,
+  that the header the upgrade will grow fits its area and that it is
+  converged (`21` otherwise): of kind device-bound, keyslot 0 and
+  exactly one other keyslot, which the one device-bound token names,
+  every keyslot `luks2`, no reencryption, a data segment identity, and
+  no token but that
+  device-bound token and pending fido2 tokens a crashed phase 1 left,
+  whose removal its commit round begins with; a token of another type is
+  refused, since the reencryption would wipe its keyslot. For the TPM
+  shape it then opens the TPM, reads its PCRs, requiring a SHA-256 bank,
+  and reads `TPM_PT_PERMANENT` without authorization through td-tpm's
+  `dictionary_attack`, requiring `lockoutAuthSet` clear (`27` otherwise,
+  its detail `01` no TPM or no answer, `02` no SHA-256 bank, `03` the
+  lockout authorization set), since a device-bound volume holds no
+  lockout token that could prove a set one; this is the upgrade's one
+  TPM read, and no TPM write follows. Then it makes the selector
+  update's reads and checks (`23`, `24`) for the direct form, preparing
+  the selector with `etc/td/boot-measurement`, as ENCRYPTION.md's
+  selector update says for the upgrade. After the review's `11` it runs
+  each new key's ceremony: its connect step, after whose `11` the worker
+  waits within the deadline for exactly one connected key that is not
+  the previous ceremony's (`05` for several), then td-fido's
+  `fido_disk::create_stepped` over root-admitted devices: creation,
+  proof, repeat, identify probe and no-PIN probe, each phase's client
+  data hashing that step's own description, which the worker presents
+  (`10`) before the key needs it and root admits; the exclusion list is
+  the credentials of the operation's earlier keys and of the header's
+  fido2 tokens that name a keyslot, none on a converged header: a
+  crashed phase 1's pending tokens are on their way out, and excluding
+  them would refuse the very key the person runs phase 1 again with. A
+  credential ID over 255 bytes is refused before the proof's PIN. The
+  derived passphrase is zeroed unused: phase 1 writes no secret, and the
+  upgrade boot derives it again. After the last step's `11` it sends
+  `12` only with 120 seconds of its deadline left (`08` otherwise);
+  after root's `13`, before any write, it re-reads the header, the
+  standing and the ESP as the selector update does (`28`), and
+  td-protector's `upgrade::phase_one` plans the header commits from the
+  re-read view (`28` should it refuse what `phase_one_fits` admitted,
+  since the header changed), confirmed against cryptsetup's own metadata
+  (`Plan::confirm`; `28` when they disagree), so the imports land where
+  td's copy of the header expects and `from` is the identity cryptsetup
+  also reads (`0f` should that read fail). Its writes, in order, each a
   key-less header commit through td-protector's runner but the
-  selector's: the
-  removal of any pending token a crashed phase 1 left; the selector in
-  its direct form, so the selector that reads what follows understands
-  it; each new key's pending fido2 token (`keyslots` empty, the role the
-  shape gives, its credential, salt and public key), in ceremony order;
-  and last the `td-upgrade` token with the shape and `from`, the
-  re-read header's data segment identity (`luks2::segment_digest`).
-  Then it sends `14`. A failure after the first write is uncertain to
-  root; what it leaves is a device-bound volume, whose pending tokens
-  without a `td-upgrade` token are orphans, or one in U0. A
-  device-bound volume whose selector phase 1 wrote boots a selector
-  carrying `etc/td/boot-measurement` (ENCRYPTION.md, "Verified account
-  handoff", for its rule on a failed measurement).
+  selector's: the removal of any pending token a crashed phase 1 left;
+  the selector in its direct form, so the selector that reads what
+  follows understands it; each new key's pending fido2 token (`keyslots`
+  empty, the role the shape gives, its credential, salt and public key),
+  in ceremony order; and last the `td-upgrade` token with the shape and
+  `from`, the re-read header's data segment identity
+  (`luks2::segment_digest`). Then it sends `14`. A failure after the
+  first write is uncertain to root; what it leaves is a device-bound
+  volume, whose pending tokens without a `td-upgrade` token are orphans,
+  or one in U0. A device-bound volume whose selector phase 1 wrote boots
+  a selector carrying `etc/td/boot-measurement` (ENCRYPTION.md,
+  "Verified account handoff", for its rule on a failed measurement).
 - **Cancellation** (tag 18). The volume byte must be `02`. Before its
   first `10` it reads the header through `read_upgrade` (`20` if it is
-  gone or refused) and plans td-protector's `upgrade::cancel`, which
+  gone or refused, `28` if it is not the baseline's) and plans
+  td-protector's `upgrade::cancel`, which
   admits only U0 (`21` otherwise). After the presentation's `11` it
   sends `12` with 120 seconds left (`08` otherwise); after root's `13`
   it re-reads the header, failing as `28` if it changed, and runs the
@@ -1834,7 +1837,21 @@ definite, and root forwards it as `91 0d`. Host tests drive each
 form over a header and an ESP the test builds, every kind at its point,
 the commit margin and the change check, including space taken after the
 presentation, and the production host's standing, template, key and
-authenticated kernel over a scratch root. The disk proof's drive each
+authenticated kernel over a scratch root. The upgrade's drive phase 1 in
+both shapes, with and without new keys and over a crashed phase 1's
+orphans, through a scripted `Keys` whose creation presents each step:
+the review and each ceremony's steps in order, td-fido's hashes bound
+to what was presented, each key's exclusion list, every read before the
+review, and the commits in order around the selector's direct write;
+and every kind at its point: `21` for a header not converged, each
+`27` detail, `20` and `28` at the view, the selector's reads, a
+description the baseline does not admit, a ceremony's `11`, `06` detail
+`06`, `01`, `0f` and `05`, a change after `13`, metadata that disagrees,
+and a failed commit. The cancellation's drive its removals in order, a
+header past U0, a volume that is not upgrading and a change after
+`13`. The production host's TPM read composes td-protector's
+`release_policy` and td-tpm's `dictionary_attack`, each tested in its
+crate. The disk proof's drive each
 proof to success and to every kind at its point: the codec's refusal,
 a keyslot that refuses, a header changed, gone or refused before the
 test, a token naming no keyslot, a description the baseline does not

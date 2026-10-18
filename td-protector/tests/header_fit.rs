@@ -447,6 +447,63 @@ fn run_step(cs: &Cryptsetup, image: &Path, step: &Step, interrupt: bool) {
     }
 }
 
+/// The largest header `phase_one_fits` admits: a converged device-bound
+/// volume whose token is at its bounds, holding the two pending tokens a
+/// crashed phase 1 left, retried with two new keys at their largest in the
+/// TPM shape. The bound it returns, which covers every later plan, leaves
+/// 1 KiB, so a retry is never refused for size; phase 1's own header is
+/// within it, and reads as U0.
+#[test]
+#[ignore = "needs TD_TEST_CRYPTSETUP and the kernel's AF_ALG"]
+fn the_largest_phase_one_header_fits() {
+    let Some(cs) = tool() else {
+        panic!("TD_TEST_CRYPTSETUP names no cryptsetup");
+    };
+    let dir = scratch("phase-one");
+    let image = format(&cs, dir.path());
+    add_keyslot(&cs, &image, 31);
+    let bound = device::Token::new(
+        31,
+        Role::DeviceBound,
+        SealedObject {
+            public: vec![0xff; device::MAX_PUBLIC_BYTES],
+            private: vec![0xff; device::MAX_PRIVATE_BYTES],
+        },
+    )
+    .unwrap();
+    import(&cs, &image, 0, &bound.encode());
+    for id in [1, 2] {
+        import(&cs, &image, id, &fido2(None).encode().unwrap());
+    }
+    let view = read_upgrade(&image);
+    assert_eq!(view.header.kind(), Kind::DeviceBound);
+    assert_eq!(view.json_len, json_len(&image));
+    let fits = upgrade::phase_one_fits(&view, Shape::Tpm, 2).unwrap();
+    eprintln!(
+        "largest phase 1 header: {} bytes, bounded at {fits} of {JSON_AREA_LEN}",
+        view.json_len
+    );
+    assert!(
+        fits + SPARE <= JSON_AREA_LEN,
+        "{fits} bytes leave under 1 KiB"
+    );
+    let Token::Fido2(key) = fido2(None) else {
+        panic!("a fido2 token")
+    };
+    let keys = [key.clone(), key];
+    let metadata = cs.metadata(&image).unwrap();
+    for step in upgrade::phase_one(&view, Shape::Tpm, &keys)
+        .unwrap()
+        .confirm(&metadata)
+        .unwrap()
+    {
+        run_step(&cs, &image, &step, false);
+    }
+    let after = read_upgrade(&image);
+    assert_eq!(upgrade::check(&after), Ok((State::U0, Shape::Tpm)));
+    assert!(json_len(&image) <= fits);
+}
+
 /// The upgrade from U0 to a protected header over the headers cryptsetup
 /// writes: phase 1's pending tokens and `td-upgrade` token over a
 /// device-bound volume, then each state's plan, confirmed against
@@ -480,24 +537,35 @@ fn the_upgrade_runs_over_cryptsetup_headers() {
         )
         .unwrap();
         import(&cs, &image, 0, &bound.encode());
-        for n in [1, 2] {
-            let role = match (shape, n) {
-                (Shape::Fido2, 1) => FidoRole::Primary,
-                _ => FidoRole::Recovery,
-            };
-            let pending = Token::Fido2(Fido2 {
-                keyslot: None,
-                role,
-                credential: vec![n; 16],
-                salt: [n; 32],
-                x: [n; 32],
-                y: [n; 32],
-            });
-            import(&cs, &image, n, &pending.encode().unwrap());
+        let role = match shape {
+            Shape::Tpm => FidoRole::Recovery,
+            Shape::Fido2 => FidoRole::Primary,
+        };
+        let keys = [1, 2].map(|n| Fido2 {
+            keyslot: None,
+            role,
+            credential: vec![n; 16],
+            salt: [n; 32],
+            x: [n; 32],
+            y: [n; 32],
+        });
+        // Phase 1 as the storage worker writes it, confirmed against
+        // cryptsetup's own metadata: tokens 1 and 2, then `td-upgrade`.
+        let view = read_upgrade(&image);
+        let from = view.volume.segment.unwrap();
+        let metadata = cs.metadata(&image).unwrap();
+        for step in upgrade::phase_one(&view, shape, &keys)
+            .unwrap()
+            .confirm(&metadata)
+            .unwrap()
+        {
+            run_step(&cs, &image, &step, false);
         }
-        let from = read_upgrade(&image).volume.segment.unwrap();
-        let upgrade = Token::Upgrade { shape, from };
-        import(&cs, &image, 3, &upgrade.encode().unwrap());
+        assert_eq!(
+            upgrade::check(&read_upgrade(&image)),
+            Ok((State::U0, shape)),
+            "{case}"
+        );
         let sealed = TpmPin {
             keyslot: None,
             pcrs: PinPcrs::Selector,

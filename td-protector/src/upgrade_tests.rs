@@ -1630,3 +1630,297 @@ fn a_u4_with_no_free_token_number_is_refused() {
     }
     assert_eq!(plan(&disk.view(), &gathered), Err(Refusal::NoFreeToken));
 }
+
+/// A converged device-bound header, as an install's first boot leaves it:
+/// the recovery key in keyslot 0 and the device-bound protector in
+/// keyslot 1 as token 0.
+fn converged() -> Disk {
+    let mut disk = Disk::u0(Shape::Tpm);
+    disk.tokens.retain(|number, _| *number == 0);
+    disk
+}
+
+/// Phase 1's new key `n` in `shape`, at its largest when `largest`.
+fn new_key(shape: Shape, n: u8, largest: bool) -> Fido2 {
+    Fido2 {
+        keyslot: None,
+        role: match shape {
+            Shape::Tpm => FidoRole::Recovery,
+            Shape::Fido2 => FidoRole::Primary,
+        },
+        credential: vec![n; if largest { MAX_CREDENTIAL_ID } else { 16 }],
+        salt: [n; 32],
+        x: [n; 32],
+        y: [n; 32],
+    }
+}
+
+/// Phase 1 over a converged header imports each new key's pending token and
+/// last `td-upgrade` naming the shape and the data segment's identity; over
+/// a crashed phase 1's header it removes the orphans first. Every cut
+/// leaves a device-bound header, whose pending tokens are orphans, or U0;
+/// and the upgrade boot then converges on the shape's protected header.
+#[test]
+fn phase_one_takes_a_converged_header_to_u0() {
+    for &shape in SHAPES {
+        for orphans in [false, true] {
+            let mut disk = converged();
+            if orphans {
+                disk.tokens
+                    .insert(1, Tok::Protected(Token::Fido2(new_key(shape, 8, false))));
+                disk.tokens
+                    .insert(2, Tok::Protected(Token::Fido2(new_key(shape, 9, false))));
+            }
+            let keys = [new_key(shape, 1, false), new_key(shape, 2, false)];
+            let plan = phase_one(&disk.view(), shape, &keys).unwrap();
+            let mut expected = Vec::new();
+            if orphans {
+                expected.extend([
+                    Step::RemoveToken { token: 1 },
+                    Step::RemoveToken { token: 2 },
+                ]);
+            }
+            expected.extend(
+                keys.iter()
+                    .map(|key| Token::Fido2(key.clone()))
+                    .chain([Token::Upgrade {
+                        shape,
+                        from: segment(1),
+                    }])
+                    .map(|token| Step::ImportToken {
+                        token,
+                        id: None,
+                        replace: false,
+                    }),
+            );
+            assert_eq!(plan.steps(), expected, "{shape:?} {orphans}");
+            let steps = plan.confirm(&disk.dump()).unwrap();
+            for cut in 0..steps.len() {
+                let mut cut_disk = disk.clone();
+                for step in &steps[..cut] {
+                    cut_disk.apply(step, None, None);
+                }
+                assert_eq!(cut_disk.header().kind(), Kind::DeviceBound, "{cut}");
+            }
+            for step in &steps {
+                disk.apply(step, None, None);
+            }
+            // The tokens land as numbers 1 to 3, the model's FIDO_KEY + n.
+            assert_eq!(check(&disk.view()), Ok((State::U0, shape)));
+            let done = converge(disk, [None, None], true, Resilience::Journal);
+            assert_final(&done, shape, full(shape), &format!("{shape:?}"));
+        }
+    }
+    // The TPM shape takes no new key: phase 1 imports `td-upgrade` alone.
+    let disk = converged();
+    let plan = phase_one(&disk.view(), Shape::Tpm, &[]).unwrap();
+    assert_eq!(plan.steps().len(), 1);
+}
+
+/// Phase 1's bound covers every header the upgrade boot then reads, each
+/// new key at its largest, and is what `phase_one_fits` returns.
+#[test]
+fn phase_one_fits_bounds_every_later_header() {
+    for &shape in SHAPES {
+        let mut disk = converged();
+        disk.tokens
+            .insert(1, Tok::Protected(Token::Fido2(new_key(shape, 8, true))));
+        let keys = [new_key(shape, 1, true), new_key(shape, 2, true)];
+        let bound = phase_one_fits(&disk.view(), shape, keys.len()).unwrap();
+        for step in phase_one(&disk.view(), shape, &keys)
+            .unwrap()
+            .confirm(&disk.dump())
+            .unwrap()
+        {
+            disk.apply(&step, None, None);
+        }
+        let mut largest = disk.json_len();
+        let mut fresh = 0;
+        for _ in 0..4 {
+            for steps in 0..32 {
+                let mut cut = disk.clone();
+                boot(
+                    &mut cut,
+                    Some(Cut {
+                        steps,
+                        inside: Some(Partial::Initialized),
+                    }),
+                    true,
+                    Resilience::Checksum,
+                    &mut 0,
+                );
+                largest = largest.max(cut.json_len());
+            }
+            boot(&mut disk, None, true, Resilience::Checksum, &mut fresh);
+        }
+        assert_eq!(disk.header().kind(), Kind::Protected);
+        assert!(largest <= bound, "{shape:?}: {largest} > {bound}");
+    }
+    // The model's sizes are below the bound's constants, so its slack
+    // would hide a missing term: the bound is exactly the sum, each token
+    // at its bounds as a new number.
+    let entry = |token: Token| token.encode().unwrap().len() + 6;
+    let key = entry(Token::Fido2(Fido2 {
+        keyslot: Some(31),
+        credential: vec![0; 255],
+        ..new_key(Shape::Tpm, 1, false)
+    }));
+    let pin = entry(Token::TpmPin(TpmPin {
+        keyslot: Some(31),
+        pcrs: PinPcrs::SecureBoot,
+        sealed: SealedObject {
+            public: vec![0; 128],
+            private: vec![0; 256],
+        },
+        ..pin(None, 1)
+    }));
+    let view = converged().view();
+    for shape in [Shape::Tpm, Shape::Fido2] {
+        for count in 1..=2 {
+            let mut sum = count * (key + KEYSLOT_JSON)
+                + entry(Token::Upgrade {
+                    shape,
+                    from: [0; 32],
+                })
+                + REENCRYPT_JSON
+                + entry(Token::RecoveryKey { keyslot: Some(31) });
+            if shape == Shape::Tpm {
+                sum += KEYSLOT_JSON + pin + LOCKOUT_JSON + 6;
+            }
+            assert_eq!(
+                phase_one_fits(&view, shape, count),
+                Ok(view.json_len + sum),
+                "{shape:?} {count}"
+            );
+        }
+    }
+}
+
+/// Phase 1 refuses a header that is not converged, counts its shape does
+/// not take, new keys that are not pending ones of the shape's role, and a
+/// header whose upgrade could outgrow the JSON area.
+#[test]
+fn phase_one_refuses_what_it_cannot_upgrade() {
+    let fits = |disk: &Disk| phase_one_fits(&disk.view(), Shape::Tpm, 2);
+    assert!(fits(&converged()).is_ok());
+    let mut unconverged = vec![Disk::u0(Shape::Tpm), in_state(Shape::Tpm, State::U2)];
+    let mut extra = converged();
+    extra.keyslots.insert(
+        2,
+        Slot {
+            key: 7,
+            vk: 1,
+            luks2: true,
+        },
+    );
+    unconverged.push(extra);
+    let mut first_boot = converged();
+    first_boot.tokens.insert(
+        0,
+        Tok::Bound {
+            slot: Some(1),
+            role: Role::FirstBoot,
+        },
+    );
+    unconverged.push(first_boot);
+    let mut orphan = converged();
+    orphan.tokens.insert(
+        4,
+        Tok::Bound {
+            slot: None,
+            role: Role::DeviceBound,
+        },
+    );
+    unconverged.push(orphan);
+    let mut foreign = converged();
+    foreign.tokens.insert(4, Tok::Foreign(vec![1]));
+    unconverged.push(foreign);
+    let mut bare = converged();
+    bare.tokens.clear();
+    unconverged.push(bare);
+    let mut zero = converged();
+    zero.tokens.insert(
+        0,
+        Tok::Bound {
+            slot: Some(0),
+            role: Role::DeviceBound,
+        },
+    );
+    unconverged.push(zero);
+    let mut protected = converged();
+    protected
+        .tokens
+        .insert(4, Tok::Protected(Token::RecoveryKey { keyslot: Some(0) }));
+    unconverged.push(protected);
+    let mut reencrypting = converged();
+    reencrypting.reencrypting = Some(2);
+    unconverged.push(reencrypting);
+    for disk in &unconverged {
+        assert_eq!(fits(disk), Err(Refusal::NotConverged), "{disk:?}");
+        assert_eq!(
+            phase_one(&disk.view(), Shape::Tpm, &[]).err(),
+            Some(Refusal::NotConverged)
+        );
+    }
+    let mut no_segment = converged().view();
+    no_segment.volume.segment = None;
+    assert_eq!(
+        phase_one_fits(&no_segment, Shape::Tpm, 0),
+        Err(Refusal::NotConverged)
+    );
+    // Counts: 0 to 2 in the TPM shape, 1 or 2 in the FIDO2 shape.
+    let view = converged().view();
+    for (shape, count, admitted) in [
+        (Shape::Tpm, 0, true),
+        (Shape::Tpm, 2, true),
+        (Shape::Tpm, 3, false),
+        (Shape::Fido2, 0, false),
+        (Shape::Fido2, 1, true),
+        (Shape::Fido2, 3, false),
+    ] {
+        let fitted = phase_one_fits(&view, shape, count);
+        assert_eq!(fitted.is_ok(), admitted, "{shape:?} {count}");
+        if !admitted {
+            assert_eq!(fitted, Err(Refusal::NewKeys));
+        }
+    }
+    // New keys: pending, of the shape's role.
+    for key in [
+        Fido2 {
+            keyslot: Some(2),
+            ..new_key(Shape::Tpm, 1, false)
+        },
+        new_key(Shape::Fido2, 1, false),
+    ] {
+        assert_eq!(
+            phase_one(&view, Shape::Tpm, &[key]).err(),
+            Some(Refusal::NewKeys)
+        );
+    }
+    let long = Fido2 {
+        credential: vec![1; MAX_CREDENTIAL_ID + 1],
+        ..new_key(Shape::Tpm, 1, false)
+    };
+    assert!(matches!(
+        phase_one(&view, Shape::Tpm, &[long]),
+        Err(Refusal::Token(_))
+    ));
+    // The bound must leave the area's last byte.
+    let growth = phase_one_fits(&view, Shape::Tpm, 2).unwrap() - view.json_len;
+    let mut edge = view.clone();
+    edge.json_len = JSON_AREA_LEN - 1 - growth;
+    assert_eq!(phase_one_fits(&edge, Shape::Tpm, 2), Ok(JSON_AREA_LEN - 1));
+    edge.json_len += 1;
+    assert_eq!(
+        phase_one_fits(&edge, Shape::Tpm, 2),
+        Err(Refusal::TooLarge {
+            bytes: JSON_AREA_LEN
+        })
+    );
+    assert!(phase_one(&edge, Shape::Tpm, &[new_key(Shape::Tpm, 1, false)]).is_ok());
+    // Each new key, the TPM shape's protectors and the shape's own token
+    // grow the bound.
+    let one = phase_one_fits(&view, Shape::Tpm, 1).unwrap();
+    assert!(phase_one_fits(&view, Shape::Tpm, 0).unwrap() < one);
+    assert!(phase_one_fits(&view, Shape::Fido2, 1).unwrap() < one);
+}

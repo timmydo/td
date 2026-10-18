@@ -1,9 +1,10 @@
 //! `td-install storage-operation --uid 1000`: td-authd's root storage
 //! worker (DESIGN.md "Storage operation worker", td-authd/DESIGN.md
 //! amendment 10). In increment 8e it carries the selector update in both
-//! forms and the keyslot test of a login-key operation's disk proof;
-//! td-authd starts it only in test builds until ENCRYPTION.md's item 9, so
-//! nothing in production runs it.
+//! forms and the keyslot test of a login-key operation's disk proof, and in
+//! 8f the re-encrypting upgrade's phase 1 and its cancellation; td-authd
+//! starts it only in test builds until ENCRYPTION.md's item 9, so nothing
+//! in production runs it.
 //!
 //! The worker reads everything an update needs before it presents the
 //! description, so the approval key's time holds no I/O, and after root's
@@ -13,11 +14,13 @@
 //! worker exits successfully after sending it. A disk proof writes
 //! nothing: it presents the proof's steps, takes the recovery key or a
 //! disk security key's assertion, and tests the keyslot that secret opens
-//! against an unchanged header.
+//! against an unchanged header. Phase 1 presents its review and each new
+//! key's ceremony, then writes key-less header commits and the selector;
+//! the cancellation removes what phase 1 wrote.
 
 use crate::consent::{
-    DiskProofs, LoginStep, Operation, Proof, Request, SelectorForm, LOGIN_LONGEST,
-    SELECTOR_UPDATE_CEILING,
+    upgrade_ceiling, DiskProofs, LoginStep, Operation, Proof, Request, SelectorForm, UpgradeShape,
+    UpgradeStep, LOGIN_LONGEST, SELECTOR_UPDATE_CEILING, UPGRADE_CANCEL_CEILING,
 };
 use crate::frames::{self, remaining, Wire};
 use crate::{
@@ -30,18 +33,19 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
-use td_fido::fido_ctap::fingerprint;
+use td_fido::fido_ctap::{fingerprint, Es256PublicKey};
 use td_fido::fido_device::{self, Interruption, Program, MAX_LIFETIME};
-use td_fido::fido_disk::{self, DiskError, Released, Steps};
+use td_fido::fido_disk::{self, CreateStep, CreateSteps, Created, DiskError, Released, Steps};
 use td_fido::fido_p256::PublicKey;
 use td_fido::fido_pin::{LoginRefusal, Pin};
 use td_fido::fido_transaction::{Devices, Error as FidoError, Status};
 use td_protector::cryptsetup::{self, Bounded, Cryptsetup};
 use td_protector::lockout::volume_uuid;
-use td_protector::luks2::{self, Header, Kind};
+use td_protector::luks2::{self, Header, Kind, UpgradeView};
 use td_protector::protected::{Fido2, FidoRole, Shape, Token};
 use td_protector::protected_plan;
 use td_protector::recovery::RecoveryKey;
+use td_protector::upgrade::{self, Step};
 
 const PRESENT: u8 = 0x10;
 const PRESENTED: u8 = 0x11;
@@ -85,6 +89,26 @@ pub(crate) enum Failure {
     /// After root's `13` and before any write, or before a disk proof's
     /// keyslot test.
     Changed,
+    /// A new key already holds a credential the upgrade excludes.
+    Excluded,
+    /// The new credential's identify probe did not select it.
+    Unprobed,
+    /// A volume state the operation does not take: a header not converged
+    /// for an upgrade, one past U0 for a cancellation.
+    State,
+    /// The TPM shape's TPM, as its detail says.
+    Tpm(TpmRefusal),
+}
+
+/// Why the TPM shape's one TPM read refused it, `27`'s detail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TpmRefusal {
+    /// No TPM, or no answer.
+    Absent,
+    NoSha256Bank,
+    /// `lockoutAuthSet`, which a device-bound volume holds no token to
+    /// prove.
+    LockoutSet,
 }
 
 impl Failure {
@@ -106,6 +130,10 @@ impl Failure {
             Self::Mistyped => 0x25,
             Self::WrongKey => 0x26,
             Self::Changed => 0x28,
+            Self::Excluded => 0x11,
+            Self::Unprobed => 0x06,
+            Self::State => 0x21,
+            Self::Tpm(_) => 0x27,
         }
     }
 
@@ -122,6 +150,13 @@ impl Failure {
                 LoginRefusal::ListTooSmall => 5,
                 // A key that cannot require its PIN has no typed text.
                 LoginRefusal::NoFido21 | LoginRefusal::PinOptional => return Self::Failed.frame(),
+            }),
+            // The login worker's reserved detail for a probe that fails.
+            Self::Unprobed => Some(6),
+            Self::Tpm(refusal) => Some(match refusal {
+                TpmRefusal::Absent => 1,
+                TpmRefusal::NoSha256Bank => 2,
+                TpmRefusal::LockoutSet => 3,
             }),
             _ => None,
         };
@@ -290,6 +325,17 @@ pub(crate) trait Host {
         expected: &Header,
         deadline: Instant,
     ) -> Result<Tested, String>;
+    /// The held partition's header and its upgrade view, read afresh.
+    fn upgrade_view(&mut self) -> Option<Result<UpgradeView, String>>;
+    /// The TPM shape's one TPM read: a SHA-256 bank, and `lockoutAuthSet`
+    /// clear in `TPM_PT_PERMANENT`. It writes nothing.
+    fn tpm(&mut self) -> Result<(), TpmRefusal>;
+    /// `luksDump --dump-json-metadata` of the held partition, after root's
+    /// `13`: cryptsetup may repair the header it reads.
+    fn metadata(&mut self) -> Result<Vec<u8>, String>;
+    /// One key-less header commit on the held partition, a token's removal
+    /// or import, whose child lives until `deadline` at most.
+    fn commit(&mut self, step: &Step, deadline: Instant) -> Result<(), String>;
 }
 
 /// What a keyslot test found.
@@ -316,6 +362,17 @@ pub(crate) trait Keys {
         identify: &[u8],
         steps: &mut Presenter<'_>,
     ) -> Result<Released, DiskError>;
+    /// After a connect step: waits until `deadline` for exactly one key,
+    /// not the previous ceremony's. Several refuse.
+    fn connect(&mut self, deadline: Instant) -> Result<(), Failure>;
+    /// A new key's ceremony through td-fido's stepped creation.
+    fn create(
+        &mut self,
+        deadline: Instant,
+        excluded: &[&[u8]],
+        volume: &[u8; 16],
+        steps: &mut Ceremony<'_>,
+    ) -> Result<Created, DiskError>;
 }
 
 /// The selector `prepare` builds from the template, key and identity.
@@ -377,6 +434,20 @@ fn perform<H: Host, K: Keys>(
         };
         return proof.run(wire, host, keys, started, entropy);
     }
+    let operation = Operated {
+        request: &request,
+        baseline: &baseline,
+        read: &read,
+    };
+    match request.operation() {
+        Operation::Upgrade { .. } => {
+            return operation.upgrade(wire, host, keys, started, margin, prepare, entropy)
+        }
+        Operation::UpgradeCancel { .. } => {
+            return operation.cancel(wire, host, started, margin, entropy)
+        }
+        _ => {}
+    }
     // Root derives the description from the baseline, as this does.
     let (form, id) = match (
         request.operation(),
@@ -396,18 +467,8 @@ fn perform<H: Host, K: Keys>(
             .ok_or(Failure::Internal)?,
     );
     // Every read before the presentation.
-    let kernel = host.kernel(&id).map_err(|_| Failure::Deployment)?;
-    let template = host.template().map_err(|_| Failure::Deployment)?;
-    let key = host.trusted_key().map_err(|_| Failure::Internal)?;
-    let selector = prepare(&template, &key, host.uuid(), baseline.volume.measured())
-        .map_err(|_| Failure::Deployment)?;
-    drop(template);
-    let esp = host.esp().map_err(|_| Failure::Esp)?;
     let staged = form == SelectorForm::Staged;
-    esp.fits(kernel.len() as u64, selector.len() as u64, staged)
-        .map_err(|_| Failure::Esp)?;
-    let admitted = esp.boot().clone();
-    drop(esp);
+    let pair = Pair::read(host, &id, baseline.volume.measured(), staged, prepare)?;
     // The description, presented once; its typed key is its receipt.
     let description = request.encode();
     let round = entropy().map_err(|_| Failure::Internal)?;
@@ -425,31 +486,427 @@ fn perform<H: Host, K: Keys>(
     if host.header() != read || host.standing() != baseline.current {
         return Err(Failure::Changed);
     }
-    let mut esp = host.esp().map_err(|_| Failure::Changed)?;
-    if *esp.boot() != admitted {
-        return Err(Failure::Changed);
-    }
-    // `fits` writes nothing, so a refusal now is as definite as the reads':
-    // the ESP's free space or slots changed since the presentation.
-    esp.fits(kernel.len() as u64, selector.len() as u64, staged)
-        .map_err(|_| Failure::Changed)?;
-    let input = |bytes: &[u8]| bytes.len() as u64;
-    let (mut k, mut i) = (kernel.as_slice(), selector.as_slice());
-    let kernel = td_fat::Input {
-        len: input(k),
-        reader: &mut k,
-    };
-    let initrd = td_fat::Input {
-        len: input(i),
-        reader: &mut i,
-    };
-    if staged {
-        esp.stage(kernel, initrd)
-    } else {
-        esp.write_direct(kernel, initrd)
-    }
-    .map_err(|_| Failure::Failed)?;
+    let mut esp = pair.reopen(host)?;
+    pair.write(&mut esp)?;
     wire.send(&[SUCCESS]).map_err(|_| Failure::Internal)
+}
+
+/// A selector pair's reads before the presentation: `current`'s
+/// authenticated kernel, the selector prepared from the running root's
+/// template, and the ESP's `EFI/BOOT` sector as td-fat admitted it, which
+/// fits the pair in its form.
+struct Pair {
+    kernel: Vec<u8>,
+    selector: Vec<u8>,
+    staged: bool,
+    admitted: td_fat::BootDir,
+}
+
+impl Pair {
+    fn read<H: Host>(
+        host: &mut H,
+        id: &[u8; 32],
+        measured: bool,
+        staged: bool,
+        prepare: Prepare<'_>,
+    ) -> Result<Self, Failure> {
+        let kernel = host.kernel(id).map_err(|_| Failure::Deployment)?;
+        let template = host.template().map_err(|_| Failure::Deployment)?;
+        let key = host.trusted_key().map_err(|_| Failure::Internal)?;
+        let selector =
+            prepare(&template, &key, host.uuid(), measured).map_err(|_| Failure::Deployment)?;
+        drop(template);
+        let esp = host.esp().map_err(|_| Failure::Esp)?;
+        esp.fits(kernel.len() as u64, selector.len() as u64, staged)
+            .map_err(|_| Failure::Esp)?;
+        let admitted = esp.boot().clone();
+        Ok(Self {
+            kernel,
+            selector,
+            staged,
+            admitted,
+        })
+    }
+
+    /// The ESP again after root's `13`, its sector as admitted, or `28`.
+    fn reopen<H: Host>(&self, host: &mut H) -> Result<td_fat::Esp<H::Disk>, Failure> {
+        let esp = host.esp().map_err(|_| Failure::Changed)?;
+        if *esp.boot() != self.admitted {
+            return Err(Failure::Changed);
+        }
+        // `fits` writes nothing, so a refusal now is as definite as the
+        // reads': the ESP's free space or slots changed since the
+        // presentation.
+        esp.fits(
+            self.kernel.len() as u64,
+            self.selector.len() as u64,
+            self.staged,
+        )
+        .map_err(|_| Failure::Changed)?;
+        Ok(esp)
+    }
+
+    fn write<D: td_fat::Device>(&self, esp: &mut td_fat::Esp<D>) -> Result<(), Failure> {
+        let input = |bytes: &[u8]| bytes.len() as u64;
+        let (mut k, mut i) = (self.kernel.as_slice(), self.selector.as_slice());
+        let kernel = td_fat::Input {
+            len: input(k),
+            reader: &mut k,
+        };
+        let initrd = td_fat::Input {
+            len: input(i),
+            reader: &mut i,
+        };
+        if self.staged {
+            esp.stage(kernel, initrd)
+        } else {
+            esp.write_direct(kernel, initrd)
+        }
+        .map_err(|_| Failure::Failed)
+    }
+}
+
+/// An upgrade or its cancellation: root's first description, the baseline
+/// it was built from, and the header read that baseline holds.
+struct Operated<'a> {
+    request: &'a Request,
+    baseline: &'a Baseline,
+    read: &'a Read,
+}
+
+impl Operated<'_> {
+    /// The header again through the upgrade's reader: `20` when it is gone
+    /// or refused, `28` when it is not the baseline's.
+    fn view<H: Host>(&self, host: &mut H) -> Result<UpgradeView, Failure> {
+        let view = match host.upgrade_view() {
+            Some(Ok(view)) => view,
+            None | Some(Err(_)) => return Err(Failure::Volume),
+        };
+        match self.read {
+            Some(Ok(header)) if *header == view.header => Ok(view),
+            _ => Err(Failure::Changed),
+        }
+    }
+
+    /// The commit round's invitation once `margin` remains, and its
+    /// acknowledgement for `description`, the operation's last step.
+    fn commit_round(
+        wire: &mut Wire,
+        description: &[u8],
+        margin: Duration,
+        entropy: &mut dyn FnMut() -> Result<[u8; 32], String>,
+    ) -> Result<(), Failure> {
+        if remaining(wire.deadline()).map_err(|_| Failure::Timeout)? < margin {
+            return Err(Failure::Timeout);
+        }
+        let round = entropy().map_err(|_| Failure::Internal)?;
+        wire.exchange(COMMIT, COMMITTED, round, description, None)
+            .map_err(|_| framing(wire))
+    }
+
+    /// Runs `steps`, a confirmed plan's, as key-less header commits.
+    fn commit<H: Host>(host: &mut H, steps: &[Step], deadline: Instant) -> Result<(), Failure> {
+        for step in steps {
+            host.commit(step, deadline).map_err(|_| Failure::Failed)?;
+        }
+        Ok(())
+    }
+
+    /// Phase 1 (DESIGN.md "Storage operation worker", Upgrade): every read
+    /// before the review, then each new key's ceremony, then after root's
+    /// `13` the re-reads and the writes: the orphans' removals, the
+    /// selector in its direct form, each new key's pending token and last
+    /// `td-upgrade`.
+    #[allow(clippy::too_many_arguments)]
+    fn upgrade<H: Host, K: Keys>(
+        &self,
+        wire: &mut Wire,
+        host: &mut H,
+        keys: &mut K,
+        started: Instant,
+        margin: Duration,
+        prepare: Prepare<'_>,
+        entropy: &mut dyn FnMut() -> Result<[u8; 32], String>,
+    ) -> Result<(), Failure> {
+        let (shape, count, id) = match (self.request.operation(), self.baseline.current) {
+            (
+                Operation::Upgrade {
+                    shape,
+                    count,
+                    current,
+                    step: UpgradeStep::Review,
+                    ..
+                },
+                Some(id),
+            ) if self.baseline.volume == Volume::DeviceBound && *current == hex(&id) => {
+                (*shape, *count, id)
+            }
+            _ => return Err(Failure::Internal),
+        };
+        self.request
+            .upgrade_start()
+            .map_err(|_| Failure::Internal)?;
+        wire.limit(
+            started
+                .checked_add(upgrade_ceiling(count))
+                .ok_or(Failure::Internal)?,
+        );
+        let (shape, role) = match shape {
+            UpgradeShape::Tpm => (Shape::Tpm, FidoRole::Recovery),
+            UpgradeShape::Fido2 => (Shape::Fido2, FidoRole::Primary),
+        };
+        // Every read before the review.
+        let view = self.view(host)?;
+        upgrade::phase_one_fits(&view, shape, usize::from(count)).map_err(|_| Failure::State)?;
+        if shape == Shape::Tpm {
+            host.tpm().map_err(Failure::Tpm)?;
+        }
+        let pair = Pair::read(host, &id, true, false, prepare)?;
+        let round = entropy().map_err(|_| Failure::Internal)?;
+        let bound = wire.bound();
+        wire.exchange(
+            PRESENT,
+            PRESENTED,
+            round,
+            &self.request.encode(),
+            Some(bound),
+        )
+        .map_err(|_| framing(wire))?;
+        // The ceremonies: none of a header token naming a keyslot, nor an
+        // earlier key's, may be created again.
+        let named: Vec<&[u8]> = fido_tokens(&view.header)
+            .into_iter()
+            .filter(|token| token.keyslot.is_some())
+            .map(|token| token.credential.as_slice())
+            .collect();
+        let volume = volume_uuid(&view.header.uuid).ok_or(Failure::Internal)?;
+        let fingerprints: Vec<[u8; 4]> = self.baseline.tokens.iter().map(|(_, key)| *key).collect();
+        let mut ceremony = Ceremony {
+            wire,
+            current: self.request.clone(),
+            baseline: &fingerprints,
+            key: 0,
+            entropy,
+            reported: None,
+            cause: None,
+        };
+        let mut made: Vec<Fido2> = Vec::with_capacity(usize::from(count));
+        for key in 1..=count {
+            ceremony.key = key;
+            ceremony.present(LoginStep::Connect, None)?;
+            keys.connect(ceremony.wire.deadline())?;
+            let mut excluded = named.clone();
+            excluded.extend(made.iter().map(|key| key.credential.as_slice()));
+            // One session's lifetime at most, inside the operation's.
+            let deadline = Instant::now()
+                .checked_add(MAX_LIFETIME)
+                .map_or(ceremony.wire.deadline(), |lifetime| {
+                    lifetime.min(ceremony.wire.deadline())
+                });
+            ceremony.wire.session(Some(deadline));
+            let result = keys.create(deadline, &excluded, &volume, &mut ceremony);
+            let created = result.map_err(|error| match error {
+                // Only a creation's exclusion list names a credential.
+                DiskError::Failed(FidoError::Status(Status::CredentialExcluded)) => {
+                    Failure::Excluded
+                }
+                error => disk_failure(
+                    error,
+                    ceremony.cause.take(),
+                    ceremony.reported.take(),
+                    ceremony.wire,
+                ),
+            });
+            ceremony.wire.session(None);
+            let created = created?;
+            let cose = Es256PublicKey::from_cose(&created.cose).map_err(|_| Failure::Failed)?;
+            let (x, y) = cose.coordinates();
+            // The passphrase is zeroed unused: the upgrade boot derives it.
+            made.push(Fido2 {
+                keyslot: None,
+                role,
+                credential: created.credential.clone(),
+                salt: created.salt,
+                x: *x,
+                y: *y,
+            });
+        }
+        let Ceremony {
+            wire,
+            current,
+            entropy,
+            ..
+        } = ceremony;
+        Self::commit_round(wire, &current.encode(), margin, entropy)?;
+        // Root may now count a write as begun; nothing is written until
+        // every read below agrees with what was presented.
+        if host.header() != *self.read || host.standing() != self.baseline.current {
+            return Err(Failure::Changed);
+        }
+        let mut esp = pair.reopen(host)?;
+        let view = self.view(host).map_err(|_| Failure::Changed)?;
+        let plan = upgrade::phase_one(&view, shape, &made).map_err(|_| Failure::Changed)?;
+        let metadata = host.metadata().map_err(|_| Failure::Failed)?;
+        let steps = plan.confirm(&metadata).map_err(|_| Failure::Changed)?;
+        // `phase_one` puts every removal first: the selector is written
+        // between them and the imports.
+        let removed = steps
+            .iter()
+            .take_while(|step| matches!(step, Step::RemoveToken { .. }))
+            .count();
+        let (removals, imports) = steps.split_at_checked(removed).ok_or(Failure::Internal)?;
+        if imports
+            .iter()
+            .any(|step| matches!(step, Step::RemoveToken { .. }))
+        {
+            return Err(Failure::Internal);
+        }
+        Self::commit(host, removals, wire.deadline())?;
+        pair.write(&mut esp)?;
+        drop(esp);
+        Self::commit(host, imports, wire.deadline())?;
+        wire.send(&[SUCCESS]).map_err(|_| Failure::Internal)
+    }
+
+    /// The cancellation in U0 (DESIGN.md "Storage operation worker",
+    /// Cancellation): the plan before its one presentation, the header
+    /// re-read after root's `13`, then the plan's removals.
+    fn cancel<H: Host>(
+        &self,
+        wire: &mut Wire,
+        host: &mut H,
+        started: Instant,
+        margin: Duration,
+        entropy: &mut dyn FnMut() -> Result<[u8; 32], String>,
+    ) -> Result<(), Failure> {
+        if self.baseline.volume != Volume::Upgrading {
+            return Err(Failure::Internal);
+        }
+        wire.limit(
+            started
+                .checked_add(UPGRADE_CANCEL_CEILING)
+                .ok_or(Failure::Internal)?,
+        );
+        let view = self.view(host)?;
+        let plan = upgrade::cancel(&view).map_err(|_| Failure::State)?;
+        let description = self.request.encode();
+        let round = entropy().map_err(|_| Failure::Internal)?;
+        let bound = wire.bound();
+        wire.exchange(PRESENT, PRESENTED, round, &description, Some(bound))
+            .map_err(|_| framing(wire))?;
+        Self::commit_round(wire, &description, margin, entropy)?;
+        if host.header() != *self.read {
+            return Err(Failure::Changed);
+        }
+        let metadata = host.metadata().map_err(|_| Failure::Failed)?;
+        let steps = plan.confirm(&metadata).map_err(|_| Failure::Changed)?;
+        Self::commit(host, &steps, wire.deadline())?;
+        wire.send(&[SUCCESS]).map_err(|_| Failure::Internal)
+    }
+}
+
+/// An upgrade's key ceremony, presented one step at a time: the connect
+/// step, then td-fido's create, prove, repeat and probe steps, each once
+/// the key has answered what it names, and the PIN root sends for each
+/// PIN step.
+pub(crate) struct Ceremony<'a> {
+    wire: &'a mut Wire,
+    /// The step last presented, which the next must succeed.
+    current: Request,
+    /// The header's fido2 tokens' fingerprints, which root admits against.
+    baseline: &'a [[u8; 4]],
+    /// The new key this ceremony creates, 1 or 2.
+    key: u8,
+    entropy: &'a mut dyn FnMut() -> Result<[u8; 32], String>,
+    /// The retries of the PIN step presented, once its PIN was taken.
+    reported: Option<u8>,
+    /// Why a step failed, which td-fido reports only as an ended step.
+    cause: Option<Failure>,
+}
+
+impl Ceremony<'_> {
+    /// Presents `step` of this key as root admits it, `created` the new
+    /// credential's fingerprint from prove on, and returns its encoding.
+    fn present(&mut self, step: LoginStep, created: Option<[u8; 4]>) -> Result<Vec<u8>, Failure> {
+        let Operation::Upgrade {
+            account,
+            shape,
+            count,
+            current,
+            ..
+        } = self.current.operation().clone()
+        else {
+            return Err(Failure::Internal);
+        };
+        let next = Request::new(
+            *self.current.nonce(),
+            self.current.owner(),
+            Operation::Upgrade {
+                account,
+                shape,
+                count,
+                current,
+                step: UpgradeStep::Key {
+                    key: self.key,
+                    step,
+                },
+                approval: None,
+            },
+        )
+        .map_err(|_| Failure::Internal)?;
+        // Exactly what root admits; td-fido never asks for a zero count.
+        self.current
+            .admit_upgrade_step(&next, self.baseline, created)
+            .map_err(|_| Failure::Internal)?;
+        let description = next.encode();
+        let round = (self.entropy)().map_err(|_| Failure::Internal)?;
+        self.wire
+            .exchange(PRESENT, PRESENTED, round, &description, None)
+            .map_err(|_| framing(self.wire))?;
+        self.current = next;
+        Ok(description)
+    }
+
+    fn pin_step(&mut self, step: CreateStep<'_>, retries: u8) -> Result<(Pin, Vec<u8>), Failure> {
+        let created = step.credential().map(fingerprint);
+        let login = match (step, created) {
+            (CreateStep::Create, _) => LoginStep::Create { retries },
+            (CreateStep::Prove(_), Some(key)) => LoginStep::Prove { key, retries },
+            (CreateStep::Repeat(_), Some(key)) => LoginStep::Repeat { key, retries },
+            _ => return Err(Failure::Internal),
+        };
+        let description = self.present(login, created)?;
+        let mut secret = self.wire.receive_secret().map_err(|_| framing(self.wire))?;
+        let pin = Pin::new(std::mem::take(&mut secret.0)).map_err(|_| Failure::Internal)?;
+        Ok((pin, description))
+    }
+}
+
+impl CreateSteps for Ceremony<'_> {
+    fn pin(&mut self, step: CreateStep<'_>, retries: u8) -> Result<(Pin, Vec<u8>), String> {
+        match self.pin_step(step, retries) {
+            Ok(answer) => {
+                self.reported = Some(retries);
+                Ok(answer)
+            }
+            Err(failure) => {
+                self.cause = Some(failure);
+                Err("upgrade PIN step failed".into())
+            }
+        }
+    }
+
+    fn probe(&mut self, credential: &[u8]) -> Result<Vec<u8>, String> {
+        let key = fingerprint(credential);
+        self.present(LoginStep::Probe { key }, Some(key))
+            .map_err(|failure| {
+                self.cause = Some(failure);
+                "upgrade probe step failed".to_string()
+            })
+    }
+
+    /// The step's rows already ask for the touch; the wire has no frame.
+    fn touch(&mut self, _: td_fido::fido_disk::Phase) {}
 }
 
 /// A disk proof: root's first description at the proof's first step, the
@@ -733,9 +1190,8 @@ fn disk_failure(
         DiskError::NotEnrolled => Failure::NotEnrolled,
         DiskError::Refused(refusal) => Failure::Refused(refusal),
         DiskError::Ended => cause.unwrap_or(Failure::Internal),
-        DiskError::CredentialLength | DiskError::Mismatch | DiskError::Unselectable => {
-            Failure::Failed
-        }
+        DiskError::Unselectable => Failure::Unprobed,
+        DiskError::CredentialLength | DiskError::Mismatch => Failure::Failed,
         DiskError::Failed(error) => match error {
             FidoError::Status(Status::PinInvalid) => {
                 reported.map_or(Failure::Failed, Failure::WrongPin)
@@ -805,7 +1261,10 @@ pub(crate) fn run(uid: u32) -> Result<(), String> {
         paths::metadata_if_present(Path::new(&format!("/proc/{pid}"))).is_some()
     });
     let mut keys = match paths::open_read(Path::new("/dev/urandom")) {
-        Ok(random) => RootKeys { random },
+        Ok(random) => RootKeys {
+            random,
+            previous: None,
+        },
         Err(_) => {
             let _ = wire.send(&Failure::Internal.frame());
             return Err("storage operation refused its start: no kernel entropy".into());
@@ -887,7 +1346,12 @@ impl Devices for Root {
 /// Production's disk security keys, td-fido's draws from the kernel.
 struct RootKeys {
     random: File,
+    /// The key the last connect step found, which the next must not be.
+    previous: Option<fido_device::Device>,
 }
+
+/// How often a connect step looks for the new key.
+const POLL: Duration = Duration::from_millis(100);
 
 impl Keys for RootKeys {
     fn authorize(
@@ -912,6 +1376,35 @@ impl Keys for RootKeys {
                     .map_err(|_| "read kernel entropy".into())
             },
         )
+    }
+
+    fn connect(&mut self, deadline: Instant) -> Result<(), Failure> {
+        loop {
+            let left = remaining(deadline).map_err(|_| Failure::Timeout)?;
+            match Root.discover().map_err(|_| Failure::Failed)?.as_slice() {
+                [node] if Some(*node) != self.previous => {
+                    self.previous = Some(*node);
+                    return Ok(());
+                }
+                [] | [_] => Root.pause(POLL.min(left)),
+                _ => return Err(Failure::OneKey),
+            }
+        }
+    }
+
+    fn create(
+        &mut self,
+        deadline: Instant,
+        excluded: &[&[u8]],
+        volume: &[u8; 16],
+        steps: &mut Ceremony<'_>,
+    ) -> Result<Created, DiskError> {
+        let random = &mut self.random;
+        fido_disk::create_stepped(&mut Root, deadline, excluded, volume, steps, &mut |out| {
+            random
+                .read_exact(out)
+                .map_err(|_| "read kernel entropy".into())
+        })
     }
 }
 
@@ -1231,6 +1724,85 @@ impl Host for Machine {
             Err(error) => Err(error.to_string()),
         }
     }
+
+    fn upgrade_view(&mut self) -> Option<Result<UpgradeView, String>> {
+        let partition = self.partition.as_mut()?;
+        Some(luks2::read_upgrade(partition).and_then(|view| {
+            if view.header.uuid == self.uuid {
+                Ok(view)
+            } else {
+                Err("the held partition's header names another volume".into())
+            }
+        }))
+    }
+
+    /// td-tpm over the resource manager: one PCR_Read of the selector's
+    /// PCRs, which answers whether a SHA-256 bank exists, then
+    /// `TPM_PT_PERMANENT`, both without authorization.
+    fn tpm(&mut self) -> Result<(), TpmRefusal> {
+        let transport = td_tpm::Device::open().map_err(|_| TpmRefusal::Absent)?;
+        let mut client = td_tpm::Client::new(transport);
+        match td_protector::release_policy(&mut client) {
+            Ok(_) => {}
+            Err(td_tpm::PcrReadError::NoSha256Bank) => return Err(TpmRefusal::NoSha256Bank),
+            Err(td_tpm::PcrReadError::Other(_)) => return Err(TpmRefusal::Absent),
+        }
+        let state = client.dictionary_attack().map_err(|_| TpmRefusal::Absent)?;
+        if state.lockout_auth_set {
+            Err(TpmRefusal::LockoutSet)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn metadata(&mut self) -> Result<Vec<u8>, String> {
+        let device = self.held_node()?;
+        self.cryptsetup()
+            .metadata(&device)
+            .map_err(|e| e.to_string())
+    }
+
+    /// The installed cryptsetup's token removal or import on the held
+    /// partition's node, checked to be the held one; its standard input
+    /// carries an imported token's text and never a key.
+    fn commit(&mut self, step: &Step, deadline: Instant) -> Result<(), String> {
+        let device = self.held_node()?;
+        let input = match step.input() {
+            upgrade::Input::Token(token) => token.encode()?.into_bytes(),
+            upgrade::Input::Nothing => Vec::new(),
+            upgrade::Input::Key(_) => return Err("a header commit takes no key".into()),
+        };
+        let args = step
+            .args(&device, "td-system", Path::new("/nonexistent"))
+            .ok_or("not a cryptsetup header commit")?;
+        match self
+            .cryptsetup()
+            .run_bounded(&args, &input, deadline, &mut || false)
+        {
+            Ok(Bounded::Exited(status)) if status.success() => Ok(()),
+            Ok(_) => Err("cryptsetup's header commit failed".into()),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+}
+
+impl Machine {
+    fn cryptsetup(&self) -> Cryptsetup {
+        Cryptsetup::new(self.root.join("bin").join(protocol::CRYPTSETUP))
+    }
+
+    /// The node `td-boot volume` named, while it still names the held
+    /// partition.
+    fn held_node(&self) -> Result<PathBuf, String> {
+        let device = self.device.as_ref().ok_or("no held partition")?;
+        let partition = self.partition.as_ref().ok_or("no held partition")?;
+        let held = partition.metadata().map_err(|e| e.to_string())?;
+        let named = paths::metadata(device).map_err(|e| e.to_string())?;
+        if !same_node(&held, &named) {
+            return Err("the partition's node no longer names the held partition".into());
+        }
+        Ok(device.clone())
+    }
 }
 
 /// Where a keyslot test's detached header copy lives: tmpfs, root's.
@@ -1498,6 +2070,17 @@ mod tests {
         opens: Result<Tested, String>,
         /// The header and deadline each test was given.
         expected: Vec<(Header, Instant)>,
+        /// The upgrade view's volume beside each header read.
+        volume: luks2::Volume,
+        /// The headers the upgrade views read, in turn; `reads` when empty.
+        views: Vec<Read>,
+        tpm: Result<(), TpmRefusal>,
+        /// cryptsetup's metadata; `None` dumps the latest read's header.
+        metadata: Option<Vec<u8>>,
+        /// Each commit, and whether the ESP held the new pair by then.
+        commits: Vec<(Step, bool)>,
+        /// The commit that fails, by its index.
+        fails: Option<usize>,
     }
 
     impl Fake {
@@ -1514,6 +2097,17 @@ mod tests {
                 tested: Vec::new(),
                 opens: Ok(Tested::Opened),
                 expected: Vec::new(),
+                volume: luks2::Volume {
+                    segment: Some(SEGMENT),
+                    reencryption: false,
+                    luks2: vec![0, 1],
+                    reencrypt_modes: Vec::new(),
+                },
+                views: Vec::new(),
+                tpm: Ok(()),
+                metadata: None,
+                commits: Vec::new(),
+                fails: None,
             }
         }
 
@@ -1573,6 +2167,93 @@ mod tests {
             self.expected.push((expected.clone(), deadline));
             self.opens.clone()
         }
+        fn upgrade_view(&mut self) -> Option<Result<UpgradeView, String>> {
+            let n = self.log.iter().filter(|&&what| what == "view").count();
+            self.log.push("view");
+            let reads = if self.views.is_empty() {
+                &self.reads
+            } else {
+                &self.views
+            };
+            let header = Self::nth(reads, n)?;
+            Some(header.map(|header| UpgradeView {
+                header,
+                volume: self.volume.clone(),
+                json_len: 3000,
+            }))
+        }
+        fn tpm(&mut self) -> Result<(), TpmRefusal> {
+            self.log.push("tpm");
+            self.tpm
+        }
+        fn metadata(&mut self) -> Result<Vec<u8>, String> {
+            self.log.push("metadata");
+            if let Some(metadata) = &self.metadata {
+                return Ok(metadata.clone());
+            }
+            match self.reads.last().cloned().flatten() {
+                Some(Ok(header)) => Ok(dump(&header)),
+                _ => Err("no header".into()),
+            }
+        }
+        fn commit(&mut self, step: &Step, _: Instant) -> Result<(), String> {
+            self.log.push("commit");
+            let written = files(&self.disk).1 == selector(true);
+            self.commits.push((step.clone(), written));
+            if self.fails == Some(self.commits.len() - 1) {
+                return Err("cryptsetup's header commit failed".into());
+            }
+            Ok(())
+        }
+    }
+
+    /// The data segment's digest and salt as the dumps write them.
+    const DIGEST: &str = "dms=";
+    const SALT: &str = "c2FsdA==";
+    const SEGMENT: [u8; 32] = [0; 32];
+
+    fn segment() -> [u8; 32] {
+        luks2::segment_digest(DIGEST, SALT)
+    }
+
+    /// `luksDump --dump-json-metadata` of `header`, its keyslots of type
+    /// `luks2` and one digest naming the data segment.
+    fn dump(header: &Header) -> Vec<u8> {
+        let quoted = |slots: &[u8]| {
+            slots
+                .iter()
+                .map(|slot| format!("\"{slot}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let keyslots: Vec<String> = header
+            .keyslots
+            .iter()
+            .map(|slot| format!("\"{slot}\": {{\"type\": \"luks2\"}}"))
+            .collect();
+        let mut tokens: Vec<(u8, String)> = header
+            .tokens
+            .iter()
+            .map(|(number, token)| (*number, token.encode()))
+            .chain(
+                header
+                    .protected
+                    .iter()
+                    .map(|(number, token)| (*number, token.encode().unwrap())),
+            )
+            .collect();
+        tokens.sort();
+        let tokens: Vec<String> = tokens
+            .iter()
+            .map(|(number, json)| format!("\"{number}\": {json}"))
+            .collect();
+        format!(
+            "{{\"keyslots\": {{{}}}, \"tokens\": {{{}}}, \"segments\": {{\"0\": {{\"type\": \"crypt\"}}}}, \"digests\": {{\"0\": {{\"type\": \"pbkdf2\", \"keyslots\": [{}], \"segments\": [\"0\"], \"digest\": \"{DIGEST}\", \"salt\": \"{SALT}\"}}}}, \"config\": {{\"json_size\": \"12288\"}}}}",
+            keyslots.join(", "),
+            tokens.join(", "),
+            quoted(&header.keyslots)
+        )
+        .into_bytes()
     }
 
     /// A disk security key's script: which token it selects and the
@@ -1587,6 +2268,13 @@ mod tests {
         identify: Vec<u8>,
         authorize: Option<Vec<u8>>,
         deadline: Option<Instant>,
+        /// Each connect's answer, the last repeating; each creation's
+        /// exclusion list and the steps it presented.
+        connects: Vec<Result<(), Failure>>,
+        excluded: Vec<Vec<Vec<u8>>>,
+        presented: Vec<Vec<u8>>,
+        /// A creation's error after this many of its four steps.
+        fails: Option<(usize, DiskError)>,
     }
 
     impl Scripted {
@@ -1599,8 +2287,31 @@ mod tests {
                 identify: Vec::new(),
                 authorize: None,
                 deadline: None,
+                connects: vec![Ok(())],
+                excluded: Vec::new(),
+                presented: Vec::new(),
+                fails: None,
             }
         }
+    }
+
+    /// A COSE ES256 key at P-256's base point, which td-fido admits.
+    fn cose() -> Vec<u8> {
+        let x = [
+            0x6b, 0x17, 0xd1, 0xf2, 0xe1, 0x2c, 0x42, 0x47, 0xf8, 0xbc, 0xe6, 0xe5, 0x63, 0xa4,
+            0x40, 0xf2, 0x77, 0x03, 0x7d, 0x81, 0x2d, 0xeb, 0x33, 0xa0, 0xf4, 0xa1, 0x39, 0x45,
+            0xd8, 0x98, 0xc2, 0x96,
+        ];
+        let y = [
+            0x4f, 0xe3, 0x42, 0xe2, 0xfe, 0x1a, 0x7f, 0x9b, 0x8e, 0xe7, 0xeb, 0x4a, 0x7c, 0x0f,
+            0x9e, 0x16, 0x2b, 0xce, 0x33, 0x57, 0x6b, 0x31, 0x5e, 0xce, 0xcb, 0xb6, 0x40, 0x68,
+            0x37, 0xbf, 0x51, 0xf5,
+        ];
+        let mut cose = vec![0xa5, 0x01, 0x02, 0x03, 0x26, 0x20, 0x01, 0x21, 0x58, 0x20];
+        cose.extend(x);
+        cose.extend([0x22, 0x58, 0x20]);
+        cose.extend(y);
+        cose
     }
 
     /// The hmac-secret output every scripted assertion gives.
@@ -1631,6 +2342,60 @@ mod tests {
             Ok(Released {
                 token: self.token,
                 passphrase: fido_disk::passphrase(&OUTPUT, volume, credential).unwrap(),
+            })
+        }
+
+        fn connect(&mut self, _: Instant) -> Result<(), Failure> {
+            let n = self.excluded.len();
+            self.connects
+                .get(n)
+                .or(self.connects.last())
+                .cloned()
+                .unwrap()
+        }
+
+        /// Credential `0xc0 + n` for the `n`th new key: create, prove,
+        /// repeat at one fewer retry, and probe.
+        fn create(
+            &mut self,
+            deadline: Instant,
+            excluded: &[&[u8]],
+            volume: &[u8; 16],
+            steps: &mut Ceremony<'_>,
+        ) -> Result<Created, DiskError> {
+            self.deadline = Some(deadline);
+            self.excluded
+                .push(excluded.iter().map(|id| id.to_vec()).collect());
+            let credential = vec![0xc0 + self.excluded.len() as u8; 16];
+            let failing = |done: usize, fails: &mut Option<(usize, DiskError)>| match fails.take() {
+                Some((at, error)) if at == done => Err(error),
+                other => {
+                    *fails = other;
+                    Ok(())
+                }
+            };
+            failing(0, &mut self.fails)?;
+            for (done, step) in [
+                CreateStep::Create,
+                CreateStep::Prove(&credential),
+                CreateStep::Repeat(&credential),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let retries = if done == 2 { 7 } else { 8 };
+                let (_pin, described) = steps.pin(step, retries).map_err(|_| DiskError::Ended)?;
+                self.presented.push(described);
+                failing(done + 1, &mut self.fails)?;
+            }
+            let described = steps.probe(&credential).map_err(|_| DiskError::Ended)?;
+            self.presented.push(described);
+            failing(4, &mut self.fails)?;
+            Ok(Created {
+                passphrase: fido_disk::passphrase(&OUTPUT, volume, &credential).unwrap(),
+                credential,
+                cose: cose(),
+                salt: [0x5c; 32],
             })
         }
     }
@@ -1698,7 +2463,11 @@ mod tests {
                 send(&mut stream, &answer);
                 let secret_step = Request::decode(&frame[33..])
                     .ok()
-                    .and_then(|request| request.login_step())
+                    .and_then(|request| {
+                        request
+                            .login_step()
+                            .or(request.upgrade_step().and_then(UpgradeStep::login))
+                    })
                     .is_some_and(LoginStep::asks_pin);
                 if tag == PRESENT && secret_step {
                     if let Some(secret) = secrets.next() {
@@ -1720,6 +2489,7 @@ mod tests {
         disk: Disk,
         tested: Vec<(u8, Vec<u8>)>,
         expected: Vec<(Header, Instant)>,
+        commits: Vec<(Step, bool)>,
     }
 
     fn run_with(host: Fake, description: Option<Vec<u8>>, margin: Duration) -> Run {
@@ -1760,6 +2530,7 @@ mod tests {
             disk: host.disk,
             tested: host.tested,
             expected: host.expected,
+            commits: host.commits,
         }
     }
 
@@ -1794,6 +2565,480 @@ mod tests {
 
     fn selector(measured: bool) -> Vec<u8> {
         prepare(&[0x54; 2000], KEY, UUID, measured).unwrap()
+    }
+
+    /// A converged device-bound header: the device-bound token naming
+    /// keyslot 1, and `pending` fido2 tokens a crashed phase 1 left.
+    fn converged(pending: &[u8]) -> Header {
+        use td_protector::token::{self as device, Role};
+        let mut header = header(Vec::new());
+        header.tokens = vec![(
+            0,
+            device::Token::new(
+                1,
+                Role::DeviceBound,
+                td_tpm::SealedObject {
+                    public: vec![0, 8, 1],
+                    private: vec![1, 1],
+                },
+            )
+            .unwrap(),
+        )];
+        for (at, byte) in pending.iter().enumerate() {
+            header.protected.push((
+                at as u8 + 1,
+                Token::Fido2(Fido2 {
+                    keyslot: None,
+                    role: FidoRole::Recovery,
+                    credential: vec![*byte; 16],
+                    salt: [1; 32],
+                    x: [2; 32],
+                    y: [3; 32],
+                }),
+            ));
+        }
+        header
+    }
+
+    /// The same header in U0: `pending` new keys' tokens and `td-upgrade`.
+    fn upgrading(pending: &[u8]) -> Header {
+        let mut header = converged(pending);
+        header.protected.push((
+            9,
+            Token::Upgrade {
+                shape: Shape::Tpm,
+                from: segment(),
+            },
+        ));
+        header
+    }
+
+    fn device_bound_host(header: Header) -> Fake {
+        let mut host = Fake::new(Some(Ok(header)));
+        host.volume.segment = Some(segment());
+        host
+    }
+
+    fn upgrade_request(shape: UpgradeShape, count: u8) -> Request {
+        Request::new(
+            NONCE,
+            1000,
+            Operation::Upgrade {
+                account: 1000,
+                shape,
+                count,
+                current: hex(&ID),
+                step: UpgradeStep::Review,
+                approval: Some(ApprovalKey::new(*b"47").unwrap()),
+            },
+        )
+        .unwrap()
+    }
+
+    fn cancel_request() -> Request {
+        Request::new(
+            NONCE,
+            1000,
+            Operation::UpgradeCancel {
+                key: ApprovalKey::new(*b"47").unwrap(),
+            },
+        )
+        .unwrap()
+    }
+
+    /// Runs `description` against `host` with `keys`, a PIN for each PIN
+    /// step.
+    fn upgraded(host: Fake, keys: &mut Scripted, description: &Request) -> Run {
+        proved(
+            host,
+            keys,
+            Some(description.encode()),
+            vec![b"1234".to_vec(); 6],
+            Duration::from_secs(5),
+        )
+    }
+
+    /// The steps each `PRESENT` frame after the first presented.
+    fn upgrade_steps(frames: &[Vec<u8>]) -> Vec<UpgradeStep> {
+        frames
+            .iter()
+            .filter(|frame| frame.first() == Some(&PRESENT))
+            .map(|frame| {
+                Request::decode(&frame[33..])
+                    .unwrap()
+                    .upgrade_step()
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    fn pending_token(byte: u8, role: FidoRole) -> Token {
+        let key = Es256PublicKey::from_cose(&cose()).unwrap();
+        let (x, y) = key.coordinates();
+        Token::Fido2(Fido2 {
+            keyslot: None,
+            role,
+            credential: vec![byte; 16],
+            salt: [0x5c; 32],
+            x: *x,
+            y: *y,
+        })
+    }
+
+    fn import(token: Token) -> Step {
+        Step::ImportToken {
+            token,
+            id: None,
+            replace: false,
+        }
+    }
+
+    #[test]
+    fn an_upgrade_presents_its_review_and_each_ceremony_then_writes_phase_one() {
+        for (shape, count, role, orphans) in [
+            (UpgradeShape::Tpm, 2, FidoRole::Recovery, vec![0x71, 0x72]),
+            (UpgradeShape::Fido2, 1, FidoRole::Primary, Vec::new()),
+            (UpgradeShape::Tpm, 0, FidoRole::Recovery, vec![0x71]),
+        ] {
+            let host = device_bound_host(converged(&orphans));
+            let mut keys = Scripted::selecting(0);
+            let review = upgrade_request(shape, count);
+            let run = upgraded(host, &mut keys, &review);
+            let case = format!("{shape:?} {count}");
+            assert_eq!(run.result, Ok(()), "{case}");
+            // The review, then each key's connect, create, prove, repeat
+            // and probe, its credential named from prove on.
+            let presented = upgrade_steps(&run.frames);
+            let mut expected = vec![UpgradeStep::Review];
+            for key in 1..=count {
+                let made = fingerprint(&[0xc0 + key; 16]);
+                expected.extend(
+                    [
+                        LoginStep::Connect,
+                        LoginStep::Create { retries: 8 },
+                        LoginStep::Prove {
+                            key: made,
+                            retries: 8,
+                        },
+                        LoginStep::Repeat {
+                            key: made,
+                            retries: 7,
+                        },
+                        LoginStep::Probe { key: made },
+                    ]
+                    .map(|step| UpgradeStep::Key { key, step }),
+                );
+            }
+            assert_eq!(presented, expected, "{case}");
+            assert_eq!(&run.frames[1][33..], &review.encode()[..]);
+            // The commit round names the last step, then success.
+            let commit = &run.frames[run.frames.len() - 2];
+            assert_eq!(commit[0], COMMIT);
+            assert_eq!(
+                Request::decode(&commit[33..]).unwrap().upgrade_step(),
+                expected.last().copied()
+            );
+            assert_eq!(run.frames.last().unwrap(), &[SUCCESS]);
+            // td-fido bound each PIN and probe step to what was presented.
+            let bodies: Vec<&[u8]> = run
+                .frames
+                .iter()
+                .filter(|frame| frame.first() == Some(&PRESENT))
+                .map(|frame| &frame[33..])
+                .collect();
+            for described in &keys.presented {
+                assert!(bodies.contains(&described.as_slice()), "{case}");
+            }
+            // Each key excludes the earlier ones' credentials.
+            let excluded: Vec<Vec<Vec<u8>>> = (0..count)
+                .map(|n| (1..=n).map(|k| vec![0xc0 + k; 16]).collect())
+                .collect();
+            assert_eq!(keys.excluded, excluded, "{case}");
+            // Every read before the review, the TPM's in the TPM shape alone.
+            let tpm = usize::from(shape == UpgradeShape::Tpm);
+            let mut reads = vec!["header", "standing", "view"];
+            reads.extend(["tpm"].iter().take(tpm));
+            reads.extend(["kernel", "template", "key", "esp"]);
+            assert_eq!(run.log[..reads.len()], reads[..], "{case}");
+            let after: Vec<&str> = run.log[reads.len()..]
+                .iter()
+                .copied()
+                .filter(|what| *what != "commit")
+                .collect();
+            assert_eq!(after, ["header", "standing", "esp", "view", "metadata"]);
+            // The orphans' removals before the selector, then each key's
+            // pending token and last `td-upgrade`.
+            let mut commits: Vec<(Step, bool)> = (1..=orphans.len() as u8)
+                .map(|token| (Step::RemoveToken { token }, false))
+                .collect();
+            for key in 1..=count {
+                commits.push((import(pending_token(0xc0 + key, role)), true));
+            }
+            let shape = match shape {
+                UpgradeShape::Tpm => Shape::Tpm,
+                UpgradeShape::Fido2 => Shape::Fido2,
+            };
+            commits.push((
+                import(Token::Upgrade {
+                    shape,
+                    from: segment(),
+                }),
+                true,
+            ));
+            assert_eq!(run.commits, commits, "{case}");
+            // The selector in its direct form, with the measurement policy.
+            let (kernel, initrd, staged) = files(&run.disk);
+            assert_eq!((kernel, initrd), (vec![0x4b; 3000], selector(true)));
+            assert_eq!(staged, None);
+        }
+    }
+
+    #[test]
+    fn an_upgrade_refuses_before_its_review() {
+        let review = upgrade_request(UpgradeShape::Tpm, 1);
+        let refused = |host: Fake, description: &Request| {
+            let run = upgraded(host, &mut Scripted::selecting(0), description);
+            assert!(upgrade_steps(&run.frames).is_empty());
+            assert!(run.commits.is_empty());
+            run
+        };
+        // Not converged: STATE, before the TPM or any selector read.
+        let mut bare = converged(&[]);
+        bare.tokens.clear();
+        let mut extra = converged(&[]);
+        extra.keyslots.push(2);
+        for header in [bare, extra] {
+            let mut host = device_bound_host(header);
+            host.volume.luks2 = host.reads[0].clone().unwrap().unwrap().keyslots;
+            let run = refused(host, &review);
+            assert_eq!(run.result, Err(Failure::State));
+            assert_eq!(run.frames.last().unwrap(), &[FAILURE, 0x21]);
+        }
+        // The TPM shape's TPM, each detail.
+        for (refusal, detail) in [
+            (TpmRefusal::Absent, 1),
+            (TpmRefusal::NoSha256Bank, 2),
+            (TpmRefusal::LockoutSet, 3),
+        ] {
+            let mut host = device_bound_host(converged(&[]));
+            host.tpm = Err(refusal);
+            let run = refused(host, &review);
+            assert_eq!(run.result, Err(Failure::Tpm(refusal)));
+            assert_eq!(run.frames.last().unwrap(), &[FAILURE, 0x27, detail]);
+            assert_eq!(run.log.last(), Some(&"tpm"));
+        }
+        // The FIDO2 shape reads no TPM.
+        let mut host = device_bound_host(converged(&[]));
+        host.tpm = Err(TpmRefusal::Absent);
+        let fido = upgrade_request(UpgradeShape::Fido2, 1);
+        let run = upgraded(host, &mut Scripted::selecting(0), &fido);
+        assert_eq!(run.result, Ok(()));
+        assert!(!run.log.contains(&"tpm"));
+        // A header gone or refused at the view: VOLUME; changed: CHANGED.
+        for (view, failure) in [
+            (None, Failure::Volume),
+            (Some(Err("refused".into())), Failure::Volume),
+            (Some(Ok(converged(&[5]))), Failure::Changed),
+        ] {
+            let mut host = device_bound_host(converged(&[]));
+            host.views = vec![view];
+            let run = refused(host, &review);
+            assert_eq!(run.frames.last().unwrap(), &failure.frame());
+        }
+        // The selector's reads, as an update's.
+        let mut kernel = device_bound_host(converged(&[]));
+        kernel.kernel = Err("bzImage does not match the manifest".into());
+        assert_eq!(refused(kernel, &review).result, Err(Failure::Deployment));
+        // A description the baseline does not admit: INTERNAL, reading
+        // nothing.
+        let key_first = Request::new(
+            NONCE,
+            1000,
+            Operation::Upgrade {
+                account: 1000,
+                shape: UpgradeShape::Tpm,
+                count: 1,
+                current: hex(&ID),
+                step: UpgradeStep::Key {
+                    key: 1,
+                    step: LoginStep::Connect,
+                },
+                approval: None,
+            },
+        )
+        .unwrap();
+        let other = Request::new(
+            NONCE,
+            1000,
+            Operation::Upgrade {
+                account: 1000,
+                shape: UpgradeShape::Tpm,
+                count: 1,
+                current: hex(&[0xcd; 32]),
+                step: UpgradeStep::Review,
+                approval: Some(ApprovalKey::new(*b"47").unwrap()),
+            },
+        )
+        .unwrap();
+        for (header, description) in [
+            (converged(&[]), key_first),
+            (converged(&[]), other),
+            (tpm_header(), review.clone()),
+            (upgrading(&[]), review.clone()),
+        ] {
+            let host = device_bound_host(header);
+            let run = refused(host, &description);
+            assert_eq!(run.result, Err(Failure::Internal));
+            assert_eq!(run.log, ["header", "standing"]);
+        }
+    }
+
+    #[test]
+    fn a_ceremony_failure_ends_the_upgrade_with_its_kind_and_writes_nothing() {
+        let review = upgrade_request(UpgradeShape::Tpm, 2);
+        for (fails, connects, failure, frame) in [
+            (
+                Some((
+                    0,
+                    DiskError::Failed(FidoError::Status(Status::CredentialExcluded)),
+                )),
+                vec![Ok(())],
+                Failure::Excluded,
+                vec![FAILURE, 0x11],
+            ),
+            (
+                Some((4, DiskError::Unselectable)),
+                vec![Ok(())],
+                Failure::Unprobed,
+                vec![FAILURE, 0x06, 0x06],
+            ),
+            (
+                Some((2, DiskError::Failed(FidoError::Status(Status::PinInvalid)))),
+                vec![Ok(())],
+                Failure::WrongPin(8),
+                vec![FAILURE, 0x01, 8],
+            ),
+            (
+                Some((3, DiskError::Mismatch)),
+                vec![Ok(())],
+                Failure::Failed,
+                vec![FAILURE, 0x0f],
+            ),
+            (
+                None,
+                vec![Ok(()), Err(Failure::OneKey)],
+                Failure::OneKey,
+                vec![FAILURE, 0x05],
+            ),
+        ] {
+            let host = device_bound_host(converged(&[]));
+            let mut keys = Scripted::selecting(0);
+            keys.fails = fails;
+            keys.connects = connects;
+            let run = upgraded(host, &mut keys, &review);
+            assert_eq!(run.result, Err(failure));
+            assert_eq!(run.frames.last().unwrap(), &frame);
+            assert!(!run.frames.iter().any(|f| f.first() == Some(&COMMIT)));
+            assert!(run.commits.is_empty());
+            assert_eq!(files(&run.disk).0, vec![1; 5000]);
+        }
+    }
+
+    #[test]
+    fn after_its_commit_round_an_upgrade_writes_only_over_what_it_presented() {
+        let review = upgrade_request(UpgradeShape::Fido2, 1);
+        // The header, the standing or the ESP changed: CHANGED, nothing
+        // written, and the worker exits successfully.
+        // The header's re-read after `13` differs; the view before the
+        // review still reads the first.
+        let mut header = device_bound_host(converged(&[]));
+        header.reads = vec![Some(Ok(converged(&[]))), Some(Ok(converged(&[4])))];
+        header.views = vec![Some(Ok(converged(&[])))];
+        // The view's re-read after `13` differs, the header's does not.
+        let mut view = device_bound_host(converged(&[]));
+        view.views = vec![Some(Ok(converged(&[]))), Some(Ok(converged(&[4])))];
+        let mut standing = device_bound_host(converged(&[]));
+        standing.standings = vec![Some(ID), None];
+        let mut esp = device_bound_host(converged(&[]));
+        // As the selector update's sector test: BOOTX64.EFI's
+        // creation-time tenths in EFI/BOOT's first sector.
+        esp.poke = Some(|disk| {
+            let (reserved, fat, _) = layout(disk);
+            disk[BASE as usize + (reserved + 2 * fat + 2) * 512 + 2 * 32 + 13] = 1;
+        });
+        let mut disagrees = device_bound_host(converged(&[]));
+        disagrees.metadata = Some(dump(&converged(&[6])));
+        // Only the metadata's disagreement reaches cryptsetup's read.
+        for (host, metadata) in [
+            (header, false),
+            (view, false),
+            (standing, false),
+            (esp, false),
+            (disagrees, true),
+        ] {
+            let run = upgraded(host, &mut Scripted::selecting(0), &review);
+            assert_eq!(run.result, Ok(()));
+            assert_eq!(run.frames.last().unwrap(), &[FAILURE, 0x28]);
+            assert_eq!(run.log.contains(&"metadata"), metadata, "{:?}", run.log);
+            assert!(run.commits.is_empty());
+            assert_eq!(files(&run.disk).0, vec![1; 5000]);
+        }
+        // A commit that fails is FAILED: uncertain to root.
+        let mut host = device_bound_host(converged(&[0x71]));
+        host.fails = Some(1);
+        let run = upgraded(host, &mut Scripted::selecting(0), &review);
+        assert_eq!(run.result, Err(Failure::Failed));
+        assert_eq!(run.frames.last().unwrap(), &[FAILURE, 0x0f]);
+        assert_eq!(run.commits.len(), 2);
+    }
+
+    #[test]
+    fn a_cancellation_removes_td_upgrade_then_the_pending_tokens() {
+        let cancel = cancel_request();
+        let host = device_bound_host(upgrading(&[0xc1, 0xc2]));
+        let run = upgraded(host, &mut Scripted::selecting(0), &cancel);
+        assert_eq!(run.result, Ok(()));
+        assert_eq!(run.frames[0][1], 2);
+        assert_eq!(run.frames[1][0], PRESENT);
+        assert_eq!(&run.frames[1][33..], &cancel.encode()[..]);
+        assert_eq!(run.frames[2][0], COMMIT);
+        assert_eq!(&run.frames[2][33..], &cancel.encode()[..]);
+        assert_eq!(run.frames[3], [SUCCESS]);
+        let removed: Vec<Step> = run.commits.into_iter().map(|(step, _)| step).collect();
+        assert_eq!(removed, [9, 1, 2].map(|token| Step::RemoveToken { token }));
+        assert_eq!(
+            run.log,
+            ["header", "standing", "view", "header", "metadata", "commit", "commit", "commit"]
+        );
+        // Past U0: STATE before the presentation.
+        let mut past = device_bound_host(upgrading(&[0xc1]));
+        past.volume.segment = Some([9; 32]);
+        let run = upgraded(past, &mut Scripted::selecting(0), &cancel);
+        assert_eq!(run.result, Err(Failure::State));
+        assert_eq!(run.frames.len(), 2);
+        // Not upgrading: INTERNAL, reading nothing more.
+        let run = upgraded(
+            device_bound_host(converged(&[])),
+            &mut Scripted::selecting(0),
+            &cancel,
+        );
+        assert_eq!(run.result, Err(Failure::Internal));
+        assert_eq!(run.log, ["header", "standing"]);
+        // Changed after the commit round: CHANGED, nothing removed.
+        let mut changed = device_bound_host(upgrading(&[0xc1]));
+        changed.reads = vec![Some(Ok(upgrading(&[0xc1]))), Some(Ok(upgrading(&[0xc3])))];
+        let run = upgraded(changed, &mut Scripted::selecting(0), &cancel);
+        assert_eq!(run.result, Ok(()));
+        assert_eq!(run.frames.last().unwrap(), &[FAILURE, 0x28]);
+        assert_eq!(run.log, ["header", "standing", "view", "header"]);
+        assert!(run.commits.is_empty());
+        // Cryptsetup's metadata that disagrees: CHANGED too.
+        let mut disagrees = device_bound_host(upgrading(&[0xc1]));
+        disagrees.metadata = Some(dump(&upgrading(&[0xc3])));
+        let run = upgraded(disagrees, &mut Scripted::selecting(0), &cancel);
+        assert_eq!(run.frames.last().unwrap(), &[FAILURE, 0x28]);
+        assert_eq!(run.log.last(), Some(&"metadata"));
+        assert!(run.commits.is_empty());
     }
 
     #[test]
@@ -2257,6 +3502,12 @@ mod tests {
             (Failure::Mistyped, &[0x15, 0x25]),
             (Failure::WrongKey, &[0x15, 0x26]),
             (Failure::Changed, &[0x15, 0x28]),
+            (Failure::Excluded, &[0x15, 0x11]),
+            (Failure::Unprobed, &[0x15, 0x06, 6]),
+            (Failure::State, &[0x15, 0x21]),
+            (Failure::Tpm(TpmRefusal::Absent), &[0x15, 0x27, 1]),
+            (Failure::Tpm(TpmRefusal::NoSha256Bank), &[0x15, 0x27, 2]),
+            (Failure::Tpm(TpmRefusal::LockoutSet), &[0x15, 0x27, 3]),
         ] {
             assert_eq!(failure.frame(), frame, "{failure:?}");
         }
@@ -2610,6 +3861,13 @@ mod tests {
                 2,
             ),
             (None, Some(status(Status::Denied)), vec![0x15, 0x07], 2),
+            // An exclusion is a creation's `11`, never a proof's.
+            (
+                None,
+                Some(status(Status::CredentialExcluded)),
+                vec![0x15, 0x0f],
+                2,
+            ),
             (
                 None,
                 Some(status(Status::TouchTimeout)),
@@ -2689,10 +3947,14 @@ mod tests {
         let production = source.split("#[cfg(test)]").next().unwrap();
         for (start, end) in [
             ("    fn recovery_key<", "    fn disk_key<"),
-            ("    fn present(", "impl Steps for Presenter"),
+            (
+                "    fn present(&mut self, token: usize",
+                "impl Steps for Presenter",
+            ),
+            ("    fn pin_step(", "impl CreateSteps for Ceremony"),
             (
                 "        let device = self.device.as_ref().ok_or(\"no held partition\")?;\n        let partition",
-                "\n/// Where a keyslot test's",
+                "    fn upgrade_view(&mut self)",
             ),
         ] {
             let body = production
