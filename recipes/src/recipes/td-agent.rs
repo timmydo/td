@@ -3,13 +3,13 @@ use crate::types::Recipe;
 /// td-agent, the coding agent's window (td-agent/DESIGN.md), built for the
 /// image as the other toolkit consumers are: a static Cargo build of its own
 /// tree with its path dependencies staged beside it, td-compositor for the
-/// font and wire sources td-ui mounts, engine for the SHA-256 td-agent mounts,
-/// and td-test-compositor, the native harness its tests use, which cargo
-/// reads to resolve the lock. No
-/// feature is enabled: `test-key-root`, which moves the key walk's top for
-/// the native fixtures, never ships. It runs as td's account outside
-/// application confinement, as td-review does, and launches the image's
-/// `/bin/td-jail --workspace` for its tools.
+/// font and wire sources td-ui mounts, engine for the SHA-256 td-agent
+/// mounts and td-png's CRC and inflater, td-util for td-png's DEFLATE
+/// encoder, and td-test-compositor, the native harness its tests use, which
+/// cargo reads to resolve the lock. No feature is enabled: `test-key-root`,
+/// which moves the key walk's top for the native fixtures, never ships. It
+/// runs as td's account outside application confinement, as td-review does,
+/// and launches the image's `/bin/td-jail --workspace` for its tools.
 pub fn recipe() -> Recipe {
     Recipe::rust("td-agent", "0.1.0")
         .local_source("td-agent")
@@ -25,6 +25,7 @@ pub fn recipe() -> Recipe {
             "td-png",
             "td-toml",
             "td-ui",
+            "td-util",
             "td-compositor",
             "engine",
             "td-test-compositor",
@@ -65,6 +66,7 @@ mod tests {
                 "td-png".into(),
                 "td-toml".into(),
                 "td-ui".into(),
+                "td-util".into(),
                 "td-compositor".into(),
                 "engine".into(),
                 "td-test-compositor".into(),

@@ -2,7 +2,8 @@
 //! the fixed Huffman code or stored, whichever is smaller. No dynamic tables,
 //! so it trails `gzip -9`: about a sixth larger on mixed source and binaries,
 //! more on skewed data. The output is any inflater's to read and depends only
-//! on the input and the level.
+//! on the input and the level. td-png mounts this file for its PNG encoder,
+//! where `crate::crc32` and, under test, `crate::gzip` are its own mounts.
 
 const WINDOW: usize = 32 * 1024;
 const MIN_MATCH: usize = 3;

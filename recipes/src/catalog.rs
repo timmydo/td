@@ -546,7 +546,8 @@ mod tests {
                 "td-test-compositor",
                 "td-toml",
                 "td-tpm",
-                "td-ui"
+                "td-ui",
+                "td-util"
             ]
         );
         lone.sort_unstable();

@@ -3,7 +3,7 @@ name = "td-png"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "Bounded PNG decoder over the engine's inflater, every colour type to eight-bit RGBA"
+description = "Bounded PNG decoder over the engine's inflater, every colour type to eight-bit RGBA, and an eight-bit RGB encoder"
 
 [workspace]
 

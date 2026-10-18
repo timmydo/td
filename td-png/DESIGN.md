@@ -1,16 +1,20 @@
 # td-png
 
 A bounded PNG decoder, std only, held to an independent oracle's hashes
-rather than a tolerance. It is a crate of its own, beside td-jpeg, so
-td-agent can show the PNG images a conversation holds (a pasted
-screenshot, a tool's output) and any later td program can read PNG the
-same way. Nothing here reads a file, the environment or a clock.
+rather than a tolerance, and an eight-bit RGB encoder held to that
+decoder. It is a crate of its own, beside td-jpeg, so td-agent can show
+the PNG images a conversation holds (a pasted screenshot, a tool's
+output), the compositor can write its screenshots, and any later td
+program can read and write PNG the same way. Nothing here reads a file,
+the environment or a clock.
 
 The inflater and the CRC are the engine's (`engine/src/gzip.rs`'s raw
 DEFLATE reader and `engine/src/crc32.rs`), mounted by `#[path]` as
 td-util mounts them rather than copied: the one inflater td trusts for
 source preparation is the one that reads image data. `gzip.rs` carries a
 file entry point td-png never calls; td-png's own source opens nothing.
+The DEFLATE encoder is td-util's (`td-util/src/deflate.rs`, its gzip
+applet's), mounted the same way; its gzip framing is unused here.
 
 ## Public surface
 
@@ -24,6 +28,10 @@ file entry point td-png never calls; td-png's own source opens nothing.
   straight (not premultiplied); its fields public, `pixel` checking them
   rather than trusting them.
 - `Colour`, `Header`, and `Error`, each refusal by name.
+- `encode_rgb8(width, height, rgb) -> Result<Vec<u8>, EncodeError>`:
+  packed eight-bit RGB rows, top to bottom, as a whole PNG stream;
+  `EncodeError` names an axis of zero or past PNG's 2^31 - 1 (`Axis`)
+  and pixels other than three bytes each (`Length`).
 - The bounds: `MAX_AXIS` (65536, long enough for a full-page screenshot;
   the pixel budget bounds the rest), `MAX_IMAGE_PIXELS` (64 Mi),
   `MAX_INFLATED_BYTES` (256 MiB, filter bytes included, so a 16-bit RGBA
@@ -90,6 +98,27 @@ hundred KiB long, so a consumer showing several images budgets each with
 `header` first. A 3840x2160 RGBA frame decodes in about 170 ms in a
 release build.
 
+## The encoder
+
+`encode.rs` writes what the decoder reads most simply: colour type 2 at
+depth 8, not interlaced, no ancillary chunk, so the stream depends only
+on the pixels. Each row takes the filter whose bytes sum smallest as
+signed values, libpng's heuristic, which picks Sub or Up for the flat
+fields and gradients of a desktop. The filtered rows go through
+td-util's encoder at its first level (fixed Huffman or stored blocks
+over short hash chains, no dynamic tables) inside a zlib header of
+`78 01` and an Adler-32, cut into `IDAT`s of one MiB. A 1920x1080
+desktop encodes in about 170 ms at the compositor's `opt-level = "s"`,
+to about a sixteenth of its RGB bytes; noise falls back to stored
+blocks, a few bytes a block past its size. It refuses only what PNG
+cannot name; a frame past the decoder's budgets encodes, and the
+decoder refuses it. Paeth's predictor and Adler-32 live here and the
+decoder uses them. `encode.rs` reaches only the crate root's `deflate`
+and `crc32`, so a consumer mounts it beside those two and carries no
+decoder, which is how the compositor's screenshots are meant to mount
+it; one that runs its tests also mounts the engine's `gzip.rs` under
+`cfg(test)`, which `deflate.rs`'s own tests read back through.
+
 ## Test contract
 
 `tests/decode.rs` holds every file of the synthetic suite
@@ -115,8 +144,23 @@ stream is refused, and each of the first 600 bytes of three files' image
 data flipped (the CRC redone, so the change reaches the inflater, the
 filters and the expansion) decodes or is refused without a panic.
 
-`tests/confinement.rs` pins one source file of td-png's own that opens
-nothing, the two engine mounts and nothing else, a manifest of no
+`tests/encode.rs` holds every stream the encoder writes to the decoder:
+one pixel, single rows and columns, odd sizes, a frame of gradient,
+checkerboard, flat and noise bands, a desktop that must shrink fiftyfold
+and noise that must spill into exactly two consecutive `IDAT`s, each
+decoded to its own pixels at alpha 255 with the header it names; the
+same pixels give the same bytes, one 4x3 stream is pinned byte for
+byte (read by `png_ref.py` and Python's zlib when pinned, so a change to
+either encoder is seen), and each refusal is named. Its unit tests hold
+Adler-32 to RFC 1950's value and a byte-at-a-time reduction and Paeth's
+observable tie order, and `lib.rs`'s holds each filter to the decoder's
+`unfilter`. A 1080p desktop's stream was also read by `png_ref.py` and
+Python's zlib when the encoder landed.
+
+`tests/confinement.rs` pins two source files of td-png's own that open
+nothing, the two engine mounts and td-util's encoder and nothing else,
+the encoder reaching only `crate::deflate` and `crate::crc32` (and no
+`super::` outside its tests), a manifest of no
 dependencies, the bounds above, the fixture inventory, `shapes.png`'s
 length, every hash the decode test holds being the README's, and the
 expansion contract stated in `src/lib.rs`.

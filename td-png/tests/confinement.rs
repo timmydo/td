@@ -1,9 +1,9 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
-//! What the compiler cannot say about td-png: one source file of its own
-//! that opens nothing, the engine's CRC and inflater mounted as source
-//! and nothing else, a manifest of no dependencies, the bounds DESIGN.md
+//! What the compiler cannot say about td-png: two source files of its
+//! own that open nothing, the engine's CRC and inflater and td-util's
+//! DEFLATE encoder mounted as source and nothing else, a manifest of no dependencies, the bounds DESIGN.md
 //! names, and the fixtures and hashes the decoder is held to.
 
 use std::collections::BTreeSet;
@@ -29,12 +29,13 @@ fn set(items: &[&str]) -> BTreeSet<String> {
 }
 
 #[test]
-fn one_source_file_that_opens_nothing_and_mounts_the_engines_two() {
+fn two_source_files_that_open_nothing_and_mount_the_engines_two_and_deflate() {
     assert!(!root().join("build.rs").exists(), "no build script");
-    assert_eq!(names("src"), set(&["lib.rs"]));
+    assert_eq!(names("src"), set(&["encode.rs", "lib.rs"]));
     let lib = read("src/lib.rs");
     assert!(lib.starts_with("#![forbid(unsafe_code)]"));
-    // Exactly the two engine files, each by its relative path.
+    // Exactly the two engine files and td-util's DEFLATE encoder, each by
+    // its relative path.
     let mounts: Vec<&str> = lib
         .lines()
         .filter(|l| l.trim_start().starts_with("#[path"))
@@ -44,12 +45,29 @@ fn one_source_file_that_opens_nothing_and_mounts_the_engines_two() {
         [
             "#[path = \"../../engine/src/crc32.rs\"]",
             "#[path = \"../../engine/src/gzip.rs\"]",
+            "#[path = \"../../td-util/src/deflate.rs\"]",
         ]
     );
     assert!(lib.contains("mod crc32;") && lib.contains("mod gzip;"));
+    assert!(lib.contains("mod deflate;") && lib.contains("mod encode;"));
+    // The encoder reaches only the root's DEFLATE encoder and CRC, so a
+    // consumer can mount it beside those two without the decoder.
+    let encode = read("src/encode.rs");
+    assert!(!encode.contains("#[path"));
+    let reached: BTreeSet<&str> = encode
+        .split("crate::")
+        .skip(1)
+        .filter_map(|rest| rest.split("::").next())
+        .collect();
+    assert_eq!(reached, ["crc32", "deflate"].into_iter().collect());
+    let shipped = encode.split("#[cfg(test)]").next().unwrap();
+    assert!(
+        !shipped.contains("super::"),
+        "encode.rs reaches past the root"
+    );
     // The included gzip.rs has a file entry point (`decompress_file`) that
     // td-png never calls; td-png's own text names no I/O.
-    let text = lib.replace("#![forbid(unsafe_code)]", "");
+    let text = lib.replace("#![forbid(unsafe_code)]", "") + &encode;
     for word in [
         "unsafe",
         "include!",
@@ -64,12 +82,12 @@ fn one_source_file_that_opens_nothing_and_mounts_the_engines_two() {
         "File::",
         "decompress_file",
     ] {
-        assert!(!text.contains(word), "lib.rs names {word}");
+        assert!(!text.contains(word), "td-png's source names {word}");
     }
     assert!(text.contains("gzip::decompress_raw_prefix("));
     assert_eq!(
         names("tests"),
-        set(&["confinement.rs", "decode.rs", "fixtures"])
+        set(&["confinement.rs", "decode.rs", "encode.rs", "fixtures"])
     );
     assert_eq!(
         names("tests/fixtures"),

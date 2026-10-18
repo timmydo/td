@@ -14,7 +14,8 @@
 //! (DESIGN.md).
 //!
 //! The inflater and the CRC are the engine's, mounted as source rather
-//! than copied.
+//! than copied. `encode_rgb8` writes eight-bit RGB over td-util's DEFLATE
+//! encoder, mounted the same way (`encode.rs`).
 
 #[path = "../../engine/src/crc32.rs"]
 #[allow(dead_code)]
@@ -41,6 +42,14 @@ mod crc32;
     )
 )]
 mod gzip;
+// td-util's DEFLATE encoder, for `encode.rs`; its gzip framing is unused.
+#[path = "../../td-util/src/deflate.rs"]
+#[allow(dead_code)]
+mod deflate;
+mod encode;
+
+use encode::{adler32, paeth};
+pub use encode::{encode_rgb8, EncodeError};
 
 use std::fmt;
 
@@ -552,37 +561,6 @@ fn inflate(stream: &[u8], expected: usize) -> Result<Vec<u8>, Error> {
     Ok(raw)
 }
 
-/// Adler-32 (RFC 1950 §9), summed in runs short enough that neither sum
-/// can overflow before its reduction.
-fn adler32(data: &[u8]) -> u32 {
-    const MOD: u32 = 65521;
-    let (mut a, mut b) = (1u32, 0u32);
-    for run in data.chunks(5552) {
-        for byte in run {
-            a += u32::from(*byte);
-            b += a;
-        }
-        a %= MOD;
-        b %= MOD;
-    }
-    (b << 16) | a
-}
-
-/// Paeth's predictor (PNG §9.4).
-fn paeth(a: u8, b: u8, c: u8) -> u8 {
-    let p = i16::from(a) + i16::from(b) - i16::from(c);
-    let pa = (p - i16::from(a)).abs();
-    let pb = (p - i16::from(b)).abs();
-    let pc = (p - i16::from(c)).abs();
-    if pa <= pb && pa <= pc {
-        a
-    } else if pb <= pc {
-        b
-    } else {
-        c
-    }
-}
-
 /// Undoes one row's filter in place, `prior` the unfiltered row above
 /// (zeros for a pass's first row), `bpp` the bytes per complete pixel
 /// (at least one).
@@ -762,4 +740,35 @@ fn rgba(
         }
         Colour::Rgba => [v(0), v(1), v(2), v(3)],
     })
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+mod tests {
+    /// The encoder's five filters are what the decoder's `unfilter`
+    /// undoes, at three bytes a pixel, whichever row a frame's pixels give
+    /// the heuristic.
+    #[test]
+    fn every_filter_is_undone_by_unfilter() {
+        let mut x = 0x9e37_79b9u32;
+        let mut row = || -> Vec<u8> {
+            (0..30)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 17;
+                    x ^= x << 5;
+                    (x & 0xff) as u8
+                })
+                .collect()
+        };
+        for _ in 0..8 {
+            let (line, above) = (row(), row());
+            for kind in 0..5u8 {
+                let mut filtered = vec![0u8; line.len()];
+                crate::encode::filter(kind, &line, &above, &mut filtered);
+                crate::unfilter(kind, &mut filtered, &above, 3).unwrap();
+                assert_eq!(filtered, line, "filter {kind}");
+            }
+        }
+    }
 }
