@@ -20,7 +20,7 @@ use crate::{
 };
 use std::path::Path;
 
-/// Inert until the atomic backend cutover. The prepared session must belong
+/// The prepared session must belong
 /// to this binding. HTTPS and response retention must share this exact clock.
 /// Read capacity is reserved before fresh DNS; no SQL runs on the reactor.
 pub struct Service<'s, 'sr, 'a> {
@@ -332,9 +332,18 @@ impl Service<'_, '_, '_> {
                         pending: &self.pending.submissions,
                         password: request.credentials.password(),
                     };
+                    let cancellations = crate::postgres_http_cancellations::Cancellations {
+                        loaded: self.loaded,
+                        executable: self.executable,
+                        binding: self.binding,
+                        slots: self.slots,
+                        clock: self.clock,
+                        pending: &self.pending.cancellations,
+                        password: request.credentials.password(),
+                    };
                     let access = dispatch::SubmissionAccess {
                         creator: &submissions,
-                        canceler: None,
+                        canceler: Some(&cancellations),
                         filer: &updates,
                         clock: self.clock,
                         device: request.device,

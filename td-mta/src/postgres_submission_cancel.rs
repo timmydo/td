@@ -38,7 +38,8 @@ pub enum Error {
 }
 #[derive(Clone)]
 pub struct Cancellation {
-    claim: Claim,
+    claim: Option<Claim>,
+    binding: Binding,
     generation: u64,
     submission: SubmissionId,
     expected: Option<u64>,
@@ -96,6 +97,12 @@ pub fn prepare_for_device(
     )
 }
 impl Cancellation {
+    fn binding(&self) -> &Binding {
+        &self.binding
+    }
+    pub(crate) fn frontend(&self) -> bool {
+        self.claim.is_none()
+    }
     pub fn operation(&self) -> SubmissionCancelId {
         self.operation
     }
@@ -180,7 +187,8 @@ fn prepare_inner(
         }
     }
     Ok(Cancellation {
-        claim: claim.clone(),
+        claim: Some(claim.clone()),
+        binding: binding.clone(),
         generation,
         submission,
         expected,
@@ -189,13 +197,128 @@ fn prepare_inner(
         digest: hash.finish().map_err(|_| Error::Crypto)?,
     })
 }
+/// A JMAP process cancels through the account/attempt fence; it does not
+/// impersonate the relay owner or require a transport in this process.
+pub fn prepare_frontend(
+    submission: SubmissionId,
+    input: ClientRequest<'_>,
+) -> Result<Cancellation, Error> {
+    if !input.binding.roles().jmap() {
+        return Err(Error::Policy);
+    }
+    if input
+        .expected
+        .is_some_and(|(epoch, _)| epoch != input.binding.epoch())
+    {
+        return Err(Error::StateMismatch);
+    }
+    let mut operation = [0; 16];
+    SystemEntropy::try_new()
+        .map_err(|_| Error::Crypto)?
+        .fill(&mut operation)
+        .map_err(|_| Error::Crypto)?;
+    let mut hash = Provider.sha256().map_err(|_| Error::Crypto)?;
+    for field in [
+        b"td-mta frontend cancel v1".as_slice(),
+        input.binding.epoch().as_bytes().as_slice(),
+        input.binding.account().as_bytes().as_slice(),
+        input.binding.profile().as_bytes(),
+        input.binding.selection().version.as_bytes().as_slice(),
+        &input.binding.selection().generation.to_be_bytes(),
+        input.device.as_bytes().as_slice(),
+        submission.as_bytes().as_slice(),
+        &operation,
+    ] {
+        hash.update(&(field.len() as u64).to_be_bytes())
+            .map_err(|_| Error::Crypto)?;
+        hash.update(field).map_err(|_| Error::Crypto)?;
+    }
+    if let Some((_, sequence)) = input.expected {
+        hash.update(&sequence.to_be_bytes())
+            .map_err(|_| Error::Crypto)?;
+    }
+    Ok(Cancellation {
+        claim: None,
+        binding: input.binding.clone(),
+        generation: 0,
+        submission,
+        expected: input.expected.map(|(_, sequence)| sequence),
+        authorization: Some(Authorization {
+            binding: input.binding.clone(),
+            device: input.device,
+        }),
+        operation: SubmissionCancelId::from_bytes(operation),
+        digest: hash.finish().map_err(|_| Error::Crypto)?,
+    })
+}
+async fn begin(
+    client: &Client,
+    value: &Cancellation,
+    policy: bool,
+    write: bool,
+) -> Result<bool, Error> {
+    if let Some(claim) = &value.claim {
+        return owners::begin(client, claim, policy, write)
+            .await
+            .map_err(Error::Owner);
+    }
+    let binding = value.binding();
+    let schema = crate::postgres_schema::lock_and_inspect(client)
+        .await
+        .map_err(|e| Error::Owner(owners::Error::Schema(e)))?;
+    if schema.store_epoch != binding.epoch() {
+        return Err(Error::Owner(owners::Error::Epoch));
+    }
+    owners::begin_transaction(client)
+        .await
+        .map_err(Error::Owner)?;
+    let valid = if policy {
+        let row = client.query_one("SELECT generation,version_id FROM td_mta.config_selection WHERE singleton=true FOR SHARE", &[]).await.map_err(|_| Error::Database)?;
+        let version: Option<&[u8]> = row.try_get(1).map_err(|_| Error::Integrity)?;
+        binding.roles().jmap()
+            && number(row.try_get(0).map_err(|_| Error::Integrity)?)?
+                == binding.selection().generation
+            && version == Some(binding.selection().version.as_bytes().as_slice())
+    } else {
+        true
+    };
+    client
+        .query_one(
+            if write {
+                "SELECT id FROM td_mta.accounts WHERE id=$1 FOR UPDATE"
+            } else {
+                "SELECT id FROM td_mta.accounts WHERE id=$1 FOR SHARE"
+            },
+            &[&binding.account().as_bytes().as_slice()],
+        )
+        .await
+        .map_err(|_| Error::Database)?;
+    Ok(valid)
+}
+async fn check_locked(client: &Client, value: &Cancellation) -> Result<i64, Error> {
+    if let Some(claim) = &value.claim {
+        owners::check_locked(client, claim, value.generation)
+            .await
+            .map_err(Error::Owner)
+    } else {
+        client
+            .query_one(
+                "SELECT (extract(epoch FROM clock_timestamp())*1000)::bigint",
+                &[],
+            )
+            .await
+            .map_err(|_| Error::Database)?
+            .try_get(0)
+            .map_err(|_| Error::Integrity)
+    }
+}
 fn number(bytes: &[u8]) -> Result<u64, Error> {
     Ok(u64::from_be_bytes(
         bytes.try_into().map_err(|_| Error::Integrity)?,
     ))
 }
 async fn receipt(client: &Client, value: &Cancellation) -> Result<Option<Outcome>, Error> {
-    let rows=client.query("SELECT request_digest,submission_id,recipient_count,changed_count,completed_at,old_sequence,new_sequence FROM td_mta.submission_cancel_receipts WHERE account=$1 AND operation=$2", &[&value.claim.binding().account().as_bytes().as_slice(),&value.operation.as_bytes().as_slice()]).await.map_err(|_|Error::Database)?;
+    let rows=client.query("SELECT request_digest,submission_id,recipient_count,changed_count,completed_at,old_sequence,new_sequence FROM td_mta.submission_cancel_receipts WHERE account=$1 AND operation=$2", &[&value.binding().account().as_bytes().as_slice(),&value.operation.as_bytes().as_slice()]).await.map_err(|_|Error::Database)?;
     let Some(row) = rows.first() else {
         return Ok(None);
     };
@@ -240,9 +363,7 @@ pub fn inspect(
     let value = value.clone();
     postgres_probe::with_mailbox_client(request, trust, deadline, move |client| {
         Box::pin(async move {
-            owners::begin(client, &value.claim, false, false)
-                .await
-                .map_err(Error::Owner)?;
+            begin(client, &value, false, false).await?;
             receipt(client, &value).await
         })
     })
@@ -313,9 +434,7 @@ fn publish_inner(
         deadline,
         move |client| {
             Box::pin(async move {
-                let policy = owners::begin(client, &value.claim, true, true)
-                    .await
-                    .map_err(Error::Owner)?;
+                let policy = begin(client, &value, true, true).await?;
                 if let Some(outcome) = receipt(client, &value).await? {
                     return Ok(outcome);
                 }
@@ -324,7 +443,9 @@ fn publish_inner(
                 }
                 match (&value.authorization, presented) {
                     (Some(authority), Some(presented)) => {
-                        client_policy(&value.claim, &authority.binding)?;
+                        if let Some(claim) = &value.claim {
+                            client_policy(claim, &authority.binding)?;
+                        }
                         if postgres_devices::authenticate(
                             client,
                             authority.binding.account(),
@@ -340,10 +461,8 @@ fn publish_inner(
                     (None, None) => (),
                     _ => return Err(Error::Unauthenticated),
                 }
-                let now = owners::check_locked(client, &value.claim, value.generation)
-                    .await
-                    .map_err(Error::Owner)?;
-                let binding = value.claim.binding();
+                let now = check_locked(client, &value).await?;
+                let binding = value.binding();
                 let account = binding.account();
                 let account = account.as_bytes().as_slice();
                 let submission = value.submission.as_bytes().as_slice();
@@ -365,7 +484,7 @@ fn publish_inner(
                 if count >= 1024 {
                     return Err(Error::Capacity);
                 }
-                let rows = client.query("SELECT s.email_id,s.thread_id,s.identity_id,s.transmitted_blob_id,s.reverse_path,s.send_at,s.expires_at,s.recipient_count,s.completed_at,s.notification,s.notification_email_id,s.changed FROM td_mta.submissions s JOIN td_mta.submission_routes r ON r.account=s.account AND r.submission_id=s.id WHERE s.account=$1 AND s.id=$2 AND r.route_name=$3 AND r.destination=$4 FOR UPDATE OF s", &[&account,&submission,&binding.route().name(),&binding.route().destination().as_slice()]).await.map_err(|_|Error::Database)?;
+                let rows = client.query("SELECT s.email_id,s.thread_id,s.identity_id,s.transmitted_blob_id,s.reverse_path,s.send_at,s.expires_at,s.recipient_count,s.completed_at,s.notification,s.notification_email_id,s.changed FROM td_mta.submissions s JOIN td_mta.submission_routes r ON r.account=s.account AND r.submission_id=s.id WHERE s.account=$1 AND s.id=$2 AND ($5 OR (r.route_name=$3 AND r.destination=$4)) FOR UPDATE OF s", &[&account,&submission,&binding.route().name(),&binding.route().destination().as_slice(),&value.frontend()]).await.map_err(|_|Error::Database)?;
                 let row = rows.first().ok_or(Error::Missing)?;
                 let before = snapshot::submission(row)?;
                 if number(row.try_get(11).map_err(|_| Error::Integrity)?)? > old {
@@ -401,9 +520,7 @@ fn publish_inner(
                 if Instant::now() >= deadline {
                     return Err(Error::Deadline);
                 }
-                owners::check_locked(client, &value.claim, value.generation)
-                    .await
-                    .map_err(Error::Owner)?;
+                check_locked(client, &value).await?;
                 let changed = next.to_be_bytes();
                 let changed = changed.as_slice();
                 if plan.changed {
@@ -431,9 +548,7 @@ fn publish_inner(
                 }
                 let changed_count = if plan.changed { count } else { 0 };
                 client.execute("INSERT INTO td_mta.submission_cancel_receipts VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)", &[&account,&value.operation.as_bytes().as_slice(),&value.digest.as_slice(),&submission,&count,&changed_count,&plan.completed_at,&old.to_be_bytes().as_slice(),&changed]).await.map_err(|_|Error::Database)?;
-                owners::check_locked(client, &value.claim, value.generation)
-                    .await
-                    .map_err(Error::Owner)?;
+                check_locked(client, &value).await?;
                 if Instant::now() >= deadline {
                     return Err(Error::Deadline);
                 }

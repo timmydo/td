@@ -55,12 +55,17 @@ fn id(value: impl wire::LocalId) -> String {
 }
 
 pub(super) fn exercise(fixture: &Fixture, context: Context<'_>) {
+    for frontend in [false, true] {
+        exercise_mode(fixture, &context, frontend);
+    }
+}
+fn exercise_mode(fixture: &Fixture, context: &Context<'_>, frontend: bool) {
     let pending = canceling::Pending::default();
     let sub = format!("decode('{}','hex')", context.submission);
     let reset = || {
         sql(fixture, &format!("UPDATE td_mta.recipients SET state=1,uncertain=0,attempt_id=NULL,attempt_count=0,last_attempt_at=NULL,phase=0,next_attempt_at=0,rcpt_reply=NULL,data_reply=NULL,reason=0,diagnostic='' WHERE submission_id={sub}; UPDATE td_mta.submissions SET completed_at=NULL WHERE id={sub}"));
     };
-    let invalid = run(&context, &pending, Patch::Invalid, 9000);
+    let invalid = run(context, &pending, Patch::Invalid, 9000, frontend);
     assert_eq!(
         invalid.json["methodResponses"][0][1]["notUpdated"][id(context.submission).as_str()]
             ["type"]
@@ -68,14 +73,14 @@ pub(super) fn exercise(fixture: &Fixture, context: Context<'_>) {
         Some("invalidProperties")
     );
     assert_eq!(invalid.closed, 0);
-    let stale = run(&context, &pending, Patch::Stale, 9000);
+    let stale = run(context, &pending, Patch::Stale, 9000, frontend);
     assert_eq!(
         stale.json["methodResponses"][0][1]["type"].as_str(),
         Some("stateMismatch")
     );
     assert_eq!(stale.closed, 0);
     sql(fixture, &format!("UPDATE td_mta.recipients SET state=4,attempt_id=decode(repeat('01',16),'hex'),attempt_count=1,last_attempt_at=0,phase=4,next_attempt_at=NULL,rcpt_reply='250 ok',data_reply='250 accepted' WHERE submission_id={sub} AND ordinal=0"));
-    let ineligible = run(&context, &pending, Patch::Valid, 9000);
+    let ineligible = run(context, &pending, Patch::Valid, 9000, frontend);
     assert_eq!(
         ineligible.json["methodResponses"][0][1]["notUpdated"][id(context.submission).as_str()]
             ["type"]
@@ -84,9 +89,9 @@ pub(super) fn exercise(fixture: &Fixture, context: Context<'_>) {
     );
     assert_eq!(ineligible.closed, 0);
     reset();
-    let changed = run(&context, &pending, Patch::Valid, 9000);
+    let changed = run(context, &pending, Patch::Valid, 9000, frontend);
     assert_updated(&changed, context.submission, 1);
-    assert_eq!(changed.closed, 1);
+    assert_eq!(changed.closed, usize::from(!frontend));
     assert_eq!(
         sql(
             fixture,
@@ -96,7 +101,7 @@ pub(super) fn exercise(fixture: &Fixture, context: Context<'_>) {
         ),
         "1000"
     );
-    let noop = run(&context, &pending, Patch::Valid, 9000);
+    let noop = run(context, &pending, Patch::Valid, 9000, frontend);
     assert_updated(&noop, context.submission, 0);
     assert_eq!(noop.closed, 0);
     assert_eq!(
@@ -119,13 +124,13 @@ pub(super) fn exercise(fixture: &Fixture, context: Context<'_>) {
     )
     .unwrap();
     sql(fixture, "CREATE CONSTRAINT TRIGGER delay_jmap_cancel AFTER INSERT ON td_mta.submission_cancel_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_cancel()");
-    let lost = run(&context, &pending, Patch::Valid, 2000);
+    let lost = run(context, &pending, Patch::Valid, 2000, frontend);
     assert_eq!(lost.json["methodResponses"][0][0].as_str(), Some("error"));
     assert_eq!(
         lost.json["methodResponses"][0][1]["type"].as_str(),
         Some("serverPartialFail")
     );
-    assert_eq!(lost.closed, 1);
+    assert_eq!(lost.closed, usize::from(!frontend));
     let operation = pending.operation().unwrap().unwrap();
     thread::sleep(Duration::from_secs(4));
     sql(
@@ -196,6 +201,7 @@ fn run(
     pending: &canceling::Pending,
     patch: Patch,
     execution_ms: u64,
+    frontend: bool,
 ) -> Response {
     let slots = ReadSlots::new(1).unwrap();
     let mut connection = context
@@ -322,7 +328,7 @@ fn run(
     };
     let access = dispatch::SubmissionAccess {
         creator: &creator,
-        canceler: Some(&canceler),
+        canceler: Some(if frontend { &worker } else { &canceler }),
         filer: &filer,
         clock: &*clock,
         device: context.device,

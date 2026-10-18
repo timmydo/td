@@ -6187,3 +6187,48 @@ settlement while rechecking
 ownership. A pending COMMIT therefore cannot trip the next candidate
 read's shorter lock timeout. Failure to establish current ownership still
 stops the service; the next notice scan uses the durable Stored marker.
+
+## 214. Live JMAP cancellation across processes
+
+The HTTP service supplies an authenticated cancellation adapter for a
+singleton `EmailSubmission/set` update with `undoStatus: "canceled"`.
+A JMAP-only profile can cancel account submissions while the relay runs in
+another process or is offline. The frontend preparation binds the account,
+selected configuration, device, submission, optional state and random
+operation. It does not manufacture a relay claim or acquire its lease.
+The existing internal route-owner API retains its owner and local-close
+checks.
+
+Frontend publication holds the selected-policy and account locks, verifies
+the current credential, and uses the same complete-group reservation,
+recipient validation, attempt retirement, change record and receipt as the
+route-owner API. It can cancel old route destinations belonging to the same
+account. Any Accepted, uncertain or AcceptancePossible recipient refuses the
+whole operation as cannotUnsend. It never promises recall of delivered mail.
+An eligible Prepared or Body attempt becomes inactive in that transaction.
+Every later relay phase/terminator admission uses that same account fence,
+so a remote worker cannot publish AcceptancePossible after cancellation.
+The worker closes on its next failed admission; already buffered partial
+body bytes are not a completed SMTP delivery. No cross-process socket
+control or new database request queue is needed.
+
+The scheduler treats a missing fenced phase publication as a retired
+attempt after settling any unknown receipt, rather than retrying it forever.
+The unchanged recovery path likewise tolerates retired attempts. A canceled
+attempt does not clear route failures as a successful delivery.
+
+The HTTPS worker retains one unknown operation. Before another cancellation
+it charges and inspects that receipt under the original request/meter
+limits. Receipt inspection takes the account lock behind the unknown COMMIT:
+Stored confirms success; absence proves rollback and releases the frontend
+pending slot. Restart needs no local journal: durable canceled state is an
+idempotent update, and a rolled-back request can be issued again. No password
+or transport callback is retained. Existing route-owner callers retain their
+historical settlement contract.
+
+Native qualification covers both prepared-owner and frontend JMAP dispatch,
+state mismatch, cannotUnsend, a thousand recipients, repeated cancellation,
+and lost COMMIT response settlement. The executable fixture uses separate
+JMAP/relay processes, cancels queued work with the relay offline and an
+active attempt before MAIL's reply, checks transport closure before another
+command, refuses accepted mail, and includes restart and account auditing.

@@ -20,6 +20,9 @@ pub(super) struct Relay {
     done: Arc<AtomicBool>,
     pub accepted: Arc<AtomicUsize>,
     pub interrupted: Arc<AtomicBool>,
+    pub cancel_waiting: Arc<AtomicBool>,
+    pub cancel_release: Arc<AtomicBool>,
+    pub cancel_closed: Arc<AtomicBool>,
     threads: Vec<thread::JoinHandle<()>>,
 }
 impl Relay {
@@ -77,6 +80,12 @@ impl Relay {
         let server_done = done.clone();
         let delivered = accepted.clone();
         let interrupt = interrupted.clone();
+        let cancel_waiting = Arc::new(AtomicBool::new(false));
+        let cancel_release = Arc::new(AtomicBool::new(false));
+        let cancel_closed = Arc::new(AtomicBool::new(false));
+        let waiting = cancel_waiting.clone();
+        let release = cancel_release.clone();
+        let closed = cancel_closed.clone();
         let server = thread::spawn(move || {
             let mut connections = 0;
             while !server_done.load(Ordering::Acquire) {
@@ -146,6 +155,25 @@ impl Relay {
                     }
                     continue;
                 }
+                if connections == 7 {
+                    waiting.store(true, Ordering::Release);
+                    let end = Instant::now() + Duration::from_secs(15);
+                    while !release.load(Ordering::Acquire) && !server_done.load(Ordering::Acquire) {
+                        assert!(Instant::now() < end);
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    write(&mut peer, b"250 sender\r\n");
+                    loop {
+                        assert!(Instant::now() < end);
+                        match peer.read(&mut [0; 512]) {
+                            Ok(IoProgress::Closed) | Err(_) => break,
+                            Ok(IoProgress::Pending) => thread::sleep(Duration::from_millis(1)),
+                            other => panic!("canceled worker sent SMTP bytes: {other:?}"),
+                        }
+                    }
+                    closed.store(true, Ordering::Release);
+                    continue;
+                }
                 if connections == 6 {
                     write(&mut peer, b"550 permanent fixture refusal\r\n");
                     continue;
@@ -181,6 +209,9 @@ impl Relay {
             done,
             accepted,
             interrupted,
+            cancel_waiting,
+            cancel_release,
+            cancel_closed,
             threads: vec![dns_thread, server],
         }
     }

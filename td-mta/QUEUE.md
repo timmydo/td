@@ -317,8 +317,13 @@ submission is required to resend a terminal failure. Terminal OutcomeUnknown
 requires operator acknowledgement before explicit deletion, with duplicate
 risk visible; it is not silently retried after expiry.
 
-Cancellation is submission-wide and atomic. Serialize against the worker;
-fence and close any Prepared/Body attempt before committing cancellation.
+Cancellation is submission-wide and atomic. Serialize against the worker
+through the PostgreSQL account/attempt fence and retire every Prepared/Body
+attempt before committing cancellation. The route-owner API closes its local
+transport before commit. A separate JMAP process uses the durable fence:
+the relay closes on its next refused admission and cannot acquire
+AcceptancePossible after cancellation. Already buffered partial body bytes
+cannot complete SMTP delivery without that terminator authority.
 Refuse if any recipient is Accepted, has uncertainty, or is currently in
 AcceptancePossible. An already wholly Canceled submission is an idempotent
 success. Before fencing or changing rows, compute and reserve the complete

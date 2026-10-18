@@ -180,7 +180,13 @@ pub(super) fn exercise(
         .local::<td_mta::ids::SubmissionId>()
         .unwrap()
     };
-    enqueue();
+    let cancel = |submission: td_mta::ids::SubmissionId| {
+        let mut bytes = [0; td_mta::wire::IdKind::WIRE_BYTES];
+        let id = td_mta::wire::encode_id(submission, &mut bytes).unwrap();
+        let reply = post(&td_json::json!({"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:submission"],"methodCalls":[["EmailSubmission/set",{"accountId":account_wire,"update":{id:{"undoStatus":"canceled"}}},"cancel"]]}).to_string());
+        (reply, id.to_owned())
+    };
+    let first = enqueue();
     let wait = |query: &str, expected: &str, seconds: u64| {
         let end = std::time::Instant::now() + Duration::from_secs(seconds);
         loop {
@@ -219,6 +225,23 @@ pub(super) fn exercise(
     sql(fixture,&format!("UPDATE td_mta.blob_chunks SET bytes=decode('{data}','hex') WHERE blob_id IN (SELECT transmitted_blob_id FROM td_mta.submissions s WHERE EXISTS(SELECT 1 FROM td_mta.recipients r WHERE r.submission_id=s.id AND state=1)); UPDATE td_mta.blobs SET length={},digest=decode('{digest}','hex') WHERE id IN (SELECT transmitted_blob_id FROM td_mta.submissions s WHERE EXISTS(SELECT 1 FROM td_mta.recipients r WHERE r.submission_id=s.id AND state=1))",bytes.len()));
     sql(fixture, "UPDATE td_mta.account_usage u SET body_bytes=(SELECT sum(length) FROM td_mta.blobs b WHERE b.account=u.account),queue_bytes=(SELECT sum(length) FROM td_mta.blobs b WHERE b.account=u.account AND EXISTS(SELECT 1 FROM td_mta.submissions s WHERE s.account=b.account AND s.transmitted_blob_id=b.id))");
     sql(fixture,"INSERT INTO td_mta.route_health SELECT account,route_name,destination,decode('0000000000000001','hex'),3,3,(extract(epoch FROM clock_timestamp())*1000)::bigint-600000,(extract(epoch FROM clock_timestamp())*1000)::bigint-1000,NULL FROM td_mta.route_owners");
+    let canceled = enqueue();
+    let (reply, id) = cancel(canceled);
+    assert!(
+        reply["methodResponses"][0][1]["updated"]
+            .get(id.as_str())
+            .unwrap()
+            .is_null(),
+        "{reply}"
+    );
+    let (reply, id) = cancel(canceled);
+    assert!(
+        reply["methodResponses"][0][1]["updated"]
+            .get(id.as_str())
+            .unwrap()
+            .is_null(),
+        "{reply}"
+    );
     let expired = enqueue();
     sql(
         fixture,
@@ -430,12 +453,52 @@ pub(super) fn exercise(
         "3",
         30,
     );
+    let (reply, id) = cancel(first);
+    assert_eq!(
+        reply["methodResponses"][0][1]["notUpdated"][id.as_str()]["type"].as_str(),
+        Some("cannotUnsend")
+    );
     let refused = enqueue();
     wait(
         "SELECT count(*) FROM td_mta.submissions WHERE notification=2",
         "2",
         30,
     );
+    // Cancel while the separate relay process is paused before MAIL's reply.
+    let active_cancel = enqueue();
+    let end = std::time::Instant::now() + Duration::from_secs(30);
+    while !relay
+        .cancel_waiting
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        assert!(std::time::Instant::now() < end);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let (reply, id) = cancel(active_cancel);
+    assert!(
+        reply["methodResponses"][0][1]["updated"]
+            .get(id.as_str())
+            .unwrap()
+            .is_null(),
+        "{reply}"
+    );
+    relay
+        .cancel_release
+        .store(true, std::sync::atomic::Ordering::Release);
+    wait(
+        "SELECT count(*) FROM td_mta.recipients WHERE state=6",
+        "2",
+        30,
+    );
+    let end = std::time::Instant::now() + Duration::from_secs(30);
+    while !relay
+        .cancel_closed
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        assert!(std::time::Instant::now() < end);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(relay.accepted.load(std::sync::atomic::Ordering::Acquire), 3);
     let refused_notice = notice_wire(refused);
     let text = notice_text(&refused_notice);
     assert!(text.contains("Permanent SMTP refusal"), "{text}");
@@ -463,6 +526,16 @@ pub(super) fn exercise(
         "1"
     );
     assert_eq!(notice_wire(expired), expiry_notice);
+    let (reply, id) = cancel(canceled);
+    assert!(
+        reply["methodResponses"][0][1]["updated"]
+            .get(id.as_str())
+            .unwrap()
+            .is_null(),
+        "{reply}"
+    );
+    assert_eq!(sql(fixture, &format!("SELECT count(*) FROM td_mta.submission_attempts WHERE submission_id=decode('{canceled}','hex')")), "0");
+    assert_eq!(sql(fixture, &format!("SELECT count(*) FROM td_mta.submission_attempts WHERE submission_id=decode('{active_cancel}','hex') AND active")), "0");
     assert_eq!(
         sql(
             fixture,
@@ -491,7 +564,7 @@ pub(super) fn exercise(
         send(&child.0, signal).unwrap();
         super::wait_command(&mut child);
     }
-    assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "8");
+    assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "10");
     let utc_ms = sql(
         fixture,
         "SELECT (extract(epoch FROM clock_timestamp())*1000)::bigint",

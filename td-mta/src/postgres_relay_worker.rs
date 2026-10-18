@@ -639,11 +639,11 @@ fn phase(
     loop {
         settle(worker, slots, control)?;
         let cap = until(&worker.connection.clock, 10_000)?;
-        if worker
-            .publish_phase(value.clone(), cap, &mut meter(cap))
-            .is_ok()
-        {
-            return Ok(());
+        match worker.publish_phase(value.clone(), cap, &mut meter(cap)) {
+            Ok(_) | Err(dispatch::Error::Phase(crate::postgres_attempt_phases::Error::Missing)) => {
+                return Ok(())
+            }
+            _ => (),
         }
         if control.stop_requested() {
             return Err(Error::Custody);

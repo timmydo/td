@@ -405,3 +405,11 @@ historical notificationEmail ID. Unit cases cover uncertain outcome wording,
 peer-control sanitization, all 1000 maximum-size recipient details and finite
 database framing allowances. This is local account mail, never an outbound
 bounce or a claim that SMTP relay acceptance proves mailbox delivery.
+
+The live PostgreSQL HTTP adapter supports singleton submission cancellation
+through `EmailSubmission/set` (`undoStatus: "canceled"`). It refuses the whole
+update if any recipient is accepted, uncertain or past the durable
+AcceptancePossible boundary. Native fixtures cover separate frontend/relay
+processes, queued and active cancellation, repeat/restart, lost COMMIT
+settlement and continued service. This is cancellation of eligible remaining
+work, not recall of delivered mail; mixed/multiple updates remain refused.

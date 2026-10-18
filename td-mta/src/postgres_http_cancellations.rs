@@ -1,4 +1,4 @@
-//! Bounded cancellation owner for the fixed HTTPS worker. No dispatch activation.
+//! Bounded authenticated cancellation owner for the fixed HTTPS worker.
 use crate::{
     admission::work::{Charge, Meter, Stop},
     clock::RuntimeClock,
@@ -77,7 +77,14 @@ impl Pending {
                     *pending = None;
                     return Ok(Some(Settled { operation, outcome }));
                 }
-                Ok(None) => return Ok(None),
+                Ok(None) => {
+                    // Frontend inspect holds the account lock behind the unknown
+                    // COMMIT: absence now proves rollback, not a live race.
+                    if change.frontend() {
+                        *pending = None;
+                    }
+                    return Ok(None);
+                }
                 Err(changes::Error::Connection(postgres_probe::Error::Transport)) => (),
                 Err(error) => return Err(Error::Publication(error)),
             }
@@ -115,6 +122,33 @@ impl Cancellations<'_> {
         meter: &mut Meter,
         close: impl Fn(Instant) -> Result<(), changes::Error> + Send + Sync + 'static,
     ) -> Result<changes::Outcome, Error> {
+        self.publish(input, Some((claim, generation)), meter, close)
+    }
+    pub fn cancel_frontend(
+        &self,
+        input: Input,
+        meter: &mut Meter,
+    ) -> Result<changes::Outcome, Error> {
+        if self.pending.operation()?.is_some() {
+            charge(meter, self.clock)?;
+            let original = Deadline::after(ports::Tick(0), meter.deadline().tick().0)?;
+            self.pending.settle(
+                self.loaded,
+                self.executable,
+                self.slots,
+                self.clock,
+                input.deadline.min(original),
+            )?;
+        }
+        self.publish(input, None, meter, |_| Ok(()))
+    }
+    fn publish(
+        &self,
+        input: Input,
+        owner: Option<(&Claim, u64)>,
+        meter: &mut Meter,
+        close: impl Fn(Instant) -> Result<(), changes::Error> + Send + Sync + 'static,
+    ) -> Result<changes::Outcome, Error> {
         if !self.executable.is_absolute()
             || !self.binding.roles().jmap()
             || self.loaded.bootstrap.profile() != self.binding.profile()
@@ -142,16 +176,17 @@ impl Cancellations<'_> {
         }
         charge(meter, self.clock)?;
         let _slot = self.slots.acquire().map_err(|_| ports::Error::Busy)?;
-        let change = changes::prepare_for_device(
-            claim,
-            generation,
-            input.submission,
-            changes::ClientRequest {
-                binding: self.binding,
-                device: input.device,
-                expected: input.expected,
-            },
-        )
+        let authorization = changes::ClientRequest {
+            binding: self.binding,
+            device: input.device,
+            expected: input.expected,
+        };
+        let change = match owner {
+            Some((claim, generation)) => {
+                changes::prepare_for_device(claim, generation, input.submission, authorization)
+            }
+            None => changes::prepare_frontend(input.submission, authorization),
+        }
         .map_err(Error::Publication)?;
         let addresses = addresses(self.loaded, self.executable, deadline)?;
         *pending = Some(change);
@@ -236,4 +271,10 @@ fn addresses(
             _ => ports::Error::Dns,
         }
     })
+}
+
+impl crate::jmap_request::dispatch::SubmissionCanceler for Cancellations<'_> {
+    fn cancel(&self, input: Input, meter: &mut Meter) -> Result<changes::Outcome, Error> {
+        self.cancel_frontend(input, meter)
+    }
 }
