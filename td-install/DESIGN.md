@@ -1350,10 +1350,11 @@ FIDO2 client, one client per Enter, opens it on the released keyslot
 alone, takes the volume key, then runs td-protector's plan and lockout
 steps; a device-bound or refused header keeps the device-bound order,
 and from 8f an upgrading one runs td-protector's upgrade boot
-(ENCRYPTION.md "Re-encrypting upgrade"), whose no-mains and cancelled
-boots keep that order without a reseal, and a device-bound header's open
-then removes pending orphans. cryptsetup names the partition by its held
-descriptor,
+(ENCRYPTION.md "Re-encrypting upgrade") or, in U5, the protected
+release; the upgrade's no-mains and cancelled boots keep the
+device-bound order without a reseal, the cancelled one's cancellation
+after its open, and a device-bound header's open then removes pending
+orphans. cryptsetup names the partition by its held descriptor,
 `/proc/<pid>/fd/N`; the mapping is then admitted by this walk, under
 that name only, held with the partition, and the boot's mounts name it
 as `/proc/<pid>/fd/M`. It does not survive `kexec`.

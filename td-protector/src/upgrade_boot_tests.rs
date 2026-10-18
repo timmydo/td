@@ -234,14 +234,14 @@ impl AsRef<[u8]> for VolumeKey {
 
 struct Selector(Shared);
 
-impl Host for Selector {
+impl Host<Cryptsetup> for Selector {
     type VolumeKey = VolumeKey;
 
     fn read(&mut self) -> Result<UpgradeView, String> {
         Ok(self.0.borrow().disk.view())
     }
 
-    fn open(&mut self, slot: Option<u8>, key: &[u8]) -> io::Result<()> {
+    fn open(&mut self, _: &mut Cryptsetup, slot: Option<u8>, key: &[u8]) -> io::Result<()> {
         let mut world = self.0.borrow_mut();
         assert!(world.opened.is_none(), "the mapping opened twice");
         let key = world.key(key);
@@ -265,7 +265,7 @@ impl Host for Selector {
         Ok(())
     }
 
-    fn volume_key(&mut self, key: &[u8]) -> io::Result<VolumeKey> {
+    fn volume_key(&mut self, _: &mut Cryptsetup, key: &[u8]) -> io::Result<VolumeKey> {
         let mut world = self.0.borrow_mut();
         assert!(world.opened.is_some(), "a volume key with no mapping");
         assert!(
@@ -462,11 +462,16 @@ fn the_upgrade_boot_protects_the_disk_in_each_shape() {
         let mut keys = security_keys(&log);
         let mut person = Person::new();
         let booted = boot_once(&shared, Some(&mut model), &mut keys, &mut person, true);
-        let Outcome::Upgraded { key } = booted.outcome else {
+        let Outcome::Upgraded { key, keyslot } = booted.outcome else {
             panic!("{shape:?}: {:?}", booted.console);
         };
         let world = shared.borrow();
         assert_eq!(key.0, vec![world.disk.vk as u8; 64]);
+        // The recovery key's keyslot, which the marker names.
+        assert!(world.disk.header().protected.iter().any(|(_, t)| *t
+            == Token::RecoveryKey {
+                keyslot: Some(keyslot)
+            }));
         assert_eq!(keys.asked, [1, 2]);
         let tpm = match shape {
             Shape::Tpm => (1, 1),
@@ -1365,4 +1370,49 @@ fn a_take_failing_after_its_import_keeps_the_protector() {
         .iter()
         .any(|line| line.starts_with("td: the TPM is unusable")));
     assert_protected(&shared.borrow().disk, Shape::Tpm, 2, (1, 1));
+}
+
+/// `orphans` removes the pending tokens an interrupted phase 1 left on a
+/// device-bound header, confirmed first; a failed removal stops it, a
+/// header without them runs nothing, and an upgrading one is not its.
+#[test]
+fn orphans_removes_phase_ones_pending_tokens() {
+    let log = Log::default();
+    let mut disk = Disk::u0(Shape::Tpm);
+    disk.tokens.remove(&3);
+    let shared = world(disk, &log);
+    shared.borrow_mut().cut = Some(0);
+    let header = shared.borrow().disk.header();
+    let mut console = Vec::new();
+    orphans(
+        &header,
+        Path::new(DEVICE),
+        &mut Cryptsetup(shared.clone()),
+        &mut |line| console.push(line.to_owned()),
+    );
+    assert_eq!(shared.borrow().commands, 1, "{console:?}");
+    assert_eq!(shared.borrow().disk.header().protected.len(), 2);
+    let mut world = shared.borrow_mut();
+    world.cut = None;
+    world.commands = 0;
+    drop(world);
+    orphans(
+        &header,
+        Path::new(DEVICE),
+        &mut Cryptsetup(shared.clone()),
+        &mut |line| console.push(line.to_owned()),
+    );
+    assert_eq!(shared.borrow().commands, 2, "{console:?}");
+    let header = shared.borrow().disk.header();
+    assert_eq!(header.kind(), Kind::DeviceBound);
+    assert!(header.protected.is_empty());
+    for header in [header, Disk::u0(Shape::Tpm).header()] {
+        orphans(
+            &header,
+            Path::new(DEVICE),
+            &mut Cryptsetup(shared.clone()),
+            &mut |_| panic!("wrote"),
+        );
+    }
+    assert_eq!(shared.borrow().commands, 2);
 }

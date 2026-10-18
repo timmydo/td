@@ -67,6 +67,10 @@ mod volume;
 // is in the target binary.
 #[path = "../../td-fs/src/real_file.rs"]
 mod td_fs;
+// td-fs's fixture guard, for this crate's tests only.
+#[cfg(test)]
+#[path = "../../td-fs/src/temp_dir.rs"]
+mod test_temp;
 // The committed fixture deployment, in its own file because the `td-install`
 // recipe check stages the SAME one and the signatures are over the manifest
 // its payloads hash to. `cfg(test)` keeps it out of the target binary, which
@@ -3101,15 +3105,18 @@ const MEASUREMENT_FAILED: &str =
 
 /// Measures the selected deployment `id` into PCR 11 when the selector
 /// carries a measurement policy, then builds a protected release's
-/// admission record with the result. A failure aborts the boot, except
-/// after a protected release (`admission` set): its record then carries
-/// method 0 and the boot goes on, since refusing would leave a machine
-/// without a working TPM, a FIDO2-primary one included, unbootable, and
-/// method 0 admits nothing. That holds when PCR 11 is uncertain too,
-/// after an extension whose readback failed.
+/// admission record with the result. A failure aborts an unencrypted
+/// boot. An `encrypted` one goes on with the fixed line: after a
+/// protected release (`admission` set) its record carries method 0, since
+/// refusing would leave a machine without a working TPM, a FIDO2-primary
+/// one included, unbootable, and method 0 admits nothing; a device-bound
+/// release, whose selector only phase 1 gives the policy, writes none
+/// (td-install/ENCRYPTION.md "Verified account handoff"). That holds when
+/// PCR 11 is uncertain too, after an extension whose readback failed.
 fn measured_record(
     id: &str,
     measured: bool,
+    encrypted: bool,
     admission: Option<admission::Method>,
     measure: impl FnOnce() -> io::Result<[u8; 32]>,
     console: &mut impl Write,
@@ -3126,7 +3133,7 @@ fn measured_record(
                 )?;
                 true
             }
-            Err(_) if admission.is_some() => {
+            Err(_) if encrypted || admission.is_some() => {
                 let _ = writeln!(console, "{MEASUREMENT_FAILED}");
                 false
             }
@@ -3157,6 +3164,7 @@ fn kexec_boot_decision(
     let record = measured_record(
         &deployment.id,
         measured,
+        handoff.is_some(),
         handoff.and_then(|handoff| handoff.admission),
         || measurement::measure(&deployment.id, cmdline.as_bytes()),
         &mut mirror::stderr(),
@@ -4201,6 +4209,16 @@ fn boot_encrypted(
         uuid: uuid.to_string(),
     };
     let mut staged = None;
+    // The header read again, and an upgrade boot's power supply and
+    // resilience, each when the release asks.
+    let mut read = || td_protector::luks2::read_upgrade(&mut partition.file());
+    let mut on_mains = || selector_update::on_mains(Path::new(POWER_SUPPLY_CLASS));
+    let mut resilience = || selector_update::resilience(&partition);
+    let mut volume = selector_release::Volume {
+        read: &mut read,
+        on_mains: &mut on_mains,
+        resilience: &mut resilience,
+    };
     let (keyslot, key, admission, mut predicted) = match selector_release::unlock(
         &header,
         &partition.path(),
@@ -4213,6 +4231,7 @@ fn boot_encrypted(
             staged.as_ref().and_then(selector_update::Staged::predicted)
         },
         Path::new(selector_release::KEY_DIRECTORY),
+        &mut volume,
         &mut console,
     ) {
         selector_release::Unlock::Boot {
@@ -4271,6 +4290,9 @@ fn boot_encrypted(
         Some(&mut commit),
     )
 }
+
+/// The kernel's power supplies, read for the upgrade's mains check.
+const POWER_SUPPLY_CLASS: &str = "/sys/class/power_supply";
 
 /// What `bind_volume` decided.
 enum Binding {
@@ -7306,9 +7328,12 @@ mod tests {
             assert_eq!(record.matches(needle).count(), 1, "{needle}");
             record.find(needle).unwrap()
         };
-        // Only a protected release survives a failed measurement.
-        assert!(at("match measure() {") < at("Err(_) if admission.is_some() => {"));
-        assert!(at("Err(_) if admission.is_some() => {") < at("Err(error) => return Err(error),"));
+        // Only an encrypted boot survives a failed measurement.
+        assert!(at("match measure() {") < at("Err(_) if encrypted || admission.is_some() => {"));
+        assert!(
+            at("Err(_) if encrypted || admission.is_some() => {")
+                < at("Err(error) => return Err(error),")
+        );
         assert!(
             at("Err(error) => return Err(error),") < at("admission_record(id, method, measured)")
         );
@@ -7355,9 +7380,9 @@ mod tests {
     /// A protected boot whose measurement fails boots with method 0 and a
     /// fixed console line: no TPM under a FIDO2-primary release, a failing
     /// one under a recovery-key release, and a readback after the
-    /// extension (PCR 11 uncertain) under a tpm-pin release. A measured
-    /// boot without a protected release still aborts on the failure, and
-    /// one that succeeds keeps its method.
+    /// extension (PCR 11 uncertain) under a tpm-pin release. A device-bound
+    /// one boots with the line and no record; an unencrypted one still
+    /// aborts on the failure, and one that succeeds keeps its method.
     #[test]
     fn a_protected_boot_whose_measurement_fails_boots_with_method_0() {
         let id = "00112233445566778899aabbccddeeff0123456789abcdeffedcba9876543210";
@@ -7383,6 +7408,7 @@ mod tests {
             let record = measured_record(
                 id,
                 true,
+                true,
                 Some(method),
                 || Err(io::Error::new(kind, why)),
                 &mut console,
@@ -7397,12 +7423,29 @@ mod tests {
                 format!("{MEASUREMENT_FAILED}\n")
             );
         }
-        // No protected release: unencrypted or device-bound, the failure
-        // aborts, before any record.
+        // A device-bound release, whose selector phase 1 gave the policy,
+        // boots with the line and no record.
+        let mut console = Vec::new();
+        let record = measured_record(
+            id,
+            true,
+            true,
+            None,
+            || Err(io::Error::new(io::ErrorKind::NotFound, "no TPM")),
+            &mut console,
+        )
+        .unwrap();
+        assert_eq!(record, None);
+        assert_eq!(
+            String::from_utf8(console).unwrap(),
+            format!("{MEASUREMENT_FAILED}\n")
+        );
+        // An unencrypted boot: the failure aborts, before any record.
         let mut console = Vec::new();
         let error = measured_record(
             id,
             true,
+            false,
             None,
             || Err(io::Error::new(io::ErrorKind::NotFound, "no TPM")),
             &mut console,
@@ -7415,6 +7458,7 @@ mod tests {
         let mut console = Vec::new();
         let record = measured_record(
             id,
+            true,
             true,
             Some(admission::Method::Fido2Primary),
             || Ok([7; 32]),
@@ -7432,6 +7476,7 @@ mod tests {
         let record = measured_record(
             id,
             false,
+            true,
             Some(admission::Method::TpmPin),
             || panic!("measured without a policy"),
             &mut Vec::new(),
@@ -7443,7 +7488,15 @@ mod tests {
             admission::Method::None
         );
         assert_eq!(
-            measured_record(id, false, None, || panic!("measured"), &mut Vec::new()).unwrap(),
+            measured_record(
+                id,
+                false,
+                false,
+                None,
+                || panic!("measured"),
+                &mut Vec::new()
+            )
+            .unwrap(),
             None
         );
     }

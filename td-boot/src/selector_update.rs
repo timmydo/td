@@ -12,16 +12,18 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use td_fat::{BootDir, Esp, FileEntry};
+use td_protector::cryptsetup::Resilience;
 use td_protector::luks2::{self, Header};
 use td_protector::protected::TpmPin;
 use td_protector::protected_plan;
 use td_protector::protected_release::{self as protected, Entered, Predicted, Prompt};
 use td_protector::release::{Runner, Tpm};
 use td_protector::update_retry;
+use td_protector::upgrade;
 
 use crate::eventlog::{self, Chain, Pcrs};
 use crate::sha256::Sha256;
@@ -531,23 +533,68 @@ fn run(command: &mut Command, what: &str) -> Result<(), String> {
     crate::run_command(command, what).map_err(|error| error.to_string())
 }
 
+/// The sysfs directory of the whole disk `partition` is on.
+fn disk_sysfs(partition: &volume::Pinned) -> Result<PathBuf, String> {
+    let rdev = partition
+        .file()
+        .metadata()
+        .map_err(|error| error.to_string())?
+        .rdev();
+    let (major, minor) = major_minor(rdev);
+    let entry = fs::canonicalize(format!("/sys/dev/block/{major}:{minor}"))
+        .map_err(|error| format!("the partition's sysfs entry: {error}"))?;
+    if !entry.join("partition").exists() {
+        return Err("the volume is not on a partition".into());
+    }
+    entry
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| "the partition has no disk".into())
+}
+
+/// The reencryption's resilience for the disk `partition` is on, by its
+/// `queue/atomic_write_unit_max_bytes` (td-install/ENCRYPTION.md
+/// "Re-encrypting upgrade"); a disk that states none, or whose entry
+/// cannot be read, takes journal resilience.
+pub(crate) fn resilience(partition: &volume::Pinned) -> Resilience {
+    let unit = disk_sysfs(partition)
+        .and_then(|disk| sysfs(&disk.join("queue/atomic_write_unit_max_bytes")))
+        .ok()
+        .and_then(|text| text.trim_end().parse::<u64>().ok());
+    upgrade::resilience(unit)
+}
+
+/// Whether the machine is on mains power for the upgrade's start: each
+/// `class` entry's `type`, and `online` reading `1`, through
+/// `upgrade::on_mains`. An entry whose `type` cannot be read is no supply;
+/// a supply whose `online` cannot be read is offline.
+pub(crate) fn on_mains(class: &Path) -> bool {
+    let mut supplies: Vec<(String, bool)> = Vec::new();
+    if let Ok(entries) = fs::read_dir(class) {
+        for entry in entries.flatten() {
+            let Ok(dir) = fs::canonicalize(entry.path()) else {
+                continue;
+            };
+            let Ok(kind) = sysfs(&dir.join("type")) else {
+                continue;
+            };
+            let online = sysfs(&dir.join("online")).is_ok_and(|text| text.trim_end() == "1");
+            supplies.push((kind.trim_end().to_owned(), online));
+        }
+    }
+    let supplies: Vec<(&str, bool)> = supplies
+        .iter()
+        .map(|(kind, online)| (kind.as_str(), *online))
+        .collect();
+    upgrade::on_mains(&supplies)
+}
+
 impl Selector<'_> {
     /// The whole disk the pinned partition is on, opened read-write by its
     /// sysfs name and required to be that device, and its logical sector.
     fn disk(&self) -> Result<(File, u64), String> {
-        let rdev = self
-            .partition
-            .file()
-            .metadata()
-            .map_err(|error| error.to_string())?
-            .rdev();
-        let (major, minor) = major_minor(rdev);
-        let entry = fs::canonicalize(format!("/sys/dev/block/{major}:{minor}"))
-            .map_err(|error| format!("the partition's sysfs entry: {error}"))?;
-        if !entry.join("partition").exists() {
-            return Err("the volume is not on a partition".into());
-        }
-        let disk = entry.parent().ok_or("the partition has no disk")?;
+        let disk = disk_sysfs(self.partition)?;
+        let disk = disk.as_path();
         let name = disk
             .file_name()
             .and_then(|name| name.to_str())

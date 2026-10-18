@@ -6,8 +6,10 @@
 //! ("Boot and authority boundaries"). A protected header takes
 //! td-protector's protected release instead ("Protected release"), its
 //! entries through the same secret-line and its security keys through the
-//! FIDO2 client. Nothing here mounts or selects: the caller does both only
-//! after `unlock` returns `Boot`.
+//! FIDO2 client. An upgrading header takes td-protector's upgrade boot
+//! ("Re-encrypting upgrade"), its U5 the protected release; its no-mains and
+//! cancelled boots the device-bound order. Nothing here mounts or selects:
+//! the caller does both only after `unlock` returns `Boot`.
 use std::ffi::OsString;
 use std::fs::{self, DirBuilder};
 use std::io::{self, Read};
@@ -21,9 +23,10 @@ use td_fido::fido_p256::PublicKey;
 use td_fido::fido_pin::{LoginRefusal, Pin};
 use td_fido::fido_transaction::{Devices, Error as FidoFailure, Status};
 use td_protector::cryptsetup::{
-    dump_volume_key_args, exit_code, open_args, open_slot_args, test_args, EXIT_BAD_PASSPHRASE,
+    dump_volume_key_args, exit_code, open_args, open_slot_args, test_args, Resilience,
+    EXIT_BAD_PASSPHRASE,
 };
-use td_protector::luks2::{Header, Kind};
+use td_protector::luks2::{Header, Kind, UpgradeView};
 use td_protector::protected::TpmPin;
 use td_protector::protected_release::{
     self as protected, Fido, FidoError, FidoToken, PreSeal, Prompt,
@@ -31,6 +34,8 @@ use td_protector::protected_release::{
 use td_protector::recovery::RecoveryKey;
 use td_protector::release::{self, Outcome, Resealed, Runner, Tpm};
 use td_protector::transition::RECOVERY_SLOT;
+use td_protector::upgrade::{self, State};
+use td_protector::upgrade_boot::{self, Boot, Host};
 use td_protector::Secret;
 
 use crate::admission;
@@ -245,14 +250,25 @@ impl SecretLine for Applet {
     }
 }
 
+/// The held partition beside its first header read: the header as it
+/// holds it now, read when asked, and whether the machine is on mains
+/// power and the disk's resilience, read when an upgrade boot before U5
+/// begins.
+pub(crate) struct Volume<'a> {
+    pub(crate) read: &'a mut dyn FnMut() -> Result<UpgradeView, String>,
+    pub(crate) on_mains: &'a mut dyn FnMut() -> bool,
+    pub(crate) resilience: &'a mut dyn FnMut() -> Resilience,
+}
+
 /// The release order over `header`, then what its outcome calls for: a
 /// released secret opens the mapping, recovery runs the recovery flow on
 /// `line`, and an uncertain cap halts. A protected header takes the
-/// protected release (`unlock_protected`); a device-bound or upgrading
-/// one, which selectors before 8f boot as device-bound without a reseal,
-/// and a refused one the device-bound order. `partition` names the pinned
-/// partition to cryptsetup, `/proc/PID/fd/N`; `tpm` is `None` when no TPM
-/// device appeared within the wait.
+/// protected release (`unlock_protected`), an upgrading one the upgrade
+/// boot (`unlock_upgrading`), and a device-bound or refused one, or an
+/// upgrading one's no-mains or cancelled boot, the device-bound order,
+/// after whose open `device_bound_end` writes. `partition` names the
+/// pinned partition to cryptsetup, `/proc/PID/fd/N`; `tpm` is `None` when
+/// no TPM device appeared within the wait.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn unlock<T: Tpm, C: Runner, F: Fido>(
     header: &Result<Header, String>,
@@ -263,9 +279,11 @@ pub(crate) fn unlock<T: Tpm, C: Runner, F: Fido>(
     keys: &mut F,
     preseal: PreSeal<'_>,
     key_directory: &Path,
+    volume: &mut Volume<'_>,
     console: &mut dyn FnMut(&str),
 ) -> Unlock {
-    if let Some(protected) = header.as_ref().ok().filter(|h| h.kind() == Kind::Protected) {
+    let kind = header.as_ref().ok().map(Header::kind);
+    if let (Some(Kind::Protected), Ok(protected)) = (kind, header) {
         return unlock_protected(
             protected,
             partition,
@@ -278,6 +296,211 @@ pub(crate) fn unlock<T: Tpm, C: Runner, F: Fido>(
             console,
         );
     }
+    let mut cancelled = false;
+    if kind == Some(Kind::Upgrading) {
+        match unlock_upgrading(
+            partition,
+            tpm.as_deref_mut(),
+            cryptsetup,
+            line,
+            keys,
+            preseal,
+            key_directory,
+            volume,
+            console,
+        ) {
+            Upgrading::Unlock(unlock) => return unlock,
+            Upgrading::DeviceBound { cancel } => cancelled = cancel,
+        }
+    }
+    let unlocked = unlock_device_bound(
+        header,
+        partition,
+        tpm,
+        cryptsetup,
+        line,
+        key_directory,
+        console,
+    );
+    if matches!(unlocked, Unlock::Boot { .. }) {
+        device_bound_end(cancelled, partition, cryptsetup, volume, console);
+    }
+    unlocked
+}
+
+/// What an upgrading header's boot came to.
+enum Upgrading {
+    Unlock(Unlock),
+    /// The device-bound order, then U0's cancellation when `cancel`.
+    DeviceBound {
+        cancel: bool,
+    },
+}
+
+/// An upgrading header's boot (ENCRYPTION.md "Re-encrypting upgrade") on
+/// its view read again: U5 the protected release (`release_upgraded`),
+/// `finish_u5` then `finish`; any other state td-protector's upgrade boot,
+/// which hands off the rotated volume key with an admission record of
+/// method 0, or comes back for the device-bound order without mains power
+/// or when cancelled. Every entry is one run of secret-line.
+#[allow(clippy::too_many_arguments)]
+fn unlock_upgrading<T: Tpm, C: Runner, F: Fido>(
+    partition: &Path,
+    mut tpm: Option<&mut T>,
+    cryptsetup: &mut C,
+    line: &mut dyn SecretLine,
+    keys: &mut F,
+    preseal: PreSeal<'_>,
+    key_directory: &Path,
+    volume: &mut Volume<'_>,
+    console: &mut dyn FnMut(&str),
+) -> Upgrading {
+    let view = match (volume.read)() {
+        Ok(view) => view,
+        Err(error) => {
+            return Upgrading::Unlock(Unlock::Halt(refused(&format!(
+                "the upgrading header: {error}"
+            ))))
+        }
+    };
+    let mut prompt = Lines(line);
+    if upgrade::check(&view).is_ok_and(|(state, _)| state == State::U5) {
+        let released = match protected::release_upgraded(
+            &view,
+            partition,
+            tpm.as_deref_mut(),
+            cryptsetup,
+            keys,
+            &mut prompt,
+            preseal,
+            console,
+        ) {
+            protected::Outcome::Released(released) => released,
+            protected::Outcome::Halt(reason) => {
+                return Upgrading::Unlock(Unlock::Halt(refused(&reason)))
+            }
+            protected::Outcome::Failed(error) => return Upgrading::Unlock(Unlock::Failed(error)),
+        };
+        return Upgrading::Unlock(open_released(
+            released,
+            Finish::Upgraded {
+                view: &view,
+                read: &mut *volume.read,
+            },
+            partition,
+            tpm,
+            cryptsetup,
+            key_directory,
+            console,
+        ));
+    }
+    let boot = Boot {
+        device: partition,
+        name: MAPPING_NAME,
+        on_mains: (volume.on_mains)(),
+        resilience: (volume.resilience)(),
+    };
+    let mut host = Selector {
+        read: &mut *volume.read,
+        partition,
+        key_directory,
+    };
+    upgraded(upgrade_boot::upgrade(
+        &view,
+        &boot,
+        tpm,
+        cryptsetup,
+        keys,
+        &mut host,
+        &mut prompt,
+        console,
+    ))
+}
+
+/// What the upgrade boot's outcome boots: the upgraded volume with an
+/// admission record of method 0 (ENCRYPTION.md "Verified account
+/// handoff"), or the device-bound order, cancelling after it or not.
+fn upgraded(outcome: upgrade_boot::Outcome<VolumeKey>) -> Upgrading {
+    match outcome {
+        upgrade_boot::Outcome::Upgraded { key, keyslot } => Upgrading::Unlock(Unlock::Boot {
+            keyslot,
+            key,
+            admission: Some(admission::Method::None),
+            predicted: None,
+        }),
+        upgrade_boot::Outcome::Cancel => Upgrading::DeviceBound { cancel: true },
+        upgrade_boot::Outcome::NoMains => Upgrading::DeviceBound { cancel: false },
+        upgrade_boot::Outcome::Halt(reason) => Upgrading::Unlock(Unlock::Halt(refused(&reason))),
+        upgrade_boot::Outcome::Failed(error) => Upgrading::Unlock(Unlock::Failed(error)),
+    }
+}
+
+/// The upgrade boot's volume: the header read again, and the mapping
+/// opened and its volume key taken as the device-bound and protected
+/// flows open them.
+struct Selector<'a> {
+    read: &'a mut dyn FnMut() -> Result<UpgradeView, String>,
+    partition: &'a Path,
+    key_directory: &'a Path,
+}
+
+impl<C: Runner> Host<C> for Selector<'_> {
+    type VolumeKey = VolumeKey;
+
+    fn read(&mut self) -> Result<UpgradeView, String> {
+        (self.read)()
+    }
+
+    fn open(&mut self, cryptsetup: &mut C, slot: Option<u8>, key: &[u8]) -> io::Result<()> {
+        let args = match slot {
+            Some(slot) => open_slot_args(self.partition, MAPPING_NAME, slot),
+            None => open_args(self.partition, MAPPING_NAME),
+        };
+        cryptsetup.run(&args, key)
+    }
+
+    fn volume_key(&mut self, cryptsetup: &mut C, key: &[u8]) -> io::Result<VolumeKey> {
+        volume_key(self.partition, key, cryptsetup, self.key_directory)
+    }
+}
+
+/// After the device-bound order opened the volume, on the header read
+/// again: a cancelled boot's cancellation, or a device-bound header's
+/// pending tokens an interrupted phase 1 left (ENCRYPTION.md
+/// "Re-encrypting upgrade"). Neither stops the boot.
+fn device_bound_end<C: Runner>(
+    cancelled: bool,
+    partition: &Path,
+    cryptsetup: &mut C,
+    volume: &mut Volume<'_>,
+    console: &mut dyn FnMut(&str),
+) {
+    let view = match (volume.read)() {
+        Ok(view) => view,
+        Err(error) => {
+            console(&format!(
+                "the header read again: {error}; nothing more is written this boot"
+            ));
+            return;
+        }
+    };
+    if cancelled {
+        upgrade_boot::cancel(&view, partition, cryptsetup, console);
+    } else if view.header.kind() == Kind::DeviceBound {
+        upgrade_boot::orphans(&view.header, partition, cryptsetup, console);
+    }
+}
+
+/// The device-bound release order and its recovery flow.
+fn unlock_device_bound<T: Tpm, C: Runner>(
+    header: &Result<Header, String>,
+    partition: &Path,
+    mut tpm: Option<&mut T>,
+    cryptsetup: &mut C,
+    line: &mut dyn SecretLine,
+    key_directory: &Path,
+    console: &mut dyn FnMut(&str),
+) -> Unlock {
     match release::release(header, partition, tpm.as_deref_mut(), cryptsetup, console) {
         Outcome::Released { keyslot, secret } => open(
             partition,
@@ -355,6 +578,68 @@ fn unlock_protected<T: Tpm, C: Runner, F: Fido>(
         protected::Outcome::Halt(reason) => return Unlock::Halt(refused(&reason)),
         protected::Outcome::Failed(error) => return Unlock::Failed(error),
     };
+    open_released(
+        released,
+        Finish::Protected(header),
+        partition,
+        tpm,
+        cryptsetup,
+        key_directory,
+        console,
+    )
+}
+
+/// The header `finish` plans over after U5's removal: the one read
+/// again, never the U5 header the release read; none when the removal or
+/// the read failed, whose boot runs no protected plan, a pre-sealed
+/// update's protector discarded with it.
+fn after_u5(
+    removed: bool,
+    read: &mut dyn FnMut() -> Result<UpgradeView, String>,
+    console: &mut dyn FnMut(&str),
+) -> Option<Header> {
+    if !removed {
+        console(
+            "no protected plan this boot; any staged update's pre-sealed protector is discarded",
+        );
+        return None;
+    }
+    match read() {
+        Ok(view) => Some(view.header),
+        Err(error) => {
+            console(&format!(
+                "the header read again: {error}; no protected plan this boot, and any staged \
+                 update's pre-sealed protector is discarded"
+            ));
+            None
+        }
+    }
+}
+
+/// The header a protected release's `finish` plans over.
+enum Finish<'a, 'r> {
+    /// The protected header the release read.
+    Protected(&'a Header),
+    /// A U5 header: `finish_u5` first, then `finish` on the header read
+    /// again; a removal that fails runs no protected plan this boot.
+    Upgraded {
+        view: &'a UpgradeView,
+        read: &'r mut dyn FnMut() -> Result<UpgradeView, String>,
+    },
+}
+
+/// A protected release's open: the mapping on the released keyslot alone
+/// with the released key, the volume key taken with it, then `finish`.
+/// A failed open fails the boot before any plan.
+fn open_released<T: Tpm, C: Runner>(
+    released: protected::Released,
+    finish: Finish<'_, '_>,
+    partition: &Path,
+    tpm: Option<&mut T>,
+    cryptsetup: &mut C,
+    key_directory: &Path,
+    console: &mut dyn FnMut(&str),
+) -> Unlock {
     let keyslot = released.keyslot;
     let opened = open(
         partition,
@@ -377,20 +662,32 @@ fn unlock_protected<T: Tpm, C: Runner, F: Fido>(
             protected::Method::RecoveryKey => "the recovery key",
         }
     ));
-    let finished = protected::finish(
-        released,
-        header,
-        partition,
-        key.expose(),
-        tpm,
-        cryptsetup,
-        console,
-    );
+    let again;
+    let header = match finish {
+        Finish::Protected(header) => Some(header),
+        Finish::Upgraded { view, read } => {
+            let removed = upgrade_boot::finish_u5(view, partition, cryptsetup, console);
+            again = after_u5(removed, read, console);
+            again.as_ref()
+        }
+    };
+    let predicted = header.and_then(|header| {
+        protected::finish(
+            released,
+            header,
+            partition,
+            key.expose(),
+            tpm,
+            cryptsetup,
+            console,
+        )
+        .predicted
+    });
     Unlock::Boot {
         keyslot,
         key,
         admission,
-        predicted: finished.predicted,
+        predicted,
     }
 }
 
@@ -1045,7 +1342,7 @@ pub(crate) mod tests {
     const PARTITION: &str = "/proc/1/fd/5";
 
     /// A released secret's open, as `unlock` makes it.
-    fn open_released(script: &mut Script, keys: &Path) -> (Unlock, Vec<u8>) {
+    fn opened_on_keyslot_0(script: &mut Script, keys: &Path) -> (Unlock, Vec<u8>) {
         let secret = Secret::generate().unwrap();
         let partition = Path::new(PARTITION);
         let unlock = open(
@@ -1079,7 +1376,7 @@ pub(crate) mod tests {
     fn a_release_opens_the_mapping_then_takes_the_volume_key() {
         let scratch = Scratch::new();
         let mut script = Script::new(Dump::Key);
-        let (unlock, secret) = open_released(&mut script, &scratch.keys());
+        let (unlock, secret) = opened_on_keyslot_0(&mut script, &scratch.keys());
         let Unlock::Boot { keyslot, key, .. } = unlock else {
             panic!("the release did not boot");
         };
@@ -1125,7 +1422,7 @@ pub(crate) mod tests {
         let scratch = Scratch::new();
         fs::create_dir(scratch.keys()).unwrap();
         let mut script = Script::new(Dump::Key);
-        let Unlock::Failed(error) = open_released(&mut script, &scratch.keys()).0 else {
+        let Unlock::Failed(error) = opened_on_keyslot_0(&mut script, &scratch.keys()).0 else {
             panic!("an existing directory was used");
         };
         assert!(
@@ -1145,7 +1442,7 @@ pub(crate) mod tests {
         let mut script = Script::new(Dump::Key);
         script.open_fails = true;
         assert!(matches!(
-            open_released(&mut script, &scratch.keys()).0,
+            opened_on_keyslot_0(&mut script, &scratch.keys()).0,
             Unlock::Failed(_)
         ));
         assert_eq!(script.verbs(), ["open"]);
@@ -1158,7 +1455,7 @@ pub(crate) mod tests {
             Dump::Bytes(0),
         ] {
             let mut script = Script::new(dump);
-            let Unlock::Failed(error) = open_released(&mut script, &scratch.keys()).0 else {
+            let Unlock::Failed(error) = opened_on_keyslot_0(&mut script, &scratch.keys()).0 else {
                 panic!("a bad dump booted");
             };
             assert_eq!(script.verbs(), ["open", "luksDump"], "{error}");
@@ -1201,7 +1498,7 @@ pub(crate) mod tests {
         let open = body("open");
         assert!(open.contains("cryptsetup.run(args, key)"));
         assert!(open.find("cryptsetup.run(args").unwrap() < open.find("volume_key(").unwrap());
-        let unlock = body("unlock");
+        let unlock = body("unlock_device_bound");
         assert!(unlock.contains(
             "Outcome::Released { keyslot, secret } => open(\n            partition,\n            \
              keyslot,\n            &open_args(partition, MAPPING_NAME),\n            \
@@ -1404,6 +1701,46 @@ pub(crate) mod tests {
         scratch: &Scratch,
         keys: &mut F,
     ) -> (Unlock, Vec<String>) {
+        run_unlock_on(
+            header,
+            tpm,
+            script,
+            console,
+            scratch,
+            keys,
+            true,
+            &mut || viewed(header, None),
+        )
+    }
+
+    /// The upgrade's view of `header`, its data segment `segment`.
+    fn viewed(
+        header: &Result<Header, String>,
+        segment: Option<[u8; 32]>,
+    ) -> Result<UpgradeView, String> {
+        header.clone().map(|header| UpgradeView {
+            volume: td_protector::luks2::Volume {
+                segment,
+                reencryption: false,
+                luks2: header.keyslots.clone(),
+                reencrypt_modes: Vec::new(),
+            },
+            header,
+            json_len: 2048,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_unlock_on<T: Tpm, F: Fido>(
+        header: &Result<Header, String>,
+        tpm: Option<&mut T>,
+        script: &mut Script,
+        console: &mut Console,
+        scratch: &Scratch,
+        keys: &mut F,
+        mains: bool,
+        read: &mut dyn FnMut() -> Result<UpgradeView, String>,
+    ) -> (Unlock, Vec<String>) {
         let mut lines = Vec::new();
         let outcome = unlock(
             header,
@@ -1414,6 +1751,11 @@ pub(crate) mod tests {
             keys,
             &mut |_| None,
             &scratch.keys(),
+            &mut Volume {
+                read,
+                on_mains: &mut || mains,
+                resilience: &mut || Resilience::Journal,
+            },
             &mut |line: &str| lines.push(line.to_owned()),
         );
         assert_eq!(LIVE_ENTRIES.with(Cell::get), 0, "an entry outlived it");
@@ -1998,7 +2340,7 @@ pub(crate) mod tests {
         assert!(tested < recover.find("open_recovered(").unwrap());
         assert_eq!(RECOVERY_SLOT, 0);
         // Release, with its cap, before any recovery.
-        let unlock = body("unlock");
+        let unlock = body("unlock_device_bound");
         let released = unlock
             .find("release::release(header, partition, tpm.as_deref_mut(), cryptsetup, console)")
             .unwrap();
@@ -2366,51 +2708,422 @@ pub(crate) mod tests {
         assert!(!lines.iter().any(|l| l.contains("123459")), "{lines:?}");
     }
 
-    /// Selectors before 8f boot a header carrying a `td-upgrade` token as a
-    /// device-bound one, with no reseal offered: a reseal would hold a
-    /// second device-bound token beside it.
+    /// A U0 header in the TPM shape: a device-bound token on keyslot 1,
+    /// keyslot 0's recovery key and `td-upgrade` recording the data
+    /// segment `FROM`.
+    fn u0_header() -> Result<Header, String> {
+        use td_protector::protected::{Shape, Token as Protected};
+        let sealed = SealedObject {
+            public: vec![1; 8],
+            private: vec![2; 8],
+        };
+        let mut header = header(vec![(0, Token::new(1, Role::DeviceBound, sealed).unwrap())])?;
+        header.protected = vec![(
+            5,
+            Protected::Upgrade {
+                shape: Shape::Tpm,
+                from: FROM,
+            },
+        )];
+        Ok(header)
+    }
+
+    const FROM: [u8; 32] = [9; 32];
+
+    /// An upgrading header takes the upgrade boot: on mains power its
+    /// recovery key's prompt first, then, with no TPM, the plans after the
+    /// cap, which halt here on the script's metadata; without mains power
+    /// the device-bound order with no reseal offered, the header left
+    /// upgrading.
     #[test]
-    fn an_upgrading_header_boots_as_device_bound_without_a_reseal() {
+    fn an_upgrading_header_takes_the_upgrade_boot() {
+        let scratch = Scratch::new();
+        let header = u0_header();
+        assert_eq!(
+            upgrade::check(&viewed(&header, Some(FROM)).unwrap()).map(|(state, _)| state),
+            Ok(State::U0)
+        );
+        let mut script = Script::new(Dump::Key);
+        let mut console = Console::new(&[Typed::Line(TYPED)]);
+        let (outcome, lines) = run_unlock_on(
+            &header,
+            no_tpm(),
+            &mut script,
+            &mut console,
+            &scratch,
+            &mut SecurityKeys(|| NoKeys),
+            true,
+            &mut || viewed(&header, Some(FROM)),
+        );
+        let Unlock::Halt(reason) = outcome else {
+            panic!("{lines:?}");
+        };
+        assert!(reason.contains("no metadata in this script"), "{reason}");
+        assert_eq!(console.prompts, [upgrade_boot::RECOVERY_PROMPT]);
+        assert!(script.commands.is_empty());
+
+        // A view the reader refuses halts before any prompt.
+        let mut console = Console::new(&[]);
+        let (outcome, lines) = run_unlock_on(
+            &header,
+            no_tpm(),
+            &mut script,
+            &mut console,
+            &scratch,
+            &mut SecurityKeys(|| NoKeys),
+            true,
+            &mut || Err("no segment".to_string()),
+        );
+        let Unlock::Halt(reason) = outcome else {
+            panic!("{lines:?}");
+        };
+        assert!(
+            reason.starts_with("the upgrading header: no segment"),
+            "{reason}"
+        );
+        assert!(console.prompts.is_empty());
+
+        let (mut tpm, _) = shared([0; 32]);
+        let mut script = Script::new(Dump::Key);
+        let mut console = Console::new(&[Typed::Line(TYPED)]);
+        let (outcome, lines) = run_unlock_on(
+            &header,
+            Some(&mut tpm),
+            &mut script,
+            &mut console,
+            &scratch,
+            &mut SecurityKeys(|| NoKeys),
+            false,
+            &mut || viewed(&header, Some(FROM)),
+        );
+        assert!(
+            matches!(
+                outcome,
+                Unlock::Boot {
+                    keyslot: 0,
+                    admission: None,
+                    ..
+                }
+            ),
+            "{lines:?}"
+        );
+        assert_eq!(console.prompts, [KEY_PROMPT], "{lines:?}");
+        assert!(lines.contains(&upgrade_boot::NO_MAINS.to_owned()));
+        assert!(
+            !lines.iter().any(|l| l.contains("cancellation")),
+            "{lines:?}"
+        );
+    }
+
+    /// U0's cancellation: the recovery key's empty entry, then `cancel`;
+    /// the device-bound order opens the volume, and only then the
+    /// cancellation's plan runs, which writes nothing on the script's
+    /// metadata.
+    #[test]
+    fn a_cancelled_upgrade_opens_device_bound_then_cancels() {
+        let scratch = Scratch::new();
+        let header = u0_header();
+        let mut script = Script::new(Dump::Key);
+        let mut console =
+            Console::new(&[Typed::Line(""), Typed::Line("cancel"), Typed::Line(TYPED)]);
+        let (outcome, lines) = run_unlock_on(
+            &header,
+            no_tpm(),
+            &mut script,
+            &mut console,
+            &scratch,
+            &mut SecurityKeys(|| NoKeys),
+            true,
+            &mut || viewed(&header, Some(FROM)),
+        );
+        assert!(
+            matches!(
+                outcome,
+                Unlock::Boot {
+                    keyslot: 0,
+                    admission: None,
+                    ..
+                }
+            ),
+            "{lines:?}"
+        );
+        assert_eq!(
+            console.prompts,
+            [
+                upgrade_boot::RECOVERY_PROMPT,
+                upgrade_boot::CANCEL_PROMPT,
+                KEY_PROMPT
+            ]
+        );
+        let at = |needle: &str| {
+            lines
+                .iter()
+                .position(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("{needle}: {lines:?}"))
+        };
+        assert!(at("protecting the disk is cancelled") < at("opens keyslot 0"));
+        assert!(at("opens keyslot 0") < at("the cancellation writes nothing this boot"));
+        assert_key_on_keyslot_0_alone(&script, &lines);
+    }
+
+    /// A U5 header is the protected release's, its record following the
+    /// release's method; `td-upgrade`'s removal runs after the open, and
+    /// one that writes nothing leaves no protected plan this boot.
+    #[test]
+    fn a_u5_header_releases_as_a_protected_one() {
         use td_protector::protected::{Shape, Token as Protected};
         let scratch = Scratch::new();
-        for upgrading in [false, true] {
-            let mut header = header(vec![first_boot_token()]);
-            if upgrading {
-                header.as_mut().unwrap().protected = vec![(
-                    5,
-                    Protected::Upgrade {
-                        shape: Shape::Tpm,
-                        from: [0; 32],
-                    },
-                )];
-            }
-            let (mut tpm, _) = shared([0; 32]);
+        let mut header = fido_header();
+        header.as_mut().unwrap().protected.push((
+            5,
+            Protected::Upgrade {
+                shape: Shape::Fido2,
+                from: FROM,
+            },
+        ));
+        let view = viewed(&header, Some([8; 32]));
+        assert_eq!(
+            upgrade::check(view.as_ref().unwrap()).map(|(state, _)| state),
+            Ok(State::U5)
+        );
+        let mut script = Script::new(Dump::Key);
+        let mut console = Console::new(&[Typed::Line(TYPED)]);
+        let (outcome, lines) = run_unlock_on(
+            &header,
+            no_tpm(),
+            &mut script,
+            &mut console,
+            &scratch,
+            &mut SecurityKeys(|| NoKeys),
+            true,
+            &mut || view.clone(),
+        );
+        assert!(
+            matches!(
+                outcome,
+                Unlock::Boot {
+                    keyslot: 0,
+                    admission: Some(admission::Method::None),
+                    ..
+                }
+            ),
+            "{lines:?}"
+        );
+        assert_eq!(console.prompts, [protected::ANOTHER_WAY_PROMPT]);
+        let at = |needle: &str| {
+            lines
+                .iter()
+                .position(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("{needle}: {lines:?}"))
+        };
+        assert!(
+            at("keyslot 0 opened with the recovery key") < at("the upgrade's end writes nothing")
+        );
+    }
+
+    /// A device-bound header with the pending tokens an interrupted phase 1
+    /// left removes them after the open, confirmed first: here the
+    /// script's metadata leaves them for a later boot. Without them
+    /// nothing more runs.
+    #[test]
+    fn a_device_bound_boot_removes_phase_ones_pending_tokens() {
+        use td_protector::protected::{Fido2, FidoRole, Token as Protected};
+        let scratch = Scratch::new();
+        let sealed = SealedObject {
+            public: vec![1; 8],
+            private: vec![2; 8],
+        };
+        let mut header = header(vec![(0, Token::new(1, Role::DeviceBound, sealed).unwrap())]);
+        header.as_mut().unwrap().protected = vec![(
+            3,
+            Protected::Fido2(Fido2 {
+                keyslot: None,
+                role: FidoRole::Primary,
+                credential: CREDENTIAL.to_vec(),
+                salt: [3; 32],
+                x: GX,
+                y: GY,
+            }),
+        )];
+        assert_eq!(header.as_ref().unwrap().kind(), Kind::DeviceBound);
+        let (mut tpm, _) = shared([0; 32]);
+        let mut script = Script::new(Dump::Key);
+        let mut console = Console::new(&[Typed::Line(TYPED), Typed::Line("no")]);
+        let (outcome, lines) =
+            run_unlock(&header, Some(&mut tpm), &mut script, &mut console, &scratch);
+        assert!(matches!(outcome, Unlock::Boot { .. }), "{lines:?}");
+        assert!(
+            lines
+                .last()
+                .is_some_and(|l| l.starts_with("phase 1's pending tokens stay this boot")),
+            "{lines:?}"
+        );
+    }
+
+    /// The upgrade boot's host opens `td-selector` on the keyslot it
+    /// names, or naming none mid reencryption, and takes the volume key
+    /// as every flow does, all through the boot's runner.
+    #[test]
+    fn the_upgrade_hosts_open_names_its_keyslot_or_none() {
+        let scratch = Scratch::new();
+        let header = u0_header();
+        let mut read = || viewed(&header, Some(FROM));
+        let keys = scratch.keys();
+        let mut host = Selector {
+            read: &mut read,
+            partition: Path::new(PARTITION),
+            key_directory: &keys,
+        };
+        let mut script = Script::new(Dump::Key);
+        Host::open(&mut host, &mut script, Some(0), KEY).unwrap();
+        Host::open(&mut host, &mut script, None, KEY).unwrap();
+        let key = Host::volume_key(&mut host, &mut script, KEY).unwrap();
+        let words = |args: Vec<OsString>| -> Vec<String> {
+            args.iter()
+                .map(|arg| arg.to_str().unwrap().to_owned())
+                .collect()
+        };
+        let partition = Path::new(PARTITION);
+        assert_eq!(
+            script.commands[0].0,
+            words(open_slot_args(partition, MAPPING_NAME, 0))
+        );
+        assert_eq!(
+            script.commands[1].0,
+            words(open_args(partition, MAPPING_NAME))
+        );
+        assert!(!script.commands[1].0.iter().any(|w| w == "--key-slot"));
+        assert_eq!(script.commands[2].0[0], "luksDump");
+        assert!(script.commands.iter().all(|(_, input)| input == KEY));
+        assert_eq!(key.expose(), script.key);
+        assert_eq!(Host::<Script>::read(&mut host), viewed(&header, Some(FROM)));
+    }
+
+    /// The wiring no model reaches: the upgrade boot takes the disk's
+    /// power supply and resilience as read, and after U5's removal
+    /// `finish` takes `after_u5`'s header, the one read again.
+    #[test]
+    fn the_upgrade_wiring_passes_what_was_read() {
+        let upgrading = body("unlock_upgrading");
+        for needle in [
+            "on_mains: (volume.on_mains)(),",
+            "resilience: (volume.resilience)(),",
+        ] {
+            assert_eq!(upgrading.matches(needle).count(), 1, "{needle}");
+        }
+        let released = body("open_released");
+        let removed =
+            "let removed = upgrade_boot::finish_u5(view, partition, cryptsetup, console);";
+        let again = "again = after_u5(removed, read, console);";
+        let used = "again.as_ref()";
+        let at = |needle: &str| {
+            assert_eq!(released.matches(needle).count(), 1, "{needle}");
+            released.find(needle).unwrap()
+        };
+        assert!(at(removed) < at(again) && at(again) < at(used));
+        assert!(at(used) < at("protected::finish("));
+        assert_eq!(released.matches("view.header").count(), 0);
+    }
+
+    /// The upgrade boot's outcome: an upgraded volume boots on the
+    /// marker's keyslot with an admission record of method 0 and no
+    /// predicted protector; a cancellation and a no-mains boot take the
+    /// device-bound order, the first cancelling after it; a halt ends in
+    /// the zeroing and the refusal.
+    #[test]
+    fn an_upgraded_boot_admits_with_method_0() {
+        let Upgrading::Unlock(Unlock::Boot {
+            keyslot,
+            admission,
+            predicted,
+            ..
+        }) = upgraded(upgrade_boot::Outcome::Upgraded {
+            key: VolumeKey::zeroed(),
+            keyslot: 2,
+        })
+        else {
+            panic!("not booted");
+        };
+        assert_eq!((keyslot, admission), (2, Some(admission::Method::None)));
+        assert!(predicted.is_none());
+        assert!(matches!(
+            upgraded(upgrade_boot::Outcome::Cancel),
+            Upgrading::DeviceBound { cancel: true }
+        ));
+        assert!(matches!(
+            upgraded(upgrade_boot::Outcome::NoMains),
+            Upgrading::DeviceBound { cancel: false }
+        ));
+        let Upgrading::Unlock(Unlock::Halt(reason)) =
+            upgraded(upgrade_boot::Outcome::Halt("stopped".into()))
+        else {
+            panic!("not halted");
+        };
+        assert_eq!(
+            reason,
+            "stopped; every released secret is zeroed and boot is refused"
+        );
+        assert!(matches!(
+            upgraded(upgrade_boot::Outcome::Failed(io::Error::other("gone"))),
+            Upgrading::Unlock(Unlock::Failed(_))
+        ));
+    }
+
+    /// After U5's removal `finish` plans over the header read again, not
+    /// the U5 one; a removal that did not run reads nothing, and it and a
+    /// failed read run no protected plan, saying so.
+    #[test]
+    fn after_u5_finish_takes_the_header_read_again() {
+        let protected = fido_header().unwrap();
+        let reads = Cell::new(0);
+        let mut read = || {
+            reads.set(reads.get() + 1);
+            viewed(&Ok(protected.clone()), None)
+        };
+        let mut lines = Vec::new();
+        assert_eq!(
+            after_u5(true, &mut read, &mut |l| lines.push(l.to_owned())),
+            Some(protected.clone())
+        );
+        assert_eq!(reads.get(), 1);
+        assert!(lines.is_empty());
+        assert_eq!(
+            after_u5(false, &mut read, &mut |l| lines.push(l.to_owned())),
+            None
+        );
+        assert_eq!(reads.get(), 1);
+        assert!(lines[0].starts_with("no protected plan this boot"));
+        let mut failing = || Err("gone".to_string());
+        assert_eq!(
+            after_u5(true, &mut failing, &mut |l| lines.push(l.to_owned())),
+            None
+        );
+        assert!(lines[1].starts_with("the header read again: gone; no protected plan"));
+    }
+
+    /// A header read again that fails after the device-bound open writes
+    /// nothing, cancelled or not, and the boot goes on.
+    #[test]
+    fn a_failed_read_after_the_device_bound_open_writes_nothing() {
+        for cancelled in [true, false] {
             let mut script = Script::new(Dump::Key);
-            let typed = if upgrading {
-                vec![Typed::Line(TYPED)]
-            } else {
-                vec![Typed::Line(TYPED), Typed::Line("no")]
-            };
-            let mut console = Console::new(&typed);
-            let (outcome, lines) =
-                run_unlock(&header, Some(&mut tpm), &mut script, &mut console, &scratch);
-            assert!(
-                matches!(
-                    outcome,
-                    Unlock::Boot {
-                        keyslot: 0,
-                        admission: None,
-                        ..
-                    }
-                ),
-                "{lines:?}"
+            let mut lines = Vec::new();
+            device_bound_end(
+                cancelled,
+                Path::new(PARTITION),
+                &mut script,
+                &mut Volume {
+                    read: &mut || Err("gone".to_string()),
+                    on_mains: &mut || true,
+                    resilience: &mut || Resilience::Journal,
+                },
+                &mut |l| lines.push(l.to_owned()),
             );
-            let expected: &[&str] = if upgrading {
-                &[KEY_PROMPT]
-            } else {
-                &[KEY_PROMPT, RESEAL_PROMPT]
-            };
-            assert_eq!(console.prompts, expected, "{lines:?}");
+            assert!(script.commands.is_empty());
+            assert_eq!(
+                lines,
+                ["the header read again: gone; nothing more is written this boot"]
+            );
         }
     }
 

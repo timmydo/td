@@ -1996,47 +1996,50 @@ operations' wire, steps and screens.
 | U4 | marker present; some pending token or the tpm-pin token (TPM shape) or the lockout token (TPM shape) missing |
 | U5 | marker, every fido2 token with a keyslot, and in the TPM shape the tpm-pin and lockout tokens |
 
-1. **Before the cap.** In U0, the selector first requires mains power:
-   a `/sys/class/power_supply` entry of type `Mains` online, or no
-   `Battery` entry. Without it the console says the upgrade waits for
+1. **Before the cap.** An upgrading header whose upgrade view td's
+   reader cannot read halts the boot, in any state. In U0, the selector
+   first requires mains power: a `/sys/class/power_supply` entry of type
+   `Mains` online, or no `Battery` entry, among the supplies the kernel
+   has registered by then, so a battery whose driver registers later
+   counts as none. Without it the console says the upgrade waits for
    mains power, and the boot runs the device-bound release order with
    nothing upgraded. Before U5 the first prompt is the recovery key's,
-   asked before anything else is gathered and tested only after the
-   cap. In U0 an empty entry there asks whether to cancel, exactly
-   `cancel` confirms and any other answer returns to the prompt:
-   confirmed, the boot runs the device-bound release order, and once
-   it opened the volume the cancellation's plan removes the
-   `td-upgrade` token, then the pending tokens it leaves as orphans; a
-   failed removal stops that plan, and the boot goes on. Neither this
-   boot nor a no-mains one offers a reseal, since the header was
-   upgrading when read; a cancelled volume's next recovery offers it.
-   A header td-protector's upgrade checks refuse, as one a foreign token
-   joined after phase 1, is not upgraded; while it still holds U0's
-   device-bound token and keyslot, unreencrypted, and no protected token
-   but `td-upgrade` and the pending ones, the console names the
-   refusal and asks the cancellation's question alone, exactly `cancel`
-   confirming as above and any other answer halting the boot, since
-   the cancellation's removals lose nothing. After U0 nothing cancels,
-   and the prompt says so. The selector then
-   gathers what the state still needs: for each pending fido2 token in
-   turn, its key alone, asked by an empty entry at the token's own
-   prompt, its PIN and a touch, the assertion in the unlock phase over
-   the volume's unlock description, since unlocking is what its keyslot
-   will do, verified under the token's public key and the passphrase
-   derived; and in the TPM shape without a tpm-pin token, the new PIN
-   twice (the pre-cap rule in "Lockout" applying), a fresh secret sealed
-   to the observed PCR 4 and PCR 9 (and PCR 7 when measured on) and a
-   literal-zero PCR 12, and one Unseal verifying it. At that prompt
-   exactly `drop` instead removes its token from the upgrade, refused
-   when it would leave the FIDO2 shape without a fido2-primary token, so
-   a key lost or broken since phase 1 does not hold the upgrade; keys
-   come back by token addition once the volume is protected. Any other
-   entry, and a key that releases nothing, asks again; the key's PIN
-   prompt takes no word, and end of input at any prompt halts the boot.
-   A seal or verifying Unseal that fails otherwise, a TPM in lockout
-   included, is taken as a TPM unusable for td (step 3), the console
-   naming the failure, so no TPM fault holds the upgrade. In U5 it
-   gathers nothing and runs the protected release instead.
+   asked before anything else is gathered and tested only after the cap.
+   In U0 an empty entry there asks whether to cancel, exactly `cancel`
+   confirms and any other answer returns to the prompt: confirmed, the
+   boot runs the device-bound release order, and once it opened the
+   volume the cancellation's plan removes the `td-upgrade` token, then
+   the pending tokens it leaves as orphans; a failed removal stops that
+   plan, and the boot goes on. Neither this boot nor a no-mains one
+   offers a reseal, since the header was upgrading when read; a
+   cancelled volume's next recovery offers it. A header td-protector's
+   upgrade checks refuse, as one a foreign token joined after phase 1,
+   is not upgraded; while it still holds U0's device-bound token and
+   keyslot, unreencrypted, and no protected token but `td-upgrade` and
+   the pending ones, the console names the refusal and asks the
+   cancellation's question alone, exactly `cancel` confirming as above
+   and any other answer halting the boot, since the cancellation's
+   removals lose nothing. After U0 nothing cancels, and the prompt says
+   so. The selector then gathers what the state still needs: for each
+   pending fido2 token in turn, its key alone, asked by an empty entry
+   at the token's own prompt, its PIN and a touch, the assertion in the
+   unlock phase over the volume's unlock description, since unlocking is
+   what its keyslot will do, verified under the token's public key and
+   the passphrase derived; and in the TPM shape without a tpm-pin token,
+   the new PIN twice (the pre-cap rule in "Lockout" applying), a fresh
+   secret sealed to the observed PCR 4 and PCR 9 (and PCR 7 when
+   measured on) and a literal-zero PCR 12, and one Unseal verifying it.
+   At that prompt exactly `drop` instead removes its token from the
+   upgrade, refused when it would leave the FIDO2 shape without a
+   fido2-primary token, so a key lost or broken since phase 1 does not
+   hold the upgrade; keys come back by token addition once the volume is
+   protected. Any other entry, and a key that releases nothing, asks
+   again; the key's PIN prompt takes no word, and end of input at any
+   prompt halts the boot. A seal or verifying Unseal that fails
+   otherwise, a TPM in lockout included, is taken as a TPM unusable for
+   td (step 3), the console naming the failure, so no TPM fault holds
+   the upgrade. In U5 it gathers nothing and runs the protected release
+   instead.
 2. **The cap.**
 3. **After the cap**, every step authorized by the recovery key, tested
    first on the recovery keyslot: keyslot 0 in U0 and U1; in U2 by its
@@ -2638,9 +2641,11 @@ commit.
      `upgrade-cancel`, with td-protector's `upgrade::phase_one_fits`
      and `phase_one` and phase 1's `TPM_PT_PERMANENT` check; their
      td-authd supervision and compositor screens, which production
-     refuses; and the selector's upgrade boot with its power check, a
-     pending key's drop and U4's exit for a TPM that became unusable,
-     and the device-bound flow's removal of pending orphans.
+     refuses; td-protector's upgrade boot, with a pending key's drop,
+     U4's exits for a TPM that became unusable or a primary that
+     changed, and the runner's progress; and td-boot's dispatch to it,
+     with its power check, U5's protected release and the device-bound
+     flow's removal of pending orphans.
    - **8g, protector management.** `storage-operation`'s FIDO2 token
      addition and removal and recovery-key removal; the PIN-change
      request and its selector half; the TPM-clear request and its

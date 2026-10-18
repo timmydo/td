@@ -837,3 +837,40 @@ fn the_commit_reports_by_where_its_write_failed() {
         (kernel(1), prepared(TEMPLATE, ARCHIVE), false)
     );
 }
+
+/// The upgrade's power check over a power-supply class directory: its
+/// entries are links to each supply's directory, `type` and `online`
+/// read there. A battery alone is not mains power; an online mains
+/// supply is; a machine with no battery is; an unreadable `online` is
+/// offline and an entry without `type` no supply.
+#[test]
+fn the_power_check_reads_each_supply() {
+    let scratch = crate::test_temp::TempDir::new("td-boot-power").unwrap();
+    let class = scratch.path().to_path_buf();
+    let devices = class.join("devices");
+    let entries = class.join("power_supply");
+    fs::create_dir_all(&entries).unwrap();
+    let supply = |name: &str, kind: Option<&str>, online: Option<&str>| {
+        let dir = devices.join(name);
+        fs::create_dir_all(&dir).unwrap();
+        if let Some(kind) = kind {
+            fs::write(dir.join("type"), format!("{kind}\n")).unwrap();
+        }
+        if let Some(online) = online {
+            fs::write(dir.join("online"), format!("{online}\n")).unwrap();
+        }
+        std::os::unix::fs::symlink(&dir, entries.join(name)).unwrap();
+    };
+    assert!(on_mains(&entries));
+    assert!(on_mains(&class.join("absent")));
+    supply("BAT0", Some("Battery"), None);
+    assert!(!on_mains(&entries));
+    supply("AC", Some("Mains"), Some("0"));
+    assert!(!on_mains(&entries));
+    supply("ADP1", Some("Mains"), None);
+    supply("hidpp", None, Some("1"));
+    assert!(!on_mains(&entries));
+    fs::write(devices.join("AC/online"), "1\n").unwrap();
+    assert!(on_mains(&entries));
+    scratch.cleanup().unwrap();
+}

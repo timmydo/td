@@ -57,6 +57,12 @@ impl VolumeKey {
     }
 }
 
+impl AsRef<[u8]> for VolumeKey {
+    fn as_ref(&self) -> &[u8] {
+        self.expose()
+    }
+}
+
 fn named(path: &Path, what: &str, error: io::Error) -> io::Error {
     io::Error::new(error.kind(), format!("{what} {}: {error}", path.display()))
 }

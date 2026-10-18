@@ -10,7 +10,7 @@
 //! release_upgraded`), its `td-upgrade` token removed by `finish_u5`.
 
 use crate::cryptsetup::{exit_code, KeyFile, Progress, Resilience, EXIT_BAD_PASSPHRASE};
-use crate::luks2::{Kind, UpgradeView};
+use crate::luks2::{Header, Kind, UpgradeView};
 use crate::pin::{observe_pin, PinPcrs};
 use crate::protected::{Shape, Token};
 use crate::protected_plan;
@@ -45,16 +45,17 @@ pub const ON_BATTERY: &str =
 /// commit leaves a state the next boot continues from.
 const STOPPED: &str = "the next boot continues protecting the disk; boot is refused";
 
-/// The volume as the selector holds it.
-pub trait Host {
+/// The volume as the selector holds it, its commands through the boot's
+/// runner `C`.
+pub trait Host<C> {
     type VolumeKey: AsRef<[u8]>;
     /// The header as the partition holds it now.
     fn read(&mut self) -> Result<UpgradeView, String>;
     /// Opens the selector's mapping with `key`, on keyslot `slot` or, mid
     /// reencryption, naming none.
-    fn open(&mut self, slot: Option<u8>, key: &[u8]) -> io::Result<()>;
+    fn open(&mut self, cryptsetup: &mut C, slot: Option<u8>, key: &[u8]) -> io::Result<()>;
     /// The open mapping's volume key, taken with `key`.
-    fn volume_key(&mut self, key: &[u8]) -> io::Result<Self::VolumeKey>;
+    fn volume_key(&mut self, cryptsetup: &mut C, key: &[u8]) -> io::Result<Self::VolumeKey>;
 }
 
 /// What the boot knows beside the header: the held partition's path, the
@@ -69,8 +70,8 @@ pub struct Boot<'a> {
 /// What the upgrade boot decided.
 pub enum Outcome<K> {
     /// The volume is protected, its mapping open: hand off `key` with an
-    /// admission record of method 0.
-    Upgraded { key: K },
+    /// admission record of method 0. `keyslot` is the recovery key's.
+    Upgraded { key: K, keyslot: u8 },
     /// Cancelled in U0: the device-bound release order, then `cancel`.
     Cancel,
     /// U0 without mains power: the device-bound release order, nothing
@@ -94,7 +95,7 @@ enum Protector {
 
 /// The upgrade boot of an upgrading header in a state before U5.
 #[allow(clippy::too_many_arguments)]
-pub fn upgrade<T: Tpm, C: Runner, F: Fido, H: Host>(
+pub fn upgrade<T: Tpm, C: Runner, F: Fido, H: Host<C>>(
     view: &UpgradeView,
     boot: &Boot<'_>,
     mut tpm: Option<&mut T>,
@@ -266,7 +267,7 @@ enum Round {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn after_cap<T: Tpm, C: Runner, H: Host>(
+fn after_cap<T: Tpm, C: Runner, H: Host<C>>(
     boot: &Boot<'_>,
     mut gathered: Secrets,
     recovery: &mut RecoveryText,
@@ -288,10 +289,18 @@ fn after_cap<T: Tpm, C: Runner, H: Host>(
             Err(error) => return Outcome::Failed(io::Error::other(error)),
         };
         if view.header.kind() != Kind::Upgrading {
-            return match (volume_key, opened) {
-                (Some(key), true) => {
+            let marked = view
+                .header
+                .protected
+                .iter()
+                .find_map(|(_, token)| match token {
+                    Token::RecoveryKey { keyslot } => *keyslot,
+                    _ => None,
+                });
+            return match (volume_key, opened, marked) {
+                (Some(key), true, Some(keyslot)) => {
                     console("td: the disk is protected");
-                    Outcome::Upgraded { key }
+                    Outcome::Upgraded { key, keyslot }
                 }
                 _ => Outcome::Halt(format!(
                     "the upgrade ended without the mapping and its key; {STOPPED}"
@@ -362,7 +371,7 @@ fn after_cap<T: Tpm, C: Runner, H: Host>(
 const MAX_ROUNDS: usize = 64;
 
 /// One state's confirmed plan, run step by step.
-struct Run<'a, 'c, C, H: Host> {
+struct Run<'a, 'c, C, H: Host<C>> {
     boot: &'a Boot<'a>,
     state: State,
     gathered: &'a mut Secrets,
@@ -374,7 +383,7 @@ struct Run<'a, 'c, C, H: Host> {
     console: &'c mut dyn FnMut(&str),
 }
 
-impl<C: Runner, H: Host> Run<'_, '_, C, H> {
+impl<C: Runner, H: Host<C>> Run<'_, '_, C, H> {
     fn run<T: Tpm>(&mut self, steps: &[Step], mut tpm: Option<&mut T>) -> io::Result<Round> {
         let count = steps.len();
         for (index, step) in steps.iter().enumerate() {
@@ -423,7 +432,10 @@ impl<C: Runner, H: Host> Run<'_, '_, C, H> {
                         }
                     }
                     if self.volume_key.is_none() {
-                        *self.volume_key = Some(self.host.volume_key(self.recovery.expose())?);
+                        *self.volume_key = Some(
+                            self.host
+                                .volume_key(&mut *self.cryptsetup, self.recovery.expose())?,
+                        );
                     }
                 }
             }
@@ -433,7 +445,10 @@ impl<C: Runner, H: Host> Run<'_, '_, C, H> {
 
     /// The mapping opened with the recovery key; a wrong key asks again.
     fn open(&mut self, slot: Option<u8>) -> io::Result<Option<Round>> {
-        match self.host.open(slot, self.recovery.expose()) {
+        match self
+            .host
+            .open(&mut *self.cryptsetup, slot, self.recovery.expose())
+        {
             Ok(()) => {
                 *self.opened = true;
                 (self.console)("td: the disk's mapping is open");
@@ -819,6 +834,41 @@ pub fn cancel<C: Runner>(
         }
     };
     removals(&steps, device, cryptsetup, "cancellation", console);
+}
+
+/// A device-bound header's pending tokens, which an interrupted phase 1
+/// leaves, removed once the device-bound order opened the volume, confirmed
+/// against cryptsetup's metadata; a header without them runs nothing.
+pub fn orphans<C: Runner>(
+    header: &Header,
+    device: &Path,
+    cryptsetup: &mut C,
+    console: &mut dyn FnMut(&str),
+) {
+    let Ok(plan) = upgrade::pending_orphans(header) else {
+        return;
+    };
+    if plan.is_empty() {
+        return;
+    }
+    let steps = match cryptsetup
+        .metadata(device)
+        .map_err(|error| error.to_string())
+        .and_then(|dump| plan.confirm(&dump).map_err(|refusal| refusal.to_string()))
+    {
+        Ok(steps) => steps,
+        Err(error) => {
+            console(&format!("phase 1's pending tokens stay this boot: {error}"));
+            return;
+        }
+    };
+    removals(
+        &steps,
+        device,
+        cryptsetup,
+        "phase 1's pending tokens",
+        console,
+    );
 }
 
 /// A U5 boot's plan after the protected release opened the volume: the
