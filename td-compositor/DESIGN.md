@@ -469,7 +469,7 @@ tablet. The USB-enabled kernel also exposes USB HID input through evdev.
 The compositor enumerates all available evdev nodes at startup; this is
 not a PS/2/virtio device allowlist. The compositor
 supports EV_KEY, EV_REL, EV_ABS, and EV_SYN. It has a fixed US key map. Every
-binding is ONE chord on `Super`:
+binding in this list but Print is ONE chord on `Super`:
 
 - the arrow keys focus left, right, up, and down;
 - adding Shift to a focus binding MOVES the focused tile in that direction,
@@ -510,7 +510,13 @@ binding is ONE chord on `Super`:
   while the login state is enrolled or unavailable ("Session lock and
   login-key entry", item 5). It is always consumed there, so no client
   sees it, and the sheet lists it only there; the direct profile leaves
-  it the client's.
+  it the client's;
+- Print (evdev's `KEY_SYSRQ`, or `KEY_PRINT` where a keyboard sends it
+  apart), with or without modifiers and never a client's, takes a
+  screenshot and puts up its card ("Screenshots" below): `C` or either
+  Enter copies, `S` saves where the session can, and Escape,
+  `Control+g` or Print again cancels. Every other key is swallowed
+  rather than dismissing the card, since the capture goes with it.
 
 Shift is read only where the list says so: `Super+Shift+f` is fullscreen and
 `Ctrl+Super+t` is a terminal, since the letter chords and the launcher one
@@ -519,12 +525,13 @@ modifier onto should do what it says rather than nothing — and it matches
 how the workspace and arrow bindings already treated Control and Alt. An
 overlay outranks all of it: while one is up it owns every non-modifier key,
 so `Super+t` behind it neither starts a second terminal nor types `t` into
-the query. The paired profile's `Super+l` alone is read before either
+the query. The paired profile's `Super+l` alone is read before any
 overlay's capture, so a lock is never swallowed by one; locking closes
-both. The launcher outranks the sheet in turn, so the two can never
-both be up: `Scene::set_help` REFUSES to raise the sheet while the launcher
-is visible. That refusal is the invariant, not the fact that `/` is no
-character the launcher accepts — the dispatch already cannot ask for it, so
+them all, the screenshot card among them. The launcher outranks the
+sheet in turn, so the two can never both be up: `Scene::set_help`
+REFUSES to raise the sheet while the launcher is visible. That refusal
+is the invariant, not the fact that `/` is no character the launcher
+accepts — the dispatch already cannot ask for it, so
 before the refusal existed the property held only because nothing happened
 to call it, and any new caller would have broken it silently. The sheet is
 checked FIRST on dismissal, though, so a sheet is always dismissable
@@ -558,7 +565,67 @@ keymap, so the glyph names (`?`, `V`, `T`) are literals — remapping a key in
 `keys.rs` would make the sheet lie with the suite green. The card is
 sized FROM the table too, so adding a row cannot push the last one past the
 bottom edge, and every pixel is clipped to it on an output too small to
-hold it.
+hold it. Its rows are 24 pixels apart, which holds the paired card's
+twenty rows, Print's among them, whole on an 800x600 output (538 rows).
+
+### Screenshots
+
+Print captures the PUBLIC scene as it stands at the press: the tiles, the
+bar and the status line, rendered by `Scene::render_screenshot`, which is
+the ordinary render without the cursor and without any compositor overlay
+(the launcher, the sheet, the screenshot card itself). It is never the
+attention screen or the lock surface, whose pixels only `render_display`
+draws, and the press opens nothing behind another overlay, on a private
+screen, or while a resume withholds input. A drag in progress ends first,
+so its drop hint is not in the picture, and the bar shows its status line
+rather than an earlier screenshot's notice. The capture is BGRX at the
+scanout size, held by the card that the press puts up and dropped by
+whatever closes it: a key, a lock, or secure attention. The card is
+modal, as the sheet is: the launcher and the sheet refuse to rise over
+it and it refuses to rise over them, presses are withheld from clients
+while it is up, and hover is withdrawn.
+
+The card's keys hand the capture to a worker thread of its own, one job
+queued behind the one running; a press past that is told
+`SCREENSHOT BUSY: TRY AGAIN` on the bar and the card stays up with the
+same capture, rather than a job being queued without bound. A key that
+chose a copy or a save is the person's decision about public pixels, so
+a queued job completes even if the session locks before it is done. The
+input layer settles the card's capture from every answer, a failed
+closing paint included, so a card that is down never swallows keys.
+The worker encodes PNG with td-png's encoder (td-png/DESIGN.md,
+"The encoder"), mounted with td-util's DEFLATE encoder and the engine's
+CRC and not the decoder, so neither the encode nor a file write holds
+the runtime lock or the input reader. Its outcome replaces the bar's
+status line for four seconds, ended by the sampler's next tick past
+them: `SCREENSHOT COPIED`, `SCREENSHOT SAVED: ~/NAME`, or
+`SCREENSHOT FAILED:` and why. Only that tick ends it, so a session whose
+bar sampler failed to start keeps its last notice up.
+
+COPY makes the picture the seat's selection, a compositor-owned source
+offered as `image/png` alone (the one-seat clipboard above). It follows
+the physical key that chose it, not a client's focus, so it is taken
+with no client focused too and offered to the next client that is. It
+replaces only the selection that stood at the key, or an earlier
+screenshot's: a client that copied or cleared something while the
+picture encoded keeps what it chose, and the notice says the copy
+failed, while two copies in a row leave the second. A VM export of it
+is refused as not text. A compositor-owned source is refused outright
+when the clipboard writer did not start, since no paste could read it. Pastes share that writer's
+two-transfer queue and five-second bound with the VM bridge's text, so a
+reader that takes a multi-megabyte picture slower than that gets a cut
+transfer.
+
+SAVE writes `screenshot_YYYY-MM-DD-HHMMSS.png`, the bar's local time, in
+the home folder, created new and readable by its owner alone (mode 0600,
+since a screenshot shows whatever was on the screen); a name taken in the
+same second gains `-1` to `-9`, and a write that fails removes its partial
+file. Only the direct profile saves, and only where `HOME` names an
+existing absolute directory: there the compositor runs as the person
+whose folder it is. The paired compositor runs at its reserved account,
+which owns no such folder and may not write the human's, so its card
+offers copy alone. A save there needs a human-side writer the authority
+starts, a separate increment.
 
 Everything in that table is taken FROM the focused client, and this list
 takes more than the one it replaces: the four arrows, Enter, and `t`/`v`/`h`
@@ -1515,7 +1582,9 @@ where no already-announced target could learn it.
 
 The runtime holds one selection for the logical seat. Only the Wayland client that
 currently owns keyboard focus may replace or clear it through the public
-data-device interface. The explicit VM bridge authority below is separate. The request's serial is
+data-device interface. The explicit VM bridge authority below and Print's
+copy ("Screenshots") are separate: each makes the compositor itself the
+source. The request's serial is
 read but is not checked against an input-event ledger, because td does not keep
 one; current keyboard ownership is the narrower authority it can enforce. A
 background request is ignored after consuming the source, as a compositor may
@@ -5676,7 +5745,8 @@ capture; it never restores ordinary routing after an uncertain transition.
 Scene::render_display alone includes the private screen. The output backend
 uses it instead of ordinary scene rendering, covering the entire output and
 all client cursors. Scene::render and render_omitting exclude those private
-pixels; a future screenshot/recording path must use that public rendering.
+pixels; a screenshot/recording path must use that public rendering, as
+Print's `render_screenshot` does ("Screenshots").
 The application pixel-evidence oracle returns zero while attention is up,
 so it cannot attribute private screen pixels to an application. No pixel
 capture or synthetic-input portal is implemented by this increment. The
@@ -7035,8 +7105,8 @@ event publication or selection revision advances the VM revision, so changing
 focus away and back cannot revive an old action. Clipboard snapshots require
 ordinary keyboard focus and refuse the secure-attention screen. Import refuses empty text and checks
 that revision before replacing the seat selection and notifying the focused
-client. Client ID zero is reserved for this compositor-owned source; ordinary
-clients start at one. Normal source cancellation and client replacement release
+client. Client ID zero is reserved for compositor-owned sources, this one and
+Print's picture; ordinary clients start at one. Normal source cancellation and client replacement release
 retained host text. No clipboard payload is logged.
 
 Export asks the current selection source through the existing bounded
@@ -7045,8 +7115,9 @@ worker reads at most 64 KiB with the snapshot deadline and checks the revision
 while waiting and immediately before returning text. Empty exports are refused
 because source closure without data cannot prove a deliberate empty selection.
 No runtime lock spans
-endpoint I/O. Import sources share one writer thread, two queued transfers and
-the existing five-second `conn::write_clipboard` bound. Queue exhaustion closes
+endpoint I/O. Compositor-owned sources share one writer thread, started
+whether or not a bridge is assigned, two queued transfers and the existing
+five-second `conn::write_clipboard` bound. Queue exhaustion closes
 the refused destination. This uses existing File ownership and syscall
 surfaces, with no new unsafe code. UTF-8 and control-character checks match the
 host boundary; the native terminal retains its normal bracketed-paste behavior.

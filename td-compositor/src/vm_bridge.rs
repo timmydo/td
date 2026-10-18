@@ -10,9 +10,33 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// One transfer of a selection this compositor owns: the destination's
+/// endpoint and the bytes to write there.
 pub(crate) struct ClipboardWrite {
     pub file: File,
     pub bytes: Arc<Vec<u8>>,
+}
+
+/// The one writer for every compositor-owned selection, the VM bridge's
+/// imported text and Print's picture alike: two transfers queued, each
+/// under `write_clipboard`'s bound, so a stalled destination costs only
+/// its own transfer and the next. Here because this module holds the one
+/// bounded transport entry outside the Wayland connection; it starts
+/// whether or not a bridge is assigned.
+pub(crate) fn start_clipboard_writer() -> Result<mpsc::SyncSender<ClipboardWrite>, String> {
+    let (sender, receiver) = mpsc::sync_channel::<ClipboardWrite>(2);
+    thread::Builder::new()
+        .name("td-clipboard".into())
+        .spawn(move || {
+            while let Ok(mut write) = receiver.recv() {
+                // Payloads and endpoint diagnostics never enter the log.
+                if conn::write_clipboard(&mut write.file, &write.bytes).is_err() {
+                    eprintln!("td-compositor: clipboard destination closed or timed out");
+                }
+            }
+        })
+        .map_err(|e| format!("start clipboard writer: {e}"))?;
+    Ok(sender)
 }
 
 pub(crate) fn start(
@@ -62,33 +86,10 @@ pub(crate) fn start(
     if !meta.file_type().is_char_device() || meta.uid() != uid || meta.mode() & 0o077 != 0 {
         return Err("VM port is not a private compositor character device".into());
     }
-    let (sender, receiver) = mpsc::sync_channel::<ClipboardWrite>(2);
     thread::Builder::new()
-        .name("td-vm-clipboard".into())
-        .spawn(move || {
-            while let Ok(mut write) = receiver.recv() {
-                // Payloads and endpoint diagnostics never enter the serial log.
-                if conn::write_clipboard(&mut write.file, &write.bytes).is_err() {
-                    eprintln!("td-compositor: VM clipboard destination closed or timed out");
-                }
-            }
-        })
-        .map_err(|e| format!("start VM clipboard writer: {e}"))?;
-    runtime
-        .lock()
-        .map_err(|_| "runtime lock poisoned")?
-        .vm_writer(Some(sender));
-    let worker_runtime = Arc::clone(&runtime);
-    if let Err(error) = thread::Builder::new()
         .name("td-vm-bridge".into())
-        .spawn(move || serve(port, worker_runtime, task_launcher))
-    {
-        runtime
-            .lock()
-            .map_err(|_| "runtime lock poisoned")?
-            .vm_writer(None);
-        return Err(format!("start VM bridge: {error}"));
-    }
+        .spawn(move || serve(port, runtime, task_launcher))
+        .map_err(|error| format!("start VM bridge: {error}"))?;
     eprintln!("td-compositor: td VM bridge v1 available");
     Ok(())
 }
@@ -584,6 +585,8 @@ mod tests {
     struct Fixture {
         dir: std::path::PathBuf,
         runtime: Arc<Mutex<Runtime>>,
+        /// The clipboard writer's queue, held so an import has a writer.
+        _writes: mpsc::Receiver<ClipboardWrite>,
     }
     impl Fixture {
         fn new() -> Self {
@@ -604,9 +607,12 @@ mod tests {
                     Surface::from_shm_pixels(100, 100, vec![255; 40000], SHM_XRGB8888).unwrap(),
                 )
                 .unwrap();
+            let (writer, writes) = mpsc::sync_channel(2);
+            runtime.clipboard_writer(Some(writer));
             Self {
                 dir,
                 runtime: Arc::new(Mutex::new(runtime)),
+                _writes: writes,
             }
         }
         fn request(
@@ -956,7 +962,7 @@ mod tests {
         let f = Fixture::new();
         let (writer, receiver) = mpsc::sync_channel(2);
         let mut runtime = f.runtime.lock().unwrap();
-        runtime.vm_writer(Some(writer));
+        runtime.clipboard_writer(Some(writer));
         let revision = runtime.vm_snapshot().unwrap();
         runtime.vm_put(revision, b"imported".to_vec()).unwrap();
         let source = runtime.selection_for_client(1).2.unwrap().identity;

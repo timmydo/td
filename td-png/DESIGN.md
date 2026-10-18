@@ -115,9 +115,10 @@ cannot name; a frame past the decoder's budgets encodes, and the
 decoder refuses it. Paeth's predictor and Adler-32 live here and the
 decoder uses them. `encode.rs` reaches only the crate root's `deflate`
 and `crc32`, so a consumer mounts it beside those two and carries no
-decoder, which is how the compositor's screenshots are meant to mount
-it; one that runs its tests also mounts the engine's `gzip.rs` under
-`cfg(test)`, which `deflate.rs`'s own tests read back through.
+decoder, as the compositor does for Print's screenshots
+(td-compositor/DESIGN.md, "Screenshots"); one that runs its tests also
+mounts the engine's `gzip.rs` under `cfg(test)`, which `deflate.rs`'s
+own tests read back through.
 
 ## Test contract
 

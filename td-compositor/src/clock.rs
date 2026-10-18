@@ -65,8 +65,26 @@ impl Clock {
         self.try_stamp(epoch).unwrap_or_else(|| "CLOCK ?".into())
     }
 
-    fn try_stamp(&self, epoch: Option<u64>) -> Option<String> {
-        let epoch = i64::try_from(epoch?).ok()?;
+    /// The local time as a file name takes it, `YYYY-MM-DD-HHMMSS`, as the
+    /// screenshot's name spells it.
+    pub fn file_stamp(&self, epoch: u64) -> Option<String> {
+        let (civil, _) = self.civil(epoch)?;
+        let Civil {
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+        } = civil;
+        Some(format!(
+            "{year:04}-{month:02}-{day:02}-{hour:02}{minute:02}{second:02}"
+        ))
+    }
+
+    /// The local civil time at `epoch` and the zone's offset there.
+    fn civil(&self, epoch: u64) -> Option<(Civil, i32)> {
+        let epoch = i64::try_from(epoch).ok()?;
         let offset = match self {
             Self::Utc => 0,
             Self::Local { zone, .. } => zone.offset_at(epoch)?,
@@ -75,7 +93,27 @@ impl Clock {
         let local = epoch.checked_add(i64::from(offset))?;
         let (year, month, day) = civil_from_days(local.div_euclid(86_400));
         let seconds = local.rem_euclid(86_400);
-        let (hour, minute, second) = (seconds / 3600, seconds / 60 % 60, seconds % 60);
+        let civil = Civil {
+            year,
+            month,
+            day,
+            hour: seconds / 3600,
+            minute: seconds / 60 % 60,
+            second: seconds % 60,
+        };
+        Some((civil, offset))
+    }
+
+    fn try_stamp(&self, epoch: Option<u64>) -> Option<String> {
+        let (civil, offset) = self.civil(epoch?)?;
+        let Civil {
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+        } = civil;
         let suffix = if offset == 0 {
             "UTC".into()
         } else {
@@ -95,6 +133,15 @@ impl Clock {
             "{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} {suffix}"
         ))
     }
+}
+
+struct Civil {
+    year: i64,
+    month: u8,
+    day: u8,
+    hour: i64,
+    minute: i64,
+    second: i64,
 }
 
 fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>, String> {
@@ -178,6 +225,16 @@ mod tests {
             clock.stamp(Some(4_118_083_200)),
             "2100-07-01 01:00:00 UTC+01:00"
         );
+        // A screenshot's file name spells the same local time.
+        assert_eq!(
+            clock.file_stamp(4_118_083_200 + 3_725).as_deref(),
+            Some("2100-07-01-020205")
+        );
+        assert_eq!(
+            Clock::Utc.file_stamp(4_102_444_800).as_deref(),
+            Some("2100-01-01-000000")
+        );
+        assert_eq!(Clock::Unavailable.file_stamp(0), None);
         assert!(scratch.load().is_err());
     }
 

@@ -859,6 +859,8 @@ pub struct Scene {
     cursor_charge: BufferCharge,
     launcher: Launcher,
     help: Help,
+    /// Print's chooser card, which holds its capture while it is up.
+    screenshot: crate::screenshot::Chooser,
     attention: bool,
     attention_draining: bool,
     attention_request: Option<crate::attention::Prepared>,
@@ -886,6 +888,9 @@ pub struct Scene {
     /// stays above the drain row, which cancels nothing.
     attention_unlocked: bool,
     status: String,
+    /// A screenshot's outcome, which the bar shows in place of `status`
+    /// until the runtime clears it.
+    notice: Option<String>,
     text: crate::text::Text,
 }
 
@@ -920,6 +925,7 @@ impl Scene {
             cursor_charge: BufferCharge::none(),
             launcher: Launcher::new(),
             help: Help::default(),
+            screenshot: crate::screenshot::Chooser::default(),
             attention: false,
             attention_draining: false,
             attention_request: None,
@@ -932,6 +938,7 @@ impl Scene {
             hostnames: crate::authority::Hostnames::default(),
             attention_unlocked: false,
             status: String::new(),
+            notice: None,
             text: crate::text::Text::default(),
         }
     }
@@ -2252,7 +2259,12 @@ impl Scene {
         self.layout.activate_key(key)
     }
 
+    /// Refuses to open the launcher over the screenshot card, as the sheet
+    /// refuses to rise over the launcher: one overlay at a time.
     pub fn launcher(&mut self, action: LauncherAction) -> Option<LaunchRequest> {
+        if action == LauncherAction::Open && self.screenshot.visible() {
+            return None;
+        }
         self.launcher.apply(action)
     }
 
@@ -2265,8 +2277,50 @@ impl Scene {
     /// launcher, which is where "the two are never both up" now lives —
     /// before, that held only because nothing happened to call it.
     pub fn set_help(&mut self, visible: bool) -> bool {
-        self.help.set(visible && !self.launcher.visible());
+        self.help
+            .set(visible && !self.launcher.visible() && !self.screenshot.visible());
         self.help.visible()
+    }
+
+    /// Put the screenshot card up holding `capture`. Refused behind any
+    /// other overlay or a private screen, so the card is never up beside
+    /// one and a capture never outlives a lock.
+    pub(crate) fn open_chooser(
+        &mut self,
+        capture: crate::screenshot::Capture,
+        saves: bool,
+    ) -> bool {
+        if self.modal() {
+            return false;
+        }
+        self.screenshot.open(capture, saves);
+        true
+    }
+
+    /// The card's capture, closing it.
+    pub(crate) fn take_chooser(&mut self) -> Option<crate::screenshot::Capture> {
+        self.screenshot.take()
+    }
+
+    pub(crate) fn chooser_visible(&self) -> bool {
+        self.screenshot.visible()
+    }
+
+    pub(crate) fn chooser_saves(&self) -> bool {
+        self.screenshot.saves()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn notice(&self) -> Option<&str> {
+        self.notice.as_deref()
+    }
+
+    /// Show `notice` on the bar in place of the status line, or the line
+    /// again; whether that changed.
+    pub(crate) fn set_notice(&mut self, notice: Option<String>) -> bool {
+        let changed = self.notice != notice;
+        self.notice = notice;
+        changed
     }
 
     pub fn help_visible(&self) -> bool {
@@ -2281,7 +2335,10 @@ impl Scene {
     /// Either overlay is modal: it owns the keyboard, withdraws pointer
     /// hover, and must not be clicked through to the tiles it covers.
     pub fn modal(&self) -> bool {
-        self.private_screen() || self.launcher.visible() || self.help.visible()
+        self.private_screen()
+            || self.launcher.visible()
+            || self.help.visible()
+            || self.screenshot.visible()
     }
 
     pub fn launcher_checkpoint(&self) -> Launcher {
@@ -3245,6 +3302,7 @@ impl Scene {
         self.attention_unlocked = false;
         self.launcher.apply(LauncherAction::Close);
         self.help.set(false);
+        self.screenshot.close();
     }
 
     /// The lock surface's rows from now on; whether they changed.
@@ -3285,6 +3343,7 @@ impl Scene {
         if visible {
             self.launcher.apply(LauncherAction::Close);
             self.help.set(false);
+            self.screenshot.close();
         }
     }
 
@@ -3433,6 +3492,20 @@ impl Scene {
         self.render_omitting(frame, width, height, stride, None);
     }
 
+    /// What a screenshot shows: the ordinary render without the cursor or
+    /// any compositor overlay, which are the moment's furniture rather
+    /// than the screen's content. Never the private screens, whose pixels
+    /// only `render_display` draws.
+    pub(crate) fn render_screenshot(
+        &self,
+        frame: &mut [u8],
+        width: usize,
+        height: usize,
+        stride: usize,
+    ) {
+        self.paint_scene(frame, width, height, stride, None, Furniture::Omitted);
+    }
+
     /// Render the same final scene while withholding one surface's pixels.
     /// The rest of its role and descendants stay in place, so comparing this
     /// image with the ordinary render identifies only that surface's final
@@ -3444,6 +3517,18 @@ impl Scene {
         height: usize,
         stride: usize,
         omitted: Option<SurfaceKey>,
+    ) {
+        self.paint_scene(frame, width, height, stride, omitted, Furniture::Drawn);
+    }
+
+    fn paint_scene(
+        &self,
+        frame: &mut [u8],
+        width: usize,
+        height: usize,
+        stride: usize,
+        omitted: Option<SurfaceKey>,
+        furniture: Furniture,
     ) {
         // `take(height)`: every other painter here clips to the output, and
         // the shadow buffer being exactly that tall is the framebuffer's
@@ -3631,8 +3716,13 @@ impl Scene {
             &self.text,
             &desks,
             active,
-            self.launcher.visible(),
-            &self.status,
+            self.launcher.visible() && furniture == Furniture::Drawn,
+            // A notice is the moment's furniture too: a second shot taken
+            // within it shows the line, not the last one's outcome.
+            match furniture {
+                Furniture::Drawn => self.notice.as_deref().unwrap_or(&self.status),
+                Furniture::Omitted => &self.status,
+            },
         );
         // A workspace block is the one that goes OVER the bar rather than
         // under it. The rule above — a block must not hide the bar — is about
@@ -3644,9 +3734,14 @@ impl Scene {
                 draw_hint(frame, width, height, stride, hint.area);
             }
         }
+        if furniture == Furniture::Omitted {
+            return;
+        }
         self.launcher
             .paint(frame, width, height, stride, &self.text);
         self.help.paint(frame, width, height, stride, &self.text);
+        self.screenshot
+            .paint(frame, width, height, stride, &self.text);
         draw_pointer(
             frame,
             width,
@@ -3657,6 +3752,13 @@ impl Scene {
             self.drawn_cursor(),
         );
     }
+}
+
+/// Whether a render draws the cursor and the compositor's overlays.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Furniture {
+    Drawn,
+    Omitted,
 }
 
 /// Where along an axis an absolute device is pointing, as a fraction of its

@@ -19,6 +19,7 @@ use crate::scene::{
     BandPress, CursorRequest, Fraction, PopupConstraint, PopupPlacement, Scene, SharedInputRegion,
     SurfaceKey, WindowGeometry,
 };
+use crate::screenshot::{Capture, Destination, Job, ScreenshotAction};
 // Production code asks the buffer whether a pixel is opaque rather than
 // comparing format numbers, so the enumerants are now a fixture vocabulary.
 #[cfg(test)]
@@ -55,6 +56,9 @@ pub(crate) const FLIP_DEADLINE: Duration = Duration::from_secs(5);
 /// them is still accepted as late (`evicted`), so the bound costs precision
 /// about ancient frames, never a refusal of a real completion.
 const MAX_RECOVERED_FRAMES: usize = 8;
+/// How long the bar shows a screenshot's outcome before the status line
+/// takes it back, at the bar's next one-second tick past it.
+const NOTICE_TIME: Duration = Duration::from_secs(4);
 
 /// Consecutive failed recoveries of one frame after which the watchdog gives
 /// up and ends the process. One tick apart, though each attempt may itself
@@ -372,6 +376,21 @@ struct PortalDialog {
     manager: PortalManagerIdentity,
 }
 
+/// A selection whose source is this compositor.
+struct OwnedSelection {
+    identity: DataSourceIdentity,
+    bytes: Arc<Vec<u8>>,
+    kind: OwnedKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OwnedKind {
+    /// The VM bridge's import, which an export may read back.
+    Text,
+    /// Print's `image/png`, which is not text to any reader.
+    Picture,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SelectionSource {
     pub identity: DataSourceIdentity,
@@ -631,8 +650,14 @@ pub struct Runtime {
     selection: Option<SelectionSource>,
     selection_revision: u64,
     vm_revision: u64,
-    vm_text: Option<(DataSourceIdentity, Arc<Vec<u8>>)>,
-    vm_writer: Option<SyncSender<crate::vm_bridge::ClipboardWrite>>,
+    /// The selection's bytes when this compositor is its source (client
+    /// zero): the VM bridge's imported text or Print's picture.
+    owned_selection: Option<OwnedSelection>,
+    clipboard_writer: Option<SyncSender<crate::vm_bridge::ClipboardWrite>>,
+    /// Print's worker, and whether it can save in the home folder.
+    screenshots: Option<(SyncSender<crate::screenshot::Job>, bool)>,
+    /// When the bar's screenshot notice gives way to the status line.
+    notice_until: Option<std::time::Instant>,
     /// xdg-foreign handles are compositor-wide bearer capabilities. The
     /// object maps stay on their owning client threads; this registry carries
     /// only the cross-client identity and relationship needed to resolve one.
@@ -851,8 +876,10 @@ impl Runtime {
             selection: None,
             selection_revision: 0,
             vm_revision: 1,
-            vm_text: None,
-            vm_writer: None,
+            owned_selection: None,
+            clipboard_writer: None,
+            screenshots: None,
+            notice_until: None,
             foreign_exports: BTreeMap::new(),
             foreign_imports: BTreeMap::new(),
             toplevel_parents: BTreeMap::new(),
@@ -3292,13 +3319,176 @@ impl Runtime {
     /// Take a new status line. Repaints only when the TEXT changed, so a
     /// sampler that ticks faster than the line does costs nothing — and the
     /// clock's seconds are what make it change at all.
+    ///
+    /// The sampler's tick is also what ends a screenshot notice, so the
+    /// line takes the bar back within a second of the notice's time.
     pub fn set_status(&mut self, status: String) -> Result<(), String> {
-        let Some(previous) = self.scene.set_status(status) else {
+        let expired = self
+            .notice_until
+            .is_some_and(|until| Instant::now() >= until);
+        if expired {
+            self.notice_until = None;
+        }
+        let cleared = expired && self.scene.set_notice(None);
+        let previous = self.scene.set_status(status);
+        if previous.is_none() && !cleared {
             return Ok(());
-        };
+        }
         if let Err(error) = self.repaint() {
-            self.scene.set_status(previous);
+            if let Some(previous) = previous {
+                self.scene.set_status(previous);
+            }
             return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Give Print a worker; `saves` says whether it can write the home
+    /// folder. Without one, Print opens nothing.
+    pub(crate) fn enable_screenshots(&mut self, jobs: SyncSender<Job>, saves: bool) {
+        self.screenshots = Some((jobs, saves));
+    }
+
+    /// Print's chooser (DESIGN.md, "Screenshots"). Answers whether the card
+    /// is up afterwards, as `help` does, so the adapter routes the next key
+    /// to it.
+    pub fn screenshot(&mut self, action: ScreenshotAction) -> Result<bool, String> {
+        let destination = match action {
+            ScreenshotAction::Take => return self.take_screenshot(),
+            ScreenshotAction::Cancel => {
+                if self.scene.take_chooser().is_some() {
+                    self.chooser_closed()?;
+                }
+                return Ok(false);
+            }
+            ScreenshotAction::Copy => Destination::Clipboard,
+            // A session that cannot save never showed the row.
+            ScreenshotAction::Save if !self.scene.chooser_saves() => {
+                return Ok(self.scene.chooser_visible());
+            }
+            ScreenshotAction::Save => Destination::Home,
+        };
+        let saves = self.scene.chooser_saves();
+        let Some(capture) = self.scene.take_chooser() else {
+            return Ok(false);
+        };
+        let job = Job {
+            capture,
+            destination,
+            replaces: self.selection.as_ref().map(|source| source.identity),
+        };
+        let queued = match &self.screenshots {
+            Some((jobs, _)) => jobs.try_send(job),
+            None => Err(TrySendError::Disconnected(job)),
+        };
+        match queued {
+            Ok(()) => {}
+            // The card goes back up with its capture, so the same moment
+            // can be copied or saved once the worker is free.
+            Err(TrySendError::Full(job)) => {
+                self.notice("SCREENSHOT BUSY: TRY AGAIN".into());
+                if self.scene.open_chooser(job.capture, saves) {
+                    if let Err(error) = self.repaint() {
+                        // Down after any failure, as the adapter assumes.
+                        self.scene.take_chooser();
+                        return Err(error);
+                    }
+                    return Ok(true);
+                }
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                self.notice("SCREENSHOT FAILED: NO WORKER".into());
+            }
+        }
+        self.chooser_closed()?;
+        Ok(false)
+    }
+
+    /// The public scene as it stands, without the cursor or an overlay,
+    /// held by the card it opens. Refused behind any overlay or private
+    /// screen, and while a resume withholds input.
+    fn take_screenshot(&mut self) -> Result<bool, String> {
+        if self.scene.chooser_visible() {
+            return Ok(true);
+        }
+        let Some(saves) = self.screenshots.as_ref().map(|(_, saves)| *saves) else {
+            return Ok(false);
+        };
+        if self.scene.modal() || self.resume_withholds() {
+            return Ok(false);
+        }
+        // The card would end a drag anyway; ending it first keeps its drop
+        // hint out of the picture.
+        self.dragging = None;
+        self.scene.clear_hint();
+        let size = self.backend.dimensions();
+        let (width, height) = (size.width, size.height);
+        let stride = width.checked_mul(4).ok_or("screenshot row overflows")?;
+        let length = stride
+            .checked_mul(height)
+            .ok_or("screenshot frame overflows")?;
+        let mut pixels = vec![0u8; length];
+        self.scene
+            .render_screenshot(&mut pixels, width, height, stride);
+        let capture = Capture {
+            width,
+            height,
+            pixels,
+        };
+        if !self.scene.open_chooser(capture, saves) {
+            return Ok(false);
+        }
+        self.cancel_drag_under_overlay();
+        if let Err(error) = self.repaint().and_then(|()| self.refresh_focus()) {
+            self.scene.take_chooser();
+            return Err(match self.repaint() {
+                Ok(()) => error,
+                Err(restore_error) => {
+                    format!("{error}; restore after screenshot card: {restore_error}")
+                }
+            });
+        }
+        Ok(true)
+    }
+
+    /// The card is down: repaint and give hover back. The capture is gone
+    /// either way, so a failure leaves the card down and says so.
+    fn chooser_closed(&mut self) -> Result<(), String> {
+        self.repaint()?;
+        self.refresh_focus()
+    }
+
+    /// Show a screenshot's outcome on the bar until a tick past
+    /// `NOTICE_TIME`, painted with the next repaint.
+    fn notice(&mut self, text: String) -> bool {
+        self.notice_until = Some(Instant::now() + NOTICE_TIME);
+        self.scene.set_notice(Some(text))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_notice(&self) -> bool {
+        self.notice_until.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_notice(&mut self) -> Option<String> {
+        self.notice_until = None;
+        let notice = self.scene.notice().map(str::to_string);
+        self.scene.set_notice(None);
+        notice
+    }
+
+    #[cfg(test)]
+    pub(crate) fn owns_picture(&self) -> bool {
+        self.owned_selection
+            .as_ref()
+            .is_some_and(|owned| owned.kind == OwnedKind::Picture)
+    }
+
+    /// The worker's outcome, shown at once.
+    pub(crate) fn screenshot_notice(&mut self, text: String) -> Result<(), String> {
+        if self.notice(text) {
+            self.repaint()?;
         }
         Ok(())
     }
@@ -4874,7 +5064,7 @@ impl Runtime {
             return Ok(None);
         }
         let prior = std::mem::replace(&mut self.selection, source);
-        self.vm_text = None;
+        self.owned_selection = None;
         let mut local_cancel = None;
         if let Some(prior) = prior {
             if prior.identity.client == client {
@@ -4904,11 +5094,12 @@ impl Runtime {
         Ok(())
     }
 
-    pub(crate) fn vm_writer(
+    /// The writer that serves every selection this compositor owns.
+    pub(crate) fn clipboard_writer(
         &mut self,
         writer: Option<SyncSender<crate::vm_bridge::ClipboardWrite>>,
     ) {
-        self.vm_writer = writer;
+        self.clipboard_writer = writer;
     }
 
     pub(crate) fn vm_snapshot(&self) -> Result<u64, String> {
@@ -4942,6 +5133,28 @@ impl Runtime {
             .focus
             .ok_or("no guest focus")?
             .client;
+        self.own_selection(
+            bytes,
+            OwnedKind::Text,
+            &["text/plain;charset=utf-8", "text/plain", "UTF8_STRING"],
+            Some(focused),
+        )
+    }
+
+    /// Replace the selection with bytes this compositor serves itself,
+    /// cancelling the prior source, and tell the focused client, if any.
+    fn own_selection(
+        &mut self,
+        bytes: Vec<u8>,
+        kind: OwnedKind,
+        mime_types: &[&str],
+        focused: Option<u64>,
+    ) -> Result<(), String> {
+        // Nothing could serve it: refuse rather than take a selection no
+        // paste can read.
+        if self.clipboard_writer.is_none() {
+            return Err("no clipboard writer".into());
+        }
         if let Some(prior) = self.selection.take() {
             self.queue_data_delivery(
                 prior.identity.client,
@@ -4955,15 +5168,18 @@ impl Runtime {
             object: 0,
             generation,
         };
-        self.vm_text = Some((identity, Arc::new(bytes)));
+        self.owned_selection = Some(OwnedSelection {
+            identity,
+            bytes: Arc::new(bytes),
+            kind,
+        });
         self.selection = Some(SelectionSource {
             identity,
-            mime_types: Arc::new(vec![
-                "text/plain;charset=utf-8".into(),
-                "text/plain".into(),
-                "UTF8_STRING".into(),
-            ]),
+            mime_types: Arc::new(mime_types.iter().map(|mime| mime.to_string()).collect()),
         });
+        let Some(focused) = focused else {
+            return Ok(());
+        };
         self.queue_selection_update(
             focused,
             SelectionUpdate {
@@ -4973,6 +5189,29 @@ impl Runtime {
         )
     }
 
+    /// Print's picture as the selection, offered as `image/png` alone. It
+    /// follows the physical key that chose it rather than a client's
+    /// focus, so it is taken with no client focused too, and offered to
+    /// the next one that is. `replaces` is the selection when the key was
+    /// pressed: a client that copied or cleared something since, while the
+    /// picture was encoding, keeps what it chose. An earlier screenshot is
+    /// always replaced, so two copies in a row leave the second.
+    pub(crate) fn own_png(
+        &mut self,
+        png: Vec<u8>,
+        replaces: Option<DataSourceIdentity>,
+    ) -> Result<(), String> {
+        let current = self.selection.as_ref().map(|source| source.identity);
+        let earlier_picture = self.owned_selection.as_ref().is_some_and(|owned| {
+            owned.kind == OwnedKind::Picture && Some(owned.identity) == current
+        });
+        if current != replaces && !earlier_picture {
+            return Err("the clipboard changed while encoding".into());
+        }
+        let focused = self.keyboard.snapshot().focus.map(|surface| surface.client);
+        self.own_selection(png, OwnedKind::Picture, &["image/png"], focused)
+    }
+
     pub(crate) fn vm_get(
         &mut self,
         revision: u64,
@@ -4980,9 +5219,12 @@ impl Runtime {
     ) -> Result<Option<Arc<Vec<u8>>>, String> {
         self.vm_check(revision)?;
         let source = self.selection.clone().ok_or("guest clipboard is empty")?;
-        if let Some((identity, bytes)) = &self.vm_text {
-            if *identity == source.identity {
-                return Ok(Some(Arc::clone(bytes)));
+        if let Some(owned) = &self.owned_selection {
+            if owned.identity == source.identity {
+                return match owned.kind {
+                    OwnedKind::Text => Ok(Some(Arc::clone(&owned.bytes))),
+                    OwnedKind::Picture => Err("guest selection is a picture, not text".into()),
+                };
             }
         }
         let mime = [
@@ -5018,7 +5260,7 @@ impl Runtime {
             return Ok(None);
         }
         self.selection = None;
-        self.vm_text = None;
+        self.owned_selection = None;
         let focused = self.keyboard.snapshot().focus.map(|surface| surface.client);
         if let Some(client) = focused {
             let update = SelectionUpdate {
@@ -5076,13 +5318,13 @@ impl Runtime {
                 }
             }
         }
-        if let Some((identity, bytes)) = &self.vm_text {
-            if *identity == source {
-                return Ok(self.vm_writer.as_ref().is_some_and(|writer| {
+        if let Some(owned) = &self.owned_selection {
+            if owned.identity == source {
+                return Ok(self.clipboard_writer.as_ref().is_some_and(|writer| {
                     writer
                         .try_send(crate::vm_bridge::ClipboardWrite {
                             file: file.into_file(),
-                            bytes: Arc::clone(bytes),
+                            bytes: Arc::clone(&owned.bytes),
                         })
                         .is_ok()
                 }));
@@ -6209,6 +6451,210 @@ mod tests {
             reader,
             TransferEndpoint::from_file(std::fs::File::from(std::os::fd::OwnedFd::from(writer))),
         )
+    }
+
+    fn screenshot_worker(runtime: &mut Runtime, saves: bool) -> Receiver<Job> {
+        let (jobs, receiver) = mpsc::sync_channel(1);
+        runtime.enable_screenshots(jobs, saves);
+        receiver
+    }
+
+    #[test]
+    fn print_holds_the_public_scene_without_the_cursor_until_copy_sends_it() {
+        let (_cleanup, mut runtime, _events, _source, _window) = clipboard_fixture();
+        let jobs = screenshot_worker(&mut runtime, false);
+        runtime
+            .pointer_frame(1, 30, 30, &[], PointerScroll::default())
+            .unwrap();
+        let size = runtime.backend.dimensions();
+        let (width, height) = (size.width, size.height);
+        let mut public = vec![0u8; width * height * 4];
+        runtime
+            .scene
+            .render_screenshot(&mut public, width, height, width * 4);
+        let mut ordinary = vec![0u8; width * height * 4];
+        runtime
+            .scene
+            .render(&mut ordinary, width, height, width * 4);
+        assert!(public != ordinary, "the cursor is not in a screenshot");
+
+        assert!(runtime.screenshot(ScreenshotAction::Take).unwrap());
+        assert!(runtime.scene.modal());
+        // The card is on the display, and not in what it holds.
+        let mut shown = vec![0u8; width * height * 4];
+        runtime
+            .scene
+            .render_display(&mut shown, width, height, width * 4)
+            .unwrap();
+        assert!(shown != ordinary, "the card is on the display");
+        // No other overlay rises over it, and a session that cannot save
+        // keeps the card up on S.
+        assert!(!runtime.help(HelpAction::Toggle).unwrap());
+        assert!(runtime.launcher(LauncherAction::Open).unwrap().is_none());
+        assert!(!runtime.launcher_visible());
+        assert!(runtime.screenshot(ScreenshotAction::Save).unwrap());
+        assert!(runtime.screenshot(ScreenshotAction::Take).unwrap());
+        assert!(jobs.try_recv().is_err());
+
+        assert!(!runtime.screenshot(ScreenshotAction::Copy).unwrap());
+        assert!(!runtime.scene.chooser_visible() && !runtime.scene.modal());
+        let job = jobs.try_recv().unwrap();
+        assert_eq!(job.destination, Destination::Clipboard);
+        assert_eq!((job.capture.width, job.capture.height), (width, height));
+        assert!(job.capture.pixels == public);
+        // Copy again with the card down sends nothing.
+        assert!(!runtime.screenshot(ScreenshotAction::Copy).unwrap());
+        assert!(jobs.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_saving_session_sends_save_and_cancel_drops_the_capture() {
+        let (_cleanup, mut runtime, _events, _source, _window) = clipboard_fixture();
+        let jobs = screenshot_worker(&mut runtime, true);
+        assert!(runtime.screenshot(ScreenshotAction::Take).unwrap());
+        assert!(!runtime.screenshot(ScreenshotAction::Save).unwrap());
+        assert_eq!(jobs.try_recv().unwrap().destination, Destination::Home);
+        assert!(runtime.screenshot(ScreenshotAction::Take).unwrap());
+        assert!(!runtime.screenshot(ScreenshotAction::Cancel).unwrap());
+        assert!(!runtime.scene.chooser_visible());
+        assert!(jobs.try_recv().is_err());
+    }
+
+    #[test]
+    fn print_opens_nothing_without_a_worker_behind_an_overlay_or_on_a_private_screen() {
+        let (_cleanup, mut runtime, _events, _source, _window) = clipboard_fixture();
+        assert!(!runtime.screenshot(ScreenshotAction::Take).unwrap());
+        let _jobs = screenshot_worker(&mut runtime, true);
+        assert!(runtime.help(HelpAction::Toggle).unwrap());
+        assert!(!runtime.screenshot(ScreenshotAction::Take).unwrap());
+        assert!(!runtime.help(HelpAction::Close).unwrap());
+        // A lock closes an open card, and with it the capture.
+        assert!(runtime.screenshot(ScreenshotAction::Take).unwrap());
+        runtime.scene.set_attention(true);
+        assert!(!runtime.scene.chooser_visible());
+        assert!(!runtime.screenshot(ScreenshotAction::Take).unwrap());
+        runtime.scene.set_attention(false);
+        assert!(runtime.screenshot(ScreenshotAction::Take).unwrap());
+        runtime.scene.lock();
+        assert!(!runtime.scene.chooser_visible());
+        assert!(!runtime.screenshot(ScreenshotAction::Take).unwrap());
+        assert!(runtime.scene.take_chooser().is_none());
+    }
+
+    #[test]
+    fn a_busy_worker_is_said_on_the_bar_and_the_notice_gives_way_to_the_line() {
+        let (_cleanup, mut runtime, _events, _source, _window) = clipboard_fixture();
+        let (jobs, _receiver) = mpsc::sync_channel(0);
+        runtime.enable_screenshots(jobs, false);
+        assert!(runtime.screenshot(ScreenshotAction::Take).unwrap());
+        // The card stays up holding the same moment, for another try.
+        assert!(runtime.screenshot(ScreenshotAction::Copy).unwrap());
+        assert!(runtime.scene.chooser_visible() && runtime.scene.modal());
+        assert_eq!(runtime.scene.notice(), Some("SCREENSHOT BUSY: TRY AGAIN"));
+        // The notice is not in a picture taken while it shows.
+        let size = runtime.backend.dimensions();
+        let (width, height) = (size.width, size.height);
+        let mut noticed = vec![0u8; width * height * 4];
+        runtime
+            .scene
+            .render_screenshot(&mut noticed, width, height, width * 4);
+        runtime.scene.set_notice(None);
+        let mut plain = vec![0u8; width * height * 4];
+        runtime
+            .scene
+            .render_screenshot(&mut plain, width, height, width * 4);
+        assert!(noticed == plain, "the notice is not in a screenshot");
+        runtime
+            .scene
+            .set_notice(Some("SCREENSHOT BUSY: TRY AGAIN".into()));
+        // A card put back but not painted is down again, as the adapter
+        // takes every error to mean.
+        runtime.fail_next_repaint();
+        assert!(runtime.screenshot(ScreenshotAction::Copy).is_err());
+        assert!(!runtime.scene.chooser_visible() && !runtime.scene.modal());
+        assert!(runtime.screenshot(ScreenshotAction::Take).unwrap());
+        assert!(!runtime.screenshot(ScreenshotAction::Cancel).unwrap());
+        runtime.set_status("LOAD 0.00".into()).unwrap();
+        assert!(runtime.scene.notice().is_some(), "not yet expired");
+        runtime.notice_until = Some(Instant::now() - Duration::from_millis(1));
+        runtime.set_status("LOAD 0.00".into()).unwrap();
+        assert_eq!(runtime.scene.notice(), None);
+        assert_eq!(runtime.notice_until, None);
+        runtime
+            .screenshot_notice("SCREENSHOT COPIED".into())
+            .unwrap();
+        assert_eq!(runtime.scene.notice(), Some("SCREENSHOT COPIED"));
+    }
+
+    #[test]
+    fn print_s_picture_is_an_image_png_selection_this_compositor_serves() {
+        use std::io::Read;
+        let (_cleanup, mut runtime, events, source, _window) = clipboard_fixture();
+        // No writer, nothing could serve it: refused, the client's source
+        // kept.
+        assert!(runtime
+            .own_png(b"\x89PNG picture".to_vec(), Some(source))
+            .unwrap_err()
+            .contains("writer"));
+        let (writer, writes) = mpsc::sync_channel(2);
+        runtime.clipboard_writer(Some(writer));
+        // A client copied something after the key: its newer selection
+        // stands.
+        assert!(runtime
+            .own_png(b"\x89PNG picture".to_vec(), None)
+            .unwrap_err()
+            .contains("changed"));
+        assert_eq!(runtime.selection_for_client(2).2.unwrap().identity, source);
+        assert!(events.try_recv().is_err());
+        runtime
+            .own_png(b"\x89PNG picture".to_vec(), Some(source))
+            .unwrap();
+        // The client source it replaced is cancelled.
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            KeyboardDelivery::DataSourceCancelled(cancelled) if cancelled == source
+        ));
+        // A second copy queued behind the first recorded the same client
+        // source, which the first picture has since replaced: the later
+        // picture still wins.
+        runtime
+            .own_png(b"\x89PNG first".to_vec(), Some(source))
+            .unwrap();
+        runtime
+            .own_png(b"\x89PNG picture".to_vec(), Some(source))
+            .unwrap();
+        assert!(
+            events.try_recv().is_err(),
+            "client zero is cancelled to no one"
+        );
+        let (focused, _, offered) = runtime.selection_for_client(2);
+        let offered = offered.unwrap();
+        assert!(focused);
+        assert_eq!(offered.identity.client, 0);
+        assert_eq!(*offered.mime_types, ["image/png".to_string()]);
+        // A VM export reads text only.
+        let revision = runtime.vm_snapshot().unwrap();
+        let (_reader, file) = clipboard_endpoint();
+        assert!(runtime
+            .vm_get(revision, file)
+            .unwrap_err()
+            .contains("picture"));
+        let (mut reader, file) = clipboard_endpoint();
+        assert!(runtime
+            .send_selection_data(2, offered.identity, "image/png".into(), file)
+            .unwrap());
+        let mut write = writes.try_recv().unwrap();
+        std::io::Write::write_all(&mut write.file, &write.bytes).unwrap();
+        drop(write);
+        reader.set_nonblocking(false).unwrap();
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"\x89PNG picture");
+        // A client's own selection replaces it.
+        let (focused, _, _) = runtime.selection_for_client(2);
+        assert!(focused);
+        runtime.set_selection(2, None).unwrap();
+        assert!(runtime.owned_selection.is_none());
     }
 
     #[test]

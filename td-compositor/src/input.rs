@@ -11,6 +11,7 @@ use crate::pointer::{
 };
 use crate::runtime::Runtime;
 use crate::scene::Fraction;
+use crate::screenshot::ScreenshotAction;
 use crate::sys;
 use std::collections::BTreeSet;
 use std::fs::{self, File};
@@ -99,11 +100,15 @@ const KEY_CAPSLOCK: u16 = 58;
 const KEY_NUMLOCK: u16 = 69;
 const KEY_KPENTER: u16 = 96;
 const KEY_RIGHTCTRL: u16 = 97;
+/// The Print Screen key: evdev names it for SysRq, which is Alt+Print.
+const KEY_SYSRQ: u16 = 99;
 const KEY_RIGHTALT: u16 = 100;
 const KEY_UP: u16 = 103;
 const KEY_LEFT: u16 = 105;
 const KEY_RIGHT: u16 = 106;
 const KEY_DOWN: u16 = 108;
+/// Print on keyboards and Fn layers that send it apart from SysRq.
+const KEY_PRINT: u16 = 210;
 const KEY_LEFTMETA: u16 = 125;
 const KEY_RIGHTMETA: u16 = 126;
 const BTN_MOUSE: u16 = 0x110;
@@ -320,6 +325,8 @@ struct KeyBindings {
     num_lock: bool,
     launcher_open: bool,
     help_open: bool,
+    /// Print's chooser card is up and owns every non-modifier key.
+    screenshot_open: bool,
     consumed: BTreeSet<(usize, u16)>,
     pointer_pending: BTreeSet<usize>,
     pointer_pressed: BTreeSet<(usize, u16)>,
@@ -368,6 +375,7 @@ struct KeyDecision {
     command: Option<Command>,
     launcher: Option<LauncherAction>,
     help: Option<HelpAction>,
+    screenshot: Option<ScreenshotAction>,
     launch: Option<LaunchRequest>,
     forward: Option<KeyInput>,
     modifiers: Option<ModifierState>,
@@ -413,6 +421,7 @@ impl KeyBindings {
             command: None,
             launcher: None,
             help: None,
+            screenshot: None,
             launch: None,
             forward: None,
             modifiers: None,
@@ -506,6 +515,7 @@ impl KeyBindings {
             self.consumed.clear();
             self.launcher_open = false;
             self.help_open = false;
+            self.screenshot_open = false;
             decision.attention = Some(true);
             return decision;
         }
@@ -596,6 +606,28 @@ impl KeyBindings {
                 }
                 _ => None,
             };
+            return decision;
+        }
+        // Print's card takes C or Enter to copy, S to save and Escape,
+        // Control+g or Print again to cancel; any other key is swallowed
+        // rather than dismissing it, since the capture is lost with it.
+        if self.screenshot_open {
+            self.consumed.insert(physical);
+            let control = self.pressed(KEY_LEFTCTRL) || self.pressed(KEY_RIGHTCTRL);
+            decision.screenshot = match event.code {
+                KEY_C | KEY_ENTER | KEY_KPENTER => Some(ScreenshotAction::Copy),
+                KEY_S => Some(ScreenshotAction::Save),
+                KEY_ESC | KEY_SYSRQ | KEY_PRINT => Some(ScreenshotAction::Cancel),
+                KEY_G if control => Some(ScreenshotAction::Cancel),
+                _ => None,
+            };
+            return decision;
+        }
+        // Print with or without modifiers, and never a client's: the one
+        // binding Super is not part of, as on every desktop.
+        if event.code == KEY_SYSRQ || event.code == KEY_PRINT {
+            self.consumed.insert(physical);
+            decision.screenshot = Some(ScreenshotAction::Take);
             return decision;
         }
         let meta = self.pressed(KEY_LEFTMETA) || self.pressed(KEY_RIGHTMETA);
@@ -906,6 +938,12 @@ impl KeyBindings {
     fn settle_help(&mut self, visible: Option<bool>) {
         if let Some(visible) = visible {
             self.help_open = visible;
+        }
+    }
+
+    fn settle_screenshot(&mut self, visible: Option<bool>) {
+        if let Some(visible) = visible {
+            self.screenshot_open = visible;
         }
     }
 
@@ -1619,6 +1657,11 @@ trait InputTarget {
     /// Answers whether the sheet is up afterwards, as `launcher` does: the
     /// adapter must know to route the NEXT key to it.
     fn help(&mut self, action: HelpAction) -> Result<bool, String>;
+    /// Print and its card's keys, answering whether the card is up
+    /// afterwards. A target with no screenshots never opens it.
+    fn screenshot(&mut self, _action: ScreenshotAction) -> Result<bool, String> {
+        Ok(false)
+    }
     /// Spawn a registry entry WITHOUT opening the overlay — `Super+t`'s whole
     /// point. Separate from `launcher` because that one is about the overlay's
     /// model and returns its visibility, which this never changes.
@@ -1848,6 +1891,7 @@ fn lock_session<T: InputTarget>(
     if target.session_locked() {
         bindings.settle_launcher(Some(false));
         bindings.settle_help(Some(false));
+        bindings.settle_screenshot(Some(false));
     }
     drained?;
     let presentation = locked?;
@@ -2580,6 +2624,13 @@ impl InputTarget for LiveInputTarget {
             .help(action)
     }
 
+    fn screenshot(&mut self, action: ScreenshotAction) -> Result<bool, String> {
+        self.runtime
+            .lock()
+            .map_err(|_| "runtime lock poisoned".to_string())?
+            .screenshot(action)
+    }
+
     fn launcher(&mut self, action: LauncherAction) -> Result<bool, String> {
         let (request, visible) = {
             let mut runtime = self
@@ -3096,6 +3147,7 @@ fn apply_locked<T: InputTarget>(
         && decision.command.is_none()
         && decision.launcher.is_none()
         && decision.help.is_none()
+        && decision.screenshot.is_none()
         && decision.launch.is_none()
         && decision.forward.is_none()
         && decision.modifiers.is_none()
@@ -3145,7 +3197,7 @@ fn deliver_pointer_frame<T: InputTarget>(
             .buttons
             .iter()
             .any(|button| button.pressed && button.code == BTN_LEFT);
-    if bindings.launcher_open || bindings.help_open {
+    if bindings.launcher_open || bindings.help_open || bindings.screenshot_open {
         buttons.retain(|button| button.state == PointerButtonState::Released);
     }
     let delivery = match frame.place {
@@ -3191,14 +3243,17 @@ fn deliver_key_decision<T: InputTarget>(
     let bindings_ordinary = decision.command.is_some()
         || decision.launcher.is_some()
         || decision.help.is_some()
+        || decision.screenshot.is_some()
         || decision.launch.is_some();
     if bindings_ordinary && runtime.session_locked() {
         decision.command = None;
         decision.launcher = None;
         decision.help = None;
+        decision.screenshot = None;
         decision.launch = None;
         bindings.settle_launcher(Some(false));
         bindings.settle_help(Some(false));
+        bindings.settle_screenshot(Some(false));
     }
     if decision.lock {
         lock_session(runtime, bindings)?;
@@ -3264,6 +3319,14 @@ fn deliver_key_decision<T: InputTarget>(
     if let Some(action) = decision.help {
         let visible = runtime.help(action)?;
         bindings.settle_help(Some(visible));
+    }
+    // Every failure leaves the card down, the capture gone with it, so the
+    // capture is settled before the error is: a key the card does not name
+    // would otherwise be swallowed with no card to say why.
+    if let Some(action) = decision.screenshot {
+        let answer = runtime.screenshot(action);
+        bindings.settle_screenshot(Some(answer.as_ref().is_ok_and(|visible| *visible)));
+        answer?;
     }
     if let Some(request) = decision.launch {
         runtime.launch(request)?;
@@ -5566,6 +5629,11 @@ mod tests {
         launched: Vec<LaunchRequest>,
         help_actions: Vec<HelpAction>,
         help: crate::help::Help,
+        screenshots: Vec<ScreenshotAction>,
+        screenshot_up: bool,
+        /// The next card action fails after closing it, as a failed paint
+        /// does.
+        screenshot_error: Option<String>,
         /// The attempt's own PIN field model, which the tests open.
         field: crate::secret_client::PinField,
         /// The masked length shown after each key that changed the field.
@@ -5691,6 +5759,16 @@ mod tests {
             // longer behaves this way.
             self.help.set(action.target(self.help.visible()));
             Ok(self.help.visible())
+        }
+
+        fn screenshot(&mut self, action: ScreenshotAction) -> Result<bool, String> {
+            self.screenshots.push(action);
+            self.screenshot_up = action == ScreenshotAction::Take;
+            if let Some(error) = self.screenshot_error.take() {
+                self.screenshot_up = false;
+                return Err(error);
+            }
+            Ok(self.screenshot_up)
         }
 
         fn launcher(&mut self, action: LauncherAction) -> Result<bool, String> {
@@ -6449,6 +6527,7 @@ mod tests {
         Launcher(LauncherAction),
         Launch(LaunchRequest),
         Help(HelpAction),
+        Screenshot(ScreenshotAction),
         /// The paired profile's session lock.
         Lock,
         /// Documented but not a key, so this row is exercised elsewhere. The
@@ -6523,6 +6602,7 @@ mod tests {
                 Bound::Launch(LaunchRequest::Agent) => "CODING AGENT",
                 Bound::Launcher(_) | Bound::Pointer(_, Pointing::Launcher) => "OPEN LAUNCHER",
                 Bound::Help(_) => "THIS HELP",
+                Bound::Screenshot(_) => "SCREENSHOT",
                 Bound::Lock => "LOCK SCREEN",
             }
         }
@@ -6546,6 +6626,8 @@ mod tests {
             // `?` IS the shifted `/`, so the glyph absorbs the modifier
             // rather than the sheet naming it twice.
             KEY_SLASH => return "SUPER+?".to_string(),
+            // The one binding without Super.
+            KEY_SYSRQ | KEY_PRINT if modifiers.is_empty() => return "PRINT".to_string(),
             other => panic!("no help spelling for evdev {other}"),
         };
         let shift = if modifiers.contains(&KEY_LEFTSHIFT) {
@@ -6616,6 +6698,7 @@ mod tests {
                 KEY_SLASH,
                 Bound::Help(HelpAction::Toggle),
             ),
+            (&[], KEY_SYSRQ, Bound::Screenshot(ScreenshotAction::Take)),
             (&[KEY_LEFTMETA], KEY_L, Bound::Lock),
             (&[], 0, Bound::Pointer("HOVER", Pointing::Focus)),
             (&[], 0, Bound::Pointer("CLICK", Pointing::Focus)),
@@ -6657,13 +6740,15 @@ mod tests {
                 decision.launcher,
                 decision.launch,
                 decision.help,
+                decision.screenshot,
                 decision.lock,
             ) {
-                (Some(command), None, None, None, false) => Bound::Command(command),
-                (None, Some(action), None, None, false) => Bound::Launcher(action),
-                (None, None, Some(request), None, false) => Bound::Launch(request),
-                (None, None, None, Some(action), false) => Bound::Help(action),
-                (None, None, None, None, true) => Bound::Lock,
+                (Some(command), None, None, None, None, false) => Bound::Command(command),
+                (None, Some(action), None, None, None, false) => Bound::Launcher(action),
+                (None, None, Some(request), None, None, false) => Bound::Launch(request),
+                (None, None, None, Some(action), None, false) => Bound::Help(action),
+                (None, None, None, None, Some(action), false) => Bound::Screenshot(action),
+                (None, None, None, None, None, true) => Bound::Lock,
                 other => panic!("{} produced {other:?}", row.keys),
             };
             assert_eq!(&actual, expected, "{} / {}", row.keys, row.action);
@@ -6954,6 +7039,202 @@ mod tests {
         assert_eq!(target.help_actions, [HelpAction::Toggle, HelpAction::Close]);
         assert_eq!(target.launched, []);
         assert_eq!(target.commands, []);
+    }
+
+    #[test]
+    fn print_takes_a_screenshot_with_any_modifiers_and_never_reaches_a_client() {
+        for modifiers in [
+            &[][..],
+            &[KEY_LEFTMETA][..],
+            &[KEY_LEFTSHIFT, KEY_LEFTCTRL][..],
+        ] {
+            let mut bindings = KeyBindings::default();
+            for modifier in modifiers {
+                press(&mut bindings, *modifier);
+            }
+            let print = bindings.feed(key(KEY_SYSRQ, KEY_PRESS));
+            assert_eq!(print.screenshot, Some(ScreenshotAction::Take));
+            assert!(print.forward.is_none() && print.command.is_none());
+            assert!(bindings.feed(key(KEY_SYSRQ, KEY_RELEASE)).forward.is_none());
+        }
+    }
+
+    #[test]
+    fn print_s_own_keycode_takes_and_cancels_as_sysrq_does() {
+        let mut bindings = KeyBindings::default();
+        let print = bindings.feed(key(KEY_PRINT, KEY_PRESS));
+        assert_eq!(print.screenshot, Some(ScreenshotAction::Take));
+        assert!(print.forward.is_none());
+        bindings.feed(key(KEY_PRINT, KEY_RELEASE));
+        bindings.settle_screenshot(Some(true));
+        assert_eq!(
+            bindings.feed(key(KEY_PRINT, KEY_PRESS)).screenshot,
+            Some(ScreenshotAction::Cancel)
+        );
+    }
+
+    /// Secure attention takes the keyboard from the card as from the other
+    /// overlays, and the card's capture flag goes with it.
+    #[test]
+    fn the_attention_chord_clears_the_cards_capture() {
+        let mut bindings = KeyBindings {
+            attention_enabled: true,
+            ..KeyBindings::default()
+        };
+        bindings.settle_screenshot(Some(true));
+        press(&mut bindings, KEY_LEFTCTRL);
+        press(&mut bindings, KEY_LEFTALT);
+        let decision = bindings.feed(key(KEY_ESC, KEY_PRESS));
+        assert_eq!(decision.attention, Some(true));
+        assert!(decision.screenshot.is_none());
+        assert!(!bindings.screenshot_open);
+    }
+
+    /// A card whose closing paint failed is still down: the adapter settles
+    /// its capture before the error, so the next key reaches the client
+    /// rather than a card nobody can see.
+    #[test]
+    fn a_failed_close_still_settles_the_card_down() {
+        let target = Mutex::new(RecordingTarget::default());
+        let bindings = Mutex::new(KeyBindings::default());
+        let mut pointer = PointerMotion::default();
+        for event in [key(KEY_SYSRQ, KEY_PRESS), key(KEY_SYSRQ, KEY_RELEASE)] {
+            apply(&target, event, 0, &bindings, &mut pointer, None).unwrap();
+        }
+        assert!(bindings.lock().unwrap().screenshot_open);
+        target.lock().unwrap().screenshot_error = Some("paint failed".into());
+        assert!(apply(
+            &target,
+            key(KEY_C, KEY_PRESS),
+            0,
+            &bindings,
+            &mut pointer,
+            None
+        )
+        .is_err());
+        assert!(!bindings.lock().unwrap().screenshot_open);
+        apply(
+            &target,
+            key(KEY_C, KEY_RELEASE),
+            0,
+            &bindings,
+            &mut pointer,
+            None,
+        )
+        .unwrap();
+        apply(
+            &target,
+            key(KEY_T, KEY_PRESS),
+            0,
+            &bindings,
+            &mut pointer,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            target.lock().unwrap().keys.len(),
+            1,
+            "the next key is the client's"
+        );
+    }
+
+    #[test]
+    fn the_card_takes_its_keys_and_swallows_every_other() {
+        let open = || {
+            let mut bindings = KeyBindings::default();
+            bindings.settle_screenshot(Some(true));
+            bindings
+        };
+        for (code, action) in [
+            (KEY_C, ScreenshotAction::Copy),
+            (KEY_ENTER, ScreenshotAction::Copy),
+            (KEY_KPENTER, ScreenshotAction::Copy),
+            (KEY_S, ScreenshotAction::Save),
+            (KEY_ESC, ScreenshotAction::Cancel),
+            (KEY_SYSRQ, ScreenshotAction::Cancel),
+        ] {
+            let mut bindings = open();
+            let decision = bindings.feed(key(code, KEY_PRESS));
+            assert_eq!(decision.screenshot, Some(action), "evdev {code}");
+            assert!(decision.forward.is_none());
+            assert!(bindings.feed(key(code, KEY_RELEASE)).forward.is_none());
+        }
+        let mut bindings = open();
+        press(&mut bindings, KEY_LEFTCTRL);
+        assert_eq!(
+            bindings.feed(key(KEY_G, KEY_PRESS)).screenshot,
+            Some(ScreenshotAction::Cancel)
+        );
+        // Any other key, a Super chord included, does nothing and reaches
+        // no client: the capture is not lost to a stray key.
+        let mut bindings = open();
+        for code in [KEY_T, KEY_SPACE, KEY_G] {
+            let decision = bindings.feed(key(code, KEY_PRESS));
+            assert!(decision.screenshot.is_none() && decision.forward.is_none());
+            assert!(decision.command.is_none() && decision.launch.is_none());
+        }
+        press(&mut bindings, KEY_LEFTMETA);
+        let chord = bindings.feed(key(KEY_T, KEY_PRESS));
+        assert!(chord.launch.is_none() && chord.screenshot.is_none() && chord.forward.is_none());
+    }
+
+    #[test]
+    fn print_behind_an_overlay_opens_no_card() {
+        let mut bindings = KeyBindings::default();
+        bindings.settle_help(Some(true));
+        let decision = bindings.feed(key(KEY_SYSRQ, KEY_PRESS));
+        assert_eq!(decision.help, Some(HelpAction::Close));
+        assert!(decision.screenshot.is_none());
+        let mut bindings = KeyBindings::default();
+        bindings.settle_launcher(Some(true));
+        let decision = bindings.feed(key(KEY_SYSRQ, KEY_PRESS));
+        assert!(decision.screenshot.is_none() && decision.launcher.is_none());
+    }
+
+    #[test]
+    fn the_adapter_routes_print_and_settles_the_cards_capture() {
+        let target = Mutex::new(RecordingTarget::default());
+        let bindings = Mutex::new(KeyBindings::default());
+        let mut pointer = PointerMotion::default();
+        for event in [key(KEY_SYSRQ, KEY_PRESS), key(KEY_SYSRQ, KEY_RELEASE)] {
+            apply(&target, event, 0, &bindings, &mut pointer, None).unwrap();
+        }
+        assert!(bindings.lock().unwrap().screenshot_open);
+        // A press while the card is up reaches no client.
+        for event in [
+            Event {
+                kind: EV_KEY,
+                code: BTN_LEFT,
+                value: KEY_PRESS,
+                timestamp: 0,
+                time: 0,
+            },
+            Event {
+                kind: EV_SYN,
+                code: SYN_REPORT,
+                value: 0,
+                timestamp: 0,
+                time: 0,
+            },
+        ] {
+            apply(&target, event, 0, &bindings, &mut pointer, None).unwrap();
+        }
+        assert!(target
+            .lock()
+            .unwrap()
+            .pointer_frames
+            .iter()
+            .all(|(_, _, _, buttons)| buttons.is_empty()));
+        for event in [key(KEY_C, KEY_PRESS), key(KEY_C, KEY_RELEASE)] {
+            apply(&target, event, 0, &bindings, &mut pointer, None).unwrap();
+        }
+        assert!(!bindings.lock().unwrap().screenshot_open);
+        let target = target.lock().unwrap();
+        assert_eq!(
+            target.screenshots,
+            [ScreenshotAction::Take, ScreenshotAction::Copy]
+        );
+        assert!(target.keys.is_empty());
     }
 
     #[test]
@@ -12241,25 +12522,40 @@ mod tests {
     /// sheet's capture close with the overlays the runtime closes, so no
     /// key is routed to an overlay that is gone.
     #[test]
-    fn locking_closes_the_launcher_and_help_capture() {
-        for help in [false, true] {
+    fn locking_closes_the_launcher_help_and_screenshot_capture() {
+        for overlay in ["launcher", "help", "screenshot"] {
             let seat = LockedSeat::open(&[]);
+            let (jobs, _queued) = std::sync::mpsc::sync_channel(1);
             {
                 let mut bindings = seat.bindings.lock().unwrap();
                 let mut runtime = seat.runtime.lock().unwrap();
-                if help {
-                    bindings.settle_help(Some(runtime.help(HelpAction::Toggle).unwrap()));
-                } else {
-                    runtime.launcher(LauncherAction::Open).unwrap();
-                    bindings.settle_launcher(Some(runtime.launcher_visible()));
+                match overlay {
+                    "help" => {
+                        bindings.settle_help(Some(runtime.help(HelpAction::Toggle).unwrap()));
+                    }
+                    "screenshot" => {
+                        runtime.enable_screenshots(jobs, false);
+                        let up = runtime.screenshot(ScreenshotAction::Take).unwrap();
+                        assert!(up);
+                        bindings.settle_screenshot(Some(up));
+                    }
+                    _ => {
+                        runtime.launcher(LauncherAction::Open).unwrap();
+                        bindings.settle_launcher(Some(runtime.launcher_visible()));
+                    }
                 }
-                assert!(bindings.launcher_open || bindings.help_open);
+                assert!(bindings.launcher_open || bindings.help_open || bindings.screenshot_open);
             }
             seat.lock().unwrap();
             let bindings = seat.bindings.lock().unwrap();
-            assert!(!bindings.launcher_open && !bindings.help_open, "{help}");
-            let runtime = seat.runtime.lock().unwrap();
+            assert!(
+                !bindings.launcher_open && !bindings.help_open && !bindings.screenshot_open,
+                "{overlay}"
+            );
+            let mut runtime = seat.runtime.lock().unwrap();
             assert!(!runtime.launcher_visible() && !runtime.help_visible());
+            // The card and its capture are gone: Copy finds nothing.
+            assert!(!runtime.screenshot(ScreenshotAction::Copy).unwrap());
         }
     }
 

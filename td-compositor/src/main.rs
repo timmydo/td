@@ -25,6 +25,46 @@ mod face_file;
 #[cfg_attr(not(feature = "target-recipe"), path = "../../td-ui/src/sfnt.rs")]
 mod sfnt;
 
+// td-png's encoder for Print's picture, over td-util's DEFLATE encoder and
+// the engine's CRC, which it reaches as `crate::deflate` and `crate::crc32`
+// (td-png/DESIGN.md, "The encoder"). The decoder is not mounted.
+#[allow(dead_code, reason = "the engine CRC's other entry points")]
+#[cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic
+    )
+)]
+#[cfg_attr(not(feature = "target-recipe"), path = "../../engine/src/crc32.rs")]
+mod crc32;
+#[allow(dead_code, reason = "td-util's gzip framing is unused here")]
+#[cfg_attr(not(feature = "target-recipe"), path = "../../td-util/src/deflate.rs")]
+mod deflate;
+#[cfg_attr(not(feature = "target-recipe"), path = "../../td-png/src/encode.rs")]
+mod png_encode;
+// `deflate.rs`'s own tests read their output back through the engine's
+// inflater.
+#[cfg(test)]
+#[allow(dead_code)]
+#[cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic
+    )
+)]
+#[cfg_attr(not(feature = "target-recipe"), path = "../../engine/src/gzip.rs")]
+mod gzip;
+// td-fs's fixture guard, for tests that own a directory.
+#[cfg(test)]
+#[cfg_attr(not(feature = "target-recipe"), path = "../../td-fs/src/temp_dir.rs")]
+mod temp_dir;
+
 mod attention;
 mod authority;
 mod bar;
@@ -53,6 +93,7 @@ mod proc_status;
 mod reportable;
 mod runtime;
 mod scene;
+mod screenshot;
 mod secret_client;
 mod server;
 mod session;
@@ -539,6 +580,32 @@ fn run_compositor(options: RunOptions) -> Result<(), String> {
     // incumbent said.
     if let Some(path) = options.control_socket.as_deref() {
         control::serve(path, Arc::clone(&runtime), socket_policy)?;
+    }
+    // The writer every compositor-owned selection is served through, the VM
+    // bridge's imported text and Print's picture. Reported, never fatal: a
+    // session without it serves no selection of its own.
+    match vm_bridge::start_clipboard_writer() {
+        Ok(writer) => runtime
+            .lock()
+            .map_err(|_| "runtime lock poisoned".to_string())?
+            .clipboard_writer(Some(writer)),
+        Err(error) => eprintln!("td-compositor: {error}"),
+    }
+    // Print's worker. It saves in the home folder only where this process
+    // runs as the person it belongs to: the direct profile. The paired
+    // compositor's account owns no such folder.
+    let home = if options.terminal_authority {
+        None
+    } else {
+        screenshot::home_folder(env::var_os("HOME"))
+    };
+    let saves = home.is_some();
+    match screenshot::start(Arc::clone(&runtime), home) {
+        Ok(jobs) => runtime
+            .lock()
+            .map_err(|_| "runtime lock poisoned".to_string())?
+            .enable_screenshots(jobs, saves),
+        Err(error) => eprintln!("td-compositor: {error}"),
     }
     if let Err(error) = vm_bridge::start(Arc::clone(&runtime), task_launcher) {
         eprintln!("td-compositor: VM bridge unavailable: {error}");
@@ -1117,10 +1184,15 @@ mod confinement {
         "app_policy.rs",
         "atlas.rs",
         "coverage.rs",
+        "crc32.rs",
+        "deflate.rs",
         "face.rs",
         "face_file.rs",
+        "gzip.rs",
+        "png_encode.rs",
         "scm.rs",
         "sfnt.rs",
+        "temp_dir.rs",
         "timezone.rs",
     ];
 
@@ -1141,6 +1213,8 @@ mod confinement {
         ("conn.rs", include_str!("conn.rs")),
         ("control.rs", include_str!("control.rs")),
         ("coverage.rs", include_str!("../../td-ui/src/coverage.rs")),
+        ("crc32.rs", include_str!("../../engine/src/crc32.rs")),
+        ("deflate.rs", include_str!("../../td-util/src/deflate.rs")),
         ("drm.rs", include_str!("drm.rs")),
         ("face.rs", include_str!("../../td-ui/src/face.rs")),
         ("face_file.rs", include_str!("../../td-ui/src/face_file.rs")),
@@ -1148,6 +1222,7 @@ mod confinement {
         ("font.rs", include_str!("font.rs")),
         ("font_data.rs", include_str!("font_data.rs")),
         ("framebuffer.rs", include_str!("framebuffer.rs")),
+        ("gzip.rs", include_str!("../../engine/src/gzip.rs")),
         ("headless.rs", include_str!("headless.rs")),
         ("help.rs", include_str!("help.rs")),
         ("input.rs", include_str!("input.rs")),
@@ -1155,18 +1230,21 @@ mod confinement {
         ("launcher.rs", include_str!("launcher.rs")),
         ("layout.rs", include_str!("layout.rs")),
         ("output.rs", include_str!("output.rs")),
+        ("png_encode.rs", include_str!("../../td-png/src/encode.rs")),
         ("pointer.rs", include_str!("pointer.rs")),
         ("positioner.rs", include_str!("positioner.rs")),
         ("proc_status.rs", include_str!("proc_status.rs")),
         ("reportable.rs", include_str!("reportable.rs")),
         ("runtime.rs", include_str!("runtime.rs")),
         ("scene.rs", include_str!("scene.rs")),
+        ("screenshot.rs", include_str!("screenshot.rs")),
         ("secret_client.rs", include_str!("secret_client.rs")),
         ("server.rs", include_str!("server.rs")),
         ("session.rs", include_str!("session.rs")),
         ("scm.rs", SCM),
         ("sfnt.rs", include_str!("../../td-ui/src/sfnt.rs")),
         ("socket.rs", include_str!("socket.rs")),
+        ("temp_dir.rs", include_str!("../../td-fs/src/temp_dir.rs")),
         ("text.rs", include_str!("text.rs")),
         ("timezone.rs", include_str!("../../td-civil/src/tzif.rs")),
         ("ui.rs", include_str!("ui.rs")),
@@ -3264,8 +3342,9 @@ pub struct MappedRegion {
             "            .spawn(move || resume.monitor(target.as_ref(), bindings.as_ref()))\n"
         ));
         // The runtime withholds a client's paint, focus and input while a
-        // lock is owed, and nothing on a private screen.
-        assert_eq!(occurrences(runtime, "self.resume_withholds()"), 7);
+        // lock is owed, and nothing on a private screen; Print captures
+        // nothing then either.
+        assert_eq!(occurrences(runtime, "self.resume_withholds()"), 8);
         assert!(runtime.contains(
             "        !self.scene.private_screen() && self.resume.as_ref().is_some_and(|resume| resume.holds())\n"
         ));

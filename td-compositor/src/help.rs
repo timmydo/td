@@ -5,7 +5,7 @@ const CARD_WIDTH: usize = 620;
 const CARD_PADDING: usize = 24;
 const TITLE_TOP: usize = 18;
 const FIRST_ROW_TOP: usize = 48;
-const ROW_STEP: usize = 26;
+const ROW_STEP: usize = 24;
 const BOTTOM_PADDING: usize = 10;
 const KEYS_LEFT: usize = 20;
 const ACTION_LEFT: usize = 280;
@@ -65,6 +65,10 @@ pub const CHORDS: &[Row] = &[
     Row {
         keys: "SUPER+?",
         action: "THIS HELP",
+    },
+    Row {
+        keys: "PRINT",
+        action: "SCREENSHOT",
     },
 ];
 
@@ -313,7 +317,7 @@ mod tests {
         );
         // The paired card, `Super+l`'s row included, fits 800x600 whole
         // too, and the title clears the first row by more than a row gap.
-        assert_eq!(card_height(true), 552);
+        assert_eq!(card_height(true), 538);
         assert!(card_height(true) <= 600 - CARD_PADDING * 2);
         const _: () = assert!(TITLE_TOP + ROW_STEP < FIRST_ROW_TOP);
     }

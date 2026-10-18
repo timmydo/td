@@ -51,6 +51,8 @@ const MODULES: &[(&str, &str)] = &[
         include_str!("../../../td-compositor/src/control.rs"),
     ),
     ("coverage", include_str!("../../../td-ui/src/coverage.rs")),
+    ("crc32", include_str!("../../../engine/src/crc32.rs")),
+    ("deflate", include_str!("../../../td-util/src/deflate.rs")),
     ("drm", include_str!("../../../td-compositor/src/drm.rs")),
     ("face", include_str!("../../../td-ui/src/face.rs")),
     ("face_file", include_str!("../../../td-ui/src/face_file.rs")),
@@ -67,6 +69,7 @@ const MODULES: &[(&str, &str)] = &[
         "framebuffer",
         include_str!("../../../td-compositor/src/framebuffer.rs"),
     ),
+    ("gzip", include_str!("../../../engine/src/gzip.rs")),
     (
         "headless",
         include_str!("../../../td-compositor/src/headless.rs"),
@@ -89,6 +92,7 @@ const MODULES: &[(&str, &str)] = &[
         "output",
         include_str!("../../../td-compositor/src/output.rs"),
     ),
+    ("png_encode", include_str!("../../../td-png/src/encode.rs")),
     (
         "pointer",
         include_str!("../../../td-compositor/src/pointer.rs"),
@@ -111,6 +115,10 @@ const MODULES: &[(&str, &str)] = &[
     ),
     ("scene", include_str!("../../../td-compositor/src/scene.rs")),
     (
+        "screenshot",
+        include_str!("../../../td-compositor/src/screenshot.rs"),
+    ),
+    (
         "server",
         include_str!("../../../td-compositor/src/server.rs"),
     ),
@@ -124,6 +132,7 @@ const MODULES: &[(&str, &str)] = &[
         include_str!("../../../td-compositor/src/socket.rs"),
     ),
     ("sys", include_str!("../../../td-compositor/src/sys.rs")),
+    ("temp_dir", include_str!("../../../td-fs/src/temp_dir.rs")),
     ("text", include_str!("../../../td-compositor/src/text.rs")),
     ("timezone", include_str!("../../../td-civil/src/tzif.rs")),
     ("ui", include_str!("../../../td-compositor/src/ui.rs")),
