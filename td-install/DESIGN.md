@@ -1348,9 +1348,11 @@ release"), td-protector's protected release instead, its entries
 through the same `secret-line` and its security keys through td-boot's
 FIDO2 client, one client per Enter, opens it on the released keyslot
 alone, takes the volume key, then runs td-protector's plan and lockout
-steps; a device-bound, upgrading or refused header keeps the
-device-bound order, so a `td-upgrade` header boots as device-bound
-without a reseal before 8f. cryptsetup names the partition by its held
+steps; a device-bound or refused header keeps the device-bound order,
+and from 8f an upgrading one runs td-protector's upgrade boot
+(ENCRYPTION.md "Re-encrypting upgrade"), whose no-mains and cancelled
+boots keep that order without a reseal, and a device-bound header's open
+then removes pending orphans. cryptsetup names the partition by its held
 descriptor,
 `/proc/<pid>/fd/N`; the mapping is then admitted by this walk, under
 that name only, held with the partition, and the boot's mounts name it
@@ -1569,7 +1571,10 @@ extends the event's SHA-256 digest once, then requires exact readback of
 the SHA-256 bank, and a reply naming another bank or PCR, or anything but
 the exact empty extension reply, is refused. An unsupported TPM, malformed
 reply, nonzero initial PCR, uncertain extension or readback mismatch
-refuses kexec.
+refuses kexec on an unencrypted boot; an encrypted one prints the fixed
+`TD-BOOT-UNMEASURED` line and boots, a protected release with a method-0
+record and, from 8f's upgrade-boot commit, a device-bound one with none
+(ENCRYPTION.md "Verified account handoff").
 It never resets a PCR or retries an extension. A failed handoff requires a
 cold boot; it cannot measure another candidate on the already-used PCR.
 The ordinary verified selection and fallback happen before measurement.

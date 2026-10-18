@@ -1149,14 +1149,18 @@ therefore requires its primary's Name to be the one a lockout token on
 the header records under a tag that verifies under the volume key
 ("Lockout"); with no such token, or under another Name, the sealed
 object gets no keyslot and the boot continues by the method that
-released it. What is defended: no keyslot is added for an object
-sealed to a primary other than the one td took the lockout on, and an
-interposer that appears after the take is refused as a changed TPM.
-What is not: an interposer present at the take, and the new PIN of a
-first seal, whose authValue such a session discloses ("Threat and
-limits"). td-tpm takes P-256 and AES from
-td-fido by path ("FIDO2 protectors"); the kernel's own TPM bus
-protection (`TCG_TPM2_HMAC`) stays off as pinned.
+released it. The upgrade boot is the one exception ("Re-encrypting
+upgrade"): its first seal gets a keyslot before the take that anchors
+it, in the same boot, and the take runs only when the storage
+primary's Name is the one the new tpm-pin token records. What is
+defended: no keyslot is added for an object sealed to a primary other
+than the one td took the lockout on, the upgrade's seal and take
+sharing one, and an interposer that appears after the take is refused as
+a changed TPM. What is not: an interposer present at the take, and the
+new PIN of a first seal, whose authValue such a session discloses
+("Threat and limits"). td-tpm takes P-256 and AES from td-fido by path
+("FIDO2 protectors"); the kernel's own TPM bus protection
+(`TCG_TPM2_HMAC`) stays off as pinned.
 
 **Lockout.** The TPM's dictionary-attack lockout is the only guess
 limit: td keeps no counter of its own, and the TPM keeps its counter in
@@ -1832,29 +1836,29 @@ record after its release, once its PCR 11 measurement of the selected
 deployment has succeeded. The record is 46 bytes: `TDADMIT1` (8 bytes),
 version 1 (1), the big-endian u32 UID the released token names (4), the
 method (1: 0 for no admission, after a fido2-recovery or recovery-key
-release and in every upgrade boot; 1 tpm-pin; 2 fido2-primary), and the
-selected deployment's 32-byte manifest ID (32). td-kexec carries it
-beside the key, on a second pipe, as a second archive member
-`td-admit-v1`, a regular file of mode 0400 owned by root with exactly
-those bytes, under the rules the key member has (`--fds-key-admit DIGEST
-KEY RECORD CMDLINE`, the record written and its write end closed before
-td-kexec starts). A protected boot whose selector carries no measurement
-policy, and so makes no PCR 11 measurement, writes the record with
-method 0: it admits nothing, though, as any valid record does, it marks
-the machine protected. So does a protected boot whose measurement fails,
-a missing or failing TPM or a readback after the extension that leaves
-PCR 11 uncertain: the selector says so on the consoles in a fixed line
-and boots, since refusing would leave a FIDO2-primary machine without a
-working TPM unbootable, and method 0 admits nothing. A device-bound or
-unencrypted boot whose selector carries no policy still stops on a
-measurement failure. A device-bound boot whose selector carries the
-policy, which only phase 1 writes (a cancelled or interrupted upgrade,
-or U0's device-bound flow), treats a failure as a protected boot does:
-the fixed line, then the boot, since its TPM may be why the person chose
-the FIDO2 shape; it writes no record, as no device-bound release does,
-so nothing is admitted. 8f's upgrade-boot commit carries this rule. A
-device-bound release writes none, an upgrading header's included until
-8f's upgrade boot.
+release and in every upgrade boot that runs the upgrade's plans from a
+state before U5; 1 tpm-pin; 2 fido2-primary), and the selected
+deployment's 32-byte manifest ID (32). td-kexec carries it beside the
+key, on a second pipe, as a second archive member `td-admit-v1`, a
+regular file of mode 0400 owned by root with exactly those bytes, under
+the rules the key member has (`--fds-key-admit DIGEST KEY RECORD
+CMDLINE`, the record written and its write end closed before td-kexec
+starts). A protected boot whose selector carries no measurement policy,
+and so makes no PCR 11 measurement, writes the record with method 0: it
+admits nothing, though, as any valid record does, it marks the machine
+protected. So does a protected boot whose measurement fails, a missing
+or failing TPM or a readback after the extension that leaves PCR 11
+uncertain: the selector says so on the consoles in a fixed line and
+boots, since refusing would leave a FIDO2-primary machine without a
+working TPM unbootable, and method 0 admits nothing. An unencrypted boot
+still stops on a measurement failure. A device-bound boot whose selector
+carries the policy, which only phase 1 writes (a cancelled or
+interrupted upgrade, or U0's device-bound flow), treats a failure as a
+protected boot does: the fixed line, then the boot, since its TPM may be
+why the person chose the FIDO2 shape; it writes no record, as no
+device-bound release does, so nothing is admitted. 8f's upgrade-boot
+commit carries this rule. A device-bound release writes none: a no-mains
+or cancelled upgrade boot is one.
 
 The deployment initramfs never carries it to disk. `mount-root` handles
 the key as today and leaves the record; a new verb, `td-boot admit
@@ -1990,32 +1994,53 @@ operations' wire, steps and screens.
 | U2 | cryptsetup's online-reencryption requirement present |
 | U3 | digest differs from `from`; no requirement; no `recovery-key` marker |
 | U4 | marker present; some pending token or the tpm-pin token (TPM shape) or the lockout token (TPM shape) missing |
-| U5 | marker, every fido2 token with a keyslot, and in the TPM shape the tpm-pin and lockout tokens, unless the TPM became unusable (below) |
+| U5 | marker, every fido2 token with a keyslot, and in the TPM shape the tpm-pin and lockout tokens |
 
 1. **Before the cap.** In U0, the selector first requires mains power:
    a `/sys/class/power_supply` entry of type `Mains` online, or no
    `Battery` entry. Without it the console says the upgrade waits for
-   mains power, and the boot runs the device-bound recovery flow with
-   nothing upgraded. In U0 an empty entry at the first prompt asks
-   whether to cancel, and exactly `cancel` confirms: the boot runs the
-   device-bound recovery flow, and its plan removes the `td-upgrade`
-   token, after which the pending tokens are orphans it removes too.
-   After U0 nothing cancels, and the prompts say so. The selector then
+   mains power, and the boot runs the device-bound release order with
+   nothing upgraded. Before U5 the first prompt is the recovery key's,
+   asked before anything else is gathered and tested only after the
+   cap. In U0 an empty entry there asks whether to cancel, exactly
+   `cancel` confirms and any other answer returns to the prompt:
+   confirmed, the boot runs the device-bound release order, and once
+   it opened the volume the cancellation's plan removes the
+   `td-upgrade` token, then the pending tokens it leaves as orphans; a
+   failed removal stops that plan, and the boot goes on. Neither this
+   boot nor a no-mains one offers a reseal, since the header was
+   upgrading when read; a cancelled volume's next recovery offers it.
+   After U0 nothing cancels, and the prompt says so. The selector then
    gathers what the state still needs: for each pending fido2 token in
-   turn, its key alone, its PIN and a touch, the assertion verified
-   under the token's public key and the passphrase derived; in the TPM
-   shape without a tpm-pin token, the new PIN twice (the pre-cap rule
-   in "Lockout" applying), a fresh secret sealed to the observed PCR 4
-   and PCR 9 (and PCR 7 when measured on) and a literal-zero PCR 12,
-   and one Unseal verifying it; and the recovery key. In U5 it gathers
-   nothing and runs the protected release instead.
+   turn, its key alone, asked by an empty entry at the token's own
+   prompt, its PIN and a touch, the assertion in the unlock phase over
+   the volume's unlock description, since unlocking is what its keyslot
+   will do, verified under the token's public key and the passphrase
+   derived; and in the TPM shape without a tpm-pin token, the new PIN
+   twice (the pre-cap rule in "Lockout" applying), a fresh secret sealed
+   to the observed PCR 4 and PCR 9 (and PCR 7 when measured on) and a
+   literal-zero PCR 12, and one Unseal verifying it. At that prompt
+   exactly `drop` instead removes its token from the upgrade, refused
+   when it would leave the FIDO2 shape without a fido2-primary token, so
+   a key lost or broken since phase 1 does not hold the upgrade; keys
+   come back by token addition once the volume is protected. Any other
+   entry, and a key that releases nothing, asks again; the key's PIN
+   prompt takes no word, and end of input at any prompt halts the boot.
+   A seal or verifying Unseal that fails otherwise, a TPM in lockout
+   included, is taken as a TPM unusable for td (step 3), the console
+   naming the failure, so no TPM fault holds the upgrade. In U5 it
+   gathers nothing and runs the protected release instead.
 2. **The cap.**
 3. **After the cap**, every step authorized by the recovery key, tested
-   first on the recovery keyslot: keyslot 0 in U0 and U1; in U2 by
-   `reencrypt --resume-only` itself, since cryptsetup then holds a
-   keyslot for each volume key; in U3 the one `luks2` keyslot no token
-   names, since reencryption may have moved it; from U4 the keyslot the
-   marker names. The steps run in order
+   first on the recovery keyslot: keyslot 0 in U0 and U1; in U2 by its
+   open naming no keyslot, since cryptsetup then holds a keyslot for
+   each volume key; in U3 the one `luks2` keyslot no token names, since
+   reencryption may have moved it; from U4 the keyslot the marker
+   names. A key that fails that test or open with cryptsetup's
+   wrong-passphrase status asks for the recovery key again, without
+   limit, keeping what was gathered, and any other failure fails the
+   boot as a failed open does; that prompt no longer cancels, since the
+   cap closed the device-bound order's unseal. The steps run in order
    from the state found, each a commit the console reports:
    - U0 to U1: kill the device-bound keyslots, then remove the
      first-boot and device-bound tokens; a token naming a killed
@@ -2027,42 +2052,63 @@ operations' wire, steps and screens.
      and PBKDF2 parameters, the recovery key on standard input
      (td-protector's runner spells the list), and `--resilience
      checksum` when the disk's `queue/atomic_write_unit_max_bytes` is
-     at least 4096, otherwise `--resilience journal`. Progress is
-     reported at least every percent. In U2 the step is `reencrypt
+     at least 4096, otherwise `--resilience journal`. cryptsetup
+     prints a `--progress-json` line each second, which the selector
+     reads as it comes, reporting a line's whole percent when it
+     exceeds the last one reported and skipping an empty line. In U2
+     the selector opens `td-selector` with the recovery
+     key naming no keyslot, which cryptsetup activates over both volume
+     keys with its helper devices, and the step is `reencrypt
      --resume-only` with the same key, before anything else and before
      any handoff, since the handoff carries one volume key; a resumption
      on battery warns and continues. td-boot admits the mapping by
      discovery's walk only once reencryption has ended and cryptsetup
-     has removed its helper devices.
+     has removed its helper devices. From then on the selector holds
+     the new volume key, taken with the recovery key, which the
+     lockout's take seals under and the handoff carries. A boot that
+     starts in U3 or U4 opens `td-selector` on the recovery keyslot its
+     state names, after that keyslot's test, and takes the key then.
    - U3 to U4: import the `recovery-key` marker naming the recovery
      keyslot.
    - U4 to U5: kill any `luks2` keyslot no token names but the marked
-     one, an add an earlier attempt left; then for each pending fido2
-     token add its keyslot, test it, and only then replace the token
-     with one naming it (`token import --token-replace`); in the TPM
-     shape add the tpm-pin keyslot, test it and import its token, then
-     take the lockout ("Lockout"). When the TPM has become unusable for
-     td since phase 1 (absent, without a SHA-256 bank, with a lockout
+     one, an add an earlier attempt left, and remove each pending token
+     dropped before the cap; then for each pending fido2 token add its
+     keyslot, test it, and only then replace the token with one naming
+     it (`token import --token-replace`); in the TPM shape add the
+     tpm-pin keyslot, test it and import its token, then take the
+     lockout ("Lockout") if the storage primary's Name is the one that
+     token records ("Bus"). When the TPM has become unusable for td
+     since phase 1 (absent, without a SHA-256 bank, with a lockout
      authorization td cannot prove, or creating a tpm-pin object over
      the token's bounds, refused at its seal before the cap), the
-     console says so and U4 ends without a tpm-pin or lockout token:
-     the volume completes as a TPM-primary volume with no tpm-pin
-     protector, as after a TPM clear,
-     whose boots ask for a token or the recovery key. A TPM that
-     becomes unusable after the tpm-pin token's import and before the
-     take ends U4 the same way with that protector but no lockout
-     token. Once the TPM is eligible again, the first such boot offers
-     no reseal and takes the lockout, writing the lockout token; the
-     boot after offers the reseal, anchored to it ("Protected
-     release").
+     console says so and U4 ends without a tpm-pin or lockout token: the
+     volume completes as a TPM-primary volume with no tpm-pin protector,
+     as after a TPM clear, whose boots ask for a token or the recovery
+     key. A primary whose Name differs from the one the tpm-pin token
+     records, a primary that changed between the seal and the take,
+     ends U4 the same way: its keyslot is killed and its token removed,
+     since "Bus" gives an unanchored object no keyslot, and no lockout
+     token is written. A TPM that becomes unusable after the tpm-pin
+     token's import and before the take, and a take that fails before
+     its token's import, end U4 with that protector but no lockout
+     token. A take that fails after its import
+     keeps its token, as the take's rules do, so the header reads U5 and
+     the next boot's proof decides. Once the TPM is eligible
+     again, the first such boot offers no reseal and takes the lockout,
+     writing the lockout token; the boot after offers the reseal,
+     anchored to it ("Protected release").
    - U5 to protected: remove the `td-upgrade` token.
 
    The selector keeps the mapping it opened, takes the volume key with
    the recovery key and hands off with an admission record of method 0.
    A boot that finds U5, which a crash just before the last step leaves,
-   releases as a protected boot, with the PIN or a primary token, and
-   its plan removes the `td-upgrade` token, so the upgrade's end needs
-   no recovery key.
+   releases as a protected boot, with the PIN or a primary token, its
+   record following that release's method; once the mapping opened
+   and the volume key was taken it first removes the `td-upgrade`
+   token, confirmed against cryptsetup's metadata, and the protected
+   plan then reads the header again, so the upgrade's end needs no
+   recovery key. A removal that fails leaves no protected plan this
+   boot, and the next boot finds U5 again.
 
 | Interrupted | Next boot |
 | --- | --- |
@@ -2117,16 +2163,30 @@ does not reach old ciphertext an SSD keeps in stale flash pages after
 remapping: someone holding the old key and the flash itself may still
 read data as it was before the upgrade. The recovery key opens the new
 key as before. The upgrade inherits whatever the device-bound system's
-root left behind (Scope).
+root left behind (Scope). The FIDO2 shape cannot drop its last new
+key: if every one is lost after the boot that left U0, the upgrade
+cannot complete, each boot asks for them again, and the volume opens
+only with its recovery key outside td. A cancellation at the upgrade
+boot's console needs only what opens a device-bound volume, less than
+`upgrade-cancel`'s consent: it returns the volume to the device-bound
+state that already opens it and loses the owner's pending keys,
+nothing else. A TPM fault at the upgrade boot, an interposer's or a
+dictionary-attack lockout included, completes the volume without the
+TPM PIN: it costs that protector, not confidentiality. After a
+transient fault or a lockout the next two boots' take and reseal
+restore it; a TPM whose lockout authorization another system set
+needs a clear from firmware first; and a protector kept without its
+lockout token still releases with the PIN, the first eligible boot
+taking the lockout.
 
 cryptsetup 2.8.8 ends a reencryption by destroying the old key's
 keyslots, each its own header commit, before the commit that drops its
 requirement. A power cut between them, a window of one keyslot-area
 wipe and two header writes after the last data is rewritten, leaves a
 header no resumption opens, though the rewrapped recovery keyslot holds
-the new key: every upgrade boot then fails at the resumption and writes
-nothing, and the volume needs a repair by hand that td does not
-provide.
+the new key: every upgrade boot then fails at U2's open or resumption
+and writes nothing, and the volume needs a repair by hand that td does
+not provide.
 
 ### Protector management
 
@@ -2570,8 +2630,9 @@ commit.
      `upgrade-cancel`, with td-protector's `upgrade::phase_one_fits`
      and `phase_one` and phase 1's `TPM_PT_PERMANENT` check; their
      td-authd supervision and compositor screens, which production
-     refuses; and the selector's upgrade boot with its power check and
-     U4's exit for a TPM that became unusable.
+     refuses; and the selector's upgrade boot with its power check, a
+     pending key's drop and U4's exit for a TPM that became unusable,
+     and the device-bound flow's removal of pending orphans.
    - **8g, protector management.** `storage-operation`'s FIDO2 token
      addition and removal and recovery-key removal; the PIN-change
      request and its selector half; the TPM-clear request and its
@@ -3011,8 +3072,11 @@ Increment 8's evidence, by sub-increment:
   a device-bound header without pending tokens. U5 completes with a PIN
   and no recovery key. A missing mains supply in U0 upgrades nothing.
   Phase 1 refuses the TPM shape on a TPM whose `lockoutAuthSet` is set;
-  a TPM that becomes unusable before U4 ends the upgrade without a
-  tpm-pin protector.
+  a TPM that becomes unusable before U4, or whose seal fails, ends the
+  upgrade without a tpm-pin protector. A dropped key's token is removed
+  and the FIDO2 shape's last refused; U0's cancel and no-mains boots
+  open as device-bound without a reseal; U5 admits by its release's
+  method.
 - **8g.** Each operation's authorization (a stale assertion, another
   operation's description, a token not enrolled, a wrong recovery key),
   the minimums, a PIN change, a TPM clear and a TPM re-enrollment each
