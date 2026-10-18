@@ -714,21 +714,38 @@ impl JmapClient {
 
         let response = self.call(request)?;
 
-        if let Some(method_response) = response.method_responses.first() {
-            if method_response.0 == "Mailbox/set" {
-                if let Some(not_destroyed) = method_response.1.get("notDestroyed") {
-                    if not_destroyed.get(id).is_some() {
-                        return Err(JmapError::Api(format!(
-                            "Failed to delete mailbox: {:?}",
-                            not_destroyed
-                        )));
-                    }
-                }
-                return Ok(());
+        self.confirm_mailbox_deletion(&response, id)
+    }
+
+    fn confirm_mailbox_deletion(&self, response: &JmapResponse, id: &str) -> Result<(), JmapError> {
+        let reply = response
+            .method_responses
+            .first()
+            .filter(|reply| reply.2 == "0" && reply.0 == "Mailbox/set")
+            .ok_or_else(|| JmapError::Api("Unexpected response for Mailbox/set destroy".into()))?;
+        if reply.1.get("accountId").and_then(Json::as_str) != Some(self.account_id.as_str()) {
+            return Err(JmapError::Api(
+                "Mailbox/set destroy returned a missing, invalid, or different account".into(),
+            ));
+        }
+        if let Some(errors) = reply.1.get("notDestroyed") {
+            if !errors.is_null() && errors.as_object().is_none() {
+                return Err(JmapError::Api("Invalid Mailbox/set notDestroyed".into()));
+            }
+            if let Some(error) = errors.get(id) {
+                return Err(JmapError::Api(format!("Mailbox deletion refused: {error}")));
             }
         }
-
-        Err(JmapError::Api("Unexpected response".to_string()))
+        let destroyed = reply.1.get("destroyed").and_then(Json::as_array);
+        if !valid_id(id)
+            || !destroyed
+                .is_some_and(|ids| ids.len() == 1 && ids.first().and_then(Json::as_str) == Some(id))
+        {
+            return Err(JmapError::Api(
+                "Mailbox deletion did not confirm the requested ID".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub fn query_emails(
@@ -2187,6 +2204,63 @@ mod tests {
                 "{body}"
             );
         }
+    }
+
+    #[test]
+    fn mailbox_deletion_requires_explicit_matching_confirmation() {
+        let client = JmapClient::unreachable_for_tests();
+        let response = |method: &str, call: &str, body| JmapResponse {
+            method_responses: vec![MethodResponse(method.into(), body, call.into())],
+            session_state: "state".into(),
+        };
+        for errors in [Json::Null, json!({})] {
+            assert!(client
+                .confirm_mailbox_deletion(
+                    &response(
+                        "Mailbox/set",
+                        "0",
+                        json!({"accountId":"account", "destroyed":["box"], "notDestroyed":errors})
+                    ),
+                    "box"
+                )
+                .is_ok());
+        }
+        let success = json!({"accountId":"account", "destroyed":["box"]});
+        for (method, call) in [("Mailbox/set", "other"), ("Email/set", "0"), ("error", "0")] {
+            assert!(client
+                .confirm_mailbox_deletion(&response(method, call, success.clone()), "box")
+                .is_err());
+        }
+        for body in [
+            json!({"accountId":"account"}),
+            json!({"destroyed":["box"]}),
+            json!({"accountId":"other", "destroyed":["box"]}),
+            json!({"accountId":"account", "destroyed":null}),
+            json!({"accountId":"account", "destroyed":[]}),
+            json!({"accountId":"account", "destroyed":{}}),
+            json!({"accountId":"account", "destroyed":[true]}),
+            json!({"accountId":"account", "destroyed":["other"]}),
+            json!({"accountId":"account", "destroyed":["box", "box"]}),
+            json!({"accountId":"account", "destroyed":["box"], "notDestroyed":[]}),
+            json!({"accountId":"account", "destroyed":["box"], "notDestroyed":{"box":{"type":"notFound"}}}),
+            json!({"accountId":"account", "notDestroyed":{"box":{"type":"mailboxHasEmail"}}}),
+        ] {
+            assert!(
+                client
+                    .confirm_mailbox_deletion(&response("Mailbox/set", "0", body.clone()), "box")
+                    .is_err(),
+                "{body}"
+            );
+        }
+        assert!(client
+            .confirm_mailbox_deletion(
+                &JmapResponse {
+                    method_responses: Vec::new(),
+                    session_state: "state".into(),
+                },
+                "box"
+            )
+            .is_err());
     }
 
     #[test]
