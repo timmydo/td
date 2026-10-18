@@ -7589,13 +7589,41 @@ fn exercise_folders(
     binding: &td_mta::postgres_runtime_profile::Binding,
 ) {
     use folders::{Error, ResultEntry};
-    use td_mta::{postgres_devices as devices, postgres_mailbox_create as folders};
+    use td_mta::{postgres_devices as devices, postgres_mailbox_set as folders};
     let account = binding.account();
     let device = devices::prepare_creation(binding.epoch(), account, "folder fixture", 1).unwrap();
     devices::publish_creation(request, trust, deadline(), &device).unwrap();
     let password = device.password();
     let prepare = |names: &[&str], expected| {
         folders::prepare(binding, device.device_id(), expected, names, deadline()).unwrap()
+    };
+    let prepare_delete = |mailbox, expected| {
+        use td_mta::{
+            admission::work::{Charge, Meter},
+            clock::RuntimeClock,
+            ports::{Clock, Deadline},
+        };
+        let clock = RuntimeClock::new();
+        let until = Deadline::after(clock.sample().unwrap().monotonic, 10_000).unwrap();
+        let mut meter = Meter::new(
+            until,
+            Charge {
+                records: 10000,
+                io_bytes: 65536,
+                output_bytes: 65536,
+                ..Default::default()
+            },
+        );
+        folders::prepare_delete_with_meter(
+            binding,
+            device.device_id(),
+            expected,
+            mailbox,
+            deadline(),
+            &mut meter,
+            &clock,
+        )
+        .unwrap()
     };
     let mixed = prepare(
         &[
@@ -7738,6 +7766,68 @@ fn exercise_folders(
         ),
         "1"
     );
+    let target = td_mta::ids::MailboxId::parse(&sql(
+        fixture,
+        "SELECT encode(id,'hex') FROM td_mta.mailboxes WHERE name='uncertain'",
+    ))
+    .unwrap();
+    let deletion = prepare_delete(Some(target), None);
+    assert_eq!(
+        folders::publish(request, trust, deadline(), &deletion, b"bad"),
+        Err(Error::Unauthenticated)
+    );
+    assert_eq!(
+        folders::publish(
+            request,
+            trust,
+            deadline(),
+            &prepare_delete(Some(target), Some(1)),
+            password
+        ),
+        Err(Error::State)
+    );
+    sql(fixture, "CREATE TRIGGER reject_folder_delete BEFORE INSERT ON td_mta.mailbox_create_receipts FOR EACH ROW EXECUTE FUNCTION public.reject_folder()");
+    assert_eq!(
+        folders::publish(request, trust, deadline(), &deletion, password),
+        Err(Error::Database)
+    );
+    assert_eq!(
+        folders::inspect(request, trust, deadline(), &deletion).unwrap(),
+        None
+    );
+    assert_eq!(
+        sql(
+            fixture,
+            "SELECT count(*) FROM td_mta.mailboxes WHERE name='uncertain'"
+        ),
+        "1"
+    );
+    sql(
+        fixture,
+        "DROP TRIGGER reject_folder_delete ON td_mta.mailbox_create_receipts",
+    );
+    let deleted = folders::publish(request, trust, deadline(), &deletion, password).unwrap();
+    assert_eq!(deleted.results, [ResultEntry::Destroyed(target)]);
+    assert_eq!(deleted.new_sequence, deleted.old_sequence + 1);
+    assert_eq!(
+        folders::publish(request, trust, deadline(), &deletion, b"bad").unwrap(),
+        deleted
+    );
+    assert_eq!(
+        folders::inspect(request, trust, deadline(), &deletion).unwrap(),
+        Some(deleted.clone())
+    );
+    let absent = folders::publish(
+        request,
+        trust,
+        deadline(),
+        &prepare_delete(Some(target), None),
+        password,
+    )
+    .unwrap();
+    assert_eq!(absent.results, [ResultEntry::NotFound]);
+    assert_eq!(absent.old_sequence, absent.new_sequence);
+    assert_eq!(sql(fixture, &format!("SELECT count(*) FROM td_mta.changes WHERE kind=1 AND action=3 AND object=decode('{target}','hex')")), "1");
     let count: usize = sql(fixture, "SELECT count(*) FROM td_mta.mailboxes")
         .parse()
         .unwrap();
@@ -7814,6 +7904,20 @@ fn exercise_folders(
     assert_eq!(
         folders::publish(request, trust, deadline(), &prepare(&[], None), password),
         Err(Error::Unauthenticated)
+    );
+    assert_eq!(
+        folders::publish(
+            request,
+            trust,
+            deadline(),
+            &prepare_delete(None, None),
+            password
+        ),
+        Err(Error::Unauthenticated)
+    );
+    assert_eq!(
+        folders::publish(request, trust, deadline(), &deletion, password).unwrap(),
+        deleted
     );
     assert_eq!(
         folders::publish(request, trust, deadline(), &mixed, password).unwrap(),
@@ -10221,7 +10325,7 @@ fn exercise_success_filing(
     use td_mta::{
         ids::{EmailId, MailboxId},
         postgres_email_set::{filing, Error, UpdateResult},
-        postgres_mailbox_create as folders,
+        postgres_mailbox_set as folders,
     };
     let creation = folders::prepare(
         binding,

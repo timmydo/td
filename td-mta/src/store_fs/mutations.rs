@@ -140,3 +140,29 @@ pub struct DraftCompletion {
     pub admission_stopped: bool,
     pub cleanup_error: Option<ports::Error>,
 }
+
+#[derive(Clone, Copy)]
+pub struct MailboxDeleteRequest {
+    pub account: AccountId,
+    pub device: DeviceId,
+    pub expected: Option<(StoreEpoch, Sequence)>,
+    pub mailbox: Option<MailboxId>,
+    pub deadline: Deadline,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MailboxDeleteResult {
+    Destroyed,
+    NotFound,
+    Forbidden,
+    HasChild,
+    HasEmail,
+}
+#[derive(Debug)]
+#[must_use = "preserve the durable result even when admission has stopped"]
+pub struct MailboxDeleteCompletion {
+    pub before_epoch: StoreEpoch,
+    pub before_sequence: Sequence,
+    pub outcome: Result<Sequence, CommitError>,
+    pub result: Option<MailboxDeleteResult>,
+    pub admission_stopped: bool,
+}

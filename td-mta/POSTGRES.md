@@ -1666,7 +1666,7 @@ Thread/get without activating PostgreSQL production dispatch.
 ## 42. Retained root-folder creation
 
 Schema version 12 adds `mailbox_create_receipts`. The
-`postgres_mailbox_create` adapter prepares at most 256 root-folder names,
+`postgres_mailbox_set` adapter prepares at most 256 root-folder names,
 using the shared bounded NFC/control/noncharacter validator. Invalid names become the existing empty-name marker before
 retaining and hashing the canonical request. Preparation retains random
 operation/object IDs and no device password. It runs outside the transaction
@@ -2543,7 +2543,7 @@ remain atomic. Unknown destinations are per-object invalidProperties, and
 membership changes retain the original Email, Thread and body identities.
 
 Prepared HTTP mailbox rights advertise add/remove alongside seen/keyword
-updates. Section 82 connects root-folder creation. Rename, folder deletion and
+updates. Section 82 connects root-folder creation. Rename and
 submission remain unsupported.
 The same uncertainty owner and settlement mechanism cover combined flag/move
 requests without new retry identities. The real-client fixture prepares an
@@ -2585,8 +2585,8 @@ reserves result capacity and a database slot before DNS, and rechecks runtime
 role, profile, account, device and expected state under the original deadline.
 Mixed method batches never enter this mutation path or native storage.
 
-A dedicated bounded owner retains one exact Creation through uncertain COMMIT.
-It blocks further folder creation without stopping reads or independent Email
+A dedicated bounded owner retains one exact Change through uncertain COMMIT.
+It blocks further folder creation or deletion without stopping reads or independent Email
 writes. Receipt settlement uses separately admitted capacity and never retries
 creation with a new identity. Absence and errors preserve the owner; confirmed
 outcomes survive local expiry. The encompassing prepared mutation owner keeps
@@ -2596,8 +2596,8 @@ scheduling and receipt reclamation remain required before runtime integration.
 Mailbox completion exposes only the original epoch and sequence, without a
 fabricated snapshot identity. The real td-mail fixture creates Archive, rejects
 its duplicate, lists it and moves mail through it. A delayed creation COMMIT
-proves exact receipt settlement and one durable folder. Hierarchy, renaming
-and folder deletion remain outside this td-mail milestone.
+proves exact receipt settlement and one durable folder. Hierarchy creation and renaming remain outside this td-mail milestone.
+Singleton deletion uses the same owner as described below.
 
 
 ## 83. Caller-funded draft preparation
@@ -6285,3 +6285,32 @@ device's upload and a lease expired after preparation without publishing an
 Email. The foreground-service fixture uploads through HTTPS and verifies
 binary attachment DATA at its local TLS smart host. Unit cases cover empty
 parts, invalid metadata, source-line/boundary refusals and exact output caps.
+
+
+## Empty folder deletion
+
+The `postgres_mailbox_set` transaction also accepts one prepared deletion.
+A distinct request-digest domain binds the target (or a valid foreign ID's
+absent local target), device, selected binding and optional expected state.
+It shares creation's account lock, current-device authorization, sequence
+checks, bounded receipt allowance and uncertain-COMMIT owner. The existing
+`mailbox_create_receipts` table stores both operations without a schema change:
+17-byte result tags 4 through 8 represent destroyed, notFound, forbidden,
+mailboxHasChild and mailboxHasEmail. Created results retain tags 1 through 3.
+
+Only an empty, roleless leaf may be removed. Any role is protected; children
+and message memberships refuse deletion. A successful deletion removes the
+folder, adds one Mailbox destroyed history row and advances the account
+sequence once in the same transaction as its receipt. Refusals retain the
+old state. Replay and inspection return the exact historical result, without
+performing a second deletion or granting fresh authorization.
+
+The HTTP profile accepts a pure singleton destroy with optional ifInState.
+Mixed create/destroy, nonempty update, multiple destroy IDs and
+onDestroyRemoveEmails=true refuse before publication. Response capacity is
+reserved before mutation. Only a confirmed commit emits destroyed; uncertainty
+retains the prepared operation and fences subsequent folder writes until
+receipt settlement. The real-client fixture covers deletion, missing and
+foreign IDs, protected Inbox, nonempty folders and parents. Native transaction
+checks cover stale state, revoked authorization and exact receipt replay; a
+delayed deletion COMMIT exercises owner settlement and one history row.

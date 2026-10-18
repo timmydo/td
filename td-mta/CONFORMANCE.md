@@ -27,7 +27,8 @@ then archives, trashes and restores messages using those returned folders,
 and checks native membership after each operation. Revoked credentials
 leave queued moves unapplied; restarting td-mail with replacement credentials
 replays its durable flag and archive intentions. The creation profile is
-name-only root folders; hierarchy, rename and deletion remain absent.
+name-only root folders. Singleton deletion removes empty roleless leaves;
+hierarchy creation and rename remain absent.
 EventSource emits pings only; Mail StateChange integration remains absent and
 is not used by td-mail. Activation follows
 the supported td-mail workflow tests, not every reference-table row.
@@ -348,13 +349,14 @@ and TLS materials, delivers a multipart message under the cloud profile and
 serves the same account through the desktop profile's prepared HTTPS backend.
 The fixture drives discovery, mailbox listing, Email/query and Email/get,
 body display, explicit Thread/get, read/unread and star/unstar updates,
-root-folder creation and duplicate refusal, moves between folders,
+root-folder creation and duplicate refusal, empty-folder deletion and
+protected/nonempty/parent/missing-folder refusals, moves between folders,
 permanent Email deletion,
 decoded attachment download and raw-message download with the real client. Authentication and API/download work run on the fixed HTTPS
 workers. Its private CA enters only the existing test-only fetch process.
 
 This PostgreSQL fixture is part of the native gate. It does not qualify
-folder deletion, cloud-provider failover or managed-database deployment.
+cloud-provider failover or managed-database deployment.
 The separate send and executable-service cases cover their named flows. Process and file cleanup belong to
 the fixture; no public endpoint is contacted.
 

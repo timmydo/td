@@ -268,7 +268,7 @@ pub mod postgres_uploads;
 pub mod postgres_usage_audit;
 
 mod mailbox_name;
-pub mod postgres_mailbox_create;
+pub mod postgres_mailbox_set;
 mod receiving_headers;
 
 pub mod smtp_data_encode;

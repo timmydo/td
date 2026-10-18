@@ -2301,7 +2301,7 @@ ADMISSION.md owns its request/response lifetime and quota contract; STORAGE.md
 owns the separate data/tmp/requests lock and cold cleanup. Core Session metadata
 is exposed by authenticated discovery now that its required endpoints are
 active. Mail reads, read/star assignments, mailbox moves and root-folder
-creation are exposed for td-mail. The account permits those writes; POLICY.md
+creation and empty-folder deletion are exposed for td-mail. The account permits those writes; POLICY.md
 specifies its Mailbox rights.
 CONFORMANCE.md records the actual client/TLS evidence. EventSource
 still emits only pings: td-mail does not consume it. Future Mail state delivery
@@ -2325,8 +2325,12 @@ Authenticated Mailbox/set accepts the root-folder name-only create objects
 td-mail emits. The bounded native creation coordinator owns validation,
 uniqueness, IDs, authorization and commit outcomes. The adapter prepays the
 entire response before calling it, preserves per-object refusals and exposes
-mayCreateTopLevelMailbox only with this active endpoint. No hierarchy, rename,
-role mutation or folder deletion is activated.
+mayCreateTopLevelMailbox only with this active endpoint. Singleton deletion
+uses the same coordinator and deletes only empty roleless leaves, with one
+Mailbox tombstone and sequence increment. Role, child and membership refusals
+leave state unchanged. The endpoint advertises mayDelete for roleless folders
+and confirms only known commits. Hierarchy creation, rename and role mutation
+remain absent; POLICY.md owns the request restrictions.
 
 ## Prepared sending identities
 

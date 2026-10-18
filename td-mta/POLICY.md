@@ -854,7 +854,7 @@ mutations requires implementing their methods and updating these rights with
 matching tests; account ownership alone does not advertise unimplemented
 operations. Mailbox/get reports rights from the same snapshot as its object.
 
-## 9. td-mail root-folder creation
+## 9. td-mail folder creation and deletion
 
 Mailbox/set accepts create objects containing only name. Names must be
 nonempty NFC UTF-8 of at most 1024 bytes, without control characters or
@@ -862,12 +862,19 @@ Unicode noncharacters. Exact root-name duplicates return invalidProperties
 for name; comparisons are case-sensitive. Invalid objects have no effects on
 other accepted creations. Created folders are subscribed, have no parent or
 role, and sortOrder zero. Root creation is advertised by the Session's
-mayCreateTopLevelMailbox; mayCreateChild, mayRename and mayDelete remain false.
+mayCreateTopLevelMailbox; mayCreateChild and mayRename remain false.
+mayDelete is true for roleless folders when the folder mutation endpoint is
+active; current contents and children may still prevent deletion.
 The client's configured archive/trash names select these ordinary folders.
 
 The active profile supports optional Mailbox ifInState and bounded create
-batches. Empty/null update and destroy are harmless; nonempty update/destroy,
-parent/role editing and onDestroyRemoveEmails remain unsupported. Creation
+batches. Empty/null update and destroy are harmless. A pure singleton destroy
+may delete an empty roleless leaf. A protected role returns forbidden,
+children return mailboxHasChild, and memberships return mailboxHasEmail;
+absent local IDs and valid foreign-format IDs return notFound. Invalid ID
+syntax refuses before effects. Mixed create/destroy, multiple destroy IDs,
+nonempty update, parent/role editing and onDestroyRemoveEmails=true remain
+unsupported. Explicit onDestroyRemoveEmails=false is accepted. Creation
 references across calls are not part of td-mail's create flow; clients read
 returned IDs or list mailboxes. A duplicate name is a refusal, not a second
 folder and not a claim that a lost earlier response failed to commit.
@@ -882,5 +889,5 @@ a foreign format and absent local IDs produce per-object notFound. Invalid ID
 syntax refuses the method before effects. Output uses the original IDs and Email states;
 only a known commit returns destroyed IDs. No role or Trash membership is
 required: td-mail's explicit permanent-delete command chooses the target.
-Mailbox removal rights already cover this operation; folder deletion remains
-unavailable. STORAGE.md owns relationship, last-body-owner and quota handling.
+Mailbox removal rights already cover this operation. STORAGE.md owns
+relationship, last-body-owner and quota handling.

@@ -354,7 +354,38 @@ pub(super) fn exercise(
                 assert_eq!(listing["emails"].as_array().unwrap().len(), 1, "{listing}");
                 assert_eq!(listing["emails"][0]["id"], email["id"]);
                 assert_eq!(listing["emails"][0]["blob_id"], email["blob_id"]);
+                if destination == archive_wire {
+                    let refused = client.ask(json!({"command":"delete_mailbox", "mailbox_id":archive_wire}));
+                    assert!(!refused["ok"].is_true(), "nonempty folder: {refused}");
+                    assert_eq!(sql(fixture, "SELECT encode(mailbox_id,'hex') FROM td_mta.memberships"), expected);
+                }
             }
+            let before = sql(fixture, "SELECT encode(sequence,'hex') FROM td_mta.accounts");
+            let refused = client.ask(json!({"command":"delete_mailbox", "mailbox_id":inbox_wire}));
+            assert!(!refused["ok"].is_true(), "protected Inbox: {refused}");
+            assert_eq!(sql(fixture, "SELECT encode(sequence,'hex') FROM td_mta.accounts"), before);
+            let created = client.ask(json!({"command":"create_mailbox", "name":"Child"}));
+            assert!(created["ok"].is_true(), "{created}");
+            sql(fixture, "UPDATE td_mta.mailboxes SET parent_id=(SELECT id FROM td_mta.mailboxes WHERE name='Archive') WHERE name='Child'");
+            let before = sql(fixture, "SELECT encode(sequence,'hex') FROM td_mta.accounts");
+            let refused = client.ask(json!({"command":"delete_mailbox", "mailbox_id":archive_wire}));
+            assert!(!refused["ok"].is_true(), "parent folder: {refused}");
+            assert_eq!(sql(fixture, "SELECT encode(sequence,'hex') FROM td_mta.accounts"), before);
+            sql(fixture, "UPDATE td_mta.mailboxes SET parent_id=NULL WHERE name='Child'");
+            let deleted = client.ask(json!({"command":"delete_mailbox", "mailbox_id":archive_wire}));
+            assert!(deleted["ok"].is_true(), "{deleted}");
+            let after = sql(fixture, "SELECT encode(sequence,'hex') FROM td_mta.accounts");
+            assert_eq!(u64::from_str_radix(&after,16).unwrap(), u64::from_str_radix(&before,16).unwrap()+1);
+            assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.mailboxes WHERE name='Archive'"), "0");
+            assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.changes WHERE kind=1 AND action=3"), "1");
+            let again = client.ask(json!({"command":"delete_mailbox", "mailbox_id":archive_wire}));
+            assert!(!again["ok"].is_true(), "missing folder: {again}");
+            assert_eq!(sql(fixture, "SELECT encode(sequence,'hex') FROM td_mta.accounts"), after);
+            let missing = client.ask(json!({"command":"delete_mailbox", "mailbox_id":"foreign-folder"}));
+            assert!(!missing["ok"].is_true(), "foreign ID: {missing}");
+            let listing = client.ask(json!({"command":"list_mailboxes"}));
+            assert!(listing["ok"].is_true(), "{listing}");
+            assert!(!listing["mailboxes"].as_array().unwrap().iter().any(|folder| folder["id"].as_str()==Some(archive_wire)));
             let usage_before = sql(fixture, "SELECT body_bytes||':'||blob_count FROM td_mta.account_usage");
             let extra = postgres_receiving::prepare(&cloud_binding, &postgres_receiving::Message {
                 bytes: message.as_bytes(), hostname: "localhost", extended: true, header_bytes: 65536,
@@ -608,7 +639,7 @@ pub(super) fn exercise(
     assert_eq!(settled.operation, operation);
     assert!(matches!(
         settled.outcome.results.as_slice(),
-        [td_mta::postgres_mailbox_create::ResultEntry::Created(_)]
+        [td_mta::postgres_mailbox_set::ResultEntry::Created(_)]
     ));
     assert_eq!(confirmed.mailboxes.operation().unwrap(), None);
     assert_eq!(
@@ -618,6 +649,70 @@ pub(super) fn exercise(
         ),
         "1"
     );
+    let [td_mta::postgres_mailbox_set::ResultEntry::Created(recovered)] =
+        settled.outcome.results.as_slice()
+    else {
+        panic!("created folder receipt")
+    };
+    let recovered = *recovered;
+    sql(fixture, "CREATE FUNCTION public.delay_folder_delete() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(4); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_folder_delete AFTER INSERT ON td_mta.mailbox_create_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_folder_delete()");
+    let until = Deadline::after(clock.sample().unwrap().monotonic, 2_000).unwrap();
+    let mut meter = td_mta::admission::work::Meter::new(
+        until,
+        td_mta::admission::work::Charge {
+            records: 10000,
+            io_bytes: 65536,
+            output_bytes: 65536,
+            ..Default::default()
+        },
+    );
+    let completion = td_mta::jmap_request::dispatch::MailboxMutator::delete_mailbox(
+        &folders,
+        td_mta::store_fs::MailboxDeleteRequest {
+            account: binding.account(),
+            device: device.device_id(),
+            expected: None,
+            mailbox: Some(recovered),
+            deadline: until,
+        },
+        &mut meter,
+    )
+    .unwrap();
+    assert!(matches!(
+        completion.outcome,
+        Err(td_mta::ports::CommitFailure::Indeterminate(_))
+    ));
+    assert_eq!(completion.result, None);
+    let operation = confirmed.mailboxes.operation().unwrap().unwrap();
+    thread::sleep(Duration::from_secs(5));
+    sql(fixture, "DROP TRIGGER delay_folder_delete ON td_mta.mailbox_create_receipts; DROP FUNCTION public.delay_folder_delete()");
+    let settled = confirmed
+        .mailboxes
+        .settle(
+            &loaded,
+            executable,
+            &settlement_slots,
+            &clock,
+            Deadline::after(clock.sample().unwrap().monotonic, 10_000).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(settled.operation, operation);
+    assert_eq!(
+        settled.outcome.results,
+        [td_mta::postgres_mailbox_set::ResultEntry::Destroyed(
+            recovered
+        )]
+    );
+    assert_eq!(confirmed.mailboxes.operation().unwrap(), None);
+    assert_eq!(
+        sql(
+            fixture,
+            "SELECT count(*) FROM td_mta.mailboxes WHERE name='Recovered'"
+        ),
+        "0"
+    );
+    assert_eq!(sql(fixture, &format!("SELECT count(*) FROM td_mta.changes WHERE kind=1 AND action=3 AND object=decode('{recovered}','hex')")), "1");
 }
 
 fn exercise_send(

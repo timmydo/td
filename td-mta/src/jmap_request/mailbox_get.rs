@@ -143,7 +143,7 @@ impl Worker<'_, '_, '_, '_, '_> {
                     may_set_keywords: self.email_updates,
                     may_create_child: false,
                     may_rename: false,
-                    may_delete: false,
+                    may_delete: self.email_updates && row.role.is_none(),
                     may_submit: false,
                 },
                 &mut output,
