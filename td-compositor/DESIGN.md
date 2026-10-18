@@ -6431,7 +6431,8 @@ selector update (`LoginSelection::SelectorUpdate`, polled as a login
 operation is, with its own end table), the disk proofs
 (`LoginSelection::Proven`) and the recovery-key profile. The upgrade
 and its cancellation are fixed by increment 8f's documentation commit
-before their code, and not yet implemented.
+before their code, and implemented (`LoginSelection::Upgrade` and
+`UpgradeCancel`, each with its own end table).
 td-authd/DESIGN.md amendment 10 gives the wire, and ENCRYPTION.md the
 operations. Until that document's item 9, root refuses every storage
 operation in a production build and decodes no disk proof there, so
@@ -6522,19 +6523,20 @@ then. At double scale an output holds 18 rows at 768 lines, 19 at 800
 and 14 at 600, and the deployment ID's row is one row from 1280 pixels
 wide and two at 1024: the TPM review, 16 or 17 rows, stays doubled at
 1366x768, 1280x800 and 1024x768 and falls back at 800x600; the FIDO2
-review, four rows taller, falls back at all four; a key step's prompt, a
-first enrollment's with one more operation row and no ID, is measured by
-the same rule with its field. Each later description is admitted through
-consent's successor rule for tag 17 and presented as a first
-enrollment's key step is ("Login-key operations"): the PIN field opens
-on root's `0c` for a create, prove or repeat step, and a successor or
-the commit follows only that step's `1c`. Root's `05` after the last
-step's receipt asks for the commit, which the client sends at once.
-Success shows `THE NEXT BOOT PROTECTS THE DISK` and `HAVE THE RECOVERY
-KEY READY`. Its ends add to the table above:
+review, four rows taller, falls back at all four; a key step's prompt,
+as tall as a first enrollment's, the count's row in place of its
+account's, is measured by the same rule with its field. Each later
+description is admitted through consent's successor rule for tag 17 and
+presented as a first enrollment's key step is ("Login-key operations"):
+the PIN field opens on root's `0c` for a create, prove or repeat step,
+and a successor or the commit follows only that step's `1c`. Root's `05`
+after the last step's receipt asks for the commit, which the client
+sends at once. Success shows `THE NEXT BOOT PROTECTS THE DISK` and `HAVE
+THE RECOVERY KEY READY`. Its ends add to the table above:
 
 | Kind | Shows |
 | --- | --- |
+| `22` NOT CURRENT | `RESTART INTO THE CURRENT SYSTEM` / `BEFORE PROTECTING THE DISK` |
 | `27` TPM | `NO USABLE TPM:` then `NONE FOUND` (`01`), `NO SHA-256 PCR BANK` (`02`) or `ITS LOCKOUT IS ALREADY SET` (`03`), then `CHOOSE SECURITY KEYS ONLY` |
 | `87` | `NEEDS AN ENROLLED LOGIN KEY` |
 | `01` to `03`, `05` to `07`, `11` | a new key's, as TOKEN-LOGIN.md's "Failure texts" show a first enrollment's |
@@ -6544,21 +6546,22 @@ The TPM shape's refusal is how the screen says why the shape is not
 offered: the storage worker alone reads the TPM, so the person, told
 why, chooses the FIDO2 shape in a new attention. An upgrade's ends are
 `87`, `22`, and `20` and `21` from the baseline, only before any
-description; `20`, `21`, `23`, `24` and, for the TPM shape alone, `27`
-only after the review's description and before its receipt; a new
-key's `01` to `03`, `05` to `07` and `11` only after its connect step;
-`0e` and `28` only after the acknowledged commit; and the selector
-update's `08`, `0f`, `10` and `80` where they can stand; any other is a
-violation. The attempt's lifetime is
-the ceiling the count gives, 240, 360 or 480 seconds.
+description; `20`, `21`, `23`, `24`, a definite `28` and, for the TPM
+shape alone, `27` only after the review's description and before its
+receipt; a new key's `01` to `03`, `05` to `07` and `11` only after its
+connect step; `0e` and `28` after the acknowledged commit; and the
+selector update's `08`, `0f`, `10` and `80` where they can stand; any
+other is a violation. The attempt's lifetime is the ceiling the count
+gives, 240, 360 or 480 seconds.
 
 **The cancellation.** `C` sends `20 03`, the lifetime's one operation,
 whose tag 18 description is presented, keyed and committed as tag 16's
-is. Success shows `DISK PROTECTION CANCELLED` and `THE NEXT BOOT MAY
-NEED THE RECOVERY KEY`. Its ends are `20` at any point before the
-commit, `21` before its receipt, `08`, `0f`, `10`, `80`, and `0e` and
-`28` only after the acknowledged commit, with the selector update's
-texts; its lifetime is 240 seconds.
+is. Success shows `DISK PROTECTION CANCELLED`, `THE NEXT BOOT MAY
+NEED` and `THE RECOVERY KEY`. Its ends are `20` at any point before the
+commit, `21` before its receipt, a definite `28` after its description
+and before its receipt, `08`, `0f`, `10`, `80`, and `0e` and `28` after
+the acknowledged commit, with the selector update's texts; its lifetime
+is 240 seconds.
 
 **Disk proofs.** On the key-management screen, while the last `1a`
 answer's protected byte reads `01`, a choice of `1`, `2` or `A`, or a
@@ -7110,8 +7113,9 @@ active paired attention outside cancellation drain and no compound commit.
 The first request consumes the presentation slot. Only its exact next
 enrollment step may replace it, owner, nonce, platform and recovery
 fixed, or a login step's one legal successor under consent's
-`login_successor`, which fixes nonce, owner and operation; the device
-data in it is root's to admit. An application-store unlock has no
+`login_successor`, or an upgrade step's under `upgrade_successor`, each
+of which fixes nonce, owner and operation; the device data in it is
+root's to admit. An application-store unlock has no
 successor. It installs the prepared frame,
 owes the entire output and repaints, naming the paint epoch that shows it.
 A `PresentedRequest` containing the exact description is returned only once

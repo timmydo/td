@@ -345,6 +345,10 @@ enum LoginScreen {
     Removing(crate::secret_client::Removal),
     /// The storage screen (DESIGN.md, "Storage operations").
     Storage,
+    /// `P`'s shape screen, then the chosen shape's count screen: the
+    /// upgrade is not yet the lifetime's selection.
+    Protect,
+    NewKeys(crate::authority::consent::UpgradeShape),
     /// A protected machine's authorization choice for the login-key
     /// operation chosen (DESIGN.md, "Storage operations"), which is not
     /// yet the lifetime's selection.
@@ -747,8 +751,34 @@ impl KeyBindings {
         if self.login_screen == LoginScreen::Storage {
             decision.secret = match code {
                 KEY_U => Some(Selection::Login(LoginSelection::SelectorUpdate)),
+                KEY_P => {
+                    self.login_screen = LoginScreen::Protect;
+                    decision.notice = Some(Notice::Protect);
+                    None
+                }
+                KEY_C => Some(Selection::Login(LoginSelection::UpgradeCancel)),
                 _ => None,
             };
+            return;
+        }
+        if self.login_screen == LoginScreen::Protect {
+            use crate::authority::consent::UpgradeShape;
+            let shape = match code {
+                KEY_T => Some(UpgradeShape::Tpm),
+                KEY_K => Some(UpgradeShape::Fido2),
+                _ => None,
+            };
+            if let Some(shape) = shape {
+                self.login_screen = LoginScreen::NewKeys(shape);
+                decision.notice = Some(Notice::NewKeys(shape));
+            }
+            return;
+        }
+        if let LoginScreen::NewKeys(shape) = self.login_screen {
+            let count = if code == KEY_0 { Some(0) } else { digit(code) };
+            decision.secret = count
+                .filter(|count| shape.takes(*count))
+                .map(|count| Selection::Login(LoginSelection::Upgrade { shape, count }));
             return;
         }
         if self.login_screen == LoginScreen::Menu {
@@ -11264,6 +11294,58 @@ mod tests {
         assert_eq!(target.keys.len(), typed);
     }
 
+    /// The storage screen's `P` opens the shape screen and a shape the
+    /// count screen, neither a selection, whose digit within the shape's
+    /// range is (DESIGN.md, "The upgrade"); `C` is the cancellation. Each
+    /// screen's other letters and digits choose nothing.
+    #[test]
+    fn the_upgrade_takes_its_shape_and_count_before_it_selects() {
+        use crate::attention::Notice;
+        use crate::authority::consent::UpgradeShape;
+        use crate::secret_client::{LoginSelection, Selection};
+        for (keys, notices, selected) in [
+            (
+                &[
+                    KEY_S, KEY_P, KEY_U, KEY_C, KEY_0, KEY_T, KEY_K, KEY_3, KEY_0,
+                ][..],
+                &[
+                    Notice::DiskEncryption,
+                    Notice::Protect,
+                    Notice::NewKeys(UpgradeShape::Tpm),
+                ][..],
+                LoginSelection::Upgrade {
+                    shape: UpgradeShape::Tpm,
+                    count: 0,
+                },
+            ),
+            (
+                &[KEY_S, KEY_P, KEY_K, KEY_T, KEY_0, KEY_3, KEY_2, KEY_1],
+                &[
+                    Notice::DiskEncryption,
+                    Notice::Protect,
+                    Notice::NewKeys(UpgradeShape::Fido2),
+                ],
+                LoginSelection::Upgrade {
+                    shape: UpgradeShape::Fido2,
+                    count: 2,
+                },
+            ),
+            (
+                &[KEY_S, KEY_C, KEY_P],
+                &[Notice::DiskEncryption],
+                LoginSelection::UpgradeCancel,
+            ),
+        ] {
+            let target = Mutex::new(RecordingTarget::default());
+            let bindings = attention_bindings(None);
+            read_reports(&target, &bindings, 0, &chord_reports(10));
+            read_reports(&target, &bindings, 0, &presses(keys, 20));
+            let target = target.lock().unwrap();
+            assert_eq!(target.notices, notices, "{selected:?}");
+            assert_eq!(target.secret_roles, [Selection::Login(selected.clone())]);
+        }
+    }
+
     /// The storage screen chooses nothing until its paint is on glass, nor
     /// at all when that paint fails.
     #[test]
@@ -11295,6 +11377,45 @@ mod tests {
         let target = target.lock().unwrap();
         assert_eq!(target.notices, [Notice::DiskEncryption]);
         assert!(target.secret_roles.is_empty());
+        drop(target);
+        // So with the upgrade's shape and count screens: each chooses
+        // nothing until its own paint is on glass.
+        use crate::authority::consent::UpgradeShape;
+        let target = Mutex::new(RecordingTarget {
+            notices_owed: true,
+            ..RecordingTarget::default()
+        });
+        let bindings = attention_bindings(None);
+        read_reports(&target, &bindings, 0, &chord_reports(10));
+        let clock = Arc::clone(&target.lock().unwrap().clock);
+        read_reports(&target, &bindings, 0, &presses(&[KEY_S], 20));
+        clock.publish_for_test(1);
+        read_reports(&target, &bindings, 0, &presses(&[KEY_P, KEY_T], 30));
+        assert_eq!(
+            target.lock().unwrap().notices,
+            [Notice::DiskEncryption, Notice::Protect]
+        );
+        clock.publish_for_test(2);
+        read_reports(&target, &bindings, 0, &presses(&[KEY_T, KEY_0], 40));
+        assert!(target.lock().unwrap().secret_roles.is_empty());
+        clock.publish_for_test(3);
+        read_reports(&target, &bindings, 0, &presses(&[KEY_0], 50));
+        let target = target.lock().unwrap();
+        assert_eq!(
+            target.notices,
+            [
+                Notice::DiskEncryption,
+                Notice::Protect,
+                Notice::NewKeys(UpgradeShape::Tpm)
+            ]
+        );
+        assert_eq!(
+            target.secret_roles,
+            [Selection::Login(LoginSelection::Upgrade {
+                shape: UpgradeShape::Tpm,
+                count: 0
+            })]
+        );
     }
 
     #[test]

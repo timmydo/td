@@ -469,7 +469,9 @@ impl Session {
                 let queued = match &mut self.operation {
                     Some(Active::Login(operation)) => operation.pin(&description, pin)?,
                     Some(Active::Proof(operation)) => operation.pin(&description, pin)?,
-                    _ => return Err("no login operation takes a PIN".into()),
+                    // An upgrade's new key's PIN steps.
+                    Some(Active::Storage(operation)) => operation.pin(&description, pin)?,
+                    _ => return Err("no operation takes a PIN".into()),
                 };
                 if !queued {
                     return Ok(vec![0x9c, 1]);
@@ -847,7 +849,7 @@ impl Session {
         active: bool,
         start: impl FnOnce(u32, crate::storage::Selection) -> Result<Storage, String>,
     ) -> Result<Vec<u8>, String> {
-        if !active || selection != crate::storage::Selection::SelectorUpdate {
+        if !active || !selection.runs() {
             return Ok(vec![0xa0, 0]);
         }
         if !self.prepared

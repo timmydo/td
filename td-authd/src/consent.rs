@@ -1078,6 +1078,13 @@ impl Request {
         self.operation.login().map(|login| login.step)
     }
 
+    /// The key-ceremony step a description presents: a login step, or an
+    /// upgrade's new key's. Its PIN steps take a `1c`.
+    pub fn ceremony_step(&self) -> Option<LoginStep> {
+        self.login_step()
+            .or(self.upgrade_step().and_then(UpgradeStep::login))
+    }
+
     /// The approval key a login disclosure step carries; none on every
     /// other step and description.
     pub fn login_approval(&self) -> Option<ApprovalKey> {
@@ -3317,6 +3324,13 @@ mod tests {
         // The next key's connect forgets the last key's credential.
         assert_eq!(admit(5, None), Ok(Admitted::Next));
         assert_eq!(admit(9, Some([2; 4])), Ok(Admitted::Last));
+        // Its key steps are ceremony steps, which a PIN step's `1c` reads;
+        // the review is none.
+        assert_eq!(request(steps[0]).ceremony_step(), None);
+        assert_eq!(
+            request(steps[2]).ceremony_step(),
+            Some(LoginStep::Create { retries: 8 })
+        );
     }
 
     /// Tag 16: the key, one form byte of 1 to 3 and the running

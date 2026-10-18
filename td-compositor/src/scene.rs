@@ -3421,10 +3421,14 @@ impl Scene {
         // A new prompt, or none, replaces a PIN field.
         self.attention_field = None;
         if self.attention_request_attempted {
-            // A login step's successor carries device data root admits, so
-            // only its shape is checked here; an enrollment's is derived.
+            // A login step's or an upgrade's successor carries device data
+            // root admits, so only its shape is checked here; an
+            // enrollment's is derived.
             let follows = match self.attention_request() {
                 Some(previous) if previous.is_login() => previous.login_successor(&request).is_ok(),
+                Some(previous) if previous.upgrade_step().is_some() => {
+                    previous.upgrade_successor(&request).is_ok()
+                }
                 Some(previous) => previous.following_enrollment_step()?.as_ref() == Some(&request),
                 None => false,
             };
@@ -10173,5 +10177,69 @@ mod tests {
                 .prepare_attention_request_with_time(unlock.clone(), 800, 600, 3200, Some(118))
                 .is_err());
         }
+    }
+
+    /// An upgrade's review is replaced only by its first key's connect step,
+    /// and each key step by its successor, under tag 17's rule.
+    #[test]
+    fn an_upgrade_prompt_admits_only_its_successor() {
+        use crate::authority::consent::{
+            ApprovalKey, LoginStep, Operation, Request, UpgradeShape, UpgradeStep,
+        };
+        let step = |step| {
+            Request::new(
+                [7; 32],
+                1000,
+                Operation::Upgrade {
+                    account: 1000,
+                    shape: UpgradeShape::Tpm,
+                    count: 1,
+                    current: "ab".repeat(32),
+                    step,
+                    approval: (step == UpgradeStep::Review)
+                        .then(|| ApprovalKey::new(*b"47").unwrap()),
+                },
+            )
+            .unwrap()
+        };
+        let key = |step| UpgradeStep::Key { key: 1, step };
+        let connect = step(key(LoginStep::Connect));
+        for (next, admitted) in [
+            (connect.clone(), true),
+            (step(key(LoginStep::Create { retries: 8 })), false),
+            (step(UpgradeStep::Review), false),
+        ] {
+            let mut scene = Scene::new();
+            scene.set_attention(true);
+            scene
+                .prepare_attention_request_with_time(
+                    step(UpgradeStep::Review),
+                    1280,
+                    800,
+                    5120,
+                    Some(360),
+                )
+                .unwrap();
+            assert_eq!(
+                scene
+                    .prepare_attention_request_with_time(next, 1280, 800, 5120, Some(359))
+                    .is_ok(),
+                admitted
+            );
+        }
+        let mut scene = Scene::new();
+        scene.set_attention(true);
+        scene
+            .prepare_attention_request_with_time(connect, 1280, 800, 5120, Some(300))
+            .unwrap();
+        assert!(scene
+            .prepare_attention_request_with_time(
+                step(key(LoginStep::Create { retries: 8 })),
+                1280,
+                800,
+                5120,
+                Some(299),
+            )
+            .is_ok());
     }
 }

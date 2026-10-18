@@ -2,9 +2,10 @@
 
 use crate::attention::{Field, Notice};
 use crate::authority::consent::{
-    Admitted, ApprovalKey, Enrollment, Fingerprint, LoginStep, Operation, Platform, Proof,
-    Recovery, Request, Role, SelectorForm, Slot, LOGIN_CEREMONY, LOGIN_KEYS, LOGIN_READING,
-    LOGIN_TWO_CEREMONIES, LOGIN_TWO_KEY_ENROLLMENT, SELECTOR_UPDATE_CEILING,
+    upgrade_ceiling, Admitted, ApprovalKey, Enrollment, Fingerprint, LoginStep, Operation,
+    Platform, Proof, Recovery, Request, Role, SelectorForm, Slot, UpgradeShape, UpgradeStep,
+    LOGIN_CEREMONY, LOGIN_KEYS, LOGIN_READING, LOGIN_TWO_CEREMONIES, LOGIN_TWO_KEY_ENROLLMENT,
+    SELECTOR_UPDATE_CEILING, UPGRADE_CANCEL_CEILING,
 };
 use crate::authority::Exchange;
 use crate::input::EvdevOrigin;
@@ -306,8 +307,9 @@ fn memory_state(swaps: io::Result<String>, limits: io::Result<String>) -> Result
     Ok(())
 }
 
+/// A login step's or an upgrade's new key's PIN step.
 fn asks_pin(request: &Request) -> bool {
-    request.login_step().is_some_and(LoginStep::asks_pin)
+    request.ceremony_step().is_some_and(LoginStep::asks_pin)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -403,7 +405,8 @@ fn approval_key(request: &Request) -> Option<ApprovalKey> {
         Operation::LoginEnroll { approval, .. } | Operation::LoginRemove { approval, .. } => {
             *approval
         }
-        Operation::SelectorUpdate { key, .. } => Some(*key),
+        Operation::SelectorUpdate { key, .. } | Operation::UpgradeCancel { key } => Some(*key),
+        Operation::Upgrade { approval, .. } => *approval,
         _ => Elevation::of(request).map(|(_, key)| key),
     }
 }
@@ -435,6 +438,16 @@ pub(crate) enum LoginSelection {
     /// `20 01`, polled as a login operation is: one step, confirmed by its
     /// approval key, then its commit.
     SelectorUpdate,
+    /// Storage operation `02`, root's `20 02 S N`: phase 1 of the
+    /// re-encrypting upgrade to `shape` with `count` new keys, its review
+    /// then each new key's ceremony, and its commit.
+    Upgrade {
+        shape: UpgradeShape,
+        count: u8,
+    },
+    /// Storage operation `03`, root's `20 03`: the upgrade's cancellation,
+    /// one step as the selector update's.
+    UpgradeCancel,
     /// A first enrollment, addition or removal authorized by a disk proof,
     /// root's `1b 0b P` (amendment 10); offered only where `DISK_PROOFS`.
     Proven(Proof, Box<LoginSelection>),
@@ -451,6 +464,11 @@ impl LoginSelection {
                 _ => return Err("a disk proof authorizes no such operation".into()),
             },
             Self::SelectorUpdate => vec![0x20, 1],
+            Self::Upgrade { shape, count } if shape.takes(*count) => {
+                vec![0x20, 2, shape.byte(), *count]
+            }
+            Self::Upgrade { .. } => return Err("an upgrade's shape does not take its count".into()),
+            Self::UpgradeCancel => vec![0x20, 3],
             Self::Unlock => vec![0x1b, 7],
             Self::Enroll(keys @ (1 | 2)) => vec![0x1b, 8, *keys],
             Self::Enroll(_) => return Err("a first enrollment has one or two keys".into()),
@@ -490,6 +508,8 @@ impl LoginSelection {
             Self::Add => LOGIN_TWO_CEREMONIES,
             Self::Enroll(_) => LOGIN_TWO_KEY_ENROLLMENT,
             Self::SelectorUpdate => SELECTOR_UPDATE_CEILING,
+            Self::Upgrade { count, .. } => upgrade_ceiling(*count),
+            Self::UpgradeCancel => UPGRADE_CANCEL_CEILING,
             // The proof replaces an addition's or removal's authorizing
             // key, and adds a ceremony to an enrollment.
             Self::Proven(_, inner) => match inner.as_ref() {
@@ -508,10 +528,19 @@ impl LoginSelection {
         }
     }
 
+    /// A storage operation (amendment 10): root's `20`, whose end changes
+    /// no login key.
+    fn storage(&self) -> bool {
+        matches!(
+            self,
+            Self::SelectorUpdate | Self::Upgrade { .. } | Self::UpgradeCancel
+        )
+    }
+
     /// Root's answer byte to the selection: `9b` for a login operation,
     /// `a0` for a storage operation.
     fn answer(&self) -> u8 {
-        if *self == Self::SelectorUpdate {
+        if self.storage() {
             0xa0
         } else {
             0x9b
@@ -521,7 +550,8 @@ impl LoginSelection {
     /// The rows an end of this operation shows.
     fn failure(&self, kind: u8, detail: u8) -> Option<&'static [&'static str]> {
         match self {
-            Self::SelectorUpdate => storage_failure(kind, detail),
+            Self::SelectorUpdate | Self::UpgradeCancel => storage_failure(kind, detail),
+            Self::Upgrade { .. } => upgrade_failure(kind, detail),
             Self::Proven(..) => proof_failure(kind, detail),
             _ => login_failure(kind, detail),
         }
@@ -536,8 +566,32 @@ impl LoginSelection {
     /// authorized as it was chosen: by the chosen disk proof (consent tags
     /// 13 to 15), or by an enrolled key, whose descriptions carry none.
     fn selects(&self, request: &Request) -> bool {
-        if *self == Self::SelectorUpdate {
-            return request.owner() == 1000 && request.selector_update().is_some();
+        match (self, request.operation()) {
+            (Self::SelectorUpdate, _) => {
+                return request.owner() == 1000 && request.selector_update().is_some()
+            }
+            // Root's review: the chosen shape and count, keyed.
+            (
+                Self::Upgrade { shape, count },
+                Operation::Upgrade {
+                    account,
+                    shape: described,
+                    count: counted,
+                    step: UpgradeStep::Review,
+                    approval: Some(_),
+                    ..
+                },
+            ) => {
+                return request.owner() == 1000
+                    && *account == 1000
+                    && described == shape
+                    && counted == count
+            }
+            (Self::UpgradeCancel, Operation::UpgradeCancel { .. }) => {
+                return request.owner() == 1000
+            }
+            (Self::Upgrade { .. } | Self::UpgradeCancel, _) => return false,
+            _ => {}
         }
         let (selection, proof) = self.authorized();
         request.owner() == 1000
@@ -571,6 +625,15 @@ impl LoginSelection {
             Self::Add => &["LOGIN KEY ADDED"],
             Self::Remove(..) => &["LOGIN KEYS REMOVED"],
             Self::Proven(_, inner) => inner.success(request),
+            Self::Upgrade { .. } => &[
+                "THE NEXT BOOT PROTECTS THE DISK",
+                "HAVE THE RECOVERY KEY READY",
+            ],
+            Self::UpgradeCancel => &[
+                "DISK PROTECTION CANCELLED",
+                "THE NEXT BOOT MAY NEED",
+                "THE RECOVERY KEY",
+            ],
             Self::SelectorUpdate => match request.and_then(Request::selector_update) {
                 Some((_, SelectorForm::Staged, _)) => &[
                     "BOOT SELECTOR UPDATED",
@@ -745,6 +808,38 @@ pub(crate) fn storage_failure(kind: u8, detail: u8) -> Option<&'static [&'static
         (0x28, 0) => &["THE DISK CHANGED; NOTHING WRITTEN"],
         (0x80, 0) => &[],
         _ => return None,
+    })
+}
+
+/// DESIGN.md's "Storage operations" text for an upgrade's end: its own, a
+/// new key's as a first enrollment's, and otherwise a selector update's.
+pub(crate) fn upgrade_failure(kind: u8, detail: u8) -> Option<&'static [&'static str]> {
+    Some(match (kind, detail) {
+        (0x27, 1) => &["NO USABLE TPM:", "NONE FOUND", "CHOOSE SECURITY KEYS ONLY"],
+        (0x27, 2) => &[
+            "NO USABLE TPM:",
+            "NO SHA-256 PCR BANK",
+            "CHOOSE SECURITY KEYS ONLY",
+        ],
+        (0x27, 3) => &[
+            "NO USABLE TPM:",
+            "ITS LOCKOUT IS ALREADY SET",
+            "CHOOSE SECURITY KEYS ONLY",
+        ],
+        (0x87, 0) => &["NEEDS AN ENROLLED LOGIN KEY"],
+        (0x22, 0) => &[
+            "RESTART INTO THE CURRENT SYSTEM",
+            "BEFORE PROTECTING THE DISK",
+        ],
+        (0x0e, 0) => &[
+            "RESULT UNCERTAIN",
+            "THE NEXT BOOT MAY NEED",
+            "THE RECOVERY KEY",
+        ],
+        (0x01, _) | (0x06, 1..=6) | (0x02 | 0x03 | 0x05 | 0x07 | 0x11, 0) => {
+            return login_failure(kind, detail)
+        }
+        _ => return storage_failure(kind, detail),
     })
 }
 
@@ -1430,10 +1525,10 @@ impl Client {
                 }
                 // Only an acknowledged write's commit can leave its outcome
                 // uncertain, and from then on nothing else can be reported
-                // but a selector update's `28`, which its worker sends only
-                // before any write.
+                // but a storage operation's `28`, which its worker sends
+                // only before any write.
                 let uncertain = *status == 0x0e;
-                let definite = login.selection == LoginSelection::SelectorUpdate && *kind == 0x28;
+                let definite = login.selection.storage() && *kind == 0x28;
                 if uncertain != (login.committed && login.selection.writes() && !definite) {
                     return Err("login operation reported the wrong kind of end".into());
                 }
@@ -1445,11 +1540,16 @@ impl Client {
                     .failure(*kind, *detail)
                     .ok_or("invalid login failure kind")?;
                 let attempt = Arc::clone(&login.attempt);
-                let login_operation = login.selection != LoginSelection::SelectorUpdate;
+                let login_operation = !login.selection.storage();
                 self.login = None;
                 self.login_ended = login_operation;
+                // `0e`'s own first row is the notice's.
                 return if uncertain {
-                    attempt.notice(Notice::Uncertain(if *kind == 0x0e { &[] } else { rows }))
+                    attempt.notice(Notice::Uncertain(if *kind == 0x0e {
+                        rows.get(1..).unwrap_or_default()
+                    } else {
+                        rows
+                    }))
                 } else if rows.is_empty() {
                     Ok(())
                 } else {
@@ -1522,7 +1622,7 @@ impl Client {
                 let attempt = Arc::clone(&login.attempt);
                 let rows = login.selection.success(login.request.as_ref());
                 let unlock = login.selection == LoginSelection::Unlock;
-                let login_operation = login.selection != LoginSelection::SelectorUpdate;
+                let login_operation = !login.selection.storage();
                 self.login = None;
                 self.login_ended = login_operation;
                 attempt.notice(Notice::Login(rows))?;
@@ -1939,6 +2039,42 @@ impl LoginPending {
                 _ => false,
             };
         }
+        // An upgrade's: root's `87` and the baseline's refusals before any
+        // description; its reads' kinds, `28` among them, while the review
+        // awaits its receipt, the TPM's for the TPM shape alone; a new
+        // key's from its connect step on; and `28` again, with `0e`, after
+        // the acknowledged commit.
+        if let LoginSelection::Upgrade { shape, .. } = self.selection {
+            let step = self.request.as_ref().and_then(Request::upgrade_step);
+            let review = step == Some(UpgradeStep::Review) && self.receipt.is_none();
+            let key = matches!(step, Some(UpgradeStep::Key { .. })) && !self.committed;
+            return match (kind, detail) {
+                (0x87 | 0x22, 0) => !described,
+                (0x20 | 0x21, 0) => !described || review,
+                (0x23 | 0x24, 0) => review,
+                (0x27, 1..=3) => review && shape == UpgradeShape::Tpm,
+                (0x01, _) | (0x06, 1..=6) | (0x02 | 0x03 | 0x05 | 0x07 | 0x11, 0) => key,
+                (0x28, 0) => !uncertain && (review || self.committed),
+                (0x0e, 0) => uncertain,
+                (0x08 | 0x0f | 0x10, 0) => true,
+                (0x80, 0) => self.cancelled,
+                _ => false,
+            };
+        }
+        // A cancellation's: `20` before the commit, `21` and `28` before
+        // its receipt, and `28` and `0e` after the acknowledged commit.
+        if self.selection == LoginSelection::UpgradeCancel {
+            let unreceived = self.receipt.is_none() && !self.committed;
+            return match (kind, detail) {
+                (0x20, 0) => !self.committed,
+                (0x21, 0) => unreceived,
+                (0x28, 0) => !uncertain && ((described && unreceived) || self.committed),
+                (0x0e, 0) => uncertain,
+                (0x08 | 0x0f | 0x10, 0) => true,
+                (0x80, 0) => self.cancelled,
+                _ => false,
+            };
+        }
         let (selection, proof) = self.selection.authorized();
         // A disk proof's own (amendment 10): root's `86` and the volume's
         // `21` before any description; the storage worker's `20` from its
@@ -1986,7 +2122,10 @@ impl LoginPending {
             {
                 return Err("root login request changed the selected operation".into());
             }
-            if self.selection == LoginSelection::SelectorUpdate {
+            if let LoginSelection::Upgrade { .. } = self.selection {
+                // The review, last only with no new key.
+                self.last = description.upgrade_start()? == Admitted::Last;
+            } else if self.selection.storage() {
                 // One step: its presentation is also its last.
                 self.last = true;
             } else {
@@ -2005,8 +2144,11 @@ impl LoginPending {
         if current == description {
             return Ok(());
         }
-        if self.selection == LoginSelection::SelectorUpdate {
-            return Err("a selector update has one description".into());
+        if matches!(
+            self.selection,
+            LoginSelection::SelectorUpdate | LoginSelection::UpgradeCancel
+        ) {
+            return Err("a one-step storage operation has one description".into());
         }
         // `03` too: root that read the next invitation, then stopped at its
         // deadline or a cancellation, describes that step while it reaps.
@@ -2018,7 +2160,11 @@ impl LoginPending {
         if asks_pin(current) && !self.pin_sent {
             return Err("login status passed a PIN step before its PIN".into());
         }
-        let admitted = current.login_successor(description)?;
+        let admitted = if let LoginSelection::Upgrade { .. } = self.selection {
+            current.upgrade_successor(description)?
+        } else {
+            current.login_successor(description)?
+        };
         match description.login_step() {
             Some(LoginStep::Authorize { key, .. }) => self.authorizer = Some(key),
             Some(
@@ -3916,6 +4062,14 @@ mod tests {
                 }),
             ],
             LoginSelection::SelectorUpdate => panic!("storage tests drive their own"),
+            LoginSelection::Upgrade { shape, count } => std::iter::once(UpgradeStep::Review)
+                .chain((1..=*count).flat_map(|key| {
+                    new_key(if key == 1 { NEW } else { BACKUP })
+                        .map(move |step| UpgradeStep::Key { key, step })
+                }))
+                .map(|step| upgrade_at(*shape, *count, step))
+                .collect(),
+            LoginSelection::UpgradeCancel => vec![upgrade_cancel()],
             LoginSelection::Proven(proof, inner) => {
                 let firsts = match proof {
                     Proof::RecoveryKey => vec![LoginStep::RecoveryKey],
@@ -4019,7 +4173,8 @@ mod tests {
     /// before the next, which the client answers with `1c`.
     fn presented(selection: &LoginSelection, count: usize) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
         let steps = steps(selection);
-        let mut replies = vec![started(), vec![0x91, 0x0b], status(3, &steps[0])];
+        let started = [&[selection.answer(), 1][..], &NONCE].concat();
+        let mut replies = vec![started, vec![0x91, 0x0b], status(3, &steps[0])];
         let mut calls = vec![
             Selection::Login(selection.clone()).request().unwrap(),
             vec![0x11],
@@ -4433,6 +4588,324 @@ mod tests {
             SelectorForm::Fido2,
         ] {
             for row in LoginSelection::SelectorUpdate.success(Some(&selector_update(form))) {
+                assert!(row.len() <= columns, "{row}");
+            }
+        }
+    }
+
+    // The upgrade and its cancellation (DESIGN.md, "The upgrade" and "The
+    // cancellation").
+
+    fn upgrade_at(shape: UpgradeShape, count: u8, step: UpgradeStep) -> Request {
+        login(Operation::Upgrade {
+            account: 1000,
+            shape,
+            count,
+            current: "ab".repeat(32),
+            step,
+            approval: (step == UpgradeStep::Review).then(|| ApprovalKey::new(*b"47").unwrap()),
+        })
+    }
+    fn upgrade_cancel() -> Request {
+        login(Operation::UpgradeCancel {
+            key: ApprovalKey::new(*b"58").unwrap(),
+        })
+    }
+    fn upgrades() -> Vec<LoginSelection> {
+        [
+            (UpgradeShape::Tpm, 0),
+            (UpgradeShape::Tpm, 2),
+            (UpgradeShape::Fido2, 1),
+            (UpgradeShape::Fido2, 2),
+        ]
+        .map(|(shape, count)| LoginSelection::Upgrade { shape, count })
+        .into()
+    }
+
+    /// `20 02 S N` and `20 03`: the review keyed, each new key's ceremony
+    /// with a `1c` for its create, prove and repeat steps, the commit over
+    /// the last step, and the success rows; nothing about login keys
+    /// changed.
+    #[test]
+    fn an_upgrade_and_a_cancellation_run_their_whole_status_sequences() {
+        let mut selections = upgrades();
+        selections.push(LoginSelection::UpgradeCancel);
+        for selection in selections {
+            let screen = Screen::login(selection.clone());
+            let steps = steps(&selection);
+            let last = steps.last().unwrap();
+            let (mut replies, mut calls) = presented(&selection, steps.len());
+            replies.extend([
+                status(5, last),
+                vec![0x94],
+                status(3, last),
+                status(6, last),
+            ]);
+            calls.extend([
+                vec![0x11],
+                description(&[0x14], last),
+                vec![0x11],
+                vec![0x11],
+            ]);
+            let (mut client, wire, result) = drive(&screen, replies);
+            assert_eq!(result, Ok(()), "{selection:?}");
+            assert!(client.login.is_none());
+            assert!(!client.take_login_end());
+            assert_eq!(wire.calls, calls, "{selection:?}");
+            let keys = match &selection {
+                LoginSelection::Upgrade { count, .. } => usize::from(*count),
+                _ => 0,
+            };
+            assert_eq!(sent(&wire, 0x1c), 3 * keys, "{selection:?}");
+            assert_eq!(sent(&wire, 0x13), steps.len());
+            assert_eq!(screen.shown(), Some(Notice::Login(selection.success(None))));
+            assert_eq!(screen.attempt.field_raw(), [0; PIN_CAPACITY]);
+        }
+        assert_eq!(
+            LoginSelection::Upgrade {
+                shape: UpgradeShape::Fido2,
+                count: 2
+            }
+            .request(),
+            Ok(vec![0x20, 2, 2, 2])
+        );
+        assert_eq!(LoginSelection::UpgradeCancel.request(), Ok(vec![0x20, 3]));
+        for (shape, count) in [(UpgradeShape::Tpm, 3), (UpgradeShape::Fido2, 0)] {
+            assert!(LoginSelection::Upgrade { shape, count }.request().is_err());
+        }
+    }
+
+    /// Each end where root can send it, and the violations: an end where it
+    /// cannot, a review for another shape or count, a step out of order and
+    /// a commit before the last step.
+    #[test]
+    fn an_upgrade_ends_only_where_root_can_end_it() {
+        let run = |selection: &LoginSelection, prefix: &[Vec<u8>], last: Vec<u8>| {
+            let screen = Screen::login(selection.clone());
+            let replies = prefix.iter().cloned().chain([last]).collect();
+            let (client, _, result) = drive(&screen, replies);
+            (client.login.is_none() && result.is_ok(), screen.shown())
+        };
+        let end = |code: u8, kind: u8, detail: u8, step: Option<&Request>| {
+            let mut bytes = vec![0x91, code, kind, detail];
+            if let Some(step) = step {
+                bytes.extend_from_slice(&step.encode());
+            }
+            bytes
+        };
+        for selection in upgrades() {
+            let LoginSelection::Upgrade { shape, count } = selection else {
+                panic!("{selection:?}")
+            };
+            let steps = steps(&selection);
+            let review = &steps[0];
+            let before = presented(&selection, 0).0[..2].to_vec();
+            // The review described, presented and not yet received.
+            let reviewing = presented(&selection, 0).0;
+            let shows = |kind, detail| upgrade_failure(kind, detail).map(Notice::Login);
+            for kind in [0x87, 0x22, 0x20, 0x21] {
+                assert_eq!(
+                    run(&selection, &before, end(0x0d, kind, 0, None)),
+                    (true, shows(kind, 0)),
+                    "{kind:02x}"
+                );
+            }
+            for kind in [0x87, 0x22] {
+                assert!(!run(&selection, &reviewing, end(0x0d, kind, 0, Some(review))).0);
+            }
+            for (kind, detail) in [(0x20, 0), (0x21, 0), (0x23, 0), (0x24, 0), (0x28, 0)] {
+                assert_eq!(
+                    run(
+                        &selection,
+                        &reviewing,
+                        end(0x0d, kind, detail, Some(review))
+                    ),
+                    (true, shows(kind, detail)),
+                    "{kind:02x}"
+                );
+            }
+            for detail in 1..=3 {
+                let tpm = shape == UpgradeShape::Tpm;
+                let (ended, shown) = run(
+                    &selection,
+                    &reviewing,
+                    end(0x0d, 0x27, detail, Some(review)),
+                );
+                assert_eq!(ended, tpm, "{shape:?}");
+                if tpm {
+                    assert_eq!(shown, shows(0x27, detail));
+                }
+            }
+            // A new key's kinds need its ceremony.
+            assert!(!run(&selection, &reviewing, end(0x0d, 0x11, 0, Some(review))).0);
+            assert!(!run(&selection, &reviewing, end(0x0d, 0x01, 7, Some(review))).0);
+            if count > 0 {
+                let (keying, _) = presented(&selection, 2);
+                let create = &steps[2];
+                for (kind, detail) in [(0x01, 7), (0x05, 0), (0x06, 6), (0x07, 0), (0x11, 0)] {
+                    assert_eq!(
+                        run(&selection, &keying, end(0x0d, kind, detail, Some(create))),
+                        (true, shows(kind, detail)),
+                        "{kind:02x}"
+                    );
+                }
+                // The reads' kinds are the review's alone.
+                for kind in [0x20, 0x21, 0x23, 0x24, 0x28] {
+                    assert!(
+                        !run(&selection, &keying, end(0x0d, kind, 0, Some(create))).0,
+                        "{kind:02x}"
+                    );
+                }
+                // A step out of order: the create before its connect.
+                let (mut skipped, _) = presented(&selection, 1);
+                skipped.pop();
+                assert!(!run(&selection, &skipped, status(3, create)).0);
+                // A commit before the last step.
+                let (keyed, _) = presented(&selection, 3);
+                assert!(!run(&selection, &keyed, status(5, &steps[2])).0);
+            }
+            // After the commit: a definite `28`, or uncertain with its rows.
+            let last = steps.last().unwrap();
+            let (mut committed, _) = presented(&selection, steps.len());
+            committed.extend([status(5, last), vec![0x94]]);
+            assert_eq!(
+                run(&selection, &committed, end(0x0d, 0x28, 0, Some(last))),
+                (true, shows(0x28, 0))
+            );
+            assert_eq!(
+                run(&selection, &committed, end(0x0e, 0x0e, 0, Some(last))),
+                (
+                    true,
+                    Some(Notice::Uncertain(&[
+                        "THE NEXT BOOT MAY NEED",
+                        "THE RECOVERY KEY"
+                    ]))
+                )
+            );
+            assert!(!run(&selection, &committed, end(0x0d, 0x23, 0, Some(last))).0);
+            // A review for another count.
+            let other = upgrade_at(shape, if count == 2 { 1 } else { 2 }, UpgradeStep::Review);
+            assert!(!run(&selection, &before, status(3, &other)).0);
+            let cancel = upgrade_cancel();
+            assert!(!run(&selection, &before, status(3, &cancel)).0);
+        }
+    }
+
+    /// A cancellation's ends: `20` before its commit, `21` and a definite
+    /// `28` before its receipt, `28` and `0e` after the commit, and one
+    /// description.
+    #[test]
+    fn a_cancellation_ends_only_where_root_can_end_it() {
+        let selection = LoginSelection::UpgradeCancel;
+        let cancel = upgrade_cancel();
+        let run = |prefix: &[Vec<u8>], last: Vec<u8>| {
+            let screen = Screen::login(selection.clone());
+            let replies = prefix.iter().cloned().chain([last]).collect();
+            let (client, _, result) = drive(&screen, replies);
+            (client.login.is_none() && result.is_ok(), screen.shown())
+        };
+        let end = |code: u8, kind: u8, described: bool| {
+            let mut bytes = vec![0x91, code, kind, 0];
+            if described {
+                bytes.extend_from_slice(&cancel.encode());
+            }
+            bytes
+        };
+        let shows = |kind| storage_failure(kind, 0).map(Notice::Login);
+        let (described, _) = presented(&selection, 0);
+        let before = described[..2].to_vec();
+        let (received, _) = presented(&selection, 1);
+        let mut committed = received.clone();
+        committed.extend([status(5, &cancel), vec![0x94]]);
+        for kind in [0x20, 0x21] {
+            assert_eq!(run(&before, end(0x0d, kind, false)), (true, shows(kind)));
+            assert_eq!(run(&described, end(0x0d, kind, true)), (true, shows(kind)));
+        }
+        assert_eq!(run(&described, end(0x0d, 0x28, true)), (true, shows(0x28)));
+        assert_eq!(run(&received, end(0x0d, 0x20, true)), (true, shows(0x20)));
+        assert!(!run(&received, end(0x0d, 0x21, true)).0);
+        assert!(!run(&received, end(0x0d, 0x28, true)).0);
+        assert!(!run(&before, end(0x0d, 0x22, false)).0);
+        assert_eq!(run(&committed, end(0x0d, 0x28, true)), (true, shows(0x28)));
+        assert_eq!(
+            run(&committed, end(0x0e, 0x0e, true)),
+            (true, Some(Notice::Uncertain(&[])))
+        );
+        assert!(!run(&committed, end(0x0d, 0x20, true)).0);
+        // One description.
+        assert!(!run(&received, status(3, &upgrade_cancel_other())).0);
+    }
+    fn upgrade_cancel_other() -> Request {
+        login(Operation::UpgradeCancel {
+            key: ApprovalKey::new(*b"69").unwrap(),
+        })
+    }
+
+    /// Every upgrade end's and success's rows fit the narrowest chrome,
+    /// and its own are DESIGN.md's.
+    #[test]
+    fn upgrade_texts_fit_the_narrowest_chrome() {
+        let tpm = |reason| Some(vec!["NO USABLE TPM:", reason, "CHOOSE SECURITY KEYS ONLY"]);
+        assert_eq!(
+            upgrade_failure(0x27, 1).map(<[_]>::to_vec),
+            tpm("NONE FOUND")
+        );
+        assert_eq!(
+            upgrade_failure(0x27, 2).map(<[_]>::to_vec),
+            tpm("NO SHA-256 PCR BANK")
+        );
+        assert_eq!(
+            upgrade_failure(0x27, 3).map(<[_]>::to_vec),
+            tpm("ITS LOCKOUT IS ALREADY SET")
+        );
+        assert_eq!(upgrade_failure(0x27, 4), None);
+        assert_eq!(
+            upgrade_failure(0x87, 0),
+            Some(&["NEEDS AN ENROLLED LOGIN KEY"][..])
+        );
+        assert_eq!(
+            upgrade_failure(0x22, 0),
+            Some(
+                &[
+                    "RESTART INTO THE CURRENT SYSTEM",
+                    "BEFORE PROTECTING THE DISK"
+                ][..]
+            )
+        );
+        assert_eq!(upgrade_failure(0x11, 0), login_failure(0x11, 0));
+        assert_eq!(upgrade_failure(0x23, 0), storage_failure(0x23, 0));
+        assert_eq!(
+            LoginSelection::Upgrade {
+                shape: UpgradeShape::Tpm,
+                count: 0
+            }
+            .success(None),
+            [
+                "THE NEXT BOOT PROTECTS THE DISK",
+                "HAVE THE RECOVERY KEY READY"
+            ]
+        );
+        assert_eq!(
+            LoginSelection::UpgradeCancel.success(None),
+            [
+                "DISK PROTECTION CANCELLED",
+                "THE NEXT BOOT MAY NEED",
+                "THE RECOVERY KEY"
+            ]
+        );
+        let columns = crate::attention::layout(320, 200).1;
+        for kind in 0..=u8::MAX {
+            for detail in 0..=8 {
+                for row in upgrade_failure(kind, detail).unwrap_or_default() {
+                    assert!(row.bytes().all(crate::ui::is_mapped), "{row}");
+                    assert!(row.len() <= columns, "{row}");
+                }
+            }
+        }
+        let mut selections = upgrades();
+        selections.push(LoginSelection::UpgradeCancel);
+        for selection in selections {
+            for row in selection.success(None) {
                 assert!(row.len() <= columns, "{row}");
             }
         }
@@ -5086,7 +5559,10 @@ mod tests {
                 LoginSelection::Enroll(_) => (0x82, 0),
                 LoginSelection::Add => (0x81, 0),
                 LoginSelection::Remove(..) => (0x83, 0),
-                LoginSelection::SelectorUpdate | LoginSelection::Proven(..) => {
+                LoginSelection::SelectorUpdate
+                | LoginSelection::Upgrade { .. }
+                | LoginSelection::UpgradeCancel
+                | LoginSelection::Proven(..) => {
                     panic!("storage and disk proof tests drive their own")
                 }
             });
@@ -5096,6 +5572,8 @@ mod tests {
                 LoginSelection::Unlock
                 | LoginSelection::Add
                 | LoginSelection::SelectorUpdate
+                | LoginSelection::Upgrade { .. }
+                | LoginSelection::UpgradeCancel
                 | LoginSelection::Proven(..) => false,
             };
         }

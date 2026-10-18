@@ -1,18 +1,21 @@
 //! Nonblocking ownership of one root storage worker, `td-install
 //! storage-operation` (td-authd/DESIGN.md amendment 10): root's side of
-//! its frames for a selector update or a login operation's disk proof.
+//! its frames for a selector update, the re-encrypting upgrade's phase 1
+//! and its cancellation, or a login operation's disk proof.
 
 use crate::consent::{
-    ApprovalKey, DiskProofs, Fingerprint, LoginStep, Operation, Request, SelectorForm,
-    SELECTOR_UPDATE_CEILING,
+    upgrade_ceiling, Admitted, ApprovalKey, DiskProofs, Fingerprint, LoginStep, Operation, Request,
+    SelectorForm, UpgradeShape, UpgradeStep, SELECTOR_UPDATE_CEILING, UPGRADE_CANCEL_CEILING,
 };
 use crate::login::{End, Pin, CANCELLED, INTERNAL, TIMEOUT};
+use crate::login_status::login_state;
 use crate::unlock::{deadline_after, Event, Wire};
 use std::fs::File;
 use std::io::Read;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
-use std::process::{Child, Command, Stdio};
+use std::path::Path;
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 /// Until td-install/ENCRYPTION.md's item 9 a production build answers
@@ -56,25 +59,61 @@ pub(crate) const CHANGED: u8 = 0x28;
 /// keyslot refused the key or the derived passphrase.
 pub(crate) const MISTYPED: u8 = 0x25;
 pub(crate) const WRONG_KEY: u8 = 0x26;
+/// The upgrade's: a new key already holding an excluded credential, and
+/// the TPM shape's TPM.
+const EXCLUDED: u8 = 0x11;
+const TPM: u8 = 0x27;
 const UNCERTAIN: u8 = 0x0e;
 const FAILED: u8 = 0x0f;
+/// Root's: an upgrade without an enrolled login state.
+pub(crate) const UNENROLLED: u8 = 0x87;
 
 /// The storage operation the paired peer selects; root derives the rest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Selection {
     SelectorUpdate,
-    /// Bytes `02` to `0a`: assigned, fixed by their own increments, and
+    /// `02 S N`: phase 1 of the upgrade to shape `S` with `N` new keys.
+    Upgrade {
+        shape: UpgradeShape,
+        count: u8,
+    },
+    /// `03`: the upgrade's cancellation.
+    UpgradeCancel,
+    /// Bytes `04` to `0a`: assigned, fixed by their own increments, and
     /// refused by this build.
     Later(u8),
 }
 
 impl Selection {
-    /// The bytes after request `20`: one operation byte.
+    /// The bytes after request `20`: one operation byte, and an upgrade's
+    /// shape and count, which its shape must take.
     pub fn decode(bytes: &[u8]) -> Result<Self, String> {
         match bytes {
             [1] => Ok(Self::SelectorUpdate),
-            [byte @ 2..=0x0a] => Ok(Self::Later(*byte)),
+            [2, shape, count] => match UpgradeShape::from_byte(*shape) {
+                Some(shape) if shape.takes(*count) => Ok(Self::Upgrade {
+                    shape,
+                    count: *count,
+                }),
+                _ => Err("invalid upgrade selection".into()),
+            },
+            [3] => Ok(Self::UpgradeCancel),
+            [byte @ 4..=0x0a] => Ok(Self::Later(*byte)),
             _ => Err("invalid storage operation selection".into()),
+        }
+    }
+
+    /// Whether this build runs the selection.
+    pub fn runs(self) -> bool {
+        !matches!(self, Self::Later(_))
+    }
+
+    /// Root's ceiling, fixed at the selection.
+    fn ceiling(self) -> Duration {
+        match self {
+            Self::Upgrade { count, .. } => upgrade_ceiling(count),
+            Self::UpgradeCancel => UPGRADE_CANCEL_CEILING,
+            Self::SelectorUpdate | Self::Later(_) => SELECTOR_UPDATE_CEILING,
         }
     }
 }
@@ -147,11 +186,24 @@ fn baseline(frame: &[u8]) -> Option<Baseline> {
 }
 
 /// The worker's typed failure and its detail byte. A selector update's
-/// carry none, and `0e` and `28` only once root acknowledged the commit. A
-/// disk proof's are the login worker's kinds a disk key can end with,
-/// with their details, and the proof's own; its `28` comes before any
-/// write, so it is definite whenever it comes.
-fn failure(frame: &[u8], committed: bool, proof: bool) -> Option<(u8, u8)> {
+/// carry none, and `0e` and `28` only once root acknowledged the commit,
+/// as an upgrade's and a cancellation's. A disk proof's are the login
+/// worker's kinds a disk key can end with, with their details, and the
+/// proof's own; its `28` comes before any write, so it is definite
+/// whenever it comes. An upgrade's and a cancellation's are where they
+/// stand (`Stage`).
+fn failure(
+    frame: &[u8],
+    committed: bool,
+    proof: bool,
+    selection: Selection,
+    stage: Stage,
+) -> Option<(u8, u8)> {
+    match selection {
+        Selection::Upgrade { shape, .. } => return upgrade_failure(frame, committed, shape, stage),
+        Selection::UpgradeCancel => return cancel_failure(frame, committed, stage),
+        Selection::SelectorUpdate | Selection::Later(_) => {}
+    }
     if proof {
         return match frame {
             [FAILURE, 0x01, retries] => Some((0x01, *retries)),
@@ -171,6 +223,53 @@ fn failure(frame: &[u8], committed: bool, proof: bool) -> Option<(u8, u8)> {
     match frame {
         [FAILURE, kind @ (TIMEOUT | FAILED | INTERNAL | DEPLOYMENT | ESP)] => Some((*kind, 0)),
         [FAILURE, kind @ (UNCERTAIN | CHANGED)] if committed => Some((*kind, 0)),
+        _ => None,
+    }
+}
+
+/// Where an upgrade or a cancellation stands, which decides the kinds
+/// its worker can end it with (td-compositor/DESIGN.md, "The upgrade").
+#[derive(Clone, Copy, Debug)]
+struct Stage {
+    /// Root's description awaits the worker's first presentation: the
+    /// worker's reads, whose `28` is definite since nothing is written.
+    reading: bool,
+    /// A new key's ceremony step is current, before the commit.
+    keyed: bool,
+}
+
+/// An upgrade's: its reads' kinds while it reads, the TPM's for the TPM
+/// shape alone, a new key's from its ceremony, and after root's commit
+/// acknowledgement `0e` and `28`; `08`, `0f` and `10` anywhere.
+fn upgrade_failure(
+    frame: &[u8],
+    committed: bool,
+    shape: UpgradeShape,
+    stage: Stage,
+) -> Option<(u8, u8)> {
+    match frame {
+        [FAILURE, kind @ (TIMEOUT | FAILED | INTERNAL)] => Some((*kind, 0)),
+        [FAILURE, kind @ (UNCERTAIN | CHANGED)] if committed => Some((*kind, 0)),
+        [FAILURE, kind @ (VOLUME | STATE | DEPLOYMENT | ESP | CHANGED)] if stage.reading => {
+            Some((*kind, 0))
+        }
+        [FAILURE, TPM, detail @ 1..=3] if stage.reading && shape == UpgradeShape::Tpm => {
+            Some((TPM, *detail))
+        }
+        [FAILURE, 0x01, retries] if stage.keyed => Some((0x01, *retries)),
+        [FAILURE, 0x06, detail @ 1..=6] if stage.keyed => Some((0x06, *detail)),
+        [FAILURE, kind @ (0x02 | 0x03 | 0x05 | 0x07 | EXCLUDED)] if stage.keyed => Some((*kind, 0)),
+        _ => None,
+    }
+}
+
+/// A cancellation's: its read's kinds while it reads, and after root's
+/// commit acknowledgement `0e` and `28`; `08`, `0f` and `10` anywhere.
+fn cancel_failure(frame: &[u8], committed: bool, stage: Stage) -> Option<(u8, u8)> {
+    match frame {
+        [FAILURE, kind @ (TIMEOUT | FAILED | INTERNAL)] => Some((*kind, 0)),
+        [FAILURE, kind @ (UNCERTAIN | CHANGED)] if committed => Some((*kind, 0)),
+        [FAILURE, kind @ (VOLUME | STATE | CHANGED)] if stage.reading => Some((*kind, 0)),
         _ => None,
     }
 }
@@ -231,6 +330,40 @@ fn selector_update(baseline: &Baseline, key: ApprovalKey) -> Result<Operation, u
     })
 }
 
+/// Tag 17's review from the baseline, or the kind that ends the upgrade
+/// before any description: it takes a device-bound volume only.
+fn upgrade(
+    baseline: &Baseline,
+    owner: u32,
+    shape: UpgradeShape,
+    count: u8,
+    key: ApprovalKey,
+) -> Result<Operation, u8> {
+    match baseline.volume {
+        Volume::None | Volume::Refused => return Err(VOLUME),
+        Volume::Upgrading | Volume::TpmPrimary | Volume::Fido2Primary => return Err(STATE),
+        Volume::DeviceBound => {}
+    }
+    let current = baseline.current.ok_or(NOT_CURRENT)?;
+    Ok(Operation::Upgrade {
+        account: owner,
+        shape,
+        count,
+        current: hex(&current),
+        step: UpgradeStep::Review,
+        approval: Some(key),
+    })
+}
+
+/// Tag 18 from the baseline: it takes an upgrading volume only.
+fn upgrade_cancel(baseline: &Baseline, key: ApprovalKey) -> Result<Operation, u8> {
+    match baseline.volume {
+        Volume::None | Volume::Refused => Err(VOLUME),
+        Volume::DeviceBound | Volume::TpmPrimary | Volume::Fido2Primary => Err(STATE),
+        Volume::Upgrading => Ok(Operation::UpgradeCancel { key }),
+    }
+}
+
 /// Each digit `2` plus its own random byte modulo 8, as an elevation's.
 fn approval_key(bytes: [u8; 2]) -> Result<ApprovalKey, String> {
     ApprovalKey::new(bytes.map(|byte| b'2' + byte % 8))
@@ -282,7 +415,21 @@ pub(crate) struct Storage {
     owner: u32,
     nonce: [u8; 32],
     approval: ApprovalKey,
+    selection: Selection,
+    /// The baseline's fido2 tokens, an upgrade's steps are admitted
+    /// against, and the credentials earlier new keys' ceremonies created,
+    /// which a later key's may not name either.
+    tokens: Vec<Fingerprint>,
+    made: Vec<Fingerprint>,
+    /// The credential the current key's ceremony created, from its prove
+    /// step.
+    created: Option<Fingerprint>,
+    /// The presented step is the operation's last: only the commit follows.
+    last: bool,
     child: Option<Child>,
+    /// The worker's exit, reaped before its channel ended, and how long
+    /// root waits for that end.
+    status: Option<(ExitStatus, Instant)>,
     wire: Option<Wire>,
     phase: Phase,
     request: Option<Request>,
@@ -308,9 +455,24 @@ impl Storage {
         if owner != 1000 {
             return Err("storage supervisor requires the configured graphical session".into());
         }
-        if !OPERATIONS || selection != Selection::SelectorUpdate {
+        if !OPERATIONS || !selection.runs() {
             return Err("storage operations are refused in this build".into());
         }
+        // An upgrade makes login-key consent the volume's (amendment 10).
+        let enrolled = !matches!(selection, Selection::Upgrade { .. })
+            || login_state::state(Path::new("/"), owner) == login_state::State::Enrolled;
+        Self::launch(owner, selection, enrolled, command(owner))
+    }
+
+    /// `start` with its login-state read and its worker the caller's: an
+    /// upgrade without an enrolled login state ends as `87` before any
+    /// worker starts.
+    fn launch(
+        owner: u32,
+        selection: Selection,
+        enrolled: bool,
+        command: Command,
+    ) -> Result<Self, String> {
         let mut nonce = [0; 32];
         let mut key = [0; 2];
         File::open("/dev/urandom")
@@ -323,15 +485,26 @@ impl Storage {
             return Err("zero storage request nonce".into());
         }
         let deadline = Instant::now()
-            .checked_add(SELECTOR_UPDATE_CEILING)
+            .checked_add(selection.ceiling())
             .ok_or("storage deadline overflow")?;
+        if !enrolled {
+            return Ok(Self::unstarted(
+                owner,
+                nonce,
+                approval_key(key)?,
+                selection,
+                deadline,
+                UNENROLLED,
+            ));
+        }
         Self::spawn(
             owner,
             nonce,
             approval_key(key)?,
+            selection,
             deadline,
             None,
-            command(owner),
+            command,
         )
     }
 
@@ -375,7 +548,15 @@ impl Storage {
             tokens: Vec::new(),
             sent: false,
         };
-        Self::spawn(owner, nonce, approval, deadline, Some(proof), command)
+        Self::spawn(
+            owner,
+            nonce,
+            approval,
+            Selection::SelectorUpdate,
+            deadline,
+            Some(proof),
+            command,
+        )
     }
 
     /// The deadline counts from before the worker starts, so it ends no
@@ -384,6 +565,7 @@ impl Storage {
         owner: u32,
         nonce: [u8; 32],
         approval: ApprovalKey,
+        selection: Selection,
         deadline: Instant,
         proof: Option<DiskProof>,
         mut command: Command,
@@ -394,24 +576,54 @@ impl Storage {
             .stdin(Stdio::from(OwnedFd::from(child)))
             .spawn()
             .map_err(|e| format!("start storage worker: {e}"))?;
-        Ok(Self {
+        let mut storage = Self::unstarted(owner, nonce, approval, selection, deadline, INTERNAL);
+        storage.child = Some(child);
+        storage.wire = Some(wire);
+        storage.phase = Phase::Baseline;
+        storage.end = None;
+        storage.terminal = None;
+        storage.proof = proof;
+        Ok(storage)
+    }
+
+    /// An operation that ends as `kind` with no worker started.
+    fn unstarted(
+        owner: u32,
+        nonce: [u8; 32],
+        approval: ApprovalKey,
+        selection: Selection,
+        deadline: Instant,
+        kind: u8,
+    ) -> Self {
+        let end = End {
+            uncertain: false,
+            kind,
+            detail: 0,
+        };
+        Self {
             owner,
             nonce,
             approval,
-            child: Some(child),
-            wire: Some(wire),
-            phase: Phase::Baseline,
+            selection,
+            tokens: Vec::new(),
+            made: Vec::new(),
+            created: None,
+            last: true,
+            child: None,
+            status: None,
+            wire: None,
+            phase: Phase::Done,
             request: None,
             round: Vec::new(),
             deadline,
             acknowledgement_deadline: None,
             committed: false,
-            proof,
+            proof: None,
             pin: None,
             grace: None,
-            end: None,
-            terminal: None,
-        })
+            end: Some(end),
+            terminal: Some(Event::Ended(end)),
+        }
     }
 
     pub fn nonce(&self) -> &[u8; 32] {
@@ -429,8 +641,11 @@ impl Storage {
     /// dropped, as a login disclosure's is.
     pub fn presented(&mut self, request: &Request) -> Result<(), String> {
         let now = Instant::now();
-        // A proof's step carries a key only where it discloses.
-        let keyed = self.proof.is_none() || request.login_approval().is_some();
+        // A step carries a key where it discloses: a proof's first, an
+        // upgrade's review, and each one-step operation's description.
+        let keyed = request.login_approval().is_some()
+            || request.upgrade_approval().is_some()
+            || request.selector_update().is_some();
         if keyed && self.request.as_ref() == Some(request) {
             if matches!(self.phase, Phase::Stopping | Phase::Done) {
                 return Ok(());
@@ -477,7 +692,7 @@ impl Storage {
             // definite `28`, is uncertain.
             self.committed = true;
             self.phase = Phase::Completion;
-        } else if self.proof.is_some() && request.login_step().is_some_and(LoginStep::asks_pin) {
+        } else if request.ceremony_step().is_some_and(LoginStep::asks_pin) {
             self.phase = Phase::Pin;
         } else {
             self.phase = Phase::Running;
@@ -485,8 +700,8 @@ impl Storage {
         Ok(())
     }
 
-    /// Forwards a disk proof's secret for its presented secret step,
-    /// keeping no copy once it is written: a disk key's PIN, or the
+    /// Forwards the secret for a presented secret step, keeping no copy
+    /// once it is written: a disk key's or a new key's PIN, or the
     /// recovery key, exactly 48 digits, which the compositor's field alone
     /// admits, so anything else ends the generation. False when the
     /// operation has already ended, or its deadline has passed, which ends
@@ -495,12 +710,9 @@ impl Storage {
         if matches!(self.phase, Phase::Stopping | Phase::Done) && request.nonce() == &self.nonce {
             return Ok(false);
         }
-        if self.proof.is_none()
-            || self.phase != Phase::Pin
-            || self.request.as_ref() != Some(request)
-        {
+        if self.phase != Phase::Pin || self.request.as_ref() != Some(request) {
             self.stop(INTERNAL)?;
-            return Err("stale disk proof secret".into());
+            return Err("stale storage secret".into());
         }
         if request.login_step() == Some(LoginStep::RecoveryKey) && !recovery_digits(&pin) {
             self.stop(INTERNAL)?;
@@ -564,27 +776,38 @@ impl Storage {
         Ok(event)
     }
 
-    /// After `14` or a committed `28`: the worker's successful exit and a
-    /// clean end of its channel, with no further byte, end the operation
-    /// as `outcome`; any other exit leaves it uncertain.
+    /// After `14` or a `28`: the worker's successful exit and a clean end
+    /// of its channel, with no further byte, end the operation as
+    /// `outcome`; any other exit leaves it uncertain. The end may follow
+    /// the exit: a process forked meanwhile holds a copy of the worker's
+    /// side until it execs, so root waits for it for `GRACE`.
     fn exited(&mut self, outcome: Event) -> Result<Event, String> {
-        let status = self
-            .child
-            .as_mut()
-            .ok_or("missing storage worker")?
-            .try_wait()
-            .map_err(|e| format!("wait for storage worker: {e}"))?;
-        if status.is_some() {
-            self.child = None;
+        if self.status.is_none() {
+            let status = self
+                .child
+                .as_mut()
+                .ok_or("missing storage worker")?
+                .try_wait()
+                .map_err(|e| format!("wait for storage worker: {e}"))?;
+            if let Some(status) = status {
+                self.child = None;
+                let until = Instant::now()
+                    .checked_add(GRACE)
+                    .unwrap_or_else(Instant::now);
+                self.status = Some((status, until));
+            }
         }
         let ended = self
             .wire
             .as_mut()
             .ok_or("missing storage endpoint")?
             .finished()?;
-        let Some(status) = status else {
+        let Some((status, until)) = self.status else {
             return Ok(Event::Waiting);
         };
+        if status.success() && !ended && Instant::now() < until {
+            return Ok(Event::Waiting);
+        }
         self.wire = None;
         if status.success() && ended {
             return Ok(self.finish(outcome));
@@ -633,7 +856,22 @@ impl Storage {
     }
 
     fn receive(&mut self, frame: Vec<u8>) -> Result<Event, String> {
-        if let Some((kind, detail)) = failure(&frame, self.committed, self.proof.is_some()) {
+        let stage = Stage {
+            reading: self.phase == Phase::Description,
+            keyed: !self.committed
+                && self
+                    .request
+                    .as_ref()
+                    .and_then(Request::upgrade_step)
+                    .is_some_and(|step| matches!(step, UpgradeStep::Key { .. })),
+        };
+        if let Some((kind, detail)) = failure(
+            &frame,
+            self.committed,
+            self.proof.is_some(),
+            self.selection,
+            stage,
+        ) {
             if kind == CHANGED {
                 self.phase = Phase::Changed;
                 return self.exited(Event::Ended(End {
@@ -651,8 +889,14 @@ impl Storage {
             (Phase::Description, Some(&PRESENT)) | (Phase::Running, Some(&COMMIT)) => {
                 self.invited(frame)
             }
-            // A disk proof's next step, before its secret is sent.
+            // A disk proof's next step, before its secret is sent, and an
+            // upgrade's next step before its last.
             (Phase::Running, Some(&PRESENT)) if sent == Some(false) => self.invited(frame),
+            (Phase::Running, Some(&PRESENT))
+                if matches!(self.selection, Selection::Upgrade { .. }) && !self.last =>
+            {
+                self.invited(frame)
+            }
             // A disk proof's success follows its secret; no commit round.
             (Phase::Running, Some(&SUCCESS)) if sent == Some(true) && frame.len() == 1 => {
                 self.phase = Phase::Exit;
@@ -673,7 +917,16 @@ impl Storage {
         if self.proof.is_some() {
             return self.begin_proof(baseline);
         }
-        let operation = match selector_update(&baseline, self.approval) {
+        let operation = match self.selection {
+            Selection::Upgrade { shape, count } => {
+                upgrade(&baseline, self.owner, shape, count, self.approval)
+            }
+            Selection::UpgradeCancel => upgrade_cancel(&baseline, self.approval),
+            Selection::SelectorUpdate | Selection::Later(_) => {
+                selector_update(&baseline, self.approval)
+            }
+        };
+        let operation = match operation {
             Ok(operation) => operation,
             Err(kind) => {
                 self.stop(kind)?;
@@ -681,6 +934,10 @@ impl Storage {
             }
         };
         let request = Request::new(self.nonce, self.owner, operation)?;
+        if request.upgrade_step().is_some() {
+            self.last = request.upgrade_start()? == Admitted::Last;
+        }
+        self.tokens = baseline.tokens;
         self.wire
             .as_mut()
             .ok_or("missing storage endpoint")?
@@ -733,10 +990,13 @@ impl Storage {
     }
 
     /// The presentation and the commit invitation, each exactly root's
-    /// description: the selector update has one step. A disk proof's first
-    /// presentation is root's description, and its next, a disk key's
-    /// authorize step, is admitted against both baselines; it has no
-    /// commit.
+    /// description: the selector update and the cancellation have one
+    /// step. An upgrade's later steps are its key ceremonies', each
+    /// admitted against the baseline's fido2 tokens and the credential the
+    /// ceremony created, and its commit names its last step. A disk
+    /// proof's first presentation is root's description, and its next, a
+    /// disk key's authorize step, is admitted against both baselines; it
+    /// has no commit.
     fn invited(&mut self, frame: Vec<u8>) -> Result<Event, String> {
         let current = self.request.as_ref().ok_or("missing storage request")?;
         let invitation = Request::decode(frame.get(33..).ok_or("short storage invitation")?)?;
@@ -760,7 +1020,30 @@ impl Storage {
             self.round = frame;
             return Ok(self.event());
         }
-        if &invitation != current {
+        if self.phase == Phase::Running && frame.first() == Some(&PRESENT) {
+            let step = invitation.upgrade_step().and_then(UpgradeStep::login);
+            // The next key's connect: the last key's credential joins the
+            // ones a new key may not name.
+            if step == Some(LoginStep::Connect) {
+                self.made.extend(self.created);
+            }
+            let created = match step {
+                Some(LoginStep::Prove { key, .. }) => Some(key),
+                Some(LoginStep::Repeat { .. } | LoginStep::Probe { .. }) => self.created,
+                _ => None,
+            };
+            let excluded: Vec<Fingerprint> =
+                self.tokens.iter().chain(&self.made).copied().collect();
+            let admitted = current.admit_upgrade_step(&invitation, &excluded, created)?;
+            self.created = created;
+            self.last = admitted == Admitted::Last;
+            self.request = Some(invitation);
+            self.phase = Phase::Presented;
+            self.acknowledgement_deadline = Some(deadline_after(ACK_TIME)?);
+            self.round = frame;
+            return Ok(self.event());
+        }
+        if &invitation != current || (frame.first() == Some(&COMMIT) && !self.last) {
             return Err("storage worker changed root's description".into());
         }
         self.acknowledgement_deadline = Some(if self.phase == Phase::Description {
@@ -923,10 +1206,23 @@ impl Storage {
             1000,
             [42; 32],
             tests::approval(),
+            Selection::SelectorUpdate,
             deadline,
             None,
             tests::fixture(script),
         )
+    }
+
+    /// A scripted worker for `selection`, as `begin` starts one.
+    pub(crate) fn scripted_as(
+        selection: Selection,
+        enrolled: bool,
+        script: &str,
+    ) -> Result<Self, String> {
+        let mut storage = Self::launch(1000, selection, enrolled, tests::fixture(script))?;
+        storage.nonce = [42; 32];
+        storage.approval = tests::approval();
+        Ok(storage)
     }
 
     pub(crate) fn fixture_pid(&self) -> Option<u32> {

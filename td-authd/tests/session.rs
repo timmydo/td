@@ -2378,6 +2378,51 @@ fn a_selector_update_runs_through_the_paired_session() {
     assert_eq!(session.answer(Request::Poll).unwrap(), [0x91, 2]);
 }
 
+/// Amendment 10's upgrade through the paired session: `20 02 02 02`, its
+/// review and two key ceremonies, each PIN step's `1c` answered `9c 00`,
+/// and its commit; without an enrolled login state `87` before any
+/// description.
+#[test]
+fn an_upgrade_runs_through_the_paired_session() {
+    use crate::consent::{UpgradeShape, UpgradeStep};
+    use crate::storage::{tests, Selection as Storage, UNENROLLED};
+    let selection = Storage::Upgrade {
+        shape: UpgradeShape::Fido2,
+        count: 2,
+    };
+    assert_eq!(
+        Request::decode(&[0x20, 2, 2, 2]).unwrap(),
+        Request::Storage(selection)
+    );
+    let mut session = quiet();
+    prepare(&mut session);
+    let begin = |session: &mut Session, enrolled: bool| {
+        let answer = session
+            .begin_storage(selection, true, |owner, chosen| {
+                assert_eq!((owner, chosen), (1000, selection));
+                crate::storage::Storage::scripted_as(chosen, enrolled, "upgrade-fido2-2")
+            })
+            .unwrap();
+        assert_eq!(answer, [&[0xa0, 1][..], &[42; 32]].concat());
+    };
+    begin(&mut session, true);
+    let review = tests::upgrade_at(UpgradeShape::Fido2, 2, UpgradeStep::Review);
+    assert_eq!(
+        login_event(&mut session),
+        [&[0x91, 4][..], &review.encode()].concat()
+    );
+    let last = *tests::ceremony_steps(2).last().unwrap();
+    let last = tests::upgrade_at(UpgradeShape::Fido2, 2, last);
+    assert_eq!(
+        login_end(&mut session),
+        [&[0x91, 6][..], &last.encode()].concat()
+    );
+    assert_eq!(session.answer(Request::Poll).unwrap(), [0x91, 2]);
+    begin(&mut session, false);
+    assert_eq!(login_end(&mut session), [0x91, 0x0d, UNENROLLED, 0]);
+    assert!(session.operation.is_none());
+}
+
 /// Until item 9 a production build answers every `20` with `a0 00` before
 /// starting anything, and every build so answers the operations their
 /// increments have not fixed.
@@ -2386,9 +2431,17 @@ fn production_refuses_every_storage_operation_before_any_worker_starts() {
     use crate::storage::Selection as Storage;
     let mut session = quiet();
     prepare(&mut session);
-    let mut refused = vec![(Storage::SelectorUpdate, false)];
+    let upgrade = Storage::Upgrade {
+        shape: crate::consent::UpgradeShape::Tpm,
+        count: 0,
+    };
+    let mut refused = vec![
+        (Storage::SelectorUpdate, false),
+        (upgrade, false),
+        (Storage::UpgradeCancel, false),
+    ];
     refused.extend(
-        (2..=0x0a).flat_map(|byte| [(Storage::Later(byte), false), (Storage::Later(byte), true)]),
+        (4..=0x0a).flat_map(|byte| [(Storage::Later(byte), false), (Storage::Later(byte), true)]),
     );
     for (selection, active) in refused {
         assert_eq!(

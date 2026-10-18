@@ -40,6 +40,10 @@ pub(crate) enum Notice {
     LoginKeys,
     /// The storage screen `S` opens (DESIGN.md, "Storage operations").
     DiskEncryption,
+    /// The upgrade's shape screen `P` opens, and the chosen shape's count
+    /// screen.
+    Protect,
+    NewKeys(crate::authority::consent::UpgradeShape),
     /// A protected machine's authorization choice for a login-key
     /// operation (DESIGN.md, "Storage operations"): the disk proofs, and
     /// for an addition or removal an enrolled key.
@@ -154,7 +158,9 @@ impl Prepared {
         remaining: Option<u64>,
     ) -> Result<Self, String> {
         let doubled = width >= 800 && height >= 600;
-        if !doubled || request.login_proof().is_none() {
+        // A disk proof's and an upgrade's prompts fall back to the single
+        // scale where the doubled cannot hold them.
+        if !doubled || (request.login_proof().is_none() && request.upgrade_step().is_none()) {
             let scale = if doubled { 2 } else { 1 };
             return Self::at_scale(request, width, height, stride, remaining, scale);
         }
@@ -271,7 +277,7 @@ impl Prepared {
                 }
             }
         }
-        let field_rows = if request.login_step().is_some_and(|step| step.asks_pin()) {
+        let field_rows = if request.ceremony_step().is_some_and(|step| step.asks_pin()) {
             let recovery =
                 request.login_step() == Some(crate::authority::consent::LoginStep::RecoveryKey);
             let (pin, touch) = if recovery {
@@ -663,6 +669,13 @@ fn notice_rows(notice: Notice) -> Vec<String> {
         Notice::LoginKeys => "LOGIN KEYS",
         Notice::StateUnknown => "LOGIN KEY STATE NOT KNOWN",
         Notice::DiskEncryption => "DISK ENCRYPTION",
+        Notice::Protect => "PROTECT THE DISK WITH:",
+        Notice::NewKeys(crate::authority::consent::UpgradeShape::Tpm) => {
+            "NEW RECOVERY SECURITY KEYS:"
+        }
+        Notice::NewKeys(crate::authority::consent::UpgradeShape::Fido2) => {
+            "NEW PRIMARY SECURITY KEYS:"
+        }
         Notice::Authorize { .. } => "AUTHORIZE WITH:",
         Notice::NotAvailable => "NOT AVAILABLE IN THIS BUILD",
         Notice::Uncertain(_) => "RESULT UNCERTAIN",
@@ -703,7 +716,30 @@ fn notice_rows(notice: Notice) -> Vec<String> {
             "D: REMOVE KEYS",
         ],
         // One row per storage operation, in operation-byte order.
-        Notice::DiskEncryption => &["U: UPDATE THE BOOT SELECTOR"],
+        Notice::DiskEncryption => &[
+            "U: UPDATE THE BOOT SELECTOR",
+            "P: PROTECT THE DISK",
+            "C: CANCEL PROTECTING THE DISK",
+        ],
+        // The trade-offs ENCRYPTION.md's phase 1 has the FIDO2 choice
+        // disclose, each under its shape's name.
+        Notice::Protect => &[
+            "T: TPM AND PIN - THE DEFAULT",
+            "K: SECURITY KEYS ONLY",
+            "KEYS: AN ALTERED BOOT CAN TAKE",
+            "THE DISK FROM ONE KEY USE",
+            "TPM: A FIRMWARE GUESS COUNT",
+            "CAN ROLL BACK WITH ITS FLASH",
+        ],
+        Notice::NewKeys(crate::authority::consent::UpgradeShape::Tpm) => &[
+            "0: NONE",
+            "1: ONE",
+            "2: TWO",
+            "MORE CAN BE ADDED ONCE PROTECTED",
+        ],
+        Notice::NewKeys(crate::authority::consent::UpgradeShape::Fido2) => {
+            &["1: ONE", "2: TWO", "MORE CAN BE ADDED ONCE PROTECTED"]
+        }
         Notice::Authorize { enrolled: true } => &[
             "R: THE DISK RECOVERY KEY",
             "S: A DISK SECURITY KEY",
@@ -1304,6 +1340,9 @@ mod tests {
         Notice::LoginKeys,
         Notice::StateUnknown,
         Notice::DiskEncryption,
+        Notice::Protect,
+        Notice::NewKeys(crate::authority::consent::UpgradeShape::Tpm),
+        Notice::NewKeys(crate::authority::consent::UpgradeShape::Fido2),
         Notice::Authorize { enrolled: true },
         Notice::Authorize { enrolled: false },
         Notice::NotAvailable,
@@ -1319,6 +1358,75 @@ mod tests {
         Notice::Uncertain(&["LOGIN KEY STATE UNAVAILABLE:", "DIRECTORY DAMAGED"]),
         Notice::Restarting,
     ];
+
+    /// DESIGN.md, "The upgrade": the TPM review stays doubled from 1024x768
+    /// and falls back at 800x600, the FIDO2 review falls back at all four
+    /// outputs, and every key step is prepared, a PIN step with its field.
+    #[test]
+    fn an_upgrade_prompt_falls_back_to_the_single_scale_only_where_it_must() {
+        use crate::authority::consent::{ApprovalKey, LoginStep, UpgradeShape, UpgradeStep};
+        let upgrade = |shape, count, step| {
+            Request::new(
+                [1; 32],
+                1000,
+                Operation::Upgrade {
+                    account: 1000,
+                    shape,
+                    count,
+                    current: "ab".repeat(32),
+                    step,
+                    approval: (step == UpgradeStep::Review)
+                        .then(|| ApprovalKey::new(*b"47").unwrap()),
+                },
+            )
+            .unwrap()
+        };
+        let outputs = [(1366, 768), (1280, 800), (1024, 768), (800, 600)];
+        for (shape, count) in [
+            (UpgradeShape::Tpm, 0),
+            (UpgradeShape::Tpm, 2),
+            (UpgradeShape::Fido2, 1),
+            (UpgradeShape::Fido2, 2),
+        ] {
+            let seconds = 240 + 120 * u64::from(count);
+            for (width, height) in outputs {
+                let review = upgrade(shape, count, UpgradeStep::Review);
+                let prepared =
+                    Prepared::with_time(review, width, height, width * 4, Some(seconds)).unwrap();
+                let doubled = shape == UpgradeShape::Tpm && height >= 768;
+                assert_eq!(
+                    prepared.scale,
+                    if doubled { 2 } else { 1 },
+                    "{shape:?} {count} {width}x{height}"
+                );
+                for key in 1..=count {
+                    for step in [
+                        LoginStep::Connect,
+                        LoginStep::Create { retries: 8 },
+                        LoginStep::Prove {
+                            key: [1; 4],
+                            retries: 8,
+                        },
+                        LoginStep::Repeat {
+                            key: [1; 4],
+                            retries: 7,
+                        },
+                        LoginStep::Probe { key: [1; 4] },
+                    ] {
+                        let prepared = Prepared::with_time(
+                            upgrade(shape, count, UpgradeStep::Key { key, step }),
+                            width,
+                            height,
+                            width * 4,
+                            Some(seconds),
+                        )
+                        .unwrap();
+                        assert_eq!(prepared.field_rows.is_some(), step.asks_pin());
+                    }
+                }
+            }
+        }
+    }
 
     /// Every screen's rows, wrapped where the output needs it, inside the
     /// output from 24 pixels in, at the smallest output a prompt takes and

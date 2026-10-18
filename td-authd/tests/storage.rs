@@ -46,6 +46,54 @@ pub(crate) fn update(form: SelectorForm) -> Request {
     .unwrap()
 }
 
+/// Root's upgrade description at `step` for `shape` and `count` over
+/// `ID`: the review carries the key.
+pub(crate) fn upgrade_at(shape: UpgradeShape, count: u8, step: UpgradeStep) -> Request {
+    Request::new(
+        NONCE,
+        1000,
+        Operation::Upgrade {
+            account: 1000,
+            shape,
+            count,
+            current: "ab".repeat(32),
+            step,
+            approval: (step == UpgradeStep::Review).then(approval),
+        },
+    )
+    .unwrap()
+}
+
+/// Every step after the review of `count` new keys, in their only order,
+/// the created credentials `0x0k0k0k0k`.
+pub(crate) fn ceremony_steps(count: u8) -> Vec<UpgradeStep> {
+    let mut steps = Vec::new();
+    for key in 1..=count {
+        let made = [key; 4];
+        for step in [
+            LoginStep::Connect,
+            LoginStep::Create { retries: 8 },
+            LoginStep::Prove {
+                key: made,
+                retries: 8,
+            },
+            LoginStep::Repeat {
+                key: made,
+                retries: 7,
+            },
+            LoginStep::Probe { key: made },
+        ] {
+            steps.push(UpgradeStep::Key { key, step });
+        }
+    }
+    steps
+}
+
+/// Root's cancellation description.
+pub(crate) fn cancellation() -> Request {
+    Request::new(NONCE, 1000, Operation::UpgradeCancel { key: approval() }).unwrap()
+}
+
 /// A baseline frame: the volume byte, a recovery-key marker, the tokens
 /// and the standing.
 pub(crate) fn baseline_frame(volume: u8, tokens: &[(u8, [u8; 4])], current: bool) -> Vec<u8> {
@@ -261,7 +309,233 @@ fn scripted_worker() {
             w.hold();
         }
         proof if proof.starts_with("proof-") => proof_script(w, proof),
+        // Holds the channel it inherited, then ends.
+        "linger" => thread::sleep(Duration::from_millis(300)),
+        "linger-long" => thread::sleep(Duration::from_millis(1500)),
+        upgrade if upgrade.starts_with("upgrade-") || upgrade.starts_with("cancel") => {
+            upgrade_script(w, upgrade)
+        }
         _ => panic!("unknown storage script {script}"),
+    }
+}
+
+/// The storage worker's side of the upgrade's and the cancellation's
+/// tests: `upgrade-SHAPE-COUNT-...`, or `cancel...`.
+fn upgrade_script(w: &mut Worker, script: &str) {
+    if let Some(rest) = script.strip_prefix("cancel") {
+        let volume = match rest.strip_prefix("-baseline:") {
+            Some(volume) => volume.parse().unwrap(),
+            None => 2,
+        };
+        w.send(&baseline_frame(volume, &[], true));
+        if volume != 2 {
+            return w.hold();
+        }
+        let cancel = cancellation();
+        assert_eq!(Request::decode(&w.read()).unwrap(), cancel);
+        match rest {
+            "" => {
+                w.invite(0x10, &cancel);
+                w.invite(0x12, &cancel);
+                w.send(&[0x14]);
+            }
+            "-past-u0" => {
+                w.send(&[0x15, 0x21]);
+                w.hold();
+            }
+            "-changed" => {
+                w.invite(0x10, &cancel);
+                w.invite(0x12, &cancel);
+                w.send(&[0x15, 0x28]);
+            }
+            // Its read finds the header changed: definite, before any
+            // presentation, though a process it leaves holds its channel
+            // a moment past its exit.
+            "-changed-view" => w.send(&[0x15, 0x28]),
+            "-changed-held" | "-changed-held-long" => {
+                w.send(&[0x15, 0x28]);
+                #[allow(
+                    clippy::zombie_processes,
+                    reason = "left holding the channel past this worker's exit"
+                )]
+                Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "storage::tests::scripted_worker", "--ignored"])
+                    .env_clear()
+                    .env(
+                        SCRIPT,
+                        if rest == "-changed-held" {
+                            "linger"
+                        } else {
+                            "linger-long"
+                        },
+                    )
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap();
+            }
+            // A selector update's kind, which no cancellation sends.
+            "-esp" => {
+                w.send(&[0x15, 0x24]);
+                w.hold();
+            }
+            _ => panic!("unknown cancellation script {script}"),
+        }
+        return;
+    }
+    let mut parts = script.split('-').skip(1);
+    let shape = match parts.next() {
+        Some("tpm") => UpgradeShape::Tpm,
+        _ => UpgradeShape::Fido2,
+    };
+    let count: u8 = parts.next().unwrap().parse().unwrap();
+    let rest: Vec<&str> = parts.collect();
+    let rest = rest.join("-");
+    let tokens: &[(u8, [u8; 4])] = if rest == "collides" {
+        &[(1, [1; 4])]
+    } else {
+        &[]
+    };
+    let volume = rest
+        .strip_prefix("baseline:")
+        .map_or(1, |volume| volume.parse().unwrap());
+    w.send(&baseline_frame(volume, tokens, rest != "not-current"));
+    if volume != 1 || rest == "not-current" {
+        return w.hold();
+    }
+    let review = upgrade_at(shape, count, UpgradeStep::Review);
+    assert_eq!(Request::decode(&w.read()).unwrap(), review);
+    let step = |step| upgrade_at(shape, count, step);
+    let steps = ceremony_steps(count);
+    // Through the ceremony's steps before `upto`, each PIN step's secret
+    // read.
+    let ceremony = |w: &mut Worker, upto: usize| {
+        for &key_step in steps.iter().take(upto) {
+            w.invite(0x10, &step(key_step));
+            if UpgradeStep::login(key_step).is_some_and(LoginStep::asks_pin) {
+                assert_eq!(w.read(), b"\x161234");
+            }
+        }
+    };
+    match rest.as_str() {
+        "" => {
+            w.invite(0x10, &review);
+            ceremony(w, steps.len());
+            let last = steps.last().map_or(review.clone(), |&last| step(last));
+            w.invite(0x12, &last);
+            w.send(&[0x14]);
+        }
+        "changed-view" => {
+            w.send(&[0x15, 0x28]);
+        }
+        "tpm-refused" => {
+            w.send(&[0x15, 0x27, 0x02]);
+            w.hold();
+        }
+        "wrong-pin" => {
+            w.invite(0x10, &review);
+            ceremony(w, 2);
+            w.send(&[0x15, 0x01, 7]);
+        }
+        "excluded" => {
+            w.invite(0x10, &review);
+            ceremony(w, 1);
+            w.send(&[0x15, 0x11]);
+        }
+        // Kinds out of their place: the TPM's and a read's during a key's
+        // ceremony, and a key's before the review is presented.
+        "tpm-at-key" | "read-at-key" => {
+            w.invite(0x10, &review);
+            ceremony(w, 1);
+            w.send(if rest == "tpm-at-key" {
+                &[0x15, 0x27, 0x02]
+            } else {
+                &[0x15, 0x21]
+            });
+            w.hold();
+        }
+        "key-at-review" => {
+            w.send(&[0x15, 0x01, 7]);
+            w.hold();
+        }
+        // The connect step presented, then held: root takes no secret for
+        // it.
+        "hold-connect" => {
+            w.invite(0x10, &review);
+            let frame = w.frame(0x10, &step(steps[0]));
+            w.send(&frame);
+            w.hold();
+        }
+        // The second key's prove names the first key's credential.
+        "reused" => {
+            w.invite(0x10, &review);
+            ceremony(w, 7);
+            let frame = w.frame(
+                0x10,
+                &step(UpgradeStep::Key {
+                    key: 2,
+                    step: LoginStep::Prove {
+                        key: [1; 4],
+                        retries: 8,
+                    },
+                }),
+            );
+            w.send(&frame);
+            w.hold();
+        }
+        "uncertain" => {
+            w.invite(0x10, &review);
+            ceremony(w, steps.len());
+            let last = steps.last().map_or(review.clone(), |&last| step(last));
+            w.invite(0x12, &last);
+            w.send(&[0x15, 0x0e]);
+        }
+        // Out of root's order: a skipped connect, an early commit, a
+        // credential the header names, a repeat of another credential and
+        // a commit naming the review after the keys.
+        "skip" => {
+            w.invite(0x10, &review);
+            let frame = w.frame(0x10, &step(steps[1]));
+            w.send(&frame);
+            w.hold();
+        }
+        "early-commit" => {
+            w.invite(0x10, &review);
+            let frame = w.frame(0x12, &review);
+            w.send(&frame);
+            w.hold();
+        }
+        "collides" => {
+            w.invite(0x10, &review);
+            ceremony(w, 2);
+            let frame = w.frame(0x10, &step(steps[2]));
+            w.send(&frame);
+            w.hold();
+        }
+        "switched" => {
+            w.invite(0x10, &review);
+            ceremony(w, 3);
+            let frame = w.frame(
+                0x10,
+                &step(UpgradeStep::Key {
+                    key: 1,
+                    step: LoginStep::Repeat {
+                        key: [9; 4],
+                        retries: 7,
+                    },
+                }),
+            );
+            w.send(&frame);
+            w.hold();
+        }
+        "stale-commit" => {
+            w.invite(0x10, &review);
+            ceremony(w, steps.len());
+            let frame = w.frame(0x12, &review);
+            w.send(&frame);
+            w.hold();
+        }
+        _ => panic!("unknown upgrade script {script}"),
     }
 }
 
@@ -277,6 +551,9 @@ fn drive(storage: &mut Storage) -> (Event, Vec<Request>) {
                 presented.push(request);
             }
             Event::Commit(request) => storage.commit(&request).unwrap(),
+            Event::Pin(request) => {
+                assert!(storage.pin(&request, Pin::new(b"1234").unwrap()).unwrap());
+            }
             Event::Waiting => thread::sleep(Duration::from_millis(1)),
             event => return (event, presented),
         }
@@ -431,16 +708,184 @@ fn a_late_receipt_ends_the_operation_and_a_stale_one_is_dropped() {
 }
 
 #[test]
-fn only_operation_byte_one_is_a_selection_this_build_runs() {
+fn operation_bytes_one_to_three_are_the_selections_this_build_runs() {
     assert_eq!(Selection::decode(&[1]), Ok(Selection::SelectorUpdate));
-    for byte in 2..=0x0a {
+    for (shape, byte, counts) in [
+        (UpgradeShape::Tpm, 1, 0..=2),
+        (UpgradeShape::Fido2, 2, 1..=2),
+    ] {
+        for count in counts {
+            assert_eq!(
+                Selection::decode(&[2, byte, count]),
+                Ok(Selection::Upgrade { shape, count })
+            );
+        }
+    }
+    assert_eq!(Selection::decode(&[3]), Ok(Selection::UpgradeCancel));
+    for byte in 4..=0x0a {
         assert_eq!(Selection::decode(&[byte]), Ok(Selection::Later(byte)));
+        assert!(!Selection::Later(byte).runs());
         assert!(Storage::start(1000, Selection::Later(byte)).is_err());
     }
-    for bad in [&[][..], &[0], &[0x0b], &[0xff], &[1, 0]] {
+    // A shape or count outside its range, a missing operand and a
+    // trailing byte.
+    for bad in [
+        &[][..],
+        &[0],
+        &[0x0b],
+        &[0xff],
+        &[1, 0],
+        &[2],
+        &[2, 1],
+        &[2, 0, 0],
+        &[2, 3, 1],
+        &[2, 1, 3],
+        &[2, 2, 0],
+        &[2, 2, 3],
+        &[2, 1, 0, 0],
+        &[3, 0],
+    ] {
         assert!(Selection::decode(bad).is_err(), "{bad:?}");
     }
     assert!(Storage::start(1001, Selection::SelectorUpdate).is_err());
+}
+
+fn upgrading(shape: UpgradeShape, count: u8, script: &str) -> Storage {
+    Storage::scripted_as(Selection::Upgrade { shape, count }, true, script).unwrap()
+}
+
+fn detailed(kind: u8, detail: u8) -> Event {
+    Event::Ended(End {
+        uncertain: false,
+        kind,
+        detail,
+    })
+}
+
+/// Amendment 10's upgrade: the review, each key's ceremony admitted as
+/// root derives it with every PIN step's secret, the commit naming the
+/// last step, and success on a clean exit.
+#[test]
+fn an_upgrade_presents_its_review_and_each_ceremony_then_commits() {
+    for (shape, count, script) in [
+        (UpgradeShape::Tpm, 0, "upgrade-tpm-0"),
+        (UpgradeShape::Tpm, 2, "upgrade-tpm-2"),
+        (UpgradeShape::Fido2, 1, "upgrade-fido2-1"),
+        (UpgradeShape::Fido2, 2, "upgrade-fido2-2"),
+    ] {
+        let mut storage = upgrading(shape, count, script);
+        let (event, presented) = drive(&mut storage);
+        assert_eq!(event, Event::Complete, "{script}");
+        let mut expected = vec![upgrade_at(shape, count, UpgradeStep::Review)];
+        expected.extend(
+            ceremony_steps(count)
+                .into_iter()
+                .map(|step| upgrade_at(shape, count, step)),
+        );
+        assert_eq!(presented, expected, "{script}");
+        assert!(storage.child.is_none() && storage.wire.is_none());
+    }
+    // Root's ceiling is the selection's.
+    let storage = upgrading(UpgradeShape::Fido2, 2, "upgrade-fido2-2-baseline:3");
+    assert!(storage.deadline > Instant::now() + Duration::from_secs(470));
+}
+
+/// An upgrade without an enrolled login state ends as `87` before any
+/// worker starts; the baseline refuses before any description; the
+/// worker's reads and ceremonies end it definitely with their details
+/// before the commit, and anything out of root's order fails.
+#[test]
+fn an_upgrade_refuses_at_each_point_before_its_commit() {
+    let fido2 = Selection::Upgrade {
+        shape: UpgradeShape::Fido2,
+        count: 1,
+    };
+    let mut storage = Storage::scripted_as(fido2, false, "upgrade-fido2-1").unwrap();
+    assert!(storage.child.is_none() && storage.wire.is_none());
+    assert_eq!(storage.poll(), Ok(ended(false, UNENROLLED)));
+    // Each with the steps root presented before it ended.
+    for (script, end, shown) in [
+        ("upgrade-fido2-1-baseline:0", ended(false, VOLUME), 0),
+        ("upgrade-fido2-1-baseline:5", ended(false, VOLUME), 0),
+        ("upgrade-fido2-1-baseline:2", ended(false, STATE), 0),
+        ("upgrade-fido2-1-baseline:3", ended(false, STATE), 0),
+        ("upgrade-fido2-1-baseline:4", ended(false, STATE), 0),
+        ("upgrade-fido2-1-not-current", ended(false, NOT_CURRENT), 0),
+        ("upgrade-fido2-1-changed-view", ended(false, CHANGED), 0),
+        ("upgrade-fido2-1-wrong-pin", detailed(0x01, 7), 3),
+        ("upgrade-fido2-1-excluded", ended(false, 0x11), 2),
+        // The TPM's kind is the TPM shape's alone, and every kind has its
+        // place.
+        ("upgrade-fido2-1-tpm-refused", ended(false, INTERNAL), 0),
+        ("upgrade-tpm-1-tpm-at-key", ended(false, INTERNAL), 2),
+        ("upgrade-fido2-1-read-at-key", ended(false, INTERNAL), 2),
+        ("upgrade-fido2-1-key-at-review", ended(false, INTERNAL), 0),
+        ("upgrade-fido2-1-skip", ended(false, INTERNAL), 1),
+        ("upgrade-fido2-1-early-commit", ended(false, INTERNAL), 1),
+        ("upgrade-fido2-1-collides", ended(false, INTERNAL), 3),
+        ("upgrade-fido2-1-switched", ended(false, INTERNAL), 4),
+        ("upgrade-fido2-1-stale-commit", ended(false, INTERNAL), 6),
+        ("upgrade-fido2-2-reused", ended(false, INTERNAL), 8),
+    ] {
+        let mut parts = script.split('-').skip(1);
+        let shape = match parts.next() {
+            Some("tpm") => UpgradeShape::Tpm,
+            _ => UpgradeShape::Fido2,
+        };
+        let count = parts.next().unwrap().parse().unwrap();
+        let mut storage = upgrading(shape, count, script);
+        let (event, presented) = drive(&mut storage);
+        assert_eq!(event, end, "{script}");
+        assert_eq!(presented.len(), shown, "{script}");
+        assert!(storage.child.is_none(), "{script}");
+    }
+    // A secret for a step that asks none ends the operation.
+    let mut storage = upgrading(UpgradeShape::Fido2, 1, "upgrade-fido2-1-hold-connect");
+    let connect = upgrade_at(UpgradeShape::Fido2, 1, ceremony_steps(1)[0]);
+    let until = Instant::now() + Duration::from_secs(10);
+    while storage.request() != Some(&connect) || storage.phase != Phase::Running {
+        match storage.poll().unwrap() {
+            Event::Present(request) => storage.presented(&request).unwrap(),
+            Event::Waiting => thread::sleep(Duration::from_millis(1)),
+            event => panic!("unexpected {event:?}"),
+        }
+        assert!(Instant::now() < until);
+    }
+    assert!(storage.pin(&connect, Pin::new(b"1234").unwrap()).is_err());
+    assert_eq!(drive(&mut storage).0, ended(false, INTERNAL));
+    let mut storage = upgrading(UpgradeShape::Tpm, 0, "upgrade-tpm-0-tpm-refused");
+    assert_eq!(drive(&mut storage).0, detailed(0x27, 2));
+    // After root's `13` the selector update's rules.
+    let mut storage = upgrading(UpgradeShape::Tpm, 0, "upgrade-tpm-0-uncertain");
+    assert_eq!(drive(&mut storage).0, ended(true, UNCERTAIN));
+}
+
+/// Tag 18: one presentation and a commit round over an upgrading volume,
+/// `21` past U0 and a definite `28` after the commit.
+#[test]
+fn a_cancellation_takes_an_upgrading_volume_and_one_presentation() {
+    for (script, end) in [
+        ("cancel", Event::Complete),
+        ("cancel-past-u0", ended(false, STATE)),
+        ("cancel-changed", ended(false, CHANGED)),
+        ("cancel-changed-view", ended(false, CHANGED)),
+        ("cancel-changed-held", ended(false, CHANGED)),
+        // Past root's grace the open channel is an unclean end.
+        ("cancel-changed-held-long", ended(false, INTERNAL)),
+        ("cancel-esp", ended(false, INTERNAL)),
+        ("cancel-baseline:0", ended(false, VOLUME)),
+        ("cancel-baseline:5", ended(false, VOLUME)),
+        ("cancel-baseline:1", ended(false, STATE)),
+        ("cancel-baseline:3", ended(false, STATE)),
+    ] {
+        let mut storage = Storage::scripted_as(Selection::UpgradeCancel, true, script).unwrap();
+        let (event, presented) = drive(&mut storage);
+        assert_eq!(event, end, "{script}");
+        if script == "cancel" {
+            assert_eq!(presented, [cancellation()]);
+        }
+        assert!(storage.child.is_none(), "{script}");
+    }
 }
 
 /// A disk proof's baseline: the volume byte, the recovery-key marker and

@@ -669,7 +669,22 @@ fn enrollment_dispatch_reaches_the_secret_decoder() -> Result<(), String> {
             crate::storage::Selection::SelectorUpdate
         ))
     );
-    for byte in 2..=0x0a {
+    assert_eq!(
+        request(&[0x20, 2, 2, 1])?,
+        Request::Secret(crate::session::Request::Storage(
+            crate::storage::Selection::Upgrade {
+                shape: crate::consent::UpgradeShape::Fido2,
+                count: 1,
+            }
+        ))
+    );
+    assert_eq!(
+        request(&[0x20, 3])?,
+        Request::Secret(crate::session::Request::Storage(
+            crate::storage::Selection::UpgradeCancel
+        ))
+    );
+    for byte in 4..=0x0a {
         assert_eq!(
             request(&[0x20, byte])?,
             Request::Secret(crate::session::Request::Storage(
@@ -677,8 +692,8 @@ fn enrollment_dispatch_reaches_the_secret_decoder() -> Result<(), String> {
             ))
         );
     }
-    // None of these takes an operand, `20` takes exactly one, and nothing
-    // above `20` is a request.
+    // None of these takes an operand, `20` takes exactly one but for an
+    // upgrade's two, and nothing above `20` is a request.
     assert!(request(&[0x1d, 0]).is_err());
     assert!(request(&[0x1e, 0]).is_err());
     assert!(request(&[0x1f, 0]).is_err());
@@ -687,6 +702,9 @@ fn enrollment_dispatch_reaches_the_secret_decoder() -> Result<(), String> {
         &[0x20, 0],
         &[0x20, 0x0b],
         &[0x20, 1, 1],
+        &[0x20, 2, 2],
+        &[0x20, 2, 2, 0],
+        &[0x20, 3, 0],
         &[0x21],
     ] {
         assert!(request(bad).is_err(), "{bad:?}");

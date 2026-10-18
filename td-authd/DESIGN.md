@@ -2664,8 +2664,8 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
     reads `1b 0b` as a malformed selection, a protocol violation, until
     item 9 lifts both together. The upgrade and its cancellation are
     fixed by ENCRYPTION.md increment 8f's documentation commit, before
-    their code, and not yet implemented; every later operation is not
-    yet fixed.
+    their code, and implemented (`20 02`, `20 03`) behind the same
+    `OPERATIONS`; every later operation is not yet fixed.
     One fixed root `/bin/td-install storage-operation --uid 1000` child
     per operation, the storage worker (`td-install/DESIGN.md`, "Storage
     operation worker"), launched and supervised as the login worker is
@@ -2902,13 +2902,16 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
     it, after its reads, as its first `10`, which root presents (`91
     04`) and acknowledges once the compositor's receipt arrives, sent
     only after the key is typed. The worker's reads may end it first,
-    with `20`, `21`, `23`, `24` or, for the TPM shape, `27`, which root
-    forwards as it forwards a selector update's `23` and `24`. Each
+    with `20`, `21`, `23`, `24`, `28` for a header that is not the one
+    its baseline read, definite since nothing is written, or, for the
+    TPM shape, `27`, which root forwards as it forwards a selector
+    update's `23` and `24`. Each
     later step is a first enrollment's key ceremony, which the worker
     presents and root admits as `admit_login_step` admits one
     (`Request::admit_upgrade_step`: tag 17's successor rule, a created
-    fingerprint no fido2 token of the baseline names, and no credential
-    reported before prove), taking a PIN step's `1c` as a login step's.
+    fingerprint no fido2 token of the baseline names, nor an earlier new
+    key's created credential, and no credential reported before prove),
+    taking a PIN step's `1c` as a login step's.
     After the last step's acknowledgement comes the commit round, in
     which the worker writes phase 1's header commits and the selector
     (`td-install/DESIGN.md`, "Storage operation worker"). The ceiling is
@@ -2925,20 +2928,25 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
     storage worker, whose baseline must show an upgrading volume (`20`
     as above, `21` for any other state), draws the approval key and
     sends tag 18; the worker repeats it once its read of the header
-    finds the upgrade cancellable, still in state U0 (`21` otherwise, or
-    `20` for a header gone or refused), which root forwards, and the
-    presentation, receipt and commit round are the selector update's.
-    Its writes remove the `td-upgrade` token, then the pending fido2
-    tokens, each a key-less header commit. Its ceiling is 240 seconds,
-    split as the selector update's, and its outcome rules are the same.
+    finds the upgrade cancellable, still in state U0 (`21` otherwise,
+    `20` for a header gone or refused, or `28`, definite, for one that
+    is not the baseline's), which root forwards, and the presentation,
+    receipt and commit round are the selector update's. Its writes
+    remove the `td-upgrade` token, then the pending fido2 tokens, each a
+    key-less header commit. Its ceiling is 240 seconds, split as the
+    selector update's, and its outcome rules are the same.
 
     **Kinds.** An end carries the worker's `15` kind, from the storage
     worker's table in `td-install/DESIGN.md` for its own, or root's:
-    `80` cancelled, `86` above, `87` an upgrade without an enrolled login
-    state, and `08` and `10` as for a login operation. The compositor
-    accepts exactly the kinds each selection can produce where it
-    stands, as for a login operation, and anything else ends the
-    generation.
+    `80` cancelled, `86` above, `87` an upgrade without an enrolled
+    login state, and `08` and `10` as for a login operation. Root admits
+    an upgrade's and a cancellation's worker kinds only where they
+    stand: the reads' while root's description awaits the worker's first
+    `10`, a new key's while a key step is current before the commit, and
+    `0e` and `28` after it; any other ends the operation as `10`. The
+    compositor accepts exactly the kinds each selection can produce
+    where it stands, as for a login operation, and anything else ends
+    the generation.
 
     **The login state.** The `9a` answer gains one byte after the
     admission byte: `01` when root read the protected marker for this
