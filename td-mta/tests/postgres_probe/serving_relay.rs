@@ -199,6 +199,13 @@ impl Relay {
                 assert!(body.windows(8).any(|w| w == b"Subject:"));
                 if connections == 2 {
                     assert!(body.windows(5).any(|w| w == "café".as_bytes()));
+                } else {
+                    assert!(body
+                        .windows(b"multipart/mixed".len())
+                        .any(|w| w == b"multipart/mixed"));
+                    assert!(body
+                        .windows(b"\r\nAAH/\r\n".len())
+                        .any(|w| w == b"\r\nAAH/\r\n"));
                 }
                 assert!(!body.windows(4).any(|w| w == b"Bcc:"));
                 write(&mut peer, b"250 accepted\r\n");

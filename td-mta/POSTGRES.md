@@ -6232,3 +6232,51 @@ and lost COMMIT response settlement. The executable fixture uses separate
 JMAP/relay processes, cancels queued work with the relay offline and an
 active attempt before MAIL's reply, checks transport closure before another
 command, refuses accepted mail, and includes restart and account auditing.
+
+
+## 215. Structured attachment sending
+
+The live draft owner accepts td-mail's uploaded attachment descriptors and
+composes multipart/mixed with its existing text part. Each source is read
+through the verified PostgreSQL blob reader under the selected account and
+current device. An Email/submission reference or that device's unexpired
+upload lease is required. The source bytes, length and digest are checked
+before composition. Publication rechecks each source manifest and access
+under the account lock with fresh device/configuration authorization; a
+lease that expired during composition cannot authorize publication.
+
+A retained Draft includes only the composed body and bounded source manifests,
+whose IDs, lengths and digests enter the operation digest. Unknown COMMIT
+uses the existing exact draft receipt and pending owner; successful receipt
+lookup remains historical evidence, independent of later source expiry.
+The input uploads retain their ordinary lease/cleanup lifecycle. Draft
+publication creates one new composed blob, not references to mutable parts.
+
+There are at most 64 attachments, with filename/type/description byte caps
+of 255/127/1024. Header controls and MIME parameter injection are refused.
+Names use RFC 2231 UTF-8 continuations; descriptions use the shared encoded
+header writer. Ordinary payloads and message/global use the shared base64
+encoder. message/rfc822 retains identity 8bit encoding and exact bytes,
+and its enclosing multipart explicitly declares 8bit,
+requiring CRLF, no NUL, lines no longer than 998 content octets, and no
+collision with the random 128-bit enclosing boundary. It is not silently
+rewritten or base64-encoded: the message/global allowance in
+[RFC 6532 section 3.5](https://www.rfc-editor.org/rfc/rfc6532.html#section-3.5)
+does not change message/rfc822's restrictions. Other message subtypes and
+multipart attachment types are refused.
+
+One original ten-second-or-shorter request deadline covers resolution,
+source verification, composition and publication. Each body read reserves
+two foreground connection permits and prepays its bounded verification and
+replay work before I/O, including fallback addresses. Aggregate decoded
+source bytes and composed bytes each stay within the selected message
+ceiling (at most 32 MiB); raw sources are dropped before publication.
+RESOURCES.md records this additional transient memory and work admission.
+
+The native td-mail send fixture uploads binary and forwarded-message files,
+composes/sends them, reconciles a retained send without duplication, and
+compares downloaded attachment bytes and UTF-8 names. It refuses another
+device's upload and a lease expired after preparation without publishing an
+Email. The foreground-service fixture uploads through HTTPS and verifies
+binary attachment DATA at its local TLS smart host. Unit cases cover empty
+parts, invalid metadata, source-line/boundary refusals and exact output caps.

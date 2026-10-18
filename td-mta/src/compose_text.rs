@@ -1,4 +1,4 @@
-//! Plain-text RFC 5322 composition for td-mail's structured draft creation.
+//! Text and attachment RFC 5322 composition for td-mail's structured draft creation.
 //! Bytes sent to the sink are provisional: the caller owns bounded private
 //! staging, all-or-nothing publication and account/device authorization.
 use crate::{
@@ -26,6 +26,33 @@ pub struct Message<'a> {
     pub references: &'a [&'a str],
     pub sent_at_ms: i64,
     pub text: &'a str,
+}
+#[derive(Clone, Copy)]
+pub struct Attachment<'a> {
+    pub name: &'a str,
+    pub content_type: &'a str,
+    pub description: Option<&'a str>,
+    pub bytes: &'a [u8],
+}
+pub const MAX_ATTACHMENTS: usize = 64;
+
+pub(crate) fn attachment_type(value: &str) -> bool {
+    let Some((kind, subtype)) = value.split_once('/') else {
+        return false;
+    };
+    value.len() <= 127
+        && !kind.is_empty()
+        && !subtype.is_empty()
+        && kind != "*"
+        && subtype != "*"
+        && !kind.eq_ignore_ascii_case("multipart")
+        && (!kind.eq_ignore_ascii_case("message")
+            || subtype.eq_ignore_ascii_case("rfc822")
+            || subtype.eq_ignore_ascii_case("global"))
+        && kind
+            .bytes()
+            .chain(subtype.bytes())
+            .all(td_header::mime_token_octet)
 }
 struct Writer<'a, F> {
     sink: F,
@@ -188,6 +215,116 @@ impl<F: FnMut(&[u8]) -> Result<(), Error>> Writer<'_, F> {
         }
         self.emit(b"\r\n")
     }
+    fn filename(&mut self, name: &str) -> Result<(), Error> {
+        if name.is_empty() || name.len() > 255 || name.chars().any(char::is_control) {
+            return Err(Error::Invalid);
+        }
+        for (index, chunk) in name.as_bytes().chunks(15).enumerate() {
+            let now = self.tick()?;
+            self.meter
+                .charge(
+                    now,
+                    Charge {
+                        io_bytes: chunk.len() as u64,
+                        records: 1,
+                        ..Charge::default()
+                    },
+                )
+                .map_err(work_error)?;
+            let mut bytes = [0; 96];
+            let mut out = TextBuffer::new(&mut bytes);
+            out.format(format_args!(";\r\n filename*{index}*="))
+                .map_err(|_| Error::Capacity)?;
+            if index == 0 {
+                out.append("UTF-8''").map_err(|_| Error::Capacity)?;
+            }
+            for byte in chunk {
+                out.format(format_args!("%{byte:02X}"))
+                    .map_err(|_| Error::Capacity)?;
+            }
+            self.emit(out.as_bytes().map_err(|_| Error::Capacity)?)?;
+        }
+        Ok(())
+    }
+    fn octets(&mut self, source: &[u8]) -> Result<(), Error> {
+        let now = self.tick()?;
+        let mut encoder = base64_encode::Encoder::new(source.len() as u64, now, self.meter)
+            .map_err(body_error)?;
+        let mut position = 0;
+        loop {
+            let now = self.tick()?;
+            let mut output = [0; 256];
+            let step = encoder
+                .poll(
+                    source.get(position..).ok_or(Error::Invalid)?,
+                    &mut output,
+                    now,
+                    self.meter,
+                )
+                .map_err(body_error)?;
+            position += step.consumed;
+            self.emit(output.get(..step.written).ok_or(Error::Invalid)?)?;
+            if step.status == base64_encode::Status::Complete {
+                break;
+            }
+        }
+        let now = self.tick()?;
+        encoder.finish(now, self.meter).map_err(body_error)
+    }
+    fn attached_message(&mut self, source: &[u8], boundary: &str) -> Result<(), Error> {
+        // message/rfc822 keeps identity transfer encoding and exact octets.
+        // Refuse malformed wire lines or an enclosing-boundary collision.
+        let mut line = 0usize;
+        let mut cr = false;
+        for (index, chunk) in source.chunks(1024).enumerate() {
+            let now = self.tick()?;
+            self.meter
+                .charge(
+                    now,
+                    Charge {
+                        io_bytes: chunk.len() as u64 * 2,
+                        records: 1,
+                        ..Charge::default()
+                    },
+                )
+                .map_err(work_error)?;
+            for (offset, byte) in chunk.iter().copied().enumerate() {
+                if line == 0 && !cr {
+                    let start = index * 1024 + offset;
+                    let rest = source.get(start..).ok_or(Error::Invalid)?;
+                    if rest.starts_with(b"--")
+                        && rest
+                            .get(2..)
+                            .is_some_and(|v| v.starts_with(boundary.as_bytes()))
+                    {
+                        return Err(Error::Invalid);
+                    }
+                }
+                match byte {
+                    b'\n' if cr => {
+                        cr = false;
+                        line = 0;
+                    }
+                    b'\r' if !cr => cr = true,
+                    0 | b'\n' | b'\r' => return Err(Error::Invalid),
+                    _ if cr => return Err(Error::Invalid),
+                    _ => {
+                        line += 1;
+                        if line > 998 {
+                            return Err(Error::Invalid);
+                        }
+                    }
+                }
+            }
+        }
+        if cr {
+            return Err(Error::Invalid);
+        }
+        for chunk in source.chunks(1024) {
+            self.emit(chunk)?;
+        }
+        Ok(())
+    }
     fn body(&mut self, text: &str) -> Result<(), Error> {
         let mut length = 0u64;
         let mut previous_cr = false;
@@ -296,6 +433,28 @@ pub fn compose(
     meter: &mut Meter,
     sink: impl FnMut(&[u8]) -> Result<(), Error>,
 ) -> Result<u64, Error> {
+    compose_attachments(message, &[], "", maximum, clock, meter, sink)
+}
+
+pub fn compose_attachments(
+    message: &Message<'_>,
+    attachments: &[Attachment<'_>],
+    boundary: &str,
+    maximum: u64,
+    clock: &dyn Clock,
+    meter: &mut Meter,
+    sink: impl FnMut(&[u8]) -> Result<(), Error>,
+) -> Result<u64, Error> {
+    if attachments.len() > MAX_ATTACHMENTS
+        || (!attachments.is_empty()
+            && (boundary.is_empty()
+                || boundary.len() > 70
+                || !boundary
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"=_-".contains(&b))))
+    {
+        return Err(Error::Invalid);
+    }
     let last = clock.sample()?.monotonic;
     let mut writer = Writer {
         sink,
@@ -345,8 +504,54 @@ pub fn compose(
         ))
         .map_err(|_| Error::Capacity)?;
     writer.emit(output.as_bytes().map_err(|_| Error::Capacity)?)?;
-    writer.emit(b"MIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n")?;
+    writer.emit(b"MIME-Version: 1.0\r\n")?;
+    if !attachments.is_empty() {
+        writer.emit(b"Content-Type: multipart/mixed; boundary=\"")?;
+        writer.emit(boundary.as_bytes())?;
+        writer.emit(b"\"\r\n")?;
+        if attachments
+            .iter()
+            .any(|part| part.content_type.eq_ignore_ascii_case("message/rfc822"))
+        {
+            writer.emit(b"Content-Transfer-Encoding: 8bit\r\n")?;
+        }
+        writer.emit(b"\r\n--")?;
+        writer.emit(boundary.as_bytes())?;
+        writer.emit(b"\r\n")?;
+    }
+    writer.emit(
+        b"Content-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n",
+    )?;
     writer.body(message.text)?;
+    for part in attachments {
+        if !attachment_type(part.content_type) || part.description.is_some_and(|v| v.len() > 1024) {
+            return Err(Error::Invalid);
+        }
+        writer.emit(b"\r\n--")?;
+        writer.emit(boundary.as_bytes())?;
+        writer.emit(b"\r\nContent-Type: ")?;
+        writer.emit(part.content_type.as_bytes())?;
+        writer.emit(b"\r\nContent-Disposition: attachment")?;
+        writer.filename(part.name)?;
+        writer.emit(b"\r\n")?;
+        if let Some(description) = part.description {
+            writer.emit(b"Content-Description:")?;
+            writer.text(description)?;
+            writer.emit(b"\r\n")?;
+        }
+        if part.content_type.eq_ignore_ascii_case("message/rfc822") {
+            writer.emit(b"Content-Transfer-Encoding: 8bit\r\n\r\n")?;
+            writer.attached_message(part.bytes, boundary)?;
+        } else {
+            writer.emit(b"Content-Transfer-Encoding: base64\r\n\r\n")?;
+            writer.octets(part.bytes)?;
+        }
+    }
+    if !attachments.is_empty() {
+        writer.emit(b"\r\n--")?;
+        writer.emit(boundary.as_bytes())?;
+        writer.emit(b"--\r\n")?;
+    }
     writer.tick()?;
     Ok(writer.length)
 }

@@ -21,7 +21,6 @@ use std::{
     time::{Duration, Instant},
 };
 /// One active or uncertain mutation. Retain this owner across HTTP requests.
-/// Production startup/recovery wiring remains part of the backend cutover.
 #[derive(Default)]
 pub struct Pending {
     change: Mutex<Option<Draft>>,
@@ -141,9 +140,12 @@ impl Drafts<'_> {
             return Err(store(Error::Conflict));
         }
         let now = self.clock.sample().map_err(store)?.monotonic;
+        let original =
+            Deadline::after(crate::ports::Tick(0), meter.deadline().tick().0).map_err(store)?;
         let until = Deadline::after(now, 10_000)
             .map_err(store)?
-            .min(input.deadline);
+            .min(input.deadline)
+            .min(original);
         let deadline = self.clock.deadline_instant(until).map_err(store)?;
         let mut pending = self
             .pending
@@ -153,11 +155,140 @@ impl Drafts<'_> {
         if pending.is_some() {
             return Err(store(Error::Busy));
         }
-        // This owner admits only one composed or uncertain body (at most 32 MiB).
+        // One owner retains at most 32 MiB each of source and composed bytes.
         let _slot = self.slots.acquire().map_err(|_| store(Error::Busy))?;
         let parsed = draft_input::parse(input.value, self.maximum_text, self.clock, until, meter)
             .map_err(DraftError::Input)?;
-        let draft = changes::prepare_with_meter(
+        let dns_deadline = deadline.min(
+            Instant::now()
+                .checked_add(Duration::from_secs(5))
+                .ok_or_else(|| store(Error::Invalid))?,
+        );
+        let addresses = crate::postgres_resolver::resolve(
+            self.executable,
+            &self.loaded.bootstrap,
+            dns_deadline,
+        )
+        .map_err(|error| {
+            store(match error {
+                crate::postgres_resolver::Error::Deadline => Error::Deadline,
+                _ => Error::Dns,
+            })
+        })?;
+        let mut loaded_parts = Vec::new();
+        loaded_parts
+            .try_reserve_exact(parsed.attachments.len())
+            .map_err(|_| store(Error::Capacity))?;
+        let mut remaining = self.binding.upload_maximum().min(32 * 1024 * 1024) as u64;
+        for attachment in &parsed.attachments {
+            // The verified body snapshot and fresh authorization use two slots.
+            let _authorization_slot = self.slots.acquire().map_err(|_| store(Error::Busy))?;
+            let mut result = Err(crate::postgres_body::Error::Missing);
+            for address in &addresses {
+                // Prepay verification and replay before opening the body snapshot,
+                // including transport fallback and protocol overhead.
+                meter
+                    .charge(
+                        self.clock.sample().map_err(store)?.monotonic,
+                        Charge {
+                            io_bytes: 192 * 1024 + remaining * 3,
+                            records: 1024 + remaining.div_ceil(4096) * 3,
+                            ..Charge::default()
+                        },
+                    )
+                    .map_err(|stop| {
+                        store(if stop == Stop::Deadline {
+                            Error::Deadline
+                        } else {
+                            Error::Capacity
+                        })
+                    })?;
+                let mut connection = self.loaded.bootstrap.request(*address);
+                connection.mode = Mode::Runtime;
+                result = crate::postgres_body::with_blob(
+                    &connection,
+                    &self.loaded.trust,
+                    deadline,
+                    crate::postgres_body::BlobRequest {
+                        binding: self.binding,
+                        blob: attachment.blob,
+                        maximum: remaining,
+                    },
+                    self.password,
+                    |metadata, reader| {
+                        let length =
+                            usize::try_from(metadata.body.length).map_err(|_| Error::Capacity)?;
+                        let mut bytes = Vec::new();
+                        bytes
+                            .try_reserve_exact(length)
+                            .map_err(|_| Error::Capacity)?;
+                        bytes.resize(length, 0);
+                        let mut offset = 0;
+                        while offset < length {
+                            if Instant::now() >= deadline {
+                                return Err(Error::Deadline);
+                            }
+                            let end = offset.saturating_add(4096).min(length);
+                            let output = bytes.get_mut(offset..end).ok_or(Error::Invalid)?;
+                            let n = reader.read_at(offset as u64, output)?;
+                            if n == 0 || n > output.len() {
+                                return Err(Error::Corrupt);
+                            }
+                            offset += n;
+                        }
+                        Ok((
+                            changes::AttachmentSource {
+                                blob: attachment.blob,
+                                length: metadata.body.length,
+                                digest: metadata.body.digest,
+                            },
+                            bytes,
+                        ))
+                    },
+                );
+                if !matches!(
+                    result,
+                    Err(crate::postgres_body::Error::Connection(
+                        postgres_probe::Error::Transport
+                    ))
+                ) {
+                    break;
+                }
+            }
+            let (source, bytes) = result.map_err(|error| match error {
+                crate::postgres_body::Error::Missing => {
+                    DraftError::Input(draft_input::Error::Property("attachments"))
+                }
+                crate::postgres_body::Error::Unauthenticated
+                | crate::postgres_body::Error::Policy => store(Error::Forbidden),
+                crate::postgres_body::Error::Capacity => store(Error::Capacity),
+                crate::postgres_body::Error::Connection(postgres_probe::Error::Deadline) => {
+                    store(Error::Deadline)
+                }
+                crate::postgres_body::Error::Read(error) => store(error),
+                _ => store(Error::Corrupt),
+            })?;
+            remaining = remaining
+                .checked_sub(source.length)
+                .ok_or_else(|| store(Error::Capacity))?;
+            loaded_parts.push((source, bytes));
+        }
+        let mut parts = Vec::new();
+        parts
+            .try_reserve_exact(loaded_parts.len())
+            .map_err(|_| store(Error::Capacity))?;
+        for (attachment, (source, bytes)) in parsed.attachments.iter().zip(&loaded_parts) {
+            parts.push(changes::Attachment {
+                source: *source,
+                part: crate::compose_text::Attachment {
+                    name: attachment.name,
+                    content_type: attachment.content_type,
+                    description: attachment.description,
+                    bytes,
+                },
+            });
+        }
+        let draft = changes::prepare_with_attachments(
             changes::DraftRequest {
                 binding: self.binding,
                 device: input.device,
@@ -165,6 +296,7 @@ impl Drafts<'_> {
                 expected: input.expected.map(|(_, sequence)| sequence.number()),
             },
             &parsed.message(),
+            &parts,
             deadline,
             meter,
             self.clock,
@@ -185,22 +317,8 @@ impl Drafts<'_> {
                     _ => Error::Capacity,
                 })
             })?;
-        let dns_deadline = deadline.min(
-            Instant::now()
-                .checked_add(Duration::from_secs(5))
-                .ok_or_else(|| store(Error::Invalid))?,
-        );
-        let addresses = crate::postgres_resolver::resolve(
-            self.executable,
-            &self.loaded.bootstrap,
-            dns_deadline,
-        )
-        .map_err(|error| {
-            store(match error {
-                crate::postgres_resolver::Error::Deadline => Error::Deadline,
-                _ => Error::Dns,
-            })
-        })?;
+        drop(parts);
+        drop(loaded_parts);
         let before_epoch = self.binding.epoch();
         let email = draft.email();
         let blob = draft.blob();
@@ -254,7 +372,13 @@ impl Drafts<'_> {
             }),
             Err(error) => {
                 *pending = None;
-                Err(store(map_error(error)))
+                if error == changes::Error::MissingAttachment {
+                    Err(DraftError::Input(draft_input::Error::Property(
+                        "attachments",
+                    )))
+                } else {
+                    Err(store(map_error(error)))
+                }
             }
         }
     }

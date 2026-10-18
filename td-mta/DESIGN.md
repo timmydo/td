@@ -11,7 +11,8 @@ flows from named database profiles. It retains fixed transport workers,
 bounded requests, database snapshots and verified immutable body readers.
 Relay profiles run a PostgreSQL route worker; JMAP profiles accept submission
 and cancellation, including when the relay runs in a separate process.
-Terminal delivery failures produce local Inbox notices with retained replies
+Structured drafts support text with uploaded attachments, including forwarded
+messages. Terminal delivery failures produce local Inbox notices with retained replies
 and explicit uncertainty, without outbound bounces.
 [CONFIG.md](CONFIG.md) describes startup; [CONFORMANCE.md](CONFORMANCE.md)
 states supported client flows and qualification limits. The v1 release still

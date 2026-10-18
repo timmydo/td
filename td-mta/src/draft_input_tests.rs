@@ -382,3 +382,60 @@ fn caller_guards_and_mailbox_id_kind_are_checked() {
         });
     }
 }
+
+#[test]
+fn attachment_descriptors_are_bounded_and_require_local_uploaded_blobs() {
+    let descriptor = r#"{"blobId":"b03030303030303030303030303030303","name":"résumé.bin","type":"application/octet-stream","disposition":"attachment","header:Content-Description:asText":"A file"}"#;
+    for count in [1, 64, 65] {
+        let text = format!(
+            "{},\"attachments\":[{}]}}",
+            BASE.strip_suffix('}').unwrap(),
+            vec![descriptor; count].join(",")
+        );
+        with_value(&text, |value| {
+            let result = parse(
+                value,
+                text.len(),
+                &Now(AtomicU64::new(1)),
+                deadline(),
+                &mut meter(),
+            );
+            if count <= 64 {
+                let draft = result.unwrap();
+                assert_eq!(draft.attachments.len(), count);
+                assert_eq!(draft.attachments[0].name, "résumé.bin");
+                assert_eq!(draft.attachments[0].blob, BlobId::from_bytes([3; 16]));
+            } else {
+                assert!(matches!(result, Err(Error::Property("attachments"))));
+            }
+        });
+    }
+    for (old, new) in [
+        (
+            "b03030303030303030303030303030303",
+            "e03030303030303030303030303030303",
+        ),
+        ("application/octet-stream", "multipart/mixed"),
+        ("attachment", "inline"),
+        ("résumé.bin", ""),
+        ("résumé.bin", r"bad\nname"),
+    ] {
+        let text = format!(
+            "{},\"attachments\":[{}]}}",
+            BASE.strip_suffix('}').unwrap(),
+            descriptor.replace(old, new)
+        );
+        with_value(&text, |value| {
+            assert!(matches!(
+                parse(
+                    value,
+                    text.len(),
+                    &Now(AtomicU64::new(1)),
+                    deadline(),
+                    &mut meter()
+                ),
+                Err(Error::Property("attachments"))
+            ))
+        });
+    }
+}

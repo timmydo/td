@@ -157,10 +157,29 @@ pub(super) fn exercise(
     let identity = td_mta::ids::IdentityId::parse("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
     let mut identity_bytes = [0; td_mta::wire::IdKind::WIRE_BYTES];
     let identity = td_mta::wire::encode_id(identity, &mut identity_bytes).unwrap();
+    // Exercise live upload, structured composition and later SMTP delivery.
+    let attachment_blob = {
+        let (mut tls, _) = super::smtp_transport::upgrade_protocol(
+            TcpStream::connect(https_address).unwrap(),
+            Arc::new(td_mta::clock::RuntimeClock::new()),
+            &fixture.ca,
+            td_crypto::TlsProtocol::Http1,
+        );
+        write!(tls, "POST /jmap/upload/{account_wire} HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: Basic {}\r\nContent-Type: application/octet-stream\r\nContent-Length: 3\r\nConnection: close\r\n\r\n", https_address.port(), encoded).unwrap();
+        tls.write_all(&[0, 1, 255]).unwrap();
+        tls.flush().unwrap();
+        let mut reply = String::new();
+        tls.read_to_string(&mut reply).unwrap();
+        assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+        td_json::parse(reply.split_once("\r\n\r\n").unwrap().1).unwrap()["blobId"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
     let enqueue = || {
         let body=td_json::json!({"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail","urn:ietf:params:jmap:submission"],"methodCalls":[
             ["Email/set",{"accountId":account_wire,"create":{"draft":{
-                "mailboxIds":{mailbox.as_str():true},"keywords":{"$draft":true,"$seen":true},"from":[{"email":"main@example.test"}],"to":[{"email":"recipient@example.test"}],"subject":"Executable relay","messageId":["relay@example.test"],"sentAt":"2026-10-13T12:00:59Z","textBody":[{"partId":"text","type":"text/plain"}],"bodyValues":{"text":{"value":"Sent by the executable.","isEncodingProblem":false,"isTruncated":false}}
+                "mailboxIds":{mailbox.as_str():true},"keywords":{"$draft":true,"$seen":true},"from":[{"email":"main@example.test"}],"to":[{"email":"recipient@example.test"}],"attachments":[{"blobId":attachment_blob.as_str(),"name":"bytes.bin","type":"application/octet-stream","disposition":"attachment"}],"subject":"Executable relay","messageId":["relay@example.test"],"sentAt":"2026-10-13T12:00:59Z","textBody":[{"partId":"text","type":"text/plain"}],"bodyValues":{"text":{"value":"Sent by the executable.","isEncodingProblem":false,"isTruncated":false}}
             }}},"0"],
             ["EmailSubmission/set",{"accountId":account_wire,"create":{"submission":{"emailId":"#draft","identityId":identity}}},"1"]
         ]}).to_string();

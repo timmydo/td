@@ -299,7 +299,7 @@ pub(super) fn exercise(
             let connected = client.ask(json!({"command":"connect", "account":"test"}));
             assert!(connected["ok"].is_true(), "{connected}");
             if sending {
-                exercise_send(&mut client, fixture, binding, &runtime);
+                exercise_send(&mut client, fixture, binding, &runtime, device.device_id(), device.password());
                 drop(client);
                 drop(stop);
                 worker.join().unwrap().unwrap();
@@ -625,12 +625,20 @@ fn exercise_send(
     fixture: &Fixture,
     binding: &Binding,
     runtime: &std::path::Path,
+    device: td_mta::ids::DeviceId,
+    password: &[u8],
 ) {
     let drafts = runtime.join("drafts");
     fs::create_dir(&drafts).unwrap();
     fs::set_permissions(&drafts, fs::Permissions::from_mode(0o700)).unwrap();
     let path = drafts.join("td-mail-draft-1-2.eml");
-    fs::write(&path, "From: main@example.test\nTo: recipient@example.test\nSubject: Real PostgreSQL send\n\nHello from td-mail through PostgreSQL.\n").unwrap();
+    let binary = drafts.join("résumé.bin");
+    let forwarded = drafts.join("forwarded.eml");
+    let forwarded_bytes =
+        "From: sender@example.test\r\nSubject: Original\r\nContent-Transfer-Encoding: 8bit\r\n\r\nForwarded café exact bytes.\r\n".as_bytes();
+    fs::write(&binary, [0, 1, 255]).unwrap();
+    fs::write(&forwarded, forwarded_bytes).unwrap();
+    fs::write(&path, format!("From: main@example.test\nTo: recipient@example.test\nSubject: Real PostgreSQL send\n--text follows this line--\n\nHello from td-mail through PostgreSQL.\n<#part type=\"application/octet-stream\" filename=\"{}\" disposition=\"attachment\" description=\"Pièce jointe\">\n<#/part>\n<#part type=\"message/rfc822\" filename=\"{}\" disposition=\"attachment\">\n<#/part>\n", binary.display(), forwarded.display())).unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
     // Keep a successful draft locally once, then exercise td-mail's retained
     // send record and server reconciliation instead of publishing it twice.
@@ -690,4 +698,118 @@ fn exercise_send(
         .as_str()
         .unwrap()
         .contains("Hello from td-mail through PostgreSQL."));
+    let attachments = stored["attachments"].as_array().unwrap();
+    assert_eq!(attachments.len(), 2, "{stored}");
+    for (attachment, name, expected) in [
+        (&attachments[0], "résumé.bin", &[0, 1, 255][..]),
+        (&attachments[1], "forwarded.eml", forwarded_bytes),
+    ] {
+        assert_eq!(attachment["name"].as_str(), Some(name), "{attachment}");
+        let download = client.ask(
+            json!({"command":"download_attachment", "blob_id":attachment["blob_id"], "name":name}),
+        );
+        assert!(download["ok"].is_true(), "{download}");
+        assert_eq!(
+            fs::read(download["path"].as_str().unwrap()).unwrap(),
+            expected
+        );
+    }
+    // Composition must not turn an expired or another device's upload lease
+    // into an account-visible Email, even after bytes were prepared.
+    use td_crypto::{Crypto, Digest};
+    use td_mta::{
+        compose_text::{Address, Message},
+        postgres_drafts as drafts_api,
+    };
+    let source = td_mta::ids::BlobId::parse(&sql(fixture,"SELECT encode(b.id,'hex') FROM td_mta.blobs b JOIN td_mta.leases l ON l.blob_id=b.id AND l.account=b.account WHERE b.length=3")).unwrap();
+    let mut hash = td_crypto::Provider.sha256().unwrap();
+    hash.update(&[0, 1, 255]).unwrap();
+    let attachment = drafts_api::Attachment {
+        source: drafts_api::AttachmentSource {
+            blob: source,
+            length: 3,
+            digest: hash.finish().unwrap(),
+        },
+        part: td_mta::compose_text::Attachment {
+            name: "copy.bin",
+            content_type: "application/octet-stream",
+            description: None,
+            bytes: &[0, 1, 255],
+        },
+    };
+    let mailbox = td_mta::wire::Id::parse(mailbox).unwrap().local().unwrap();
+    let message = Message {
+        from: Address {
+            name: "",
+            email: "main@example.test",
+        },
+        to: &[],
+        cc: &[],
+        bcc: &[],
+        reply_to: &[],
+        subject: "lease refusal",
+        message_id: "refused@example.test",
+        in_reply_to: &[],
+        references: &[],
+        sent_at_ms: 0,
+        text: "body",
+    };
+    let clock = td_mta::clock::RuntimeClock::new();
+    let make = |device| {
+        let until = Deadline::after(clock.sample().unwrap().monotonic, 10_000).unwrap();
+        let mut meter = td_mta::admission::work::Meter::new(
+            until,
+            td_mta::admission::work::Charge {
+                io_bytes: 1_000_000,
+                output_bytes: 1_000_000,
+                records: 100_000,
+                unlinks: 0,
+            },
+        );
+        drafts_api::prepare_with_attachments(
+            drafts_api::DraftRequest {
+                binding,
+                device,
+                mailbox,
+                expected: None,
+            },
+            &message,
+            std::slice::from_ref(&attachment),
+            deadline(),
+            &mut meter,
+            &clock,
+        )
+        .unwrap()
+    };
+    let trust = td_crypto::TrustStore::from_pem(&fixture.ca).unwrap();
+    let other = td_mta::postgres_devices::prepare_creation(
+        binding.epoch(),
+        binding.account(),
+        "other attachment device",
+        2,
+    )
+    .unwrap();
+    td_mta::postgres_devices::publish_creation(&fixture.request(), &trust, deadline(), &other)
+        .unwrap();
+    let before = sql(fixture, "SELECT count(*) FROM td_mta.emails");
+    assert_eq!(
+        drafts_api::publish(
+            &fixture.request(),
+            &trust,
+            deadline(),
+            &make(other.device_id()),
+            other.password()
+        ),
+        Err(drafts_api::Error::MissingAttachment)
+    );
+    let prepared = make(device);
+    sql(
+        fixture,
+        &format!("UPDATE td_mta.leases SET expires_at=1 WHERE blob_id=decode('{source}','hex')"),
+    );
+    assert_eq!(
+        drafts_api::publish(&fixture.request(), &trust, deadline(), &prepared, password),
+        Err(drafts_api::Error::MissingAttachment)
+    );
+    assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), before);
 }

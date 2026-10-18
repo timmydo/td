@@ -4441,3 +4441,27 @@ at most one turn every five seconds. POSTGRES.md section 213 records its
 separate aggregate database framing and composition work ceilings. The
 shared account body/blob quotas include generated notices. Failure retains
 only the database Pending marker; no unbounded local retry queue is added.
+
+
+## PostgreSQL attachment composition
+
+The single HTTP draft owner additionally retains at most 64 source
+manifests/descriptors and an aggregate 32 MiB of verified raw attachments,
+bounded further by the profile's message ceiling. Composition retains at
+most another 32 MiB of message bytes; the existing growable composed buffer
+may reserve capacity above its current length. Raw sources are released
+before database publication or uncertain-draft retention. Each source read
+reserves two ordinary database slots for its verified snapshot and fresh
+primary authorization; the existing bounded body cache/protocol buffers
+remain additional. No new thread, unbounded queue or connection pool is added.
+
+All reads share the original request meter and ten-second-or-shorter deadline.
+Before each source/address attempt the owner prepays 192 KiB plus three times
+the remaining aggregate source allowance in I/O, and 1024 plus three times
+ceil(remaining/4096) records. This conservative charge covers verification,
+replay and framing even on fallback. Composition and source/body digests
+charge the same meter separately. Refusal discards provisional bytes; the
+existing pending owner retains only the prepared message/manifests after an
+unknown COMMIT. Filename, media type and description limits are 255, 127 and
+1024 bytes per part; composition uses fixed encoder/header scratch. This is
+a finite memory/work bound, not maximum-size throughput qualification.

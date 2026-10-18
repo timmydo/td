@@ -357,3 +357,164 @@ fn date_year_edges_match_the_declared_range() {
         }
     }
 }
+
+fn render_parts(parts: &[Attachment<'_>], maximum: u64) -> Result<Vec<u8>, Error> {
+    let mut output = Vec::new();
+    compose_attachments(
+        &message("body\n"),
+        parts,
+        "=_fixture",
+        maximum,
+        &TestClock(AtomicU64::new(0)),
+        &mut meter(),
+        |bytes| {
+            output.extend_from_slice(bytes);
+            Ok(())
+        },
+    )?;
+    Ok(output)
+}
+#[test]
+fn binary_and_forwarded_parts_preserve_octets_and_structure() {
+    let forwarded = "From: a@example.test\r\nSubject: forwarded\r\nContent-Transfer-Encoding: 8bit\r\n\r\ncafé exact body\r\n".as_bytes();
+    let parts = [
+        Attachment {
+            name: "résumé.bin",
+            content_type: "application/octet-stream",
+            description: Some("Pièce jointe"),
+            bytes: &[0, 1, 255],
+        },
+        Attachment {
+            name: "empty.txt",
+            content_type: "text/plain",
+            description: None,
+            bytes: b"",
+        },
+        Attachment {
+            name: "forwarded.eml",
+            content_type: "message/rfc822",
+            description: None,
+            bytes: forwarded,
+        },
+    ];
+    let wire = render_parts(&parts, 10000).unwrap();
+    let mut backing = [td_mime::structure::Part::default(); 16];
+    let mut work = meter();
+    let mut budget = td_mime::nfc::HeaderBudget::new();
+    let mut cursor = td_mime::structure::Cursor::new(
+        &wire,
+        0,
+        td_mime::header_select::SourceEnd::Eof,
+        td_mime::structure::Limits::default(),
+        &mut backing,
+        &mut work,
+        &mut budget,
+    )
+    .unwrap();
+    while cursor.poll(Tick(1)).unwrap() != td_mime::structure::Status::Complete {}
+    let parsed = cursor.parts().unwrap().unwrap();
+    assert!(parsed.iter().all(|part| part.problems() == 0));
+    assert_eq!(parsed[0].media, td_mime::structure::Media::Multipart);
+    let leaves: Vec<_> = parsed
+        .iter()
+        .filter(|part| part.parent == parsed[0].ordinal && part.ordinal != parsed[0].ordinal)
+        .collect();
+    assert_eq!(leaves.len(), 4);
+    for (part, expected) in leaves
+        .iter()
+        .skip(1)
+        .zip([&[0, 1, 255][..], &b""[..], forwarded])
+    {
+        let body = &wire[part.body_start as usize..part.entity_end as usize];
+        if part.encoding == td_mime::structure::Encoding::Base64 {
+            let mut framed = b"\r\n\r\n".to_vec();
+            framed.extend_from_slice(body);
+            assert_eq!(decode_body(&framed), expected);
+        } else {
+            assert_eq!(body, expected);
+        }
+    }
+    let text = String::from_utf8(wire.clone()).unwrap();
+    assert!(text
+        .split_once("\r\n\r\n")
+        .unwrap()
+        .0
+        .contains("Content-Transfer-Encoding: 8bit"));
+    assert!(text.contains("filename*0*=UTF-8''%72%C3%A9%73%75%6D%C3%A9%2E%62%69%6E"));
+    assert!(text.contains("Content-Description:\r\n =?UTF-8?B?"));
+    assert_eq!(render_parts(&parts, wire.len() as u64).unwrap(), wire);
+    assert_eq!(
+        render_parts(&parts, wire.len() as u64 - 1),
+        Err(Error::Quota)
+    );
+}
+#[test]
+fn attachments_refuse_unsafe_metadata_wire_lines_and_boundaries() {
+    let part = Attachment {
+        name: "file",
+        content_type: "application/octet-stream",
+        description: None,
+        bytes: b"data",
+    };
+    for content_type in [
+        "text/plain; charset=x",
+        "text/\r\nInjected: x",
+        "multipart/mixed",
+        "message/partial",
+        "*/*",
+        "no-slash",
+    ] {
+        assert_eq!(
+            render_parts(
+                &[Attachment {
+                    content_type,
+                    ..part
+                }],
+                10000
+            ),
+            Err(Error::Invalid)
+        );
+    }
+    for name in ["", "line\nname", "nul\0name", &"x".repeat(256)] {
+        assert_eq!(
+            render_parts(&[Attachment { name, ..part }], 10000),
+            Err(Error::Invalid)
+        );
+    }
+    for description in ["injected\r\nHeader: x", &"x".repeat(1025)] {
+        assert_eq!(
+            render_parts(
+                &[Attachment {
+                    description: Some(description),
+                    ..part
+                }],
+                10000
+            ),
+            Err(Error::Invalid)
+        );
+    }
+    for bytes in [
+        &b"bare\nline"[..],
+        b"bare\rline",
+        b"nul\0",
+        b"--=_fixture\r\n",
+        b"ends\r",
+        &vec![b'a'; 999],
+    ] {
+        assert_eq!(
+            render_parts(
+                &[Attachment {
+                    content_type: "message/rfc822",
+                    bytes,
+                    ..part
+                }],
+                10000
+            ),
+            Err(Error::Invalid)
+        );
+    }
+    assert_eq!(
+        render_parts(&vec![part; MAX_ATTACHMENTS + 1], 100000),
+        Err(Error::Invalid)
+    );
+}

@@ -1,4 +1,4 @@
-//! Retained plain-text draft creation for td-mail; no submission authority.
+//! Retained MIME draft creation for td-mail; no submission authority.
 use crate::{
     admission::work::{Charge, Meter},
     clock::RuntimeClock,
@@ -39,11 +39,22 @@ pub enum Error {
     Conflict,
     State,
     MissingMailbox,
+    MissingAttachment,
     Crypto,
     Database,
     Indeterminate,
 }
 
+#[derive(Clone, Copy)]
+pub struct AttachmentSource {
+    pub blob: BlobId,
+    pub length: u64,
+    pub digest: [u8; 32],
+}
+pub struct Attachment<'a> {
+    pub source: AttachmentSource,
+    pub part: compose_text::Attachment<'a>,
+}
 pub struct DraftRequest<'a> {
     pub binding: &'a Binding,
     pub device: DeviceId,
@@ -79,6 +90,7 @@ pub struct Draft {
     request_digest: [u8; 32],
     message_id: String,
     anchors: Vec<String>,
+    sources: Vec<AttachmentSource>,
 }
 impl Draft {
     pub fn operation(&self) -> DraftOperationId {
@@ -193,19 +205,76 @@ pub fn prepare_with_meter(
     meter: &mut Meter,
     clock: &RuntimeClock,
 ) -> Result<Draft, Error> {
+    prepare_with_attachments(request, message, &[], deadline, meter, clock)
+}
+
+pub fn prepare_with_attachments(
+    request: DraftRequest<'_>,
+    message: &Message<'_>,
+    attachments: &[Attachment<'_>],
+    deadline: Instant,
+    meter: &mut Meter,
+    clock: &RuntimeClock,
+) -> Result<Draft, Error> {
     preparation_time(request.binding, message, deadline)?;
     let binding = request.binding;
     let maximum = binding.upload_maximum().min(32 * 1024 * 1024);
     let clock = PreparationClock { clock, deadline };
     charge(&clock, meter, 0)?;
+    if attachments.len() > compose_text::MAX_ATTACHMENTS {
+        return Err(Error::Capacity);
+    }
+    let mut sources = Vec::new();
+    let mut parts = Vec::new();
+    sources
+        .try_reserve_exact(attachments.len())
+        .map_err(|_| Error::Capacity)?;
+    parts
+        .try_reserve_exact(attachments.len())
+        .map_err(|_| Error::Capacity)?;
+    let mut decoded = 0u64;
+    for attachment in attachments {
+        charge(&clock, meter, 0)?;
+        if attachment.source.length != attachment.part.bytes.len() as u64 {
+            return Err(Error::Integrity);
+        }
+        decoded = decoded
+            .checked_add(attachment.source.length)
+            .filter(|n| *n <= maximum as u64)
+            .ok_or(Error::Capacity)?;
+        let mut source_hash = Provider.sha256().map_err(|_| Error::Crypto)?;
+        for chunk in attachment.part.bytes.chunks(publication::CHUNK) {
+            charge(&clock, meter, chunk.len())?;
+            source_hash.update(chunk).map_err(|_| Error::Crypto)?;
+        }
+        if source_hash.finish().map_err(|_| Error::Crypto)? != attachment.source.digest {
+            return Err(Error::Integrity);
+        }
+        sources.push(attachment.source);
+        parts.push(attachment.part);
+    }
+    let mut random = [0; 16];
+    SystemEntropy::try_new()
+        .map_err(|_| Error::Crypto)?
+        .fill(&mut random)
+        .map_err(|_| Error::Crypto)?;
+    let boundary = format!("=_td_mta_{}", BlobId::from_bytes(random));
     let mut bytes = Vec::new();
-    let length = compose_text::compose(message, maximum as u64, &clock, meter, |part| {
-        bytes
-            .try_reserve(part.len())
-            .map_err(|_| ports::Error::Capacity)?;
-        bytes.extend_from_slice(part);
-        Ok(())
-    })
+    let length = compose_text::compose_attachments(
+        message,
+        &parts,
+        &boundary,
+        maximum as u64,
+        &clock,
+        meter,
+        |part| {
+            bytes
+                .try_reserve(part.len())
+                .map_err(|_| ports::Error::Capacity)?;
+            bytes.extend_from_slice(part);
+            Ok(())
+        },
+    )
     .map_err(Error::Compose)?;
     if length != bytes.len() as u64 {
         return Err(Error::Integrity);
@@ -261,6 +330,14 @@ pub fn prepare_with_meter(
         charge(&clock, meter, part.len())?;
         hash.update(part).map_err(|_| Error::Crypto)?;
     }
+    for source in &sources {
+        charge(&clock, meter, 56)?;
+        hash.update(source.blob.as_bytes())
+            .map_err(|_| Error::Crypto)?;
+        hash.update(&source.length.to_be_bytes())
+            .map_err(|_| Error::Crypto)?;
+        hash.update(&source.digest).map_err(|_| Error::Crypto)?;
+    }
     let request_digest = hash.finish().map_err(|_| Error::Crypto)?;
     if Instant::now() >= deadline {
         return Err(Error::Connection(postgres_probe::Error::Deadline));
@@ -280,6 +357,7 @@ pub fn prepare_with_meter(
         request_digest,
         message_id: copy(message.message_id)?,
         anchors,
+        sources,
     })
 }
 
@@ -421,6 +499,22 @@ pub fn publish(
             }
             if draft.expected.is_some_and(|expected| expected != old) {
                 return Err(Error::State);
+            }
+            for source in &draft.sources {
+                if Instant::now() >= deadline {
+                    return Err(Error::Connection(postgres_probe::Error::Deadline));
+                }
+                let rows = client.query("SELECT b.length,b.digest,EXISTS(SELECT 1 FROM td_mta.emails e WHERE e.account=b.account AND e.blob_id=b.id) OR EXISTS(SELECT 1 FROM td_mta.submissions s WHERE s.account=b.account AND s.transmitted_blob_id=b.id) OR EXISTS(SELECT 1 FROM td_mta.leases l WHERE l.account=b.account AND l.blob_id=b.id AND l.device_id=$3 AND l.expires_at>(extract(epoch FROM clock_timestamp())*1000)::bigint) FROM td_mta.blobs b WHERE b.account=$1 AND b.id=$2", &[&account,&source.blob.as_bytes().as_slice(),&draft.device.as_bytes().as_slice()]).await.map_err(|_| Error::Database)?;
+                let row = rows.first().ok_or(Error::MissingAttachment)?;
+                let length: i64 = row.try_get(0).map_err(|_| Error::Integrity)?;
+                let digest: &[u8] = row.try_get(1).map_err(|_| Error::Integrity)?;
+                let authorized: bool = row.try_get(2).map_err(|_| Error::Integrity)?;
+                if !authorized {
+                    return Err(Error::MissingAttachment);
+                }
+                if u64::try_from(length).ok() != Some(source.length) || digest != source.digest {
+                    return Err(Error::Integrity);
+                }
             }
             let next = crate::postgres_sequence::next(client, account, old)
                 .await

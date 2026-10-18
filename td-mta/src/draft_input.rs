@@ -2,7 +2,7 @@
 use crate::{
     admission::work::{Charge, Meter, Stop},
     compose_text::{Address, Message},
-    ids::MailboxId,
+    ids::{BlobId, MailboxId},
     ports::{Clock, Deadline, Tick},
     wire,
 };
@@ -27,6 +27,7 @@ impl std::error::Error for Error {}
 /// and identifier descriptors. This is passive input, never write authority.
 pub struct Draft<'a> {
     pub mailbox: MailboxId,
+    pub attachments: Vec<Attachment<'a>>,
     from: Address<'a>,
     to: Vec<Address<'a>>,
     cc: Vec<Address<'a>>,
@@ -38,6 +39,12 @@ pub struct Draft<'a> {
     references: Vec<&'a str>,
     sent_at_ms: i64,
     text: &'a str,
+}
+pub struct Attachment<'a> {
+    pub blob: BlobId,
+    pub name: &'a str,
+    pub content_type: &'a str,
+    pub description: Option<&'a str>,
 }
 impl Draft<'_> {
     pub fn message(&self) -> Message<'_> {
@@ -100,6 +107,53 @@ impl Work<'_> {
         let text = std::str::from_utf8(bytes).map_err(|_| Error::Property(field))?;
         self.charge(0)?;
         Ok(text)
+    }
+    fn attachments<'a>(&mut self, value: Value<'a>) -> Result<Vec<Attachment<'a>>, Error> {
+        let parts = value
+            .as_array()
+            .filter(|v| v.len() <= crate::compose_text::MAX_ATTACHMENTS)
+            .ok_or(Error::Property("attachments"))?;
+        let mut result = Vec::new();
+        result
+            .try_reserve_exact(parts.len())
+            .map_err(|_| Error::Capacity)?;
+        for part in parts {
+            self.charge(0)?;
+            let mut fields = part.as_object().ok_or(Error::Property("attachments"))?;
+            let (mut blob, mut name, mut kind, mut disposition, mut description) =
+                (None, None, None, false, None);
+            while let Some((key, value)) = fields.next_bytes() {
+                let text = self.string(value, "attachments")?;
+                match key {
+                    b"blobId" => blob = wire::Id::parse(text).ok().and_then(|v| v.local()),
+                    b"name" => name = Some(text),
+                    b"type" => kind = Some(text),
+                    b"disposition" => disposition = text == "attachment",
+                    b"header:Content-Description:asText"
+                        if text.len() <= 1024 && !text.chars().any(char::is_control) =>
+                    {
+                        description = Some(text)
+                    }
+                    _ => return Err(Error::Property("attachments")),
+                }
+            }
+            let name = name
+                .filter(|s| !s.is_empty() && s.len() <= 255 && !s.chars().any(char::is_control))
+                .ok_or(Error::Property("attachments"))?;
+            let content_type = kind
+                .filter(|s| crate::compose_text::attachment_type(s))
+                .ok_or(Error::Property("attachments"))?;
+            if !disposition {
+                return Err(Error::Property("attachments"));
+            }
+            result.push(Attachment {
+                blob: blob.ok_or(Error::Property("attachments"))?,
+                name,
+                content_type,
+                description,
+            });
+        }
+        Ok(result)
     }
     fn addresses<'a>(
         &mut self,
@@ -269,6 +323,7 @@ pub fn parse<'a>(
     let (mut mailbox, mut from, mut subject, mut message_id, mut date, mut text) =
         (None, None, None, None, None, None);
     let (mut keywords, mut text_part) = (false, false);
+    let mut attachments = Vec::new();
     let (mut to, mut cc, mut bcc, mut reply_to, mut in_reply_to, mut references) = (
         Vec::new(),
         Vec::new(),
@@ -331,8 +386,7 @@ pub fn parse<'a>(
                 text_part = true;
             }
             b"bodyValues" => text = Some(work.text(value)?),
-            b"attachments" if value.as_array().is_some_and(|v| v.len() == 0) => (),
-            b"attachments" => return Err(Error::Property("attachments")),
+            b"attachments" => attachments = work.attachments(value)?,
             b"htmlBody" => return Err(Error::Property("htmlBody")),
             b"preview" => return Err(Error::Property("preview")),
             _ => return Err(Error::Property("create")),
@@ -346,6 +400,7 @@ pub fn parse<'a>(
     }
     work.charge(0)?;
     Ok(Draft {
+        attachments,
         mailbox: mailbox.ok_or(Error::Property("mailboxIds"))?,
         from: from.ok_or(Error::Property("from"))?,
         to,

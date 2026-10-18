@@ -19,7 +19,8 @@ Authenticated
 Session discovery, bounded Core and Mail read batches, upload/download, the
 single-account Blob/copy outcome and PushSubscription policy are active.
 Email/set read/unread, star patches and single-destination mailbox replacement
-and permanent deletion are active; structured creation remains absent. The native td-mail fixture sets and clears
+and permanent deletion are active. Structured text/attachment creation and
+Submission are active for the supported sending flow described below. The native td-mail fixture sets and clears
 both flags over HTTPS and checks persisted keyword rows after each result.
 It creates archive/trash folders through td-mail, refuses a duplicate name,
 then archives, trashes and restores messages using those returned folders,
@@ -28,7 +29,7 @@ leave queued moves unapplied; restarting td-mail with replacement credentials
 replays its durable flag and archive intentions. The creation profile is
 name-only root folders; hierarchy, rename and deletion remain absent.
 EventSource emits pings only; Mail StateChange integration remains absent and
-is not used by td-mail. Submission remains unadvertised. Activation follows
+is not used by td-mail. Activation follows
 the supported td-mail workflow tests, not every reference-table row.
 M22/M24 still own real-client and complete release coverage. API.md and
 QUEUE.md fix state/error and submission policies.
@@ -361,11 +362,14 @@ delayed-COMMIT receipt settlement. It does not exercise td-mail sending or
 advertise Submission.
 
 The separate `real_postgres_td_mail_sends_plain_text` fixture uses the prepared
-Submission Session and the real td-mail/fetch processes. It covers plain-text
+Submission Session and the real td-mail/fetch processes. It covers text and attachment
 sending, identity discovery, folder creation, draft/submission/filing replies,
 stored message retrieval and retained-send reconciliation after failed local
 draft retirement. The second client attempt must return the original
-submission ID with exactly one queued submission. This prepared fixture does not deliver via SMTP or test attachment sending;
+submission ID with exactly one queued submission. Binary and forwarded-message
+attachments retain their octets through upload, composition, stored retrieval
+and download, including a UTF-8 filename. Expired and other-device upload
+leases cannot publish a draft. This prepared fixture does not deliver via SMTP;
 the foreground-service fixture below covers executable SMTP delivery.
 
 
@@ -374,17 +378,17 @@ chunked uploads, downloads their blobs under current device authorization,
 refuses malformed/oversized input, and settles a delayed COMMIT without a
 second publication. A separate real HTTPS test proves an uncertain upload
 closes only its exchange without a final receipt and releases its body slot
-for another request. This does not qualify td-mail attachment composition.
+for another request. The native sending fixture above qualifies td-mail attachment composition.
 
 
-The native PostgreSQL foreground-service fixture submits a plain-text draft
+The native PostgreSQL foreground-service fixture uploads a binary attachment and submits a structured draft
 and EmailSubmission through the executable's HTTPS endpoint to its separate
 relay profile. Its local TLS smart host refuses the first MAIL with 451;
 the fixture restarts the relay, delivers fresh mail during the retry hold,
 delivers a verified eight-bit fixture source using 8BITMIME and checks route
 backoff reset, then observes the original message delivered after the real five-minute
 startup guard and persisted retry deadline. It checks durable recipient
-states and actual DATA receipt. It confirms the stable clock through local
+states and actual DATA receipt, including the binary attachment encoding. It confirms the stable clock through local
 control, then kills the process during a later MAIL and checks that a new
 owner recovers Prepared after the abandoned lease expires. That interrupted
 message has expired meanwhile; recovery records a non-dispatchable expiry-wait
@@ -413,3 +417,14 @@ AcceptancePossible boundary. Native fixtures cover separate frontend/relay
 processes, queued and active cancellation, repeat/restart, lost COMMIT
 settlement and continued service. This is cancellation of eligible remaining
 work, not recall of delivered mail; mixed/multiple updates remain refused.
+
+Structured attachment creation accepts at most 64 local blob IDs, each with
+an attachment disposition, a nonempty filename of at most 255 UTF-8 bytes,
+a media type of at most 127 bytes, and an optional description of at most
+1024 UTF-8 bytes. Multipart sources and message subtypes other than rfc822
+and global are refused. Forwarded message/rfc822 bytes must have SMTP-safe
+CRLF lines (at most 998 content octets, no NUL); they are preserved exactly.
+Ordinary attachment octets use base64. Aggregate decoded input and encoded
+message each obey the selected message-size ceiling, capped at 32 MiB.
+MIME-part locators must first be downloaded/uploaded, as td-mail does; they
+are not local upload IDs. HTML draft composition remains outside this flow.
