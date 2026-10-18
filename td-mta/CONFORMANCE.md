@@ -329,8 +329,8 @@ root-set, managed-provider, maximum-load or full release qualification.
 The PostgreSQL real-client send fixture below exercises plain-text draft
 creation, submission history and success filing through the prepared HTTPS
 backend. The removed local-store draft/device-policy fixtures are not
-qualification for this backend. The foreground service currently advertises
-mailbox access without Submission; relay scheduling remains unavailable.
+qualification for this backend. The foreground service advertises Submission and runs relay scheduling for
+relay profiles.
 Shared creation-ID and response-envelope tests continue to cover bounded
 encoding, seed replacement, partial results and output failures. Attachment
 creation remains unsupported.
@@ -365,8 +365,8 @@ Submission Session and the real td-mail/fetch processes. It covers plain-text
 sending, identity discovery, folder creation, draft/submission/filing replies,
 stored message retrieval and retained-send reconciliation after failed local
 draft retirement. The second client attempt must return the original
-submission ID with exactly one queued submission. It does not deliver via
-SMTP, test attachment sending, or activate the production backend.
+submission ID with exactly one queued submission. This prepared fixture does not deliver via SMTP or test attachment sending;
+the foreground-service fixture below covers executable SMTP delivery.
 
 
 The prepared PostgreSQL HTTP fixture also receives length-delimited and
@@ -374,8 +374,7 @@ chunked uploads, downloads their blobs under current device authorization,
 refuses malformed/oversized input, and settles a delayed COMMIT without a
 second publication. A separate real HTTPS test proves an uncertain upload
 closes only its exchange without a final receipt and releases its body slot
-for another request. This does not qualify td-mail attachment composition or
-activate the production backend.
+for another request. This does not qualify td-mail attachment composition.
 
 
 The native PostgreSQL foreground-service fixture submits a plain-text draft
@@ -391,3 +390,18 @@ owner recovers Prepared after the abandoned lease expires. That interrupted
 message has expired meanwhile; recovery records a non-dispatchable expiry-wait
 marker while terminal expiry remains held for clock confirmation. This qualifies the bounded plain-text path,
 not maximum-size throughput or every SMTP failure interleaving.
+
+
+## Local delivery-failure notices
+
+The foreground PostgreSQL fixture covers terminal expiry and permanent MAIL
+rejection producing unread Inbox notices. Email/get returns their decoded
+plain-text report, including local expiry reasons and actual retained SMTP
+replies. An injected local storage refusal leaves notification Pending and
+creates no partial Email. A deferred COMMIT longer than the notice deadline
+exercises an uncertain response; restart observes one Stored notice. Deleting
+that Email through JMAP and restarting does not regenerate it or replace its
+historical notificationEmail ID. Unit cases cover uncertain outcome wording,
+peer-control sanitization, all 1000 maximum-size recipient details and finite
+database framing allowances. This is local account mail, never an outbound
+bounce or a claim that SMTP relay acceptance proves mailbox delivery.

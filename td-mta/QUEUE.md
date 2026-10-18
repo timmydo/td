@@ -358,6 +358,9 @@ set notification Pending in the same transaction. A local account-only
 failure email and notification Stored + notificationEmail are committed in
 one later transaction; retry Pending on local storage failure. Its Email ID is
 historical after user deletion, so a deleted notice is not generated again.
+The foreground PostgreSQL publisher implements these notices as unread Inbox
+mail, with bounded publication and restart semantics in POSTGRES.md section
+213. It never schedules a notice for SMTP delivery.
 Never notify an external inbound reverse path. Administrative acknowledgement
 and deletion are explicit, durably committed actions subject to the same worker fence.
 

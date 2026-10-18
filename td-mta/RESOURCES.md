@@ -4432,3 +4432,12 @@ uses a separate bounded database call and cannot consume a body-source slot.
 POSTGRES.md section 212 owns the work-meter ceilings and lifecycle. These
 explicit active-worker reservations are additional to the planned resource
 ledger; whole-process RSS and maximum-body throughput remain unqualified.
+
+
+The relay's local-notice turn additionally retains at most 10 MiB of report
+text, 16 MiB of encoded MIME and one 100-recipient SQL page. It runs serially
+with SMTP attempts using one ordinary slot, with a five-second deadline and
+at most one turn every five seconds. POSTGRES.md section 213 records its
+separate aggregate database framing and composition work ceilings. The
+shared account body/blob quotas include generated notices. Failure retains
+only the database Pending marker; no unbounded local retry queue is added.

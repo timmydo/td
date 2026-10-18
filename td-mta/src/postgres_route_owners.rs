@@ -445,6 +445,14 @@ fn update(
     let marker = attempted.clone();
     let result = postgres_probe::with_mutation_client(request, trust, deadline, move |client| {
         Box::pin(async move {
+            if !release {
+                // A local publication may hold the account through its COMMIT.
+                // Keep this wait inside the caller's original deadline.
+                client
+                    .batch_execute("SET lock_timeout=8000; SET statement_timeout=8000")
+                    .await
+                    .map_err(|_| Error::Database)?;
+            }
             if !begin(client, &claim, !release, true).await? {
                 return Err(Error::Policy);
             }

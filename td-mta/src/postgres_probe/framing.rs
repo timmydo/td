@@ -86,6 +86,14 @@ impl Input {
         }
     }
 
+    pub(super) fn notices() -> Self {
+        Self {
+            bytes: 12 * 1024 * 1024,
+            frames: 4096,
+            ..Self::new()
+        }
+    }
+
     pub(super) fn cancellation() -> Self {
         Self {
             bytes: 2 * 1024 * 1024,
@@ -394,6 +402,25 @@ mod tests {
             assert!(input.accept(&frame(b'R', &0u32.to_be_bytes())).is_err());
             assert!(window.begin().is_err());
         }
+    }
+
+    #[test]
+    fn notice_budget_bounds_rows_bytes_and_authentication() {
+        let mut input = Input::notices();
+        for _ in 0..4096 {
+            assert!(input.accept(&frame(b'N', b"\0")).is_ok());
+        }
+        assert!(input.accept(&frame(b'N', b"\0")).is_err());
+        assert!(Input::notices().accept(&frame(b'Z', b"I")).is_err());
+        assert!(Input::notices()
+            .accept(&frame(b'D', &[0; 128 * 1024]))
+            .is_err());
+        let mut input = Input::notices();
+        let packet = frame(b'D', &[0; 128 * 1024 - 4]);
+        for _ in 0..95 {
+            assert!(input.accept(&packet).is_ok());
+        }
+        assert!(input.accept(&packet).is_err());
     }
 
     #[test]

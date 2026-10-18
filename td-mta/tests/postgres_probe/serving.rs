@@ -171,6 +171,14 @@ pub(super) fn exercise(
                 .is_some(),
             "{reply}"
         );
+        td_mta::wire::Id::parse(
+            reply["methodResponses"][1][1]["created"]["submission"]["id"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap()
+        .local::<td_mta::ids::SubmissionId>()
+        .unwrap()
     };
     enqueue();
     let wait = |query: &str, expected: &str, seconds: u64| {
@@ -209,7 +217,15 @@ pub(super) fn exercise(
         .collect::<String>();
     let data = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
     sql(fixture,&format!("UPDATE td_mta.blob_chunks SET bytes=decode('{data}','hex') WHERE blob_id IN (SELECT transmitted_blob_id FROM td_mta.submissions s WHERE EXISTS(SELECT 1 FROM td_mta.recipients r WHERE r.submission_id=s.id AND state=1)); UPDATE td_mta.blobs SET length={},digest=decode('{digest}','hex') WHERE id IN (SELECT transmitted_blob_id FROM td_mta.submissions s WHERE EXISTS(SELECT 1 FROM td_mta.recipients r WHERE r.submission_id=s.id AND state=1))",bytes.len()));
+    sql(fixture, "UPDATE td_mta.account_usage u SET body_bytes=(SELECT sum(length) FROM td_mta.blobs b WHERE b.account=u.account),queue_bytes=(SELECT sum(length) FROM td_mta.blobs b WHERE b.account=u.account AND EXISTS(SELECT 1 FROM td_mta.submissions s WHERE s.account=b.account AND s.transmitted_blob_id=b.id))");
     sql(fixture,"INSERT INTO td_mta.route_health SELECT account,route_name,destination,decode('0000000000000001','hex'),3,3,(extract(epoch FROM clock_timestamp())*1000)::bigint-600000,(extract(epoch FROM clock_timestamp())*1000)::bigint-1000,NULL FROM td_mta.route_owners");
+    let expired = enqueue();
+    sql(
+        fixture,
+        &format!(
+            "UPDATE td_mta.submissions SET expires_at=send_at WHERE id=decode('{expired}','hex')"
+        ),
+    );
     let restarted = start("cloud");
     cloud = restarted.0;
     wait(
@@ -241,6 +257,8 @@ pub(super) fn exercise(
         assert!(output.status.success());
         String::from_utf8(output.stdout).unwrap()
     };
+    // A local publication failure must leave Pending without partial mail.
+    sql(fixture, "CREATE SEQUENCE public.notice_attempts; CREATE FUNCTION public.refuse_notice() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog AS $$ BEGIN PERFORM nextval('public.notice_attempts'); RAISE EXCEPTION 'fixture storage refusal'; END $$; CREATE TRIGGER refuse_notice BEFORE INSERT ON td_mta.emails FOR EACH ROW WHEN (NEW.origin=4) EXECUTE FUNCTION public.refuse_notice()");
     assert!(clock_command("queue-clock-status").contains("held"));
     assert!(clock_command("queue-clock-confirm").contains("requested"));
     let end = std::time::Instant::now() + Duration::from_secs(10);
@@ -248,6 +266,66 @@ pub(super) fn exercise(
         assert!(std::time::Instant::now() < end);
         std::thread::sleep(Duration::from_millis(50));
     }
+    wait(
+        "SELECT is_called::text FROM public.notice_attempts",
+        "true",
+        30,
+    );
+    assert_eq!(
+        sql(
+            fixture,
+            "SELECT count(*) FROM td_mta.submissions WHERE notification=1"
+        ),
+        "1"
+    );
+    assert_eq!(
+        sql(fixture, "SELECT count(*) FROM td_mta.emails WHERE origin=4"),
+        "0"
+    );
+    // Lose the reply after COMMIT has entered a deferred trigger. The notice
+    // marker and local mail must still settle together, without replay duplicates.
+    sql(fixture, "DROP TRIGGER refuse_notice ON td_mta.emails; DROP FUNCTION public.refuse_notice(); DROP SEQUENCE public.notice_attempts; CREATE FUNCTION public.arm_notice() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM set_config('statement_timeout','10000',true); RETURN NEW; END $$; CREATE TRIGGER arm_notice BEFORE UPDATE ON td_mta.submissions FOR EACH ROW WHEN (NEW.notification=2 AND OLD.notification=1) EXECUTE FUNCTION public.arm_notice(); CREATE FUNCTION public.delay_notice() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(6); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_notice AFTER UPDATE ON td_mta.submissions DEFERRABLE INITIALLY DEFERRED FOR EACH ROW WHEN (NEW.notification=2 AND OLD.notification=1) EXECUTE FUNCTION public.delay_notice()");
+    wait(
+        "SELECT count(*) FROM td_mta.submissions WHERE notification=2",
+        "1",
+        30,
+    );
+    sql(
+        fixture,
+        "DROP TRIGGER delay_notice ON td_mta.submissions; DROP FUNCTION public.delay_notice(); DROP TRIGGER arm_notice ON td_mta.submissions; DROP FUNCTION public.arm_notice()",
+    );
+    assert_eq!(
+        sql(fixture, "SELECT count(*) FROM td_mta.emails WHERE origin=4"),
+        "1"
+    );
+    assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.memberships m JOIN td_mta.emails e ON e.account=m.account AND e.id=m.email_id JOIN td_mta.mailboxes b ON b.account=m.account AND b.id=m.mailbox_id WHERE e.origin=4 AND b.role='inbox' AND NOT EXISTS(SELECT 1 FROM td_mta.keywords k WHERE k.account=e.account AND k.email_id=e.id AND k.keyword='$seen')"), "1");
+    let notice_wire = |submission: td_mta::ids::SubmissionId| {
+        let id = td_mta::ids::EmailId::parse(&sql(fixture, &format!("SELECT encode(notification_email_id,'hex') FROM td_mta.submissions WHERE id=decode('{submission}','hex')"))).unwrap();
+        let mut bytes = [0; td_mta::wire::IdKind::WIRE_BYTES];
+        td_mta::wire::encode_id(id, &mut bytes).unwrap().to_owned()
+    };
+    let notice_text = |id: &str| {
+        let reply=post(&td_json::json!({"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail"],"methodCalls":[["Email/get",{"accountId":account_wire,"ids":[id],"properties":["id","subject","textBody","bodyValues"],"fetchTextBodyValues":true},"notice"]]}).to_string());
+        let email = &reply["methodResponses"][0][1]["list"][0];
+        let part = email["textBody"][0]["partId"].as_str().unwrap();
+        email["bodyValues"][part]["value"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let expiry_notice = notice_wire(expired);
+    assert!(notice_text(&expiry_notice).contains("Delivery deadline expired"));
+    assert!(cloud.0.try_wait().unwrap().is_none());
+    assert!(clock_command("queue-clock-status").contains("confirmed"));
+    // Recreate a worker after its uncertain publication; Stored is its receipt.
+    let output = Command::new(env!("CARGO_BIN_EXE_td-mta"))
+        .args(["stop", "--runtime"])
+        .arg(&cloud_runtime)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    super::wait_command(&mut cloud);
+    cloud = start("cloud").0;
     enqueue();
     let end = std::time::Instant::now() + Duration::from_secs(30);
     while !relay.interrupted.load(std::sync::atomic::Ordering::Acquire) {
@@ -352,6 +430,46 @@ pub(super) fn exercise(
         "3",
         30,
     );
+    let refused = enqueue();
+    wait(
+        "SELECT count(*) FROM td_mta.submissions WHERE notification=2",
+        "2",
+        30,
+    );
+    let refused_notice = notice_wire(refused);
+    let text = notice_text(&refused_notice);
+    assert!(text.contains("Permanent SMTP refusal"), "{text}");
+    assert!(text.contains("550 permanent fixture refusal"), "{text}");
+    assert_eq!(
+        sql(fixture, "SELECT count(*) FROM td_mta.emails WHERE origin=4"),
+        "2"
+    );
+    let reply=post(&td_json::json!({"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail"],"methodCalls":[["Email/set",{"accountId":account_wire,"destroy":[expiry_notice.as_str()]},"delete-notice"]]}).to_string());
+    assert_eq!(
+        reply["methodResponses"][0][1]["destroyed"][0].as_str(),
+        Some(expiry_notice.as_str())
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_td-mta"))
+        .args(["stop", "--runtime"])
+        .arg(&cloud_runtime)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    super::wait_command(&mut cloud);
+    cloud = start("cloud").0;
+    std::thread::sleep(Duration::from_secs(6));
+    assert_eq!(
+        sql(fixture, "SELECT count(*) FROM td_mta.emails WHERE origin=4"),
+        "1"
+    );
+    assert_eq!(notice_wire(expired), expiry_notice);
+    assert_eq!(
+        sql(
+            fixture,
+            "SELECT count(*) FROM td_mta.submissions WHERE notification=2"
+        ),
+        "2"
+    );
     let revoke =
         td_mta::postgres_devices::prepare_revocation(epoch, account, device.device_id(), 2)
             .unwrap();
@@ -373,5 +491,28 @@ pub(super) fn exercise(
         send(&child.0, signal).unwrap();
         super::wait_command(&mut child);
     }
-    assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "5");
+    assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "8");
+    let utc_ms = sql(
+        fixture,
+        "SELECT (extract(epoch FROM clock_timestamp())*1000)::bigint",
+    )
+    .parse()
+    .unwrap();
+    td_mta::postgres_account_audit::inspect(
+        &fixture.request(),
+        &trust,
+        deadline(),
+        epoch,
+        account,
+        utc_ms,
+        td_mta::postgres_account_audit::Limits {
+            metadata: td_mta::metadata_sweep::Limits {
+                rows: 10000,
+                parent_reads: 10000,
+            },
+            blobs: 100,
+            bytes: 1024 * 1024,
+        },
+    )
+    .unwrap();
 }

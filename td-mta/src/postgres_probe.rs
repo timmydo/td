@@ -197,6 +197,23 @@ pub(crate) fn with_upload_client<T>(
     )
 }
 
+// At most 1000 retained recipient replies and one local notice, no remote body.
+pub(crate) fn with_notice_client<T>(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    operation: impl for<'a> FnOnce(&'a tokio_postgres::Client) -> Pin<Box<dyn Future<Output = T> + 'a>>,
+) -> Result<T, Error> {
+    with_output_limit(
+        request,
+        trust,
+        deadline,
+        20 * 1024 * 1024,
+        Input::notices(),
+        operation,
+    )
+}
+
 // Explicit owner DDL needs more command completions than a probe.
 pub(crate) fn with_schema_client<T>(
     request: &Request<'_>,

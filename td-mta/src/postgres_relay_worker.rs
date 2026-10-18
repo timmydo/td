@@ -219,8 +219,30 @@ impl Worker<'_, '_> {
         let mut buffers = (Box::new([0; TLS_WIRE_BYTES]), Box::new([0; TLS_WIRE_BYTES]));
         let source_slots = database(ReadSlots::new(2))?;
         let mut retry = false;
+        let mut notice_at = Instant::now();
         while !control.stop_requested() {
             settle(worker, settlement, control)?;
+            if Instant::now() >= notice_at {
+                let _slot = database(worker.connection.slots.acquire())?;
+                if let Err(error) = crate::postgres_failure_notice::publish_next(
+                    self.request,
+                    self.trust,
+                    Instant::now() + Duration::from_secs(5),
+                    claim,
+                    generation,
+                ) {
+                    eprintln!("td-mta: local delivery notice deferred: {error:?}");
+                    // Serialize behind COMMIT or rollback before short-lock reads.
+                    database(owners::renew(
+                        self.request,
+                        self.trust,
+                        Instant::now() + Duration::from_secs(10),
+                        claim,
+                        generation,
+                    ))?;
+                }
+                notice_at = Instant::now() + Duration::from_secs(5);
+            }
             if self.queue.repair.load(Ordering::Acquire) == 1 {
                 let value = database(crate::postgres_route_repair::prepare(claim, generation))?;
                 let repaired = health(

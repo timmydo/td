@@ -6126,3 +6126,64 @@ Prepared cap to select SevenBit or EightBit before MAIL; DATA requires the
 matching EHLO capability. This scan uses fixed 4096-byte scratch and prepays
 three maximum-body extents plus database validation overhead, with charged
 records per read. There is no complete-message allocation.
+
+
+## 213. Local terminal-delivery notices
+
+Each foreground relay worker attempts at most one pending local notice every
+five seconds, independently of route backoff, repair holds and expiry clock
+confirmation. Only already completed submissions with notification Pending
+qualify. The current selected relay profile and live route lease authorize
+its account; an older submission destination does not strand local notices
+when the smart host changes. No notice enters the outgoing submission queue.
+
+The publisher holds the configuration, account and route fences while it
+reads up to 1000 terminal recipients in pages of 100 and builds one plain-text
+report with the shared compose_text MIME writer. The report identifies the
+submission and original Email, gives each recipient's outcome/reason, and
+includes retained RCPT/message replies and diagnostics. Unknown outcomes say
+that delivery may have occurred. Peer control characters are replaced with
+question marks in the text body; no peer text becomes a header. The generated
+message uses a local system sender, its own Message-ID and a fresh thread.
+
+One transaction writes the immutable blob, unread Inbox Email, membership,
+thread/anchor, quota charge and CHANGE rows for Email, Thread, Mailbox and
+Submission, then changes Pending to Stored with its historical Email ID.
+It preserves completedAt, recipients, their replies and uncertainty. Account
+sequence admission preserves outstanding final-result reservations. The
+existing shared body/blob quotas apply; missing Inbox, quota/storage failures
+or bounded-work refusal leave Pending for a later turn and do not stop SMTP
+scheduling. Errors are redacted fixed enums in the service log.
+
+Stored is the durable receipt. Every subsequent scan first obtains the same
+account lock, so it waits for any older commit/rollback before selecting
+Pending again. A crash or lost COMMIT response therefore cannot create a
+second notice. The marker retains the Email ID after JMAP deletion, so missing
+Email bytes are not a reason to republish. No extra receipt table, schema
+upgrade or file-backed continuation is introduced.
+
+Each turn uses one ordinary database slot and a five-second absolute deadline.
+Raw report text is capped at 10 MiB and the MIME message at 16 MiB; each SQL
+page holds at most 100 rows of schema-bounded recipient fields. The private
+wire adapter bounds aggregate input at 12 MiB/4096 frames, retains the existing
+128-KiB per-frame/authentication limits, and bounds output at 20 MiB. Composition
+has one 128-MiB I/O, 64-MiB output and two-million-record meter, never refreshed
+inside a turn. These are work ceilings; the report/message and bounded SQL
+page are additional transient memory, released before the next SMTP attempt.
+
+Lease renewal permits an eight-second database lock/statement wait inside
+its original ten-second client deadline, so a five-second notice turn can
+outlast the ordinary one-second lock timeout. It still checks the current
+owner and unexpired lease under the acquired locks before extending it;
+waiting never authorizes renewal of an expired or replaced owner. Storage
+that exceeds this tolerance still stops the service under the existing
+lease-loss policy.
+
+After a notice error, including an indeterminate COMMIT, the scheduling
+worker also performs
+that bounded renewal before ordinary queue reads. Its account lock waits
+behind the notice transaction (COMMIT or rollback) and establishes
+settlement while rechecking
+ownership. A pending COMMIT therefore cannot trip the next candidate
+read's shorter lock timeout. Failure to establish current ownership still
+stops the service; the next notice scan uses the durable Stored marker.

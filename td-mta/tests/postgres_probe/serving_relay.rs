@@ -146,6 +146,10 @@ impl Relay {
                     }
                     continue;
                 }
+                if connections == 6 {
+                    write(&mut peer, b"550 permanent fixture refusal\r\n");
+                    continue;
+                }
                 if connections == 1 {
                     write(&mut peer, b"451 temporary fixture failure\r\n");
                     continue;

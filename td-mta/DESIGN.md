@@ -10,6 +10,8 @@ The foreground service receives SMTP and serves the implemented td-mail JMAP
 flows from named database profiles. It retains fixed transport workers,
 bounded requests, database snapshots and verified immutable body readers.
 Relay profiles run a PostgreSQL route worker; JMAP profiles accept submission.
+Terminal delivery failures produce local Inbox notices with retained replies
+and explicit uncertainty, without outbound bounces.
 [CONFIG.md](CONFIG.md) describes startup; [CONFORMANCE.md](CONFORMANCE.md)
 states supported client flows and qualification limits. The v1 release still
 requires section 15's evidence; functioning receive/JMAP service is not a
