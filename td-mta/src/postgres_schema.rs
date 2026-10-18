@@ -245,13 +245,13 @@ pub(crate) async fn lock_exclusive_transaction_and_inspect(
 async fn lock_transaction(client: &Client, exclusive: bool) -> Result<Receipt, Error> {
     version(client).await?;
     let locked: bool = client
-        .query_one(
+        .query_typed_one(
             if exclusive {
                 "SELECT pg_catalog.pg_try_advisory_xact_lock($1)"
             } else {
                 "SELECT pg_catalog.pg_try_advisory_xact_lock_shared($1)"
             },
-            &[&MIGRATION_KEY],
+            &[(&MIGRATION_KEY, tokio_postgres::types::Type::INT8)],
         )
         .await
         .map_err(|_| Error::Database)?
@@ -266,8 +266,8 @@ async fn lock_transaction(client: &Client, exclusive: bool) -> Result<Receipt, E
 async fn ledger(client: &Client, require_current: bool) -> Result<Receipt, Error> {
     let limit = MIGRATIONS.len().checked_add(1).ok_or(Error::Version)?;
     let limit = i64::try_from(limit).map_err(|_| Error::Version)?;
-    let rows = client.query(
-        "SELECT version, checksum, store_epoch FROM td_mta.schema_migrations ORDER BY version LIMIT $1", &[&limit])
+    let rows = client.query_typed(
+        "SELECT version, checksum, store_epoch FROM td_mta.schema_migrations ORDER BY version LIMIT $1", &[(&limit, tokio_postgres::types::Type::INT8)])
         .await.map_err(|_| Error::Database)?;
     if rows.is_empty()
         || rows.len() > MIGRATIONS.len()
@@ -304,7 +304,7 @@ async fn version(client: &Client) -> Result<(), Error> {
         return Err(Error::Version);
     }
     let encoding: String = client
-        .query_one("SELECT pg_catalog.current_setting('server_encoding')", &[])
+        .query_typed_one("SELECT pg_catalog.current_setting('server_encoding')", &[])
         .await
         .map_err(|_| Error::Database)?
         .try_get(0)

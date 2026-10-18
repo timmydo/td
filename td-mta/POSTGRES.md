@@ -5024,6 +5024,11 @@ section 181 separately prepays its larger finite connection budget. A successful
 counter and extends no deadline. A returned limit can only tighten the next
 turn's cap. Runtime authentication is connection-bound; schema, durability,
 role, privileges and live dispatch conditions are rechecked each turn.
+The schema, role, policy, owner, health, receipt and recipient reads use
+explicit PostgreSQL parameter types so the driver can send each query in
+one round trip without separately preparing and closing a statement. SQL
+ordering, lock lifetimes and fresh observations are unchanged; no result
+is cached between validation turns.
 
 Native fixtures verify two checks on one backend, idle state after rollback,
 and an independent connection acquiring exclusive migration and conflicting

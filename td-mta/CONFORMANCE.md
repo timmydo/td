@@ -305,6 +305,9 @@ last-event-ID replay avoidance and closeafter=state. Core exposes no stateful
 account data type. The live stream still produces pings only; this read
 profile does not claim Mail StateChange events. The real-client fixture below
 qualifies the request-driven td-mail flow independently of passive SSE tests.
+td-mail does not consume EventSource; it refreshes on its configured idle-sync
+interval (60 seconds by default) and on manual refresh. Live Mail events
+remain deferred.
 
 ## Mailbox query availability
 
@@ -325,16 +328,16 @@ The private CA enters only the existing fetch test process. This establishes
 client/server compatibility for the flows described below, not production
 root-set, managed-provider, maximum-load or full release qualification.
 
-## Plain-text Email creation evidence
+## Structured Email creation evidence
 
-The PostgreSQL real-client send fixture below exercises plain-text draft
-creation, submission history and success filing through the prepared HTTPS
-backend. The removed local-store draft/device-policy fixtures are not
+The PostgreSQL real-client send fixture below exercises text and attachment
+draft creation, submission history and success filing through the prepared
+HTTPS backend. The removed local-store draft/device-policy fixtures are not
 qualification for this backend. The foreground service advertises Submission and runs relay scheduling for
 relay profiles.
 Shared creation-ID and response-envelope tests continue to cover bounded
 encoding, seed replacement, partial results and output failures. Attachment
-creation remains unsupported.
+limits and native sending evidence are described below.
 
 ## Prepared PostgreSQL real-client fixture
 

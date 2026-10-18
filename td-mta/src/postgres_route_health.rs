@@ -158,7 +158,7 @@ pub(crate) fn state(row: &Row, offset: usize, revision: u64) -> Result<State, Er
 }
 pub(crate) async fn current(client: &Client, claim: &Claim) -> Result<Option<State>, Error> {
     let binding = claim.binding();
-    let rows=client.query("SELECT revision,failure_count,reason,failed_at,next_at,repair_generation FROM td_mta.route_health WHERE account=$1 AND route_name=$2 AND destination=$3", &[&binding.account().as_bytes().as_slice(),&binding.route().name(),&binding.route().destination().as_slice()]).await.map_err(|_|Error::Database)?;
+    let rows=client.query_typed("SELECT revision,failure_count,reason,failed_at,next_at,repair_generation FROM td_mta.route_health WHERE account=$1 AND route_name=$2 AND destination=$3", &[(&binding.account().as_bytes().as_slice(),tokio_postgres::types::Type::BYTEA),(&binding.route().name(),tokio_postgres::types::Type::TEXT),(&binding.route().destination().as_slice(),tokio_postgres::types::Type::BYTEA)]).await.map_err(|_|Error::Database)?;
     rows.first()
         .map(|row| {
             state(

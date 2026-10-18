@@ -149,7 +149,7 @@ pub fn inspect(
 
 pub(crate) async fn qualify(client: &Client) -> Result<(), Error> {
     let row = client
-        .query_one(ROLE, &[])
+        .query_typed_one(ROLE, &[])
         .await
         .map_err(|_| Error::Database)?;
     if !row.try_get::<_, bool>(0).map_err(|_| Error::Database)? {
@@ -157,7 +157,7 @@ pub(crate) async fn qualify(client: &Client) -> Result<(), Error> {
     }
     let limit = i64::try_from(TABLES.len() + 1).map_err(|_| Error::Privileges)?;
     let rows = client
-        .query(PRIVILEGES, &[&limit])
+        .query_typed(PRIVILEGES, &[(&limit, tokio_postgres::types::Type::INT8)])
         .await
         .map_err(|_| Error::Database)?;
     if rows.len() != TABLES.len() {
@@ -185,7 +185,7 @@ pub(crate) async fn qualify(client: &Client) -> Result<(), Error> {
         }
     }
     let rows = client
-        .query(
+        .query_typed(
             "SELECT singleton,blocked FROM td_mta.runtime_barrier LIMIT 2",
             &[],
         )

@@ -126,7 +126,7 @@ pub(crate) async fn lock_account_policy(
     write: bool,
 ) -> Result<bool, Error> {
     let current_policy = if policy {
-        let row = client.query_one("SELECT generation,version_id FROM td_mta.config_selection WHERE singleton=true FOR SHARE", &[]).await.map_err(|_|Error::Database)?;
+        let row = client.query_typed_one("SELECT generation,version_id FROM td_mta.config_selection WHERE singleton=true FOR SHARE", &[]).await.map_err(|_|Error::Database)?;
         let version: Option<&[u8]> = row.try_get(1).map_err(|_| Error::Integrity)?;
         claim.binding.roles().relay()
             && number(row.try_get(0).map_err(|_| Error::Integrity)?)?
@@ -141,14 +141,20 @@ pub(crate) async fn lock_account_policy(
         "SELECT id FROM td_mta.accounts WHERE id=$1 FOR SHARE"
     };
     client
-        .query_one(query, &[&claim.binding.account().as_bytes().as_slice()])
+        .query_typed_one(
+            query,
+            &[(
+                &claim.binding.account().as_bytes().as_slice(),
+                tokio_postgres::types::Type::BYTEA,
+            )],
+        )
         .await
         .map_err(|_| Error::Database)?;
     Ok(current_policy)
 }
 async fn now(client: &Client) -> Result<i64, Error> {
     client
-        .query_one(
+        .query_typed_one(
             "SELECT (extract(epoch FROM clock_timestamp())*1000)::bigint",
             &[],
         )
@@ -202,7 +208,7 @@ struct Owner {
     expires_at: Option<i64>,
 }
 async fn owner(client: &Client, claim: &Claim) -> Result<Option<Owner>, Error> {
-    let rows = client.query("SELECT generation,owner_boot,operation,destination,last_clock,expires_at FROM td_mta.route_owners WHERE account=$1 AND route_name=$2 FOR UPDATE", &[&claim.binding.account().as_bytes().as_slice(), &claim.binding.route().name()]).await.map_err(|_|Error::Database)?;
+    let rows = client.query_typed("SELECT generation,owner_boot,operation,destination,last_clock,expires_at FROM td_mta.route_owners WHERE account=$1 AND route_name=$2 FOR UPDATE", &[(&claim.binding.account().as_bytes().as_slice(), tokio_postgres::types::Type::BYTEA), (&claim.binding.route().name(), tokio_postgres::types::Type::TEXT)]).await.map_err(|_|Error::Database)?;
     let Some(row) = rows.first() else {
         return Ok(None);
     };

@@ -13,6 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 use td_crypto::{Crypto, Digest, Provider, TrustStore};
+use tokio_postgres::types::Type;
 
 /// Validate the exact still-active AcceptancePossible subset and its durable
 /// capacity under fresh policy, ownership and queue-clock checks. All database
@@ -217,7 +218,7 @@ async fn check_locked(
     let account_id = binding.account();
     let account = account_id.as_bytes().as_slice();
     let attempt = value.attempt.as_bytes().as_slice();
-    let rows = client.query("SELECT a.submission_id,s.expires_at,s.completed_at,s.changed,n.sequence,n.floor,a.ordinals FROM td_mta.submission_attempts a JOIN td_mta.submissions s ON s.account=a.account AND s.id=a.submission_id JOIN td_mta.accounts n ON n.id=a.account WHERE a.account=$1 AND a.attempt_id=$2 AND a.active AND a.route_name=$3 AND a.destination=$4 AND a.generation=$5 AND a.owner_boot=$6 AND a.owner_operation=$7", &[&account,&attempt,&binding.route().name(),&binding.route().destination().as_slice(),&value.generation.to_be_bytes().as_slice(),&value.claim.boot().as_bytes().as_slice(),&value.claim.operation().as_bytes().as_slice()]).await.map_err(|_|Error::Database)?;
+    let rows = client.query_typed("SELECT a.submission_id,s.expires_at,s.completed_at,s.changed,n.sequence,n.floor,a.ordinals FROM td_mta.submission_attempts a JOIN td_mta.submissions s ON s.account=a.account AND s.id=a.submission_id JOIN td_mta.accounts n ON n.id=a.account WHERE a.account=$1 AND a.attempt_id=$2 AND a.active AND a.route_name=$3 AND a.destination=$4 AND a.generation=$5 AND a.owner_boot=$6 AND a.owner_operation=$7", &[(&account,Type::BYTEA),(&attempt,Type::BYTEA),(&binding.route().name(),Type::TEXT),(&binding.route().destination().as_slice(),Type::BYTEA),(&value.generation.to_be_bytes().as_slice(),Type::BYTEA),(&value.claim.boot().as_bytes().as_slice(),Type::BYTEA),(&value.claim.operation().as_bytes().as_slice(),Type::BYTEA)]).await.map_err(|_|Error::Database)?;
     let row = rows.first().ok_or(Error::Missing)?;
     let submission: &[u8] = row.try_get(0).map_err(|_| Error::Integrity)?;
     let expires: i64 = row.try_get(1).map_err(|_| Error::Integrity)?;
@@ -248,7 +249,14 @@ async fn check_locked(
         "SELECT ordinal,phase,rcpt_reply,data_reply,reason,changed,next_attempt_at FROM td_mta.recipients WHERE account=$1 AND submission_id=$2 AND attempt_id=$3 AND state=2 ORDER BY ordinal LIMIT 101"
     };
     let rows = client
-        .query(query, &[&account, &submission, &attempt])
+        .query_typed(
+            query,
+            &[
+                (&account, Type::BYTEA),
+                (&submission, Type::BYTEA),
+                (&attempt, Type::BYTEA),
+            ],
+        )
         .await
         .map_err(|_| Error::Database)?;
     if rows.len() > 100 {

@@ -667,12 +667,18 @@ async fn receipt(client: &Client, value: &Fields) -> Result<Option<Outcome>, Err
         "SELECT request_digest,recipient_count,old_sequence,new_sequence FROM td_mta.attempt_phase_receipts WHERE account=$1 AND attempt_id=$2 AND phase=$3"
     };
     let rows = client
-        .query(
+        .query_typed(
             query,
             &[
-                &value.claim.binding().account().as_bytes().as_slice(),
-                &value.attempt.as_bytes().as_slice(),
-                &value.phase,
+                (
+                    &value.claim.binding().account().as_bytes().as_slice(),
+                    tokio_postgres::types::Type::BYTEA,
+                ),
+                (
+                    &value.attempt.as_bytes().as_slice(),
+                    tokio_postgres::types::Type::BYTEA,
+                ),
+                (&value.phase, tokio_postgres::types::Type::INT8),
             ],
         )
         .await
