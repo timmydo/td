@@ -54,8 +54,15 @@ prerequisites" onward):
   amendment 10): the identify hash binds the caller's identify step, and
   the assertion's binds the step its `Steps` presents for the selected
   token and the key's PIN retries, which exist only once the key has
-  answered. It holds no header and no policy; td-boot's selector and
-  td-install's storage worker are its consumers.
+  answered. `create_stepped` is `create` in presented steps, for the
+  upgrade's key ceremonies (td-authd/DESIGN.md amendment 10, tag 17):
+  its `CreateSteps` gives the create step's description once the key
+  reports its retries, the prove and repeat steps' once it also names
+  the new credential, and the probe step's, which both probes bind;
+  each phase's hash binds its own step, and every check is `create`'s,
+  which is `create_stepped` with one description for every phase. It
+  holds no header and no policy; td-boot's selector and td-install's
+  storage worker are its consumers.
   Its vectors, `tests/disk_vectors.txt`, come from
   `tests/disk_vectors.py`, which computes them with Python's hashlib and
   hmac alone.

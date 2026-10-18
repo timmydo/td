@@ -1702,7 +1702,7 @@ consent time holds no I/O.
   the direct form, preparing the selector with
   `etc/td/boot-measurement`, as ENCRYPTION.md's selector update says for
   the upgrade. After the review's `11` it runs each new key's ceremony
-  as td-fido's stepped `fido_disk::create` over root-admitted devices:
+  as td-fido's `fido_disk::create_stepped` over root-admitted devices:
   creation, proof, repeat, identify probe and no-PIN probe, each phase's
   client data hashing that step's own description, which the worker
   presents (`10`) before the key needs it and root admits; the

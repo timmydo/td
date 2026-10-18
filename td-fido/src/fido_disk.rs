@@ -137,7 +137,7 @@ pub enum DiskError {
     /// Admission's typed refusals, `NoFido21` and the no-PIN probe's
     /// `PinOptional` among them.
     Refused(LoginRefusal),
-    /// The person ended a PIN step.
+    /// The person ended a PIN step, or a stepped creation's probe step.
     Ended,
     /// A typed CTAP status, an interruption (`Expired` past the deadline),
     /// the transport, entropy, or a protocol or verification failure such
@@ -322,13 +322,113 @@ pub struct Created {
 /// session: creation and its proof, each with its PIN and touch; a repeat
 /// that must reproduce the proof's output exactly; the identify probe over
 /// `excluded` then the new credential, which must select it; and the
-/// no-PIN probe, which must not give the PIN's output.
+/// no-PIN probe, which must not give the PIN's output. Every phase's hash
+/// binds the operation's one description.
 pub fn create<D: Devices>(
     devices: &mut D,
     deadline: Instant,
     excluded: &[&[u8]],
     operation: Operation<'_>,
     person: &mut impl Person,
+    entropy: &mut impl FnMut(&mut [u8]) -> Result<(), String>,
+) -> Result<Created, DiskError> {
+    created(
+        devices,
+        deadline,
+        excluded,
+        &operation.volume,
+        &mut Described {
+            description: operation.description,
+            person,
+        },
+        entropy,
+    )
+}
+
+/// The steps of a creation presented one at a time (td-authd/DESIGN.md
+/// amendment 10, the upgrade's key ceremony): a step's description names
+/// the key's PIN retries or the new credential, so it exists only once
+/// the key has answered.
+pub trait CreateSteps {
+    /// A PIN step with the key's own retry count, an untrusted claim: the
+    /// step's canonical description, once presented, and the PIN typed for
+    /// it. An error ends the operation before the PIN reaches the key.
+    fn pin(&mut self, step: CreateStep<'_>, retries: u8) -> Result<(Pin, Vec<u8>), String>;
+    /// The probe step for the new credential: its description, once
+    /// presented, which both probes bind. An error ends the operation.
+    fn probe(&mut self, credential: &[u8]) -> Result<Vec<u8>, String>;
+    /// The key will next wait for a touch, as `Person::touch`.
+    fn touch(&mut self, phase: Phase);
+}
+
+/// A stepped creation's PIN steps: create, before any credential
+/// exists, then prove and repeat for the new one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CreateStep<'a> {
+    Create,
+    Prove(&'a [u8]),
+    Repeat(&'a [u8]),
+}
+
+impl<'a> CreateStep<'a> {
+    pub fn phase(self) -> Phase {
+        match self {
+            Self::Create => Phase::Create,
+            Self::Prove(_) => Phase::Prove,
+            Self::Repeat(_) => Phase::Repeat,
+        }
+    }
+
+    /// The new credential a prove or repeat step names.
+    pub fn credential(self) -> Option<&'a [u8]> {
+        match self {
+            Self::Create => None,
+            Self::Prove(credential) | Self::Repeat(credential) => Some(credential),
+        }
+    }
+}
+
+/// `create` in presented steps: each phase's hash binds the description
+/// `steps` gives for it, the identify and no-PIN probes the probe step's.
+/// Every check is `create`'s.
+pub fn create_stepped<D: Devices>(
+    devices: &mut D,
+    deadline: Instant,
+    excluded: &[&[u8]],
+    volume: &[u8; 16],
+    steps: &mut impl CreateSteps,
+    entropy: &mut impl FnMut(&mut [u8]) -> Result<(), String>,
+) -> Result<Created, DiskError> {
+    created(devices, deadline, excluded, volume, steps, entropy)
+}
+
+/// One description for every phase of `create`.
+struct Described<'a, P> {
+    description: &'a [u8],
+    person: &'a mut P,
+}
+
+impl<P: Person> CreateSteps for Described<'_, P> {
+    fn pin(&mut self, step: CreateStep<'_>, retries: u8) -> Result<(Pin, Vec<u8>), String> {
+        Ok((
+            self.person.pin(step.phase(), retries)?,
+            self.description.to_vec(),
+        ))
+    }
+    fn probe(&mut self, _: &[u8]) -> Result<Vec<u8>, String> {
+        Ok(self.description.to_vec())
+    }
+    fn touch(&mut self, phase: Phase) {
+        self.person.touch(phase);
+    }
+}
+
+fn created<D: Devices>(
+    devices: &mut D,
+    deadline: Instant,
+    excluded: &[&[u8]],
+    volume: &[u8; 16],
+    steps: &mut impl CreateSteps,
     entropy: &mut impl FnMut(&mut [u8]) -> Result<(), String>,
 ) -> Result<Created, DiskError> {
     if excluded.len() >= MAX_TOKENS {
@@ -355,18 +455,21 @@ pub fn create<D: Devices>(
                     excluded,
                 },
                 &mut |step, retries| {
-                    let (phase, random) = match step {
-                        LoginPin::Creation => (Phase::Create, &create_random),
+                    let (step, random) = match step {
+                        LoginPin::Creation => (CreateStep::Create, &create_random),
                         // The header's bound, before the proof's PIN.
                         LoginPin::Proof(credential) if credential.len() > MAX_CREDENTIAL => {
                             long = true;
                             return Err("disk credential longer than 255 bytes".into());
                         }
-                        LoginPin::Proof(_) => (Phase::Prove, &prove_random),
+                        LoginPin::Proof(credential) => {
+                            (CreateStep::Prove(credential), &prove_random)
+                        }
                     };
-                    let pin = person.pin(phase, retries)?;
-                    person.touch(phase);
-                    Ok((pin, client_data_hash(phase, operation.description, random)?))
+                    let (pin, description) = steps.pin(step, retries)?;
+                    let phase = step.phase();
+                    steps.touch(phase);
+                    Ok((pin, client_data_hash(phase, &description, random)?))
                 },
                 entropy,
             )
@@ -392,12 +495,9 @@ pub fn create<D: Devices>(
                     salt,
                 },
                 &mut |_, retries| {
-                    let pin = person.pin(Phase::Repeat, retries)?;
-                    person.touch(Phase::Repeat);
-                    Ok((
-                        pin,
-                        client_data_hash(Phase::Repeat, operation.description, &random)?,
-                    ))
+                    let (pin, description) = steps.pin(CreateStep::Repeat(credential), retries)?;
+                    steps.touch(Phase::Repeat);
+                    Ok((pin, client_data_hash(Phase::Repeat, &description, &random)?))
                 },
                 entropy,
             )
@@ -407,11 +507,12 @@ pub fn create<D: Devices>(
     if !reproduced {
         return Err(DiskError::Mismatch);
     }
+    // After the person's wait, so the one-key check follows it.
+    let description = steps.probe(credential).map_err(|_| DiskError::Ended)?;
     same_key(devices, node)?;
     let mut ids: Vec<&[u8]> = excluded.to_vec();
     ids.push(credential);
-    let hash = client_data_hash(Phase::Probe, operation.description, &fresh(entropy)?)
-        .map_err(protocol)?;
+    let hash = client_data_hash(Phase::Probe, &description, &fresh(entropy)?).map_err(protocol)?;
     let selected = Transaction::new(open(devices, node, deadline)?)
         .map_err(LoginError::from)
         .and_then(|transaction| transaction.identify(&ids, hash))?;
@@ -419,11 +520,10 @@ pub fn create<D: Devices>(
         return Err(DiskError::Unselectable);
     }
     same_key(devices, node)?;
-    let hash = client_data_hash(Phase::Probe, operation.description, &fresh(entropy)?)
-        .map_err(protocol)?;
+    let hash = client_data_hash(Phase::Probe, &description, &fresh(entropy)?).map_err(protocol)?;
     let key = public()?;
     let channel = open(devices, node, deadline)?;
-    person.touch(Phase::Probe);
+    steps.touch(Phase::Probe);
     probe(
         channel,
         credential,
@@ -433,8 +533,7 @@ pub fn create<D: Devices>(
         created.output(),
         entropy,
     )?;
-    let passphrase =
-        passphrase(created.output().bytes(), &operation.volume, credential).map_err(protocol)?;
+    let passphrase = passphrase(created.output().bytes(), volume, credential).map_err(protocol)?;
     Ok(Created {
         credential: credential.to_vec(),
         cose: created.cose().to_vec(),
@@ -527,7 +626,7 @@ mod tests {
     use crate::fido_cbor::{self as cbor, Value};
     use crate::fido_transaction::Status;
     use crate::fido_virtual::{Config, Link, Output, Script, Signing, Virtual};
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::rc::Rc;
     use std::time::Duration;
 
@@ -557,6 +656,8 @@ mod tests {
         connected: Vec<Vec<usize>>,
         scripts: Vec<(usize, Script)>,
         opened: usize,
+        /// Once set, every node is connected.
+        all: Rc<Cell<bool>>,
     }
 
     impl Keys {
@@ -569,6 +670,7 @@ mod tests {
                 connected,
                 scripts: Vec::new(),
                 opened: 0,
+                all: Rc::default(),
             }
         }
     }
@@ -577,6 +679,9 @@ mod tests {
         type Node = usize;
         type Channel = Link;
         fn discover(&mut self) -> Result<Vec<usize>, String> {
+            if self.all.get() {
+                return Ok((0..self.nodes.len()).collect());
+            }
             Ok(self
                 .connected
                 .get(self.opened)
@@ -1323,5 +1428,235 @@ mod tests {
             Some(DiskError::OneKey)
         );
         assert_eq!(both.opened, 0);
+    }
+
+    /// A creation's steps as a presenting caller sees them: each phase,
+    /// the credential it names and the retries, and a description built
+    /// from them.
+    #[derive(Default)]
+    struct Stepping {
+        asked: Vec<(Phase, Option<Vec<u8>>, u8)>,
+        probed: Vec<Vec<u8>>,
+        touches: Vec<Phase>,
+        ends: Option<Phase>,
+        /// A wrong PIN typed at this phase.
+        wrong: Option<Phase>,
+        /// Set while the probe step is presented: another key connected.
+        connects: Option<Rc<Cell<bool>>>,
+    }
+
+    fn described(phase: Phase, credential: Option<&[u8]>, retries: u8) -> Vec<u8> {
+        let fingerprint =
+            credential.map_or([0; 4], |id| crypto::digest(id)[..4].try_into().unwrap());
+        [b"step ".as_slice(), &[phase as u8, retries], &fingerprint].concat()
+    }
+
+    impl CreateSteps for Stepping {
+        fn pin(&mut self, step: CreateStep<'_>, retries: u8) -> Result<(Pin, Vec<u8>), String> {
+            let (phase, credential) = (step.phase(), step.credential());
+            self.asked
+                .push((phase, credential.map(<[u8]>::to_vec), retries));
+            if self.ends == Some(phase) {
+                return Err("the person ended it".into());
+            }
+            let pin: &[u8] = if self.wrong == Some(phase) {
+                b"9999"
+            } else {
+                PIN
+            };
+            Ok((Pin::new(pin.into())?, described(phase, credential, retries)))
+        }
+        fn probe(&mut self, credential: &[u8]) -> Result<Vec<u8>, String> {
+            self.probed.push(credential.to_vec());
+            if let Some(all) = &self.connects {
+                all.set(true);
+            }
+            if self.ends == Some(Phase::Probe) {
+                return Err("the person ended it".into());
+            }
+            Ok(described(Phase::Probe, Some(credential), 0))
+        }
+        fn touch(&mut self, phase: Phase) {
+            self.touches.push(phase);
+        }
+    }
+
+    fn stepped_on(
+        keys: &mut Keys,
+        excluded: &[&[u8]],
+        steps: &mut Stepping,
+        draws: &Rc<RefCell<Vec<[u8; 32]>>>,
+    ) -> Result<Created, DiskError> {
+        create_stepped(keys, later(), excluded, &VOLUME, steps, &mut entropy(draws))
+    }
+
+    #[test]
+    fn a_stepped_creation_binds_each_step_it_presents() {
+        let key = blank("disk-stepped");
+        let draws = Rc::new(RefCell::new(Vec::new()));
+        let mut keys = Keys::one(&key);
+        let mut steps = Stepping::default();
+        let created = stepped_on(&mut keys, &[], &mut steps, &draws).unwrap();
+        let id = created.credential.clone();
+        // Create names no credential; prove and repeat name the new one,
+        // as the probe does, each with the key's own retries.
+        assert_eq!(
+            steps.asked,
+            [
+                (Phase::Create, None, 8),
+                (Phase::Prove, Some(id.clone()), 8),
+                (Phase::Repeat, Some(id.clone()), 8),
+            ]
+        );
+        assert_eq!(steps.probed.as_slice(), std::slice::from_ref(&id));
+        assert_eq!(
+            steps.touches,
+            [Phase::Create, Phase::Prove, Phase::Repeat, Phase::Probe]
+        );
+        assert_eq!(keys.opened, 4);
+        let draws = draws.borrow().clone();
+        let bound = |hash: &[u8; 32], phase: Phase, description: &[u8]| {
+            draws
+                .iter()
+                .any(|draw| client_data_hash(phase, description, draw).unwrap() == *hash)
+        };
+        let [create_hash] = hashes(&key, 1, 1)[..] else {
+            panic!("one creation")
+        };
+        assert!(bound(
+            &create_hash,
+            Phase::Create,
+            &described(Phase::Create, None, 8)
+        ));
+        let assertions = hashes(&key, 2, 2);
+        let [prove, repeat, probe, presence] = assertions[..] else {
+            panic!("four assertions")
+        };
+        let step = |phase, retries| described(phase, Some(&id), retries);
+        assert!(bound(&prove, Phase::Prove, &step(Phase::Prove, 8)));
+        assert!(bound(&repeat, Phase::Repeat, &step(Phase::Repeat, 8)));
+        // Both probes bind the one probe step.
+        assert!(bound(&probe, Phase::Probe, &step(Phase::Probe, 0)));
+        assert!(bound(&presence, Phase::Probe, &step(Phase::Probe, 0)));
+        // No step's hash binds another step's description.
+        assert!(!bound(&prove, Phase::Prove, &step(Phase::Repeat, 8)));
+        assert!(!bound(&repeat, Phase::Repeat, &step(Phase::Prove, 8)));
+        assert!(!bound(&create_hash, Phase::Create, &step(Phase::Prove, 8)));
+        assert!(!bound(&repeat, Phase::Repeat, &step(Phase::Probe, 0)));
+        assert_ne!(probe, presence);
+        // The passphrase is the one-description creation's: the PIN's
+        // output for the salt, which a release reproduces.
+        let (with_uv, _) = key.state().credentials[0].hmac.unwrap();
+        let output = crypto::hmac(&with_uv, &created.salt);
+        let expected = passphrase(&output, &VOLUME, &created.credential).unwrap();
+        assert_eq!(created.passphrase.bytes(), expected.bytes());
+        let released = release_on(
+            &mut Keys::one(&key),
+            &[token(&created)],
+            &mut Console::default(),
+        )
+        .unwrap();
+        assert_eq!(released.passphrase.bytes(), created.passphrase.bytes());
+    }
+
+    #[test]
+    fn a_stepped_creation_ends_at_any_refused_step_and_excludes_as_create_does() {
+        let draws = Rc::new(RefCell::new(Vec::new()));
+        // Each PIN step and the probe step end the creation when refused,
+        // before the key is asked anything more.
+        let order = [Phase::Create, Phase::Prove, Phase::Repeat, Phase::Probe];
+        let sessions = [1, 1, 2, 2];
+        for ((at, phase), opened) in order.into_iter().enumerate().zip(sessions) {
+            let key = blank("disk-stepped-ends");
+            let mut keys = Keys::one(&key);
+            let mut steps = Stepping {
+                ends: Some(phase),
+                ..Stepping::default()
+            };
+            assert_eq!(
+                stepped_on(&mut keys, &[], &mut steps, &draws).err(),
+                Some(DiskError::Ended),
+                "{phase:?}"
+            );
+            // The refused step waits for no touch; each earlier one did.
+            // No later session opens.
+            assert_eq!(steps.touches, order[..at], "{phase:?}");
+            assert_eq!(keys.opened, opened, "{phase:?}");
+        }
+        // A key connected while the probe step is presented ends the
+        // creation before the identify probe's session.
+        let key = blank("disk-stepped-swap");
+        let other = blank("disk-stepped-other");
+        let mut keys = Keys::sessions(&[&key, &other], vec![vec![0]]);
+        let mut steps = Stepping {
+            connects: Some(keys.all.clone()),
+            ..Stepping::default()
+        };
+        assert_eq!(
+            stepped_on(&mut keys, &[], &mut steps, &draws).err(),
+            Some(DiskError::OneKey)
+        );
+        assert_eq!(keys.opened, 2);
+        // A wrong PIN at prove is the key's typed status, and no repeat
+        // step is asked; the next creation's create step names the key's
+        // falling count, and each later step its own, reset by that PIN.
+        let key = blank("disk-stepped-wrong");
+        let mut steps = Stepping {
+            wrong: Some(Phase::Prove),
+            ..Stepping::default()
+        };
+        assert_eq!(
+            stepped_on(&mut Keys::one(&key), &[], &mut steps, &draws).err(),
+            Some(DiskError::Failed(Error::Status(Status::PinInvalid)))
+        );
+        let asked: Vec<_> = steps
+            .asked
+            .iter()
+            .map(|(phase, _, n)| (*phase, *n))
+            .collect();
+        assert_eq!(asked, [(Phase::Create, 8), (Phase::Prove, 8)]);
+        let mut steps = Stepping::default();
+        assert!(stepped_on(&mut Keys::one(&key), &[], &mut steps, &draws).is_ok());
+        let asked: Vec<_> = steps
+            .asked
+            .iter()
+            .map(|(phase, _, n)| (*phase, *n))
+            .collect();
+        assert_eq!(
+            asked,
+            [(Phase::Create, 7), (Phase::Prove, 8), (Phase::Repeat, 8)]
+        );
+        // A 256-byte credential ID ends the creation before a prove step.
+        let long = Virtual::new(
+            Config {
+                id_length: 256,
+                max_id: None,
+                ..Config::default()
+            },
+            Some(PIN),
+            "disk-stepped-long",
+        );
+        let mut steps = Stepping::default();
+        assert_eq!(
+            stepped_on(&mut Keys::one(&long), &[], &mut steps, &draws).err(),
+            Some(DiskError::CredentialLength)
+        );
+        assert_eq!(steps.asked, [(Phase::Create, None, 8)]);
+        // The exclusion list is create's: a key holding an excluded
+        // credential is refused at makeCredential, asked no proof.
+        let key = blank("disk-stepped-excluded");
+        let first = create_on(&key, &mut Console::default()).unwrap();
+        let mut steps = Stepping::default();
+        assert_eq!(
+            stepped_on(
+                &mut Keys::one(&key),
+                &[&first.credential],
+                &mut steps,
+                &draws
+            )
+            .err(),
+            Some(DiskError::Failed(Error::Status(Status::CredentialExcluded)))
+        );
+        assert_eq!(steps.asked, [(Phase::Create, None, 8)]);
     }
 }
