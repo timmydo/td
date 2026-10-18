@@ -6,7 +6,7 @@
 //! (DESIGN.md, td-install/ENCRYPTION.md "Device-bound default"); and the
 //! protected tier's PIN primitives, token codecs, lockout token
 //! encryption, plans and release, which the installed selector runs on a
-//! protected header.
+//! protected header, and the re-encrypting upgrade's planner.
 #![forbid(unsafe_code)]
 #![cfg_attr(
     test,
@@ -36,6 +36,7 @@ pub mod release;
 pub mod token;
 pub mod transition;
 pub mod update_retry;
+pub mod upgrade;
 
 /// The engine's SHA-256, which td-fido's `hmac.rs` names as
 /// `super::sha256`.

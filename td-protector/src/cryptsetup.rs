@@ -272,6 +272,75 @@ pub fn detached_test_args(header: &Path, device: &Path, slot: u8) -> Vec<OsStrin
     args
 }
 
+/// The new volume key's parameters `reencrypt` takes: formatting's cipher,
+/// key size and sector size, and its keyslots' PBKDF2. cryptsetup 2.8.8
+/// sizes a new key by `--new-key-size`; `--key-size` names the current key,
+/// which it reads from the header instead.
+const REENCRYPT: &[&str] = &[
+    "--use-random",
+    "--cipher",
+    "aes-xts-plain64",
+    "--new-key-size",
+    "512",
+    "--sector-size",
+    "4096",
+    "--hash",
+    "sha256",
+    "--pbkdf",
+    "pbkdf2",
+    "--pbkdf-force-iterations",
+    "1000",
+];
+
+/// How a reencryption protects the hotzone it is rewriting, both in the
+/// keyslots area (ENCRYPTION.md "Re-encrypting upgrade").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Resilience {
+    /// A checksum of each sector, relying on whole atomic 4096-byte writes.
+    Checksum,
+    /// The data written twice.
+    Journal,
+}
+
+/// `reencrypt` of `device` online under the active mapping `name` to a new
+/// volume key: keyslot `slot`'s key on standard input unlocks it, and
+/// cryptsetup rewraps that keyslot alone for the new key, wiping every
+/// other keyslot once it finishes.
+pub fn reencrypt_args(
+    device: &Path,
+    name: &str,
+    slot: u8,
+    resilience: Resilience,
+) -> Vec<OsString> {
+    let mut args = os(&["reencrypt", "--batch-mode", "--active-name", name]);
+    args.push("--key-slot".into());
+    args.push(slot.to_string().into());
+    args.push("--key-file=-".into());
+    args.extend(os(REENCRYPT));
+    args.extend(os(match resilience {
+        Resilience::Checksum => &["--resilience", "checksum", "--resilience-hash", "sha256"],
+        Resilience::Journal => &["--resilience", "journal"],
+    }));
+    args.push(device.into());
+    args
+}
+
+/// `reencrypt --resume-only` of an interrupted reencryption of `device`,
+/// online under the active mapping `name`: the key on standard input opens
+/// one of the keyslots cryptsetup then holds for each volume key.
+pub fn reencrypt_resume_args(device: &Path, name: &str) -> Vec<OsString> {
+    let mut args = os(&[
+        "reencrypt",
+        "--resume-only",
+        "--batch-mode",
+        "--active-name",
+        name,
+        "--key-file=-",
+    ]);
+    args.push(device.into());
+    args
+}
+
 /// How long a bounded run sleeps between looks at its child.
 const BOUNDED_POLL: Duration = Duration::from_millis(10);
 
@@ -754,6 +823,97 @@ mod tests {
                 ]
             );
         }
+    }
+
+    /// The upgrade's reencryption, in both resilience modes, and its
+    /// resumption, word for word (ENCRYPTION.md "Re-encrypting upgrade").
+    #[test]
+    fn the_reencryption_is_spelled_exactly() {
+        let device = Path::new("/proc/1/fd/5");
+        let start = |slot| {
+            vec![
+                "reencrypt",
+                "--batch-mode",
+                "--active-name",
+                "td-selector",
+                "--key-slot",
+                slot,
+                "--key-file=-",
+                "--use-random",
+                "--cipher",
+                "aes-xts-plain64",
+                "--new-key-size",
+                "512",
+                "--sector-size",
+                "4096",
+                "--hash",
+                "sha256",
+                "--pbkdf",
+                "pbkdf2",
+                "--pbkdf-force-iterations",
+                "1000",
+                "--resilience",
+            ]
+        };
+        let mut checksum = start("0");
+        checksum.extend(["checksum", "--resilience-hash", "sha256", "/proc/1/fd/5"]);
+        assert_eq!(
+            words(&reencrypt_args(
+                device,
+                "td-selector",
+                0,
+                Resilience::Checksum
+            )),
+            checksum
+        );
+        let mut journal = start("17");
+        journal.extend(["journal", "/proc/1/fd/5"]);
+        assert_eq!(
+            words(&reencrypt_args(
+                device,
+                "td-selector",
+                17,
+                Resilience::Journal
+            )),
+            journal
+        );
+        assert_eq!(
+            words(&reencrypt_resume_args(device, "td-selector")),
+            [
+                "reencrypt",
+                "--resume-only",
+                "--batch-mode",
+                "--active-name",
+                "td-selector",
+                "--key-file=-",
+                "/proc/1/fd/5",
+            ]
+        );
+    }
+
+    /// The reencryption's new key takes formatting's parameters, its size
+    /// as `--new-key-size`.
+    #[test]
+    fn the_reencryption_takes_the_formats_parameters() {
+        let value = |list: &[&'static str], flag: &str| {
+            let at = list.iter().position(|word| *word == flag).unwrap();
+            list[at + 1]
+        };
+        for flag in [
+            "--cipher",
+            "--sector-size",
+            "--hash",
+            "--pbkdf",
+            "--pbkdf-force-iterations",
+        ] {
+            assert_eq!(value(REENCRYPT, flag), value(FORMAT, flag), "{flag}");
+        }
+        assert_eq!(
+            value(REENCRYPT, "--new-key-size"),
+            value(FORMAT, "--key-size")
+        );
+        assert!(!REENCRYPT.contains(&"--key-size"));
+        assert!(REENCRYPT.contains(&"--use-random"));
     }
 
     /// The key file holds exactly the secret and then end of file, is open

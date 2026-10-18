@@ -318,8 +318,9 @@ fn shared(copy: &ValidCopy) -> Result<[&[u8]; 5], String> {
 }
 
 /// The JSON area of a 16 KiB copy: one object from its first byte, then
-/// only NUL bytes. Nothing longer reaches td-json.
-fn json_area(json: &[u8]) -> Result<Json, String> {
+/// only NUL bytes, with the object's length. Nothing longer reaches
+/// td-json.
+fn json_area(json: &[u8]) -> Result<(Json, usize), String> {
     if json.len() != JSON_AREA_LEN {
         return Err(format!(
             "LUKS2 JSON area is {} bytes, not {JSON_AREA_LEN}",
@@ -337,7 +338,8 @@ fn json_area(json: &[u8]) -> Result<Json, String> {
     if text.first() != Some(&b'{') || text.last() != Some(&b'}') {
         return Err("LUKS2 JSON area is not one object followed by NUL bytes".into());
     }
-    td_json::parse_slice(text).map_err(|e| format!("LUKS2 JSON area: {e}"))
+    let json = td_json::parse_slice(text).map_err(|e| format!("LUKS2 JSON area: {e}"))?;
+    Ok((json, end))
 }
 
 /// An object keyed by slot numbers 0 to 31, as `(number, value)`.
@@ -370,7 +372,7 @@ fn header_from(copy: &ValidCopy, which: HeaderCopy) -> Result<Header, String> {
             ))
         }
     };
-    let json = json_area(json)?;
+    let (json, _) = json_area(json)?;
     let Metadata {
         keyslots,
         tokens,
@@ -602,6 +604,120 @@ pub fn identity<R: Read + Seek>(device: &mut R) -> Result<Identity, String> {
     })
 }
 
+/// What the re-encrypting upgrade reads of a header beyond its keyslots
+/// and tokens (DESIGN.md "Protected roles").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Volume {
+    /// The data segment's identity (`segment_digest`) for the one digest
+    /// naming segment 0; `None` when no single digest names it with a
+    /// `digest` and a `salt`.
+    pub segment: Option<[u8; SHA256_LEN]>,
+    /// A mandatory requirement cryptsetup's online reencryption sets
+    /// (`online-reencrypt`, `-v2` or `-v3`): a reencryption is in progress.
+    pub reencryption: bool,
+    /// The keyslots of type `luks2`, ascending: a reencryption's own keyslot
+    /// is another type, and unlocks nothing.
+    pub luks2: Vec<u8>,
+    /// The `mode` of each keyslot of type `reencrypt`, in keyslot order:
+    /// `reencrypt`, `encrypt` or `decrypt` as cryptsetup writes it.
+    pub reencrypt_modes: Vec<String>,
+}
+
+/// The data segment's identity: the SHA-256 over its digest's `digest`
+/// text, a zero byte and its `salt` text, as cryptsetup writes them in
+/// base64. A reencryption draws both anew, so a changed identity says the
+/// volume key changed.
+pub fn segment_digest(digest: &str, salt: &str) -> [u8; SHA256_LEN] {
+    td_tpm::digest(&[digest.as_bytes(), &[0], salt.as_bytes()].concat())
+}
+
+fn volume(json: &Json) -> Result<Volume, String> {
+    let keyslots = numbered(json, "keyslots")?;
+    let typed = |kind: &'static str| {
+        keyslots
+            .iter()
+            .filter(move |(_, keyslot)| keyslot.get("type").and_then(Json::as_str) == Some(kind))
+    };
+    let luks2 = typed("luks2").map(|(number, _)| *number).collect();
+    let reencrypt_modes = typed("reencrypt")
+        .map(|(_, keyslot)| {
+            keyslot
+                .get("mode")
+                .and_then(Json::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .collect();
+    let digests = numbered(json, "digests")?;
+    let mut naming = digests.iter().filter(|(_, digest)| {
+        digest
+            .get("segments")
+            .and_then(Json::as_arr)
+            .is_some_and(|segments| segments.iter().any(|s| s.as_str() == Some("0")))
+    });
+    let segment = match (naming.next(), naming.next()) {
+        (Some((_, digest)), None) => match (
+            digest.get("digest").and_then(Json::as_str),
+            digest.get("salt").and_then(Json::as_str),
+        ) {
+            (Some(digest), Some(salt)) => Some(segment_digest(digest, salt)),
+            _ => None,
+        },
+        _ => None,
+    };
+    let reencryption = match json.get_path(&["config", "requirements", "mandatory"]) {
+        None => false,
+        Some(mandatory) => {
+            let mut reencryption = false;
+            for requirement in mandatory
+                .as_arr()
+                .ok_or("LUKS2 mandatory requirements are not an array")?
+            {
+                let requirement = requirement
+                    .as_str()
+                    .ok_or("LUKS2 mandatory requirement is not a string")?;
+                reencryption |= requirement.starts_with("online-reencrypt");
+            }
+            reencryption
+        }
+    };
+    Ok(Volume {
+        segment,
+        reencryption,
+        luks2,
+        reencrypt_modes,
+    })
+}
+
+/// `read`, and the upgrade's view of the same copy with the length of its
+/// JSON text, which the upgrade's planner grows only within the area.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpgradeView {
+    pub header: Header,
+    pub volume: Volume,
+    pub json_len: usize,
+}
+
+pub fn read_upgrade<R: Read + Seek>(device: &mut R) -> Result<UpgradeView, String> {
+    let (copy, which) = used_copy(device)?;
+    let header = header_from(&copy, which)?;
+    let (json, json_len) = json_area(copy.json.as_deref().unwrap_or_default())?;
+    Ok(UpgradeView {
+        header,
+        volume: volume(&json)?,
+        json_len,
+    })
+}
+
+/// `metadata`, and the upgrade's view of the header cryptsetup uses, so
+/// that an upgrade plan's confirmation compares both.
+pub fn upgrade_metadata(text: &[u8]) -> Result<(Metadata, Volume), String> {
+    let metadata = metadata(text)?;
+    let json =
+        td_json::parse_slice(text).map_err(|e| format!("cryptsetup's LUKS2 metadata: {e}"))?;
+    Ok((metadata, volume(&json)?))
+}
+
 /// The largest keyslots area cryptsetup itself formats (its
 /// `LUKS2_MAX_KEYSLOTS_SIZE`): a test area is at most two 16 KiB copies
 /// and this.
@@ -651,7 +767,7 @@ impl TestArea {
 pub fn test_area<R: Read + Seek>(device: &mut R) -> Result<TestArea, String> {
     let (copy, which) = used_copy(device)?;
     let header = header_from(&copy, which)?;
-    let json = json_area(copy.json.as_deref().unwrap_or_default())?;
+    let (json, _) = json_area(copy.json.as_deref().unwrap_or_default())?;
     let keyslots_size = json
         .get_path(&["config", "keyslots_size"])
         .and_then(Json::as_str)
@@ -1488,5 +1604,125 @@ mod tests {
                 digest: MAX_DIGEST_ITERATIONS
             })
         );
+    }
+
+    /// cryptsetup 2.8.8's own metadata, compacted: a U1 header (keyslot 0
+    /// and the `td-upgrade` token), the same header after `reencrypt
+    /// --init-only` with journal resilience (U2), and a header after a
+    /// whole reencryption (U3), which rewrapped keyslot 0's key into
+    /// keyslot 1.
+    const U1_DUMP: &str = r#"{"keyslots":{"0":{"type":"luks2","key_size":64,"af":{"type":"luks1","stripes":4000,"hash":"sha256"},"area":{"type":"raw","offset":"32768","size":"258048","encryption":"aes-xts-plain64","key_size":64},"kdf":{"type":"pbkdf2","hash":"sha256","iterations":1000,"salt":"JryVNwtodNCKirHhnn23zMszf5s/gwfh34C720cNwq8="}}},"tokens":{"3":{"type":"td-upgrade","keyslots":[],"shape":"tpm","from":"7777777777777777777777777777777777777777777777777777777777777777"}},"segments":{"0":{"type":"crypt","offset":"16777216","size":"dynamic","iv_tweak":"0","encryption":"aes-xts-plain64","sector_size":4096}},"digests":{"0":{"type":"pbkdf2","keyslots":["0"],"segments":["0"],"hash":"sha256","iterations":1000,"salt":"71shKqe2GoUjdvWJ5LwpIUK9u0s5ag1V7LuGEnVRK6s=","digest":"Qufgdz095/Yz8tjTATvRwkixYFtr6GVq8GZfx14emAY="}},"config":{"json_size":"12288","keyslots_size":"16744448"}}"#;
+    const U2_DUMP: &str = r#"{"keyslots":{"0":{"type":"luks2","key_size":64,"af":{"type":"luks1","stripes":4000,"hash":"sha256"},"area":{"type":"raw","offset":"32768","size":"258048","encryption":"aes-xts-plain64","key_size":64},"kdf":{"type":"pbkdf2","hash":"sha256","iterations":1000,"salt":"JryVNwtodNCKirHhnn23zMszf5s/gwfh34C720cNwq8="}},"1":{"type":"luks2","key_size":64,"af":{"type":"luks1","stripes":4000,"hash":"sha256"},"area":{"type":"raw","offset":"290816","size":"258048","encryption":"aes-xts-plain64","key_size":64},"kdf":{"type":"pbkdf2","hash":"sha256","iterations":1000,"salt":"wQvAYaQc0EZdrdz3uMJNtLDbntRyU6i6SGzRbYmL8fM="}},"2":{"area":{"offset":"548864","size":"16228352","type":"journal"},"type":"reencrypt","key_size":1,"mode":"reencrypt","direction":"forward","priority":0}},"tokens":{"3":{"type":"td-upgrade","keyslots":[],"shape":"tpm","from":"7777777777777777777777777777777777777777777777777777777777777777"}},"segments":{"0":{"type":"crypt","offset":"16777216","size":"dynamic","iv_tweak":"0","encryption":"aes-xts-plain64","sector_size":4096},"1":{"type":"crypt","offset":"16777216","size":"dynamic","iv_tweak":"0","encryption":"aes-xts-plain64","sector_size":4096,"flags":["backup-previous"]},"2":{"type":"crypt","offset":"16777216","size":"dynamic","iv_tweak":"0","encryption":"aes-xts-plain64","sector_size":4096,"flags":["backup-final"]}},"digests":{"0":{"type":"pbkdf2","keyslots":["0"],"segments":["0","1"],"hash":"sha256","iterations":1000,"salt":"71shKqe2GoUjdvWJ5LwpIUK9u0s5ag1V7LuGEnVRK6s=","digest":"Qufgdz095/Yz8tjTATvRwkixYFtr6GVq8GZfx14emAY="},"1":{"type":"pbkdf2","keyslots":["1"],"segments":["2"],"hash":"sha256","iterations":1000,"salt":"6EgPXWrS1HYZOBrpOMR6s/XA4xaeX7V1Y4oelsRI+p4=","digest":"ZgWMTUHdvQtCZ8BOff5hFv2FRu5Xe0YCsmzeFZfeo7o="},"2":{"type":"pbkdf2","keyslots":["2"],"segments":[],"hash":"sha256","iterations":1000,"salt":"nNbPV3EqWQ9QWrNtRsv9tHbQ7jvMLtBGIKBDwkrYV+c=","digest":"etahzNZdEpir4XuOCGXZhGvs4VrAYHyHXRxkM1shB1g="}},"config":{"json_size":"12288","keyslots_size":"16744448","requirements":{"mandatory":["online-reencrypt-v2"]}}}"#;
+    const U3_DUMP: &str = r#"{"keyslots":{"1":{"type":"luks2","key_size":64,"af":{"type":"luks1","stripes":4000,"hash":"sha256"},"area":{"type":"raw","offset":"290816","size":"258048","encryption":"aes-xts-plain64","key_size":64},"kdf":{"type":"pbkdf2","hash":"sha256","iterations":1000,"salt":"HSQ8JL2FgkQxfE/Qa/M7W4uGURZAVdud9IpkLBFIyaE="}}},"tokens":{},"segments":{"0":{"type":"crypt","offset":"16777216","size":"dynamic","iv_tweak":"0","encryption":"aes-xts-plain64","sector_size":4096}},"digests":{"1":{"type":"pbkdf2","keyslots":["1"],"segments":["0"],"hash":"sha256","iterations":1000,"salt":"PJmI4euY91knIROPEZ4N1KsMBiwordGaxCaGXam2iq0=","digest":"+FrKhxWcXi0iWLhQaZ54MV2G4iLQXUJA9XhoIyyyWoQ="}},"config":{"json_size":"12288","keyslots_size":"16744448"}}"#;
+    /// `segment_digest` of U1's data segment and of U3's, by Python's
+    /// hashlib over the digest text, a zero byte and the salt text.
+    const U1_SEGMENT: &str = "8184a7dd05012478e30f74d54fde60529df8e06382a5fbd62e6ced18b31a3ac3";
+    const U3_SEGMENT: &str = "14054f22dd709921bac58513122a92a2d2f3381558a70875a4e17cc3c899e4f1";
+
+    fn segment(hex: &str) -> Option<[u8; SHA256_LEN]> {
+        crate::token::unhex("segment", hex, SHA256_LEN)
+            .ok()?
+            .try_into()
+            .ok()
+    }
+
+    /// The upgrade's view of cryptsetup's reencryption states: the data
+    /// segment's identity unchanged by an initialized reencryption and
+    /// changed by a finished one, the requirement, and the `luks2`
+    /// keyslots beside the reencryption's own.
+    #[test]
+    fn the_upgrade_view_reads_cryptsetup_reencryption_states() {
+        assert_eq!(
+            Some(segment_digest(
+                "Qufgdz095/Yz8tjTATvRwkixYFtr6GVq8GZfx14emAY=",
+                "71shKqe2GoUjdvWJ5LwpIUK9u0s5ag1V7LuGEnVRK6s="
+            )),
+            segment(U1_SEGMENT)
+        );
+        let (u1_metadata, u1) = upgrade_metadata(U1_DUMP.as_bytes()).unwrap();
+        let (u2_metadata, u2) = upgrade_metadata(U2_DUMP.as_bytes()).unwrap();
+        let (u3_metadata, u3) = upgrade_metadata(U3_DUMP.as_bytes()).unwrap();
+        assert_eq!(
+            u1,
+            Volume {
+                segment: segment(U1_SEGMENT),
+                reencryption: false,
+                luks2: vec![0],
+                reencrypt_modes: vec![],
+            }
+        );
+        assert_eq!(
+            u2,
+            Volume {
+                segment: segment(U1_SEGMENT),
+                reencryption: true,
+                luks2: vec![0, 1],
+                reencrypt_modes: vec!["reencrypt".into()],
+            }
+        );
+        assert_eq!(
+            u3,
+            Volume {
+                segment: segment(U3_SEGMENT),
+                reencryption: false,
+                luks2: vec![1],
+                reencrypt_modes: vec![],
+            }
+        );
+        assert_eq!(u1_metadata.keyslots, [0]);
+        assert_eq!(u2_metadata.keyslots, [0, 1, 2]);
+        assert_eq!(u3_metadata.keyslots, [1]);
+        assert_eq!(u2_metadata.protected.len(), 1);
+        // The header area's own reading agrees, with its text's length.
+        for (dump, metadata, volume) in [(U1_DUMP, u1_metadata, u1), (U2_DUMP, u2_metadata, u2)] {
+            let view = read_upgrade(&mut Cursor::new(device(5, dump, 5, dump))).unwrap();
+            assert_eq!(view.header.kind(), Kind::Upgrading);
+            assert_eq!(view.header.metadata(), metadata);
+            assert_eq!(view.volume, volume);
+            assert_eq!(view.json_len, dump.len());
+        }
+    }
+
+    #[test]
+    fn the_upgrade_view_names_one_data_segment_digest_and_reads_requirements() {
+        let volume = |digests: &str, config: &str| {
+            let json = format!(
+                r#"{{"keyslots":{{"0":{{"type":"luks2"}},"2":{{"type":"reencrypt"}}}},"tokens":{{}},"segments":{{}},"digests":{{{digests}}},"config":{{{config}}}}}"#
+            );
+            upgrade_metadata(json.as_bytes()).map(|(_, volume)| volume)
+        };
+        let one = r#""0":{"segments":["0"],"digest":"d","salt":"s"}"#;
+        let found = volume(one, "").unwrap();
+        assert_eq!(found.segment, Some(segment_digest("d", "s")));
+        assert_ne!(found.segment, Some(segment_digest("ds", "")));
+        assert_eq!(found.luks2, [0]);
+        assert_eq!(found.reencrypt_modes, [""]);
+        assert!(!found.reencryption);
+        for digests in [
+            "",
+            r#""0":{"segments":["1"],"digest":"d","salt":"s"}"#,
+            r#""0":{"segments":["0"],"digest":"d"}"#,
+            r#""0":{"segments":["0"],"salt":"s"}"#,
+            r#""0":{"segments":["0"],"digest":"d","salt":"s"},"1":{"segments":["0"],"digest":"e","salt":"s"}"#,
+        ] {
+            assert_eq!(volume(digests, "").unwrap().segment, None, "{digests}");
+        }
+        for (mandatory, reencryption) in [
+            ("[]", false),
+            (r#"["foo"]"#, false),
+            (r#"["online-reencrypt"]"#, true),
+            (r#"["foo","online-reencrypt-v3"]"#, true),
+        ] {
+            let config = format!(r#""requirements":{{"mandatory":{mandatory}}}"#);
+            assert_eq!(
+                volume(one, &config).unwrap().reencryption,
+                reencryption,
+                "{mandatory}"
+            );
+        }
+        for mandatory in [r#""online-reencrypt-v2""#, "[2]"] {
+            let config = format!(r#""requirements":{{"mandatory":{mandatory}}}"#);
+            assert!(volume(one, &config).is_err(), "{mandatory}");
+        }
     }
 }

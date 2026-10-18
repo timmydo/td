@@ -672,10 +672,12 @@ lockout's take, proof, counter and reset, which td-boot's installed
 selector runs on a protected header from its third, and the deployment
 initramfs's PolicyPCR-only check of tpm-pin tokens, and, from 8e, the
 update-retry token's codec, reader bound and tag (`update_retry`) and a
-selector update's pre-seal and token steps (below).
-Before item 9 only a header root wrote through the worker, or one forged
-on the disk, reaches them. The lockout's clear, the secure-boot and
-config tokens and the upgrade's plans and `reencrypt` shapes are not.
+selector update's pre-seal and token steps (below), and, from 8f's first
+commit, the reader's upgrade view, the upgrade's plans and the runner's
+`reencrypt` shapes (below), which nothing runs until the selector's
+upgrade boot. Before item 9 only a header root wrote through the worker,
+or one forged on the disk, reaches them. The lockout's clear and the
+secure-boot and config tokens are not current.
 
 **Lockout.** `lockout::seal(volume_key, uuid, l, name)` and `open`
 implement ENCRYPTION.md's lockout token: HKDF-SHA256 over the volume key
@@ -813,7 +815,7 @@ releases and the volume opens after its keyslot's test, every token and
 keyslot left as it is. In a device-bound header it treats the protected
 tier's tokens as it treats foreign ones, their keyslots and token
 numbers taken and never removed; the pending tokens an interrupted
-phase 1 leaves are removed by 8f's planner.
+phase 1 leaves are removed by 8f's planner (`upgrade::pending_orphans`).
 
 Measured with the pinned cryptsetup 2.8.8 on header files the test
 builds (`tests/header_fit.rs`, ENCRYPTION.md "Re-encrypting upgrade"),
@@ -833,7 +835,8 @@ on a 20 GiB file with no tokens, an offline reencryption interrupted
 after its first GiB grew the JSON from 1976 bytes to 2114, and 14-digit
 byte counts add a few bytes per field, which the 2.5 KiB margin absorbs.
 The pinned sizes hold for the test's fixture, a 20 MiB file, and 8f's
-planner computes each step's real size before writing. The protected
+planner bounds each plan's size from the header's own before writing
+("Upgrade plans"). The protected
 header, 8e's update-retry token included and before 8i's tokens are
 added, and a U2 header holding
 only what U2 holds are read back through `luks2::read` and agree with
@@ -854,8 +857,8 @@ planner runs, over ENCRYPTION.md's states U0 to U5, read from the header
 alone: the data segment's digest against `from`, cryptsetup's
 online-reencryption requirement, and which tokens exist. A pending
 fido2 token without a `td-upgrade` token is an orphan. The upgrade
-planner computes each step's resulting JSON size and refuses a step
-whose header would not fit the 12 KiB area, before writing.
+planner bounds each plan's resulting JSON size and refuses a plan whose
+header could outgrow the 12 KiB area, before writing.
 
 Since 8c, `protected_plan` is that planner for protected headers, pure
 as `transition` is. `check` admits a header only when it is protected
@@ -915,13 +918,145 @@ not fit is refused by cryptsetup's own commit, which leaves the header
 unchanged: the plans stay within the reader's per-class bounds, which
 the header measurement below covers with 1 KiB to spare.
 
-**Runner.** The runner gains `reencrypt` in three spelled shapes, the
-upgrade's initialization with `--resilience checksum` or `--resilience
-journal` (ENCRYPTION.md's argument list) and `--resume-only`, each with
-`--active-name td-selector` and the key on standard input, and `token
-import` with and without `--token-replace` for a token id, the second
-current since 8c (`token_replace_args`), cryptsetup's one header commit
-replacing the token in place. Its
+**Upgrade plans.** Since 8f, `upgrade` is the upgrade's planner, pure
+as `transition` is, over `luks2::read_upgrade`'s view: the header,
+its `Volume` and the length of the used copy's JSON text, up to its NUL
+padding. `Volume` holds the data segment's identity, whether a
+mandatory requirement starting `online-reencrypt` is present (cryptsetup
+2.8.8 writes `online-reencrypt-v2`), the keyslots of type `luks2`, and
+the `mode` of each keyslot of type `reencrypt`, a reencryption's own.
+`luks2::upgrade_metadata` reads the same from cryptsetup's dump, so a
+plan's confirmation compares them too. The identity
+(`luks2::segment_digest`) is the SHA-256 over the `digest` text, a zero
+byte and the `salt` text, in the base64 cryptsetup writes, of the one
+digest naming segment 0, or none when no single digest does; phase 1
+writes it as the `td-upgrade` token's `from`. Measured with the pinned
+cryptsetup on a file, an initialized reencryption keeps the old digest
+on segment 0, and a finished one leaves one keyslot, the rewrapped
+recovery key at the lowest number free at its start (keyslot 1), one
+segment and a new digest. `check` reads the state from the header
+alone: U2 while the requirement is present, then U0 or U1 while the
+identity equals `from`, U0 when a device-bound td token names a
+keyslot, U3 once it differs and no marker exists, and from the marker
+U4, or U5 when every fido2 token names a keyslot and, in the TPM shape,
+a tpm-pin token names one and a lockout token exists. `needs` says what
+the boot gathers before the cap, every pending fido2 token, the TPM
+shape's tpm-pin protector when none names a keyslot, and the recovery
+key, and whether a take follows (`lockout`), for which the selector
+reads the TPM before the cap even with nothing to seal, in each state
+before U5, which gathers nothing. The selector passes a TPM it found
+unusable as `Tpm::Unusable` whatever it was to seal. `plan` returns one
+state's steps; the selector runs them, reads the header again and plans
+the next state. Each plan is ENCRYPTION.md's step 3 for its state, every
+step authorized by the recovery key and tested first on the recovery
+keyslot, and its `Step`s name the key each one's standard input or key
+file carries (`Key`): the recovery key, a pending token's passphrase or
+the new tpm-pin secret. `cancel` is U0's cancellation, the `td-upgrade`
+token's removal then the pending tokens'. It asks only what makes a
+header U0 (no reencryption, the identity unchanged, a device-bound
+token naming a keyslot, and no protected token but the pending fido2
+ones and `td-upgrade`, so the reader admits what it leaves), not
+`check`'s other rules, since its removals lose nothing: an upgrading
+header `check` refuses for a token of another type, one a foreign
+token joined after phase 1, can still leave the upgrade before its
+first commit. `pending_orphans` removes the pending tokens from a
+device-bound header. `on_mains` and
+`resilience` are the power and resilience rules over what the selector
+reads from `/sys`. Choices beyond ENCRYPTION.md's text, each failing
+closed:
+
+- A token of another type refuses the upgrading header: the
+  reencryption rewraps the recovery keyslot alone and wipes the others,
+  so a foreign protector would lose its keyslot. So does a keyslot not
+  of type `luks2` outside a reencryption, an update-retry or request
+  token, a token of the other shape, the FIDO2 shape without a
+  fido2-primary token, before the marker any protected token but a
+  pending fido2 one and `td-upgrade`, a device-bound token once the
+  identity changed, a device-bound token naming keyslot 0, a marker
+  naming none, a second tpm-pin token, from U4 a keyslot two tokens
+  name, and in U2 a reencryption keyslot whose `mode` is not
+  `reencrypt`: resuming a forged `decrypt` would leave the volume in
+  clear.
+- Only U0 waits for mains power, as ENCRYPTION.md's step 1 says. U1 also
+  starts the whole-volume rewrite, but after U0's commit the boot has
+  already asked for the recovery key and holds no device-bound
+  protector to boot by instead: waiting would only defer the rewrite to
+  a later recovery-key boot, so U1 starts on battery with the warning a
+  resumption gives.
+- U0's plan ends at its own commits, the kills and removals after which
+  nothing cancels. U1's plan repeats them for what a cut left, every
+  keyslot but 0 and every device-bound token, orphans included, then
+  re-encrypts, so no keyslot cryptsetup would wipe remains.
+- U3 marks the one `luks2` keyslot no token names; two such keyslots
+  refuse, since either could be the recovery key's.
+- U4 kills every keyslot no token names but the marker's, removes a
+  tpm-pin token naming none, adds each pending token's keyslot at the
+  lowest free number from 1, then the tpm-pin protector's. Each
+  protector is added, tested, and only then named by its token, the
+  fido2 one replaced in place: a fido2 token naming a keyslot is never
+  tested again by the upgrade, so a keyslot no test proved stays an
+  orphan the next boot kills and adds again. (A protected plan's
+  reseal imports before its test, since every boot's release tests its
+  tpm-pin keyslot.) Its last step is
+  `TakeLockout`, run by the selector with the token `lockout_import`
+  places at the lowest free number, when the TPM shape lacks a lockout
+  token and the TPM is usable; otherwise the `td-upgrade` token's
+  removal, since without a take nothing further makes the header U5.
+- A gathered tpm-pin protector or passphrase a state does not need is
+  ignored; one it needs and lacks refuses the plan (`MissingFido2`,
+  `NoTpmPin`).
+- U5's plan is the `td-upgrade` token's removal alone, tested by nothing:
+  the protected release already opened the volume.
+- The planner trusts `from`. Phase 1 writes it from `read_upgrade`'s view
+  alone. A `from` that never matched the volume reads as U3 at once and
+  ends without a rotation, but no header holding the device-bound
+  protector reads so (a device-bound token refuses U3), and removing that
+  protector by hand needs no less than writing the header; what such a
+  writer achieves, a volume protected under its old key, is the
+  device-bound root's inheritance ENCRYPTION.md's Scope already
+  concedes.
+- cryptsetup 2.8.8 finishes a reencryption by destroying the old key's
+  keyslots, each its own header commit, before the commit that drops its
+  requirement (`reencrypt_teardown_ok`), wiping each keyslot's area
+  before its commit. A cut from the first wipe to the last commit
+  leaves the requirement with no usable keyslot for the old key, which
+  no resumption opens
+  (ENCRYPTION.md "Threat and limits"): U2's plan is the resumption
+  alone, so such a boot fails at it and writes nothing.
+
+Each plan's header must fit the 12 KiB area, judged before its first
+step as the view's JSON length grown by what the plan adds and never
+shrunk by what it removes: a token's compact text and six bytes for its
+number and separators, a replaced token's growth, `KEYSLOT_JSON` (320
+bytes; an added keyslot measured 305, 307 at a two-digit number) per
+keyslot, `REENCRYPT_JSON` (1536; an initialization measured 1208 bytes
+with journal resilience and 1244 with checksum, and a split segment
+138 more, above) for the reencryption, and a lockout token at its
+largest for the take. The text must leave at least the area's last
+byte for its NUL, as cryptsetup and the reader require, so a plan whose
+bound reaches 12288 is refused. A removal alone always fits.
+
+**Runner.** The runner gains `reencrypt` in two spelled shapes, current
+since 8f: `reencrypt_args`, the upgrade's initialization and run
+(`--batch-mode --active-name NAME --key-slot N --key-file=-`, then
+`--use-random`, formatting's cipher, `--new-key-size 512`, its sector
+size and PBKDF2, then `--resilience checksum --resilience-hash sha256`
+or `--resilience journal`), and `reencrypt_resume_args` (`--resume-only
+--batch-mode --active-name NAME --key-file=-`), naming no keyslot, since
+cryptsetup then holds one for each volume key and tries the key on both.
+Both read the recovery key on standard input. cryptsetup 2.8.8 sizes the
+new key by `--new-key-size`, reading `--key-size` only for a header
+without keyslots, and a test ties each value to formatting's. It loads
+an online reencryption by the active mapping's name and uses the device
+operand only in messages, so the selector must hold `NAME` over the
+partition it read. Progress is not in these shapes: with
+`--batch-mode` cryptsetup prints none, and `--progress-json` streams
+past `run`'s output bound over a long reencryption, so the selector's
+commit adds it beside a run that reports progress as it reads it
+(ENCRYPTION.md asks at least every percent). `token import` with and without
+`--token-replace` for a token id, the second current since 8c
+(`token_replace_args`), is cryptsetup's one header commit replacing the
+token in place. Its
 `luksKillSlot` floor stays 32 bytes, which a FIDO2 passphrase and the
 recovery key's 48 digits meet.
 
@@ -1055,7 +1190,11 @@ HKDF expands two blocks. A plan has at most 39
 steps: two tests, a kill per keyslot from 1 to 31, a removal per td
 token, an add and an import. The runner's inputs are at most one page.
 A protected plan has at most 48 steps: a kill per keyslot but the
-opener's, a removal per td token, an add, an import and a test.
+opener's, a removal per td token, an add, an import and a test. An
+upgrade plan has at most 50: a test, a kill per keyslot but the
+recovery keyslot, a removal per orphan tpm-pin token, an add, an import
+and a test per pending fido2 token and for the tpm-pin protector, and
+the take or the `td-upgrade` token's removal.
 A PIN is at most 63 bytes, and a chain check sends one PCR_Read, one
 CreatePrimary, one Load and two flushes. A release tries at most four
 tokens, seals at most one protector, caps once, and runs at most one
@@ -1244,9 +1383,45 @@ a foreign token's keyslot, compare `metadata`, and refuse each class
 over its bound, every mixture of a device-bound token or orphan with a
 protected one, two device-bound tokens beside `td-upgrade`, a
 malformed protected token, a lockout naming a keyslot, a role td does
-not know yet and a token naming an absent keyslot. Planner tests refuse
+not know yet and a token naming an absent keyslot. Upgrade-view tests
+read cryptsetup 2.8.8's own dumps of a U1 header, of it after
+`reencrypt --init-only` and of a header after a whole reencryption, pin
+the data segment's identity against Python's hashlib, read the same
+view from a header area with its text's length, and leave the identity
+empty for no digest, another segment, a missing digest or salt and two
+digests naming segment 0, reading the requirement from its versions and
+refusing a malformed one. Planner tests refuse
 protected and upgrading headers and leave pending fido2 tokens beside a
-device-bound header with their numbers taken. Protected-plan tests, over
+device-bound header with their numbers taken. Upgrade-plan tests, over a
+model of cryptsetup's commits whose reencryption rewraps the recovery
+key at the lowest free keyslot, refuses one whose unlocked keyslot a
+token names (cryptsetup would move the token), needs a keyslot of each
+key to resume and wipes every old one at its end, and whose every state
+the reader admits as cryptsetup's metadata, drive the upgrade from U0 in
+both shapes and resilience modes (which differ in the model only in
+their arguments), cut after every step, after the reencryption's
+unbound keyslot and after its initialization, and the boot that resumes
+it cut the same way, and require one final header: the shape's
+protectors and the
+marker only, every keyslot named, the volume key rotated, the recovery
+key, each fido2 passphrase and the tpm-pin secret opening theirs, the
+lockout token in the TPM shape, no `td-upgrade` token, and
+`protected_plan::check` admitting it. They pin the states a cut leaves
+in the table's order with what each gathers, U5's plan needing no
+recovery key, the U0 to U3 and U4 plans and their arguments, an
+unbound keyslot killed in U1, a cut in cryptsetup's last commits
+planning only the resumption, a TPM unusable from the start or from
+any cut ending the upgrade without adding a tpm-pin or lockout token
+and one unusable at the take planning none, the mains and resilience
+rules, a cancellation at every cut, of a U0 header `check` refuses, and
+an interrupted phase 1 leaving a device-bound header without pending
+tokens, no cancellation after U0, every refusal above with forged
+headers, a reencryption in another mode, a plan that would not fit by
+one byte, a secret not gathered, no free token number, metadata that
+disagrees in the data segment or the requirement, and the lockout
+import's state. Every keyslot from 1 taken is the planner's refusal
+too, but a U4 header cannot reach it: a keyslot no token names is an
+orphan its plan frees. Protected-plan tests, over
 a model of cryptsetup's commits whose every state the reader's bounds
 must admit, pin a tpm-pin release retiring a superseded protector, an
 orphan keyslot and an orphan token; two tpm-pin tokens on one keyslot
@@ -1310,7 +1485,21 @@ an output over 8160 bytes refused untouched.
 The header measurement (`tests/header_fit.rs`) runs the pinned
 cryptsetup on 20 MiB files with td's own `luksFormat`, `luksAddKey` and
 `token import` argument lists and pins the JSON sizes above, each at
-least 1 KiB under the 12 KiB area, the two copies equal:
+least 1 KiB under the 12 KiB area, the two copies equal. It also holds
+the upgrade's growth bounds to what cryptsetup writes, and runs the
+upgrade from a device-bound header with phase 1's tokens to a protected
+one: each state's plan confirmed against cryptsetup's metadata and run
+through the runner's arguments, the TPM shape in both resilience modes,
+uncut and interrupted after the initialization, and the FIDO2 shape
+interrupted so. A file has no mapping, so the reencryption runs as the
+runner spells it with `--init-only` in place of `--active-name
+td-selector`, and resumes offline (`--force-offline-reencrypt
+--disable-locks`); the online shape is first run by the selector's
+oracle. The result is a header of the shape the protected planner
+admits, its volume key rotated, each protector opening its keyslot and
+a wrong key refused. It also emulates a cut in cryptsetup's last
+commits, keyslot 0 killed after an initialization, which no resumption
+opens:
 
 ```
 TD_TEST_CRYPTSETUP=/absolute/path/to/cryptsetup cargo test --frozen --manifest-path td-protector/Cargo.toml --test header_fit -- --ignored

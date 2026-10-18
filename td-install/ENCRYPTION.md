@@ -2018,20 +2018,23 @@ while the header is in state U0.
      keyslot.
    - U4 to U5: kill any `luks2` keyslot no token names but the marked
      one, an add an earlier attempt left; then for each pending fido2
-     token add its keyslot and replace the token with one naming it
-     (`token import --token-replace`), testing each; in the TPM shape
-     add the tpm-pin keyslot, import its token and test it, then take
-     the lockout ("Lockout"). When the TPM has become unusable for td
-     since phase 1 (absent, without a SHA-256 bank, with a lockout
+     token add its keyslot, test it, and only then replace the token
+     with one naming it (`token import --token-replace`); in the TPM
+     shape add the tpm-pin keyslot, test it and import its token, then
+     take the lockout ("Lockout"). When the TPM has become unusable for
+     td since phase 1 (absent, without a SHA-256 bank, with a lockout
      authorization td cannot prove, or creating a tpm-pin object over
      the token's bounds, refused at its seal before the cap), the
-     console says so and U4 ends
-     without a tpm-pin or lockout token: the volume completes as a
-     TPM-primary volume with no tpm-pin protector, as after a TPM clear,
-     whose boots ask for a token or the recovery key. Once the TPM is
-     eligible again, the first such boot offers no reseal and takes the
-     lockout, writing the lockout token; the boot after offers the
-     reseal, anchored to it ("Protected release").
+     console says so and U4 ends without a tpm-pin or lockout token:
+     the volume completes as a TPM-primary volume with no tpm-pin
+     protector, as after a TPM clear,
+     whose boots ask for a token or the recovery key. A TPM that
+     becomes unusable after the tpm-pin token's import and before the
+     take ends U4 the same way with that protector but no lockout
+     token. Once the TPM is eligible again, the first such boot offers
+     no reseal and takes the lockout, writing the lockout token; the
+     boot after offers the reseal, anchored to it ("Protected
+     release").
    - U5 to protected: remove the `td-upgrade` token.
 
    The selector keeps the mapping it opened, takes the volume key with
@@ -2046,7 +2049,7 @@ while the header is in state U0.
 | Phase 1, before `td-upgrade` | device-bound recovery and reseal; pending tokens removed; phase 1 again |
 | Upgrade boot, before the first commit | U0 again, cancel still offered |
 | U0 to U1, between kill and removal | U1 after the orphan's removal |
-| U1, U2 | reencryption starts or resumes with the recovery key |
+| U1, U2 | reencryption starts or resumes with the recovery key, but for the cut below |
 | U3 | marker import |
 | U4, after an add before its token | that keyslot killed as an orphan, the add repeated; a lost tpm-pin secret means the PIN is asked again before the cap |
 | U4, inside the lockout take | the take's own crash rule ("Lockout") |
@@ -2082,9 +2085,10 @@ keyslot is added or header written, and is a TPM unusable for td: the
 FIDO2 shape and the recovery key remain, as for one without a SHA-256
 bank, and 8c pins that ordering. If a later measurement leaves less
 than 1 KiB, a bound or the token counts shrink in that commit, amending
-this section. The planner computes each step's
-resulting JSON size and refuses a step whose header would not fit,
-before writing.
+this section. The planner bounds each plan's
+resulting JSON size, from the header's own and cryptsetup's measured
+growth, and refuses a plan whose header could outgrow the area, before
+writing (td-protector/DESIGN.md, "Upgrade plans").
 
 **Threat and limits.** Rotation makes the old volume key, and any copy
 of it taken while the volume was device-bound, useless for what is
@@ -2094,6 +2098,15 @@ remapping: someone holding the old key and the flash itself may still
 read data as it was before the upgrade. The recovery key opens the new
 key as before. The upgrade inherits whatever the device-bound system's
 root left behind (Scope).
+
+cryptsetup 2.8.8 ends a reencryption by destroying the old key's
+keyslots, each its own header commit, before the commit that drops its
+requirement. A power cut between them, a window of one keyslot-area
+wipe and two header writes after the last data is rewritten, leaves a
+header no resumption opens, though the rewrapped recovery keyslot holds
+the new key: every upgrade boot then fails at the resumption and writes
+nothing, and the volume needs a repair by hand that td does not
+provide.
 
 ### Protector management
 

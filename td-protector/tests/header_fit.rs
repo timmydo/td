@@ -18,14 +18,22 @@
 )]
 
 use std::ffi::OsString;
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use td_fs::TempDir;
+use td_protector::cryptsetup::Resilience;
 use td_protector::cryptsetup::{self, Cryptsetup, KeyFile};
+use td_protector::luks2::UpgradeView;
 use td_protector::luks2::{self, Kind, BINARY_HEADER_LEN, JSON_AREA_LEN};
 use td_protector::pin::PinPcrs;
 use td_protector::protected::{
     Fido2, FidoRole, Lockout, Operation, Shape, Token, TpmPin, UpdateRetry,
+};
+use td_protector::protected_plan;
+use td_protector::token::{self as device, Role};
+use td_protector::upgrade::{
+    self, Gathered, Input, Key, State, Step, Tpm, KEYSLOT_JSON, REENCRYPT_JSON,
 };
 use td_tpm::SealedObject;
 
@@ -40,21 +48,8 @@ const PROTECTED_JSON: usize = 10360;
 const UPGRADE_U2_JOURNAL_JSON: usize = 9696;
 const UPGRADE_U2_CHECKSUM_JSON: usize = 9732;
 
-struct Scratch(PathBuf);
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-fn scratch(name: &str) -> Scratch {
-    let dir = std::env::temp_dir().join(format!(
-        "td-protector-header-fit-{name}-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir(&dir).unwrap();
-    Scratch(dir)
+fn scratch(name: &str) -> TempDir {
+    TempDir::new(&format!("td-protector-header-fit-{name}")).unwrap()
 }
 
 fn tool() -> Option<Cryptsetup> {
@@ -193,7 +188,7 @@ fn the_largest_protected_header_fits() {
         panic!("TD_TEST_CRYPTSETUP names no cryptsetup");
     };
     let dir = scratch("protected");
-    let image = format(&cs, &dir.0);
+    let image = format(&cs, dir.path());
     for slot in 26..=31 {
         add_keyslot(&cs, &image, slot);
     }
@@ -273,7 +268,7 @@ fn a_u2_header_reads_as_upgrading() {
         panic!("TD_TEST_CRYPTSETUP names no cryptsetup");
     };
     let dir = scratch("u2-read");
-    let image = format(&cs, &dir.0);
+    let image = format(&cs, dir.path());
     for id in 0..4 {
         import(&cs, &image, id, &fido2(None).encode().unwrap());
     }
@@ -297,7 +292,7 @@ fn upgrading_u2(name: &str, resilience: &[&str], expected: usize) {
         panic!("TD_TEST_CRYPTSETUP names no cryptsetup");
     };
     let dir = scratch(name);
-    let image = format(&cs, &dir.0);
+    let image = format(&cs, dir.path());
     let mut id = 19;
     for _ in 0..4 {
         import(&cs, &image, id, &fido2(None).encode().unwrap());
@@ -349,4 +344,270 @@ fn the_largest_u2_header_fits_in_checksum_resilience() {
         &["--resilience", "checksum", "--resilience-hash", "sha256"],
         UPGRADE_U2_CHECKSUM_JSON,
     );
+}
+
+/// The runner's reencryption as the upgrade spells it, initialized only:
+/// online it runs under the selector's mapping, which a file has none of.
+fn reencrypt_init_only(cs: &Cryptsetup, image: &Path, slot: u8, resilience: Resilience) {
+    let mut args = cryptsetup::reencrypt_args(image, "td-selector", slot, resilience);
+    let at = args.iter().position(|arg| arg == "--active-name").unwrap();
+    args.splice(at..at + 2, [OsString::from("--init-only")]);
+    cs.run(&args, RECOVERY).unwrap();
+}
+
+/// The runner's resumption, offline in place of under the mapping, with no
+/// lock directory to take.
+fn resume_offline(cs: &Cryptsetup, image: &Path) {
+    let mut args = cryptsetup::reencrypt_resume_args(image, "td-selector");
+    let at = args.iter().position(|arg| arg == "--active-name").unwrap();
+    args.splice(
+        at..at + 2,
+        ["--force-offline-reencrypt", "--disable-locks"].map(OsString::from),
+    );
+    cs.run(&args, RECOVERY).unwrap();
+}
+
+/// The upgrade planner's growth bounds hold for what cryptsetup writes: a
+/// keyslot added at a two-digit number, and the reencryption's
+/// initialization in both resilience modes.
+#[test]
+#[ignore = "needs TD_TEST_CRYPTSETUP and the kernel's AF_ALG"]
+fn the_upgrade_growth_bounds_hold() {
+    let Some(cs) = tool() else {
+        panic!("TD_TEST_CRYPTSETUP names no cryptsetup");
+    };
+    let dir = scratch("growth-keyslot");
+    let image = format(&cs, dir.path());
+    let before = json_len(&image);
+    add_keyslot(&cs, &image, 31);
+    let grown = json_len(&image) - before;
+    eprintln!("a keyslot adds {grown} bytes");
+    assert!(grown <= KEYSLOT_JSON, "{grown}");
+    for resilience in [Resilience::Checksum, Resilience::Journal] {
+        let dir = scratch(&format!("growth-{resilience:?}"));
+        let image = format(&cs, dir.path());
+        let before = json_len(&image);
+        reencrypt_init_only(&cs, &image, 0, resilience);
+        let grown = json_len(&image) - before;
+        eprintln!("{resilience:?} reencryption adds {grown} bytes");
+        assert!(grown <= REENCRYPT_JSON, "{grown}");
+    }
+}
+
+fn read_upgrade(image: &Path) -> UpgradeView {
+    luks2::read_upgrade(&mut File::open(image).unwrap()).unwrap()
+}
+
+/// The secret each of the upgrade's keys stands for in this test.
+fn secret(key: Key) -> Vec<u8> {
+    match key {
+        Key::Recovery => RECOVERY.to_vec(),
+        Key::Fido2 { token } => vec![0xf0 + token; 32],
+        Key::TpmPin => vec![0x77; 32],
+    }
+}
+
+/// One plan step through the runner, the reencryption stopped after its
+/// initialization when `interrupt` is set.
+fn run_step(cs: &Cryptsetup, image: &Path, step: &Step, interrupt: bool) {
+    match step {
+        Step::Reencrypt { slot, resilience } => {
+            reencrypt_init_only(cs, image, *slot, *resilience);
+            if !interrupt {
+                resume_offline(cs, image);
+            }
+        }
+        Step::ResumeReencrypt => resume_offline(cs, image),
+        Step::TakeLockout => {
+            let lockout = Lockout {
+                primary: [0x0b; 34],
+                nonce: [1; 32],
+                ciphertext: [2; 32],
+                tag: [3; 32],
+                proven: false,
+            };
+            let (_, import) = upgrade::lockout_import(&read_upgrade(image), &lockout).unwrap();
+            run_step(cs, image, &import, false);
+        }
+        _ => {
+            let key = step
+                .new_key()
+                .map(|key| KeyFile::new(&secret(key)).unwrap());
+            let new_key = key
+                .as_ref()
+                .map_or(Path::new("/nonexistent"), KeyFile::path);
+            let args = step.args(image, "td-selector", new_key).unwrap();
+            let input = match step.input() {
+                Input::Key(key) => secret(key),
+                Input::Token(token) => token.encode().unwrap().into_bytes(),
+                Input::Nothing => Vec::new(),
+            };
+            cs.run(&args, &input).unwrap();
+        }
+    }
+}
+
+/// The upgrade from U0 to a protected header over the headers cryptsetup
+/// writes: phase 1's pending tokens and `td-upgrade` token over a
+/// device-bound volume, then each state's plan, confirmed against
+/// cryptsetup's own metadata and run through the runner: the TPM shape in
+/// both resilience modes, uncut and interrupted after the reencryption's
+/// initialization (U2), and the FIDO2 shape interrupted so. The result is
+/// a header of the shape the protected planner admits, its volume key
+/// rotated, every protector opening its keyslot and a wrong key refused.
+#[test]
+#[ignore = "needs TD_TEST_CRYPTSETUP and the kernel's AF_ALG"]
+fn the_upgrade_runs_over_cryptsetup_headers() {
+    let Some(cs) = tool() else {
+        panic!("TD_TEST_CRYPTSETUP names no cryptsetup");
+    };
+    for (shape, resilience, interrupt) in [
+        (Shape::Tpm, Resilience::Checksum, false),
+        (Shape::Tpm, Resilience::Journal, true),
+        (Shape::Fido2, Resilience::Checksum, true),
+    ] {
+        let case = format!("{shape:?} {resilience:?} {interrupt}");
+        let dir = scratch(&format!("upgrade-{shape:?}-{resilience:?}"));
+        let image = format(&cs, dir.path());
+        add_keyslot(&cs, &image, 1);
+        let bound = device::Token::new(
+            1,
+            Role::DeviceBound,
+            SealedObject {
+                public: vec![0x00, 0x08, 0x01],
+                private: vec![0x01, 0x01],
+            },
+        )
+        .unwrap();
+        import(&cs, &image, 0, &bound.encode());
+        for n in [1, 2] {
+            let role = match (shape, n) {
+                (Shape::Fido2, 1) => FidoRole::Primary,
+                _ => FidoRole::Recovery,
+            };
+            let pending = Token::Fido2(Fido2 {
+                keyslot: None,
+                role,
+                credential: vec![n; 16],
+                salt: [n; 32],
+                x: [n; 32],
+                y: [n; 32],
+            });
+            import(&cs, &image, n, &pending.encode().unwrap());
+        }
+        let from = read_upgrade(&image).volume.segment.unwrap();
+        let upgrade = Token::Upgrade { shape, from };
+        import(&cs, &image, 3, &upgrade.encode().unwrap());
+        let sealed = TpmPin {
+            keyslot: None,
+            pcrs: PinPcrs::Selector,
+            primary: [0x0b; 34],
+            salt: [0x5a; 32],
+            sealed: SealedObject {
+                public: vec![0x77; 78],
+                private: vec![0x66; 158],
+            },
+        };
+        let gathered = Gathered {
+            fido2: &[1, 2],
+            tpm: match shape {
+                Shape::Tpm => Tpm::Sealed(&sealed),
+                Shape::Fido2 => Tpm::None,
+            },
+            resilience,
+        };
+        let mut states = Vec::new();
+        let mut cut = interrupt;
+        while read_upgrade(&image).header.kind() == Kind::Upgrading {
+            assert!(states.len() < 8, "{states:?}");
+            let view = read_upgrade(&image);
+            states.push(upgrade::check(&view).unwrap().0);
+            let metadata = cs.metadata(&image).unwrap();
+            let steps = upgrade::plan(&view, &gathered)
+                .unwrap()
+                .confirm(&metadata)
+                .unwrap();
+            for step in &steps {
+                run_step(&cs, &image, step, cut);
+            }
+            cut &= !steps.iter().any(|s| matches!(s, Step::Reencrypt { .. }));
+        }
+        // The interrupted reencryption shows U2; the FIDO2 shape's U4 plan
+        // ends the upgrade itself, the TPM shape's with the take, which
+        // leaves U5.
+        let mut expected = vec![State::U0, State::U1];
+        if interrupt {
+            expected.push(State::U2);
+        }
+        expected.extend([State::U3, State::U4]);
+        if shape == Shape::Tpm {
+            expected.push(State::U5);
+        }
+        assert_eq!(states, expected, "{case}");
+        let view = read_upgrade(&image);
+        assert_eq!(view.header.kind(), Kind::Protected);
+        assert_eq!(protected_plan::check(&view.header), Ok(shape), "{case}");
+        assert_ne!(view.volume.segment, Some(from));
+        let theirs = luks2::metadata(&cs.metadata(&image).unwrap()).unwrap();
+        assert_eq!(theirs, view.header.metadata());
+        let mut opened = Vec::new();
+        for (_, token) in &view.header.protected {
+            let key = match token {
+                Token::RecoveryKey { .. } => Key::Recovery,
+                Token::Fido2(fido) => Key::Fido2 {
+                    token: fido.credential[0],
+                },
+                Token::TpmPin(_) => Key::TpmPin,
+                Token::Lockout(_) => continue,
+                other => panic!("{other:?} remains"),
+            };
+            let slot = token.keyslot().unwrap();
+            cs.run(&cryptsetup::test_args(&image, slot), &secret(key))
+                .unwrap();
+            let wrong = cs
+                .run(&cryptsetup::test_args(&image, slot), &[0x33; 32])
+                .unwrap_err();
+            assert_eq!(
+                cryptsetup::exit_code(&wrong),
+                Some(cryptsetup::EXIT_BAD_PASSPHRASE)
+            );
+            opened.push(slot);
+        }
+        opened.sort_unstable();
+        assert_eq!(opened, view.header.keyslots, "{case}");
+        let tpm_pin = usize::from(shape == Shape::Tpm);
+        assert_eq!(opened.len(), 3 + tpm_pin, "{case}");
+    }
+}
+
+/// cryptsetup's last reencryption commits destroy the old key's keyslots
+/// one at a time while its requirement stays (ENCRYPTION.md "Threat and
+/// limits"). The header a cut there leaves, emulated by killing keyslot 0
+/// of an initialized reencryption, is one no resumption opens with the
+/// recovery key, though the rewrapped keyslot still holds it: the
+/// planner's U2 can only offer the resumption again.
+#[test]
+#[ignore = "needs TD_TEST_CRYPTSETUP and the kernel's AF_ALG"]
+fn a_cut_inside_cryptsetups_last_commits_cannot_resume() {
+    let Some(cs) = tool() else {
+        panic!("TD_TEST_CRYPTSETUP names no cryptsetup");
+    };
+    let dir = scratch("finishing");
+    let image = format(&cs, dir.path());
+    reencrypt_init_only(&cs, &image, 0, Resilience::Journal);
+    cs.run(&cryptsetup::kill_slot_args(&image, 0), RECOVERY)
+        .unwrap();
+    let view = read_upgrade(&image);
+    assert!(view.volume.reencryption);
+    assert_eq!(view.volume.luks2, [1]);
+    let mut resume = cryptsetup::reencrypt_resume_args(&image, "td-selector");
+    let at = resume
+        .iter()
+        .position(|arg| arg == "--active-name")
+        .unwrap();
+    resume.splice(
+        at..at + 2,
+        ["--force-offline-reencrypt", "--disable-locks"].map(OsString::from),
+    );
+    assert!(cs.run(&resume, RECOVERY).is_err());
 }
