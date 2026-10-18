@@ -171,6 +171,104 @@ impl SelectorForm {
 /// (td-authd/DESIGN.md, amendment 10).
 pub const SELECTOR_UPDATE_CEILING: Duration = Duration::from_secs(240);
 
+/// The upgrade's cancellation's ceiling, split as a selector update's.
+pub const UPGRADE_CANCEL_CEILING: Duration = SELECTOR_UPDATE_CEILING;
+
+/// The protected shape an upgrade chooses, tag 17's shape byte
+/// (td-install/ENCRYPTION.md, "Re-encrypting upgrade", phase 1).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UpgradeShape {
+    /// TPM primary, `1`: its new keys are fido2-recovery tokens.
+    Tpm,
+    /// FIDO2 primary, `2`: its new keys are fido2-primary tokens.
+    Fido2,
+}
+
+impl UpgradeShape {
+    pub fn byte(self) -> u8 {
+        match self {
+            Self::Tpm => 1,
+            Self::Fido2 => 2,
+        }
+    }
+
+    pub fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            1 => Some(Self::Tpm),
+            2 => Some(Self::Fido2),
+            _ => None,
+        }
+    }
+
+    /// Whether phase 1 may enroll `count` new keys in this shape: zero to
+    /// two recovery keys beside the TPM, one or two primary keys.
+    pub fn takes(self, count: u8) -> bool {
+        match self {
+            Self::Tpm => count <= 2,
+            Self::Fido2 => (1..=2).contains(&count),
+        }
+    }
+}
+
+/// An upgrade's ceiling, root's and the worker's: a selector update's
+/// 120 seconds for the reads and the review and 120 for the writes, and
+/// 120 per new key's ceremony (td-authd/DESIGN.md, amendment 10).
+pub fn upgrade_ceiling(count: u8) -> Duration {
+    SELECTOR_UPDATE_CEILING.saturating_add(LOGIN_CEREMONY.saturating_mul(u32::from(count)))
+}
+
+/// The review step's byte, after the login steps' and the disk proof's.
+const REVIEW: u8 = 12;
+
+/// A new key's ceremony, in its only order: connect, create, prove,
+/// repeat and probe, a first enrollment's and an upgrade's.
+const CEREMONY: &[u8] = &[8, 3, 4, 5, 6];
+
+/// One presented step of an upgrade: its review, which discloses and
+/// carries the approval key, or a step of a new key's ceremony.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UpgradeStep {
+    Review,
+    /// `key` is 1 through the new key count; `step` is connect, create,
+    /// prove, repeat or probe.
+    Key {
+        key: u8,
+        step: LoginStep,
+    },
+}
+
+impl UpgradeStep {
+    /// Its key byte, `0` for the review, and its step byte.
+    fn position(self) -> (u8, u8) {
+        match self {
+            Self::Review => (0, REVIEW),
+            Self::Key { key, step } => (key, step.byte()),
+        }
+    }
+
+    /// The ceremony step a key step presents, none for the review.
+    pub fn login(self) -> Option<LoginStep> {
+        match self {
+            Self::Review => None,
+            Self::Key { step, .. } => Some(step),
+        }
+    }
+}
+
+/// The step that must follow `position` in an upgrade of `count` new
+/// keys, or none after its last.
+fn upgrade_following(count: u8, (key, byte): (u8, u8)) -> Option<(u8, u8)> {
+    if key == 0 {
+        return (count > 0).then_some((1, LoginStep::Connect.byte()));
+    }
+    let index = CEREMONY.iter().position(|step| *step == byte)?;
+    match CEREMONY.get(index.saturating_add(1)) {
+        Some(next) => Some((key, *next)),
+        None if key < count => Some((key.saturating_add(1), LoginStep::Connect.byte())),
+        None => None,
+    }
+}
+
 /// The renderer's columns at its narrowest accepted output, 320 pixels less
 /// 48 of margin in 8-pixel Unifont cells (td-compositor/src/attention.rs).
 /// Every login row fits, so wrapping never splits a fingerprint.
@@ -359,7 +457,7 @@ impl LoginKind {
     fn steps(self, proof: Option<Proof>) -> &'static [u8] {
         match (self, proof) {
             (Self::Unlock, _) => &[1, 7],
-            (Self::Enroll, None) => &[8, 3, 4, 5, 6],
+            (Self::Enroll, None) => CEREMONY,
             (Self::Enroll, Some(Proof::RecoveryKey)) => &[9, 8, 3, 4, 5, 6],
             (Self::Enroll, Some(Proof::DiskKey)) => &[10, 11, 8, 3, 4, 5, 6],
             (Self::Add, None) => &[1, 2, 8, 3, 4, 5, 6],
@@ -700,6 +798,23 @@ pub enum Operation {
         form: SelectorForm,
         current: String,
     },
+    /// Storage operation `02`: phase 1 of the re-encrypting upgrade to
+    /// `shape`, enrolling `count` new keys, writing the running
+    /// deployment `current`'s selector. `approval` is the review's key,
+    /// on the review only.
+    Upgrade {
+        account: u32,
+        shape: UpgradeShape,
+        count: u8,
+        current: String,
+        step: UpgradeStep,
+        approval: Option<ApprovalKey>,
+    },
+    /// Storage operation `03`: the upgrade's cancellation in state U0.
+    /// One step, confirmed by typing `key`.
+    UpgradeCancel {
+        key: ApprovalKey,
+    },
 }
 
 impl Operation {
@@ -902,6 +1017,26 @@ impl Request {
             Operation::SelectorUpdate { current, .. } if !deployment_id(current) => {
                 return Err("invalid consent selector update deployment".into());
             }
+            Operation::Upgrade {
+                account,
+                shape,
+                count,
+                current,
+                step,
+                approval,
+            } if *account != owner
+                || !shape.takes(*count)
+                || !deployment_id(current)
+                || approval.is_some() != (*step == UpgradeStep::Review)
+                || match step {
+                    UpgradeStep::Review => false,
+                    UpgradeStep::Key { key, step } => {
+                        !(1..=*count).contains(key) || !CEREMONY.contains(&step.byte())
+                    }
+                } =>
+            {
+                return Err("invalid consent upgrade".into());
+            }
             Operation::SetHostname {
                 key: _,
                 requester,
@@ -956,10 +1091,13 @@ impl Request {
     }
 
     /// The ceiling a prompt's time line counts from where the operation
-    /// fixes one: a login operation's, or a selector update's.
+    /// fixes one: a login operation's, a selector update's, an
+    /// upgrade's or its cancellation's.
     pub fn ceiling(&self) -> Option<Duration> {
         match self.operation {
             Operation::SelectorUpdate { .. } => Some(SELECTOR_UPDATE_CEILING),
+            Operation::Upgrade { count, .. } => Some(upgrade_ceiling(count)),
+            Operation::UpgradeCancel { .. } => Some(UPGRADE_CANCEL_CEILING),
             _ => self.login_ceiling(),
         }
     }
@@ -1244,6 +1382,126 @@ impl Request {
         Ok(admitted)
     }
 
+    /// The step an upgrade description presents; none on every other.
+    pub fn upgrade_step(&self) -> Option<UpgradeStep> {
+        match self.operation {
+            Operation::Upgrade { step, .. } => Some(step),
+            _ => None,
+        }
+    }
+
+    /// The approval key an upgrade's review or its cancellation carries.
+    pub fn upgrade_approval(&self) -> Option<ApprovalKey> {
+        match self.operation {
+            Operation::Upgrade { approval, .. } => approval,
+            Operation::UpgradeCancel { key } => Some(key),
+            _ => None,
+        }
+    }
+
+    /// The shape of an upgrade's first presentation: its review. `Last`
+    /// when it enrolls no new key, so only its commit follows.
+    pub fn upgrade_start(&self) -> Result<Admitted, String> {
+        match self.operation {
+            Operation::Upgrade {
+                step: UpgradeStep::Review,
+                count,
+                ..
+            } => Ok(if count == 0 {
+                Admitted::Last
+            } else {
+                Admitted::Next
+            }),
+            Operation::Upgrade { .. } => Err("an upgrade begins at its review".into()),
+            _ => Err("not an upgrade step".into()),
+        }
+    }
+
+    /// The shape of `next` as this upgrade step's successor, from the two
+    /// descriptions alone: `next` keeps the nonce, owner, account, shape,
+    /// count and deployment; its step is the only legal next one, a key's
+    /// probe moving to the next key's connect; a repeat or probe names the
+    /// credential its prove named; and a PIN step's retries are not zero.
+    /// `Last` means `next` is the upgrade's final step.
+    pub fn upgrade_successor(&self, next: &Self) -> Result<Admitted, String> {
+        let (
+            Operation::Upgrade {
+                account,
+                shape,
+                count,
+                current,
+                step,
+                ..
+            },
+            Operation::Upgrade {
+                account: next_account,
+                shape: next_shape,
+                count: next_count,
+                current: next_current,
+                step: next_step,
+                ..
+            },
+        ) = (&self.operation, &next.operation)
+        else {
+            return Err("not an upgrade step".into());
+        };
+        if next.nonce != self.nonce
+            || next.owner != self.owner
+            || next_account != account
+            || next_shape != shape
+            || next_count != count
+            || next_current != current
+        {
+            return Err("upgrade step changed its operation".into());
+        }
+        if upgrade_following(*count, step.position()) != Some(next_step.position()) {
+            return Err("illegal upgrade step order".into());
+        }
+        let (current_key, following) = (step.login(), next_step.login());
+        if matches!(
+            following,
+            Some(LoginStep::Repeat { .. } | LoginStep::Probe { .. })
+        ) && following.and_then(LoginStep::key) != current_key.and_then(LoginStep::key)
+        {
+            return Err("upgrade step changed its key".into());
+        }
+        if following.and_then(LoginStep::retries) == Some(0) {
+            return Err("a blocked key cannot take a PIN".into());
+        }
+        Ok(match upgrade_following(*count, next_step.position()) {
+            Some(_) => Admitted::Next,
+            None => Admitted::Last,
+        })
+    }
+
+    /// Admits `invitation`, the storage worker's next upgrade step:
+    /// `upgrade_successor`, then the device data. `baseline` is the
+    /// fingerprints of the header's fido2 tokens; `created` the credential
+    /// the worker reported creating in the current key's ceremony, which
+    /// exists only between its create and probe steps. A prove, repeat or
+    /// probe names the created credential, which no baseline token names.
+    pub fn admit_upgrade_step(
+        &self,
+        invitation: &Self,
+        baseline: &[Fingerprint],
+        created: Option<Fingerprint>,
+    ) -> Result<Admitted, String> {
+        let admitted = self.upgrade_successor(invitation)?;
+        let named = match invitation.upgrade_step().and_then(UpgradeStep::login) {
+            Some(LoginStep::Connect | LoginStep::Create { .. }) => created.is_none(),
+            Some(
+                LoginStep::Prove { key, .. }
+                | LoginStep::Repeat { key, .. }
+                | LoginStep::Probe { key },
+            ) => created == Some(key) && !baseline.contains(&key),
+            _ => false,
+        };
+        if !named {
+            return Err("upgrade step names a key root did not admit".into());
+        }
+        Ok(admitted)
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(MAX_BYTES);
         bytes.extend_from_slice(MAGIC);
@@ -1398,6 +1656,38 @@ impl Request {
                 bytes.extend_from_slice(&key.digits());
                 bytes.push(form.byte());
                 bytes.extend_from_slice(current.as_bytes());
+            }
+            Operation::Upgrade {
+                account,
+                shape,
+                count,
+                current,
+                step,
+                approval,
+            } => {
+                bytes.push(17);
+                bytes.extend_from_slice(&account.to_be_bytes());
+                bytes.push(shape.byte());
+                bytes.push(*count);
+                bytes.extend_from_slice(current.as_bytes());
+                let (key, byte) = step.position();
+                bytes.push(key);
+                bytes.push(byte);
+                if let Some(step) = step.login() {
+                    if let Some(key) = step.key() {
+                        bytes.extend_from_slice(&key);
+                    }
+                    if let Some(retries) = step.retries() {
+                        bytes.push(retries);
+                    }
+                }
+                if let Some(approval) = approval {
+                    bytes.extend_from_slice(&approval.digits());
+                }
+            }
+            Operation::UpgradeCancel { key } => {
+                bytes.push(18);
+                bytes.extend_from_slice(&key.digits());
             }
         }
         bytes
@@ -1599,6 +1889,39 @@ impl Request {
                     current: input.deployment()?,
                 }
             }
+            17 => {
+                let account = input.number()?;
+                let shape = UpgradeShape::from_byte(input.byte()?)
+                    .ok_or("invalid consent upgrade shape")?;
+                let count = input.byte()?;
+                let current = input.deployment()?;
+                let (step, approval) = match input.byte()? {
+                    0 => {
+                        if input.byte()? != REVIEW {
+                            return Err("invalid consent upgrade review".into());
+                        }
+                        (UpgradeStep::Review, Some(input.approval_key()?))
+                    }
+                    key => (
+                        UpgradeStep::Key {
+                            key,
+                            step: input.login_step()?,
+                        },
+                        None,
+                    ),
+                };
+                Operation::Upgrade {
+                    account,
+                    shape,
+                    count,
+                    current,
+                    step,
+                    approval,
+                }
+            }
+            18 => Operation::UpgradeCancel {
+                key: input.approval_key()?,
+            },
             _ => return Err("unknown consent operation".into()),
         };
         if !input.0.is_empty() {
@@ -1766,6 +2089,18 @@ impl Request {
                 lines.extend(form.rows().map(String::from));
                 approval_lines(&mut lines, *key);
             }
+            Operation::Upgrade {
+                shape,
+                count,
+                current,
+                step,
+                approval,
+                ..
+            } => upgrade_lines(&mut lines, *shape, *count, current, *step, *approval),
+            Operation::UpgradeCancel { key } => {
+                lines.extend(UPGRADE_CANCEL.iter().map(|row| row.to_string()));
+                approval_lines(&mut lines, *key);
+            }
         }
         // A key's rows carry their own Escape.
         if !matches!(
@@ -1776,6 +2111,7 @@ impl Request {
                 | Operation::SetHostname { .. }
                 | Operation::SelectorUpdate { .. }
         ) && self.login_approval().is_none()
+            && self.upgrade_approval().is_none()
         {
             lines.push("ESC TO CANCEL".into());
         }
@@ -1921,6 +2257,103 @@ fn login_lines(lines: &mut Vec<String>, login: &Login<'_>) {
         approval_lines(lines, key);
     }
 }
+
+/// An upgrade's rows: its shape and count, then the review's ID and
+/// disclosure with the approval key, or a key step's rows as a first
+/// enrollment's, without the ID its bytes bind.
+fn upgrade_lines(
+    lines: &mut Vec<String>,
+    shape: UpgradeShape,
+    count: u8,
+    current: &str,
+    step: UpgradeStep,
+    approval: Option<ApprovalKey>,
+) {
+    match shape {
+        UpgradeShape::Tpm => {
+            lines.push("PROTECT THE DISK: TPM AND PIN".into());
+            lines.push(format!("NEW RECOVERY KEYS: {count}"));
+        }
+        UpgradeShape::Fido2 => {
+            lines.push("PROTECT THE DISK: SECURITY KEYS".into());
+            lines.push(format!("NEW PRIMARY KEYS: {count}"));
+        }
+    }
+    match step {
+        UpgradeStep::Review => {
+            lines.push(format!("DEPLOYMENT: {current}"));
+            lines.extend(UPGRADE_REVIEW.iter().map(|row| row.to_string()));
+            lines.push(
+                match (shape, count) {
+                    (UpgradeShape::Tpm, 0) => "AND FOR A NEW PIN",
+                    (UpgradeShape::Tpm, _) => "AND FOR THESE KEYS AND A NEW PIN",
+                    (UpgradeShape::Fido2, _) => "AND FOR THESE KEYS",
+                }
+                .into(),
+            );
+            if shape == UpgradeShape::Fido2 {
+                lines.extend(FIDO2_TRADE_OFFS.iter().map(|row| row.to_string()));
+            }
+            if let Some(key) = approval {
+                approval_lines(lines, key);
+            }
+        }
+        UpgradeStep::Key { key, step } => {
+            lines.push(format!("NEW KEY {key} OF {count}"));
+            match step {
+                LoginStep::Connect => {
+                    if key > 1 {
+                        lines.push("REMOVE THE PREVIOUS KEY".into());
+                    }
+                    lines.push("CONNECT ONLY THE NEW KEY".into());
+                }
+                LoginStep::Create { .. } => lines.push("CREATE A DISK CREDENTIAL".into()),
+                LoginStep::Prove { key, .. } => lines.push(format!("VERIFY NEW KEY {}", hex(&key))),
+                LoginStep::Repeat { key, .. } => {
+                    lines.push(format!("VERIFY NEW KEY {} AGAIN", hex(&key)));
+                }
+                LoginStep::Probe { key } => {
+                    lines.push(format!("CHECKING NEW KEY {}", hex(&key)));
+                    lines.push("KEEP IT CONNECTED AND TOUCH IT".into());
+                }
+                // Construction admits only the ceremony's steps.
+                _ => {}
+            }
+            if let Some(retries) = step.retries() {
+                lines.push(format!("{retries} PIN ATTEMPTS LEFT ON THIS KEY"));
+                lines.push("ENTER ITS PIN, THEN TOUCH THE KEY".into());
+            }
+        }
+    }
+}
+
+/// The review's disclosure (td-install/ENCRYPTION.md, phase 1), before
+/// the row naming what the upgrade boot asks for. Every row fits
+/// `PROMPT_COLUMNS` and the renderer's glyphs.
+const UPGRADE_REVIEW: &[&str] = &[
+    "THE NEXT BOOT REWRITES THE DISK",
+    "ONE READ AND ONE OR TWO WRITES",
+    "OF THE WHOLE VOLUME",
+    "IT NEEDS MAINS POWER",
+    "THE MACHINE IS UNUSABLE UNTIL DONE",
+    "IT ASKS FOR THE RECOVERY KEY",
+    "WHICH STAYS THE RECOVERY PROTECTOR",
+];
+
+/// The FIDO2 shape's two trade-offs, which its choice discloses.
+const FIDO2_TRADE_OFFS: &[&str] = &[
+    "AN ALTERED BOOT CAN TAKE THE DISK",
+    "FROM ONE USE OF A KEY AND PIN",
+    "WHILE A FIRMWARE TPM GUESS COUNT",
+    "CAN ROLL BACK WITH ITS FLASH",
+];
+
+/// The cancellation's rows, before its approval key's.
+const UPGRADE_CANCEL: &[&str] = &[
+    "CANCEL PROTECTING THE DISK",
+    "THE NEXT BOOT MAY NEED",
+    "THE RECOVERY KEY AND A RESEAL",
+];
 
 /// What a first enrollment changes (td-login/TOKEN-LOGIN.md, "Enrollment,
 /// addition and removal"). Every disclosure row fits `PROMPT_COLUMNS`.
@@ -2204,6 +2637,50 @@ mod tests {
         }
     }
 
+    fn upgrade(shape: UpgradeShape, count: u8, step: UpgradeStep) -> Operation {
+        Operation::Upgrade {
+            account: 1000,
+            shape,
+            count,
+            current: CURRENT.into(),
+            step,
+            approval: (step == UpgradeStep::Review).then(|| approval(b"58")),
+        }
+    }
+
+    fn key_step(key: u8, step: LoginStep) -> UpgradeStep {
+        UpgradeStep::Key { key, step }
+    }
+
+    /// Every step of an upgrade of `count` new keys, in its only order,
+    /// the created credentials `0x0k0k0k0k`.
+    fn upgrade_steps(count: u8) -> Vec<UpgradeStep> {
+        let mut steps = vec![UpgradeStep::Review];
+        for key in 1..=count {
+            let made = [key; 4];
+            steps.extend([
+                key_step(key, LoginStep::Connect),
+                key_step(key, LoginStep::Create { retries: 8 }),
+                key_step(
+                    key,
+                    LoginStep::Prove {
+                        key: made,
+                        retries: 8,
+                    },
+                ),
+                key_step(
+                    key,
+                    LoginStep::Repeat {
+                        key: made,
+                        retries: 7,
+                    },
+                ),
+                key_step(key, LoginStep::Probe { key: made }),
+            ]);
+        }
+        steps
+    }
+
     fn rename(requester: u32, old: &str, new: &str) -> Operation {
         Operation::SetHostname {
             key: approval(b"29"),
@@ -2394,6 +2871,452 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Tag 17: the account, shape, count and running deployment's ID,
+    /// then the step, 119 bytes for the review and 122 at the widest; tag
+    /// 18: the key alone, 47 bytes (td-authd/DESIGN.md, amendment 10).
+    #[test]
+    fn an_upgrade_and_its_cancellation_encode_exactly() {
+        let mut header = b"TDCONS01".to_vec();
+        header.extend([1; 32]);
+        header.extend(1000u32.to_be_bytes());
+        assert_eq!(header.len(), 44);
+        let review = Request::new(
+            [1; 32],
+            1000,
+            upgrade(UpgradeShape::Tpm, 2, UpgradeStep::Review),
+        )
+        .unwrap();
+        let mut literal = header.clone();
+        literal.push(17);
+        literal.extend(1000u32.to_be_bytes());
+        literal.extend([1, 2]);
+        literal.extend(CURRENT.as_bytes());
+        literal.extend([0, 12, b'5', b'8']);
+        assert_eq!(literal.len(), 119);
+        assert_eq!(review.encode(), literal);
+        assert_eq!(Request::decode(&literal).unwrap(), review);
+        assert_eq!(review.upgrade_approval(), Some(approval(b"58")));
+        assert!(!review.is_login());
+        // The widest value: a prove or repeat step.
+        let prove = Request::new(
+            [1; 32],
+            1000,
+            upgrade(
+                UpgradeShape::Fido2,
+                2,
+                key_step(
+                    2,
+                    LoginStep::Repeat {
+                        key: [9, 8, 7, 6],
+                        retries: 3,
+                    },
+                ),
+            ),
+        )
+        .unwrap();
+        let mut literal = header.clone();
+        literal.push(17);
+        literal.extend(1000u32.to_be_bytes());
+        literal.extend([2, 2]);
+        literal.extend(CURRENT.as_bytes());
+        literal.extend([2, 5, 9, 8, 7, 6, 3]);
+        assert_eq!(literal.len(), 122);
+        assert_eq!(prove.encode(), literal);
+        assert_eq!(Request::decode(&literal).unwrap(), prove);
+        assert_eq!(prove.upgrade_approval(), None);
+        for step in upgrade_steps(2) {
+            let request = Request::new([1; 32], 1000, upgrade(UpgradeShape::Tpm, 2, step)).unwrap();
+            assert!(request.encode().len() <= 122);
+            assert_eq!(Request::decode(&request.encode()).unwrap(), request);
+            assert_eq!(request.upgrade_step(), Some(step));
+        }
+        let cancel = Request::new(
+            [1; 32],
+            1000,
+            Operation::UpgradeCancel {
+                key: approval(b"47"),
+            },
+        )
+        .unwrap();
+        let mut literal = header;
+        literal.extend([18, b'4', b'7']);
+        assert_eq!(literal.len(), 47);
+        assert_eq!(cancel.encode(), literal);
+        assert_eq!(Request::decode(&literal).unwrap(), cancel);
+        assert_eq!(cancel.upgrade_approval(), Some(approval(b"47")));
+        assert_eq!(cancel.upgrade_step(), None);
+        assert_eq!(cancel.ceiling(), Some(UPGRADE_CANCEL_CEILING));
+        for end in 0..literal.len() {
+            assert!(Request::decode(&literal[..end]).is_err(), "{end}");
+        }
+        literal.push(0);
+        assert!(Request::decode(&literal).is_err());
+    }
+
+    #[test]
+    fn an_upgrade_review_discloses_phase_one_and_a_key_step_shows_its_ceremony() {
+        let deployment = format!("DEPLOYMENT: {CURRENT}");
+        let review = |shape, count| {
+            Request::new([1; 32], 1000, upgrade(shape, count, UpgradeStep::Review))
+                .unwrap()
+                .lines()
+        };
+        let disclosure = [
+            "THE NEXT BOOT REWRITES THE DISK",
+            "ONE READ AND ONE OR TWO WRITES",
+            "OF THE WHOLE VOLUME",
+            "IT NEEDS MAINS POWER",
+            "THE MACHINE IS UNUSABLE UNTIL DONE",
+            "IT ASKS FOR THE RECOVERY KEY",
+            "WHICH STAYS THE RECOVERY PROTECTOR",
+        ];
+        let expected = |head: [&str; 2], asks: &str, more: &[&str]| {
+            let mut rows = vec![
+                "TD SECURE ATTENTION".to_string(),
+                "SESSION USER 1000".into(),
+                head[0].into(),
+                head[1].into(),
+                deployment.clone(),
+            ];
+            rows.extend(disclosure.map(String::from));
+            rows.push(asks.into());
+            rows.extend(more.iter().map(|row| row.to_string()));
+            rows.extend(["APPROVE: TYPE 5 THEN 8".into(), "ESC: CANCEL".into()]);
+            rows
+        };
+        let tpm = ["PROTECT THE DISK: TPM AND PIN", "NEW RECOVERY KEYS: 0"];
+        assert_eq!(
+            review(UpgradeShape::Tpm, 0),
+            expected(tpm, "AND FOR A NEW PIN", &[])
+        );
+        let tpm = ["PROTECT THE DISK: TPM AND PIN", "NEW RECOVERY KEYS: 2"];
+        assert_eq!(
+            review(UpgradeShape::Tpm, 2),
+            expected(tpm, "AND FOR THESE KEYS AND A NEW PIN", &[])
+        );
+        let fido = ["PROTECT THE DISK: SECURITY KEYS", "NEW PRIMARY KEYS: 1"];
+        let fido_review = review(UpgradeShape::Fido2, 1);
+        assert_eq!(
+            fido_review,
+            expected(
+                fido,
+                "AND FOR THESE KEYS",
+                &[
+                    "AN ALTERED BOOT CAN TAKE THE DISK",
+                    "FROM ONE USE OF A KEY AND PIN",
+                    "WHILE A FIRMWARE TPM GUESS COUNT",
+                    "CAN ROLL BACK WITH ITS FLASH",
+                ],
+            )
+        );
+        // The FIDO2 review is four rows taller; the compositor adds the time
+        // line, so 20 and 16 rows where the ID takes one.
+        assert_eq!(fido_review.len(), 19);
+        assert_eq!(review(UpgradeShape::Tpm, 2).len(), 15);
+        // A key step: a first enrollment's rows, no ID, and Escape.
+        let rows = |step| {
+            Request::new([1; 32], 1000, upgrade(UpgradeShape::Tpm, 2, step))
+                .unwrap()
+                .lines()
+        };
+        let head = |more: &[&str]| -> Vec<String> {
+            let mut all = vec![
+                "TD SECURE ATTENTION",
+                "SESSION USER 1000",
+                "PROTECT THE DISK: TPM AND PIN",
+                "NEW RECOVERY KEYS: 2",
+            ];
+            all.extend_from_slice(more);
+            all.push("ESC TO CANCEL");
+            all.into_iter().map(String::from).collect()
+        };
+        assert_eq!(
+            rows(key_step(1, LoginStep::Connect)),
+            head(&["NEW KEY 1 OF 2", "CONNECT ONLY THE NEW KEY"])
+        );
+        assert_eq!(
+            rows(key_step(2, LoginStep::Connect)),
+            head(&[
+                "NEW KEY 2 OF 2",
+                "REMOVE THE PREVIOUS KEY",
+                "CONNECT ONLY THE NEW KEY"
+            ])
+        );
+        assert_eq!(
+            rows(key_step(1, LoginStep::Create { retries: 8 })),
+            head(&[
+                "NEW KEY 1 OF 2",
+                "CREATE A DISK CREDENTIAL",
+                "8 PIN ATTEMPTS LEFT ON THIS KEY",
+                "ENTER ITS PIN, THEN TOUCH THE KEY"
+            ])
+        );
+        assert_eq!(
+            rows(key_step(
+                1,
+                LoginStep::Probe {
+                    key: [0xab, 0xcd, 0, 1]
+                }
+            )),
+            head(&[
+                "NEW KEY 1 OF 2",
+                "CHECKING NEW KEY abcd0001",
+                "KEEP IT CONNECTED AND TOUCH IT"
+            ])
+        );
+        // Every row but the ID's fits, with no glyph the renderer lacks.
+        for shape in [UpgradeShape::Tpm, UpgradeShape::Fido2] {
+            for step in upgrade_steps(2) {
+                let request = Request::new([1; 32], 1000, upgrade(shape, 2, step)).unwrap();
+                for row in request.lines() {
+                    if row != deployment {
+                        assert!(row.len() <= PROMPT_COLUMNS, "{row}");
+                    }
+                    assert!(!row.contains(['\'', '(', ')']), "{row}");
+                }
+            }
+        }
+        let cancel = Request::new(
+            [1; 32],
+            1000,
+            Operation::UpgradeCancel {
+                key: approval(b"47"),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            cancel.lines(),
+            [
+                "TD SECURE ATTENTION",
+                "SESSION USER 1000",
+                "CANCEL PROTECTING THE DISK",
+                "THE NEXT BOOT MAY NEED",
+                "THE RECOVERY KEY AND A RESEAL",
+                "APPROVE: TYPE 4 THEN 7",
+                "ESC: CANCEL",
+            ]
+        );
+    }
+
+    #[test]
+    fn invalid_upgrades_refuse() {
+        let new = |owner, operation| Request::new([1; 32], owner, operation);
+        // The account is the owner; each shape takes its own counts.
+        assert!(new(1001, upgrade(UpgradeShape::Tpm, 0, UpgradeStep::Review)).is_err());
+        for (shape, counts) in [(UpgradeShape::Tpm, 0..=2), (UpgradeShape::Fido2, 1..=2)] {
+            for count in 0..=4 {
+                let made = new(1000, upgrade(shape, count, UpgradeStep::Review));
+                assert_eq!(made.is_ok(), counts.contains(&count), "{shape:?} {count}");
+            }
+        }
+        // The review carries the approval key and a key step none.
+        let mut bare = upgrade(UpgradeShape::Tpm, 1, UpgradeStep::Review);
+        if let Operation::Upgrade { approval, .. } = &mut bare {
+            *approval = None;
+        }
+        assert!(new(1000, bare).is_err());
+        let mut keyed = upgrade(UpgradeShape::Tpm, 1, key_step(1, LoginStep::Connect));
+        if let Operation::Upgrade { approval: key, .. } = &mut keyed {
+            *key = Some(approval(b"58"));
+        }
+        assert!(new(1000, keyed).is_err());
+        // A key step names a new key and a ceremony step.
+        for (key, step) in [
+            (0, LoginStep::Connect),
+            (2, LoginStep::Connect),
+            (1, LoginStep::Identify),
+            (
+                1,
+                LoginStep::Authorize {
+                    key: [1; 4],
+                    retries: 8,
+                },
+            ),
+            (1, LoginStep::RecoveryKey),
+            (1, LoginStep::DiskIdentify),
+        ] {
+            assert!(
+                new(1000, upgrade(UpgradeShape::Tpm, 1, key_step(key, step))).is_err(),
+                "{key} {step:?}"
+            );
+        }
+        let mut wrong = upgrade(UpgradeShape::Tpm, 1, UpgradeStep::Review);
+        if let Operation::Upgrade { current, .. } = &mut wrong {
+            *current = CURRENT.to_uppercase();
+        }
+        assert!(new(1000, wrong).is_err());
+        // The decoder refuses a shape, a review byte and trailing bytes.
+        let bytes = new(1000, upgrade(UpgradeShape::Tpm, 1, UpgradeStep::Review))
+            .unwrap()
+            .encode();
+        for shape in [0, 3, 0xff] {
+            let mut bad = bytes.clone();
+            bad[49] = shape;
+            assert_eq!(
+                Request::decode(&bad).err().unwrap(),
+                "invalid consent upgrade shape"
+            );
+        }
+        let mut bad = bytes.clone();
+        bad[116] = 8;
+        assert_eq!(
+            Request::decode(&bad).err().unwrap(),
+            "invalid consent upgrade review"
+        );
+        let mut bad = bytes.clone();
+        bad[115] = 1;
+        assert!(Request::decode(&bad).is_err());
+        for end in 0..bytes.len() {
+            assert!(Request::decode(&bytes[..end]).is_err(), "{end}");
+        }
+        let mut long = bytes;
+        long.push(0);
+        assert!(Request::decode(&long).is_err());
+    }
+
+    #[test]
+    fn an_upgrades_steps_follow_their_only_order() {
+        let request = |count, step| {
+            Request::new([1; 32], 1000, upgrade(UpgradeShape::Tpm, count, step)).unwrap()
+        };
+        // No new key: the review is the last step.
+        assert_eq!(
+            request(0, UpgradeStep::Review).upgrade_start(),
+            Ok(Admitted::Last)
+        );
+        let steps = upgrade_steps(2);
+        assert_eq!(steps.len(), 11);
+        assert_eq!(request(2, steps[0]).upgrade_start(), Ok(Admitted::Next));
+        assert!(request(2, steps[1]).upgrade_start().is_err());
+        for (index, pair) in steps.windows(2).enumerate() {
+            let admitted = request(2, pair[0]).upgrade_successor(&request(2, pair[1]));
+            let expected = if index == steps.len() - 2 {
+                Admitted::Last
+            } else {
+                Admitted::Next
+            };
+            assert_eq!(admitted, Ok(expected), "{pair:?}");
+        }
+        // Nothing follows the last step, and no step is skipped or repeated.
+        let last = request(2, steps[10]);
+        assert!(last.upgrade_successor(&request(2, steps[1])).is_err());
+        for (from, to) in [(0, 2), (1, 1), (5, 7), (5, 1), (6, 10)] {
+            assert!(
+                request(2, steps[from])
+                    .upgrade_successor(&request(2, steps[to]))
+                    .is_err(),
+                "{from} {to}"
+            );
+        }
+        // A successor keeps every field of the operation.
+        let review = request(2, steps[0]);
+        let connect = request(2, steps[1]);
+        let changed = |edit: &dyn Fn(&mut Operation)| {
+            let mut operation = connect.operation().clone();
+            edit(&mut operation);
+            Request::new([1; 32], 1000, operation).unwrap()
+        };
+        let shape = changed(&|operation| {
+            if let Operation::Upgrade { shape, .. } = operation {
+                *shape = UpgradeShape::Fido2;
+            }
+        });
+        let count = changed(&|operation| {
+            if let Operation::Upgrade { count, .. } = operation {
+                *count = 1;
+            }
+        });
+        let current = changed(&|operation| {
+            if let Operation::Upgrade { current, .. } = operation {
+                *current = PREVIOUS.into();
+            }
+        });
+        for next in [shape, count, current] {
+            assert_eq!(
+                review.upgrade_successor(&next),
+                Err("upgrade step changed its operation".into())
+            );
+        }
+        let other_nonce = Request::new([2; 32], 1000, connect.operation().clone()).unwrap();
+        assert!(review.upgrade_successor(&other_nonce).is_err());
+        // A repeat or probe keeps the prove's credential, and a PIN step
+        // needs retries left.
+        let prove = request(2, steps[3]);
+        let stranger = request(
+            2,
+            key_step(
+                1,
+                LoginStep::Repeat {
+                    key: [7; 4],
+                    retries: 7,
+                },
+            ),
+        );
+        assert_eq!(
+            prove.upgrade_successor(&stranger),
+            Err("upgrade step changed its key".into())
+        );
+        let blocked = request(
+            2,
+            key_step(
+                1,
+                LoginStep::Repeat {
+                    key: [1; 4],
+                    retries: 0,
+                },
+            ),
+        );
+        assert!(prove.upgrade_successor(&blocked).is_err());
+        // Neither a login step nor a cancellation is an upgrade's.
+        let cancel = Request::new(
+            [1; 32],
+            1000,
+            Operation::UpgradeCancel {
+                key: approval(b"47"),
+            },
+        )
+        .unwrap();
+        assert!(cancel.upgrade_start().is_err());
+        assert!(review.upgrade_successor(&cancel).is_err());
+        // The ceilings: 240 seconds and 120 more per new key.
+        for (count, seconds) in [(0, 240), (1, 360), (2, 480)] {
+            assert_eq!(
+                request(count, UpgradeStep::Review).ceiling(),
+                Some(Duration::from_secs(seconds))
+            );
+        }
+        assert_eq!(upgrade_ceiling(2), LOGIN_LONGEST);
+    }
+
+    #[test]
+    fn an_upgrade_step_names_only_the_credential_its_ceremony_created() {
+        let request =
+            |step| Request::new([1; 32], 1000, upgrade(UpgradeShape::Fido2, 2, step)).unwrap();
+        let steps = upgrade_steps(2);
+        let baseline = [[0xee; 4]];
+        let admit = |from: usize, created| {
+            request(steps[from]).admit_upgrade_step(&request(steps[from + 1]), &baseline, created)
+        };
+        // Connect and create come before any credential exists.
+        assert_eq!(admit(0, None), Ok(Admitted::Next));
+        assert_eq!(admit(1, None), Ok(Admitted::Next));
+        assert!(admit(1, Some([1; 4])).is_err());
+        // Prove, repeat and probe name exactly the created credential.
+        for from in 2..5 {
+            assert_eq!(admit(from, Some([1; 4])), Ok(Admitted::Next), "{from}");
+            assert!(admit(from, None).is_err(), "{from}");
+            assert!(admit(from, Some([2; 4])).is_err(), "{from}");
+        }
+        // Never one a header token already names, even by collision.
+        let collides = [[1; 4]];
+        assert!(request(steps[2])
+            .admit_upgrade_step(&request(steps[3]), &collides, Some([1; 4]))
+            .is_err());
+        // The next key's connect forgets the last key's credential.
+        assert_eq!(admit(5, None), Ok(Admitted::Next));
+        assert_eq!(admit(9, Some([2; 4])), Ok(Admitted::Last));
     }
 
     /// Tag 16: the key, one form byte of 1 to 3 and the running
@@ -3742,8 +4665,9 @@ mod tests {
         let mut identify = header(7);
         identify.extend([2, 2, 1]);
         assert!(Request::decode(&identify).is_ok());
-        // 13 to 15 are the disk proofs', 17 to 25 reserved.
-        for tag in [0, 3, 17, 25, 255] {
+        // 13 to 15 are the disk proofs', 16 to 18 the storage
+        // operations', 19 to 25 reserved.
+        for tag in [0, 3, 19, 25, 255] {
             let mut bad = identify.clone();
             bad[44] = tag;
             assert_eq!(

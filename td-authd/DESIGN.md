@@ -2839,10 +2839,11 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
     OF A KEY AND PIN`, `WHILE A FIRMWARE TPM GUESS COUNT` and `CAN ROLL
     BACK WITH ITS FLASH`, and last the approval key's rows. A key
     step's are a first enrollment's, `NEW KEY K OF N` and the step's own
-    rows, without the ID, which its bytes still bind and the review
-    showed. Every row is within `PROMPT_COLUMNS`, and none uses an
-    apostrophe or a parenthesis. Create, prove and repeat ask for the
-    new key's PIN (`asks_pin`).
+    rows, but for the create step's `CREATE A DISK CREDENTIAL`, without
+    the ID, which its bytes still bind and the review showed. Every row
+    but the ID's, which wraps as tag 5's does, is within
+    `PROMPT_COLUMNS`, and none uses an apostrophe or a parenthesis.
+    Create, prove and repeat ask for the new key's PIN (`asks_pin`).
 
     Tag 18 is the upgrade's cancellation: right after its tag byte the
     two-byte approval key, 47 bytes in all, one step and no step byte,
