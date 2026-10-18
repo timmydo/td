@@ -352,10 +352,11 @@ pub(super) fn exercise(
                 fixture,
                 &format!("UPDATE td_mta.submissions SET expires_at=send_at WHERE id={sub}"),
             );
-            assert_eq!(
-                failed.step(until(10_000), &mut meter(), &settlement),
-                Err(Error::Recovery(recovery::Error::ExpiryHold))
-            );
+            assert!(failed
+                .step(until(10_000), &mut meter(), &settlement)
+                .unwrap()
+                .is_some());
+            assert_eq!(sql(fixture,&format!("SELECT count(*) FROM td_mta.recipients r JOIN td_mta.submissions s ON s.account=r.account AND s.id=r.submission_id WHERE s.id={sub} AND r.next_attempt_at=s.expires_at AND r.state=3")),"1");
             sql(fixture,&format!("UPDATE td_mta.submissions SET expires_at=(extract(epoch FROM clock_timestamp())*1000)::bigint+86400000 WHERE id={sub}"));
         }
         if n == 162 {

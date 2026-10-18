@@ -280,7 +280,22 @@ fn sql(fixture: &Fixture, query: &str) -> String {
             .spawn()
             .unwrap(),
     );
-    wait_command(&mut child);
+    let stop = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            assert!(
+                status.success(),
+                "SQL {query}: {}",
+                fs::read_to_string(&path).unwrap()
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < stop,
+            "SQL fixture command timed out: {query}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
     assert!(fs::metadata(&path).unwrap().len() < 4096);
     fs::read_to_string(path).unwrap().trim().to_owned()
 }
@@ -2471,6 +2486,8 @@ fn real_postgres_smtp_worker_preserves_starttls_receipts() {
 
 #[path = "postgres_probe/serving.rs"]
 mod serving;
+#[path = "postgres_probe/serving_relay.rs"]
+mod serving_relay;
 
 #[test]
 #[ignore = "real local PostgreSQL tools required"]
@@ -2555,6 +2572,10 @@ text_signature_file = "/postgres-material/{}"
 "#,
         Version::from_bytes([5; 16])
     );
+    let mut relay_socket = matches!(exercise, ConfigurationExercise::Serving)
+        .then(|| TcpListener::bind("127.0.0.1:0").unwrap());
+    let mut relay_dns = matches!(exercise, ConfigurationExercise::Serving)
+        .then(|| std::net::UdpSocket::bind("127.0.0.1:0").unwrap());
     let desktop = format!(
         r#"[server]
 hostname = "localhost"
@@ -2582,6 +2603,16 @@ certificate = "public"
         key = Version::from_bytes([3; 16]),
         ca = Version::from_bytes([4; 16])
     );
+    let desktop = if let (Some(relay), Some(dns)) = (&relay_socket, &relay_dns) {
+        desktop
+            .replace(
+                "port = 465",
+                &format!("port = {}", relay.local_addr().unwrap().port()),
+            )
+            .replace("127.0.0.1:53", &dns.local_addr().unwrap().to_string())
+    } else {
+        desktop
+    };
     let mut https_socket = matches!(
         exercise,
         ConfigurationExercise::Client
@@ -2636,7 +2667,7 @@ per_peer_limit = 1
         cloud
     };
     let cloud_roles = if matches!(exercise, ConfigurationExercise::Serving) {
-        1
+        5
     } else if matches!(exercise, ConfigurationExercise::Submissions) {
         7
     } else {
@@ -2994,6 +3025,8 @@ per_peer_limit = 1
                 "cloud",
                 if cloud_roles == 1 {
                     "receive"
+                } else if cloud_roles == 5 {
+                    "receive,relay"
                 } else if cloud_roles == 7 {
                     "receive,jmap,relay"
                 } else {
@@ -3151,6 +3184,8 @@ per_peer_limit = 1
             &fixture,
             smtp_socket.take().unwrap(),
             https_socket.take().unwrap(),
+            relay_socket.take().unwrap(),
+            relay_dns.take().unwrap(),
         );
         return;
     }
@@ -10750,10 +10785,9 @@ fn exercise_attempt_recovery(
         &format!("SELECT expires_at FROM td_mta.submissions WHERE id=decode('{submission}','hex')"),
     );
     sql(fixture,&format!("UPDATE td_mta.submissions SET expires_at=(extract(epoch FROM clock_timestamp())*1000)::bigint+1000 WHERE id=decode('{submission}','hex')"));
-    assert_eq!(
-        recovery::publish(request, trust, deadline(), &value),
-        Err(recovery::Error::ExpiryHold)
-    );
+    expiry_wait_snapshot(fixture, || {
+        recovery::publish(request, trust, deadline(), &value).unwrap();
+    });
     sql(fixture,&format!("UPDATE td_mta.submissions SET expires_at={expiry} WHERE id=decode('{submission}','hex')"));
     let before = sql(
         fixture,
@@ -12002,3 +12036,25 @@ mod metadata_audit_commands;
 
 #[path = "postgres_probe/history_audit.rs"]
 mod history_audit;
+
+// Exercise a committed expiry-wait result, then restore this isolated fixture
+// so subsequent rollback/unknown-commit cases can use their original attempt.
+fn expiry_wait_snapshot(fixture: &Fixture, publish: impl FnOnce()) {
+    let tables = sql(fixture,"SELECT tablename FROM pg_catalog.pg_tables WHERE schemaname='td_mta' AND (tablename IN ('accounts','changes','submissions','recipients','submission_attempts') OR tablename LIKE 'attempt_%') ORDER BY tablename");
+    for table in tables.lines() {
+        sql(
+            fixture,
+            &format!("CREATE TABLE public.expiry_snapshot_{table} AS TABLE td_mta.{table}"),
+        );
+    }
+    publish();
+    assert_ne!(sql(fixture,"SELECT count(*) FROM td_mta.recipients r JOIN td_mta.submissions s ON s.account=r.account AND s.id=r.submission_id WHERE r.state IN (3,7) AND r.phase=4 AND r.next_attempt_at=s.expires_at"),"0");
+    // Restore one consistent snapshot without transient parent/child FK conflicts.
+    // This is the isolated superuser fixture, never the runtime connection.
+    let mut restore = String::from("BEGIN; SET LOCAL session_replication_role=replica;");
+    for table in tables.lines() {
+        restore.push_str(&format!("DELETE FROM td_mta.{table}; INSERT INTO td_mta.{table} SELECT * FROM public.expiry_snapshot_{table}; DROP TABLE public.expiry_snapshot_{table};"));
+    }
+    restore.push_str("COMMIT;");
+    sql(fixture, &restore);
+}

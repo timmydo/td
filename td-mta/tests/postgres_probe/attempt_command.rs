@@ -96,10 +96,9 @@ pub(super) fn exercise(
         sql(fixture,&format!("UPDATE td_mta.recipients SET uncertain=1 WHERE submission_id=decode('{submission}','hex') AND ordinal=0; UPDATE td_mta.recipients SET rcpt_reply='250 old',data_reply='450 old' WHERE submission_id=decode('{submission}','hex') AND state=2"));
         if temporary {
             sql(fixture,&format!("UPDATE td_mta.submissions SET expires_at=(extract(epoch FROM clock_timestamp())*1000)::bigint+1000 WHERE id=decode('{submission}','hex')"));
-            assert_eq!(
-                phases::publish(request, trust, deadline(), &value),
-                Err(phases::Error::ExpiryHold)
-            );
+            super::expiry_wait_snapshot(fixture, || {
+                phases::publish(request, trust, deadline(), &value).unwrap();
+            });
             sql(fixture,&format!("UPDATE td_mta.submissions SET expires_at=(extract(epoch FROM clock_timestamp())*1000)::bigint+86400000 WHERE id=decode('{submission}','hex')"));
         }
         if case == 2 {

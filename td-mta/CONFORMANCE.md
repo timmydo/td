@@ -376,3 +376,18 @@ second publication. A separate real HTTPS test proves an uncertain upload
 closes only its exchange without a final receipt and releases its body slot
 for another request. This does not qualify td-mail attachment composition or
 activate the production backend.
+
+
+The native PostgreSQL foreground-service fixture submits a plain-text draft
+and EmailSubmission through the executable's HTTPS endpoint to its separate
+relay profile. Its local TLS smart host refuses the first MAIL with 451;
+the fixture restarts the relay, delivers fresh mail during the retry hold,
+delivers a verified eight-bit fixture source using 8BITMIME and checks route
+backoff reset, then observes the original message delivered after the real five-minute
+startup guard and persisted retry deadline. It checks durable recipient
+states and actual DATA receipt. It confirms the stable clock through local
+control, then kills the process during a later MAIL and checks that a new
+owner recovers Prepared after the abandoned lease expires. That interrupted
+message has expired meanwhile; recovery records a non-dispatchable expiry-wait
+marker while terminal expiry remains held for clock confirmation. This qualifies the bounded plain-text path,
+not maximum-size throughput or every SMTP failure interleaving.

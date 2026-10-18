@@ -1970,9 +1970,9 @@ attempt identity. Retry times use the queue contract's clipped uniform jitter
 with at most 32 entropy draws; failure rolls back. Recipient updates use one
 bounded SQL array batch rather than one protocol exchange per recipient.
 
-This path handles only work with room for a retry before expiry. It refuses
-near-expiry/overdue responsibility as ExpiryHold without clearing the active
-attempt or declaring terminal failure. Clock-confirmed expiry remains a
+This path preserves near-expiry/overdue responsibility using the QUEUE.md
+expiry-wait marker and retires the active attempt without declaring terminal
+failure. Clock-confirmed expiry remains a
 separate activation prerequisite. A backwards last-attempt timestamp refuses.
 Runtime clock discontinuity validation and the five-minute monotonic restart
 guard still precede any actual retry. Receipt storage has a 1024-per-account
@@ -3184,15 +3184,15 @@ current attempt had reached AcceptancePossible.
 
 Temporary refusals schedule each recipient using the shared bounded jitter
 policy; earlier uncertainty yields OutcomeUnknown, otherwise RetryWait.
-A retry that cannot precede expiry refuses with ExpiryHold for the separate
-clock-confirmed expiry path. Permanent refusals terminate retries, retaining
+A retry that cannot precede expiry records expires_at as the nonterminal
+expiry-wait marker for the separate clock-confirmed expiry path. Permanent refusals terminate retries, retaining
 OutcomeUnknown for prior uncertainty and Failed otherwise; a genuine refusal
 can be retained after expiry. Result rows, submission completion and pending
 failure notice, attempt retirement, history and receipt commit together.
 Historical replay preserves the original random retry times.
 
 The runtime-role fixture exercises ordering, exact subsets, maximum replies,
-near-expiry hold, rollback, delayed COMMIT settlement, conflicting replay,
+expiry-wait marker, rollback, delayed COMMIT settlement, conflicting replay,
 retry bounds, uncertainty preservation and final completion after expiry.
 This prepares final DATA results only. RCPT/MAIL/DATA-command refusals,
 transport failures, retry dispatch, capacity reservation and production
@@ -3260,7 +3260,7 @@ receipt. Unknown COMMIT settles the retained operation historically.
 All still-InFlight recipients end together. Prepared and Body become RetryWait
 unless earlier uncertainty is latched; AcceptancePossible latches uncertainty
 and becomes retryable OutcomeUnknown. Genuine replies remain unchanged, and
-already settled RCPT recipients are excluded. Bounded jitter, near-expiry hold,
+already settled RCPT recipients are excluded. Bounded jitter, expiry-wait marker,
 account history and attempt retirement reuse the existing recovery transaction
 and its bounded receipts. This operation does not pause a route, certify TLS
 or credentials, reserve final-outcome capacity, or activate production relay.
@@ -5210,7 +5210,7 @@ Network backoff, TLS repair hold, settlement after SMTP expiry, known health
 and recovery rollback, delayed commits and missing receipts, generic
 settlement followed by exact reinspection, budget/deadline/slot refusal,
 ordinary-slot occupancy during inspection, unrelated Pending preservation,
-and recovery expiry hold. They assert health before retirement, one health
+and recovery expiry-wait marker. They assert health before retirement, one health
 count and one recovery sequence change, retained Prepared on early failures,
 and candidate refusal by backoff/repair after retirement. This activates
 no scheduler or PostgreSQL backend and changes no schema.
@@ -6077,7 +6077,52 @@ the shared decoder through normal transaction-aligned paging.
 The active serve command loads and validates the selected database profile
 and uses PostgreSQL SMTP storage, HTTPS authentication and JMAP adapters.
 CONFIG.md owns syntax and local runtime/scratch placement. Receive and JMAP
-roles are supported, including a JMAP-only instance; relay remains refused.
+roles are supported, including a JMAP-only instance and a separate relay.
 The embedded backend, local-store commands and file-backed device registry
 are removed. This is not a live migration or a complete release qualification
 claim.
+
+## 212. Foreground relay scheduling
+
+A relay profile runs one fixed SMTP worker and one lease-renewal worker.
+It pins the startup primary address and published configuration/TLS generation;
+there is no transparent primary fallback or configuration reload. Every SMTP
+phase retains the existing current-policy, route-generation and attempt fences.
+Renewal failure stops the service, and the original bounded SMTP attempt closes
+before joining workers and releasing the lease. Busy ownership is standby.
+
+The worker reserves two ordinary database slots, two independent body-source
+slots, one separate settlement slot, and two reusable TLS wire buffers. It polls bounded candidate pages, alternating
+fresh and retry work, and admits at most one attempt per turn. The existing
+100-recipient batch and ten-second initial admission cap remain in force; a
+120-second outer budget cannot extend that shorter cap. Wire, database and
+source meters each have bounded 1-GiB I/O/output and two-million-record budgets;
+these are work ceilings, not resident allocations. Exhaustion refuses work.
+
+Passive active-attempt discovery is fenced to the current account, route and
+destination and reads at most two rows, refusing multiple active owners.
+Restart recovery uses the previous generation; locally abandoned Prepared
+attempts use current-owner interruption after transport closure. Possible
+acceptance remains uncertain. Known MAIL/DATA/final refusal and RCPT evidence
+are settled before generic recovery. Unknown COMMIT retains the exact Pending
+owner and blocks subsequent work until its receipt is observed. No absent
+receipt authorizes replay. A requested stop may abandon unresolved custody;
+durable phase recovery on restart remains conservative.
+
+The process starts the five-minute retry guard from database UTC and its one
+monotonic clock. New mail may dispatch while retries wait. Expiry scans precede
+dispatch; the private queue clock confirmation operation in CONFIG.md enables
+at most one 100-recipient expiry batch per second. Overdue work remains held
+until confirmation. Authentication and TLS failures publish a route pause;
+network failures, including DNS idle timeout while the original cap remains
+live, publish route backoff. A local exhausted cap does not diagnose the route.
+Durably accepted final DATA resets consecutive route failures. Success and
+repair retain exact operations and inspect unknown COMMIT before further work.
+After selecting a repaired configuration and restarting, an explicit private
+`queue-route-repair` request releases the configuration-bound pause only if
+the database confirms a newer selected generation. Mere restart never repairs.
+The worker scans the verified immutable transmitted source under its original
+Prepared cap to select SevenBit or EightBit before MAIL; DATA requires the
+matching EHLO capability. This scan uses fixed 4096-byte scratch and prepays
+three maximum-body extents plus database validation overhead, with charged
+records per read. There is no complete-message allocation.

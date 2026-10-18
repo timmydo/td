@@ -1,8 +1,8 @@
 # Submission and relay contract
 
 [POSTGRES.md](POSTGRES.md) owns active PostgreSQL storage and configuration.
-Receive/JMAP serving is implemented. Relay process integration remains
-incomplete and is refused; there is no alternative local database backend.
+Receive/JMAP serving and foreground relay scheduling are implemented; there
+is no alternative local database backend.
 
 This document is normative for M16/M17 and administration. FORMAT.md owns
 bytes; this document owns allowed states and transitions. It does not enable
@@ -14,6 +14,8 @@ signed UTC milliseconds. Attempt deadlines use the monotonic Clock adapter.
 Authorize the account, identity, From/Sender and envelope before publishing
 the transmitted blob. Reject malformed addresses, ambiguous multiple
 Sender/From fields, empty recipient sets and unsupported envelope parameters.
+Reject non-ASCII root headers before accepting submission; SMTPUTF8 is not
+supported. Eight-bit MIME body octets remain permitted.
 V1 advertises an empty submissionExtensions map and maxDelayedSend zero.
 Null/omitted envelope is derived according to RFC 8621 §7: Sender, otherwise
 From, with the identity address substituted when the derived sender is not
@@ -277,7 +279,12 @@ limit of 32 entropy samples and failure pauses dispatch. Clipping the interval
 before sampling avoids concentrating probability at either bound. Use checked
 arithmetic. Entropy failure pauses dispatch; it does not discard or immediately retry a recipient. No free-text
 SMTP retry hints are interpreted in v1. The persisted next-attempt UTC time
-is bounded by expiry; if no eligible time precedes expiry, expire instead.
+is bounded by expiry. If no eligible time precedes expiry, persist exactly
+expires_at as a nonterminal expiry-wait marker, preserving actual replies and
+uncertainty while retiring the active attempt. Dispatch requires both
+next_attempt_at <= now and now < expires_at, so that equality can never send,
+even after a backward clock change. Clock-confirmed expiry later makes the
+terminal transition. The marker is not a retry that bypasses minimum delay.
 
 Route backoff uses the same bounds, shared across recipients; bad credentials
 or certificate verification require a successful explicit configuration/

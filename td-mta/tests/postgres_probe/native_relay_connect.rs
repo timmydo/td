@@ -450,7 +450,7 @@ fn failures(
     source: SubmissionId,
     setup: &Setup,
 ) {
-    for n in [167, 168, 170, 171, 172, 189, 190, 169] {
+    for n in [167, 168, 170, 171, 172, 189, 190, 166, 169] {
         let submission = SubmissionId::from_bytes([n; 16]);
         let sub = format!("decode('{submission}','hex')");
         let src = format!("decode('{source}','hex')");
@@ -503,7 +503,17 @@ fn failures(
                 &mut database,
             )
             .unwrap();
-        let failure = if n == 171 {
+        let failure = if n == 166 {
+            let failure = call(prepared, &setup.profile, &mut database, wire::meter(cap))
+                .err()
+                .unwrap();
+            assert_eq!(failure.stage, connect::Stage::Resolve);
+            assert!(matches!(failure.closed, connect::Closed::Auth(_)));
+            setup.dns.set_nonblocking(true).unwrap();
+            while setup.dns.recv_from(&mut [0; 512]).is_ok() {}
+            setup.dns.set_nonblocking(false).unwrap();
+            failure
+        } else if n == 171 {
             blocked(fixture, || {
                 let short = Deadline::after(clock.sample().unwrap().monotonic, 300).unwrap();
                 let began = std::time::Instant::now();
@@ -717,6 +727,10 @@ fn failures(
                     .unwrap()
                     .is_some());
             }
+        }
+        if n == 166 {
+            assert_eq!(sql(fixture, "SELECT reason FROM td_mta.route_health"), "3");
+            sql(fixture, "DELETE FROM td_mta.route_health");
         }
         assert!(pending.identity().unwrap().is_none());
         assert_eq!(sql(fixture,&format!("SELECT count(*) FROM td_mta.submission_attempts WHERE submission_id={sub} AND active")), "0");

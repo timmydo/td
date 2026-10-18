@@ -156,6 +156,7 @@ pub mod postgres_relay_data;
 pub mod postgres_relay_finish;
 pub mod postgres_relay_mail;
 pub mod postgres_relay_rcpt;
+pub mod postgres_relay_worker;
 pub mod postgres_resolver;
 pub mod postgres_route_health;
 pub mod postgres_route_owners;

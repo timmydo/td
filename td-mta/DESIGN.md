@@ -9,7 +9,7 @@ and response scratch. PostgreSQL is the sole mail and configuration store.
 The foreground service receives SMTP and serves the implemented td-mail JMAP
 flows from named database profiles. It retains fixed transport workers,
 bounded requests, database snapshots and verified immutable body readers.
-Relay service activation remains incomplete and is explicitly refused.
+Relay profiles run a PostgreSQL route worker; JMAP profiles accept submission.
 [CONFIG.md](CONFIG.md) describes startup; [CONFORMANCE.md](CONFORMANCE.md)
 states supported client flows and qualification limits. The v1 release still
 requires section 15's evidence; functioning receive/JMAP service is not a
@@ -2547,7 +2547,7 @@ copy and all queue rows still require separate admission and atomic publication.
 PostgreSQL submission admission, source verification, transmitted-copy
 publication and durable receipt settlement are specified in POSTGRES.md.
 The shared header and envelope algorithms above do not grant publication
-authority. Relay process scheduling remains separate from these transactions.
+authority. The foreground route worker schedules these durable submissions.
 
 ## Request-local creation map
 

@@ -66,6 +66,7 @@ pub struct RecoveryRefusal {
 #[must_use = "settle the closed attempt"]
 pub enum Closed<'w, 'a, 'r> {
     Interrupted(ClosedInterruption),
+    /// Ordered route-health and attempt retirement (AUTH, TLS or network).
     Auth(FailedPrepared<'w, 'a, 'r>),
 }
 pub struct Refusal<'w, 'a, 'r, B: TlsWireStorage> {
@@ -231,16 +232,32 @@ pub fn connect<'w, 'a, 'r, B: TlsWireStorage, E: Entropy>(
             session,
             passive,
         }),
-        Err(failure) => Err(Refusal {
-            stage: failure.stage,
-            error: failure.error,
-            closed: if failure.auth_rejected {
-                Closed::Auth(plan.into_failed(health::Failure::Auth))
-            } else {
-                Closed::Interrupted(passive)
-            },
-            buffers: failure.buffers,
-        }),
+        Err(failure) => {
+            let remote_idle = failure.stage == Stage::Resolve
+                && failure.error == Error::Protocol(ports::Error::Deadline)
+                && deadline(&plan, wire)
+                    .ok()
+                    .zip(plan.runtime_clock().sample().ok())
+                    .is_some_and(|(cap, now)| !cap.expired(now.monotonic));
+            Err(Refusal {
+                stage: failure.stage,
+                error: failure.error,
+                closed: if failure.auth_rejected {
+                    Closed::Auth(plan.into_failed(health::Failure::Auth))
+                } else if matches!(failure.error, Error::Protocol(ports::Error::Tls)) {
+                    Closed::Auth(plan.into_failed(health::Failure::Tls))
+                } else if matches!(
+                    failure.error,
+                    Error::Protocol(ports::Error::Dns | ports::Error::Io { .. })
+                ) || remote_idle
+                {
+                    Closed::Auth(plan.into_failed(health::Failure::Network))
+                } else {
+                    Closed::Interrupted(passive)
+                },
+                buffers: failure.buffers,
+            })
+        }
     }
 }
 fn deadline(plan: &MailPlan<'_, '_, '_>, meter: &Meter) -> Result<Deadline, ports::Error> {

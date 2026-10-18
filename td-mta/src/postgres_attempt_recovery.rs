@@ -26,7 +26,6 @@ pub enum Error {
     Capacity,
     Crypto,
     Clock,
-    ExpiryHold,
     Conflict,
     Database,
     Indeterminate,
@@ -69,6 +68,39 @@ pub struct Outcome {
     pub old_sequence: u64,
     pub new_sequence: u64,
 }
+/// One passive active-attempt hint under the current route fence. A worker
+/// calls this only with all of its own transports closed; publication checks
+/// the generation again. The route permits at most one active attempt.
+pub fn active(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    claim: &Claim,
+    generation: u64,
+) -> Result<Option<(AttemptId, u64)>, Error> {
+    let claim = claim.clone();
+    postgres_probe::with_mailbox_client(request, trust, deadline, move |client| {
+        Box::pin(async move {
+            if !owners::begin(client, &claim, true, false).await.map_err(Error::Owner)? {
+                return Err(Error::Policy);
+            }
+            owners::check_locked(client, &claim, generation).await.map_err(Error::Owner)?;
+            let binding = claim.binding();
+            let rows = client.query("SELECT attempt_id,generation FROM td_mta.submission_attempts WHERE account=$1 AND route_name=$2 AND destination=$3 AND active LIMIT 2", &[&binding.account().as_bytes().as_slice(), &binding.route().name(), &binding.route().destination().as_slice()]).await.map_err(|_|Error::Database)?;
+            if rows.len() > 1 { return Err(Error::Integrity); }
+            let result = rows.first().map(|row| {
+                let bytes: &[u8] = row.try_get(0).map_err(|_|Error::Integrity)?;
+                let id = AttemptId::from_bytes(bytes.try_into().map_err(|_|Error::Integrity)?);
+                let prior = number(row.try_get(1).map_err(|_|Error::Integrity)?)?;
+                if prior == 0 || prior > generation { return Err(Error::Integrity); }
+                Ok((id, prior))
+            }).transpose()?;
+            owners::check_locked(client, &claim, generation).await.map_err(Error::Owner)?;
+            Ok(result)
+        })
+    }).map_err(Error::Connection)?
+}
+
 pub fn prepare(claim: &Claim, generation: u64, attempt: AttemptId) -> Result<Recovery, Error> {
     prepare_mode(claim, generation, attempt, false)
 }
@@ -420,10 +452,11 @@ pub fn publish(
                     &mut entropy,
                     u32::try_from(count).map_err(|_| Error::Integrity)?,
                 )?;
-                let retry = timestamp.checked_add(delay).ok_or(Error::Clock)?;
-                if retry >= expires {
-                    return Err(Error::ExpiryHold);
-                }
+                // Equality is an expiry-wait marker, never eligible dispatch.
+                let retry = timestamp
+                    .checked_add(delay)
+                    .ok_or(Error::Clock)?
+                    .min(expires);
                 let uncertain = i64::from(uncertain == 1 || phase == 3);
                 let state = if uncertain == 1 { 7i64 } else { 3i64 };
                 let reason = if phase == 3 { 9i64 } else { 3i64 };

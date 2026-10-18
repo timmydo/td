@@ -61,6 +61,7 @@ pub(super) fn run(options: Options) -> Result<(), ConfigFailure> {
     .map_err(|_| config_failure("postgres", "resolution"))?;
     let mut generations = td_mta::generations::GenerationSet::at_startup();
     let mut prepared = None;
+    let mut selected_address = None;
     for address in addresses {
         let mut request = loaded.bootstrap.request(address);
         request.mode = td_mta::postgres_probe::Mode::Runtime;
@@ -84,14 +85,21 @@ pub(super) fn run(options: Options) -> Result<(), ConfigFailure> {
             )
             .map_err(|_| config_failure("postgres", "profile"))?,
         );
+        selected_address = Some(address);
         break;
     }
-    let (binding, resolved, prepared) = prepared
+    let (published, retired) = prepared
         .ok_or_else(|| config_failure("postgres", "connection"))?
-        .into_parts();
-    if binding.roles().relay() {
-        return Err(config_failure("profile", "unsupported-role"));
-    }
+        .publish(&mut generations)
+        .map_err(|error| adapter("tls", error.error))?;
+    drop(retired);
+    let binding = published.binding();
+    let resolved = published.configuration();
+    let relay = binding.roles().relay();
+    let mut relay_request = loaded
+        .bootstrap
+        .request(selected_address.ok_or_else(|| config_failure("postgres", "connection"))?);
+    relay_request.mode = td_mta::postgres_probe::Mode::Runtime;
     let mailbox_access = binding.roles().jmap();
     let candidate = resolved.candidate();
     let runtime_path = options.runtime.as_str();
@@ -110,11 +118,6 @@ pub(super) fn run(options: Options) -> Result<(), ConfigFailure> {
         return Err(config_failure("profile", "jmap-read-capacity"));
     }
     let deadline = scope(clock.as_ref(), 10_000)?;
-    drop(
-        generations
-            .publish(prepared)
-            .map_err(|error| adapter("tls", error.error()))?,
-    );
     let policies = generations
         .current()
         .ok_or_else(|| config_failure("tls", "invariant"))?;
@@ -212,7 +215,7 @@ pub(super) fn run(options: Options) -> Result<(), ConfigFailure> {
             }
             let session = if mailbox_access {
                 Some(
-                    td_mta::jmap_session::Session::mail_access(
+                    td_mta::jmap_session::Session::mail_submission(
                         view.origin()
                             .map_err(|_| config_failure("configuration", "invariant"))?,
                         candidate
@@ -235,7 +238,7 @@ pub(super) fn run(options: Options) -> Result<(), ConfigFailure> {
                 (Some(responses), Some(session)) => Some(td_mta::postgres_http_api::Service {
                     loaded: &loaded,
                     executable: &executable,
-                    binding: &binding,
+                    binding,
                     slots: &slots,
                     pending: &http_pending,
                     responses,
@@ -254,7 +257,7 @@ pub(super) fn run(options: Options) -> Result<(), ConfigFailure> {
                     td_mta::postgres_http_auth::Authentication::new(
                         &loaded,
                         &executable,
-                        &binding,
+                        binding,
                         clock.as_ref(),
                     )
                     .map_err(|error| adapter("authentication", error))?,
@@ -263,6 +266,7 @@ pub(super) fn run(options: Options) -> Result<(), ConfigFailure> {
                 None
             };
             let https_ready = AtomicBool::new(false);
+            let relay_ready = AtomicBool::new(false);
             let https = if let Some(authentication) = authentication.as_ref() {
                 Some(td_mta::https::Https {
                     listeners: &https_listeners,
@@ -297,7 +301,7 @@ pub(super) fn run(options: Options) -> Result<(), ConfigFailure> {
                         td_mta::postgres_smtp_receiving::Receiving {
                             loaded: &loaded,
                             executable: &executable,
-                            binding: &binding,
+                            binding,
                             slots: &slots,
                             clock: clock.as_ref(),
                             pending: &smtp_pending,
@@ -328,12 +332,18 @@ pub(super) fn run(options: Options) -> Result<(), ConfigFailure> {
                 control.stop();
             }
             let finished = AtomicBool::new(false);
+            let queue_control = td_mta::postgres_relay_worker::QueueControl::default();
             std::thread::scope(|scope| {
                 let worker = std::thread::Builder::new()
                     .name("smtp-control".into())
                     .spawn_scoped(scope, || {
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            endpoint.run(&control, &finished, mailbox_access)
+                            endpoint.run(
+                                &control,
+                                &finished,
+                                mailbox_access,
+                                relay.then_some(&queue_control),
+                            )
                         }));
                         if !matches!(result, Ok(Ok(()))) {
                             control.stop();
@@ -369,16 +379,50 @@ pub(super) fn run(options: Options) -> Result<(), ConfigFailure> {
                 } else {
                     None
                 };
+                let relay_worker = if relay {
+                    let relay_service = td_mta::postgres_relay_worker::Worker {
+                        queue: &queue_control,
+                        request: &relay_request,
+                        trust: &loaded.trust,
+                        profile: &published,
+                        clock: clock.clone(),
+                        handshakes: &handshakes,
+                        maximum: limits.message_bytes as u64,
+                    };
+                    Some(
+                        std::thread::Builder::new()
+                            .name("smtp-relay".into())
+                            .spawn_scoped(scope, {
+                                let control = &control;
+                                let relay_ready = &relay_ready;
+                                move || {
+                                    let result =
+                                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                                            || relay_service.run(control, relay_ready),
+                                        ));
+                                    if !matches!(result, Ok(Ok(()))) {
+                                        control.stop();
+                                    }
+                                    result
+                                }
+                            })
+                            .map_err(|_| config_failure("relay", "worker-start"))?,
+                    )
+                } else {
+                    None
+                };
                 let ready = || {
                     let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
-                    while mailbox_access && !https_ready.load(Ordering::Acquire) {
+                    while (mailbox_access && !https_ready.load(Ordering::Acquire))
+                        || (relay && !relay_ready.load(Ordering::Acquire))
+                    {
                         if control.stop_requested() || std::time::Instant::now() >= until {
                             control.stop();
                             return Err(ports::Error::WriterStopped);
                         }
                         std::thread::sleep(std::time::Duration::from_millis(5));
                     }
-                    announce(listeners.len(), mailbox_access)
+                    announce(listeners.len(), mailbox_access, relay)
                 };
                 let result = match receiving.as_ref() {
                     Some(receiving) => receiving.run_with_ready(&control, ready),
@@ -391,6 +435,11 @@ pub(super) fn run(options: Options) -> Result<(), ConfigFailure> {
                 if let Some(worker) = http_worker {
                     if !matches!(worker.join(), Ok(Ok(Ok(())))) {
                         return Err(config_failure("https", "worker-stopped"));
+                    }
+                }
+                if let Some(worker) = relay_worker {
+                    if !matches!(worker.join(), Ok(Ok(Ok(())))) {
+                        return Err(config_failure("relay", "worker-stopped"));
                     }
                 }
                 result?;
@@ -420,14 +469,14 @@ fn same_owner_root(
     }
     Ok(root)
 }
-fn announce(listeners: usize, mailbox_access: bool) -> Result<(), ports::Error> {
+fn announce(listeners: usize, mailbox_access: bool, relay: bool) -> Result<(), ports::Error> {
     let mut output = io::stdout().lock();
     let profile = if mailbox_access {
         "mailbox-access"
     } else {
         "smtp-only"
     };
-    writeln!(output, "{{\"schema\":1,\"command\":\"serve\",\"status\":\"ready\",\"profile\":\"{profile}\",\"smtp_listeners\":{listeners},\"https\":{mailbox_access},\"outbound\":false,\"reload\":false,\"signal_drain\":true}}")?;
+    writeln!(output, "{{\"schema\":1,\"command\":\"serve\",\"status\":\"ready\",\"profile\":\"{profile}\",\"smtp_listeners\":{listeners},\"https\":{mailbox_access},\"outbound\":{relay},\"reload\":false,\"signal_drain\":true}}")?;
     output.flush()?;
     Ok(())
 }

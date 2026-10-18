@@ -145,10 +145,9 @@ pub(super) fn exercise(
             Err(recovery::Error::CurrentOwner)
         );
         sql(fixture,&format!("UPDATE td_mta.submissions SET expires_at=(extract(epoch FROM clock_timestamp())*1000)::bigint+1000 WHERE id=decode('{submission}','hex')"));
-        assert_eq!(
-            recovery::publish(request, trust, deadline(), &value),
-            Err(recovery::Error::ExpiryHold)
-        );
+        super::expiry_wait_snapshot(fixture, || {
+            recovery::publish(request, trust, deadline(), &value).unwrap();
+        });
         sql(fixture,&format!("UPDATE td_mta.submissions SET expires_at=(extract(epoch FROM clock_timestamp())*1000)::bigint+86400000 WHERE id=decode('{submission}','hex')"));
         if phase == 1 || phase == 4 {
             let before_replies = sql(fixture, &format!("SELECT md5(string_agg(concat_ws('|',ordinal,rcpt_reply,data_reply),',' ORDER BY ordinal)) FROM td_mta.recipients WHERE submission_id=decode('{submission}','hex')"));
@@ -305,10 +304,9 @@ pub(super) fn exercise(
     let value =
         recovery::interrupted_with_rcpt(claim, generation, attempt.attempt, &borrowed).unwrap();
     sql(fixture,&format!("UPDATE td_mta.submissions SET expires_at=(extract(epoch FROM clock_timestamp())*1000)::bigint+1000 WHERE id=decode('{submission}','hex')"));
-    assert_eq!(
-        recovery::publish(request, trust, deadline(), &value),
-        Err(recovery::Error::ExpiryHold)
-    );
+    super::expiry_wait_snapshot(fixture, || {
+        recovery::publish(request, trust, deadline(), &value).unwrap();
+    });
     sql(fixture,&format!("UPDATE td_mta.submissions SET expires_at=(extract(epoch FROM clock_timestamp())*1000)::bigint+86400000 WHERE id=decode('{submission}','hex')"));
     let before = sql(
         fixture,

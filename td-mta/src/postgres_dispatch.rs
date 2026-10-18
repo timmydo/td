@@ -646,6 +646,73 @@ impl<'w, 'a, 'r> PreparedResult<'w, 'a, 'r> {
         self.published.dispatch.clone()
     }
 
+    /// Classify the verified immutable body before MAIL without renewing the
+    /// Prepared limit. The same source will be reopened for DATA after 354.
+    pub(crate) fn body_mode(
+        &self,
+        maximum: u64,
+        meter: &mut Meter,
+    ) -> Result<crate::smtp_data_encode::Body, Error> {
+        let bytes = maximum
+            .checked_mul(3)
+            .and_then(|n| n.checked_add(ATTEMPT_IO))
+            .ok_or(ports::Error::Capacity)?;
+        let limit = self
+            .worker
+            .connection
+            .admit(self.until, meter, bytes)?
+            .min(self.limit);
+        let _slot = self
+            .worker
+            .connection
+            .slots
+            .acquire()
+            .map_err(|_| ports::Error::Busy)?;
+        attempts::with_body(
+            self.worker.connection.request,
+            self.worker.connection.trust,
+            limit,
+            &self.published.dispatch,
+            maximum,
+            |_, body| {
+                let mut scratch = [0; 4096];
+                let mut offset = 0;
+                let mut mode = crate::smtp_data_encode::Body::SevenBit;
+                while offset < body.len() {
+                    if Instant::now() >= limit {
+                        return Err(ports::Error::Deadline);
+                    }
+                    meter
+                        .charge(
+                            self.worker.connection.clock.sample()?.monotonic,
+                            Charge {
+                                records: 1,
+                                ..Default::default()
+                            },
+                        )
+                        .map_err(|stop| match stop {
+                            Stop::Deadline => ports::Error::Deadline,
+                            _ => ports::Error::Capacity,
+                        })?;
+                    let n = body.read_at(offset, &mut scratch)?;
+                    let bytes = scratch
+                        .get(..n)
+                        .filter(|_| n > 0)
+                        .ok_or(ports::Error::Corrupt)?;
+                    if bytes.iter().any(|byte| !byte.is_ascii()) {
+                        mode = crate::smtp_data_encode::Body::EightBit;
+                    }
+                    offset = offset.checked_add(n as u64).ok_or(ports::Error::Capacity)?;
+                }
+                if Instant::now() >= limit {
+                    return Err(ports::Error::Deadline);
+                }
+                Ok(mode)
+            },
+        )
+        .map_err(|_| Error::Admission(ports::Error::Corrupt))
+    }
+
     /// Bind the first untouched envelope and its observed cap to this owner.
     pub fn admit_envelope(mut self, meter: &mut Meter) -> Result<EnvelopePlan<'w, 'a, 'r>, Error> {
         let (envelope, limit) = self.observe_envelope(meter)?;

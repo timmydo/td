@@ -4418,3 +4418,17 @@ including account capture, all keyset reads and acknowledged rollback.
 Each accepted row spends the explicit total row allowance; failure returns
 no partial report. Retired rows count against that allowance. No full history
 vector, live-object index, body buffer or new worker budget is introduced.
+
+
+## Active PostgreSQL relay worker
+
+A relay role adds one SMTP thread and one lease-renewal thread, independently
+of the fixed receiving/HTTPS workers. The relay owns two reusable TLS wire
+buffers, fixed command/reply/body/DNS scratch, one bounded candidate page,
+one active attempt and at most one retained failure continuation. It reserves
+two ordinary PostgreSQL read slots, two independent body-source slots and
+one separate settlement slot. Renewal
+uses a separate bounded database call and cannot consume a body-source slot.
+POSTGRES.md section 212 owns the work-meter ceilings and lifecycle. These
+explicit active-worker reservations are additional to the planned resource
+ledger; whole-process RSS and maximum-body throughput remain unqualified.

@@ -117,6 +117,47 @@ fn run() -> io::Result<ExitCode> {
     if first.as_deref() == Some(OsStr::new("postgres")) {
         return postgres::run(args);
     }
+    if matches!(
+        first.as_deref().and_then(|s| s.to_str()),
+        Some(
+            "queue-clock-confirm"
+                | "queue-clock-status"
+                | "queue-route-repair"
+                | "queue-route-status"
+        )
+    ) {
+        let command = first
+            .as_deref()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+        let result = (|| {
+            if args.next().as_deref() != Some(OsStr::new("--runtime")) {
+                return Err(config_failure("arguments", "invalid-arguments"));
+            }
+            let path = args
+                .next()
+                .and_then(|p| p.into_string().ok())
+                .ok_or_else(|| config_failure("arguments", "invalid-arguments"))?;
+            if args.next().is_some() {
+                return Err(config_failure("arguments", "invalid-arguments"));
+            }
+            control::clock_request(&path, command)
+        })();
+        return match result {
+            Ok(status) => {
+                writeln!(
+                    io::stdout().lock(),
+                    "{{\"schema\":1,\"command\":\"{command}\",\"status\":\"{status}\"}}"
+                )?;
+                Ok(ExitCode::SUCCESS)
+            }
+            Err(error) => {
+                let code = error.failure.exit_code();
+                configuration_failure(&mut io::stdout().lock(), command, error)?;
+                Ok(code)
+            }
+        };
+    }
     if matches!(first.as_deref(), Some(value) if value == OsStr::new("status") || value == OsStr::new("stop"))
     {
         let stop = first.as_deref() == Some(OsStr::new("stop"));

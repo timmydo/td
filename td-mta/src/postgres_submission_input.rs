@@ -325,6 +325,18 @@ fn freeze(
     };
     let body_start = usize::try_from(end.body_start).map_err(|_| Error::Headers)?;
     let headers = headers.get(..body_start).ok_or(Error::Headers)?;
+    charge(
+        clock,
+        meter,
+        Charge {
+            io_bytes: headers.len() as u64,
+            records: 1,
+            ..Charge::default()
+        },
+    )?;
+    if !headers.is_ascii() {
+        return Err(Error::Headers);
+    }
     let deadline =
         Deadline::after(ports::Tick(0), meter.deadline().tick().0).map_err(Error::Work)?;
     let envelope =
@@ -490,6 +502,16 @@ mod tests {
             .unwrap()
             .bytes
             .ends_with(&vec![b'x'; 12000]));
+    }
+    #[test]
+    fn eight_bit_body_does_not_authorize_utf8_headers() {
+        let prefix = "From: main@example.test\r\nTo: one@example.test\r\n";
+        for step in [1, 7, 4096] {
+            let headers = format!("{prefix}Subject: café\r\n\r\nASCII body");
+            assert!(matches!(run(headers.as_bytes(), step), Err(Error::Headers)));
+            let body = format!("{prefix}Subject: ASCII\r\n\r\ncafé");
+            assert_eq!(run(body.as_bytes(), step).unwrap().bytes, body.as_bytes());
+        }
     }
     #[test]
     fn identity_headers_work_size_and_source_failures_refuse() {

@@ -138,6 +138,9 @@ pub struct PublishedProfile {
     pub(crate) policies: GenerationLease<TlsPolicies>,
 }
 impl PublishedProfile {
+    pub fn configuration(&self) -> &ResolvedProfile {
+        &self.configuration
+    }
     pub fn binding(&self) -> &Binding {
         &self.binding
     }

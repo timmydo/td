@@ -78,6 +78,7 @@ impl Endpoint {
         control: &Control,
         finished: &AtomicBool,
         mailbox_access: bool,
+        queue: Option<&td_mta::postgres_relay_worker::QueueControl>,
     ) -> io::Result<()> {
         let mut retry_at = Instant::now();
         while !finished.load(Ordering::Acquire) {
@@ -91,7 +92,7 @@ impl Endpoint {
             match self.listener.accept() {
                 Ok((mut stream, _)) => {
                     // One private operator request; neither storage nor SMTP waits on it.
-                    let _ = exchange(&mut stream, control, mailbox_access);
+                    let _ = exchange_queue(&mut stream, control, mailbox_access, queue);
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     std::thread::sleep(TURN);
@@ -202,7 +203,16 @@ fn send(stream: &mut UnixStream, start: Instant, mut bytes: &[u8]) -> io::Result
     }
     Ok(())
 }
+#[cfg(test)]
 fn exchange(stream: &mut UnixStream, control: &Control, mailbox_access: bool) -> io::Result<()> {
+    exchange_queue(stream, control, mailbox_access, None)
+}
+fn exchange_queue(
+    stream: &mut UnixStream,
+    control: &Control,
+    mailbox_access: bool,
+    queue: Option<&td_mta::postgres_relay_worker::QueueControl>,
+) -> io::Result<()> {
     let start = Instant::now();
     let mut bytes = [0; 256];
     let request = line(stream, start, &mut bytes, true)?;
@@ -214,6 +224,31 @@ fn exchange(stream: &mut UnixStream, control: &Control, mailbox_access: bool) ->
             State::Stopped => b"STOPPED\n",
             State::Failed => b"FAILED\n",
         },
+        b"ROUTE-REPAIR\n" if queue.is_some() => {
+            if let Some(queue) = queue {
+                queue.request_repair();
+            }
+            b"REQUESTED\n"
+        }
+        b"ROUTE-STATUS\n" if queue.is_some() => match queue.map(|q| q.repair_status()) {
+            Some("requested") => b"REQUESTED\n",
+            Some("repaired") => b"REPAIRED\n",
+            Some("refused") => b"REFUSED\n",
+            _ => b"IDLE\n",
+        },
+        b"CLOCK-CONFIRM\n" if queue.is_some() => {
+            if let Some(queue) = queue {
+                queue.request_confirmation();
+            }
+            b"REQUESTED\n"
+        }
+        b"CLOCK-STATUS\n" if queue.is_some() => {
+            if queue.is_some_and(|queue| queue.expiry_enabled()) {
+                b"CONFIRMED\n"
+            } else {
+                b"HELD\n"
+            }
+        }
         b"STOP\n" => {
             control.stop();
             b"REQUESTED\n"
@@ -257,6 +292,36 @@ pub(super) fn request(
         _ => Err(config_failure("control", "invalid-response")),
     }?;
     Ok((state, profile))
+}
+
+pub(super) fn clock_request(runtime: &str, command: &str) -> Result<&'static str, ConfigFailure> {
+    let (_root, mut stream) = connect(runtime)?;
+    let start = Instant::now();
+    send(
+        &mut stream,
+        start,
+        match command {
+            "queue-clock-confirm" => b"CLOCK-CONFIRM\n",
+            "queue-route-repair" => b"ROUTE-REPAIR\n",
+            "queue-route-status" => b"ROUTE-STATUS\n",
+            _ => b"CLOCK-STATUS\n",
+        },
+    )
+    .map_err(io_failure)?;
+    stream
+        .shutdown(std::net::Shutdown::Write)
+        .map_err(io_failure)?;
+    let mut bytes = [0; 32];
+    let reply = line(&mut stream, start, &mut bytes, false).map_err(io_failure)?;
+    match reply.strip_prefix(b"HTTPS ").unwrap_or(reply) {
+        b"REQUESTED\n" => Ok("requested"),
+        b"CONFIRMED\n" => Ok("confirmed"),
+        b"HELD\n" => Ok("held"),
+        b"REPAIRED\n" => Ok("repaired"),
+        b"REFUSED\n" => Ok("refused"),
+        b"IDLE\n" => Ok("idle"),
+        _ => Err(config_failure("queue", "unavailable")),
+    }
 }
 
 fn connect(runtime: &str) -> Result<(PrivateRoot, UnixStream), ConfigFailure> {

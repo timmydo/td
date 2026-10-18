@@ -1742,10 +1742,28 @@ unsupported schemas, unavailable databases and invalid profiles before
 opening listeners. It never creates or upgrades the schema.
 
 Receive and JMAP roles use the PostgreSQL SMTP, authentication, read and
-mutation adapters. A JMAP-only instance needs no SMTP listener. Relay roles
-remain refused until the relay loop is connected. Configuration reload is
-not yet active: a changed selection fences old operations and requires
-restart. The JMAP session advertises Mail, not Submission.
+mutation adapters. A JMAP-only instance needs no SMTP listener and advertises
+Submission; it can queue mail for a separate relay instance. A relay role
+starts one route worker, including in a listener-free profile. Concurrent
+instances wait for the database route lease. Configuration reload is not yet
+active: a changed selection fences old operations and requires restart.
+
+`queue-clock-status --runtime PATH` reports `held` or `confirmed` for relay
+expiry. `queue-clock-confirm --runtime PATH` requests clock confirmation on
+that process through its private control socket. The acknowledgment is
+`requested`, not completion: check status afterward. Confirmation before
+five minutes of stable database UTC/monotonic progress is refused; submit
+again afterward. A restart or clock discontinuity restores the hold. This
+operation permits bounded overdue expiry under QUEUE.md; it does not move
+retry deadlines earlier.
+
+`queue-route-repair --runtime PATH` explicitly requests release of a TLS or
+authentication pause after selecting a newer repaired configuration and
+restarting the relay. It does not bypass the database's newer-generation or
+minimum-backoff requirements. `queue-route-status --runtime PATH` reports the
+last local repair request as `idle`, `requested`, `repaired` or `refused`.
+An acknowledgment of `requested` is not a successful repair. Unknown COMMIT
+holds that exact operation for receipt inspection before further scheduling.
 
 Runtime and scratch are explicit host-local paths, owned by the service
 user with mode 0700. Each instance has its own paths. The runtime control
@@ -1798,9 +1816,8 @@ root from a previous mailbox run, but does not require one. The API accepts
 application/json with fixed or chunked bodies and returns ordered retained
 responses, result references, createdIds and the prepared Session state.
 Malformed requests and advertised limits receive standard JMAP problem details.
-Authenticated GET `/.well-known/jmap` returns Core and Mail capabilities,
-a sole read-only account and its Mail primary-account mapping. Submission
-remains unadvertised. The event_streams limit defaults to two and
+Authenticated GET `/.well-known/jmap` returns Core, Mail and Submission
+capabilities and the sole writable account with its primary-account mappings. The event_streams limit defaults to two and
 must be nonzero for mailbox-access. The resource plan already requires it
 strictly below https_connections, reserving capacity for other requests. The
 profile-neutral resource planner permits zero for receive-only profiles; mailbox-access

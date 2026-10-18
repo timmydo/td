@@ -104,10 +104,9 @@ pub(super) fn exercise(
             );
             let expiry=sql(fixture,&format!("SELECT expires_at FROM td_mta.submissions WHERE id=decode('{submission}','hex')"));
             sql(fixture,&format!("UPDATE td_mta.submissions SET expires_at=(extract(epoch FROM clock_timestamp())*1000)::bigint+1000 WHERE id=decode('{submission}','hex')"));
-            assert_eq!(
-                phases::publish(request, trust, deadline(), &refused),
-                Err(phases::Error::ExpiryHold)
-            );
+            super::expiry_wait_snapshot(fixture, || {
+                phases::publish(request, trust, deadline(), &refused).unwrap();
+            });
             sql(fixture,&format!("UPDATE td_mta.submissions SET expires_at={expiry} WHERE id=decode('{submission}','hex')"));
             sql(fixture,"CREATE FUNCTION public.reject_refusal() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture refusal'; END $$; CREATE TRIGGER reject_refusal BEFORE INSERT ON td_mta.attempt_refusal_receipts FOR EACH ROW EXECUTE FUNCTION public.reject_refusal()");
             assert_eq!(

@@ -1004,11 +1004,14 @@ fn publish_inner(
                                 }
                                 _ => Error::Integrity,
                             })?;
-                            let retry = timestamp.checked_add(delay).ok_or(Error::Capacity)?;
-                            if retry >= expires {
-                                return Err(Error::ExpiryHold);
-                            }
-                            Some(retry)
+                            // Preserve the actual reply while clock-confirmed
+                            // expiry remains held; equality cannot dispatch.
+                            Some(
+                                timestamp
+                                    .checked_add(delay)
+                                    .ok_or(Error::Capacity)?
+                                    .min(expires),
+                            )
                         };
                         states.push(if uncertain == 1 {
                             7i64
