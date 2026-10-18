@@ -578,6 +578,7 @@ fn the_upgrade_runs_over_cryptsetup_headers() {
         };
         let gathered = Gathered {
             fido2: &[1, 2],
+            dropped: &[],
             tpm: match shape {
                 Shape::Tpm => Tpm::Sealed(&sealed),
                 Shape::Fido2 => Tpm::None,

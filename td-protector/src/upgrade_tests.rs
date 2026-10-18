@@ -7,9 +7,9 @@ use std::collections::BTreeMap;
 use td_tpm::SealedObject;
 
 /// The recovery key's identity in the model.
-const RECOVERY_KEY: u32 = 1000;
+pub(crate) const RECOVERY_KEY: u32 = 1000;
 /// A pending fido2 token `n`'s passphrase is `FIDO_KEY + n`.
-const FIDO_KEY: u32 = 2000;
+pub(crate) const FIDO_KEY: u32 = 2000;
 /// The device-bound protector's secret.
 const DEVICE_KEY: u32 = 101;
 /// The salt text every modelled digest carries.
@@ -18,14 +18,14 @@ const SALT: &str = "c2FsdA==";
 /// A keyslot as cryptsetup keeps it: the key it opens with, the volume key
 /// it wraps, and whether it is a `luks2` keyslot or a reencryption's own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Slot {
-    key: u32,
-    vk: u32,
-    luks2: bool,
+pub(crate) struct Slot {
+    pub(crate) key: u32,
+    pub(crate) vk: u32,
+    pub(crate) luks2: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Tok {
+pub(crate) enum Tok {
     Protected(Token),
     /// A first-boot or device-bound td token, an orphan naming none.
     Bound {
@@ -38,19 +38,19 @@ enum Tok {
 /// A LUKS2 header as cryptsetup keeps it, with the data segment's volume
 /// key generation and an online reencryption's target.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Disk {
-    keyslots: BTreeMap<u8, Slot>,
-    tokens: BTreeMap<u8, Tok>,
-    vk: u32,
+pub(crate) struct Disk {
+    pub(crate) keyslots: BTreeMap<u8, Slot>,
+    pub(crate) tokens: BTreeMap<u8, Tok>,
+    pub(crate) vk: u32,
     next_vk: u32,
-    reencrypting: Option<u32>,
+    pub(crate) reencrypting: Option<u32>,
     /// The `mode` a reencryption keyslot carries.
     mode: &'static str,
 }
 
 /// Where a power cut stops a reencryption among cryptsetup's commits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Partial {
+pub(crate) enum Partial {
     /// After its new key's keyslot, before the initialization's commit:
     /// an unbound keyslot no token names.
     Unbound,
@@ -130,7 +130,7 @@ impl Disk {
     /// device-bound protector in keyslot 1 as token 0, the pending fido2
     /// tokens 1 and 2 (in the FIDO2 shape the first is primary) and the
     /// `td-upgrade` token 3 over volume key 1.
-    fn u0(shape: Shape) -> Self {
+    pub(crate) fn u0(shape: Shape) -> Self {
         let mut disk = Self {
             keyslots: BTreeMap::from([
                 (
@@ -180,7 +180,7 @@ impl Disk {
         disk
     }
 
-    fn header(&self) -> Header {
+    pub(crate) fn header(&self) -> Header {
         let mut header = Header {
             copy: HeaderCopy::Primary,
             seqid: 1,
@@ -259,7 +259,7 @@ impl Disk {
         427 + 305 * luks2 + reencryption + tokens
     }
 
-    fn view(&self) -> UpgradeView {
+    pub(crate) fn view(&self) -> UpgradeView {
         UpgradeView {
             header: self.header(),
             volume: self.volume(),
@@ -269,7 +269,7 @@ impl Disk {
 
     /// The header as `luksDump --dump-json-metadata` prints it, which the
     /// reader's own bounds then judge.
-    fn dump(&self) -> Vec<u8> {
+    pub(crate) fn dump(&self) -> Vec<u8> {
         let keyslots: Vec<String> = self
             .keyslots
             .iter()
@@ -334,7 +334,7 @@ impl Disk {
     }
 
     /// Whether `slot` opens the data segment with `key`.
-    fn opens(&self, slot: u8, key: u32) -> bool {
+    pub(crate) fn opens(&self, slot: u8, key: u32) -> bool {
         self.keyslots
             .get(&slot)
             .is_some_and(|s| s.luks2 && s.key == key && s.vk == self.vk)
@@ -395,7 +395,7 @@ impl Disk {
 
     /// One step as cryptsetup commits it, `tpm` the sealed secret this
     /// boot. `partial` stops a reencryption where a power cut would.
-    fn apply(&mut self, step: &Step, tpm: Option<u32>, partial: Option<Partial>) {
+    pub(crate) fn apply(&mut self, step: &Step, tpm: Option<u32>, partial: Option<Partial>) {
         match step {
             Step::Test { slot, key } => {
                 assert!(self.opens(*slot, secret(*key, tpm)), "{step:?}")
@@ -541,6 +541,7 @@ fn boot(
     let tpm_key = sealed.as_ref().map(key_of);
     let gathered = Gathered {
         fido2: &needs.fido2,
+        dropped: &[],
         tpm,
         resilience,
     };
@@ -773,6 +774,7 @@ fn u5_completes_without_the_recovery_key() {
     );
     let gathered = Gathered {
         fido2: &[],
+        dropped: &[],
         tpm: Tpm::None,
         resilience: Resilience::Journal,
     };
@@ -1130,6 +1132,7 @@ fn forged_headers_plan_nothing() {
     cases.push(("two tpm-pin tokens", disk, Refusal::Unexpected { token: 9 }));
     let gathered = Gathered {
         fido2: &[1, 2],
+        dropped: &[],
         tpm: Tpm::Unusable,
         resilience: Resilience::Journal,
     };
@@ -1180,6 +1183,7 @@ fn forged_headers_plan_nothing() {
 fn a_plan_that_would_not_fit_is_refused() {
     let gathered = Gathered {
         fido2: &[1, 2],
+        dropped: &[],
         tpm: Tpm::Unusable,
         resilience: Resilience::Checksum,
     };
@@ -1211,6 +1215,7 @@ fn a_secret_not_gathered_is_refused() {
     let view = in_state(Shape::Tpm, State::U4).view();
     let mut gathered = Gathered {
         fido2: &[1],
+        dropped: &[],
         tpm: Tpm::Unusable,
         resilience: Resilience::Journal,
     };
@@ -1255,6 +1260,7 @@ fn the_u4_plan_adds_each_protector_under_the_recovery_key() {
     let sealed = pin(None, 3001);
     let gathered = Gathered {
         fido2: &[1, 2],
+        dropped: &[],
         tpm: Tpm::Sealed(&sealed),
         resilience: Resilience::Journal,
     };
@@ -1333,6 +1339,7 @@ fn the_u4_plan_adds_each_protector_under_the_recovery_key() {
 fn the_reencryption_runs_with_the_recovery_key_on_keyslot_0() {
     let gathered = Gathered {
         fido2: &[1, 2],
+        dropped: &[],
         tpm: Tpm::Unusable,
         resilience: Resilience::Checksum,
     };
@@ -1419,6 +1426,7 @@ fn the_reencryption_runs_with_the_recovery_key_on_keyslot_0() {
 fn metadata_that_disagrees_runs_no_step() {
     let gathered = Gathered {
         fido2: &[1, 2],
+        dropped: &[],
         tpm: Tpm::Unusable,
         resilience: Resilience::Journal,
     };
@@ -1490,6 +1498,7 @@ fn an_unbound_keyslot_a_cut_initialization_left_is_killed() {
         .unwrap();
     let gathered = Gathered {
         fido2: &[1, 2],
+        dropped: &[],
         tpm: Tpm::Unusable,
         resilience: Resilience::Journal,
     };
@@ -1521,6 +1530,7 @@ fn a_cut_inside_cryptsetups_last_commits_plans_only_the_resumption() {
     let mut finishing = disk.clone();
     let gathered = Gathered {
         fido2: &[1, 2],
+        dropped: &[],
         tpm: Tpm::Unusable,
         resilience: Resilience::Journal,
     };
@@ -1575,6 +1585,7 @@ fn a_take_on_an_unusable_tpm_is_not_planned() {
     );
     let usable = Gathered {
         fido2: &[],
+        dropped: &[],
         tpm: Tpm::None,
         resilience: Resilience::Journal,
     };
@@ -1608,6 +1619,137 @@ fn a_take_on_an_unusable_tpm_is_not_planned() {
     assert!(!fido.tpm_pin && !fido.lockout);
 }
 
+/// Every state's plan run to the end under `gathered`, uncut.
+fn run_all(disk: &mut Disk, gathered: &Gathered, tpm: Option<u32>) {
+    for _ in 0..8 {
+        let view = disk.view();
+        if view.header.kind() != Kind::Upgrading {
+            return;
+        }
+        let steps = plan(&view, gathered)
+            .unwrap()
+            .confirm(&disk.dump())
+            .unwrap();
+        for step in &steps {
+            disk.apply(step, tpm, None);
+        }
+    }
+    panic!("the upgrade did not end: {disk:?}");
+}
+
+/// A dropped pending key: its token goes in U4 and no keyslot is added for
+/// it, in either shape, but the FIDO2 shape keeps a fido2-primary token,
+/// and only a pending token not yet dropped may go.
+#[test]
+fn a_dropped_key_is_removed_and_the_fido2_shapes_last_refused() {
+    for &shape in SHAPES {
+        let view = Disk::u0(shape).view();
+        assert!(droppable(&view, &[], 2), "{shape:?}");
+        assert!(!droppable(&view, &[2], 2), "{shape:?}");
+        assert!(!droppable(&view, &[], 3), "{shape:?}: td-upgrade");
+        assert!(!droppable(&view, &[], 7), "{shape:?}: no token");
+        // Token 1 is the FIDO2 shape's one fido2-primary token.
+        assert_eq!(droppable(&view, &[], 1), shape == Shape::Tpm, "{shape:?}");
+        assert_eq!(droppable(&view, &[2], 1), shape == Shape::Tpm, "{shape:?}");
+        let sealed = pin(None, 3001);
+        let mut disk = Disk::u0(shape);
+        let gathered = Gathered {
+            fido2: &[1],
+            dropped: &[2],
+            tpm: match shape {
+                Shape::Tpm => Tpm::Sealed(&sealed),
+                Shape::Fido2 => Tpm::None,
+            },
+            resilience: Resilience::Journal,
+        };
+        run_all(&mut disk, &gathered, Some(key_of(&sealed)));
+        let header = disk.header();
+        assert_eq!(
+            protected_plan::check(&header),
+            Ok(shape),
+            "{shape:?} {disk:?}"
+        );
+        // A later import may take the dropped token's number.
+        let fidos = header
+            .protected
+            .iter()
+            .filter(|(_, token)| matches!(token, Token::Fido2(_)))
+            .count();
+        assert_eq!(fidos, 1, "{shape:?}");
+        assert!(
+            header
+                .protected
+                .iter()
+                .any(|(n, t)| *n == 1 && matches!(t, Token::Fido2(fido) if fido.keyslot.is_some())),
+            "{shape:?}"
+        );
+        // The FIDO2 shape's last fido2-primary token, and a token that is
+        // not pending, refuse the plan.
+        let view = in_state(shape, State::U4).view();
+        let dropping = |dropped: &'static [u8]| Gathered {
+            fido2: &[1, 2],
+            dropped,
+            tpm: Tpm::Unusable,
+            resilience: Resilience::Journal,
+        };
+        if shape == Shape::Fido2 {
+            assert_eq!(plan(&view, &dropping(&[1])), Err(Refusal::NoPrimary));
+        }
+        assert_eq!(
+            plan(&view, &dropping(&[3])),
+            Err(Refusal::Unexpected { token: 3 }),
+            "{shape:?}"
+        );
+    }
+}
+
+/// A primary whose Name changed between the seal and the take: U4 kills
+/// the new tpm-pin keyslot and removes its token, then the `td-upgrade`
+/// token, so no keyslot remains for an object no lockout token anchors.
+#[test]
+fn a_changed_primary_removes_the_new_tpm_pin_protector() {
+    let mut whole = Disk::u0(Shape::Tpm);
+    let total = boot(&mut whole, None, true, Resilience::Journal, &mut 0);
+    let mut disk = cut_at(Shape::Tpm, total - 2, None);
+    let view = disk.view();
+    let (number, slot) = view
+        .header
+        .protected
+        .iter()
+        .find_map(|(number, token)| match token {
+            Token::TpmPin(pin) => Some((*number, pin.keyslot.unwrap())),
+            _ => None,
+        })
+        .unwrap();
+    let marker = super::marker(&view.header).unwrap().unwrap();
+    let changed = Gathered {
+        fido2: &[],
+        dropped: &[],
+        tpm: Tpm::Changed,
+        resilience: Resilience::Journal,
+    };
+    assert_eq!(
+        plan(&view, &changed).unwrap().steps(),
+        [
+            Step::Test {
+                slot: marker,
+                key: Key::Recovery
+            },
+            Step::KillSlot { slot, by: marker },
+            Step::RemoveToken { token: number },
+            Step::RemoveToken { token: 3 }
+        ]
+    );
+    run_all(&mut disk, &changed, None);
+    let header = disk.header();
+    assert_eq!(protected_plan::check(&header), Ok(Shape::Tpm));
+    assert!(!header
+        .protected
+        .iter()
+        .any(|(_, token)| matches!(token, Token::TpmPin(_) | Token::Lockout(_))));
+    assert!(!disk.keyslots.contains_key(&slot));
+}
+
 /// U4 whose every token number is taken refuses the tpm-pin import before
 /// its first step. (Every keyslot from 1 taken cannot be reached in U4: a
 /// keyslot no token names is an orphan its plan frees, and protected
@@ -1617,6 +1759,7 @@ fn a_u4_with_no_free_token_number_is_refused() {
     let sealed = pin(None, 3001);
     let gathered = Gathered {
         fido2: &[1, 2],
+        dropped: &[],
         tpm: Tpm::Sealed(&sealed),
         resilience: Resilience::Journal,
     };

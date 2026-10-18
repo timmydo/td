@@ -1091,11 +1091,12 @@ new key by `--new-key-size`, reading `--key-size` only for a header
 without keyslots, and a test ties each value to formatting's. It loads
 an online reencryption by the active mapping's name and uses the device
 operand only in messages, so the selector must hold `NAME` over the
-partition it read. Since 8f's selector commit both shapes carry
+partition it read. Since 8f's upgrade boot both shapes carry
 `--progress-json --progress-frequency 1`, measured to print one line a
 second under `--batch-mode` (`{"device":…,"device_bytes":"N",
 "device_size":"M",…}`), which streams past `run`'s output bound over a
-long reencryption: they run through `Runner::reencrypt`, which reads
+long reencryption: they run through `Runner::reencrypt`, whose default
+refuses, so that only a runner that streams reencrypts; it reads
 standard output a line at a time, each bounded at 4096 bytes with no
 total bound, and passes each line's `device_bytes` and `device_size`
 to the caller, which reports a line's whole percent when it exceeds
@@ -1107,48 +1108,68 @@ status alone decides the step. `token import` with and without
 token in place. Its `luksKillSlot` floor stays 32 bytes, which a FIDO2
 passphrase and the recovery key's 48 digits meet.
 
-**Upgrade boot.** Since 8f's selector commit `upgrade_boot` is the
-selector's flow while the header carries a `td-upgrade` token
-(ENCRYPTION.md "Re-encrypting upgrade"), beside `protected_release`,
-over the same `Tpm`, `Runner`, `Fido` and `Prompt`, pure but for them:
-before the cap the recovery key's prompt with U0's cancellation, each
+**Upgrade boot.** Since 8f `upgrade_boot` is the selector's flow while
+the header carries a `td-upgrade` token (ENCRYPTION.md "Re-encrypting
+upgrade"), which td-boot dispatches to from 8f's last commit, beside
+`protected_release`, over the same `Tpm`, `Runner`, `Fido` and
+`Prompt` and a `Host` for the volume (the header read again, the
+mapping's open with or without a keyslot, and the volume key), pure
+but for them. `upgrade` takes the view in a state before U5 and the
+boot's `Boot` (the held partition, the mapping's name, the power
+supply and the disk's resilience) and returns `Upgraded` with the
+volume key, `Cancel`, `NoMains`, `Halt` or `Failed`; `cancel` is the
+cancellation td-boot runs after the device-bound release order opened
+the volume, and `finish_u5` the U5 plan. A header `needs` refuses
+halts, but while `cancel` admits it the cancellation's question comes
+first, alone. Before the cap: the recovery key's prompt with U0's
+cancellation, each
 pending key through `Fido` over that token alone or its drop, and in
 the TPM shape the TPM's read, the new PIN and the verified seal that
 `protected_release` shares; after it the plans, state after state,
 each confirmed against cryptsetup's metadata before its first step and
-the header read again through the caller after its last, the volume
+the header read again through the caller after its last, a dropped
+token no longer pending leaving `Gathered::dropped` then, the volume
 key taken through the caller once reencryption ended or, in a boot
 starting in U3 or U4, at the open on its state's recovery keyslot,
 and the take through `upgrade::lockout_import`, only while the storage
-primary's Name is the new tpm-pin token's (ENCRYPTION.md "Bus"). A
+primary's Name is the new tpm-pin token's (ENCRYPTION.md "Bus"), read
+once and passed to `lockout_stage`, which sends every lockout command
+under it. A
 take refused before its import, or one that fails there, plans the
 header read again with `Tpm::Unusable`; a primary whose Name differs
 plans it with `Tpm::Changed`, U4's plan then killing the tpm-pin
 keyslot and removing its token before the `td-upgrade` token's
 removal; and a take that fails after its import keeps its token, the
-header then reading U5. U5 is the protected release's:
-`release` admits an upgrading header `upgrade::check` places in U5,
-`td-upgrade` aside, and td-boot runs U5's plan before `finish`, which
-takes the header read after it.
+header then reading U5, as the console says. A boot runs at most 64
+committed rounds, far over five states and U4's again; a wrong recovery
+key spends none, and is asked for again without limit. U5 is the
+protected release's, offering no reseal:
+`release_upgraded` admits an upgrading header `upgrade::check` places
+in U5, `td-upgrade` aside, and td-boot runs `finish_u5` before
+`finish`, which takes the header read after it. A failed step other
+than the recovery key's wrong-passphrase test or open halts the boot:
+each commit leaves a state the next boot continues from. The take's
+`lockout_stage` is the protected release's, given the upgrade's
+import.
 
 **Release.** Since 8c the protected path is its own module,
 `protected_release`, beside the device-bound `release::release`, which
 td-boot keeps for device-bound headers and an upgrading one's no-mains
 and cancelled boots; `release` refuses a header whose `Kind` is not
-protected, but for an upgrading one in U5. Its `Released` names the
-method (tpm-pin, fido2-primary, fido2-recovery or recovery key) that the
-admission record follows, `Method::admits` the two primary ones; FIDO2
-comes through `protected_release::Fido`, which td-boot's worker
-implements and tests script, and every console entry through `Prompt`,
-one run of secret-line each. The `release::Tpm` trait gains the
-protected tier's operations as default methods over td-tpm's salted
-sessions (`dictionary_attack`, `primary_name`, `seal_pin`, `unseal_pin`
-and `lockout` with a `LockoutCommand`), so the release tests stand a
-model in for the sessions while the chain check, the PCR reads and the
-cap stay on the scripted wire; an emulator test runs the defaults
-against swtpm. `release` runs, before the cap, the chain check, the
-warning, the TPM PIN, another way and the verified reseal, then the cap
-and the released keyslot's test; `finish`, after the selector opened
+protected, and `release_upgraded` admits an upgrading one in U5. Its
+`Released` names the method (tpm-pin, fido2-primary, fido2-recovery or
+recovery key) that the admission record follows, `Method::admits` the
+two primary ones; FIDO2 comes through `protected_release::Fido`, which
+td-boot's worker implements and tests script, and every console entry
+through `Prompt`, one run of secret-line each. The `release::Tpm` trait
+gains the protected tier's operations as default methods over td-tpm's
+salted sessions (`dictionary_attack`, `primary_name`, `seal_pin`,
+`unseal_pin` and `lockout` with a `LockoutCommand`), so the release
+tests stand a model in for the sessions while the chain check, the PCR
+reads and the cap stay on the scripted wire; an emulator test runs the
+defaults against swtpm. `release` runs, before the cap, the chain check,
+the warning, the TPM PIN, another way and the verified reseal, then the
+cap and the released keyslot's test; `finish`, after the selector opened
 the mapping with the volume key, confirms cryptsetup's metadata once
 before the first write and runs the plan, the take or proof, the
 counter and the reset. `policy_pcr_alone` is the deployment
@@ -1493,68 +1514,97 @@ tokens, no cancellation after U0, every refusal above with forged
 headers, a reencryption in another mode, a plan that would not fit by
 one byte, a secret not gathered, no free token number, metadata that
 disagrees in the data segment or the requirement, and the lockout
-import's state. Every keyslot from 1 taken is the planner's refusal
-too, but a U4 header cannot reach it: a keyslot no token names is an
-orphan its plan frees. Protected-plan tests, over
-a model of cryptsetup's commits whose every state the reader's bounds
-must admit, pin a tpm-pin release retiring a superseded protector, an
-orphan keyslot and an orphan token; two tpm-pin tokens on one keyslot
-keeping it for the one that released; a fido2-recovery or recovery-key
-release planning nothing; the reseal after each, and beside two tpm-pin
-tokens retiring both first; no reseal after a tpm-pin release or in
-the FIDO2 shape; a fido2-primary release removing only orphans, and no
-keyslot as an orphan without a marker; forged headers refused before
-any step (a tpm-pin token on a fido2 or the recovery keyslot, a fido2 or
-foreign token on a tpm-pin keyslot, a fido2-primary token beside a
-tpm-pin or lockout token, the TPM shape without a marker or with one
-naming none, an upgrading header before U5 and a device-bound header),
-each also refusing the lockout import; an opened token of another kind
-or naming no keyslot; metadata that disagrees; no free keyslot or token
-number and an object over the token's bounds; the lockout token's
-import, proof mark and removal at the numbers the planner names; and
-every plan, a tpm-pin release and the reseal beside one and two old
-protectors, cut after each of its steps, converging over the next boots
-on one header. Protected-release tests run `release` and `finish` over
-the scripted wire TPM with a model of the salted sessions, a scripted
-FIDO2 worker, scripted secret-line entries, and a cryptsetup model that
-requires PCR 12 capped before every command and every state to pass the
-reader's bounds; the model refuses a lockout command before a keyslot's
-test has passed and a seal after the cap. They pin a PIN release and its
-take (token on the header first, then the change, the parameters and the
-reset, then proven) and the next boot's proof (SetPrimaryPolicy before
-DictionaryAttackParameters, no reset, no write); a codec-refused entry
-costing no TPM command; wrong PINs counted and the counter printed
-after the test; a lockout turning to another way and that release's
-reset, and a lockout answered at the Unseal; a changed chain, a fresh
-TPM (a new primary) and another primary each asking no PIN and warning
-before any prompt and offering no reseal, and a Load refused under the
-recorded primary offering one; no SHA-256 bank asking no PIN and taking
-nothing; an unmeasured PCR 4 or 9 offering no reseal; each
-FIDO2 role and the recovery key in both shapes, with no reseal, take or
-write in the FIDO2 shape; a wrong recovery key asking again after the
-cap; the reseal confirmed (verified before the cap, requiring the
-recorded Name, planned after the take, the next boot taking the new
-PIN), declined, and failing at its seal, its verification and the
-token's bounds; the pre-cap lockout rule; a refused take discarding the
-reseal and its unproven token proven on the next boot; a verified
-token's L reused and a forged one replaced; a refused proof removing an
-unproven token and keeping a proven one, a locked lockout hierarchy
-keeping an unproven one, a refused DictionaryAttackParameters after a
-proof keeping it proven, and an interposed take; a seal's keyslot
-added only under the anchored primary (an interposer's primary taking
-nothing, a lockout token whose tag fails anchoring nothing); a failed
-keyslot test discarding the pending reseal; a header with no lockout
-token offering no reseal and its take anchoring the next boot's; no
-tpm-pin token warning before any prompt; no TPM device; end of input and failed applets; every cut of the reseal with
-its take and of a PIN release's plan converging; forged headers (a
-foreign policy, a tpm-pin token on the fido2 or recovery keyslot, a
-lockout token whose tag fails, metadata over the bounds, a mixed shape,
-an upgrading header before U5) releasing nothing unverified and writing
-nothing; the post-cap check's PolicyPCR alone; that every secret is
-dropped and none reaches a console line. td-fido's `hkdf_expand` is
-pinned to RFC 5869's three SHA-256 cases at their whole lengths, with
-the info split at every offset, one block agreeing with `hkdf`, and an
-output over 8160 bytes refused untouched.
+import's state, a dropped key's removal with the FIDO2 shape's last
+fido2-primary token and a token not pending refused, and a changed
+primary's protector killed and removed. Every keyslot from 1 taken is
+the planner's refusal too, but a U4 header cannot reach it: a keyslot
+no token names is an orphan its plan frees. Upgrade-boot tests run
+`upgrade` over the same model behind a runner that reads each spelled
+command back into its step, the release tests' TPM model and a
+scripted security key: the whole boot from U0 in each shape, the keys
+and the seal before any command, the mapping before the reencryption,
+the volume key after it, the take, the progress lines; U0 waiting for
+mains and a later state warning on battery; the cancellation at the
+recovery key's empty entry, other answers returning, and its plan
+leaving a device-bound header; no cancellation after U0; a wrong
+recovery key asking again after the cap, keeping the keys and the seal;
+a drop, the last primary's refused, a key that answers nothing once;
+a failed seal, a lockout authorization another system set and no TPM
+completing without the TPM PIN; a changed primary at the take across a
+cut, and after a drop in one boot; a take failing after its import
+keeping the protector; more wrong recovery keys than the round bound;
+a refused U0 header's cancellation and halt, and none past U0; a take
+refused before its import keeping the protector without a lockout
+token; a power cut at every command in both shapes, and inside the
+reencryption before and after its initialization, a U2 boot opening
+naming no keyslot, converging on one protected header; U5 refused
+before U5, released in it by the TPM PIN, the recovery key's release
+there offering no reseal and after it one, and `finish_u5`'s removal;
+and end of input at each prompt halting before any command; progress
+over 100% reported as 100%. Runner tests read
+cryptsetup 2.8.8's progress line as the pinned binary printed it, refuse
+what is not one, and stream a child's lines with an empty, an over-long
+and an unterminated one, and more lines than `run`'s output bound.
+Protected-plan tests, over a model of cryptsetup's commits whose every
+state the reader's bounds must admit, pin a tpm-pin release retiring a
+superseded protector, an orphan keyslot and an orphan token; two tpm-pin
+tokens on one keyslot keeping it for the one that released; a
+fido2-recovery or recovery-key release planning nothing; the reseal
+after each, and beside two tpm-pin tokens retiring both first; no reseal
+after a tpm-pin release or in the FIDO2 shape; a fido2-primary release
+removing only orphans, and no keyslot as an orphan without a marker;
+forged headers refused before any step (a tpm-pin token on a fido2 or
+the recovery keyslot, a fido2 or foreign token on a tpm-pin keyslot, a
+fido2-primary token beside a tpm-pin or lockout token, the TPM shape
+without a marker or with one naming none, an upgrading header before U5
+and a device-bound header), each also refusing the lockout import; an
+opened token of another kind or naming no keyslot; metadata that
+disagrees; no free keyslot or token number and an object over the
+token's bounds; the lockout token's import, proof mark and removal at
+the numbers the planner names; and every plan, a tpm-pin release and the
+reseal beside one and two old protectors, cut after each of its steps,
+converging over the next boots on one header. Protected-release tests
+run `release` and `finish` over the scripted wire TPM with a model of
+the salted sessions, a scripted FIDO2 worker, scripted secret-line
+entries, and a cryptsetup model that requires PCR 12 capped before every
+command and every state to pass the reader's bounds; the model refuses a
+lockout command before a keyslot's test has passed and a seal after the
+cap. They pin a PIN release and its take (token on the header first,
+then the change, the parameters and the reset, then proven) and the next
+boot's proof (SetPrimaryPolicy before DictionaryAttackParameters, no
+reset, no write); a codec-refused entry costing no TPM command; wrong
+PINs counted and the counter printed after the test; a lockout turning
+to another way and that release's reset, and a lockout answered at the
+Unseal; a changed chain, a fresh TPM (a new primary) and another primary
+each asking no PIN and warning before any prompt and offering no reseal,
+and a Load refused under the recorded primary offering one; no SHA-256
+bank asking no PIN and taking nothing; an unmeasured PCR 4 or 9 offering
+no reseal; each FIDO2 role and the recovery key in both shapes, with no
+reseal, take or write in the FIDO2 shape; a wrong recovery key asking
+again after the cap; the reseal confirmed (verified before the cap,
+requiring the recorded Name, planned after the take, the next boot
+taking the new PIN), declined, and failing at its seal, its verification
+and the token's bounds; the pre-cap lockout rule; a refused take
+discarding the reseal and its unproven token proven on the next boot; a
+verified token's L reused and a forged one replaced; a refused proof
+removing an unproven token and keeping a proven one, a locked lockout
+hierarchy keeping an unproven one, a refused DictionaryAttackParameters
+after a proof keeping it proven, and an interposed take; a seal's
+keyslot added only under the anchored primary (an interposer's primary
+taking nothing, a lockout token whose tag fails anchoring nothing); a
+failed keyslot test discarding the pending reseal; a header with no
+lockout token offering no reseal and its take anchoring the next boot's;
+no tpm-pin token warning before any prompt; no TPM device; end of input
+and failed applets; every cut of the reseal with its take and of a PIN
+release's plan converging; forged headers (a foreign policy, a tpm-pin
+token on the fido2 or recovery keyslot, a lockout token whose tag fails,
+metadata over the bounds, a mixed shape, an upgrading header before U5)
+releasing nothing unverified and writing nothing; the post-cap check's
+PolicyPCR alone; that every secret is dropped and none reaches a console
+line. td-fido's `hkdf_expand` is pinned to RFC 5869's three SHA-256
+cases at their whole lengths, with the info split at every offset, one
+block agreeing with `hkdf`, and an output over 8160 bytes refused
+untouched.
 
 The header measurement (`tests/header_fit.rs`) runs the pinned
 cryptsetup on 20 MiB files with td's own `luksFormat`, `luksAddKey` and

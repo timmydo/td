@@ -6,7 +6,7 @@
 //! Every TPM operation opens its own client through `Tpm`, every cryptsetup
 //! command runs through `Runner`, and every secret is zeroed when dropped.
 
-use crate::cryptsetup::{Cryptsetup, KeyFile};
+use crate::cryptsetup::{Cryptsetup, KeyFile, Progress};
 use crate::lockout;
 use crate::luks2::{Header, MAX_TD_TOKENS};
 use crate::pin::{release_pin_policy, AuthValue, PinPolicy};
@@ -152,6 +152,21 @@ pub trait Runner {
     fn run(&mut self, args: &[OsString], input: &[u8]) -> io::Result<()>;
     /// `luksDump --dump-json-metadata` of `device` (`Cryptsetup::metadata`).
     fn metadata(&mut self, device: &Path) -> io::Result<Vec<u8>>;
+    /// A reencryption, its progress lines passed on as read
+    /// (`Cryptsetup::reencrypt`). `run`'s output bound would stop one, so
+    /// a runner that does not stream refuses it.
+    fn reencrypt(
+        &mut self,
+        args: &[OsString],
+        input: &[u8],
+        progress: &mut dyn FnMut(Progress),
+    ) -> io::Result<()> {
+        let _ = (args, input, progress);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "this runner cannot stream a reencryption",
+        ))
+    }
 }
 
 impl Runner for Cryptsetup {
@@ -160,6 +175,14 @@ impl Runner for Cryptsetup {
     }
     fn metadata(&mut self, device: &Path) -> io::Result<Vec<u8>> {
         Cryptsetup::metadata(self, device)
+    }
+    fn reencrypt(
+        &mut self,
+        args: &[OsString],
+        input: &[u8],
+        progress: &mut dyn FnMut(Progress),
+    ) -> io::Result<()> {
+        Cryptsetup::reencrypt(self, args, input, progress)
     }
 }
 

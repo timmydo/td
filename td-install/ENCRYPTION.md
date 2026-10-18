@@ -2010,7 +2010,14 @@ operations' wire, steps and screens.
    failed removal stops that plan, and the boot goes on. Neither this
    boot nor a no-mains one offers a reseal, since the header was
    upgrading when read; a cancelled volume's next recovery offers it.
-   After U0 nothing cancels, and the prompt says so. The selector then
+   A header td-protector's upgrade checks refuse, as one a foreign token
+   joined after phase 1, is not upgraded; while it still holds U0's
+   device-bound token and keyslot, unreencrypted, and no protected token
+   but `td-upgrade` and the pending ones, the console names the
+   refusal and asks the cancellation's question alone, exactly `cancel`
+   confirming as above and any other answer halting the boot, since
+   the cancellation's removals lose nothing. After U0 nothing cancels,
+   and the prompt says so. The selector then
    gathers what the state still needs: for each pending fido2 token in
    turn, its key alone, asked by an empty entry at the token's own
    prompt, its PIN and a touch, the assertion in the unlock phase over
@@ -2108,7 +2115,8 @@ operations' wire, steps and screens.
    token, confirmed against cryptsetup's metadata, and the protected
    plan then reads the header again, so the upgrade's end needs no
    recovery key. A removal that fails leaves no protected plan this
-   boot, and the next boot finds U5 again.
+   boot, and the next boot finds U5 again. That boot offers no reseal,
+   since the header was upgrading when read; the next one offers it.
 
 | Interrupted | Next boot |
 | --- | --- |

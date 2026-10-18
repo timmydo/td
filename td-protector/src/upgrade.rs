@@ -365,6 +365,9 @@ pub struct Needs {
 pub struct Gathered<'a> {
     /// The pending fido2 tokens whose passphrases were derived.
     pub fido2: &'a [u8],
+    /// The pending fido2 tokens the person dropped before the cap, which
+    /// U4's plan removes (`droppable`).
+    pub dropped: &'a [u8],
     pub tpm: Tpm<'a>,
     pub resilience: Resilience,
 }
@@ -382,6 +385,31 @@ pub enum Tpm<'a> {
     /// adding a tpm-pin or lockout token. The selector passes it whenever
     /// it found the TPM so, whether or not anything was to be sealed.
     Unusable,
+    /// The storage primary's Name differs from the one the tpm-pin token
+    /// records, found at the take: U4 kills that protector's keyslot and
+    /// removes its token, since no lockout token anchors it (ENCRYPTION.md
+    /// "Bus"), and adds no lockout token.
+    Changed,
+}
+
+/// Whether pending fido2 token `token` may join `dropped`: a pending one
+/// not yet dropped, leaving the FIDO2 shape a fido2-primary token.
+pub fn droppable(view: &UpgradeView, dropped: &[u8], token: u8) -> bool {
+    let Ok((_, shape)) = check(view) else {
+        return false;
+    };
+    let header = &view.header;
+    if !pending(header).contains(&token) || dropped.contains(&token) {
+        return false;
+    }
+    shape != Shape::Fido2 || primary_left(header, dropped, Some(token))
+}
+
+/// Whether a fido2-primary token remains once `dropped`, and `also`, go.
+fn primary_left(header: &Header, dropped: &[u8], also: Option<u8>) -> bool {
+    fido2s(header).iter().any(|(number, fido)| {
+        fido.role == FidoRole::Primary && !dropped.contains(number) && Some(*number) != also
+    })
 }
 
 /// The `td-upgrade` token's number, shape and `from`.
@@ -416,7 +444,7 @@ fn fido2s(header: &Header) -> Vec<(u8, &Fido2)> {
 }
 
 /// The pending fido2 tokens: those naming no keyslot.
-fn pending(header: &Header) -> Vec<u8> {
+pub fn pending(header: &Header) -> Vec<u8> {
     fido2s(header)
         .into_iter()
         .filter(|(_, fido)| fido.keyslot.is_none())
@@ -599,11 +627,13 @@ fn free_keyslot(taken: &[u8]) -> Result<u8, Refusal> {
 /// - U2: resume the reencryption, which tests the key itself.
 /// - U3: import the marker naming the one `luks2` keyslot no token names.
 /// - U4: kill any `luks2` keyslot no token names but the marker's and
-///   remove an orphan tpm-pin token, then for each pending fido2 token add
-///   its keyslot, test it and only then replace the token with one naming
-///   it, so a keyslot no test proved stays an orphan the next boot kills;
-///   in the TPM shape add the tpm-pin protector the same way and take the
-///   lockout. When no take follows, the `td-upgrade` token is removed last.
+///   remove an orphan tpm-pin token and each dropped pending token, then
+///   for each other pending fido2 token add its keyslot, test it and only
+///   then replace the token with one naming it, so a keyslot no test
+///   proved stays an orphan the next boot kills; in the TPM shape add the
+///   tpm-pin protector the same way and take the lockout, or after a
+///   changed primary kill and remove that protector. When no take
+///   follows, the `td-upgrade` token is removed last.
 /// - U5: remove the `td-upgrade` token; the release already opened the
 ///   volume, so nothing is tested again.
 ///
@@ -696,6 +726,20 @@ pub fn plan(view: &UpgradeView, gathered: &Gathered) -> Result<Plan, Refusal> {
                     .iter()
                     .map(|token| Step::RemoveToken { token: *token }),
             );
+            for token in gathered.dropped {
+                if !pending(header).contains(token) {
+                    return Err(Refusal::Unexpected { token: *token });
+                }
+            }
+            if shape == Shape::Fido2 && !primary_left(header, gathered.dropped, None) {
+                return Err(Refusal::NoPrimary);
+            }
+            steps.extend(
+                gathered
+                    .dropped
+                    .iter()
+                    .map(|token| Step::RemoveToken { token: *token }),
+            );
             let mut taken: Vec<u8> = header
                 .keyslots
                 .iter()
@@ -703,7 +747,7 @@ pub fn plan(view: &UpgradeView, gathered: &Gathered) -> Result<Plan, Refusal> {
                 .filter(|slot| !orphans.contains(slot))
                 .collect();
             for (number, fido) in fido2s(header) {
-                if fido.keyslot.is_some() {
+                if fido.keyslot.is_some() || gathered.dropped.contains(&number) {
                     continue;
                 }
                 if !gathered.fido2.contains(&number) {
@@ -731,7 +775,20 @@ pub fn plan(view: &UpgradeView, gathered: &Gathered) -> Result<Plan, Refusal> {
                 });
             }
             let mut take = false;
-            if shape == Shape::Tpm && gathered.tpm != Tpm::Unusable {
+            if shape == Shape::Tpm && gathered.tpm == Tpm::Changed {
+                let pins: Vec<(u8, u8)> = header
+                    .protected
+                    .iter()
+                    .filter_map(|(number, token)| match token {
+                        Token::TpmPin(pin) => pin.keyslot.map(|slot| (*number, slot)),
+                        _ => None,
+                    })
+                    .collect();
+                for (token, slot) in pins {
+                    steps.push(Step::KillSlot { slot, by });
+                    steps.push(Step::RemoveToken { token });
+                }
+            } else if shape == Shape::Tpm && gathered.tpm != Tpm::Unusable {
                 if tpm_pin_keyslot(header).is_none() {
                     let Tpm::Sealed(sealed) = gathered.tpm else {
                         return Err(Refusal::NoTpmPin);
@@ -988,4 +1045,4 @@ pub fn pending_orphans(header: &Header) -> Result<Plan, Refusal> {
 
 #[cfg(test)]
 #[path = "upgrade_tests.rs"]
-mod tests;
+pub(crate) mod tests;

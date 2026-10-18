@@ -159,6 +159,9 @@ const PROTECTOR_TOKEN_RS: &str = include_str!("../../../td-protector/src/token.r
 const PROTECTOR_TRANSITION_RS: &str = include_str!("../../../td-protector/src/transition.rs");
 const PROTECTOR_UPGRADE_RS: &str = include_str!("../../../td-protector/src/upgrade.rs");
 const PROTECTOR_UPGRADE_TESTS_RS: &str = include_str!("../../../td-protector/src/upgrade_tests.rs");
+const PROTECTOR_UPGRADE_BOOT_RS: &str = include_str!("../../../td-protector/src/upgrade_boot.rs");
+const PROTECTOR_UPGRADE_BOOT_TESTS_RS: &str =
+    include_str!("../../../td-protector/src/upgrade_boot_tests.rs");
 
 pub fn recipe() -> Recipe {
     let rustc = "{in:rust-toolchain}/bin/rustc";
@@ -434,6 +437,16 @@ pub fn recipe() -> Recipe {
         Step::WriteFile {
             path: "{src}/td-protector/src/upgrade_tests.rs".into(),
             content: PROTECTOR_UPGRADE_TESTS_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-protector/src/upgrade_boot.rs".into(),
+            content: PROTECTOR_UPGRADE_BOOT_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-protector/src/upgrade_boot_tests.rs".into(),
+            content: PROTECTOR_UPGRADE_BOOT_TESTS_RS.into(),
             exec: false,
         },
         Step::MkDir {

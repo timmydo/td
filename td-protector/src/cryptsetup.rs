@@ -292,6 +292,47 @@ const REENCRYPT: &[&str] = &[
     "1000",
 ];
 
+/// A reencryption's progress, one JSON line a second on standard output
+/// (`Cryptsetup::reencrypt`); `--batch-mode` alone prints none.
+const PROGRESS: &[&str] = &["--progress-json", "--progress-frequency", "1"];
+
+/// The longest progress line read; a longer one is skipped as unreadable.
+pub const MAX_PROGRESS_LINE: usize = 4096;
+
+/// One line of a reencryption's progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Progress {
+    /// `device_bytes` of `device_size` rewritten.
+    Bytes { done: u64, size: u64 },
+    /// A line that is not cryptsetup's progress object.
+    Unreadable,
+}
+
+/// cryptsetup 2.8.8's progress object, `{"device":…,"device_bytes":"N",
+/// "device_size":"M",…}`, its two counts as decimal strings.
+pub fn progress_line(line: &[u8]) -> Progress {
+    let field = |name: &str| -> Option<u64> {
+        let key = format!("\"{name}\":\"");
+        let at = line
+            .windows(key.len())
+            .position(|window| window == key.as_bytes())?;
+        let rest = line.get(at + key.len()..)?;
+        let end = rest.iter().position(|byte| *byte == b'"')?;
+        let digits = rest.get(..end)?;
+        if digits.is_empty() || digits.len() > 20 || !digits.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        std::str::from_utf8(digits).ok()?.parse().ok()
+    };
+    if line.first() != Some(&b'{') || line.last() != Some(&b'}') {
+        return Progress::Unreadable;
+    }
+    match (field("device_bytes"), field("device_size")) {
+        (Some(done), Some(size)) => Progress::Bytes { done, size },
+        _ => Progress::Unreadable,
+    }
+}
+
 /// How a reencryption protects the hotzone it is rewriting, both in the
 /// keyslots area (ENCRYPTION.md "Re-encrypting upgrade").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -312,7 +353,9 @@ pub fn reencrypt_args(
     slot: u8,
     resilience: Resilience,
 ) -> Vec<OsString> {
-    let mut args = os(&["reencrypt", "--batch-mode", "--active-name", name]);
+    let mut args = os(&["reencrypt", "--batch-mode"]);
+    args.extend(os(PROGRESS));
+    args.extend(os(&["--active-name", name]));
     args.push("--key-slot".into());
     args.push(slot.to_string().into());
     args.push("--key-file=-".into());
@@ -329,14 +372,9 @@ pub fn reencrypt_args(
 /// online under the active mapping `name`: the key on standard input opens
 /// one of the keyslots cryptsetup then holds for each volume key.
 pub fn reencrypt_resume_args(device: &Path, name: &str) -> Vec<OsString> {
-    let mut args = os(&[
-        "reencrypt",
-        "--resume-only",
-        "--batch-mode",
-        "--active-name",
-        name,
-        "--key-file=-",
-    ]);
+    let mut args = os(&["reencrypt", "--resume-only", "--batch-mode"]);
+    args.extend(os(PROGRESS));
+    args.extend(os(&["--active-name", name, "--key-file=-"]));
     args.push(device.into());
     args
 }
@@ -359,6 +397,44 @@ pub enum Bounded {
 pub enum Mapping {
     Active,
     Inactive,
+}
+
+/// Each line `reader` yields, as `progress_line` reads it, until end of
+/// file: one over `MAX_PROGRESS_LINE` bytes is unreadable and its rest
+/// discarded, and an empty one is skipped.
+fn stream_lines(mut reader: impl Read, progress: &mut dyn FnMut(Progress)) -> io::Result<()> {
+    let mut line = Vec::with_capacity(MAX_PROGRESS_LINE);
+    let mut over = false;
+    let mut buffer = [0u8; 512];
+    loop {
+        let read = match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        for byte in buffer.get(..read).unwrap_or_default() {
+            if *byte != b'\n' {
+                if line.len() < MAX_PROGRESS_LINE {
+                    line.push(*byte);
+                } else {
+                    over = true;
+                }
+                continue;
+            }
+            if over {
+                progress(Progress::Unreadable);
+            } else if !line.is_empty() {
+                progress(progress_line(&line));
+            }
+            line.clear();
+            over = false;
+        }
+    }
+    if over || !line.is_empty() {
+        progress(Progress::Unreadable);
+    }
+    Ok(())
 }
 
 /// Input written whole into a pipe whose write end is closed: a reader gets
@@ -519,6 +595,39 @@ impl Cryptsetup {
             child.wait()?;
             return ended;
         }
+    }
+
+    /// Runs a reencryption with `input` on its standard input, passing
+    /// each line of its standard output to `progress` as it reads it, each
+    /// bounded at `MAX_PROGRESS_LINE` bytes with no total bound; an empty
+    /// line, which an interrupted run prints, is skipped. Its exit alone
+    /// decides the run.
+    pub fn reencrypt(
+        &self,
+        args: &[OsString],
+        input: &[u8],
+        progress: &mut dyn FnMut(Progress),
+    ) -> io::Result<()> {
+        self.checked(args, input)?;
+        let stdin = filled_pipe(input)?;
+        let mut child = Command::new(&self.program)
+            .args(args)
+            .env_clear()
+            .stdin(Stdio::from(stdin))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(|error| invalid(format!("cannot run {}: {error}", self.program.display())))?;
+        let read = match child.stdout.take() {
+            Some(stdout) => stream_lines(stdout, progress),
+            None => Ok(()),
+        };
+        let status = child.wait()?;
+        read?;
+        if !status.success() {
+            return Err(self.failed(args, status));
+        }
+        Ok(())
     }
 
     /// The JSON metadata of the header copy cryptsetup uses on `device`,
@@ -834,6 +943,9 @@ mod tests {
             vec![
                 "reencrypt",
                 "--batch-mode",
+                "--progress-json",
+                "--progress-frequency",
+                "1",
                 "--active-name",
                 "td-selector",
                 "--key-slot",
@@ -883,12 +995,124 @@ mod tests {
                 "reencrypt",
                 "--resume-only",
                 "--batch-mode",
+                "--progress-json",
+                "--progress-frequency",
+                "1",
                 "--active-name",
                 "td-selector",
                 "--key-file=-",
                 "/proc/1/fd/5",
             ]
         );
+    }
+
+    /// cryptsetup 2.8.8's progress lines, as the pinned binary printed them
+    /// on a file, and what is not one.
+    #[test]
+    fn a_progress_line_is_read_or_refused() {
+        let line = br#"{"device":"/proc/1/fd/5","device_bytes":"276824064","device_size":"536870912","speed":"129815762","eta_ms":"2000","time_ms":"1000"}"#;
+        assert_eq!(
+            progress_line(line),
+            Progress::Bytes {
+                done: 276824064,
+                size: 536870912
+            }
+        );
+        for bad in [
+            &br#"Reencryption interrupted."#[..],
+            br#"{"device_bytes":"1"}"#,
+            br#"{"device_bytes":"","device_size":"2"}"#,
+            br#"{"device_bytes":"-1","device_size":"2"}"#,
+            br#"{"device_bytes":"1","device_size":"999999999999999999999"}"#,
+            br#"{"device_bytes":1,"device_size":2}"#,
+            br#""device_bytes":"1","device_size":"2""#,
+        ] {
+            assert_eq!(
+                progress_line(bad),
+                Progress::Unreadable,
+                "{}",
+                String::from_utf8_lossy(bad)
+            );
+        }
+    }
+
+    /// A reencryption's run streams each line as it comes, skips empty
+    /// ones, refuses one over the bound and a last line without its
+    /// newline, and fails on the child's exit alone.
+    #[test]
+    fn a_reencryption_streams_its_progress() {
+        let dir = td_fs::TempDir::new("td-protector-reencrypt-progress").unwrap();
+        let program = dir.path().join("cryptsetup");
+        let long = "x".repeat(MAX_PROGRESS_LINE + 1);
+        let body = format!(
+            "#!/bin/sh\nread key\n[ \"$key\" = secret ] || exit 9\n\
+             echo '{{\"device_bytes\":\"1\",\"device_size\":\"4\"}}'\necho\n\
+             echo '{long}'\necho 'Reencryption interrupted.'\n\
+             echo '{{\"device_bytes\":\"4\",\"device_size\":\"4\"}}'\nprintf tail\n\
+             exit \"$1\"\n"
+        );
+        let written = Command::new("/bin/sh")
+            .args([
+                "-c",
+                "printf '%s' \"$2\" > \"$1\" && chmod 755 \"$1\"",
+                "sh",
+            ])
+            .arg(&program)
+            .arg(body)
+            .status()
+            .unwrap();
+        assert!(written.success());
+        let cryptsetup = Cryptsetup::new(program);
+        let mut seen = Vec::new();
+        cryptsetup
+            .reencrypt(&os(&["0"]), b"secret\n", &mut |line| seen.push(line))
+            .unwrap();
+        assert_eq!(
+            seen,
+            [
+                Progress::Bytes { done: 1, size: 4 },
+                Progress::Unreadable,
+                Progress::Unreadable,
+                Progress::Bytes { done: 4, size: 4 },
+                Progress::Unreadable,
+            ]
+        );
+        let error = cryptsetup
+            .reencrypt(&os(&["2"]), b"secret\n", &mut |_| {})
+            .unwrap_err();
+        assert_eq!(exit_code(&error), Some(2), "{error}");
+        // A whole disk's lines run past `run`'s output bound: the stream
+        // has none.
+        let many = dir.path().join("many");
+        let lines = MAX_OUTPUT / 40 + 1000;
+        let body = format!(
+            "#!/bin/sh\ni=0\nwhile [ $i -lt {lines} ]; do\n\
+             echo \"{{\\\"device_bytes\\\":\\\"$i\\\",\\\"device_size\\\":\\\"{lines}\\\"}}\"\n\
+             i=$((i+1))\ndone\n"
+        );
+        let written = Command::new("/bin/sh")
+            .args([
+                "-c",
+                "printf '%s' \"$2\" > \"$1\" && chmod 755 \"$1\"",
+                "sh",
+            ])
+            .arg(&many)
+            .arg(body)
+            .status()
+            .unwrap();
+        assert!(written.success());
+        let mut count = 0u64;
+        let mut last = None;
+        Cryptsetup::new(many)
+            .reencrypt(&os(&[]), b"", &mut |line| {
+                if let Progress::Bytes { done, .. } = line {
+                    count += 1;
+                    last = Some(done);
+                }
+            })
+            .unwrap();
+        assert_eq!(count, lines as u64);
+        assert_eq!(last, Some(lines as u64 - 1));
     }
 
     /// The reencryption's new key takes formatting's parameters, its size

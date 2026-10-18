@@ -13,17 +13,18 @@
 //! code: td-boot dispatches a protected header here.
 
 use crate::cryptsetup::{exit_code, test_args, KeyFile, EXIT_BAD_PASSPHRASE};
-use crate::luks2::{Header, Kind, MAX_FIDO2_TOKENS};
+use crate::luks2::{Header, Kind, UpgradeView, MAX_FIDO2_TOKENS};
 use crate::pin::{
     chain_check, observe_pin, protected_auth_policy, release_pin_policy, ChainError, Pin, PinPcrs,
     PinPolicy, PRIMARY_NAME_LEN, SALT_LEN,
 };
 use crate::protected::{
-    FidoRole, Shape, Token, TpmPin, MAX_PIN_PRIVATE_BYTES, MAX_PIN_PUBLIC_BYTES,
+    FidoRole, Lockout, Shape, Token, TpmPin, MAX_PIN_PRIVATE_BYTES, MAX_PIN_PUBLIC_BYTES,
 };
 use crate::protected_plan::{self, Input, Opened, Step};
 use crate::recovery::{RecoveryKey, RecoveryText};
 use crate::release::{LockoutCommand, Runner, Tpm};
+use crate::upgrade;
 use crate::{cap, lockout, read_random, CapError, ObserveError, Secret, UnsealError};
 use crate::{POLICY_PCR_REFUSED, SECRET_LEN};
 use std::io;
@@ -199,9 +200,9 @@ impl Key {
 }
 
 /// A reseal's new tpm-pin protector, verified before the cap.
-struct NewPin {
-    token: TpmPin,
-    secret: Secret,
+pub(crate) struct NewPin {
+    pub(crate) token: TpmPin,
+    pub(crate) secret: Secret,
 }
 
 /// A release whose keyslot's test passed. The selector opens the mapping
@@ -293,6 +294,59 @@ struct Chain {
 pub fn release<T: Tpm, C: Runner, F: Fido>(
     header: &Header,
     device: &Path,
+    tpm: Option<&mut T>,
+    cryptsetup: &mut C,
+    fido: &mut F,
+    prompt: &mut dyn Prompt,
+    preseal: PreSeal<'_>,
+    console: &mut dyn FnMut(&str),
+) -> Outcome {
+    // td-boot dispatches a protected header here, and an upgrading one in
+    // U5 through `release_upgraded`.
+    if header.kind() != Kind::Protected {
+        return Outcome::Halt("the header is not a protected one; boot is refused".into());
+    }
+    released(
+        header, device, tpm, cryptsetup, fido, prompt, preseal, console,
+    )
+}
+
+/// `release` of an upgrading header that `upgrade::check` places in U5,
+/// whose `td-upgrade` token it otherwise ignores (ENCRYPTION.md
+/// "Re-encrypting upgrade"): its protectors are the protected tier's, each
+/// added and tested under the recovery key. td-boot then removes the
+/// token (`upgrade_boot::finish_u5`) before `finish`, which takes the
+/// header read after it.
+#[allow(clippy::too_many_arguments)]
+pub fn release_upgraded<T: Tpm, C: Runner, F: Fido>(
+    view: &UpgradeView,
+    device: &Path,
+    tpm: Option<&mut T>,
+    cryptsetup: &mut C,
+    fido: &mut F,
+    prompt: &mut dyn Prompt,
+    preseal: PreSeal<'_>,
+    console: &mut dyn FnMut(&str),
+) -> Outcome {
+    if !matches!(upgrade::check(view), Ok((upgrade::State::U5, _))) {
+        return Outcome::Halt("the upgrading header is not in U5; boot is refused".into());
+    }
+    released(
+        &view.header,
+        device,
+        tpm,
+        cryptsetup,
+        fido,
+        prompt,
+        preseal,
+        console,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn released<T: Tpm, C: Runner, F: Fido>(
+    header: &Header,
+    device: &Path,
     mut tpm: Option<&mut T>,
     cryptsetup: &mut C,
     fido: &mut F,
@@ -300,11 +354,6 @@ pub fn release<T: Tpm, C: Runner, F: Fido>(
     preseal: PreSeal<'_>,
     console: &mut dyn FnMut(&str),
 ) -> Outcome {
-    // td-boot dispatches only a protected header here; an upgrading one
-    // boots as device-bound until 8f.
-    if header.kind() != Kind::Protected {
-        return Outcome::Halt("the header is not a protected one; boot is refused".into());
-    }
     let shape = protected_plan::shape(header);
     let mut ways = Ways {
         header,
@@ -547,9 +596,22 @@ pub fn finish<T: Tpm, C: Runner>(
         _ => None,
     };
     let lockout = match tpm.as_deref_mut() {
-        Some(tpm) if lockout_due => {
-            lockout_stage(header, device, volume_key, tpm, cryptsetup, console)
-        }
+        Some(tpm) if lockout_due => match tpm.primary_name() {
+            Ok(name) => lockout_stage(
+                header,
+                device,
+                volume_key,
+                tpm,
+                name,
+                cryptsetup,
+                &|token| protected_plan::lockout_import(header, token).map_err(|r| r.to_string()),
+                console,
+            ),
+            Err(error) => {
+                console(&format!("no lockout step: the storage primary: {error}"));
+                None
+            }
+        },
         _ => None,
     };
     if let Some(new) = &reseal {
@@ -783,7 +845,7 @@ const REFUSED_ENTRY: &str = "the entry is longer than 256 bytes or holds a newli
 
 /// One entry at `prompt`, a refused record asking again; end of input or
 /// a failed applet is the halt reason.
-fn entry(
+pub(crate) fn entry(
     prompt: &mut dyn Prompt,
     text: &str,
     what: &str,
@@ -1094,11 +1156,21 @@ fn offer_reseal<T: Tpm>(
         return Ok(None);
     }
     let pin = new_pin(prompt, console)?;
-    Ok(seal_new(policy, chain.recorded, &pin, tpm, console))
+    Ok(seal_new(
+        policy,
+        chain.recorded,
+        &pin,
+        tpm,
+        "no reseal",
+        console,
+    ))
 }
 
 /// Two entries the PIN codec admits that are equal.
-fn new_pin(prompt: &mut dyn Prompt, console: &mut dyn FnMut(&str)) -> Result<Pin, String> {
+pub(crate) fn new_pin(
+    prompt: &mut dyn Prompt,
+    console: &mut dyn FnMut(&str),
+) -> Result<Pin, String> {
     loop {
         let first = entry(prompt, NEW_PIN_PROMPT, "new PIN", console)?;
         let pin = match Pin::parse(first.as_bytes()) {
@@ -1123,15 +1195,16 @@ fn new_pin(prompt: &mut dyn Prompt, console: &mut dyn FnMut(&str)) -> Result<Pin
 /// it. An object over the token's 128- and 256-byte bounds is refused
 /// here, before the cap and before any keyslot or header write: such a
 /// TPM is unusable for the TPM PIN.
-fn seal_new<T: Tpm>(
+pub(crate) fn seal_new<T: Tpm>(
     policy: PinPolicy,
     recorded: Option<[u8; PRIMARY_NAME_LEN]>,
     pin: &Pin,
     tpm: &mut T,
+    what: &str,
     console: &mut dyn FnMut(&str),
 ) -> Option<NewPin> {
     let refuse = |console: &mut dyn FnMut(&str), why: String| {
-        console(&format!("no reseal: {why}; nothing is kept"));
+        console(&format!("{what}: {why}; nothing is kept"));
         None
     };
     let mut salt = [0u8; SALT_LEN];
@@ -1297,6 +1370,10 @@ pub fn write_tokens<C: Runner>(
 /// A tpm-pin object's salt is public, but drawn as a secret is.
 const SALT_SOURCE: &str = "/dev/random";
 
+/// Where a fresh lockout token goes: the protected planner's
+/// `lockout_import`, or the upgrade's in U4.
+pub(crate) type LockoutImport<'a> = dyn Fn(&Lockout) -> Result<(u8, Step), String> + 'a;
+
 /// The lockout's take or proof (ENCRYPTION.md "Lockout"), after the
 /// keyslot's test, with the volume key: with lockoutAuthSet clear a take
 /// under the verified token's `L`, or a fresh one imported unproven
@@ -1305,13 +1382,17 @@ const SALT_SOURCE: &str = "/dev/random";
 /// token and keeps a proven one. Anything else is a TPM td cannot prove,
 /// named, and nothing further is sent to its lockout hierarchy. The
 /// authorization and the primary's Name are returned when this boot holds
-/// them proven.
-fn lockout_stage<T: Tpm, C: Runner>(
+/// them proven. `name` is the storage primary's Name, read once by the
+/// caller, which every lockout command here is sent under.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn lockout_stage<T: Tpm, C: Runner>(
     header: &Header,
     device: &Path,
     volume_key: &[u8],
     tpm: &mut T,
+    name: Vec<u8>,
     cryptsetup: &mut C,
+    import: &LockoutImport<'_>,
     console: &mut dyn FnMut(&str),
 ) -> Option<(LockoutAuth, Vec<u8>)> {
     let cannot = |console: &mut dyn FnMut(&str), why: &str| {
@@ -1324,13 +1405,6 @@ fn lockout_stage<T: Tpm, C: Runner>(
     let Some(uuid) = lockout::volume_uuid(&header.uuid) else {
         console("no lockout step: the volume's UUID is not a LUKS2 UUID");
         return None;
-    };
-    let name = match tpm.primary_name() {
-        Ok(name) => name,
-        Err(error) => {
-            console(&format!("no lockout step: the storage primary: {error}"));
-            return None;
-        }
     };
     let Ok(primary) = <[u8; PRIMARY_NAME_LEN]>::try_from(name.as_slice()) else {
         console("no lockout step: the storage primary's Name is not SHA-256");
@@ -1393,7 +1467,7 @@ fn lockout_stage<T: Tpm, C: Runner>(
                         return None;
                     }
                 };
-                let (number, step) = match protected_plan::lockout_import(header, &token) {
+                let (number, step) = match import(&token) {
                     Ok(import) => import,
                     Err(refusal) => {
                         console(&format!("no lockout take: {refusal}"));
@@ -1623,7 +1697,7 @@ fn run_step<C: Runner>(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::cryptsetup::{Failed, MIN_KILL_KEY};
     use crate::luks2::{self, HeaderCopy};
@@ -1656,29 +1730,29 @@ mod tests {
     const CRED_RECOVERY: &[u8] = &[0xc3; 16];
     const KEYED_HASH: u16 = 0x0008;
 
-    type Log = Rc<RefCell<Vec<String>>>;
+    pub(crate) type Log = Rc<RefCell<Vec<String>>>;
 
-    fn note(log: &Log, entry: String) {
+    pub(crate) fn note(log: &Log, entry: String) {
         log.borrow_mut().push(entry);
     }
 
     /// PCR 12 once the cap closed it.
-    fn capped() -> [u8; 32] {
+    pub(crate) fn capped() -> [u8; 32] {
         td_tpm::digest(&[[0; 32], cap_event()].concat())
     }
 
     /// What the release model's TPM holds beyond the wire's PCRs, primary
     /// and Load: the salted sessions' commands td-tpm runs, modelled.
-    struct State {
-        da: DictionaryAttack,
+    pub(crate) struct State {
+        pub(crate) da: DictionaryAttack,
         lockout_auth: Option<[u8; 32]>,
-        primary: [u8; PRIMARY_NAME_LEN],
+        pub(crate) primary: [u8; PRIMARY_NAME_LEN],
         /// Each sealed object's private area: its authValue and secret.
         objects: BTreeMap<Vec<u8>, ([u8; 32], [u8; SECRET_LEN])>,
         next: u32,
         /// A seal that fails, one over the token's bounds, or one whose
         /// object does not verify.
-        seal_fault: Option<&'static str>,
+        pub(crate) seal_fault: Option<&'static str>,
         /// An interposer shows lockoutAuthSet clear.
         show_clear: bool,
         /// An interposer forwards the change and forges its refusal.
@@ -1688,7 +1762,7 @@ mod tests {
         hierarchy_locked: bool,
         /// DictionaryAttackParameters is refused as a wrong
         /// authorization, as an interposer can forge after a success.
-        refuse_parameters: bool,
+        pub(crate) refuse_parameters: bool,
         /// The TPM locks out between the dictionary-attack read and the
         /// Unseal.
         lockout_at_unseal: bool,
@@ -1698,14 +1772,14 @@ mod tests {
     /// check, the PCRs and the cap, and a model of td-tpm's salted
     /// operations that judges the PCRs on that wire.
     #[derive(Clone)]
-    struct Model {
-        wire: Scripted,
-        state: Rc<RefCell<State>>,
+    pub(crate) struct Model {
+        pub(crate) wire: Scripted,
+        pub(crate) state: Rc<RefCell<State>>,
         log: Log,
     }
 
     impl Model {
-        fn new(log: &Log) -> Self {
+        pub(crate) fn new(log: &Log) -> Self {
             let wire = Scripted::new();
             let (_, name) = wire.client().storage_primary(None).unwrap();
             wire.codes();
@@ -1735,7 +1809,7 @@ mod tests {
             }
         }
 
-        fn reboot(&self) {
+        pub(crate) fn reboot(&self) {
             self.wire.0.borrow_mut().pcrs[usize::from(CAP_PCR)] = [0; 32];
         }
 
@@ -1932,7 +2006,7 @@ mod tests {
         }
     }
 
-    fn exited(code: i32) -> io::Error {
+    pub(crate) fn exited(code: i32) -> io::Error {
         Failed::new(
             Path::new("/bin/cryptsetup"),
             "open",
