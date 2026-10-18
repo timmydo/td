@@ -1587,8 +1587,10 @@ states remains governed by [ENCRYPTION.md](ENCRYPTION.md).
 ### Storage operation worker
 
 Fixed by [ENCRYPTION.md](ENCRYPTION.md) increment 8e's documentation
-commit before its code. `storage_operation.rs` implements the selector
-update and the disk proof's keyslot test; td-authd refuses every
+commit before its code, and the upgrade and its cancellation by 8f's.
+`storage_operation.rs` implements the selector update and the disk
+proof's keyslot test; the upgrade and its cancellation are not yet
+implemented. td-authd refuses every
 storage operation in a production build until that document's item 9,
 and starts a disk proof's worker only in builds that decode the proof,
 test builds until then. The worker
@@ -1643,7 +1645,8 @@ is. The baseline, sent before any presentation, token or ESP I/O, is
   `current`, acknowledged and with no pending attempt, or `01` alone.
 
 Root's first frame is a TDCONS01 description: tag 16 for a selector
-update, or tags 13 to 15 at their proof's first step for a disk proof.
+update, tag 17's review for an upgrade, tag 18 for its cancellation, or
+tags 13 to 15 at their proof's first step for a disk proof.
 The worker requires it to be what its baseline admits, as root does,
 or fails as INTERNAL before any I/O, and repeats it exactly as its
 first `10`, a selector update's after the reads below, so the key's
@@ -1676,6 +1679,73 @@ consent time holds no I/O.
   changed). Then it stages
   the pair or writes it directly (ENCRYPTION.md, "Selector update") and
   sends `14`. It never opens the volume or reads its key.
+- **Upgrade** (tag 17; ENCRYPTION.md "Re-encrypting upgrade", phase 1).
+  The volume byte must be `01` and the ID the baseline's. Before its
+  first `10` the worker reads the header again through td-protector's
+  `read_upgrade` (`20` if it is gone or the reader now refuses it) and
+  requires, through td-protector's `upgrade::phase_one_fits` with the
+  shape and count, that the header the upgrade will grow fits its area
+  and that it is converged (`21` otherwise): of kind
+  device-bound, keyslot 0 and exactly one other keyslot, which the one
+  device-bound token names, no reencryption, a data segment identity,
+  and no token but that device-bound token and pending fido2 tokens a
+  crashed phase 1 left, whose removal its commit round begins with; a
+  token of another type is refused, since the reencryption would wipe
+  its keyslot. For the TPM shape it then opens the TPM, reads its PCRs,
+  requiring a SHA-256 bank, and reads `TPM_PT_PERMANENT` without
+  authorization through td-tpm's `dictionary_attack`, requiring
+  `lockoutAuthSet` clear (`27` otherwise, its detail `01` no TPM or no
+  answer, `02` no SHA-256 bank, `03` the lockout authorization set),
+  since a device-bound volume holds no lockout token that could prove a
+  set one; this is the upgrade's one TPM read, and no TPM write follows.
+  Then it makes the selector update's reads and checks (`23`, `24`) for
+  the direct form, preparing the selector with
+  `etc/td/boot-measurement`, as ENCRYPTION.md's selector update says for
+  the upgrade. After the review's `11` it runs each new key's ceremony
+  as td-fido's stepped `fido_disk::create` over root-admitted devices:
+  creation, proof, repeat, identify probe and no-PIN probe, each phase's
+  client data hashing that step's own description, which the worker
+  presents (`10`) before the key needs it and root admits; the
+  exclusion list is the credentials of the operation's earlier keys and
+  of the header's fido2 tokens that name a keyslot, none on a converged
+  header: a crashed phase 1's pending tokens are on their way out, and
+  excluding them would refuse the very key the person runs phase 1
+  again with. A credential ID over 255 bytes is refused before the
+  proof's PIN. The derived passphrase is zeroed
+  unused: phase 1 writes no secret, and the upgrade boot derives it
+  again. After the last step's `11` it sends `12` only with 120 seconds
+  of its deadline left (`08` otherwise); after root's `13`, before any
+  write, it re-reads the header, the standing and the ESP as the
+  selector update does (`28`), and td-protector's `upgrade::phase_one`
+  plans the header commits from the re-read view (`28` should it refuse
+  what `phase_one_fits` admitted, since the header changed), confirmed
+  against cryptsetup's own metadata (`Plan::confirm`; `28` when they
+  disagree),
+  so the imports land where td's copy of the header expects and `from`
+  is the identity cryptsetup also reads. Its writes, in order, each a
+  key-less header commit through td-protector's runner but the
+  selector's: the
+  removal of any pending token a crashed phase 1 left; the selector in
+  its direct form, so the selector that reads what follows understands
+  it; each new key's pending fido2 token (`keyslots` empty, the role the
+  shape gives, its credential, salt and public key), in ceremony order;
+  and last the `td-upgrade` token with the shape and `from`, the
+  re-read header's data segment identity (`luks2::segment_digest`).
+  Then it sends `14`. A failure after the first write is uncertain to
+  root; what it leaves is a device-bound volume, whose pending tokens
+  without a `td-upgrade` token are orphans, or one in U0. A
+  device-bound volume whose selector phase 1 wrote boots a selector
+  carrying `etc/td/boot-measurement` (ENCRYPTION.md, "Verified account
+  handoff", for its rule on a failed measurement).
+- **Cancellation** (tag 18). The volume byte must be `02`. Before its
+  first `10` it reads the header through `read_upgrade` (`20` if it is
+  gone or refused) and plans td-protector's `upgrade::cancel`, which
+  admits only U0 (`21` otherwise). After the presentation's `11` it
+  sends `12` with 120 seconds left (`08` otherwise); after root's `13`
+  it re-reads the header, failing as `28` if it changed, and runs the
+  plan, confirmed against cryptsetup's own metadata (`Plan::confirm`;
+  `28` when they disagree): the `td-upgrade` token's removal, then each
+  pending token's, each a key-less header commit. Then it sends `14`.
 - **Disk proof** (tags 13 to 15). Root's first description must be the
   proof's first step for the worker's account, one its own baseline
   offers (consent's `proof_start`: a `recovery-key` marker, or a fido2
@@ -1738,19 +1808,23 @@ consent time holds no I/O.
 
 Its failure kinds are td-secret's login worker's where they mean the
 same (`01` to `08` for a disk key's PIN, presence, devices and time,
-`04` a key that is no header token's, `0e` an uncertain write, `0f`,
-`10`), and its own:
+`04` a key that is no header token's, `06` a new key td's creation
+refuses, with its detail, `06` detail `06` among them for a probe that
+does not select the new credential, `11` a new key already holding one
+of the excluded credentials, `0e` an uncertain write, `0f`, a repeat
+that does not reproduce the proof and a credential ID over 255 bytes
+included, and `10`), and its own:
 
 | Byte | Kind |
 | --- | --- |
 | `20` | VOLUME: no encrypted td volume, or a header td's reader refuses |
-| `21` | STATE: a volume state the operation does not take, such as an unencrypted or upgrading volume for a selector update, or a proof the header has no protector for |
+| `21` | STATE: a volume state the operation does not take, such as an unencrypted or upgrading volume for a selector update, a header not converged for an upgrade, one past U0 for a cancellation, or a proof the header has no protector for |
 | `22` | NOT CURRENT: the running deployment is not an acknowledged `current` with no pending attempt |
 | `23` | DEPLOYMENT: the kernel or the template does not match `current`'s manifest |
 | `24` | ESP: the ESP is not td's layout or lacks the space ("Selector update") |
 | `25` | KEY MISTYPED: the recovery-key codec refused the entry |
 | `26` | WRONG KEY: the keyslot refused the recovery key or the derived passphrase |
-| `27` | reserved |
+| `27` | TPM: the TPM shape needs a TPM with a SHA-256 bank whose `lockoutAuthSet` is clear; detail `01` no TPM, `02` no SHA-256 bank, `03` lockout authorization set |
 | `28` | CHANGED: the header, the deployment's standing or the ESP changed since it was read; sent before any write, so definite |
 
 After root's `13` any outcome but `14` with a successful exit is

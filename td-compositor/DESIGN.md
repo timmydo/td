@@ -6145,8 +6145,8 @@ by an enrolled key. With its
 time line a one-key enrollment's is 18 rows and a removal of seven of
 eight keys 16, so at the prompt's doubled scale they are shown whole
 from 768 rows of output (1024x768 and 1366x768 among them; a disk
-proof's prompt may instead fall back to the single scale there, "Storage
-operations") and, at the
+proof's or an upgrade's prompt may instead fall back to the single
+scale there, "Storage operations") and, at the
 single scale below 800x600, at 640x480; on an 800x600 output the
 one-key enrollment's refuses as any prompt that cannot hold its rows
 does, and the operation fails before any token I/O, while a two-key
@@ -6429,7 +6429,9 @@ Fixed by `td-install/ENCRYPTION.md` increment 8e's documentation
 commit before their code, and implemented: the storage screen and the
 selector update (`LoginSelection::SelectorUpdate`, polled as a login
 operation is, with its own end table), the disk proofs
-(`LoginSelection::Proven`) and the recovery-key profile.
+(`LoginSelection::Proven`) and the recovery-key profile. The upgrade
+and its cancellation are fixed by increment 8f's documentation commit
+before their code, and not yet implemented.
 td-authd/DESIGN.md amendment 10 gives the wire, and ENCRYPTION.md the
 operations. Until that document's item 9, root refuses every storage
 operation in a production build and decodes no disk proof there, so
@@ -6451,8 +6453,9 @@ under the menu's rules and before the lifetime's operation, opens the
 storage screen, which names its paint as the key-management screen
 does and chooses nothing until that paint is on glass. Its rows are
 `DISK ENCRYPTION`, then one row per operation, in operation-byte
-order: in 8e `U: UPDATE THE BOOT SELECTOR`; each later increment adds
-its own row with its operation. On that screen the menu's letters
+order: in 8e `U: UPDATE THE BOOT SELECTOR`; in 8f `P: PROTECT THE DISK`
+and `C: CANCEL PROTECTING THE DISK`; each later increment adds its own
+row with its operation. On that screen the menu's letters
 select nothing and Escape still cancels. A choice is the lifetime's one
 operation, read under the menu's rules, so a security key's own
 keyboard neither opens the screen nor chooses on it; on the lock
@@ -6492,6 +6495,71 @@ the acknowledged commit, and `20` to `22` only before any description;
 any other is a violation. The attempt's lifetime is the operation's
 ceiling, 240 seconds, and its prompt's time line shows it.
 
+**The upgrade.** `P` does not select yet: it opens the shape screen,
+named by its own paint and read under the same rules, its title `PROTECT
+THE DISK WITH:` and six rows, `T: TPM AND PIN - THE DEFAULT`, `K:
+SECURITY KEYS ONLY`, then the trade-offs ENCRYPTION.md's phase 1 has the
+FIDO2 choice disclose, each under its shape's name: `KEYS: AN ALTERED
+BOOT CAN TAKE`, `THE DISK FROM ONE KEY USE`, `TPM: A FIRMWARE GUESS
+COUNT` and `CAN ROLL BACK WITH ITS FLASH`. A choice opens the count
+screen, `NEW RECOVERY SECURITY KEYS:` with `0: NONE`, `1: ONE` and `2:
+TWO` for the TPM shape, or `NEW PRIMARY SECURITY KEYS:` with `1: ONE`
+and `2: TWO` for the FIDO2 shape, then `MORE CAN BE ADDED ONCE
+PROTECTED`. Every row is within the screen font's glyphs, which hold no
+apostrophe, comma or parenthesis. The digit sends `20 02 S N` and is the
+lifetime's one operation; Escape on either screen closes attention as on
+the storage screen and cancels nothing at root, since nothing was sent.
+`C`, `T` and `K` are modhex letters, which the exclusion of a security
+key's own keyboard covers as it covers `B` and `H`. `a0 00` and `a0 01`
+are the selector update's. Root's first description, tag 17's review,
+must keep the nonce, owner and account 1000 and the chosen shape and
+count; it is presented with its approval key's rows as tag 16's is, and
+its receipt sent only after the key's second digit. Every tag 17 prompt
+that cannot hold its rows, and a PIN step's field, at the doubled scale
+is prepared at the single scale, as a disk proof's is
+(`Prepared::with_time` learns tag 17 beside `login_proof`), and only
+then. At double scale an output holds 18 rows at 768 lines, 19 at 800
+and 14 at 600, and the deployment ID's row is one row from 1280 pixels
+wide and two at 1024: the TPM review, 16 or 17 rows, stays doubled at
+1366x768, 1280x800 and 1024x768 and falls back at 800x600; the FIDO2
+review, four rows taller, falls back at all four; a key step's prompt, a
+first enrollment's with one more operation row and no ID, is measured by
+the same rule with its field. Each later description is admitted through
+consent's successor rule for tag 17 and presented as a first
+enrollment's key step is ("Login-key operations"): the PIN field opens
+on root's `0c` for a create, prove or repeat step, and a successor or
+the commit follows only that step's `1c`. Root's `05` after the last
+step's receipt asks for the commit, which the client sends at once.
+Success shows `THE NEXT BOOT PROTECTS THE DISK` and `HAVE THE RECOVERY
+KEY READY`. Its ends add to the table above:
+
+| Kind | Shows |
+| --- | --- |
+| `27` TPM | `NO USABLE TPM:` then `NONE FOUND` (`01`), `NO SHA-256 PCR BANK` (`02`) or `ITS LOCKOUT IS ALREADY SET` (`03`), then `CHOOSE SECURITY KEYS ONLY` |
+| `87` | `NEEDS AN ENROLLED LOGIN KEY` |
+| `01` to `03`, `05` to `07`, `11` | a new key's, as TOKEN-LOGIN.md's "Failure texts" show a first enrollment's |
+| `0e` uncertain | `RESULT UNCERTAIN` and `THE NEXT BOOT MAY NEED` / `THE RECOVERY KEY` |
+
+The TPM shape's refusal is how the screen says why the shape is not
+offered: the storage worker alone reads the TPM, so the person, told
+why, chooses the FIDO2 shape in a new attention. An upgrade's ends are
+`87`, `22`, and `20` and `21` from the baseline, only before any
+description; `20`, `21`, `23`, `24` and, for the TPM shape alone, `27`
+only after the review's description and before its receipt; a new
+key's `01` to `03`, `05` to `07` and `11` only after its connect step;
+`0e` and `28` only after the acknowledged commit; and the selector
+update's `08`, `0f`, `10` and `80` where they can stand; any other is a
+violation. The attempt's lifetime is
+the ceiling the count gives, 240, 360 or 480 seconds.
+
+**The cancellation.** `C` sends `20 03`, the lifetime's one operation,
+whose tag 18 description is presented, keyed and committed as tag 16's
+is. Success shows `DISK PROTECTION CANCELLED` and `THE NEXT BOOT MAY
+NEED THE RECOVERY KEY`. Its ends are `20` at any point before the
+commit, `21` before its receipt, `08`, `0f`, `10`, `80`, and `0e` and
+`28` only after the acknowledged commit, with the selector update's
+texts; its lifetime is 240 seconds.
+
 **Disk proofs.** On the key-management screen, while the last `1a`
 answer's protected byte reads `01`, a choice of `1`, `2` or `A`, or a
 removal's Enter, does not select yet: the screen shows `AUTHORIZE
@@ -6525,7 +6593,8 @@ on the step that also opens the field. So a disk proof's prompt that
 cannot hold its rows and its field at the doubled scale is prepared at
 the single scale instead, and only then (`Prepared::with_time`); one
 the single scale cannot hold either is refused as too small, and no
-other prompt ever falls back. At 768 rows of output a one-key
+prompt but a disk proof's and an upgrade's (tag 17, "The upgrade"
+above) ever falls back. At 768 rows of output a one-key
 enrollment's first proof step, either proof, and a recovery-key removal
 leaving one key fall back; at 1280x800 the one-key recovery-key
 enrollment's still does, needing 875 rows doubled; every other proof
@@ -6557,7 +6626,11 @@ profile and then shows `TOUCH YOUR KEY`, as a login authorize step
 does.
 
 Host tests drive a selector update's whole status sequence to each
-form's success and every end in the table, a key typed before
+form's success and every end in the table (the upgrade's and the
+cancellation's, once implemented, each shape and count's whole
+sequence, the shape and count screens, every end where root can and
+cannot send it, and the tag 17 fallback at 1024x768 and 800x600), a
+key typed before
 presentation and a wrong digit, the storage screen's choices and their
 refusal outside attention, before the screen is on glass and from a
 security key's own keyboard, the protected byte's choices and their

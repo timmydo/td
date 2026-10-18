@@ -960,7 +960,33 @@ ones and `td-upgrade`, so the reader admits what it leaves), not
 header `check` refuses for a token of another type, one a foreign
 token joined after phase 1, can still leave the upgrade before its
 first commit. `pending_orphans` removes the pending tokens from a
-device-bound header. `on_mains` and
+device-bound header. Phase 1's two functions, which 8f's
+storage-operation commit adds, are `phase_one_fits` and `phase_one`.
+`phase_one_fits` takes the view, the shape and the new key count: it
+refuses a header that is not converged (device-bound, keyslot 0 and
+exactly one other keyslot, which the one device-bound token names, no
+reencryption, a data segment identity, and no other token but pending
+fido2 ones, `Refusal::NotConverged`), and one too large. Its size bound
+is every later plan's sum taken at once: the view's JSON length grown
+by phase 1's imports, each new pending token at its largest (a 255-byte
+credential), and by everything the upgrade boot will add, the
+reencryption, a keyslot per new key, the marker and, in the TPM shape,
+a keyslot and a token at its largest for the tpm-pin protector and the
+lockout token, never shrunk by what any of them removes, must leave
+the area's last byte (`TooLarge` otherwise), so no state's plan the
+boot reaches is refused for size. The worker calls it before its first
+`10`, with the count alone, and ends with `21` on either refusal.
+`phase_one` takes the re-read view after `13`, the shape and the new
+keys' pending fido2 tokens, makes the same checks, which the earlier
+call already passed unless the header changed (`28`), then plans each
+orphan pending token's removal, each new pending token's import and
+last the `td-upgrade` token's import with the shape and the view's
+identity as `from`. The worker writes the selector after the plan's
+removals and before its first import, and confirms the plan once,
+before its first write. That commit's planner tests build the largest
+header `phase_one_fits` admits, a retry over two orphan pending tokens
+adding two new keys at their largest in the TPM shape, and require it
+to leave 1 KiB of the area, so a retry is never refused for size. `on_mains` and
 `resilience` are the power and resilience rules over what the selector
 reads from `/sys`. Choices beyond ENCRYPTION.md's text, each failing
 closed:

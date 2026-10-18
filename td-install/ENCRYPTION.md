@@ -1826,8 +1826,8 @@ valid, which lets that genuine chain boot once more.
 
 ### Verified account handoff
 
-One primary authentication unlocks storage and admits its account to
-one fresh session. Every protected boot's selector writes an admission
+One primary authentication unlocks storage and admits its account to one
+fresh session. Every protected boot's selector writes an admission
 record after its release, once its PCR 11 measurement of the selected
 deployment has succeeded. The record is 46 bytes: `TDADMIT1` (8 bytes),
 version 1 (1), the big-endian u32 UID the released token names (4), the
@@ -1838,17 +1838,23 @@ beside the key, on a second pipe, as a second archive member
 `td-admit-v1`, a regular file of mode 0400 owned by root with exactly
 those bytes, under the rules the key member has (`--fds-key-admit DIGEST
 KEY RECORD CMDLINE`, the record written and its write end closed before
-td-kexec starts). A protected boot whose selector carries no
-measurement policy, and so makes no PCR 11 measurement, writes the
-record with method 0: it admits nothing, though, as any valid record
-does, it marks the machine protected. So does a protected boot whose
-measurement fails, a missing or failing TPM or a readback after the
-extension that leaves PCR 11 uncertain: the selector says so on the
-consoles in a fixed line and boots, since refusing would leave a
-FIDO2-primary machine without a working TPM unbootable, and method 0
-admits nothing. A device-bound or unencrypted boot, which carries no
-policy, still stops on a measurement failure. A device-bound release
-writes none, an upgrading header's included until 8f's upgrade boot.
+td-kexec starts). A protected boot whose selector carries no measurement
+policy, and so makes no PCR 11 measurement, writes the record with
+method 0: it admits nothing, though, as any valid record does, it marks
+the machine protected. So does a protected boot whose measurement fails,
+a missing or failing TPM or a readback after the extension that leaves
+PCR 11 uncertain: the selector says so on the consoles in a fixed line
+and boots, since refusing would leave a FIDO2-primary machine without a
+working TPM unbootable, and method 0 admits nothing. A device-bound or
+unencrypted boot whose selector carries no policy still stops on a
+measurement failure. A device-bound boot whose selector carries the
+policy, which only phase 1 writes (a cancelled or interrupted upgrade,
+or U0's device-bound flow), treats a failure as a protected boot does:
+the fixed line, then the boot, since its TPM may be why the person chose
+the FIDO2 shape; it writes no record, as no device-bound release does,
+so nothing is admitted. 8f's upgrade-boot commit carries this rule. A
+device-bound release writes none, an upgrading header's included until
+8f's upgrade boot.
 
 The deployment initramfs never carries it to disk. `mount-root` handles
 the key as today and leaves the record; a new verb, `td-boot admit
@@ -1932,33 +1938,47 @@ rotation is required ("Device-bound default").
 td-authd's physical consent. It requires a converged device-bound header
 (keyslot 0 and one device-bound protector), no reencryption in progress,
 an acknowledged `current`, and an enrolled login state (TOKEN-LOGIN.md).
-The person chooses the shape, TPM primary being the default; the
-FIDO2-primary choice discloses both trade-offs: an altered selector can
-take the volume from a single presentation of the key, while a firmware
-TPM's guess counter rolls back with its flash ("Lockout"). The TPM shape
-is offered only when a TPM with a SHA-256 bank is present and its
-`TPM_PT_PERMANENT`, read without authorization, shows `lockoutAuthSet`
-clear, since a device-bound volume holds no lockout token that could
-prove a set one; otherwise the screen says why and offers the FIDO2
-shape. Each FIDO2 credential is created, proved, repeated and probed
-("FIDO2 protectors") through the compositor's PIN field. The worker then
-writes, each a key-less header commit: the selector update in its direct
-form, so the selector that reads what follows understands it; each fido2
-token with empty `keyslots`, a pending token; and last the `td-upgrade`
-token, a token type of its own holding only the shape and `from`, the
-SHA-256 of the data segment's digest and salt as they are now
-(td-protector, "Protected roles"). A pending fido2 token is pending only
-beside a `td-upgrade` token; without one it is an orphan the next plan
-removes, so a crash inside phase 1 leaves a device-bound volume that
-boots through recovery and its confirmed reseal, the selector having
-changed, and the person runs phase 1 again. Before consenting, the
-review discloses the upgrade boot's duration (about one read and one
-write of the whole volume, two writes with journal resilience), that it
-needs mains power, that the machine is not usable during it, that the
-recovery key is needed at that boot and stays the recovery protector,
-and that the tokens and the new PIN are asked for then.
-`storage-operation`'s `upgrade-cancel` removes the `td-upgrade` token
-while the header is in state U0.
+The person chooses the shape, TPM primary being the default, and how
+many new FIDO2 keys phase 1 enrolls: zero to two fido2-recovery keys for
+the TPM shape, one or two fido2-primary keys for the FIDO2 shape, the
+recovery key meeting the FIDO2 shape's minimum; more keys, and the other
+role, come by token addition once the volume is protected ("Protector
+management"). The FIDO2-primary choice discloses both trade-offs: an
+altered selector can take the volume from a single presentation of the
+key, while a firmware TPM's guess counter rolls back with its flash
+("Lockout"). The TPM shape is taken only when a TPM with a SHA-256 bank
+is present and its `TPM_PT_PERMANENT`, read without authorization, shows
+`lockoutAuthSet` clear, since a device-bound volume holds no lockout
+token that could prove a set one; otherwise the operation ends before
+consent saying why, and the person may choose the FIDO2 shape
+(td-authd/DESIGN.md amendment 10, kind `27`). Each FIDO2 credential is
+created, proved, repeated and probed ("FIDO2 protectors") through the
+compositor's PIN field; its exclusions are the operation's own earlier
+keys, since a converged header's only fido2 tokens are a crashed phase
+1's orphans, which its commit round removes. The worker then writes,
+each a key-less header commit: the removal of any pending token a
+crashed phase 1 left; the selector update in its direct form, so the
+selector that reads what follows understands it; each fido2 token with
+empty `keyslots`, a pending token; and last the `td-upgrade` token, a
+token type of its own holding only the shape and `from`, the SHA-256 of
+the data segment's digest and salt as they are now (td-protector,
+"Protected roles"). A pending fido2 token is pending only beside a
+`td-upgrade` token; without one it is an orphan the next plan removes,
+so a crash inside phase 1 leaves a device-bound volume that, once
+the selector was written, boots through recovery and its confirmed
+reseal, and the person runs phase 1 again. Before consenting, the review
+discloses the upgrade boot's duration (about one read and one write of
+the whole volume, two writes with journal resilience), that it needs
+mains power, that the machine is not usable during it, that the recovery
+key is needed at that boot and stays the recovery protector, and that
+the tokens and the new PIN are asked for then. `storage-operation`'s
+`upgrade-cancel` removes the `td-upgrade` token while the header is in
+state U0, then the pending tokens it leaves as orphans, so a cancelled
+volume is device-bound as before phase 1 but for the selector it wrote,
+which carries the measurement policy ("Verified account handoff").
+td-authd's amendment 10, the storage worker (DESIGN.md, "Storage
+operation worker") and the compositor's storage screen fix both
+operations' wire, steps and screens.
 
 **The upgrade boot** is the selector's flow while the header carries a
 `td-upgrade` token. Its state is read from the header alone:
@@ -2046,7 +2066,7 @@ while the header is in state U0.
 
 | Interrupted | Next boot |
 | --- | --- |
-| Phase 1, before `td-upgrade` | device-bound recovery and reseal; pending tokens removed; phase 1 again |
+| Phase 1, before `td-upgrade` | the ordinary device-bound release before the selector's write, recovery and reseal after it; orphan pending tokens removed; phase 1 again |
 | Upgrade boot, before the first commit | U0 again, cancel still offered |
 | U0 to U1, between kill and removal | U1 after the orphan's removal |
 | U1, U2 | reencryption starts or resumes with the recovery key, but for the cut below |
@@ -2536,12 +2556,22 @@ commit.
      interim refusal in test builds only; its exit is item 9's
      activation, which sets `storage::OPERATIONS` and `DISK_PROOFS`
      in production.
-   - **8f, re-encrypting upgrade.** td-protector's upgrade planner over
-     the states U0 to U5 and the runner's `reencrypt` (initialization in
-     both resilience modes and `--resume-only`) and `token import`
-     shapes; the `upgrade` and `upgrade-cancel` operations, with phase
-     1's `TPM_PT_PERMANENT` check; the selector's upgrade boot with its
-     power check and U4's exit for a TPM that became unusable.
+   - **8f, re-encrypting upgrade.** Its commits, in order:
+     td-protector's upgrade planner over the states U0 to U5 and the
+     runner's `reencrypt` (initialization in both resilience modes and
+     `--resume-only`) and `token import` shapes; a documentation commit
+     fixing the `upgrade` and `upgrade-cancel` operations' wire
+     (td-authd's amendment 10: `20 02` with its shape and count, `20 03`,
+     consent tags 17 and 18 and the review step, the ceilings and kinds
+     `27` and `87`), the storage worker's two operations and the
+     compositor's screens, before their code; the shared consent codec's
+     tags 17 and 18; td-fido's stepped disk creation, whose phases each
+     hash their own presented step; `storage-operation`'s `upgrade` and
+     `upgrade-cancel`, with td-protector's `upgrade::phase_one_fits`
+     and `phase_one` and phase 1's `TPM_PT_PERMANENT` check; their
+     td-authd supervision and compositor screens, which production
+     refuses; and the selector's upgrade boot with its power check and
+     U4's exit for a TPM that became unusable.
    - **8g, protector management.** `storage-operation`'s FIDO2 token
      addition and removal and recovery-key removal; the PIN-change
      request and its selector half; the TPM-clear request and its

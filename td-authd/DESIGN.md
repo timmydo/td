@@ -2662,8 +2662,10 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
     `a0 00`. The disk proofs are implemented too (`proof.rs`, `1b 0b`)
     and decoded only where `OPERATIONS` is set, so a production build
     reads `1b 0b` as a malformed selection, a protocol violation, until
-    item 9 lifts both together. Every later operation is not yet
-    implemented.
+    item 9 lifts both together. The upgrade and its cancellation are
+    fixed by ENCRYPTION.md increment 8f's documentation commit, before
+    their code, and not yet implemented; every later operation is not
+    yet fixed.
     One fixed root `/bin/td-install storage-operation --uid 1000` child
     per operation, the storage worker (`td-install/DESIGN.md`, "Storage
     operation worker"), launched and supervised as the login worker is
@@ -2685,25 +2687,30 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
     the worker through `1c` and its `16` frame.
 
     **Selection.** Request `20` and one operation byte selects a storage
-    operation: `01` selector update. The other operations' bytes are
-    assigned here, and their operands and steps are fixed by their own
-    increment's documentation commit, before their code, under this
-    framing: `02` upgrade, `03` upgrade cancellation, `04` FIDO2 token
-    addition, `05` FIDO2 token removal, `06` recovery-key removal, `07`
-    PIN-change request, `08` TPM-clear request, `09` TPM re-enrollment
-    request and `0a` Secure Boot enrollment; until then each decodes
-    and is refused as this build's. `20` needs completed preparation and
-    an empty slot, as `1b` does, or ends the generation; it answers `a0
-    01` and the operation's 32-byte nonce, started, or `a0 00`, refused
-    in this build. `a0 00` comes first: an operation this build refuses,
-    and every `20` in a production build, is answered `a0 00` before
-    preparation or the slot is checked, so such a `20` never ends the
-    generation. The private channel routes `20` to the paired session
-    beside `10` to `1f`, and still refuses `21` and above. Polls `11`,
-    cancellation `15`, presentation `13`, commit `14` and the secret
-    request `1c` are a login operation's, with the same answers (`91 0b`
-    while root waits for the worker's baseline, `91 03` to `91 06`, `91
-    0c`, `91 0d` and `91 0e`; `9c`; `95`).
+    operation: `01` selector update, `02` upgrade, followed by its shape
+    and key count ("The upgrade" below), and `03` upgrade cancellation.
+    The other operations' bytes are assigned here, and their operands
+    and steps are fixed by their own increment's documentation commit,
+    before their code, under this framing: `04` FIDO2 token addition,
+    `05` FIDO2 token removal, `06` recovery-key removal, `07` PIN-change
+    request, `08` TPM-clear request, `09` TPM re-enrollment request and
+    `0a` Secure Boot enrollment; until then each decodes and is refused
+    as this build's. Every build decodes `20 02`'s two operand bytes
+    first: a shape or count outside its range, a missing operand or a
+    trailing byte after any selection is a protocol violation that ends
+    the generation, as a malformed `1b` is, before the rule below
+    answers a well-formed one. `20` needs completed preparation and an
+    empty slot, as `1b` does, or ends the generation; it answers `a0 01`
+    and the operation's 32-byte nonce, started, or `a0 00`, refused in
+    this build. `a0 00` comes first: an operation this build refuses,
+    and every well-formed `20` in a production build, is answered `a0
+    00` before preparation or the slot is checked, so such a `20` never
+    ends the generation. The private channel routes `20` to the paired
+    session beside `10` to `1f`, and still refuses `21` and above. Polls
+    `11`, cancellation `15`, presentation `13`, commit `14` and the
+    secret request `1c` are a login operation's, with the same answers
+    (`91 0b` while root waits for the worker's baseline, `91 03` to `91
+    06`, `91 0c`, `91 0d` and `91 0e`; `9c`; `95`).
 
     **Disk proofs.** Request `1b 0b P` followed by a first enrollment
     (`08 01`, `08 02`), an addition (`09`) or a removal (`0a`, the count
@@ -2801,9 +2808,50 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
     FOR THE DISK PIN` and `AND COMPLETES THE UPDATE` (3), `THE NEXT BOOT
     NEEDS THE RECOVERY KEY` and `AND A CONFIRMED RESEAL` (1), or `EVERY
     BOOT ASKS FOR A SECURITY KEY` and `AS IT DOES NOW` (2); then the
-    key's rows. Tags 17 to 25 are reserved for operation bytes `02` to
-    `0a` in that order, and decode as unknown until their increments fix
-    them.
+    key's rows.
+
+    Tag 17 is the upgrade. Right after its tag byte come the big-endian
+    u32 account, which must equal the owner; the shape byte, `1` TPM
+    primary or `2` FIDO2 primary; the new key count, 0 to 2 for the TPM
+    shape and 1 to 2 for the FIDO2 shape; and the 64 lowercase
+    hexadecimal bytes of the running deployment's manifest ID, as tag 16
+    carries it. Then the step: one key byte, `0` for the review and 1
+    through the count for that new key's ceremony, the step byte and
+    the step's fields. A new step joins the table above, review (12, no
+    fields), which ends with the two approval-key bytes; the key steps
+    are connect, create, prove, repeat and probe with their login
+    fields. The only order is the review, then for each new key in turn
+    its connect, create, prove, repeat and probe; the last step is the
+    review when the count is 0 and the last key's probe otherwise, and a
+    repeat or probe names the credential its prove named. The widest
+    value, a prove or repeat step, is 122 bytes, and the review 119. The
+    rows are `PROTECT THE DISK: TPM AND PIN` or `PROTECT THE DISK:
+    SECURITY KEYS`, then `NEW RECOVERY KEYS: N` (TPM) or `NEW PRIMARY
+    KEYS: N` (FIDO2), then the step's. The review's are the ID's rows
+    as tag 5 shows them and the disclosure ENCRYPTION.md's phase 1
+    requires before consent, `THE NEXT BOOT REWRITES THE DISK`, `ONE
+    READ AND ONE OR TWO WRITES`, `OF THE WHOLE VOLUME`, `IT NEEDS MAINS
+    POWER`, `THE MACHINE IS UNUSABLE UNTIL DONE`, `IT ASKS FOR THE
+    RECOVERY KEY` and `WHICH STAYS THE RECOVERY PROTECTOR`, then `AND
+    FOR A NEW PIN` (TPM, no new keys), `AND FOR THESE KEYS AND A NEW
+    PIN` (TPM) or `AND FOR THESE KEYS` (FIDO2), then for the FIDO2 shape
+    its trade-offs, `AN ALTERED BOOT CAN TAKE THE DISK`, `FROM ONE USE
+    OF A KEY AND PIN`, `WHILE A FIRMWARE TPM GUESS COUNT` and `CAN ROLL
+    BACK WITH ITS FLASH`, and last the approval key's rows. A key
+    step's are a first enrollment's, `NEW KEY K OF N` and the step's own
+    rows, without the ID, which its bytes still bind and the review
+    showed. Every row is within `PROMPT_COLUMNS`, and none uses an
+    apostrophe or a parenthesis. Create, prove and repeat ask for the
+    new key's PIN (`asks_pin`).
+
+    Tag 18 is the upgrade's cancellation: right after its tag byte the
+    two-byte approval key, 47 bytes in all, one step and no step byte,
+    `Last`, as tag 16's. Its rows are `CANCEL PROTECTING THE DISK`, `THE
+    NEXT BOOT MAY NEED` and `THE RECOVERY KEY AND A RESEAL`, since the
+    selector phase 1 wrote may no longer match the device-bound seal,
+    then the key's rows. Tags 19 to 25 are reserved for operation bytes
+    `04` to `0a` in that order, and decode as unknown until their
+    increments fix them.
 
     **The selector update.** At `20 01` root starts the storage worker,
     which sends its baseline: the volume's state, its tokens and the
@@ -2835,12 +2883,61 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
     it as `91 0d 28 00`. Success shows the form's result
     (`td-compositor/DESIGN.md`, "Storage operations").
 
+    **The upgrade.** ENCRYPTION.md's phase 1 ("Re-encrypting upgrade").
+    `20 02 S N` chooses the shape `S`, `01` TPM primary or `02` FIDO2
+    primary, and the new key count `N`, 0 to 2 for the TPM shape, each a
+    fido2-recovery token, or 1 to 2 for the FIDO2 shape, each a
+    fido2-primary token; a volume takes more by token addition (`04`)
+    once protected. Root reads the login state at the start, as it reads
+    the protected marker for a disk proof, and ends the operation with
+    `87` unless it reads enrolled, before any worker starts: an upgrade
+    makes login-key consent the volume's, which an unenrolled or
+    unavailable state cannot give. Otherwise it starts the storage
+    worker, whose baseline must show a device-bound volume (`20` for no
+    encrypted td volume or a refused header, `21` for any other state)
+    and an acknowledged `current` with no pending attempt (`22`); root
+    ends the operation with that kind before any description. It then
+    draws the approval key and sends tag 17's review; the worker repeats
+    it, after its reads, as its first `10`, which root presents (`91
+    04`) and acknowledges once the compositor's receipt arrives, sent
+    only after the key is typed. The worker's reads may end it first,
+    with `20`, `21`, `23`, `24` or, for the TPM shape, `27`, which root
+    forwards as it forwards a selector update's `23` and `24`. Each
+    later step is a first enrollment's key ceremony, which the worker
+    presents and root admits as `admit_login_step` admits one
+    (`Request::admit_upgrade_step`: tag 17's successor rule, a created
+    fingerprint no fido2 token of the baseline names, and no credential
+    reported before prove), taking a PIN step's `1c` as a login step's.
+    After the last step's acknowledgement comes the commit round, in
+    which the worker writes phase 1's header commits and the selector
+    (`td-install/DESIGN.md`, "Storage operation worker"). The ceiling is
+    fixed at the selection: 240 seconds and 120 more for each new key,
+    240, 360 or 480, the reads and the review taking the first 120, each
+    key ceremony its 120 and the writes the last 120 behind the worker's
+    commit margin, as for the selector update; `LOGIN_LONGEST` (480)
+    remains the largest operation. The outcome rules after `13` are the
+    selector update's: anything but `14` and a successful exit is
+    uncertain (`91 0e`), but for `28` with a successful exit (`91 0d 28
+    00`).
+
+    **The cancellation.** `20 03` takes no operand. Root starts the
+    storage worker, whose baseline must show an upgrading volume (`20`
+    as above, `21` for any other state), draws the approval key and
+    sends tag 18; the worker repeats it once its read of the header
+    finds the upgrade cancellable, still in state U0 (`21` otherwise, or
+    `20` for a header gone or refused), which root forwards, and the
+    presentation, receipt and commit round are the selector update's.
+    Its writes remove the `td-upgrade` token, then the pending fido2
+    tokens, each a key-less header commit. Its ceiling is 240 seconds,
+    split as the selector update's, and its outcome rules are the same.
+
     **Kinds.** An end carries the worker's `15` kind, from the storage
     worker's table in `td-install/DESIGN.md` for its own, or root's:
-    `80` cancelled, `86` above, and `08` and `10` as for a login
-    operation. The compositor accepts exactly the kinds each selection
-    can produce where it stands, as for a login operation, and anything
-    else ends the generation.
+    `80` cancelled, `86` above, `87` an upgrade without an enrolled login
+    state, and `08` and `10` as for a login operation. The compositor
+    accepts exactly the kinds each selection can produce where it
+    stands, as for a login operation, and anything else ends the
+    generation.
 
     **The login state.** The `9a` answer gains one byte after the
     admission byte: `01` when root read the protected marker for this
