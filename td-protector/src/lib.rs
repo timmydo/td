@@ -539,7 +539,7 @@ mod tests {
         /// Run the command but lose its reply: these exchanges, from one.
         pub(crate) lose: Vec<usize>,
         /// A cleared TPM: its new storage primary seed loads no object
-        /// sealed before.
+        /// sealed before, only those sealed since.
         pub(crate) cleared: bool,
         /// Refuse this command with this response code.
         pub(crate) refuse: Option<(u32, u32)>,
@@ -549,6 +549,16 @@ mod tests {
         /// The storage primary seed: a cleared TPM's new seed gives its
         /// primary another Name.
         pub(crate) seed: u8,
+    }
+
+    /// A scripted private area's prefix: `scripted+:` for one sealed under
+    /// a cleared TPM's new seed, which loads.
+    pub(crate) fn scripted_private(cleared: bool) -> Vec<u8> {
+        if cleared {
+            b"scripted+:".to_vec()
+        } else {
+            b"scripted:".to_vec()
+        }
     }
 
     #[derive(Clone)]
@@ -793,7 +803,7 @@ mod tests {
                     input.end().unwrap();
                     let mut public = template[..template.len() - 2].to_vec();
                     put_blob(&mut public, &td_tpm::digest(data)).unwrap();
-                    let mut private = b"scripted:".to_vec();
+                    let mut private = scripted_private(self.cleared);
                     private.extend_from_slice(data);
                     put_blob(&mut out, &private).unwrap();
                     put_blob(&mut out, &public).unwrap();
@@ -806,7 +816,9 @@ mod tests {
                     let mut fields = Reader(public);
                     fields.take(8).unwrap();
                     let policy = fields.blob().unwrap().to_vec();
-                    let Some(data) = private.strip_prefix(b"scripted:").filter(|_| !self.cleared)
+                    let Some(data) = private
+                        .strip_prefix(b"scripted+:")
+                        .or_else(|| private.strip_prefix(b"scripted:").filter(|_| !self.cleared))
                     else {
                         return response(NO_SESSIONS, RC_INTEGRITY, &[]);
                     };

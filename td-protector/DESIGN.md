@@ -687,9 +687,9 @@ them. Protector management's planners (8g, below) are current: the
 storage worker plans through `manage` and seals requests, and the
 selector's protected release checks a request's tag. It removes one
 whose tag fails, a re-enrollment on the recorded primary, and a clear or
-re-enrollment with no TPM td can prove. It carries out a PIN change and
-a TPM clear. It asks no re-enrollment's question yet, so such a request
-stays. The secure-boot and config tokens are not current.
+re-enrollment with no TPM td can prove. It carries out a PIN change, a
+TPM clear and a TPM re-enrollment. The secure-boot and config tokens are
+not current.
 
 **Lockout.** `lockout::seal(volume_key, uuid, l, name)` and `open`
 implement ENCRYPTION.md's lockout token: HKDF-SHA256 over the volume key
@@ -1195,14 +1195,16 @@ counter and the reset. `policy_pcr_alone` is the deployment
 initramfs's post-cap check. Choices beyond ENCRYPTION.md's text, each
 failing closed:
 
-- A reseal passes the storage-primary Name every tpm-pin token records
-  to `seal_pin`'s `expected`, and is not offered when the tokens record
-  different Names or the chain check found another primary
-  (`ChainError::OtherPrimary`): a primary that appeared since the first
-  seal never receives a new authValue and secret ("Bus"). A cleared or
-  replaced TPM, whose primary is new, therefore gets no reseal at boot;
-  a TPM that refuses the Load under the recorded primary does. With no
-  tpm-pin token the seal is a first one and passes none.
+- A reseal passes the storage-primary Name every tpm-pin token naming
+  a keyslot records to `seal_pin`'s `expected`. It is not offered when
+  those tokens record different Names or the chain check found another
+  primary (`ChainError::OtherPrimary`): a primary that appeared since
+  the first seal never receives a new authValue and secret ("Bus"). A
+  cleared or replaced TPM, whose primary is new, therefore gets no
+  reseal at boot; a TPM that refuses the Load under the recorded primary
+  does. An orphan seals nothing, so its Name is not read. With no
+  tpm-pin token naming a keyslot the seal is a first one, anchored
+  after the cap, and passes none; its plan removes any orphan.
 - After the cap, before a plan adds its keyslot, every seal, a first
   one included, requires its primary's Name to be the one a lockout
   token on the header read at release records under a tag that
@@ -1417,6 +1419,18 @@ Its choices beyond ENCRYPTION.md's text, each failing closed:
   can be forged over a clear done, and a reset under the old `L` would
   spend the cleared TPM's lockout attempt. A predicted update's
   protector is discarded before it.
+- A re-enrollment's question is asked where the lockout step is due;
+  otherwise the request is unproven. A clear on another primary asks
+  it too. Its plan runs in place of the boot's own, before the lockout
+  step.
+- That step then reads the header as the plan left it, the stale
+  tokens gone, so it takes this TPM's lockout with a fresh token at a
+  free number. A plan that does not complete takes nothing: the request
+  stays for the next boot, or a stale token stays and the owner asks
+  again. With no lockout token, a cut after a kill leaves an orphaned
+  tpm-pin token, whose Name is not read: the next boot has no tpm-pin
+  keyslot to check the TPM by, removes any request left as unproven,
+  and takes.
 - The new PIN is sealed to the released token's PCRs, under the primary
   it records, and verified with one Unseal, as a reseal's is.
 - A reseal beside a pending clear or re-enrollment is refused

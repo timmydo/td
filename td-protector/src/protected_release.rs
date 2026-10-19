@@ -105,6 +105,12 @@ pub const CLEAR_REQUESTED: &str = "td: a TPM clear was requested: it destroys th
 /// The clear's question; only `CLEAR_WORD` confirms.
 pub const CLEAR_PROMPT: &str = "td: type clear to clear the TPM: ";
 pub const CLEAR_WORD: &[u8] = b"clear";
+/// Printed after the cap before a verified re-enrollment's question, or a
+/// clear's on a TPM whose storage primary is another.
+pub const REENROLL_REQUESTED: &str = "td: this TPM's storage primary is not the one td recorded";
+/// The re-enrollment's question; only `REENROLL_WORD` confirms.
+pub const REENROLL_PROMPT: &str = "td: type reenroll to enroll this TPM: ";
+pub const REENROLL_WORD: &[u8] = b"reenroll";
 /// Printed when TPM2_Clear refuses, `TPM_RC_DISABLED` among its reasons.
 pub const CLEAR_REFUSED: &str = "td: the TPM refuses to be cleared; clear it from firmware setup";
 
@@ -297,9 +303,9 @@ pub enum Outcome {
 struct Chain {
     /// The token whose object can release here.
     passed: Option<(u8, TpmPin)>,
-    /// The storage primary's Name every tpm-pin token records, which a
-    /// reseal requires again; `None` with no tpm-pin token on the header,
-    /// when the reseal is a first seal.
+    /// The storage primary's Name every tpm-pin token naming a keyslot
+    /// records, which a reseal requires again; `None` with none, when the
+    /// reseal is a first seal.
     recorded: Option<[u8; PRIMARY_NAME_LEN]>,
     /// The tokens record different Names, or the TPM's primary is not the
     /// recorded one: no reseal is offered.
@@ -577,17 +583,21 @@ pub struct Finished {
 }
 
 /// After the selector opened the mapping and took `volume_key` with the
-/// released key: a pending request's fate under its tag (`request::fate`),
-/// one confirmation of cryptsetup's metadata before the first write;
-/// without a reseal the plan, `request::plan`'s beside a request, then in
-/// the TPM-primary shape the lockout's take or proof; with one, the take
-/// or proof first and the reseal's plan only once it succeeded, so a take
-/// or proof that fails discards the object before its import; then the
-/// counter, a confirmed TPM clear's TPM2_Clear and its plan, in place of
-/// the boot's own, and the counter's reset after a security-key or
-/// recovery-key release without one. A TPM clear's question is asked at
-/// `prompt`, after the cap with the tag verified. The TPM is reached only
-/// when this boot's own cap closed PCR 12; nothing here halts the boot.
+/// released key. A pending request's fate is read under its tag
+/// (`request::fate`), and a clear's or re-enrollment's question asked at
+/// `prompt`, after the cap with the tag verified. Cryptsetup's metadata is
+/// confirmed once before the first write.
+///
+/// Without a reseal the plan runs, `request::plan`'s beside a request, a
+/// re-enrollment's included; then, in the TPM-primary shape, the lockout's
+/// take or proof, a re-enrollment's over the header as its plan left it,
+/// every other over the header at release. With a reseal the
+/// take or proof comes first and its plan only once it succeeded, so a
+/// failure discards the object before its import. Then the counter's
+/// line, a confirmed clear's TPM2_Clear and its plan in place of the
+/// boot's own, and the counter's reset after a security-key or
+/// recovery-key release without one. The TPM is reached only when this
+/// boot's own cap closed PCR 12; nothing here halts the boot.
 #[allow(clippy::too_many_arguments)]
 pub fn finish<T: Tpm, C: Runner>(
     released: Released,
@@ -667,8 +677,13 @@ pub fn finish<T: Tpm, C: Runner>(
         (Some(_), Some(uuid)) => {
             request::fate(header, volume_key, &uuid, &boot).map(|(number, fate)| {
                 // The take this boot would make writes a token the clear's
-                // plan, read from this header, would not retire.
-                let askable = lockout_due && protected_plan::lockout(header).is_some();
+                // plan, read from this header, would not retire. A
+                // re-enrollment's plan retires the stale lockout token
+                // before its own take.
+                let askable = Askable {
+                    clear: lockout_due && protected_plan::lockout(header).is_some(),
+                    reenroll: lockout_due,
+                };
                 (uuid, number, resolve(fate, askable, prompt, console))
             })
         }
@@ -692,6 +707,9 @@ pub fn finish<T: Tpm, C: Runner>(
     let clearing = fated
         .as_ref()
         .is_some_and(|(_, _, resolved)| *resolved == Resolved::Clear);
+    let reenrolling = fated
+        .as_ref()
+        .is_some_and(|(_, _, resolved)| *resolved == Resolved::Reenroll);
     let request = fated.as_ref().map(|(uuid, number, _)| (*uuid, *number));
     let mut said = None;
     let planned = match fated {
@@ -731,18 +749,45 @@ pub fn finish<T: Tpm, C: Runner>(
         opener_key: key.expose(),
         new: None,
     };
+    let mut ran = None;
     if reseal.is_none() {
         if let Some(plan) = &plan {
-            run_steps(plan.steps(), device, &keys, said, cryptsetup, console);
+            ran = Some(run_steps(
+                plan.steps(),
+                device,
+                &keys,
+                said,
+                cryptsetup,
+                console,
+            ));
         }
     }
+    // A confirmed re-enrollment retired the stale tpm-pin and lockout
+    // tokens: the lockout step takes this TPM's lockout over the header as
+    // that plan left it, and none if the plan did not complete or run.
+    let after;
+    let lockout_header = match (reenrolling, &plan, ran) {
+        (false, _, _) => Some(header),
+        (true, Some(plan), Some(Ran { done: true, .. })) => {
+            after = retired(header, plan.steps());
+            Some(&after)
+        }
+        (true, _, Some(_)) => {
+            console("no lockout step: the re-enrollment's plan did not complete");
+            None
+        }
+        (true, _, None) => {
+            console("no lockout step: the re-enrollment's plan did not run");
+            None
+        }
+    };
     // The counter as the release left it, before a take's reset.
     let counter = match tpm.as_deref_mut() {
         Some(tpm) if shape == Shape::Tpm => Some(tpm.dictionary_attack()),
         _ => None,
     };
-    let held = match (tpm.as_deref_mut(), name) {
-        (Some(tpm), Some(name)) if lockout_due => match name {
+    let held = match (tpm.as_deref_mut(), name, lockout_header) {
+        (Some(tpm), Some(name), Some(header)) if lockout_due => match name {
             Ok(name) => lockout_stage(
                 header,
                 device,
@@ -783,7 +828,7 @@ pub fn finish<T: Tpm, C: Runner>(
                     ..keys
                 };
                 finished.resealed =
-                    run_steps(plan.steps(), device, &keys, said, cryptsetup, console);
+                    run_steps(plan.steps(), device, &keys, said, cryptsetup, console).tested;
                 match finished.resealed {
                     Some(slot) if changing => console(&format!(
                         "td: the TPM PIN is changed: keyslot {slot} holds the new PIN's \
@@ -939,39 +984,68 @@ fn boot_primary(
     }
 }
 
+/// Which question this boot may ask: a clear's only where the lockout
+/// step is due on a header with a lockout token, a re-enrollment's where
+/// the lockout step is due.
+#[derive(Clone, Copy)]
+struct Askable {
+    clear: bool,
+    reenroll: bool,
+}
+
 /// A request's fate once its question is answered (ENCRYPTION.md "TPM
-/// clear"): a clear's, `askable` only where the lockout step is due on a
-/// header with a lockout token, is otherwise unproven. A re-enrollment's
-/// question is not asked: the request stays for a later boot, which says
-/// so.
+/// clear", "TPM re-enrollment"); one this boot may not ask is unproven.
 fn resolve(
     fate: Fate,
-    askable: bool,
+    askable: Askable,
     prompt: &mut dyn Prompt,
     console: &mut dyn FnMut(&str),
 ) -> Resolved {
     let resolved = match fate {
         Fate::Resolved(resolved) => resolved,
-        Fate::Ask(Question::Clear) if !askable => Resolved::Removed(Removed::Unproven),
-        Fate::Ask(question @ Question::Clear) => {
-            console(CLEAR_REQUESTED);
-            console(ANSWER_KEYS);
-            let confirmed = match prompt.read(CLEAR_PROMPT) {
-                Ok(Entered::Line(answer)) => answer.as_bytes() == CLEAR_WORD,
-                Ok(Entered::Eof | Entered::Refused) => false,
-                Err(error) => {
-                    console(&format!("the TPM clear's question failed: {error}"));
-                    false
-                }
+        Fate::Ask(question) => {
+            let (may, requested, text, word) = match question {
+                Question::Clear => (askable.clear, CLEAR_REQUESTED, CLEAR_PROMPT, CLEAR_WORD),
+                Question::Reenroll => (
+                    askable.reenroll,
+                    REENROLL_REQUESTED,
+                    REENROLL_PROMPT,
+                    REENROLL_WORD,
+                ),
             };
-            question.answered(confirmed)
+            if !may {
+                Resolved::Removed(Removed::Unproven)
+            } else {
+                console(requested);
+                console(ANSWER_KEYS);
+                let confirmed = match prompt.read(text) {
+                    Ok(Entered::Line(answer)) => answer.as_bytes() == word,
+                    Ok(Entered::Eof | Entered::Refused) => false,
+                    Err(error) => {
+                        console(&format!("the request's question failed: {error}"));
+                        false
+                    }
+                };
+                question.answered(confirmed)
+            }
         }
-        Fate::Ask(Question::Reenroll) => Resolved::Left,
     };
     if resolved == Resolved::Left {
         console(STAYS);
     }
     resolved
+}
+
+/// `header` with each protected token `steps` remove gone: the tokens
+/// the lockout step reads and numbers by.
+fn retired(header: &Header, steps: &[Step]) -> Header {
+    let mut after = header.clone();
+    after.protected.retain(|(number, _)| {
+        !steps
+            .iter()
+            .any(|step| matches!(step, Step::RemoveToken { token } if token == number))
+    });
+    after
 }
 
 /// Whether TPM2_Clear itself refused: disabled, its authorization, or
@@ -1012,7 +1086,10 @@ fn removal_line(resolved: Resolved) -> Option<&'static str> {
         }
         Resolved::PinChange => "td: removed the PIN change request: its new PIN is installed next",
         Resolved::Clear => "td: removed the TPM clear request: the TPM is cleared",
-        Resolved::Left | Resolved::Reenroll => return None,
+        Resolved::Reenroll => {
+            "td: removed the TPM re-enrollment request: the stale TPM protectors are retired"
+        }
+        Resolved::Left => return None,
     })
 }
 
@@ -1092,17 +1169,18 @@ fn describe(header: &Header, opened: Opened) -> String {
 /// until one passes; when none does, the warning, before any prompt.
 fn chain_stage<T: Tpm>(header: &Header, tpm: &mut T, console: &mut dyn FnMut(&str)) -> Chain {
     let mut chain = Chain::default();
-    let all = protected_plan::tpm_pins(header);
-    for (_, token) in &all {
+    // An orphan, whose keyslot a cut plan killed, seals nothing and
+    // records no primary: with only orphans a reseal is a first seal.
+    let pins: Vec<(u8, &TpmPin)> = protected_plan::tpm_pins(header)
+        .into_iter()
+        .filter(|(_, token)| token.keyslot.is_some())
+        .collect();
+    for (_, token) in &pins {
         match chain.recorded {
             Some(name) if name != token.primary => chain.other_primary = true,
             _ => chain.recorded = Some(token.primary),
         }
     }
-    let pins: Vec<(u8, &TpmPin)> = all
-        .into_iter()
-        .filter(|(_, token)| token.keyslot.is_some())
-        .collect();
     if pins.is_empty() {
         // The TPM-primary shape always holds one: its absence is a cut
         // update, a cleared TPM's re-enrollment not yet done, or a header
@@ -2044,9 +2122,16 @@ fn describe_step(step: &Step) -> String {
     }
 }
 
+/// What `run_steps` ran: the reseal's new keyslot once its test passed,
+/// and whether every step did.
+#[derive(Clone, Copy)]
+struct Ran {
+    tested: Option<u8>,
+    done: bool,
+}
+
 /// Run `steps` in order, reporting each commit; a failed step stops the
-/// plan, and the next boot's plan completes what is left. Returns the
-/// reseal's new keyslot once its test passed.
+/// plan, and the next boot's plan completes what is left.
 fn run_steps<C: Runner>(
     steps: &[Step],
     device: &Path,
@@ -2054,7 +2139,7 @@ fn run_steps<C: Runner>(
     said: Option<(u8, &str)>,
     cryptsetup: &mut C,
     console: &mut dyn FnMut(&str),
-) -> Option<u8> {
+) -> Ran {
     let mut tested = None;
     let count = steps.len();
     for (index, step) in steps.iter().enumerate() {
@@ -2082,11 +2167,14 @@ fn run_steps<C: Runner>(
                     "protected plan step {at}/{count} failed ({}): {error}",
                     describe_step(step)
                 ));
-                return tested;
+                return Ran {
+                    tested,
+                    done: false,
+                };
             }
         }
     }
-    tested
+    Ran { tested, done: true }
 }
 
 /// One step through the runner: a key on standard input by the keyslot it
@@ -2317,7 +2405,7 @@ pub(crate) mod tests {
                 _ => 32,
             };
             state.next += 1;
-            let mut private = b"scripted:".to_vec();
+            let mut private = crate::tests::scripted_private(self.wire.0.borrow().cleared);
             private.extend_from_slice(&state.next.to_be_bytes());
             if state.seal_fault != Some("verify") {
                 state
@@ -2356,10 +2444,11 @@ pub(crate) mod tests {
                     message: "another storage primary".into(),
                 });
             }
+            let fresh = token.sealed.private.starts_with(b"scripted+:");
             let Some((sealed_auth, secret)) = state
                 .objects
                 .get(&token.sealed.private)
-                .filter(|_| !self.wire.0.borrow().cleared)
+                .filter(|_| fresh || !self.wire.0.borrow().cleared)
                 .copied()
             else {
                 return Err(Self::refused(LOAD, 0x1df));
@@ -4408,6 +4497,7 @@ pub(crate) mod tests {
     }
 
     const REMOVED: &str = "cs remove 5";
+    const ASK_REENROLL: &str = "ask td: type reenroll to enroll this TPM: ";
     const UNPROVEN: &str = "say td: removed a TPM clear or re-enrollment request: td cannot";
     const RECORDED: &str = "say td: removed a TPM re-enrollment request: this TPM's";
     const STAYS: &str = "say td: a disk request stays for a later boot";
@@ -4504,14 +4594,14 @@ pub(crate) mod tests {
         world.taken(&[0x42; 32]);
         world.request(Operation::TpmReenroll, true);
         world.replaced();
-        released(&world.boot(vec![say(RECOVERY)]), &world);
-        assert!(world.has(STAYS) && world.pending());
+        released(&world.boot(vec![say(RECOVERY), say(b"no")]), &world);
+        assert!(world.has(ASK_REENROLL) && !world.pending());
         // Without a lockout token the chain check decides.
         let mut world = World::tpm_shape();
         world.request(Operation::TpmReenroll, true);
         world.replaced();
-        released(&world.boot(vec![say(RECOVERY)]), &world);
-        assert!(world.has(STAYS) && world.pending());
+        released(&world.boot(vec![say(RECOVERY), say(b"no")]), &world);
+        assert!(world.has(ASK_REENROLL) && !world.pending());
         // With one, it decides over the tpm-pin token's Name, which anyone
         // who writes the disk can set to this TPM's.
         let mut world = World::tpm_shape();
@@ -4523,9 +4613,9 @@ pub(crate) mod tests {
         };
         pin.primary = fresh;
         world.request(Operation::TpmReenroll, true);
-        released(&world.boot(vec![say(RECOVERY)]), &world);
-        assert!(!world.has("say td: removed"), "{:?}", world.lines());
-        assert!(world.has(STAYS) && world.pending());
+        released(&world.boot(vec![say(RECOVERY), say(b"no")]), &world);
+        assert!(!world.has(UNPROVEN), "{:?}", world.lines());
+        assert!(world.has(ASK_REENROLL) && !world.pending());
         // On the recorded TPM its token decides over a tpm-pin Name that
         // names another: the re-enrollment goes.
         let mut world = World::tpm_shape();
@@ -4977,8 +5067,8 @@ pub(crate) mod tests {
         assert!(world.has(STAYS) && world.pending() && !world.has("cs kill"));
         assert!(!world.has("tpm lockout Reset"));
         world.model.state.borrow_mut().clear_fault = None;
-        released(&world.boot(vec![say(RECOVERY)]), &world);
-        assert!(!world.has(&format!("ask {CLEAR_PROMPT}")) && world.pending());
+        released(&world.boot(vec![say(RECOVERY), say(b"no")]), &world);
+        assert!(!world.has(&format!("ask {CLEAR_PROMPT}")) && world.has(ASK_REENROLL));
     }
 
     /// The clear's question needs a lockout token on the header, which
@@ -5035,5 +5125,328 @@ pub(crate) mod tests {
         world.model.state.borrow_mut().clear_fault = None;
         released(&world.boot(clear_script()), &world);
         assert!(world.cleared() && !world.pending());
+    }
+
+    /// A recovery-key boot that confirms a verified re-enrollment.
+    fn reenroll_script() -> Vec<Say> {
+        vec![say(RECOVERY), say(REENROLL_WORD)]
+    }
+
+    /// A re-enrollment requested on the TPM td took, which was then
+    /// replaced.
+    fn reenroll_world() -> World {
+        let mut world = World::tpm_shape();
+        world.taken(&[0x42; 32]);
+        world.request(Operation::TpmReenroll, true);
+        world.replaced();
+        world
+    }
+
+    /// A re-enrollment on a header with no lockout token, whose chain check
+    /// found the replaced TPM's other primary.
+    fn unanchored_reenroll_world() -> World {
+        let mut world = World::tpm_shape();
+        world.request(Operation::TpmReenroll, true);
+        world.replaced();
+        world
+    }
+
+    /// The question after the cap with the tag verified; confirmed, the
+    /// re-enrollment's plan in place of the boot's own, before the lockout
+    /// step: the tpm-pin keyslots killed, the request removed, the stale
+    /// tpm-pin and lockout tokens retired. Then this TPM's lockout is
+    /// taken over the header as the plan left it, and the next boot's
+    /// reseal seals to this TPM under the new token.
+    #[test]
+    fn a_confirmed_reenrollment_retires_the_stale_protectors_then_takes_the_tpm() {
+        let mut world = reenroll_world();
+        let run = world.boot(reenroll_script());
+        assert_eq!(released(&run, &world), (0, Method::RecoveryKey));
+        let order = [
+            "cs test 0 ok",
+            &format!("say {REENROLL_REQUESTED}"),
+            &format!("say {ANSWER_KEYS}"),
+            ASK_REENROLL,
+            "cs kill 1",
+            REMOVED,
+            "say td: removed the TPM re-enrollment request: the stale TPM protectors are retired",
+            "cs remove 1",
+            "cs remove 3",
+            "cs import 1 lockout",
+            "tpm lockout Take",
+            "tpm lockout Parameters",
+            "tpm lockout Reset",
+        ];
+        let at: Vec<usize> = order.iter().map(|entry| world.at(entry)).collect();
+        assert!(at.windows(2).all(|w| w[0] < w[1]), "{:?}", world.lines());
+        let pins = |world: &World| {
+            world
+                .disk
+                .tokens
+                .values()
+                .filter(|token| matches!(token, Token::TpmPin(_)))
+                .count()
+        };
+        assert!(!world.pending() && pins(&world) == 0);
+        let fresh = world.model.state.borrow().primary;
+        let lockout: Vec<&Lockout> = world
+            .disk
+            .tokens
+            .values()
+            .filter_map(|token| match token {
+                Token::Lockout(lockout) => Some(lockout),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            matches!(lockout[..], [token] if token.proven && token.primary == fresh),
+            "{:?}",
+            world.disk.shape()
+        );
+        // The next boot reseals to this TPM; the one after releases by PIN.
+        let run = world.boot(reseal_script());
+        assert_eq!(released(&run, &world), (0, Method::RecoveryKey));
+        assert!(
+            world.has("say reseal: keyslot 1 holds a TPM PIN protector"),
+            "{:?}",
+            world.lines()
+        );
+        let run = world.boot(vec![say(NEW_PIN)]);
+        assert_eq!(released(&run, &world).1, Method::TpmPin);
+    }
+
+    /// A clear whose TPM is not the recorded one asks re-enrollment's
+    /// question: the TPM td recorded is gone.
+    #[test]
+    fn a_clear_on_another_tpm_asks_to_reenroll() {
+        let mut world = World::tpm_shape();
+        world.taken(&[0x42; 32]);
+        world.request(Operation::TpmClear, true);
+        world.replaced();
+        released(&world.boot(reenroll_script()), &world);
+        assert!(world.has(ASK_REENROLL) && !world.has(&format!("ask {CLEAR_PROMPT}")));
+        assert!(!world.cleared() && !world.pending());
+        assert!(world.has("say td: removed the TPM re-enrollment request"));
+        assert!(world.has("tpm lockout Reset"));
+    }
+
+    /// Any answer but `reenroll` declines; a plan that does not complete
+    /// takes no lockout; a lockout another system set refuses the take
+    /// with the stale protectors already retired.
+    #[test]
+    fn a_reenrollment_that_does_not_complete_takes_nothing() {
+        for answer in [
+            say(b"Reenroll"),
+            say(b"reenrollx"),
+            say(b""),
+            Say::Eof,
+            Say::Refused,
+            Say::Fail,
+        ] {
+            let mut world = reenroll_world();
+            released(&world.boot(vec![say(RECOVERY), answer]), &world);
+            assert!(world.has("say td: removed the declined disk request"));
+            assert!(!world.pending() && world.disk.tokens.contains_key(&1));
+            assert!(!world.has("cs remove 1"));
+        }
+        // A cut at each of the plan's commands takes nothing, beside a
+        // stale lockout token or with none, where the chain check found
+        // the other primary. A cut at the take's import leaves no lockout
+        // token, and the next boot takes.
+        for setup in [reenroll_world, unanchored_reenroll_world] {
+            let mut whole = setup();
+            whole.boot(reenroll_script());
+            let steps = whole
+                .lines()
+                .iter()
+                .filter(|line| line.starts_with("say protected plan step"))
+                .count();
+            let (mut planned, mut imported) = (0, 0);
+            for cut in 1..whole.disk.commands {
+                let mut world = setup();
+                world.disk.cut = Some(cut);
+                world.boot(reenroll_script());
+                if world.has("say no lockout step: the re-enrollment's plan did not complete") {
+                    assert!(!world.has("tpm lockout"), "cut {cut}");
+                    planned += 1;
+                }
+                if world.has("say no lockout take: its token is not on the header") {
+                    world.disk.cut = None;
+                    released(&world.boot(vec![say(RECOVERY)]), &world);
+                    assert!(world.has("tpm lockout Take"), "cut {cut}");
+                    imported += 1;
+                }
+            }
+            assert_eq!((planned, imported), (steps, 1));
+        }
+        let mut world = reenroll_world();
+        {
+            let mut state = world.model.state.borrow_mut();
+            state.da.lockout_auth_set = true;
+            state.lockout_auth = Some([0x77; 32]);
+        }
+        released(&world.boot(reenroll_script()), &world);
+        assert!(world.has("say td: td cannot prove this TPM's lockout authorization"));
+        assert!(!world.tpm_lockout() && !world.pending());
+        let tpm_held = world
+            .disk
+            .tokens
+            .values()
+            .any(|token| matches!(token, Token::TpmPin(_) | Token::Lockout(_)));
+        assert!(!tpm_held, "{:?}", world.disk.shape());
+    }
+
+    /// With no lockout token the plan retires the stale tpm-pin token
+    /// alone, and the take imports at the lowest free number.
+    #[test]
+    fn a_reenrollment_without_a_lockout_token_takes_the_tpm() {
+        let mut world = unanchored_reenroll_world();
+        released(&world.boot(reenroll_script()), &world);
+        let order = [
+            ASK_REENROLL,
+            "cs kill 1",
+            REMOVED,
+            "cs remove 1",
+            "cs import 1 lockout",
+            "tpm lockout Take",
+        ];
+        let at: Vec<usize> = order.iter().map(|entry| world.at(entry)).collect();
+        assert!(at.windows(2).all(|w| w[0] < w[1]), "{:?}", world.lines());
+        assert!(!world.pending());
+        assert!(matches!(world.disk.tokens.get(&1), Some(Token::Lockout(t)) if t.proven));
+    }
+
+    /// A declined re-enrollment's question for a clear on another primary
+    /// removes the request with nothing cleared, retired or taken: the
+    /// stale lockout token names the other primary.
+    #[test]
+    fn a_declined_clear_on_another_tpm_is_removed() {
+        let mut world = World::tpm_shape();
+        world.taken(&[0x42; 32]);
+        world.request(Operation::TpmClear, true);
+        world.replaced();
+        released(&world.boot(vec![say(RECOVERY), say(b"no")]), &world);
+        assert!(world.has(ASK_REENROLL) && !world.pending());
+        assert!(world.has("say td: removed the declined disk request"));
+        assert!(!world.cleared() && !world.tpm_lockout() && !world.has("cs kill"));
+        assert!(world.disk.tokens.contains_key(&1) && world.disk.tokens.contains_key(&3));
+    }
+
+    /// A question this boot may not ask is unproven, with nothing asked:
+    /// defence, since no boot without the lockout step due reads a
+    /// primary that is another.
+    #[test]
+    fn a_question_this_boot_may_not_ask_is_unproven() {
+        for question in [Question::Clear, Question::Reenroll] {
+            let log = Log::default();
+            let mut prompt = Script {
+                items: VecDeque::new(),
+                log: log.clone(),
+            };
+            let never = Askable {
+                clear: false,
+                reenroll: false,
+            };
+            let resolved = resolve(Fate::Ask(question), never, &mut prompt, &mut |_| {});
+            assert_eq!(resolved, Resolved::Removed(Removed::Unproven));
+            assert!(log.borrow().is_empty());
+        }
+    }
+
+    /// Released by the fido2-recovery key, the re-enrollment kills the
+    /// stale keyslot under the opener's key, as at a recovery-key release.
+    #[test]
+    fn a_reenrollment_at_a_security_key_release_takes_the_tpm() {
+        let mut world = reenroll_world();
+        world.plug(CRED_RECOVERY, 2);
+        let run = world.boot(vec![say(b""), say(KEY_PIN), say(REENROLL_WORD)]);
+        assert_eq!(released(&run, &world).1, Method::Fido2Recovery);
+        assert!(
+            world.has("say protected plan step 1/4: keyslot 1 destroyed, keyslot 2 authorizing")
+        );
+        assert!(world.has("tpm lockout Take") && !world.pending());
+    }
+
+    /// After a cut at any of the plan's commands the next boots converge
+    /// on one proven lockout token for this TPM and no stale token. While
+    /// a stale token names the old primary the request asks again, or the
+    /// owner requests again once it is gone; with none left the request is
+    /// unproven and the next boot takes. A tpm-pin token whose keyslot the
+    /// cut plan killed is an orphan: it records no primary, so the next
+    /// reseal is a first seal, and its plan removes the orphan.
+    #[test]
+    fn every_cut_of_a_reenrollment_converges() {
+        for setup in [reenroll_world, unanchored_reenroll_world] {
+            let mut whole = setup();
+            whole.boot(reenroll_script());
+            for cut in 1..whole.disk.commands {
+                let mut world = setup();
+                world.disk.cut = Some(cut);
+                world.boot(reenroll_script());
+                world.disk.cut = None;
+                let fresh = world.model.state.borrow().primary;
+                // A stale token that still names the old primary: a tpm-pin
+                // token on a live keyslot, or the old lockout token. An
+                // orphaned tpm-pin token proves no primary.
+                let stale = |world: &World| {
+                    world.disk.tokens.values().any(|t| match t {
+                        Token::TpmPin(_) => t
+                            .keyslot()
+                            .is_some_and(|slot| world.disk.keyslots.contains_key(&slot)),
+                        Token::Lockout(lockout) => lockout.primary != fresh,
+                        _ => false,
+                    })
+                };
+                let settled = |world: &World| {
+                    let lockouts: Vec<&Token> = world
+                        .disk
+                        .tokens
+                        .values()
+                        .filter(|t| matches!(t, Token::Lockout(_)))
+                        .collect();
+                    !world.pending()
+                        && !stale(world)
+                        && matches!(lockouts[..], [Token::Lockout(t)] if t.proven && t.primary == fresh)
+                };
+                for _ in 0..3 {
+                    if settled(&world) {
+                        break;
+                    }
+                    let script = if stale(&world) {
+                        if !world.pending() {
+                            world.request(Operation::TpmReenroll, true);
+                        }
+                        reenroll_script()
+                    } else if world
+                        .disk
+                        .tokens
+                        .values()
+                        .any(|t| matches!(t, Token::Lockout(_)))
+                    {
+                        // This TPM's token anchors a reseal, offered and
+                        // declined.
+                        vec![say(RECOVERY), say(b"no")]
+                    } else {
+                        vec![say(RECOVERY)]
+                    };
+                    released(&world.boot(script), &world);
+                }
+                assert!(settled(&world), "cut {cut}: {:?}", world.disk.shape());
+                let run = world.boot(reseal_script());
+                assert!(
+                    run.finished
+                        .is_some_and(|finished| finished.resealed.is_some()),
+                    "cut {cut}: {:?}",
+                    world.lines()
+                );
+                let pins = world
+                    .disk
+                    .tokens
+                    .values()
+                    .filter(|t| matches!(t, Token::TpmPin(_)))
+                    .count();
+                assert_eq!(pins, 1, "cut {cut}: {:?}", world.disk.shape());
+            }
+        }
     }
 }

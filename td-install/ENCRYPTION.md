@@ -1355,12 +1355,14 @@ the plan only after the cap, the TPM wait) and replaces steps 2 and 3:
      PCR 12 is still zero, so unlike the device-bound reseal this one is
      verified before the cap. A failed seal or verification says so and
      keeps nothing. A re-seal requires the storage primary the tpm-pin
-     tokens recorded ("Bus"), so a TPM whose primary is another, a
-     cleared or replaced one among them, is offered none and keeps only
-     the security keys and the recovery key at boot until protector
-     management's TPM re-enrollment ("Protector management"). After
-     the cap a sealed object's keyslot is added only under the primary
-     a verified lockout token records ("Bus"), a first seal included.
+     tokens on live keyslots recorded ("Bus"). So a TPM whose primary is
+     another, a cleared or replaced one among them, is offered none and
+     keeps only the security keys and the recovery key at boot until
+     protector management's TPM re-enrollment ("Protector management").
+     An orphaned token, whose keyslot a cut plan killed, counts for
+     none. After the cap a sealed object's keyslot is added only under
+     the primary a verified lockout token records ("Bus"), a first seal
+     included.
      With no lockout token on the header no reseal is offered, since its
      keyslot would never be added and its seal would send the new PIN's
      authValue for nothing: the console says that this boot takes the
