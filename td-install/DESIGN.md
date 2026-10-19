@@ -1599,8 +1599,8 @@ commit before its code, the upgrade and its cancellation by 8f's, and
 protector management by 8g's.
 `storage_operation.rs` implements the selector update, the disk
 proof's keyslot test, the upgrade's phase 1 and its cancellation, and
-protector management's addition, removal and recovery-key removal; the
-upgrade boot is the selector's. td-authd refuses every
+protector management's addition, removal, recovery-key removal and
+requests; the upgrade boot is the selector's. td-authd refuses every
 storage operation in a production build until that document's item 9,
 and starts a disk proof's worker only in builds that decode the proof,
 test builds until then. The worker
@@ -1632,7 +1632,8 @@ no other operand, and keeps the login worker's startup, unnamed
 socketpair, descriptor inventory and bounded framing
 (td-secret/DESIGN.md, "Login-key worker"): it requires no active swap
 and a zero core-dump soft limit before its baseline, since it may hold
-a recovery key, a PIN or a derived passphrase, and reads every frame
+a recovery key, a PIN, a derived passphrase or a volume key, and reads
+every frame
 into clearing storage.
 
 Its frames are the login worker's: it sends `18` its baseline, `10` and
@@ -1806,9 +1807,13 @@ consent time holds no I/O.
       one, which the check before the first `10` bounds.
     - The worker reads exactly 64 bytes, the header's volume-key size,
       into clearing storage, then unlinks FILE and the copy whether or
-      not the read succeeded (`0f` on any failure, the test having
-      passed). A killed worker's FILE goes with its directory at the
-      next worker's start.
+      not the read succeeded. The test having passed, the dump's
+      deadline is `08`, as the test's, and any other failure `0f`. A
+      killed worker's FILE goes with its directory at the next worker's
+      start.
+    - The copied area's keyslots must each have a cost too, since the
+      header may have changed between the check before the first `10`
+      and the copy (`0f` otherwise).
     - The key reaches no frame, string, error or log, and is zeroed
       once the tag is computed or at any end.
   - *The commit round.* After the last step's `11` the worker sends
@@ -1964,10 +1969,12 @@ baseline does not give, a change after `13`, metadata that disagrees and
 a cut at each write; and each request's dump, a header holding a keyslot
 without a cost (`0f` before any step), a dump that fails or whose file
 is not 64 bytes (`0f`), FILE and the copy removed on every path, a
-pending request replaced, and the imported tag against
-`tests/token_vectors.py`'s. td-protector's `keyslot_test` also runs the
-exact dump against the pinned cryptsetup over a header copy of a volume
-it formats with a known volume key, which the file reproduces.
+pending request replaced, and the imported tag recomputed through
+td-protector's `request::tag`, which `tests/token_vectors.py`'s vectors
+pin. td-protector's `keyslot_test` also runs the exact dump against the
+pinned cryptsetup over a header copy of a volume it formats: the file
+reproduces the key the volume itself dumps, through either keyslot, and
+a name that exists is refused.
 
 ## 6. Signing and keys
 

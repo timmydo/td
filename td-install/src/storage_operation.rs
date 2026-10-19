@@ -20,7 +20,9 @@
 //! management adds and removes a FIDO2 protector or removes the recovery
 //! key: a disk proof whose secret the worker keeps, an addition's new key's
 //! ceremony, then after root's `13` td-protector's `manage` plan, its
-//! keyslot commits under the proof's secret and the new key's.
+//! keyslot commits under the proof's secret and the new key's. Its
+//! requests' proof also dumps the volume key from the tested copy, to tag
+//! the key-less request token it writes.
 
 use crate::consent::{
     upgrade_ceiling, DiskProofs, DiskRequest, DiskRole, LoginStep, Operation, Proof, Protected,
@@ -53,6 +55,7 @@ use td_protector::manage;
 use td_protector::protected::{Fido2, FidoRole, Shape, Token};
 use td_protector::protected_plan::{self, Opened};
 use td_protector::recovery::{RecoveryKey, RecoveryText};
+use td_protector::request;
 use td_protector::upgrade::{self, Step};
 
 const PRESENT: u8 = 0x10;
@@ -359,6 +362,16 @@ fn disk_role(role: FidoRole) -> DiskRole {
     }
 }
 
+/// td-protector's request operation for consent's.
+fn operation_of(request: DiskRequest) -> td_protector::protected::Operation {
+    use td_protector::protected::Operation as Requested;
+    match request {
+        DiskRequest::PinChange => Requested::PinChange,
+        DiskRequest::TpmClear => Requested::TpmClear,
+        DiskRequest::Reenroll => Requested::TpmReenroll,
+    }
+}
+
 /// A `td-request` token's operation as consent names it.
 fn disk_request(operation: td_protector::protected::Operation) -> DiskRequest {
     use td_protector::protected::Operation as Requested;
@@ -404,15 +417,23 @@ pub(crate) trait Host {
     /// standard input, which maps nothing, against a private detached
     /// copy of the held partition's header area that must read as
     /// `expected`: a repair cryptsetup makes lands in the copy, never on
-    /// the disk. The child lives until `deadline` at most. Any failure but
-    /// these outcomes is an error naming no key.
+    /// the disk. With `dump`, a passed test then puts the volume key there
+    /// from that copy through `luksDump --dump-volume-key`, the same key on
+    /// standard input, every keyslot of the copied area costed. Each child
+    /// lives until `deadline` at most. Any failure but these outcomes is an
+    /// error naming no key.
     fn test_keyslot(
         &mut self,
         slot: u8,
         key: &[u8],
         expected: &Header,
         deadline: Instant,
+        dump: Option<&mut Option<VolumeKey>>,
     ) -> Result<Tested, String>;
+    /// Whether every keyslot of the held partition's header area, as
+    /// td-protector's `test_area` reads it, has a bounded cost: a dump
+    /// tries every keyslot.
+    fn costed(&mut self) -> Result<(), String>;
     /// The held partition's header and its upgrade view, read afresh.
     fn upgrade_view(&mut self) -> Option<Result<UpgradeView, String>>;
     /// The TPM shape's one TPM read: a SHA-256 bank, and `lockoutAuthSet`
@@ -440,17 +461,51 @@ pub(crate) trait Host {
 /// The keys a protector plan's steps take, each by the keyslot it opens:
 /// the proof's, and an addition's new key's.
 pub(crate) struct Secrets<'a> {
-    pub(crate) opener: (u8, &'a [u8]),
+    /// None for a request, whose writes are key-less: its proof's
+    /// secret is gone by then.
+    pub(crate) opener: (u8, Option<&'a [u8]>),
     pub(crate) new: Option<(u8, &'a [u8])>,
 }
 
 impl Secrets<'_> {
     fn of(&self, slot: u8) -> Result<&[u8], String> {
         match (self.opener, self.new) {
-            ((opener, key), _) if opener == slot => Ok(key),
+            ((opener, Some(key)), _) if opener == slot => Ok(key),
             (_, Some((new, key))) if new == slot => Ok(key),
             _ => Err("no key for that keyslot".into()),
         }
+    }
+}
+
+/// The header's volume-key size, which td's install writes.
+const VOLUME_KEY_BYTES: usize = 64;
+
+/// The file a request's volume-key dump writes, in its copy's directory.
+const VOLUME_KEY_FILE: &str = "volume-key";
+
+/// A request's volume key, dumped from its proof's header copy: one heap
+/// allocation zeroed on drop, which no frame, string, error or log holds.
+/// It is neither `Debug`, `Display` nor `Clone`.
+pub(crate) struct VolumeKey(Box<[u8; VOLUME_KEY_BYTES]>);
+
+impl VolumeKey {
+    fn zeroed() -> Self {
+        Self(Box::new([0; VOLUME_KEY_BYTES]))
+    }
+
+    /// The buffer a reader fills.
+    pub(crate) fn fill(&mut self) -> &mut [u8] {
+        self.0.as_mut_slice()
+    }
+
+    fn expose(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+}
+
+impl Drop for VolumeKey {
+    fn drop(&mut self) {
+        td_tpm::zero(self.0.as_mut_slice());
     }
 }
 
@@ -564,7 +619,8 @@ fn perform<H: Host, K: Keys>(
         }
         Operation::ProtectorAdd { .. }
         | Operation::ProtectorRemove { .. }
-        | Operation::RecoveryRemove { .. } => {
+        | Operation::RecoveryRemove { .. }
+        | Operation::ProtectorRequest { .. } => {
             let managed = Managed {
                 request: &request,
                 baseline: &baseline,
@@ -572,8 +628,6 @@ fn perform<H: Host, K: Keys>(
             };
             return managed.run(wire, host, keys, started, margin, entropy);
         }
-        // The requests are a later commit's.
-        Operation::ProtectorRequest { .. } => return Err(Failure::Internal),
         _ => {}
     }
     // Root derives the description from the baseline, as this does.
@@ -1091,7 +1145,7 @@ impl Proved<'_> {
         // The secret is zeroed unused: a login operation's proof writes
         // nothing to the volume.
         match self.request.login_proof() {
-            Some(Proof::RecoveryKey) => self.recovery_key(wire, host, header).map(drop),
+            Some(Proof::RecoveryKey) => self.recovery_key(wire, host, header, None).map(drop),
             Some(Proof::DiskKey) => {
                 let numbered = fido_tokens(header);
                 let candidates = Candidates {
@@ -1099,7 +1153,7 @@ impl Proved<'_> {
                     fingerprints: &tokens,
                     chosen: None,
                 };
-                self.disk_key(wire, host, keys, header, &candidates, entropy)
+                self.disk_key(wire, host, keys, header, &candidates, entropy, None)
                     .map(drop)
             }
             None => Err(Failure::Internal),
@@ -1117,6 +1171,7 @@ impl Proved<'_> {
         wire: &mut Wire,
         host: &mut H,
         header: &Header,
+        dump: Option<&mut Option<VolumeKey>>,
     ) -> Result<RecoveryText, Failure> {
         let (_, slot) = protected_plan::marker(header).ok_or(Failure::Internal)?;
         let entry = wire.receive_secret().map_err(|_| framing(wire))?;
@@ -1124,14 +1179,16 @@ impl Proved<'_> {
         drop(entry);
         let passphrase = key.map_err(|_| Failure::Mistyped)?.passphrase();
         self.unchanged(host)?;
-        tested(host.test_keyslot(slot, passphrase.expose(), header, wire.deadline()))?;
+        tested(host.test_keyslot(slot, passphrase.expose(), header, wire.deadline(), dump))?;
         Ok(passphrase)
     }
 
     /// The disk key's two presented steps through td-fido, its verified
     /// assertion's derived passphrase tested on the keyslot its token
     /// names: the token's number, the passphrase and the authorize step
-    /// presented.
+    /// presented. With `dump`, a request's, the test's copy gives the
+    /// volume key.
+    #[allow(clippy::too_many_arguments)]
     fn disk_key<H: Host, K: Keys>(
         &self,
         wire: &mut Wire,
@@ -1140,6 +1197,7 @@ impl Proved<'_> {
         header: &Header,
         candidates: &Candidates<'_>,
         entropy: &mut dyn FnMut() -> Result<[u8; 32], String>,
+        dump: Option<&mut Option<VolumeKey>>,
     ) -> Result<(u8, Passphrase, Request), Failure> {
         // A token whose point td-fido refuses is not tried, as the
         // selector's release skips it: the rest still prove.
@@ -1200,7 +1258,13 @@ impl Proved<'_> {
             .and_then(|(number, token)| Some((*number, token.keyslot?)))
             .ok_or(Failure::WrongKey)?;
         self.unchanged(host)?;
-        tested(host.test_keyslot(slot, released.passphrase.bytes(), header, wire.deadline()))?;
+        tested(host.test_keyslot(
+            slot,
+            released.passphrase.bytes(),
+            header,
+            wire.deadline(),
+            dump,
+        ))?;
         let presented = presented.ok_or(Failure::Internal)?;
         Ok((number, released.passphrase, presented))
     }
@@ -1218,9 +1282,9 @@ impl Proved<'_> {
     }
 }
 
-/// Protector management's addition, removal and recovery-key removal
-/// (DESIGN.md "Storage operation worker", Protector management): root's
-/// first description, the baseline and the header read it holds.
+/// Protector management's addition, removal, recovery-key removal and
+/// requests (DESIGN.md "Storage operation worker", Protector management):
+/// root's first description, the baseline and the header read it holds.
 struct Managed<'a> {
     request: &'a Request,
     baseline: &'a Baseline,
@@ -1245,8 +1309,9 @@ impl Secret {
 
 impl Managed<'_> {
     /// The first description as the baseline admits it, the choose step's
-    /// digit for a removal, the proof, an addition's new key, then after
-    /// root's `13` the re-read and the `manage` plan's writes.
+    /// digit for a removal, the proof, a request's volume key from its
+    /// header copy, an addition's new key, then after root's `13` the
+    /// re-read and the `manage` plan's writes.
     fn run<H: Host, K: Keys>(
         &self,
         wire: &mut Wire,
@@ -1266,6 +1331,15 @@ impl Managed<'_> {
         }
         let ceiling = self.request.ceiling().ok_or(Failure::Internal)?;
         wire.limit(started.checked_add(ceiling).ok_or(Failure::Internal)?);
+        let requested = match self.request.operation() {
+            Operation::ProtectorRequest { request, .. } => Some(operation_of(*request)),
+            _ => None,
+        };
+        // A request's dump tries every keyslot, not the tested one.
+        if requested.is_some() {
+            host.costed().map_err(|_| Failure::Failed)?;
+        }
+        let mut volume = None;
         let fingerprints = protected.protector_keys();
         let disk = DiskProofs {
             recovery_key: protected.marker,
@@ -1297,7 +1371,8 @@ impl Managed<'_> {
         };
         let (opened, secret, last) = match current.protector_proof() {
             Some(Proof::RecoveryKey) => {
-                let text = proof.recovery_key(wire, host, header)?;
+                let dump = requested.is_some().then_some(&mut volume);
+                let text = proof.recovery_key(wire, host, header, dump)?;
                 (Opened::RecoveryKey, Secret::Recovery(text), current.clone())
             }
             Some(Proof::DiskKey) => {
@@ -1306,8 +1381,15 @@ impl Managed<'_> {
                     fingerprints: &fingerprints,
                     chosen: chosen.and_then(|position: u8| usize::from(position).checked_sub(1)),
                 };
-                let (token, passphrase, presented) =
-                    proof.disk_key(wire, host, keys, header, &candidates, entropy)?;
+                let (token, passphrase, presented) = proof.disk_key(
+                    wire,
+                    host,
+                    keys,
+                    header,
+                    &candidates,
+                    entropy,
+                    requested.is_some().then_some(&mut volume),
+                )?;
                 (Opened::Fido2 { token }, Secret::Disk(passphrase), presented)
             }
             None => return Err(Failure::Internal),
@@ -1328,6 +1410,8 @@ impl Managed<'_> {
             made = Some((fido, passphrase));
             last = presented;
         }
+        // A request's writes are key-less: its proof's secret goes now.
+        let secret = requested.is_none().then_some(secret);
         Operated::commit_round(wire, &last.encode(), margin, entropy)?;
         // Root may now count a write as begun; nothing is written until the
         // header agrees with what was presented.
@@ -1345,6 +1429,18 @@ impl Managed<'_> {
                 manage::remove(header, opened, number)
             }
             (Operation::RecoveryRemove { .. }, None) => manage::remove_recovery(header, opened),
+            (Operation::ProtectorRequest { .. }, None) => {
+                let (Some(operation), Some(key)) = (requested, volume.take()) else {
+                    return Err(Failure::Internal);
+                };
+                let uuid = volume_uuid(&header.uuid).ok_or(Failure::Internal)?;
+                // Tagged over the re-read header, which is this one; the
+                // key is zeroed once the tag is computed.
+                let sealed = request::seal(key.expose(), &uuid, operation, &header.protected)
+                    .map_err(|_| Failure::Failed)?;
+                drop(key);
+                manage::request(header, opened, &sealed)
+            }
             _ => return Err(Failure::Internal),
         }
         .map_err(|_| Failure::Changed)?;
@@ -1365,7 +1461,7 @@ impl Managed<'_> {
             _ => None,
         });
         let secrets = Secrets {
-            opener: (opener, secret.bytes()),
+            opener: (opener, secret.as_ref().map(Secret::bytes)),
             new: match (new_slot, &made) {
                 (Some(slot), Some((_, passphrase))) => Some((slot, passphrase.bytes().as_slice())),
                 (None, None) => None,
@@ -1396,7 +1492,7 @@ impl Managed<'_> {
                         Some(Ok(written)) => written,
                         _ => return Err(Failure::Failed),
                     };
-                    match host.test_keyslot(*slot, key, &written, wire.deadline()) {
+                    match host.test_keyslot(*slot, key, &written, wire.deadline(), None) {
                         Ok(Tested::Opened) => {}
                         Ok(Tested::Refused) => return Err(Failure::Uncertain),
                         _ => return Err(Failure::Failed),
@@ -1651,6 +1747,19 @@ fn stepped(request: &Request, step: LoginStep) -> Result<Request, Failure> {
             step,
             approval: None,
         },
+        Operation::ProtectorRequest {
+            account,
+            proof,
+            request,
+            pending,
+            ..
+        } => Operation::ProtectorRequest {
+            account,
+            proof,
+            request,
+            pending,
+            step,
+        },
         Operation::LoginEnroll {
             account,
             before,
@@ -1767,7 +1876,8 @@ pub(crate) fn run(uid: u32) -> Result<(), String> {
         .ok_or("storage operation deadline overflow")?;
     let mut wire = Wire::new(stream, deadline)?;
     // Before the baseline, as td-secret's workers do: a disk proof holds a
-    // recovery key, a PIN or a derived passphrase.
+    // recovery key, a PIN or a derived passphrase, and a request the
+    // volume key.
     let memory = crate::memory::with_memory_state(
         paths::read_to_string(Path::new("/proc/swaps")),
         paths::read_to_string(Path::new("/proc/self/limits")),
@@ -2240,14 +2350,16 @@ impl Host for Machine {
 
     /// The installed cryptsetup against a detached copy of the held
     /// partition's header area, the node it names checked to be the held
-    /// one; the child is killed and reaped at `deadline` or when root hangs
-    /// up. Its errors name no key.
+    /// one; each child is killed and reaped at `deadline` or when root
+    /// hangs up. A dump's file is unlinked, and the copy removed, whether
+    /// or not its read succeeded. Its errors name no key.
     fn test_keyslot(
         &mut self,
         slot: u8,
         key: &[u8],
         expected: &Header,
         deadline: Instant,
+        dump: Option<&mut Option<VolumeKey>>,
     ) -> Result<Tested, String> {
         let device = self.device.as_ref().ok_or("no held partition")?;
         let partition = self.partition.as_mut().ok_or("no held partition")?;
@@ -2261,6 +2373,10 @@ impl Host for Machine {
             return Ok(Tested::Changed);
         }
         area.cost(slot)?;
+        // The dump tries every keyslot of the copy it reads, this one.
+        if dump.is_some() {
+            area.all_costed()?;
+        }
         let copy = DetachedHeader::take(&self.root.join(RUN_DIR), partition, area.length)?;
         // The copy cryptsetup reads is the header presented, or nothing
         // runs: a disk that changed while it was copied fails here.
@@ -2273,7 +2389,7 @@ impl Host for Machine {
         let authority = self.authority.as_ref();
         let mut abandoned = || authority.is_some_and(hung_up);
         let args = cryptsetup::detached_test_args(&copy.path, device, slot);
-        match program.run_bounded(&args, key, deadline, &mut abandoned) {
+        let tested = match program.run_bounded(&args, key, deadline, &mut abandoned) {
             Ok(Bounded::Exited(status)) if status.success() => Ok(Tested::Opened),
             Ok(Bounded::Exited(status))
                 if status.code() == Some(cryptsetup::EXIT_BAD_PASSPHRASE) =>
@@ -2284,7 +2400,37 @@ impl Host for Machine {
             Ok(Bounded::Expired) => Ok(Tested::Expired),
             Ok(Bounded::Abandoned) => Err("root hung up during the keyslot test".into()),
             Err(error) => Err(error.to_string()),
+        };
+        let (Ok(Tested::Opened), Some(dumped_into)) = (&tested, dump) else {
+            return tested;
+        };
+        let mut volume = VolumeKey::zeroed();
+        // cryptsetup creates the file `O_CREAT|O_EXCL` at mode 0400 in the
+        // copy's own mode-0700 directory.
+        let file = copy.dir.join(VOLUME_KEY_FILE);
+        let args = cryptsetup::dump_volume_key_args(&copy.path, &file);
+        let dumped = match program.run_bounded(&args, key, deadline, &mut abandoned) {
+            Ok(Bounded::Exited(status)) if status.success() => {
+                read_volume_key(&file, &mut volume).map(|()| Tested::Opened)
+            }
+            Ok(Bounded::Exited(_)) => Err("cryptsetup's volume-key dump failed".into()),
+            Ok(Bounded::Expired) => Ok(Tested::Expired),
+            Ok(Bounded::Abandoned) => Err("root hung up during the volume-key dump".into()),
+            Err(error) => Err(error.to_string()),
+        };
+        let unlinked = paths::remove_file_if_present(&file);
+        drop(copy);
+        let dumped = dumped?;
+        unlinked.map_err(|_| "unlink the volume-key file")?;
+        if dumped == Tested::Opened {
+            *dumped_into = Some(volume);
         }
+        Ok(dumped)
+    }
+
+    fn costed(&mut self) -> Result<(), String> {
+        let partition = self.partition.as_mut().ok_or("no held partition")?;
+        luks2::test_area(partition)?.all_costed()
     }
 
     fn upgrade_view(&mut self) -> Option<Result<UpgradeView, String>> {
@@ -2481,6 +2627,23 @@ impl DetachedHeader {
     }
 }
 
+/// Exactly `VOLUME_KEY_BYTES` from the regular file cryptsetup wrote, then
+/// end of file, into `volume`. Its errors name no key.
+fn read_volume_key(path: &Path, volume: &mut VolumeKey) -> Result<(), String> {
+    let (mut file, metadata) =
+        td_fs::open_real_file(path, "volume-key file").map_err(|_| "open the volume-key file")?;
+    if metadata.len() != VOLUME_KEY_BYTES as u64 {
+        return Err("the volume-key file does not hold exactly one volume key".into());
+    }
+    file.read_exact(volume.fill())
+        .map_err(|_| "read the volume-key file")?;
+    let mut past = [0; 1];
+    match file.read(&mut past) {
+        Ok(0) => Ok(()),
+        _ => Err("the volume-key file does not hold exactly one volume key".into()),
+    }
+}
+
 impl Drop for DetachedHeader {
     fn drop(&mut self) {
         let _ = paths::remove_dir_all_if_present(&self.dir);
@@ -2663,6 +2826,9 @@ mod tests {
         ])
     }
 
+    /// The volume key a fake dump reads.
+    const DUMPED: [u8; VOLUME_KEY_BYTES] = [0x5a; VOLUME_KEY_BYTES];
+
     struct Fake {
         reads: Vec<Read>,
         standings: Vec<Option<[u8; 32]>>,
@@ -2697,6 +2863,13 @@ mod tests {
         protected: Vec<Written>,
         /// The protector write that fails, by its index.
         protected_fails: Option<usize>,
+        /// A request's volume-key dump after a passed test: `Opened`
+        /// gives `DUMPED`.
+        dumped: Result<Tested, String>,
+        /// Whether every keyslot has a cost.
+        costed: Result<(), String>,
+        /// Whether an `Opened` dump hands its key back.
+        hands_back: bool,
     }
 
     type Written = (protected_plan::Step, Vec<u8>, Option<Vec<u8>>);
@@ -2729,6 +2902,9 @@ mod tests {
                 answers: Vec::new(),
                 protected: Vec::new(),
                 protected_fails: None,
+                dumped: Ok(Tested::Opened),
+                costed: Ok(()),
+                hands_back: true,
             }
         }
 
@@ -2782,6 +2958,7 @@ mod tests {
             key: &[u8],
             expected: &Header,
             deadline: Instant,
+            dump: Option<&mut Option<VolumeKey>>,
         ) -> Result<Tested, String> {
             self.log.push("test");
             let answer = self
@@ -2791,7 +2968,21 @@ mod tests {
                 .unwrap_or(self.opens.clone());
             self.tested.push((slot, key.to_vec()));
             self.expected.push((expected.clone(), deadline));
+            if let (Ok(Tested::Opened), Some(slot)) = (&answer, dump) {
+                self.log.push("dump");
+                let dumped = self.dumped.clone()?;
+                if dumped == Tested::Opened && self.hands_back {
+                    let mut volume = VolumeKey::zeroed();
+                    volume.fill().copy_from_slice(&DUMPED);
+                    *slot = Some(volume);
+                }
+                return Ok(dumped);
+            }
             answer
+        }
+        fn costed(&mut self) -> Result<(), String> {
+            self.log.push("costed");
+            self.costed.clone()
         }
         fn upgrade_view(&mut self) -> Option<Result<UpgradeView, String>> {
             let n = self.log.iter().filter(|&&what| what == "view").count();
@@ -4845,7 +5036,7 @@ mod tests {
             removal: other,
             step: LoginStep::Choose,
         });
-        // The requests are a later commit's, refused before `admits`.
+        // A request that does not say it replaces the pending one.
         let request = managed(Operation::ProtectorRequest {
             account: 1000,
             proof: Proof::RecoveryKey,
@@ -4881,7 +5072,7 @@ mod tests {
             (tpm_protected(false), fido_removal),
             (tpm_protected(true), orphaned),
             (full, adding_key(Proof::RecoveryKey, LoginStep::RecoveryKey)),
-            (tpm_protected(false), request),
+            (tpm_protected(true), request),
             (
                 header(Vec::new()),
                 removing(Proof::DiskKey, 0, LoginStep::Choose),
@@ -5440,6 +5631,12 @@ mod tests {
             ("impl Secret {", "impl Managed<'_> {"),
             ("impl Secrets<'_> {", "/// The selector `prepare` builds"),
             ("    fn protected_step(", "    fn cryptsetup(&self)"),
+            ("fn read_volume_key(", "impl Drop for DetachedHeader"),
+            ("impl VolumeKey {", "/// What a keyslot test found."),
+            (
+                "            (Operation::ProtectorRequest { .. }, None) => {",
+                "        let metadata = host.metadata()",
+            ),
             (
                 "        let device = self.device.as_ref().ok_or(\"no held partition\")?;\n        let partition",
                 "    fn upgrade_view(&mut self)",
@@ -5498,10 +5695,23 @@ mod tests {
     /// stale one cryptsetup would repair, then its keyslots area and data:
     /// keyslot 0 has td's PBKDF2, keyslot 1 Argon2.
     fn partition(seqid: u64) -> Vec<u8> {
+        partition_with(seqid, false)
+    }
+
+    /// `partition`, keyslot 1 PBKDF2 too where `costed`, as a dump needs.
+    fn partition_with(seqid: u64, costed: bool) -> Vec<u8> {
         let json = |seqid: u64| {
-            format!(
+            let json = format!(
                 "{{\"keyslots\":{{\"0\":{{\"type\":\"luks2\",\"kdf\":{{\"type\":\"pbkdf2\",\"hash\":\"sha256\",\"iterations\":1000}}}},\"1\":{{\"type\":\"luks2\",\"kdf\":{{\"type\":\"argon2id\",\"time\":4,\"memory\":1048576,\"cpus\":4}}}}}},\"tokens\":{{}},\"segments\":{{\"0\":{{\"type\":\"crypt\",\"offset\":\"{seqid}\"}}}},\"digests\":{{\"0\":{{\"type\":\"pbkdf2\",\"keyslots\":[\"0\",\"1\"],\"hash\":\"sha256\",\"iterations\":250000}}}},\"config\":{{\"json_size\":\"12288\",\"keyslots_size\":\"{KEYSLOTS_SIZE}\"}}}}"
-            )
+            );
+            if costed {
+                json.replace(
+                    "{\"type\":\"argon2id\",\"time\":4,\"memory\":1048576,\"cpus\":4}",
+                    "{\"type\":\"pbkdf2\",\"hash\":\"sha256\",\"iterations\":1000}",
+                )
+            } else {
+                json
+            }
         };
         let mut out = luks_copy(false, seqid, &json(seqid));
         out.extend(luks_copy(true, seqid - 1, &json(seqid - 1)));
@@ -5540,16 +5750,22 @@ mod tests {
         crate::scratch::executable(
             &bin.join(protocol::CRYPTSETUP),
             &format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{dir}/argv'\n\
+                "#!/bin/sh\nif [ \"$1\" = luksDump ]; then \
+                 printf '%s\\n' \"$@\" > '{dir}/dump-argv'; read key || :; \
+                 case \"$key\" in right) printf '{whole}' > \"$5\";; \
+                 short) printf 'kkk' > \"$5\";; long) printf '{whole}k' > \"$5\";; \
+                 stalled) exec '{sleep}' 60;; *) exit 1;; esac; exit 0; fi\n\
+                 printf '%s\\n' \"$@\" > '{dir}/argv'\n\
                  h=\nfor a; do if [ \"$p\" = --header ]; then h=$a; fi; p=$a; done\n\
                  '{cat}' > '{dir}/stdin'\n'{cat}' \"$h\" > '{dir}/seen'\n\
                  printf 'REPAIRED' > \"$h\"\n\
                  read key < '{dir}/stdin' || :\n\
-                 case \"$key\" in right) exit 0;; wrong) exit 2;; \
+                 case \"$key\" in right|short|long|stalled|undumped) exit 0;; wrong) exit 2;; \
                  stall) echo $$ > '{dir}/pid'; exec '{sleep}' 60;; *) exit 1;; esac\n",
                 dir = bin.display(),
                 cat = tool("cat").display(),
-                sleep = tool("sleep").display()
+                sleep = tool("sleep").display(),
+                whole = "k".repeat(VOLUME_KEY_BYTES),
             ),
         )
         .unwrap();
@@ -5568,12 +5784,36 @@ mod tests {
         }
     }
 
+    /// `keyslot()` over a partition whose every keyslot has a cost.
+    fn costed_keyslot() -> Keyslot {
+        let mut test = keyslot();
+        let image = partition_with(5, true);
+        std::fs::write(&test.device, &image).unwrap();
+        test.expected = luks2::read(&mut std::io::Cursor::new(&image)).unwrap();
+        test.image = image;
+        test
+    }
+
     impl Keyslot {
         fn test(&mut self, slot: u8, key: &[u8], deadline: Instant) -> Result<Tested, String> {
             let expected = self.expected.clone();
             self.host
                 .machine
-                .test_keyslot(slot, key, &expected, deadline)
+                .test_keyslot(slot, key, &expected, deadline, None)
+        }
+
+        fn dump(
+            &mut self,
+            key: &[u8],
+            deadline: Instant,
+        ) -> (Result<Tested, String>, Option<VolumeKey>) {
+            let expected = self.expected.clone();
+            let mut volume = None;
+            let tested =
+                self.host
+                    .machine
+                    .test_keyslot(0, key, &expected, deadline, Some(&mut volume));
+            (tested, volume)
         }
 
         fn ran(&self) -> bool {
@@ -5741,5 +5981,330 @@ mod tests {
         test.host.machine.authority = Some(authority);
         assert_eq!(test.test(0, b"right", later()), Ok(Tested::Opened));
         drop(root);
+    }
+
+    // The requests (DESIGN.md "Storage operation worker", Protector
+    // management).
+
+    fn requesting(
+        proof: Proof,
+        request: DiskRequest,
+        pending: Option<DiskRequest>,
+        step: LoginStep,
+    ) -> Request {
+        managed(Operation::ProtectorRequest {
+            account: 1000,
+            proof,
+            request,
+            pending,
+            step,
+        })
+    }
+
+    /// The last write after root's `13`: the request, key-less, its tag
+    /// under the dumped key over `header`, the header as re-read.
+    fn sealed(run: &Run, header: &Header) -> td_protector::protected::Request {
+        let Some((
+            protected_plan::Step::ImportToken {
+                token: Token::Request(sealed),
+                id: None,
+                replace: false,
+            },
+            input,
+            None,
+        )) = run.protected.last()
+        else {
+            panic!("{:?}", run.protected)
+        };
+        assert!(input.is_empty());
+        let uuid = volume_uuid(UUID).unwrap();
+        let tag = request::tag(
+            &DUMPED,
+            &uuid,
+            sealed.operation,
+            &sealed.nonce,
+            &header.protected,
+        )
+        .unwrap();
+        assert_eq!(sealed.tag, tag);
+        sealed.clone()
+    }
+
+    #[test]
+    fn a_request_dumps_the_proofs_volume_key_then_writes_its_tagged_token() {
+        use td_protector::protected::Operation as Requested;
+        let digits = recovery_digits();
+        let first = requesting(
+            Proof::RecoveryKey,
+            DiskRequest::PinChange,
+            None,
+            LoginStep::RecoveryKey,
+        );
+        let host = Fake::new(Some(Ok(tpm_protected(false))));
+        let run = manage_run(
+            host,
+            &mut Scripted::selecting(0),
+            &first,
+            vec![digits.clone()],
+        );
+        assert_eq!(run.result, Ok(()));
+        assert_eq!(presented(&run.frames), [first]);
+        assert_eq!(run.tested, [(0, digits)]);
+        assert_eq!(run.protected.len(), 1);
+        assert_eq!(
+            sealed(&run, &tpm_protected(false)).operation,
+            Requested::PinChange
+        );
+        // Every keyslot's cost before the first `10`; the dump with the
+        // test; nothing of the key in a frame.
+        assert_eq!(
+            run.log,
+            [
+                "header", "standing", "costed", "header", "test", "dump", "header", "metadata",
+                "write"
+            ]
+        );
+        assert!(!run
+            .frames
+            .iter()
+            .any(|frame| frame.windows(VOLUME_KEY_BYTES).any(|bytes| bytes == DUMPED)));
+        assert_eq!(run.frames.last().unwrap(), &[SUCCESS]);
+    }
+
+    #[test]
+    fn a_request_by_a_security_key_replaces_the_pending_one() {
+        use td_protector::protected::Operation as Requested;
+        let authorize = LoginStep::DiskAuthorize {
+            key: fingerprint(&[7; 16]),
+            retries: 8,
+        };
+        let first = requesting(
+            Proof::DiskKey,
+            DiskRequest::Reenroll,
+            Some(DiskRequest::TpmClear),
+            LoginStep::DiskIdentify,
+        );
+        let host = Fake::new(Some(Ok(tpm_protected(true))));
+        let run = manage_run(
+            host,
+            &mut Scripted::selecting(0),
+            &first,
+            vec![b"1234".to_vec()],
+        );
+        assert_eq!(run.result, Ok(()));
+        assert_eq!(
+            presented(&run.frames),
+            [
+                first,
+                requesting(
+                    Proof::DiskKey,
+                    DiskRequest::Reenroll,
+                    Some(DiskRequest::TpmClear),
+                    authorize
+                )
+            ]
+        );
+        assert_eq!(run.tested, [(2, passphrase(7))]);
+        // The pending request's removal, then the new one.
+        assert_eq!(
+            run.protected[0],
+            (
+                protected_plan::Step::RemoveToken { token: 7 },
+                Vec::new(),
+                None
+            )
+        );
+        assert_eq!(run.protected.len(), 2);
+        assert_eq!(
+            sealed(&run, &tpm_protected(true)).operation,
+            Requested::TpmReenroll
+        );
+    }
+
+    #[test]
+    fn a_request_ends_before_any_write_where_its_dump_cannot_run() {
+        let digits = recovery_digits();
+        let first = requesting(
+            Proof::RecoveryKey,
+            DiskRequest::TpmClear,
+            None,
+            LoginStep::RecoveryKey,
+        );
+        // A keyslot without a bounded cost: `0f` before anything is
+        // presented.
+        let mut host = Fake::new(Some(Ok(tpm_protected(false))));
+        host.costed = Err("keyslot 1 is argon2id".into());
+        let run = manage_run(
+            host,
+            &mut Scripted::selecting(0),
+            &first,
+            vec![digits.clone()],
+        );
+        assert_eq!(run.result, Err(Failure::Failed));
+        assert!(presented(&run.frames).is_empty());
+        assert_eq!(run.frames.last().unwrap(), &[0x15, 0x0f]);
+        assert!(run.tested.is_empty());
+        // A dump that fails after the test passed: `0f`, before `12`.
+        let mut host = Fake::new(Some(Ok(tpm_protected(false))));
+        host.dumped = Err("cryptsetup's volume-key dump failed".into());
+        let run = manage_run(
+            host,
+            &mut Scripted::selecting(0),
+            &first,
+            vec![digits.clone()],
+        );
+        assert_eq!(run.result, Err(Failure::Failed));
+        assert_eq!(run.frames.last().unwrap(), &[0x15, 0x0f]);
+        assert!(!run.frames.iter().any(|frame| frame[0] == COMMIT));
+        assert!(run.protected.is_empty());
+        assert_eq!(run.tested, [(0, digits.clone())]);
+        assert!(run.log.contains(&"dump"));
+        // One past the deadline, as the test's: `08`.
+        let mut host = Fake::new(Some(Ok(tpm_protected(false))));
+        host.dumped = Ok(Tested::Expired);
+        let run = manage_run(
+            host,
+            &mut Scripted::selecting(0),
+            &first,
+            vec![digits.clone()],
+        );
+        assert_eq!(run.result, Err(Failure::Timeout));
+        assert!(run.protected.is_empty());
+        // An `Opened` with no key seals nothing.
+        let mut host = Fake::new(Some(Ok(tpm_protected(false))));
+        host.hands_back = false;
+        let run = manage_run(
+            host,
+            &mut Scripted::selecting(0),
+            &first,
+            vec![digits.clone()],
+        );
+        assert_eq!(run.result, Err(Failure::Internal));
+        assert!(run.protected.is_empty());
+        // A refused test dumps nothing.
+        let mut host = Fake::new(Some(Ok(tpm_protected(false))));
+        host.opens = Ok(Tested::Refused);
+        let run = manage_run(host, &mut Scripted::selecting(0), &first, vec![digits]);
+        assert_eq!(run.result, Err(Failure::WrongKey));
+        assert!(!run.log.contains(&"dump"));
+        assert!(run.protected.is_empty());
+    }
+
+    /// The dump reads the volume key from the tested copy, the proof's key
+    /// on standard input, then the file and the copy go on every path.
+    #[test]
+    fn a_dump_reads_the_volume_key_from_the_tested_copy_then_removes_both() {
+        let mut test = costed_keyslot();
+        let (tested, volume) = test.dump(b"right", later());
+        assert_eq!(tested, Ok(Tested::Opened));
+        assert_eq!(volume.unwrap().expose(), [b'k'; VOLUME_KEY_BYTES]);
+        let argv = std::fs::read_to_string(test.bin.join("dump-argv")).unwrap();
+        let argv: Vec<&str> = argv.lines().collect();
+        let copy = argv.last().unwrap().to_string();
+        assert!(copy.contains(COPY_PREFIX) && copy.ends_with("/header"));
+        let file = copy.replace("/header", &format!("/{VOLUME_KEY_FILE}"));
+        assert_eq!(
+            argv,
+            [
+                "luksDump",
+                "--dump-volume-key",
+                "--batch-mode",
+                "--volume-key-file",
+                &file,
+                "--key-file=-",
+                &copy,
+            ]
+        );
+        test.untouched();
+        // A file one byte short or long is no key, a dump that fails gives
+        // none, and one past the deadline is killed: no key, each time
+        // with the file and the copy gone.
+        for key in [&b"short"[..], b"long", b"undumped"] {
+            let mut test = costed_keyslot();
+            let (tested, volume) = test.dump(key, later());
+            assert!(tested.is_err() && volume.is_none());
+            test.untouched();
+        }
+        let mut test = costed_keyslot();
+        let (tested, volume) = test.dump(b"stalled", Instant::now() + Duration::from_millis(300));
+        assert_eq!(tested, Ok(Tested::Expired));
+        assert!(volume.is_none() && test.bin.join("dump-argv").exists());
+        test.untouched();
+        // A keyslot without a cost in the copied area: nothing runs.
+        let mut test = keyslot();
+        let (tested, volume) = test.dump(b"right", later());
+        assert!(tested.is_err() && volume.is_none() && !test.ran());
+        test.untouched();
+        // A refused test runs no dump.
+        let mut test = costed_keyslot();
+        let (tested, volume) = test.dump(b"wrong", later());
+        assert_eq!(tested, Ok(Tested::Refused));
+        assert!(volume.is_none() && !test.bin.join("dump-argv").exists());
+        test.untouched();
+    }
+
+    /// Two requests under one volume key never share a nonce.
+    #[test]
+    fn each_request_draws_its_own_nonce() {
+        let first = requesting(
+            Proof::RecoveryKey,
+            DiskRequest::TpmClear,
+            None,
+            LoginStep::RecoveryKey,
+        );
+        let nonce = || {
+            let host = Fake::new(Some(Ok(tpm_protected(false))));
+            let run = manage_run(
+                host,
+                &mut Scripted::selecting(0),
+                &first,
+                vec![recovery_digits()],
+            );
+            sealed(&run, &tpm_protected(false)).nonce
+        };
+        assert_ne!(nonce(), nonce());
+    }
+
+    #[test]
+    fn after_its_commit_a_requests_change_writes_nothing() {
+        let first = requesting(
+            Proof::RecoveryKey,
+            DiskRequest::PinChange,
+            None,
+            LoginStep::RecoveryKey,
+        );
+        let mut changed = tpm_protected(false);
+        changed.seqid = 2;
+        let mut host = Fake::new(Some(Ok(tpm_protected(false))));
+        host.reads = vec![
+            Some(Ok(tpm_protected(false))),
+            Some(Ok(tpm_protected(false))),
+            Some(Ok(changed)),
+        ];
+        let run = manage_run(
+            host,
+            &mut Scripted::selecting(0),
+            &first,
+            vec![recovery_digits()],
+        );
+        assert_eq!(run.frames.last().unwrap(), &[0x15, 0x28]);
+        assert!(run.protected.is_empty());
+        // A cut at the pending request's removal, the first write.
+        let mut host = Fake::new(Some(Ok(tpm_protected(true))));
+        host.protected_fails = Some(0);
+        let first = requesting(
+            Proof::RecoveryKey,
+            DiskRequest::TpmClear,
+            Some(DiskRequest::TpmClear),
+            LoginStep::RecoveryKey,
+        );
+        let run = manage_run(
+            host,
+            &mut Scripted::selecting(0),
+            &first,
+            vec![recovery_digits()],
+        );
+        assert_eq!(run.result, Err(Failure::Failed));
+        assert_eq!(run.protected.len(), 1);
     }
 }

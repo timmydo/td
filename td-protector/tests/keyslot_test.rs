@@ -2,7 +2,8 @@
 //! byte-for-byte unchanged, run by the pinned cryptsetup itself
 //! (td-install/DESIGN.md, "Storage operation worker"): cryptsetup repairs
 //! a stale or damaged second copy before it tries a key, and that repair
-//! must land in the copy. Ignored by default, as `header_fit` is: it
+//! must land in the copy. A request's volume-key dump of that copy gives
+//! the volume's key. Ignored by default, as `header_fit` is: it
 //! needs the source-built cryptsetup and the host kernel's AF_ALG hash
 //! and skcipher interfaces.
 //!
@@ -186,4 +187,53 @@ fn a_detached_test_leaves_a_volume_with_a_stale_second_copy_unchanged() {
 #[ignore = "needs TD_TEST_CRYPTSETUP and the kernel's AF_ALG"]
 fn a_detached_test_leaves_a_volume_with_a_damaged_second_copy_unchanged() {
     untouched(true);
+}
+
+/// A request's dump exactly as the storage worker runs it: the tested
+/// header copy as the device, a keyslot's key on standard input, into a
+/// new file beside the copy. It reproduces the key the volume itself
+/// dumps, through either keyslot, and refuses a name that exists.
+#[test]
+#[ignore = "needs TD_TEST_CRYPTSETUP and the kernel's AF_ALG"]
+fn a_dump_of_a_header_copy_gives_the_volumes_key() {
+    let cs = tool();
+    let dir = scratch("dump");
+    let image = volume(&cs, &dir.0, false);
+    let area = luks2::test_area(&mut File::open(&image).unwrap()).unwrap();
+    area.all_costed().unwrap();
+    let length = usize::try_from(area.length).unwrap();
+    let copy = bytes(&image, 0, length);
+    let dump = |device: &Path, file: &Path, key: &[u8]| {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        cs.run_bounded(
+            &cryptsetup::dump_volume_key_args(device, file),
+            key,
+            deadline,
+            &mut || false,
+        )
+        .unwrap()
+    };
+    let succeeded = |ended: Bounded| matches!(ended, Bounded::Exited(status) if status.success());
+    // The volume's own key, its copy as read before: this dump repairs
+    // the stale second copy on the image.
+    let whole = dir.0.join("whole");
+    assert!(succeeded(dump(&image, &whole, RECOVERY)));
+    let expected = fs::read(&whole).unwrap();
+    assert_eq!(expected.len(), 64);
+    let header = dir.0.join("header");
+    let file = dir.0.join("volume-key");
+    for (slot, key) in [(0, RECOVERY), (FIDO_SLOT, &FIDO_KEY[..])] {
+        // The copy as the worker leaves it: tested, and repaired, first.
+        fs::write(&header, &copy).unwrap();
+        assert!(succeeded(test(&cs, &header, &image, slot, key)));
+        assert!(succeeded(dump(&header, &file, key)));
+        assert_eq!(fs::read(&file).unwrap(), expected);
+        fs::remove_file(&file).unwrap();
+    }
+    // A wrong key writes nothing; an existing name is left as it was.
+    assert!(!succeeded(dump(&header, &file, &[0; 32])));
+    assert!(!file.exists());
+    fs::write(&file, b"x").unwrap();
+    assert!(!succeeded(dump(&header, &file, RECOVERY)));
+    assert_eq!(fs::read(&file).unwrap(), b"x");
 }
