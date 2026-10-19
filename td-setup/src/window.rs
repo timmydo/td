@@ -17,6 +17,7 @@ use td_install::installation_plan::{Destination, Plan, Settings, Storage};
 
 use td_ui::client::{run, App, Client, Handled, KeyboardEvent, Tag};
 use td_ui::font::Font;
+use td_ui::keyboard::Stroke;
 use td_ui::keys::{self, Overlay, Section, Step};
 use td_ui::pointer;
 use td_ui::raster::{Composition, Draw, Primitive, Raster, Scale, Surface, CHROME};
@@ -67,6 +68,8 @@ struct Window {
     front: Front,
     /// The boot evidence, when the command line asks for it.
     proof: Option<Proof>,
+    /// The turn loop's time before the event in hand, for arming repeat.
+    clock: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1128,9 +1131,26 @@ impl Front {
     }
 }
 
-fn keyboard_chord(event: KeyboardEvent) -> Result<Option<String>> {
+/// Whether a held key repeats `chord` on a page: moving through a list,
+/// the form or a page of detail, and deleting or typing text, a space
+/// included. Return, Escape and the window's own chords act once a press,
+/// so holding one never advances, leaves or asks the service anything
+/// twice. A key repeats while held whether or not its page moves.
+fn repeats(chord: &str) -> bool {
+    let mut chars = chord.chars();
+    matches!(
+        chord,
+        "Up" | "Down" | "Left" | "Right" | "PageUp" | "PageDown" | "Backspace" | "Delete"
+    ) || matches!(
+        (chars.next(), chars.next()),
+        (Some(typed), None) if typed == ' ' || typed.is_ascii_graphic()
+    )
+}
+
+/// A translated press: its key, for arming repeat, and its stroke.
+fn keyboard_chord(event: KeyboardEvent) -> Result<Option<(u32, Stroke)>> {
     match event {
-        KeyboardEvent::Key { stroke, .. } => Ok(Some(stroke.chord)),
+        KeyboardEvent::Key { key, stroke, .. } => Ok(Some((key, stroke))),
         KeyboardEvent::Keymap(Err(detail)) => Err(format!("keyboard keymap: {detail}")),
         _ => Ok(None),
     }
@@ -1148,6 +1168,7 @@ impl Window {
             dirty: true,
             front: Front::new(),
             proof: proof.then(Proof::default),
+            clock: 0,
         })
     }
 
@@ -1182,7 +1203,7 @@ impl Window {
     }
 
     fn event(&mut self, message: Message) -> Result<()> {
-        match self.client.handle(&message, 0)? {
+        match self.client.handle(&message, self.clock)? {
             Handled::Done => Ok(()),
             Handled::FrameDone => {
                 if let Some(proof) = self.proof.as_mut() {
@@ -1228,7 +1249,7 @@ impl Window {
             | Handled::SeatRemoved => Err("installer keyboard is unavailable".into()),
             // Only translated keyboard presses navigate the live pages.
             Handled::Keyboard(event) => match keyboard_chord(event)? {
-                Some(chord) => self.chord(chord),
+                Some((key, stroke)) => self.press(key, stroke),
                 None => Ok(()),
             },
             Handled::Pointer(event) => {
@@ -1261,35 +1282,54 @@ impl Window {
             ..
         } = event
         {
+            // A key held through the press stops repeating, so it
+            // reaches no page once the list is gone.
             if self.key_list.press() != Step::Kept {
+                self.client.cancel_repeat();
                 self.dirty = true;
             }
         }
     }
 
+    /// A translated press: its chord, and repeat armed for `key` at the
+    /// turn's clock when the keymap repeats the key and the chord may.
+    fn press(&mut self, key: u32, stroke: Stroke) -> Result<()> {
+        let held = stroke.repeat;
+        if self.chord(stroke.chord)? && held && !self.client.closed() {
+            self.client.arm(key, self.clock);
+        }
+        Ok(())
+    }
+
     /// A chord from the seat's keyboard. The theme chord is the window's,
     /// never a page's, and asks the service for nothing; so is
     /// `keys::CHORD`, which opens the key list, and while that is open it
-    /// takes every other chord and no page hears one.
-    fn chord(&mut self, chord: String) -> Result<()> {
+    /// takes every other chord and no page hears one. True when a held
+    /// key may repeat the chord: the list's while it scrolls, a page's
+    /// for the keys `repeats` names.
+    fn chord(&mut self, chord: String) -> Result<bool> {
+        let mut repeat = false;
         if chord == td_ui::theme::CHORD {
             if let Err(why) = self.theme.advance() {
                 let _ = writeln!(std::io::stderr(), "td-setup: {why}");
             }
         } else if self.key_list.is_open() {
             let surface = self.surface()?;
-            if self.key_list.key(&chord, surface) == Step::Kept {
-                return Ok(());
+            match self.key_list.key(&chord, surface) {
+                Step::Kept => return Ok(false),
+                Step::Moved => repeat = true,
+                Step::Closed => {}
             }
         } else if chord == keys::CHORD {
             let surface = self.surface()?;
             self.key_list
                 .open(self.front.wizard.key_sections(), surface);
         } else {
+            repeat = repeats(&chord);
             self.front.key(&chord, Path::new(SOCKET));
         }
         self.dirty = true;
-        Ok(())
+        Ok(repeat)
     }
 
     fn draw(&mut self) -> Result<()> {
@@ -1483,7 +1523,8 @@ impl App for Window {
 
     fn descriptor_wait(&mut self) {}
 
-    fn tick(&mut self, _now: u64) -> Result<()> {
+    fn tick(&mut self, now: u64) -> Result<()> {
+        self.clock = now;
         self.receive();
         Ok(())
     }
@@ -1495,13 +1536,29 @@ impl App for Window {
     /// Every turn ends here, idle or not, so an answer arriving while
     /// nothing else happens is still shown within a turn. A status sent
     /// from an answer counts its interval from this turn.
-    fn end_turn(&mut self, now: u64, _idle: bool) -> Result<()> {
+    fn end_turn(&mut self, now: u64, idle: bool) -> Result<()> {
         self.front.now = now;
         self.receive();
         if self.front.wizard.executing.is_some() {
             self.front.poll(now);
         }
         self.say();
+        // Queued releases and focus changes have settled; a repeat that
+        // no longer applies stops, and the next press arms another.
+        if idle && !self.client.closed() {
+            if let Some(stroke) = self.client.repeat(now)? {
+                // Only a list still open or a key `repeats` names hears
+                // the clock; any other stroke is never delivered twice.
+                let open = self.key_list.is_open();
+                if !(open || repeats(&stroke.chord)) || !self.chord(stroke.chord)? {
+                    self.client.cancel_repeat();
+                }
+            }
+        }
+        let wait = self.client.wait_ms(now);
+        self.client
+            .connection()
+            .set_wait(std::time::Duration::from_millis(wait));
         Ok(())
     }
 
@@ -1604,10 +1661,10 @@ mod tests {
         assert_eq!(wizard.page, Page::Refused("the installer service is busy"));
         assert_eq!(wizard.key("Escape"), Action::None);
         assert_eq!(wizard.page, Page::Welcome);
-        assert_eq!(
+        assert!(matches!(
             keyboard_chord(KeyboardEvent::Keymap(Err("bad map".into()))),
-            Err("keyboard keymap: bad map".into())
-        );
+            Err(why) if why == "keyboard keymap: bad map"
+        ));
     }
 
     /// A wizard listing `vda` and `vdb`.
@@ -3200,6 +3257,127 @@ mod tests {
         // Closed, the page has its keys again.
         window.chord("Down".into()).unwrap();
         assert_eq!(window.front.wizard.selected, Some(0));
+    }
+
+    #[test]
+    fn held_keys_repeat_movement_and_typing_but_never_a_step() {
+        for chord in [
+            "Up",
+            "Down",
+            "Left",
+            "Right",
+            "PageUp",
+            "PageDown",
+            "Backspace",
+            "Delete",
+            "a",
+            "7",
+            "-",
+            " ",
+        ] {
+            assert!(repeats(chord), "{chord}");
+        }
+        for chord in [
+            "Return", "Escape", "Tab", "S-Tab", "Home", "End", "F1", "F12", "C-a", "ab", "\t", "",
+        ] {
+            assert!(!repeats(chord), "{chord}");
+        }
+        let (mut window, _peer) = window();
+        window.front.wizard = listed();
+        assert!(window.chord("Down".into()).unwrap());
+        assert!(!window.chord("Return".into()).unwrap());
+        // The key list repeats only while it scrolls, and a key that
+        // closes it repeats nowhere.
+        window.chord("Escape".into()).unwrap();
+        assert!(!window.chord(keys::CHORD.into()).unwrap());
+        assert!(window.chord("Down".into()).unwrap());
+        assert!(!window.chord("Return".into()).unwrap());
+        assert!(!window.chord("q".into()).unwrap());
+        assert!(!window.key_list.is_open());
+        assert!(!window.chord(td_ui::theme::CHORD.into()).unwrap());
+    }
+
+    /// The few keys the repeat test presses, in the compositor's keymap
+    /// form: q, Return, j and Down, at evdev codes 16, 28, 36 and 108.
+    const KEYMAP: &str = "xkb_keymap {\n\
+        xkb_keycodes \"t\" {\n\
+        minimum = 8;\n\
+        maximum = 255;\n\
+        <AD01> = 24; <RTRN> = 36; <AC07> = 44; <DOWN> = 116;\n\
+        };\n\
+        xkb_types \"t\" {\n\
+        type \"ONE_LEVEL\" {\n\
+        modifiers = none;\n\
+        level_name[Level1] = \"Base\";\n\
+        };\n\
+        };\n\
+        xkb_compatibility \"t\" {\n\
+        };\n\
+        xkb_symbols \"t\" {\n\
+        key <AD01> { [ q ] };\n\
+        key <RTRN> { [ Return ] };\n\
+        key <AC07> { [ j ] };\n\
+        key <DOWN> { [ Down ] };\n\
+        };\n\
+        };\n";
+
+    /// Presses `key` at `now` as the seat would: translated by the
+    /// client's keymap, then through the window's own press path.
+    fn press(window: &mut Window, key: u32, now: u64) {
+        window.clock = now;
+        let stroke = window.client.input_mut().key(key, true).unwrap().unwrap();
+        window.press(key, stroke).unwrap();
+    }
+
+    #[test]
+    fn a_held_key_repeats_on_idle_turns_until_released_or_the_list_closes() {
+        let (mut window, _peer) = window();
+        let input = window.client.input_mut();
+        input.map = Some(td_ui::keyboard::Keymap::parse(KEYMAP).unwrap());
+        input.focus(&[], true).unwrap();
+        input.modifiers(td_ui::keyboard::Modifiers::default());
+        input.timing(25, 600, 0).unwrap();
+        window.front.wizard = listed();
+        press(&mut window, 108, 0);
+        assert_eq!(window.front.wizard.selected, Some(0));
+        // Not before the delay, and not on a turn whose queue was full.
+        window.end_turn(599, true).unwrap();
+        window.end_turn(600, false).unwrap();
+        assert_eq!(window.front.wizard.selected, Some(0));
+        window.end_turn(600, true).unwrap();
+        assert_eq!(window.front.wizard.selected, Some(1));
+        // Held at the list's end it still repeats, moving nothing.
+        window.end_turn(640, true).unwrap();
+        assert_eq!(window.front.wizard.selected, Some(1));
+        window.client.input_mut().key(108, false).unwrap();
+        window.end_turn(5000, true).unwrap();
+        assert!(window.client.repeat(10_000).unwrap().is_none());
+        // Return arms nothing, so holding it asks for nothing twice.
+        window.front.wizard = listed();
+        press(&mut window, 28, 6000);
+        assert!(window.client.repeat(10_000).unwrap().is_none());
+        window.client.input_mut().key(28, false).unwrap();
+        // A reading key scrolling the key list repeats; a click closing
+        // the list stops it, so nothing reaches the page under it.
+        window.front.wizard = listed();
+        window.chord(keys::CHORD.into()).unwrap();
+        press(&mut window, 36, 11_000);
+        assert_eq!(window.key_list.help().first(), 1);
+        window.pointer(pointer::Event::Button {
+            serial: 2,
+            button: BUTTON_LEFT,
+            pressed: true,
+        });
+        assert!(!window.key_list.is_open());
+        window.end_turn(20_000, true).unwrap();
+        assert_eq!(window.front.wizard.selected, None);
+        assert!(window.client.repeat(30_000).unwrap().is_none());
+        // q closes the open list on its press and repeats nowhere.
+        window.client.input_mut().key(36, false).unwrap();
+        window.chord(keys::CHORD.into()).unwrap();
+        press(&mut window, 16, 31_000);
+        assert!(!window.key_list.is_open());
+        assert!(window.client.repeat(40_000).unwrap().is_none());
     }
 
     #[test]

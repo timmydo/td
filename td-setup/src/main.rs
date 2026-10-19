@@ -29,6 +29,8 @@ const HELP: &str = concat!(
     "On any page F1 shows these keys over it until F1, q, Escape or a\n",
     "click (the window ignores the pointer otherwise), and\n",
     "F12 moves the window to the next colour theme and keeps it.\n",
+    "Held, the arrows, PageUp, PageDown, Backspace, Delete and typed\n",
+    "characters repeat; Return, Escape and the rest act once a press.\n",
     "When the boot's command line holds td.setup-input=1 it also says, on\n",
     "standard error, each page state it showed while holding the keyboard.\n",
     "--preview writes the welcome page as a PPM image to stdout.\n",

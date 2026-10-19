@@ -127,6 +127,19 @@ theme chord, moves it to the next for the wizard's run (td-ui/DESIGN.md,
 "Themes"): it runs without a home, so it reads and keeps no theme file.
 The window takes F12 before any page does, so it asks the service nothing,
 and the headless renders paint in `SAND`.
+A held key repeats at the delay and rate the compositor's keyboard
+announces, through td-ui's repeat (td-ui/DESIGN.md), only where moving
+or typing is what it repeats: Up, Down, Left, Right, PageUp, PageDown,
+Backspace, Delete and a typed character, space included, on any page,
+and the key list's reading keys while they scroll it. On a page Return,
+Escape, Tab, Home, End, F1 and F12 act once a press, so a held key never
+advances or leaves a step or asks the service anything twice. A page's
+key repeats while held whether or not the page moves, as at a list's
+end. A key that closes the key list, or one held through the click that
+closes it, stops repeating, so it never reaches the page under the
+list. A repeat fires only at the end of a turn whose queue drained,
+after any release or focus change queued before it, and only for a
+chord the list or the page still repeats.
 F1, td-ui's key list chord, is the window's too (td-ui/DESIGN.md, "Key
 list"): it opens the list of the pages' keys over the page, the shown
 page's first (with the time zone row focused, its keys and then the
