@@ -328,6 +328,7 @@ fn scripted_worker() {
             w.hold();
         }
         proof if proof.starts_with("proof-") => proof_script(w, proof),
+        protector if protector.starts_with("protector-") => protector_script(w, protector),
         // Holds the channel it inherited, then ends.
         "linger" => thread::sleep(Duration::from_millis(300)),
         "linger-long" => thread::sleep(Duration::from_millis(1500)),
@@ -571,7 +572,10 @@ fn drive(storage: &mut Storage) -> (Event, Vec<Request>) {
             }
             Event::Commit(request) => storage.commit(&request).unwrap(),
             Event::Pin(request) => {
-                assert!(storage.pin(&request, Pin::new(b"1234").unwrap()).unwrap());
+                let secret = secret_of(&request).unwrap();
+                assert!(storage
+                    .pin(&request, Pin::entry(&secret[1..]).unwrap())
+                    .unwrap());
             }
             Event::Waiting => thread::sleep(Duration::from_millis(1)),
             event => return (event, presented),
@@ -731,7 +735,7 @@ fn a_late_receipt_ends_the_operation_and_a_stale_one_is_dropped() {
 }
 
 #[test]
-fn operation_bytes_one_to_three_are_the_selections_this_build_runs() {
+fn operation_bytes_one_to_six_are_the_selections_this_build_runs() {
     assert_eq!(Selection::decode(&[1]), Ok(Selection::SelectorUpdate));
     for (shape, byte, counts) in [
         (UpgradeShape::Tpm, 1, 0..=2),
@@ -745,10 +749,29 @@ fn operation_bytes_one_to_three_are_the_selections_this_build_runs() {
         }
     }
     assert_eq!(Selection::decode(&[3]), Ok(Selection::UpgradeCancel));
-    for byte in 4..=0x0a {
-        assert_eq!(Selection::decode(&[byte]), Ok(Selection::Later(byte)));
-        assert!(!Selection::Later(byte).runs());
-        assert!(Storage::start(1000, Selection::Later(byte)).is_err());
+    // Protector management with its operands; the requests and
+    // Secure Boot enrollment are refused by this build.
+    let request = |request| {
+        Selection::Protector(Managed::Request {
+            proof: Proof::RecoveryKey,
+            request,
+        })
+    };
+    for (bytes, selection, runs) in [
+        (&[4, 1, 2][..], Selection::Protector(ADD), true),
+        (&[4, 2, 2], Selection::Protector(ADD_BY_KEY), true),
+        (&[5, 2], Selection::Protector(REMOVE), true),
+        (&[6], Selection::Protector(Managed::RecoveryRemove), true),
+        (&[7, 1], request(DiskRequest::PinChange), false),
+        (&[8, 1], request(DiskRequest::TpmClear), false),
+        (&[9, 1], request(DiskRequest::Reenroll), false),
+        (&[0x0a], Selection::Later(0x0a), false),
+    ] {
+        assert_eq!(Selection::decode(bytes), Ok(selection), "{bytes:?}");
+        assert_eq!(selection.runs(), runs, "{bytes:?}");
+        if !runs {
+            assert!(Storage::start(1000, selection).is_err());
+        }
     }
     // A shape or count outside its range, a missing operand and a
     // trailing byte.
@@ -767,6 +790,23 @@ fn operation_bytes_one_to_three_are_the_selections_this_build_runs() {
         &[2, 2, 3],
         &[2, 1, 0, 0],
         &[3, 0],
+        &[4],
+        &[4, 1],
+        &[4, 0, 1],
+        &[4, 3, 1],
+        &[4, 1, 0],
+        &[4, 1, 3],
+        &[4, 1, 1, 0],
+        &[5],
+        &[5, 0],
+        &[5, 3],
+        &[5, 1, 0],
+        &[6, 0],
+        &[7],
+        &[8, 0],
+        &[9, 3],
+        &[9, 1, 0],
+        &[0x0a, 0],
     ] {
         assert!(Selection::decode(bad).is_err(), "{bad:?}");
     }
@@ -1039,4 +1079,600 @@ fn recovered_until_pin(w: &mut Worker, recovery: &Request) {
     w.send(&proof_baseline(3, true, &[(1, T)]));
     assert_eq!(&Request::decode(&w.read()).unwrap(), recovery);
     w.invite(0x10, recovery);
+}
+
+/// The secret frame root forwards for `step`: the recovery key, a choose
+/// step's digit `1`, or a PIN.
+fn secret_of(step: &Request) -> Option<Vec<u8>> {
+    use crate::proof::tests::RECOVERY;
+    let mut frame = vec![0x16];
+    if step.asks_recovery_key() {
+        frame.extend_from_slice(RECOVERY);
+    } else if step.protector_step() == Some(LoginStep::Choose) {
+        frame.push(b'1');
+    } else if step.ceremony_step().is_some_and(LoginStep::asks_pin) {
+        frame.extend_from_slice(b"1234");
+    } else {
+        return None;
+    }
+    Some(frame)
+}
+
+const P: [u8; 4] = [0x51; 4];
+const Q: [u8; 4] = [0x52; 4];
+const R: [u8; 4] = [0x53; 4];
+/// An orphan's: a fido2 token naming no keyslot.
+const O: [u8; 4] = [0x54; 4];
+/// The credential an addition's ceremony creates.
+const N: [u8; 4] = [0x0e; 4];
+
+const ADD: Managed = Managed::Add {
+    proof: Proof::RecoveryKey,
+    role: DiskRole::Recovery,
+};
+const ADD_BY_KEY: Managed = Managed::Add {
+    proof: Proof::DiskKey,
+    role: DiskRole::Recovery,
+};
+const REMOVE: Managed = Managed::Remove {
+    proof: Proof::DiskKey,
+};
+
+/// A protected baseline: the volume byte, the marker, each fido2 token's
+/// role, keyslot byte and fingerprint, the tpm-pin count and the lockout,
+/// no request, and the standing.
+fn protected_frame(
+    volume: u8,
+    marker: bool,
+    tokens: &[(u8, u8, [u8; 4])],
+    tpm_pins: u8,
+    lockout: bool,
+) -> Vec<u8> {
+    let mut frame = vec![0x18, volume, u8::from(marker), tokens.len() as u8];
+    for (role, named, key) in tokens {
+        frame.extend([*role, *named]);
+        frame.extend_from_slice(key);
+    }
+    frame.extend([tpm_pins, u8::from(lockout), 0, 0]);
+    frame.extend_from_slice(&ID);
+    frame
+}
+
+/// The TPM shape: a recovery key on a keyslot beside an orphan, a tpm-pin
+/// token and the lockout.
+fn tpm_volume() -> Vec<u8> {
+    protected_frame(3, true, &[(2, 1, R), (2, 0, O)], 1, true)
+}
+
+/// The FIDO2 shape: two primary keys and a recovery key.
+fn fido_volume() -> Vec<u8> {
+    protected_frame(4, true, &[(1, 1, P), (1, 1, Q), (2, 1, R)], 0, false)
+}
+
+fn described(operation: Operation) -> Request {
+    Request::new(NONCE, 1000, operation).unwrap()
+}
+
+fn adding(proof: Proof, step: LoginStep) -> Request {
+    described(Operation::ProtectorAdd {
+        account: 1000,
+        proof,
+        role: DiskRole::Recovery,
+        step,
+    })
+}
+
+/// An addition by the recovery key, every step in its order.
+fn addition() -> Vec<Request> {
+    [
+        LoginStep::RecoveryKey,
+        LoginStep::Connect,
+        LoginStep::Create { retries: 8 },
+        LoginStep::Prove { key: N, retries: 8 },
+        LoginStep::Repeat { key: N, retries: 7 },
+        LoginStep::Probe { key: N },
+    ]
+    .map(|step| adding(Proof::RecoveryKey, step))
+    .to_vec()
+}
+
+fn removing(chosen: u8, step: LoginStep) -> Request {
+    removing_by(Proof::DiskKey, &fido_volume(), chosen, step)
+}
+
+/// A removal by `proof` over `volume`'s list.
+fn removing_by(proof: Proof, volume: &[u8], chosen: u8, step: LoginStep) -> Request {
+    let mut removal = baseline(volume).unwrap().protected.unwrap().removal();
+    removal.chosen = chosen;
+    described(Operation::ProtectorRemove {
+        account: 1000,
+        proof,
+        removal,
+        step,
+    })
+}
+
+/// The FIDO2 shape without the marker: one primary key, which no
+/// removal may take, and two recovery keys.
+fn unmarked_volume() -> Vec<u8> {
+    protected_frame(4, false, &[(1, 1, P), (2, 1, Q), (2, 1, R)], 0, false)
+}
+
+/// A removal of the first primary key by the second.
+fn removal() -> Vec<Request> {
+    vec![
+        removing(0, LoginStep::Choose),
+        removing(1, LoginStep::DiskIdentify),
+        removing(1, LoginStep::DiskAuthorize { key: Q, retries: 8 }),
+    ]
+}
+
+fn recovery_removing(step: LoginStep, keyed: bool) -> Request {
+    described(Operation::RecoveryRemove {
+        account: 1000,
+        step,
+        approval: keyed.then(approval),
+    })
+}
+
+/// The recovery key's removal: tag 21's identify step with its key, then
+/// the first primary key's authorize step.
+fn recovery_removal() -> Vec<Request> {
+    vec![
+        recovery_removing(LoginStep::DiskIdentify, true),
+        recovery_removing(LoginStep::DiskAuthorize { key: P, retries: 8 }, false),
+    ]
+}
+
+/// Each step presented in turn, with the secret root forwards for it.
+fn walk(w: &mut Worker, steps: &[Request]) {
+    for step in steps {
+        w.invite(0x10, step);
+        if let Some(secret) = secret_of(step) {
+            assert_eq!(w.read(), secret);
+        }
+    }
+}
+
+/// The storage worker's side of protector management's tests:
+/// `protector-baseline:NAME`, or an addition's, a removal's or a
+/// recovery-key removal's script.
+fn protector_script(w: &mut Worker, script: &str) {
+    let rest = script.trim_start_matches("protector-");
+    if let Some(name) = rest.strip_prefix("baseline:") {
+        let frame = match name {
+            "none" => baseline_frame(0, &[], true),
+            "device-bound" => baseline_frame(1, &[], true),
+            "upgrading" => baseline_frame(2, &[], true),
+            "tpm" => tpm_volume(),
+            "fido-unmarked" => {
+                let mut frame = fido_volume();
+                frame[2] = 0;
+                frame
+            }
+            other => panic!("unknown protector baseline {other}"),
+        };
+        w.send(&frame);
+        return w.hold();
+    }
+    let (volume, steps) = if rest == "add-key" {
+        let authorize = LoginStep::DiskAuthorize { key: R, retries: 8 };
+        let mut steps = vec![
+            adding(Proof::DiskKey, LoginStep::DiskIdentify),
+            adding(Proof::DiskKey, authorize),
+        ];
+        steps.extend(
+            addition()
+                .iter()
+                .skip(1)
+                .map(|step| adding(Proof::DiskKey, step.protector_step().unwrap())),
+        );
+        (tpm_volume(), steps)
+    } else if rest.starts_with("add") {
+        (tpm_volume(), addition())
+    } else if rest == "remove-recovery" {
+        let volume = fido_volume();
+        let steps = vec![
+            removing_by(Proof::RecoveryKey, &volume, 0, LoginStep::Choose),
+            removing_by(Proof::RecoveryKey, &volume, 1, LoginStep::RecoveryKey),
+        ];
+        (volume, steps)
+    } else if rest == "remove-unmarked-hold" {
+        let volume = unmarked_volume();
+        let steps = vec![removing_by(Proof::DiskKey, &volume, 0, LoginStep::Choose)];
+        (volume, steps)
+    } else if rest.starts_with("remove") {
+        (fido_volume(), removal())
+    } else if rest == "orphan" {
+        (
+            tpm_volume(),
+            vec![adding(Proof::DiskKey, LoginStep::DiskIdentify)],
+        )
+    } else {
+        (fido_volume(), recovery_removal())
+    };
+    w.send(&volume);
+    assert_eq!(Request::decode(&w.read()).unwrap(), steps[0]);
+    let last = steps.last().unwrap().clone();
+    // Presents `request` out of root's order, then holds.
+    let stray = |w: &mut Worker, tag, request: &Request| {
+        let frame = w.frame(tag, request);
+        w.send(&frame);
+        w.hold();
+    };
+    match rest {
+        "add" | "add-key" | "remove" | "remove-recovery" | "recovery-remove" => {
+            walk(w, &steps);
+            w.invite(0x12, &last);
+            w.send(&[0x14]);
+        }
+        "add-uncertain" | "add-changed" => {
+            walk(w, &steps);
+            w.invite(0x12, &last);
+            w.send(&[0x15, if rest == "add-uncertain" { 0x0e } else { 0x28 }]);
+        }
+        "add-excluded" => {
+            walk(w, &steps[..3]);
+            w.send(&[0x15, 0x11]);
+            w.hold();
+        }
+        // A new key's own kinds: a wrong PIN at its create step and an
+        // unselected probe.
+        "add-wrong-pin" | "add-unprobed" => {
+            let (shown, frame) = if rest == "add-wrong-pin" {
+                (3, &[0x15, 0x01, 7])
+            } else {
+                (6, &[0x15, 0x06, 0x06])
+            };
+            walk(w, &steps[..shown]);
+            w.send(frame);
+            w.hold();
+        }
+        "add-excluded-early" | "add-mistyped" | "add-uncertain-early" => {
+            walk(w, &steps[..1]);
+            w.send(&[
+                0x15,
+                match rest {
+                    "add-excluded-early" => 0x11,
+                    "add-mistyped" => 0x25,
+                    _ => 0x0e,
+                },
+            ]);
+            w.hold();
+        }
+        "add-hold" | "remove-hold" | "remove-unmarked-hold" | "recovery-remove-hold" => {
+            stray(w, 0x10, &steps[0])
+        }
+        "remove-authorize-hold" => {
+            walk(w, &steps[..2]);
+            stray(w, 0x10, &steps[2]);
+        }
+        // Kinds before the proof's first step: at root's description, at
+        // the choose step, and the chosen key's outside a removal.
+        "add-kind-at-description" => {
+            w.send(&[0x15, 0x26]);
+            w.hold();
+        }
+        "remove-kind-at-choose" | "remove-chosen-at-choose" => {
+            walk(w, &steps[..1]);
+            w.send(if rest == "remove-kind-at-choose" {
+                &[0x15, 0x25]
+            } else {
+                &[0x15, 0x04, 0x01]
+            });
+            w.hold();
+        }
+        "add-chosen" => {
+            walk(w, &steps[..1]);
+            w.send(&[0x15, 0x04, 0x01]);
+            w.hold();
+        }
+        "remove-chosen" => {
+            walk(w, &steps[..2]);
+            w.send(&[0x15, 0x04, 0x01]);
+            w.hold();
+        }
+        // Out of root's order: a position the digit did not name, the
+        // chosen key authorizing, an early commit, a new key naming a
+        // protector's credential, a description root did not give, and
+        // an orphan's key.
+        "remove-unchosen" => {
+            walk(w, &steps[..1]);
+            stray(w, 0x10, &removing(2, LoginStep::DiskIdentify));
+        }
+        "remove-authorize-chosen" => {
+            walk(w, &steps[..2]);
+            let chosen = LoginStep::DiskAuthorize { key: P, retries: 8 };
+            stray(w, 0x10, &removing(1, chosen));
+        }
+        "remove-early-commit" => {
+            walk(w, &steps[..2]);
+            stray(w, 0x12, &steps[1]);
+        }
+        "add-reuses" => {
+            walk(w, &steps[..3]);
+            let reused = LoginStep::Prove { key: R, retries: 8 };
+            stray(w, 0x10, &adding(Proof::RecoveryKey, reused));
+        }
+        "changed-description" => stray(w, 0x10, &removal()[0]),
+        "orphan" => {
+            walk(w, &steps);
+            let orphan = LoginStep::DiskAuthorize { key: O, retries: 8 };
+            stray(w, 0x10, &adding(Proof::DiskKey, orphan));
+        }
+        _ => panic!("unknown protector script {script}"),
+    }
+}
+
+fn managing(managed: Managed, script: &str) -> Storage {
+    Storage::scripted_as(Selection::Protector(managed), true, script).unwrap()
+}
+
+/// Polls until root presents its first step, unacknowledged.
+fn first_presented(storage: &mut Storage) -> Request {
+    let until = Instant::now() + Duration::from_secs(10);
+    loop {
+        match storage.poll().unwrap() {
+            Event::Present(request) => return request,
+            Event::Waiting => thread::sleep(Duration::from_millis(1)),
+            event => panic!("unexpected {event:?}"),
+        }
+        assert!(Instant::now() < until);
+    }
+}
+
+#[test]
+fn a_protected_baseline_gives_the_volume_protector_management_reads() {
+    let parsed = baseline(&tpm_volume()).unwrap();
+    assert_eq!(parsed.tokens, [R, O]);
+    assert_eq!(
+        parsed.protected,
+        Some(Protected {
+            shape: UpgradeShape::Tpm,
+            marker: true,
+            tpm_pin: true,
+            lockout: true,
+            request: None,
+            tokens: vec![
+                (DiskRole::Recovery, true, R),
+                (DiskRole::Recovery, false, O)
+            ],
+        })
+    );
+    // The request byte, after the tokens, the tpm-pin count and the
+    // lockout.
+    let mut pending = tpm_volume();
+    pending[18] = 2;
+    assert_eq!(
+        baseline(&pending).unwrap().protected.unwrap().request,
+        Some(DiskRequest::TpmClear)
+    );
+    let fido = baseline(&fido_volume()).unwrap().protected.unwrap();
+    assert_eq!(fido.shape, UpgradeShape::Fido2);
+    assert!(!fido.tpm_pin && !fido.lockout);
+    // Only a protected volume has one.
+    for volume in [0, 1, 2, 5] {
+        assert_eq!(
+            baseline(&baseline_frame(volume, &[], true))
+                .unwrap()
+                .protected,
+            None
+        );
+    }
+}
+
+/// Amendment 10: each step admitted as root derives it, every secret
+/// forwarded, the commit naming the last step and success on a clean
+/// exit.
+#[test]
+fn protector_management_presents_each_step_then_commits() {
+    for (managed, script, steps) in [
+        (ADD, "protector-add", addition()),
+        (REMOVE, "protector-remove", removal()),
+        (
+            Managed::RecoveryRemove,
+            "protector-recovery-remove",
+            recovery_removal(),
+        ),
+    ] {
+        let mut storage = managing(managed, script);
+        let (event, presented) = drive(&mut storage);
+        assert_eq!(event, Event::Complete, "{script}");
+        assert_eq!(presented, steps, "{script}");
+        assert!(storage.child.is_none() && storage.wire.is_none());
+    }
+    // An addition by a disk key, and a removal by the recovery key, whose
+    // recovery-key step is its last.
+    for (managed, script, count) in [
+        (ADD_BY_KEY, "protector-add-key", 7),
+        (
+            Managed::Remove {
+                proof: Proof::RecoveryKey,
+            },
+            "protector-remove-recovery",
+            2,
+        ),
+    ] {
+        let mut storage = managing(managed, script);
+        let (event, presented) = drive(&mut storage);
+        assert_eq!(event, Event::Complete, "{script}");
+        assert_eq!(presented.len(), count, "{script}");
+        assert!(storage.child.is_none() && storage.wire.is_none());
+    }
+    // Root's ceiling is the selection's, and only tag 21's first step
+    // waits for a typed key.
+    let mut storage = managing(ADD, "protector-add-hold");
+    assert!(storage.deadline > Instant::now() + Duration::from_secs(350));
+    first_presented(&mut storage);
+    assert!(storage.acknowledgement_deadline.unwrap() < storage.deadline);
+    let mut storage = managing(Managed::RecoveryRemove, "protector-recovery-remove-hold");
+    first_presented(&mut storage);
+    assert_eq!(storage.acknowledgement_deadline, Some(storage.deadline));
+}
+
+#[test]
+fn protector_management_refuses_from_the_baseline_before_any_description() {
+    for (managed, script, end) in [
+        (ADD, "protector-baseline:none", ended(false, VOLUME)),
+        (ADD, "protector-baseline:device-bound", ended(false, STATE)),
+        (REMOVE, "protector-baseline:upgrading", ended(false, STATE)),
+        (
+            Managed::Add {
+                proof: Proof::RecoveryKey,
+                role: DiskRole::Primary,
+            },
+            "protector-baseline:tpm",
+            detailed(STATE, 1),
+        ),
+        (
+            Managed::RecoveryRemove,
+            "protector-baseline:tpm",
+            detailed(STATE, 2),
+        ),
+        (ADD, "protector-baseline:fido-unmarked", detailed(STATE, 0)),
+    ] {
+        let mut storage = managing(managed, script);
+        let (event, presented) = drive(&mut storage);
+        assert_eq!(event, end, "{script}");
+        assert!(presented.is_empty() && storage.request.is_none());
+        assert!(storage.child.is_none());
+    }
+}
+
+#[test]
+fn protector_managements_kinds_stand_where_a_disk_proofs_do() {
+    for (managed, script, end, shown) in [
+        (ADD, "protector-add-excluded", ended(false, EXCLUDED), 3),
+        (ADD, "protector-add-wrong-pin", detailed(0x01, 7), 3),
+        (ADD, "protector-add-unprobed", detailed(0x06, 6), 6),
+        (ADD, "protector-add-mistyped", ended(false, MISTYPED), 1),
+        (ADD, "protector-add-uncertain", ended(true, UNCERTAIN), 6),
+        (ADD, "protector-add-changed", ended(false, CHANGED), 6),
+        (REMOVE, "protector-remove-chosen", detailed(0x04, 1), 2),
+        // A new key's kind at the proof, `0e` before the commit, and
+        // steps out of root's order.
+        (
+            ADD,
+            "protector-add-excluded-early",
+            ended(false, INTERNAL),
+            1,
+        ),
+        (
+            ADD,
+            "protector-add-uncertain-early",
+            ended(false, INTERNAL),
+            1,
+        ),
+        (
+            REMOVE,
+            "protector-remove-unchosen",
+            ended(false, INTERNAL),
+            1,
+        ),
+        (
+            REMOVE,
+            "protector-remove-authorize-chosen",
+            ended(false, INTERNAL),
+            2,
+        ),
+        (
+            REMOVE,
+            "protector-remove-early-commit",
+            ended(false, INTERNAL),
+            2,
+        ),
+        (ADD, "protector-add-reuses", ended(false, INTERNAL), 3),
+        (
+            Managed::RecoveryRemove,
+            "protector-changed-description",
+            ended(false, INTERNAL),
+            0,
+        ),
+        (ADD_BY_KEY, "protector-orphan", ended(false, INTERNAL), 1),
+        (
+            ADD,
+            "protector-add-kind-at-description",
+            ended(false, INTERNAL),
+            0,
+        ),
+        (
+            REMOVE,
+            "protector-remove-kind-at-choose",
+            ended(false, INTERNAL),
+            1,
+        ),
+        (
+            REMOVE,
+            "protector-remove-chosen-at-choose",
+            ended(false, INTERNAL),
+            1,
+        ),
+        (ADD, "protector-add-chosen", ended(false, INTERNAL), 1),
+    ] {
+        let mut storage = managing(managed, script);
+        let (event, presented) = drive(&mut storage);
+        assert_eq!(event, end, "{script}");
+        assert_eq!(presented.len(), shown, "{script}");
+        assert!(storage.child.is_none(), "{script}");
+    }
+}
+
+/// A choose step's `1c` is one digit naming a removable token, and a
+/// recovery-key step's 48 digits; anything else ends the generation, and
+/// the stopped worker has its grace for its header copy.
+#[test]
+fn a_secret_outside_its_steps_profile_ends_the_operation() {
+    for (managed, script, entry) in [
+        (REMOVE, "protector-remove-hold", &b"0"[..]),
+        (REMOVE, "protector-remove-hold", b"4"),
+        (REMOVE, "protector-remove-hold", b"12"),
+        // Listed, but the only primary key.
+        (REMOVE, "protector-remove-unmarked-hold", b"1"),
+        (ADD, "protector-add-hold", b"1234"),
+    ] {
+        let mut storage = managing(managed, script);
+        let step = first_presented(&mut storage);
+        storage.presented(&step).unwrap();
+        assert_eq!(storage.poll(), Ok(Event::Pin(step.clone())));
+        assert!(storage.pin(&step, Pin::entry(entry).unwrap()).is_err());
+        assert!(storage.grace.is_some() && storage.chosen.is_none());
+        assert_eq!(drive(&mut storage).0, ended(false, INTERNAL));
+    }
+}
+
+/// A PIN step's secret is at least four bytes, though `1c` decodes one.
+#[test]
+fn a_storage_pin_step_takes_no_short_secret() {
+    let mut storage = managing(REMOVE, "protector-remove-authorize-hold");
+    let authorize = &removal()[2];
+    let until = Instant::now() + Duration::from_secs(10);
+    loop {
+        match storage.poll().unwrap() {
+            Event::Present(request) => storage.presented(&request).unwrap(),
+            Event::Pin(request) if request == *authorize => break,
+            Event::Pin(request) => {
+                let secret = secret_of(&request).unwrap();
+                assert!(storage
+                    .pin(&request, Pin::entry(&secret[1..]).unwrap())
+                    .unwrap());
+            }
+            Event::Waiting => thread::sleep(Duration::from_millis(1)),
+            event => panic!("unexpected {event:?}"),
+        }
+        assert!(Instant::now() < until);
+    }
+    assert!(storage.pin(authorize, Pin::entry(b"123").unwrap()).is_err());
+    assert!(storage.pin.is_none() && storage.grace.is_some());
+    assert_eq!(drive(&mut storage).0, ended(false, INTERNAL));
+}
+
+/// Tag 21's receipt follows its typed key, which may come at any time
+/// before root's deadline: one after it ends the operation as TIMEOUT.
+#[test]
+fn a_late_tag_21_receipt_ends_the_operation() {
+    let mut storage = managing(Managed::RecoveryRemove, "protector-recovery-remove-hold");
+    let first = first_presented(&mut storage);
+    storage.expire();
+    storage.presented(&first).unwrap();
+    assert_eq!(drive(&mut storage).0, ended(false, TIMEOUT));
 }

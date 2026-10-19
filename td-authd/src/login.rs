@@ -259,12 +259,19 @@ pub(crate) fn draw() -> Result<([u8; 32], ApprovalKey), String> {
 pub(crate) struct Pin(Vec<u8>);
 
 impl Pin {
-    /// The worker's profile: 4 to 63 printable ASCII bytes.
-    pub fn new(bytes: &[u8]) -> Result<Self, String> {
-        if !(4..=63).contains(&bytes.len()) || !bytes.iter().all(|b| (0x20..=0x7e).contains(b)) {
-            return Err("login PIN is outside its profile".into());
+    /// A `1c` secret as the codec admits it: 1 to 63 printable ASCII
+    /// bytes. Each supervisor holds it to its step's profile: a PIN's
+    /// (`is_pin`), a recovery key's 48 digits or a choose step's digit.
+    pub fn entry(bytes: &[u8]) -> Result<Self, String> {
+        if !(1..=63).contains(&bytes.len()) || !bytes.iter().all(|b| (0x20..=0x7e).contains(b)) {
+            return Err("login secret is outside its profile".into());
         }
         Ok(Self(bytes.to_vec()))
+    }
+
+    /// Whether the secret is within a PIN's profile.
+    pub fn is_pin(&self) -> bool {
+        self.0.len() >= 4
     }
 
     /// The bytes the worker's frame carries.
@@ -595,6 +602,10 @@ impl Login {
         if self.phase != Phase::Pin || self.request.as_ref() != Some(request) {
             self.stop(INTERNAL, 0)?;
             return Err("stale login PIN".into());
+        }
+        if !pin.is_pin() {
+            self.stop(INTERNAL, 0)?;
+            return Err("login PIN is outside its profile".into());
         }
         // The person may submit just after root's last poll.
         if Instant::now() >= self.deadline {
@@ -958,3 +969,18 @@ impl Login {
 #[cfg(test)]
 #[path = "../tests/login.rs"]
 pub(crate) mod tests;
+
+#[cfg(test)]
+impl Pin {
+    /// A test's PIN, within the worker's profile: 4 to 63 printable ASCII
+    /// bytes.
+    pub fn new(bytes: &[u8]) -> Result<Self, String> {
+        Self::entry(bytes).and_then(|pin| {
+            if pin.is_pin() {
+                Ok(pin)
+            } else {
+                Err("login PIN is outside its profile".into())
+            }
+        })
+    }
+}

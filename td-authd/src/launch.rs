@@ -684,13 +684,47 @@ fn enrollment_dispatch_reaches_the_secret_decoder() -> Result<(), String> {
             crate::storage::Selection::UpgradeCancel
         ))
     );
-    for byte in 4..=0x0a {
-        assert_eq!(
-            request(&[0x20, byte])?,
-            Request::Secret(crate::session::Request::Storage(
-                crate::storage::Selection::Later(byte)
-            ))
-        );
+    {
+        use crate::consent::{DiskRequest, DiskRole, Managed, Proof};
+        use crate::storage::Selection;
+        for (bytes, selection) in [
+            (
+                &[0x20, 4, 2, 1][..],
+                Selection::Protector(Managed::Add {
+                    proof: Proof::DiskKey,
+                    role: DiskRole::Primary,
+                }),
+            ),
+            (
+                &[0x20, 5, 1],
+                Selection::Protector(Managed::Remove {
+                    proof: Proof::RecoveryKey,
+                }),
+            ),
+            (&[0x20, 6], Selection::Protector(Managed::RecoveryRemove)),
+            (
+                &[0x20, 9, 2],
+                Selection::Protector(Managed::Request {
+                    proof: Proof::DiskKey,
+                    request: DiskRequest::Reenroll,
+                }),
+            ),
+            (&[0x20, 0x0a], Selection::Later(0x0a)),
+        ] {
+            assert_eq!(
+                request(bytes)?,
+                Request::Secret(crate::session::Request::Storage(selection))
+            );
+        }
+        // An operand missing, outside its range or trailing.
+        for bad in [
+            &[0x20, 4, 2][..],
+            &[0x20, 4, 3, 1],
+            &[0x20, 5],
+            &[0x20, 6, 1],
+        ] {
+            assert!(request(bad).is_err(), "{bad:?}");
+        }
     }
     // None of these takes an operand, `20` takes exactly one but for an
     // upgrade's two, and nothing above `20` is a request.

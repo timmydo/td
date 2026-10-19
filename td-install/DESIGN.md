@@ -1882,9 +1882,10 @@ consent time holds no I/O.
   reaped at the operation's deadline (`08`) or as soon as root's end of
   the socket closes, which a second handle on it reads for every 10 ms,
   so a cancellation, which closes root's end, ends it. Root gives a
-  proof's storage worker one second after closing its channel before
-  it kills it (td-authd/DESIGN.md amendment 10), so the copy is
-  removed; until item 9 only a test build's root starts this path.
+  proof's storage worker, and protector management's, one second after
+  closing its channel before it kills it (td-authd/DESIGN.md amendment
+  10), so the copy is removed; until item 9 only a test build's root
+  starts this path.
 
   Success sends `14` with no commit round, and
   the worker exits; the secret, output and passphrase are zeroed first.

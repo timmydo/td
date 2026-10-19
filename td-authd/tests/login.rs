@@ -1022,6 +1022,12 @@ fn a_pin_after_the_deadline_ends_the_operation_not_the_generation() {
     let other = request(unlocking(2, LoginStep::Unlock { key: A, retries: 7 }));
     assert!(login.pin(&other, Pin::new(b"1234").unwrap()).is_err());
     assert_eq!(drive(&mut login).0, ended(false, INTERNAL, 0));
+    // `1c` admits a choose step's one digit, which no PIN step takes.
+    let mut login = scripted(Selection::Unlock, "stall-pin");
+    until_phase(&mut login, Phase::Pin);
+    assert!(login.pin(&unlock, Pin::entry(b"123").unwrap()).is_err());
+    assert!(login.pin.is_none());
+    assert_eq!(drive(&mut login).0, ended(false, INTERNAL, 0));
 }
 
 #[test]

@@ -1,11 +1,14 @@
 //! Nonblocking ownership of one root storage worker, `td-install
 //! storage-operation` (td-authd/DESIGN.md amendment 10): root's side of
 //! its frames for a selector update, the re-encrypting upgrade's phase 1
-//! and its cancellation, or a login operation's disk proof.
+//! and its cancellation, protector management, or a login operation's
+//! disk proof.
 
 use crate::consent::{
-    upgrade_ceiling, Admitted, ApprovalKey, DiskProofs, Fingerprint, LoginStep, Operation, Request,
-    SelectorForm, UpgradeShape, UpgradeStep, SELECTOR_UPDATE_CEILING, UPGRADE_CANCEL_CEILING,
+    upgrade_ceiling, Admitted, ApprovalKey, DiskProofs, DiskRequest, DiskRole, Fingerprint,
+    LoginStep, Managed, Operation, Proof, Protected, Request, SelectorForm, UpgradeShape,
+    UpgradeStep, PROTECTOR_CEILING, REQUEST_CEILING, SELECTOR_UPDATE_CEILING,
+    UPGRADE_CANCEL_CEILING,
 };
 use crate::login::{End, Pin, CANCELLED, INTERNAL, TIMEOUT};
 use crate::login_status::login_state;
@@ -79,8 +82,11 @@ pub(crate) enum Selection {
     },
     /// `03`: the upgrade's cancellation.
     UpgradeCancel,
-    /// Bytes `04` to `0a`: assigned, fixed by their own increments, and
-    /// refused by this build.
+    /// `04` to `09`: protector management with its proof and an
+    /// addition's role. This build refuses the three requests.
+    Protector(Managed),
+    /// `0a`: assigned, fixed by its own increment, and refused by this
+    /// build.
     Later(u8),
 }
 
@@ -98,14 +104,36 @@ impl Selection {
                 _ => Err("invalid upgrade selection".into()),
             },
             [3] => Ok(Self::UpgradeCancel),
-            [byte @ 4..=0x0a] => Ok(Self::Later(*byte)),
+            [4, proof, role] => match (Proof::from_byte(*proof), DiskRole::from_byte(*role)) {
+                (Some(proof), Some(role)) => Ok(Self::Protector(Managed::Add { proof, role })),
+                _ => Err("invalid protector addition selection".into()),
+            },
+            [5, proof] => Proof::from_byte(*proof)
+                .map(|proof| Self::Protector(Managed::Remove { proof }))
+                .ok_or_else(|| "invalid protector removal selection".into()),
+            [6] => Ok(Self::Protector(Managed::RecoveryRemove)),
+            [byte @ 7..=9, proof] => {
+                match (
+                    Proof::from_byte(*proof),
+                    DiskRequest::from_byte(byte.saturating_sub(6)),
+                ) {
+                    (Some(proof), Some(request)) => {
+                        Ok(Self::Protector(Managed::Request { proof, request }))
+                    }
+                    _ => Err("invalid protector request selection".into()),
+                }
+            }
+            [0x0a] => Ok(Self::Later(0x0a)),
             _ => Err("invalid storage operation selection".into()),
         }
     }
 
     /// Whether this build runs the selection.
     pub fn runs(self) -> bool {
-        !matches!(self, Self::Later(_))
+        !matches!(
+            self,
+            Self::Later(_) | Self::Protector(Managed::Request { .. })
+        )
     }
 
     /// Root's ceiling, fixed at the selection.
@@ -113,6 +141,8 @@ impl Selection {
         match self {
             Self::Upgrade { count, .. } => upgrade_ceiling(count),
             Self::UpgradeCancel => UPGRADE_CANCEL_CEILING,
+            Self::Protector(Managed::Request { .. }) => REQUEST_CEILING,
+            Self::Protector(_) => PROTECTOR_CEILING,
             Self::SelectorUpdate | Self::Later(_) => SELECTOR_UPDATE_CEILING,
         }
     }
@@ -141,13 +171,15 @@ struct Baseline {
     /// The running deployment's manifest ID when it is an acknowledged
     /// `current` with no pending attempt.
     current: Option<[u8; 32]>,
+    /// A protected volume's, `03` or `04`, which protector management
+    /// reads.
+    protected: Option<Protected>,
 }
 
 /// `18`, the volume byte, the recovery-key byte, up to four fido2 tokens
 /// with their roles, keyslot bytes and fingerprints, the tpm-pin count,
 /// the lockout and request bytes, then `00` and the running deployment's
-/// manifest ID, or `01`. Protector management's bytes are range-checked
-/// here; its operations do not yet read them.
+/// manifest ID, or `01`.
 fn baseline(frame: &[u8]) -> Option<Baseline> {
     let [BASELINE, volume, recovery, count, rest @ ..] = frame else {
         return None;
@@ -168,14 +200,18 @@ fn baseline(frame: &[u8]) -> Option<Baseline> {
     let (tokens, []) = tokens.as_chunks::<6>() else {
         return None;
     };
-    if !tokens
+    let tokens = tokens
         .iter()
-        .all(|[role, named, ..]| matches!(role, 1 | 2) && *named <= 1)
-    {
-        return None;
-    }
-    // The tpm-pin count, the lockout byte and the request byte.
-    let [0..=2, 0 | 1, 0..=3, standing @ ..] = rest else {
+        .map(|[role, named, a, b, c, d]| {
+            let named = match named {
+                0 => false,
+                1 => true,
+                _ => return None,
+            };
+            Some((DiskRole::from_byte(*role)?, named, [*a, *b, *c, *d]))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let [tpm_pins @ 0..=2, lockout @ (0 | 1), request @ 0..=3, standing @ ..] = rest else {
         return None;
     };
     let current = match standing {
@@ -183,14 +219,24 @@ fn baseline(frame: &[u8]) -> Option<Baseline> {
         [1] => None,
         _ => return None,
     };
+    let shape = match volume {
+        Volume::TpmPrimary => Some(UpgradeShape::Tpm),
+        Volume::Fido2Primary => Some(UpgradeShape::Fido2),
+        _ => None,
+    };
     Some(Baseline {
         volume,
         recovery: *recovery == 1,
-        tokens: tokens
-            .iter()
-            .map(|[_, _, a, b, c, d]| [*a, *b, *c, *d])
-            .collect(),
+        tokens: tokens.iter().map(|(.., key)| *key).collect(),
         current,
+        protected: shape.map(|shape| Protected {
+            shape,
+            marker: *recovery == 1,
+            tpm_pin: *tpm_pins > 0,
+            lockout: *lockout == 1,
+            request: DiskRequest::from_byte(*request),
+            tokens,
+        }),
     })
 }
 
@@ -211,6 +257,9 @@ fn failure(
     match selection {
         Selection::Upgrade { shape, .. } => return upgrade_failure(frame, committed, shape, stage),
         Selection::UpgradeCancel => return cancel_failure(frame, committed, stage),
+        Selection::Protector(managed) => {
+            return protector_failure(frame, committed, managed, stage)
+        }
         Selection::SelectorUpdate | Selection::Later(_) => {}
     }
     if proof {
@@ -245,6 +294,9 @@ struct Stage {
     reading: bool,
     /// A new key's ceremony step is current, before the commit.
     keyed: bool,
+    /// Protector management's: a presented step from the proof's first
+    /// on is current, before the commit.
+    proving: bool,
 }
 
 /// An upgrade's: its reads' kinds while it reads, the TPM's for the TPM
@@ -268,6 +320,32 @@ fn upgrade_failure(
         [FAILURE, 0x01, retries] if stage.keyed => Some((0x01, *retries)),
         [FAILURE, 0x06, detail @ 1..=6] if stage.keyed => Some((0x06, *detail)),
         [FAILURE, kind @ (0x02 | 0x03 | 0x05 | 0x07 | EXCLUDED)] if stage.keyed => Some((*kind, 0)),
+        _ => None,
+    }
+}
+
+/// Protector management's, where a disk proof's stand: `20` before the
+/// commit; the proof's kinds and a removal's chosen key's `04` detail `01`
+/// from the proof's first presented step; `11` while a new key's step is
+/// current; after root's commit acknowledgement `0e`; `08`, `0f`, `10`
+/// and a definite `28` anywhere.
+fn protector_failure(
+    frame: &[u8],
+    committed: bool,
+    managed: Managed,
+    stage: Stage,
+) -> Option<(u8, u8)> {
+    match frame {
+        [FAILURE, kind @ (TIMEOUT | FAILED | INTERNAL | CHANGED)] => Some((*kind, 0)),
+        [FAILURE, UNCERTAIN] if committed => Some((UNCERTAIN, 0)),
+        _ if committed => None,
+        [FAILURE, VOLUME] => Some((VOLUME, 0)),
+        _ if !stage.proving => None,
+        [FAILURE, 0x01, retries] => Some((0x01, *retries)),
+        [FAILURE, 0x06, detail @ 1..=6] => Some((0x06, *detail)),
+        [FAILURE, 0x04, 0x01] if matches!(managed, Managed::Remove { .. }) => Some((0x04, 1)),
+        [FAILURE, kind @ (0x02..=0x05 | 0x07 | MISTYPED | WRONG_KEY)] => Some((*kind, 0)),
+        [FAILURE, EXCLUDED] if stage.keyed => Some((EXCLUDED, 0)),
         _ => None,
     }
 }
@@ -449,9 +527,15 @@ pub(crate) struct Storage {
     committed: bool,
     /// Set for a disk proof's worker.
     proof: Option<DiskProof>,
+    /// Protector management's volume, from the baseline, and the
+    /// position a removal's choose step named, which its next step must
+    /// carry.
+    protected: Option<Protected>,
+    chosen: Option<u8>,
     /// A disk proof's secret on its way to the worker, zeroed when dropped.
     pin: Option<Pin>,
-    /// When a stopped proof's worker is killed if it has not exited.
+    /// When a stopped worker holding a header copy, a disk proof's or
+    /// protector management's, is killed if it has not exited.
     grace: Option<Instant>,
     end: Option<End>,
     terminal: Option<Event>,
@@ -628,6 +712,8 @@ impl Storage {
             acknowledgement_deadline: None,
             committed: false,
             proof: None,
+            protected: None,
+            chosen: None,
             pin: None,
             grace: None,
             end: Some(end),
@@ -651,9 +737,11 @@ impl Storage {
     pub fn presented(&mut self, request: &Request) -> Result<(), String> {
         let now = Instant::now();
         // A step carries a key where it discloses: a proof's first, an
-        // upgrade's review, and each one-step operation's description.
+        // upgrade's review, tag 21's identify step, and each one-step
+        // operation's description.
         let keyed = request.login_approval().is_some()
             || request.upgrade_approval().is_some()
+            || request.protector_approval().is_some()
             || request.selector_update().is_some();
         if keyed && self.request.as_ref() == Some(request) {
             if matches!(self.phase, Phase::Stopping | Phase::Done) {
@@ -710,11 +798,12 @@ impl Storage {
     }
 
     /// Forwards the secret for a presented secret step, keeping no copy
-    /// once it is written: a disk key's or a new key's PIN, or the
-    /// recovery key, exactly 48 digits, which the compositor's field alone
-    /// admits, so anything else ends the generation. False when the
-    /// operation has already ended, or its deadline has passed, which ends
-    /// it: the secret is dropped.
+    /// once it is written: a disk key's or a new key's PIN, the recovery
+    /// key, exactly 48 digits, or a choose step's one digit naming a
+    /// removable token, which the compositor's fields alone admit, so
+    /// anything else ends the generation. False when the operation has
+    /// already ended, or its deadline has passed, which ends it: the
+    /// secret is dropped.
     pub fn pin(&mut self, request: &Request, pin: Pin) -> Result<bool, String> {
         if matches!(self.phase, Phase::Stopping | Phase::Done) && request.nonce() == &self.nonce {
             return Ok(false);
@@ -723,15 +812,30 @@ impl Storage {
             self.stop(INTERNAL)?;
             return Err("stale storage secret".into());
         }
-        if request.login_step() == Some(LoginStep::RecoveryKey) && !recovery_digits(&pin) {
+        if request.asks_recovery_key() && !recovery_digits(&pin) {
             self.stop(INTERNAL)?;
             return Err("recovery key outside its profile".into());
         }
+        let chosen = match (request.protector_step(), request.removal()) {
+            (Some(LoginStep::Choose), Some(removal)) => match removal.entry(pin.bytes()) {
+                Some(position) => Some(position),
+                None => {
+                    self.stop(INTERNAL)?;
+                    return Err("choose entry outside its profile".into());
+                }
+            },
+            _ if !request.asks_recovery_key() && !pin.is_pin() => {
+                self.stop(INTERNAL)?;
+                return Err("login PIN is outside its profile".into());
+            }
+            _ => None,
+        };
         if Instant::now() >= self.deadline {
             drop(pin);
             self.stop(TIMEOUT)?;
             return Ok(false);
         }
+        self.chosen = chosen;
         self.pin = Some(pin);
         self.phase = Phase::Sending;
         Ok(true)
@@ -868,11 +972,26 @@ impl Storage {
         let stage = Stage {
             reading: self.phase == Phase::Description,
             keyed: !self.committed
+                && self.request.as_ref().is_some_and(|request| {
+                    matches!(request.upgrade_step(), Some(UpgradeStep::Key { .. }))
+                        || matches!(
+                            request.protector_step(),
+                            Some(
+                                LoginStep::Connect
+                                    | LoginStep::Create { .. }
+                                    | LoginStep::Prove { .. }
+                                    | LoginStep::Repeat { .. }
+                                    | LoginStep::Probe { .. }
+                            )
+                        )
+                }),
+            proving: !self.committed
+                && !matches!(self.phase, Phase::Baseline | Phase::Description)
                 && self
                     .request
                     .as_ref()
-                    .and_then(Request::upgrade_step)
-                    .is_some_and(|step| matches!(step, UpgradeStep::Key { .. })),
+                    .and_then(Request::protector_step)
+                    .is_some_and(|step| step != LoginStep::Choose),
         };
         if let Some((kind, detail)) = failure(
             &frame,
@@ -899,10 +1018,14 @@ impl Storage {
                 self.invited(frame)
             }
             // A disk proof's next step, before its secret is sent, and an
-            // upgrade's next step before its last.
+            // upgrade's or protector management's next step before its
+            // last.
             (Phase::Running, Some(&PRESENT)) if sent == Some(false) => self.invited(frame),
             (Phase::Running, Some(&PRESENT))
-                if matches!(self.selection, Selection::Upgrade { .. }) && !self.last =>
+                if matches!(
+                    self.selection,
+                    Selection::Upgrade { .. } | Selection::Protector(_)
+                ) && !self.last =>
             {
                 self.invited(frame)
             }
@@ -927,6 +1050,7 @@ impl Storage {
             return self.begin_proof(baseline);
         }
         let operation = match self.selection {
+            Selection::Protector(managed) => return self.begin_protector(baseline, managed),
             Selection::Upgrade { shape, count } => {
                 upgrade(&baseline, self.owner, shape, count, self.approval)
             }
@@ -947,6 +1071,39 @@ impl Storage {
             self.last = request.upgrade_start()? == Admitted::Last;
         }
         self.tokens = baseline.tokens;
+        self.wire
+            .as_mut()
+            .ok_or("missing storage endpoint")?
+            .queue(&request.encode())?;
+        self.request = Some(request);
+        self.phase = Phase::Description;
+        Ok(Event::Waiting)
+    }
+
+    /// Protector management's first description, from the baseline: `20`
+    /// for no encrypted td volume or a header td's reader refuses, `21`
+    /// for any other volume than a protected one, or `21` and its detail
+    /// where the volume cannot take the operation (`Protected::first`),
+    /// each before the worker sees any description.
+    fn begin_protector(&mut self, baseline: Baseline, managed: Managed) -> Result<Event, String> {
+        let first = match (baseline.volume, &baseline.protected) {
+            (Volume::None | Volume::Refused, _) => Err((VOLUME, 0)),
+            (_, None) => Err((STATE, 0)),
+            (_, Some(protected)) => protected
+                .first(self.owner, managed, Some(self.approval))
+                .map_err(|detail| (STATE, detail)),
+        };
+        let (operation, protected) = match (first, baseline.protected) {
+            (Ok(operation), Some(protected)) => (operation, protected),
+            (Err((kind, detail)), _) => {
+                self.stop_with(kind, detail)?;
+                return self.reap();
+            }
+            (Ok(_), None) => return Err("missing protected volume".into()),
+        };
+        let request = Request::new(self.nonce, self.owner, operation)?;
+        self.last = protected.admits(&request)? == Admitted::Last;
+        self.protected = Some(protected);
         self.wire
             .as_mut()
             .ok_or("missing storage endpoint")?
@@ -1005,7 +1162,10 @@ impl Storage {
     /// ceremony created, and its commit names its last step. A disk
     /// proof's first presentation is root's description, and its next, a
     /// disk key's authorize step, is admitted against both baselines; it
-    /// has no commit.
+    /// has no commit. Protector management's later steps are admitted
+    /// against the baseline's protectors, a removal's chosen position and
+    /// an addition's created credential, and its commit names its last
+    /// step.
     fn invited(&mut self, frame: Vec<u8>) -> Result<Event, String> {
         let current = self.request.as_ref().ok_or("missing storage request")?;
         let invitation = Request::decode(frame.get(33..).ok_or("short storage invitation")?)?;
@@ -1026,6 +1186,29 @@ impl Storage {
             });
             self.request = Some(invitation);
             self.phase = Phase::Presented;
+            self.round = frame;
+            return Ok(self.event());
+        }
+        if let (Some(protected), Phase::Running, Some(&PRESENT)) =
+            (&self.protected, self.phase, frame.first())
+        {
+            let keys = protected.protector_keys();
+            let disk = DiskProofs {
+                recovery_key: protected.marker,
+                tokens: &keys,
+            };
+            let created = match invitation.protector_step() {
+                Some(LoginStep::Prove { key, .. }) => Some(key),
+                Some(LoginStep::Repeat { .. } | LoginStep::Probe { .. }) => self.created,
+                _ => None,
+            };
+            let admitted =
+                current.admit_protector_step(&invitation, disk, created, self.chosen.take())?;
+            self.created = created;
+            self.last = admitted == Admitted::Last;
+            self.request = Some(invitation);
+            self.phase = Phase::Presented;
+            self.acknowledgement_deadline = Some(deadline_after(ACK_TIME)?);
             self.round = frame;
             return Ok(self.event());
         }
@@ -1056,9 +1239,14 @@ impl Storage {
             return Err("storage worker changed root's description".into());
         }
         self.acknowledgement_deadline = Some(if self.phase == Phase::Description {
-            // The approval key is typed against the operation's deadline.
             self.phase = Phase::Presented;
-            self.deadline
+            // The approval key is typed against the operation's deadline;
+            // protector management's first step carries one only at tag 21.
+            if self.protected.is_some() && invitation.protector_approval().is_none() {
+                deadline_after(ACK_TIME)?
+            } else {
+                self.deadline
+            }
         } else {
             self.phase = Phase::Commit;
             deadline_after(ACK_TIME)?
@@ -1089,10 +1277,10 @@ impl Storage {
     }
 
     /// Records how the operation ended and stops the worker: a selector
-    /// update's is killed at once; a disk proof's channel is closed, which
-    /// its keyslot test reads as the operation's end and kills and reaps
-    /// its cryptsetup child, and the worker is killed only if it has not
-    /// exited by the grace's end.
+    /// update's is killed at once; a disk proof's or protector
+    /// management's channel is closed, which its keyslot test reads as
+    /// the operation's end and kills and reaps its cryptsetup child, and
+    /// the worker is killed only if it has not exited by the grace's end.
     fn stop_with(&mut self, kind: u8, detail: u8) -> Result<(), String> {
         if matches!(self.phase, Phase::Stopping | Phase::Done) {
             return Ok(());
@@ -1102,7 +1290,7 @@ impl Storage {
         self.round.clear();
         self.pin = None;
         self.acknowledgement_deadline = None;
-        if self.proof.is_some() {
+        if self.graced() {
             self.grace = Some(
                 Instant::now()
                     .checked_add(GRACE)
@@ -1115,6 +1303,12 @@ impl Storage {
         }
         self.phase = Phase::Stopping;
         Ok(())
+    }
+
+    /// Whether the worker may hold a header copy for a keyslot test: a
+    /// disk proof's, or protector management's.
+    fn graced(&self) -> bool {
+        self.proof.is_some() || matches!(self.selection, Selection::Protector(_))
     }
 
     fn reap(&mut self) -> Result<Event, String> {
@@ -1152,8 +1346,9 @@ impl Storage {
     pub fn reap_for_teardown(mut self) -> Result<(), String> {
         self.wire = None;
         self.pin = None;
+        let graced_worker = self.graced();
         if let Some(child) = &mut self.child {
-            if self.proof.is_some() && graced(child) {
+            if graced_worker && graced(child) {
                 self.child = None;
                 return Ok(());
             }
@@ -1169,11 +1364,11 @@ impl Storage {
     }
 }
 
-/// With its channel already closed, waits out a disk proof's grace for
+/// With its channel already closed, waits out a graced worker's grace for
 /// `child` to exit: true once it has been reaped.
 ///
 /// This blocks the authority thread for at most GRACE, polling every 10 ms.
-/// Only teardown after a peer failure and dropping a live proof's worker
+/// Only teardown after a peer failure and dropping a live graced worker
 /// call it. Neither can defer the reap: teardown must prove the worker
 /// cannot write again before the generation ends, and Drop has no later
 /// poll. Both are rare, so a bounded one-second block is acceptable there.
@@ -1194,8 +1389,9 @@ fn graced(child: &mut Child) -> bool {
 impl Drop for Storage {
     fn drop(&mut self) {
         self.wire = None;
+        let graced_worker = self.graced();
         if let Some(child) = &mut self.child {
-            if self.proof.is_some() && graced(child) {
+            if graced_worker && graced(child) {
                 return;
             }
             let _ = child.kill();

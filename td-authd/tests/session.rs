@@ -1280,12 +1280,18 @@ fn login_requests_have_one_encoding_and_a_pin_never_prints() {
         Request::Pin(Box::new(unlock.clone()), Pin::new(b"1234").unwrap())
     );
     assert!(format!("{request:?}").ends_with(", Pin(..))"));
+    // A secret of 1 to 63 bytes, which the supervisor holds to its step's
+    // profile.
+    assert_eq!(
+        Request::decode(&bytes[..bytes.len() - 3]).unwrap(),
+        Request::Pin(Box::new(unlock.clone()), Pin::entry(b"1").unwrap())
+    );
     for bad in [
         vec![0x1b],
         vec![0x1b, 8, 3],
         vec![0x1c],
         vec![0x1c, 0xff],
-        bytes[..bytes.len() - 1].to_vec(),
+        bytes[..bytes.len() - 4].to_vec(),
         [&bytes[..], b"\n"].concat(),
         [&[0x1c, encoded.len() as u8 + 1][..], &encoded, b"1234"].concat(),
     ] {
@@ -2440,9 +2446,32 @@ fn production_refuses_every_storage_operation_before_any_worker_starts() {
         (upgrade, false),
         (Storage::UpgradeCancel, false),
     ];
-    refused.extend(
-        (4..=0x0a).flat_map(|byte| [(Storage::Later(byte), false), (Storage::Later(byte), true)]),
-    );
+    use crate::consent::{DiskRequest, DiskRole, Managed, Proof};
+    for managed in [
+        Managed::Add {
+            proof: Proof::DiskKey,
+            role: DiskRole::Recovery,
+        },
+        Managed::Remove {
+            proof: Proof::RecoveryKey,
+        },
+        Managed::RecoveryRemove,
+    ] {
+        refused.push((Storage::Protector(managed), false));
+    }
+    // The requests and Secure Boot enrollment, in every build.
+    for request in [
+        DiskRequest::PinChange,
+        DiskRequest::TpmClear,
+        DiskRequest::Reenroll,
+    ] {
+        let selection = Storage::Protector(Managed::Request {
+            proof: Proof::DiskKey,
+            request,
+        });
+        refused.extend([(selection, false), (selection, true)]);
+    }
+    refused.extend([(Storage::Later(0x0a), false), (Storage::Later(0x0a), true)]);
     for (selection, active) in refused {
         assert_eq!(
             session

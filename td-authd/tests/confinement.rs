@@ -191,7 +191,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert_eq!(login.matches("Instant::now()").count(), 5);
     assert_eq!(
         fingerprint(login),
-        0xfdd35efbd98912ad,
+        0xeb6e3f0237d05a94,
         "login worker supervisor changed"
     );
     assert_eq!(
@@ -242,7 +242,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert!(!session.contains("::launch("));
     assert_eq!(
         fingerprint(storage),
-        0x3dca155f70a36f89,
+        0x649662b596e4dde7,
         "storage worker supervisor changed"
     );
     assert_eq!(
@@ -1170,9 +1170,9 @@ const LOGIN_STATE_FINGERPRINT: u64 = 0x10b1af1d87d02b94;
 const SHARED_LOGIN_STATE_FINGERPRINT: u64 = 0x36b736e5dda17cc6;
 const SHARED_HOSTNAME_FINGERPRINT: u64 = 0x49026f28c1db76ec;
 
-const LAUNCH_FINGERPRINT: u64 = 0xef96bbea83ac95d5;
+const LAUNCH_FINGERPRINT: u64 = 0x73229ac7c8bf6263;
 const MAIN_FINGERPRINT: u64 = 0xd03c9fa382ca5d9a;
-const SESSION_FINGERPRINT: u64 = 0x01441f0b6890757a;
+const SESSION_FINGERPRINT: u64 = 0x595c2dcc5491ebac;
 
 const INTAKE_RAW_FINGERPRINT: u64 = 0x320c8b6ddbfe29af;
 const INTAKE_FINGERPRINT: u64 = 0xe2f50441f71b4c76;

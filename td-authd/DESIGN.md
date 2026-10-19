@@ -2667,9 +2667,12 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
     their code, and implemented (`20 02`, `20 03`) behind the same
     `OPERATIONS`. Protector management (`20 04` to `20 09`) is fixed by
     increment 8g's documentation commit, before its code. Its consent
-    tags 19 to 24 and the choose step are implemented, and nothing
-    builds them yet; the operations are not yet implemented. Secure
-    Boot enrollment (`20 0a`) is not yet fixed.
+    tags 19 to 24 and the choose step are implemented. So are the
+    addition, the removal and the recovery-key removal (`20 04` to
+    `20 06`), behind the same `OPERATIONS`; the compositor does not yet
+    select them. Every build refuses the three requests (`20 07` to
+    `20 09`) until they are implemented. Secure Boot enrollment (`20
+    0a`) is not yet fixed.
     One fixed root `/bin/td-install storage-operation --uid 1000` child
     per operation, the storage worker (`td-install/DESIGN.md`, "Storage
     operation worker"), launched and supervised as the login worker is
@@ -3117,7 +3120,9 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
 
     The writes run behind the worker's commit margin, as for the
     selector update, and `LOGIN_LONGEST` (480) remains the largest
-    operation.
+    operation. As for a disk proof, a stop closes the worker's channel
+    and kills it only after `GRACE`. Its proof's keyslot test holds a
+    header copy.
 
     **Kinds.** An end carries the worker's `15` kind, from the storage
     worker's table in `td-install/DESIGN.md` for its own, or root's:
@@ -3127,13 +3132,14 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
     stand: the reads' while root's description awaits the worker's first
     `10`, a new key's while a key step is current before the commit, and
     `0e` and `28` after it; any other ends the operation as `10`.
-    Protector management's kinds stand where a disk proof's do: `20`,
-    `25`, `26` and a definite `28` where they stand there, and the
-    proof's `01` to `08` from its first step; then a new key's kinds
-    while its step is current, and `0e` and `28` after the commit. The
-    compositor accepts exactly the kinds each selection can produce
-    where it stands, as for a login operation, and anything else ends
-    the generation.
+    Protector management's kinds stand where a disk proof's do: `20`
+    before the commit and a definite `28` anywhere; the proof's `01` to
+    `07`, `25` and `26` from its first presented step to the commit,
+    never at a choose step; a removal's `04` detail `01` there too; a
+    new key's `11` while its step is current; and `0e` after the
+    commit. The compositor accepts exactly the kinds each selection can
+    produce where it stands, as for a login operation, and anything
+    else ends the generation.
 
     **The login state.** The `9a` answer gains one byte after the
     admission byte: `01` when root read the protected marker for this
@@ -3169,13 +3175,17 @@ argument. The paired requests are:
 | --- | --- |
 | `1a` | `9a`, then the state: `00` unenrolled; `01`, a slot count of 1 to 8 and that many four-byte fingerprints in canonical slot order; or `02` and the cause `0a`, `0b` or `0c`, TOKEN-LOGIN.md's failure kinds, or `0d`, an unenrolled protected machine; then a length byte of 1 to 32 and the primary username, a length byte of 0 to 63 and the hostname, the revocation byte, `00` to `03`, the admission byte, `00` or `01`, and the protected byte, `00` or `01` (amendments 1, 7, 9 and 10) |
 | `1b 07` unlock; `1b 08 01` or `1b 08 02` one- or two-key first enrollment; `1b 09` addition; `1b 0a N` and N slots, each a position and a four-byte fingerprint, positions strictly increasing within 1 to 8 | `9b 01` and the 32-byte nonce: started |
-| `1c`, one length byte, the current step's canonical description, then the PIN (4 to 63 printable ASCII bytes) | `9c 00` PIN queued; `9c 01` the operation had already ended, or root's deadline has passed, which ends it as TIMEOUT: the PIN is dropped |
+| `1c`, one length byte, the current step's canonical description, then the secret: 1 to 63 printable ASCII bytes, a PIN step's at least 4 (amendment 10's secrets below) | `9c 00` PIN queued; `9c 01` the operation had already ended, or root's deadline has passed, which ends it as TIMEOUT: the PIN is dropped |
 
 Amendment 10 extends these rows: `1b 0b P` and an enrollment, addition
 or removal selects a login operation authorized by a disk proof, with
 the `9b` answers; `20` and an operation byte selects a storage
 operation, answered `a0`; a recovery-key step's `1c` carries the 48
-digits; and a choose step's `1c` carries one digit.
+digits; and a choose step's `1c` carries one digit. So `1c` decodes 1
+to 63 printable ASCII bytes, and the supervisor holds them to the
+current step's profile: shorter than four bytes on a PIN step ends the
+generation, as a malformed `1c` does. A `1c` for an operation that has
+already ended is dropped first, as any secret for it is.
 
 `1a` needs completed preparation, or it ends the generation, but neither
 needs nor takes the operation slot. The compositor admits only an answer

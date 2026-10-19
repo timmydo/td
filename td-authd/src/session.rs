@@ -92,7 +92,7 @@ impl Request {
                     .ok_or("truncated login PIN request")?;
                 Ok(Self::Pin(
                     Box::new(Description::decode(description)?),
-                    Pin::new(pin)?,
+                    Pin::entry(pin)?,
                 ))
             }
             _ => Err("invalid secret session request".into()),
@@ -469,7 +469,9 @@ impl Session {
                 let queued = match &mut self.operation {
                     Some(Active::Login(operation)) => operation.pin(&description, pin)?,
                     Some(Active::Proof(operation)) => operation.pin(&description, pin)?,
-                    // An upgrade's new key's PIN steps.
+                    // An upgrade's new key's PIN steps, and protector
+                    // management's secrets: its PINs, the recovery key and
+                    // a choose step's digit.
                     Some(Active::Storage(operation)) => operation.pin(&description, pin)?,
                     _ => return Err("no operation takes a PIN".into()),
                 };
