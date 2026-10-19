@@ -44,6 +44,8 @@ pub(crate) enum Notice {
     /// screen.
     Protect,
     NewKeys(crate::authority::consent::UpgradeShape),
+    /// A protector addition's role screen `A` opens.
+    AddRole,
     /// A protected machine's authorization choice for a login-key
     /// operation (DESIGN.md, "Storage operations"): the disk proofs, and
     /// for an addition or removal an enrolled key.
@@ -93,6 +95,9 @@ const TOUCH_PROMPT: &str = "TOUCH YOUR KEY";
 /// operations").
 const RECOVERY_PROMPT: &str = "TYPE THE DISK RECOVERY KEY";
 const CHECKING_PROMPT: &str = "CHECKING THE RECOVERY KEY";
+/// A removal's choose step's (DESIGN.md, "Protector management").
+const CHOOSE_PROMPT: &str = "TYPE A NUMBER FROM THE LIST";
+const CHOSEN_PROMPT: &str = "KEY CHOSEN";
 /// The most masks the field shows: FIDO's longest PIN.
 const MASKS: usize = 63;
 /// The recovery-key profile's masks: its 48 digits, in groups of six one
@@ -158,9 +163,13 @@ impl Prepared {
         remaining: Option<u64>,
     ) -> Result<Self, String> {
         let doubled = width >= 800 && height >= 600;
-        // A disk proof's and an upgrade's prompts fall back to the single
-        // scale where the doubled cannot hold them.
-        if !doubled || (request.login_proof().is_none() && request.upgrade_step().is_none()) {
+        // A disk proof's, an upgrade's and protector management's prompts
+        // fall back to the single scale where the doubled cannot hold them.
+        if !doubled
+            || (request.login_proof().is_none()
+                && request.upgrade_step().is_none()
+                && request.protector_step().is_none())
+        {
             let scale = if doubled { 2 } else { 1 };
             return Self::at_scale(request, width, height, stride, remaining, scale);
         }
@@ -278,10 +287,13 @@ impl Prepared {
             }
         }
         let field_rows = if request.ceremony_step().is_some_and(|step| step.asks_pin()) {
-            let recovery =
-                request.login_step() == Some(crate::authority::consent::LoginStep::RecoveryKey);
+            let recovery = request.asks_recovery_key();
+            let choose =
+                request.protector_step() == Some(crate::authority::consent::LoginStep::Choose);
             let (pin, touch) = if recovery {
                 (RECOVERY_PROMPT, CHECKING_PROMPT)
+            } else if choose {
+                (CHOOSE_PROMPT, CHOSEN_PROMPT)
             } else {
                 (PIN_PROMPT, TOUCH_PROMPT)
             };
@@ -676,6 +688,7 @@ fn notice_rows(notice: Notice) -> Vec<String> {
         Notice::NewKeys(crate::authority::consent::UpgradeShape::Fido2) => {
             "NEW PRIMARY SECURITY KEYS:"
         }
+        Notice::AddRole => "ADD A DISK SECURITY KEY AS:",
         Notice::Authorize { .. } => "AUTHORIZE WITH:",
         Notice::NotAvailable => "NOT AVAILABLE IN THIS BUILD",
         Notice::Uncertain(_) => "RESULT UNCERTAIN",
@@ -720,6 +733,16 @@ fn notice_rows(notice: Notice) -> Vec<String> {
             "U: UPDATE THE BOOT SELECTOR",
             "P: PROTECT THE DISK",
             "C: CANCEL PROTECTING THE DISK",
+            "A: ADD A DISK SECURITY KEY",
+            "R: REMOVE A DISK SECURITY KEY",
+            "X: REMOVE THE RECOVERY KEY",
+        ],
+        Notice::AddRole => &[
+            "P: A PRIMARY KEY THAT UNLOCKS",
+            "AND LOGS IN AT BOOT",
+            "R: A RECOVERY KEY THAT ONLY",
+            "UNLOCKS THE DISK",
+            "TPM DISKS TAKE RECOVERY KEYS ONLY",
         ],
         // The trade-offs ENCRYPTION.md's phase 1 has the FIDO2 choice
         // disclose, each under its shape's name.
@@ -1343,6 +1366,7 @@ mod tests {
         Notice::Protect,
         Notice::NewKeys(crate::authority::consent::UpgradeShape::Tpm),
         Notice::NewKeys(crate::authority::consent::UpgradeShape::Fido2),
+        Notice::AddRole,
         Notice::Authorize { enrolled: true },
         Notice::Authorize { enrolled: false },
         Notice::NotAvailable,
@@ -1425,6 +1449,101 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// Every protector-management step is prepared at each oracle output,
+    /// at either scale, a secret step with its field, and a choose step's
+    /// field rows are its own.
+    #[test]
+    fn a_protector_prompt_is_prepared_with_its_field() {
+        use crate::authority::consent::{
+            ApprovalKey, DiskRole, DiskToken, LoginStep, Proof, Removal, UpgradeShape,
+        };
+        let removal = |chosen| Removal {
+            shape: UpgradeShape::Fido2,
+            marker: true,
+            tpm_pin: false,
+            tokens: (1..=4u8)
+                .map(|key| DiskToken {
+                    role: if key < 3 {
+                        DiskRole::Primary
+                    } else {
+                        DiskRole::Recovery
+                    },
+                    key: [key; 4],
+                })
+                .collect(),
+            chosen,
+        };
+        let authorize = LoginStep::DiskAuthorize {
+            key: [2; 4],
+            retries: 8,
+        };
+        let made = [9; 4];
+        let mut operations = vec![
+            Operation::ProtectorRemove {
+                account: 1000,
+                proof: Proof::DiskKey,
+                removal: removal(0),
+                step: LoginStep::Choose,
+            },
+            Operation::ProtectorRemove {
+                account: 1000,
+                proof: Proof::DiskKey,
+                removal: removal(1),
+                step: authorize,
+            },
+            Operation::RecoveryRemove {
+                account: 1000,
+                step: LoginStep::DiskIdentify,
+                approval: Some(ApprovalKey::new(*b"47").unwrap()),
+            },
+        ];
+        for step in [
+            LoginStep::RecoveryKey,
+            LoginStep::Connect,
+            LoginStep::Create { retries: 8 },
+            LoginStep::Prove {
+                key: made,
+                retries: 8,
+            },
+        ] {
+            operations.push(Operation::ProtectorAdd {
+                account: 1000,
+                proof: Proof::RecoveryKey,
+                role: DiskRole::Primary,
+                step,
+            });
+        }
+        for operation in operations {
+            let request = Request::new([1; 32], 1000, operation).unwrap();
+            for (width, height) in [(1366, 768), (1280, 800), (1024, 768), (800, 600)] {
+                let prepared =
+                    Prepared::with_time(request.clone(), width, height, width * 4, Some(360))
+                        .unwrap();
+                let asks = request.ceremony_step().unwrap().asks_pin();
+                assert_eq!(prepared.field_rows.is_some(), asks, "{request:?}");
+                // DESIGN.md: none falls back at the oracle outputs.
+                assert_eq!(prepared.scale, 2, "{request:?} {width}x{height}");
+            }
+        }
+        let choose = Request::new(
+            [1; 32],
+            1000,
+            Operation::ProtectorRemove {
+                account: 1000,
+                proof: Proof::DiskKey,
+                removal: removal(0),
+                step: LoginStep::Choose,
+            },
+        )
+        .unwrap();
+        let prompt = Prepared::with_time(choose, 1280, 800, 5120, Some(360)).unwrap();
+        for field in [Field::Pin(1), Field::Touch] {
+            let mut painted = vec![0; 5120 * 800];
+            assert!(prompt.paint_field(&mut painted, 1280, 800, 5120, field));
+            assert!(painted == expected_field(&prompt, field), "{field:?}");
         }
     }
 
@@ -2063,13 +2182,16 @@ mod tests {
         let mut expected = prompt.pixels.clone();
         let white = [0xff, 0xff, 0xff, 0];
         let text = prompt.foot + 4 * scale;
-        let recovery =
-            prompt.request.login_step() == Some(crate::authority::consent::LoginStep::RecoveryKey);
-        let (line, count) = match (field, recovery) {
-            (Field::Pin(count), false) => ("ENTER THE PIN FOR THIS KEY", usize::from(count)),
-            (Field::Touch, false) => ("TOUCH YOUR KEY", 0),
-            (Field::Pin(count), true) => ("TYPE THE DISK RECOVERY KEY", usize::from(count)),
-            (Field::Touch, true) => ("CHECKING THE RECOVERY KEY", 0),
+        let recovery = prompt.request.asks_recovery_key();
+        let choose =
+            prompt.request.protector_step() == Some(crate::authority::consent::LoginStep::Choose);
+        let (line, count) = match (field, recovery, choose) {
+            (Field::Pin(count), false, false) => ("ENTER THE PIN FOR THIS KEY", usize::from(count)),
+            (Field::Touch, false, false) => ("TOUCH YOUR KEY", 0),
+            (Field::Pin(count), true, _) => ("TYPE THE DISK RECOVERY KEY", usize::from(count)),
+            (Field::Touch, true, _) => ("CHECKING THE RECOVERY KEY", 0),
+            (Field::Pin(count), false, true) => ("TYPE A NUMBER FROM THE LIST", usize::from(count)),
+            (Field::Touch, false, true) => ("KEY CHOSEN", 0),
         };
         for (column, character) in line.chars().enumerate() {
             let glyph = font.index(character);

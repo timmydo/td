@@ -3545,7 +3545,8 @@ pub struct MappedRegion {
              Operation::LoginEnroll { approval, .. } | Operation::LoginRemove { approval, .. } => {\n            \
              *approval\n        }\n        \
              Operation::SelectorUpdate { key, .. } | Operation::UpgradeCancel { key } => Some(*key),\n        \
-             Operation::Upgrade { approval, .. } => *approval,\n        \
+             Operation::Upgrade { approval, .. } | Operation::RecoveryRemove { approval, .. } => {\n            \
+             *approval\n        }\n        \
              _ => Elevation::of(request).map(|(_, key)| key),\n    }\n}\n"
         ));
         // The reader, the digit's check, a presented prompt's keeping and

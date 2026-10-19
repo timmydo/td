@@ -6432,7 +6432,12 @@ operation is, with its own end table), the disk proofs
 (`LoginSelection::Proven`) and the recovery-key profile. The upgrade
 and its cancellation are fixed by increment 8f's documentation commit
 before their code, and implemented (`LoginSelection::Upgrade` and
-`UpgradeCancel`, each with its own end table).
+`UpgradeCancel`, each with its own end table). Protector management is
+fixed by increment 8g's documentation commit before its code. Its
+addition, removal and recovery-key removal are implemented
+(`LoginSelection::Protector`, the `A`, `R` and `X` rows and their
+screens). The three requests and their `N`, `T` and `E` rows are not
+yet implemented.
 td-authd/DESIGN.md amendment 10 gives the wire, and ENCRYPTION.md the
 operations. Until that document's item 9, root refuses every storage
 operation in a production build and decodes no disk proof there, so
@@ -6595,11 +6600,13 @@ authorization screen is a disk proof's without `K`: `AUTHORIZE WITH:`,
   is admitted through consent's successor rule for its tag.
 - Each prompt is prepared as a disk proof's: at the single scale where
   the doubled cannot hold its rows and field (`Prepared::with_time`
-  learns tags 19 to 24 beside `login_proof`).
+  learns tags 19 to 24 beside `login_proof`). At the four oracle
+  outputs every one stays doubled, four tokens and a field included.
 - A proof step is presented as a disk proof's, and a new key's step as
   an upgrade's. Tag 21's identify step is keyed as a login disclosure
   step is, its receipt sent only after the key's second digit.
-- A removal's choose step opens a one-digit field on root's `0c`. A
+- A removal's choose step opens a one-digit field on root's `0c`. Its
+  row is `TYPE A NUMBER FROM THE LIST`; once sent, `KEY CHOSEN`. A
   digit naming a removable token, by consent's `Removal::removable` over
   the description, is sent as `1c` at once; any other key is ignored,
   and Escape cancels. The next description must carry that digit as its
@@ -6623,19 +6630,34 @@ tables above:
 | `01` to `03`, `05` to `07`, `11` | a new key's, as an upgrade's |
 | `0e` uncertain, for an addition | `RESULT UNCERTAIN` and `THE NEW KEY MAY OPEN THE DISK` / `EVEN IF IT IS NOT LISTED` |
 
-`21` with detail `00` keeps the selector update's text. Where a kind is
-both a proof's and a new key's, the step that stands chooses its text.
+`21` with detail `00` keeps the selector update's text. A kind that is
+both a proof's and a new key's shows the same text at either.
 
 Where each end may stand; any other is a violation:
 
-- `20` and `21` from the baseline: only before any description;
-- the proof's kinds: where a disk proof's stand;
-- an addition's new-key kinds: only after its connect step;
-- `0e` and `28`: after the acknowledged commit;
+- `21` from the baseline, with no detail or the selection's own
+  (`01` for an addition, `02` for either removal, `03` for a
+  request): only before any description;
+- `20`: before the commit;
+- a definite `28`: from the first description on;
+- the proof's `01` to `07` and `26`, a recovery-key proof's `25` and a
+  removal's `04` detail `01`: from the proof's first step to the
+  commit, never at the choose step;
+- an addition's new-key kinds, `11` among them: from its connect step
+  to the commit;
+- `0e`: after the acknowledged commit;
 - the selector update's `08`, `0f`, `10` and `80`: where they can stand.
 
 The attempt's lifetime is amendment 10's ceiling: 360 seconds for an
 addition or either removal, and 240 for a request.
+
+Host tests drive each operation's whole status sequence, the choose
+digit among its secrets. They cover each end where root can send it and
+where it cannot; another operation's, role's or proof's first
+description; a step past another position; and the authorizing key's
+reuse. They also cover the choose profile, every prompt at the four
+oracle outputs, and the screens through `read_device`: before they
+are on glass and from a security key's own keyboard.
 
 **Disk proofs.** On the key-management screen, while the last `1a`
 answer's protected byte reads `01`, a choice of `1`, `2` or `A`, or a

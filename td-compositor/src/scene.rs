@@ -3421,13 +3421,16 @@ impl Scene {
         // A new prompt, or none, replaces a PIN field.
         self.attention_field = None;
         if self.attention_request_attempted {
-            // A login step's or an upgrade's successor carries device data
-            // root admits, so only its shape is checked here; an
-            // enrollment's is derived.
+            // A login step's, an upgrade's or protector management's
+            // successor carries device data root admits, so only its shape
+            // is checked here; an enrollment's is derived.
             let follows = match self.attention_request() {
                 Some(previous) if previous.is_login() => previous.login_successor(&request).is_ok(),
                 Some(previous) if previous.upgrade_step().is_some() => {
                     previous.upgrade_successor(&request).is_ok()
+                }
+                Some(previous) if previous.protector_step().is_some() => {
+                    previous.protector_successor(&request).is_ok()
                 }
                 Some(previous) => previous.following_enrollment_step()?.as_ref() == Some(&request),
                 None => false,
@@ -10176,6 +10179,139 @@ mod tests {
             assert!(scene
                 .prepare_attention_request_with_time(unlock.clone(), 800, 600, 3200, Some(118))
                 .is_err());
+        }
+    }
+
+    /// A removal's choose step is replaced only by its proof's first step
+    /// carrying a chosen position, under tag 20's rule.
+    #[test]
+    fn a_protector_prompt_admits_only_its_successor() {
+        use crate::authority::consent::{
+            DiskRole, DiskToken, LoginStep, Operation, Proof, Removal, Request, UpgradeShape,
+        };
+        let step = |chosen, step| {
+            Request::new(
+                [7; 32],
+                1000,
+                Operation::ProtectorRemove {
+                    account: 1000,
+                    proof: Proof::DiskKey,
+                    removal: Removal {
+                        shape: UpgradeShape::Fido2,
+                        marker: true,
+                        tpm_pin: false,
+                        tokens: vec![
+                            DiskToken {
+                                role: DiskRole::Primary,
+                                key: [1; 4],
+                            },
+                            DiskToken {
+                                role: DiskRole::Primary,
+                                key: [2; 4],
+                            },
+                        ],
+                        chosen,
+                    },
+                    step,
+                },
+            )
+            .unwrap()
+        };
+        let authorize = LoginStep::DiskAuthorize {
+            key: [2; 4],
+            retries: 8,
+        };
+        for (next, admitted) in [
+            (step(1, LoginStep::DiskIdentify), true),
+            (step(1, authorize), false),
+            (step(0, LoginStep::Choose), false),
+        ] {
+            let mut scene = Scene::new();
+            scene.set_attention(true);
+            scene
+                .prepare_attention_request_with_time(
+                    step(0, LoginStep::Choose),
+                    1280,
+                    800,
+                    5120,
+                    Some(360),
+                )
+                .unwrap();
+            assert_eq!(
+                scene
+                    .prepare_attention_request_with_time(next, 1280, 800, 5120, Some(359))
+                    .is_ok(),
+                admitted
+            );
+        }
+    }
+
+    /// Tag 21's keyed identify step is replaced only by its authorize step,
+    /// and an addition's connect step only by its create step.
+    #[test]
+    fn a_recovery_removal_and_an_addition_admit_only_their_successors() {
+        use crate::authority::consent::{
+            ApprovalKey, DiskRole, LoginStep, Operation, Proof, Request,
+        };
+        let authorize = LoginStep::DiskAuthorize {
+            key: [2; 4],
+            retries: 8,
+        };
+        let recovery = |step: LoginStep| {
+            Request::new(
+                [7; 32],
+                1000,
+                Operation::RecoveryRemove {
+                    account: 1000,
+                    step,
+                    approval: (step == LoginStep::DiskIdentify)
+                        .then(|| ApprovalKey::new(*b"47").unwrap()),
+                },
+            )
+            .unwrap()
+        };
+        let add = |step| {
+            Request::new(
+                [7; 32],
+                1000,
+                Operation::ProtectorAdd {
+                    account: 1000,
+                    proof: Proof::RecoveryKey,
+                    role: DiskRole::Recovery,
+                    step,
+                },
+            )
+            .unwrap()
+        };
+        let prove = LoginStep::Prove {
+            key: [9; 4],
+            retries: 8,
+        };
+        for (first, next, admitted) in [
+            (recovery(LoginStep::DiskIdentify), recovery(authorize), true),
+            (
+                recovery(LoginStep::DiskIdentify),
+                recovery(LoginStep::DiskIdentify),
+                false,
+            ),
+            (
+                add(LoginStep::Connect),
+                add(LoginStep::Create { retries: 8 }),
+                true,
+            ),
+            (add(LoginStep::Connect), add(prove), false),
+        ] {
+            let mut scene = Scene::new();
+            scene.set_attention(true);
+            scene
+                .prepare_attention_request_with_time(first, 1280, 800, 5120, Some(360))
+                .unwrap();
+            assert_eq!(
+                scene
+                    .prepare_attention_request_with_time(next, 1280, 800, 5120, Some(359))
+                    .is_ok(),
+                admitted
+            );
         }
     }
 

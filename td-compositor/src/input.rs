@@ -349,10 +349,21 @@ enum LoginScreen {
     /// upgrade is not yet the lifetime's selection.
     Protect,
     NewKeys(crate::authority::consent::UpgradeShape),
+    /// `A`'s role screen, then an addition's or `R`'s authorization
+    /// screen: protector management is not yet the lifetime's selection.
+    AddRole,
+    ProtectorAuthorize(ProtectorChoice),
     /// A protected machine's authorization choice for the login-key
     /// operation chosen (DESIGN.md, "Storage operations"), which is not
     /// yet the lifetime's selection.
     Authorize(crate::secret_client::LoginSelection),
+}
+
+/// The protector operation an authorization screen authorizes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProtectorChoice {
+    Add(crate::authority::consent::DiskRole),
+    Remove,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -757,8 +768,50 @@ impl KeyBindings {
                     None
                 }
                 KEY_C => Some(Selection::Login(LoginSelection::UpgradeCancel)),
+                KEY_A => {
+                    self.login_screen = LoginScreen::AddRole;
+                    decision.notice = Some(Notice::AddRole);
+                    None
+                }
+                KEY_R => {
+                    self.login_screen = LoginScreen::ProtectorAuthorize(ProtectorChoice::Remove);
+                    decision.notice = Some(Notice::Authorize { enrolled: false });
+                    None
+                }
+                // Only a disk security key authorizes it.
+                KEY_X => Some(Selection::Login(LoginSelection::Protector(
+                    crate::authority::consent::Managed::RecoveryRemove,
+                ))),
                 _ => None,
             };
+            return;
+        }
+        if self.login_screen == LoginScreen::AddRole {
+            use crate::authority::consent::DiskRole;
+            let role = match code {
+                KEY_P => Some(DiskRole::Primary),
+                KEY_R => Some(DiskRole::Recovery),
+                _ => None,
+            };
+            if let Some(role) = role {
+                self.login_screen = LoginScreen::ProtectorAuthorize(ProtectorChoice::Add(role));
+                decision.notice = Some(Notice::Authorize { enrolled: false });
+            }
+            return;
+        }
+        if let LoginScreen::ProtectorAuthorize(choice) = self.login_screen {
+            use crate::authority::consent::{Managed, Proof};
+            let proof = match code {
+                KEY_R => Some(Proof::RecoveryKey),
+                KEY_S => Some(Proof::DiskKey),
+                _ => None,
+            };
+            decision.secret = proof.map(|proof| {
+                Selection::Login(LoginSelection::Protector(match choice {
+                    ProtectorChoice::Add(role) => Managed::Add { proof, role },
+                    ProtectorChoice::Remove => Managed::Remove { proof },
+                }))
+            });
             return;
         }
         if self.login_screen == LoginScreen::Protect {
@@ -11277,10 +11330,7 @@ mod tests {
             &target,
             &bindings,
             0,
-            &presses(
-                &[KEY_S, KEY_W, KEY_I, KEY_R, KEY_E, KEY_K, KEY_L, KEY_B],
-                20,
-            ),
+            &presses(&[KEY_S, KEY_W, KEY_I, KEY_E, KEY_K, KEY_L, KEY_B], 20),
         );
         assert!(target.lock().unwrap().secret_roles.is_empty());
         read_reports(&target, &bindings, 0, &presses(&[KEY_U, KEY_U, KEY_S], 30));
@@ -11344,6 +11394,130 @@ mod tests {
             assert_eq!(target.notices, notices, "{selected:?}");
             assert_eq!(target.secret_roles, [Selection::Login(selected.clone())]);
         }
+    }
+
+    /// The storage screen's `A` opens the role screen and a role the
+    /// authorization screen, `R` the authorization screen, neither a
+    /// selection, whose `R` or `S` is (DESIGN.md, "Protector management");
+    /// `X` selects the recovery key's removal at once. Each screen's
+    /// other letters choose nothing.
+    #[test]
+    fn protector_management_takes_its_role_and_proof_before_it_selects() {
+        use crate::attention::Notice;
+        use crate::authority::consent::{DiskRole, Managed, Proof};
+        use crate::secret_client::{LoginSelection, Selection};
+        let authorize = Notice::Authorize { enrolled: false };
+        for (keys, notices, selected) in [
+            (
+                &[KEY_S, KEY_A, KEY_S, KEY_K, KEY_P, KEY_P, KEY_K, KEY_R][..],
+                &[Notice::DiskEncryption, Notice::AddRole, authorize][..],
+                Managed::Add {
+                    proof: Proof::RecoveryKey,
+                    role: DiskRole::Primary,
+                },
+            ),
+            (
+                &[KEY_S, KEY_A, KEY_R, KEY_P, KEY_K, KEY_S],
+                &[Notice::DiskEncryption, Notice::AddRole, authorize],
+                Managed::Add {
+                    proof: Proof::DiskKey,
+                    role: DiskRole::Recovery,
+                },
+            ),
+            (
+                &[KEY_S, KEY_R, KEY_A, KEY_X, KEY_S],
+                &[Notice::DiskEncryption, authorize],
+                Managed::Remove {
+                    proof: Proof::DiskKey,
+                },
+            ),
+            (
+                &[KEY_S, KEY_X, KEY_R],
+                &[Notice::DiskEncryption],
+                Managed::RecoveryRemove,
+            ),
+        ] {
+            let target = Mutex::new(RecordingTarget::default());
+            let bindings = attention_bindings(None);
+            read_reports(&target, &bindings, 0, &chord_reports(10));
+            read_reports(&target, &bindings, 0, &presses(keys, 20));
+            let target = target.lock().unwrap();
+            assert_eq!(target.notices, notices, "{selected:?}");
+            assert_eq!(
+                target.secret_roles,
+                [Selection::Login(LoginSelection::Protector(selected))]
+            );
+        }
+    }
+
+    /// The role and authorization screens choose nothing until their own
+    /// paint is on glass, as the storage screen.
+    #[test]
+    fn the_protector_screens_choose_nothing_until_on_glass() {
+        use crate::attention::Notice;
+        use crate::authority::consent::{DiskRole, Managed, Proof};
+        use crate::secret_client::{LoginSelection, Selection};
+        let target = Mutex::new(RecordingTarget {
+            notices_owed: true,
+            ..RecordingTarget::default()
+        });
+        let bindings = attention_bindings(None);
+        read_reports(&target, &bindings, 0, &chord_reports(10));
+        let clock = Arc::clone(&target.lock().unwrap().clock);
+        read_reports(&target, &bindings, 0, &presses(&[KEY_S], 20));
+        clock.publish_for_test(1);
+        read_reports(&target, &bindings, 0, &presses(&[KEY_A, KEY_P], 30));
+        assert_eq!(
+            target.lock().unwrap().notices,
+            [Notice::DiskEncryption, Notice::AddRole]
+        );
+        clock.publish_for_test(2);
+        read_reports(&target, &bindings, 0, &presses(&[KEY_P, KEY_R], 40));
+        assert!(target.lock().unwrap().secret_roles.is_empty());
+        clock.publish_for_test(3);
+        read_reports(&target, &bindings, 0, &presses(&[KEY_R], 50));
+        let target = target.lock().unwrap();
+        assert_eq!(
+            target.notices,
+            [
+                Notice::DiskEncryption,
+                Notice::AddRole,
+                Notice::Authorize { enrolled: false }
+            ]
+        );
+        assert_eq!(
+            target.secret_roles,
+            [Selection::Login(LoginSelection::Protector(Managed::Add {
+                proof: Proof::RecoveryKey,
+                role: DiskRole::Primary,
+            }))]
+        );
+        drop(target);
+        // A security key's own keyboard chooses nothing on these screens:
+        // its touch types modhex, whose `r` is a letter here.
+        const KEY: usize = 1;
+        let target = Mutex::new(RecordingTarget::default());
+        let bindings = attention_bindings(None);
+        bindings.lock().unwrap().attention_excluded.insert(KEY);
+        read_reports(&target, &bindings, 0, &chord_reports(10));
+        read_reports(&target, &bindings, 0, &presses(&[KEY_S], 20));
+        read_reports(
+            &target,
+            &bindings,
+            KEY,
+            &presses(&[KEY_A, KEY_R, KEY_X], 30),
+        );
+        read_reports(&target, &bindings, 0, &presses(&[KEY_R], 40));
+        read_reports(&target, &bindings, KEY, &presses(&[KEY_R, KEY_S], 50));
+        let target = target.lock().unwrap();
+        assert_eq!(
+            target.notices,
+            [
+                Notice::DiskEncryption,
+                Notice::Authorize { enrolled: false }
+            ]
+        );
+        assert!(target.secret_roles.is_empty());
     }
 
     /// The storage screen chooses nothing until its paint is on glass, nor
@@ -11547,7 +11721,11 @@ mod tests {
         for numlock in [false, true] {
             let (target, bindings) = pin_field(&[]);
             assert!(!bindings.lock().unwrap().num_lock);
-            target.lock().unwrap().field.open_for(true);
+            target
+                .lock()
+                .unwrap()
+                .field
+                .open_for(crate::secret_client::Profile::Recovery);
             if numlock {
                 read_reports(&target, &bindings, 0, &presses(&[KEY_NUMLOCK], 30));
             }
