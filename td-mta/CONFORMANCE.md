@@ -47,8 +47,12 @@ through td-mail: Reply-To, recipient filtering, Message-ID/References,
 sent date and quoted/forwarded body context come from the server. Automatic
 rules request a decoded custom header and distinguish matching from
 nonmatching values using fresh caches; the matching rule persists a flag.
-This covers automatic rules' full email projection, not the separate
-body-omitting rule preview/replay projection.
+The same native fixture submits the exact body-free Email/get projection
+used by rule preview/replay directly to the PostgreSQL HTTP backend. It checks
+address/message headers, decoded custom headers, explicit null for an absent
+header, missing email IDs, and omission of unrequested body properties.
+This validates that projection at the backend boundary; preview interaction
+and queued rule replay are not driven through the real td-mail UI here.
 EventSource emits pings only; Mail StateChange integration remains absent and
 is not used by td-mail. Activation follows
 the supported td-mail workflow tests, not every reference-table row.

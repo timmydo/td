@@ -252,6 +252,16 @@ pub(super) fn exercise(
         admission: &admission,
         timeouts: &timeouts,
     };
+    if !sending {
+        exercise_rule_projection(
+            &backend,
+            device.device_id(),
+            device.password(),
+            delivery.email(),
+        );
+        assert_eq!(responses.used().unwrap(), 0);
+        assert!(!responses.admission_stopped());
+    }
     let config = runtime.join("mail.toml");
     fs::write(&config, format!("[account.test]\nwell_known_url = \"{origin}/.well-known/jmap\"\nusername = \"user\"\npassword_command = \"printf {}\"\n", std::str::from_utf8(device.password()).unwrap())).unwrap();
     let mut mail_config = fs::read_to_string(&config).unwrap();
@@ -723,6 +733,116 @@ pub(super) fn exercise(
         "0"
     );
     assert_eq!(sql(fixture, &format!("SELECT count(*) FROM td_mta.changes WHERE kind=1 AND action=3 AND object=decode('{recovered}','hex')")), "1");
+}
+
+fn exercise_rule_projection(
+    backend: &td_mta::postgres_http_api::Service<'_, '_, '_>,
+    device: td_mta::ids::DeviceId,
+    password: &[u8],
+    email: td_mta::ids::EmailId,
+) {
+    use td_mta::https_upload::Backend;
+    let credentials = http_fixture::credentials(password);
+    let mut buffer = [0; td_mta::wire::IdKind::WIRE_BYTES];
+    let account = td_mta::wire::encode_id(backend.binding.account(), &mut buffer)
+        .unwrap()
+        .to_owned();
+    let email = td_mta::wire::encode_id(email, &mut buffer)
+        .unwrap()
+        .to_owned();
+    let absent =
+        td_mta::wire::encode_id(td_mta::ids::EmailId::from_bytes([0xfe; 16]), &mut buffer).unwrap();
+    // td-mail::get_emails_for_rules intentionally asks for no body properties.
+    let properties = [
+        "id",
+        "threadId",
+        "from",
+        "to",
+        "cc",
+        "replyTo",
+        "subject",
+        "messageId",
+        "receivedAt",
+        "keywords",
+        "mailboxIds",
+        "header:X-Td-Fixture:asText",
+        "header:X-Td-Missing:asText",
+    ];
+    let body = json!({"using":["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+        "methodCalls":[["Email/get", {"accountId":account, "ids":[email, absent],
+            "properties":properties}, "0"]]})
+    .to_string();
+    let mut wire = http_fixture::Wire {
+        input: body.as_bytes().to_vec(),
+        position: 0,
+        output: Vec::new(),
+        fail_write: false,
+    };
+    backend
+        .api(
+            td_mta::https_api::Request {
+                device,
+                credentials: &credentials,
+                framing: td_mta::http_request::Framing::Length(body.len() as u64),
+                prefix: &[],
+                expect_continue: false,
+                deadline: Deadline::after(backend.clock.sample().unwrap().monotonic, 10_000)
+                    .unwrap(),
+            },
+            &mut wire,
+            &Control::default(),
+        )
+        .unwrap();
+    let wire = String::from_utf8(wire.output).unwrap();
+    let (headers, body) = wire.split_once("\r\n\r\n").unwrap();
+    assert!(headers.starts_with("HTTP/1.1 200 OK\r\n"), "{wire}");
+    let response = td_json::parse(body).unwrap();
+    let methods = response["methodResponses"].as_array().unwrap();
+    assert_eq!(methods.len(), 1, "{response}");
+    assert_eq!(methods[0][0].as_str(), Some("Email/get"), "{response}");
+    assert_eq!(methods[0][2].as_str(), Some("0"), "{response}");
+    let result = &methods[0][1];
+    assert_eq!(result["accountId"].as_str(), Some(account.as_str()));
+    assert_eq!(result["notFound"], json!([absent]));
+    let list = result["list"].as_array().unwrap();
+    assert_eq!(list.len(), 1, "{result}");
+    let item = &list[0];
+    assert_eq!(item["id"].as_str(), Some(email.as_str()));
+    assert_eq!(item["subject"].as_str(), Some("PostgreSQL client"));
+    assert_eq!(
+        item["from"][0]["email"].as_str(),
+        Some("sender@example.test")
+    );
+    assert_eq!(item["to"][0]["email"].as_str(), Some("main@example.test"));
+    assert_eq!(item["cc"][0]["email"].as_str(), Some("peer@example.test"));
+    assert_eq!(
+        item["replyTo"][0]["email"].as_str(),
+        Some("reply@example.test")
+    );
+    assert_eq!(item["messageId"], json!(["postgres-client@example.test"]));
+    assert_eq!(
+        item["header:X-Td-Fixture:asText"].as_str(),
+        Some("café triage")
+    );
+    assert!(item
+        .get("header:X-Td-Missing:asText")
+        .is_some_and(Json::is_null));
+    let object = item.as_object().unwrap();
+    assert_eq!(object.len(), properties.len(), "{item}");
+    for name in properties {
+        assert!(item.get(name).is_some(), "missing {name}: {item}");
+    }
+    for name in [
+        "bodyValues",
+        "textBody",
+        "htmlBody",
+        "bodyStructure",
+        "preview",
+        "attachments",
+        "blobId",
+    ] {
+        assert!(item.get(name).is_none(), "unrequested {name}: {item}");
+    }
 }
 
 fn exercise_reply_context(client: &mut Client, id: &str) {

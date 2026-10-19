@@ -6104,26 +6104,13 @@ fn exercise_read_dispatch(
     assert!(!owner.admission_stopped());
 }
 
-fn exercise_http_read(
-    fixture: &Fixture,
-    binding: &td_mta::postgres_runtime_profile::Binding,
-    password: &[u8],
-    device: td_mta::ids::DeviceId,
-    drafts: bool,
-) {
-    use std::sync::Arc;
-    use td_mta::{
-        admission::{timers::NetworkLimits, DiskLimits, ViewMode, WorkLimits},
-        http_request::Framing,
-        https_upload::Backend,
-        ports::{Clock, Deadline, Error, FlushProgress, IoProgress, Transport},
-        store_fs::{PrivateRoot, RequestSpool, ResponseCoordinator},
-    };
-    struct Wire {
-        input: Vec<u8>,
-        position: usize,
-        output: Vec<u8>,
-        fail_write: bool,
+mod http_fixture {
+    use td_mta::ports::{Error, FlushProgress, IoProgress, Transport};
+    pub(super) struct Wire {
+        pub(super) input: Vec<u8>,
+        pub(super) position: usize,
+        pub(super) output: Vec<u8>,
+        pub(super) fail_write: bool,
     }
     impl Transport for Wire {
         fn read(&mut self, bytes: &mut [u8]) -> Result<IoProgress, Error> {
@@ -6154,7 +6141,7 @@ fn exercise_http_read(
         }
         fn abort(&mut self) {}
     }
-    let credentials = |password: &[u8]| {
+    pub(super) fn credentials(password: &[u8]) -> td_mta::http_auth::BasicCredentials {
         let bytes = [b"reader:".as_slice(), password].concat();
         let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         let mut encoded = String::from("Basic ");
@@ -6176,6 +6163,24 @@ fn exercise_http_read(
             });
         }
         td_mta::http_auth::parse_basic("reader", Some(&encoded)).unwrap()
+    }
+}
+
+fn exercise_http_read(
+    fixture: &Fixture,
+    binding: &td_mta::postgres_runtime_profile::Binding,
+    password: &[u8],
+    device: td_mta::ids::DeviceId,
+    drafts: bool,
+) {
+    use http_fixture::{credentials, Wire};
+    use std::sync::Arc;
+    use td_mta::{
+        admission::{timers::NetworkLimits, DiskLimits, ViewMode, WorkLimits},
+        http_request::Framing,
+        https_upload::Backend,
+        ports::{Clock, Deadline, Error},
+        store_fs::{PrivateRoot, RequestSpool, ResponseCoordinator},
     };
     let loaded = td_mta::postgres_input::Loaded {
         bootstrap: td_mta::postgres_bootstrap::Bootstrap::parse(
