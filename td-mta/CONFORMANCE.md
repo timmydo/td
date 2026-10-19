@@ -42,6 +42,13 @@ filenames and text MIME parts, using the shared HTML extraction policy.
 Embedded message content currently causes an explicit interpretation error;
 it is not silently omitted from search. Query work or deadline exhaustion
 also refuses the method rather than returning a partial match page.
+The native read fixture also builds reply, reply-all and forward drafts
+through td-mail: Reply-To, recipient filtering, Message-ID/References,
+sent date and quoted/forwarded body context come from the server. Automatic
+rules request a decoded custom header and distinguish matching from
+nonmatching values using fresh caches; the matching rule persists a flag.
+This covers automatic rules' full email projection, not the separate
+body-omitting rule preview/replay projection.
 EventSource emits pings only; Mail StateChange integration remains absent and
 is not used by td-mail. Activation follows
 the supported td-mail workflow tests, not every reference-table row.

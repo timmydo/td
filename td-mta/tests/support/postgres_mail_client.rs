@@ -141,6 +141,9 @@ pub(super) fn exercise(
     let message = concat!(
         "From: Sender <sender@example.test>\r\nTo: main@example.test\r\n",
         "Subject: PostgreSQL client\r\nMessage-ID: <postgres-client@example.test>\r\n",
+        "Reply-To: Reply Desk <reply@example.test>\r\nCc: Peer <peer@example.test>\r\n",
+        "References: <ancestor@example.test>\r\nDate: Tue, 14 Nov 2023 12:00:00 +0000\r\n",
+        "X-Td-Fixture: =?utf-8?Q?caf=C3=A9_triage?=\r\n",
         "MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=x\r\n\r\n",
         "--x\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nHello PostgreSQL client\r\n",
         "--x\r\nContent-Type: application/octet-stream\r\n",
@@ -251,6 +254,9 @@ pub(super) fn exercise(
     };
     let config = runtime.join("mail.toml");
     fs::write(&config, format!("[account.test]\nwell_known_url = \"{origin}/.well-known/jmap\"\nusername = \"user\"\npassword_command = \"printf {}\"\n", std::str::from_utf8(device.password()).unwrap())).unwrap();
+    let mut mail_config = fs::read_to_string(&config).unwrap();
+    mail_config.push_str("[mail]\nreply_from = \"main@example.test\"\n");
+    fs::write(&config, mail_config).unwrap();
     fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
     let fetch_socket = runtime.join("td-fetch/socket");
     let _fetch = Process(
@@ -322,6 +328,7 @@ pub(super) fn exercise(
             assert_eq!(members.len(), 1, "{thread}");
             assert_eq!(members[0]["id"], email["id"]);
             assert_eq!(members[0]["body"], email["body"]);
+            exercise_reply_context(&mut client, email["id"].as_str().unwrap());
             for (command, seen, flagged) in [("mark_read", true, false), ("flag", true, true), ("mark_unread", false, true), ("unflag", false, false)] {
                 let changed = client.ask(json!({"command":command, "id":email["id"]}));
                 assert!(changed["ok"].is_true(), "{changed}");
@@ -388,6 +395,7 @@ pub(super) fn exercise(
             assert!(!listing["mailboxes"].as_array().unwrap().iter().any(|folder| folder["id"].as_str()==Some(archive_wire)));
             exercise_queries(&mut client, request, trust, &cloud_binding, inbox_wire,
                 listing["mailboxes"].as_array().unwrap().iter().find(|folder| folder["name"].as_str()==Some("Child")).unwrap()["id"].as_str().unwrap(), email["id"].as_str().unwrap());
+            exercise_header_rules(fixture, &config, &runtime, inbox_wire, email["id"].as_str().unwrap());
             let usage_before = sql(fixture, "SELECT body_bytes||':'||blob_count FROM td_mta.account_usage");
             let extra = postgres_receiving::prepare(&cloud_binding, &postgres_receiving::Message {
                 bytes: message.as_bytes(), hostname: "localhost", extended: true, header_bytes: 65536,
@@ -715,6 +723,104 @@ pub(super) fn exercise(
         "0"
     );
     assert_eq!(sql(fixture, &format!("SELECT count(*) FROM td_mta.changes WHERE kind=1 AND action=3 AND object=decode('{recovered}','hex')")), "1");
+}
+
+fn exercise_reply_context(client: &mut Client, id: &str) {
+    for reply_all in [false, true] {
+        let response = client.ask(json!({"command":"reply_draft", "id":id,
+            "reply_all":reply_all}));
+        assert!(response["ok"].is_true(), "{response}");
+        let draft = response["draft"].as_str().unwrap();
+        for expected in [
+            "From: main@example.test\n",
+            "To: Reply Desk <reply@example.test>\n",
+            "Subject: Re: PostgreSQL client\n",
+            "In-Reply-To: <postgres-client@example.test>\n",
+            "References: <ancestor@example.test> <postgres-client@example.test>\n",
+            "On 2023-11-14T12:00:00Z, Sender <sender@example.test> wrote:",
+            "> Hello PostgreSQL client",
+        ] {
+            assert!(draft.contains(expected), "missing {expected:?}: {draft}");
+        }
+        let cc = draft.lines().find(|line| line.starts_with("Cc:"));
+        assert_eq!(
+            cc,
+            reply_all.then_some("Cc: Peer <peer@example.test>"),
+            "{draft}"
+        );
+    }
+    let response = client.ask(json!({"command":"forward_draft", "id":id}));
+    assert!(response["ok"].is_true(), "{response}");
+    let draft = response["draft"].as_str().unwrap();
+    for expected in [
+        "From: main@example.test\nTo: \nSubject: Fwd: PostgreSQL client\n",
+        "---------- Forwarded message ----------",
+        "From: Sender <sender@example.test>\n",
+        "Date: 2023-11-14T12:00:00Z\n",
+        "Subject: PostgreSQL client\n",
+        "To: main@example.test\n",
+        "Cc: Peer <peer@example.test>\n",
+        "Hello PostgreSQL client",
+    ] {
+        assert!(draft.contains(expected), "missing {expected:?}: {draft}");
+    }
+}
+
+fn exercise_header_rules(
+    fixture: &Fixture,
+    config: &std::path::Path,
+    runtime: &std::path::Path,
+    mailbox: &str,
+    id: &str,
+) {
+    let root = runtime.join("header-rules");
+    fs::create_dir(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    let rules_config = root.join("mail.toml");
+    let mut contents = fs::read_to_string(config).unwrap();
+    // The base configuration already ends in the mail table.
+    contents.push_str("rules_mailbox_regex = \".*\"\n");
+    fs::write(&rules_config, contents).unwrap();
+    fs::set_permissions(&rules_config, fs::Permissions::from_mode(0o600)).unwrap();
+    for (name, pattern, flagged) in [("miss", "^wrong$", false), ("match", "^café triage$", true)]
+    {
+        fs::write(root.join("rules.toml"), format!(
+            "[[rule]]\nname = \"custom-header\"\n[rule.match]\nheader = \"X-Td-Fixture\"\nregex = \"{pattern}\"\n[rule.actions]\nflag = true\n"
+        )).unwrap();
+        // Fresh caches ensure an earlier processed marker cannot hide a rule.
+        let mut client = Client::start_with_state(&rules_config, runtime, &root.join(name));
+        let connected = client.ask(json!({"command":"connect", "account":"test"}));
+        assert!(connected["ok"].is_true(), "{connected}");
+        let mailboxes = client.ask(json!({"command":"list_mailboxes"}));
+        assert!(mailboxes["ok"].is_true(), "{mailboxes}");
+        let listing = client.ask(json!({"command":"query_emails", "mailbox_id":mailbox}));
+        assert!(listing["ok"].is_true(), "{listing}");
+        assert_eq!(listing["emails"].as_array().unwrap().len(), 1, "{listing}");
+        assert_eq!(listing["emails"][0]["id"].as_str(), Some(id), "{listing}");
+        assert_eq!(
+            listing["emails"][0]["body"].as_str(),
+            Some("Hello PostgreSQL client")
+        );
+        assert!(!listing["emails"][0]["unreadable"].is_true(), "{listing}");
+        assert_eq!(
+            sql(
+                fixture,
+                "SELECT count(*) FROM td_mta.keywords WHERE keyword='$flagged'"
+            ),
+            if flagged { "1" } else { "0" }
+        );
+        if flagged {
+            let restored = client.ask(json!({"command":"unflag", "id":id}));
+            assert!(restored["ok"].is_true(), "{restored}");
+            assert_eq!(
+                sql(
+                    fixture,
+                    "SELECT count(*) FROM td_mta.keywords WHERE keyword='$flagged'"
+                ),
+                "0"
+            );
+        }
+    }
 }
 
 fn exercise_queries(
