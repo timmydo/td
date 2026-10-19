@@ -407,9 +407,14 @@ pub(super) fn exercise(
                 listing["mailboxes"].as_array().unwrap().iter().find(|folder| folder["name"].as_str()==Some("Child")).unwrap()["id"].as_str().unwrap(), email["id"].as_str().unwrap());
             exercise_header_rules(fixture, &config, &runtime, inbox_wire, email["id"].as_str().unwrap());
             let usage_before = sql(fixture, "SELECT body_bytes||':'||blob_count FROM td_mta.account_usage");
+            let reply_message = message
+                .replace("Message-ID: <postgres-client@example.test>", "Message-ID: <postgres-reply@example.test>")
+                .replace("References: <ancestor@example.test>", "References: <ancestor@example.test> <postgres-client@example.test>")
+                .replace("Subject: PostgreSQL client", "Subject: Re: PostgreSQL client")
+                .replace("Hello PostgreSQL client", "Reply through PostgreSQL");
             let extra = postgres_receiving::prepare(&cloud_binding, &postgres_receiving::Message {
-                bytes: message.as_bytes(), hostname: "localhost", extended: true, header_bytes: 65536,
-                received_at: 1_700_000_000_000,
+                bytes: reply_message.as_bytes(), hostname: "localhost", extended: true, header_bytes: 65536,
+                received_at: 1_700_000_001_000,
                 receipt: SmtpReceipt { peer: "192.0.2.1".parse().unwrap(), tls: ReceiptTls::Tls13, gateway: None,
                     ehlo: "sender.example.test", reverse_path: "sender@example.test", recipients },
             }, deadline()).unwrap();
@@ -418,8 +423,33 @@ pub(super) fn exercise(
             let extra_wire = td_mta::wire::encode_id(extra.email(), &mut extra_wire).unwrap();
             let listing = client.ask(json!({"command":"query_emails", "mailbox_id":inbox_wire, "limit":50}));
             assert_eq!(listing["emails"].as_array().unwrap().len(), 2, "{listing}");
+            let check_thread = |client: &mut Client, expected: &[(&str, &str)]| {
+                let reply = client.ask(json!({"command":"get_thread", "thread_id":email["thread_id"]}));
+                assert!(reply["ok"].is_true(), "{reply}");
+                let members = reply["emails"].as_array().unwrap();
+                let actual: Vec<_> = members.iter().map(|member| {
+                    assert_eq!(member["thread_id"], email["thread_id"], "{reply}");
+                    (member["id"].as_str().unwrap(), member["body"].as_str().unwrap())
+                }).collect();
+                assert_eq!(actual, expected, "{reply}");
+            };
+            let original = (email["id"].as_str().unwrap(), "Hello PostgreSQL client");
+            let reply = (extra_wire, "Reply through PostgreSQL");
+            check_thread(&mut client, &[original, reply]);
+            let thread_folders = client.ask(json!({"command":"list_mailboxes"}));
+            assert!(thread_folders["ok"].is_true(), "{thread_folders}");
+            let other = thread_folders["mailboxes"].as_array().unwrap().iter()
+                .find(|folder| folder["name"].as_str() == Some("Child")).unwrap()["id"].as_str().unwrap();
+            let moved = client.ask(json!({"command":"move_email", "id":extra_wire, "to_mailbox_id":other}));
+            assert!(moved["ok"].is_true(), "{moved}");
+            check_thread(&mut client, &[original, reply]);
+            let inbox = client.ask(json!({"command":"query_emails", "mailbox_id":inbox_wire}));
+            assert!(inbox["ok"].is_true(), "{inbox}");
+            assert_eq!(inbox["emails"].as_array().unwrap().len(), 1, "{inbox}");
+            assert_eq!(inbox["emails"][0]["id"], email["id"]);
             let deleted = client.ask(json!({"command":"destroy", "id":extra_wire}));
             assert!(deleted["results"][0]["ok"].is_true(), "{deleted}");
+            check_thread(&mut client, &[original]);
             assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "1");
             assert_eq!(sql(fixture, "SELECT body_bytes||':'||blob_count FROM td_mta.account_usage"), usage_before);
             let listing = client.ask(json!({"command":"query_emails", "mailbox_id":inbox_wire, "limit":50}));

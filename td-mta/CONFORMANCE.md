@@ -382,6 +382,12 @@ permanent Email deletion,
 decoded attachment download and raw-message download with the real client. Authentication and API/download work run on the fixed HTTPS
 workers. Its private CA enters only the existing test-only fetch process.
 
+A received reply with a distinct Message-ID and References to the original
+joins its thread. Real td-mail retrieves both bodies in received-time order,
+including after the reply moves to another folder; deleting that reply leaves
+the original thread member visible. This exercises Thread/get followed by
+Email/get through the client, not just stored thread IDs.
+
 This PostgreSQL fixture is part of the native gate. It does not qualify
 cloud-provider failover or managed-database deployment.
 The separate send and executable-service cases cover their named flows. Process and file cleanup belong to
