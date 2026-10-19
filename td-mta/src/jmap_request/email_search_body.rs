@@ -58,6 +58,59 @@ fn search_inner(
     if pin.len() > limits.message_bytes as u64 {
         return Err(Error::StorageCapacity);
     }
+    if limits.mime_parts == 0 {
+        return Err(Error::MessageInterpretation);
+    }
+    let mut pending = Vec::new();
+    pending
+        .try_reserve_exact(limits.mime_parts)
+        .map_err(|_| Error::StorageCapacity)?;
+    pending.push(Context {
+        extent: 0..pin.len(),
+        stage: 0,
+    });
+    let mut traversal = Traversal {
+        search,
+        budget,
+        pending,
+        parts: limits.mime_parts,
+        headers: limits.header_bytes,
+    };
+    while let Some(context) = traversal.pending.pop() {
+        if traversal.parts == 0 {
+            return Err(Error::MessageInterpretation);
+        }
+        let mut local = *limits;
+        local.mime_parts = traversal.parts;
+        local.mime_depth = limits.mime_depth.min(traversal.parts);
+        // The parser requires a positive ceiling. Aggregate accounting below
+        // still refuses any header bytes beyond the remaining allowance.
+        local.header_bytes = traversal.headers.max(1);
+        search_context(pin, &local, clock, work, &mut traversal, context)?;
+    }
+    Ok(traversal.search.matched())
+}
+struct Context {
+    extent: std::ops::Range<u64>,
+    stage: usize,
+}
+struct Traversal<'a> {
+    search: &'a mut Search,
+    budget: &'a mut HeaderBudget,
+    pending: Vec<Context>,
+    parts: usize,
+    headers: usize,
+}
+fn search_context(
+    pin: &mut PinnedBlob<'_, '_>,
+    limits: &Limits,
+    clock: &dyn Clock,
+    work: &mut Meter,
+    traversal: &mut Traversal<'_>,
+    context: Context,
+) -> Result<(), Error> {
+    let search = &mut *traversal.search;
+    let budget = &mut *traversal.budget;
     let mut selected = Selection::new();
     for name in ["From", "To", "Cc", "Bcc"] {
         selected.include(&format!("header:{name}:asAddresses:all"), work, clock)?;
@@ -90,6 +143,7 @@ fn search_inner(
         clock,
         work,
         HeaderBacking {
+            extent: context.extent.clone(),
             arena: &mut arena,
             budget,
             scratch: &mut scratch,
@@ -123,11 +177,10 @@ fn search_inner(
     let mut chunk = [0; 4096];
     let mut parts = buffer(limits.mime_parts)?;
     let mut headers = buffer(limits.mime_parts)?;
-    let length = pin.len();
     let mut cursor = blob_structure::Cursor::new(
         pin,
         blob_structure::Settings {
-            extent: 0..length,
+            extent: context.extent,
             limits: mime_structure::Limits {
                 header_bytes: limits.header_bytes,
                 mime_depth: limits.mime_depth,
@@ -147,6 +200,16 @@ fn search_inner(
     .map_err(mime)?;
     while cursor.poll(now(clock)?).map_err(mime)? != mime_structure::Status::Complete {}
     let mut original = cursor.finish(now(clock)?).map_err(mime)?;
+    traversal.parts = traversal
+        .parts
+        .checked_sub(original.parts.len())
+        .ok_or(Error::MessageInterpretation)?;
+    traversal.headers = traversal
+        .headers
+        .checked_sub(
+            usize::try_from(original.header_bytes).map_err(|_| Error::MessageInterpretation)?,
+        )
+        .ok_or(Error::MessageInterpretation)?;
     let mut metadata = Metadata::new(limits.header_bytes.min(16 * 1024))?;
     let mut input = buffer(crate::mime_input::INPUT_BYTES)?;
     let mut checkpoints = crate::mime_input::Checkpoints::default();
@@ -170,8 +233,23 @@ fn search_inner(
                 clock,
             )?;
         }
-        // Nested message interpretation is not active in this search profile.
-        // Refuse instead of silently omitting potentially matching content.
+        if heads.content_type.eq_ignore_ascii_case(b"message/rfc822") {
+            let node = part.metadata.part;
+            if node.encoding != mime_structure::Encoding::Identity
+                || node.problems() & mime_structure::UNKNOWN_ENCODING != 0
+                || context.stage == 6
+                || traversal.pending.len() >= traversal.parts
+            {
+                return Err(Error::MessageInterpretation);
+            }
+            charge(part.structure.work, clock, 1)?;
+            traversal.pending.push(Context {
+                extent: node.body_start..node.entity_end,
+                stage: context.stage + 1,
+            });
+            continue;
+        }
+        // Other message types require their own decoded source context.
         if heads
             .content_type
             .get(..8)
@@ -242,7 +320,7 @@ fn search_inner(
     }
     original.source.check_deadline().map_err(storage)?;
     charge(original.work, clock, 0)?;
-    Ok(search.matched())
+    Ok(())
 }
 
 #[cfg(test)]
@@ -270,6 +348,126 @@ mod tests {
                 unlinks: 0,
             },
         )
+    }
+    fn attached(body: &str) -> String {
+        format!("Content-Type: message/rfc822\r\nContent-Transfer-Encoding: 8bit\r\n\r\n{body}")
+    }
+    fn check_source(message: &[u8], limits: &Limits, query: &str) -> Result<bool, Error> {
+        let mut outcome = Err(Error::State);
+        crate::store_fs::with_pinned_fixture(message, &Fixed, |mut pin| {
+            outcome = search_verified(
+                &mut pin,
+                limits,
+                &mut Search::parse(query).unwrap(),
+                &Fixed,
+                &mut work(100_000_000),
+            );
+        });
+        outcome
+    }
+    #[test]
+    fn attached_identity_messages_search_headers_and_text_as_separate_fields() {
+        let inner = "From: Inner <inner@example.test>\r\nSubject: =?utf-8?Q?Orchard_caf=C3=A9?=\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<style>hiddenneedle</style><p>Harvest &amp; rain</p>";
+        let source = attached(&attached(inner));
+        for (query, expected) in [
+            ("inner@example.test CAFÉ harvest", true),
+            ("\"Harvest & rain\"", true),
+            ("hiddenneedle", false),
+            ("\"café Harvest\"", false),
+            ("absent", false),
+        ] {
+            assert_eq!(
+                check_source(source.as_bytes(), &Limits::default(), query),
+                Ok(expected),
+                "{query}"
+            );
+        }
+        let siblings = format!(
+            "Content-Type: multipart/mixed;boundary=x\r\n\r\n--x\r\n{}\r\n--x\r\n{}\r\n--x--\r\n",
+            attached("Subject: First\r\n\r\napples"),
+            attached("Subject: Second\r\n\r\npears")
+        );
+        assert_eq!(
+            check_source(siblings.as_bytes(), &Limits::default(), "first pears"),
+            Ok(true)
+        );
+    }
+    #[test]
+    fn attached_headerless_message_fits_exact_header_allowance() {
+        let header = "Content-Type: message/rfc822\r\n";
+        let limits = Limits {
+            header_bytes: header.len(),
+            mime_depth: 1,
+            mime_parts: 2,
+            ..Limits::default()
+        };
+        let source = format!("{header}\r\n\r\nneedle");
+        assert_eq!(check_source(source.as_bytes(), &limits, "needle"), Ok(true));
+        let source = format!("{header}\r\nX: y\r\n\r\nneedle");
+        assert_eq!(
+            check_source(source.as_bytes(), &limits, "needle"),
+            Err(Error::MessageInterpretation)
+        );
+    }
+    #[test]
+    fn embedded_contexts_keep_aggregate_limits_and_refuse_unsupported_sources() {
+        let inner = "Subject: Found\r\n\r\nbody";
+        let mut source = inner.to_owned();
+        for _ in 0..6 {
+            source = attached(&source);
+        }
+        assert_eq!(
+            check_source(source.as_bytes(), &Limits::default(), "found"),
+            Ok(true)
+        );
+        source = attached(&source);
+        assert_eq!(
+            check_source(source.as_bytes(), &Limits::default(), "found"),
+            Err(Error::MessageInterpretation)
+        );
+        let source = attached(inner);
+        let limits = Limits {
+            mime_parts: 1,
+            ..Limits::default()
+        };
+        assert_eq!(
+            check_source(source.as_bytes(), &limits, "found"),
+            Err(Error::MessageInterpretation)
+        );
+        let limits = Limits {
+            mime_parts: 2,
+            mime_depth: 2,
+            ..Limits::default()
+        };
+        assert_eq!(check_source(source.as_bytes(), &limits, "found"), Ok(true));
+        let headers = b"Content-Type: message/rfc822\r\nContent-Transfer-Encoding: 8bit\r\nSubject: Found\r\n";
+        let limits = Limits {
+            header_bytes: headers.len(),
+            ..Limits::default()
+        };
+        assert_eq!(check_source(source.as_bytes(), &limits, "found"), Ok(true));
+        // Each context fits alone, but their sum exceeds this bound by one.
+        let limits = Limits {
+            header_bytes: headers.len() - 1,
+            ..limits
+        };
+        assert_eq!(
+            check_source(source.as_bytes(), &limits, "found"),
+            Err(Error::MessageInterpretation)
+        );
+        for header in [
+            "Content-Type: message/rfc822\r\nContent-Transfer-Encoding: base64",
+            "Content-Type: message/rfc822\r\nContent-Transfer-Encoding: quoted-printable",
+            "Content-Type: message/rfc822\r\nContent-Transfer-Encoding: unknown",
+            "Content-Type: message/global",
+        ] {
+            let source = format!("Subject: Found\r\n{header}\r\n\r\n{inner}");
+            assert_eq!(
+                check_source(source.as_bytes(), &Limits::default(), "found"),
+                Err(Error::MessageInterpretation),
+                "{header}"
+            );
+        }
     }
     #[test]
     fn verified_sources_decode_names_extract_html_and_exclude_binary_data() {
@@ -341,6 +539,7 @@ mod tests {
                 &Fixed,
                 &mut meter,
                 HeaderBacking {
+                    extent: 0..MESSAGE.len() as u64,
                     arena: &mut arena,
                     budget: &mut budget,
                     scratch: &mut Scratch::new(),

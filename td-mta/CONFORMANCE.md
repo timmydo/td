@@ -39,8 +39,11 @@ between folders and deleting the corpus verifies fresh mailbox-scoped results.
 This is bounded functional coverage, not a large-mailbox performance claim.
 The active text-search profile covers root From/To/Cc/Bcc/Subject headers,
 filenames and text MIME parts, using the shared HTML extraction policy.
-Embedded message content currently causes an explicit interpretation error;
-it is not silently omitted from search. Query work or deadline exhaustion
+Identity-encoded message/rfc822 attachments, as produced by td-mail's
+forwarded-message attachment flow, are searched in separate bounded message
+contexts. Their headers and text participate in matching. Encoded embedded
+messages and other message/* types still cause an explicit interpretation
+error; unsupported content is not silently omitted from search. Query work or deadline exhaustion
 also refuses the method rather than returning a partial match page.
 The native read fixture also builds reply, reply-all and forward drafts
 through td-mail: Reply-To, recipient filtering, Message-ID/References,

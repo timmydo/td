@@ -2073,7 +2073,11 @@ neither a page nor a message renews them. Only the result page and bounded
 decoded headers are retained, with streamed text bodies and fixed HTML
 extraction state. Matching uses at most 64 substring automata over a 4096-byte
 operand, with field-local phrase progress and simple Unicode lowercase.
-POLICY.md owns supported sources and explicit embedded-message refusal.
+Identity-encoded message/rfc822 attachments use an iterative worklist of
+separate message contexts, retaining one context's parsing buffers at a time.
+The six-boundary nesting limit, aggregate part/header ceilings, original
+work meter and header budget apply across the traversal. POLICY.md owns
+supported sources and explicit refusal of other embedded-message encodings.
 This is a functional bounded scan, not a full-text index or throughput claim.
 
 ## 11. Submission and retry semantics

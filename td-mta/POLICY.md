@@ -624,9 +624,17 @@ mailbox and received-date conditions. It searches all root From/To/Cc/Bcc/
 Subject occurrences, MIME filenames and text parts, including text attachments;
 address names and mailbox strings are separate searchable fields, decoded
 through the supported address projection rather than the public Text form.
-HTML uses the shared extraction below. Embedded `message/*` interpretation
-is not active: encountering it refuses the query as messageInterpretation,
-even if earlier fields matched. Empty text needs no content interpretation.
+HTML uses the shared extraction below. Identity-encoded `message/rfc822`
+attachments are parsed as separate message contexts, including their own
+address/subject headers, filenames and text parts. At most six embedded
+message boundaries are followed; multipart depth remains independently
+bounded inside each context. Part counts and raw header bytes are aggregate
+across the outer message and every embedded context, as are the original
+work allowance and header interpretation budget. Bodies remain streamed;
+search does not publish nested blob locators. Transfer-encoded embedded
+messages, unknown transfer encodings and other `message/*` types still refuse
+the query as messageInterpretation, even if earlier fields matched. Empty
+text needs no content interpretation.
 The broader filter inventory below remains reference scope as CONFORMANCE.md
 specifies. No missing source is reported as a nonmatch.
 

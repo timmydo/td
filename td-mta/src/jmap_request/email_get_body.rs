@@ -144,6 +144,7 @@ pub fn write_verified(
     result
 }
 struct HeaderBacking<'a> {
+    extent: std::ops::Range<u64>,
     arena: &'a mut [u8],
     budget: &'a mut HeaderBudget,
     scratch: &'a mut Scratch,
@@ -177,8 +178,9 @@ fn write_headers(
                 worker.check()?;
             }
         }
-        let mut reader = crate::root_headers::Cursor::new(
+        let mut reader = crate::root_headers::Cursor::new_extent(
             pin,
+            backing.extent,
             limits.header_bytes as u64,
             backing.arena,
             work,
@@ -244,6 +246,7 @@ fn write_verified_inner(
         .and_then(|bytes| bytes.checked_add(2))
         .ok_or(Error::ResponseCapacity)?;
     let mut arena = buffer(arena_bytes)?;
+    let extent = 0..pin.len();
     write_headers(
         worker,
         pin,
@@ -251,6 +254,7 @@ fn write_verified_inner(
         clock,
         work,
         HeaderBacking {
+            extent,
             arena: &mut arena,
             budget: &mut budget,
             scratch: &mut scratch,

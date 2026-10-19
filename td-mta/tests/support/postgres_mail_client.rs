@@ -1130,11 +1130,19 @@ fn exercise_queries(
     postgres_receiving::publish(request, trust, deadline(), &nested).unwrap();
     let mut wire = [0; td_mta::wire::IdKind::WIRE_BYTES];
     let wire = td_mta::wire::encode_id(nested.email(), &mut wire).unwrap();
-    let refused = client.ask(json!({"command":"query_emails", "mailbox_id":inbox,
-        "search":"orchard"}));
-    assert!(
-        !refused["ok"].is_true(),
-        "embedded content must not silently disappear: {refused}"
+    for search in ["inner@example.test orchard", "nested content"] {
+        check(
+            client.ask(json!({"command":"query_emails", "mailbox_id":inbox,
+            "search":search})),
+            0,
+            &[wire],
+        );
+    }
+    check(
+        client.ask(json!({"command":"query_emails", "mailbox_id":inbox,
+        "search":"orchard absent-token"})),
+        0,
+        &[],
     );
     let deleted = client.ask(json!({"command":"destroy", "id":wire}));
     assert!(deleted["results"][0]["ok"].is_true(), "{deleted}");
