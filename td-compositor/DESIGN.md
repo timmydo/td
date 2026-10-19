@@ -6566,38 +6566,52 @@ the acknowledged commit, with the selector update's texts; its lifetime
 is 240 seconds.
 
 **Protector management.** The storage screen's 8g rows open their own
-screens, named by their paint and read under the same rules, and only a
-screen's last choice sends the selection, the lifetime's one operation;
-Escape before it closes attention and cancels nothing at root, since
-nothing was sent. `A` opens the role screen, `ADD A DISK SECURITY KEY
-AS:`, `P: A PRIMARY KEY THAT UNLOCKS`, `AND LOGS IN AT BOOT`, `R: A
-RECOVERY KEY THAT ONLY`, `UNLOCKS THE DISK` and `TPM DISKS TAKE RECOVERY
-KEYS ONLY`; its choice, and `R`, `N`, `T` and `E` on the storage screen,
-open the authorization screen, a disk proof's without `K`: `AUTHORIZE
-WITH:`, `R: THE DISK RECOVERY KEY` and `S: A DISK SECURITY KEY`, whose
-choice sends `20 04 P R`, `20 05 P`, `20 07 P`, `20 08 P` or `20 09 P`.
-`X` sends `20 06` at once, since only a disk security key authorizes it.
-Every letter on these screens is read as every selection is, under the
-exclusion of a security key's own keyboard. `a0 00` and `a0 01` are the
-selector update's. Root's first description must keep the nonce, owner
-and account 1000 and carry the selection's operation, proof and role;
-each later one is admitted through consent's successor rule for its tag,
-and each prompt is prepared as a disk proof's, at the single scale where
-the doubled cannot hold its rows and field (`Prepared::with_time` learns
-tags 19 to 24 beside `login_proof`). A proof step and a new key's step
-are presented as a disk proof's and an upgrade's are; tag 21's identify
-step is keyed as a login disclosure step is, its receipt sent only after
-the key's second digit. A removal's choose step opens a one-digit field
-on root's `0c`: a digit naming a removable token, by consent's
-`Removal::removable` over the description, sends it as `1c` at once, any
-other key is ignored, and Escape cancels; the next description must
-carry that digit as its chosen position, or the generation ends, as for
-a nonce not kept. Root's `05` after the last step's receipt asks for the
-commit, which the client sends at once. Success shows `DISK SECURITY KEY
-ADDED`, `DISK SECURITY KEY REMOVED`, `DISK RECOVERY KEY REMOVED`, or,
-for a request, `PIN CHANGE REQUESTED`, `TPM CLEAR REQUESTED` or `TPM
-RE-ENROLLMENT REQUESTED`, then the request's next-boot rows as its
-description shows them. Their ends add to the tables above:
+screens, each named by its paint and read under the same rules. Only a
+screen's last choice sends the selection, which is the lifetime's one
+operation; Escape before it closes attention and cancels nothing at
+root, since nothing was sent. Every letter on these screens is read as
+every selection is, under the exclusion of a security key's own
+keyboard.
+
+| Row | Operation | Opens | Sends |
+| --- | --- | --- | --- |
+| `A` | add a key | the role screen, then the authorization screen | `20 04 P R` |
+| `R` | remove a key | the authorization screen | `20 05 P` |
+| `X` | remove the recovery key | nothing: only a disk security key authorizes it | `20 06` at once |
+| `N` | request a PIN change | the authorization screen | `20 07 P` |
+| `T` | request a TPM clear | the authorization screen | `20 08 P` |
+| `E` | request a re-enrollment | the authorization screen | `20 09 P` |
+
+The role screen's rows are `ADD A DISK SECURITY KEY AS:`, `P: A PRIMARY
+KEY THAT UNLOCKS`, `AND LOGS IN AT BOOT`, `R: A RECOVERY KEY THAT ONLY`,
+`UNLOCKS THE DISK` and `TPM DISKS TAKE RECOVERY KEYS ONLY`. The
+authorization screen is a disk proof's without `K`: `AUTHORIZE WITH:`,
+`R: THE DISK RECOVERY KEY` and `S: A DISK SECURITY KEY`.
+
+`a0 00` and `a0 01` are the selector update's. The descriptions:
+
+- Root's first description must keep the nonce, owner and account 1000,
+  and carry the selection's operation, proof and role. Each later one
+  is admitted through consent's successor rule for its tag.
+- Each prompt is prepared as a disk proof's: at the single scale where
+  the doubled cannot hold its rows and field (`Prepared::with_time`
+  learns tags 19 to 24 beside `login_proof`).
+- A proof step is presented as a disk proof's, and a new key's step as
+  an upgrade's. Tag 21's identify step is keyed as a login disclosure
+  step is, its receipt sent only after the key's second digit.
+- A removal's choose step opens a one-digit field on root's `0c`. A
+  digit naming a removable token, by consent's `Removal::removable` over
+  the description, is sent as `1c` at once; any other key is ignored,
+  and Escape cancels. The next description must carry that digit as its
+  chosen position, or the generation ends, as for a nonce not kept.
+- Root's `05` after the last step's receipt asks for the commit, which
+  the client sends at once.
+
+Success shows `DISK SECURITY KEY ADDED`, `DISK SECURITY KEY REMOVED` or
+`DISK RECOVERY KEY REMOVED`; for a request, `PIN CHANGE REQUESTED`, `TPM
+CLEAR REQUESTED` or `TPM RE-ENROLLMENT REQUESTED`, then the request's
+next-boot rows as its description shows them. The ends add to the kind
+tables above:
 
 | Kind | Shows |
 | --- | --- |
@@ -6609,16 +6623,19 @@ description shows them. Their ends add to the tables above:
 | `01` to `03`, `05` to `07`, `11` | a new key's, as an upgrade's |
 | `0e` uncertain, for an addition | `RESULT UNCERTAIN` and `THE NEW KEY MAY OPEN THE DISK` / `EVEN IF IT IS NOT LISTED` |
 
-`21` with detail `00` keeps the selector update's text. Where a kind
-is both a proof's and a new key's, the step that stands chooses its
-text: a proof step's or a new key's. Protector
-management's ends are `20` and `21` from the baseline only before any
-description; the proof's kinds where a disk proof's stand; an
-addition's new-key kinds only after its connect step; `0e` and `28`
-after the acknowledged commit; and the selector update's `08`, `0f`,
-`10` and `80` where they can stand; any other is a violation. The
-attempt's lifetime is amendment 10's ceiling, 360 seconds for an
-addition or either removal and 240 for a request.
+`21` with detail `00` keeps the selector update's text. Where a kind is
+both a proof's and a new key's, the step that stands chooses its text.
+
+Where each end may stand; any other is a violation:
+
+- `20` and `21` from the baseline: only before any description;
+- the proof's kinds: where a disk proof's stand;
+- an addition's new-key kinds: only after its connect step;
+- `0e` and `28`: after the acknowledged commit;
+- the selector update's `08`, `0f`, `10` and `80`: where they can stand.
+
+The attempt's lifetime is amendment 10's ceiling: 360 seconds for an
+addition or either removal, and 240 for a request.
 
 **Disk proofs.** On the key-management screen, while the last `1a`
 answer's protected byte reads `01`, a choice of `1`, `2` or `A`, or a

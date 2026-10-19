@@ -1276,58 +1276,77 @@ DictionaryAttackParameters and LockReset) or a proof's two
 counter reset and, from its increment, one requested clear.
 
 **Protector management** (8g; ENCRYPTION.md "Protector management").
-`request::tag(volume_key, uuid, operation, nonce, header)` is
-ENCRYPTION.md's request tag: a 32-byte key HKDF-SHA256 derives from the
-volume key with an empty salt and the info
-`td/disk-protector/request/v1`, a zero byte, the UUID as the lockout
-reads it and the nonce, and the tag is HMAC-SHA256 under it over the
-operation name's length byte and name, the nonce, the header's lockout
-nonce (32 zero bytes without a lockout token) and the SHA-256 over each
-tpm-pin token's `public` bytes in token-number order, each preceded by
-its length as two big-endian bytes. `request::verifies` recomputes it
-over the header read at release and compares in constant time; an empty
-volume key verifies nothing, and the key is zeroed on drop.
-`tests/token_vectors.py` computes the tag independently. The running
-system's planners, `manage::add`, `manage::remove`,
-`manage::remove_recovery` and `manage::request`, plan over a protected
-header with the operation's proof as the opener (the token whose keyslot
-the proof tested, or the recovery key on the marker's), each pure and
-confirmed by one `Plan::confirm`: an addition's keyslot at the lowest
-free from 1 under the opener with the new passphrase, its token imported
-naming it and a test; a removal's kill of the chosen token's keyslot,
-then its token; a recovery-key removal's kill of the marker's keyslot,
-then the marker; and a request's removal of a pending `td-request`
-token, then its import. Each refuses what root's `21` details refuse
-from the baseline (td-authd/DESIGN.md amendment 10: `Refusal::Role` and
-`Full`, detail 01; `Minimum`, detail 02, the shape's minimums and the
-removal's own TPM-shape rule; `NoProtector`, detail 03), the opener
-being the removed token or the marker it removes included, and a header
-that is not protected; the reader's bounds hold the result. The
-selector's `request::plan`, after the cap with the volume key, gives
-each request one of three fates. It is removed without being carried
-out: as the plan's first write when its tag fails, when it is declined
-and when it is a re-enrollment on the recorded primary, a PIN release's
-included; with the reseal's plan when it is a PIN change at a boot whose
-confirmed reseal's plan runs, which sets a new PIN itself; and at that
-step when it is a clear whose TPM the lockout step cannot prove or that
-TPM2_Clear refuses. It is left untouched for a later boot when it is a
-PIN change at a boot by another protector, or one whose seal or
-verification failed, and a clear on the recorded primary whose lockout
-step met `TPM_RC_LOCKOUT` or whose TPM2_Clear answer was lost. Otherwise
-it is carried out in ENCRYPTION.md's order, each write through the
-protected planner's own (the PIN change's through the reseal's, the
-retirements through the planner's retirement, the take through
-`lockout_import`), and removed just before the first write that changes
-the state its tag covers, so a cut leaves either the request and that
-state or neither. The PIN change's prompt precedes the cap and the plan,
-which only discards what it sealed when the tag fails. A clear after a
-PIN release removes the tpm-pin token but not its keyslot, which
-cryptsetup kills only under another keyslot's key; that keyslot is then
-an orphan, killed beside the marker by the reseal boot's plan.
-`request::plan` is the one plan a release by a fido2-recovery token or
-the recovery key runs without a reseal: what it carries out under a
-verified tag and the person's confirmation, and the removal of a request
-it does not carry out (above, "Plans on protected headers").
+
+*The request tag.* `request::tag(volume_key, uuid, operation, nonce,
+header)` computes ENCRYPTION.md's request tag:
+
+1. HKDF-SHA256 derives a 32-byte key from the volume key, with an empty
+   salt and the info `td/disk-protector/request/v1`, a zero byte, the
+   UUID as the lockout reads it, and the nonce.
+2. The tag is HMAC-SHA256 under that key over the operation name's
+   length byte and name, the nonce, the header's lockout nonce (32 zero
+   bytes without a lockout token), and the SHA-256 over each tpm-pin
+   token's `public` bytes in token-number order, each preceded by its
+   length as two big-endian bytes.
+
+`request::verifies` recomputes it over the header read at release and
+compares in constant time. An empty volume key verifies nothing, and
+the key is zeroed on drop. `tests/token_vectors.py` computes the tag
+independently.
+
+*The running system's planners.* `manage::add`, `manage::remove`,
+`manage::remove_recovery` and `manage::request` plan over a protected
+header. Their opener is the operation's proof: the token whose keyslot
+the proof tested, or the recovery key on the marker's keyslot. Each is
+pure and confirmed by one `Plan::confirm`.
+
+| Planner | Steps |
+| --- | --- |
+| `manage::add` | a keyslot at the lowest free number from 1, under the opener with the new passphrase; its token, imported naming it; a test |
+| `manage::remove` | a kill of the chosen token's keyslot; then the token's removal |
+| `manage::remove_recovery` | a kill of the marker's keyslot; then the marker's removal |
+| `manage::request` | the removal of a pending `td-request` token; then the new token's import |
+
+Each refuses what root's `21` details refuse from the baseline
+(td-authd/DESIGN.md amendment 10): `Refusal::Role` and `Full` (detail
+01), `Minimum` (detail 02: the shape's minimums and the removal's own
+TPM-shape rule) and `NoProtector` (detail 03). Each also refuses an
+opener that is the token being removed, or the marker being removed,
+and a header that is not protected. The reader's bounds hold the
+result.
+
+*The selector's `request::plan`.* After the cap, with the volume key, it
+gives each request one of three fates: removed without being carried
+out (at one of three points), left for a later boot, or carried out.
+
+| Fate | When |
+| --- | --- |
+| Removed as the plan's first write | its tag fails; it is declined; it is a re-enrollment on the recorded primary, a PIN release's included |
+| Removed with the reseal's plan | a PIN change at a boot whose confirmed reseal's plan runs, since that sets a new PIN itself |
+| Removed at that step | a clear whose TPM the lockout step cannot prove, or that TPM2_Clear refuses |
+| Left for a later boot | a PIN change at a boot by another protector, or one whose seal or verification failed; a clear on the recorded primary whose lockout step met `TPM_RC_LOCKOUT`, or whose TPM2_Clear answer was lost |
+| Carried out | otherwise, in ENCRYPTION.md's order |
+
+A request carried out has each write made through the protected
+planner's own: the PIN change's through the reseal's, the retirements
+through the planner's retirement, and the take through
+`lockout_import`. It is removed just before the first write that
+changes the state its tag covers, so a cut leaves either the request
+and that state, or neither.
+
+Two further rules:
+
+- The PIN change's prompt comes before the cap and the plan. The plan's
+  only part in it, when the tag fails, is to discard what was sealed.
+- A clear after a PIN release removes the tpm-pin token but not its
+  keyslot, since cryptsetup kills a keyslot only under another
+  keyslot's key. That keyslot is then an orphan, which the reseal boot's
+  plan kills beside the marker.
+
+`request::plan` is the one plan that a release by a fido2-recovery token
+or the recovery key runs without a reseal: what it carries out under a
+verified tag and the person's confirmation, and the removal of a
+request it does not carry out (above, "Plans on protected headers").
 
 ## Bounds
 

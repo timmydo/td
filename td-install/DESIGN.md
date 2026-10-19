@@ -1765,55 +1765,63 @@ consent time holds no I/O.
   pending token's, each a key-less header commit. Then it sends `14`.
 - **Protector management** (tags 19 to 24; ENCRYPTION.md "Protector
   management"). The volume byte must be `03` or `04`, and root's first
-  description what its baseline admits, as for a disk proof. A request
-  first checks, over the header area `test_area` reads, that every
-  keyslot has a cost (`TestArea::all_costed`; `0f` otherwise, before its
-  first `10`), since its dump below tries every keyslot. A removal first
-  presents the choose step and takes its `16`, the chosen position,
-  which must name a removable token by its own baseline and which its
-  next description must carry (INTERNAL otherwise). The proof is a disk
-  proof's below, with its kinds, but that a removal's disk key is
-  identified among the header's fido2 tokens other than the chosen one
-  (`04` detail `01` for the chosen token's key), so the authorizing
-  token remains, and that a request keeps the proof's header copy past
-  the keyslot test, to its dump. An addition then runs the new key's
-  ceremony as the upgrade's does, through `fido_disk::create_stepped`
-  for the chosen role, with every fido2 token's credential excluded
-  (`11`), and keeps its derived passphrase in clearing storage for its
-  keyslot. A request then reads the volume key from that copy through
-  the runner's existing dump shape, the selector's (ENCRYPTION.md
-  "Selector release"): `cryptsetup luksDump --dump-volume-key
-  --batch-mode --volume-key-file FILE --key-file=- COPY`, the proof's
-  secret on standard input, run bounded as the keyslot test is, FILE a
-  new name in the worker's own mode-0700 directory under `/run`, beside
-  the copy. cryptsetup 2.8.8 tries every keyslot (`CRYPT_ANY_SLOT`) for
-  this, not the tested one, which the check above bounds, and creates
-  FILE `O_CREAT|O_EXCL` at mode 0400. The worker reads exactly 64 bytes,
-  the header's volume-key size, into clearing storage, then unlinks FILE
-  and the copy whether or not the read succeeded (`0f` on any failure,
-  the test having passed); a killed worker's FILE goes with its
-  directory at the next worker's start. The key reaches no frame,
-  string, error or log, and is zeroed once the tag is computed or at any
-  end. The dump runs within the proof's 120 seconds, before `12`. After
-  the last step's `11` the worker sends `12` only with 120 seconds of
-  its deadline left (`08` otherwise); after root's `13`, before any
-  write, it re-reads the header (`28` if it is not the baseline's) and
-  plans with td-protector's `manage` planners from the re-read view,
-  confirmed against cryptsetup's own metadata (`Plan::confirm`; `28`
-  when they disagree, or when a planner refuses what the baseline
-  admitted, since the header changed). Its writes, through
-  td-protector's runner: for an addition, the new keyslot added under
-  the proof's secret with the new key's derived passphrase, its fido2
-  token naming it, then the new keyslot's test on a fresh copy (`0e`
-  should it refuse); for a removal, the chosen token's keyslot killed
-  under the proof's secret, then the token; for a recovery-key removal,
-  the marker's keyslot killed under the disk key's passphrase, then the
-  marker; for a request, a pending `td-request` token's removal, then
-  the new request, its 32-byte nonce from `/dev/random` and its tag from
-  td-protector's `request::tag` under the dumped key over the re-read
-  header (ENCRYPTION.md "Request tag"), imported key-less. Then it sends
-  `14`. A failure after the first write is uncertain to root; what it
-  leaves is ENCRYPTION.md's rule for a cut.
+  description what its baseline admits, as for a disk proof.
+  - *Before the first `10`.* A request checks, over the header area
+    `test_area` reads, that every keyslot has a cost
+    (`TestArea::all_costed`; `0f` otherwise), since its dump below
+    tries every keyslot.
+  - *The choose step.* A removal first presents the choose step and
+    takes its `16`, the chosen position. That position must name a
+    removable token by the worker's own baseline, and the next
+    description must carry it (INTERNAL otherwise).
+  - *The proof.* A disk proof's, below, with its kinds, except that:
+    - a removal's disk key is identified among the header's fido2
+      tokens other than the chosen one (`04` detail `01` for the chosen
+      token's own key), so the authorizing token remains;
+    - a request keeps the proof's header copy past the keyslot test,
+      for its dump.
+  - *An addition's new key.* Its ceremony runs as the upgrade's does,
+    through `fido_disk::create_stepped` for the chosen role, with every
+    fido2 token's credential excluded (`11`). The derived passphrase is
+    kept in clearing storage for its keyslot.
+  - *A request's volume key.* The worker reads it from that header copy
+    through the runner's existing dump shape, the selector's
+    (ENCRYPTION.md "Selector release"): `cryptsetup luksDump
+    --dump-volume-key --batch-mode --volume-key-file FILE --key-file=-
+    COPY`, with the proof's secret on standard input.
+    - It runs bounded, as the keyslot test does, within the proof's 120
+      seconds and before `12`.
+    - FILE is a new name in the worker's own mode-0700 directory under
+      `/run`, beside the copy. cryptsetup 2.8.8 creates it with
+      `O_CREAT|O_EXCL` at mode 0400.
+    - cryptsetup tries every keyslot (`CRYPT_ANY_SLOT`), not the tested
+      one, which the check before the first `10` bounds.
+    - The worker reads exactly 64 bytes, the header's volume-key size,
+      into clearing storage, then unlinks FILE and the copy whether or
+      not the read succeeded (`0f` on any failure, the test having
+      passed). A killed worker's FILE goes with its directory at the
+      next worker's start.
+    - The key reaches no frame, string, error or log, and is zeroed
+      once the tag is computed or at any end.
+  - *The commit round.* After the last step's `11` the worker sends
+    `12` only with 120 seconds of its deadline left (`08` otherwise).
+    After root's `13`, before any write, it re-reads the header (`28`
+    if it is not the baseline's) and plans with td-protector's `manage`
+    planners from the re-read view. The plan is confirmed against
+    cryptsetup's own metadata (`Plan::confirm`); `28` when they
+    disagree, or when a planner refuses what the baseline admitted,
+    since the header changed. Its writes, through td-protector's
+    runner, are then:
+
+    | Operation | Writes, in order |
+    | --- | --- |
+    | Addition | the new keyslot, added under the proof's secret with the new key's derived passphrase; its fido2 token, naming it; the new keyslot's test on a fresh copy (`0e` should it refuse) |
+    | Removal | the chosen token's keyslot, killed under the proof's secret; then the token |
+    | Recovery-key removal | the marker's keyslot, killed under the disk key's passphrase; then the marker |
+    | Request | a pending `td-request` token's removal; then the new request, key-less, with a 32-byte nonce from `/dev/random` and its tag from td-protector's `request::tag` under the dumped key over the re-read header (ENCRYPTION.md "Request tag") |
+
+    Then it sends `14`. A failure after the first write is uncertain to
+    root; what it leaves is ENCRYPTION.md's rule for a cut.
 - **Disk proof** (tags 13 to 15). Root's first description must be the
   proof's first step for the worker's account, one its own baseline
   offers (consent's `proof_start`: a `recovery-key` marker, or a fido2
