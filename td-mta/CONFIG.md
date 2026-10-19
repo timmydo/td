@@ -1777,9 +1777,10 @@ The shared fixed workers retain their existing limits and deadlines.
 `stop --runtime PATH` and SIGTERM/SIGINT request orderly drain. Control
 socket device operations are unavailable; use the PostgreSQL device
 commands, whose changes are checked by fresh authentication and mutations.
-Readiness follows startup of all selected network workers. Outbound relay,
-automatic restart recovery of uncertain in-memory operations and full
-restore activation are not claimed by this increment.
+Readiness follows startup of all selected network workers; it does not
+prove outbound delivery or database integrity. Relay scheduling and its
+receipt-based restart recovery follow QUEUE.md and POSTGRES.md. Full restore
+activation remains separate from starting a service profile.
 
 ### Response retention admission
 

@@ -1,12 +1,12 @@
 # PostgreSQL service deployment notes
 
-The executable serves receive and JMAP profiles from PostgreSQL. The former
+The executable serves receive, JMAP and relay profiles from PostgreSQL. The former
 SQLite receiver procedure and its local initialization, verification,
 backup/restore and file-configuration commands are removed. There is no
 existing deployment or SQLite data conversion requirement.
 [POSTGRES.md](POSTGRES.md) owns database preparation and current support;
 [CONFIG.md](CONFIG.md#foreground-postgresql-service) owns foreground serving.
-Relay and reload remain inactive.
+Relay scheduling is active; configuration reload requires process restart.
 
 ## Build and retain a release
 
@@ -73,14 +73,18 @@ trusted physical ancestors. Each instance owns its own runtime and scratch;
 the shared database owns durable mail, configuration and device credentials.
 The runtime directory must be recreated after reboot if it is volatile.
 
-After selecting a validated receive or JMAP profile, start it explicitly:
+After selecting a validated receive, JMAP or relay profile, start it explicitly:
 
 ```text
 /opt/td-mta/bin/td-mta serve --connection-file /etc/td-mta/runtime-connection --profile cloud --runtime /run/td-mta --scratch /var/lib/td-mta-scratch
 ```
 
 The profile name must match the selected database configuration. JMAP-only
-profiles need no SMTP listener. A supervisor must consume stdout/stderr and
+profiles need no SMTP listener and can submit mail to a selected relay profile.
+A relay-only profile needs no inbound listener. It runs one route worker;
+concurrent instances coordinate through the database route lease. Profiles
+may run on the same host, each with separate runtime and scratch directories.
+A supervisor must consume stdout/stderr and
 use the flushed ready result or the readiness command below; successful
 exec alone does not establish listener readiness. Low-port binding remains
 a host provisioning responsibility for the unprivileged service identity.
@@ -97,7 +101,7 @@ Run local control commands as the service identity:
 Status reports lifecycle, not database integrity or future delivery success.
 A stop acknowledgement records the request; wait for the serving process
 to exit. SIGTERM and SIGINT also request orderly shutdown after startup.
-The control socket provides status and stop only. Administer credentials
+The private control socket also provides the relay controls below. Administer credentials
 through `postgres device-create`, `postgres device-list` and `postgres
 device-revoke`, using the explicit database/account arguments in POSTGRES.md.
 
@@ -107,6 +111,32 @@ are not implemented. The native executable fixture qualifies separate
 receive/JMAP processes, durable SMTP delivery, verified HTTPS credential
 acceptance and revocation, control stop and signal-based restart cycles.
 It does not qualify a deployment host or supervisor.
+
+## Relay clock and route controls
+
+Run these commands as the relay service identity against its runtime path:
+
+```text
+/opt/td-mta/bin/td-mta queue-clock-status --runtime /run/td-mta-relay
+/opt/td-mta/bin/td-mta queue-clock-confirm --runtime /run/td-mta-relay
+/opt/td-mta/bin/td-mta queue-route-status --runtime /run/td-mta-relay
+/opt/td-mta/bin/td-mta queue-route-repair --runtime /run/td-mta-relay
+```
+
+Clock status reports `held` or `confirmed`. Confirmation is eligible only
+after five minutes of stable database UTC/monotonic progress. Its immediate
+`requested` result acknowledges the request; inspect status afterward and
+request again if it was too early. Restart or clock discontinuity restores
+the hold. Confirmation permits bounded overdue expiry; it does not move
+retry deadlines earlier.
+
+For a route paused by TLS or authentication failure, publish a newer repaired
+configuration, restart the relay with that selection, then request route
+repair. The request does not bypass the newer-generation or minimum-backoff
+checks. Route status reports the last local request as `idle`, `requested`,
+`repaired` or `refused`; `requested` alone is not evidence of success.
+[CONFIG.md](CONFIG.md#foreground-postgresql-service) and QUEUE.md own these
+controls and their bounded recovery semantics.
 
 ## Database backup and recovery
 

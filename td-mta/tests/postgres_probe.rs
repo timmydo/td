@@ -2627,7 +2627,7 @@ certificate = "public"
                 "https://localhost",
                 &format!("https://localhost:{}", address.port()),
             )
-            .replace("127.0.0.1:443", &address.to_string())
+            .replace("bind = \"127.0.0.1:443\"", &format!("bind = \"{address}\""))
     } else {
         desktop
     };
