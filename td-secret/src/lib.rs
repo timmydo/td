@@ -240,7 +240,8 @@ mod p256_signer;
 
 /// Valid descriptions for `owner` of the operations the approval key
 /// confirms, consent tags 5 (`deploy-publish`), 11 and 12, and of the
-/// storage operations', 16, 17 (the upgrade's review and a PIN step) and 18.
+/// storage operations', 16, 17 (the upgrade's review and a PIN step), 18
+/// and protector management's 19 to 24.
 /// td-secret decodes them through the shared consent codec but performs
 /// none, so every worker's operation match must refuse them.
 #[cfg(test)]
@@ -288,6 +289,53 @@ fn elevation_descriptions(owner: u32) -> Vec<Vec<u8>> {
             approval: None,
         },
         consent::Operation::UpgradeCancel { key },
+        consent::Operation::ProtectorAdd {
+            account: owner,
+            proof: consent::Proof::RecoveryKey,
+            role: consent::DiskRole::Recovery,
+            step: consent::LoginStep::RecoveryKey,
+        },
+        consent::Operation::ProtectorRemove {
+            account: owner,
+            proof: consent::Proof::DiskKey,
+            removal: consent::Removal {
+                shape: consent::UpgradeShape::Tpm,
+                marker: true,
+                tpm_pin: true,
+                tokens: vec![consent::DiskToken {
+                    role: consent::DiskRole::Recovery,
+                    key: [1, 2, 3, 4],
+                }],
+                chosen: 0,
+            },
+            step: consent::LoginStep::Choose,
+        },
+        consent::Operation::RecoveryRemove {
+            account: owner,
+            step: consent::LoginStep::DiskIdentify,
+            approval: Some(key),
+        },
+        consent::Operation::ProtectorRequest {
+            account: owner,
+            proof: consent::Proof::RecoveryKey,
+            request: consent::DiskRequest::PinChange,
+            pending: None,
+            step: consent::LoginStep::RecoveryKey,
+        },
+        consent::Operation::ProtectorRequest {
+            account: owner,
+            proof: consent::Proof::RecoveryKey,
+            request: consent::DiskRequest::TpmClear,
+            pending: Some(consent::DiskRequest::PinChange),
+            step: consent::LoginStep::RecoveryKey,
+        },
+        consent::Operation::ProtectorRequest {
+            account: owner,
+            proof: consent::Proof::RecoveryKey,
+            request: consent::DiskRequest::Reenroll,
+            pending: None,
+            step: consent::LoginStep::RecoveryKey,
+        },
     ]
     .into_iter()
     .map(|operation| {
@@ -348,7 +396,7 @@ mod confinement {
             fingerprint(include_str!("enrollment_operation.rs")),
             0x44a7a283c11747d6
         );
-        assert_eq!(fingerprint(include_str!("../../td-authd/src/consent.rs")), 0xae8d29fa24aec8fe, "shared consent changed: reconcile td-authd/tests/confinement.rs and td-compositor/src/main.rs pins");
+        assert_eq!(fingerprint(include_str!("../../td-authd/src/consent.rs")), 0x3acc7bb4fc81b499, "shared consent changed: reconcile td-authd/tests/confinement.rs and td-compositor/src/main.rs pins");
         // The shared consent's hostname rules: firstboot's one copy.
         let production = include_str!("lib.rs").split("#[cfg(test)]").next().unwrap();
         assert!(production.contains(

@@ -220,6 +220,208 @@ pub fn upgrade_ceiling(count: u8) -> Duration {
 /// The review step's byte, after the login steps' and the disk proof's.
 const REVIEW: u8 = 12;
 
+/// A protector addition's, removal's and recovery-key removal's ceiling:
+/// 120 seconds each for the proof, the new key's ceremony or the
+/// reading, and the writes (td-authd/DESIGN.md, amendment 10).
+pub const PROTECTOR_CEILING: Duration = Duration::from_secs(360);
+/// A request's: the proof's 120 seconds and the writes'.
+pub const REQUEST_CEILING: Duration = Duration::from_secs(240);
+/// The most fido2 tokens a protected volume holds, which tag 20 lists.
+const MAX_DISK_TOKENS: usize = 4;
+
+/// A disk security key's role, tag 19's role byte and each of tag 20's
+/// tokens'.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DiskRole {
+    /// fido2-primary, `1`.
+    Primary,
+    /// fido2-recovery, `2`.
+    Recovery,
+}
+
+impl DiskRole {
+    pub fn byte(self) -> u8 {
+        match self {
+            Self::Primary => 1,
+            Self::Recovery => 2,
+        }
+    }
+
+    pub fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            1 => Some(Self::Primary),
+            2 => Some(Self::Recovery),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Primary => "PRIMARY KEY",
+            Self::Recovery => "RECOVERY KEY",
+        }
+    }
+}
+
+/// A disk request, tags 22 to 24 in order, and the pending byte's `1` to
+/// `3` (td-install/ENCRYPTION.md, "Requests").
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DiskRequest {
+    PinChange,
+    TpmClear,
+    Reenroll,
+}
+
+impl DiskRequest {
+    pub fn byte(self) -> u8 {
+        match self {
+            Self::PinChange => 1,
+            Self::TpmClear => 2,
+            Self::Reenroll => 3,
+        }
+    }
+
+    pub fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            1 => Some(Self::PinChange),
+            2 => Some(Self::TpmClear),
+            3 => Some(Self::Reenroll),
+            _ => None,
+        }
+    }
+
+    fn tag(self) -> u8 {
+        21 + self.byte()
+    }
+
+    fn rows(self) -> &'static [&'static str] {
+        match self {
+            Self::PinChange => &[
+                "REQUEST A DISK PIN CHANGE",
+                "THE NEXT BOOT BY THE PIN",
+                "ASKS FOR A NEW PIN",
+            ],
+            // The boots after take the lockout and offer the reseal.
+            Self::TpmClear => &[
+                "REQUEST A TPM CLEAR",
+                "THE NEXT BOOT ASKS TO CLEAR",
+                "THE TPM AND ALL ITS KEYS",
+                "BOOTS AFTER NEED A SECURITY KEY",
+                "OR THE RECOVERY KEY",
+            ],
+            Self::Reenroll => &[
+                "REQUEST TPM RE-ENROLLMENT",
+                "THE NEXT BOOT BY A SECURITY KEY",
+                "OR RECOVERY KEY ASKS TO RE-ENROLL",
+            ],
+        }
+    }
+
+    fn pending_row(self) -> &'static str {
+        match self {
+            Self::PinChange => "REPLACES THE PENDING PIN CHANGE",
+            Self::TpmClear => "REPLACES THE PENDING TPM CLEAR",
+            Self::Reenroll => "REPLACES THE PENDING RE-ENROLLMENT",
+        }
+    }
+}
+
+/// One fido2 token of tag 20's list, in token-number order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DiskToken {
+    pub role: DiskRole,
+    pub key: Fingerprint,
+}
+
+/// Tag 20's view of the volume: its shape, whether a `recovery-key`
+/// marker and a tpm-pin token name keyslots, its FIDO2 protectors (the
+/// fido2 tokens naming a keyslot), one to four, and the chosen position,
+/// `0` at the choose step and 1 through the count at every later one.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Removal {
+    pub shape: UpgradeShape,
+    pub marker: bool,
+    pub tpm_pin: bool,
+    pub tokens: Vec<DiskToken>,
+    pub chosen: u8,
+}
+
+impl Removal {
+    /// Whether the token at `position` may be removed (amendment 10): in
+    /// the TPM shape any token while a tpm-pin token names a keyslot, and
+    /// otherwise one whose removal leaves another, so the recovery key is
+    /// never left alone; in the FIDO2 shape one whose removal leaves a
+    /// fido2-primary token and either two tokens or the marker.
+    pub fn removable(&self, position: u8) -> bool {
+        let Some(index) = usize::from(position).checked_sub(1) else {
+            return false;
+        };
+        if index >= self.tokens.len() {
+            return false;
+        }
+        let left: Vec<&DiskToken> = self
+            .tokens
+            .iter()
+            .enumerate()
+            .filter(|(at, _)| *at != index)
+            .map(|(_, token)| token)
+            .collect();
+        match self.shape {
+            UpgradeShape::Tpm => self.tpm_pin || !left.is_empty(),
+            UpgradeShape::Fido2 => {
+                left.iter().any(|token| token.role == DiskRole::Primary)
+                    && (left.len() >= 2 || self.marker)
+            }
+        }
+    }
+
+    /// A choose step's `1c`: exactly one ASCII digit naming a removable
+    /// token, its position.
+    pub fn entry(&self, bytes: &[u8]) -> Option<u8> {
+        match bytes {
+            [digit @ b'1'..=b'9'] => {
+                Some(digit - b'0').filter(|position| self.removable(*position))
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether this list is `disk`'s protectors, in the same order: the
+    /// tokens a position names on the worker's header.
+    fn lists(&self, disk: DiskProofs<'_>) -> bool {
+        self.tokens
+            .iter()
+            .map(|token| token.key)
+            .eq(disk.tokens.iter().copied())
+    }
+
+    /// The listed tokens but the chosen one, which a disk authorize step
+    /// must name.
+    fn authorizes(&self, key: Fingerprint) -> bool {
+        self.tokens
+            .iter()
+            .enumerate()
+            .any(|(at, token)| usize::from(self.chosen) != at.saturating_add(1) && token.key == key)
+    }
+
+    /// The list without its chosen position, which every step keeps.
+    fn same_volume(&self, other: &Self) -> bool {
+        self.shape == other.shape
+            && self.marker == other.marker
+            && self.tpm_pin == other.tpm_pin
+            && self.tokens == other.tokens
+    }
+
+    fn token_row(position: usize, token: &DiskToken) -> String {
+        format!(
+            "{}: {} {}",
+            position.saturating_add(1),
+            token.role.name(),
+            hex(&token.key)
+        )
+    }
+}
+
 /// A new key's ceremony, in its only order: connect, create, prove,
 /// repeat and probe, a first enrollment's and an upgrade's.
 const CEREMONY: &[u8] = &[8, 3, 4, 5, 6];
@@ -358,6 +560,9 @@ pub enum LoginStep {
         key: Fingerprint,
         retries: u8,
     },
+    /// A protector removal's choice: one digit naming the token to remove,
+    /// typed through the PIN field.
+    Choose,
 }
 
 impl LoginStep {
@@ -374,13 +579,15 @@ impl LoginStep {
             Self::RecoveryKey => 9,
             Self::DiskIdentify => 10,
             Self::DiskAuthorize { .. } => 11,
+            Self::Choose => 13,
         }
     }
 
-    /// Whether the step asks for a secret through the PIN field: a key's
-    /// PIN, or the recovery-key step's recovery key.
+    /// Whether the step asks for an entry through the PIN field: a key's
+    /// PIN, the recovery-key step's recovery key, or the choose step's
+    /// digit.
     pub fn asks_pin(self) -> bool {
-        self.retries().is_some() || self == Self::RecoveryKey
+        self.retries().is_some() || matches!(self, Self::RecoveryKey | Self::Choose)
     }
 
     /// Whether the step is a disk proof's, which the storage worker
@@ -404,7 +611,8 @@ impl LoginStep {
             | Self::Create { .. }
             | Self::Connect
             | Self::RecoveryKey
-            | Self::DiskIdentify => None,
+            | Self::DiskIdentify
+            | Self::Choose => None,
         }
     }
 
@@ -421,7 +629,8 @@ impl LoginStep {
             | Self::Probe { .. }
             | Self::Connect
             | Self::RecoveryKey
-            | Self::DiskIdentify => None,
+            | Self::DiskIdentify
+            | Self::Choose => None,
         }
     }
 }
@@ -815,9 +1024,424 @@ pub enum Operation {
     UpgradeCancel {
         key: ApprovalKey,
     },
+    /// Storage operation `04`, tag 19: one FIDO2 token in `role`.
+    ProtectorAdd {
+        account: u32,
+        proof: Proof,
+        role: DiskRole,
+        step: LoginStep,
+    },
+    /// Storage operation `05`, tag 20: the token `removal` chooses.
+    ProtectorRemove {
+        account: u32,
+        proof: Proof,
+        removal: Removal,
+        step: LoginStep,
+    },
+    /// Storage operation `06`, tag 21: the recovery key's removal, always
+    /// by a disk security key. `approval` is the disclosure's key, on its
+    /// identify step only.
+    RecoveryRemove {
+        account: u32,
+        step: LoginStep,
+        approval: Option<ApprovalKey>,
+    },
+    /// Storage operations `07` to `09`, tags 22 to 24: `request`, in place
+    /// of the pending one.
+    ProtectorRequest {
+        account: u32,
+        proof: Proof,
+        request: DiskRequest,
+        pending: Option<DiskRequest>,
+        step: LoginStep,
+    },
+}
+
+/// What a protector-management selection chooses before root reads the
+/// baseline: the operation, its proof and an addition's role (amendment
+/// 10, `20 04` to `20 09`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Managed {
+    Add {
+        proof: Proof,
+        role: DiskRole,
+    },
+    Remove {
+        proof: Proof,
+    },
+    /// Always by a disk security key.
+    RecoveryRemove,
+    Request {
+        proof: Proof,
+        request: DiskRequest,
+    },
+}
+
+impl Managed {
+    fn proof(self) -> Proof {
+        match self {
+            Self::Add { proof, .. } | Self::Remove { proof } | Self::Request { proof, .. } => proof,
+            Self::RecoveryRemove => Proof::DiskKey,
+        }
+    }
+}
+
+/// A protected volume as the storage worker's baseline gives it, the
+/// bytes root and the worker both read protector management from.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Protected {
+    pub shape: UpgradeShape,
+    /// A `recovery-key` marker names a keyslot.
+    pub marker: bool,
+    /// A tpm-pin token names a keyslot.
+    pub tpm_pin: bool,
+    pub lockout: bool,
+    /// The pending `td-request` token's operation.
+    pub request: Option<DiskRequest>,
+    /// Every fido2 token in token-number order: its role, whether it names
+    /// a keyslot, and its fingerprint.
+    pub tokens: Vec<(DiskRole, bool, Fingerprint)>,
+}
+
+impl Protected {
+    /// The FIDO2 protectors, the fido2 tokens naming a keyslot, in order.
+    pub fn protectors(&self) -> Vec<DiskToken> {
+        self.tokens
+            .iter()
+            .filter(|(_, named, _)| *named)
+            .map(|(role, _, key)| DiskToken {
+                role: *role,
+                key: *key,
+            })
+            .collect()
+    }
+
+    /// The protectors' fingerprints, which protector management's
+    /// `DiskProofs` carries.
+    pub fn protector_keys(&self) -> Vec<Fingerprint> {
+        self.protectors().iter().map(|token| token.key).collect()
+    }
+
+    /// Tag 20's list at its choose step.
+    pub fn removal(&self) -> Removal {
+        Removal {
+            shape: self.shape,
+            marker: self.marker,
+            tpm_pin: self.tpm_pin,
+            tokens: self.protectors(),
+            chosen: 0,
+        }
+    }
+
+    /// Root's `21` detail when this volume cannot take `managed`
+    /// (amendment 10): `01` an addition the shape cannot take, `02` a
+    /// removal with no removable token or a recovery-key removal outside
+    /// its minimums, `03` a request without its protector, and `00` a
+    /// proof the volume does not offer.
+    pub fn refusal(&self, managed: Managed) -> Option<u8> {
+        let protectors = self.protectors();
+        let primary = protectors
+            .iter()
+            .any(|token| token.role == DiskRole::Primary);
+        let pin = self.shape == UpgradeShape::Tpm && self.tpm_pin;
+        let refused = match managed {
+            // Every fido2 token counts against the room, an orphan's too.
+            Managed::Add { role, .. } => {
+                let same = self.tokens.iter().filter(|(of, ..)| *of == role).count();
+                (self.shape == UpgradeShape::Tpm && role != DiskRole::Recovery)
+                    || self.tokens.len() >= MAX_DISK_TOKENS
+                    || (self.shape == UpgradeShape::Fido2 && same >= 3)
+            }
+            .then_some(1),
+            Managed::Remove { .. } => {
+                let removal = self.removal();
+                let positions = u8::try_from(protectors.len()).unwrap_or(0);
+                (!(1..=positions).any(|position| removal.removable(position))).then_some(2)
+            }
+            Managed::RecoveryRemove => (self.shape != UpgradeShape::Fido2
+                || !self.marker
+                || protectors.len() < 2
+                || !primary)
+                .then_some(2),
+            Managed::Request { request, .. } => match request {
+                DiskRequest::PinChange => !(pin && self.lockout),
+                DiskRequest::TpmClear => !self.lockout,
+                DiskRequest::Reenroll => {
+                    self.shape != UpgradeShape::Tpm || !(self.tpm_pin || self.lockout)
+                }
+            }
+            .then_some(3),
+        };
+        let removal = matches!(managed, Managed::Remove { .. });
+        let offered = match managed.proof() {
+            Proof::RecoveryKey => self.marker,
+            Proof::DiskKey => protectors.len() >= if removal { 2 } else { 1 },
+        };
+        refused.or((!offered).then_some(0))
+    }
+
+    /// Root's first description for `managed` (amendment 10): the proof's
+    /// first step, a removal's choose step over this volume's protectors,
+    /// or tag 21's identify step carrying `approval`; a request names the
+    /// pending one. The `21` detail instead when the volume cannot take it.
+    pub fn first(
+        &self,
+        account: u32,
+        managed: Managed,
+        approval: Option<ApprovalKey>,
+    ) -> Result<Operation, u8> {
+        if let Some(detail) = self.refusal(managed) {
+            return Err(detail);
+        }
+        let step = |proof| match proof {
+            Proof::RecoveryKey => LoginStep::RecoveryKey,
+            Proof::DiskKey => LoginStep::DiskIdentify,
+        };
+        Ok(match managed {
+            Managed::Add { proof, role } => Operation::ProtectorAdd {
+                account,
+                proof,
+                role,
+                step: step(proof),
+            },
+            Managed::Remove { proof } => Operation::ProtectorRemove {
+                account,
+                proof,
+                removal: self.removal(),
+                step: LoginStep::Choose,
+            },
+            Managed::RecoveryRemove => Operation::RecoveryRemove {
+                account,
+                step: LoginStep::DiskIdentify,
+                approval,
+            },
+            Managed::Request { proof, request } => Operation::ProtectorRequest {
+                account,
+                proof,
+                request,
+                pending: self.request,
+                step: step(proof),
+            },
+        })
+    }
+
+    /// Whether `request` is root's first description over this volume,
+    /// as the storage worker checks it: exactly `first`'s, with its own
+    /// approval key. `Last` when only the commit follows, a request proven
+    /// by the recovery key.
+    pub fn admits(&self, request: &Request) -> Result<Admitted, String> {
+        let managed = match request.operation() {
+            Operation::ProtectorAdd { proof, role, .. } => Managed::Add {
+                proof: *proof,
+                role: *role,
+            },
+            Operation::ProtectorRemove { proof, .. } => Managed::Remove { proof: *proof },
+            Operation::RecoveryRemove { .. } => Managed::RecoveryRemove,
+            Operation::ProtectorRequest { proof, request, .. } => Managed::Request {
+                proof: *proof,
+                request: *request,
+            },
+            _ => return Err("not a protector operation step".into()),
+        };
+        let protector = request
+            .operation
+            .protector()
+            .ok_or("not a protector operation step")?;
+        match self.first(protector.account, managed, protector.approval) {
+            Ok(first) if first == *request.operation() => Ok(match protector.following() {
+                Some(_) => Admitted::Next,
+                None => Admitted::Last,
+            }),
+            _ => Err("not the first description this volume admits".into()),
+        }
+    }
+}
+
+/// The fields every protector-management operation shares, tags 19 to
+/// 24.
+struct Protector<'a> {
+    tag: u8,
+    account: u32,
+    /// Tag 21's is always a disk security key's, and has no byte.
+    proof: Proof,
+    step: LoginStep,
+    removal: Option<&'a Removal>,
+    approval: Option<ApprovalKey>,
+}
+
+impl Protector<'_> {
+    /// Whether the worker's baseline `disk` offers this operation's proof:
+    /// the marker for the recovery key, a FIDO2 protector for a disk key,
+    /// two for a removal's, whose authorizing token remains; and for a
+    /// removal, a list that is the baseline's protectors. `disk` carries
+    /// the protectors for protector management.
+    fn offered(&self, disk: DiskProofs<'_>) -> bool {
+        let tokens = match self.removal {
+            Some(removal) if !removal.lists(disk) => return false,
+            Some(_) => 2,
+            None => 1,
+        };
+        match self.proof {
+            Proof::RecoveryKey => disk.recovery_key,
+            Proof::DiskKey => disk.tokens.len() >= tokens,
+        }
+    }
+
+    /// Step bytes in their only order (amendment 10, "Step orders").
+    fn steps(&self) -> &'static [u8] {
+        match (self.tag, self.proof) {
+            (19, Proof::RecoveryKey) => &[9, 8, 3, 4, 5, 6],
+            (19, Proof::DiskKey) => &[10, 11, 8, 3, 4, 5, 6],
+            (20, Proof::RecoveryKey) => &[13, 9],
+            (20, Proof::DiskKey) => &[13, 10, 11],
+            (_, proof) => proof.steps(),
+        }
+    }
+
+    fn following(&self) -> Option<u8> {
+        let steps = self.steps();
+        let index = steps.iter().position(|byte| *byte == self.step.byte())?;
+        steps.get(index.saturating_add(1)).copied()
+    }
+
+    fn valid(&self, owner: u32) -> bool {
+        let chosen = match self.removal {
+            Some(removal) => {
+                (1..=MAX_DISK_TOKENS).contains(&removal.tokens.len())
+                    // Each shape's own: the TPM shape holds recovery
+                    // tokens only, the FIDO2 shape no tpm-pin token.
+                    && match removal.shape {
+                        UpgradeShape::Tpm => removal
+                            .tokens
+                            .iter()
+                            .all(|token| token.role == DiskRole::Recovery),
+                        UpgradeShape::Fido2 => !removal.tpm_pin,
+                    }
+                    && (removal.chosen == 0) == (self.step == LoginStep::Choose)
+                    && (removal.chosen == 0 || removal.removable(removal.chosen))
+                    && match self.step {
+                        LoginStep::DiskAuthorize { key, .. } => removal.authorizes(key),
+                        _ => true,
+                    }
+            }
+            None => true,
+        };
+        self.account == owner
+            && self.steps().contains(&self.step.byte())
+            && chosen
+            && (self.tag != 21 || self.approval.is_some() == (self.step == LoginStep::DiskIdentify))
+    }
+
+    fn ceiling(&self) -> Duration {
+        if self.tag >= 22 {
+            REQUEST_CEILING
+        } else {
+            PROTECTOR_CEILING
+        }
+    }
 }
 
 impl Operation {
+    fn protector(&self) -> Option<Protector<'_>> {
+        let view = |tag, account: &u32, proof: &Proof, step: &LoginStep| Protector {
+            tag,
+            account: *account,
+            proof: *proof,
+            step: *step,
+            removal: None,
+            approval: None,
+        };
+        Some(match self {
+            Self::ProtectorAdd {
+                account,
+                proof,
+                step,
+                ..
+            } => view(19, account, proof, step),
+            Self::ProtectorRemove {
+                account,
+                proof,
+                removal,
+                step,
+            } => Protector {
+                removal: Some(removal),
+                ..view(20, account, proof, step)
+            },
+            Self::RecoveryRemove {
+                account,
+                step,
+                approval,
+            } => Protector {
+                approval: *approval,
+                ..view(21, account, &Proof::DiskKey, step)
+            },
+            Self::ProtectorRequest {
+                account,
+                proof,
+                request,
+                step,
+                ..
+            } => view(request.tag(), account, proof, step),
+            _ => return None,
+        })
+    }
+
+    /// Whether `other` is the same protector operation at another step:
+    /// every field but the step, the chosen position and the disclosure's
+    /// key.
+    fn same_protector(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::ProtectorAdd {
+                    account,
+                    proof,
+                    role,
+                    ..
+                },
+                Self::ProtectorAdd {
+                    account: a,
+                    proof: p,
+                    role: r,
+                    ..
+                },
+            ) => account == a && proof == p && role == r,
+            (
+                Self::ProtectorRemove {
+                    account,
+                    proof,
+                    removal,
+                    ..
+                },
+                Self::ProtectorRemove {
+                    account: a,
+                    proof: p,
+                    removal: r,
+                    ..
+                },
+            ) => account == a && proof == p && removal.same_volume(r),
+            (Self::RecoveryRemove { account, .. }, Self::RecoveryRemove { account: a, .. }) => {
+                account == a
+            }
+            (
+                Self::ProtectorRequest {
+                    account,
+                    proof,
+                    request,
+                    pending,
+                    ..
+                },
+                Self::ProtectorRequest {
+                    account: a,
+                    proof: p,
+                    request: r,
+                    pending: q,
+                    ..
+                },
+            ) => account == a && proof == p && request == r && pending == q,
+            _ => false,
+        }
+    }
+
     fn login(&self) -> Option<Login<'_>> {
         let login =
             |kind, account: &u32, before: &u8, after: &u8, key, removed, step: &LoginStep| Login {
@@ -957,6 +1581,12 @@ impl Request {
         if operation.login().is_some_and(|login| !login.valid(owner)) {
             return Err("invalid consent login operation".into());
         }
+        if operation
+            .protector()
+            .is_some_and(|protector| !protector.valid(owner))
+        {
+            return Err("invalid consent protector operation".into());
+        }
         match &operation {
             Operation::Install {
                 key: _,
@@ -1078,11 +1708,137 @@ impl Request {
         self.operation.login().map(|login| login.step)
     }
 
-    /// The key-ceremony step a description presents: a login step, or an
-    /// upgrade's new key's. Its PIN steps take a `1c`.
+    /// The key-ceremony step a description presents: a login step, an
+    /// upgrade's new key's, or a protector operation's. Its PIN steps take
+    /// a `1c`.
     pub fn ceremony_step(&self) -> Option<LoginStep> {
         self.login_step()
             .or(self.upgrade_step().and_then(UpgradeStep::login))
+            .or(self.protector_step())
+    }
+
+    /// Whether the description's ceremony step asks for the recovery key,
+    /// whose field and `1c` are 48 digits.
+    pub fn asks_recovery_key(&self) -> bool {
+        self.ceremony_step() == Some(LoginStep::RecoveryKey)
+    }
+
+    /// The step a protector-management description presents, tags 19 to
+    /// 24.
+    pub fn protector_step(&self) -> Option<LoginStep> {
+        self.operation.protector().map(|protector| protector.step)
+    }
+
+    /// The disk proof a protector-management description carries.
+    pub fn protector_proof(&self) -> Option<Proof> {
+        self.operation.protector().map(|protector| protector.proof)
+    }
+
+    /// The approval key tag 21's identify step carries.
+    pub fn protector_approval(&self) -> Option<ApprovalKey> {
+        self.operation
+            .protector()
+            .and_then(|protector| protector.approval)
+    }
+
+    /// Tag 20's view of the volume.
+    pub fn removal(&self) -> Option<&Removal> {
+        match &self.operation {
+            Operation::ProtectorRemove { removal, .. } => Some(removal),
+            _ => None,
+        }
+    }
+
+    /// The shape of `next` as this protector step's successor, from the
+    /// two descriptions alone: `next` keeps the nonce, owner and every
+    /// field but its step; its step is the only legal next one; after the
+    /// choose step it sets the chosen position, which no later step
+    /// changes; a repeat or probe names the credential its prove named;
+    /// and a PIN step's retries are not zero. `Last` means `next` is the
+    /// operation's final step.
+    pub fn protector_successor(&self, next: &Self) -> Result<Admitted, String> {
+        let (Some(current), Some(following)) =
+            (self.operation.protector(), next.operation.protector())
+        else {
+            return Err("not a protector operation step".into());
+        };
+        if next.nonce != self.nonce
+            || next.owner != self.owner
+            || !self.operation.same_protector(&next.operation)
+        {
+            return Err("protector step changed its operation".into());
+        }
+        if current.following() != Some(following.step.byte()) {
+            return Err("illegal protector step order".into());
+        }
+        if let (Some(removal), Some(next_removal)) = (current.removal, following.removal) {
+            // Construction holds a later step's position to a removable one.
+            if current.step != LoginStep::Choose && next_removal.chosen != removal.chosen {
+                return Err("protector step changed its chosen key".into());
+            }
+        }
+        if matches!(
+            following.step,
+            LoginStep::Repeat { .. } | LoginStep::Probe { .. }
+        ) && following.step.key() != current.step.key()
+        {
+            return Err("protector step changed its key".into());
+        }
+        if following.step.retries() == Some(0) {
+            return Err("a blocked key cannot take a PIN".into());
+        }
+        Ok(match following.following() {
+            Some(_) => Admitted::Next,
+            None => Admitted::Last,
+        })
+    }
+
+    /// Admits `invitation`, the storage worker's next protector step
+    /// (`Request::admit_protector_step`, amendment 10):
+    /// `protector_successor`, then the device data. `disk` is the
+    /// worker's baseline's protectors; `created` the credential the worker
+    /// reported creating in an addition's ceremony, between its create and
+    /// probe steps; `chosen` the position the choose step's `1c` named,
+    /// given exactly after the choose step, which the invitation must
+    /// carry. A proof step needs the proof the baseline offers; a disk
+    /// authorize step names a protector, a removal's other than the chosen
+    /// one; a prove, repeat or probe names the created credential, which
+    /// no protector names.
+    pub fn admit_protector_step(
+        &self,
+        invitation: &Self,
+        disk: DiskProofs<'_>,
+        created: Option<Fingerprint>,
+        chosen: Option<u8>,
+    ) -> Result<Admitted, String> {
+        let admitted = self.protector_successor(invitation)?;
+        let (Some(current), Some(following)) =
+            (self.operation.protector(), invitation.operation.protector())
+        else {
+            return Err("not a protector operation step".into());
+        };
+        let choosing = current.step == LoginStep::Choose;
+        if choosing != chosen.is_some()
+            || (choosing && following.removal.map(|removal| removal.chosen) != chosen)
+        {
+            return Err("protector step does not carry the chosen key".into());
+        }
+        let step = following.step;
+        let proof = following.offered(disk) && created.is_none();
+        let named = match step {
+            LoginStep::RecoveryKey | LoginStep::DiskIdentify => proof,
+            LoginStep::DiskAuthorize { key, .. } => proof && disk.tokens.contains(&key),
+            LoginStep::Connect | LoginStep::Create { .. } => created.is_none(),
+            LoginStep::Prove { key, .. }
+            | LoginStep::Repeat { key, .. }
+            | LoginStep::Probe { key } => created == Some(key) && !disk.tokens.contains(&key),
+            // Choose is only ever the first step.
+            _ => false,
+        };
+        if !named {
+            return Err("protector step names a key root did not admit".into());
+        }
+        Ok(admitted)
     }
 
     /// The approval key a login disclosure step carries; none on every
@@ -1105,6 +1861,13 @@ impl Request {
             Operation::SelectorUpdate { .. } => Some(SELECTOR_UPDATE_CEILING),
             Operation::Upgrade { count, .. } => Some(upgrade_ceiling(count)),
             Operation::UpgradeCancel { .. } => Some(UPGRADE_CANCEL_CEILING),
+            Operation::ProtectorAdd { .. }
+            | Operation::ProtectorRemove { .. }
+            | Operation::RecoveryRemove { .. }
+            | Operation::ProtectorRequest { .. } => self
+                .operation
+                .protector()
+                .map(|protector| protector.ceiling()),
             _ => self.login_ceiling(),
         }
     }
@@ -1352,10 +2115,12 @@ impl Request {
             LoginStep::Prove { key, .. }
             | LoginStep::Repeat { key, .. }
             | LoginStep::Probe { key } => created_is(key),
-            // The storage worker's, admitted by `admit_proof_step`.
-            LoginStep::RecoveryKey | LoginStep::DiskIdentify | LoginStep::DiskAuthorize { .. } => {
-                false
-            }
+            // The storage worker's, admitted by `admit_proof_step`; the
+            // choose step is protector management's alone.
+            LoginStep::RecoveryKey
+            | LoginStep::DiskIdentify
+            | LoginStep::DiskAuthorize { .. }
+            | LoginStep::Choose => false,
         };
         if !named {
             return Err("login step names a key root did not admit".into());
@@ -1696,6 +2461,47 @@ impl Request {
                 bytes.push(18);
                 bytes.extend_from_slice(&key.digits());
             }
+            Operation::ProtectorAdd { .. }
+            | Operation::ProtectorRemove { .. }
+            | Operation::RecoveryRemove { .. }
+            | Operation::ProtectorRequest { .. } => {
+                if let Some(protector) = self.operation.protector() {
+                    bytes.push(protector.tag);
+                    bytes.extend_from_slice(&protector.account.to_be_bytes());
+                    if protector.tag != 21 {
+                        bytes.push(protector.proof.byte());
+                    }
+                    match &self.operation {
+                        Operation::ProtectorAdd { role, .. } => bytes.push(role.byte()),
+                        Operation::ProtectorRemove { removal, .. } => {
+                            bytes.push(removal.shape.byte());
+                            bytes.push(u8::from(removal.marker));
+                            bytes.push(u8::from(removal.tpm_pin));
+                            // Construction bounds the list to four.
+                            bytes.push(removal.tokens.len() as u8);
+                            for token in &removal.tokens {
+                                bytes.push(token.role.byte());
+                                bytes.extend_from_slice(&token.key);
+                            }
+                            bytes.push(removal.chosen);
+                        }
+                        Operation::ProtectorRequest { pending, .. } => {
+                            bytes.push(pending.map_or(0, DiskRequest::byte));
+                        }
+                        _ => {}
+                    }
+                    bytes.push(protector.step.byte());
+                    if let Some(key) = protector.step.key() {
+                        bytes.extend_from_slice(&key);
+                    }
+                    if let Some(retries) = protector.step.retries() {
+                        bytes.push(retries);
+                    }
+                    if let Some(approval) = protector.approval {
+                        bytes.extend_from_slice(&approval.digits());
+                    }
+                }
+            }
         }
         bytes
     }
@@ -1929,6 +2735,90 @@ impl Request {
             18 => Operation::UpgradeCancel {
                 key: input.approval_key()?,
             },
+            tag @ 19..=24 => {
+                let account = input.number()?;
+                let proof = if tag == 21 {
+                    Proof::DiskKey
+                } else {
+                    Proof::from_byte(input.byte()?).ok_or("invalid consent disk proof")?
+                };
+                match tag {
+                    19 => {
+                        let role = DiskRole::from_byte(input.byte()?)
+                            .ok_or("invalid consent disk role")?;
+                        Operation::ProtectorAdd {
+                            account,
+                            proof,
+                            role,
+                            step: input.login_step()?,
+                        }
+                    }
+                    20 => {
+                        let shape = UpgradeShape::from_byte(input.byte()?)
+                            .ok_or("invalid consent disk shape")?;
+                        let marker = input.flag()?;
+                        let tpm_pin = input.flag()?;
+                        let count = usize::from(input.byte()?);
+                        if !(1..=MAX_DISK_TOKENS).contains(&count) {
+                            return Err("invalid consent disk token list".into());
+                        }
+                        let mut tokens = Vec::with_capacity(count);
+                        for _ in 0..count {
+                            let role = DiskRole::from_byte(input.byte()?)
+                                .ok_or("invalid consent disk role")?;
+                            tokens.push(DiskToken {
+                                role,
+                                key: input.fingerprint()?,
+                            });
+                        }
+                        let chosen = input.byte()?;
+                        Operation::ProtectorRemove {
+                            account,
+                            proof,
+                            removal: Removal {
+                                shape,
+                                marker,
+                                tpm_pin,
+                                tokens,
+                                chosen,
+                            },
+                            step: input.login_step()?,
+                        }
+                    }
+                    21 => {
+                        let step = input.login_step()?;
+                        // The identify step's key ends the value, as a
+                        // login disclosure step's does.
+                        let approval = if step == LoginStep::DiskIdentify {
+                            Some(input.approval_key()?)
+                        } else {
+                            None
+                        };
+                        Operation::RecoveryRemove {
+                            account,
+                            step,
+                            approval,
+                        }
+                    }
+                    _ => {
+                        let pending = match input.byte()? {
+                            0 => None,
+                            byte => Some(
+                                DiskRequest::from_byte(byte)
+                                    .ok_or("invalid consent pending request")?,
+                            ),
+                        };
+                        Operation::ProtectorRequest {
+                            account,
+                            proof,
+                            request: DiskRequest::from_byte(tag - 21)
+                                .ok_or("unknown consent operation")?,
+                            pending,
+                            step: input.login_step()?,
+                        }
+                    }
+                }
+            }
             _ => return Err("unknown consent operation".into()),
         };
         if !input.0.is_empty() {
@@ -2108,6 +2998,10 @@ impl Request {
                 lines.extend(UPGRADE_CANCEL.iter().map(|row| row.to_string()));
                 approval_lines(&mut lines, *key);
             }
+            Operation::ProtectorAdd { .. }
+            | Operation::ProtectorRemove { .. }
+            | Operation::RecoveryRemove { .. }
+            | Operation::ProtectorRequest { .. } => protector_lines(&mut lines, &self.operation),
         }
         // A key's rows carry their own Escape.
         if !matches!(
@@ -2119,6 +3013,7 @@ impl Request {
                 | Operation::SelectorUpdate { .. }
         ) && self.login_approval().is_none()
             && self.upgrade_approval().is_none()
+            && self.protector_approval().is_none()
         {
             lines.push("ESC TO CANCEL".into());
         }
@@ -2210,10 +3105,8 @@ fn login_lines(lines: &mut Vec<String>, login: &Login<'_>) {
     if login.kind == LoginKind::Remove && login.after == 0 && login.approval.is_none() {
         lines.push(NO_KEY.into());
     }
-    match login.proof {
-        Some(Proof::RecoveryKey) => lines.push("AUTHORIZED BY DISK RECOVERY KEY".into()),
-        Some(Proof::DiskKey) => lines.push("AUTHORIZED BY A DISK SECURITY KEY".into()),
-        None => {}
+    if let Some(proof) = login.proof {
+        lines.push(proof_row(proof).into());
     }
     match login.step {
         LoginStep::Identify => lines.push("CONNECT ONLY ONE ENROLLED KEY".into()),
@@ -2229,25 +3122,9 @@ fn login_lines(lines: &mut Vec<String>, login: &Login<'_>) {
             lines.push(format!("AUTHORIZE WITH KEY {}", hex(&key)));
         }
         LoginStep::Unlock { key, .. } => lines.push(format!("UNLOCK WITH KEY {}", hex(&key))),
-        LoginStep::Create { .. } => lines.push("CREATE A LOGIN CREDENTIAL".into()),
-        LoginStep::Prove { key, .. } => lines.push(format!("VERIFY NEW KEY {}", hex(&key))),
-        LoginStep::Repeat { key, .. } => {
-            lines.push(format!("VERIFY NEW KEY {} AGAIN", hex(&key)));
-        }
-        LoginStep::Probe { key } => {
-            lines.push(format!("CHECKING NEW KEY {}", hex(&key)));
-            lines.push("KEEP IT CONNECTED AND TOUCH IT".into());
-        }
-        LoginStep::RecoveryKey => lines.push("TYPE THE DISK RECOVERY KEY".into()),
-        LoginStep::DiskIdentify => lines.push("CONNECT ONE DISK SECURITY KEY ONLY".into()),
-        LoginStep::DiskAuthorize { key, .. } => {
-            lines.push(format!("DISK SECURITY KEY {}", hex(&key)));
-        }
+        step => step_rows(lines, step, "LOGIN"),
     }
-    if let Some(retries) = login.step.retries() {
-        lines.push(format!("{retries} PIN ATTEMPTS LEFT ON THIS KEY"));
-        lines.push("ENTER ITS PIN, THEN TOUCH THE KEY".into());
-    }
+    pin_rows(lines, login.step);
     if let Some(key) = login.approval {
         let disclosure: &[&[&str]] = match (login.kind, login.after) {
             (LoginKind::Enroll, 1) => &[ENROLLMENT_DISCLOSURE, ONE_KEY_DISCLOSURE],
@@ -2314,25 +3191,130 @@ fn upgrade_lines(
                     }
                     lines.push("CONNECT ONLY THE NEW KEY".into());
                 }
-                LoginStep::Create { .. } => lines.push("CREATE A DISK CREDENTIAL".into()),
-                LoginStep::Prove { key, .. } => lines.push(format!("VERIFY NEW KEY {}", hex(&key))),
-                LoginStep::Repeat { key, .. } => {
-                    lines.push(format!("VERIFY NEW KEY {} AGAIN", hex(&key)));
-                }
-                LoginStep::Probe { key } => {
-                    lines.push(format!("CHECKING NEW KEY {}", hex(&key)));
-                    lines.push("KEEP IT CONNECTED AND TOUCH IT".into());
-                }
                 // Construction admits only the ceremony's steps.
-                _ => {}
+                step => step_rows(lines, step, "DISK"),
             }
-            if let Some(retries) = step.retries() {
-                lines.push(format!("{retries} PIN ATTEMPTS LEFT ON THIS KEY"));
-                lines.push("ENTER ITS PIN, THEN TOUCH THE KEY".into());
-            }
+            pin_rows(lines, step);
         }
     }
 }
+
+/// A disk proof's row.
+fn proof_row(proof: Proof) -> &'static str {
+    match proof {
+        Proof::RecoveryKey => "AUTHORIZED BY DISK RECOVERY KEY",
+        Proof::DiskKey => "AUTHORIZED BY A DISK SECURITY KEY",
+    }
+}
+
+/// The rows every operation shows alike for a disk proof step or a new
+/// key's create, prove, repeat or probe, `credential` naming what create
+/// makes; none for a step whose rows are its operation's own.
+fn step_rows(lines: &mut Vec<String>, step: LoginStep, credential: &str) {
+    match step {
+        LoginStep::Create { .. } => lines.push(format!("CREATE A {credential} CREDENTIAL")),
+        LoginStep::Prove { key, .. } => lines.push(format!("VERIFY NEW KEY {}", hex(&key))),
+        LoginStep::Repeat { key, .. } => {
+            lines.push(format!("VERIFY NEW KEY {} AGAIN", hex(&key)));
+        }
+        LoginStep::Probe { key } => {
+            lines.push(format!("CHECKING NEW KEY {}", hex(&key)));
+            lines.push("KEEP IT CONNECTED AND TOUCH IT".into());
+        }
+        LoginStep::RecoveryKey => lines.push("TYPE THE DISK RECOVERY KEY".into()),
+        LoginStep::DiskIdentify => lines.push("CONNECT ONE DISK SECURITY KEY ONLY".into()),
+        LoginStep::DiskAuthorize { key, .. } => {
+            lines.push(format!("DISK SECURITY KEY {}", hex(&key)));
+        }
+        LoginStep::Identify
+        | LoginStep::Connect
+        | LoginStep::Authorize { .. }
+        | LoginStep::Unlock { .. }
+        | LoginStep::Choose => {}
+    }
+}
+
+/// A PIN step's two rows.
+fn pin_rows(lines: &mut Vec<String>, step: LoginStep) {
+    if let Some(retries) = step.retries() {
+        lines.push(format!("{retries} PIN ATTEMPTS LEFT ON THIS KEY"));
+        lines.push("ENTER ITS PIN, THEN TOUCH THE KEY".into());
+    }
+}
+
+/// A protector operation's rows (amendment 10, "Rows"): the operation's,
+/// a request's pending row, the proof's, then the step's; a removal's
+/// list at its choose step; tag 21's disclosure at its identify step,
+/// with the approval key's rows last, as on every prompt.
+fn protector_lines(lines: &mut Vec<String>, operation: &Operation) {
+    let Some(protector) = operation.protector() else {
+        return;
+    };
+    match operation {
+        Operation::ProtectorAdd { role, .. } => {
+            lines.push("ADD A DISK SECURITY KEY".into());
+            lines.push(format!("AS A {}", role.name()));
+        }
+        Operation::ProtectorRemove { removal, .. } => {
+            lines.push("REMOVE A DISK SECURITY KEY".into());
+            if removal.chosen == 0 {
+                lines.push("CHOOSE THE KEY TO REMOVE".into());
+                for (at, token) in removal.tokens.iter().enumerate() {
+                    let row = Removal::token_row(at, token);
+                    let position = u8::try_from(at.saturating_add(1)).unwrap_or(0);
+                    if removal.removable(position) {
+                        lines.push(row);
+                    } else {
+                        lines.push(format!("{row} - NEEDED"));
+                    }
+                }
+                lines.push("TYPE ITS NUMBER".into());
+            } else if let Some(token) = usize::from(removal.chosen)
+                .checked_sub(1)
+                .and_then(|at| removal.tokens.get(at).map(|token| (at, token)))
+            {
+                lines.push(format!("REMOVES {}", Removal::token_row(token.0, token.1)));
+            }
+        }
+        Operation::RecoveryRemove { .. } => {
+            lines.push("REMOVE THE DISK RECOVERY KEY".into());
+            if protector.approval.is_some() {
+                lines.extend(RECOVERY_REMOVAL.iter().map(|row| row.to_string()));
+            }
+        }
+        Operation::ProtectorRequest {
+            request, pending, ..
+        } => {
+            lines.extend(request.rows().iter().map(|row| row.to_string()));
+            if let Some(pending) = pending {
+                lines.push(pending.pending_row().into());
+            }
+        }
+        _ => {}
+    }
+    lines.push(proof_row(protector.proof).into());
+    match protector.step {
+        LoginStep::Connect => {
+            if protector.proof == Proof::DiskKey {
+                lines.push("REMOVE THE AUTHORIZING KEY".into());
+            }
+            lines.push("CONNECT ONLY THE NEW KEY".into());
+        }
+        // The choose step's rows are the list above.
+        step => step_rows(lines, step, "DISK"),
+    }
+    pin_rows(lines, protector.step);
+    if let Some(key) = protector.approval {
+        approval_lines(lines, key);
+    }
+}
+
+/// What removing the recovery key leaves, tag 21's disclosure.
+const RECOVERY_REMOVAL: &[&str] = &[
+    "AFTER THIS ONLY THE SECURITY KEYS",
+    "ON THE DISK CAN OPEN IT",
+    "LOSING THEM ALL LOSES THE DATA",
+];
 
 /// The review's disclosure (td-install/ENCRYPTION.md, phase 1), before
 /// the row naming what the upgrade boot asks for. Every row fits
@@ -2484,6 +3466,13 @@ impl<'a> Input<'a> {
         String::from_utf8(self.take(64)?.to_vec())
             .map_err(|_| "invalid deployment ID encoding".into())
     }
+    fn flag(&mut self) -> Result<bool, String> {
+        match self.byte()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err("invalid consent flag".into()),
+        }
+    }
     fn fingerprint(&mut self) -> Result<Fingerprint, String> {
         self.take(4)?
             .try_into()
@@ -2529,6 +3518,7 @@ impl<'a> Input<'a> {
             8 => LoginStep::Connect,
             9 => LoginStep::RecoveryKey,
             10 => LoginStep::DiskIdentify,
+            13 => LoginStep::Choose,
             11 => {
                 let key = self.fingerprint()?;
                 LoginStep::DiskAuthorize {
@@ -4679,9 +5669,9 @@ mod tests {
         let mut identify = header(7);
         identify.extend([2, 2, 1]);
         assert!(Request::decode(&identify).is_ok());
-        // 13 to 15 are the disk proofs', 16 to 18 the storage
-        // operations', 19 to 25 reserved.
-        for tag in [0, 3, 19, 25, 255] {
+        // 13 to 15 are the disk proofs', 16 to 24 the storage
+        // operations', 25 reserved for Secure Boot enrollment.
+        for tag in [0, 3, 25, 26, 255] {
             let mut bad = identify.clone();
             bad[44] = tag;
             assert_eq!(
@@ -5260,6 +6250,7 @@ mod tests {
             LoginStep::RecoveryKey => "recovery key",
             LoginStep::DiskIdentify => "disk identify",
             LoginStep::DiskAuthorize { .. } => "disk authorize",
+            LoginStep::Choose => "choose",
         };
         (name, key)
     }
@@ -5277,7 +6268,8 @@ mod tests {
             LoginStep::Identify
             | LoginStep::Connect
             | LoginStep::RecoveryKey
-            | LoginStep::DiskIdentify => (None, None),
+            | LoginStep::DiskIdentify
+            | LoginStep::Choose => (None, None),
             LoginStep::Create { retries } => (None, Some(retries)),
             LoginStep::Probe { key } => (Some(key), None),
             LoginStep::Authorize { key, retries }
@@ -6715,6 +7707,1299 @@ mod tests {
             ),
         ] {
             assert!(begin(operation.clone(), baseline).is_err(), "{operation:?}");
+        }
+    }
+
+    /// Protector management, tags 19 to 24 (amendment 10).
+    mod protectors {
+        use super::super::*;
+
+        const NONCE: [u8; 32] = [9; 32];
+        const A: Fingerprint = [0x1a, 0x2b, 0x3c, 0x4d];
+        const B: Fingerprint = [0x5e, 0x6f, 0x70, 0x81];
+        const C: Fingerprint = [0x92, 0xa3, 0xb4, 0xc5];
+        const D: Fingerprint = [0xd6, 0xe7, 0xf8, 0x09];
+        const NEW: Fingerprint = [0xee, 0xee, 0xee, 0xee];
+        const PROOFS: &[Proof] = &[Proof::RecoveryKey, Proof::DiskKey];
+
+        fn key() -> ApprovalKey {
+            ApprovalKey::new(*b"47").unwrap()
+        }
+
+        fn request(operation: Operation) -> Result<Request, String> {
+            Request::new(NONCE, 1000, operation)
+        }
+
+        fn ok(operation: Operation) -> Request {
+            request(operation).unwrap()
+        }
+
+        fn token(role: DiskRole, key: Fingerprint) -> DiskToken {
+            DiskToken { role, key }
+        }
+
+        /// The TPM shape with a tpm-pin token and two recovery tokens.
+        fn tpm_removal(chosen: u8) -> Removal {
+            Removal {
+                shape: UpgradeShape::Tpm,
+                marker: true,
+                tpm_pin: true,
+                tokens: vec![token(DiskRole::Recovery, A), token(DiskRole::Recovery, B)],
+                chosen,
+            }
+        }
+
+        /// The FIDO2 shape at four tokens: three primaries and a recovery.
+        fn four(chosen: u8) -> Removal {
+            Removal {
+                shape: UpgradeShape::Fido2,
+                marker: true,
+                tpm_pin: false,
+                tokens: vec![
+                    token(DiskRole::Primary, A),
+                    token(DiskRole::Primary, B),
+                    token(DiskRole::Primary, C),
+                    token(DiskRole::Recovery, D),
+                ],
+                chosen,
+            }
+        }
+
+        fn add(proof: Proof, step: LoginStep) -> Operation {
+            Operation::ProtectorAdd {
+                account: 1000,
+                proof,
+                role: DiskRole::Recovery,
+                step,
+            }
+        }
+
+        fn remove(proof: Proof, removal: Removal, step: LoginStep) -> Operation {
+            Operation::ProtectorRemove {
+                account: 1000,
+                proof,
+                removal,
+                step,
+            }
+        }
+
+        fn recovery(step: LoginStep) -> Operation {
+            Operation::RecoveryRemove {
+                account: 1000,
+                approval: (step == LoginStep::DiskIdentify).then(key),
+                step,
+            }
+        }
+
+        fn ask(request: DiskRequest, proof: Proof, step: LoginStep) -> Operation {
+            Operation::ProtectorRequest {
+                account: 1000,
+                proof,
+                request,
+                pending: None,
+                step,
+            }
+        }
+
+        fn authorize(key: Fingerprint) -> LoginStep {
+            LoginStep::DiskAuthorize { key, retries: 8 }
+        }
+
+        /// The TPM shape with every protector the walks need: the marker,
+        /// a tpm-pin token, the lockout and two recovery keys.
+        fn tpm() -> Protected {
+            Protected {
+                shape: UpgradeShape::Tpm,
+                marker: true,
+                tpm_pin: true,
+                lockout: true,
+                request: None,
+                tokens: vec![(DiskRole::Recovery, true, A), (DiskRole::Recovery, true, B)],
+            }
+        }
+
+        /// The FIDO2 shape with the marker and two primary keys.
+        fn fido() -> Protected {
+            Protected {
+                shape: UpgradeShape::Fido2,
+                marker: true,
+                tpm_pin: false,
+                lockout: false,
+                request: None,
+                tokens: vec![(DiskRole::Primary, true, A), (DiskRole::Primary, true, B)],
+            }
+        }
+
+        /// The volume a walk's first description is root's for.
+        fn volume(request: &Request) -> Protected {
+            match request.operation() {
+                Operation::RecoveryRemove { .. } => fido(),
+                _ => tpm(),
+            }
+        }
+
+        fn first_proof(proof: Proof) -> LoginStep {
+            match proof {
+                Proof::RecoveryKey => LoginStep::RecoveryKey,
+                Proof::DiskKey => LoginStep::DiskIdentify,
+            }
+        }
+
+        /// Each operation's every step, in order.
+        fn walks() -> Vec<Vec<Operation>> {
+            let mut walks = Vec::new();
+            for proof in PROOFS {
+                let proof_steps = match proof {
+                    Proof::RecoveryKey => vec![LoginStep::RecoveryKey],
+                    Proof::DiskKey => vec![LoginStep::DiskIdentify, authorize(A)],
+                };
+                let ceremony = [
+                    LoginStep::Connect,
+                    LoginStep::Create { retries: 8 },
+                    LoginStep::Prove {
+                        key: NEW,
+                        retries: 8,
+                    },
+                    LoginStep::Repeat {
+                        key: NEW,
+                        retries: 7,
+                    },
+                    LoginStep::Probe { key: NEW },
+                ];
+                walks.push(
+                    proof_steps
+                        .iter()
+                        .chain(ceremony.iter())
+                        .map(|step| add(*proof, *step))
+                        .collect(),
+                );
+                // Remove token 2, authorized by token 1.
+                let mut removal = vec![remove(*proof, tpm_removal(0), LoginStep::Choose)];
+                removal.extend(
+                    proof_steps
+                        .iter()
+                        .map(|step| remove(*proof, tpm_removal(2), *step)),
+                );
+                walks.push(removal);
+                for request in [
+                    DiskRequest::PinChange,
+                    DiskRequest::TpmClear,
+                    DiskRequest::Reenroll,
+                ] {
+                    walks.push(
+                        proof_steps
+                            .iter()
+                            .map(|step| ask(request, *proof, *step))
+                            .collect(),
+                    );
+                }
+            }
+            walks.push(vec![
+                recovery(LoginStep::DiskIdentify),
+                recovery(authorize(A)),
+            ]);
+            walks
+        }
+
+        #[test]
+        fn every_step_has_an_independent_literal_encoding() {
+            let mut header = b"TDCONS01".to_vec();
+            header.extend([9; 32]);
+            header.extend([0, 0, 3, 232]);
+            let literal = |tail: &[u8]| [header.as_slice(), tail].concat();
+            let cases: Vec<(Operation, Vec<u8>)> = vec![
+                (
+                    add(
+                        Proof::DiskKey,
+                        LoginStep::Prove {
+                            key: NEW,
+                            retries: 8,
+                        },
+                    ),
+                    literal(&[19, 0, 0, 3, 232, 2, 2, 4, 0xee, 0xee, 0xee, 0xee, 8]),
+                ),
+                (
+                    remove(Proof::RecoveryKey, tpm_removal(0), LoginStep::Choose),
+                    literal(&[
+                        20, 0, 0, 3, 232, 1, 1, 1, 1, 2, 2, 0x1a, 0x2b, 0x3c, 0x4d, 2, 0x5e, 0x6f,
+                        0x70, 0x81, 0, 13,
+                    ]),
+                ),
+                (
+                    remove(Proof::DiskKey, tpm_removal(2), authorize(A)),
+                    literal(&[
+                        20, 0, 0, 3, 232, 2, 1, 1, 1, 2, 2, 0x1a, 0x2b, 0x3c, 0x4d, 2, 0x5e, 0x6f,
+                        0x70, 0x81, 2, 11, 0x1a, 0x2b, 0x3c, 0x4d, 8,
+                    ]),
+                ),
+                (
+                    recovery(LoginStep::DiskIdentify),
+                    literal(&[21, 0, 0, 3, 232, 10, b'4', b'7']),
+                ),
+                (
+                    Operation::ProtectorRequest {
+                        account: 1000,
+                        proof: Proof::RecoveryKey,
+                        request: DiskRequest::Reenroll,
+                        pending: Some(DiskRequest::TpmClear),
+                        step: LoginStep::RecoveryKey,
+                    },
+                    literal(&[24, 0, 0, 3, 232, 1, 2, 9]),
+                ),
+            ];
+            for (operation, bytes) in cases {
+                let request = ok(operation);
+                assert_eq!(request.encode(), bytes, "{request:?}");
+                assert_eq!(Request::decode(&bytes).unwrap(), request);
+            }
+        }
+
+        #[test]
+        fn every_step_roundtrips_and_refuses_truncation_or_trailing_bytes() {
+            for walk in walks() {
+                for operation in walk {
+                    let request = ok(operation);
+                    let bytes = request.encode();
+                    assert_eq!(Request::decode(&bytes).unwrap(), request);
+                    for cut in 44..bytes.len() {
+                        assert!(Request::decode(bytes.get(..cut).unwrap()).is_err(), "{cut}");
+                    }
+                    let mut long = bytes.clone();
+                    long.push(0);
+                    assert!(Request::decode(&long).is_err());
+                }
+            }
+        }
+
+        #[test]
+        fn the_widest_values_are_amendment_10s() {
+            let prove = LoginStep::Prove {
+                key: NEW,
+                retries: 8,
+            };
+            for (operation, bytes) in [
+                (add(Proof::DiskKey, prove), 57),
+                (add(Proof::DiskKey, authorize(A)), 57),
+                (remove(Proof::DiskKey, four(4), authorize(A)), 81),
+                (remove(Proof::DiskKey, four(0), LoginStep::Choose), 76),
+                (recovery(authorize(A)), 55),
+                (recovery(LoginStep::DiskIdentify), 52),
+                (ask(DiskRequest::Reenroll, Proof::DiskKey, authorize(A)), 57),
+            ] {
+                assert_eq!(ok(operation).encode().len(), bytes);
+            }
+        }
+
+        #[test]
+        fn construction_refuses_what_the_tags_do_not_admit() {
+            let refused = |operation| request(operation).unwrap_err();
+            // Another account, a step outside the order.
+            assert!(refused(Operation::ProtectorAdd {
+                account: 1001,
+                proof: Proof::DiskKey,
+                role: DiskRole::Primary,
+                step: LoginStep::DiskIdentify,
+            })
+            .contains("protector"));
+            for operation in [
+                add(Proof::RecoveryKey, LoginStep::DiskIdentify),
+                add(Proof::DiskKey, LoginStep::Identify),
+                add(Proof::DiskKey, LoginStep::Choose),
+                remove(Proof::DiskKey, tpm_removal(2), LoginStep::Connect),
+                remove(Proof::RecoveryKey, tpm_removal(2), authorize(A)),
+                recovery(LoginStep::RecoveryKey),
+                ask(DiskRequest::PinChange, Proof::DiskKey, LoginStep::Connect),
+                ask(DiskRequest::TpmClear, Proof::DiskKey, LoginStep::Choose),
+            ] {
+                assert!(request(operation.clone()).is_err(), "{operation:?}");
+            }
+            // The chosen position: zero exactly at the choose step, then a
+            // listed and removable token, never the authorizing one.
+            for operation in [
+                remove(Proof::DiskKey, tpm_removal(1), LoginStep::Choose),
+                remove(Proof::DiskKey, tpm_removal(0), LoginStep::DiskIdentify),
+                remove(Proof::DiskKey, tpm_removal(3), LoginStep::DiskIdentify),
+                remove(Proof::DiskKey, tpm_removal(2), authorize(B)),
+                remove(Proof::DiskKey, tpm_removal(2), authorize(C)),
+            ] {
+                assert!(request(operation.clone()).is_err(), "{operation:?}");
+            }
+            let mut alone = tpm_removal(1);
+            alone.tpm_pin = false;
+            alone.tokens.truncate(1);
+            assert!(request(remove(Proof::RecoveryKey, alone, LoginStep::RecoveryKey)).is_err());
+            for count in [0, 5] {
+                let mut list = four(0);
+                list.tokens = vec![token(DiskRole::Primary, A); count];
+                assert!(request(remove(Proof::DiskKey, list, LoginStep::Choose)).is_err());
+            }
+            // Tag 21's key on its identify step alone.
+            for (step, approval) in [(LoginStep::DiskIdentify, None), (authorize(A), Some(key()))] {
+                assert!(request(Operation::RecoveryRemove {
+                    account: 1000,
+                    step,
+                    approval
+                })
+                .is_err());
+            }
+        }
+
+        #[test]
+        fn decoding_refuses_bytes_outside_their_ranges() {
+            let base = ok(remove(Proof::DiskKey, tpm_removal(2), authorize(A))).encode();
+            // proof, shape, marker, tpm-pin, count, a role.
+            for (at, byte) in [
+                (49, 3),
+                (49, 0),
+                (50, 3),
+                (51, 2),
+                (52, 2),
+                (53, 5),
+                (54, 3),
+            ] {
+                let mut bad = base.clone();
+                *bad.get_mut(at).unwrap() = byte;
+                assert!(Request::decode(&bad).is_err(), "{at} {byte}");
+            }
+            let role = ok(add(Proof::DiskKey, LoginStep::DiskIdentify)).encode();
+            let mut bad = role.clone();
+            *bad.get_mut(50).unwrap() = 3;
+            assert!(Request::decode(&bad).is_err());
+            let pending = ok(ask(
+                DiskRequest::PinChange,
+                Proof::DiskKey,
+                LoginStep::DiskIdentify,
+            ))
+            .encode();
+            for byte in [1, 2, 3] {
+                let mut fine = pending.clone();
+                *fine.get_mut(50).unwrap() = byte;
+                assert!(Request::decode(&fine).is_ok());
+            }
+            let mut bad = pending.clone();
+            *bad.get_mut(50).unwrap() = 4;
+            assert!(Request::decode(&bad).is_err());
+        }
+
+        #[test]
+        fn each_walk_is_its_tags_only_order() {
+            for walk in walks() {
+                let requests: Vec<Request> = walk.into_iter().map(ok).collect();
+                let first = requests.first().unwrap();
+                let protected = volume(first);
+                let expected = if requests.len() == 1 {
+                    Admitted::Last
+                } else {
+                    Admitted::Next
+                };
+                assert_eq!(protected.admits(first), Ok(expected));
+                for (at, (current, next)) in
+                    requests.iter().zip(requests.iter().skip(1)).enumerate()
+                {
+                    let last = at + 2 == requests.len();
+                    assert_eq!(
+                        current.protector_successor(next),
+                        Ok(if last { Admitted::Last } else { Admitted::Next }),
+                        "{next:?}"
+                    );
+                    // No step skips, repeats or goes back.
+                    assert!(next.protector_successor(current).is_err());
+                    assert!(current.protector_successor(current).is_err());
+                    if let Some(skipped) = requests.get(at + 2) {
+                        assert!(current.protector_successor(skipped).is_err());
+                    }
+                }
+                // A later step is no start.
+                for later in requests.iter().skip(1) {
+                    assert!(protected.admits(later).is_err());
+                }
+            }
+        }
+
+        #[test]
+        fn a_successor_keeps_every_field_but_its_step() {
+            let choose = ok(remove(Proof::DiskKey, four(0), LoginStep::Choose));
+            let identify = ok(remove(Proof::DiskKey, four(2), LoginStep::DiskIdentify));
+            assert_eq!(choose.protector_successor(&identify), Ok(Admitted::Next));
+            // The chosen position is fixed after the choose step.
+            let moved = ok(remove(Proof::DiskKey, four(3), authorize(A)));
+            assert!(identify.protector_successor(&moved).is_err());
+            let kept = ok(remove(Proof::DiskKey, four(2), authorize(A)));
+            assert_eq!(identify.protector_successor(&kept), Ok(Admitted::Last));
+            // The list, the proof, the role, the request and the pending
+            // request are fixed.
+            let mut other_list = four(2);
+            other_list.marker = false;
+            assert!(choose
+                .protector_successor(&ok(remove(
+                    Proof::DiskKey,
+                    other_list,
+                    LoginStep::DiskIdentify
+                )))
+                .is_err());
+            let start = ok(add(Proof::DiskKey, LoginStep::DiskIdentify));
+            let primary = ok(Operation::ProtectorAdd {
+                account: 1000,
+                proof: Proof::DiskKey,
+                role: DiskRole::Primary,
+                step: authorize(A),
+            });
+            assert!(start.protector_successor(&primary).is_err());
+            let pin = ok(ask(
+                DiskRequest::PinChange,
+                Proof::DiskKey,
+                LoginStep::DiskIdentify,
+            ));
+            let clear = ok(ask(DiskRequest::TpmClear, Proof::DiskKey, authorize(A)));
+            assert!(pin.protector_successor(&clear).is_err());
+            let replacing = ok(Operation::ProtectorRequest {
+                account: 1000,
+                proof: Proof::DiskKey,
+                request: DiskRequest::PinChange,
+                pending: Some(DiskRequest::PinChange),
+                step: authorize(A),
+            });
+            assert!(pin.protector_successor(&replacing).is_err());
+            let nonce = Request::new(
+                [8; 32],
+                1000,
+                ask(DiskRequest::PinChange, Proof::DiskKey, authorize(A)),
+            )
+            .unwrap();
+            assert!(pin.protector_successor(&nonce).is_err());
+            // A blocked key, and a repeat naming another credential.
+            let blocked = ok(ask(
+                DiskRequest::PinChange,
+                Proof::DiskKey,
+                LoginStep::DiskAuthorize { key: A, retries: 0 },
+            ));
+            assert!(pin.protector_successor(&blocked).is_err());
+            let prove = ok(add(
+                Proof::RecoveryKey,
+                LoginStep::Prove {
+                    key: NEW,
+                    retries: 8,
+                },
+            ));
+            let other = ok(add(
+                Proof::RecoveryKey,
+                LoginStep::Repeat { key: A, retries: 8 },
+            ));
+            assert!(prove.protector_successor(&other).is_err());
+            // Other kinds are no protector steps.
+            let selector = ok(Operation::UpgradeCancel { key: key() });
+            assert!(selector.protector_successor(&pin).is_err());
+            assert!(tpm().admits(&selector).is_err());
+        }
+
+        #[test]
+        fn root_admits_only_the_baselines_protectors_and_the_created_key() {
+            let disk = DiskProofs {
+                recovery_key: false,
+                tokens: &[A, B],
+            };
+            let marked = DiskProofs {
+                recovery_key: true,
+                ..disk
+            };
+            let identify = ok(add(Proof::DiskKey, LoginStep::DiskIdentify));
+            let admit = |current: &Request, next: &Request, disk, created, chosen| {
+                current.admit_protector_step(next, disk, created, chosen)
+            };
+            assert!(admit(
+                &identify,
+                &ok(add(Proof::DiskKey, authorize(A))),
+                disk,
+                None,
+                None
+            )
+            .is_ok());
+            // A key outside the baseline; any proof step once a credential
+            // exists.
+            let stranger = ok(add(Proof::DiskKey, authorize(NEW)));
+            assert!(admit(&identify, &stranger, disk, None, None).is_err());
+            let authorized = ok(add(Proof::DiskKey, authorize(A)));
+            assert!(admit(&identify, &authorized, disk, Some(NEW), None).is_err());
+            let connect = ok(add(Proof::DiskKey, LoginStep::Connect));
+            assert!(admit(&authorized, &connect, disk, None, None).is_ok());
+            assert!(admit(&authorized, &connect, disk, Some(NEW), None).is_err());
+            let create = ok(add(Proof::DiskKey, LoginStep::Create { retries: 8 }));
+            assert!(admit(&connect, &create, disk, Some(NEW), None).is_err());
+            let prove = |key| ok(add(Proof::DiskKey, LoginStep::Prove { key, retries: 8 }));
+            assert!(admit(&create, &prove(NEW), disk, Some(NEW), None).is_ok());
+            assert!(admit(&create, &prove(NEW), disk, None, None).is_err());
+            assert!(admit(&create, &prove(A), disk, Some(A), None).is_err());
+            let repeat = |key| ok(add(Proof::DiskKey, LoginStep::Repeat { key, retries: 7 }));
+            assert!(admit(&prove(NEW), &repeat(NEW), disk, Some(NEW), None).is_ok());
+            assert!(admit(&prove(NEW), &repeat(NEW), disk, Some(D), None).is_err());
+            let probe = ok(add(Proof::DiskKey, LoginStep::Probe { key: NEW }));
+            assert!(admit(&repeat(NEW), &probe, disk, Some(NEW), None).is_ok());
+            assert!(admit(&repeat(NEW), &probe, disk, Some(D), None).is_err());
+            // Tag 21's disk authorize names a protector.
+            let disclosure = ok(recovery(LoginStep::DiskIdentify));
+            assert!(admit(&disclosure, &ok(recovery(authorize(B))), disk, None, None).is_ok());
+            assert!(admit(&disclosure, &ok(recovery(authorize(C))), disk, None, None).is_err());
+            // A removal's choose step: the typed position, carried; the
+            // recovery key needs the marker.
+            let choose = ok(remove(
+                Proof::RecoveryKey,
+                tpm_removal(0),
+                LoginStep::Choose,
+            ));
+            let typed = ok(remove(
+                Proof::RecoveryKey,
+                tpm_removal(1),
+                LoginStep::RecoveryKey,
+            ));
+            assert!(admit(&choose, &typed, disk, None, Some(1)).is_err());
+            assert!(admit(&choose, &typed, marked, None, Some(1)).is_ok());
+            assert!(admit(&choose, &typed, marked, None, Some(2)).is_err());
+            assert!(admit(&choose, &typed, marked, None, None).is_err());
+            // The digit only after the choose step.
+            assert!(admit(&identify, &authorized, disk, None, Some(1)).is_err());
+            // Tag 20's disk authorize names a listed protector other than
+            // the chosen one, and its list is the baseline's.
+            let identified = ok(remove(
+                Proof::DiskKey,
+                tpm_removal(2),
+                LoginStep::DiskIdentify,
+            ));
+            let by = ok(remove(Proof::DiskKey, tpm_removal(2), authorize(A)));
+            assert!(admit(&identified, &by, disk, None, None).is_ok());
+            let reordered = DiskProofs {
+                recovery_key: true,
+                tokens: &[B, A],
+            };
+            assert!(admit(&identified, &by, reordered, None, None).is_err());
+        }
+
+        #[test]
+        fn the_first_description_is_the_baselines() {
+            let first = |protected: &Protected, managed| {
+                protected.first(1000, managed, Some(key())).map(ok)
+            };
+            let disk = Proof::DiskKey;
+            let typed = Proof::RecoveryKey;
+            // Root's, which the worker admits; anything else it does not.
+            for (protected, managed) in [
+                (
+                    tpm(),
+                    Managed::Add {
+                        proof: disk,
+                        role: DiskRole::Recovery,
+                    },
+                ),
+                (
+                    fido(),
+                    Managed::Add {
+                        proof: typed,
+                        role: DiskRole::Primary,
+                    },
+                ),
+                (tpm(), Managed::Remove { proof: disk }),
+                (fido(), Managed::Remove { proof: typed }),
+                (fido(), Managed::RecoveryRemove),
+                (
+                    tpm(),
+                    Managed::Request {
+                        proof: typed,
+                        request: DiskRequest::PinChange,
+                    },
+                ),
+                (
+                    tpm(),
+                    Managed::Request {
+                        proof: disk,
+                        request: DiskRequest::TpmClear,
+                    },
+                ),
+                (
+                    tpm(),
+                    Managed::Request {
+                        proof: disk,
+                        request: DiskRequest::Reenroll,
+                    },
+                ),
+            ] {
+                let request = first(&protected, managed).unwrap();
+                assert!(protected.admits(&request).is_ok(), "{managed:?}");
+                let mut other = protected.clone();
+                other.tokens.swap(0, 1);
+                other.tokens[0].2 = C;
+                if matches!(managed, Managed::Remove { .. }) {
+                    assert!(other.admits(&request).is_err());
+                }
+                let mut pending = protected.clone();
+                pending.request = Some(DiskRequest::TpmClear);
+                if matches!(managed, Managed::Request { .. }) {
+                    assert!(pending.admits(&request).is_err());
+                    let replacing = first(&pending, managed).unwrap();
+                    assert!(pending.admits(&replacing).is_ok());
+                    assert!(protected.admits(&replacing).is_err());
+                }
+            }
+            assert_eq!(
+                first(
+                    &tpm(),
+                    Managed::Request {
+                        proof: typed,
+                        request: DiskRequest::Reenroll
+                    }
+                )
+                .unwrap()
+                .operation(),
+                &ask(DiskRequest::Reenroll, typed, LoginStep::RecoveryKey)
+            );
+            assert_eq!(
+                first(&tpm(), Managed::Remove { proof: disk })
+                    .unwrap()
+                    .removal(),
+                Some(&tpm_removal(0))
+            );
+            // A role, a shape or a marker the baseline does not hold.
+            let request = first(
+                &fido(),
+                Managed::Add {
+                    proof: typed,
+                    role: DiskRole::Primary,
+                },
+            )
+            .unwrap();
+            let mut unmarked = fido();
+            unmarked.marker = false;
+            assert!(unmarked.admits(&request).is_err());
+            assert!(tpm().admits(&request).is_err());
+            let mut shaped = tpm();
+            shaped.shape = UpgradeShape::Fido2;
+            shaped.tpm_pin = false;
+            let removal = first(&tpm(), Managed::Remove { proof: disk }).unwrap();
+            assert!(shaped.admits(&removal).is_err());
+        }
+
+        #[test]
+        fn each_refusal_is_its_detail() {
+            let refusal = |protected: &Protected, managed| protected.refusal(managed);
+            let disk = Proof::DiskKey;
+            let typed = Proof::RecoveryKey;
+            let add = |role| Managed::Add { proof: disk, role };
+            let ask = |request| Managed::Request {
+                proof: disk,
+                request,
+            };
+            assert_eq!(refusal(&tpm(), add(DiskRole::Recovery)), None);
+            // 01: a role the shape does not take, or no room, an orphan's
+            // included.
+            assert_eq!(refusal(&tpm(), add(DiskRole::Primary)), Some(1));
+            let mut full = tpm();
+            full.tokens.push((DiskRole::Recovery, true, C));
+            full.tokens.push((DiskRole::Recovery, false, D));
+            assert_eq!(refusal(&full, add(DiskRole::Recovery)), Some(1));
+            let mut three = fido();
+            three.tokens.push((DiskRole::Primary, false, C));
+            assert_eq!(refusal(&three, add(DiskRole::Primary)), Some(1));
+            assert_eq!(refusal(&three, add(DiskRole::Recovery)), None);
+            // 02: no removable protector; the recovery key's minimums.
+            let mut alone = tpm();
+            alone.tpm_pin = false;
+            alone.tokens = vec![
+                (DiskRole::Recovery, true, A),
+                (DiskRole::Recovery, false, B),
+            ];
+            assert_eq!(refusal(&alone, Managed::Remove { proof: typed }), Some(2));
+            assert_eq!(alone.removal().tokens.len(), 1);
+            let mut none = tpm();
+            none.tokens.clear();
+            assert_eq!(refusal(&none, Managed::Remove { proof: typed }), Some(2));
+            assert_eq!(refusal(&fido(), Managed::RecoveryRemove), None);
+            assert_eq!(refusal(&tpm(), Managed::RecoveryRemove), Some(2));
+            let mut unmarked = fido();
+            unmarked.marker = false;
+            assert_eq!(refusal(&unmarked, Managed::RecoveryRemove), Some(2));
+            let mut one = fido();
+            one.tokens[1].1 = false;
+            assert_eq!(refusal(&one, Managed::RecoveryRemove), Some(2));
+            let mut recoveries = fido();
+            recoveries.tokens = vec![(DiskRole::Recovery, true, A), (DiskRole::Recovery, true, B)];
+            assert_eq!(refusal(&recoveries, Managed::RecoveryRemove), Some(2));
+            // 03: each request's protector.
+            for request in [
+                DiskRequest::PinChange,
+                DiskRequest::TpmClear,
+                DiskRequest::Reenroll,
+            ] {
+                assert_eq!(refusal(&tpm(), ask(request)), None, "{request:?}");
+                assert_eq!(refusal(&fido(), ask(request)), Some(3), "{request:?}");
+            }
+            let mut unanchored = tpm();
+            unanchored.lockout = false;
+            assert_eq!(refusal(&unanchored, ask(DiskRequest::PinChange)), Some(3));
+            assert_eq!(refusal(&unanchored, ask(DiskRequest::TpmClear)), Some(3));
+            assert_eq!(refusal(&unanchored, ask(DiskRequest::Reenroll)), None);
+            let mut cleared = tpm();
+            cleared.tpm_pin = false;
+            assert_eq!(refusal(&cleared, ask(DiskRequest::PinChange)), Some(3));
+            assert_eq!(refusal(&cleared, ask(DiskRequest::Reenroll)), None);
+            cleared.lockout = false;
+            assert_eq!(refusal(&cleared, ask(DiskRequest::Reenroll)), Some(3));
+            // 00: a proof the volume does not offer, after the operation's.
+            assert_eq!(
+                refusal(
+                    &unmarked,
+                    Managed::Add {
+                        proof: typed,
+                        role: DiskRole::Primary
+                    }
+                ),
+                Some(0)
+            );
+            let mut bare = tpm();
+            bare.tokens.clear();
+            assert_eq!(refusal(&bare, add(DiskRole::Recovery)), Some(0));
+            let mut single = tpm();
+            single.tokens.pop();
+            assert_eq!(refusal(&single, Managed::Remove { proof: disk }), Some(0));
+            assert_eq!(refusal(&single, Managed::Remove { proof: typed }), None);
+            assert_eq!(refusal(&fido(), ask(DiskRequest::PinChange)), Some(3));
+            assert!(fido()
+                .first(1000, Managed::RecoveryRemove, Some(key()))
+                .is_ok());
+            assert_eq!(
+                tpm().first(1000, Managed::RecoveryRemove, Some(key())),
+                Err(2)
+            );
+            // The operation's detail, not the proof's, where both apply.
+            assert_eq!(
+                refusal(&unmarked, Managed::Remove { proof: typed }),
+                Some(2)
+            );
+        }
+
+        #[test]
+        fn a_choose_entry_is_one_digit_naming_a_removable_token() {
+            let mut removal = tpm_removal(0);
+            assert_eq!(removal.entry(b"1"), Some(1));
+            assert_eq!(removal.entry(b"2"), Some(2));
+            for entry in [&b""[..], b"0", b"3", b"9", b"12", b"a", b" 1", b"\x01"] {
+                assert_eq!(removal.entry(entry), None, "{entry:?}");
+            }
+            removal.tpm_pin = false;
+            removal.tokens.truncate(1);
+            assert_eq!(removal.entry(b"1"), None);
+        }
+
+        #[test]
+        fn no_other_tag_takes_the_choose_step() {
+            let choose = LoginStep::Choose;
+            for operation in [
+                Operation::LoginUnlock {
+                    account: 1000,
+                    before: 1,
+                    after: 1,
+                    step: choose,
+                },
+                Operation::LoginAdd {
+                    account: 1000,
+                    before: 1,
+                    after: 2,
+                    step: choose,
+                    proof: None,
+                },
+                Operation::LoginAdd {
+                    account: 1000,
+                    before: 1,
+                    after: 2,
+                    step: choose,
+                    proof: Some(Proof::DiskKey),
+                },
+                Operation::Upgrade {
+                    account: 1000,
+                    shape: UpgradeShape::Tpm,
+                    count: 1,
+                    current: "a".repeat(64),
+                    step: UpgradeStep::Key {
+                        key: 1,
+                        step: choose,
+                    },
+                    approval: None,
+                },
+                add(Proof::DiskKey, choose),
+                recovery(choose),
+                ask(DiskRequest::Reenroll, Proof::DiskKey, choose),
+            ] {
+                assert!(request(operation.clone()).is_err(), "{operation:?}");
+            }
+        }
+
+        #[test]
+        fn a_well_formed_list_of_zero_or_five_tokens_refuses() {
+            let four = ok(remove(Proof::DiskKey, four(0), LoginStep::Choose)).encode();
+            // The count at 53, four tokens from 54, the chosen position at 74.
+            assert_eq!(four[53], 4);
+            let mut five = four.clone();
+            five[53] = 5;
+            five.splice(74..74, [1, 9, 9, 9, 9]);
+            assert_eq!(
+                Request::decode(&five).unwrap_err(),
+                "invalid consent disk token list"
+            );
+            let mut none = four.clone();
+            none[53] = 0;
+            none.drain(54..74);
+            assert_eq!(
+                Request::decode(&none).unwrap_err(),
+                "invalid consent disk token list"
+            );
+        }
+
+        #[test]
+        fn each_shapes_list_holds_its_own_tokens() {
+            let mut primary = tpm_removal(0);
+            primary.tokens[1].role = DiskRole::Primary;
+            assert!(request(remove(Proof::DiskKey, primary, LoginStep::Choose)).is_err());
+            let mut pinned = four(0);
+            pinned.tpm_pin = true;
+            assert!(request(remove(Proof::DiskKey, pinned, LoginStep::Choose)).is_err());
+        }
+
+        #[test]
+        fn a_removals_successor_keeps_its_whole_list() {
+            let choose = ok(remove(Proof::DiskKey, four(0), LoginStep::Choose));
+            let changes: &[fn(&mut Removal)] = &[
+                |list| list.marker = false,
+                |list| list.tokens[0].role = DiskRole::Recovery,
+                |list| list.tokens[3].role = DiskRole::Primary,
+                |list| list.tokens[1].key = NEW,
+                |list| list.tokens.swap(1, 2),
+                |list| {
+                    list.tokens.pop();
+                },
+            ];
+            for change in changes {
+                let mut list = four(1);
+                change(&mut list);
+                let next = ok(remove(Proof::DiskKey, list, LoginStep::DiskIdentify));
+                assert!(choose.protector_successor(&next).is_err(), "{next:?}");
+            }
+            // The tpm-pin byte alone.
+            let mut tpm = tpm_removal(0);
+            let choose = ok(remove(Proof::DiskKey, tpm.clone(), LoginStep::Choose));
+            tpm.chosen = 1;
+            tpm.tpm_pin = false;
+            let next = ok(remove(Proof::DiskKey, tpm, LoginStep::DiskIdentify));
+            assert!(choose.protector_successor(&next).is_err());
+            // The shape alone, over the same recovery tokens.
+            let recoveries = Removal {
+                shape: UpgradeShape::Fido2,
+                marker: true,
+                tpm_pin: false,
+                tokens: vec![token(DiskRole::Recovery, A), token(DiskRole::Recovery, B)],
+                chosen: 0,
+            };
+            let choose = ok(remove(
+                Proof::DiskKey,
+                recoveries.clone(),
+                LoginStep::Choose,
+            ));
+            let reshaped = Removal {
+                shape: UpgradeShape::Tpm,
+                chosen: 1,
+                ..recoveries
+            };
+            let next = ok(remove(Proof::DiskKey, reshaped, LoginStep::DiskIdentify));
+            assert!(choose.protector_successor(&next).is_err());
+        }
+
+        #[test]
+        fn every_step_shows_its_literal_rows() {
+            let rows = |operation| ok(operation).lines().split_off(2);
+            let prove = LoginStep::Prove {
+                key: NEW,
+                retries: 8,
+            };
+            let repeat = LoginStep::Repeat {
+                key: NEW,
+                retries: 7,
+            };
+            let head = ["ADD A DISK SECURITY KEY", "AS A RECOVERY KEY"];
+            let pin = |retries: u8| {
+                [
+                    format!("{retries} PIN ATTEMPTS LEFT ON THIS KEY"),
+                    "ENTER ITS PIN, THEN TOUCH THE KEY".to_string(),
+                ]
+            };
+            let cases: Vec<(Operation, Vec<String>)> = vec![
+                (
+                    add(Proof::DiskKey, LoginStep::Connect),
+                    vec![
+                        "AUTHORIZED BY A DISK SECURITY KEY".into(),
+                        "REMOVE THE AUTHORIZING KEY".into(),
+                        "CONNECT ONLY THE NEW KEY".into(),
+                    ],
+                ),
+                (
+                    add(Proof::RecoveryKey, LoginStep::Connect),
+                    vec![
+                        "AUTHORIZED BY DISK RECOVERY KEY".into(),
+                        "CONNECT ONLY THE NEW KEY".into(),
+                    ],
+                ),
+                (
+                    add(Proof::RecoveryKey, prove),
+                    [
+                        vec![
+                            "AUTHORIZED BY DISK RECOVERY KEY".into(),
+                            "VERIFY NEW KEY eeeeeeee".into(),
+                        ],
+                        pin(8).to_vec(),
+                    ]
+                    .concat(),
+                ),
+                (
+                    add(Proof::RecoveryKey, repeat),
+                    [
+                        vec![
+                            "AUTHORIZED BY DISK RECOVERY KEY".into(),
+                            "VERIFY NEW KEY eeeeeeee AGAIN".into(),
+                        ],
+                        pin(7).to_vec(),
+                    ]
+                    .concat(),
+                ),
+                (
+                    add(Proof::RecoveryKey, LoginStep::Probe { key: NEW }),
+                    vec![
+                        "AUTHORIZED BY DISK RECOVERY KEY".into(),
+                        "CHECKING NEW KEY eeeeeeee".into(),
+                        "KEEP IT CONNECTED AND TOUCH IT".into(),
+                    ],
+                ),
+            ];
+            for (operation, step) in cases {
+                let expected: Vec<String> = head
+                    .iter()
+                    .map(|row| row.to_string())
+                    .chain(step)
+                    .chain(["ESC TO CANCEL".to_string()])
+                    .collect();
+                assert_eq!(rows(operation), expected);
+            }
+            assert_eq!(
+                rows(remove(
+                    Proof::RecoveryKey,
+                    tpm_removal(1),
+                    LoginStep::RecoveryKey
+                )),
+                [
+                    "REMOVE A DISK SECURITY KEY",
+                    "REMOVES 1: RECOVERY KEY 1a2b3c4d",
+                    "AUTHORIZED BY DISK RECOVERY KEY",
+                    "TYPE THE DISK RECOVERY KEY",
+                    "ESC TO CANCEL",
+                ]
+            );
+            assert_eq!(
+                rows(ask(
+                    DiskRequest::PinChange,
+                    Proof::DiskKey,
+                    LoginStep::DiskIdentify
+                )),
+                [
+                    "REQUEST A DISK PIN CHANGE",
+                    "THE NEXT BOOT BY THE PIN",
+                    "ASKS FOR A NEW PIN",
+                    "AUTHORIZED BY A DISK SECURITY KEY",
+                    "CONNECT ONE DISK SECURITY KEY ONLY",
+                    "ESC TO CANCEL",
+                ]
+            );
+            assert_eq!(
+                rows(Operation::ProtectorRequest {
+                    account: 1000,
+                    proof: Proof::DiskKey,
+                    request: DiskRequest::Reenroll,
+                    pending: Some(DiskRequest::PinChange),
+                    step: authorize(A),
+                }),
+                [
+                    "REQUEST TPM RE-ENROLLMENT",
+                    "THE NEXT BOOT BY A SECURITY KEY",
+                    "OR RECOVERY KEY ASKS TO RE-ENROLL",
+                    "REPLACES THE PENDING PIN CHANGE",
+                    "AUTHORIZED BY A DISK SECURITY KEY",
+                    "DISK SECURITY KEY 1a2b3c4d",
+                    "8 PIN ATTEMPTS LEFT ON THIS KEY",
+                    "ENTER ITS PIN, THEN TOUCH THE KEY",
+                    "ESC TO CANCEL",
+                ]
+            );
+            let primary = Operation::ProtectorAdd {
+                account: 1000,
+                proof: Proof::RecoveryKey,
+                role: DiskRole::Primary,
+                step: LoginStep::RecoveryKey,
+            };
+            assert_eq!(rows(primary)[1], "AS A PRIMARY KEY");
+            assert_eq!("REPLACES THE PENDING RE-ENROLLMENT".len(), PROMPT_COLUMNS);
+        }
+
+        #[test]
+        fn a_shared_fingerprint_is_told_apart_by_its_position() {
+            let mut twins = tpm_removal(1);
+            twins.tokens[1].key = A;
+            let by = ok(remove(Proof::DiskKey, twins.clone(), authorize(A)));
+            assert!(by
+                .lines()
+                .contains(&"REMOVES 1: RECOVERY KEY 1a2b3c4d".to_string()));
+            twins.tokens.truncate(1);
+            twins.tpm_pin = true;
+            assert!(request(remove(Proof::DiskKey, twins, authorize(A))).is_err());
+        }
+
+        #[test]
+        fn decoding_holds_the_chosen_position_and_the_step_to_the_tag() {
+            let base = ok(remove(
+                Proof::DiskKey,
+                tpm_removal(2),
+                LoginStep::DiskIdentify,
+            ))
+            .encode();
+            // Two tokens from 54, the chosen position at 64, the step at 65.
+            assert_eq!((base[64], base[65]), (2, 10));
+            for chosen in [0, 3] {
+                let mut bad = base.clone();
+                bad[64] = chosen;
+                assert!(Request::decode(&bad).is_err(), "{chosen}");
+            }
+            let choose = ok(remove(Proof::DiskKey, tpm_removal(0), LoginStep::Choose)).encode();
+            let mut bad = choose.clone();
+            bad[64] = 1;
+            assert!(Request::decode(&bad).is_err());
+            let start = ok(add(Proof::RecoveryKey, LoginStep::RecoveryKey)).encode();
+            for step in [1, 7, 12, 14] {
+                let mut bad = start.clone();
+                *bad.last_mut().unwrap() = step;
+                assert!(Request::decode(&bad).is_err(), "{step}");
+            }
+        }
+
+        #[test]
+        fn the_remaining_rows_are_literal() {
+            assert_eq!(
+                ok(recovery(authorize(A))).lines().split_off(2),
+                [
+                    "REMOVE THE DISK RECOVERY KEY",
+                    "AUTHORIZED BY A DISK SECURITY KEY",
+                    "DISK SECURITY KEY 1a2b3c4d",
+                    "8 PIN ATTEMPTS LEFT ON THIS KEY",
+                    "ENTER ITS PIN, THEN TOUCH THE KEY",
+                    "ESC TO CANCEL",
+                ]
+            );
+            for (pending, row) in [
+                (DiskRequest::PinChange, "REPLACES THE PENDING PIN CHANGE"),
+                (DiskRequest::TpmClear, "REPLACES THE PENDING TPM CLEAR"),
+                (DiskRequest::Reenroll, "REPLACES THE PENDING RE-ENROLLMENT"),
+            ] {
+                let rows = ok(Operation::ProtectorRequest {
+                    account: 1000,
+                    proof: Proof::RecoveryKey,
+                    request: DiskRequest::PinChange,
+                    pending: Some(pending),
+                    step: LoginStep::RecoveryKey,
+                })
+                .lines();
+                assert_eq!(rows[5], row);
+            }
+        }
+
+        #[test]
+        fn removable_keeps_each_shapes_minimums() {
+            let mut tpm = tpm_removal(0);
+            assert!(tpm.removable(1) && tpm.removable(2));
+            assert!(!tpm.removable(0) && !tpm.removable(3));
+            tpm.tpm_pin = false;
+            assert!(tpm.removable(1));
+            tpm.tokens.truncate(1);
+            assert!(!tpm.removable(1));
+            tpm.tpm_pin = true;
+            assert!(tpm.removable(1));
+            let mut fido = four(0);
+            for position in 1..=4 {
+                assert!(fido.removable(position), "{position}");
+            }
+            // One primary and the recovery token beside the marker.
+            fido.tokens = vec![token(DiskRole::Primary, A), token(DiskRole::Recovery, D)];
+            assert!(!fido.removable(1) && fido.removable(2));
+            fido.marker = false;
+            assert!(!fido.removable(2));
+            fido.tokens.push(token(DiskRole::Primary, B));
+            assert!(fido.removable(1) && fido.removable(2) && fido.removable(3));
+        }
+
+        #[test]
+        fn the_rows_are_amendment_10s_and_fit_the_prompt() {
+            let rows = |operation| ok(operation).lines();
+            let choose = rows(remove(Proof::DiskKey, tpm_removal(0), LoginStep::Choose));
+            assert_eq!(
+                choose.get(2..).unwrap(),
+                [
+                    "REMOVE A DISK SECURITY KEY",
+                    "CHOOSE THE KEY TO REMOVE",
+                    "1: RECOVERY KEY 1a2b3c4d",
+                    "2: RECOVERY KEY 5e6f7081",
+                    "TYPE ITS NUMBER",
+                    "AUTHORIZED BY A DISK SECURITY KEY",
+                    "ESC TO CANCEL",
+                ]
+            );
+            let mut needed = tpm_removal(0);
+            needed.tpm_pin = false;
+            needed.tokens.truncate(1);
+            needed.tokens.push(token(DiskRole::Recovery, B));
+            let mut one = needed.clone();
+            one.tokens.truncate(1);
+            assert!(rows(remove(Proof::RecoveryKey, one, LoginStep::Choose))
+                .contains(&"1: RECOVERY KEY 1a2b3c4d - NEEDED".to_string()));
+            let later = rows(remove(Proof::DiskKey, tpm_removal(2), authorize(A)));
+            assert_eq!(
+                later.get(2..).unwrap(),
+                [
+                    "REMOVE A DISK SECURITY KEY",
+                    "REMOVES 2: RECOVERY KEY 5e6f7081",
+                    "AUTHORIZED BY A DISK SECURITY KEY",
+                    "DISK SECURITY KEY 1a2b3c4d",
+                    "8 PIN ATTEMPTS LEFT ON THIS KEY",
+                    "ENTER ITS PIN, THEN TOUCH THE KEY",
+                    "ESC TO CANCEL",
+                ]
+            );
+            assert_eq!(
+                rows(recovery(LoginStep::DiskIdentify)).get(2..).unwrap(),
+                [
+                    "REMOVE THE DISK RECOVERY KEY",
+                    "AFTER THIS ONLY THE SECURITY KEYS",
+                    "ON THE DISK CAN OPEN IT",
+                    "LOSING THEM ALL LOSES THE DATA",
+                    "AUTHORIZED BY A DISK SECURITY KEY",
+                    "CONNECT ONE DISK SECURITY KEY ONLY",
+                    "APPROVE: TYPE 4 THEN 7",
+                    "ESC: CANCEL",
+                ]
+            );
+            assert_eq!(
+                rows(Operation::ProtectorRequest {
+                    account: 1000,
+                    proof: Proof::RecoveryKey,
+                    request: DiskRequest::TpmClear,
+                    pending: Some(DiskRequest::Reenroll),
+                    step: LoginStep::RecoveryKey,
+                })
+                .get(2..)
+                .unwrap(),
+                [
+                    "REQUEST A TPM CLEAR",
+                    "THE NEXT BOOT ASKS TO CLEAR",
+                    "THE TPM AND ALL ITS KEYS",
+                    "BOOTS AFTER NEED A SECURITY KEY",
+                    "OR THE RECOVERY KEY",
+                    "REPLACES THE PENDING RE-ENROLLMENT",
+                    "AUTHORIZED BY DISK RECOVERY KEY",
+                    "TYPE THE DISK RECOVERY KEY",
+                    "ESC TO CANCEL",
+                ]
+            );
+            let add_rows = rows(add(Proof::RecoveryKey, LoginStep::Create { retries: 3 }));
+            assert_eq!(
+                add_rows.get(2..5).unwrap(),
+                [
+                    "ADD A DISK SECURITY KEY",
+                    "AS A RECOVERY KEY",
+                    "AUTHORIZED BY DISK RECOVERY KEY",
+                ]
+            );
+            assert!(add_rows.contains(&"CREATE A DISK CREDENTIAL".to_string()));
+            // Every row of every step, the four-token lists' and every
+            // pending row among them, fits and uses no apostrophe, comma
+            // or parenthesis, but the PIN step's fixed row.
+            let mut all: Vec<Operation> = walks().into_iter().flatten().collect();
+            all.push(remove(Proof::DiskKey, four(0), LoginStep::Choose));
+            all.push(remove(Proof::DiskKey, four(4), authorize(A)));
+            for pending in [
+                DiskRequest::PinChange,
+                DiskRequest::TpmClear,
+                DiskRequest::Reenroll,
+            ] {
+                all.push(Operation::ProtectorRequest {
+                    account: 1000,
+                    proof: Proof::DiskKey,
+                    request: DiskRequest::PinChange,
+                    pending: Some(pending),
+                    step: LoginStep::DiskIdentify,
+                });
+            }
+            for operation in all {
+                for row in rows(operation).iter().skip(2) {
+                    assert!(row.len() <= PROMPT_COLUMNS, "{row}");
+                    if row != "ENTER ITS PIN, THEN TOUCH THE KEY" {
+                        assert!(!row.contains([',', '\'', '(', ')']), "{row}");
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn the_ceilings_and_steps_are_amendment_10s() {
+            let ceiling = |operation| ok(operation).ceiling();
+            let long = Some(PROTECTOR_CEILING);
+            assert_eq!(ceiling(add(Proof::DiskKey, LoginStep::DiskIdentify)), long);
+            assert_eq!(
+                ceiling(remove(Proof::DiskKey, tpm_removal(0), LoginStep::Choose)),
+                long
+            );
+            assert_eq!(ceiling(recovery(LoginStep::DiskIdentify)), long);
+            for request in [
+                DiskRequest::PinChange,
+                DiskRequest::TpmClear,
+                DiskRequest::Reenroll,
+            ] {
+                assert_eq!(
+                    ceiling(ask(request, Proof::RecoveryKey, LoginStep::RecoveryKey)),
+                    Some(REQUEST_CEILING)
+                );
+            }
+            assert_eq!(PROTECTOR_CEILING, Duration::from_secs(360));
+            assert_eq!(REQUEST_CEILING, Duration::from_secs(240));
+            assert!(LOGIN_LONGEST >= PROTECTOR_CEILING);
+            // The choose step asks for its digit; tag 21 discloses.
+            assert!(LoginStep::Choose.asks_pin());
+            assert!(ok(add(Proof::RecoveryKey, LoginStep::RecoveryKey)).asks_recovery_key());
+            assert!(ok(remove(
+                Proof::RecoveryKey,
+                tpm_removal(1),
+                LoginStep::RecoveryKey
+            ))
+            .asks_recovery_key());
+            assert!(!ok(remove(
+                Proof::RecoveryKey,
+                tpm_removal(0),
+                LoginStep::Choose
+            ))
+            .asks_recovery_key());
+            let choose = ok(remove(Proof::DiskKey, tpm_removal(0), LoginStep::Choose));
+            assert_eq!(choose.ceremony_step(), Some(LoginStep::Choose));
+            assert_eq!(choose.removal(), Some(&tpm_removal(0)));
+            assert_eq!(choose.protector_proof(), Some(Proof::DiskKey));
+            assert_eq!(
+                ok(recovery(LoginStep::DiskIdentify)).protector_approval(),
+                Some(key())
+            );
+            assert_eq!(ok(recovery(authorize(A))).protector_approval(), None);
+            for proof in PROOFS {
+                assert_eq!(
+                    ok(ask(DiskRequest::TpmClear, *proof, first_proof(*proof))).protector_step(),
+                    Some(first_proof(*proof))
+                );
+            }
         }
     }
 }

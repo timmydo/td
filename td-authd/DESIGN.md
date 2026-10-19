@@ -2666,8 +2666,10 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
     fixed by ENCRYPTION.md increment 8f's documentation commit, before
     their code, and implemented (`20 02`, `20 03`) behind the same
     `OPERATIONS`. Protector management (`20 04` to `20 09`) is fixed by
-    increment 8g's documentation commit, before its code, and not yet
-    implemented; Secure Boot enrollment (`20 0a`) is not yet fixed.
+    increment 8g's documentation commit, before its code. Its consent
+    tags 19 to 24 and the choose step are implemented, and nothing
+    builds them yet; the operations are not yet implemented. Secure
+    Boot enrollment (`20 0a`) is not yet fixed.
     One fixed root `/bin/td-install storage-operation --uid 1000` child
     per operation, the storage worker (`td-install/DESIGN.md`, "Storage
     operation worker"), launched and supervised as the login worker is
@@ -2885,11 +2887,15 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
        `0`;
     3. tpm-pin: `1` when a tpm-pin token naming a keyslot is on the
        header, else `0`;
-    4. the fido2 token count, 1 to 4;
-    5. that many tokens in token-number order, each its role byte and
-       fingerprint;
+    4. the count of FIDO2 protectors, the fido2 tokens naming a
+       keyslot, 1 to 4;
+    5. that many protectors in token-number order, each its role byte
+       and fingerprint;
     6. the chosen position: `0` at the choose step, 1 through the count
        at every later step.
+
+    In the TPM shape every listed token is fido2-recovery. In the FIDO2
+    shape the tpm-pin byte is `0`. Other values refuse.
 
     The pending byte of tags 22 to 24 is `0` when the header holds no
     `td-request` token, or `1` to `3` for the pending request's
@@ -2938,14 +2944,18 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
     DISK RECOVERY KEY` or `AUTHORIZED BY A DISK SECURITY KEY`, tag 21
     always the second; then the step's rows, as tags 13 to 15 show a
     proof step and tag 17 a new key's step, with `CREATE A DISK
-    CREDENTIAL` at create. Every row is within `PROMPT_COLUMNS` and uses
-    no apostrophe, comma or parenthesis.
+    CREDENTIAL` at create; tag 19's connect step after a disk key's
+    proof first shows `REMOVE THE AUTHORIZING KEY`, as tag 14's does.
+    Last, tag 21's identify step shows the approval key's rows. Every
+    row is within `PROMPT_COLUMNS` and uses no apostrophe, comma or
+    parenthesis. The one exception is a PIN step's fixed row `ENTER ITS
+    PIN, THEN TOUCH THE KEY`.
 
     | Tag | The operation's rows |
     | --- | --- |
     | 19 | `ADD A DISK SECURITY KEY`; `AS A PRIMARY KEY` or `AS A RECOVERY KEY` |
     | 20 | `REMOVE A DISK SECURITY KEY`; at the choose step, the list below; at every later step, the chosen token as `REMOVES 2: RECOVERY KEY 1a2b3c4d` (its position, role and fingerprint, since two tokens may share a fingerprint) |
-    | 21 | `REMOVE THE DISK RECOVERY KEY`; at its identify step, the disclosure `AFTER THIS ONLY THE SECURITY KEYS`, `ON THE DISK CAN OPEN IT` and `LOSING THEM ALL LOSES THE DATA`, then the approval key's rows |
+    | 21 | `REMOVE THE DISK RECOVERY KEY`; at its identify step, the disclosure `AFTER THIS ONLY THE SECURITY KEYS`, `ON THE DISK CAN OPEN IT` and `LOSING THEM ALL LOSES THE DATA`; the approval key's rows come last, after the step's |
     | 22 | `REQUEST A DISK PIN CHANGE`, `THE NEXT BOOT BY THE PIN`, `ASKS FOR A NEW PIN` |
     | 23 | `REQUEST A TPM CLEAR`, `THE NEXT BOOT ASKS TO CLEAR`, `THE TPM AND ALL ITS KEYS`, `BOOTS AFTER NEED A SECURITY KEY`, `OR THE RECOVERY KEY` (the two boots that take the lockout and offer the reseal) |
     | 24 | `REQUEST TPM RE-ENROLLMENT`, `THE NEXT BOOT BY A SECURITY KEY`, `OR RECOVERY KEY ASKS TO RE-ENROLL` |
@@ -3053,33 +3063,42 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
 
     | Detail | Meaning |
     | --- | --- |
-    | `00` | The proof is not offered: the recovery key without a marker, a disk key without a fido2 token, or a removal by disk key without two |
-    | `01` | An addition the shape cannot take: a role it does not take (the TPM shape takes fido2-recovery only), or no room (four FIDO2 tokens, or in the FIDO2 shape three of that role) |
-    | `02` | A removal with no removable token (`Removal::removable`), or a recovery-key removal outside the FIDO2 shape, without the marker, or with fewer than two FIDO2 tokens |
+    | `00` | The proof is not offered: the recovery key without a marker, a disk key without a FIDO2 protector, or a removal by disk key without two |
+    | `01` | An addition the shape cannot take: a role it does not take (the TPM shape takes fido2-recovery only), or no room (four fido2 tokens, or in the FIDO2 shape three of that role; every fido2 token counts, an orphan too, as td-protector's reader counts them) |
+    | `02` | A removal with no removable protector (`Removal::removable`), or a recovery-key removal outside the FIDO2 shape, without the marker, or without two FIDO2 protectors, one of them fido2-primary |
     | `03` | A request without the protector it acts on: a PIN change without the TPM shape, a tpm-pin token naming a keyslot and a lockout token, which anchors the new seal; a TPM clear without a lockout token; a re-enrollment outside the TPM shape, or with neither a tpm-pin token naming a keyslot nor a lockout token, since it would find nothing stale |
+
+    A FIDO2 protector is a fido2 token naming a keyslot: an orphan opens
+    nothing. When the operation's own detail also applies, root sends
+    that one, not `00`.
 
     Otherwise root builds the first description from the baseline: the
     proof's first step, the choose step for a removal, or tag 21's
     identify step with an approval key root draws, as for a login
-    disclosure. The worker repeats it as its first `10`, before any
-    token I/O.
+    disclosure. Consent's `Protected` holds the baseline's protected
+    volume:
+    `refusal` gives the detail, `first` the description, and `admits`
+    is the worker's check that root's description is that one. The
+    worker repeats it as its first `10`, before any token I/O.
 
     Root admits each later step as a disk proof's
     (`Request::admit_protector_step`):
 
     - by the tag's successor rule;
-    - a disk key's fingerprint must name a fido2 token of the baseline,
-      for a removal one other than the chosen token (the worker ends
-      with `04` detail `01` otherwise), with retries of one nonzero
-      byte;
+    - a disk key's fingerprint must name a FIDO2 protector of the
+      baseline, for a removal one other than the chosen token (the
+      worker ends with `04` detail `01` otherwise), with retries of one
+      nonzero byte, and a removal's list must be the baseline's
+      protectors in order;
     - a recovery-key step only where the baseline has the marker;
     - for an addition's new key, what `admit_upgrade_step` admits of a
-      new key.
+      new key, its fingerprint no FIDO2 protector's.
 
     A choose step's `1c` must hold exactly one ASCII digit naming a
-    removable token. Root parses it, forwards it to the worker as a
-    one-byte `16` frame, and requires it as the next step's chosen
-    position; the compositor and the worker check the same. Anything
+    removable token (`Removal::entry`). Root parses it, forwards it to
+    the worker as a one-byte `16` frame, and requires it as the next
+    step's chosen position (`admit_protector_step`'s `chosen`); the
+    compositor and the worker check the same. Anything
     else is a protocol violation that ends the generation, since the
     compositor's field admits nothing else. A recovery-key step's `1c`
     is a disk proof's.

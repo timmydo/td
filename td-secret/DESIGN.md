@@ -1830,10 +1830,10 @@ operation.
 
 Consent tags 11 and 12 describe the elevation operations `deploy-rollback`
 and `set-hostname` (td-authd/DESIGN.md, "Elevation operations").
-td-secret's copy of the shared codec decodes tags 5, 11 and 12, so their
-refusal rests on each worker's operation match: the unlock, enrollment,
-credential write and login-key workers each reject all three, which a
-test feeds every worker.
+td-secret's copy of the shared codec decodes tags 5, 11 and 12, and the
+storage operations' 16 to 24, so their refusal rests on each worker's
+operation match: the unlock, enrollment, credential write and login-key
+workers each reject every one, which a test feeds every worker.
 
 ## Login record codec
 
