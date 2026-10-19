@@ -114,14 +114,23 @@ ended connection discards the listed observations. An absent intake fails at
 once; otherwise a worker thread connects, requires the service's greeting
 within ten seconds and does the blocking exchange, one request at a time, so
 the window keeps drawing, and between requests it notices the service
-closing. A reply has no time limit. Up and Down move the list's navigation
-index, PageUp and PageDown page a disk's identity, and Escape returns to
-welcome. From the list Escape keeps the connection for the next request;
-while waiting it abandons the request and its connection, so a service that
-never answers cannot hold the window, and td-authd serves the next installer
-once it reaps that service. Disks the window stopped waiting for are
-dropped. With a disk selected, Return continues to the settings step
-described below and Escape there goes back to the list, keeping the drafts.
+closing. A reply has no time limit. The disks show in a listbox: a paper
+ground inside a border, as the form's text fields have, each row the
+disk's kernel name, its model (`model:` and the escaped value, `model
+reported empty` or `model not reported`; an escaped value holds no
+space, so it cannot read as either) and its capacity, and the selected
+disk's row in the selection colour with paper ink. Until one is chosen
+the detail under it says to click a disk or press Up or Down. Up and
+Down move the list's navigation index, a left click on a listed disk's
+row selects that disk as they would, PageUp and PageDown page a disk's
+identity, and Escape returns to welcome; the key list names the click
+beside Up and Down. From the list Escape keeps the connection for the
+next request; while waiting it abandons the request and its connection,
+so a service that never answers cannot hold the window, and td-authd
+serves the next installer once it reaps that service. Disks the window
+stopped waiting for are dropped. With a disk selected, Return continues
+to the settings step described below and Escape there goes back to the
+list, keeping the drafts.
 The live window paints in td-ui's first theme, `SAND`, and F12, td-ui's
 theme chord, moves it to the next for the wizard's run (td-ui/DESIGN.md,
 "Themes"): it runs without a home, so it reads and keeps no theme file.
@@ -148,15 +157,23 @@ a table beside the code that binds them (the form's beside its drafts).
 While the list is open it takes every key but F12, its reading keys
 scrolling it and F1, `q` or Escape closing it, as a left click does, and
 no page hears one or asks the service anything; a resize lays it out
-again. The window
-ignores the pointer, but a click closes the key list: a left press
-while it is open closes it and repaints, as its title bar's td-ui hint
-says, and reaches no page. Nothing else from the pointer does anything,
-so only F1 opens the list (no page has a Help button, td-ui's
-`keys::BUTTON`), it scrolls by its keys only, not the wheel, and F1,
-`q`, Escape or that click close it. A window test sends it motion, the
-wheel, a right press and releases, which leave it open and paint
-nothing, then a left press, which closes it with the page unchanged.
+again. A click closes the key list: a left press while it is open
+closes it and repaints, as its title bar's td-ui hint says, stops a key
+held through it from repeating, and reaches no page. With the list
+closed a left press is the page's click at the pointer's last position:
+on the destination step a listed disk's row selects that disk, hit
+against the first row the last frame showed rather than one a pending
+move would reveal, and a press anywhere else there or on another page
+does nothing. A click only selects, as Up and Down do; continuing is
+still the page's key. Motion only moves the position, and the release,
+the wheel and the other buttons do nothing, so only F1 opens the list
+(no page has a Help button, td-ui's `keys::BUTTON`), it scrolls by its
+keys only, not the wheel, and F1, `q`, Escape or that click close it. A
+window test sends it motion, the wheel, a right press and releases,
+which leave it open and paint nothing, then a left press, which closes
+it with the page unchanged; another clicks each disk's row, the
+selected row again, an empty row, the heading and the detail, and the
+same place off the destination step.
 The list's rows are spelled as td-ui's keymap spells chords
 (`Return`, `PageUp`, `S-Tab`), and `keys::check` holds every page's
 sections to that spelling; `--help` and this document name the keys

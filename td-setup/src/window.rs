@@ -70,6 +70,8 @@ struct Window {
     proof: Option<Proof>,
     /// The turn loop's time before the event in hand, for arming repeat.
     clock: u64,
+    /// The pointer's last position on the surface, in surface pixels.
+    pointer: (i64, i64),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -161,6 +163,7 @@ const WELCOME_KEYS: &[(&str, &str)] =
     &[("Return", "ask the installer service for the eligible disks")];
 const DISK_KEYS: &[(&str, &str)] = &[
     ("Up/Down", "select the disk above or below"),
+    ("click", "select the disk under the pointer"),
     (
         "PageUp/PageDown",
         "page through the selected disk's identity",
@@ -1177,6 +1180,7 @@ impl Window {
             front: Front::new(),
             proof: proof.then(Proof::default),
             clock: 0,
+            pointer: (0, 0),
         })
     }
 
@@ -1281,21 +1285,55 @@ impl Window {
         Surface::new(width, height, Scale::new(1).map_err(error)?).map_err(error)
     }
 
-    /// The pointer drives no page: a left press only closes an open key
-    /// list, as its title bar says, and repaints; the rest is ignored.
+    /// A left press closes an open key list, as its title bar says, and
+    /// reaches nothing else; otherwise it is the page's click at the
+    /// pointer's last position. Motion only moves that position, and the
+    /// rest of the pointer is ignored.
     fn pointer(&mut self, event: pointer::Event) {
-        if let pointer::Event::Button {
-            button: BUTTON_LEFT,
-            pressed: true,
-            ..
-        } = event
-        {
-            // A key held through the press stops repeating, so it
-            // reaches no page once the list is gone.
-            if self.key_list.press() != Step::Kept {
-                self.client.cancel_repeat();
-                self.dirty = true;
+        match event {
+            // Coordinates arrive in 24.8 fixed point.
+            pointer::Event::Enter { x, y, .. } | pointer::Event::Motion(x, y) => {
+                self.pointer = (i64::from(x).div_euclid(256), i64::from(y).div_euclid(256));
             }
+            pointer::Event::Button {
+                button: BUTTON_LEFT,
+                pressed: true,
+                ..
+            } => {
+                // A key held through the press stops repeating, so it
+                // reaches no page once the list is gone.
+                if self.key_list.press() != Step::Kept {
+                    self.client.cancel_repeat();
+                    self.dirty = true;
+                } else if self.click() {
+                    self.dirty = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// A left press on the page at the pointer: on the destination step
+    /// a listed disk's row selects that disk, as Up and Down would. The
+    /// hit uses the first row the last frame showed, not one a pending
+    /// move would reveal. True when the page changed.
+    fn click(&mut self) -> bool {
+        let Ok(surface) = self.surface() else {
+            return false;
+        };
+        let (x, y) = self.pointer;
+        let wizard = &mut self.front.wizard;
+        if wizard.page != Page::Destinations {
+            return false;
+        }
+        let hit = DestinationPage::new_with_first(surface, &wizard.disks, None, wizard.first, 0)
+            .and_then(|page| page.hit(x, y));
+        match hit {
+            Some(index) if wizard.selected != Some(index) => {
+                wizard.select(index);
+                true
+            }
+            _ => false,
         }
     }
 
@@ -3386,6 +3424,83 @@ mod tests {
         press(&mut window, 16, 31_000);
         assert!(!window.key_list.is_open());
         assert!(window.client.repeat(40_000).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_click_hits_the_rows_the_last_frame_showed_not_a_pending_move() {
+        let at = |x: i64, y: i64| pointer::Event::Motion((x * 256) as i32, (y * 256) as i32);
+        let (mut window, _peer) = window();
+        window.front.wizard = listed();
+        window.front.wizard.disks = (0..12)
+            .map(|index| disk(&format!("vd{}", (b'a' + index) as char)))
+            .collect();
+        // Shown from the first disk; a selection of the last, not yet
+        // drawn, would reveal the list's end.
+        window.front.wizard.selected = Some(11);
+        window.pointer(at(100, 4 * 24 + 5));
+        window.pointer(pointer::Event::Button {
+            serial: 1,
+            button: BUTTON_LEFT,
+            pressed: true,
+        });
+        assert_eq!(window.front.wizard.selected, Some(0));
+    }
+
+    #[test]
+    fn a_click_on_a_listed_disk_selects_it_and_nothing_else_does() {
+        let at = |x: i64, y: i64| pointer::Event::Motion((x * 256) as i32, (y * 256) as i32);
+        let press = pointer::Event::Button {
+            serial: 1,
+            button: BUTTON_LEFT,
+            pressed: true,
+        };
+        let (mut window, _peer) = window();
+        window.front.wizard = listed();
+        // The list's rows start four chrome rows down, 24 pixels each:
+        // vdb's row, then vda's.
+        window.pointer(at(100, 4 * 24 + 24 + 5));
+        window.dirty = false;
+        window.pointer(press);
+        assert_eq!(window.front.wizard.selected, Some(1));
+        assert!(window.dirty);
+        window.pointer(at(100, 4 * 24 + 5));
+        window.pointer(press);
+        assert_eq!(window.front.wizard.selected, Some(0));
+        // The selected row again, an empty row, the heading and the
+        // detail change nothing and paint nothing.
+        for (x, y) in [
+            (100, 4 * 24 + 5),
+            (100, 4 * 24 + 3 * 24 + 5),
+            (100, 30),
+            (100, 400),
+        ] {
+            window.dirty = false;
+            window.pointer(at(x, y));
+            window.pointer(press);
+            assert_eq!(window.front.wizard.selected, Some(0));
+            assert!(!window.dirty);
+        }
+        // A release and the right button select nothing.
+        window.pointer(at(100, 4 * 24 + 24 + 5));
+        for event in [
+            pointer::Event::Button {
+                serial: 1,
+                button: BUTTON_LEFT,
+                pressed: false,
+            },
+            pointer::Event::Button {
+                serial: 1,
+                button: 273,
+                pressed: true,
+            },
+        ] {
+            window.pointer(event);
+        }
+        assert_eq!(window.front.wizard.selected, Some(0));
+        // Off the destination step a click on the same place is nobody's.
+        window.front.wizard.page = Page::Welcome;
+        window.pointer(press);
+        assert_eq!(window.front.wizard.selected, Some(0));
     }
 
     #[test]

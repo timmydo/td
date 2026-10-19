@@ -2,8 +2,9 @@
 //! installer service. A `Destination` admits wire fields only: rendering it
 //! here neither establishes eligibility nor authorizes a write.
 
+use crate::listbox::{Choice, ListBox};
 use td_install::installation_plan::Destination;
-use td_ui::chrome::{Block, Item, List, Status, BLOCK_SCALARS, ROW};
+use td_ui::chrome::{Block, Status, BLOCK_SCALARS, ROW};
 use td_ui::raster::{
     text_run, Composition, Draw, GlyphStyle, Primitive, Rect, Surface, CHROME, INK,
 };
@@ -26,7 +27,7 @@ struct Row {
 /// is an index in that list, not a disk claim or consent token.
 pub struct DestinationPage {
     surface: Surface,
-    list: List,
+    list: ListBox,
     rows: Vec<Row>,
     first: usize,
     selected: Option<usize>,
@@ -111,7 +112,7 @@ impl DestinationPage {
         }
         let selected = if overflow { None } else { selected };
         let width = surface.width.checked_sub(2 * INSET * scale)?;
-        let list = List::new(
+        let list = ListBox::new(
             surface,
             Rect {
                 x: (INSET * scale) as i64,
@@ -172,7 +173,7 @@ impl DestinationPage {
         } else {
             push_lines(
                 &mut lines,
-                "Select a disk to inspect its identity before continuing.",
+                "Click a disk, or press Up or Down, to select it and inspect its identity.",
                 columns,
             );
         }
@@ -209,6 +210,13 @@ impl DestinationPage {
     /// the destination under its own held claim before any execution.
     pub fn selected(&self) -> Option<usize> {
         self.selected
+    }
+
+    /// The listed disk under the point, as an index in the service's
+    /// list: a shown row holding a disk, never an empty row below them.
+    pub fn hit(&self, x: i64, y: i64) -> Option<usize> {
+        let index = self.first.checked_add(self.list.hit(x, y)?)?;
+        (index < self.rows.len()).then_some(index)
     }
 
     /// The first visible disk row, for caller-owned scrolling state.
@@ -251,16 +259,18 @@ fn model(disk: &Destination) -> String {
         .unwrap_or_else(|| "not provided".into())
 }
 
+/// The row's model, worded for the list: a supplied value is escaped, so
+/// it holds no space and cannot read as either absent wording.
 fn row_model(disk: &Destination) -> String {
     disk.model()
         .map(|text| {
             if text.is_empty() {
-                "present, empty".into()
+                "model reported empty".into()
             } else {
-                format!("value: {}", short_label(text))
+                format!("model: {}", short_label(text))
             }
         })
-        .unwrap_or_else(|| "not provided".into())
+        .unwrap_or_else(|| "model not reported".into())
 }
 
 /// Append the complete escaped disk identity for both destination and review.
@@ -439,14 +449,12 @@ impl Composition for DestinationPage {
             sink,
         );
         self.list.emit(
-            self.rows.iter().skip(self.first).map(|row| Item {
+            self.rows.iter().skip(self.first).map(|row| Choice {
                 label: &row.label,
                 meta: &row.capacity,
-                enabled: true,
-                marked: false,
             }),
             self.first,
-            self.selected.unwrap_or(usize::MAX),
+            self.selected,
             self.rows.len(),
             damage,
             sink,
@@ -637,6 +645,48 @@ mod tests {
     }
 
     #[test]
+    fn a_hit_names_the_listed_disk_under_the_point_and_nothing_else() {
+        let disk = Destination::new(DestinationObservation {
+            name: "sda",
+            major: 8,
+            minor: 0,
+            sequence: 23,
+            capacity: 51_200_000,
+            sector: 512,
+            removable: false,
+            model: None,
+            serial: None,
+            wwid: None,
+        })
+        .unwrap();
+        let row = |index: usize| (LIST_TOP + index * ROW + 5) as i64;
+        // Twelve disks scrolled to the fifth: row k is disk 4 + k.
+        let disks = vec![disk.clone(); 12];
+        let page = DestinationPage::new_with_first(surface(), &disks, None, 4, 0).unwrap();
+        assert_eq!(page.first_visible(), 4);
+        assert_eq!(page.hit(100, row(0)), Some(4));
+        assert_eq!(page.hit(100, row(LIST_ROWS - 1)), Some(4 + LIST_ROWS - 1));
+        // Three disks leave empty rows below them; the heading and the
+        // detail are no row.
+        let few = DestinationPage::new(surface(), disks.get(..3).unwrap(), None, 0).unwrap();
+        assert_eq!(few.hit(100, row(2)), Some(2));
+        assert_eq!(few.hit(100, row(3)), None);
+        assert_eq!(few.hit(100, 30), None);
+        assert_eq!(few.hit(100, (DETAIL_TOP + 5) as i64), None);
+        // An overflowing list and the notices offer no disk at all.
+        let too_many = vec![disk; MAX_DISKS + 1];
+        let pages = [
+            DestinationPage::new(surface(), &too_many, None, 0).unwrap(),
+            DestinationPage::waiting(surface()).unwrap(),
+            DestinationPage::unavailable(surface()).unwrap(),
+            DestinationPage::refused(surface(), "no").unwrap(),
+        ];
+        for page in pages {
+            assert_eq!(page.hit(100, row(0)), None);
+        }
+    }
+
+    #[test]
     fn wide_pages_paint_every_escaped_identifier_character() {
         let label = "\u{1}".repeat(256);
         let disk = Destination::new(DestinationObservation {
@@ -690,13 +740,23 @@ mod tests {
         let empty = Destination::new(observation(Some(""))).unwrap();
         assert_eq!(model(&missing), "not provided");
         assert_eq!(model(&empty), "present, empty");
-        assert_eq!(row_model(&empty), "present, empty");
-        for marker in ["not provided", "present, empty"] {
+        assert_eq!(row_model(&missing), "model not reported");
+        assert_eq!(row_model(&empty), "model reported empty");
+        for marker in [
+            "not provided",
+            "present, empty",
+            "model not reported",
+            "model reported empty",
+        ] {
             let supplied = Destination::new(observation(Some(marker))).unwrap();
             let displayed = format!("value: {}", safe_label(marker));
             assert_eq!(model(&supplied), displayed);
-            assert_eq!(row_model(&supplied), displayed);
             assert_eq!(label_or_empty(marker), displayed);
+            let row = row_model(&supplied);
+            assert_eq!(row, format!("model: {}", safe_label(marker)));
+            assert!(!row.trim_start_matches("model: ").contains(' '));
+            assert_ne!(row, row_model(&missing));
+            assert_ne!(row, row_model(&empty));
         }
     }
 
@@ -742,14 +802,12 @@ mod tests {
         assert!(page.rows.first().unwrap().label.ends_with('…'));
         let mut painted = String::new();
         page.list.emit(
-            page.rows.iter().map(|row| Item {
+            page.rows.iter().map(|row| Choice {
                 label: &row.label,
                 meta: &row.capacity,
-                enabled: true,
-                marked: false,
             }),
             0,
-            0,
+            Some(0),
             1,
             surface().bounds(),
             &mut |draw| {
