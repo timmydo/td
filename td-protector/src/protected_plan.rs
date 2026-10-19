@@ -613,7 +613,7 @@ mod tests {
     use super::*;
     use crate::luks2::HeaderCopy;
     use crate::pin::PinPcrs;
-    use crate::protected::{Fido2, FidoRole, Operation};
+    use crate::protected::{Fido2, FidoRole};
     use std::collections::BTreeMap;
     use td_tpm::SealedObject;
 
@@ -1148,12 +1148,7 @@ mod tests {
             );
         }
         // A request token names no keyslot and is never an orphan.
-        disk.tokens.insert(
-            7,
-            Token::Request {
-                operation: Operation::PinChange,
-            },
-        );
+        disk.tokens.insert(7, crate::protected::fixtures::request());
         assert_eq!(
             steps(&disk, Opened::TpmPin { token: 1 }, None),
             [Step::RemoveToken { token: 6 }]

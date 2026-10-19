@@ -1012,12 +1012,8 @@ fn forged_headers_plan_nothing() {
         Refusal::MixedShape,
     ));
     let mut disk = Disk::u0(Shape::Tpm);
-    disk.tokens.insert(
-        8,
-        Tok::Protected(Token::Request {
-            operation: crate::protected::Operation::PinChange,
-        }),
-    );
+    disk.tokens
+        .insert(8, Tok::Protected(crate::protected::fixtures::request()));
     cases.push(("a request", disk, Refusal::Unexpected { token: 8 }));
     let mut disk = Disk::u0(Shape::Tpm);
     disk.tokens

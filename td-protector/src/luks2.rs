@@ -499,7 +499,7 @@ fn protected_bounds(
             1,
         ),
         ("td-upgrade", count(&|t| matches!(t, T::Upgrade { .. })), 1),
-        ("td-request", count(&|t| matches!(t, T::Request { .. })), 1),
+        ("td-request", count(&|t| matches!(t, T::Request(_))), 1),
     ];
     for (class, count, most) in bounds {
         if count > most {
@@ -758,6 +758,17 @@ impl TestArea {
             Some((_, cost)) => cost.clone(),
             None => Err(format!("LUKS2 header has no keyslot {slot}")),
         }
+    }
+
+    /// Whether every keyslot has a cost, or why the first that has none
+    /// does not: a volume-key dump needs it, since cryptsetup 2.8.8's
+    /// `luksDump --dump-volume-key` tries every keyslot (`CRYPT_ANY_SLOT`),
+    /// not the tested one. A header without keyslots holds, and its proof
+    /// has no keyslot to test.
+    pub fn all_costed(&self) -> Result<(), String> {
+        self.costs
+            .iter()
+            .try_for_each(|(_, cost)| cost.as_ref().map(|_| ()).map_err(Clone::clone))
     }
 }
 
@@ -1544,6 +1555,7 @@ mod tests {
         assert_eq!(area.cost(0), Ok(td));
         assert_eq!(area.cost(1), Ok(td));
         assert!(area.cost(2).is_err());
+        assert_eq!(area.all_costed(), Ok(()));
         // cryptsetup's largest keyslots area, and one byte past it.
         let largest = MAX_KEYSLOTS_SIZE.to_string();
         assert!(super::tests::area(&tested_json(TD_KDF, DIGEST, &largest)).is_ok());
@@ -1586,11 +1598,25 @@ mod tests {
         ] {
             let area = area(&tested_json(kdf, digest, "16744448")).unwrap();
             assert!(area.cost(0).is_err(), "{kdf} {digest}");
+            // Keyslot 1 alone is testable, but a dump tries keyslot 0 too.
+            if digest == DIGEST {
+                assert!(area.cost(1).is_ok(), "{kdf} {digest}");
+            }
+            assert_eq!(area.all_costed(), area.cost(0).map(|_| ()));
         }
         let two = format!(
             r#"{{"keyslots":{{"0":{{"type":"luks2","kdf":{TD_KDF}}}}},"tokens":{{}},"segments":{{}},"digests":{{"0":{DIGEST},"1":{DIGEST}}},"config":{{"keyslots_size":"4096"}}}}"#
         );
         assert!(area(&two).unwrap().cost(0).is_err());
+        // Keyslot 0 costed and keyslot 1 not: a dump still tries keyslot 1.
+        let later = tested_json(TD_KDF, DIGEST, "4096").replacen(
+            r#""iterations":1000}}}"#,
+            r#""iterations":100001}}}"#,
+            1,
+        );
+        let later = area(&later).unwrap();
+        assert!(later.cost(0).is_ok() && later.cost(1).is_err());
+        assert_eq!(later.all_costed(), later.cost(1).map(|_| ()));
         // At the ceilings exactly, the cost is admitted.
         let ceiling = tested_json(
             r#"{"type":"pbkdf2","hash":"sha256","iterations":100000}"#,

@@ -2,8 +2,8 @@
 
 Usage: python3 -I token_vectors.py
 No network or td implementation imports. Not a build/test/runtime
-dependency: src/protected.rs, src/lockout.rs and src/update_retry.rs pin
-the lines it prints
+dependency: src/protected.rs, src/lockout.rs, src/update_retry.rs and
+src/request.rs pin the lines it prints
 as literals. Every input below is a public fixture.
 
 Lockout token (td-install/ENCRYPTION.md, "PIN and dictionary-attack
@@ -19,6 +19,14 @@ is 32 bytes of the same HKDF with the info
 b"td/disk-protector/update-retry/v1", one zero byte and the UUID; "pair" is
 the SHA-256 of the staged kernel's SHA-256 followed by the staged
 initramfs's, and "tag" HMAC-SHA256 under the key over "pair".
+
+Request token (td-install/ENCRYPTION.md, "Request tag"): the key is 32
+bytes of the same HKDF with the info b"td/disk-protector/request/v1", one
+zero byte, the UUID and the request's nonce; "tag" is HMAC-SHA256 under it
+over one length byte and the operation's name, the nonce, the lockout
+token's nonce (32 zero bytes without one) and the SHA-256 over every
+tpm-pin token's public area in token-number order, each preceded by its
+length as two big-endian bytes.
 
 Token text: compact JSON, keys in td-protector/DESIGN.md's order, every
 byte field lowercase hexadecimal. Printed are the fixture tokens' exact
@@ -90,8 +98,21 @@ def upgrade(shape, source):
     return text([("type", "td-upgrade"), ("keyslots", []), ("shape", shape), ("from", source.hex())])
 
 
-def request(operation):
-    return text([("type", "td-request"), ("keyslots", []), ("operation", operation)])
+def request(operation, nonce, tag):
+    return text([
+        ("type", "td-request"), ("keyslots", []), ("operation", operation),
+        ("nonce", nonce.hex()), ("tag", tag.hex()),
+    ])
+
+
+REQUEST_DOMAIN = b"td/disk-protector/request/v1"
+
+
+def request_tag(volume_key, uuid, operation, nonce, lockout_nonce, publics):
+    key = hkdf(volume_key, b"", REQUEST_DOMAIN + b"\x00" + uuid + nonce, 32)
+    pins = hashlib.sha256(b"".join(len(p).to_bytes(2, "big") + p for p in publics)).digest()
+    name = operation.encode()
+    return hmac.new(key, bytes([len(name)]) + name + nonce + lockout_nonce + pins, hashlib.sha256).digest()
 
 
 volume_key = bytes(range(64))
@@ -114,6 +135,13 @@ retry_tag = hmac.new(retry_key, pair, hashlib.sha256).digest()
 print(f"update-retry pair {pair.hex()}")
 print(f"update-retry tag {retry_tag.hex()}")
 
+request_nonce = bytes(range(0x80, 0xA0))
+publics = [bytes.fromhex("0008abcd"), bytes.fromhex("0006a1b2c3")]
+request_tag_value = request_tag(volume_key, uuid, "pin-change", request_nonce, nonce, publics)
+bare_tag = request_tag(volume_key, uuid, "tpm-reenroll", request_nonce, b"\x00" * 32, [])
+print(f"request tag {request_tag_value.hex()}")
+print(f"request bare tag {bare_tag.hex()}")
+
 fixtures = [
     ("tpm-pin", tpm_pin(2, "4,9", primary, b"\x22" * 32, bytes.fromhex("0008abcd"), bytes.fromhex("0102fe"))),
     ("fido2", fido2(3, "fido2-primary", b"\x33" * 16, b"\x44" * 32, b"\x55" * 32, b"\x66" * 32)),
@@ -121,7 +149,7 @@ fixtures = [
     ("marker", marker(0)),
     ("lockout", lockout(primary, nonce, ciphertext, tag, False)),
     ("upgrade", upgrade("tpm", b"\x77" * 32)),
-    ("request", request("pin-change")),
+    ("request", request("pin-change", request_nonce, request_tag_value)),
     ("update-retry", update_retry(pair, retry_tag)),
 ]
 for name, token in fixtures:
@@ -133,7 +161,7 @@ largest = [
     ("marker", marker(31)),
     ("lockout", lockout(b"\xff" * 34, b"\xff" * 32, b"\xff" * 32, b"\xff" * 32, True)),
     ("upgrade", upgrade("fido2", b"\xff" * 32)),
-    ("request", request("pin-change")),
+    ("request", request("tpm-reenroll", b"\xff" * 32, b"\xff" * 32)),
     ("update-retry", update_retry(b"\xff" * 32, b"\xff" * 32)),
 ]
 for name, token in largest:

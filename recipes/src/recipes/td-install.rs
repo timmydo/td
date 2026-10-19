@@ -157,6 +157,7 @@ const PROTECTOR_PROTECTED_RELEASE_RS: &str =
     include_str!("../../../td-protector/src/protected_release.rs");
 const PROTECTOR_RECOVERY_RS: &str = include_str!("../../../td-protector/src/recovery.rs");
 const PROTECTOR_RELEASE_RS: &str = include_str!("../../../td-protector/src/release.rs");
+const PROTECTOR_REQUEST_RS: &str = include_str!("../../../td-protector/src/request.rs");
 const PROTECTOR_TOKEN_RS: &str = include_str!("../../../td-protector/src/token.rs");
 const PROTECTOR_TRANSITION_RS: &str = include_str!("../../../td-protector/src/transition.rs");
 const PROTECTOR_UPGRADE_RS: &str = include_str!("../../../td-protector/src/upgrade.rs");
@@ -328,6 +329,11 @@ pub fn recipe() -> Recipe {
         Step::WriteFile {
             path: "{src}/td-protector/src/release.rs".into(),
             content: PROTECTOR_RELEASE_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-protector/src/request.rs".into(),
+            content: PROTECTOR_REQUEST_RS.into(),
             exec: false,
         },
         Step::WriteFile {

@@ -28,7 +28,7 @@ use td_protector::luks2::UpgradeView;
 use td_protector::luks2::{self, Kind, BINARY_HEADER_LEN, JSON_AREA_LEN};
 use td_protector::pin::PinPcrs;
 use td_protector::protected::{
-    Fido2, FidoRole, Lockout, Operation, Shape, Token, TpmPin, UpdateRetry,
+    Fido2, FidoRole, Lockout, Operation, Request, Shape, Token, TpmPin, UpdateRetry,
 };
 use td_protector::protected_plan;
 use td_protector::token::{self as device, Role};
@@ -44,9 +44,9 @@ const RECOVERY: &[u8] = b"000000000000000000000000000000000000000000000000";
 /// The JSON text each header measured, cryptsetup 2.8.8 writing it. The
 /// fixtures are fixed and every PBKDF parameter forced, so the sizes are
 /// exact.
-const PROTECTED_JSON: usize = 10360;
-const UPGRADE_U2_JOURNAL_JSON: usize = 9696;
-const UPGRADE_U2_CHECKSUM_JSON: usize = 9732;
+const PROTECTED_JSON: usize = 10510;
+const UPGRADE_U2_JOURNAL_JSON: usize = 9846;
+const UPGRADE_U2_CHECKSUM_JSON: usize = 9882;
 
 fn scratch(name: &str) -> TempDir {
     TempDir::new(&format!("td-protector-header-fit-{name}")).unwrap()
@@ -138,10 +138,13 @@ fn upgrade() -> Token {
     }
 }
 
+/// The largest request: the longest operation name, its nonce and tag.
 fn request() -> Token {
-    Token::Request {
-        operation: Operation::PinChange,
-    }
+    Token::Request(Request {
+        operation: Operation::TpmReenroll,
+        nonce: [0xff; 32],
+        tag: [0xff; 32],
+    })
 }
 
 fn hex(len: usize) -> String {

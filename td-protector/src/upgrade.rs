@@ -505,7 +505,7 @@ pub fn check(view: &UpgradeView) -> Result<(State, Shape), Refusal> {
             Token::TpmPin(_) | Token::Lockout(_) if shape == Shape::Fido2 => {
                 return Err(Refusal::MixedShape)
             }
-            Token::UpdateRetry(_) | Token::Request { .. } => {
+            Token::UpdateRetry(_) | Token::Request(_) => {
                 return Err(Refusal::Unexpected { token: *number })
             }
             _ => {}

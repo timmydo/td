@@ -835,26 +835,24 @@ the largest protected header, keyslot 0 and six more, four fido2
 tokens with 255-byte credentials, two tpm-pin tokens, the marker, the
 lockout, `td-upgrade` and `td-request` tokens at their bounds, and the
 secure-boot, config (two tags) and update-retry tokens at theirs, holds
-10360 bytes of JSON of the 12288; the largest U2, every token naming no
+10510 bytes of JSON of the 12288; the largest U2, every token naming no
 keyslot and `reencrypt --init-only` adding its keyslots, segments and
-digest, 9696 bytes with journal resilience and 9732 with checksum.
-8g's request fields and its longest operation name add 150 bytes to
-each, 10510, 9846 and 9882 by arithmetic, which 8g's format commit
-re-measures. At the device-bound sealed-area bounds each tpm-pin token
-would be 768 bytes longer and the protected header would hold 11896,
-12046 with 8g's request, under 1 KiB spare. The U2 headers are measured
-at `reencrypt --init-only`. A reencryption interrupted part-way splits
-its first segment in two and a multi-terabyte volume writes longer
-offsets and sizes: probed by hand on a 20 GiB file with no tokens, an
-offline reencryption interrupted after its first GiB grew the JSON from
-1976 bytes to 2114, and 14-digit byte counts add a few bytes per field,
-which the 2.5 KiB margin absorbs. The pinned sizes hold for the test's
-fixture, a 20 MiB file, and 8f's planner bounds each plan's size from
-the header's own before writing ("Upgrade plans"). The protected
-header, 8e's update-retry token included and before 8i's tokens are
-added, and a U2 header holding
-only what U2 holds are read back through `luks2::read` and agree with
-cryptsetup's own metadata dump.
+digest, 9846 bytes with journal resilience and 9882 with checksum. The
+largest request, a `tpm-reenroll` one, is in each. At the device-bound
+sealed-area bounds each tpm-pin token would be 768 bytes longer and the
+protected header would hold 12046, under 1 KiB spare. The U2 headers
+are measured at `reencrypt --init-only`. A reencryption interrupted
+part-way splits its first segment in two and a multi-terabyte volume
+writes longer offsets and sizes: probed by hand on a 20 GiB file with no
+tokens, an offline reencryption interrupted after its first GiB grew the
+JSON from 1976 bytes to 2114, and 14-digit byte counts add a few bytes
+per field, which the 2.3 KiB margin absorbs. The pinned sizes hold for
+the test's fixture, a 20 MiB file, and 8f's planner bounds each plan's
+size from the header's own before writing ("Upgrade plans"). The
+protected header, 8e's update-retry token included and before 8i's
+tokens are added, and a U2 header holding only what U2 holds are read
+back through `luks2::read` and agree with cryptsetup's own metadata
+dump.
 
 **Plans on protected headers.** The recovery keyslot is the one the
 `recovery-key` marker names; an orphan is any keyslot no token of any
@@ -1289,8 +1287,10 @@ header)` computes ENCRYPTION.md's request tag:
    token's `public` bytes in token-number order, each preceded by its
    length as two big-endian bytes.
 
-`request::verifies` recomputes it over the header read at release and
-compares in constant time. An empty volume key verifies nothing, and
+`request::seal` draws the nonce from `/dev/random` and returns the
+token's fields. `request::verifies` recomputes the tag over the header
+read at release and compares in constant time; a header with two lockout
+tokens verifies nothing. An empty volume key verifies nothing, and
 the key is zeroed on drop. `tests/token_vectors.py` computes the tag
 independently.
 
@@ -1549,7 +1549,7 @@ A normal cargo pass with it ignored is not TPM integration evidence.
 Protected-token tests pin each 8a token's exact encoding for fixed
 values and the largest encoding of each kind (tpm-pin 1038 bytes, fido2
 824, marker 63, lockout 376, `td-upgrade` 125, `td-request` 210, a
-`tpm-reenroll` one, from 8g's format commit) as
+`tpm-reenroll` one) as
 literals that `tests/token_vectors.py`, a stdlib-only host tool and no
 build input, computes independently (Python's `json`, `hmac` and
 `hashlib`), round trip them, and refuse every key, type, role, keyslot,

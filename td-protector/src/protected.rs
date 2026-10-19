@@ -71,12 +71,16 @@ impl Shape {
 pub enum Operation {
     PinChange,
     TpmClear,
+    TpmReenroll,
 }
 impl Operation {
+    pub const ALL: &'static [Self] = &[Self::PinChange, Self::TpmClear, Self::TpmReenroll];
+
     pub fn name(self) -> &'static str {
         match self {
             Self::PinChange => "pin-change",
             Self::TpmClear => "tpm-clear",
+            Self::TpmReenroll => "tpm-reenroll",
         }
     }
 }
@@ -129,6 +133,16 @@ pub struct UpdateRetry {
     pub tag: [u8; FIELD_LEN],
 }
 
+/// A running-system request (ENCRYPTION.md "Protector management"): the
+/// operation, a fresh nonce and its tag under a key the volume key
+/// derives (`request`). It names no keyslot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Request {
+    pub operation: Operation,
+    pub nonce: [u8; FIELD_LEN],
+    pub tag: [u8; FIELD_LEN],
+}
+
 /// One protected-tier token of td's types.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Token {
@@ -146,9 +160,7 @@ pub enum Token {
         shape: Shape,
         from: [u8; FIELD_LEN],
     },
-    Request {
-        operation: Operation,
-    },
+    Request(Request),
 }
 
 /// Whether a `td-protector` token's `role` is a protected one, so that the
@@ -186,10 +198,9 @@ impl Token {
             Self::TpmPin(TpmPin { keyslot, .. })
             | Self::Fido2(Fido2 { keyslot, .. })
             | Self::RecoveryKey { keyslot } => *keyslot,
-            Self::Lockout(_)
-            | Self::UpdateRetry(_)
-            | Self::Upgrade { .. }
-            | Self::Request { .. } => None,
+            Self::Lockout(_) | Self::UpdateRetry(_) | Self::Upgrade { .. } | Self::Request(_) => {
+                None
+            }
         }
     }
 
@@ -202,7 +213,7 @@ impl Token {
             Self::Lockout(_) => (TOKEN_TYPE, Some("lockout")),
             Self::UpdateRetry(_) => (TOKEN_TYPE, Some("update-retry")),
             Self::Upgrade { .. } => (UPGRADE_TYPE, None),
-            Self::Request { .. } => (REQUEST_TYPE, None),
+            Self::Request(_) => (REQUEST_TYPE, None),
         }
     }
 
@@ -282,7 +293,11 @@ impl Token {
             Self::Upgrade { shape, from } => {
                 vec![("shape", text(shape.name())), ("from", bytes(from))]
             }
-            Self::Request { operation } => vec![("operation", text(operation.name()))],
+            Self::Request(request) => vec![
+                ("operation", text(request.operation.name())),
+                ("nonce", bytes(&request.nonce)),
+                ("tag", bytes(&request.tag)),
+            ],
         };
         pairs.extend(
             fields
@@ -423,15 +438,18 @@ impl Token {
                 }
             }
             REQUEST_TYPE => {
-                fields.keys(&["type", "keyslots", "operation"])?;
+                fields.keys(&["type", "keyslots", "operation", "nonce", "tag"])?;
                 fields.no_keyslot()?;
-                Self::Request {
-                    operation: match fields.text("operation")? {
-                        "pin-change" => Operation::PinChange,
-                        "tpm-clear" => Operation::TpmClear,
-                        _ => return Err("td token operation is not pin-change or tpm-clear".into()),
-                    },
-                }
+                let operation = fields.text("operation")?;
+                Self::Request(Request {
+                    operation: Operation::ALL
+                        .iter()
+                        .copied()
+                        .find(|known| known.name() == operation)
+                        .ok_or("td token operation is not one td knows")?,
+                    nonce: fixed("nonce", fields.text("nonce")?)?,
+                    tag: fixed("tag", fields.text("tag")?)?,
+                })
             }
             _ => return Err(format!("token type {kind:?} is not one of td's")),
         };
@@ -557,10 +575,14 @@ pub(crate) mod fixtures {
         }
     }
 
+    /// `tests/token_vectors.py`'s request, tagged over a header holding
+    /// its lockout nonce and two tpm-pin tokens (`request`'s tests).
     pub(crate) fn request() -> Token {
-        Token::Request {
+        Token::Request(Request {
             operation: Operation::PinChange,
-        }
+            nonce: core::array::from_fn(|at| 0x80 + at as u8),
+            tag: unhex_fixed("ce5df8321a7b1efeaccb9504b238a6a56d916d22015da4b88d90c265ed05069d"),
+        })
     }
 
     /// `tests/token_vectors.py`'s update-retry token.
@@ -597,7 +619,7 @@ mod tests {
     const PENDING: &str = r#"{"type":"td-protector","keyslots":[],"role":"fido2-recovery","account":"1000","credential":"33333333333333333333333333333333","salt":"4444444444444444444444444444444444444444444444444444444444444444","x":"5555555555555555555555555555555555555555555555555555555555555555","y":"6666666666666666666666666666666666666666666666666666666666666666"}"#;
     const MARKER: &str = r#"{"type":"td-protector","keyslots":["0"],"role":"recovery-key"}"#;
     const UPGRADE: &str = r#"{"type":"td-upgrade","keyslots":[],"shape":"tpm","from":"7777777777777777777777777777777777777777777777777777777777777777"}"#;
-    const REQUEST: &str = r#"{"type":"td-request","keyslots":[],"operation":"pin-change"}"#;
+    const REQUEST: &str = r#"{"type":"td-request","keyslots":[],"operation":"pin-change","nonce":"808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f","tag":"ce5df8321a7b1efeaccb9504b238a6a56d916d22015da4b88d90c265ed05069d"}"#;
     const UPDATE_RETRY: &str = r#"{"type":"td-protector","keyslots":[],"role":"update-retry","pair":"05483fb1d64a81bbee3bb71ea3becf9ee94b11fed3753a3bc74c0022f1990ee9","tag":"12d6440af0b8aecb63b8d1889e42ff561e478ab367cd9fac0f9089342a4d3dee"}"#;
 
     fn cases() -> Vec<(Token, &'static str)> {
@@ -636,13 +658,40 @@ mod tests {
         let text = lockout().encode().unwrap();
         assert_eq!(Token::decode(text.as_bytes()).unwrap(), lockout());
         // Key order and whitespace are not part of the format.
-        let reordered = r#"{ "operation":"tpm-clear", "keyslots":[ ], "type":"td-request" }"#;
+        let reordered = format!(
+            r#"{{ "tag":"{}", "operation":"tpm-clear", "keyslots":[ ], "nonce":"{}", "type":"td-request" }}"#,
+            "cd".repeat(32),
+            "ab".repeat(32)
+        );
         assert_eq!(
             Token::decode(reordered.as_bytes()).unwrap(),
-            Token::Request {
-                operation: Operation::TpmClear
-            }
+            Token::Request(Request {
+                operation: Operation::TpmClear,
+                nonce: [0xab; 32],
+                tag: [0xcd; 32],
+            })
         );
+        // `Operation::ALL` holds every operation once, and each name
+        // round trips.
+        for (at, operation) in Operation::ALL.iter().enumerate() {
+            let expected = match operation {
+                Operation::PinChange => 0,
+                Operation::TpmClear => 1,
+                Operation::TpmReenroll => 2,
+            };
+            assert_eq!(at, expected, "{operation:?}");
+        }
+        assert_eq!(Operation::ALL.len(), 3);
+        for operation in Operation::ALL {
+            let token = Token::Request(Request {
+                operation: *operation,
+                nonce: [1; 32],
+                tag: [2; 32],
+            });
+            let text = token.encode().unwrap();
+            assert!(text.contains(&format!(r#""operation":"{}""#, operation.name())));
+            assert_eq!(Token::decode(text.as_bytes()).unwrap(), token);
+        }
         let fido = Token::decode(FIDO2.replace(r#"["3"]"#, "[]").as_bytes()).unwrap();
         assert_eq!(fido.keyslot(), None);
         assert_eq!(fido2(Some(3), FidoRole::Primary).keyslot(), Some(3));
@@ -712,7 +761,14 @@ mod tests {
                 },
                 125,
             ),
-            (request(), 60),
+            (
+                Token::Request(Request {
+                    operation: Operation::TpmReenroll,
+                    nonce: [0xff; 32],
+                    tag: [0xff; 32],
+                }),
+                210,
+            ),
             (
                 Token::UpdateRetry(UpdateRetry {
                     pair: [0xff; 32],
@@ -759,6 +815,22 @@ mod tests {
                 "unknown key \"sal\"",
             ),
             (with(FIDO2, r#","y":"#, r#","z":"#), "unknown key \"z\""),
+            (
+                with(
+                    REQUEST,
+                    r#","nonce":"808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f""#,
+                    "",
+                ),
+                "has no nonce",
+            ),
+            (
+                with(
+                    REQUEST,
+                    r#","tag":"ce5df8321a7b1efeaccb9504b238a6a56d916d22015da4b88d90c265ed05069d""#,
+                    "",
+                ),
+                "has no tag",
+            ),
             (
                 with(REQUEST, r#","operation":"pin-change""#, ""),
                 "has no operation",
@@ -833,6 +905,14 @@ mod tests {
             (with(UPGRADE, r#""tpm""#, r#""TPM""#), "shape is not"),
             (with(REQUEST, "pin-change", "pin-reset"), "operation is not"),
             (
+                with(REQUEST, "pin-change", "PIN-CHANGE"),
+                "operation is not",
+            ),
+            (
+                with(REQUEST, r#","tag":"#, r#","tags":"#),
+                "unknown key \"tags\"",
+            ),
+            (
                 with(
                     &lockout().encode().unwrap(),
                     r#""proven":"1""#,
@@ -884,6 +964,8 @@ mod tests {
             (lockout.as_str(), "ciphertext", 32),
             (lockout.as_str(), "tag", 32),
             (UPGRADE, "from", 32),
+            (REQUEST, "nonce", 32),
+            (REQUEST, "tag", 32),
         ];
         for (text, field, len) in fixed {
             assert!(Token::decode(wide(text, field, len).as_bytes()).is_ok());

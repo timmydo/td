@@ -2155,12 +2155,12 @@ update-retry tokens, a request, their keyslots, and in U2 cryptsetup's
 reencryption keyslot, segments and second digest. 8a's codec tests and
 8f's planner tests build each worst case with the pinned cryptsetup on a
 header file, the U2 one by `reencrypt --init-only`, and require at least
-1 KiB to spare. 8a measured 10360 bytes for the largest protected
-header and 9732 for the largest U2 (td-protector/DESIGN.md, "Protected
-roles"), with a tpm-pin token's sealed areas bounded at 128 and 256
-bytes rather than the device-bound token's 256 and 512, at which the
-protected header would leave under 1 KiB. A smaller credential bound or
-fewer tokens would refuse real keys or shapes; the tpm-pin object is
+1 KiB to spare. With 8g's request, the largest protected header
+measures 10510 bytes and the largest U2 9882 (td-protector/DESIGN.md,
+"Protected roles"), with a tpm-pin token's sealed areas bounded at 128
+and 256 bytes rather than the device-bound token's 256 and 512, at which
+the protected header would leave under 1 KiB. A smaller credential bound
+or fewer tokens would refuse real keys or shapes; the tpm-pin object is
 td's own. Its public area is exactly 78 bytes, which td-protector's
 chain check enforces (a SHA-256 keyed-hash object with a 32-byte
 authPolicy and unique). Its private area follows the TCG reference
@@ -2508,8 +2508,8 @@ the safe outcome.
   system can therefore request a TPM clear or re-enrollment, which the
   owner then confirms with one answer at a later boot; it already holds
   the volume key.
-- A declined request stays valid in old header copies until a like
-  operation changes the state its tag covers. If such a copy is
+- A declined or replaced request stays valid in old header copies until
+  a like operation changes the state its tag covers. If such a copy is
   restored, the request asks again, and declining it again costs
   nothing.
 - Re-enrollment is still trust on first use: an interposer present at

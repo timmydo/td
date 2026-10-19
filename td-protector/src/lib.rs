@@ -33,6 +33,7 @@ pub mod protected_plan;
 pub mod protected_release;
 pub mod recovery;
 pub mod release;
+pub mod request;
 pub mod token;
 pub mod transition;
 pub mod update_retry;
