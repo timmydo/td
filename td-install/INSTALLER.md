@@ -164,9 +164,10 @@ closed a left press is the page's click at the pointer's last position:
 on the destination step a listed disk's row selects that disk, hit
 against the first row the last frame showed rather than one a pending
 move would reveal, and a press anywhere else there or on another page
-does nothing. A click only selects, as Up and Down do; continuing is
-still the page's key. Motion only moves the position, and the release,
-the wheel and the other buttons do nothing, so only F1 opens the list
+does nothing. A click on a disk only selects, as Up and Down do;
+continuing is Return or the Next button below. Motion only moves the
+position, a left release acts only on a step button as below, and the
+wheel and the other buttons do nothing, so only F1 opens the list
 (no page has a Help button, td-ui's `keys::BUTTON`), it scrolls by its
 keys only, not the wheel, and F1, `q`, Escape or that click close it. A
 window test sends it motion, the wheel, a right press and releases,
@@ -187,6 +188,37 @@ compositor case presses F1 on the seat and finds welcome around the
 panel and its title bar in the selection's
 colour, Return reaching no page while it is open, and Escape painting
 welcome whole again.
+
+Every step page shows step buttons at the right of its footer row,
+laid out by td-setup's `nav` over td-ui's `Button`: Back where Escape
+steps back and Next where Return steps on, each named for what it does
+there: Next on welcome, the disk list and the shown recovery key, Review
+on settings, Install on the review, Confirm on the type-back, and
+Withdraw alone on the consent view; the waiting, unavailable and refused
+notices have Back alone. The two are fixed slots ten cells wide, Next
+always rightmost and Back always left of it, a lone Back or Withdraw
+included, so a button never sits where the next page puts the other
+kind. Next is painted as the default step, in the selection's colour,
+and disabled while Return would do nothing: with no disk selected, while
+a proposal or an execute is outstanding, or while a typed key is with
+the service. A button acts on a left release over the one pressed, on
+the page it was pressed on, so a press dragged off it, a key between
+press and release, or the page changing under it does nothing, and
+leaving the window forgets the press. A button is hit only as the last
+presented frame showed it, unchanged since, so a frame too small for its
+page offers none, and only once its page has been shown for half a
+second, so a double click's second press does not act on the page the
+first opened. On settings Review asks for the review from whichever
+field has the focus, as Return on the time zone does. The completion
+page's Restart and Power off act the same way while an ending may be
+asked for. Progress, a recovery key still being asked for and an
+outcome have no step buttons. A button is a view of its key: it asks
+the service nothing the key would not, and consent is still given only
+at the compositor's secure prompt. `--preview`, and the native
+compositor case that compares welcome and the unavailable notice pixel
+for pixel, paint the same buttons, and `--render-check` refuses a page
+whose footer text would run under the slots.
+
 Its progress and completion views are pure views of the service's
 reports, described below. A live boot starts the window in the graphical
 session ("Live startup"); the end-to-end installation evidence is in place

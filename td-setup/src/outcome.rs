@@ -355,6 +355,23 @@ impl CompletionPage {
         self.choice = choice;
         self
     }
+
+    /// The ending whose button holds the point, laid out as `emit` paints
+    /// it; whether one may be chosen is the caller's.
+    pub fn hit(&self, x: i64, y: i64) -> Option<Ending> {
+        let labels = labels();
+        let index = self.buttons(&labels).hit(x, y)?;
+        Ending::ALL.get(index).copied()
+    }
+
+    fn buttons<'a>(&self, labels: &'a [&'a str]) -> Buttons<'a> {
+        let scale = self.surface.scale.value();
+        Buttons::new(self.surface, (11 * ROW * scale) as i64, labels)
+    }
+}
+
+fn labels() -> Vec<&'static str> {
+    Ending::ALL.iter().map(|ending| label(*ending)).collect()
 }
 
 impl Composition for CompletionPage {
@@ -373,20 +390,18 @@ impl Composition for CompletionPage {
             sink,
         );
         for (index, text) in [
-            "Choose Restart or Power off and press Return. Keep the installation",
-            "media in until the computer has restarted and shows its startup",
-            "screen, or has powered off, then remove it, so that it starts the",
-            "installed system.",
+            "Click Restart or Power off, or choose one and press Return. Keep the",
+            "installation media in until the computer has restarted and shows its",
+            "startup screen, or has powered off, then remove it, so that it starts",
+            "the installed system.",
         ]
         .iter()
         .enumerate()
         {
             row(self.surface, 6 + index, text, damage, sink);
         }
-        let scale = self.surface.scale.value();
-        let labels: Vec<&str> = Ending::ALL.iter().map(|ending| label(*ending)).collect();
-        let buttons = Buttons::new(self.surface, (11 * ROW * scale) as i64, &labels);
-        buttons.emit(
+        let labels = labels();
+        self.buttons(&labels).emit(
             Ending::ALL
                 .iter()
                 .map(|ending| (self.choice == Some(*ending), self.choice.is_some())),
@@ -557,9 +572,21 @@ mod tests {
         let complete = CompletionPage::new(screen).unwrap();
         let painted = glyphs(&complete, screen);
         assert!(painted.contains("Installation complete"));
-        assert!(painted.contains("Choose Restart or Power off and press Return"));
-        assert!(painted.contains("Keep the installation"));
+        assert!(painted.contains("Click Restart or Power off, or choose one and press Return"));
+        assert!(painted.contains("installation media in"));
         assert!(painted.contains("has powered off"));
+        // Each button's own pixels name its ending; the gap names none.
+        let restart = complete.buttons(&labels()).button(0).unwrap().rect();
+        let power = complete.buttons(&labels()).button(1).unwrap().rect();
+        assert_eq!(
+            complete.hit(restart.x + 2, restart.y + 4),
+            Some(Ending::Restart)
+        );
+        assert_eq!(
+            complete.hit(power.x + 2, power.y + 4),
+            Some(Ending::PowerOff)
+        );
+        assert_eq!(complete.hit(power.x - 2, power.y + 4), None);
         for ending in Ending::ALL {
             assert!(painted.contains(label(*ending)), "{ending:?}");
         }

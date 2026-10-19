@@ -27,6 +27,7 @@ use td_ui::wire::Message;
 
 use crate::destination::DestinationPage;
 use crate::evidence::{self, field, Proof};
+use crate::nav::{Go, Nav, Steps};
 use crate::outcome::{CompletionPage, Progress, ProgressPage};
 use crate::recovery::{self, Entry, Key, RecoveryPage};
 use crate::review::ReviewPage;
@@ -40,6 +41,10 @@ type Result<T> = std::result::Result<T, String>;
 fn error(value: impl std::fmt::Display) -> String {
     value.to_string()
 }
+
+/// How long a page must have been shown, in milliseconds, before its
+/// buttons take a press: longer than a double click's second press.
+const SETTLE: u64 = 500;
 
 /// The default toplevel extent, used until the compositor configures one.
 const DEFAULT_SIZE: (usize, usize) = (800, 600);
@@ -72,6 +77,21 @@ struct Window {
     clock: u64,
     /// The pointer's last position on the surface, in surface pixels.
     pointer: (i64, i64),
+    /// The page and button a left press went down on, which its release
+    /// over the same button on the same page activates.
+    pressed: Option<(Page, Target)>,
+    /// What the last presented frame showed: its page, step buttons and
+    /// the turn-loop time that page was first shown. Buttons are hit only
+    /// as shown, and not before `SETTLE` has passed.
+    shown: Option<(Page, Steps, u64)>,
+}
+
+/// A button the pointer can press: a step button, or a completion
+/// page's ending.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Target {
+    Step(Go),
+    End(Ending),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -519,6 +539,64 @@ impl Wizard {
         );
         ordered.extend(sections.into_iter().flatten());
         ordered
+    }
+
+    /// The shown page's step buttons: Back where Escape steps back, Next
+    /// where Return steps on, each named for what it does there, and Next
+    /// pressable only when Return would do something now.
+    fn steps(&self) -> Steps {
+        const BACK: Option<&str> = Some("Back");
+        match &self.page {
+            Page::Welcome => crate::nav::WELCOME,
+            Page::Waiting | Page::Unavailable | Page::Refused(_) => Steps {
+                back: BACK,
+                next: None,
+            },
+            Page::Destinations => Steps {
+                back: BACK,
+                next: Some(("Next", self.selected.is_some())),
+            },
+            Page::Settings => Steps {
+                back: BACK,
+                next: Some(("Review", !self.reviewing())),
+            },
+            Page::Review => Steps {
+                back: BACK,
+                next: Some((
+                    "Install",
+                    self.execute.is_none() && self.executing.is_none(),
+                )),
+            },
+            Page::Progress(Progress::Consent) => Steps {
+                back: Some("Withdraw"),
+                next: None,
+            },
+            Page::Recovery(KeyStep::Shown) => Steps {
+                back: None,
+                next: Some(("Next", true)),
+            },
+            Page::Recovery(KeyStep::TypeBack) => Steps {
+                back: BACK,
+                next: Some(("Confirm", !self.typed_out())),
+            },
+            Page::Progress(_) | Page::Recovery(KeyStep::Asking) | Page::Complete => {
+                Steps::default()
+            }
+        }
+    }
+
+    /// A step button: Back is the page's Escape and Next its Return, but
+    /// on settings Next asks for the review from whichever field has the
+    /// focus, as Return on the time zone does.
+    fn go(&mut self, go: Go) -> Action {
+        match (go, &self.page) {
+            (Go::Back, _) => self.key("Escape"),
+            (Go::Next, Page::Settings) => {
+                self.propose();
+                Action::None
+            }
+            (Go::Next, _) => self.key("Return"),
+        }
     }
 
     fn select(&mut self, index: usize) {
@@ -1037,7 +1115,18 @@ impl Front {
     }
 
     fn key(&mut self, chord: &str, intake: &Path) {
-        match self.wizard.key(chord) {
+        let action = self.wizard.key(chord);
+        self.act(action, intake);
+    }
+
+    /// A step button, as its key would be.
+    fn go(&mut self, go: Go, intake: &Path) {
+        let action = self.wizard.go(go);
+        self.act(action, intake);
+    }
+
+    fn act(&mut self, action: Action, intake: &Path) {
+        match action {
             // A hung service cannot hold the window: the person leaves it.
             Action::Abandon => self.service = None,
             Action::None => self.request(Some(intake)),
@@ -1181,6 +1270,8 @@ impl Window {
             proof: proof.then(Proof::default),
             clock: 0,
             pointer: (0, 0),
+            pressed: None,
+            shown: None,
         })
     }
 
@@ -1300,6 +1391,7 @@ impl Window {
                 pressed: true,
                 ..
             } => {
+                self.pressed = None;
                 // A key held through the press stops repeating, so it
                 // reaches no page once the list is gone.
                 if self.key_list.press() != Step::Kept {
@@ -1307,10 +1399,78 @@ impl Window {
                     self.dirty = true;
                 } else if self.click() {
                     self.dirty = true;
+                } else {
+                    let page = self.front.wizard.page.clone();
+                    self.pressed = self.target().map(|target| (page, target));
                 }
             }
+            // A button acts on the release over the one pressed, so a
+            // press dragged off it does nothing.
+            pointer::Event::Button {
+                button: BUTTON_LEFT,
+                pressed: false,
+                ..
+            } => {
+                if let Some((page, target)) = self.pressed.take() {
+                    if page == self.front.wizard.page && self.target() == Some(target) {
+                        self.activate(target);
+                    }
+                }
+            }
+            pointer::Event::Leave(_) => self.pressed = None,
             _ => {}
         }
+    }
+
+    /// The enabled button under the pointer on the shown page.
+    fn target(&self) -> Option<Target> {
+        let surface = self.surface().ok()?;
+        let (x, y) = self.pointer;
+        let wizard = &self.front.wizard;
+        // Only what the frame on screen showed, unchanged since, and only
+        // once its page has been shown long enough to be seen: a double
+        // click's second press lands on the page the first one opened.
+        let (page, steps, since) = self.shown.as_ref()?;
+        if *page != wizard.page || *steps != wizard.steps() || self.clock < since + SETTLE {
+            return None;
+        }
+        if wizard.page == Page::Complete {
+            return wizard
+                .endable()
+                .then(|| CompletionPage::new(surface)?.hit(x, y))
+                .flatten()
+                .map(Target::End);
+        }
+        Nav::new(surface, wizard.steps())?
+            .hit(x, y)
+            .map(Target::Step)
+    }
+
+    /// Notes what a presented frame showed: the page and its buttons, or
+    /// nothing when the page did not fit. A page shown again keeps the
+    /// time it was first shown.
+    fn presented(&mut self, page: bool) {
+        let wizard = &self.front.wizard;
+        let since = match &self.shown {
+            Some((shown, _, since)) if *shown == wizard.page => *since,
+            _ => self.clock,
+        };
+        self.shown = page.then(|| (wizard.page.clone(), wizard.steps(), since));
+    }
+
+    /// A button's action: a step button's as its key's, an ending chosen
+    /// and asked for as Return on it would.
+    fn activate(&mut self, target: Target) {
+        // A held key's repeat would act on the page the button leads to.
+        self.client.cancel_repeat();
+        match target {
+            Target::Step(go) => self.front.go(go, Path::new(SOCKET)),
+            Target::End(ending) => {
+                self.front.wizard.choice = ending;
+                self.front.key("Return", Path::new(SOCKET));
+            }
+        }
+        self.dirty = true;
     }
 
     /// A left press on the page at the pointer: on the destination step
@@ -1354,6 +1514,8 @@ impl Window {
     /// key may repeat the chord: the list's while it scrolls, a page's
     /// for the keys `repeats` names.
     fn chord(&mut self, chord: String) -> Result<bool> {
+        // A key between a press and its release leaves nothing to act on.
+        self.pressed = None;
         let mut repeat = false;
         if chord == td_ui::theme::CHORD {
             if let Err(why) = self.theme.advance() {
@@ -1488,6 +1650,7 @@ impl Window {
             }
             _ => None,
         };
+        let nav = Nav::new(surface, wizard.steps());
         let Window {
             client,
             font,
@@ -1538,12 +1701,17 @@ impl Window {
                     Ok(())
                 }
             };
+            // The step buttons over the page's footer row.
+            if let (true, Some(nav)) = (page, &nav) {
+                nav.emit(surface.bounds(), &mut |draw| raster.draw(draw));
+            }
             // The key list, when open, is the last thing painted.
             key_list.emit(surface, surface.bounds(), &mut |draw| raster.draw(draw));
             result
         })?;
         if presented {
             self.dirty = false;
+            self.presented(page);
             if let Some(proof) = self.proof.as_mut() {
                 if page {
                     proof.drawn(self.front.wizard.state());
@@ -1585,6 +1753,9 @@ impl App for Window {
     fn end_turn(&mut self, now: u64, idle: bool) -> Result<()> {
         self.front.now = now;
         self.receive();
+        // A page an answer brings in is shown from now, not from the last
+        // input event, so its buttons settle from when it appears.
+        self.clock = now;
         if self.front.wizard.executing.is_some() {
             self.front.poll(now);
         }
@@ -3501,6 +3672,290 @@ mod tests {
         window.front.wizard.page = Page::Welcome;
         window.pointer(press);
         assert_eq!(window.front.wizard.selected, Some(0));
+    }
+
+    #[test]
+    fn each_page_offers_the_step_buttons_its_keys_take() {
+        let both = |back, next, enabled| Steps {
+            back: Some(back),
+            next: Some((next, enabled)),
+        };
+        let mut wizard = Wizard::new();
+        assert_eq!(
+            wizard.steps(),
+            Steps {
+                back: None,
+                next: Some(("Next", true)),
+            }
+        );
+        let mut wizard_listed = listed();
+        assert_eq!(wizard_listed.steps(), both("Back", "Next", false));
+        wizard_listed.key("Down");
+        assert_eq!(wizard_listed.steps(), both("Back", "Next", true));
+        wizard_listed.key("Return");
+        assert_eq!(wizard_listed.page, Page::Settings);
+        assert_eq!(wizard_listed.steps(), both("Back", "Review", true));
+        // Next on settings asks for the review from any field, as Return
+        // on the time zone does; with the form unfinished it says why.
+        assert_eq!(wizard_listed.draft.focused(), 0);
+        assert_eq!(wizard_listed.go(Go::Next), Action::None);
+        assert_eq!(
+            wizard_listed.notice,
+            Some("Enter a username before review.")
+        );
+        assert_eq!(wizard_listed.go(Go::Back), Action::None);
+        assert_eq!(wizard_listed.page, Page::Destinations);
+        wizard.page = Page::Waiting;
+        assert_eq!(
+            wizard.steps(),
+            Steps {
+                back: Some("Back"),
+                next: None,
+            }
+        );
+        assert_eq!(wizard.go(Go::Back), Action::Abandon);
+        assert_eq!(wizard.page, Page::Welcome);
+        wizard.page = Page::Progress(Progress::Consent);
+        assert_eq!(wizard.steps().back, Some("Withdraw"));
+        assert_eq!(wizard.steps().next, None);
+        for page in [Page::Unavailable, Page::Refused("refused")] {
+            wizard.page = page;
+            assert_eq!(wizard.steps().back, Some("Back"));
+            assert_eq!(wizard.steps().next, None);
+        }
+        // Install, and Confirm, are disabled while their request is out.
+        wizard.page = Page::Review;
+        assert_eq!(wizard.steps(), both("Back", "Install", true));
+        wizard.executing = Some([1; 32]);
+        assert_eq!(wizard.steps(), both("Back", "Install", false));
+        wizard.page = Page::Recovery(KeyStep::Shown);
+        assert_eq!(wizard.steps(), crate::nav::WELCOME);
+        wizard.page = Page::Recovery(KeyStep::TypeBack);
+        assert_eq!(wizard.steps(), both("Back", "Confirm", true));
+        wizard.confirming = true;
+        assert_eq!(wizard.steps(), both("Back", "Confirm", false));
+        for page in [
+            Page::Progress(Progress::Unknown),
+            Page::Recovery(KeyStep::Asking),
+            Page::Complete,
+        ] {
+            wizard.page = page;
+            assert_eq!(wizard.steps(), Steps::default());
+        }
+    }
+
+    /// Notes the shown page as a presented frame would, and lets it be
+    /// shown long enough for its buttons to take a press.
+    fn shown_settled(window: &mut Window) {
+        window.presented(true);
+        window.clock += SETTLE;
+    }
+
+    /// The step button's left edge on the footer row, if it is enabled.
+    fn slot(window: &Window, go: Go) -> Option<i64> {
+        let surface = window.surface().unwrap();
+        let footer = surface.height as i64 - 12;
+        let nav = Nav::new(surface, window.front.wizard.steps())?;
+        (0..surface.width as i64).find(|x| nav.hit(*x, footer) == Some(go))
+    }
+
+    #[test]
+    fn a_step_button_acts_on_the_release_over_the_one_pressed() {
+        let at = |x: i64, y: i64| pointer::Event::Motion((x * 256) as i32, (y * 256) as i32);
+        let button = |pressed| pointer::Event::Button {
+            serial: 1,
+            button: BUTTON_LEFT,
+            pressed,
+        };
+        let (mut window, _peer) = window();
+        let footer = window.surface().unwrap().height as i64 - 12;
+        window.front.wizard = listed();
+        // Next is disabled with no disk selected: no target, nothing done.
+        assert_eq!(slot(&window, Go::Next), None);
+        window.front.wizard.key("Down");
+        let next = slot(&window, Go::Next).unwrap();
+        let back = slot(&window, Go::Back).unwrap();
+        assert!(back < next);
+        // Not yet presented, nothing is a target; presented but not yet
+        // settled, neither.
+        window.pointer(at(back + 4, footer));
+        window.pointer(button(true));
+        window.pointer(button(false));
+        window.presented(true);
+        window.pointer(button(true));
+        window.pointer(button(false));
+        assert_eq!(window.front.wizard.page, Page::Destinations);
+        window.clock += SETTLE;
+        // Pressed on Next, released on Back: nothing.
+        window.pointer(at(next + 4, footer));
+        window.pointer(button(true));
+        window.pointer(at(back + 4, footer));
+        window.pointer(button(false));
+        assert_eq!(window.front.wizard.page, Page::Destinations);
+        // A key between the press and its release leaves nothing.
+        window.pointer(button(true));
+        window.chord("PageDown".into()).unwrap();
+        window.pointer(button(false));
+        assert_eq!(window.front.wizard.page, Page::Destinations);
+        // A frame too small for its page paints no buttons to press.
+        window.presented(false);
+        window.pointer(button(true));
+        window.pointer(button(false));
+        assert_eq!(window.front.wizard.page, Page::Destinations);
+        shown_settled(&mut window);
+        // Pressed and released on Back: back to welcome.
+        window.pointer(button(true));
+        assert_eq!(window.front.wizard.page, Page::Destinations);
+        window.dirty = false;
+        window.pointer(button(false));
+        assert_eq!(window.front.wizard.page, Page::Welcome);
+        assert!(window.dirty);
+        // A release with nothing pressed, and one after the pointer left,
+        // do nothing.
+        window.front.wizard = listed();
+        window.front.wizard.key("Down");
+        window.front.wizard.catalog = Catalog::Listed;
+        shown_settled(&mut window);
+        window.pointer(at(next + 4, footer));
+        window.pointer(button(false));
+        window.pointer(button(true));
+        window.pointer(pointer::Event::Leave(1));
+        window.pointer(at(next + 4, footer));
+        window.pointer(button(false));
+        assert_eq!(window.front.wizard.page, Page::Destinations);
+        // A double click on Next takes one step: the second press lands
+        // on the next page before it has settled.
+        window.pointer(button(true));
+        window.pointer(button(false));
+        assert_eq!(window.front.wizard.page, Page::Settings);
+        window.presented(true);
+        window.clock += 200;
+        window.pointer(button(true));
+        window.pointer(button(false));
+        assert_eq!(window.front.wizard.page, Page::Settings);
+        assert_eq!(window.front.wizard.notice, None);
+        // A press on one page and its release on another do nothing.
+        window.clock += SETTLE;
+        window.pointer(at(back + 4, footer));
+        window.pointer(button(true));
+        // An answer, not a key, moves the page under the held press; the
+        // new page's Back, on the same pixels, is not the one pressed.
+        window.front.wizard.key("Escape");
+        assert_eq!(window.front.wizard.page, Page::Destinations);
+        shown_settled(&mut window);
+        window.pointer(button(false));
+        assert_eq!(window.front.wizard.page, Page::Destinations);
+    }
+
+    #[test]
+    fn buttons_settle_from_when_their_page_is_shown_and_follow_its_frame() {
+        let at = |x: i64, y: i64| pointer::Event::Motion((x * 256) as i32, (y * 256) as i32);
+        let (mut window, _peer) = window();
+        let footer = window.surface().unwrap().height as i64 - 12;
+        window.front.wizard = listed();
+        window.front.wizard.key("Down");
+        let back = slot(&window, Go::Back).unwrap();
+        window.pointer(at(back + 4, footer));
+        // A redraw of the same page keeps the time it was first shown.
+        window.presented(true);
+        window.clock += SETTLE - 1;
+        window.presented(true);
+        window.clock += 1;
+        assert_eq!(window.target(), Some(Target::Step(Go::Back)));
+        // Its buttons changed since the frame on screen: none until the
+        // next frame shows them.
+        window.front.wizard.selected = None;
+        assert_eq!(window.target(), None);
+        window.presented(true);
+        assert_eq!(window.target(), Some(Target::Step(Go::Back)));
+        // A turn's end moves the clock, so a page an answer brings in
+        // settles from when it is drawn.
+        let now = window.clock + 10_000;
+        window.end_turn(now, false).unwrap();
+        assert_eq!(window.clock, now);
+        window.front.wizard.page = Page::Waiting;
+        window.presented(true);
+        assert_eq!(window.target(), None);
+        window.clock += SETTLE;
+        assert_eq!(window.target(), Some(Target::Step(Go::Back)));
+    }
+
+    #[test]
+    fn a_click_on_restart_or_power_off_asks_once_while_an_ending_may_be_asked() {
+        let at = |x: i64, y: i64| pointer::Event::Motion((x * 256) as i32, (y * 256) as i32);
+        let click = |window: &mut Window| {
+            for pressed in [true, false] {
+                window.pointer(pointer::Event::Button {
+                    serial: 1,
+                    button: BUTTON_LEFT,
+                    pressed,
+                });
+            }
+        };
+        let (mut window, _peer) = window();
+        window.front.wizard.page = Page::Complete;
+        let surface = window.surface().unwrap();
+        let page = CompletionPage::new(surface).unwrap();
+        let (x, y) = (0..surface.width as i64)
+            .flat_map(|x| (0..surface.height as i64).map(move |y| (x, y)))
+            .find(|(x, y)| page.hit(*x, *y) == Some(Ending::PowerOff))
+            .unwrap();
+        shown_settled(&mut window);
+        window.pointer(at(x + 2, y + 2));
+        // Nothing complete, no ending may be asked: no target.
+        click(&mut window);
+        assert_eq!(window.front.wizard.power, Power::Offered);
+        window.front.wizard.completed = Some([3; 32]);
+        click(&mut window);
+        assert_eq!(window.front.wizard.choice, Ending::PowerOff);
+        assert!(matches!(
+            window.front.wizard.power,
+            Power::Wanted(Ending::PowerOff) | Power::Unavailable
+        ));
+        let after = window.front.wizard.power;
+        window.front.wizard.choice = Ending::Restart;
+        click(&mut window);
+        assert_eq!(window.front.wizard.power, after);
+        assert_eq!(window.front.wizard.choice, Ending::Restart);
+    }
+
+    #[test]
+    fn a_button_cancels_a_held_key_and_a_press_on_the_open_key_list_is_none() {
+        let at = |x: i64, y: i64| pointer::Event::Motion((x * 256) as i32, (y * 256) as i32);
+        let (mut window, _peer) = window();
+        let footer = window.surface().unwrap().height as i64 - 12;
+        let input = window.client.input_mut();
+        input.map = Some(td_ui::keyboard::Keymap::parse(KEYMAP).unwrap());
+        input.focus(&[], true).unwrap();
+        input.modifiers(td_ui::keyboard::Modifiers::default());
+        input.timing(25, 600, 0).unwrap();
+        window.front.wizard = listed();
+        press(&mut window, 108, 0);
+        shown_settled(&mut window);
+        let back = slot(&window, Go::Back).unwrap();
+        window.pointer(at(back + 4, footer));
+        for pressed in [true, false] {
+            window.pointer(pointer::Event::Button {
+                serial: 1,
+                button: BUTTON_LEFT,
+                pressed,
+            });
+        }
+        assert_eq!(window.front.wizard.page, Page::Welcome);
+        assert!(window.client.repeat(100_000).unwrap().is_none());
+        // With the key list open the press only closes it.
+        window.front.wizard = listed();
+        shown_settled(&mut window);
+        window.chord(keys::CHORD.into()).unwrap();
+        for pressed in [true, false] {
+            window.pointer(pointer::Event::Button {
+                serial: 1,
+                button: BUTTON_LEFT,
+                pressed,
+            });
+        }
+        assert!(!window.key_list.is_open());
+        assert_eq!(window.front.wizard.page, Page::Destinations);
     }
 
     #[test]

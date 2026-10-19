@@ -9,6 +9,7 @@
 
 use super::*;
 
+use td_setup::nav::{Nav, Steps};
 use td_test_compositor::{
     ppm, Compositor, Controls, Placement, FRAME_BYTES, OUTPUT_HEIGHT, OUTPUT_WIDTH,
 };
@@ -298,11 +299,13 @@ fn welcome_pixels(width: usize, height: usize, theme: &'static td_ui::theme::The
     let page = td_setup::welcome::Welcome::new(surface).unwrap();
     let font = td_ui::font::pinned().unwrap();
     let mut pixels = vec![0; width * height * 4];
-    Raster::new(&mut pixels, &font, surface, width * 4)
+    let mut raster = Raster::new(&mut pixels, &font, surface, width * 4)
         .unwrap()
-        .with_theme(theme)
-        .paint(&page, surface.bounds())
-        .unwrap();
+        .with_theme(theme);
+    raster.paint(&page, surface.bounds()).unwrap();
+    // Welcome's one step button, Next, over its footer row.
+    let nav = Nav::new(surface, td_setup::nav::WELCOME).unwrap();
+    nav.emit(surface.bounds(), &mut |draw| raster.draw(draw));
     pixels
 }
 
@@ -317,10 +320,15 @@ fn unavailable_pixels(width: usize, height: usize) -> Vec<u8> {
     let page = page.unwrap();
     let font = td_ui::font::pinned().unwrap();
     let mut pixels = vec![0; width * height * 4];
-    Raster::new(&mut pixels, &font, surface, width * 4)
-        .unwrap()
-        .paint(&page, surface.bounds())
-        .unwrap();
+    let mut raster = Raster::new(&mut pixels, &font, surface, width * 4).unwrap();
+    raster.paint(&page, surface.bounds()).unwrap();
+    // The unavailable page's one step button, Back.
+    let steps = Steps {
+        back: Some("Back"),
+        next: None,
+    };
+    let nav = Nav::new(surface, steps).unwrap();
+    nav.emit(surface.bounds(), &mut |draw| raster.draw(draw));
     pixels
 }
 

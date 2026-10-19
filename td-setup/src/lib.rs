@@ -18,6 +18,7 @@
 pub mod destination;
 pub mod evidence;
 mod listbox;
+pub mod nav;
 pub mod outcome;
 pub mod recovery;
 pub mod review;
@@ -59,17 +60,31 @@ pub fn render_check() -> Result<(), String> {
 
 fn render_check_surface(font: &td_ui::font::Font, surface: Surface) -> Result<(), String> {
     let mut pixels = vec![0u8; surface.width * surface.height * 4];
+    // The step buttons' slots on the footer row; no page's footer text may
+    // run under them.
+    let footer = td_ui::chrome::Status::new(surface).rect().y;
+    let reach = nav::Nav::reach(surface).ok_or("no room for the step buttons")?;
+    let cell = (td_ui::CELL_WIDTH * surface.scale.value()) as i64;
     let mut paint = |page: &dyn Composition| -> Result<(), String> {
         let mut missing = None;
+        let mut under = None;
         let mut glyphs = 0usize;
         page.emit(surface.bounds(), &mut |draw| {
-            if let Primitive::Glyph { scalar, .. } = draw.primitive {
+            if let Primitive::Glyph { scalar, x, y, .. } = draw.primitive {
                 glyphs += 1;
                 if missing.is_none() && !font.covers(scalar) {
                     missing = Some(scalar);
                 }
+                if y >= footer && x + cell > reach && scalar != ' ' {
+                    under = Some(scalar);
+                }
             }
         });
+        if let Some(scalar) = under {
+            return Err(format!(
+                "footer text {scalar:?} runs under the step buttons"
+            ));
+        }
         if let Some(scalar) = missing {
             return Err(format!(
                 "page uses missing font glyph U+{:04X}",
@@ -246,18 +261,22 @@ fn all_installer_pages_paint_with_the_pinned_font() -> Result<(), String> {
 }
 
 /// Renders the welcome page to a tight XRGB buffer, `width` by `height` at
-/// `scale`, for a still-image preview. The surface must be large enough to
-/// hold the page (see `Welcome::new`).
+/// `scale`, for a still-image preview, with its step button as the window
+/// shows it. The surface must be large enough to hold the page (see
+/// `Welcome::new`).
 pub fn preview(width: usize, height: usize, scale: u8) -> Result<Vec<u8>, String> {
     let font = td_ui::font::pinned()?;
     let scale = Scale::new(scale).map_err(|error| format!("{error:?}"))?;
     let surface = Surface::new(width, height, scale).map_err(|error| format!("{error:?}"))?;
     let page = Welcome::new(surface).ok_or("surface too small for the welcome page")?;
+    let nav = nav::Nav::new(surface, nav::WELCOME).ok_or("no room for the step button")?;
     let mut pixels = vec![0u8; width * height * 4];
-    Raster::new(&mut pixels, &font, surface, width * 4)
-        .map_err(|error| format!("{error:?}"))?
+    let mut raster = Raster::new(&mut pixels, &font, surface, width * 4)
+        .map_err(|error| format!("{error:?}"))?;
+    raster
         .paint(&page, surface.bounds())
         .map_err(|error| format!("{error:?}"))?;
+    nav.emit(surface.bounds(), &mut |draw| raster.draw(draw));
     Ok(pixels)
 }
 
