@@ -84,6 +84,8 @@ struct Window {
     /// the turn-loop time that page was first shown. Buttons are hit only
     /// as shown, and not before `SETTLE` has passed.
     shown: Option<(Page, Steps, u64)>,
+    /// The wheel's motion within the pointer's current frame.
+    wheel: pointer::Wheel,
 }
 
 /// A button the pointer can press: a step button, or a completion
@@ -397,6 +399,13 @@ impl Wizard {
                 self.withdrawing = None;
                 return Action::Abandon;
             }
+            // An open chooser list takes every key, Escape and Return
+            // included, until it closes.
+            (Page::Settings, _) if self.draft.is_open() => {
+                if self.draft.key(chord) && !self.reviewing() {
+                    self.notice = None;
+                }
+            }
             // Back keeps the drafts and the disk they were for; a review
             // still coming is released when it comes.
             (Page::Settings, "Escape") => {
@@ -503,6 +512,10 @@ impl Wizard {
         let mut zone = Section::new("Time zone", TIME_ZONE_KEYS);
         let zones = crate::settings::ZONE_KEYS.iter().copied().map(keys::row);
         zone.rows.extend(zones);
+        // Only the open time zone list's keys: closed, its section would
+        // repeat the time zone's, and the layout's list is the form's row.
+        let zone_open = self.draft.is_open() && self.draft.focused() == TIME_ZONE;
+        let list = zone_open.then(|| Section::new("Time zone list", crate::settings::LIST_KEYS));
         let mut type_back = Section::new("Type back", TYPE_BACK_KEYS);
         let field = recovery::TYPE_BACK_KEYS.iter().copied().map(keys::row);
         type_back.rows.extend(field);
@@ -516,10 +529,12 @@ impl Wizard {
             Some(Section::new("Complete", COMPLETE_KEYS)),
             Some(Section::new("Recovery key", RECOVERY_KEYS)),
             Some(type_back),
+            list,
         ];
         let leads: &[usize] = match &self.page {
             Page::Welcome => &[0],
             Page::Waiting | Page::Unavailable | Page::Refused(_) | Page::Destinations => &[1],
+            Page::Settings if zone_open => &[9, 3, 2],
             Page::Settings if self.draft.focused() == TIME_ZONE => &[3, 2],
             Page::Settings => &[2],
             Page::Review => &[4],
@@ -1272,6 +1287,7 @@ impl Window {
             pointer: (0, 0),
             pressed: None,
             shown: None,
+            wheel: pointer::Wheel::default(),
         })
     }
 
@@ -1378,8 +1394,9 @@ impl Window {
 
     /// A left press closes an open key list, as its title bar says, and
     /// reaches nothing else; otherwise it is the page's click at the
-    /// pointer's last position. Motion only moves that position, and the
-    /// rest of the pointer is ignored.
+    /// pointer's last position, or a step button's press, which its
+    /// release activates. Motion only moves that position, the wheel
+    /// scrolls an open chooser list, and the rest is ignored.
     fn pointer(&mut self, event: pointer::Event) {
         match event {
             // Coordinates arrive in 24.8 fixed point.
@@ -1398,6 +1415,9 @@ impl Window {
                     self.client.cancel_repeat();
                     self.dirty = true;
                 } else if self.click() {
+                    // A key held through it would walk away from what
+                    // was clicked.
+                    self.client.cancel_repeat();
                     self.dirty = true;
                 } else {
                     let page = self.front.wizard.page.clone();
@@ -1417,7 +1437,32 @@ impl Window {
                     }
                 }
             }
-            pointer::Event::Leave(_) => self.pressed = None,
+            pointer::Event::Leave(_) => {
+                self.pressed = None;
+                self.wheel = pointer::Wheel::default();
+            }
+            pointer::Event::Axis(..)
+            | pointer::Event::Discrete(..)
+            | pointer::Event::Source(_)
+            | pointer::Event::Stop(_) => {
+                // A frame past the wheel's budget is dropped whole.
+                if self.wheel.update(event).is_err() {
+                    self.wheel = pointer::Wheel::default();
+                }
+            }
+            // The wheel scrolls only an open chooser list, and not under
+            // the key list.
+            pointer::Event::Frame => {
+                let (rows, _) = self.wheel.frame();
+                let draft = &mut self.front.wizard.draft;
+                if rows != 0
+                    && !self.key_list.is_open()
+                    && self.front.wizard.page == Page::Settings
+                    && draft.scroll(rows)
+                {
+                    self.dirty = true;
+                }
+            }
             _ => {}
         }
     }
@@ -1476,13 +1521,28 @@ impl Window {
     /// A left press on the page at the pointer: on the destination step
     /// a listed disk's row selects that disk, as Up and Down would. The
     /// hit uses the first row the last frame showed, not one a pending
-    /// move would reveal. True when the page changed.
+    /// move would reveal. True when the page changed or took the press.
     fn click(&mut self) -> bool {
         let Ok(surface) = self.surface() else {
             return false;
         };
         let (x, y) = self.pointer;
         let wizard = &mut self.front.wizard;
+        // On settings a click focuses a field or works a chooser's list;
+        // while a list is open every click is the list's, so none reaches
+        // a button under it.
+        if wizard.page == Page::Settings {
+            let open = wizard.draft.is_open();
+            let hit = wizard
+                .draft
+                .page(surface, wizard.zone_hint(), wizard.notice)
+                .and_then(|page| page.hit(x, y));
+            let changed = wizard.draft.click(hit);
+            if changed && !wizard.reviewing() {
+                wizard.notice = None;
+            }
+            return changed || open;
+        }
         if wizard.page != Page::Destinations {
             return false;
         }
@@ -1756,6 +1816,11 @@ impl App for Window {
         // A page an answer brings in is shown from now, not from the last
         // input event, so its buttons settle from when it appears.
         self.clock = now;
+        // An answer that leaves settings takes an open list with it.
+        let wizard = &mut self.front.wizard;
+        if wizard.page != Page::Settings && wizard.draft.shut() {
+            self.dirty = true;
+        }
         if self.front.wizard.executing.is_some() {
             self.front.poll(now);
         }
@@ -2991,7 +3056,7 @@ mod tests {
         wizard.key("Return");
         assert_eq!(wizard.page, Page::Settings);
         assert_eq!(titles(&wizard)[..3], ["Settings", "Welcome", "Disks"]);
-        let wizard = filled();
+        let mut wizard = filled();
         assert_eq!(wizard.draft.focused(), TIME_ZONE);
         assert_eq!(
             titles(&wizard),
@@ -3007,6 +3072,22 @@ mod tests {
                 "Type back"
             ]
         );
+        // The open time zone list leads with its own keys, then the
+        // form's; the layout's list leads with the form's, which name it.
+        wizard.key(" ");
+        assert!(wizard.draft.is_open());
+        assert_eq!(
+            titles(&wizard)[..3],
+            ["Time zone list", "Time zone", "Settings"]
+        );
+        assert_eq!(titles(&wizard).len(), 10);
+        wizard.key("Tab");
+        wizard.key("S-Tab");
+        wizard.key("S-Tab");
+        wizard.key(" ");
+        assert!(wizard.draft.is_open());
+        assert_eq!(titles(&wizard)[0], "Settings");
+        assert_eq!(titles(&wizard).len(), 9);
         let mut wizard = on_review();
         assert_eq!(titles(&wizard)[0], "Review");
         wizard.key("Return");
@@ -3061,9 +3142,13 @@ mod tests {
         wizard.key("Return");
         assert_eq!(wizard.page, Page::Settings);
         checked(&wizard);
-        let wizard = filled();
+        let mut wizard = filled();
         assert_eq!(wizard.draft.focused(), TIME_ZONE);
         checked(&wizard);
+        wizard.key(" ");
+        assert!(wizard.draft.is_open());
+        checked(&wizard);
+        wizard.key("Escape");
         let mut wizard = on_review();
         checked(&wizard);
         wizard.key("Return");
@@ -3920,6 +4005,28 @@ mod tests {
     }
 
     #[test]
+    fn a_click_that_changes_the_page_cancels_a_held_key() {
+        let at = |x: i64, y: i64| pointer::Event::Motion((x * 256) as i32, (y * 256) as i32);
+        let (mut window, _peer) = window();
+        let input = window.client.input_mut();
+        input.map = Some(td_ui::keyboard::Keymap::parse(KEYMAP).unwrap());
+        input.focus(&[], true).unwrap();
+        input.modifiers(td_ui::keyboard::Modifiers::default());
+        input.timing(25, 600, 0).unwrap();
+        window.front.wizard = listed();
+        press(&mut window, 108, 0);
+        assert_eq!(window.front.wizard.selected, Some(0));
+        window.pointer(at(100, 5 * 24 + 5));
+        window.pointer(pointer::Event::Button {
+            serial: 1,
+            button: BUTTON_LEFT,
+            pressed: true,
+        });
+        assert_eq!(window.front.wizard.selected, Some(1));
+        assert!(window.client.repeat(100_000).unwrap().is_none());
+    }
+
+    #[test]
     fn a_button_cancels_a_held_key_and_a_press_on_the_open_key_list_is_none() {
         let at = |x: i64, y: i64| pointer::Event::Motion((x * 256) as i32, (y * 256) as i32);
         let (mut window, _peer) = window();
@@ -3955,6 +4062,112 @@ mod tests {
             });
         }
         assert!(!window.key_list.is_open());
+        assert_eq!(window.front.wizard.page, Page::Destinations);
+    }
+
+    #[test]
+    fn the_settings_form_takes_clicks_and_its_open_list_the_wheel() {
+        let at = |x: i64, y: i64| pointer::Event::Motion((x * 256) as i32, (y * 256) as i32);
+        let press = |window: &mut Window| {
+            for pressed in [true, false] {
+                window.pointer(pointer::Event::Button {
+                    serial: 1,
+                    button: BUTTON_LEFT,
+                    pressed,
+                });
+            }
+        };
+        let (mut window, _peer) = window();
+        window.front.wizard = listed();
+        window.front.wizard.key("Down");
+        window.front.wizard.key("Return");
+        assert_eq!(window.front.wizard.page, Page::Settings);
+        shown_settled(&mut window);
+        let zones: Vec<String> = (0..12).map(|index| format!("Zone/{index:02}")).collect();
+        window.front.wizard.draft.offer(zones);
+        window.front.wizard.catalog = Catalog::Listed;
+        // The time zone's row, the fourth field, opens its list.
+        window.pointer(at(100, 17 * 24 + 5));
+        press(&mut window);
+        assert!(window.front.wizard.draft.is_open());
+        // The wheel scrolls it; Escape closes it and stays on the page.
+        for event in [pointer::Event::Axis(0, 3 * 16 * 256), pointer::Event::Frame] {
+            window.pointer(event);
+        }
+        assert!(window.dirty);
+        window.chord("Escape".into()).unwrap();
+        assert!(!window.front.wizard.draft.is_open());
+        assert_eq!(window.front.wizard.page, Page::Settings);
+        // Open again, a click on the step buttons only closes the list.
+        window.pointer(at(100, 17 * 24 + 5));
+        press(&mut window);
+        let surface = window.surface().unwrap();
+        let footer = surface.height as i64 - 12;
+        let nav = Nav::new(surface, window.front.wizard.steps()).unwrap();
+        let back = (0..surface.width as i64)
+            .find(|x| nav.hit(*x, footer) == Some(Go::Back))
+            .unwrap();
+        window.pointer(at(back + 4, footer));
+        press(&mut window);
+        assert!(!window.front.wizard.draft.is_open());
+        assert_eq!(window.front.wizard.page, Page::Settings);
+        // Closed, Back is Back.
+        press(&mut window);
+        assert_eq!(window.front.wizard.page, Page::Destinations);
+        // A click on the username field focuses it.
+        window.front.wizard.key("Return");
+        window.front.wizard.draft.key("Tab");
+        window.pointer(at(100, 5 * 24 + 5));
+        press(&mut window);
+        assert_eq!(window.front.wizard.draft.focused(), 0);
+    }
+
+    #[test]
+    fn an_open_list_keeps_its_return_and_closes_when_settings_is_left() {
+        let mut wizard = filled();
+        // Return that closes the list proposes nothing; the next does.
+        wizard.key(" ");
+        assert!(wizard.draft.is_open());
+        wizard.key("Return");
+        assert!(!wizard.draft.is_open());
+        assert_eq!(wizard.proposal, None);
+        wizard.key("Return");
+        assert!(wizard.proposal.is_some());
+        // A turn's end on settings leaves the list open; a review that
+        // arrives while it is open takes it away, keeping its choice.
+        let (mut window, _peer) = window();
+        window.front.wizard = filled();
+        window.front.wizard.key(" ");
+        window.front.wizard.key("Down");
+        window.end_turn(1, false).unwrap();
+        assert!(window.front.wizard.draft.is_open());
+        let chosen = window.front.wizard.draft.values()[3].to_string();
+        window.front.wizard.page = Page::Review;
+        window.dirty = false;
+        window.end_turn(1, false).unwrap();
+        assert!(!window.front.wizard.draft.is_open());
+        assert_eq!(window.front.wizard.draft.values()[3], chosen);
+        assert!(window.dirty);
+    }
+
+    #[test]
+    fn a_seek_leaves_the_step_buttons_their_first_click() {
+        let at = |x: i64, y: i64| pointer::Event::Motion((x * 256) as i32, (y * 256) as i32);
+        let (mut window, _peer) = window();
+        window.front.wizard = filled();
+        assert_eq!(window.front.wizard.draft.focused(), TIME_ZONE);
+        window.chord("E".into()).unwrap();
+        shown_settled(&mut window);
+        let footer = window.surface().unwrap().height as i64 - 12;
+        let back = slot(&window, Go::Back).unwrap();
+        window.pointer(at(back + 4, footer));
+        for pressed in [true, false] {
+            window.pointer(pointer::Event::Button {
+                serial: 1,
+                button: BUTTON_LEFT,
+                pressed,
+            });
+        }
         assert_eq!(window.front.wizard.page, Page::Destinations);
     }
 

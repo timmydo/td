@@ -2,7 +2,8 @@
 //! and the page that renders them. Drafts are bounded tokens; wire
 //! admission, policy checks, and catalog membership remain the service's.
 
-use td_ui::chrome::{Field, Item, List, Status, TextEntry, ROW};
+use crate::listbox::{Choice, ListBox};
+use td_ui::chrome::{Field, Status, TextEntry, ROW};
 use td_ui::raster::{
     text_run, Composition, Draw, GlyphStyle, Primitive, Rect, Surface, CHROME, INK,
 };
@@ -23,6 +24,14 @@ const FOOTER: &str = "Account and region \u{b7} step 3 of 6 \u{b7} Return on Tim
 const NOTICE_ROW: usize = 18;
 /// The one keyboard layout the installer offers.
 pub const KEYBOARD: &str = "us";
+/// The keyboard layouts its chooser lists: version 1's one.
+const KEYBOARDS: &[&str] = &[KEYBOARD];
+/// The keyboard layout field, a chooser like the time zone's.
+const KEYBOARD_FIELD: usize = 2;
+/// The rows an open chooser's list shows at most.
+const LIST_ROWS: usize = 8;
+/// A chooser row's mark that it opens a list.
+const OPENS: &str = "\u{25be}";
 /// The time zone chosen when the catalog has it and nothing else was.
 const DEFAULT_ZONE: &str = "Etc/UTC";
 /// The rows PageUp and PageDown move a time zone selection.
@@ -39,6 +48,11 @@ pub const FIELD_KEYS: &[(&str, &str)] = &[
     ),
     ("Down/Return", "the next field"),
     ("Up", "the previous field"),
+    (
+        "Space/M-Down",
+        "open the keyboard layout's list on its row: Return or a click there chooses, Escape closes it unchanged",
+    ),
+    ("click", "focus a field, or open a chooser's list"),
     ("Left/Right", "move the caret in the username or hostname"),
     ("Home/End", "the caret to the start or end of its text"),
     (
@@ -51,12 +65,44 @@ pub const FIELD_KEYS: &[(&str, &str)] = &[
     ),
 ];
 
+/// The keys the open time zone list takes; the window lists them first
+/// while it is open. The keyboard layout's list is the form's row.
+pub const LIST_KEYS: &[(&str, &str)] = &[
+    ("Return", "keep the chosen entry and close the list"),
+    (
+        "Escape",
+        "close the list, putting back the entry it opened on",
+    ),
+    (
+        "Tab/S-Tab",
+        "keep the choice and go to the next or previous field",
+    ),
+    ("Up/Down", "the time zone above or below"),
+    ("PageUp/PageDown", "a page of time zones up or down"),
+    ("Home/End", "the first or last time zone"),
+    (
+        "a character",
+        "seek the first time zone beginning with what was typed",
+    ),
+    ("Backspace", "drop the last character sought"),
+    (
+        "click",
+        "choose the entry under the pointer, or elsewhere close the list unchanged",
+    ),
+    ("wheel", "scroll the list"),
+];
+
 /// What `Draft::key` does with a key in the time zone row.
 pub const ZONE_KEYS: &[(&str, &str)] = &[
     ("Tab/S-Tab", "the first or previous field"),
     ("Up/Down", "the time zone above or below"),
     ("PageUp/PageDown", "a page of time zones up or down"),
     ("Home/End", "the first or last time zone"),
+    (
+        "Space/M-Down",
+        "open the list of time zones: there the same keys move, Return or a click chooses and Escape closes it unchanged",
+    ),
+    ("wheel", "scroll the open list"),
     (
         "a character",
         "seek the first time zone beginning with what was typed, ignoring case",
@@ -75,6 +121,32 @@ pub struct Draft {
     zone: Option<usize>,
     /// What has been typed toward a time zone since it was focused.
     seek: String,
+    /// Whether the focused chooser's list is open, its first shown row,
+    /// and the zone chosen when it opened, which Escape restores.
+    open: bool,
+    first: usize,
+    before: Option<usize>,
+}
+
+/// An open chooser's list, as the page paints it: the shown rows from
+/// `first`, out of `total`, and the chosen row's index in all of them.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Dropdown<'a> {
+    pub field: usize,
+    pub shown: Vec<&'a str>,
+    pub first: usize,
+    pub total: usize,
+    pub chosen: Option<usize>,
+}
+
+/// What a point on the form is: a field's row, or a row of the open list
+/// by its index in the whole list.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Hit {
+    Field(usize),
+    Item(usize),
+    /// The open list's scrollbar or border: inside it, but no entry.
+    List,
 }
 
 impl Draft {
@@ -130,34 +202,189 @@ impl Draft {
         !self.zones.is_empty()
     }
 
+    /// Whether a chooser's list is open; it takes every key until closed.
+    pub fn is_open(&self) -> bool {
+        self.open
+    }
+
+    /// The open list, for the page to paint.
+    pub fn dropdown(&self) -> Option<Dropdown<'_>> {
+        if !self.open {
+            return None;
+        }
+        let shown = if self.focused == TIME_ZONE {
+            self.zones
+                .iter()
+                .skip(self.first)
+                .take(LIST_ROWS)
+                .map(String::as_str)
+                .collect()
+        } else {
+            KEYBOARDS
+                .iter()
+                .skip(self.first)
+                .take(LIST_ROWS)
+                .copied()
+                .collect()
+        };
+        Some(Dropdown {
+            field: self.focused,
+            shown,
+            first: self.first,
+            total: self.listed(),
+            chosen: self.at(),
+        })
+    }
+
+    /// A click on the form: a field focuses it, a chooser's row opening
+    /// its list or closing the one open; a row of the open list chooses
+    /// it and closes the list; anywhere else closes an open list
+    /// unchanged. True when the draft changed.
+    pub fn click(&mut self, hit: Option<Hit>) -> bool {
+        let before = self.state();
+        match hit {
+            Some(Hit::Item(index)) if self.open && index < self.listed() => {
+                if self.focused == TIME_ZONE {
+                    self.zone = Some(index);
+                }
+                self.close(true);
+            }
+            Some(Hit::Field(field)) if self.open && field == self.focused => self.close(true),
+            Some(Hit::Field(field)) if field < LABELS.len() => {
+                self.close(false);
+                self.focus(field);
+                if field >= KEYBOARD_FIELD {
+                    self.open_list();
+                }
+            }
+            Some(Hit::List) => {}
+            // Off the form a click closes an open list, and changes
+            // nothing else, so it leaves a seek and the step buttons be.
+            _ if self.open => self.close(false),
+            _ => {}
+        }
+        before != self.state()
+    }
+
+    /// Closes an open list keeping its choice, as the page is left by
+    /// something other than a key. True when one was open.
+    pub fn shut(&mut self) -> bool {
+        if !self.open {
+            return false;
+        }
+        self.close(true);
+        true
+    }
+
+    /// Scrolls the open list by `rows`, without choosing. True when it
+    /// moved.
+    pub fn scroll(&mut self, rows: isize) -> bool {
+        if !self.open {
+            return false;
+        }
+        let last = self.listed().saturating_sub(LIST_ROWS);
+        let first = if rows < 0 {
+            self.first.saturating_sub(rows.unsigned_abs())
+        } else {
+            self.first.saturating_add(rows.unsigned_abs()).min(last)
+        };
+        let moved = first != self.first;
+        self.first = first;
+        moved
+    }
+
+    /// The entries the focused chooser lists.
+    fn listed(&self) -> usize {
+        if self.focused == TIME_ZONE {
+            self.zones.len()
+        } else if self.focused == KEYBOARD_FIELD {
+            KEYBOARDS.len()
+        } else {
+            0
+        }
+    }
+
+    /// The focused chooser's chosen entry.
+    fn at(&self) -> Option<usize> {
+        if self.focused == TIME_ZONE {
+            self.zone
+        } else {
+            KEYBOARDS.iter().position(|layout| *layout == KEYBOARD)
+        }
+    }
+
+    fn open_list(&mut self) {
+        if self.focused >= KEYBOARD_FIELD && self.listed() > 0 {
+            self.open = true;
+            self.before = self.zone;
+            self.seek.clear();
+            self.reveal();
+        }
+    }
+
+    /// Closes the list, keeping what it chose or restoring the zone it
+    /// opened on.
+    fn close(&mut self, keep: bool) {
+        if self.open && !keep {
+            self.zone = self.before;
+        }
+        self.open = false;
+        self.seek.clear();
+    }
+
+    /// Moves the list's first row as little as possible to show the
+    /// chosen entry.
+    fn reveal(&mut self) {
+        let last = self.listed().saturating_sub(LIST_ROWS);
+        if let Some(at) = self.at() {
+            if at < self.first {
+                self.first = at;
+            } else if at >= self.first.saturating_add(LIST_ROWS) {
+                self.first = at + 1 - LIST_ROWS;
+            }
+        }
+        self.first = self.first.min(last);
+    }
+
+    fn state(&self) -> (String, Option<usize>, bool, usize, usize) {
+        (
+            self.seek.clone(),
+            self.zone,
+            self.open,
+            self.first,
+            self.focused,
+        )
+    }
+
     /// Applies one key chord, as td-ui names it; a key the focused field
     /// does not take changes nothing. True when the draft changed.
     pub fn key(&mut self, chord: &str) -> bool {
         // The catalog is not edited by keys, so it is left out.
-        let before = (
-            self.texts.clone(),
-            self.carets,
-            self.focused,
-            self.zone,
-            self.seek.clone(),
-        );
+        let before = (self.texts.clone(), self.carets, self.state());
         let fields = LABELS.len();
         match chord {
+            // An open list takes every key: it moves, chooses or closes.
+            "Escape" if self.open => self.close(false),
+            "Return" if self.open => self.close(true),
+            "Tab" | "S-Tab" if self.open => {
+                self.close(true);
+                self.key(chord);
+            }
+            _ if self.open => {
+                if self.focused == TIME_ZONE {
+                    self.choose(chord);
+                    self.reveal();
+                }
+            }
             "Tab" => self.focus((self.focused + 1) % fields),
             "S-Tab" => self.focus((self.focused + fields - 1) % fields),
+            " " | "M-Down" if self.focused >= KEYBOARD_FIELD => self.open_list(),
             _ if self.focused == TIME_ZONE => self.choose(chord),
             "Down" | "Return" => self.focus(self.focused + 1),
             "Up" => self.focus(self.focused.saturating_sub(1)),
             _ => self.type_key(chord),
         }
-        before
-            != (
-                self.texts.clone(),
-                self.carets,
-                self.focused,
-                self.zone,
-                self.seek.clone(),
-            )
+        before != (self.texts.clone(), self.carets, self.state())
     }
 
     fn focus(&mut self, field: usize) {
@@ -261,7 +488,11 @@ impl Draft {
             self.carets,
             true,
         )
-        .map(|page| page.with_hint(hint).with_notice(notice))
+        .map(|page| {
+            page.with_hint(hint)
+                .with_notice(notice)
+                .with_dropdown(self.dropdown())
+        })
     }
 }
 
@@ -286,10 +517,12 @@ pub struct SettingsPage<'a> {
     carets: [usize; 2],
     caret_visible: bool,
     entries: [TextEntry; 2],
-    choices: [List; 2],
+    choices: [ListBox; 2],
     footer: Status,
     hint: Option<&'a str>,
     notice: Option<&'a str>,
+    /// The open list and the box it is painted in.
+    dropdown: Option<(Dropdown<'a>, ListBox)>,
 }
 
 impl<'a> SettingsPage<'a> {
@@ -331,7 +564,7 @@ impl<'a> SettingsPage<'a> {
             )
         };
         let choice_at = |row: usize| {
-            List::new(
+            ListBox::new(
                 surface,
                 Rect {
                     x: (INSET * scale) as i64,
@@ -366,7 +599,61 @@ impl<'a> SettingsPage<'a> {
             footer,
             hint: None,
             notice: None,
+            dropdown: None,
         })
+    }
+
+    /// Shows `dropdown` under its chooser's row, or over it when the
+    /// footer leaves no room below. One that cannot be placed is not
+    /// shown.
+    pub fn with_dropdown(mut self, dropdown: Option<Dropdown<'a>>) -> Self {
+        self.dropdown = dropdown.and_then(|dropdown| {
+            let chooser = self
+                .choices
+                .get(dropdown.field.checked_sub(KEYBOARD_FIELD)?)?;
+            let s = self.surface.scale.value();
+            let rows = dropdown.total.clamp(1, LIST_ROWS);
+            let height = rows.checked_mul(ROW * s)?;
+            let anchor = chooser.rect();
+            let below = anchor.y + i64::from(anchor.height);
+            let footer = self.footer.rect().y;
+            let y = if below + height as i64 <= footer {
+                below
+            } else {
+                anchor.y - height as i64
+            };
+            let rect = Rect {
+                y,
+                height: u32::try_from(height).ok()?,
+                ..anchor
+            };
+            let list = ListBox::new(self.surface, rect)?;
+            Some((dropdown, list))
+        });
+        self
+    }
+
+    /// What lies under the point: a row of the open list, by its index in
+    /// the whole list, or a field's row.
+    pub fn hit(&self, x: i64, y: i64) -> Option<Hit> {
+        if let Some((dropdown, list)) = &self.dropdown {
+            if let Some(row) = list.hit(x, y) {
+                let index = dropdown.first.checked_add(row)?;
+                return (index < dropdown.total).then_some(Hit::Item(index));
+            }
+            // What the list covers is the list's, never a field under it.
+            if list.rect().contains(x, y) {
+                return Some(Hit::List);
+            }
+        }
+        let rows = self
+            .entries
+            .iter()
+            .map(|entry| entry.rect())
+            .chain(self.choices.iter().map(|choice| choice.rect()));
+        rows.enumerate()
+            .find(|(_, rect)| rect.contains(x, y))
+            .map(|(field, _)| Hit::Field(field))
     }
 
     /// Shows `hint` in place of an empty time zone's placeholder.
@@ -483,18 +770,12 @@ impl Composition for SettingsPage<'_> {
                     continue;
                 };
                 choice.emit(
-                    [Item {
+                    [Choice {
                         label: if value.is_empty() { placeholder } else { value },
-                        meta: "Choose",
-                        enabled: true,
-                        marked: false,
+                        meta: OPENS,
                     }],
                     0,
-                    if self.focused == Some(index) {
-                        0
-                    } else {
-                        usize::MAX
-                    },
+                    (self.focused == Some(index)).then_some(0),
                     1,
                     damage,
                     sink,
@@ -518,6 +799,20 @@ impl Composition for SettingsPage<'_> {
             );
         }
         self.footer.emit(FOOTER.chars(), damage, sink);
+        // The open list over the form, last.
+        if let Some((dropdown, list)) = &self.dropdown {
+            list.emit(
+                dropdown
+                    .shown
+                    .iter()
+                    .map(|label| Choice { label, meta: "" }),
+                dropdown.first,
+                dropdown.chosen,
+                dropdown.total,
+                damage,
+                sink,
+            );
+        }
     }
 }
 
@@ -722,6 +1017,174 @@ mod tests {
             *values.get_mut(index).unwrap() = &rejected;
             assert!(SettingsPage::new(surface(800, 480), values, None, [0; 2], false).is_none());
         }
+    }
+
+    /// Twelve zones, more than an open list shows.
+    fn many() -> Vec<String> {
+        (0..12).map(|index| format!("Zone/{index:02}")).collect()
+    }
+
+    #[test]
+    fn a_chooser_list_opens_moves_chooses_and_closes_unchanged() {
+        let mut draft = Draft::default();
+        draft.offer(many());
+        assert_eq!(draft.values()[3], "");
+        // Space types nothing in a text field and opens nothing there.
+        assert!(!draft.key(" "));
+        assert!(!draft.is_open());
+        typed(&mut draft, &["Tab", "Tab", "Tab"]);
+        assert_eq!(draft.focused(), TIME_ZONE);
+        assert!(draft.key(" "));
+        assert!(draft.is_open());
+        let open = draft.dropdown().unwrap();
+        assert_eq!((open.field, open.total, open.first), (TIME_ZONE, 12, 0));
+        assert_eq!(open.shown.len(), LIST_ROWS);
+        // Keys move the choice and the shown rows follow it; Escape puts
+        // back the zone it opened on, and leaves nothing else.
+        typed(&mut draft, &["End"]);
+        assert_eq!(draft.values()[3], "Zone/11");
+        assert_eq!(draft.dropdown().unwrap().first, 12 - LIST_ROWS);
+        assert!(draft.key("Escape"));
+        assert!(!draft.is_open());
+        assert_eq!(draft.values()[3], "");
+        assert_eq!(draft.focused(), TIME_ZONE);
+        // M-Down opens it too; Return keeps the choice.
+        typed(&mut draft, &["M-Down", "Down", "Down", "Return"]);
+        assert!(!draft.is_open());
+        assert_eq!(draft.values()[3], "Zone/01");
+        // Typing seeks while open; Tab keeps the choice and moves on.
+        typed(&mut draft, &["Space"]);
+        assert!(!draft.is_open(), "only an unmodified space opens");
+        typed(&mut draft, &[" ", "Z", "o", "n", "e", "/", "0", "7", "Tab"]);
+        assert!(!draft.is_open());
+        assert_eq!(draft.values()[3], "Zone/07");
+        assert_eq!(draft.focused(), 0);
+        // The keyboard layout's list holds its one layout.
+        typed(&mut draft, &["Tab", "Tab", " "]);
+        assert_eq!(draft.focused(), KEYBOARD_FIELD);
+        let keyboard = draft.dropdown().unwrap();
+        assert_eq!(keyboard.shown, vec![KEYBOARD]);
+        assert_eq!(keyboard.chosen, Some(0));
+        typed(&mut draft, &["Down", "Return"]);
+        assert_eq!(draft.values()[2], KEYBOARD);
+        // No catalog, no list.
+        let mut empty = Draft::default();
+        typed(&mut empty, &["Tab", "Tab", "Tab", " "]);
+        assert!(!empty.is_open());
+    }
+
+    #[test]
+    fn the_wheel_scrolls_an_open_list_without_choosing() {
+        let mut draft = Draft::default();
+        draft.offer(many());
+        assert!(!draft.scroll(3), "a closed list does not scroll");
+        typed(&mut draft, &["Tab", "Tab", "Tab", " "]);
+        let zone = draft.values()[3].to_string();
+        assert!(draft.scroll(3));
+        assert_eq!(draft.dropdown().unwrap().first, 3);
+        assert!(draft.scroll(100));
+        assert_eq!(draft.dropdown().unwrap().first, 12 - LIST_ROWS);
+        assert!(!draft.scroll(1));
+        assert!(draft.scroll(-100));
+        assert_eq!(draft.dropdown().unwrap().first, 0);
+        assert_eq!(draft.values()[3], zone);
+    }
+
+    #[test]
+    fn a_click_focuses_fields_and_works_the_open_list() {
+        let surface = surface(crate::MIN_PAGE_WIDTH, crate::MIN_PAGE_HEIGHT);
+        let mut draft = Draft::default();
+        draft.offer(many());
+        let hit =
+            |draft: &Draft, x: i64, y: i64| draft.page(surface, None, None).unwrap().hit(x, y);
+        let row = |label_row: usize| ((label_row + 1) * ROW + 5) as i64;
+        // Fields by their rows; the labels and the gap are none.
+        for (field, label_row) in LABEL_ROWS.iter().enumerate() {
+            assert_eq!(hit(&draft, 100, row(*label_row)), Some(Hit::Field(field)));
+            assert_eq!(hit(&draft, 100, (label_row * ROW + 5) as i64), None);
+        }
+        // A click on the time zone's row focuses it and opens its list,
+        // over the row: below it the footer leaves no room.
+        assert!(draft.click(hit(&draft, 100, row(16))));
+        assert_eq!(draft.focused(), TIME_ZONE);
+        assert!(draft.is_open());
+        let page = draft.page(surface, None, None).unwrap();
+        let (_, list) = page.dropdown.as_ref().unwrap();
+        assert_eq!(
+            list.rect().y + i64::from(list.rect().height),
+            row(16) - 5,
+            "the list ends where the row begins"
+        );
+        let top = list.rect().y;
+        // Its rows are items by their index in the whole list.
+        assert_eq!(hit(&draft, 100, top + 5), Some(Hit::Item(0)));
+        assert_eq!(
+            hit(&draft, 100, top + 3 * ROW as i64 + 5),
+            Some(Hit::Item(3))
+        );
+        draft.scroll(2);
+        assert_eq!(
+            hit(&draft, 100, top + 3 * ROW as i64 + 5),
+            Some(Hit::Item(5))
+        );
+        // Choosing one closes the list with it.
+        assert!(draft.click(Some(Hit::Item(5))));
+        assert!(!draft.is_open());
+        assert_eq!(draft.values()[3], "Zone/05");
+        // A click elsewhere closes an open list unchanged, and one on
+        // another field moves the focus there.
+        draft.click(Some(Hit::Field(TIME_ZONE)));
+        draft.key("Down");
+        assert_eq!(draft.values()[3], "Zone/06");
+        assert!(draft.click(None));
+        assert!(!draft.is_open());
+        assert_eq!(draft.values()[3], "Zone/05");
+        draft.click(Some(Hit::Field(TIME_ZONE)));
+        draft.key("Down");
+        assert!(draft.click(Some(Hit::Field(0))));
+        assert_eq!((draft.focused(), draft.is_open()), (0, false));
+        assert_eq!(draft.values()[3], "Zone/05");
+        // The open chooser's own row closes it, keeping the choice.
+        draft.click(Some(Hit::Field(TIME_ZONE)));
+        draft.key("Down");
+        assert!(draft.click(Some(Hit::Field(TIME_ZONE))));
+        assert!(!draft.is_open());
+        assert_eq!(draft.values()[3], "Zone/06");
+        // The keyboard layout's list opens under its row.
+        draft.click(Some(Hit::Field(KEYBOARD_FIELD)));
+        let page = draft.page(surface, None, None).unwrap();
+        let (_, list) = page.dropdown.as_ref().unwrap();
+        assert_eq!(list.rect().y, row(12) - 5 + ROW as i64);
+    }
+
+    #[test]
+    fn the_open_list_s_scrollbar_is_the_list_s_and_a_click_off_a_closed_one_is_nothing() {
+        let surface = surface(800, 600);
+        let mut draft = Draft::default();
+        draft.offer(many());
+        typed(&mut draft, &["Tab", "Tab", "Tab", " ", "Down"]);
+        let zone = draft.values()[3].to_string();
+        let page = draft.page(surface, None, None).unwrap();
+        let rect = page.dropdown.as_ref().unwrap().1.rect();
+        // The gutter over the hostname's and the keyboard's rows.
+        let gutter = rect.x + i64::from(rect.width) - 4;
+        for y in [
+            rect.y + 2,
+            rect.y + 4 * ROW as i64 + 5,
+            rect.y + i64::from(rect.height) - 1,
+        ] {
+            assert_eq!(page.hit(gutter, y), Some(Hit::List));
+        }
+        assert!(!draft.click(Some(Hit::List)));
+        assert!(draft.is_open());
+        assert_eq!(draft.values()[3], zone);
+        // Closed, a click off the form leaves a seek and all else be.
+        draft.key("Return");
+        typed(&mut draft, &["Z"]);
+        assert!(!draft.click(None));
+        assert!(!draft.click(Some(Hit::List)));
+        assert!(!draft.click(Some(Hit::Item(0))));
+        assert_eq!(draft.values()[3], zone);
     }
 
     #[test]

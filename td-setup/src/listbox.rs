@@ -37,6 +37,10 @@ impl ListBox {
         })
     }
 
+    pub fn rect(self) -> Rect {
+        self.list.rect()
+    }
+
     /// The rows it shows at once.
     pub fn rows(self) -> usize {
         self.list.rows()
@@ -110,6 +114,7 @@ impl ListBox {
         let Some(damage) = damage.intersection(face) else {
             return;
         };
+        let bar = self.list.scrollbar(total, first);
         for (index, choice) in choices.into_iter().enumerate() {
             // The text keeps td-ui's row geometry; the face clips only the
             // fill and the glyphs, so every row's text sits alike.
@@ -126,7 +131,17 @@ impl ListBox {
                 (PAPER, INK)
             };
             if chosen {
-                fill(row, ground, damage, sink);
+                // With nothing to scroll the gutter is the rows' own, so
+                // the chosen row's colour runs on to the bezel.
+                let band = if bar.enabled() {
+                    row
+                } else {
+                    Rect {
+                        width: (face.x + i64::from(face.width) - row.x).max(0) as u32,
+                        ..row
+                    }
+                };
+                fill(band, ground, damage, sink);
             }
             let style = GlyphStyle::medium(ink, ground);
             let cells = choice.meta.chars().count() as i64;
@@ -155,7 +170,6 @@ impl ListBox {
                 sink,
             );
         }
-        let bar = self.list.scrollbar(total, first);
         if bar.enabled() {
             fill(bar.thumb, LINE_NUMBER, damage, sink);
         }

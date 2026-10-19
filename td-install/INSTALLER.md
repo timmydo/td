@@ -163,18 +163,22 @@ held through it from repeating, and reaches no page. With the list
 closed a left press is the page's click at the pointer's last position:
 on the destination step a listed disk's row selects that disk, hit
 against the first row the last frame showed rather than one a pending
-move would reveal, and a press anywhere else there or on another page
-does nothing. A click on a disk only selects, as Up and Down do;
-continuing is Return or the Next button below. Motion only moves the
-position, a left release acts only on a step button as below, and the
-wheel and the other buttons do nothing, so only F1 opens the list
-(no page has a Help button, td-ui's `keys::BUTTON`), it scrolls by its
-keys only, not the wheel, and F1, `q`, Escape or that click close it. A
-window test sends it motion, the wheel, a right press and releases,
-which leave it open and paint nothing, then a left press, which closes
-it with the page unchanged; another clicks each disk's row, the
-selected row again, an empty row, the heading and the detail, and the
-same place off the destination step.
+move would reveal; on settings a click focuses a field or works a
+chooser, as that step says; and a press anywhere else on those pages or
+on another page does nothing but press a step button below. A click on
+a disk only selects, as Up and Down do; continuing is Return or the
+Next button below. A click that changes the page stops a key held
+through it from repeating. Motion only moves the position, a left
+release acts only on a step button as below, the wheel scrolls only an
+open chooser list on settings, and the other buttons do nothing, so
+only F1 opens the key list (no page has a Help button, td-ui's
+`keys::BUTTON`), it scrolls by its keys only, not the wheel, and F1,
+`q`, Escape or that click close it. A window test sends it motion, the
+wheel, a right press and releases, which leave it open and paint
+nothing, then a left press, which closes it with the page unchanged;
+another clicks each disk's row, the selected row again, an empty row,
+the heading and the detail, and the same place off the destination
+step.
 The list's rows are spelled as td-ui's keymap spells chords
 (`Return`, `PageUp`, `S-Tab`), and `keys::check` holds every page's
 sections to that spelling; `--help` and this document name the keys
@@ -407,8 +411,32 @@ between fields; on the others Up, Down and Return do. The drafts, and a
 catalog already received, outlive a lost connection. The page displays
 bounded tokens and focus without treating wire admission as policy or
 catalog approval, and empty values may be shown before completion; the
-validation contract below applies before review. Return on the time zone row
-proposes the selected disk with the drafts, or says on the page's notice row
+validation contract below applies before review.
+
+Keyboard layout and time zone are drop-down choosers: each is a bordered
+box with a `▾` at its right, and opens a list of its entries, eight
+rows tall with a scrollbar when there are more, under the box, or over it
+when the footer leaves no room below. Space or `M-Down` on a chooser, or a
+left click on it, opens the list with the current choice selected and in
+view. While it is open it takes every key: on the time zone Up, Down,
+PageUp, PageDown, Home, End and typed characters choose as above and the
+rows follow the choice; Return, or a click on the open chooser, closes it
+keeping the choice; a click on a row chooses that entry and closes it;
+a click on the list's scrollbar or border does nothing; Escape, or a
+click anywhere else, closes it and puts back the zone it opened on,
+a click on another field also focusing it, and on the other chooser
+opening its list; Tab and S-Tab keep the choice and move on. Rows are hit
+as the list now stands, which the next frame shows. The wheel scrolls
+the open list without choosing, and does nothing while it is closed. A
+click on a text field focuses it, and with no list open a click off the
+fields changes nothing, so a seek in progress and a step button's first
+press survive it. The layout's list holds its one layout, `us`; a time
+zone list opens only once the catalog has arrived. While the time zone
+list is open the key list leads with its keys. So a Return that closes
+the list never proposes, and a press on a step button while a list is
+open only closes it, unchanged; an answer that leaves settings closes
+it keeping its choice. Return on the time zone row proposes the
+selected disk with the drafts, or says on the page's notice row
 which field is still empty; while the service reviews, the notice says so
 and a second Return proposes nothing. The service's review opens the review
 page, and its refusal is shown on the notice row in the installer's words
