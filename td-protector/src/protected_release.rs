@@ -2,9 +2,10 @@
 //! release", "PIN and dictionary-attack policy" and its "Lockout";
 //! DESIGN.md "Protected roles", "Release"): before the cap the chain
 //! check and its warning, the TPM PIN, a security key through `Fido`, the
-//! recovery key and the verified reseal; the cap; the released keyslot's
-//! test; then, once the selector holds the volume key (`finish`), the plan,
-//! the lockout's take or proof, the counter and its reset. A selector
+//! recovery key and the verified reseal or a requested PIN change; the
+//! cap; the released keyslot's test; then, once the selector holds the
+//! volume key (`finish`), a request's fate under its tag, the plan, the
+//! lockout's take or proof, the counter and its reset. A selector
 //! update's pre-seal (ENCRYPTION.md "Selector update") seals the PIN's
 //! released secret to the caller's predicted PCRs before the cap, and
 //! `write_tokens` runs its commit's token steps. Every TPM
@@ -40,6 +41,10 @@ pub const ANOTHER_WAY_PROMPT: &str =
 /// A reseal's new PIN, asked twice.
 pub const NEW_PIN_PROMPT: &str = "td new PIN: ";
 pub const NEW_PIN_AGAIN_PROMPT: &str = "td new PIN again: ";
+/// A requested PIN change's first entry (ENCRYPTION.md "PIN change").
+pub const CHANGE_PIN_PROMPT: &str = "td new PIN (empty to cancel): ";
+/// Printed after a TPM PIN release beside a pending PIN change.
+pub const PIN_CHANGE_REQUESTED: &str = "td: a TPM PIN change was requested";
 /// The reseal question, asked through secret-line so that nothing typed
 /// before it can answer it.
 pub const RESEAL_PROMPT: &str =
@@ -204,7 +209,8 @@ impl Key {
     }
 }
 
-/// A reseal's new tpm-pin protector, verified before the cap.
+/// A reseal's or a PIN change's new tpm-pin protector, verified before
+/// the cap.
 pub(crate) struct NewPin {
     pub(crate) token: TpmPin,
     pub(crate) secret: Secret,
@@ -217,6 +223,7 @@ pub struct Released {
     pub key: Key,
     pub method: Method,
     opened: Opened,
+    /// The confirmed reseal's protector, or a PIN change's (`new_pin`).
     reseal: Option<NewPin>,
     /// A selector update's pre-seal: the PIN's released secret sealed under
     /// the typed PIN to the predicted chain, naming no keyslot yet.
@@ -225,6 +232,9 @@ pub struct Released {
     capped: bool,
     /// What the chain check found of this TPM's storage primary.
     primary: Primary,
+    /// After a TPM PIN release beside a pending PIN change, its entry;
+    /// `reseal` holds the protector a `Sealed` one sealed.
+    new_pin: Option<request::NewPin>,
 }
 
 /// A staged selector update's predicted PCRs (ENCRYPTION.md "Selector
@@ -295,10 +305,11 @@ struct Chain {
 /// passing, the offered reseal, sealed and verified before the cap. The
 /// cap whenever a TPM device exists. After it, the released keyslot's
 /// test, a wrong key asking again for a security key or the recovery key.
-/// After a TPM PIN release `preseal` runs, still before the cap, and a
-/// prediction it returns is sealed under the typed PIN. No cryptsetup
+/// After a TPM PIN release a pending PIN change's new PIN is asked,
+/// sealed and verified, or else `preseal` runs, still before the cap, and
+/// a prediction it returns is sealed under the typed PIN. No cryptsetup
 /// command runs before the cap, and no secret but the one returned and a
-/// verified reseal's outlives this.
+/// verified reseal's or PIN change's outlives this.
 #[allow(clippy::too_many_arguments)]
 pub fn release<T: Tpm, C: Runner, F: Fido>(
     header: &Header,
@@ -372,6 +383,8 @@ fn released<T: Tpm, C: Runner, F: Fido>(
     let mut chain = Chain::default();
     let mut released = None;
     let mut predicted = None;
+    let mut new_pin = None;
+    let mut changed = None;
     match tpm.as_deref_mut() {
         None if shape == Shape::Tpm => console(NO_TPM),
         None => {}
@@ -380,11 +393,29 @@ fn released<T: Tpm, C: Runner, F: Fido>(
             if let Some((number, token)) = &chain.passed {
                 match pin_loop(*number, token, tpm, prompt, console) {
                     Ok(Some((secret, pin))) => {
-                        predicted = preseal(console)
-                            .and_then(|values| {
-                                seal_predicted(token, &values, &pin, &secret, tpm, console)
-                            })
-                            .map(Box::new);
+                        // A requested PIN change or else the pre-seal, never
+                        // both: a staged update waits for the next PIN boot.
+                        let change = request::pending(header)
+                            .is_some_and(|(_, request)| request.operation == Operation::PinChange);
+                        if change {
+                            match change_pin(header, *number, token, tpm, prompt, console) {
+                                Ok((entry, sealed)) => {
+                                    new_pin = Some(entry);
+                                    changed = sealed;
+                                }
+                                Err(reason) => return Outcome::Halt(reason),
+                            }
+                            console(
+                                "a staged selector update, if any, waits for a PIN boot \
+                                 without a PIN change request",
+                            );
+                        } else {
+                            predicted = preseal(console)
+                                .and_then(|values| {
+                                    seal_predicted(token, &values, &pin, &secret, tpm, console)
+                                })
+                                .map(Box::new);
+                        }
                         drop(pin);
                         released = Some((Opened::TpmPin { token: *number }, Key::Secret(secret)))
                     }
@@ -403,6 +434,7 @@ fn released<T: Tpm, C: Runner, F: Fido>(
         },
     };
     let mut reseal = match tpm.as_deref_mut() {
+        _ if changed.is_some() => changed,
         Some(tpm)
             if shape == Shape::Tpm
                 && chain.passed.is_none()
@@ -472,12 +504,17 @@ fn released<T: Tpm, C: Runner, F: Fido>(
                 }
                 // A reseal confirmed after a key that opens nothing is
                 // someone's, not the owner's: the next key's release must
-                // not install it.
+                // not install it. Nor a PIN change's, sealed under a PIN
+                // whose keyslot did not open.
+                let change = new_pin.take().is_some();
                 if reseal.take().is_some() {
-                    console(
+                    console(if change {
+                        "the PIN change sealed after that key is discarded: the old TPM PIN \
+                         and the request stay"
+                    } else {
                         "the reseal confirmed after that key is discarded: no keyslot is \
-                         added this boot",
-                    );
+                         added this boot"
+                    });
                 }
                 match another_way(&mut ways, prompt, console) {
                     Ok((next, next_key)) => {
@@ -506,13 +543,15 @@ fn released<T: Tpm, C: Runner, F: Fido>(
         predicted,
         capped,
         primary,
+        new_pin,
     })
 }
 
 /// What `finish` did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Finished {
-    /// The resealed protector's keyslot, once its test passed.
+    /// The resealed protector's keyslot, a PIN change's included, once its
+    /// test passed.
     pub resealed: Option<u8>,
     /// This boot took or proved the TPM's lockout authorization.
     pub lockout: bool,
@@ -550,7 +589,9 @@ pub fn finish<T: Tpm, C: Runner>(
         predicted,
         capped,
         primary: chain_primary,
+        new_pin,
     } = released;
+    let mut reseal = reseal;
     let mut finished = Finished::default();
     let dropped = |console: &mut dyn FnMut(&str)| {
         if predicted.is_some() {
@@ -559,9 +600,13 @@ pub fn finish<T: Tpm, C: Runner>(
     };
     let mut tpm = tpm.filter(|_| capped);
     let discard = |console: &mut dyn FnMut(&str), why: &str| {
-        console(&format!(
-            "the resealed protector is discarded before its import: {why}"
-        ))
+        console(&match new_pin {
+            Some(_) => format!(
+                "the new PIN's protector is discarded before its import: {why}; the old TPM PIN \
+                 and the request stay"
+            ),
+            None => format!("the resealed protector is discarded before its import: {why}"),
+        })
     };
     let shape = match protected_plan::check(header) {
         Ok(shape) => shape,
@@ -594,25 +639,35 @@ pub fn finish<T: Tpm, C: Runner>(
     let boot = Boot {
         opened,
         primary,
-        new_pin: None,
-        reseal: reseal.is_some(),
+        new_pin,
+        // A PIN change's protector is no confirmed reseal.
+        reseal: reseal.is_some() && new_pin.is_none(),
     };
-    let new = reseal.as_ref().map(|new| &new.token);
-    let mut said = None;
-    let planned = match (pending, uuid) {
-        (Some(_), Some(uuid)) => match request::fate(header, volume_key, &uuid, &boot) {
-            Some((number, fate)) => {
-                let resolved = resolve(fate, console);
-                said = removal_line(resolved).map(|line| (number, line));
-                request::plan(header, volume_key, &uuid, opened, new, number, resolved)
-            }
-            None => protected_plan::plan(header, opened, new),
-        },
+    let fated = match (pending, uuid) {
+        (Some(_), Some(uuid)) => request::fate(header, volume_key, &uuid, &boot)
+            .map(|(number, fate)| (uuid, number, resolve(fate, console))),
         (Some(_), None) => {
             console("td: a disk request stays: the volume's UUID is not a LUKS2 UUID");
-            protected_plan::plan(header, opened, new)
+            None
         }
-        (None, _) => protected_plan::plan(header, opened, new),
+        (None, _) => None,
+    };
+    // A PIN change's protector is installed only as the request it was
+    // sealed for, whose tag verified.
+    let changing = fated
+        .as_ref()
+        .is_some_and(|(_, _, resolved)| *resolved == Resolved::PinChange);
+    if new_pin == Some(request::NewPin::Sealed) && !changing && reseal.take().is_some() {
+        console("the new PIN's protector is discarded before the plan: the old TPM PIN stays");
+    }
+    let new = reseal.as_ref().map(|new| &new.token);
+    let mut said = None;
+    let planned = match fated {
+        Some((uuid, number, resolved)) => {
+            said = removal_line(resolved).map(|line| (number, line));
+            request::plan(header, volume_key, &uuid, opened, new, number, resolved)
+        }
+        None => protected_plan::plan(header, opened, new),
     };
     let plan = match planned {
         Ok(plan) => Some(plan),
@@ -695,11 +750,16 @@ pub fn finish<T: Tpm, C: Runner>(
                 };
                 finished.resealed =
                     run_steps(plan.steps(), device, &keys, said, cryptsetup, console);
-                if let Some(slot) = finished.resealed {
-                    console(&format!(
+                match finished.resealed {
+                    Some(slot) if changing => console(&format!(
+                        "td: the TPM PIN is changed: keyslot {slot} holds the new PIN's \
+                         protector, verified before the cap"
+                    )),
+                    Some(slot) => console(&format!(
                         "reseal: keyslot {slot} holds a TPM PIN protector sealed to this boot \
                          chain, verified before the cap"
-                    ));
+                    )),
+                    None => {}
                 }
             }
             (None, _) => discard(
@@ -813,7 +873,8 @@ fn removal_line(resolved: Resolved) -> Option<&'static str> {
         Resolved::Superseded => {
             "td: removed the PIN change request: the confirmed reseal sets a new TPM PIN"
         }
-        Resolved::Left | Resolved::PinChange | Resolved::Clear | Resolved::Reenroll => return None,
+        Resolved::PinChange => "td: removed the PIN change request: its new PIN is installed next",
+        Resolved::Left | Resolved::Clear | Resolved::Reenroll => return None,
     })
 }
 
@@ -1199,17 +1260,7 @@ fn offer_reseal<T: Tpm>(
     prompt: &mut dyn Prompt,
     console: &mut dyn FnMut(&str),
 ) -> Result<Option<NewPin>, String> {
-    let placeholder = TpmPin {
-        keyslot: None,
-        pcrs: PinPcrs::Selector,
-        primary: [0; PRIMARY_NAME_LEN],
-        salt: [0; SALT_LEN],
-        sealed: SealedObject {
-            public: vec![0],
-            private: vec![0],
-        },
-    };
-    if let Err(refusal) = protected_plan::plan(header, opened, Some(&placeholder)) {
+    if let Err(refusal) = protected_plan::plan(header, opened, Some(&placeholder())) {
         console(&format!("no reseal is offered: {refusal}"));
         return Ok(None);
     }
@@ -1294,13 +1345,107 @@ fn offer_reseal<T: Tpm>(
     ))
 }
 
+/// A protector standing in for one not yet sealed, for asking a planner
+/// before any PIN is typed whether it would admit one.
+fn placeholder() -> TpmPin {
+    TpmPin {
+        keyslot: None,
+        pcrs: PinPcrs::Selector,
+        primary: [0; PRIMARY_NAME_LEN],
+        salt: [0; SALT_LEN],
+        sealed: SealedObject {
+            public: vec![0],
+            private: vec![0],
+        },
+    }
+}
+
 /// Two entries the PIN codec admits that are equal.
 pub(crate) fn new_pin(
     prompt: &mut dyn Prompt,
     console: &mut dyn FnMut(&str),
 ) -> Result<Pin, String> {
     loop {
-        let first = entry(prompt, NEW_PIN_PROMPT, "new PIN", console)?;
+        if let Some(pin) = new_pin_from(prompt, NEW_PIN_PROMPT, false, console)? {
+            return Ok(pin);
+        }
+    }
+}
+
+/// A requested PIN change after a TPM PIN release by `token`, before the
+/// cap (ENCRYPTION.md "PIN change"): the new PIN, an empty first entry
+/// declining it, sealed under the recorded primary to the token's PCRs
+/// as they read now and verified with one Unseal. A seal that fails
+/// keeps the old PIN. As for the reseal, nothing is asked where `finish`
+/// would discard the object: with no lockout token to anchor it, or a
+/// plan the planner refuses. `Err` is the halt reason of an entry's end.
+fn change_pin<T: Tpm>(
+    header: &Header,
+    number: u8,
+    token: &TpmPin,
+    tpm: &mut T,
+    prompt: &mut dyn Prompt,
+    console: &mut dyn FnMut(&str),
+) -> Result<(request::NewPin, Option<NewPin>), String> {
+    console(PIN_CHANGE_REQUESTED);
+    let refused = if protected_plan::lockout(header).is_none() {
+        Some("this volume holds no lockout token to anchor the new PIN's protector".to_string())
+    } else {
+        protected_plan::pin_change(header, Opened::TpmPin { token: number }, &placeholder())
+            .err()
+            .map(|refusal| refusal.to_string())
+    };
+    if let Some(why) = refused {
+        console(&format!(
+            "no PIN change: {why}; the old TPM PIN and the request stay"
+        ));
+        return Ok((request::NewPin::Failed, None));
+    }
+    console(PIN_KEYS);
+    let Some(pin) = new_pin_from(prompt, CHANGE_PIN_PROMPT, true, console)? else {
+        console("td: the PIN change is declined: the plan removes its request");
+        return Ok((request::NewPin::Declined, None));
+    };
+    let policy = match tpm
+        .open()
+        .map_err(ObserveError::Tpm)
+        .and_then(|mut client| observe_pin(&mut client, token.pcrs))
+    {
+        Ok(policy) => policy,
+        Err(error) => {
+            console(&format!("no PIN change: {error}; the old TPM PIN stays"));
+            return Ok((request::NewPin::Failed, None));
+        }
+    };
+    Ok(
+        match seal_new(
+            policy,
+            Some(token.primary),
+            &pin,
+            tpm,
+            "no PIN change",
+            console,
+        ) {
+            Some(sealed) => (request::NewPin::Sealed, Some(sealed)),
+            None => (request::NewPin::Failed, None),
+        },
+    )
+}
+
+/// One new PIN entered twice, the first at `first_prompt`, asked again
+/// until both agree and the codec admits it; `None` when `cancel` lets an
+/// empty first entry decline.
+fn new_pin_from(
+    prompt: &mut dyn Prompt,
+    first_prompt: &str,
+    cancel: bool,
+    console: &mut dyn FnMut(&str),
+) -> Result<Option<Pin>, String> {
+    loop {
+        let first = entry(prompt, first_prompt, "new PIN", console)?;
+        if cancel && first.as_bytes().is_empty() {
+            return Ok(None);
+        }
         let pin = match Pin::parse(first.as_bytes()) {
             Ok(pin) => pin,
             Err(error) => {
@@ -1310,7 +1455,7 @@ pub(crate) fn new_pin(
         };
         let second = entry(prompt, NEW_PIN_AGAIN_PROMPT, "new PIN", console)?;
         if first.as_bytes() == second.as_bytes() {
-            return Ok(pin);
+            return Ok(Some(pin));
         }
         console("td: the two PINs differ: enter the new PIN again");
     }
@@ -2487,14 +2632,18 @@ pub(crate) mod tests {
         }
 
         fn enroll_pin(&mut self, number: u8, slot: u8, pin: &[u8]) -> TpmPin {
-            let policy = observe_pin(&mut self.model.wire.client(), PinPcrs::Selector).unwrap();
+            self.enroll_pin_with(number, slot, pin, PinPcrs::Selector)
+        }
+
+        fn enroll_pin_with(&mut self, number: u8, slot: u8, pin: &[u8], pcrs: PinPcrs) -> TpmPin {
+            let policy = observe_pin(&mut self.model.wire.client(), pcrs).unwrap();
             let salt = [number; SALT_LEN];
             let auth = Pin::parse(pin).ok().unwrap().auth_value(&salt);
             let secret = Secret::generate().unwrap();
             let sealed = self.model.seal_pin(&policy, None, &auth, &secret).unwrap();
             let token = TpmPin {
                 keyslot: Some(slot),
-                pcrs: PinPcrs::Selector,
+                pcrs,
                 primary: sealed.primary_name.try_into().unwrap(),
                 salt,
                 sealed: sealed.object,
@@ -4049,10 +4198,12 @@ pub(crate) mod tests {
             Operation::TpmReenroll,
         ] {
             for pin in [true, false] {
-                let script = if pin {
-                    vec![say(PIN)]
-                } else {
-                    vec![say(b""), say(RECOVERY)]
+                // A PIN change's new PIN is asked before the tag can be
+                // checked: declined here.
+                let script = match (pin, operation) {
+                    (true, Operation::PinChange) => vec![say(PIN), say(b"")],
+                    (true, _) => vec![say(PIN)],
+                    (false, _) => vec![say(b""), say(RECOVERY)],
                 };
                 let mut world = World::tpm_shape();
                 world.taken(&[0x42; 32]);
@@ -4117,12 +4268,10 @@ pub(crate) mod tests {
         world.plug(CRED_PRIMARY, 1);
         released(&world.boot(vec![say(b""), say(KEY_PIN)]), &world);
         assert!(world.has(UNPROVEN));
-        // A PIN change by another protector, or at a PIN release before
-        // its new PIN is asked, stays; so does a clear or a re-enrollment
-        // whose question this boot asks none of.
+        // A PIN change by another protector stays; so does a clear or a
+        // re-enrollment whose question this boot asks none of.
         for (operation, script) in [
             (Operation::PinChange, vec![say(b""), say(RECOVERY)]),
-            (Operation::PinChange, vec![say(PIN)]),
             (Operation::TpmClear, vec![say(PIN)]),
             (Operation::TpmClear, vec![say(b""), say(RECOVERY)]),
         ] {
@@ -4257,5 +4406,193 @@ pub(crate) mod tests {
         assert!(world.has(&format!("say {}", request::UNVERIFIED)));
         assert!(world.at(REMOVED) < world.at("cs add 3 by 0"));
         assert!(!world.pending());
+    }
+
+    /// A PIN boot's PIN change: the new PIN twice.
+    fn change_script() -> Vec<Say> {
+        vec![say(PIN), say(NEW_PIN), say(NEW_PIN)]
+    }
+
+    /// The new PIN is asked after the PIN release and sealed and verified
+    /// before the cap, in place of the pre-seal; after the cap, with the
+    /// tag verified and the lockout proved, the reseal's order installs it
+    /// and removes the request just before its import.
+    #[test]
+    fn a_pin_change_is_sealed_before_the_cap_and_installed_as_a_reseal() {
+        let mut world = World::tpm_shape();
+        world.taken(&[0x42; 32]);
+        world.predict = Some(Predicted {
+            pcr4: [4; 32],
+            pcr7: [7; 32],
+            pcr9: [9; 32],
+        });
+        world.request(Operation::PinChange, true);
+        let run = world.boot(change_script());
+        assert_eq!(released(&run, &world), (1, Method::TpmPin));
+        let order = [
+            "say td: a TPM PIN change was requested",
+            &format!("ask {CHANGE_PIN_PROMPT}"),
+            &format!("ask {NEW_PIN_AGAIN_PROMPT}"),
+            "tpm seal expects recorded true",
+            "say the new TPM PIN protector verifies before the cap",
+            "cs test 1 ok",
+            "tpm lockout",
+            "cs add 3 by 1",
+            REMOVED,
+            "say td: removed the PIN change request",
+            "cs import 4 tpm-pin",
+            "cs test 3 ok",
+            "say td: the TPM PIN is changed: keyslot 3",
+        ];
+        let at: Vec<usize> = order.iter().map(|entry| world.at(entry)).collect();
+        assert!(at.windows(2).all(|w| w[0] < w[1]), "{:?}", world.lines());
+        // The key positions again, before the new PIN.
+        assert_eq!(world.count(&format!("say {PIN_KEYS}")), 2);
+        // Never both: no pre-seal, and so no update's protector.
+        assert!(!world.has("preseal"));
+        assert_eq!(run.finished.unwrap().predicted, None);
+        assert!(!world.pending());
+        // The new PIN opens the next boot; the old one is gone.
+        let run = world.boot(vec![say(NEW_PIN)]);
+        assert_eq!(released(&run, &world), (3, Method::TpmPin));
+        assert!(!world.disk.keyslots.contains_key(&1));
+    }
+
+    /// A SecureBoot token's new PIN keeps PCR 7.
+    #[test]
+    fn a_pin_change_keeps_the_tokens_pcrs() {
+        let mut world = World::empty();
+        world.model.wire.0.borrow_mut().pcrs[7] = [0x70; 32];
+        world.enroll_pin_with(1, 1, PIN, PinPcrs::SecureBoot);
+        world.enroll_fido(2, 2, FidoRole::Recovery, CRED_RECOVERY);
+        world.taken(&[0x42; 32]);
+        world.request(Operation::PinChange, true);
+        released(&world.boot(change_script()), &world);
+        let Some(Token::TpmPin(new)) = world.disk.tokens.get(&4) else {
+            panic!("no new tpm-pin token: {:?}", world.lines());
+        };
+        assert_eq!(new.pcrs, PinPcrs::SecureBoot);
+    }
+
+    /// An empty first entry declines: nothing is sealed, the plan removes
+    /// the request, and the old PIN stays.
+    #[test]
+    fn a_declined_pin_change_is_removed() {
+        let mut world = World::tpm_shape();
+        world.taken(&[0x42; 32]);
+        world.request(Operation::PinChange, true);
+        world.predict = Some(Predicted {
+            pcr4: [4; 32],
+            pcr7: [7; 32],
+            pcr9: [9; 32],
+        });
+        let run = world.boot(vec![say(PIN), say(b"")]);
+        assert_eq!(released(&run, &world), (1, Method::TpmPin));
+        assert!(!world.has("tpm seal") && !world.has("preseal"));
+        assert!(world.at(REMOVED) < world.at("say td: removed the declined disk request"));
+        assert!(!world.pending());
+        assert_eq!(
+            released(&world.boot(vec![say(PIN)]), &world),
+            (1, Method::TpmPin)
+        );
+    }
+
+    /// A PIN change whose seal fails keeps the old PIN and the request;
+    /// one whose tag fails, or whose seal no lockout token anchors, is
+    /// discarded before any keyslot is added.
+    #[test]
+    fn a_pin_change_that_cannot_be_installed_keeps_the_old_pin() {
+        for fault in ["fail", "verify", "oversize"] {
+            let mut world = World::tpm_shape();
+            world.taken(&[0x42; 32]);
+            world.request(Operation::PinChange, true);
+            world.model.state.borrow_mut().seal_fault = Some(fault);
+            released(&world.boot(change_script()), &world);
+            assert!(world.at("say no PIN change: ") < world.at("cs test 1 ok"));
+            assert!(world.has(STAYS) && world.pending(), "{fault}");
+            assert!(!world.has("cs add"));
+        }
+        // The tag fails: discarded, and the request removed.
+        let mut world = World::tpm_shape();
+        world.taken(&[0x42; 32]);
+        world.request(Operation::PinChange, false);
+        released(&world.boot(change_script()), &world);
+        assert!(world.has("say the new PIN's protector is discarded before the plan"));
+        assert!(world.has(&format!("say {}", request::UNVERIFIED)));
+        assert!(!world.has("cs add") && !world.pending());
+        assert_eq!(
+            released(&world.boot(vec![say(PIN)]), &world),
+            (1, Method::TpmPin)
+        );
+        // No lockout token to anchor it: no new PIN is asked.
+        let mut world = World::tpm_shape();
+        world.request(Operation::PinChange, true);
+        released(&world.boot(vec![say(PIN)]), &world);
+        assert!(world.has("say no PIN change: this volume holds no lockout token"));
+        assert!(!world.has(&format!("ask {CHANGE_PIN_PROMPT}")) && !world.has("tpm seal"));
+        // Nor where the planner refuses: a header with no recovery-key
+        // marker, which the reader admits and the tag does not cover.
+        let mut world = World::tpm_shape();
+        world.taken(&[0x42; 32]);
+        world.disk.tokens.remove(&0);
+        world.request(Operation::PinChange, true);
+        released(&world.boot(vec![say(PIN)]), &world);
+        assert!(world.has("say no PIN change: the LUKS2 header has no recovery-key marker"));
+        assert!(!world.has(&format!("ask {CHANGE_PIN_PROMPT}")) && world.pending());
+        // A lockout proof refused with the hierarchy locked out runs no
+        // plan: the request and the old PIN stay.
+        let mut world = World::tpm_shape();
+        world.taken(&[0x42; 32]);
+        world.request(Operation::PinChange, true);
+        world.model.state.borrow_mut().hierarchy_locked = true;
+        released(&world.boot(change_script()), &world);
+        assert!(world.has("say the new PIN's protector is discarded before its import"));
+        assert!(!world.has("cs add") && world.pending());
+        world.model.state.borrow_mut().hierarchy_locked = false;
+        assert_eq!(
+            released(&world.boot(vec![say(PIN), say(b"")]), &world),
+            (1, Method::TpmPin)
+        );
+        // A PIN whose keyslot does not open installs nothing: the next
+        // key's release keeps the request for a PIN boot.
+        let mut world = World::tpm_shape();
+        world.taken(&[0x42; 32]);
+        world.request(Operation::PinChange, true);
+        world.disk.keyslots.insert(1, vec![0x13; SECRET_LEN]);
+        let mut script = change_script();
+        script.push(say(RECOVERY));
+        assert_eq!(
+            released(&world.boot(script), &world),
+            (0, Method::RecoveryKey)
+        );
+        assert!(world.has("say the PIN change sealed after that key is discarded"));
+        assert!(!world.has("cs add") && world.has(STAYS) && world.pending());
+        // End of input at the new PIN halts, as at the reseal's.
+        let mut world = World::tpm_shape();
+        world.taken(&[0x42; 32]);
+        world.request(Operation::PinChange, true);
+        let run = world.boot(vec![say(PIN), say(NEW_PIN), Say::Eof]);
+        assert!(run.halt.is_some() && !world.has("cs test"));
+    }
+
+    /// At the reseal's new PIN an empty entry is the codec's refusal, not
+    /// a decline.
+    #[test]
+    fn an_empty_new_pin_at_the_reseal_asks_again() {
+        let mut world = changed();
+        let run = world.boot(vec![
+            say(RECOVERY),
+            say(b"reseal"),
+            say(b""),
+            say(NEW_PIN),
+            say(NEW_PIN),
+        ]);
+        assert_eq!(released(&run, &world), (0, Method::RecoveryKey));
+        assert_eq!(world.count(&format!("ask {NEW_PIN_PROMPT}")), 2);
+        assert!(world
+            .lines()
+            .iter()
+            .any(|line| line.ends_with(": enter the new PIN again")));
+        assert!(run.finished.unwrap().resealed.is_some());
     }
 }

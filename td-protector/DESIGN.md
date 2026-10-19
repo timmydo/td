@@ -687,10 +687,10 @@ them. Protector management's planners (8g, below) are current: the
 storage worker plans through `manage` and seals requests, and the
 selector's protected release checks a request's tag. It removes one
 whose tag fails, a re-enrollment on the recorded primary, and a clear or
-re-enrollment with no TPM td can prove. It carries none out yet: it asks
-no TPM clear's or re-enrollment's question, so such a request stays, as
-a PIN change does. The lockout's clear and the secure-boot and
-config tokens are not current.
+re-enrollment with no TPM td can prove. It carries out a PIN change. It
+asks no TPM clear's or re-enrollment's question yet, so such a request
+stays. The lockout's clear and the secure-boot and config tokens are not
+current.
 
 **Lockout.** `lockout::seal(volume_key, uuid, l, name)` and `open`
 implement ENCRYPTION.md's lockout token: HKDF-SHA256 over the volume key
@@ -1386,6 +1386,15 @@ Its choices beyond ENCRYPTION.md's text, each failing closed:
   refuses a re-enrollment after one.
 - A PIN release beside a pending PIN change whose entry the selector did
   not take leaves it.
+- Beside a pending PIN change a PIN release runs no pre-seal, whether
+  the new PIN is then entered, declined or fails to seal, or its tag
+  fails: the staged update waits for a PIN boot without one.
+- As for the reseal, no new PIN is asked with no lockout token on the
+  header, or a plan the planner refuses: the request stays. One whose
+  lockout take or proof then fails is discarded as a reseal is, and its
+  request stays for the next PIN boot.
+- The new PIN is sealed to the released token's PCRs, under the primary
+  it records, and verified with one Unseal, as a reseal's is.
 - A reseal beside a pending clear or re-enrollment is refused
   (`NoReseal`).
 - `protected_plan::pin_change` is a reseal after a TPM PIN release.

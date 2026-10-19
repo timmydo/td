@@ -3153,6 +3153,7 @@ pub(crate) mod tests {
             protected::ANOTHER_WAY_PROMPT,
             protected::NEW_PIN_PROMPT,
             protected::NEW_PIN_AGAIN_PROMPT,
+            protected::CHANGE_PIN_PROMPT,
             protected::RESEAL_PROMPT,
             "td security key PIN (255 attempts left): ",
         ] {
