@@ -2066,6 +2066,16 @@ results or report an exact total before computing it. Exhausted work/time
 budgets return the appropriate explicit error; attachment binary contents are
 not decoded as documents. Index build, rebuild and query must obey section 5.
 
+The active PostgreSQL search walks date/mailbox-filtered candidates in windows
+of 32 within one authenticated snapshot. One method work budget and deadline
+cover all candidate verification, header decoding, MIME traversal and matching;
+neither a page nor a message renews them. Only the result page and bounded
+decoded headers are retained, with streamed text bodies and fixed HTML
+extraction state. Matching uses at most 64 substring automata over a 4096-byte
+operand, with field-local phrase progress and simple Unicode lowercase.
+POLICY.md owns supported sources and explicit embedded-message refusal.
+This is a functional bounded scan, not a full-text index or throughput claim.
+
 ## 11. Submission and retry semantics
 
 [QUEUE.md](QUEUE.md) owns the exact transition, cancellation, retry and standard

@@ -29,6 +29,19 @@ leave queued moves unapplied; restarting td-mail with replacement credentials
 replays its durable flag and archive intentions. The creation profile is
 name-only root folders. Singleton deletion removes empty roleless leaves;
 hierarchy creation and rename remain absent.
+The native read fixture also exercises td-mail search and pagination with
+five received messages, including equal timestamps across page boundaries.
+It checks case-insensitive text, decoded UTF-8 body text and phrases, tokens
+spread across headers and body, inclusive after/exclusive before dates,
+HTML text with suppressed style content, attachment filenames, combined
+filters, empty pages and invalid-date/oversized-text refusals. Moving a match
+between folders and deleting the corpus verifies fresh mailbox-scoped results.
+This is bounded functional coverage, not a large-mailbox performance claim.
+The active text-search profile covers root From/To/Cc/Bcc/Subject headers,
+filenames and text MIME parts, using the shared HTML extraction policy.
+Embedded message content currently causes an explicit interpretation error;
+it is not silently omitted from search. Query work or deadline exhaustion
+also refuses the method rather than returning a partial match page.
 EventSource emits pings only; Mail StateChange integration remains absent and
 is not used by td-mail. Activation follows
 the supported td-mail workflow tests, not every reference-table row.

@@ -386,6 +386,8 @@ pub(super) fn exercise(
             let listing = client.ask(json!({"command":"list_mailboxes"}));
             assert!(listing["ok"].is_true(), "{listing}");
             assert!(!listing["mailboxes"].as_array().unwrap().iter().any(|folder| folder["id"].as_str()==Some(archive_wire)));
+            exercise_queries(&mut client, request, trust, &cloud_binding, inbox_wire,
+                listing["mailboxes"].as_array().unwrap().iter().find(|folder| folder["name"].as_str()==Some("Child")).unwrap()["id"].as_str().unwrap(), email["id"].as_str().unwrap());
             let usage_before = sql(fixture, "SELECT body_bytes||':'||blob_count FROM td_mta.account_usage");
             let extra = postgres_receiving::prepare(&cloud_binding, &postgres_receiving::Message {
                 bytes: message.as_bytes(), hostname: "localhost", extended: true, header_bytes: 65536,
@@ -713,6 +715,203 @@ pub(super) fn exercise(
         "0"
     );
     assert_eq!(sql(fixture, &format!("SELECT count(*) FROM td_mta.changes WHERE kind=1 AND action=3 AND object=decode('{recovered}','hex')")), "1");
+}
+
+fn exercise_queries(
+    client: &mut Client,
+    request: &Request<'_>,
+    trust: &TrustStore,
+    binding: &Binding,
+    inbox: &str,
+    other: &str,
+    original: &str,
+) {
+    use td_mta::{
+        format::row::{ReceiptRecipients, ReceiptTls, SmtpReceipt},
+        postgres_receiving,
+    };
+    let mut recipient_bytes = [0; 256];
+    let recipients =
+        ReceiptRecipients::encode(&["main@example.test"], &mut recipient_bytes).unwrap();
+    let mut messages = Vec::new();
+    // Equal received dates must remain distinct across page boundaries.
+    for (index, day) in [0, 1, 1, 2, 3].into_iter().enumerate() {
+        let received = 1_704_067_200_000 + day * 86_400_000;
+        let subject = if index == 4 {
+            "Unrelated heading"
+        } else {
+            "Orchard report"
+        };
+        let (kind, body) = if index == 4 {
+            (
+                "text/html",
+                format!("<style>hiddenneedle</style><p>Orchard caf=C3=A9 harvest {index}</p>"),
+            )
+        } else {
+            ("text/plain", format!("Orchard caf=C3=A9 harvest {index}"))
+        };
+        let message = format!(
+            "From: Gardener <gardener@example.test>\r\nTo: main@example.test\r\nSubject: {subject}\r\nMessage-ID: <query-{index}@example.test>\r\nMIME-Version: 1.0\r\nContent-Type: {kind}; charset=utf-8\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n{body}\r\n"
+        );
+        let delivery = postgres_receiving::prepare(
+            binding,
+            &postgres_receiving::Message {
+                bytes: message.as_bytes(),
+                hostname: "localhost",
+                extended: true,
+                header_bytes: 65536,
+                received_at: received,
+                receipt: SmtpReceipt {
+                    peer: "192.0.2.1".parse().unwrap(),
+                    tls: ReceiptTls::Tls13,
+                    gateway: None,
+                    ehlo: "sender.example.test",
+                    reverse_path: "sender@example.test",
+                    recipients,
+                },
+            },
+            deadline(),
+        )
+        .unwrap();
+        postgres_receiving::publish(request, trust, deadline(), &delivery).unwrap();
+        let mut wire = [0; td_mta::wire::IdKind::WIRE_BYTES];
+        let wire = td_mta::wire::encode_id(delivery.email(), &mut wire)
+            .unwrap()
+            .to_owned();
+        messages.push((received, wire));
+    }
+    // Wire IDs use canonical hex, so lexical ID order is the raw-ID tie-break.
+    messages.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    let ids: Vec<&str> = messages.iter().map(|(_, id)| id.as_str()).collect();
+    let check = |reply: Json, position: u64, expected: &[&str]| {
+        assert!(reply["ok"].is_true(), "{reply}");
+        assert_eq!(reply["position"].as_u64(), Some(position), "{reply}");
+        assert_eq!(
+            reply["loaded"].as_u64(),
+            Some(expected.len() as u64),
+            "{reply}"
+        );
+        let actual: Vec<&str> = reply["emails"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|email| email["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(actual, expected, "{reply}");
+    };
+    for position in [0, 3, 5] {
+        let end = (position + 3).min(ids.len());
+        check(
+            client.ask(json!({"command":"query_emails", "mailbox_id":inbox,
+                "limit":3, "position":position, "search":"oRcHaRd"})),
+            position as u64,
+            &ids[position..end],
+        );
+    }
+    // This uses the native indexed date path, without the text-search scanner.
+    check(
+        client.ask(json!({"command":"query_emails", "mailbox_id":inbox,
+        "limit":2, "position":2, "received_after":"2024-01-01T00:00:00Z"})),
+        2,
+        &ids[2..4],
+    );
+    for search in ["CAFÉ", "\"café harvest\"", "gardener orchard"] {
+        check(
+            client.ask(json!({"command":"query_emails", "mailbox_id":inbox,
+            "search":search})),
+            0,
+            &ids,
+        );
+    }
+    check(
+        client.ask(json!({"command":"query_emails", "mailbox_id":inbox,
+        "search":"bytes.bin"})),
+        0,
+        &[original],
+    );
+    // after is inclusive; before is exclusive, even with a text condition.
+    check(
+        client.ask(json!({"command":"query_emails", "mailbox_id":inbox,
+        "search":"orchard", "received_after":"2024-01-02T00:00:00Z",
+        "received_before":"2024-01-03T00:00:00Z"})),
+        0,
+        &ids[2..4],
+    );
+    check(
+        client.ask(json!({"command":"query_emails", "mailbox_id":inbox,
+        "received_after":"2024-01-02T00:00:00Z",
+        "received_before":"2024-01-02T00:00:00Z"})),
+        0,
+        &[],
+    );
+    check(
+        client.ask(json!({"command":"query_emails", "mailbox_id":inbox,
+        "search":"orchard absent-token"})),
+        0,
+        &[],
+    );
+    let invalid = client.ask(json!({"command":"query_emails", "mailbox_id":inbox,
+        "received_after":"not-a-date"}));
+    assert!(
+        !invalid["ok"].is_true(),
+        "invalid date must not become an empty success: {invalid}"
+    );
+    check(
+        client.ask(json!({"command":"query_emails", "mailbox_id":inbox,
+        "search":"hiddenneedle"})),
+        0,
+        &[],
+    );
+    check(
+        client.ask(json!({"command":"query_emails", "mailbox_id":inbox,
+        "search":"\"client Hello\""})),
+        0,
+        &[],
+    );
+    let invalid = client.ask(json!({"command":"query_emails", "mailbox_id":inbox,
+        "search":"x".repeat(4097)}));
+    assert!(!invalid["ok"].is_true(), "oversized operand: {invalid}");
+    let moved = client.ask(json!({"command":"move_email", "id":ids[0], "to_mailbox_id":other}));
+    assert!(moved["ok"].is_true(), "{moved}");
+    check(
+        client.ask(json!({"command":"query_emails", "mailbox_id":inbox,
+        "search":"orchard"})),
+        0,
+        &ids[1..],
+    );
+    check(
+        client.ask(json!({"command":"query_emails", "mailbox_id":other,
+        "search":"orchard"})),
+        0,
+        &ids[..1],
+    );
+    for id in ids {
+        let deleted = client.ask(json!({"command":"destroy", "id":id}));
+        assert!(deleted["results"][0]["ok"].is_true(), "{deleted}");
+    }
+    check(
+        client.ask(json!({"command":"query_emails", "mailbox_id":inbox,
+        "search":"orchard"})),
+        0,
+        &[],
+    );
+    let nested = postgres_receiving::prepare(binding, &postgres_receiving::Message {
+        bytes: b"From: sender@example.test\r\nTo: main@example.test\r\nSubject: Nested\r\nMIME-Version: 1.0\r\nContent-Type: message/rfc822\r\n\r\nFrom: inner@example.test\r\nSubject: Orchard\r\n\r\nNested content\r\n",
+        hostname: "localhost", extended: true, header_bytes: 65536, received_at: 1_704_067_200_000,
+        receipt: SmtpReceipt { peer: "192.0.2.1".parse().unwrap(), tls: ReceiptTls::Tls13,
+            gateway: None, ehlo: "sender.example.test", reverse_path: "sender@example.test", recipients },
+    }, deadline()).unwrap();
+    postgres_receiving::publish(request, trust, deadline(), &nested).unwrap();
+    let mut wire = [0; td_mta::wire::IdKind::WIRE_BYTES];
+    let wire = td_mta::wire::encode_id(nested.email(), &mut wire).unwrap();
+    let refused = client.ask(json!({"command":"query_emails", "mailbox_id":inbox,
+        "search":"orchard"}));
+    assert!(
+        !refused["ok"].is_true(),
+        "embedded content must not silently disappear: {refused}"
+    );
+    let deleted = client.ask(json!({"command":"destroy", "id":wire}));
+    assert!(deleted["results"][0]["ok"].is_true(), "{deleted}");
 }
 
 fn exercise_send(

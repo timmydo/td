@@ -27,6 +27,8 @@ mod submission_query;
 
 #[path = "email_query.rs"]
 mod email_query;
+#[path = "email_search.rs"]
+mod email_search;
 
 #[path = "email_get.rs"]
 mod email_get;
@@ -433,6 +435,14 @@ fn reborrow_read<'short, 'long: 'short>(
 
 // This preparation seam disappears with the local database adapter at cutover.
 trait MailRead: crate::email_response::Source<Error = crate::postgres_read::Error> {
+    fn search_email(
+        &mut self,
+        id: crate::ids::EmailId,
+        limits: &crate::limits::Limits,
+        search: &mut email_search::Search,
+        clock: &dyn ports::Clock,
+        work: &mut crate::admission::work::Meter,
+    ) -> Result<bool, Error>;
     fn identity(&self) -> ports::ViewIdentity;
     fn check(&mut self) -> Result<(), Error>;
     fn mailboxes(&mut self) -> Result<Vec<crate::postgres_mailboxes::Mailbox>, Error>;
@@ -469,6 +479,22 @@ trait MailRead: crate::email_response::Source<Error = crate::postgres_read::Erro
     ) -> Result<(), Error>;
 }
 impl MailRead for crate::postgres_read::Snapshot<'_> {
+    fn search_email(
+        &mut self,
+        id: crate::ids::EmailId,
+        limits: &crate::limits::Limits,
+        search: &mut email_search::Search,
+        clock: &dyn ports::Clock,
+        work: &mut crate::admission::work::Meter,
+    ) -> Result<bool, Error> {
+        let mut result = Err(Error::State);
+        self.with_pinned_body(id, |_, pin| {
+            result = email_get::search_verified(pin, limits, search, clock, work);
+            Ok(())
+        })
+        .map_err(postgres_read_error)?;
+        result
+    }
     fn identity(&self) -> ports::ViewIdentity {
         self.identity()
     }
@@ -956,7 +982,11 @@ impl Worker<'_, '_, '_, '_, '_> {
         } else if name == "Thread/get" {
             self.thread_get(start..end, responses.request().envelope.maximum_objects)
         } else if name == "Email/query" {
-            self.email_query(start..end, responses.request().envelope.query_page)
+            self.email_query(
+                start..end,
+                responses.request().envelope.query_page,
+                &responses.request().envelope.mail_limits,
+            )
         } else if name == "Mailbox/query" || name == "Mailbox/queryChanges" {
             Err(Error::UnknownMethod)
         } else if name == "Mailbox/get" {

@@ -128,6 +128,7 @@ impl Default for Selection {
         Self::new()
     }
 }
+pub(super) use body::search_verified;
 pub use body::{write_verified, Output};
 pub(super) struct BodyProjection<'a> {
     pub metadata: crate::email_response::EmailMetadata,

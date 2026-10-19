@@ -1,5 +1,7 @@
 //! Bounded per-message composition over one verified account snapshot.
 use super::{storage, Error, Selection, Worker};
+#[path = "email_search_body.rs"]
+mod search;
 use crate::{
     admission::work::Meter,
     blob_structure,
@@ -13,6 +15,7 @@ use crate::{
     ports::{BlobReader, Clock, Tick},
     store_fs::PinnedBlob,
 };
+pub(in crate::jmap_request::dispatch) use search::search_verified;
 
 pub(super) fn buffer<T: Default + Clone>(count: usize) -> Result<Vec<T>, Error> {
     let mut result = Vec::new();
@@ -140,6 +143,78 @@ pub fn write_verified(
     }
     result
 }
+struct HeaderBacking<'a> {
+    arena: &'a mut [u8],
+    budget: &'a mut HeaderBudget,
+    scratch: &'a mut Scratch,
+}
+fn write_headers(
+    worker: &mut impl Output,
+    pin: &mut PinnedBlob<'_, '_>,
+    settings: (&Limits, &Selection),
+    clock: &dyn Clock,
+    work: &mut Meter,
+    backing: HeaderBacking<'_>,
+) -> Result<(), Error> {
+    let (limits, selected) = settings;
+    let mut chunk = [0; 4096];
+    if !selected.headers.is_empty() {
+        let mut properties = Vec::new();
+        properties
+            .try_reserve_exact(selected.headers.len())
+            .map_err(|_| Error::ResponseCapacity)?;
+        for name in &selected.headers {
+            let name = std::str::from_utf8(name.bytes()).map_err(|_| Error::State)?;
+            let mut parser =
+                crate::header_property::Cursor::new(name, crate::header_property::Context::Email);
+            loop {
+                if let crate::header_property::Status::Complete(property) =
+                    parser.poll(now(clock)?, work).map_err(mime)?
+                {
+                    properties.push(property.ok_or(Error::State)?);
+                    break;
+                }
+                worker.check()?;
+            }
+        }
+        let mut reader = crate::root_headers::Cursor::new(
+            pin,
+            limits.header_bytes as u64,
+            backing.arena,
+            work,
+            now(clock)?,
+        )
+        .map_err(mime)?;
+        while reader.poll(now(clock)?).map_err(mime)? != crate::root_headers::Status::Complete {
+            worker.check()?;
+        }
+        let mut reader = reader
+            .into_json(backing.budget, backing.scratch, now(clock)?)
+            .map_err(mime)?;
+        for property in properties {
+            worker.check()?;
+            let mut key = [0; 1538];
+            let mut key = crate::bounded::TextBuffer::new(&mut key);
+            crate::jmap_session::quoted(&mut key, property.requested()).map_err(storage)?;
+            worker.append(b",")?;
+            worker.append(key.as_bytes().map_err(|_| Error::State)?)?;
+            worker.append(b":")?;
+            let mut cursor = reader
+                .project(root_header_json::Selection::Value(property), now(clock)?)
+                .map_err(mime)?;
+            loop {
+                let progress = cursor.poll(now(clock)?, &mut chunk).map_err(mime)?;
+                worker.append(chunk.get(..progress.written).ok_or(Error::State)?)?;
+                if progress.status == root_header_json::Status::Complete {
+                    break;
+                }
+            }
+            cursor.finish(now(clock)?).map_err(mime)?;
+        }
+        reader.finish(now(clock)?).map_err(mime)?;
+    }
+    Ok(())
+}
 fn write_verified_inner(
     output: &mut (impl Output + ?Sized),
     pin: &mut PinnedBlob<'_, '_>,
@@ -169,61 +244,18 @@ fn write_verified_inner(
         .and_then(|bytes| bytes.checked_add(2))
         .ok_or(Error::ResponseCapacity)?;
     let mut arena = buffer(arena_bytes)?;
-    if !selected.headers.is_empty() {
-        let mut properties = Vec::new();
-        properties
-            .try_reserve_exact(selected.headers.len())
-            .map_err(|_| Error::ResponseCapacity)?;
-        for name in &selected.headers {
-            let name = std::str::from_utf8(name.bytes()).map_err(|_| Error::State)?;
-            let mut parser =
-                crate::header_property::Cursor::new(name, crate::header_property::Context::Email);
-            loop {
-                if let crate::header_property::Status::Complete(property) =
-                    parser.poll(now(clock)?, work).map_err(mime)?
-                {
-                    properties.push(property.ok_or(Error::State)?);
-                    break;
-                }
-                worker.check()?;
-            }
-        }
-        let mut reader = crate::root_headers::Cursor::new(
-            pin,
-            limits.header_bytes as u64,
-            &mut arena,
-            work,
-            now(clock)?,
-        )
-        .map_err(mime)?;
-        while reader.poll(now(clock)?).map_err(mime)? != crate::root_headers::Status::Complete {
-            worker.check()?;
-        }
-        let mut reader = reader
-            .into_json(&mut budget, &mut scratch, now(clock)?)
-            .map_err(mime)?;
-        for property in properties {
-            worker.check()?;
-            let mut key = [0; 1538];
-            let mut key = crate::bounded::TextBuffer::new(&mut key);
-            crate::jmap_session::quoted(&mut key, property.requested()).map_err(storage)?;
-            worker.append(b",")?;
-            worker.append(key.as_bytes().map_err(|_| Error::State)?)?;
-            worker.append(b":")?;
-            let mut cursor = reader
-                .project(root_header_json::Selection::Value(property), now(clock)?)
-                .map_err(mime)?;
-            loop {
-                let progress = cursor.poll(now(clock)?, &mut chunk).map_err(mime)?;
-                worker.append(chunk.get(..progress.written).ok_or(Error::State)?)?;
-                if progress.status == root_header_json::Status::Complete {
-                    break;
-                }
-            }
-            cursor.finish(now(clock)?).map_err(mime)?;
-        }
-        reader.finish(now(clock)?).map_err(mime)?;
-    }
+    write_headers(
+        worker,
+        pin,
+        (limits, selected),
+        clock,
+        work,
+        HeaderBacking {
+            arena: &mut arena,
+            budget: &mut budget,
+            scratch: &mut scratch,
+        },
+    )?;
     if !selected.body() {
         pin.check_deadline().map_err(storage)?;
         worker.flush()?;

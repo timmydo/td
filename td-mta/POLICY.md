@@ -619,6 +619,17 @@ STORAGE.md owns snapshot consistency and count resource/failure behavior.
 
 ### 4.2. Queries and state
 
+The active td-mail PostgreSQL query profile accepts one `text` operand with
+mailbox and received-date conditions. It searches all root From/To/Cc/Bcc/
+Subject occurrences, MIME filenames and text parts, including text attachments;
+address names and mailbox strings are separate searchable fields, decoded
+through the supported address projection rather than the public Text form.
+HTML uses the shared extraction below. Embedded `message/*` interpretation
+is not active: encountering it refuses the query as messageInterpretation,
+even if earlier fields matched. Empty text needs no content interpretation.
+The broader filter inventory below remains reference scope as CONFORMANCE.md
+specifies. No missing source is reported as a nonmatch.
+
 All standard filters in CONFORMANCE.md are required. No inThread extension is
 accepted. An unknown filter property/operator returns unsupportedFilter; wrong
 JSON shape/type returns invalidArguments. AND/OR/NOT follow RFC 8620, with
