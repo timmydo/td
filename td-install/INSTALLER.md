@@ -160,10 +160,14 @@ nothing, then a left press, which closes it with the page unchanged.
 The list's rows are spelled as td-ui's keymap spells chords
 (`Return`, `PageUp`, `S-Tab`), and `keys::check` holds every page's
 sections to that spelling; `--help` and this document name the keys
-the same way. It is painted last over the live frame, never in a headless
-render, and the boot evidence still says the page under it, a frame
-repainted for the list saying nothing new. A native compositor case presses F1 on the seat
-and finds welcome around the panel and its title bar in the selection's
+the same way. The secure prompt's keys are the compositor's, not the
+window's: the consent view, its key list's prose row and `--help` name
+them as the compositor's screen and td-authd's requesters do
+(Ctrl+Alt+Escape, Enter). It is painted last over the live frame, never
+in a headless render, and the boot evidence still says the page under
+it, a frame repainted for the list saying nothing new. A native
+compositor case presses F1 on the seat and finds welcome around the
+panel and its title bar in the selection's
 colour, Return reaching no page while it is open, and Escape painting
 welcome whole again.
 Its progress and completion views are pure views of the service's
@@ -423,9 +427,14 @@ The caller may show the view only after the service reports durable
 filesystem and deployment publication, verified boot artifacts, and settings
 publication. In the live window, execute answered awaiting consent shows a
 consent view: confirm or decline at the secure prompt, since this window
-cannot give consent. For a device-bound review the view adds that after
-confirmation the secure screen closes by itself and the person returns here
-to write down the recovery key: the compositor, not this window, shows its
+cannot give consent. Nothing pushes that prompt, so the view says how to
+open it, as td-authd's other requesters do: Ctrl+Alt+Escape, then I for
+the attention menu's installation row, where Enter confirms and Escape
+declines; the window's key list says so in a prose row, the chord
+being the secure screen's, not its own. For a device-bound review the
+view adds that after confirmation the secure screen closes by itself
+and the person returns here to write down the recovery key: the
+compositor, not this window, shows its
 returning notice and closes the screen once consent is committed
 (td-compositor/DESIGN.md "Physical installation confirmation"), and the
 recovery-key pages follow. An unencrypted installation's screen keeps its

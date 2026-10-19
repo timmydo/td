@@ -184,8 +184,16 @@ const REVIEW_KEYS: &[(&str, &str)] = &[
     ),
     ("Escape", "withdraw the review and go back to the settings"),
 ];
-const CONSENT_KEYS: &[(&str, &str)] =
-    &[("Escape", "withdraw the review and go back to the settings")];
+/// The secure prompt's keys are the compositor's, so they are prose,
+/// spelled as its screen and td-authd's requesters spell them.
+const CONSENT_KEYS: &[(&str, &str)] = &[
+    (
+        "",
+        "Ctrl+Alt+Escape, then I, opens the compositor's secure prompt, where \
+         Enter confirms and Escape declines; those keys are the compositor's, not this window's",
+    ),
+    ("Escape", "withdraw the review and go back to the settings"),
+];
 const RECOVERY_KEYS: &[(&str, &str)] = &[("Return", "type the key back once it is written down")];
 /// The type-back's own keys; the field's are `recovery`'s.
 const TYPE_BACK_KEYS: &[(&str, &str)] = &[

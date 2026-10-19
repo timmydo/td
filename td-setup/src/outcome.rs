@@ -15,6 +15,13 @@ const FAILED_FOOTER: &str = "Installation stopped \u{b7} step 5 of 6";
 const UNKNOWN_FOOTER: &str = "Outcome unknown \u{b7} step 5 of 6";
 const UNCONFIRMED_FOOTER: &str = "Installation not finished \u{b7} step 6 of 6";
 const COMPLETE_FOOTER: &str = "Complete \u{b7} step 6 of 6";
+/// How the person reaches the secure prompt: the paired compositor's
+/// attention chord and its menu's installation row. Nothing pushes the
+/// prompt, so the page must say how to open it.
+const OPEN_SECURE_PROMPT: &[&str] = &[
+    "Press Ctrl+Alt+Escape, then I, to open the secure prompt.",
+    "There, Enter confirms the installation and Escape declines it.",
+];
 /// What a device-bound consent page adds: the secure screen closes by
 /// itself after confirmation, and the key follows here.
 const RETURN_AFTER_CONSENT: &[&str] = &[
@@ -143,13 +150,9 @@ impl Composition for ProgressPage {
         let footer = match self.progress {
             Progress::Consent => {
                 row(self.surface, 1, "Waiting for consent", damage, sink);
-                row(
-                    self.surface,
-                    4,
-                    "Confirm or decline the installation at the secure prompt.",
-                    damage,
-                    sink,
-                );
+                for (index, text) in OPEN_SECURE_PROMPT.iter().enumerate() {
+                    row(self.surface, 3 + index, text, damage, sink);
+                }
                 row(
                     self.surface,
                     6,
@@ -520,6 +523,9 @@ mod tests {
         let consent = ProgressPage::new(screen, Progress::Consent).unwrap();
         let painted = glyphs(&consent, screen);
         assert!(painted.contains("secure prompt") && painted.contains(CONSENT_FOOTER));
+        for text in OPEN_SECURE_PROMPT {
+            assert!(painted.contains(text), "{text}");
+        }
         assert!(!painted.contains("recovery key"));
         let bound = ProgressPage::new(screen, Progress::Consent)
             .unwrap()
