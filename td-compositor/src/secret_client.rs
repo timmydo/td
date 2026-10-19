@@ -700,11 +700,25 @@ impl LoginSelection {
                 Managed::Add { .. } => &["DISK SECURITY KEY ADDED"],
                 Managed::Remove { .. } => &["DISK SECURITY KEY REMOVED"],
                 Managed::RecoveryRemove => &["DISK RECOVERY KEY REMOVED"],
-                // Their next-boot rows come with the requests.
+                // Then the next-boot rows its description showed.
                 Managed::Request { request, .. } => match request {
-                    DiskRequest::PinChange => &["PIN CHANGE REQUESTED"],
-                    DiskRequest::TpmClear => &["TPM CLEAR REQUESTED"],
-                    DiskRequest::Reenroll => &["TPM RE-ENROLLMENT REQUESTED"],
+                    DiskRequest::PinChange => &[
+                        "PIN CHANGE REQUESTED",
+                        "THE NEXT BOOT BY THE PIN",
+                        "ASKS FOR A NEW PIN",
+                    ],
+                    DiskRequest::TpmClear => &[
+                        "TPM CLEAR REQUESTED",
+                        "THE NEXT BOOT ASKS TO CLEAR",
+                        "THE TPM AND ALL ITS KEYS",
+                        "BOOTS AFTER NEED A SECURITY KEY",
+                        "OR THE RECOVERY KEY",
+                    ],
+                    DiskRequest::Reenroll => &[
+                        "TPM RE-ENROLLMENT REQUESTED",
+                        "THE NEXT BOOT BY A SECURITY KEY",
+                        "OR RECOVERY KEY ASKS TO RE-ENROLL",
+                    ],
                 },
             },
             Self::SelectorUpdate => match request.and_then(Request::selector_update) {
@@ -4838,6 +4852,38 @@ mod tests {
                 assert!(row.len() <= columns, "{row}");
             }
         }
+        // Protector management's ends and successes; a request's success
+        // ends with the next-boot rows its description showed.
+        for selection in protectors() {
+            let LoginSelection::Protector(managed) = selection else {
+                panic!("{selection:?}")
+            };
+            for kind in 0..=u8::MAX {
+                for detail in 0..=7 {
+                    for row in protector_failure(managed, kind, detail).unwrap_or_default() {
+                        assert!(row.bytes().all(crate::ui::is_mapped), "{row}");
+                        assert!(row.len() <= columns, "{row}");
+                    }
+                }
+            }
+            let success = selection.success(None);
+            for row in success {
+                assert!(row.bytes().all(crate::ui::is_mapped), "{row}");
+                assert!(row.len() <= columns, "{row}");
+            }
+            if let Managed::Request { .. } = managed {
+                let lines = steps(&selection)[0].lines();
+                let next_boot: Vec<&str> = lines
+                    .iter()
+                    .map(String::as_str)
+                    .skip_while(|line| !line.starts_with("THE NEXT BOOT"))
+                    .take_while(|line| {
+                        !line.starts_with("REPLACES") && !line.starts_with("AUTHORIZED BY")
+                    })
+                    .collect();
+                assert_eq!(next_boot, success[1..], "{managed:?}");
+            }
+        }
     }
 
     // Protector management (DESIGN.md, "Protector management").
@@ -4912,7 +4958,20 @@ mod tests {
                     approval: None,
                 }),
             ],
-            Managed::Request { .. } => panic!("the requests are a later commit's"),
+            // A TPM clear replaces a pending PIN change.
+            Managed::Request { proof: by, request } => proof(by)
+                .into_iter()
+                .map(|step| {
+                    login(Operation::ProtectorRequest {
+                        account: 1000,
+                        proof: by,
+                        request,
+                        pending: (request == DiskRequest::TpmClear)
+                            .then_some(DiskRequest::PinChange),
+                        step,
+                    })
+                })
+                .collect(),
         }
     }
 
@@ -4934,12 +4993,24 @@ mod tests {
                 proof: Proof::RecoveryKey,
             },
             Managed::RecoveryRemove,
+            Managed::Request {
+                proof: Proof::RecoveryKey,
+                request: DiskRequest::PinChange,
+            },
+            Managed::Request {
+                proof: Proof::DiskKey,
+                request: DiskRequest::TpmClear,
+            },
+            Managed::Request {
+                proof: Proof::DiskKey,
+                request: DiskRequest::Reenroll,
+            },
         ]
         .map(LoginSelection::Protector)
         .into()
     }
 
-    /// `20 04` to `20 06`: every step presented, tag 21's keyed, each
+    /// `20 04` to `20 09`: every step presented, tag 21's keyed, each
     /// secret step's `1c`, a removal's chosen digit among them, the commit
     /// over the last step, and the success rows; nothing about login keys
     /// changed.
@@ -5049,6 +5120,7 @@ mod tests {
             let described = presented(&selection, 0).0;
             let refusal = match managed {
                 Managed::Add { .. } => 1,
+                Managed::Request { .. } => 3,
                 _ => 2,
             };
             for detail in 0..=3 {
@@ -5111,6 +5183,9 @@ mod tests {
                     ..
                 } | Managed::Remove {
                     proof: Proof::RecoveryKey
+                } | Managed::Request {
+                    proof: Proof::RecoveryKey,
+                    ..
                 }
             );
             for (kind, detail, stands) in [
@@ -5248,6 +5323,64 @@ mod tests {
         }
         let before = presented(&removal, 0).0[..2].to_vec();
         assert!(refused(&removal, &before, status(3, &steps(&removal)[1])));
+        // A request's that changes the request, the proof or the step.
+        let request = |proof, request, step| {
+            login(Operation::ProtectorRequest {
+                account: 1000,
+                proof,
+                request,
+                pending: None,
+                step,
+            })
+        };
+        let pin_change = LoginSelection::Protector(Managed::Request {
+            proof: Proof::RecoveryKey,
+            request: DiskRequest::PinChange,
+        });
+        let requested = presented(&pin_change, 0).0[..2].to_vec();
+        assert!(!refused(
+            &pin_change,
+            &requested,
+            status(
+                3,
+                &request(
+                    Proof::RecoveryKey,
+                    DiskRequest::PinChange,
+                    LoginStep::RecoveryKey
+                )
+            )
+        ));
+        for other in [
+            request(
+                Proof::RecoveryKey,
+                DiskRequest::TpmClear,
+                LoginStep::RecoveryKey,
+            ),
+            request(
+                Proof::DiskKey,
+                DiskRequest::PinChange,
+                LoginStep::DiskIdentify,
+            ),
+        ] {
+            assert!(
+                refused(&pin_change, &requested, status(3, &other)),
+                "{other:?}"
+            );
+        }
+        let by_key = LoginSelection::Protector(Managed::Request {
+            proof: Proof::DiskKey,
+            request: DiskRequest::PinChange,
+        });
+        let requested = presented(&by_key, 0).0[..2].to_vec();
+        let authorize = request(
+            Proof::DiskKey,
+            DiskRequest::PinChange,
+            LoginStep::DiskAuthorize {
+                key: SECOND,
+                retries: 8,
+            },
+        );
+        assert!(refused(&by_key, &requested, status(3, &authorize)));
         let by_recovery = login(Operation::ProtectorRemove {
             account: 1000,
             proof: Proof::RecoveryKey,

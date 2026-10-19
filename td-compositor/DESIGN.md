@@ -6433,11 +6433,9 @@ operation is, with its own end table), the disk proofs
 and its cancellation are fixed by increment 8f's documentation commit
 before their code, and implemented (`LoginSelection::Upgrade` and
 `UpgradeCancel`, each with its own end table). Protector management is
-fixed by increment 8g's documentation commit before its code. Its
-addition, removal and recovery-key removal are implemented
-(`LoginSelection::Protector`, the `A`, `R` and `X` rows and their
-screens). The three requests and their `N`, `T` and `E` rows are not
-yet implemented.
+fixed by increment 8g's documentation commit before its code. All six
+operations are implemented: `LoginSelection::Protector`, the `A`, `R`,
+`X`, `N`, `T` and `E` rows and their screens.
 td-authd/DESIGN.md amendment 10 gives the wire, and ENCRYPTION.md the
 operations. Until that document's item 9, root refuses every storage
 operation in a production build and decodes no disk proof there, so
@@ -6601,7 +6599,9 @@ authorization screen is a disk proof's without `K`: `AUTHORIZE WITH:`,
 - Each prompt is prepared as a disk proof's: at the single scale where
   the doubled cannot hold its rows and field (`Prepared::with_time`
   learns tags 19 to 24 beside `login_proof`). At the four oracle
-  outputs every one stays doubled, four tokens and a field included.
+  outputs every prompt stays doubled, four tokens and a field included,
+  except one. A TPM clear's security-key PIN step falls back at
+  800x600, with or without a pending request.
 - A proof step is presented as a disk proof's, and a new key's step as
   an upgrade's. Tag 21's identify step is keyed as a login disclosure
   step is, its receipt sent only after the key's second digit.

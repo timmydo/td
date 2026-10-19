@@ -736,6 +736,9 @@ fn notice_rows(notice: Notice) -> Vec<String> {
             "A: ADD A DISK SECURITY KEY",
             "R: REMOVE A DISK SECURITY KEY",
             "X: REMOVE THE RECOVERY KEY",
+            "N: CHANGE THE DISK PIN",
+            "T: CLEAR THE TPM",
+            "E: RE-ENROLL A NEW TPM",
         ],
         Notice::AddRole => &[
             "P: A PRIMARY KEY THAT UNLOCKS",
@@ -1516,16 +1519,57 @@ mod tests {
                 step,
             });
         }
+        // Each request, alone or replacing a pending one, at either
+        // proof's step: the TPM clear's rows are the most.
+        use crate::authority::consent::DiskRequest;
+        for request in [
+            DiskRequest::PinChange,
+            DiskRequest::TpmClear,
+            DiskRequest::Reenroll,
+        ] {
+            for step in [LoginStep::RecoveryKey, LoginStep::DiskIdentify, authorize] {
+                for pending in [
+                    None,
+                    Some(DiskRequest::PinChange),
+                    Some(DiskRequest::TpmClear),
+                    Some(DiskRequest::Reenroll),
+                ] {
+                    operations.push(Operation::ProtectorRequest {
+                        account: 1000,
+                        proof: if step == LoginStep::RecoveryKey {
+                            Proof::RecoveryKey
+                        } else {
+                            Proof::DiskKey
+                        },
+                        request,
+                        pending,
+                        step,
+                    });
+                }
+            }
+        }
         for operation in operations {
             let request = Request::new([1; 32], 1000, operation).unwrap();
+            let ceiling = request.ceiling().unwrap().as_secs();
             for (width, height) in [(1366, 768), (1280, 800), (1024, 768), (800, 600)] {
                 let prepared =
-                    Prepared::with_time(request.clone(), width, height, width * 4, Some(360))
+                    Prepared::with_time(request.clone(), width, height, width * 4, Some(ceiling))
                         .unwrap();
                 let asks = request.ceremony_step().unwrap().asks_pin();
                 assert_eq!(prepared.field_rows.is_some(), asks, "{request:?}");
-                // DESIGN.md: none falls back at the oracle outputs.
-                assert_eq!(prepared.scale, 2, "{request:?} {width}x{height}");
+                // DESIGN.md: one falls back at the oracle outputs, a TPM
+                // clear's security-key PIN step at 800x600.
+                let single = height == 600
+                    && matches!(
+                        request.operation(),
+                        Operation::ProtectorRequest {
+                            request: DiskRequest::TpmClear,
+                            step: LoginStep::DiskAuthorize { .. },
+                            ..
+                        }
+                    );
+                let scale = if single { 1 } else { 2 };
+                assert_eq!(prepared.scale, scale, "{request:?} {width}x{height}");
             }
         }
         let choose = Request::new(
