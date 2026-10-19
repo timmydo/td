@@ -242,7 +242,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert!(!session.contains("::launch("));
     assert_eq!(
         fingerprint(storage),
-        0x649662b596e4dde7,
+        0x38c4d28aece89d9b,
         "storage worker supervisor changed"
     );
     assert_eq!(

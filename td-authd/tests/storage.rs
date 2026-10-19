@@ -735,7 +735,7 @@ fn a_late_receipt_ends_the_operation_and_a_stale_one_is_dropped() {
 }
 
 #[test]
-fn operation_bytes_one_to_six_are_the_selections_this_build_runs() {
+fn operation_bytes_one_to_nine_are_the_selections_this_build_runs() {
     assert_eq!(Selection::decode(&[1]), Ok(Selection::SelectorUpdate));
     for (shape, byte, counts) in [
         (UpgradeShape::Tpm, 1, 0..=2),
@@ -749,8 +749,8 @@ fn operation_bytes_one_to_six_are_the_selections_this_build_runs() {
         }
     }
     assert_eq!(Selection::decode(&[3]), Ok(Selection::UpgradeCancel));
-    // Protector management with its operands; the requests and
-    // Secure Boot enrollment are refused by this build.
+    // Protector management with its operands; Secure Boot enrollment
+    // is refused by this build.
     let request = |request| {
         Selection::Protector(Managed::Request {
             proof: Proof::RecoveryKey,
@@ -762,9 +762,9 @@ fn operation_bytes_one_to_six_are_the_selections_this_build_runs() {
         (&[4, 2, 2], Selection::Protector(ADD_BY_KEY), true),
         (&[5, 2], Selection::Protector(REMOVE), true),
         (&[6], Selection::Protector(Managed::RecoveryRemove), true),
-        (&[7, 1], request(DiskRequest::PinChange), false),
-        (&[8, 1], request(DiskRequest::TpmClear), false),
-        (&[9, 1], request(DiskRequest::Reenroll), false),
+        (&[7, 1], request(DiskRequest::PinChange), true),
+        (&[8, 1], request(DiskRequest::TpmClear), true),
+        (&[9, 1], request(DiskRequest::Reenroll), true),
         (&[0x0a], Selection::Later(0x0a), false),
     ] {
         assert_eq!(Selection::decode(bytes), Ok(selection), "{bytes:?}");
@@ -1144,6 +1144,54 @@ fn tpm_volume() -> Vec<u8> {
     protected_frame(3, true, &[(2, 1, R), (2, 0, O)], 1, true)
 }
 
+/// The TPM shape with a pending TPM clear.
+fn pending_volume() -> Vec<u8> {
+    let mut frame = tpm_volume();
+    let at = frame.len() - ID.len() - 2;
+    frame[at] = 2;
+    frame
+}
+
+fn requesting(proof: Proof, request: DiskRequest, pending: bool, step: LoginStep) -> Request {
+    described(Operation::ProtectorRequest {
+        account: 1000,
+        proof,
+        request,
+        pending: pending.then_some(DiskRequest::TpmClear),
+        step,
+    })
+}
+
+/// A PIN change by the recovery key: its one step is its last.
+fn pin_change() -> Vec<Request> {
+    vec![requesting(
+        Proof::RecoveryKey,
+        DiskRequest::PinChange,
+        false,
+        LoginStep::RecoveryKey,
+    )]
+}
+
+/// A re-enrollment by the recovery key's security key, replacing the
+/// pending TPM clear.
+fn reenrollment() -> Vec<Request> {
+    [
+        LoginStep::DiskIdentify,
+        LoginStep::DiskAuthorize { key: R, retries: 8 },
+    ]
+    .map(|step| requesting(Proof::DiskKey, DiskRequest::Reenroll, true, step))
+    .to_vec()
+}
+
+const PIN_CHANGE: Managed = Managed::Request {
+    proof: Proof::RecoveryKey,
+    request: DiskRequest::PinChange,
+};
+const REENROLL: Managed = Managed::Request {
+    proof: Proof::DiskKey,
+    request: DiskRequest::Reenroll,
+};
+
 /// The FIDO2 shape: two primary keys and a recovery key.
 fn fido_volume() -> Vec<u8> {
     protected_frame(4, true, &[(1, 1, P), (1, 1, Q), (2, 1, R)], 0, false)
@@ -1245,6 +1293,7 @@ fn protector_script(w: &mut Worker, script: &str) {
             "device-bound" => baseline_frame(1, &[], true),
             "upgrading" => baseline_frame(2, &[], true),
             "tpm" => tpm_volume(),
+            "fido" => fido_volume(),
             "fido-unmarked" => {
                 let mut frame = fido_volume();
                 frame[2] = 0;
@@ -1283,6 +1332,18 @@ fn protector_script(w: &mut Worker, script: &str) {
         (volume, steps)
     } else if rest.starts_with("remove") {
         (fido_volume(), removal())
+    } else if rest.starts_with("request-pin") {
+        (tpm_volume(), pin_change())
+    } else if rest == "request-clear" {
+        let steps = vec![requesting(
+            Proof::RecoveryKey,
+            DiskRequest::TpmClear,
+            false,
+            LoginStep::RecoveryKey,
+        )];
+        (tpm_volume(), steps)
+    } else if rest.starts_with("request-reenroll") {
+        (pending_volume(), reenrollment())
     } else if rest == "orphan" {
         (
             tpm_volume(),
@@ -1301,7 +1362,8 @@ fn protector_script(w: &mut Worker, script: &str) {
         w.hold();
     };
     match rest {
-        "add" | "add-key" | "remove" | "remove-recovery" | "recovery-remove" => {
+        "add" | "add-key" | "remove" | "remove-recovery" | "recovery-remove" | "request-pin"
+        | "request-reenroll" | "request-clear" => {
             walk(w, &steps);
             w.invite(0x12, &last);
             w.send(&[0x14]);
@@ -1351,6 +1413,34 @@ fn protector_script(w: &mut Worker, script: &str) {
         // the choose step, and the chosen key's outside a removal.
         "add-kind-at-description" => {
             w.send(&[0x15, 0x26]);
+            w.hold();
+        }
+        // A request's keyslot without a bounded cost, before anything is
+        // presented; its dump failing after the test.
+        "request-pin-uncosted" => {
+            w.send(&[0x15, FAILED]);
+            w.hold();
+        }
+        "request-pin-undumped" => {
+            walk(w, &steps);
+            w.send(&[0x15, FAILED]);
+            w.hold();
+        }
+        "request-pin-early-commit" => stray(w, 0x12, &steps[0]),
+        "request-pin-hold" => stray(w, 0x10, &steps[0]),
+        // A commit asked after the one step's receipt, its key unsent.
+        "request-pin-keyless-commit" => {
+            w.invite(0x10, &steps[0]);
+            stray(w, 0x12, &steps[0]);
+        }
+        // A disk key's wrong PIN, and the dump past its deadline.
+        "request-reenroll-wrong-pin" | "request-reenroll-undumped" => {
+            walk(w, &steps);
+            w.send(if rest == "request-reenroll-wrong-pin" {
+                &[0x15, 0x01, 7]
+            } else {
+                &[0x15, TIMEOUT]
+            });
             w.hold();
         }
         "remove-kind-at-choose" | "remove-chosen-at-choose" => {
@@ -1481,6 +1571,34 @@ fn protector_management_presents_each_step_then_commits() {
         assert_eq!(presented, steps, "{script}");
         assert!(storage.child.is_none() && storage.wire.is_none());
     }
+    // The requests: a PIN change by the recovery key, whose one step is
+    // its last, and a re-enrollment by a security key replacing the
+    // pending TPM clear, each under the request's ceiling.
+    for (managed, script, steps) in [
+        (PIN_CHANGE, "protector-request-pin", pin_change()),
+        (
+            Managed::Request {
+                proof: Proof::RecoveryKey,
+                request: DiskRequest::TpmClear,
+            },
+            "protector-request-clear",
+            vec![requesting(
+                Proof::RecoveryKey,
+                DiskRequest::TpmClear,
+                false,
+                LoginStep::RecoveryKey,
+            )],
+        ),
+        (REENROLL, "protector-request-reenroll", reenrollment()),
+    ] {
+        let mut storage = managing(managed, script);
+        assert!(storage.deadline < Instant::now() + Duration::from_secs(241));
+        assert!(storage.deadline > Instant::now() + Duration::from_secs(230));
+        let (event, presented) = drive(&mut storage);
+        assert_eq!(event, Event::Complete, "{script}");
+        assert_eq!(presented, steps, "{script}");
+        assert!(storage.child.is_none() && storage.wire.is_none());
+    }
     // An addition by a disk key, and a removal by the recovery key, whose
     // recovery-key step is its last.
     for (managed, script, count) in [
@@ -1530,6 +1648,8 @@ fn protector_management_refuses_from_the_baseline_before_any_description() {
             detailed(STATE, 2),
         ),
         (ADD, "protector-baseline:fido-unmarked", detailed(STATE, 0)),
+        // A PIN change outside the TPM shape.
+        (PIN_CHANGE, "protector-baseline:fido", detailed(STATE, 3)),
     ] {
         let mut storage = managing(managed, script);
         let (event, presented) = drive(&mut storage);
@@ -1608,6 +1728,38 @@ fn protector_managements_kinds_stand_where_a_disk_proofs_do() {
             1,
         ),
         (ADD, "protector-add-chosen", ended(false, INTERNAL), 1),
+        // A request's `0f` before its first presentation and after its
+        // proof; a commit asked before its one step was presented.
+        (
+            PIN_CHANGE,
+            "protector-request-pin-uncosted",
+            ended(false, FAILED),
+            0,
+        ),
+        (
+            PIN_CHANGE,
+            "protector-request-pin-undumped",
+            ended(false, FAILED),
+            1,
+        ),
+        (
+            PIN_CHANGE,
+            "protector-request-pin-early-commit",
+            ended(false, INTERNAL),
+            0,
+        ),
+        (
+            REENROLL,
+            "protector-request-reenroll-wrong-pin",
+            detailed(0x01, 7),
+            2,
+        ),
+        (
+            REENROLL,
+            "protector-request-reenroll-undumped",
+            ended(false, TIMEOUT),
+            2,
+        ),
     ] {
         let mut storage = managing(managed, script);
         let (event, presented) = drive(&mut storage);
@@ -1629,6 +1781,7 @@ fn a_secret_outside_its_steps_profile_ends_the_operation() {
         // Listed, but the only primary key.
         (REMOVE, "protector-remove-unmarked-hold", b"1"),
         (ADD, "protector-add-hold", b"1234"),
+        (PIN_CHANGE, "protector-request-pin-hold", b"1234"),
     ] {
         let mut storage = managing(managed, script);
         let step = first_presented(&mut storage);
@@ -1675,4 +1828,23 @@ fn a_late_tag_21_receipt_ends_the_operation() {
     storage.expire();
     storage.presented(&first).unwrap();
     assert_eq!(drive(&mut storage).0, ended(false, TIMEOUT));
+}
+
+/// A commit asked while root still waits for the step's secret, or before
+/// it reached the worker, is out of order: root sends `13` only once the
+/// secret is written.
+#[test]
+fn a_commit_before_the_steps_secret_ends_the_operation() {
+    let mut storage = managing(PIN_CHANGE, "protector-request-pin-keyless-commit");
+    let step = first_presented(&mut storage);
+    storage.presented(&step).unwrap();
+    let until = Instant::now() + Duration::from_secs(10);
+    let event = loop {
+        match storage.poll().unwrap() {
+            Event::Pin(_) | Event::Waiting => thread::sleep(Duration::from_millis(1)),
+            event => break event,
+        }
+        assert!(Instant::now() < until);
+    };
+    assert_eq!(event, ended(false, INTERNAL));
 }

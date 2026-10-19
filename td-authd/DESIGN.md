@@ -2670,9 +2670,9 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
     tags 19 to 24 and the choose step are implemented. So are the
     addition, the removal and the recovery-key removal (`20 04` to
     `20 06`), behind the same `OPERATIONS`, and the compositor selects
-    them. Every build refuses the three requests (`20 07` to
-    `20 09`) until they are implemented. Secure Boot enrollment (`20
-    0a`) is not yet fixed.
+    them. So are the three requests (`20 07` to `20 09`), behind the
+    same `OPERATIONS`; the compositor does not yet select them. Secure
+    Boot enrollment (`20 0a`) is not yet fixed.
     One fixed root `/bin/td-install storage-operation --uid 1000` child
     per operation, the storage worker (`td-install/DESIGN.md`, "Storage
     operation worker"), launched and supervised as the login worker is

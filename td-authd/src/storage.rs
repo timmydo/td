@@ -83,7 +83,7 @@ pub(crate) enum Selection {
     /// `03`: the upgrade's cancellation.
     UpgradeCancel,
     /// `04` to `09`: protector management with its proof and an
-    /// addition's role. This build refuses the three requests.
+    /// addition's role.
     Protector(Managed),
     /// `0a`: assigned, fixed by its own increment, and refused by this
     /// build.
@@ -130,10 +130,7 @@ impl Selection {
 
     /// Whether this build runs the selection.
     pub fn runs(self) -> bool {
-        !matches!(
-            self,
-            Self::Later(_) | Self::Protector(Managed::Request { .. })
-        )
+        !matches!(self, Self::Later(_))
     }
 
     /// Root's ceiling, fixed at the selection.
@@ -737,8 +734,8 @@ impl Storage {
     pub fn presented(&mut self, request: &Request) -> Result<(), String> {
         let now = Instant::now();
         // A step carries a key where it discloses: a proof's first, an
-        // upgrade's review, tag 21's identify step, and each one-step
-        // operation's description.
+        // upgrade's review, tag 21's identify step, and the selector
+        // update's and the cancellation's description.
         let keyed = request.login_approval().is_some()
             || request.upgrade_approval().is_some()
             || request.protector_approval().is_some()

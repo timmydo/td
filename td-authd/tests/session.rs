@@ -2456,21 +2456,22 @@ fn production_refuses_every_storage_operation_before_any_worker_starts() {
             proof: Proof::RecoveryKey,
         },
         Managed::RecoveryRemove,
+        Managed::Request {
+            proof: Proof::DiskKey,
+            request: DiskRequest::PinChange,
+        },
+        Managed::Request {
+            proof: Proof::RecoveryKey,
+            request: DiskRequest::TpmClear,
+        },
+        Managed::Request {
+            proof: Proof::DiskKey,
+            request: DiskRequest::Reenroll,
+        },
     ] {
         refused.push((Storage::Protector(managed), false));
     }
-    // The requests and Secure Boot enrollment, in every build.
-    for request in [
-        DiskRequest::PinChange,
-        DiskRequest::TpmClear,
-        DiskRequest::Reenroll,
-    ] {
-        let selection = Storage::Protector(Managed::Request {
-            proof: Proof::DiskKey,
-            request,
-        });
-        refused.extend([(selection, false), (selection, true)]);
-    }
+    // Secure Boot enrollment, in every build.
     refused.extend([(Storage::Later(0x0a), false), (Storage::Later(0x0a), true)]);
     for (selection, active) in refused {
         assert_eq!(
