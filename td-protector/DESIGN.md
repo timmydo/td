@@ -322,7 +322,10 @@ adds), and those of the one digest naming it, at most
 count for about an eighth of a second at formatting). Any other KDF,
 Argon2 among them, whose memory and time td does not run, or a count
 over its ceiling, or no single digest, has no cost, and the test is
-refused before cryptsetup starts.
+refused before cryptsetup starts. `TestArea::all_costed` holds when
+every keyslot has a cost: 8g's volume-key dump tries every keyslot, not
+the tested one (cryptsetup 2.8.8's `luksDump --dump-volume-key` opens
+with `CRYPT_ANY_SLOT`), so the storage worker runs it only then.
 
 ## Cryptsetup runner
 
@@ -375,7 +378,9 @@ remains; `luksDump --dump-json-metadata`; `luksDump --dump-volume-key
 --batch-mode --volume-key-file FILE --key-file=-`, for the selector's
 handoff, which cryptsetup 2.8.8 writes to a new FILE it creates
 `O_CREAT|O_EXCL` at mode 0400 and names on standard output without the
-key (ENCRYPTION.md "Selector release" says what was verified); `open`,
+key (ENCRYPTION.md "Selector release" says what was verified), and, from
+8g, for the storage worker's request on its header copy through
+`run_bounded`; `open`,
 `close`, `status`; `open --key-slot N`, the passphrase tried on that
 keyslot alone, with which the selector's recovery flow opens keyslot 0;
 `open --test-passphrase` on one keyslot, and the same against a
@@ -401,7 +406,8 @@ it kills the child and reaps it before returning `Expired` or
 `Abandoned`, so no child outlives the run with its input, however long
 a lock, an I/O or a key derivation would keep it. Its refusals before a
 child starts are `run`'s. td-install's storage worker runs its keyslot
-test through it (td-install/DESIGN.md, "Storage operation worker").
+test and a request's volume-key dump through it (td-install/DESIGN.md,
+"Storage operation worker").
 
 ## Transitions
 
@@ -677,7 +683,8 @@ tag (`update_retry`) and a selector update's pre-seal and token steps
 upgrade's plans and the runner's `reencrypt` shapes (below), which the
 selector's upgrade boot runs from 8f's last commit. Before item 9 only a
 header root wrote through the worker, or one forged on the disk, reaches
-them. The lockout's clear and the secure-boot and config tokens are not
+them. The lockout's clear, protector management's request tag and
+planners (8g, below) and the secure-boot and config tokens are not
 current.
 
 **Lockout.** `lockout::seal(volume_key, uuid, l, name)` and `open`
@@ -725,7 +732,8 @@ hexadecimal string as the device-bound format's are:
 {"type":"td-protector","keyslots":[],"role":"update-retry",
  "pair":"HEX","tag":"HEX"}
 {"type":"td-upgrade","keyslots":[],"shape":"tpm","from":"HEX"}
-{"type":"td-request","keyslots":[],"operation":"pin-change"}
+{"type":"td-request","keyslots":[],"operation":"pin-change",
+ "nonce":"HEX","tag":"HEX"}
 ```
 
 `pcrs` is `4,9` or `4,7,9`; `primary` is the storage primary's 34-byte
@@ -734,17 +742,18 @@ and a pending one has empty `keyslots`; `shape` is `tpm` or `fido2`;
 `from` is 32 bytes; `tags` holds one or two distinct 32-byte HMAC-SHA256
 tags; `pair` is the SHA-256 over the staged pair's two digests and `tag`
 its 32-byte HMAC-SHA256 under the update-retry key; `operation` is
-`pin-change` or `tpm-clear`; `account` is `1000`; `proven` is `0`
-until a take's LockReset or a proof under the lockout token succeeds
-and `1` after (ENCRYPTION.md "Lockout"), outside the tag, since
-whoever can write the header can remove the token anyway; marking a
-token over a wrong `L` proven costs only one refused proof per boot,
-bounded by the lockout hierarchy's own recovery. `seal` writes `0`,
-and nothing else is admitted. `salt`, `x`, `y`,
-`nonce`, `ciphertext` and `tag` are 32 bytes, and `credential` is 1 to
-255 bytes. A tpm-pin token's `public` and `private` are 1 to 128 and 1
-to 256 bytes, tighter than the device-bound token's 256 and 512 so that
-the largest protected header leaves 1 KiB of the JSON area spare
+`pin-change`, `tpm-clear` or `tpm-reenroll`, and a request's `nonce`
+and `tag` are 32 bytes each (8g; "Protector management" below);
+`account` is `1000`; `proven` is `0` until a take's LockReset or a proof
+under the lockout token succeeds and `1` after (ENCRYPTION.md
+"Lockout"), outside the tag, since whoever can write the header can
+remove the token anyway; marking a token over a wrong `L` proven costs
+only one refused proof per boot, bounded by the lockout hierarchy's own
+recovery. `seal` writes `0`, and nothing else is admitted. `salt`, `x`,
+`y`, `nonce`, `ciphertext` and `tag` are 32 bytes, and `credential` is 1
+to 255 bytes. A tpm-pin token's `public` and `private` are 1 to 128 and
+1 to 256 bytes, tighter than the device-bound token's 256 and 512 so
+that the largest protected header leaves 1 KiB of the JSON area spare
 ("Headers"). td creates the object: its public area is exactly 78
 bytes, which `protected_auth_policy` enforces, and its private area
 follows the TCG reference layout every commercial TPM derives from, an
@@ -828,18 +837,20 @@ lockout, `td-upgrade` and `td-request` tokens at their bounds, and the
 secure-boot, config (two tags) and update-retry tokens at theirs, holds
 10360 bytes of JSON of the 12288; the largest U2, every token naming no
 keyslot and `reencrypt --init-only` adding its keyslots, segments and
-digest, 9696 bytes with journal resilience and 9732 with checksum. At
-the device-bound sealed-area bounds each tpm-pin token would be 768
-bytes longer and the protected header would hold 11896, under 1 KiB
-spare. The U2 headers are measured at `reencrypt --init-only`. A
-reencryption interrupted part-way splits its first segment in two and a
-multi-terabyte volume writes longer offsets and sizes: probed by hand
-on a 20 GiB file with no tokens, an offline reencryption interrupted
-after its first GiB grew the JSON from 1976 bytes to 2114, and 14-digit
-byte counts add a few bytes per field, which the 2.5 KiB margin absorbs.
-The pinned sizes hold for the test's fixture, a 20 MiB file, and 8f's
-planner bounds each plan's size from the header's own before writing
-("Upgrade plans"). The protected
+digest, 9696 bytes with journal resilience and 9732 with checksum.
+8g's request fields and its longest operation name add 150 bytes to
+each, 10510, 9846 and 9882 by arithmetic, which 8g's format commit
+re-measures. At the device-bound sealed-area bounds each tpm-pin token
+would be 768 bytes longer and the protected header would hold 11896,
+12046 with 8g's request, under 1 KiB spare. The U2 headers are measured
+at `reencrypt --init-only`. A reencryption interrupted part-way splits
+its first segment in two and a multi-terabyte volume writes longer
+offsets and sizes: probed by hand on a 20 GiB file with no tokens, an
+offline reencryption interrupted after its first GiB grew the JSON from
+1976 bytes to 2114, and 14-digit byte counts add a few bytes per field,
+which the 2.5 KiB margin absorbs. The pinned sizes hold for the test's
+fixture, a 20 MiB file, and 8f's planner bounds each plan's size from
+the header's own before writing ("Upgrade plans"). The protected
 header, 8e's update-retry token included and before 8i's tokens are
 added, and a U2 header holding
 only what U2 holds are read back through `luks2::read` and agree with
@@ -884,7 +895,10 @@ failing closed:
   read after a tpm-pin release: a fido2-recovery or recovery-key release
   without a reseal plans nothing, orphans included, as the device-bound
   recovery without a reseal does, so a boot through a security key, a
-  locked-out TPM's included, never retires the tpm-pin protector.
+  locked-out TPM's included, never retires the tpm-pin protector. The
+  one exception, from 8g, is `request::plan` ("Protector management"
+  below): a request whose tag verifies and which the person confirmed,
+  and the removal of one it does not carry out.
 - An orphan keyslot is killed only beside a marker naming the recovery
   keyslot, never the opener's, the marker's or one a protected or
   foreign token names; without a marker, in the FIDO2 shape, no keyslot
@@ -1261,6 +1275,60 @@ DictionaryAttackParameters and LockReset) or a proof's two
 (SetPrimaryPolicy, DictionaryAttackParameters), then at most one
 counter reset and, from its increment, one requested clear.
 
+**Protector management** (8g; ENCRYPTION.md "Protector management").
+`request::tag(volume_key, uuid, operation, nonce, header)` is
+ENCRYPTION.md's request tag: a 32-byte key HKDF-SHA256 derives from the
+volume key with an empty salt and the info
+`td/disk-protector/request/v1`, a zero byte, the UUID as the lockout
+reads it and the nonce, and the tag is HMAC-SHA256 under it over the
+operation name's length byte and name, the nonce, the header's lockout
+nonce (32 zero bytes without a lockout token) and the SHA-256 over each
+tpm-pin token's `public` bytes in token-number order, each preceded by
+its length as two big-endian bytes. `request::verifies` recomputes it
+over the header read at release and compares in constant time; an empty
+volume key verifies nothing, and the key is zeroed on drop.
+`tests/token_vectors.py` computes the tag independently. The running
+system's planners, `manage::add`, `manage::remove`,
+`manage::remove_recovery` and `manage::request`, plan over a protected
+header with the operation's proof as the opener (the token whose keyslot
+the proof tested, or the recovery key on the marker's), each pure and
+confirmed by one `Plan::confirm`: an addition's keyslot at the lowest
+free from 1 under the opener with the new passphrase, its token imported
+naming it and a test; a removal's kill of the chosen token's keyslot,
+then its token; a recovery-key removal's kill of the marker's keyslot,
+then the marker; and a request's removal of a pending `td-request`
+token, then its import. Each refuses what root's `21` details refuse
+from the baseline (td-authd/DESIGN.md amendment 10: `Refusal::Role` and
+`Full`, detail 01; `Minimum`, detail 02, the shape's minimums and the
+removal's own TPM-shape rule; `NoProtector`, detail 03), the opener
+being the removed token or the marker it removes included, and a header
+that is not protected; the reader's bounds hold the result. The
+selector's `request::plan`, after the cap with the volume key, gives
+each request one of three fates. It is removed without being carried
+out: as the plan's first write when its tag fails, when it is declined
+and when it is a re-enrollment on the recorded primary, a PIN release's
+included; with the reseal's plan when it is a PIN change at a boot whose
+confirmed reseal's plan runs, which sets a new PIN itself; and at that
+step when it is a clear whose TPM the lockout step cannot prove or that
+TPM2_Clear refuses. It is left untouched for a later boot when it is a
+PIN change at a boot by another protector, or one whose seal or
+verification failed, and a clear on the recorded primary whose lockout
+step met `TPM_RC_LOCKOUT` or whose TPM2_Clear answer was lost. Otherwise
+it is carried out in ENCRYPTION.md's order, each write through the
+protected planner's own (the PIN change's through the reseal's, the
+retirements through the planner's retirement, the take through
+`lockout_import`), and removed just before the first write that changes
+the state its tag covers, so a cut leaves either the request and that
+state or neither. The PIN change's prompt precedes the cap and the plan,
+which only discards what it sealed when the tag fails. A clear after a
+PIN release removes the tpm-pin token but not its keyslot, which
+cryptsetup kills only under another keyslot's key; that keyslot is then
+an orphan, killed beside the marker by the reseal boot's plan.
+`request::plan` is the one plan a release by a fido2-recovery token or
+the recovery key runs without a reseal: what it carries out under a
+verified tag and the person's confirmation, and the removal of a request
+it does not carry out (above, "Plans on protected headers").
+
 ## Bounds
 
 Every TPM exchange is td-tpm's: bounded commands and replies, no retry or
@@ -1461,7 +1529,8 @@ A normal cargo pass with it ignored is not TPM integration evidence.
 
 Protected-token tests pin each 8a token's exact encoding for fixed
 values and the largest encoding of each kind (tpm-pin 1038 bytes, fido2
-824, marker 63, lockout 376, `td-upgrade` 125, `td-request` 60) as
+824, marker 63, lockout 376, `td-upgrade` 125, `td-request` 210, a
+`tpm-reenroll` one, from 8g's format commit) as
 literals that `tests/token_vectors.py`, a stdlib-only host tool and no
 build input, computes independently (Python's `json`, `hmac` and
 `hashlib`), round trip them, and refuse every key, type, role, keyslot,

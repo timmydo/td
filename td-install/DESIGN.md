@@ -1390,10 +1390,12 @@ ENCRYPTION.md increment 8's `td-install storage-operation` ("Storage
 operation worker" below): the
 upgrade's first phase reads one TPM capability, it and the requests
 import key-less tokens, protector management adds and kills keyslots
-under a FIDO2 passphrase or the recovery key, a login-key disk proof
-tests one of them on its keyslot, the selector update writes the ESP, and Secure
+under a disk proof's secret, a FIDO2 passphrase or the recovery key, a
+request reads the volume key through cryptsetup's volume-key dump under
+that secret to tag its token, a login-key disk proof tests one of them
+on its keyslot, the selector update writes the ESP, and Secure
 Boot enrollment signs with a TPM-held key and writes EFI variables;
-none of them opens the volume or reads its key.
+none of them opens the volume, and only a request reads its key.
 Device-mapper refuses, or defers
 until the last close, removing a mapping that is open, so the held
 descriptor keeps the mapping for the operation; root reloading its
@@ -1634,9 +1636,10 @@ into clearing storage.
 Its frames are the login worker's: it sends `18` its baseline, `10` and
 `12` invitations, `14` success and `15` a failure; root sends the
 description, `11` and `13` acknowledgements and `16` a secret after a
-secret step's acknowledgement, `16` and 4 to 63 bytes as a PIN frame
-is. The baseline, sent before any presentation, token or ESP I/O, is
-`18`, then:
+secret step's acknowledgement, `16` and 4 to 63 bytes as a PIN frame is,
+or, after a removal's choose step, `16` and one ASCII digit, the chosen
+position. The baseline, sent before any presentation, token or ESP I/O,
+is `18`, then:
 
 - the volume byte, from discovery's held partition and td-protector's
   reader over its LUKS2 header: `00` no encrypted td volume, `01`
@@ -1647,12 +1650,17 @@ is. The baseline, sent before any presentation, token or ESP I/O, is
 - the fido2 token count, 0 to 4, then each token's role (`01` primary,
   `02` recovery) and fingerprint, the first four bytes of SHA-256 over
   its credential ID, in token-number order;
+- the tpm-pin token count, 0 to 2, `01` when a lockout token is on the
+  header, else `00`, and the request byte, `00` with no `td-request`
+  token or `01` to `03` for its operation (`pin-change`, `tpm-clear`,
+  `tpm-reenroll`);
 - `00` and the running deployment's 32-byte manifest ID when it is
   `current`, acknowledged and with no pending attempt, or `01` alone.
 
 Root's first frame is a TDCONS01 description: tag 16 for a selector
-update, tag 17's review for an upgrade, tag 18 for its cancellation, or
-tags 13 to 15 at their proof's first step for a disk proof.
+update, tag 17's review for an upgrade, tag 18 for its cancellation,
+tags 13 to 15 at their proof's first step for a disk proof, or tags 19
+to 24 at their first step for protector management.
 The worker requires it to be what its baseline admits, as root does,
 or fails as INTERNAL before any I/O, and repeats it exactly as its
 first `10`, a selector update's after the reads below, so the key's
@@ -1755,6 +1763,57 @@ consent time holds no I/O.
   plan, confirmed against cryptsetup's own metadata (`Plan::confirm`;
   `28` when they disagree): the `td-upgrade` token's removal, then each
   pending token's, each a key-less header commit. Then it sends `14`.
+- **Protector management** (tags 19 to 24; ENCRYPTION.md "Protector
+  management"). The volume byte must be `03` or `04`, and root's first
+  description what its baseline admits, as for a disk proof. A request
+  first checks, over the header area `test_area` reads, that every
+  keyslot has a cost (`TestArea::all_costed`; `0f` otherwise, before its
+  first `10`), since its dump below tries every keyslot. A removal first
+  presents the choose step and takes its `16`, the chosen position,
+  which must name a removable token by its own baseline and which its
+  next description must carry (INTERNAL otherwise). The proof is a disk
+  proof's below, with its kinds, but that a removal's disk key is
+  identified among the header's fido2 tokens other than the chosen one
+  (`04` detail `01` for the chosen token's key), so the authorizing
+  token remains, and that a request keeps the proof's header copy past
+  the keyslot test, to its dump. An addition then runs the new key's
+  ceremony as the upgrade's does, through `fido_disk::create_stepped`
+  for the chosen role, with every fido2 token's credential excluded
+  (`11`), and keeps its derived passphrase in clearing storage for its
+  keyslot. A request then reads the volume key from that copy through
+  the runner's existing dump shape, the selector's (ENCRYPTION.md
+  "Selector release"): `cryptsetup luksDump --dump-volume-key
+  --batch-mode --volume-key-file FILE --key-file=- COPY`, the proof's
+  secret on standard input, run bounded as the keyslot test is, FILE a
+  new name in the worker's own mode-0700 directory under `/run`, beside
+  the copy. cryptsetup 2.8.8 tries every keyslot (`CRYPT_ANY_SLOT`) for
+  this, not the tested one, which the check above bounds, and creates
+  FILE `O_CREAT|O_EXCL` at mode 0400. The worker reads exactly 64 bytes,
+  the header's volume-key size, into clearing storage, then unlinks FILE
+  and the copy whether or not the read succeeded (`0f` on any failure,
+  the test having passed); a killed worker's FILE goes with its
+  directory at the next worker's start. The key reaches no frame,
+  string, error or log, and is zeroed once the tag is computed or at any
+  end. The dump runs within the proof's 120 seconds, before `12`. After
+  the last step's `11` the worker sends `12` only with 120 seconds of
+  its deadline left (`08` otherwise); after root's `13`, before any
+  write, it re-reads the header (`28` if it is not the baseline's) and
+  plans with td-protector's `manage` planners from the re-read view,
+  confirmed against cryptsetup's own metadata (`Plan::confirm`; `28`
+  when they disagree, or when a planner refuses what the baseline
+  admitted, since the header changed). Its writes, through
+  td-protector's runner: for an addition, the new keyslot added under
+  the proof's secret with the new key's derived passphrase, its fido2
+  token naming it, then the new keyslot's test on a fresh copy (`0e`
+  should it refuse); for a removal, the chosen token's keyslot killed
+  under the proof's secret, then the token; for a recovery-key removal,
+  the marker's keyslot killed under the disk key's passphrase, then the
+  marker; for a request, a pending `td-request` token's removal, then
+  the new request, its 32-byte nonce from `/dev/random` and its tag from
+  td-protector's `request::tag` under the dumped key over the re-read
+  header (ENCRYPTION.md "Request tag"), imported key-less. Then it sends
+  `14`. A failure after the first write is uncertain to root; what it
+  leaves is ENCRYPTION.md's rule for a cut.
 - **Disk proof** (tags 13 to 15). Root's first description must be the
   proof's first step for the worker's account, one its own baseline
   offers (consent's `proof_start`: a `recovery-key` marker, or a fido2
@@ -1798,7 +1857,8 @@ consent time holds no I/O.
   under `/run`, mode 0700, and reads the copy again, which must equal
   what it read (`28` otherwise). `cryptsetup open --test-passphrase
   --header COPY --key-slot N --key-file=- DEVICE` then reads, and
-  repairs, only the copy, which is removed afterwards. A worker killed
+  repairs, only the copy, which is removed afterwards, after its
+  volume-key dump for a request. A worker killed
   meanwhile leaves its copy behind, so each worker's start removes the
   copies dead workers left: real directories root owns, named exactly
   for a pid no live process has, a live worker's left alone. The
@@ -1817,7 +1877,8 @@ consent time holds no I/O.
 
 Its failure kinds are td-secret's login worker's where they mean the
 same (`01` to `08` for a disk key's PIN, presence, devices and time,
-`04` a key that is no header token's, `06` a new key td's creation
+`04` a key that is no header token's, detail `01` a removal's chosen
+token's, `06` a new key td's creation
 refuses, with its detail, `06` detail `06` among them for a probe that
 does not select the new credential, `11` a new key already holding one
 of the excluded credentials, `0e` an uncertain write, `0f`, a repeat
@@ -1827,7 +1888,7 @@ included, and `10`), and its own:
 | Byte | Kind |
 | --- | --- |
 | `20` | VOLUME: no encrypted td volume, or a header td's reader refuses |
-| `21` | STATE: a volume state the operation does not take, such as an unencrypted or upgrading volume for a selector update, a header not converged for an upgrade, one past U0 for a cancellation, or a proof the header has no protector for |
+| `21` | STATE: a volume state the operation does not take, such as an unencrypted or upgrading volume for a selector update, a header not converged for an upgrade, one past U0 for a cancellation, or a proof the header has no protector for; for protector management, root's details apply (td-authd/DESIGN.md amendment 10): `01` a role the shape does not take or has no room for, `02` a removal below the shape's minimums, `03` a request without the protector it acts on, and `00` otherwise |
 | `22` | NOT CURRENT: the running deployment is not an acknowledged `current` with no pending attempt |
 | `23` | DEPLOYMENT: the kernel or the template does not match `current`'s manifest |
 | `24` | ESP: the ESP is not td's layout or lacks the space ("Selector update") |
@@ -1876,6 +1937,20 @@ sweep removes only dead workers' copies root owns. td-protector's
 is stale or damaged, the exact invocation leaves the volume's SHA-256
 unchanged for a right key and a wrong one (exit 2, `26`), while
 cryptsetup repairs the copy.
+
+Protector management's drive each operation over protected headers the
+test builds, in both shapes, through a scripted `Keys` and cryptsetup:
+each proof and its kinds, a removal's choose step and its digit, a
+removal's disk key that is the chosen token's (`04` detail `01`), an
+addition's ceremony with every credential excluded, every `21` detail
+from the baseline, a change after `13`, metadata that disagrees and a
+cut at each write; and each request's dump, a header holding a keyslot
+without a cost (`0f` before any step), a dump that fails or whose file
+is not 64 bytes (`0f`), FILE and the copy removed on every path, a
+pending request replaced, and the imported tag against
+`tests/token_vectors.py`'s. td-protector's `keyslot_test` also runs the
+exact dump against the pinned cryptsetup over a header copy of a volume
+it formats with a known volume key, which the file reproduces.
 
 ## 6. Signing and keys
 
