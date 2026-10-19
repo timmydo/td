@@ -94,14 +94,16 @@ pub(crate) fn cancellation() -> Request {
     Request::new(NONCE, 1000, Operation::UpgradeCancel { key: approval() }).unwrap()
 }
 
-/// A baseline frame: the volume byte, a recovery-key marker, the tokens
-/// and the standing.
+/// A baseline frame: the volume byte, a recovery-key marker, the tokens,
+/// each naming a keyslot, no tpm-pin, lockout or request, and the
+/// standing.
 pub(crate) fn baseline_frame(volume: u8, tokens: &[(u8, [u8; 4])], current: bool) -> Vec<u8> {
     let mut frame = vec![0x18, volume, 1, tokens.len() as u8];
     for (role, fingerprint) in tokens {
-        frame.push(*role);
+        frame.extend([*role, 1]);
         frame.extend_from_slice(fingerprint);
     }
+    frame.extend([0, 0, 0]);
     if current {
         frame.push(0);
         frame.extend_from_slice(&ID);
@@ -284,7 +286,9 @@ fn scripted_worker() {
                 "upgrading" => baseline_frame(2, &[], true),
                 "not-current" => baseline_frame(3, &[(1, [1; 4])], false),
                 // A volume byte past 05, a recovery byte past 01, five
-                // tokens, a role past 02, a short ID and a trailing byte.
+                // tokens, a role past 02, a keyslot byte past 01, three
+                // tpm-pin tokens, a lockout byte past 01, a request byte
+                // past 03, a short ID and a trailing byte.
                 "volume" => baseline_frame(6, &[], true),
                 "recovery" => {
                     let mut frame = baseline_frame(1, &[], true);
@@ -293,6 +297,21 @@ fn scripted_worker() {
                 }
                 "tokens" => baseline_frame(4, &[(1, [1; 4]); 5], true),
                 "role" => baseline_frame(4, &[(3, [1; 4])], true),
+                "named" => {
+                    let mut frame = baseline_frame(4, &[(1, [1; 4])], true);
+                    frame[5] = 2;
+                    frame
+                }
+                field @ ("tpm-pins" | "lockout" | "request") => {
+                    let mut frame = baseline_frame(4, &[], true);
+                    let (at, byte) = match field {
+                        "tpm-pins" => (4, 3),
+                        "lockout" => (5, 2),
+                        _ => (6, 4),
+                    };
+                    frame[at] = byte;
+                    frame
+                }
                 "short" => {
                     let mut frame = baseline_frame(1, &[], true);
                     frame.pop();
@@ -601,6 +620,10 @@ fn the_baseline_refuses_before_any_description() {
         ("baseline:recovery", INTERNAL),
         ("baseline:tokens", INTERNAL),
         ("baseline:role", INTERNAL),
+        ("baseline:named", INTERNAL),
+        ("baseline:tpm-pins", INTERNAL),
+        ("baseline:lockout", INTERNAL),
+        ("baseline:request", INTERNAL),
         ("baseline:short", INTERNAL),
         ("baseline:trailing", INTERNAL),
     ] {

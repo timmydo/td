@@ -2852,31 +2852,40 @@ commit.
      changed, and the runner's progress; and td-boot's dispatch to it,
      with its power check, U5's protected release and the device-bound
      flow's removal of pending orphans.
-   - **8g, protector management.** Its commits, in order: a
-     documentation commit fixing the six operations' wire (td-authd's
-     amendment 10: `20 04` to `20 09` with their proof and role bytes,
-     consent tags 19 to 24 and the choose step, root's `21` details and
-     the ceilings), the storage worker's operations, its baseline's
-     tpm-pin, lockout and request bytes and its volume-key dump, the
-     compositor's screens, the request tag's encoding and the
-     selector halves' order and texts, before their code;
-     td-protector's request format (the `nonce` and `tag` fields and
-     `tpm-reenroll`), its tag, the reader's bounds and the header's
-     re-measure, and `test_area`'s every-keyslot cost; td-protector's
-     `manage` planners and the boot's request planner; the shared
-     consent codec's tags 19 to 24; then `storage-operation`'s addition,
-     removal and recovery-key removal with their td-authd supervision
-     and compositor screens, which production refuses; then its three
-     requests the same way; and last td-boot's selector halves: the
-     tag's verification, the PIN change, the TPM clear, whose refusal
-     names a TPM with TPM2_Clear disabled (td-tpm's `ClearDisabled`,
-     `TPM_RC_DISABLED`), which only firmware can enable, and TPM
-     re-enrollment for a cleared or replaced TPM, confirmed after a
-     token or recovery-key release, which retires the stale tpm-pin
-     keyslots and tokens and the stale lockout token and takes the new
-     TPM's lockout with a fresh token in that boot. The seal is the next
-     boot's ordinary reseal, which that token anchors ("Bus"), since no
-     boot anchors a seal to its own take; no second TPM clear.
+   - **8g, protector management.** Its commits, in order:
+     1. A documentation commit, before their code. It fixes the six
+        operations' wire (td-authd's amendment 10: `20 04` to `20 09`
+        with their proof and role bytes, consent tags 19 to 24 and the
+        choose step, root's `21` details and the ceilings), the storage
+        worker's operations, its baseline's tpm-pin, lockout and
+        request bytes and its volume-key dump, the compositor's screens,
+        the request tag's encoding and the selector halves' order and
+        texts.
+     2. td-protector's request format (the `nonce` and `tag` fields
+        and `tpm-reenroll`), its tag, the reader's bounds and the
+        header's re-measure, and `test_area`'s every-keyslot cost.
+     3. td-protector's `manage` planners and the boot's request
+        planner.
+     4. The shared consent codec's tags 19 to 24.
+     5. `storage-operation`'s addition, removal and recovery-key
+        removal.
+     6. Their td-authd supervision.
+     7. Their compositor screens. Production still refuses the
+        operations.
+     8. The three requests, in the same three steps.
+     9. Last, td-boot's selector halves:
+        - the tag's verification;
+        - the PIN change;
+        - the TPM clear, whose refusal names a TPM with TPM2_Clear
+          disabled (td-tpm's `ClearDisabled`, `TPM_RC_DISABLED`),
+          which only firmware can enable;
+        - TPM re-enrollment for a cleared or replaced TPM, confirmed
+          after a token or recovery-key release. It retires the stale
+          tpm-pin keyslots and tokens and the stale lockout token, and
+          takes the new TPM's lockout with a fresh token in that boot.
+          The seal is the next boot's ordinary reseal, which that token
+          anchors ("Bus"), since no boot anchors a seal to its own
+          take; no second TPM clear.
    - **8h, the combined oracle.** The host's virtual FIDO2 authenticator
      over QEMU `usb-redir` ("Acceptance evidence"); then
      `qemu-boot-protected` with every leg below, which are also 8c's

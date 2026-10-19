@@ -1595,9 +1595,11 @@ states remains governed by [ENCRYPTION.md](ENCRYPTION.md).
 ### Storage operation worker
 
 Fixed by [ENCRYPTION.md](ENCRYPTION.md) increment 8e's documentation
-commit before its code, and the upgrade and its cancellation by 8f's.
+commit before its code, the upgrade and its cancellation by 8f's, and
+protector management by 8g's.
 `storage_operation.rs` implements the selector update, the disk
-proof's keyslot test, the upgrade's phase 1 and its cancellation; the
+proof's keyslot test, the upgrade's phase 1 and its cancellation, and
+protector management's addition, removal and recovery-key removal; the
 upgrade boot is the selector's. td-authd refuses every
 storage operation in a production build until that document's item 9,
 and starts a disk proof's worker only in builds that decode the proof,
@@ -1648,8 +1650,9 @@ is `18`, then:
   shape, `05` a header the reader refuses;
 - `01` when a `recovery-key` marker names a keyslot, else `00`;
 - the fido2 token count, 0 to 4, then each token's role (`01` primary,
-  `02` recovery) and fingerprint, the first four bytes of SHA-256 over
-  its credential ID, in token-number order;
+  `02` recovery), `01` when it names a keyslot, else `00`, and its
+  fingerprint, the first four bytes of SHA-256 over its credential ID,
+  in token-number order;
 - the count of tpm-pin tokens naming a keyslot, 0 to 2, `01` when a
   lockout token is on the header, else `00`, and the request byte, `00`
   with no `td-request` token or `01` to `03` for its operation
@@ -1765,7 +1768,8 @@ consent time holds no I/O.
   pending token's, each a key-less header commit. Then it sends `14`.
 - **Protector management** (tags 19 to 24; ENCRYPTION.md "Protector
   management"). The volume byte must be `03` or `04`, and root's first
-  description what its baseline admits, as for a disk proof.
+  description exactly the one its baseline gives (consent's
+  `Protected::admits`), or the worker fails as INTERNAL before any I/O.
   - *Before the first `10`.* A request checks, over the header area
     `test_area` reads, that every keyslot has a cost
     (`TestArea::all_costed`; `0f` otherwise), since its dump below
@@ -1775,15 +1779,19 @@ consent time holds no I/O.
     removable token by the worker's own baseline, and the next
     description must carry it (INTERNAL otherwise).
   - *The proof.* A disk proof's, below, with its kinds, except that:
-    - a removal's disk key is identified among the header's fido2
-      tokens other than the chosen one (`04` detail `01` for the chosen
-      token's own key), so the authorizing token remains;
+    - a disk key is identified among the FIDO2 protectors, the fido2
+      tokens naming a keyslot, so an orphan's key is `04`;
+    - a removal's disk key may not be the chosen token's (`04` detail
+      `01`, before its PIN), so the authorizing token remains;
+    - the proof's secret is kept, zeroed on drop, for the writes;
     - a request keeps the proof's header copy past the keyslot test,
       for its dump.
   - *An addition's new key.* Its ceremony runs as the upgrade's does,
     through `fido_disk::create_stepped` for the chosen role, with every
-    fido2 token's credential excluded (`11`). The derived passphrase is
-    kept in clearing storage for its keyslot.
+    fido2 token's credential excluded (`11`). Its connect step waits for
+    one key that is not the one the proof used, so the authorizing key
+    must be removed first. The derived passphrase is kept in clearing
+    storage for its keyslot.
   - *A request's volume key.* The worker reads it from that header copy
     through the runner's existing dump shape, the selector's
     (ENCRYPTION.md "Selector release"): `cryptsetup luksDump
@@ -1885,13 +1893,13 @@ consent time holds no I/O.
 
 Its failure kinds are td-secret's login worker's where they mean the
 same (`01` to `08` for a disk key's PIN, presence, devices and time,
-`04` a key that is no header token's, detail `01` a removal's chosen
-token's, `06` a new key td's creation
-refuses, with its detail, `06` detail `06` among them for a probe that
-does not select the new credential, `11` a new key already holding one
-of the excluded credentials, `0e` an uncertain write, `0f`, a repeat
-that does not reproduce the proof and a credential ID over 255 bytes
-included, and `10`), and its own:
+`04` a key that is no header token's, for protector management no FIDO2
+protector's, detail `01` a removal's chosen token's, `06` a new key td's
+creation refuses, with its detail, `06` detail `06` among them for a
+probe that does not select the new credential, `11` a new key already
+holding one of the excluded credentials, `0e` an uncertain write, `0f`,
+a repeat that does not reproduce the proof and a credential ID over 255
+bytes included, and `10`), and its own:
 
 | Byte | Kind |
 | --- | --- |
@@ -1950,9 +1958,9 @@ Protector management's drive each operation over protected headers the
 test builds, in both shapes, through a scripted `Keys` and cryptsetup:
 each proof and its kinds, a removal's choose step and its digit, a
 removal's disk key that is the chosen token's (`04` detail `01`), an
-addition's ceremony with every credential excluded, every `21` detail
-from the baseline, a change after `13`, metadata that disagrees and a
-cut at each write; and each request's dump, a header holding a keyslot
+addition's ceremony with every credential excluded, a description the
+baseline does not give, a change after `13`, metadata that disagrees and
+a cut at each write; and each request's dump, a header holding a keyslot
 without a cost (`0f` before any step), a dump that fails or whose file
 is not 64 bytes (`0f`), FILE and the copy removed on every path, a
 pending request replaced, and the imported tag against

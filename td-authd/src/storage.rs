@@ -144,8 +144,10 @@ struct Baseline {
 }
 
 /// `18`, the volume byte, the recovery-key byte, up to four fido2 tokens
-/// with their roles and fingerprints, then `00` and the running
-/// deployment's manifest ID, or `01`.
+/// with their roles, keyslot bytes and fingerprints, the tpm-pin count,
+/// the lockout and request bytes, then `00` and the running deployment's
+/// manifest ID, or `01`. Protector management's bytes are range-checked
+/// here; its operations do not yet read them.
 fn baseline(frame: &[u8]) -> Option<Baseline> {
     let [BASELINE, volume, recovery, count, rest @ ..] = frame else {
         return None;
@@ -162,13 +164,20 @@ fn baseline(frame: &[u8]) -> Option<Baseline> {
     if *recovery > 1 || *count > 4 {
         return None;
     }
-    let (tokens, standing) = rest.split_at_checked(usize::from(*count) * 5)?;
-    let (tokens, []) = tokens.as_chunks::<5>() else {
+    let (tokens, rest) = rest.split_at_checked(usize::from(*count) * 6)?;
+    let (tokens, []) = tokens.as_chunks::<6>() else {
         return None;
     };
-    if !tokens.iter().all(|[role, ..]| matches!(role, 1 | 2)) {
+    if !tokens
+        .iter()
+        .all(|[role, named, ..]| matches!(role, 1 | 2) && *named <= 1)
+    {
         return None;
     }
+    // The tpm-pin count, the lockout byte and the request byte.
+    let [0..=2, 0 | 1, 0..=3, standing @ ..] = rest else {
+        return None;
+    };
     let current = match standing {
         [0, id @ ..] => Some(id.try_into().ok()?),
         [1] => None,
@@ -179,7 +188,7 @@ fn baseline(frame: &[u8]) -> Option<Baseline> {
         recovery: *recovery == 1,
         tokens: tokens
             .iter()
-            .map(|[_, a, b, c, d]| [*a, *b, *c, *d])
+            .map(|[_, _, a, b, c, d]| [*a, *b, *c, *d])
             .collect(),
         current,
     })
