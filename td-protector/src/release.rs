@@ -119,6 +119,7 @@ pub trait Tpm {
                 client.set_dictionary_attack(primary, auth, lockout::DA_PARAMETERS)
             }
             LockoutCommand::Reset => client.reset_lockout(primary, auth),
+            LockoutCommand::Clear => client.clear(primary, auth),
         }
     }
 }
@@ -126,14 +127,16 @@ pub trait Tpm {
 /// The lockout hierarchy's commands a release sends (ENCRYPTION.md
 /// "Lockout"): td-tpm's take (TPM2_HierarchyChangeAuth from the empty
 /// authorization, then TPM2_SetPrimaryPolicy), the policy alone,
-/// TPM2_DictionaryAttackParameters with td's values, and
-/// TPM2_DictionaryAttackLockReset.
+/// TPM2_DictionaryAttackParameters with td's values,
+/// TPM2_DictionaryAttackLockReset, and a requested TPM clear's TPM2_Clear
+/// (ENCRYPTION.md "TPM clear").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LockoutCommand {
     Take,
     ClearPolicy,
     Parameters,
     Reset,
+    Clear,
 }
 
 /// The kernel resource manager, `/dev/tpmrm0`.

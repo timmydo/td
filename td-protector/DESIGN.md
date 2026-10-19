@@ -687,10 +687,9 @@ them. Protector management's planners (8g, below) are current: the
 storage worker plans through `manage` and seals requests, and the
 selector's protected release checks a request's tag. It removes one
 whose tag fails, a re-enrollment on the recorded primary, and a clear or
-re-enrollment with no TPM td can prove. It carries out a PIN change. It
-asks no TPM clear's or re-enrollment's question yet, so such a request
-stays. The lockout's clear and the secure-boot and config tokens are not
-current.
+re-enrollment with no TPM td can prove. It carries out a PIN change and
+a TPM clear. It asks no re-enrollment's question yet, so such a request
+stays. The secure-boot and config tokens are not current.
 
 **Lockout.** `lockout::seal(volume_key, uuid, l, name)` and `open`
 implement ENCRYPTION.md's lockout token: HKDF-SHA256 over the volume key
@@ -714,8 +713,9 @@ proof and the reset are the protected release's (below), over td-tpm's
 lockout commands (td-tpm/DESIGN.md "Lockout hierarchy") with the
 parameters `DA_MAX_TRIES` 32, `DA_RECOVERY_SECS` 600 and
 `DA_LOCKOUT_RECOVERY_SECS` 86400 (`lockout::DA_PARAMETERS`, pinned by
-test); none matches parameters in place of a proof. The clear lands with
-the `tpm-clear` request.
+test); none matches parameters in place of a proof. The clear,
+TPM2_Clear under `L`, is a confirmed `tpm-clear` request's ("The
+selector's `request::plan`").
 
 **Tokens.** Each protected token is a LUKS2 token object with exactly
 these keys, in this order, every text a canonical decimal or lowercase
@@ -1339,8 +1339,8 @@ out (at one of three points), left for a later boot, or carried out.
 | --- | --- |
 | Removed as the plan's first write | its tag fails; it is declined; it is a re-enrollment on the recorded primary, a PIN release's included; it is a clear or re-enrollment with no TPM td can prove this boot, before its question (`Removed::Unproven`) |
 | Removed with the reseal's plan | a PIN change at a boot whose confirmed reseal's plan runs, since that sets a new PIN itself |
-| Removed at that step | a clear whose TPM the lockout step cannot prove, or that TPM2_Clear refuses |
-| Left for a later boot | a PIN change at a boot by another protector, or one whose seal or verification failed; a clear on the recorded primary whose lockout step met `TPM_RC_LOCKOUT`, or whose TPM2_Clear answer was lost |
+| Removed at that step | a clear whose TPM the lockout step cannot prove, or that TPM2_Clear itself refuses |
+| Left for a later boot | a PIN change at a boot by another protector, or one whose seal or verification failed; a clear on the recorded primary whose lockout step or TPM2_Clear met `TPM_RC_LOCKOUT`, whose DictionaryAttackParameters was refused after the proof, whose TPM2_Clear answer was lost, or a command before which was refused |
 | Carried out | otherwise, in ENCRYPTION.md's order |
 
 `request::fate` gives the pending request's number and fate from the
@@ -1391,8 +1391,32 @@ Its choices beyond ENCRYPTION.md's text, each failing closed:
   fails: the staged update waits for a PIN boot without one.
 - As for the reseal, no new PIN is asked with no lockout token on the
   header, or a plan the planner refuses: the request stays. One whose
-  lockout take or proof then fails is discarded as a reseal is, and its
-  request stays for the next PIN boot.
+  lockout take or proof then fails, or whose seal no lockout token on
+  the header anchors under the volume key, is discarded as a reseal is,
+  and its request stays for the next PIN boot.
+- A clear's question is asked only where the lockout step is due, the
+  TPM-primary shape with a TPM this boot capped, on a header with a
+  lockout token; otherwise the request is unproven. The token is the
+  worker's precondition too: without one the take would write a token
+  the clear's plan, read from the release header, does not retire. End
+  of input, a refused entry and any answer but `clear` decline.
+- A confirmed clear's plan runs once TPM2_Clear succeeded, in place of
+  the boot's own. Where it is not run, at the lockout step or at
+  TPM2_Clear, the boot's own plan runs instead, after the lockout step,
+  beside the request's removal or not.
+- A lockout step that met a locked-out hierarchy, at its take or its
+  proof, or whose DictionaryAttackParameters was refused after its
+  proof, leaves the clear for a later boot; every other failure is a TPM
+  td cannot prove.
+- Only TPM2_Clear's own refusal removes the request with `td: the TPM
+  refuses to be cleared; clear it from firmware setup`: `TPM_RC_DISABLED`,
+  a wrong authorization, or a refusal naming TPM2_Clear. No answer, a
+  locked-out hierarchy, or a command before TPM2_Clear refused leaves
+  it: whether the TPM acted is the next boot's to find.
+- No counter reset follows a TPM2_Clear sent, refused or not: a refusal
+  can be forged over a clear done, and a reset under the old `L` would
+  spend the cleared TPM's lockout attempt. A predicted update's
+  protector is discarded before it.
 - The new PIN is sealed to the released token's PCRs, under the primary
   it records, and verified with one Unseal, as a reseal's is.
 - A reseal beside a pending clear or re-enrollment is refused

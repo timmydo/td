@@ -79,8 +79,7 @@ pub(crate) const ENTRY_KEYS: &str =
      it is not shown as it is typed";
 /// Printed before the reseal question: on a keyboard whose letters sit
 /// elsewhere, the answer is typed where a US keyboard has them.
-pub(crate) const RESEAL_KEYS: &str =
-    "type the answer at its US key positions: the keyboard is read as a US one";
+pub(crate) const RESEAL_KEYS: &str = protected::ANSWER_KEYS;
 /// The one answer that confirms the reseal: no default, and no other word.
 pub(crate) const RESEAL_WORD: &[u8] = b"reseal";
 /// secret-line's longest line (its `LINE_MAX`).
@@ -390,6 +389,7 @@ fn unlock_upgrading<T: Tpm, C: Runner, F: Fido>(
             partition,
             tpm,
             cryptsetup,
+            &mut prompt,
             key_directory,
             console,
         ));
@@ -584,6 +584,7 @@ fn unlock_protected<T: Tpm, C: Runner, F: Fido>(
         partition,
         tpm,
         cryptsetup,
+        &mut prompt,
         key_directory,
         console,
     )
@@ -631,12 +632,14 @@ enum Finish<'a, 'r> {
 /// A protected release's open: the mapping on the released keyslot alone
 /// with the released key, the volume key taken with it, then `finish`.
 /// A failed open fails the boot before any plan.
+#[allow(clippy::too_many_arguments)]
 fn open_released<T: Tpm, C: Runner>(
     released: protected::Released,
     finish: Finish<'_, '_>,
     partition: &Path,
     tpm: Option<&mut T>,
     cryptsetup: &mut C,
+    prompt: &mut dyn protected::Prompt,
     key_directory: &Path,
     console: &mut dyn FnMut(&str),
 ) -> Unlock {
@@ -679,6 +682,7 @@ fn open_released<T: Tpm, C: Runner>(
             key.expose(),
             tpm,
             cryptsetup,
+            prompt,
             console,
         )
         .predicted
@@ -3154,6 +3158,7 @@ pub(crate) mod tests {
             protected::NEW_PIN_PROMPT,
             protected::NEW_PIN_AGAIN_PROMPT,
             protected::CHANGE_PIN_PROMPT,
+            protected::CLEAR_PROMPT,
             protected::RESEAL_PROMPT,
             "td security key PIN (255 attempts left): ",
         ] {

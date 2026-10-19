@@ -1395,18 +1395,18 @@ the plan only after the cap, the TPM wait) and replaces steps 2 and 3:
    fails, one declined and a re-enrollment on the recorded primary are
    removed first ("Protector management"), a PIN change a confirmed
    reseal supersedes with the reseal's plan, and a clear whose TPM the
-   lockout step cannot prove, or that TPM2_Clear refuses, at that step;
-   a confirmed reseal's keyslot, or a requested PIN change's, is added
-   under the released secret, its token imported and its keyslot tested,
-   then every other tpm-pin keyslot and token is retired, and orphans
-   are removed under the protected rules (td-protector, "Protected
-   roles"); then a confirmed re-enrollment's retirement of the stale
-   tpm-pin and lockout tokens, or a confirmed clear's on a TPM whose
-   primary already changed. The lockout take or proof, the counter, a
-   confirmed TPM clear with its retirements, and a staged update's
-   authentication, import and commit follow in that order, each needing
-   the volume key or the open volume, and a carried-out request is
-   removed just before the first write that changes the state its tag
+   lockout step cannot prove, or that TPM2_Clear itself refuses, at that
+   step; a confirmed reseal's keyslot, or a requested PIN change's, is
+   added under the released secret, its token imported and its keyslot
+   tested, then every other tpm-pin keyslot and token is retired, and
+   orphans are removed under the protected rules (td-protector,
+   "Protected roles"); then a confirmed re-enrollment's retirement of
+   the stale tpm-pin and lockout tokens, or a confirmed clear's on a TPM
+   whose primary already changed. The lockout take or proof, the
+   counter, a confirmed TPM clear with its retirements, and a staged
+   update's authentication, import and commit follow in that order, each
+   needing the volume key or the open volume, and a carried-out request
+   is removed just before the first write that changes the state its tag
    covers; with a confirmed reseal the take or proof runs before the
    reseal's plan, which runs only once it succeeded ("Lockout"). The
    selector then selects, writes the admission record ("Verified account
@@ -2402,8 +2402,8 @@ verified:
 
 1. The selector prints `td: a TPM clear was requested: it destroys the
    TPM PIN protector, the Secure Boot key and every key the TPM holds
-   for this system`, then td-boot's `RESEAL_KEYS` key-position line,
-   and asks `td: type clear to clear the TPM: `.
+   for this system`, then the `ANSWER_KEYS` key-position line, and
+   asks `td: type clear to clear the TPM: `.
 2. Exactly `clear` confirms. Any other answer declines, and the plan
    removes the request.
 
@@ -2441,9 +2441,9 @@ Other outcomes:
 | Situation | What happens |
 | --- | --- |
 | The TPM's storage primary is not the recorded one: a clear whose TPM2_Clear answer was lost, or a replaced TPM | The selector asks re-enrollment's question instead, `td: this TPM's storage primary is not the one td recorded` and `td: type reenroll to enroll this TPM: `. Confirmed, it runs no TPM2_Clear and retires the tokens and removes the request where re-enrollment does; that boot's lockout step takes this TPM's lockout. |
-| On the recorded primary, the lockout step is refused with `TPM_RC_LOCKOUT` | Nothing was checked; the request stays for a later boot. |
-| A TPM td cannot prove, or TPM2_Clear refused, `TPM_RC_DISABLED` among them (`td: the TPM refuses to be cleared; clear it from firmware setup`) | The request is removed at that step, with the reason printed, and nothing is retired: the firmware's own clear is then the way. |
-| TPM2_Clear's answer is lost | The request stays. The next boot finds the recorded primary and asks again, or another primary and asks as in the first row. |
+| On the recorded primary, the lockout step or TPM2_Clear is refused with `TPM_RC_LOCKOUT`, or the lockout step's DictionaryAttackParameters is refused after its proof | Nothing was cleared; the request stays for a later boot. |
+| A TPM td cannot prove, or TPM2_Clear itself refused, `TPM_RC_DISABLED` among the reasons (`td: the TPM refuses to be cleared; clear it from firmware setup`) | The request is removed at that step, with the reason printed, and nothing is retired: the firmware's own clear is then the way. |
+| TPM2_Clear's answer is lost, or a command before it in the same exchange is refused | The request stays. The next boot finds the recorded primary and asks again, or another primary and asks as in the first row. |
 | A crash during the retirements | A stale token is left and no request. The owner requests re-enrollment, which that token admits. |
 
 No reseal is offered while a clear or re-enrollment request is pending,
@@ -2465,7 +2465,7 @@ updates"). Re-enrollment adopts it:
    included, is removed with no prompt, so neither a planted request
    nor one on a TPM td still recognises can retire the anchor.
 3. It prints `td: this TPM's storage primary is not the one td
-   recorded` and the `RESEAL_KEYS` line, and asks `td: type reenroll to
+   recorded` and the `ANSWER_KEYS` line, and asks `td: type reenroll to
    enroll this TPM: `. Exactly `reenroll` confirms; any other answer
    declines, and the plan removes the request.
 4. Confirmed, the plan kills the stale tpm-pin keyslots, removes the
@@ -2494,7 +2494,8 @@ If it fails:
 
 **Typed answers.** `clear` and `reenroll` are read as the reseal's
 answer is ("Keyboard console"): at their US key positions, after the
-`RESEAL_KEYS` line that says so. A mistyped answer declines, which is
+`ANSWER_KEYS` line that says so (td-protector's, which td-boot's
+reseal prints as `RESEAL_KEYS`). A mistyped answer declines, which is
 the safe outcome.
 
 **Threat and limits.**

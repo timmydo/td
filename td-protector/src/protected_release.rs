@@ -25,7 +25,7 @@ use crate::protected::{
 use crate::protected_plan::{self, Input, Opened, Step};
 use crate::recovery::{RecoveryKey, RecoveryText};
 use crate::release::{LockoutCommand, Runner, Tpm};
-use crate::request::{self, Boot, Fate, Primary, Removed, Resolved};
+use crate::request::{self, Boot, Fate, Primary, Question, Removed, Resolved};
 use crate::upgrade;
 use crate::{cap, lockout, read_random, CapError, ObserveError, Secret, UnsealError};
 use crate::{POLICY_PCR_REFUSED, SECRET_LEN};
@@ -94,6 +94,19 @@ pub const RESEAL_WARNING: &str = "a reseal binds release to this boot chain unde
 /// their US key positions.
 pub const RESEAL_KEYS: &str =
     "type the answer and the new PIN at their US key positions: the keyboard is read as a US one";
+
+/// Printed before a typed answer that is no PIN: td-boot's reseal, a TPM
+/// clear's and a re-enrollment's (ENCRYPTION.md "Typed answers").
+pub const ANSWER_KEYS: &str =
+    "type the answer at its US key positions: the keyboard is read as a US one";
+/// Printed after the cap before a verified TPM clear request's question.
+pub const CLEAR_REQUESTED: &str = "td: a TPM clear was requested: it destroys the TPM PIN \
+     protector, the Secure Boot key and every key the TPM holds for this system";
+/// The clear's question; only `CLEAR_WORD` confirms.
+pub const CLEAR_PROMPT: &str = "td: type clear to clear the TPM: ";
+pub const CLEAR_WORD: &[u8] = b"clear";
+/// Printed when TPM2_Clear refuses, `TPM_RC_DISABLED` among its reasons.
+pub const CLEAR_REFUSED: &str = "td: the TPM refuses to be cleared; clear it from firmware setup";
 
 /// One console entry, zeroed on drop and neither `Debug`, `Display` nor
 /// `Clone`.
@@ -553,7 +566,8 @@ pub struct Finished {
     /// The resealed protector's keyslot, a PIN change's included, once its
     /// test passed.
     pub resealed: Option<u8>,
-    /// This boot took or proved the TPM's lockout authorization.
+    /// This boot took or proved the TPM's lockout authorization, a
+    /// TPM2_Clear after it included.
     pub lockout: bool,
     /// A selector update's predicted protector, naming the keyslot that
     /// released, for the commit to import; none once this boot refused
@@ -569,8 +583,12 @@ pub struct Finished {
 /// the TPM-primary shape the lockout's take or proof; with one, the take
 /// or proof first and the reseal's plan only once it succeeded, so a take
 /// or proof that fails discards the object before its import; then the
-/// counter, and its reset after a security-key or recovery-key release. The TPM is reached only
+/// counter, a confirmed TPM clear's TPM2_Clear and its plan, in place of
+/// the boot's own, and the counter's reset after a security-key or
+/// recovery-key release without one. A TPM clear's question is asked at
+/// `prompt`, after the cap with the tag verified. The TPM is reached only
 /// when this boot's own cap closed PCR 12; nothing here halts the boot.
+#[allow(clippy::too_many_arguments)]
 pub fn finish<T: Tpm, C: Runner>(
     released: Released,
     header: &Header,
@@ -578,6 +596,7 @@ pub fn finish<T: Tpm, C: Runner>(
     volume_key: &[u8],
     tpm: Option<&mut T>,
     cryptsetup: &mut C,
+    prompt: &mut dyn Prompt,
     console: &mut dyn FnMut(&str),
 ) -> Finished {
     let Released {
@@ -592,6 +611,7 @@ pub fn finish<T: Tpm, C: Runner>(
         new_pin,
     } = released;
     let mut reseal = reseal;
+    let mut predicted = predicted;
     let mut finished = Finished::default();
     let dropped = |console: &mut dyn FnMut(&str)| {
         if predicted.is_some() {
@@ -644,8 +664,14 @@ pub fn finish<T: Tpm, C: Runner>(
         reseal: reseal.is_some() && new_pin.is_none(),
     };
     let fated = match (pending, uuid) {
-        (Some(_), Some(uuid)) => request::fate(header, volume_key, &uuid, &boot)
-            .map(|(number, fate)| (uuid, number, resolve(fate, console))),
+        (Some(_), Some(uuid)) => {
+            request::fate(header, volume_key, &uuid, &boot).map(|(number, fate)| {
+                // The take this boot would make writes a token the clear's
+                // plan, read from this header, would not retire.
+                let askable = lockout_due && protected_plan::lockout(header).is_some();
+                (uuid, number, resolve(fate, askable, prompt, console))
+            })
+        }
         (Some(_), None) => {
             console("td: a disk request stays: the volume's UUID is not a LUKS2 UUID");
             None
@@ -661,6 +687,12 @@ pub fn finish<T: Tpm, C: Runner>(
         console("the new PIN's protector is discarded before the plan: the old TPM PIN stays");
     }
     let new = reseal.as_ref().map(|new| &new.token);
+    // A confirmed clear's plan runs once TPM2_Clear succeeded, in place of
+    // the boot's own.
+    let clearing = fated
+        .as_ref()
+        .is_some_and(|(_, _, resolved)| *resolved == Resolved::Clear);
+    let request = fated.as_ref().map(|(uuid, number, _)| (*uuid, *number));
     let mut said = None;
     let planned = match fated {
         Some((uuid, number, resolved)) => {
@@ -676,6 +708,7 @@ pub fn finish<T: Tpm, C: Runner>(
             None
         }
     };
+    let (plan, clear_plan) = if clearing { (None, plan) } else { (plan, None) };
     if plan.as_ref().is_some_and(|plan| !plan.is_empty()) || lockout_due {
         let confirmed = cryptsetup
             .metadata(device)
@@ -708,7 +741,7 @@ pub fn finish<T: Tpm, C: Runner>(
         Some(tpm) if shape == Shape::Tpm => Some(tpm.dictionary_attack()),
         _ => None,
     };
-    let lockout = match (tpm.as_deref_mut(), name) {
+    let held = match (tpm.as_deref_mut(), name) {
         (Some(tpm), Some(name)) if lockout_due => match name {
             Ok(name) => lockout_stage(
                 header,
@@ -722,11 +755,12 @@ pub fn finish<T: Tpm, C: Runner>(
             ),
             Err(error) => {
                 console(&format!("no lockout step: the storage primary: {error}"));
-                None
+                Err(Unheld::Unproven)
             }
         },
-        _ => None,
+        _ => Err(Unheld::Unproven),
     };
+    let lockout = held.as_ref().ok();
     if let Some(new) = &reseal {
         // The seal's primary must be the one a lockout token already on
         // this header records under the volume key: the header's tpm-pin
@@ -770,6 +804,72 @@ pub fn finish<T: Tpm, C: Runner>(
         }
     }
     drop(reseal);
+    match counter {
+        Some(Ok(state)) if state.counter > 0 => console(&format!(
+            "td: the TPM counted {} wrong PINs since its last reset",
+            state.counter
+        )),
+        Some(Err(error)) => console(&format!("the TPM's counter cannot be read: {error}")),
+        _ => {}
+    }
+    // A confirmed TPM clear: TPM2_Clear under the authorization this boot
+    // holds proven, then its plan; else its fate at that step.
+    let mut cleared = false;
+    let mut clear_sent = false;
+    if let (Some((uuid, number)), Some(clear)) = (request, &clear_plan) {
+        let resolved = match (lockout, tpm.as_deref_mut()) {
+            (Some((auth, primary)), Some(tpm)) => {
+                if predicted.take().is_some() {
+                    console(
+                        "the update's predicted protector is discarded before the TPM clear: the \
+                         update stays staged",
+                    );
+                }
+                clear_sent = true;
+                match tpm.lockout(LockoutCommand::Clear, primary, auth) {
+                    Ok(()) => {
+                        cleared = true;
+                        console("td: the TPM is cleared");
+                        Resolved::Clear
+                    }
+                    Err(error) if clear_refused(&error) => {
+                        console(&format!("TPM2_Clear: {error}"));
+                        console(CLEAR_REFUSED);
+                        Resolved::Removed(Removed::Refused)
+                    }
+                    // No answer, a locked-out hierarchy, or a command
+                    // before TPM2_Clear refused: whether the TPM acted is
+                    // the next boot's to find.
+                    Err(error) => {
+                        console(&format!("TPM2_Clear did not complete: {error}"));
+                        Resolved::Left
+                    }
+                }
+            }
+            _ => match held {
+                Err(Unheld::Waits) => Resolved::Left,
+                _ => Resolved::Removed(Removed::Unproven),
+            },
+        };
+        if resolved == Resolved::Left {
+            console(STAYS);
+        }
+        let replanned;
+        let steps = if cleared {
+            clear.steps()
+        } else {
+            replanned = request::plan(header, volume_key, &uuid, opened, None, number, resolved);
+            match &replanned {
+                Ok(plan) => plan.steps(),
+                Err(refusal) => {
+                    console(&format!("no plan this boot: {refusal}"));
+                    &[]
+                }
+            }
+        };
+        let said = removal_line(resolved).map(|line| (number, line));
+        run_steps(steps, device, &keys, said, cryptsetup, console);
+    }
     // The update's predicted protector goes on to the commit under the
     // reseal's rule: only beside a lockout this boot took or proved, whose
     // token on the header read at release records the object's primary
@@ -797,17 +897,13 @@ pub fn finish<T: Tpm, C: Runner>(
             }
         }
     }
-    match counter {
-        Some(Ok(state)) if state.counter > 0 => console(&format!(
-            "td: the TPM counted {} wrong PINs since its last reset",
-            state.counter
-        )),
-        Some(Err(error)) => console(&format!("the TPM's counter cannot be read: {error}")),
-        _ => {}
-    }
     if let (Some((auth, primary)), Some(tpm)) = (&lockout, tpm) {
         finished.lockout = true;
-        if method != Method::TpmPin {
+        // Not after a TPM2_Clear sent, refused or not: a refusal can be
+        // forged over a clear done, and a reset under the old `L` would
+        // spend the cleared TPM's lockout attempt, the next boot's take
+        // then refused for a day.
+        if method != Method::TpmPin && !clear_sent {
             match tpm.lockout(LockoutCommand::Reset, primary, auth) {
                 Ok(()) => console("td: the TPM's wrong-PIN counter is reset"),
                 Err(error) => console(&format!("the TPM's counter reset failed: {error}")),
@@ -843,19 +939,60 @@ fn boot_primary(
     }
 }
 
-/// A request's fate once nothing more is asked. A TPM clear's or
-/// re-enrollment's question is not asked: the request stays for a later
-/// boot, which says so.
-fn resolve(fate: Fate, console: &mut dyn FnMut(&str)) -> Resolved {
+/// A request's fate once its question is answered (ENCRYPTION.md "TPM
+/// clear"): a clear's, `askable` only where the lockout step is due on a
+/// header with a lockout token, is otherwise unproven. A re-enrollment's
+/// question is not asked: the request stays for a later boot, which says
+/// so.
+fn resolve(
+    fate: Fate,
+    askable: bool,
+    prompt: &mut dyn Prompt,
+    console: &mut dyn FnMut(&str),
+) -> Resolved {
     let resolved = match fate {
         Fate::Resolved(resolved) => resolved,
-        Fate::Ask(_) => Resolved::Left,
+        Fate::Ask(Question::Clear) if !askable => Resolved::Removed(Removed::Unproven),
+        Fate::Ask(question @ Question::Clear) => {
+            console(CLEAR_REQUESTED);
+            console(ANSWER_KEYS);
+            let confirmed = match prompt.read(CLEAR_PROMPT) {
+                Ok(Entered::Line(answer)) => answer.as_bytes() == CLEAR_WORD,
+                Ok(Entered::Eof | Entered::Refused) => false,
+                Err(error) => {
+                    console(&format!("the TPM clear's question failed: {error}"));
+                    false
+                }
+            };
+            question.answered(confirmed)
+        }
+        Fate::Ask(Question::Reenroll) => Resolved::Left,
     };
     if resolved == Resolved::Left {
-        console("td: a disk request stays for a later boot");
+        console(STAYS);
     }
     resolved
 }
+
+/// Whether TPM2_Clear itself refused: disabled, its authorization, or
+/// its own refusal. A refusal of a command before it is no clear's.
+fn clear_refused(error: &LockoutError) -> bool {
+    match error {
+        LockoutError::ClearDisabled => true,
+        LockoutError::Authorization {
+            command,
+            kind: AuthRefusal::AuthFail,
+        } => *command == td_tpm::CLEAR,
+        LockoutError::Failed {
+            refusal: Some(refusal),
+            ..
+        } => refusal.command == td_tpm::CLEAR,
+        _ => false,
+    }
+}
+
+/// Printed for a request left for a later boot.
+const STAYS: &str = "td: a disk request stays for a later boot";
 
 /// What the console says once the plan's removal of the request succeeds.
 fn removal_line(resolved: Resolved) -> Option<&'static str> {
@@ -874,7 +1011,8 @@ fn removal_line(resolved: Resolved) -> Option<&'static str> {
             "td: removed the PIN change request: the confirmed reseal sets a new TPM PIN"
         }
         Resolved::PinChange => "td: removed the PIN change request: its new PIN is installed next",
-        Resolved::Left | Resolved::Clear | Resolved::Reenroll => return None,
+        Resolved::Clear => "td: removed the TPM clear request: the TPM is cleared",
+        Resolved::Left | Resolved::Reenroll => return None,
     })
 }
 
@@ -1647,6 +1785,16 @@ const SALT_SOURCE: &str = "/dev/random";
 /// `lockout_import`, or the upgrade's in U4.
 pub(crate) type LockoutImport<'a> = dyn Fn(&Lockout) -> Result<(u8, Step), String> + 'a;
 
+/// Why a lockout step holds no authorization this boot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Unheld {
+    /// The TPM refused as a locked-out lockout hierarchy, which checked
+    /// nothing, or after possession was proven: a later boot tries again.
+    Waits,
+    /// No TPM td can prove this boot.
+    Unproven,
+}
+
 /// The lockout's take or proof (ENCRYPTION.md "Lockout"), after the
 /// keyslot's test, with the volume key: with lockoutAuthSet clear a take
 /// under the verified token's `L`, or a fresh one imported unproven
@@ -1655,8 +1803,9 @@ pub(crate) type LockoutImport<'a> = dyn Fn(&Lockout) -> Result<(u8, Step), Strin
 /// token and keeps a proven one. Anything else is a TPM td cannot prove,
 /// named, and nothing further is sent to its lockout hierarchy. The
 /// authorization and the primary's Name are returned when this boot holds
-/// them proven. `name` is the storage primary's Name, read once by the
-/// caller, which every lockout command here is sent under.
+/// them proven, and otherwise why not. `name` is the storage primary's
+/// Name, read once by the caller, which every lockout command here is sent
+/// under.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn lockout_stage<T: Tpm, C: Runner>(
     header: &Header,
@@ -1667,7 +1816,7 @@ pub(crate) fn lockout_stage<T: Tpm, C: Runner>(
     cryptsetup: &mut C,
     import: &LockoutImport<'_>,
     console: &mut dyn FnMut(&str),
-) -> Option<(LockoutAuth, Vec<u8>)> {
+) -> Result<(LockoutAuth, Vec<u8>), Unheld> {
     let cannot = |console: &mut dyn FnMut(&str), why: &str| {
         console(&format!(
             "td: td cannot prove this TPM's lockout authorization ({why}): the TPM-primary \
@@ -1677,11 +1826,11 @@ pub(crate) fn lockout_stage<T: Tpm, C: Runner>(
     };
     let Some(uuid) = lockout::volume_uuid(&header.uuid) else {
         console("no lockout step: the volume's UUID is not a LUKS2 UUID");
-        return None;
+        return Err(Unheld::Unproven);
     };
     let Ok(primary) = <[u8; PRIMARY_NAME_LEN]>::try_from(name.as_slice()) else {
         console("no lockout step: the storage primary's Name is not SHA-256");
-        return None;
+        return Err(Unheld::Unproven);
     };
     let state = match tpm.dictionary_attack() {
         Ok(state) => state,
@@ -1689,7 +1838,7 @@ pub(crate) fn lockout_stage<T: Tpm, C: Runner>(
             console(&format!(
                 "no lockout step: the TPM's lockout state: {error}"
             ));
-            return None;
+            return Err(Unheld::Unproven);
         }
     };
     let keys = Keys {
@@ -1727,7 +1876,7 @@ pub(crate) fn lockout_stage<T: Tpm, C: Runner>(
                      protector management re-adds a TPM PIN protector under a security key \
                      or the recovery key",
                 );
-                return None;
+                return Err(Unheld::Unproven);
             }
             _ => {
                 let fresh = LockoutAuth::generate().and_then(|auth| {
@@ -1737,20 +1886,20 @@ pub(crate) fn lockout_stage<T: Tpm, C: Runner>(
                     Ok(fresh) => fresh,
                     Err(error) => {
                         console(&format!("no lockout take: {error}"));
-                        return None;
+                        return Err(Unheld::Unproven);
                     }
                 };
                 let (number, step) = match import(&token) {
                     Ok(import) => import,
                     Err(refusal) => {
                         console(&format!("no lockout take: {refusal}"));
-                        return None;
+                        return Err(Unheld::Unproven);
                     }
                 };
                 // The authorization is on the header before the TPM holds it.
                 if !write(step, console) {
                     console("no lockout take: its token is not on the header");
-                    return None;
+                    return Err(Unheld::Unproven);
                 }
                 (number, auth, token)
             }
@@ -1764,7 +1913,10 @@ pub(crate) fn lockout_stage<T: Tpm, C: Runner>(
                 console(&format!(
                     "the lockout take stopped: {error}; its token stays for the next boot's proof"
                 ));
-                return None;
+                return Err(match error.authorization() {
+                    Some(AuthRefusal::Lockout) => Unheld::Waits,
+                    _ => Unheld::Unproven,
+                });
             }
         }
         console(
@@ -1776,7 +1928,7 @@ pub(crate) fn lockout_stage<T: Tpm, C: Runner>(
                 write(step, console);
             }
         }
-        return Some((auth, name));
+        return Ok((auth, name));
     }
     let (number, lockout_token, auth) = match token {
         None => {
@@ -1784,11 +1936,11 @@ pub(crate) fn lockout_stage<T: Tpm, C: Runner>(
                 console,
                 "another system set it, and this volume holds no lockout token",
             );
-            return None;
+            return Err(Unheld::Unproven);
         }
         Some((_, _, Err(error))) => {
             cannot(console, &error.to_string());
-            return None;
+            return Err(Unheld::Unproven);
         }
         Some((number, token, Ok(auth))) => (number, token.clone(), auth),
     };
@@ -1806,7 +1958,7 @@ pub(crate) fn lockout_stage<T: Tpm, C: Runner>(
                 write(protected_plan::lockout_remove(number), console);
             }
             cannot(console, &format!("the TPM refused its proof: {error}"));
-            return None;
+            return Err(Unheld::Unproven);
         }
         // A locked lockout hierarchy checked nothing: L may still be the
         // TPM's, so the token stays for a later boot's proof.
@@ -1820,15 +1972,15 @@ pub(crate) fn lockout_stage<T: Tpm, C: Runner>(
                 "the lockout proof waits: {error}; the TPM's lockout hierarchy is locked out \
                  and checked nothing, so the lockout token stays"
             ));
-            return None;
+            return Err(Unheld::Waits);
         }
         Err(LockoutError::OtherPrimary) => {
             cannot(console, "its storage primary is not the token's");
-            return None;
+            return Err(Unheld::Unproven);
         }
         Err(error) => {
             console(&format!("the lockout proof stopped: {error}"));
-            return None;
+            return Err(Unheld::Unproven);
         }
     }
     console("td proved the TPM's lockout authorization");
@@ -1844,9 +1996,9 @@ pub(crate) fn lockout_stage<T: Tpm, C: Runner>(
             "td's dictionary-attack parameters were not set: {error}; the proven lockout token \
              stays, and the next boot's proof sets them"
         ));
-        return None;
+        return Err(Unheld::Waits);
     }
-    Some((auth, name))
+    Ok((auth, name))
 }
 
 /// The keys a plan's steps name: the opener's and the reseal's.
@@ -2046,6 +2198,12 @@ pub(crate) mod tests {
         /// The TPM locks out between the dictionary-attack read and the
         /// Unseal.
         lockout_at_unseal: bool,
+        /// TPM2_Clear refused (`refused`), disabled (`disabled`), refused
+        /// its authorization (`authfail`), done
+        /// with its answer lost (`lost`), lost before it acted (`unsent`),
+        /// the command before it refused (`early`), or the hierarchy
+        /// locked out (`locked`).
+        clear_fault: Option<&'static str>,
     }
 
     /// The TPM the release reaches: the scripted wire TPM for the chain
@@ -2084,6 +2242,7 @@ pub(crate) mod tests {
                     hierarchy_locked: false,
                     refuse_parameters: false,
                     lockout_at_unseal: false,
+                    clear_fault: None,
                 })),
                 log: log.clone(),
             }
@@ -2236,6 +2395,7 @@ pub(crate) mod tests {
                 return Err(LockoutError::OtherPrimary);
             }
             let code = match command {
+                LockoutCommand::Clear => td_tpm::CLEAR,
                 LockoutCommand::Take => HIERARCHY_CHANGE_AUTH,
                 LockoutCommand::ClearPolicy => SET_PRIMARY_POLICY,
                 LockoutCommand::Parameters => DICTIONARY_ATTACK_PARAMETERS,
@@ -2246,6 +2406,14 @@ pub(crate) mod tests {
                 kind: AuthRefusal::AuthFail,
             });
             if command == LockoutCommand::Take {
+                // HierarchyChangeAuth under the empty authorization meets
+                // a locked-out hierarchy as any lockout command does.
+                if state.hierarchy_locked {
+                    return Err(LockoutError::Authorization {
+                        command: code,
+                        kind: AuthRefusal::Lockout,
+                    });
+                }
                 if state.da.lockout_auth_set {
                     if state.show_clear {
                         return refused;
@@ -2279,6 +2447,62 @@ pub(crate) mod tests {
                 LockoutCommand::Reset => {
                     state.da.counter = 0;
                     state.da.in_lockout = false;
+                }
+                LockoutCommand::Clear => {
+                    match state.clear_fault {
+                        Some("disabled") => return Err(LockoutError::ClearDisabled),
+                        Some("authfail") => return refused,
+                        Some("unsent") => {
+                            return Err(LockoutError::Failed {
+                                refusal: None,
+                                message: "the TPM's answer was lost".into(),
+                            })
+                        }
+                        Some("early") => {
+                            return Err(LockoutError::Failed {
+                                refusal: Some(Refusal {
+                                    command: 0x131,
+                                    rc: 0x902,
+                                }),
+                                message: "CreatePrimary refused".into(),
+                            })
+                        }
+                        Some("locked") => {
+                            return Err(LockoutError::Authorization {
+                                command: code,
+                                kind: AuthRefusal::Lockout,
+                            })
+                        }
+                        Some("refused") => {
+                            return Err(LockoutError::Failed {
+                                refusal: Some(Refusal {
+                                    command: code,
+                                    rc: 0x149,
+                                }),
+                                message: "TPM2_Clear refused".into(),
+                            })
+                        }
+                        _ => {}
+                    }
+                    // Every object under the storage hierarchy goes, with
+                    // the lockout authorization and the counter.
+                    let lost = state.clear_fault == Some("lost");
+                    state.objects.clear();
+                    state.da.lockout_auth_set = false;
+                    state.da.counter = 0;
+                    state.da.in_lockout = false;
+                    state.lockout_auth = None;
+                    drop(state);
+                    self.wire.0.borrow_mut().cleared = true;
+                    self.wire.0.borrow_mut().seed += 1;
+                    let (_, fresh) = self.wire.client().storage_primary(None).unwrap();
+                    self.state.borrow_mut().primary = fresh.try_into().unwrap();
+                    if lost {
+                        return Err(LockoutError::Failed {
+                            refusal: None,
+                            message: "the TPM's answer was lost".into(),
+                        });
+                    }
                 }
                 _ => {}
             }
@@ -2747,6 +2971,7 @@ pub(crate) mod tests {
                         &VOLUME_KEY,
                         tpm,
                         &mut self.disk,
+                        &mut prompt,
                         &mut console,
                     ));
                 }
@@ -4268,20 +4493,13 @@ pub(crate) mod tests {
         world.plug(CRED_PRIMARY, 1);
         released(&world.boot(vec![say(b""), say(KEY_PIN)]), &world);
         assert!(world.has(UNPROVEN));
-        // A PIN change by another protector stays; so does a clear or a
-        // re-enrollment whose question this boot asks none of.
-        for (operation, script) in [
-            (Operation::PinChange, vec![say(b""), say(RECOVERY)]),
-            (Operation::TpmClear, vec![say(PIN)]),
-            (Operation::TpmClear, vec![say(b""), say(RECOVERY)]),
-        ] {
-            let mut world = World::tpm_shape();
-            world.taken(&[0x42; 32]);
-            world.request(operation, true);
-            released(&world.boot(script), &world);
-            assert!(world.has(STAYS), "{operation:?}");
-            assert!(!world.has(REMOVED) && world.pending());
-        }
+        // A PIN change by another protector stays.
+        let mut world = World::tpm_shape();
+        world.taken(&[0x42; 32]);
+        world.request(Operation::PinChange, true);
+        released(&world.boot(vec![say(b""), say(RECOVERY)]), &world);
+        assert!(world.has(STAYS));
+        assert!(!world.has(REMOVED) && world.pending());
         let mut world = World::tpm_shape();
         world.taken(&[0x42; 32]);
         world.request(Operation::TpmReenroll, true);
@@ -4357,14 +4575,15 @@ pub(crate) mod tests {
             for verifies in [true, false] {
                 let mut world = changed();
                 world.request(operation, verifies);
-                released(&world.boot(vec![say(RECOVERY)]), &world);
+                // A verified clear is asked, and declined.
+                let mut script = vec![say(RECOVERY)];
+                if verifies && operation == Operation::TpmClear {
+                    script.push(say(b"no"));
+                }
+                released(&world.boot(script), &world);
                 assert!(world.has(&format!("say {NO_RESEAL_REQUEST}")));
                 assert!(!world.has("ask Type reseal"));
-                // A verified re-enrollment on the recorded primary goes.
-                assert_eq!(
-                    world.pending(),
-                    verifies && operation == Operation::TpmClear
-                );
+                assert!(!world.pending());
             }
         }
         let mut world = changed();
@@ -4498,8 +4717,9 @@ pub(crate) mod tests {
     }
 
     /// A PIN change whose seal fails keeps the old PIN and the request;
-    /// one whose tag fails, or whose seal no lockout token anchors, is
-    /// discarded before any keyslot is added.
+    /// one whose tag fails is discarded before any keyslot is added. With
+    /// no lockout token, or a plan the planner refuses, no new PIN is
+    /// asked, and the request stays.
     #[test]
     fn a_pin_change_that_cannot_be_installed_keeps_the_old_pin() {
         for fault in ["fail", "verify", "oversize"] {
@@ -4594,5 +4814,226 @@ pub(crate) mod tests {
             .iter()
             .any(|line| line.ends_with(": enter the new PIN again")));
         assert!(run.finished.unwrap().resealed.is_some());
+    }
+
+    impl World {
+        /// TPM2_Clear's entry, which `at` would confuse with ClearPolicy.
+        fn clear_at(&self) -> usize {
+            let log = self.log.borrow();
+            log.iter()
+                .position(|entry| entry == "tpm lockout Clear")
+                .unwrap_or_else(|| panic!("no TPM2_Clear in {log:?}"))
+        }
+
+        fn cleared(&self) -> bool {
+            self.log
+                .borrow()
+                .iter()
+                .any(|entry| entry == "tpm lockout Clear")
+        }
+    }
+
+    /// A recovery-key boot that confirms a verified clear.
+    fn clear_script() -> Vec<Say> {
+        vec![say(b""), say(RECOVERY), say(CLEAR_WORD)]
+    }
+
+    fn clear_world() -> World {
+        let mut world = World::tpm_shape();
+        world.taken(&[0x42; 32]);
+        world.request(Operation::TpmClear, true);
+        world
+    }
+
+    /// The question after the cap with the tag verified; confirmed, the
+    /// lockout proof, the counter, TPM2_Clear under `L`, then the clear's
+    /// plan in place of the boot's own: the tpm-pin keyslots killed, the
+    /// request removed, the tpm-pin and lockout tokens retired. No reset
+    /// follows, and the next boot takes the cleared TPM's lockout anew
+    /// with no reseal offered.
+    #[test]
+    fn a_confirmed_clear_clears_the_tpm_and_retires_its_protectors() {
+        let mut world = clear_world();
+        world.model.state.borrow_mut().da.counter = 2;
+        let run = world.boot(clear_script());
+        assert_eq!(released(&run, &world), (0, Method::RecoveryKey));
+        let order = [
+            "cs test 0 ok",
+            &format!("say {CLEAR_REQUESTED}"),
+            &format!("say {ANSWER_KEYS}"),
+            &format!("ask {CLEAR_PROMPT}"),
+            "tpm lockout ClearPolicy",
+            "tpm lockout Parameters",
+            "say td: the TPM counted 2 wrong PINs since its last reset",
+            "say td: the TPM is cleared",
+            "cs kill 1",
+            REMOVED,
+            "say td: removed the TPM clear request: the TPM is cleared",
+            "cs remove 1",
+            "cs remove 3",
+        ];
+        let at: Vec<usize> = order.iter().map(|entry| world.at(entry)).collect();
+        assert!(at.windows(2).all(|w| w[0] < w[1]), "{:?}", world.lines());
+        let clear = world.clear_at();
+        assert!(world.at("say td: the TPM counted") < clear);
+        assert!(clear < world.at("say td: the TPM is cleared"));
+        assert!(!world.has("tpm lockout Reset"));
+        for number in [1, 3, REQUEST] {
+            assert!(!world.disk.tokens.contains_key(&number), "{number}");
+        }
+        assert!(!world.disk.keyslots.contains_key(&1));
+        // The next boot: no TPM PIN, no reseal, and a fresh take.
+        let run = world.boot(vec![say(RECOVERY)]);
+        assert_eq!(released(&run, &world), (0, Method::RecoveryKey));
+        assert!(!world.has(ASK_PIN) && !world.has("ask Type reseal"));
+        assert!(world.has("say td took the TPM's lockout hierarchy"));
+    }
+
+    /// After a PIN release the released keyslot cannot be killed under
+    /// another: only its token is retired, and the keyslot is an orphan.
+    /// A pre-sealed update's protector is discarded before TPM2_Clear.
+    #[test]
+    fn a_clear_after_a_pin_release_retires_the_token_alone() {
+        let mut world = clear_world();
+        world.predict = Some(Predicted {
+            pcr4: [4; 32],
+            pcr7: [7; 32],
+            pcr9: [9; 32],
+        });
+        let run = world.boot(vec![say(PIN), say(CLEAR_WORD)]);
+        assert_eq!(released(&run, &world), (1, Method::TpmPin));
+        let discarded =
+            world.at("say the update's predicted protector is discarded before the TPM");
+        assert!(discarded < world.clear_at());
+        assert_eq!(run.finished.unwrap().predicted, None);
+        assert!(!world.has("cs kill"));
+        assert!(!world.disk.tokens.contains_key(&1) && world.disk.keyslots.contains_key(&1));
+        assert!(!world.pending());
+    }
+
+    /// Any answer but `clear` declines: the plan removes the request and
+    /// nothing is cleared.
+    #[test]
+    fn a_declined_clear_is_removed() {
+        for answer in [
+            say(b"Clear"),
+            say(b""),
+            say(b"clearx"),
+            say(b"clear "),
+            Say::Eof,
+            Say::Refused,
+            Say::Fail,
+        ] {
+            let mut world = clear_world();
+            released(&world.boot(vec![say(b""), say(RECOVERY), answer]), &world);
+            assert!(world.at(REMOVED) < world.at("say td: removed the declined disk request"));
+            assert!(!world.cleared() && !world.pending());
+            assert!(world.disk.tokens.contains_key(&1) && world.has("tpm lockout Reset"));
+        }
+    }
+
+    /// A confirmed clear's fate at the lockout step and at TPM2_Clear.
+    #[test]
+    fn a_clear_that_does_not_run_stays_or_is_removed() {
+        // The lockout hierarchy locked out checked nothing: it stays.
+        let mut world = clear_world();
+        world.model.state.borrow_mut().hierarchy_locked = true;
+        released(&world.boot(clear_script()), &world);
+        assert!(!world.cleared() && world.has(STAYS) && world.pending());
+        // So does a proof whose DictionaryAttackParameters is refused:
+        // possession was proven.
+        let mut world = clear_world();
+        world.model.state.borrow_mut().refuse_parameters = true;
+        released(&world.boot(clear_script()), &world);
+        assert!(!world.cleared() && world.has(STAYS) && world.pending());
+        // A proof refused: a TPM td cannot prove, removed with nothing
+        // retired.
+        let mut world = clear_world();
+        world.model.state.borrow_mut().lockout_auth = Some([0x43; 32]);
+        released(&world.boot(clear_script()), &world);
+        assert!(!world.cleared() && !world.pending());
+        assert!(world.has(UNPROVEN) && world.disk.tokens.contains_key(&1));
+        // TPM2_Clear refused, disabled or not: removed, the reason said,
+        // nothing retired.
+        for fault in ["disabled", "refused", "authfail"] {
+            let mut world = clear_world();
+            world.model.state.borrow_mut().clear_fault = Some(fault);
+            released(&world.boot(clear_script()), &world);
+            assert!(world.clear_at() < world.at(&format!("say {CLEAR_REFUSED}")));
+            assert!(world.has("say td: removed a TPM clear request the TPM refused"));
+            assert!(!world.pending() && !world.has("cs kill"));
+            assert!(world.disk.tokens.contains_key(&1) && world.disk.tokens.contains_key(&3));
+        }
+        let mut world = clear_world();
+        world.model.state.borrow_mut().clear_fault = Some("disabled");
+        released(&world.boot(clear_script()), &world);
+        assert!(world.has("say TPM2_Clear: the TPM has TPM2_Clear disabled"));
+        // Its answer lost: it stays, and the next boot finds another
+        // primary.
+        let mut world = clear_world();
+        world.model.state.borrow_mut().clear_fault = Some("lost");
+        released(&world.boot(clear_script()), &world);
+        assert!(world.has("say TPM2_Clear did not complete"));
+        assert!(world.has(STAYS) && world.pending() && !world.has("cs kill"));
+        assert!(!world.has("tpm lockout Reset"));
+        world.model.state.borrow_mut().clear_fault = None;
+        released(&world.boot(vec![say(RECOVERY)]), &world);
+        assert!(!world.has(&format!("ask {CLEAR_PROMPT}")) && world.pending());
+    }
+
+    /// The clear's question needs a lockout token on the header, which
+    /// the clear's plan retires: a take this boot would write another.
+    /// Nor is anything sent once cryptsetup's metadata does not confirm
+    /// the header.
+    #[test]
+    fn a_clear_is_asked_only_where_it_can_run() {
+        let mut world = World::tpm_shape();
+        world.request(Operation::TpmClear, true);
+        released(&world.boot(vec![say(b""), say(RECOVERY)]), &world);
+        assert!(!world.has(&format!("ask {CLEAR_PROMPT}")));
+        assert!(world.has(UNPROVEN) && !world.pending() && !world.cleared());
+        let mut world = World::tpm_shape();
+        world.taken(&[0x42; 32]);
+        let before = world.disk.dump();
+        world.request(Operation::TpmClear, true);
+        world.disk.dump_override = Some(before);
+        released(&world.boot(clear_script()), &world);
+        assert!(world.has("say no header change this boot"));
+        assert!(!world.tpm_lockout() && world.pending());
+    }
+
+    /// A locked-out hierarchy at the take, as at the proof, leaves the
+    /// clear; so does TPM2_Clear itself refused as locked out, or a
+    /// command before it refused, with nothing said of firmware.
+    #[test]
+    fn a_locked_out_take_or_an_unsent_clear_leaves_the_request() {
+        let mut world = clear_world();
+        {
+            let mut state = world.model.state.borrow_mut();
+            state.da.lockout_auth_set = false;
+            state.lockout_auth = None;
+            state.hierarchy_locked = true;
+        }
+        released(&world.boot(clear_script()), &world);
+        assert!(world.has("say the lockout take stopped"));
+        assert!(!world.has("tpm lockout Parameters"));
+        assert!(!world.cleared() && world.has(STAYS) && world.pending());
+        for fault in ["early", "locked"] {
+            let mut world = clear_world();
+            world.model.state.borrow_mut().clear_fault = Some(fault);
+            released(&world.boot(clear_script()), &world);
+            assert!(world.has("say TPM2_Clear did not complete"), "{fault}");
+            assert!(!world.has(&format!("say {CLEAR_REFUSED}")));
+            assert!(world.has(STAYS) && world.pending() && !world.has("cs kill"));
+        }
+        // An answer lost before the TPM acted: the next boot finds the
+        // recorded primary and asks again.
+        let mut world = clear_world();
+        world.model.state.borrow_mut().clear_fault = Some("unsent");
+        released(&world.boot(clear_script()), &world);
+        assert!(world.has(STAYS) && world.pending());
+        world.model.state.borrow_mut().clear_fault = None;
+        released(&world.boot(clear_script()), &world);
+        assert!(world.cleared() && !world.pending());
     }
 }

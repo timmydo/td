@@ -579,7 +579,7 @@ impl<C: Runner, H: Host<C>> Run<'_, '_, C, H> {
             &import,
             self.console,
         );
-        if taken.is_some() {
+        if taken.is_ok() {
             return Round::Done;
         }
         // An imported token keeps the protector: the header reads U5, and
