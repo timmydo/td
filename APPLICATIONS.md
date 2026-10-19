@@ -10420,6 +10420,21 @@ webpki-roots, and no decoder. So:
    its per-read and per-write timeouts. A bounded number of
    connections are served at once; the rest wait.
 
+   A counted, non-public request may carry `tls-ca N`, where N is 1 to
+   65536, with `redirects 0`. After the blank line it sends N bytes of
+   PEM CA certificates, then the declared request body. The service uses
+   only those roots for this HTTPS request, with ordinary signature,
+   expiration and hostname verification. Empty, invalid or oversized
+   bundles fail; HTTP, streaming, public-policy and automatic-redirect
+   combinations are refused. The service never reads a caller-named
+   certificate path, changes global roots or pools connections between
+   requests. An older service refuses the unknown field, without fallback.
+   td-mail's optional per-account `tls_ca_file` is an absolute path read
+   at account connection, bounded to the same size. It supplies these
+   bytes only for the origin of the configured `well_known_url`; other
+   origins use public roots. The file must be visible to the application
+   in its jail. This changes TLS trust, never the destination policy.
+
    A request may carry a `stream` line, with no value; without it the
    above is the whole protocol, unchanged. With it, the reply head ends
    in `stream` where it would say `body N`, and the body follows as
@@ -10543,7 +10558,7 @@ webpki-roots, and no decoder. So:
    and the origin process ending with a killed service; no recipe check
    builds td-net.
 5. What this buys, exactly: the applications hold no socket but a unix
-   one, resolve no names, carry no trust store, and their closures are
+   one, resolve no names, perform no TLS verification, and their closures are
    std; TLS trust, timeouts and body caps live in one reviewed place,
    and a jail that lost its grant loses the network entirely rather than
    its unmounted sockets. What it does not buy: a destination policy. An

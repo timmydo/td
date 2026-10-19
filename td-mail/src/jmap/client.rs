@@ -204,17 +204,78 @@ struct Fetched {
     body: Vec<u8>,
 }
 
+#[derive(Default)]
+struct AccountTrust {
+    origin: Option<String>,
+    pem: Option<Vec<u8>>,
+}
+
+impl AccountTrust {
+    fn load(url: &str, file: Option<&str>) -> Result<Self, JmapError> {
+        use std::io::Read;
+        let Some(file) = file else {
+            return Ok(Self::default());
+        };
+        if !url
+            .split_once("://")
+            .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("https"))
+            || !std::path::Path::new(file).is_absolute()
+        {
+            return Err(JmapError::Http(
+                "tls_ca_file requires an absolute file path and an HTTPS well_known_url".into(),
+            ));
+        }
+        let mut pem = Vec::new();
+        std::fs::File::open(file)
+            .and_then(|file| {
+                file.take(td_fetch_client::MAX_TLS_CA as u64 + 1)
+                    .read_to_end(&mut pem)
+            })
+            .map_err(|e| JmapError::Http(format!("read tls_ca_file {file}: {e}")))?;
+        if pem.is_empty() || pem.len() > td_fetch_client::MAX_TLS_CA {
+            return Err(JmapError::Http(
+                "tls_ca_file must contain 1..65536 bytes of PEM certificates".into(),
+            ));
+        }
+        Ok(Self {
+            origin: JmapClient::origin(url),
+            pem: Some(pem),
+        })
+    }
+
+    fn roots_for(&self, url: &str) -> Option<&[u8]> {
+        if self.origin.is_some() && self.origin == JmapClient::origin(url) {
+            self.pem.as_deref()
+        } else {
+            None
+        }
+    }
+}
+
 /// GET `url`, with the credential when `auth` carries one. No redirects
 /// are followed for us: the service would drop the credential on the
 /// way, and the loops below follow with it or without it as the origin
 /// rule says.
-fn get_with_auth(url: &str, auth: Option<&str>) -> Result<Fetched, JmapError> {
+fn get_with_auth(
+    url: &str,
+    auth: Option<&str>,
+    trust: &AccountTrust,
+) -> Result<Fetched, JmapError> {
     if !td_fetch_client::available() {
         return Err(no_fetch_service());
     }
     let headers: Vec<(&str, &str)> = auth.map(|a| ("authorization", a)).into_iter().collect();
     let response = read_backoff(
-        || td_fetch_client::get(url, &headers, RESPONSE_LIMIT, Some(0)),
+        || {
+            td_fetch_client::request_with_ca(
+                "GET",
+                url,
+                &headers,
+                &[],
+                RESPONSE_LIMIT,
+                trust.roots_for(url),
+            )
+        },
         std::thread::sleep,
     )
     .map_err(|e| JmapError::Http(e.to_string()))?;
@@ -247,6 +308,7 @@ fn uri_encode(value: &str) -> String {
 }
 
 pub struct JmapClient {
+    trust: AccountTrust,
     username: String,
     password: String,
     api_url: String,
@@ -274,6 +336,7 @@ impl JmapClient {
     /// one to exist and not to answer.
     pub(crate) fn unreachable_for_tests() -> Self {
         JmapClient {
+            trust: AccountTrust::default(),
             username: "tester".to_string(),
             password: String::new(),
             api_url: "https://mail.invalid/jmap".to_string(),
@@ -325,6 +388,7 @@ impl JmapClient {
         url: &str,
         auth: &str,
         max_redirects: u32,
+        trust: &AccountTrust,
     ) -> Result<(String, String), JmapError> {
         let mut current_url = url.to_string();
         let mut carries = true;
@@ -332,10 +396,11 @@ impl JmapClient {
         for i in 0..max_redirects {
             log_debug!("[JMAP] Request {} to: {}", i + 1, current_url);
 
-            let fetched = get_with_auth(&current_url, carries.then_some(auth)).map_err(|e| {
-                log_error!("[JMAP] Connection error: {}", e);
-                e
-            })?;
+            let fetched =
+                get_with_auth(&current_url, carries.then_some(auth), trust).map_err(|e| {
+                    log_error!("[JMAP] Connection error: {}", e);
+                    e
+                })?;
             let status = fetched.status;
             log_debug!("[JMAP] Got {} response", status);
 
@@ -482,12 +547,14 @@ impl JmapClient {
         well_known_url: &str,
         username: &str,
         password: &str,
+        tls_ca_file: Option<&str>,
     ) -> Result<(JmapSession, Self), JmapError> {
         log_info!("[JMAP] Discovering JMAP session from: {}", well_known_url);
         let auth = Self::auth_header(username, password);
 
+        let trust = AccountTrust::load(well_known_url, tls_ca_file)?;
         let (_final_url, response_text) =
-            Self::fetch_with_auth_following_redirects(well_known_url, &auth, 5)?;
+            Self::fetch_with_auth_following_redirects(well_known_url, &auth, 5, &trust)?;
 
         log_debug!("[JMAP] Session response received, parsing...");
 
@@ -523,6 +590,7 @@ impl JmapClient {
             if submission { "listed" } else { "not listed" }
         );
         let client = JmapClient {
+            trust,
             username: username.to_string(),
             password: password.to_string(),
             api_url: session.api_url.clone(),
@@ -557,7 +625,8 @@ impl JmapClient {
         // The fetch service carries the request; a status of 400 or more is
         // an error here rather than a reply, as it was before.
         let send = || {
-            td_fetch_client::post(
+            td_fetch_client::request_with_ca(
+                "POST",
                 &self.api_url,
                 &[
                     ("authorization", auth.as_str()),
@@ -565,6 +634,7 @@ impl JmapClient {
                 ],
                 request_json.as_bytes(),
                 RESPONSE_LIMIT,
+                self.trust.roots_for(&self.api_url),
             )
         };
         let response = if read_batch(&request) {
@@ -1455,7 +1525,8 @@ impl JmapClient {
             url
         );
         let auth = Self::auth_header(&self.username, &self.password);
-        let response = td_fetch_client::post(
+        let response = td_fetch_client::request_with_ca(
+            "POST",
             &url,
             &[
                 ("authorization", auth.as_str()),
@@ -1463,6 +1534,7 @@ impl JmapClient {
             ],
             bytes,
             RESPONSE_LIMIT,
+            self.trust.roots_for(&url),
         )
         .map_err(|e| JmapError::Http(e.to_string()))?;
         if response.status >= 400 {
@@ -1900,7 +1972,8 @@ impl JmapClient {
         let mut current_url = url.clone();
         let mut carries = true;
         for _ in 0..5 {
-            let fetched = get_with_auth(&current_url, carries.then_some(auth.as_str()))?;
+            let fetched =
+                get_with_auth(&current_url, carries.then_some(auth.as_str()), &self.trust)?;
             let status = fetched.status;
             if (300..400).contains(&status) {
                 match fetched.location {
@@ -2073,7 +2146,7 @@ impl JmapClient {
         log_debug!("[JMAP] Downloading blob from: {}", url);
 
         let auth = Self::auth_header(&self.username, &self.password);
-        let (_, body) = Self::fetch_with_auth_following_redirects(&url, &auth, 5)?;
+        let (_, body) = Self::fetch_with_auth_following_redirects(&url, &auth, 5, &self.trust)?;
 
         log_info!("[JMAP] Raw email downloaded, {} bytes", body.len());
         Ok(Some(body))
@@ -2096,6 +2169,38 @@ fn truncate_str(s: &str, max_len: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_ca_is_loaded_bounded_and_scoped_to_one_origin() {
+        let dir = td_fs::TempDir::new("mail-account-ca").unwrap();
+        let path = dir.path().join("ca.pem");
+        let file = path.to_str().unwrap();
+        let url = "https://mail.test/session";
+        assert!(AccountTrust::load(url, Some(file)).is_err());
+        std::fs::write(&path, b"test root bytes").unwrap();
+        let trust = AccountTrust::load("HTTPS://mail.test/session", Some(file)).unwrap();
+        assert_eq!(
+            trust.roots_for("HTTPS://MAIL.TEST:443/api"),
+            Some(b"test root bytes".as_slice())
+        );
+        for other in [
+            "http://mail.test/api",
+            "https://other.test/api",
+            "https://mail.test:8443/api",
+        ] {
+            assert!(trust.roots_for(other).is_none());
+        }
+        assert!(AccountTrust::load(url, None)
+            .unwrap()
+            .roots_for(url)
+            .is_none());
+        assert!(AccountTrust::load("http://mail.test/", Some(file)).is_err());
+        assert!(AccountTrust::load(url, Some("ca.pem")).is_err());
+        for bytes in [Vec::new(), vec![b'x'; td_fetch_client::MAX_TLS_CA + 1]] {
+            std::fs::write(&path, bytes).unwrap();
+            assert!(AccountTrust::load(url, Some(file)).is_err());
+        }
+    }
 
     #[test]
     fn reconciliation_filing_requires_requested_properties() {

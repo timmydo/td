@@ -9,6 +9,7 @@ pub struct AccountConfig {
     pub well_known_url: String,
     pub username: String,
     pub password: PasswordSource,
+    pub tls_ca_file: Option<String>,
 }
 
 /// Where an account's password comes from. `Command` runs a shell command
@@ -403,14 +404,21 @@ struct RawAccountFields {
     secret: Option<String>,
     /// The retired key is recognised so its refusal can say what replaced it.
     password_file: bool,
+    tls_ca_file: Option<String>,
 }
 
-const ACCOUNT_KEYS: &[&str] = &["well_known_url", "username", "password_command", "secret"];
+const ACCOUNT_KEYS: &[&str] = &[
+    "well_known_url",
+    "username",
+    "password_command",
+    "secret",
+    "tls_ca_file",
+];
 
 impl RawAccountFields {
     fn from_toml(table: &Toml) -> Result<Self, TomlError> {
         // The retired key is recognised, so its refusal can say what replaced
-        // it, and not advertised: an unknown key is named against the four.
+        // it, and not advertised in the accepted-key list.
         if let Some(key) = table
             .unknown_keys(ACCOUNT_KEYS)
             .iter()
@@ -424,6 +432,7 @@ impl RawAccountFields {
             password_command: table.optional_str("password_command")?.map(str::to_string),
             secret: table.optional_str("secret")?.map(str::to_string),
             password_file: table.get("password_file").is_some(),
+            tls_ca_file: table.optional_str("tls_ca_file")?.map(str::to_string),
         })
     }
 }
@@ -539,6 +548,7 @@ impl Config {
             let account_name = name.clone();
             accounts.push(AccountConfig {
                 name,
+                tls_ca_file: account.tls_ca_file,
                 well_known_url: require_field(
                     account.well_known_url,
                     &format!("missing well_known_url in [account.{}]", account_name),
@@ -565,6 +575,7 @@ impl Config {
             })?;
             accounts.push(AccountConfig {
                 name: "default".to_string(),
+                tls_ca_file: jmap.tls_ca_file,
                 well_known_url: require_field(
                     jmap.well_known_url,
                     "missing well_known_url (in [jmap] or [account.NAME])",
@@ -970,6 +981,42 @@ password_command = "pass show email/example.com"
     }
 
     #[test]
+    fn ca_file_is_optional_and_specific_to_the_account() {
+        let text = r#"[account.local]
+well_known_url = "https://localhost/session"
+username = "local"
+password_command = "false"
+tls_ca_file = "/home/me/local-ca.pem"
+[account.public]
+well_known_url = "https://mail.test/session"
+username = "public"
+password_command = "false"
+"#;
+        let config = Config::parse(text).unwrap();
+        assert_eq!(
+            config
+                .accounts
+                .iter()
+                .find(|a| a.name == "local")
+                .unwrap()
+                .tls_ca_file
+                .as_deref(),
+            Some("/home/me/local-ca.pem")
+        );
+        assert!(config
+            .accounts
+            .iter()
+            .find(|a| a.name == "public")
+            .unwrap()
+            .tls_ca_file
+            .is_none());
+        assert!(Config::parse(
+            &text.replace("tls_ca_file = \"/home/me/local-ca.pem\"", "tls_ca_file = 4")
+        )
+        .is_err());
+    }
+
+    #[test]
     fn test_parse_legacy_jmap_config() {
         let config = Config::parse(
             r#"
@@ -1273,7 +1320,7 @@ secret = "portal"
             ),
             (
                 "well_known_url = \"https://mx.example.com/.well-known/jmap\"\nusername = \"u@example.com\"\nsecret = \"portal\"\nbogus = 1\n",
-                "unknown field `bogus`, expected one of `well_known_url`, `username`, `password_command`, `secret`",
+                "unknown field `bogus`, expected one of `well_known_url`, `username`, `password_command`, `secret`, `tls_ca_file`",
             ),
             (
                 "well_known_url = \"https://mx.example.com/.well-known/jmap\"\nusername = \"u@example.com\"\npassword_command = \"pass\"\nsecret = \"portal\"\n",
@@ -1372,6 +1419,7 @@ secret = \"portal\"
     fn a_reserved_example_server_is_a_placeholder_and_no_other_is() {
         let account = |url: &str| AccountConfig {
             name: "a".to_string(),
+            tls_ca_file: None,
             well_known_url: url.to_string(),
             username: "u@example.com".to_string(),
             password: PasswordSource::Portal("a".to_string()),

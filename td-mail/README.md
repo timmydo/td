@@ -350,6 +350,27 @@ username = "me@work.com"
 password_command = "pass show email/work.com"
 ```
 
+For a private HTTPS server, an account may set
+`tls_ca_file = "/absolute/path/to/ca.pem"`. The file contains public CA
+certificates in PEM format (1–65536 bytes), never a private key. td-mail
+reads it when connecting the account; reconnect after replacing it.
+For HTTPS requests to the origin of that account's `well_known_url`
+(scheme, hostname and port), these certificates replace the public roots.
+Certificate signatures, expiration and hostname checks remain enabled.
+Other origins, including redirect destinations and separately hosted JMAP
+API or attachment endpoints, use the normal public roots. Configure the
+final discovery URL directly if a private server redirects to another
+origin. Accounts without this setting are unchanged. An unreadable or
+invalid bundle fails the connection; there is no fallback to public roots
+for the configured origin and no certificate-verification bypass.
+
+The file must be readable by td-mail itself; inside a jail, use a path
+visible in that application's configuration directory. The fetch service
+receives bounded certificate bytes, not a host pathname. This option does
+not change its destination policy: the stock service still refuses
+loopback. Local host testing uses a separately started fetch service with
+its existing `--allow-loopback` option.
+
 Each account sets exactly one of `secret = "portal"` or `password_command`.
 Legacy fallback is supported via `[jmap]` with `well_known_url`, `username`, and one of those;
 its portal credential is mail/default.

@@ -71,6 +71,8 @@ pub(crate) const PROTOCOL: &str = "td-fetch 1";
 /// A head line, including its newline, in either direction. A URL or header
 /// past this is refused, not truncated.
 const MAX_LINE: usize = 8 * 1024;
+/// Bytes of PEM roots carried by one counted request.
+const MAX_TLS_CA: usize = 64 * 1024;
 /// Header lines a request may carry, and a reply.
 const MAX_HEADERS: usize = 64;
 /// The most a client may send as a body: a mail with attachments, not an
@@ -368,6 +370,7 @@ impl Method {
 
 #[derive(Debug)]
 struct Request {
+    tls_ca: Option<Vec<u8>>,
     method: Method,
     url: String,
     headers: Vec<(String, String)>,
@@ -718,6 +721,7 @@ fn read_request(reader: &mut impl BufRead) -> Result<Request, Fault> {
     let mut redirects = None;
     let mut stream = false;
     let mut public = false;
+    let mut tls_ca_len = None;
     let mut body_len = 0u64;
     let mut seen = std::collections::BTreeSet::new();
     loop {
@@ -757,6 +761,17 @@ fn read_request(reader: &mut impl BufRead) -> Result<Request, Fault> {
                     .filter(|n| *n > 0)
                     .ok_or_else(|| Fault::Malformed(format!("limit {value:?}")))?
                     .min(MAX_RESPONSE_BODY);
+            }
+            "tls-ca" => {
+                tls_ca_len = Some(
+                    value
+                        .parse::<usize>()
+                        .ok()
+                        .filter(|n| (1..=MAX_TLS_CA).contains(n))
+                        .ok_or_else(|| {
+                            Fault::Malformed("TLS CA bundle must contain 1..65536 bytes".into())
+                        })?,
+                );
             }
             "body" => {
                 body_len = value
@@ -800,11 +815,26 @@ fn read_request(reader: &mut impl BufRead) -> Result<Request, Fault> {
     if method == Method::Post && redirects.unwrap_or(0) > 0 {
         return Err(Fault::Malformed("a POST with redirects".into()));
     }
+    if tls_ca_len.is_some() && (stream || public || redirects != Some(0)) {
+        return Err(Fault::Malformed(
+            "tls-ca requires redirects 0 and a counted non-public request".into(),
+        ));
+    }
+    let tls_ca = if let Some(len) = tls_ca_len {
+        let mut pem = vec![0; len];
+        reader
+            .read_exact(&mut pem)
+            .map_err(|e| Fault::Malformed(format!("TLS CA bundle short: {e}")))?;
+        Some(pem)
+    } else {
+        None
+    };
     let mut body = vec![0u8; body_len as usize];
     reader
         .read_exact(&mut body)
         .map_err(|e| Fault::Malformed(format!("body short: {e}")))?;
     Ok(Request {
+        tls_ca,
         method,
         url,
         headers,
@@ -924,6 +954,25 @@ fn perform(request: Request, policy: Policy, origin: Duration) -> Result<Reply, 
     })
 }
 
+fn custom_tls(pem: &[u8]) -> Result<ureq::rustls::ClientConfig, Fault> {
+    use ureq::rustls::pki_types::{pem::PemObject, CertificateDer};
+    let mut roots = ureq::rustls::RootCertStore::empty();
+    for cert in CertificateDer::pem_slice_iter(pem) {
+        let cert = cert.map_err(|e| Fault::Malformed(format!("invalid TLS CA PEM: {e}")))?;
+        roots
+            .add(cert)
+            .map_err(|e| Fault::Malformed(format!("invalid TLS CA certificate: {e}")))?;
+    }
+    if roots.is_empty() {
+        return Err(Fault::Malformed(
+            "TLS CA bundle contains no certificates".into(),
+        ));
+    }
+    Ok(ureq::rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth())
+}
+
 /// The origin's status and the headers relayed from it.
 type OriginHead = (u16, Vec<(String, String)>);
 
@@ -962,6 +1011,18 @@ fn open(
         Some(config) => builder.tls_config(Arc::clone(config)),
         None => builder,
     };
+    let builder = if let Some(pem) = request.tls_ca.as_deref() {
+        if !request
+            .url
+            .split_once("://")
+            .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("https"))
+        {
+            return Err(Fault::Refused("custom TLS roots require HTTPS".into()));
+        }
+        builder.tls_config(Arc::new(custom_tls(pem)?))
+    } else {
+        builder
+    };
     let agent = match timing {
         // One deadline for the exchange: ureq applies it in place of its
         // per-read and per-write timeouts, so setting those would do
@@ -978,6 +1039,7 @@ fn open(
     }
     .build();
     let Request {
+        tls_ca: _,
         method,
         url,
         headers,
@@ -1238,6 +1300,7 @@ fn hand_over(mut input: impl Write, request: Request) {
     // Whole, so that a field added to a request is handed over or said
     // not to be.
     let Request {
+        tls_ca: _,
         method,
         url,
         headers,
@@ -1845,6 +1908,115 @@ mod tests {
         assert_eq!(ureq_redirects(0), 0);
         assert_eq!(ureq_redirects(1), 2);
         assert_eq!(ureq_redirects(MAX_REDIRECTS), MAX_REDIRECTS + 1);
+    }
+
+    const ACCOUNT_CA: &[u8] = include_bytes!("../tests/fixtures/account-ca/ca.pem");
+
+    #[test]
+    fn account_ca_framing_is_bounded_and_unambiguous() {
+        for head in [
+            "tls-ca 0",
+            "tls-ca 65537",
+            "tls-ca nope",
+            "tls-ca 1\ntls-ca 1",
+            "tls-ca 1\nstream",
+            "tls-ca 1\npublic",
+        ] {
+            assert!(account_request(
+                &format!("method GET\nurl https://localhost/\nredirects 0\n{head}\n"),
+                b"x"
+            )
+            .is_err());
+        }
+        assert!(account_request("method GET\nurl https://localhost/\ntls-ca 1\n", b"x").is_err());
+        assert!(account_request(
+            "method GET\nurl https://localhost/\nredirects 0\ntls-ca 2\n",
+            b"x"
+        )
+        .is_err());
+        let request = account_request(
+            "method POST\nurl https://localhost/\nredirects 0\ntls-ca 3\nbody 4\n",
+            b"pemBODY",
+        )
+        .unwrap();
+        assert_eq!(request.tls_ca.as_deref(), Some(b"pem".as_slice()));
+        assert_eq!(request.body, b"BODY");
+        for pem in [
+            b"".as_slice(),
+            b"junk",
+            b"-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n",
+        ] {
+            assert!(custom_tls(pem).is_err());
+        }
+    }
+
+    fn account_tls_exchange(ca: Option<&[u8]>, host: &str, expired: bool) -> bool {
+        use ureq::rustls::{
+            pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer},
+            ServerConfig, ServerConnection, StreamOwned,
+        };
+        let cert = if expired {
+            include_bytes!("../tests/fixtures/account-ca/expired.pem").as_slice()
+        } else {
+            include_bytes!("../tests/fixtures/account-ca/server.pem").as_slice()
+        };
+        let cert = CertificateDer::from_pem_slice(cert).unwrap();
+        let key = PrivateKeyDer::from_pem_slice(include_bytes!(
+            "../tests/fixtures/account-ca/server.key"
+        ))
+        .unwrap();
+        let config = Arc::new(
+            ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert], key)
+                .unwrap(),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut stream = StreamOwned::new(ServerConnection::new(config).unwrap(), socket);
+            let mut reader = BufReader::new(&mut stream);
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) if line == "\r\n" => break,
+                    Ok(_) => {}
+                }
+            }
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+            let _ = stream.flush();
+        });
+        let mut request = account_request(
+            &format!("method GET\nurl HTTPS://{host}:{port}/\nredirects 0\n"),
+            b"",
+        )
+        .unwrap();
+        request.tls_ca = ca.map(Vec::from);
+        let result = perform(request, LENIENT, Duration::from_secs(5));
+        server.join().unwrap();
+        result.is_ok_and(|reply| reply.status == 200 && reply.body == b"ok")
+    }
+
+    #[test]
+    fn account_ca_preserves_verification_and_does_not_leak() {
+        assert!(!account_tls_exchange(None, "localhost", false));
+        assert!(account_tls_exchange(Some(ACCOUNT_CA), "localhost", false));
+        assert!(!account_tls_exchange(Some(ACCOUNT_CA), "127.0.0.1", false));
+        assert!(!account_tls_exchange(Some(ACCOUNT_CA), "localhost", true));
+        assert!(!account_tls_exchange(None, "localhost", false));
+    }
+
+    fn account_request(head: &str, body: &[u8]) -> Result<Request, String> {
+        parse(&request_bytes(head, body))
     }
 
     pub(super) static MAIL_TLS: std::sync::OnceLock<Arc<ureq::rustls::ClientConfig>> =

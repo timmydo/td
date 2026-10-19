@@ -170,6 +170,7 @@ mod portal_tests {
             crate::testing::tempdir().unwrap(),
         );
         let mut placeholder = crate::config::AccountConfig {
+            tls_ca_file: None,
             name: "main".to_string(),
             well_known_url: "https://mail.example.com/.well-known/jmap".to_string(),
             username: "you@example.com".to_string(),
@@ -214,15 +215,18 @@ pub fn connect_account(account: &AccountConfig) -> Result<JmapClient, String> {
             account.name, account.well_known_url
         ));
     }
-    let (_session, client) =
-        JmapClient::discover(&account.well_known_url, &account.username, &password).map_err(
-            |e| match e {
-                // The diagnostic already names what is missing and what
-                // would answer it; a discovery prefix would only bury it.
-                JmapError::NoFetchService(message) => message,
-                other => format!("JMAP discovery error: {}", other),
-            },
-        )?;
+    let (_session, client) = JmapClient::discover(
+        &account.well_known_url,
+        &account.username,
+        &password,
+        account.tls_ca_file.as_deref(),
+    )
+    .map_err(|e| match e {
+        // The diagnostic already names what is missing and what
+        // would answer it; a discovery prefix would only bury it.
+        JmapError::NoFetchService(message) => message,
+        other => format!("JMAP discovery error: {}", other),
+    })?;
     Ok(client)
 }
 
@@ -330,6 +334,7 @@ Rules:
 - `well_known_url`, `username`, and exactly one of `password_command` or `secret` are required per account.
 - `secret = "portal"` asks td's credential portal for the secret stored as mail/NAME for [account.NAME] (mail/default for a legacy [jmap] section); it needs no shell and no file, and it works inside a td jail only, where the helper is packaged. Submit the secret from the human session with `td-secret set mail/NAME < file`, then press Ctrl+Alt+Esc and W, verify the target and touch the enrolled token. NAME is 1 to 64 bytes of [A-Za-z0-9_-].
 - `password_command` is a shell command that prints the password to stdout.
+- Optional `tls_ca_file` names an absolute path to a PEM CA bundle (at most 64 KiB), read on connect. It replaces public roots only for the HTTPS origin of `well_known_url`; other origins use public roots. Certificate and hostname verification remain enabled.
 - Quoted strings support \", \\, \n, \t escapes.
 - `scrolloff` and `[theme]` were the terminal's; they are accepted and ignored. The window keeps the selection in view and draws with the toolkit's colours.
 - Sending needs nothing here: a draft goes through the account's JMAP server (mail submission, RFC 8621), under the identity whose address the draft's From names; there is no SMTP setting.
@@ -497,6 +502,7 @@ fn print_help_config() {
     );
     println!("  username = \"user@example.com\"                    # Email address (required)");
     println!("  secret = \"portal\"                                # The credential portal, mail/NAME (this or password_command)");
+    println!("  tls_ca_file = \"/absolute/path/ca.pem\"              # Optional private CA for this HTTPS origin");
     println!("  password_command = \"pass show email/example\"     # Shell command printing the password (or secret)");
     println!();
     println!("[retention.NAME]                 # Optional folder retention policies");

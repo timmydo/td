@@ -27,6 +27,9 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::Duration;
 
+/// Maximum PEM CA bundle carried by one request.
+pub const MAX_TLS_CA: usize = 64 * 1024;
+
 const PROTOCOL: &str = "td-fetch 1";
 const SOCKET_DIRECTORY: &str = "td-fetch";
 const SOCKET_FILE: &str = "socket";
@@ -239,6 +242,7 @@ pub fn get_public(
         &[],
         limit,
         Shape {
+            tls_ca: None,
             redirects: Some(0),
             stream: false,
             public: true,
@@ -283,6 +287,34 @@ pub fn post_stream(
     stream("POST", url, headers, body, limit, None)
 }
 
+/// A counted GET or POST using public roots when `tls_ca` is absent,
+/// or HTTPS with only the supplied PEM roots when present. Redirects
+/// are returned to the caller so it can decide the next origin's trust.
+pub fn request_with_ca(
+    method: &str,
+    url: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+    limit: Option<u64>,
+    tls_ca: Option<&[u8]>,
+) -> Result<Response, Error> {
+    let limit = limit.unwrap_or(DEFAULT_LIMIT);
+    let (mut reader, written) = send(
+        method,
+        url,
+        headers,
+        body,
+        limit,
+        Shape {
+            redirects: Some(0),
+            stream: false,
+            public: false,
+            tls_ca,
+        },
+    )?;
+    settle(read_reply(&mut reader, limit), written)
+}
+
 fn request(
     method: &str,
     url: &str,
@@ -299,6 +331,7 @@ fn request(
         body,
         limit,
         Shape {
+            tls_ca: None,
             redirects,
             stream: false,
             public: false,
@@ -323,6 +356,7 @@ fn stream(
         body,
         limit,
         Shape {
+            tls_ca: None,
             redirects,
             stream: true,
             public: false,
@@ -349,8 +383,9 @@ fn stream(
     })
 }
 
-/// A request's optional lines: `redirects N`, `stream` and `public`.
-struct Shape {
+/// A request's optional framing and per-request PEM trust bundle.
+struct Shape<'a> {
+    tls_ca: Option<&'a [u8]>,
     redirects: Option<u32>,
     stream: bool,
     public: bool,
@@ -366,11 +401,20 @@ fn send(
     limit: u64,
     shape: Shape,
 ) -> Result<(BufReader<UnixStream>, std::io::Result<()>), Error> {
+    if !matches!(method, "GET" | "POST") {
+        return Err(Error::Malformed("method must be GET or POST".into()));
+    }
     let Shape {
         redirects,
         stream,
         public,
+        tls_ca,
     } = shape;
+    if tls_ca.is_some_and(|ca| ca.is_empty() || ca.len() > MAX_TLS_CA) {
+        return Err(Error::Malformed(
+            "TLS CA bundle must contain 1..65536 bytes".into(),
+        ));
+    }
     check_head(url, headers)?;
     let path = socket_path().ok_or_else(|| Error::Io("no td-fetch socket".into()))?;
     let mut socket = UnixStream::connect(&path).map_err(|e| Error::Io(format!("connect: {e}")))?;
@@ -398,11 +442,15 @@ fn send(
     if public {
         head.push_str("public\n");
     }
+    if let Some(ca) = tls_ca {
+        head.push_str(&format!("tls-ca {}\n", ca.len()));
+    }
     head.push_str(&format!("body {}\n\n", body.len()));
     // Written whole before anything is read; the service may already have
     // answered and closed, and then the reply is what matters, not EPIPE.
     let written = socket
         .write_all(head.as_bytes())
+        .and_then(|()| socket.write_all(tls_ca.unwrap_or_default()))
         .and_then(|()| socket.write_all(body))
         .and_then(|()| socket.flush());
     Ok((BufReader::new(socket), written))
@@ -619,6 +667,22 @@ mod tests {
 
     /// A body the service announces past what was asked for is refused
     /// before it is read.
+    #[test]
+    fn custom_ca_request_refuses_invalid_inputs_before_connecting() {
+        for method in ["PUT", "GET\npublic"] {
+            assert!(matches!(
+                request_with_ca(method, "https://h/", &[], &[], None, None),
+                Err(Error::Malformed(_))
+            ));
+        }
+        for pem in [Vec::new(), vec![0; MAX_TLS_CA + 1]] {
+            assert!(matches!(
+                request_with_ca("GET", "https://h/", &[], &[], None, Some(&pem)),
+                Err(Error::Malformed(_))
+            ));
+        }
+    }
+
     #[test]
     fn a_body_past_the_limit_is_not_read() {
         let wire = format!("{PROTOCOL}\nstatus 200\nbody 11\n\nhello world");
