@@ -1315,17 +1315,70 @@ opener that is the token being removed, or the marker being removed,
 and a header that is not protected. The reader's bounds hold the
 result.
 
+`manage::protectors` lists the fido2 tokens naming a keyslot, the
+FIDO2 protectors every minimum counts, and `manage::removable` is
+`Removal::removable` over them, so the storage worker's baseline and its
+planners agree. A tpm-pin token counts, for the removal's TPM-shape rule
+and a request's protector, only when it names a keyslot: an orphan opens
+nothing. An addition counts every fido2 token against the four-token
+bound and its role's three, a pending or orphan one included, since the
+reader's bound counts them. A recovery-key removal also needs a
+fido2-primary protector among the two. A tpm-pin opener is refused as
+`UnknownToken`: a proof is a security key's or the recovery key's.
+
 *The selector's `request::plan`.* After the cap, with the volume key, it
 gives each request one of three fates: removed without being carried
 out (at one of three points), left for a later boot, or carried out.
 
 | Fate | When |
 | --- | --- |
-| Removed as the plan's first write | its tag fails; it is declined; it is a re-enrollment on the recorded primary, a PIN release's included |
+| Removed as the plan's first write | its tag fails; it is declined; it is a re-enrollment on the recorded primary, a PIN release's included; it is a clear or re-enrollment with no TPM td can prove this boot, before its question (`Removed::Unproven`) |
 | Removed with the reseal's plan | a PIN change at a boot whose confirmed reseal's plan runs, since that sets a new PIN itself |
 | Removed at that step | a clear whose TPM the lockout step cannot prove, or that TPM2_Clear refuses |
 | Left for a later boot | a PIN change at a boot by another protector, or one whose seal or verification failed; a clear on the recorded primary whose lockout step met `TPM_RC_LOCKOUT`, or whose TPM2_Clear answer was lost |
 | Carried out | otherwise, in ENCRYPTION.md's order |
+
+`request::fate` gives the pending request's number and fate from the
+header read at release, the volume key, the UUID and the boot (`Boot`):
+
+- the opener;
+- the TPM's `Primary`: `Recorded`, `Other`, or `Unknown` with no TPM td
+  can read or prove;
+- after a PIN release, a PIN change's `NewPin`: `Sealed`, `Declined` or
+  `Failed`;
+- whether a reseal was confirmed.
+
+The fate is `Resolved`, or a `Question`, the clear's or re-enrollment's,
+whose `answered` resolves it. `request::plan` then gives the boot's plan
+beside it:
+
+| Resolved | Plan |
+| --- | --- |
+| `Removed` | the request's removal, then the boot's own plan |
+| `Left` | the boot's own plan |
+| `Superseded`, `PinChange` | the reseal's plan, `protected_plan::pin_change`'s for a PIN change, the request removed just before its first write the tag covers |
+| `Clear`, `Reenroll` | in place of the boot's own plan: a kill of each tpm-pin keyslot but the opener's under the opener, the request's removal, then each tpm-pin token's and the lockout token's removal |
+
+A fate that carries the request out, `PinChange`, `Clear` or
+`Reenroll` (which a clear on another primary resolves to), needs the
+request's operation and a tag that verifies under the volume key over
+the header, which `plan` checks again (`Refusal::Request`). The selector
+resolves a confirmed clear whose lockout step cannot prove this TPM as
+`Removed::Unproven` and one TPM2_Clear refuses as `Removed::Refused`.
+
+Its choices beyond ENCRYPTION.md's text, each failing closed:
+
+- A PIN release proves the recorded primary, so a clear there asks the
+  clear's question whatever primary the caller reports, and `plan`
+  refuses a re-enrollment after one.
+- A PIN release beside a pending PIN change whose entry the selector did
+  not take leaves it.
+- A reseal beside a pending clear or re-enrollment is refused
+  (`NoReseal`).
+- `protected_plan::pin_change` is a reseal after a TPM PIN release.
+  Should the new token exceed the two-token bound, the other tpm-pin
+  tokens are retired first; the released keyslot stays until the new
+  keyslot's test, then is retired under its key.
 
 A request carried out has each write made through the protected
 planner's own: the PIN change's through the reseal's, the retirements

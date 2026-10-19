@@ -27,6 +27,7 @@ use td_tpm::{Client, PcrPolicy, PcrReadError, PcrSelection, Refusal, SealedObjec
 pub mod cryptsetup;
 pub mod lockout;
 pub mod luks2;
+pub mod manage;
 pub mod pin;
 pub mod protected;
 pub mod protected_plan;

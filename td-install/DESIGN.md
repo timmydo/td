@@ -1650,10 +1650,10 @@ is `18`, then:
 - the fido2 token count, 0 to 4, then each token's role (`01` primary,
   `02` recovery) and fingerprint, the first four bytes of SHA-256 over
   its credential ID, in token-number order;
-- the tpm-pin token count, 0 to 2, `01` when a lockout token is on the
-  header, else `00`, and the request byte, `00` with no `td-request`
-  token or `01` to `03` for its operation (`pin-change`, `tpm-clear`,
-  `tpm-reenroll`);
+- the count of tpm-pin tokens naming a keyslot, 0 to 2, `01` when a
+  lockout token is on the header, else `00`, and the request byte, `00`
+  with no `td-request` token or `01` to `03` for its operation
+  (`pin-change`, `tpm-clear`, `tpm-reenroll`);
 - `00` and the running deployment's 32-byte manifest ID when it is
   `current`, acknowledged and with no pending attempt, or `01` alone.
 

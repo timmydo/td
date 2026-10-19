@@ -2260,9 +2260,9 @@ cryptsetup commands (DESIGN.md "Full-system volume consumers").
   - It never leaves a shape below its minimums.
   - A security-key proof must come from another token.
   - In the TPM shape it also never leaves the recovery key alone while
-    the header has no tpm-pin token, as after a clear or re-enrollment
-    and before the reseal. This is the operation's own rule, not a
-    shape minimum.
+    the header has no tpm-pin token naming a keyslot, as after a clear
+    or re-enrollment and before the reseal. This is the operation's own
+    rule, not a shape minimum.
   - Limit: a TPM cleared from firmware, or replaced, keeps its stale
     tpm-pin token until re-enrollment, so the header still counts as
     having one. Its last FIDO2 token can then be removed, leaving the
@@ -2342,6 +2342,7 @@ re-enrollment, and before a PIN change writes anything.
 | A re-enrollment on the TPM whose primary the header records | As the plan's first write, with no prompt |
 | A PIN change superseded by a confirmed reseal | With the reseal's plan |
 | A clear whose TPM the lockout step cannot prove, or that TPM2_Clear refuses | At that step, with nothing retired |
+| A clear or re-enrollment at a boot with no TPM td can prove | As the plan's first write, with no prompt |
 | Carried out | Just before the first write that changes the state its tag covers |
 
 The last rule means an interrupted boot leaves either the request and
@@ -2418,8 +2419,9 @@ Confirmed, on the TPM whose storage primary the header records
    selector update predicted this boot is discarded; the update stays
    staged, as on a TPM td cannot anchor ("Selector update"), until a
    PIN boot after the reseal.
-2. The plan removes the request, then retires the tpm-pin keyslot and
-   token and the lockout token.
+2. The plan kills the tpm-pin keyslots, removes the request, then
+   retires the tpm-pin tokens and the lockout token: the kills change
+   nothing the tag covers.
 
 After a PIN release, the tpm-pin keyslot is the one that opened the
 volume, and cryptsetup kills a keyslot only with another keyslot's key.
@@ -2438,7 +2440,7 @@ Other outcomes:
 
 | Situation | What happens |
 | --- | --- |
-| The TPM's storage primary is not the recorded one: a clear whose TPM2_Clear answer was lost, or a replaced TPM | The selector asks re-enrollment's question instead, `td: this TPM's storage primary is not the one td recorded` and `td: type reenroll to enroll this TPM: `. Confirmed, it runs no TPM2_Clear, removes the request, and retires the tokens where re-enrollment does; that boot's lockout step takes this TPM's lockout. |
+| The TPM's storage primary is not the recorded one: a clear whose TPM2_Clear answer was lost, or a replaced TPM | The selector asks re-enrollment's question instead, `td: this TPM's storage primary is not the one td recorded` and `td: type reenroll to enroll this TPM: `. Confirmed, it runs no TPM2_Clear and retires the tokens and removes the request where re-enrollment does; that boot's lockout step takes this TPM's lockout. |
 | On the recorded primary, the lockout step is refused with `TPM_RC_LOCKOUT` | Nothing was checked; the request stays for a later boot. |
 | A TPM td cannot prove, or TPM2_Clear refused, `TPM_RC_DISABLED` among them (`td: the TPM refuses to be cleared; clear it from firmware setup`) | The request is removed at that step, with the reason printed, and nothing is retired: the firmware's own clear is then the way. |
 | TPM2_Clear's answer is lost | The request stays. The next boot finds the recorded primary and asks again, or another primary and asks as in the first row. |
@@ -2466,8 +2468,8 @@ updates"). Re-enrollment adopts it:
    recorded` and the `RESEAL_KEYS` line, and asks `td: type reenroll to
    enroll this TPM: `. Exactly `reenroll` confirms; any other answer
    declines, and the plan removes the request.
-4. Confirmed, the plan removes the request, then retires the stale
-   tpm-pin keyslots and tokens and the stale lockout token.
+4. Confirmed, the plan kills the stale tpm-pin keyslots, removes the
+   request, then retires the stale tpm-pin tokens and lockout token.
 5. That boot's lockout step takes this TPM's lockout with a fresh token
    ("Lockout"): trust on first use on the new primary.
 6. The next boot by a security key or the recovery key offers the
@@ -2508,6 +2510,11 @@ the safe outcome.
   system can therefore request a TPM clear or re-enrollment, which the
   owner then confirms with one answer at a later boot; it already holds
   the volume key.
+- A request left for a later boot stops verifying when that boot's own
+  writes change the state its tag covers: its plan retiring a selector
+  update's second tpm-pin token, or its lockout step replacing or
+  removing the lockout token. The next boot removes it as one that does
+  not verify, and the owner requests it again.
 - A declined or replaced request stays valid in old header copies until
   a like operation changes the state its tag covers. If such a copy is
   restored, the request asks again, and declining it again costs

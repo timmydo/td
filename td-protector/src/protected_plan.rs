@@ -133,6 +133,23 @@ pub enum Refusal {
     /// cryptsetup's own metadata could not be read or does not agree with
     /// the header the plan was computed from.
     Metadata(String),
+    /// An addition of a role the shape does not take: the TPM-primary
+    /// shape takes fido2-recovery tokens only (`manage`).
+    Role,
+    /// An addition beyond the shape's bounds: four FIDO2 tokens, or in the
+    /// FIDO2-primary shape three of the new token's role.
+    Full,
+    /// A removal that would leave the shape below its minimums, or the
+    /// recovery key alone in the TPM-primary shape without a tpm-pin token
+    /// naming a keyslot.
+    Minimum,
+    /// A request without the protector it acts on.
+    NoProtector,
+    /// The protector to remove is the one whose proof authorizes it.
+    RemovesOpener,
+    /// A request to carry out whose operation is not the fate's, or whose
+    /// tag does not verify for this header.
+    Request,
 }
 
 impl fmt::Display for Refusal {
@@ -164,6 +181,14 @@ impl fmt::Display for Refusal {
                  primary the protector was sealed under",
             ),
             Self::Metadata(error) => f.write_str(error),
+            Self::Role => f.write_str("this shape does not take a security key of that role"),
+            Self::Full => f.write_str("this shape holds no more security keys of that role"),
+            Self::Minimum => f.write_str("the removal would leave the shape below its minimums"),
+            Self::NoProtector => f.write_str("the header has no protector the request acts on"),
+            Self::RemovesOpener => {
+                f.write_str("the protector to remove is the one that authorizes the removal")
+            }
+            Self::Request => f.write_str("the request does not verify for what it carries out"),
         }
     }
 }
@@ -176,6 +201,14 @@ pub struct Plan {
 }
 
 impl Plan {
+    /// `steps` over the header they were computed from.
+    pub(crate) fn new(header: &Header, steps: Vec<Step>) -> Self {
+        Self {
+            view: header.metadata(),
+            steps,
+        }
+    }
+
     /// The steps, for inspection. The executor runs only those `confirm`
     /// returns.
     pub fn steps(&self) -> &[Step] {
@@ -298,7 +331,7 @@ pub fn check(header: &Header) -> Result<Shape, Refusal> {
 }
 
 /// The keyslot `opened` names, checked against its kind.
-fn opener(header: &Header, opened: Opened) -> Result<u8, Refusal> {
+pub(crate) fn opener(header: &Header, opened: Opened) -> Result<u8, Refusal> {
     let named = |number: u8, kind: &dyn Fn(&Token) -> bool| {
         header
             .protected
@@ -354,17 +387,39 @@ fn primary(header: &Header, shape: Shape, opened: Opened) -> bool {
 pub fn plan(header: &Header, opened: Opened, reseal: Option<&TpmPin>) -> Result<Plan, Refusal> {
     let shape = check(header)?;
     let opener = opener(header, opened)?;
-    let done = |steps: Vec<Step>| Plan {
-        view: header.metadata(),
-        steps,
-    };
     let primary = primary(header, shape, opened);
     if reseal.is_some() && (primary || shape != Shape::Tpm) {
         return Err(Refusal::NoReseal);
     }
     if !primary && reseal.is_none() {
-        return Ok(done(Vec::new()));
+        return Ok(Plan::new(header, Vec::new()));
     }
+    planned(header, opened, opener, reseal)
+}
+
+/// A PIN change's plan (ENCRYPTION.md "PIN change"): a reseal's, after a
+/// TPM PIN release in the TPM-primary shape, `new` the protector sealed
+/// under the new PIN. The released keyslot authorizes the new one and is
+/// retired under the new keyslot's key once its test passed; should the
+/// new token exceed the two-token bound, the other tpm-pin tokens are
+/// retired first, the released keyslot still opening.
+pub fn pin_change(header: &Header, opened: Opened, new: &TpmPin) -> Result<Plan, Refusal> {
+    let shape = check(header)?;
+    let opener = opener(header, opened)?;
+    if shape != Shape::Tpm || !matches!(opened, Opened::TpmPin { .. }) {
+        return Err(Refusal::NoReseal);
+    }
+    planned(header, opened, opener, Some(new))
+}
+
+/// `plan`'s and `pin_change`'s steps once their refusals passed.
+fn planned(
+    header: &Header,
+    opened: Opened,
+    opener: u8,
+    reseal: Option<&TpmPin>,
+) -> Result<Plan, Refusal> {
+    let done = |steps: Vec<Step>| Plan::new(header, steps);
     // Orphan keyslots: none named by a token of any type, foreign and
     // protected tokens both (`foreign_keyslots`). Without a marker naming
     // the recovery keyslot none is killed, since it could be that one.
@@ -428,13 +483,27 @@ pub fn plan(header: &Header, opened: Opened, reseal: Option<&TpmPin>) -> Result<
         }
         return Ok(done(steps));
     };
-    // The reseal: retired first when its token would exceed the bound.
+    // The reseal: retired first when its token would exceed the bound. A
+    // PIN change's released token and keyslot stay until the new test.
+    let released = match opened {
+        Opened::TpmPin { token } => Some((token, opener)),
+        _ => None,
+    };
+    let first: Vec<(u8, u8)> = pins
+        .iter()
+        .copied()
+        .filter(|pin| Some(*pin) != released)
+        .collect();
     let early = pins.len() >= MAX_TPM_PIN_TOKENS;
     if early {
-        retire(&mut steps, None, opener, &pins);
+        retire(&mut steps, released, opener, &first);
     }
     let retired: Vec<u8> = if early {
-        pins.iter().map(|(_, slot)| *slot).collect()
+        first
+            .iter()
+            .map(|(_, slot)| *slot)
+            .filter(|slot| *slot != opener)
+            .collect()
     } else {
         Vec::new()
     };
@@ -444,7 +513,7 @@ pub fn plan(header: &Header, opened: Opened, reseal: Option<&TpmPin>) -> Result<
         .copied()
         .filter(|slot| !orphan_slots.contains(slot) && !retired.contains(slot))
         .collect();
-    let removed = orphan_tokens.len() + if early { pins.len() } else { 0 };
+    let removed = orphan_tokens.len() + if early { first.len() } else { 0 };
     let held = header
         .token_numbers()
         .len()
@@ -470,6 +539,8 @@ pub fn plan(header: &Header, opened: Opened, reseal: Option<&TpmPin>) -> Result<
     steps.push(Step::Test { slot });
     if !early {
         retire(&mut steps, None, slot, &pins);
+    } else if let Some(released) = released {
+        retire(&mut steps, None, slot, &[released]);
     }
     Ok(done(steps))
 }
@@ -531,7 +602,7 @@ pub fn update_retry(header: &Header) -> Option<(u8, &UpdateRetry)> {
 }
 
 /// The lowest token number no token holds.
-fn free_token(header: &Header) -> Result<u8, Refusal> {
+pub(crate) fn free_token(header: &Header) -> Result<u8, Refusal> {
     let used = header.token_numbers();
     (0..=MAX_SLOT)
         .find(|number| !used.contains(number))
@@ -609,7 +680,7 @@ pub fn retry_remove(header: &Header) -> Option<Step> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::luks2::HeaderCopy;
     use crate::pin::PinPcrs;
@@ -618,12 +689,12 @@ mod tests {
     use td_tpm::SealedObject;
 
     /// The recovery key's identity in the model.
-    const RECOVERY_KEY: u32 = 1000;
+    pub(crate) const RECOVERY_KEY: u32 = 1000;
     /// A security key's passphrase in the model.
-    const FIDO_KEY: u32 = 2000;
+    pub(crate) const FIDO_KEY: u32 = 2000;
 
     /// A tpm-pin protector sealed to boot chain `chain`, releasing `key`.
-    fn pin(slot: Option<u8>, chain: u8, key: u32) -> TpmPin {
+    pub(crate) fn pin(slot: Option<u8>, chain: u8, key: u32) -> TpmPin {
         TpmPin {
             keyslot: slot,
             pcrs: PinPcrs::Selector,
@@ -644,7 +715,7 @@ mod tests {
         u32::from_be_bytes(pin.sealed.public[1..5].try_into().unwrap())
     }
 
-    fn fido(slot: Option<u8>, role: FidoRole) -> Token {
+    pub(crate) fn fido(slot: Option<u8>, role: FidoRole) -> Token {
         Token::Fido2(Fido2 {
             keyslot: slot,
             role,
@@ -655,7 +726,7 @@ mod tests {
         })
     }
 
-    fn lockout_token(proven: bool) -> Lockout {
+    pub(crate) fn lockout_token(proven: bool) -> Lockout {
         Lockout {
             primary: [0x0b; 34],
             nonce: [1; 32],
@@ -668,10 +739,10 @@ mod tests {
     /// A LUKS2 header as cryptsetup keeps it: each keyslot's key, td's
     /// protected tokens and foreign tokens.
     #[derive(Debug, Clone, PartialEq, Eq)]
-    struct Disk {
-        keyslots: BTreeMap<u8, u32>,
-        tokens: BTreeMap<u8, Token>,
-        foreign: BTreeMap<u8, Vec<u8>>,
+    pub(crate) struct Disk {
+        pub(crate) keyslots: BTreeMap<u8, u32>,
+        pub(crate) tokens: BTreeMap<u8, Token>,
+        pub(crate) foreign: BTreeMap<u8, Vec<u8>>,
     }
 
     impl Disk {
@@ -679,7 +750,7 @@ mod tests {
         /// in keyslot 0 and its marker as token 0, the tpm-pin protector of
         /// chain 1 in keyslot 1 as token 1, a fido2-recovery token 2 on
         /// keyslot 2, and the lockout token 3.
-        fn tpm_shape() -> Self {
+        pub(crate) fn tpm_shape() -> Self {
             let mut disk = Self {
                 keyslots: BTreeMap::from([(0, RECOVERY_KEY), (1, 101), (2, FIDO_KEY)]),
                 tokens: BTreeMap::new(),
@@ -696,7 +767,7 @@ mod tests {
         /// The FIDO2-primary shape: two fido2-primary tokens on keyslots 1
         /// and 2 and a fido2-recovery one on keyslot 3, the recovery key
         /// in keyslot 0 and its marker.
-        fn fido_shape() -> Self {
+        pub(crate) fn fido_shape() -> Self {
             let mut disk = Self {
                 keyslots: BTreeMap::from([
                     (0, RECOVERY_KEY),
@@ -715,7 +786,7 @@ mod tests {
             disk
         }
 
-        fn header(&self) -> Header {
+        pub(crate) fn header(&self) -> Header {
             Header {
                 copy: HeaderCopy::Primary,
                 seqid: 1,
@@ -740,7 +811,7 @@ mod tests {
 
         /// The header as `luksDump --dump-json-metadata` prints it, which
         /// the reader's own bounds then judge.
-        fn dump(&self) -> Vec<u8> {
+        pub(crate) fn dump(&self) -> Vec<u8> {
             let keyslots: Vec<String> = self
                 .keyslots
                 .keys()
@@ -775,7 +846,7 @@ mod tests {
         }
 
         /// One step as cryptsetup commits it, the new keyslot's key `new`.
-        fn apply(&mut self, step: &Step, new: u32) {
+        pub(crate) fn apply(&mut self, step: &Step, new: u32) {
             match step {
                 Step::Test { slot } => assert!(self.keyslots.contains_key(slot), "{step:?}"),
                 Step::KillSlot { slot, by } => {
@@ -859,6 +930,33 @@ mod tests {
             id: None,
             replace: false,
         }
+    }
+
+    #[test]
+    fn a_pin_change_is_planned_only_after_a_pin_release_in_the_tpm_shape() {
+        let disk = Disk::tpm_shape();
+        let new = pin(None, 1, 3000);
+        for opened in [Opened::Fido2 { token: 2 }, Opened::RecoveryKey] {
+            assert_eq!(
+                pin_change(&disk.header(), opened, &new).unwrap_err(),
+                Refusal::NoReseal
+            );
+        }
+        assert!(pin_change(&disk.header(), Opened::TpmPin { token: 1 }, &new).is_ok());
+        // `plan` itself still offers no reseal after a PIN release.
+        assert_eq!(
+            refused(&disk, Opened::TpmPin { token: 1 }, Some(&new)),
+            Refusal::NoReseal
+        );
+        assert_eq!(
+            pin_change(
+                &Disk::fido_shape().header(),
+                Opened::Fido2 { token: 1 },
+                &new
+            )
+            .unwrap_err(),
+            Refusal::NoReseal
+        );
     }
 
     #[test]

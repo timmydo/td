@@ -2883,7 +2883,8 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
     1. shape: `1` TPM primary, `2` FIDO2 primary;
     2. marker: `1` when a `recovery-key` marker names a keyslot, else
        `0`;
-    3. tpm-pin: `1` when a tpm-pin token is on the header, else `0`;
+    3. tpm-pin: `1` when a tpm-pin token naming a keyslot is on the
+       header, else `0`;
     4. the fido2 token count, 1 to 4;
     5. that many tokens in token-number order, each its role byte and
        fingerprint;
@@ -3055,7 +3056,7 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
     | `00` | The proof is not offered: the recovery key without a marker, a disk key without a fido2 token, or a removal by disk key without two |
     | `01` | An addition the shape cannot take: a role it does not take (the TPM shape takes fido2-recovery only), or no room (four FIDO2 tokens, or in the FIDO2 shape three of that role) |
     | `02` | A removal with no removable token (`Removal::removable`), or a recovery-key removal outside the FIDO2 shape, without the marker, or with fewer than two FIDO2 tokens |
-    | `03` | A request without the protector it acts on: a PIN change without the TPM shape, a tpm-pin token and a lockout token, which anchors the new seal; a TPM clear without a lockout token; a re-enrollment outside the TPM shape, or with neither a tpm-pin nor a lockout token, since it would find nothing stale |
+    | `03` | A request without the protector it acts on: a PIN change without the TPM shape, a tpm-pin token naming a keyslot and a lockout token, which anchors the new seal; a TPM clear without a lockout token; a re-enrollment outside the TPM shape, or with neither a tpm-pin token naming a keyslot nor a lockout token, since it would find nothing stale |
 
     Otherwise root builds the first description from the baseline: the
     proof's first step, the choose step for a removal, or tag 21's
