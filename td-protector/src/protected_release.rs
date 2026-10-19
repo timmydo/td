@@ -19,11 +19,12 @@ use crate::pin::{
     PinPolicy, PRIMARY_NAME_LEN, SALT_LEN,
 };
 use crate::protected::{
-    FidoRole, Lockout, Shape, Token, TpmPin, MAX_PIN_PRIVATE_BYTES, MAX_PIN_PUBLIC_BYTES,
+    FidoRole, Lockout, Operation, Shape, Token, TpmPin, MAX_PIN_PRIVATE_BYTES, MAX_PIN_PUBLIC_BYTES,
 };
 use crate::protected_plan::{self, Input, Opened, Step};
 use crate::recovery::{RecoveryKey, RecoveryText};
 use crate::release::{LockoutCommand, Runner, Tpm};
+use crate::request::{self, Boot, Fate, Primary, Removed, Resolved};
 use crate::upgrade;
 use crate::{cap, lockout, read_random, CapError, ObserveError, Secret, UnsealError};
 use crate::{POLICY_PCR_REFUSED, SECRET_LEN};
@@ -69,6 +70,10 @@ pub const NO_PIN_PROTECTOR: &str =
 pub const NO_ANCHOR: &str = "no reseal is offered: this volume holds no lockout token to anchor \
      a new TPM PIN protector; this boot takes the TPM's lockout, and the next boot by a security \
      key or the recovery key offers the reseal";
+/// Printed instead of the reseal's offer beside a pending TPM clear or
+/// re-enrollment request (ENCRYPTION.md "Protected release").
+pub const NO_RESEAL_REQUEST: &str = "no reseal is offered: a TPM clear or re-enrollment \
+     request is pending, and carrying it out would retire the new protector";
 /// Printed before the first PIN prompt: the consoles read key positions
 /// under the kernel's US keymap ("PIN and dictionary-attack policy").
 pub const PIN_KEYS: &str = "the TPM PIN is read at its US key positions whatever the keys \
@@ -218,6 +223,8 @@ pub struct Released {
     predicted: Option<Box<TpmPin>>,
     /// This boot's own cap closed PCR 12, on a TPM with a SHA-256 bank.
     capped: bool,
+    /// What the chain check found of this TPM's storage primary.
+    primary: Primary,
 }
 
 /// A staged selector update's predicted PCRs (ENCRYPTION.md "Selector
@@ -274,6 +281,8 @@ struct Chain {
     /// The tokens record different Names, or the TPM's primary is not the
     /// recorded one: no reseal is offered.
     other_primary: bool,
+    /// The TPM's primary is not the one a token records.
+    other_tpm: bool,
 }
 
 /// The protected release order over `header`, a protected header td's
@@ -481,6 +490,13 @@ fn released<T: Tpm, C: Runner, F: Fido>(
             Err(error) => return Outcome::Failed(error),
         }
     };
+    let primary = if chain.passed.is_some() {
+        Primary::Recorded
+    } else if chain.other_tpm {
+        Primary::Other
+    } else {
+        Primary::Unknown
+    };
     Outcome::Released(Released {
         keyslot,
         key,
@@ -489,6 +505,7 @@ fn released<T: Tpm, C: Runner, F: Fido>(
         reseal,
         predicted,
         capped,
+        primary,
     })
 }
 
@@ -507,12 +524,13 @@ pub struct Finished {
 }
 
 /// After the selector opened the mapping and took `volume_key` with the
-/// released key: one confirmation of cryptsetup's metadata before the
-/// first write; without a reseal the plan, then in the TPM-primary shape
-/// the lockout's take or proof; with one, the take or proof first and the
-/// reseal's plan only once it succeeded, so a take or proof that fails
-/// discards the object before its import; then the counter, and its reset
-/// after a security-key or recovery-key release. The TPM is reached only
+/// released key: a pending request's fate under its tag (`request::fate`),
+/// one confirmation of cryptsetup's metadata before the first write;
+/// without a reseal the plan, `request::plan`'s beside a request, then in
+/// the TPM-primary shape the lockout's take or proof; with one, the take
+/// or proof first and the reseal's plan only once it succeeded, so a take
+/// or proof that fails discards the object before its import; then the
+/// counter, and its reset after a security-key or recovery-key release. The TPM is reached only
 /// when this boot's own cap closed PCR 12; nothing here halts the boot.
 pub fn finish<T: Tpm, C: Runner>(
     released: Released,
@@ -531,6 +549,7 @@ pub fn finish<T: Tpm, C: Runner>(
         reseal,
         predicted,
         capped,
+        primary: chain_primary,
     } = released;
     let mut finished = Finished::default();
     let dropped = |console: &mut dyn FnMut(&str)| {
@@ -555,14 +574,53 @@ pub fn finish<T: Tpm, C: Runner>(
             return finished;
         }
     };
-    let plan = match protected_plan::plan(header, opened, reseal.as_ref().map(|new| &new.token)) {
+    let uuid = lockout::volume_uuid(&header.uuid);
+    let pending = request::pending(header);
+    let lockout_due = shape == Shape::Tpm && tpm.is_some();
+    // A forged request costs no TPM command.
+    let verified = matches!((pending, &uuid), (Some((_, request)), Some(uuid))
+        if request::verifies(volume_key, uuid, request, &header.protected));
+    // The storage primary's Name, read once after the cap, which the
+    // request's primary and every lockout command are judged under.
+    let anchored = verified && protected_plan::lockout(header).is_some();
+    let name = match tpm.as_deref_mut() {
+        Some(tpm) if lockout_due || anchored => Some(tpm.primary_name()),
+        _ => None,
+    };
+    let primary = match (&name, &uuid) {
+        (Some(Ok(name)), Some(uuid)) => boot_primary(header, volume_key, uuid, name, chain_primary),
+        _ => Primary::Unknown,
+    };
+    let boot = Boot {
+        opened,
+        primary,
+        new_pin: None,
+        reseal: reseal.is_some(),
+    };
+    let new = reseal.as_ref().map(|new| &new.token);
+    let mut said = None;
+    let planned = match (pending, uuid) {
+        (Some(_), Some(uuid)) => match request::fate(header, volume_key, &uuid, &boot) {
+            Some((number, fate)) => {
+                let resolved = resolve(fate, console);
+                said = removal_line(resolved).map(|line| (number, line));
+                request::plan(header, volume_key, &uuid, opened, new, number, resolved)
+            }
+            None => protected_plan::plan(header, opened, new),
+        },
+        (Some(_), None) => {
+            console("td: a disk request stays: the volume's UUID is not a LUKS2 UUID");
+            protected_plan::plan(header, opened, new)
+        }
+        (None, _) => protected_plan::plan(header, opened, new),
+    };
+    let plan = match planned {
         Ok(plan) => Some(plan),
         Err(refusal) => {
             console(&format!("no plan this boot: {refusal}"));
             None
         }
     };
-    let lockout_due = shape == Shape::Tpm && tpm.is_some();
     if plan.as_ref().is_some_and(|plan| !plan.is_empty()) || lockout_due {
         let confirmed = cryptsetup
             .metadata(device)
@@ -587,7 +645,7 @@ pub fn finish<T: Tpm, C: Runner>(
     };
     if reseal.is_none() {
         if let Some(plan) = &plan {
-            run_steps(plan.steps(), device, &keys, cryptsetup, console);
+            run_steps(plan.steps(), device, &keys, said, cryptsetup, console);
         }
     }
     // The counter as the release left it, before a take's reset.
@@ -595,8 +653,8 @@ pub fn finish<T: Tpm, C: Runner>(
         Some(tpm) if shape == Shape::Tpm => Some(tpm.dictionary_attack()),
         _ => None,
     };
-    let lockout = match tpm.as_deref_mut() {
-        Some(tpm) if lockout_due => match tpm.primary_name() {
+    let lockout = match (tpm.as_deref_mut(), name) {
+        (Some(tpm), Some(name)) if lockout_due => match name {
             Ok(name) => lockout_stage(
                 header,
                 device,
@@ -635,7 +693,8 @@ pub fn finish<T: Tpm, C: Runner>(
                     new: new_slot.map(|slot| (slot, &new.secret)),
                     ..keys
                 };
-                finished.resealed = run_steps(plan.steps(), device, &keys, cryptsetup, console);
+                finished.resealed =
+                    run_steps(plan.steps(), device, &keys, said, cryptsetup, console);
                 if let Some(slot) = finished.resealed {
                     console(&format!(
                         "reseal: keyslot {slot} holds a TPM PIN protector sealed to this boot \
@@ -696,6 +755,66 @@ pub fn finish<T: Tpm, C: Runner>(
         }
     }
     finished
+}
+
+/// This TPM's storage primary, its Name `name`, against the header's
+/// record, for a pending request. A lockout token on the header decides,
+/// as the record the volume key authenticates: `Recorded` when it opens,
+/// `Other` when it verifies but names another primary, and `Unknown`
+/// otherwise, a forged or damaged one never deferring to the tpm-pin
+/// tokens' Names. Without one, what the chain check found.
+fn boot_primary(
+    header: &Header,
+    volume_key: &[u8],
+    uuid: &[u8; lockout::VOLUME_UUID_LEN],
+    name: &[u8],
+    chain: Primary,
+) -> Primary {
+    let Some((_, token)) = protected_plan::lockout(header) else {
+        return chain;
+    };
+    let Ok(primary) = <[u8; PRIMARY_NAME_LEN]>::try_from(name) else {
+        return Primary::Unknown;
+    };
+    match lockout::open(volume_key, uuid, token, &primary) {
+        Ok(_) => Primary::Recorded,
+        Err(lockout::OpenError::OtherPrimary) => Primary::Other,
+        Err(lockout::OpenError::Tag | lockout::OpenError::Invalid(_)) => Primary::Unknown,
+    }
+}
+
+/// A request's fate once nothing more is asked. A TPM clear's or
+/// re-enrollment's question is not asked: the request stays for a later
+/// boot, which says so.
+fn resolve(fate: Fate, console: &mut dyn FnMut(&str)) -> Resolved {
+    let resolved = match fate {
+        Fate::Resolved(resolved) => resolved,
+        Fate::Ask(_) => Resolved::Left,
+    };
+    if resolved == Resolved::Left {
+        console("td: a disk request stays for a later boot");
+    }
+    resolved
+}
+
+/// What the console says once the plan's removal of the request succeeds.
+fn removal_line(resolved: Resolved) -> Option<&'static str> {
+    Some(match resolved {
+        Resolved::Removed(Removed::Unverified) => request::UNVERIFIED,
+        Resolved::Removed(Removed::Declined) => "td: removed the declined disk request",
+        Resolved::Removed(Removed::RecordedPrimary) => {
+            "td: removed a TPM re-enrollment request: this TPM's storage primary is the one td \
+             recorded"
+        }
+        Resolved::Removed(Removed::Unproven) => {
+            "td: removed a TPM clear or re-enrollment request: td cannot prove this boot's TPM"
+        }
+        Resolved::Removed(Removed::Refused) => "td: removed a TPM clear request the TPM refused",
+        Resolved::Superseded => {
+            "td: removed the PIN change request: the confirmed reseal sets a new TPM PIN"
+        }
+        Resolved::Left | Resolved::PinChange | Resolved::Clear | Resolved::Reenroll => return None,
+    })
 }
 
 /// The deployment initramfs's post-cap check of a tpm-pin token
@@ -817,6 +936,7 @@ fn chain_stage<T: Tpm>(header: &Header, tpm: &mut T, console: &mut dyn FnMut(&st
                     ChainError::OtherPrimary => {
                         replaced = true;
                         chain.other_primary = true;
+                        chain.other_tpm = true;
                     }
                     ChainError::PrimaryRefused(_) | ChainError::Other(_) => replaced = true,
                 }
@@ -1102,6 +1222,14 @@ fn offer_reseal<T: Tpm>(
              td seals no new TPM PIN protector to another; security keys and the recovery key \
              remain",
         );
+        return Ok(None);
+    }
+    // Before its tag can be verified: carrying it out would retire the
+    // reseal.
+    if request::pending(header)
+        .is_some_and(|(_, request)| request.operation != Operation::PinChange)
+    {
+        console(NO_RESEAL_REQUEST);
         return Ok(None);
     }
     // 8c names no PCR 7: whether Secure Boot is on is 8i's reading of the
@@ -1626,6 +1754,7 @@ fn run_steps<C: Runner>(
     steps: &[Step],
     device: &Path,
     keys: &Keys<'_>,
+    said: Option<(u8, &str)>,
     cryptsetup: &mut C,
     console: &mut dyn FnMut(&str),
 ) -> Option<u8> {
@@ -1642,6 +1771,12 @@ fn run_steps<C: Runner>(
                 if let Step::Test { slot } = step {
                     if keys.new.is_some_and(|(new, _)| new == *slot) {
                         tested = Some(*slot);
+                    }
+                }
+                // A request's removal is said once it is done.
+                if let (Step::RemoveToken { token }, Some((number, line))) = (step, said) {
+                    if *token == number {
+                        console(line);
                     }
                 }
             }
@@ -2297,6 +2432,8 @@ pub(crate) mod tests {
         tpm: bool,
         /// What the selector's pre-seal predicts this boot.
         predict: Option<Predicted>,
+        /// PCR 12 already closed as the boot begins.
+        precapped: bool,
     }
 
     impl World {
@@ -2325,6 +2462,7 @@ pub(crate) mod tests {
                 keys,
                 tpm: true,
                 predict: None,
+                precapped: false,
             }
         }
 
@@ -2413,6 +2551,9 @@ pub(crate) mod tests {
         /// secret is gone once it returns and the script is used up.
         fn boot(&mut self, script: Vec<Say>) -> Run {
             self.model.reboot();
+            if self.precapped {
+                self.model.wire.0.borrow_mut().pcrs[usize::from(CAP_PCR)] = capped();
+            }
             self.log.borrow_mut().clear();
             self.disk.commands = 0;
             if self.disk.dump_override.is_none() {
@@ -3845,5 +3986,276 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert_eq!(protected_plan::update_retry(&world.disk.header()), None);
+    }
+
+    /// The request token's number in these tests.
+    const REQUEST: u8 = 5;
+
+    impl World {
+        /// A pending request for `operation` as token 5, tagged over the
+        /// header as it stands, or with its tag's first byte flipped.
+        fn request(&mut self, operation: Operation, verifies: bool) {
+            let nonce = [0x35; 32];
+            let mut tag = request::tag(
+                &VOLUME_KEY,
+                &lockout::volume_uuid(UUID).unwrap(),
+                operation,
+                &nonce,
+                &self.disk.header().protected,
+            )
+            .unwrap();
+            if !verifies {
+                tag[0] ^= 1;
+            }
+            self.disk.tokens.insert(
+                REQUEST,
+                Token::Request(crate::protected::Request {
+                    operation,
+                    nonce,
+                    tag,
+                }),
+            );
+        }
+
+        /// A cleared TPM: a new seed, so its primary has another Name.
+        fn replaced(&mut self) {
+            self.model.wire.0.borrow_mut().cleared = true;
+            self.model.wire.0.borrow_mut().seed = 1;
+            let (_, fresh) = self.model.wire.client().storage_primary(None).unwrap();
+            let mut state = self.model.state.borrow_mut();
+            state.primary = fresh.try_into().unwrap();
+            state.da.lockout_auth_set = false;
+            state.lockout_auth = None;
+        }
+
+        fn pending(&self) -> bool {
+            self.disk.tokens.contains_key(&REQUEST)
+        }
+    }
+
+    const REMOVED: &str = "cs remove 5";
+    const UNPROVEN: &str = "say td: removed a TPM clear or re-enrollment request: td cannot";
+    const RECORDED: &str = "say td: removed a TPM re-enrollment request: this TPM's";
+    const STAYS: &str = "say td: a disk request stays for a later boot";
+
+    /// The tag is checked after the cap with the volume key: a request
+    /// that fails it is the plan's first write, before the lockout step,
+    /// whatever its operation and the release.
+    #[test]
+    fn a_request_whose_tag_fails_is_removed_first() {
+        for operation in [
+            Operation::PinChange,
+            Operation::TpmClear,
+            Operation::TpmReenroll,
+        ] {
+            for pin in [true, false] {
+                let script = if pin {
+                    vec![say(PIN)]
+                } else {
+                    vec![say(b""), say(RECOVERY)]
+                };
+                let mut world = World::tpm_shape();
+                world.taken(&[0x42; 32]);
+                world.request(operation, false);
+                let run = world.boot(script);
+                released(&run, &world);
+                // Said once it is done.
+                let said = world.at(&format!("say {}", request::UNVERIFIED));
+                assert!(world.at(REMOVED) < said);
+                assert!(world.at("cs test") < world.at(REMOVED));
+                assert!(world.at(REMOVED) < world.at("tpm lockout"));
+                assert!(!world.pending(), "{operation:?}");
+                assert!(!world.has(STAYS));
+            }
+        }
+        // A FIDO2-primary header's too.
+        let mut world = World::fido_shape();
+        world.request(Operation::TpmClear, false);
+        world.plug(CRED_PRIMARY, 1);
+        let run = world.boot(vec![say(b""), say(KEY_PIN)]);
+        released(&run, &world);
+        assert!(world.has(REMOVED) && !world.pending());
+    }
+
+    /// A verified request is removed without a prompt where it cannot be
+    /// carried out, and otherwise stays.
+    #[test]
+    fn a_verified_request_is_removed_or_stays_by_the_boot() {
+        // A re-enrollment on the recorded primary, a PIN release's
+        // included; a security key's on a header with no lockout token,
+        // the chain check deciding.
+        for (script, taken) in [
+            (vec![say(PIN)], true),
+            (vec![say(b""), say(RECOVERY)], true),
+            (vec![say(b""), say(RECOVERY)], false),
+        ] {
+            let mut world = World::tpm_shape();
+            if taken {
+                world.taken(&[0x42; 32]);
+            }
+            world.request(Operation::TpmReenroll, true);
+            let run = world.boot(script);
+            released(&run, &world);
+            assert!(world.has(RECORDED));
+            assert!(world.at(REMOVED) < world.at("tpm lockout"));
+            assert!(!world.pending());
+        }
+        // A clear or re-enrollment with no TPM.
+        for operation in [Operation::TpmClear, Operation::TpmReenroll] {
+            let mut world = World::tpm_shape();
+            world.tpm = false;
+            world.disk.wire = None;
+            world.request(operation, true);
+            let run = world.boot(vec![say(RECOVERY)]);
+            released(&run, &world);
+            assert!(world.has(UNPROVEN));
+            assert!(!world.pending());
+        }
+        // A FIDO2-primary header has no record to prove a TPM by.
+        let mut world = World::fido_shape();
+        world.request(Operation::TpmReenroll, true);
+        world.plug(CRED_PRIMARY, 1);
+        released(&world.boot(vec![say(b""), say(KEY_PIN)]), &world);
+        assert!(world.has(UNPROVEN));
+        // A PIN change by another protector, or at a PIN release before
+        // its new PIN is asked, stays; so does a clear or a re-enrollment
+        // whose question this boot asks none of.
+        for (operation, script) in [
+            (Operation::PinChange, vec![say(b""), say(RECOVERY)]),
+            (Operation::PinChange, vec![say(PIN)]),
+            (Operation::TpmClear, vec![say(PIN)]),
+            (Operation::TpmClear, vec![say(b""), say(RECOVERY)]),
+        ] {
+            let mut world = World::tpm_shape();
+            world.taken(&[0x42; 32]);
+            world.request(operation, true);
+            released(&world.boot(script), &world);
+            assert!(world.has(STAYS), "{operation:?}");
+            assert!(!world.has(REMOVED) && world.pending());
+        }
+        let mut world = World::tpm_shape();
+        world.taken(&[0x42; 32]);
+        world.request(Operation::TpmReenroll, true);
+        world.replaced();
+        released(&world.boot(vec![say(RECOVERY)]), &world);
+        assert!(world.has(STAYS) && world.pending());
+        // Without a lockout token the chain check decides.
+        let mut world = World::tpm_shape();
+        world.request(Operation::TpmReenroll, true);
+        world.replaced();
+        released(&world.boot(vec![say(RECOVERY)]), &world);
+        assert!(world.has(STAYS) && world.pending());
+        // With one, it decides over the tpm-pin token's Name, which anyone
+        // who writes the disk can set to this TPM's.
+        let mut world = World::tpm_shape();
+        world.taken(&[0x42; 32]);
+        world.replaced();
+        let fresh = world.model.state.borrow().primary;
+        let Some(Token::TpmPin(pin)) = world.disk.tokens.get_mut(&1) else {
+            panic!("no tpm-pin token 1");
+        };
+        pin.primary = fresh;
+        world.request(Operation::TpmReenroll, true);
+        released(&world.boot(vec![say(RECOVERY)]), &world);
+        assert!(!world.has("say td: removed"), "{:?}", world.lines());
+        assert!(world.has(STAYS) && world.pending());
+        // On the recorded TPM its token decides over a tpm-pin Name that
+        // names another: the re-enrollment goes.
+        let mut world = World::tpm_shape();
+        world.taken(&[0x42; 32]);
+        let Some(Token::TpmPin(pin)) = world.disk.tokens.get_mut(&1) else {
+            panic!("no tpm-pin token 1");
+        };
+        pin.primary = [0x99; PRIMARY_NAME_LEN];
+        world.request(Operation::TpmReenroll, true);
+        released(&world.boot(vec![say(RECOVERY)]), &world);
+        assert!(world.has(RECORDED) && !world.pending());
+        // A lockout token whose tag fails proves nothing, whatever the
+        // tpm-pin Names say; the request still verifies, since its tag
+        // covers only that token's nonce.
+        let mut world = World::tpm_shape();
+        let mut token = world.lockout_token(&[0x42; 32], true);
+        token.tag[0] ^= 1;
+        world.disk.tokens.insert(3, Token::Lockout(token));
+        let Some(Token::TpmPin(pin)) = world.disk.tokens.get_mut(&1) else {
+            panic!("no tpm-pin token 1");
+        };
+        pin.primary = [0x99; PRIMARY_NAME_LEN];
+        world.request(Operation::TpmReenroll, true);
+        released(&world.boot(vec![say(RECOVERY)]), &world);
+        assert!(world.has(UNPROVEN) && !world.pending());
+        // A TPM this boot's cap did not close is not one td proves.
+        let mut world = World::tpm_shape();
+        world.taken(&[0x42; 32]);
+        world.replaced();
+        world.precapped = true;
+        world.request(Operation::TpmReenroll, true);
+        released(&world.boot(vec![say(RECOVERY)]), &world);
+        assert!(
+            world.has(UNPROVEN) && !world.pending(),
+            "{:?}",
+            world.lines()
+        );
+    }
+
+    /// No reseal is offered beside a pending clear or re-enrollment, even
+    /// one whose tag fails, which the plan then removes; beside a PIN
+    /// change, the confirmed reseal's plan removes it just before the
+    /// first write its tag covers.
+    #[test]
+    fn a_reseal_beside_a_request() {
+        for operation in [Operation::TpmClear, Operation::TpmReenroll] {
+            for verifies in [true, false] {
+                let mut world = changed();
+                world.request(operation, verifies);
+                released(&world.boot(vec![say(RECOVERY)]), &world);
+                assert!(world.has(&format!("say {NO_RESEAL_REQUEST}")));
+                assert!(!world.has("ask Type reseal"));
+                // A verified re-enrollment on the recorded primary goes.
+                assert_eq!(
+                    world.pending(),
+                    verifies && operation == Operation::TpmClear
+                );
+            }
+        }
+        let mut world = changed();
+        world.request(Operation::PinChange, true);
+        let run = world.boot(reseal_script());
+        released(&run, &world);
+        let order = [
+            "tpm lockout Parameters",
+            "cs add 3 by 0",
+            REMOVED,
+            "say td: removed the PIN change request: the confirmed reseal",
+            "cs import 4 tpm-pin",
+            "cs test 3 ok",
+        ];
+        let at: Vec<usize> = order.iter().map(|entry| world.at(entry)).collect();
+        assert!(at.windows(2).all(|w| w[0] < w[1]), "{:?}", world.lines());
+        assert!(!world.pending());
+        // A reseal whose take fails runs no plan: the request stays.
+        let mut world = changed();
+        world.request(Operation::PinChange, true);
+        world.model.state.borrow_mut().hierarchy_locked = true;
+        released(&world.boot(reseal_script()), &world);
+        assert!(!world.has(REMOVED) && world.pending());
+        assert!(!world.has("say td: removed"));
+        // Nothing is said removed when cryptsetup's metadata does not
+        // confirm the header: no plan runs.
+        let mut world = World::tpm_shape();
+        world.taken(&[0x42; 32]);
+        let before = world.disk.dump();
+        world.request(Operation::PinChange, false);
+        world.disk.dump_override = Some(before);
+        released(&world.boot(vec![say(b""), say(RECOVERY)]), &world);
+        assert!(world.has("say no header change this boot"));
+        assert!(!world.has("say td: removed") && world.pending());
+        // One whose tag fails is removed first with the reseal's plan.
+        let mut world = changed();
+        world.request(Operation::PinChange, false);
+        released(&world.boot(reseal_script()), &world);
+        assert!(world.has(&format!("say {}", request::UNVERIFIED)));
+        assert!(world.at(REMOVED) < world.at("cs add 3 by 0"));
+        assert!(!world.pending());
     }
 }

@@ -3,9 +3,8 @@
 //! one whose tag verifies under the volume key. The tag covers the header
 //! state the request acts on, which every operation changes, so a request
 //! copied from an older header copy stops verifying once a like operation
-//! has run. Beside it, the selector's request planner (`fate`, `plan`).
-//! Library code: nothing calls it before 8g's storage-worker requests and
-//! the selector halves.
+//! has run. Beside it, the selector's request planner (`fate`, `plan`),
+//! which the protected release's `finish` runs.
 
 use crate::hmac::{hkdf_expand, hmac_sha256};
 use crate::lockout::VOLUME_UUID_LEN;

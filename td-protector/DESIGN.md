@@ -683,9 +683,14 @@ tag (`update_retry`) and a selector update's pre-seal and token steps
 upgrade's plans and the runner's `reencrypt` shapes (below), which the
 selector's upgrade boot runs from 8f's last commit. Before item 9 only a
 header root wrote through the worker, or one forged on the disk, reaches
-them. The lockout's clear, protector management's request tag and
-planners (8g, below) and the secure-boot and config tokens are not
-current.
+them. Protector management's planners (8g, below) are current: the
+storage worker plans through `manage` and seals requests, and the
+selector's protected release checks a request's tag. It removes one
+whose tag fails, a re-enrollment on the recorded primary, and a clear or
+re-enrollment with no TPM td can prove. It carries none out yet: it asks
+no TPM clear's or re-enrollment's question, so such a request stays, as
+a PIN change does. The lockout's clear and the secure-boot and
+config tokens are not current.
 
 **Lockout.** `lockout::seal(volume_key, uuid, l, name)` and `open`
 implement ENCRYPTION.md's lockout token: HKDF-SHA256 over the volume key
@@ -1368,6 +1373,14 @@ resolves a confirmed clear whose lockout step cannot prove this TPM as
 
 Its choices beyond ENCRYPTION.md's text, each failing closed:
 
+- The selector's `Primary` comes from the lockout token whenever one is
+  on the header. Opened under the volume key against this TPM's
+  primary, it gives `Recorded`; one that verifies but names another
+  primary gives `Other`; any other gives `Unknown`. The tpm-pin tokens'
+  Names are unauthenticated, so they decide only without a lockout
+  token: a passing object is `Recorded`, a Name the TPM's primary does
+  not match `Other`. With no TPM, a cap this boot did not close, or a
+  primary whose Name cannot be read, it is `Unknown`.
 - A PIN release proves the recorded primary, so a clear there asks the
   clear's question whatever primary the caller reports, and `plan`
   refuses a re-enrollment after one.
