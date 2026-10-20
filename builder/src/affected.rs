@@ -312,7 +312,7 @@ const TARGET_INCLUDED_ENGINE_SOURCES: &[(&str, &str)] = &[
     ),
     (
         "engine/src/crc32.rs",
-        "td-builder's xz decoder, the shared gzip decoder, target-static td-install and target-static td-boot (each through gpt.rs), target-static td-util's gzip applets, and td-png's chunk CRCs",
+        "the shared xz decoder (td-builder and td-feed), the shared gzip decoder, target-static td-install and target-static td-boot (each through gpt.rs), target-static td-util's gzip applets, and td-png's chunk CRCs",
     ),
     (
         "engine/src/gzip.rs",

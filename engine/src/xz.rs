@@ -1,8 +1,9 @@
-//! Minimal XZ (LZMA2) reader for td-builder.
+//! Minimal XZ (LZMA2) reader shared by td-builder and td-net.
 //!
-//! Kept in-tree and std-only for the same reason as `tar.rs`/`gzip.rs`: the
-//! bootstrap engine unpacks pinned source tarballs natively so recipes need
-//! no host tar/xz (re #469).
+//! Kept std-only for the same reason as `gzip.rs`: td-builder unpacks pinned
+//! source tarballs natively so recipes need no host tar/xz (re #469), and
+//! td-net decodes the xz-only Debian package indexes it resolves the build
+//! root from.
 //!
 //! Scope: enough of the .xz container to decode real release tarballs —
 //! stream header/footer, block headers, the index, multi-stream
@@ -19,7 +20,7 @@ use crate::sha256::Sha256;
 use std::io::{self, BufRead, Write};
 
 const XZ_MAGIC: [u8; 6] = [0xfd, b'7', b'z', b'X', b'Z', 0x00];
-const XZ_FOOTER_MAGIC: [u8; 2] = [b'Y', b'Z'];
+const XZ_FOOTER_MAGIC: [u8; 2] = *b"YZ";
 const MAX_DICT_BYTES: u64 = 256 * 1024 * 1024;
 const OUTPUT_CHUNK_BYTES: usize = 64 * 1024;
 // Two u64 values per block. Real release archives have orders of magnitude
@@ -1724,7 +1725,10 @@ mod tests {
     #[test]
     fn decodes_real_release_tarballs() {
         for name in ["binutils-2.44.tar.xz", "linux-4.14.67.tar.xz"] {
-            let path = crate::bootstrap::shared_sources_dir().join(name);
+            let home = std::env::var_os("HOME").unwrap_or_default();
+            let path = std::path::PathBuf::from(home)
+                .join(".td/sources")
+                .join(name);
             if !path.exists() {
                 println!("skipping {name}: {} not present", path.display());
                 continue;

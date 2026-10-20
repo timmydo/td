@@ -21,8 +21,9 @@
 //!
 //! The control-plane-only `gzip` module holds the one std-only DEFLATE
 //! implementation shared by builder source extraction, `td-net`'s bounded
-//! OSTree acquisition and the later deploy materializer. No target binary
-//! `#[path]`-includes it.
+//! OSTree acquisition and the later deploy materializer; `xz` is its LZMA2
+//! counterpart, shared by builder source extraction and `td-net`'s Debian
+//! index resolution. No target binary `#[path]`-includes either.
 //!
 //! `sha512` and `ed25519` arrive with AUTHENTICATED deployments, and are
 //! target-side in that same way — which is why the crate's first line no
@@ -72,3 +73,4 @@ pub mod local_source;
 pub mod sha256;
 pub mod sha512;
 pub mod target_profile;
+pub mod xz;

@@ -62,6 +62,8 @@
 //!                         argv per line (the recipe stem last)
 //!   source-pins           print recipe-owned fixed-output source pins as:
 //!                         <key>\t<url>\t<sha256>\t<file>
+//!   build-root-pins       print the Debian build root's layer and .deb pins
+//!                         (recipes/src/debian-root.lock) in the same form
 //!   source-pin STEM       print the fixed-output source pin(s) owned by STEM
 //!                         in the same tab-separated form
 //!   ostree-pins           print exact foreign deploy pins as:
@@ -201,6 +203,15 @@ fn recipe_checks(r: &td_recipe::types::Recipe) -> Vec<&td_recipe::types::RecipeC
 
 fn print_source_pins() {
     for pin in td_recipe::source_pins::all() {
+        println!("{}\t{}\t{}\t{}", pin.key, pin.url, pin.sha256, pin.file);
+    }
+}
+
+/// A separate verb from `source-pins`, so no consumer that resolves a seed or
+/// lock input by key or file can meet a build-root pin.
+fn print_build_root_pins() {
+    let pins = td_recipe::source_pins::build_root_pins().unwrap_or_else(|e| die(&e));
+    for pin in pins {
         println!("{}\t{}\t{}\t{}", pin.key, pin.url, pin.sha256, pin.file);
     }
 }
@@ -569,6 +580,12 @@ fn main() {
             }
             print_source_pins();
         }
+        Some("build-root-pins") => {
+            if args.get(2).is_some() {
+                die("usage: build-root-pins");
+            }
+            print_build_root_pins();
+        }
         Some("source-pin") => {
             let stem = args.get(2).unwrap_or_else(|| die("usage: source-pin STEM"));
             if args.get(3).is_some() {
@@ -635,7 +652,7 @@ fn main() {
                 die(&e);
             }
         }
-        _ => die("usage: td-recipe-eval list|emit|check-list|check-count|check-script|check-run|build-run|check-history|clear-store|gc-store|qemu-secret|qemu-secret-system|qemu-login-system|qemu-boot|qemu-boot-uefi|qemu-boot-media|qemu-install|qemu-install-system|qemu-install-encrypted|qemu-boot-encrypted|qemu-boot-live|compose-iso|build-iso|test-iso|qemu-boot-erofs|qemu-boot-system|qemu-deploy-rollback|qemu-update|qemu-boot-net|qemu-boot-kexec|run|bundle|warm|verify-store|payload-closure|application-closure|vendor-warm-args|source-pins|source-pin|ostree-pins|ostree-pin|seed-digests|local-source-roster|bootstrap-root ..."),
+        _ => die("usage: td-recipe-eval list|emit|check-list|check-count|check-script|check-run|build-run|check-history|clear-store|gc-store|qemu-secret|qemu-secret-system|qemu-login-system|qemu-boot|qemu-boot-uefi|qemu-boot-media|qemu-install|qemu-install-system|qemu-install-encrypted|qemu-boot-encrypted|qemu-boot-live|compose-iso|build-iso|test-iso|qemu-boot-erofs|qemu-boot-system|qemu-deploy-rollback|qemu-update|qemu-boot-net|qemu-boot-kexec|run|bundle|warm|verify-store|payload-closure|application-closure|vendor-warm-args|source-pins|build-root-pins|source-pin|ostree-pins|ostree-pin|seed-digests|local-source-roster|bootstrap-root ..."),
     }
 }
 
@@ -745,6 +762,8 @@ mod tests {
         // its last consumer.
         assert_eq!(pins.len(), 79);
         assert!(pins.iter().any(|pin| pin.key == "stage0-source"));
+        // The build root lists through `build-root-pins` alone.
+        assert!(pins.iter().all(|pin| !pin.key.starts_with("debian-root-")));
         assert!(pins.iter().any(|pin| pin.key == "ca-certificates-source"));
         assert!(pins.iter().any(|pin| pin.key == "tzdata-source"));
         assert!(pins

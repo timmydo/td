@@ -272,7 +272,7 @@ struct RegistryBlob {
     require_https: bool,
 }
 
-fn repository_name_is_valid(name: &str) -> bool {
+pub(crate) fn repository_name_is_valid(name: &str) -> bool {
     name.split('/').all(|part| {
         let bytes = part.as_bytes();
         bytes.first().is_some_and(u8::is_ascii_alphanumeric)
@@ -293,6 +293,123 @@ fn registry_blob(url: &str) -> Option<RegistryBlob> {
         token_url: format!("{realm}?service={service}&scope=repository:{repository}:pull"),
         require_https: true,
     })
+}
+
+/// The manifest media types an image reference may resolve to: a
+/// multi-platform index, or one platform's image manifest.
+const MANIFEST_ACCEPT: &str = "application/vnd.oci.image.index.v1+json, \
+     application/vnd.docker.distribution.manifest.list.v2+json, \
+     application/vnd.oci.image.manifest.v1+json, \
+     application/vnd.docker.distribution.manifest.v2+json";
+
+/// Real indexes and image manifests are a few kilobytes.
+const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
+
+pub(crate) fn tag_is_valid(tag: &str) -> bool {
+    let bytes = tag.as_bytes();
+    (1..=128).contains(&bytes.len())
+        && bytes
+            .first()
+            .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// A manifest URL on an allowlisted registry, by tag or by sha256 digest:
+/// the token flow it needs, and the digest its body must hash to, if any.
+fn registry_manifest(url: &str) -> Option<(RegistryBlob, Option<String>)> {
+    let (host, path) = url.strip_prefix("https://")?.split_once('/')?;
+    let &(_, realm, service) = TOKEN_REGISTRIES.iter().find(|entry| entry.0 == host)?;
+    let (repository, reference) = path.strip_prefix("v2/")?.rsplit_once("/manifests/")?;
+    if !repository_name_is_valid(repository) {
+        return None;
+    }
+    let digest = match reference.strip_prefix("sha256:") {
+        Some(hex)
+            if hex.len() == 64 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) =>
+        {
+            Some(hex.to_string())
+        }
+        Some(_) => return None,
+        None if tag_is_valid(reference) => None,
+        None => return None,
+    };
+    let blob = RegistryBlob {
+        token_url: format!("{realm}?service={service}&scope=repository:{repository}:pull"),
+        require_https: true,
+    };
+    Some((blob, digest))
+}
+
+fn registry_manifest_once(
+    agent: &ureq::Agent,
+    url: &str,
+    blob: &RegistryBlob,
+) -> Result<Vec<u8>, Attempt> {
+    let token = registry_token(agent, &blob.token_url, None)?;
+    let request = agent
+        .get(url)
+        .set("Accept", MANIFEST_ACCEPT)
+        .set("Authorization", &format!("Bearer {token}"));
+    let resp = call_labeled(request, url, false)?;
+    if resp.status() != 200 {
+        return Err(Attempt::Answered(format!(
+            "{url}: manifest answered status {}",
+            resp.status()
+        )));
+    }
+    let mut body = Vec::new();
+    resp.into_reader()
+        .take(MAX_MANIFEST_BYTES.saturating_add(1))
+        .read_to_end(&mut body)
+        .map_err(|e| Attempt::Transport(format!("read {url}: {e}")))?;
+    if u64::try_from(body.len()).unwrap_or(u64::MAX) > MAX_MANIFEST_BYTES {
+        return Err(Attempt::Answered(format!(
+            "{url}: manifest exceeds its {MAX_MANIFEST_BYTES}-byte limit"
+        )));
+    }
+    Ok(body)
+}
+
+/// GET an image manifest or index from an allowlisted registry through the
+/// anonymous token flow. A manifest asked for by digest must hash to it.
+/// This is pin-discovery tooling: builds fetch only pinned blobs.
+pub(crate) fn get_registry_manifest(url: &str) -> Result<Vec<u8>, String> {
+    let (blob, digest) =
+        registry_manifest(url).ok_or_else(|| format!("{url}: not an allowlisted manifest URL"))?;
+    get_registry_manifest_with(url, &blob, digest.as_deref())
+}
+
+fn get_registry_manifest_with(
+    url: &str,
+    blob: &RegistryBlob,
+    digest: Option<&str>,
+) -> Result<Vec<u8>, String> {
+    use sha2::Digest as _;
+    let mut last = String::new();
+    for attempt in 1..=ATTEMPTS {
+        match registry_manifest_once(&agent_no_redirects(), url, blob) {
+            Ok(body) => {
+                let got = format!("{:x}", sha2::Sha256::digest(&body));
+                return match digest {
+                    Some(want) if want != got => Err(format!(
+                        "{url}: manifest hashes to sha256:{got}, not the digest asked for"
+                    )),
+                    _ => Ok(body),
+                };
+            }
+            Err(Attempt::Answered(e)) => return Err(e),
+            Err(Attempt::Transport(e)) => {
+                last = e;
+                if attempt < ATTEMPTS {
+                    eprintln!("td-net: {last} (attempt {attempt}/{ATTEMPTS}) — retrying");
+                    retry_pause(None)?;
+                }
+            }
+        }
+    }
+    Err(format!("{last} (after {ATTEMPTS} attempts)"))
 }
 
 /// Bound one hop by what remains of the transfer's absolute deadline. ureq
@@ -1298,5 +1415,59 @@ mod tests {
         )
         .expect_err("the no-redirect policy cannot fetch a registry blob");
         assert!(error.contains("refuses"), "{error}");
+    }
+
+    #[test]
+    fn manifest_urls_name_a_tag_or_a_digest_on_an_allowlisted_registry() {
+        let base = "https://registry-1.docker.io/v2/library/debian/manifests/";
+        let (blob, digest) = registry_manifest(&format!("{base}trixie-20261005-slim")).unwrap();
+        assert!(blob.require_https);
+        assert!(blob
+            .token_url
+            .ends_with("scope=repository:library/debian:pull"));
+        assert_eq!(digest, None);
+        let (_, digest) = registry_manifest(&format!("{base}sha256:{BLOB_HEX}")).unwrap();
+        assert_eq!(digest.as_deref(), Some(BLOB_HEX));
+        for other in [
+            format!("{base}.hidden"),
+            format!("{base}sha256:abc"),
+            format!("{base}{}", "t".repeat(129)),
+            "https://registry.example/v2/library/debian/manifests/trixie".to_string(),
+            format!("https://registry-1.docker.io{BLOB_PATH}"),
+        ] {
+            assert!(registry_manifest(&other).is_none(), "{other}");
+        }
+    }
+
+    #[test]
+    fn a_manifest_is_fetched_with_the_token_and_checked_against_its_digest() {
+        let Some((listener, base)) = loopback() else {
+            return;
+        };
+        let body = r#"{"schemaVersion":2}"#;
+        let server = serve_routes(listener, 4, Duration::from_secs(2), move |request| {
+            if first_line(request).starts_with("GET /token ") {
+                reply(200, "", r#"{"token":"t"}"#)
+            } else if has_bearer(request, "t")
+                && request.contains("application/vnd.oci.image.index.v1+json")
+            {
+                reply(200, "", body)
+            } else {
+                reply(400, "", "")
+            }
+        });
+        let blob = RegistryBlob {
+            token_url: format!("{base}/token"),
+            require_https: false,
+        };
+        let url = format!("{base}/v2/library/debian/manifests/trixie");
+
+        let fetched = get_registry_manifest_with(&url, &blob, None).unwrap();
+        let mismatch = get_registry_manifest_with(&url, &blob, Some(BLOB_HEX))
+            .expect_err("a body that does not hash to its digest is refused");
+
+        assert_eq!(fetched, body.as_bytes());
+        assert!(mismatch.contains("not the digest asked for"), "{mismatch}");
+        assert_eq!(server.join().unwrap().len(), 4);
     }
 }

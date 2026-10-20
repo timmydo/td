@@ -80,13 +80,12 @@ mod test_temp;
 mod toolchain_x86_64;
 mod verdict_journal;
 mod worktree_gc;
-mod xz;
 
 // The JSON value/parser/canonical writer, SHA-256 and CRC-32 live in the
 // shared, std-only td-engine (one copy for td-builder + td-recipe-eval).
 // Re-exported at crate root so existing `crate::json::` / `json::` (and
 // `sha256::`) paths are unchanged.
-pub use td_engine::{crc32, json, sha256};
+pub use td_engine::{crc32, json, sha256, xz};
 
 use std::ffi::CString;
 use std::io::Read;

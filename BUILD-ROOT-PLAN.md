@@ -76,12 +76,18 @@ deleted; its findings are summarized under "Facts" below.
    target without the token, under one absolute deadline; every source
    path (`warm sources`, the shared feed, `td-fetch`) inherits it. Layer
    media-type refusal moves to increments 2–3.
-2. **Debian lock + resolver.** `td-recipe-eval debian-root resolve`
-   (std-only Rust: InRelease → Packages.xz → closure with
-   Pre-Depends/Depends/Provides) writes committed
-   `seed/debian-root.lock` (image digest, snapshot TS, InRelease sha256,
-   rows url/sha256/size/file). `source-pins` emits its rows;
-   `td-feed warm build-root` prefetches.
+2. **Debian lock + resolver.** `td-feed debian-root resolve
+   recipes/src/debian-root.lock` resolves the image tag to its one gzip
+   layer (refusing any other layer format), reads the layer's dpkg status,
+   reads each archive's Packages.xz checked against its InRelease, and
+   writes the closure (Pre-Depends/Depends/Provides/Breaks, dpkg version
+   order, no downgrades, whole-root consistency) below the lock's input
+   lines. The xz decoder moves into td-engine so td-net can read the
+   xz-only security index. `source_pins::build_root_pins()` reads the
+   lock's `layer`/`deb` rows as a pin class `by_key`, `all` and
+   `source-pins` never return; `td-recipe-eval build-root-pins` lists
+   them and `td-feed warm build-root` caches them. The lock is a
+   `PIN_TABLES` entry, so a re-pin re-keys every check.
 3. **Build-root input class.** td-builder unpacks layer (whiteouts) +
    .debs in lock order + fixups, applies the slim path-excludes, refuses
    writes through symlinks, flattens ownership, caches the tree by lock

@@ -16,11 +16,16 @@
 //     is self-describing, a persistent daemon serves whatever any branch has warmed into
 //     the shared store with no index coupling. Missing path/sidecar 404/500. No egress.
 //
+//   td-feed debian-root resolve LOCK
+//                      Re-resolve the Debian build root's lock (feed/debian.rs);
+//                      `td-feed warm build-root` then caches its pins.
+//
 //   td-feed selftest   Self-contained LOOPBACK round-trip (offline): an ORIGIN server on
 //                      127.0.0.1, `warm` a one-entry index from it, `serve` the store on a
 //                      2nd port, fetch the artifact back THROUGH the feed and verify it.
 //                      Also asserts both gates are load-bearing: a wrong pinned hash reds
 //                      warm, a corrupted store byte reds serve (sidecar mismatch).
+mod debian;
 mod graphs;
 mod vendor;
 
@@ -2389,6 +2394,11 @@ fn recipe_eval_tool(root: &Path) -> Result<PathBuf, String> {
 }
 
 fn recipe_source_pins_result(root: &Path) -> Result<Vec<SourcePin>, String> {
+    recipe_pins_result(root, "source-pins")
+}
+
+/// `verb` is `source-pins` or `build-root-pins`; both print the same rows.
+fn recipe_pins_result(root: &Path, verb: &str) -> Result<Vec<SourcePin>, String> {
     if !root.join("recipes/Cargo.toml").is_file() {
         return Err(format!(
             "no recipes/Cargo.toml under {} to resolve recipe source pins",
@@ -2397,19 +2407,19 @@ fn recipe_source_pins_result(root: &Path) -> Result<Vec<SourcePin>, String> {
     }
     let eval = recipe_eval_tool(root)?;
     let out = Command::new(&eval)
-        .arg("source-pins")
+        .arg(verb)
         .current_dir(root)
         .output()
-        .map_err(|e| format!("spawn {} source-pins: {e}", eval.display()))?;
+        .map_err(|e| format!("spawn {} {verb}: {e}", eval.display()))?;
     if !out.status.success() {
         return Err(format!(
-            "td-recipe-eval source-pins failed\nstdout:\n{}\nstderr:\n{}",
+            "td-recipe-eval {verb} failed\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         ));
     }
     let text =
-        String::from_utf8(out.stdout).map_err(|e| format!("source-pins output not UTF-8: {e}"))?;
+        String::from_utf8(out.stdout).map_err(|e| format!("{verb} output not UTF-8: {e}"))?;
     parse_source_pins(&text)
 }
 
@@ -2752,17 +2762,36 @@ fn warm_sources(root: &Path) -> Result<(), String> {
     if pins.is_empty() {
         return Err("td-recipe-eval source-pins returned no pins".into());
     }
-    std::fs::create_dir_all(&dest).map_err(|e| format!("create {}: {e}", dest.display()))?;
+    warm_pins("sources", &pins, &dest)?;
+
+    // Derived inputs: the sanitized Linux UAPI headers for the glibc rungs, produced FROM the
+    // pinned linux source (the sandbox can't run the kernel build). Both lanes, best-effort.
+    warm_kernel_headers_from_pins(root, "i386", &pins);
+    warm_kernel_headers_from_pins(root, "x86_64", &pins);
+    Ok(())
+}
+
+/// `td-feed warm build-root`: the Debian build root's layer and .debs, which
+/// `warm sources` leaves alone.
+fn warm_build_root(root: &Path) -> Result<(), String> {
+    let pins = recipe_pins_result(root, "build-root-pins")?;
+    warm_pins("build-root", &pins, &sources_dir())
+}
+
+/// Warm each pin into `dest`, through the shared feed when one is running.
+/// Best-effort per pin: a miss is reported, and its consumer's gate reds.
+fn warm_pins(label: &str, pins: &[SourcePin], dest: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dest).map_err(|e| format!("create {}: {e}", dest.display()))?;
 
     let feed = shared_feed();
     if let Some((addr, store)) = &feed {
         eprintln!(
-            ">> td-feed warm sources: using the shared feed at http://{addr} (store {})",
+            ">> td-feed warm {label}: using the shared feed at http://{addr} (store {})",
             store.display()
         );
     }
 
-    for pin in &pins {
+    for pin in pins {
         let out = dest.join(&pin.file);
         if let Ok(have) = file_sha256(&out) {
             if have == pin.sha256 {
@@ -2791,19 +2820,14 @@ fn warm_sources(root: &Path) -> Result<(), String> {
             via = Some("a direct fetch".to_string());
         }
         match via {
-            Some(v) => eprintln!(">> td-feed warm sources: warmed {} via {v} (sha256 verified)", out.display()),
+            Some(v) => eprintln!(">> td-feed warm {label}: warmed {} via {v} (sha256 verified)", out.display()),
             None => eprintln!(
-                ">> td-feed warm sources: could not warm {} ({}) (feed + direct both failed) — skipping (the bootstrap gate will report if it runs)",
+                ">> td-feed warm {label}: could not warm {} ({}) (feed + direct both failed) — skipping (the bootstrap gate will report if it runs)",
                 pin.file,
                 pin.key
             ),
         }
     }
-
-    // Derived inputs: the sanitized Linux UAPI headers for the glibc rungs, produced FROM the
-    // pinned linux source (the sandbox can't run the kernel build). Both lanes, best-effort.
-    warm_kernel_headers_from_pins(root, "i386", &pins);
-    warm_kernel_headers_from_pins(root, "x86_64", &pins);
     Ok(())
 }
 
@@ -3109,7 +3133,7 @@ fn warm_usage() -> ! {
     eprintln!(
         "usage:\n  td-feed warm index INDEX STORE        (also: td-feed warm INDEX STORE)\n  \
          td-feed warm crate CRATE VERSION [DEST]\n  td-feed warm crate-local SRCDIR DEST\n  \
-         td-feed warm sources\n  td-feed warm kernel-headers ARCH\n  \
+         td-feed warm sources\n  td-feed warm build-root\n  td-feed warm kernel-headers ARCH\n  \
          td-feed warm ostree REPOSITORY REF COMMIT CONTENT DEST"
     );
     std::process::exit(2);
@@ -3401,6 +3425,11 @@ pub fn run(a: &[String]) {
                         die(format!("warm sources: {e}"));
                     }
                 }
+                Some("build-root") if a.len() == 3 => {
+                    if let Err(e) = warm_build_root(&root) {
+                        die(format!("warm build-root: {e}"));
+                    }
+                }
                 Some("kernel-headers") if a.len() == 4 => warm_kernel_headers(&root, &a[3]),
                 Some("ostree") if a.len() == 8 => {
                     if let Err(error) = warm_ostree(a) {
@@ -3418,6 +3447,7 @@ pub fn run(a: &[String]) {
                                 | "crate"
                                 | "crate-local"
                                 | "sources"
+                                | "build-root"
                                 | "kernel-headers"
                                 | "ostree"
                         ) =>
@@ -3425,6 +3455,11 @@ pub fn run(a: &[String]) {
                     warm_index(&a[2], &a[3])
                 }
                 _ => warm_usage(),
+            }
+        }
+        Some("debian-root") => {
+            if let Err(error) = debian::run(a.get(2..).unwrap_or_default()) {
+                die(format!("debian-root: {error}"));
             }
         }
         Some("warm-selftest") if a.len() == 2 => warm_selftest(),
@@ -3460,8 +3495,9 @@ pub fn run(a: &[String]) {
             eprintln!(
                 "usage:\n  td-feed warm INDEX STORE   (low-level; also: warm index INDEX STORE)\n  \
                  td-feed warm crate CRATE VERSION [DEST]\n  td-feed warm crate-local SRCDIR DEST\n  \
-                 td-feed warm sources\n  td-feed warm kernel-headers ARCH\n  \
+                 td-feed warm sources\n  td-feed warm build-root\n  td-feed warm kernel-headers ARCH\n  \
                  td-feed warm ostree REPOSITORY REF COMMIT CONTENT DEST\n  \
+                 td-feed debian-root resolve LOCK\n  \
                  td-feed serve STORE ADDR\n  \
                  td-feed export sources  (publish existing host archives; no downloads)\n  td-feed consume sources  (TD_FEED_BASE or VM endpoint; no upstream fallback)\n  td-feed export cargo LOCK ARCHIVES\n  td-feed consume cargo LOCK ARCHIVES\n  td-feed export vendors [TARGET]\n  td-feed consume vendors [TARGET]\n  td-feed export graphs\n  td-feed consume graphs\n  td-feed ensure-serve\n  td-feed cargo-proxy STORE ADDR\n  td-feed selftest\n  \
                  td-feed cargo-proxy-selftest\n  td-feed warm-selftest"
