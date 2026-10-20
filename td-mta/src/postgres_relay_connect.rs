@@ -579,6 +579,7 @@ fn setup<B: TlsWireStorage, E: Entropy>(
         cap,
         wire,
     )
+    .and_then(auth::Exchange::with_initial_response)
     .map_err(|failure| SocketFailure::local(Stage::Auth, failure.error, failure.into_buffers()))?;
     loop {
         match exchange.advance() {

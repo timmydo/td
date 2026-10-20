@@ -1165,9 +1165,12 @@ queue authority. POSTGRES.md section 183 owns this bound-path check.
 The prepared AUTH exchange consumes that fresh-EHLO session and borrows the
 original work meter and credential strings. Prefer advertised PLAIN; select
 LOGIN only when PLAIN is absent. Never retry with another mechanism after
-refusal. Send AUTH without an initial response. PLAIN requires one empty,
-single-line 334 challenge, then sends the RFC 4616 empty-authorization-identity
-form. LOGIN requires two single-line 334 challenges with strictly valid padded
+refusal. The connector prefers a PLAIN initial response when the complete
+command including CRLF fits 512 bytes. It encodes the RFC 4616 empty
+authorization identity form before output and requires 235 immediately.
+Longer PLAIN responses use one empty, single-line 334 challenge before sending
+that same form. LOGIN requires two single-line 334 challenges with strictly
+valid padded
 base64 (empty is allowed); ignore decoded prompt contents and send username,
 then password. Both mechanisms require a complete 235 reply after the final
 credential response. Early 235, unexpected codes, malformed challenges, EOF,

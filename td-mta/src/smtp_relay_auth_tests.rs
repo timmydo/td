@@ -645,3 +645,80 @@ pub(super) fn authenticated_with_advertisement(
     assert_eq!(session.capabilities(), capabilities);
     (session, peer)
 }
+
+#[test]
+fn relay_auth_initial_plain_requires_final_reply_without_another_challenge() {
+    let _serial = serial();
+    let material = Material::new();
+    let command = [b"AUTH PLAIN ".as_slice(), PLAIN].concat();
+    for response in [
+        b"235 authenticated\r\n".as_slice(),
+        b"535 denied\r\n",
+        b"334 Ok\r\n",
+        b"235 ok\r\n235 injected\r\n",
+    ] {
+        for chunk in [1, 512] {
+            if response == b"235 ok\r\n235 injected\r\n" && chunk == 1 {
+                continue;
+            }
+            let (session, mut peer) = ready(&material, b"250-local\r\n250 AUTH PLAIN LOGIN\r\n");
+            let mut cells = Cells::new();
+            let mut meter = meter();
+            let owner = Exchange::new(
+                session,
+                "private-relay",
+                "password",
+                cells.scratch(),
+                material.source.clone(),
+                cap(),
+                &mut meter,
+            )
+            .ok()
+            .unwrap()
+            .with_initial_response()
+            .ok()
+            .unwrap();
+            let result = drive(owner, &mut peer, &[(&command, response)], chunk, false);
+            match result {
+                Ok(session) => {
+                    assert_eq!(response, b"235 authenticated\r\n");
+                    drop(session.into_buffers().unwrap());
+                }
+                Err(failure) => {
+                    assert_ne!(response, b"235 authenticated\r\n");
+                    assert_eq!(
+                        failure.peer_rejection(),
+                        (response == b"535 denied\r\n").then_some(535)
+                    );
+                    drop(failure.into_buffers().unwrap());
+                }
+            }
+            drop(peer.into_buffers().unwrap());
+        }
+    }
+}
+
+#[test]
+fn relay_auth_initial_response_line_bound_keeps_long_responses_challenged() {
+    let _serial = serial();
+    let material = Material::new();
+    let username = "u".repeat(254);
+    for (password_len, encoded, initial) in [
+        (116, "AHV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1AHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBw\r\n", true),
+        (117, "AHV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1AHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcA==\r\n", false),
+    ] {
+        let password = "p".repeat(password_len);
+        let command = [b"AUTH PLAIN ".as_slice(), encoded.as_bytes()].concat();
+        assert_eq!(command.len(), if initial { 509 } else { 513 });
+        let (session, mut peer) = ready_credentials(&material, b"250-local\r\n250 AUTH PLAIN\r\n", &username, &password);
+        let mut cells = Cells::new();
+        let mut meter = meter();
+        let owner = Exchange::new(session, &username, &password, cells.scratch(), material.source.clone(), cap(), &mut meter)
+            .ok().unwrap().with_initial_response().ok().unwrap();
+        let first = [(&command[..], b"235 ok\r\n".as_slice())];
+        let challenged = [(b"AUTH PLAIN\r\n".as_slice(), b"334 \r\n".as_slice()), (encoded.as_bytes(), b"235 ok\r\n".as_slice())];
+        let session = drive(owner, &mut peer, if initial { &first } else { &challenged }, 1, false).ok().unwrap();
+        drop(session.into_buffers().unwrap());
+        drop(peer.into_buffers().unwrap());
+    }
+}

@@ -51,6 +51,7 @@ pub struct Exchange<'a, B: TlsWireStorage> {
     password: &'a str,
     phase: Phase,
     round: usize,
+    initial_response: bool,
     peer_rejection: Option<u16>,
     input: &'a mut [u8],
     used: usize,
@@ -167,6 +168,7 @@ impl<'a, B: TlsWireStorage> Exchange<'a, B> {
                 password,
                 phase: Phase::Write(0),
                 round: 0,
+                initial_response: false,
                 peer_rejection: None,
                 input,
                 used: 0,
@@ -181,6 +183,36 @@ impl<'a, B: TlsWireStorage> Exchange<'a, B> {
                 encoded_len: 0,
                 encoder: None,
             }),
+        }
+    }
+    /// Prefer a PLAIN initial response when the entire SMTP line fits. Call
+    /// before driving the exchange; longer responses retain challenge mode.
+    pub fn with_initial_response(mut self) -> Result<Self, Refusal<B>> {
+        let result = (|| {
+            check_time(self.clock.as_ref(), self.deadline, self.meter)?;
+            if self.round != 0 || !matches!(self.phase, Phase::Write(0)) {
+                return Err(Error::Invalid);
+            }
+            let raw = self
+                .username
+                .len()
+                .checked_add(self.password.len())
+                .and_then(|n| n.checked_add(2))
+                .ok_or(Error::Capacity)?;
+            let line = raw
+                .div_ceil(3)
+                .checked_mul(4)
+                .and_then(|n| n.checked_add(13))
+                .ok_or(Error::Capacity)?;
+            if self.mechanism == Mechanism::Plain && line <= LINE_BYTES {
+                self.initial_response = true;
+                self.phase = Phase::Prepare;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => Ok(self),
+            Err(error) => Err(refuse(self.connection, error)),
         }
     }
     /// One transport operation, one reply line, or one bounded codec poll.
@@ -405,6 +437,23 @@ impl<'a, B: TlsWireStorage> Exchange<'a, B> {
         }
         self.plain_consumed = 0;
         self.encoded_len = 0;
+        if self.initial_response {
+            let prefix = b"AUTH PLAIN ";
+            self.meter
+                .charge(
+                    now,
+                    Charge {
+                        output_bytes: prefix.len() as u64,
+                        ..Charge::default()
+                    },
+                )
+                .map_err(work_error)?;
+            self.encoded
+                .get_mut(..prefix.len())
+                .ok_or(Error::Capacity)?
+                .copy_from_slice(prefix);
+            self.encoded_len = prefix.len();
+        }
         self.encoder = Some(
             base64_encode::Encoder::new_unwrapped(self.plain_len as u64, now, self.meter)
                 .map_err(encode_error)?,

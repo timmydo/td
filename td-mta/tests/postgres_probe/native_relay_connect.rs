@@ -181,12 +181,11 @@ impl Setup {
         if revoke.is_some() {
             return peer;
         }
-        script(&mut peer, &clock, cap, b"AUTH PLAIN\r\n", b"334 \r\n");
         script(
             &mut peer,
             &clock,
             cap,
-            b"AHJlbGF5LXVzZXIAZGF0YWJhc2UtcGFzc3dvcmQ=\r\n",
+            b"AUTH PLAIN AHJlbGF5LXVzZXIAZGF0YWJhc2UtcGFzc3dvcmQ=\r\n",
             if refuse {
                 b"535 credentials refused\r\n"
             } else {

@@ -127,11 +127,9 @@ impl Relay {
                     &mut peer,
                     b"250-localhost\r\n250-8BITMIME\r\n250 AUTH PLAIN\r\n",
                 );
-                assert_eq!(line(&mut peer), b"AUTH PLAIN\r\n");
-                write(&mut peer, b"334 \r\n");
                 assert_eq!(
                     line(&mut peer),
-                    b"AHJlbGF5LXVzZXIAZGF0YWJhc2UtcGFzc3dvcmQ=\r\n"
+                    b"AUTH PLAIN AHJlbGF5LXVzZXIAZGF0YWJhc2UtcGFzc3dvcmQ=\r\n"
                 );
                 write(&mut peer, b"235 authenticated\r\n");
                 let mail = line(&mut peer);
