@@ -69,11 +69,13 @@ deleted; its findings are summarized under "Facts" below.
 
 ## Increments (each one green, reviewed, landable; order matters)
 
-1. **Registry-blob fetch + cache.** New acquire variant in
-   `net/src/feed.rs`: 401 → validate `auth.docker.io` realm → anonymous
-   token → bearer GET → follow 307 without the header → verify sha256 →
-   publish to `~/.td/sources`. Refuse unknown layer media types (no zstd
-   reader). Tests against a local fixture registry.
+1. **Registry-blob fetch + cache** (landed as `td-net: fetch pinned
+   container-registry blobs through the token flow`). `http::get_to_file`
+   recognises an allowlisted registry blob URL and fetches it as anonymous
+   token (realm from the allowlist) → bearer GET → absolute https redirect
+   target without the token, under one absolute deadline; every source
+   path (`warm sources`, the shared feed, `td-fetch`) inherits it. Layer
+   media-type refusal moves to increments 2–3.
 2. **Debian lock + resolver.** `td-recipe-eval debian-root resolve`
    (std-only Rust: InRelease → Packages.xz → closure with
    Pre-Depends/Depends/Provides) writes committed
