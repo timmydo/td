@@ -12,7 +12,7 @@ use std::io::Read;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 /// Margin against the worker's five-second acknowledgement window. A
@@ -21,6 +21,9 @@ use std::time::{Duration, Instant};
 const ACK_TIME: Duration = Duration::from_secs(3);
 /// The worker's PIN frame: its tag and at most 63 PIN bytes.
 const PIN_FRAME: usize = 64;
+/// How long root waits for the channel's end after the worker's
+/// successful exit.
+const GRACE: Duration = Duration::from_secs(1);
 
 const PRESENT: u8 = 0x10;
 const PRESENTED: u8 = 0x11;
@@ -343,6 +346,9 @@ pub(crate) struct Login {
     /// the operation started.
     protected: bool,
     child: Option<Child>,
+    /// The worker's exit, reaped before its channel ended, and until when
+    /// root waits for that end.
+    status: Option<(ExitStatus, Instant)>,
     wire: Option<Wire>,
     phase: Phase,
     /// The worker's slot fingerprints in canonical order.
@@ -455,6 +461,7 @@ impl Login {
             selection,
             protected,
             child: Some(child),
+            status: None,
             wire: Some(wire),
             phase: Phase::Baseline,
             baseline: Vec::new(),
@@ -670,27 +677,38 @@ impl Login {
     }
 
     /// After `14`: the worker's successful exit and a clean end of its
-    /// channel, with no further byte, complete the operation.
+    /// channel, with no further byte, complete the operation. The end may
+    /// lag the exit while another process holds a copy of the worker's
+    /// side: a descendant, or in a multi-threaded host a process a sibling
+    /// thread forked while root still held that side, until it execs. So
+    /// after a successful exit root waits for the end until `GRACE` ends.
     fn exited(&mut self) -> Result<Event, String> {
-        let status = self
-            .child
-            .as_mut()
-            .ok_or("missing login worker")?
-            .try_wait()
-            .map_err(|e| format!("wait for login worker: {e}"))?;
-        if status.is_some() {
-            self.child = None;
+        if self.status.is_none() {
+            let status = self
+                .child
+                .as_mut()
+                .ok_or("missing login worker")?
+                .try_wait()
+                .map_err(|e| format!("wait for login worker: {e}"))?;
+            if let Some(status) = status {
+                self.child = None;
+                let now = Instant::now();
+                self.status = Some((status, now.checked_add(GRACE).unwrap_or(now)));
+            }
         }
         // Read after the wait: once the worker has exited, what remains is
-        // all it wrote.
+        // all it wrote; anything later, from a descendant, is refused.
         let ended = self
             .wire
             .as_mut()
             .ok_or("missing login endpoint")?
             .finished()?;
-        let Some(status) = status else {
+        let Some((status, until)) = self.status else {
             return Ok(Event::Waiting);
         };
+        if status.success() && !ended && Instant::now() < until {
+            return Ok(Event::Waiting);
+        }
         self.wire = None;
         if status.success() && ended {
             return Ok(self.finish(Event::Complete));

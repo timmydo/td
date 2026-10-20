@@ -188,10 +188,11 @@ fn the_production_source_and_raw_boundary_are_closed() {
         login.matches("self.deadline = self.deadline.min(").count(),
         1
     );
-    assert_eq!(login.matches("Instant::now()").count(), 5);
+    // Five, and two in `exited`'s grace.
+    assert_eq!(login.matches("Instant::now()").count(), 7);
     assert_eq!(
         fingerprint(login),
-        0xeb6e3f0237d05a94,
+        0x881f86541dc72e1f,
         "login worker supervisor changed"
     );
     assert_eq!(

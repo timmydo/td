@@ -3245,9 +3245,15 @@ root has written a PIN it accepted, an UNCERTAIN failure before a
 write's `13` or in an unlock, or any byte after `14` included, ends the operation as INTERNAL;
 the worker's typed `15` ends it with its kind at any point before `14`.
 Success needs `14`, then the worker's successful exit and the clean end
-of its channel. Root answers the compositor's `13` and `14` with `11` and
-`13` as for secret operations, within three seconds of the invitation
-against the worker's five. A disclosure step (TOKEN-LOGIN.md increment
+of its channel. The end may lag the exit. Another process may hold a
+copy of the worker's side: a descendant of the worker, or, in a
+multi-threaded host such as the test harness, a process a sibling
+thread forked while root still held that side, until it execs. So after
+a successful exit root waits up to one second (`GRACE`) for the end. A
+channel still open then ends the operation as INTERNAL. Root answers
+the compositor's `13` and `14` with `11` and `13` as for secret
+operations, within three seconds of the invitation against the
+worker's five. A disclosure step (TOKEN-LOGIN.md increment
 5's A4) is the exception: root waits for the compositor's `13`, and the
 worker for root's `11`, until the operation's deadline, since no token
 I/O is open while the person reads and types the key. A disclosure
