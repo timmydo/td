@@ -271,3 +271,179 @@ restore command. POSTGRES.md owns maintenance, restored-epoch and uncertain
 external-delivery constraints; recovery activation remains separate work.
 Neither a historical audit report nor copying a local runtime/scratch
 directory is a database backup or recovery authorization.
+
+## Local logical backup and an isolated restore drill
+
+PostgreSQL's `pg_dump --format=custom` takes a consistent logical database
+snapshot while service continues. See PostgreSQL 17
+[pg_dump](https://www.postgresql.org/docs/17/app-pgdump.html) and
+[pg_restore](https://www.postgresql.org/docs/17/app-pgrestore.html).
+Use PostgreSQL 17 client tools for the
+qualified local setup. This includes td-mta's bodies, metadata, history,
+configuration, device verifiers and queue receipts; the archive contains
+private keys and relay credentials too. Protect the backup directory as 0700
+and its files as 0600. A backup on the service disk does not protect against
+loss of that disk; copy retained backups to separately protected storage.
+
+Provision a private libpq service file and password file for the owner login,
+separately from td-mta's connection-file syntax. The service contains `host`,
+`port`, `dbname`, `user`, `sslmode=verify-full`, `sslrootcert`, `passfile`, and
+`connect_timeout=10`; the referenced mode-0600 password file uses PostgreSQL's
+`host:port:database:user:password` format, escaping colons and backslashes.
+Do not put the password or the full connection URI in command arguments or
+shell history. Clear conflicting ambient `PG*` variables before using these
+examples; retain only the explicit service selection for the dump:
+
+```sh
+(
+  set -eu
+  umask 077
+  mkdir /home/alice/mail-backups/backup-001
+  PGSERVICEFILE=/home/alice/.config/td-mta/backup.pg_service.conf \
+  PGSERVICE=td-mta-backup \
+  pg_dump --no-password --format=custom \
+    --file=/home/alice/mail-backups/backup-001/mail.dump
+  pg_restore --list /home/alice/mail-backups/backup-001/mail.dump
+)
+```
+
+Create each backup directory anew; do not reuse the example's suffix or
+truncate an older archive. Check command exit status before calling a backup
+complete. Retain a checksum, timestamp, PostgreSQL version and application
+release/schema version alongside the archive. `--list` alone checks the
+archive directory, not whether its data can be restored.
+
+Retain protected bootstrap material separately: database owner/runtime login
+credentials and role/grant provisioning, database TLS trust, the local CA key
+if used, profile source files, current selection receipts, the td-mail device
+password and its per-account CA configuration, and the matching executable
+release. `pg_dump` does not include cluster roles, server configuration,
+bootstrap files or mail accepted after its snapshot. A restored device
+verifier cannot reconstruct the client password. Keeping these files beside
+a dump is convenient, but an independently recoverable copy is still needed.
+
+A drill restores into a fresh cluster with no TCP listener and a private Unix
+socket. Use absolute paths without whitespace for this example's `pg_ctl -o`
+argument, a new mode-0700 root, and separate service/data directories. The two
+NOLOGIN role names below match the local deployment; reproduce the actual
+source role names when they differ. Do not enable a source runtime password
+or copy supervisor definitions into this cluster.
+
+```sh
+(
+  set -eu
+  umask 077
+  mkdir /home/alice/mail-restore-001
+  mkdir /home/alice/mail-restore-001/socket
+  initdb -D /home/alice/mail-restore-001/data -U restore_admin \
+    --auth-local=trust --auth-host=reject --no-locale -E UTF8
+  pg_ctl -D /home/alice/mail-restore-001/data \
+    -l /home/alice/mail-restore-001/postgres.log \
+    -o "-h '' -k /home/alice/mail-restore-001/socket -p 55439" -w start
+)
+```
+
+The socket's private ancestor is the local authentication boundary. In a
+separate shell with the source's `PG*` variables cleared, set only the drill's
+connection variables and create the empty destination:
+
+```sh
+(
+  set -eu
+  export PGHOST=/home/alice/mail-restore-001/socket PGPORT=55439
+  export PGUSER=restore_admin PGDATABASE=postgres
+  psql -X -v ON_ERROR_STOP=1 -c 'CREATE ROLE td_mta_owner NOLOGIN'
+  psql -X -v ON_ERROR_STOP=1 -c 'CREATE ROLE td_mta_runtime NOLOGIN'
+  createdb --owner=td_mta_owner restored_mail
+  pg_restore --exit-on-error --single-transaction --dbname=restored_mail \
+    /home/alice/mail-backups/backup-001/mail.dump
+  psql -X -v ON_ERROR_STOP=1 --dbname=restored_mail \
+    -c 'ALTER DATABASE restored_mail SET default_transaction_read_only = on'
+)
+```
+
+Verify the expected tables, row counts, message IDs, immutable bodies and
+queue receipts, not just process exit. For an exact before/after comparison,
+briefly stop all MTA writers before the dump and source inventory, then start
+them again after those two observations. Compare every table's ordered row
+encoding under identical PostgreSQL session settings (including UTC and ISO
+dates), retaining only hashes/counts in the diagnostic report. Treat raw
+inventory output as secret-bearing. This is a database-copy check, not
+whole-mail semantic validation or permission to start a restored service.
+
+Stop the drill with `pg_ctl -D /home/alice/mail-restore-001/data -m fast -w stop`
+and remove only its disposable cluster after retaining the report. Never run
+`td-mta serve` against the drill or point an existing profile at it. An actual
+recovery additionally requires POSTGRES.md section 6's old-instance fencing,
+fresh epoch, credential/configuration review and delivery quarantine; the
+current local drill supplies none of that activation authority.
+
+## Renew a local private certificate
+
+A local `localhost` deployment uses its explicitly trusted private CA;
+public ACME issuance is not involved. Check both the CA and leaf expiration
+with `openssl x509 -in FILE -noout -dates`, and check the renewal threshold
+with `openssl x509 -in FILE -checkend 2592000 -noout`. Nonzero means renewal
+is due (or the input could not be checked); it is not an instruction to
+ignore verification. Schedule the operator check before either certificate
+expires. These are manual operator commands, not built-in automatic renewal.
+
+Retain the CA certificate/key and prior server generation privately. Create
+new files in a new mode-0700 directory with umask 077. A 90-day leaf under an
+existing CA can be prepared with the following commands; select a new random
+positive serial and retain it before signing. The CA must remain valid for
+the entire new leaf's intended lifetime:
+
+```sh
+(
+  set -eu
+  openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -noenc \
+    -keyout server.key -out server.csr -subj /CN=localhost
+  openssl x509 -req -in server.csr -CA /absolute/local-ca.pem \
+    -CAkey /absolute/local-ca.key -set_serial 0xRETAINED_RANDOM_SERIAL \
+    -days 90 -extfile extensions -out server.pem
+  openssl verify -CAfile /absolute/local-ca.pem \
+    -verify_hostname localhost server.pem
+)
+```
+
+The `extensions` file for this local-only profile is:
+
+```text
+basicConstraints=critical,CA:FALSE
+keyUsage=critical,digitalSignature
+extendedKeyUsage=serverAuth
+subjectAltName=DNS:localhost,IP:127.0.0.1
+```
+
+The short-lived development CA may itself need replacement before issuing a
+leaf. An explicit local CA renewal can retain its key and subject while
+issuing a longer-lived self-signed CA certificate with critical CA:TRUE and
+keyCertSign,cRLSign usage. Verify the old leaf against that candidate before
+replacing clients' CA files; do not assume matching subject names imply
+matching keys. A different CA key requires an explicit overlap/trust rotation
+for every client. Neither operation changes bundled public roots or grants
+trust to other td-mail accounts. Keep CA expiry on the operator's schedule.
+
+Use `postgres material-version` to retain separate chain/key IDs, then import
+`server.pem` as `certificate-chain` and `server.key` as `private-key`, using
+`material-import` with the owner connection file and expected epoch. Replace
+only the certificate material references in copies of every affected profile.
+Generate/retain a configuration version; `config-import` it with every profile
+and `config-check` it. Prepare and retain a `config-selection-prepare` request
+using the currently selected generation, then publish that exact request with
+`config-select`. Resolve uncertain results with `config-selection-inspect` and
+the same retained request. POSTGRES.md sections 17, 26 and 198 specify these
+commands; do not invent a fresh request to hide uncertainty.
+
+Certificate files on disk do not update td-mta's immutable database materials.
+Selecting a configuration advances the database-wide generation and fences
+every instance using that selection. Restart all of them, including unchanged
+listener-free relay profiles, and require ready status from each instance. When the private PostgreSQL server uses the same local leaf,
+install its new certificate/key pair and reload or restart PostgreSQL too;
+keep its bootstrap clients' trust valid throughout the transition. Verify new
+connections to PostgreSQL, JMAP HTTPS and SMTP STARTTLS with name/chain checks,
+and confirm that they present the intended certificate and expiration. Keep
+the old files and selected configuration receipt for diagnosing a failed
+rotation. Do not claim live reload or automatic ACME support from this manual
+procedure.
