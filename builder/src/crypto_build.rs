@@ -80,7 +80,22 @@ impl Drop for Child {
 }
 
 pub(crate) fn run(root: &Path, action: &str, manifest: &str) -> Result<()> {
-    if !matches!(action, "test" | "clippy") {
+    run_inner(root, action, manifest).map(|_| ())
+}
+
+pub(crate) struct Release {
+    pub(crate) executable: PathBuf,
+    pub(crate) vendor: PathBuf,
+    pub(crate) receipt: String,
+}
+
+pub(crate) fn release(root: &Path) -> Result<Release> {
+    run_inner(root, "build", "td-mta/Cargo.toml")?
+        .ok_or("release build returned no executable".into())
+}
+
+fn run_inner(root: &Path, action: &str, manifest: &str) -> Result<Option<Release>> {
+    if !matches!(action, "test" | "clippy" | "build") {
         return Err("crypto-cargo accepts only test or clippy".into());
     }
     let name = match manifest {
@@ -224,6 +239,28 @@ pub(crate) fn run(root: &Path, action: &str, manifest: &str) -> Result<()> {
         std::str::from_utf8(&output.stdout).map_err(|e| format!("crypto graph UTF-8: {e}"))?;
     crate::crypto_policy::active_graph(root, name, graph)?;
     let mut cmd = command(action, manifest);
+    if action == "build" {
+        std::fs::create_dir_all(&target_dir).map_err(|e| format!("release target: {e}"))?;
+        let target = Path::new(&target_dir)
+            .canonicalize()
+            .map_err(|e| e.to_string())?;
+        cmd.args(["--release", "--bin", "td-mta"])
+            .env("CARGO_PROFILE_RELEASE_DEBUG", "1")
+            .env("CARGO_PROFILE_RELEASE_STRIP", "none");
+        let mut receipt = String::from("td-mta native host release; debug retained in executable\nNot portable or source-bootstrapped. Retain host compiler/runtime packages.\n");
+        receipt.push_str(&format!("command {cmd:?}\n"));
+        let executable = fixture_executable(
+            cmd,
+            "td-mta",
+            crate::crypto_isolated::ArtifactKind::Installed,
+            &target,
+        )?;
+        return Ok(Some(Release {
+            executable,
+            vendor: PathBuf::from(vendor),
+            receipt,
+        }));
+    }
     let mut live_fixture = None;
     if action == "test" && name == "td-mta" {
         std::fs::create_dir_all(&target_dir).map_err(|e| format!("crypto fixture target: {e}"))?;
@@ -316,7 +353,7 @@ pub(crate) fn run(root: &Path, action: &str, manifest: &str) -> Result<()> {
             crate::native_tests::run_cases(fixture)?;
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 fn fixture_executable(

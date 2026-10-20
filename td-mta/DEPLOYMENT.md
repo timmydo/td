@@ -8,6 +8,62 @@ existing deployment or SQLite data conversion requirement.
 [CONFIG.md](CONFIG.md#foreground-postgresql-service) owns foreground serving.
 Relay scheduling is active; configuration reload requires process restart.
 
+## Install for the current host user
+
+From the checkout, run `./install-td-mta`. It builds a native release with
+verified, pinned mail dependencies, then installs `~/.local/bin/td-mta`.
+`--prefix /absolute/path` selects another prefix. Cargo, Rust and a C
+compiler must be available; the builder handles the same host toolchain
+preparation as its mail checks. Dependency preparation may fetch declared
+archives; compilation is frozen/offline.
+
+This is a host build, not the portable release below or a source-bootstrapped
+td artifact. Retain the host runtime libraries/toolchain generation it links
+against (including Guix profile packages). Each installation retains a new
+release under `PREFIX/lib/td-mta/releases/`, with debug information inside
+the executable, the build command receipt, manifests, lock and dependency
+notices. The `PREFIX/bin/td-mta` link selects the new release. Running services
+keep their executable until restarted. Older releases are not deleted.
+
+After preparing the database and selecting profiles, generate service files:
+
+```text
+./install-td-mta --services-only --connection-file /home/alice/.config/td-mta/runtime-connection --state-dir /home/alice/.local/state/td-mta --profile frontend --profile relay
+```
+
+Omit `--services-only` to build/install and generate in one invocation.
+Each profile gets separate private runtime/scratch directories. Both systemd
+user units and Shepherd service definitions are written under
+`PREFIX/share/td-mta/services/`. Matching files may be reused; edited files
+are never overwritten. Only paths enter the definitions, never credentials.
+Installation does not initialize a database, grant privileges, change its
+selected configuration, or start a service.
+
+For systemd, use the printed `systemctl --user enable --now /absolute/unit`
+command; `systemctl --user status`, `stop`, and `restart td-mta-PROFILE` manage
+it, and `journalctl --user -u td-mta-PROFILE` reads its logs. Persistence beyond
+logout/reboot requires the host's user-manager policy, such as lingering.
+For Guix/Shepherd 1.0 or newer, load the printed `.scm` with `herd load root PATH`, then
+`herd start td-mta-PROFILE`. Use `herd status`, `stop`, and `restart` for
+management. Logs go to `STATE/PROFILE/service.log`; Shepherd owns their
+rotation. For login startup, load the definition and start the service from
+your user Shepherd configuration (or equivalent Guix Home service). Loading
+at runtime alone does not persist it across a Shepherd restart.
+
+These definitions run as the current user. A system deployment uses a dedicated
+unprivileged identity: install/build as that identity and adapt the unit with
+`User=`, `Group=` and the system manager's target, or the Shepherd constructor's
+`#:user`/`#:group`. Provision ownership and low-port access separately; do not
+run the engine as root. Other supervisors can directly run the foreground
+command below and send SIGTERM to stop it.
+
+Supervisor `active` means the process started, not that mail is ready. Require
+`td-mta status --json --require-ready --runtime STATE/PROFILE/runtime` before
+using it. PostgreSQL must already be available; use the host's PostgreSQL
+service, or a separately supervised private cluster. The MTA installer never
+assumes ownership of an existing cluster. A failed startup is retried by the
+service manager. Readiness does not depend on remote delivery succeeding.
+
 ## Build and retain a release
 
 On the build host, use the pinned archive preparation and isolated build in

@@ -2153,7 +2153,7 @@ fn build_architecture(
     )
 }
 
-fn retain_notices(source: &Path, destination: &Path, depth: usize) -> Result<usize> {
+pub(crate) fn retain_notices(source: &Path, destination: &Path, depth: usize) -> Result<usize> {
     if depth > 64 {
         return Err("portable notice nesting exceeds 64 directories".into());
     }
