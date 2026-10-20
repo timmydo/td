@@ -1037,6 +1037,11 @@ pub struct Recipe {
     /// closing it would cost, and this doc deliberately claims no more than the
     /// two properties above.
     pub payload_inputs: Option<Vec<String>>,
+    /// Build inside the Debian build root (BUILD-ROOT-PLAN.md): the pinned
+    /// root is the sandbox's read-only `/`, so steps may run its C tools.
+    /// It is not an input: no `{in:...}` names it and no output may
+    /// reference it or carry its interpreter.
+    pub build_root: bool,
     /// Immutable application-package metadata. The declaration omits identity,
     /// version and provenance; the derivation assembler binds those from this
     /// final Recipe and materializes `{out}/manifest` for application-capable
@@ -1157,6 +1162,7 @@ impl Recipe {
             inputs: None,
             native_inputs: None,
             payload_inputs: None,
+            build_root: false,
             application: None,
             application_launcher: None,
             application_permissions: None,
@@ -1225,6 +1231,10 @@ impl Recipe {
     /// template expansion.
     pub fn payload_inputs(mut self, xs: &[&str]) -> Recipe {
         self.payload_inputs = Some(vs(xs));
+        self
+    }
+    pub fn build_root(mut self) -> Recipe {
+        self.build_root = true;
         self
     }
     pub fn application(mut self, declaration: ApplicationDeclaration) -> Recipe {
@@ -1475,6 +1485,10 @@ impl Recipe {
         if let Some(x) = &self.payload_inputs {
             o.push(("payloadInputs".into(), arr(x)));
         }
+        // Emitted only when set, like `payloadInputs`.
+        if self.build_root {
+            o.push(("buildRoot".into(), Json::Str("debian".into())));
+        }
         // Likewise emitted only when TRUE, and never as `false`: the mark must
         // cross into the build JSON (§B.8 — `build_plan_auto` sees nothing else),
         // and a `"foreign":false` on every recipe would change every derivation
@@ -1617,6 +1631,20 @@ mod tests {
         assert_eq!(
             with.to_json().to_canonical(),
             r#"{"buildSystem":"gnu","inputs":["gcc"],"name":"fixture","payloadInputs":["firefox"],"version":"1.0"}"#
+        );
+    }
+
+    /// Like the payload channel, the build root costs nothing unset.
+    #[test]
+    fn the_build_root_is_its_own_key_and_costs_nothing_unset() {
+        let plain = Recipe::mesboot("fixture", "1.0");
+        assert_eq!(
+            plain.to_json().to_canonical(),
+            r#"{"buildSystem":"mesboot","name":"fixture","version":"1.0"}"#
+        );
+        assert_eq!(
+            plain.build_root().to_json().to_canonical(),
+            r#"{"buildRoot":"debian","buildSystem":"mesboot","name":"fixture","version":"1.0"}"#
         );
     }
 

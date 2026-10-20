@@ -61,7 +61,8 @@ fn is_snapshot_stamp(stamp: &str) -> bool {
 }
 
 /// Parse the input lines; resolved lines (`index`, `manifest`, `layer`,
-/// `inrelease`, `deb`) are the resolver's own output and are ignored here.
+/// `inrelease`, `deb`, and `td-builder build-root pin`'s `tree`) are ignored
+/// here, and a re-resolve drops `tree` until the root is pinned again.
 fn parse_spec(text: &str) -> Result<Spec, String> {
     let (mut image, mut snapshot, mut archives, mut want) = (None, None, Vec::new(), Vec::new());
     for (n, raw) in text.lines().enumerate() {
@@ -96,7 +97,7 @@ fn parse_spec(text: &str) -> Result<Spec, String> {
             ("want", names) if !names.is_empty() && names.iter().all(|n| is_debian_word(n)) => {
                 want.extend(names.iter().map(|n| n.to_string()));
             }
-            ("index" | "manifest" | "layer" | "inrelease" | "deb", _) => {}
+            ("index" | "manifest" | "layer" | "inrelease" | "deb" | "tree", _) => {}
             _ => return Err(bad()),
         }
     }
@@ -855,7 +856,7 @@ fn render(spec_text: &str, spec: &Spec, resolved: &Resolved) -> Result<String, S
         let keyword = line.split_whitespace().next().unwrap_or_default();
         if !matches!(
             keyword,
-            "index" | "manifest" | "layer" | "inrelease" | "deb"
+            "index" | "manifest" | "layer" | "inrelease" | "deb" | "tree"
         ) && !line.starts_with("# resolved")
         {
             out.push_str(line);
@@ -1558,7 +1559,8 @@ mod tests {
                         want gcc make\n\
                         \n\
                         # resolved by `td-feed debian-root resolve`; review the diff\n\
-                        deb debian-root-old old_1_amd64.deb 00 1 https://x/old 1\n";
+                        deb debian-root-old old_1_amd64.deb 00 1 https://x/old 1\n\
+                        tree sha256:00\n";
 
     #[test]
     fn the_spec_reads_input_lines_and_ignores_resolved_ones() {
@@ -1596,6 +1598,10 @@ mod tests {
         let text = render(SPEC, &spec, &resolved).unwrap();
         assert!(text.starts_with("# header comment\nimage library/debian:trixie-20261005-slim\n"));
         assert!(!text.contains("debian-root-old"));
+        assert!(
+            !text.contains("tree sha256:"),
+            "a re-resolve unpins the tree"
+        );
         assert_eq!(text.matches("# resolved by").count(), 1);
         assert!(
             text.contains("layer debian-root-layer debian-trixie-20261005-slim-amd64-layer.tar.gz")

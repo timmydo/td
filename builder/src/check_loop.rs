@@ -762,6 +762,18 @@ fn heavy_warms(root: &Path, eval: Option<&str>) {
              (best-effort; the gates enforce presence)"
         );
     }
+    // The Debian build root's layer and .debs (build_root.rs), which `warm
+    // sources` leaves alone; the build-root recipes' checks assemble from them.
+    if !warm_status(
+        &[tdfeed.clone(), s("warm"), s("build-root")],
+        root,
+        &src_envs,
+    ) {
+        eprintln!(
+            "td-builder check: warm build-root failed — the build root's pins may be cold \
+             (best-effort; `td-builder build-root assemble` enforces presence)"
+        );
+    }
 
     // Corpus crate warms are independent, but compiler memory is the limiting
     // resource on the hosts this scheduler protects.

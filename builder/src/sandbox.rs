@@ -1311,6 +1311,10 @@ pub enum InputOrigin {
     /// placement db `store-add-builder` wrote for the binary driving this
     /// build.
     ControlPlaneBuilder,
+    /// The Debian build root (build_root.rs): the one store path the compiled
+    /// lock names, at its pinned tree hash. A sandbox root for the drvs that
+    /// declare it; never a builder.
+    BuildRoot,
 }
 
 impl InputOrigin {
@@ -1320,6 +1324,7 @@ impl InputOrigin {
             InputOrigin::AuditedSeed => "audited-seed",
             InputOrigin::RecipeOutput => "recipe-output",
             InputOrigin::ControlPlaneBuilder => "control-plane-builder",
+            InputOrigin::BuildRoot => "build-root",
         }
     }
 }
@@ -1429,6 +1434,29 @@ fn plan_staged_item(
         )));
     }
     Ok(vec![(on_disk.to_string(), target)])
+}
+
+/// The build root a drv declared (`TD_BUILD_ROOT`), when present: it must be
+/// a closure item the manifest types `BuildRoot`, so an env line alone cannot
+/// make an arbitrary input the sandbox's `/`.
+fn build_root_item(drv: &Derivation, manifest: &StageManifest) -> io::Result<Option<String>> {
+    let Some((_, root)) = drv.env.iter().find(|(k, _)| k == "TD_BUILD_ROOT") else {
+        return Ok(None);
+    };
+    let (path, pinned) = crate::build_root::pinned().map_err(err)?;
+    match manifest.get(root.as_str()) {
+        Some(item)
+            if *root == path
+                && item.origin == InputOrigin::BuildRoot
+                && item.nar_hash == pinned =>
+        {
+            Ok(Some(root.clone()))
+        }
+        _ => Err(err(format!(
+            "TD_BUILD_ROOT {root} is not the build root this td-builder pins ({pinned}) \
+             that a td-owned db vouches for"
+        ))),
+    }
 }
 
 /// The store paths a drv declared through the DATA channel (APPLICATIONS.md §B.8),
@@ -1563,11 +1591,17 @@ pub fn build(
     let newstore = scratch.join("newstore");
     fs::create_dir_all(&newstore)?;
     let plan = plan_bind_restrictions(drv, closure)?;
+    let build_root = build_root_item(drv, manifest)?;
+    let mut root_src: Option<CString> = None;
     let mut binds: Vec<(CString, CString, bool)> = Vec::with_capacity(closure.len());
     // CANONICAL is the store path the build SEES; ON-DISK is where to bind FROM
     // (== canonical for daemon-resident items, a td store dir for td-interned ones).
     for (canonical, on_disk, extra) in plan {
         verify_staged_item(manifest, canonical, on_disk)?;
+        if build_root.as_deref() == Some(canonical) {
+            root_src =
+                Some(CString::new(on_disk).map_err(|_| err(format!("{on_disk}: NUL in path")))?);
+        }
         let meta = fs::symlink_metadata(on_disk)
             .map_err(|e| err(format!("closure item {canonical} (on disk {on_disk}): {e}")))?;
         for (src, dst) in plan_staged_item(&newstore, canonical, on_disk, &meta)? {
@@ -1578,6 +1612,11 @@ pub fn build(
                 extra,
             ));
         }
+    }
+    if build_root.is_some() && root_src.is_none() {
+        return Err(err(format!(
+            "{drv_path}: TD_BUILD_ROOT names a path outside its closure"
+        )));
     }
 
     // The build dir is `guix-build-<drvName>-0`. For a store-path drv that is
@@ -1665,6 +1704,13 @@ pub fn build(
         .collect();
     extra_prefixes.sort();
     extra_prefixes.dedup();
+    // The read-only root carries mount points for /td/store alone.
+    if root_src.is_some() && (store_dir_str != "/td/store" || !extra_prefixes.is_empty()) {
+        return Err(err(format!(
+            "{drv_path}: a build-root derivation builds in /td/store alone, not {store_dir_str} \
+             with {extra_prefixes:?}"
+        )));
+    }
     let extra_store_dirs: Vec<PathBuf> = extra_prefixes
         .iter()
         .map(|p| newroot.join(p.trim_start_matches('/')))
@@ -1685,6 +1731,23 @@ pub fn build(
          nobody:x:65534:65534:Nobody:/:/noshell\n"
     );
     let group_body = format!("root:x:0:\nnixbld:x:{GUEST_GID}:\nnogroup:x:65534:\n");
+    // A read-only build root keeps its own /etc: the two files bind over its
+    // passwd and group from scratch instead of being written into a tmpfs.
+    let etc_binds = match &root_src {
+        Some(_) => {
+            let passwd = scratch.join("etc-passwd");
+            let group = scratch.join("etc-group");
+            fs::write(&passwd, &passwd_body)?;
+            fs::write(&group, &group_body)?;
+            Some((
+                cstr(&passwd),
+                cstr(&etc_passwd),
+                cstr(&group),
+                cstr(&etc_group),
+            ))
+        }
+        None => None,
+    };
     let build_dir_owned = build_dir.clone();
     let mesboot_steps_file = PathBuf::from(&build_dir).join(crate::build::MESBOOT_STEPS_FILE);
 
@@ -1794,8 +1857,18 @@ pub fn build(
                 sys::mount(Some(src), dst, None, sys::MS_BIND, None)?;
                 sys::restrict_mount(dst, *noexec, false).map_err(mount_restriction_error)?;
             }
-            // The fresh minimal root, then its skeleton dirs.
-            sys::mount(Some(&tmpfs_c), &newroot_c, Some(&tmpfs_c), 0, None)?;
+            // The fresh minimal root, then its skeleton dirs — or the verified
+            // build root, bound and locked read-only on its top mount before
+            // anything mounts over it. Its skeleton exists (build_root.rs), so
+            // the create_dir_all calls below find every mount point present.
+            match &root_src {
+                Some(src) => {
+                    sys::mount(Some(src), &newroot_c, None, sys::MS_BIND, None)?;
+                    sys::restrict_mount(&newroot_c, false, false)
+                        .map_err(mount_restriction_error)?;
+                }
+                None => sys::mount(Some(&tmpfs_c), &newroot_c, Some(&tmpfs_c), 0, None)?,
+            }
             fs::create_dir_all(&store_dir)?;
             fs::create_dir_all(&tmp_dir)?;
             fs::create_dir_all(&dev_dir)?;
@@ -1849,13 +1922,26 @@ pub fn build(
                 e
             })?;
             // Minimal /etc.
-            fs::write(&etc_passwd, &passwd_body)?;
-            fs::write(&etc_group, &group_body)?;
+            match &etc_binds {
+                Some((passwd_src, passwd_dst, group_src, group_dst)) => {
+                    for (src, dst) in [(passwd_src, passwd_dst), (group_src, group_dst)] {
+                        sys::mount(Some(src), dst, None, sys::MS_BIND, None)?;
+                        sys::restrict_mount(dst, false, false).map_err(mount_restriction_error)?;
+                    }
+                }
+                None => {
+                    fs::write(&etc_passwd, &passwd_body)?;
+                    fs::write(&etc_group, &group_body)?;
+                }
+            }
             // Pivot into the minimal root and drop the host root entirely.
             sys::pivot_root(&newroot_c, &oldroot_rel_c)?;
             std::env::set_current_dir("/")?;
             sys::umount2(&oldroot_abs_c, sys::MNT_DETACH)?;
-            let _ = fs::remove_dir("/oldroot");
+            // A read-only build root keeps its empty mount point.
+            if root_src.is_none() {
+                let _ = fs::remove_dir("/oldroot");
+            }
             // The build dir lives on the private disk-backed /tmp bind.
             fs::DirBuilder::new().mode(0o700).create(&build_dir_owned)?;
             write_mesboot_steps_file(&mesboot_steps_file, mesboot_steps.as_deref())?;
@@ -3157,6 +3243,70 @@ mod tests {
             flag_arg,
             Some("extra,"),
             "the bind must carry the PLAN's flag word, not a literal"
+        );
+    }
+
+    #[test]
+    fn a_build_root_must_be_a_closure_item_typed_build_root() {
+        let drv = |env: Vec<(String, String)>| Derivation {
+            outputs: Vec::new(),
+            input_drvs: Vec::new(),
+            input_srcs: Vec::new(),
+            platform: "x86_64-linux".into(),
+            builder: "/b".into(),
+            args: Vec::new(),
+            env,
+        };
+        let (root, pinned) = crate::build_root::pinned().unwrap();
+        let root = root.as_str();
+        let manifest_at = |origin, nar_hash: &str| {
+            let mut m = StageManifest::new();
+            m.insert(
+                root.to_string(),
+                StagedInput {
+                    nar_hash: nar_hash.into(),
+                    origin,
+                },
+            );
+            m
+        };
+        let manifest = |origin| manifest_at(origin, &pinned);
+        let declared = drv(vec![("TD_BUILD_ROOT".into(), root.into())]);
+        assert_eq!(
+            build_root_item(&drv(Vec::new()), &manifest(InputOrigin::BuildRoot)).unwrap(),
+            None
+        );
+        assert_eq!(
+            build_root_item(&declared, &manifest(InputOrigin::BuildRoot))
+                .unwrap()
+                .as_deref(),
+            Some(root)
+        );
+        // An env line cannot make a seed, a recipe output, the builder, an
+        // unvouched path or a root at another tree hash `/`.
+        for origin in [
+            InputOrigin::AuditedSeed,
+            InputOrigin::RecipeOutput,
+            InputOrigin::ControlPlaneBuilder,
+        ] {
+            assert!(build_root_item(&declared, &manifest(origin)).is_err());
+        }
+        let other = format!("sha256:{}", "0".repeat(64));
+        assert!(build_root_item(&declared, &manifest_at(InputOrigin::BuildRoot, &other)).is_err());
+        assert!(build_root_item(&declared, &StageManifest::new()).is_err());
+        let elsewhere = "/td/store/0123456789abcdfghijklmnpqrsvwxyz-debian-build-root";
+        let mut moved = StageManifest::new();
+        moved.insert(
+            elsewhere.to_string(),
+            StagedInput {
+                nar_hash: pinned.clone(),
+                origin: InputOrigin::BuildRoot,
+            },
+        );
+        let named = drv(vec![("TD_BUILD_ROOT".into(), elsewhere.into())]);
+        assert!(
+            build_root_item(&named, &moved).is_err(),
+            "only the compiled path"
         );
     }
 

@@ -107,7 +107,8 @@ The pin is never downloaded or published; `td-recipe-eval bootstrap-root check`
 rebuilds the ladder from stage0 on demand and reports any item that does not
 reproduce. `DEVELOPMENT.md` says when to re-pin. The compiler/libc path is
 iterative. Recipe steps may execute only audited seed executables, unmarked
-outputs of earlier recipes, and executables created by the current build. Host
+outputs of earlier recipes, executables created by the current build, and,
+in a recipe that declares it, the Debian build root's tools (below). Host
 `/bin`, `/usr`, ambient `PATH`, and arbitrary host store paths are never target
 inputs.
 
@@ -119,7 +120,8 @@ dependency.
 ## Foreign application payloads
 
 td's bootstrap graph contains no foreign binary other than its declared
-bootstrap seeds and the non-executable pinned upstream data below. A
+bootstrap seeds, the Debian build root's tools and the non-executable pinned
+upstream data below. A
 third-party application is a marked foreign prebuilt
 payload in `/td/store`, not a bootstrap seed. The mark is load-bearing:
 
@@ -157,6 +159,38 @@ is data inside the target graph, not source-built: a source-bootstrap
 claim names it as upstream data. Adding a pin of this class is a
 reviewed pin; data a td program would execute or load as code belongs to
 no class here and needs an amendment to this file.
+
+## Debian build root
+
+td is moving its C toolchain off the stage0 ladder (`BUILD-ROOT-PLAN.md`).
+The build root is a build environment, not an input: a pinned Debian image
+layer plus pinned .debs from snapshot.debian.org, resolved into
+`recipes/src/debian-root.lock` by `td-feed debian-root resolve`, and
+assembled by td-builder into one input-addressed store path whose NAR hash
+the lock pins. A recipe that declares `build_root` runs with that tree as
+its read-only sandbox `/`, so its steps may run Debian's gcc, binutils, make
+and the rest. What td enforces:
+
+- its pins are a class of their own: no input channel, seed or source-pin
+  lookup resolves one, and the sandbox binds as `/` only the path the
+  compiled lock names, at its pinned hash, vouched by a db typed
+  `BuildRoot`, never a builder or tool input;
+- an output built in it may not reference its store path, and no file in
+  that output may be an ELF naming an interpreter or RUNPATH outside the
+  store, or a symlink to an absolute path outside the store.
+
+What td does not enforce: static objects of the root's (`crt*.o`,
+`libgcc.a`, `libc.a`) linked into an output are indistinguishable from
+compiled source, and the root carries no mark that propagates to outputs
+or to recipes that later use them. Recipes in the root must therefore link
+only against td-built libraries or none, which their review and their own
+checks establish. A source-bootstrap claim names the root as a build-tool
+trust root, as it names the Rust bootstrap snapshot, for every output whose
+build closure includes a root-built output; the stage0 provenance
+statements above hold only for outputs whose closure excludes one.
+
+Changing the root's packages is a reviewed lock change. Until the ladder is
+deleted (increment 11 of that plan) both paths coexist.
 
 ## Rust bridge and dependencies
 

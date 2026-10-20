@@ -2467,7 +2467,7 @@ pub(crate) mod tests {
     // string slot holds `interp` (NUL-terminated). `is64` selects ELFCLASS64 (x86-64) or
     // ELFCLASS32 (i686 — the class the bootstrap toolchain cc1/as/ld actually is). Enough
     // for the reader/writer; not a runnable binary (no sections), which is all this needs.
-    fn synth_interp_elf(interp: &str, is64: bool) -> Vec<u8> {
+    pub(crate) fn synth_interp_elf(interp: &str, is64: bool) -> Vec<u8> {
         let (ehdr, phentsize) = if is64 {
             (64usize, 56usize)
         } else {
@@ -2534,7 +2534,7 @@ pub(crate) mod tests {
     // DT_STRTAB vaddr equals its file offset) + a PT_DYNAMIC holding DT_STRTAB, one run-path
     // entry (DT_RUNPATH if `runpath`, else legacy DT_RPATH), and DT_NULL. The .dynstr is
     // `"\0" <rpath> "\0"`. `is64` selects the ELF class. Enough for the run-path reader/writer.
-    fn synth_dyn_elf(rpath: &str, runpath: bool, is64: bool) -> Vec<u8> {
+    pub(crate) fn synth_dyn_elf(rpath: &str, runpath: bool, is64: bool) -> Vec<u8> {
         let (ehdr, phentsize, dyn_entsize, d_un) = if is64 {
             (64usize, 56usize, 16usize, 8usize)
         } else {

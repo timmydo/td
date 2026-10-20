@@ -798,45 +798,11 @@ fn materialize_with(pin: &PinDef, key: &str, foreign: &[&str]) -> SourcePin {
 const BUILD_ROOT_LOCK: &str = include_str!("debian-root.lock");
 
 pub fn build_root_pins() -> Result<Vec<SourcePin>, String> {
-    parse_build_root_lock(BUILD_ROOT_LOCK)
-}
-
-/// The `layer` and `deb` rows: `KIND KEY FILE SHA256 SIZE URL [VERSION]`.
-/// Every other line is the resolver's input or audit record.
-fn parse_build_root_lock(text: &str) -> Result<Vec<SourcePin>, String> {
-    let mut pins: Vec<SourcePin> = Vec::new();
-    for (n, line) in text.lines().enumerate() {
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        let bad = |what: &str| format!("debian-root.lock line {}: {what}", n + 1);
-        let (key, file, sha256, size, url) = match fields.as_slice() {
-            ["layer", key, file, sha256, size, url] | ["deb", key, file, sha256, size, url, _] => {
-                (*key, *file, *sha256, *size, *url)
-            }
-            ["layer" | "deb", ..] => return Err(bad("malformed pin row")),
-            _ => continue,
-        };
-        let hex = sha256.len() == 64
-            && sha256
-                .bytes()
-                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
-        let basename = !file.is_empty() && !file.starts_with('.') && !file.contains('/');
-        if !key.starts_with("debian-root-")
-            || !hex
-            || !basename
-            || size.parse::<u64>().is_err()
-            || !url.starts_with("https://")
-        {
-            return Err(bad("pin row fails validation"));
-        }
-        if pins.iter().any(|pin| pin.key == key || pin.file == file) {
-            return Err(bad("duplicate key or file"));
-        }
-        pins.push(SourcePin::new(key, url, sha256, file));
-    }
-    if !pins.iter().any(|pin| pin.key == "debian-root-layer") {
-        return Err("debian-root.lock pins no image layer".into());
-    }
-    Ok(pins)
+    Ok(td_engine::debian_root::parse(BUILD_ROOT_LOCK)?
+        .pins
+        .iter()
+        .map(|pin| SourcePin::new(&pin.key, &pin.url, &pin.sha256, &pin.file))
+        .collect())
 }
 
 #[cfg(test)]
@@ -873,54 +839,6 @@ mod tests {
         }
         assert!(PINS.iter().all(|pin| !pin.key.starts_with("debian-root-")
             && !pin.aliases.iter().any(|a| a.starts_with("debian-root-"))));
-    }
-
-    #[test]
-    fn the_build_root_lock_reader_refuses_malformed_rows() {
-        let hex = "a".repeat(64);
-        let layer = format!("layer debian-root-layer l.tar.gz {hex} 1 https://r/l");
-        let deb = |key: &str, file: &str, sha: &str, url: &str| {
-            format!("{layer}\ndeb {key} {file} {sha} 2 {url} 1.0\n")
-        };
-        assert_eq!(
-            parse_build_root_lock(&deb("debian-root-x", "x.deb", &hex, "https://d/x"))
-                .unwrap()
-                .len(),
-            2
-        );
-        for (text, why) in [
-            (deb("x", "x.deb", &hex, "https://d/x"), "unprefixed key"),
-            (
-                deb("debian-root-x", "a/x.deb", &hex, "https://d/x"),
-                "path file",
-            ),
-            (
-                deb("debian-root-x", "x.deb", &"A".repeat(64), "https://d/x"),
-                "upper hex",
-            ),
-            (
-                deb("debian-root-x", "x.deb", &hex, "http://d/x"),
-                "plain http",
-            ),
-            (
-                deb("debian-root-layer", "x.deb", &hex, "https://d/x"),
-                "duplicate key",
-            ),
-            (
-                deb("debian-root-x", "l.tar.gz", &hex, "https://d/x"),
-                "duplicate file",
-            ),
-            (
-                format!("{layer}\ndeb debian-root-x x.deb {hex} 2 https://d/x\n"),
-                "short row",
-            ),
-            (
-                format!("deb debian-root-x x.deb {hex} 2 https://d/x 1\n"),
-                "no layer",
-            ),
-        ] {
-            assert!(parse_build_root_lock(&text).is_err(), "{why}");
-        }
     }
 
     #[test]

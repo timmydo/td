@@ -22,6 +22,7 @@ mod bootstrap;
 mod bootstrap_root;
 mod build;
 mod build_daemon;
+mod build_root;
 mod bzip2;
 mod cargo_lock;
 mod check_host;
@@ -4763,11 +4764,29 @@ fn stage_input_closure(
     // SRC_OVERRIDE source) pass through unchanged. The on-disk half rides through
     // closure.txt, so a later `td-builder check` of this drv stages the dep with no
     // extra argument.
+    // The build root binds straight from the seed store it was assembled into:
+    // copying 400 MB into each run's td-store would buy nothing, since the
+    // sandbox NAR-verifies the bytes against the pinned tree either way.
+    let build_root = parsed
+        .env
+        .iter()
+        .find(|(k, _)| k == "TD_BUILD_ROOT")
+        .map(|(_, v)| v.as_str());
     let closure: Vec<String> = closure
         .into_iter()
         .map(|e| {
             if e.contains('\t') {
                 return e;
+            }
+            if build_root == Some(e.as_str()) {
+                let base = e.rsplit('/').next().unwrap_or(e.as_str());
+                let placed = seed_store_dirs
+                    .iter()
+                    .map(|dir| Path::new(dir).join(base))
+                    .find(|path| path.is_dir());
+                if let Some(on_disk) = placed {
+                    return format!("{e}\t{}", on_disk.display());
+                }
             }
             if let Some(ts) = td_store {
                 // Re-key by BASENAME (store hashes are unique), so a seed staging-store that holds BOTH
@@ -4962,6 +4981,13 @@ fn realize_drv(
                     r.store_path
                 ));
             }
+        }
+    }
+    // A build-root output keeps nothing of the root: no reference to its store
+    // path, and no ELF interpreter or RUNPATH outside the store (build_root.rs).
+    if let Some((_, root)) = parsed.env.iter().find(|(k, _)| k == "TD_BUILD_ROOT") {
+        for r in &regs {
+            build_root::check_output(root, &r.store_path, &r.refs, &scratch.join("newstore"))?;
         }
     }
     // td OWNS the store record of its build: write a td store-db registering the
@@ -6020,6 +6046,22 @@ fn assemble_recipe_drv(
             "recipe: `cargoLock' requires the exact committed lock staged in TD_VENDOR_DIR".into(),
         );
     }
+    // The Debian build root (build_root.rs): staged as an input-src so it is in
+    // the closure and the hash, named to the sandbox by TD_BUILD_ROOT, and
+    // never entered into TD_INPUTS or the input map, so no `{in:...}` reaches it.
+    let build_root = match alist.get("buildRoot") {
+        None => None,
+        Some(json::Json::Str(root)) if root == "debian" && build_system == "mesboot" => {
+            Some(build_root::store_path(&build_root::lock()?)?)
+        }
+        Some(json::Json::Str(root)) if root == "debian" => {
+            return Err(format!(
+                "recipe: buildSystem \"{build_system}\" cannot build in the build root; \
+                 only explicit mesboot steps can"
+            ))
+        }
+        Some(_) => return Err("recipe: `buildRoot' must be \"debian\"".into()),
+    };
     let foreign_source = foreign_source_of(name, &alist)?;
     let phase_runner = match build_system {
         "gnu" => "autotools-build",
@@ -6277,6 +6319,10 @@ fn assemble_recipe_drv(
     // `*.crate`, staged as an input-src; run_rust vendors from it (TD_VENDOR_DIR set below).
     if let Some(vd) = vendor_dir {
         push_drv_field(&mut spec, "input-src", vd)?;
+    }
+    if let Some(root) = &build_root {
+        push_drv_field(&mut spec, "input-src", root)?;
+        push_drv_env(&mut spec, "TD_BUILD_ROOT", root)?;
     }
     if !source.is_empty() {
         push_drv_env(&mut spec, "TD_SRC", &source)?;
@@ -6910,6 +6956,7 @@ fn build_plan(
     if let Some(db) = root_db {
         td_dbs.push((db.to_string(), sandbox::InputOrigin::AuditedSeed));
     }
+    let mut build_root_admitted = false;
     let store_prefix = store::store_dir();
 
     for raw in plan.lines() {
@@ -6936,6 +6983,18 @@ fn build_plan(
             .ok_or_else(|| format!("recipe {recipe_json}: no name"))?;
         let step_scratch = scratch.join(name);
         std::fs::create_dir_all(&step_scratch).map_err(|e| e.to_string())?;
+        // A build-root step's root is vouched by its own db beside the seed db,
+        // authenticated against the compiled lock and typed BuildRoot — admitted
+        // once, by the first step that declares it.
+        if alist.get("buildRoot").is_some() && !build_root_admitted {
+            let db = build_root::db_path(Path::new(seed_db), &build_root::lock()?)?;
+            build_root::authenticate_db(&db, Path::new(seed_store))?;
+            td_dbs.push((
+                db.to_string_lossy().into_owned(),
+                sandbox::InputOrigin::BuildRoot,
+            ));
+            build_root_admitted = true;
+        }
         // Whole-step wall clock (TD_TIMING): the per-rung total the user sees ticking by, so a
         // recipe {name} phase breakdown can be compared against its step {name} total.
         let _step_t = timed(format!("step {name}"));
@@ -12002,6 +12061,17 @@ fn main() -> ExitCode {
         // were built under. bootstrap-root verify SEED-STORE ROOT-DB —
         // authenticate an admitted root. bootstrap-root abi — the effective
         // ABI revision. See bootstrap_root.rs.
+        // build-root assemble SOURCES SEED-STORE SEED-DB — place the pinned
+        // Debian build root and its db. build-root pin SOURCES LOCK WORK —
+        // write the assembled tree's hash into the lock. build-root path —
+        // print its store path. See build_root.rs.
+        Some("build-root") => match build_root::run(args.get(2..).unwrap_or_default()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("td-builder: build-root: {e}");
+                ExitCode::FAILURE
+            }
+        },
         Some("bootstrap-root") => match run_bootstrap_root(args.get(2..).unwrap_or_default()) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
@@ -19134,6 +19204,53 @@ daemon build START (2/2 active)
             assemble_recipe_drv(recipe, lock.to_str().unwrap(), &dir, None).unwrap();
         assert_eq!(source, "", "make-test has no source (none declared)");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn assemble_recipe_drv_stages_a_declared_build_root_outside_the_input_map() {
+        let _dir_cleanup = crate::test_temp::TempDir::new("td-build-root-drv").unwrap();
+        let dir = _dir_cleanup.join("fixture");
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = dir.join("hello.lock");
+        let make = "/td/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-make-4.4.1-x86_64";
+        std::fs::write(&lock, format!("make-x86-64 {make} td-recipe-output\n")).unwrap();
+        let recipe = |extra: &str, system: &str| {
+            format!(
+                r#"{{"name":"hello","version":"1.0","buildSystem":"{system}","nativeInputs":["make-x86-64"]{extra},"steps":[]}}"#
+            )
+        };
+        let assemble = |json: &str| assemble_recipe_drv(json, lock.to_str().unwrap(), &dir, None);
+        let root = build_root::store_path(&build_root::lock().unwrap()).unwrap();
+        let (plain, _, plain_drv, _) = assemble(&recipe("", "mesboot")).unwrap();
+        let (rooted, _, drv, _) = assemble(&recipe(r#","buildRoot":"debian""#, "mesboot")).unwrap();
+        assert_ne!(plain, rooted, "the root is part of the derivation");
+        let env = |d: &drv::Derivation, key: &str| {
+            d.env.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+        };
+        assert_eq!(env(&drv, "TD_BUILD_ROOT"), Some(root.clone()));
+        assert!(drv.input_srcs.contains(&root));
+        let inputs = env(&drv, "TD_INPUTS").unwrap_or_default();
+        assert!(inputs.contains(make), "{inputs}");
+        assert!(!inputs.contains(&root), "the root is not a tool input");
+        assert_eq!(env(&plain_drv, "TD_BUILD_ROOT"), None);
+        assert!(!plain_drv.input_srcs.contains(&root));
+        for (json, why) in [
+            (
+                recipe(r#","buildRoot":"debian""#, "gnu"),
+                "cannot build in the build root",
+            ),
+            (
+                recipe(r#","buildRoot":"alpine""#, "mesboot"),
+                "must be \"debian\"",
+            ),
+            (
+                recipe(r#","buildRoot":true"#, "mesboot"),
+                "must be \"debian\"",
+            ),
+        ] {
+            let error = assemble(&json).unwrap_err();
+            assert!(error.contains(why), "{error}");
+        }
     }
 
     // #429 code-review fix (CONFIRMED finding): a mesboot recipe that DOES declare a

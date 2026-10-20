@@ -4414,6 +4414,25 @@ impl RecipeCheckRunner {
         self.store_add_recursive_into(name, src, &self.db)
     }
 
+    /// Place the pinned Debian build root in the seed store, with its db
+    /// beside the seed db where `build-plan` looks for it. td-builder
+    /// assembles it from the warm pins once and authenticates it after.
+    fn ensure_build_root(&self) -> Result<String, String> {
+        let mut cmd = self.builder_command();
+        cmd.arg("build-root")
+            .arg("assemble")
+            .arg(path_str(self.sources_dir())?)
+            .arg(path_str(&self.store)?)
+            .arg(path_str(&self.db)?);
+        let out = command_output(&mut cmd, "build-root assemble")?;
+        out.lines()
+            .rev()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| "build-root assemble produced no path".to_string())
+    }
+
     fn store_add_recursive_into(
         &self,
         name: &str,
@@ -4523,6 +4542,9 @@ impl RecipeCheckRunner {
             rooted |= matches!(input, SeedInput::BootstrapRoot { .. });
             let derived = self.ensure_seed_input(&input)?;
             entries.push((input.key().to_string(), derived));
+        }
+        if nodes.iter().any(|node| node.recipe.build_root) {
+            self.ensure_build_root()?;
         }
         if let Ok(mut set) = self.rooted.lock() {
             if rooted {

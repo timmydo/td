@@ -53,6 +53,9 @@ pub mod application_spec;
 pub mod bootstrap_root;
 pub mod cpio;
 pub mod crc32;
+// `debian_root` parses recipes/src/debian-root.lock: td-recipe-eval lists
+// its pins, td-builder assembles and admits the root against it.
+pub mod debian_root;
 pub mod ed25519;
 pub mod launcher;
 pub mod ostree;

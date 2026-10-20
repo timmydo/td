@@ -9,6 +9,9 @@
 # and review the diff. The resolver rewrites only the lines below its
 # `# resolved` marker. `td-recipe-eval build-root-pins` lists the `layer`
 # and `deb` rows, which `td-feed warm build-root` caches in ~/.td/sources.
+# A re-resolve drops the `tree` row; after rebuilding td-builder, run
+#   td-builder build-root pin ~/.td/sources recipes/src/debian-root.lock WORK
+# to write the assembled tree's NAR hash back, which assembly then requires.
 #
 # `want` is the C build tool set: the kernel needs gcc, make, flex, bison,
 # bc, libelf-dev and rsync; cryptsetup's json-c needs cmake; the rest serve
@@ -121,3 +124,4 @@ deb debian-root-rpcsvc-proto rpcsvc-proto_1.4.3-1_amd64.deb 32ac0692694f8a34cc90
 deb debian-root-rsync rsync_3.5.0+ds1-0+deb13u1_amd64.deb 4e7c9ceffc110e23e91177811fb02c7033b161d327f696f1b8f2f57d2edb92c5 501964 https://snapshot.debian.org/archive/debian-security/20261005T000000Z/pool/updates/main/r/rsync/rsync_3.5.0+ds1-0+deb13u1_amd64.deb 3.5.0+ds1-0+deb13u1
 deb debian-root-xz-utils xz-utils_5.8.1-1+deb13u1_amd64.deb 9e0a39d95373afdaad3c9dfaab3c8b0beb9a2c4654e6be10b4bcf458509a3217 659488 https://snapshot.debian.org/archive/debian/20261005T000000Z/pool/main/x/xz-utils/xz-utils_5.8.1-1+deb13u1_amd64.deb 5.8.1-1+deb13u1
 deb debian-root-zlib1g-dev zlib1g-dev_1.3.dfsg+really1.3.1-1+b1_amd64.deb 76ed5c858e1aef38b7be93acce5910e457e77bd6271471b9d05fb42e78826224 919744 https://snapshot.debian.org/archive/debian/20261005T000000Z/pool/main/z/zlib/zlib1g-dev_1.3.dfsg+really1.3.1-1+b1_amd64.deb 1:1.3.dfsg+really1.3.1-1+b1
+tree sha256:bb20e48de3bf414cdfb140dea8875810d4cfa992712ca789d588b6fbc8d02262

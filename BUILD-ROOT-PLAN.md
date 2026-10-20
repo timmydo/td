@@ -88,12 +88,20 @@ deleted; its findings are summarized under "Facts" below.
    `source-pins` never return; `td-recipe-eval build-root-pins` lists
    them and `td-feed warm build-root` caches them. The lock is a
    `PIN_TABLES` entry, so a re-pin re-keys every check.
-3. **Build-root input class.** td-builder unpacks layer (whiteouts) +
-   .debs in lock order + fixups, applies the slim path-excludes, refuses
-   writes through symlinks, flattens ownership, caches the tree by lock
-   hash, and runs a recipe with it as `/`. Marked; ordinary channels
-   refuse it; closure scan forbids references. **AGENTS.md trust-zone
-   amendment lands here.** Test: hello.c recipe.
+3. **Build-root input class.** `td-builder build-root assemble` unpacks
+   the layer (refusing whiteouts) and each .deb's `data.tar.xz` in lock
+   order, writes through the usrmerge links only, drops the slim
+   excludes, adds the update-alternatives links, and places the tree at
+   an input-addressed store path keyed by the pins and the pinned tree;
+   `build-root pin` writes its NAR hash into the lock, and assembly
+   refuses any other tree. `Recipe::build_root()` stages it outside the
+   input map; the sandbox binds it read-only as `/` (typed `BuildRoot`,
+   never a builder); an output may not reference it or carry an ELF
+   interpreter/RUNPATH or a symlink that resolves outside the store. Only
+   `build-plan` (the check runner's path) admits the root's db; the
+   daemon and `build-recipe` fail closed on a build-root drv until a
+   later increment needs them. AGENTS.md and UNSAFE.md amended. Test:
+   `build-root-hello-test` (freestanding C compiled and run in the root).
 4. **Kernel in the build root.** `linux-x86-64` uses the 49-package
    subset. Deletes the bc, flex and elfutils recipes. Integration tier
    run by hand before push (boot path).
