@@ -149,12 +149,12 @@ fn random_hex(bytes: usize) -> Result<String> {
     Ok(value.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-fn protected_input(path: &Path, limit: u64) -> Result<Vec<u8>> {
+pub(super) fn protected_input(path: &Path, limit: u64) -> Result<Vec<u8>> {
     trusted_ancestors(path.parent().ok_or("missing input parent")?)?;
     read_private_input(path, limit)
 }
 
-fn trusted_ancestors(path: &Path) -> Result<()> {
+pub(super) fn trusted_ancestors(path: &Path) -> Result<()> {
     if !path.is_absolute() {
         return Err("private paths must be absolute".into());
     }
@@ -202,7 +202,7 @@ fn read_private_input(path: &Path, limit: u64) -> Result<Vec<u8>> {
     Ok(data)
 }
 
-fn command(program: &Path) -> Command {
+pub(super) fn command(program: &Path) -> Command {
     let mut cmd = Command::new(program);
     crate::sandbox::die_with_parent(&mut cmd);
     for (key, _) in std::env::vars_os() {

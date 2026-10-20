@@ -375,8 +375,9 @@ controls and their bounded recovery semantics.
 ## Database backup and recovery
 
 Use PostgreSQL backup and recovery tooling for the database and retain its
-required connection/bootstrap material. There is no td-mta local backup or
-restore command. POSTGRES.md owns maintenance, restored-epoch and uncertain
+required connection/bootstrap material. The host installer can run bounded
+logical backups; the mail daemon has no restore command. POSTGRES.md owns
+maintenance, restored-epoch and uncertain
 external-delivery constraints; recovery activation remains separate work.
 Neither a historical audit report nor copying a local runtime/scratch
 directory is a database backup or recovery authorization.
@@ -430,6 +431,53 @@ release. `pg_dump` does not include cluster roles, server configuration,
 bootstrap files or mail accepted after its snapshot. A restored device
 verifier cannot reconstruct the client password. Keeping these files beside
 a dump is convenient, but an independently recoverable copy is still needed.
+
+### Bounded local backups
+
+The host installer also provides a bounded logical backup command. Provision
+PostgreSQL 17 `pg_dump` and `pg_restore` on PATH, the private libpq service and
+password files described above, and an existing owned mode-0700 destination
+with trusted physical parent directories. Then run:
+
+```sh
+./install-td-mta --backup \
+  --service-file /home/alice/.config/td-mta/backup.pg_service.conf \
+  --service td-mta-backup --destination /home/alice/mail-backups
+```
+
+A retained host builder can run the same operation without compiling:
+`/absolute/td-builder install-td-mta --backup ...`. This is host control-plane
+backup orchestration, not a target distribution executable or a database
+restore command. The operator's service selection controls which database is
+backed up; use the owner login and verified local PostgreSQL TLS.
+
+Defaults retain at most 30 completed archives, cap each archive at 1 GiB and
+cap total directory bytes at 8 GiB. Override these with `--retain`,
+`--max-archive-bytes` and `--max-total-bytes`. The total must accommodate two
+maximum-size archives plus 64 KiB of bounded receipts and diagnostics. A
+private advisory lock excludes concurrent runs. Old completed archives are
+pruned to admit the next attempt, but the newest completed archive is never
+removed to make an attempt fit. Unknown regular files consume the budget;
+links, non-private files and more than 4096 directory entries refuse a run.
+Admission also reserves four entries for scratch, diagnostics and publication;
+creating the lock cannot exceed the directory ceiling.
+These are byte-count admission bounds, not filesystem block quotas.
+
+Each PostgreSQL tool has a ten-minute deadline; its streamed output is capped
+before being written. Failed tool diagnostics retain only the first 16 KiB
+in private `last-error`; normal terminal output never includes their content.
+The dump is published under a new filename only after `pg_restore --list`
+succeeds, with a JSON receipt containing timestamp, archive bytes, SHA-256
+and both tool versions. This checks the archive directory, not a full
+restore; the receipt explicitly records `restored: false`. The next locked
+run removes interrupted scratch in the command's reserved `backup-N-N`
+namespace. Do not put operator files in that namespace.
+
+A failed attempt returns nonzero and preserves the newest completed archive.
+Schedule with a supervisor that records failures and inspect backup age as
+well as exit status. Local retention alone does not protect against disk
+loss. Retain protected bootstrap material separately and perform isolated
+restore drills before treating the backup as recoverable.
 
 A drill restores into a fresh cluster with no TCP listener and a private Unix
 socket. Use absolute paths without whitespace for this example's `pg_ctl -o`
