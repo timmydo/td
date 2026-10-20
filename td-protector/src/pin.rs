@@ -824,7 +824,7 @@ mod tests {
         }
 
         #[test]
-        #[ignore = "needs TD_TEST_SWTPM, the pinned swtpm 0.10.1"]
+        #[ignore = "needs the pinned swtpm 0.10.1 on PATH"]
         fn emulator_tpm_pin_policy_digest_and_chain_check() {
             let tpm = Emulator::start(&fresh_state("pin"));
             // The TPM computes the pinned literals itself.

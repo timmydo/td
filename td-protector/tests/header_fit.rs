@@ -7,8 +7,8 @@
 //! provide.
 //!
 //! ```text
-//! TD_TEST_CRYPTSETUP=/absolute/path/to/cryptsetup cargo test --frozen \
-//!   --manifest-path td-protector/Cargo.toml --test header_fit -- --ignored
+//! cargo test --frozen --manifest-path td-protector/Cargo.toml \
+//!   --test header_fit -- --ignored
 //! ```
 #![allow(
     clippy::unwrap_used,
@@ -52,10 +52,11 @@ fn scratch(name: &str) -> TempDir {
     TempDir::new(&format!("td-protector-header-fit-{name}")).unwrap()
 }
 
-fn tool() -> Option<Cryptsetup> {
-    let path = PathBuf::from(std::env::var_os("TD_TEST_CRYPTSETUP")?);
-    assert!(path.is_absolute(), "TD_TEST_CRYPTSETUP must be absolute");
-    Some(Cryptsetup::new(path))
+#[path = "support/pinned_cryptsetup.rs"]
+mod pinned_cryptsetup;
+
+fn tool() -> Cryptsetup {
+    Cryptsetup::new(pinned_cryptsetup::path())
 }
 
 /// A td-formatted volume on a 20 MiB file: keyslot 0 the recovery key.
@@ -185,11 +186,9 @@ fn later_tokens() -> Vec<String> {
 /// token beside them, then 8i's tokens. td's reader reads the header
 /// before the last two, which it does not know yet.
 #[test]
-#[ignore = "needs TD_TEST_CRYPTSETUP and the kernel's AF_ALG"]
+#[ignore = "needs the pinned cryptsetup on PATH and the kernel's AF_ALG"]
 fn the_largest_protected_header_fits() {
-    let Some(cs) = tool() else {
-        panic!("TD_TEST_CRYPTSETUP names no cryptsetup");
-    };
+    let cs = tool();
     let dir = scratch("protected");
     let image = format(&cs, dir.path());
     for slot in 26..=31 {
@@ -265,11 +264,9 @@ fn reencrypt_init(cs: &Cryptsetup, image: &Path, resilience: &[&str]) {
 /// segments and second digest by `reencrypt --init-only`. td's reader
 /// reads it as an upgrading header, as cryptsetup's metadata dump does.
 #[test]
-#[ignore = "needs TD_TEST_CRYPTSETUP and the kernel's AF_ALG"]
+#[ignore = "needs the pinned cryptsetup on PATH and the kernel's AF_ALG"]
 fn a_u2_header_reads_as_upgrading() {
-    let Some(cs) = tool() else {
-        panic!("TD_TEST_CRYPTSETUP names no cryptsetup");
-    };
+    let cs = tool();
     let dir = scratch("u2-read");
     let image = format(&cs, dir.path());
     for id in 0..4 {
@@ -291,9 +288,7 @@ fn a_u2_header_reads_as_upgrading() {
 /// holds, then `reencrypt --init-only`, after which cryptsetup refuses a
 /// token import.
 fn upgrading_u2(name: &str, resilience: &[&str], expected: usize) {
-    let Some(cs) = tool() else {
-        panic!("TD_TEST_CRYPTSETUP names no cryptsetup");
-    };
+    let cs = tool();
     let dir = scratch(name);
     let image = format(&cs, dir.path());
     let mut id = 19;
@@ -330,7 +325,7 @@ fn upgrading_u2(name: &str, resilience: &[&str], expected: usize) {
 }
 
 #[test]
-#[ignore = "needs TD_TEST_CRYPTSETUP and the kernel's AF_ALG"]
+#[ignore = "needs the pinned cryptsetup on PATH and the kernel's AF_ALG"]
 fn the_largest_u2_header_fits_in_journal_resilience() {
     upgrading_u2(
         "u2-journal",
@@ -340,7 +335,7 @@ fn the_largest_u2_header_fits_in_journal_resilience() {
 }
 
 #[test]
-#[ignore = "needs TD_TEST_CRYPTSETUP and the kernel's AF_ALG"]
+#[ignore = "needs the pinned cryptsetup on PATH and the kernel's AF_ALG"]
 fn the_largest_u2_header_fits_in_checksum_resilience() {
     upgrading_u2(
         "u2-checksum",
@@ -374,11 +369,9 @@ fn resume_offline(cs: &Cryptsetup, image: &Path) {
 /// keyslot added at a two-digit number, and the reencryption's
 /// initialization in both resilience modes.
 #[test]
-#[ignore = "needs TD_TEST_CRYPTSETUP and the kernel's AF_ALG"]
+#[ignore = "needs the pinned cryptsetup on PATH and the kernel's AF_ALG"]
 fn the_upgrade_growth_bounds_hold() {
-    let Some(cs) = tool() else {
-        panic!("TD_TEST_CRYPTSETUP names no cryptsetup");
-    };
+    let cs = tool();
     let dir = scratch("growth-keyslot");
     let image = format(&cs, dir.path());
     let before = json_len(&image);
@@ -457,11 +450,9 @@ fn run_step(cs: &Cryptsetup, image: &Path, step: &Step, interrupt: bool) {
 /// 1 KiB, so a retry is never refused for size; phase 1's own header is
 /// within it, and reads as U0.
 #[test]
-#[ignore = "needs TD_TEST_CRYPTSETUP and the kernel's AF_ALG"]
+#[ignore = "needs the pinned cryptsetup on PATH and the kernel's AF_ALG"]
 fn the_largest_phase_one_header_fits() {
-    let Some(cs) = tool() else {
-        panic!("TD_TEST_CRYPTSETUP names no cryptsetup");
-    };
+    let cs = tool();
     let dir = scratch("phase-one");
     let image = format(&cs, dir.path());
     add_keyslot(&cs, &image, 31);
@@ -516,11 +507,9 @@ fn the_largest_phase_one_header_fits() {
 /// a header of the shape the protected planner admits, its volume key
 /// rotated, every protector opening its keyslot and a wrong key refused.
 #[test]
-#[ignore = "needs TD_TEST_CRYPTSETUP and the kernel's AF_ALG"]
+#[ignore = "needs the pinned cryptsetup on PATH and the kernel's AF_ALG"]
 fn the_upgrade_runs_over_cryptsetup_headers() {
-    let Some(cs) = tool() else {
-        panic!("TD_TEST_CRYPTSETUP names no cryptsetup");
-    };
+    let cs = tool();
     for (shape, resilience, interrupt) in [
         (Shape::Tpm, Resilience::Checksum, false),
         (Shape::Tpm, Resilience::Journal, true),
@@ -659,11 +648,9 @@ fn the_upgrade_runs_over_cryptsetup_headers() {
 /// recovery key, though the rewrapped keyslot still holds it: the
 /// planner's U2 can only offer the resumption again.
 #[test]
-#[ignore = "needs TD_TEST_CRYPTSETUP and the kernel's AF_ALG"]
+#[ignore = "needs the pinned cryptsetup on PATH and the kernel's AF_ALG"]
 fn a_cut_inside_cryptsetups_last_commits_cannot_resume() {
-    let Some(cs) = tool() else {
-        panic!("TD_TEST_CRYPTSETUP names no cryptsetup");
-    };
+    let cs = tool();
     let dir = scratch("finishing");
     let image = format(&cs, dir.path());
     reencrypt_init_only(&cs, &image, 0, Resilience::Journal);

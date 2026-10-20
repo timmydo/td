@@ -478,16 +478,20 @@ pub(crate) mod tests {
             std::fs::create_dir_all(state).unwrap();
             let socket = state.join("socket");
             let _ = std::fs::remove_file(&socket);
-            let executable = std::env::var_os("TD_TEST_SWTPM")
-                .expect("set TD_TEST_SWTPM to pinned swtpm 0.10.1");
-            let version = Command::new(&executable).arg("--version").output().unwrap();
-            assert!(version.status.success());
+            // The spawn searches PATH itself; NotFound is "not on PATH".
+            let version = match Command::new("swtpm").arg("--version").output() {
+                Ok(version) => version,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    panic!("swtpm not found on PATH; the oracle needs swtpm 0.10.1")
+                }
+                Err(e) => panic!("swtpm --version: {e}"),
+            };
+            let stdout = String::from_utf8_lossy(&version.stdout);
             assert!(
-                String::from_utf8_lossy(&version.stdout)
-                    .starts_with("TPM emulator version 0.10.1,"),
-                "oracle requires swtpm 0.10.1"
+                version.status.success() && stdout.starts_with("TPM emulator version 0.10.1,"),
+                "the swtpm on PATH is not swtpm 0.10.1: {stdout}"
             );
-            let child = Command::new(executable)
+            let child = Command::new("swtpm")
                 .args(["socket", "--tpm2", "--tpmstate"])
                 .arg(format!("dir={},mode=0600", state.display()))
                 .arg("--server")
@@ -1104,7 +1108,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    #[ignore = "requires explicitly supplied pinned host swtpm; never accesses hardware"]
+    #[ignore = "requires the pinned swtpm 0.10.1 on PATH; never accesses hardware"]
     fn emulator_metadata_binding_survives_restart_and_refuses_substitution() {
         struct Directory(PathBuf);
         impl Drop for Directory {
@@ -1179,7 +1183,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    #[ignore = "requires explicitly supplied pinned host swtpm; never accesses hardware"]
+    #[ignore = "requires the pinned swtpm 0.10.1 on PATH; never accesses hardware"]
     fn emulator_es256_verifies_mutations_and_retires_handles() {
         let root = std::env::temp_dir().join(format!("td-es256-oracle-{}", std::process::id()));
         assert!(!root.exists());
@@ -1206,7 +1210,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    #[ignore = "requires explicitly supplied pinned host swtpm; never accesses hardware"]
+    #[ignore = "requires the pinned swtpm 0.10.1 on PATH; never accesses hardware"]
     fn emulator_seals_reboots_and_refuses_changed_platform_or_tpm() {
         let root = std::env::temp_dir().join(format!("td-tpm-oracle-{}", std::process::id()));
         assert!(!root.exists());
@@ -1421,7 +1425,7 @@ mod assertions {
     }
 
     #[test]
-    #[ignore = "requires explicitly supplied pinned host swtpm; never accesses hardware"]
+    #[ignore = "requires the pinned swtpm 0.10.1 on PATH; never accesses hardware"]
     fn emulator_assertion_binds_challenge_extensions_and_signature() {
         // Independently signed using host OpenSSL 3.5.7; no private key or runtime dependency.
         let key = Es256PublicKey::from_cose(&cose()).unwrap();
@@ -1521,7 +1525,7 @@ mod assertions {
     }
 
     #[test]
-    #[ignore = "requires explicitly supplied pinned host swtpm; never accesses hardware"]
+    #[ignore = "requires the pinned swtpm 0.10.1 on PATH; never accesses hardware"]
     fn emulator_enrollment_requires_fresh_proof_under_the_created_key() {
         struct Directory(std::path::PathBuf);
         impl Drop for Directory {

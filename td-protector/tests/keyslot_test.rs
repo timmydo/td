@@ -8,8 +8,8 @@
 //! and skcipher interfaces.
 //!
 //! ```text
-//! TD_TEST_CRYPTSETUP=/absolute/path/to/cryptsetup cargo test --frozen \
-//!   --manifest-path td-protector/Cargo.toml --test keyslot_test -- --ignored
+//! cargo test --frozen --manifest-path td-protector/Cargo.toml \
+//!   --test keyslot_test -- --ignored
 //! ```
 #![allow(
     clippy::unwrap_used,
@@ -51,12 +51,11 @@ fn scratch(name: &str) -> Scratch {
     Scratch(dir)
 }
 
+#[path = "support/pinned_cryptsetup.rs"]
+mod pinned_cryptsetup;
+
 fn tool() -> Cryptsetup {
-    let Some(path) = std::env::var_os("TD_TEST_CRYPTSETUP").map(PathBuf::from) else {
-        panic!("TD_TEST_CRYPTSETUP names no cryptsetup");
-    };
-    assert!(path.is_absolute(), "TD_TEST_CRYPTSETUP must be absolute");
-    Cryptsetup::new(path)
+    Cryptsetup::new(pinned_cryptsetup::path())
 }
 
 fn import(cs: &Cryptsetup, image: &Path, id: u8, token: &Token) {
@@ -178,13 +177,13 @@ fn untouched(damaged: bool) {
 }
 
 #[test]
-#[ignore = "needs TD_TEST_CRYPTSETUP and the kernel's AF_ALG"]
+#[ignore = "needs the pinned cryptsetup on PATH and the kernel's AF_ALG"]
 fn a_detached_test_leaves_a_volume_with_a_stale_second_copy_unchanged() {
     untouched(false);
 }
 
 #[test]
-#[ignore = "needs TD_TEST_CRYPTSETUP and the kernel's AF_ALG"]
+#[ignore = "needs the pinned cryptsetup on PATH and the kernel's AF_ALG"]
 fn a_detached_test_leaves_a_volume_with_a_damaged_second_copy_unchanged() {
     untouched(true);
 }
@@ -194,7 +193,7 @@ fn a_detached_test_leaves_a_volume_with_a_damaged_second_copy_unchanged() {
 /// new file beside the copy. It reproduces the key the volume itself
 /// dumps, through either keyslot, and refuses a name that exists.
 #[test]
-#[ignore = "needs TD_TEST_CRYPTSETUP and the kernel's AF_ALG"]
+#[ignore = "needs the pinned cryptsetup on PATH and the kernel's AF_ALG"]
 fn a_dump_of_a_header_copy_gives_the_volumes_key() {
     let cs = tool();
     let dir = scratch("dump");

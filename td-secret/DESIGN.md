@@ -867,13 +867,15 @@ target graph. A host distribution's build of the same releases (swtpm
 same way, outside every td artifact. The oracles check only swtpm's
 `--version` line; swtpm reports no libtpms release (its `--print-info`
 names the TPM specification and firmware date, not the library), so the
-libtpms version is the operator's to match and is unchecked. Then run:
+libtpms version is the operator's to match and is unchecked. Put that
+swtpm first on `PATH` and run:
 
 ```
-TD_TEST_SWTPM=/absolute/path/to/swtpm cargo test --frozen --manifest-path td-secret/Cargo.toml emulator_ -- --ignored
+cargo test --frozen --manifest-path td-secret/Cargo.toml emulator_ -- --ignored
 ```
 
-The ignored tests require that explicit executable path, create fresh
+The ignored tests take the first `swtpm` on `PATH`, refuse one that is
+missing or not 0.10.1 quoting the version line it printed, create fresh
 emulator state and Unix sockets, and never open a hardware TPM. The
 emulator helper lives in td-secret's test module over td-tpm's public
 client, which td-firstboot and td-portal also compile; td-tpm has no

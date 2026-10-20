@@ -1,7 +1,7 @@
 //! The pinned-swtpm oracle for salted and PIN-authorized sessions and the
 //! lockout hierarchy, run as td-secret/DESIGN.md "TPM validation" runs
-//! td-secret's: `TD_TEST_SWTPM=/absolute/path/to/swtpm cargo test
-//! --manifest-path td-tpm/Cargo.toml emulator_ -- --ignored`.
+//! td-secret's, with swtpm 0.10.1 on PATH: `cargo test --manifest-path
+//! td-tpm/Cargo.toml emulator_ -- --ignored`.
 
 use super::*;
 use std::cell::RefCell;
@@ -61,11 +61,26 @@ struct Emulator {
     codes: Rc<RefCell<Vec<u32>>>,
 }
 
+/// Checks that the first `swtpm` on PATH is the pinned 0.10.1. The spawn
+/// itself searches PATH, so no lookup of td's is needed here.
+fn swtpm() -> &'static str {
+    let version = match Command::new("swtpm").arg("--version").output() {
+        Ok(version) => version,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            panic!("swtpm not found on PATH; the oracle needs swtpm 0.10.1")
+        }
+        Err(e) => panic!("swtpm --version: {e}"),
+    };
+    let stdout = String::from_utf8_lossy(&version.stdout);
+    assert!(
+        version.status.success() && stdout.starts_with("TPM emulator version 0.10.1,"),
+        "the swtpm on PATH is not swtpm 0.10.1: {stdout}"
+    );
+    "swtpm"
+}
+
 fn spawn(state: &Path, socket: &Path) -> Child {
-    let executable =
-        std::env::var_os("TD_TEST_SWTPM").expect("set TD_TEST_SWTPM to pinned swtpm 0.10.1");
-    let version = Command::new(&executable).arg("--version").output().unwrap();
-    assert!(String::from_utf8_lossy(&version.stdout).starts_with("TPM emulator version 0.10.1,"));
+    let executable = swtpm();
     let mut child = Command::new(executable)
         .args(["socket", "--tpm2", "--tpmstate"])
         .arg(format!("dir={},mode=0600", state.display()))
@@ -277,7 +292,7 @@ fn unseal(
 }
 
 #[test]
-#[ignore = "needs TD_TEST_SWTPM, the pinned swtpm 0.10.1"]
+#[ignore = "needs the pinned swtpm 0.10.1 on PATH"]
 fn emulator_seals_and_unseals_with_the_right_pin_in_a_salted_session() {
     let tpm = Emulator::start("pin");
     tpm.measure();
@@ -310,7 +325,7 @@ fn emulator_seals_and_unseals_with_the_right_pin_in_a_salted_session() {
 }
 
 #[test]
-#[ignore = "needs TD_TEST_SWTPM, the pinned swtpm 0.10.1"]
+#[ignore = "needs the pinned swtpm 0.10.1 on PATH"]
 fn emulator_counts_a_wrong_pin_across_a_restart() {
     let mut tpm = Emulator::start("wrong");
     tpm.measure();
@@ -352,7 +367,7 @@ fn emulator_counts_a_wrong_pin_across_a_restart() {
 }
 
 #[test]
-#[ignore = "needs TD_TEST_SWTPM, the pinned swtpm 0.10.1"]
+#[ignore = "needs the pinned swtpm 0.10.1 on PATH"]
 fn emulator_locks_out_after_32_wrong_pins_until_the_lockout_reset() {
     let mut tpm = Emulator::start("lockout");
     let auth = tpm.take(TD_PARAMETERS);
@@ -394,7 +409,7 @@ fn emulator_locks_out_after_32_wrong_pins_until_the_lockout_reset() {
 }
 
 #[test]
-#[ignore = "needs TD_TEST_SWTPM, the pinned swtpm 0.10.1"]
+#[ignore = "needs the pinned swtpm 0.10.1 on PATH"]
 fn emulator_takes_the_lockout_hierarchy_once_and_keeps_it_across_a_restart() {
     let mut tpm = Emulator::start("take");
     let name = tpm.primary_name();
@@ -444,7 +459,7 @@ fn emulator_takes_the_lockout_hierarchy_once_and_keeps_it_across_a_restart() {
 }
 
 #[test]
-#[ignore = "needs TD_TEST_SWTPM, the pinned swtpm 0.10.1"]
+#[ignore = "needs the pinned swtpm 0.10.1 on PATH"]
 fn emulator_sets_the_dictionary_attack_parameters_under_the_lockout_authorization() {
     let tpm = Emulator::start("parameters");
     let auth = tpm.take(TD_PARAMETERS);
@@ -490,7 +505,7 @@ fn da_bytes(values: DaParameters) -> Vec<u8> {
 }
 
 #[test]
-#[ignore = "needs TD_TEST_SWTPM, the pinned swtpm 0.10.1"]
+#[ignore = "needs the pinned swtpm 0.10.1 on PATH"]
 fn emulator_takeover_empties_a_lockout_policy_another_system_set() {
     let tpm = Emulator::start("policy");
     tpm.foreign_lockout_policy();
@@ -535,7 +550,7 @@ fn emulator_takeover_empties_a_lockout_policy_another_system_set() {
 }
 
 #[test]
-#[ignore = "needs TD_TEST_SWTPM, the pinned swtpm 0.10.1"]
+#[ignore = "needs the pinned swtpm 0.10.1 on PATH"]
 fn emulator_a_proof_repairs_a_take_interrupted_before_its_policy() {
     let tpm = Emulator::start("repair");
     tpm.foreign_lockout_policy();
@@ -558,7 +573,7 @@ fn emulator_a_proof_repairs_a_take_interrupted_before_its_policy() {
 }
 
 #[test]
-#[ignore = "needs TD_TEST_SWTPM, the pinned swtpm 0.10.1"]
+#[ignore = "needs the pinned swtpm 0.10.1 on PATH"]
 fn emulator_refuses_a_wrong_lockout_authorization_until_lockout_recovery() {
     let tpm = Emulator::start("wrong-lockout");
     // lockoutRecovery in seconds: the refusals below must land inside it.
@@ -614,7 +629,7 @@ fn emulator_refuses_a_wrong_lockout_authorization_until_lockout_recovery() {
 }
 
 #[test]
-#[ignore = "needs TD_TEST_SWTPM, the pinned swtpm 0.10.1"]
+#[ignore = "needs the pinned swtpm 0.10.1 on PATH"]
 fn emulator_clears_the_tpm_under_the_lockout_authorization() {
     let tpm = Emulator::start("clear");
     tpm.measure();
@@ -670,7 +685,7 @@ fn emulator_clears_the_tpm_under_the_lockout_authorization() {
 }
 
 #[test]
-#[ignore = "needs TD_TEST_SWTPM, the pinned swtpm 0.10.1"]
+#[ignore = "needs the pinned swtpm 0.10.1 on PATH"]
 fn emulator_refuses_a_changed_chain_and_a_closed_cap_without_counting() {
     let mut tpm = Emulator::start("chain");
     tpm.measure();
@@ -707,7 +722,7 @@ fn emulator_refuses_a_changed_chain_and_a_closed_cap_without_counting() {
 }
 
 #[test]
-#[ignore = "needs TD_TEST_SWTPM, the pinned swtpm 0.10.1"]
+#[ignore = "needs the pinned swtpm 0.10.1 on PATH"]
 fn emulator_refuses_a_fresh_tpm_and_another_primary_before_seal_or_unseal() {
     let first = Emulator::start("first");
     first.measure();

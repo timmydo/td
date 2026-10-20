@@ -1620,7 +1620,7 @@ cap, the next boot's release after a restart, a changed selector image
 refused at Unseal, and a fresh TPM state's Load refusal (0x1df):
 
 ```
-TD_TEST_SWTPM=/absolute/path/to/swtpm cargo test --frozen --manifest-path td-protector/Cargo.toml emulator_ -- --ignored
+cargo test --frozen --manifest-path td-protector/Cargo.toml emulator_ -- --ignored
 ```
 
 PIN tests pin the codec's bounds (0, 5, 6, 63 and 64 bytes, the length
@@ -1830,7 +1830,7 @@ commits, keyslot 0 killed after an initialization, which no resumption
 opens:
 
 ```
-TD_TEST_CRYPTSETUP=/absolute/path/to/cryptsetup cargo test --frozen --manifest-path td-protector/Cargo.toml --test header_fit -- --ignored
+cargo test --frozen --manifest-path td-protector/Cargo.toml --test header_fit -- --ignored
 ```
 
 The keyslot test (`tests/keyslot_test.rs`) runs the same cryptsetup
@@ -1844,11 +1844,14 @@ is not, which is cryptsetup's repair landing there. Naming the volume
 as `--header` changes it, for a wrong key too:
 
 ```
-TD_TEST_CRYPTSETUP=/absolute/path/to/cryptsetup cargo test --frozen --manifest-path td-protector/Cargo.toml --test keyslot_test -- --ignored
+cargo test --frozen --manifest-path td-protector/Cargo.toml --test keyslot_test -- --ignored
 ```
 
 Both need the host kernel's AF_ALG hash and skcipher interfaces and no
 privilege; a regular file serves as the data device, with no loop. The
 cryptsetup is the `cryptsetup-x86-64` recipe's output,
 `bin/cryptsetup.static` under the path `td-recipe-eval build-run
-cryptsetup-x86-64` prints.
+cryptsetup-x86-64` prints. They take the first `cryptsetup` on `PATH`,
+with no sbin fallback, so put that output on `PATH` under that name,
+ahead of any other; with none there, or one whose `--version` is not
+2.8.8, they fail saying so.

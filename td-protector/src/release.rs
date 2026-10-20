@@ -1926,7 +1926,7 @@ mod tests {
     /// verification, cap and transition, the TPM's refusal after the cap,
     /// the next boot's release, a changed boot chain, and a cleared TPM.
     #[test]
-    #[ignore = "needs TD_TEST_SWTPM, the pinned swtpm 0.10.1"]
+    #[ignore = "needs the pinned swtpm 0.10.1 on PATH"]
     fn emulator_release_runs_the_first_boot_transition_and_then_releases() {
         use crate::tests::emulator::{fresh_state, Emulator, Socket};
         struct Swtpm(Emulator);

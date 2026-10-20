@@ -365,9 +365,9 @@ its session and primary flushed, Clear's `TPM_RC_DISABLED` typed and
 another command's not, and an authorization code from a command before
 the lockout one not typed as the lockout's.
 
-Ignored oracles against the pinned swtpm 0.10.1 (`emulator_tests.rs`:
-`TD_TEST_SWTPM=/absolute/path/to/swtpm cargo test --manifest-path
-td-tpm/Cargo.toml emulator_ -- --ignored`) seal and unseal with the
+Ignored oracles against the pinned swtpm 0.10.1, the first `swtpm` on
+`PATH` (`emulator_tests.rs`: `cargo test --manifest-path
+td-tpm/Cargo.toml emulator_ -- --ignored`), seal and unseal with the
 right PIN in a salted session; refuse a wrong PIN with 0x98e and raise
 the counter, which an orderly restart keeps, while a noDA object's wrong
 PIN is 0x9a2 and uncounted; lock out after 32 wrong PINs with 0x921,

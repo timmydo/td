@@ -1285,9 +1285,8 @@ mod tests {
     }
 
     /// The swtpm oracle, run as td-secret/DESIGN.md "TPM validation" runs
-    /// td-secret's: `TD_TEST_SWTPM=/absolute/path/to/swtpm cargo test
-    /// --frozen --manifest-path td-protector/Cargo.toml emulator_ --
-    /// --ignored`.
+    /// td-secret's, with swtpm 0.10.1 on PATH: `cargo test --frozen
+    /// --manifest-path td-protector/Cargo.toml emulator_ -- --ignored`.
     pub(crate) mod emulator {
         use super::*;
         use std::io::Write;
@@ -1333,17 +1332,27 @@ mod tests {
             ))
         }
 
+        /// The pinned swtpm 0.10.1, the first `swtpm` on PATH.
+        fn swtpm() -> PathBuf {
+            let Some(executable) = td_fs::executable_on_path("swtpm") else {
+                panic!("swtpm not found on PATH; the oracle needs swtpm 0.10.1");
+            };
+            let version = Command::new(&executable)
+                .arg("--version")
+                .output()
+                .unwrap_or_else(|e| panic!("{} --version: {e}", executable.display()));
+            let stdout = String::from_utf8_lossy(&version.stdout);
+            assert!(
+                version.status.success() && stdout.starts_with("TPM emulator version 0.10.1,"),
+                "{} is not swtpm 0.10.1: {stdout}",
+                executable.display()
+            );
+            executable
+        }
+
         /// swtpm on `state`, its socket inside it, once the socket exists.
         fn spawn(state: &Path, socket: &Path) -> Child {
-            let executable = std::env::var_os("TD_TEST_SWTPM")
-                .expect("set TD_TEST_SWTPM to pinned swtpm 0.10.1");
-            let version = Command::new(&executable).arg("--version").output().unwrap();
-            assert!(version.status.success());
-            assert!(
-                String::from_utf8_lossy(&version.stdout)
-                    .starts_with("TPM emulator version 0.10.1,"),
-                "oracle requires swtpm 0.10.1"
-            );
+            let executable = swtpm();
             let mut child = Command::new(executable)
                 .args(["socket", "--tpm2", "--tpmstate"])
                 .arg(format!("dir={},mode=0600", state.display()))
@@ -1413,7 +1422,7 @@ mod tests {
         }
 
         #[test]
-        #[ignore = "needs TD_TEST_SWTPM, the pinned swtpm 0.10.1"]
+        #[ignore = "needs the pinned swtpm 0.10.1 on PATH"]
         fn emulator_protectors_release_until_the_cap() {
             let tpm = Emulator::start(&fresh_state("oracle"));
             // The emulator has no firmware: the observed policy is refused

@@ -1612,7 +1612,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires explicitly supplied pinned host swtpm; never accesses hardware"]
+    #[ignore = "requires the pinned swtpm 0.10.1 on PATH; never accesses hardware"]
     fn emulator_token_store_reopens_and_releases_only_the_bound_role() {
         use crate::fido_metadata::{tests as fixtures, Protection, Role};
         let root = std::env::temp_dir().join(format!(
@@ -1778,7 +1778,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires explicitly supplied pinned host swtpm; never accesses hardware"]
+    #[ignore = "requires the pinned swtpm 0.10.1 on PATH; never accesses hardware"]
     fn emulator_enrolls_a_locked_tpm_store_without_a_portal_release() {
         use crate::fido_metadata::{tests as fixtures, Protection, Role};
         let root = std::env::temp_dir().join(format!(
@@ -1896,7 +1896,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires explicitly supplied pinned host swtpm; never accesses hardware"]
+    #[ignore = "requires the pinned swtpm 0.10.1 on PATH; never accesses hardware"]
     fn emulator_migrates_real_store_without_persisting_the_new_master() {
         let root = std::env::temp_dir().join(format!("td-tpm-store-{}", std::process::id()));
         assert!(!root.exists());
@@ -2158,7 +2158,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires explicitly supplied pinned host swtpm; never accesses hardware"]
+    #[ignore = "requires the pinned swtpm 0.10.1 on PATH; never accesses hardware"]
     fn emulator_token_write_changes_one_record_without_releasing_the_store() {
         use crate::fido_metadata::{tests as fixtures, Protection, Role};
         let root = std::env::temp_dir().join(format!(

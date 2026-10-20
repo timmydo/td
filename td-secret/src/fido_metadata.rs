@@ -611,7 +611,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    #[ignore = "requires explicitly supplied pinned host swtpm; never accesses hardware"]
+    #[ignore = "requires the pinned swtpm 0.10.1 on PATH; never accesses hardware"]
     fn emulator_release_requires_signed_presence_and_the_sealed_enrollment() {
         struct Directory(std::path::PathBuf);
         impl Drop for Directory {

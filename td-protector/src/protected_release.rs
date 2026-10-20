@@ -3860,7 +3860,7 @@ pub(crate) mod tests {
     /// after the cap the post-cap check's PolicyPCR is refused with
     /// nothing loaded.
     #[test]
-    #[ignore = "needs TD_TEST_SWTPM, the pinned swtpm 0.10.1"]
+    #[ignore = "needs the pinned swtpm 0.10.1 on PATH"]
     fn emulator_protected_operations() {
         use crate::tests::emulator::{fresh_state, Emulator, Socket};
         struct Swtpm(Emulator);
