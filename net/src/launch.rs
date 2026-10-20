@@ -101,6 +101,12 @@ const PROBE_PACE: Duration = Duration::from_millis(50);
 /// replaces the file on disk does not change.
 pub(crate) const SELF: &str = "/proc/self/exe";
 
+#[derive(Clone, Copy, Default)]
+struct LaunchOptions {
+    loud: bool,
+    allow_loopback: bool,
+}
+
 /// `td-launch PROGRAM [ARG...]`, `args[0]` being the applet's name.
 pub fn run(args: &[String]) {
     let code = match args.get(1).map(String::as_str) {
@@ -110,13 +116,39 @@ pub fn run(args: &[String]) {
         // The companions those programs are given, for `./install-apps`
         // to build and install beside this binary.
         Some("--companions") if args.len() == 2 => list("--companions", &all_companions()),
+        Some("--allow-loopback") => match args.get(2).filter(|program| program.contains('/')) {
+            Some(program) => say(launch_here(
+                Path::new(program),
+                args.get(3..).unwrap_or(&[]),
+                &[],
+                false,
+                LaunchOptions {
+                    loud: true,
+                    allow_loopback: true,
+                },
+            )),
+            None => {
+                eprintln!("usage: td-net launch --allow-loopback PROGRAM [ARG...]");
+                2
+            }
+        },
         Some(program) if program.contains('/') => {
             let rest = args.get(2..).unwrap_or(&[]);
-            say(launch_here(Path::new(program), rest, &[], false, true))
+            say(launch_here(
+                Path::new(program),
+                rest,
+                &[],
+                false,
+                LaunchOptions {
+                    loud: true,
+                    allow_loopback: false,
+                },
+            ))
         }
         _ => {
             eprintln!(
                 "usage: td-net launch PROGRAM [ARG...]  (PROGRAM a path)
+       td-net launch --allow-loopback PROGRAM [ARG...]
        td-net launch --names
        td-net launch --companions"
             );
@@ -134,7 +166,13 @@ pub fn run_named(name: &str, args: &[String]) {
         .and_then(|exe| {
             let program = beside(&exe, name)?;
             let named = companions_beside(&exe, name)?;
-            launch_here(&program, args, &named, relays(name), false)
+            launch_here(
+                &program,
+                args,
+                &named,
+                relays(name),
+                LaunchOptions::default(),
+            )
         });
     std::process::exit(say(launched));
 }
@@ -230,7 +268,7 @@ fn launch_here(
     args: &[String],
     named: &[(&str, Option<PathBuf>)],
     egress: bool,
-    loud: bool,
+    options: LaunchOptions,
 ) -> Result<(), String> {
     let (runtime, display) = session(
         nonempty("XDG_RUNTIME_DIR").as_deref(),
@@ -244,7 +282,7 @@ fn launch_here(
         &runtime,
         display.as_deref(),
         egress,
-        loud,
+        options,
     )
 }
 
@@ -358,16 +396,21 @@ const EGRESSD: Service = Service {
 /// Starts this binary's `service` at `socket`, to end when this process's
 /// pid is no longer its parent, and waits for its probe; the child is
 /// killed when it does not answer.
-fn start_service(service: &Service, socket: &Path) -> Result<Child, String> {
+fn start_service(service: &Service, socket: &Path, allow_loopback: bool) -> Result<Child, String> {
     let applet = service.applet;
-    let mut child = Command::new(SELF)
+    let mut command = Command::new(SELF);
+    command
         .arg0(applet)
         .args(["run", "--exit-with-parent"])
         .arg(std::process::id().to_string())
         .arg("--socket")
         .arg(socket)
         .stdin(Stdio::null())
-        .process_group(0)
+        .process_group(0);
+    if allow_loopback && applet == FETCHD.applet {
+        command.arg("--allow-loopback");
+    }
+    let mut child = command
         .spawn()
         .map_err(|e| format!("cannot start {applet}: {e}"))?;
     let deadline = Instant::now() + SERVICE_START;
@@ -405,7 +448,7 @@ fn launch(
     runtime: &Path,
     display: Option<&Path>,
     egress: bool,
-    loud: bool,
+    options: LaunchOptions,
 ) -> Result<(), String> {
     let private = private_runtime(runtime, Path::new("/proc"))?;
     let socket = socket_under(&private);
@@ -415,7 +458,7 @@ fn launch(
         wanted.push((EGRESSD, private.join("td-egress").join("socket")));
     }
     for (service, at) in &wanted {
-        match start_service(service, at) {
+        match start_service(service, at, options.allow_loopback) {
             Ok(child) => services.push(child),
             Err(e) => {
                 for mut child in services {
@@ -427,7 +470,7 @@ fn launch(
             }
         }
     }
-    if loud {
+    if options.loud {
         eprintln!(
             "td-launch: serving the fetch socket at {}",
             socket.display()

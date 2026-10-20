@@ -550,3 +550,16 @@ longer interprets words such as "unknown" as proof of deletion. Requests obey
 the server's maxObjectsInSet. td-mta accepts pure destruction requests and
 atomically removes relationships and unowned bodies; shared or leased bodies
 remain until their last owner releases them.
+
+For a local td-mta account, launch with an explicitly loopback-enabled fetch
+service (using the ordinary binaries installed by `./install-apps`):
+
+```text
+~/.local/lib/td/td-net launch --allow-loopback ~/.local/lib/td/td-mail --config=/absolute/path/to/mail.toml
+```
+
+Add `--cli` for the JSON-line interface. The launcher preserves the Wayland
+connection and stops its fetch service when td-mail exits. The option permits
+loopback for this application's requests; certificate verification
+and the account's `tls_ca_file` origin scope still apply. The ordinary
+`~/.local/bin/td-mail` launch keeps the default loopback refusal.

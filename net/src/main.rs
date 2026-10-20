@@ -40,6 +40,9 @@ mod launch;
 mod ostree;
 mod sig;
 mod subst;
+#[cfg(test)]
+#[path = "../../td-fs/src/temp_dir.rs"]
+mod test_temp;
 
 // The deployment protocol td-boot READS, included from the crate that defines
 // it rather than restated here: `td-deploy` signs a manifest td-boot must

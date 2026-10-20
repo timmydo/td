@@ -7,6 +7,11 @@
 //! passes; `TD_LAUNCH_TEST_EXIT` is the code it then exits with, and
 //! `TD_LAUNCH_TEST_HOLD` keeps it running until it is killed.
 
+#[path = "../../td-fs/src/temp_dir.rs"]
+mod temp_dir;
+use std::io::{Read, Write};
+use std::net::TcpListener;
+
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -23,11 +28,8 @@ const COMPANIONS: &str = "TD_LAUNCH_TEST_COMPANIONS";
 /// its runtime directory.
 const EGRESS: &str = "TD_LAUNCH_TEST_EGRESS";
 
-fn scratch(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("td-launch-it-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+fn scratch(tag: &str) -> temp_dir::TempDir {
+    temp_dir::TempDir::new(&format!("td-launch-it-{tag}")).unwrap()
 }
 
 fn until(what: &str, mut done: impl FnMut() -> bool) {
@@ -60,6 +62,33 @@ fn launched_program() {
         session.parent().unwrap().join("wayland-9")
     );
     std::fs::write(&mark, socket.as_os_str().as_encoded_bytes()).unwrap();
+    if let Ok(url) = std::env::var("TD_LAUNCH_TEST_FETCH_URL") {
+        let mut fetch = UnixStream::connect(&socket).unwrap();
+        fetch
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        fetch
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let public = if std::env::var_os("TD_LAUNCH_TEST_PUBLIC").is_some() {
+            "public\n"
+        } else {
+            ""
+        };
+        write!(
+            fetch,
+            "td-fetch 1\nmethod GET\nurl {url}\nlimit 1024\nredirects 0\n{public}body 0\n\n"
+        )
+        .unwrap();
+        let mut response = String::new();
+        fetch.take(4096).read_to_string(&mut response).unwrap();
+        std::fs::write(
+            std::env::var_os("TD_LAUNCH_TEST_FETCH_RESULT").unwrap(),
+            response,
+        )
+        .unwrap();
+    }
+
     if let Some(record) = std::env::var_os(EGRESS) {
         let egress = runtime.join("td-egress/socket");
         let served = UnixStream::connect(&egress).is_ok();
@@ -98,6 +127,9 @@ fn as_child<'a>(command: &'a mut Command, runtime: &Path, mark: &Path) -> &'a mu
         .env_remove(HOLD)
         .env_remove(COMPANIONS)
         .env_remove(EGRESS)
+        .env_remove("TD_LAUNCH_TEST_FETCH_URL")
+        .env_remove("TD_LAUNCH_TEST_FETCH_RESULT")
+        .env_remove("TD_LAUNCH_TEST_PUBLIC")
         .stdin(Stdio::null())
 }
 
@@ -329,4 +361,77 @@ fn the_names_are_listed_for_the_installer() {
         String::from_utf8(output.stdout).unwrap(),
         "td-agent\ntd-mail\ntd-news\n"
     );
+}
+
+#[test]
+fn loopback_requires_explicit_launch_opt_in() {
+    let base = scratch("loopback");
+    let runtime = base.join("run");
+    std::fs::create_dir(&runtime).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    let peer = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(20))
+                }
+                Err(e) => panic!("fixture accept: {e}"),
+            }
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut request = Vec::new();
+        let mut byte = [0];
+        while !request.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).unwrap();
+            request.push(byte[0]);
+            assert!(request.len() < 8192);
+        }
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            .unwrap();
+    });
+    for (name, allow, public) in [
+        ("default", false, false),
+        ("public", false, true),
+        ("local", true, false),
+    ] {
+        let mark = base.join(format!("mark-{name}"));
+        let result = base.join(format!("result-{name}"));
+        let mut command = Command::new(TD_NET);
+        command.arg("launch");
+        if allow {
+            command.arg("--allow-loopback");
+        }
+        command.arg(std::env::current_exe().unwrap());
+        as_child(&mut command, &runtime, &mark);
+        command
+            .env("TD_LAUNCH_TEST_FETCH_URL", &url)
+            .env("TD_LAUNCH_TEST_FETCH_RESULT", &result);
+        if public {
+            command.env("TD_LAUNCH_TEST_PUBLIC", "1");
+        }
+        assert!(command.status().unwrap().success());
+        let response = std::fs::read_to_string(result).unwrap();
+        if name == "local" {
+            assert!(
+                response.contains("status 200\n") && response.ends_with("ok"),
+                "{response}"
+            );
+        } else {
+            assert!(response.contains("error refused:"), "{response}");
+        }
+        nothing_served(&runtime, &mark);
+    }
+    peer.join().unwrap();
 }

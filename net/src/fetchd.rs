@@ -156,10 +156,10 @@ const CONNECTION_HEADERS: &[&str] = &[
     "upgrade",
 ];
 const SERVICE_HEADERS: &[&str] = &["host", "content-length", "accept-encoding"];
-/// What the probe asks for: a loopback URL the policy refuses, so the reply
-/// proves the socket, the framing and the policy without a route out.
-const PROBE_URL: &str = "http://127.0.0.1:1/";
-const PROBE_EXPECTED: &str = "error refused: loopback address";
+/// An unspecified address is refused even with the explicit loopback option.
+/// This checks framing and policy without connecting to a local listener.
+const PROBE_URL: &str = "http://0.0.0.0:1/";
+const PROBE_EXPECTED: &str = "error refused: unspecified address";
 
 pub fn run(args: &[String]) {
     let code = match args.get(1).map(String::as_str) {
@@ -1848,7 +1848,7 @@ fn bounded_line(text: &str) -> String {
     line
 }
 
-/// Connect, ask for the loopback URL, expect the policy's refusal: the
+/// Connect, ask for the unspecified-address URL, expect refusal: the
 /// socket is served, the framing is understood and the policy is on.
 fn probe(socket: &Path) -> Result<(), String> {
     probe_within(socket, CLIENT_IO_TIMEOUT)
@@ -2514,7 +2514,7 @@ mod tests {
 
     #[test]
     fn a_request_is_served_over_the_socket_within_its_bounds() {
-        let dir = scratch("serve");
+        let dir = crate::test_temp::TempDir::new("fetchd-serve").unwrap();
         let socket = dir.join("td-fetch");
         let Some(()) = served(&socket, LENIENT) else {
             return;
@@ -2713,10 +2713,8 @@ mod tests {
         assert!(second.starts_with("post /post http/1.1"), "{second}");
         assert!(second.contains("content-type: text/plain"), "{second}");
         assert!(second.ends_with("hello"), "{second}");
-        // The probe, against this lenient service, sees the transport error
-        // rather than the refusal it expects: the flag is not for units.
-        let err = probe(&socket).unwrap_err();
-        assert!(err.contains("second line"), "{err}");
+        // The probe never connects, even with explicit loopback permission.
+        probe(&socket).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

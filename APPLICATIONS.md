@@ -10539,13 +10539,13 @@ webpki-roots, and no decoder. So:
    with `redirects 0`, its caller judging each `location`.
 4. Evidence. The boot VM has no route out, so the evidence is the socket
    and the policy: `[fetch-evidence]` connects as the UI user, asks for
-   a loopback URL and expects the exact refusal; inside the jail, the
+   an unspecified-address URL and expects the exact refusal; inside the jail, the
    stage-2 readback already requires every granted socket to be present
    and mounted read-only, so `TD-MAIL-RUNNING` under the grant proves
    the socket reached the instance; the marker `TD-FETCH-OK` is latched
    as an exact line and required by the oracle. Host side, the crate's
    own tests, which the `net-test` preflight runs, serve the applet
-   against a std `TcpListener` on loopback under a test-only allow flag
+   against a std `TcpListener` on loopback under an explicit allow flag
    and pin the framing, the caps, the header rules and the redirects,
    and, running the built binary as the service with test-only shortened
    bounds that only the allow flag admits, a streamed request's frames
@@ -11308,6 +11308,19 @@ two-configuration rule reads the launch as availability: the
 applications run here as they run on td, the jail is what is absent, and
 a feature owes this launcher nothing. The installed program finds no
 service of its own any other way.
+
+For a deliberately local account, `td-net launch --allow-loopback
+/absolute/path/to/td-mail --config=/absolute/path/to/mail.toml` starts the
+same managed fetch service with its existing loopback exception. This is an
+explicit host launch option, never an inherited environment switch or the
+installed application-name default. It permits loopback destinations for all
+requests made by that launched application, including redirects and requests
+marked public; it is not an account-specific address grant. Public requests
+still refuse other private/local-network destinations. TLS verification, including td-mail's
+per-account CA scoping, is unchanged. The same parent lifetime cleanup and
+Wayland path preservation apply. Normal installed launches still refuse
+loopback; td image confinement and its fetch-service configuration are
+unchanged.
 
 ### X.8 The `workspace` kind on a host
 
