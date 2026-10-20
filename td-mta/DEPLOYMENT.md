@@ -183,6 +183,70 @@ objects. Explicitly select the retained companion when using external tools.
 
 ## Prepare the database and instance
 
+For a new current-user, single-host deployment, the host installer can
+orchestrate the preparation below:
+
+```text
+./install-td-mta --setup-local --root /home/alice/mail-test \
+  --account test@example.com --relay-host smtp.example.com \
+  --relay-user test@example.com \
+  --relay-password-file /home/alice/.config/mail/relay-password \
+  --resolver 127.0.0.1:53
+```
+
+Install the binary first with `./install-td-mta`; use the same `--prefix` for
+setup when overriding its default. PostgreSQL 17's `initdb`, `postgres`,
+`pg_ctl`, `psql`, and OpenSSL must be available on the host PATH. These are
+host provisioning tools, not target recipe dependencies. The command runs
+them directly, without a shell. It creates a new mode-0700 root under
+trusted physical ancestors; existing roots, symlinks, privileged local
+ports and conflicting local port assignments refuse. The parent must already
+exist. Roots are limited to 72 bytes for the MTA control socket.
+
+Default ports are PostgreSQL 35432, HTTPS 54443 and incoming SMTP 55225;
+`--postgres-port`, `--https-port` and `--smtp-port` override them. All three
+bind IPv4 loopback only. Relay uses verified implicit TLS on port 465;
+`--relay-port` overrides the port, not the transport. Supply the relay login
+explicitly. Its password input must be a private, user-owned regular file;
+its ancestors must be physical, root/user-owned and not shared-writable.
+One final LF or CRLF is removed. An optional `--relay-ca-file` takes a
+similarly protected trust bundle; otherwise the bundled public roots apply.
+Account addresses, relay hostnames and relay users use simple ASCII names.
+The resolver must be an explicit IP:port endpoint reachable by the service.
+
+Setup creates a local CA and 90-day server leaf, initializes its own cluster,
+briefly starts PostgreSQL, creates separate schema-owner and runtime logins,
+initializes the schema/account/device, imports immutable materials and all
+three profiles, publishes a retained selection request, and checks runtime
+privileges. Temporary local trust authentication is confined to the private
+socket and setup administrator. The final configuration disables Unix
+sockets and accepts only TLS/SCRAM owner/runtime connections over loopback.
+PostgreSQL is stopped before successful return. No MTA service starts and
+no mail is sent. This does not provision an existing or remote database.
+
+The root retains private command output/error receipts, credentials, source
+profiles, material/configuration IDs and the exact selection request.
+Passwords never enter process arguments or normal terminal output. On
+failure, the owned PostgreSQL child is stopped and the partial directory
+is retained for inspection; setup does not retry publication, resume partial
+data or delete it. An uncertain device creation still requires inspection
+and revocation before replacement, as POSTGRES.md specifies.
+Each direct tool child is also armed to die if the installer is terminated;
+PostgreSQL's postmaster-death handling then retires its own workers. An
+interrupted cluster may need PostgreSQL crash recovery; it is never adopted
+by another setup run.
+
+`START.txt` supplies commands for the generated systemd user units or
+Shepherd definitions under `ROOT/services/`, including the private PostgreSQL
+service and MTA dependencies. These names support one such local deployment
+per user service manager. Definitions use the installed MTA path and the
+PostgreSQL executable found on PATH; retain those host installations.
+Choose one manager, start the services explicitly, and require each profile's
+readiness. `ROOT/mail.toml` configures td-mail with this account's private CA
+and device-password command. Use `td-net launch --allow-loopback` for this
+local account. Startup persistence, certificate renewal and backups still
+follow the procedures elsewhere in this document.
+
 Use the explicit PostgreSQL preparation commands described in POSTGRES.md:
 initialize or inspect the schema with its owner login, initialize the
 account, import validated material and configuration versions, and publish

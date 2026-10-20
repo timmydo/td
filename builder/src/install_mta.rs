@@ -5,6 +5,8 @@ use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 
 type Result<T> = std::result::Result<T, String>;
+#[path = "install_mta_setup.rs"]
+mod install_mta_setup;
 const HELP: &str = "Usage: ./install-td-mta [--prefix PATH]
        ./install-td-mta --services-only --connection-file PATH --state-dir PATH
            --profile NAME [--profile NAME ...] [--prefix PATH]
@@ -15,6 +17,7 @@ Service configuration requires all three connection/state/profile options.
 Generates both systemd user units and Shepherd definitions; does not enable them.
 Database preparation and credentials remain explicit (td-mta/POSTGRES.md).
 --services-only uses the already installed executable without rebuilding.
+Use --setup-local --help to provision a new private local PostgreSQL account.
 ";
 
 #[derive(Debug)]
@@ -267,6 +270,9 @@ fn install(root: &Path, opts: &Options) -> Result<()> {
 }
 
 pub(crate) fn run(args: &[String]) -> ExitCode {
+    if args.first().is_some_and(|v| v == "--setup-local") {
+        return install_mta_setup::run(args.get(1..).unwrap_or_default());
+    }
     if args == ["--help"] || args == ["-h"] {
         print!("{HELP}");
         return ExitCode::SUCCESS;
