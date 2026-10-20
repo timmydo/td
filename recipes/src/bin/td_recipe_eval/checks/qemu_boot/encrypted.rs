@@ -1698,9 +1698,21 @@ mod tests {
         assert!(verify_no_table(&file, len, 512).is_err());
         let primary = 2 * 512 + GPT_ENTRY_BYTES;
         let backup = len - 512 - GPT_ENTRY_BYTES;
-        let mut middle = vec![0; usize::try_from(backup - primary).unwrap()];
-        file.read_exact_at(&mut middle, primary).unwrap();
-        assert!(middle.iter().all(|byte| *byte == 0));
+        // A reused megabyte rather than the whole gigabyte: the suite shares one
+        // data-segment cap (`run-capped`), which a 1 GiB buffer beside the other
+        // tests' arenas reached.
+        let mut chunk = vec![0; 1 << 20];
+        let mut at = primary;
+        while at < backup {
+            let len = (backup - at).min(chunk.len() as u64);
+            let part = chunk.get_mut(..usize::try_from(len).unwrap()).unwrap();
+            file.read_exact_at(part, at).unwrap();
+            assert!(
+                part.iter().all(|byte| *byte == 0),
+                "a nonzero byte at {at}.."
+            );
+            at += part.len() as u64;
+        }
         fs::remove_dir_all(&dir).unwrap();
     }
 
