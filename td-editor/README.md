@@ -635,14 +635,20 @@ This waits for actual frame completion. The ordinary tests need no display
 and check transferred pool pixels and lifecycle behavior with Unix sockets.
 
 For the production editor/control-worker and keyboard tests, no existing display
-is needed. Supply an absolute Weston executable path and the matching
-upstream build-tree `test-plugin.so` (normally not installed). The test starts
-and reaps its own headless Pixman/kiosk compositor and editor:
+is needed. They run the `weston` on `PATH` and load the upstream
+`test-plugin.so` beside it: through any symlink to the binary's own
+`PREFIX/bin/weston`, they look in `PREFIX/lib/weston/`,
+`PREFIX/lib64/weston/` and the multiarch `PREFIX/lib/ARCH-linux-gnu/weston/`,
+and, for a meson build tree whose `BUILD/frontend/weston` (or
+`BUILD/compositor/weston` before Weston 13) is on `PATH`, in
+`BUILD/tests/`. Upstream builds the plugin but does not install it, so a
+packaged Weston has none; put a build tree's `weston` on `PATH`, or copy
+its plugin under the prefix. Without one the cases fail, naming where
+they looked. The test starts and reaps its own headless Pixman/kiosk
+compositor and editor:
 
 ```text
 TD_TEST_TRUSTED_ROOT=1 \
-TD_EDITOR_TEST_WESTON=/absolute/path/to/weston \
-TD_EDITOR_TEST_WESTON_MODULE=/absolute/path/to/test-plugin.so \
 cargo test --frozen --manifest-path td-editor/Cargo.toml --test control_process \
   disposable_weston -- --ignored
 ```
@@ -661,7 +667,7 @@ physical input or prove GPU, scanout, captured pixels, or td-jail integration.
 Weston is optional host test tooling, not an editor or ordinary-gate dependency.
 
 The `disposable_weston` invocation above runs all five cases.
-Keep the executable/module outside the host's `/tmp` or in the bound
+Keep the Weston installation outside the host's `/tmp` or in the bound
 worktree: the trusted-root fixture replaces `/tmp` with its own empty mount.
 The two separately reported keyboard cases create fresh instances for the
 Windows/Emacs profiles and inject key press/release through Weston's

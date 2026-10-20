@@ -25,4 +25,5 @@ indexing_slicing = "deny"
 td-ui = { path = "../td-ui" }
 
 [dev-dependencies]
+td-fs = { path = "../td-fs" }
 td-test-compositor = { path = "../td-test-compositor" }

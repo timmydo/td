@@ -11,9 +11,14 @@ name = "td-editor"
 version = "0.1.0"
 dependencies = [
  "td-civil",
+ "td-fs",
  "td-test-compositor",
  "td-ui",
 ]
+
+[[package]]
+name = "td-fs"
+version = "0.1.0"
 
 [[package]]
 name = "td-test-compositor"

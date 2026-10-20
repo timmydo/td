@@ -3,7 +3,7 @@ use crate::types::Recipe;
 pub fn recipe() -> Recipe {
     Recipe::rust("td-taskmgr", "0.1.0")
         .local_source("td-taskmgr")
-        .local_source_trees(&["td-ui", "td-compositor", "td-test-compositor"])
+        .local_source_trees(&["td-ui", "td-compositor", "td-fs", "td-test-compositor"])
         .native_inputs(&[
             "rust-toolchain",
             "gcc-x86-64-self",
@@ -30,6 +30,7 @@ mod tests {
             Some(vec![
                 "td-ui".into(),
                 "td-compositor".into(),
+                "td-fs".into(),
                 "td-test-compositor".into()
             ])
         );

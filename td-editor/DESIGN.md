@@ -3388,8 +3388,12 @@ deadline to masquerade as the tested cancellation or lifecycle transition.
 Weston remains separate optional interoperability evidence below.
 
 The opt-in `disposable_weston_runs_the_production_editor_and_control_workers`
-test requires explicit absolute paths to a Weston executable and its matching
-upstream `test-plugin.so`. It starts an owned headless Pixman/kiosk compositor
+test runs the `weston` on `PATH` with the upstream `test-plugin.so` beside
+it: under the same resolved prefix (`lib`, `lib64` or the multiarch `lib`
+directory), or in the `tests/` of the meson build tree that binary was
+built in, since upstream does not install the plugin; it fails naming
+where it looked when there is none. It starts an owned headless
+Pixman/kiosk compositor
 with a private runtime/socket, an empty inherited environment and no user
 configuration. The upstream plugin supplies the test seat; stock Weston 10.0.2
 headless has no seat and the file-window required-seat policy remains intact.

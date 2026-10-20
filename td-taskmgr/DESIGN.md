@@ -582,9 +582,10 @@ projection. Process controls use a separate bounded action worker.
 
 The affected-check mapping runs the discovered standalone crate and
 workspace lock/test/Clippy preflight. The target recipe stages td-taskmgr,
-td-ui and td-compositor, builds offline with the source-built Rust toolchain,
-and installs a static binary with the standard frame-pointer/debug-companion
-policy. Its companion check executes the realized binary's help and two
+td-ui and td-compositor, and the tests' dev-dependencies td-fs and
+td-test-compositor that cargo reads to resolve the lock, builds offline
+with the source-built Rust toolchain, and installs a static binary with
+the standard frame-pointer/debug-companion policy. Its companion check executes the realized binary's help and two
 bounded resource observations. Source edits select the local pin and target
 recipe checks; DESIGN.md remains excluded from staging and source hashes.
 The image and launcher runtime coverage is recorded below.
@@ -687,10 +688,11 @@ menu and a preparing request, and the derived rows equal
 `control::BINDINGS`, `confirmations::KEYS` and the results' rows.
 td-compositor currently completes hidden-client callbacks, so that case
 bounds updates rather than assuming callbacks stop. The separately opt-in
-Weston fixture requires `TD_TEST_WESTON`, scopes protocol evidence to the
-client that set our app ID, and checks configure, repeated attachments,
-frame callbacks, buffer releases, navigation, continuing observations and
-clean remote quit. The host smoke passed with Guix Weston 10.0.2 on x86-64
+(ignored) Weston fixture runs the `weston` on `PATH`, failing by name
+when there is none, scopes protocol evidence to the client that set our
+app ID, and checks configure, repeated attachments, frame callbacks,
+buffer releases, navigation, continuing observations and clean remote
+quit. The host smoke passed with Guix Weston 10.0.2 on x86-64
 Linux 7.0.14. These are host compatibility observations, not td
 target-image evidence.
 

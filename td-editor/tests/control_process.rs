@@ -738,21 +738,9 @@ impl Drop for WestonProcess {
 }
 impl WestonProcess {
     fn start(directory: &Directory) -> Self {
-        let executable = PathBuf::from(
-            std::env::var_os("TD_EDITOR_TEST_WESTON").expect("explicit Weston executable"),
-        );
-        let module = PathBuf::from(
-            std::env::var_os("TD_EDITOR_TEST_WESTON_MODULE")
-                .expect("explicit matching upstream Weston test-plugin"),
-        );
-        assert!(
-            executable.is_absolute(),
-            "absolute Weston executable required"
-        );
-        assert!(
-            module.is_absolute(),
-            "absolute matching Weston test module required"
-        );
+        let executable = td_fs::executable_on_path("weston")
+            .expect("weston not found on PATH: these cases need an installed Weston");
+        let module = weston_test_plugin(&executable);
         let display = directory.0.join("wayland");
         let log = directory.0.join("weston.log");
         let mut module_arg = std::ffi::OsString::from("--modules=");
@@ -804,6 +792,79 @@ impl WestonProcess {
     }
 }
 
+/// Where upstream's `test-plugin.so` is beside a `weston`: installed under
+/// the `bin/weston` prefix (plain, lib64 and multiarch) or, since upstream
+/// does not install it, in the meson build tree whose `frontend/weston`
+/// (`compositor/weston` before 13) is on PATH.
+fn weston_test_plugin_candidates(executable: &Path) -> Vec<PathBuf> {
+    // Through any profile symlink, so the prefix is the package's own.
+    let resolved = std::fs::canonicalize(executable).unwrap_or_else(|_| executable.to_path_buf());
+    let Some(prefix) = resolved.parent().and_then(Path::parent) else {
+        return Vec::new();
+    };
+    let multiarch = format!("{}-linux-gnu", std::env::consts::ARCH);
+    let mut candidates: Vec<PathBuf> = ["lib", "lib64", &format!("lib/{multiarch}")]
+        .iter()
+        .map(|lib| prefix.join(lib).join("weston/test-plugin.so"))
+        .collect();
+    candidates.push(prefix.join("tests/test-plugin.so"));
+    candidates
+}
+
+/// The matching upstream test plugin beside `executable`.
+#[allow(clippy::panic)]
+fn weston_test_plugin(executable: &Path) -> PathBuf {
+    let candidates = weston_test_plugin_candidates(executable);
+    if let Some(found) = candidates.iter().find(|path| path.is_file()) {
+        return found.clone();
+    }
+    let looked: Vec<String> = candidates
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect();
+    panic!(
+        "no test-plugin.so beside {}; looked for: {}. Upstream builds the plugin but \
+         does not install it: put a Weston build tree's weston on PATH, or install its \
+         tests/test-plugin.so under the prefix",
+        executable.display(),
+        looked.join(", ")
+    );
+}
+
+#[test]
+fn the_weston_test_plugin_is_looked_for_under_the_binarys_prefix() {
+    let owned = td_fs::TempDir::new("td-editor-weston-prefix").unwrap();
+    let root = std::fs::canonicalize(owned.path()).unwrap();
+    let prefix = root.join("prefix");
+    std::fs::create_dir_all(prefix.join("bin")).unwrap();
+    std::fs::write(prefix.join("bin/weston"), b"").unwrap();
+    // A profile's link resolves to the package's own prefix.
+    std::fs::create_dir_all(root.join("profile/bin")).unwrap();
+    let weston = root.join("profile/bin/weston");
+    std::os::unix::fs::symlink(prefix.join("bin/weston"), &weston).unwrap();
+    let multiarch = format!("lib/{}-linux-gnu", std::env::consts::ARCH);
+    let mut expected: Vec<PathBuf> = ["lib", "lib64", multiarch.as_str()]
+        .iter()
+        .map(|lib| prefix.join(lib).join("weston/test-plugin.so"))
+        .collect();
+    expected.push(prefix.join("tests/test-plugin.so"));
+    assert_eq!(weston_test_plugin_candidates(&weston), expected);
+    let lib64 = prefix.join("lib64/weston");
+    std::fs::create_dir_all(&lib64).unwrap();
+    std::fs::write(lib64.join("test-plugin.so"), b"").unwrap();
+    assert_eq!(weston_test_plugin(&weston), lib64.join("test-plugin.so"));
+    // A build tree: `<build>/frontend/weston` beside `<build>/tests/`.
+    let build = root.join("build");
+    std::fs::create_dir_all(build.join("frontend")).unwrap();
+    std::fs::create_dir_all(build.join("tests")).unwrap();
+    std::fs::write(build.join("frontend/weston"), b"").unwrap();
+    std::fs::write(build.join("tests/test-plugin.so"), b"").unwrap();
+    assert_eq!(
+        weston_test_plugin(&build.join("frontend/weston")),
+        build.join("tests/test-plugin.so")
+    );
+}
+
 fn display_roundtrip(mut stream: UnixStream) {
     let deadline = Instant::now() + TIMEOUT;
     send(&mut stream, 1, 0, &words(&[2])).unwrap();
@@ -814,7 +875,7 @@ fn display_roundtrip(mut stream: UnixStream) {
 }
 
 #[test]
-#[ignore = "requires explicit Weston executable and matching upstream test-plugin; see README"]
+#[ignore = "needs weston on PATH with its upstream test-plugin.so beside it; see README"]
 fn disposable_weston_runs_the_production_editor_and_control_workers() {
     let directory = Directory::new("td-editor-process");
     let display = directory.0.join("wayland");
@@ -1115,13 +1176,13 @@ fn weston_keyboard_profile(profile: &str) {
 }
 
 #[test]
-#[ignore = "requires explicit Weston executable and matching upstream test-plugin; see README"]
+#[ignore = "needs weston on PATH with its upstream test-plugin.so beside it; see README"]
 fn disposable_weston_delivers_windows_keyboard_events() {
     weston_keyboard_profile("windows");
 }
 
 #[test]
-#[ignore = "requires explicit Weston executable and matching upstream test-plugin; see README"]
+#[ignore = "needs weston on PATH with its upstream test-plugin.so beside it; see README"]
 fn disposable_weston_delivers_emacs_keyboard_events() {
     weston_keyboard_profile("emacs");
 }
@@ -1172,7 +1233,7 @@ fn weston_test_timed_requests_use_integer_pixels_and_nanosecond_timestamps() {
 }
 
 #[test]
-#[ignore = "requires explicit Weston executable and matching upstream test-plugin; see README"]
+#[ignore = "needs weston on PATH with its upstream test-plugin.so beside it; see README"]
 fn disposable_weston_delivers_pointer_selection_and_menu_events() {
     for line_numbers in [true, false] {
         weston_pointer_line_numbers(line_numbers);
@@ -1252,7 +1313,7 @@ fn weston_pointer_line_numbers(line_numbers: bool) {
 }
 
 #[test]
-#[ignore = "requires explicit Weston executable and matching upstream test-plugin; see README"]
+#[ignore = "needs weston on PATH with its upstream test-plugin.so beside it; see README"]
 fn disposable_weston_transfers_clipboard_between_editor_processes() {
     let compositor = Directory::new("td-editor-process");
     let display = compositor.0.join("wayland");

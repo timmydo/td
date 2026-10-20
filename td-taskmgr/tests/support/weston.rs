@@ -9,11 +9,10 @@ impl Drop for Server {
     }
 }
 #[test]
-#[ignore = "set TD_TEST_WESTON to an installed absolute Weston executable"]
+#[ignore = "needs an installed weston on PATH"]
 fn real_weston_configures_releases_buffers_and_keeps_collection_live() {
-    let binary =
-        PathBuf::from(std::env::var_os("TD_TEST_WESTON").expect("TD_TEST_WESTON required"));
-    assert!(binary.is_absolute());
+    let binary = td_fs::executable_on_path("weston")
+        .expect("weston not found on PATH: this case needs an installed Weston");
     let directory = Directory::new("td-taskmgr-process");
     let log = directory.0.join("weston.log");
     let mut server = Server(
