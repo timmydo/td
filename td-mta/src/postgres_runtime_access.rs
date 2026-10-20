@@ -35,6 +35,8 @@ const TABLES: &[(&str, Access)] = &[
     ("config_selection_receipts", Access::Read),
     ("account_bootstraps", Access::Read),
     ("accounts", Access::Mail),
+    ("application_log_state", Access::Mail),
+    ("application_logs", Access::Mail),
     ("blob_ids", Access::Mail),
     ("blobs", Access::Mail),
     ("blob_chunks", Access::Mail),

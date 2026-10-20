@@ -6315,3 +6315,31 @@ receipt settlement. The real-client fixture covers deletion, missing and
 foreign IDs, protected Inbox, nonempty folders and parents. Native transaction
 checks cover stale state, revoked authorization and exact receipt replay; a
 delayed deletion COMMIT exercises owner settlement and one history row.
+
+
+## Application diagnostic retention (schema 29)
+
+`postgres_logs.sql` adds `application_log_state` and `application_logs`.
+Both require runtime SELECT/INSERT/UPDATE/DELETE, without ownership, DDL,
+TRUNCATE or grant options; existing owner/runtime separation is unchanged.
+Stop all service instances for the explicit schema upgrade, revoke runtime
+schema/table/column privileges as required by `schema-upgrade`, upgrade with
+the owner connection, reapply the exact runtime grants (including these two
+tables), run `runtime-check`, and restart on the matching executable. Never
+edit an existing migration checksum. Mail tables and retained mail are unchanged.
+
+OBSERVABILITY.md owns the 30-day age policy, fixed ring, rate/byte limits,
+loss counters and failure isolation. These records use asynchronous commit,
+may be lost or overwritten, and are never a source of delivery, recovery or
+publication authority. Log inspection is bounded and epoch-qualified:
+
+```text
+td-mta postgres logs --connection-file /private/owner-connection --epoch HEX --limit 100
+td-mta logging-status --runtime /private/runtime
+```
+
+Use the last returned `before` ID for the next page. The log relations have
+a physical high-water stop in addition to live-row bounds; PostgreSQL WAL,
+archive/replication retention, backups and whole-volume headroom still require
+normal operational limits and monitoring. A stopped diagnostic sink must not
+be treated as a reason to resend mail.

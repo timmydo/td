@@ -2159,8 +2159,9 @@ record and retry locally. Explicit deletion/retention operations reclaim data.
 
 [OBSERVABILITY.md](OBSERVABILITY.md) specifies the implemented M04d1 event
 and explicit inspection encoders and M04d2 fixed event queue/loss counters
-and bounded status snapshots. Runtime synchronization, status aggregation
-and file output remain M19.
+and bounded status snapshots. Schema 29 adds the bounded PostgreSQL service
+sink and independent local logging status; full status aggregation remains
+planned.
 
 Emit versioned JSON Lines with bounded event sizes, fixed event codes, severity,
 UTC time, process boot ID, config generation, connection/request ID, transaction
@@ -2169,11 +2170,16 @@ peer strings. Structured fields have documented meaning and stable enum values.
 Default logs omit credentials, Authorization/AUTH contents, message bodies,
 subjects, and recipient addresses; authorized inspection can retrieve details.
 
-One writer rotates by size using rename, retaining the configured generations.
-Bound log buffering; a flooded peer cannot block durable mail storage behind
-logging. Report suppressed-event counts and log-write failures in health plus
-a rate-limited stderr fallback. Logs are diagnostic evidence, not the metadata authority
-or an acceptance condition. The supervisor must not rotate the same files.
+Service writers retain up to 30 days in PostgreSQL, bounded by a 65,536-row
+ring, 1,024-byte events, a shared ingestion rate and a 96 MiB relation-size
+stop threshold. Fixed per-kind suppression and bounded nonblocking queues keep
+peer floods off the storage path. Capacity can evict records before 30 days.
+`postgres logs` reports retention, loss and capacity eviction; `logging-status`
+reads boot-local losses and write failures even when PostgreSQL is unavailable.
+No file sink or stderr fallback is used by this writer. PostgreSQL WAL and
+cluster disk budgeting remain operational responsibilities. Logs are diagnostic
+evidence, not metadata authority or an acceptance condition. See
+OBSERVABILITY.md for exact bounds and implemented event coverage.
 
 Expose counters for accepted/refused mail, TLS/plain sessions, active slots,
 limit refusals, queue age/depth, unknown outcomes, logical disk usage/quotas, dropped logs,

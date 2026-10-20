@@ -488,7 +488,13 @@ impl Https<'_> {
                 }
                 let mut wake_body = false;
                 let mut wake_auth = false;
-                match self.step(client, &mut attempts, body_active, &mut event_count) {
+                match self.step(
+                    client,
+                    &mut attempts,
+                    body_active,
+                    &mut event_count,
+                    control,
+                ) {
                     Ok(true) => {
                         wake_auth = client.phase == Phase::Authenticate;
                         if matches!(client.phase, Phase::Upload | Phase::Download | Phase::Api) {
@@ -636,6 +642,7 @@ impl Https<'_> {
         attempts: &mut Attempts,
         body_active: &AtomicU8,
         event_count: &mut usize,
+        control: &Control,
     ) -> Result<bool, Error> {
         let time = self.clock.sample()?;
         if client.absolute.expired(time.monotonic)
@@ -869,6 +876,18 @@ impl Https<'_> {
                         Err(_) => 503,
                     }
                 };
+                if status == 401 {
+                    control.log(crate::observability::Kind::AuthenticationFailed, None, None);
+                }
+                if status == 429 {
+                    control.log(
+                        crate::observability::Kind::AdmissionRefused {
+                            reason: crate::observability::Refusal::Capacity,
+                        },
+                        None,
+                        None,
+                    );
+                }
                 self.respond(client, status, time.utc_ms)?;
             }
             Phase::Events => return self.events(client, time.monotonic),

@@ -65,6 +65,15 @@ pub(super) fn exercise(
         let line = receive.recv_timeout(Duration::from_secs(20)).unwrap();
         reader.join().unwrap();
         assert!(line.contains("\"status\":\"ready\""), "{line}");
+        let status = Command::new(env!("CARGO_BIN_EXE_td-mta"))
+            .args(["logging-status", "--runtime"])
+            .arg(&runtime)
+            .output()
+            .unwrap();
+        assert!(status.status.success());
+        let status = td_json::parse(std::str::from_utf8(&status.stdout).unwrap()).unwrap();
+        assert_eq!(status["status"].as_str(), Some("ok"));
+        assert_eq!(status["write_failures"].as_u64(), Some(0));
         (child, runtime)
     };
     drop((smtp, https));
@@ -607,4 +616,20 @@ pub(super) fn exercise(
         },
     )
     .unwrap();
+    assert!(sql(fixture,"SELECT count(*) FROM td_mta.application_logs WHERE event::json->'facts'->>'code'='metadata_committed'").parse::<usize>().unwrap()>0);
+    assert!(sql(fixture,"SELECT count(*) FROM td_mta.application_logs WHERE event::json->'facts'->>'code'='service_stopped'").parse::<usize>().unwrap()>0);
+    let output = Command::new(env!("CARGO_BIN_EXE_td-mta"))
+        .args(["postgres", "logs", "--connection-file"])
+        .arg(&connection)
+        .args(["--epoch", &epoch.to_string(), "--limit", "1"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let page = td_json::parse(std::str::from_utf8(&output.stdout).unwrap()).unwrap();
+    assert_eq!(page["records"].as_array().unwrap().len(), 1);
+    assert_eq!(page["retention_days"].as_u64(), Some(30));
 }

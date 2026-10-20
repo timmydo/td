@@ -84,16 +84,41 @@ pub enum State {
 pub struct Control {
     stop: AtomicBool,
     state: AtomicU8,
+    logging: Option<crate::application_log::Producer>,
 }
 impl Default for Control {
     fn default() -> Self {
         Self {
             stop: AtomicBool::new(false),
             state: AtomicU8::new(0),
+            logging: None,
         }
     }
 }
 impl Control {
+    pub fn with_logging(logging: crate::application_log::Producer) -> Self {
+        Self {
+            logging: Some(logging),
+            ..Self::default()
+        }
+    }
+    pub fn log(
+        &self,
+        kind: crate::observability::Kind,
+        submission: Option<crate::ids::SubmissionId>,
+        transaction: Option<crate::format::Sequence>,
+    ) {
+        if let Some(logging) = self.logging.as_ref() {
+            logging.emit(kind, submission, transaction);
+        }
+    }
+    pub fn logging(&self) -> Option<&crate::application_log::Producer> {
+        self.logging.as_ref()
+    }
+    pub fn logging_status(&self) -> Option<crate::application_log::Status> {
+        self.logging.as_ref().map(|logging| logging.status())
+    }
+
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Release);
     }
@@ -910,6 +935,13 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                     Ok(completion) => {
                         // Preserve the native outcome even when accounting or cleanup failed.
                         let result = completion.outcome;
+                        if let Ok(commit) = result {
+                            control.log(
+                                crate::observability::Kind::MetadataCommitted,
+                                None,
+                                Some(commit.sequence),
+                            );
+                        }
                         if completion.stop || matches!(result, Err(CommitFailure::Indeterminate(_)))
                         {
                             control.fail();

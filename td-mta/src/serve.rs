@@ -327,13 +327,47 @@ pub(super) fn run(options: Options) -> Result<(), ConfigFailure> {
             });
             super::signal_sys::block().map_err(|_| config_failure("signals", "io"))?;
             let endpoint = Endpoint::bind(runtime, runtime_path)?;
-            let control = Control::default();
+            let (logging, log_writer) = td_mta::application_log::Producer::new(
+                clock.clone(),
+                binding.selection().generation,
+                candidate.minimum_severity(),
+            )
+            .map_err(|error| adapter("logging", error))?;
+            let control = Control::with_logging(logging);
+            control.log(td_mta::observability::Kind::BootStarted, None, None);
+            control.log(td_mta::observability::Kind::ConfigActivated, None, None);
+            let log_finished = AtomicBool::new(false);
             if super::signal_sys::requested().map_err(|_| config_failure("signals", "io"))? {
                 control.stop();
             }
             let finished = AtomicBool::new(false);
             let queue_control = td_mta::postgres_relay_worker::QueueControl::default();
             std::thread::scope(|scope| {
+                let _log_finish = LogFinish {
+                    finished: &log_finished,
+                    control: &control,
+                };
+                let _log_worker = std::thread::Builder::new()
+                    .name("database-logs".into())
+                    .spawn_scoped(scope, || {
+                        if let Some(producer) = control.logging() {
+                            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                log_writer.run(
+                                    producer,
+                                    &loaded,
+                                    &executable,
+                                    binding.epoch(),
+                                    binding.profile(),
+                                    &log_finished,
+                                )
+                            }))
+                            .is_err()
+                            {
+                                producer.writer_failed();
+                            }
+                        }
+                    })
+                    .map_err(|_| config_failure("logging", "worker-start"))?;
                 let worker = std::thread::Builder::new()
                     .name("smtp-control".into())
                     .spawn_scoped(scope, || {
@@ -346,7 +380,7 @@ pub(super) fn run(options: Options) -> Result<(), ConfigFailure> {
                             )
                         }));
                         if !matches!(result, Ok(Ok(()))) {
-                            control.stop();
+                            control.fail();
                         }
                         result
                     })
@@ -364,7 +398,7 @@ pub(super) fn run(options: Options) -> Result<(), ConfigFailure> {
                                     https.run(&control)
                                 }));
                             if !matches!(result, Ok(Ok(()))) {
-                                control.stop();
+                                control.fail();
                             }
                             result
                         }) {
@@ -401,7 +435,7 @@ pub(super) fn run(options: Options) -> Result<(), ConfigFailure> {
                                             || relay_service.run(control, relay_ready),
                                         ));
                                     if !matches!(result, Ok(Ok(()))) {
-                                        control.stop();
+                                        control.fail();
                                     }
                                     result
                                 }
@@ -421,6 +455,24 @@ pub(super) fn run(options: Options) -> Result<(), ConfigFailure> {
                             return Err(ports::Error::WriterStopped);
                         }
                         std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    if !listeners.is_empty() {
+                        control.log(
+                            td_mta::observability::Kind::ListenerReady {
+                                protocol: td_mta::observability::Listener::Smtp,
+                            },
+                            None,
+                            None,
+                        );
+                    }
+                    if mailbox_access {
+                        control.log(
+                            td_mta::observability::Kind::ListenerReady {
+                                protocol: td_mta::observability::Listener::Jmap,
+                            },
+                            None,
+                            None,
+                        );
                     }
                     announce(listeners.len(), mailbox_access, relay)
                 };
@@ -489,6 +541,24 @@ impl Drop for ControlFinish<'_> {
     fn drop(&mut self) {
         self.finished.store(true, Ordering::Release);
         self.control.stop();
+    }
+}
+
+struct LogFinish<'a> {
+    finished: &'a AtomicBool,
+    control: &'a Control,
+}
+impl Drop for LogFinish<'_> {
+    fn drop(&mut self) {
+        self.control.log(
+            td_mta::observability::Kind::ServiceStopped {
+                failed: std::thread::panicking()
+                    || self.control.state() == td_mta::smtp_receiving::State::Failed,
+            },
+            None,
+            None,
+        );
+        self.finished.store(true, Ordering::Release);
     }
 }
 

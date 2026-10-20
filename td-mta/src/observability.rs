@@ -132,9 +132,93 @@ impl Delivery {
         }
     }
 }
+/// Fixed relay phases; never copied from server text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RelayStep {
+    Mail,
+    Rcpt,
+    Data,
+    Body,
+    Source,
+    Final,
+}
+impl RelayStep {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Mail => "mail",
+            Self::Rcpt => "rcpt",
+            Self::Data => "data",
+            Self::Body => "body",
+            Self::Source => "source",
+            Self::Final => "final",
+        }
+    }
+}
+fn connect_stage(stage: crate::postgres_relay_connect::Stage) -> &'static str {
+    use crate::postgres_relay_connect::Stage;
+    match stage {
+        Stage::Admission => "admission",
+        Stage::Resolve => "resolve",
+        Stage::Dial => "dial",
+        Stage::StartTls => "starttls",
+        Stage::Handshake => "handshake",
+        Stage::Ehlo => "ehlo",
+        Stage::Auth => "auth",
+    }
+}
+fn connect_error(error: Option<crate::ports::Error>) -> &'static str {
+    use crate::ports::Error;
+    match error {
+        None => "publication",
+        Some(Error::Capacity) => "capacity",
+        Some(Error::Quota) => "quota",
+        Some(Error::Busy) => "busy",
+        Some(Error::Deadline) => "deadline",
+        Some(Error::NotFound) => "not_found",
+        Some(Error::Forbidden) => "forbidden",
+        Some(Error::Invalid) => "invalid",
+        Some(Error::Corrupt) => "corrupt",
+        Some(Error::Conflict) => "conflict",
+        Some(Error::HistoryLost) => "history_lost",
+        Some(Error::WriterStopped) => "writer_stopped",
+        Some(Error::Entropy) => "entropy",
+        Some(Error::Crypto) => "crypto",
+        Some(Error::Tls) => "tls",
+        Some(Error::Dns) => "dns",
+        Some(Error::Io { .. }) => "io",
+    }
+}
+fn notice_error(error: crate::postgres_failure_notice::Error) -> &'static str {
+    use crate::postgres_failure_notice::Error;
+    match error {
+        Error::Connection(_) => "connection",
+        Error::Owner(_) => "owner",
+        Error::Work(error) => connect_error(Some(error)),
+        Error::Policy => "policy",
+        Error::Integrity => "integrity",
+        Error::Capacity => "capacity",
+        Error::Quota => "quota",
+        Error::Database => "database",
+        Error::Crypto => "crypto",
+        Error::Indeterminate => "indeterminate",
+    }
+}
 /// No free-form strings, addresses, credentials or message fields are accepted.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Kind {
+    DeliveryNoticeDeferred {
+        error: crate::postgres_failure_notice::Error,
+    },
+    RelayConnectionFailed {
+        stage: crate::postgres_relay_connect::Stage,
+        error: Option<crate::ports::Error>,
+    },
+    RelayStepFailed {
+        stage: RelayStep,
+    },
+    ServiceStopped {
+        failed: bool,
+    },
     BootStarted,
     ConfigActivated,
     ListenerReady {
@@ -179,6 +263,10 @@ pub enum Kind {
 impl Kind {
     pub const fn code(self) -> &'static str {
         match self {
+            Self::DeliveryNoticeDeferred { .. } => "delivery_notice_deferred",
+            Self::RelayConnectionFailed { .. } => "relay_connection_failed",
+            Self::RelayStepFailed { .. } => "relay_step_failed",
+            Self::ServiceStopped { .. } => "service_stopped",
             Self::BootStarted => "boot_started",
             Self::ConfigActivated => "config_activated",
             Self::ListenerReady { .. } => "listener_ready",
@@ -200,7 +288,10 @@ impl Kind {
     }
     pub const fn severity(self) -> Severity {
         match self {
-            Self::AdmissionRefused { .. }
+            Self::DeliveryNoticeDeferred { .. }
+            | Self::RelayConnectionFailed { .. }
+            | Self::RelayStepFailed { .. }
+            | Self::AdmissionRefused { .. }
             | Self::TlsFailed { .. }
             | Self::AuthenticationFailed
             | Self::CertificateRenewalFailed
@@ -208,8 +299,9 @@ impl Kind {
             | Self::RelayOutcome {
                 outcome: Delivery::Retry | Delivery::PermanentFailure | Delivery::Unknown,
             } => Severity::Warning,
-            Self::LogWriteFailed { .. } => Severity::Error,
-            Self::BootStarted
+            Self::LogWriteFailed { .. } | Self::ServiceStopped { failed: true } => Severity::Error,
+            Self::ServiceStopped { failed: false }
+            | Self::BootStarted
             | Self::ConfigActivated
             | Self::ListenerReady { .. }
             | Self::ConnectionOpened { .. }
@@ -226,6 +318,11 @@ impl Kind {
     }
     fn action(self) -> Option<&'static str> {
         match self {
+            Self::DeliveryNoticeDeferred { .. }
+            | Self::RelayConnectionFailed { .. }
+            | Self::RelayStepFailed { .. } => Some("inspect_relay"),
+            Self::ServiceStopped { failed: true } => Some("inspect_service"),
+            Self::ServiceStopped { failed: false } => None,
             Self::AdmissionRefused { reason } => Some(reason.action()),
             Self::RelayOutcome {
                 outcome: Delivery::PermanentFailure | Delivery::Unknown,
@@ -278,6 +375,17 @@ impl fmt::Display for EventJson<'_> {
             e.kind.severity().code()
         )?;
         match e.kind {
+            Kind::DeliveryNoticeDeferred { error } => {
+                write!(f, ",\"error\":\"{}\"", notice_error(error))?
+            }
+            Kind::ServiceStopped { failed } => write!(f, ",\"failed\":{failed}")?,
+            Kind::RelayStepFailed { stage } => write!(f, ",\"stage\":\"{}\"", stage.code())?,
+            Kind::RelayConnectionFailed { stage, error } => write!(
+                f,
+                ",\"stage\":\"{}\",\"error\":\"{}\"",
+                connect_stage(stage),
+                connect_error(error)
+            )?,
             Kind::TlsFailed { protocol } => write!(f, ",\"protocol\":\"{}\"", protocol.code())?,
             Kind::TlsEstablished { protocol, version } => {
                 let security = match version {
@@ -506,6 +614,22 @@ mod tests {
                 os_code: Some(i32::MIN),
             },
             Kind::LogWriteFailed { os_code: None },
+            Kind::DeliveryNoticeDeferred {
+                error: crate::postgres_failure_notice::Error::Indeterminate,
+            },
+            Kind::ServiceStopped { failed: false },
+            Kind::ServiceStopped { failed: true },
+            Kind::RelayConnectionFailed {
+                stage: crate::postgres_relay_connect::Stage::Auth,
+                error: Some(crate::ports::Error::Invalid),
+            },
+            Kind::RelayConnectionFailed {
+                stage: crate::postgres_relay_connect::Stage::Admission,
+                error: None,
+            },
+            Kind::RelayStepFailed {
+                stage: RelayStep::Final,
+            },
         ];
         for protocol in [Protocol::Smtp, Protocol::Jmap, Protocol::Relay] {
             result.push(Kind::TlsFailed { protocol });
@@ -676,6 +800,9 @@ mod tests {
     // Independent v1 contract oracle; a new variant requires an explicit policy.
     fn policy(kind: Kind) -> (&'static str, &'static str, &'static str) {
         match kind {
+            Kind::DeliveryNoticeDeferred { .. } => {
+                ("delivery_notice_deferred", "warning", "[\"inspect_relay\"]")
+            }
             Kind::BootStarted => ("boot_started", "info", "[]"),
             Kind::ConfigActivated => ("config_activated", "info", "[]"),
             Kind::ListenerReady { .. } => ("listener_ready", "info", "[]"),
@@ -715,6 +842,14 @@ mod tests {
             ),
             Kind::LogSuppressed { .. } => ("log_suppressed", "warning", "[\"inspect_logging\"]"),
             Kind::LogWriteFailed { .. } => ("log_write_failed", "error", "[\"inspect_logging\"]"),
+            Kind::ServiceStopped { failed: false } => ("service_stopped", "info", "[]"),
+            Kind::ServiceStopped { failed: true } => {
+                ("service_stopped", "error", "[\"inspect_service\"]")
+            }
+            Kind::RelayConnectionFailed { .. } => {
+                ("relay_connection_failed", "warning", "[\"inspect_relay\"]")
+            }
+            Kind::RelayStepFailed { .. } => ("relay_step_failed", "warning", "[\"inspect_relay\"]"),
         }
     }
     #[test]

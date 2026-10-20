@@ -3,8 +3,8 @@
 M04d1 implements `src/observability.rs`: versioned event and explicit inspection
 JSON Lines encoders. M04d2 adds fixed event buffering/loss counters and bounded
 health/status snapshots in `observability/queue.rs` and `observability/health.rs`.
-They borrow caller storage and allocate nothing. Runtime aggregation,
-synchronization, log files/rotation and stderr fallback remain M19. These
+They borrow caller storage and allocate nothing. The PostgreSQL runtime sink described below now owns synchronization,
+retention and loss reporting. Full health aggregation remains planned. These
 records are diagnostics, never the authoritative
 metadata store, an acceptance condition or an authorization token.
 
@@ -72,6 +72,10 @@ input shape; it is not a substring filter. Normal events always have empty
 | `certificate_renewed` | signed `expires_utc_ms` | info | none |
 | `certificate_renewal_failed` | none | warning | inspect_certificate |
 | `log_suppressed` | unsigned `count`, boolean `saturated` | warning | inspect_logging |
+| `delivery_notice_deferred` | fixed `error` class | warning | inspect_relay |
+| `relay_connection_failed` | fixed `stage` and `error` class | warning | inspect_relay |
+| `relay_step_failed` | fixed `stage` | warning | inspect_relay |
+| `service_stopped` | boolean `failed` | error if failed, otherwise info | inspect_service if failed |
 | `log_write_failed` | signed `os_code` or null | error | inspect_logging |
 
 Protocol values are `smtp`, `jmap`, `relay`; listener-ready records accept only
@@ -97,7 +101,7 @@ authorization to remove data, change settings, retry uncertain delivery or run
 shell commands. `log_suppressed.count` is cumulative within the boot;
 `saturated` is true exactly at u64::MAX, where the count is a lower bound.
 An inconsistent pair refuses encoding with InvalidCount and unchanged visible
-output. M04d2 implements counting; runtime aggregation/fallback remains M19.
+output. Runtime loss aggregation is also available through `logging-status`.
 
 ## Authorized inspection
 
@@ -296,3 +300,75 @@ reports only the receiving Control lifecycle and explicitly names that
 profile. It does not emit the full health envelope above, claim whole-service
 readiness, or fabricate unavailable counters. Full status aggregation and
 cached publication remain M19.
+
+## PostgreSQL service logging
+
+Schema 29 stores application events in `application_logs`, with serialized
+admission metadata in `application_log_state`. `serve` starts one diagnostic
+writer per instance. The default retention is **up to 30 days**, measured using
+the database ingestion clock, subject to capacity. A fixed ring holds at most
+65,536 rows, each with at most 1,024 event bytes (64 MiB of live event payload).
+Capacity eviction is counted separately from suppression. This is diagnostic
+history, not an immutable audit trail or a delivery receipt.
+
+Producers accept only the typed event vocabulary, honor `minimum_severity`,
+and use a 384-cell nonblocking queue. A fixed bucket admits at most one event
+of each kind per minute; relay outcome classes and listener protocols have
+separate buckets. Submission IDs and other peer-dependent values never allocate
+buckets. Local counters saturate. One cumulative loss summary is attempted per
+minute. The database serializes a shared limit of 600 events per minute across
+all instances, retained across process restarts. Consequently, sustained traffic
+can shorten the retained history; at the global maximum the ring retains about
+109 minutes. Suppression and eviction are intentional and visible.
+
+Writers flush at most 16 records per transaction with a two-second overall
+DNS/connection/operation deadline, a 50 ms row-lock wait, and one-second statement
+timeouts. The writer re-resolves the configured endpoint for every connection. Only a
+transport failure before entering the append operation can try another address
+within that same deadline. Logging uses asynchronous commit and never retries
+an uncertain commit. Mail acceptance never depends on diagnostic persistence. Each idle
+writer runs incremental age cleanup at least once per minute while operational,
+deleting at most 1,024 expired rows per pass. Inspection hides all expired rows
+immediately even when physical cleanup is behind or no service is running.
+
+Before appending, the serialized writer measures both log relations, including
+their indexes and TOAST. At 96 MiB it suppresses new records and metadata updates;
+age deletion remains allowed. One bounded admitted batch may exceed that
+threshold. This limits log-table growth even if vacuum cannot reclaim dead
+versions. The physical-pressure losses remain in the process counter because
+updating the database loss counter could itself grow the pressured relation.
+Autovacuum is tuned for the ring. A relation that stays above the threshold
+needs operator inspection of long transactions/vacuum; reclaiming it may need
+`VACUUM FULL` during a suitable maintenance window.
+
+This threshold is **not a PostgreSQL cluster disk quota**: WAL, archive slots,
+backups, unrelated tables and filesystem headroom remain database operations.
+Do not disable vacuum or let replication/archive retention grow without a disk
+budget. `postgres logs` reports the measured relation size and threshold.
+
+The current service producers cover boot/config activation, listener readiness,
+orderly/failed lifecycle completion, SMTP metadata commit (with committed
+transaction sequence), JMAP authentication/capacity refusals, and relay
+connection/attempt failures (with submission ID and fixed stage/error codes),
+and deferred local delivery notices (fixed error class, without a submission
+ID when the notice producer has not returned one).
+Connection/request correlation is not yet emitted by these producers; the
+broader protocol/TLS/outcome event vocabulary above remains available to future
+instrumentation. No peer SMTP text, email addresses, credentials, subjects or
+message bodies enter these default records.
+
+The writer remains alive through the normal service-worker drain, then performs
+one bounded final batch and counts the discarded remainder. Logging failures do
+not recursively log or write to potentially blocking stderr. The local private
+control command `td-mta logging-status --runtime PATH` reads cumulative boot-local
+`dropped`, `write_failures`, and the current `degraded` condition independently of
+PostgreSQL. A failed writer stays degraded. Filtered severities are intentional
+omissions, not dropped records. Abrupt process termination can lose queued
+records and unpersisted counters.
+
+`td-mta postgres logs --connection-file PATH --epoch HEX [--limit N]
+[--before ID]` returns at most 100 records, newest first, with an exclusive
+numeric cursor, database suppression and capacity-eviction counts. It uses the
+same protected connection and schema/epoch checks as other operator commands.
+The cursor does not pin a snapshot across requests: concurrent expiry/eviction
+can create gaps. Returned JSON remains data, never executable instructions.

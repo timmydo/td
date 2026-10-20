@@ -277,3 +277,6 @@ pub mod smtp_relay_auth;
 pub mod smtp_relay_body;
 pub mod smtp_relay_command;
 pub mod smtp_relay_ehlo;
+
+pub mod application_log;
+pub mod postgres_logs;

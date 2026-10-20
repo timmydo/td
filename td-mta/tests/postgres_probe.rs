@@ -395,7 +395,7 @@ fn real_postgres_schema_initialization_is_atomic_and_locked() {
     );
     wait_command(&mut shared);
     let receipt = initialize(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 28);
+    assert_eq!(receipt.version, 29);
     assert_eq!(
         inspect(&fixture.request(), &trust, deadline()).unwrap(),
         receipt
@@ -472,7 +472,7 @@ CREATE EVENT TRIGGER td_schema_delay ON ddl_command_end WHEN TAG IN ('CREATE TAB
         inspect(&fixture.request(), &trust, deadline())
             .unwrap()
             .version,
-        28
+        29
     );
     assert_eq!(
         initialize(&fixture.request(), &trust, deadline()),
@@ -597,7 +597,7 @@ fn real_postgres_schema_commands_prepare_and_inspect_one_epoch() {
     };
     assert!(invoke("schema-inspect", 1).contains("schema-operation-failed"));
     let initialized = invoke("schema-init", 0);
-    assert!(initialized.contains("\"schema_version\":28"));
+    assert!(initialized.contains("\"schema_version\":29"));
     assert!(initialized.contains(
         "\"ledger_checked\":true,\"serving_schema_checked\":false,\"profile_checked\":false"
     ));
@@ -842,7 +842,7 @@ fn real_postgres_runtime_credentials_separate_mail_writes_from_owner_authority()
     }
     sql(
         &fixture,
-        "UPDATE td_mta.schema_migrations SET version=99 WHERE version=28",
+        "UPDATE td_mta.schema_migrations SET version=99 WHERE version=29",
     );
     assert_eq!(
         probe(&serving, &trust, deadline()),
@@ -850,7 +850,7 @@ fn real_postgres_runtime_credentials_separate_mail_writes_from_owner_authority()
     );
     sql(
         &fixture,
-        "UPDATE td_mta.schema_migrations SET version=28 WHERE version=99",
+        "UPDATE td_mta.schema_migrations SET version=29 WHERE version=99",
     );
     assert_eq!(
         schema::inspect(&serving, &trust, deadline()).unwrap(),
@@ -1032,7 +1032,7 @@ fn real_postgres_material_schema_upgrade_preserves_epoch_and_rolls_back() {
     );
     wait_command(&mut held);
     let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 28);
+    assert_eq!(receipt.version, 29);
     assert_eq!(receipt.store_epoch.as_bytes(), &[1; 16]);
     assert_eq!(
         upgrade(&fixture.request(), &trust, deadline()).unwrap(),
@@ -1741,7 +1741,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
     use td_mta::postgres_schema::{inspect, upgrade, Error as SchemaError};
     for previous_version in [
         2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-        27,
+        27, 28,
     ] {
         let fixture = Fixture::new();
         let trust = TrustStore::from_pem(&fixture.ca).unwrap();
@@ -1773,6 +1773,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             include_str!("../src/postgres_route_health.sql"),
             include_str!("../src/postgres_submission_cancel.sql"),
             include_str!("../src/postgres_final_capacity.sql"),
+            include_str!("../src/postgres_runtime_barrier.sql"),
         ]
         .iter()
         .take(previous_version)
@@ -1822,6 +1823,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             25 => "submission_cancel_receipts",
             26 => "attempt_final_reservations",
             27 => "runtime_barrier",
+            28 => "application_log_state",
             _ => "flag_receipts",
         };
         if previous_version == 8 {
@@ -1874,7 +1876,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             sql(&fixture,"UPDATE td_mta.recipients SET state=7,uncertain=1,phase=4,reason=9,next_attempt_at=1");
         }
         let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
-        assert_eq!(receipt.version, 28);
+        assert_eq!(receipt.version, 29);
         assert_eq!(
             sql(
                 &fixture,
@@ -2518,6 +2520,7 @@ mod serving_relay;
 #[test]
 #[ignore = "real local PostgreSQL tools required"]
 fn real_postgres_executable_receives_and_serves_database_profiles() {
+    application_logs::real_postgres_logs_bound_retention_rate_wrap_and_inspection();
     exercise_configuration(ConfigurationExercise::Serving);
 }
 
@@ -12193,3 +12196,6 @@ fn expiry_wait_snapshot(fixture: &Fixture, publish: impl FnOnce()) {
     restore.push_str("COMMIT;");
     sql(fixture, &restore);
 }
+
+#[path = "postgres_probe/application_logs.rs"]
+mod application_logs;

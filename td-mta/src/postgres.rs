@@ -14,6 +14,7 @@ mod configuration;
 mod device_create;
 mod device_list;
 mod device_revoke;
+mod logs;
 mod maintenance;
 mod material;
 mod metadata_audit;
@@ -82,6 +83,9 @@ fn arguments(operation: Operation, mut args: impl Iterator<Item = OsString>) -> 
 
 pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<ExitCode> {
     let command = args.next();
+    if command.as_deref() == Some(OsStr::new("logs")) {
+        return logs::run(args);
+    }
     if let Some(operation) = command.as_deref().and_then(maintenance::Operation::parse) {
         return maintenance::run(operation, args);
     }

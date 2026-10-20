@@ -216,6 +216,11 @@ fn exchange_queue(
     let start = Instant::now();
     let mut bytes = [0; 256];
     let request = line(stream, start, &mut bytes, true)?;
+    if request == b"LOG-STATUS\n" {
+        let value = control.logging_status();
+        let response=match value {Some(status)=>format!("{{\"schema\":1,\"command\":\"logging-status\",\"status\":\"ok\",\"dropped\":{},\"write_failures\":{},\"degraded\":{}}}\n",status.dropped,status.write_failures,status.degraded),None=>"{\"schema\":1,\"command\":\"logging-status\",\"status\":\"unavailable\"}\n".to_owned()};
+        return send(stream, start, response.as_bytes());
+    }
     let response: &[u8] = match request {
         b"STATUS\n" => match control.state() {
             State::Starting => b"STARTING\n",
@@ -340,6 +345,22 @@ fn connect(runtime: &str) -> Result<(PrivateRoot, UnixStream), ConfigFailure> {
     let stream = UnixStream::connect(&path).map_err(io_failure)?;
     Ok((root, stream))
 }
+pub(super) fn logging_request(runtime: &str) -> Result<String, ConfigFailure> {
+    let (_root, mut stream) = connect(runtime)?;
+    let start = Instant::now();
+    send(&mut stream, start, b"LOG-STATUS\n").map_err(io_failure)?;
+    stream
+        .shutdown(std::net::Shutdown::Write)
+        .map_err(io_failure)?;
+    let mut bytes = [0; 256];
+    let response = line(&mut stream, start, &mut bytes, false).map_err(io_failure)?;
+    let text = std::str::from_utf8(response)
+        .map_err(|_| super::config_failure("logging", "invalid-response"))?;
+    let json =
+        td_json::parse(text).map_err(|_| super::config_failure("logging", "invalid-response"))?;
+    Ok(json.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]

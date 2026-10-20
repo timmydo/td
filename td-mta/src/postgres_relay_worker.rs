@@ -231,7 +231,11 @@ impl Worker<'_, '_> {
                     claim,
                     generation,
                 ) {
-                    eprintln!("td-mta: local delivery notice deferred: {error:?}");
+                    control.log(
+                        crate::observability::Kind::DeliveryNoticeDeferred { error },
+                        None,
+                        None,
+                    );
                     // Serialize behind COMMIT or rollback before short-lock reads.
                     database(owners::renew(
                         self.request,
@@ -435,6 +439,7 @@ impl Worker<'_, '_> {
         generation: u64,
     ) -> Result<Buffers, Error> {
         let id = prepared.attempt();
+        let submission = prepared.outcome().submission;
         let mode = database(prepared.body_mode(self.maximum, db))?;
         let mut wire = meter(cap);
         let (mut input, mut first, mut second, mut third, mut command) =
@@ -465,6 +470,17 @@ impl Worker<'_, '_> {
         let connected = match connected {
             Ok(value) => value,
             Err(failure) => {
+                control.log(
+                    crate::observability::Kind::RelayConnectionFailed {
+                        stage: failure.stage,
+                        error: match failure.error {
+                            connect::Error::Protocol(error) => Some(error),
+                            connect::Error::Publication(_) => None,
+                        },
+                    },
+                    Some(submission),
+                    None,
+                );
                 let buffers = failure.buffers?;
                 match failure.closed {
                     connect::Closed::Interrupted(closed) => recover(
@@ -512,26 +528,16 @@ impl Worker<'_, '_> {
                 Ok(done.buffers?)
             }
             Err(stopped) => {
-                match &stopped.evidence {
-                    attempt::Evidence::Mail(f) => {
-                        eprintln!("td-mta: relay MAIL stopped: {:?}", f.error)
-                    }
-                    attempt::Evidence::Rcpt { error, .. } => {
-                        eprintln!("td-mta: relay RCPT stopped: {error:?}")
-                    }
-                    attempt::Evidence::Data(f) => {
-                        eprintln!("td-mta: relay DATA stopped: {:?}", f.error)
-                    }
-                    attempt::Evidence::Body(f) => {
-                        eprintln!("td-mta: relay body stopped: {:?}", f.error)
-                    }
-                    attempt::Evidence::Source(f) => {
-                        eprintln!("td-mta: relay source stopped: {:?}", f.error)
-                    }
-                    attempt::Evidence::Final(f) => {
-                        eprintln!("td-mta: relay final reply stopped: {:?}", f.error)
-                    }
-                }
+                use crate::observability::{Kind, RelayStep};
+                let stage = match &stopped.evidence {
+                    attempt::Evidence::Mail(_) => RelayStep::Mail,
+                    attempt::Evidence::Rcpt { .. } => RelayStep::Rcpt,
+                    attempt::Evidence::Data(_) => RelayStep::Data,
+                    attempt::Evidence::Body(_) => RelayStep::Body,
+                    attempt::Evidence::Source(_) => RelayStep::Source,
+                    attempt::Evidence::Final(_) => RelayStep::Final,
+                };
+                control.log(Kind::RelayStepFailed { stage }, Some(submission), None);
                 let fallback = stopped.interruption;
                 let (buffers, changes, recovery) = match stopped.evidence {
                     attempt::Evidence::Mail(f) => (
