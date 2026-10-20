@@ -535,6 +535,40 @@ recovery additionally requires POSTGRES.md section 6's old-instance fencing,
 fresh epoch, credential/configuration review and delivery quarantine; the
 current local drill supplies none of that activation authority.
 
+## Scheduled operator health
+
+Check each selected mail profile with `td-mta status --json --require-ready`
+and its private runtime directory. Check each native certificate worker with
+`td-mta acme-status --connection-file PATH --certificate-profile NAME
+--require-ready --minimum-validity-seconds 2592000`. Keep these as separate
+supervisor commands so a failing profile cannot be hidden by another healthy
+one. Public ACME health does not cover a private PostgreSQL certificate;
+check that leaf and its CA with the expiry command in the next section.
+
+For a bounded backup destination, use:
+
+```text
+./install-td-mta --backup-status --destination /home/alice/mail-backups \
+  --maximum-age-seconds 172800
+```
+
+This read-only command exits zero only for a completed archive with a matching
+receipt and file length, whose recorded creation time is no more than two days
+old (the default), is not in the future, and has no retained `last-error` tool
+diagnostic. The age bound accepts 1 through 31536000 seconds. An empty directory,
+invalid receipt, missing archive, stale backup or I/O failure exits one. The
+JSON result includes age, archive count and directory bytes. It does not hash
+archive contents, restore data, or certify recoverability. Filename sequence
+numbers do not substitute for the receipt's creation time after clock rollback.
+A concurrent producer may change files during this observation; retry a failed
+check after that bounded job finishes. Inspect the backup supervisor's result
+as well: failures before tool startup need not create a `last-error` file.
+
+Schedule checks independently of the services they observe, retain their exit
+status in the supervisor, and arrange operator notification appropriate to the
+host. A timer alone does not send an alert. Check free disk space and off-host
+backup copies separately; a recent local archive does not cover VM loss.
+
 ## Renew a local private certificate
 
 A local `localhost` deployment uses its explicitly trusted private CA;

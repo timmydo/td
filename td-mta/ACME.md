@@ -47,6 +47,15 @@ td-mta acme-status --connection-file /private/runtime-connection \
 Status reports pending, ready, degraded or expired, the selected certificate
 generation, expiry, next attempt, failure count and whether an owner lease is
 live. Ready is a database observation, not an external reachability test.
+By default a successful status query exits zero even when the worker is not
+ready. Add `--require-ready` for supervisor health checks: it exits one unless
+the status is ready. `--minimum-validity-seconds N` additionally reports
+`expiring` when the active certificate has less than N seconds remaining;
+N is 0 through 31536000, default zero. Combine both options to fail a check
+before expiry, for example `--require-ready --minimum-validity-seconds 2592000`
+for a 30-day margin. A live lease and no recorded renewal failures are also
+required for ready status. These checks do not trigger issuance or renewal.
+
 Certificate success/failure events use the bounded application-log tables.
 Database outages can prevent both persistence and logging; the HTTP-01 cache
 expires and the worker retries ownership acquisition. No peer diagnostics or

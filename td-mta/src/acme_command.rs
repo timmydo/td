@@ -249,21 +249,65 @@ pub(super) fn run(options: Options) -> Result<(), ConfigFailure> {
     })
 }
 
-pub(super) fn status(mut args: impl Iterator<Item = OsString>) -> Result<(), ConfigFailure> {
-    let (mut connection, mut profile) = (None, None);
+struct StatusOptions {
+    connection: String,
+    profile: String,
+    require_ready: bool,
+    minimum_validity_ms: i64,
+}
+
+fn status_arguments(mut args: impl Iterator<Item = OsString>) -> Option<StatusOptions> {
+    let (mut connection, mut profile, mut minimum) = (None, None, None);
+    let mut require_ready = false;
     while let Some(flag) = args.next() {
-        let value = args
-            .next()
-            .and_then(|v| v.into_string().ok())
-            .ok_or_else(|| config_failure("arguments", "invalid-arguments"))?;
+        if flag == "--require-ready" {
+            if require_ready {
+                return None;
+            }
+            require_ready = true;
+            continue;
+        }
+        let value = args.next()?.into_string().ok()?;
         match flag.to_str() {
             Some("--connection-file") if connection.is_none() => connection = Some(value),
             Some("--certificate-profile") if profile.is_none() => profile = Some(value),
-            _ => return Err(config_failure("arguments", "invalid-arguments")),
+            Some("--minimum-validity-seconds") if minimum.is_none() => {
+                let seconds = value.parse::<u32>().ok()?;
+                if seconds > 31_536_000 {
+                    return None;
+                }
+                minimum = Some(i64::from(seconds) * 1000);
+            }
+            _ => return None,
         }
     }
-    let connection = connection.ok_or_else(|| config_failure("arguments", "invalid-arguments"))?;
-    let profile = profile.ok_or_else(|| config_failure("arguments", "invalid-arguments"))?;
+    Some(StatusOptions {
+        connection: connection?,
+        profile: profile?,
+        require_ready,
+        minimum_validity_ms: minimum.unwrap_or(0),
+    })
+}
+
+fn status_health(status: &postgres_acme::Status, now: i64, minimum_ms: i64) -> &'static str {
+    if status.generation == 0 {
+        "pending"
+    } else if status.expires_ms <= now {
+        "expired"
+    } else if status.expires_ms < now.saturating_add(minimum_ms) {
+        "expiring"
+    } else if !status.leased || status.failures > 0 {
+        "degraded"
+    } else {
+        "ready"
+    }
+}
+
+pub(super) fn status(args: impl Iterator<Item = OsString>) -> Result<bool, ConfigFailure> {
+    let options =
+        status_arguments(args).ok_or_else(|| config_failure("arguments", "invalid-arguments"))?;
+    let connection = options.connection;
+    let profile = options.profile;
     let loaded = td_mta::postgres_input::Loaded::open(&connection, "acme")
         .map_err(|_| config_failure("acme", "connection-file"))?;
     let executable = std::env::current_exe().map_err(|_| config_failure("acme", "executable"))?;
@@ -296,18 +340,74 @@ pub(super) fn status(mut args: impl Iterator<Item = OsString>) -> Result<(), Con
         )
         .map_err(|_| config_failure("acme", "status"))?;
         let now = now().map_err(|_| config_failure("acme", "clock"))?;
-        let health = if status.generation == 0 {
-            "pending"
-        } else if status.expires_ms <= now {
-            "expired"
-        } else if !status.leased || status.failures > 0 {
-            "degraded"
-        } else {
-            "ready"
-        };
+        let health = status_health(&status, now, options.minimum_validity_ms);
         use std::io::Write;
         writeln!(std::io::stdout().lock(),"{{\"schema\":1,\"command\":\"acme-status\",\"status\":\"{health}\",\"generation\":{},\"expires_utc_ms\":{},\"next_attempt_utc_ms\":{},\"failures\":{},\"leased\":{}}}",status.generation,status.expires_ms,status.next_ms,status.failures,status.leased).map_err(|_|config_failure("acme","output"))?;
-        return Ok(());
+        return Ok(!options.require_ready || health == "ready");
     }
     Err(config_failure("acme", "connection"))
+}
+
+#[cfg(test)]
+mod status_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    #[test]
+    fn status_arguments_bound_and_preserve_optional_readiness() {
+        let base = [
+            "--connection-file",
+            "/private/runtime",
+            "--certificate-profile",
+            "public",
+        ];
+        let parse = |extra: &[&str]| {
+            status_arguments(
+                base.iter()
+                    .chain(extra.iter())
+                    .map(|value| OsString::from(*value)),
+            )
+        };
+        let default = parse(&[]).unwrap();
+        assert!(!default.require_ready);
+        assert_eq!(default.minimum_validity_ms, 0);
+        let strict = parse(&["--require-ready", "--minimum-validity-seconds", "2592000"]).unwrap();
+        assert!(strict.require_ready);
+        assert_eq!(strict.minimum_validity_ms, 2_592_000_000);
+        for extra in [
+            vec!["--require-ready", "--require-ready"],
+            vec!["--minimum-validity-seconds"],
+            vec!["--minimum-validity-seconds", "-1"],
+            vec!["--minimum-validity-seconds", "31536001"],
+            vec![
+                "--minimum-validity-seconds",
+                "1",
+                "--minimum-validity-seconds",
+                "2",
+            ],
+        ] {
+            assert!(parse(&extra).is_none());
+        }
+    }
+
+    #[test]
+    fn status_health_detects_expiry_leases_failures_and_validity_margin() {
+        let mut status = postgres_acme::Status {
+            generation: 0,
+            next_ms: 0,
+            expires_ms: 2000,
+            failures: 0,
+            leased: true,
+        };
+        assert_eq!(status_health(&status, 1000, 0), "pending");
+        status.generation = 1;
+        assert_eq!(status_health(&status, 2000, 0), "expired");
+        assert_eq!(status_health(&status, 1000, 1000), "ready");
+        assert_eq!(status_health(&status, 1000, 1001), "expiring");
+        status.leased = false;
+        assert_eq!(status_health(&status, 1000, 0), "degraded");
+        status.leased = true;
+        status.failures = 1;
+        assert_eq!(status_health(&status, 1000, 0), "degraded");
+    }
 }

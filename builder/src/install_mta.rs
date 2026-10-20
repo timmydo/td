@@ -25,6 +25,7 @@ Database preparation and credentials remain explicit (td-mta/POSTGRES.md).
 --services-only uses the already installed executable without rebuilding.
 Use --setup-local --help to provision a new private local PostgreSQL account.
 Use --backup --help for bounded host PostgreSQL logical backups.
+Use --backup-status --help for read-only backup freshness checks.
 ";
 
 #[derive(Debug)]
@@ -428,6 +429,9 @@ fn install(root: &Path, opts: &Options) -> Result<()> {
 }
 
 pub(crate) fn run(args: &[String]) -> ExitCode {
+    if args.first().is_some_and(|v| v == "--backup-status") {
+        return install_mta_backup::status(args.get(1..).unwrap_or_default());
+    }
     if args.first().is_some_and(|v| v == "--backup") {
         return install_mta_backup::run(args.get(1..).unwrap_or_default());
     }

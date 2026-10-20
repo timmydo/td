@@ -564,6 +564,121 @@ pub(super) fn run(args: &[String]) -> ExitCode {
     }
 }
 
+// Readiness observes the receipt and file length; it does not verify contents.
+fn receipt_created(input: &str, archive: &Archive) -> Result<u64> {
+    let receipt = crate::json::parse(input).map_err(|_| "invalid backup receipt")?;
+    let number = |key| match receipt.get(key) {
+        Some(Json::Num(value)) => value.parse::<u64>().map_err(|_| "invalid receipt number"),
+        _ => Err("missing receipt number"),
+    };
+    if number("schema")? != 1
+        || number("bytes")? != archive.bytes
+        || archive.bytes == 0
+        || receipt.get("archive").and_then(Json::as_str) != archive.path.to_str()
+    {
+        return Err("backup receipt does not match archive".into());
+    }
+    Ok(number("created_unix_seconds")?)
+}
+
+fn freshness(created: u64, now: u64, maximum_age: u64, last_error: bool) -> &'static str {
+    if created > now {
+        "future"
+    } else if now - created > maximum_age {
+        "stale"
+    } else if last_error {
+        "last-attempt-failed"
+    } else {
+        "ready"
+    }
+}
+
+fn status_options(args: &[String]) -> Result<(PathBuf, u64)> {
+    let mut destination = None;
+    let mut age = None;
+    let mut args = args.iter();
+    while let Some(flag) = args.next() {
+        let value = args.next().ok_or("missing backup status option value")?;
+        match flag.as_str() {
+            "--destination" if destination.is_none() => destination = Some(absolute(value)?),
+            "--maximum-age-seconds" if age.is_none() => {
+                let seconds = value.parse::<u64>().map_err(|_| "invalid backup age")?;
+                if !(1..=31_536_000).contains(&seconds) {
+                    return Err("backup age must be 1..31536000 seconds".into());
+                }
+                age = Some(seconds);
+            }
+            _ => return Err("unknown or duplicate backup status option".into()),
+        }
+    }
+    Ok((
+        destination.ok_or("missing --destination")?,
+        age.unwrap_or(172800),
+    ))
+}
+
+fn backup_status(destination: &Path, maximum_age: u64) -> Result<bool> {
+    super::install_mta_setup::trusted_ancestors(destination)?;
+    let metadata = fs::symlink_metadata(destination).map_err(|e| e.to_string())?;
+    if metadata.uid() != crate::sys::getuid() || metadata.mode() & 0o777 != 0o700 {
+        return Err("backup destination must be owned by this user with mode 0700".into());
+    }
+    let (archives, total, _) = inventory(destination)?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_secs();
+    let mut created = Json::Null;
+    let mut age = Json::Null;
+    let health = match archives.last() {
+        None => "missing",
+        Some(archive) => {
+            let bytes = super::install_mta_setup::protected_input(
+                &archive.path.with_extension("json"),
+                65536,
+            )?;
+            let input = std::str::from_utf8(&bytes).map_err(|_| "invalid receipt encoding")?;
+            let stamp = receipt_created(input, archive)?;
+            created = Json::Num(stamp.to_string());
+            if let Some(seconds) = now.checked_sub(stamp) {
+                age = Json::Num(seconds.to_string());
+            }
+            let last_error = match fs::symlink_metadata(destination.join("last-error")) {
+                Ok(_) => true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                Err(e) => return Err(e.to_string()),
+            };
+            freshness(stamp, now, maximum_age, last_error)
+        }
+    };
+    let report = Json::Obj(vec![
+        ("schema".into(), Json::Num("1".into())),
+        ("status".into(), Json::Str(health.into())),
+        ("created_unix_seconds".into(), created),
+        ("age_seconds".into(), age),
+        ("archives".into(), Json::Num(archives.len().to_string())),
+        ("directory_bytes".into(), Json::Num(total.to_string())),
+        ("contents_verified".into(), Json::Bool(false)),
+    ]);
+    println!("{}", report.to_canonical());
+    Ok(health == "ready")
+}
+
+pub(super) fn status(args: &[String]) -> ExitCode {
+    if args == ["--help"] {
+        println!("Usage: ./install-td-mta --backup-status --destination PATH [--maximum-age-seconds N]\n\nRead-only receipt/age check; defaults to 172800 seconds (two days).\nExits 1 unless a recent completed archive and matching receipt exist,\nwith no retained tool failure diagnostic. Does not hash or restore archives.");
+        return ExitCode::SUCCESS;
+    }
+    match status_options(args).and_then(|(destination, age)| backup_status(&destination, age)) {
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::FAILURE,
+        Err(e) => {
+            eprintln!("install-td-mta backup status: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -750,5 +865,50 @@ mod tests {
             bounded_output(fixture_command("ok"), &mut output, 1024 * 1024, &diagnostic).unwrap()
                 > 262144
         );
+    }
+    #[test]
+    fn receipt_freshness_uses_recorded_time_and_requires_matching_archive() {
+        let archive = Archive {
+            path: PathBuf::from("/private/backup-9999-1.dump"),
+            stamp: 9999,
+            bytes: 12,
+        };
+        let receipt = r#"{"schema":1,"created_unix_seconds":100,"bytes":12,"archive":"/private/backup-9999-1.dump"}"#;
+        assert_eq!(receipt_created(receipt, &archive).unwrap(), 100);
+        assert_eq!(freshness(100, 200, 100, false), "ready");
+        assert_eq!(freshness(100, 201, 100, false), "stale");
+        assert_eq!(freshness(100, 99, 100, false), "future");
+        assert_eq!(freshness(100, 200, 100, true), "last-attempt-failed");
+        for bad in [
+            receipt.replace("\"bytes\":12", "\"bytes\":13"),
+            receipt.replace("9999-1", "9998-1"),
+            receipt.replace("\"schema\":1", "\"schema\":2"),
+            receipt.replace(
+                "\"created_unix_seconds\":100",
+                "\"created_unix_seconds\":-1",
+            ),
+        ] {
+            assert!(receipt_created(&bad, &archive).is_err());
+        }
+    }
+
+    #[test]
+    fn backup_status_arguments_bound_age_and_reject_ambiguity() {
+        let base = ["--destination", "/private/backups"].map(String::from);
+        assert_eq!(status_options(&base).unwrap().1, 172800);
+        for extra in [
+            vec!["--maximum-age-seconds", "0"],
+            vec!["--maximum-age-seconds", "31536001"],
+            vec!["--destination", "/other"],
+            vec!["--maximum-age-seconds", "1", "--maximum-age-seconds", "2"],
+            vec!["--retain", "1"],
+        ] {
+            let args: Vec<_> = base
+                .iter()
+                .cloned()
+                .chain(extra.into_iter().map(String::from))
+                .collect();
+            assert!(status_options(&args).is_err());
+        }
     }
 }
