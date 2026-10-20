@@ -223,7 +223,12 @@ mod tests {
             Err(std::fs::TryLockError::WouldBlock)
         ));
         drop(first);
-        assert!(probe.try_lock().is_ok());
+        // Not instantly: a sibling test's spawn can hold a fork-duplicated
+        // copy of this descriptor until it execs.
+        assert!(crate::sandbox::retry_briefly(
+            || probe.try_lock().is_ok(),
+            |ok| *ok
+        ));
         let _ = std::fs::remove_dir_all(&d);
     }
 }

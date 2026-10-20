@@ -1075,6 +1075,11 @@ mod tests {
         assert!(runner_live(&state));
         assert!(hold_lock(&state).is_err());
         drop(held);
-        assert!(!runner_live(&state));
+        // Not instantly: a sibling test's spawn can hold a fork-duplicated
+        // copy of this descriptor until it execs.
+        assert!(!crate::sandbox::retry_briefly(
+            || runner_live(&state),
+            |live| !*live
+        ));
     }
 }
