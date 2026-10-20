@@ -7,6 +7,8 @@ use std::process::ExitCode;
 type Result<T> = std::result::Result<T, String>;
 #[path = "install_mta_backup.rs"]
 mod install_mta_backup;
+#[path = "install_mta_operations.rs"]
+mod install_mta_operations;
 #[path = "install_mta_setup.rs"]
 mod install_mta_setup;
 const HELP: &str = "Usage: ./install-td-mta [--prefix PATH]
@@ -24,6 +26,7 @@ Generates both systemd user units and Shepherd definitions; does not enable them
 Database preparation and credentials remain explicit (td-mta/POSTGRES.md).
 --services-only uses the already installed executable without rebuilding.
 Use --setup-local --help to provision a new private local PostgreSQL account.
+Use --operations-services --help to generate backup and health schedules.
 Use --backup --help for bounded host PostgreSQL logical backups.
 Use --backup-status --help for read-only backup freshness checks.
 ";
@@ -429,6 +432,9 @@ fn install(root: &Path, opts: &Options) -> Result<()> {
 }
 
 pub(crate) fn run(args: &[String]) -> ExitCode {
+    if args.first().is_some_and(|v| v == "--operations-services") {
+        return install_mta_operations::run(args.get(1..).unwrap_or_default());
+    }
     if args.first().is_some_and(|v| v == "--backup-status") {
         return install_mta_backup::status(args.get(1..).unwrap_or_default());
     }

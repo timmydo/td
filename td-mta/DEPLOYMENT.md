@@ -108,6 +108,74 @@ not order their startup or perform initial certificate issuance. The service
 name `td-mta-acme-NAME` must not also be used by a mail profile. Private worker
 logs live under `STATE/.acme/NAME/`; edited definitions are preserved.
 
+## Generated backup and health schedules
+
+Once mail profiles, local tools and backup credentials are prepared, generate
+independent scheduled operations with the same installer:
+
+```text
+./install-td-mta --operations-services --prefix /home/alice/.local \
+  --state-dir /home/alice/.local/state/td-mta \
+  --mail-profile frontend --mail-profile receive --mail-profile relay \
+  --certificate-profile public \
+  --connection-file /home/alice/.config/td-mta/runtime-connection \
+  --tls-certificate /home/alice/.local/state/td-mta/postgres/server.pem \
+  --tls-certificate /home/alice/.local/state/td-mta/postgres/ca.pem \
+  --openssl-bin /usr/bin/openssl \
+  --backup-service-file /home/alice/.config/td-mta/backup.pg_service.conf \
+  --backup-service td-mta-backup \
+  --backup-destination /home/alice/mail-backups --postgres-bin /usr/lib/postgresql/17/bin
+```
+
+Select any complete group independently: mail profiles, managed certificate
+profiles with their connection file, private certificate files with an explicit
+OpenSSL executable, or the four backup arguments. Repeat profiles/certificate
+files up to 32 per kind. All paths are absolute. The mail state directory is the
+same one used when generating the foreground services. Provision the backup
+destination and credentials as described below; generation does not create or
+validate them. `--tool-library-dir` optionally supplies the PostgreSQL tools'
+host library directory. Their PATH contains only `--postgres-bin`; retain that
+host tool installation and its runtime libraries. No secret values enter units.
+
+Files named `td-mta-maint-*` are retained beside the ordinary service definitions.
+The installer refuses conflicting operator-edited definitions before writing the
+batch. Backup generation installs the current host builder as a retained helper
+under `PREFIX/lib/td-mta/host-tools/` and selects it with
+`PREFIX/bin/td-mta-operator`; the source checkout is not a runtime dependency.
+The helper is host control-plane code, not a target distribution artifact.
+Prior helper versions remain available. This command does not rebuild td-mta.
+
+For systemd, run each printed `systemctl --user link` for the oneshot service,
+then the corresponding `enable --now` for its timer. Each check runs independently
+at boot plus two minutes and every fifteen minutes thereafter. Backups run at
+03:15 in the manager's local timezone with missed-run persistence. Inspect both
+`systemctl --user list-timers` and the individual oneshot service results and
+journals: an active timer does not mean its last job succeeded. System services
+need the same explicit identity/ownership adaptation described above.
+
+For Shepherd 1.0 or newer, load and start the generated timed services. Checks
+run at minutes 0, 15, 30 and 45; backups at 03:15, using the supervisor's local
+timezone. Unlike the systemd backup timer, these do not catch up missed runs.
+Use each timer's `trigger` action for an immediate test and inspect its past-run
+status and private log under `STATE/.operations/`. Each timer waits for its
+previous invocation and limits it to 120 seconds for checks or 45 minutes for
+backups. Load/start definitions from the user's persistent Shepherd configuration
+for session startup; loading them once is not persistence. Guix Home requires
+translating the generated timer constructor into its `shepherd-service` form,
+as for foreground definitions below. Logs use Shepherd's rotation policy.
+
+Health jobs never start or depend on a mail/backup worker: they observe existing
+readiness, the managed certificate lease/failure state and thirty-day validity,
+private certificate thirty-day expiry, and two-day backup freshness. Each failure
+is independent. A recent archive does not prove the backup timer is enabled,
+a private certificate expiry check is not a chain/hostname check, and freshness
+is not archive integrity or a restore test. Backup bounds remain 1 GiB/archive,
+8 GiB/destination and thirty completed archives; the command's lock also refuses
+overlapping manual invocations. Supervisors cap wall time, and the backup helper
+retains its own output and tool-time bounds. Configure host memory/process limits
+as appropriate. Off-host copies, free-space checks and failure notifications
+remain operator responsibilities; generation sends no mail or alerts.
+
 ## Persistent Guix Home services
 
 Use `home-shepherd-service-type` in the Home configuration, rather than
