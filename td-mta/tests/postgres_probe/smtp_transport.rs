@@ -249,12 +249,26 @@ pub(super) fn exercise(
                 command(&mut client, b"EHLO sender.example.test\r\n", "250");
                 command(&mut client, b"RCPT TO:<main@example.test>\r\n", "503");
             }
+            // Receiving never grants relay authority, even for a forged local sender.
+            command(&mut client, b"AUTH PLAIN AGxvY2FsAHBhc3N3b3Jk\r\n", "500");
+            for sender in ["outside@remote.test", "main@example.test", ""] {
+                command(&mut client, format!("MAIL FROM:<{sender}>\r\n").as_bytes(), "250");
+                for recipient in ["outside@remote.test", "unknown@example.test",
+                    "outside%remote.test@example.test", "remote.test!outside@example.test",
+                    "@example.test:outside@remote.test"] {
+                    command(&mut client, format!("RCPT TO:<{recipient}>\r\n").as_bytes(), "550");
+                }
+                command(&mut client, b"DATA\r\n", "503");
+                command(&mut client, b"RSET\r\n", "250");
+            }
             envelope(&mut client);
-            client.get_mut().write_all(b"Subject: PostgreSQL worker\r\n\r\nbody\r\n").unwrap();
+            client.get_mut().write_all(b"Subject: PostgreSQL worker\r\nFrom: main@example.test\r\nTo: outside@remote.test\r\nResent-To: other@remote.test\r\nX-Original-To: third@remote.test\r\nAuthentication-Results: example.test; auth=pass\r\n\r\nbody\r\n").unwrap();
             assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"), "0");
             command(&mut client, b".\r\n", "250");
             assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"), "1");
             assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "1");
+            assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.submissions"), "0");
+            assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.submission_routes"), "0");
             assert_eq!(pending.operation().unwrap(), None);
 
             // A known rollback refuses the transaction without retiring the worker.

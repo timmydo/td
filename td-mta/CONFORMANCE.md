@@ -435,6 +435,27 @@ marker while terminal expiry remains held for clock confirmation. This qualifies
 not maximum-size throughput or every SMTP failure interleaving.
 
 
+## Receive-to-relay authority regression
+
+The native SMTP transport fixtures exercise plain and STARTTLS sessions with
+external, forged-local and null senders. External, unconfigured local,
+percent/bang and source-routed external recipients refuse before DATA;
+SMTP AUTH is not a submission path. Successful local delivery with forged
+sender, destination and authentication headers creates no outbound
+submission or route.
+
+The separate foreground-process fixture also mixes an accepted local RCPT
+with rejected external RCPT commands. Its delivered message carries forged
+From, To, Bcc, Resent-To, X-Original-To, X-Forwarded-To, Received and
+Authentication-Results headers. After local acceptance, outbound submission,
+recipient and route tables remain empty, queue usage remains zero, and the
+fixture smart host has accepted no delivery. Authenticated JMAP submission
+then exercises the legitimate outbound path in the same fixture.
+[CONFIG.md](CONFIG.md#local-recipient-routing) owns alias authority; aliases
+resolve to the local account and do not forward externally. td-mail rules
+currently change flags or mailbox membership and have no sending action.
+This coverage does not authorize a future forwarding feature.
+
 ## Local delivery-failure notices
 
 The foreground PostgreSQL fixture covers terminal expiry and permanent MAIL

@@ -98,15 +98,33 @@ pub(super) fn exercise(
     };
     exchange(b"", "220");
     exchange(b"EHLO sender.example.test\r\n", "250");
+    exchange(b"AUTH PLAIN AGxvY2FsAHBhc3N3b3Jk\r\n", "500");
     exchange(b"MAIL FROM:<sender@example.test>\r\n", "250");
+    exchange(b"RCPT TO:<outside@remote.test>\r\n", "550");
     exchange(b"RCPT TO:<main@example.test>\r\n", "250");
+    exchange(b"RCPT TO:<@example.test:outside@remote.test>\r\n", "550");
     exchange(b"DATA\r\n", "354");
     exchange(
-        b"Subject: Executable PostgreSQL\r\n\r\nDelivered by the real process.\r\n.\r\n",
+        b"Subject: Executable PostgreSQL\r\nFrom: main@example.test\r\nTo: outside@remote.test\r\nBcc: hidden@remote.test\r\nResent-To: other@remote.test\r\nX-Original-To: third@remote.test\r\nX-Forwarded-To: fourth@remote.test\r\nReceived: from trusted.example.test with ESMTPA\r\nAuthentication-Results: mx.example.test; auth=pass\r\n\r\nDelivered by the real process.\r\n.\r\n",
         "250",
     );
     exchange(b"QUIT\r\n", "221");
     assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "1");
+    // SMTP envelopes and header claims confer no submission authority.
+    for table in ["submissions", "recipients", "submission_routes"] {
+        assert_eq!(
+            sql(fixture, &format!("SELECT count(*) FROM td_mta.{table}")),
+            "0"
+        );
+    }
+    assert_eq!(
+        sql(
+            fixture,
+            "SELECT queue_bytes,queue_submissions FROM td_mta.account_usage"
+        ),
+        "0|0"
+    );
+    assert_eq!(relay.accepted.load(std::sync::atomic::Ordering::Acquire), 0);
     let trust = td_crypto::TrustStore::from_pem(&fixture.ca).unwrap();
     let epoch = td_mta::postgres_schema::inspect(&fixture.request(), &trust, deadline())
         .unwrap()
