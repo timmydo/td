@@ -174,7 +174,7 @@ fn service_files(
     let unit = format!("[Unit]\nDescription=td-mta {profile}\n\n[Service]\nType=exec\nExecStart=:{exec}\nRestart=on-failure\nRestartSec=5\nTimeoutStopSec=120\nUMask=0077\n\n[Install]\nWantedBy=default.target\n");
     let command = argv.iter().map(|s| scheme(s)).collect::<Vec<_>>().join(" ");
     let log = state.join(profile).join("service.log");
-    let scm = format!("(use-modules (shepherd service))\n(register-services\n (service '(td-mta-{profile})\n  #:documentation \"td-mta {profile}; check readiness with td-mta status.\"\n  #:respawn? #t\n  #:start (make-forkexec-constructor\n           '({command})\n           #:log-file {}\n           #:file-creation-mask #o077)\n  #:stop (make-kill-destructor SIGTERM #:grace-period 120)))\n", scheme(text(&log)?));
+    let scm = format!("(use-modules (shepherd service))\n(register-services\n (service '(td-mta-{profile})\n  #:documentation \"td-mta {profile}; check readiness with td-mta status.\"\n  #:respawn? #t\n  #:respawn-delay 5\n  #:start (make-forkexec-constructor\n           '({command})\n           #:log-file {}\n           #:file-creation-mask #o077)\n  #:stop (make-kill-destructor SIGTERM #:grace-period 120)))\n", scheme(text(&log)?));
     Ok((unit, scm))
 }
 

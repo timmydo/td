@@ -64,6 +64,75 @@ service, or a separately supervised private cluster. The MTA installer never
 assumes ownership of an existing cluster. A failed startup is retried by the
 service manager. Readiness does not depend on remote delivery succeeding.
 
+## Persistent Guix Home services
+
+Use `home-shepherd-service-type` in the Home configuration, rather than
+editing Guix's generated `~/.config/shepherd/init.scm`. Preserve the existing
+Home packages and services. If the source configuration is stale, recover the
+installed `~/.guix-home/configuration.scm` into a new source file before
+adding mail services; do not reconfigure from an older package list.
+
+Add `(gnu home services shepherd)` and `(guix gexp)` to the configuration's
+imports. The following constructor returns a Home service for one previously
+prepared profile; `root` and `prefix` are absolute operator-selected paths.
+Append its returned service to the existing `home-environment` services:
+
+```scheme
+(define (mail-profile root prefix name)
+  (let* ((base (string-append root "/" name))
+         (args (list (string-append prefix "/bin/td-mta") "serve"
+                     "--connection-file" "/home/alice/.config/td-mta/runtime-connection"
+                     "--profile" name
+                     "--runtime" (string-append base "/runtime")
+                     "--scratch" (string-append base "/scratch"))))
+    (simple-service
+      (string->symbol (string-append "mail-" name))
+      home-shepherd-service-type
+      (list
+        (shepherd-service
+          (provision (list (string->symbol (string-append "td-mta-" name))))
+          (documentation "Local mail profile; td-mta status checks readiness.")
+          (respawn-delay 5)
+          (requirement '(local-mail-postgres))
+          (start #~(make-forkexec-constructor '#$args
+                     #:log-file #$(string-append base "/service.log")
+                     #:file-creation-mask #o077))
+          (stop #~(make-kill-destructor SIGTERM #:grace-period 120)))))))
+```
+
+`local-mail-postgres` must name a separately declared Home Shepherd service
+for the private cluster. Its start constructor runs the retained PostgreSQL
+`postgres -D /absolute/cluster` executable with a private log and mask 0077;
+its stop constructor uses `SIGINT` and a 120-second grace period for PostgreSQL
+fast shutdown. Use the actual provision name in `requirement`. For an external
+or system-managed database, omit that requirement: a user Shepherd service
+cannot depend on another supervisor's service. A process dependency orders
+startup but does not prove PostgreSQL accepts authenticated connections yet;
+MTA startup refusal and supervisor retry still apply. Set a five-second
+respawn delay on both PostgreSQL and MTA Home services. Shepherd 1.0 defaults
+to rapid retries and disables a service after five respawns within seven
+seconds; the longer delay lets a recovering database become available
+without exhausting that default retry limit. The installer-generated
+Shepherd definitions use the same five-second delay. Existing service files
+are preserved: explicitly add the delay to previously generated definitions.
+
+Build the candidate with `guix home build /absolute/home.scm`. Inspect its
+`profile` link and generated Shepherd definitions before applying
+`guix home reconfigure /absolute/home.scm`. Reconfiguration changes the user's
+Home generation; it need not replace a running manually registered service
+of the same name. Stop and unload the old MTA registrations first, followed
+by their private PostgreSQL registration, then load/register the newly built
+service expressions and start them. Alternatively use a fresh login/session.
+Never load the installer's `register-services` files as Guix Home
+`shepherd-service` expressions: these are different interfaces.
+
+Verify all selected profiles with `status --require-ready`, including after
+restarting the private database. Keep the prior Home generation and release
+for rollback. Home's default auto-start runs these services when its user
+Shepherd starts at login; it is not a promise of unattended boot or service
+survival outside the host's user-session policy. Do not run both the old
+manual startup file and the Home-managed definitions on subsequent logins.
+
 ## Build and retain a release
 
 On the build host, use the pinned archive preparation and isolated build in
