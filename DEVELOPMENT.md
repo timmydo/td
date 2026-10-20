@@ -474,6 +474,15 @@ read. Every manifest-declared target file
 is inspected, including paths spelled through `..`, custom build scripts,
 and single-quoted target paths.
 
+The evaluator's own tree, `recipes/src/bin/td-recipe-eval.rs` and
+`recipes/src/bin/td_recipe_eval/`, is a workspace binary as well: a
+change there runs the workspace legs and repository formatting, plus
+the legs of each standalone crate that names `recipes/src/bin` or
+`td_recipe_eval` (or may reach a recipe directory through fragments,
+as above) and that crate's reader closure. Today that crate is td-vm,
+whose boot-profile test includes evaluator checks. Recipe-checks still
+treats an evaluator path as a miss and lists every check.
+
 The system-level qemu oracles are a separate tier, `td-builder check
 integration`, which `check` alone does not include. It runs on the host,
 never in the gate sandbox: it warms the system image's inputs, then runs

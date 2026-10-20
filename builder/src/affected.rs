@@ -5156,14 +5156,7 @@ fn crate_reader_inputs(root: &Path, reader: &GateCrate) -> Result<(String, Strin
 /// inputs. Complete paths to other recipe files do not. Splitting at quotes
 /// also widens for raw strings; escapes and parent traversal stay uncertain.
 fn may_read_recipe_definitions(text: &str) -> bool {
-    // Concatenation can split a directory name itself. Combining all quoted
-    // fragments may widen on unrelated literals, which is the safe direction.
-    let quoted: String = text
-        .split('"')
-        .enumerate()
-        .filter_map(|(i, part)| (i % 2 == 1).then_some(part))
-        .collect();
-    if quoted.contains("recipes/src/recipes") {
+    if joined_quoted(text).contains("recipes/src/recipes") {
         return true;
     }
     for fragment in text.split('"') {
@@ -5216,6 +5209,29 @@ fn may_read_recipe_definitions(text: &str) -> bool {
 struct CrateReaderGraph {
     readers: Vec<(String, Vec<String>)>,
     recipe_definitions: bool,
+    /// Roster crates that may read the evaluator's sources, which td-vm's
+    /// boot-profile test does by `include_str!`.
+    evaluator_readers: Vec<String>,
+}
+
+/// Whether text names the evaluator's source tree, or may reach it through
+/// a recipe-directory path whose target cannot be told from its fragments.
+fn may_read_evaluator(text: &str) -> bool {
+    let quoted = joined_quoted(text);
+    [text, quoted.as_str()]
+        .iter()
+        .any(|t| t.contains("recipes/src/bin") || t.contains("td_recipe_eval"))
+        || may_read_recipe_definitions(text)
+}
+
+/// Every quoted fragment of `text`, concatenated: concatenation can split a
+/// directory name itself. Joining unrelated literals may widen, which is the
+/// safe direction.
+fn joined_quoted(text: &str) -> String {
+    text.split('"')
+        .enumerate()
+        .filter_map(|(i, part)| (i % 2 == 1).then_some(part))
+        .collect()
 }
 
 fn crate_reader_graph(root: &Path, roster: &[GateCrate]) -> Result<CrateReaderGraph, String> {
@@ -5224,14 +5240,20 @@ fn crate_reader_graph(root: &Path, roster: &[GateCrate]) -> Result<CrateReaderGr
         .map(|c| (c.name.clone(), Vec::new()))
         .collect();
     let mut recipe_definitions = false;
+    let mut evaluator_readers = Vec::new();
     for reader in roster {
         let (text, manifest) = crate_reader_inputs(root, reader)?;
+        let manifest_code = || {
+            manifest
+                .lines()
+                .map(|line| line.split_once('#').map_or(line, |(code, _)| code))
+        };
         // These reads sit outside the roster graph and require every crate leg.
-        recipe_definitions |= may_read_recipe_definitions(&text)
-            || manifest.lines().any(|line| {
-                let code = line.split_once('#').map_or(line, |(code, _)| code);
-                may_read_recipe_definitions(code)
-            });
+        recipe_definitions |=
+            may_read_recipe_definitions(&text) || manifest_code().any(may_read_recipe_definitions);
+        if may_read_evaluator(&text) || manifest_code().any(may_read_evaluator) {
+            evaluator_readers.push(reader.name.clone());
+        }
         for read in roster {
             if read.name == reader.name {
                 continue;
@@ -5251,6 +5273,7 @@ fn crate_reader_graph(root: &Path, roster: &[GateCrate]) -> Result<CrateReaderGr
     Ok(CrateReaderGraph {
         readers: out,
         recipe_definitions,
+        evaluator_readers,
     })
 }
 
@@ -5321,7 +5344,8 @@ const WORKSPACE_EXEMPT: &[(&str, &[&str])] = &[(
 /// names the roster crate whose directory holds it; that crate's commands
 /// run, and so do those of every crate that READS it — closed transitively,
 /// since a reader of a reader saw the change too. Flat recipe definitions and
-/// builder files no crate leg observes owe the workspace commands. Anything
+/// builder files no crate leg observes owe the workspace commands; evaluator
+/// sources owe them and the crates naming the evaluator's tree. Anything
 /// the rule does not recognise — shared recipe machinery, a crate-leg builder
 /// source, `engine/`, an unmapped path, a `..`, an empty diff — takes the whole
 /// list, so every unknown fails safe.
@@ -5334,6 +5358,11 @@ fn cargo_test_cmds(root: &Path, changed: &[String]) -> Result<Vec<String>, Strin
     let graph = crate_reader_graph(root, &roster)?;
     if changed.iter().any(|p| recipe_definition(p)) && graph.recipe_definitions {
         return Ok(all);
+    }
+    if changed.iter().any(|p| evaluator_source(p)) {
+        for reader in &graph.evaluator_readers {
+            push_unique(&mut selected, reader);
+        }
     }
     let readers = graph.readers;
     close_over_readers(&mut selected, &readers);
@@ -5412,9 +5441,18 @@ fn builder_workspace_only(p: &str) -> bool {
 }
 
 /// The flat recipe registry compiles definitions in the workspace; target
-/// builds remain covered by the separately scoped recipe-checks gate.
+/// builds remain covered by the separately scoped recipe-checks gate. The
+/// evaluator is a workspace binary too, and owes beyond its workspace legs
+/// only the crates that read its sources.
 fn workspace_only_change(p: &str) -> bool {
-    builder_workspace_only(p) || recipe_definition(p)
+    builder_workspace_only(p) || recipe_definition(p) || evaluator_source(p)
+}
+
+/// `td-recipe-eval`'s own tree: its entry file and the `td_recipe_eval`
+/// modules, checks and fixtures beside it.
+fn evaluator_source(p: &str) -> bool {
+    p.strip_prefix("recipes/src/bin/")
+        .is_some_and(|rest| rest == "td-recipe-eval.rs" || rest.starts_with("td_recipe_eval/"))
 }
 
 fn recipe_definition(p: &str) -> bool {
@@ -9478,6 +9516,94 @@ mod tests {
             );
             assert!(mixed.iter().any(|c| c == "cargo test --frozen --workspace"));
         }
+    }
+
+    #[test]
+    fn evaluator_sources_run_workspace_legs_and_their_readers() {
+        let root = repo_root();
+        if discover_gate_crates(&root).is_err() {
+            eprintln!("SKIP: no roster crates (builder-only sandbox)");
+            return;
+        }
+        let all = cargo_test_cmds_all(&root).unwrap();
+        let workspace = cargo_test_cmds(&root, &["builder/src/main.rs".to_string()]).unwrap();
+        // td-vm's boot-profile test includes evaluator checks; its readers follow.
+        let readers = cargo_test_cmds(
+            &root,
+            &[
+                "builder/src/main.rs".to_string(),
+                "td-vm/src/lib.rs".to_string(),
+            ],
+        )
+        .unwrap();
+        for path in [
+            "recipes/src/bin/td-recipe-eval.rs",
+            "recipes/src/bin/td_recipe_eval/check_runner.rs",
+            "recipes/src/bin/td_recipe_eval/checks/qemu_boot.rs",
+        ] {
+            let selected = cargo_test_cmds(&root, &[path.to_string()]).unwrap();
+            // DEVELOPMENT.md names td-vm as the only reader: a new one reds here
+            // until the doc says so.
+            assert_eq!(selected, readers, "{path}");
+            assert!(workspace.iter().all(|c| selected.contains(c)), "{path}");
+            assert!(selected.len() < all.len(), "{path}");
+        }
+        for path in [
+            "recipes/src/bin/other.rs",
+            "recipes/src/bin/td_recipe_eval.rs",
+            "recipes/src/bin/td-recipe-eval.rs.bak",
+        ] {
+            assert_eq!(
+                cargo_test_cmds(&root, &[path.to_string()]).unwrap(),
+                all,
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_crate_naming_the_evaluator_tree_is_its_reader() {
+        let _root_cleanup = crate::test_temp::TempDir::new("td-evaluator-readers").unwrap();
+        let root = _root_cleanup.join("fixture");
+        for name in ["td-aa", "td-bb"] {
+            std::fs::create_dir_all(root.join(name).join("src")).unwrap();
+            std::fs::write(
+                root.join(name).join("Cargo.toml"),
+                format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n"),
+            )
+            .unwrap();
+            std::fs::write(root.join(name).join("src/lib.rs"), "pub fn value() {}\n").unwrap();
+        }
+        let changed = vec!["recipes/src/bin/td_recipe_eval/check_runner.rs".to_string()];
+        let crates = |cmds: Vec<String>| {
+            let mut names: Vec<String> = cmds
+                .iter()
+                .filter_map(|c| cmd_manifest_crate(c).map(str::to_string))
+                .collect();
+            names.dedup();
+            names
+        };
+        assert!(crates(cargo_test_cmds(&root, &changed).unwrap()).is_empty());
+        for read in [
+            "const P: &str = include_str!(\"../../recipes/src/bin/td_recipe_eval/x.rs\");\n",
+            "const P: &str = concat!(\"../td_recipe_eval\", \"/x.rs\");\n",
+            "const P: &str = concat!(\"../../recip\", \"es/src/bin/td-recipe-eval.rs\");\n",
+            "const P: &str = concat!(\"../../recipes/src/\", \"bin/td-recipe-eval.rs\");\n",
+            "const P: &str = include_str!(\"../../recipes/src/../src/bin/x.rs\");\n",
+        ] {
+            std::fs::write(root.join("td-aa/src/probe.rs"), read).unwrap();
+            assert_eq!(
+                crates(cargo_test_cmds(&root, &changed).unwrap()),
+                ["td-aa"],
+                "{read}"
+            );
+        }
+        std::fs::write(
+            root.join("td-aa/src/probe.rs"),
+            "const NAME: &str = \"td-recipe-eval\";\n",
+        )
+        .unwrap();
+        assert!(crates(cargo_test_cmds(&root, &changed).unwrap()).is_empty());
     }
 
     #[test]
