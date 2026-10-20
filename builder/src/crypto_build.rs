@@ -123,12 +123,6 @@ fn run_inner(root: &Path, action: &str, manifest: &str) -> Result<Option<Release
         .collect::<Result<Vec<_>>>()?;
     check_controls(variables.into_iter())?;
     let home = Scratch::create(root)?;
-    let vendor = crate::host_bin::prepare_mail_vendor(root)?;
-    let vendor = vendor
-        .canonicalize()
-        .map_err(|e| format!("crypto vendor path: {e}"))?;
-    let vendor = vendor.to_str().ok_or("crypto vendor path must be UTF-8")?;
-    let quoted = td_engine::json::Json::Str(vendor.into()).to_json_string();
     let penv = crate::stage0::ProvisionEnv::from_env(root);
     let rustpath = crate::stage0::provision_rust(&penv).map_err(|e| e.to_string())?;
     let ccpath = crate::stage0::provision_cc(&penv).map_err(|e| e.to_string())?;
@@ -151,6 +145,20 @@ fn run_inner(root: &Path, action: &str, manifest: &str) -> Result<Option<Release
             "crypto host qualification is not yet defined for {host}"
         ));
     }
+    let path = format!(
+        "{rustpath}:{ccpath}:{}",
+        std::env::var("PATH").unwrap_or_default()
+    );
+    // Before any test runs, over the PATH the fixtures inherit.
+    if action == "test" && name == "td-mta" {
+        postgres_bin(&path)?;
+    }
+    let vendor = crate::host_bin::prepare_mail_vendor(root)?;
+    let vendor = vendor
+        .canonicalize()
+        .map_err(|e| format!("crypto vendor path: {e}"))?;
+    let vendor = vendor.to_str().ok_or("crypto vendor path must be UTF-8")?;
+    let quoted = td_engine::json::Json::Str(vendor.into()).to_json_string();
     let target_dir = std::env::var_os("CARGO_TARGET_DIR")
         .unwrap_or_else(|| root.join(".td-build-cache/crypto-target").into_os_string());
     let native_flags = format!(
@@ -178,13 +186,7 @@ fn run_inner(root: &Path, action: &str, manifest: &str) -> Result<Option<Release
             ])
             .env("CARGO_HOME", &home.0)
             .env("CARGO_TARGET_DIR", &target_dir)
-            .env(
-                "PATH",
-                format!(
-                    "{rustpath}:{ccpath}:{}",
-                    std::env::var("PATH").unwrap_or_default()
-                ),
-            )
+            .env("PATH", &path)
             .env("RUSTC", &rustc)
             .env("RUSTDOC", &rustdoc)
             .env("RUSTC_WRAPPER", "")
@@ -317,18 +319,6 @@ fn run_inner(root: &Path, action: &str, manifest: &str) -> Result<Option<Release
         return Err(format!("crypto {action} failed: {status}"));
     }
     if let Some((mail, fetch)) = live_fixture {
-        let postgres = std::env::var_os("TD_MTA_TEST_POSTGRES_BIN")
-            .map(PathBuf::from)
-            .ok_or("native mail tests require TD_MTA_TEST_POSTGRES_BIN pointing to PostgreSQL 17 binaries")?;
-        if !postgres.is_absolute()
-            || ["initdb", "postgres", "pg_ctl", "psql"]
-                .iter()
-                .any(|name| !postgres.join(name).is_file())
-        {
-            return Err(
-                "TD_MTA_TEST_POSTGRES_BIN must be an absolute PostgreSQL binary directory".into(),
-            );
-        }
         for case in [
             "real_postgres_td_mail_reads_and_downloads",
             "real_postgres_td_mail_sends_plain_text",
@@ -338,7 +328,6 @@ fn run_inner(root: &Path, action: &str, manifest: &str) -> Result<Option<Release
             fixture
                 .env("TD_MTA_TEST_MAIL", &mail)
                 .env("TD_MTA_TEST_FETCH", &fetch)
-                .env("TD_MTA_TEST_POSTGRES_BIN", &postgres)
                 .env("TD_TEST_TRUSTED_ROOT", "private")
                 .args([
                     "--test",
@@ -354,6 +343,52 @@ fn run_inner(root: &Path, action: &str, manifest: &str) -> Result<Option<Release
         }
     }
     Ok(None)
+}
+
+/// The PostgreSQL 17 directory the native mail fixtures take from `path`:
+/// the directory of its first `initdb`, which must also hold `postgres`,
+/// `pg_ctl` and `psql`, as the fixtures require, with what its
+/// `postgres --version` reports.
+pub(crate) fn postgres_bin(path: &str) -> Result<(PathBuf, String)> {
+    let need = "native mail tests need PostgreSQL 17's initdb, postgres, pg_ctl and psql in one PATH directory";
+    let initdb = crate::stage0::find_in_path(path, "initdb")
+        .ok_or_else(|| format!("{need}: no initdb on PATH"))?;
+    let bin = initdb
+        .parent()
+        .filter(|dir| dir.is_absolute())
+        .ok_or_else(|| format!("{need}: initdb is in a relative PATH entry"))?;
+    for name in ["postgres", "pg_ctl", "psql"] {
+        if !crate::stage0::is_exec(&bin.join(name)) {
+            return Err(format!(
+                "{need}: {} has initdb but no {name}",
+                bin.display()
+            ));
+        }
+    }
+    let postgres = bin.join("postgres");
+    let mut cmd = Command::new(&postgres);
+    cmd.arg("--version").stdin(Stdio::null());
+    let out = crate::spawn::past_a_busy_program(|| cmd.output())
+        .map_err(|e| format!("{need}: {} --version: {e}", postgres.display()))?;
+    let version = String::from_utf8_lossy(&out.stdout);
+    if !out.status.success() || postgres_major(&version) != Some("17") {
+        return Err(format!(
+            "{need}: {} --version reports {:?}",
+            postgres.display(),
+            version.trim()
+        ));
+    }
+    Ok((bin.to_path_buf(), version.trim().to_string()))
+}
+
+/// The major version in `postgres --version`'s "postgres (PostgreSQL) 17.10",
+/// which a distribution may follow with its own suffix.
+fn postgres_major(version: &str) -> Option<&str> {
+    let release = version.trim().strip_prefix("postgres (PostgreSQL) ")?;
+    release
+        .split(|ch: char| !ch.is_ascii_digit())
+        .next()
+        .filter(|major| !major.is_empty())
 }
 
 fn fixture_executable(
@@ -418,5 +453,58 @@ mod tests {
         ] {
             assert!(check_controls(std::iter::once((key.into(), value.into()))).is_err());
         }
+    }
+
+    #[test]
+    fn postgres_major_reads_the_release_line() {
+        assert_eq!(postgres_major("postgres (PostgreSQL) 17.10\n"), Some("17"));
+        assert_eq!(
+            postgres_major("postgres (PostgreSQL) 17.2 (Debian 17.2-1.pgdg120+1)"),
+            Some("17")
+        );
+        assert_eq!(postgres_major("postgres (PostgreSQL) 16.4"), Some("16"));
+        assert_eq!(postgres_major("postgres (PostgreSQL) 18beta1"), Some("18"));
+        assert_eq!(postgres_major("psql (PostgreSQL) 17.10"), None);
+        assert_eq!(postgres_major("postgres (PostgreSQL) beta"), None);
+    }
+
+    /// PATH's first initdb picks the directory, the other tools must sit
+    /// beside it, and the release must be 17; each refusal says what is
+    /// missing.
+    #[test]
+    fn postgres_bin_takes_one_directory_from_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let owned = crate::test_temp::TempDir::new("td-crypto-postgres-bin").unwrap();
+        let (early, late) = (owned.path().join("early"), owned.path().join("late"));
+        std::fs::create_dir(&early).unwrap();
+        std::fs::create_dir(&late).unwrap();
+        let tool = |dir: &Path, name: &str, body: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let path = format!("{}:{}", early.display(), late.display());
+        let err = postgres_bin(&path).unwrap_err();
+        assert!(err.ends_with("no initdb on PATH"), "{err}");
+        for name in ["initdb", "pg_ctl", "psql"] {
+            tool(&late, name, "exit 0");
+        }
+        tool(&late, "postgres", "echo 'postgres (PostgreSQL) 17.10'");
+        tool(&early, "initdb", "exit 0");
+        tool(&early, "pg_ctl", "exit 0");
+        let err = postgres_bin(&path).unwrap_err();
+        assert!(err.contains(&format!("{} has initdb but no postgres", early.display())));
+        tool(&early, "postgres", "echo 'postgres (PostgreSQL) 16.4'");
+        tool(&early, "psql", "exit 0");
+        let err = postgres_bin(&path).unwrap_err();
+        assert!(
+            err.contains("reports \"postgres (PostgreSQL) 16.4\""),
+            "{err}"
+        );
+        std::fs::remove_file(early.join("initdb")).unwrap();
+        assert_eq!(
+            postgres_bin(&path).unwrap(),
+            (late.clone(), "postgres (PostgreSQL) 17.10".to_string())
+        );
     }
 }

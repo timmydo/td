@@ -400,10 +400,11 @@ Provider diagnostics and credentials never enter the fixed error enum.
 The worker drives `poll_message` and drops asynchronous notices without
 invoking the driver Future implementation, which logs raw server text.
 
-The ignored `postgres_probe` integration fixture requires an explicitly
-provided independently installed PostgreSQL bin directory through
-`TD_MTA_TEST_POSTGRES_BIN`. It initializes only a new private disposable
-cluster, creates its own test certificate and password, and checks verified
+The ignored `postgres_probe` integration fixture requires an independently
+installed PostgreSQL 17 on `PATH`: the directory of the first `initdb`
+there, which must also hold `postgres`, `pg_ctl` and `psql`. No variable
+names it. It initializes only a new private disposable cluster, creates
+its own test certificate and password, and checks verified
 TLS/SCRAM, wrong name/trust/password, expired deadline, TLS refusal,
 cleartext/trust authentication refusal, read-only refusal and reconnect after
 server restart. It never connects to

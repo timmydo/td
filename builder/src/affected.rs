@@ -3818,14 +3818,19 @@ fn preflight_key(root: &Path, host: &[u8]) -> Option<String> {
     Some(crate::sha256::to_base16(&h.finalize()))
 }
 
+/// Host tools a preflight takes from PATH: PostgreSQL's `initdb`, which the
+/// native mail leg requires.
+const PREFLIGHT_PATH_TOOLS: &[&str] = &["initdb"];
+
 /// What selects and configures the toolchain a cargo preflight runs, which
 /// the tree does not pin: the variables cargo and rustc read for it, every
 /// cargo config cargo merges (the repository's own is in the tree; one
 /// above it, as a worktree under the main checkout has, or in CARGO_HOME
 /// is not), the test runner the repository's config names, and the
 /// versions of the compiler cargo would pick, cargo, clippy, rustfmt, and
-/// what the crypto legs build with. None when a required tool cannot be
-/// asked, and then nothing is reused or recorded.
+/// what the crypto legs build with, and the `PREFLIGHT_PATH_TOOLS` found on
+/// PATH, if any. None when a required tool cannot be asked, and then
+/// nothing is reused or recorded.
 fn preflight_host(root: &Path) -> Option<Vec<u8>> {
     // Every variable cargo or rustc may read config from (`CARGO_*`,
     // including the per-target runner and linker, and `RUST*`), but the
@@ -3840,10 +3845,7 @@ fn preflight_host(root: &Path) -> Option<Vec<u8>> {
             (k.starts_with("CARGO_") || k.starts_with("RUST")) && !volatile(k)
                 || matches!(
                     k.as_str(),
-                    "TD_CC_HOME"
-                        | "TD_RUN_CAPPED_MIB"
-                        | "TD_RUST_HOME"
-                        | "TD_MTA_TEST_POSTGRES_BIN"
+                    "TD_CC_HOME" | "TD_RUN_CAPPED_MIB" | "TD_RUST_HOME"
                 )
         })
         .collect();
@@ -3904,6 +3906,20 @@ fn preflight_host(root: &Path) -> Option<Vec<u8>> {
     // Optional: a host without them runs no crypto leg that passes.
     let cc = probe("cc", &["--version"]);
     field("cc --version", cc.as_deref());
+    // Which install of each, and what it reports, or that there is none:
+    // a pass without one is not reused once one appears.
+    let path = std::env::var("PATH").unwrap_or_default();
+    for tool in PREFLIGHT_PATH_TOOLS {
+        let found = crate::stage0::find_in_path(&path, tool).map(|bin| {
+            let version = probe(&bin.to_string_lossy(), &["--version"]).unwrap_or_default();
+            let bin = bin.canonicalize().unwrap_or(bin);
+            let mut seen = bin.into_os_string().into_encoded_bytes();
+            seen.push(b'\n');
+            seen.extend(version);
+            seen
+        });
+        field(&format!("PATH {tool}"), found.as_deref());
+    }
     if let Some(home) = std::env::var_os("TD_RUST_HOME") {
         let rustc = Path::new(&home).join("bin/rustc");
         let out = probe(&rustc.to_string_lossy(), &["-vV"]);

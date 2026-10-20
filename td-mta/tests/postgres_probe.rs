@@ -24,6 +24,33 @@ mod mail_client;
 
 const PASSWORD: &[u8] = b"disposable-postgres-fixture-password";
 
+/// The directory of PATH's `initdb`, which must also hold `postgres`,
+/// `pg_ctl` and `psql`, so all four come from one installation, and whose
+/// `postgres` is release 17.
+fn postgres_bin() -> PathBuf {
+    let initdb = td_fs::executable_on_path("initdb")
+        .unwrap_or_else(|| panic!("PostgreSQL 17 is not on PATH: no initdb"));
+    let bin = initdb.parent().unwrap().to_path_buf();
+    for name in ["postgres", "pg_ctl", "psql"] {
+        assert!(
+            td_fs::executable_in(Some(bin.as_os_str()), name).is_some(),
+            "PostgreSQL on PATH: {} has initdb but no {name}",
+            bin.display()
+        );
+    }
+    let version = std::process::Command::new(bin.join("postgres"))
+        .arg("--version")
+        .output()
+        .unwrap();
+    let version = String::from_utf8_lossy(&version.stdout);
+    assert!(
+        version.starts_with("postgres (PostgreSQL) 17."),
+        "PostgreSQL on PATH: {} is not release 17: {version}",
+        bin.display()
+    );
+    bin
+}
+
 struct Fixture {
     root: TempDir,
     bin: PathBuf,
@@ -34,8 +61,7 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
-        let bin = PathBuf::from(std::env::var_os("TD_MTA_TEST_POSTGRES_BIN").unwrap());
-        assert!(bin.is_absolute());
+        let bin = postgres_bin();
         let root = TempDir::new("td-postgres-probe").unwrap();
         let port = TcpListener::bind(("127.0.0.1", 0))
             .unwrap()
@@ -895,7 +921,7 @@ fn real_postgres_runtime_credentials_separate_mail_writes_from_owner_authority()
 }
 
 #[test]
-#[ignore = "requires TD_MTA_TEST_POSTGRES_BIN pointing to an independently installed PostgreSQL"]
+#[ignore = "requires PostgreSQL 17's initdb, postgres, pg_ctl and psql on PATH"]
 fn real_postgres_requires_tls_scram_primary_settings_and_reconnects() {
     let mut fixture = Fixture::new();
     let trust = TrustStore::from_pem(&fixture.ca).unwrap();
@@ -3785,7 +3811,7 @@ fn real_postgres_account_bootstrap_is_atomic_retained_and_preserves_later_state(
 }
 
 #[test]
-#[ignore = "requires TD_MTA_TEST_POSTGRES_BIN naming an independently installed PostgreSQL 17"]
+#[ignore = "requires PostgreSQL 17's initdb, postgres, pg_ctl and psql on PATH"]
 fn real_postgres_mailbox_reads_bind_authentication_counts_and_state() {
     use td_mta::{
         ids::{AccountId, StoreEpoch},
@@ -3990,7 +4016,7 @@ fn real_postgres_mailbox_reads_bind_authentication_counts_and_state() {
 }
 
 #[test]
-#[ignore = "requires TD_MTA_TEST_POSTGRES_BIN naming an independently installed PostgreSQL 17"]
+#[ignore = "requires PostgreSQL 17's initdb, postgres, pg_ctl and psql on PATH"]
 fn real_postgres_email_bodies_are_verified_bounded_and_snapshot_pinned() {
     use td_crypto::Digest;
     use td_mta::{

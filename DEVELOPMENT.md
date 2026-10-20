@@ -120,7 +120,9 @@ reused. Their key adds what picks and configures the toolchain: the
 every `CARGO_*` and `RUST*` variable but those that set only
 parallelism or output, `TD_RUST_HOME`, `TD_CC_HOME` and the memory cap,
 every cargo config cargo merges from above the repository or in
-`CARGO_HOME`, and the test runner's bytes; a pass is recorded only if
+`CARGO_HOME`, the test runner's bytes, and which `initdb` (the native
+mail leg's PostgreSQL) is first on `PATH` with what its `--version`
+prints, or that there is none; a pass is recorded only if
 the content is unchanged when it finishes. A run holds its journal
 throughout, so a second run in the worktree waits. A gate does not
 recheck the content, so do not edit a worktree under a running `ready`.
@@ -1010,10 +1012,13 @@ Cargo artifact records identify the helper executables inside the selected
 target directory. Ambient TD_MTA_TEST_MAIL and TD_MTA_TEST_FETCH cannot replace
 them. After ordinary tests, the wrapper runs the exact ignored PostgreSQL read,
 plain-text send and foreground-service cases. Each requires a positive passing
-libtest summary and exit success. Host preparation must provide PostgreSQL 17
-and set TD_MTA_TEST_POSTGRES_BIN to the absolute directory containing initdb,
-postgres, pg_ctl and psql. The fixtures own disposable clusters; no existing
-database service or public endpoint is required.
+libtest summary and exit success. Host preparation must put PostgreSQL 17 on
+`PATH`: the directory of the first `initdb` there must also hold `postgres`,
+`pg_ctl` and `psql`, and `postgres --version` must report release 17. The
+wrapper checks this before any test runs and names what is missing; the
+fixtures find the same directory on `PATH` themselves, so no variable names
+it. The fixtures own disposable clusters; no existing database service or
+public endpoint is required.
 
 td-mta/CONFORMANCE.md records what this native client fixture proves. Its
 private root certificate enters only the isolated fetch test process behind

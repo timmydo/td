@@ -347,10 +347,11 @@ this backend. Mailbox/get supplies the mailbox discovery used by td-mail.
 
 The native crypto-cargo wrapper builds this checkout's td-mail and td-net
 fetch test executables. It requires the PostgreSQL read/download, plain-text
-send and actual foreground-service fixtures to pass. Set
-`TD_MTA_TEST_POSTGRES_BIN` to an absolute directory containing PostgreSQL 17
-`initdb`, `postgres`, `pg_ctl` and `psql`. Each fixture owns its disposable
-cluster and process cleanup; it contacts no public endpoint.
+send and actual foreground-service fixtures to pass. PostgreSQL 17's
+`initdb`, `postgres`, `pg_ctl` and `psql` must be on `PATH` in one
+directory, the first `initdb`'s; the wrapper refuses before any test runs
+when they are not, and no variable names them. Each fixture owns its
+disposable cluster and process cleanup; it contacts no public endpoint.
 
 The private CA enters only the existing fetch test process. This establishes
 client/server compatibility for the flows described below, not production
