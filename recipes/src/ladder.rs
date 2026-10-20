@@ -2700,30 +2700,27 @@ mod tests {
 
     fn linux_boundary_references_are_boot_artifacts_only(
         canonical: &str,
-        cpio_references: usize,
         packed_kernel_references: usize,
         copied_kernel_references: usize,
     ) -> bool {
         let linux_token = "{in:linux-x86-64}";
-        let cpio_use = format!("'{linux_token}/gen_init_cpio' -t 1 ");
         let packed_kernel = format!("file /kernel/bzImage {linux_token}/bzImage 0644 0 0");
         let copied_kernel = format!("\"{linux_token}/bzImage\"");
         canonical.matches(linux_token).count()
-            == cpio_references + packed_kernel_references + copied_kernel_references
-            && canonical.matches(&cpio_use).count() == cpio_references
+            == packed_kernel_references + copied_kernel_references
             && canonical.matches(&packed_kernel).count() == packed_kernel_references
             && canonical.matches(&copied_kernel).count() == copied_kernel_references
     }
 
     /// linux-x86-64 is past the boundary only for the tools BusyBox supplied;
-    /// its gen_init_cpio and bzImage are still native GCC 14 output, and the
-    /// boundary guard cannot see what its readers take from it. The boot
-    /// recipes may take only those two.
+    /// its bzImage is still native GCC 14 output, and the boundary guard
+    /// cannot see what its readers take from it. The boot recipes may take
+    /// only that; td-util packs their initramfs.
     #[test]
     fn boot_recipes_use_the_kernel_only_for_boot_artifacts() {
         let recipes = catalog::all();
-        for (stem, cpio_references, packed_kernel_references, copied_kernel_references) in
-            [("kexec-spike-x86-64", 2, 1, 1), ("system-x86-64", 2, 0, 1)]
+        for (stem, packed_kernel_references, copied_kernel_references) in
+            [("kexec-spike-x86-64", 1, 1), ("system-x86-64", 0, 1)]
         {
             let recipe = recipes
                 .iter()
@@ -2740,54 +2737,39 @@ mod tests {
             assert!(
                 linux_boundary_references_are_boot_artifacts_only(
                     &canonical,
-                    cpio_references,
                     packed_kernel_references,
                     copied_kernel_references,
                 ),
-                "{stem} may use linux-x86-64 only for gen_init_cpio and bzImage"
+                "{stem} may use linux-x86-64 only for bzImage"
             );
-            let bypass = format!("{canonical}{{in:linux-x86-64}}/scripts/host-tool");
-            assert!(
-                !linux_boundary_references_are_boot_artifacts_only(
-                    &bypass,
-                    cpio_references,
-                    packed_kernel_references,
-                    copied_kernel_references,
-                ),
-                "another linux-x86-64 path must not fit the boot-artifact exception"
-            );
-            for artifact in ["gen_init_cpio", "bzImage"] {
-                for suffix in [".unexpected", "-wrapper", "$suffix"] {
-                    let prefix_bypass = canonical.replacen(
-                        &format!("{{in:linux-x86-64}}/{artifact}"),
-                        &format!("{{in:linux-x86-64}}/{artifact}{suffix}"),
-                        1,
-                    );
-                    assert!(
-                        !linux_boundary_references_are_boot_artifacts_only(
-                            &prefix_bypass,
-                            cpio_references,
-                            packed_kernel_references,
-                            copied_kernel_references,
-                        ),
-                        "a same-prefix linux-x86-64 path must not fit the exception"
-                    );
-                }
+            for bypass in [
+                format!("{canonical}{{in:linux-x86-64}}/scripts/host-tool"),
+                format!("{canonical}'{{in:linux-x86-64}}/gen_init_cpio' -t 1 "),
+            ] {
+                assert!(
+                    !linux_boundary_references_are_boot_artifacts_only(
+                        &bypass,
+                        packed_kernel_references,
+                        copied_kernel_references,
+                    ),
+                    "another linux-x86-64 path must not fit the boot-artifact exception"
+                );
             }
-            let quote_concat_bypass = canonical.replacen(
-                "'{in:linux-x86-64}/gen_init_cpio' -t 1 ",
-                "'{in:linux-x86-64}/gen_init_cpio'.unexpected -t 1 ",
-                1,
-            );
-            assert!(
-                !linux_boundary_references_are_boot_artifacts_only(
-                    &quote_concat_bypass,
-                    cpio_references,
-                    packed_kernel_references,
-                    copied_kernel_references,
-                ),
-                "shell quote concatenation must not extend the approved executable"
-            );
+            for suffix in [".unexpected", "-wrapper", "$suffix"] {
+                let prefix_bypass = canonical.replacen(
+                    "{in:linux-x86-64}/bzImage",
+                    &format!("{{in:linux-x86-64}}/bzImage{suffix}"),
+                    1,
+                );
+                assert!(
+                    !linux_boundary_references_are_boot_artifacts_only(
+                        &prefix_bypass,
+                        packed_kernel_references,
+                        copied_kernel_references,
+                    ),
+                    "a same-prefix linux-x86-64 path must not fit the exception"
+                );
+            }
         }
     }
 

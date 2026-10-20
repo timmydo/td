@@ -91,11 +91,11 @@ pub fn recipe() -> Recipe {
                 "-c",
                 &format!(
                     "l=$('{bin}' --list) || {{ echo 'td-util --list failed' >&2; exit 1; }}; \
-                     for a in cat chmod chown clear cmp cpio diff dmesg free gunzip gzip less ln mkdir mv od printf ps readlink rm sleep test uname which zcat; do \
+                     for a in cat chmod chown clear cmp cpio diff dmesg free gen_init_cpio gunzip gzip less ln mkdir mv od printf ps readlink rm sleep test uname which zcat; do \
                          printf '%s\\n' \"$l\" | grep -q -x -F \"$a\" || {{ echo \"td-util does not serve applet '$a'\" >&2; exit 1; }}; \
                      done; \
                      n=$(printf '%s\\n' \"$l\" | wc -l); \
-                     [ \"$n\" -eq 27 ] || {{ echo \"td-util serves $n applets, expected exactly 27 — update this check deliberately when adding one\" >&2; exit 1; }}"
+                     [ \"$n\" -eq 28 ] || {{ echo \"td-util serves $n applets, expected exactly 28 — update this check deliberately when adding one\" >&2; exit 1; }}"
                 ),
             ],
         )
@@ -184,7 +184,7 @@ pub fn recipe() -> Recipe {
     // trimmed. The other two build-tool applets are left to the crate's
     // process tests, which the in-sandbox cargo gate runs: their names are
     // the retired findutils words, which the ladder guard refuses in any Run
-    // argv, so this text names them nowhere — the count of 27 above pins
+    // argv, so this text names them nowhere — the count of 28 above pins
     // that they are served.
     steps.extend(unpack_into("td-util-test-source", "{root}/zlib"));
     steps.push(
@@ -281,7 +281,7 @@ pub fn recipe() -> Recipe {
     });
     steps.push(Step::WriteFile {
         path: "{out}/result".into(),
-        content: "PASS: td-util is a statically-linked ELF64 x86-64 executable (ET_EXEC) with no PT_INTERP and no dynamic NEEDED entry; it serves exactly twenty-seven applets, among them cat/chmod/chown/clear/cmp/cpio/diff/dmesg/free/gunzip/gzip/less/ln/mkdir/mv/od/printf/ps/readlink/rm/sleep/test/uname/which/zcat, dispatches through both the argv[0] and `td-util <applet>` forms, renames with mv and refuses its unimplemented forms, honours its exit codes (`which` 1 = not resolved, 2 = usage; `test` 0 = true, 1 = false, 2 = bad expression), interoperates with zlib's minigzip and a GNU cpio newc archive, and parses /proc for free/ps/uname where /proc is mounted\n".into(),
+        content: "PASS: td-util is a statically-linked ELF64 x86-64 executable (ET_EXEC) with no PT_INTERP and no dynamic NEEDED entry; it serves exactly twenty-eight applets, among them cat/chmod/chown/clear/cmp/cpio/diff/dmesg/free/gen_init_cpio/gunzip/gzip/less/ln/mkdir/mv/od/printf/ps/readlink/rm/sleep/test/uname/which/zcat, dispatches through both the argv[0] and `td-util <applet>` forms, renames with mv and refuses its unimplemented forms, honours its exit codes (`which` 1 = not resolved, 2 = usage; `test` 0 = true, 1 = false, 2 = bad expression), interoperates with zlib's minigzip and a GNU cpio newc archive, and parses /proc for free/ps/uname where /proc is mounted\n".into(),
         exec: false,
     });
     steps.push(Step::Require {

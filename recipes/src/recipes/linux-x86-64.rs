@@ -32,10 +32,9 @@ use crate::types::{Recipe, Step, TextEdit};
 // (/var,/tmp,/run). CONFIG_DEVTMPFS_MOUNT is deliberately NOT managed here: it does not
 // auto-mount /dev on an initramfs boot (only when the kernel mounts a real root),
 // so the `system-x86-64` init mounts devtmpfs itself; a hand-packed /dev/console
-// node still covers init's own stdio before that first sysinit line runs. The
-// output also EXPORTS the in-tree `gen_init_cpio` packer so the downstream
-// `system-x86-64` distro recipe can pack its own root-owned initramfs from the
-// same td-built tool.
+// node still covers init's own stdio before that first sysinit line runs.
+// Downstream initramfs are packed by td-util's `gen_init_cpio`, not by this
+// kernel's in-tree hostprog, which stays a build-only tool.
 //
 // READ-ONLY ROOT (re #549): the config also turns on what the two-stage boot
 // needs to pivot from the initramfs onto a disk-backed, read-only erofs
@@ -1311,13 +1310,6 @@ pub fn recipe() -> Recipe {
             "{src}/System.map".into(),
             "{src}/arch/x86/boot/bzImage".into(),
             "{root}/initramfs.cpio".into(),
-            // Export the in-tree cpio packer so a downstream distro recipe
-            // (system-x86-64) can pack its OWN root-owned initramfs — with the
-            // unprivileged `nod` device-node trick and per-entry uid/gid 0 — from
-            // the SAME td-built gen_init_cpio this kernel already built and ran.
-            // Rebuilding it in the distro recipe would need the kernel source; this
-            // 3-line export avoids that.
-            "{src}/usr/gen_init_cpio".into(),
         ],
         dest: "{out}".into(),
     });
@@ -1328,10 +1320,6 @@ pub fn recipe() -> Recipe {
             "{out}/initramfs.cpio".into(),
         ],
         exec: false,
-    });
-    steps.push(Step::Require {
-        paths: vec!["{out}/gen_init_cpio".into()],
-        exec: true,
     });
     // [native-arch] vmlinux must be an ELF64 x86-64 linked executable (EXEC, not a
     // stray relocatable .o) — caught at the producer rung, parity with

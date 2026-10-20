@@ -3,6 +3,10 @@
 version = 4
 
 [[package]]
+name = "td-fs"
+version = "0.1.0"
+
+[[package]]
 name = "td-source-scan"
 version = "0.1.0"
 
@@ -10,5 +14,6 @@ version = "0.1.0"
 name = "td-util"
 version = "0.1.0"
 dependencies = [
+ "td-fs",
  "td-source-scan",
 ]

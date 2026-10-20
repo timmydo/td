@@ -23,7 +23,7 @@
 //! `td-util <applet> [args]` form covers the un-symlinked case.
 //!
 //! A third kind replaces busybox in the build graph: `find`, `xargs`, `cmp`,
-//! `diff`, `od`, `uname`, `gzip`/`gunzip`/`zcat` and `cpio`, the tools recipes
+//! `diff`, `od`, `uname`, `gzip`/`gunzip`/`zcat`, `cpio` and `gen_init_cpio`, the tools recipes
 //! and the initramfs build drive. Each takes the subset those callers use and
 //! refuses the rest rather than guessing at it. `gzip` decodes with the engine's
 //! inflater and CRC, included below, so one decoder serves source preparation
@@ -68,6 +68,7 @@ mod fileattr;
 mod fileops;
 mod find;
 mod free;
+mod gen_init_cpio;
 mod glob;
 mod gz;
 #[path = "../../engine/src/gzip.rs"]
@@ -115,6 +116,7 @@ const APPLETS: &[(&str, Applet)] = &[
     ("dmesg", dmesg::run),
     ("find", find::run),
     ("free", free::run),
+    ("gen_init_cpio", gen_init_cpio::run),
     ("gunzip", gz::gunzip),
     ("gzip", gz::gzip),
     ("less", less::run),
@@ -398,8 +400,8 @@ mod confinement {
         }
         assert_eq!(
             declared.len(),
-            24,
-            "expected twenty-four modules in src/ beside the crate root"
+            25,
+            "expected twenty-five modules in src/ beside the crate root"
         );
         // ...and nothing scanned is orphaned: a file present but declared by no
         // `mod` line is either dead or reached a way this scan does not model.
@@ -438,6 +440,7 @@ mod confinement {
                 "fileops.rs",
                 "find.rs",
                 "free.rs",
+                "gen_init_cpio.rs",
                 "glob.rs",
                 "gz.rs",
                 "less.rs",

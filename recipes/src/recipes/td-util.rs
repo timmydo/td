@@ -22,7 +22,7 @@ use crate::types::{Recipe, Step};
 // (uutils owns them and the farms are disjoint) and are reached as `td-util <applet>`.
 //
 // A third kind replaces busybox in the build graph: find, xargs, cmp, diff,
-// gzip/gunzip/zcat and cpio. They are served by `td-util <applet>` like the
+// od, uname, gzip/gunzip/zcat, cpio and gen_init_cpio. They are served by `td-util <applet>` like the
 // eleven above and get no `/bin` name. `find` and `xargs` are the retired
 // findutils words, so the ladder guard's TOOL_PROVIDER_BODIES names the three
 // bodies that serve them. main.rs's two `#[path]` includes reach the engine's
@@ -88,6 +88,10 @@ const MODULES: &[(&str, &str)] = &[
     ("fileops", include_str!("../../../td-util/src/fileops.rs")),
     ("find", include_str!("../../../td-util/src/find.rs")),
     ("free", include_str!("../../../td-util/src/free.rs")),
+    (
+        "gen_init_cpio",
+        include_str!("../../../td-util/src/gen_init_cpio.rs"),
+    ),
     ("glob", include_str!("../../../td-util/src/glob.rs")),
     ("gz", include_str!("../../../td-util/src/gz.rs")),
     ("less", include_str!("../../../td-util/src/less.rs")),

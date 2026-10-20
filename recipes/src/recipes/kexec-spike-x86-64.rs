@@ -24,8 +24,7 @@ use crate::types::{Recipe, Step};
 // (the kexec'd inner kernel has no /td/store, only its initramfs): td-sh (the /init
 // interpreter, as /bin/sh), td-init (for `reboot`) and td-kexec are static ELFs
 // packed as real `file` entries (not slinks into the store, unlike system-x86-64's
-// stage-1), and the packer is the linux-x86-64-exported gen_init_cpio (itself
-// HOSTCC `-static`). The inner cpio is packed first, then
+// stage-1), and the packer is td-util's gen_init_cpio. The inner cpio is packed first, then
 // embedded as a `file` in the outer cpio.
 pub fn recipe() -> Recipe {
     let mut steps = vec![post_rust_tool_farm("{in:gawk-x86-64-self}/bin/gawk")];
@@ -63,7 +62,7 @@ pub fn recipe() -> Recipe {
             &[
                 POST_RUST_SH,
                 "-c",
-                "'{in:linux-x86-64}/gen_init_cpio' -t 1 '{root}/inner-spec' > '{root}/inner.cpio'",
+                "'{in:td-util}/bin/td-util' gen_init_cpio -t 1 '{root}/inner-spec' > '{root}/inner.cpio'",
             ],
         )
         .env("PATH", "{tools}"),
@@ -109,7 +108,7 @@ pub fn recipe() -> Recipe {
             &[
                 POST_RUST_SH,
                 "-c",
-                "'{in:linux-x86-64}/gen_init_cpio' -t 1 '{root}/outer-spec' > '{root}/outer-initramfs.cpio'",
+                "'{in:td-util}/bin/td-util' gen_init_cpio -t 1 '{root}/outer-spec' > '{root}/outer-initramfs.cpio'",
             ],
         )
         .env("PATH", "{tools}"),

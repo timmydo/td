@@ -2,8 +2,8 @@
 //! the kernel's `gen_init_cpio` writes. `-t -v` adds ` -> TARGET` to a
 //! symlink's name, which is what an image check reads; it is display text,
 //! not GNU's `ls -l` listing, and a name holding ` -> ` reads the same.
-//! Listing and extraction only: td builds archives with `gen_init_cpio` or
-//! the engine writer. Extraction stays
+//! Listing and extraction only: td builds archives with the `gen_init_cpio`
+//! applet or the engine writer. Extraction stays
 //! under the current directory: a name with a `..` component is refused, a
 //! leading `/` dropped, and every ancestor that already exists must be a real
 //! directory, so an archive cannot plant a link and then write through it.

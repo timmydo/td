@@ -5081,8 +5081,8 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
 
 /// A producer-rung shape check on the deployment bundle and staged real-root
 /// scratch tree. For the cpio: real newc magic, a size floor (the static shell alone is
-/// larger), a td-util `cpio -t` parse (a reader independent of gen_init_cpio, which
-/// wrote it), the members that make it bootable (incl. the /init pivot script), and
+/// larger), a td-util `cpio -t` parse (a reader separate from the packer's writer and
+/// cross-checked against GNU cpio in td-util-test), the members that make it bootable (incl. the /init pivot script), and
 /// each packed binary under /td/store. For the root tree: /init and /bin/sh are
 /// symlinks into /td/store, the key /etc files exist, and no `/bin/busybox`
 /// multiplexer entry is packed; the package itself is no input of this recipe, so
@@ -5595,8 +5595,8 @@ pub fn recipe() -> Recipe {
             &[
                 POST_RUST_SH,
                 "-c",
-                "'{in:linux-x86-64}/gen_init_cpio' -t 1 '{root}/selector.spec' > '{root}/selector-initramfs.cpio'; \
-                 '{in:linux-x86-64}/gen_init_cpio' -t 1 '{root}/deployment.spec' > '{root}/initramfs.cpio'",
+                "'{in:td-util}/bin/td-util' gen_init_cpio -t 1 '{root}/selector.spec' > '{root}/selector-initramfs.cpio' && \
+                 '{in:td-util}/bin/td-util' gen_init_cpio -t 1 '{root}/deployment.spec' > '{root}/initramfs.cpio'",
             ],
         )
         .env("PATH", "{tools}"),
@@ -5678,7 +5678,7 @@ pub fn recipe() -> Recipe {
         // gawk-x86-64-self: the post-Rust tool farm's awk. This recipe's own steps
         //   run under td-sh with that farm; gawk itself is not packed, and
         //   `nothing_on_the_image_is_busybox` holds the image free of BusyBox.
-        // linux-x86-64: the EXPORTED gen_init_cpio packer (verified STATICALLY linked).
+        // linux-x86-64: the bzImage both boot phases run.
         // uutils: the dynamically-linked `coreutils` multicall packed as the /bin file/text
         //   userland (#547).
         // ripgrep/fd: dynamically linked Rust search tools exposed as /bin/rg and /bin/fd.
@@ -13883,7 +13883,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         }
         // BusyBox is not even a build tool here: the steps run under td-sh
         // and shape_check parses both archives with td-util's cpio, a reader
-        // independent of the gen_init_cpio that wrote them. Undeclared, its
+        // separate from the packer's writer. Undeclared, its
         // store path is outside the image's staging paths, which take only
         // declared inputs (StageRuntimeClosure refuses any other reference).
         assert!(
