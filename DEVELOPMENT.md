@@ -121,8 +121,9 @@ every `CARGO_*` and `RUST*` variable but those that set only
 parallelism or output, `TD_RUST_HOME`, `TD_CC_HOME` and the memory cap,
 every cargo config cargo merges from above the repository or in
 `CARGO_HOME`, the test runner's bytes, and which `initdb` (the native
-mail leg's PostgreSQL) is first on `PATH` with what its `--version`
-prints, or that there is none; a pass is recorded only if
+mail leg's PostgreSQL) and `dav1d` (td-photo's decode oracles) are first
+on `PATH` with what their `--version` prints, or that there is none; a
+pass is recorded only if
 the content is unchanged when it finishes. A run holds its journal
 throughout, so a second run in the worktree waits. A gate does not
 recheck the content, so do not edit a worktree under a running `ready`.

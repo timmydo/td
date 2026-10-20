@@ -1474,13 +1474,14 @@ chroma filtering. Prediction reads the unfiltered pixels, so the filters
 run once the frame is coded, over the superblock-padded planes a decoder
 filters, and only on a reconstruction the caller asked to keep, which is
 then what any conforming decoder shows; `tests/av1.rs` holds that to
-dav1d when one is named (`TD_TEST_DAV1D`), and holds six small streams
-and their reconstructions to the hashes of bytes dav1d decoded, so a
-change to any emitted symbol or filtered pixel is verified against the
-decoder before the hash moves. It is fed rows like the JPEG encoder and
-codes a batch of superblock rows when one is complete, holding the
-batch's planes, a byte and a half a pixel (Export, above); a frame is
-at most 16384 on an axis. A block's prediction edges
+the `dav1d` on `PATH` when there is one (a run without one says so on
+stderr and skips that leg, as the gate's sandbox does), and holds six
+small streams and their reconstructions to the hashes of bytes dav1d
+decoded, so a change to any emitted symbol or filtered pixel is
+verified against the decoder before the hash moves. It is fed rows
+like the JPEG encoder and codes a batch of superblock rows when one is
+complete, holding the batch's planes, a byte and a half a pixel
+(Export, above); a frame is at most 16384 on an axis. A block's prediction edges
 are read once per plane and every mode is predicted from them into the
 row's scratch, which also holds the transform's working blocks and each
 plane's trial and best coding and only grows over the row, so a block
@@ -2092,8 +2093,8 @@ level of each size and grid, the axes refused, the quality to
 superblocks of every edge, one pixel, a frame wider than a tile, ten
 superblock rows over two batches, tile columns a superblock wide and
 two and five tile rows on one to three threads, each coding
-to a stream whose reconstruction is the encoder's own and, with
-`TD_TEST_DAV1D` naming a dav1d binary, decoded by it to the same bytes
+to a stream whose reconstruction is the encoder's own and, with a
+`dav1d` on `PATH`, decoded by it to the same bytes
 exactly, as are colour ramps that make chroma from luma code every
 pair of alpha signs in blocks both edges cut, and noise, a hard edge
 and a chroma checkerboard at the strongest filter strengths, and
@@ -2131,7 +2132,7 @@ strength adjustment by value; `avif`'s hold every box to its bytes.
 its ratio kept, an edge past the source and `full` the source's own size,
 a lower quality fewer bytes at the same size and the shrunk frame's mean
 the full one's within the codings' error, an AVIF named by its format
-with the shrunk size in its `ispe` and, with `TD_TEST_DAV1D` alone, its
+with the shrunk size in its `ispe` and, with a `dav1d` on `PATH`, its
 luma the JPEG export's within the codings' error (the gate holds the
 streams by hash in `tests/av1.rs`), a lower quality fewer bytes, each
 bad setting refused by name before anything is written) and
@@ -2498,12 +2499,14 @@ all-target Clippy.
 
 The target recipe `td-photo` (`recipes/src/recipes/td-photo.rs`) builds
 the crate with cargo on the source-built toolchain, staging the
-`td-civil`, `td-jpeg`, `td-ui` and `td-compositor` trees beside it so
-the calendar and the decoder resolve and the toolkit's `#[path]` mounts
-and embedded notices resolve as the sources name them, links the binary
-fully static and splits its debug companion: the td-editor and
-td-taskmgr shape, with a lock that lists only td-photo, td-civil,
-td-jpeg and td-ui. The system image
+`td-civil`, `td-fs`, `td-jpeg`, `td-ui`, `td-compositor` and
+`td-test-compositor` trees beside it so the calendar and the decoder
+resolve, the toolkit's `#[path]` mounts and embedded notices resolve as
+the sources name them, and the tests' dev-dependencies resolve, links
+the binary fully static and splits its debug companion: the td-editor
+and td-taskmgr shape, with a lock that lists only td-photo, td-civil,
+td-jpeg, td-ui and the dev-only td-fs and td-test-compositor. The
+system image
 (`recipes/src/recipes/system-x86-64.rs`) copies the complete recipe
 output, companion included, into the immutable root and links
 `/bin/td-photo` to it; the tool is run from the terminal or from the

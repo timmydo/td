@@ -115,14 +115,14 @@ fn the_manifest_declares_the_calendar_the_decoder_and_the_toolkit_and_joins_the_
         ),
         "the civil calendar, the JPEG decoder and the toolkit by path"
     );
-    // And the native harness, for the tests alone.
+    // And the file helpers and the native harness, for the tests alone.
     assert!(
         manifest.ends_with(
-            "\n[dev-dependencies]\ntd-test-compositor = { path = \"../td-test-compositor\" }\n"
+            "\n[dev-dependencies]\ntd-fs = { path = \"../td-fs\" }\ntd-test-compositor = { path = \"../td-test-compositor\" }\n"
         ),
-        "the native harness by path, for the tests"
+        "the file helpers and the native harness by path, for the tests"
     );
-    assert_eq!(manifest.matches("path =").count(), 4, "four dependencies");
+    assert_eq!(manifest.matches("path =").count(), 5, "five dependencies");
     assert_eq!(manifest.matches("[dependencies]").count(), 1);
     assert_eq!(manifest.matches("[dev-dependencies]").count(), 1);
     assert!(!manifest.contains("[build-dependencies]"));
@@ -147,8 +147,9 @@ fn the_manifest_declares_the_calendar_the_decoder_and_the_toolkit_and_joins_the_
         assert!(manifest.contains(&format!("{lint} = \"deny\"")), "{lint}");
     }
     let lock = read("Cargo.lock");
-    assert_eq!(lock.matches("[[package]]").count(), 5);
+    assert_eq!(lock.matches("[[package]]").count(), 6);
     assert!(lock.contains("name = \"td-civil\""));
+    assert!(lock.contains("name = \"td-fs\""));
     assert!(lock.contains("name = \"td-jpeg\""));
     assert!(lock.contains("name = \"td-photo\""));
     assert!(lock.contains("name = \"td-test-compositor\""));

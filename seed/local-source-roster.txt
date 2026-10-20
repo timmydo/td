@@ -19,7 +19,7 @@ td-net-source net engine,td-boot,td-fs
 td-news-source td-news td-civil,td-fetch-client,td-html,td-json,td-kv,td-toml,td-ui,td-compositor
 td-open-source td-open td-busd,td-secret
 td-pass-source td-pass td-secret,td-ui,td-compositor,td-authd,td-busd,td-firstboot,engine,td-tpm,td-fido,td-test-compositor
-td-photo-source td-photo td-civil,td-jpeg,td-ui,td-compositor,td-test-compositor
+td-photo-source td-photo td-civil,td-fs,td-jpeg,td-ui,td-compositor,td-test-compositor
 td-portal-source td-portal td-secret,td-busd,td-compositor,engine,td-ui,td-tpm,td-fido,td-test-compositor
 td-review-source td-review td-fs,td-ui,td-compositor
 td-setup-source td-setup td-install,td-ui,td-compositor,td-protector,td-tpm,td-fido,td-json,td-fat,engine,td-test-compositor

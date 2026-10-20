@@ -7,6 +7,10 @@ name = "td-civil"
 version = "0.1.0"
 
 [[package]]
+name = "td-fs"
+version = "0.1.0"
+
+[[package]]
 name = "td-jpeg"
 version = "0.1.0"
 
@@ -15,6 +19,7 @@ name = "td-photo"
 version = "0.1.0"
 dependencies = [
  "td-civil",
+ "td-fs",
  "td-jpeg",
  "td-test-compositor",
  "td-ui",

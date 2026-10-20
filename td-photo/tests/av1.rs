@@ -8,11 +8,15 @@
 
 //! The AV1 encoder: its frames' geometry, the streams it writes for a
 //! range of shapes and qualities, their reconstruction against the
-//! source, and, with `TD_TEST_DAV1D` naming a `dav1d` binary, that a real
-//! decoder shows exactly the picture the encoder reconstructed for
-//! itself. Without the binary the decoder leg is skipped, not failed.
+//! source, and, with a `dav1d` on `PATH`, that a real decoder shows
+//! exactly the picture the encoder reconstructed for itself. Without one
+//! the decoder leg is skipped, saying so, not failed: the gate's sandbox
+//! has no dav1d.
 
+use std::io::Write;
+use std::path::PathBuf;
 use std::process::Command;
+use std::sync::OnceLock;
 
 use td_photo::av1::{qindex, Encoder, Geometry, Reconstruction};
 use td_photo::avif;
@@ -133,10 +137,29 @@ fn encode_rgb(
     (obus, reconstruction.unwrap())
 }
 
+/// The `dav1d` on `PATH`, looked up once. Its absence is written to
+/// stderr directly, which libtest does not capture, so a run that skipped
+/// the decoder says so.
+fn dav1d_binary() -> Option<&'static PathBuf> {
+    static FOUND: OnceLock<Option<PathBuf>> = OnceLock::new();
+    FOUND
+        .get_or_init(|| {
+            let found = td_fs::executable_on_path("dav1d");
+            if found.is_none() {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "dav1d not found on PATH: the AV1 decode oracle is skipped"
+                );
+            }
+            found
+        })
+        .as_ref()
+}
+
 /// Decodes the OBUs with dav1d (a section-5 stream led by a temporal
 /// delimiter) to raw 4:2:0 planes, or `None` without the binary.
 fn dav1d(obus: &[u8], name: &str) -> Option<Vec<u8>> {
-    let dav1d = std::env::var_os("TD_TEST_DAV1D")?;
+    let dav1d = dav1d_binary()?;
     let dir = scratch(name);
     let (input, output) = (dir.join("stream.obu"), dir.join("stream.yuv"));
     let mut stream = vec![0x12, 0x00];
@@ -701,7 +724,7 @@ fn fnv(bytes: &[u8]) -> u64 {
 }
 
 /// The streams and their reconstructions are the bytes dav1d decoded
-/// once: the hashes were recorded from a run with `TD_TEST_DAV1D` and
+/// once: the hashes were recorded from a run with dav1d on `PATH` and
 /// every decode exact, so a change to any emitted symbol, or to the
 /// filtered pixels of these pictures, reds here with or without the
 /// decoder and is verified against it again before the hash moves. The coarse cases filter at

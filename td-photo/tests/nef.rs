@@ -2582,9 +2582,16 @@ fn the_command_line_exports_at_a_quality_and_a_long_edge_and_every_pick() {
 }
 
 /// The luma plane dav1d decodes from an AV1 stream (a section-5 stream
-/// led by a temporal delimiter), or `None` without `TD_TEST_DAV1D`.
+/// led by a temporal delimiter), or `None` without a `dav1d` on `PATH`,
+/// which is written to stderr directly so libtest does not swallow it.
 fn td_photo_av1_decode(obus: &[u8], width: usize, height: usize) -> Option<Vec<u8>> {
-    let dav1d = std::env::var_os("TD_TEST_DAV1D")?;
+    let Some(dav1d) = td_fs::executable_on_path("dav1d") else {
+        let _ = std::io::Write::write_all(
+            &mut std::io::stderr(),
+            b"dav1d not found on PATH: the AVIF export's decode check is skipped\n",
+        );
+        return None;
+    };
     let dir = scratch("avif-decode");
     let input = dir.join("in.obu");
     let output = dir.join("out.yuv");

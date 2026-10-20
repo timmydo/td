@@ -3819,8 +3819,9 @@ fn preflight_key(root: &Path, host: &[u8]) -> Option<String> {
 }
 
 /// Host tools a preflight takes from PATH: PostgreSQL's `initdb`, which the
-/// native mail leg requires.
-const PREFLIGHT_PATH_TOOLS: &[&str] = &["initdb"];
+/// native mail leg requires, and `dav1d`, whose decode oracles td-photo's
+/// tests run only when one is there.
+const PREFLIGHT_PATH_TOOLS: &[&str] = &["initdb", "dav1d"];
 
 /// What selects and configures the toolchain a cargo preflight runs, which
 /// the tree does not pin: the variables cargo and rustc read for it, every
