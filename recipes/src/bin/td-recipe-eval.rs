@@ -671,8 +671,6 @@ mod tests {
             "gcc-x86-64-native-test",
             "gcc-x86-64-self-test",
             "linux-x86-64-test",
-            "flex-x86-64-test",
-            "elfutils-x86-64-test",
             "btrfs-progs-x86-64-test",
             "ca-certificates-test",
             "td-boot-test",
@@ -706,8 +704,6 @@ mod tests {
             // host-side tool (`td-recipe-eval qemu-boot`), not a sandboxed gate
             // check, because a qemu boot needs host qemu the gate sandbox hides
             // (re #529). Its in-sandbox coverage is linux-x86-64-test above.
-            ("flex-x86-64-test", 1),
-            ("elfutils-x86-64-test", 1),
             ("btrfs-progs-x86-64-test", 1),
             ("ca-certificates-test", 1),
             ("td-boot-test", 1),
@@ -746,8 +742,7 @@ mod tests {
         // parser generator, re #469) + Python-3.11.1 (the glibc-rung python3,
         // re #469) + GCC 10.5.0 (the compatibility bridge between
         // gcc-mesboot 4.9.4 and GCC 14.3.0) + the linux-x86-64 kernel source +
-        // flex-2.6.4 + elfutils-0.192 (the modern-kernel host tools flex +
-        // libelf, re #529) + CMake 3.31.12 + Rust 1.96.0 source and its exact
+        // CMake 3.31.12 + Rust 1.96.0 source and its exact
         // three-component Rust 1.95.0 stage0 snapshot + coreutils-0.9.0 (the
         // uutils, ripgrep, and fd userland `.crate` sources) + btrfs-progs 7.0
         // and util-linux 2.42.2 (the persistent-volume writer and its minimal
@@ -757,10 +752,10 @@ mod tests {
         // data 2026d, and the Nerd Fonts v3.5.1 JetBrains Mono release with
         // nine licence notices + cryptsetup 2.8.8 with json-c 0.18, popt 1.19
         // and LVM2 2.03.43 (the LUKS2 userspace and its static libraries) +
-        // gawk 5.4.1 (the build-only awk after rust-toolchain) + bc 1.08.2 (the
-        // build-only bc for the kernel's timeconst.bc). BusyBox's pin left with
-        // its last consumer.
-        assert_eq!(pins.len(), 79);
+        // gawk 5.4.1 (the build-only awk after rust-toolchain). BusyBox's pin
+        // left with its last consumer; the kernel's flex, elfutils and bc left
+        // when it moved into the Debian build root.
+        assert_eq!(pins.len(), 76);
         assert!(pins.iter().any(|pin| pin.key == "stage0-source"));
         // The build root lists through `build-root-pins` alone.
         assert!(pins.iter().all(|pin| !pin.key.starts_with("debian-root-")));

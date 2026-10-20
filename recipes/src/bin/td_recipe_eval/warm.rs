@@ -49,6 +49,9 @@ struct Cold {
     headers: Vec<&'static str>,
     /// Rust rungs whose vendored dep closure is missing.
     vendors: Vec<VendorJob>,
+    /// The Debian build root's layer and .debs, when a recipe in the closure
+    /// builds in it; `td-feed warm build-root` fetches them.
+    build_root: Vec<SourcePin>,
 }
 
 impl Cold {
@@ -57,6 +60,7 @@ impl Cold {
             && self.ostree.is_empty()
             && self.headers.is_empty()
             && self.vendors.is_empty()
+            && self.build_root.is_empty()
     }
 
     /// One operator-facing line naming what is missing. A cold checkout is
@@ -88,6 +92,15 @@ impl Cold {
                 self.headers.len(),
                 plural(self.headers.len()),
                 self.headers.join(" ")
+            ));
+        }
+        if !self.build_root.is_empty() {
+            let files: Vec<&str> = self.build_root.iter().map(|p| p.file.as_str()).collect();
+            parts.push(format!(
+                "{} build-root pin{} ({})",
+                files.len(),
+                plural(files.len()),
+                elided(&files)
             ));
         }
         if !self.vendors.is_empty() {
@@ -180,6 +193,9 @@ pub(crate) fn preflight(
     if !cold.sources.is_empty() || !cold.headers.is_empty() {
         run_warm(&td_net, root, builder, &[s("warm"), s("sources")]);
     }
+    if !cold.build_root.is_empty() {
+        run_warm(&td_net, root, builder, &[s("warm"), s("build-root")]);
+    }
     for job in &cold.vendors {
         run_warm(&td_net, root, builder, &job.args);
     }
@@ -263,11 +279,18 @@ fn survey(
             | SeedInput::BootstrapRoot { .. } => {}
         }
     }
+    let mut build_root = Vec::new();
+    if graph.iter().any(|node| node.recipe.build_root) {
+        for pin in td_recipe::source_pins::build_root_pins()? {
+            push_cold_source(&mut build_root, sources_dir, pin);
+        }
+    }
     Ok(Cold {
         sources,
         ostree,
         headers,
         vendors: cold_vendor_jobs(root, &graph)?,
+        build_root,
     })
 }
 
@@ -621,6 +644,38 @@ mod tests {
         let _ = fs::remove_dir_all(&sources);
     }
 
+    /// The kernel builds in the Debian build root, so an image's closure needs
+    /// the root's pins too; a closure with no build-root recipe needs none.
+    #[test]
+    fn a_closure_with_a_build_root_recipe_surveys_the_roots_pins() {
+        let root = crate::test_temp::TempDir::new("td-warm-build-root").unwrap();
+        let sources = root.join("sources");
+        fs::create_dir_all(&sources).unwrap();
+        let pins = td_recipe::source_pins::build_root_pins().unwrap();
+        let cold = survey(
+            &root,
+            &sources,
+            &root.join("ostree"),
+            &["linux-x86-64-test"],
+        )
+        .unwrap();
+        assert_eq!(cold.build_root.len(), pins.len());
+        assert!(cold.describe().contains("build-root pin"));
+        for pin in &pins {
+            fs::write(sources.join(&pin.file), b"").unwrap();
+        }
+        let warm = survey(
+            &root,
+            &sources,
+            &root.join("ostree"),
+            &["linux-x86-64-test"],
+        )
+        .unwrap();
+        assert!(warm.build_root.is_empty());
+        let none = survey(&root, &sources, &root.join("ostree"), &["make-test"]).unwrap();
+        assert!(none.build_root.is_empty());
+    }
+
     #[test]
     fn firefox_surveys_and_completes_its_exact_graph_cache() {
         let root = scratch("firefox-root");
@@ -759,7 +814,11 @@ mod tests {
         let root = scratch("warm-root");
         let sources = scratch("warm-sources");
         let cold = survey(&root, &sources, &root.join("ostree"), &["system-x86-64"]).unwrap();
-        for pin in &cold.sources {
+        assert!(
+            !cold.build_root.is_empty(),
+            "the image's kernel builds in the root"
+        );
+        for pin in cold.sources.iter().chain(&cold.build_root) {
             fs::write(sources.join(&pin.file), b"pinned bytes").unwrap();
         }
         let linux = source_pin_for_key("linux-source").unwrap();

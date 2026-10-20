@@ -6705,6 +6705,10 @@ pub(crate) struct PayloadClosure {
     /// a pin is bytes rather than a recipe — so they are counted apart from the
     /// number the claim divides.
     pub(crate) pins: Vec<String>,
+    /// Members built in the Debian build root (AGENTS.md "Debian build
+    /// root"), sorted: compiled from source by tools td did not build, so the
+    /// claim names the root as a build-tool trust root for each of them.
+    pub(crate) build_root_members: Vec<String>,
 }
 
 impl PayloadClosure {
@@ -6734,7 +6738,16 @@ impl PayloadClosure {
         for key in &self.pins {
             out.push_str(&format!("payload\tpin\t{key}\n"));
         }
+        out.push_str(&self.build_root_lines());
         out
+    }
+
+    /// One `build-root	debian	<stem>` line per member built in the root.
+    pub(crate) fn build_root_lines(&self) -> String {
+        self.build_root_members
+            .iter()
+            .map(|stem| format!("build-root\tdebian\t{stem}\n"))
+            .collect()
     }
 }
 
@@ -6899,6 +6912,7 @@ fn application_store_closure_report(
         let disposition = if retained { "retained" } else { "build-only" };
         out.push_str(&format!("payload\tpin\t{pin}\t{path}\t{disposition}\n"));
     }
+    out.push_str(&payloads.build_root_lines());
     Ok(out)
 }
 
@@ -6982,9 +6996,13 @@ fn contains_payloads(
     let members: HashSet<&str> = nodes.iter().map(|node| node.stem.as_str()).collect();
     let mut foreign_members = Vec::new();
     let mut pins = Vec::new();
+    let mut build_root_members = Vec::new();
     for node in nodes {
         if node.recipe.is_foreign() {
             foreign_members.push(node.stem.clone());
+        }
+        if node.recipe.build_root {
+            build_root_members.push(node.stem.clone());
         }
         // A marked pin is reported beside the output built from it rather than
         // instead of it: the archive's bytes are a store path of their own, so
@@ -7004,6 +7022,8 @@ fn contains_payloads(
     foreign_members.dedup();
     pins.sort();
     pins.dedup();
+    build_root_members.sort();
+    build_root_members.dedup();
     PayloadClosure {
         // The DISTINCT stems rather than `nodes.len()`: a repeated node would
         // otherwise inflate the number the claim divides while the sets it is
@@ -7013,6 +7033,7 @@ fn contains_payloads(
         seeds,
         foreign_members,
         pins,
+        build_root_members,
     }
 }
 
@@ -9154,6 +9175,35 @@ mod tests {
         );
     }
 
+    /// A member built in the Debian build root stays unmarked, and the answer
+    /// names the root beside it; the kernel's real closure carries the line.
+    #[test]
+    fn the_closure_query_names_the_build_root_beside_its_members() {
+        let node = |stem: &str, recipe: Recipe| RecipeNode {
+            stem: stem.to_string(),
+            recipe,
+        };
+        let nodes = vec![
+            node("kernel", Recipe::mesboot("kernel", "1").build_root()),
+            node("image", Recipe::gnu("image", "1")),
+        ];
+        let answer = contains_payloads(&nodes, 0, |_| false);
+        assert_eq!(answer.unmarked(), 2);
+        assert_eq!(
+            answer.report(),
+            "members\t2\nunmarked\t2\naudited-seeds\t0\nbuild-root\tdebian\tkernel\n"
+        );
+        let real = payload_closure(&["linux-x86-64-test"]).unwrap().report();
+        assert!(
+            real.contains("build-root\tdebian\tlinux-x86-64\n"),
+            "{real}"
+        );
+        assert!(
+            real.contains("build-root\tdebian\tlinux-x86-64-test\n"),
+            "{real}"
+        );
+    }
+
     /// The query answers over a whole closure and reports what it finds THERE:
     /// a marked pin an image stages directly as data is a payload the claim does
     /// not cover, and an unmarked graph is covered entirely.
@@ -9548,6 +9598,8 @@ mod tests {
                 "freedesktop-platform-25-08-source".to_string(),
             ]
         );
+        // The kernel is the image's one member built in the Debian build root.
+        assert_eq!(answer.build_root_members, ["linux-x86-64".to_string()]);
     }
 
     /// A fake `cargo` at `path`: `body` runs with the real cargo's argv, so a test
@@ -11638,11 +11690,8 @@ chmod 755 '{}'
             "gcc-x86-64-stage2-test",
             "gcc-x86-64-native-test",
             "gcc-x86-64-self-test",
-            // #529 modern-kernel rung + its two new host-tool dependency recipes;
-            // each -test pulls its producer's whole closure, so this also covers
-            // flex-x86-64, elfutils-x86-64, and linux-x86-64 transitively.
-            "flex-x86-64-test",
-            "elfutils-x86-64-test",
+            // The kernel's test pulls its whole closure, the build root
+            // among it.
             "linux-x86-64-test",
             "hello-test",
         ] {

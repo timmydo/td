@@ -91,8 +91,8 @@ const BOOT_FAIL_PARKED: &str = "td-boot-parked-v1";
 // deployment, selected from persistent Btrfs and entered through kexec onto a
 // disk-backed READ-ONLY EROFS root.
 //
-// This is the "system definition" recipe. It composes artifacts that already exist in
-// the ladder — the source-built `linux-x86-64` kernel and td's own static Rust
+// This is the "system definition" recipe. It composes artifacts td already builds —
+// the `linux-x86-64` kernel (source-built in the Debian build root) and td's own static Rust
 // userland — into a first-class deployment bundle:
 //
 //   boot/{selector-initramfs.cpio,manifest}

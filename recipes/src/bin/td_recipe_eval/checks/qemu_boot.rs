@@ -1,4 +1,4 @@
-//! Host-side qemu boot validation (re #529): boot the td-source-built
+//! Host-side qemu boot validation (re #529): boot the source-built
 //! linux-x86-64 kernel under HOST qemu and prove it reaches a real userland.
 //! Reached only through the `td-recipe-eval qemu-boot` subcommand
 //! (check_runner::qemu_boot_cli), NOT a gated recipe check.
@@ -694,7 +694,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     let (bzimage, initramfs) = build_kernel(runner)?;
 
     println!(
-        "   [qemu-boot] {qemu} boots the td-source-built bzImage with the td-sh initramfs\n              kernel:    {}\n              initramfs: {}",
+        "   [qemu-boot] {qemu} boots the source-built bzImage with the td-sh initramfs\n              kernel:    {}\n              initramfs: {}",
         bzimage.display(),
         initramfs.display()
     );
@@ -735,7 +735,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         ));
     }
     println!(
-        "PASS: linux-x86-64 boots under qemu — the td-source-built kernel reaches userspace and \
+        "PASS: linux-x86-64 boots under qemu — the source-built kernel reaches userspace and \
          runs the static td-sh userland ({MARKER} on ttyS0)"
     );
     Ok(())
@@ -755,7 +755,7 @@ pub(crate) fn run_erofs(runner: &RecipeCheckRunner) -> Result<(), String> {
     let disk = build_probe_image(runner)?;
 
     println!(
-        "   [qemu-boot-erofs] {qemu} boots the td-source-built bzImage with a read-only erofs virtio-blk disk\n              kernel:    {}\n              initramfs: {}\n              erofs img: {}",
+        "   [qemu-boot-erofs] {qemu} boots the source-built bzImage with a read-only erofs virtio-blk disk\n              kernel:    {}\n              initramfs: {}\n              erofs img: {}",
         bzimage.display(),
         initramfs.display(),
         disk.display()
@@ -3033,7 +3033,7 @@ pub(crate) fn run_kexec(runner: &RecipeCheckRunner) -> Result<(), String> {
     let (bzimage, initramfs) = build_spike(runner)?;
 
     println!(
-        "   [qemu-boot-kexec] {qemu} boots the td-source-built bzImage, then the outer /init td-kexecs a SECOND kernel start\n              kernel:    {}\n              initramfs: {}",
+        "   [qemu-boot-kexec] {qemu} boots the source-built bzImage, then the outer /init td-kexecs a SECOND kernel start\n              kernel:    {}\n              initramfs: {}",
         bzimage.display(),
         initramfs.display()
     );
@@ -3096,7 +3096,7 @@ pub(crate) fn run_kexec(runner: &RecipeCheckRunner) -> Result<(), String> {
         "STAGE1 (scrolled out of the console tail)"
     };
     println!(
-        "PASS: kexec-spike-x86-64 kexecs under qemu — the td-source-built kernel boots, td-kexec \
+        "PASS: kexec-spike-x86-64 kexecs under qemu — the source-built kernel boots, td-kexec \
          kexec_file_load(2)+reboot(KEXEC)s a SECOND kernel start ({stage1} -> {KEXEC_STAGE2_MARKER} on ttyS0)"
     );
     Ok(())

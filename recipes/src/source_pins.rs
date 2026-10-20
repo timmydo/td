@@ -25,16 +25,6 @@ const PINS: &[PinDef] = &[
         file: "bash-2.05b.tar.gz",
     },
     PinDef {
-        key: "bc-x86-64-self-source",
-        aliases: &[],
-        // GNU bc 1.08.2, build-only, for the kernel's timeconst.bc. The
-        // tarball's detached signature verifies against the GNU keyring (Ken
-        // Pizzini, 325B54E4653F935A25CF32BDA186278D426A38E9).
-        url: "https://ftp.gnu.org/gnu/bc/bc-1.08.2.tar.gz",
-        sha256: "ae470fec429775653e042015edc928d07c8c3b2fc59765172a330d3d87785f86",
-        file: "bc-1.08.2.tar.gz",
-    },
-    PinDef {
         key: "binutils-mesboot-source",
         aliases: &[],
         url: "https://ftp.gnu.org/gnu/binutils/binutils-2.20.1a.tar.bz2",
@@ -146,44 +136,11 @@ const PINS: &[PinDef] = &[
         file: "diffutils-2.7.tar.gz",
     },
     PinDef {
-        key: "elfutils-x86-64-source",
-        aliases: &[],
-        // elfutils 0.192 — the source of `libelf`, which the modern Linux kernel's
-        // objtool host tool links against (re #529). objtool is force-selected on
-        // x86_64 in current kernels (7.x: HAVE_STATIC_CALL_INLINE +
-        // HAVE_UACCESS_VALIDATION both `select OBJTOOL` unconditionally), so libelf
-        // is not avoidable the way it was in the 4.14 rung. The `elfutils-x86-64` recipe builds ONLY libelf.a
-        // + headers from this tarball with td's native x86_64 toolchain; objtool
-        // tolerates old libelf (it defines LIBELF_USE_DEPRECATED), so the exact
-        // version is not load-bearing. 0.192 is a deliberate stable pin (a
-        // reviewed update bumps the version + hash together); newer 0.19x
-        // releases exist and any of them would serve — this is not a "latest"
-        // claim, and the build asserts nothing about the minor version.
-        url: "https://sourceware.org/elfutils/ftp/0.192/elfutils-0.192.tar.bz2",
-        sha256: "616099beae24aba11f9b63d86ca6cc8d566d968b802391334c91df54eab416b4",
-        file: "elfutils-0.192.tar.bz2",
-    },
-    PinDef {
         key: "fd-source",
         aliases: &[],
         url: "https://static.crates.io/crates/fd-find/fd-find-10.2.0.crate",
         sha256: "de08defa195af894cc295a43bfc65ba28903e492fd5f32f7a24bf75eafd9bf34",
         file: "fd-find-10.2.0.crate",
-    },
-    PinDef {
-        key: "flex-x86-64-source",
-        aliases: &[],
-        // GNU flex 2.6.4 — the lexical-analyzer generator the modern Linux kernel
-        // (>= 4.18) requires for scripts/kconfig's lexer; the pre-generated
-        // `*_shipped` parsers the 4.14 rung relied on are gone from the current
-        // tree (re #529). The `flex-x86-64` recipe builds it static with td's
-        // native x86_64 toolchain. The release tarball ships the generated
-        // scanner/parser C (src/scan.c, src/parse.c), so no pre-existing flex or
-        // bison is needed to build it; it execs m4 (m4-mesboot, baked at configure)
-        // at scanner-generation time. Latest release.
-        url: "https://github.com/westes/flex/releases/download/v2.6.4/flex-2.6.4.tar.gz",
-        sha256: "e87aae032bf07c26f85ac0ed3250998c37621d95f8bd748b31f15b33c45ee995",
-        file: "flex-2.6.4.tar.gz",
     },
     PinDef {
         key: "gawk-mesboot-source",
@@ -856,8 +813,7 @@ mod tests {
         // Python-3.11.1 (the glibc-rung python3, re #469) + GCC 10.5.0 (the
         // compatibility bridge between gcc-mesboot 4.9.4 and GCC 14.3.0) +
         // the linux-x86-64 kernel source (separate from the 4.14 UAPI-header
-        // pin, re #529) + flex-2.6.4 and elfutils-0.192 (the modern-kernel host
-        // tools flex + libelf, re #529) + CMake 3.31.12 + Rust 1.96.0 source and
+        // pin, re #529) + CMake 3.31.12 + Rust 1.96.0 source and
         // its exact three-component Rust 1.95.0 bootstrap snapshot +
         // coreutils-0.9.0, ripgrep 14.1.1, and fd 10.2.0 (the Rust userland
         // `.crate` sources) +
@@ -873,10 +829,10 @@ mod tests {
         // Fonts v3.5.1 JetBrains Mono release ten pinned upstream data pins:
         // the archive and nine licence notices. cryptsetup 2.8.8 with json-c
         // 0.18, popt 1.19 and LVM2 2.03.43 add the LUKS2 userspace closure.
-        // gawk 5.4.1 is the build-only awk after rust-toolchain, and bc 1.08.2
-        // the build-only bc for the kernel's timeconst.bc. BusyBox's pin left
-        // with its last consumer.
-        assert_eq!(all().len(), 79);
+        // gawk 5.4.1 is the build-only awk after rust-toolchain. BusyBox's pin
+        // left with its last consumer, and the kernel's bc, flex and elfutils
+        // left when it moved into the Debian build root.
+        assert_eq!(all().len(), 76);
     }
 
     /// A roster keyed by NAME can name nothing, and this workstream has twice

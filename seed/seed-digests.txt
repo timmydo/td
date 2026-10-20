@@ -10,7 +10,6 @@
 # source changes. Hand-editing a row is self-defeating: the runner
 # re-derives from the pins every run and reds on disagreement.
 bash-mesboot-source 0w2mkw1b4ll6wfq48nsmp9l13b3za98g-bash-mesboot-source
-bc-x86-64-self-source 3a3f0g1d72nj8ga5qx7zln483cb0pai1-bc-x86-64-self-source
 binutils-244-source 8xzd2kk7j2pj9fhkmab3ajhgpmccgidj-binutils-244-source
 binutils-mesboot-source 455cqqkkwpx94h5km91l46wldq80dgyl-binutils-mesboot-source
 bison-mesboot-source 091gccsyc4qcsnk4r6p99mqkk259f3ar-bison-mesboot-source
@@ -22,10 +21,8 @@ coreutils-mesboot0-source 7dkw301jma5vnzc6x5i09nmh2dn7ak0q-coreutils-mesboot0-so
 cryptsetup-x86-64-source v3g69yip0g4zybh9yw2hlp3zzcfy98fc-cryptsetup-x86-64-source
 curl-x86-64-source 985mgjp6q4y958wwzqs984nkh399jnac-curl-x86-64-source
 diffutils-mesboot0-source ilin34x3xf4shlhs892wchsc0vjyqwb8-diffutils-mesboot0-source
-elfutils-x86-64-source n4g2hjlg72jm5wn0lx9fxplvh2y82d0b-elfutils-x86-64-source
 fd-source rsp3qagl8x7gh5hqpzy93adwfv5pv2ay-fd-source
 firefox-154-source 40asdrhyln3x194j276abhb2j2i7a04z-firefox-154-source
-flex-x86-64-source v1hf8a11jna03slg5iqr5zj5kfxshvwz-flex-x86-64-source
 freedesktop-platform-25-08-source cgynxza1vd3h30gd4hjl7vp82hdqlyj3-freedesktop-platform-25-08-source
 gawk-mesboot-source 128bh62a669ds6v5q6v2sih5a1qk51wj-gawk-mesboot-source
 gawk-mesboot0-source zdx7nfqxa7pddqpip7bpa13d79d5p7q2-gawk-mesboot0-source

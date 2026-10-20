@@ -1,3 +1,4 @@
+use crate::ladder::{BUILD_ROOT_PATH, BUILD_ROOT_SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 // The Debian build root (BUILD-ROOT-PLAN.md) as a sandbox root: its gcc
@@ -60,8 +61,8 @@ pub fn recipe() -> Recipe {
                 "hello.c",
             ],
         )
-        .env("PATH", "/usr/bin"),
-        Step::run("{root}/test", &["/usr/bin/sh", "-c", script]).env("PATH", "/usr/bin"),
+        .env("PATH", BUILD_ROOT_PATH),
+        Step::run("{root}/test", &[BUILD_ROOT_SH, "-c", script]).env("PATH", BUILD_ROOT_PATH),
         Step::WriteFile {
             path: "{out}/result".into(),
             content: "PASS: the Debian build root's gcc 14.2.0 built a freestanding static \

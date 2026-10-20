@@ -113,7 +113,7 @@ the pin block.
 **three** steps, and reading only the first is how an earlier draft of
 this table got an answer wrong:
 
-1. **`allnoconfig`** (`linux-x86-64.rs:331`) answers `n` to every
+1. **`allnoconfig`** (`linux-x86-64.rs:154`) answers `n` to every
    *prompted* symbol regardless of its `default`. A symbol whose prompt
    is guarded `if EXPERT` keeps its default instead, because
    `allnoconfig` turns `EXPERT` off and an invisible prompt cannot be
@@ -2299,6 +2299,18 @@ and admits only when the bytes equal it; `td-recipe-eval bootstrap-root
 check` re-proves it on demand, and `TD_BOOTSTRAP_FROM_STAGE0=1` makes the
 query walk the whole chain.
 
+A member built in the Debian build root (AGENTS.md, "Debian build root")
+is source-built by tools td did not build, so the answer names the root
+beside it as a build-tool trust root, one fixed-arity line per such
+member, after the payload lines:
+
+```text
+build-root	debian	linux-x86-64
+```
+
+It is still counted as `unmarked`: the mark is about application
+payloads, and the kernel is compiled from its pinned source.
+
 A marked pin is reported BESIDE the output built from it rather than
 instead of it: the archive's bytes are a store path of their own, so the
 two are two paths the claim does not cover. Neither is a closure MEMBER
@@ -2648,6 +2660,10 @@ store	/td/store/<hash>-ripgrep-seed-15.2.0
 payload	recipe	ripgrep-seed	/td/store/<hash>-ripgrep-seed-15.2.0	retained
 payload	pin	ripgrep-seed-source	/td/store/<hash>-ripgrep-seed-source	build-only
 ```
+
+A closure member built in the Debian build root adds the same
+three-field `build-root	debian	<stem>` line the closure query prints,
+after the payload lines.
 
 #### Metadata, exports, and what the marker does not do
 

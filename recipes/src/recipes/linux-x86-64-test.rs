@@ -1,4 +1,4 @@
-use crate::ladder::{initramfs_cpio_shape_check, mesboot0_inputs, mesboot0_path, SH};
+use crate::ladder::{initramfs_cpio_shape_check, BUILD_ROOT_PATH as PATH, BUILD_ROOT_SH as SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 // linux-x86-64-test: behavioral validation of the source-built kernel (#529).
@@ -13,13 +13,12 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 //   2. vmlinux carries the `Linux version 7.1.4` banner (init/version.o's
 //      linux_banner[], always obj-y) — proof the kernel actually compiled and
 //      linked, not just that some ELF exists,
-//   3. vmlinux embeds no `/gnu/store` bytes — the no-guix host-free leg, mirroring
-//      the other native-toolchain tests (td's native toolchain is /td/store; a
+//   3. vmlinux embeds no `/gnu/store` bytes — the no-guix host-free leg (a
 //      /gnu/store byte would mean a host-guix compiler/lib leaked into the image),
 //   4. bzImage is well-formed: a size floor (>= 64 KiB) rejects a header-only or
 //      truncated image; the 0xAA55 boot signature at 0x1fe and the "HdrS" magic at
-//      0x202 (arch/x86/boot/header.S, read with od's offset seek since mesboot0
-//      ships no dd) prove the boot-setup header; and the gzip magic `1f 8b 08`
+//      0x202 (arch/x86/boot/header.S, read with od's offset seek) prove the
+//      boot-setup header; and the gzip magic `1f 8b 08`
 //      appears somewhere in the file, proving the CONFIG_KERNEL_GZIP payload was
 //      actually compressed and embedded — not just the raw ELF wrapped in a stub.
 //   5. bzImage has PE32+ x86-64 EFI application headers and a file-backed
@@ -43,8 +42,8 @@ pub fn recipe() -> Recipe {
     let vmlinux = "{in:linux-x86-64}/vmlinux";
     let bzimage = "{in:linux-x86-64}/bzImage";
     let initramfs = "{in:linux-x86-64}/initramfs.cpio";
-    let readelf = "{in:binutils-x86-64-native}/bin/readelf";
-    let nm = "{in:binutils-x86-64-native}/bin/nm";
+    let readelf = "/usr/bin/readelf";
+    let nm = "/usr/bin/nm";
     let mut steps = Vec::new();
 
     steps.push(
@@ -61,7 +60,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &mesboot0_path()),
+        .env("PATH", PATH),
     );
     steps.push(
         Step::run(
@@ -74,7 +73,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &mesboot0_path()),
+        .env("PATH", PATH),
     );
     steps.push(
         Step::run(
@@ -87,7 +86,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &mesboot0_path()),
+        .env("PATH", PATH),
     );
     steps.push(
         Step::run(
@@ -106,13 +105,13 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &mesboot0_path()),
+        .env("PATH", PATH),
     );
     steps.push(Step::AssertEfiApplication {
         path: bzimage.into(),
     });
     let initramfs_check = initramfs_cpio_shape_check(initramfs, "{in:td-util}/bin/td-util");
-    steps.push(Step::run("{root}", &[SH, "-c", &initramfs_check]).env("PATH", &mesboot0_path()));
+    steps.push(Step::run("{root}", &[SH, "-c", &initramfs_check]).env("PATH", PATH));
 
     steps.push(
         Step::run(
@@ -128,7 +127,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &mesboot0_path()),
+        .env("PATH", PATH),
     );
 
     steps.push(Step::MkDir {
@@ -136,7 +135,7 @@ pub fn recipe() -> Recipe {
     });
     steps.push(Step::WriteFile {
         path: "{out}/result".into(),
-        content: "PASS: Linux 7.1.4, source-built by the native /td/store x86_64 toolchain — vmlinux is a well-formed ELF64 x86-64 image carrying the Linux banner and built-in dm-crypt with generic/accelerated AES-XTS and the AF_ALG hash/skcipher interfaces, bzImage carries the x86 boot-setup header (0xAA55 + HdrS) and x86-64 PE headers, and initramfs.cpio is a newc cpio carrying the static td-sh, td-init and td-util userland\n".into(),
+        content: "PASS: Linux 7.1.4, source-built in the Debian build root — vmlinux is a well-formed ELF64 x86-64 image carrying the Linux banner and built-in dm-crypt with generic/accelerated AES-XTS and the AF_ALG hash/skcipher interfaces, bzImage carries the x86 boot-setup header (0xAA55 + HdrS) and x86-64 PE headers, and initramfs.cpio is a newc cpio carrying the static td-sh, td-init and td-util userland\n".into(),
         exec: false,
     });
     steps.push(Step::Require {
@@ -145,12 +144,12 @@ pub fn recipe() -> Recipe {
     });
 
     Recipe::mesboot("linux-x86-64-test", "1.0")
-        .native_inputs(&["linux-x86-64", "binutils-x86-64-native", "td-util"])
-        .inputs_owned(mesboot0_inputs(&[]))
+        .build_root()
+        .native_inputs(&["linux-x86-64", "td-util"])
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
-echo ">> recipe-check linux-x86-64-test: build-plan --auto builds linux-x86-64 (Linux 7.1.4 vmlinux + bzImage + td-sh initramfs, source-built by the native /td/store x86_64 GCC 14 + glibc 2.41 toolchain) and asserts a well-formed ELF64 x86-64 vmlinux with the Linux banner and built-in dm-crypt with generic/accelerated AES-XTS and the AF_ALG hash/skcipher interfaces, a bzImage carrying x86 boot-setup and EFI application headers, and a newc initramfs.cpio carrying the static td-sh, td-init and td-util userland"
+echo ">> recipe-check linux-x86-64-test: build-plan --auto builds linux-x86-64 (Linux 7.1.4 vmlinux + bzImage + td-sh initramfs, source-built in the Debian build root) and asserts a well-formed ELF64 x86-64 vmlinux with the Linux banner and built-in dm-crypt with generic/accelerated AES-XTS and the AF_ALG hash/skcipher interfaces, a bzImage carrying x86 boot-setup and EFI application headers, and a newc initramfs.cpio carrying the static td-sh, td-init and td-util userland"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run linux-x86-64-test 1
 "#,

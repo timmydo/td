@@ -102,9 +102,15 @@ deleted; its findings are summarized under "Facts" below.
    daemon and `build-recipe` fail closed on a build-root drv until a
    later increment needs them. AGENTS.md and UNSAFE.md amended. Test:
    `build-root-hello-test` (freestanding C compiled and run in the root).
-4. **Kernel in the build root.** `linux-x86-64` uses the 49-package
-   subset. Deletes the bc, flex and elfutils recipes. Integration tier
-   run by hand before push (boot path).
+4. **Kernel in the build root.** First (4a), td-util gains a Rust
+   `gen_init_cpio`, byte-identical to the kernel's, and the boot recipes
+   pack with it, so the kernel exports no host program. Then (4b)
+   `linux-x86-64` and its test build in the whole root (no subset: one
+   tree serves every build-root recipe), with Debian's gcc, binutils,
+   make, flex, bison, bc and libelf. The bc, flex and elfutils recipes
+   and their pins are deleted, along with the kernel's glibc sysroot,
+   static HOSTCC wrapper, libelf pkg-config shim and tool farm. The
+   integration tier is run by hand before push (boot path).
 5. **td glibc, libgcc and zlib from the build root.** `glibc-x86-64`
    rebuilt with Debian gcc in the root (same 2.41 source, frame pointers,
    companions); new `gcc-runtime` recipe builds only GCC 14's target

@@ -1,4 +1,4 @@
-//! Host-side interactive distro runner (re #541, #550): build the td-source-built
+//! Host-side interactive distro runner (re #541, #550): build the source-built
 //! `system-x86-64` deployment bundle and boot it under HOST qemu with an
 //! graphical virtio framebuffer plus an INTERACTIVE serial console, so an operator can
 //! watch it boot, mount the read-only erofs root, `switch_root` into it, auto-log-in as

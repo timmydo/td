@@ -14,7 +14,8 @@
 # to write the assembled tree's NAR hash back, which assembly then requires.
 #
 # `want` is the C build tool set: the kernel needs gcc, make, flex, bison,
-# bc, libelf-dev and rsync; cryptsetup's json-c needs cmake; the rest serve
+# bc, pkgconf and libelf-dev; rsync serves `make headers_install`, which
+# no recipe runs yet; cryptsetup's json-c needs cmake; the rest serve
 # the C packages and the C inside Rust crates. Every pinned source is C, so
 # there is no g++.
 image library/debian:trixie-20261005-slim

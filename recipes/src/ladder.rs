@@ -708,6 +708,11 @@ pub fn post_rust_inputs<'a>(awk_input: &'a str, extras: &[&'a str]) -> Vec<&'a s
 /// producer, the gated shape check, and the boot oracle can never silently desync.
 pub const USERLAND_MARKER: &str = "TD-USERLAND-OK";
 
+/// The Debian build root's shell and tool directory, for the recipes that
+/// build in it (`Recipe::build_root`).
+pub const BUILD_ROOT_SH: &str = "/usr/bin/bash";
+pub const BUILD_ROOT_PATH: &str = "/usr/bin";
+
 /// The line the bootable-kernel rung's `/init` prints on ttyS0 AFTER it mounts the
 /// attached virtio-blk disk as READ-ONLY erofs and reads `EROFS_PROBE_SENTINEL`
 /// back — the success signal the host-side `qemu-boot-erofs` tool asserts on
@@ -1872,10 +1877,6 @@ mod tests {
     // self-hosting but are not ancestors of rust-toolchain. New recipes default
     // to the far side of the boundary and must not grow this list silently.
     const BOOTSTRAP_SIDE_CONSUMERS: &[&str] = &[
-        "elfutils-x86-64",
-        "elfutils-x86-64-test",
-        "flex-x86-64",
-        "flex-x86-64-test",
         "gcc-10-bridge-test",
         "gcc-x86-64-native-test",
         "gcc-x86-64-stage2-test",
@@ -1892,31 +1893,6 @@ mod tests {
         ("rust-userland-auto-test", "rust-stage0"),
         ("gcc-x86-64-self-test", "gcc-x86-64-native"),
         ("gcc-x86-64-self-test", "binutils-x86-64-native"),
-        // The kernel stays built by the native GCC 14 toolchain and mesboot0
-        // userland it was proven with; only the tools BusyBox supplied (bc,
-        // td-util, uutils, and td-sh and td-init for its initramfs) come from
-        // past the boundary, which puts it there. Its test reads the same
-        // artifacts with the same userland.
-        ("linux-x86-64", "bash-mesboot"),
-        ("linux-x86-64", "binutils-x86-64-native"),
-        ("linux-x86-64", "bison-mesboot"),
-        ("linux-x86-64", "coreutils-mesboot0"),
-        ("linux-x86-64", "diffutils-mesboot0"),
-        ("linux-x86-64", "elfutils-x86-64"),
-        ("linux-x86-64", "flex-x86-64"),
-        ("linux-x86-64", "gawk-mesboot0"),
-        ("linux-x86-64", "gcc-x86-64-native"),
-        ("linux-x86-64", "grep-mesboot0"),
-        ("linux-x86-64", "m4-mesboot"),
-        ("linux-x86-64", "make-x86-64"),
-        ("linux-x86-64", "sed-mesboot0"),
-        ("linux-x86-64-test", "bash-mesboot"),
-        ("linux-x86-64-test", "binutils-x86-64-native"),
-        ("linux-x86-64-test", "coreutils-mesboot0"),
-        ("linux-x86-64-test", "diffutils-mesboot0"),
-        ("linux-x86-64-test", "gawk-mesboot0"),
-        ("linux-x86-64-test", "grep-mesboot0"),
-        ("linux-x86-64-test", "sed-mesboot0"),
         // Rebuild GNU Make once with the final compiler. The preceding Make is
         // only the build driver; later packages consume make-x86-64-self.
         // The frozen UAPI input is a fixed-output source governed by the seed
@@ -2712,10 +2688,9 @@ mod tests {
             && canonical.matches(&copied_kernel).count() == copied_kernel_references
     }
 
-    /// linux-x86-64 is past the boundary only for the tools BusyBox supplied;
-    /// its bzImage is still native GCC 14 output, and the boundary guard
+    /// linux-x86-64 is built in the Debian build root, and the boundary guard
     /// cannot see what its readers take from it. The boot recipes may take
-    /// only that; td-util packs their initramfs.
+    /// only its bzImage; td-util packs their initramfs.
     #[test]
     fn boot_recipes_use_the_kernel_only_for_boot_artifacts() {
         let recipes = catalog::all();
