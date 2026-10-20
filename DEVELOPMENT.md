@@ -160,7 +160,7 @@ either binary is not. The gate says how many checks it answered that way
 and counts them apart from the ones it ran.
 
 A check that runs says why in its log, as `[memo] CHECK runs (key K):
-...`: the key's components that changed since the pass it last used
+...`: the key's components that changed since the pass it recorded last
 (`changed recipe uutils, changed sources uutils, changed lock ...`), or
 that it has none on record, or that `TD_CHECK_FULL` is set. Every check
 run, memoized or not, appends a line to
@@ -181,8 +181,8 @@ check whose key differs from a pass on record here only in its
 key holds, does not run: it prints `[td-check-memo:deferred]` with the
 components that changed, the gate counts and names it as deferred to
 main beside its memo answers, and the history records it as `deferred`,
-not as a run. Every pass of the check is weighed, not only the last
-used, since worktrees on other bases record passes of the same check in
+not as a run. Every pass of the check is weighed, not only the
+newest, since worktrees on other bases record passes of the same check in
 the shared memo; only a well-formed pass whose components hash to the
 key it is filed under counts. A change to anything else the check reads
 — its script, a recipe in its closure or the sources it embeds, a lock,
@@ -202,9 +202,10 @@ says so; the same changes arriving from main are main's to run. So a
 branch that touches only the builder engine, the evaluator's shared
 code or the engine crate runs none of the checks they alone reach, and
 one that changes a recipe or a check's body still runs the checks that
-reach it whatever main did to the engine since. Weighing passes is not
-a use of them, so gc-store still expires them; the pass that defers is
-stamped as one, as a memo hit's is. main-integration runs every recipe
+reach it whatever main did to the engine since. Weighing passes records
+nothing; the pass that defers becomes the check's recorded root, as a
+memo hit's does, so it outlives the collection below while this
+worktree's last run needed it. main-integration runs every recipe
 check undeferred (below); on the check host's machine its passes are
 what the next branch compares with, while a runner on a host of its own
 still covers main but leaves the branches' memo to their own runs. The
@@ -249,32 +250,57 @@ dir.
 ## Reclaiming the shared build cache
 
 The ladder work dir under `~/.td/build-daemon/ladder-shared-v1` keeps every
-output every worktree has built. Normal builds, checks (including verdict
-memo hits) and boot preparation attempt automatic retention cleanup before
-taking the shared ladder lock. At most once an hour across all worktrees,
-it removes cache entries and memos unused for one day, preserving recent
-closures and the pinned seed store. It takes the ladder exclusively without
-waiting; a live build defers cleanup to a later invocation. Failed or deferred
-sweeps do not advance the shared completion stamp. Cleanup failures warn
-and leave the requested operation running; automatic reports go to stderr.
-No host scheduler is
-needed. This is retention, not a byte cap: recently used outputs can still
-fill the disk, and cleanup runs only when td is invoked.
+output every worktree has built. Collection keeps what each worktree's last
+runs needed and nothing else; there is no age window. Every build records,
+under `gc-roots/`, per worktree and per target, the store basename of each
+rung as its `STEP` line names it, so a build stopped or failed part way
+keeps what it finished for its retry; a build that completes replaces the
+record's outputs with exactly the rungs it named. A build-run memo hit records that
+memo and the trees it names, and a check's verdict memo is recorded under
+the check when a pass writes it, a memo hit reads it, or a branch run
+defers to it. A target the worktree builds again therefore stops rooting
+what it no longer names; one it never builds again stays rooted as last
+built. A record that would say what it already says is not rewritten.
 
-To inspect or run a different retention window explicitly:
+Normal builds, checks (including verdict memo hits) and boot preparation
+attempt that collection before taking the shared ladder lock, whenever a
+record has changed since the last completed sweep. It takes the ladder
+exclusively without waiting; a live build defers it to a later invocation,
+and failed or deferred sweeps do not advance the shared completion stamp.
+Cleanup failures warn and leave the requested operation running; automatic
+reports go to stderr. No host scheduler is needed. Until some record names
+an output, nothing in the cache is collected. This is not a byte cap: what
+the worktrees' last runs needed can still fill the disk, and cleanup runs
+only when td is invoked.
+
+A record's worktree is gone only when git has removed it: the directory
+is absent, and so is git's administrative directory for it (recorded with
+the roots) from a `.git/worktrees/` that is itself visible, or that
+directory's name now belongs to a worktree elsewhere. A worktree
+deleted by hand stays live until `git worktree prune` removes that entry,
+a main checkout is never gone, and a sweep that cannot see the repository
+(the check sandbox sees only its own worktree) judges nothing gone. A gone
+worktree's record still roots until a live worktree's record of the same
+build or check is at least as new or already names all it names, and of several
+gone ones only the newest does, so removing a worktree does not collect
+what its successor is about to reuse. So a key no live worktree builds
+again keeps its last gone record, one per key; the bootstrap root's
+ladder is one key across re-pins for that reason. Records that are never
+judged gone (a main checkout, a root that is not a git checkout, the old
+path of a `git worktree move`) root until their record is replaced;
+removing their directory under `gc-roots/` releases them. A record from
+a newer td-recipe-eval stops every sweep until this one is as new.
+
+To see what a sweep would reclaim, or run one on demand:
 
 ```text
-td-recipe-eval gc-store --unused-for 14 --dry-run
-td-recipe-eval gc-store --unused-for 14
+td-recipe-eval gc-store --dry-run
+td-recipe-eval gc-store
 ```
 
-A cache record is used when a build reuses it: a rung's receipt on a warm
-hit, a build-run memo when an unchanged plan skips the climb, a verdict memo
-when a check is skipped. Each hit stamps its record, and a record's last use
-is the newer of that stamp and its atime, so a reader can only keep an entry
-longer, never shorter. `gc-store` keeps the closure of everything used
-within the window over the cache's reference graph — what a reused output
-references stays with it, and a memo's whole recorded closure stays — and
+`gc-store` keeps the closure of every recorded output over the cache's
+reference graph — what a recorded output references stays with it — with
+the receipts whose outputs all stay and the memos a record names, and
 removes the other rows, trees, receipts and memos. The seed store is not
 touched.
 
@@ -282,10 +308,9 @@ It holds the ladder exclusively, as `clear-store` does: it waits for the
 running builds, checks and boots that hold it to finish and blocks new ones
 while it runs, so run it when builds are quiet. A check whose verdict memo
 hits never takes the ladder, and its read of that memo may overlap the memo
-reaping; nothing worse than a lost stamp comes of it. Too short a window
-costs a rebuild, never a wrong build: the cache is content-addressed, and a
-missing rung cold-climbs on its next use. The dry run prints what a window
-would reclaim before it does.
+reaping; nothing worse than a record naming a removed memo comes of it. A
+missing root costs a rebuild, never a wrong build: the cache is
+content-addressed, and a missing rung cold-climbs on its next use.
 
 Beside the ladder's records, `td-shell-cache/` keeps what the
 rust-toolchain check's `td shell` proof built (ripgrep, fd, uutils), so a

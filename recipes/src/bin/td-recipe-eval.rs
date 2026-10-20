@@ -28,10 +28,10 @@
 //!   clear-store           reset the ladder work dir (seed store/db + shared
 //!                         build-cache); the next build re-derives seeds and
 //!                         cold-climbs. The only path that clears persisted state
-//!   gc-store --unused-for DAYS [--dry-run]
-//!                         reclaim shared build-cache entries and memos nothing
-//!                         has used for DAYS days; what a recent build reused
-//!                         stays, with everything it references
+//!   gc-store [--dry-run]  reclaim shared build-cache entries and memos no
+//!                         worktree's last run of a build or check needed;
+//!                         what those runs recorded stays, with everything it
+//!                         references
 //!   compose-iso OUTPUT KERNEL INITRAMFS [ISO-NAME=FILE ...]
 //!                         stream built inputs into a retained hybrid ISO;
 //!                         no build, signing, device access or live-profile creation
@@ -87,6 +87,8 @@ mod bootstrap_root;
 mod check_runner;
 #[path = "td_recipe_eval/checks/mod.rs"]
 mod checks;
+#[path = "td_recipe_eval/gc_roots.rs"]
+mod gc_roots;
 #[path = "td_recipe_eval/iso_image.rs"]
 mod iso_image;
 #[path = "td_recipe_eval/local_source_roster.rs"]

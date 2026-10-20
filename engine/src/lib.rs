@@ -50,11 +50,6 @@ pub mod application_spec;
 // `bootstrap_root` parses `seed/bootstrap-root.txt`, which td-recipe-eval
 // writes and td-builder admits seeds against — one parser for both.
 pub mod bootstrap_root;
-// `cache_use` is the last-use rule the build cache's reclaim reads: td-builder
-// stamps a receipt at a warm hit, td-recipe-eval a memo, and `gc-store` judges
-// both by it — one module so the two writers and the one reader cannot drift.
-// Control-plane only: no target binary includes it.
-pub mod cache_use;
 pub mod cpio;
 pub mod crc32;
 pub mod ed25519;
