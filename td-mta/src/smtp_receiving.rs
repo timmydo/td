@@ -83,6 +83,7 @@ pub enum State {
 
 pub struct Control {
     stop: AtomicBool,
+    user_stopped: AtomicBool,
     state: AtomicU8,
     logging: Option<crate::application_log::Producer>,
 }
@@ -90,6 +91,7 @@ impl Default for Control {
     fn default() -> Self {
         Self {
             stop: AtomicBool::new(false),
+            user_stopped: AtomicBool::new(false),
             state: AtomicU8::new(0),
             logging: None,
         }
@@ -119,6 +121,13 @@ impl Control {
         self.logging.as_ref().map(|logging| logging.status())
     }
 
+    pub fn user_stop(&self) {
+        self.user_stopped.store(true, Ordering::Release);
+        self.stop();
+    }
+    pub fn user_stopped(&self) -> bool {
+        self.user_stopped.load(Ordering::Acquire)
+    }
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Release);
     }

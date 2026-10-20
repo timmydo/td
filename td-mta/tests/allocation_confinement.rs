@@ -95,12 +95,17 @@ fn scan(root: &Path, path: &Path) {
             }
             "td-mta/src/serve.rs" => {
                 assert_eq!(source.matches("super::signal_sys::block()").count(), 1);
-                assert_eq!(source.matches("super::signal_sys::requested()").count(), 1);
-                assert_eq!(words(&source, "signal_sys"), 2);
+                assert_eq!(source.matches("super::signal_sys::requested()").count(), 2);
+                assert_eq!(words(&source, "signal_sys"), 3);
                 assert!(
                     source.find("signal_sys::block()").unwrap()
                         < source.find("Endpoint::bind(").unwrap()
                 );
+            }
+            "td-mta/src/acme_command.rs" => {
+                assert_eq!(source.matches("super::signal_sys::block()").count(), 1);
+                assert_eq!(source.matches("super::signal_sys::requested()").count(), 1);
+                assert_eq!(words(&source, "signal_sys"), 2);
             }
             "td-mta/src/control.rs" => {
                 assert_eq!(source.matches("super::signal_sys::requested()").count(), 1);

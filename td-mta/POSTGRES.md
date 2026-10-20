@@ -6343,3 +6343,23 @@ a physical high-water stop in addition to live-row bounds; PostgreSQL WAL,
 archive/replication retention, backups and whole-volume headroom still require
 normal operational limits and monitoring. A stopped diagnostic sink must not
 be treated as a reason to resend mail.
+
+## 8.121 Native ACME state and certificate pairs
+
+Schema 30 adds `acme_profiles`, sixteen fixed slots containing bounded private
+account/order state and one active certificate/key pair per named profile.
+Runtime qualification grants ordinary data access to this table; immutable
+operator configuration/material tables retain their existing read-only grants.
+[ACME.md](ACME.md) specifies the implemented single-endpoint routing restriction,
+lease/revision protocol, endpoint policy and retry/retention bounds.
+
+Claims check the schema/store epoch and serialize only short slot/ownership
+transactions. Every save matches the random owner, expected revision and
+unexpired database lease. Publication changes the active pair and pending state
+in the same statement. Uncertain outcomes are reloaded on the next ownership
+turn. No CA connection runs inside a database transaction. Managed material
+loaders fetch and pin the complete active pair once per profile and verify its
+settings digest against the configured directory, contact and exact name set.
+Different chain/key reads cannot observe different renewals. No arbitrary file
+path, material version, configuration selection or mail-delivery authority is
+created by this mapping.

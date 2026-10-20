@@ -2618,3 +2618,15 @@ only the initial observation; mutations and body admission keep their existing
 fresh authorization boundaries. The PostgreSQL verifier owns the database-backed device check. The backend contract requires bounded completion
 under the supplied deadline. Service shutdown joins the verifier along with
 the existing workers; database lookup must never run on the network reactor.
+
+## Native ACME deployment profile
+
+[ACME.md](ACME.md) owns the implemented single-endpoint native HTTP-01 worker,
+its supported CA subset, persistence bounds, renewal scheduling and operational
+commands. It starts independently of selected mail profiles, so initial issuance
+can run before a usable certificate exists. Mail profile import/activation still
+requires a valid certificate. The native worker owns the declared HTTP-01
+listener. Managed certificate changes currently cause bounded mail-service drain
+and internal reload with a brief listener gap; uninterrupted generation swapping
+remains outside this deployment profile. Explicit external certificate inputs
+remain supported. No Certbot subprocess or dependency is introduced.

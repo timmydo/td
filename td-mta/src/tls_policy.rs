@@ -48,6 +48,7 @@ pub struct MaterialRequest<'a> {
     kind: MaterialKind,
     profile: Option<&'a str>,
     path: Option<&'a str>,
+    managed_settings: Option<[u8; 32]>,
 }
 
 impl MaterialRequest<'_> {
@@ -59,6 +60,9 @@ impl MaterialRequest<'_> {
     }
     pub fn path(&self) -> Option<&str> {
         self.path
+    }
+    pub fn managed_settings(&self) -> Option<[u8; 32]> {
+        self.managed_settings
     }
 }
 
@@ -610,6 +614,7 @@ fn client<R: Read>(
                 kind,
                 profile: None,
                 path: Some(path),
+                managed_settings: None,
             },
             inputs::MAX_CA_BYTES,
             open,
@@ -684,11 +689,35 @@ fn build<R: Read>(
                 count = count.checked_add(1).ok_or(Error::Capacity)?;
             }
         }
+        let managed_settings = if profile.mode == certificate::Mode::Acme {
+            let acme = profiles
+                .acme()
+                .map_err(|_| Error::Invalid)?
+                .ok_or(Error::Invalid)?;
+            let settings = crate::acme::order::Settings {
+                directory: acme.directory.raw().to_owned(),
+                contact: acme.contact.to_owned(),
+                names: names
+                    .get(..count)
+                    .ok_or(Error::Invalid)?
+                    .iter()
+                    .map(|name| (*name).to_owned())
+                    .collect(),
+            };
+            if acme.ca_file.is_none() {
+                Some(settings.identity().map_err(|_| Error::Invalid)?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let chain = read(
             MaterialRequest {
                 kind: MaterialKind::Chain,
                 profile: Some(profile.name),
                 path: profile.chain_file,
+                managed_settings,
             },
             inputs::MAX_CHAIN_BYTES,
             open,
@@ -698,6 +727,7 @@ fn build<R: Read>(
                 kind: MaterialKind::Key,
                 profile: Some(profile.name),
                 path: profile.key_file,
+                managed_settings,
             },
             inputs::MAX_KEY_BYTES,
             open,
@@ -848,6 +878,7 @@ fn build<R: Read>(
                 kind: MaterialKind::GatewayCa,
                 profile: Some(gateway.name),
                 path: Some(gateway.ca_file),
+                managed_settings: None,
             },
             inputs::MAX_CA_BYTES,
             open,

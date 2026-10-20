@@ -395,7 +395,7 @@ fn real_postgres_schema_initialization_is_atomic_and_locked() {
     );
     wait_command(&mut shared);
     let receipt = initialize(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 29);
+    assert_eq!(receipt.version, 30);
     assert_eq!(
         inspect(&fixture.request(), &trust, deadline()).unwrap(),
         receipt
@@ -472,7 +472,7 @@ CREATE EVENT TRIGGER td_schema_delay ON ddl_command_end WHEN TAG IN ('CREATE TAB
         inspect(&fixture.request(), &trust, deadline())
             .unwrap()
             .version,
-        29
+        30
     );
     assert_eq!(
         initialize(&fixture.request(), &trust, deadline()),
@@ -597,7 +597,7 @@ fn real_postgres_schema_commands_prepare_and_inspect_one_epoch() {
     };
     assert!(invoke("schema-inspect", 1).contains("schema-operation-failed"));
     let initialized = invoke("schema-init", 0);
-    assert!(initialized.contains("\"schema_version\":29"));
+    assert!(initialized.contains("\"schema_version\":30"));
     assert!(initialized.contains(
         "\"ledger_checked\":true,\"serving_schema_checked\":false,\"profile_checked\":false"
     ));
@@ -842,7 +842,7 @@ fn real_postgres_runtime_credentials_separate_mail_writes_from_owner_authority()
     }
     sql(
         &fixture,
-        "UPDATE td_mta.schema_migrations SET version=99 WHERE version=29",
+        "UPDATE td_mta.schema_migrations SET version=99 WHERE version=30",
     );
     assert_eq!(
         probe(&serving, &trust, deadline()),
@@ -850,7 +850,7 @@ fn real_postgres_runtime_credentials_separate_mail_writes_from_owner_authority()
     );
     sql(
         &fixture,
-        "UPDATE td_mta.schema_migrations SET version=29 WHERE version=99",
+        "UPDATE td_mta.schema_migrations SET version=30 WHERE version=99",
     );
     assert_eq!(
         schema::inspect(&serving, &trust, deadline()).unwrap(),
@@ -1032,7 +1032,7 @@ fn real_postgres_material_schema_upgrade_preserves_epoch_and_rolls_back() {
     );
     wait_command(&mut held);
     let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 29);
+    assert_eq!(receipt.version, 30);
     assert_eq!(receipt.store_epoch.as_bytes(), &[1; 16]);
     assert_eq!(
         upgrade(&fixture.request(), &trust, deadline()).unwrap(),
@@ -1876,7 +1876,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             sql(&fixture,"UPDATE td_mta.recipients SET state=7,uncertain=1,phase=4,reason=9,next_attempt_at=1");
         }
         let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
-        assert_eq!(receipt.version, 29);
+        assert_eq!(receipt.version, 30);
         assert_eq!(
             sql(
                 &fixture,
@@ -2521,6 +2521,7 @@ mod serving_relay;
 #[ignore = "real local PostgreSQL tools required"]
 fn real_postgres_executable_receives_and_serves_database_profiles() {
     application_logs::real_postgres_logs_bound_retention_rate_wrap_and_inspection();
+    acme::real_postgres_acme_fences_ownership_and_pins_complete_pairs();
     exercise_configuration(ConfigurationExercise::Serving);
 }
 
@@ -3209,6 +3210,28 @@ per_peer_limit = 1
     if matches!(exercise, ConfigurationExercise::Serving) {
         create_runtime_login(&fixture);
         grant_runtime_mail(&fixture);
+        acme::publish_fixture_pair(&fixture);
+        let managed = |source: &str| {
+            source.replace(&format!("mode = \"files\"\nchain_file = \"/postgres-material/{}\"\nkey_file = \"/postgres-material/{}\"", Version::from_bytes([2;16]), Version::from_bytes([3;16])), "mode = \"acme\"")
+                + "\n[acme]\ndirectory = \"https://acme.example.test/directory\"\ncontact = \"operator@example.test\"\nterms_accepted = true\n[listener \"http01\"]\nkind = \"http01\"\nbind = \"127.0.0.1:80\"\n"
+        };
+        let managed_cloud = managed(&cloud);
+        let managed_desktop = managed(&desktop);
+        let managed = prepare(&[
+            Profile {
+                source: managed_cloud.as_bytes(),
+                ..one
+            },
+            Profile {
+                source: managed_desktop.as_bytes(),
+                ..two
+            },
+        ])
+        .unwrap();
+        let version = versions::Version::from_bytes([24; 16]);
+        versions::publish(&request, &trust, deadline(), version, &managed).unwrap();
+        let change = selection::prepare(epoch, 1, version, &managed).unwrap();
+        selection::publish(&request, &trust, deadline(), change).unwrap();
         serving::exercise(
             &fixture,
             smtp_socket.take().unwrap(),
@@ -12199,3 +12222,6 @@ fn expiry_wait_snapshot(fixture: &Fixture, publish: impl FnOnce()) {
 
 #[path = "postgres_probe/application_logs.rs"]
 mod application_logs;
+
+#[path = "postgres_probe/acme.rs"]
+mod acme;

@@ -47,6 +47,18 @@ pub(super) fn arguments(mut args: impl Iterator<Item = std::ffi::OsString>) -> O
 }
 
 pub(super) fn run(options: Options) -> Result<(), ConfigFailure> {
+    loop {
+        let reload = AtomicBool::new(false);
+        run_once(&options, &reload)?;
+        if !reload.load(Ordering::Acquire)
+            || super::signal_sys::requested().map_err(|_| config_failure("signals", "io"))?
+        {
+            return Ok(());
+        }
+    }
+}
+
+fn run_once(options: &Options, reload: &AtomicBool) -> Result<(), ConfigFailure> {
     let clock = Arc::new(RuntimeClock::new());
     let loaded = td_mta::postgres_input::Loaded::open(&options.connection, &options.profile)
         .map_err(|error| config_failure("postgres", error.code()))?;
@@ -62,6 +74,7 @@ pub(super) fn run(options: Options) -> Result<(), ConfigFailure> {
     let mut generations = td_mta::generations::GenerationSet::at_startup();
     let mut prepared = None;
     let mut selected_address = None;
+    let mut certificate_revisions = Vec::new();
     for address in addresses {
         let mut request = loaded.bootstrap.request(address);
         request.mode = td_mta::postgres_probe::Mode::Runtime;
@@ -72,6 +85,9 @@ pub(super) fn run(options: Options) -> Result<(), ConfigFailure> {
             )) => continue,
             Err(_) => return Err(config_failure("postgres", "runtime-qualification")),
         };
+        certificate_revisions =
+            td_mta::postgres_acme::generations(&request, &loaded.trust, until, schema.store_epoch)
+                .map_err(|_| config_failure("certificate", "database"))?;
         prepared = Some(
             td_mta::postgres_runtime_profile::load(
                 &request,
@@ -130,6 +146,20 @@ pub(super) fn run(options: Options) -> Result<(), ConfigFailure> {
             let view = records
                 .view(graph)
                 .map_err(|_| config_failure("configuration", "invariant"))?;
+            let certificates = view
+                .certificates()
+                .map_err(|_| config_failure("certificate", "configuration"))?;
+            let mut managed_names = Vec::new();
+            for index in 0..certificates.len() {
+                let certificate = certificates
+                    .profile(index)
+                    .map_err(|_| config_failure("certificate", "configuration"))?
+                    .ok_or_else(|| config_failure("certificate", "configuration"))?;
+                if certificate.mode == td_mta::config::certificate::Mode::Acme {
+                    managed_names.push(certificate.name.to_owned());
+                }
+            }
+            certificate_revisions.retain(|(name, _)| managed_names.contains(name));
             let rows = view
                 .listeners()
                 .map_err(|_| config_failure("configuration", "invariant"))?;
@@ -147,6 +177,7 @@ pub(super) fn run(options: Options) -> Result<(), ConfigFailure> {
                     Kind::DirectSmtp if row.bind.is_ipv4() => direct.push(row),
                     Kind::Https if mailbox_access && row.bind.is_ipv4() => https_rows.push(row),
                     Kind::Https if !mailbox_access => (),
+                    Kind::Http01 => (),
                     _ => return Err(config_failure("listeners", "unsupported-listener")),
                 }
             }
@@ -368,6 +399,60 @@ pub(super) fn run(options: Options) -> Result<(), ConfigFailure> {
                         }
                     })
                     .map_err(|_| config_failure("logging", "worker-start"))?;
+                let _early_finish = ControlFinish {
+                    finished: &finished,
+                    control: &control,
+                };
+                let certificate_worker = std::thread::Builder::new()
+                    .name("certificate-watch".into())
+                    .spawn_scoped(scope, || {
+                        if managed_names.is_empty() {
+                            return;
+                        }
+                        let mut next = std::time::Instant::now();
+                        while !control.stop_requested() {
+                            if std::time::Instant::now() < next {
+                                std::thread::sleep(std::time::Duration::from_millis(100));
+                                continue;
+                            }
+                            next = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                            let until =
+                                std::time::Instant::now() + std::time::Duration::from_secs(10);
+                            let observation = (|| {
+                                let addresses = td_mta::postgres_resolver::resolve(
+                                    &executable,
+                                    &loaded.bootstrap,
+                                    until.min(
+                                        std::time::Instant::now()
+                                            + std::time::Duration::from_secs(5),
+                                    ),
+                                )
+                                .ok()?;
+                                for address in addresses {
+                                    let mut request = loaded.bootstrap.request(address);
+                                    request.mode = td_mta::postgres_probe::Mode::Runtime;
+                                    if let Ok(mut revisions) = td_mta::postgres_acme::generations(
+                                        &request,
+                                        &loaded.trust,
+                                        until,
+                                        binding.epoch(),
+                                    ) {
+                                        revisions.retain(|(name, _)| managed_names.contains(name));
+                                        return Some(revisions);
+                                    }
+                                }
+                                None
+                            })();
+                            if observation
+                                .is_some_and(|revisions| revisions != certificate_revisions)
+                                && !control.stop_requested()
+                            {
+                                reload.store(true, Ordering::Release);
+                                control.stop();
+                            }
+                        }
+                    })
+                    .map_err(|_| config_failure("certificate", "worker-start"))?;
                 let worker = std::thread::Builder::new()
                     .name("smtp-control".into())
                     .spawn_scoped(scope, || {
@@ -484,6 +569,12 @@ pub(super) fn run(options: Options) -> Result<(), ConfigFailure> {
                 drop(finish);
                 control.stop();
                 let joined = worker.join();
+                if certificate_worker.join().is_err() {
+                    return Err(config_failure("certificate", "worker-stopped"));
+                }
+                if control.user_stopped() {
+                    reload.store(false, Ordering::Release);
+                }
                 if let Some(worker) = http_worker {
                     if !matches!(worker.join(), Ok(Ok(Ok(())))) {
                         return Err(config_failure("https", "worker-stopped"));

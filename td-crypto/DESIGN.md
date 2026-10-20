@@ -1167,3 +1167,15 @@ semantics; they are not qualified as nonblocking or latency-bounded. M07e must
 measure contention across handshake and established workers, along with the
 shared clock callback, before service admission. Any later lock-free health
 optimization must independently preserve those retirement fences.
+
+### Exact issued DNS identifiers
+
+`ServerIdentity::check_exact_dns_names` checks that the leaf SAN contains
+exactly the identity's admitted bindings, once each, using ASCII case folding.
+It refuses wildcards, additional DNS names and non-DNS GeneralNames. The
+existing bounded DER/SAN reader supplies the bytes; no alternate certificate
+parser is introduced. Ordinary externally provisioned identities retain their
+existing wildcard/name-coverage semantics unless the caller requests this
+additional check. ACME publication requires it before selecting a generation.
+This checks identifiers, not public-root trust; the issuer response still needs
+an authenticated configured CA transport.

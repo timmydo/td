@@ -33,9 +33,21 @@ pub fn resolve(
     if !executable.is_absolute() {
         return Err(Error::Invalid);
     }
+    resolve_host(executable, bootstrap.host(), deadline)
+}
+
+/// Bounded resolution for one already-authorized service endpoint.
+pub fn resolve_host(
+    executable: &Path,
+    host: &str,
+    deadline: Instant,
+) -> Result<Vec<IpAddr>, Error> {
+    if !executable.is_absolute() {
+        return Err(Error::Invalid);
+    }
     let mut command = Command::new(executable);
     command.arg("--internal-postgres-resolve");
-    resolve_command(command, bootstrap.host(), deadline)
+    resolve_command(command, host, deadline)
 }
 
 fn resolve_command(

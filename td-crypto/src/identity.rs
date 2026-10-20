@@ -35,6 +35,14 @@ impl ServerIdentity {
         admission_boundary(|| admit(chain, key, names, now))
     }
 
+    /// Require the leaf SAN to contain exactly the admitted DNS bindings.
+    /// Refuse wildcards, duplicate names, extra names and other GeneralNames.
+    /// This is certificate metadata validation, not a public-root trust proof.
+    pub fn check_exact_dns_names(&self) -> Result<(), TlsError> {
+        let leaf = self.certificate_der(0).ok_or(TlsError::Invalid)?;
+        Certificate::parse(leaf)?.exact_dns_names(&self.names)
+    }
+
     /// Number of certificates retained in their supplied leaf-first order.
     pub fn certificate_count(&self) -> usize {
         self.certified.cert.len()

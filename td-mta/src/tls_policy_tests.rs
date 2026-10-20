@@ -595,6 +595,7 @@ fn material_reader_caps_bytes_eof_and_interrupted_work() {
         kind: MaterialKind::Key,
         profile: Some("private"),
         path: Some("/secret"),
+        managed_settings: None,
     };
     assert_eq!(
         read(request(), 4, &mut |_| Ok(Cursor::new(b"1234")))

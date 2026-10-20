@@ -62,6 +62,7 @@ pub struct Loader<'a, 'r> {
     requests: usize,
     reserved: usize,
     failed: bool,
+    managed: Vec<(String, crate::postgres_acme::Active)>,
 }
 impl<'a, 'r> Loader<'a, 'r> {
     pub fn new(
@@ -78,6 +79,7 @@ impl<'a, 'r> Loader<'a, 'r> {
             requests: 0,
             reserved: 0,
             failed: false,
+            managed: Vec::new(),
         }
     }
 
@@ -85,10 +87,57 @@ impl<'a, 'r> Loader<'a, 'r> {
         self.open(Some(reference.path()), input_kind(reference.target()))
     }
 
-    /// Managed ACME requests have no explicit version and are refused until
-    /// database-backed ACME publication supplies a separately fenced mapping.
+    /// Pin one complete managed pair per profile across chain/key requests.
     pub fn open_tls(&mut self, reference: MaterialRequest<'_>) -> Result<Reader, Error> {
-        self.open(reference.path(), tls_kind(reference.kind()))
+        if reference.path().is_some() {
+            return self.open(reference.path(), tls_kind(reference.kind()));
+        }
+        if self.failed || Instant::now() >= self.deadline {
+            return Err(Error::Failed);
+        }
+        self.failed = true;
+        self.requests = self.requests.checked_add(1).ok_or(Error::Capacity)?;
+        self.reserved = self
+            .reserved
+            .checked_add(tls_kind(reference.kind()).max_bytes())
+            .ok_or(Error::Capacity)?;
+        if self.requests > MAX_REQUESTS || self.reserved > MAX_RESERVED_BYTES {
+            return Err(Error::Capacity);
+        }
+        let profile = reference.profile().ok_or(Error::ManagedCertificate)?;
+        if !self.managed.iter().any(|(name, _)| name == profile) {
+            if self.managed.len() >= crate::config::certificate::MAX_PROFILES {
+                return Err(Error::Capacity);
+            }
+            let active = crate::postgres_acme::active(
+                self.request,
+                self.trust,
+                self.deadline,
+                self.epoch,
+                profile,
+            )
+            .map_err(|_| Error::ManagedCertificate)?;
+            self.managed.push((profile.to_owned(), active));
+        }
+        let (_, active) = self
+            .managed
+            .iter()
+            .find(|(name, _)| name == profile)
+            .ok_or(Error::ManagedCertificate)?;
+        if reference.managed_settings() != Some(active.settings) {
+            return Err(Error::ManagedCertificate);
+        }
+        let bytes = match reference.kind() {
+            MaterialKind::Chain => active.chain.clone(),
+            MaterialKind::Key => active.key.clone(),
+            _ => return Err(Error::ManagedCertificate),
+        };
+        self.failed = false;
+        Ok(Reader {
+            material: None,
+            managed: bytes,
+            position: 0,
+        })
     }
 
     fn reserve(&mut self, reference: Option<&str>, kind: Kind) -> Result<Version, Error> {
@@ -127,7 +176,8 @@ impl<'a, 'r> Loader<'a, 'r> {
         }
         self.failed = false;
         Ok(Reader {
-            material,
+            material: Some(material),
+            managed: Vec::new(),
             position: 0,
         })
     }
@@ -136,14 +186,24 @@ impl<'a, 'r> Loader<'a, 'r> {
 /// Owned verified bytes, with no path opener, Debug output or text conversion.
 /// Content decoding and provider validation remain the existing consumers'.
 pub struct Reader {
-    material: Material,
+    material: Option<Material>,
+    managed: Vec<u8>,
     position: usize,
+}
+impl Drop for Reader {
+    fn drop(&mut self) {
+        self.managed.fill(0);
+        std::hint::black_box(&mut self.managed);
+    }
 }
 impl io::Read for Reader {
     fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
-        let remaining = self
+        let bytes = self
             .material
-            .bytes()
+            .as_ref()
+            .map(Material::bytes)
+            .unwrap_or(&self.managed);
+        let remaining = bytes
             .get(self.position..)
             .ok_or(io::ErrorKind::InvalidData)?;
         let count = remaining.len().min(output.len());

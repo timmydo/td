@@ -5,7 +5,7 @@ use std::{
     net::{TcpListener, TcpStream},
     os::unix::fs::PermissionsExt,
     process::{Command, Stdio},
-    sync::{mpsc, Arc},
+    sync::Arc,
     time::Duration,
 };
 
@@ -42,7 +42,7 @@ pub(super) fn exercise(
             fs::create_dir_all(path).unwrap();
             fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
         }
-        let mut child = ProbeChild(
+        let child = ProbeChild(
             Command::new(env!("CARGO_BIN_EXE_td-mta"))
                 .args(["serve", "--connection-file"])
                 .arg(&connection)
@@ -50,21 +50,23 @@ pub(super) fn exercise(
                 .arg(&runtime)
                 .arg("--scratch")
                 .arg(&scratch)
-                .stdout(Stdio::piped())
+                .stdout(fs::File::create(local.join(format!("{profile}-output"))).unwrap())
                 .stderr(Stdio::inherit())
                 .spawn()
                 .unwrap(),
         );
-        let stdout = child.0.stdout.take().unwrap();
-        let (send, receive) = mpsc::channel();
-        let reader = std::thread::spawn(move || {
-            let mut line = String::new();
-            BufReader::new(stdout).read_line(&mut line).unwrap();
-            let _ = send.send(line);
-        });
-        let line = receive.recv_timeout(Duration::from_secs(20)).unwrap();
-        reader.join().unwrap();
-        assert!(line.contains("\"status\":\"ready\""), "{line}");
+        let until = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let output = fs::read_to_string(local.join(format!("{profile}-output"))).unwrap();
+            if output.contains("\"status\":\"ready\"") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < until,
+                "service did not start: {output}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
         let status = Command::new(env!("CARGO_BIN_EXE_td-mta"))
             .args(["logging-status", "--runtime"])
             .arg(&runtime)
@@ -571,6 +573,27 @@ pub(super) fn exercise(
         ),
         "2"
     );
+    super::acme::publish_fixture_pair(fixture);
+    let until = std::time::Instant::now() + Duration::from_secs(50);
+    loop {
+        assert!(cloud.0.try_wait().unwrap().is_none());
+        assert!(desktop.0.try_wait().unwrap().is_none());
+        if ["cloud", "desktop"].iter().all(|profile| {
+            fs::read_to_string(local.join(format!("{profile}-output")))
+                .unwrap()
+                .matches("\"status\":\"ready\"")
+                .count()
+                >= 2
+        }) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < until,
+            "managed certificate reload did not finish"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(query(&encoded).starts_with("HTTP/1.1 200"));
     let revoke =
         td_mta::postgres_devices::prepare_revocation(epoch, account, device.device_id(), 2)
             .unwrap();

@@ -83,7 +83,7 @@ impl Endpoint {
         let mut retry_at = Instant::now();
         while !finished.load(Ordering::Acquire) {
             if super::signal_sys::requested()? {
-                control.stop();
+                control.user_stop();
             }
             if Instant::now() < retry_at {
                 std::thread::sleep(TURN);
@@ -255,7 +255,7 @@ fn exchange_queue(
             }
         }
         b"STOP\n" => {
-            control.stop();
+            control.user_stop();
             b"REQUESTED\n"
         }
         _ => b"INVALID\n",

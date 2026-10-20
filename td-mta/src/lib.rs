@@ -280,3 +280,7 @@ pub mod smtp_relay_ehlo;
 
 pub mod application_log;
 pub mod postgres_logs;
+
+pub mod acme;
+
+pub mod postgres_acme;

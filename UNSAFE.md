@@ -3470,6 +3470,13 @@ module, allowance/instruction counts, import and caller inventory. Real
 child-process tests exercise both signals and cleanup; T3 records their
 separate signal sender. Both architectures require execution qualification.
 
+The native ACME command uses the same fixed signal operations: it blocks
+before binding HTTP-01 and creating its sole responder worker, then polls
+between bounded issuance turns and during scheduled waits. A network turn
+may delay shutdown by its 100-second cap plus bounded database operations.
+The mail coordinator also polls before starting another certificate-reload
+cycle. No additional syscall, mask, pointer shape or unsafe block is added.
+
 Filesystem operations use safe std APIs under STORAGE.md's stable-path
 contract. The separate test executables retain T1/T2/T3 below.
 

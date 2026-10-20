@@ -23,6 +23,7 @@ pub(super) struct Certificate<'a> {
     pub key_usage: Option<u16>,
     pub extended_usage: Option<u8>,
     pub has_name_constraints: bool,
+    subject_alt_names: Option<&'a [u8]>,
 }
 
 fn whole_sequence(bytes: &[u8]) -> Result<Der<'_>, TlsError> {
@@ -135,6 +136,7 @@ impl<'a> Certificate<'a> {
             key_usage: None,
             extended_usage: None,
             has_name_constraints: false,
+            subject_alt_names: None,
         };
         if !body.0.is_empty() {
             let mut extensions = whole_sequence(body.take(0xa3)?.value)?;
@@ -158,7 +160,10 @@ impl<'a> Certificate<'a> {
                     [0x55, 0x1d, 0x13] => certificate.basic_constraints(contents)?,
                     [0x55, 0x1d, 0x0f] => certificate.key_usage(contents)?,
                     [0x55, 0x1d, 0x25] => certificate.extended_usage(contents)?,
-                    [0x55, 0x1d, 0x11] => subject_names(contents)?,
+                    [0x55, 0x1d, 0x11] => {
+                        subject_names(contents)?;
+                        certificate.subject_alt_names = Some(contents);
+                    }
                     [0x55, 0x1d, 0x1e] => certificate.has_name_constraints = true,
                     _ => {}
                 }
@@ -166,6 +171,30 @@ impl<'a> Certificate<'a> {
         }
         body.end()?;
         Ok(certificate)
+    }
+
+    pub fn exact_dns_names(&self, expected: &[String]) -> Result<(), TlsError> {
+        let mut entries = whole_sequence(self.subject_alt_names.ok_or(TlsError::Invalid)?)?;
+        let mut seen = 0u32;
+        while !entries.0.is_empty() {
+            let name = entries.take(0x82)?;
+            let name = std::str::from_utf8(name.value).map_err(|_| TlsError::Invalid)?;
+            let index = expected
+                .iter()
+                .position(|value| value.eq_ignore_ascii_case(name))
+                .ok_or(TlsError::Invalid)?;
+            let bit = 1u32
+                .checked_shl(u32::try_from(index).map_err(|_| TlsError::Invalid)?)
+                .ok_or(TlsError::Invalid)?;
+            if seen & bit != 0 {
+                return Err(TlsError::Invalid);
+            }
+            seen |= bit;
+        }
+        if seen.count_ones() as usize != expected.len() {
+            return Err(TlsError::Invalid);
+        }
+        Ok(())
     }
 
     fn basic_constraints(&mut self, bytes: &[u8]) -> Result<(), TlsError> {
