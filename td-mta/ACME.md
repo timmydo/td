@@ -8,6 +8,8 @@ certificate profile. It can request up to 32 exact DNS names. DNS-01, wildcard
 identifiers, external account binding, private CA directories and distributed
 HTTP-01 routing are not supported by this command.
 
+The host installer can generate systemd and Shepherd definitions for this
+worker; see [DEPLOYMENT.md](DEPLOYMENT.md#native-certificate-service).
 Start the worker before importing a managed mail configuration:
 
 ```text

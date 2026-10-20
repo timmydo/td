@@ -64,6 +64,50 @@ service, or a separately supervised private cluster. The MTA installer never
 assumes ownership of an existing cluster. A failed startup is retried by the
 service manager. Readiness does not depend on remote delivery succeeding.
 
+## Native certificate service
+
+For a public deployment with a prepared PostgreSQL runtime login, generate
+an independent certificate worker before configuring mail:
+
+```text
+./install-td-mta --services-only --prefix /home/alice/.local \
+  --connection-file /home/alice/.config/td-mta/runtime-connection \
+  --state-dir /home/alice/.local/state/td-mta \
+  --acme-profile public \
+  --acme-directory https://acme-v02.api.letsencrypt.org/directory \
+  --acme-contact operator@example.org --acme-name mx.example.org \
+  --acme-bind 0.0.0.0:80 --accept-acme-terms
+```
+
+This writes `td-mta-acme-public.service` and `.scm` beside the mail service
+files, with a 180-second stop grace period and five-second restart delay.
+No selected mail profile or existing certificate is needed. The command
+prints supervisor startup and certificate-status commands; it does not
+start the worker, contact a CA, change the database or select mail profiles.
+`--accept-acme-terms` explicitly records agreement to the selected CA's terms
+in the generated worker command. The worker validates the full CA settings
+when it starts. Repeat `--acme-name` for additional exact lowercase DNS
+names, up to 32. One invocation generates one worker; separate certificate
+profiles need separate reachable challenge listeners.
+
+Provision the public DNS, inbound port 80 and the service user's permission
+to bind that port before starting. A higher local `--acme-bind` port needs
+external forwarding from public port 80. These remain host administration,
+as for the mail listener ports. The same current-user and dedicated-system
+identity guidance above applies. PostgreSQL must already be running. For
+Guix Home, use the generated argv and log path in a `shepherd-service` with
+the database requirement, as below; do not load the registration file as a
+Home service expression.
+
+Start only the certificate worker initially. Wait for `acme-status` to
+report `ready`, then import/check/select matching managed mail configuration
+as described in [ACME.md](ACME.md), and start the mail services. Certificate
+readiness alone does not prove public mail readiness. Mail definitions may
+also be generated in the same invocation using `--profile`; generation does
+not order their startup or perform initial certificate issuance. The service
+name `td-mta-acme-NAME` must not also be used by a mail profile. Private worker
+logs live under `STATE/.acme/NAME/`; edited definitions are preserved.
+
 ## Persistent Guix Home services
 
 Use `home-shepherd-service-type` in the Home configuration, rather than
@@ -294,9 +338,10 @@ The private control socket also provides the relay controls below. Administer cr
 through `postgres device-create`, `postgres device-list` and `postgres
 device-revoke`, using the explicit database/account arguments in POSTGRES.md.
 
-Configuration and certificate changes require validated database versions,
-selection and process restart. Automatic certificate renewal and live reload
-are not implemented. The native executable fixture qualifies separate
+General configuration changes require validated database versions, selection
+and process restart. Native managed certificate renewal is supervised
+separately; serving processes drain and reload when their managed certificate
+generation changes, as [ACME.md](ACME.md) specifies. The native executable fixture qualifies separate
 receive/JMAP processes, durable SMTP delivery, verified HTTPS credential
 acceptance and revocation, control stop and signal-based restart cycles.
 It does not qualify a deployment host or supervisor.
