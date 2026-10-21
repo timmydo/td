@@ -13,7 +13,7 @@ pub fn recipe() -> Recipe {
             paths: vec![make.into()],
             exec: true,
         },
-        post_rust_tool_farm("{in:gawk-x86-64-self}/bin/gawk"),
+        post_rust_tool_farm(Some("{in:gawk-x86-64-self}/bin/gawk")),
         Step::Require {
             paths: vec![debug.into()],
             exec: false,
@@ -97,7 +97,7 @@ pub fn recipe() -> Recipe {
 
     Recipe::mesboot("make-x86-64-self-test", "1.0")
         .native_inputs(&post_rust_inputs(
-            "gawk-x86-64-self",
+            Some("gawk-x86-64-self"),
             &["make-x86-64-self", "binutils-x86-64-self"],
         ))
         .steps(steps)

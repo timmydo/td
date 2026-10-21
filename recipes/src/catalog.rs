@@ -697,6 +697,49 @@ mod tests {
         }
     }
 
+    /// A post-Rust tool farm links an awk only for the ladder's own builds;
+    /// a recipe whose farm has none runs none, so that the image and the
+    /// kexec spike need no ladder gawk.
+    #[test]
+    fn a_farm_without_awk_runs_none() {
+        let mut checked = 0;
+        for (stem, recipe) in all() {
+            let steps = recipe.steps.as_deref().unwrap_or_default();
+            let farm_has_awk = steps.iter().any(|step| match step {
+                crate::types::Step::ToolFarm { links } => {
+                    links.iter().any(|(name, _)| name == "awk")
+                }
+                _ => false,
+            });
+            let post_rust_farm = steps.iter().any(|step| match step {
+                crate::types::Step::ToolFarm { links } => links
+                    .iter()
+                    .any(|(_, target)| target.contains("{in:td-sh}")),
+                _ => false,
+            });
+            if !post_rust_farm || farm_has_awk {
+                continue;
+            }
+            checked += 1;
+            for step in steps {
+                if let crate::types::Step::Run { argv, .. } = step {
+                    // The image's shape check names awk among the applets
+                    // it proves absent; nothing else may.
+                    assert!(
+                        !argv
+                            .iter()
+                            .any(|arg| arg.replace("in vi more awk;", "").contains("awk")),
+                        "{stem} runs awk with a farm that has none: {argv:?}"
+                    );
+                }
+            }
+        }
+        assert!(
+            checked >= 3,
+            "system-x86-64 and the kexec spikes: {checked}"
+        );
+    }
+
     /// A build-root C recipe that splits companions links code that ships,
     /// and takes its start files and libgcc from gcc-runtime, or, for glibc,
     /// from gcc-runtime-stage1; the profiler's boundary lists name exactly

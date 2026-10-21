@@ -5,7 +5,7 @@ use crate::ladder::{
 use crate::types::{Recipe, Step, TextEdit};
 
 // GNU awk for the builds after rust-toolchain: build-only, as reviewed for
-// retiring BusyBox, and the awk every post-Rust tool farm links. It is the
+// retiring BusyBox, and the awk the ladder's post-Rust tool farms link. It is the
 // first build on that farm (td-sh, td-txt, td-util and uutils). Its own
 // configure needs an awk and its build a make, and the post-Rust ones would
 // themselves be built with this gawk, so it takes the root's gawk-mesboot and
@@ -41,7 +41,7 @@ pub fn recipe() -> Recipe {
         ],
     ));
     steps.extend(unpack_keep_top("linux-headers-x86-64", "{root}/kh"));
-    steps.push(post_rust_tool_farm("{in:gawk-mesboot}/bin/gawk"));
+    steps.push(post_rust_tool_farm(Some("{in:gawk-mesboot}/bin/gawk")));
     let to_td_sh = |expect| {
         vec![TextEdit::new(
             "execl(\"/bin/sh\", \"sh\", \"-c\", ",
@@ -163,7 +163,7 @@ pub fn recipe() -> Recipe {
     Recipe::mesboot("gawk-x86-64-self", "5.4.1")
         .source_input("gawk-x86-64-self-source")
         .native_inputs(&post_rust_inputs(
-            "gawk-mesboot",
+            Some("gawk-mesboot"),
             &[
                 "gcc-x86-64-self",
                 "binutils-x86-64-self",

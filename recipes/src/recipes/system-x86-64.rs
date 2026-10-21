@@ -5461,7 +5461,7 @@ fn selector_template_dir() -> &'static str {
 pub fn recipe() -> Recipe {
     // The recipe's own shell steps run under td-sh with the post-Rust tool
     // farm; nothing the farm links is packed by that route.
-    let mut steps = vec![post_rust_tool_farm("{in:gawk-x86-64-self}/bin/gawk")];
+    let mut steps = vec![post_rust_tool_farm(None)];
     steps.push(Step::MkDir {
         path: "{out}".into(),
     });
@@ -5622,9 +5622,10 @@ pub fn recipe() -> Recipe {
     steps.push(Step::run("{out}", &[POST_RUST_SH, "-c", &shape_check()]).env("PATH", "{tools}"));
 
     let recipe = Recipe::mesboot("system-x86-64", "0.2")
-        // gawk-x86-64-self: the post-Rust tool farm's awk. This recipe's own steps
-        //   run under td-sh with that farm; gawk itself is not packed, and
-        //   `nothing_on_the_image_is_busybox` holds the image free of BusyBox.
+        // This recipe's own steps run under td-sh with the post-Rust tool farm,
+        //   which holds no awk (catalog's `a_farm_without_awk_runs_none`), so no
+        //   ladder output is an input; `nothing_on_the_image_is_busybox` holds the image
+        //   free of BusyBox.
         // linux-x86-64: the bzImage both boot phases run.
         // uutils: the dynamically-linked `coreutils` multicall packed as the /bin file/text
         //   userland (#547).
@@ -5672,10 +5673,10 @@ pub fn recipe() -> Recipe {
         // cryptsetup-x86-64: static cryptsetup a live installer formats a
         //   device-bound volume with, and the deployment initramfs opens one.
         // post_rust_inputs adds the tool farm's providers (td-sh, td-txt,
-        // td-util, uutils, all also packed) and its awk, so the farm and this
-        // list cannot drift apart.
+        // td-util, uutils, all also packed), so the farm and this list cannot
+        // drift apart.
         .native_inputs(&post_rust_inputs(
-            "gawk-x86-64-self",
+            None,
             &[
                 "linux-x86-64",
                 "td-btrfs",
@@ -9228,6 +9229,7 @@ mod tests {
             "gcc-x86-64-native",
             "gcc-x86-64-self",
             "binutils-x86-64-self",
+            "gawk-x86-64-self",
             "bash-mesboot",
             "python-mesboot",
             "libressl-x86-64",

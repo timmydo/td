@@ -787,7 +787,8 @@ impl AwkHost {
 /// Validate one retained DWARF-5 source file against the line-table-only
 /// companion policy. Every directory and file entry resolves below a declared
 /// stable root; the named source must resolve below `source_root`. It runs
-/// under td-sh with the post-Rust farm's awk, so the recipe builds that farm.
+/// under td-sh with the post-Rust farm's awk, so the recipe builds that farm
+/// with one (`post_rust_tool_farm(Some(..))`).
 pub fn debug_line_source_root_check(
     readelf: &str,
     debug: &str,
@@ -1022,9 +1023,10 @@ const POST_RUST_TOOLS: &[(&str, &str, &[&str])] = &[
 ];
 
 /// The `{tools}` farm for a post-Rust build: `POST_RUST_TOOLS`, plus `awk`
-/// from `awk` (an `{in:...}` executable). Put `{tools}` on PATH ahead of the
-/// recipe's toolchain directories.
-pub fn post_rust_tool_farm(awk: &str) -> Step {
+/// from `awk` (an `{in:...}` executable) for the ladder's own builds, which
+/// run it; td's never do. Put `{tools}` on PATH ahead of the recipe's
+/// toolchain directories.
+pub fn post_rust_tool_farm(awk: Option<&str>) -> Step {
     let mut links: Vec<(String, String)> = POST_RUST_TOOLS
         .iter()
         .flat_map(|(_, target, names)| {
@@ -1033,18 +1035,20 @@ pub fn post_rust_tool_farm(awk: &str) -> Step {
                 .map(move |name| ((*name).to_string(), (*target).to_string()))
         })
         .collect();
-    links.push(("awk".into(), awk.into()));
+    if let Some(awk) = awk {
+        links.push(("awk".into(), awk.into()));
+    }
     Step::ToolFarm { links }
 }
 
 /// The inputs `post_rust_tool_farm` links to, in lockstep with it: the
-/// providers, then `awk_input`, then the recipe's own `extras`. Pair with
-/// `Recipe::native_inputs`.
-pub fn post_rust_inputs<'a>(awk_input: &'a str, extras: &[&'a str]) -> Vec<&'a str> {
+/// providers, then `awk_input` if any, then the recipe's own `extras`. Pair
+/// with `Recipe::native_inputs`.
+pub fn post_rust_inputs<'a>(awk_input: Option<&'a str>, extras: &[&'a str]) -> Vec<&'a str> {
     POST_RUST_TOOLS
         .iter()
         .map(|(input, _, _)| *input)
-        .chain(std::iter::once(awk_input))
+        .chain(awk_input)
         .chain(extras.iter().copied())
         .collect()
 }
@@ -2636,7 +2640,8 @@ mod tests {
         // The frozen UAPI input is a fixed-output source governed by the seed
         // provenance gate, not a catalog recipe this exception table can name.
         ("make-x86-64-self", "make-x86-64"),
-        // The build-only gawk every later post-Rust build takes its awk from.
+        // The build-only gawk the ladder's own post-Rust builds take their
+        // awk from.
         // Its own configure needs an awk and its build a make, and both of
         // the post-Rust ones would be built with it, so it takes the root's
         // gawk and the bootstrap Make, once, as make-x86-64-self does.

@@ -42,7 +42,7 @@ pub fn recipe() -> Recipe {
             paths: vec![gawk.into(), "{in:gawk-x86-64-self}/bin/awk".into()],
             exec: true,
         },
-        post_rust_tool_farm("{in:gawk-x86-64-self}/bin/awk"),
+        post_rust_tool_farm(Some("{in:gawk-x86-64-self}/bin/awk")),
         Step::MkDir {
             path: "{root}/test".into(),
         },
@@ -65,7 +65,7 @@ pub fn recipe() -> Recipe {
 
     Recipe::mesboot("gawk-x86-64-self-test", "1.0")
         .native_inputs(&post_rust_inputs(
-            "gawk-x86-64-self",
+            Some("gawk-x86-64-self"),
             &["binutils-x86-64-self"],
         ))
         .steps(steps)

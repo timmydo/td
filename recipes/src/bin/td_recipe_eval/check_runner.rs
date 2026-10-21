@@ -9592,6 +9592,26 @@ mod tests {
     /// The shipped deployment's exact containment answer. The two imported
     /// packages and their shared runtime must be listed as foreign recipes and
     /// source pins while the image that stages them remains unmarked.
+    /// Nothing the image builds reaches the stage0 ladder: no member of its
+    /// uncut closure is on the ladder's side of the bootstrap-root cut, and
+    /// cutting there, whatever the environment asks, removes nothing.
+    #[test]
+    fn the_deployment_reaches_no_ladder_recipe() {
+        let targets = [PAYLOAD_CLOSURE_DEFAULT];
+        let full = recipe_closure_full(&targets).unwrap();
+        let ladder: Vec<&str> = full
+            .iter()
+            .map(|node| node.stem.as_str())
+            .filter(|stem| crate::bootstrap_root::ladder_side(stem).unwrap())
+            .collect();
+        assert!(ladder.is_empty(), "the deployment builds {ladder:?}");
+        let cut: BTreeSet<&str> = crate::bootstrap_root::CUT.iter().copied().collect();
+        assert_eq!(
+            recipe_closure_cut(&targets, &cut).unwrap().len(),
+            full.len()
+        );
+    }
+
     #[test]
     fn the_shipped_deployment_reports_only_its_three_foreign_payloads() {
         let answer = payload_closure(&[PAYLOAD_CLOSURE_DEFAULT]).unwrap();

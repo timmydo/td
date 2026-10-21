@@ -19,7 +19,7 @@ pub fn recipe() -> Recipe {
     let mut steps = unpack_into("make-x86-64-self-source", "{src}");
 
     steps.extend(unpack_keep_top("linux-headers-x86-64", "{root}/kh"));
-    steps.push(post_rust_tool_farm("{in:gawk-x86-64-self}/bin/gawk"));
+    steps.push(post_rust_tool_farm(Some("{in:gawk-x86-64-self}/bin/gawk")));
     steps.push(Step::PatchShebangs {
         dir: "{src}".into(),
         shell: POST_RUST_SH.into(),
@@ -98,7 +98,7 @@ pub fn recipe() -> Recipe {
     Recipe::mesboot("make-x86-64-self", "4.4.1")
         .source_input("make-x86-64-source")
         .native_inputs(&post_rust_inputs(
-            "gawk-x86-64-self",
+            Some("gawk-x86-64-self"),
             &[
                 "gcc-x86-64-self",
                 "binutils-x86-64-self",

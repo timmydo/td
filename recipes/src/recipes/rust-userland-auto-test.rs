@@ -101,7 +101,7 @@ pub fn recipe() -> Recipe {
     let mail = "{in:td-mail}/bin/td-mail";
     let fixture = "{root}/fixtures/known-needle.txt";
     let mut steps = vec![
-        post_rust_tool_farm("{in:gawk-x86-64-self}/bin/gawk"),
+        post_rust_tool_farm(Some("{in:gawk-x86-64-self}/bin/gawk")),
         dynamic_contract("ripgrep", rg, "ld-linux-x86-64.so.2\nlibc.so.6"),
         dynamic_contract("fd", fd, "libc.so.6"),
         // The two applications are td's own root crates built static from
@@ -154,7 +154,7 @@ pub fn recipe() -> Recipe {
 
     Recipe::mesboot("rust-userland-auto-test", "1.0")
         .native_inputs(&post_rust_inputs(
-            "gawk-x86-64-self",
+            Some("gawk-x86-64-self"),
             &[
                 "ripgrep",
                 "fd",

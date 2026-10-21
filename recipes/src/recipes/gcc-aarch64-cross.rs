@@ -44,7 +44,7 @@ pub fn recipe() -> Recipe {
     let mut steps = unpack_into("gcc-aarch64-cross-source", "{src}");
     steps.extend(unpack_into("binutils-244-source", "{root}/binutils"));
     steps.extend(unpack_keep_top("linux-headers-x86-64", "{root}/kh"));
-    steps.push(post_rust_tool_farm("{in:gawk-x86-64-self}/bin/gawk"));
+    steps.push(post_rust_tool_farm(Some("{in:gawk-x86-64-self}/bin/gawk")));
     for (input, directory, link) in [
         ("gmp63", "gmp-6.3.0", "gmp"),
         ("mpfr421", "mpfr-4.2.1", "mpfr"),
@@ -239,7 +239,7 @@ pub fn recipe() -> Recipe {
     Recipe::mesboot("gcc-aarch64-cross", "14.3.0")
         .source_input("gcc-14-source")
         .native_inputs(&post_rust_inputs(
-            "gawk-x86-64-self",
+            Some("gawk-x86-64-self"),
             &[
                 "gcc-x86-64-self",
                 "binutils-x86-64-self",
