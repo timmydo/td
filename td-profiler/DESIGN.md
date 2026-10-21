@@ -32,7 +32,6 @@ debug profile. Every source-built user-mode object which can execute in the
 shipped system uses them, including:
 
 - the native compiler, libc, source-built libraries, and userland closure;
-- the shipped stage2 compiler, in-tree standard library, and Cargo;
 - target-built td control-plane programs and Rust userland;
 - registry dependency crates, build-script C/C++ objects, and direct `rustc`
   recipes.
@@ -43,6 +42,17 @@ panic strategy remain independent choices. Bootstrap seeds, build-only
 intermediates which cannot execute in the shipped system, the kernel and
 firmware are separate contracts. Marked foreign application payloads cannot
 acquire frame pointers after the fact; §7 defines their explicit fallback.
+
+The Rust toolchain td ships is upstream's prebuilt release (AGENTS.md "Rust
+toolchain"), not a source build. Its rustc, Cargo, Clippy, rust-lld and LLVM
+carry no debug companions, and the image's object index excludes its store
+item, so samples in them keep their raw addresses and report as unresolved
+(`symbol-coverage-unavailable`) without td attribution.
+Its prebuilt standard library, which every Rust output links, keeps frame
+pointers in only part of its code: each Rust output's assembly-exception
+marker names it (`rust-toolchain`) as a coverage boundary beside the
+compiler-runtime assembly. td's own crates and their dependencies keep the
+policy below.
 Implementation increment 1 makes this a checked current claim.
 
 The compiler policy applies to compiler-generated code. Hand-written assembly
@@ -101,17 +111,8 @@ td-profiler deliberately refuses that oversized line program, preserves
 function attribution, and emits its existing explicit line-resolution
 diagnostic.
 
-Rust 1.96.0's `lib/librustc_driver-277b25caa34f5853.so` is the one named
-exception. Its 102,210,217-byte `.debug_line` exceeds the ordinary reader
-ceiling; after the same non-line DWARF pruning, its companion is 165,003,688
-bytes. The producer admits only that exact runtime under a 128-MiB line-section
-ceiling and a 192-MiB companion ceiling. This producer ceiling happens to
-equal the reader's separate 128-MiB whole-object budget; it does not relax or
-derive from that budget. Every other Rust-toolchain ELF remains ordinary. The
-driver's retained line program is structurally checked to require no pruned
-`.debug_str`. The exception does not claim that the runtime reader accepts its
-oversized line program. An update to the pinned producer must remeasure the
-section and companion, then re-review or remove the exception.
+No producer currently holds this exception. The upstream Rust toolchain,
+whose source-built driver once did, ships without companions.
 
 A recipe links each user-mode ELF with a deterministic GNU build ID, using the
 linker's SHA-1 build-id form. This is a pair check over linked bytes, not object
@@ -174,15 +175,12 @@ debugging information. The producer removes `.debug_info`, `.debug_abbrev`,
 line-table unit is DWARF 2 through 4, whose path tables are inline, or when a
 structural scan of every DWARF-5 directory and file format finds no
 `DW_FORM_strp`. A declared `DW_FORM_strp` keeps `.debug_str` and subjects it to
-the ordinary reader ceiling. The Rust-driver
-exception removes it and then structurally rejects a retained line program
-which declares `DW_FORM_strp`. The image recipe records the companions' total
-bytes and enforces a literal compiled ceiling kept outside the measuring code.
-The source-built toolchain and shipped deployment have independent ceilings:
-four GiB for the LLVM/rustc-dominated toolchain output and one GiB for the
-complete standard image, including its source-built development toolchain.
-The toolchain's producer ceiling does not enlarge the deployment allowance.
-Changing either is reviewed with the corresponding size report. This keeps
+the ordinary reader ceiling. A source-line exception removes it and then
+structurally rejects a retained line program which declares `DW_FORM_strp`.
+The image recipe records the companions' total bytes and enforces a literal
+compiled ceiling kept outside the measuring code.
+The shipped deployment's ceiling is one GiB for the complete standard image.
+Changing it is reviewed with the corresponding size report. This keeps
 the always-available data useful for function and source-line attribution
 without turning every deployment into a full debugger SDK.
 
@@ -201,10 +199,9 @@ The deployment bundle records `deployment/debug-size` beside `root.erofs`.
 It remains a derived build report rather than a boot payload: the exact
 three-payload `td-deployment-v1` manifest stays readable by selectors already
 installed before profiling, while the manifest's `root.erofs` digest binds the
-debug companions whose size the report measures. The source-built Rust
-toolchain records its separately dominated subtotal at `share/td/debug-size`
-in that output. Both reports are stable `key=value` files and enforce their
-scope's compiled ceiling before their containing outputs can be committed.
+debug companions whose size the report measures. The report is a stable
+`key=value` file and enforces its scope's compiled ceiling before the
+deployment can be committed.
 
 Debug information is expected to change output hashes. Reproducibility means
 that the same declared inputs produce the same runtime and debug bytes; it
@@ -483,9 +480,9 @@ callchain.
 
 One ordinary object accepts at most 32 MiB of `.debug_line`, 32 MiB for either
 external line-string section, one million retained line ranges, and 4,096 bytes
-in one reported source path. The named Rust-driver producer
-exception is not accepted by this reader: function symbols remain available
-and source-line attribution fails explicitly at the 32-MiB check. One unit may
+in one reported source path. A source-line producer exception is not
+accepted by this reader: function symbols remain available and source-line
+attribution fails explicitly at the 32-MiB check. One unit may
 declare at most 200,000 combined transient file/directory entries. The
 producer's pre-prune dependency scan applies that same per-unit ceiling and
 admits at most 6,400,000
@@ -769,6 +766,8 @@ user mode. Coverage degrades explicitly:
 - a marked foreign payload or executable bootstrap seed may lack frame pointers
   or debug information;
 - reviewed hand-written assembly may not preserve a frame chain;
+- the upstream Rust toolchain's objects have no companions, and the prebuilt
+  standard library Rust outputs link has incomplete frame pointers;
 - an anonymous/JIT mapping may have no stable object;
 - a deleted or replaced non-store mapping may be unavailable at report time;
 - kernel permission or ring loss may remove records.
@@ -793,9 +792,8 @@ design:
    to every shipped source-built user-mode build path. Tests pin flags, path
    remaps, GNU build IDs, companion layout and pair verification, assembly
    exceptions, and double-build identity. A literal debug-size ceiling is
-   reviewed outside the measuring code. The shipped image and the separately
-   retained source-built toolchain each report against their own ceiling, so
-   rustc and LLVM growth cannot silently relax the deployment budget.
+   reviewed outside the measuring code, and the shipped image reports
+   against it.
 2. Add the dependency-free `td-profiler` collector and offline report command.
    Amend `UNSAFE.md`, confine the syscall roster, and register the standalone
    lock and affected checks. Unit tests cover CPU-set parsing, perf record

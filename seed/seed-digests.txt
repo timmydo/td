@@ -15,7 +15,6 @@ binutils-mesboot-source 455cqqkkwpx94h5km91l46wldq80dgyl-binutils-mesboot-source
 bison-mesboot-source 091gccsyc4qcsnk4r6p99mqkk259f3ar-bison-mesboot-source
 ca-certificates-source 1nh4w1q566ga153y3h427ai268h934nx-ca-certificates-source
 claude-code-source 38p8258xch0p61w26g2k7h6in56jzyh9-claude-code-source
-cmake-x86-64-source arcs0qgnqjhfljjd69mpgnjnanpcrlid-cmake-x86-64-source
 coreutils-mesboot0-source 7dkw301jma5vnzc6x5i09nmh2dn7ak0q-coreutils-mesboot0-source
 cryptsetup-x86-64-source v3g69yip0g4zybh9yw2hlp3zzcfy98fc-cryptsetup-x86-64-source
 curl-x86-64-source 985mgjp6q4y958wwzqs984nkh399jnac-curl-x86-64-source
@@ -80,10 +79,10 @@ popt-x86-64-source i2hswa2a3s6kzvqrzl9hz4gvgavsx4yh-popt-x86-64-source
 python-mesboot-source 460ch0an5nlsgs5i9ppdk6b890fnvw1y-python-mesboot-source
 ripgrep-seed-source vg4gdaxl18mqlbhybnn2pq7lpwm3wm2q-ripgrep-seed-source
 ripgrep-source ma4kmnnyn1hlimj2rw6hq7p07h8g2p3x-ripgrep-source
-rust-source cm16nyx12gdvnbm868xrrfcyaij9xqi1-rust-source
-rust-stage0-cargo-source gsd6q27xf6sv3js5hy0ngi3d5hp0s73l-rust-stage0-cargo-source
-rust-stage0-rustc-source 5jhmhhjm2dc9k0xp2xcyn37f6mm548nb-rust-stage0-rustc-source
-rust-stage0-std-source cq2l2plp6jfcqzchh4zczg8g6sy6syvg-rust-stage0-std-source
+rust-cargo-dist f8wnk26zf00vamwc8b4ix61a7njji7yd-rust-cargo-dist
+rust-clippy-dist qw713yaddz7n6hfnxcipy173hxic1hh2-rust-clippy-dist
+rust-rustc-dist h6ys76xx8ddx53hwn9ja662kycmxrcls-rust-rustc-dist
+rust-std-dist dwjgr6wbk88ay81n4qxlwy9xnjjqmk5s-rust-std-dist
 sed-mesboot-source 331jp1sj5iyjhnb35391k2sjjkqrawk1-sed-mesboot-source
 sed-mesboot0-source i6y1c09pssxjdc60wmdf96vf11hxa56c-sed-mesboot0-source
 stage0-source ma16im40lnb5dldxwglzzs7iqpzfiz4m-stage0-source

@@ -65,8 +65,8 @@ Readiness follows the initial framebuffer paint, opening all input nodes and
 binding both Wayland listeners. The optional control socket binds before
 that marker as well, and a failed bind is fatal.
 
-All target-side UI code is dependency-free Rust built by td's source-built
-stage2 toolchain. The target closure contains no Mesa, libdrm userspace,
+All target-side UI code is dependency-free Rust built by td's pinned Rust
+toolchain. The target closure contains no Mesa, libdrm userspace,
 libinput, libudev, libseat, libwayland, Cairo, Pango, fontconfig, Meson,
 Ninja, or pkg-config.
 

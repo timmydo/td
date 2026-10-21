@@ -40,7 +40,7 @@ any client: its launcher runs `/bin/td-term run` for a terminal window, and
 its terminal authority learns that a terminal it launched is up by running
 `/bin/td-term probe SOCKET` as a subprocess (§4).
 
-All terminal code is dependency-free Rust built by td's source-built stage2
+All terminal code is dependency-free Rust built by td's pinned Rust
 toolchain. It has no external toolkit, GPU API, dynamic font system, terminal
 daemon, configuration language, plugin interface, or external crate. Its
 renderer is software XRGB8888 into the `wl_shm` buffers td-ui's client owns.

@@ -58,24 +58,47 @@ fn run(arguments: Vec<OsString>) -> Result<(), String> {
 fn index_command(arguments: &[OsString]) -> Result<(), String> {
     let root = arguments.first().ok_or_else(usage).map(PathBuf::from)?;
     let output = arguments.get(1).ok_or_else(usage).map(PathBuf::from)?;
-    let exclusions = match arguments.get(2).and_then(|value| value.to_str()) {
-        None if arguments.len() == 2 => Vec::new(),
-        Some("--exclude-registry") if arguments.len() == 5 => index::registry_exclusions(
-            &root,
-            &PathBuf::from(
-                arguments
-                    .get(3)
-                    .ok_or("--exclude-registry requires a path")?,
-            ),
-            &PathBuf::from(
-                arguments
-                    .get(4)
-                    .ok_or("--exclude-registry requires an application-root policy")?,
-            ),
-        )?,
-        _ => return Err("index accepts only --exclude-registry REGISTRY APPLICATION_ROOTS".into()),
+    let (registry, items) = index_exclusions(arguments.get(2..).unwrap_or_default())?;
+    let mut exclusions = match registry {
+        Some((registry, roots)) => index::registry_exclusions(&root, &registry, &roots)?,
+        None => Vec::new(),
     };
+    exclusions.extend(items);
     index::build(&root, &output, &exclusions)
+}
+
+/// An application registry, given at most once, and any number of named
+/// store items whose objects the index leaves out. `index::build` holds
+/// every exclusion to one canonical /td/store child.
+type IndexExclusions = (Option<(PathBuf, PathBuf)>, Vec<PathBuf>);
+
+fn index_exclusions(arguments: &[OsString]) -> Result<IndexExclusions, String> {
+    let mut registry = None;
+    let mut items = Vec::new();
+    let mut at = 0usize;
+    while at < arguments.len() {
+        let option = arguments
+            .get(at)
+            .and_then(|value| value.to_str())
+            .ok_or("index option is not UTF-8")?;
+        at = at.saturating_add(1);
+        match option {
+            "--exclude-registry" if registry.is_none() => {
+                let path = PathBuf::from(take(arguments, &mut at, option)?);
+                let roots = PathBuf::from(take(arguments, &mut at, option)?);
+                registry = Some((path, roots));
+            }
+            "--exclude-store-item" => items.push(PathBuf::from(take(arguments, &mut at, option)?)),
+            _ => {
+                return Err(
+                    "index accepts only --exclude-registry REGISTRY APPLICATION_ROOTS (once) \
+                     and --exclude-store-item STORE_ITEM"
+                        .into(),
+                )
+            }
+        }
+    }
+    Ok((registry, items))
 }
 
 fn evidence_command(arguments: &[OsString]) -> Result<(), String> {
@@ -261,7 +284,8 @@ fn usage() -> String {
      [--duration-secs N|--duration-ms N] [--once]\n       td-profiler report ABSOLUTE-CAPTURE \
      [--object-index PATH|--no-object-index]  # maintenance writer; writes \
      ABSOLUTE-CAPTURE/regenerated\n       td-profiler index ROOT OUTPUT \
-     [--exclude-registry REGISTRY APPLICATION_ROOTS]\n       td-profiler evidence CAPTURE-ROOT \
+     [--exclude-registry REGISTRY APPLICATION_ROOTS] [--exclude-store-item STORE_ITEM]...\n       \
+     td-profiler evidence CAPTURE-ROOT \
      [--timeout-secs N] [--attribution-timeout-secs N] --uid N --gid N \
      [--attribution-cmdline-token TOKEN]\n       td-profiler probe"
         .into()
@@ -333,6 +357,60 @@ mod confinement {
             assert!(!COLLECTOR.contains(forbidden));
             assert!(!SYS.contains(forbidden));
             assert!(!topology.contains(forbidden));
+        }
+    }
+}
+
+#[cfg(test)]
+mod index_arguments {
+    #![allow(clippy::unwrap_used)]
+
+    use super::index_exclusions;
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    fn args(values: &[&str]) -> Vec<OsString> {
+        values.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn store_items_repeat_and_the_registry_is_given_once() {
+        let (registry, items) = index_exclusions(&args(&[
+            "--exclude-store-item",
+            "/td/store/a-rust",
+            "--exclude-registry",
+            "/r/apps.tsv",
+            "/r/roots.tsv",
+            "--exclude-store-item",
+            "/td/store/b-other",
+        ]))
+        .unwrap();
+        assert_eq!(
+            registry,
+            Some((PathBuf::from("/r/apps.tsv"), PathBuf::from("/r/roots.tsv")))
+        );
+        assert_eq!(
+            items,
+            [
+                PathBuf::from("/td/store/a-rust"),
+                PathBuf::from("/td/store/b-other")
+            ]
+        );
+        assert_eq!(index_exclusions(&[]).unwrap(), (None, Vec::new()));
+        for refused in [
+            &[
+                "--exclude-registry",
+                "/a",
+                "/b",
+                "--exclude-registry",
+                "/c",
+                "/d",
+            ][..],
+            &["--exclude-store-item"],
+            &["--exclude-registry", "/a"],
+            &["--exclude-other", "/a"],
+        ] {
+            assert!(index_exclusions(&args(refused)).is_err(), "{refused:?}");
         }
     }
 }

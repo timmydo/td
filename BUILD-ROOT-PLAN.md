@@ -56,11 +56,17 @@ deleted; its findings are summarized under "Facts" below.
 - Static td programs (td-sh, td-init, td-kexec, ...) are already static
   glibc (`+crt-static`, `relocation-model=static`); the gnu target keeps
   them unchanged.
-- rust-stage0 already retargets the upstream gnu snapshot onto td's
-  glibc/libgcc/zlib with td's ELF editor, so no new ELF capability is
-  needed. Upstream gnu rustc needs glibc, libgcc_s and zlib at runtime.
-- After the cutover only json-c (cryptsetup's LUKS2 dependency) needs
-  cmake; AWS-LC already builds with its `cc` builder.
+- The `rust-dist` transform retargets the upstream gnu release onto
+  td's glibc/libgcc/zlib with td's ELF editor, so no new ELF capability
+  was needed. Upstream gnu rustc needs glibc, libgcc_s and zlib at
+  runtime. Its default linker, `cc` from PATH, is passed
+  `-fuse-ld=lld -B…/gcc-ld`, which td's GCC (configured `--with-ld`)
+  consumes and ignores, so it links with GNU ld; an explicitly named gcc
+  infers a flavor without lld, and `-Clinker-features=-lld` pins GNU ld
+  either way. rust-lld first links in increment 7.
+- After the cutover only json-c (cryptsetup's LUKS2 dependency) needed
+  cmake, so it moved into the root with the cutover and the ladder's
+  cmake went; AWS-LC already builds with its `cc` builder.
 - Toolchain size: today ~1,030 MiB (source-built Rust 576, GCC 255,
   binutils 114, glibc 86). After: upstream Rust ~650 + glibc ~86 +
   libgcc/zlib/td-cc a few MiB ≈ 740 MiB, ~290 MiB smaller.
@@ -125,25 +131,31 @@ deleted; its findings are summarized under "Facts" below.
    becomes the pinned upstream 1.96.0 gnu dist (rustc, rust-std, Cargo,
    Clippy) through the renamed `rust-dist` transform onto td glibc,
    gcc-runtime's libgcc_s and zlib (moved into the root, with
-   companions), rust-lld included. gcc-x86-64-self stays the `cc`;
-   upstream's default `-fuse-ld=lld` then links with rust-lld through
-   `gcc-ld/ld.lld`. Upstream rustc/Cargo/rust-lld/LLVM and rust-std are
-   a declared profiler boundary. Amends AGENTS.md (trust model, Rust
-   bridge, profiling contract), `td-profiler/DESIGN.md` and the design
-   docs that cite the source-built toolchain. Deletes the source-built
-   stage1/stage2/LLVM path, `rust-stage0` and `td-util-boot`.
+   companions), rust-lld included, `gcc-ld/ld.lld` linked to it.
+   gcc-x86-64-self stays the `cc`, and td's recipes pass
+   `-Clinker-features=-lld` so they keep linking with GNU ld: the
+   cutover changes the compiler's provenance, not the linker, and the
+   linker moves with the driver in 7. Upstream rustc/Cargo/rust-lld/LLVM
+   and rust-std are a declared profiler boundary; the image's object
+   index excludes the toolchain. json-c moves into the root, so the
+   ladder's cmake goes. Amends AGENTS.md (trust model, Rust toolchain,
+   profiling contract), `td-profiler/DESIGN.md` and the design docs that
+   cite the source-built toolchain. Deletes the source-built
+   stage1/stage2/LLVM path, `rust-stage0`, `td-util-boot` and
+   `cmake-x86-64`.
 7. **A GCC-free Rust link driver.** Accepts rustc's gcc-style link
    lines (`-Wl,…`, `-nodefaultlibs`, `-pie`, `-static`, `-static-pie`,
    `-shared`, `-l…`, `-L…`, `-o`), selects td glibc/gcc-runtime crt
    objects per output kind, runs `rust-lld`; refuses compile requests.
-   Every Rust recipe and the image's `cc` for Cargo switch to it. Tests:
+   Every Rust recipe and the image's `cc` for Cargo switch to it, and
+   `-Clinker-features=-lld` leaves the target policy. Tests:
    a dynamic PIE, a static ET_EXEC, a static PIE, a proc-macro dylib and
    a cdylib, with no gcc or binutils reachable. C inside crates (`ring`,
    AWS-LC, jemalloc, blake3, oniguruma, pcre2) compiles in the build root
    against td glibc. Amends `crypto_policy.rs` and the td-crypto/td-mta
    design docs for AWS-LC's compiler.
 8. **C packages in the build root against td glibc**: LibreSSL (library
-   only), curl, Git 2.55.0; json-c, popt, libdevmapper, util-linux libs,
+   only), curl, Git 2.55.0; popt, libdevmapper, util-linux libs,
    cryptsetup (static, as today); OpenSSH (`--without-openssl`). One
    landing per stack (git, cryptsetup, ssh).
    8b. **glibc in the build root.** `glibc-x86-64` rebuilt in the root

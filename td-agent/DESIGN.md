@@ -100,7 +100,7 @@ measured effect of edit formats and tool ergonomics. td-agent
 reimplements none of them and inherits none of their compatibility claims.
 
 td-agent is its own crate, `td-agent/`, and its own static binary, built by
-td's source-built stage2 toolchain. Its manifest declares eleven
+td's pinned Rust toolchain. Its manifest declares eleven
 dependencies, all td crates by path: `td-civil`, `td-encoding`,
 `td-fetch-client`, `td-fs`, `td-html`, `td-jpeg`, `td-json`,
 `td-markdown`, `td-png`, `td-toml` and `td-ui`, and its lock lists

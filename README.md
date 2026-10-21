@@ -14,11 +14,12 @@ nothing in the root is mutable.
 - **Immutable** — the root filesystem is a read-only erofs image. `/bin`
   is a pure symlink farm into `/td/store`; there is no `/usr` or `/sbin`.
   `/var` is persistent Btrfs state; `/run` and `/tmp` are volatile tmpfs.
-- **Built from source** — bootstrapped from the tiny `stage0-posix` seed
-  through an iterative GCC/glibc ladder and a source-built Rust toolchain.
-  Host `/bin`, `/usr`, and ambient `PATH` never enter a build. (The one
-  downloaded trust root — the pinned Rust bootstrap snapshot — is rebuilt
-  from source and never reaches the final image.)
+- **Built from source** — the C platform is bootstrapped from the tiny
+  `stage0-posix` seed through an iterative GCC/glibc ladder; Rust is
+  upstream's pinned 1.96.0 release, retargeted onto td's glibc. Host
+  `/bin`, `/usr`, and ambient `PATH` never enter a build. (The downloaded
+  trust roots — that Rust release and the Debian build root that compiles
+  the kernel and the Rust runtime's C libraries — are pinned by SHA-256.)
 - **Rust-first userland** — the core file and text tools are Rust uutils, and
   the boot/login/shell path is td's own static Rust multicalls. No
   third-party multicall is shipped: the image packs nothing td did not

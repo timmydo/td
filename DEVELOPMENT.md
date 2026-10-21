@@ -790,8 +790,8 @@ again. Source-pin tests match the formatted text, so a reformatted line they
 read needs its pin moved with it.
 
 The check needs `rustfmt` on `PATH`, which the host toolchain is expected
-to provide; a minimal rustup profile does not. td's own source-built Rust
-toolchain does not ship it yet, so on a td system the two preflights fail,
+to provide; a minimal rustup profile does not. td's own Rust toolchain
+does not ship it yet, so on a td system the two preflights fail,
 saying so, until it does. rustfmt also reads a `rustfmt.toml` above the
 repository or in the user's configuration directory, as `cargo fmt` does;
 keep none there.

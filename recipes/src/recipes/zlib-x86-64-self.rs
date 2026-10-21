@@ -1,10 +1,9 @@
 use crate::ladder::{post_rust_inputs, post_rust_tool_farm, unpack_into, POST_RUST_SH};
 use crate::types::{Recipe, Step};
 
-// Final-toolchain zlib for source-built userland. The earlier zlib-x86-64
-// output is deliberately a bootstrap-only shared library for the downloaded
-// Rust snapshot; this rung instead exports a profiled static archive and public
-// headers for curl and Git.
+// Final-toolchain zlib for source-built userland. zlib-x86-64 is the shared
+// library the upstream Rust toolchain runs on; this rung instead exports a
+// profiled static archive and public headers for curl and Git.
 pub fn recipe() -> Recipe {
     let sgcc = "{in:gcc-x86-64-self}/stage/td/store/gcc-14.3.0-x86_64-self/bin/gcc";
     let sbin = "{in:binutils-x86-64-self}/bin";

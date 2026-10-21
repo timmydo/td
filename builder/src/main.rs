@@ -5814,7 +5814,7 @@ const APPLICATION_PHASE_RUNNERS: &[&str] = &[
     "cmake-build",
     "mesboot-build",
 ];
-const NON_APPLICATION_PHASE_RUNNERS: &[&str] = &["stage0-build", "rust-stage0-build"];
+const NON_APPLICATION_PHASE_RUNNERS: &[&str] = &["stage0-build", "rust-dist-build"];
 
 fn push_drv_field(spec: &mut String, directive: &str, value: &str) -> Result<(), String> {
     if directive
@@ -6075,10 +6075,10 @@ fn assemble_recipe_drv(
         // mesboot: the bootstrap-RUNG executor (build::run_mesboot, #378 slices
         // 2+3) — the recipe's typed steps run in the sandbox over staged inputs.
         "mesboot" => "mesboot-build",
-        // rust-stage0: assemble the exact upstream rustc/rust-std/Cargo bootstrap
-        // components and retarget them to td's declared runtime closure.
-        "rust-stage0" => "rust-stage0-build",
-        other => return Err(format!("recipe: unknown buildSystem `{other}' (known: gnu, rust, cmake, stage0, mesboot, rust-stage0)")),
+        // rust-dist: assemble the pinned upstream Rust release components and
+        // retarget them onto td's declared runtime.
+        "rust-dist" => "rust-dist-build",
+        other => return Err(format!("recipe: unknown buildSystem `{other}' (known: gnu, rust, cmake, stage0, mesboot, rust-dist)")),
     };
     let application_capable = APPLICATION_PHASE_RUNNERS.contains(&phase_runner);
     if !application_capable && !NON_APPLICATION_PHASE_RUNNERS.contains(&phase_runner) {
@@ -6420,22 +6420,22 @@ fn assemble_recipe_drv(
                 push_drv_env(&mut spec, "TD_INPUT_MAP", &map.to_json_string())?;
             }
         }
-        // rust-stage0: the exact upstream bootstrap-component ELF-retarget transform.
-        // TD_SRC is the rustc component; rust-std/Cargo sources and the td runtime
-        // closure resolve by NAME through TD_INPUT_MAP. No compilation occurs here.
-        "rust-stage0" => {
+        // rust-dist: the upstream Rust release ELF-retarget transform. TD_SRC is
+        // the rustc component; the other components and td's runtime resolve by
+        // NAME through TD_INPUT_MAP. No compilation occurs here.
+        "rust-dist" => {
             if alist.get("configureFlags").is_some()
                 || alist.get("phases").is_some()
                 || alist.get("bins").is_some()
                 || alist.get("steps").is_some()
             {
                 return Err(
-                    "recipe: buildSystem \"rust-stage0\" supports no configureFlags/phases/bins/steps — it transforms exact rustc/rust-std/Cargo component tarballs against declared runtime inputs".into(),
+                    "recipe: buildSystem \"rust-dist\" supports no configureFlags/phases/bins/steps — it transforms pinned Rust release components against declared runtime inputs".into(),
                 );
             }
             if !vendor.is_empty() || vendor_dir.is_some() {
                 return Err(
-                    "recipe: buildSystem \"rust-stage0\" takes no vendored crates — the transform extracts prebuilt bootstrap components, it does not compile".into(),
+                    "recipe: buildSystem \"rust-dist\" takes no vendored crates — the transform extracts prebuilt release components, it does not compile".into(),
                 );
             }
             let map = input_map_json(&entries, &std::collections::BTreeSet::new())?;
@@ -8275,13 +8275,13 @@ fn emit_recipe_json(pkg: &str) -> Result<String, String> {
 /// The pre-provisioned NATIVE `/td/store` toolchain `td shell` builds the Rust userland with,
 /// handed in via the `TD_SHELL_NATIVE_*` environment (its provisioning gate `td-shell-userland`
 /// is staged by the rust-toolchain recipe's product proof. When present, a vendored rust build (ripgrep,
-/// fd, …) links this toolchain — never a host or downloaded-stage0 compiler. Its lock is assembled
+/// fd, …) links this toolchain — never a host compiler. Its lock is assembled
 /// from the interned package source plus these recipe outputs, whose physical store and databases
 /// ride the typed `--recipe-output-store` / `--recipe-output-db` argv channels. Exact compiler,
 /// interpreter, RUNPATH, include, and `-B` paths put run_rust in native link mode. A package build
 /// with no native toolchain provisioned is a hard error.
 struct NativeToolchain {
-    /// Physical store containing the source-built stage2 and native build platform.
+    /// Physical store containing the Rust toolchain and native build platform.
     /// Its canonical location is `/td/store`; `--recipe-output-store` carries the
     /// physical/canonical split explicitly to the build engine.
     store: String,
@@ -8298,7 +8298,7 @@ struct NativeToolchain {
     cc: String,
     cxx: String,
     include: String,
-    /// Recipe-output lock lines for the source-built stage2 and native
+    /// Recipe-output lock lines for rust-toolchain and the native
     /// GCC/binutils/glibc: what a Rust package declares.
     lock_lines: String,
 }
@@ -8356,7 +8356,7 @@ impl NativeToolchain {
 /// for PKG"), it does NOT fall back to guix. The package that lands on PATH is td's
 /// own build at td's own store path. A vendored rust build (ripgrep, fd, …) links the
 /// NATIVE `/td/store` toolchain provisioned via `TD_SHELL_NATIVE_*` (see `NativeToolchain`),
-/// never the downloaded stage0 Rust snapshot or a host compiler.
+/// never a host compiler.
 ///
 /// Config (env): TD_RECIPE_EVAL (td's Rust recipe-catalog evaluator, to emit the
 /// recipe),
@@ -8398,7 +8398,7 @@ fn run_shell(rest: &[String]) -> Result<std::process::ExitStatus, String> {
         .to_string_lossy()
         .into_owned();
     // The pre-provisioned NATIVE /td/store toolchain (TD_SHELL_NATIVE_*), if any. When present, a
-    // vendored rust build links it instead of downloaded stage0 or a host compiler.
+    // vendored rust build links it instead of a host compiler.
     let native = NativeToolchain::from_env()?;
 
     // Build each named package with td-builder itself — no guix — and collect the
@@ -8432,9 +8432,8 @@ fn run_shell(rest: &[String]) -> Result<std::process::ExitStatus, String> {
                     return Err(format!(
                         "build `{pkg}': a vendored rust build needs the native /td/store toolchain, \
                          but TD_SHELL_NATIVE_STORE is not set. The rust-toolchain recipe check \
-                         must stage native gcc/binutils/glibc plus the recipe-graph source-built \
-                         stage2 Rust toolchain. Downloaded stage0 and host compiler fallbacks are \
-                         forbidden for `td shell'."
+                         must stage native gcc/binutils/glibc plus the recipe-graph rust-toolchain \
+                         output. Host compiler fallbacks are forbidden for `td shell'."
                     ));
                 };
                 // Add only the explicitly provisioned recipe outputs to the
@@ -8731,8 +8730,7 @@ fn stage_verified_shell_source_archive(
 
 /// Add the authenticated `/td/store` recipe-output build platform to an
 /// interned-source lock. This replaces the old mixed Guix/native retargeting:
-/// any `/gnu/store` line or downloaded `rust-stage0` input is now a hard error,
-/// not something filtered heuristically.
+/// any `/gnu/store` line is a hard error, not something filtered heuristically.
 fn recipe_toolchain_lock_body(seed_body: &str, native_lines: &str) -> Result<String, String> {
     let mut source_lines = seed_body.lines().filter(|line| !line.trim().is_empty());
     let (Some(source_line), None) = (source_lines.next(), source_lines.next()) else {
@@ -8763,11 +8761,6 @@ fn recipe_toolchain_lock_body(seed_body: &str, native_lines: &str) -> Result<Str
         {
             return Err(format!(
                 "td shell native lock line is not one canonical /td/store recipe output: {line}"
-            ));
-        }
-        if fields.iter().any(|field| field.contains("rust-stage0")) {
-            return Err(format!(
-                "td shell native lock names the downloaded rust-stage0 trust root: {line}"
             ));
         }
     }
@@ -12621,12 +12614,12 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        // td's Rust bootstrap-snapshot transform: see build::run_rust_stage0.
+        // td's upstream Rust release transform: see build::run_rust_dist.
         // Same env-driven derivation-builder contract as the other phase runners.
-        Some("rust-stage0-build") if args.len() == 2 => match build::run_rust_stage0() {
+        Some("rust-dist-build") if args.len() == 2 => match build::run_rust_dist() {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
-                eprintln!("td-builder: rust-stage0-build: {e}");
+                eprintln!("td-builder: rust-dist-build: {e}");
                 ExitCode::FAILURE
             }
         },
@@ -12913,8 +12906,7 @@ mod tests {
     }
 
     // The product shell may add only current `/td/store` recipe outputs to
-    // that source lock. Guix paths and the downloaded Rust stage0 are rejected
-    // rather than silently removed.
+    // that source lock. Guix paths are rejected rather than silently removed.
     #[test]
     fn recipe_toolchain_lock_accepts_only_td_recipe_outputs() {
         let source = "ripgrep-source /td/store/src-ripgrep source\n";
@@ -12947,11 +12939,6 @@ glibc-x86-64 /td/store/gl-glibc td-recipe-output
         assert!(recipe_toolchain_lock_body(
             source,
             "rust-toolchain /gnu/store/final td-recipe-output\n"
-        )
-        .is_err());
-        assert!(recipe_toolchain_lock_body(
-            source,
-            "rust-stage0 /td/store/downloaded-rust-stage0 td-recipe-output\n"
         )
         .is_err());
         assert!(
@@ -17620,7 +17607,7 @@ daemon build START (2/2 active)
         }
         for (runner, build_fn) in [
             ("stage0-build", "run_stage0"),
-            ("rust-stage0-build", "run_rust_stage0"),
+            ("rust-dist-build", "run_rust_dist"),
         ] {
             assert!(NON_APPLICATION_PHASE_RUNNERS.contains(&runner));
             let call = format!("match build::{build_fn}()");
@@ -17868,7 +17855,7 @@ daemon build START (2/2 active)
                 "does not admit application metadata",
             ),
             (
-                r#"{"name":"fixture","version":"1","buildSystem":"rust-stage0","application":{"runtime":"runtime","entry":"/app/bin/app"}}"#.to_string(),
+                r#"{"name":"fixture","version":"1","buildSystem":"rust-dist","application":{"runtime":"runtime","entry":"/app/bin/app"}}"#.to_string(),
                 "does not admit application metadata",
             ),
             (

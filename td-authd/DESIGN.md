@@ -768,7 +768,7 @@ the fixed read-only firstboot check directly to diagnose its refusal.
 Host tests execute a real child through the same descriptor/environment
 sanitizer and verify its inherited kernel descriptors, bounded records,
 terminal argument selection, strict wire records, and completion retirement.
-The target producer runs these tests with source-built Rust. No test or
+The target producer runs these tests with td's Rust toolchain. No test or
 terminal-launch success is evidence of FIDO2 authentication or consent.
 
 `td-authd/tests/launch_vm.rs` is a standalone disposable-VM fixture. Compile

@@ -8,8 +8,8 @@ const GLIBC_STAGE: &str = "stage/td/store/glibc-2.41-x86_64";
 /// The provenance scans every contract shares. The scanner's positive control
 /// comes first: a NUL-filled probe longer than the tested binary with the
 /// needle at its far end, so a scanner that stops at a NUL, or at the binary's
-/// length, is caught before its two negative answers are trusted. The
-/// negatives are no `/gnu/store` bytes and no Rust stage0 bytes.
+/// length, is caught before its negative answer is trusted: no `/gnu/store`
+/// bytes.
 fn provenance_scans(label: &str, binary: &str) -> String {
     let scanner = "{in:td-txt}/bin/td-txt";
     format!(
@@ -22,10 +22,7 @@ fn provenance_scans(label: &str, binary: &str) -> String {
          [ \"$probe_size\" -gt \"$binary_size\" ] || {{ echo 'binary provenance control does not reach beyond the tested binary size' >&2; exit 1; }}; \
          '{scanner}' grep -a -Fq -- td-binary-scan-positive '{{root}}/binary-scan-probe' || {{ echo 'binary provenance scanner missed its positive control' >&2; exit 1; }}; \
          '{scanner}' grep -a -Fq -- /gnu/store '{binary}'; scan=$?; \
-         case \"$scan\" in 1) :;; 0) echo '{label} embeds /gnu/store bytes' >&2; exit 1;; *) echo 'binary provenance scan failed for {label}' >&2; exit 1;; esac; \
-         stage0='{{in:rust-stage0}}'; stage0_base=${{stage0##*/}}; \
-         '{scanner}' grep -a -Fq -- \"$stage0_base\" '{binary}'; scan=$?; \
-         case \"$scan\" in 1) :;; 0) echo '{label} embeds Rust stage0 bytes' >&2; exit 1;; *) echo 'Rust stage0 provenance scan failed for {label}' >&2; exit 1;; esac; "
+         case \"$scan\" in 1) :;; 0) echo '{label} embeds /gnu/store bytes' >&2; exit 1;; *) echo 'binary provenance scan failed for {label}' >&2; exit 1;; esac; "
     )
 }
 
@@ -165,16 +162,13 @@ pub fn recipe() -> Recipe {
                 "td-mail",
                 "binutils-x86-64-self",
                 "glibc-x86-64",
-                // This boundary check needs the stage0 basename for its negative
-                // byte scan; it never executes the bootstrap compiler.
-                "rust-stage0",
             ],
         ))
         .steps(steps)
         .checks(vec![
             RecipeCheck::new(
                 r#"
-echo ">> recipe-check rust-userland-auto-test: build-plan --auto builds ripgrep, fd, td-news and td-mail with the source-built Rust/native toolchain, verifies the exact dynamic runtime closure of the first two, the td-owned static PIE shape of the last two, and runs real searches and usage output with /gnu/store absent"
+echo ">> recipe-check rust-userland-auto-test: build-plan --auto builds ripgrep, fd, td-news and td-mail with upstream Rust and the native toolchain, verifies the exact dynamic runtime closure of the first two, the td-owned static PIE shape of the last two, and runs real searches and usage output with /gnu/store absent"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run rust-userland-auto-test 1
 "#,

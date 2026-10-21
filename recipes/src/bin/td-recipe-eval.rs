@@ -742,8 +742,8 @@ mod tests {
         // parser generator, re #469) + Python-3.11.1 (the glibc-rung python3,
         // re #469) + GCC 10.5.0 (the compatibility bridge between
         // gcc-mesboot 4.9.4 and GCC 14.3.0) + the linux-x86-64 kernel source +
-        // CMake 3.31.12 + Rust 1.96.0 source and its exact
-        // three-component Rust 1.95.0 stage0 snapshot + coreutils-0.9.0 (the
+        // the upstream Rust 1.96.0 rustc, rust-std, Cargo and Clippy release
+        // components + coreutils-0.9.0 (the
         // uutils, ripgrep, and fd userland `.crate` sources) + util-linux
         // 2.42.2 (cryptsetup's libuuid and libblkid) + the ripgrep 15.2.0
         // static application seed + curl's
@@ -755,8 +755,9 @@ mod tests {
         // gawk 5.4.1 (the build-only awk after rust-toolchain). BusyBox's pin
         // left with its last consumer; the kernel's flex, elfutils and bc left
         // when it moved into the Debian build root; btrfs-progs left when
-        // td-btrfs replaced it.
-        assert_eq!(pins.len(), 75);
+        // td-btrfs replaced it; CMake and the Rust source and its bootstrap
+        // snapshot left with the source-built toolchain.
+        assert_eq!(pins.len(), 74);
         assert!(pins.iter().any(|pin| pin.key == "stage0-source"));
         // The build root lists through `build-root-pins` alone.
         assert!(pins.iter().all(|pin| !pin.key.starts_with("debian-root-")));
@@ -765,12 +766,15 @@ mod tests {
         assert!(pins
             .iter()
             .any(|pin| pin.key == "jetbrains-mono-nerd-font-source"));
-        assert!(pins.iter().any(|pin| pin.key == "cmake-x86-64-source"));
         assert!(pins.iter().any(|pin| pin.key == "claude-code-source"));
-        assert!(pins.iter().any(|pin| pin.key == "rust-source"));
-        assert!(pins.iter().any(|pin| pin.key == "rust-stage0-rustc-source"));
-        assert!(pins.iter().any(|pin| pin.key == "rust-stage0-std-source"));
-        assert!(pins.iter().any(|pin| pin.key == "rust-stage0-cargo-source"));
+        for key in [
+            "rust-rustc-dist",
+            "rust-std-dist",
+            "rust-cargo-dist",
+            "rust-clippy-dist",
+        ] {
+            assert!(pins.iter().any(|pin| pin.key == key), "{key}");
+        }
         assert!(pins.iter().any(|pin| pin.key == "oyacc-source"));
         assert!(pins.iter().any(|pin| pin.key == "bash-mesboot-source"));
         assert!(pins.iter().any(|pin| pin.key == "uutils-source"));

@@ -7,11 +7,14 @@
 /// rustc arguments used by direct target recipes. `{root}` and `{src}` are
 /// expanded by the typed recipe engine so the ephemeral build directory never
 /// reaches DWARF and package source has the canonical `/td-build` root.
-pub const DIRECT_RUSTC_ARGS: [&str; 6] = [
+pub const DIRECT_RUSTC_ARGS: [&str; 7] = [
     "-Cforce-frame-pointers=yes",
     "-Cdebuginfo=line-tables-only",
     "-Cstrip=none",
     "-Clink-arg=-Wl,--build-id=sha1",
+    // Upstream's gnu target links through rust-lld by default; recipes keep
+    // the declared GNU linker until the rust-lld link driver replaces it.
+    "-Clinker-features=-lld",
     "--remap-path-prefix={root}=/td-build-root",
     "--remap-path-prefix={src}=/td-build",
 ];
@@ -48,12 +51,13 @@ pub const ALWAYS_PRUNED_DEBUG_SECTIONS: &[&str] = &[
 /// ordinary recipe path uses `{root}` and `{src}`; the bounded reproducibility
 /// oracle supplies two different roots which must canonicalize to these same
 /// target-visible names.
-pub fn direct_rustc_args(build_root: &str, source_root: &str) -> [String; 6] {
+pub fn direct_rustc_args(build_root: &str, source_root: &str) -> [String; 7] {
     [
         DIRECT_RUSTC_ARGS[0].into(),
         DIRECT_RUSTC_ARGS[1].into(),
         DIRECT_RUSTC_ARGS[2].into(),
         DIRECT_RUSTC_ARGS[3].into(),
+        DIRECT_RUSTC_ARGS[4].into(),
         format!("--remap-path-prefix={build_root}=/td-build-root"),
         format!("--remap-path-prefix={source_root}=/td-build"),
     ]
@@ -76,14 +80,11 @@ pub const ASSEMBLY_EXCEPTIONS: &[(&str, &str)] = &[
     ("gcc-x86-64-self", "upstream GCC libgcc x86_64 assembly"),
     // libgcc built in the Debian build root.
     ("gcc-runtime", "upstream GCC libgcc x86_64 assembly"),
+    // Every Rust output links upstream's prebuilt std, whose frame pointers
+    // are incomplete, and its compiler-runtime assembly.
     (
         "rust-toolchain",
-        "upstream LLVM and Rust compiler-runtime assembly",
-    ),
-    // td-util-boot links the snapshot's prebuilt std, not rust-toolchain's.
-    (
-        "rust-stage0",
-        "upstream Rust 1.95.0 snapshot std and compiler-runtime assembly",
+        "upstream Rust 1.96.0 prebuilt standard library and compiler-runtime",
     ),
     // The target-built td-net multicall, the fetch service's tier, links
     // rustls through `ring`, whose pregenerated x86_64 assembly is compiled
@@ -92,10 +93,6 @@ pub const ASSEMBLY_EXCEPTIONS: &[(&str, &str)] = &[
     ("td-net", "ring 0.17.14 x86_64 assembly"),
 ];
 
-/// The Rust-profiled recipes compiled by the stage0 snapshot, whose std is
-/// the snapshot's prebuilt one rather than rust-toolchain's.
-pub const SNAPSHOT_STD_RECIPES: &[&str] = &["td-util-boot"];
-
 /// Recipes whose linked outputs include the Rust runtime boundary. The glibc
 /// and libgcc boundaries apply to every output passed to the target splitter;
 /// this roster adds Rust/LLVM and is pinned against both Cargo and direct-rustc
@@ -103,7 +100,6 @@ pub const SNAPSHOT_STD_RECIPES: &[&str] = &["td-util-boot"];
 pub const RUST_PROFILED_RECIPES: &[&str] = &[
     "fd",
     "ripgrep",
-    "rust-toolchain",
     "td-agent",
     "td-audio",
     "td-authd",
@@ -143,7 +139,6 @@ pub const RUST_PROFILED_RECIPES: &[&str] = &[
     "td-txt",
     "td-update",
     "td-util",
-    "td-util-boot",
     "td-vm-guest",
     "uutils",
 ];
@@ -163,13 +158,11 @@ pub fn output_assembly_exceptions(recipe: &str) -> Vec<(&'static str, &'static s
                 || (*source == "gcc-x86-64-self"
                     && !matches!(
                         recipe,
-                        "glibc-x86-64" | "binutils-x86-64-self" | "gcc-runtime"
+                        "glibc-x86-64" | "binutils-x86-64-self" | "gcc-runtime" | "zlib-x86-64"
                     ))
-                || (*source == "gcc-runtime" && recipe == "gcc-runtime")
-                || (*source == "rust-toolchain"
-                    && RUST_PROFILED_RECIPES.contains(&recipe)
-                    && !SNAPSHOT_STD_RECIPES.contains(&recipe))
-                || (*source == "rust-stage0" && SNAPSHOT_STD_RECIPES.contains(&recipe))
+                // Build-root C links gcc-runtime's start files, not GCC's.
+                || (*source == "gcc-runtime" && matches!(recipe, "gcc-runtime" | "zlib-x86-64"))
+                || (*source == "rust-toolchain" && RUST_PROFILED_RECIPES.contains(&recipe))
                 // A package's own crate assembly reaches that package alone.
                 || (*source == recipe && recipe == "td-net")
         })
@@ -196,19 +189,9 @@ pub struct LineAttributionException {
     pub reason: &'static str,
 }
 
-pub const LINE_ATTRIBUTION_EXCEPTIONS: &[(&str, LineAttributionException)] = &[
-    (
-        "rust-toolchain",
-        LineAttributionException {
-            runtime_relative_path: "lib/librustc_driver-277b25caa34f5853.so",
-            max_line_section_bytes: 128 * 1024 * 1024,
-            max_companion_bytes: 192 * 1024 * 1024,
-            require_complete_line_strings: true,
-            reason:
-                "Rust 1.96.0 librustc_driver's line program is beyond td-profiler's bounded per-object reader",
-        },
-    ),
-];
+/// Empty since td ships the upstream Rust toolchain, which has no companions;
+/// a producer whose line program outgrows the reader is named here.
+pub const LINE_ATTRIBUTION_EXCEPTIONS: &[(&str, LineAttributionException)] = &[];
 
 pub fn line_attribution_exception(recipe: &str) -> Option<LineAttributionException> {
     LINE_ATTRIBUTION_EXCEPTIONS
@@ -233,16 +216,8 @@ pub fn debug_companion_policy(recipe: &str) -> String {
     }
 }
 
-/// Maximum debug-companion bytes admitted by the source-built Rust toolchain
-/// recipe. The toolchain recipe owns its measurement; keeping the reviewed
-/// literal here prevents measuring code from moving its own limit. Four GiB
-/// leaves headroom for line tables from the source-built rustc/LLVM closure
-/// without permitting unbounded full DWARF.
-pub const TOOLCHAIN_DEBUG_CEILING_BYTES: u64 = 4_294_967_296;
-
-/// The shipped image includes the source-built development toolchain within a
-/// one-GiB companion budget. This is independent of the toolchain producer's
-/// ceiling: compiler growth must also fit the complete deployment budget.
+/// The shipped image's one-GiB companion budget, measured over the whole
+/// deployment rather than by any one producer.
 pub const DEPLOYMENT_DEBUG_CEILING_BYTES: u64 = 1_073_741_824;
 
 /// Compose the Cargo runner's target-only RUSTFLAGS. The three varying source
@@ -259,7 +234,7 @@ pub fn cargo_rustflags(
          --remap-path-prefix={cargo_root}=/td-cargo \
          --remap-path-prefix={vendor_root}=/td-cargo/vendor \
          -Cforce-frame-pointers=yes -Cdebuginfo=line-tables-only -Cstrip=none \
-         -Clink-arg=-Wl,--build-id=sha1 -Clinker={linker}"
+         -Clink-arg=-Wl,--build-id=sha1 -Clinker-features=-lld -Clinker={linker}"
     )
 }
 
@@ -299,6 +274,7 @@ mod tests {
             "-Cdebuginfo=line-tables-only",
             "-Cstrip=none",
             "-Clink-arg=-Wl,--build-id=sha1",
+            "-Clinker-features=-lld",
             "--remap-path-prefix=/tmp/build=/td-build",
             "--remap-path-prefix=/tmp/cargo=/td-cargo",
             "--remap-path-prefix=/tmp/vendor=/td-cargo/vendor",
@@ -325,6 +301,7 @@ mod tests {
                 "-Cdebuginfo=line-tables-only",
                 "-Cstrip=none",
                 "-Clink-arg=-Wl,--build-id=sha1",
+                "-Clinker-features=-lld",
                 "--remap-path-prefix=/scratch/one=/td-build-root",
                 "--remap-path-prefix=/source/one=/td-build",
             ]
@@ -349,27 +326,19 @@ mod tests {
                 ("gcc-runtime", "upstream GCC libgcc x86_64 assembly"),
                 (
                     "rust-toolchain",
-                    "upstream LLVM and Rust compiler-runtime assembly"
-                ),
-                (
-                    "rust-stage0",
-                    "upstream Rust 1.95.0 snapshot std and compiler-runtime assembly"
+                    "upstream Rust 1.96.0 prebuilt standard library and compiler-runtime"
                 ),
                 ("td-net", "ring 0.17.14 x86_64 assembly"),
             ]
         );
+        // The toolchain is the boundary's source, not one of its outputs.
         assert_eq!(
-            output_assembly_exceptions("td-util-boot"),
+            output_assembly_exceptions("rust-toolchain"),
             vec![
                 ("glibc-x86-64", "upstream glibc sysdeps/x86_64 assembly"),
                 ("gcc-x86-64-self", "upstream GCC libgcc x86_64 assembly"),
-                (
-                    "rust-stage0",
-                    "upstream Rust 1.95.0 snapshot std and compiler-runtime assembly"
-                ),
             ]
         );
-        assert_eq!(TOOLCHAIN_DEBUG_CEILING_BYTES, 4_294_967_296);
         assert_eq!(DEPLOYMENT_DEBUG_CEILING_BYTES, 1_073_741_824);
         assert_eq!(
             output_assembly_exceptions("td-boot"),
@@ -378,7 +347,7 @@ mod tests {
                 ("gcc-x86-64-self", "upstream GCC libgcc x86_64 assembly"),
                 (
                     "rust-toolchain",
-                    "upstream LLVM and Rust compiler-runtime assembly"
+                    "upstream Rust 1.96.0 prebuilt standard library and compiler-runtime"
                 ),
             ]
         );
@@ -389,7 +358,7 @@ mod tests {
                 ("gcc-x86-64-self", "upstream GCC libgcc x86_64 assembly"),
                 (
                     "rust-toolchain",
-                    "upstream LLVM and Rust compiler-runtime assembly"
+                    "upstream Rust 1.96.0 prebuilt standard library and compiler-runtime"
                 ),
                 ("td-net", "ring 0.17.14 x86_64 assembly"),
             ]
@@ -404,7 +373,7 @@ mod tests {
                     ("gcc-x86-64-self", "upstream GCC libgcc x86_64 assembly"),
                     (
                         "rust-toolchain",
-                        "upstream LLVM and Rust compiler-runtime assembly"
+                        "upstream Rust 1.96.0 prebuilt standard library and compiler-runtime"
                     ),
                 ],
                 "{application}"
@@ -444,32 +413,24 @@ mod tests {
                 ("gcc-x86-64-self", "upstream GCC libgcc x86_64 assembly"),
             ]
         );
-        assert_eq!(
-            output_assembly_exceptions("gcc-runtime"),
-            vec![
-                ("glibc-x86-64", "upstream glibc sysdeps/x86_64 assembly"),
-                ("gcc-runtime", "upstream GCC libgcc x86_64 assembly"),
-            ]
-        );
+        for stem in ["gcc-runtime", "zlib-x86-64"] {
+            assert_eq!(
+                output_assembly_exceptions(stem),
+                vec![
+                    ("glibc-x86-64", "upstream glibc sysdeps/x86_64 assembly"),
+                    ("gcc-runtime", "upstream GCC libgcc x86_64 assembly"),
+                ],
+                "{stem}"
+            );
+        }
     }
 
     #[test]
-    fn oversized_line_attribution_boundaries_are_exactly_named() {
+    fn oversized_line_attribution_boundaries_are_an_explicit_roster() {
         assert_eq!(DEFAULT_PROFILE_LINE_SECTION_BYTES, 32 * 1024 * 1024);
         assert_eq!(DEBUG_COMPANION_POLICY, "line-tables-v2");
-        assert_eq!(LINE_ATTRIBUTION_EXCEPTIONS.len(), 1);
-        let rust = line_attribution_exception("rust-toolchain").unwrap();
-        assert_eq!(
-            rust.runtime_relative_path,
-            "lib/librustc_driver-277b25caa34f5853.so"
-        );
-        assert_eq!(rust.max_line_section_bytes, 128 * 1024 * 1024);
-        assert_eq!(rust.max_companion_bytes, 192 * 1024 * 1024);
-        assert!(rust.require_complete_line_strings);
-        assert_eq!(
-            rust.reason,
-            "Rust 1.96.0 librustc_driver's line program is beyond td-profiler's bounded per-object reader"
-        );
+        assert!(LINE_ATTRIBUTION_EXCEPTIONS.is_empty());
+        assert_eq!(line_attribution_exception("rust-toolchain"), None);
         assert_eq!(line_attribution_exception("td-profiler"), None);
         assert_eq!(debug_companion_policy("td-profiler"), "line-tables-v2");
         let mut recipes = std::collections::BTreeSet::new();

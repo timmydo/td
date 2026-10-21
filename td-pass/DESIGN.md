@@ -480,7 +480,7 @@ td-secret's physical primary/backup and fresh-machine recovery evidence.
 ### Implemented artifact
 
 `recipes/src/recipes/td-pass.rs` builds td-pass as a target Cargo recipe
-with the source-built stage2 toolchain, from the checkout's own trees:
+with td's Rust toolchain, from the checkout's own trees:
 td-pass, and the sibling trees its closure mounts by path (td-secret,
 td-ui, td-compositor, td-authd, td-busd, td-firstboot and engine). Its
 lock names only td-pass, td-secret and td-ui, so the closure is std. The

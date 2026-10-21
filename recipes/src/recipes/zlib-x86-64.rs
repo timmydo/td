@@ -1,101 +1,149 @@
-use crate::ladder::{mesboot0_inputs, mesboot0_path, unpack_into, SH};
-use crate::types::{Recipe, Step};
+use crate::ladder::{
+    build_root_glibc_cc, unpack_into, BUILD_ROOT_GLIBC as GLIBC, BUILD_ROOT_PATH as PATH,
+    BUILD_ROOT_SH as SH,
+};
+use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
-// zlib 1.3.1 for x86_64 (#410): the shared libz.so.1 needed by the downloaded
-// Rust stage0 snapshot's prebuilt LLVM. The /td/store x86_64 toolchain (glibc
-// 2.41 + cross gcc 14.3.0) otherwise ships no zlib. `rust-stage0` co-locates this
-// source-built soname in its explicit bootstrap trust-root closure; the shipped
-// source-built stage2 LLVM is configured without zlib.
-//
-// This is the recipe port of the shell `build_zlib_x86_64` that lived in the gate-416
-// script (tests/rust-x86_64-runtime-store-native.sh), retired with #410: CC is a wrapper around the cross gcc
-// (`{in:gcc-x86-64-stage2}/…/x86_64-pc-linux-gnu-gcc`) that adds the x86_64 glibc 2.41
-// headers/libs (`-isystem`/`-B`/`-L`); the glibc-x86-64 output's include already carries the
-// kernel UAPI headers glibc's bits/local_lim.h needs, so no separate kernel-header overlay is
-// required (the shell path needed one only because it built against the header-less FETCHED
-// glibc closure). AR/RANLIB are the cross binutils. Produces
-// {out}/stage/td/store/zlib-1.3.1/lib/libz.so.1.3.1 + the libz.so.1 soname link — exactly the
-// soname `rust-stage0`'s transform co-locates. native_inputs: gcc-x86-64-stage2 (the cross
-// CC + its libgcc), glibc-x86-64 (headers+libs), binutils-x86-64 (ar/ranlib + the as/ld the
-// cross gcc's baked --with-as/--with-ld resolve to).
-// Host-free build tools: mesboot0 + make-mesboot. re #469.
+// zlib 1.3.1's shared libz.so.1 for x86_64: the one zlib the upstream Rust
+// toolchain's libLLVM and rust-lld need at run time (rust-toolchain links it
+// into its lib/). Built in the Debian build root: Debian's gcc compiles
+// zlib's sources against a sysroot of td glibc under the shipped target
+// profile (`build_root_glibc_cc`), and Debian's ld links the library from td
+// glibc's and gcc-runtime's start files alone (`-nostdlib -z defs`, every
+// object named), so no file of the root's libc or libgcc reaches it. The
+// probe links a program against the result the same way and round-trips
+// data through it.
+const RUNTIME: &str = "{in:gcc-runtime}/lib";
+
+const PROBE: &str = "#include <stdio.h>\n\
+                     #include <string.h>\n\
+                     #include <zlib.h>\n\
+                     \n\
+                     int main(void)\n\
+                     {\n\
+                     \x20 const char in[] = \"td zlib td zlib td zlib td zlib\";\n\
+                     \x20 unsigned char packed[128], out[128];\n\
+                     \x20 uLongf plen = sizeof packed, olen = sizeof out;\n\
+                     \x20 if (compress(packed, &plen, (const Bytef *)in, sizeof in) != Z_OK) return 1;\n\
+                     \x20 if (uncompress(out, &olen, packed, plen) != Z_OK) return 2;\n\
+                     \x20 if (olen != sizeof in || memcmp(in, out, olen) != 0) return 3;\n\
+                     \x20 printf(\"%s %d\\n\", zlibVersion(), plen < sizeof in);\n\
+                     \x20 return 0;\n\
+                     }\n";
+
 pub fn recipe() -> Recipe {
-    let xgcc =
-        "{in:gcc-x86-64-stage2}/stage/td/store/gcc-14.3.0-x86_64/bin/x86_64-pc-linux-gnu-gcc";
-    let xglibc = "{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64";
-    let xar = "{in:binutils-x86-64}/bin/x86_64-pc-linux-gnu-ar";
-    let xranlib = "{in:binutils-x86-64}/bin/x86_64-pc-linux-gnu-ranlib";
-    let lib = "{out}/stage/td/store/zlib-1.3.1/lib";
     let mut steps = unpack_into("zlib-x86-64-source", "{src}");
-    // the cross-gcc wrapper: x86_64 glibc 2.41 headers/libs (crt*.o live in glibc's lib, so -B
-    // finds them). The cross gcc self-locates its own libgcc + baked --with-as/--with-ld.
+    steps.extend(build_root_glibc_cc());
+    // The library link: the objects zlib's Makefile passes, between td
+    // glibc's and gcc-runtime's start files, against td glibc's libc.
     steps.push(Step::WriteFile {
-        path: "{root}/wb/cc".into(),
+        path: "{root}/wb/ldshared".into(),
         content: format!(
-            "#!{SH}\nexec \"{xgcc}\" -isystem \"{xglibc}/include\" -B\"{xglibc}/lib\" -L\"{xglibc}/lib\" \"$@\"\n"
+            "#!{SH}\nset -e\nout=; objs=\n\
+             while [ $# -gt 0 ]; do case $1 in -o) out=$2; shift;; *.o|*.lo) objs=\"$objs $1\";; esac; shift; done\n\
+             [ -n \"$out\" ] && [ -n \"$objs\" ] || {{ echo 'ldshared: no output or objects' >&2; exit 1; }}\n\
+             exec /usr/bin/ld -nostdlib -shared -z defs -soname libz.so.1 \
+             --version-script {{src}}/zlib.map --build-id=sha1 --eh-frame-hdr -o \"$out\" \
+             {GLIBC}/lib/crti.o {RUNTIME}/crtbeginS.o $objs {GLIBC}/lib/libc.so.6 \
+             {GLIBC}/lib/libc_nonshared.a {RUNTIME}/crtendS.o {GLIBC}/lib/crtn.o\n"
         ),
         exec: true,
     });
-    // zlib's hand-written ./configure honours CC/AR/RANLIB from the env; --shared builds the
-    // SHAREDLIBV (libz.so.1.3.1). CHOST names the x86_64 target (AR/RANLIB overridden anyway).
+    steps.push(
+        Step::run("{src}", &[SH, "./configure", "--prefix=/zlib", "--shared"])
+            .env("PATH", PATH)
+            .env("CC", "{root}/wb/cc")
+            .env("CFLAGS", "-O2")
+            .env("LDSHARED", "{root}/wb/ldshared")
+            .env("SOURCE_DATE_EPOCH", "1"),
+    );
+    // Every configure probe passed: hidden visibility, no fallback defines.
     steps.push(
         Step::run(
             "{src}",
             &[
                 SH,
-                "./configure",
-                "--prefix=/td/store/zlib-1.3.1",
-                "--shared",
+                "-c",
+                "set -e; f=$(grep '^SFLAGS=' Makefile); \
+                 case $f in *-DHAVE_HIDDEN*) ;; *) echo \"configure lost hidden visibility: $f\" >&2; exit 1;; esac; \
+                 case $f in *-DNO_*|*-DHAS_*) echo \"configure fell back: $f\" >&2; exit 1;; esac",
             ],
         )
-        .env("PATH", &mesboot0_path())
-        .env("CC", "{root}/wb/cc")
-        .env("CHOST", "x86_64-pc-linux-gnu")
-        .env("AR", xar)
-        .env("RANLIB", xranlib)
-        .env("CONFIG_SHELL", SH)
-        .env("SHELL", SH),
+        .env("PATH", PATH),
     );
-    // build ONLY the shared lib target (the transform needs libz.so.1; matches the shell's
-    // explicit `make … libz.so.1.3.1`, avoiding the example/minigzip run-programs).
     steps.push(
-        Step::run(
-            "{src}",
-            &[
-                "{in:make-mesboot}/bin/make",
-                "-j{jobs}",
-                "libz.so.1.3.1",
-                &format!("SHELL={SH}"),
-                &format!("CONFIG_SHELL={SH}"),
-            ],
-        )
-        .env("PATH", &mesboot0_path())
-        .env("CC", "{root}/wb/cc")
-        .env("AR", xar)
-        .env("RANLIB", xranlib),
+        Step::run("{src}", &["make", "-j{jobs}", "libz.so.1.3.1"])
+            .env("PATH", PATH)
+            .env("SOURCE_DATE_EPOCH", "1"),
     );
-    // stage libz.so.1.3.1 + the libz.so.1 soname link into the /td/store prefix tree.
-    steps.push(Step::MkDir { path: lib.into() });
+    steps.push(Step::MkDir {
+        path: "{out}/lib".into(),
+    });
+    steps.push(Step::MkDir {
+        path: "{out}/include".into(),
+    });
     steps.push(Step::CopyFiles {
         files: vec!["{src}/libz.so.1.3.1".into()],
-        dest: lib.into(),
+        dest: "{out}/lib".into(),
     });
-    steps.push(Step::Symlink {
-        target: "libz.so.1.3.1".into(),
-        link: format!("{lib}/libz.so.1"),
+    steps.push(Step::CopyFiles {
+        files: vec!["{src}/zlib.h".into(), "{src}/zconf.h".into()],
+        dest: "{out}/include".into(),
     });
-    steps.push(Step::Require {
-        paths: vec![format!("{lib}/libz.so.1.3.1"), format!("{lib}/libz.so.1")],
-        exec: false,
-    });
+    for link in ["libz.so.1", "libz.so"] {
+        steps.push(Step::Symlink {
+            target: "libz.so.1.3.1".into(),
+            link: format!("{{out}}/lib/{link}"),
+        });
+    }
+    steps.extend(probe());
+    steps.push(Step::split_debug_tree("{out}", "/usr/bin/objcopy"));
+
     Recipe::mesboot("zlib-x86-64", "1.3.1")
         .source_input("zlib-x86-64-source")
-        .native_inputs(&[
-            "gcc-x86-64-stage2",
-            "glibc-x86-64",
-            "binutils-x86-64",
-            "make-mesboot",
-        ])
-        .inputs_owned(mesboot0_inputs(&[]))
+        .build_root()
+        .native_inputs(&["glibc-x86-64", "gcc-runtime"])
         .steps(steps)
+        .checks(vec![RecipeCheck::new(
+            r#"
+echo ">> recipe-check zlib-x86-64: build zlib 1.3.1 in the Debian build root against td glibc and gcc-runtime alone"
+: "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
+exec "$TD_RECIPE_EVAL" check-run zlib-x86-64 1
+"#,
+        )
+        .with_runner(CheckRunner::BuildOnly)])
+}
+
+/// Link a program against the built library from td glibc and gcc-runtime
+/// alone, run it, and check the library's shape.
+fn probe() -> Vec<Step> {
+    let build = format!(
+        "set -e; g={GLIBC}/lib; r={RUNTIME}; \
+         '{{root}}/wb/cc' -c -O2 -fPIE -I'{{out}}/include' -o probe.o probe.c; \
+         ld -nostdlib --build-id=sha1 --eh-frame-hdr -pie -dynamic-linker $g/ld-linux-x86-64.so.2 \
+         -rpath $g:'{{out}}/lib' -o probe $g/Scrt1.o $g/crti.o $r/crtbeginS.o probe.o \
+         '{{out}}/lib/libz.so.1' $g/libc.so.6 $g/libc_nonshared.a $g/ld-linux-x86-64.so.2 \
+         $r/crtendS.o $g/crtn.o"
+    );
+    let verify = "set -e; out=$(./probe); \
+                  [ \"$out\" = '1.3.1 1' ] || { echo \"probe: $out\" >&2; exit 1; }; \
+                  d=$(readelf -d '{out}/lib/libz.so.1.3.1'); \
+                  n=$(printf '%s\\n' \"$d\" | grep NEEDED | sed 's/.*\\[\\(.*\\)\\]/\\1/' | tr '\\n' ' '); \
+                  [ \"$n\" = 'libc.so.6 ' ] || { echo \"libz.so.1 needs: $n\" >&2; exit 1; }; \
+                  printf '%s\\n' \"$d\" | grep -q 'SONAME.*\\[libz.so.1\\]' || { echo 'libz soname is not libz.so.1' >&2; exit 1; }; \
+                  case $d in *RPATH*|*RUNPATH*) echo 'libz.so.1 has a search path' >&2; exit 1;; esac; \
+                  id=$(readelf -n '{out}/lib/libz.so.1.3.1' | sed -n 's/.*Build ID: //p'); \
+                  [ ${#id} = 40 ] || { echo \"libz.so.1 build ID is not SHA-1: $id\" >&2; exit 1; }";
+    vec![
+        Step::MkDir {
+            path: "{root}/probe".into(),
+        },
+        Step::WriteFile {
+            path: "{root}/probe/probe.c".into(),
+            content: PROBE.into(),
+            exec: false,
+        },
+        Step::run("{root}/probe", &[SH, "-c", &build]).env("PATH", PATH),
+        Step::run("{root}/probe", &[SH, "-c", verify]).env("PATH", PATH),
+    ]
 }

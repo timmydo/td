@@ -1082,7 +1082,7 @@ td-compositor/assets/unifont-OFL-1.1.txt
 ```
 
 The target recipe `td-editor` (`recipes/src/recipes/td-editor.rs`) builds
-the crate with cargo on the source-built toolchain, staging the
+the crate with cargo on td's Rust toolchain, staging the
 `td-civil`, `td-ui` and `td-compositor` trees beside it so the calendar
 resolves and those five files arrive as the sources above name them,
 links the binary fully static and splits its debug companion. The system

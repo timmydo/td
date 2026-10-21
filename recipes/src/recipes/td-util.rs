@@ -130,10 +130,8 @@ pub fn recipe() -> Recipe {
     build("td-util", "rust-toolchain")
 }
 
-/// td-util compiled by `rust`'s rustc into the output `name`. td-util-boot is
-/// the same sources built by the Rust snapshot, for the builds that run
-/// before rust-toolchain exists; it is staged under `{src}/<name>` so the
-/// ladder's tool-provider roster names each recipe's bodies apart.
+/// td-util compiled by `rust`'s rustc into the output `name`, staged under
+/// `{src}/<name>` so the ladder's tool-provider roster names its bodies.
 pub fn build(name: &str, rust: &str) -> Recipe {
     // The self-hosted toolchains install under a nested stage/td/store/<pkg>
     // DESTDIR (re the /td/store prefix); rust-toolchain installs flat.

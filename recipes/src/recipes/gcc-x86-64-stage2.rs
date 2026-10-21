@@ -7,8 +7,8 @@ use crate::types::{Recipe, Step};
 
 // GCC 14.3.0 cross STAGE2 (#378 slice 4, guix's cross gcc final): the FULL cross
 // compiler — c,c++ --enable-shared --enable-threads=posix against the x86_64
-// glibc 2.41 sysroot → x86_64-pc-linux-gnu-{gcc,g++} + libgcc_s.so.1 (rustc needs
-// it dynamically) + libstdc++.so.6. Built STATIC by the i686 gcc 14.3.0 (like
+// glibc 2.41 sysroot → x86_64-pc-linux-gnu-{gcc,g++} + libgcc_s.so.1 +
+// libstdc++.so.6. Built STATIC by the i686 gcc 14.3.0 (like
 // stage1; NOT incremental on stage1 — a full build against the now-complete
 // sysroot). The sysroot is assembled from the x86_64 kernel UAPI headers +
 // glibc-x86-64's headers/libs. gmp/mpfr/mpc in-tree. --with-as/--with-ld at the

@@ -6685,11 +6685,11 @@ pub(crate) struct PayloadClosure {
     /// Distinct audited SEED INPUTS the closure declares — the pinned sources,
     /// stage0 artifacts, seed patches and local sources the planning pass
     /// classified. Reported because the count above it must not be read as
-    /// "nothing prebuilt is in here": `rust-stage0` transforms an upstream
-    /// binary snapshot and is a member of this very closure, and stage0-posix
-    /// is a seed. Both are td's declared bootstrap trust roots, which
-    /// AGENTS.md's claim names as its exception; §B.8's mark is about
-    /// APPLICATION payloads and says nothing about them.
+    /// "nothing prebuilt is in here": `rust-toolchain` is the upstream Rust
+    /// release and a member of this very closure, and stage0-posix is a seed.
+    /// Both are td's declared trust roots, which AGENTS.md's claim names as
+    /// its exception; §B.8's mark is about APPLICATION payloads and says
+    /// nothing about them.
     pub(crate) seeds: usize,
     /// The members DERIVED from a payload — excluded from the claim, sorted.
     pub(crate) foreign_members: Vec<String>,
@@ -6702,6 +6702,9 @@ pub(crate) struct PayloadClosure {
     /// root"), sorted: compiled from source by tools td did not build, so the
     /// claim names the root as a build-tool trust root for each of them.
     pub(crate) build_root_members: Vec<String>,
+    /// Members that are the upstream Rust release (`BuildSystem::RustDist`),
+    /// sorted: prebuilt, so the claim names them as a trust root.
+    pub(crate) upstream_rust_members: Vec<String>,
 }
 
 impl PayloadClosure {
@@ -6731,16 +6734,22 @@ impl PayloadClosure {
         for key in &self.pins {
             out.push_str(&format!("payload\tpin\t{key}\n"));
         }
-        out.push_str(&self.build_root_lines());
+        out.push_str(&self.trust_root_lines());
         out
     }
 
-    /// One `build-root	debian	<stem>` line per member built in the root.
-    pub(crate) fn build_root_lines(&self) -> String {
-        self.build_root_members
+    /// One `build-root	debian	<stem>` line per member built in the root,
+    /// then one `upstream-rust	dist	<stem>` line per prebuilt Rust member.
+    pub(crate) fn trust_root_lines(&self) -> String {
+        let root = self
+            .build_root_members
             .iter()
-            .map(|stem| format!("build-root\tdebian\t{stem}\n"))
-            .collect()
+            .map(|stem| format!("build-root\tdebian\t{stem}\n"));
+        let rust = self
+            .upstream_rust_members
+            .iter()
+            .map(|stem| format!("upstream-rust\tdist\t{stem}\n"));
+        root.chain(rust).collect()
     }
 }
 
@@ -6905,7 +6914,7 @@ fn application_store_closure_report(
         let disposition = if retained { "retained" } else { "build-only" };
         out.push_str(&format!("payload\tpin\t{pin}\t{path}\t{disposition}\n"));
     }
-    out.push_str(&payloads.build_root_lines());
+    out.push_str(&payloads.trust_root_lines());
     Ok(out)
 }
 
@@ -6990,12 +6999,19 @@ fn contains_payloads(
     let mut foreign_members = Vec::new();
     let mut pins = Vec::new();
     let mut build_root_members = Vec::new();
+    let mut upstream_rust_members = Vec::new();
     for node in nodes {
         if node.recipe.is_foreign() {
             foreign_members.push(node.stem.clone());
         }
         if node.recipe.build_root {
             build_root_members.push(node.stem.clone());
+        }
+        if matches!(
+            node.recipe.build_system,
+            td_recipe::types::BuildSystem::RustDist
+        ) {
+            upstream_rust_members.push(node.stem.clone());
         }
         // A marked pin is reported beside the output built from it rather than
         // instead of it: the archive's bytes are a store path of their own, so
@@ -7017,6 +7033,8 @@ fn contains_payloads(
     pins.dedup();
     build_root_members.sort();
     build_root_members.dedup();
+    upstream_rust_members.sort();
+    upstream_rust_members.dedup();
     PayloadClosure {
         // The DISTINCT stems rather than `nodes.len()`: a repeated node would
         // otherwise inflate the number the claim divides while the sets it is
@@ -7027,6 +7045,7 @@ fn contains_payloads(
         foreign_members,
         pins,
         build_root_members,
+        upstream_rust_members,
     }
 }
 
@@ -9168,8 +9187,9 @@ mod tests {
         );
     }
 
-    /// A member built in the Debian build root stays unmarked, and the answer
-    /// names the root beside it; the kernel's real closure carries the line.
+    /// A member built in the Debian build root, or the upstream Rust release,
+    /// stays unmarked, and the answer names its trust root beside it; the
+    /// kernel's real closure carries the build-root line.
     #[test]
     fn the_closure_query_names_the_build_root_beside_its_members() {
         let node = |stem: &str, recipe: Recipe| RecipeNode {
@@ -9178,13 +9198,15 @@ mod tests {
         };
         let nodes = vec![
             node("kernel", Recipe::mesboot("kernel", "1").build_root()),
+            node("rust", Recipe::rust_dist("rust", "1")),
             node("image", Recipe::gnu("image", "1")),
         ];
         let answer = contains_payloads(&nodes, 0, |_| false);
-        assert_eq!(answer.unmarked(), 2);
+        assert_eq!(answer.unmarked(), 3);
         assert_eq!(
             answer.report(),
-            "members\t2\nunmarked\t2\naudited-seeds\t0\nbuild-root\tdebian\tkernel\n"
+            "members\t3\nunmarked\t3\naudited-seeds\t0\nbuild-root\tdebian\tkernel\n\
+             upstream-rust\tdist\trust\n"
         );
         let real = payload_closure(&["linux-x86-64-test"]).unwrap().report();
         assert!(
@@ -9591,8 +9613,18 @@ mod tests {
                 "freedesktop-platform-25-08-source".to_string(),
             ]
         );
-        // The kernel is the image's one member built in the Debian build root.
-        assert_eq!(answer.build_root_members, ["linux-x86-64".to_string()]);
+        // The members built in the Debian build root: the kernel, the
+        // upstream toolchain's runtime, and cryptsetup's json-c.
+        assert_eq!(
+            answer.build_root_members,
+            [
+                "gcc-runtime",
+                "json-c-x86-64",
+                "linux-x86-64",
+                "zlib-x86-64"
+            ]
+        );
+        assert_eq!(answer.upstream_rust_members, ["rust-toolchain"]);
     }
 
     /// A fake `cargo` at `path`: `body` runs with the real cargo's argv, so a test

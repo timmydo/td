@@ -625,8 +625,8 @@ pub fn debug_line_validator_regression_steps() -> Vec<Step> {
     ]
 }
 
-/// The shell beyond rust-toolchain: td-sh, built by direct rustc from the
-/// stage2 toolchain, so no recipe that uses it can be on its own input path.
+/// The shell beyond rust-toolchain: td-sh, built by direct rustc from that
+/// toolchain, so no recipe that uses it can be on its own input path.
 pub const POST_RUST_SH: &str = "{in:td-sh}/bin/td-sh";
 
 /// td-sh runs `&` on a thread, so its `$!` names that JOB, not a process
@@ -712,6 +712,77 @@ pub const USERLAND_MARKER: &str = "TD-USERLAND-OK";
 /// build in it (`Recipe::build_root`).
 pub const BUILD_ROOT_SH: &str = "/usr/bin/bash";
 pub const BUILD_ROOT_PATH: &str = "/usr/bin";
+
+/// td glibc's staged tree, which build-root C recipes compile against.
+pub const BUILD_ROOT_GLIBC: &str = "{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64";
+
+/// Steps giving a build-root recipe `{root}/wb/cc`: Debian's gcc against a
+/// sysroot copy of td glibc, under the shipped target profile after the
+/// caller's flags. `-B` and `-L` put the sysroot ahead of Debian's own
+/// start files and libc, so configure probes link and see td glibc; the
+/// last step proves the start files, `libc.so` and every include directory
+/// resolve there (gcc's freestanding headers excepted). A probe's libgcc
+/// is still Debian's: probe programs are build-only.
+pub fn build_root_glibc_cc() -> Vec<Step> {
+    vec![
+        Step::CopyTree {
+            from: format!("{BUILD_ROOT_GLIBC}/include"),
+            dest: "{root}/sysroot/include".into(),
+        },
+        Step::CopyTree {
+            from: format!("{BUILD_ROOT_GLIBC}/lib"),
+            dest: "{root}/sysroot/lib".into(),
+        },
+        // glibc's linker scripts must name its libraries by bare name, which
+        // the link resolves through `-L`, or every probe would fail and
+        // silently change the configuration.
+        Step::run(
+            "{root}/sysroot/lib",
+            &[
+                BUILD_ROOT_SH,
+                "-c",
+                "set -e; for f in libc.so libm.so; do \
+                 grep -q 'GNU ld script' \"$f\"; \
+                 sed -i 's,/td/store/glibc-2.41-x86_64/lib/,,g' \"$f\"; \
+                 if grep -q /td/store/ \"$f\"; then echo \"$f still names a store path\" >&2; \
+                 exit 1; fi; done",
+            ],
+        )
+        .env("PATH", BUILD_ROOT_PATH),
+        Step::MkDir {
+            path: "{root}/wb".into(),
+        },
+        Step::WriteFile {
+            path: "{root}/wb/cc".into(),
+            content: format!(
+                "#!{BUILD_ROOT_SH}\nexec /usr/bin/gcc --sysroot={{root}}/sysroot \
+                 -isystem {{root}}/sysroot/include -B{{root}}/sysroot/lib/ -L{{root}}/sysroot/lib \
+                 \"$@\" -fno-omit-frame-pointer -g1 \
+                 -ffile-prefix-map={{root}}=/td-build-root -ffile-prefix-map={{src}}=/td-build\n"
+            ),
+            exec: true,
+        },
+        Step::run(
+            "{root}",
+            &[
+                BUILD_ROOT_SH,
+                "-c",
+                "set -e; cc='{root}/wb/cc'; \
+                 for f in crt1.o Scrt1.o crti.o crtn.o libc.so libc.so.6; do \
+                 case $(realpath -m \"$(\"$cc\" -print-file-name=$f)\") in \
+                 '{root}/sysroot/lib/'*) ;; \
+                 *) echo \"$f resolves outside the sysroot\" >&2; exit 1;; esac; done; \
+                 inc=$(\"$cc\" -E -v -x c /dev/null 2>&1 >/dev/null | \
+                 sed -n '/^#include <...> search starts here:$/,/^End of search list.$/p' | sed '1d;$d'); \
+                 [ -n \"$inc\" ] || { echo 'no include search dirs' >&2; exit 1; }; \
+                 for d in $inc; do case $(realpath -m \"$d\") in \
+                 '{root}/sysroot/'*|/usr/lib/gcc/x86_64-linux-gnu/*) ;; \
+                 *) echo \"include dir outside the sysroot: $d\" >&2; exit 1;; esac; done",
+            ],
+        )
+        .env("PATH", BUILD_ROOT_PATH),
+    ]
+}
 
 /// The line the bootable-kernel rung's `/init` prints on ttyS0 AFTER it mounts the
 /// attached virtio-blk disk as READ-ONLY erofs and reads `EROFS_PROBE_SENTINEL`
@@ -1869,9 +1940,9 @@ mod tests {
         "gcc-x86-64-self",
         "binutils-x86-64-self",
         "glibc-x86-64",
-        // Static CMake is already built with the final native GCC and is the
-        // reviewed configure-language boundary for later C/C++ build tools.
-        "cmake-x86-64",
+        // The upstream toolchain's runtime, built in the Debian build root.
+        "gcc-runtime",
+        "zlib-x86-64",
     ];
     // These independent target artifacts and checks deliberately run before
     // self-hosting but are not ancestors of rust-toolchain. New recipes default
@@ -1884,13 +1955,16 @@ mod tests {
         "hello",
         "hello-test",
         "make-test",
+        // GNU Make built by the native GCC: the driver that builds
+        // make-x86-64-self and gawk-x86-64-self, and no longer an ancestor
+        // of any boundary output.
+        "make-x86-64",
         "sed-mesboot",
     ];
     const SELF_HOSTED_PHASE_MARKERS: &[&str] =
         &["rust-toolchain", "gcc-x86-64-self", "binutils-x86-64-self"];
     const POST_BOOTSTRAP_PROTECTED_INPUT_EXCEPTIONS: &[(&str, &str)] = &[
         // Identity/codegen audits deliberately look back across the boundary.
-        ("rust-userland-auto-test", "rust-stage0"),
         ("gcc-x86-64-self-test", "gcc-x86-64-native"),
         ("gcc-x86-64-self-test", "binutils-x86-64-native"),
         // Rebuild GNU Make once with the final compiler. The preceding Make is
@@ -2305,10 +2379,6 @@ mod tests {
         ("td-util", "find.rs", &["find"]),
         ("td-util", "main.rs", &["find", "xargs"]),
         ("td-util", "xargs.rs", &["xargs"]),
-        // The same bodies, compiled by the Rust snapshot for the pre-Rust builds.
-        ("td-util-boot", "find.rs", &["find"]),
-        ("td-util-boot", "main.rs", &["find", "xargs"]),
-        ("td-util-boot", "xargs.rs", &["xargs"]),
     ];
 
     /// Whether this step writes a body `stem` provides `cmd` from.
@@ -2472,14 +2542,16 @@ mod tests {
     fn bootstrap_partition(
         recipes: &[(&'static str, Recipe)],
     ) -> (HashSet<String>, HashSet<String>) {
+        // The bootstrap is everything the boundary outputs are built from.
         let mut bootstrap_recipes = HashSet::new();
-        collect_recipe_closure(recipes, "rust-toolchain", &mut bootstrap_recipes);
+        for &boundary_output in POST_BOOTSTRAP_BOUNDARY_OUTPUTS {
+            collect_recipe_closure(recipes, boundary_output, &mut bootstrap_recipes);
+        }
         let mut bootstrap_interior = bootstrap_recipes.clone();
         for &boundary_output in POST_BOOTSTRAP_BOUNDARY_OUTPUTS {
             assert!(
                 bootstrap_interior.remove(boundary_output),
-                "post-bootstrap boundary output is absent from rust-toolchain closure: \
-                 {boundary_output}"
+                "post-bootstrap boundary output is not a catalog recipe: {boundary_output}"
             );
         }
         (bootstrap_recipes, bootstrap_interior)
@@ -2656,6 +2728,11 @@ mod tests {
                         continue;
                     }
                 }
+                // A build-root recipe's sandbox `/` is the pinned root, whose
+                // shell is its declared interpreter.
+                if recipe.build_root && shebang == format!("#!{}", super::BUILD_ROOT_SH) {
+                    continue;
+                }
                 let guest = (stem.to_string(), path.clone());
                 if shebang == "#!/bin/sh" && expected_guest_shebangs.contains(&guest) {
                     seen_guest_shebangs.insert(guest);
@@ -2745,76 +2822,6 @@ mod tests {
                     "a same-prefix linux-x86-64 path must not fit the exception"
                 );
             }
-        }
-    }
-
-    fn stage0_command_is_identity_only(command: &str) -> bool {
-        let stage0_token = "{in:rust-stage0}";
-        let identity_read = "stage0='{in:rust-stage0}'; stage0_base=${stage0##*/};";
-        let identity_scan = "'{in:td-txt}/bin/td-txt' grep -a -Fq -- \"$stage0_base\" ";
-        if !command.contains(identity_read) || !command.contains(identity_scan) {
-            return false;
-        }
-        let residue = command
-            .replacen(identity_read, "", 1)
-            .replacen(identity_scan, "", 1);
-        !residue.contains(stage0_token)
-            && !residue.contains("$stage0")
-            && !residue.contains("${stage0")
-    }
-
-    #[test]
-    fn rust_stage0_boundary_exception_is_identity_only() {
-        let recipes = catalog::all();
-        let recipe = recipes
-            .iter()
-            .find(|(stem, _)| *stem == "rust-userland-auto-test")
-            .map(|(_, recipe)| recipe);
-        assert!(
-            recipe.is_some(),
-            "rust-userland-auto-test must remain in the catalog"
-        );
-        let Some(recipe) = recipe else {
-            return;
-        };
-        let stage0_token = "{in:rust-stage0}";
-        assert_eq!(
-            recipe
-                .to_json()
-                .to_canonical()
-                .matches(stage0_token)
-                .count(),
-            4,
-            "the boundary probe may name rust-stage0 once per tested binary (ripgrep, fd, td-news, td-mail)"
-        );
-
-        let commands: Vec<&str> = recipe
-            .steps
-            .iter()
-            .flatten()
-            .filter_map(|step| match step {
-                Step::Run { argv, .. } => argv
-                    .iter()
-                    .find(|arg| arg.contains(stage0_token))
-                    .map(String::as_str),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            commands.len(),
-            4,
-            "each tested binary must keep one rust-stage0 identity read"
-        );
-        for command in commands {
-            assert!(
-                stage0_command_is_identity_only(command),
-                "the boundary probe may scan for the basename but must not use rust-stage0"
-            );
-            let bypass = format!("{command}; \"$stage0_base/bin/rustc\" --version");
-            assert!(
-                !stage0_command_is_identity_only(&bypass),
-                "executing a path reconstructed from stage0_base must be rejected"
-            );
         }
     }
 

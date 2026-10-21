@@ -2498,7 +2498,7 @@ all-target Clippy.
 ## Packaging
 
 The target recipe `td-photo` (`recipes/src/recipes/td-photo.rs`) builds
-the crate with cargo on the source-built toolchain, staging the
+the crate with cargo on td's Rust toolchain, staging the
 `td-civil`, `td-fs`, `td-jpeg`, `td-ui`, `td-compositor` and
 `td-test-compositor` trees beside it so the calendar and the decoder
 resolve, the toolkit's `#[path]` mounts and embedded notices resolve as

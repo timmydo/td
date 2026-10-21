@@ -77,16 +77,6 @@ const PINS: &[PinDef] = &[
         file: "claude-2.1.260-linux-x64",
     },
     PinDef {
-        key: "cmake-x86-64-source",
-        aliases: &[],
-        // CMake is the one explicitly approved new build-only dependency for the
-        // Rust bridge (PR #533). LLVM 22 requires CMake >= 3.20; the maintained
-        // 3.31 line is new enough without adopting a moving latest release.
-        url: "https://cmake.org/files/v3.31/cmake-3.31.12.tar.gz",
-        sha256: "5f3fd5a54dfa65602bdbed64f981a72673cc19f2d304cc2955cf0dfa0cfd8272",
-        file: "cmake-3.31.12.tar.gz",
-    },
-    PinDef {
         key: "coreutils-mesboot0-source",
         aliases: &[],
         // GNU coreutils 5.0 — the tcc-era coreutils provider (re #469). The exact
@@ -554,35 +544,34 @@ const PINS: &[PinDef] = &[
         file: "ripgrep-14.1.1.crate",
     },
     PinDef {
-        key: "rust-source",
+        key: "rust-rustc-dist",
         aliases: &[],
-        // The upstream source release is comprehensive: vendored Cargo sources,
-        // in-tree Cargo, and llvm-project are all inside this fixed-output input.
-        url: "https://static.rust-lang.org/dist/rustc-1.96.0-src.tar.xz",
-        sha256: "b99ce16cdf0ecfc761b585ac84d131b46733465a02f8ecd0ff2de9713c62ee09",
-        file: "rustc-1.96.0-src.tar.xz",
+        // The upstream Rust 1.96.0 release (channel-rust-1.96.0.toml, dated
+        // 2026-05-28), retargeted onto td's runtime by `rust-toolchain`.
+        url: "https://static.rust-lang.org/dist/2026-05-28/rustc-1.96.0-x86_64-unknown-linux-gnu.tar.xz",
+        sha256: "7d7fa1d0cfb0fab71a956bb78f41107202c17f30ab56c45288e869a37fd9633d",
+        file: "rustc-1.96.0-x86_64-unknown-linux-gnu.tar.xz",
     },
     PinDef {
-        key: "rust-stage0-rustc-source",
+        key: "rust-std-dist",
         aliases: &[],
-        // Exact bootstrap compiler selected by rustc 1.96.0's src/stage0.
-        url: "https://static.rust-lang.org/dist/2026-04-16/rustc-1.95.0-x86_64-unknown-linux-gnu.tar.xz",
-        sha256: "8426a3d170a5879f5682f5fbdd024a1779b3951e7baba685af2d6dc32a6dfc15",
-        file: "rustc-1.95.0-x86_64-unknown-linux-gnu.tar.xz",
+        url: "https://static.rust-lang.org/dist/2026-05-28/rust-std-1.96.0-x86_64-unknown-linux-gnu.tar.xz",
+        sha256: "c09c7c646248f14f473f5f7a029af15ee57c3a9f9bc93dfa72d9621938586b82",
+        file: "rust-std-1.96.0-x86_64-unknown-linux-gnu.tar.xz",
     },
     PinDef {
-        key: "rust-stage0-std-source",
+        key: "rust-cargo-dist",
         aliases: &[],
-        url: "https://static.rust-lang.org/dist/2026-04-16/rust-std-1.95.0-x86_64-unknown-linux-gnu.tar.xz",
-        sha256: "047ea7098803d3500fa1072e9cee5392697e21525559e4458128a2bf874aa382",
-        file: "rust-std-1.95.0-x86_64-unknown-linux-gnu.tar.xz",
+        url: "https://static.rust-lang.org/dist/2026-05-28/cargo-1.96.0-x86_64-unknown-linux-gnu.tar.xz",
+        sha256: "dee75c3c8f9f600ad75bc0c93249e767d3047845a4dd668327ce43ab039ba266",
+        file: "cargo-1.96.0-x86_64-unknown-linux-gnu.tar.xz",
     },
     PinDef {
-        key: "rust-stage0-cargo-source",
+        key: "rust-clippy-dist",
         aliases: &[],
-        url: "https://static.rust-lang.org/dist/2026-04-16/cargo-1.95.0-x86_64-unknown-linux-gnu.tar.xz",
-        sha256: "e74edd2cf7d0f1f1383b4f00eb90c843750bc489e2ccf7214e6476678a907425",
-        file: "cargo-1.95.0-x86_64-unknown-linux-gnu.tar.xz",
+        url: "https://static.rust-lang.org/dist/2026-05-28/clippy-1.96.0-x86_64-unknown-linux-gnu.tar.xz",
+        sha256: "9b0b89c67d5ce8195e1c8733587a63e326353fdda65f62455a64fa03e25659f2",
+        file: "clippy-1.96.0-x86_64-unknown-linux-gnu.tar.xz",
     },
     PinDef {
         key: "sed-mesboot-source",
@@ -804,8 +793,8 @@ mod tests {
         // Python-3.11.1 (the glibc-rung python3, re #469) + GCC 10.5.0 (the
         // compatibility bridge between gcc-mesboot 4.9.4 and GCC 14.3.0) +
         // the linux-x86-64 kernel source (separate from the 4.14 UAPI-header
-        // pin, re #529) + CMake 3.31.12 + Rust 1.96.0 source and
-        // its exact three-component Rust 1.95.0 bootstrap snapshot +
+        // pin, re #529) + the upstream Rust 1.96.0 rustc, rust-std, Cargo and
+        // Clippy release components +
         // coreutils-0.9.0, ripgrep 14.1.1, and fd 10.2.0 (the Rust userland
         // `.crate` sources) +
         // util-linux 2.42.2 (cryptsetup's minimal libuuid/libblkid build
@@ -823,8 +812,9 @@ mod tests {
         // gawk 5.4.1 is the build-only awk after rust-toolchain. BusyBox's pin
         // left with its last consumer, the kernel's bc, flex and elfutils
         // left when it moved into the Debian build root, and btrfs-progs left
-        // when td-btrfs replaced it.
-        assert_eq!(all().len(), 75);
+        // when td-btrfs replaced it. CMake and the Rust source and its
+        // bootstrap snapshot left with the source-built toolchain.
+        assert_eq!(all().len(), 74);
     }
 
     /// A roster keyed by NAME can name nothing, and this workstream has twice

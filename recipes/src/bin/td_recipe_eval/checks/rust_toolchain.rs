@@ -1,14 +1,11 @@
-use std::collections::HashMap;
-use std::fs::{self, File};
-use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::fs;
+use std::path::Path;
 use std::process::Command;
 
 use td_recipe::catalog;
 use td_recipe::types::CheckRunner;
 
 use crate::check_runner::{is_executable, RecipeCheckRunner, TD_STORE_DIR};
-use crate::sha256::Sha256;
 
 // The nested `stage/td/store/<pkg>` prefix each `-self`/glibc recipe output carries.
 // `td-builder`'s NATIVE_GCC_STAGE/toolchain_x86_64::GLIBC_X86_64_STAGE embed the
@@ -21,16 +18,35 @@ pub(super) const GLIBC_STAGE: &str = "stage/td/store/glibc-2.41-x86_64";
 /// order `CheckRunner::RustToolchain` declares them.
 const PROVED_USERLAND: &[&str] = &["ripgrep", "fd", "uutils"];
 
+/// The shipped executables the transform relinks onto td glibc's loader.
+const RELINKED: &[&str] = &[
+    "bin/rustc",
+    "bin/rustdoc",
+    "bin/cargo",
+    "bin/cargo-clippy",
+    "bin/clippy-driver",
+    "lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-lld",
+];
+
+/// Compiles a lint-free crate and one using `unwrap()` under
+/// `--deny clippy::unwrap_used`, read on stdin by the smoke below.
+const CLIPPY_PROBE: &str = include_str!("../../../probes/rust_clippy.rs");
+
 pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     runner.prepare_recipe_target("rust-toolchain")?;
     let build_out = runner.build_plan("rust-toolchain")?;
     let rust_tree = runner.ladder_out_from(&build_out, "rust-toolchain")?;
-    let stage0_tree = runner.ladder_out_from(&build_out, "rust-stage0")?;
-    let gcc_tree = runner.ladder_out_from(&build_out, "gcc-x86-64-self")?;
-    let binutils_tree = runner.ladder_out_from(&build_out, "binutils-x86-64-self")?;
     let glibc_tree = runner.ladder_out_from(&build_out, "glibc-x86-64")?;
-    // The proof's shell and text tools are the bootstrap root's userland, which
-    // the toolchain's own build ran on: nothing later exists before this check.
+    let runtime_tree = runner.ladder_out_from(&build_out, "gcc-runtime")?;
+    let zlib_tree = runner.ladder_out_from(&build_out, "zlib-x86-64")?;
+    // The toolchain's own closure holds no linker: the proofs link with the
+    // declared GCC and binutils the Rust recipes use.
+    runner.prepare_recipe_target("gcc-x86-64-self")?;
+    let gcc_out = runner.build_plan("gcc-x86-64-self")?;
+    let gcc_tree = runner.ladder_out_from(&gcc_out, "gcc-x86-64-self")?;
+    let binutils_tree = runner.ladder_out_from(&gcc_out, "binutils-x86-64-self")?;
+    // The proof's shell and text tools are the bootstrap root's userland:
+    // nothing later exists before this check.
     let sh = format!(
         "{}/sh",
         root_userland_bin(runner, &build_out, "bash-mesboot")?
@@ -41,11 +57,11 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         .collect::<Result<Vec<_>, _>>()?
         .join(":");
     println!(
-        "   [ladder] x86_64 Rust bridge via build-plan --auto: exact stage0 snapshot -> source-built rustc/std/Cargo/Clippy ({})",
+        "   [ladder] x86_64 upstream Rust 1.96.0 via build-plan --auto, retargeted onto td glibc/libgcc/zlib ({})",
         rust_tree.display()
     );
-    for binary in ["rustc", "rustdoc", "cargo", "cargo-clippy", "clippy-driver"] {
-        let path = rust_tree.join("bin").join(binary);
+    for binary in RELINKED {
+        let path = rust_tree.join(binary);
         if !is_executable(&path) {
             return Err(format!(
                 "{binary} missing from rust-toolchain output ({})",
@@ -53,9 +69,6 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
             ));
         }
     }
-
-    reject_stage0_artifacts(&stage0_tree, &rust_tree)?;
-    reject_shared_llvm(&rust_tree)?;
 
     let rust_base = path_basename(&rust_tree)?;
     let gcc_base = path_basename(&gcc_tree)?;
@@ -65,104 +78,92 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     let gcc_path = format!("{TD_STORE_DIR}/{gcc_base}/{GCC_STAGE}");
     let binutils_path = format!("{TD_STORE_DIR}/{binutils_base}/bin");
     let glibc_path = format!("{TD_STORE_DIR}/{glibc_base}/{GLIBC_STAGE}");
+    let runtime_path = format!("{TD_STORE_DIR}/{}/lib", path_basename(&runtime_tree)?);
+    let zlib_path = format!("{TD_STORE_DIR}/{}/lib", path_basename(&zlib_tree)?);
 
-    let rustc_version =
-        runner.store_ns_output(&[&format!("{rust_path}/bin/rustc"), "--version"], None)?;
-    if !rustc_version.starts_with("rustc 1.96.0") {
-        return Err(format!(
-            "rustc version did not match the pinned 1.96.0 release: {}",
-            rustc_version.trim()
-        ));
-    }
-    let cargo_version =
-        runner.store_ns_output(&[&format!("{rust_path}/bin/cargo"), "--version"], None)?;
-    if !cargo_version.starts_with("cargo 1.96.0") {
-        return Err(format!(
-            "Cargo version did not match the source-built 1.96.0 release: {}",
-            cargo_version.trim()
-        ));
+    for (binary, version) in [("rustc", "rustc 1.96.0"), ("cargo", "cargo 1.96.0")] {
+        let out =
+            runner.store_ns_output(&[&format!("{rust_path}/bin/{binary}"), "--version"], None)?;
+        if !out.starts_with(version) {
+            return Err(format!(
+                "{binary} version did not match the pinned 1.96.0 release: {}",
+                out.trim()
+            ));
+        }
     }
 
+    let relinked = RELINKED.join(" ");
+    // td's recipes name GCC and pass `-Clinker-features=-lld`: GNU ld. The
+    // default linker, `cc` from PATH, gets upstream's `-fuse-ld=lld`, which
+    // td's GCC (configured `--with-ld`) consumes and ignores: GNU ld too.
+    let link_args = format!(
+        "-C link-arg=-B{binutils_path}/ \
+         -C link-arg=-B{glibc_path}/lib \
+         -C link-arg=-L{glibc_path}/lib \
+         -C link-arg=-static-libgcc \
+         -C link-arg=-Wl,--dynamic-linker,{glibc_path}/lib/ld-linux-x86-64.so.2 \
+         -C link-arg=-Wl,-rpath,{glibc_path}/lib"
+    );
+    let link = format!("-C linker={gcc_path}/bin/gcc {link_args}");
     let smoke = format!(
         "set -eu\n\
          test ! -e /gnu/store\n\
          export PATH='{userland}'\n\
          readelf='{binutils_path}/readelf'\n\
-         test -f '{rust_path}/share/td/debug-size'\n\
-         grep -F -x 'scope=rust-toolchain' '{rust_path}/share/td/debug-size' >/dev/null\n\
-         marker='{rust_path}/lib/debug/.td-assembly-exception'\n\
-         test -f \"$marker\"\n\
-         grep -F -x 'exception.2.source=rust-toolchain' \"$marker\" >/dev/null\n\
-         line_marker='{rust_path}/lib/debug/.td-line-attribution-exception'\n\
-         driver_runtime='{rust_path}/lib/librustc_driver-277b25caa34f5853.so'\n\
-         driver_debug='{rust_path}/lib/debug/lib/librustc_driver-277b25caa34f5853.so.debug'\n\
-         test -f \"$line_marker\"\n\
-         test -f \"$driver_runtime\"\n\
-         test -f \"$driver_debug\"\n\
-         driver_runtime_id=\"$(\"$readelf\" -n \"$driver_runtime\" | grep 'Build ID:')\"\n\
-         driver_debug_id=\"$(\"$readelf\" -n \"$driver_debug\" | grep 'Build ID:')\"\n\
-         test -n \"$driver_runtime_id\" || exit 83\n\
-         test \"$driver_runtime_id\" = \"$driver_debug_id\" || exit 84\n\
-         rc=0; \"$readelf\" -S \"$driver_runtime\" | grep -F '.symtab' >/dev/null || rc=$?; [ \"$rc\" = 1 ] || exit 87\n\
-         \"$readelf\" -S \"$driver_debug\" | grep -F '.symtab' >/dev/null\n\
-         line_size=\"$(\"$readelf\" -SW \"$driver_debug\" | awk '{{ for (i = 1; i <= NF; i++) if ($i == \".debug_line\") {{ print $(i + 4); exit }} }}')\"\n\
-         printf '%s\\n' \"$line_size\" | grep -E '^0*6179aa9$' >/dev/null || exit 85\n\
-         rc=0; \"$readelf\" -SW \"$driver_debug\" | grep -E '[[:space:]](\\.debug_(info|abbrev|aranges|types|ranges|rnglists|frame|loc|loclists|str|str_offsets|addr|macro|macinfo|pubnames|pubtypes|gnu_pubnames|gnu_pubtypes|names|sup|cu_index|tu_index)|\\.gdb_index)([[:space:]]|$)' >/dev/null || rc=$?; [ \"$rc\" = 1 ] || exit 88\n\
-         test \"$(wc -c < \"$driver_debug\")\" = 165003688 || exit 86\n\
-         grep -F -x 'output=rust-toolchain' \"$line_marker\" >/dev/null\n\
-         grep -F -x 'runtime=lib/librustc_driver-277b25caa34f5853.so' \"$line_marker\" >/dev/null\n\
-         grep -F -x 'reader_ceiling_bytes=33554432' \"$line_marker\" >/dev/null\n\
-         grep -F -x 'admitted_ceiling_bytes=134217728' \"$line_marker\" >/dev/null\n\
-         grep -F -x 'companion_ceiling_bytes=201326592' \"$line_marker\" >/dev/null\n\
-         grep -F \"Rust 1.96.0 librustc_driver's line program\" \"$line_marker\" >/dev/null\n\
-         for name in rustc rustdoc cargo cargo-clippy clippy-driver; do\n\
-           runtime='{rust_path}/bin/'\"$name\"\n\
-           debug='{rust_path}/lib/debug/bin/'\"$name\"'.debug'\n\
-           test -f \"$debug\"\n\
-           test \"$(\"$readelf\" -n \"$runtime\" | grep 'Build ID:')\" = \"$(\"$readelf\" -n \"$debug\" | grep 'Build ID:')\"\n\
-           rc=0; \"$readelf\" -S \"$runtime\" | grep -F '.symtab' >/dev/null || rc=$?; [ \"$rc\" = 1 ] || exit 89\n\
-           \"$readelf\" -S \"$debug\" | grep -F '.symtab' >/dev/null\n\
-           \"$readelf\" -S \"$debug\" | grep -F '.debug_line' >/dev/null\n\
+         interp='{glibc_path}/lib/ld-linux-x86-64.so.2'\n\
+         cd '{rust_path}'\n\
+         for b in {relinked}; do\n\
+           \"$readelf\" -l \"$b\" | grep -F \"[Requesting program interpreter: $interp]\" >/dev/null || {{ echo \"$b is not on td glibc's loader\" >&2; exit 81; }}\n\
          done\n\
+         for pair in libc.so.6:'{glibc_path}/lib/libc.so.6' libgcc_s.so.1:'{runtime_path}/libgcc_s.so.1' libz.so.1:'{zlib_path}/libz.so.1'; do\n\
+           test \"$(readlink \"lib/${{pair%%:*}}\")\" = \"${{pair#*:}}\" || {{ echo \"lib/${{pair%%:*}} is not td's\" >&2; exit 82; }}\n\
+         done\n\
+         gccld=lib/rustlib/x86_64-unknown-linux-gnu/bin/gcc-ld\n\
+         test \"$(readlink \"$gccld/ld.lld\")\" = ../rust-lld || exit 83\n\
+         test \"$(ls \"$gccld\")\" = ld.lld || {{ echo 'gcc-ld holds more than ld.lld' >&2; exit 83; }}\n\
+         \"$gccld/ld.lld\" --version | grep -F LLD >/dev/null || exit 84\n\
+         test ! -e lib/debug || {{ echo 'the upstream toolchain carries debug companions' >&2; exit 85; }}\n\
+         test -f share/doc/rust/COPYRIGHT.html || {{ echo 'the upstream licence notices are missing' >&2; exit 85; }}\n\
+         rc=0; grep -r -a -F -l /gnu/store bin lib >/dev/null || rc=$?; [ \"$rc\" = 1 ] || exit 86\n\
+         cd /tmp\n\
          printf '%s\\n' 'fn main() {{ println!(\"42\"); }}' >/tmp/td-rust-smoke.rs\n\
-         '{rust_path}/bin/rustc' --edition=2021 /tmp/td-rust-smoke.rs \
-           -C linker={gcc_path}/bin/gcc \
-           -C link-arg=-B{binutils_path}/ \
-           -C link-arg=-B{glibc_path}/lib \
-           -C link-arg=-L{glibc_path}/lib \
-           -C link-arg=-static-libgcc \
-           -C link-arg=-Wl,--dynamic-linker,{glibc_path}/lib/ld-linux-x86-64.so.2 \
-           -C link-arg=-Wl,--enable-new-dtags \
-           -C link-arg=-Wl,-rpath,{glibc_path}/lib \
-           -o /tmp/td-rust-smoke\n\
-         test \"$(/tmp/td-rust-smoke)\" = 42\n\
+         '{rust_path}/bin/rustc' --edition=2021 /tmp/td-rust-smoke.rs -C linker-features=-lld {link} -o /tmp/td-rust-ld\n\
+         mkdir -p /tmp/td-default-cc\n\
+         printf '%s\\n' '#!{sh}' 'exec {gcc_path}/bin/gcc \"$@\"' >/tmp/td-default-cc/cc\n\
+         chmod +x /tmp/td-default-cc/cc\n\
+         PATH=\"/tmp/td-default-cc:$PATH\" '{rust_path}/bin/rustc' --edition=2021 /tmp/td-rust-smoke.rs {link_args} -o /tmp/td-rust-default\n\
+         test \"$(/tmp/td-rust-ld)\" = 42\n\
+         test \"$(/tmp/td-rust-default)\" = 42\n\
+         for p in ld default; do\n\
+           c=$(\"$readelf\" -p .comment \"/tmp/td-rust-$p\") || exit 89\n\
+           case $c in *'rustc version'*) ;; *) echo \"the $p link has no rustc comment\" >&2; exit 89;; esac\n\
+           case $c in *'Linker: LLD'*) echo \"the $p link used lld, not td's GNU ld\" >&2; exit 87;; esac\n\
+         done\n\
          mkdir -p /tmp/td-cargo-smoke/src /tmp/td-cargo-home /tmp/td-cargo-target\n\
          printf '%s\\n' '[package]' 'name = \"td-cargo-smoke\"' 'version = \"0.0.0\"' 'edition = \"2021\"' >/tmp/td-cargo-smoke/Cargo.toml\n\
          printf '%s\\n' 'fn main() {{ println!(\"43\"); }}' >/tmp/td-cargo-smoke/src/main.rs\n\
-         export PATH='{rust_path}/bin'\n\
-         RUSTC='{rust_path}/bin/rustc' \
-         CARGO_HOME=/tmp/td-cargo-home \
-         HOME=/tmp/td-cargo-home \
-         CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER='{gcc_path}/bin/gcc' \
-         RUSTFLAGS='-C link-arg=-B{binutils_path}/ -C link-arg=-B{glibc_path}/lib -C link-arg=-L{glibc_path}/lib -C link-arg=-static-libgcc -C link-arg=-Wl,--dynamic-linker,{glibc_path}/lib/ld-linux-x86-64.so.2 -C link-arg=-Wl,--enable-new-dtags -C link-arg=-Wl,-rpath,{glibc_path}/lib' \
+         PATH='{rust_path}/bin' RUSTC='{rust_path}/bin/rustc' CARGO_HOME=/tmp/td-cargo-home HOME=/tmp/td-cargo-home \
+         RUSTFLAGS='-C linker-features=-lld {link}' \
          '{rust_path}/bin/cargo' build --offline --manifest-path /tmp/td-cargo-smoke/Cargo.toml --target-dir /tmp/td-cargo-target\n\
          test \"$(/tmp/td-cargo-target/debug/td-cargo-smoke)\" = 43\n\
-         printf '%s\\n' CARGO-BRIDGE-OK\n\
-         printf '%s\\n' RUST-BRIDGE-OK\n"
+         mkdir -p /tmp/td-clippy-proof\n\
+         cat >/tmp/td-clippy-proof/probe.rs\n\
+         '{rust_path}/bin/rustc' --edition=2021 /tmp/td-clippy-proof/probe.rs -C linker-features=-lld {link} -o /tmp/td-clippy-proof/probe\n\
+         printf '%s\\n' '#!{sh}' 'exec {gcc_path}/bin/gcc -B{binutils_path}/ -B{glibc_path}/lib -L{glibc_path}/lib -static-libgcc -Wl,--dynamic-linker,{glibc_path}/lib/ld-linux-x86-64.so.2 -Wl,-rpath,{glibc_path}/lib \"$@\"' >/tmp/td-clippy-proof/cc\n\
+         chmod +x /tmp/td-clippy-proof/cc\n\
+         (cd /tmp/td-clippy-proof && PATH='{rust_path}/bin' ./probe '{rust_path}/bin/cargo' '{rust_path}/bin/rustc' /tmp/td-clippy-proof/cc)\n\
+         printf '%s\\n' RUST-TOOLCHAIN-OK\n"
     );
-    let smoke_out = runner.store_ns_output(&[&sh, "-c", &smoke], None)?;
-    if !smoke_out.lines().any(|line| line == "RUST-BRIDGE-OK")
-        || !smoke_out.lines().any(|line| line == "CARGO-BRIDGE-OK")
-    {
+    let smoke_out = runner.store_ns_output(&[&sh, "-c", &smoke], Some(CLIPPY_PROBE))?;
+    if !smoke_out.lines().any(|line| line == "RUST-TOOLCHAIN-OK") {
         return Err(format!(
-            "source-built stage2 rustc/Cargo did not complete their td-native smoke tests: {}",
+            "upstream rustc/Cargo/Clippy did not complete their td-native smoke tests: {}",
             smoke_out.trim()
         ));
     }
     prove_td_shell_userland(
         runner,
-        &build_out,
-        &stage0_tree,
+        &[&build_out, &gcc_out],
         &gcc_path,
         &binutils_path,
         &glibc_path,
@@ -174,7 +175,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         glibc_base,
     )?;
     println!(
-        "PASS: rust-toolchain: source-built Rust 1.96.0 rustc/std/Cargo/Clippy contain no stage0 artifacts; td shell builds (or reuses from its cache) and runs ripgrep/fd/uutils against td GCC/glibc with /gnu/store absent"
+        "PASS: rust-toolchain: upstream Rust 1.96.0 rustc/Cargo/Clippy/rust-lld run on td glibc, gcc-runtime and zlib, link through td's GCC, and td shell builds (or reuses from its cache) and runs ripgrep/fd/uutils with /gnu/store absent"
     );
     Ok(())
 }
@@ -182,8 +183,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
 #[allow(clippy::too_many_arguments)]
 fn prove_td_shell_userland(
     runner: &RecipeCheckRunner,
-    build_out: &Path,
-    stage0_tree: &Path,
+    build_outs: &[&Path],
     gcc_path: &str,
     binutils_path: &str,
     glibc_path: &str,
@@ -265,7 +265,15 @@ fn prove_td_shell_userland(
     let _shell_cache_lock = crate::check_runner::lock_file(&shell_cache_lock)?;
     reset_shell_cache_on_toolchain_change(&shell_cache, &lock)?;
 
-    let dbs = runner.recipe_output_dbs(build_out)?;
+    // The toolchain's plan and the linker's each vouch their own outputs.
+    let mut dbs = Vec::new();
+    for build_out in build_outs {
+        for db in runner.recipe_output_dbs(build_out)? {
+            if !dbs.contains(&db) {
+                dbs.push(db);
+            }
+        }
+    }
     let dbs = dbs
         .iter()
         .map(|path| {
@@ -277,7 +285,6 @@ fn prove_td_shell_userland(
     let tdstore = runner.tdstore_path();
     let store_ns_builder = runner.control_builder_path();
     let evaluator = std::env::current_exe().map_err(|e| format!("locate td-recipe-eval: {e}"))?;
-    let stage0_base = path_basename(stage0_tree)?;
     let interp = format!("{glibc_path}/lib/ld-linux-x86-64.so.2");
     let script = format!(
         "set -eu\n\
@@ -330,7 +337,6 @@ fn prove_td_shell_userland(
            grep -F -x 'exception.1.source=gcc-x86-64-self' \"$marker\" >/dev/null\n\
            grep -F -x 'exception.2.source=rust-toolchain' \"$marker\" >/dev/null\n\
            rc=0; grep -a -F /gnu/store \"$binary\" >/dev/null || rc=$?; [ \"$rc\" = 1 ] || exit 93\n\
-           rc=0; grep -a -F '{stage0_base}' \"$binary\" >/dev/null || rc=$?; [ \"$rc\" = 1 ] || exit 94\n\
          done\n\
          printf '%s\\n' TD-SHELL-USERLAND-OK\n"
     );
@@ -404,7 +410,7 @@ fn prove_td_shell_userland(
         ));
     }
     println!(
-        "   [product] td shell built (or reused from its cache) ripgrep {rg_version}, fd {fd_version}, and uutils {uutils_version} with source-built stage2 and ran all three under own-root /td/store"
+        "   [product] td shell built (or reused from its cache) ripgrep {rg_version}, fd {fd_version}, and uutils {uutils_version} with upstream Rust and ran all three under own-root /td/store"
     );
     Ok(())
 }
@@ -476,212 +482,10 @@ pub(super) fn path_basename(path: &Path) -> Result<&str, String> {
         .ok_or_else(|| format!("path has no UTF-8 basename: {}", path.display()))
 }
 
-/// Reject both direct references to the stage0 store path and byte-for-byte copies
-/// of compiled stage0 artifacts. Text/debugger helpers may legitimately be
-/// reproduced from the same Rust source, so the equality oracle is deliberately
-/// scoped to executables and compiler/linker artifacts.
-fn reject_stage0_artifacts(stage0: &Path, final_tree: &Path) -> Result<(), String> {
-    let stage0_base = path_basename(stage0)?.as_bytes();
-    let mut stage0_hashes = HashMap::new();
-    for path in regular_files(stage0)? {
-        if is_compiled_artifact(&path)? {
-            stage0_hashes.insert(hash_file(&path)?, path);
-        }
-    }
-    for path in tree_entries(final_tree)? {
-        let meta =
-            fs::symlink_metadata(&path).map_err(|e| format!("stat {}: {e}", path.display()))?;
-        if meta.file_type().is_symlink() {
-            let target =
-                fs::read_link(&path).map_err(|e| format!("readlink {}: {e}", path.display()))?;
-            if target
-                .as_os_str()
-                .as_encoded_bytes()
-                .windows(stage0_base.len())
-                .any(|part| part == stage0_base)
-            {
-                return Err(format!(
-                    "final Rust toolchain symlink {} references rust-stage0 ({})",
-                    path.display(),
-                    target.display()
-                ));
-            }
-        } else if meta.is_file() {
-            let compiled = is_compiled_artifact(&path)?;
-            let (digest, contains_stage0) = hash_file_and_contains(&path, stage0_base)?;
-            if contains_stage0 {
-                return Err(format!(
-                    "final Rust toolchain file {} contains the rust-stage0 store basename",
-                    path.display()
-                ));
-            }
-            if compiled {
-                if let Some(source) = stage0_hashes.get(&digest) {
-                    return Err(format!(
-                        "final Rust toolchain copied compiled stage0 artifact {} byte-for-byte as {}",
-                        source.display(),
-                        path.display()
-                    ));
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn reject_shared_llvm(root: &Path) -> Result<(), String> {
-    for path in tree_entries(root)? {
-        let name = path
-            .file_name()
-            .and_then(|part| part.to_str())
-            .unwrap_or("");
-        if name.starts_with("libLLVM") && name.contains(".so") {
-            return Err(format!(
-                "final Rust toolchain contains shared/prebuilt LLVM artifact {}",
-                path.display()
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn is_compiled_artifact(path: &Path) -> Result<bool, String> {
-    let name = path
-        .file_name()
-        .and_then(|part| part.to_str())
-        .unwrap_or("");
-    if name.ends_with(".rlib")
-        || name.ends_with(".a")
-        || name.ends_with(".o")
-        || name.ends_with(".so")
-        || name.contains(".so.")
-    {
-        return Ok(true);
-    }
-    let mut file = File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
-    let mut magic = [0u8; 4];
-    let len = file
-        .read(magic.as_mut_slice())
-        .map_err(|e| format!("read {}: {e}", path.display()))?;
-    Ok(len == magic.len() && magic == *b"\x7fELF")
-}
-
-fn regular_files(root: &Path) -> Result<Vec<PathBuf>, String> {
-    let mut files = Vec::new();
-    for path in tree_entries(root)? {
-        let meta =
-            fs::symlink_metadata(&path).map_err(|e| format!("stat {}: {e}", path.display()))?;
-        if meta.is_file() {
-            files.push(path);
-        }
-    }
-    Ok(files)
-}
-
-fn tree_entries(root: &Path) -> Result<Vec<PathBuf>, String> {
-    let mut pending = vec![root.to_path_buf()];
-    let mut entries = Vec::new();
-    while let Some(dir) = pending.pop() {
-        let mut children = Vec::new();
-        for entry in fs::read_dir(&dir).map_err(|e| format!("read dir {}: {e}", dir.display()))? {
-            children.push(
-                entry
-                    .map_err(|e| format!("read dir {} entry: {e}", dir.display()))?
-                    .path(),
-            );
-        }
-        children.sort();
-        for path in children {
-            let meta =
-                fs::symlink_metadata(&path).map_err(|e| format!("stat {}: {e}", path.display()))?;
-            if meta.is_dir() {
-                pending.push(path.clone());
-            }
-            entries.push(path);
-        }
-    }
-    entries.sort();
-    Ok(entries)
-}
-
-fn hash_file(path: &Path) -> Result<[u8; 32], String> {
-    Ok(hash_file_and_contains(path, &[])?.0)
-}
-
-/// Hash a file and scan for a byte sequence in one pass. Final Rust/LLVM
-/// artifacts are large enough that reading each once keeps the trust-root
-/// check bounded without weakening either oracle.
-fn hash_file_and_contains(path: &Path, needle: &[u8]) -> Result<([u8; 32], bool), String> {
-    let mut file = File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 64 * 1024];
-    let mut carry = Vec::new();
-    let mut contains = needle.is_empty();
-    loop {
-        let len = file
-            .read(buffer.as_mut_slice())
-            .map_err(|e| format!("read {}: {e}", path.display()))?;
-        if len == 0 {
-            break;
-        }
-        let bytes = buffer
-            .get(..len)
-            .ok_or_else(|| format!("invalid read length {len} for {}", path.display()))?;
-        hasher.update(bytes);
-        if !contains {
-            let mut scan = Vec::with_capacity(carry.len() + bytes.len());
-            scan.extend_from_slice(&carry);
-            scan.extend_from_slice(bytes);
-            contains = scan.windows(needle.len()).any(|part| part == needle);
-            let keep = needle.len().saturating_sub(1).min(scan.len());
-            carry.clear();
-            if let Some(tail) = scan.get(scan.len().saturating_sub(keep)..) {
-                carry.extend_from_slice(tail);
-            }
-        }
-    }
-    Ok((hasher.finalize(), contains))
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{hash_file_and_contains, is_compiled_artifact, Sha256};
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
-
-    #[test]
-    fn combined_hash_scan_finds_a_needle_across_buffer_chunks() {
-        let path = std::env::temp_dir().join(format!("td-rust-hash-scan-{}", std::process::id()));
-        let mut bytes = vec![b'x'; 64 * 1024 - 2];
-        bytes.extend_from_slice(b"stage0-store-name");
-        fs::write(&path, &bytes).unwrap();
-
-        let mut expected = Sha256::new();
-        expected.update(&bytes);
-        let (digest, found) = hash_file_and_contains(&path, b"stage0-store-name").unwrap();
-        let (_, absent) = hash_file_and_contains(&path, b"not-present").unwrap();
-        assert_eq!(digest, expected.finalize());
-        assert!(found);
-        assert!(!absent);
-
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn compiled_artifact_classifier_uses_format_not_exec_bit() {
-        let base = std::env::temp_dir().join(format!("td-rust-artifact-{}", std::process::id()));
-        let script = base.with_extension("sh");
-        let elf = base.with_extension("bin");
-        fs::write(&script, b"#!/bin/sh\nexit 0\n").unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
-        fs::write(&elf, b"\x7fELFtest").unwrap();
-
-        assert!(!is_compiled_artifact(&script).unwrap());
-        assert!(is_compiled_artifact(&elf).unwrap());
-
-        fs::remove_file(script).unwrap();
-        fs::remove_file(elf).unwrap();
-    }
 
     /// The shell cache survives an unchanged toolchain and is emptied, then
     /// re-stamped, when the toolchain moves or it was never stamped.

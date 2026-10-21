@@ -130,8 +130,8 @@ impl BuildInputs {
 
 const USAGE: &str = "usage: td-builder toolchain-recipe {x86_64-self}  (inputs via TDXS_* env)";
 
-/// `td-builder toolchain-recipe <name>`. The downloaded Rust transform is a
-/// first-class, stage0-only recipe (`rust-stage0`); it is not a CLI subcommand.
+/// `td-builder toolchain-recipe <name>`. The upstream Rust transform is the
+/// first-class `rust-toolchain` recipe (`rust-dist`); it is not a CLI subcommand.
 pub fn cli(args: &[String]) -> ExitCode {
     match args.get(2).map(String::as_str) {
         Some("x86_64-self") => {
@@ -206,61 +206,91 @@ pub fn run_self(inp: &BuildInputs) -> Result<String, String> {
     Ok(report)
 }
 
-// --- rust-stage0: exact upstream bootstrap snapshot retarget transform -----------
+// --- rust-dist: the upstream Rust release, retargeted onto td's runtime ----------
 //
-// The engine phase runner for buildSystem "rust-stage0". It unpacks the exact
-// rustc/rust-std/Cargo component tarballs named by Rust source's src/stage0, co-locates
-// the /td/store runtime closure (glibc sonames + libgcc_s + libz, found via the UNCHANGED
-// upstream RUNPATH $ORIGIN/../lib — the portable, content-addressed-store-safe choice) and
-// RELINKS rustc/cargo's ELF interpreter — `crate::elf::set_interp`, GROWS the slot per
-// #258, NOT patchelf — onto the /td/store x86_64 glibc loader.
+// The engine phase runner for buildSystem "rust-dist" (`rust-toolchain`). It unpacks
+// the pinned rustc, rust-std, Cargo and Clippy release components with the engine's
+// own archive readers, assembles one toolchain tree, links td's runtime into its lib/
+// (found through the UNCHANGED upstream RUNPATH `$ORIGIN/../lib`), and relinks each
+// shipped executable's interpreter onto td's glibc loader with `crate::elf::set_interp`
+// (which grows the slot, #258). No compilation and no subprocess.
 //
-// It runs in the HERMETIC drv sandbox entirely as td-builder Rust: engine-native
-// archive readers, filesystem copies, and crate::elf; no unpacker subprocess runs.
+//   TD_SRC        the rustc component tarball (Class::Source).
+//   TD_INPUT_MAP  name -> /td/store path:
+//                   rust-std-dist, rust-cargo-dist, rust-clippy-dist
+//                   glibc-x86-64   staged at GLIBC_X86_64_STAGE (loader + sonames)
+//                   gcc-runtime    lib/libgcc_s.so.1
+//                   zlib-x86-64    lib/libz.so.1
+//   out           the toolchain tree.
 //
-//   TD_SRC        the exact upstream rustc component tarball (Class::Source).
-//   TD_INPUT_MAP  lock name -> /td/store path; the transform reads its inputs BY RECIPE NAME
-//                 and also resolves rust-std/Cargo source component tarballs:
-//                   rust-stage0-std-source
-//                   rust-stage0-cargo-source
-//                   glibc-x86-64       the x86_64 glibc 2.41 tree (interp + sonames), at its
-//                                      staged stage/td/store/glibc-2.41-x86_64 prefix
-//                   gcc-x86-64-stage2  the cross gcc final — libgcc_s.so.1 (found recursively)
-//                   zlib-x86-64        the td-built libz.so.1 tree
-//   out           the stage0-only rustc/rustdoc/Cargo/sysroot tree.
-//
-// The interp target is <glibc-x86-64 staged>/lib/ld-linux-x86-64.so.2 — the input's own
-// /td/store path. Same pinned source + same inputs => byte-identical tree (the `td-builder
-// check` double-build oracle proves it); a missing input reds at drv-assembly
-// (build-recipe), before a build.
+// The runtime libraries are symlinks into their own outputs, so each keeps its own
+// debug companion and the closure names them. Same pins + same inputs => the same
+// tree (the double-build oracle proves it).
 
-/// The staged install-prefix subpaths of the x86_64 toolchain rung outputs (a mesboot rung
-/// installs into <out>/stage/td/store/<prefix>). Kept beside the transform so the resolution
-/// stays in one place if a rung's version bumps.
+/// The staged install-prefix subpath of the x86_64 glibc rung output (a mesboot rung
+/// installs into <out>/stage/td/store/<prefix>).
 pub(crate) const GLIBC_X86_64_STAGE: &str = "stage/td/store/glibc-2.41-x86_64";
-const GCC_X86_64_STAGE: &str = "stage/td/store/gcc-14.3.0-x86_64";
-const ZLIB_X86_64_LIB: &str = "stage/td/store/zlib-1.3.1/lib";
 
-/// The resolved stage0 transform inputs, read from the drv env.
-struct RustStage0Inputs {
+/// The upstream target triple whose host toolchain and standard library td ships.
+const RUST_TARGET_BIN: &str = "lib/rustlib/x86_64-unknown-linux-gnu/bin";
+
+/// The shipped executables, relative to the tree, each relinked onto td's loader.
+const RUST_EXECUTABLES: &[&str] = &[
+    "bin/rustc",
+    "bin/rustdoc",
+    "bin/cargo",
+    "bin/cargo-clippy",
+    "bin/clippy-driver",
+    "lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-lld",
+];
+
+/// Upstream files td does not ship: the installer manifest each component
+/// copies to the root, debugger scripts for absent debuggers, the
+/// rust-analyzer server, linker flavors for other platforms, the wasm
+/// component linker, and an objcopy whose RUNPATH cannot reach libLLVM.
+const RUST_DROPPED: &[&str] = &[
+    "manifest.in",
+    "bin/rust-gdb",
+    "bin/rust-gdbgui",
+    "bin/rust-lldb",
+    "libexec",
+    "lib/rustlib/x86_64-unknown-linux-gnu/bin/gcc-ld",
+    "lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-objcopy",
+    "lib/rustlib/x86_64-unknown-linux-gnu/bin/wasm-component-ld",
+];
+
+/// The shared libraries in lib/ the executables load, by name prefix. The
+/// prefix names libLLVM's soname file, not the `libLLVM-*.so` linker script.
+const RUST_SHARED_LIBS: &[&str] = &["librustc_driver-", "libLLVM.so."];
+
+/// glibc sonames the upstream binaries need, linked from td glibc into lib/.
+const RUST_GLIBC_SONAMES: &[&str] = &[
+    "libc.so.6",
+    "libdl.so.2",
+    "librt.so.1",
+    "libpthread.so.0",
+    "libm.so.6",
+];
+
+/// The resolved transform inputs, read from the drv env.
+struct RustDistInputs {
     /// Individually unpacked upstream component trees.
     rustc_src: PathBuf,
-    cargo_src: PathBuf,
     std_src: PathBuf,
-    /// glibc-x86-64 (staged) — the x86_64 glibc 2.41 tree (interp target + co-located sonames).
+    cargo_src: PathBuf,
+    clippy_src: PathBuf,
+    /// glibc-x86-64 (staged): the loader and the sonames linked into lib/.
     glibc: PathBuf,
-    /// The dir under gcc-x86-64-stage2 holding `libgcc_s.so.1` (found recursively).
-    libgcc_dir: PathBuf,
-    /// zlib-x86-64 (staged lib) — holds `libz.so.1.*`.
-    libz_dir: PathBuf,
-    /// `<glibc>/lib/ld-linux-x86-64.so.2` — the /td/store loader rustc/cargo relink onto.
-    glibc_interp: String,
-    /// `$out` — the transform's output tree.
+    /// gcc-runtime's `lib/libgcc_s.so.1`.
+    libgcc_s: PathBuf,
+    /// zlib-x86-64's `lib/libz.so.1`.
+    libz: PathBuf,
+    /// `$out`.
     out: PathBuf,
 }
 
-impl RustStage0Inputs {
-    fn from_drv_env() -> Result<RustStage0Inputs, String> {
+impl RustDistInputs {
+    fn from_drv_env() -> Result<RustDistInputs, String> {
         let g = |k: &str| -> Result<String, String> {
             std::env::var(k).map_err(|_| format!("env {k} unset"))
         };
@@ -270,66 +300,47 @@ impl RustStage0Inputs {
             map.get(name)
                 .and_then(crate::json::Json::as_str)
                 .map(PathBuf::from)
-                .ok_or_else(|| {
-                    format!(
-                        "rust-stage0: lock is missing the `{name}' input (needed by the transform)"
-                    )
-                })
+                .ok_or_else(|| format!("rust-dist: lock is missing the `{name}' input"))
         };
-        // #410: inputs resolved BY RECIPE NAME to their staged install prefixes — the
-        // recipe-graph model (glibc/libgcc/libz are the rungs build-plan --auto chained).
-        let glibc = pick("glibc-x86-64")?.join(GLIBC_X86_64_STAGE);
-        let gcc = pick("gcc-x86-64-stage2")?.join(GCC_X86_64_STAGE);
-        let libgcc = find_file(&gcc, "libgcc_s.so.1").ok_or_else(|| {
-            format!(
-                "rust-stage0: no libgcc_s.so.1 under the gcc-x86-64-stage2 input {}",
-                gcc.display()
-            )
-        })?;
-        let libgcc_dir = libgcc
-            .parent()
-            .ok_or("rust-stage0: libgcc_s.so.1 has no parent dir")?
-            .to_path_buf();
-        let libz_dir = pick("zlib-x86-64")?.join(ZLIB_X86_64_LIB);
-        let glibc_interp = format!("{}/lib/ld-linux-x86-64.so.2", glibc.display());
-        // Unpack all three exact snapshot components with the engine-native tar reader.
-        let rustc_tar = PathBuf::from(g("TD_SRC")?);
-        let std_tar = pick("rust-stage0-std-source")?;
-        let cargo_tar = pick("rust-stage0-cargo-source")?;
-        let rustc_src = mktemp_dir("td-rust-stage0-rustc")?;
-        let std_src = mktemp_dir("td-rust-stage0-std")?;
-        let cargo_src = mktemp_dir("td-rust-stage0-cargo")?;
-        unpack_rust_component(&rustc_tar, &rustc_src, "rustc/bin/rustc")?;
-        unpack_rust_component(
-            &std_tar,
-            &std_src,
-            "rust-std-x86_64-unknown-linux-gnu/lib/rustlib",
-        )?;
-        unpack_rust_component(&cargo_tar, &cargo_src, "cargo/bin/cargo")?;
-        Ok(RustStage0Inputs {
-            rustc_src,
-            cargo_src,
-            std_src,
-            glibc,
-            libgcc_dir,
-            libz_dir,
-            glibc_interp,
+        let unpack = |tar: &Path, tag: &str, required: &str| -> Result<PathBuf, String> {
+            let dir = mktemp_dir(tag)?;
+            unpack_rust_component(tar, &dir, required)?;
+            Ok(dir)
+        };
+        Ok(RustDistInputs {
+            rustc_src: unpack(
+                Path::new(&g("TD_SRC")?),
+                "td-rust-dist-rustc",
+                "rustc/bin/rustc",
+            )?,
+            std_src: unpack(
+                &pick("rust-std-dist")?,
+                "td-rust-dist-std",
+                "rust-std-x86_64-unknown-linux-gnu/lib/rustlib",
+            )?,
+            cargo_src: unpack(
+                &pick("rust-cargo-dist")?,
+                "td-rust-dist-cargo",
+                "cargo/bin/cargo",
+            )?,
+            clippy_src: unpack(
+                &pick("rust-clippy-dist")?,
+                "td-rust-dist-clippy",
+                "clippy-preview/bin/clippy-driver",
+            )?,
+            glibc: pick("glibc-x86-64")?.join(GLIBC_X86_64_STAGE),
+            libgcc_s: pick("gcc-runtime")?.join("lib/libgcc_s.so.1"),
+            libz: pick("zlib-x86-64")?.join("lib/libz.so.1"),
             out: PathBuf::from(g("out")?),
         })
     }
 }
 
-/// Unpack the pinned Rust release `.tar.gz` into `dest` (top-level dir stripped) with the
-/// ENGINE's own gzip/tar readers (`crate::tar::unpack_archive`) — no subprocess, no
-/// unpacker inputs at all: tar/gzip left the host-tool tier with `Step::Unpack`, and the
-/// transform admits no host tool (re #469). The combined installer carries components
-/// `assemble_rust_tree` never reads (docs, rustfmt, clippy, …); the full unpack writes
-/// them to the build scratch only — the assemble step copies rustc/, cargo/, and
-/// rust-std-*/ into `$out`, so the extra members cost scratch bytes, never output bytes.
-/// NOTE at the next rust-pin bump: the engine tar reader caps a single entry at
-/// `tar::MAX_TAR_ENTRY_BYTES` (256 MiB) — a limit host `tar` never imposed. Today's
-/// members are well under it; a future release with a >256 MiB member (a fat
-/// libLLVM/debuginfo blob) would red here, and the cap would need raising in lockstep.
+/// Unpack one pinned release component into `dest` (top-level dir stripped) with the
+/// engine's own gzip/xz/tar readers — no subprocess. A component is checked for the
+/// one member it must carry, so a layout change upstream fails here.
+/// NOTE at the next pin bump: the engine tar reader caps a single entry at
+/// `tar::MAX_TAR_ENTRY_BYTES` (256 MiB), a limit host `tar` never imposed.
 fn unpack_rust_component(tarball: &Path, dest: &Path, required: &str) -> Result<(), String> {
     crate::tar::unpack_archive(tarball, dest, false)?;
     if !dest.join(required).exists() {
@@ -341,59 +352,58 @@ fn unpack_rust_component(tarball: &Path, dest: &Path, required: &str) -> Result<
     Ok(())
 }
 
-/// Assemble and retarget the exact downloaded stage0 snapshot. No compilation.
-pub fn run_rust_stage0_build() -> Result<(), String> {
-    let inp = RustStage0Inputs::from_drv_env()?;
+/// Assemble and retarget the pinned upstream release. No compilation.
+pub fn run_rust_dist_build() -> Result<(), String> {
+    let inp = RustDistInputs::from_drv_env()?;
     assemble_rust_tree(&inp)?;
-    relink_rust_interp(&inp.out, &inp.glibc_interp)?;
+    relink_rust_interp(&inp.out, &inp.glibc)?;
     Ok(())
 }
 
-/// Copy rustc/cargo + rustlib from the extracted release tree (TD_SRC), provenance-check,
-/// and co-locate the /td/store runtime closure into `<out>/lib`.
-fn assemble_rust_tree(inp: &RustStage0Inputs) -> Result<(), String> {
+/// Copy the components into one tree, drop what td does not ship, link the runtime
+/// into lib/, and provenance-check the result.
+fn assemble_rust_tree(inp: &RustDistInputs) -> Result<(), String> {
     let tree = &inp.out;
-    fs::create_dir_all(tree.join("bin")).map_err(ioerr("mkdir out/bin"))?;
-    fs::create_dir_all(tree.join("lib")).map_err(ioerr("mkdir out/lib"))?;
-    for bin in ["rustc", "rustdoc"] {
-        fs::copy(
-            inp.rustc_src.join("rustc/bin").join(bin),
-            tree.join("bin").join(bin),
-        )
-        .map_err(ioerr("cp rustc component binary"))?;
-    }
-    fs::copy(
-        inp.cargo_src.join("cargo/bin/cargo"),
-        tree.join("bin/cargo"),
-    )
-    .map_err(ioerr("cp cargo"))?;
-    // librustc_driver, libLLVM, libstd*.so, AND rustc's own rustlib/.
-    copy_tree_contents(&inp.rustc_src.join("rustc/lib"), &tree.join("lib"))
-        .map_err(ioerr("cp rustc/lib"))?;
-    let std_rustlib = inp
-        .std_src
-        .join("rust-std-x86_64-unknown-linux-gnu/lib/rustlib");
-    if std_rustlib.is_dir() {
-        copy_tree_contents(&std_rustlib, &tree.join("lib/rustlib"))
-            .map_err(ioerr("merge rustlib"))?;
+    for (component, dir) in [
+        (&inp.rustc_src, "rustc"),
+        (&inp.cargo_src, "cargo"),
+        (&inp.clippy_src, "clippy-preview"),
+        (&inp.std_src, "rust-std-x86_64-unknown-linux-gnu"),
+    ] {
+        merge_component(&component.join(dir), tree, Path::new(""))?;
     }
     make_writable(tree).map_err(ioerr("chmod tree"))?;
+    for dropped in RUST_DROPPED {
+        let path = tree.join(dropped);
+        let meta = fs::symlink_metadata(&path)
+            .map_err(|e| format!("rust-dist: upstream no longer ships {dropped}: {e}"))?;
+        if meta.is_dir() {
+            fs::remove_dir_all(&path)
+        } else {
+            fs::remove_file(&path)
+        }
+        .map_err(|e| format!("rust-dist: remove {dropped}: {e}"))?;
+    }
+    // rustc's default link passes `-B…/gcc-ld -fuse-ld=lld`, which runs
+    // `gcc-ld/ld.lld` under a gcc built without `--with-ld` (td's ignores it). As a
+    // link to rust-lld, lld takes its GNU flavor from that name and `$ORIGIN` is
+    // rust-lld's own directory, so the upstream wrapper and its unreachable
+    // RUNPATH are not needed.
+    let gcc_ld = tree.join(RUST_TARGET_BIN).join("gcc-ld");
+    fs::create_dir_all(&gcc_ld).map_err(ioerr("mkdir gcc-ld"))?;
+    symlink_force("../rust-lld", &gcc_ld.join("ld.lld"))?;
 
-    // the sysroot MUST hold a libstd rlib — else rustc has nothing to link a program to.
+    // The sysroot must hold the standard library rlibs a program links.
     let rlib_dir = tree.join("lib/rustlib/x86_64-unknown-linux-gnu/lib");
-    if !glob_exists(&rlib_dir, "libstd-", ".rlib") {
-        return Err("assembled rust sysroot has no libstd rlib (rustlib missing) — rustc could not link a program".into());
+    for crate_name in ["libstd-", "libproc_macro-", "libtest-"] {
+        if !glob_exists(&rlib_dir, crate_name, ".rlib") {
+            return Err(format!("assembled rust sysroot has no {crate_name}*.rlib"));
+        }
     }
 
-    // [provenance] the upstream binaries + librustc_driver carry NO /gnu/store bytes.
-    let mut provenance = vec![
-        tree.join("bin/rustc"),
-        tree.join("bin/rustdoc"),
-        tree.join("bin/cargo"),
-    ];
-    if let Some(drv) = glob_first_in(&tree.join("lib"), "librustc_driver-", ".so") {
-        provenance.push(drv);
-    }
+    // [provenance] the upstream binaries and libraries carry no /gnu/store bytes.
+    let mut provenance: Vec<PathBuf> = RUST_EXECUTABLES.iter().map(|b| tree.join(b)).collect();
+    provenance.extend(rust_shared_libs(tree)?);
     for b in &provenance {
         if contains_gnu_store(b)? {
             return Err(format!(
@@ -403,53 +413,194 @@ fn assemble_rust_tree(inp: &RustStage0Inputs) -> Result<(), String> {
         }
     }
 
-    // co-locate the full external runtime closure in lib/ (found via RUNPATH $ORIGIN/../lib):
-    // glibc sonames + libgcc_s (+ the bare .so link the rust link's -lgcc_s resolves) + libz.
-    for soname in [
-        "libc.so.6",
-        "libdl.so.2",
-        "librt.so.1",
-        "libpthread.so.0",
-        "libm.so.6",
-    ] {
-        let src = inp.glibc.join("lib").join(soname);
-        if !src.exists() {
-            return Err(format!("x86_64 glibc 2.41 is missing {soname}"));
+    // The runtime, linked from its own outputs into lib/, which every shipped
+    // binary's RUNPATH reaches.
+    let lib = tree.join("lib");
+    let mut runtime: Vec<(PathBuf, &str)> = RUST_GLIBC_SONAMES
+        .iter()
+        .map(|soname| (inp.glibc.join("lib").join(soname), *soname))
+        .collect();
+    runtime.push((inp.libgcc_s.clone(), "libgcc_s.so.1"));
+    runtime.push((inp.libz.clone(), "libz.so.1"));
+    for (target, soname) in runtime {
+        if !target.is_file() {
+            return Err(format!(
+                "rust-dist: runtime library {} is missing",
+                target.display()
+            ));
         }
-        copy_deref(&src, &tree.join("lib").join(soname))?;
+        symlink_force_abs(&target, &lib.join(soname))?;
     }
-    copy_deref(
-        &inp.libgcc_dir.join("libgcc_s.so.1"),
-        &tree.join("lib/libgcc_s.so.1"),
-    )?;
-    symlink_force("libgcc_s.so.1", &tree.join("lib/libgcc_s.so"))?;
-    let libz = glob_first_in(&inp.libz_dir, "libz.so.1", "").ok_or_else(|| {
-        format!(
-            "rust-stage0: no libz.so.1* under the zlib-x86-64 input {}",
-            inp.libz_dir.display()
-        )
-    })?;
-    copy_deref(&libz, &tree.join("lib/libz.so.1"))?;
-    make_writable(tree).map_err(ioerr("chmod tree"))?;
     Ok(())
 }
 
-/// Relink stage0 rustc, rustdoc, and Cargo's ELF interpreter to `glibc_interp`,
-/// GROWS the slot when the new path is longer per #258 — no patchelf), asserting each
-/// landed under /td/store.
-fn relink_rust_interp(tree: &Path, glibc_interp: &str) -> Result<(), String> {
-    for b in ["rustc", "rustdoc", "cargo"] {
-        let bin = tree.join("bin").join(b);
-        crate::elf::set_interp(&bin, glibc_interp)?;
+/// Relink each shipped executable's ELF interpreter onto td glibc's loader, and
+/// check every library each shipped ELF needs resolves through its own RUNPATH
+/// inside the tree.
+fn relink_rust_interp(tree: &Path, glibc: &Path) -> Result<(), String> {
+    let interp = format!("{}/lib/ld-linux-x86-64.so.2", glibc.display());
+    for b in RUST_EXECUTABLES {
+        let bin = tree.join(b);
+        crate::elf::set_interp(&bin, &interp)?;
         let got = crate::elf::read_interp(&bin)?.unwrap_or_default();
-        let ok = got.starts_with("/td/store/") && got.ends_with("/lib/ld-linux-x86-64.so.2");
-        if !ok {
+        if got != interp {
             return Err(format!(
-                "interp of {b} not relinked to the /td/store glibc loader (got: {got})"
+                "interp of {b} not relinked to td glibc's loader (got: {got})"
             ));
         }
     }
+    // An executable upstream adds would otherwise keep its /lib64 loader.
+    let mut interpreted = Vec::new();
+    collect_interpreted(tree, tree, &mut interpreted)?;
+    if let Some(stray) = interpreted
+        .iter()
+        .find(|rel| !RUST_EXECUTABLES.contains(&rel.as_str()))
+    {
+        return Err(format!(
+            "rust-dist: {stray} has an ELF interpreter but is neither relinked nor dropped"
+        ));
+    }
+    let mut elfs: Vec<PathBuf> = RUST_EXECUTABLES.iter().map(|b| tree.join(b)).collect();
+    elfs.extend(rust_shared_libs(tree)?);
+    for elf in &elfs {
+        let origin = elf
+            .parent()
+            .ok_or_else(|| format!("{} has no parent", elf.display()))?;
+        let runpath = crate::elf::read_rpath(elf)?.unwrap_or_default();
+        let needed = crate::elf::read_needed(elf)?;
+        needed_resolve(tree, origin, &runpath, &needed)
+            .map_err(|e| format!("rust-dist: {}: {e}", elf.display()))?;
+    }
     Ok(())
+}
+
+/// Copy one component's tree into `dst`. Components share directories but no
+/// file except the installer manifest each carries at its root, which is
+/// dropped later; any other collision means the release layout changed.
+fn merge_component(src: &Path, dst: &Path, rel: &Path) -> Result<(), String> {
+    fs::create_dir_all(dst).map_err(|e| format!("mkdir {}: {e}", dst.display()))?;
+    let entries = fs::read_dir(src).map_err(|e| format!("read {}: {e}", src.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("read {}: {e}", src.display()))?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        let rel = rel.join(entry.file_name());
+        let from_dir = fs::symlink_metadata(&from)
+            .map_err(|e| format!("stat {}: {e}", from.display()))?
+            .is_dir();
+        match fs::symlink_metadata(&to) {
+            Ok(existing) if from_dir && existing.is_dir() => merge_component(&from, &to, &rel)?,
+            Ok(_) if rel == Path::new("manifest.in") => {
+                copy_entry(&from, &to).map_err(|e| format!("copy {}: {e}", from.display()))?
+            }
+            Ok(_) => {
+                return Err(format!("rust-dist: two components ship {}", rel.display()));
+            }
+            Err(_) => {
+                copy_entry(&from, &to).map_err(|e| format!("copy {}: {e}", from.display()))?
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `path` with `.` and `..` resolved without touching the filesystem; `None`
+/// when `..` climbs above the root.
+fn lexical_normalize(path: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() || out.as_os_str().is_empty() {
+                    return None;
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    Some(out)
+}
+
+/// Tree-relative paths of every regular file under `dir` that is an ELF with a
+/// program interpreter.
+fn collect_interpreted(tree: &Path, dir: &Path, out: &mut Vec<String>) -> Result<(), String> {
+    let entries = fs::read_dir(dir).map_err(|e| format!("read {}: {e}", dir.display()))?;
+    for entry in entries {
+        let path = entry
+            .map_err(|e| format!("read {}: {e}", dir.display()))?
+            .path();
+        let meta =
+            fs::symlink_metadata(&path).map_err(|e| format!("stat {}: {e}", path.display()))?;
+        if meta.is_dir() {
+            collect_interpreted(tree, &path, out)?;
+        } else if meta.is_file()
+            && is_elf(&path)?
+            && crate::elf::read_interp(&path)
+                .map_err(|e| format!("{}: {e}", path.display()))?
+                .is_some()
+        {
+            let rel = path
+                .strip_prefix(tree)
+                .map_err(|_| format!("{} is outside {}", path.display(), tree.display()))?;
+            out.push(rel.to_string_lossy().into_owned());
+        }
+    }
+    Ok(())
+}
+
+fn is_elf(path: &Path) -> Result<bool, String> {
+    use std::io::Read;
+    let mut magic = [0u8; 4];
+    let mut file = fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    match file.read_exact(&mut magic) {
+        Ok(()) => Ok(magic == *b"\x7fELF"),
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(e) => Err(format!("read {}: {e}", path.display())),
+    }
+}
+
+/// Each of `RUST_SHARED_LIBS` in the tree's lib/; a missing one is an error.
+fn rust_shared_libs(tree: &Path) -> Result<Vec<PathBuf>, String> {
+    RUST_SHARED_LIBS
+        .iter()
+        .map(|prefix| {
+            glob_first_in(&tree.join("lib"), prefix, "")
+                .ok_or_else(|| format!("rust-dist: lib/ has no {prefix}*"))
+        })
+        .collect()
+}
+
+/// Every RUNPATH entry is `$ORIGIN`-relative and stays inside `tree`, and
+/// every DT_NEEDED other than the loader resolves through one of them.
+fn needed_resolve(
+    tree: &Path,
+    origin: &Path,
+    runpath: &str,
+    needed: &[String],
+) -> Result<(), String> {
+    let mut dirs = Vec::new();
+    let entries = runpath.split(':').filter(|_| !runpath.is_empty());
+    for entry in entries {
+        let rest = entry
+            .strip_prefix("$ORIGIN")
+            .ok_or_else(|| format!("RUNPATH entry {entry:?} is not $ORIGIN-relative"))?;
+        let dir = lexical_normalize(&origin.join(rest.trim_start_matches('/')))
+            .filter(|dir| dir.starts_with(tree))
+            .ok_or_else(|| format!("RUNPATH entry {entry:?} leaves the toolchain tree"))?;
+        dirs.push(dir);
+    }
+    match needed
+        .iter()
+        .filter(|name| name.as_str() != "ld-linux-x86-64.so.2")
+        .find(|name| !dirs.iter().any(|dir| dir.join(name).exists()))
+    {
+        Some(missing) => Err(format!(
+            "needs {missing}, which its RUNPATH {runpath:?} does not reach"
+        )),
+        None => Ok(()),
+    }
 }
 
 // --- x86_64 binutils 2.44 (native + self flavors) ----------------------------------
@@ -1060,9 +1211,9 @@ fn copy_entry(from: &Path, to: &Path) -> io::Result<()> {
         }
         let _ = fs::set_permissions(to, md.permissions());
     } else if ft.is_file() {
-        // cp -f semantics: an existing dest may be read-only (rust ships 0444 files, and the
-        // rust-std rustlib merge overlays rustc's rustlib), and fs::copy would then fail with
-        // EACCES opening it for write — remove it first so the overlay always lands.
+        // cp -f semantics: an existing dest may be read-only (rust ships 0444 files, and each
+        // component's root manifest.in overwrites the last), and fs::copy would then fail
+        // with EACCES opening it for write — remove it first so the overlay always lands.
         if fs::symlink_metadata(to).is_ok() {
             let _ = fs::remove_file(to);
         }
@@ -1075,9 +1226,8 @@ fn copy_entry(from: &Path, to: &Path) -> io::Result<()> {
 /// directory level the immediate files are checked in sorted order, then the subdirectories are
 /// recursed in sorted order (a files-first depth-first search). An unreadable subdirectory is
 /// SKIPPED, not fatal — so one bad dir cannot mask a match elsewhere in the tree (a `.ok()?` in
-/// the loop would abort the whole search). Determinism matters: the rust-stage0 transform
-/// co-locates the libgcc_s.so.1 this returns, so a filesystem-order pick would make the relinked
-/// tree non-reproducible when a gcc install ships more than one copy.
+/// the loop would abort the whole search). Determinism matters: a filesystem-order pick would
+/// make a build that consumes the result non-reproducible when a tree holds more than one copy.
 fn find_file(root: &Path, name: &str) -> Option<PathBuf> {
     let rd = fs::read_dir(root).ok()?;
     let mut files: Vec<PathBuf> = Vec::new();
@@ -1107,15 +1257,6 @@ fn find_file(root: &Path, name: &str) -> Option<PathBuf> {
         }
     }
     None
-}
-
-/// `cp -L SRC DST` — copy following a symlink (fs::copy reads through the symlink),
-/// making the destination writable (the source .so may be 0444).
-fn copy_deref(src: &Path, dst: &Path) -> Result<(), String> {
-    fs::copy(src, dst).map_err(|e| format!("cp {} -> {}: {e}", src.display(), dst.display()))?;
-    let mut perm = fs::metadata(dst).map_err(ioerr("stat copy"))?.permissions();
-    perm.set_mode(perm.mode() | 0o644);
-    fs::set_permissions(dst, perm).map_err(ioerr("chmod copy"))
 }
 
 /// True iff any file in `dir` is named `<prefix>…<suffix>`.
@@ -1234,7 +1375,7 @@ mod tests {
     #[test]
     fn unpack_rust_component_strips_top_and_guards_layout() {
         let d = tmp("td-rust-unpack");
-        let top = "rustc-1.95.0-x86_64-unknown-linux-gnu";
+        let top = "rustc-1.96.0-x86_64-unknown-linux-gnu";
         let good = d.join("good.tar");
         fs::write(
             &good,
@@ -1478,27 +1619,103 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
     }
 
+    /// rust-lld's RUNPATH reaches lib/ through `$ORIGIN/../../../`; a
+    /// library no entry reaches, or any entry not `$ORIGIN`-relative, is refused.
     #[test]
-    fn copy_deref_follows_symlink_and_makes_writable() {
-        let d = tmp("td-xn-test-deref");
-        let real = d.join("libc-real.so");
-        fs::write(&real, b"REALBYTES").unwrap();
-        set_mode(&real, 0o444).unwrap();
-        let link = d.join("libc.so.6");
-        std::os::unix::fs::symlink("libc-real.so", &link).unwrap();
-        let dst = d.join("out/libc.so.6");
-        fs::create_dir_all(d.join("out")).unwrap();
-        // copy through the symlink → the destination holds the TARGET's bytes and is writable.
-        copy_deref(&link, &dst).unwrap();
-        assert_eq!(fs::read(&dst).unwrap(), b"REALBYTES");
-        assert!(
-            !fs::symlink_metadata(&dst).unwrap().file_type().is_symlink(),
-            "dst should be a real file, not a symlink"
+    fn needed_libraries_resolve_only_through_origin_runpath() {
+        let d = tmp("td-rust-needed");
+        let bin = d.join("lib/rustlib/x86_64-unknown-linux-gnu/bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(d.join("lib/libLLVM.so.22.1"), b"").unwrap();
+        fs::write(d.join("lib/libc.so.6"), b"").unwrap();
+        let needed: Vec<String> = ["libLLVM.so.22.1", "libc.so.6", "ld-linux-x86-64.so.2"]
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        let runpath = "$ORIGIN/../../../:$ORIGIN/../lib";
+        assert_eq!(needed_resolve(&d, &bin, runpath, &needed), Ok(()));
+        assert_eq!(needed_resolve(&d, &bin, "", &[]), Ok(()));
+        let mut more = needed.clone();
+        more.push("libz.so.1".into());
+        let err = needed_resolve(&d, &bin, runpath, &more).unwrap_err();
+        assert!(err.contains("needs libz.so.1"), "{err}");
+        // An absolute entry is refused, though it names the directory.
+        let absolute = format!("$ORIGIN/../../../:{}", d.join("lib").display());
+        let err = needed_resolve(&d, &bin, &absolute, &needed).unwrap_err();
+        assert!(err.contains("not $ORIGIN-relative"), "{err}");
+        // So are an empty entry (the working directory) and a climb out.
+        let err = needed_resolve(&d, &bin, "$ORIGIN/../../../:", &needed).unwrap_err();
+        assert!(err.contains("not $ORIGIN-relative"), "{err}");
+        let err = needed_resolve(&d, &bin, "$ORIGIN/../../../../../lib", &needed).unwrap_err();
+        assert!(err.contains("leaves the toolchain tree"), "{err}");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// The shared-library list names libLLVM's soname file, so its 42-byte
+    /// `libLLVM-*.so` linker script, which sorts first, is never the one
+    /// checked; a tree missing either library is refused.
+    #[test]
+    fn shared_libraries_are_the_real_objects_and_required() {
+        let d = tmp("td-rust-shared");
+        fs::create_dir_all(d.join("lib")).unwrap();
+        fs::write(d.join("lib/libLLVM-22-rust-1.96.0-stable.so"), b"INPUT(x)").unwrap();
+        fs::write(d.join("lib/librustc_driver-4d71126a08f22b4a.so"), b"").unwrap();
+        let err = rust_shared_libs(&d).unwrap_err();
+        assert!(err.contains("libLLVM.so."), "{err}");
+        fs::write(d.join("lib/libLLVM.so.22.1-rust-1.96.0-stable"), b"").unwrap();
+        let libs = rust_shared_libs(&d).unwrap();
+        assert_eq!(
+            libs,
+            [
+                d.join("lib/librustc_driver-4d71126a08f22b4a.so"),
+                d.join("lib/libLLVM.so.22.1-rust-1.96.0-stable"),
+            ]
         );
-        assert!(
-            fs::metadata(&dst).unwrap().permissions().mode() & 0o200 != 0,
-            "dst should be writable"
-        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// Components may share directories; a shared file other than the root
+    /// installer manifest is refused.
+    #[test]
+    fn components_merge_without_collisions() {
+        let d = tmp("td-rust-merge");
+        let (a, b, tree) = (d.join("a"), d.join("b"), d.join("tree"));
+        for (component, bin) in [(&a, "rustc"), (&b, "cargo")] {
+            fs::create_dir_all(component.join("bin")).unwrap();
+            fs::write(component.join("bin").join(bin), bin).unwrap();
+            fs::write(component.join("manifest.in"), bin).unwrap();
+        }
+        merge_component(&a, &tree, Path::new("")).unwrap();
+        merge_component(&b, &tree, Path::new("")).unwrap();
+        assert!(tree.join("bin/rustc").is_file() && tree.join("bin/cargo").is_file());
+        let c = d.join("c");
+        fs::create_dir_all(c.join("bin")).unwrap();
+        fs::write(c.join("bin/rustc"), "other").unwrap();
+        let err = merge_component(&c, &tree, Path::new("")).unwrap_err();
+        assert!(err.contains("two components ship bin/rustc"), "{err}");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// Only regular ELF files with a program interpreter are collected; a
+    /// symlink to one, a library without one, and a non-ELF file are not.
+    #[test]
+    fn interpreted_files_are_found_anywhere_in_the_tree() {
+        let d = tmp("td-rust-interp");
+        let tree = d.join("tree");
+        fs::create_dir_all(tree.join("bin")).unwrap();
+        fs::create_dir_all(tree.join("lib/deep")).unwrap();
+        let interp = crate::elf::tests::synth_interp_elf("/lib64/ld-linux-x86-64.so.2", true);
+        fs::write(tree.join("bin/rustc"), &interp).unwrap();
+        fs::write(tree.join("lib/deep/stray"), &interp).unwrap();
+        let library = crate::elf::tests::synth_needed_elf(&["libc.so.6"], true);
+        fs::write(tree.join("lib/libfoo.so"), library).unwrap();
+        std::os::unix::fs::symlink("../bin/rustc", tree.join("lib/link")).unwrap();
+        fs::write(tree.join("bin/script"), b"#!/bin/sh\n").unwrap();
+        fs::write(tree.join("lib/short"), b"\x7fE").unwrap();
+        let mut found = Vec::new();
+        collect_interpreted(&tree, &tree, &mut found).unwrap();
+        found.sort();
+        assert_eq!(found, ["bin/rustc", "lib/deep/stray"]);
         let _ = fs::remove_dir_all(&d);
     }
 }

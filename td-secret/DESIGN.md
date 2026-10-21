@@ -331,7 +331,7 @@ writes consume this transport under the contracts below.
 Tests cover report boundaries, literal wire encoding, sequence and channel
 substitution, keepalive state, initialization binding, malformed TPM Names
 and tickets, and cleanup failures. The target recipe compiles and runs the
-ordinary crate tests with its source-built toolchain. The explicit
+ordinary crate tests with td's Rust toolchain. The explicit
 `emulator_es256` oracle uses an independently generated OpenSSL P-256
 signature fixture, rejects changed public coordinates, digest and signature
 components, and repeats verification beyond the TPM transient-slot count.

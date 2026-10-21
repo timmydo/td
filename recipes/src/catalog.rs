@@ -225,7 +225,6 @@ mod tests {
     #[test]
     fn every_direct_target_rust_recipe_uses_the_global_profile_and_companion_step() {
         let expected = [
-            "rust-toolchain",
             "td-audio",
             "td-authd",
             "td-boot",
@@ -251,7 +250,6 @@ mod tests {
             "td-txt",
             "td-update",
             "td-util",
-            "td-util-boot",
             "td-vm-guest",
         ];
         let mut covered = Vec::new();
@@ -289,7 +287,7 @@ mod tests {
                     policy_position > source_position,
                     "{stem}: target policy must follow recipe-local rustc options"
                 );
-                for required in td_engine::target_profile::DIRECT_RUSTC_ARGS.iter().take(4) {
+                for required in td_engine::target_profile::DIRECT_RUSTC_ARGS.iter().take(5) {
                     assert!(
                         argv.iter().any(|arg| arg == required),
                         "{stem}: direct rustc omitted {required}"
@@ -397,7 +395,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("assembly exception names missing recipe {stem}"));
             if matches!(
                 stem,
-                "gcc-x86-64-stage1" | "gcc-x86-64-native" | "rust-stage0"
+                "gcc-x86-64-stage1" | "gcc-x86-64-native" | "rust-toolchain"
             ) {
                 continue;
             }
@@ -416,9 +414,9 @@ mod tests {
         }
 
         // These compiler rungs are build-only provenance for libgcc objects
-        // (or, for rust-stage0, the snapshot std td-util-boot links)
-        // linked into later outputs. They do not need companions of their own,
-        // but the marker on each split consumer must name the actual rung.
+        // linked into later outputs, and rust-toolchain is the prebuilt std
+        // every Rust output links. They need no companions of their own, but
+        // the marker on each split consumer must name the actual source.
         assert!(
             td_engine::target_profile::output_assembly_exceptions("glibc-x86-64")
                 .iter()
@@ -429,9 +427,11 @@ mod tests {
                 .iter()
                 .any(|(source, _)| *source == "gcc-x86-64-native"));
         }
-        let boot = td_engine::target_profile::output_assembly_exceptions("td-util-boot");
-        assert!(boot.iter().any(|(source, _)| *source == "rust-stage0"));
-        assert!(!boot.iter().any(|(source, _)| *source == "rust-toolchain"));
+        assert!(
+            td_engine::target_profile::output_assembly_exceptions("td-util")
+                .iter()
+                .any(|(source, _)| *source == "rust-toolchain")
+        );
 
         let mut rust_outputs: Vec<&str> = all()
             .into_iter()
@@ -450,7 +450,7 @@ mod tests {
                                     && argv.iter().any(|arg| arg.ends_with(".rs"))
                         )
                     });
-                (cargo || direct || stem == "rust-toolchain").then_some(stem)
+                (cargo || direct).then_some(stem)
             })
             .collect();
         rust_outputs.sort_unstable();
@@ -582,21 +582,13 @@ mod tests {
     }
 
     #[test]
-    fn deployment_and_toolchain_have_independent_external_debug_ceilings() {
-        for (stem, expected_scope, expected_report, expected_ceiling) in [
-            (
-                "rust-toolchain",
-                "rust-toolchain",
-                "{out}/share/td/debug-size",
-                td_engine::target_profile::TOOLCHAIN_DEBUG_CEILING_BYTES,
-            ),
-            (
-                "system-x86-64",
-                "deployment",
-                "{out}/deployment/debug-size",
-                td_engine::target_profile::DEPLOYMENT_DEBUG_CEILING_BYTES,
-            ),
-        ] {
+    fn the_deployment_has_an_external_debug_ceiling() {
+        for (stem, expected_scope, expected_report, expected_ceiling) in [(
+            "system-x86-64",
+            "deployment",
+            "{out}/deployment/debug-size",
+            td_engine::target_profile::DEPLOYMENT_DEBUG_CEILING_BYTES,
+        )] {
             let recipe = lookup(stem).unwrap_or_else(|| panic!("missing recipe {stem}"));
             let sizes: Vec<(&str, &str, u64)> = recipe
                 .steps
@@ -628,7 +620,7 @@ mod tests {
             ("gcc-runtime", 0),
             ("gcc-x86-64-self", 4),
             ("glibc-x86-64", 1),
-            ("rust-toolchain", 2),
+            ("zlib-x86-64", 1),
         ] {
             let recipe = lookup(stem).unwrap_or_else(|| panic!("missing target recipe {stem}"));
             let json = recipe.to_json().to_canonical();
@@ -678,21 +670,6 @@ mod tests {
                     "{stem}: the specific package-source remap must follow the build-root remap"
                 );
             }
-        }
-        let rust = lookup("rust-toolchain")
-            .expect("rust toolchain recipe")
-            .to_json()
-            .to_canonical();
-        for required in [
-            "debuginfo-level = 1",
-            "frame-pointers = true",
-            "release-debuginfo = false",
-            "remap-debuginfo = false",
-            "RUSTFLAGS_NOT_BOOTSTRAP",
-            "/td-cargo/vendor",
-            "strip = false",
-        ] {
-            assert!(rust.contains(required), "rust bootstrap omitted {required}");
         }
     }
 }

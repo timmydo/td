@@ -18,7 +18,7 @@ joins the gate by existing (`[package.metadata.td-gate]`, all-target
 Clippy).
 
 Implemented artifact: `recipes/src/recipes/td-dua.rs` builds it with
-the source-built stage2 toolchain from the checkout's own trees, td-dua
+td's Rust toolchain from the checkout's own trees, td-dua
 staged with td-civil, td-json, td-ui and td-compositor (td-ui's mounts
 and notices), as td-photo is, with td-json added; the binary is static,
 with its debug companion beside it. The image copies the whole output

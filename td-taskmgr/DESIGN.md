@@ -584,7 +584,7 @@ The affected-check mapping runs the discovered standalone crate and
 workspace lock/test/Clippy preflight. The target recipe stages td-taskmgr,
 td-ui and td-compositor, and the tests' dev-dependencies td-fs and
 td-test-compositor that cargo reads to resolve the lock, builds offline
-with the source-built Rust toolchain, and installs a static binary with
+with td's Rust toolchain, and installs a static binary with
 the standard frame-pointer/debug-companion policy. Its companion check executes the realized binary's help and two
 bounded resource observations. Source edits select the local pin and target
 recipe checks; DESIGN.md remains excluded from staging and source hashes.

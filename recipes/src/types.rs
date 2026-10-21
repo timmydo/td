@@ -45,11 +45,11 @@ pub enum BuildSystem {
     Cmake,
     Stage0,
     Mesboot,
-    /// The Rust stage0 TRANSFORM: NOT a compile. It assembles the exact upstream
-    /// rustc/rust-std/Cargo snapshot selected by the pinned Rust source, co-locates
-    /// its declared runtime closure, and retargets rustc/rustdoc/Cargo onto td's
-    /// glibc. Only the source-built stage2 recipe may consume this trust root.
-    RustStage0,
+    /// The upstream Rust dist TRANSFORM: NOT a compile. It assembles the pinned
+    /// rustc/rust-std/Cargo/Clippy release components, links in its declared
+    /// runtime (td glibc, gcc-runtime's libgcc_s, zlib), and retargets every
+    /// executable onto td's glibc loader. `rust-toolchain` is its one recipe.
+    RustDist,
 }
 
 impl BuildSystem {
@@ -60,7 +60,7 @@ impl BuildSystem {
             BuildSystem::Cmake => "cmake",
             BuildSystem::Stage0 => "stage0",
             BuildSystem::Mesboot => "mesboot",
-            BuildSystem::RustStage0 => "rust-stage0",
+            BuildSystem::RustDist => "rust-dist",
         }
     }
 }
@@ -1205,10 +1205,9 @@ impl Recipe {
     pub fn mesboot(name: &str, version: &str) -> Recipe {
         Recipe::base(name, version, BuildSystem::Mesboot)
     }
-    /// The stage0-only Rust snapshot transform. The final `rust-toolchain` is a
-    /// separate source build and must never use this build-system constructor.
-    pub fn rust_stage0(name: &str, version: &str) -> Recipe {
-        Recipe::base(name, version, BuildSystem::RustStage0)
+    /// The upstream Rust dist transform (`BuildSystem::RustDist`).
+    pub fn rust_dist(name: &str, version: &str) -> Recipe {
+        Recipe::base(name, version, BuildSystem::RustDist)
     }
 
     /// Attaches source pins like `inputs` does, and that is not symmetry for its

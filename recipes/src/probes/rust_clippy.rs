@@ -24,7 +24,7 @@ fn clippy(cargo: &Path, rustc: &Path, linker: &Path, root: &Path) -> Result<Outp
             "-Cforce-frame-pointers=yes\x1f-Cdebuginfo=line-tables-only",
         )
         .output()
-        .map_err(|error| format!("run source-built Cargo/Clippy: {error}"))
+        .map_err(|error| format!("run Cargo/Clippy: {error}"))
 }
 
 fn require_success(output: Output, phase: &str) -> Result<(), String> {
@@ -59,7 +59,7 @@ fn main() -> Result<(), String> {
     )
     .map_err(|error| error.to_string())?;
     let source = root.join("src/main.rs");
-    let clean = "fn main() { println!(\"source-built Clippy\"); }\n";
+    let clean = "fn main() { println!(\"td Clippy\"); }\n";
     std::fs::write(&source, clean).map_err(|error| error.to_string())?;
     require_success(clippy(cargo, rustc, linker, &root)?, "clean source")?;
 
@@ -81,7 +81,7 @@ fn main() -> Result<(), String> {
     }
     std::fs::write(
         &source,
-        "fn main() { println!(\"source-built Clippy: repaired\"); }\n",
+        "fn main() { println!(\"td Clippy: repaired\"); }\n",
     )
     .map_err(|error| error.to_string())?;
     require_success(clippy(cargo, rustc, linker, &root)?, "repaired source")?;

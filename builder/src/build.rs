@@ -2459,12 +2459,12 @@ fn cargo_selection(cargo_dir: &Path, pin_target: bool) -> Result<(Vec<String>, P
 ///                      carry internal whitespace, the same drv-safe encoding the
 ///                      autotools path uses.
 ///
-/// rust-stage0-build — assemble the exact upstream Rust bootstrap components and
-/// retarget their ELF interpreters to td's declared runtime closure. This is the
-/// explicit bootstrap trust-root transform; `rust-toolchain` is a separate recipe
-/// that source-builds the shipped stage2 compiler, standard library, and Cargo.
-pub fn run_rust_stage0() -> Result<(), String> {
-    crate::toolchain_x86_64::run_rust_stage0_build()
+/// rust-dist-build — assemble the pinned upstream Rust release components and
+/// retarget their ELF interpreters to td's declared runtime closure. This is
+/// `rust-toolchain`, the shipped upstream compiler, standard library, Cargo and
+/// Clippy: a declared Rust trust root.
+pub fn run_rust_dist() -> Result<(), String> {
+    crate::toolchain_x86_64::run_rust_dist_build()
 }
 
 /// Determinism: the configure pins CMAKE_BUILD_TYPE=Release and the build dir is a
@@ -5315,8 +5315,13 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(base.join("bin")).unwrap();
         fs::create_dir_all(base.join("lib")).unwrap();
-        let exception =
-            td_engine::target_profile::line_attribution_exception("rust-toolchain").unwrap();
+        let exception = td_engine::target_profile::LineAttributionException {
+            runtime_relative_path: "lib/libdriver.so",
+            max_line_section_bytes: 128 * 1024 * 1024,
+            max_companion_bytes: 192 * 1024 * 1024,
+            require_complete_line_strings: true,
+            reason: "fixture",
+        };
         let driver = base.join(exception.runtime_relative_path);
         fs::write(&driver, b"driver").unwrap();
 

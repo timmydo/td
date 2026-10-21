@@ -108,7 +108,7 @@ const NATIVE: &[NativeInput] = &[
     NativeInput {
         graph: "zlib-x86-64",
         recipe: "zlib-x86-64",
-        directory: "stage/td/store/zlib-1.3.1/lib",
+        directory: "lib",
         inside: "/zlib",
     },
 ];

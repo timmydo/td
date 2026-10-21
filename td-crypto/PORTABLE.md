@@ -145,7 +145,7 @@ it to realize these named outputs from the current checkout's recipes:
 | `gcc-x86-64-self` | `binutils-x86-64-self` | binutils 2.44, `/binutils` |
 | `gcc-x86-64-self` | `glibc-x86-64` | glibc 2.41 host loader/libraries, `/lib64` |
 | `gcc-x86-64-self` | `gcc-x86-64-stage2` | host libgcc_s, `/gcc-runtime` |
-| `zlib-x86-64` | `zlib-x86-64` | shared zlib 1.3.1 host runtime, `/zlib` |
+| `zlib-x86-64` | `zlib-x86-64` | shared zlib 1.3.1 host runtime, built in the Debian build root, `/zlib` |
 
 For aarch64, preparation additionally realizes `gcc-aarch64-cross` and
 mounts its output at `/cross`. It builds native x86-64 static GCC 14.3.0 and

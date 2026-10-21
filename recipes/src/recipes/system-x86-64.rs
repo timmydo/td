@@ -4905,8 +4905,9 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
         target: "{in:td-busd}/bin/td-busd".into(),
         link: "{root}/real-root/bin/td-busd".into(),
     });
-    // One standard image includes the source-built development toolchain.
-    // The compiler launcher supplies exact store paths without shell setup.
+    // One standard image includes the development toolchain: upstream Rust
+    // on td's runtime, and td's GCC behind the compiler launcher, which
+    // supplies exact store paths without shell setup.
     for name in ["rustc", "rustdoc", "cargo", "cargo-clippy", "clippy-driver"] {
         steps.push(Step::Symlink {
             target: format!("{{in:rust-toolchain}}/bin/{name}"),
@@ -5068,6 +5069,10 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
             "--exclude-registry",
             "{root}/real-root/etc/td-applications.tsv",
             "{root}/real-root/etc/td-profiler-application-roots.tsv",
+            // The upstream Rust toolchain ships no debug companions; its
+            // objects are a coverage boundary (td-profiler/DESIGN.md §7).
+            "--exclude-store-item",
+            "{in:rust-toolchain}",
         ],
     ));
     Ok(steps)
@@ -5266,8 +5271,7 @@ fn shape_check() -> String {
      [ \"$(head -n 1 \"$pindex\")\" = td-profiler-objects-v1 ] || { echo 'root tree: deployment profiler object index has the wrong header' >&2; exit 1; }; \
      netrow=$(grep -F \"{in:td-net}/bin/td-net\" \"$pindex\") || { echo 'root tree: deployment profiler object index omits td-net' >&2; exit 1; }; \
      case \"$netrow\" in *';assembly-boundary=1'*) : ;; *) echo 'root tree: deployment profiler object index omits the td-net assembly boundary' >&2; exit 1;; esac; \
-     driverrow=$(grep -F \"{in:rust-toolchain}/lib/librustc_driver-\" \"$pindex\") || { echo 'root tree: deployment profiler object index omits librustc_driver' >&2; exit 1; }; \
-     case \"$driverrow\" in *';line-attribution-boundary=1'*) : ;; *) echo 'root tree: deployment profiler object index omits the librustc_driver line-attribution boundary' >&2; exit 1;; esac; \
+     if grep -F \"{in:rust-toolchain}/\" \"$pindex\" >/dev/null; then echo 'root tree: deployment profiler object index lists the companion-less upstream Rust toolchain' >&2; exit 1; fi; \
      [ \"$(readlink \"$root/bin/td-jail\" 2>/dev/null)\" = \"{in:td-jail}/bin/td-jail\" ] || { echo 'root tree: /bin/td-jail is not a symlink to the staged confinement boundary' >&2; exit 1; }; \
      tdj=\"{root}/real-root{in:td-jail}/bin/td-jail\"; { [ -f \"$tdj\" ] && [ -x \"$tdj\" ]; } || { echo 'root tree: td-jail is not packed and executable, so the running-kernel transition oracle cannot run' >&2; exit 1; }; \
      [ \"$(readlink \"$root/bin/td-seatd\" 2>/dev/null)\" = \"{in:td-seatd}/bin/td-seatd\" ] || { echo 'root tree: /bin/td-seatd is not a symlink to the staged single-user seat assigner' >&2; exit 1; }; \
@@ -5767,6 +5771,9 @@ pub fn recipe() -> Recipe {
                 "td-secret",
                 "td-net",
                 "rust-toolchain",
+                // The upstream toolchain's runtime, which its lib/ links to.
+                "gcc-runtime",
+                "zlib-x86-64",
                 "gcc-x86-64-self",
                 "binutils-x86-64-self",
                 "td-cc",
@@ -6341,6 +6348,8 @@ mod tests {
                     "--exclude-registry",
                     "{root}/real-root/etc/td-applications.tsv",
                     "{root}/real-root/etc/td-profiler-application-roots.tsv",
+                    "--exclude-store-item",
+                    "{in:rust-toolchain}",
                 ]
         )));
         assert!(recipe()
@@ -9288,6 +9297,8 @@ mod tests {
         for required in [
             "libressl-x86-64",
             "rust-toolchain",
+            "gcc-runtime",
+            "zlib-x86-64",
             "gcc-x86-64-self",
             "binutils-x86-64-self",
             "td-cc",
@@ -9297,7 +9308,7 @@ mod tests {
                 "shipped input {required} must be declared"
             );
         }
-        for forbidden in ["rust-stage0", "gcc-x86-64-native", "bash-mesboot"] {
+        for forbidden in ["gcc-x86-64-native", "bash-mesboot", "python-mesboot"] {
             assert!(
                 !native_inputs.iter().any(|input| input == forbidden),
                 "build-only input {forbidden} must not be a direct system input"

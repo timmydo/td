@@ -230,7 +230,7 @@ base. Extend the existing system image where its capability checks identify
 a gap. These are requirements for development readiness, not prerequisites
 for the initial stock-desktop lifecycle increment. The image producer owns:
 
-- Source-built Rust, Cargo, linker/compiler tools, td control-plane tools,
+- td's Rust toolchain and Cargo, linker/compiler tools, td control-plane tools,
   Git, the source-built OpenSSH client and key generator, required build/test
   utilities, CA certificates, and declared offline dependency sources.
   A clean checkout must build its builder and run the
@@ -269,7 +269,7 @@ In particular, toolchain checks and a provider-authentication probe must pass
 before displaying an agent as ready. Probes do not submit prompts or paid
 model requests merely to check login.
 
-The native-toolchain increment packs source-built Rust/Cargo, GCC, binutils,
+The native-toolchain increment packs td's Rust/Cargo, GCC, binutils,
 and the `td-cc` compiler defaults into that standard image. Newly published
 bundles have a 256 GiB sparse disk and Btrfs filesystem, shared by the signed
 deployment and private writable `@var` state. Untouched capacity consumes no

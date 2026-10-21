@@ -183,8 +183,8 @@ pub fn recipe() -> Recipe {
                 "MAKEINFO=true",
                 "LDFLAGS=-static",
                 "LDFLAGS_FOR_TARGET=-static",
-                // rustc links this gcc's static libstdc++.a/libgcc.a into its SHARED
-                // librustc_driver.so, so target libs (C and C++) must be built PIC.
+                // Shared Rust outputs (proc macros, cdylibs) link this gcc's static
+                // libstdc++.a/libgcc.a, so target libs (C and C++) must be built PIC.
                 "CFLAGS_FOR_TARGET=-g1 -O2 -fPIC -fno-omit-frame-pointer -ffile-prefix-map={root}=/td-build-root -ffile-prefix-map={src}=/td-build",
                 "CXXFLAGS_FOR_TARGET=-g1 -O2 -fPIC -fno-omit-frame-pointer -ffile-prefix-map={root}=/td-build-root -ffile-prefix-map={src}=/td-build",
             ],

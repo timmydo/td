@@ -30,7 +30,7 @@ format from the **target**. There is no target-side OSTree client, GVariant
 reader, OpenPGP verification, HTTP or TLS. §B.3.1 selects a bounded
 control-plane reader for exact Flathub commit graphs; the signature that
 authorizes each commit is still checked by a human when the pin is reviewed,
-the same way td already trusts the kernel tarball and Rust bootstrap snapshot.
+the same way td already trusts the kernel tarball and Rust release.
 
 The cost is that the curated set is td's to maintain: a seed bump is a
 pin review plus a rebuild, and no application td has not packaged can be
@@ -1029,7 +1029,7 @@ further code, the outer sandbox parent recognizes the four application-capable
 runners and materializes the manifest, spec and `exports/launcher.tsv` as mode
 0644 metadata. It creates `exports/` as mode 0755 without following a symlink.
 None of the three values is passed into the package PID namespace. The sealed
-`stage0` seed and downloaded `rust-stage0` trust root refuse application
+`stage0` seed and the `rust-dist` toolchain transform refuse application
 metadata at assembly; their outer post-build verifier only reserves the root
 names and can never write metadata.
 This is not a `Step`: applications built with GNU, CMake or Cargo get the same
@@ -1186,7 +1186,7 @@ fetch, so pinning one would require td to host it, which §Z refuses.
 
 1. **Pin what upstream publishes** as a plain file at a stable URL, in
    `recipes/src/source_pins.rs` — a URL, a `sha256`, a filename. The
-   mechanism the kernel tarball and Rust bootstrap snapshot already use,
+   mechanism the kernel tarball and Rust release components already use,
    fetched by `td-net`, verified the same way. The pin carries the
    `foreign` taint (§B.8).
 2. **A recipe transforms it** into a package: unpack, lay out `files/`, and
@@ -2280,11 +2280,12 @@ itself had, answered with a number rather than with a fixture.
 **The second line is NOT spelled `source-bootstrapped`, and that is a
 correction review forced rather than a wording preference.** The count is
 members minus marked payloads, and two members of this very closure are
-prebuilt: `rust-stage0` transforms an upstream binary snapshot, and
-`stage0` is the stage0-posix seed. Both are td's declared bootstrap trust
-roots, which AGENTS.md's claim names as its own exception — "no foreign
-binary other than its declared bootstrap seeds" — and §B.8's mark is
-about APPLICATION payloads and says nothing about them. A line spelled
+prebuilt: `rust-toolchain` is the upstream Rust release, and `stage0`
+is the stage0-posix seed. Both are td's declared trust roots, which
+AGENTS.md's claim names as its own exceptions — "no foreign binary other
+than its declared bootstrap seeds, the Debian build root's tools, the
+upstream Rust toolchain" — and §B.8's mark is about APPLICATION payloads
+and says nothing about them. A line spelled
 `source-bootstrapped 66` would therefore deny something td declares, and
 a reader parsing it as "nothing prebuilt is in here" would be wrong. So
 the wire says `unmarked`, the design sentence stays what it is, and
@@ -2534,12 +2535,16 @@ into the runtime at `/usr`. It does not resolve on td's image root — and
 that much is true, though not for the reason a draft gave. It cited
 `builder/src/elf.rs`'s interpreter retargeting, whose only production
 caller is `toolchain_x86_64.rs`'s `relink_rust_interp` over `rustc`,
-`rustdoc` and `cargo`, which are Rust stage0 and excluded from final
-closures. The real reason is that td's shipped userland is **statically
+`rustdoc` and `cargo`, which were then Rust stage0 and excluded from final
+closures. The real reason was that td's shipped userland is **statically
 linked**, asserted by `Step::AssertStatic` in about twenty-eight
-recipes; nothing in the image has an interpreter at all. Same conclusion,
-and the difference matters because the stated reason would survive td
-shipping one dynamically-linked binary and the real one would not. So —
+recipes; nothing in the image then had an interpreter at all. Same
+conclusion, and the difference mattered because the stated reason would
+survive td shipping one dynamically-linked binary and the real one would
+not. td now ships one such set: the upstream Rust toolchain, whose
+executables carry td glibc's store loader as `PT_INTERP`, never `/lib64`;
+the conclusion still holds because no seed's `/lib64` interpreter
+resolves on the image root. So —
 the argument went — a payload exec'd outside a jail fails `ENOENT`
 before one instruction of its code runs.
 
@@ -2578,7 +2583,7 @@ is, **`AGENTS.md` says "applications are RUN behind td's boundaries",
 never "can only run" behind them.**
 
 Deliberately **not** done: retargeting a payload's interpreter into the
-store the way the Rust bootstrap snapshot's is. That would make the
+store the way the upstream Rust toolchain's is. That would make the
 payload no longer the pinned bytes, and it is the jail's job to supply
 the runtime.
 
@@ -9669,7 +9674,7 @@ The experiments that settle what is left, none longer than a week:
 | **E1 — package half answered (§B.3.1)** | inspect the signed Firefox 154.0 and Freedesktop 25.08 deploy commits without executing the app; map their exact `files/` trees to `/app` and `/usr` | the deploy hierarchy is the right package/runtime split and has no special or setid files. Publisher estimates total 993.7 MB deployed and 382.7 MB downloaded; the bounded importer records exact authenticated graph totals separately. Execution waits on the dynamic-runtime/jail, bus and Wayland stop line rather than using host `bwrap` as a substitute for td-jail |
 | **E1b — COMPLETE** | fetch, materialize and admit the same exact signed Flathub commits through a bounded control-plane importer | Exact-ref admission, commit/root/file authentication, bounded graph acquisition, offline cache re-authentication and repair, transactional cache publication, transactional `files/` reconstruction, typed recipe pins, automatic warming and marked recursive store admission are landed and exercised against both pins. Flathub publishes no stable deploy tarball, so an ambient `flatpak` recipe and a locally hosted export are both refused. §B.3.1 is the importer contract; dynamic runtime validation and jail integration are the next application increments |
 | **E2 — COMPLETE** | filter globals from GTK 4.22.1; exercise forced Cairo; compile in exact Freedesktop SDK 25.08 and run against the exact pinned Platform; run pinned Firefox 154.0 on no-dmabuf Weston and test its nested user namespace and `about:support` sandbox report | data-device is the GTK first-window blocker while subcompositor is class U; forced Cairo, pinned llvmpipe, and pinned Firefox all attach shm without dmabuf; stock Firefox denies nested user namespaces yet retains effective content sandbox level 6, selecting one standard td filter. The pinned Freedesktop runtime contains GTK 3 rather than GTK 4, so a future GTK 4 runtime selection repeats that identified part of the matrix |
-| **E3** | a Meson-world pilot — recipes for `pkgconf`, Ninja, Meson, a native CPython, then GLib and a Wayland-only `gtk3-demo` | td's *actual* per-package source cost, the number with the widest error bars. Near `cmake-x86-64`'s cost and the source track is real; a multi-week fight per package and the hybrid is permanent posture |
+| **E3** | a Meson-world pilot — recipes for `pkgconf`, Ninja, Meson, a native CPython, then GLib and a Wayland-only `gtk3-demo` | td's *actual* per-package source cost, the number with the widest error bars. Near `cmake-x86-64`'s cost (a recipe since deleted) and the source track is real; a multi-week fight per package and the hybrid is permanent posture |
 | **E4 — COMPLETE** | the §0 cgroup pins plus live active membership and exact controller readback for Firefox gating the QEMU oracle; lower-level regressions retain the fixture's `memory.high=48M`, `memory.max=64M`, `pids.max=32`, and `cpu.max=50000 100000` case | §P's mechanism works on the target kernel, while the smaller exact fixture policy remains pinned below it |
 | **E5** | `glxinfo` inside a jail on virtio-gpu QEMU with the runtime's GL extension mounted | §M's first step |
 | **E6** | `RLIMIT_AS=2G` on Firefox; record the crash | closes the rlimits-versus-cgroups argument with data |
