@@ -7,16 +7,17 @@ use td_recipe::types::CheckRunner;
 
 use crate::check_runner::{is_executable, RecipeCheckRunner, TD_STORE_DIR};
 
-// The nested `stage/td/store/<pkg>` prefix each `-self`/glibc recipe output carries.
-// `td-builder`'s NATIVE_GCC_STAGE/toolchain_x86_64::GLIBC_X86_64_STAGE embed the
-// same pinned versions for the build-plan `--auto` link env; the two must move
-// together on a compiler/libc bump (re #547).
-const GCC_STAGE: &str = "stage/td/store/gcc-14.3.0-x86_64-self";
+// The nested `stage/td/store/<pkg>` prefix the glibc recipe output carries.
+// `td-builder`'s toolchain_x86_64::GLIBC_X86_64_STAGE embeds the same pinned
+// version; the two must move together on a libc bump (re #547).
 pub(super) const GLIBC_STAGE: &str = "stage/td/store/glibc-2.41-x86_64";
 
 /// The userland the `td shell` product proof builds and exercises, in the
 /// order `CheckRunner::RustToolchain` declares them.
 const PROVED_USERLAND: &[&str] = &["ripgrep", "fd", "uutils"];
+
+/// The runner's last declared build: the readelf the proofs inspect with.
+const INSPECTOR: &str = "binutils-x86-64-self";
 
 /// The shipped executables the transform relinks onto td glibc's loader.
 const RELINKED: &[&str] = &[
@@ -39,27 +40,25 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     let glibc_tree = runner.ladder_out_from(&build_out, "glibc-x86-64")?;
     let runtime_tree = runner.ladder_out_from(&build_out, "gcc-runtime")?;
     let zlib_tree = runner.ladder_out_from(&build_out, "zlib-x86-64")?;
-    // The proofs link through td-link, as every Rust recipe does. GCC is the
-    // C compiler `td shell` hands C build scripts, and binutils the readelf
-    // the proofs inspect with.
+    // The proofs link through td-link, as every Rust recipe does, and
+    // inspect with binutils' readelf. `td shell` builds in the Debian build
+    // root, whose gcc compiles C build scripts.
     runner.prepare_recipe_target("td-link")?;
     let link_out = runner.build_plan("td-link")?;
     let link_tree = runner.ladder_out_from(&link_out, "td-link")?;
-    runner.prepare_recipe_target("gcc-x86-64-self")?;
-    let gcc_out = runner.build_plan("gcc-x86-64-self")?;
-    let gcc_tree = runner.ladder_out_from(&gcc_out, "gcc-x86-64-self")?;
-    let binutils_tree = runner.ladder_out_from(&gcc_out, "binutils-x86-64-self")?;
+    runner.prepare_recipe_target(INSPECTOR)?;
+    let binutils_out = runner.build_plan(INSPECTOR)?;
+    let binutils_tree = runner.ladder_out_from(&binutils_out, INSPECTOR)?;
     // The proof's shell and text tools are the bootstrap root's userland:
     // nothing later exists before this check. The toolchain's closure is
-    // built in the Debian root, so they come from GCC's plan.
-    let gcc = "gcc-x86-64-self";
+    // built in the Debian root, so they come from binutils' plan.
     let sh = format!(
         "{}/sh",
-        root_userland_bin(runner, gcc, &gcc_out, "bash-mesboot")?
+        root_userland_bin(runner, INSPECTOR, &binutils_out, "bash-mesboot")?
     );
     let userland = ROOT_USERLAND
         .iter()
-        .map(|stem| root_userland_bin(runner, gcc, &gcc_out, stem))
+        .map(|stem| root_userland_bin(runner, INSPECTOR, &binutils_out, stem))
         .collect::<Result<Vec<_>, _>>()?
         .join(":");
     println!(
@@ -77,14 +76,12 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     }
 
     let rust_base = path_basename(&rust_tree)?;
-    let gcc_base = path_basename(&gcc_tree)?;
     let binutils_base = path_basename(&binutils_tree)?;
     let glibc_base = path_basename(&glibc_tree)?;
     let link_base = path_basename(&link_tree)?;
     let td_link = format!("{TD_STORE_DIR}/{link_base}/bin/td-link");
     let rust_path = format!("{TD_STORE_DIR}/{rust_base}");
-    let gcc_path = format!("{TD_STORE_DIR}/{gcc_base}/{GCC_STAGE}");
-    let binutils_path = format!("{TD_STORE_DIR}/{binutils_base}/bin");
+    let readelf = format!("{TD_STORE_DIR}/{binutils_base}/bin/readelf");
     let glibc_path = format!("{TD_STORE_DIR}/{glibc_base}/{GLIBC_STAGE}");
     let runtime_path = format!("{TD_STORE_DIR}/{}/lib", path_basename(&runtime_tree)?);
     let zlib_path = format!("{TD_STORE_DIR}/{}/lib", path_basename(&zlib_tree)?);
@@ -108,7 +105,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         "set -eu\n\
          test ! -e /gnu/store\n\
          export PATH='{userland}'\n\
-         readelf='{binutils_path}/readelf'\n\
+         readelf='{readelf}'\n\
          interp='{glibc_path}/lib/ld-linux-x86-64.so.2'\n\
          cd '{rust_path}'\n\
          for b in {relinked}; do\n\
@@ -153,16 +150,13 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     }
     prove_td_shell_userland(
         runner,
-        &[&build_out, &link_out, &gcc_out],
-        &gcc_path,
-        &binutils_path,
+        &[&build_out, &link_out],
+        &readelf,
         &glibc_path,
         &sh,
         &userland,
         rust_base,
         link_base,
-        gcc_base,
-        binutils_base,
         glibc_base,
     )?;
     println!(
@@ -175,15 +169,12 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
 fn prove_td_shell_userland(
     runner: &RecipeCheckRunner,
     build_outs: &[&Path],
-    gcc_path: &str,
-    binutils_path: &str,
+    readelf: &str,
     glibc_path: &str,
     sh: &str,
     userland: &str,
     rust_base: &str,
     link_base: &str,
-    gcc_base: &str,
-    binutils_base: &str,
     glibc_base: &str,
 ) -> Result<(), String> {
     let root = std::env::current_dir().map_err(|e| format!("current dir: {e}"))?;
@@ -191,17 +182,20 @@ fn prove_td_shell_userland(
     // The packages are the runner's declared builds, so the key and reach
     // that read them name exactly what is built here; their versions come
     // from the recipes, so a bump needs no edit to this proof.
-    let packages = CheckRunner::RustToolchain.extra_builds();
+    let declared = CheckRunner::RustToolchain.extra_builds();
     // The script below exercises each package in its own role; a declared
     // build it does not exercise, or a role it lost, is a drift to fix here.
-    if packages != PROVED_USERLAND {
-        return Err(format!(
-            "rust-toolchain declares the builds [{}] but its product proof exercises \
-             [{}]; change both together",
-            packages.join(" "),
-            PROVED_USERLAND.join(" ")
-        ));
-    }
+    let packages = match declared.split_last() {
+        Some((last, userland)) if *last == INSPECTOR && userland == PROVED_USERLAND => userland,
+        _ => {
+            return Err(format!(
+                "rust-toolchain declares the builds [{}] but its product proof exercises \
+                 [{} {INSPECTOR}]; change both together",
+                declared.join(" "),
+                PROVED_USERLAND.join(" ")
+            ))
+        }
+    };
     let version = |stem: &str| {
         catalog::lookup(stem)
             .map(|r| r.version)
@@ -226,8 +220,6 @@ fn prove_td_shell_userland(
     let lock = format!(
         "rust-toolchain {TD_STORE_DIR}/{rust_base} td-recipe-output\n\
          td-link {TD_STORE_DIR}/{link_base} td-recipe-output\n\
-         gcc-x86-64-self {TD_STORE_DIR}/{gcc_base} td-recipe-output\n\
-         binutils-x86-64-self {TD_STORE_DIR}/{binutils_base} td-recipe-output\n\
          glibc-x86-64 {TD_STORE_DIR}/{glibc_base} td-recipe-output\n"
     );
     fs::write(&native_lock, &lock).map_err(|e| format!("write {}: {e}", native_lock.display()))?;
@@ -312,7 +304,7 @@ fn prove_td_shell_userland(
          case \"$uu_id\" in ''|*[!0-9]*) exit 98 ;; esac\n\
          \"$uutils\" --list >/tmp/td-shell-userland/uutils-list || exit 99\n\
          rc=0; grep -F -x stdbuf /tmp/td-shell-userland/uutils-list >/dev/null || rc=$?; [ \"$rc\" = 1 ] || exit 100\n\
-         readelf='{binutils_path}/readelf'\n\
+         readelf='{readelf}'\n\
          \"$readelf\" -l \"$rg\" | grep -F '{interp}' >/dev/null\n\
          \"$readelf\" -l \"$fd\" | grep -F '{interp}' >/dev/null\n\
          \"$readelf\" -l \"$uutils\" | grep -F '{interp}' >/dev/null\n\
@@ -345,6 +337,8 @@ fn prove_td_shell_userland(
     let persist_db_s = path_str(&persist_db)?;
     let store_ns_builder_s = path_str(store_ns_builder)?;
     let evaluator_s = path_str(&evaluator)?;
+    // Every Cargo recipe builds in the Debian build root.
+    let (root_store, seed_db) = runner.build_root_seed()?;
     let mut cmd: Command = runner.clean_builder_command();
     cmd.env("HOME", product_s)
         .env("TMPDIR", tmp_s)
@@ -355,23 +349,11 @@ fn prove_td_shell_userland(
         .env("TD_SHELL_REPO_ROOT", repo_s)
         .env("TD_SHELL_NATIVE_STORE", tdstore_s)
         .env("TD_SHELL_NATIVE_EXTRA_DBS", dbs)
-        .env("TD_SHELL_NATIVE_INTERP", &interp)
-        .env("TD_SHELL_NATIVE_RPATH", format!("{glibc_path}/lib"))
-        .env(
-            "TD_SHELL_NATIVE_BDIR",
-            format!("{binutils_path}:{glibc_path}/lib"),
-        )
-        .env("TD_SHELL_NATIVE_CC", format!("{gcc_path}/bin/gcc"))
-        .env("TD_SHELL_NATIVE_CXX", format!("{gcc_path}/bin/g++"))
-        .env("TD_SHELL_NATIVE_INCLUDE", format!("{glibc_path}/include"))
+        .env("TD_SHELL_NATIVE_BUILD_ROOT_STORE", path_str(root_store)?)
+        .env("TD_SHELL_NATIVE_BUILD_ROOT_SEED_DB", path_str(seed_db)?)
         .env("TD_SHELL_NATIVE_LOCK", lock_s)
         .env("TD_PERSIST_STORE", tdstore_s)
         .env("TD_PERSIST_DB", persist_db_s);
-    // The GCC built above the pinned root references root items, which
-    // only the root db vouches; td-builder authenticates it at intake.
-    if let Some(db) = runner.bootstrap_root_db_for("gcc-x86-64-self")? {
-        cmd.env("TD_SHELL_NATIVE_ROOT_DB", path_str(&db)?);
-    }
     // The shell asks this evaluator for each recipe it builds; the command
     // carries the check's confinement, so it refuses any not declared.
     cmd.arg("shell")
@@ -522,8 +504,10 @@ mod tests {
     /// verdict key reads what the proof builds and nothing is built unproved.
     #[test]
     fn the_proof_exercises_exactly_the_declared_builds() {
+        let mut proved = super::PROVED_USERLAND.to_vec();
+        proved.push(super::INSPECTOR);
         assert_eq!(
-            super::PROVED_USERLAND,
+            proved,
             td_recipe::types::CheckRunner::RustToolchain.extra_builds()
         );
     }

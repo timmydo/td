@@ -108,9 +108,10 @@ deleted; its findings are summarized under "Facts" below.
    input map; the sandbox binds it read-only as `/` (typed `BuildRoot`,
    never a builder); an output may not reference it or carry an ELF
    interpreter/RUNPATH or a symlink that resolves outside the store. Only
-   `build-plan` (the check runner's path) admits the root's db; the
-   daemon and `build-recipe` fail closed on a build-root drv until a
-   later increment needs them. AGENTS.md and UNSAFE.md amended. Test:
+   `build-plan` (the check runner's path) and, since 7b, `build-recipe`
+   with `--build-root-db` and `--build-root-store` admit the root's db;
+   the daemon admits none, so a build-root drv fails closed there.
+   AGENTS.md and UNSAFE.md amended. Test:
    `build-root-hello-test` (freestanding C compiled and run in the root).
 4. **Kernel in the build root.** First (4a), td-util gains a Rust
    `gen_init_cpio`, byte-identical to the kernel's, and the boot recipes
@@ -166,6 +167,30 @@ deleted; its findings are summarized under "Facts" below.
    build root against td glibc instead of with gcc-x86-64-self, so Cargo
    recipes drop their GCC and binutils for C. Amends `crypto_policy.rs`
    and the td-crypto/td-mta design docs for AWS-LC's compiler.
+   Landed: every Cargo recipe (all seventeen) declares the build root
+   and only rust-toolchain, td-link and glibc-x86-64; the builder
+   refuses a Cargo recipe outside the root. The runner hands build
+   scripts the root's gcc and `ar` (`as` through COMPILER_PATH, no C++),
+   with the target profile's `cargo_cflags` then `-nostdinc`, `-isystem`
+   for gcc's own headers and td glibc's, `-MD`, and a specs file whose
+   link spec is an error; after Cargo, every object must have its header
+   list, each header resolving (symlinks followed) into those two trees
+   or the build's own, every C object's DWARF producer must keep frame
+   pointers, and the object count must equal the recipe's `c_objects`
+   (absent, none). The root's objcopy splits the companions. C is
+   compiled for ring (td-net, 30 objects) and oniguruma (uutils, 48);
+   blake3 compiles none for uutils' applets, fd's jemalloc stays
+   disabled, and ripgrep's jemalloc (musl only) and pcre2 (opt-in) are
+   not built. `td shell` admits the root through
+   `build-recipe --build-root-db/--build-root-store`. No recipe builds
+   AWS-LC: only td-crypto's host-only portable musl artifact does, with
+   the ladder's GCC and binutils against musl headers (and
+   gcc-aarch64-cross), so `crypto_policy.rs` and the td-crypto/td-mta
+   docs are unchanged and that kit moves with increment 11. Two ladder
+   uses remain for increment 11: the rust-toolchain check declares
+   binutils-x86-64-self as a build (`INSPECTOR`) for its readelf and the
+   root userland its proof runs under, and the direct-rustc recipes
+   still declare binutils-x86-64-self for objcopy.
 8. **C packages in the build root against td glibc**: LibreSSL (library
    only), curl, Git 2.55.0; popt, libdevmapper, util-linux libs,
    cryptsetup (static, as today); OpenSSH (`--without-openssl`). One

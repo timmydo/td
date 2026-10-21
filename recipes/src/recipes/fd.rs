@@ -2,17 +2,12 @@ use crate::types::Recipe;
 
 // Keep fd's C-building jemalloc default disabled. The committed lock and
 // declared native inputs let `td shell` and `build-plan --auto` share the same
-// offline crate closure and source-built target toolchain.
+// offline crate closure and toolchain, in the build root.
 pub fn recipe() -> Recipe {
     Recipe::rust("fd", "10.2.0")
         .source_input("fd-source")
-        .native_inputs(&[
-            "rust-toolchain",
-            "td-link",
-            "gcc-x86-64-self",
-            "binutils-x86-64-self",
-            "glibc-x86-64",
-        ])
+        .build_root()
+        .native_inputs(&["rust-toolchain", "td-link", "glibc-x86-64"])
         .cargo_lock("recipes/locks/fd/Cargo.lock")
         .bins(&["fd"])
         .no_default_features()

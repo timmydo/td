@@ -1724,6 +1724,351 @@ fn verify_committed_cargo_lock(
     Ok(committed)
 }
 
+/// The Debian build root's C tools a Cargo build's scripts reach.
+const BUILD_ROOT_CC: &str = "/usr/bin/gcc";
+const BUILD_ROOT_AR: &str = "/usr/bin/ar";
+/// Where gcc finds `as`.
+const BUILD_ROOT_TOOLS: &str = "/usr/bin";
+/// Debian gcc's own directory, holding its freestanding headers.
+const BUILD_ROOT_GCC_LIB: &str = "/usr/lib/gcc/";
+/// gcc's link spec for build-script C: td-link links every Rust output, so a
+/// compile that would link (a probe's `gcc probe.c -o probe`) fails rather
+/// than linking the root's libc.
+const NO_LINK_SPECS: &str =
+    "*link:\n%ebuild-script C may not link: td-link links every Rust output\n\n";
+
+/// Build-script C in the Debian build root: the root's gcc with td glibc's
+/// headers and gcc's own freestanding ones in place of the root's.
+struct BuildRootC {
+    gcc_include: String,
+    glibc_include: String,
+    /// The `NO_LINK_SPECS` file CFLAGS names.
+    specs: String,
+}
+
+/// What `BuildRootC::check_objects` found.
+#[derive(Debug, PartialEq)]
+struct CObjects {
+    objects: usize,
+    /// Of `objects`, those assembled from a `.S` source.
+    assembly: usize,
+}
+
+impl BuildRootC {
+    /// The root's C toolchain, with `NO_LINK_SPECS` written below `work`.
+    fn probe(work: &Path) -> Result<BuildRootC, String> {
+        if env::var_os("TD_BUILD_ROOT").is_none() {
+            return Err(
+                "a Cargo build runs in the Debian build root; TD_BUILD_ROOT is unset".into(),
+            );
+        }
+        let glibc_include = env::var("TD_RUST_C_INCLUDE")
+            .map_err(|_| "TD_RUST_C_INCLUDE not set (td glibc's headers)".to_string())?;
+        if !Path::new(&glibc_include).join("stdio.h").is_file() {
+            return Err(format!(
+                "TD_RUST_C_INCLUDE {glibc_include} holds no td glibc headers"
+            ));
+        }
+        let out = Command::new(BUILD_ROOT_CC)
+            .arg("-print-file-name=include")
+            .env_clear()
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| format!("run {BUILD_ROOT_CC}: {e}"))?;
+        let gcc_include = String::from_utf8(out.stdout)
+            .map_err(|_| format!("{BUILD_ROOT_CC} -print-file-name: not UTF-8"))?
+            .trim()
+            .to_string();
+        if !out.status.success()
+            || !gcc_include.starts_with(BUILD_ROOT_GCC_LIB)
+            || !Path::new(&gcc_include).join("stddef.h").is_file()
+        {
+            return Err(format!(
+                "{BUILD_ROOT_CC} names no freestanding include directory under \
+                 {BUILD_ROOT_GCC_LIB}: `{gcc_include}'"
+            ));
+        }
+        let specs = work.join("td-c-no-link.specs");
+        fs::write(&specs, NO_LINK_SPECS).map_err(|e| format!("write {}: {e}", specs.display()))?;
+        let specs = specs.to_str().ok_or("non-UTF-8 specs path")?.to_string();
+        Ok(BuildRootC {
+            gcc_include,
+            glibc_include,
+            specs,
+        })
+    }
+
+    /// Cargo's C environment: the root's gcc and `ar`, `as` found through
+    /// COMPILER_PATH (the root's /usr/bin is not on PATH), and the target
+    /// profile's C flags, then the headers: `-nostdinc` drops every standard
+    /// directory, the root's /usr/include among them, `-MD` leaves each
+    /// object's header list beside it for `check_objects`, and the specs file
+    /// refuses a link. No CXX: `cc` finds no C++ compiler on PATH, so C++
+    /// fails rather than reaching the root's.
+    fn env(&self, profile: &str) -> Vec<(String, String)> {
+        let cflags = format!(
+            "{profile} -nostdinc -isystem {} -isystem {} -MD -specs={}",
+            self.gcc_include, self.glibc_include, self.specs
+        );
+        [
+            ("CC", BUILD_ROOT_CC),
+            ("AR", BUILD_ROOT_AR),
+            ("COMPILER_PATH", BUILD_ROOT_TOOLS),
+            ("CFLAGS", &cflags),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect()
+    }
+
+    /// Every object under `target` has its `-MD` list; every header in it
+    /// resolves, symlinks followed, below td glibc's or gcc's own headers or
+    /// one of the build's `trees`; and every C object's producer keeps frame
+    /// pointers. An object without a list was compiled without CFLAGS. A
+    /// relative header resolves against the compiling build script's
+    /// vendored package (`build_script_package`).
+    fn check_objects(
+        &self,
+        target: &Path,
+        trees: &[&str],
+        vendor: &Path,
+    ) -> Result<CObjects, String> {
+        let mut admitted = Vec::new();
+        for dir in trees
+            .iter()
+            .copied()
+            .chain([self.gcc_include.as_str(), self.glibc_include.as_str()])
+        {
+            // A tree the build never made admits nothing.
+            if let Ok(dir) = fs::canonicalize(dir) {
+                admitted.push(dir);
+            }
+        }
+        let mut objects = Vec::new();
+        if target.is_dir() {
+            collect_objects(target, &mut objects)?;
+        }
+        let mut assembly = 0;
+        for object in &objects {
+            let list = object.with_extension("d");
+            let text = fs::read_to_string(&list).map_err(|e| {
+                format!(
+                    "C object {} has no header list {} ({e}): compiled without CFLAGS",
+                    object.display(),
+                    list.display()
+                )
+            })?;
+            let prerequisites = make_prerequisites(&text);
+            let mut package = None;
+            for header in &prerequisites {
+                let path = if header.starts_with('/') {
+                    PathBuf::from(header)
+                } else {
+                    let dir = match package.take() {
+                        Some(dir) => dir,
+                        None => build_script_package(object, vendor)?,
+                    };
+                    let path = dir.join(header);
+                    package = Some(dir);
+                    path
+                };
+                header_admitted(&path, &admitted)
+                    .map_err(|why| format!("C object {} read {header}, {why}", object.display()))?;
+            }
+            let source = prerequisites
+                .first()
+                .ok_or_else(|| format!("C object {}: empty header list", object.display()))?;
+            if assembled_or_keeps_frame_pointers(object, source)? {
+                assembly += 1;
+            }
+        }
+        Ok(CObjects {
+            objects: objects.len(),
+            assembly,
+        })
+    }
+}
+
+/// Every regular `*.o` below `dir`, symlinks not followed.
+fn collect_objects(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+    let entries = fs::read_dir(dir).map_err(|e| format!("read {}: {e}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("read {}: {e}", dir.display()))?;
+        let path = entry.path();
+        let kind = entry
+            .file_type()
+            .map_err(|e| format!("stat {}: {e}", path.display()))?;
+        if kind.is_dir() {
+            collect_objects(&path, out)?;
+        } else if kind.is_file() && path.extension() == Some(OsStr::new("o")) {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+/// The words of a gcc `-MD` rule but its target: `\`-newline continues,
+/// `\ ` and `\#` escape, `$$` is `$`.
+fn make_prerequisites(text: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if matches!(chars.peek(), Some(' ' | '#')) => {
+                if let Some(escaped) = chars.next() {
+                    word.push(escaped);
+                }
+            }
+            '$' if chars.peek() == Some(&'$') => {
+                chars.next();
+                word.push('$');
+            }
+            '\\' if chars.peek() == Some(&'\n') => {
+                chars.next();
+                words.push(std::mem::take(&mut word));
+            }
+            c if c.is_whitespace() => words.push(std::mem::take(&mut word)),
+            c => word.push(c),
+        }
+    }
+    words.push(word);
+    words
+        .into_iter()
+        .filter(|word| !word.is_empty() && !word.ends_with(':'))
+        .collect()
+}
+
+/// The vendored package whose build script compiled `object`: Cargo runs a
+/// build script in its package's directory and `cc` compiles there, so a
+/// relative header is relative to it. The object's `build/NAME-HASH`
+/// names the package; exactly one vendored `NAME-VERSION` whose manifest
+/// names NAME must exist.
+fn build_script_package(object: &Path, vendor: &Path) -> Result<PathBuf, String> {
+    let name = object
+        .ancestors()
+        .find_map(|dir| {
+            if dir.parent()?.file_name()? != "build" {
+                return None;
+            }
+            let (name, hash) = dir.file_name()?.to_str()?.rsplit_once('-')?;
+            (hash.len() == 16 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+                .then(|| name.to_string())
+        })
+        .ok_or_else(|| {
+            format!(
+                "C object {} names a relative header outside any build script's OUT_DIR",
+                object.display()
+            )
+        })?;
+    let prefix = format!("{name}-");
+    let mut found = Vec::new();
+    let entries = fs::read_dir(vendor).map_err(|e| {
+        format!(
+            "build script {name}: read vendor tree {}: {e}",
+            vendor.display()
+        )
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("read {}: {e}", vendor.display()))?;
+        let file_name = entry.file_name();
+        let versioned = file_name
+            .to_str()
+            .and_then(|n| n.strip_prefix(&prefix))
+            .is_some_and(|version| version.starts_with(|c: char| c.is_ascii_digit()));
+        // `md-` also prefixes `md-5-0.10.6`: the manifest names the package.
+        if versioned && package_name(&entry.path().join("Cargo.toml")).as_deref() == Some(&name) {
+            found.push(entry.path());
+        }
+    }
+    match found.as_slice() {
+        [package] => Ok(package.clone()),
+        _ => Err(format!(
+            "build script {name}: {} vendored packages of that name, so no compile \
+             directory for its relative headers",
+            found.len()
+        )),
+    }
+}
+
+/// The `[package]` table's `name` in a vendored crate's manifest, which
+/// crates.io normalizes to one `name = "..."` line.
+fn package_name(manifest: &Path) -> Option<String> {
+    let text = fs::read_to_string(manifest).ok()?;
+    let mut in_package = false;
+    for line in text.lines().map(str::trim) {
+        if line.starts_with('[') {
+            in_package = line == "[package]";
+        } else if in_package {
+            let Some(value) = line
+                .strip_prefix("name")
+                .and_then(|rest| rest.trim_start().strip_prefix('='))
+            else {
+                continue;
+            };
+            return value
+                .trim()
+                .strip_prefix('"')
+                .and_then(|v| v.strip_suffix('"'))
+                .map(str::to_string);
+        }
+    }
+    None
+}
+
+/// A header resolves, symlinks followed, below an admitted directory.
+fn header_admitted(header: &Path, admitted: &[PathBuf]) -> Result<(), String> {
+    let real = fs::canonicalize(header).map_err(|e| format!("which does not resolve ({e})"))?;
+    if admitted.iter().any(|dir| real.starts_with(dir)) {
+        return Ok(());
+    }
+    Err(format!(
+        "resolving to {}, outside td glibc's and gcc's own headers and the build's trees",
+        real.display()
+    ))
+}
+
+/// Whether `object` is assembly. A C object's producer must keep frame
+/// pointers: `-fno-omit-frame-pointer` with no later `-fomit-frame-pointer`,
+/// as a crate's own flags follow CFLAGS. An object with no C producer must
+/// come from a `.S` source, a coverage boundary td-profiler names; a plain
+/// `.s` leaves no `-MD` list, so `check_objects` refuses it first.
+fn assembled_or_keeps_frame_pointers(object: &Path, source: &str) -> Result<bool, String> {
+    let producers = crate::elf::debug_producers(object)?;
+    let mut c = producers.iter().filter(|producer| {
+        producer
+            .strip_prefix("GNU C")
+            .and_then(|rest| rest.chars().next())
+            .is_some_and(|c| c.is_ascii_digit())
+    });
+    let Some(first) = c.next() else {
+        if source.ends_with(".S") {
+            return Ok(true);
+        }
+        return Err(format!(
+            "C object {} from {source} names no GNU C producer (compiled without -g)",
+            object.display()
+        ));
+    };
+    for producer in std::iter::once(first).chain(c) {
+        let mut keeps = false;
+        for flag in producer.split_whitespace() {
+            match flag {
+                "-fno-omit-frame-pointer" => keeps = true,
+                "-fomit-frame-pointer" => keeps = false,
+                _ => {}
+            }
+        }
+        if !keeps {
+            return Err(format!(
+                "C object {} omits frame pointers: `{producer}'",
+                object.display()
+            ));
+        }
+    }
+    Ok(false)
+}
+
 /// rust-build — td's OWN Rust/cargo build "system" (sibling of `run`, the
 /// autotools runner). The REPLACEMENT for Guix's `cargo-build-system`: here the
 /// build LOGIC is td's Rust; only the rustc/cargo/gcc seed is the external
@@ -1734,21 +2079,22 @@ fn verify_committed_cargo_lock(
 ///
 /// Determinism (the durable repro oracle is `td-builder check`'s double-build):
 /// SOURCE_DATE_EPOCH=1 plus `--remap-path-prefix` strip the (varying) build-dir
-/// and CARGO_HOME absolute paths so the binary does not embed them; linking
-/// through gcc-toolchain's gcc (Guix's ld-wrapper) injects the RUNPATH to the
-/// toolchain libs, so the output runs on a guix system and both double-build runs
-/// share the same RUNPATH.
+/// and CARGO_HOME absolute paths so the binary does not embed them; td-link
+/// supplies the loader and run path of every link.
+///
+/// It runs in the Debian build root (`TD_BUILD_ROOT`): C a build script
+/// compiles is the root's gcc against td glibc's headers and gcc's own
+/// freestanding ones, compile-only, archived by the root's `ar`
+/// (`BuildRootC`).
 ///
 /// Inputs (env, set by `system td-build`):
 ///   out          the output store path.
 ///   TD_SRC       the crate source (a store directory or a source tarball).
-///   TD_INPUTS    ':'-joined input store paths (rustc, cargo, gcc, binutils,
-///                libc, build userland) — their bin/ dirs build PATH, lib/ build
-///                LIBRARY_PATH.
-///   TD_RUST_STORE_CC / TD_RUST_STORE_CXX optional exact compilers nested in a
-///                recipe output whose top-level `bin/` is not the installed
-///                compiler prefix (the native GCC ladder output).
-///   TD_RUST_STORE_INCLUDE optional ':'-joined native include directories.
+///   TD_INPUTS    ':'-joined input store paths (rustc, cargo, td-link, glibc)
+///                — their bin/ dirs build PATH.
+///   TD_RUST_C_INCLUDE td glibc's staged include tree.
+///   TD_RUST_C_OBJECTS the exact count of build-script objects; unset, none.
+///   TD_RUST_OBJCOPY the objcopy that splits debug companions.
 ///   TD_RUST_BINS space-separated binary names to install into $out/bin.
 ///   TD_CARGO_SUBDIR optional relative path from the materialized source root to
 ///                the Cargo workspace.
@@ -1799,30 +2145,16 @@ pub fn run_rust() -> Result<(), String> {
         return Err("TD_RUST_BINS is empty (no binaries to install)".into());
     }
 
-    // set-paths: PATH from inputs' bin/ dirs; LIBRARY_PATH from lib/lib64 so the
-    // ld-wrapper finds (and RUNPATHs) the toolchain libs at link time; C_INCLUDE_PATH
-    // from include/ so a crate's C build script (e.g. the crypto backend's `cc`
-    // build) finds the seed's headers — incl. the kernel headers (linux/*.h).
-    let mut path: Vec<String> = Vec::new();
-    let mut lib: Vec<String> = Vec::new();
-    let mut cinc: Vec<String> = Vec::new();
-    for p in inputs.split(':').filter(|s| !s.is_empty()) {
-        let bin = format!("{p}/bin");
-        if Path::new(&bin).is_dir() {
-            path.push(bin);
-        }
-        for sub in ["lib", "lib64"] {
-            let d = format!("{p}/{sub}");
-            if Path::new(&d).is_dir() {
-                lib.push(d);
-            }
-        }
-        let inc = format!("{p}/include");
-        if Path::new(&inc).is_dir() {
-            cinc.push(inc);
-        }
-    }
-    let path = path.join(":");
+    // set-paths: PATH from inputs' bin/ dirs alone; the root's /usr/bin is
+    // not on it, so a build script finds no root tool on PATH. The root is
+    // `/`, so an absolute path still runs one; CC and AR below name two.
+    let path = inputs
+        .split(':')
+        .filter(|s| !s.is_empty())
+        .map(|p| format!("{p}/bin"))
+        .filter(|bin| Path::new(bin).is_dir())
+        .collect::<Vec<_>>()
+        .join(":");
     let cargo = find_in_path(&path, "cargo").ok_or("cargo not found in TD_INPUTS")?;
     find_in_path(&path, "rustc").ok_or("rustc not found in TD_INPUTS")?;
     let objcopy = env::var("TD_RUST_OBJCOPY").map_err(|_| {
@@ -1834,32 +2166,14 @@ pub fn run_rust() -> Result<(), String> {
     let linker = find_in_path(&path, "td-link")
         .ok_or("td-link not found in TD_INPUTS (a Rust recipe declares td-link, its linker)")?;
     require_executable_file(&linker, "Rust linker td-link")?;
-    // The C compiler of crates with C build scripts (the `cc` crate honors CC).
-    let gcc = env::var("TD_RUST_STORE_CC")
-        .ok()
-        .filter(|p| !p.is_empty())
-        .or_else(|| find_in_path(&path, "gcc"))
-        .ok_or("gcc not found in TD_INPUTS and TD_RUST_STORE_CC is unset (C compiler)")?;
-    require_executable_file(&gcc, "native C compiler")?;
-    // Optional C/C++ compiler for crates with C build scripts (the `cc` crate honors
-    // CC/CXX). Absent for pure-Rust builds — harmless, since no C is compiled then.
-    let gpp = env::var("TD_RUST_STORE_CXX")
-        .ok()
-        .filter(|p| !p.is_empty())
-        .or_else(|| find_in_path(&path, "g++"));
-    if let Some(cxx) = &gpp {
-        require_executable_file(cxx, "native Rust C++ compiler")?;
-    }
-    if let Ok(extra) = env::var("TD_RUST_STORE_INCLUDE") {
-        for dir in extra.split(':').filter(|p| !p.is_empty()) {
-            if !Path::new(dir).is_dir() {
-                return Err(format!(
-                    "native Rust include directory does not exist: {dir}"
-                ));
-            }
-            cinc.push(dir.to_string());
-        }
-    }
+    let expected_objects: usize = match env::var("TD_RUST_C_OBJECTS") {
+        Ok(count) => count
+            .parse()
+            .map_err(|_| format!("TD_RUST_C_OBJECTS `{count}' is not a count"))?,
+        Err(env::VarError::NotPresent) => 0,
+        Err(e) => return Err(format!("TD_RUST_C_OBJECTS: {e}")),
+    };
+    let c = BuildRootC::probe(&env::current_dir().map_err(|e| e.to_string())?)?;
 
     // Materialize a WRITABLE source tree (cargo writes target/). A store directory
     // (self-host) is copied; a tarball is unpacked with its single top directory
@@ -1894,17 +2208,6 @@ pub fn run_rust() -> Result<(), String> {
         Err(env::VarError::NotPresent) => false,
         Err(e) => return Err(format!("TD_RUST_STATIC: {e}")),
     };
-    // The native /td/store toolchain's loader and `-B` roots, for C build
-    // scripts that link a probe with the native gcc (below).
-    let store_interp = env::var("TD_RUST_STORE_INTERP")
-        .ok()
-        .filter(|interp| !interp.is_empty());
-    let store_bdirs: Vec<String> = env::var("TD_RUST_STORE_BDIR")
-        .unwrap_or_default()
-        .split(':')
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned)
-        .collect();
     let build_abs = cwd.join(build_dir);
     let cargo_dir = cargo_workspace_dir(&build_abs, cargo_subdir.as_deref())?;
     if verify_cargo_lock {
@@ -1938,7 +2241,11 @@ pub fn run_rust() -> Result<(), String> {
     // the start files of each output kind, so the flags name none of them.
     let mut rustflags =
         td_engine::target_profile::cargo_rustflags(&build_abs, &cargo_home, &vendor_abs);
-    let cflags = td_engine::target_profile::cargo_cflags(&build_abs, &cargo_home, &vendor_abs);
+    let c_env = c.env(&td_engine::target_profile::cargo_cflags(
+        &build_abs,
+        &cargo_home,
+        &vendor_abs,
+    ));
     // `+crt-static` under the target's default `pic` relocation model is
     // rustc's static-PIE link: td-link receives `-static-pie`, starts the
     // image from glibc's `rcrt1.o`, and the output is ET_DYN with no
@@ -1950,46 +2257,13 @@ pub fn run_rust() -> Result<(), String> {
     if static_link {
         rustflags.push_str(" -Ctarget-feature=+crt-static");
     }
-    // A crate's C build script drives the `cc` crate, whose compile+link reads LIBRARY_PATH
-    // for BOTH -l libraries and the crt startfiles (crt1.o/crti.o/crtn.o) — but the
-    // native glibc's lib lives at a nested stage/td/store/<pkg>/lib path that is NOT any input's {p}/lib.
-    // Fold those same bdir dirs into LIBRARY_PATH so a C crypto crate (aws-lc-sys/ring) links
-    // instead of redding with "cannot find crt1.o". Unset ⇒ empty ⇒ no-op (the pure-Rust and
-    // self-host paths are unchanged); binutils' bin dir carries no libs so adding it is inert.
-    for b in &store_bdirs {
-        lib.push(b.clone());
-    }
-    // A C build script may compile *and run* a probe executable (aws-lc-sys's memcmp_check
-    // links a binary and asserts it exits 0). The native gcc bakes no interp/RUNPATH, so
-    // that probe cannot exec in the hermetic sandbox and the crate misreports it as a
-    // "compiler bug". Such probes honor LDFLAGS on their link, so give them the /td/store
-    // dynamic-linker + RUNPATH td-link gives a Rust link. The `cc` crate never reads LDFLAGS
-    // for its object compiles, so this only reaches build scripts that link a runnable exe.
-    // Unset TD_RUST_STORE_INTERP leaves only the deterministic build-ID policy.
-    let mut ldflags = String::from("-Wl,--build-id=sha1");
-    if let Some(interp) = &store_interp {
-        ldflags.push_str(&format!(" -Wl,--dynamic-linker,{interp}"));
-        for rp in env::var("TD_RUST_STORE_RPATH")
-            .unwrap_or_default()
-            .split(':')
-            .filter(|s| !s.is_empty())
-        {
-            ldflags.push_str(&format!(" -Wl,-rpath,{rp}"));
-        }
-    }
     let mut envs: Vec<(String, String)> = vec![
         ("out".into(), out.clone()),
         ("PATH".into(), path.clone()),
-        ("LIBRARY_PATH".into(), lib.join(":")),
-        ("C_INCLUDE_PATH".into(), cinc.join(":")),
-        ("CPLUS_INCLUDE_PATH".into(), cinc.join(":")),
-        ("CC".into(), gcc.clone()),
         (
             "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER".into(),
             linker.clone(),
         ),
-        ("CFLAGS".into(), cflags.clone()),
-        ("CXXFLAGS".into(), cflags),
         ("HOME".into(), "/homeless-shelter".into()),
         ("CARGO_HOME".into(), cargo_home.clone()),
         ("SOURCE_DATE_EPOCH".into(), "1".into()),
@@ -1999,10 +2273,7 @@ pub fn run_rust() -> Result<(), String> {
             crate::check_memory::build_jobs().to_string(),
         ),
     ];
-    if let Some(gpp) = gpp {
-        envs.push(("CXX".into(), gpp));
-    }
-    envs.push(("LDFLAGS".into(), ldflags));
+    envs.extend(c_env);
 
     // Assemble one Cargo vendor directory from registry archives, which retain
     // their Cargo.lock checksums.
@@ -2059,6 +2330,23 @@ pub fn run_rust() -> Result<(), String> {
     }
     let cargo_argv: Vec<&str> = cargo_args.iter().map(String::as_str).collect();
     run_cmd(&cargo, &cargo_argv, &cargo_dir_str, &envs, &WATCH_PHASE)?;
+    let found = c.check_objects(
+        &cargo_dir.join("target"),
+        &[build_abs.as_str(), cargo_home.as_str(), vendor_abs.as_str()],
+        &vendor_dir,
+    )?;
+    if found.objects != expected_objects {
+        return Err(format!(
+            "build scripts compiled {} C object(s); the recipe declares {expected_objects} \
+             (cObjects)",
+            found.objects
+        ));
+    }
+    println!(
+        ">> td-build: {} build-script C object(s) as declared, {} of them assembly; every \
+         header td glibc's, gcc's own or the build's; every C object keeps frame pointers",
+        found.objects, found.assembly
+    );
 
     // install the named binaries to $out/bin.
     let bindir = format!("{out}/bin");
@@ -5003,6 +5291,247 @@ pub fn run_mesboot() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An ELF64 relocatable object whose `.debug_str` holds `strings`.
+    fn object_with_debug_str(strings: &[&str]) -> Vec<u8> {
+        let mut debug_str = Vec::new();
+        for text in strings {
+            debug_str.extend_from_slice(text.as_bytes());
+            debug_str.push(0);
+        }
+        let names = b"\0.debug_str\0.shstrtab\0";
+        let str_at = 64usize;
+        let names_at = str_at + debug_str.len();
+        let headers_at = (names_at + names.len()).next_multiple_of(8);
+        let mut elf = vec![0u8; headers_at + 3 * 64];
+        elf[..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 2;
+        elf[5] = 1;
+        elf[6] = 1;
+        elf[16..18].copy_from_slice(&1u16.to_le_bytes());
+        elf[18..20].copy_from_slice(&62u16.to_le_bytes());
+        elf[20..24].copy_from_slice(&1u32.to_le_bytes());
+        elf[40..48].copy_from_slice(&(headers_at as u64).to_le_bytes());
+        elf[52..54].copy_from_slice(&64u16.to_le_bytes());
+        elf[58..60].copy_from_slice(&64u16.to_le_bytes());
+        elf[60..62].copy_from_slice(&3u16.to_le_bytes());
+        elf[62..64].copy_from_slice(&2u16.to_le_bytes());
+        elf[str_at..names_at].copy_from_slice(&debug_str);
+        elf[names_at..names_at + names.len()].copy_from_slice(names);
+        let mut section = |index: usize, name: u32, kind: u32, offset: usize, size: usize| {
+            let at = headers_at + index * 64;
+            elf[at..at + 4].copy_from_slice(&name.to_le_bytes());
+            elf[at + 4..at + 8].copy_from_slice(&kind.to_le_bytes());
+            elf[at + 24..at + 32].copy_from_slice(&(offset as u64).to_le_bytes());
+            elf[at + 32..at + 40].copy_from_slice(&(size as u64).to_le_bytes());
+        };
+        section(1, 1, 1, str_at, debug_str.len());
+        section(2, 12, 3, names_at, names.len());
+        elf
+    }
+
+    /// Build-script C names only td glibc's headers, gcc's own and the
+    /// build's trees, judged where each header resolves: `-nostdinc` with
+    /// the two `-isystem`s, `-MD` so every object leaves its header list, a
+    /// specs file that refuses a link, and a check that reads every list and
+    /// every C object's producer.
+    #[test]
+    fn build_script_c_reads_only_td_glibc_and_gcc_headers() {
+        let _base_cleanup = crate::test_temp::TempDir::new("td-cargo-c-headers").unwrap();
+        let base = _base_cleanup.join("fixture");
+        let glibc = base.join("glibc/include");
+        let gcc = base.join("gcc/include");
+        let outside = base.join("outside");
+        let build = base.join("build");
+        let out = build.join("target/release/build/onig_sys-0123456789abcdef/out");
+        // Cargo runs onig_sys's build script, and `cc`, in its package.
+        let vendor = base.join("vendor");
+        let package = vendor.join("onig_sys-69.8.1");
+        for dir in [
+            &out,
+            &glibc.join("bits"),
+            &gcc,
+            &outside,
+            &base.join("gcc/include-fixed"),
+            &package.join("oniguruma/src"),
+        ] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        for file in [
+            glibc.join("stdio.h"),
+            glibc.join("bits/types.h"),
+            gcc.join("stddef.h"),
+            base.join("gcc/include-fixed/limits.h"),
+            outside.join("stdio.h"),
+            out.join("regint.h"),
+            build.join("regexec.c"),
+            build.join("asm.S"),
+            build.join("a b.h"),
+            package.join("oniguruma/src/regexec.c"),
+        ] {
+            fs::write(file, b"").unwrap();
+        }
+        // crates.io's normalized manifest: `name` after other keys.
+        let manifest = |name: &str| {
+            format!("[package]\nedition = \"2018\"\nname = \"{name}\"\n[lib]\nname = \"x\"\n")
+        };
+        fs::write(package.join("Cargo.toml"), manifest("onig_sys")).unwrap();
+        // A build script's include directory that leads out of the build.
+        std::os::unix::fs::symlink(&outside, out.join("inc")).unwrap();
+        let c = BuildRootC {
+            gcc_include: gcc.to_str().unwrap().into(),
+            glibc_include: glibc.to_str().unwrap().into(),
+            specs: "/w/td-c-no-link.specs".into(),
+        };
+        let profile = td_engine::target_profile::cargo_cflags("/b", "/c", "/v");
+        let env = c.env(&profile);
+        let keys: Vec<&str> = env.iter().map(|(key, _)| key.as_str()).collect();
+        assert_eq!(keys, ["CC", "AR", "COMPILER_PATH", "CFLAGS"]);
+        let value = |key: &str| {
+            env.iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value.as_str())
+        };
+        assert_eq!(value("CC"), Some("/usr/bin/gcc"));
+        assert_eq!(value("AR"), Some("/usr/bin/ar"));
+        assert_eq!(value("COMPILER_PATH"), Some("/usr/bin"));
+        let flags = value("CFLAGS").unwrap_or_default();
+        assert_eq!(
+            flags,
+            format!(
+                "{profile} -nostdinc -isystem {} -isystem {} -MD -specs=/w/td-c-no-link.specs",
+                gcc.display(),
+                glibc.display()
+            )
+        );
+        assert!(NO_LINK_SPECS.starts_with("*link:\n%e"), "{NO_LINK_SPECS}");
+
+        let object = out.join("1a2b-regexec.o");
+        let producer = "GNU C17 14.2.0 -mtune=generic -march=x86-64 -g1 -O2 \
+                        -fno-omit-frame-pointer -fPIC";
+        fs::write(&object, object_with_debug_str(&["regexec.c", producer])).unwrap();
+        let trees = [build.to_str().unwrap(), vendor.to_str().unwrap()];
+        let target = build.join("target");
+        let list = |source: &str, headers: &str| {
+            fs::write(
+                object.with_extension("d"),
+                format!(
+                    "{}: {source} \\\n {}/regint.h \\\n {headers}\n",
+                    object.display(),
+                    out.display()
+                ),
+            )
+            .unwrap();
+        };
+        let regexec = build.join("regexec.c");
+        let regexec = regexec.to_str().unwrap();
+        list(
+            regexec,
+            &format!(
+                "{}/stdio.h {}/bits/../bits/types.h {}/stddef.h {}/a\\ b.h \
+                 oniguruma/src/regexec.c",
+                glibc.display(),
+                glibc.display(),
+                gcc.display(),
+                build.display()
+            ),
+        );
+        let checked = c.check_objects(&target, &trees, &vendor).unwrap();
+        assert_eq!(
+            checked,
+            CObjects {
+                objects: 1,
+                assembly: 0
+            }
+        );
+        for (header, why) in [
+            (
+                outside.join("stdio.h").display().to_string(),
+                "outside td glibc's",
+            ),
+            (
+                format!("{}/../../outside/stdio.h", glibc.display()),
+                "outside td glibc's",
+            ),
+            // The symlink names a path inside the build; it resolves outside.
+            (
+                out.join("inc/stdio.h").display().to_string(),
+                "outside td glibc's",
+            ),
+            (
+                base.join("gcc/include-fixed/limits.h")
+                    .display()
+                    .to_string(),
+                "outside td glibc's",
+            ),
+            // Relative headers resolve in the package, never in `/`.
+            ("usr/include/stdint.h".to_string(), "does not resolve"),
+            ("../../outside/stdio.h".to_string(), "outside td glibc's"),
+            (
+                glibc.join("absent.h").display().to_string(),
+                "does not resolve",
+            ),
+        ] {
+            list(regexec, &header);
+            let error = c.check_objects(&target, &trees, &vendor).unwrap_err();
+            assert!(error.contains(why), "{header}: {error}");
+        }
+
+        // Two vendored copies leave a relative header no compile directory.
+        let second = vendor.join("onig_sys-70.0.0");
+        fs::create_dir_all(&second).unwrap();
+        fs::write(second.join("Cargo.toml"), manifest("onig_sys")).unwrap();
+        list(regexec, "oniguruma/src/regexec.c");
+        let error = c.check_objects(&target, &trees, &vendor).unwrap_err();
+        assert!(error.contains("2 vendored packages"), "{error}");
+        fs::remove_dir_all(&second).unwrap();
+        // `md-` prefixes `md-5-0.10.6`; only a manifest naming `md` is md's.
+        let md_object = target.join("release/build/md-0123456789abcdef/out/x.o");
+        let md5 = vendor.join("md-5-0.10.6");
+        fs::create_dir_all(&md5).unwrap();
+        fs::write(md5.join("Cargo.toml"), manifest("md-5")).unwrap();
+        let error = build_script_package(&md_object, &vendor).unwrap_err();
+        assert!(error.contains("0 vendored packages"), "{error}");
+        let md = vendor.join("md-0.1.0");
+        fs::create_dir_all(&md).unwrap();
+        fs::write(md.join("Cargo.toml"), manifest("md")).unwrap();
+        assert_eq!(build_script_package(&md_object, &vendor).unwrap(), md);
+        fs::remove_dir_all(&md5).unwrap();
+        fs::remove_dir_all(&md).unwrap();
+
+        // A crate flag after CFLAGS that drops frame pointers is refused.
+        list(regexec, "");
+        let dropped = format!("{producer} -fomit-frame-pointer");
+        fs::write(&object, object_with_debug_str(&[&dropped])).unwrap();
+        let error = c.check_objects(&target, &trees, &vendor).unwrap_err();
+        assert!(error.contains("omits frame pointers"), "{error}");
+        let restored = format!("{dropped} -fno-omit-frame-pointer");
+        fs::write(&object, object_with_debug_str(&[&restored])).unwrap();
+        assert_eq!(
+            c.check_objects(&target, &trees, &vendor).unwrap().objects,
+            1
+        );
+        // No C producer: assembly is a boundary, C without -g is refused.
+        fs::write(&object, object_with_debug_str(&["GNU AS 2.44"])).unwrap();
+        let error = c.check_objects(&target, &trees, &vendor).unwrap_err();
+        assert!(error.contains("no GNU C producer"), "{error}");
+        list(build.join("asm.S").to_str().unwrap(), "");
+        assert_eq!(
+            c.check_objects(&target, &trees, &vendor).unwrap(),
+            CObjects {
+                objects: 1,
+                assembly: 1
+            }
+        );
+
+        fs::remove_file(object.with_extension("d")).unwrap();
+        let error = c.check_objects(&target, &trees, &vendor).unwrap_err();
+        assert!(error.contains("compiled without CFLAGS"), "{error}");
+        assert_eq!(
+            make_prerequisites("x.o: a\\ b.c c$$d.h \\\n e\\#f.h\n"),
+            ["a b.c", "c$d.h", "e#f.h"]
+        );
+    }
 
     #[test]
     fn cargo_lock_sources_refuse_every_git_entry() {

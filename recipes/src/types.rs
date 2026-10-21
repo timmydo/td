@@ -1069,6 +1069,9 @@ pub struct Recipe {
     pub cargo_subdir: Option<String>,
     pub no_default_features: Option<bool>,
     pub features: Option<Vec<String>>,
+    /// The exact number of C and assembly objects a Cargo recipe's build
+    /// scripts compile, each header-checked; absent means none.
+    pub c_objects: Option<u32>,
     /// Package-owned behavioral/reproducibility checks. The gate runner consumes
     /// these through `td-recipe-eval check-*`; the build path ignores them.
     pub checks: Option<Vec<RecipeCheck>>,
@@ -1130,8 +1133,9 @@ impl CheckRunner {
     pub fn extra_builds(self) -> &'static [&'static str] {
         match self {
             // The product proof `td shell`-builds the Rust userland with the
-            // toolchain it just made (checks/rust_toolchain.rs).
-            CheckRunner::RustToolchain => &["ripgrep", "fd", "uutils"],
+            // toolchain it just made and inspects ELF with binutils' readelf,
+            // which no Cargo recipe's closure holds (checks/rust_toolchain.rs).
+            CheckRunner::RustToolchain => &["ripgrep", "fd", "uutils", "binutils-x86-64-self"],
             CheckRunner::BuildOnly | CheckRunner::Tzdata => &[],
         }
     }
@@ -1176,6 +1180,7 @@ impl Recipe {
             cargo_subdir: None,
             no_default_features: None,
             features: None,
+            c_objects: None,
             checks: None,
             source_pins: None,
             ostree_pins: None,
@@ -1310,6 +1315,10 @@ impl Recipe {
     }
     pub fn no_default_features(mut self) -> Recipe {
         self.no_default_features = Some(true);
+        self
+    }
+    pub fn c_objects(mut self, count: u32) -> Recipe {
+        self.c_objects = Some(count);
         self
     }
     pub fn features(mut self, xs: &[&str]) -> Recipe {
@@ -1548,6 +1557,9 @@ impl Recipe {
         }
         if let Some(x) = &self.features {
             o.push(("features".into(), arr(x)));
+        }
+        if let Some(count) = self.c_objects {
+            o.push(("cObjects".into(), Json::Num(count.to_string())));
         }
         if let Some(l) = &self.cargo_lock {
             o.push(("cargoLock".into(), Json::Str(l.clone())));

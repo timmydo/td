@@ -228,14 +228,20 @@ on its second and third stages linking byte-identically. GCC still links
 Rust in three places until the image switch (increment 10 of
 `BUILD-ROOT-PLAN.md`): the native control-plane build on a td host
 (`builder/src/stage0.rs`, `-Clinker` the host's `cc`), Cargo's default
-`cc` in the image, and td-cc's own launcher probes. C that Cargo build
-scripts compile still uses td's GCC until it moves into the build root.
+`cc` in the image, and td-cc's own launcher probes. Every Cargo recipe
+builds in the Debian build root: the C its build scripts compile is the
+root's GCC, which the runner's CFLAGS forbid to link, against td glibc's
+headers and GCC's own freestanding headers, archived by the root's `ar`,
+and the root's `objcopy` splits its companions. Each object the build
+leaves must show it: its dependency list resolves into those headers or
+the build's trees, and the recipe declares how many objects there are.
 
 Cargo dependency sources are fixed-output inputs selected by committed
 `Cargo.lock` checksums. Builds run offline. Git dependencies are unsupported
 without explicit sign-off and a fixed-output representation pinned by commit
 and archive hash. Build scripts, proc macros, C, and assembly may use only
-td-built tools and the pinned Rust toolchain. New td-owned shipped userland
+td-built tools, the pinned Rust toolchain and, for C and assembly, the
+Debian build root's compiler and archiver. New td-owned shipped userland
 should be Rust built with that toolchain.
 
 The final image uses uutils for its core userland and does not carry the GNU

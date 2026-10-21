@@ -16,13 +16,8 @@ pub fn recipe() -> Recipe {
     Recipe::rust("td-dua", "0.1.0")
         .local_source("td-dua")
         .local_source_trees(&["td-civil", "td-json", "td-ui", "td-compositor"])
-        .native_inputs(&[
-            "rust-toolchain",
-            "td-link",
-            "gcc-x86-64-self",
-            "binutils-x86-64-self",
-            "glibc-x86-64",
-        ])
+        .build_root()
+        .native_inputs(&["rust-toolchain", "td-link", "glibc-x86-64"])
         .cargo_subdir("td-dua")
         .cargo_lock("td-dua/Cargo.lock")
         .static_link()

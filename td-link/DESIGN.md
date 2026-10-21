@@ -141,5 +141,8 @@ carry td glibc's `lib` as `DT_RPATH`, no `DT_RUNPATH`, and need only
 `libc.so.6`, `ld-linux-x86-64.so.2` and, for the program, the cdylib;
 the static programs need nothing.
 
-C compiled by Cargo build scripts still uses td's GCC and is outside this
-driver (`BUILD-ROOT-PLAN.md`).
+C that Cargo build scripts compile is outside this driver: the Debian
+build root's GCC compiles it against td glibc's headers and its own
+freestanding ones into archives, which td-link then links as it links
+any other input. Under the runner's CFLAGS that GCC refuses to link,
+so td-link links every Rust output.

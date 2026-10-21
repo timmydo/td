@@ -1161,6 +1161,43 @@ pub fn read_build_id(path: &Path) -> Result<Vec<u8>, String> {
     one_build_id(path, &mut elf)
 }
 
+/// Largest `.debug_str`/`.debug_info` `debug_producers` reads.
+const MAX_PRODUCER_SECTION_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Every DWARF producer string (`GNU C17 …`, `GNU AS …`) in an object's
+/// `.debug_str` or `.debug_info`: the compiler and the options it recorded.
+pub fn debug_producers(path: &Path) -> Result<Vec<String>, String> {
+    let mut elf = FileElf::open(path)?;
+    let mut producers = Vec::new();
+    for section in elf.sections.clone() {
+        let name = elf.section_name(&section)?;
+        if !matches!(name, b".debug_str" | b".debug_info") || section.kind == SHT_NOBITS {
+            continue;
+        }
+        if section.size > MAX_PRODUCER_SECTION_BYTES {
+            return Err(format!(
+                "{}: {} bytes of debug strings (limit {MAX_PRODUCER_SECTION_BYTES})",
+                path.display(),
+                section.size
+            ));
+        }
+        let mut bytes = vec![0u8; usize::try_from(section.size).map_err(|e| e.to_string())?];
+        elf.file
+            .seek(SeekFrom::Start(section.offset))
+            .and_then(|_| elf.file.read_exact(&mut bytes))
+            .map_err(|e| format!("read {} debug strings: {e}", path.display()))?;
+        let mut rest = bytes.as_slice();
+        while let Some(at) = rest.windows(4).position(|window| window == b"GNU ") {
+            let tail = rest.get(at..).unwrap_or_default();
+            let end = tail.iter().position(|b| *b == 0).unwrap_or(tail.len());
+            let text = tail.get(..end).unwrap_or_default();
+            producers.push(String::from_utf8_lossy(text).into_owned());
+            rest = tail.get(end..).unwrap_or_default();
+        }
+    }
+    Ok(producers)
+}
+
 fn one_build_id(path: &Path, elf: &mut FileElf) -> Result<Vec<u8>, String> {
     let ids = elf.build_ids()?;
     if ids.len() != 1 {

@@ -5415,51 +5415,27 @@ fn substitute_gcc_toolchain(inputs: &mut [String], tc: &str) -> bool {
     swapped
 }
 
-// The nested `stage/td/store/<pkg>` prefix each `-self`/glibc recipe output carries.
-// These embed the same pinned versions the rust-toolchain check's GCC_STAGE/GLIBC_STAGE
-// consts do; the two must move together on a compiler/libc bump (re #547).
-const NATIVE_GCC_STAGE: &str = "stage/td/store/gcc-14.3.0-x86_64-self";
+/// The root's objcopy, which splits a Cargo recipe's debug companions as it
+/// does every build-root output's.
+const BUILD_ROOT_OBJCOPY: &str = "/usr/bin/objcopy";
 
-/// The six native `/td/store` link strings a `rust` recipe bakes into its drv env
-/// (TD_RUST_STORE_*), derived from the declared native inputs.
-struct NativeRustLinkEnv {
-    interp: String,
-    rpath: String,
-    bdir: String,
-    cc: String,
-    cxx: String,
-    include: String,
-}
-
-/// Derive the native link env from a rust recipe's declared toolchain inputs, the
-/// build-plan `--auto` counterpart to the `td shell` path where the rust-toolchain
-/// check pre-sets TD_RUST_STORE_* in the environment. The three inputs' resolved
-/// store paths are the same `{TD_STORE_DIR}/{base}` values that check bakes into
-/// TD_SHELL_NATIVE_*, so the formulas here mirror `checks/rust_toolchain.rs` exactly
-/// — a `td shell` and an `--auto` build of the same recipe get identical link env.
-/// `None` when any of the three inputs is absent (a rust recipe that declares no
-/// native toolchain — not linkable this way).
-fn derive_native_rust_link_env(entries: &[lock::Entry]) -> Option<NativeRustLinkEnv> {
-    let find = |n: &str| {
-        entries
-            .iter()
-            .find(|e| e.name == n)
-            .map(|e| e.path.as_str())
-    };
-    let gcc_root = find("gcc-x86-64-self")?;
-    let binutils_root = find("binutils-x86-64-self")?;
-    let glibc_root = find("glibc-x86-64")?;
-    let gcc_path = format!("{gcc_root}/{NATIVE_GCC_STAGE}");
-    let binutils_path = format!("{binutils_root}/bin");
-    let glibc_path = format!("{glibc_root}/{}", toolchain_x86_64::GLIBC_X86_64_STAGE);
-    Some(NativeRustLinkEnv {
-        interp: format!("{glibc_path}/lib/ld-linux-x86-64.so.2"),
-        rpath: format!("{glibc_path}/lib"),
-        bdir: format!("{binutils_path}:{glibc_path}/lib"),
-        cc: format!("{gcc_path}/bin/gcc"),
-        cxx: format!("{gcc_path}/bin/g++"),
-        include: format!("{glibc_path}/include"),
-    })
+/// td glibc's staged include tree, the only libc headers a Cargo recipe's
+/// build-script C compiles against (build::run_rust).
+fn cargo_c_include(name: &str, entries: &[lock::Entry]) -> Result<String, String> {
+    let glibc = entries
+        .iter()
+        .find(|entry| entry.name == "glibc-x86-64")
+        .ok_or_else(|| {
+            format!(
+                "recipe: Cargo target `{name}' must declare glibc-x86-64, whose headers its \
+                 build scripts' C compiles against"
+            )
+        })?;
+    Ok(format!(
+        "{}/{}/include",
+        glibc.path,
+        toolchain_x86_64::GLIBC_X86_64_STAGE
+    ))
 }
 
 /// The TD_INPUT_MAP object (input NAME -> store PATH) from resolved lock entries.
@@ -6004,6 +5980,12 @@ fn assemble_recipe_drv(
         .get("buildSystem")
         .and_then(json::Json::as_str)
         .unwrap_or("gnu");
+    // Only Cargo counts build-script objects (run_rust).
+    if build_system != "rust" && alist.get("cObjects").is_some() {
+        return Err(format!(
+            "recipe: `cObjects' is for buildSystem \"rust\", not \"{build_system}\""
+        ));
+    }
     let cargo_lock = match alist.get("cargoLock") {
         None => None,
         Some(json::Json::Str(value)) if !value.is_empty() => Some(value.as_str()),
@@ -6049,15 +6031,24 @@ fn assemble_recipe_drv(
     // The Debian build root (build_root.rs): staged as an input-src so it is in
     // the closure and the hash, named to the sandbox by TD_BUILD_ROOT, and
     // never entered into TD_INPUTS or the input map, so no `{in:...}` reaches it.
+    // Every Cargo build runs in it: its build scripts' C compiles with the
+    // root's GCC against td glibc's headers (build::run_rust).
     let build_root = match alist.get("buildRoot") {
+        None if build_system == "rust" => {
+            return Err(
+                "recipe: buildSystem \"rust\" builds in the build root; declare buildRoot".into(),
+            )
+        }
         None => None,
-        Some(json::Json::Str(root)) if root == "debian" && build_system == "mesboot" => {
+        Some(json::Json::Str(root))
+            if root == "debian" && matches!(build_system, "mesboot" | "rust") =>
+        {
             Some(build_root::store_path(&build_root::lock()?)?)
         }
         Some(json::Json::Str(root)) if root == "debian" => {
             return Err(format!(
                 "recipe: buildSystem \"{build_system}\" cannot build in the build root; \
-                 only explicit mesboot steps can"
+                 only explicit mesboot steps and Cargo can"
             ))
         }
         Some(_) => return Err("recipe: `buildRoot' must be \"debian\"".into()),
@@ -6468,20 +6459,21 @@ fn assemble_recipe_drv(
                 return Err("recipe: buildSystem \"rust\" requires a non-empty `bins'".into());
             }
             push_drv_env(&mut spec, "TD_RUST_BINS", &bins.join(" "))?;
-            let objcopy_root = entries
-                .iter()
-                .find(|entry| entry.name == "binutils-x86-64-self")
-                .map(|entry| entry.path.as_str())
-                .ok_or_else(|| {
-                    format!(
-                        "recipe: rust target `{name}' must declare binutils-x86-64-self for debug splitting"
-                    )
-                })?;
+            push_drv_env(&mut spec, "TD_RUST_OBJCOPY", BUILD_ROOT_OBJCOPY)?;
             push_drv_env(
                 &mut spec,
-                "TD_RUST_OBJCOPY",
-                &format!("{objcopy_root}/bin/objcopy"),
+                "TD_RUST_C_INCLUDE",
+                &cargo_c_include(name, &entries)?,
             )?;
+            // The exact count of objects the build scripts compile; absent
+            // means none, so C a recipe never declared fails its build.
+            match alist.get("cObjects") {
+                None => {}
+                Some(json::Json::Num(count)) if count.parse::<u32>().is_ok_and(|n| n > 0) => {
+                    push_drv_env(&mut spec, "TD_RUST_C_OBJECTS", count)?;
+                }
+                Some(_) => return Err("recipe: `cObjects' must be a positive integer".into()),
+            }
             if !vendor.is_empty() {
                 push_drv_env(&mut spec, "TD_VENDOR_CRATES", &vendor.join(":"))?;
             }
@@ -6489,38 +6481,6 @@ fn assemble_recipe_drv(
             // every crate from it). No `/gnu/store` crate path, no guix-daemon FOD.
             if let Some(vd) = vendor_dir {
                 push_drv_env(&mut spec, "TD_VENDOR_DIR", vd)?;
-            }
-            // Native /td/store toolchain link mode (#258): the sandbox clears the env, so run_rust
-            // only sees the drv's `env` lines — bake the six TD_RUST_STORE_* into the drv (mirroring
-            // the TD_GCC_TOOLCHAIN input override above). When they are set the build links against the
-            // native /td/store gcc (a PLAIN gcc, no ld-wrapper): run_rust bakes the interp/RUNPATH/-B
-            // explicitly so the built binary resolves its libc/libgcc_s from /td/store at run time. The
-            // values are fixed /td/store paths, so the drv (and its double-build `check`) stay
-            // deterministic. Two sources, env-first: `td shell` pre-sets them in the environment
-            // (provision_rust_inputs); `build-plan --auto` clears the env, so DERIVE the identical
-            // values from the recipe's declared native inputs (re #547). Neither ⇒ no env lines ⇒ the
-            // legacy ld-wrapper path, unchanged.
-            let derived = derive_native_rust_link_env(&entries);
-            for (k, d) in [
-                ("TD_RUST_STORE_INTERP", derived.as_ref().map(|d| &d.interp)),
-                ("TD_RUST_STORE_RPATH", derived.as_ref().map(|d| &d.rpath)),
-                ("TD_RUST_STORE_BDIR", derived.as_ref().map(|d| &d.bdir)),
-                ("TD_RUST_STORE_CC", derived.as_ref().map(|d| &d.cc)),
-                ("TD_RUST_STORE_CXX", derived.as_ref().map(|d| &d.cxx)),
-                (
-                    "TD_RUST_STORE_INCLUDE",
-                    derived.as_ref().map(|d| &d.include),
-                ),
-            ] {
-                let v = match std::env::var(k) {
-                    Ok(v) if !v.is_empty() => Some(v),
-                    _ => d.cloned(),
-                };
-                if let Some(v) = v {
-                    if !v.is_empty() {
-                        push_drv_env(&mut spec, k, &v)?;
-                    }
-                }
             }
             // Optional cargo feature selection (both default-absent ⇒ a plain
             // `cargo build` with the crate's defaults, unchanged). `noDefaultFeatures`
@@ -8277,9 +8237,10 @@ fn emit_recipe_json(pkg: &str) -> Result<String, String> {
 /// is staged by the rust-toolchain recipe's product proof. When present, a vendored rust build (ripgrep,
 /// fd, …) links this toolchain — never a host compiler. Its lock is assembled
 /// from the interned package source plus these recipe outputs, whose physical store and databases
-/// ride the typed `--recipe-output-store` / `--recipe-output-db` argv channels. Exact compiler,
-/// interpreter, RUNPATH, include, and `-B` paths put run_rust in native link mode. A package build
-/// with no native toolchain provisioned is a hard error.
+/// ride the typed `--recipe-output-store` / `--recipe-output-db` argv channels. Every such build
+/// runs in the Debian build root, admitted from the seed store it was assembled into
+/// (`--build-root-db` / `--build-root-store`). A package build with no native toolchain
+/// provisioned is a hard error.
 struct NativeToolchain {
     /// Physical store containing the Rust toolchain and native build platform.
     /// Its canonical location is `/td/store`; `--recipe-output-store` carries the
@@ -8288,18 +8249,11 @@ struct NativeToolchain {
     /// The native toolchain's own td store db(s) (its `/td/store` outputs + refs), colon-
     /// separated → passed to build-recipe as `--recipe-output-db` argv (typed, re #469).
     extra_dbs: String,
-    /// The bootstrap-root db, when the toolchain was built above the pinned
-    /// root (`TD_SHELL_NATIVE_ROOT_DB`) → `--bootstrap-root-db`.
-    root_db: Option<String>,
-    /// Native link mode: the `/td/store` glibc loader, RUNPATH, and `-B` dir baked by run_rust.
-    interp: String,
-    rpath: String,
-    bdir: String,
-    cc: String,
-    cxx: String,
-    include: String,
-    /// Recipe-output lock lines for rust-toolchain and the native
-    /// GCC/binutils/glibc: what a Rust package declares.
+    /// The Debian build root's db and the seed store holding the root.
+    build_root_db: String,
+    build_root_store: String,
+    /// Recipe-output lock lines for rust-toolchain, td-link and glibc:
+    /// what a Rust package declares.
     lock_lines: String,
 }
 
@@ -8320,28 +8274,21 @@ impl NativeToolchain {
                 .ok_or_else(|| format!("TD_SHELL_NATIVE_STORE is set but {k} is not (native-toolchain provisioning is incomplete)"))
         };
         let extra_dbs = get("TD_SHELL_NATIVE_EXTRA_DBS")?;
-        let interp = get("TD_SHELL_NATIVE_INTERP")?;
-        let rpath = get("TD_SHELL_NATIVE_RPATH")?;
-        let bdir = get("TD_SHELL_NATIVE_BDIR")?;
-        let cc = get("TD_SHELL_NATIVE_CC")?;
-        let cxx = get("TD_SHELL_NATIVE_CXX")?;
-        let include = get("TD_SHELL_NATIVE_INCLUDE")?;
+        // The root's db sits beside the seed db, named by the compiled lock.
+        let seed_db = get("TD_SHELL_NATIVE_BUILD_ROOT_SEED_DB")?;
+        let build_root_db = build_root::db_path(Path::new(&seed_db), &build_root::lock()?)?
+            .to_str()
+            .ok_or("non-UTF-8 build root db path")?
+            .to_string();
+        let build_root_store = get("TD_SHELL_NATIVE_BUILD_ROOT_STORE")?;
         let lock_file = get("TD_SHELL_NATIVE_LOCK")?;
         let lock_lines = std::fs::read_to_string(&lock_file)
             .map_err(|e| format!("read TD_SHELL_NATIVE_LOCK {lock_file}: {e}"))?;
-        let root_db = std::env::var("TD_SHELL_NATIVE_ROOT_DB")
-            .ok()
-            .filter(|s| !s.is_empty());
         Ok(Some(NativeToolchain {
             store,
             extra_dbs,
-            root_db,
-            interp,
-            rpath,
-            bdir,
-            cc,
-            cxx,
-            include,
+            build_root_db,
+            build_root_store,
             lock_lines,
         }))
     }
@@ -8423,17 +8370,17 @@ fn run_shell(rest: &[String]) -> Result<std::process::ExitStatus, String> {
         // not a bespoke harness.
         let mut bargs: Vec<String> = vec!["build-recipe".into(), json_file.clone()];
         // A vendored rust build links the native /td/store toolchain when it is provisioned; a
-        // package without warmed inputs cannot use the retired legacy shell path. Keep the chosen
-        // native env so the build-recipe subprocess gets TD_RUST_STORE_* (and the
-        // recipe-output store/db argv) for the vendored-rust case.
-        let native_env = match provision_rust_inputs(pkg, &recipe_json, &sd, &self_exe)? {
+        // package without warmed inputs cannot use the retired legacy shell path. The
+        // build-recipe subprocess gets the recipe-output store/db and build-root argv.
+        match provision_rust_inputs(pkg, &recipe_json, &sd, &self_exe)? {
             Some((seedlock, source_lock, extra)) => {
                 let Some(nt) = &native else {
                     return Err(format!(
                         "build `{pkg}': a vendored rust build needs the native /td/store toolchain, \
                          but TD_SHELL_NATIVE_STORE is not set. The rust-toolchain recipe check \
-                         must stage native gcc/binutils/glibc plus the recipe-graph rust-toolchain \
-                         output. Host compiler fallbacks are forbidden for `td shell'."
+                         must stage td-link and glibc plus the recipe-graph rust-toolchain \
+                         output, and name the build root. Host compiler fallbacks are forbidden \
+                         for `td shell'."
                     ));
                 };
                 // Add only the explicitly provisioned recipe outputs to the
@@ -8455,11 +8402,11 @@ fn run_shell(rest: &[String]) -> Result<std::process::ExitStatus, String> {
                     bargs.push("--recipe-output-db".into());
                     bargs.push(db.to_string());
                 }
-                if let Some(db) = &nt.root_db {
-                    bargs.push("--bootstrap-root-db".into());
-                    bargs.push(db.clone());
-                }
-                nt
+                // Every Cargo recipe builds in the Debian build root.
+                bargs.push("--build-root-db".into());
+                bargs.push(nt.build_root_db.clone());
+                bargs.push("--build-root-store".into());
+                bargs.push(nt.build_root_store.clone());
             }
             None => {
                 return Err(format!(
@@ -8467,22 +8414,13 @@ fn run_shell(rest: &[String]) -> Result<std::process::ExitStatus, String> {
                      TD_SHELL_VENDOR_ROOT; the legacy shell build path is retired"
                 ));
             }
-        };
+        }
         // BUILD it via the build-recipe subcommand (its content-addressed cache makes
         // an unchanged recipe a HIT — build-on-demand + cached). A subprocess keeps the
         // build's chatter off the command's stdout, and rides the inherited
         // TD_BUILDER_* override so the builder is the td-placed stage0 too.
         let mut build = Command::new(&self_exe);
         build.args(&bargs);
-        // Native link mode: recipe outputs are admitted through typed argv,
-        // while the exact nested compiler/runtime paths are embedded in the drv.
-        build
-            .env("TD_RUST_STORE_INTERP", &native_env.interp)
-            .env("TD_RUST_STORE_RPATH", &native_env.rpath)
-            .env("TD_RUST_STORE_BDIR", &native_env.bdir)
-            .env("TD_RUST_STORE_CC", &native_env.cc)
-            .env("TD_RUST_STORE_CXX", &native_env.cxx)
-            .env("TD_RUST_STORE_INCLUDE", &native_env.include);
         let out = crate::spawn::past_a_busy_program(|| build.output())
             .map_err(|e| format!("build `{pkg}': spawn td-builder build-recipe: {e}"))?;
         if !out.status.success() {
@@ -9237,6 +9175,9 @@ struct RecipeOutputOptions {
     positional_len: usize,
     dbs: Vec<(String, sandbox::InputOrigin)>,
     store: Option<String>,
+    /// The seed store the Debian build root was assembled into, beside its
+    /// `--build-root-db`.
+    build_root_store: Option<String>,
 }
 
 /// Select the physical byte stores and their canonical prefix for a
@@ -9270,6 +9211,7 @@ fn parse_recipe_output_options(args: &[String]) -> Result<RecipeOutputOptions, S
     let mut positional_len = args.len();
     let mut dbs = Vec::new();
     let mut store = None;
+    let mut build_root_store = None;
     while positional_len >= 8 {
         match args
             .get(positional_len.saturating_sub(2))
@@ -9282,16 +9224,6 @@ fn parse_recipe_output_options(args: &[String]) -> Result<RecipeOutputOptions, S
                 dbs.push((db.clone(), sandbox::InputOrigin::RecipeOutput));
                 positional_len = positional_len.saturating_sub(2);
             }
-            // The pinned bootstrap root's db: its rows are ladder outputs a
-            // cut graph staged, admitted against the compiled manifest at
-            // intake, never engine receipts.
-            Some("--bootstrap-root-db") => {
-                let db = args
-                    .get(positional_len.saturating_sub(1))
-                    .ok_or("--bootstrap-root-db has no value")?;
-                dbs.push((db.clone(), sandbox::InputOrigin::AuditedSeed));
-                positional_len = positional_len.saturating_sub(2);
-            }
             Some("--recipe-output-store") => {
                 if store.is_some() {
                     return Err("--recipe-output-store may be passed only once".into());
@@ -9299,14 +9231,43 @@ fn parse_recipe_output_options(args: &[String]) -> Result<RecipeOutputOptions, S
                 store = args.get(positional_len.saturating_sub(1)).cloned();
                 positional_len = positional_len.saturating_sub(2);
             }
+            // The Debian build root's db, admitted against the compiled lock
+            // in the store `--build-root-store` names, as build-plan admits it.
+            Some("--build-root-db") => {
+                if dbs
+                    .iter()
+                    .any(|(_, origin)| *origin == sandbox::InputOrigin::BuildRoot)
+                {
+                    return Err("--build-root-db may be passed only once".into());
+                }
+                let db = args
+                    .get(positional_len.saturating_sub(1))
+                    .ok_or("--build-root-db has no value")?;
+                dbs.push((db.clone(), sandbox::InputOrigin::BuildRoot));
+                positional_len = positional_len.saturating_sub(2);
+            }
+            Some("--build-root-store") => {
+                if build_root_store.is_some() {
+                    return Err("--build-root-store may be passed only once".into());
+                }
+                build_root_store = args.get(positional_len.saturating_sub(1)).cloned();
+                positional_len = positional_len.saturating_sub(2);
+            }
             _ => break,
         }
     }
     dbs.reverse();
+    let has_root_db = dbs
+        .iter()
+        .any(|(_, origin)| *origin == sandbox::InputOrigin::BuildRoot);
+    if has_root_db != build_root_store.is_some() {
+        return Err("--build-root-db and --build-root-store go together".into());
+    }
     Ok(RecipeOutputOptions {
         positional_len,
         dbs,
         store,
+        build_root_store,
     })
 }
 
@@ -11875,12 +11836,13 @@ fn main() -> ExitCode {
             let pos_len = options.positional_len;
             let recipe_output_dbs = options.dbs;
             let recipe_output_store = options.store;
+            let build_root_store = options.build_root_store;
             if !(pos_len == 6 || pos_len == 8 || pos_len == 11) {
                 eprintln!(
                     "td-builder: build-recipe: usage: build-recipe RECIPE-JSON-FILE LOCK \
                      SCRATCH STORE-DIR [SRC-STORE-DIR SRC-DB [VENDOR-CANONICAL VENDOR-STORE \
                      VENDOR-DB]] [--recipe-output-store STORE] [--recipe-output-db DB]... \
-                     [--bootstrap-root-db DB]"
+                     [--build-root-db DB --build-root-store DIR]"
                 );
                 return ExitCode::FAILURE;
             }
@@ -11931,7 +11893,7 @@ fn main() -> ExitCode {
                 // `--recipe-output-store` when one is given); td-built copies are
                 // restored to their /td/store canonicals from the roots + the typed
                 // recipe-output dbs.
-                let (seed_store_dirs, seed_prefix, td_store) =
+                let (mut seed_store_dirs, seed_prefix, td_store) =
                     build_recipe_store_layout(recipe_output_store.as_deref(), store_dir)?;
                 // The typed db set: the argv `--recipe-output-db` entries (prior td
                 // recipe outputs whose bytes live OUTSIDE the scanned dir — their refs
@@ -11940,10 +11902,14 @@ fn main() -> ExitCode {
                 // engine-receipt-backed — a raw path/env value cannot mint a typed origin.
                 for (dbp, origin) in &recipe_output_dbs {
                     match origin {
-                        sandbox::InputOrigin::AuditedSeed => bootstrap_root::authenticate_db(
-                            dbp,
-                            Path::new(recipe_output_store.as_deref().unwrap_or(store_dir)),
-                        )?,
+                        // The root binds from the store it was assembled into.
+                        sandbox::InputOrigin::BuildRoot => {
+                            let root_store = build_root_store
+                                .as_deref()
+                                .ok_or("--build-root-db needs --build-root-store")?;
+                            build_root::authenticate_db(Path::new(dbp), Path::new(root_store))?;
+                            seed_store_dirs.push(root_store.to_string());
+                        }
                         _ => authenticate_recipe_output_db(dbp)?,
                     }
                 }
@@ -12912,8 +12878,7 @@ mod tests {
         let source = "ripgrep-source /td/store/src-ripgrep source\n";
         let native = "\
 rust-toolchain /td/store/qnkl-rust-toolchain td-recipe-output
-gcc-x86-64-self /td/store/ng-gcc-self td-recipe-output
-binutils-x86-64-self /td/store/nb-binutils-self td-recipe-output
+td-link /td/store/tl-td-link td-recipe-output
 glibc-x86-64 /td/store/gl-glibc td-recipe-output
 ";
         let out = recipe_toolchain_lock_body(source, native).unwrap();
@@ -12990,32 +12955,62 @@ glibc-x86-64 /td/store/gl-glibc td-recipe-output
         assert_eq!(dbs, ["one.db", "two.db"]);
     }
 
+    /// `td shell`'s Cargo builds run in the root: its db is typed BuildRoot
+    /// and travels with the store it was assembled into, once.
     #[test]
-    fn a_bootstrap_root_db_is_typed_as_an_audited_seed() {
-        let args: Vec<String> = [
-            "td-builder",
-            "build-recipe",
-            "recipe.json",
-            "lock",
-            "scratch",
-            "store",
+    fn a_build_root_db_is_typed_and_needs_its_store() {
+        let args = |tail: &[&str]| -> Vec<String> {
+            [
+                "td-builder",
+                "build-recipe",
+                "recipe.json",
+                "lock",
+                "scratch",
+                "store",
+            ]
+            .iter()
+            .chain(tail)
+            .map(|s| s.to_string())
+            .collect()
+        };
+        let parsed = parse_recipe_output_options(&args(&[
+            "--build-root-db",
+            "root.db",
             "--recipe-output-db",
             "one.db",
-            "--bootstrap-root-db",
-            "root.db",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-        let parsed = parse_recipe_output_options(&args).unwrap();
+            "--build-root-store",
+            "seed-store",
+        ]))
+        .unwrap();
         assert_eq!(parsed.positional_len, 6);
+        assert_eq!(parsed.build_root_store.as_deref(), Some("seed-store"));
         assert_eq!(
             parsed.dbs,
             [
+                ("root.db".to_string(), sandbox::InputOrigin::BuildRoot),
                 ("one.db".to_string(), sandbox::InputOrigin::RecipeOutput),
-                ("root.db".to_string(), sandbox::InputOrigin::AuditedSeed),
             ]
         );
+        for (tail, why) in [
+            (&["--build-root-db", "root.db"][..], "go together"),
+            (&["--build-root-store", "seed-store"][..], "go together"),
+            (
+                &[
+                    "--build-root-db",
+                    "a.db",
+                    "--build-root-db",
+                    "b.db",
+                    "--build-root-store",
+                    "s",
+                ][..],
+                "only once",
+            ),
+        ] {
+            let error = parse_recipe_output_options(&args(tail))
+                .err()
+                .unwrap_or_default();
+            assert!(error.contains(why), "{tail:?}: {error}");
+        }
     }
 
     #[test]
@@ -18510,25 +18505,28 @@ daemon build START (2/2 active)
         );
     }
 
-    // The final GCC lives below its recipe output, so run_rust needs exact
-    // compiler/include paths as well as interp/RUNPATH/-B. The build sandbox
-    // clears ambient env; every value must therefore ride in the drv.
+    // Every Cargo build runs in the Debian build root: the drv names the root,
+    // the root's objcopy and td glibc's include tree, and nothing of a ladder
+    // compiler. The build sandbox clears ambient env, so all of it rides in
+    // the drv.
     #[test]
-    fn assemble_recipe_drv_forwards_td_rust_store_env() {
-        let _dir_cleanup = crate::test_temp::TempDir::new("td-ruststore").unwrap();
+    fn a_cargo_recipe_builds_in_the_root_against_td_glibc_headers() {
+        let _dir_cleanup = crate::test_temp::TempDir::new("td-cargo-root").unwrap();
         let dir = _dir_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let lock = dir.join("ripgrep.lock");
+        let glibc = "/td/store/dddddddddddddddddddddddddddddddd-glibc-x86-64-2.41";
         std::fs::write(
             &lock,
-            "ripgrep-source /gnu/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-ripgrep-14.1.1.tar.gz source\n\
-             /td/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-gcc-14.3.0-x86_64-native /td/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-gcc-14.3.0-x86_64-native\n\
-             binutils-x86-64-self /td/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-binutils-x86-64-self td-recipe-output\n\
-             /td/store/cccccccccccccccccccccccccccccccc-rust-1.96.0-x86_64-store-native /td/store/cccccccccccccccccccccccccccccccc-rust-1.96.0-x86_64-store-native\n",
+            format!(
+                "ripgrep-source /gnu/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-ripgrep-14.1.1.tar.gz source\n\
+                 glibc-x86-64 {glibc} td-recipe-output\n\
+                 /td/store/cccccccccccccccccccccccccccccccc-rust-1.96.0-x86_64-store-native /td/store/cccccccccccccccccccccccccccccccc-rust-1.96.0-x86_64-store-native\n"
+            ),
         )
         .unwrap();
-        let recipe = r#"{"name":"ripgrep","version":"14.1.1","buildSystem":"rust","bins":["rg"],"cargoSubdir":"workspace"}"#;
+        let recipe = r#"{"name":"ripgrep","version":"14.1.1","buildSystem":"rust","bins":["rg"],"cargoSubdir":"workspace","buildRoot":"debian"}"#;
         let lockp = lock.to_str().unwrap();
         let env_of = |drv: &drv::Derivation, k: &str| {
             drv.env
@@ -18536,64 +18534,33 @@ daemon build START (2/2 active)
                 .find(|(kk, _)| kk == k)
                 .map(|(_, v)| v.clone())
         };
-        let interp =
-            "/td/store/cccccccccccccccccccccccccccccccc-glibc-2.41-x86_64/lib/ld-linux-x86-64.so.2";
-        let rpath = "/td/store/cccccccccccccccccccccccccccccccc-glibc-2.41-x86_64/lib";
-        let bdir = rpath;
-        let cc = "/td/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-gcc/stage/td/store/gcc/bin/gcc";
-        let cxx = "/td/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-gcc/stage/td/store/gcc/bin/g++";
-        let include =
-            "/td/store/dddddddddddddddddddddddddddddddd-glibc/stage/td/store/glibc/include";
-
-        // WITH the vars set: the rust drv carries them so run_rust can bake interp/RUNPATH/-B.
-        std::env::set_var("TD_RUST_STORE_INTERP", interp);
-        std::env::set_var("TD_RUST_STORE_RPATH", rpath);
-        std::env::set_var("TD_RUST_STORE_BDIR", bdir);
-        std::env::set_var("TD_RUST_STORE_CC", cc);
-        std::env::set_var("TD_RUST_STORE_CXX", cxx);
-        std::env::set_var("TD_RUST_STORE_INCLUDE", include);
         let (_p, _f, drv, _s) = assemble_recipe_drv(recipe, lockp, &dir, None).unwrap();
-        std::env::remove_var("TD_RUST_STORE_INTERP");
-        std::env::remove_var("TD_RUST_STORE_RPATH");
-        std::env::remove_var("TD_RUST_STORE_BDIR");
-        std::env::remove_var("TD_RUST_STORE_CC");
-        std::env::remove_var("TD_RUST_STORE_CXX");
-        std::env::remove_var("TD_RUST_STORE_INCLUDE");
+        let root = build_root::store_path(&build_root::lock().unwrap()).unwrap();
+        assert_eq!(env_of(&drv, "TD_BUILD_ROOT"), Some(root.clone()));
+        assert!(drv.input_srcs.contains(&root));
         assert_eq!(
-            env_of(&drv, "TD_RUST_STORE_INTERP").as_deref(),
-            Some(interp),
-            "interp forwarded to the drv env"
-        );
-        assert_eq!(
-            env_of(&drv, "TD_RUST_STORE_RPATH").as_deref(),
-            Some(rpath),
-            "rpath forwarded"
-        );
-        assert_eq!(
-            env_of(&drv, "TD_RUST_STORE_BDIR").as_deref(),
-            Some(bdir),
-            "bdir forwarded"
-        );
-        assert_eq!(
-            env_of(&drv, "TD_RUST_STORE_CC").as_deref(),
-            Some(cc),
-            "cc forwarded"
-        );
-        assert_eq!(
-            env_of(&drv, "TD_RUST_STORE_CXX").as_deref(),
-            Some(cxx),
-            "cxx forwarded"
-        );
-        assert_eq!(
-            env_of(&drv, "TD_RUST_STORE_INCLUDE").as_deref(),
-            Some(include),
-            "include forwarded"
+            env_of(&drv, "TD_RUST_C_INCLUDE"),
+            Some(format!(
+                "{glibc}/{}/include",
+                toolchain_x86_64::GLIBC_X86_64_STAGE
+            )),
+            "build-script C compiles against td glibc's staged headers"
         );
         assert_eq!(
             env_of(&drv, "TD_RUST_OBJCOPY").as_deref(),
-            Some("/td/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-binutils-x86-64-self/bin/objcopy"),
-            "debug splitting binds the exact named tool input"
+            Some("/usr/bin/objcopy"),
+            "the root's objcopy splits the companions"
         );
+        for gone in [
+            "TD_RUST_STORE_INTERP",
+            "TD_RUST_STORE_RPATH",
+            "TD_RUST_STORE_BDIR",
+            "TD_RUST_STORE_CC",
+            "TD_RUST_STORE_CXX",
+            "TD_RUST_STORE_INCLUDE",
+        ] {
+            assert!(env_of(&drv, gone).is_none(), "{gone}");
+        }
         assert_eq!(env_of(&drv, "TD_RECIPE_NAME").as_deref(), Some("ripgrep"));
         let expected_policy = td_engine::target_profile::debug_companion_policy("ripgrep");
         assert_eq!(
@@ -18605,57 +18572,59 @@ daemon build START (2/2 active)
             env_of(&drv, "TD_CARGO_SUBDIR").as_deref(),
             Some("workspace")
         );
+        // No declared C objects: the runner requires none.
+        assert!(env_of(&drv, "TD_RUST_C_OBJECTS").is_none());
+        let with_c = recipe.replace(r#""bins""#, r#""cObjects":48,"bins""#);
+        let (_p, _f, drv, _s) = assemble_recipe_drv(&with_c, lockp, &dir, None).unwrap();
+        assert_eq!(env_of(&drv, "TD_RUST_C_OBJECTS").as_deref(), Some("48"));
+        for bad in ["0", "-1", "\"48\""] {
+            let bad = recipe.replace(r#""bins""#, &format!(r#""cObjects":{bad},"bins""#));
+            let error = assemble_recipe_drv(&bad, lockp, &dir, None).unwrap_err();
+            assert!(error.contains("cObjects"), "{bad}: {error}");
+        }
+        for system in ["mesboot", "gnu"] {
+            let other = with_c.replace(r#""rust""#, &format!("\"{system}\""));
+            let error = assemble_recipe_drv(&other, lockp, &dir, None).unwrap_err();
+            assert!(error.contains("`cObjects' is for buildSystem"), "{error}");
+        }
 
-        // WITHOUT the native-link vars: none of those six are emitted.
-        let (_p, _f, drv0, _s) = assemble_recipe_drv(recipe, lockp, &dir, None).unwrap();
-        assert!(
-            env_of(&drv0, "TD_RUST_STORE_INTERP").is_none(),
-            "no interp in the drv env by default"
-        );
-        assert!(
-            env_of(&drv0, "TD_RUST_STORE_RPATH").is_none(),
-            "no rpath by default"
-        );
-        assert!(
-            env_of(&drv0, "TD_RUST_STORE_BDIR").is_none(),
-            "no bdir by default"
-        );
-        assert!(
-            env_of(&drv0, "TD_RUST_STORE_CC").is_none(),
-            "no cc by default"
-        );
-        assert!(
-            env_of(&drv0, "TD_RUST_STORE_CXX").is_none(),
-            "no cxx by default"
-        );
-        assert!(
-            env_of(&drv0, "TD_RUST_STORE_INCLUDE").is_none(),
-            "no include by default"
-        );
+        // Outside the root, or without td glibc, a Cargo recipe is refused.
+        let unrooted =
+            r#"{"name":"ripgrep","version":"14.1.1","buildSystem":"rust","bins":["rg"]}"#;
+        let error = assemble_recipe_drv(unrooted, lockp, &dir, None).unwrap_err();
+        assert!(error.contains("declare buildRoot"), "{error}");
+        let no_glibc = dir.join("no-glibc.lock");
+        std::fs::write(
+            &no_glibc,
+            "ripgrep-source /gnu/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-ripgrep-14.1.1.tar.gz source\n",
+        )
+        .unwrap();
+        let error =
+            assemble_recipe_drv(recipe, no_glibc.to_str().unwrap(), &dir, None).unwrap_err();
+        assert!(error.contains("must declare glibc-x86-64"), "{error}");
 
         // A recipe omitting the workspace selector emits no env line, so
         // existing Rust derivations retain their prior environment shape.
-        let plain_recipe =
-            r#"{"name":"ripgrep","version":"14.1.1","buildSystem":"rust","bins":["rg"]}"#;
+        let plain_recipe = r#"{"name":"ripgrep","version":"14.1.1","buildSystem":"rust","bins":["rg"],"buildRoot":"debian"}"#;
         let (_p, _f, plain_drv, _s) = assemble_recipe_drv(plain_recipe, lockp, &dir, None).unwrap();
         assert!(env_of(&plain_drv, "TD_CARGO_SUBDIR").is_none());
 
         // `cargoSubdir: "."` names the archive root explicitly for the warm
         // plan's benefit and selects nothing, so the derivation is exactly the
         // plain shape above.
-        let root_recipe = r#"{"name":"tn","version":"0.1.0","buildSystem":"rust","bins":["tn"],"cargoSubdir":"."}"#;
+        let root_recipe = r#"{"name":"tn","version":"0.1.0","buildSystem":"rust","bins":["tn"],"cargoSubdir":".","buildRoot":"debian"}"#;
         let (_p, _f, root_drv, _s) = assemble_recipe_drv(root_recipe, lockp, &dir, None).unwrap();
         assert!(env_of(&root_drv, "TD_CARGO_SUBDIR").is_none());
         assert!(env_of(&root_drv, "TD_RUST_STATIC").is_none());
 
         // `staticLink` reaches the runner as one exact flag and nothing else
         // changes: the runner, not the derivation, pins the target for it.
-        let static_recipe = r#"{"name":"tmc","version":"0.1.0","buildSystem":"rust","bins":["tmc"],"cargoSubdir":".","staticLink":true}"#;
+        let static_recipe = r#"{"name":"tmc","version":"0.1.0","buildSystem":"rust","bins":["tmc"],"cargoSubdir":".","staticLink":true,"buildRoot":"debian"}"#;
         let (_p, _f, static_drv, _s) =
             assemble_recipe_drv(static_recipe, lockp, &dir, None).unwrap();
         assert_eq!(env_of(&static_drv, "TD_RUST_STATIC").as_deref(), Some("1"));
         assert!(env_of(&static_drv, "TD_CARGO_SUBDIR").is_none());
-        let unstatic_recipe = r#"{"name":"tmc","version":"0.1.0","buildSystem":"rust","bins":["tmc"],"staticLink":false}"#;
+        let unstatic_recipe = r#"{"name":"tmc","version":"0.1.0","buildSystem":"rust","bins":["tmc"],"staticLink":false,"buildRoot":"debian"}"#;
         let (_p, _f, unstatic_drv, _s) =
             assemble_recipe_drv(unstatic_recipe, lockp, &dir, None).unwrap();
         assert!(env_of(&unstatic_drv, "TD_RUST_STATIC").is_none());
@@ -18718,12 +18687,12 @@ daemon build START (2/2 active)
         std::fs::write(
             &lock,
             "tool-source /td/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-tool-source source\n\
-             binutils-x86-64-self /td/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-binutils-x86-64-self td-recipe-output\n",
+             glibc-x86-64 /td/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-glibc-x86-64-2.41 td-recipe-output\n",
         )
         .unwrap();
         let lockp = lock.to_str().unwrap();
         let vendor = "/td/store/vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv-tool-vendor";
-        let verify = r#"{"name":"tool","version":"1","buildSystem":"rust","sourceInput":"tool-source","bins":["tool"],"cargoLock":"recipes/locks/tool/Cargo.lock"}"#;
+        let verify = r#"{"name":"tool","version":"1","buildSystem":"rust","sourceInput":"tool-source","bins":["tool"],"cargoLock":"recipes/locks/tool/Cargo.lock","buildRoot":"debian"}"#;
         let env_of = |drv: &drv::Derivation, key: &str| {
             drv.env
                 .iter()
@@ -18737,7 +18706,7 @@ daemon build START (2/2 active)
             Some("verify")
         );
 
-        let plain = r#"{"name":"tool","version":"1","buildSystem":"rust","sourceInput":"tool-source","bins":["tool"]}"#;
+        let plain = r#"{"name":"tool","version":"1","buildSystem":"rust","sourceInput":"tool-source","bins":["tool"],"buildRoot":"debian"}"#;
         let (_, _, plain_drv, _) = assemble_recipe_drv(plain, lockp, &dir, None).unwrap();
         assert!(env_of(&plain_drv, "TD_CARGO_LOCK_POLICY").is_none());
 
@@ -18773,57 +18742,6 @@ daemon build START (2/2 active)
             assert!(error.contains(expected), "{error}");
         }
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    // build-plan --auto derives TD_RUST_STORE_* from the declared native inputs (the env
-    // is cleared in the graph build). The derived strings must equal the rust-toolchain
-    // check's TD_SHELL_NATIVE_* formulas so a `td shell` and an `--auto` build of the same
-    // recipe link identically (re #547).
-    #[test]
-    fn derive_native_rust_link_env_mirrors_the_check_formulas() {
-        let mk = |name: &str, path: &str| lock::Entry {
-            name: name.to_string(),
-            path: path.to_string(),
-            class: lock::Class::Seed,
-        };
-        let gcc = "/td/store/gggggggggggggggggggggggggggggggg-gcc-x86-64-self";
-        let binutils = "/td/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-binutils-x86-64-self";
-        let glibc = "/td/store/llllllllllllllllllllllllllllllll-glibc-x86-64";
-        let entries = vec![
-            mk(
-                "uutils-source",
-                "/td/store/ssssssssssssssssssssssssssssssss-uutils-source",
-            ),
-            mk(
-                "rust-toolchain",
-                "/td/store/rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr-rust-toolchain",
-            ),
-            mk("gcc-x86-64-self", gcc),
-            mk("binutils-x86-64-self", binutils),
-            mk("glibc-x86-64", glibc),
-            mk(
-                "busybox-x86-64",
-                "/td/store/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-busybox-x86-64",
-            ),
-        ];
-        let d = derive_native_rust_link_env(&entries).expect("all three inputs present");
-        let gp = format!("{glibc}/{}", toolchain_x86_64::GLIBC_X86_64_STAGE);
-        let gccp = format!("{gcc}/{NATIVE_GCC_STAGE}");
-        assert_eq!(d.interp, format!("{gp}/lib/ld-linux-x86-64.so.2"));
-        assert_eq!(d.rpath, format!("{gp}/lib"));
-        assert_eq!(d.bdir, format!("{binutils}/bin:{gp}/lib"));
-        assert_eq!(d.cc, format!("{gccp}/bin/gcc"));
-        assert_eq!(d.cxx, format!("{gccp}/bin/g++"));
-        assert_eq!(d.include, format!("{gp}/include"));
-
-        // A rust recipe that names no native toolchain is not linkable this way.
-        assert!(derive_native_rust_link_env(&[mk("uutils-source", "/x")]).is_none());
-        // Missing any ONE of the three ⇒ None (binutils absent here).
-        assert!(derive_native_rust_link_env(&[
-            mk("gcc-x86-64-self", gcc),
-            mk("glibc-x86-64", glibc),
-        ])
-        .is_none());
     }
 
     #[test]

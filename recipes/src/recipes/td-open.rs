@@ -13,13 +13,8 @@ pub fn recipe() -> Recipe {
     Recipe::rust("td-open", "0.1.0")
         .local_source("td-open")
         .local_source_trees(&["td-busd", "td-secret"])
-        .native_inputs(&[
-            "rust-toolchain",
-            "td-link",
-            "gcc-x86-64-self",
-            "binutils-x86-64-self",
-            "glibc-x86-64",
-        ])
+        .build_root()
+        .native_inputs(&["rust-toolchain", "td-link", "glibc-x86-64"])
         .cargo_subdir("td-open")
         .cargo_lock("td-open/Cargo.lock")
         .static_link()

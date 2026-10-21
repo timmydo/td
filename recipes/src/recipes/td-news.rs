@@ -21,13 +21,8 @@ pub fn recipe() -> Recipe {
             "td-ui",
             "td-compositor",
         ])
-        .native_inputs(&[
-            "rust-toolchain",
-            "td-link",
-            "gcc-x86-64-self",
-            "binutils-x86-64-self",
-            "glibc-x86-64",
-        ])
+        .build_root()
+        .native_inputs(&["rust-toolchain", "td-link", "glibc-x86-64"])
         .cargo_subdir("td-news")
         .cargo_lock("td-news/Cargo.lock")
         .static_link()

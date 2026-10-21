@@ -24,13 +24,8 @@ pub fn recipe() -> Recipe {
             "td-compositor",
             "td-test-compositor",
         ])
-        .native_inputs(&[
-            "rust-toolchain",
-            "td-link",
-            "gcc-x86-64-self",
-            "binutils-x86-64-self",
-            "glibc-x86-64",
-        ])
+        .build_root()
+        .native_inputs(&["rust-toolchain", "td-link", "glibc-x86-64"])
         .cargo_subdir("td-photo")
         .cargo_lock("td-photo/Cargo.lock")
         .static_link()

@@ -18,13 +18,8 @@ pub fn recipe() -> Recipe {
     Recipe::rust("td-term", "0.1.0")
         .local_source("td-term")
         .local_source_trees(&["td-fs", "td-ui", "td-compositor"])
-        .native_inputs(&[
-            "rust-toolchain",
-            "td-link",
-            "gcc-x86-64-self",
-            "binutils-x86-64-self",
-            "glibc-x86-64",
-        ])
+        .build_root()
+        .native_inputs(&["rust-toolchain", "td-link", "glibc-x86-64"])
         .cargo_subdir("td-term")
         .cargo_lock("td-term/Cargo.lock")
         .static_link()

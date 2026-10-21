@@ -15,15 +15,12 @@ pub fn recipe() -> Recipe {
     Recipe::rust("td-net", "0.1.0")
         .local_source("net")
         .local_source_trees(&["engine", "td-boot", "td-fs"])
-        .native_inputs(&[
-            "rust-toolchain",
-            "td-link",
-            "gcc-x86-64-self",
-            "binutils-x86-64-self",
-            "glibc-x86-64",
-        ])
+        .build_root()
+        .native_inputs(&["rust-toolchain", "td-link", "glibc-x86-64"])
         .cargo_subdir("net")
         .cargo_lock("net/Cargo.lock")
+        // ring 0.17.14's C and pregenerated x86_64 assembly.
+        .c_objects(30)
         .static_link()
         .bins(&["td-net"])
 }
@@ -49,6 +46,7 @@ mod tests {
         assert_eq!(recipe.cargo_lock.as_deref(), Some("net/Cargo.lock"));
         assert_eq!(recipe.bins, Some(vec!["td-net".to_string()]));
         assert_eq!(recipe.static_link, Some(true));
+        assert_eq!(recipe.c_objects, Some(30));
         // No fetch pin: the bytes are the committed trees, pinned by the
         // compiled seed-digest table.
         assert!(crate::source_pins::by_key("td-net-source").is_none());

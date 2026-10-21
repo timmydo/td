@@ -76,7 +76,20 @@ canonical roots are `/td-build` for package source, `/td-build-root` for other
 build scratch, and `/td-cargo` for Cargo's working state; vendor source is
 mapped below `/td-cargo/vendor`. Line tables may also name headers or static
 objects from declared inputs below `/td/store`; those content-addressed paths
-are already stable inputs, not varying build paths to remap. Timestamps,
+are already stable inputs, not varying build paths to remap. C compiled in
+the Debian build root, a Cargo build script's included, may likewise name
+GCC's own freestanding headers below
+`/usr/lib/gcc/x86_64-linux-gnu/14/include`, which the pinned root fixes;
+the line-table validator admits that directory and nothing else of the
+root's. The Cargo runner hands build scripts' C the Rust objects' policy
+above as CFLAGS: `-O2 -g1 -fno-omit-frame-pointer` and the same three
+remaps. A crate's own flags follow CFLAGS, so a crate may raise `-g`,
+which the split prunes, or drop frame pointers; after the build the
+runner reads every C object's DWARF producer and refuses one that lacks
+`-fno-omit-frame-pointer` or names a later `-fomit-frame-pointer`. An
+object with no C producer must come from a preprocessed `.S` source:
+hand-written assembly, a coverage boundary as below. A plain `.s` leaves
+no dependency list, so its object is refused. Timestamps,
 archive ordering, and other build identity inputs remain pinned by the normal
 recipe reproducibility contract.
 

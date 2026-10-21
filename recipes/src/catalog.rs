@@ -447,22 +447,58 @@ mod tests {
         );
     }
 
+    /// A Cargo target builds in the Debian build root, whose gcc compiles its
+    /// build scripts' C against td glibc's headers and whose objcopy splits
+    /// its companions; td-link links it. No ladder tool is an input.
     #[test]
-    fn every_cargo_target_declares_the_objcopy_and_linker_the_runner_uses() {
+    fn every_cargo_target_builds_in_the_root_with_td_link_and_td_glibc() {
+        let mut cargo = Vec::new();
         for (stem, recipe) in all() {
             if !matches!(recipe.build_system, crate::types::BuildSystem::Rust) {
                 continue;
             }
-            let inputs = recipe.native_inputs.as_deref().unwrap_or_default();
+            cargo.push(stem);
             assert!(
-                inputs.iter().any(|input| input == "binutils-x86-64-self"),
-                "{stem}: Cargo target must declare binutils-x86-64-self for debug splitting"
+                recipe.build_root,
+                "{stem}: Cargo target must declare the build root"
             );
-            assert!(
-                inputs.iter().any(|input| input == "td-link"),
-                "{stem}: Cargo target must declare td-link, its linker"
+            assert_eq!(
+                recipe.native_inputs.as_deref().unwrap_or_default(),
+                ["rust-toolchain", "td-link", "glibc-x86-64"],
+                "{stem}: a Cargo target's toolchain, linker and C headers"
             );
+            crate::ladder::assert_no_ladder_tools(&recipe, &[]);
+            // Only these build scripts compile C, each to an exact count.
+            let objects = match stem {
+                "td-net" => Some(30),
+                "uutils" => Some(48),
+                _ => None,
+            };
+            assert_eq!(recipe.c_objects, objects, "{stem}: build-script C objects");
         }
+        cargo.sort_unstable();
+        assert_eq!(
+            cargo,
+            [
+                "fd",
+                "ripgrep",
+                "td-agent",
+                "td-dua",
+                "td-editor",
+                "td-mail",
+                "td-net",
+                "td-news",
+                "td-open",
+                "td-pass",
+                "td-photo",
+                "td-portal",
+                "td-review",
+                "td-setup",
+                "td-taskmgr",
+                "td-term",
+                "uutils",
+            ]
+        );
     }
 
     #[test]

@@ -314,7 +314,7 @@ fn assert_build_root_c(recipe: &Recipe, runtime: &[&str]) {
 /// Neither input channel names a ladder toolchain or a post-Rust farm
 /// provider other than one of `subjects`, and no step builds the farm.
 #[cfg(test)]
-fn assert_no_ladder_tools(recipe: &Recipe, subjects: &[&str]) {
+pub(crate) fn assert_no_ladder_tools(recipe: &Recipe, subjects: &[&str]) {
     let inputs: Vec<&String> = recipe
         .native_inputs
         .iter()
@@ -641,7 +641,8 @@ function under(path, prefix) {
 }
 function allowed(path) {
   return under(path, "/td-build") || under(path, "/td-build-root") ||
-         under(path, "/td-cargo") || under(path, "/td/store")
+         under(path, "/td-cargo") || under(path, "/td/store") ||
+         under(path, "/usr/lib/gcc/x86_64-linux-gnu/14/include")
 }
 function reject(reason, value) {
   print "debug line-table " reason ": " value > "/dev/stderr"
@@ -910,6 +911,32 @@ fn debug_line_regression(host: AwkHost) -> Vec<Step> {
  Line Number Statements:
   define new File Table entry: /home/user name/x.c
 "#;
+    // The pinned root's GCC names its own freestanding headers; nothing
+    // else of the root's is a stable line-table root.
+    const GCC_HEADER: &str = r#"  Offset: 0
+  DWARF Version: 5
+ The Directory Table
+  Entry Name
+  0 (indirect line string, offset: 0): /td-build
+  1 (indirect line string, offset: 1): /usr/lib/gcc/x86_64-linux-gnu/14/include
+ The File Name Table
+  Entry Dir Name
+  0 0 (indirect line string, offset: 2): main.c
+  1 1 (indirect line string, offset: 3): stddef.h
+ Line Number Statements:
+"#;
+    const GCC_FIXED: &str = r#"  Offset: 0
+  DWARF Version: 5
+ The Directory Table
+  Entry Name
+  0 (indirect line string, offset: 0): /td-build
+  1 (indirect line string, offset: 1): /usr/lib/gcc/x86_64-linux-gnu/14/include-fixed
+ The File Name Table
+  Entry Dir Name
+  0 0 (indirect line string, offset: 2): main.c
+  1 1 (indirect line string, offset: 3): limits.h
+ Line Number Statements:
+"#;
 
     fn producer(fixture: &str) -> String {
         format!("printf '%s' '{fixture}'")
@@ -930,8 +957,12 @@ fn debug_line_regression(host: AwkHost) -> Vec<Step> {
     let dwarf4 = fixture_command(DWARF4);
     let statement_scratch = fixture_command(STATEMENT_SCRATCH);
     let dynamic_outside = fixture_command(DYNAMIC_OUTSIDE);
+    let gcc_header = fixture_command(GCC_HEADER);
+    let gcc_fixed = fixture_command(GCC_FIXED);
     let command = format!(
         "{good} || {{ echo 'canonical rawline fixture was rejected' >&2; exit 1; }}; \
+         {gcc_header} || {{ echo 'gcc-header rawline fixture was rejected' >&2; exit 1; }}; \
+         if {gcc_fixed} 2>/dev/null; then echo 'gcc include-fixed rawline fixture passed' >&2; exit 1; fi; \
          if {wrong} 2>/dev/null; then echo 'wrong-directory rawline fixture passed' >&2; exit 1; fi; \
          if {traversal} 2>/dev/null; then echo 'traversal rawline fixture passed' >&2; exit 1; fi; \
          if {spaced} 2>/dev/null; then echo 'spaced-path rawline fixture passed' >&2; exit 1; fi; \

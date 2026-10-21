@@ -4,13 +4,8 @@ pub fn recipe() -> Recipe {
     Recipe::rust("td-taskmgr", "0.1.0")
         .local_source("td-taskmgr")
         .local_source_trees(&["td-ui", "td-compositor", "td-fs", "td-test-compositor"])
-        .native_inputs(&[
-            "rust-toolchain",
-            "td-link",
-            "gcc-x86-64-self",
-            "binutils-x86-64-self",
-            "glibc-x86-64",
-        ])
+        .build_root()
+        .native_inputs(&["rust-toolchain", "td-link", "glibc-x86-64"])
         .cargo_subdir("td-taskmgr")
         .cargo_lock("td-taskmgr/Cargo.lock")
         .static_link()

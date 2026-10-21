@@ -4426,6 +4426,13 @@ impl RecipeCheckRunner {
             .ok_or_else(|| "build-root assemble produced no path".to_string())
     }
 
+    /// The seed store holding the placed build root and the seed db its own
+    /// db sits beside: what `td shell` admits the root from.
+    pub(crate) fn build_root_seed(&self) -> Result<(&Path, &Path), String> {
+        self.ensure_build_root()?;
+        Ok((&self.store, &self.db))
+    }
+
     fn store_add_recursive_into(
         &self,
         name: &str,
@@ -9616,13 +9623,15 @@ mod tests {
         // The members built in the Debian build root: the kernel, glibc and
         // the static libgcc it links, the upstream toolchain's runtime,
         // zlib, cryptsetup with its libraries, OpenSSH, Git with curl and
-        // LibreSSL, and td-link, whose throwaway first stage the root's GCC
-        // links.
+        // LibreSSL, td-link, whose throwaway first stage the root's GCC
+        // links, and every Cargo recipe, whose build scripts' C the root's
+        // GCC compiles.
         assert_eq!(
             answer.build_root_members,
             [
                 "cryptsetup-x86-64",
                 "curl-x86-64",
+                "fd",
                 "gcc-runtime",
                 "gcc-runtime-stage1",
                 "git-x86-64",
@@ -9633,8 +9642,24 @@ mod tests {
                 "linux-x86-64",
                 "openssh-x86-64",
                 "popt-x86-64",
+                "ripgrep",
+                "td-agent",
+                "td-dua",
+                "td-editor",
                 "td-link",
+                "td-mail",
+                "td-net",
+                "td-news",
+                "td-open",
+                "td-pass",
+                "td-photo",
+                "td-portal",
+                "td-review",
+                "td-setup",
+                "td-taskmgr",
+                "td-term",
                 "util-linux-libs-x86-64",
+                "uutils",
                 "zlib-x86-64"
             ]
         );
@@ -11855,18 +11880,29 @@ chmod 755 '{}'
     #[test]
     fn a_runner_declared_build_joins_the_check_and_nothing_else_is_built() {
         let roots = check_roots("rust-toolchain", Some(CheckRunner::RustToolchain));
-        assert_eq!(roots, ["rust-toolchain", "ripgrep", "fd", "uutils"]);
+        assert_eq!(
+            roots,
+            [
+                "rust-toolchain",
+                "ripgrep",
+                "fd",
+                "uutils",
+                "binutils-x86-64-self"
+            ]
+        );
         let closure = recipe_closure(&roots).unwrap();
         let stems: BTreeSet<String> = closure.iter().map(|n| n.stem.clone()).collect();
-        // The key reads each declared build's recipe and its committed lock.
+        // The key reads each declared build's recipe and a Cargo build's
+        // committed lock.
         let (locks, _) = closure_repo_inputs(&closure);
         for extra in CheckRunner::RustToolchain.extra_builds() {
             assert!(
                 stems.contains(*extra),
                 "{extra} outside the check's closure"
             );
-            let lock = catalog::lookup(extra).unwrap().cargo_lock.unwrap();
-            assert!(locks.contains(&lock), "{lock} outside the check's key");
+            if let Some(lock) = catalog::lookup(extra).unwrap().cargo_lock {
+                assert!(locks.contains(&lock), "{lock} outside the check's key");
+            }
         }
         let owner = catalog::lookup("rust-toolchain").unwrap();
         assert_eq!(owner_roots("rust-toolchain", &owner), roots);

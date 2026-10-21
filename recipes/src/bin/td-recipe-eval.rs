@@ -819,16 +819,10 @@ mod tests {
 
     #[test]
     fn rust_userland_recipes_own_their_fixed_output_source_pins() {
-        let platform: Vec<String> = [
-            "rust-toolchain",
-            "td-link",
-            "gcc-x86-64-self",
-            "binutils-x86-64-self",
-            "glibc-x86-64",
-        ]
-        .into_iter()
-        .map(str::to_string)
-        .collect();
+        let platform: Vec<String> = ["rust-toolchain", "td-link", "glibc-x86-64"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
         let ripgrep = catalog::lookup("ripgrep").unwrap();
         assert_eq!(ripgrep.source_input.as_deref(), Some("ripgrep-source"));
         assert_eq!(ripgrep.native_inputs.as_deref(), Some(platform.as_slice()));
