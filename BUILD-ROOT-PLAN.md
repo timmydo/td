@@ -242,11 +242,14 @@ deleted; its findings are summarized under "Facts" below.
     there. The ladder's users move first, in parts; the deletion, the
     sweep and this file's removal are the last. Landed: the direct-rustc
     recipes build in the root and split with its objcopy, so no shipped
-    output's build declares the ladder's binutils. Still on the ladder:
-    the td tests' readelf and tool-farm awk, the rust-toolchain check,
-    td-jail-seccomp-probe, the crypto portable kit, system-x86-64's and
-    kexec-spike-x86-64's tool-farm awk (gawk-x86-64-self), and the
-    ladder's own fixtures (hello, hello-test), deleted with it.
+    output's build declares the ladder's binutils; and ten td tests grade
+    their subjects in the root with its bash, readelf, grep and gawk.
+    Still on the ladder: td-jail-test's, td-svc-test's and
+    rust-userland-auto-test's readelf and tool farm, the rust-toolchain
+    check, td-jail-seccomp-probe, the crypto portable kit,
+    system-x86-64's, kexec-spike-x86-64's and kexec-spike-x86-64-test's
+    tool farm (gawk-x86-64-self), and the ladder's own fixtures (hello,
+    hello-test), deleted with it.
 12. **td-btrfs** (landed): std-only mkfs with `--rootdir/--subvol`;
     btrfs-progs, its pin and test are deleted; util-linux libs stay for
     cryptsetup.

@@ -1,4 +1,4 @@
-use crate::ladder::{post_rust_inputs, post_rust_tool_farm, POST_RUST_SH};
+use crate::ladder::{BUILD_ROOT_PATH as PATH, BUILD_ROOT_SH as SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 // td-init-test: build-shape AND behavioural validation of the boot-glue multicall.
@@ -46,16 +46,20 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 // The applets' live behaviour on a booted machine (PID 1 supervision, ctty
 // acquisition, the real switch_root) belongs to the headless boot oracle, which
 // gains it when system-x86-64 flips its /bin farm to td-init.
+//
+// The steps run in the Debian build root under its bash, with its readelf,
+// grep and coreutils and PATH its /usr/bin alone; td-init is reached only by
+// its store path or a symlink to it.
 pub fn recipe() -> Recipe {
     let bin = "{in:td-init}/bin/td-init";
-    let readelf = "{in:binutils-x86-64-self}/bin/readelf";
-    let mut steps = vec![post_rust_tool_farm("{in:gawk-x86-64-self}/bin/gawk")];
+    let readelf = "/usr/bin/readelf";
+    let mut steps = Vec::new();
 
     steps.push(
         Step::run(
             "{root}",
             &[
-                POST_RUST_SH,
+                SH,
                 "-c",
                 &format!(
                     "h=$('{readelf}' -h '{bin}' 2>/dev/null) || {{ echo 'readelf -h failed on td-init' >&2; exit 1; }}; \
@@ -65,13 +69,13 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", "{tools}"),
+        .env("PATH", PATH),
     );
     steps.push(
         Step::run(
             "{root}",
             &[
-                POST_RUST_SH,
+                SH,
                 "-c",
                 &format!(
                     "lout=$('{readelf}' -l '{bin}' 2>/dev/null) || {{ echo 'readelf -l failed on td-init (cannot verify absence of PT_INTERP)' >&2; exit 1; }}; \
@@ -79,13 +83,13 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", "{tools}"),
+        .env("PATH", PATH),
     );
     steps.push(
         Step::run(
             "{root}",
             &[
-                POST_RUST_SH,
+                SH,
                 "-c",
                 &format!(
                     "dout=$('{readelf}' -d '{bin}' 2>/dev/null) || {{ echo 'readelf -d failed on td-init (cannot verify absence of dynamic NEEDED)' >&2; exit 1; }}; \
@@ -93,7 +97,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", "{tools}"),
+        .env("PATH", PATH),
     );
 
     // Applet roster: the /bin symlink farm this multicall will back is generated
@@ -103,7 +107,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_RUST_SH,
+                SH,
                 "-c",
                 &format!(
                     "l=$('{bin}' --list) || {{ echo 'td-init --list failed' >&2; exit 1; }}; \
@@ -115,7 +119,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", "{tools}"),
+        .env("PATH", PATH),
     );
 
     // The inittab fixtures `init --dry-run` parses. Written as files rather than
@@ -144,7 +148,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_RUST_SH,
+                SH,
                 "-c",
                 &format!(
                     "'{bin}' no-such-applet >/dev/null 2>&1; \
@@ -204,7 +208,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", "{tools}"),
+        .env("PATH", PATH),
     );
 
     // init's inittab validator, through the argv[0] form the kernel uses for
@@ -219,7 +223,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_RUST_SH,
+                SH,
                 "-c",
                 &format!(
                     "d='{{root}}/argv0'; \
@@ -237,7 +241,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", "{tools}"),
+        .env("PATH", PATH),
     );
 
     // switch_root's fail-early contract: a new root that cannot exec its init
@@ -247,7 +251,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_RUST_SH,
+                SH,
                 "-c",
                 &format!(
                     "e=$('{bin}' switch_root '{{root}}/absent' /sbin/init 2>&1); \
@@ -287,7 +291,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", "{tools}"),
+        .env("PATH", PATH),
     );
 
     // mount/umount: the rejection paths, then the read-only table listing where
@@ -300,7 +304,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_RUST_SH,
+                SH,
                 "-c",
                 &format!(
                     "e=$('{bin}' mount --not-an-option 2>&1); \
@@ -336,7 +340,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", "{tools}"),
+        .env("PATH", PATH),
     );
 
     // hostname: the rejection paths, then printing where /proc is mounted. The
@@ -345,7 +349,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_RUST_SH,
+                SH,
                 "-c",
                 &format!(
                     "'{bin}' hostname -F '{{root}}/no-such-file' >/dev/null 2>&1; \
@@ -365,7 +369,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", "{tools}"),
+        .env("PATH", PATH),
     );
 
     steps.push(Step::MkDir {
@@ -382,14 +386,24 @@ pub fn recipe() -> Recipe {
     });
 
     Recipe::mesboot("td-init-test", "1.0")
-        .native_inputs(&post_rust_inputs("gawk-x86-64-self", &["td-init", "binutils-x86-64-self"]))
+        .build_root()
+        .native_inputs(&["td-init"])
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
-echo ">> recipe-check td-init-test: build-plan --auto builds td-init (td's static boot-glue multicall: init/reboot/poweroff/halt/switch_root/mount/umount/devpts/cttyhack/getty/hostname/losetup/mknod/sync, statically linked by the /td/store target Rust + native GCC/binutils/glibc toolchain), asserts a self-contained static ELF64 x86-64 executable (ET_EXEC, no PT_INTERP, no dynamic NEEDED), and exercises the applet roster, both dispatch forms, the inittab validator, the mount-table listing, and the fail-early/reject paths of the irreversible applets"
+echo ">> recipe-check td-init-test: build-plan --auto builds td-init (td's static boot-glue multicall: init/reboot/poweroff/halt/switch_root/mount/umount/devpts/cttyhack/getty/hostname/losetup/mknod/sync, statically linked by the /td/store target Rust toolchain through td-link against td glibc), asserts a self-contained static ELF64 x86-64 executable (ET_EXEC, no PT_INTERP, no dynamic NEEDED), and exercises the applet roster, both dispatch forms, the inittab validator, the mount-table listing, and the fail-early/reject paths of the irreversible applets"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run td-init-test 1
 "#,
         )
         .with_runner(CheckRunner::BuildOnly)])
+}
+
+#[cfg(test)]
+mod tests {
+    /// td-init is graded only by the Debian build root's tools, never by its own.
+    #[test]
+    fn td_init_is_graded_only_by_the_roots_tools() {
+        crate::ladder::assert_build_root_test(&super::recipe(), &["td-init"], &["td-init"]);
+    }
 }

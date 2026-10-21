@@ -1,4 +1,4 @@
-use crate::ladder::{post_rust_inputs, post_rust_tool_farm, POST_RUST_SH};
+use crate::ladder::{BUILD_ROOT_PATH as PATH, BUILD_ROOT_SH as SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 const GOOD_ID: &str = "ba7dfe039aae6703b7c58003bf32909c9b9df7801d4d18bd72bf3fa8425ecd0b";
@@ -6,13 +6,15 @@ const BAD_ID: &str = "0000000000000000000000000000000000000000000000000000000000
 
 // Exercise the target-linked binary against a corrupt current deployment, a
 // verified previous deployment, and a subsequently tampered previous payload.
+// The steps run in the Debian build root under its bash, reading td-boot's
+// verdicts with the root's grep and its shape with the root's readelf; PATH
+// is the root's /usr/bin alone and td-boot is reached only by its store path.
 pub fn recipe() -> Recipe {
     let bin = "{in:td-boot}/bin/td-boot";
-    let readelf = "{in:binutils-x86-64-self}/bin/readelf";
+    let readelf = "/usr/bin/readelf";
     let good = format!("{{root}}/volume/td/deployments/{GOOD_ID}");
     let bad = format!("{{root}}/volume/td/deployments/{BAD_ID}");
     let mut steps = vec![
-        post_rust_tool_farm("{in:gawk-x86-64-self}/bin/gawk"),
         Step::MkDir { path: good.clone() },
         Step::MkDir { path: bad.clone() },
         Step::MkDir {
@@ -61,7 +63,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_RUST_SH,
+                SH,
                 "-c",
                 &format!(
                     "'{bin}' verify '{{root}}/volume' > '{{root}}/selected' 2> '{{root}}/warning' || exit 1; \
@@ -70,7 +72,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", "{tools}"),
+        .env("PATH", PATH),
     );
     steps.push(Step::WriteFile {
         path: format!("{good}/root.erofs"),
@@ -81,7 +83,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_RUST_SH,
+                SH,
                 "-c",
                 &format!(
                     "if '{bin}' verify '{{root}}/volume' > '{{root}}/tampered-out' 2> '{{root}}/tampered-error'; then echo 'td-boot accepted a tampered payload' >&2; exit 1; fi; \
@@ -89,13 +91,13 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", "{tools}"),
+        .env("PATH", PATH),
     );
     steps.push(
         Step::run(
             "{root}",
             &[
-                POST_RUST_SH,
+                SH,
                 "-c",
                 &format!(
                     "h=$('{readelf}' -h '{bin}' 2>/dev/null) || {{ echo 'readelf -h failed on td-boot' >&2; exit 1; }}; \
@@ -109,7 +111,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", "{tools}"),
+        .env("PATH", PATH),
     );
     steps.extend([
         Step::MkDir {
@@ -127,7 +129,8 @@ pub fn recipe() -> Recipe {
     ]);
 
     Recipe::mesboot("td-boot-test", "1.0")
-        .native_inputs(&post_rust_inputs("gawk-x86-64-self", &["td-boot", "binutils-x86-64-self"]))
+        .build_root()
+        .native_inputs(&["td-boot"])
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
@@ -137,4 +140,13 @@ exec "$TD_RECIPE_EVAL" check-run td-boot-test 1
 "#,
         )
         .with_runner(CheckRunner::BuildOnly)])
+}
+
+#[cfg(test)]
+mod tests {
+    /// td-boot is graded only by the Debian build root's tools, never by its own.
+    #[test]
+    fn td_boot_is_graded_only_by_the_roots_tools() {
+        crate::ladder::assert_build_root_test(&super::recipe(), &["td-boot"], &["td-boot"]);
+    }
 }

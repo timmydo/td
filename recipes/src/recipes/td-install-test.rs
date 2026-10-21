@@ -1,4 +1,4 @@
-use crate::ladder::{post_rust_inputs, post_rust_tool_farm, POST_RUST_SH};
+use crate::ladder::{BUILD_ROOT_PATH as PATH, BUILD_ROOT_SH as SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 use crate::td_boot_protocol;
@@ -26,6 +26,9 @@ mod td_boot_fixture;
 // in LBA 1 with its disk GUID 56 bytes into it. The BACKUP header is read too,
 // out of the last LBA, because it is the copy the `last_usable`/backup
 // arithmetic can put in the wrong place while every primary-table check passes.
+//
+// The reads are the Debian build root's: its bash, od, cmp and gawk, with PATH
+// its /usr/bin alone, and the td programs reached only by their store paths.
 const ESP_AT: u64 = 1024 * 1024;
 const DISK_BYTES: u64 = 6 * 1024 * 1024 * 1024;
 const SECTOR: u64 = 512;
@@ -182,7 +185,7 @@ fn publish_steps(
          {{ echo \"a fresh install offers $offered in its update channel\" >&2; exit 1; }}; \
          '{btrfs}' list '{{root}}/scratch/td-volume.img' > '{{root}}/published-listing' || \
          {{ echo 'the volume has no readable filesystem tree' >&2; exit 1; }}; \
-         awk '$1 == \"d\" && $6 == \"/{deployments}/{id}\" {{ found = 1 }} END {{ exit !found }}' \
+         gawk '$1 == \"d\" && $6 == \"/{deployments}/{id}\" {{ found = 1 }} END {{ exit !found }}' \
          '{{root}}/published-listing' || \
          {{ echo 'the published deployment {id} is not in the volume' >&2; exit 1; }}",
         boot = td_boot_protocol::BOOT_DIR,
@@ -199,7 +202,7 @@ fn publish_steps(
         Step::run(
             "{root}",
             &[
-                POST_RUST_SH,
+                SH,
                 "-c",
                 &format!(
                     "'{bin}' volume '{disk}' '{mkfs}' '{{root}}/scratch' '{td_boot}' \
@@ -217,7 +220,7 @@ fn publish_steps(
                 ),
             ],
         )
-        .env("PATH", "{tools}"),
+        .env("PATH", PATH),
     );
 
     // ...and the key is LOAD-BEARING rather than passed along: the same publish
@@ -245,7 +248,7 @@ fn publish_steps(
         Step::run(
             "{root}",
             &[
-                POST_RUST_SH,
+                SH,
                 "-c",
                 &format!(
                     "if '{bin}' volume '{disk}' '{mkfs}' '{{root}}/scratch2' '{td_boot}' \
@@ -267,7 +270,7 @@ fn publish_steps(
                 ),
             ],
         )
-        .env("PATH", "{tools}"),
+        .env("PATH", PATH),
     );
 
     steps
@@ -330,10 +333,10 @@ pub fn recipe() -> Recipe {
     let subvol_exists = format!(
         "'{btrfs}' list '{{root}}/scratch/td-volume.img' > '{{root}}/subvol-listing' || \
          {{ echo 'the volume has no readable root tree' >&2; exit 1; }}; \
-         awk '$6 == \"/{subvol}\" && $7 == \"[subvolume\" {{ found = 1 }} END {{ exit !found }}' \
+         gawk '$6 == \"/{subvol}\" && $7 == \"[subvolume\" {{ found = 1 }} END {{ exit !found }}' \
          '{{root}}/subvol-listing' || \
          {{ echo 'the volume has no {subvol} subvolume' >&2; exit 1; }}; \
-         awk '$6 == \"/{subvol}\" && $7 == \"[subvolume\" && $9 == \"rw]\" {{ found = 1 }} END {{ exit !found }}' \
+         gawk '$6 == \"/{subvol}\" && $7 == \"[subvolume\" && $9 == \"rw]\" {{ found = 1 }} END {{ exit !found }}' \
          '{{root}}/subvol-listing' || \
          {{ echo 'the {subvol} subvolume is read-only' >&2; exit 1; }}",
         subvol = td_boot_protocol::VOLUME_SUBVOL
@@ -348,9 +351,7 @@ pub fn recipe() -> Recipe {
     );
 
     let mut steps = vec![
-        post_rust_tool_farm("{in:gawk-x86-64-self}/bin/gawk"),
-        // Engine-native, so the destination costs no `dd`, which the post-Rust
-        // farm does not serve.
+        // Engine-native: the size is the builder's, not a shell tool's.
         Step::Truncate {
             path: disk.into(),
             bytes: DISK_BYTES,
@@ -358,7 +359,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_RUST_SH,
+                SH,
                 "-c",
                 &format!(
                     // The size is CHECKED as well as asked for, because
@@ -372,14 +373,14 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", "{tools}"),
+        .env("PATH", PATH),
         // A REINSTALL over the disk just written. The disk GUID must be freshly
         // drawn, since a fixed one would have every td disk claim the same
         // identity, and the whole layout must still be there afterwards.
         Step::run(
             "{root}",
             &[
-                POST_RUST_SH,
+                SH,
                 "-c",
                 &format!(
                     "before=$(od -An -tx1 -j 568 -N 16 '{disk}') || exit 1; \
@@ -390,7 +391,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", "{tools}"),
+        .env("PATH", PATH),
         // D7's BINDING, and the reason it is a `Require` rather than a comment:
         // the formatter on the install path, from its own recipe, is named by
         // `protocol.rs` and composed into this path, so a td-btrfs that
@@ -405,7 +406,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_RUST_SH,
+                SH,
                 "-c",
                 &format!(
                     "'{bin}' volume '{disk}' '{mkfs}' '{{root}}/scratch' > '{{root}}/volume-out' || {{ echo 'td-install volume failed' >&2; exit 1; }}; \
@@ -419,7 +420,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", "{tools}"),
+        .env("PATH", PATH),
     ];
 
     // The publish pass gets the DISK checks too, not only the deployment ones.
@@ -453,7 +454,8 @@ pub fn recipe() -> Recipe {
     ]);
 
     Recipe::mesboot("td-install-test", "1.0")
-        .native_inputs(&post_rust_inputs("gawk-x86-64-self", &["td-install", "td-boot", "td-btrfs"]))
+        .build_root()
+        .native_inputs(&["td-install", "td-boot", "td-btrfs"])
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
@@ -518,6 +520,15 @@ mod tests {
             }),
             "no step checks the restored volume's update channel; wanted {wanted}"
         );
+    }
+
+    /// Only the Debian build root's tools are on PATH; the installer, the
+    /// td-boot it publishes through and the td-btrfs it formats with, which
+    /// also read back its volume, run by their store paths.
+    #[test]
+    fn only_the_roots_tools_are_on_path() {
+        let subjects = ["td-install", "td-boot", "td-btrfs"];
+        crate::ladder::assert_build_root_test(&super::recipe(), &subjects, &subjects);
     }
 
     /// The deployment id the check looks for is the one td-boot will compute:

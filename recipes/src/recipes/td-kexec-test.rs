@@ -1,4 +1,4 @@
-use crate::ladder::{post_rust_inputs, post_rust_tool_farm, POST_RUST_SH};
+use crate::ladder::{BUILD_ROOT_PATH as PATH, BUILD_ROOT_SH as SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 // td-kexec-test: behavioral validation of the target-built guest kexec helper.
@@ -15,16 +15,19 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 //      section at all) — an EMPTY runtime closure, no libc.so to resolve.
 // The behavioural proof that it actually kexecs is the operator qemu spike (two-
 // kernel marker boot under -accel tcg), which cannot run in this BuildOnly rung.
+//
+// The walk runs in the Debian build root: its bash, readelf and grep, with
+// PATH the root's /usr/bin alone and td-kexec reached only by its store path.
 pub fn recipe() -> Recipe {
     let bin = "{in:td-kexec}/bin/td-kexec";
-    let readelf = "{in:binutils-x86-64-self}/bin/readelf";
-    let mut steps = vec![post_rust_tool_farm("{in:gawk-x86-64-self}/bin/gawk")];
+    let readelf = "/usr/bin/readelf";
+    let mut steps = Vec::new();
 
     steps.push(
         Step::run(
             "{root}",
             &[
-                POST_RUST_SH,
+                SH,
                 "-c",
                 &format!(
                     "h=$('{readelf}' -h '{bin}' 2>/dev/null) || {{ echo 'readelf -h failed on td-kexec' >&2; exit 1; }}; \
@@ -34,13 +37,13 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", "{tools}"),
+        .env("PATH", PATH),
     );
     steps.push(
         Step::run(
             "{root}",
             &[
-                POST_RUST_SH,
+                SH,
                 "-c",
                 &format!(
                     "lout=$('{readelf}' -l '{bin}' 2>/dev/null) || {{ echo 'readelf -l failed on td-kexec (cannot verify absence of PT_INTERP)' >&2; exit 1; }}; \
@@ -48,13 +51,13 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", "{tools}"),
+        .env("PATH", PATH),
     );
     steps.push(
         Step::run(
             "{root}",
             &[
-                POST_RUST_SH,
+                SH,
                 "-c",
                 &format!(
                     "dout=$('{readelf}' -d '{bin}' 2>/dev/null) || {{ echo 'readelf -d failed on td-kexec (cannot verify absence of dynamic NEEDED)' >&2; exit 1; }}; \
@@ -62,7 +65,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", "{tools}"),
+        .env("PATH", PATH),
     );
 
     steps.push(Step::MkDir {
@@ -79,14 +82,24 @@ pub fn recipe() -> Recipe {
     });
 
     Recipe::mesboot("td-kexec-test", "1.0")
-        .native_inputs(&post_rust_inputs("gawk-x86-64-self", &["td-kexec", "binutils-x86-64-self"]))
+        .build_root()
+        .native_inputs(&["td-kexec"])
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
-echo ">> recipe-check td-kexec-test: build-plan --auto builds td-kexec (the guest kexec helper, statically linked by the /td/store target Rust + native GCC/binutils/glibc toolchain) and asserts a self-contained static ELF64 x86-64 executable (ET_EXEC, no PT_INTERP, no dynamic NEEDED)"
+echo ">> recipe-check td-kexec-test: build-plan --auto builds td-kexec (the guest kexec helper, statically linked by the /td/store target Rust toolchain through td-link against td glibc) and asserts a self-contained static ELF64 x86-64 executable (ET_EXEC, no PT_INTERP, no dynamic NEEDED)"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run td-kexec-test 1
 "#,
         )
         .with_runner(CheckRunner::BuildOnly)])
+}
+
+#[cfg(test)]
+mod tests {
+    /// td-kexec is examined only by the Debian build root's tools, never by its own.
+    #[test]
+    fn td_kexec_is_examined_only_by_the_roots_tools() {
+        crate::ladder::assert_build_root_test(&super::recipe(), &["td-kexec"], &["td-kexec"]);
+    }
 }

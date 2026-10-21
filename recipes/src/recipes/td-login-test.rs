@@ -1,4 +1,4 @@
-use crate::ladder::{post_rust_inputs, post_rust_tool_farm, POST_RUST_SH};
+use crate::ladder::{BUILD_ROOT_PATH as PATH, BUILD_ROOT_SH as SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 // td-login-test: build-shape AND behavioural validation of the credential
@@ -23,18 +23,19 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 // image's health target depends on — asserted BOTH ways, so a probe that always
 // passed would red here rather than green-light a broken switch on the image.
 //
-// The static link needs the full target toolchain, so this rides the loop
-// toolchain like its siblings.
+// The steps run in the Debian build root under its bash, with its readelf,
+// grep and coreutils and PATH its /usr/bin alone; td-login is reached only by
+// its store path or a symlink to it.
 pub fn recipe() -> Recipe {
     let bin = "{in:td-login}/bin/td-login";
-    let readelf = "{in:binutils-x86-64-self}/bin/readelf";
-    let mut steps = vec![post_rust_tool_farm("{in:gawk-x86-64-self}/bin/gawk")];
+    let readelf = "/usr/bin/readelf";
+    let mut steps = Vec::new();
 
     steps.push(
         Step::run(
             "{root}",
             &[
-                POST_RUST_SH,
+                SH,
                 "-c",
                 &format!(
                     "h=$('{readelf}' -h '{bin}' 2>/dev/null) || {{ echo 'readelf -h failed on td-login' >&2; exit 1; }}; \
@@ -44,13 +45,13 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", "{tools}"),
+        .env("PATH", PATH),
     );
     steps.push(
         Step::run(
             "{root}",
             &[
-                POST_RUST_SH,
+                SH,
                 "-c",
                 &format!(
                     "lout=$('{readelf}' -l '{bin}' 2>/dev/null) || {{ echo 'readelf -l failed on td-login (cannot verify absence of PT_INTERP)' >&2; exit 1; }}; \
@@ -58,13 +59,13 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", "{tools}"),
+        .env("PATH", PATH),
     );
     steps.push(
         Step::run(
             "{root}",
             &[
-                POST_RUST_SH,
+                SH,
                 "-c",
                 &format!(
                     "dout=$('{readelf}' -d '{bin}' 2>/dev/null) || {{ echo 'readelf -d failed on td-login (cannot verify absence of dynamic NEEDED)' >&2; exit 1; }}; \
@@ -72,7 +73,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", "{tools}"),
+        .env("PATH", PATH),
     );
 
     // Applet roster: the /bin symlink farm this multicall backs is generated
@@ -84,7 +85,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_RUST_SH,
+                SH,
                 "-c",
                 &format!(
                     "l=$('{bin}' --list) || {{ echo 'td-login --list failed' >&2; exit 1; }}; \
@@ -96,7 +97,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", "{tools}"),
+        .env("PATH", PATH),
     );
 
     // Dispatch through BOTH entry forms, plus the documented exit codes and the
@@ -106,7 +107,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_RUST_SH,
+                SH,
                 "-c",
                 &format!(
                     "'{bin}' no-such-applet >/dev/null 2>&1; \
@@ -142,7 +143,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", "{tools}"),
+        .env("PATH", PATH),
     );
 
     // The readback probe, asserted BOTH ways against this sandbox's own
@@ -153,7 +154,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_RUST_SH,
+                SH,
                 "-c",
                 &format!(
                     "if [ -r /proc/self/status ]; then \
@@ -188,7 +189,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", "{tools}"),
+        .env("PATH", PATH),
     );
 
     steps.push(Step::MkDir {
@@ -205,14 +206,24 @@ pub fn recipe() -> Recipe {
     });
 
     Recipe::mesboot("td-login-test", "1.0")
-        .native_inputs(&post_rust_inputs("gawk-x86-64-self", &["td-login", "binutils-x86-64-self"]))
+        .build_root()
+        .native_inputs(&["td-login"])
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
-echo ">> recipe-check td-login-test: build-plan --auto builds td-login (td's static credential multicall: login and the exec-* subcommands, statically linked by the /td/store target Rust + native GCC/binutils/glibc toolchain), asserts a self-contained static ELF64 x86-64 executable (ET_EXEC, no PT_INTERP, no dynamic NEEDED), and exercises the applet roster, both dispatch forms, the argv refusals, and the credential readback probe the image's TD-LOGIN-RUN-OK marker rests on"
+echo ">> recipe-check td-login-test: build-plan --auto builds td-login (td's static credential multicall: login and the exec-* subcommands, statically linked by the /td/store target Rust toolchain through td-link against td glibc), asserts a self-contained static ELF64 x86-64 executable (ET_EXEC, no PT_INTERP, no dynamic NEEDED), and exercises the applet roster, both dispatch forms, the argv refusals, and the credential readback probe the image's TD-LOGIN-RUN-OK marker rests on"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run td-login-test 1
 "#,
         )
         .with_runner(CheckRunner::BuildOnly)])
+}
+
+#[cfg(test)]
+mod tests {
+    /// td-login is graded only by the Debian build root's tools, never by its own.
+    #[test]
+    fn td_login_is_graded_only_by_the_roots_tools() {
+        crate::ladder::assert_build_root_test(&super::recipe(), &["td-login"], &["td-login"]);
+    }
 }

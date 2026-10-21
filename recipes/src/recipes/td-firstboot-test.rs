@@ -1,4 +1,4 @@
-use crate::ladder::{post_rust_inputs, post_rust_tool_farm, POST_RUST_SH};
+use crate::ladder::{BUILD_ROOT_PATH as PATH, BUILD_ROOT_SH as SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 // td-firstboot-test: build-shape AND behavioural validation of the per-machine
@@ -32,22 +32,26 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 // The persistent-storage refusal (a state dir on tmpfs) is NOT tested here: it is a
 // pure decision over /proc/mounts text, unit-tested in td-firstboot's own
 // `mounts` module, and the build sandbox cannot present an arbitrary mount table.
+//
+// The steps and the keygen stubs run in the Debian build root under its bash,
+// with its readelf, grep and coreutils and PATH its /usr/bin alone; td-firstboot,
+// td-mail and td-news are reached only by their store paths.
 pub fn recipe() -> Recipe {
-    let shebang = format!("#!{POST_RUST_SH}");
+    let shebang = format!("#!{SH}");
     let bin = "{in:td-firstboot}/bin/td-firstboot";
     // The two programs the provisioned configurations are for, built from
     // the checkout's own trees: the proof that a template parses is the
     // program's own parser, not a second reading of its format.
     let mail = "{in:td-mail}/bin/td-mail";
     let news = "{in:td-news}/bin/td-news";
-    let readelf = "{in:binutils-x86-64-self}/bin/readelf";
-    let mut steps = vec![post_rust_tool_farm("{in:gawk-x86-64-self}/bin/gawk")];
+    let readelf = "/usr/bin/readelf";
+    let mut steps = Vec::new();
 
     steps.push(
         Step::run(
             "{root}",
             &[
-                POST_RUST_SH,
+                SH,
                 "-c",
                 &format!(
                     "h=$('{readelf}' -h '{bin}' 2>/dev/null) || {{ echo 'readelf -h failed on td-firstboot' >&2; exit 1; }}; \
@@ -57,13 +61,13 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", "{tools}"),
+        .env("PATH", PATH),
     );
     steps.push(
         Step::run(
             "{root}",
             &[
-                POST_RUST_SH,
+                SH,
                 "-c",
                 &format!(
                     "lout=$('{readelf}' -l '{bin}' 2>/dev/null) || {{ echo 'readelf -l failed on td-firstboot (cannot verify absence of PT_INTERP)' >&2; exit 1; }}; \
@@ -73,7 +77,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", "{tools}"),
+        .env("PATH", PATH),
     );
 
     // The keygen stub: the three standard OpenSSH operations td-firstboot uses, in
@@ -157,7 +161,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_RUST_SH,
+                SH,
                 "-c",
                 &format!(
                     "state='{{root}}/state'; stub='{{root}}/keygen-stub'; \
@@ -198,7 +202,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", "{tools}"),
+        .env("PATH", PATH),
     );
 
     // The applications' first configuration. The flag pair adds the
@@ -218,7 +222,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_RUST_SH,
+                SH,
                 "-c",
                 &format!(
                     "state='{{root}}/state'; stub='{{root}}/keygen-stub'; err=\"{{root}}/apps.err\"; \
@@ -268,7 +272,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", "{tools}"),
+        .env("PATH", PATH),
     );
 
     // The refusals. A machine that believes it has an identity it does not have is
@@ -278,7 +282,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_RUST_SH,
+                SH,
                 "-c",
                 &format!(
                     "for case in fails lies bad-fingerprint; do \
@@ -334,7 +338,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", "{tools}"),
+        .env("PATH", PATH),
     );
 
     steps.push(Step::MkDir {
@@ -351,10 +355,8 @@ pub fn recipe() -> Recipe {
     });
 
     Recipe::mesboot("td-firstboot-test", "1.0")
-        .native_inputs(&post_rust_inputs(
-            "gawk-x86-64-self",
-            &["td-firstboot", "binutils-x86-64-self", "td-mail", "td-news"],
-        ))
+        .build_root()
+        .native_inputs(&["td-firstboot", "td-mail", "td-news"])
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
@@ -364,4 +366,33 @@ exec "$TD_RECIPE_EVAL" check-run td-firstboot-test 1
 "#,
         )
         .with_runner(CheckRunner::BuildOnly)])
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::types::Step;
+
+    /// Only the Debian build root's tools are on PATH; td-firstboot and the
+    /// two programs that parse the configurations it provisions run by their
+    /// store paths, and the keygen stubs it runs are the root's bash scripts.
+    #[test]
+    fn only_the_roots_tools_are_on_path() {
+        let recipe = super::recipe();
+        let subjects = ["td-firstboot", "td-mail", "td-news"];
+        crate::ladder::assert_build_root_test(&recipe, &subjects, &subjects);
+        let stubs: Vec<&str> = recipe
+            .steps
+            .iter()
+            .flatten()
+            .filter_map(|step| match step {
+                Step::WriteFile {
+                    content,
+                    exec: true,
+                    ..
+                } => content.lines().next(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(stubs, ["#!/usr/bin/bash"; 4]);
+    }
 }

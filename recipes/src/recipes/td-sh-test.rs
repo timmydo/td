@@ -1,4 +1,4 @@
-use crate::ladder::{post_rust_inputs, post_rust_tool_farm, SH};
+use crate::ladder::{BUILD_ROOT_PATH as PATH, BUILD_ROOT_SH as SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 // td-sh-test: build-shape validation of the target-built shell.
@@ -25,13 +25,14 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 // property that harness cannot: that the target toolchain links td-sh into the
 // self-contained static ELF the boot-critical `/bin/sh` slot requires.
 //
-// The walk runs under the bootstrap root's bash, not the farm's `sh`: that is
-// td-sh, and a shell that mis-read a pipeline's status could pass its own check.
-// Its grep is the farm's, td-txt, which is not the subject.
+// The walk runs in the Debian build root under its GNU bash, never td-sh: a
+// shell that mis-read a pipeline's status could pass its own check. Its
+// readelf and grep are the root's too, with PATH the root's /usr/bin alone,
+// and td-sh is reached only by its store path.
 pub fn recipe() -> Recipe {
     let bin = "{in:td-sh}/bin/td-sh";
-    let readelf = "{in:binutils-x86-64-self}/bin/readelf";
-    let mut steps = vec![post_rust_tool_farm("{in:gawk-x86-64-self}/bin/gawk")];
+    let readelf = "/usr/bin/readelf";
+    let mut steps = Vec::new();
 
     steps.push(
         Step::run(
@@ -47,7 +48,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", "{tools}"),
+        .env("PATH", PATH),
     );
     steps.push(
         Step::run(
@@ -61,7 +62,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", "{tools}"),
+        .env("PATH", PATH),
     );
     steps.push(
         Step::run(
@@ -75,13 +76,13 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", "{tools}"),
+        .env("PATH", PATH),
     );
     // Beyond the shape: actually RUN the static binary so a mis-built ELF with
     // correct headers but a broken entry point / bad static link fails here (the
     // shape checks alone would pass it). `-c 'exit 0'` parses and runs a real (if
     // trivial) program through the interpreter and must exit 0.
-    steps.push(Step::run("{root}", &[bin, "-c", "exit 0"]));
+    steps.push(Step::run("{root}", &[bin, "-c", "exit 0"]).env("PATH", PATH));
 
     steps.push(Step::MkDir {
         path: "{out}".into(),
@@ -97,17 +98,25 @@ pub fn recipe() -> Recipe {
     });
 
     Recipe::mesboot("td-sh-test", "1.0")
-        .native_inputs(&post_rust_inputs(
-            "gawk-x86-64-self",
-            &["binutils-x86-64-self", "bash-mesboot"],
-        ))
+        .build_root()
+        .native_inputs(&["td-sh"])
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
-echo ">> recipe-check td-sh-test: build-plan --auto builds td-sh (the target /bin/sh, statically linked by the /td/store target Rust + native GCC/binutils/glibc toolchain), asserts a self-contained static ELF64 x86-64 executable (ET_EXEC, no PT_INTERP, no dynamic NEEDED), and runs it (-c 'exit 0')"
+echo ">> recipe-check td-sh-test: build-plan --auto builds td-sh (the target /bin/sh, statically linked by the /td/store target Rust toolchain through td-link against td glibc), asserts a self-contained static ELF64 x86-64 executable (ET_EXEC, no PT_INTERP, no dynamic NEEDED), and runs it (-c 'exit 0')"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run td-sh-test 1
 "#,
         )
         .with_runner(CheckRunner::BuildOnly)])
+}
+
+#[cfg(test)]
+mod tests {
+    /// td-sh is graded only by the Debian build root's bash and tools, never
+    /// by its own: the root's bash is the independent shell.
+    #[test]
+    fn td_sh_is_graded_only_by_the_roots_bash_and_tools() {
+        crate::ladder::assert_build_root_test(&super::recipe(), &["td-sh"], &["td-sh"]);
+    }
 }

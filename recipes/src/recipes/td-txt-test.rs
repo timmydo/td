@@ -1,4 +1,4 @@
-use crate::ladder::{post_rust_inputs, post_rust_tool_farm, POST_RUST_SH};
+use crate::ladder::{BUILD_ROOT_PATH as PATH, BUILD_ROOT_SH as SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 // td-txt-test: build-shape validation of the target-built text userland.
@@ -26,21 +26,20 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 // here proves the SEPARATE property that harness cannot: that the target
 // toolchain links td-txt into a self-contained static ELF.
 //
-// The checks read readelf's output with the bootstrap root's GNU grep, ahead of
-// the farm on PATH: the farm's grep IS td-txt, and a grep that mis-matched could
-// pass its own check. The smoke step reaches td-txt only by its own path.
-const ORACLE_PATH: &str = "{in:grep-mesboot0}/bin:{tools}";
-
+// The checks run in the Debian build root and read the root's readelf output
+// with its GNU grep, PATH the root's /usr/bin alone: no grep on it is td-txt,
+// and a grep that mis-matched could pass its own check. The smoke step
+// reaches td-txt only by its own path.
 pub fn recipe() -> Recipe {
     let bin = "{in:td-txt}/bin/td-txt";
-    let readelf = "{in:binutils-x86-64-self}/bin/readelf";
-    let mut steps = vec![post_rust_tool_farm("{in:gawk-x86-64-self}/bin/gawk")];
+    let readelf = "/usr/bin/readelf";
+    let mut steps = Vec::new();
 
     steps.push(
         Step::run(
             "{root}",
             &[
-                POST_RUST_SH,
+                SH,
                 "-c",
                 &format!(
                     "h=$('{readelf}' -h '{bin}' 2>/dev/null) || {{ echo 'readelf -h failed on td-txt' >&2; exit 1; }}; \
@@ -50,13 +49,13 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", ORACLE_PATH),
+        .env("PATH", PATH),
     );
     steps.push(
         Step::run(
             "{root}",
             &[
-                POST_RUST_SH,
+                SH,
                 "-c",
                 &format!(
                     "lout=$('{readelf}' -l '{bin}' 2>/dev/null) || {{ echo 'readelf -l failed on td-txt (cannot verify absence of PT_INTERP)' >&2; exit 1; }}; \
@@ -64,13 +63,13 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", ORACLE_PATH),
+        .env("PATH", PATH),
     );
     steps.push(
         Step::run(
             "{root}",
             &[
-                POST_RUST_SH,
+                SH,
                 "-c",
                 &format!(
                     "dout=$('{readelf}' -d '{bin}' 2>/dev/null) || {{ echo 'readelf -d failed on td-txt (cannot verify absence of dynamic NEEDED)' >&2; exit 1; }}; \
@@ -78,7 +77,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", ORACLE_PATH),
+        .env("PATH", PATH),
     );
     // Beyond the shape: RUN it. `--list` names the applets, a `grep` symlink
     // proves argv[0] dispatch (how the image's /bin farm reaches it), and the
@@ -88,7 +87,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_RUST_SH,
+                SH,
                 "-c",
                 &format!(
                     "list=$('{bin}' --list) || {{ echo 'td-txt --list failed' >&2; exit 1; }}; \
@@ -104,7 +103,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", ORACLE_PATH),
+        .env("PATH", PATH),
     );
 
     steps.push(Step::MkDir {
@@ -121,17 +120,25 @@ pub fn recipe() -> Recipe {
     });
 
     Recipe::mesboot("td-txt-test", "1.0")
-        .native_inputs(&post_rust_inputs(
-            "gawk-x86-64-self",
-            &["binutils-x86-64-self", "grep-mesboot0"],
-        ))
+        .build_root()
+        .native_inputs(&["td-txt"])
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
-echo ">> recipe-check td-txt-test: build-plan --auto builds td-txt (the target grep/sed multicall, statically linked by the /td/store target Rust + native GCC/binutils/glibc toolchain), asserts a self-contained static ELF64 x86-64 executable (ET_EXEC, no PT_INTERP, no dynamic NEEDED), and runs both applets through argv[0] and explicit dispatch"
+echo ">> recipe-check td-txt-test: build-plan --auto builds td-txt (the target grep/sed multicall, statically linked by the /td/store target Rust toolchain through td-link against td glibc), asserts a self-contained static ELF64 x86-64 executable (ET_EXEC, no PT_INTERP, no dynamic NEEDED), and runs both applets through argv[0] and explicit dispatch"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run td-txt-test 1
 "#,
         )
         .with_runner(CheckRunner::BuildOnly)])
+}
+
+#[cfg(test)]
+mod tests {
+    /// td-txt is graded only by the Debian build root's GNU grep and tools,
+    /// never by its own: no grep on PATH is td-txt.
+    #[test]
+    fn td_txt_is_graded_only_by_the_roots_grep_and_tools() {
+        crate::ladder::assert_build_root_test(&super::recipe(), &["td-txt"], &["td-txt"]);
+    }
 }
