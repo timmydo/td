@@ -368,7 +368,6 @@ const TARGET_STATIC_RECIPES: &[(&str, &str)] = &[
     ("td-boot/src", "recipes/src/recipes/td-boot.rs"),
     ("td-btrfs/src", "recipes/src/recipes/td-btrfs.rs"),
     ("td-busd/src", "recipes/src/recipes/td-busd.rs"),
-    ("td-cc/src", "recipes/src/recipes/td-cc.rs"),
     ("td-compositor/src", "recipes/src/recipes/td-compositor.rs"),
     ("td-firstboot/src", "recipes/src/recipes/td-firstboot.rs"),
     ("td-init/src", "recipes/src/recipes/td-init.rs"),

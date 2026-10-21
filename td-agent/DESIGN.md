@@ -341,7 +341,9 @@ using scratch outputs and a 15-second deadline each, before the first paid
 completion. `native_build_environment` and `native_build_preflight` records
 retain validation and results. Older traces may retain `native_tool_alias`
 records from the retired review-specific compiler forwarder. Failures are
-explicit model-visible limitations, not test passes. These probes establish
+explicit model-visible limitations, not test passes. On a td system, whose
+`cc` is td-link, the C probe reports that limitation and the Rust probe
+links. These probes establish
 basic compilation/linking, not every package's required tool or library.
 
 Repository reviews prepare a private Cargo home, expand explicit relative

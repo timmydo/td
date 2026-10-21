@@ -553,7 +553,9 @@ fn run_warm(td_net: &Path, root: &Path, builder: &Path, args: &[String]) -> bool
 /// not a second copy of it: that build pins the compiler and fails closed on a
 /// dynamic result, because a control-plane binary carrying a mutable guix-home
 /// runpath dies at exec time on the hosts this is meant to help. Cargo decides
-/// freshness there, so an edited net/ cannot leave a stale fetcher behind.
+/// freshness there, so an edited net/ cannot leave a stale fetcher behind,
+/// except on a td host without a C compiler, which resolves the deployed
+/// td-net instead.
 fn resolve_td_net(builder: &Path) -> Result<PathBuf, String> {
     println!("   [warm] resolving td's fetch tool (net/); a cold tree builds it once.\n");
     // stdout is the path; stderr is INHERITED, not captured — resolving can mean

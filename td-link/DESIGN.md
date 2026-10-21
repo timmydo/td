@@ -146,3 +146,16 @@ build root's GCC compiles it against td glibc's headers and its own
 freestanding ones into archives, which td-link then links as it links
 any other input. Under the runner's CFLAGS that GCC refuses to link,
 so td-link links every Rust output.
+
+## In the image
+
+The standard image ships the driver as `/bin/td-link` and as `/bin/cc`,
+rustc's and Cargo's default linker name, so a plain `rustc` or `cargo
+build` on a td system, its build scripts and proc macros included, and
+the native control-plane build link through it without configuration.
+That `cc` refuses compile requests like any other: the image ships no C
+compiler, and C builds in the Debian build root. The control plane's
+host C paths (`stage0::provision_c_compiler`) therefore pass over a `cc`
+that resolves to td-link, to a `gcc` beside it that does not, and with
+none read the host as having no C compiler; a `TD_CC_HOME` whose `cc` is
+td-link is broken.

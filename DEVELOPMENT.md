@@ -882,6 +882,14 @@ resolution alone does not prove that native dependencies can build.
 The target artifact graph retains its own declared tool inputs. See
 `APPLICATIONS.md` §C and `td-agent/DESIGN.md` §2 for the exact boundaries.
 
+A td system is not a full host for these preparations: its `/bin/cc` is
+td-link, which links Rust and compiles no C, and it ships no `gcc`. Rust
+builds and tests link through it, but what needs host C fails there:
+`gate-crates crypto-cargo` (AWS-LC) with that diagnosis, and `net-test`
+(ring, `CC=gcc`) and the td-update, td-vm and td-vm-guest test fixtures
+that link with `-Clinker=gcc` (GNU ld, not bundled LLD) for want of a
+`gcc`; run `ready` on a host with a C toolchain.
+
 ## Native compositor fixture builds
 
 A crate with `native-compositor-tests = true` may additionally declare one

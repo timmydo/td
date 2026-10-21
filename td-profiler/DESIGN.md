@@ -65,8 +65,7 @@ includes glibc startup and libgcc in downstream static executables, plus the
 Rust runtime and package-specific assembly where applicable. Every Rust
 output a recipe builds is linked by td-link (`td-link/DESIGN.md`) from
 gcc-runtime's start files and static libgcc, so its marker names
-gcc-runtime's libgcc assembly; td-cc's, whose launcher probes GCC still
-links until the image switch, also keeps gcc-x86-64-self's.
+gcc-runtime's libgcc assembly.
 Offline analysis therefore does not need the recipe checkout to discover a
 boundary.
 

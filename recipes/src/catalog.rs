@@ -231,7 +231,6 @@ mod tests {
             "td-boot",
             "td-btrfs",
             "td-busd",
-            "td-cc",
             "td-compositor",
             "td-firstboot",
             "td-init",
@@ -301,7 +300,8 @@ mod tests {
                     );
                 }
                 // td-link links every Rust output; only its own bootstrap
-                // and td-cc's proof of the compiler launcher name another.
+                // names another, and td-link-test names it `cc`, as the
+                // image's /bin/cc does.
                 let linkers: Vec<&str> = argv
                     .iter()
                     .filter_map(|arg| arg.strip_prefix("-Clinker="))
@@ -322,7 +322,7 @@ mod tests {
                             .unwrap_or_default();
                         td_link_stages.push((linker.to_string(), output));
                     }
-                    "td-cc" if linker == "{out}/bin/cc" => {}
+                    "td-link-test" if linker == "cc" => {}
                     _ => assert_eq!(linker, crate::ladder::TD_LINK, "{stem}: links with td-link"),
                 }
                 let build_remaps: Vec<&str> = argv

@@ -103,7 +103,6 @@ pub const RUST_PROFILED_RECIPES: &[&str] = &[
     "td-boot",
     "td-btrfs",
     "td-busd",
-    "td-cc",
     "td-compositor",
     "td-dua",
     "td-editor",
@@ -172,9 +171,7 @@ pub fn output_assembly_exceptions(recipe: &str) -> Vec<(&'static str, &'static s
                 || (*source == "gcc-x86-64-self"
                     && !matches!(recipe, "glibc-x86-64" | "binutils-x86-64-self")
                     && !BUILD_ROOT_LINKED.contains(&recipe)
-                    // td-link links td-cc as well, but td-cc ships a
-                    // libgcc_eh.a copied from GCC's libgcc.a.
-                    && (recipe == "td-cc" || !RUST_PROFILED_RECIPES.contains(&recipe)))
+                    && !RUST_PROFILED_RECIPES.contains(&recipe))
                 // Build-root C and every Rust output, which td-link links,
                 // take gcc-runtime's start files and libgcc, not GCC's.
                 || (*source == "gcc-runtime"
@@ -427,20 +424,6 @@ mod tests {
                     "upstream native GCC libgcc x86_64 assembly"
                 ),
                 ("gcc-x86-64-self", "upstream GCC libgcc x86_64 assembly"),
-            ]
-        );
-        // td-cc is linked by td-link but ships a libgcc_eh.a copied from
-        // GCC's libgcc.a, so it keeps GCC's boundary beside gcc-runtime's.
-        assert_eq!(
-            output_assembly_exceptions("td-cc"),
-            vec![
-                ("glibc-x86-64", "upstream glibc sysdeps/x86_64 assembly"),
-                ("gcc-x86-64-self", "upstream GCC libgcc x86_64 assembly"),
-                ("gcc-runtime", "upstream GCC libgcc x86_64 assembly"),
-                (
-                    "rust-toolchain",
-                    "upstream Rust 1.96.0 prebuilt standard library and compiler-runtime"
-                ),
             ]
         );
         // td-link builds in the root and is a Rust output.

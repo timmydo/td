@@ -269,8 +269,9 @@ In particular, toolchain checks and a provider-authentication probe must pass
 before displaying an agent as ready. Probes do not submit prompts or paid
 model requests merely to check login.
 
-The native-toolchain increment packs td's Rust/Cargo, GCC, binutils,
-and the `td-cc` compiler defaults into that standard image. Newly published
+The native-toolchain increment packs td's Rust/Cargo and td-link, its
+linker and the image's `cc`, into that standard image; it carries no C
+compiler. Newly published
 bundles have a 256 GiB sparse disk and Btrfs filesystem, shared by the signed
 deployment and private writable `@var` state. Untouched capacity consumes no
 host space; writes grow each instance's overlay. Raw bundle publication across
@@ -289,10 +290,11 @@ recording the affected capture's uncertainty instead of requiring a patched
 kernel with CPU hotplug disabled. CPU allocation in the manager still applies
 at boot; live QEMU CPU-device management is not implemented.
 The standard
-Rust toolchain also builds cargo-clippy and clippy-driver from its pinned
-source release, with an offline clean/denied-lint/repaired recipe probe.
+Rust toolchain also ships upstream's cargo-clippy and clippy-driver, with an
+offline clean/denied-lint/repaired recipe probe.
 On a standard td system, the control-plane helper resolver selects the
-installed `x86_64-unknown-linux-gnu` Rust standard library and native C linker.
+installed `x86_64-unknown-linux-gnu` Rust standard library and `/bin/cc`,
+which is td-link, as linker.
 It recognizes the exact `ID=td` system identity in `/etc/os-release`; this
 selects build configuration and grants no artifact provenance or authority.
 Missing or broken native tools fail provisioning instead of downloading a
@@ -305,9 +307,13 @@ must have no ELF interpreter, dynamic dependencies, or runtime search path;
 GNU static linkage is not a claim that libc name resolution can never load
 runtime modules. The standard td image provides that libc runtime. Compiler,
 linker, wrapper settings, and Cargo flags are pinned at helper build sites.
-The native network helper builds offline and frozen from the verified
-`td-net` vendor directory prepared through td-feed. Both the prelude and
-native compiler path require its completion record to match the current lock.
+td-link compiles no C, so the network helper, whose ring compiles C, does
+not build on a standard td system: the resolver uses the deployed
+target-built td-net that `/bin/td-feed` names, the deployed commit's rather
+than the checkout's, and host-only AWS-LC builds fail.
+Elsewhere the native network helper builds offline and frozen from the
+verified `td-net` vendor directory prepared through td-feed. Both the prelude
+and native compiler path require its completion record to match the current lock.
 A missing, incomplete, or stale vendor is a preparation gap; use the installed
 td-feed/VM artifact preparation path first. Cargo never fetches registry
 packages to repair this gap. The completion record is a local preparation

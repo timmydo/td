@@ -571,6 +571,44 @@ pub(crate) fn provision_cc(env: &ProvisionEnv) -> Result<String, ProvisionErr> {
     ))
 }
 
+/// [`provision_cc`] for a build that compiles C (cc-rs, AWS-LC) rather than
+/// only linking. A td image's `cc` is td-link, td's Rust linker, which
+/// refuses compile requests; C there builds in the Debian build root, so
+/// such a host is unprovisioned for host C, not broken.
+pub(crate) fn provision_c_compiler(env: &ProvisionEnv) -> Result<String, ProvisionErr> {
+    let path = provision_cc(env)?;
+    if host_c_compiler(&path).is_some() || host_cc(&path).is_none() {
+        return Ok(path);
+    }
+    // A named toolchain that cannot compile is broken, not absent.
+    if let Some(home) = &env.cc_home {
+        return Err(ProvisionErr::Broken(format!(
+            "TD_CC_HOME={home}: its cc is td-link, which compiles no C"
+        )));
+    }
+    Err(ProvisionErr::Unavailable(
+        "the cc on PATH is td-link, which links Rust and compiles no C; C builds \
+         in the Debian build root"
+            .to_string(),
+    ))
+}
+
+/// [`host_cc`] for compiling C: a `cc` that is td-link yields to a `gcc`
+/// on the same path that is not.
+pub(crate) fn host_c_compiler(path: &str) -> Option<PathBuf> {
+    let cc = host_cc(path)?;
+    if !is_td_link(&cc) {
+        return Some(cc);
+    }
+    find_in_path(path, "gcc").filter(|gcc| !is_td_link(gcc))
+}
+
+/// Whether `cc` resolves to td's link driver.
+pub(crate) fn is_td_link(cc: &Path) -> bool {
+    cc.canonicalize()
+        .is_ok_and(|path| path.file_name().is_some_and(|name| name == "td-link"))
+}
+
 /// Preserve the selected compiler, but name a cc alias as gcc when PATH
 /// exposes the same executable named gcc there. Shared dispatchers such as
 /// ccache must retain cc: their invoked name can select a different compiler.
@@ -1916,6 +1954,40 @@ mod tests {
         let mut env3 = base_env();
         env3.search_path = sysd.to_string_lossy().into_owned();
         assert_eq!(provision_cc(&env3).unwrap(), sysd.to_string_lossy());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_td_link_cc_links_but_compiles_no_c() {
+        let d = scratch("td-link-cc");
+        let bin = d.join("bin");
+        exec_file(&d.join("store/td-link/bin/td-link"));
+        std::fs::create_dir_all(&bin).unwrap();
+        std::os::unix::fs::symlink(d.join("store/td-link/bin/td-link"), bin.join("cc")).unwrap();
+        let mut env = base_env();
+        env.search_path = bin.to_string_lossy().into_owned();
+        // Still the linker every Rust build resolves...
+        assert_eq!(provision_cc(&env).unwrap(), env.search_path);
+        // ...but no C compiler.
+        assert!(
+            matches!(provision_c_compiler(&env).unwrap_err(), ProvisionErr::Unavailable(m) if m.contains("td-link"))
+        );
+        // A gcc beside it compiles.
+        exec_file(&bin.join("gcc"));
+        assert_eq!(provision_c_compiler(&env).unwrap(), env.search_path);
+        assert_eq!(host_c_compiler(&env.search_path), Some(bin.join("gcc")));
+        std::fs::remove_file(bin.join("gcc")).unwrap();
+        // A named toolchain whose cc is td-link is broken, not absent.
+        env.cc_home = Some(d.to_string_lossy().into_owned());
+        assert!(
+            matches!(provision_c_compiler(&env).unwrap_err(), ProvisionErr::Broken(m) if m.contains("TD_CC_HOME"))
+        );
+        env.cc_home = None;
+        // Any other cc compiles C.
+        let other = d.join("other");
+        exec_file(&other.join("cc"));
+        env.search_path = other.to_string_lossy().into_owned();
+        assert_eq!(provision_c_compiler(&env).unwrap(), env.search_path);
         let _ = std::fs::remove_dir_all(&d);
     }
 

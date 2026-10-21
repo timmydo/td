@@ -249,7 +249,7 @@ pub(crate) fn host_cargo_bin(
             return None;
         }
     };
-    let ccpath = match crate::stage0::provision_cc(&penv) {
+    let ccpath = match crate::stage0::provision_c_compiler(&penv) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("td-builder check: static {bin}: no C toolchain ({e}) — skipping host build");
@@ -264,7 +264,7 @@ pub(crate) fn host_cargo_bin(
         eprintln!("td-builder check: static {bin}: no rustc on the provisioned rust toolchain — skipping host build");
         return None;
     };
-    let Some(cc) = crate::stage0::host_cc(&ccpath) else {
+    let Some(cc) = crate::stage0::host_c_compiler(&ccpath) else {
         eprintln!("td-builder check: static {bin}: no cc/gcc on the provisioned C toolchain — skipping host build");
         return None;
     };
@@ -401,7 +401,43 @@ pub(crate) fn host_cargo_bin(
 /// second copy of it. Applet dispatch is by argv there (`td-net feed …`), which is
 /// why this returns the multicall and `host_net_applet` returns a link.
 pub(crate) fn host_td_net(root: &Path) -> Option<PathBuf> {
-    host_cargo_bin(root, "net", "td-net", None)
+    deployed_net_applet(root, "td-feed")
+        .and_then(|applet| applet.canonicalize().ok())
+        .or_else(|| host_cargo_bin(root, "net", "td-net", None))
+}
+
+/// The deployed td-net applet `name` on a td host that cannot compile
+/// net/'s C (ring): its `cc` is td-link, so /bin's link to the image's
+/// target-built multicall stands in. It is the deployed commit's td-net,
+/// not the checkout's, so a checkout needing a newer td-feed verb fails in
+/// that verb. None elsewhere, so a host with C builds net/.
+pub(crate) fn deployed_net_applet(root: &Path, name: &str) -> Option<PathBuf> {
+    deployed_applet(&crate::stage0::ProvisionEnv::from_env(root), name)
+}
+
+fn deployed_applet(penv: &crate::stage0::ProvisionEnv, name: &str) -> Option<PathBuf> {
+    if !penv.native_td
+        || !matches!(
+            crate::stage0::provision_c_compiler(penv),
+            Err(crate::stage0::ProvisionErr::Unavailable(_))
+        )
+    {
+        return None;
+    }
+    let applet = crate::stage0::find_in_path(&penv.search_path, name)?;
+    let multicall = applet.canonicalize().ok()?;
+    if multicall.file_name()? != "td-net" {
+        return None;
+    }
+    static NOTE: std::sync::Once = std::sync::Once::new();
+    NOTE.call_once(|| {
+        eprintln!(
+            "td-builder: no C compiler builds net/ here; using the deployed {} \
+             (the image's commit, not this checkout's)",
+            multicall.display()
+        )
+    });
+    Some(applet)
 }
 
 /// Wait for a warm child under an optional deadline: block when there is
@@ -443,6 +479,47 @@ pub(crate) fn arm_check_child(cmd: &mut Command) {
     // hosted runner dies. PR_SET_PDEATHSIG is reset across fork, so arming only
     // the runner in check_host is not enough for provisioning and warm tools.
     crate::sandbox::die_with_parent(cmd);
+}
+
+#[cfg(test)]
+mod deployed_applet_tests {
+    use super::*;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    fn exec(path: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn a_td_host_without_c_uses_the_deployed_multicall() {
+        let d = crate::test_temp::TempDir::new("deployed-applet").unwrap();
+        let bin = d.join("bin");
+        exec(&d.join("store/td-link/bin/td-link"));
+        exec(&d.join("store/td-net/bin/td-net"));
+        std::fs::create_dir_all(&bin).unwrap();
+        symlink(d.join("store/td-link/bin/td-link"), bin.join("cc")).unwrap();
+        symlink(d.join("store/td-net/bin/td-net"), bin.join("td-feed")).unwrap();
+        let mut penv = crate::stage0::ProvisionEnv {
+            rust_home: None,
+            cc_home: None,
+            rust_version: "1.96.0".to_string(),
+            search_path: bin.to_string_lossy().into_owned(),
+            native_td: true,
+        };
+        assert_eq!(deployed_applet(&penv, "td-feed"), Some(bin.join("td-feed")));
+        // Only the multicall stands in for an applet.
+        exec(&bin.join("td-subst"));
+        assert_eq!(deployed_applet(&penv, "td-subst"), None);
+        // Off td, or with a C compiler, net/ builds instead.
+        penv.native_td = false;
+        assert_eq!(deployed_applet(&penv, "td-feed"), None);
+        penv.native_td = true;
+        std::fs::remove_file(bin.join("cc")).unwrap();
+        exec(&bin.join("cc"));
+        assert_eq!(deployed_applet(&penv, "td-feed"), None);
+    }
 }
 
 #[cfg(test)]

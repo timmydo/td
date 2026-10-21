@@ -125,7 +125,7 @@ fn run_inner(root: &Path, action: &str, manifest: &str) -> Result<Option<Release
     let home = Scratch::create(root)?;
     let penv = crate::stage0::ProvisionEnv::from_env(root);
     let rustpath = crate::stage0::provision_rust(&penv).map_err(|e| e.to_string())?;
-    let ccpath = crate::stage0::provision_cc(&penv).map_err(|e| e.to_string())?;
+    let ccpath = crate::stage0::provision_c_compiler(&penv).map_err(|e| e.to_string())?;
     let find = |path: &str, binary: &str| {
         crate::stage0::find_in_path(path, binary)
             .ok_or_else(|| format!("crypto build requires {binary} in provisioned toolchain"))
@@ -133,7 +133,7 @@ fn run_inner(root: &Path, action: &str, manifest: &str) -> Result<Option<Release
     let cargo = find(&rustpath, "cargo")?;
     let rustc = find(&rustpath, "rustc")?;
     let rustdoc = find(&rustpath, "rustdoc")?;
-    let cc = crate::stage0::host_cc(&ccpath)
+    let cc = crate::stage0::host_c_compiler(&ccpath)
         .ok_or("crypto build requires cc or gcc in provisioned toolchain")?;
     let ar = find(&ccpath, "ar")?;
     let host = crate::stage0::rustc_host_triple(&rustc)?;

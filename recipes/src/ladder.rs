@@ -212,7 +212,7 @@ pub fn target_rustc_at_roots(
 }
 
 /// Direct rustc under the target policy with another linker: td-link's own
-/// bootstrap, and td-cc's proof of its compiler launcher.
+/// bootstrap, and td-link-test's link through `cc` on PATH.
 pub fn target_rustc_linked_by(dir: &str, rustc: &str, args: &[&str], linker: &str) -> Step {
     rustc_step(dir, rustc, args, linker, "{root}", "{src}")
 }

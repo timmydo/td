@@ -493,9 +493,13 @@ fn newstore_bin(root: &Path, newstore_rel: &str, bin: &str) -> Option<PathBuf> {
 /// Build the merged `net` control-plane crate (td-net) with the host cargo, statically,
 /// then return an APPLET-named link to it (td-fetch/td-feed/td-subst) beside the binary —
 /// so argv[0] basename multicall dispatch selects the applet with the caller's argv
-/// UNCHANGED. One td-net build is shared across the applets. None on any build/link
-/// failure (best-effort warm; the gates enforce presence).
+/// UNCHANGED. One td-net build is shared across the applets. On a td host without a C
+/// compiler it is the deployed multicall's /bin link instead (`deployed_net_applet`).
+/// None on any build/link failure (best-effort warm; the gates enforce presence).
 fn host_net_applet(root: &Path, applet: &str, deadline: Option<Instant>) -> Option<PathBuf> {
+    if let Some(deployed) = crate::host_bin::deployed_net_applet(root, applet) {
+        return Some(deployed);
+    }
     let td_net = host_cargo_bin(root, "net", "td-net", deadline)?;
     let link = td_net.with_file_name(applet);
     if link == td_net {
@@ -648,7 +652,8 @@ fn warm_kernel_headers_seed(root: &Path) {
         return;
     }
     // Only a stale newstore pick is worth retrying against the source build; a
-    // source build already IS this tree.
+    // source build already IS this tree (on a td host without C, the deployed
+    // td-net, which a retry would only run again).
     if newstore.is_none() {
         eprintln!(
             "td-builder check: kernel-headers seed still absent for {} — the loop intern \
@@ -893,8 +898,9 @@ fn warm_vendor_closures(
     // A stale newstore td-feed may predate a warm verb and reject it, exiting
     // non-zero without writing a vendor dir. Same shape as the
     // kernel-headers seed (issue #546): build the source `feed/` once and retry
-    // only what is still absent. A source build already IS this tree, so a
-    // non-newstore pick has nothing better to retry with.
+    // only what is still absent. A source build already IS this tree (or, on a
+    // td host without C, the deployed td-net), so a non-newstore pick has nothing
+    // better to retry with.
     if retry.is_empty() || !tdfeed_from_newstore {
         report_cold_vendors(&cold, "");
         return;

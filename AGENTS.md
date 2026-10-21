@@ -224,17 +224,17 @@ ordinary archives, and runs the toolchain's rust-lld with td glibc's and
 gcc-runtime's start files and libraries, so no GCC or binutils takes part
 in the link. td-link is itself a Debian build-root member: the root's GCC
 links its throwaway first stage, and its claim to link without GCC rests
-on its second and third stages linking byte-identically. GCC still links
-Rust in three places until the image switch (increment 10 of
-`BUILD-ROOT-PLAN.md`): the native control-plane build on a td host
-(`builder/src/stage0.rs`, `-Clinker` the host's `cc`), Cargo's default
-`cc` in the image, and td-cc's own launcher probes. Every Cargo recipe
-builds in the Debian build root: the C its build scripts compile is the
-root's GCC, which the runner's CFLAGS forbid to link, against td glibc's
-headers and GCC's own freestanding headers, archived by the root's `ar`,
-and the root's `objcopy` splits its companions. Each object the build
-leaves must show it: its dependency list resolves into those headers or
-the build's trees, and the recipe declares how many objects there are.
+on its second and third stages linking byte-identically. The image ships
+td-link, not GCC or binutils: its `/bin/cc` is td-link, so rustc's and
+Cargo's default linker, and the native control-plane build on a td host,
+link through it, and a td host compiles no C outside the build root.
+Every Cargo recipe builds in the Debian build root: the C its build
+scripts compile is the root's GCC, which the runner's CFLAGS forbid to
+link, against td glibc's headers and GCC's own freestanding headers,
+archived by the root's `ar`, and the root's `objcopy` splits its
+companions. Each object the build leaves must show it: its dependency
+list resolves into those headers or the build's trees, and the recipe
+declares how many objects there are.
 
 Cargo dependency sources are fixed-output inputs selected by committed
 `Cargo.lock` checksums. Builds run offline. Git dependencies are unsupported
@@ -245,8 +245,9 @@ Debian build root's compiler and archiver. New td-owned shipped userland
 should be Rust built with that toolchain.
 
 The final image uses uutils for its core userland and does not carry the GNU
-bootstrap userland forward. The C toolchain, glibc, kernel, boot/firmware
-components, and explicitly reviewed non-Rust packages are the exceptions.
+bootstrap userland forward. glibc and libgcc, the kernel, boot/firmware
+components, and explicitly reviewed non-Rust packages are the exceptions;
+it ships no C compiler.
 
 ## Target user-mode profiling contract
 

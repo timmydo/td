@@ -15,9 +15,9 @@ deleted; its findings are summarized under "Facts" below.
 | libc | **glibc 2.41, built from source in the build root.** Rust target stays `x86_64-unknown-linux-gnu` |
 | GCC runtime | GCC's `libgcc` (libgcc_s.so.1, libgcc.a, libgcc_eh.a, crtbegin/crtend) built from the pinned GCC 14 source in the build root |
 | Rust | Upstream prebuilt gnu-host rustc/cargo/rust-std/clippy 1.96.0, retargeted onto td glibc/libgcc/zlib by the existing rust-stage0 transform (renamed `rust-dist`) |
-| Linking without GCC | `td-link`, a GCC-free link driver: rustc's linker, forwarding to `rust-lld` with td's glibc and libgcc start-up files. `td-cc` stays the image's GCC launcher until the image switch |
+| Linking without GCC | `td-link`, a GCC-free link driver: rustc's linker, forwarding to `rust-lld` with td's glibc and libgcc start-up files. It is also the image's `/bin/cc`; td-cc, the GCC launcher, is gone |
 | Old ladder | Deleted entirely (stage0, Mes, TinyCC, GCC/glibc/binutils ladder, source-built Rust/LLVM, bootstrap-root) |
-| Self-hosting | Image ships upstream Rust + td-cc + glibc + libgcc; C rebuilds need the build root (fetched on demand, cached) |
+| Self-hosting | Image ships upstream Rust + td-link + glibc + libgcc and no C compiler; C rebuilds need the build root (fetched on demand, cached) |
 | Git | Upstream Git 2.55.0 from source in the build root (grit rejected) |
 | btrfs-progs | Replaced by the std-only Rust `td-btrfs` (landed) |
 | Allocator / musl | Not applicable; glibc malloc stays. musl may be revisited separately later |
@@ -226,7 +226,10 @@ deleted; its findings are summarized under "Facts" below.
    LibreSSL builds no command.
 10. **Image switch.** system-x86-64 ships the upstream Rust toolchain,
     td-link, td glibc and libgcc instead of GCC and binutils; Cargo in
-    the image takes td-link as its linker, and td-cc goes.
+    the image takes td-link as its linker, and td-cc goes. Landed:
+    `/bin/cc` is td-link; on a td host the control plane links through
+    it, reads it as no C compiler, and resolves td-net to the deployed
+    multicall, since net/'s ring compiles C.
 11. **Delete the ladder.** `seed/` (stage0, patches, bootstrap-root,
     seed digests as applicable), stage0/Mes/TinyCC/mesboot/GCC/glibc
     ladder/binutils/make/gawk/cmake recipes, `ladder.rs`, `mes_boot.rs`,

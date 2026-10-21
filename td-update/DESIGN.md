@@ -68,15 +68,18 @@ not a same-UID isolation boundary or an atomic no-replace syscall claim.
 ## Build command
 
 From the checkout root, `./update build` compiles that checkout's builder and
-recipe evaluator offline with the installed `/bin/cargo` and `/bin/rustc`.
-It selects the native GNU target explicitly and keeps control-plane build
-outputs under `.td-build-cache/update-tools`. These locally compiled helpers
-retain control-plane roles; this does not admit them as target recipe tools.
+recipe evaluator offline with the installed `/bin/cargo` and `/bin/rustc`,
+which link through `/bin/cc`, td-link. It selects the native GNU target
+explicitly and keeps control-plane build outputs under
+`.td-build-cache/update-tools`. These locally compiled helpers retain
+control-plane roles; this does not admit them as target recipe tools.
 
 Before the evaluator runs, the installed `/bin/td-feed` fetches the
 checkout's `net/Cargo.lock` closure with `warm crate-local net td-net`.
-This breaks the cold-start dependency: native `provision-net` rebuilds the
-fetch tool offline only after that verified vendor closure exists. A warm
+This breaks the cold-start dependency where a C compiler exists: native
+`provision-net` rebuilds the fetch tool offline only after that verified
+vendor closure exists. A td system has none for td-net's ring, so there
+`provision-net` resolves to the installed multicall itself. A warm
 that reports success without complete inputs still fails the evaluator's
 native vendor verification before any system build starts.
 

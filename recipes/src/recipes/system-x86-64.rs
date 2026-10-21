@@ -4719,9 +4719,7 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
         "{in:openssh-x86-64}".into(),
         "{in:git-x86-64}".into(),
         "{in:rust-toolchain}".into(),
-        "{in:gcc-x86-64-self}".into(),
-        "{in:binutils-x86-64-self}".into(),
-        "{in:td-cc}".into(),
+        "{in:td-link}".into(),
     ];
     runtime_roots.extend(
         application_payload_inputs(sys)
@@ -4860,26 +4858,19 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
         target: "{in:td-busd}/bin/td-busd".into(),
         link: "{root}/real-root/bin/td-busd".into(),
     });
-    // One standard image includes the development toolchain: upstream Rust
-    // on td's runtime, and td's GCC behind the compiler launcher, which
-    // supplies exact store paths without shell setup.
+    // One standard image includes the Rust development toolchain: upstream
+    // Rust on td's runtime, linked through td-link. rustc's and Cargo's
+    // default linker is `cc` from PATH, so /bin/cc is td-link too: it links
+    // Rust and refuses to compile C, which builds in the Debian build root.
     for name in ["rustc", "rustdoc", "cargo", "cargo-clippy", "clippy-driver"] {
         steps.push(Step::Symlink {
             target: format!("{{in:rust-toolchain}}/bin/{name}"),
             link: format!("{{root}}/real-root/bin/{name}"),
         });
     }
-    for name in ["td-cc", "cc", "gcc", "c++", "g++"] {
+    for name in ["td-link", "cc"] {
         steps.push(Step::Symlink {
-            target: "{in:td-cc}/bin/td-cc".into(),
-            link: format!("{{root}}/real-root/bin/{name}"),
-        });
-    }
-    for name in [
-        "ar", "as", "ld", "nm", "ranlib", "objcopy", "objdump", "readelf", "strip",
-    ] {
-        steps.push(Step::Symlink {
-            target: format!("{{in:binutils-x86-64-self}}/bin/{name}"),
+            target: "{in:td-link}/bin/td-link".into(),
             link: format!("{{root}}/real-root/bin/{name}"),
         });
     }
@@ -5731,9 +5722,7 @@ pub fn recipe() -> Recipe {
                 // The upstream toolchain's runtime, which its lib/ links to.
                 "gcc-runtime",
                 "zlib-x86-64",
-                "gcc-x86-64-self",
-                "binutils-x86-64-self",
-                "td-cc",
+                "td-link",
             ],
         ))
         .steps(steps);
@@ -9140,9 +9129,7 @@ mod tests {
             "{in:openssh-x86-64}".to_string(),
             "{in:git-x86-64}".to_string(),
             "{in:rust-toolchain}".to_string(),
-            "{in:gcc-x86-64-self}".to_string(),
-            "{in:binutils-x86-64-self}".to_string(),
-            "{in:td-cc}".to_string(),
+            "{in:td-link}".to_string(),
             format!("{{payload:{CLAUDE_NAME}}}"),
             format!("{{payload:{FIREFOX_NAME}}}"),
             "{payload:freedesktop-platform-25-08}".to_string(),
@@ -9168,6 +9155,20 @@ mod tests {
             )),
             "runtime store items must not bypass StageRuntimeClosure"
         );
+        // No C toolchain ships: /bin/cc is td-link, and no GCC, binutils or
+        // compiler launcher reaches /bin.
+        for name in [
+            "gcc", "c++", "g++", "td-cc", "ar", "as", "ld", "nm", "ranlib", "objcopy", "objdump",
+            "readelf", "strip",
+        ] {
+            let link = format!("{{root}}/real-root/bin/{name}");
+            assert!(
+                !steps
+                    .iter()
+                    .any(|step| matches!(step, Step::Symlink { link: l, .. } if l == &link)),
+                "/bin/{name} names a C tool the image no longer ships"
+            );
+        }
         // curl and Git link LibreSSL's archives statically; the image
         // carries none of it and no `openssl` command.
         assert!(
@@ -9195,20 +9196,8 @@ mod tests {
             ("cargo", "{in:rust-toolchain}/bin/cargo"),
             ("cargo-clippy", "{in:rust-toolchain}/bin/cargo-clippy"),
             ("clippy-driver", "{in:rust-toolchain}/bin/clippy-driver"),
-            ("td-cc", "{in:td-cc}/bin/td-cc"),
-            ("cc", "{in:td-cc}/bin/td-cc"),
-            ("gcc", "{in:td-cc}/bin/td-cc"),
-            ("c++", "{in:td-cc}/bin/td-cc"),
-            ("g++", "{in:td-cc}/bin/td-cc"),
-            ("ar", "{in:binutils-x86-64-self}/bin/ar"),
-            ("ld", "{in:binutils-x86-64-self}/bin/ld"),
-            ("as", "{in:binutils-x86-64-self}/bin/as"),
-            ("nm", "{in:binutils-x86-64-self}/bin/nm"),
-            ("ranlib", "{in:binutils-x86-64-self}/bin/ranlib"),
-            ("objcopy", "{in:binutils-x86-64-self}/bin/objcopy"),
-            ("objdump", "{in:binutils-x86-64-self}/bin/objdump"),
-            ("readelf", "{in:binutils-x86-64-self}/bin/readelf"),
-            ("strip", "{in:binutils-x86-64-self}/bin/strip"),
+            ("td-link", "{in:td-link}/bin/td-link"),
+            ("cc", "{in:td-link}/bin/td-link"),
         ] {
             let link = format!("{{root}}/real-root/bin/{name}");
             let targets: Vec<&str> = steps
@@ -9229,14 +9218,7 @@ mod tests {
         }
 
         let native_inputs = recipe().native_inputs.expect("system native inputs");
-        for required in [
-            "rust-toolchain",
-            "gcc-runtime",
-            "zlib-x86-64",
-            "gcc-x86-64-self",
-            "binutils-x86-64-self",
-            "td-cc",
-        ] {
+        for required in ["rust-toolchain", "gcc-runtime", "zlib-x86-64", "td-link"] {
             assert!(
                 native_inputs.iter().any(|input| input == required),
                 "shipped input {required} must be declared"
@@ -9244,6 +9226,8 @@ mod tests {
         }
         for forbidden in [
             "gcc-x86-64-native",
+            "gcc-x86-64-self",
+            "binutils-x86-64-self",
             "bash-mesboot",
             "python-mesboot",
             "libressl-x86-64",
