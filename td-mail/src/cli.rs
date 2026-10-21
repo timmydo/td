@@ -41,10 +41,15 @@ struct CliState {
     connected_username: Option<String>,
     cached_mailboxes: Vec<Mailbox>,
     next_op_id: u64,
+    /// Every account's rules; `rules` holds those of the account
+    /// connected, as do the folder and From settings below, which are
+    /// `[mail]`'s until an account is connected.
+    all_rules: Vec<CompiledRule>,
     rules: Arc<Vec<CompiledRule>>,
     custom_headers: Arc<Vec<String>>,
     rules_mailbox_regex: Arc<UserRegex>,
     my_email_regex: Arc<UserRegex>,
+    reply_from: Option<String>,
     archive_folder: String,
     deleted_folder: String,
     archive_mailbox_id: Option<String>,
@@ -116,9 +121,7 @@ impl CliState {
     }
 
     fn reply_from_header(&self) -> String {
-        self.config
-            .mail
-            .reply_from
+        self.reply_from
             .clone()
             .or_else(|| self.connected_username.clone())
             .unwrap_or_else(|| "user@example.com".to_string())
@@ -316,6 +319,18 @@ fn cmd_connect(state: &mut CliState, input: &Value) -> Value {
     state.connected_account = None;
     state.connected_username = None;
     state.cached_mailboxes.clear();
+    // A plan names the previous account's messages.
+    state.triage_plans.clear();
+    // The account's settings, whether or not it connects: nothing of the
+    // previous account's is left to a later command.
+    let rules = rules::for_account(&state.all_rules, &account.name);
+    state.custom_headers = Arc::new(rules::extract_custom_headers(&rules));
+    state.rules = Arc::new(rules);
+    state.reply_from = account.mail.reply_from.clone();
+    state.archive_folder = account.mail.archive_folder.clone();
+    state.deleted_folder = account.mail.deleted_folder.clone();
+    state.archive_mailbox_id = account.mail.archive_mailbox_id.clone();
+    state.deleted_mailbox_id = account.mail.deleted_mailbox_id.clone();
 
     let client = if state.offline {
         None
@@ -1684,20 +1699,20 @@ fn recv_mutation_response(state: &CliState) -> Value {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn run_cli(
     config: Config,
     rules: Vec<CompiledRule>,
     custom_headers: Vec<String>,
-    rules_mailbox_regex: UserRegex,
-    my_email_regex: UserRegex,
-    archive_folder: String,
-    deleted_folder: String,
-    archive_mailbox_id: Option<String>,
-    deleted_mailbox_id: Option<String>,
     offline: bool,
 ) {
     let mut state = CliState {
+        reply_from: config.mail.reply_from.clone(),
+        rules_mailbox_regex: Arc::new(config.mail.rules_mailbox_regex.clone()),
+        my_email_regex: Arc::new(config.mail.my_email_regex.clone()),
+        archive_folder: config.mail.archive_folder.clone(),
+        deleted_folder: config.mail.deleted_folder.clone(),
+        archive_mailbox_id: config.mail.archive_mailbox_id.clone(),
+        deleted_mailbox_id: config.mail.deleted_mailbox_id.clone(),
         config,
         cmd_tx: None,
         resp_rx: None,
@@ -1705,14 +1720,9 @@ pub fn run_cli(
         connected_username: None,
         cached_mailboxes: Vec::new(),
         next_op_id: 0,
+        all_rules: rules.clone(),
         rules: Arc::new(rules),
         custom_headers: Arc::new(custom_headers),
-        rules_mailbox_regex: Arc::new(rules_mailbox_regex),
-        my_email_regex: Arc::new(my_email_regex),
-        archive_folder,
-        deleted_folder,
-        archive_mailbox_id,
-        deleted_mailbox_id,
         next_plan_id: 0,
         triage_plans: HashMap::new(),
         offline,

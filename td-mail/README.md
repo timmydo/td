@@ -348,7 +348,30 @@ secret = "portal"
 well_known_url = "https://mx.work.com/.well-known/jmap"
 username = "me@work.com"
 password_command = "pass show email/work.com"
+reply_from = "Me <me@work.com>"
+archive_folder = "Old Mail"
+
+[retention.work-archive]
+folder = "Old Mail"
+days = 730
+account = "work"
 ```
+
+An `[account.NAME]` section may set `[mail]`'s `reply_from`,
+`archive_folder`, `deleted_folder`, `archive_mailbox_id` and
+`deleted_mailbox_id` for that account alone; what it leaves unset is
+`[mail]`'s, except that an account setting a folder or its mailbox id
+takes no mailbox id for it from `[mail]`, since a mailbox id names a
+mailbox on one server. The mailbox ids are read by `--cli` alone.
+
+A `[retention.NAME]` policy with `account = "NAME"` is that account's
+alone, and one without it applies to every account. A rule in
+`rules.toml` takes `account = "NAME"` the same way. The legacy `[jmap]`
+section's account is named `default`. A policy or rule naming an
+account the configuration does not have is refused: the configuration
+does not load, and the rules file is not used. So is an unknown key in
+a rule, its actions or its triage, so a misspelled `account` cannot
+leave a rule running for every account.
 
 For a private HTTPS server, an account may set
 `tls_ca_file = "/absolute/path/to/ca.pem"`. The file contains public CA

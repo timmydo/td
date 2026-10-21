@@ -30,14 +30,17 @@ impl CliHarness {
     }
 
     fn start_with_mail_config(mail_config: &str) -> Self {
-        Self::start_with_opts(mail_config, false, None, None)
+        Self::start_with_opts("", mail_config, false, None, None)
     }
 
     fn start_with_data_home(data_home: PathBuf) -> Self {
-        Self::start_with_opts("", false, None, Some(data_home))
+        Self::start_with_opts("", "", false, None, Some(data_home))
     }
 
+    /// `account_config` is added to `[account.test]`, `mail_config` to
+    /// `[mail]`.
     fn start_with_opts(
+        account_config: &str,
         mail_config: &str,
         offline: bool,
         cache_home: Option<PathBuf>,
@@ -54,11 +57,13 @@ impl CliHarness {
 well_known_url = "{}/.well-known/jmap"
 username = "test@example.com"
 password_command = "echo test"
+{}
 
 [mail]
 {}
 "#,
             server.url(),
+            account_config,
             mail_config
         );
         std::fs::write(&config_path, config_content).expect("write config");
@@ -307,6 +312,35 @@ deleted_mailbox_id = "mbox-trash"
     assert!(!ids.contains(&"email-003"));
 }
 
+/// The connected account's own folders, ids and From replace `[mail]`'s,
+/// whose folder names would resolve to nothing.
+#[test]
+fn test_account_overrides_mail_settings_on_connect() {
+    let mut h = CliHarness::start_with_opts(
+        r#"reply_from = "Work <test@example.com>"
+archive_folder = "not-a-real-folder"
+archive_mailbox_id = "mbox-archive"
+deleted_mailbox_id = "mbox-trash""#,
+        r#"reply_from = "Shared <shared@example.com>"
+archive_folder = "also-not-real"
+deleted_folder = "nor-this""#,
+        false,
+        None,
+        None,
+    );
+    assert!(h.send(json!({"command": "connect", "account": "test"}))["ok"].is_true());
+    let draft = h.send(json!({"command": "compose_draft"}));
+    assert!(
+        text(&draft["draft"]).starts_with("From: Work <test@example.com>\n"),
+        "{}",
+        draft
+    );
+    let archive = h.send(json!({"command": "bulk_archive", "ids": ["email-001"]}));
+    assert_eq!(number(&archive["succeeded"]), 1, "{}", archive);
+    let delete = h.send(json!({"command": "bulk_delete_email", "ids": ["email-002"]}));
+    assert_eq!(number(&delete["succeeded"]), 1, "{}", delete);
+}
+
 #[test]
 fn test_query_emails_date_filters() {
     let mut h = CliHarness::start();
@@ -397,7 +431,7 @@ fn test_offline_queue_replay_on_reconnect() {
     // Prime cache from an online session.
     {
         let mut online =
-            CliHarness::start_with_opts("", false, Some(cache_dir.path().to_path_buf()), None);
+            CliHarness::start_with_opts("", "", false, Some(cache_dir.path().to_path_buf()), None);
         assert!(online.send(json!({"command": "connect", "account": "test"}))["ok"].is_true());
         assert!(online.send(json!({"command": "list_mailboxes"}))["ok"].is_true());
         assert!(online.send(json!({
@@ -411,7 +445,7 @@ fn test_offline_queue_replay_on_reconnect() {
     // Queue writes offline; they should succeed and update local cache projection.
     {
         let mut offline =
-            CliHarness::start_with_opts("", true, Some(cache_dir.path().to_path_buf()), None);
+            CliHarness::start_with_opts("", "", true, Some(cache_dir.path().to_path_buf()), None);
         assert!(offline.send(json!({"command": "connect", "account": "test"}))["ok"].is_true());
 
         let mark = offline.send(json!({"command": "mark_read", "id": "email-002"}));
@@ -442,7 +476,7 @@ fn test_offline_queue_replay_on_reconnect() {
     // Reconnect online with the same cache; queued ops should replay to server.
     {
         let mut online =
-            CliHarness::start_with_opts("", false, Some(cache_dir.path().to_path_buf()), None);
+            CliHarness::start_with_opts("", "", false, Some(cache_dir.path().to_path_buf()), None);
         assert!(online.send(json!({"command": "connect", "account": "test"}))["ok"].is_true());
 
         let e1 =
@@ -1233,7 +1267,7 @@ fn test_send_draft_submits_through_jmap_and_retires_the_draft() {
 /// draft is not queued, since the person is waiting on it.
 #[test]
 fn test_send_draft_offline_is_refused_not_queued() {
-    let mut h = CliHarness::start_with_opts("", true, None, None);
+    let mut h = CliHarness::start_with_opts("", "", true, None, None);
     let state = testing::tempdir().expect("state dir");
     let drafts = state.path().join("td-mail/drafts");
     std::fs::create_dir_all(&drafts).expect("drafts dir");
@@ -1428,13 +1462,13 @@ fn stored_metadata_failure_remains_an_error() {
 fn offline_open_retains_cached_unreadable_metadata() {
     let cache = testing::tempdir().unwrap();
     {
-        let mut h = CliHarness::start_with_opts("", false, Some(cache.path().into()), None);
+        let mut h = CliHarness::start_with_opts("", "", false, Some(cache.path().into()), None);
         assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
         h.server().refuse_read("email-001", "messageInterpretation");
         let response = h.send(json!({"command":"query_emails", "mailbox_id":"mbox-inbox"}));
         assert!(response["ok"].is_true(), "{response}");
     }
-    let mut h = CliHarness::start_with_opts("", true, Some(cache.path().into()), None);
+    let mut h = CliHarness::start_with_opts("", "", true, Some(cache.path().into()), None);
     assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
     let response = h.send(json!({"command":"get_email", "id":"email-001"}));
     assert!(response["ok"].is_true(), "{response}");

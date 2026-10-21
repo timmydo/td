@@ -10,6 +10,72 @@ pub struct AccountConfig {
     pub username: String,
     pub password: PasswordSource,
     pub tls_ca_file: Option<String>,
+    pub mail: AccountMail,
+}
+
+/// The `[mail]` settings an account may set for itself, resolved: the
+/// value `[account.NAME]` gives, else `[mail]`'s, else the default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountMail {
+    pub reply_from: Option<String>,
+    pub archive_folder: String,
+    pub deleted_folder: String,
+    pub archive_mailbox_id: Option<String>,
+    pub deleted_mailbox_id: Option<String>,
+}
+
+impl AccountMail {
+    /// `[mail]`'s settings, overridden where the account sets them. An
+    /// account that sets a folder or its mailbox id takes no mailbox id
+    /// for it from `[mail]`, whose id names a mailbox on another
+    /// account's server; an unset folder name is still `[mail]`'s.
+    fn resolve(mail: &RawMailConfig, account: &RawAccountFields) -> Self {
+        let folder = |own: &Option<String>,
+                      own_id: &Option<String>,
+                      shared: &String,
+                      shared_id: &Option<String>| {
+            if own.is_some() || own_id.is_some() {
+                (
+                    own.clone().unwrap_or_else(|| shared.clone()),
+                    own_id.clone(),
+                )
+            } else {
+                (shared.clone(), shared_id.clone())
+            }
+        };
+        let (archive_folder, archive_mailbox_id) = folder(
+            &account.archive_folder,
+            &account.archive_mailbox_id,
+            &mail.archive_folder,
+            &mail.archive_mailbox_id,
+        );
+        let (deleted_folder, deleted_mailbox_id) = folder(
+            &account.deleted_folder,
+            &account.deleted_mailbox_id,
+            &mail.deleted_folder,
+            &mail.deleted_mailbox_id,
+        );
+        AccountMail {
+            reply_from: account.reply_from.clone().or(mail.reply_from.clone()),
+            archive_folder,
+            deleted_folder,
+            archive_mailbox_id,
+            deleted_mailbox_id,
+        }
+    }
+
+    /// An account's settings with nothing set: the folders a test's
+    /// mailboxes are named.
+    #[cfg(test)]
+    pub fn for_test() -> Self {
+        AccountMail {
+            reply_from: None,
+            archive_folder: "Archive".to_string(),
+            deleted_folder: "Trash".to_string(),
+            archive_mailbox_id: None,
+            deleted_mailbox_id: None,
+        }
+    }
 }
 
 /// Where an account's password comes from. `Command` runs a shell command
@@ -112,6 +178,20 @@ pub struct RetentionPolicyConfig {
     pub name: String,
     pub folder: String,
     pub days: u32,
+    /// The one account the policy is for; none applies it to every one.
+    pub account: Option<String>,
+}
+
+/// The policies of `policies` that apply to the account named `account`.
+pub fn retention_for(
+    policies: &[RetentionPolicyConfig],
+    account: &str,
+) -> Vec<RetentionPolicyConfig> {
+    policies
+        .iter()
+        .filter(|policy| policy.account.as_deref().is_none_or(|name| name == account))
+        .cloned()
+        .collect()
 }
 
 #[derive(Debug)]
@@ -405,6 +485,12 @@ struct RawAccountFields {
     /// The retired key is recognised so its refusal can say what replaced it.
     password_file: bool,
     tls_ca_file: Option<String>,
+    /// `[mail]`'s keys, set for this account alone.
+    reply_from: Option<String>,
+    archive_folder: Option<String>,
+    deleted_folder: Option<String>,
+    archive_mailbox_id: Option<String>,
+    deleted_mailbox_id: Option<String>,
 }
 
 const ACCOUNT_KEYS: &[&str] = &[
@@ -413,6 +499,11 @@ const ACCOUNT_KEYS: &[&str] = &[
     "password_command",
     "secret",
     "tls_ca_file",
+    "reply_from",
+    "archive_folder",
+    "deleted_folder",
+    "archive_mailbox_id",
+    "deleted_mailbox_id",
 ];
 
 impl RawAccountFields {
@@ -433,6 +524,15 @@ impl RawAccountFields {
             secret: table.optional_str("secret")?.map(str::to_string),
             password_file: table.get("password_file").is_some(),
             tls_ca_file: table.optional_str("tls_ca_file")?.map(str::to_string),
+            reply_from: table.optional_str("reply_from")?.map(str::to_string),
+            archive_folder: table.optional_str("archive_folder")?.map(str::to_string),
+            deleted_folder: table.optional_str("deleted_folder")?.map(str::to_string),
+            archive_mailbox_id: table
+                .optional_str("archive_mailbox_id")?
+                .map(str::to_string),
+            deleted_mailbox_id: table
+                .optional_str("deleted_mailbox_id")?
+                .map(str::to_string),
         })
     }
 }
@@ -441,9 +541,10 @@ impl RawAccountFields {
 struct RawRetentionPolicy {
     folder: Option<String>,
     days: Option<u32>,
+    account: Option<String>,
 }
 
-const RETENTION_KEYS: &[&str] = &["folder", "days"];
+const RETENTION_KEYS: &[&str] = &["folder", "days", "account"];
 
 impl RawRetentionPolicy {
     fn from_toml(table: &Toml) -> Result<Self, TomlError> {
@@ -451,6 +552,7 @@ impl RawRetentionPolicy {
         Ok(RawRetentionPolicy {
             folder: table.optional_str("folder")?.map(str::to_string),
             days: table.optional_u32("days")?,
+            account: table.optional_str("account")?.map(str::to_string),
         })
     }
 }
@@ -540,7 +642,12 @@ impl Config {
                     name
                 )));
             }
-            retention_policies.push(RetentionPolicyConfig { name, folder, days });
+            retention_policies.push(RetentionPolicyConfig {
+                name,
+                folder,
+                days,
+                account: policy.account,
+            });
         }
 
         let mut accounts = Vec::new();
@@ -548,6 +655,7 @@ impl Config {
             let account_name = name.clone();
             accounts.push(AccountConfig {
                 name,
+                mail: AccountMail::resolve(&raw.mail, &account),
                 tls_ca_file: account.tls_ca_file,
                 well_known_url: require_field(
                     account.well_known_url,
@@ -575,6 +683,7 @@ impl Config {
             })?;
             accounts.push(AccountConfig {
                 name: "default".to_string(),
+                mail: AccountMail::resolve(&raw.mail, &jmap),
                 tls_ca_file: jmap.tls_ca_file,
                 well_known_url: require_field(
                     jmap.well_known_url,
@@ -592,6 +701,19 @@ impl Config {
                     "[jmap]",
                 )?,
             });
+        }
+
+        // A policy for an account the file does not configure would
+        // never run, which is a mistake to say rather than keep.
+        for policy in &retention_policies {
+            if let Some(account) = &policy.account {
+                if !accounts.iter().any(|a| &a.name == account) {
+                    return Err(ConfigError::Parse(format!(
+                        "[retention.{}] names account \"{}\", which is not configured",
+                        policy.name, account
+                    )));
+                }
+            }
         }
 
         for (field, value) in [
@@ -1200,6 +1322,126 @@ password_command = "pass show email/example.com"
         assert_eq!(config.mail.retention_policies[1].days, 30);
     }
 
+    /// An account sets `[mail]`'s From and folders for itself, and takes
+    /// `[mail]`'s, or the defaults, for what it leaves unset; a retention
+    /// policy may be one account's alone, and must name one configured.
+    #[test]
+    fn an_account_overrides_the_shared_mail_settings_for_itself() {
+        let text = r#"
+[mail]
+reply_from = "Me <me@home.test>"
+archive_folder = "Archive"
+archive_mailbox_id = "M-shared"
+deleted_folder = "Bin-shared"
+deleted_mailbox_id = "D-shared"
+
+[account.side]
+well_known_url = "https://side.test/.well-known/jmap"
+username = "me@side.test"
+password_command = "true"
+archive_folder = "Kept"
+deleted_mailbox_id = "d-side"
+
+[account.home]
+well_known_url = "https://home.test/.well-known/jmap"
+username = "me@home.test"
+password_command = "true"
+
+[account.work]
+well_known_url = "https://work.test/.well-known/jmap"
+username = "me@work.test"
+password_command = "true"
+reply_from = "Me <me@work.test>"
+archive_folder = "Old"
+deleted_folder = "Bin"
+archive_mailbox_id = "a1"
+deleted_mailbox_id = "d1"
+
+[retention.everywhere]
+folder = "Trash"
+days = 30
+
+[retention.work-archive]
+folder = "Old"
+days = 365
+account = "work"
+"#;
+        let config = Config::parse(text).unwrap();
+        let account = |name: &str| {
+            config
+                .accounts
+                .iter()
+                .find(|a| a.name == name)
+                .unwrap()
+                .mail
+                .clone()
+        };
+        assert_eq!(
+            account("home"),
+            AccountMail {
+                reply_from: Some("Me <me@home.test>".to_string()),
+                archive_folder: "Archive".to_string(),
+                deleted_folder: "Bin-shared".to_string(),
+                archive_mailbox_id: Some("M-shared".to_string()),
+                deleted_mailbox_id: Some("D-shared".to_string()),
+            }
+        );
+        // Its own folder name takes no mailbox id from [mail], whose id
+        // is on another server; its own id alone keeps [mail]'s name.
+        assert_eq!(account("side").archive_folder, "Kept");
+        assert_eq!(account("side").archive_mailbox_id, None);
+        assert_eq!(account("side").deleted_folder, "Bin-shared");
+        assert_eq!(
+            account("side").deleted_mailbox_id.as_deref(),
+            Some("d-side")
+        );
+        assert_eq!(
+            account("work"),
+            AccountMail {
+                reply_from: Some("Me <me@work.test>".to_string()),
+                archive_folder: "Old".to_string(),
+                deleted_folder: "Bin".to_string(),
+                archive_mailbox_id: Some("a1".to_string()),
+                deleted_mailbox_id: Some("d1".to_string()),
+            }
+        );
+        let names = |account: &str| -> Vec<String> {
+            retention_for(&config.mail.retention_policies, account)
+                .into_iter()
+                .map(|policy| policy.name)
+                .collect()
+        };
+        assert_eq!(names("home"), ["everywhere"]);
+        assert_eq!(names("work"), ["everywhere", "work-archive"]);
+
+        // The legacy [jmap] account is "default", and takes the same keys.
+        let legacy = Config::parse(&format!(
+            "{}\nreply_from = \"Old <old@example.com>\"\n[retention.mine]\nfolder = \"Trash\"\ndays = 7\naccount = \"default\"\n",
+            jmap_config("")
+        ))
+        .unwrap();
+        let only = legacy.accounts.first().unwrap();
+        assert_eq!(only.name, "default");
+        assert_eq!(
+            only.mail.reply_from.as_deref(),
+            Some("Old <old@example.com>")
+        );
+        assert_eq!(
+            retention_for(&legacy.mail.retention_policies, "default").len(),
+            1
+        );
+
+        let err = Config::parse(&text.replace("account = \"work\"", "account = \"wrok\""))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(
+                "[retention.work-archive] names account \"wrok\", which is not configured"
+            ),
+            "{err}"
+        );
+    }
+
     #[test]
     fn test_mailbox_id_overrides() {
         let config = Config::parse(
@@ -1423,6 +1665,7 @@ secret = \"portal\"
             well_known_url: url.to_string(),
             username: "u@example.com".to_string(),
             password: PasswordSource::Portal("a".to_string()),
+            mail: AccountMail::for_test(),
         };
         for url in [
             "https://mail.example.com/.well-known/jmap",

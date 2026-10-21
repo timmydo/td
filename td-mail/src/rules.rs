@@ -13,8 +13,10 @@ pub struct RulesConfig {
 }
 
 impl RulesConfig {
-    /// Read a rules file. Unknown keys are ignored, as serde's default was;
-    /// a missing required key reads with serde's own wording.
+    /// Read a rules file. An unknown key in a rule, its actions or its
+    /// triage is refused, since a misspelled `account` would run the rule
+    /// for every account; a missing required key reads with serde's own
+    /// wording.
     pub fn parse(contents: &str) -> Result<Self, String> {
         let document = td_toml::parse(contents).map_err(|e| e.to_string())?;
         RulesConfig::from_toml(&document).map_err(|e| e.to_string())
@@ -38,13 +40,37 @@ pub struct RuleDef {
     pub name: String,
     pub continue_processing: Option<bool>,
     pub skip_if_to_me: Option<bool>,
+    /// The one account the rule runs for; none runs it for every one.
+    pub account: Option<String>,
     pub match_condition: ConditionDef,
     pub actions: ActionsDef,
     pub triage: Option<TriageHintDef>,
 }
 
+const RULE_KEYS: &[&str] = &[
+    "name",
+    "continue_processing",
+    "skip_if_to_me",
+    "account",
+    "match",
+    "actions",
+    "triage",
+];
+
+const ACTION_KEYS: &[&str] = &[
+    "mark_read",
+    "mark_unread",
+    "flag",
+    "unflag",
+    "move_to",
+    "delete",
+];
+
+const TRIAGE_KEYS: &[&str] = &["action", "confidence"];
+
 impl RuleDef {
     fn from_toml(table: &Toml) -> Result<Self, TomlError> {
+        table.check_known_keys(RULE_KEYS)?;
         let triage = match table.optional_table("triage")? {
             Some(t) => Some(TriageHintDef::from_toml(t)?),
             None => None,
@@ -53,6 +79,7 @@ impl RuleDef {
             name: table.require_str("name")?.to_string(),
             continue_processing: table.optional_bool("continue_processing")?,
             skip_if_to_me: table.optional_bool("skip_if_to_me")?,
+            account: table.optional_str("account")?.map(str::to_string),
             match_condition: ConditionDef::from_toml(table.require_table("match")?)?,
             actions: ActionsDef::from_toml(table.require_table("actions")?)?,
             triage,
@@ -68,6 +95,7 @@ pub struct TriageHintDef {
 
 impl TriageHintDef {
     fn from_toml(table: &Toml) -> Result<Self, TomlError> {
+        table.check_known_keys(TRIAGE_KEYS)?;
         Ok(TriageHintDef {
             action: TriageHintActionDef::from_toml(table.require_str("action")?)?,
             confidence: table.optional_float("confidence")?.map(|v| v as f32),
@@ -154,6 +182,7 @@ pub struct ActionsDef {
 
 impl ActionsDef {
     fn from_toml(table: &Toml) -> Result<Self, TomlError> {
+        table.check_known_keys(ACTION_KEYS)?;
         Ok(ActionsDef {
             mark_read: table.optional_bool("mark_read")?,
             mark_unread: table.optional_bool("mark_unread")?,
@@ -167,11 +196,12 @@ impl ActionsDef {
 
 // --- Compiled types ---
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CompiledRule {
     pub name: String,
     pub continue_processing: bool,
     pub skip_if_to_me: bool,
+    pub account: Option<String>,
     pub actions: Vec<Action>,
     pub condition: CompiledCondition,
     pub triage_action: Option<TriageHintActionDef>,
@@ -188,7 +218,7 @@ pub enum Action {
     Delete,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum CompiledCondition {
     Header { header: String, regex: UserRegex },
     All(Vec<CompiledCondition>),
@@ -211,6 +241,32 @@ pub fn load_rules(path: &Path) -> Result<Vec<CompiledRule>, String> {
         .collect::<Result<Vec<_>, _>>()
 }
 
+/// The rules of `rules` that run for the account named `account`, in
+/// their order: those that name it and those that name none.
+pub fn for_account(rules: &[CompiledRule], account: &str) -> Vec<CompiledRule> {
+    rules
+        .iter()
+        .filter(|rule| rule.account.as_deref().is_none_or(|name| name == account))
+        .cloned()
+        .collect()
+}
+
+/// Refuses a rule that names an account `accounts` does not hold: it
+/// would never run.
+pub fn check_accounts(rules: &[CompiledRule], accounts: &[&str]) -> Result<(), String> {
+    for rule in rules {
+        if let Some(account) = &rule.account {
+            if !accounts.contains(&account.as_str()) {
+                return Err(format!(
+                    "Rule '{}' names account \"{}\", which is not configured",
+                    rule.name, account
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn format_rules_for_display(rules: &[CompiledRule]) -> String {
     if rules.is_empty() {
         return "No rules defined.".to_string();
@@ -231,6 +287,9 @@ pub fn format_rules_for_display(rules: &[CompiledRule]) -> String {
             "  Skip if not to me: {}\n",
             if rule.skip_if_to_me { "yes" } else { "no" }
         ));
+        if let Some(account) = &rule.account {
+            out.push_str(&format!("  Account: {}\n", account));
+        }
         out.push_str(&format!(
             "  Match: {}\n",
             format_condition_for_display(&rule.condition)
@@ -252,6 +311,7 @@ fn compile_rule(def: RuleDef) -> Result<CompiledRule, String> {
         name: def.name,
         continue_processing: def.continue_processing.unwrap_or(false),
         skip_if_to_me: def.skip_if_to_me.unwrap_or(false),
+        account: def.account,
         actions,
         condition,
         triage_action: def.triage.as_ref().map(|t| match t.action {
@@ -1105,6 +1165,65 @@ flag = true
         assert!(custom.contains(&"header:X-Spam-Score:asText".to_string()));
         assert!(custom.contains(&"header:X-Mailing-List:asText".to_string()));
         assert_eq!(custom.len(), 2);
+    }
+
+    /// A rule that names an account runs for it alone, one that names
+    /// none for every account, each account's in the file's order; a
+    /// rule naming an account not configured is refused.
+    #[test]
+    fn a_rule_may_be_one_accounts_alone() {
+        let toml_str = r#"
+[[rule]]
+name = "work lists"
+account = "work"
+[rule.match]
+header = "X-Mailing-List"
+regex = "dev"
+[rule.actions]
+flag = true
+
+[[rule]]
+name = "everywhere"
+[rule.match]
+header = "From"
+regex = "news"
+[rule.actions]
+mark_read = true
+"#;
+        let rules: Vec<CompiledRule> = RulesConfig::parse(toml_str)
+            .unwrap()
+            .rule
+            .into_iter()
+            .map(compile_rule)
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let names = |account: &str| -> Vec<String> {
+            for_account(&rules, account)
+                .into_iter()
+                .map(|rule| rule.name)
+                .collect()
+        };
+        assert_eq!(names("work"), ["work lists", "everywhere"]);
+        assert_eq!(names("home"), ["everywhere"]);
+        // The headers fetched are the account's rules' alone.
+        assert!(extract_custom_headers(&for_account(&rules, "home")).is_empty());
+        assert!(format_rules_for_display(&rules).contains("  Account: work\n"));
+
+        assert!(check_accounts(&rules, &["home", "work"]).is_ok());
+        let err = check_accounts(&rules, &["home"]).unwrap_err();
+        assert_eq!(
+            err,
+            "Rule 'work lists' names account \"work\", which is not configured"
+        );
+
+        // A misspelled key is refused, not a rule for every account.
+        for (from, to) in [("account = ", "acount = "), ("flag = true", "flagg = true")] {
+            let err = RulesConfig::parse(&toml_str.replacen(from, to, 1)).unwrap_err();
+            assert!(
+                err.contains(to.trim_end_matches(" = ").trim_end_matches(" = true")),
+                "{err}"
+            );
+        }
     }
 
     #[test]

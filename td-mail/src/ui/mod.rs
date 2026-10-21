@@ -74,13 +74,11 @@ struct Setup {
     account_names: Vec<String>,
     page_size: u32,
     browser: Option<String>,
-    reply_from: Option<String>,
-    archive_folder: String,
-    deleted_folder: String,
+    /// Every account's policies and rules; each account's backend and
+    /// views get those that apply to it.
     retention_policies: Vec<RetentionPolicyConfig>,
     sync_interval_secs: Option<u64>,
-    rules: Arc<Vec<CompiledRule>>,
-    custom_headers: Arc<Vec<String>>,
+    rules: Vec<CompiledRule>,
     rules_mailbox_regex: Arc<UserRegex>,
     my_email_regex: Arc<UserRegex>,
     spam_config: SpamConfig,
@@ -105,14 +103,14 @@ impl Setup {
         MailboxListView::new(
             cmd_tx.clone(),
             account.username.clone(),
-            self.reply_from.clone(),
+            account.mail.reply_from.clone(),
             self.browser.clone(),
             self.page_size,
             self.account_names.clone(),
             account.name.clone(),
-            self.archive_folder.clone(),
-            self.deleted_folder.clone(),
-            self.retention_policies.clone(),
+            account.mail.archive_folder.clone(),
+            account.mail.deleted_folder.clone(),
+            crate::config::retention_for(&self.retention_policies, &account.name),
             self.sync_interval_secs,
         )
         .with_setup(AccountSetup {
@@ -149,13 +147,15 @@ impl Setup {
         account: &AccountConfig,
         origin: &str,
     ) -> (Sender<BackendCommand>, Receiver<BackendResponse>) {
+        let rules = crate::rules::for_account(&self.rules, &account.name);
+        let custom_headers = crate::rules::extract_custom_headers(&rules);
         let (cmd_tx, resp_rx) = backend::spawn(
             None,
             !self.offline,
             true,
             account.name.clone(),
-            self.rules.clone(),
-            self.custom_headers.clone(),
+            Arc::new(rules),
+            Arc::new(custom_headers),
             self.rules_mailbox_regex.clone(),
             self.my_email_regex.clone(),
             self.spam_config.clone(),
@@ -1737,14 +1737,10 @@ pub fn run(
     browser: Option<String>,
     mouse: bool,
     sync_interval_secs: Option<u64>,
-    archive_folder: String,
-    deleted_folder: String,
-    reply_from: Option<String>,
     rules_mailbox_regex: UserRegex,
     my_email_regex: UserRegex,
     retention_policies: Vec<RetentionPolicyConfig>,
     rules: Vec<CompiledRule>,
-    custom_headers: Vec<String>,
     spam_config: SpamConfig,
     offline: bool,
     config_path: PathBuf,
@@ -1764,13 +1760,9 @@ pub fn run(
         accounts,
         page_size,
         browser,
-        reply_from,
-        archive_folder,
-        deleted_folder,
         retention_policies,
         sync_interval_secs,
-        rules: Arc::new(rules),
-        custom_headers: Arc::new(custom_headers),
+        rules,
         // Both patterns were compiled where the configuration was read.
         rules_mailbox_regex: Arc::new(rules_mailbox_regex),
         my_email_regex: Arc::new(my_email_regex),
@@ -1835,6 +1827,7 @@ mod frame_tests {
             well_known_url: String::new(),
             username: "me@example.com".to_string(),
             password: PasswordSource::Command("true".to_string()),
+            mail: crate::config::AccountMail::for_test(),
         }
     }
 
@@ -1845,13 +1838,9 @@ mod frame_tests {
             account_names: vec!["test".to_string()],
             page_size: 50,
             browser: None,
-            reply_from: None,
-            archive_folder: "Archive".to_string(),
-            deleted_folder: "Trash".to_string(),
             retention_policies: Vec::new(),
             sync_interval_secs: None,
-            rules: Arc::new(Vec::new()),
-            custom_headers: Arc::new(Vec::new()),
+            rules: Vec::new(),
             rules_mailbox_regex: regex("^INBOX$"),
             my_email_regex: regex("^$"),
             spam_config: SpamConfig {
@@ -3271,6 +3260,29 @@ mod frame_tests {
         assert_eq!(note(&session), "Hidden files left out; Ctrl-H shows them");
         key(&mut session, "Escape");
         assert_eq!(text(&session), template);
+    }
+
+    /// An account's own `reply_from` is the From of a draft composed
+    /// from its mailbox list.
+    #[test]
+    fn an_accounts_own_reply_from_is_the_drafts_from() {
+        let state = crate::testing::tempdir().unwrap();
+        let mut setup = setup();
+        setup.draft_dir = Some(state.path().join("drafts"));
+        let mut work = account();
+        work.mail.reply_from = Some("Work <me@work.test>".to_string());
+        setup.accounts = vec![work.clone()];
+        let (cmd_tx, _cmd_rx) = mpsc::channel();
+        let (_resp_tx, resp_rx) = mpsc::channel();
+        let view = setup.mailbox_view(&cmd_tx, &work);
+        let stack = ViewStack::new(Box::new(view));
+        let mut session = Session::new(setup, stack, cmd_tx, resp_rx, false).unwrap();
+        key(&mut session, "c");
+        assert!(
+            text(&session).starts_with("From: Work <me@work.test>\nTo: \n"),
+            "{}",
+            text(&session)
+        );
     }
 
     /// `c` retains a draft and opens it in the pane, editable and

@@ -178,6 +178,7 @@ mod portal_tests {
                 withheld.path(),
                 "echo 'no such credential' >&2; exit 3",
             )),
+            mail: crate::config::AccountMail::for_test(),
         };
         let err = crate::connect_account(&placeholder).err().unwrap();
         assert!(err.contains("no such credential"), "{err}");
@@ -270,6 +271,22 @@ fn print_rules() {
             std::process::exit(1);
         }
     };
+    // The window refuses a rules file naming an account the
+    // configuration does not have, so this says so too.
+    match Config::load(&config_path) {
+        Ok(config) => {
+            let names: Vec<&str> = config.accounts.iter().map(|a| a.name.as_str()).collect();
+            if let Err(e) = rules::check_accounts(&loaded, &names) {
+                eprintln!("Rules in {} are not used: {}", rules_path.display(), e);
+                std::process::exit(1);
+            }
+        }
+        Err(e) => eprintln!(
+            "Account names not checked: {}: {}",
+            config_path.display(),
+            e
+        ),
+    }
     let custom_headers = rules::extract_custom_headers(&loaded);
 
     println!("Rules file: {}", rules_path.display());
@@ -318,6 +335,11 @@ days = 365                  # expire mail older than 365 days in Archive when pr
 folder = "Trash"
 days = 30                   # expire mail older than 30 days in Trash when pressing X
 
+[retention.work-archive]
+folder = "Old Mail"
+days = 730
+account = "work"            # optional: this account's policy alone (default: every account)
+
 [account.personal]
 well_known_url = "https://mx.example.com/.well-known/jmap"
 username = "me@example.com"
@@ -327,6 +349,8 @@ secret = "portal"
 well_known_url = "https://mx.work.com/.well-known/jmap"
 username = "me@work.com"
 password_command = "pass show email/work.com"
+reply_from = "Me <me@work.com>"  # optional: [mail]'s keys, for this account alone
+archive_folder = "Old Mail"
 ```
 
 Rules:
@@ -339,6 +363,7 @@ Rules:
 - `scrolloff` and `[theme]` were the terminal's; they are accepted and ignored. The window keeps the selection in view and draws with the toolkit's colours.
 - Sending needs nothing here: a draft goes through the account's JMAP server (mail submission, RFC 8621), under the identity whose address the draft's From names; there is no SMTP setting.
 - `archive_folder` and `deleted_folder` are mailbox targets for `a` and `d` in list views.
+- An [account.NAME] section may also set `reply_from`, `archive_folder`, `deleted_folder`, `archive_mailbox_id` and `deleted_mailbox_id` for that account alone; what it leaves unset is [mail]'s. An account that sets a folder or its mailbox id takes no mailbox id for it from [mail]; an unset folder name is still [mail]'s. The mailbox ids are read by `--cli` alone. The legacy [jmap] account is named `default`.
 - `rules_mailbox_regex` controls which mailbox names auto-run rules on refresh/fetch; default is `^INBOX$`.
 - `my_email_regex` is matched against combined To/Cc and used by rules with `skip_if_to_me = true`.
 - Both patterns are POSIX Extended Regular Expressions over bytes, with GNU `\w \W \b \B` and an optional leading `(?i)`; `\d \D \s \S` and `(?:...)` are accepted. Matching is leftmost-longest and ASCII. Lookaround, backreferences, named/comment groups, non-greedy quantifiers, `\uXXXX`/`\x..`/`\p{{...}}` and a pattern over 4 KiB are refused, and a refused pattern is a config error naming the pattern and the reason. See `td-mail --prompt=rules`.
@@ -347,6 +372,7 @@ Rules:
 - Retention policy fields:
   - `folder` (required): mailbox name, role, or path (e.g. "INBOX/Alerts")
   - `days` (required): positive integer; emails older than this are deleted on `X`.
+  - `account` (optional): the one configured account the policy is for; without it, every account's.
 
 Please ask me for my email provider, username, and how I store passwords, then generate a config file.
 "#,
@@ -448,6 +474,7 @@ Matching is POSIX leftmost-longest, so `x|xy` matches `xy`. `.` is one byte and 
 
 By default, only the first matching rule applies per email. Set `continue_processing = true` to allow subsequent rules to also match.
 Set `skip_if_to_me = true` to skip a rule when `mail.my_email_regex` matches To or Cc.
+Set `account = "NAME"` to run a rule for the configured [account.NAME] alone (`default` for a legacy [jmap] section); a rule without it runs for every account. A rule naming an account that is not configured, or an unknown key in a rule, its actions or its triage, makes the rules file fail to load.
 
 Please ask me what kinds of emails I receive and how I want them organized, then generate a rules file.
 "#,
@@ -482,8 +509,8 @@ fn print_help_config() {
     println!("[mail]");
     println!("  archive_folder = \"archive\"   # Target folder for 'a' archive action (default: \"archive\")");
     println!("  deleted_folder = \"trash\"     # Target folder for 'd' delete action (default: \"trash\")");
-    println!("  archive_mailbox_id = \"id\"    # Override archive folder by JMAP mailbox ID");
-    println!("  deleted_mailbox_id = \"id\"    # Override deleted folder by JMAP mailbox ID");
+    println!("  archive_mailbox_id = \"id\"    # Override archive folder by JMAP mailbox ID (--cli only)");
+    println!("  deleted_mailbox_id = \"id\"    # Override deleted folder by JMAP mailbox ID (--cli only)");
     println!("  reply_from = \"Name <email>\"  # Override From header for replies/compose/forward");
     println!("  rules_mailbox_regex = \"^INBOX$\"  # Run rules only on matching mailbox names (default: \"^INBOX$\")");
     println!("  my_email_regex = \"^$\"        # Your email addresses for skip_if_to_me rule option (default: \"^$\")");
@@ -504,10 +531,15 @@ fn print_help_config() {
     println!("  secret = \"portal\"                                # The credential portal, mail/NAME (this or password_command)");
     println!("  tls_ca_file = \"/absolute/path/ca.pem\"              # Optional private CA for this HTTPS origin");
     println!("  password_command = \"pass show email/example\"     # Shell command printing the password (or secret)");
+    println!("  reply_from, archive_folder, deleted_folder,      # Optional: [mail]'s keys for this account alone");
+    println!("  archive_mailbox_id, deleted_mailbox_id");
     println!();
     println!("[retention.NAME]                 # Optional folder retention policies");
     println!("  folder = \"Archive\"            # Mailbox name to apply retention (required)");
     println!("  days = 365                   # Expire mail older than this many days (required)");
+    println!(
+        "  account = \"NAME\"             # The one account it is for (default: every account)"
+    );
     println!();
     println!(
         "# `scrolloff` under [ui] and a [theme] section were the terminal's: accepted, ignored."
@@ -622,8 +654,11 @@ fn main() {
             // it in the working directory.
             None => PathBuf::from("rules.toml"),
         });
+    let account_names: Vec<&str> = config.accounts.iter().map(|a| a.name.as_str()).collect();
     let (compiled_rules, custom_headers) = if rules_path.exists() {
-        match rules::load_rules(&rules_path) {
+        let loaded = rules::load_rules(&rules_path)
+            .and_then(|rules| rules::check_accounts(&rules, &account_names).map(|()| rules));
+        match loaded {
             Ok(rules) => {
                 let headers = rules::extract_custom_headers(&rules);
                 eprintln!(
@@ -638,6 +673,9 @@ fn main() {
                 (rules, headers)
             }
             Err(e) => {
+                // Logged too: a window the compositor starts has no
+                // stderr anyone reads.
+                log_warn!("[Main] rules in {} not used: {}", rules_path.display(), e);
                 eprintln!(
                     "Warning: failed to load rules from {}: {}",
                     rules_path.display(),
@@ -653,24 +691,7 @@ fn main() {
     let offline = args.iter().any(|a| a == "--offline");
 
     if args.iter().any(|a| a == "--cli") {
-        let archive_folder = config.mail.archive_folder.clone();
-        let deleted_folder = config.mail.deleted_folder.clone();
-        let archive_mailbox_id = config.mail.archive_mailbox_id.clone();
-        let deleted_mailbox_id = config.mail.deleted_mailbox_id.clone();
-        let rules_mailbox_regex = config.mail.rules_mailbox_regex.clone();
-        let my_email_regex = config.mail.my_email_regex.clone();
-        cli::run_cli(
-            config,
-            compiled_rules,
-            custom_headers,
-            rules_mailbox_regex,
-            my_email_regex,
-            archive_folder,
-            deleted_folder,
-            archive_mailbox_id,
-            deleted_mailbox_id,
-            offline,
-        );
+        cli::run_cli(config, compiled_rules, custom_headers, offline);
         log_info!("[Main] td-mail exiting");
         std::process::exit(0);
     }
@@ -699,14 +720,10 @@ fn main() {
         config.ui.browser,
         config.ui.mouse,
         config.ui.sync_interval_secs,
-        config.mail.archive_folder,
-        config.mail.deleted_folder,
-        config.mail.reply_from,
         config.mail.rules_mailbox_regex,
         config.mail.my_email_regex,
         config.mail.retention_policies,
         compiled_rules,
-        custom_headers,
         config.spam,
         offline,
         config_path,

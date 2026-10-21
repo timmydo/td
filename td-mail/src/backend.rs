@@ -639,6 +639,9 @@ impl From<&RetentionPolicySnapshot> for RetentionPolicyConfig {
             name: value.name.clone(),
             folder: value.folder.clone(),
             days: value.days,
+            // A queued expiry runs in the backend of the account it was
+            // queued for, which had the account's policies alone.
+            account: None,
         }
     }
 }
