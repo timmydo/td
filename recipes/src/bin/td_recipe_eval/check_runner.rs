@@ -11922,7 +11922,6 @@ chmod 755 '{}'
             for check in [
                 "gawk-x86-64-self-test",
                 "make-x86-64-self-test",
-                "zlib-x86-64-self-test",
                 "rust-toolchain",
             ] {
                 assert!(reach.contains_key(check), "{scope}: {reach:?}");

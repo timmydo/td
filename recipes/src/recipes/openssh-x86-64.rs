@@ -225,7 +225,7 @@ mod tests {
                 "missing {required}"
             );
         }
-        for forbidden in ["libressl-x86-64", "zlib-x86-64-self", "rust-toolchain"] {
+        for forbidden in ["libressl-x86-64", "zlib-x86-64", "rust-toolchain"] {
             assert!(
                 !recipe
                     .native_inputs

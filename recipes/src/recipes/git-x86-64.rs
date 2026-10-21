@@ -13,7 +13,7 @@ pub fn recipe() -> Recipe {
     let xglibc = "{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64";
     let curl = "{in:curl-x86-64}";
     let tls = "{in:libressl-x86-64}";
-    let zlib = "{in:zlib-x86-64-self}";
+    let zlib = "{in:zlib-x86-64}";
     let path = format!("{{root}}/wb:{{tools}}:{sbin}");
 
     let mut steps = unpack_into("git-x86-64-source", "{src}");
@@ -285,7 +285,7 @@ pub fn recipe() -> Recipe {
             &[
                 "curl-x86-64",
                 "libressl-x86-64",
-                "zlib-x86-64-self",
+                "zlib-x86-64",
                 "gcc-x86-64-self",
                 "binutils-x86-64-self",
                 "glibc-x86-64",
@@ -314,7 +314,7 @@ mod tests {
                     "gawk-x86-64-self",
                     "curl-x86-64",
                     "libressl-x86-64",
-                    "zlib-x86-64-self",
+                    "zlib-x86-64",
                     "gcc-x86-64-self",
                     "binutils-x86-64-self",
                     "glibc-x86-64",
@@ -346,7 +346,7 @@ mod tests {
             assert!(config.contains(required), "missing Git policy {required}");
         }
         assert!(config.contains("CURL_LDFLAGS = {in:curl-x86-64}/lib/libcurl.a"));
-        assert!(config.contains("override EXTLIBS = {in:zlib-x86-64-self}/lib/libz.a"));
+        assert!(config.contains("override EXTLIBS = {in:zlib-x86-64}/lib/libz.a"));
         assert!(!config.contains("CURLDIR ="));
         assert!(!config.contains("CURL_CFLAGS ="));
         assert!(!config.contains("SANE_TOOL_PATH ="));
@@ -389,7 +389,7 @@ mod tests {
             "-ffile-prefix-map={src}=/td-build",
             "-ffile-prefix-map={in:curl-x86-64}=/td-build/input/curl",
             "-ffile-prefix-map={in:libressl-x86-64}=/td-build/input/libressl",
-            "-ffile-prefix-map={in:zlib-x86-64-self}=/td-build/input/zlib",
+            "-ffile-prefix-map={in:zlib-x86-64}=/td-build/input/zlib",
             "-Wl,--build-id=sha1",
         ] {
             assert!(

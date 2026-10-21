@@ -7,7 +7,7 @@ pub fn recipe() -> Recipe {
     let xglibc = "{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64";
     let curl = "{in:curl-x86-64}";
     let tls = "{in:libressl-x86-64}";
-    let zlib = "{in:zlib-x86-64-self}";
+    let zlib = "{in:zlib-x86-64}";
     let path = format!("{{tools}}:{sbin}");
 
     let mut steps = vec![
@@ -504,7 +504,7 @@ int main(void) {
             &[
                 "curl-x86-64",
                 "libressl-x86-64",
-                "zlib-x86-64-self",
+                "zlib-x86-64",
                 "gcc-x86-64-self",
                 "binutils-x86-64-self",
                 "glibc-x86-64",
@@ -539,7 +539,7 @@ mod tests {
                     "gawk-x86-64-self",
                     "curl-x86-64",
                     "libressl-x86-64",
-                    "zlib-x86-64-self",
+                    "zlib-x86-64",
                     "gcc-x86-64-self",
                     "binutils-x86-64-self",
                     "glibc-x86-64",

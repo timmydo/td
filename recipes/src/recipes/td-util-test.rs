@@ -24,7 +24,7 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 // td-util's own, so no assertion about td-util is graded by one of them: the
 // subject is always invoked by its store path, and a byte comparison is the
 // shell's. The format crossings take oracles td did not write: zlib's own
-// minigzip, compiled here from zlib's source against the post-Rust libz, and a
+// minigzip, compiled here from zlib's source against zlib-x86-64's libz.a, and a
 // newc archive GNU cpio 2.15 wrote.
 pub fn recipe() -> Recipe {
     let bin = "{in:td-util}/bin/td-util";
@@ -32,7 +32,7 @@ pub fn recipe() -> Recipe {
     let sgcc = "{in:gcc-x86-64-self}/stage/td/store/gcc-14.3.0-x86_64-self/bin/gcc";
     let sbin = "{in:binutils-x86-64-self}/bin";
     let xglibc = "{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64";
-    let zlib = "{in:zlib-x86-64-self}";
+    let zlib = "{in:zlib-x86-64}";
     let mut steps = vec![post_rust_tool_farm("{in:gawk-x86-64-self}/bin/gawk")];
 
     steps.push(
@@ -297,7 +297,7 @@ pub fn recipe() -> Recipe {
                 "binutils-x86-64-self",
                 "gcc-x86-64-self",
                 "glibc-x86-64",
-                "zlib-x86-64-self",
+                "zlib-x86-64",
             ],
         ))
         .steps(steps)

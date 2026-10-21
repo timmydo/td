@@ -9,7 +9,7 @@ pub fn recipe() -> Recipe {
     let sbin = "{in:binutils-x86-64-self}/bin";
     let xglibc = "{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64";
     let tls = "{in:libressl-x86-64}";
-    let zlib = "{in:zlib-x86-64-self}";
+    let zlib = "{in:zlib-x86-64}";
     let path = format!("{{root}}/wb:{{tools}}:{sbin}");
 
     let mut steps = unpack_into("curl-x86-64-source", "{src}");
@@ -182,7 +182,7 @@ pub fn recipe() -> Recipe {
             "gawk-x86-64-self",
             &[
                 "libressl-x86-64",
-                "zlib-x86-64-self",
+                "zlib-x86-64",
                 "gcc-x86-64-self",
                 "binutils-x86-64-self",
                 "glibc-x86-64",
@@ -210,7 +210,7 @@ mod tests {
                     "uutils",
                     "gawk-x86-64-self",
                     "libressl-x86-64",
-                    "zlib-x86-64-self",
+                    "zlib-x86-64",
                     "gcc-x86-64-self",
                     "binutils-x86-64-self",
                     "glibc-x86-64",
@@ -252,7 +252,7 @@ mod tests {
             .any(|arg| arg == "--with-openssl={in:libressl-x86-64}"));
         assert!(configure
             .iter()
-            .any(|arg| arg == "--with-zlib={in:zlib-x86-64-self}"));
+            .any(|arg| arg == "--with-zlib={in:zlib-x86-64}"));
     }
 
     #[test]
@@ -275,7 +275,7 @@ mod tests {
             "-ffile-prefix-map={root}=/td-build-root",
             "-ffile-prefix-map={src}=/td-build",
             "-ffile-prefix-map={in:libressl-x86-64}=/td-build/input/libressl",
-            "-ffile-prefix-map={in:zlib-x86-64-self}=/td-build/input/zlib",
+            "-ffile-prefix-map={in:zlib-x86-64}=/td-build/input/zlib",
             "-Wl,--build-id=sha1",
         ] {
             assert!(

@@ -134,11 +134,7 @@ mod tests {
         compile_directory_consumers.dedup();
         assert_eq!(
             compile_directory_consumers,
-            [
-                "curl-x86-64-test",
-                "libressl-x86-64-test",
-                "zlib-x86-64-self-test",
-            ]
+            ["curl-x86-64-test", "libressl-x86-64-test", "zlib-x86-64"]
         );
     }
 
