@@ -17,7 +17,9 @@ pub enum Code {
     Capacity,
     InvalidDomain,
     InvalidAddress,
-    SecondAccount,
+    DuplicateAccount,
+    MissingPostmaster,
+    PostmasterAccount,
     MissingAccount,
     MissingDomain,
     DuplicateDomain,
@@ -32,7 +34,9 @@ impl Code {
             Self::Capacity => "config_route_capacity",
             Self::InvalidDomain => "config_route_invalid_domain",
             Self::InvalidAddress => "config_route_invalid_address",
-            Self::SecondAccount => "config_route_second_account",
+            Self::DuplicateAccount => "config_route_duplicate_account",
+            Self::MissingPostmaster => "config_route_missing_postmaster",
+            Self::PostmasterAccount => "config_route_postmaster_account",
             Self::MissingAccount => "config_route_missing_account",
             Self::MissingDomain => "config_route_missing_domain",
             Self::DuplicateDomain => "config_route_duplicate_domain",
@@ -167,7 +171,8 @@ pub struct Builder<'a> {
     domain_count: usize,
     aliases: &'a mut [AliasSlot],
     alias_count: usize,
-    account: Option<(AccountId, Location)>,
+    accounts: [Option<(AccountId, Location)>; super::identities::MAX_ACCOUNTS],
+    postmaster: Option<(AccountId, Location)>,
     failure: Option<Error>,
 }
 impl<'a> Builder<'a> {
@@ -193,7 +198,8 @@ impl<'a> Builder<'a> {
             domain_count: 0,
             aliases,
             alias_count: 0,
-            account: None,
+            accounts: [None; super::identities::MAX_ACCOUNTS],
+            postmaster: None,
             failure: None,
         })
     }
@@ -229,12 +235,30 @@ impl<'a> Builder<'a> {
         if let Some(e) = self.failure {
             return Err(e);
         }
-        if let Some((_, previous)) = self.account {
-            let mut e = error(Code::SecondAccount, Some(at));
-            e.previous = Some(previous);
+        if let Some((_, previous)) = self
+            .accounts
+            .iter()
+            .flatten()
+            .find(|(id, _)| *id == account)
+        {
+            let mut e = error(Code::DuplicateAccount, Some(at));
+            e.previous = Some(*previous);
             return self.record(Err(e), at);
         }
-        self.account = Some((account, at));
+        let Some(slot) = self.accounts.iter_mut().find(|slot| slot.is_none()) else {
+            return self.record(Err(error(Code::Capacity, Some(at))), at);
+        };
+        *slot = Some((account, at));
+        Ok(())
+    }
+    pub fn postmaster(&mut self, account: AccountId, at: Location) -> Result<(), Error> {
+        if let Some(e) = self.failure {
+            return Err(e);
+        }
+        if self.postmaster.is_some() {
+            return self.record(Err(error(Code::PostmasterAccount, Some(at))), at);
+        }
+        self.postmaster = Some((account, at));
         Ok(())
     }
     pub fn domain(&mut self, name: &str, at: Location) -> Result<(), Error> {
@@ -339,7 +363,23 @@ impl<'a> Builder<'a> {
         if let Some(e) = self.failure {
             return Err(e);
         }
-        let (account, _) = self.account.ok_or(error(Code::MissingAccount, None))?;
+        let mut accounts = self.accounts.iter().flatten();
+        let first = accounts.next().ok_or(error(Code::MissingAccount, None))?.0;
+        let account = match self.postmaster {
+            Some((id, at)) => {
+                if !self
+                    .accounts
+                    .iter()
+                    .flatten()
+                    .any(|(known, _)| *known == id)
+                {
+                    return Err(error(Code::UnknownAccount, Some(at)));
+                }
+                id
+            }
+            None if accounts.next().is_none() => first,
+            None => return Err(error(Code::MissingPostmaster, None)),
+        };
         let text = self.text.get(..self.text_length).ok_or_else(invariant)?;
         let domains = self
             .domains
@@ -357,8 +397,16 @@ impl<'a> Builder<'a> {
         }
         for row in aliases.iter() {
             row.local.get(text)?;
-            if row.account != account {
+            if !self
+                .accounts
+                .iter()
+                .flatten()
+                .any(|(id, _)| *id == row.account)
+            {
                 return Err(error(Code::UnknownAccount, Some(row.location())));
+            }
+            if row.local.get(text)? == b"postmaster" && row.account != account {
+                return Err(error(Code::PostmasterAccount, Some(row.location())));
             }
             if !domains
                 .get(usize::from(row.domain))
@@ -441,6 +489,7 @@ impl fmt::Debug for Routing<'_> {
     }
 }
 impl Routing<'_> {
+    /// The configured postmaster account, never an alias delivery target.
     pub fn account(&self) -> AccountId {
         self.account
     }
@@ -489,7 +538,14 @@ impl Routing<'_> {
                 .cmp(&domain_index)
                 .then(r.local.get(self.text)?.cmp(local)))
         })?;
-        Ok(found.map(|_| self.account))
+        found
+            .map(|index| {
+                self.aliases
+                    .get(index)
+                    .map(|row| row.account)
+                    .ok_or_else(invariant)
+            })
+            .transpose()
     }
 }
 
@@ -535,6 +591,56 @@ mod tests {
         Location {
             line: NonZeroU32::new(line).unwrap(),
             column: 1,
+        }
+    }
+    #[test]
+    fn multiple_accounts_require_explicit_postmaster_and_route_exact_targets() {
+        let second = AccountId::from_bytes([2; 16]);
+        for scenario in 0..4 {
+            let mut text = [0; 1024];
+            let mut domains = [DomainSlot::EMPTY; 2];
+            let mut aliases = [AliasSlot::EMPTY; 4];
+            let mut b = Builder::new(&mut text, &mut domains, &mut aliases).unwrap();
+            b.alias("a@example.test", ACCOUNT, at(1)).unwrap();
+            b.alias("b@example.test", second, at(2)).unwrap();
+            b.domain("example.test", at(3)).unwrap();
+            b.account(second, at(4)).unwrap();
+            b.account(ACCOUNT, at(5)).unwrap();
+            if scenario != 0 {
+                b.postmaster(
+                    if scenario == 2 {
+                        AccountId::from_bytes([3; 16])
+                    } else {
+                        ACCOUNT
+                    },
+                    at(6),
+                )
+                .unwrap();
+            }
+            if scenario == 3 {
+                b.alias("POSTMASTER@example.test", second, at(7)).unwrap();
+            }
+            let routes = match scenario {
+                0 => {
+                    assert_eq!(b.finish().unwrap_err().code, Code::MissingPostmaster);
+                    continue;
+                }
+                2 => {
+                    assert_eq!(b.finish().unwrap_err().code, Code::UnknownAccount);
+                    continue;
+                }
+                3 => {
+                    assert_eq!(b.finish().unwrap_err().code, Code::PostmasterAccount);
+                    continue;
+                }
+                _ => b.finish().unwrap(),
+            };
+            assert_eq!(routes.resolve("a@example.test"), Ok(Some(ACCOUNT)));
+            assert_eq!(routes.resolve("b@example.test"), Ok(Some(second)));
+            assert_eq!(routes.resolve("POSTMASTER"), Ok(Some(ACCOUNT)));
+            assert_eq!(routes.resolve("postmaster@example.test"), Ok(Some(ACCOUNT)));
+            assert_eq!(routes.resolve("b@foreign.test"), Ok(None));
+            assert_eq!(routes.resolve("unknown@example.test"), Ok(None));
         }
     }
     #[test]
@@ -675,7 +781,7 @@ mod tests {
         let mut b = Builder::new(&mut text, &mut domains, &mut aliases).unwrap();
         b.account(ACCOUNT, at(1)).unwrap();
         let e = b.account(ACCOUNT, at(2)).unwrap_err();
-        assert_eq!(e.code, Code::SecondAccount);
+        assert_eq!(e.code, Code::DuplicateAccount);
         assert_eq!(e.previous, Some(at(1)));
         assert_eq!(b.domain("example.test", at(3)), Err(e));
         assert_eq!(b.finish().unwrap_err(), e);
@@ -952,7 +1058,7 @@ mod tests {
             (Code::Capacity, "config_route_capacity"),
             (Code::InvalidDomain, "config_route_invalid_domain"),
             (Code::InvalidAddress, "config_route_invalid_address"),
-            (Code::SecondAccount, "config_route_second_account"),
+            (Code::DuplicateAccount, "config_route_duplicate_account"),
             (Code::MissingAccount, "config_route_missing_account"),
             (Code::MissingDomain, "config_route_missing_domain"),
             (Code::DuplicateDomain, "config_route_duplicate_domain"),

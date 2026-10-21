@@ -93,6 +93,7 @@ omitted when all its fields have defaults.
 | Field | Type/default | Constraint/meaning |
 | --- | --- | --- |
 | `hostname` | DNS text, required | Outbound EHLO and loopback-fixture greeting identity |
+| `postmaster_account` | Account ID text, sole account if omitted | Required with multiple accounts; declared account receiving every reserved postmaster address |
 | `jmap_origin` | Origin text, required | Sole JMAP discovery/HTTP authority; never derived from Host |
 | `online_background` | Boolean, true | Select OnlineBackground or ForegroundOnly resource planning |
 | `public_ipv4` | IP text, absent | Optional IPv4 address for `dns-plan`; never infer it from a wildcard/private bind |
@@ -157,7 +158,9 @@ all three resource planners before a structural candidate can be returned.
 
 ## 3. Account, domains and aliases
 
-Exactly one `[account "ID"]` is required. Its fields are:
+One to 16 `[account "ID"]` stanzas are structurally supported. IDs and
+case-sensitive usernames must be unique. Runtime publication currently
+requires a single account until account-scoped serving is wired. Fields are:
 
 | Field | Type/default | Constraint |
 | --- | --- | --- |

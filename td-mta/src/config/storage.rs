@@ -432,7 +432,7 @@ const _: [(); 1] = [(); (size_of::<Candidate>() <= GLOBAL_BYTES + PLANS_BYTES) a
 const _: [(); 1] = [(); (size_of::<dispatch::Header>() <= 4 * 1024) as usize];
 const _: [(); 1] = [(); (size_of::<super::resources::Validated>() <= PLANS_BYTES) as usize];
 const _: [(); 1] = [(); (size_of::<graph::Header>() <= 1024) as usize];
-const _: [(); 1] = [(); (size_of::<identities::Header>() <= 128) as usize];
+const _: [(); 1] = [(); (size_of::<identities::Header>() <= 1024) as usize];
 const _: [(); 1] =
     [(); (size_of::<super::materialize::ResolvedText>() <= GLOBAL_BYTES + PLANS_BYTES) as usize];
 const _: [(); 1] =

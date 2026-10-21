@@ -344,17 +344,17 @@ account = "0123456789abcdef0123456789abcdef"
 ```
 
 Account labels and alias targets are canonical AccountId strings, independent
-of mail paths. The sole account stanza declares its stable ID. Domain labels
+of mail paths. Each account stanza declares its stable ID. Domain labels
 are served DNS names; alias labels are full addresses, and each alias requires
 exactly one `account` assignment. No folder/forwarding/catch-all fields exist.
-The outer schema rejects absent labels, duplicate or unknown fields and any
-second account stanza. Other account/identity fields are specified in SCHEMA.md; these
+The outer schema rejects absent labels, duplicate or unknown fields and duplicate
+account IDs or usernames. Other account/identity fields are specified in SCHEMA.md; these
 examples are a routing fragment, not a complete runnable configuration.
 The helper accepts typed AccountId values and does not parse those labels.
 
-Exactly one account and at least one served domain are required before a
+One to 16 accounts and at least one served domain are required before a
 routing view exists. Account declaration may follow aliases. Every alias must
-reference the sole account and a declared domain. Conflicting or redundant
+reference a declared account and domain. Conflicting or redundant
 canonical domain/alias declarations are errors, including duplicate aliases
 targeting the same account. Ordinary local-part case remains significant;
 domain case does not. No routing decision uses a display name or filesystem
@@ -395,10 +395,12 @@ the routing key does not replace that inspection record.
 
 ### Postmaster and refusal behavior
 
-Every served domain routes any case of postmaster to the sole account, and
-the domainless `Postmaster` form does so as well. These routes are implicit
-and cannot be disabled. An explicit postmaster alias is permitted but must
-pass the same domain/account checks; it adds no forwarding authority.
+Every served domain routes any case of postmaster to `server.postmaster_account`,
+and the domainless `Postmaster` form does so as well. A single-account
+configuration may omit that setting, defaulting to its sole account; multiple
+accounts require it explicitly. It must name a declared account. These routes
+are implicit and cannot be disabled. An explicit postmaster alias must target
+that same account; it adds no forwarding authority.
 Quoted equivalent local forms with a served domain receive the same reserved
 handling. The domainless exception is only the unquoted `Postmaster` token
 (case-insensitive), as in RFC 5321 §4.1.1.3; quoted domainless forms do not
@@ -663,7 +665,11 @@ public callers.
 
 Account input validates the case-sensitive visible ASCII username
 excluding colon, its 254-byte ceiling, and the 4096-byte display-name
-ceiling. Require exactly one account. Identity inputs carry explicit
+ceiling. The structural account registry holds 1..16 accounts with unique IDs
+and case-sensitive unique usernames. Its bounded inline metadata fits 1 KiB
+inside the existing candidate header and parser workspace reservations. The
+singleton accessor refuses a multi-account registry; indexed account views
+and identity owner IDs preserve explicit account selection. Identity inputs carry explicit
 defaults for name/list selectors and optional absolute signature paths.
 Mailboxes use the shared syntax and size limits while preserving their
 configured visible spelling. Only sending identities reject a decoded
@@ -1353,7 +1359,7 @@ sticky errors, reject internal owner/count mismatch, and retain an independent
 prior candidate across replacement failure. No old generation is mutated.
 
 Complete sealed headers fit 4 KiB; the graph subheader fits 1 KiB and identity
-subheader 128 bytes, within global headroom. Resource plans independently fit
+subheader 1 KiB, within global headroom. Resource plans independently fit
 their 4 KiB partition. Candidate inline ownership plus headers fits global
 headroom plus the plans partition. `allocated_bytes` counts the actual table
 capacities plus the whole candidate header once, replacing the small empty
@@ -1831,3 +1837,19 @@ without treating a ping as a state event. A zero ping interval keeps the stream 
 revocation, disconnect, shutdown or the absolute connection deadline. Each
 output frame has a fixed stall deadline. Event streams do not consume the
 API/upload body permit.
+## Account-scoped identity preparation
+
+`identity_catalog::Catalog::prepare_for_account` and
+`config::preimage::write_for_account` require a declared account and include
+only its identities. Filtering preserves the original global identity index
+for resolved signatures, and keeps identity IDs globally unique. An account's
+visible identity digest does not change when another account's identities
+change. Unknown accounts are errors, not empty or default-account catalogs.
+The existing 64-identity, address-cell and text reservations remain aggregate
+configuration limits, not per-account allowances.
+
+This structural support does not yet enable multiple serving accounts:
+`postgres_runtime_profile` still requires the singleton accessor and rejects
+multi-account configurations before publication. Runtime principal selection,
+SMTP fanout and relay scheduling must replace that restriction together before
+such a configuration can be served.

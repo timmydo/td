@@ -61,8 +61,29 @@ impl Catalog {
         configuration: &ResolvedText,
         crypto: &impl Crypto,
     ) -> Result<Self, PreparationError> {
+        let account = configuration
+            .candidate()
+            .identities()
+            .map_err(|_| Error::Corrupt)?
+            .account()
+            .map_err(|_| Error::Corrupt)?
+            .id;
+        Self::prepare_for_account(configuration, account, crypto)
+    }
+    pub fn prepare_for_account(
+        configuration: &ResolvedText,
+        account: AccountId,
+        crypto: &impl Crypto,
+    ) -> Result<Self, PreparationError> {
+        preimage::write(configuration, |_| Ok::<_, td_crypto::Error>(())).map_err(|error| {
+            match error {
+                preimage::Error::Sink(error) => PreparationError::from(error),
+                preimage::Error::Invariant => Error::Corrupt.into(),
+                preimage::Error::Invalid(error) => PreparationError::Representation(error),
+            }
+        })?;
         let mut hash = crypto.sha256()?;
-        preimage::write(configuration, |bytes| hash.update(bytes)).map_err(
+        preimage::write_for_account(configuration, account, |bytes| hash.update(bytes)).map_err(
             |error| match error {
                 preimage::Error::Sink(error) => PreparationError::from(error),
                 preimage::Error::Invariant => Error::Corrupt.into(),
@@ -74,7 +95,6 @@ impl Catalog {
             .candidate()
             .identities()
             .map_err(|_| Error::Corrupt)?;
-        let account = records.account().map_err(|_| Error::Corrupt)?.id;
         let mut bytes = Vec::new();
         bytes
             .try_reserve_exact(MAX_BYTES)
@@ -91,6 +111,9 @@ impl Catalog {
                     .identity(index)
                     .map_err(|_| Error::Corrupt)?
                     .ok_or(Error::Corrupt)?;
+                if record.account != account {
+                    continue;
+                }
                 let signatures = configuration
                     .signatures(index)
                     .map_err(|_| Error::Corrupt)?
@@ -222,6 +245,56 @@ mod tests {
         catalog.state(snapshot(catalog.account(), epoch)).unwrap()
     }
     use crate::config::preimage::tests::{lock, resolved, BASE};
+    #[test]
+    fn multiple_accounts_have_private_objects_and_independent_visible_state() {
+        let _lock = lock();
+        let a = AccountId::from_bytes([0xaa; 16]);
+        let b = AccountId::from_bytes([0xcc; 16]);
+        let source = format!("{}\n[account \"cccccccccccccccccccccccccccccccc\"]\nusername = \"other-user\"\n[identity \"dddddddddddddddddddddddddddddddd\"]\naccount = \"cccccccccccccccccccccccccccccccc\"\nemail = \"other@example.test\"\ntext_signature_file = \"/other-signature\"\n", BASE.replace("[server]", "[server]\npostmaster_account = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\""));
+        let config = resolved(&source);
+        assert!(Catalog::prepare(&config, &td_crypto::Provider).is_err());
+        let first = Catalog::prepare_for_account(&config, a, &td_crypto::Provider).unwrap();
+        let second = Catalog::prepare_for_account(&config, b, &td_crypto::Provider).unwrap();
+        assert_eq!(
+            first.ids().collect::<Vec<_>>(),
+            vec![IdentityId::from_bytes([0xbb; 16])]
+        );
+        assert_eq!(
+            second.ids().collect::<Vec<_>>(),
+            vec![IdentityId::from_bytes([0xdd; 16])]
+        );
+        assert!(first
+            .object(IdentityId::from_bytes([0xdd; 16]))
+            .unwrap()
+            .is_none());
+        assert!(second
+            .object(IdentityId::from_bytes([0xbb; 16]))
+            .unwrap()
+            .is_none());
+        let object = std::str::from_utf8(
+            second
+                .object(IdentityId::from_bytes([0xdd; 16]))
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(object.contains("other@example.test"));
+        assert!(object.contains("T\\n"));
+        let changed = resolved(&source.replace("other@example.test", "new@example.test"));
+        let same_a = Catalog::prepare_for_account(&changed, a, &td_crypto::Provider).unwrap();
+        let changed_b = Catalog::prepare_for_account(&changed, b, &td_crypto::Provider).unwrap();
+        assert_eq!(first, same_a);
+        assert_ne!(second, changed_b);
+        assert!(Catalog::prepare_for_account(
+            &config,
+            AccountId::from_bytes([0xee; 16]),
+            &td_crypto::Provider
+        )
+        .is_err());
+        assert!(second
+            .state(snapshot(a, StoreEpoch::from_bytes([1; 16])))
+            .is_err());
+    }
     #[test]
     fn default_objects_are_read_only_and_exclude_private_configuration() {
         let _lock = lock();

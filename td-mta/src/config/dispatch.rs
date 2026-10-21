@@ -319,7 +319,7 @@ fn singleton(section: Section) -> Option<usize> {
         Section::Server => Some(0),
         Section::Paths => Some(1),
         Section::Logging => Some(2),
-        Section::Account => Some(3),
+
         Section::Relay => Some(4),
         Section::Acme => Some(5),
         Section::Resource(resources::Section::Limits) => Some(6),
@@ -751,6 +751,15 @@ fn apply_context(
 ) -> Result<(), Error> {
     match c.section {
         Section::Server => {
+            if c.text("postmaster_account")?.is_some() {
+                targets
+                    .policy
+                    .postmaster(
+                        c.account("postmaster_account")?,
+                        c.at("postmaster_account")?,
+                    )
+                    .map_err(Error::from_policy)?;
+            }
             let hostname = c.required_text("hostname")?;
             values::dns_name(hostname).map_err(|_| c.value_error("hostname"))?;
             let origin = c.required_text("jmap_origin")?;
@@ -1326,7 +1335,6 @@ certificate = "public"
         let singletons = [
             ("server", "hostname = \"mail.example.test\"\njmap_origin = \"https://jmap.example.test\"\n"),
             ("paths", ""), ("logging", ""),
-            ("account \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"", "username = \"operator\"\n"),
             ("relay", "host = \"relay.example.test\"\nport = 465\nusername = \"operator\"\npassword_file = \"/password\"\n"),
             ("acme", "directory = \"https://acme.example.test/directory\"\ncontact = \"operator@example.test\"\nterms_accepted = true\n"),
             ("limits", ""), ("disk", ""), ("work", ""), ("network", ""),

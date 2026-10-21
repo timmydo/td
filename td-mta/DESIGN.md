@@ -1752,9 +1752,10 @@ Do not advertise SMTPUTF8, CHUNKING, BINARYMIME, DSN, or AUTH in v1 reception.
 Local configured addresses use ASCII domains/local-parts; domains compare
 case-insensitively, while ordinary local-parts match aliases case-sensitively.
 Reserve case-insensitive `postmaster` at every served domain and the SMTP
-domainless Postmaster form, routing both to the sole account. Configuration
-must validate that route; it cannot disable it or redirect it outside the
-account. Support VRFY with the standard non-enumerating 252 response.
+domainless Postmaster form, routing both to the configured postmaster account.
+Configuration defaults that account only for a singleton account registry;
+multiple accounts require an explicit declared `server.postmaster_account`.
+Configuration cannot disable the route or redirect it outside that account. Support VRFY with the standard non-enumerating 252 response.
 Unicode message display names and MIME content remain supported.
 
 Reject unknown/nonlocal recipients at RCPT. Resolve accepted aliases to stable

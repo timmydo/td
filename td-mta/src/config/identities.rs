@@ -6,6 +6,7 @@ use std::{
     num::{NonZeroU32, NonZeroU64},
 };
 
+pub const MAX_ACCOUNTS: usize = 16;
 pub const MAX_ADDRESS_CELLS: usize = identity::MAX_IDENTITIES * identity::MAX_ADDRESSES * 2;
 const NONE: u16 = u16::MAX;
 const ORIGIN: Location = Location {
@@ -219,7 +220,7 @@ pub struct Builder<'a> {
     addresses: &'a mut [AddressSlot],
     identity_count: usize,
     address_count: usize,
-    account: Option<Account>,
+    accounts: [Option<Account>; MAX_ACCOUNTS],
     owner: NonZeroU64,
     failure: Option<Error>,
 }
@@ -245,7 +246,7 @@ impl<'a> Builder<'a> {
             addresses,
             identity_count: 0,
             address_count: 0,
-            account: None,
+            accounts: [None; MAX_ACCOUNTS],
             owner: arena.owner(),
             failure: None,
         })
@@ -311,7 +312,11 @@ impl<'a> Builder<'a> {
         at: Location,
     ) -> Result<(), Error> {
         self.operation(arena, at, |this, arena| {
-            if let Some(old) = this.account {
+            let text = arena.borrowed_view().map_err(|_| invariant())?;
+            for old in this.accounts.iter().flatten() {
+                if old.id != id && read(text, this.owner, old.username)? != username {
+                    continue;
+                }
                 return Err(Error {
                     code: Code::DuplicateAccount,
                     location: Some(at),
@@ -326,10 +331,15 @@ impl<'a> Builder<'a> {
             {
                 return Err(err(Code::Username, Some(at)));
             }
+            let index = this
+                .accounts
+                .iter()
+                .position(Option::is_none)
+                .ok_or_else(|| err(Code::Capacity, Some(at)))?;
             check_name(name, at)?;
             let username = store(arena, username, at)?;
             let name = store(arena, name, at)?;
-            this.account = Some(Account {
+            *this.accounts.get_mut(index).ok_or_else(invariant)? = Some(Account {
                 id,
                 username,
                 name,
@@ -451,9 +461,9 @@ impl<'a> Builder<'a> {
         if let Some(e) = self.failure {
             return Err(e);
         }
-        let account = self
-            .account
-            .ok_or_else(|| err(Code::MissingAccount, None))?;
+        if self.accounts.iter().all(Option::is_none) {
+            return Err(err(Code::MissingAccount, None));
+        }
         if self.identity_count == 0 {
             return Err(err(Code::MissingIdentity, None));
         }
@@ -469,7 +479,12 @@ impl<'a> Builder<'a> {
             if !slot.declared {
                 return Err(err(Code::UnknownIdentity, Some(slot.location)));
             }
-            if slot.account != account.id {
+            if !self
+                .accounts
+                .iter()
+                .flatten()
+                .any(|account| account.id == slot.account)
+            {
                 return Err(err(Code::UnknownAccount, Some(slot.location)));
             }
             for (chain, enabled) in slot.chains.iter().zip([slot.reply, slot.bcc]) {
@@ -486,7 +501,7 @@ impl<'a> Builder<'a> {
         Ok(Records {
             identities,
             addresses,
-            account,
+            accounts: self.accounts,
             owner: self.owner,
         })
     }
@@ -525,7 +540,7 @@ fn store(arena: &mut text::Builder<'_>, input: &str, at: Location) -> Result<tex
 pub struct Records<'a> {
     identities: &'a mut [IdentitySlot],
     addresses: &'a [AddressSlot],
-    account: Account,
+    accounts: [Option<Account>; MAX_ACCOUNTS],
     owner: NonZeroU64,
 }
 impl fmt::Debug for Records<'_> {
@@ -544,7 +559,7 @@ impl<'a> Records<'a> {
         Ok(View {
             identities: self.identities,
             addresses: self.addresses,
-            account: self.account,
+            accounts: self.accounts,
             owner: self.owner,
             text,
         })
@@ -554,7 +569,7 @@ impl<'a> Records<'a> {
 pub struct View<'s, 't> {
     identities: &'s [IdentitySlot],
     addresses: &'s [AddressSlot],
-    account: Account,
+    accounts: [Option<Account>; MAX_ACCOUNTS],
     text: text::View<'t>,
     owner: NonZeroU64,
 }
@@ -576,6 +591,7 @@ impl fmt::Debug for AccountView<'_> {
 }
 pub struct IdentityView<'s, 't> {
     pub id: IdentityId,
+    pub account: AccountId,
     pub name: &'t str,
     pub email: &'t str,
     pub reply_to: Option<AddressIter<'s, 't>>,
@@ -595,12 +611,31 @@ impl<'s, 't> View<'s, 't> {
     pub fn is_empty(self) -> bool {
         self.identities.is_empty()
     }
+    /// The legacy singleton accessor refuses ambiguity rather than selecting an owner.
     pub fn account(self) -> Result<AccountView<'t>, Error> {
-        Ok(AccountView {
-            id: self.account.id,
-            username: read(self.text, self.owner, self.account.username)?,
-            name: read(self.text, self.owner, self.account.name)?,
-        })
+        if self.account_count() != 1 {
+            return Err(err(Code::DuplicateAccount, None));
+        }
+        self.account_at(0)?.ok_or_else(invariant)
+    }
+    pub fn account_count(self) -> usize {
+        self.accounts.iter().flatten().count()
+    }
+    pub fn account_at(self, index: usize) -> Result<Option<AccountView<'t>>, Error> {
+        let Some(account) = self.accounts.get(index).and_then(Option::as_ref) else {
+            return Ok(None);
+        };
+        Ok(Some(AccountView {
+            id: account.id,
+            username: read(self.text, self.owner, account.username)?,
+            name: read(self.text, self.owner, account.name)?,
+        }))
+    }
+    pub fn contains_account(self, id: AccountId) -> bool {
+        self.accounts
+            .iter()
+            .flatten()
+            .any(|account| account.id == id)
     }
     pub fn identity(self, index: usize) -> Result<Option<IdentityView<'s, 't>>, Error> {
         let Some(slot) = self.identities.get(index) else {
@@ -622,6 +657,7 @@ impl<'s, 't> View<'s, 't> {
         };
         Ok(Some(IdentityView {
             id: slot.id,
+            account: slot.account,
             name: read(self.text, self.owner, slot.name)?,
             email: read(self.text, self.owner, slot.email)?,
             reply_to: make_list(List::ReplyTo, slot.reply)?,
@@ -696,7 +732,7 @@ impl<'t> Iterator for AddressIter<'_, 't> {
 pub(super) struct Header {
     identities: usize,
     addresses: usize,
-    account: Account,
+    accounts: [Option<Account>; MAX_ACCOUNTS],
     owner: NonZeroU64,
 }
 impl Records<'_> {
@@ -704,7 +740,7 @@ impl Records<'_> {
         Header {
             identities: self.identities.len(),
             addresses: self.addresses.len(),
-            account: self.account,
+            accounts: self.accounts,
             owner: self.owner,
         }
     }
@@ -786,7 +822,7 @@ impl Header {
         Ok(View {
             identities: identities.get(..self.identities).ok_or_else(invariant)?,
             addresses: addresses.get(..self.addresses).ok_or_else(invariant)?,
-            account: self.account,
+            accounts: self.accounts,
             owner: self.owner,
             text,
         })
@@ -832,6 +868,76 @@ mod tests {
             vec![IdentitySlot::EMPTY; 4],
             vec![AddressSlot::EMPTY; 40],
         )
+    }
+    #[test]
+    fn account_registry_bounds_duplicates_and_identity_ownership() {
+        let _lock = lock();
+        for duplicate in [true, false] {
+            let (mut bytes, mut ids, mut addresses) = storage();
+            let mut arena = text::Builder::new(&mut bytes).unwrap();
+            let mut b = Builder::new(&arena, &mut ids, &mut addresses).unwrap();
+            b.account(&mut arena, account(1), "owner", "", at(1))
+                .unwrap();
+            let error = b
+                .account(
+                    &mut arena,
+                    if duplicate { account(1) } else { account(2) },
+                    if duplicate { "different" } else { "owner" },
+                    "",
+                    at(2),
+                )
+                .unwrap_err();
+            assert_eq!(error.code, Code::DuplicateAccount);
+            assert_eq!(error.previous, Some(at(1)));
+            assert_eq!(b.finish().unwrap_err(), error);
+        }
+        let (mut bytes, mut ids, mut addresses) = storage();
+        let mut arena = text::Builder::new(&mut bytes).unwrap();
+        let mut b = Builder::new(&arena, &mut ids, &mut addresses).unwrap();
+        for n in 0..MAX_ACCOUNTS {
+            b.account(
+                &mut arena,
+                account(n as u8),
+                &format!("user{n}"),
+                "",
+                at(n as u32 + 1),
+            )
+            .unwrap();
+        }
+        let error = b
+            .account(&mut arena, account(100), "overflow", "", at(100))
+            .unwrap_err();
+        assert_eq!(error.code, Code::Capacity);
+        assert_eq!(b.finish().unwrap_err(), error);
+
+        let (mut bytes, mut ids, mut addresses) = storage();
+        let mut arena = text::Builder::new(&mut bytes).unwrap();
+        let mut b = Builder::new(&arena, &mut ids, &mut addresses).unwrap();
+        b.account(&mut arena, account(1), "owner", "A", at(1))
+            .unwrap();
+        b.account(&mut arena, account(2), "Owner", "B", at(2))
+            .unwrap();
+        b.identity(&mut arena, input(1), at(3)).unwrap();
+        b.identity(
+            &mut arena,
+            IdentityInput {
+                account: account(2),
+                ..input(2)
+            },
+            at(4),
+        )
+        .unwrap();
+        let records = b.finish().unwrap();
+        let view = records.view(arena.freeze().unwrap()).unwrap();
+        assert_eq!(view.account_count(), 2);
+        assert_eq!(view.account().unwrap_err().code, Code::DuplicateAccount);
+        assert_eq!(view.account_at(0).unwrap().unwrap().username, "owner");
+        assert_eq!(view.account_at(1).unwrap().unwrap().username, "Owner");
+        assert!(view.account_at(2).unwrap().is_none());
+        assert!(view.account_at(usize::MAX).unwrap().is_none());
+        assert_eq!(view.identity(0).unwrap().unwrap().account, account(1));
+        assert_eq!(view.identity(1).unwrap().unwrap().account, account(2));
+        assert!(!view.contains_account(account(3)));
     }
     #[test]
     fn forward_lists_keep_order_and_null_empty_names_after_identity_sort() {
@@ -1101,7 +1207,7 @@ mod tests {
         let _lock = lock();
         assert!(std::mem::size_of::<IdentitySlot>() <= 128);
         assert!(std::mem::size_of::<AddressSlot>() <= 32);
-        assert!(std::mem::size_of::<Builder<'_>>() <= 256);
+        assert!(std::mem::size_of::<Builder<'_>>() <= 1024);
         let mut bytes = vec![0; text::MAX_BYTES];
         let mut ids = vec![IdentitySlot::EMPTY; identity::MAX_IDENTITIES];
         let mut addresses = vec![AddressSlot::EMPTY; MAX_ADDRESS_CELLS];

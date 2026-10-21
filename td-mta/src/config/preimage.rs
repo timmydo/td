@@ -1,6 +1,6 @@
 //! Bounded visible-identity assembly for a trusted control-worker sink.
 use super::{identity, materialize};
-use crate::ids::IdentityId;
+use crate::ids::{AccountId, IdentityId};
 use std::{fmt, mem::size_of};
 
 const ADDRESS_COUNT: usize = super::identities::MAX_ADDRESS_CELLS;
@@ -81,10 +81,30 @@ pub fn write<E>(
     resolved: &materialize::ResolvedText,
     sink: impl FnMut(&[u8]) -> Result<(), E>,
 ) -> Result<usize, Error<E>> {
+    write_selected(resolved, None, sink)
+}
+
+/// Encode only identities owned by the selected, declared account.
+pub fn write_for_account<E>(
+    resolved: &materialize::ResolvedText,
+    account: AccountId,
+    sink: impl FnMut(&[u8]) -> Result<(), E>,
+) -> Result<usize, Error<E>> {
+    write_selected(resolved, Some(account), sink)
+}
+
+fn write_selected<E>(
+    resolved: &materialize::ResolvedText,
+    account: Option<AccountId>,
+    sink: impl FnMut(&[u8]) -> Result<(), E>,
+) -> Result<usize, Error<E>> {
     let records = resolved
         .candidate()
         .identities()
         .map_err(|_| Error::Invariant)?;
+    if account.is_some_and(|id| !records.contains_account(id)) {
+        return Err(Error::Invariant);
+    }
     let count = records.len();
     if count > identity::MAX_IDENTITIES {
         return Err(Error::Invariant);
@@ -97,6 +117,9 @@ pub fn write<E>(
             .identity(index)
             .map_err(|_| Error::Invariant)?
             .ok_or(Error::Invariant)?;
+        if account.is_some_and(|id| record.account != id) {
+            continue;
+        }
         for (kind, list) in [record.reply_to, record.bcc].into_iter().enumerate() {
             let Some(list) = list else { continue };
             let start = used;
@@ -125,11 +148,15 @@ pub fn write<E>(
     }
     let addresses = addresses.get(..used).ok_or(Error::Invariant)?;
     let mut identities = [EMPTY_IDENTITY; identity::MAX_IDENTITIES];
+    let mut selected = 0usize;
     for index in 0..count {
         let record = records
             .identity(index)
             .map_err(|_| Error::Invariant)?
             .ok_or(Error::Invariant)?;
+        if account.is_some_and(|id| record.account != id) {
+            continue;
+        }
         let signatures = resolved
             .signatures(index)
             .map_err(|_| Error::Invariant)?
@@ -145,7 +172,7 @@ pub fn write<E>(
             .ok_or(Error::Invariant)?
             .borrow(addresses)
             .ok_or(Error::Invariant)?;
-        *identities.get_mut(index).ok_or(Error::Invariant)? = identity::Identity {
+        *identities.get_mut(selected).ok_or(Error::Invariant)? = identity::Identity {
             id: record.id,
             name: record.name,
             email: record.email,
@@ -154,8 +181,9 @@ pub fn write<E>(
             text_signature: signatures.text,
             html_signature: signatures.html,
         };
+        selected += 1;
     }
-    identity::write_preimage(identities.get(..count).ok_or(Error::Invariant)?, sink).map_err(
+    identity::write_preimage(identities.get(..selected).ok_or(Error::Invariant)?, sink).map_err(
         |error| match error {
             identity::WriteError::Invalid(error) => Error::Invalid(error),
             identity::WriteError::Sink(error) => Error::Sink(error),

@@ -201,6 +201,13 @@ impl<'a> Builder<'a> {
         let result = self.routes.account(id, at).map_err(route_error);
         self.record(result)
     }
+    pub fn postmaster(&mut self, id: AccountId, at: Location) -> Result<(), Error> {
+        if let Some(e) = self.failure {
+            return Err(e);
+        }
+        let result = self.routes.postmaster(id, at).map_err(route_error);
+        self.record(result)
+    }
     pub fn alias(&mut self, address: &str, id: AccountId, at: Location) -> Result<(), Error> {
         if let Some(e) = self.failure {
             return Err(e);
@@ -792,7 +799,7 @@ mod tests {
     fn full_domain_count_uses_one_default_hostname_and_fits_policy_partition() {
         let _lock = lock();
         assert!(std::mem::size_of::<Slot>() <= 64);
-        assert!(std::mem::size_of::<Builder<'_>>() <= 256);
+        assert!(std::mem::size_of::<Builder<'_>>() <= 1024);
         let mut s = Storage::new(routing::MAX_DOMAINS);
         let mut arena = text::Builder::new(&mut s.text).unwrap();
         let mut b = Builder::new(
