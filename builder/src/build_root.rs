@@ -541,22 +541,33 @@ enum Companion {
 }
 
 /// Whether `path` is the debug companion of a runtime in the output at `top`:
-/// a non-executable, debug-only (`--only-keep-debug`) `lib/debug/<rel>.debug`
-/// that pairs with a regular file `<rel>` inside the output. A companion
+/// a non-executable, debug-only (`--only-keep-debug`) `<prefix>/lib/debug/
+/// <rel>.debug` that pairs with a regular file `<prefix>/<rel>` inside the
+/// output, under the nearest enclosing `lib/debug`. The prefix is empty
+/// for most outputs and the staged install prefix for glibc's. A companion
 /// keeps its runtime's program headers over NOBITS sections, so its
 /// interpreter and dynamic ranges hold no loader data. A named
 /// line-attribution exception's companion does not pair here; no recipe in
 /// the root has one.
 fn companion(top: &Path, path: &Path) -> Companion {
-    let Some(rel) = path
-        .strip_prefix(top.join("lib/debug"))
-        .ok()
-        .and_then(|rel| rel.to_str())
-        .and_then(|rel| rel.strip_suffix(".debug"))
+    let Some((prefix, rel)) = path
+        .ancestors()
+        .skip(1)
+        .take_while(|dir| dir.starts_with(top))
+        .find(|dir| dir.ends_with("lib/debug"))
+        .and_then(|dir| {
+            let prefix = dir.parent()?.parent()?;
+            let rel = path
+                .strip_prefix(dir)
+                .ok()?
+                .to_str()?
+                .strip_suffix(".debug")?;
+            prefix.starts_with(top).then_some((prefix, rel))
+        })
     else {
         return Companion::No;
     };
-    let runtime = top.join(rel);
+    let runtime = prefix.join(rel);
     let why = (|| {
         if !fs::symlink_metadata(&runtime)
             .map_err(|e| format!("no runtime {}: {e}", runtime.display()))?
@@ -1008,6 +1019,47 @@ mod tests {
         assert_eq!(companion(&out, &debug), Companion::Paired);
         assert_eq!(companion(&out, &out.join("bin/tool")), Companion::No);
         check_output(&root, &output, &[], dir.path()).unwrap();
+        // Under a staged install prefix, as glibc's, the nearest lib/debug
+        // pairs with the runtime beside it.
+        let staged = out.join("stage/td/store/p");
+        fs::create_dir_all(staged.join("lib/debug/bin")).unwrap();
+        fs::create_dir_all(staged.join("bin")).unwrap();
+        fs::copy(out.join("bin/tool"), staged.join("bin/tool")).unwrap();
+        let staged_debug = staged.join("lib/debug/bin/tool.debug");
+        fs::write(&staged_debug, &companion_bytes).unwrap();
+        assert_eq!(companion(&out, &staged_debug), Companion::Paired);
+        check_output(&root, &output, &[], dir.path()).unwrap();
+        let staged_unpaired = |path: &Path, why: &str| match companion(&out, path) {
+            Companion::Unpaired(reason) => assert!(reason.contains(why), "{reason}"),
+            other => panic!("expected an unpaired verdict ({why}), got {other:?}"),
+        };
+        // A staged companion with no runtime beside it, or with a symlink
+        // there, is not one.
+        fs::remove_file(staged.join("bin/tool")).unwrap();
+        staged_unpaired(&staged_debug, "no runtime");
+        std::os::unix::fs::symlink(out.join("bin/tool"), staged.join("bin/tool")).unwrap();
+        staged_unpaired(&staged_debug, "is not a regular file");
+        fs::remove_file(staged.join("bin/tool")).unwrap();
+        fs::copy(out.join("bin/tool"), staged.join("bin/tool")).unwrap();
+        // Nested lib/debug directories pair with the nearest only: the
+        // outer one's runtime, staged/x/lib/debug/bin/tool, is not
+        // consulted, and the nearest one's runtime is missing.
+        let nested = staged.join("lib/debug/x/lib/debug/bin/tool.debug");
+        fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        fs::write(&nested, &companion_bytes).unwrap();
+        fs::create_dir_all(staged.join("x/lib/debug/bin")).unwrap();
+        fs::copy(out.join("bin/tool"), staged.join("x/lib/debug/bin/tool")).unwrap();
+        staged_unpaired(
+            &nested,
+            &format!(
+                "no runtime {}",
+                staged.join("lib/debug/x/bin/tool").display()
+            ),
+        );
+        fs::create_dir_all(staged.join("lib/debug/x/bin")).unwrap();
+        fs::copy(out.join("bin/tool"), staged.join("lib/debug/x/bin/tool")).unwrap();
+        assert_eq!(companion(&out, &nested), Companion::Paired);
+        fs::remove_dir_all(out.join("stage")).unwrap();
         // Judged itself, the same bytes are refused: this was the failure.
         fs::rename(out.join("bin/tool"), out.join("bin/moved")).unwrap();
         let error = check_output(&root, &output, &[], dir.path()).unwrap_err();
