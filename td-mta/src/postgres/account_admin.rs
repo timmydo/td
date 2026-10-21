@@ -23,6 +23,9 @@ use td_mta::{
 pub(super) enum Command {
     Create,
     Update,
+    IdentityAdd,
+    IdentityUpdate,
+    IdentityRemove,
     AliasAdd,
     AliasRemove,
     Apply,
@@ -32,6 +35,9 @@ pub(super) enum Command {
 impl Command {
     pub(super) fn parse(value: &OsStr) -> Option<Self> {
         Some(match value.to_str()? {
+            "account-identity-add" => Self::IdentityAdd,
+            "account-identity-update" => Self::IdentityUpdate,
+            "account-identity-remove" => Self::IdentityRemove,
             "account-create" => Self::Create,
             "account-update" => Self::Update,
             "account-alias-add" => Self::AliasAdd,
@@ -44,6 +50,9 @@ impl Command {
     }
     fn name(self) -> &'static str {
         match self {
+            Self::IdentityAdd => "postgres-account-identity-add",
+            Self::IdentityUpdate => "postgres-account-identity-update",
+            Self::IdentityRemove => "postgres-account-identity-remove",
             Self::Create => "postgres-account-create",
             Self::Update => "postgres-account-update",
             Self::AliasAdd => "postgres-account-alias-add",
@@ -59,6 +68,7 @@ struct Options {
     operation: Option<String>,
     epoch: Option<StoreEpoch>,
     account: Option<AccountId>,
+    identity: Option<IdentityId>,
     address: Option<String>,
     name: Option<String>,
     username: Option<String>,
@@ -69,6 +79,7 @@ fn arguments(command: Command, mut args: impl Iterator<Item = OsString>) -> Opti
         operation: None,
         epoch: None,
         account: None,
+        identity: None,
         address: None,
         name: None,
         username: None,
@@ -90,7 +101,12 @@ fn arguments(command: Command, mut args: impl Iterator<Item = OsString>) -> Opti
             "--account"
                 if matches!(
                     command,
-                    Command::Update | Command::AliasAdd | Command::AliasRemove
+                    Command::Update
+                        | Command::AliasAdd
+                        | Command::AliasRemove
+                        | Command::IdentityAdd
+                        | Command::IdentityUpdate
+                        | Command::IdentityRemove
                 ) && o.account.is_none() =>
             {
                 o.account = Some(AccountId::parse(&value).ok()?)
@@ -98,13 +114,29 @@ fn arguments(command: Command, mut args: impl Iterator<Item = OsString>) -> Opti
             "--address"
                 if matches!(
                     command,
-                    Command::Create | Command::AliasAdd | Command::AliasRemove
+                    Command::Create
+                        | Command::AliasAdd
+                        | Command::AliasRemove
+                        | Command::IdentityAdd
+                        | Command::IdentityUpdate
                 ) && o.address.is_none() =>
             {
                 o.address = Some(value)
             }
+            "--identity"
+                if matches!(command, Command::IdentityUpdate | Command::IdentityRemove)
+                    && o.identity.is_none() =>
+            {
+                o.identity = Some(IdentityId::parse(&value).ok()?)
+            }
             "--name"
-                if matches!(command, Command::Create | Command::Update) && o.name.is_none() =>
+                if matches!(
+                    command,
+                    Command::Create
+                        | Command::Update
+                        | Command::IdentityAdd
+                        | Command::IdentityUpdate
+                ) && o.name.is_none() =>
             {
                 o.name = Some(value)
             }
@@ -120,12 +152,20 @@ fn arguments(command: Command, mut args: impl Iterator<Item = OsString>) -> Opti
         || (command != Command::List && o.operation.is_none())
         || (matches!(
             command,
-            Command::Update | Command::AliasAdd | Command::AliasRemove
+            Command::Update
+                | Command::AliasAdd
+                | Command::AliasRemove
+                | Command::IdentityAdd
+                | Command::IdentityUpdate
+                | Command::IdentityRemove
         ) && o.account.is_none())
         || (matches!(
             command,
-            Command::Create | Command::AliasAdd | Command::AliasRemove
+            Command::Create | Command::AliasAdd | Command::AliasRemove | Command::IdentityAdd
         ) && o.address.is_none())
+        || (matches!(command, Command::IdentityUpdate | Command::IdentityRemove)
+            && o.identity.is_none())
+        || (command == Command::IdentityUpdate && o.name.is_none() && o.address.is_none())
         || (command == Command::Update && o.name.is_none() && o.username.is_none())
     {
         return None;
@@ -218,10 +258,10 @@ fn classify(error: admin::Error) -> AttemptError {
             "account-admin",
             match error {
                 Error::Edit(td_mta::account_configuration::Error::Missing) => {
-                    "account-or-alias-not-found"
+                    "account-alias-or-identity-not-found"
                 }
                 Error::Edit(td_mta::account_configuration::Error::Conflict) => {
-                    "account-or-alias-conflict"
+                    "account-alias-or-identity-conflict"
                 }
                 Error::MissingSelection => "no-selected-configuration",
                 Error::Capacity => "capacity",
@@ -268,6 +308,22 @@ fn execute(command: Command, o: &Options) -> Result<(), (&'static str, &'static 
         };
         let address = o.address.as_deref().unwrap_or("");
         let edit = match command {
+            Command::IdentityAdd => Edit::IdentityAdd {
+                account,
+                identity: IdentityId::from_bytes(random()?),
+                address,
+                name: o.name.as_deref().unwrap_or(address),
+            },
+            Command::IdentityUpdate => Edit::IdentityUpdate {
+                account,
+                identity: o.identity.ok_or(("arguments", "identity-required"))?,
+                address: o.address.as_deref(),
+                name: o.name.as_deref(),
+            },
+            Command::IdentityRemove => Edit::IdentityRemove {
+                account,
+                identity: o.identity.ok_or(("arguments", "identity-required"))?,
+            },
             Command::Create => Edit::Create {
                 account,
                 identity: IdentityId::from_bytes(random()?),
@@ -423,6 +479,42 @@ mod tests {
             Command::Apply,
             base.into_iter()
                 .chain(["--operation-file", "/private/second"])
+                .map(OsString::from)
+        )
+        .is_none());
+    }
+    #[test]
+    fn identity_options_require_owner_and_explicit_changes() {
+        let base = [
+            "--connection-file",
+            "/private/connection",
+            "--operation-file",
+            "/private/op",
+            "--account",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--identity",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ];
+        assert!(arguments(
+            Command::IdentityRemove,
+            base.map(OsString::from).into_iter()
+        )
+        .is_some());
+        assert!(arguments(
+            Command::IdentityUpdate,
+            base.map(OsString::from).into_iter()
+        )
+        .is_none());
+        assert!(arguments(Command::IdentityAdd, base.map(OsString::from).into_iter()).is_none());
+        assert!(arguments(
+            Command::IdentityUpdate,
+            base.into_iter().chain(["--name", ""]).map(OsString::from)
+        )
+        .is_some());
+        assert!(arguments(
+            Command::IdentityRemove,
+            base.into_iter()
+                .chain(["--address", "sender@example.test"])
                 .map(OsString::from)
         )
         .is_none());

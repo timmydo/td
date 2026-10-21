@@ -1525,6 +1525,10 @@ postmaster when a second is added. `account-apply` resumes the same operation;
 `account-operation-inspect` resolves its historical selection receipt.
 Concurrent edits conflict rather than overwriting a newer generation.
 `account-list` reports selected account, alias and identity configuration.
+`account-identity-add`, `account-identity-update` and `account-identity-remove`
+use the same retained workflow for account-owned sending identities. Updates
+preserve omitted fields and identity IDs; removal also deletes its address-list
+entries, but never receiving aliases or already accepted outgoing messages.
 None of these commands starts or restarts a service or provisions a device
 password. POSTGRES.md owns their retention and partial-completion contract.
 
@@ -1536,7 +1540,7 @@ Physical backup and recovery use PostgreSQL tooling. Readiness does not
 contact Migadu or a CA. Configuration errors do not echo supplied secrets.
 
 Listener address changes, data-root changes, and pool sizing require restart.
-Account and alias configuration changes also require restart. Device
+Account, alias and sending identity configuration changes require restart. Device
 revocations are observed from PostgreSQL; managed certificates trigger bounded
 drain and reload. Revocation
 is rechecked before a mutation commits; a connection is not permanent authority.

@@ -6622,3 +6622,26 @@ Native tests exercise executable create/list/alias commands, protected
 operation permissions, first-to-second postmaster preservation, exact replay,
 conflicting edits, and selection commit uncertainty. They verify unrelated
 accounts and identities survive and account storage is not duplicated.
+
+### Sending identity administration
+
+`postgres account-identity-add --connection-file PATH --account ID --address
+EMAIL [--name NAME] --operation-file PATH` creates a fresh sending identity;
+name defaults to the address. `account-list` reports its generated identity ID.
+`account-identity-update` takes `--account ID --identity ID` and at least one
+of `--address EMAIL` or `--name NAME`; an empty name is allowed. It preserves
+the identity ID, omitted fields, signatures and Reply-To/Bcc lists.
+`account-identity-remove` takes `--account ID --identity ID` and removes that
+identity and all of its address-list entries. Update/remove require the
+identity to belong to the named account. All three commands require the same
+connection and operation-file options and accept optional `--epoch`.
+
+These commands use the same retained-operation, validation, CAS, replay and
+restart contract above. They never add or remove receiving aliases, create
+account storage or provision credentials. A sending address need not be a
+receiving alias or use a locally received domain; the operator is responsible
+for authorizing it with the outbound provider. Normal mailbox syntax and the
+aggregate 64-identity limit still apply. An account may become receive-only
+when its last identity is removed, but the configuration must retain at least
+one identity globally. Removal prevents future submissions after activation;
+it does not cancel already accepted messages or rewrite their envelopes.

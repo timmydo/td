@@ -253,4 +253,136 @@ pub(super) fn exercise(
         1
     )
     .contains("read-sync-or-integrity-failed"));
+    // Sending authority is account-scoped and independent of receiving aliases.
+    let run_identity = |command: &str, extra: &[&str], file: &str, status| {
+        let path = root.join(file);
+        let mut args = vec![
+            "postgres",
+            command,
+            "--connection-file",
+            connection.to_str().unwrap(),
+            "--account",
+            &account_text,
+            "--operation-file",
+            path.to_str().unwrap(),
+        ];
+        args.extend_from_slice(extra);
+        command_output(&args, root, status)
+    };
+    run_identity(
+        "account-identity-add",
+        &["--address", "send@external.test", "--name", "Sender"],
+        "identity-add.operation",
+        0,
+    );
+    let selected = selection::read(request, trust, deadline(), epoch)
+        .unwrap()
+        .unwrap();
+    let source = std::str::from_utf8(selected.1.shared()).unwrap();
+    let header = source
+        .split("[identity ")
+        .last()
+        .unwrap()
+        .split('"')
+        .nth(1)
+        .unwrap()
+        .to_owned();
+    assert!(source.contains("send@external.test"));
+    assert!(!source.contains("[alias \"send@external.test\"]"));
+    let generation = selected.0.generation;
+    let path = root.join("identity-add.operation");
+    command_output(
+        &[
+            "postgres",
+            "account-apply",
+            "--connection-file",
+            connection.to_str().unwrap(),
+            "--operation-file",
+            path.to_str().unwrap(),
+        ],
+        root,
+        0,
+    );
+    assert_eq!(
+        selection::read(request, trust, deadline(), epoch)
+            .unwrap()
+            .unwrap()
+            .0
+            .generation,
+        generation
+    );
+    run_identity(
+        "account-identity-update",
+        &["--identity", &header, "--name", ""],
+        "identity-update.operation",
+        0,
+    );
+    let selected = selection::read(request, trust, deadline(), epoch)
+        .unwrap()
+        .unwrap();
+    let source = std::str::from_utf8(selected.1.shared()).unwrap();
+    assert!(source.contains("send@external.test"));
+    assert!(!source.contains("name = \"Sender\""));
+    run_identity(
+        "account-identity-remove",
+        &["--identity", &header],
+        "identity-remove.operation",
+        0,
+    );
+    let selected = selection::read(request, trust, deadline(), epoch)
+        .unwrap()
+        .unwrap();
+    let source = std::str::from_utf8(selected.1.shared()).unwrap();
+    assert!(!source.contains(&header));
+    assert!(source.contains("second@example.test"));
+    assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.accounts"), "2");
+    let first_identity = source
+        .split("[identity ")
+        .nth(1)
+        .unwrap()
+        .split('"')
+        .nth(1)
+        .unwrap()
+        .to_owned();
+    let second_identity = source
+        .split("[identity ")
+        .last()
+        .unwrap()
+        .split('"')
+        .nth(1)
+        .unwrap()
+        .to_owned();
+    run_identity(
+        "account-identity-remove",
+        &["--identity", &first_identity],
+        "foreign-identity.operation",
+        1,
+    );
+    assert!(!root.join("foreign-identity.operation").exists());
+    run_identity(
+        "account-identity-add",
+        &["--address", "*@external.test"],
+        "wildcard-identity.operation",
+        1,
+    );
+    assert!(!root.join("wildcard-identity.operation").exists());
+    run_identity(
+        "account-identity-remove",
+        &["--identity", &second_identity],
+        "receive-only.operation",
+        0,
+    );
+    assert!(matches!(
+        admin::prepare(
+            request,
+            trust,
+            deadline(),
+            epoch,
+            &Edit::IdentityRemove {
+                account: AccountId::parse("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
+                identity: td_mta::ids::IdentityId::parse(&first_identity).unwrap(),
+            }
+        ),
+        Err(admin::Error::Configuration(_))
+    ));
 }

@@ -830,3 +830,15 @@ td-mta postgres account-apply --connection-file /private/owner-connection \
 A receipt describes that operation's publication, not current service readiness.
 Use `account-list` to inspect the current selection and service readiness checks
 after restart. See POSTGRES.md for partial completion and concurrent-edit rules.
+
+To grant an existing account another From address, use
+`td-mta postgres account-identity-add --connection-file OWNER_CONNECTION
+--account ACCOUNT_ID --address sender@example.test --name "Sender"
+--operation-file PRIVATE_DIRECTORY/add-sender.operation`. List identities with
+`postgres account-list`. Rename one with `account-identity-update --account
+ACCOUNT_ID --identity ID --name "New name"`, or remove it with
+`account-identity-remove --account ACCOUNT_ID --identity ID`; supply a fresh
+private operation-file path and owner connection for each command. Restart the
+affected instances after selection. Receiving aliases are separate; configure
+one explicitly if the address should also accept incoming mail. Ensure your
+outbound provider authorizes the new sender before using it.
