@@ -11930,7 +11930,9 @@ chmod 755 '{}'
                 "ripgrep",
                 "fd",
                 "uutils",
-                "binutils-x86-64-self"
+                "td-sh",
+                "td-util",
+                "td-txt"
             ]
         );
         let closure = recipe_closure(&roots).unwrap();

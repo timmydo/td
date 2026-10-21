@@ -677,6 +677,7 @@ mod tests {
             "td-install-test",
             "hello-test",
             "rust-userland-auto-test",
+            "rust-toolchain-test",
         ] {
             let r = catalog::lookup(stem).unwrap();
             assert_eq!(recipe_checks(&r).len(), 1, "{stem}");
@@ -710,6 +711,7 @@ mod tests {
             ("td-install-test", 1),
             ("hello-test", 1),
             ("rust-userland-auto-test", 1),
+            ("rust-toolchain-test", 1),
             ("tzdata", 1),
         ] {
             let recipe = catalog::lookup(stem).unwrap();

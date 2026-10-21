@@ -1,9 +1,16 @@
-use crate::ladder::{post_rust_inputs, post_rust_tool_farm, POST_RUST_SH};
+use crate::ladder::{BUILD_ROOT_GLIBC, BUILD_ROOT_PATH as PATH, BUILD_ROOT_SH as SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
-// Keep in lockstep with toolchain_x86_64::GLIBC_X86_64_STAGE and
-// rust_toolchain::GLIBC_STAGE.
-const GLIBC_STAGE: &str = "stage/td/store/glibc-2.41-x86_64";
+// rust-userland-auto-test: the runtime contract of the Rust userland the
+// auto graph builds. ripgrep and fd hold td glibc's exact dynamic closure,
+// td-news and td-mail are td-owned static PIEs, and all four run.
+//
+// Every step runs in the Debian build root under its bash with PATH the
+// root's /usr/bin alone, and grades with the root's readelf, grep and sed:
+// no subject is on PATH, and each is reached by its store path.
+
+/// The subjects, and td glibc for its loader's path.
+const INPUTS: &[&str] = &["ripgrep", "fd", "td-news", "td-mail", "glibc-x86-64"];
 
 /// The provenance scans every contract shares. The scanner's positive control
 /// comes first: a NUL-filled probe longer than the tested binary with the
@@ -11,7 +18,7 @@ const GLIBC_STAGE: &str = "stage/td/store/glibc-2.41-x86_64";
 /// length, is caught before its negative answer is trusted: no `/gnu/store`
 /// bytes.
 fn provenance_scans(label: &str, binary: &str) -> String {
-    let scanner = "{in:td-txt}/bin/td-txt";
+    let scanner = "/usr/bin/grep";
     format!(
         "binary_size=$(wc -c < '{binary}'); \
          head -c \"$binary_size\" /dev/zero > '{{root}}/binary-scan-probe' || {{ echo 'could not create binary provenance control' >&2; exit 1; }}; \
@@ -20,20 +27,20 @@ fn provenance_scans(label: &str, binary: &str) -> String {
          [ \"$1\" = 00 ] || {{ echo 'binary provenance control contains no NUL' >&2; exit 1; }}; \
          probe_size=$(wc -c < '{{root}}/binary-scan-probe'); \
          [ \"$probe_size\" -gt \"$binary_size\" ] || {{ echo 'binary provenance control does not reach beyond the tested binary size' >&2; exit 1; }}; \
-         '{scanner}' grep -a -Fq -- td-binary-scan-positive '{{root}}/binary-scan-probe' || {{ echo 'binary provenance scanner missed its positive control' >&2; exit 1; }}; \
-         '{scanner}' grep -a -Fq -- /gnu/store '{binary}'; scan=$?; \
+         '{scanner}' -a -Fq -- td-binary-scan-positive '{{root}}/binary-scan-probe' || {{ echo 'binary provenance scanner missed its positive control' >&2; exit 1; }}; \
+         '{scanner}' -a -Fq -- /gnu/store '{binary}'; scan=$?; \
          case \"$scan\" in 1) :;; 0) echo '{label} embeds /gnu/store bytes' >&2; exit 1;; *) echo 'binary provenance scan failed for {label}' >&2; exit 1;; esac; "
     )
 }
 
 fn dynamic_contract(label: &str, binary: &str, expected_needed: &str) -> Step {
-    let readelf = "{in:binutils-x86-64-self}/bin/readelf";
+    let readelf = "/usr/bin/readelf";
     let scans = provenance_scans(label, binary);
-    let glibc = format!("{{in:glibc-x86-64}}/{GLIBC_STAGE}");
+    let glibc = BUILD_ROOT_GLIBC;
     Step::run(
         "{root}",
         &[
-            POST_RUST_SH,
+            SH,
             "-c",
             &format!(
                 "[ -x '{binary}' ] || {{ echo '{label} output is not executable' >&2; exit 1; }}; \
@@ -53,7 +60,7 @@ fn dynamic_contract(label: &str, binary: &str, expected_needed: &str) -> Step {
             ),
         ],
     )
-    .env("PATH", "{tools}")
+    .env("PATH", PATH)
 }
 
 /// The contract of a td-owned static program the Cargo runner links
@@ -67,13 +74,13 @@ fn dynamic_contract(label: &str, binary: &str, expected_needed: &str) -> Step {
 /// as it admits direct rustc's fixed-address one; the runner's install
 /// check is the producer's check, this one the consumer's.
 fn static_contract(label: &str, binary: &str) -> Step {
-    let readelf = "{in:binutils-x86-64-self}/bin/readelf";
+    let readelf = "/usr/bin/readelf";
     let scans = provenance_scans(label, binary);
     let (elf_type, shape_name) = ("DYN", "a static PIE (ET_DYN) executable");
     Step::run(
         "{root}",
         &[
-            POST_RUST_SH,
+            SH,
             "-c",
             &format!(
                 "[ -x '{binary}' ] || {{ echo '{label} output is not executable' >&2; exit 1; }}; \
@@ -91,7 +98,7 @@ fn static_contract(label: &str, binary: &str) -> Step {
             ),
         ],
     )
-    .env("PATH", "{tools}")
+    .env("PATH", PATH)
 }
 
 pub fn recipe() -> Recipe {
@@ -101,7 +108,6 @@ pub fn recipe() -> Recipe {
     let mail = "{in:td-mail}/bin/td-mail";
     let fixture = "{root}/fixtures/known-needle.txt";
     let mut steps = vec![
-        post_rust_tool_farm(Some("{in:gawk-x86-64-self}/bin/gawk")),
         dynamic_contract("ripgrep", rg, "ld-linux-x86-64.so.2\nlibc.so.6"),
         dynamic_contract("fd", fd, "libc.so.6"),
         // The two applications are td's own root crates built static from
@@ -123,7 +129,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_RUST_SH,
+                SH,
                 "-c",
                 &format!(
                     "actual=$('{rg}' --color never --no-filename '^needle$' '{fixture}') || {{ echo 'ripgrep search failed' >&2; exit 1; }}; \
@@ -137,7 +143,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", "{tools}"),
+        .env("PATH", PATH),
     );
     steps.push(Step::MkDir {
         path: "{out}".into(),
@@ -153,26 +159,30 @@ pub fn recipe() -> Recipe {
     });
 
     Recipe::mesboot("rust-userland-auto-test", "1.0")
-        .native_inputs(&post_rust_inputs(
-            Some("gawk-x86-64-self"),
-            &[
-                "ripgrep",
-                "fd",
-                "td-news",
-                "td-mail",
-                "binutils-x86-64-self",
-                "glibc-x86-64",
-            ],
-        ))
+        .build_root()
+        .native_inputs(INPUTS)
         .steps(steps)
         .checks(vec![
             RecipeCheck::new(
                 r#"
-echo ">> recipe-check rust-userland-auto-test: build-plan --auto builds ripgrep, fd, td-news and td-mail with upstream Rust and the native toolchain, verifies the exact dynamic runtime closure of the first two, the td-owned static PIE shape of the last two, and runs real searches and usage output with /gnu/store absent"
+echo ">> recipe-check rust-userland-auto-test: build-plan --auto builds ripgrep, fd, td-news and td-mail with upstream Rust through td-link, verifies the exact dynamic runtime closure of the first two, the td-owned static PIE shape of the last two, and runs real searches and usage output, graded in the Debian build root"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run rust-userland-auto-test 1
 "#,
             )
             .with_runner(CheckRunner::BuildOnly),
         ])
+}
+
+#[cfg(test)]
+mod tests {
+    /// The four programs are graded only by the root's bash and tools.
+    #[test]
+    fn the_userland_is_graded_only_by_the_roots_bash_and_tools() {
+        crate::ladder::assert_build_root_test(
+            &super::recipe(),
+            super::INPUTS,
+            &["ripgrep", "fd", "td-news", "td-mail"],
+        );
+    }
 }

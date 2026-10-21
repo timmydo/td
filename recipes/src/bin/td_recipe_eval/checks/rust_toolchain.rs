@@ -16,75 +16,39 @@ pub(super) const GLIBC_STAGE: &str = "stage/td/store/glibc-2.41-x86_64";
 /// order `CheckRunner::RustToolchain` declares them.
 const PROVED_USERLAND: &[&str] = &["ripgrep", "fd", "uutils"];
 
-/// The runner's last declared build: the readelf the proofs inspect with.
-const INSPECTOR: &str = "binutils-x86-64-self";
+/// The proof script's own tools, declared after `PROVED_USERLAND`: td-sh
+/// runs it, td-util serves `mkdir` and td-txt `grep`, each a static
+/// multicall at `bin/<stem>`. None of them is a program the proof grades.
+const SCRIPT_USERLAND: &[&str] = &["td-sh", "td-util", "td-txt"];
 
-/// The shipped executables the transform relinks onto td glibc's loader.
-const RELINKED: &[&str] = &[
-    "bin/rustc",
-    "bin/rustdoc",
-    "bin/cargo",
-    "bin/cargo-clippy",
-    "bin/clippy-driver",
-    "lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-lld",
-];
-
-/// Compiles a lint-free crate and one using `unwrap()` under
-/// `--deny clippy::unwrap_used`, read on stdin by the smoke below.
-const CLIPPY_PROBE: &str = include_str!("../../../probes/rust_clippy.rs");
-
+// The toolchain's ELF shape, its rustc/Cargo/Clippy smokes and the shipped
+// userland's ELF and debug companions are rust-toolchain-test's, graded in
+// the Debian build root. This check keeps what needs the control plane:
+// the toolchain runs in a host-free /td/store namespace, and `td shell`
+// builds and runs the userland there.
 pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     runner.prepare_recipe_target("rust-toolchain")?;
     let build_out = runner.build_plan("rust-toolchain")?;
     let rust_tree = runner.ladder_out_from(&build_out, "rust-toolchain")?;
     let glibc_tree = runner.ladder_out_from(&build_out, "glibc-x86-64")?;
-    let runtime_tree = runner.ladder_out_from(&build_out, "gcc-runtime")?;
-    let zlib_tree = runner.ladder_out_from(&build_out, "zlib-x86-64")?;
-    // The proofs link through td-link, as every Rust recipe does, and
-    // inspect with binutils' readelf. `td shell` builds in the Debian build
-    // root, whose gcc compiles C build scripts.
+    // `td shell` links through td-link, as every Rust recipe does, and
+    // builds in the Debian build root, whose gcc compiles C build scripts.
     runner.prepare_recipe_target("td-link")?;
     let link_out = runner.build_plan("td-link")?;
     let link_tree = runner.ladder_out_from(&link_out, "td-link")?;
-    runner.prepare_recipe_target(INSPECTOR)?;
-    let binutils_out = runner.build_plan(INSPECTOR)?;
-    let binutils_tree = runner.ladder_out_from(&binutils_out, INSPECTOR)?;
-    // The proof's shell and text tools are the bootstrap root's userland:
-    // nothing later exists before this check. The toolchain's closure is
-    // built in the Debian root, so they come from binutils' plan.
-    let sh = format!(
-        "{}/sh",
-        root_userland_bin(runner, INSPECTOR, &binutils_out, "bash-mesboot")?
-    );
-    let userland = ROOT_USERLAND
-        .iter()
-        .map(|stem| root_userland_bin(runner, INSPECTOR, &binutils_out, stem))
-        .collect::<Result<Vec<_>, _>>()?
-        .join(":");
+    let mut tools = Vec::new();
+    for stem in SCRIPT_USERLAND {
+        tools.push(script_tool(runner, stem)?);
+    }
     println!(
-        "   [ladder] x86_64 upstream Rust 1.96.0 via build-plan --auto, retargeted onto td glibc/libgcc/zlib ({})",
+        "   [toolchain] x86_64 upstream Rust 1.96.0 via build-plan --auto, retargeted onto td glibc/libgcc/zlib ({})",
         rust_tree.display()
     );
-    for binary in RELINKED {
-        let path = rust_tree.join(binary);
-        if !is_executable(&path) {
-            return Err(format!(
-                "{binary} missing from rust-toolchain output ({})",
-                path.display()
-            ));
-        }
-    }
 
     let rust_base = path_basename(&rust_tree)?;
-    let binutils_base = path_basename(&binutils_tree)?;
     let glibc_base = path_basename(&glibc_tree)?;
     let link_base = path_basename(&link_tree)?;
-    let td_link = format!("{TD_STORE_DIR}/{link_base}/bin/td-link");
     let rust_path = format!("{TD_STORE_DIR}/{rust_base}");
-    let readelf = format!("{TD_STORE_DIR}/{binutils_base}/bin/readelf");
-    let glibc_path = format!("{TD_STORE_DIR}/{glibc_base}/{GLIBC_STAGE}");
-    let runtime_path = format!("{TD_STORE_DIR}/{}/lib", path_basename(&runtime_tree)?);
-    let zlib_path = format!("{TD_STORE_DIR}/{}/lib", path_basename(&zlib_tree)?);
 
     for (binary, version) in [("rustc", "rustc 1.96.0"), ("cargo", "cargo 1.96.0")] {
         let out =
@@ -97,102 +61,77 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         }
     }
 
-    let relinked = RELINKED.join(" ");
-    // td's recipes link through td-link, which runs rust-lld: every link
-    // below must carry LLD's comment.
-    let link = format!("-C linker={td_link}");
-    let smoke = format!(
-        "set -eu\n\
-         test ! -e /gnu/store\n\
-         export PATH='{userland}'\n\
-         readelf='{readelf}'\n\
-         interp='{glibc_path}/lib/ld-linux-x86-64.so.2'\n\
-         cd '{rust_path}'\n\
-         for b in {relinked}; do\n\
-           \"$readelf\" -l \"$b\" | grep -F \"[Requesting program interpreter: $interp]\" >/dev/null || {{ echo \"$b is not on td glibc's loader\" >&2; exit 81; }}\n\
-         done\n\
-         for pair in libc.so.6:'{glibc_path}/lib/libc.so.6' libgcc_s.so.1:'{runtime_path}/libgcc_s.so.1' libz.so.1:'{zlib_path}/libz.so.1'; do\n\
-           test \"$(readlink \"lib/${{pair%%:*}}\")\" = \"${{pair#*:}}\" || {{ echo \"lib/${{pair%%:*}} is not td's\" >&2; exit 82; }}\n\
-         done\n\
-         gccld=lib/rustlib/x86_64-unknown-linux-gnu/bin/gcc-ld\n\
-         test \"$(readlink \"$gccld/ld.lld\")\" = ../rust-lld || exit 83\n\
-         test \"$(ls \"$gccld\")\" = ld.lld || {{ echo 'gcc-ld holds more than ld.lld' >&2; exit 83; }}\n\
-         \"$gccld/ld.lld\" --version | grep -F LLD >/dev/null || exit 84\n\
-         test ! -e lib/debug || {{ echo 'the upstream toolchain carries debug companions' >&2; exit 85; }}\n\
-         test -f share/doc/rust/COPYRIGHT.html || {{ echo 'the upstream licence notices are missing' >&2; exit 85; }}\n\
-         rc=0; grep -r -a -F -l /gnu/store bin lib >/dev/null || rc=$?; [ \"$rc\" = 1 ] || exit 86\n\
-         cd /tmp\n\
-         printf '%s\\n' 'fn main() {{ println!(\"42\"); }}' >/tmp/td-rust-smoke.rs\n\
-         '{rust_path}/bin/rustc' --edition=2021 /tmp/td-rust-smoke.rs {link} -o /tmp/td-rust-ld\n\
-         test \"$(/tmp/td-rust-ld)\" = 42\n\
-         c=$(\"$readelf\" -p .comment /tmp/td-rust-ld) || exit 89\n\
-         case $c in *'rustc version'*) ;; *) echo 'the link has no rustc comment' >&2; exit 89;; esac\n\
-         case $c in *'Linker: LLD'*) ;; *) echo 'the td-link link did not use rust-lld' >&2; exit 87;; esac\n\
-         mkdir -p /tmp/td-cargo-smoke/src /tmp/td-cargo-home /tmp/td-cargo-target\n\
-         printf '%s\\n' '[package]' 'name = \"td-cargo-smoke\"' 'version = \"0.0.0\"' 'edition = \"2021\"' >/tmp/td-cargo-smoke/Cargo.toml\n\
-         printf '%s\\n' 'fn main() {{ println!(\"43\"); }}' >/tmp/td-cargo-smoke/src/main.rs\n\
-         PATH='{rust_path}/bin' RUSTC='{rust_path}/bin/rustc' CARGO_HOME=/tmp/td-cargo-home HOME=/tmp/td-cargo-home \
-         CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER='{td_link}' \
-         '{rust_path}/bin/cargo' build --offline --manifest-path /tmp/td-cargo-smoke/Cargo.toml --target-dir /tmp/td-cargo-target\n\
-         test \"$(/tmp/td-cargo-target/debug/td-cargo-smoke)\" = 43\n\
-         mkdir -p /tmp/td-clippy-proof\n\
-         cat >/tmp/td-clippy-proof/probe.rs\n\
-         '{rust_path}/bin/rustc' --edition=2021 /tmp/td-clippy-proof/probe.rs {link} -o /tmp/td-clippy-proof/probe\n\
-         (cd /tmp/td-clippy-proof && PATH='{rust_path}/bin' ./probe '{rust_path}/bin/cargo' '{rust_path}/bin/rustc' '{td_link}')\n\
-         printf '%s\\n' RUST-TOOLCHAIN-OK\n"
-    );
-    let smoke_out = runner.store_ns_output(&[&sh, "-c", &smoke], Some(CLIPPY_PROBE))?;
-    if !smoke_out.lines().any(|line| line == "RUST-TOOLCHAIN-OK") {
-        return Err(format!(
-            "upstream rustc/Cargo/Clippy did not complete their td-native smoke tests: {}",
-            smoke_out.trim()
-        ));
-    }
     prove_td_shell_userland(
         runner,
         &[&build_out, &link_out],
-        &readelf,
-        &glibc_path,
-        &sh,
-        &userland,
+        &tools,
         rust_base,
         link_base,
         glibc_base,
     )?;
     println!(
-        "PASS: rust-toolchain: upstream Rust 1.96.0 rustc/Cargo/Clippy/rust-lld run on td glibc, gcc-runtime and zlib, link through td-link and rust-lld, and td shell builds (or reuses from its cache) and runs ripgrep/fd/uutils with /gnu/store absent"
+        "PASS: rust-toolchain: upstream Rust 1.96.0 rustc and Cargo run on td glibc under own-root /td/store, and td shell builds (or reuses from its cache) and runs ripgrep/fd/uutils there with /gnu/store absent"
     );
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+/// `stem`'s multicall at `/td/store/<base>/bin/<stem>`, built by its plan
+/// into the check's store, which the proof's namespace binds.
+fn script_tool(runner: &RecipeCheckRunner, stem: &str) -> Result<String, String> {
+    runner.prepare_recipe_target(stem)?;
+    let out = runner.build_plan(stem)?;
+    let tree = runner.ladder_out_from(&out, stem)?;
+    let binary = tree.join("bin").join(stem);
+    if !is_executable(&binary) {
+        return Err(format!(
+            "{stem}: bin/{stem} is not an executable in the check's store ({})",
+            binary.display()
+        ));
+    }
+    Ok(format!(
+        "{TD_STORE_DIR}/{}/bin/{stem}",
+        path_basename(&tree)?
+    ))
+}
+
+/// The packages `td shell` builds: the runner's declared builds, which
+/// must be `PROVED_USERLAND` then `SCRIPT_USERLAND`, so the key and reach
+/// that read them name exactly what is built here.
+fn shell_packages<'a>(declared: &'a [&'a str]) -> Result<&'a [&'a str], String> {
+    match declared.split_at_checked(PROVED_USERLAND.len()) {
+        Some((proved, tools)) if proved == PROVED_USERLAND && tools == SCRIPT_USERLAND => {
+            Ok(proved)
+        }
+        _ => Err(format!(
+            "rust-toolchain declares the builds [{}] but its product proof exercises \
+             [{}] under [{}]; change both together",
+            declared.join(" "),
+            PROVED_USERLAND.join(" "),
+            SCRIPT_USERLAND.join(" ")
+        )),
+    }
+}
+
 fn prove_td_shell_userland(
     runner: &RecipeCheckRunner,
     build_outs: &[&Path],
-    readelf: &str,
-    glibc_path: &str,
-    sh: &str,
-    userland: &str,
+    tools: &[String],
     rust_base: &str,
     link_base: &str,
     glibc_base: &str,
 ) -> Result<(), String> {
     let root = std::env::current_dir().map_err(|e| format!("current dir: {e}"))?;
     let vendor_root = root.join(".td-build-cache/crate-vendor");
-    // The packages are the runner's declared builds, so the key and reach
-    // that read them name exactly what is built here; their versions come
-    // from the recipes, so a bump needs no edit to this proof.
-    let declared = CheckRunner::RustToolchain.extra_builds();
-    // The script below exercises each package in its own role; a declared
-    // build it does not exercise, or a role it lost, is a drift to fix here.
-    let packages = match declared.split_last() {
-        Some((last, userland)) if *last == INSPECTOR && userland == PROVED_USERLAND => userland,
+    // Their versions come from the recipes, so a bump needs no edit to
+    // this proof.
+    let packages = shell_packages(CheckRunner::RustToolchain.extra_builds())?;
+    let (sh, util, txt) = match tools {
+        [sh, util, txt] => (sh, util, txt),
         _ => {
             return Err(format!(
-                "rust-toolchain declares the builds [{}] but its product proof exercises \
-                 [{} {INSPECTOR}]; change both together",
-                declared.join(" "),
-                PROVED_USERLAND.join(" ")
+                "the product proof needs [{}], got {} tools",
+                SCRIPT_USERLAND.join(" "),
+                tools.len()
             ))
         }
     };
@@ -250,7 +189,7 @@ fn prove_td_shell_userland(
     let _shell_cache_lock = crate::check_runner::lock_file(&shell_cache_lock)?;
     reset_shell_cache_on_toolchain_change(&shell_cache, &lock)?;
 
-    // The toolchain's, td-link's and GCC's plans each vouch their own outputs.
+    // The toolchain's and td-link's plans each vouch their own outputs.
     let mut dbs = Vec::new();
     for build_out in build_outs {
         for db in runner.recipe_output_dbs(build_out)? {
@@ -270,27 +209,42 @@ fn prove_td_shell_userland(
     let tdstore = runner.tdstore_path();
     let store_ns_builder = runner.control_builder_path();
     let evaluator = std::env::current_exe().map_err(|e| format!("locate td-recipe-eval: {e}"))?;
-    let interp = format!("{glibc_path}/lib/ld-linux-x86-64.so.2");
+    // td-sh runs it with no PATH to search: every program is named by its
+    // store path, the multicalls by their applet argument. One build of
+    // each product may be visible, and it is the one td shell made, so its
+    // companion, assembly-exception marker and freedom from /gnu/store are
+    // checked here; rust-toolchain-test grades the plan builds' ELF.
     let script = format!(
         "set -eu\n\
          test ! -e /gnu/store\n\
-         export PATH='{userland}'\n\
+         PATH=/nonexistent\n\
+         export PATH\n\
+         util='{util}'\n\
+         txt='{txt}'\n\
          rg=''\n\
          for p in {TD_STORE_DIR}/*-ripgrep-{rg_version}/bin/rg; do\n\
-           if test -x \"$p\"; then rg=$p; fi\n\
+           if test -x \"$p\"; then test -z \"$rg\" || exit 89; rg=$p; fi\n\
          done\n\
          fd=''\n\
          for p in {TD_STORE_DIR}/*-fd-{fd_version}/bin/fd; do\n\
-           if test -x \"$p\"; then fd=$p; fi\n\
+           if test -x \"$p\"; then test -z \"$fd\" || exit 89; fd=$p; fi\n\
          done\n\
          uutils=''\n\
          for p in {TD_STORE_DIR}/*-uutils-{uutils_version}/bin/coreutils; do\n\
-           if test -x \"$p\"; then uutils=$p; fi\n\
+           if test -x \"$p\"; then test -z \"$uutils\" || exit 89; uutils=$p; fi\n\
          done\n\
          test -n \"$rg\"\n\
          test -n \"$fd\"\n\
          test -n \"$uutils\"\n\
-         mkdir -p /tmp/td-shell-userland/sub\n\
+         for b in \"$rg\" \"$fd\" \"$uutils\"; do\n\
+           package=${{b%/bin/*}}\n\
+           test -f \"$package/lib/debug/bin/${{b##*/}}.debug\" || exit 93\n\
+           for line in exception.0.source=glibc-x86-64 exception.1.source=gcc-runtime exception.2.source=rust-toolchain; do\n\
+             \"$txt\" grep -F -x \"$line\" \"$package/lib/debug/.td-assembly-exception\" >/dev/null || exit 94\n\
+           done\n\
+           rc=0; \"$txt\" grep -a -F -q /gnu/store \"$b\" || rc=$?; [ \"$rc\" = 1 ] || exit 90\n\
+         done\n\
+         \"$util\" mkdir -p /tmp/td-shell-userland/sub\n\
          printf '%s\\n' TD-414-NEEDLE >/tmp/td-shell-userland/sub/known-needle.txt\n\
          rg_out=$(\"$rg\" --fixed-strings TD-414-NEEDLE /tmp/td-shell-userland)\n\
          case \"$rg_out\" in *TD-414-NEEDLE*) ;; *) exit 91 ;; esac\n\
@@ -303,26 +257,7 @@ fn prove_td_shell_userland(
          uu_id=$(\"$uutils\" id -u)\n\
          case \"$uu_id\" in ''|*[!0-9]*) exit 98 ;; esac\n\
          \"$uutils\" --list >/tmp/td-shell-userland/uutils-list || exit 99\n\
-         rc=0; grep -F -x stdbuf /tmp/td-shell-userland/uutils-list >/dev/null || rc=$?; [ \"$rc\" = 1 ] || exit 100\n\
-         readelf='{readelf}'\n\
-         \"$readelf\" -l \"$rg\" | grep -F '{interp}' >/dev/null\n\
-         \"$readelf\" -l \"$fd\" | grep -F '{interp}' >/dev/null\n\
-         \"$readelf\" -l \"$uutils\" | grep -F '{interp}' >/dev/null\n\
-         for binary in \"$rg\" \"$fd\" \"$uutils\"; do\n\
-           package=${{binary%/bin/*}}\n\
-           name=${{binary##*/}}\n\
-           debug=\"$package/lib/debug/bin/$name.debug\"\n\
-           test -f \"$debug\"\n\
-           test \"$(\"$readelf\" -n \"$binary\" | grep 'Build ID:')\" = \"$(\"$readelf\" -n \"$debug\" | grep 'Build ID:')\"\n\
-           rc=0; \"$readelf\" -S \"$binary\" | grep -F '.symtab' >/dev/null || rc=$?; [ \"$rc\" = 1 ] || exit 88\n\
-           \"$readelf\" -S \"$debug\" | grep -F '.symtab' >/dev/null\n\
-           \"$readelf\" -S \"$debug\" | grep -F '.debug_line' >/dev/null\n\
-           marker=\"$package/lib/debug/.td-assembly-exception\"\n\
-           grep -F -x 'exception.0.source=glibc-x86-64' \"$marker\" >/dev/null\n\
-           grep -F -x 'exception.1.source=gcc-runtime' \"$marker\" >/dev/null\n\
-           grep -F -x 'exception.2.source=rust-toolchain' \"$marker\" >/dev/null\n\
-           rc=0; grep -a -F /gnu/store \"$binary\" >/dev/null || rc=$?; [ \"$rc\" = 1 ] || exit 93\n\
-         done\n\
+         rc=0; \"$txt\" grep -F -x stdbuf /tmp/td-shell-userland/uutils-list >/dev/null || rc=$?; [ \"$rc\" = 1 ] || exit 100\n\
          printf '%s\\n' TD-SHELL-USERLAND-OK\n"
     );
 
@@ -361,7 +296,7 @@ fn prove_td_shell_userland(
         .args(["--", store_ns_builder_s])
         .arg("store-ns")
         .arg(tdstore_s)
-        .args(["--", sh, "-c", &script]);
+        .args(["--", sh.as_str(), "-c", &script]);
     let output = cmd
         .output()
         .map_err(|e| format!("spawn td shell ripgrep fd uutils product proof: {e}"))?;
@@ -417,41 +352,6 @@ fn path_str(path: &Path) -> Result<&str, String> {
         .ok_or_else(|| format!("path is not UTF-8: {}", path.display()))
 }
 
-/// The bootstrap root's userland on the proofs' PATH, in lookup order: `sh` is
-/// bash, and coreutils 5.0, grep 2.4 and gawk serve the rest.
-const ROOT_USERLAND: &[&str] = &[
-    "coreutils-mesboot0",
-    "grep-mesboot0",
-    "gawk-mesboot0",
-    "bash-mesboot",
-];
-
-/// A root userland rung's `bin` directory under `/td/store`: the pinned
-/// root's item when `target`'s plan started at the cut, which stages it
-/// into the check's store, else that plan's own build of the rung from
-/// stage0.
-fn root_userland_bin(
-    runner: &RecipeCheckRunner,
-    target: &str,
-    build_out: &Path,
-    stem: &str,
-) -> Result<String, String> {
-    let base = if runner.bootstrap_root_db_for(target)?.is_some() {
-        crate::bootstrap_root::root()?
-            .exports
-            .iter()
-            .find(|(export, _)| export == stem)
-            .map(|(_, base)| base.clone())
-            .ok_or_else(|| format!("{stem}: not exported by the bootstrap root"))?
-    } else {
-        path_basename(&runner.ladder_out_from(build_out, stem)?)?.to_string()
-    };
-    if !runner.tdstore_path().join(&base).join("bin").is_dir() {
-        return Err(format!("{stem}: {base} is not staged in the check's store"));
-    }
-    Ok(format!("{TD_STORE_DIR}/{base}/bin"))
-}
-
 pub(super) fn path_basename(path: &Path) -> Result<&str, String> {
     path.file_name()
         .and_then(|name| name.to_str())
@@ -504,11 +404,31 @@ mod tests {
     /// verdict key reads what the proof builds and nothing is built unproved.
     #[test]
     fn the_proof_exercises_exactly_the_declared_builds() {
+        let declared = td_recipe::types::CheckRunner::RustToolchain.extra_builds();
         let mut proved = super::PROVED_USERLAND.to_vec();
-        proved.push(super::INSPECTOR);
+        proved.extend_from_slice(super::SCRIPT_USERLAND);
+        assert_eq!(proved, declared);
         assert_eq!(
-            proved,
-            td_recipe::types::CheckRunner::RustToolchain.extra_builds()
+            super::shell_packages(declared).unwrap(),
+            super::PROVED_USERLAND
         );
+        // A drift either way is refused, not built.
+        for drifted in [
+            &["ripgrep", "fd", "uutils"][..],
+            &["ripgrep", "fd", "uutils", "td-sh", "td-txt", "td-util"],
+            &[
+                "ripgrep", "fd", "uutils", "td-sh", "td-util", "td-txt", "gawk",
+            ],
+        ] {
+            let refused = super::shell_packages(drifted).unwrap_err();
+            assert!(refused.contains("change both together"), "{refused}");
+        }
+        // No ladder rung serves the proof any more.
+        for stem in declared {
+            assert!(
+                !stem.contains("mesboot") && !stem.ends_with("-self"),
+                "{stem}"
+            );
+        }
     }
 }

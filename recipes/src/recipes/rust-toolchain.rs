@@ -24,7 +24,7 @@ pub fn recipe() -> Recipe {
         .native_inputs(&["glibc-x86-64", "gcc-runtime", "zlib-x86-64"])
         .checks(vec![RecipeCheck::new(
             r#"
-echo ">> recipe-check rust-toolchain: retarget upstream Rust 1.96.0 onto td glibc/libgcc/zlib, compile and link with it, and build the td shell userland"
+echo ">> recipe-check rust-toolchain: retarget upstream Rust 1.96.0 onto td glibc/libgcc/zlib, run it under own-root /td/store, and build and run the td shell userland there (rust-toolchain-test grades its ELF, links and smokes)"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run rust-toolchain 1
 "#,

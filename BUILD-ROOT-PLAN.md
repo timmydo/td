@@ -186,10 +186,7 @@ deleted; its findings are summarized under "Facts" below.
    AWS-LC: only td-crypto's host-only portable musl artifact does, with
    the ladder's GCC and binutils against musl headers (and
    gcc-aarch64-cross), so `crypto_policy.rs` and the td-crypto/td-mta
-   docs are unchanged and that kit moves with increment 11, as does the
-   rust-toolchain check's declared build of binutils-x86-64-self
-   (`INSPECTOR`) for its readelf and the root userland its proof runs
-   under.
+   docs are unchanged and that kit moves with increment 11.
 8. **C packages in the build root against td glibc**: LibreSSL (library
    only), curl, Git 2.55.0; popt, libdevmapper, util-linux libs,
    cryptsetup (static, as today); OpenSSH (`--without-openssl`). One
@@ -248,9 +245,14 @@ deleted; its findings are summarized under "Facts" below.
     post-Rust tool farm holds no awk for td's own builds, so the image's
     whole closure (system-x86-64) reaches no ladder recipe; and
     td-jail-seccomp-probe compiles with the root's gcc against td glibc.
-    Still on the ladder: rust-userland-auto-test's readelf and tool
-    farm, the rust-toolchain check, the crypto portable kit, and the
-    ladder's own fixtures (hello, hello-test), deleted with it.
+    rust-userland-auto-test grades in the root too, and
+    rust-toolchain-test holds the toolchain's ELF shape, its rustc, Cargo
+    and Clippy smokes and the Rust userland's ELF and debug companions
+    there, leaving the rust-toolchain check its own-root `--version` runs
+    and its `td shell` proof, which runs under td-sh with td-util's mkdir
+    and td-txt's grep. Still on the ladder: the crypto portable kit, and
+    the ladder's own recipes and tests (the -self tests, hello,
+    hello-test), deleted with it.
 12. **td-btrfs** (landed): std-only mkfs with `--rootdir/--subvol`;
     btrfs-progs, its pin and test are deleted; util-linux libs stay for
     cryptsetup.

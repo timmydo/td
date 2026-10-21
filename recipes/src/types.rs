@@ -1133,9 +1133,12 @@ impl CheckRunner {
     pub fn extra_builds(self) -> &'static [&'static str] {
         match self {
             // The product proof `td shell`-builds the Rust userland with the
-            // toolchain it just made and inspects ELF with binutils' readelf,
-            // which no Cargo recipe's closure holds (checks/rust_toolchain.rs).
-            CheckRunner::RustToolchain => &["ripgrep", "fd", "uutils", "binutils-x86-64-self"],
+            // toolchain it just made, then runs it under td-sh with td-util's
+            // mkdir and td-txt's grep, none of which a Cargo recipe's closure
+            // holds (checks/rust_toolchain.rs).
+            CheckRunner::RustToolchain => {
+                &["ripgrep", "fd", "uutils", "td-sh", "td-util", "td-txt"]
+            }
             CheckRunner::BuildOnly | CheckRunner::Tzdata => &[],
         }
     }
