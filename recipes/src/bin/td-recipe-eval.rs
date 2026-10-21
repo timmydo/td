@@ -64,6 +64,10 @@
 //!                         <key>\t<url>\t<sha256>\t<file>
 //!   build-root-pins       print the Debian build root's layer and .deb pins
 //!                         (recipes/src/debian-root.lock) in the same form
+//!   build-root-seed       place the build root in the seed store from its
+//!                         warmed pins and print the seed store, the seed
+//!                         db and the ladder lock (td-crypto's portable kit
+//!                         reads them and holds that lock shared)
 //!   source-pin STEM       print the fixed-output source pin(s) owned by STEM
 //!                         in the same tab-separated form
 //!   ostree-pins           print exact foreign deploy pins as:
@@ -586,6 +590,12 @@ fn main() {
             }
             print_build_root_pins();
         }
+        Some("build-root-seed") => {
+            let rest = args.get(2..).unwrap_or(&[]);
+            if let Err(e) = check_runner::build_root_seed_cli(rest) {
+                die_runner(&e);
+            }
+        }
         Some("source-pin") => {
             let stem = args.get(2).unwrap_or_else(|| die("usage: source-pin STEM"));
             if args.get(3).is_some() {
@@ -652,7 +662,7 @@ fn main() {
                 die(&e);
             }
         }
-        _ => die("usage: td-recipe-eval list|emit|check-list|check-count|check-script|check-run|build-run|check-history|clear-store|gc-store|qemu-secret|qemu-secret-system|qemu-login-system|qemu-boot|qemu-boot-uefi|qemu-boot-media|qemu-install|qemu-install-system|qemu-install-encrypted|qemu-boot-encrypted|qemu-boot-live|compose-iso|build-iso|test-iso|qemu-boot-erofs|qemu-boot-system|qemu-deploy-rollback|qemu-update|qemu-boot-net|qemu-boot-kexec|run|bundle|warm|verify-store|payload-closure|application-closure|vendor-warm-args|source-pins|build-root-pins|source-pin|ostree-pins|ostree-pin|seed-digests|local-source-roster|bootstrap-root ..."),
+        _ => die("usage: td-recipe-eval list|emit|check-list|check-count|check-script|check-run|build-run|check-history|clear-store|gc-store|qemu-secret|qemu-secret-system|qemu-login-system|qemu-boot|qemu-boot-uefi|qemu-boot-media|qemu-install|qemu-install-system|qemu-install-encrypted|qemu-boot-encrypted|qemu-boot-live|compose-iso|build-iso|test-iso|qemu-boot-erofs|qemu-boot-system|qemu-deploy-rollback|qemu-update|qemu-boot-net|qemu-boot-kexec|run|bundle|warm|verify-store|payload-closure|application-closure|vendor-warm-args|source-pins|build-root-pins|build-root-seed|source-pin|ostree-pins|ostree-pin|seed-digests|local-source-roster|bootstrap-root ..."),
     }
 }
 

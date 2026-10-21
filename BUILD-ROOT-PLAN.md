@@ -165,8 +165,7 @@ deleted; its findings are summarized under "Facts" below.
    7b. **C inside crates in the build root.** C compiled by build scripts
    (`ring`, AWS-LC, jemalloc, blake3, oniguruma, pcre2) compiles in the
    build root against td glibc instead of with gcc-x86-64-self, so Cargo
-   recipes drop their GCC and binutils for C. Amends `crypto_policy.rs`
-   and the td-crypto/td-mta design docs for AWS-LC's compiler.
+   recipes drop their GCC and binutils for C.
    Landed: every Cargo recipe (all seventeen) declares the build root
    and only rust-toolchain, td-link and glibc-x86-64; the builder
    refuses a Cargo recipe outside the root. The runner hands build
@@ -183,10 +182,9 @@ deleted; its findings are summarized under "Facts" below.
    disabled, and ripgrep's jemalloc (musl only) and pcre2 (opt-in) are
    not built. `td shell` admits the root through
    `build-recipe --build-root-db/--build-root-store`. No recipe builds
-   AWS-LC: only td-crypto's host-only portable musl artifact does, with
-   the ladder's GCC and binutils against musl headers (and
-   gcc-aarch64-cross), so `crypto_policy.rs` and the td-crypto/td-mta
-   docs are unchanged and that kit moves with increment 11.
+   AWS-LC: only td-crypto's host-only portable musl artifact does, which
+   moved with increment 11 (`crypto_policy.rs`, which pins crates and
+   features, not compilers, is unchanged).
 8. **C packages in the build root against td glibc**: LibreSSL (library
    only), curl, Git 2.55.0; popt, libdevmapper, util-linux libs,
    cryptsetup (static, as today); OpenSSH (`--without-openssl`). One
@@ -250,7 +248,12 @@ deleted; its findings are summarized under "Facts" below.
     and Clippy smokes and the Rust userland's ELF and debug companions
     there, leaving the rust-toolchain check its own-root `--version` runs
     and its `td shell` proof, which runs under td-sh with td-util's mkdir
-    and td-txt's grep. Still on the ladder: the crypto portable kit, and
+    and td-txt's grep. td-crypto's host-only portable kit (not a recipe)
+    compiles AWS-LC's C with the root's gcc and binutils against musl
+    headers, and for aarch64 with Debian's aarch64-linux-gnu cross gcc
+    and binutils, which the lock gained, and runs the upstream Rust host
+    tools and build scripts on the root's glibc, libgcc_s and zlib, so
+    gcc-aarch64-cross, which only it used, is gone. Still on the ladder:
     the ladder's own recipes and tests (the -self tests, hello,
     hello-test), deleted with it.
 12. **td-btrfs** (landed): std-only mkfs with `--rootdir/--subvol`;

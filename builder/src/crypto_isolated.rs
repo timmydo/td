@@ -34,8 +34,107 @@ fn binary_names(architecture: Architecture) -> &'static [&'static str] {
     }
 }
 
-const LIBRARIES: &str = "/lib64:/gcc-runtime:/zlib:/rust/lib";
-const NATIVE_FLAGS: &str = "-nostdinc -isystem /musl/include -isystem /cc/lib/gcc/x86_64-pc-linux-gnu/14.3.0/include -B/binutils/bin/ -march=x86-64 -mtune=generic -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer -g1 -ffile-prefix-map=/source=/td-build -ffile-prefix-map=/vendor=/td-cargo/vendor -ffile-prefix-map=/output=/td-build-root";
+/// The Debian build root's directories the compile namespace binds, each at
+/// its path in the root: `/usr` holds GCC, binutils, and the glibc, libgcc_s
+/// and zlib the upstream Rust host tools and build scripts run on; `/lib`
+/// and `/lib64` are the root's usrmerge links, through which its loader
+/// (`/lib64/ld-linux-x86-64.so.2`) and `libc.so` script name them. No td
+/// glibc is mounted where the root's GCC would resolve an interpreter.
+const BUILD_ROOT_BINDS: &[(&str, &str)] = &[
+    ("usr", "/usr"),
+    ("usr/lib", "/lib"),
+    ("usr/lib64", "/lib64"),
+];
+const HOST_CC: &str = "/usr/bin/gcc";
+const HOST_BINUTILS: &str = "/usr/bin/";
+
+/// One target's C tools from the build root, by absolute path: `/usr/bin`
+/// stays off `PATH`, since it also holds the root's cmake and pkg-config.
+struct Tools {
+    cc: &'static str,
+    ar: &'static str,
+    nm: &'static str,
+    objcopy: &'static str,
+    /// The `-B` prefix GCC finds its assembler under.
+    binutils: &'static str,
+    /// Where GCC's own freestanding headers must lie.
+    gcc_lib: &'static str,
+    /// Code generation, pinned rather than left to the root GCC's defaults.
+    machine: &'static str,
+}
+
+fn tools(architecture: Architecture) -> Tools {
+    match architecture {
+        Architecture::X86_64 => Tools {
+            cc: HOST_CC,
+            ar: "/usr/bin/ar",
+            nm: "/usr/bin/nm",
+            objcopy: "/usr/bin/objcopy",
+            binutils: HOST_BINUTILS,
+            gcc_lib: "/usr/lib/gcc/x86_64-linux-gnu/",
+            machine: "-march=x86-64 -mtune=generic -fcf-protection=none",
+        },
+        Architecture::Aarch64 => Tools {
+            cc: "/usr/bin/aarch64-linux-gnu-gcc",
+            ar: "/usr/bin/aarch64-linux-gnu-ar",
+            nm: "/usr/bin/aarch64-linux-gnu-nm",
+            objcopy: "/usr/bin/aarch64-linux-gnu-objcopy",
+            binutils: "/usr/aarch64-linux-gnu/bin/",
+            gcc_lib: "/usr/lib/gcc-cross/aarch64-linux-gnu/",
+            machine: "-march=armv8-a -mtune=generic -mno-outline-atomics -mbranch-protection=none",
+        },
+    }
+}
+
+/// The C compiler flags for one target: musl's headers and GCC's own
+/// freestanding ones only, at the include directory the root's GCC reports.
+pub(crate) struct CFlags {
+    architecture: Architecture,
+    flags: String,
+}
+
+impl CFlags {
+    fn new(architecture: Architecture, include: &str) -> Self {
+        let tools = tools(architecture);
+        let flags = format!(
+            "-nostdinc -isystem /musl/include -isystem {include} -B{} {} -fno-stack-protector -fno-stack-clash-protection -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer -g1 -ffile-prefix-map=/source=/td-build -ffile-prefix-map=/vendor=/td-cargo/vendor -ffile-prefix-map=/output=/td-build-root",
+            tools.binutils, tools.machine
+        );
+        Self {
+            architecture,
+            flags,
+        }
+    }
+
+    /// Ask the root's GCC for its freestanding include directory.
+    pub(crate) fn probe(architecture: Architecture) -> Result<Self> {
+        let tools = tools(architecture);
+        let mut command = Command::new(tools.cc);
+        command
+            .arg("-print-file-name=include")
+            .env_clear()
+            .stdin(Stdio::null());
+        crate::host_bin::arm_check_child(&mut command);
+        let name = format!("gcc-include-{}", architecture.name());
+        let output = bounded_output(&mut command, &name, 4096, 30)?;
+        let include = output.trim_end_matches('\n');
+        if include.contains(char::is_whitespace)
+            || !include.starts_with(tools.gcc_lib)
+            || include.split('/').any(|part| part == "..")
+            || !Path::new(include).join("stddef.h").is_file()
+        {
+            return Err(format!(
+                "{} names no freestanding include directory under {}: `{include}'",
+                tools.cc, tools.gcc_lib
+            ));
+        }
+        Ok(Self::new(architecture, include))
+    }
+
+    pub(crate) fn architecture(&self) -> Architecture {
+        self.architecture
+    }
+}
 
 #[cfg(test)]
 pub(crate) fn rust_flags() -> String {
@@ -94,19 +193,12 @@ pub(crate) fn rust_flags_architecture(architecture: Architecture) -> String {
     flags.join("\x1f")
 }
 
-pub(crate) fn cargo(verb: &str, package: &str) -> Command {
-    cargo_manifest(verb, Path::new(&format!("/source/{package}/Cargo.toml")))
+pub(crate) fn cargo(verb: &str, package: &str, c: &CFlags) -> Command {
+    cargo_manifest_architecture(verb, Path::new(&format!("/source/{package}/Cargo.toml")), c)
 }
 
-pub(crate) fn cargo_manifest(verb: &str, manifest: &Path) -> Command {
-    cargo_manifest_architecture(verb, manifest, Architecture::X86_64)
-}
-
-pub(crate) fn cargo_manifest_architecture(
-    verb: &str,
-    manifest: &Path,
-    architecture: Architecture,
-) -> Command {
+pub(crate) fn cargo_manifest_architecture(verb: &str, manifest: &Path, c: &CFlags) -> Command {
+    let architecture = c.architecture;
     let mut command = Command::new("/rust/bin/cargo");
     command
         .current_dir("/tmp")
@@ -128,8 +220,7 @@ pub(crate) fn cargo_manifest_architecture(
         .env("HOME", "/tmp/home")
         .env("CARGO_HOME", "/tmp/home")
         .env("CARGO_TARGET_DIR", "/output/target")
-        .env("PATH", "/rust/bin:/cc/bin:/binutils/bin")
-        .env("LD_LIBRARY_PATH", LIBRARIES)
+        .env("PATH", "/rust/bin")
         .env("RUSTC", "/rust/bin/rustc")
         .env("RUSTDOC", "/rust/bin/rustdoc")
         .env("CARGO_BUILD_JOBS", "2")
@@ -149,13 +240,8 @@ pub(crate) fn cargo_manifest_architecture(
         .env("PKG_CONFIG", "/td-crypto-decoy")
         .env("OPENSSL_DIR", "/undeclared-openssl")
         .stdin(Stdio::null());
-    let (cc, ar, flags) = match architecture {
-        Architecture::X86_64 => ("/cc/bin/gcc", "/binutils/bin/ar", NATIVE_FLAGS),
-        Architecture::Aarch64 => (
-            "/cross/bin/aarch64-linux-musl-gcc", "/cross/bin/aarch64-linux-musl-ar",
-            "-nostdinc -isystem /musl/include -isystem /cross/lib/gcc/aarch64-linux-musl/14.3.0/include -B/cross/aarch64-linux-musl/bin/ -march=armv8-a -mtune=generic -mno-outline-atomics -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer -g1 -ffile-prefix-map=/source=/td-build -ffile-prefix-map=/vendor=/td-cargo/vendor -ffile-prefix-map=/output=/td-build-root"
-        ),
-    };
+    let tools = tools(architecture);
+    let (cc, ar, flags) = (tools.cc, tools.ar, c.flags.as_str());
     for suffix in [
         String::new(),
         format!("_{}", architecture.triple()),
@@ -248,18 +334,12 @@ pub(crate) fn decoy_applet() -> std::process::ExitCode {
     crate::applet_exit("td-crypto-decoy", decoy().map(|()| 0))
 }
 
+/// Build scripts and proc macros link with the root's GCC against the
+/// root's own glibc, whose loader the namespace mounts at its usual path.
 pub(crate) fn host_linker(args: &[String]) -> Result<()> {
-    require_namespace(&["/cc/bin/gcc", "/binutils/bin/ld"])?;
-    let mut command = Command::new("/cc/bin/gcc");
-    command
-        .args([
-            "-B/binutils/bin/",
-            "-B/lib64/",
-            "-L/lib64/",
-            "-Wl,--dynamic-linker=/lib64/ld-linux-x86-64.so.2",
-            "-Wl,-rpath,/lib64",
-        ])
-        .args(args);
+    require_namespace(&[HOST_CC, "/usr/bin/ld", "/lib64/ld-linux-x86-64.so.2"])?;
+    let mut command = Command::new(HOST_CC);
+    command.arg(format!("-B{HOST_BINUTILS}")).args(args);
     crate::host_bin::arm_check_child(&mut command);
     let status = command
         .status()
@@ -442,10 +522,7 @@ fn split_mail_debug_architecture(receipt: &mut String, architecture: Architectur
     commands.push(prune);
     commands.push(vec!["--strip-all".into(), path_text(runtime)?]);
     for (index, args) in commands.iter().enumerate() {
-        let mut command = Command::new(match architecture {
-            Architecture::X86_64 => "/binutils/bin/objcopy",
-            Architecture::Aarch64 => "/cross/bin/aarch64-linux-musl-objcopy",
-        });
+        let mut command = Command::new(tools(architecture).objcopy);
         command.args(args).env_clear().stdin(Stdio::null());
         crate::host_bin::arm_check_child(&mut command);
         let name = format!("mail-debug-{index}");
@@ -510,16 +587,17 @@ pub(crate) fn build_inner() -> Result<()> {
         "/vendor",
         "/rust/bin/cargo",
         "/musl/include/stdint.h",
-        "/cc/bin/gcc",
-        "/binutils/bin/ar",
-        "/lib64",
-        "/gcc-runtime",
-        "/zlib",
+        HOST_CC,
+        "/usr/bin/ar",
+        "/usr/bin/nm",
+        "/usr/bin/objcopy",
+        "/lib64/ld-linux-x86-64.so.2",
     ])?;
     fs::create_dir_all("/tmp/home").map_err(|e| format!("portable Cargo home: {e}"))?;
+    let c = CFlags::probe(Architecture::X86_64)?;
     let mut receipt = String::from("cargo-environment cleared\n");
     for package in ["td-crypto", "td-mta"] {
-        let mut command = cargo("tree", package);
+        let mut command = cargo("tree", package, &c);
         command.args([
             "--edges",
             "normal,build",
@@ -534,7 +612,7 @@ pub(crate) fn build_inner() -> Result<()> {
         let graph = bounded_output(&mut command, &name, 256 * 1024, 1200)?;
         crate::crypto_policy::active_graph(Path::new("/source"), package, &graph)?;
     }
-    let mut command = cargo("build", "td-mta");
+    let mut command = cargo("build", "td-mta", &c);
     command.args([
         "--release",
         "--bin",
@@ -544,7 +622,7 @@ pub(crate) fn build_inner() -> Result<()> {
     command_record(&command, "mail-build", &mut receipt)?;
     let output = bounded_output(&mut command, "mail-build", 8 * 1024 * 1024, 1200)?;
     let mail = executable(&output, "td-mta", ArtifactKind::Installed)?;
-    let mut command = cargo("test", "td-mta");
+    let mut command = cargo("test", "td-mta", &c);
     command.args([
         "--release",
         "--test",
@@ -556,7 +634,7 @@ pub(crate) fn build_inner() -> Result<()> {
     command_record(&command, "mail-cli-build", &mut receipt)?;
     let output = bounded_output(&mut command, "mail-cli-build", 8 * 1024 * 1024, 1200)?;
     let cli = executable(&output, "operator_cli", ArtifactKind::IntegrationTest)?;
-    let mut command = cargo("test", "td-crypto");
+    let mut command = cargo("test", "td-crypto", &c);
     command.args([
         "--release",
         "--lib",
@@ -566,7 +644,7 @@ pub(crate) fn build_inner() -> Result<()> {
     command_record(&command, "crypto-build", &mut receipt)?;
     let output = bounded_output(&mut command, "crypto-build", 8 * 1024 * 1024, 1200)?;
     let crypto = executable(&output, "td_crypto", ArtifactKind::LibraryTest)?;
-    let mut command = cargo("test", "td-mta");
+    let mut command = cargo("test", "td-mta", &c);
     command.args([
         "--release",
         "--test",
@@ -577,7 +655,7 @@ pub(crate) fn build_inner() -> Result<()> {
     command_record(&command, "config-stack-build", &mut receipt)?;
     let output = bounded_output(&mut command, "config-stack-build", 8 * 1024 * 1024, 1200)?;
     let config = executable(&output, "config_stack", ArtifactKind::IntegrationTest)?;
-    let mut command = cargo("test", "td-mta");
+    let mut command = cargo("test", "td-mta", &c);
     command.args([
         "--release",
         "--test",
@@ -588,7 +666,7 @@ pub(crate) fn build_inner() -> Result<()> {
     command_record(&command, "format-digest-build", &mut receipt)?;
     let output = bounded_output(&mut command, "format-digest-build", 8 * 1024 * 1024, 1200)?;
     let format = executable(&output, "format_rows", ArtifactKind::IntegrationTest)?;
-    let mut command = cargo("test", "td-mta");
+    let mut command = cargo("test", "td-mta", &c);
     command.args([
         "--release",
         "--lib",
@@ -598,7 +676,7 @@ pub(crate) fn build_inner() -> Result<()> {
     command_record(&command, "mail-transport-build", &mut receipt)?;
     let output = bounded_output(&mut command, "mail-transport-build", 8 * 1024 * 1024, 1200)?;
     let transport = executable(&output, "td_mta", ArtifactKind::LibraryTest)?;
-    let mut command = cargo("test", "td-mta");
+    let mut command = cargo("test", "td-mta", &c);
     command.args([
         "--release",
         "--test",
@@ -609,7 +687,7 @@ pub(crate) fn build_inner() -> Result<()> {
     command_record(&command, "rust-allocation-build", &mut receipt)?;
     let output = bounded_output(&mut command, "rust-allocation-build", 8 * 1024 * 1024, 1200)?;
     let allocation = executable(&output, "rust_alloc_probe", ArtifactKind::IntegrationTest)?;
-    let mut command = cargo("rustc", "td-mta");
+    let mut command = cargo("rustc", "td-mta", &c);
     command.args([
         "--release",
         "--test",
@@ -632,7 +710,7 @@ pub(crate) fn build_inner() -> Result<()> {
         1200,
     )?;
     let native = executable(&output, "native_alloc_probe", ArtifactKind::IntegrationTest)?;
-    let mut command = cargo("test", "td-mta");
+    let mut command = cargo("test", "td-mta", &c);
     command.args([
         "--release",
         "--test",
@@ -657,7 +735,7 @@ pub(crate) fn build_inner() -> Result<()> {
     .into_iter()
     .enumerate()
     {
-        let mut command = Command::new("/binutils/bin/nm");
+        let mut command = Command::new(tools(Architecture::X86_64).nm);
         command
             .arg("--defined-only")
             .arg(binary)
@@ -692,7 +770,7 @@ pub(crate) fn build_inner() -> Result<()> {
     )?;
     copy_binary(&rss, Path::new("/output/artifacts/td-mta-rss-probe"))?;
     split_mail_debug(&mut receipt)?;
-    crate::crypto_api::qualify(&mut receipt)?;
+    crate::crypto_api::qualify(&mut receipt, &c)?;
     refuse_decoy(Path::new("/output"))?;
     write_new(Path::new("/output/artifacts/COMMANDS"), receipt.as_bytes())?;
     Ok(())
@@ -706,20 +784,20 @@ pub(crate) fn cross_build_inner() -> Result<()> {
         "/vendor",
         "/rust/bin/cargo",
         "/musl/include/stdint.h",
-        "/cc/bin/gcc",
-        "/cross/bin/aarch64-linux-musl-gcc",
-        "/cross/bin/aarch64-linux-musl-ar",
-        "/cross/bin/aarch64-linux-musl-nm",
-        "/cross/bin/aarch64-linux-musl-objcopy",
-        "/lib64",
-        "/gcc-runtime",
-        "/zlib",
+        HOST_CC,
+        "/usr/bin/aarch64-linux-gnu-gcc",
+        "/usr/bin/aarch64-linux-gnu-ar",
+        "/usr/bin/aarch64-linux-gnu-nm",
+        "/usr/bin/aarch64-linux-gnu-objcopy",
+        "/usr/aarch64-linux-gnu/bin/as",
+        "/lib64/ld-linux-x86-64.so.2",
     ])?;
     fs::create_dir_all("/tmp/home").map_err(|e| format!("portable Cargo home: {e}"))?;
+    let c = CFlags::probe(architecture)?;
     let mut receipt = String::from("cargo-environment cleared\nruntime not-run cross-compiled\n");
     for package in ["td-crypto", "td-mta"] {
         let manifest = format!("/source/{package}/Cargo.toml");
-        let mut command = cargo_manifest_architecture("tree", Path::new(&manifest), architecture);
+        let mut command = cargo_manifest_architecture("tree", Path::new(&manifest), &c);
         command.args([
             "--edges",
             "normal,build",
@@ -777,7 +855,7 @@ pub(crate) fn cross_build_inner() -> Result<()> {
         let mut command = cargo_manifest_architecture(
             if test { "test" } else { "build" },
             Path::new(&manifest),
-            architecture,
+            &c,
         );
         command
             .args(["--release", "--message-format=json-render-diagnostics"])
@@ -789,7 +867,7 @@ pub(crate) fn cross_build_inner() -> Result<()> {
         command_record(&command, &label, &mut receipt)?;
         let output = bounded_output(&mut command, &label, 8 * 1024 * 1024, 1200)?;
         let binary = executable_for(&output, name, kind, architecture)?;
-        let mut symbols = Command::new("/cross/bin/aarch64-linux-musl-nm");
+        let mut symbols = Command::new(tools(architecture).nm);
         symbols
             .arg("--defined-only")
             .arg(&binary)
@@ -806,7 +884,7 @@ pub(crate) fn cross_build_inner() -> Result<()> {
     }
     refuse_decoy(Path::new("/output"))?;
     split_mail_debug_architecture(&mut receipt, architecture)?;
-    crate::crypto_api::qualify_architecture(&mut receipt, architecture)?;
+    crate::crypto_api::qualify(&mut receipt, &c)?;
     refuse_decoy(Path::new("/output"))?;
     write_new(Path::new("/output/artifacts/COMMANDS"), receipt.as_bytes())?;
     Ok(())
@@ -1383,6 +1461,39 @@ fn bind(source: &Path, destination: &str, readonly: bool) -> Result<crate::sandb
         readonly,
         ro_optional: false,
     })
+}
+
+/// Every mount of the compile namespace: the declared inputs read-only, the
+/// private output, and from the authenticated build root `BUILD_ROOT_BINDS`
+/// alone.
+fn compile_binds(
+    source: &Path,
+    vendor: &Path,
+    inputs: &crate::crypto_portable::Inputs,
+    helper: &Path,
+    output: &Path,
+) -> Result<Vec<crate::sandbox::Bind>> {
+    let mut binds = vec![
+        bind(source, "/source", true)?,
+        bind(vendor, "/vendor", true)?,
+        bind(&inputs.rust, "/rust", true)?,
+        bind(&inputs.headers, "/musl", true)?,
+        bind(helper, "/td-builder", true)?,
+        bind(helper, "/td-crypto-host-linker", true)?,
+        bind(helper, "/td-crypto-decoy", true)?,
+        bind(output, "/output", false)?,
+    ];
+    for (inside, destination) in BUILD_ROOT_BINDS {
+        let directory = inputs.build_root.directory.join(inside);
+        if !fs::symlink_metadata(&directory).is_ok_and(|m| m.is_dir()) {
+            return Err(format!(
+                "build root lacks a real directory {}",
+                directory.display()
+            ));
+        }
+        binds.push(bind(&directory, destination, true)?);
+    }
+    Ok(binds)
 }
 
 fn source_tree(source: &Path, destination: &Path, depth: usize) -> Result<()> {
@@ -2064,16 +2175,7 @@ fn build_architecture(
     crate::elf::assert_static(&helper)?;
     let output = scratch.0.join("output");
     fs::create_dir(&output).map_err(|e| format!("create portable output: {e}"))?;
-    let mut binds = vec![
-        bind(&source, "/source", true)?,
-        bind(&vendor, "/vendor", true)?,
-        bind(&inputs.rust, "/rust", true)?,
-        bind(&inputs.headers, "/musl", true)?,
-        bind(&helper, "/td-builder", true)?,
-        bind(&helper, "/td-crypto-host-linker", true)?,
-        bind(&helper, "/td-crypto-decoy", true)?,
-        bind(&output, "/output", false)?,
-    ];
+    let binds = compile_binds(&source, &vendor, &inputs, &helper, &output)?;
     let header_digest = crate::sandbox::nar_hash_of(&inputs.headers)
         .map_err(|e| format!("hash portable headers: {e}"))?;
     let helper_digest =
@@ -2082,10 +2184,7 @@ fn build_architecture(
     let mut receipt = format!(
         "portable-build 1\nsource {source_digest}\nvendor {vendor_digest}\nrust-kit {kit_digest}\nheaders {header_digest}\nhelper {helper_digest}\ntarget {target}\n"
     );
-    for input in inputs.native {
-        binds.push(bind(&input.directory, input.inside, true)?);
-        receipt.push_str(&input.record);
-    }
+    receipt.push_str(&inputs.build_root.record);
     enter(
         "/td-builder",
         &[
@@ -2795,7 +2894,9 @@ mod tests {
         }
         assert!(native_allocation_symbols("000 T __wrap_memalign", false).is_err());
         assert!(!rust_flags().contains("--wrap"));
-        assert!(!NATIVE_FLAGS.contains("--wrap"));
+        assert!(!CFlags::new(Architecture::X86_64, "/include")
+            .flags
+            .contains("--wrap"));
         let measured = format!("native_registry_storage_bytes=1048608\nnative_counter_storage_bytes=56\nnative_thread_flag_bytes=1\n{NATIVE_SUCCESS}");
         assert!(native_allocation_evidence(&measured, false).is_ok());
         assert!(native_allocation_evidence(&measured.replace("=56", "=0"), false).is_err());
@@ -3127,10 +3228,11 @@ mod tests {
 
     #[test]
     fn arm_cargo_selects_cross_tools_but_keeps_the_host_linker() {
+        let include = "/usr/lib/gcc-cross/aarch64-linux-gnu/14/include";
         let command = cargo_manifest_architecture(
             "build",
             Path::new("/source/td-mta/Cargo.toml"),
-            Architecture::Aarch64,
+            &CFlags::new(Architecture::Aarch64, include),
         );
         let args: Vec<_> = command.get_args().collect();
         assert!(args.contains(&std::ffi::OsStr::new("aarch64-unknown-linux-musl")));
@@ -3143,8 +3245,13 @@ mod tests {
             assert_eq!(
                 env.get(std::ffi::OsStr::new(key)),
                 Some(&Some(std::ffi::OsStr::new(
-                    "/cross/bin/aarch64-linux-musl-gcc"
+                    "/usr/bin/aarch64-linux-gnu-gcc"
                 )))
+            );
+            let ar = key.replacen("CC", "AR", 1);
+            assert_eq!(
+                env.get(std::ffi::OsStr::new(&ar)),
+                Some(&Some(std::ffi::OsStr::new("/usr/bin/aarch64-linux-gnu-ar")))
             );
         }
         assert_eq!(
@@ -3159,8 +3266,18 @@ mod tests {
             .unwrap()
             .to_str()
             .unwrap();
-        assert!(flags.contains("/cross/lib/gcc/aarch64-linux-musl/14.3.0/include"));
-        assert!(flags.contains("-march=armv8-a"));
+        assert!(flags.contains(&format!("-isystem /musl/include -isystem {include} ")));
+        assert!(flags.contains("-B/usr/aarch64-linux-gnu/bin/ "));
+        for pinned in [
+            "-march=armv8-a",
+            "-mno-outline-atomics",
+            "-mbranch-protection=none",
+            "-fno-stack-protector",
+            "-fno-stack-clash-protection",
+            "-fno-omit-frame-pointer",
+        ] {
+            assert!(flags.contains(pinned), "{pinned}");
+        }
         assert!(!flags.contains("-march=x86-64"));
         assert_eq!(
             env.get(std::ffi::OsStr::new("HOST_CC")),
@@ -3176,16 +3293,36 @@ mod tests {
 
     #[test]
     fn cargo_uses_fixed_tools_flags_and_native_fallback_decoys() {
-        let command = cargo("build", "td-mta");
+        let include = "/usr/lib/gcc/x86_64-linux-gnu/14/include";
+        let command = cargo(
+            "build",
+            "td-mta",
+            &CFlags::new(Architecture::X86_64, include),
+        );
         let env: BTreeMap<_, _> = command
             .get_envs()
             .filter_map(|(k, v)| v.map(|v| (k.to_string_lossy(), v.to_string_lossy())))
             .collect();
-        assert_eq!(env.get("CC").unwrap(), "/cc/bin/gcc");
-        assert_eq!(env.get("AR").unwrap(), "/binutils/bin/ar");
+        assert_eq!(env.get("CC").unwrap(), "/usr/bin/gcc");
+        assert_eq!(env.get("AR").unwrap(), "/usr/bin/ar");
         assert_eq!(env.get("CMAKE").unwrap(), "/td-crypto-decoy");
         assert_eq!(env.get("PKG_CONFIG").unwrap(), "/td-crypto-decoy");
-        assert!(env.get("CFLAGS").unwrap().contains("-nostdinc"));
+        // The root's /usr/bin holds a real cmake and pkg-config.
+        assert_eq!(env.get("PATH").unwrap(), "/rust/bin");
+        assert!(!env.contains_key("LD_LIBRARY_PATH"));
+        let flags = env.get("CFLAGS").unwrap();
+        assert!(flags.starts_with(&format!(
+            "-nostdinc -isystem /musl/include -isystem {include} -B/usr/bin/ "
+        )));
+        for pinned in [
+            "-march=x86-64",
+            "-fcf-protection=none",
+            "-fno-stack-protector",
+            "-fno-stack-clash-protection",
+            "-fno-omit-frame-pointer",
+        ] {
+            assert!(flags.contains(pinned), "{pinned}");
+        }
         assert!(env
             .get("CARGO_ENCODED_RUSTFLAGS")
             .unwrap()
@@ -3216,5 +3353,86 @@ mod tests {
         fs::remove_dir_all(&destination).unwrap();
         symlink(&source, &destination).unwrap();
         assert!(publish().is_err());
+    }
+
+    #[test]
+    fn the_compile_namespace_mounts_only_the_build_roots_paths_and_no_td_glibc_role() {
+        let scratch = crate::test_temp::TempDir::new("td-crypto-binds").unwrap();
+        let root = scratch.join("debian-build-root");
+        for directory in ["usr/bin", "usr/lib/x86_64-linux-gnu", "usr/lib64", "etc"] {
+            fs::create_dir_all(root.join(directory)).unwrap();
+        }
+        for name in ["lib", "lib64", "bin"] {
+            symlink(format!("usr/{name}"), root.join(name)).unwrap();
+        }
+        let inputs = crate::crypto_portable::Inputs {
+            rust: scratch.join("rust"),
+            headers: scratch.join("musl"),
+            build_root: crate::crypto_portable::BuildRoot {
+                directory: root.clone(),
+                record: String::new(),
+                _lock: std::fs::File::create(scratch.join("ladder.lock")).unwrap(),
+            },
+        };
+        let input = |name: &str| scratch.join(name);
+        let binds = compile_binds(
+            &input("source"),
+            &input("vendor"),
+            &inputs,
+            &input("helper"),
+            &input("output"),
+        )
+        .unwrap();
+        let mounted: BTreeMap<_, _> = binds
+            .iter()
+            .map(|b| (b.dest.clone().unwrap(), (b.src.clone(), b.readonly)))
+            .collect();
+        assert_eq!(mounted.len(), binds.len());
+        let from_root: BTreeMap<_, _> = mounted
+            .iter()
+            .filter(|(_, (src, _))| Path::new(src).starts_with(&root))
+            .map(|(dest, (src, readonly))| {
+                assert!(readonly, "{dest}");
+                (dest.as_str(), src.clone())
+            })
+            .collect();
+        let expected: BTreeMap<_, _> = [
+            ("/usr", "usr"),
+            ("/lib", "usr/lib"),
+            ("/lib64", "usr/lib64"),
+        ]
+        .into_iter()
+        .map(|(dest, inside)| (dest, root.join(inside).to_str().unwrap().to_owned()))
+        .collect();
+        assert_eq!(from_root, expected);
+        let declared: Vec<_> = mounted.keys().map(String::as_str).collect();
+        assert_eq!(
+            declared,
+            [
+                "/lib",
+                "/lib64",
+                "/musl",
+                "/output",
+                "/rust",
+                "/source",
+                "/td-builder",
+                "/td-crypto-decoy",
+                "/td-crypto-host-linker",
+                "/usr",
+                "/vendor",
+            ]
+        );
+        assert!(!mounted.get("/output").unwrap().1);
+        // A root whose usrmerge target is a link is refused, not followed.
+        fs::remove_dir(root.join("usr/lib64")).unwrap();
+        symlink("lib", root.join("usr/lib64")).unwrap();
+        let refused = compile_binds(
+            &input("source"),
+            &input("vendor"),
+            &inputs,
+            &input("helper"),
+            &input("output"),
+        );
+        assert!(refused.is_err_and(|e| e.contains("usr/lib64")));
     }
 }

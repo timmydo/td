@@ -976,8 +976,9 @@ behavior before consumers depend on it; exact versions belong in the
 lock/review.
 
 The portable musl artifact has a separate, host-only build manifest: pin Rust
-and its target standard library, the musl C compiler/linker and sysroot needed
-by the crypto provider, and their source/artifact checksums and provenance.
+and its target standard library, the musl headers, the C compiler and binutils
+needed by the crypto provider (the pinned Debian build root's), and their
+source/artifact checksums and provenance.
 Provision them before offline builds; ambient host tools cannot silently fill
 missing inputs. M03b2 owns these exact pins and a clean build fixture. This
 portability workflow is outside td's source-built glibc target artifact graph;

@@ -1,9 +1,8 @@
 //! Host-only, pinned inputs for the standalone musl artifact.
 
 use crate::crypto_headers::Architecture;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -47,13 +46,6 @@ const RUST: &[Archive] = &[
     },
 ];
 
-struct NativeInput {
-    graph: &'static str,
-    recipe: &'static str,
-    directory: &'static str,
-    inside: &'static str,
-}
-
 const ARM_RUST: &[Archive] = &[Archive {
     name: "rust-std-1.96.0-aarch64-unknown-linux-musl",
     component: "rust-std-aarch64-unknown-linux-musl",
@@ -71,198 +63,6 @@ fn rust_archives(architecture: Architecture) -> impl Iterator<Item = &'static Ar
             Architecture::X86_64 => [].iter(),
             Architecture::Aarch64 => ARM_RUST.iter(),
         })
-}
-
-const ARM_NATIVE: &[NativeInput] = &[NativeInput {
-    graph: "gcc-aarch64-cross",
-    recipe: "gcc-aarch64-cross",
-    directory: "",
-    inside: "/cross",
-}];
-
-const NATIVE: &[NativeInput] = &[
-    NativeInput {
-        graph: "gcc-x86-64-self",
-        recipe: "gcc-x86-64-self",
-        directory: "stage/td/store/gcc-14.3.0-x86_64-self",
-        inside: "/cc",
-    },
-    NativeInput {
-        graph: "gcc-x86-64-self",
-        recipe: "binutils-x86-64-self",
-        directory: "",
-        inside: "/binutils",
-    },
-    NativeInput {
-        graph: "gcc-x86-64-self",
-        recipe: "glibc-x86-64",
-        directory: "stage/td/store/glibc-2.41-x86_64/lib",
-        inside: "/lib64",
-    },
-    NativeInput {
-        graph: "gcc-x86-64-self",
-        recipe: "gcc-x86-64-stage2",
-        directory: "stage/td/store/gcc-14.3.0-x86_64/x86_64-pc-linux-gnu/lib64",
-        inside: "/gcc-runtime",
-    },
-    NativeInput {
-        graph: "zlib-x86-64",
-        recipe: "zlib-x86-64",
-        directory: "lib",
-        inside: "/zlib",
-    },
-];
-
-pub(crate) struct NativeTree {
-    pub(crate) inside: &'static str,
-    pub(crate) directory: PathBuf,
-    pub(crate) record: String,
-}
-
-#[derive(Default)]
-struct NativeLog {
-    outputs: BTreeMap<String, PathBuf>,
-    work: Option<PathBuf>,
-    tail: String,
-    invalid: Option<String>,
-}
-
-fn absolute_record(text: &str) -> Result<PathBuf> {
-    let path = PathBuf::from(text);
-    if !path.is_absolute()
-        || path
-            .components()
-            .any(|p| matches!(p, std::path::Component::ParentDir))
-    {
-        return Err("native output path must be absolute without parent traversal".into());
-    }
-    Ok(path)
-}
-
-fn native_record(
-    line: &[u8],
-    truncated: bool,
-    inputs: &[&NativeInput],
-    log: &mut NativeLog,
-) -> Result<()> {
-    if !line.starts_with(b"TD_RECIPE_RUN_OUT ") && !line.starts_with(b"TD_RECIPE_RUN_WORK ") {
-        return Ok(());
-    }
-    if truncated || !line.ends_with(b"\n") {
-        return Err("overlong or unterminated native output record".into());
-    }
-    let text = std::str::from_utf8(line)
-        .map_err(|e| format!("native record UTF-8: {e}"))?
-        .trim_end_matches(['\r', '\n']);
-    if let Some(path) = text.strip_prefix("TD_RECIPE_RUN_WORK ") {
-        if log.work.replace(absolute_record(path)?).is_some() {
-            return Err("duplicate native work record".into());
-        }
-    } else if let Some(record) = text.strip_prefix("TD_RECIPE_RUN_OUT ") {
-        let (name, path) = record
-            .split_once(' ')
-            .ok_or("malformed native output record")?;
-        if !inputs.iter().any(|input| input.recipe == name) {
-            return Err(format!("unexpected native output record: {name}"));
-        }
-        if log
-            .outputs
-            .insert(name.into(), absolute_record(path)?)
-            .is_some()
-        {
-            return Err(format!("duplicate native output record: {name}"));
-        }
-    }
-    Ok(())
-}
-
-fn native_log(mut reader: impl BufRead, inputs: &[&NativeInput]) -> Result<NativeLog> {
-    let mut log = NativeLog::default();
-    let mut tail = VecDeque::new();
-    loop {
-        let mut line = Vec::new();
-        let mut truncated = false;
-        let mut ended = false;
-        loop {
-            let bytes = reader
-                .fill_buf()
-                .map_err(|e| format!("read native log: {e}"))?;
-            if bytes.is_empty() {
-                break;
-            }
-            let count = if let Some(end) = bytes.iter().position(|b| *b == b'\n') {
-                ended = true;
-                end + 1
-            } else {
-                bytes.len()
-            };
-            let keep = count.min(65_536usize.saturating_sub(line.len()));
-            line.extend_from_slice(bytes.get(..keep).ok_or("native log buffer bounds")?);
-            truncated |= keep < count;
-            reader.consume(count);
-            if ended {
-                break;
-            }
-        }
-        if line.is_empty() {
-            break;
-        }
-        if let Err(e) = native_record(&line, truncated, inputs, &mut log) {
-            if log.invalid.is_none() {
-                log.invalid = Some(e);
-            }
-        }
-        let mut diagnostic = String::from_utf8_lossy(&line).into_owned();
-        if truncated {
-            diagnostic.push_str("… [line truncated]\n");
-        }
-        if tail.len() == 30 {
-            tail.pop_front();
-        }
-        tail.push_back(diagnostic);
-        if !ended {
-            break;
-        }
-    }
-    log.tail = tail.into_iter().collect();
-    Ok(log)
-}
-
-fn durable_output(work: &Path, staged: &Path) -> Result<PathBuf> {
-    if !staged.starts_with(work.join("scratch")) {
-        return Err("native staged output is outside evaluator scratch".into());
-    }
-    let name = staged.file_name().ok_or("native output lacks a name")?;
-    // The evaluator publishes complete cache trees and reclaims them by
-    // rename, whereas scratch cleanup may leave a partially deleted tree.
-    Ok(work.join("build-cache/store").join(name))
-}
-
-fn role_directory(output: &Path, role: &str) -> Result<PathBuf> {
-    if !fs::symlink_metadata(output).is_ok_and(|m| m.is_dir()) {
-        return Err("native cache root is not a real directory".into());
-    }
-    let directory = if role.is_empty() {
-        output.to_path_buf()
-    } else {
-        output.join(role)
-    };
-    if !fs::symlink_metadata(&directory).is_ok_and(|m| m.is_dir()) {
-        return Err(format!(
-            "native recipe layout changed: {}",
-            directory.display()
-        ));
-    }
-    let directory = directory
-        .canonicalize()
-        .map_err(|e| format!("resolve native input: {e}"))?;
-    let canonical_output = output
-        .canonicalize()
-        .map_err(|e| format!("resolve native output: {e}"))?;
-    if !directory.starts_with(canonical_output) {
-        return Err("native input directory escapes its recipe output".into());
-    }
-    Ok(directory)
 }
 
 fn tree_hash(path: &Path) -> Result<String> {
@@ -318,109 +118,112 @@ pub(crate) fn publish_tree(
     Ok(destination)
 }
 
-fn retain_native(
-    source: &Path,
-    parent: &Path,
-    scratch: &Scratch,
-    name: &str,
-) -> Result<(PathBuf, String)> {
-    let expected = tree_hash(source)?;
-    let destination = cache_path(parent, name, &expected)?;
-    if verified_cache(&destination, &expected)? {
-        return Ok((destination, expected));
-    }
-    let private = scratch.0.join(name);
-    crate::build::copy_tree_writable(source, &private)?;
-    if tree_hash(&private)? != expected || tree_hash(source)? != expected {
-        return Err("native output changed during retention; retry preparation".into());
-    }
-    let destination = publish_tree(&private, parent, name, &expected)?;
-    Ok((destination, expected))
+/// The pinned Debian build root (AGENTS.md, "Debian build root"): the
+/// portable compile's C toolchain and the host runtime its upstream Rust
+/// tools and build scripts run on.
+pub(crate) struct BuildRoot {
+    /// The authenticated tree on disk.
+    pub(crate) directory: PathBuf,
+    /// Its store path and pinned NAR hash, for `BUILD-INPUTS`.
+    pub(crate) record: String,
+    /// The evaluator's ladder lock, held shared while the tree is bound, as
+    /// a build holds it: `clear-store` cannot remove the tree under the
+    /// kit's mounts.
+    pub(crate) _lock: fs::File,
 }
 
-fn native_outputs(root: &Path, architecture: Architecture) -> Result<Vec<NativeTree>> {
+fn absolute_record(text: &str) -> Result<PathBuf> {
+    let path = PathBuf::from(text);
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|p| matches!(p, std::path::Component::ParentDir))
+    {
+        return Err("build root seed path must be absolute without parent traversal".into());
+    }
+    Ok(path)
+}
+
+/// The seed store, seed db and ladder lock `td-recipe-eval build-root-seed`
+/// reports. Other lines (progress) are skipped; each record must appear once.
+fn seed_record(text: &str) -> Result<(PathBuf, PathBuf, PathBuf)> {
+    let (mut store, mut db, mut lock) = (None, None, None);
+    for line in text.lines() {
+        let (slot, path) = if let Some(path) = line.strip_prefix("TD_BUILD_ROOT_STORE ") {
+            (&mut store, path)
+        } else if let Some(path) = line.strip_prefix("TD_BUILD_ROOT_SEED_DB ") {
+            (&mut db, path)
+        } else if let Some(path) = line.strip_prefix("TD_BUILD_ROOT_LOCK ") {
+            (&mut lock, path)
+        } else {
+            continue;
+        };
+        if slot.replace(absolute_record(path)?).is_some() {
+            return Err("duplicate build root seed record".into());
+        }
+    }
+    Ok((
+        store.ok_or("td-recipe-eval reported no build root seed store")?,
+        db.ok_or("td-recipe-eval reported no build root seed db")?,
+        lock.ok_or("td-recipe-eval reported no ladder lock")?,
+    ))
+}
+
+/// The evaluator places the root in the machine's shared seed store, as a
+/// build-root recipe's check does. Its answer only says where to look:
+/// td-builder authenticates that tree against its own compiled lock,
+/// re-hashing the bytes it will bind.
+fn build_root(root: &Path) -> Result<BuildRoot> {
     let parent = root.join(".td-build-cache");
     let evaluator = crate::stage0::recipe_eval_place(root, &parent.join("recipe-eval"))?;
     let scratch = Scratch::new(&parent)?;
-    let log_path = scratch.0.join("native.log");
-    eprintln!(
-        "portable: realizing the declared td GNU inputs (a cold source bootstrap can take hours)"
-    );
-    let selected: Vec<_> = NATIVE
-        .iter()
-        .chain(match architecture {
-            Architecture::X86_64 => [].iter(),
-            Architecture::Aarch64 => ARM_NATIVE.iter(),
-        })
-        .collect();
-    let mut trees = Vec::new();
-    for graph in selected
-        .iter()
-        .map(|input| input.graph)
-        .collect::<BTreeSet<_>>()
-    {
-        let inputs: Vec<_> = selected
-            .iter()
-            .copied()
-            .filter(|input| input.graph == graph)
-            .collect();
-        let log =
-            fs::File::create(&log_path).map_err(|e| format!("create native build log: {e}"))?;
-        let mut command = Command::new(&evaluator);
-        command.current_dir(root).arg("build-run").arg(graph);
-        for input in &inputs {
-            command.arg(input.recipe);
-        }
-        command
-            .stdout(
-                log.try_clone()
-                    .map_err(|e| format!("clone native log: {e}"))?,
-            )
-            .stderr(log);
-        crate::host_bin::arm_check_child(&mut command);
-        let status = command
-            .status()
-            .map_err(|e| format!("realize portable native inputs: {e}"))?;
-        let reader = BufReader::new(fs::File::open(&log_path).map_err(|e| {
-            format!("portable native graph {graph} exited ({status}); log open failed: {e}")
-        })?);
-        let log = native_log(reader, &inputs).map_err(|e| {
-            format!("portable native graph {graph} exited ({status}); log read failed: {e}")
-        })?;
-        if !status.success() {
-            return Err(format!(
-                "portable native graph {graph} failed ({status}):\n{}",
-                log.tail
-            ));
-        }
-        if let Some(error) = log.invalid {
-            return Err(format!(
-                "portable native graph {graph} exited ({status}); {error}"
-            ));
-        }
-        let work = log
-            .work
-            .ok_or("native realization did not return its work directory")?;
-        for input in inputs {
-            let staged = log
-                .outputs
-                .get(input.recipe)
-                .ok_or_else(|| format!("native realization did not return {}", input.recipe))?;
-            let identity = staged
-                .file_name()
-                .and_then(|s| s.to_str())
-                .ok_or("native output lacks a UTF-8 name")?;
-            let source = durable_output(&work, staged)?;
-            let (output, digest) = retain_native(&source, &parent, &scratch, input.recipe)?;
-            let directory = role_directory(&output, input.directory)?;
-            trees.push(NativeTree {
-                inside: input.inside,
-                directory,
-                record: format!("native {} {identity} {digest}\n", input.recipe),
-            });
-        }
+    let report = scratch.0.join("build-root-seed.out");
+    let output =
+        fs::File::create(&report).map_err(|e| format!("create build root seed report: {e}"))?;
+    let mut command = Command::new(&evaluator);
+    command
+        .current_dir(root)
+        .arg("build-root-seed")
+        .stdout(output);
+    crate::host_bin::arm_check_child(&mut command);
+    let status = command
+        .status()
+        .map_err(|e| format!("place the portable build root: {e}"))?;
+    if !status.success() {
+        return Err(format!(
+            "td-recipe-eval build-root-seed failed ({status}); a cold root needs `td-feed warm build-root'"
+        ));
     }
-    Ok(trees)
+    let text = crate::crypto_isolated::read_output(&report, "build-root-seed", 64 * 1024)?;
+    let (store, seed_db, ladder) = seed_record(&text)?;
+    // Taken before the tree is authenticated, so what is hashed is what stays
+    // bound; a `clear-store` between the evaluator's exit and this only makes
+    // the authentication below fail.
+    let held = fs::File::open(&ladder)
+        .map_err(|e| format!("open the ladder lock {}: {e}", ladder.display()))?;
+    held.lock_shared()
+        .map_err(|e| format!("lock the ladder {}: {e}", ladder.display()))?;
+    let lock = crate::build_root::lock()?;
+    let db = crate::build_root::db_path(&seed_db, &lock)?;
+    let path = crate::build_root::authenticate_db(&db, &store)?;
+    let (_, tree) = crate::build_root::pinned()?;
+    let base = path
+        .rsplit('/')
+        .next()
+        .filter(|base| !base.is_empty())
+        .ok_or("build root store path has no basename")?;
+    let directory = store.join(base);
+    if !fs::symlink_metadata(&directory).is_ok_and(|m| m.is_dir()) {
+        return Err(format!(
+            "build root is not a real directory: {}",
+            directory.display()
+        ));
+    }
+    Ok(BuildRoot {
+        directory,
+        record: format!("build-root {path} {tree}\n"),
+        _lock: held,
+    })
 }
 
 struct Scratch(PathBuf);
@@ -613,7 +416,7 @@ fn prepare_rust(root: &Path, archives: &Path, architecture: Architecture) -> Res
 pub(crate) struct Inputs {
     pub(crate) rust: PathBuf,
     pub(crate) headers: PathBuf,
-    pub(crate) native: Vec<NativeTree>,
+    pub(crate) build_root: BuildRoot,
 }
 
 pub(crate) fn inputs_architecture(
@@ -628,7 +431,7 @@ pub(crate) fn inputs_architecture(
             &archives.join("musl-1.2.5.tar.gz"),
             architecture,
         )?,
-        native: native_outputs(root, architecture)?,
+        build_root: build_root(root)?,
     })
 }
 
@@ -644,14 +447,11 @@ pub(crate) fn prepare_architecture(
     let inputs = inputs_architecture(root, archives, architecture)?;
     println!("portable-rust {}", inputs.rust.display());
     println!("portable-musl-headers {}", inputs.headers.display());
-    for tree in inputs.native {
-        print!("{}", tree.record);
-        println!(
-            "portable-native-bind {} {}",
-            tree.inside,
-            tree.directory.display()
-        );
-    }
+    print!("{}", inputs.build_root.record);
+    println!(
+        "portable-build-root {}",
+        inputs.build_root.directory.display()
+    );
     Ok(())
 }
 
@@ -659,7 +459,6 @@ pub(crate) fn prepare_architecture(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
     use std::os::unix::fs::{symlink, PermissionsExt};
 
     #[test]
@@ -709,69 +508,6 @@ mod tests {
         symlink(&private, &source).unwrap();
         assert!(copy_archive(&source, &scratch.0.join("link"), &pin).is_err());
         assert!(copy_archive(&private, &private, &pin).is_err());
-    }
-
-    #[test]
-    fn native_records_reject_ambiguity_and_bound_logs() {
-        let inputs = vec![NATIVE.first().unwrap()];
-        let good = "building\nTD_RECIPE_RUN_OUT gcc-x86-64-self /a/path with spaces\n";
-        let log = native_log(Cursor::new(good), &inputs).unwrap();
-        assert!(log.invalid.is_none());
-        assert_eq!(
-            log.outputs.get("gcc-x86-64-self").unwrap(),
-            Path::new("/a/path with spaces")
-        );
-        for bad in [
-            format!("{good}{good}"),
-            "TD_RECIPE_RUN_OUT other /path\n".into(),
-            "TD_RECIPE_RUN_OUT gcc-x86-64-self relative\n".into(),
-            "TD_RECIPE_RUN_OUT gcc-x86-64-self /a/../b\n".into(),
-            "TD_RECIPE_RUN_OUT gcc-x86-64-self /path".into(),
-            format!(
-                "TD_RECIPE_RUN_OUT gcc-x86-64-self /{}\n",
-                "x".repeat(65_537)
-            ),
-        ] {
-            assert!(native_log(Cursor::new(bad), &inputs)
-                .unwrap()
-                .invalid
-                .is_some());
-        }
-        let log = native_log(Cursor::new("line\n".repeat(100)), &inputs).unwrap();
-        assert_eq!(log.tail.lines().count(), 30);
-        let mut noisy = vec![0xff; 90_000];
-        noisy.extend_from_slice(b"\n");
-        noisy.extend_from_slice(good.as_bytes());
-        let log = native_log(Cursor::new(noisy), &inputs).unwrap();
-        assert!(log.invalid.is_none());
-        assert_eq!(log.outputs.len(), 1);
-        assert!(log.tail.contains("truncated"));
-    }
-
-    #[test]
-    fn retained_native_bytes_survive_evaluator_reaping() {
-        let scratch = Scratch::new(&std::env::temp_dir()).unwrap();
-        let source = scratch.0.join("evaluator-output");
-        let parent = scratch.0.join("cache");
-        fs::create_dir_all(source.join("bin")).unwrap();
-        fs::create_dir(&parent).unwrap();
-        fs::write(source.join("bin/tool"), b"tool").unwrap();
-        fs::set_permissions(source.join("bin/tool"), fs::Permissions::from_mode(0o755)).unwrap();
-        symlink("tool", source.join("bin/alias")).unwrap();
-        let expected = tree_hash(&source).unwrap();
-        let (retained, digest) = retain_native(&source, &parent, &scratch, "fixture").unwrap();
-        // A warm reuse must not attempt a new private copy.
-        fs::write(scratch.0.join("fixture"), b"would block copying").unwrap();
-        assert_eq!(
-            retain_native(&source, &parent, &scratch, "fixture")
-                .unwrap()
-                .0,
-            retained
-        );
-        fs::remove_dir_all(&source).unwrap();
-        assert_eq!(digest, expected);
-        assert_eq!(tree_hash(&retained).unwrap(), expected);
-        assert_eq!(fs::read(retained.join("bin/alias")).unwrap(), b"tool");
     }
 
     #[test]
@@ -891,56 +627,32 @@ mod tests {
     }
 
     #[test]
-    fn roles_cannot_escape_or_use_symlink_roots() {
-        let scratch = Scratch::new(&std::env::temp_dir()).unwrap();
-        let output = scratch.0.join("output");
-        fs::create_dir_all(output.join("stage/lib")).unwrap();
+    fn build_root_seed_records_are_exact() {
+        let good = "progress\nTD_BUILD_ROOT_STORE /a/seed store\n\
+            TD_BUILD_ROOT_SEED_DB /a/seed-db/x.db\nTD_BUILD_ROOT_LOCK /a.lock\n";
         assert_eq!(
-            role_directory(&output, "stage/lib").unwrap(),
-            output.join("stage/lib")
+            seed_record(good).unwrap(),
+            (
+                PathBuf::from("/a/seed store"),
+                PathBuf::from("/a/seed-db/x.db"),
+                PathBuf::from("/a.lock")
+            )
         );
-        assert_eq!(role_directory(&output, "").unwrap(), output);
-        assert!(role_directory(&output, "missing").is_err());
-        let alias = scratch.0.join("alias");
-        symlink(&output, &alias).unwrap();
-        assert!(role_directory(&alias, "stage/lib").is_err());
-        let outside = scratch.0.join("outside");
-        fs::create_dir_all(outside.join("lib")).unwrap();
-        fs::remove_dir_all(output.join("stage")).unwrap();
-        symlink(&outside, output.join("stage")).unwrap();
-        assert!(role_directory(&output, "stage/lib")
-            .unwrap_err()
-            .contains("escapes"));
-        assert!(role_directory(&output, "stage").is_err());
-    }
-
-    #[test]
-    fn evaluator_staging_is_not_the_native_copy_authority() {
-        let scratch = Scratch::new(&std::env::temp_dir()).unwrap();
-        let work = scratch.0.join("work");
-        let staged = work.join("scratch/run/tdstore/hash-recipe");
-        let source = work.join("build-cache/store/hash-recipe");
-        fs::create_dir_all(&staged).unwrap();
-        fs::create_dir_all(&source).unwrap();
-        fs::write(source.join("tool"), b"complete recipe output").unwrap();
-        // An interrupted scratch reaper may leave only an empty directory.
-        assert_ne!(tree_hash(&staged).unwrap(), tree_hash(&source).unwrap());
-        assert_eq!(durable_output(&work, &staged).unwrap(), source);
-        fs::remove_dir_all(&staged).unwrap();
-        assert_eq!(durable_output(&work, &staged).unwrap(), source);
-        assert!(durable_output(&work, Path::new("/elsewhere/output")).is_err());
-        let inputs = vec![NATIVE.first().unwrap()];
-        let valid = "TD_RECIPE_RUN_WORK /work\n";
-        assert_eq!(
-            native_log(Cursor::new(valid), &inputs)
-                .unwrap()
-                .work
-                .unwrap(),
-            Path::new("/work")
-        );
-        assert!(native_log(Cursor::new(format!("{valid}{valid}")), &inputs)
-            .unwrap()
-            .invalid
-            .is_some());
+        let pair = "TD_BUILD_ROOT_STORE /a\nTD_BUILD_ROOT_SEED_DB /a.db\n";
+        for bad in [
+            format!("{good}TD_BUILD_ROOT_STORE /b\n"),
+            format!("{good}TD_BUILD_ROOT_SEED_DB /b.db\n"),
+            format!("{good}TD_BUILD_ROOT_LOCK /b.lock\n"),
+            pair.into(),
+            format!("{pair}TD_BUILD_ROOT_LOCK relative.lock\n"),
+            "TD_BUILD_ROOT_STORE /a\nTD_BUILD_ROOT_LOCK /a.lock\n".into(),
+            "TD_BUILD_ROOT_STORE relative\nTD_BUILD_ROOT_SEED_DB /a.db\nTD_BUILD_ROOT_LOCK /l\n"
+                .into(),
+            "TD_BUILD_ROOT_STORE /a/../b\nTD_BUILD_ROOT_SEED_DB /a.db\nTD_BUILD_ROOT_LOCK /l\n"
+                .into(),
+            String::new(),
+        ] {
+            assert!(seed_record(&bad).is_err(), "{bad}");
+        }
     }
 }

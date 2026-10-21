@@ -2547,7 +2547,6 @@ mod tests {
             "make-441",
             "gcc-x86-64-stage2",
             "gcc-10-bridge",
-            "gcc-aarch64-cross",
             "ripgrep-seed",
             "tcc",
             "stage0",

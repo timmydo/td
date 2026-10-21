@@ -271,8 +271,8 @@ This milestone lands in independently checked increments:
   licensing and refusal of modified archives or cached output. This prepares
   one native input and does not complete M03.
 - **M03b2b:** prepare the pinned upstream Rust host/target components and
-  retain the declared td GNU recipe outputs in verified local caches. This
-  prepares build inputs only; no portable artifact is qualified yet.
+  authenticate the pinned Debian build root that supplies the C toolchain.
+  This prepares build inputs only; no portable artifact is qualified yet.
 - **M03b2c:** implemented the explicit isolated build command, packaging binary,
   source/cc decoys, missing-input refusals and static ELF/clean-runtime checks
   in td-crypto/PORTABLE.md. It is separately provisioned from ordinary host

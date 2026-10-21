@@ -2,8 +2,9 @@
 
 ## Status
 
-M03b2a implements header preparation; M03b2b prepares the remaining Rust and
-GNU tool inputs. M03b2c supplies isolated compilation and static artifact
+M03b2a implements header preparation; M03b2b prepares the remaining Rust
+inputs and the Debian build root's C toolchain. M03b2c supplies isolated
+compilation and static artifact
 qualification. M03b2d1 adds API confinement; M03b2d2 adds local TLS smoke.
 This is a host build path for the
 standalone td-mta executable; it does not grant the source-bootstrap provenance
@@ -134,73 +135,94 @@ and notices. A changed or symlink cache root fails. No persisted digest alone
 authenticates a mutable tree. This prepares binaries and libraries as data;
 preparation alone does not execute them or prove their runtime closure.
 
-## Declared GNU tool and host runtime inputs
+## Debian build root: C toolchain and host runtime
 
-The preparer rebuilds or reuses a source-fingerprinted td-recipe-eval and asks
-it to realize these named outputs from the current checkout's recipes:
+The C compiler, binutils, and the host runtime the upstream Rust tools run
+on are td's pinned Debian build root (AGENTS.md, "Debian build root";
+`recipes/src/debian-root.lock`), the same tree td's C recipes build in. The
+kit stays host-only: it is not a recipe and adds nothing to the target graph.
+The preparer rebuilds or reuses a source-fingerprinted td-recipe-eval and
+runs its `build-root-seed`, which places the root in the machine's shared
+seed store from the pins `td-feed warm build-root` caches in `~/.td/sources`,
+under the ladder lock a build takes, and prints the seed store, the seed db
+and that lock's path. A cold pin cache fails there; warm it first. The kit
+then holds the lock shared until its build ends, as a build does, so
+`clear-store` waits rather than removing the tree under its mounts. That
+answer only says where to look: td-builder takes the ladder lock
+first, then authenticates the root against its own compiled
+`debian-root.lock`, requiring the root's db to register exactly that
+lock's store path at its pinned NAR hash, and re-hashes the tree on
+disk. Anything else is refused; there is no
+host or ambient fallback, and no caller-supplied compiler path selects a
+tool. The preparer does not use `TD_RECIPE_EVAL`. Direct preparation has no
+wall-clock deadline; its child has the existing parent-death handling.
 
-| Graph | Output | Intended isolated role |
+The compile namespace binds three directories of the authenticated root,
+read-only, each at its path in the root, and nothing else of it:
+
+| Root directory | Mounted at | Role |
 | --- | --- | --- |
-| `gcc-x86-64-self` | `gcc-x86-64-self` | GCC 14.3.0 C compiler, `/cc` |
-| `gcc-x86-64-self` | `binutils-x86-64-self` | binutils 2.44, `/binutils` |
-| `gcc-x86-64-self` | `glibc-x86-64` | glibc 2.41 host loader/libraries, `/lib64` |
-| `gcc-x86-64-self` | `gcc-x86-64-stage2` | host libgcc_s, `/gcc-runtime` |
-| `zlib-x86-64` | `zlib-x86-64` | shared zlib 1.3.1 host runtime, built in the Debian build root, `/zlib` |
+| `usr` | `/usr` | Debian's GCC 14.2.0 and binutils 2.44, x86-64 and `aarch64-linux-gnu` cross; glibc 2.41, libgcc_s and zlib for the upstream Rust host tools, build scripts and proc macros |
+| `usr/lib` | `/lib` | the usrmerge link the root's loader link and `libc.so` script name |
+| `usr/lib64` | `/lib64` | the loader, `/lib64/ld-linux-x86-64.so.2` |
 
-For aarch64, preparation additionally realizes `gcc-aarch64-cross` and
-mounts its output at `/cross`. It builds native x86-64 static GCC 14.3.0 and
-binutils 2.44 tools targeting `aarch64-linux-musl`, from the existing reviewed
-source pins. It builds no ARM libc or compiler runtime: the matching Rust
-target standard library owns those inputs. Its build probe compiles, archives
-and links an ARM object. GCC selects a generic `none-*` host for its bundled GMP; the explicit
-`--disable-assembly` reinforces that generic C selection without a build-only
-assembler macro dependency.
+| Target | C compiler | `ar`, `nm`, `objcopy` | assembler prefix (`-B`) |
+| --- | --- | --- | --- |
+| `x86_64` | `/usr/bin/gcc` | `/usr/bin/ar`, `nm`, `objcopy` | `/usr/bin/` |
+| `aarch64` | `/usr/bin/aarch64-linux-gnu-gcc` | `/usr/bin/aarch64-linux-gnu-ar`, `-nm`, `-objcopy` | `/usr/aarch64-linux-gnu/bin/` |
 
-The recipe graph and its fixed-output source declarations are the authority;
-no caller-supplied compiler path or guessed store hash selects a tool. The
-preparer does not use `TD_RECIPE_EVAL`. Realization may provision declared
-sources; a cold source bootstrap can take hours. The command is not a claim
-of completely offline provisioning. The later compilation must be offline.
-Direct preparation has no wall-clock deadline; its child has the existing
-parent-death handling. Logs retain at most 30 input lines for failure diagnostics, each truncated
-to 64 KiB before lossy decoding and marked when truncated. Only output/work
-records require complete UTF-8 lines. A failed realization reports its exit
-status and tail; an unreadable log still reports the exit status. Logs are
-transient and reused for each graph, then removed on completion or error.
+td glibc is mounted nowhere, so nothing the root's GCC links can resolve
+td's loader. The root's `/usr/bin` stays off `PATH` (`/rust/bin` alone),
+since it also holds cmake and pkg-config: every tool is named by absolute
+path, and `CMAKE` and `PKG_CONFIG` still reach only the decoy. That
+guarantee is about lookup, not presence: the root's cmake, pkg-config,
+perl, python3, glibc headers and static archives are in the namespace,
+and a build script naming one by absolute path would reach it. The
+reviewed, policy-pinned dependency graph (`crypto_policy.rs`) is what
+excludes that; the decoys prove only that no tool was found through
+the environment. There is no
+`LD_LIBRARY_PATH`: rustc, rustdoc, Cargo and rust-lld find the kit's own
+libraries through their `$ORIGIN` run path and glibc, libgcc_s and zlib
+through the root's loader. Build scripts and proc macros link through
+`/td-crypto-host-linker`, which runs the root's `gcc -B/usr/bin/` against
+the root's own glibc. The target link is unchanged: rust-lld with
+`+crt-static` and the musl libc of Rust's self-contained target library.
 
-The evaluator's work record and output basenames select complete trees under
-its durable `build-cache/store`. Reclaimable evaluator staging trees are not
-copy authorities: a failed scratch cleanup could leave a truncated tree there.
-Durable cache reclamation renames whole trees away before deleting them.
-Each selected output is hashed and compared with any retained cache entry.
-A matching retained entry avoids another copy. A cache miss is copied into
-private scratch, compared with the source hash, and published atomically.
-Disappearing inputs or changed bytes fail and require a retry. This uses the
-recipe store's existing trust model; the preparer records its bytes and does
-not independently re-prove a warm build's source provenance. Cache reuse
-requires a fresh durable-output comparison.
-Role directories are resolved within the retained output; a changed layout or
-escaping directory is refused. Internal tool links are retained as data, not
-followed to import host files. The isolated build below resolves these links only inside its declared mounts.
+Inside the namespace the compile asks the root's GCC for its freestanding
+include directory (`-print-file-name=include`) and refuses one outside
+`/usr/lib/gcc/x86_64-linux-gnu/` (`/usr/lib/gcc-cross/aarch64-linux-gnu/`)
+or without `stddef.h`; CFLAGS name it after musl's headers. Debian's GCC is
+configured `--enable-default-pie`, but the cc builder compiles every object
+`-fPIC` regardless. CFLAGS pin `-fno-stack-protector`,
+`-fno-stack-clash-protection` and `-fcf-protection=none` (x86-64) or
+`-mbranch-protection=none` (aarch64), today's defaults of both compilers,
+so a re-pinned root cannot change them silently; with these flags, the
+aarch64 compiler's `-Q --help=common,target,optimizers` report matched the
+retired source-built `aarch64-linux-musl` cross compiler's exactly. The cross
+compiler targets `aarch64-linux-gnu` but only compiles, freestanding against
+musl's headers, so its glibc target shows only as predefined macros
+(`__gnu_linux__`, decimal-float limits, `__INT_FAST16_TYPE__` and
+`__INT_FAST32_TYPE__`, which musl's own `stdint.h` does not read). The
+root's arm64 cross runtime packages (`libc6-arm64-cross`, libgcc's and the
+sanitizers') come with that compiler as dependencies and are never linked.
 
-Success prints `portable-rust`, `portable-musl-headers`, and pairs of `native`
-recipe identity/NAR records and `portable-native-bind` role/directory records.
-This is preparation output, not an installed artifact manifest. No tool flags,
-API confinement, static-linking result or service capability is established by
-this command alone.
+Success prints `portable-rust`, `portable-musl-headers`, the root's
+`build-root` store path and pinned NAR record, and its `portable-build-root`
+directory. This is preparation output, not an installed artifact manifest.
+No tool flags, API confinement, static-linking result or service capability
+is established by this command alone.
 
 All these caches are reconstructible and caller-owned. On mismatch remove
 only the named cache entry and retry; there is no automatic repair or fsync
 claim. A hard kill may leave `crypto-portable-<pid>-<attempt>` scratch behind;
 remove it only after confirming that process has ended. The build host needs
-space for archives, extraction, reconstructed kit and retained native outputs.
-Each extracted Rust component and its private archive are removed after
-installation. Superseded content-addressed kits and each worktree's native
-copies remain until explicitly removed. Remove an old `crypto-*` cache entry
+space for archives, extraction and the reconstructed kit; the build root
+lives once per machine in the shared seed store (about 660 MiB), and nothing
+of it is copied into the worktree. Each extracted Rust component and its
+private archive are removed after installation. Superseded content-addressed
+kits remain until explicitly removed. Remove an old `crypto-*` cache entry
 only when no preparation or build uses it and it is no longer needed; a later
-preparation reconstructs it. The final evaluator scratch tree also remains
-until the evaluator's ordinary later-run cleanup and may occupy several GiB;
-this command does not sweep shared evaluator scratch. Service memory budgets
+preparation reconstructs it. Service memory budgets
 do not describe build-time resource use. Both commands require an x86-64
 build host; aarch64 is a cross-compilation target, not a supported build host.
 
@@ -210,12 +232,14 @@ build host; aarch64 is a cross-compilation target, not a supported build host.
 td-builder gate-crates crypto-portable-cross-build --archives /path/to/archives
 ```
 
-This command uses the aarch64 kit, headers and source-built cross tools in
-an isolated offline build. It applies the same dependency admission, API
-confinement and fallback refusal as the x86-64 path. Rust uses its generic
-ARM CPU baseline; C uses `-march=armv8-a -mtune=generic` and disables outlined
-atomics so GCC does not introduce a dependency on a separately built target
-libgcc. Both request frame pointers and level-1 debug data. Rustdoc's pinned
+This command uses the aarch64 kit and headers and the build root's Debian
+`aarch64-linux-gnu` cross GCC and binutils in an isolated offline build. It
+applies the same dependency admission, API confinement and fallback refusal
+as the x86-64 path. Rust uses its generic ARM CPU baseline; C uses
+`-march=armv8-a -mtune=generic` and disables outlined atomics so GCC does not
+introduce a dependency on a target libgcc, which nothing links: the root's
+arm64 libgcc stays out of the link. Both request frame pointers and level-1
+debug data. Rustdoc's pinned
 baseline features are `neon` and `outline-atomics`.
 
 Rust's ARM target defaults to a non-PIE static executable. This build uses
@@ -284,9 +308,10 @@ no previous Cargo target directory is reused. Caller-owned source/cache
 trees must not be concurrently modified. No hostile same-uid writer
 boundary is claimed.
 
-The namespace has only these mounts plus the Rust kit, musl headers and five
-native roles listed above. It has private `/tmp`, minimal `/dev`, private `/proc`
-and no host `/usr`, `/bin`, OpenSSL installation or Cargo configuration. Cargo's
+The namespace has only these mounts plus the Rust kit, musl headers and the
+build root's `/usr`, `/lib` and `/lib64` listed above. It has private `/tmp`,
+minimal `/dev`, private `/proc` and no host `/usr` or `/bin`, no td glibc, no
+OpenSSL headers and no Cargo configuration. Cargo's
 environment is cleared and reconstructed. The inner helper records each actual
 Cargo command's arguments, working directory and explicit environment in
 `BUILD-INPUTS`; these include frozen/offline source replacement, two jobs, epoch 0,
@@ -298,8 +323,9 @@ A missing compiler, header, archive or library is an error, with no ambient
 substitute. There is no Zig dependency.
 
 Rust links the target through its bundled rust-lld, static musl target std and
-`+crt-static`, with `target-cpu=x86-64`. GCC uses `-nostdinc`, only the declared
-musl/GCC builtin includes and binutils, and `-march=x86-64 -mtune=generic`.
+`+crt-static`, with `target-cpu=x86-64`. The root's GCC uses `-nostdinc`, only
+musl's and its own freestanding includes and the root's binutils, and
+`-march=x86-64 -mtune=generic`.
 Compiled Rust and C request frame pointers and level-1 debug information;
 release/bench profile stripping is explicitly disabled, and the artifact check
 requires structurally valid `.debug_line` data. Source/vendor/output paths map
@@ -309,7 +335,7 @@ remain profiling boundaries. This host portable artifact is not the target
 image's whole-closure profiling qualification.
 
 The linker requests a deterministic SHA-1 GNU build ID. After allocator-symbol
-inspection, the declared binutils `objcopy` creates `td-mta.debug` from the
+inspection, the build root's `objcopy` creates `td-mta.debug` from the
 receiver, prunes non-line DWARF using the shared target profiling policy, then
 strips the runtime. The existing ELF pair validator requires matching build IDs,
 ordinary companion symbols, useful uncompressed line tables and a stripped
@@ -466,7 +492,8 @@ Success prints `.td-build-cache/crypto-artifact-<NAR-sha256>`, containing:
   musl, not full service admission, native allocation/stack/RSS, or
   complete SMTP/STARTTLS protocol integration.
 - `BUILD-INPUTS`: staged source, vendor, reconstructed Rust kit, headers and
-  helper NAR hashes, native recipe identities/NARs, target and actual inner
+  helper NAR hashes, the build root's store path and pinned NAR hash
+  (`build-root PATH sha256:...`), target and actual inner
   Cargo argument/environment records.
 - `notices/`: upstream LICENSE/COPYING/COPYRIGHT/NOTICE/AUTHORS files, including nested
   provider attribution and Rust's bundled library notices. Vendor notices cover
@@ -900,7 +927,7 @@ are separate cases. No gateway authorization or whole-memory bound is claimed.
 
 `td-mta-rust-allocation-probe` is a separate integration test with its own main
 and no libtest workers. The ordinary installed executable and library retain
-their existing allocator. The build uses declared binutils nm to require the
+their existing allocator. The build uses the build root's nm to require the
 `TD_MTA_ALLOCATION_COUNTERS` and `rust_alloc_probe` symbol-name substrings
 in this test and refuse these sentinels in every other retained executable.
 These are checks for the named probe, not exhaustive classification of all

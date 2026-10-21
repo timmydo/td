@@ -287,8 +287,9 @@ administrator-owned directories. Write the complete original
 Compare the installed runtime and companion byte-for-byte with the archive
 before starting. `BUILD-INPUTS` identifies inputs, not installed output bytes.
 Preserve the complete notices tree. Do not install only the runtime and discard its companion or provenance receipt.
-This portable build uses the pinned upstream Rust/musl kit described in
-PORTABLE.md; it is not the source-bootstrapped td system-image artifact.
+This portable build uses the pinned upstream Rust/musl kit and the pinned
+Debian build root's GCC and binutils described in PORTABLE.md; it is not the
+source-bootstrapped td system-image artifact.
 Prebuilt standard-library/libc code and provider assembly remain explicit
 profiling boundaries. This layout does not configure automatic discovery by
 host debuggers, and td-profiler currently indexes only canonical `/td/store`

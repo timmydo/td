@@ -412,6 +412,29 @@ pub fn clear_store_cli(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// `build-root-seed`: place the pinned Debian build root in the seed store, as
+/// a build-root recipe's build does, and print where it and its db live and
+/// which lock guards them: `TD_BUILD_ROOT_STORE <seed store>`,
+/// `TD_BUILD_ROOT_SEED_DB <seed db>` (the root's own db sits beside it) and
+/// `TD_BUILD_ROOT_LOCK <ladder lock>`. td-crypto's host-only portable kit
+/// takes its C toolchain from there, holds that lock shared for as long as it
+/// binds the tree, and authenticates the tree itself (td-crypto/PORTABLE.md).
+pub fn build_root_seed_cli(args: &[String]) -> Result<(), String> {
+    if !args.is_empty() {
+        return Err("usage: build-root-seed".to_string());
+    }
+    let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
+    let runner = RecipeCheckRunner::new(root, &scratch_name("build-root-seed", &[]))?;
+    // As a build takes it: the ladder lock, then `setup`, which makes the seed
+    // store and seed db directories a cold ladder lacks.
+    let _lock = lock_ladder_for_run(&runner)?;
+    let (store, db) = runner.build_root_seed()?;
+    println!("TD_BUILD_ROOT_STORE {}", path_str(store)?);
+    println!("TD_BUILD_ROOT_SEED_DB {}", path_str(db)?);
+    println!("TD_BUILD_ROOT_LOCK {}", path_str(&runner.lock_path())?);
+    Ok(())
+}
+
 /// `td-recipe-eval gc-store [--dry-run]` — reclaim what no worktree's last run
 /// needed from the shared build cache: the middle ground between `clear-store`
 /// (everything) and the cap eviction (everything, once over a size). Every build,
