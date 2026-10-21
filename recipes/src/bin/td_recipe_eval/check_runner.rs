@@ -9623,9 +9623,10 @@ mod tests {
         // The members built in the Debian build root: the kernel, glibc and
         // the static libgcc it links, the upstream toolchain's runtime,
         // zlib, cryptsetup with its libraries, OpenSSH, Git with curl and
-        // LibreSSL, td-link, whose throwaway first stage the root's GCC
-        // links, and every Cargo recipe, whose build scripts' C the root's
-        // GCC compiles.
+        // LibreSSL, and every Rust recipe: td-link, whose throwaway first
+        // stage the root's GCC links, each Cargo recipe, whose build
+        // scripts' C the root's GCC compiles, and each direct-rustc
+        // recipe, whose companions the root's objcopy splits.
         assert_eq!(
             answer.build_root_members,
             [
@@ -9644,23 +9645,45 @@ mod tests {
                 "popt-x86-64",
                 "ripgrep",
                 "td-agent",
+                "td-audio",
+                "td-authd",
+                "td-boot",
+                "td-btrfs",
+                "td-busd",
+                "td-compositor",
                 "td-dua",
                 "td-editor",
+                "td-firstboot",
+                "td-init",
+                "td-install",
+                "td-jail",
+                "td-kexec",
                 "td-link",
+                "td-login",
                 "td-mail",
                 "td-net",
+                "td-netd",
                 "td-news",
                 "td-open",
                 "td-pass",
                 "td-photo",
                 "td-portal",
+                "td-profiler",
                 "td-review",
+                "td-seatd",
+                "td-secret",
                 "td-setup",
+                "td-sh",
+                "td-svc",
                 "td-taskmgr",
                 "td-term",
+                "td-txt",
+                "td-update",
+                "td-util",
+                "td-vm-guest",
                 "util-linux-libs-x86-64",
                 "uutils",
-                "zlib-x86-64"
+                "zlib-x86-64",
             ]
         );
         assert_eq!(answer.upstream_rust_members, ["rust-toolchain"]);

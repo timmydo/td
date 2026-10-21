@@ -1,5 +1,5 @@
 use crate::ladder::{
-    gcc_install_headers_without_tar, post_rust_inputs, post_rust_tool_farm, split_target_debug,
+    gcc_install_headers_without_tar, ladder_split_debug, post_rust_inputs, post_rust_tool_farm,
     unpack_into, unpack_keep_top, POST_RUST_SH,
 };
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step, TextEdit};
@@ -176,7 +176,7 @@ pub fn recipe() -> Recipe {
         ],
         exec: true,
     });
-    steps.push(split_target_debug("{out}"));
+    steps.push(ladder_split_debug("{out}"));
     steps.push(Step::assert_static(&[
         "{out}/bin/aarch64-linux-musl-gcc",
         "{out}/libexec/gcc/aarch64-linux-musl/14.3.0/cc1",

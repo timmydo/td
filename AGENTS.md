@@ -234,7 +234,10 @@ link, against td glibc's headers and GCC's own freestanding headers,
 archived by the root's `ar`, and the root's `objcopy` splits its
 companions. Each object the build leaves must show it: its dependency
 list resolves into those headers or the build's trees, and the recipe
-declares how many objects there are.
+declares how many objects there are. Every other recipe that runs
+rustc directly builds there too, but td-link-test, which builds outside
+it to prove td-link needs no GCC or binutils, and the root's `objcopy`
+splits its companions.
 
 Cargo dependency sources are fixed-output inputs selected by committed
 `Cargo.lock` checksums. Builds run offline. Git dependencies are unsupported

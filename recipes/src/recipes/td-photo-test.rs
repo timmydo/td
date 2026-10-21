@@ -23,11 +23,11 @@ pub fn recipe() -> Recipe {
     let synth = "{out}/bin/td-photo-synth";
     let frame = "{root}/roll/DSC_0001.NEF";
     Recipe::mesboot("td-photo-test", "1.0")
+        .build_root()
         .native_inputs(&[
             "td-photo",
             "rust-toolchain",
             "td-link",
-            "binutils-x86-64-self",
             "glibc-x86-64",
         ])
         .steps(vec![
@@ -133,7 +133,6 @@ mod tests {
                 "td-photo".into(),
                 "rust-toolchain".into(),
                 "td-link".into(),
-                "binutils-x86-64-self".into(),
                 "glibc-x86-64".into(),
             ])
         );

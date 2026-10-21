@@ -1,5 +1,5 @@
 use crate::ladder::{
-    post_rust_inputs, post_rust_tool_farm, split_target_debug, unpack_into, unpack_keep_top,
+    ladder_split_debug, post_rust_inputs, post_rust_tool_farm, unpack_into, unpack_keep_top,
     POST_RUST_SH,
 };
 use crate::types::{Recipe, Step};
@@ -91,7 +91,7 @@ pub fn recipe() -> Recipe {
         paths: vec!["{out}/bin/make".into()],
         exec: true,
     });
-    steps.push(split_target_debug("{out}"));
+    steps.push(ladder_split_debug("{out}"));
     steps.push(Step::assert_static(&["{out}/bin/make"]));
     steps.push(Step::run("{out}", &["{out}/bin/make", "--version"]).env("PATH", "{tools}"));
 

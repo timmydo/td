@@ -411,13 +411,15 @@ mod tests {
                     "{stem}: a direct Rust recipe declares td-link, its linker"
                 );
             }
-            // td-link-test ships no ELF, only its verdict; a build-root
-            // recipe splits with the root's objcopy.
-            let objcopy = if recipe.build_root {
-                "/usr/bin/objcopy"
-            } else {
-                "{in:binutils-x86-64-self}/bin/objcopy"
-            };
+            // td-link-test ships no ELF, only its verdict, and runs outside
+            // the root to prove td-link needs no GCC or binutils; the others
+            // build in the Debian build root and split with its objcopy.
+            assert!(
+                stem == "td-link-test" || recipe.build_root,
+                "{stem}: a direct Rust recipe builds in the build root"
+            );
+            crate::ladder::assert_no_ladder_tools(&recipe, &[]);
+            let objcopy = "/usr/bin/objcopy";
             assert!(
                 stem == "td-link-test"
                     || steps.iter().any(|step| matches!(
@@ -695,16 +697,19 @@ mod tests {
         }
     }
 
-    /// A build-root recipe that splits companions links code that ships, and
-    /// takes its start files and libgcc from gcc-runtime, or, for glibc,
+    /// A build-root C recipe that splits companions links code that ships,
+    /// and takes its start files and libgcc from gcc-runtime, or, for glibc,
     /// from gcc-runtime-stage1; the profiler's boundary lists name exactly
-    /// those recipes.
+    /// those recipes. Direct Rust recipes, td-link's own aside, are
+    /// `RUST_PROFILED_RECIPES`' to name.
     #[test]
     fn build_root_linked_outputs_match_the_profile_boundary() {
         let mut linked: Vec<&str> = all()
             .into_iter()
-            .filter(|(_, recipe)| {
+            .filter(|(stem, recipe)| {
                 recipe.build_root
+                    && (*stem == "td-link"
+                        || !td_engine::target_profile::RUST_PROFILED_RECIPES.contains(stem))
                     && recipe
                         .steps
                         .as_deref()

@@ -241,10 +241,17 @@ fn rustc_step(
     }
 }
 
-/// Split every installed runtime ELF in a direct td recipe with the final
-/// source-built binutils. Keeping this adjacent to `target_rustc` makes the
-/// compile and post-link halves of the global policy one reusable path.
+/// Split every installed runtime ELF in a direct td recipe with the Debian
+/// build root's objcopy, so the recipe declares `Recipe::build_root`.
+/// Keeping this adjacent to `target_rustc` makes the compile and post-link
+/// halves of the global policy one reusable path.
 pub fn split_target_debug(root: &str) -> Step {
+    Step::split_debug_tree(root, "/usr/bin/objcopy")
+}
+
+/// `split_target_debug` for the ladder's own recipes, which build outside
+/// the root with the source-built binutils.
+pub fn ladder_split_debug(root: &str) -> Step {
     Step::split_debug_tree(root, "{in:binutils-x86-64-self}/bin/objcopy")
 }
 
@@ -630,8 +637,9 @@ pub fn static_local_source_program(name: &str, shared: &[(&str, &str)]) -> Recip
     ]);
 
     Recipe::mesboot(name, "0.1")
+        .build_root()
         .local_source(name)
-        .native_inputs(&["rust-toolchain", "td-link", "binutils-x86-64-self"])
+        .native_inputs(&["rust-toolchain", "td-link"])
         .steps(steps)
 }
 

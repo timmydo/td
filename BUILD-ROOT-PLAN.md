@@ -186,11 +186,10 @@ deleted; its findings are summarized under "Facts" below.
    AWS-LC: only td-crypto's host-only portable musl artifact does, with
    the ladder's GCC and binutils against musl headers (and
    gcc-aarch64-cross), so `crypto_policy.rs` and the td-crypto/td-mta
-   docs are unchanged and that kit moves with increment 11. Two ladder
-   uses remain for increment 11: the rust-toolchain check declares
-   binutils-x86-64-self as a build (`INSPECTOR`) for its readelf and the
-   root userland its proof runs under, and the direct-rustc recipes
-   still declare binutils-x86-64-self for objcopy.
+   docs are unchanged and that kit moves with increment 11, as does the
+   rust-toolchain check's declared build of binutils-x86-64-self
+   (`INSPECTOR`) for its readelf and the root userland its proof runs
+   under.
 8. **C packages in the build root against td glibc**: LibreSSL (library
    only), curl, Git 2.55.0; popt, libdevmapper, util-linux libs,
    cryptsetup (static, as today); OpenSSH (`--without-openssl`). One
@@ -240,7 +239,14 @@ deleted; its findings are summarized under "Facts" below.
     (trust model, Rust bridge, profiling contract), DEVELOPMENT.md,
     td-profiler/DESIGN.md, td-agent/DESIGN.md, APPLICATIONS.md, and the
     per-crate DESIGN.md files that cite it. This plan file is deleted
-    there.
+    there. The ladder's users move first, in parts; the deletion, the
+    sweep and this file's removal are the last. Landed: the direct-rustc
+    recipes build in the root and split with its objcopy, so no shipped
+    output's build declares the ladder's binutils. Still on the ladder:
+    the td tests' readelf and tool-farm awk, the rust-toolchain check,
+    td-jail-seccomp-probe, the crypto portable kit, system-x86-64's and
+    kexec-spike-x86-64's tool-farm awk (gawk-x86-64-self), and the
+    ladder's own fixtures (hello, hello-test), deleted with it.
 12. **td-btrfs** (landed): std-only mkfs with `--rootdir/--subvol`;
     btrfs-progs, its pin and test are deleted; util-linux libs stay for
     cryptsetup.

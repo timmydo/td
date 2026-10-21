@@ -201,7 +201,8 @@ pub fn build(name: &str, rust: &str) -> Recipe {
     steps.push(Step::assert_static(&["{out}/bin/td-util"]));
 
     Recipe::mesboot(name, "0.1")
-        .native_inputs(&[rust, "td-link", "binutils-x86-64-self", "glibc-x86-64"])
+        .build_root()
+        .native_inputs(&[rust, "td-link", "glibc-x86-64"])
         .steps(steps)
 }
 

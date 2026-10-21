@@ -46,12 +46,8 @@ pub fn recipe() -> Recipe {
     ];
 
     Recipe::mesboot("td-seatd", "0.1")
-        .native_inputs(&[
-            "rust-toolchain",
-            "td-link",
-            "binutils-x86-64-self",
-            "glibc-x86-64",
-        ])
+        .build_root()
+        .native_inputs(&["rust-toolchain", "td-link", "glibc-x86-64"])
         .steps(steps)
 }
 
