@@ -1948,8 +1948,12 @@ the combined profile. Secondary HTTPS identities are checked by the provider
 at handshake time and do not govern the origin's readiness. Host must match the configured JMAP
 DNS origin and port (case-insensitive host, omitted port means 443). An Origin
 header must match that HTTPS origin; no CORS permission is emitted. A bounded
-strict Basic decoder compares the configured username exactly and verifies
-the generated device token. Each request observes current revocation state.
+strict Basic decoder retains the exact username and password in a bounded,
+request-owned buffer. Authentication selects the account by case-sensitive
+username and verifies its generated device token. The resulting account/device
+principal selects the request backend; caller-supplied account IDs do not.
+Session discovery exposes only that account. Each request observes current
+revocation state.
 Upload publication acquires a fresh commit-time authorization guard; future
 mutations must do the same.
 

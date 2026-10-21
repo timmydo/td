@@ -234,9 +234,14 @@ pub(super) fn exercise(
     };
     let executable = std::path::Path::new(env!("CARGO_BIN_EXE_td-mta"));
     let slots = td_mta::postgres_read::ReadSlots::new(2).unwrap();
-    let authentication =
-        td_mta::postgres_http_auth::Authentication::new(&loaded, executable, binding, &clock)
-            .unwrap();
+    let authentication_accounts = [("user", binding)];
+    let authentication = td_mta::postgres_http_auth::Authentication::new(
+        &loaded,
+        executable,
+        &authentication_accounts,
+        &clock,
+    )
+    .unwrap();
     let pending = td_mta::postgres_http_updates::Pending::default();
     let backend = td_mta::postgres_http_api::Service {
         loaded: &loaded,
@@ -301,8 +306,8 @@ pub(super) fn exercise(
         let server = td_mta::https::Https {
             listeners: &listeners, policies, handshakes: &handshakes,
             authentication: &authentication, origin: Origin::parse(&origin).unwrap(),
-            username: "user", resources, timeouts: &timeouts, clock: clock.clone(),
-            uploads: Some(&backend), ready: &ready,
+            resources, timeouts: &timeouts, clock: clock.clone(),
+            backends: &[&backend], ready: &ready,
         };
         thread::scope(|scope| {
             let worker = scope.spawn(|| server.run(&control));

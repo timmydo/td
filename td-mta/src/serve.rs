@@ -283,12 +283,21 @@ fn run_once(options: &Options, reload: &AtomicBool) -> Result<(), ConfigFailure>
                 (None, None) => None,
                 _ => return Err(config_failure("https", "invariant")),
             };
+            let authentication_accounts = [(
+                candidate
+                    .identities()
+                    .map_err(|_| config_failure("configuration", "invariant"))?
+                    .account()
+                    .map_err(|_| config_failure("configuration", "invariant"))?
+                    .username,
+                binding,
+            )];
             let authentication = if mailbox_access {
                 Some(
                     td_mta::postgres_http_auth::Authentication::new(
                         &loaded,
                         &executable,
-                        binding,
+                        &authentication_accounts,
                         clock.as_ref(),
                     )
                     .map_err(|error| adapter("authentication", error))?,
@@ -298,6 +307,13 @@ fn run_once(options: &Options, reload: &AtomicBool) -> Result<(), ConfigFailure>
             };
             let https_ready = AtomicBool::new(false);
             let relay_ready = AtomicBool::new(false);
+            let backend_refs = api_service
+                .as_ref()
+                .map(|service| [service as &dyn td_mta::https_upload::Backend]);
+            let backends = backend_refs
+                .as_ref()
+                .map(|values| values.as_slice())
+                .unwrap_or(&[]);
             let https = if let Some(authentication) = authentication.as_ref() {
                 Some(td_mta::https::Https {
                     listeners: &https_listeners,
@@ -307,20 +323,10 @@ fn run_once(options: &Options, reload: &AtomicBool) -> Result<(), ConfigFailure>
                     origin: view
                         .origin()
                         .map_err(|_| config_failure("configuration", "invariant"))?,
-                    username: candidate
-                        .identities()
-                        .map_err(|_| config_failure("configuration", "invariant"))?
-                        .account()
-                        .map_err(|_| config_failure("configuration", "invariant"))?
-                        .username,
                     resources,
                     timeouts: plans.timeouts(),
                     clock: clock.clone(),
-                    uploads: Some(
-                        api_service
-                            .as_ref()
-                            .ok_or_else(|| config_failure("https", "invariant"))?,
-                    ),
+                    backends,
                     ready: &https_ready,
                 })
             } else {

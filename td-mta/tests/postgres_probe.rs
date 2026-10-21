@@ -5790,11 +5790,21 @@ fn exercise_http_auth(
     let connection = loaded("mail_runtime");
     let clock = td_mta::clock::RuntimeClock::new();
     let executable = std::path::Path::new(env!("CARGO_BIN_EXE_td-mta"));
+    let accounts = [("reader", binding)];
+    let principal = td_mta::http_auth::Principal {
+        account: binding.account(),
+        device,
+    };
     let auth =
-        td_mta::postgres_http_auth::Authentication::new(&connection, executable, binding, &clock)
+        td_mta::postgres_http_auth::Authentication::new(&connection, executable, &accounts, &clock)
             .unwrap();
     let until = || Deadline::after(clock.sample().unwrap().monotonic, 10_000).unwrap();
-    assert_eq!(auth.authenticate(password, until()), Ok(Some(device)));
+    assert_eq!(
+        auth.authenticate("reader", password, until()),
+        Ok(Some(principal))
+    );
+    assert_eq!(auth.authenticate("Reader", password, until()), Ok(None));
+    assert_eq!(auth.authenticate("unknown", password, until()), Ok(None));
     use std::io::Write;
     let mut blocker = ProbeChild(
         sql_command(fixture)
@@ -5816,39 +5826,48 @@ fn exercise_http_auth(
         thread::sleep(Duration::from_millis(5));
     }
     thread::scope(|scope| {
-        let worker = scope.spawn(|| auth.authenticate(password, until()));
+        let worker = scope.spawn(|| auth.authenticate("reader", password, until()));
         let stop = deadline();
         while sql(fixture, "SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE application_name='td-mta-postgres' AND wait_event_type='Lock'") != "1" {
             assert!(!worker.is_finished(), "authentication ended before lock contention");
             assert!(Instant::now() < stop);
             thread::sleep(Duration::from_millis(5));
         }
-        assert_eq!(auth.authenticate(password, until()), Err(Error::Busy));
+        assert_eq!(
+            auth.authenticate("reader", password, until()),
+            Err(Error::Busy)
+        );
         assert_eq!(worker.join().unwrap(), Err(Error::Invalid));
     });
     for _ in 0..3 {
         let short = Deadline::after(clock.sample().unwrap().monotonic, 500).unwrap();
-        assert_eq!(auth.authenticate(password, short), Err(Error::Deadline));
+        assert_eq!(
+            auth.authenticate("reader", password, short),
+            Err(Error::Deadline)
+        );
     }
     writeln!(input, "COMMIT;").unwrap();
     drop(input);
     wait_command(&mut blocker);
-    assert_eq!(auth.authenticate(password, until()), Ok(Some(device)));
-    assert_eq!(auth.authenticate(b"malformed", until()), Ok(None));
+    assert_eq!(
+        auth.authenticate("reader", password, until()),
+        Ok(Some(principal))
+    );
+    assert_eq!(auth.authenticate("reader", b"malformed", until()), Ok(None));
     let mut wrong = password.to_vec();
     let last = wrong.last_mut().unwrap();
     *last = if *last == b'0' { b'1' } else { b'0' };
-    assert_eq!(auth.authenticate(&wrong, until()), Ok(None));
+    assert_eq!(auth.authenticate("reader", &wrong, until()), Ok(None));
     assert_eq!(
-        auth.authenticate(password, Deadline::after(Tick(0), 0).unwrap()),
+        auth.authenticate("reader", password, Deadline::after(Tick(0), 0).unwrap()),
         Err(Error::Deadline)
     );
     let owner = loaded("td_probe");
     let unqualified =
-        td_mta::postgres_http_auth::Authentication::new(&owner, executable, binding, &clock)
+        td_mta::postgres_http_auth::Authentication::new(&owner, executable, &accounts, &clock)
             .unwrap();
     assert_eq!(
-        unqualified.authenticate(password, until()),
+        unqualified.authenticate("reader", password, until()),
         Err(Error::Invalid)
     );
     let revoked = td_mta::postgres_devices::prepare_creation(
@@ -5866,8 +5885,11 @@ fn exercise_http_auth(
     )
     .unwrap();
     assert_eq!(
-        auth.authenticate(revoked.password(), until()),
-        Ok(Some(revoked.device_id()))
+        auth.authenticate("reader", revoked.password(), until()),
+        Ok(Some(td_mta::http_auth::Principal {
+            account: binding.account(),
+            device: revoked.device_id()
+        }))
     );
     let revoke = td_mta::postgres_devices::prepare_revocation(
         binding.epoch(),
@@ -5883,8 +5905,14 @@ fn exercise_http_auth(
         &revoke,
     )
     .unwrap();
-    assert_eq!(auth.authenticate(revoked.password(), until()), Ok(None));
-    assert_eq!(auth.authenticate(password, until()), Ok(Some(device)));
+    assert_eq!(
+        auth.authenticate("reader", revoked.password(), until()),
+        Ok(None)
+    );
+    assert_eq!(
+        auth.authenticate("reader", password, until()),
+        Ok(Some(principal))
+    );
 }
 
 fn exercise_read_dispatch(
@@ -6216,7 +6244,7 @@ mod http_fixture {
                 '='
             });
         }
-        td_mta::http_auth::parse_basic("reader", Some(&encoded)).unwrap()
+        td_mta::http_auth::parse_basic(Some(&encoded)).unwrap()
     }
 }
 

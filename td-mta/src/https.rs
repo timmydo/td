@@ -9,7 +9,6 @@ use crate::{
     http_auth::{self, Attempts},
     http_request::{self, HeadReader, HEAD_BYTES, QUANTUM},
     https_upload,
-    ids::DeviceId,
     limits::ResourcePlan,
     ports::{
         Clock, Deadline, Error, FlushProgress, Handshake, IoProgress, Tick, TlsPolicyId,
@@ -89,9 +88,9 @@ struct Client {
     response: Vec<u8>,
     sent: usize,
     attempt_admitted: bool,
-    device: Option<DeviceId>,
+    principal: Option<http_auth::Principal>,
     credentials: Option<http_auth::BasicCredentials>,
-    authentication: Option<Result<Option<DeviceId>, Error>>,
+    authentication: Option<Result<Option<http_auth::Principal>, Error>>,
     body_slot: bool,
     events: Option<EventState>,
     stop_after_response: bool,
@@ -129,19 +128,34 @@ pub struct Https<'a> {
     pub handshakes: &'a HandshakePool,
     pub authentication: &'a dyn http_auth::Authenticator,
     pub origin: Origin<'a>,
-    pub username: &'a str,
     pub resources: &'a ResourcePlan,
     pub timeouts: &'a TimeoutPlan,
     pub clock: Arc<dyn Clock>,
-    pub uploads: Option<&'a dyn https_upload::Backend>,
+    pub backends: &'a [&'a dyn https_upload::Backend],
     pub ready: &'a AtomicBool,
 }
 impl Https<'_> {
+    fn backend(&self, account: crate::ids::AccountId) -> Option<&dyn https_upload::Backend> {
+        self.backends
+            .iter()
+            .copied()
+            .find(|backend| backend.account() == account)
+    }
     pub fn run(&self, control: &Control) -> Result<(), Error> {
         if self.listeners.is_empty() {
             return Err(Error::Invalid);
         }
-        if let Some(session) = self.uploads.and_then(|backend| backend.session()) {
+        if self.backends.len() > crate::config::identities::MAX_ACCOUNTS
+            || self.backends.iter().enumerate().any(|(index, backend)| {
+                self.backends
+                    .iter()
+                    .take(index)
+                    .any(|prior| prior.account() == backend.account())
+            })
+        {
+            return Err(Error::Invalid);
+        }
+        for session in self.backends.iter().filter_map(|backend| backend.session()) {
             if self.resources.limits().event_streams == 0
                 || session.concurrency().requests != 1
                 || session.concurrency().uploads != 1
@@ -337,12 +351,14 @@ impl Https<'_> {
         }
         if client.credentials.is_none() {
             let head = client.head.head().map_err(|_| Error::Invalid)?;
-            client.credentials = http_auth::parse_basic(self.username, head.authorization);
+            client.credentials = http_auth::parse_basic(head.authorization);
         }
         let result = match client.credentials.as_ref() {
-            Some(credentials) => self
-                .authentication
-                .authenticate(credentials.password(), deadline),
+            Some(credentials) => self.authentication.authenticate(
+                credentials.username(),
+                credentials.password(),
+                deadline,
+            ),
             None => Ok(None),
         };
         let after = self.clock.sample()?.monotonic;
@@ -617,7 +633,7 @@ impl Https<'_> {
                     response,
                     sent: 0,
                     attempt_admitted: false,
-                    device: None,
+                    principal: None,
                     credentials: None,
                     authentication: None,
                     body_slot: false,
@@ -719,8 +735,9 @@ impl Https<'_> {
                         return Ok(true);
                     };
                     match authentication {
-                        Ok(Some(device)) => {
-                            if let Some(backend) = self.uploads {
+                        Ok(Some(principal)) => {
+                            let device = principal.device;
+                            if let Some(backend) = self.backend(principal.account) {
                                 if let Some(account) = head.target.strip_prefix("/jmap/upload/") {
                                     if head.method != "POST" {
                                         405
@@ -743,7 +760,7 @@ impl Https<'_> {
                                         }
                                     } else {
                                         client.body_slot = true;
-                                        client.device = Some(device);
+                                        client.principal = Some(principal);
                                         client.phase = Phase::Upload;
                                         return Ok(true);
                                     }
@@ -767,7 +784,7 @@ impl Https<'_> {
                                         }
                                     } else {
                                         client.body_slot = true;
-                                        client.device = Some(device);
+                                        client.principal = Some(principal);
                                         client.phase = Phase::Download;
                                         return Ok(true);
                                     }
@@ -793,7 +810,7 @@ impl Https<'_> {
                                         503
                                     } else {
                                         client.body_slot = true;
-                                        client.device = Some(device);
+                                        client.principal = Some(principal);
                                         client.phase = Phase::Api;
                                         return Ok(true);
                                     }
@@ -852,7 +869,7 @@ impl Https<'_> {
                                             head.last_event_id,
                                             time.monotonic,
                                         )?;
-                                        client.device = Some(device);
+                                        client.principal = Some(principal);
                                         self.begin_events(
                                             client,
                                             stream,
@@ -940,7 +957,8 @@ impl Https<'_> {
     }
     fn download(&self, client: &mut Client, control: &Control) -> Result<(), Error> {
         use crate::https_download::{Failure, Request, Target};
-        let backend = self.uploads.ok_or(Error::Invalid)?;
+        let principal = client.principal.ok_or(Error::Invalid)?;
+        let backend = self.backend(principal.account).ok_or(Error::Invalid)?;
         let target = match Target::parse(client.head.head().map_err(|_| Error::Invalid)?.target) {
             Ok(target) if target.account() == backend.account() => target,
             Ok(_) | Err(Error::NotFound) => {
@@ -966,7 +984,7 @@ impl Https<'_> {
         let result = backend.download(
             Request {
                 target: &target,
-                device: client.device.ok_or(Error::Invalid)?,
+                device: principal.device,
                 credentials: client.credentials.as_ref().ok_or(Error::Invalid)?,
                 deadline: operation,
             },
@@ -998,14 +1016,15 @@ impl Https<'_> {
     }
     fn api(&self, client: &mut Client, control: &Control) -> Result<(), Error> {
         use crate::https_download::Failure;
-        let backend = self.uploads.ok_or(Error::Invalid)?;
+        let principal = client.principal.ok_or(Error::Invalid)?;
+        let backend = self.backend(principal.account).ok_or(Error::Invalid)?;
         let head = client.head.head().map_err(|_| Error::Invalid)?;
         let framing = head.framing;
         let expect_continue = head.expect_continue;
         client.head = HeadReader::new(Vec::new().into_boxed_slice());
         let result = backend.api(
             crate::https_api::Request {
-                device: client.device.ok_or(Error::Invalid)?,
+                device: principal.device,
                 credentials: client.credentials.as_ref().ok_or(Error::Invalid)?,
                 framing,
                 expect_continue,
@@ -1047,7 +1066,8 @@ impl Https<'_> {
         }
     }
     fn upload(&self, client: &mut Client, control: &Control) -> Result<(), Error> {
-        let backend = self.uploads.ok_or(Error::Invalid)?;
+        let principal = client.principal.ok_or(Error::Invalid)?;
+        let backend = self.backend(principal.account).ok_or(Error::Invalid)?;
         let head = client.head.head().map_err(|_| Error::Invalid)?;
         let now = self.clock.sample()?.monotonic;
         let configured_max =
@@ -1087,7 +1107,7 @@ impl Https<'_> {
         let result = backend.receive(
             https_upload::Request {
                 account: backend.account(),
-                device: client.device.ok_or(Error::Invalid)?,
+                device: principal.device,
                 credentials: client.credentials.as_ref().ok_or(Error::Invalid)?,
                 framing,
                 content_type: media,
@@ -1178,13 +1198,13 @@ impl Https<'_> {
             return Err(Error::WriterStopped);
         }
         state.last = now;
-        let backend = self.uploads.ok_or(Error::Invalid)?;
-        let snapshot =
-            match backend.event_snapshot(client.device.ok_or(Error::Invalid)?, client.absolute) {
-                Ok(snapshot) => snapshot,
-                Err(Error::Busy) => return Ok(true),
-                Err(error) => return Err(error),
-            };
+        let principal = client.principal.ok_or(Error::Invalid)?;
+        let backend = self.backend(principal.account).ok_or(Error::Invalid)?;
+        let snapshot = match backend.event_snapshot(principal.device, client.absolute) {
+            Ok(snapshot) => snapshot,
+            Err(Error::Busy) => return Ok(true),
+            Err(error) => return Err(error),
+        };
         let event = client.events.as_mut().ok_or(Error::Invalid)?;
         let connection = client.connection.as_mut().ok_or(Error::Invalid)?;
         if event.headers {

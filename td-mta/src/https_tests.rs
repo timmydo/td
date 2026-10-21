@@ -145,9 +145,10 @@ fn https_enforces_auth_origin_framing_revocation_and_idle_deadlines() {
     impl http_auth::Authenticator for Delayed<'_> {
         fn authenticate(
             &self,
+            username: &str,
             password: &[u8],
             deadline: Deadline,
-        ) -> Result<Option<DeviceId>, Error> {
+        ) -> Result<Option<http_auth::Principal>, Error> {
             assert_eq!(std::thread::current().name(), Some("https-auth"));
             if self.armed.swap(false, Ordering::AcqRel) {
                 self.entered.store(true, Ordering::Release);
@@ -159,7 +160,7 @@ fn https_enforces_auth_origin_framing_revocation_and_idle_deadlines() {
                     std::thread::sleep(Duration::from_millis(1));
                 }
             }
-            http_auth::Authenticator::authenticate(self.inner, password, deadline)
+            http_auth::Authenticator::authenticate(self.inner, username, password, deadline)
         }
     }
     let authentication = Delayed {
@@ -196,13 +197,12 @@ fn https_enforces_auth_origin_framing_revocation_and_idle_deadlines() {
                 .unwrap();
             let listeners = [BoundListener::new(socket, row, &lease).unwrap()];
             let server = Https {
-                uploads: None,
+                backends: &[],
                 listeners: &listeners,
                 policies: &lease,
                 handshakes: &handshakes,
                 authentication: &authentication,
                 origin: Origin::parse(&origin_text).unwrap(),
-                username: "private-user",
                 resources: &resource,
                 timeouts: &timeouts,
                 clock: clock.clone(),
@@ -505,13 +505,12 @@ fn stopped_upload_receipt(late: Option<bool>) {
                 .unwrap();
             let listeners = [BoundListener::new(socket, row, &lease).unwrap()];
             let server = Https {
-                uploads: Some(&late),
+                backends: &[&late],
                 listeners: &listeners,
                 policies: &lease,
                 handshakes: &handshakes,
                 authentication: &devices,
                 origin: Origin::parse(&origin_text).unwrap(),
-                username: "private-user",
                 resources: &resource,
                 timeouts: &timeouts,
                 clock: clock.clone(),
@@ -658,13 +657,12 @@ fn download_failures_release_shared_slot_and_shutdown_joins_streaming() {
                 .unwrap();
             let listeners = [BoundListener::new(socket, row, &lease).unwrap()];
             let server = Https {
-                uploads: Some(&late),
+                backends: &[&late],
                 listeners: &listeners,
                 policies: &lease,
                 handshakes: &handshakes,
                 authentication: &devices,
                 origin: Origin::parse(&origin_text).unwrap(),
-                username: "private-user",
                 resources: &resource,
                 timeouts: &timeouts,
                 clock: clock.clone(),
@@ -774,7 +772,15 @@ impl TestCredentials {
     }
 }
 impl http_auth::Authenticator for Mutex<TestCredentials> {
-    fn authenticate(&self, password: &[u8], _: Deadline) -> Result<Option<DeviceId>, Error> {
+    fn authenticate(
+        &self,
+        username: &str,
+        password: &[u8],
+        _: Deadline,
+    ) -> Result<Option<http_auth::Principal>, Error> {
+        if username != "private-user" {
+            return Ok(None);
+        }
         let registry = self.try_lock().map_err(|_| Error::Busy)?;
         let Some(credential) = &registry.credential else {
             return Ok(None);
@@ -786,7 +792,10 @@ impl http_auth::Authenticator for Mutex<TestCredentials> {
             && presented
                 .matches(registry.account, &credential.salt, &credential.verifier)
                 .map_err(|_| Error::Invalid)?)
-        .then_some(credential.id))
+        .then_some(http_auth::Principal {
+            account: registry.account,
+            device: credential.id,
+        }))
     }
 }
 fn upload_reply(client: &mut impl Transport) -> (u16, String) {
@@ -821,4 +830,139 @@ fn full_reply(client: &mut impl Transport) -> (u16, String, String) {
         head.to_owned(),
         body.to_owned(),
     )
+}
+
+#[test]
+fn authenticated_account_selects_backend_even_when_device_ids_match() {
+    struct Accounts;
+    impl http_auth::Authenticator for Accounts {
+        fn authenticate(
+            &self,
+            username: &str,
+            password: &[u8],
+            _: Deadline,
+        ) -> Result<Option<http_auth::Principal>, Error> {
+            let account = match (username, password) {
+                ("first", b"first-password") => AccountId::from_bytes([0xaa; 16]),
+                ("second", b"second-password") => AccountId::from_bytes([0xbb; 16]),
+                _ => return Ok(None),
+            };
+            Ok(Some(http_auth::Principal {
+                account,
+                device: DeviceId::from_bytes([7; 16]),
+            }))
+        }
+    }
+    struct Backend {
+        account: AccountId,
+        session: crate::jmap_session::Session,
+        calls: AtomicU64,
+    }
+    impl crate::https_upload::Backend for Backend {
+        fn account(&self) -> AccountId {
+            self.account
+        }
+        fn session(&self) -> Option<&crate::jmap_session::Session> {
+            Some(&self.session)
+        }
+        fn receive(
+            &self,
+            request: crate::https_upload::Request<'_>,
+            _: &mut dyn Transport,
+            _: &Control,
+        ) -> Result<crate::https_upload::Response, Error> {
+            assert_eq!(request.account, self.account);
+            assert_eq!(request.device, DeviceId::from_bytes([7; 16]));
+            assert_eq!(
+                request.credentials.username(),
+                if self.account == AccountId::from_bytes([0xaa; 16]) {
+                    "first"
+                } else {
+                    "second"
+                }
+            );
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            crate::https_upload::Response::created(
+                self.account,
+                crate::ids::BlobId::from_bytes([8; 16]),
+                0,
+                "text/plain",
+                false,
+            )
+        }
+    }
+    let _serial = serial();
+    let material = Material::new();
+    let socket = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = socket.local_addr().unwrap();
+    let origin_text = format!("https://localhost:{}", address.port());
+    let source = source(false)
+        .replace("https://localhost", &origin_text)
+        .replace("127.0.0.1:443", &address.to_string());
+    let lease = material.published(&source);
+    let resolved = resolved(&source);
+    let resource = Limits::default().plan().unwrap();
+    let admission = DiskLimits::default()
+        .plan(&resource, WorkLimits::default(), ViewMode::OnlineBackground)
+        .unwrap();
+    let timeouts = NetworkLimits::default().plan(&admission).unwrap();
+    let clock = Arc::new(Now(Instant::now(), AtomicU64::new(0)));
+    let ready = AtomicBool::new(false);
+    let control = Control::default();
+    let handshakes = HandshakePool::new(2).unwrap();
+    let make = |id, username| Backend {
+        account: id,
+        session: crate::jmap_session::Session::mail_submission(
+            Origin::parse(&origin_text).unwrap(),
+            crate::config::identities::AccountView {
+                id,
+                username,
+                name: username,
+            },
+            &resource,
+            crate::jmap_session::Concurrency {
+                uploads: 1,
+                requests: 1,
+            },
+        )
+        .unwrap(),
+        calls: AtomicU64::new(0),
+    };
+    let first = make(AccountId::from_bytes([0xaa; 16]), "first");
+    let second = make(AccountId::from_bytes([0xbb; 16]), "second");
+    resolved.candidate().with_graph(|records, graph| {
+        let rows = records.view(graph).unwrap().listeners().unwrap();
+        let row = (0..rows.len()).filter_map(|i| rows.listener(i).unwrap()).find(|r| r.kind == Kind::Https).unwrap();
+        let listeners = [BoundListener::new(socket, row, &lease).unwrap()];
+        let server = Https { backends: &[&first, &second], listeners: &listeners, policies: &lease,
+            handshakes: &handshakes, authentication: &Accounts, origin: Origin::parse(&origin_text).unwrap(),
+            resources: &resource, timeouts: &timeouts, clock: clock.clone(), ready: &ready };
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| server.run(&control));
+            let stop = Stop(&control);
+            wait(|| ready.load(Ordering::Acquire));
+            for (username, password, own, other) in [
+                ("first", "first-password", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "abbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+                ("second", "second-password", "abbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            ] {
+                let authorization = base64(format!("{username}:{password}").as_bytes());
+                let mut peer = client(address, &lease, clock.clone());
+                send(&mut peer, format!("GET /.well-known/jmap HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: Basic {authorization}\r\n\r\n", address.port()).as_bytes());
+                let (status, _, body) = full_reply(&mut peer);
+                assert_eq!(status, 200);
+                assert!(body.contains(own), "{body}");
+                assert!(!body.contains(other), "{body}");
+                drop(peer);
+                for (target, expected) in [(other, 404), (own, 200)] {
+                    let mut peer = client(address, &lease, clock.clone());
+                    send(&mut peer, format!("POST /jmap/upload/{target} HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: Basic {authorization}\r\nContent-Type: text/plain\r\nContent-Length: 0\r\n\r\n", address.port()).as_bytes());
+                    assert_eq!(full_reply(&mut peer).0, expected);
+                }
+            }
+            assert_eq!(first.calls.load(Ordering::Relaxed), 1);
+            assert_eq!(second.calls.load(Ordering::Relaxed), 1);
+            drop(stop);
+            worker.join().unwrap().unwrap();
+        });
+    }).unwrap();
 }

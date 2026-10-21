@@ -2074,13 +2074,17 @@ runtime login; privilege changes are refused on the next connection.
 
 ## 57. Request credential ownership
 
-`http_auth::parse_basic` separates bounded HTTP Basic decoding and exact
-configured-username matching from storage authentication. Its owned
+`http_auth::parse_basic` separates bounded HTTP Basic decoding from storage
+authentication. It retains the exact visible-ASCII username (1..254 bytes,
+excluding colon) and at most 97 password bytes. Its owned
 `BasicCredentials` retains at most 352 decoded bytes, has no Debug or Clone
 implementation, and clears its decoded buffer on drop. It contains presented
 bytes only, not a device ID, cached verifier result or authorization grant.
-The existing local `basic` adapter uses this same parser and still checks the
-local registry before returning a device ID.
+`postgres_http_auth::Authentication` matches the username case-sensitively
+against a bounded registry of at most 16 account bindings, then checks the
+password using that account's fresh primary snapshot. It returns a principal
+containing both AccountId and DeviceId; a device ID alone cannot identify an
+account because device IDs are unique only within their account.
 
 At PostgreSQL runtime integration the bounded HTTPS request worker may retain this owner
 for that request only, borrowing its password for fresh primary snapshot and
@@ -6423,3 +6427,20 @@ successful service activation. The isolated restore fixture covers the
 archive round trip, rollback and ambiguous commit, epoch change and pending
 recipient quarantine. Hosted activation and off-host backup durability remain
 separate operational checks.
+
+## HTTPS account selection
+
+The fixed HTTPS authentication worker returns an account/device principal.
+The network reactor selects a backend by that authenticated account, and
+retains the principal until the request ends. Backend registration is bounded
+to 16 distinct account IDs. Session discovery, upload, download, JMAP API and
+event snapshot dispatch all use that selection. URL or method argument account
+IDs never select authority: the selected account-scoped backend retains its
+existing target-account checks, fresh device checks and publication fences.
+Credentials remain request-owned and zeroed on drop; no worker pool, read
+capacity, body-operation concurrency or authentication-rate allowance is
+multiplied by the number of accounts.
+
+The server's cold profile loader still requires one account at this stage.
+The HTTPS mechanism can dispatch multiple registered backends, but activating
+multiple configured database accounts remains a separate runtime step.

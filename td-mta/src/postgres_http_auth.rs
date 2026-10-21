@@ -2,8 +2,7 @@
 use crate::{
     clock::RuntimeClock,
     device_credentials::Presented,
-    http_auth::Authenticator,
-    ids::DeviceId,
+    http_auth::{Authenticator, Principal},
     ports::{Deadline, Error},
     postgres_input::Loaded,
     postgres_probe::{self, Mode},
@@ -22,7 +21,7 @@ use std::{
 pub struct Authentication<'a> {
     loaded: &'a Loaded,
     executable: &'a Path,
-    binding: &'a Binding,
+    accounts: &'a [(&'a str, &'a Binding)],
     clock: &'a RuntimeClock,
     active: AtomicBool,
 }
@@ -30,19 +29,34 @@ impl<'a> Authentication<'a> {
     pub fn new(
         loaded: &'a Loaded,
         executable: &'a Path,
-        binding: &'a Binding,
+        accounts: &'a [(&'a str, &'a Binding)],
         clock: &'a RuntimeClock,
     ) -> Result<Self, Error> {
         if !executable.is_absolute()
-            || !binding.roles().jmap()
-            || loaded.bootstrap.profile() != binding.profile()
+            || accounts.is_empty()
+            || accounts.len() > crate::config::identities::MAX_ACCOUNTS
+            || accounts
+                .iter()
+                .enumerate()
+                .any(|(index, (username, binding))| {
+                    username.is_empty()
+                        || username.len() > 254
+                        || !username
+                            .bytes()
+                            .all(|byte| (33..=126).contains(&byte) && byte != b':')
+                        || !binding.roles().jmap()
+                        || loaded.bootstrap.profile() != binding.profile()
+                        || accounts.iter().take(index).any(|(prior, other)| {
+                            prior == username || other.account() == binding.account()
+                        })
+                })
         {
             return Err(Error::Invalid);
         }
         Ok(Self {
             loaded,
             executable,
-            binding,
+            accounts,
             clock,
             active: AtomicBool::new(false),
         })
@@ -55,7 +69,12 @@ impl Drop for Permit<'_> {
     }
 }
 impl Authenticator for Authentication<'_> {
-    fn authenticate(&self, password: &[u8], deadline: Deadline) -> Result<Option<DeviceId>, Error> {
+    fn authenticate(
+        &self,
+        username: &str,
+        password: &[u8],
+        deadline: Deadline,
+    ) -> Result<Option<Principal>, Error> {
         let now = Instant::now();
         let deadline = self.clock.deadline_instant(deadline)?.min(
             now.checked_add(Duration::from_secs(10))
@@ -64,6 +83,9 @@ impl Authenticator for Authentication<'_> {
         if now >= deadline {
             return Err(Error::Deadline);
         }
+        let Some((_, binding)) = self.accounts.iter().find(|(name, _)| *name == username) else {
+            return Ok(None);
+        };
         if Presented::parse(password).is_none() {
             return Ok(None);
         }
@@ -86,7 +108,8 @@ impl Authenticator for Authentication<'_> {
             request.mode = Mode::Runtime;
             let presented = Presented::parse(password).ok_or(Error::Invalid)?;
             let device = presented.id();
-            let binding = self.binding.clone();
+            let binding = (*binding).clone();
+            let account = binding.account();
             let result = postgres_probe::with_client(
                 &request,
                 &self.loaded.trust,
@@ -101,7 +124,7 @@ impl Authenticator for Authentication<'_> {
                 return Err(Error::Deadline);
             }
             match result {
-                Ok(Ok(_)) => return Ok(Some(device)),
+                Ok(Ok(_)) => return Ok(Some(Principal { account, device })),
                 Ok(Err(postgres_snapshot::Error::Unauthenticated)) => return Ok(None),
                 Ok(Err(_)) => return Err(Error::Invalid),
                 Err(postgres_probe::Error::Transport) => continue,
