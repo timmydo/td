@@ -107,15 +107,15 @@ Linux UAPI preparation uses `td-builder kernel-headers` with the recipe's
 source path and SHA-256, x86 architecture, and a new private work directory.
 Both accepted architectures emit identical headers under this pinned x86
 policy; other architectures are refused. It supports Linux 4.14.67,
-checking the eight upstream selection and transformation scripts before
-proceeding. Rust handles xz/tar
-extraction, header selection, syscall constants, textual sanitization and
-canonical uncompressed GNU tar output. The installed C compiler builds the
-pinned source's `unifdef.c` as a temporary control-plane helper. `HOSTCC`
-selects one executable, defaulting to `gcc`; it is never parsed as a shell
-command or split into arguments. The helper and its compiler never become
-target recipe inputs through this operation.
-No make, shell, sed, tar or xz executable participates in header preparation.
+checking the nine upstream selection and transformation sources, its
+`scripts/unifdef.c` among them, before proceeding. Rust handles xz/tar
+extraction, header selection, syscall constants, textual sanitization,
+the `unifdef -U__KERNEL__ -D__EXPORTED_HEADERS__` pass and canonical
+uncompressed GNU tar output. That pass is a port of the pinned unifdef 2.5
+(`builder/src/unifdef.rs`), not a compiled copy, so header preparation
+needs no C compiler.
+No compiler, make, shell, sed, tar or xz executable participates in header
+preparation.
 The generated i386 and x86_64 archives retain their existing seed digests.
 A future selection-policy change requires updating this implementation.
 

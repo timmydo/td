@@ -4,7 +4,6 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 type Result<T> = std::result::Result<T, String>;
 const MAX_SOURCE: u64 = 512 * 1024 * 1024;
@@ -42,6 +41,11 @@ const POLICY: &[(&str, &str)] = &[
     (
         "arch/x86/entry/syscalls/Makefile",
         "f7857161e29f29f19449b479cc751bb5636849805d79fc9c12230fef2351a6a0",
+    ),
+    // The unifdef that crate::unifdef ports.
+    (
+        "scripts/unifdef.c",
+        "3e7d8a44f184444232ff30ef71e32f8715f49f1fad80cbf908f73f99ad6e3ab2",
     ),
 ];
 
@@ -450,21 +454,6 @@ pub(crate) fn run_cli(args: &[String]) -> Result<()> {
     let source = work.0.join("source");
     crate::tar::unpack_archive(&private_archive, &source, false)?;
     verify_policy(&source)?;
-    let unifdef = work.0.join("unifdef");
-    let compiler = std::env::var_os("HOSTCC")
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "gcc".into());
-    let status = Command::new(compiler)
-        .args(["-std=gnu89", "-O2", "-o"])
-        .arg(&unifdef)
-        .arg(source.join("scripts/unifdef.c"))
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::null())
-        .status()
-        .map_err(|e| format!("compile pinned unifdef: {e}"))?;
-    if !status.success() {
-        return Err(format!("compile pinned unifdef: {status}"));
-    }
     let mut files = BTreeMap::new();
     let common = source.join("include/uapi");
     let x86 = source.join("arch/x86/include/uapi");
@@ -495,23 +484,13 @@ pub(crate) fn run_cli(args: &[String]) -> Result<()> {
         // Upstream excludes source headers from the generated-header list.
         files.entry(format!("asm/{name}")).or_insert(bytes);
     }
-    let temporary = work.0.join("sanitized.h");
     for (name, bytes) in &mut files {
-        fs::write(&temporary, sanitize(bytes)).map_err(|e| e.to_string())?;
-        let result = Command::new(&unifdef)
-            .args(["-U__KERNEL__", "-D__EXPORTED_HEADERS__"])
-            .arg(&temporary)
-            .stdin(Stdio::inherit())
-            .output()
-            .map_err(|e| format!("unifdef {name}: {e}"))?;
-        if !matches!(result.status.code(), Some(0 | 1)) || result.stdout.len() as u64 > MAX_HEADER {
-            return Err(format!(
-                "unifdef {name}: {}: {}",
-                result.status,
-                String::from_utf8_lossy(&result.stderr)
-            ));
+        let filtered =
+            crate::unifdef::filter(&sanitize(bytes)).map_err(|e| format!("unifdef {name}: {e}"))?;
+        if filtered.len() as u64 > MAX_HEADER {
+            return Err(format!("unifdef {name}: output exceeds its bound"));
         }
-        *bytes = result.stdout;
+        *bytes = filtered;
     }
     files.insert("linux/version.h".into(), b"#define LINUX_VERSION_CODE 265795\n#define KERNEL_VERSION(a,b,c) (((a) << 16) + ((b) << 8) + (c))\n".to_vec());
     if files.len() > 2048 || files.values().map(Vec::len).sum::<usize>() > MAX_TOTAL {
@@ -558,7 +537,7 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
     #[test]
-    fn policy_changes_are_refused_before_compiling() {
+    fn policy_changes_are_refused_before_filtering() {
         let _dir_cleanup = crate::test_temp::TempDir::new("td-header-policy").unwrap();
         let dir = _dir_cleanup.join("fixture");
         fs::create_dir(&dir).unwrap();

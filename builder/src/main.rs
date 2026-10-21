@@ -79,6 +79,7 @@ mod test_root;
 #[path = "../../td-fs/src/temp_dir.rs"]
 mod test_temp;
 mod toolchain_x86_64;
+mod unifdef;
 mod verdict_journal;
 mod worktree_gc;
 
