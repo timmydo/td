@@ -1219,6 +1219,56 @@ pub fn debug_line_requires_debug_str(path: &Path) -> Result<bool, String> {
         .debug_str)
 }
 
+/// Whether `path` is debug-only, as `objcopy --only-keep-debug` writes it:
+/// every allocated section other than a note is SHT_NOBITS, at least one
+/// is, and no PT_INTERP or PT_DYNAMIC segment holds file bytes.
+pub fn is_debug_only(path: &Path) -> Result<bool, String> {
+    let elf = FileElf::open(path)?;
+    let mut nobits = false;
+    for section in &elf.sections {
+        if section.flags & SHF_ALLOC == 0 || section.kind == SHT_NOTE {
+            continue;
+        }
+        if section.kind != SHT_NOBITS {
+            return Ok(false);
+        }
+        nobits = true;
+    }
+    if !nobits || !elf.is64 {
+        return Ok(false);
+    }
+    let mut file =
+        std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let mut header = [0u8; 64];
+    file.read_exact(&mut header)
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    let phoff = u64le(&header, 0x20)?;
+    let entry_size = u64::from(u16le(&header, 0x36)?);
+    let count = u64::from(u16le(&header, 0x38)?);
+    if count != 0 && entry_size < 56 {
+        return Err(format!(
+            "{}: ELF program header is too small",
+            path.display()
+        ));
+    }
+    let mut segment = [0u8; 56];
+    for index in 0..count {
+        let at = index
+            .checked_mul(entry_size)
+            .and_then(|offset| offset.checked_add(phoff))
+            .ok_or("ELF program header offset overflow")?;
+        file.seek(SeekFrom::Start(at))
+            .map_err(|e| format!("seek {}: {e}", path.display()))?;
+        file.read_exact(&mut segment)
+            .map_err(|e| format!("read {} program header: {e}", path.display()))?;
+        let kind = u32le(&segment, 0)?;
+        if matches!(kind, PT_INTERP | PT_DYNAMIC) && u64le(&segment, 0x20)? != 0 {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Verify the runtime/debug pair identity and the companion's minimum useful
 /// contents. The runtime retains only allocated/runtime metadata and dynamic
 /// symbols; the full ordinary symbol table lives in the companion.
@@ -2699,7 +2749,11 @@ pub(crate) mod tests {
         b
     }
 
-    fn synth_profiled_elf(build_ids: &[[u8; 20]], with_lines: bool, with_symbols: bool) -> Vec<u8> {
+    pub(crate) fn synth_profiled_elf(
+        build_ids: &[[u8; 20]],
+        with_lines: bool,
+        with_symbols: bool,
+    ) -> Vec<u8> {
         let names = b"\0.shstrtab\0.note.gnu.build-id\0.symtab\0.debug_line\0.strtab\0.text\0.bss\0.debug_gdb_scripts\0.debug_line_str\0.debug_str\0";
         let name_offset = |name: &[u8]| {
             names
@@ -2846,7 +2900,7 @@ pub(crate) mod tests {
         bytes
     }
 
-    fn profile_section_u64(bytes: &mut [u8], section: usize, field: usize, value: u64) {
+    pub(crate) fn profile_section_u64(bytes: &mut [u8], section: usize, field: usize, value: u64) {
         let shoff = u64le(bytes, 0x28).unwrap() as usize;
         let start = shoff + section * 64 + field;
         bytes
@@ -2855,7 +2909,7 @@ pub(crate) mod tests {
             .copy_from_slice(&value.to_le_bytes());
     }
 
-    fn profile_section_u32(bytes: &mut [u8], section: usize, field: usize, value: u32) {
+    pub(crate) fn profile_section_u32(bytes: &mut [u8], section: usize, field: usize, value: u32) {
         let shoff = u64le(bytes, 0x28).unwrap() as usize;
         let start = shoff + section * 64 + field;
         bytes

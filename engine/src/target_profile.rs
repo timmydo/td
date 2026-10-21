@@ -74,6 +74,8 @@ pub const ASSEMBLY_EXCEPTIONS: &[(&str, &str)] = &[
         "upstream native GCC libgcc x86_64 assembly",
     ),
     ("gcc-x86-64-self", "upstream GCC libgcc x86_64 assembly"),
+    // libgcc built in the Debian build root.
+    ("gcc-runtime", "upstream GCC libgcc x86_64 assembly"),
     (
         "rust-toolchain",
         "upstream LLVM and Rust compiler-runtime assembly",
@@ -159,7 +161,11 @@ pub fn output_assembly_exceptions(recipe: &str) -> Vec<(&'static str, &'static s
                 || (*source == "gcc-x86-64-native"
                     && matches!(recipe, "binutils-x86-64-self" | "gcc-x86-64-self"))
                 || (*source == "gcc-x86-64-self"
-                    && !matches!(recipe, "glibc-x86-64" | "binutils-x86-64-self"))
+                    && !matches!(
+                        recipe,
+                        "glibc-x86-64" | "binutils-x86-64-self" | "gcc-runtime"
+                    ))
+                || (*source == "gcc-runtime" && recipe == "gcc-runtime")
                 || (*source == "rust-toolchain"
                     && RUST_PROFILED_RECIPES.contains(&recipe)
                     && !SNAPSHOT_STD_RECIPES.contains(&recipe))
@@ -340,6 +346,7 @@ mod tests {
                     "upstream native GCC libgcc x86_64 assembly"
                 ),
                 ("gcc-x86-64-self", "upstream GCC libgcc x86_64 assembly"),
+                ("gcc-runtime", "upstream GCC libgcc x86_64 assembly"),
                 (
                     "rust-toolchain",
                     "upstream LLVM and Rust compiler-runtime assembly"
@@ -435,6 +442,13 @@ mod tests {
                     "upstream native GCC libgcc x86_64 assembly"
                 ),
                 ("gcc-x86-64-self", "upstream GCC libgcc x86_64 assembly"),
+            ]
+        );
+        assert_eq!(
+            output_assembly_exceptions("gcc-runtime"),
+            vec![
+                ("glibc-x86-64", "upstream glibc sysdeps/x86_64 assembly"),
+                ("gcc-runtime", "upstream GCC libgcc x86_64 assembly"),
             ]
         );
     }

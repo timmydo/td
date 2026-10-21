@@ -14,7 +14,7 @@ deleted; its findings are summarized under "Facts" below.
 | Base | Debian 13 "trixie" slim, pinned by registry layer digest, plus pinned .debs from snapshot.debian.org (cmake included) |
 | libc | **glibc 2.41, built from source in the build root.** Rust target stays `x86_64-unknown-linux-gnu` |
 | GCC runtime | GCC's `libgcc` (libgcc_s.so.1, libgcc.a, libgcc_eh.a, crtbegin/crtend) built from the pinned GCC 14 source in the build root |
-| Rust | Upstream prebuilt gnu-host rustc/cargo/rust-std 1.96.0, retargeted onto td glibc/libgcc/zlib by the existing rust-stage0 transform |
+| Rust | Upstream prebuilt gnu-host rustc/cargo/rust-std/clippy 1.96.0, retargeted onto td glibc/libgcc/zlib by the existing rust-stage0 transform (renamed `rust-dist`) |
 | Linking without GCC | `td-cc` becomes a GCC-free link driver: rustc's `cc`, forwarding to `rust-lld` with td's glibc and libgcc start-up files |
 | Old ladder | Deleted entirely (stage0, Mes, TinyCC, GCC/glibc/binutils ladder, source-built Rust/LLVM, bootstrap-root) |
 | Self-hosting | Image ships upstream Rust + td-cc + glibc + libgcc; C rebuilds need the build root (fetched on demand, cached) |
@@ -49,7 +49,7 @@ deleted; its findings are summarized under "Facts" below.
 - Registry: anonymous token flow; blob GET 307s to an expiring CDN URL;
   pinning the blob digest URL needs no manifest GET (no rate-limit cost).
   Trixie slim = one gzip layer, 29.8 MB.
-- 93 .debs / 92 MB give gcc 14.2, binutils 2.44, make, flex, bison, bc,
+- 98 .debs / 107 MB give gcc and g++ 14.2, binutils 2.44, make, flex, bison, bc,
   perl, libelf-dev, pkgconf, cmake, rsync, cpio, xz, patch. Kernel alone
   needs 49. No dpkg: data.tar.xz extraction + 7 symlink fixups.
 - td's kernel config (7.1.4) builds in the root in 158 s at -j16.
@@ -111,33 +111,50 @@ deleted; its findings are summarized under "Facts" below.
    and their pins are deleted, along with the kernel's glibc sysroot,
    static HOSTCC wrapper, libelf pkg-config shim and tool farm. The
    integration tier is run by hand before push (boot path).
-5. **td glibc, libgcc and zlib from the build root.** `glibc-x86-64`
-   rebuilt with Debian gcc in the root (same 2.41 source, frame pointers,
-   companions); new `gcc-runtime` recipe builds only GCC 14's target
-   libgcc from the pinned source; `zlib-x86-64` moves into the root.
-   Gate: their outputs reference nothing in the build root.
-6. **td-cc as a GCC-free link driver.** Accepts rustc's gcc-style link
+5. **td libgcc from the build root.** New `gcc-runtime` recipe: the
+   root's gcc/g++ build GCC 14.3's compiler proper from the pinned
+   source, which compiles only the target libgcc (libgcc.a, libgcc_eh.a,
+   libgcc_s.so.1, crtbegin/crtend) against a sysroot of td glibc, with
+   frame pointers and companions. Its probes link a dynamic PIE and a
+   static ET_EXEC from td glibc and it alone (`ld -nostdlib`) and run
+   them. Built against today's ladder glibc; glibc moves later (8b).
+   Order note: moving glibc first would re-key the whole ladder GCC and
+   the source-built Rust above it on every iteration, and glibc must
+   link a td libgcc, never the root's.
+6. **Rust toolchain cutover** (one atomic landing). `rust-toolchain`
+   becomes the pinned upstream 1.96.0 gnu dist (rustc, rust-std, Cargo,
+   Clippy) through the renamed `rust-dist` transform onto td glibc,
+   gcc-runtime's libgcc_s and zlib (moved into the root, with
+   companions), rust-lld included. gcc-x86-64-self stays the `cc`;
+   upstream's default `-fuse-ld=lld` then links with rust-lld through
+   `gcc-ld/ld.lld`. Upstream rustc/Cargo/rust-lld/LLVM and rust-std are
+   a declared profiler boundary. Amends AGENTS.md (trust model, Rust
+   bridge, profiling contract), `td-profiler/DESIGN.md` and the design
+   docs that cite the source-built toolchain. Deletes the source-built
+   stage1/stage2/LLVM path, `rust-stage0` and `td-util-boot`.
+7. **A GCC-free Rust link driver.** Accepts rustc's gcc-style link
    lines (`-Wl,…`, `-nodefaultlibs`, `-pie`, `-static`, `-static-pie`,
-   `-shared`, `-l…`, `-L…`, `-o`), selects td glibc/libgcc crt objects
-   per output kind, runs `rust-lld`; refuses compile requests. Tests:
-   link td-builder (dynamic PIE), td-sh (static ET_EXEC), a proc-macro
-   dylib, a cdylib, with no gcc or binutils reachable.
-7. **Rust toolchain cutover** (one atomic landing). `rust-toolchain`
-   becomes the pinned upstream 1.96.0 gnu dist through the rust-stage0
-   transform (now onto the step-5 runtime, rust-lld included), with
-   td-cc as the linker. Recipes keep the gnu target. C inside crates
-   (`ring`, AWS-LC, SQLite) compiles in the build root against td glibc.
-   Amend `td-profiler/DESIGN.md`, `crypto_policy.rs` and the
-   td-crypto/td-mta design docs. Deletes the source-built
-   stage1/stage2/LLVM path and `td-util-boot`.
+   `-shared`, `-l…`, `-L…`, `-o`), selects td glibc/gcc-runtime crt
+   objects per output kind, runs `rust-lld`; refuses compile requests.
+   Every Rust recipe and the image's `cc` for Cargo switch to it. Tests:
+   a dynamic PIE, a static ET_EXEC, a static PIE, a proc-macro dylib and
+   a cdylib, with no gcc or binutils reachable. C inside crates (`ring`,
+   AWS-LC, jemalloc, blake3, oniguruma, pcre2) compiles in the build root
+   against td glibc. Amends `crypto_policy.rs` and the td-crypto/td-mta
+   design docs for AWS-LC's compiler.
 8. **C packages in the build root against td glibc**: LibreSSL (library
    only), curl, Git 2.55.0; json-c, popt, libdevmapper, util-linux libs,
    cryptsetup (static, as today); OpenSSH (`--without-openssl`). One
    landing per stack (git, cryptsetup, ssh).
+   8b. **glibc in the build root.** `glibc-x86-64` rebuilt in the root
+   (same 2.41 source, frame pointers, companions; the root gains gawk
+   and python3). Its link uses a static libgcc built from td glibc's
+   installed headers first, never the root's libgcc, and gcc-runtime is
+   then rebuilt against the new glibc.
 9. **Test HTTPS origin.** Replace `openssl s_server/s_client` with a
    small rustls tool on td-net; LibreSSL's command leaves the image.
 10. **Image switch.** system-x86-64 ships the upstream Rust toolchain,
-    td-cc driver, td glibc and libgcc instead of GCC and binutils.
+    the link driver, td glibc and libgcc instead of GCC and binutils.
 11. **Delete the ladder.** `seed/` (stage0, patches, bootstrap-root,
     seed digests as applicable), stage0/Mes/TinyCC/mesboot/GCC/glibc
     ladder/binutils/make/gawk/cmake recipes, `ladder.rs`, `mes_boot.rs`,

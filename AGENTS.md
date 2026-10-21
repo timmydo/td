@@ -179,7 +179,9 @@ and the rest. What td enforces:
   `BuildRoot`, never a builder or tool input;
 - an output built in it may not reference its store path, and no file in
   that output may be an ELF naming an interpreter or RUNPATH outside the
-  store, or a symlink to an absolute path outside the store.
+  store (a non-executable debug-only companion, whose loader ranges hold
+  no data, is judged by the runtime it pairs with), or a symlink to an
+  absolute path outside the store.
 
 What td does not enforce: static objects of the root's (`crt*.o`,
 `libgcc.a`, `libc.a`) linked into an output are indistinguishable from

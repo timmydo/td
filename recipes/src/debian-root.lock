@@ -15,15 +15,15 @@
 #
 # `want` is the C build tool set: the kernel needs gcc, make, flex, bison,
 # bc, pkgconf and libelf-dev; rsync serves `make headers_install`, which
-# no recipe runs yet; cryptsetup's json-c needs cmake; the rest serve
-# the C packages and the C inside Rust crates. Every pinned source is C, so
-# there is no g++.
+# no recipe runs yet; cryptsetup's json-c needs cmake; gcc-runtime builds
+# GCC itself, which is C++, so it needs g++; the rest serve the C packages
+# and the C inside Rust crates.
 image library/debian:trixie-20261005-slim
 snapshot 20261005T000000Z
 archive debian trixie
 archive debian trixie-updates
 archive debian-security trixie-security
-want gcc make flex bison bc perl libelf-dev pkgconf cmake rsync cpio xz-utils patch
+want gcc g++ make flex bison bc perl libelf-dev pkgconf cmake rsync cpio xz-utils patch
 
 # resolved by `td-feed debian-root resolve`; review the diff
 index sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f
@@ -45,6 +45,10 @@ deb debian-root-cpp-14 cpp-14_14.2.0-19_amd64.deb 3bae5fe03c56c6d021900ab4fb79e3
 deb debian-root-cpp-14-x86-64-linux-gnu cpp-14-x86-64-linux-gnu_14.2.0-19_amd64.deb ef274b5379f5f97fc71619d39ecc84d039d3e184570d207b909c90afaa5d79e0 11047460 https://snapshot.debian.org/archive/debian/20261005T000000Z/pool/main/g/gcc-14/cpp-14-x86-64-linux-gnu_14.2.0-19_amd64.deb 14.2.0-19
 deb debian-root-cpp-x86-64-linux-gnu cpp-x86-64-linux-gnu_14.2.0-1_amd64.deb d902f484e38bce59e82efc0df2fe20139a0932ca759ecafdfe6e5b6c72238eb8 4840 https://snapshot.debian.org/archive/debian/20261005T000000Z/pool/main/g/gcc-defaults/cpp-x86-64-linux-gnu_14.2.0-1_amd64.deb 4:14.2.0-1
 deb debian-root-flex flex_2.6.4-8.2+b4_amd64.deb 75f963765232c356d0a2fb70e780dfa9de2425aca036ec60eefb7fc98a2c905b 423136 https://snapshot.debian.org/archive/debian/20261005T000000Z/pool/main/f/flex/flex_2.6.4-8.2+b4_amd64.deb 2.6.4-8.2+b4
+deb debian-root-g++ g++_14.2.0-1_amd64.deb f86661c021ab2acb39ceb87315e7c2d4d420fdadc19945d5d589f3953410445c 1344 https://snapshot.debian.org/archive/debian/20261005T000000Z/pool/main/g/gcc-defaults/g++_14.2.0-1_amd64.deb 4:14.2.0-1
+deb debian-root-g++-14 g++-14_14.2.0-19_amd64.deb 4706ab29eab3d81e93582b45b229fdedc71f1eec3071996a448cf2c8beb83f3a 22544 https://snapshot.debian.org/archive/debian/20261005T000000Z/pool/main/g/gcc-14/g++-14_14.2.0-19_amd64.deb 14.2.0-19
+deb debian-root-g++-14-x86-64-linux-gnu g++-14-x86-64-linux-gnu_14.2.0-19_amd64.deb c66b009fedd340520279d1af2f91d0668e9f64f0c08fe62179ca1c75e556be58 12114812 https://snapshot.debian.org/archive/debian/20261005T000000Z/pool/main/g/gcc-14/g++-14-x86-64-linux-gnu_14.2.0-19_amd64.deb 14.2.0-19
+deb debian-root-g++-x86-64-linux-gnu g++-x86-64-linux-gnu_14.2.0-1_amd64.deb 15e10fc3948ec76be8d51b23e75ad9df9c39588c94f1f47059cee02c117c7583 1200 https://snapshot.debian.org/archive/debian/20261005T000000Z/pool/main/g/gcc-defaults/g++-x86-64-linux-gnu_14.2.0-1_amd64.deb 4:14.2.0-1
 deb debian-root-gcc gcc_14.2.0-1_amd64.deb eee65c41a441c57c05f754ced1b9d093956966a1c7da9938c3ec00d3dc2f905d 5136 https://snapshot.debian.org/archive/debian/20261005T000000Z/pool/main/g/gcc-defaults/gcc_14.2.0-1_amd64.deb 4:14.2.0-1
 deb debian-root-gcc-14 gcc-14_14.2.0-19_amd64.deb 21500408b5019d8d29f70ce58488e2eea469a1adb4b5fd7db45e819b5efcac4e 540064 https://snapshot.debian.org/archive/debian/20261005T000000Z/pool/main/g/gcc-14/gcc-14_14.2.0-19_amd64.deb 14.2.0-19
 deb debian-root-gcc-14-x86-64-linux-gnu gcc-14-x86-64-linux-gnu_14.2.0-19_amd64.deb a17ef039f1ba482051c3efb5c2c24070002e60dd0bd09fd456ec31481a11b725 21389968 https://snapshot.debian.org/archive/debian/20261005T000000Z/pool/main/g/gcc-14/gcc-14-x86-64-linux-gnu_14.2.0-19_amd64.deb 14.2.0-19
@@ -104,6 +108,7 @@ deb debian-root-libsasl2-2 libsasl2-2_2.1.28+dfsg1-9_amd64.deb 66e49d7ae026811b4
 deb debian-root-libsasl2-modules-db libsasl2-modules-db_2.1.28+dfsg1-9_amd64.deb a5c38659fbd62c33c6d9bfa2be43e75a572d1818531aad32dd74d0a58cc4bd19 19768 https://snapshot.debian.org/archive/debian/20261005T000000Z/pool/main/c/cyrus-sasl2/libsasl2-modules-db_2.1.28+dfsg1-9_amd64.deb 2.1.28+dfsg1-9
 deb debian-root-libsframe1 libsframe1_2.44-3_amd64.deb 38f625dfdc582717029ac3a3e97c51d994ec2e7a0e9b230c6b44e40d1276311f 78360 https://snapshot.debian.org/archive/debian/20261005T000000Z/pool/main/b/binutils/libsframe1_2.44-3_amd64.deb 2.44-3
 deb debian-root-libssh2-1t64 libssh2-1t64_1.11.1-1+deb13u2_amd64.deb dbb1024c192d4d292b7cfa902b96076cfe81b56a5eed4fb28da36e8bf543e49a 245240 https://snapshot.debian.org/archive/debian/20261005T000000Z/pool/main/libs/libssh2/libssh2-1t64_1.11.1-1+deb13u2_amd64.deb 1.11.1-1+deb13u2
+deb debian-root-libstdc++-14-dev libstdc++-14-dev_14.2.0-19_amd64.deb 4b962fac5f1af0bd8b1b3f97e0f47b9d8e9a79e88802143f00ebfbd78ad87a7b 2375760 https://snapshot.debian.org/archive/debian/20261005T000000Z/pool/main/g/gcc-14/libstdc++-14-dev_14.2.0-19_amd64.deb 14.2.0-19
 deb debian-root-libtasn1-6 libtasn1-6_4.20.0-2+deb13u1_amd64.deb 23fec6e06583ce2bad9b2c04c9b485e90440e259b1abf8677cd80d3ce60831ad 50112 https://snapshot.debian.org/archive/debian/20261005T000000Z/pool/main/libt/libtasn1-6/libtasn1-6_4.20.0-2+deb13u1_amd64.deb 4.20.0-2+deb13u1
 deb debian-root-libtsan2 libtsan2_14.2.0-19_amd64.deb 529d7f68227d16975076c5f842e8b687faea1b5df8e0dcf62e436d5402844ca5 2460216 https://snapshot.debian.org/archive/debian/20261005T000000Z/pool/main/g/gcc-14/libtsan2_14.2.0-19_amd64.deb 14.2.0-19
 deb debian-root-libubsan1 libubsan1_14.2.0-19_amd64.deb 9205a1bef7d6a52ffc06548e0cde169ff303e688c12d9be3a98f734449077e22 1074340 https://snapshot.debian.org/archive/debian/20261005T000000Z/pool/main/g/gcc-14/libubsan1_14.2.0-19_amd64.deb 14.2.0-19
@@ -125,4 +130,4 @@ deb debian-root-rpcsvc-proto rpcsvc-proto_1.4.3-1_amd64.deb 32ac0692694f8a34cc90
 deb debian-root-rsync rsync_3.5.0+ds1-0+deb13u1_amd64.deb 4e7c9ceffc110e23e91177811fb02c7033b161d327f696f1b8f2f57d2edb92c5 501964 https://snapshot.debian.org/archive/debian-security/20261005T000000Z/pool/updates/main/r/rsync/rsync_3.5.0+ds1-0+deb13u1_amd64.deb 3.5.0+ds1-0+deb13u1
 deb debian-root-xz-utils xz-utils_5.8.1-1+deb13u1_amd64.deb 9e0a39d95373afdaad3c9dfaab3c8b0beb9a2c4654e6be10b4bcf458509a3217 659488 https://snapshot.debian.org/archive/debian/20261005T000000Z/pool/main/x/xz-utils/xz-utils_5.8.1-1+deb13u1_amd64.deb 5.8.1-1+deb13u1
 deb debian-root-zlib1g-dev zlib1g-dev_1.3.dfsg+really1.3.1-1+b1_amd64.deb 76ed5c858e1aef38b7be93acce5910e457e77bd6271471b9d05fb42e78826224 919744 https://snapshot.debian.org/archive/debian/20261005T000000Z/pool/main/z/zlib/zlib1g-dev_1.3.dfsg+really1.3.1-1+b1_amd64.deb 1:1.3.dfsg+really1.3.1-1+b1
-tree sha256:bb20e48de3bf414cdfb140dea8875810d4cfa992712ca789d588b6fbc8d02262
+tree sha256:4759264120eb88384e96192c3804eeee9eb70297916966162ad6cdb26218822d

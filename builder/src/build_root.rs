@@ -14,6 +14,7 @@
 
 use crate::{sandbox, scan, sha256, store, store_db, store_db_read, tar, xz};
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use td_engine::debian_root::{self, Kind, Lock, Pin};
@@ -507,8 +508,9 @@ fn pin(sources: &Path, lock_file: &Path, work_dir: &Path) -> Result<String, Stri
 /// Refuse an output built in the root that keeps the root at run time: a
 /// reference to its store path, an ELF whose interpreter or RUNPATH names a
 /// path outside the store (the root's `/lib64/ld-linux-x86-64.so.2`, its
-/// `/usr/lib`), or an absolute symlink out of the store. It cannot see a
-/// static object of the root's linked into an output; AGENTS.md says so.
+/// `/usr/lib`), or an absolute symlink out of the store. A debug companion
+/// is judged by its runtime (`companion`). It cannot see a static object of
+/// the root's linked into an output; AGENTS.md says so.
 pub(crate) fn check_output(
     root: &str,
     output: &str,
@@ -523,7 +525,68 @@ pub(crate) fn check_output(
         .next()
         .ok_or_else(|| format!("{output}: not a store path"))?;
     let store_prefix = format!("{}/", store::store_dir());
-    check_tree(&newstore.join(base), output, output, &store_prefix)
+    let top = newstore.join(base);
+    check_tree(&top, &top, output, output, &store_prefix)
+}
+
+/// What an ELF in an output is to the gate.
+#[derive(Debug, PartialEq)]
+enum Companion {
+    /// Not at a companion's path: judged itself.
+    No,
+    /// The debug companion of a runtime in the output: the runtime is judged.
+    Paired,
+    /// At a companion's path but not one, for this reason: judged itself.
+    Unpaired(String),
+}
+
+/// Whether `path` is the debug companion of a runtime in the output at `top`:
+/// a non-executable, debug-only (`--only-keep-debug`) `lib/debug/<rel>.debug`
+/// that pairs with a regular file `<rel>` inside the output. A companion
+/// keeps its runtime's program headers over NOBITS sections, so its
+/// interpreter and dynamic ranges hold no loader data. A named
+/// line-attribution exception's companion does not pair here; no recipe in
+/// the root has one.
+fn companion(top: &Path, path: &Path) -> Companion {
+    let Some(rel) = path
+        .strip_prefix(top.join("lib/debug"))
+        .ok()
+        .and_then(|rel| rel.to_str())
+        .and_then(|rel| rel.strip_suffix(".debug"))
+    else {
+        return Companion::No;
+    };
+    let runtime = top.join(rel);
+    let why = (|| {
+        if !fs::symlink_metadata(&runtime)
+            .map_err(|e| format!("no runtime {}: {e}", runtime.display()))?
+            .is_file()
+        {
+            return Err(format!("{} is not a regular file", runtime.display()));
+        }
+        let real = fs::canonicalize(&runtime)
+            .map_err(|e| format!("resolve {}: {e}", runtime.display()))?;
+        let real_top =
+            fs::canonicalize(top).map_err(|e| format!("resolve {}: {e}", top.display()))?;
+        if !real.starts_with(&real_top) {
+            return Err(format!("{} resolves outside the output", runtime.display()));
+        }
+        let mode = fs::metadata(path)
+            .map_err(|e| format!("stat {}: {e}", path.display()))?
+            .permissions()
+            .mode();
+        if mode & 0o111 != 0 {
+            return Err("it is executable".into());
+        }
+        if !crate::elf::is_debug_only(path)? {
+            return Err("it is not debug-only: it holds allocated or loader data".into());
+        }
+        crate::elf::assert_debug_pair(&runtime, path)
+    })();
+    match why {
+        Ok(()) => Companion::Paired,
+        Err(why) => Companion::Unpaired(why),
+    }
 }
 
 /// `path` with `.` and `..` resolved lexically, or None when `..` climbs
@@ -551,6 +614,7 @@ fn in_store(path: &str, store_prefix: &str) -> bool {
 /// `path` on disk is `canonical` in the store; `..` and `$ORIGIN` are
 /// resolved against `canonical` so neither climbs out unseen.
 fn check_tree(
+    top: &Path,
     path: &Path,
     canonical: &str,
     output: &str,
@@ -584,22 +648,28 @@ fn check_tree(
         for entry in entries {
             let name = entry.file_name();
             let child = format!("{canonical}/{}", name.to_string_lossy());
-            check_tree(&entry.path(), &child, output, store_prefix)?;
+            check_tree(top, &entry.path(), &child, output, store_prefix)?;
         }
         return Ok(());
     }
     if !meta.is_file() || !is_elf(path)? {
         return Ok(());
     }
-    if let Some(interp) = crate::elf::read_interp(path)? {
+    let note = match companion(top, path) {
+        Companion::Paired => return Ok(()),
+        Companion::Unpaired(why) => format!(" (not a debug companion: {why})"),
+        Companion::No => String::new(),
+    };
+    let judged = |e: String| format!("{output}: {}: {e}{note}", path.display());
+    if let Some(interp) = crate::elf::read_interp(path).map_err(judged)? {
         if !in_store(&interp, store_prefix) {
             return Err(format!(
-                "{output}: {} names the interpreter {interp}, outside the store",
+                "{output}: {} names the interpreter {interp}, outside the store{note}",
                 path.display()
             ));
         }
     }
-    if let Some(rpath) = crate::elf::read_rpath(path)? {
+    if let Some(rpath) = crate::elf::read_rpath(path).map_err(judged)? {
         let outside = rpath.split(':').find(|entry| {
             let resolved = match entry
                 .strip_prefix("$ORIGIN")
@@ -612,7 +682,7 @@ fn check_tree(
         });
         if let Some(entry) = outside {
             return Err(format!(
-                "{output}: {} searches {entry}, outside the store",
+                "{output}: {} searches {entry}, outside the store{note}",
                 path.display()
             ));
         }
@@ -846,6 +916,23 @@ mod tests {
         assert!(add_skeleton(&bad).unwrap_err().contains("proc"));
     }
 
+    /// `elf` with a PT_INTERP and a PT_DYNAMIC appended, each `filesz`
+    /// bytes long at offset 0.
+    fn with_loader_headers(mut elf: Vec<u8>, filesz: u64) -> Vec<u8> {
+        let phoff = elf.len() as u64;
+        for kind in [3u32, 2] {
+            elf.extend_from_slice(&kind.to_le_bytes());
+            elf.extend_from_slice(&4u32.to_le_bytes());
+            for field in [0u64, 0, 0, filesz, filesz, 8] {
+                elf.extend_from_slice(&field.to_le_bytes());
+            }
+        }
+        elf[0x20..0x28].copy_from_slice(&phoff.to_le_bytes());
+        elf[0x36..0x38].copy_from_slice(&56u16.to_le_bytes());
+        elf[0x38..0x3a].copy_from_slice(&2u16.to_le_bytes());
+        elf
+    }
+
     #[test]
     fn an_output_may_not_keep_the_root() {
         let dir = tmp("output");
@@ -897,6 +984,92 @@ mod tests {
         );
         let error = check_output(&root, &output, &[], dir.path()).unwrap_err();
         assert!(error.contains("searches /usr/lib"), "{error}");
+        fs::remove_file(out.join("bin/usr-lib")).unwrap();
+
+        // A companion's program headers lie over NOBITS sections, so it is
+        // judged by its runtime; anything else below lib/debug is judged
+        // itself, and the verdict says why it is not a companion.
+        use crate::elf::tests::{profile_section_u32, profile_section_u64, synth_profiled_elf};
+        use std::os::unix::fs::PermissionsExt;
+        let id = [7u8; 20];
+        let debug = out.join("lib/debug/bin/tool.debug");
+        fs::create_dir_all(out.join("lib/debug/bin")).unwrap();
+        fs::write(
+            out.join("bin/tool"),
+            synth_profiled_elf(&[id], false, false),
+        )
+        .unwrap();
+        // As objcopy --only-keep-debug writes it: every allocated section
+        // NOBITS, and PT_INTERP and PT_DYNAMIC kept with no file bytes.
+        let mut companion_bytes = synth_profiled_elf(&[id], true, true);
+        profile_section_u32(&mut companion_bytes, 7, 4, 8);
+        let companion_bytes = with_loader_headers(companion_bytes, 0);
+        fs::write(&debug, &companion_bytes).unwrap();
+        assert_eq!(companion(&out, &debug), Companion::Paired);
+        assert_eq!(companion(&out, &out.join("bin/tool")), Companion::No);
+        check_output(&root, &output, &[], dir.path()).unwrap();
+        // Judged itself, the same bytes are refused: this was the failure.
+        fs::rename(out.join("bin/tool"), out.join("bin/moved")).unwrap();
+        let error = check_output(&root, &output, &[], dir.path()).unwrap_err();
+        assert!(
+            error.contains("not a debug companion: no runtime"),
+            "{error}"
+        );
+        fs::rename(out.join("bin/moved"), out.join("bin/tool")).unwrap();
+        let unpaired = |path: &Path, why: &str| match companion(&out, path) {
+            Companion::Unpaired(reason) => assert!(reason.contains(why), "{reason}"),
+            other => panic!("expected an unpaired verdict ({why}), got {other:?}"),
+        };
+        // An executable file at a companion's path is not one.
+        fs::set_permissions(&debug, fs::Permissions::from_mode(0o755)).unwrap();
+        unpaired(&debug, "executable");
+        fs::set_permissions(&debug, fs::Permissions::from_mode(0o644)).unwrap();
+        // Nor is a pair whose allocated section still carries file data,
+        // as an unstripped copy of the runtime would.
+        let mut loadable = companion_bytes.clone();
+        profile_section_u32(&mut loadable, 6, 4, 1);
+        profile_section_u64(&mut loadable, 6, 0x18, 0);
+        profile_section_u64(&mut loadable, 6, 0x20, 1);
+        fs::write(&debug, &loadable).unwrap();
+        unpaired(&debug, "not debug-only");
+        // Nor one whose interpreter segment holds file bytes.
+        let mut sections = synth_profiled_elf(&[id], true, true);
+        profile_section_u32(&mut sections, 7, 4, 8);
+        fs::write(&debug, with_loader_headers(sections, 8)).unwrap();
+        unpaired(&debug, "not debug-only");
+        fs::write(&debug, &companion_bytes).unwrap();
+        // Nor one whose runtime lies outside the output through a link.
+        let elsewhere = dir.path().join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        fs::write(
+            elsewhere.join("tool"),
+            synth_profiled_elf(&[id], false, false),
+        )
+        .unwrap();
+        fs::create_dir_all(out.join("lib/debug/via")).unwrap();
+        let via = out.join("lib/debug/via/tool.debug");
+        fs::write(&via, &companion_bytes).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, out.join("via")).unwrap();
+        unpaired(&via, "outside the output");
+        fs::remove_file(out.join("via")).unwrap();
+        fs::remove_dir_all(out.join("lib/debug/via")).unwrap();
+        // A file there that pairs with nothing is judged itself, and its
+        // refusal says why it was not taken as a companion.
+        let debian = crate::elf::tests::synth_interp_elf("/lib64/ld-linux-x86-64.so.2", true);
+        fs::write(out.join("lib/debug/bin/orphan.debug"), &debian).unwrap();
+        let error = check_output(&root, &output, &[], dir.path()).unwrap_err();
+        assert!(
+            error.contains("orphan.debug names the interpreter")
+                && error.contains("not a debug companion: no runtime"),
+            "{error}"
+        );
+        fs::remove_file(out.join("lib/debug/bin/orphan.debug")).unwrap();
+        fs::write(&debug, &debian).unwrap();
+        let error = check_output(&root, &output, &[], dir.path()).unwrap_err();
+        assert!(
+            error.contains("tool.debug names the interpreter"),
+            "{error}"
+        );
     }
 
     #[test]

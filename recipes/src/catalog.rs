@@ -625,6 +625,7 @@ mod tests {
     fn source_built_runtime_toolchain_keeps_frames_lines_ids_and_remapped_paths() {
         for (stem, expected_tail_uses) in [
             ("binutils-x86-64-self", 2),
+            ("gcc-runtime", 0),
             ("gcc-x86-64-self", 4),
             ("glibc-x86-64", 1),
             ("rust-toolchain", 2),
