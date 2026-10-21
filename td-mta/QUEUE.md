@@ -68,7 +68,7 @@ attempt, attemptCount and lastAttemptAt are either all absent/zero or all presen
 | Accepted | Final | Absent | Genuine final positive DATA reply durably recorded for this recipient |
 | Failed | None if never attempted, otherwise Final | Absent | Definitive failure/expiry, with no earlier uncertainty |
 | Canceled | None if never attempted, otherwise Final | Absent | Guaranteed no delivery, uncertainty false, reason Canceled |
-| OutcomeUnknown | AcceptancePossible or Final | Present while retry eligible, otherwise absent | Acceptance may have occurred; uncertainty true |
+| OutcomeUnknown | AcceptancePossible or Final; None for never-attempted Restored | Present while retry eligible, otherwise absent | Acceptance may have occurred; uncertainty true |
 
 InFlight/Body and InFlight/AcceptancePossible require a positive RCPT reply
 and absent dataReply: the new RCPT clears earlier DATA history before body
@@ -83,6 +83,10 @@ and a temporary/network/TLS/authentication/protocol reason, with uncertainty
 false. Unknown uses Uncertain, or the later failure/expiry reason. It has a next
 attempt exactly when the reason is neither Expired nor SmtpPermanent; a
 permanent refusal stops retries while the uncertainty latch remains visible.
+Restored is terminal with no next attempt: after backup recovery even a
+never-attempted snapshot may omit later delivery. It uses None phase when
+no attempt is recorded, otherwise Final, and never invents attempt history.
+Only explicit owner recovery publishes this reason.
 Other failure reasons preserve a retry until expiry, including route pauses. Any unsuccessful attempt with an earlier uncertainty latch
 returns OutcomeUnknown, never RetryWait/Failed. InFlight
 starts with reason None. The uncertainty bit is latched once any attempt may
@@ -91,6 +95,10 @@ that bit to expose an earlier duplicate risk. All state changes produce an
 EmailSubmission-updated CHANGE in the same transaction, even when only local
 diagnostics change. Mailbox/Email/Thread changes are added only when their
 objects actually change (for example a local failure notice).
+
+Explicit restored-store release instead renews the store epoch and advances
+all history floors to their current sequence in the quarantine transaction;
+old incremental states cannot cross this boundary.
 
 Recovery's `recipient_sweep::Sweep` enforces the current-state combinations
 above after local row-codec checks, along with exact ordinal coverage and the

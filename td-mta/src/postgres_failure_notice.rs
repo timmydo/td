@@ -132,6 +132,7 @@ fn render_recipient(text: &mut String, row: Recipient<'_>) -> Result<(), Error> 
         7 => "Canceled",
         8 => "Protocol failure",
         9 => "Uncertain delivery",
+        10 => "Restored backup; delivery uncertain; resend disabled",
         _ => return Err(Error::Integrity),
     };
     detail(text, "Reason: ", reason, 64)?;
@@ -435,6 +436,25 @@ mod tests {
             reason: 2,
             diagnostic: "remote refusal",
         }
+    }
+    #[test]
+    fn restored_notice_renders_without_an_smtp_reply() {
+        let mut text = String::new();
+        render_recipient(
+            &mut text,
+            Recipient {
+                state: 7,
+                uncertain: 1,
+                reason: 10,
+                data: None,
+                diagnostic: "Restored backup",
+                ..row()
+            },
+        )
+        .unwrap();
+        assert!(text.contains("may have received"));
+        assert!(text.contains("resend disabled"));
+        assert!(!text.contains("Failed;"));
     }
     #[test]
     fn reports_unknown_without_claiming_failure_and_keeps_peer_text_in_body() {

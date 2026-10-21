@@ -30,7 +30,7 @@ tags!(NotificationState { None = 0, Pending = 1, Stored = 2 });
 tags!(LeaseUse { Import = 1, Attachment = 2, Both = 3 });
 tags!(FailureReason { None = 0, SmtpTemporary = 1, SmtpPermanent = 2,
     Network = 3, Tls = 4, Authentication = 5, Expired = 6, Canceled = 7,
-    Protocol = 8, Uncertain = 9 });
+    Protocol = 8, Uncertain = 9, Restored = 10 });
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BlobRow {

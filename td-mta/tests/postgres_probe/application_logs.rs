@@ -16,7 +16,7 @@ pub(super) fn real_postgres_logs_bound_retention_rate_wrap_and_inspection() {
         .store_epoch;
     sql(&fixture,"DROP TABLE td_mta.acme_profiles,td_mta.application_logs,td_mta.application_log_state; DELETE FROM td_mta.schema_migrations WHERE version>=29");
     let upgraded = postgres_schema::upgrade(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(upgraded.version, 30);
+    assert_eq!(upgraded.version, 31);
     assert_eq!(upgraded.store_epoch, epoch);
     create_runtime_login(&fixture);
     grant_runtime_mail(&fixture);

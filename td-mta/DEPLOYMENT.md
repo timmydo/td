@@ -447,7 +447,9 @@ Use PostgreSQL backup and recovery tooling for the database and retain its
 required connection/bootstrap material. The host installer can run bounded
 logical backups; the mail daemon has no restore command. POSTGRES.md owns
 maintenance, restored-epoch and uncertain
-external-delivery constraints; recovery activation remains separate work.
+external-delivery constraints and the explicit recovery-release command.
+Release quarantines pending delivery and requires fresh credentials and
+reimported configuration before service activation.
 Neither a historical audit report nor copying a local runtime/scratch
 directory is a database backup or recovery authorization.
 

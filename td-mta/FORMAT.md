@@ -248,7 +248,7 @@ would be illegal. No caller may infer queue validity from successful decoding.
 | Attempt phase | None=0, Prepared=1, Body=2, AcceptancePossible=3, Final=4 |
 | Notification | None=0, Pending=1, Stored=2 |
 | Lease uses | Import=1, Attachment=2, Both=3 |
-| Failure reason | None=0, SmtpTemporary=1, SmtpPermanent=2, Network=3, Tls=4, Authentication=5, Expired=6, Canceled=7, Protocol=8, Uncertain=9 |
+| Failure reason | None=0, SmtpTemporary=1, SmtpPermanent=2, Network=3, Tls=4, Authentication=5, Expired=6, Canceled=7, Protocol=8, Uncertain=9, Restored=10 |
 
 Lease uses is an exact enum, not extensible flags. Unknown values in every
 enum refuse. Import Mailbox rows have no historicalBlob; Email rows require

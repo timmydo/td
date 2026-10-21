@@ -5935,7 +5935,7 @@ holder makes entry refuse busy; it does not wait for or cancel live work.
 The singleton must exist and be well-formed. Entry never inserts missing
 state or changes the epoch, mail, configuration, credentials or receipts.
 
-The only supported transition is false to true. At the same epoch, observing
+Maintenance entry only transitions false to true. At the same epoch, observing
 true is already success and performs no UPDATE. Unacknowledged COMMIT is
 indeterminate, not rollback. Resolve it by inspection or repetition using the
 same expected epoch. Inspection holds a shared migration lock, so an original
@@ -5944,9 +5944,10 @@ observation permits only the same monotone entry, not runtime activation.
 An acknowledged COMMIT remains known even if completing it crosses the
 caller deadline; a read/no-op result requires the final deadline check.
 
-No supported release exists. A future release MUST atomically renew the
-store epoch with clearing the barrier, in addition to completing recovery's
-quarantine, credential/configuration and semantic-state requirements. This
+The explicit recovery-release protocol below renews the store epoch while
+clearing the barrier and quarantining pending deliveries. It requires
+restored devices revoked and external configuration/fencing review; semantic
+verification and subsequent profile/credential activation remain explicit. This
 prevents an old entry retry from reblocking a reopened store. Direct owner
 SQL that clears the barrier without renewal violates this protocol. Barrier
 entry alone supplies no epoch renewal, delivery quarantine, resend decision,
@@ -5965,7 +5966,8 @@ and the explicit `--instances-and-smtp-fenced` flag. The flag attests that
 all old instances and SMTP egress are externally stopped/fenced; it neither
 performs nor proves fencing. Duplicate, unknown and missing arguments refuse
 before opening the protected connection file. Inspection rejects that flag.
-No release, force, profile selector or epoch-generation option exists.
+Neither maintenance command has a force, profile selector or epoch-generation
+option. Recovery release is a separate owner command described below.
 
 Both commands use section 206's owner and expected-epoch checks, the existing
 protected bootstrap loader and one original DNS/connection deadline. Only a
@@ -6363,3 +6365,61 @@ settings digest against the configured directory, contact and exact name set.
 Different chain/key reads cannot observe different renewals. No arbitrary file
 path, material version, configuration selection or mail-delivery authority is
 created by this mapping.
+
+## 8.122 Restored-store delivery quarantine (schema 31)
+
+`td-mta postgres recovery-release` is an explicit owner operation after
+`maintenance-enter`. Keep old instances stopped and SMTP egress fenced
+throughout the recovery. The flags attest operator actions; they do not
+establish a network fence. This command never starts a service.
+
+Retain a fresh random 16-byte new epoch before publication, alongside the
+restored epoch. First inspect the restored accounts, bodies, counters and
+configuration, and revoke **every** restored device with `device-revoke`.
+The release refuses any still-active device, missing maintenance barrier,
+wrong epoch, invalid account floor, inconsistent pending submission or
+relation exceeding `--max-rows` (1 through 1,000,000). The bound applies to
+each rewritten mail/queue relation; the command retains its ten-second
+deadline. Failure before COMMIT rolls the entire operation back.
+
+```text
+td-mta postgres recovery-release --connection-file /private/owner-connection \
+  --epoch OLD_HEX --new-epoch FRESH_HEX --max-rows 100000 \
+  --instances-and-smtp-fenced --configuration-reviewed
+```
+
+Release changes Queued, InFlight, RetryWait and retryable OutcomeUnknown
+recipients into terminal OutcomeUnknown with explicit uncertainty and the Restored reason (schema 31).
+A backup may predate every attempt: this reason also permits an unattempted
+recipient with phase None, without inventing attempt history. Release clears
+retry times, completes
+those submissions and requests only local failure notices. Accepted, failed,
+canceled and already-terminal unknown results stay intact. Replies and attempt history
+remain available; active attempts, final reservations and route ownership are
+retired. Bodies and usage counters remain unchanged. Account history floors
+advance to current sequences, preventing access to pre-recovery incremental
+history under the new epoch. The ledger epoch changes and the maintenance
+barrier releases in the same transaction.
+
+Retain both epochs after an indeterminate result. Wait for the operation to
+settle, then inspect the schema and maintenance barrier. A new epoch with an
+open barrier identifies committed release; the old epoch with a closed
+barrier permits retry with the **same** new epoch. A busy migration lock is
+not a rollback. Any other state requires investigation. Never substitute a
+new epoch to hide uncertainty.
+
+Configuration encodings are epoch-bound: existing selected profiles fail to
+load after release. Import the reviewed private configuration sources as a
+new version under the fresh epoch, then explicitly select it using the next
+selection generation. Retain old configuration versions and receipts. Create
+fresh device credentials and verify mailbox reads before opening ingress or
+SMTP egress. Separately review database/bootstrap credentials, relay secrets,
+ACME account state and all changes or deliveries after the backup boundary.
+Quarantined submissions never retry automatically; deliberately submitting a
+new copy requires accepting duplicate-delivery risk.
+
+A release receipt reports quarantine counts, not full semantic integrity or
+successful service activation. The isolated restore fixture covers the
+archive round trip, rollback and ambiguous commit, epoch change and pending
+recipient quarantine. Hosted activation and off-host backup durability remain
+separate operational checks.

@@ -1,4 +1,4 @@
-//! Owner-side monotone maintenance entry; no recovery or release authority.
+//! Owner-side maintenance entry and observation; recovery owns release.
 use crate::{
     ids::StoreEpoch,
     postgres_probe::{self, Mode, Request},
@@ -32,7 +32,7 @@ pub enum Error {
     Indeterminate,
 }
 
-async fn owner(client: &Client) -> Result<(), Error> {
+pub(crate) async fn owner(client: &Client) -> Result<(), Error> {
     let row = client.query_one("SELECT current_user=session_user AND n.nspowner=r.oid AND (SELECT count(*)=2 AND bool_and(c.relowner=r.oid) FROM pg_catalog.pg_class c WHERE c.relnamespace=n.oid AND c.relname IN ('schema_migrations','runtime_barrier') AND c.relkind='r' AND c.relpersistence='p' AND NOT c.relrowsecurity AND NOT c.relforcerowsecurity) FROM pg_catalog.pg_namespace n JOIN pg_catalog.pg_roles r ON r.rolname=current_user WHERE n.nspname='td_mta'", &[]).await.map_err(|_| Error::Database)?;
     if !row.try_get::<_, bool>(0).map_err(|_| Error::Integrity)? {
         return Err(Error::Owner);
@@ -40,7 +40,7 @@ async fn owner(client: &Client) -> Result<(), Error> {
     Ok(())
 }
 
-async fn blocked(client: &Client) -> Result<bool, Error> {
+pub(crate) async fn blocked(client: &Client) -> Result<bool, Error> {
     let rows = client
         .query(
             "SELECT singleton,blocked FROM td_mta.runtime_barrier LIMIT 2",
@@ -97,8 +97,8 @@ pub fn inspect(
 }
 
 /// Enter maintenance after externally fencing all instances and SMTP egress.
-/// Repetition at this epoch is monotone. A future release must renew the epoch
-/// atomically; this API offers neither release nor a complete restore protocol.
+/// Repetition at this epoch is monotone. Recovery release must renew the epoch
+/// atomically; postgres_recovery owns the explicit release protocol.
 pub fn enter(
     request: &Request<'_>,
     trust: &TrustStore,

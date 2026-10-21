@@ -44,8 +44,9 @@ const MIGRATIONS: &[&str] = &[
     include_str!("postgres_runtime_barrier.sql"),
     include_str!("postgres_logs.sql"),
     include_str!("postgres_acme.sql"),
+    include_str!("postgres_recovery.sql"),
 ];
-const VERSION: u32 = 30;
+const VERSION: u32 = 31;
 const PRIVATE_ACL: &str = "SELECT NOT EXISTS (
     SELECT 1 FROM pg_catalog.pg_namespace n,
     LATERAL pg_catalog.aclexplode(COALESCE(n.nspacl,

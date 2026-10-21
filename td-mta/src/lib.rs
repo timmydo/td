@@ -150,6 +150,7 @@ pub mod postgres_metadata_audit;
 pub mod postgres_probe;
 pub mod postgres_profile_materials;
 pub mod postgres_read;
+pub mod postgres_recovery;
 pub mod postgres_relay_attempt;
 pub mod postgres_relay_body;
 pub mod postgres_relay_connect;

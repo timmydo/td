@@ -347,17 +347,17 @@ fn run_inner(root: &Path, action: &str, manifest: &str) -> Result<Option<Release
 
 /// The PostgreSQL 17 directory the native mail fixtures take from `path`:
 /// the directory of its first `initdb`, which must also hold `postgres`,
-/// `pg_ctl` and `psql`, as the fixtures require, with what its
+/// `pg_ctl`, `psql`, `pg_dump` and `pg_restore`, as the fixtures require, with what its
 /// `postgres --version` reports.
 pub(crate) fn postgres_bin(path: &str) -> Result<(PathBuf, String)> {
-    let need = "native mail tests need PostgreSQL 17's initdb, postgres, pg_ctl and psql in one PATH directory";
+    let need = "native mail tests need PostgreSQL 17's initdb, postgres, pg_ctl, psql, pg_dump and pg_restore in one PATH directory";
     let initdb = crate::stage0::find_in_path(path, "initdb")
         .ok_or_else(|| format!("{need}: no initdb on PATH"))?;
     let bin = initdb
         .parent()
         .filter(|dir| dir.is_absolute())
         .ok_or_else(|| format!("{need}: initdb is in a relative PATH entry"))?;
-    for name in ["postgres", "pg_ctl", "psql"] {
+    for name in ["postgres", "pg_ctl", "psql", "pg_dump", "pg_restore"] {
         if !crate::stage0::is_exec(&bin.join(name)) {
             return Err(format!(
                 "{need}: {} has initdb but no {name}",
@@ -486,7 +486,7 @@ mod tests {
         let path = format!("{}:{}", early.display(), late.display());
         let err = postgres_bin(&path).unwrap_err();
         assert!(err.ends_with("no initdb on PATH"), "{err}");
-        for name in ["initdb", "pg_ctl", "psql"] {
+        for name in ["initdb", "pg_ctl", "psql", "pg_dump", "pg_restore"] {
             tool(&late, name, "exit 0");
         }
         tool(&late, "postgres", "echo 'postgres (PostgreSQL) 17.10'");
@@ -496,6 +496,8 @@ mod tests {
         assert!(err.contains(&format!("{} has initdb but no postgres", early.display())));
         tool(&early, "postgres", "echo 'postgres (PostgreSQL) 16.4'");
         tool(&early, "psql", "exit 0");
+        tool(&early, "pg_dump", "exit 0");
+        tool(&early, "pg_restore", "exit 0");
         let err = postgres_bin(&path).unwrap_err();
         assert!(
             err.contains("reports \"postgres (PostgreSQL) 16.4\""),

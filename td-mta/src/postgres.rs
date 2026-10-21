@@ -1,4 +1,4 @@
-//! Explicit database preparation; never opens mail service admission.
+//! Explicit database administration; never starts a mail service.
 use std::{
     ffi::{OsStr, OsString},
     io::{self, Write},
@@ -18,6 +18,7 @@ mod logs;
 mod maintenance;
 mod material;
 mod metadata_audit;
+mod recovery;
 mod selection;
 mod usage;
 
@@ -83,6 +84,9 @@ fn arguments(operation: Operation, mut args: impl Iterator<Item = OsString>) -> 
 
 pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<ExitCode> {
     let command = args.next();
+    if command.as_deref() == Some(OsStr::new("recovery-release")) {
+        return recovery::run(args);
+    }
     if command.as_deref() == Some(OsStr::new("logs")) {
         return logs::run(args);
     }

@@ -1015,7 +1015,9 @@ them. After ordinary tests, the wrapper runs the exact ignored PostgreSQL read,
 plain-text send and foreground-service cases. Each requires a positive passing
 libtest summary and exit success. Host preparation must put PostgreSQL 17 on
 `PATH`: the directory of the first `initdb` there must also hold `postgres`,
-`pg_ctl` and `psql`, and `postgres --version` must report release 17. The
+`pg_ctl`, `psql`, `pg_dump` and `pg_restore`, and `postgres --version` must
+report release 17. The restore fixture uses the same installation for its
+archive round trip. The
 wrapper checks this before any test runs and names what is missing; the
 fixtures find the same directory on `PATH` themselves, so no variable names
 it. The fixtures own disposable clusters; no existing database service or

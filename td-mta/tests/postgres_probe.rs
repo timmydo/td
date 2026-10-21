@@ -25,13 +25,13 @@ mod mail_client;
 const PASSWORD: &[u8] = b"disposable-postgres-fixture-password";
 
 /// The directory of PATH's `initdb`, which must also hold `postgres`,
-/// `pg_ctl` and `psql`, so all four come from one installation, and whose
+/// `pg_ctl`, `psql`, `pg_dump` and `pg_restore`, from one installation, whose
 /// `postgres` is release 17.
 fn postgres_bin() -> PathBuf {
     let initdb = td_fs::executable_on_path("initdb")
         .unwrap_or_else(|| panic!("PostgreSQL 17 is not on PATH: no initdb"));
     let bin = initdb.parent().unwrap().to_path_buf();
-    for name in ["postgres", "pg_ctl", "psql"] {
+    for name in ["postgres", "pg_ctl", "psql", "pg_dump", "pg_restore"] {
         assert!(
             td_fs::executable_in(Some(bin.as_os_str()), name).is_some(),
             "PostgreSQL on PATH: {} has initdb but no {name}",
@@ -395,7 +395,7 @@ fn real_postgres_schema_initialization_is_atomic_and_locked() {
     );
     wait_command(&mut shared);
     let receipt = initialize(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 30);
+    assert_eq!(receipt.version, 31);
     assert_eq!(
         inspect(&fixture.request(), &trust, deadline()).unwrap(),
         receipt
@@ -472,7 +472,7 @@ CREATE EVENT TRIGGER td_schema_delay ON ddl_command_end WHEN TAG IN ('CREATE TAB
         inspect(&fixture.request(), &trust, deadline())
             .unwrap()
             .version,
-        30
+        31
     );
     assert_eq!(
         initialize(&fixture.request(), &trust, deadline()),
@@ -597,7 +597,7 @@ fn real_postgres_schema_commands_prepare_and_inspect_one_epoch() {
     };
     assert!(invoke("schema-inspect", 1).contains("schema-operation-failed"));
     let initialized = invoke("schema-init", 0);
-    assert!(initialized.contains("\"schema_version\":30"));
+    assert!(initialized.contains("\"schema_version\":31"));
     assert!(initialized.contains(
         "\"ledger_checked\":true,\"serving_schema_checked\":false,\"profile_checked\":false"
     ));
@@ -842,7 +842,7 @@ fn real_postgres_runtime_credentials_separate_mail_writes_from_owner_authority()
     }
     sql(
         &fixture,
-        "UPDATE td_mta.schema_migrations SET version=99 WHERE version=30",
+        "UPDATE td_mta.schema_migrations SET version=99 WHERE version=31",
     );
     assert_eq!(
         probe(&serving, &trust, deadline()),
@@ -850,7 +850,7 @@ fn real_postgres_runtime_credentials_separate_mail_writes_from_owner_authority()
     );
     sql(
         &fixture,
-        "UPDATE td_mta.schema_migrations SET version=30 WHERE version=99",
+        "UPDATE td_mta.schema_migrations SET version=31 WHERE version=99",
     );
     assert_eq!(
         schema::inspect(&serving, &trust, deadline()).unwrap(),
@@ -1032,7 +1032,7 @@ fn real_postgres_material_schema_upgrade_preserves_epoch_and_rolls_back() {
     );
     wait_command(&mut held);
     let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 30);
+    assert_eq!(receipt.version, 31);
     assert_eq!(receipt.store_epoch.as_bytes(), &[1; 16]);
     assert_eq!(
         upgrade(&fixture.request(), &trust, deadline()).unwrap(),
@@ -1876,7 +1876,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             sql(&fixture,"UPDATE td_mta.recipients SET state=7,uncertain=1,phase=4,reason=9,next_attempt_at=1");
         }
         let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
-        assert_eq!(receipt.version, 30);
+        assert_eq!(receipt.version, 31);
         assert_eq!(
             sql(
                 &fixture,
@@ -2522,6 +2522,8 @@ mod serving_relay;
 fn real_postgres_executable_receives_and_serves_database_profiles() {
     application_logs::real_postgres_logs_bound_retention_rate_wrap_and_inspection();
     acme::real_postgres_acme_fences_ownership_and_pins_complete_pairs();
+    recovery::real_postgres_restore_quarantines_pending_delivery_and_changes_epoch();
+    recovery::real_postgres_recovery_uncertain_commit_keeps_retained_new_epoch();
     exercise_configuration(ConfigurationExercise::Serving);
 }
 
@@ -12225,3 +12227,6 @@ mod application_logs;
 
 #[path = "postgres_probe/acme.rs"]
 mod acme;
+
+#[path = "postgres_probe/recovery.rs"]
+mod recovery;

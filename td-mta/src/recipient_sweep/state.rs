@@ -122,6 +122,9 @@ fn validate(row: RecipientRow<'_>) -> Result<(), QueueError> {
         S::Canceled => {
             row.phase == final_phase && !next && !row.uncertain && row.reason == F::Canceled
         }
+        S::OutcomeUnknown if row.reason == F::Restored => {
+            row.phase == final_phase && row.uncertain && !next
+        }
         S::OutcomeUnknown => {
             matches!(row.phase, P::AcceptancePossible | P::Final)
                 && row.uncertain
@@ -413,5 +416,28 @@ mod tests {
         group.recipient(recipient(S::Canceled)).unwrap();
         group.recipient(recipient(S::Accepted)).unwrap();
         assert_eq!(group.finish(), Err(QueueError::PartialCancellation));
+    }
+
+    #[test]
+    fn restored_uncertainty_is_terminal_without_inventing_attempts() {
+        for prior in [RecipientState::Queued, RecipientState::RetryWait] {
+            let mut row = recipient(prior);
+            row.state = RecipientState::OutcomeUnknown;
+            row.reason = FailureReason::Restored;
+            row.uncertain = true;
+            row.next_attempt_at = None;
+            assert_eq!(validate(row), Ok(()));
+            row.next_attempt_at = Some(1);
+            assert_eq!(validate(row), Err(QueueError::RecipientState));
+            row.next_attempt_at = None;
+            row.uncertain = false;
+            assert_eq!(validate(row), Err(QueueError::RecipientState));
+        }
+        let mut row = recipient(RecipientState::Queued);
+        row.state = RecipientState::OutcomeUnknown;
+        row.reason = FailureReason::Uncertain;
+        row.uncertain = true;
+        row.next_attempt_at = None;
+        assert_eq!(validate(row), Err(QueueError::RecipientState));
     }
 }
