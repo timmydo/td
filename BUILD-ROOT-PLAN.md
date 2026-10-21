@@ -162,10 +162,10 @@ deleted; its findings are summarized under "Facts" below.
    gcc with td glibc's sysroot and gcc-runtime's `crtbeginT.o`,
    `libgcc.a` and `libgcc_eh.a` ahead of the root's, and
    `build_root_link_map_check` proves from the final link's map that
-   nothing was loaded from the root. Landed: the cryptsetup and ssh
-   stacks (OpenSSH links dynamically: `build_root_dynamic_cc`, and its
-   map must load td glibc's libc.so.6), and zlib-x86-64 also ships the
-   static archive (the ladder's zlib-x86-64-self is gone).
+   nothing was loaded from the root. Landed: all three stacks (OpenSSH
+   and Git link dynamically: `build_root_dynamic_cc`, and their maps
+   must load td glibc's libc.so.6), and zlib-x86-64 also ships
+   the static archive (the ladder's zlib-x86-64-self is gone).
    8b. **glibc in the build root.** `glibc-x86-64` rebuilt in the root
    (same 2.41 source, frame pointers, companions; the root gains gawk
    and python3). Its link uses a static libgcc built from td glibc's

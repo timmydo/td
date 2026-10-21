@@ -67,13 +67,18 @@ pub fn recipe() -> Recipe {
                              if grep -a -Fq \"$forbidden\" \"$binary\"; then echo \"Git binary retains forbidden path $forbidden\" >&2; exit 1; fi; \
                          done; \
                      done; \
-                     r=0; grep -r -a -l -F -e '{{in:td-sh}}' '{git}' > build-shell.refs || r=$?; \
-                     [ \"$r\" = 1 ] || {{ echo \"Git output names the build shell (grep status $r):\" >&2; cat build-shell.refs >&2; exit 1; }}; \
-                     for script in '{git}'/libexec/git-core/git-submodule '{git}'/libexec/git-core/git-merge-octopus \
-                         '{git}'/share/git-core/templates/hooks/pre-commit.sample; do \
-                         IFS= read -r first < \"$script\" || exit 1; \
-                         [ \"$first\" = '#!/bin/sh' ] || {{ echo \"$script starts $first, not #!/bin/sh\" >&2; exit 1; }}; \
-                     done"
+                     r=0; grep -r -a -l -F -e '{{in:td-sh}}' -e /usr/bin/bash '{git}' > build-shell.refs || r=$?; \
+                     [ \"$r\" = 1 ] || {{ echo \"Git output names a build shell (grep status $r):\" >&2; cat build-shell.refs >&2; exit 1; }}; \
+                     scripts=0; \
+                     for script in '{git}'/libexec/git-core/* '{git}'/share/git-core/templates/hooks/*; do \
+                         [ -f \"$script\" ] || continue; \
+                         IFS= read -r first < \"$script\" || continue; \
+                         case $first in '#!'*) ;; *) continue;; esac; \
+                         scripts=$((scripts+1)); \
+                         [ \"$first\" = '#!/bin/sh' ] || [ \"${{script##*/}}\" = fsmonitor-watchman.sample ] || \
+                             {{ echo \"$script starts $first, not #!/bin/sh\" >&2; exit 1; }}; \
+                     done; \
+                     [ $scripts -ge 10 ] || {{ echo \"only $scripts shipped scripts carry a shebang\" >&2; exit 1; }}"
                 ),
             ],
         )

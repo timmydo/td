@@ -1,5 +1,6 @@
 use crate::ladder::{
-    post_rust_inputs, post_rust_tool_farm, split_target_debug, unpack_into, POST_RUST_SH,
+    build_root_dynamic_cc, build_root_link_map_check, unpack_into, LinkedLibc, BUILD_ROOT_PATH,
+    BUILD_ROOT_SH as SH,
 };
 use crate::types::{Recipe, Step, TextEdit};
 
@@ -7,108 +8,59 @@ use crate::types::{Recipe, Step, TextEdit};
 // Git delegates SSH transport to the separately source-built OpenSSH client;
 // language runtimes, legacy WebDAV, localization, and direct OpenSSL use remain
 // outside this daily-driver closure.
+//
+// It compiles in the Debian build root against td glibc
+// (`build_root_dynamic_cc`): each program links td glibc's libc.so.6 with its
+// loader and RUNPATH, gcc-runtime's start files and libgcc, and the curl,
+// LibreSSL and zlib archives, which its link map proves.
+
+/// The ELF programs, each linked by its own make.
+const PROGRAMS: &[&str] = &["git", "git-remote-http", "git-sh-i18n--envsubst"];
+
+/// Shell scripts, generated without a link. The https alias is not made here:
+/// its rule would revisit git-remote-http after that link's map was checked.
+const SCRIPTS: &[&str] = &[
+    "git-difftool--helper",
+    "git-filter-branch",
+    "git-merge-octopus",
+    "git-merge-one-file",
+    "git-merge-resolve",
+    "git-mergetool",
+    "git-quiltimport",
+    "git-request-pull",
+    "git-submodule",
+    "git-web--browse",
+    "git-mergetool--lib",
+    "git-sh-i18n",
+    "git-sh-setup",
+];
+
+/// Written only if a make after the per-program links links again.
+const NO_LINK_MAP: &str = "{root}/no-link.map";
+
 pub fn recipe() -> Recipe {
-    let sgcc = "{in:gcc-x86-64-self}/stage/td/store/gcc-14.3.0-x86_64-self/bin/gcc";
-    let sbin = "{in:binutils-x86-64-self}/bin";
-    let xglibc = "{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64";
     let curl = "{in:curl-x86-64}";
     let tls = "{in:libressl-x86-64}";
     let zlib = "{in:zlib-x86-64}";
-    let path = format!("{{root}}/wb:{{tools}}:{sbin}");
+    let path = format!("{{root}}/wb:{BUILD_ROOT_PATH}");
 
     let mut steps = unpack_into("git-x86-64-source", "{src}");
-    steps.push(post_rust_tool_farm("{in:gawk-x86-64-self}/bin/gawk"));
-    steps.push(Step::PatchShebangs {
-        dir: "{src}".into(),
-        shell: POST_RUST_SH.into(),
-    });
 
-    // SHELL_PATH is compiled into shipped scripts as /bin/sh. Generated build
-    // inputs must nevertheless run with the declared td-sh while the recipe
-    // sandbox has no ambient /bin. Keep those two roles separate.
-    //
-    // PatchShebangs gives every script td-sh's store path, and git restores
-    // SHELL_PATH over it with `1s|#!.*/sh|`, which BusyBox's .../bin/sh met
-    // and .../bin/td-sh does not. Each such rewrite gains a second
-    // expression for exactly that path, so shipped scripts and hook samples
-    // keep #!/bin/sh and name no build shell.
-    steps.push(Step::substitute_text(
-        "{src}/tools/generate-script.sh",
-        vec![TextEdit::new(
-            "sed -e \"1s|#!.*/sh|#!$SHELL_PATH|\" \\",
-            "sed -e \"1s|#!.*/sh|#!$SHELL_PATH|\" -e \"1s|#!.*/td-sh$|#!$SHELL_PATH|\" \\",
-            1,
-        )],
-    ));
-    steps.push(Step::substitute_text(
-        "{src}/templates/Makefile",
-        vec![TextEdit::new(
-            "sed -e '1s|#!.*/sh|#!$(SHELL_PATH_SQ)|' \\",
-            "sed -e '1s|#!.*/sh|#!$(SHELL_PATH_SQ)|' -e '1s|#!.*/td-sh$$|#!$(SHELL_PATH_SQ)|' \\",
-            1,
-        )],
-    ));
-    steps.push(Step::substitute_text(
-        "{src}/shared.mak",
-        vec![TextEdit::new(
-            "$(SHELL_PATH) \"$(1)/GIT-VERSION-GEN\"",
-            "$(SHELL) \"$(1)/GIT-VERSION-GEN\"",
-            1,
-        )],
-    ));
+    // SHELL_PATH=/bin/sh is compiled into shipped scripts, and Git's
+    // generators run under it too: the root's /bin/sh, as upstream intends.
     steps.push(Step::substitute_text(
         "{src}/Makefile",
-        vec![
-            TextEdit::new(
-                "$(QUIET_GEN)$(SHELL_PATH) ./tools/generate-configlist.sh",
-                "$(QUIET_GEN)$(SHELL) ./tools/generate-configlist.sh",
-                1,
-            ),
-            TextEdit::new(
-                "$(QUIET_GEN)$(SHELL_PATH) ./tools/generate-cmdlist.sh",
-                "$(QUIET_GEN)$(SHELL) ./tools/generate-cmdlist.sh",
-                1,
-            ),
-            TextEdit::new(
-                "$(QUIET_GEN)$(SHELL_PATH) ./tools/generate-hooklist.sh",
-                "$(QUIET_GEN)$(SHELL) ./tools/generate-hooklist.sh",
-                1,
-            ),
-            TextEdit::new(
-                "sed -e '1s|#!.*/sh|#!$(SHELL_PATH_SQ)|' \\",
-                "sed -e '1s|#!.*/sh|#!$(SHELL_PATH_SQ)|' -e '1s|#!.*/td-sh$$|#!$(SHELL_PATH_SQ)|' \\",
-                3,
-            ),
-            TextEdit::new(
-                "REMOTE_CURL_ALIASES = git-remote-https$X git-remote-ftp$X git-remote-ftps$X",
-                "REMOTE_CURL_ALIASES = git-remote-https$X",
-                1,
-            ),
-        ],
+        vec![TextEdit::new(
+            "REMOTE_CURL_ALIASES = git-remote-https$X git-remote-ftp$X git-remote-ftps$X",
+            "REMOTE_CURL_ALIASES = git-remote-https$X",
+            1,
+        )],
     ));
-    steps.push(Step::WriteFile {
-        path: "{root}/wb/cc".into(),
-        content: format!(
-            "#!{POST_RUST_SH}\n\
-             exec \"{sgcc}\" -isystem \"{xglibc}/include\" \
-             -B\"{sbin}/\" -B\"{xglibc}/lib\" \
-             -L\"{xglibc}/lib\" -static-libgcc \"$@\" \
-             -fno-omit-frame-pointer -g1 \
-             -ffile-prefix-map={{root}}=/td-build-root \
-             -ffile-prefix-map={{src}}=/td-build \
-             -ffile-prefix-map={curl}=/td-build/input/curl \
-             -ffile-prefix-map={tls}=/td-build/input/libressl \
-             -ffile-prefix-map={zlib}=/td-build/input/zlib \
-             -Wl,--dynamic-linker -Wl,{xglibc}/lib/ld-linux-x86-64.so.2 \
-             -Wl,--enable-new-dtags -Wl,-rpath -Wl,{xglibc}/lib \
-             -Wl,--build-id=sha1\n"
-        ),
-        exec: true,
-    });
+    steps.extend(build_root_dynamic_cc());
     steps.push(Step::WriteFile {
         path: "{root}/wb/curl-config".into(),
         content: format!(
-            "#!{POST_RUST_SH}\n\
+            "#!{SH}\n\
              case \"$1\" in\n\
              --vernum) printf '%s\\n' '081500';;\n\
              *) exit 1;;\n\
@@ -126,14 +78,19 @@ pub fn recipe() -> Recipe {
              sysconfdir = /etc\n\
              SHELL_PATH = /bin/sh\n\
              CC = {{root}}/wb/cc\n\
-             AR = {sbin}/ar\n\
+             AR = /usr/bin/ar\n\
              CURL_CONFIG = {{root}}/wb/curl-config\n\
              CURL_LDFLAGS = {curl}/lib/libcurl.a {tls}/lib/libssl.a {tls}/lib/libcrypto.a {zlib}/lib/libz.a -pthread\n\
-             # Git's later EXTLIBS additions are exactly zlib and pthread for\n\
-             # this configuration. Name pthread in CURL_LDFLAGS and zlib here\n\
-             # so no implicit -lz or -lpthread search can escape the closure.\n\
+             # The override drops Git's EXTLIBS additions for this\n\
+             # configuration, zlib, pthread and config.mak.uname's -ldl. Name\n\
+             # pthread in CURL_LDFLAGS and zlib here so no implicit -l search\n\
+             # can escape the closure; dlopen is in td glibc's libc.so.6.\n\
              override EXTLIBS = {zlib}/lib/libz.a\n\
-             CFLAGS = -O2 -I{curl}/include -I{zlib}/include\n\
+             CFLAGS = -O2 -I{curl}/include -I{zlib}/include \
+             -ffile-prefix-map={curl}=/td-build/input/curl \
+             -ffile-prefix-map={tls}=/td-build/input/libressl \
+             -ffile-prefix-map={zlib}=/td-build/input/zlib\n\
+             LDFLAGS = -Wl,--build-id=sha1\n\
              NO_PERL = YesPlease\n\
              PERL_PATH =\n\
              NO_PYTHON = YesPlease\n\
@@ -152,50 +109,79 @@ pub fn recipe() -> Recipe {
         exec: false,
     });
 
+    // One make per program: each link writes, and is checked against, its own
+    // map. The scripts follow without a link.
+    for program in PROGRAMS {
+        let map = format!("{{root}}/{program}.map");
+        steps.push(
+            Step::run(
+                "{src}",
+                &["/usr/bin/make", "-j{jobs}", &format!("SHELL={SH}"), program],
+            )
+            .env("PATH", &path)
+            .env("SHELL", SH)
+            .env("TD_LINK_MAP", &map)
+            .env("SOURCE_DATE_EPOCH", "1"),
+        );
+        steps.push(build_root_link_map_check(
+            "{src}",
+            &map,
+            program,
+            &[
+                "gcc-runtime",
+                "curl-x86-64",
+                "libressl-x86-64",
+                "zlib-x86-64",
+            ],
+            LinkedLibc::Shared,
+        ));
+    }
+    // The scripts and templates link nothing: any link would write the
+    // sentinel map, which must stay absent.
+    let mut scripts = vec![
+        "/usr/bin/make".to_string(),
+        "-j{jobs}".to_string(),
+        format!("SHELL={SH}"),
+    ];
+    scripts.extend(SCRIPTS.iter().map(|name| name.to_string()));
+    steps.push(Step::Run {
+        dir: "{src}".into(),
+        argv: scripts,
+        env: vec![
+            ("PATH".into(), path.clone()),
+            ("SHELL".into(), SH.into()),
+            ("TD_LINK_MAP".into(), NO_LINK_MAP.into()),
+            ("SOURCE_DATE_EPOCH".into(), "1".into()),
+        ],
+    });
     steps.push(
         Step::run(
             "{src}",
             &[
-                "{in:make-x86-64-self}/bin/make",
-                "-j{jobs}",
-                &format!("SHELL={POST_RUST_SH}"),
-                "git",
-                "git-remote-http",
-                "git-remote-https",
-                "git-sh-i18n--envsubst",
-                "git-difftool--helper",
-                "git-filter-branch",
-                "git-merge-octopus",
-                "git-merge-one-file",
-                "git-merge-resolve",
-                "git-mergetool",
-                "git-quiltimport",
-                "git-request-pull",
-                "git-submodule",
-                "git-web--browse",
-                "git-mergetool--lib",
-                "git-sh-i18n",
-                "git-sh-setup",
+                "/usr/bin/make",
+                "-C",
+                "templates",
+                &format!("SHELL={SH}"),
+                "SHELL_PATH=/bin/sh",
             ],
         )
         .env("PATH", &path)
-        .env("SHELL", POST_RUST_SH)
+        .env("SHELL", SH)
+        .env("TD_LINK_MAP", NO_LINK_MAP)
         .env("SOURCE_DATE_EPOCH", "1"),
     );
     steps.push(
         Step::run(
             "{src}",
             &[
-                "{in:make-x86-64-self}/bin/make",
-                "-C",
-                "templates",
-                &format!("SHELL={POST_RUST_SH}"),
-                "SHELL_PATH=/bin/sh",
+                SH,
+                "-c",
+                &format!(
+                    "if [ -e '{NO_LINK_MAP}' ]; then echo 'a script make linked' >&2; exit 1; fi"
+                ),
             ],
         )
-        .env("PATH", &path)
-        .env("SHELL", POST_RUST_SH)
-        .env("SOURCE_DATE_EPOCH", "1"),
+        .env("PATH", &path),
     );
 
     for dir in [
@@ -227,24 +213,10 @@ pub fn recipe() -> Recipe {
         link: "{out}/libexec/git-core/git-remote-https".into(),
     });
     steps.push(Step::CopyFiles {
-        files: [
-            "git-difftool--helper",
-            "git-filter-branch",
-            "git-merge-octopus",
-            "git-merge-one-file",
-            "git-merge-resolve",
-            "git-mergetool",
-            "git-quiltimport",
-            "git-request-pull",
-            "git-submodule",
-            "git-web--browse",
-            "git-mergetool--lib",
-            "git-sh-i18n",
-            "git-sh-setup",
-        ]
-        .iter()
-        .map(|name| format!("{{src}}/{name}"))
-        .collect(),
+        files: SCRIPTS
+            .iter()
+            .map(|name| format!("{{src}}/{name}"))
+            .collect(),
         dest: "{out}/libexec/git-core".into(),
     });
     steps.push(Step::CopyTree {
@@ -276,28 +248,24 @@ pub fn recipe() -> Recipe {
         ],
         exec: false,
     });
-    steps.push(split_target_debug("{out}"));
+    steps.push(Step::split_debug_tree("{out}", "/usr/bin/objcopy"));
 
     Recipe::mesboot("git-x86-64", "2.55.0")
         .source_input("git-x86-64-source")
-        .native_inputs(&post_rust_inputs(
-            "gawk-x86-64-self",
-            &[
-                "curl-x86-64",
-                "libressl-x86-64",
-                "zlib-x86-64",
-                "gcc-x86-64-self",
-                "binutils-x86-64-self",
-                "glibc-x86-64",
-                "make-x86-64-self",
-            ],
-        ))
+        .build_root()
+        .native_inputs(&[
+            "curl-x86-64",
+            "libressl-x86-64",
+            "zlib-x86-64",
+            "glibc-x86-64",
+            "gcc-runtime",
+        ])
         .steps(steps)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::recipe;
+    use super::{recipe, PROGRAMS, SCRIPTS};
     use crate::types::Step;
 
     #[test]
@@ -307,18 +275,11 @@ mod tests {
             recipe.native_inputs.as_deref(),
             Some(
                 [
-                    "td-sh",
-                    "td-txt",
-                    "td-util",
-                    "uutils",
-                    "gawk-x86-64-self",
                     "curl-x86-64",
                     "libressl-x86-64",
                     "zlib-x86-64",
-                    "gcc-x86-64-self",
-                    "binutils-x86-64-self",
                     "glibc-x86-64",
-                    "make-x86-64-self",
+                    "gcc-runtime",
                 ]
                 .map(str::to_string)
                 .as_slice()
@@ -352,50 +313,102 @@ mod tests {
         assert!(!config.contains("SANE_TOOL_PATH ="));
         assert!(!config.contains("ZLIB_PATH ="));
 
-        let build = steps.iter().find_map(|step| match step {
-            Step::Run { argv, .. }
-                if argv.first() == Some(&"{in:make-x86-64-self}/bin/make".to_string())
-                    && argv.iter().any(|arg| arg == "git-remote-http") =>
+        let makes: Vec<_> = steps
+            .iter()
+            .filter_map(|step| match step {
+                Step::Run { argv, .. }
+                    if argv.first().is_some_and(|arg| arg == "/usr/bin/make") =>
+                {
+                    Some(argv)
+                }
+                _ => None,
+            })
+            .collect();
+        for program in PROGRAMS {
+            let map = format!("{{root}}/{program}.map");
+            let link = steps
+                .iter()
+                .position(|step| {
+                    matches!(step, Step::Run { argv, env, .. }
+                        if argv.last().is_some_and(|arg| arg == program)
+                            && env.iter().any(|(key, value)| key == "TD_LINK_MAP" && *value == map))
+                })
+                .expect("the program's own make writes its map");
+            let checked = steps
+                .iter()
+                .position(|step| {
+                    matches!(step, Step::Run { argv, .. }
+                        if argv.iter().any(|arg| arg.contains(&format!("m='{map}'"))
+                            && arg.contains(&format!("= '{program}'"))
+                            && arg.contains("{in:curl-x86-64}")
+                            && arg.contains("$sys/libc.so.6")))
+                })
+                .expect("link-map check");
+            assert!(link < checked, "{program}'s map is checked after its link");
+        }
+        let scripts = makes
+            .iter()
+            .find(|argv| argv.iter().any(|arg| arg == "git-submodule"))
+            .expect("script make");
+        assert!(SCRIPTS
+            .iter()
+            .all(|name| scripts.iter().any(|arg| arg == name)));
+        assert!(!PROGRAMS
+            .iter()
+            .any(|name| scripts.iter().any(|arg| arg == name)));
+        assert!(!makes.iter().any(|argv| argv.iter().any(|arg| arg == "all")));
+        assert!(!scripts.iter().any(|arg| arg == "git-remote-https"));
+        let sentinel = steps.iter().position(|step| {
+            matches!(step, Step::Run { argv, .. }
+                if argv.iter().any(|arg| arg.contains("[ -e '{root}/no-link.map' ]")))
+        });
+        let last_make = steps.iter().rposition(|step| {
+            matches!(step, Step::Run { argv, .. }
+                if argv.first().is_some_and(|arg| arg == "/usr/bin/make"))
+        });
+        assert!(
+            sentinel > last_make,
+            "the no-link sentinel follows every make"
+        );
+        for argv_env in steps.iter().filter_map(|step| match step {
+            Step::Run { argv, env, .. }
+                if argv.first().is_some_and(|arg| arg == "/usr/bin/make")
+                    && !PROGRAMS
+                        .iter()
+                        .any(|name| argv.last().is_some_and(|arg| arg == name)) =>
             {
-                Some(argv)
+                Some(env)
             }
             _ => None,
-        });
-        let build = build.expect("bounded Git build");
-        assert!(build.iter().any(|arg| arg == "git"));
-        assert!(build.iter().any(|arg| arg == "git-remote-https"));
-        assert!(build.iter().any(|arg| arg == "git-sh-i18n--envsubst"));
-        assert!(!build.iter().any(|arg| arg == "all"));
+        }) {
+            assert!(argv_env
+                .iter()
+                .any(|(key, value)| key == "TD_LINK_MAP" && value == "{root}/no-link.map"));
+        }
     }
 
     #[test]
-    fn compiler_wrapper_keeps_the_target_profile_policy_last() {
-        let steps = recipe().steps.expect("git steps");
-        let wrapper = steps
-            .iter()
+    fn build_root_wrapper_and_config_keep_the_target_profile() {
+        let recipe = recipe();
+        crate::ladder::assert_build_root_dynamic_c(&recipe);
+        let config = recipe
+            .steps
+            .unwrap_or_default()
+            .into_iter()
             .find_map(|step| match step {
-                Step::WriteFile { path, content, .. } if path == "{root}/wb/cc" => Some(content),
+                Step::WriteFile { path, content, .. } if path == "{src}/config.mak" => {
+                    Some(content)
+                }
                 _ => None,
             })
-            .expect("compiler wrapper");
-        let package_args = wrapper.find("\"$@\"").expect("package arguments");
-        let profile_policy = wrapper
-            .rfind("-fno-omit-frame-pointer")
-            .expect("frame-pointer policy");
-        assert!(package_args < profile_policy);
+            .expect("Git build configuration");
         for required in [
-            "-g1",
-            "-ffile-prefix-map={root}=/td-build-root",
-            "-ffile-prefix-map={src}=/td-build",
             "-ffile-prefix-map={in:curl-x86-64}=/td-build/input/curl",
             "-ffile-prefix-map={in:libressl-x86-64}=/td-build/input/libressl",
             "-ffile-prefix-map={in:zlib-x86-64}=/td-build/input/zlib",
-            "-Wl,--build-id=sha1",
+            "LDFLAGS = -Wl,--build-id=sha1",
         ] {
-            assert!(
-                wrapper.contains(required),
-                "missing target policy {required}"
-            );
+            assert!(config.contains(required), "missing {required}");
         }
     }
 }

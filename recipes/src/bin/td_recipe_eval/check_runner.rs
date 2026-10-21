@@ -9615,14 +9615,17 @@ mod tests {
         );
         // The members built in the Debian build root: the kernel, the
         // upstream toolchain's runtime, zlib, cryptsetup with its libraries,
-        // and OpenSSH.
+        // OpenSSH, and Git with curl and LibreSSL.
         assert_eq!(
             answer.build_root_members,
             [
                 "cryptsetup-x86-64",
+                "curl-x86-64",
                 "gcc-runtime",
+                "git-x86-64",
                 "json-c-x86-64",
                 "libdevmapper-x86-64",
+                "libressl-x86-64",
                 "linux-x86-64",
                 "openssh-x86-64",
                 "popt-x86-64",

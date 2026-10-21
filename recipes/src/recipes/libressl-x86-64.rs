@@ -1,10 +1,13 @@
-use crate::ladder::{post_rust_inputs, post_rust_tool_farm, unpack_into, POST_RUST_SH};
+use crate::ladder::{build_root_static_cc, unpack_into, BUILD_ROOT_PATH, BUILD_ROOT_SH as SH};
 use crate::types::{Recipe, Step, TextEdit};
 
 // LibreSSL 4.3.2 provides the OpenSSL-compatible TLS surface curl and Git will
 // consume. It exports static libssl.a + libcrypto.a and the public headers,
 // and no program: the libraries are absorbed into downstream runtime ELFs,
 // which carry td's debug-companion policy at their own final link boundary.
+//
+// It compiles in the Debian build root against td glibc
+// (`build_root_static_cc`); the archives' consumers link them.
 //
 // Upstream's hand-written assembly is disabled. The portable C implementation
 // is compiled with td's target-wide frame-pointer, bounded line-table, and
@@ -14,25 +17,17 @@ use crate::types::{Recipe, Step, TextEdit};
 // libressl-x86-64-test compiles, links, and runs a verified client/server TLS
 // handshake against exactly the installed archives.
 pub fn recipe() -> Recipe {
-    let sgcc = "{in:gcc-x86-64-self}/stage/td/store/gcc-14.3.0-x86_64-self/bin/gcc";
-    let sbin = "{in:binutils-x86-64-self}/bin";
-    let xglibc = "{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64";
-    let path = format!("{{root}}/wb:{{tools}}:{sbin}");
+    let path = format!("{{root}}/wb:{BUILD_ROOT_PATH}");
 
+    // GNU libtool expands the convenience libcompat.a into libcrypto.a with
+    // `find`, from the root's image layer (findutils is Essential); without
+    // it libtool still succeeds and emits an incomplete archive, which
+    // libressl-x86-64-test's compat-member check refuses.
     let mut steps = unpack_into("libressl-x86-64-source", "{src}");
-    // GNU libtool expands the convenience libcompat.a into libcrypto.a by
-    // walking its extraction directory with `find`, which the farm serves;
-    // without it libtool still exits successfully but silently emits an
-    // incomplete archive.
-    steps.push(post_rust_tool_farm("{in:gawk-x86-64-self}/bin/gawk"));
-    steps.push(Step::PatchShebangs {
-        dir: "{src}".into(),
-        shell: POST_RUST_SH.into(),
-    });
 
-    // Libtool's generated x86-64 ABI probe names /usr/bin/file directly. The
-    // target sandbox intentionally has no host /usr, so route the two possible
-    // conftest.o probes through a tiny declared-binutils adapter instead.
+    // Libtool's generated x86-64 ABI probe names /usr/bin/file directly; route
+    // the two possible conftest.o probes through a readelf adapter, so the
+    // answer does not depend on whether the root carries file(1).
     steps.push(Step::substitute_text(
         "{src}/configure",
         vec![TextEdit::new(
@@ -44,8 +39,8 @@ pub fn recipe() -> Recipe {
     steps.push(Step::WriteFile {
         path: "{root}/wb/file".into(),
         content: format!(
-            "#!{POST_RUST_SH}\n\
-             h=$('{sbin}/readelf' -h \"$1\") || exit 1\n\
+            "#!{SH}\n\
+             h=$(/usr/bin/readelf -h \"$1\") || exit 1\n\
              case \"$h\" in\n\
              *'Class:'*'ELF64'*) printf '%s\\n' 'ELF 64-bit LSB relocatable';;\n\
              *'Class:'*'ELF32'*) printf '%s\\n' 'ELF 32-bit LSB relocatable';;\n\
@@ -54,25 +49,13 @@ pub fn recipe() -> Recipe {
         ),
         exec: true,
     });
-    steps.push(Step::WriteFile {
-        path: "{root}/wb/cc".into(),
-        content: format!(
-            "#!{POST_RUST_SH}\n\
-             exec \"{sgcc}\" -static -isystem \"{xglibc}/include\" \
-             -B\"{sbin}/\" -B\"{xglibc}/lib\" \
-             -L\"{xglibc}/lib\" -static-libgcc \"$@\" \
-             -fno-omit-frame-pointer -g1 \
-             -ffile-prefix-map={{root}}=/td-build-root \
-             -ffile-prefix-map={{src}}=/td-build -Wl,--build-id=sha1\n"
-        ),
-        exec: true,
-    });
+    steps.extend(build_root_static_cc());
 
     steps.push(
         Step::run(
             "{src}",
             &[
-                POST_RUST_SH,
+                SH,
                 "./configure",
                 "--build=x86_64-pc-linux-gnu",
                 "--host=x86_64-pc-linux-gnu",
@@ -86,13 +69,13 @@ pub fn recipe() -> Recipe {
             ],
         )
         .env("PATH", &path)
-        .env("CONFIG_SHELL", POST_RUST_SH)
-        .env("SHELL", POST_RUST_SH)
+        .env("CONFIG_SHELL", SH)
+        .env("SHELL", SH)
         .env("CC", "{root}/wb/cc")
         .env("CCAS", "{root}/wb/cc")
-        .env("AR", "{in:binutils-x86-64-self}/bin/ar")
-        .env("RANLIB", "{in:binutils-x86-64-self}/bin/ranlib")
-        .env("NM", "{in:binutils-x86-64-self}/bin/nm")
+        .env("AR", "/usr/bin/ar")
+        .env("RANLIB", "/usr/bin/ranlib")
+        .env("NM", "/usr/bin/nm")
         .env("CFLAGS", "-O2")
         .env("SOURCE_DATE_EPOCH", "1"),
     );
@@ -105,17 +88,17 @@ pub fn recipe() -> Recipe {
             Step::run(
                 "{src}",
                 &[
-                    "{in:make-x86-64-self}/bin/make",
+                    "/usr/bin/make",
                     "-j{jobs}",
                     "-C",
                     dir,
                     target,
-                    &format!("SHELL={POST_RUST_SH}"),
+                    &format!("SHELL={SH}"),
                 ],
             )
             .env("PATH", &path)
-            .env("CONFIG_SHELL", POST_RUST_SH)
-            .env("SHELL", POST_RUST_SH)
+            .env("CONFIG_SHELL", SH)
+            .env("SHELL", SH)
             .env("SOURCE_DATE_EPOCH", "1"),
         );
     }
@@ -136,17 +119,17 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{src}",
             &[
-                "{in:make-x86-64-self}/bin/make",
+                "/usr/bin/make",
                 "-C",
                 "include/openssl",
                 "install-data-am",
                 "prefix={out}",
-                &format!("SHELL={POST_RUST_SH}"),
+                &format!("SHELL={SH}"),
             ],
         )
         .env("PATH", &path)
-        .env("CONFIG_SHELL", POST_RUST_SH)
-        .env("SHELL", POST_RUST_SH)
+        .env("CONFIG_SHELL", SH)
+        .env("SHELL", SH)
         .env("SOURCE_DATE_EPOCH", "1"),
     );
     steps.push(Step::Require {
@@ -162,42 +145,26 @@ pub fn recipe() -> Recipe {
 
     Recipe::mesboot("libressl-x86-64", "4.3.2")
         .source_input("libressl-x86-64-source")
-        .native_inputs(&post_rust_inputs(
-            "gawk-x86-64-self",
-            &[
-                "gcc-x86-64-self",
-                "binutils-x86-64-self",
-                "glibc-x86-64",
-                "make-x86-64-self",
-            ],
-        ))
+        .build_root()
+        .native_inputs(&["glibc-x86-64", "gcc-runtime"])
         .steps(steps)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{recipe, POST_RUST_SH};
+    use super::{recipe, SH};
+    use crate::ladder::assert_build_root_static_c;
     use crate::types::Step;
 
     #[test]
-    fn portable_static_build_uses_only_post_rust_inputs() {
+    fn portable_static_build_uses_only_build_root_inputs() {
         let recipe = recipe();
         assert_eq!(
             recipe.native_inputs.as_deref(),
             Some(
-                [
-                    "td-sh",
-                    "td-txt",
-                    "td-util",
-                    "uutils",
-                    "gawk-x86-64-self",
-                    "gcc-x86-64-self",
-                    "binutils-x86-64-self",
-                    "glibc-x86-64",
-                    "make-x86-64-self",
-                ]
-                .map(str::to_string)
-                .as_slice()
+                ["glibc-x86-64", "gcc-runtime"]
+                    .map(str::to_string)
+                    .as_slice()
             )
         );
         assert!(recipe.inputs.is_none());
@@ -216,17 +183,10 @@ mod tests {
         assert_eq!(
             make_runs,
             vec![
+                format!("/usr/bin/make -j{{jobs}} -C crypto libcrypto.la SHELL={SH}"),
+                format!("/usr/bin/make -j{{jobs}} -C ssl remove_bs_objects SHELL={SH}"),
                 format!(
-                    "{{in:make-x86-64-self}}/bin/make -j{{jobs}} -C crypto libcrypto.la \
-                     SHELL={POST_RUST_SH}"
-                ),
-                format!(
-                    "{{in:make-x86-64-self}}/bin/make -j{{jobs}} -C ssl remove_bs_objects \
-                     SHELL={POST_RUST_SH}"
-                ),
-                format!(
-                    "{{in:make-x86-64-self}}/bin/make -C include/openssl install-data-am \
-                     prefix={{out}} SHELL={POST_RUST_SH}"
+                    "/usr/bin/make -C include/openssl install-data-am prefix={{out}} SHELL={SH}"
                 ),
             ]
         );
@@ -241,31 +201,9 @@ mod tests {
 
     #[test]
     fn portable_static_build_keeps_the_target_profile_policy_last() {
-        let steps = recipe().steps.expect("libressl steps");
-        let wrapper = steps
-            .iter()
-            .find_map(|step| match step {
-                Step::WriteFile { path, content, .. } if path == "{root}/wb/cc" => Some(content),
-                _ => None,
-            })
-            .expect("compiler wrapper");
-        let package_args = wrapper.find("\"$@\"").expect("package arguments");
-        let profile_policy = wrapper
-            .rfind("-fno-omit-frame-pointer")
-            .expect("frame-pointer policy");
-        assert!(package_args < profile_policy);
-        for required in [
-            "-g1",
-            "-ffile-prefix-map={root}=/td-build-root",
-            "-ffile-prefix-map={src}=/td-build",
-            "-Wl,--build-id=sha1",
-        ] {
-            assert!(
-                wrapper.contains(required),
-                "missing target policy {required}"
-            );
-        }
-
+        let recipe = recipe();
+        assert_build_root_static_c(&recipe);
+        let steps = recipe.steps.expect("libressl steps");
         let configure = steps.iter().find_map(|step| match step {
             Step::Run { argv, .. } if argv.iter().any(|arg| arg == "./configure") => Some(argv),
             _ => None,

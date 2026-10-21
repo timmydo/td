@@ -150,6 +150,7 @@ pub const BUILD_ROOT_LINKED: &[&str] = &[
     "zlib-x86-64",
     "cryptsetup-x86-64",
     "openssh-x86-64",
+    "git-x86-64",
 ];
 
 /// Conservative transitive assembly boundaries for a linked output. Every

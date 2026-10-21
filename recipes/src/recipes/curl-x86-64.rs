@@ -1,45 +1,28 @@
-use crate::ladder::{post_rust_inputs, post_rust_tool_farm, unpack_into, POST_RUST_SH};
+use crate::ladder::{build_root_static_cc, unpack_into, BUILD_ROOT_PATH, BUILD_ROOT_SH as SH};
 use crate::types::{Recipe, Step};
 
 // Static libcurl for Git's HTTP and HTTPS transports. This is intentionally a
 // library-only output: td does not need a second interactive downloader, and a
 // narrow protocol/dependency surface makes the eventual Git closure auditable.
+// It compiles in the Debian build root against td glibc
+// (`build_root_static_cc`); Git's link consumes the archive.
 pub fn recipe() -> Recipe {
-    let sgcc = "{in:gcc-x86-64-self}/stage/td/store/gcc-14.3.0-x86_64-self/bin/gcc";
-    let sbin = "{in:binutils-x86-64-self}/bin";
-    let xglibc = "{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64";
     let tls = "{in:libressl-x86-64}";
     let zlib = "{in:zlib-x86-64}";
-    let path = format!("{{root}}/wb:{{tools}}:{sbin}");
+    let path = format!("{{root}}/wb:{BUILD_ROOT_PATH}");
+    let cflags = format!(
+        "-O2 -ffile-prefix-map={tls}=/td-build/input/libressl \
+         -ffile-prefix-map={zlib}=/td-build/input/zlib"
+    );
 
     let mut steps = unpack_into("curl-x86-64-source", "{src}");
-    steps.push(post_rust_tool_farm("{in:gawk-x86-64-self}/bin/gawk"));
-    steps.push(Step::PatchShebangs {
-        dir: "{src}".into(),
-        shell: POST_RUST_SH.into(),
-    });
-    steps.push(Step::WriteFile {
-        path: "{root}/wb/cc".into(),
-        content: format!(
-            "#!{POST_RUST_SH}\n\
-             exec \"{sgcc}\" -static -isystem \"{xglibc}/include\" \
-             -B\"{sbin}/\" -B\"{xglibc}/lib\" \
-             -L\"{xglibc}/lib\" -static-libgcc \"$@\" \
-             -fno-omit-frame-pointer -g1 \
-             -ffile-prefix-map={{root}}=/td-build-root \
-             -ffile-prefix-map={{src}}=/td-build \
-             -ffile-prefix-map={tls}=/td-build/input/libressl \
-             -ffile-prefix-map={zlib}=/td-build/input/zlib \
-             -Wl,--build-id=sha1\n"
-        ),
-        exec: true,
-    });
+    steps.extend(build_root_static_cc());
 
     steps.push(
         Step::run(
             "{src}",
             &[
-                POST_RUST_SH,
+                SH,
                 "./configure",
                 "--build=x86_64-pc-linux-gnu",
                 "--host=x86_64-pc-linux-gnu",
@@ -105,32 +88,32 @@ pub fn recipe() -> Recipe {
             ],
         )
         .env("PATH", &path)
-        .env("CONFIG_SHELL", POST_RUST_SH)
-        .env("SHELL", POST_RUST_SH)
+        .env("CONFIG_SHELL", SH)
+        .env("SHELL", SH)
         .env("CC", "{root}/wb/cc")
-        .env("AR", "{in:binutils-x86-64-self}/bin/ar")
-        .env("RANLIB", "{in:binutils-x86-64-self}/bin/ranlib")
-        .env("NM", "{in:binutils-x86-64-self}/bin/nm")
+        .env("AR", "/usr/bin/ar")
+        .env("RANLIB", "/usr/bin/ranlib")
+        .env("NM", "/usr/bin/nm")
         .env("CPPFLAGS", &format!("-I{tls}/include -I{zlib}/include"))
         .env("LDFLAGS", &format!("-L{tls}/lib -L{zlib}/lib"))
-        .env("CFLAGS", "-O2")
+        .env("CFLAGS", &cflags)
         .env("SOURCE_DATE_EPOCH", "1"),
     );
     steps.push(
         Step::run(
             "{src}",
             &[
-                "{in:make-x86-64-self}/bin/make",
+                "/usr/bin/make",
                 "-j{jobs}",
                 "-C",
                 "lib",
                 "libcurl.la",
-                &format!("SHELL={POST_RUST_SH}"),
+                &format!("SHELL={SH}"),
             ],
         )
         .env("PATH", &path)
-        .env("CONFIG_SHELL", POST_RUST_SH)
-        .env("SHELL", POST_RUST_SH)
+        .env("CONFIG_SHELL", SH)
+        .env("SHELL", SH)
         .env("SOURCE_DATE_EPOCH", "1"),
     );
     steps.push(Step::MkDir {
@@ -178,17 +161,13 @@ pub fn recipe() -> Recipe {
 
     Recipe::mesboot("curl-x86-64", "8.21.0")
         .source_input("curl-x86-64-source")
-        .native_inputs(&post_rust_inputs(
-            "gawk-x86-64-self",
-            &[
-                "libressl-x86-64",
-                "zlib-x86-64",
-                "gcc-x86-64-self",
-                "binutils-x86-64-self",
-                "glibc-x86-64",
-                "make-x86-64-self",
-            ],
-        ))
+        .build_root()
+        .native_inputs(&[
+            "libressl-x86-64",
+            "zlib-x86-64",
+            "glibc-x86-64",
+            "gcc-runtime",
+        ])
         .steps(steps)
 }
 
@@ -204,17 +183,10 @@ mod tests {
             recipe.native_inputs.as_deref(),
             Some(
                 [
-                    "td-sh",
-                    "td-txt",
-                    "td-util",
-                    "uutils",
-                    "gawk-x86-64-self",
                     "libressl-x86-64",
                     "zlib-x86-64",
-                    "gcc-x86-64-self",
-                    "binutils-x86-64-self",
                     "glibc-x86-64",
-                    "make-x86-64-self",
+                    "gcc-runtime",
                 ]
                 .map(str::to_string)
                 .as_slice()
@@ -256,32 +228,25 @@ mod tests {
     }
 
     #[test]
-    fn compiler_wrapper_keeps_the_target_profile_policy_last() {
-        let steps = recipe().steps.expect("curl steps");
-        let wrapper = steps
-            .iter()
+    fn build_root_wrapper_and_cflags_keep_the_target_profile() {
+        let recipe = recipe();
+        crate::ladder::assert_build_root_static_c(&recipe);
+        let cflags = recipe
+            .steps
+            .unwrap_or_default()
+            .into_iter()
             .find_map(|step| match step {
-                Step::WriteFile { path, content, .. } if path == "{root}/wb/cc" => Some(content),
+                Step::Run { argv, env, .. } if argv.iter().any(|arg| arg == "./configure") => env
+                    .into_iter()
+                    .find_map(|(key, value)| (key == "CFLAGS").then_some(value)),
                 _ => None,
             })
-            .expect("compiler wrapper");
-        let package_args = wrapper.find("\"$@\"").expect("package arguments");
-        let profile_policy = wrapper
-            .rfind("-fno-omit-frame-pointer")
-            .expect("frame-pointer policy");
-        assert!(package_args < profile_policy);
+            .expect("configure CFLAGS");
         for required in [
-            "-g1",
-            "-ffile-prefix-map={root}=/td-build-root",
-            "-ffile-prefix-map={src}=/td-build",
             "-ffile-prefix-map={in:libressl-x86-64}=/td-build/input/libressl",
             "-ffile-prefix-map={in:zlib-x86-64}=/td-build/input/zlib",
-            "-Wl,--build-id=sha1",
         ] {
-            assert!(
-                wrapper.contains(required),
-                "missing target policy {required}"
-            );
+            assert!(cflags.contains(required), "missing {required}");
         }
     }
 }

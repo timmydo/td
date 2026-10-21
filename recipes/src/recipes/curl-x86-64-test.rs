@@ -54,7 +54,11 @@ pub fn recipe() -> Recipe {
             &[
                 POST_RUST_SH,
                 "-c",
-                "if grep -a -Eq '/gnu/store|/td/store|/td-input|/td-build-root' '{in:curl-x86-64}/lib/libcurl.a'; then echo 'libcurl archive retains a noncanonical store reference' >&2; exit 1; fi",
+                // td glibc's headers reach the line tables through the build
+                // root's sysroot copy, remapped below the canonical
+                // /td-build-root (td-profiler/DESIGN.md §2); no other build
+                // or store path, and no unmapped build directory, may remain.
+                "if grep -a -oE '(/gnu/store|/td/store|/td-input|/td-build-root|guix-build)[^[:cntrl:][:space:]]*' '{in:curl-x86-64}/lib/libcurl.a' | grep -Evq '^/td-build-root/sysroot/include(/|$)'; then echo 'libcurl archive retains a noncanonical store reference' >&2; exit 1; fi",
             ],
         )
         .env("PATH", &path),
