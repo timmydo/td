@@ -115,7 +115,7 @@ fn crc32c(bytes: &[u8]) -> u32 {
     !crc
 }
 
-// btrfs-progs v7.0 kernel-shared/uapi/btrfs_tree.h, btrfs_super_block.
+// The Btrfs superblock (td-btrfs/src/format.rs; the kernel's btrfs_super_block).
 fn identify(bytes: &[u8]) -> io::Result<Option<Uuid>> {
     if bytes.len() != SUPER_BYTES {
         return Err(invalid("truncated Btrfs superblock"));

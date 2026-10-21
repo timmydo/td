@@ -182,7 +182,7 @@ const OUTPUTS: &[&str] = &[
     "td-init",
     "td-boot",
     "td-kexec",
-    "btrfs-progs-x86-64",
+    "td-btrfs",
     "tzdata",
 ];
 
@@ -1588,6 +1588,10 @@ fn validate_media_protection(result: &BootResult) -> Result<(), String> {
     Ok(())
 }
 
+/// What td-btrfs reports when the bounded scratch cannot hold the image:
+/// its first write, the 2 MiB wipe at the image's start, with its errno.
+const SCRATCH_DIAGNOSTIC: &str = "write of 2097152 bytes at 0 failed: No space left on device";
+
 fn validate_scratch_refusal(result: &BootResult, source_device: &str) -> Result<(), String> {
     require(
         result,
@@ -1599,7 +1603,7 @@ fn validate_scratch_refusal(result: &BootResult, source_device: &str) -> Result<
         protocol::SCRATCH_EXHAUSTED_MARKER,
         "scratch ENOSPC probe",
     )?;
-    validate_target_refusal(result, source_device, "unable to zero the output file")?;
+    validate_target_refusal(result, source_device, SCRATCH_DIAGNOSTIC)?;
     if !result
         .console
         .contains("/bin/mkfs.btrfs failed on the scratch image")
@@ -3222,7 +3226,7 @@ mod tests {
     fn scratch_refusal_requires_exhaustion_in_the_formatter_before_publication() {
         let mut result = interrupted_result();
         result.console = format!(
-            "{}\n{}\n{} /dev/sr0\nERROR: unable to zero the output file\ntd-install: /bin/mkfs.btrfs failed on the scratch image (exit status: 1)\n{} /bin/td-install failed: exit status: 1\n{}\n",
+            "{}\n{}\n{} /dev/sr0\nERROR: /scratch/td-volume.img: write of 2097152 bytes at 0 failed: No space left on device (os error 28)\ntd-install: /bin/mkfs.btrfs failed on the scratch image (exit status: 1)\n{} /bin/td-install failed: exit status: 1\n{}\n",
             protocol::SCRATCH_LIMIT_MARKER, protocol::SCRATCH_EXHAUSTED_MARKER, protocol::MEDIA_MARKER, protocol::REFUSED_PREFIX, protocol::REFUSAL_COMPLETE_MARKER
         );
         assert!(validate_scratch_refusal(&result, "/dev/sr0").is_ok());
@@ -3231,7 +3235,7 @@ mod tests {
         for missing in [
             protocol::SCRATCH_LIMIT_MARKER,
             protocol::SCRATCH_EXHAUSTED_MARKER,
-            "unable to zero the output file",
+            SCRATCH_DIAGNOSTIC,
             "/bin/mkfs.btrfs failed on the scratch image",
             protocol::REFUSED_PREFIX,
             protocol::REFUSAL_COMPLETE_MARKER,

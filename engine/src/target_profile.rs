@@ -106,6 +106,7 @@ pub const RUST_PROFILED_RECIPES: &[&str] = &[
     "td-audio",
     "td-authd",
     "td-boot",
+    "td-btrfs",
     "td-busd",
     "td-cc",
     "td-compositor",

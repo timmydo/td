@@ -107,7 +107,7 @@ fn noisy_mkfs(dir: &Path) -> Res<PathBuf> {
     let fake = dir.join("mkfs.btrfs");
     scratch::executable(
         &fake,
-        "#!/bin/sh\necho 'btrfs-progs v7.0'\necho 'Label: td-system'\n",
+        "#!/bin/sh\necho 'td-btrfs mkfs'\necho 'Label: td-system'\n",
     )?;
     Ok(fake)
 }
@@ -174,14 +174,14 @@ fn a_childs_banner_stays_out_of_the_reported_line() -> Res<()> {
         "stdout carried more than the reported line: {out:?}"
     );
     assert!(
-        !out.contains("btrfs-progs"),
+        !out.contains("td-btrfs mkfs"),
         "the child's banner reached stdout: {out:?}"
     );
     // ...and it is not merely SUPPRESSED: it goes to stderr, so a failing mkfs
     // still says what went wrong.
     let err = String::from_utf8_lossy(&volume.stderr);
     assert!(
-        err.contains("btrfs-progs"),
+        err.contains("td-btrfs mkfs"),
         "the child's output was discarded rather than redirected: {err:?}"
     );
     // The line parses as three numbers, which is what a caller reads.

@@ -338,12 +338,13 @@ formatting" owns the mechanism.
 Formatting erases nothing beyond what it writes. `luksFormat` writes the
 16 MiB header area and leaves the data segment as it found it; mkfs.btrfs
 and td-boot then write, through the mapping, only the blocks the new
-filesystem uses. Every other block of the segment keeps what the disk held
-before, in plaintext. An attacker with the disk reads those earlier
-contents wherever the installed system has not yet overwritten them, which
-just after installation is nearly the whole volume, and can tell such
-blocks from ones written since, so learns roughly how much the system has
-written. The tier protects what is written after installation, not what
+filesystem uses and the 2 MiB mkfs.btrfs zeroes at each end of it. Every
+other block of the segment keeps what the disk held before, in plaintext.
+An attacker with the disk reads those earlier contents wherever the
+installed system has not yet overwritten them, which just after
+installation is nearly the whole volume, and can tell such blocks from
+ones written since, so learns roughly how much the system has written.
+The tier protects what is written after installation, not what
 the disk held before it. td performs no whole-disk overwrite, discard or
 drive sanitize; erasing a disk's earlier contents is its owner's separate
 step before installing. The ESP and the partition table are plaintext on
@@ -2689,16 +2690,16 @@ commit.
 3. Source-built cryptsetup. The repository owner granted principle-2
    sign-off for a static cryptsetup using its kernel crypto backend and
    internal Argon2, with this closure: LVM2's device-mapper library alone,
-   json-c, popt, and util-linux's libuuid and libblkid already built for
-   btrfs-progs. No OpenSSL, libgcrypt, udev, libssh, external token loader or
-   token plugin enters; any other library needs its own sign-off. LUKS2
-   re-encryption stays enabled. The kernel gains the AF_ALG hash and
-   skcipher interfaces and the HMAC, SHA-256 and XTS-AES algorithms that
-   backend uses; td-jail's socket-family filter already keeps confined
-   applications from AF_ALG. The same increment amends DESIGN.md D6 to make
-   cryptsetup its boot-path exception; the build-time binding D7 requires
-   lands with its first exec. Do not replace this with a new cryptographic
-   disk format.
+   json-c, popt, and util-linux's libuuid and libblkid, first built for
+   btrfs-progs, which td-btrfs has since replaced. No OpenSSL, libgcrypt,
+   udev, libssh, external token loader or token plugin enters; any other
+   library needs its own sign-off. LUKS2 re-encryption stays enabled. The
+   kernel gains the AF_ALG hash and skcipher interfaces and the HMAC,
+   SHA-256 and XTS-AES algorithms that backend uses; td-jail's
+   socket-family filter already keeps confined applications from AF_ALG.
+   The same increment amends DESIGN.md D6 to make cryptsetup its boot-path
+   exception; the build-time binding D7 requires lands with its first exec.
+   Do not replace this with a new cryptographic disk format.
    New Rust syscall surfaces amend UNSAFE.md with their component contract
    in the same increment.
 4. Share td-secret's dependency-free TPM 2.0 client with the disk

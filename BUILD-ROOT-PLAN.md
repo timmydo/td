@@ -19,7 +19,7 @@ deleted; its findings are summarized under "Facts" below.
 | Old ladder | Deleted entirely (stage0, Mes, TinyCC, GCC/glibc/binutils ladder, source-built Rust/LLVM, bootstrap-root) |
 | Self-hosting | Image ships upstream Rust + td-cc + glibc + libgcc; C rebuilds need the build root (fetched on demand, cached) |
 | Git | Upstream Git 2.55.0 from source in the build root (grit rejected) |
-| btrfs-progs | Built in the build root now; replaced by a Rust `td-btrfs` later |
+| btrfs-progs | Replaced by the std-only Rust `td-btrfs` (landed) |
 | Allocator / musl | Not applicable; glibc malloc stays. musl may be revisited separately later |
 | Downloads | Every image layer, .deb and source is an ordinary sha256 pin in `~/.td/sources`; upstream is contacted only on a cache miss |
 
@@ -132,8 +132,8 @@ deleted; its findings are summarized under "Facts" below.
    stage1/stage2/LLVM path and `td-util-boot`.
 8. **C packages in the build root against td glibc**: LibreSSL (library
    only), curl, Git 2.55.0; json-c, popt, libdevmapper, util-linux libs,
-   cryptsetup (static, as today); OpenSSH (`--without-openssl`);
-   btrfs-progs. One landing per stack (git, cryptsetup, ssh, btrfs).
+   cryptsetup (static, as today); OpenSSH (`--without-openssl`). One
+   landing per stack (git, cryptsetup, ssh).
 9. **Test HTTPS origin.** Replace `openssl s_server/s_client` with a
    small rustls tool on td-net; LibreSSL's command leaves the image.
 10. **Image switch.** system-x86-64 ships the upstream Rust toolchain,
@@ -149,8 +149,9 @@ deleted; its findings are summarized under "Facts" below.
     td-profiler/DESIGN.md, td-agent/DESIGN.md, APPLICATIONS.md, and the
     per-crate DESIGN.md files that cite it. This plan file is deleted
     there.
-12. **td-btrfs** (later): std-only mkfs with `--rootdir/--subvol`;
-    deletes btrfs-progs.
+12. **td-btrfs** (landed): std-only mkfs with `--rootdir/--subvol`;
+    btrfs-progs, its pin and test are deleted; util-linux libs stay for
+    cryptsetup.
 
 ## Risks
 

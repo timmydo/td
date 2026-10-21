@@ -229,6 +229,7 @@ mod tests {
             "td-audio",
             "td-authd",
             "td-boot",
+            "td-btrfs",
             "td-busd",
             "td-cc",
             "td-compositor",

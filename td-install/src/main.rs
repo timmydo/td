@@ -182,7 +182,7 @@ enum Mode {
     },
     /// `mkfs` is passed rather than looked up: this crate execs exactly what it
     /// is told to and never resolves a program through an ambient `PATH`, which
-    /// is what makes the one third-party program on the install path (D7) a
+    /// is what makes the formatter on the install path (D7) a
     /// declared input of whoever calls it. `scratch` is the caller's too — the
     /// image needs room the size of the volume's real contents, and only the
     /// caller knows where there is any. With a publish that is the deployment
@@ -4923,7 +4923,7 @@ impl PreparedVolumeImage {
 
         // The scratch directory is the CALLER's, and so is what is left in it. Not
         // tidiness deferred: the image is the only artifact anything can check the
-        // filesystem itself against — `btrfs check` wants a device or a file, and
+        // filesystem itself against — `td-btrfs check` wants a device or a file, and
         // the copy on the destination begins half a gigabyte in, where no tool can
         // be pointed at it. Deleting it here would leave the strongest available
         // check with nothing to run on.
@@ -7507,7 +7507,7 @@ mod tests {
     fn the_reported_line_is_the_volumes_geometry() {
         let scratch = Scratch::disk(DISK);
         run_layout(&scratch.path, &mut Vec::new()).unwrap();
-        let dir = fake_mkfs("#!/bin/sh\necho 'btrfs-progs v7.0'\n");
+        let dir = fake_mkfs("#!/bin/sh\necho 'td-btrfs mkfs'\n");
         let mut out = Vec::new();
         run_volume(
             VolumeSettings::default(),

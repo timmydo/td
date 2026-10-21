@@ -29,7 +29,7 @@ pub fn recipe() -> Recipe {
         "td-init",
         "td-boot",
         "td-kexec",
-        "btrfs-progs-x86-64",
+        "td-btrfs",
         "tzdata",
     ])
 }

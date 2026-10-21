@@ -3,13 +3,13 @@ use crate::ladder::{
 };
 use crate::types::{Recipe, Step};
 
-// The only util-linux surface btrfs-progs needs: static libuuid and libblkid.
+// The only util-linux surface cryptsetup needs: static libuuid and libblkid.
 // All programs and unrelated libraries are disabled, and only the two archives
 // plus their public headers leave the derivation.
 //
 // Built past the bootstrap boundary, by the self-hosted toolchain under the
 // shipped target profile (td-profiler/DESIGN.md §2): its objects are linked
-// into mkfs.btrfs, which ships, and one frame-pointer-less caller truncates
+// into cryptsetup, which ships, and one frame-pointer-less caller truncates
 // every stack above it.
 pub fn recipe() -> Recipe {
     let sgcc = "{in:gcc-x86-64-self}/stage/td/store/gcc-14.3.0-x86_64-self/bin/gcc";

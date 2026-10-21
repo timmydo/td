@@ -797,17 +797,10 @@ const BOOT_TIMEOUT_ENV: &str = "TD_QEMU_BOOT_TIMEOUT_SECS";
 const ORACLES: &[(&str, &[&str])] = &[
     (
         "qemu-boot-system",
-        &[
-            "system-x86-64",
-            "btrfs-progs-x86-64",
-            "td-jail-seccomp-probe",
-        ],
+        &["system-x86-64", "td-btrfs", "td-jail-seccomp-probe"],
     ),
     ("qemu-boot-live", &["system-x86-64"]),
-    (
-        "qemu-deploy-rollback",
-        &["system-x86-64", "btrfs-progs-x86-64"],
-    ),
+    ("qemu-deploy-rollback", &["system-x86-64", "td-btrfs"]),
     (
         "qemu-install-system",
         &["system-x86-64", "td-install-qemu-test"],
@@ -1136,7 +1129,7 @@ pub fn qemu_boot_session_cli(args: &[String]) -> Result<(), String> {
     if args.len() > 1 || args.first().is_some_and(|stem| stem != STEM) {
         return Err(format!("usage: qemu-boot-session [{STEM}]"));
     }
-    let targets = [STEM, "btrfs-progs-x86-64", "td-jail-seccomp-probe"];
+    let targets = [STEM, "td-btrfs", "td-jail-seccomp-probe"];
     crate::checks::accel::headless_from_env()?;
     ensure_targets_provenance(&targets)?;
     let root = env::current_dir().map_err(|error| format!("current dir: {error}"))?;
@@ -1165,7 +1158,7 @@ pub fn qemu_boot_net_cli(args: &[String]) -> Result<(), String> {
     }
     // Provenance planning FIRST — before the runner exists (re #469), matching
     // `qemu_boot_cli`: a rejected graph spawns no subprocess.
-    let targets = [stem, "btrfs-progs-x86-64", "td-jail-seccomp-probe"];
+    let targets = [stem, "td-btrfs", "td-jail-seccomp-probe"];
     crate::checks::accel::headless_from_env()?;
     ensure_targets_provenance(&targets)?;
 
@@ -1246,7 +1239,7 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     }
     // Provenance planning FIRST — before the runner exists, so a rejected graph
     // spawns no subprocess at all (re #469), matching `cli`/`build_cli`/`qemu_boot`.
-    let targets = [stem, "btrfs-progs-x86-64"];
+    let targets = [stem, "td-btrfs"];
     ensure_targets_provenance(&targets)?;
 
     let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
@@ -1278,7 +1271,7 @@ pub fn bundle_cli(args: &[String]) -> Result<(), String> {
 
     // Provenance planning FIRST — before the runner exists, so a rejected graph
     // spawns no subprocess at all (re #469), matching every other host command.
-    let targets = [STEM, "btrfs-progs-x86-64"];
+    let targets = [STEM, "td-btrfs"];
     ensure_targets_provenance(&targets)?;
 
     let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
@@ -12957,7 +12950,7 @@ chmod 755 '{}'
         for name in [
             "recipe system-x86-64",
             "sources system-x86-64",
-            "recipe btrfs-progs-x86-64",
+            "recipe td-btrfs",
             "builder-engine",
             "seed-patches",
         ] {

@@ -671,7 +671,7 @@ mod tests {
             "gcc-x86-64-native-test",
             "gcc-x86-64-self-test",
             "linux-x86-64-test",
-            "btrfs-progs-x86-64-test",
+            "td-btrfs-test",
             "ca-certificates-test",
             "td-boot-test",
             "td-install-test",
@@ -704,7 +704,7 @@ mod tests {
             // host-side tool (`td-recipe-eval qemu-boot`), not a sandboxed gate
             // check, because a qemu boot needs host qemu the gate sandbox hides
             // (re #529). Its in-sandbox coverage is linux-x86-64-test above.
-            ("btrfs-progs-x86-64-test", 1),
+            ("td-btrfs-test", 1),
             ("ca-certificates-test", 1),
             ("td-boot-test", 1),
             ("td-install-test", 1),
@@ -744,9 +744,9 @@ mod tests {
         // gcc-mesboot 4.9.4 and GCC 14.3.0) + the linux-x86-64 kernel source +
         // CMake 3.31.12 + Rust 1.96.0 source and its exact
         // three-component Rust 1.95.0 stage0 snapshot + coreutils-0.9.0 (the
-        // uutils, ripgrep, and fd userland `.crate` sources) + btrfs-progs 7.0
-        // and util-linux 2.42.2 (the persistent-volume writer and its minimal
-        // libraries) + the ripgrep 15.2.0 static application seed + curl's
+        // uutils, ripgrep, and fd userland `.crate` sources) + util-linux
+        // 2.42.2 (cryptsetup's libuuid and libblkid) + the ripgrep 15.2.0
+        // static application seed + curl's
         // dated Mozilla CA extract + OpenSSH Portable 10.5p1, the
         // Claude Code 2.1.260 native Linux x86-64 binary, IANA timezone
         // data 2026d, and the Nerd Fonts v3.5.1 JetBrains Mono release with
@@ -754,8 +754,9 @@ mod tests {
         // and LVM2 2.03.43 (the LUKS2 userspace and its static libraries) +
         // gawk 5.4.1 (the build-only awk after rust-toolchain). BusyBox's pin
         // left with its last consumer; the kernel's flex, elfutils and bc left
-        // when it moved into the Debian build root.
-        assert_eq!(pins.len(), 76);
+        // when it moved into the Debian build root; btrfs-progs left when
+        // td-btrfs replaced it.
+        assert_eq!(pins.len(), 75);
         assert!(pins.iter().any(|pin| pin.key == "stage0-source"));
         // The build root lists through `build-root-pins` alone.
         assert!(pins.iter().all(|pin| !pin.key.starts_with("debian-root-")));
@@ -778,7 +779,7 @@ mod tests {
             .any(|pin| pin.key == "ripgrep-seed-source" && pin.foreign()));
         assert!(pins
             .iter()
-            .any(|pin| pin.key == "btrfs-progs-x86-64-source"));
+            .all(|pin| pin.key != "btrfs-progs-x86-64-source"));
         assert!(pins
             .iter()
             .any(|pin| pin.key == "util-linux-libs-x86-64-source"));

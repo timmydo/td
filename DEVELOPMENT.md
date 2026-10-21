@@ -574,7 +574,7 @@ way. No branch's
 `ready` runs it, so an hour of qemu never holds a landing: the
 selection prints that the tier is deferred to main, and names in its
 notes a change to the boot path — the code, manifest, lock or build
-script of td-boot, td-firstboot, td-init, td-install,
+script of td-boot, td-btrfs, td-firstboot, td-init, td-install,
 td-install-qemu-test, td-json, td-kexec, td-login, td-protector, td-sh,
 td-svc or td-tpm, or the recipe of the same name; the linux-x86-64 or
 system-x86-64 recipe; the

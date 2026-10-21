@@ -193,10 +193,11 @@ and updating a deployment must never require writing to the ESP.
 true — `td-boot` reaches only `td-init` applets, and `losetup` moved into
 `td-init` precisely so that no absolute path to a foreign multicall sits
 between a machine and its root filesystem. This workstream does not
-reintroduce one. The deliberate exception is D7's `mkfs.btrfs`: at INSTALL
-time, and on a LIVE boot, whose deployment initramfs formats its volatile
-volume with it (MEDIA.md "Live boot"). The second is the source-built static
-`cryptsetup` that [ENCRYPTION.md](ENCRYPTION.md) approves for LUKS2: the
+reintroduce one. D7's `mkfs.btrfs`, run at INSTALL time and on a LIVE boot,
+whose deployment initramfs formats its volatile volume with it (MEDIA.md
+"Live boot"), is td's own Rust from the `td-btrfs` recipe, not a third-party
+program. The deliberate exception is the source-built static `cryptsetup`
+that [ENCRYPTION.md](ENCRYPTION.md) approves for LUKS2: the
 installer formats with it, and the selector and deployment initramfs open
 the volume with it. Its key material reaches it only through a descriptor,
 never argv or the environment. The installer's device-bound formatting
@@ -233,14 +234,13 @@ update without a predicted protector; the image build refuses a selector
 initramfs whose `/bin/reboot` does not link td-init and a deployment
 initramfs that carries it.
 
-**D7. `mkfs.btrfs` is an approved install-time exception, bound at build
-time.** `td-install` execs the shipped, source-built `btrfs-progs` to create
-the volume; writing a Btrfs formatter in Rust is not a thing this workstream
-is going to do well, and a wrong one produces a volume that mounts and then
-loses data. The cost is real and is the `losetup` lesson: an install would
-depend on a third-party program existing at a path, with nothing tying the
-two together, so dropping it from the image would break installs with **no
-build-time complaint**. So the landing that execs it also carries the binding
+**D7. `mkfs.btrfs` is bound at build time.** `td-install` execs the
+shipped `mkfs.btrfs`, td's std-only Rust formatter from the `td-btrfs`
+recipe ([td-btrfs/DESIGN.md](../td-btrfs/DESIGN.md)), to create the volume.
+The cost is real and is the `losetup` lesson: an install would depend on
+another program existing at a path, with nothing tying the two together,
+so dropping it from the image would break installs with **no build-time
+complaint**. So the landing that execs it also carries the binding
 `td-boot/src/protocol.rs` already models for applets — a named constant that
 the recipe-side image check consumes, so an image that does not provide
 `mkfs.btrfs` **reds the build** instead of failing an install on a machine
@@ -584,8 +584,8 @@ Unreadable candidates or malformed sysfs values refuse; small devices cannot
 contain a primary superblock and are skipped.
 
 One 4096-byte primary superblock at byte 65536 is read through the held
-descriptor. The layout follows btrfs-progs v7.0's
-[`btrfs_super_block`](https://github.com/kdave/btrfs-progs/blob/v7.0/kernel-shared/uapi/btrfs_tree.h).
+descriptor. The layout is the kernel's `btrfs_super_block`, as
+[`td-btrfs/src/format.rs`](../td-btrfs/src/format.rs) writes it.
 Non-Btrfs and differently labelled volumes are ignored. Matching labels
 require CRC32C, the primary offset, a nonzero UUID, one device, and ordinary
 superblock flags. Unsupported checksums, seed/metadump/changing/error flags,
@@ -828,7 +828,7 @@ INSTALLER.md owns the generator's output and future-plan boundary.
 The system's root image carries the stock selector at
 `/lib/td-boot/selector-initramfs.cpio` (td-boot's root-relative
 `SELECTOR_TEMPLATE_PATH`), `td-install` at `/bin/td-install` and the
-static `mkfs.btrfs` the deployment initramfs already carries, linked at
+static `td-btrfs` the deployment initramfs already carries, linked at
 `/bin/mkfs.btrfs` (the name D7's `MKFS_BTRFS` gives), and the static
 `cryptsetup` with its debug companion, linked at `/bin/cryptsetup` (D6),
 so a live installer finds them in the root image `live-root` hashed
@@ -2905,13 +2905,14 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
 
    7b is itself two commits, and the RECIPE is the first of them. D7's binding
    is a build-time complaint about a missing program, so something has to
-   build td-install with `btrfs-progs` declared beside it — and today nothing
-   builds td-install at all. There is also no install image to pack it into,
-   so the roster check `td-boot/src/protocol.rs` already models for td-init
-   applets has no image to read; what it reads instead is td-install's own
-   declared inputs. The recipe is worth landing on its own for the reason item
-   5 was split off: a `#[path]`-including crate that only ever compiles on the
-   host has not been shown to compile for the target, and the recipe is also
+   build td-install with its formatter (now `td-btrfs`) declared beside it —
+   and today nothing builds td-install at all. There is also no install image
+   to pack it into, so the roster check `td-boot/src/protocol.rs` already
+   models for td-init applets has no image to read; what it reads instead is
+   td-install's own declared inputs. The recipe is worth landing on its own
+   for the reason item 5 was split off: a `#[path]`-including crate that
+   only ever compiles on the host has not been shown to compile for the
+   target, and the recipe is also
    the only place a test can EXEC `mkfs.btrfs`, since no host is required to
    have one. `recipe-checks` joins td-install's route with that recipe.
 
@@ -2944,7 +2945,7 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    claim this file made and the disk did not keep. The front holds XFS at 0,
    ext* at 1 KiB and Btrfs at 64 KiB; the TAIL holds MD RAID 0.90 metadata in
    the last 64 KiB, MD RAID 1.0 eight kilobytes from the end, and ZFS's L2/L3
-   labels. btrfs-progs wipes both ends of its device, so on a fresh image both
+   labels. mkfs.btrfs zeroes both ends of its device, so on a fresh image both
    wipes are holes — and it is exactly those holes the copy discards. Installing
    over a former mdadm member with 1.0 metadata therefore left `blkid` reporting
    both `btrfs` and `linux_raid_member`, which is a disk mdadm may assemble and
@@ -2993,8 +2994,8 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    shifts every field read by position — or a newline, which would break the
    one-line promise outright. Everything a person reads goes to stderr,
    including the stdout of EVERY child this path runs — `mkfs.btrfs`, whose
-   banner is a version string, and since 7c `td-boot publish`, whose is the
-   deployment id. Both are things a caller might want and neither is a byte
+   report names the new filesystem, and since 7c `td-boot publish`, whose is
+   the deployment id. Both are things a caller might want and neither is a byte
    offset, so the rule is about the CHANNEL rather than about how interesting
    the bytes are.
 
@@ -3062,12 +3063,12 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    exercises the shipped code path rather than a cousin of it — which is D9,
    and the same argument that settled the `BLKRRPART` question above. It is
    also verifiable offline, which is what makes it a check rather than a
-   hope: `btrfs inspect-internal dump-tree -t fs` lists the directory entries
-   of an unmounted image, so the recipe can assert `td/deployments/<id>` and
-   the selector are really in the filesystem on the destination. Measured on
-   a real image before this was written down — including that `--rootdir`
-   preserves a SYMLINK as one (`type SYMLINK`), which the selector is and
-   without which the assertion would be about a file of the same name.
+   hope: `td-btrfs list` lists the directory entries of an unmounted image,
+   so the recipe can assert `td/deployments/<id>` and the selector are really
+   in the filesystem on the destination. Measured on a real image before this
+   was written down — including that `--rootdir` preserves a SYMLINK as one
+   (listed `l … -> TARGET`), which the selector is and without which the
+   assertion would be about a file of the same name.
 
    That recipe check is 7c's THIRD commit, and it is what makes the first two
    more than a claim: they substitute a shell script for `td-boot` on both
@@ -3444,10 +3445,10 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    The recipe check asserts it off the RESTORED IMAGE rather than off the
    staging tree, for the reason the selector symlink is checked that way, and
    the wrong-key pass asserts the volume carries neither a selector nor a
-   trust root. What that check does NOT cover is the MODE: `btrfs restore`
-   does not restore permissions without `-m`, so the 0644 is asserted on the
-   staging tree — which is what `--rootdir` reads — and under a hostile umask
-   by the subprocess test, rather than off the image.
+   trust root. What that check does NOT cover is the MODE: `td-btrfs restore`
+   does not restore modes, so the 0644 is asserted on the staging tree —
+   which is what `--rootdir` reads — and under a hostile umask by the
+   subprocess test, rather than off the image.
 
    **10d — `td-boot install` can be TOLD which key**, which is what makes the
    trust root 10a writes reachable by anything. The verb took three arguments
@@ -3539,7 +3540,7 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    emptying the real channel, which has to keep its candidate for the pass that
    follows.
 
-   Empty directories DO survive `mkfs.btrfs --rootdir` and `btrfs restore` —
+   Empty directories DO survive `mkfs.btrfs --rootdir` and `td-btrfs restore` —
    checked rather than assumed, since both this fixture and the installer's own
    `VOLUME_CHANNEL_DIR` depend on it. `td-install-test` asserts it on the real
    restored image now, rather than leaving it to a check somebody once ran by

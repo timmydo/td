@@ -366,6 +366,7 @@ const TARGET_STATIC_RECIPES: &[(&str, &str)] = &[
     ("td-audio/src", "recipes/src/recipes/td-audio.rs"),
     ("td-authd/src", "recipes/src/recipes/td-authd.rs"),
     ("td-boot/src", "recipes/src/recipes/td-boot.rs"),
+    ("td-btrfs/src", "recipes/src/recipes/td-btrfs.rs"),
     ("td-busd/src", "recipes/src/recipes/td-busd.rs"),
     ("td-cc/src", "recipes/src/recipes/td-cc.rs"),
     ("td-compositor/src", "recipes/src/recipes/td-compositor.rs"),
@@ -1221,6 +1222,19 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         // Retained `td-boot/` inputs enter td-net's seed, re-derived LIVE from
         // the checkout (re #469 local-source-roster split) — no local-source
         // preflight to select here either.
+        sel.add_target("check");
+        sel.add_target("recipe-checks");
+        return;
+    }
+
+    // td-btrfs is target-static like td-kexec: host cargo holds its unit and
+    // round-trip tests, and td-btrfs-test formats, checks and restores a
+    // volume with the shipped binary.
+    if pattern_matches(
+        "td-btrfs/*|td-btrfs/src/*|td-btrfs/Cargo.toml|td-btrfs/Cargo.lock",
+        p,
+    ) {
+        sel.add_preflight("cargo-test");
         sel.add_target("check");
         sel.add_target("recipe-checks");
         return;
@@ -2083,10 +2097,10 @@ fn compute_selection(root: &Path, changed: &[String]) -> Selection {
 
 /// The crates the system image boots through or the oracles drive: init,
 /// the shell its scripts run in, the boot protocol and kexec, login, the
-/// service supervisor, first boot, and the installer with its test driver,
-/// and the libraries td-boot links for volume discovery, its PCR 11
-/// measurement and the live selector's PCR 12 cap: td-protector, td-tpm and
-/// td-json.
+/// service supervisor, first boot, the installer with its test driver and
+/// the formatter it and a live boot run (td-btrfs), and the libraries
+/// td-boot links for volume discovery, its PCR 11 measurement and the live
+/// selector's PCR 12 cap: td-protector, td-tpm and td-json.
 /// td-fs, which td-boot and the installer compile in, is left out by
 /// decision: its changes run the gates on a branch and the oracles on main.
 /// A change to one's code, manifest, lock or build script, or to its recipe
@@ -2096,6 +2110,7 @@ fn compute_selection(root: &Path, changed: &[String]) -> Selection {
 /// named.
 const BOOT_CRATES: &[&str] = &[
     "td-boot",
+    "td-btrfs",
     "td-firstboot",
     "td-init",
     "td-install",
@@ -2730,6 +2745,10 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     // which statically links it via td-kexec-test.
     assert_target!("td-kexec/src/main.rs", "check");
     assert_target!("td-kexec/src/main.rs", "recipe-checks");
+    assert_preflight!("td-btrfs/src/mkfs.rs", "cargo-test");
+    assert_target!("td-btrfs/src/mkfs.rs", "check");
+    assert_target!("td-btrfs/src/mkfs.rs", "recipe-checks");
+    assert_target!("td-btrfs/Cargo.lock", "recipe-checks");
     assert_target!("td-jail/src/main.rs", "check");
     assert_target!("td-jail/src/main.rs", "recipe-checks");
     assert_target!("td-jail/src/sys.rs", "check");

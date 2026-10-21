@@ -1142,11 +1142,12 @@ cold-disk or physical-presence claim.
 ### Complete store across a cold desktop boot
 
 The additional `fido-cold-create` and `fido-cold-reopen` guests share one
-fresh 256-MiB disk and retained emulator state. The guest uses td-built
-btrfs-progs to create a Btrfs `@var` subvolume and mounts it at `/var` with
-nosuid,nodev. Each guest starts from a fresh initramfs and `/run`; distinct
-kernel boot IDs establish that the second run is a new boot. Both guests
-must unmount `/var` successfully before their normal poweroff.
+fresh 256-MiB disk and retained emulator state. The guest uses td-btrfs's
+`mkfs.btrfs --rootdir --subvol` to create a Btrfs `@var` subvolume and mounts
+it at `/var` with nosuid,nodev. Each guest starts from a fresh initramfs
+and `/run`; distinct kernel boot IDs establish that the second run is a
+new boot. Both guests must unmount `/var` successfully before their
+normal poweroff.
 
 Creation repeats the full desktop enrollment, public write, jailed retrieval
 and generation-relock sequence with the explicitly unrecoverable policy.

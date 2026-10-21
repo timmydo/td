@@ -18,10 +18,10 @@ pub(crate) const TARGETS: &[&str] = &[
     "td-busd",
     "td-portal",
     "td-jail",
-    "btrfs-progs-x86-64",
+    "td-btrfs",
 ];
 
-pub(crate) const SYSTEM_TARGETS: &[&str] = &["system-secret-vm-test", "btrfs-progs-x86-64"];
+pub(crate) const SYSTEM_TARGETS: &[&str] = &["system-secret-vm-test", "td-btrfs"];
 
 pub(crate) fn system_options(args: &[String]) -> Result<(PathBuf, bool), String> {
     let (args, powercuts) = match args.split_last() {
@@ -266,8 +266,7 @@ pub(crate) fn run(
         files.push((destination, built.join("bin").join(name)));
     }
     // The login power-cut guest's volume, and the TPM cold-store guests'.
-    let btrfs = output(runner, "btrfs-progs-x86-64")?;
-    files.push(("bin/btrfs", btrfs.join("bin/btrfs")));
+    let btrfs = output(runner, "td-btrfs")?;
     files.push(("bin/mkfs.btrfs", btrfs.join("bin/mkfs.btrfs")));
     let mut contents = Vec::new();
     for (name, path) in &files {

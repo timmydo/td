@@ -539,13 +539,15 @@ read before reporting the limit. Source validation, selector preparation and
 coordinated formatting otherwise use the normal installation path.
 
 The formatter creates a sparse image; this check deliberately pins failure
-during its first real writes. The pinned mkfs.btrfs maps the failed
-scratch-image zeroing write to a generic error without retaining errno. After installation fails, the
-fixture independently attempts one 4 KiB write to a new private scratch
-file. Only kernel ENOSPC (28) emits the exhaustion marker; other errors or
-a successful write refuse without it. No such probe writes the destination.
-The host requires both scratch markers, the actual mkfs zeroing diagnostic,
-a failed mkfs.btrfs scratch-image operation and the installer failure.
+during its first real write. td-btrfs's mkfs.btrfs reports that write, the
+2 MiB zeroing of the image's start, with its errno text (`write of 2097152
+bytes at 0 failed: No space left on device`). After installation fails, the
+fixture independently attempts one
+4 KiB write to a new private scratch file. Only kernel ENOSPC (28) emits
+the exhaustion marker; other errors or a successful write refuse without
+it. No such probe writes the destination. The host requires both scratch
+markers, the actual mkfs zeroing diagnostic, a failed mkfs.btrfs
+scratch-image operation and the installer failure.
 Partition refresh, publication and deployment selection must be absent.
 After QEMU is reaped, the host checks the destination's complete byte
 length and SHA-256 against its pre-boot canaries and sparse gaps. An

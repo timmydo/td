@@ -219,7 +219,7 @@ pub fn valid_digest(bytes: &[u8]) -> bool {
             .iter()
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
-// The one third-party program on the install path (D7). A NAME, not a path:
+// The formatter on the install path, td-btrfs by this name (D7). A NAME, not a path:
 // `td-install` is told where it is, and this is what the build-time check binds
 // against so an image or a recipe that stops providing it reds the build rather
 // than failing an install on a machine someone is standing in front of. Same

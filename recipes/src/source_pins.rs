@@ -53,15 +53,6 @@ const PINS: &[PinDef] = &[
         file: "bison-3.8.2.tar.xz",
     },
     PinDef {
-        key: "btrfs-progs-x86-64-source",
-        aliases: &[],
-        // btrfs-progs 7.0 provides the offline --rootdir/--subvol image builder
-        // used to initialize persistent system volumes without host mounts.
-        url: "https://www.kernel.org/pub/linux/kernel/people/kdave/btrfs-progs/btrfs-progs-v7.0.tar.xz",
-        sha256: "c286d6876cbcd72327a0b417e4cfd280353ec23e37b549fdbcd7800a832d9a99",
-        file: "btrfs-progs-v7.0.tar.xz",
-    },
-    PinDef {
         key: "ca-certificates-source",
         aliases: &[],
         // Mozilla's trust store as rendered in PEM form by curl. Pin the dated
@@ -648,7 +639,7 @@ const PINS: &[PinDef] = &[
     PinDef {
         key: "util-linux-libs-x86-64-source",
         aliases: &[],
-        // btrfs-progs requires libuuid and libblkid. The recipe builds only
+        // cryptsetup requires libuuid and libblkid. The recipe builds only
         // those two static libraries; no util-linux programs are shipped.
         url: "https://www.kernel.org/pub/linux/utils/util-linux/v2.42/util-linux-2.42.2.tar.xz",
         sha256: "03a05d3adf9602ef128f2da05b84b3205ce60c351e5737c0370f74000679ce8a",
@@ -817,8 +808,8 @@ mod tests {
         // its exact three-component Rust 1.95.0 bootstrap snapshot +
         // coreutils-0.9.0, ripgrep 14.1.1, and fd 10.2.0 (the Rust userland
         // `.crate` sources) +
-        // btrfs-progs 7.0 and util-linux 2.42.2 (the persistent-volume writer
-        // and its minimal libuuid/libblkid build closure) + the first reviewed
+        // util-linux 2.42.2 (cryptsetup's minimal libuuid/libblkid build
+        // closure) + the first reviewed
         // foreign application seed, upstream ripgrep 15.2.0, LibreSSL 4.3.2,
         // curl 8.21.0 (the static HTTPS foundation for Git), Git 2.55.0,
         // curl's dated Mozilla CA extract, OpenSSH Portable 10.5p1, and
@@ -830,9 +821,10 @@ mod tests {
         // the archive and nine licence notices. cryptsetup 2.8.8 with json-c
         // 0.18, popt 1.19 and LVM2 2.03.43 add the LUKS2 userspace closure.
         // gawk 5.4.1 is the build-only awk after rust-toolchain. BusyBox's pin
-        // left with its last consumer, and the kernel's bc, flex and elfutils
-        // left when it moved into the Debian build root.
-        assert_eq!(all().len(), 76);
+        // left with its last consumer, the kernel's bc, flex and elfutils
+        // left when it moved into the Debian build root, and btrfs-progs left
+        // when td-btrfs replaced it.
+        assert_eq!(all().len(), 75);
     }
 
     /// A roster keyed by NAME can name nothing, and this workstream has twice

@@ -54,7 +54,7 @@ const LABEL_IN_SUPERBLOCK: u64 = 299;
 /// is authenticated rather than taken on trust — the key is passed, so a
 /// signature that did not verify is a failed build.
 ///
-/// Offline throughout. `dump-tree -t fs` lists an unmounted filesystem's
+/// Offline throughout. `td-btrfs list` walks an unmounted filesystem's
 /// directory entries, which is the only kind this check has: nothing mounts,
 /// nothing loops, and no partition device is needed, which is the whole of why
 /// the publish goes through the staging tree (DESIGN §10 item 7c).
@@ -114,7 +114,7 @@ fn publish_steps(
         paths: vec![td_boot.into()],
         exec: true,
     });
-    // `btrfs restore` writes into an existing directory.
+    // `td-btrfs restore` writes into an existing empty directory.
     steps.push(Step::MkDir {
         path: "{root}/restored".into(),
     });
@@ -126,8 +126,8 @@ fn publish_steps(
     // ordinary directory and asserting against it says only that `td-boot`
     // wrote what it should; what has to be true is that `mkfs.btrfs --rootdir`
     // then carried it in UNCHANGED, and a check on the staging tree cannot see
-    // the difference. `btrfs restore` gives the image's contents back as
-    // ordinary files — the shape `btrfs-progs-x86-64-test` already uses — so
+    // the difference. `td-btrfs restore` gives the image's contents back as
+    // ordinary files — the shape `td-btrfs-test` already uses — so
     // the selector's SYMLINK-ness and its target are both testable on what was
     // actually installed. A `--rootdir` that dereferenced the selector would
     // leave a regular file of the right name, which every name-only check
@@ -136,9 +136,9 @@ fn publish_steps(
     // `readlink` on the restored tree is also the one assertion that ties the
     // selector to THIS deployment rather than to any deployment, and the
     // payload comparison is what stops an empty directory of the right name
-    // counting as a published bundle. `dump-tree` is kept for the id because it
-    // reads the filesystem's own directory entries rather than a restored copy
-    // of them.
+    // counting as a published bundle. `td-btrfs list` is kept for the id
+    // because it reads the filesystem's own directory entries rather than a
+    // restored copy of them.
     //
     // Compared with `cmp -s`, byte for byte, rather than through `cat`:
     // `$(cat f)` strips trailing newlines from BOTH sides, so two files
@@ -149,7 +149,7 @@ fn publish_steps(
     // exists, it is a DIRECTORY, and it is EMPTY. The last is the contract — a
     // machine has a channel and has been offered nothing — and this is also the
     // only check that an empty directory survives `mkfs.btrfs --rootdir` and
-    // `btrfs restore` at all, which everything `td-boot update` does on an
+    // `td-btrfs restore` at all, which everything `td-boot update` does on an
     // installed machine rests on.
     //
     // `ls -A` and `[`, not `rmdir`, which would answer by changing the tree
@@ -158,7 +158,7 @@ fn publish_steps(
     // usage to stderr and hand back the empty string, and an emptiness test
     // that reads that as "empty" passes whatever is in the directory.
     let deployment_is_in_the_volume = format!(
-        "'{btrfs}' restore -s -S '{{root}}/scratch/td-volume.img' '{{root}}/restored' || \
+        "'{btrfs}' restore '{{root}}/scratch/td-volume.img' '{{root}}/restored' || \
          {{ echo 'the volume could not be restored' >&2; exit 1; }}; \
          target=$(readlink '{{root}}/restored/{boot}/{current}') || \
          {{ echo 'the {current} selector did not survive as a symlink' >&2; exit 1; }}; \
@@ -180,10 +180,11 @@ fn publish_steps(
          {{ echo 'the update channel could not be listed' >&2; exit 1; }}; \
          [ -z \"$offered\" ] || \
          {{ echo \"a fresh install offers $offered in its update channel\" >&2; exit 1; }}; \
-         tree=$('{btrfs}' inspect-internal dump-tree -t fs '{{root}}/scratch/td-volume.img') || \
+         '{btrfs}' list '{{root}}/scratch/td-volume.img' > '{{root}}/published-listing' || \
          {{ echo 'the volume has no readable filesystem tree' >&2; exit 1; }}; \
-         case \"$tree\" in *'name: {id}'*) ;; \
-         *) echo 'the published deployment {id} is not in the volume' >&2; exit 1 ;; esac",
+         awk '$1 == \"d\" && $6 == \"/{deployments}/{id}\" {{ found = 1 }} END {{ exit !found }}' \
+         '{{root}}/published-listing' || \
+         {{ echo 'the published deployment {id} is not in the volume' >&2; exit 1; }}",
         boot = td_boot_protocol::BOOT_DIR,
         deployments = td_boot_protocol::DEPLOYMENTS_DIR,
         trusted = td_boot_protocol::VOLUME_TRUSTED_KEY,
@@ -207,7 +208,7 @@ fn publish_steps(
                      read -r off len written < '{{root}}/publish-out' || exit 1; \
                      [ \"$off\" -eq {VOLUME_AT} ] || {{ echo \"the volume landed at $off, not {VOLUME_AT}\" >&2; exit 1; }}; \
                      [ \"$len\" -gt 0 ] && [ \"$written\" -gt 0 ] || {{ echo \"the volume is $len bytes and $written were written\" >&2; exit 1; }}; \
-                     '{btrfs}' check --readonly --check-data-csum '{{root}}/scratch/td-volume.img' \
+                     '{btrfs}' check '{{root}}/scratch/td-volume.img' \
                      || {{ echo 'the filesystem td-install built does not check out' >&2; exit 1; }}; \
                      {deployment_is_in_the_volume}; \
                      {subvol_exists}; \
@@ -305,11 +306,8 @@ pub fn recipe() -> Recipe {
          [ \"$1$2$3$4$5$6$7$8$9${{10}}${{11}}\" = '{label}' ] || {{ echo 'the ESP is not labelled TD-ESP' >&2; exit 1; }}"
     );
 
-    let mkfs = format!(
-        "{{in:btrfs-progs-x86-64}}/bin/{}",
-        td_boot_protocol::MKFS_BTRFS
-    );
-    let btrfs = "{in:btrfs-progs-x86-64}/bin/btrfs";
+    let mkfs = format!("{{in:td-btrfs}}/bin/{}", td_boot_protocol::MKFS_BTRFS);
+    let btrfs = "{in:td-btrfs}/bin/td-btrfs";
     // `_BHRfS_M`, and "td-system" — the label `protocol.rs` names, read out of
     // the copy on the DISK rather than out of the image it was made in.
     let btrfs_magic = "5f42485266535f4d";
@@ -319,23 +317,25 @@ pub fn recipe() -> Recipe {
     let volume_label_at = VOLUME_AT + SUPERBLOCK_AT + LABEL_IN_SUPERBLOCK;
     // The `@var` subvolume is the reason the volume exists at all — the boot
     // path mounts it on /var — and nothing above sees it: a superblock, a label
-    // and a clean `btrfs check` are all identical with and without it. The root
-    // TREE is where a subvolume appears, and `dump-tree -t root` reads it out of
+    // and a clean `td-btrfs check` are all identical with and without it. The
+    // root TREE is where a subvolume appears, and `td-btrfs list` marks the
+    // directory a subvolume's root with `[subvolume ID rw|ro]` read out of it, in
     // an unmounted image, which is the only kind this check has. A plain
-    // DIRECTORY of the same name lives in the FS tree instead and does not
-    // appear here, so this cannot be satisfied by `--rootdir` alone.
+    // DIRECTORY of the same name carries no mark, so this cannot be satisfied
+    // by `--rootdir` alone.
     //
-    // Read-WRITE is asserted by the absence of the flag rather than by its
-    // presence: `--subvol ro:@var` writes `flags 0x1(RDONLY)` on that root, and
-    // a read-only /var is a machine that boots and then cannot write anything
-    // down. Matched with `case`, so no applet outside the shell is needed.
+    // Read-WRITE is asserted exactly: `--subvol ro:@var` lists the root `ro`,
+    // and a read-only /var is a machine that boots and then cannot write
+    // anything down.
     let subvol_exists = format!(
-        "tree=$('{btrfs}' inspect-internal dump-tree -t root '{{root}}/scratch/td-volume.img') || \
+        "'{btrfs}' list '{{root}}/scratch/td-volume.img' > '{{root}}/subvol-listing' || \
          {{ echo 'the volume has no readable root tree' >&2; exit 1; }}; \
-         case \"$tree\" in *'name {subvol}'*) ;; \
-         *) echo 'the volume has no {subvol} subvolume' >&2; exit 1 ;; esac; \
-         case \"$tree\" in *RDONLY*) echo 'the {subvol} subvolume is read-only' >&2; exit 1 ;; \
-         *) ;; esac",
+         awk '$6 == \"/{subvol}\" && $7 == \"[subvolume\" {{ found = 1 }} END {{ exit !found }}' \
+         '{{root}}/subvol-listing' || \
+         {{ echo 'the volume has no {subvol} subvolume' >&2; exit 1; }}; \
+         awk '$6 == \"/{subvol}\" && $7 == \"[subvolume\" && $9 == \"rw]\" {{ found = 1 }} END {{ exit !found }}' \
+         '{{root}}/subvol-listing' || \
+         {{ echo 'the {subvol} subvolume is read-only' >&2; exit 1; }}",
         subvol = td_boot_protocol::VOLUME_SUBVOL
     );
     let volume_is_on_the_disk = format!(
@@ -392,8 +392,8 @@ pub fn recipe() -> Recipe {
         )
         .env("PATH", "{tools}"),
         // D7's BINDING, and the reason it is a `Require` rather than a comment:
-        // the one third-party program on the install path is named by
-        // `protocol.rs` and composed into this path, so a btrfs-progs that
+        // the formatter on the install path, from its own recipe, is named by
+        // `protocol.rs` and composed into this path, so a td-btrfs that
         // stopped shipping it — or a rename on either side — reds the build
         // instead of failing an install on a machine someone is standing in
         // front of. It is checked BEFORE the step that execs it, so the
@@ -412,7 +412,7 @@ pub fn recipe() -> Recipe {
                      read -r off len written < '{{root}}/volume-out' || exit 1; \
                      [ \"$off\" -eq {VOLUME_AT} ] || {{ echo \"the volume landed at $off, not {VOLUME_AT}\" >&2; exit 1; }}; \
                      [ \"$len\" -gt 0 ] && [ \"$written\" -gt 0 ] || {{ echo \"the volume is $len bytes and $written were written\" >&2; exit 1; }}; \
-                     '{btrfs}' check --readonly --check-data-csum '{{root}}/scratch/td-volume.img' || {{ echo 'the filesystem td-install built does not check out' >&2; exit 1; }}; \
+                     '{btrfs}' check '{{root}}/scratch/td-volume.img' || {{ echo 'the filesystem td-install built does not check out' >&2; exit 1; }}; \
                      {subvol_exists}; \
                      {volume_is_on_the_disk}; \
                      {layout_is_intact}"
@@ -453,7 +453,7 @@ pub fn recipe() -> Recipe {
     ]);
 
     Recipe::mesboot("td-install-test", "1.0")
-        .native_inputs(&post_rust_inputs("gawk-x86-64-self", &["td-install", "td-boot", "btrfs-progs-x86-64"]))
+        .native_inputs(&post_rust_inputs("gawk-x86-64-self", &["td-install", "td-boot", "td-btrfs"]))
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
@@ -498,7 +498,7 @@ mod tests {
     /// Everything `td-boot update` does on an installed machine rests on that
     /// directory being there and empty, and `td-install`'s own tests cannot
     /// say it: they read the staging tree, before a filesystem exists. Only
-    /// this check sees the channel after `mkfs.btrfs --rootdir` and `btrfs
+    /// this check sees the channel after `mkfs.btrfs --rootdir` and `td-btrfs
     /// restore` have both had it — which is the survival of an empty directory
     /// through them, the fact the whole channel design rests on. It runs in the
     /// tier that does not run on every host, so its PRESENCE is asserted where

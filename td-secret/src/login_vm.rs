@@ -13,7 +13,7 @@ use crate::fido_device::vm_tests::desktop::{self, Diagnostics, Keyboard, Pair, P
 use crate::fido_device::Device;
 use crate::fido_uhid::{guard, Plugged, Served, KEEPALIVE_PERIOD};
 use std::cell::Cell;
-use std::os::unix::fs::FileTypeExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -1933,27 +1933,22 @@ fn mount(create: bool) {
         let mut prefix = [0; 4096];
         File::open(VOLUME).unwrap().read_exact(&mut prefix).unwrap();
         assert_eq!(prefix, [0; 4096], "fixture disk is not fresh");
+        // A seed holding only `@var`, root-owned 0755, which mkfs makes the
+        // subvolume the guest mounts.
+        fs::create_dir_all("/volume-seed/@var").unwrap();
+        fs::set_permissions("/volume-seed/@var", fs::Permissions::from_mode(0o755)).unwrap();
         assert!(Command::new("/bin/mkfs.btrfs")
-            .args(["-q", VOLUME])
+            .args([
+                "-q",
+                "--rootdir",
+                "/volume-seed",
+                "--subvol",
+                "rw:@var",
+                VOLUME
+            ])
             .status()
             .unwrap()
             .success());
-        fs::create_dir("/volume").unwrap();
-        applet(&[
-            "mount",
-            "-t",
-            "btrfs",
-            "-o",
-            "nosuid,nodev",
-            VOLUME,
-            "/volume",
-        ]);
-        assert!(Command::new("/bin/btrfs")
-            .args(["subvolume", "create", "/volume/@var"])
-            .status()
-            .unwrap()
-            .success());
-        applet(&["umount", "/volume"]);
     }
     applet(&["mount", "-t", "btrfs", "-o", MOUNT, VOLUME, "/var"]);
     assert!(fs::read_to_string("/proc/self/mountinfo")

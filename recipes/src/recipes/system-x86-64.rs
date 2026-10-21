@@ -4374,16 +4374,12 @@ fn build_initramfs_spec(init: &str, phase: Phase) -> String {
             s.push_str("slink /bin/switch_root {in:td-init}/bin/td-init 0777 0 0\n");
             // Only a live boot's /init formats anything: its volatile volume on
             // /dev/ram0. Static, so it runs before any root is mounted; its
-            // debug companion ships in the real root with the package.
-            s.push_str("dir {in:btrfs-progs-x86-64} 0755 0 0\n");
-            s.push_str("dir {in:btrfs-progs-x86-64}/bin 0755 0 0\n");
-            s.push_str(
-                "file {in:btrfs-progs-x86-64}/bin/mkfs.btrfs.static \
-                 {in:btrfs-progs-x86-64}/bin/mkfs.btrfs.static 0755 0 0\n",
-            );
-            s.push_str(
-                "slink /bin/mkfs.btrfs {in:btrfs-progs-x86-64}/bin/mkfs.btrfs.static 0777 0 0\n",
-            );
+            // debug companion ships in the real root with the package. The
+            // one td-btrfs ELF is the formatter by the name it is run as.
+            s.push_str("dir {in:td-btrfs} 0755 0 0\n");
+            s.push_str("dir {in:td-btrfs}/bin 0755 0 0\n");
+            s.push_str("file {in:td-btrfs}/bin/td-btrfs {in:td-btrfs}/bin/td-btrfs 0755 0 0\n");
+            s.push_str("slink /bin/mkfs.btrfs {in:td-btrfs}/bin/td-btrfs 0777 0 0\n");
             // The tier marker, read by td-authd's update consent and the
             // login worker through the deployment ID; nothing at boot reads it.
             s.push_str("dir /etc 0755 0 0\n");
@@ -4706,23 +4702,21 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
         exec: false,
     });
     // A live boot's deployment initramfs runs mkfs.btrfs from this package; the
-    // image carries the static binaries and their debug companions.
+    // image carries the static binary and its debug companion.
     steps.push(Step::MkDir {
-        path: "{root}/real-root{in:btrfs-progs-x86-64}".into(),
+        path: "{root}/real-root{in:td-btrfs}".into(),
     });
     for child in ["bin", "lib/debug"] {
         steps.push(Step::CopyTree {
-            from: format!("{{in:btrfs-progs-x86-64}}/{child}"),
-            dest: format!("{{root}}/real-root{{in:btrfs-progs-x86-64}}/{child}"),
+            from: format!("{{in:td-btrfs}}/{child}"),
+            dest: format!("{{root}}/real-root{{in:td-btrfs}}/{child}"),
         });
     }
     // A live installer formats the destination with the same static binary,
     // bound at /bin in the hashed root rather than found through PATH (D7).
+    // td-btrfs is mkfs.btrfs when run by that name.
     steps.push(Step::Symlink {
-        target: format!(
-            "{{in:btrfs-progs-x86-64}}/bin/{}.static",
-            td_boot_protocol::MKFS_BTRFS
-        ),
+        target: "{in:td-btrfs}/bin/td-btrfs".into(),
         link: format!("{{root}}/real-root/bin/{}", td_boot_protocol::MKFS_BTRFS),
     });
     // A live installer formats a device-bound volume with the static
@@ -5137,11 +5131,11 @@ fn shape_check() -> String {
      for l in \"$selector_list\" \"$init_list\"; do printf '%s\\n' \"$l\" | grep -qE '^td/store/[^/]+/bin/td-util$' || { echo 'initramfs: td-util store member missing - /bin/td-util would dangle and the /init would stop at its first cat/sleep under set -e, with no cause on the console' >&2; exit 1; }; done; \
      if printf '%s\\n' \"$selector_list\" | grep -q -x -F bin/switch_root; then echo 'selector initramfs: switch_root must be deployment-only - the selector kexecs, it never pivots' >&2; exit 1; fi; \
      printf '%s\\n' \"$init_list\" | grep -q -x -F bin/mkfs.btrfs || { echo 'deployment initramfs: bin/mkfs.btrfs missing - a live boot could not format its volatile volume' >&2; exit 1; }; \
-     printf '%s\\n' \"$init_list\" | grep -qE '^td/store/[^/]+/bin/mkfs[.]btrfs[.]static$' || { echo 'deployment initramfs: mkfs.btrfs store member missing - /bin/mkfs.btrfs would dangle' >&2; exit 1; }; \
+     printf '%s\\n' \"$init_list\" | grep -qE '^td/store/[^/]+/bin/td-btrfs$' || { echo 'deployment initramfs: td-btrfs store member missing - /bin/mkfs.btrfs would dangle' >&2; exit 1; }; \
      if printf '%s\\n' \"$selector_list\" | grep -q -x -F bin/mkfs.btrfs; then echo 'selector initramfs: mkfs.btrfs must be deployment-only - the selector formats nothing' >&2; exit 1; fi; \
-     if printf '%s\\n' \"$selector_list\" | grep -qE '^td/store/[^/]+/bin/mkfs[.]btrfs[.]static$'; then echo 'selector initramfs: the mkfs.btrfs payload must be deployment-only' >&2; exit 1; fi; \
-     for p in mkfs.btrfs btrfs; do [ -f \"$root{in:btrfs-progs-x86-64}/lib/debug/bin/$p.static.debug\" ] || { echo \"root tree: $p lacks its debug companion\" >&2; exit 1; }; done; \
-     [ \"$(readlink \"$root/bin/mkfs.btrfs\" 2>/dev/null)\" = \"{in:btrfs-progs-x86-64}/bin/mkfs.btrfs.static\" ] && [ -f \"$root{in:btrfs-progs-x86-64}/bin/mkfs.btrfs.static\" ] && [ -x \"$root{in:btrfs-progs-x86-64}/bin/mkfs.btrfs.static\" ] || { echo 'root tree: /bin/mkfs.btrfs must link the static mkfs.btrfs a live installer formats with' >&2; exit 1; }; \
+     if printf '%s\\n' \"$selector_list\" | grep -qE '^td/store/[^/]+/bin/td-btrfs$'; then echo 'selector initramfs: the mkfs.btrfs payload must be deployment-only' >&2; exit 1; fi; \
+     [ -f \"$root{in:td-btrfs}/lib/debug/bin/td-btrfs.debug\" ] || { echo 'root tree: td-btrfs lacks its debug companion' >&2; exit 1; }; \
+     [ \"$(readlink \"$root/bin/mkfs.btrfs\" 2>/dev/null)\" = \"{in:td-btrfs}/bin/td-btrfs\" ] && [ -f \"$root{in:td-btrfs}/bin/td-btrfs\" ] && [ -x \"$root{in:td-btrfs}/bin/td-btrfs\" ] || { echo 'root tree: /bin/mkfs.btrfs must link the static td-btrfs a live installer formats with' >&2; exit 1; }; \
      [ \"$(readlink \"$root/bin/cryptsetup\" 2>/dev/null)\" = \"{in:cryptsetup-x86-64}/bin/cryptsetup.static\" ] && [ -f \"$root{in:cryptsetup-x86-64}/bin/cryptsetup.static\" ] && [ -x \"$root{in:cryptsetup-x86-64}/bin/cryptsetup.static\" ] || { echo 'root tree: /bin/cryptsetup must link the static cryptsetup a live installer formats device-bound volumes with' >&2; exit 1; }; \
      [ -s \"$root{in:cryptsetup-x86-64}/lib/debug/bin/cryptsetup.static.debug\" ] || { echo 'root tree: cryptsetup lacks its debug companion' >&2; exit 1; }; \
      printf '%s\\n' \"$selector_list\" | grep -q -x -F bin/cryptsetup || { echo 'selector initramfs: bin/cryptsetup missing - an installed selector could not open a device-bound volume after its release' >&2; exit 1; }; \
@@ -5720,7 +5714,8 @@ pub fn recipe() -> Recipe {
         // td-busd: the static session D-Bus broker used by every Firefox launch.
         // td-portal: the static Settings service, activation supervisor, and
         //   unprivileged live client probe.
-        // btrfs-progs-x86-64: static mkfs.btrfs for a live boot's volatile volume.
+        // td-btrfs: static mkfs.btrfs for a live boot's volatile volume and a
+        //   live installer's destination.
         // cryptsetup-x86-64: static cryptsetup a live installer formats a
         //   device-bound volume with, and the deployment initramfs opens one.
         // post_rust_inputs adds the tool farm's providers (td-sh, td-txt,
@@ -5730,7 +5725,7 @@ pub fn recipe() -> Recipe {
             "gawk-x86-64-self",
             &[
                 "linux-x86-64",
-                "btrfs-progs-x86-64",
+                "td-btrfs",
                 "cryptsetup-x86-64",
                 "ripgrep",
                 "fd",
@@ -7982,15 +7977,15 @@ mod tests {
             .iter()
             .position(|step| {
                 matches!(step, Step::CopyTree { from, dest }
-                if from == "{in:btrfs-progs-x86-64}/bin"
-                    && dest == "{root}/real-root{in:btrfs-progs-x86-64}/bin")
+                if from == "{in:td-btrfs}/bin"
+                    && dest == "{root}/real-root{in:td-btrfs}/bin")
             })
             .unwrap();
         let linked = steps
             .iter()
             .position(|step| {
                 matches!(step, Step::Symlink { target, link }
-                if target == "{in:btrfs-progs-x86-64}/bin/mkfs.btrfs.static"
+                if target == "{in:td-btrfs}/bin/td-btrfs"
                     && link == "{root}/real-root/bin/mkfs.btrfs")
             })
             .unwrap();
@@ -13535,7 +13530,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         const PAT: &str = "^td/store/[^/]+/bin/";
         let mut greps = 0usize;
         for (at, _) in check.match_indices(PAT) {
-            // `[.]` is the regex's literal dot, as in `mkfs[.]btrfs[.]static`.
+            // `[.]` is the regex's literal dot, as in `cryptsetup[.]static`.
             let name: String = check
                 .get(at + PAT.len()..)
                 .unwrap_or_default()

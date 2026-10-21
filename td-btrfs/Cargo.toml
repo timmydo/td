@@ -1,0 +1,31 @@
+[package]
+name = "td-btrfs"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "td's std-only Btrfs image writer and reader: mkfs.btrfs --rootdir/--subvol, and the offline check and restore its tests use"
+
+[package.metadata.td-gate]
+clippy-all-targets = true
+
+[workspace]
+
+[dev-dependencies]
+td-fs = { path = "../td-fs" }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"
+
+[profile.release]
+opt-level = 2
+panic = "abort"
+strip = true

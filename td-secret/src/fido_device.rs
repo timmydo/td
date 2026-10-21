@@ -2001,27 +2001,24 @@ pub(crate) mod vm_tests {
                     .read_exact(&mut prefix)
                     .unwrap();
                 assert_eq!(prefix, [0; 4096], "fixture disk is not fresh");
+                use std::os::unix::fs::PermissionsExt;
+                // A seed holding only `@var`, root-owned 0755, which mkfs
+                // makes the subvolume the guest mounts.
+                fs::create_dir_all("/volume-seed/@var").unwrap();
+                fs::set_permissions("/volume-seed/@var", fs::Permissions::from_mode(0o755))
+                    .unwrap();
                 assert!(Command::new("/bin/mkfs.btrfs")
-                    .args(["-q", "/dev/vda"])
+                    .args([
+                        "-q",
+                        "--rootdir",
+                        "/volume-seed",
+                        "--subvol",
+                        "rw:@var",
+                        "/dev/vda",
+                    ])
                     .status()
                     .unwrap()
                     .success());
-                fs::create_dir("/volume").unwrap();
-                applet(&[
-                    "mount",
-                    "-t",
-                    "btrfs",
-                    "-o",
-                    "nosuid,nodev",
-                    "/dev/vda",
-                    "/volume",
-                ]);
-                assert!(Command::new("/bin/btrfs")
-                    .args(["subvolume", "create", "/volume/@var"])
-                    .status()
-                    .unwrap()
-                    .success());
-                applet(&["umount", "/volume"]);
             }
             applet(&[
                 "mount",

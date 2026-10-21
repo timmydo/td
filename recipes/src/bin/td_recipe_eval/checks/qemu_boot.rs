@@ -3337,15 +3337,15 @@ fn build_td_jail_seccomp_probe(runner: &RecipeCheckRunner) -> Result<PathBuf, St
 }
 
 pub(crate) fn build_btrfs_tools(runner: &RecipeCheckRunner) -> Result<(PathBuf, PathBuf), String> {
-    runner.prepare_recipe_target("btrfs-progs-x86-64")?;
-    let build_out = runner.build_plan("btrfs-progs-x86-64")?;
-    let tree = runner.ladder_out_from(&build_out, "btrfs-progs-x86-64")?;
+    runner.prepare_recipe_target("td-btrfs")?;
+    let build_out = runner.build_plan("td-btrfs")?;
+    let tree = runner.ladder_out_from(&build_out, "td-btrfs")?;
     let mkfs = tree.join("bin/mkfs.btrfs");
-    let btrfs = tree.join("bin/btrfs");
-    for (label, path) in [("mkfs.btrfs", &mkfs), ("btrfs", &btrfs)] {
+    let btrfs = tree.join("bin/td-btrfs");
+    for (label, path) in [("mkfs.btrfs", &mkfs), ("td-btrfs", &btrfs)] {
         if !is_executable(path) {
             return Err(format!(
-                "btrfs-progs-x86-64 output is missing executable {label} ({})",
+                "td-btrfs output is missing executable {label} ({})",
                 path.display()
             ));
         }
@@ -4367,7 +4367,7 @@ fn link_or_copy(source: &Path, target: &Path) -> Result<(), String> {
 
 pub(crate) fn check_persistent_volume(btrfs: &Path, output: &Path) -> Result<(), String> {
     let status = Command::new(btrfs)
-        .args(["check", "--readonly", "--check-data-csum"])
+        .arg("check")
         .arg(output)
         .status()
         .map_err(|e| format!("spawn {} check: {e}", btrfs.display()))?;
