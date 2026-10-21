@@ -38,7 +38,8 @@ use td_ui::window::{Clipboard, Flow, Handler, Input, PointerPhase, Refusal};
 use views::compose::ComposeView;
 use views::drafts::DraftsView;
 use views::mailbox_list::{AccountSetup, MailboxListView};
-use views::{Body, Scene, Scroll, Slot, ViewAction, ViewStack};
+use views::unified_inbox::{Inbox, UnifiedInboxView};
+use views::{Body, Scene, Scroll, Slot, View, ViewAction, ViewStack};
 
 /// The tenth of a second the terminal's read timed out at, kept as the
 /// longest a turn waits for the backend's answer or the idle-sync clock.
@@ -202,6 +203,15 @@ impl Setup {
             ));
         }
     }
+}
+
+/// The From an account's drafts and replies start with.
+fn reply_from(account: &AccountConfig) -> String {
+    account
+        .mail
+        .reply_from
+        .clone()
+        .unwrap_or_else(|| account.username.clone())
 }
 
 /// An account the session has open, at its place in `Setup::accounts`:
@@ -402,7 +412,10 @@ impl Session {
                 setup.accounts.len()
             ));
         };
-        let stack = ViewStack::new(Box::new(setup.mailbox_view(&open.cmd_tx, account)));
+        let stack = ViewStack::new(
+            Box::new(setup.mailbox_view(&open.cmd_tx, account)),
+            Some(current),
+        );
         let sidebar = Sidebar::new(&setup.account_names, current);
         let mut session = Session {
             sync_interval: setup.sync_interval_secs.map(Duration::from_secs),
@@ -495,6 +508,11 @@ impl Session {
     fn act(&mut self, action: ViewAction) {
         match action {
             ViewAction::Continue => self.redraw(),
+            ViewAction::PushFor(account, new_view) => {
+                self.stack.push_for(Some(account), new_view);
+                self.prepare_frame();
+                self.redraw();
+            }
             ViewAction::Push(new_view) => {
                 self.stack.push(new_view);
                 // The pane holds the new view's document at once, so a
@@ -935,11 +953,12 @@ impl Session {
         if let Some(path) = &prepared.attachment_dir {
             crate::log_info!("Draft attachments retained at {}", path.display());
         }
-        let Some(cmd_tx) = self.cmd_tx() else {
+        let account = self.draft_account();
+        let Some(cmd_tx) = self.live.get(account).map(|live| live.cmd_tx.clone()) else {
             return;
         };
         match ComposeView::open(prepared.draft_path, prepared.attachment_dir, cmd_tx) {
-            Ok(view) => self.act(ViewAction::Push(Box::new(view))),
+            Ok(view) => self.act(ViewAction::PushFor(account, Box::new(view))),
             Err(e) => {
                 crate::log_error!("Failed to read the retained draft back: {}", e);
                 self.redraw();
@@ -955,11 +974,15 @@ impl Session {
             Some(dir) => Ok(dir.clone()),
             None => compose::draft_dir(),
         };
-        let Some(cmd_tx) = self.cmd_tx() else {
+        let account = self.draft_account();
+        let Some(cmd_tx) = self.live.get(account).map(|live| live.cmd_tx.clone()) else {
             return;
         };
         match dir {
-            Ok(dir) => self.act(ViewAction::Push(Box::new(DraftsView::new(dir, cmd_tx)))),
+            Ok(dir) => self.act(ViewAction::PushFor(
+                account,
+                Box::new(DraftsView::new(dir, cmd_tx)),
+            )),
             Err(e) => {
                 crate::log_error!("No drafts to list: {}", e);
                 self.redraw();
@@ -1129,9 +1152,18 @@ impl Session {
         }
     }
 
-    /// The shown account's backend.
+    /// The account the top view is bound to, or over every account, the
+    /// account last shown: whose a draft composed or replied to there is,
+    /// and whose backend sends it.
+    fn draft_account(&self) -> usize {
+        self.stack.top_account().unwrap_or(self.current)
+    }
+
+    /// The backend of `draft_account`.
     fn cmd_tx(&self) -> Option<Sender<BackendCommand>> {
-        self.live.get(self.current).map(|live| live.cmd_tx.clone())
+        self.live
+            .get(self.draft_account())
+            .map(|live| live.cmd_tx.clone())
     }
 
     /// The mailbox list of the account at `index`, and its folders'
@@ -1151,10 +1183,13 @@ impl Session {
         Some(view)
     }
 
-    /// The stack replaced by `view`, the account at `index`'s.
-    fn replace_stack(&mut self, index: usize, view: MailboxListView) {
-        self.current = index;
-        let old = std::mem::replace(&mut self.stack, ViewStack::new(Box::new(view)));
+    /// The stack replaced by `view`, bound to the account at `index`, or
+    /// over every account.
+    fn replace_stack(&mut self, index: Option<usize>, view: Box<dyn View>) {
+        if let Some(index) = index {
+            self.current = index;
+        }
+        let old = std::mem::replace(&mut self.stack, ViewStack::new(view, index));
         for slot in old.into_slots() {
             self.pane.close(slot.text);
         }
@@ -1166,7 +1201,7 @@ impl Session {
     /// unseeded: a set-up's, whose old folders are another server's.
     fn show_account(&mut self, index: usize, origin: &str) {
         if let Some(view) = self.account_view(index, origin, false) {
-            self.replace_stack(index, view);
+            self.replace_stack(Some(index), Box::new(view));
         }
     }
 
@@ -1175,7 +1210,7 @@ impl Session {
     /// page. The account shown keeps its page, popped to, with what it
     /// caches; another's replaces the stack, seeded from the tree.
     fn open_page(&mut self, index: usize, id: Option<&str>) {
-        if index == self.current {
+        if index == self.current && self.stack.root_account() == Some(index) {
             for slot in self.stack.pop_to_root() {
                 self.pane.close(slot.text);
             }
@@ -1188,7 +1223,7 @@ impl Session {
             let Some(view) = self.account_view(index, "sidebar", true) else {
                 return;
             };
-            self.replace_stack(index, view);
+            self.replace_stack(Some(index), Box::new(view));
         }
         let opened = id.and_then(|id| self.stack.root_mut()?.open_folder(id));
         if let Some(action) = opened {
@@ -1208,9 +1243,61 @@ impl Session {
         self.sidebar.select(entry.clone());
         self.sidebar.focused = false;
         match entry {
+            // Shown already, it is kept and refreshed as a pop reveals it.
+            Entry::Unified if self.stack.root_account().is_none() => {
+                for slot in self.stack.pop_to_root() {
+                    self.pane.close(slot.text);
+                }
+                if let Some(root) = self.stack.root_mut() {
+                    root.on_reveal();
+                }
+                self.redraw();
+            }
+            Entry::Unified => self.open_unified(),
             Entry::Account(index) => self.open_page(index, None),
             Entry::Folder { account, id } => self.open_page(account, Some(&id)),
         }
+    }
+
+    /// The stack replaced by the unified inbox over every account, each
+    /// account's inbox found among the folders the tree holds or, not
+    /// yet listed, in its next listing. A draft composed there is from
+    /// the account last shown.
+    fn open_unified(&mut self) {
+        let inboxes = self
+            .setup
+            .accounts
+            .iter()
+            .zip(&self.live)
+            .enumerate()
+            .map(|(index, (account, live))| Inbox {
+                account: index,
+                name: account.name.clone(),
+                cmd_tx: live.cmd_tx.clone(),
+                reply_from: reply_from(account),
+                archive_folder: account.mail.archive_folder.clone(),
+                deleted_folder: account.mail.deleted_folder.clone(),
+                mailboxes: self
+                    .sidebar
+                    .folders(index)
+                    .map(<[_]>::to_vec)
+                    .unwrap_or_default(),
+            })
+            .collect();
+        let (compose_name, compose_from) = self
+            .setup
+            .accounts
+            .get(self.current)
+            .map(|account| (account.name.clone(), reply_from(account)))
+            .unwrap_or_default();
+        let view = UnifiedInboxView::new(
+            inboxes,
+            self.setup.page_size,
+            self.setup.browser.clone(),
+            compose_name,
+            compose_from,
+        );
+        self.replace_stack(None, Box::new(view));
     }
 
     /// A key while the tree has the keys: its moves, and the entry
@@ -1955,10 +2042,7 @@ impl Handler for Session {
                         self.redraw();
                     }
                 }
-                if index != self.current {
-                    continue;
-                }
-                if self.stack.handle_response(&response) {
+                if self.stack.handle_response(index, &response) {
                     self.redraw();
                 }
                 self.hold_draft();
@@ -1991,9 +2075,10 @@ impl Handler for Session {
                 // it asks a question a listing under it could change.
                 let several = self.setup.accounts.len() > 1;
                 if several {
-                    let over_page = self.stack.depth() > 1;
+                    let page_on_top =
+                        self.stack.depth() == 1 && self.stack.root_account() == Some(self.current);
                     for (index, live) in self.live.iter().enumerate() {
-                        if index != self.current || over_page {
+                        if index != self.current || !page_on_top {
                             let _ = live.cmd_tx.send(BackendCommand::FetchMailboxes {
                                 origin: "idle_sync.sidebar".to_string(),
                             });
@@ -2511,6 +2596,19 @@ mod frame_tests {
         Receiver<BackendCommand>,
         Receiver<BackendCommand>,
     ) {
+        let (session, state, test_cmds, work_cmds, _) = two_accounts_answering();
+        (session, state, test_cmds, work_cmds)
+    }
+
+    /// `two_accounts`, with each account's answer sender kept open.
+    #[allow(clippy::type_complexity)]
+    fn two_accounts_answering() -> (
+        Session,
+        crate::testing::TempDir,
+        Receiver<BackendCommand>,
+        Receiver<BackendCommand>,
+        [Sender<BackendResponse>; 2],
+    ) {
         let state = crate::testing::tempdir().unwrap();
         let mut setup = setup();
         setup.draft_dir = Some(state.path().join("drafts"));
@@ -2545,7 +2643,13 @@ mod frame_tests {
             ])))
             .unwrap();
         assert_eq!(session.poll(0), Flow::Continue);
-        (session, state, test_cmds, work_cmds)
+        (
+            session,
+            state,
+            test_cmds,
+            work_cmds,
+            [test_answer, work_answer],
+        )
     }
 
     /// A key the tree does not take gives the views the keys and is
@@ -2597,7 +2701,7 @@ mod frame_tests {
     fn a_press_opens_a_tree_entry_and_the_idle_sync_asks_every_account() {
         let (mut session, _state, test_cmds, work_cmds) = two_accounts();
         while test_cmds.try_recv().is_ok() {}
-        // The tree: test, its INBOX, work, its INBOX and Projects.
+        // The tree: All inboxes, test, its INBOX, work, its INBOX and Projects.
         let row = |session: &Session, index: usize| {
             session
                 .shape()
@@ -2607,7 +2711,7 @@ mod frame_tests {
         };
         key(&mut session, "+");
         key(&mut session, "f");
-        let inbox = row(&session, 1);
+        let inbox = row(&session, 2);
         press(&mut session, inbox.x + 4, inbox.y + 4);
         assert_eq!(session.current, 0);
         assert_eq!(session.stack.depth(), 2);
@@ -2638,7 +2742,7 @@ mod frame_tests {
         assert_eq!(session.current, 0);
         assert_eq!(session.stack.depth(), 2);
 
-        let heading = row(&session, 2);
+        let heading = row(&session, 3);
         press(&mut session, heading.x + 4, heading.y + 4);
         assert_eq!(session.current, 1);
         assert_eq!(session.stack.depth(), 1);
@@ -2664,6 +2768,137 @@ mod frame_tests {
         assert!(work_cmds
             .try_iter()
             .any(|command| matches!(command, BackendCommand::FetchMailboxes { .. })));
+    }
+
+    /// "All inboxes" heads the tree and opens the unified inbox over
+    /// every account: each account's inbox is asked of its own backend
+    /// and both answers fill it, newest first; a message opens over it
+    /// bound to its own account, whose backend a reply or draft there
+    /// then uses, and another account's answers do not reach it.
+    #[test]
+    fn all_inboxes_merge_every_account_and_a_message_opens_on_its_own() {
+        let (mut session, _state, test_cmds, work_cmds, [test_answer, work_answer]) =
+            two_accounts_answering();
+        while test_cmds.try_recv().is_ok() {}
+        while work_cmds.try_recv().is_ok() {}
+        key(&mut session, "Tab");
+        key(&mut session, "Home");
+        key(&mut session, "Return");
+        assert_eq!(session.stack.root_account(), None);
+        let asked = |commands: &Receiver<BackendCommand>, inbox: &str| {
+            commands.try_iter().any(|command| {
+                matches!(command, BackendCommand::QueryEmails { mailbox_id, .. } if mailbox_id == inbox)
+            })
+        };
+        assert!(asked(&test_cmds, "t1"));
+        assert!(asked(&work_cmds, "w1"));
+
+        let message = |id: &str, received: &str| crate::jmap::types::Email {
+            id: id.to_string(),
+            thread_id: None,
+            from: None,
+            to: None,
+            cc: None,
+            reply_to: None,
+            subject: Some(format!("About {id}")),
+            received_at: Some(received.to_string()),
+            sent_at: None,
+            preview: None,
+            text_body: None,
+            html_body: None,
+            body_values: std::collections::HashMap::new(),
+            keywords: std::collections::HashMap::new(),
+            mailbox_ids: std::collections::HashMap::new(),
+            message_id: None,
+            references: None,
+            attachments: None,
+            extra: std::collections::HashMap::new(),
+        };
+        let answer = |inbox: &str, email| BackendResponse::Emails {
+            mailbox_id: inbox.to_string(),
+            emails: Ok(vec![email]),
+            total: None,
+            position: 0,
+            loaded: 1,
+            thread_counts: std::collections::HashMap::new(),
+        };
+        test_answer
+            .send(answer("t1", message("m-test", "2026-02-01T09:00:00Z")))
+            .unwrap();
+        work_answer
+            .send(answer("w1", message("m-work", "2026-02-02T09:00:00Z")))
+            .unwrap();
+        assert_eq!(session.poll(0), Flow::Continue);
+        let shown = session.shown();
+        assert!(
+            shown.contains("About m-test") && shown.contains("About m-work"),
+            "{shown}"
+        );
+
+        key(&mut session, "Home");
+        key(&mut session, "Return");
+        assert_eq!(session.stack.depth(), 2);
+        assert_eq!(session.stack.top_account(), Some(1));
+        assert!(work_cmds
+            .try_iter()
+            .any(|command| matches!(command, BackendCommand::GetEmail { id } if id == "m-work")));
+        assert!(test_cmds.try_recv().is_err());
+        // A draft from the message is the work account's to send.
+        session
+            .cmd_tx()
+            .unwrap()
+            .send(BackendCommand::FetchMailboxes {
+                origin: "probe".to_string(),
+            })
+            .unwrap();
+        assert!(work_cmds.try_iter().any(|command| matches!(
+            command,
+            BackendCommand::FetchMailboxes { origin } if origin == "probe"
+        )));
+        assert!(test_cmds.try_recv().is_err());
+        // The test account's answer for the same id is not the message's.
+        test_answer
+            .send(BackendResponse::EmailBody {
+                id: "m-work".to_string(),
+                result: Box::new(Ok(message("m-work", "2026-02-02T09:00:00Z"))),
+            })
+            .unwrap();
+        assert_eq!(session.poll(0), Flow::Continue);
+        assert!(
+            session.shown().contains("Loading email..."),
+            "{}",
+            session.shown()
+        );
+        // Its own account's answer is.
+        work_answer
+            .send(BackendResponse::EmailBody {
+                id: "m-work".to_string(),
+                result: Box::new(Ok(message("m-work", "2026-02-02T09:00:00Z"))),
+            })
+            .unwrap();
+        assert_eq!(session.poll(0), Flow::Continue);
+        assert!(
+            !session.shown().contains("Loading email..."),
+            "{}",
+            session.shown()
+        );
+
+        // "All inboxes" again keeps the view, popped to; a draft composed
+        // there is the account last shown's, and says so.
+        key(&mut session, "Tab");
+        key(&mut session, "Home");
+        key(&mut session, "Return");
+        assert_eq!(session.stack.depth(), 1);
+        assert_eq!(session.stack.root_account(), None);
+        assert!(session.shown().contains("c:compose from test"));
+        key(&mut session, "c");
+        assert!(session.editing(false));
+        assert_eq!(session.stack.top_account(), Some(0));
+        assert!(
+            text(&session).starts_with("From: me@example.com\n"),
+            "{}",
+            text(&session)
+        );
     }
 
     /// The connector's queue keeps one request per account: a newer one
@@ -3195,7 +3430,7 @@ mod frame_tests {
         assert_eq!(session.shown(), text, "the view is as it was");
         let first = |session: &Session| session.keys().first().map(|section| section.title);
         assert_eq!(first(&session), Some("Mailbox List"));
-        assert_eq!(session.keys().len(), 9);
+        assert_eq!(session.keys().len(), 10);
         key(&mut session, "Return");
         assert_eq!(first(&session), Some("Email List"));
         key(&mut session, "?");

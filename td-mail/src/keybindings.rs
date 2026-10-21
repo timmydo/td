@@ -295,6 +295,36 @@ pub const ACCOUNT_TREE: Table = Table {
     ],
 };
 
+pub const UNIFIED_INBOX: Table = Table {
+    id: "unified_inbox",
+    title: "All Inboxes",
+    bindings: &[
+        ("q", "quit", "Quit"),
+        (
+            "n/j/Down",
+            "next",
+            "Next message; at the last, the next page",
+        ),
+        ("p/k/Up", "prev", "Previous message"),
+        ("PageUp/PageDown", "page", "A page up or down; at the last, the next page"),
+        ("Home/End", "ends", "First or last message; End fetches the next page"),
+        (
+            "Return",
+            "open",
+            "Read the message on its own account, marked read; n/p there step through that account's messages",
+        ),
+        ("g", "refresh", "Ask every account for its inbox again"),
+        (
+            "a",
+            "archive",
+            "Archive to the message's own account's folder",
+        ),
+        ("d", "delete", "Move to the message's own account's trash"),
+        ("u", "toggle_read", "Mark read or unread"),
+        ("f", "toggle_flag", "Flag or unflag"),
+    ],
+};
+
 const TABLES: &[&Table] = &[
     &GLOBAL,
     &MAILBOX_LIST,
@@ -305,6 +335,7 @@ const TABLES: &[&Table] = &[
     &SENT,
     &COMPOSE,
     &ACCOUNT_TREE,
+    &UNIFIED_INBOX,
 ];
 
 /// The key list's sections: `first`'s, the view shown, then the rest in
@@ -379,7 +410,8 @@ mod tests {
                 "Drafts",
                 "Sent Draft",
                 "Compose",
-                "Account Tree"
+                "Account Tree",
+                "All Inboxes"
             ]
         );
         assert_eq!(
@@ -401,7 +433,8 @@ mod tests {
                 "Drafts",
                 "Sent Draft",
                 "Compose",
-                "Account Tree"
+                "Account Tree",
+                "All Inboxes"
             ]
         );
         assert!(viewing[0].rows.contains(&Row {

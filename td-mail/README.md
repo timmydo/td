@@ -403,9 +403,23 @@ discovery round trips never hold it; the mailbox list loads once the
 connection is decided. Every account is opened at start and stays open,
 each with its own backend: one connection is made at a time, the shown
 account's first. With two or more accounts the window keeps an account
-tree at its left: each account's heading, with its inbox's unread count
-(`...` until its folders are listed, `offline` when the fetch failed),
-and its folders under it. Tab moves the keys to the tree and back
+tree at its left: "All inboxes" first, with every inbox's unread count,
+then each account's heading, with its inbox's unread count (`...` until
+its folders are listed, `offline` when the fetch failed), and its
+folders under it. "All inboxes" opens the unified inbox: every
+account's inbox in one list, newest first, each row naming its account.
+Return reads a message on its own account (it is marked read there, a
+reply or a draft from it is that account's, and `n`/`p` there step
+through that account's messages); `a` and `d` move it to its own
+account's archive or trash, `u` and `f` toggle read and flagged, each put
+back if that account refuses; `g` asks every account again, and
+returning from a message asks its account. A draft composed from the
+unified inbox itself is from the account last shown, which the status
+row names. Each account's inbox is fetched a page at a time, and the
+list stops where an account with older mail still unfetched stops (the
+count reads `n/m+`), so nothing older of another account is missing
+above the last row; moving to the last row fetches that account's next
+page. Tab moves the keys to the tree and back
 (Escape or `q` give them back too, and any other key gives them back
 and acts in the view); `n`/`p`, the arrows, the page keys, Home and End
 move in it, and Return, Space or a press opens an entry in place of the

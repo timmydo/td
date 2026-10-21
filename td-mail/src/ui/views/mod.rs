@@ -19,6 +19,7 @@ pub mod mailbox_list;
 pub mod retention_preview;
 pub mod rules_preview;
 pub mod thread_view;
+pub mod unified_inbox;
 
 use super::input::Key;
 use crate::backend::BackendResponse;
@@ -139,6 +140,9 @@ pub fn text_scroll(key: Key) -> Option<Scroll> {
 pub enum ViewAction {
     Continue,
     Push(Box<dyn View>),
+    /// Push a view bound to the account at this place in the session's
+    /// accounts, as a message the unified inbox opens is.
+    PushFor(usize, Box<dyn View>),
     Pop,
     Quit,
     /// Retain the draft and edit it in the pane.
@@ -197,6 +201,12 @@ pub trait View {
     /// Handle a response from the backend thread.
     /// Returns true if the view consumed the response and should re-render.
     fn on_response(&mut self, response: &BackendResponse) -> bool;
+    /// A response from the account at `account`'s backend: a view bound
+    /// to one account takes it as its own; one over every account (the
+    /// unified inbox) tells the accounts apart.
+    fn on_account_response(&mut self, _account: usize, response: &BackendResponse) -> bool {
+        self.on_response(response)
+    }
     /// Check for a pending action triggered by an async response.
     fn take_pending_action(&mut self) -> Option<ViewAction> {
         None
@@ -236,6 +246,9 @@ pub trait View {
 /// in the pane.
 pub struct Slot {
     pub view: Box<dyn View>,
+    /// The account the view is bound to, whose answers alone reach it;
+    /// none for a view over every account.
+    pub account: Option<usize>,
     pub first: usize,
     pub entry_first: usize,
     pub text: Option<super::frame::Shown>,
@@ -246,10 +259,11 @@ pub struct ViewStack {
 }
 
 impl ViewStack {
-    pub fn new(initial: Box<dyn View>) -> Self {
+    pub fn new(initial: Box<dyn View>, account: Option<usize>) -> Self {
         ViewStack {
             slots: vec![Slot {
                 view: initial,
+                account,
                 first: 0,
                 entry_first: 0,
                 text: None,
@@ -263,12 +277,16 @@ impl ViewStack {
             .map(|slot| slot.view.handle_key(key, page))
     }
 
-    /// Route a backend response to all views (top-most can trigger re-render).
-    pub fn handle_response(&mut self, response: &BackendResponse) -> bool {
+    /// Route the account at `account`'s response to every view bound to
+    /// it or over every account (top-most can trigger re-render).
+    pub fn handle_response(&mut self, account: usize, response: &BackendResponse) -> bool {
         let top = self.slots.len().saturating_sub(1);
         let mut needs_render = false;
         for (idx, slot) in self.slots.iter_mut().enumerate() {
-            if slot.view.on_response(response) && idx == top {
+            if slot.account.is_some_and(|bound| bound != account) {
+                continue;
+            }
+            if slot.view.on_account_response(account, response) && idx == top {
                 needs_render = true;
             }
         }
@@ -291,9 +309,16 @@ impl ViewStack {
         self.slots.last_mut()
     }
 
+    /// A view over the top one, bound to the same account.
     pub fn push(&mut self, view: Box<dyn View>) {
+        let account = self.top().and_then(|slot| slot.account);
+        self.push_for(account, view);
+    }
+
+    pub fn push_for(&mut self, account: Option<usize>, view: Box<dyn View>) {
         self.slots.push(Slot {
             view,
+            account,
             first: 0,
             entry_first: 0,
             text: None,
@@ -316,6 +341,16 @@ impl ViewStack {
     /// Every view but the root, popped, for their documents to close.
     pub fn pop_to_root(&mut self) -> Vec<Slot> {
         self.slots.split_off(self.slots.len().min(1))
+    }
+
+    /// The account the root view is bound to; none over every account.
+    pub fn root_account(&self) -> Option<usize> {
+        self.slots.first().and_then(|slot| slot.account)
+    }
+
+    /// The account the top view is bound to; none over every account.
+    pub fn top_account(&self) -> Option<usize> {
+        self.slots.last().and_then(|slot| slot.account)
     }
 
     /// The root view.

@@ -1,9 +1,10 @@
-//! The account tree beside the views, with two or more accounts: each
-//! account's heading and, under it, its folders as its backend last
-//! listed them. A heading opens the account's own page (its folder list,
-//! set-up and reconnect); a folder opens that folder's mail. The tree
-//! keeps its selection by entry, so a folder list arriving for one
-//! account does not move it.
+//! The account tree beside the views, with two or more accounts: the
+//! unified inbox first, then each account's heading and, under it, its
+//! folders as its backend last listed them. A heading opens the
+//! account's own page (its folder list, set-up and reconnect); a folder
+//! opens that folder's mail; the unified inbox every account's inbox.
+//! The tree keeps its selection by entry, so a folder list arriving for
+//! one account does not move it.
 
 use super::views::mailbox_list::MailboxListView;
 use super::views::Row;
@@ -17,6 +18,8 @@ pub const CELLS: usize = 24;
 /// One entry of the tree.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Entry {
+    /// Every account's inbox in one list.
+    Unified,
     /// The account at this place in the session's accounts.
     Account(usize),
     /// A folder of that account, by its mailbox id.
@@ -31,6 +34,18 @@ struct Account {
     folders: Option<Vec<Mailbox>>,
     /// Why the last folder fetch failed, when it did.
     error: Option<String>,
+}
+
+impl Account {
+    /// The unread of its inbox, as last listed.
+    fn inbox_unread(&self) -> u32 {
+        self.folders
+            .iter()
+            .flatten()
+            .filter(|f| f.role.as_deref() == Some("inbox"))
+            .map(|f| f.unread_emails)
+            .sum()
+    }
 }
 
 pub struct Sidebar {
@@ -82,7 +97,8 @@ impl Sidebar {
     }
 
     fn entries(&self) -> impl Iterator<Item = Entry> + '_ {
-        self.accounts
+        let accounts = self
+            .accounts
             .iter()
             .enumerate()
             .flat_map(|(index, account)| {
@@ -92,14 +108,16 @@ impl Sidebar {
                         id: folder.id.clone(),
                     },
                 ))
-            })
+            });
+        std::iter::once(Entry::Unified).chain(accounts)
     }
 
     pub fn len(&self) -> usize {
-        self.accounts
+        1 + self
+            .accounts
             .iter()
             .map(|a| 1 + a.folders.as_ref().map_or(0, Vec::len))
-            .sum()
+            .sum::<usize>()
     }
 
     pub fn entry(&self, index: usize) -> Option<Entry> {
@@ -113,13 +131,13 @@ impl Sidebar {
         at(&self.selected)
             .or_else(|| match &self.selected {
                 Entry::Folder { account, .. } => at(&Entry::Account(*account)),
-                Entry::Account(_) => None,
+                Entry::Account(_) | Entry::Unified => None,
             })
             .unwrap_or(0)
     }
 
     pub fn selected(&self) -> Entry {
-        self.entry(self.cursor()).unwrap_or(Entry::Account(0))
+        self.entry(self.cursor()).unwrap_or(Entry::Unified)
     }
 
     pub fn select(&mut self, entry: Entry) {
@@ -135,27 +153,36 @@ impl Sidebar {
         }
     }
 
-    /// Entry `index` as a row: a heading names its account, with its
-    /// inbox's unread or why it has no folders at the right; a folder is
-    /// indented under it, with its unread.
+    /// Entry `index` as a row: the unified inbox with every inbox's
+    /// unread; a heading names its account, with its inbox's unread or
+    /// why it has no folders at the right; a folder is indented under
+    /// it, with its unread.
     pub fn row(&self, index: usize) -> Row {
+        let count = |unread: u32| {
+            if unread > 0 {
+                unread.to_string()
+            } else {
+                String::new()
+            }
+        };
         match self.entry(index) {
+            Some(Entry::Unified) => {
+                let unread: u32 = self.accounts.iter().map(Account::inbox_unread).sum();
+                Row {
+                    label: "All inboxes".to_string(),
+                    meta: count(unread),
+                    marked: unread > 0,
+                }
+            }
             Some(Entry::Account(account)) => {
                 let Some(held) = self.accounts.get(account) else {
                     return Row::default();
                 };
-                let unread: u32 = held
-                    .folders
-                    .iter()
-                    .flatten()
-                    .filter(|f| f.role.as_deref() == Some("inbox"))
-                    .map(|f| f.unread_emails)
-                    .sum();
+                let unread = held.inbox_unread();
                 let meta = match (&held.folders, &held.error) {
                     (_, Some(_)) => "offline".to_string(),
                     (None, None) => "...".to_string(),
-                    (Some(_), None) if unread > 0 => unread.to_string(),
-                    (Some(_), None) => String::new(),
+                    (Some(_), None) => count(unread),
                 };
                 Row {
                     label: held.name.clone(),
@@ -172,11 +199,7 @@ impl Sidebar {
                 };
                 Row {
                     label: format!("  {}", folder.name.replace(['\n', '\r'], " ")),
-                    meta: if folder.unread_emails > 0 {
-                        folder.unread_emails.to_string()
-                    } else {
-                        String::new()
-                    },
+                    meta: count(folder.unread_emails),
                     marked: folder.unread_emails > 0,
                 }
             }
@@ -202,17 +225,17 @@ mod tests {
         }
     }
 
-    /// The tree lists each account's heading and then its folders, the
-    /// inbox first; an account not yet listed says so, one whose fetch
-    /// failed says it is offline; the selection stays on its entry as
-    /// listings arrive, and falls back to the heading when its folder
-    /// goes.
+    /// The tree lists the unified inbox, counting every inbox's unread,
+    /// then each account's heading and its folders, the inbox first; an
+    /// account not yet listed says so, one whose fetch failed says it is
+    /// offline; the selection stays on its entry as listings arrive, and
+    /// falls back to the heading when its folder goes.
     #[test]
     fn the_tree_lists_each_accounts_folders_and_keeps_its_selection() {
         let mut tree = Sidebar::new(&["home".to_string(), "work".to_string()], 1);
-        assert_eq!(tree.len(), 2);
+        assert_eq!(tree.len(), 3);
         assert_eq!(tree.selected(), Entry::Account(1));
-        assert_eq!(tree.row(0).meta, "...");
+        assert_eq!(tree.row(1).meta, "...");
         tree.listed(
             1,
             &Ok(vec![
@@ -222,9 +245,12 @@ mod tests {
         );
         assert_eq!(tree.selected(), Entry::Account(1));
         let rows: Vec<_> = (0..tree.len()).map(|i| tree.row(i).label).collect();
-        assert_eq!(rows, ["home", "work", "  Inbox", "  Projects"]);
-        assert_eq!(tree.row(1).meta, "4");
-        assert!(tree.row(1).marked);
+        assert_eq!(
+            rows,
+            ["All inboxes", "home", "work", "  Inbox", "  Projects"]
+        );
+        assert_eq!(tree.row(2).meta, "4");
+        assert!(tree.row(2).marked);
         tree.move_by(2);
         assert_eq!(
             tree.selected(),
@@ -233,15 +259,16 @@ mod tests {
                 id: "w2".to_string()
             }
         );
-        tree.listed(0, &Ok(vec![folder("h1", "Inbox", Some("inbox"), 0)]));
-        assert_eq!(tree.cursor(), 4);
+        tree.listed(0, &Ok(vec![folder("h1", "Inbox", Some("inbox"), 3)]));
+        assert_eq!(tree.cursor(), 5);
+        assert_eq!(tree.row(0).meta, "7");
         tree.listed(0, &Err("no route to host".to_string()));
-        assert_eq!(tree.row(0).meta, "offline");
-        assert_eq!(tree.len(), 5, "a failure keeps the folders it had");
+        assert_eq!(tree.row(1).meta, "offline");
+        assert_eq!(tree.len(), 6, "a failure keeps the folders it had");
         tree.listed(1, &Ok(vec![folder("w1", "Inbox", Some("inbox"), 0)]));
         assert_eq!(tree.selected(), Entry::Account(1));
         tree.move_by(-10);
-        assert_eq!(tree.selected(), Entry::Account(0));
+        assert_eq!(tree.selected(), Entry::Unified);
         tree.move_by(10);
         assert_eq!(
             tree.selected(),
