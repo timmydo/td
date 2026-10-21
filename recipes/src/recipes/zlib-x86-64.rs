@@ -1,6 +1,6 @@
 use crate::ladder::{
-    build_root_glibc_cc, build_root_link_map_check, unpack_into, BUILD_ROOT_GLIBC as GLIBC,
-    BUILD_ROOT_PATH as PATH, BUILD_ROOT_SH as SH,
+    build_root_glibc_cc, build_root_link_map_check, unpack_into, LinkedLibc,
+    BUILD_ROOT_GLIBC as GLIBC, BUILD_ROOT_PATH as PATH, BUILD_ROOT_SH as SH,
 };
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
@@ -268,6 +268,7 @@ fn archive_checks() -> Vec<Step> {
             "{root}/archive-test/zlib-test.map",
             "zlib-test",
             &["gcc-runtime"],
+            LinkedLibc::Archive,
         ),
     ]
 }

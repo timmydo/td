@@ -1,6 +1,6 @@
 use crate::ladder::{
-    build_root_link_map_check, build_root_static_cc, unpack_into, unpack_keep_top, BUILD_ROOT_PATH,
-    BUILD_ROOT_SH as SH,
+    build_root_link_map_check, build_root_static_cc, unpack_into, unpack_keep_top, LinkedLibc,
+    BUILD_ROOT_PATH, BUILD_ROOT_SH as SH,
 };
 use crate::types::{Recipe, Step};
 
@@ -154,6 +154,7 @@ pub fn recipe() -> Recipe {
             "popt-x86-64",
             "libdevmapper-x86-64",
         ],
+        LinkedLibc::Archive,
     ));
     steps.push(Step::split_debug_tree("{out}", "/usr/bin/objcopy"));
     steps.push(Step::assert_static(&["{out}/bin/cryptsetup"]));

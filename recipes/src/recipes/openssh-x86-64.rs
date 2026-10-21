@@ -1,5 +1,6 @@
 use crate::ladder::{
-    post_rust_inputs, post_rust_tool_farm, split_target_debug, unpack_into, POST_RUST_SH,
+    build_root_dynamic_cc, build_root_link_map_check, unpack_into, LinkedLibc, BUILD_ROOT_PATH,
+    BUILD_ROOT_SH as SH,
 };
 use crate::types::{Recipe, Step};
 
@@ -9,6 +10,15 @@ use crate::types::{Recipe, Step};
 // KEXs, Ed25519 keys, and ChaCha20-Poly1305. zlib, PAM, Kerberos, PKCS#11,
 // FIDO, libedit, login accounting, and the unshipped client/server tools never
 // enter the closure.
+//
+// It compiles in the Debian build root against td glibc under the shipped
+// target profile (`build_root_dynamic_cc`; the seccomp sandbox's linux/
+// headers are td glibc's staged copy). Each program links td glibc's libc.so.6
+// with its loader and DT_RUNPATH, and gcc-runtime's libgcc; its link map
+// proves no input came from the root, and the wrapper's guard puts the start
+// files in gcc-runtime and the sysroot. configure's resolved library lines
+// are pinned to td glibc's libraries. Every program is split into a runtime
+// and a debug companion (td-profiler/DESIGN.md §2).
 //
 // Portable OpenSSH has no build switch that removes password verification, and
 // its fallback verifier requires crypt(3) even when PasswordAuthentication is
@@ -30,18 +40,13 @@ auth_password(struct ssh *ssh, const char *password)
 }
 "#;
 
+/// The shipped programs, each built by its own make.
+const PROGRAMS: &[&str] = &["ssh", "sshd", "sshd-session", "sshd-auth", "ssh-keygen"];
+
 pub fn recipe() -> Recipe {
-    let sgcc = "{in:gcc-x86-64-self}/stage/td/store/gcc-14.3.0-x86_64-self/bin/gcc";
-    let sbin = "{in:binutils-x86-64-self}/bin";
-    let xglibc = "{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64";
-    let path = format!("{{root}}/wb:{{tools}}:{sbin}");
+    let path = format!("{{root}}/wb:{BUILD_ROOT_PATH}");
 
     let mut steps = unpack_into("openssh-x86-64-source", "{src}");
-    steps.push(post_rust_tool_farm("{in:gawk-x86-64-self}/bin/gawk"));
-    steps.push(Step::PatchShebangs {
-        dir: "{src}".into(),
-        shell: POST_RUST_SH.into(),
-    });
     steps.push(Step::WriteFile {
         path: "{src}/auth-passwd.c".into(),
         content: AUTH_PASSWORD_DISABLED_C.into(),
@@ -50,27 +55,12 @@ pub fn recipe() -> Recipe {
     steps.push(Step::MkDir {
         path: "{root}/build".into(),
     });
-    steps.push(Step::WriteFile {
-        path: "{root}/wb/cc".into(),
-        content: format!(
-            "#!{POST_RUST_SH}\n\
-             exec \"{sgcc}\" -isystem \"{xglibc}/include\" \
-             -B\"{sbin}/\" -B\"{xglibc}/lib\" \
-             -L\"{xglibc}/lib\" \"$@\" \
-             -static-libgcc -fno-omit-frame-pointer -g1 \
-             -ffile-prefix-map={{root}}=/td-build-root \
-             -ffile-prefix-map={{src}}=/td-build \
-             -Wl,--dynamic-linker -Wl,{xglibc}/lib/ld-linux-x86-64.so.2 \
-             -Wl,--enable-new-dtags -Wl,-rpath -Wl,{xglibc}/lib \
-             -Wl,--build-id=sha1\n"
-        ),
-        exec: true,
-    });
+    steps.extend(build_root_dynamic_cc());
     steps.push(
         Step::run(
             "{root}/build",
             &[
-                POST_RUST_SH,
+                SH,
                 "{src}/configure",
                 "--build=x86_64-pc-linux-gnu",
                 "--host=x86_64-pc-linux-gnu",
@@ -105,34 +95,59 @@ pub fn recipe() -> Recipe {
             ],
         )
         .env("PATH", &path)
-        .env("CONFIG_SHELL", POST_RUST_SH)
-        .env("SHELL", POST_RUST_SH)
+        .env("CONFIG_SHELL", SH)
+        .env("SHELL", SH)
         .env("CC", "{root}/wb/cc")
-        .env("AR", "{in:binutils-x86-64-self}/bin/ar")
-        .env("RANLIB", "{in:binutils-x86-64-self}/bin/ranlib")
-        .env("NM", "{in:binutils-x86-64-self}/bin/nm")
-        .env("OBJCOPY", "{in:binutils-x86-64-self}/bin/objcopy")
+        .env("AR", "/usr/bin/ar")
+        .env("RANLIB", "/usr/bin/ranlib")
+        .env("NM", "/usr/bin/nm")
+        .env("OBJCOPY", "/usr/bin/objcopy")
         .env("CFLAGS", "-O2")
+        .env("LDFLAGS", "-Wl,--build-id=sha1")
+        // td glibc has no crypt(3); the probe would find the root's libcrypt.
+        .env("ac_cv_lib_crypt_crypt", "no")
+        .env("ac_cv_func_crypt", "no")
         .env("SOURCE_DATE_EPOCH", "1"),
     );
+    // A probe that finds a library outside td glibc changes the build even
+    // where no shipped link records it; only td glibc's may be resolved.
     steps.push(
         Step::run(
             "{root}/build",
             &[
-                "{in:make-x86-64-self}/bin/make",
-                "-j{jobs}",
-                &format!("SHELL={POST_RUST_SH}"),
-                "ssh",
-                "sshd",
-                "sshd-session",
-                "sshd-auth",
-                "ssh-keygen",
+                SH,
+                "-c",
+                "set -e; for v in LIBS CHANNELLIBS K5LIBS GSSLIBS SSHDLIBS LIBEDIT LIBFIDO2 LIBWTMPDB; do \
+                 line=$(grep \"^$v=\" Makefile) || { echo \"Makefile has no $v\" >&2; exit 1; }; \
+                 for t in ${line#*=}; do case $t in \
+                 -lresolv|-lutil|-ldl|-lrt|-lpthread|-lm) ;; \
+                 *) echo \"configure resolved $v: $t\" >&2; exit 1;; esac; done; done",
             ],
         )
-        .env("PATH", &path)
-        .env("SHELL", POST_RUST_SH)
-        .env("SOURCE_DATE_EPOCH", "1"),
+        .env("PATH", &path),
     );
+    // One make per program: each link writes, and is checked against, its own
+    // map.
+    for program in PROGRAMS {
+        let map = format!("{{root}}/{program}.map");
+        steps.push(
+            Step::run(
+                "{root}/build",
+                &["/usr/bin/make", "-j{jobs}", &format!("SHELL={SH}"), program],
+            )
+            .env("PATH", &path)
+            .env("SHELL", SH)
+            .env("TD_LINK_MAP", &map)
+            .env("SOURCE_DATE_EPOCH", "1"),
+        );
+        steps.push(build_root_link_map_check(
+            "{root}/build",
+            &map,
+            program,
+            &["gcc-runtime"],
+            LinkedLibc::Shared,
+        ));
+    }
     for dir in ["{out}/bin", "{out}/libexec"] {
         steps.push(Step::MkDir { path: dir.into() });
     }
@@ -160,25 +175,18 @@ pub fn recipe() -> Recipe {
         ],
         exec: true,
     });
-    steps.push(split_target_debug("{out}"));
+    steps.push(Step::split_debug_tree("{out}", "/usr/bin/objcopy"));
 
     Recipe::mesboot("openssh-x86-64", "10.5p1")
         .source_input("openssh-x86-64-source")
-        .native_inputs(&post_rust_inputs(
-            "gawk-x86-64-self",
-            &[
-                "gcc-x86-64-self",
-                "binutils-x86-64-self",
-                "glibc-x86-64",
-                "make-x86-64-self",
-            ],
-        ))
+        .build_root()
+        .native_inputs(&["glibc-x86-64", "gcc-runtime"])
         .steps(steps)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{recipe, AUTH_PASSWORD_DISABLED_C};
+    use super::{recipe, AUTH_PASSWORD_DISABLED_C, PROGRAMS};
     use crate::types::Step;
 
     #[test]
@@ -187,21 +195,12 @@ mod tests {
         assert_eq!(
             recipe.native_inputs.as_deref(),
             Some(
-                [
-                    "td-sh",
-                    "td-txt",
-                    "td-util",
-                    "uutils",
-                    "gawk-x86-64-self",
-                    "gcc-x86-64-self",
-                    "binutils-x86-64-self",
-                    "glibc-x86-64",
-                    "make-x86-64-self",
-                ]
-                .map(str::to_string)
-                .as_slice()
+                ["glibc-x86-64", "gcc-runtime"]
+                    .map(str::to_string)
+                    .as_slice()
             )
         );
+        assert!(recipe.build_root);
         let steps = recipe.steps.unwrap_or_default();
         let configure = steps.iter().find_map(|step| match step {
             Step::Run { argv, .. } if argv.iter().any(|arg| arg.ends_with("/configure")) => {
@@ -210,6 +209,33 @@ mod tests {
             _ => None,
         });
         let configure = configure.expect("OpenSSH configure invocation");
+        let crypt_off = steps.iter().any(|step| {
+            matches!(step, Step::Run { argv, env, .. }
+            if argv.iter().any(|arg| arg.ends_with("/configure"))
+                && ["ac_cv_lib_crypt_crypt", "ac_cv_func_crypt"].iter().all(|var| {
+                    env.iter().any(|(key, value)| key == var && value == "no")
+                }))
+        });
+        assert!(
+            crypt_off,
+            "configure must not find the build root's libcrypt"
+        );
+        let build_id = steps.iter().any(|step| {
+            matches!(step, Step::Run { argv, env, .. }
+                if argv.iter().any(|arg| arg.ends_with("/configure"))
+                    && env.iter().any(|(key, value)| key == "LDFLAGS"
+                        && value.contains("-Wl,--build-id=sha1")))
+        });
+        assert!(
+            build_id,
+            "configure's LDFLAGS must carry the SHA-1 build id"
+        );
+        let libraries_pinned = steps.iter().any(|step| {
+            matches!(step, Step::Run { argv, .. }
+                if argv.iter().any(|arg| arg.contains("for v in LIBS CHANNELLIBS")
+                    && arg.contains("SSHDLIBS")))
+        });
+        assert!(libraries_pinned, "configure's library lines must be pinned");
         for required in [
             "--without-openssl",
             "--without-zlib",
@@ -237,20 +263,47 @@ mod tests {
             );
         }
 
-        let build = steps.iter().find_map(|step| match step {
-            Step::Run { argv, .. }
-                if argv.first().is_some_and(|arg| arg.ends_with("/bin/make")) =>
-            {
-                Some(argv)
-            }
-            _ => None,
-        });
-        let build = build.expect("bounded OpenSSH make invocation");
+        let builds: Vec<_> = steps
+            .iter()
+            .filter_map(|step| match step {
+                Step::Run { argv, env, .. }
+                    if argv.first().is_some_and(|arg| arg.ends_with("/bin/make")) =>
+                {
+                    Some((argv, env))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(builds.len(), PROGRAMS.len(), "one make per program");
         for target in ["ssh", "sshd", "sshd-session", "sshd-auth", "ssh-keygen"] {
-            assert!(build.iter().any(|arg| arg == target), "missing {target}");
+            let map = format!("{{root}}/{target}.map");
+            let (link, _) = steps
+                .iter()
+                .enumerate()
+                .find(|(_, step)| {
+                    matches!(step, Step::Run { argv, env, .. }
+                        if argv.last().is_some_and(|arg| arg == target)
+                            && env.iter().any(|(key, value)| key == "TD_LINK_MAP" && *value == map))
+                })
+                .expect("the program's own make writes its map");
+            let checked = steps
+                .iter()
+                .position(|step| {
+                    matches!(step, Step::Run { argv, .. }
+                        if argv.iter().any(|arg| arg.contains(&format!("m='{map}'"))
+                            && arg.contains(&format!("= '{target}'"))
+                            && arg.contains("$sys/libc.so.6")))
+                })
+                .expect("link-map check");
+            assert!(link < checked, "{target}'s map is checked after its link");
         }
         for omitted in ["scp", "sftp", "sftp-server", "ssh-agent", "ssh-add"] {
-            assert!(!build.iter().any(|arg| arg == omitted), "built {omitted}");
+            assert!(
+                !builds
+                    .iter()
+                    .any(|(argv, _)| argv.iter().any(|arg| arg == omitted)),
+                "built {omitted}"
+            );
         }
 
         assert!(AUTH_PASSWORD_DISABLED_C.contains("return 0;"));
@@ -259,28 +312,6 @@ mod tests {
 
     #[test]
     fn compiler_policy_follows_package_flags() {
-        let wrapper = recipe()
-            .steps
-            .unwrap_or_default()
-            .into_iter()
-            .find_map(|step| match step {
-                Step::WriteFile { path, content, .. } if path == "{root}/wb/cc" => Some(content),
-                _ => None,
-            })
-            .expect("compiler wrapper");
-        let package_args = wrapper.find("\"$@\"").expect("package flags");
-        let policy = wrapper
-            .rfind("-fno-omit-frame-pointer")
-            .expect("target profile");
-        assert!(package_args < policy);
-        for required in [
-            "-static-libgcc",
-            "-g1",
-            "-ffile-prefix-map={root}=/td-build-root",
-            "-ffile-prefix-map={src}=/td-build",
-            "-Wl,--build-id=sha1",
-        ] {
-            assert!(wrapper.contains(required), "missing {required}");
-        }
+        crate::ladder::assert_build_root_dynamic_c(&recipe());
     }
 }

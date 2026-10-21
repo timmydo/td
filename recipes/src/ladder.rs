@@ -230,8 +230,28 @@ pub fn split_target_debug(root: &str) -> Step {
 /// gcc-runtime declared, no ladder toolchain or post-Rust tool farm, and
 /// the target profile after the package's flags.
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 pub(crate) fn assert_build_root_static_c(recipe: &Recipe) {
+    assert_build_root_c(recipe, &["-static -B{in:gcc-runtime}/lib/"]);
+}
+
+/// `assert_build_root_static_c` for `build_root_dynamic_cc`: td's libgcc,
+/// and td glibc's loader and RUNPATH.
+#[cfg(test)]
+pub(crate) fn assert_build_root_dynamic_c(recipe: &Recipe) {
+    assert_build_root_c(
+        recipe,
+        &[
+            "-static-libgcc -B{in:gcc-runtime}/lib/",
+            "-Wl,--enable-new-dtags",
+            &format!("-Wl,--dynamic-linker={BUILD_ROOT_GLIBC}/lib/ld-linux-x86-64.so.2"),
+            &format!("-Wl,-rpath,{BUILD_ROOT_GLIBC}/lib"),
+        ],
+    );
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+fn assert_build_root_c(recipe: &Recipe, runtime: &[&str]) {
     assert!(
         recipe.build_root,
         "{} must declare the build root",
@@ -274,10 +294,9 @@ pub(crate) fn assert_build_root_static_c(recipe: &Recipe) {
             _ => None,
         })
         .expect("compiler wrapper");
-    assert!(
-        wrapper.contains("-static -B{in:gcc-runtime}/lib/"),
-        "{wrapper}"
-    );
+    for flag in runtime {
+        assert!(wrapper.contains(flag), "{flag} missing from {wrapper}");
+    }
     let package = wrapper.find("\"$@\"").expect("package flags");
     let policy = wrapper
         .find("-fno-omit-frame-pointer")
@@ -790,7 +809,7 @@ pub const BUILD_ROOT_GLIBC: &str = "{in:glibc-x86-64}/stage/td/store/glibc-2.41-
 /// resolve there (gcc's freestanding headers excepted). A probe's libgcc
 /// is still Debian's: probe programs are build-only.
 pub fn build_root_glibc_cc() -> Vec<Step> {
-    build_root_cc(false)
+    build_root_cc(BuildRootLink::Probe)
 }
 
 /// `build_root_glibc_cc` for static links that ship: `-static`, and
@@ -800,27 +819,61 @@ pub fn build_root_glibc_cc() -> Vec<Step> {
 /// by `build_root_link_map_check`, is the proof. The recipe declares
 /// `gcc-runtime`. With `TD_LINK_MAP` set, a link writes its map there.
 pub fn build_root_static_cc() -> Vec<Step> {
-    build_root_cc(true)
+    build_root_cc(BuildRootLink::Static)
 }
 
-fn build_root_cc(static_runtime: bool) -> Vec<Step> {
-    let wrapper_runtime = if static_runtime {
-        "-static -B{in:gcc-runtime}/lib/ ${TD_LINK_MAP:+-Wl,-Map=$TD_LINK_MAP} "
+/// `build_root_glibc_cc` for dynamic executables that ship: `-static-libgcc`
+/// with gcc-runtime's directory ahead of gcc's own, so `crtbeginS.o`,
+/// `crtendS.o`, `libgcc.a` and `libgcc_eh.a` are td's, and td glibc's loader
+/// and DT_RUNPATH. As with `build_root_static_cc`, the guard is a prefilter and
+/// the link map is the proof; the recipe declares `gcc-runtime`.
+pub fn build_root_dynamic_cc() -> Vec<Step> {
+    build_root_cc(BuildRootLink::Dynamic)
+}
+
+#[derive(Clone, Copy)]
+enum BuildRootLink {
+    Probe,
+    Static,
+    Dynamic,
+}
+
+fn build_root_cc(link: BuildRootLink) -> Vec<Step> {
+    let wrapper_runtime = match link {
+        BuildRootLink::Probe => String::new(),
+        BuildRootLink::Static => {
+            "-static -B{in:gcc-runtime}/lib/ ${TD_LINK_MAP:+-Wl,-Map=$TD_LINK_MAP} ".to_string()
+        }
+        BuildRootLink::Dynamic => format!(
+            "-static-libgcc -B{{in:gcc-runtime}}/lib/ \
+             -Wl,--dynamic-linker={BUILD_ROOT_GLIBC}/lib/ld-linux-x86-64.so.2 \
+             -Wl,--enable-new-dtags -Wl,-rpath,{BUILD_ROOT_GLIBC}/lib \
+             ${{TD_LINK_MAP:+-Wl,-Map=$TD_LINK_MAP}} "
+        ),
+    };
+    let runtime_objects = match link {
+        BuildRootLink::Probe => None,
+        BuildRootLink::Static => Some("crtbeginT.o crtend.o libgcc.a libgcc_eh.a"),
+        BuildRootLink::Dynamic => Some("crtbeginS.o crtendS.o libgcc.a libgcc_eh.a"),
+    };
+    let guard_runtime = runtime_objects
+        .map(|objects| {
+            format!(
+                "rt=$(realpath -m '{{in:gcc-runtime}}/lib'); \
+                 for f in {objects}; do \
+                 case $(realpath -m \"$(\"$cc\" -print-file-name=$f)\") in \
+                 \"$rt\"/*) ;; \
+                 *) echo \"$f resolves outside gcc-runtime\" >&2; exit 1;; esac; done; "
+            )
+        })
+        .unwrap_or_default();
+    let guard_libc_a = if matches!(link, BuildRootLink::Static) {
+        " libc.a"
     } else {
         ""
     };
-    let guard_runtime = if static_runtime {
-        "rt=$(realpath -m '{in:gcc-runtime}/lib'); \
-         for f in crtbeginT.o crtend.o libgcc.a libgcc_eh.a; do \
-         case $(realpath -m \"$(\"$cc\" -print-file-name=$f)\") in \
-         \"$rt\"/*) ;; \
-         *) echo \"$f resolves outside gcc-runtime\" >&2; exit 1;; esac; done; "
-    } else {
-        ""
-    };
-    let guard_libc_a = if static_runtime { " libc.a" } else { "" };
     let mut guard = String::from("set -e; cc='{root}/wb/cc'; ");
-    guard.push_str(guard_runtime);
+    guard.push_str(&guard_runtime);
     guard.push_str("for f in crt1.o Scrt1.o crti.o crtn.o libc.so libc.so.6");
     guard.push_str(guard_libc_a);
     guard.push_str(
@@ -877,13 +930,43 @@ fn build_root_cc(static_runtime: bool) -> Vec<Step> {
     ]
 }
 
-/// A step proving, from the map `build_root_static_cc` wrote at `map`, that
-/// the link which produced `output` loaded nothing from the Debian root.
-/// The map must record that one output, and every loaded file, resolved
-/// from `dir` where the link ran, must lie under the build directory or one
-/// of `inputs` (recipe input names); libgcc and libc must be gcc-runtime's
-/// and the sysroot's. The root's own store path is never an input.
-pub fn build_root_link_map_check(dir: &str, map: &str, output: &str, inputs: &[&str]) -> Step {
+/// The td glibc a build-root link must load from the sysroot.
+#[derive(Clone, Copy)]
+pub enum LinkedLibc {
+    /// `libc.a`: a `build_root_static_cc` link.
+    Archive,
+    /// `libc.so.6`: a `build_root_dynamic_cc` link.
+    Shared,
+}
+
+impl LinkedLibc {
+    fn file(self) -> &'static str {
+        match self {
+            LinkedLibc::Archive => "libc.a",
+            LinkedLibc::Shared => "libc.so.6",
+        }
+    }
+}
+
+/// A step proving, from the map a link through a build-root wrapper
+/// (`-Wl,-Map`, or `TD_LINK_MAP` for `build_root_static_cc` and
+/// `build_root_dynamic_cc`) wrote at `map`, that the link which produced
+/// `output` loaded nothing from the Debian root. The map must record that
+/// one output, and every input file (a `LOAD` line), resolved from `dir`
+/// where the link ran, must lie under the build directory, the source
+/// directory or one of `inputs` (recipe input names); libgcc.a must be
+/// gcc-runtime's and `libc` the sysroot's. The root's own store path is
+/// never an input. A library ld opens only to check an input DSO's
+/// DT_NEEDED prints no `LOAD` line; it contributes no bytes or DT_NEEDED,
+/// and today td libc.so.6's one dependency, the loader, is itself an input.
+pub fn build_root_link_map_check(
+    dir: &str,
+    map: &str,
+    output: &str,
+    inputs: &[&str],
+    libc: LinkedLibc,
+) -> Step {
+    let libc = libc.file();
     let allowed: String = inputs
         .iter()
         .map(|input| format!(" \"$(realpath -m '{{in:{input}}}')\""))
@@ -906,10 +989,10 @@ pub fn build_root_link_map_check(dir: &str, map: &str, output: &str, inputs: &[&
                  [ \"$f\" = 'linker stubs' ] && continue; r=$(realpath -m \"$f\"); ok=0; \
                  for a in \"$@\"; do [ -n \"$a\" ] || continue; case $r in \"$a\"/*) ok=1;; esac; done; \
                  [ $ok = 1 ] || fail \"loaded $f from outside the build and its inputs\"; \
-                 [ \"$r\" = \"$rt/libgcc.a\" ] && gcc=1; [ \"$r\" = \"$sys/libc.a\" ] && libc=1; \
+                 [ \"$r\" = \"$rt/libgcc.a\" ] && gcc=1; [ \"$r\" = \"$sys/{libc}\" ] && libc=1; \
                  done < \"$m\"; \
                  [ $gcc = 1 ] || fail \"did not load gcc-runtime's libgcc.a\"; \
-                 [ $libc = 1 ] || fail \"did not load td glibc's libc.a\""
+                 [ $libc = 1 ] || fail \"did not load td glibc's {libc}\""
             ),
         ],
     )
@@ -2006,15 +2089,26 @@ mod tests {
             "{root}/out.map",
             "prog.static",
             &["gcc-runtime", "popt-x86-64"],
+            super::LinkedLibc::Archive,
         );
-        let Step::Run { argv, .. } = step else {
-            panic!("the map check is a run step");
+        let shared = super::build_root_link_map_check(
+            "{src}",
+            "{root}/out.map",
+            "prog",
+            &["gcc-runtime"],
+            super::LinkedLibc::Shared,
+        );
+        let script = |step: Step| {
+            let Step::Run { argv, .. } = step else {
+                panic!("the map check is a run step");
+            };
+            argv[2]
+                .replace("{root}", &root)
+                .replace("{src}", &src)
+                .replace("{in:gcc-runtime}", &format!("{store}/gcc-runtime"))
+                .replace("{in:popt-x86-64}", &format!("{store}/popt-x86-64"))
         };
-        let script = argv[2]
-            .replace("{root}", &root)
-            .replace("{src}", &src)
-            .replace("{in:gcc-runtime}", &format!("{store}/gcc-runtime"))
-            .replace("{in:popt-x86-64}", &format!("{store}/popt-x86-64"));
+        let (script, shared) = (script(step), script(shared));
         for dir in [&src, &format!("{root}/sysroot/lib")] {
             std::fs::create_dir_all(dir).unwrap();
         }
@@ -2049,12 +2143,43 @@ mod tests {
                 clean.replace(&format!("LOAD {store}/gcc-runtime/lib/libgcc.a\n"), ""),
                 Some("did not load gcc-runtime's libgcc.a"),
             ),
+            (
+                clean.replace(&format!("LOAD {root}/sysroot/lib/libc.a\n"), ""),
+                Some("did not load td glibc's libc.a"),
+            ),
         ];
-        for (map, refusal) in cases {
+        let dynamic = format!(
+            "OUTPUT(prog elf64-x86-64)\nLOAD {store}/gcc-runtime/lib/libgcc.a\n\
+             LOAD {root}/sysroot/lib/libc.so.6\nLOAD {root}/sysroot/lib/libc_nonshared.a\n\
+             LOAD {root}/sysroot/lib/ld-linux-x86-64.so.2\nLOAD prog.o\n"
+        );
+        let shared_cases = [
+            (dynamic.clone(), None),
+            (
+                dynamic.replace(
+                    &format!("{root}/sysroot/lib/libc.so.6"),
+                    "/lib/x86_64-linux-gnu/libc.so.6",
+                ),
+                Some("from outside the build"),
+            ),
+            (
+                dynamic.replace("libc.so.6", "libc.a"),
+                Some("did not load td glibc's libc.so.6"),
+            ),
+        ];
+        let runs = cases
+            .into_iter()
+            .map(|(map, refusal)| (&script, map, refusal))
+            .chain(
+                shared_cases
+                    .into_iter()
+                    .map(|(map, refusal)| (&shared, map, refusal)),
+            );
+        for (script, map, refusal) in runs {
             std::fs::write(format!("{root}/out.map"), &map).unwrap();
             let run = std::process::Command::new("sh")
                 .arg("-c")
-                .arg(&script)
+                .arg(script)
                 .current_dir(&src)
                 .output()
                 .unwrap();
