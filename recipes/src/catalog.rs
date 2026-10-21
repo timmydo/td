@@ -581,6 +581,30 @@ mod tests {
         }
     }
 
+    /// A build-root recipe that splits companions links code that ships, and
+    /// takes its start files and libgcc from gcc-runtime; the profiler's
+    /// boundary list names exactly those recipes.
+    #[test]
+    fn build_root_linked_outputs_match_the_profile_boundary() {
+        let mut linked: Vec<&str> = all()
+            .into_iter()
+            .filter(|(_, recipe)| {
+                recipe.build_root
+                    && recipe
+                        .steps
+                        .as_deref()
+                        .unwrap_or_default()
+                        .iter()
+                        .any(|step| matches!(step, crate::types::Step::SplitDebugTree { .. }))
+            })
+            .map(|(stem, _)| stem)
+            .collect();
+        linked.sort_unstable();
+        let mut expected = td_engine::target_profile::BUILD_ROOT_LINKED.to_vec();
+        expected.sort_unstable();
+        assert_eq!(linked, expected);
+    }
+
     #[test]
     fn the_deployment_has_an_external_debug_ceiling() {
         for (stem, expected_scope, expected_report, expected_ceiling) in [(

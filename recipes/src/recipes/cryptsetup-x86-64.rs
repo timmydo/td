@@ -1,6 +1,6 @@
 use crate::ladder::{
-    post_rust_inputs, post_rust_tool_farm, split_target_debug, unpack_into, unpack_keep_top,
-    POST_RUST_SH,
+    build_root_link_map_check, build_root_static_cc, unpack_into, unpack_keep_top, BUILD_ROOT_PATH,
+    BUILD_ROOT_SH as SH,
 };
 use crate::types::{Recipe, Step};
 
@@ -12,9 +12,10 @@ use crate::types::{Recipe, Step};
 // veritysetup and integritysetup are disabled; LUKS2 re-encryption stays.
 //
 // The whole static closure (json-c, popt, libdevmapper, util-linux's libuuid
-// and libblkid) is compiled by the self-hosted toolchain under the shipped
-// target profile, and the binary is split into a runtime and a debug
-// companion (td-profiler/DESIGN.md §2). The system image binds it at
+// and libblkid) is compiled in the Debian build root against td glibc under
+// the shipped target profile; the link takes td's start files and libgcc
+// from gcc-runtime, which the link-map check proves, and the binary is split
+// into a runtime and a debug companion (td-profiler/DESIGN.md §2). The system image binds it at
 // /bin/cryptsetup for the installer's device-bound formatting, with the
 // build-time binding D7 requires of mkfs.btrfs (DESIGN.md D6).
 /// The exact feature line the realized binary must report: blkid signature
@@ -22,43 +23,23 @@ use crate::types::{Recipe, Step};
 pub const VERSION_LINE: &str = "cryptsetup 2.8.8 flags: BLKID KERNEL_CAPI ";
 
 pub fn recipe() -> Recipe {
-    let sgcc = "{in:gcc-x86-64-self}/stage/td/store/gcc-14.3.0-x86_64-self/bin/gcc";
-    let xglibc = "{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64";
-    let sbin = "{in:binutils-x86-64-self}/bin";
     let ul = "{in:util-linux-libs-x86-64}";
     let jc = "{in:json-c-x86-64}";
     let popt = "{in:popt-x86-64}";
     let dm = "{in:libdevmapper-x86-64}";
-    let path = format!("{{root}}/wb:{{tools}}:{{in:make-x86-64-self}}/bin:{sbin}");
-    let cip = format!(
-        "{ul}/include:{jc}/include:{popt}/include:{dm}/include:{xglibc}/include:{{root}}/kh"
-    );
+    let path = format!("{{root}}/wb:{BUILD_ROOT_PATH}");
+    let cip = format!("{ul}/include:{jc}/include:{popt}/include:{dm}/include:{{root}}/kh");
+    let ldflags = format!("-L{ul}/lib -L{jc}/lib -L{popt}/lib -L{dm}/lib -Wl,--build-id=sha1");
 
     let mut steps = unpack_into("cryptsetup-x86-64-source", "{src}");
     steps.extend(unpack_keep_top("linux-headers-x86-64", "{root}/kh"));
-    steps.push(post_rust_tool_farm("{in:gawk-x86-64-self}/bin/gawk"));
-    steps.push(Step::PatchShebangs {
-        dir: "{src}".into(),
-        shell: POST_RUST_SH.into(),
-    });
-    steps.push(Step::WriteFile {
-        path: "{root}/wb/cc".into(),
-        content: format!(
-            "#!{POST_RUST_SH}\nexec \"{sgcc}\" -static -B\"{sbin}/\" -B{xglibc}/lib -L{xglibc}/lib \
-             -L{ul}/lib -L{jc}/lib -L{popt}/lib -L{dm}/lib \"$@\" \
-             -fno-omit-frame-pointer -g1 \
-             -ffile-prefix-map={{root}}=/td-build-root \
-             -ffile-prefix-map={{src}}=/td-build \
-             -Wl,--build-id=sha1\n"
-        ),
-        exec: true,
-    });
+    steps.extend(build_root_static_cc());
     // The release configure script queries pkg-config for these four modules;
     // every answer names an explicit recipe input.
     steps.push(Step::WriteFile {
         path: "{root}/wb/pkg-config".into(),
         content: format!(
-            "#!{POST_RUST_SH}\n\
+            "#!{SH}\n\
              mod=''; cflags=0; libs=0; version=0\n\
              for a in \"$@\"; do\n\
              \tcase \"$a\" in\n\
@@ -90,7 +71,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{src}",
             &[
-                POST_RUST_SH,
+                SH,
                 "./configure",
                 "--build=x86_64-pc-linux-gnu",
                 "--host=x86_64-pc-linux-gnu",
@@ -116,13 +97,14 @@ pub fn recipe() -> Recipe {
             ],
         )
         .env("PATH", &path)
-        .env("CONFIG_SHELL", POST_RUST_SH)
-        .env("SHELL", POST_RUST_SH)
+        .env("CONFIG_SHELL", SH)
+        .env("SHELL", SH)
         .env("CC", "{root}/wb/cc")
         .env("CC_FOR_BUILD", "{root}/wb/cc")
-        .env("AR", "{in:binutils-x86-64-self}/bin/ar")
-        .env("RANLIB", "{in:binutils-x86-64-self}/bin/ranlib")
+        .env("AR", "/usr/bin/ar")
+        .env("RANLIB", "/usr/bin/ranlib")
         .env("PKG_CONFIG", "{root}/wb/pkg-config")
+        .env("LDFLAGS", &ldflags)
         .env("C_INCLUDE_PATH", &cip)
         .env("SOURCE_DATE_EPOCH", "1"),
     );
@@ -130,17 +112,18 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{src}",
             &[
-                "{in:make-x86-64-self}/bin/make",
+                "/usr/bin/make",
                 "-j{jobs}",
                 "cryptsetup.static",
-                &format!("SHELL={POST_RUST_SH}"),
-                &format!("CONFIG_SHELL={POST_RUST_SH}"),
+                &format!("SHELL={SH}"),
+                &format!("CONFIG_SHELL={SH}"),
             ],
         )
         .env("PATH", &path)
         .env("CC", "{root}/wb/cc")
-        .env("AR", "{in:binutils-x86-64-self}/bin/ar")
-        .env("RANLIB", "{in:binutils-x86-64-self}/bin/ranlib")
+        .env("AR", "/usr/bin/ar")
+        .env("RANLIB", "/usr/bin/ranlib")
+        .env("TD_LINK_MAP", "{root}/cryptsetup.map")
         .env("C_INCLUDE_PATH", &cip)
         .env("SOURCE_DATE_EPOCH", "1"),
     );
@@ -159,16 +142,29 @@ pub fn recipe() -> Recipe {
         paths: vec!["{out}/bin/cryptsetup".into()],
         exec: true,
     });
-    steps.push(split_target_debug("{out}"));
+    steps.push(build_root_link_map_check(
+        "{src}",
+        "{root}/cryptsetup.map",
+        "cryptsetup.static",
+        &[
+            "gcc-runtime",
+            "glibc-x86-64",
+            "util-linux-libs-x86-64",
+            "json-c-x86-64",
+            "popt-x86-64",
+            "libdevmapper-x86-64",
+        ],
+    ));
+    steps.push(Step::split_debug_tree("{out}", "/usr/bin/objcopy"));
     steps.push(Step::assert_static(&["{out}/bin/cryptsetup"]));
     steps.push(
         Step::run(
             "{out}",
             &[
-                POST_RUST_SH,
+                SH,
                 "-c",
                 &format!(
-                    "h=$('{{in:binutils-x86-64-self}}/bin/readelf' -h bin/cryptsetup); \
+                    "h=$('/usr/bin/readelf' -h bin/cryptsetup); \
                      printf '%s\\n' \"$h\" | grep -i 'class:' | grep -qi 'ELF64' || {{ echo 'cryptsetup is not ELF64' >&2; exit 1; }}; \
                      printf '%s\\n' \"$h\" | grep -i 'machine:' | grep -qi 'x86-64' || {{ echo 'cryptsetup is not x86-64' >&2; exit 1; }}; \
                      v=$(bin/cryptsetup --version) || exit 1; \
@@ -181,19 +177,15 @@ pub fn recipe() -> Recipe {
 
     Recipe::mesboot("cryptsetup-x86-64", "2.8.8")
         .source_input("cryptsetup-x86-64-source")
-        .native_inputs(&post_rust_inputs(
-            "gawk-x86-64-self",
-            &[
-                "util-linux-libs-x86-64",
-                "json-c-x86-64",
-                "popt-x86-64",
-                "libdevmapper-x86-64",
-                "gcc-x86-64-self",
-                "binutils-x86-64-self",
-                "glibc-x86-64",
-                "make-x86-64-self",
-            ],
-        ))
+        .build_root()
+        .native_inputs(&[
+            "util-linux-libs-x86-64",
+            "json-c-x86-64",
+            "popt-x86-64",
+            "libdevmapper-x86-64",
+            "glibc-x86-64",
+            "gcc-runtime",
+        ])
         .inputs(&["linux-headers-x86-64"])
         .steps(steps)
 }
@@ -206,10 +198,9 @@ mod tests {
     #[test]
     fn shipped_binary_follows_the_target_profile_and_is_split() {
         let recipe = recipe();
+        crate::ladder::assert_build_root_static_c(&recipe);
         let inputs = recipe.native_inputs.clone().unwrap_or_default();
         for required in [
-            "gcc-x86-64-self",
-            "binutils-x86-64-self",
             "util-linux-libs-x86-64",
             "json-c-x86-64",
             "popt-x86-64",
@@ -217,34 +208,32 @@ mod tests {
         ] {
             assert!(inputs.iter().any(|input| input == required), "{required}");
         }
-        for bootstrap in ["gcc-x86-64-native", "binutils-x86-64-native"] {
-            assert!(
-                !inputs.iter().any(|input| input == bootstrap),
-                "{bootstrap}"
-            );
-        }
         let steps = recipe.steps.unwrap_or_default();
-        let wrapper = steps
+        let link = steps
             .iter()
             .find_map(|step| match step {
-                Step::WriteFile { path, content, .. } if path == "{root}/wb/cc" => Some(content),
+                Step::Run { argv, env, .. }
+                    if argv.iter().any(|arg| arg == "cryptsetup.static") =>
+                {
+                    Some(env)
+                }
                 _ => None,
             })
-            .expect("compiler wrapper");
-        let package = wrapper.find("\"$@\"").expect("package flags");
-        let policy = wrapper
-            .find("-fno-omit-frame-pointer")
-            .expect("target profile");
-        assert!(package < policy, "package flags could override the profile");
-        for required in [
-            "-g1",
-            "-ffile-prefix-map={root}=/td-build-root",
-            "-ffile-prefix-map={src}=/td-build",
-            "-Wl,--build-id=sha1",
-            "-B\"{in:binutils-x86-64-self}/bin/\"",
-        ] {
-            assert!(wrapper.contains(required), "missing {required}");
-        }
+            .expect("link step");
+        assert!(
+            link.iter()
+                .any(|(key, value)| key == "TD_LINK_MAP" && value == "{root}/cryptsetup.map"),
+            "the final link must write the map the check reads"
+        );
+        let configure_ldflags = steps.iter().any(|step| {
+            matches!(step, Step::Run { env, .. }
+                if env.iter().any(|(key, value)| key == "LDFLAGS" && value.contains("-Wl,--build-id=sha1")))
+        });
+        assert!(configure_ldflags, "the build id must reach the link");
+        let mapped = steps
+            .iter()
+            .position(|step| matches!(step, Step::Run { argv, .. } if argv.iter().any(|arg| arg.contains("link map $m"))))
+            .expect("link-map check");
         let split = steps
             .iter()
             .position(|step| matches!(step, Step::SplitDebugTree { root, .. } if root == "{out}"))
@@ -254,6 +243,7 @@ mod tests {
             .position(|step| matches!(step, Step::CopyFiles { dest, .. } if dest == "{out}/bin"))
             .expect("install");
         assert!(installed < split, "the split must see the installed binary");
+        assert!(mapped < split, "the link map is checked before the split");
         let checked = steps
             .iter()
             .position(|step| matches!(step, Step::AssertStatic { .. }))

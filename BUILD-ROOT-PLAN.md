@@ -158,6 +158,11 @@ deleted; its findings are summarized under "Facts" below.
    only), curl, Git 2.55.0; popt, libdevmapper, util-linux libs,
    cryptsetup (static, as today); OpenSSH (`--without-openssl`). One
    landing per stack (git, cryptsetup, ssh).
+   A static link that ships uses `ladder::build_root_static_cc`: Debian
+   gcc with td glibc's sysroot and gcc-runtime's `crtbeginT.o`,
+   `libgcc.a` and `libgcc_eh.a` ahead of the root's, and
+   `build_root_link_map_check` proves from the final link's map that
+   nothing was loaded from the root. Landed: the cryptsetup stack.
    8b. **glibc in the build root.** `glibc-x86-64` rebuilt in the root
    (same 2.41 source, frame pointers, companions; the root gains gawk
    and python3). Its link uses a static libgcc built from td glibc's

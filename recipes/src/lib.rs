@@ -46,6 +46,9 @@ pub mod td_civil_tzif;
 pub mod td_fs;
 #[path = "../../td-install/src/timezones.rs"]
 pub mod td_install_timezones;
+#[cfg(test)]
+#[path = "../../td-fs/src/temp_dir.rs"]
+mod test_temp;
 
 // Keep the native guest oracle contract inside the catalog dependency scan.
 #[path = "../../td-install-qemu-test/src/protocol.rs"]

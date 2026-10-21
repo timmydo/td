@@ -143,6 +143,10 @@ pub const RUST_PROFILED_RECIPES: &[&str] = &[
     "uutils",
 ];
 
+/// Build-root outputs that link gcc-runtime's start files and libgcc in
+/// place of GCC's.
+pub const BUILD_ROOT_LINKED: &[&str] = &["gcc-runtime", "zlib-x86-64", "cryptsetup-x86-64"];
+
 /// Conservative transitive assembly boundaries for a linked output. Every
 /// split target may contain glibc startup code and libgcc; Rust outputs also
 /// contain standard-library/compiler-runtime code.
@@ -156,12 +160,9 @@ pub fn output_assembly_exceptions(recipe: &str) -> Vec<(&'static str, &'static s
                 || (*source == "gcc-x86-64-native"
                     && matches!(recipe, "binutils-x86-64-self" | "gcc-x86-64-self"))
                 || (*source == "gcc-x86-64-self"
-                    && !matches!(
-                        recipe,
-                        "glibc-x86-64" | "binutils-x86-64-self" | "gcc-runtime" | "zlib-x86-64"
-                    ))
-                // Build-root C links gcc-runtime's start files, not GCC's.
-                || (*source == "gcc-runtime" && matches!(recipe, "gcc-runtime" | "zlib-x86-64"))
+                    && !matches!(recipe, "glibc-x86-64" | "binutils-x86-64-self")
+                    && !BUILD_ROOT_LINKED.contains(&recipe))
+                || (*source == "gcc-runtime" && BUILD_ROOT_LINKED.contains(&recipe))
                 || (*source == "rust-toolchain" && RUST_PROFILED_RECIPES.contains(&recipe))
                 // A package's own crate assembly reaches that package alone.
                 || (*source == recipe && recipe == "td-net")
@@ -413,7 +414,7 @@ mod tests {
                 ("gcc-x86-64-self", "upstream GCC libgcc x86_64 assembly"),
             ]
         );
-        for stem in ["gcc-runtime", "zlib-x86-64"] {
+        for stem in BUILD_ROOT_LINKED {
             assert_eq!(
                 output_assembly_exceptions(stem),
                 vec![

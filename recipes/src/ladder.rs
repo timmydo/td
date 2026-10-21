@@ -226,6 +226,72 @@ pub fn split_target_debug(root: &str) -> Step {
     Step::split_debug_tree(root, "{in:binutils-x86-64-self}/bin/objcopy")
 }
 
+/// A build-root C recipe that uses `build_root_static_cc`: td glibc and
+/// gcc-runtime declared, no ladder toolchain or post-Rust tool farm, and
+/// the target profile after the package's flags.
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+pub(crate) fn assert_build_root_static_c(recipe: &Recipe) {
+    assert!(
+        recipe.build_root,
+        "{} must declare the build root",
+        recipe.name
+    );
+    let inputs = recipe.native_inputs.clone().unwrap_or_default();
+    for required in ["glibc-x86-64", "gcc-runtime"] {
+        assert!(inputs.iter().any(|input| input == required), "{required}");
+    }
+    for ladder in [
+        "gcc-x86-64-self",
+        "binutils-x86-64-self",
+        "make-x86-64-self",
+        "gcc-x86-64-native",
+        "binutils-x86-64-native",
+        "gawk-x86-64-self",
+    ]
+    .into_iter()
+    .chain(POST_RUST_TOOLS.iter().map(|(input, _, _)| *input))
+    {
+        assert!(!inputs.iter().any(|input| input == ladder), "{ladder}");
+    }
+    assert!(
+        !recipe
+            .steps
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|step| matches!(step, Step::ToolFarm { .. })),
+        "{} builds on the post-Rust tool farm",
+        recipe.name
+    );
+    let wrapper = recipe
+        .steps
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .find_map(|step| match step {
+            Step::WriteFile { path, content, .. } if path == "{root}/wb/cc" => Some(content),
+            _ => None,
+        })
+        .expect("compiler wrapper");
+    assert!(
+        wrapper.contains("-static -B{in:gcc-runtime}/lib/"),
+        "{wrapper}"
+    );
+    let package = wrapper.find("\"$@\"").expect("package flags");
+    let policy = wrapper
+        .find("-fno-omit-frame-pointer")
+        .expect("target profile");
+    assert!(package < policy, "package flags could override the profile");
+    for required in [
+        "-g1",
+        "-ffile-prefix-map={root}=/td-build-root",
+        "-ffile-prefix-map={src}=/td-build",
+    ] {
+        assert!(wrapper.contains(required), "missing {required}");
+    }
+}
+
 /// A direct-rustc recipe stages its sibling crates file by file, so a module
 /// added to one must be staged too or the recipe build fails: every file
 /// under each `crates/src` must be written at `{src}/CRATE/src/FILE`.
@@ -724,6 +790,51 @@ pub const BUILD_ROOT_GLIBC: &str = "{in:glibc-x86-64}/stage/td/store/glibc-2.41-
 /// resolve there (gcc's freestanding headers excepted). A probe's libgcc
 /// is still Debian's: probe programs are build-only.
 pub fn build_root_glibc_cc() -> Vec<Step> {
+    build_root_cc(false)
+}
+
+/// `build_root_glibc_cc` for static links that ship: `-static`, and
+/// gcc-runtime's directory ahead of gcc's own, so `crtbeginT.o`, `libgcc.a`
+/// and `libgcc_eh.a` are td's. The guard checks where gcc's startfile search
+/// finds them; ld searches the user `-L` dirs first, so the link's map, read
+/// by `build_root_link_map_check`, is the proof. The recipe declares
+/// `gcc-runtime`. With `TD_LINK_MAP` set, a link writes its map there.
+pub fn build_root_static_cc() -> Vec<Step> {
+    build_root_cc(true)
+}
+
+fn build_root_cc(static_runtime: bool) -> Vec<Step> {
+    let wrapper_runtime = if static_runtime {
+        "-static -B{in:gcc-runtime}/lib/ ${TD_LINK_MAP:+-Wl,-Map=$TD_LINK_MAP} "
+    } else {
+        ""
+    };
+    let guard_runtime = if static_runtime {
+        "rt=$(realpath -m '{in:gcc-runtime}/lib'); \
+         for f in crtbeginT.o crtend.o libgcc.a libgcc_eh.a; do \
+         case $(realpath -m \"$(\"$cc\" -print-file-name=$f)\") in \
+         \"$rt\"/*) ;; \
+         *) echo \"$f resolves outside gcc-runtime\" >&2; exit 1;; esac; done; "
+    } else {
+        ""
+    };
+    let guard_libc_a = if static_runtime { " libc.a" } else { "" };
+    let mut guard = String::from("set -e; cc='{root}/wb/cc'; ");
+    guard.push_str(guard_runtime);
+    guard.push_str("for f in crt1.o Scrt1.o crti.o crtn.o libc.so libc.so.6");
+    guard.push_str(guard_libc_a);
+    guard.push_str(
+        "; do \
+         case $(realpath -m \"$(\"$cc\" -print-file-name=$f)\") in \
+         '{root}/sysroot/lib/'*) ;; \
+         *) echo \"$f resolves outside the sysroot\" >&2; exit 1;; esac; done; \
+         inc=$(\"$cc\" -E -v -x c /dev/null 2>&1 >/dev/null | \
+         sed -n '/^#include <...> search starts here:$/,/^End of search list.$/p' | sed '1d;$d'); \
+         [ -n \"$inc\" ] || { echo 'no include search dirs' >&2; exit 1; }; \
+         for d in $inc; do case $(realpath -m \"$d\") in \
+         '{root}/sysroot/'*|/usr/lib/gcc/x86_64-linux-gnu/*) ;; \
+         *) echo \"include dir outside the sysroot: $d\" >&2; exit 1;; esac; done",
+    );
     vec![
         Step::CopyTree {
             from: format!("{BUILD_ROOT_GLIBC}/include"),
@@ -755,33 +866,54 @@ pub fn build_root_glibc_cc() -> Vec<Step> {
         Step::WriteFile {
             path: "{root}/wb/cc".into(),
             content: format!(
-                "#!{BUILD_ROOT_SH}\nexec /usr/bin/gcc --sysroot={{root}}/sysroot \
+                "#!{BUILD_ROOT_SH}\nexec /usr/bin/gcc --sysroot={{root}}/sysroot {wrapper_runtime}\
                  -isystem {{root}}/sysroot/include -B{{root}}/sysroot/lib/ -L{{root}}/sysroot/lib \
                  \"$@\" -fno-omit-frame-pointer -g1 \
                  -ffile-prefix-map={{root}}=/td-build-root -ffile-prefix-map={{src}}=/td-build\n"
             ),
             exec: true,
         },
-        Step::run(
-            "{root}",
-            &[
-                BUILD_ROOT_SH,
-                "-c",
-                "set -e; cc='{root}/wb/cc'; \
-                 for f in crt1.o Scrt1.o crti.o crtn.o libc.so libc.so.6; do \
-                 case $(realpath -m \"$(\"$cc\" -print-file-name=$f)\") in \
-                 '{root}/sysroot/lib/'*) ;; \
-                 *) echo \"$f resolves outside the sysroot\" >&2; exit 1;; esac; done; \
-                 inc=$(\"$cc\" -E -v -x c /dev/null 2>&1 >/dev/null | \
-                 sed -n '/^#include <...> search starts here:$/,/^End of search list.$/p' | sed '1d;$d'); \
-                 [ -n \"$inc\" ] || { echo 'no include search dirs' >&2; exit 1; }; \
-                 for d in $inc; do case $(realpath -m \"$d\") in \
-                 '{root}/sysroot/'*|/usr/lib/gcc/x86_64-linux-gnu/*) ;; \
-                 *) echo \"include dir outside the sysroot: $d\" >&2; exit 1;; esac; done",
-            ],
-        )
-        .env("PATH", BUILD_ROOT_PATH),
+        Step::run("{root}", &[BUILD_ROOT_SH, "-c", &guard]).env("PATH", BUILD_ROOT_PATH),
     ]
+}
+
+/// A step proving, from the map `build_root_static_cc` wrote at `map`, that
+/// the link which produced `output` loaded nothing from the Debian root.
+/// The map must record that one output, and every loaded file, resolved
+/// from `dir` where the link ran, must lie under the build directory or one
+/// of `inputs` (recipe input names); libgcc and libc must be gcc-runtime's
+/// and the sysroot's. The root's own store path is never an input.
+pub fn build_root_link_map_check(dir: &str, map: &str, output: &str, inputs: &[&str]) -> Step {
+    let allowed: String = inputs
+        .iter()
+        .map(|input| format!(" \"$(realpath -m '{{in:{input}}}')\""))
+        .collect();
+    Step::run(
+        dir,
+        &[
+            BUILD_ROOT_SH,
+            "-c",
+            &format!(
+                "set -e; m='{map}'; fail() {{ echo \"link map $m: $*\" >&2; exit 1; }}; \
+                 [ -s \"$m\" ] || fail 'missing'; \
+                 outs=$(grep -c '^OUTPUT(' \"$m\" || true); [ \"$outs\" = 1 ] || fail \"records $outs outputs\"; \
+                 o=$(sed -n 's/^OUTPUT(\\([^ ]*\\) .*/\\1/p' \"$m\"); [ \"${{o##*/}}\" = '{output}' ] || fail \"is the link of $o\"; \
+                 set -- \"$(realpath -m '{{root}}')\" \"$(realpath -m '{{src}}')\"{allowed}; \
+                 rt=$(realpath -m '{{in:gcc-runtime}}/lib'); sys=$(realpath -m '{{root}}/sysroot/lib'); \
+                 gcc=0; libc=0; \
+                 while IFS= read -r line; do \
+                 case $line in 'LOAD '*) f=${{line#LOAD }};; *) continue;; esac; \
+                 [ \"$f\" = 'linker stubs' ] && continue; r=$(realpath -m \"$f\"); ok=0; \
+                 for a in \"$@\"; do [ -n \"$a\" ] || continue; case $r in \"$a\"/*) ok=1;; esac; done; \
+                 [ $ok = 1 ] || fail \"loaded $f from outside the build and its inputs\"; \
+                 [ \"$r\" = \"$rt/libgcc.a\" ] && gcc=1; [ \"$r\" = \"$sys/libc.a\" ] && libc=1; \
+                 done < \"$m\"; \
+                 [ $gcc = 1 ] || fail \"did not load gcc-runtime's libgcc.a\"; \
+                 [ $libc = 1 ] || fail \"did not load td glibc's libc.a\""
+            ),
+        ],
+    )
+    .env("PATH", BUILD_ROOT_PATH)
 }
 
 /// The line the bootable-kernel rung's `/init` prints on ttyS0 AFTER it mounts the
@@ -1856,6 +1988,86 @@ pub fn glibc241_host_free_fixups() -> Vec<Step> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Runs the map check's own script against fixture maps: a clean link
+    /// passes; Debian files, the root's store path, a relative escape, a map
+    /// of another output and a link without td's libgcc are refused.
+    #[test]
+    fn the_link_map_check_refuses_loads_outside_the_build_and_its_inputs() {
+        let tmp = crate::test_temp::TempDir::new("td-link-map").unwrap();
+        let base = tmp.path().to_string_lossy().into_owned();
+        let (root, src, store) = (
+            format!("{base}/root"),
+            format!("{base}/root/src"),
+            format!("{base}/store"),
+        );
+        let step = super::build_root_link_map_check(
+            "{src}",
+            "{root}/out.map",
+            "prog.static",
+            &["gcc-runtime", "popt-x86-64"],
+        );
+        let Step::Run { argv, .. } = step else {
+            panic!("the map check is a run step");
+        };
+        let script = argv[2]
+            .replace("{root}", &root)
+            .replace("{src}", &src)
+            .replace("{in:gcc-runtime}", &format!("{store}/gcc-runtime"))
+            .replace("{in:popt-x86-64}", &format!("{store}/popt-x86-64"));
+        for dir in [&src, &format!("{root}/sysroot/lib")] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let clean = format!(
+            "OUTPUT(prog.static elf64-x86-64)\nLOAD {store}/gcc-runtime/lib/libgcc.a\n\
+             LOAD {root}/sysroot/lib/libc.a\nLOAD {store}/popt-x86-64/lib/libpopt.a\n\
+             LOAD prog.o\nLOAD linker stubs\n"
+        );
+        let cases = [
+            (clean.clone(), None),
+            (
+                format!("{clean}LOAD /usr/lib/gcc/x86_64-linux-gnu/14/libgcc_eh.a\n"),
+                Some("from outside the build"),
+            ),
+            (
+                format!("{clean}LOAD {store}/debian-root/usr/lib/libm.a\n"),
+                Some("from outside the build"),
+            ),
+            (
+                format!("{clean}LOAD ../../../usr/lib/libfoo.a\n"),
+                Some("from outside the build"),
+            ),
+            (
+                clean.replace("prog.static", "helper"),
+                Some("is the link of helper"),
+            ),
+            (
+                format!("{clean}OUTPUT(helper elf64-x86-64)\n"),
+                Some("records 2 outputs"),
+            ),
+            (
+                clean.replace(&format!("LOAD {store}/gcc-runtime/lib/libgcc.a\n"), ""),
+                Some("did not load gcc-runtime's libgcc.a"),
+            ),
+        ];
+        for (map, refusal) in cases {
+            std::fs::write(format!("{root}/out.map"), &map).unwrap();
+            let run = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&script)
+                .current_dir(&src)
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&run.stderr);
+            match refusal {
+                None => assert!(run.status.success(), "{map}: {stderr}"),
+                Some(reason) => {
+                    assert!(!run.status.success(), "{map} passed");
+                    assert!(stderr.contains(reason), "{map}: {stderr}");
+                }
+            }
+        }
+    }
     use crate::catalog;
     use crate::types::{Recipe, Step};
     use std::collections::HashSet;

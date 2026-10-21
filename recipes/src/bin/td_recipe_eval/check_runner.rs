@@ -9614,13 +9614,17 @@ mod tests {
             ]
         );
         // The members built in the Debian build root: the kernel, the
-        // upstream toolchain's runtime, and cryptsetup's json-c.
+        // upstream toolchain's runtime, and cryptsetup with its libraries.
         assert_eq!(
             answer.build_root_members,
             [
+                "cryptsetup-x86-64",
                 "gcc-runtime",
                 "json-c-x86-64",
+                "libdevmapper-x86-64",
                 "linux-x86-64",
+                "popt-x86-64",
+                "util-linux-libs-x86-64",
                 "zlib-x86-64"
             ]
         );
