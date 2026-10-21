@@ -7,6 +7,7 @@ use crate::{
     },
     format::Sequence,
     ids::StoreEpoch,
+    ports::Commit,
 };
 use std::num::NonZeroU32;
 const ACCOUNT: AccountId = AccountId::from_bytes([1; 16]);
@@ -98,7 +99,10 @@ fn sequence_routes_aliases_and_reset() {
             command(&mut s, &format!("RCPT TO:<{address}>\r\n"), code);
         }
         let e = s.envelope().unwrap();
-        assert_eq!(e.account, ACCOUNT);
+        assert!(e
+            .recipients
+            .iter()
+            .all(|recipient| recipient.account == ACCOUNT));
         assert_eq!(e.recipients.len(), 5);
         assert!(e.reverse_path.is_empty());
         command(&mut s, "EHLO bad_domain\r\n", "501 ");
@@ -153,7 +157,7 @@ fn transcript_every_split_preserves_octets_and_waits_for_publication() {
             assert_eq!(stored, expected);
             assert_eq!(s.pending(), Pending::Commit);
             assert_eq!(s.feed(b"QUIT\r\n"), Err(Error::Conflict));
-            s.committed(Ok(receipt())).unwrap();
+            s.committed(Ok(Commits::new([receipt()]).unwrap())).unwrap();
             assert!(reply(&s).starts_with("250 2.0.0 Message accepted"));
             assert_eq!(s.feed(b"QUIT\r\n"), Err(Error::Conflict));
             s.reply_sent().unwrap();
@@ -287,7 +291,8 @@ fn commit_outcomes_and_begin_refusal() {
             begin(&mut s, "");
             s.feed(b".\r\nQUIT\r\n").unwrap();
             assert_eq!(s.pending(), Pending::Commit);
-            s.committed(outcome).unwrap();
+            s.committed(outcome.map(|commit| Commits::new([commit]).unwrap()))
+                .unwrap();
             if matches!(outcome, Err(CommitFailure::Rejected(_))) {
                 assert!(reply(&s).starts_with("451 "));
                 s.reply_sent().unwrap();
@@ -389,7 +394,11 @@ fn retained_recipients_fit_the_actual_receipt_codec() {
         }
         command(&mut s, &format!("RCPT TO:<{address}>\r\n"), "452 ");
         let e = s.envelope().unwrap();
-        let recipients: Vec<_> = e.recipients.iter().map(String::as_str).collect();
+        let recipients: Vec<_> = e
+            .recipients
+            .iter()
+            .map(|recipient| recipient.address.as_str())
+            .collect();
         let mut output = [0; MAX_RECEIPT_BYTES];
         let receipt =
             crate::format::row::ReceiptRecipients::encode(&recipients, &mut output).unwrap();
@@ -553,4 +562,56 @@ fn accepted_mail_limit_survives_rset_ehlo_and_tls_reset() {
         command(&mut s, "MAIL FROM:<>\r\n", "421 ");
         assert_eq!(s.pending(), Pending::Closed);
     });
+}
+
+#[test]
+fn multi_account_envelope_requires_complete_commit_set() {
+    let other = AccountId::from_bytes([3; 16]);
+    let mut text = [0; 1024];
+    let mut domains = [DomainSlot::EMPTY; 1];
+    let mut aliases = [AliasSlot::EMPTY; 3];
+    let at = Location {
+        line: NonZeroU32::new(1).unwrap(),
+        column: 1,
+    };
+    let mut builder = Builder::new(&mut text, &mut domains, &mut aliases).unwrap();
+    builder.account(ACCOUNT, at).unwrap();
+    builder.account(other, at).unwrap();
+    builder.postmaster(ACCOUNT, at).unwrap();
+    builder.domain("example.test", at).unwrap();
+    builder.alias("Alice@example.test", ACCOUNT, at).unwrap();
+    builder.alias("alias@example.test", ACCOUNT, at).unwrap();
+    builder.alias("second@example.test", other, at).unwrap();
+    let routing = builder.finish().unwrap();
+    for complete in [false, true] {
+        let mut s = session(&routing);
+        command(&mut s, "EHLO sender.test\r\n", "250-");
+        command(&mut s, "MAIL FROM:<>\r\n", "250 ");
+        command(&mut s, "RCPT TO:<second@example.test>\r\n", "250 ");
+        command(&mut s, "RCPT TO:<Alice@example.test>\r\n", "250 ");
+        command(&mut s, "RCPT TO:<alias@example.test>\r\n", "250 ");
+        command(&mut s, "RCPT TO:<outside@external.test>\r\n", "550 ");
+        command(&mut s, "RCPT TO:<unknown@example.test>\r\n", "550 ");
+        assert_eq!(s.envelope().unwrap().recipients.len(), 3);
+        assert_eq!(s.envelope().unwrap().recipients[0].account, other);
+        s.feed(b"DATA\r\n").unwrap();
+        s.data_ready(Ok(())).unwrap();
+        s.reply_sent().unwrap();
+        s.feed(b".\r\n").unwrap();
+        let mut commits = vec![receipt()];
+        if complete {
+            commits.push(Commit {
+                account: other,
+                ..receipt()
+            });
+        }
+        s.committed(Ok(Commits::new(commits).unwrap())).unwrap();
+        if complete {
+            assert!(reply(&s).starts_with("250 "));
+        } else {
+            assert_eq!(s.pending(), Pending::Closed);
+        }
+    }
+    assert_eq!(Commits::new([receipt(), receipt()]), Err(Error::Invalid));
+    assert_eq!(Commits::new([]), Err(Error::Invalid));
 }

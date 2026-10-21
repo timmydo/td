@@ -2514,6 +2514,8 @@ fn real_postgres_smtp_worker_preserves_starttls_receipts() {
 
 #[path = "postgres_probe/multi_account.rs"]
 mod multi_account;
+#[path = "postgres_probe/multi_receiving.rs"]
+mod multi_receiving;
 
 #[path = "postgres_probe/serving.rs"]
 mod serving;
@@ -11735,6 +11737,7 @@ fn exercise_smtp_storage(fixture: &Fixture, binding: &td_mta::postgres_runtime_p
             loaded: &loaded,
             executable,
             binding,
+            additional: &[],
             slots: &slots,
             clock: &clock,
             pending: &pending,
@@ -11788,7 +11791,6 @@ fn exercise_smtp_storage(fixture: &Fixture, binding: &td_mta::postgres_runtime_p
         session.feed(b"DATA\r\n").unwrap();
         let deadline = until(if case == 3 { 3000 } else { 10_000 });
         let begin = |clock: Arc<dyn Clock>, generation| Begin {
-            account: binding.account(),
             config_generation: generation,
             peer: "192.0.2.2".parse().unwrap(),
             tls: ReceiptTls::Plain,
@@ -11867,8 +11869,9 @@ fn exercise_smtp_storage(fixture: &Fixture, binding: &td_mta::postgres_runtime_p
         if case == 2 {
             assert!(!completed.stop);
             let commit = completed.outcome.unwrap();
-            assert_eq!(commit.account, binding.account());
-            assert_eq!(commit.epoch, binding.epoch());
+            assert_eq!(commit.iter().count(), 1);
+            assert_eq!(commit.iter().next().unwrap().account, binding.account());
+            assert_eq!(commit.iter().next().unwrap().epoch, binding.epoch());
             session.committed(Ok(commit)).unwrap();
             assert!(
                 matches!(session.pending(), Action::Reply { bytes, .. } if bytes.starts_with(b"250"))
@@ -11954,6 +11957,7 @@ fn exercise_smtp_receiving_owner(
         loaded: &loaded,
         executable,
         binding,
+        additional: &[],
         slots: &slots,
         clock: &clock,
         pending: &pending,
@@ -12068,7 +12072,10 @@ fn exercise_smtp_receiving_owner(
         .unwrap()
         .unwrap();
     assert_eq!(settled.operation, operation);
-    assert_eq!(settled.outcome.length, first.length);
+    assert_eq!(
+        settled.outcome.accounts.first().unwrap().1.length,
+        first.length
+    );
     assert_eq!(pending.operation().unwrap(), None);
     assert_eq!(
         sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"),

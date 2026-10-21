@@ -4,7 +4,8 @@ use crate::{
     format::row::{MAX_ADDRESS, MAX_RECEIPT_BYTES, MAX_RECIPIENTS},
     ids::AccountId,
     limits::MAX_MESSAGE_BYTES,
-    ports::{Commit, CommitFailure, Error},
+    ports::{CommitFailure, Error},
+    smtp_storage::Commits,
 };
 use std::{
     fmt::Write,
@@ -29,14 +30,18 @@ pub struct Settings<'a> {
 }
 
 /// Accepted envelope spellings, without brackets or obsolete source routes.
-/// All recipients resolve to this one account; delivery must file exactly once.
+/// Every recipient retains its resolved local account; aliases file once per account.
 pub struct Envelope {
-    pub account: AccountId,
     pub ehlo: String,
     pub reverse_path: String,
-    pub recipients: Vec<String>,
+    pub recipients: Vec<Recipient>,
     pub eight_bit: bool,
     pub declared_bytes: Option<u64>,
+}
+
+pub struct Recipient {
+    pub account: AccountId,
+    pub address: String,
 }
 
 /// The driver must finish this operation before supplying more input. A Reply
@@ -312,16 +317,23 @@ impl<'a> Session<'a> {
     }
     /// Trusted adapter result, not a credential or proof by itself. Success must
     /// mean raw mail, trace/envelope, thread, Inbox and history are durable.
-    pub fn committed(&mut self, result: Result<Commit, CommitFailure>) -> Result<(), Error> {
+    pub fn committed(&mut self, result: Result<Commits, CommitFailure>) -> Result<(), Error> {
         if self.state != State::Commit {
             return Err(Error::Conflict);
         }
         match result {
             Ok(commit)
-                if self
-                    .envelope
-                    .as_ref()
-                    .is_some_and(|e| e.account == commit.account) =>
+                if self.envelope.as_ref().is_some_and(|e| {
+                    e.recipients.iter().all(|recipient| {
+                        commit
+                            .iter()
+                            .any(|entry| entry.account == recipient.account)
+                    }) && commit.iter().all(|entry| {
+                        e.recipients
+                            .iter()
+                            .any(|recipient| recipient.account == entry.account)
+                    })
+                }) =>
             {
                 self.reset();
                 self.respond("250 2.0.0 Message accepted\r\n", Next::Command);
@@ -549,7 +561,6 @@ impl<'a> Session<'a> {
             .try_reserve(self.settings.recipients)
             .map_err(|_| Error::Capacity)?;
         self.envelope = Some(Envelope {
-            account: self.routes.account(),
             ehlo: copy(&self.hello)?,
             reverse_path: copy(address)?,
             recipients,
@@ -573,8 +584,8 @@ impl<'a> Session<'a> {
             self.respond("555 5.5.4 Unsupported RCPT parameter\r\n", Next::Command);
             return Ok(());
         }
-        match self.routes.resolve(address) {
-            Ok(Some(account)) if account == self.routes.account() => (),
+        let account = match self.routes.resolve(address) {
+            Ok(Some(account)) => account,
             Ok(_) => {
                 self.respond("550 5.1.1 Unknown local recipient\r\n", Next::Command);
                 return Ok(());
@@ -583,7 +594,7 @@ impl<'a> Session<'a> {
                 self.respond("451 4.3.0 Routing unavailable\r\n", Next::Command);
                 return Ok(());
             }
-        }
+        };
         let envelope = self.envelope.as_mut().ok_or(Error::Invalid)?;
         // ReceiptRecipients stores a count and a u32 length before each address.
         let needed = self.recipient_bytes + 4 + address.len();
@@ -591,7 +602,10 @@ impl<'a> Session<'a> {
             self.respond("452 4.5.3 Too many recipients\r\n", Next::Command);
             return Ok(());
         }
-        envelope.recipients.push(copy(address)?);
+        envelope.recipients.push(Recipient {
+            account,
+            address: copy(address)?,
+        });
         self.recipient_bytes = needed;
         self.respond("250 2.1.5 Recipient accepted\r\n", Next::Command);
         Ok(())

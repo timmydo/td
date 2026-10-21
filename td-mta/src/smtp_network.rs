@@ -2,10 +2,9 @@
 use crate::{
     admission::timers::{self, TimeoutPlan, SESSION_SECONDS},
     config::routing::Routing,
-    ports::{
-        Clock, Commit, CommitFailure, Deadline, Error, FlushProgress, IoProgress, Tick, Transport,
-    },
+    ports::{Clock, CommitFailure, Deadline, Error, FlushProgress, IoProgress, Tick, Transport},
     smtp_session::{Pending, Session, Settings},
+    smtp_storage::Commits,
     transport::SOCKET_CHUNK,
 };
 
@@ -126,7 +125,7 @@ impl<'a> Network<'a> {
     /// late. This grace never extends the lease used to admit or commit work.
     pub fn committed(
         &mut self,
-        result: Result<Commit, CommitFailure>,
+        result: Result<Commits, CommitFailure>,
         clock: &(impl Clock + ?Sized),
     ) -> Result<(), Error> {
         let now = self.complete_work(Work::Commit, clock)?;

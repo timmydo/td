@@ -182,6 +182,7 @@ pub(super) fn exercise(
             loaded: &loaded,
             executable: std::path::Path::new(env!("CARGO_BIN_EXE_td-mta")),
             binding,
+            additional: &[],
             slots: &slots,
             clock: &clock,
             pending: &pending,

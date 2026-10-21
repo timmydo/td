@@ -7,7 +7,7 @@ use crate::{
     postgres_input::Loaded,
     postgres_probe::{self, Mode},
     postgres_read::ReadSlots,
-    postgres_receiving::{self as changes, Delivery, Message},
+    postgres_receiving::{self as changes, Fanout, Message, Target},
     postgres_runtime_profile::Binding,
 };
 use std::{
@@ -31,13 +31,13 @@ impl From<ports::Error> for Error {
 /// Runtime startup/recovery wiring belongs to cutover.
 #[derive(Default)]
 pub struct Pending {
-    change: Mutex<Option<Delivery>>,
+    change: Mutex<Option<Fanout>>,
 }
 
 #[derive(Debug)]
 pub struct Settled {
     pub operation: ReceivingOperationId,
-    pub outcome: changes::Outcome,
+    pub outcome: changes::FanoutOutcome,
 }
 impl Pending {
     pub fn operation(&self) -> Result<Option<ReceivingOperationId>, Error> {
@@ -46,7 +46,7 @@ impl Pending {
             .try_lock()
             .map_err(|_| ports::Error::Busy)?
             .as_ref()
-            .map(Delivery::operation))
+            .map(Fanout::operation))
     }
     /// Historical inspection only, using independent settlement capacity.
     /// Absence and errors leave the original operation fenced and retained.
@@ -70,7 +70,7 @@ impl Pending {
         for address in addresses(loaded, executable, deadline)? {
             let mut connection = loaded.bootstrap.request(address);
             connection.mode = Mode::Runtime;
-            match changes::inspect(&connection, &loaded.trust, deadline, change) {
+            match changes::inspect_fanout(&connection, &loaded.trust, deadline, change) {
                 Ok(Some(outcome)) => {
                     let operation = change.operation();
                     *pending = None;
@@ -91,18 +91,40 @@ pub struct Receiving<'a> {
     pub loaded: &'a Loaded,
     pub executable: &'a Path,
     pub binding: &'a Binding,
+    pub additional: &'a [&'a Binding],
     pub slots: &'a ReadSlots,
     pub clock: &'a RuntimeClock,
     pub pending: &'a Pending,
 }
 impl Receiving<'_> {
+    pub(crate) fn valid(&self) -> bool {
+        self.executable.is_absolute()
+            && self.binding.roles().receive()
+            && self.loaded.bootstrap.profile() == self.binding.profile()
+            && self.additional.len() < crate::config::identities::MAX_ACCOUNTS
+            && !self.additional.iter().enumerate().any(|(index, binding)| {
+                binding.account() == self.binding.account()
+                    || !binding.roles().receive()
+                    || binding.epoch() != self.binding.epoch()
+                    || binding.selection() != self.binding.selection()
+                    || binding.profile() != self.binding.profile()
+                    || self
+                        .additional
+                        .iter()
+                        .take(index)
+                        .any(|prior| prior.account() == binding.account())
+            })
+    }
+    pub fn binding_for(&self, account: crate::ids::AccountId) -> Option<&Binding> {
+        std::iter::once(self.binding)
+            .chain(self.additional.iter().copied())
+            .find(|binding| binding.account() == account)
+    }
+
     /// A bounded startup/reconnect observation. Every delivery still rechecks
     /// current selection and Inbox inside its publication transaction.
     pub fn ready(&self, until: Deadline) -> Result<(), Error> {
-        if !self.executable.is_absolute()
-            || !self.binding.roles().receive()
-            || self.loaded.bootstrap.profile() != self.binding.profile()
-        {
+        if !self.valid() {
             return Err(ports::Error::Forbidden.into());
         }
         let pending = self
@@ -115,10 +137,17 @@ impl Receiving<'_> {
         }
         let deadline = phase(self.clock, until)?;
         let _slot = self.slots.acquire().map_err(|_| ports::Error::Busy)?;
+        let mut bindings = Vec::new();
+        bindings
+            .try_reserve_exact(1 + self.additional.len())
+            .map_err(|_| ports::Error::Capacity)?;
+        bindings.push(self.binding);
+        bindings.extend(self.additional.iter().copied());
         for address in addresses(self.loaded, self.executable, deadline)? {
             let mut connection = self.loaded.bootstrap.request(address);
             connection.mode = Mode::Runtime;
-            match changes::ready(&connection, &self.loaded.trust, deadline, self.binding) {
+            let ready = changes::ready_many(&connection, &self.loaded.trust, deadline, &bindings);
+            match ready {
                 Ok(_) => return Ok(()),
                 Err(changes::Error::Connection(postgres_probe::Error::Transport)) => (),
                 Err(error) => return Err(Error::Publication(error)),
@@ -137,9 +166,32 @@ impl Receiving<'_> {
         until: Deadline,
         meter: &mut Meter,
     ) -> Result<changes::Outcome, Error> {
-        if !self.executable.is_absolute()
-            || !self.binding.roles().receive()
-            || self.loaded.bootstrap.profile() != self.binding.profile()
+        let outcome = self.create_fanout(
+            &[Target {
+                binding: self.binding,
+                recipients: message.receipt.recipients,
+            }],
+            message,
+            until,
+            meter,
+        )?;
+        outcome
+            .accounts
+            .first()
+            .map(|(_, outcome)| *outcome)
+            .ok_or(Error::Admission(ports::Error::Invalid))
+    }
+    pub fn create_fanout(
+        &self,
+        targets: &[Target<'_>],
+        message: &Message<'_>,
+        until: Deadline,
+        meter: &mut Meter,
+    ) -> Result<changes::FanoutOutcome, Error> {
+        if !self.valid()
+            || targets
+                .iter()
+                .any(|target| self.binding_for(target.binding.account()) != Some(target.binding))
             || message.header_bytes > self.binding.header_maximum()
             || message.receipt.recipients.count() as usize > self.binding.recipient_maximum()
         {
@@ -167,10 +219,12 @@ impl Receiving<'_> {
         // Retain only one prepared message; ingress admission remains external.
         let _slot = self.slots.acquire().map_err(|_| ports::Error::Busy)?;
         let addresses = addresses(self.loaded, self.executable, deadline)?;
-        let change =
-            changes::prepare_with_meter(self.binding, message, deadline, meter, self.clock)
-                .map_err(Error::Publication)?;
-        let length = change.length();
+        let change = changes::prepare_fanout(targets, message, deadline, meter, self.clock)
+            .map_err(Error::Publication)?;
+        let length = change
+            .length()
+            .checked_mul(change.count() as u64)
+            .ok_or(ports::Error::Capacity)?;
         meter
             .charge(
                 self.clock.sample()?.monotonic,
@@ -189,7 +243,7 @@ impl Receiving<'_> {
         for address in addresses {
             let mut connection = self.loaded.bootstrap.request(address);
             connection.mode = Mode::Runtime;
-            outcome = changes::publish(&connection, &self.loaded.trust, deadline, change);
+            outcome = changes::publish_fanout(&connection, &self.loaded.trust, deadline, change);
             if !matches!(
                 outcome,
                 Err(changes::Error::Connection(postgres_probe::Error::Transport))

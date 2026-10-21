@@ -295,9 +295,9 @@ pub fn load(
         .identities()
         .map_err(|_| Error::Account)?;
     let roles = configuration.roles();
-    // Receiving fanout and route scheduling must be admitted before those roles
-    // can activate more than one account.
-    if catalog.account_count() > 1 && (roles.receive() || roles.relay()) {
+    // Relay scheduling must rotate through accounts before that role can activate
+    // more than one account.
+    if catalog.account_count() > 1 && roles.relay() {
         return Err(Error::Account);
     }
     let relay_policy = if roles.relay() {

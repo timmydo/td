@@ -562,11 +562,12 @@ fn established_tls_flushes_known_result_and_expiry_notice_within_fixed_finishing
                 // Protocol result injection; native durability is tested separately.
                 network
                     .committed(
-                        Ok(crate::ports::Commit {
+                        Ok(crate::smtp_storage::Commits::new([crate::ports::Commit {
                             account: crate::ids::AccountId::from_bytes([0xaa; 16]),
                             epoch: crate::ids::StoreEpoch::from_bytes([2; 16]),
                             sequence: crate::format::Sequence::from_u64(1),
-                        }),
+                        }])
+                        .unwrap()),
                         clock.as_ref(),
                     )
                     .unwrap();

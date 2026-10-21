@@ -6449,9 +6449,48 @@ configuration and TLS generation; an absent account never falls back to the
 first binding. The compatibility binding accessor is for common profile facts,
 not request dispatch. Extracting a singleton binding refuses multiple accounts.
 
-JMAP-only profiles register one Session and backend per account. All backends
+JMAP profiles register one Session and backend per account. All backends
 share read slots, pending-mutation ownership, response admission and body
 operation capacity. Each Session names only its authenticated account. Three
 MiB of startup metadata reservation covers the aggregate catalog preparation,
-bindings and up to sixteen Session documents. Receiving and relay profiles
-still reject multiple accounts before publication at this intermediate step.
+bindings and up to sixteen Session documents. Relay profiles still reject
+multiple accounts before publication at this intermediate step.
+
+
+## Transactional incoming delivery across accounts
+
+An accepted SMTP envelope retains each address's pinned local account. The
+fixed receiving worker groups those recipients by account, preserving accepted
+spellings and filing aliases only once per account. Unknown or external
+recipients are refused before DATA; no SMTP AUTH or forwarding authority is
+introduced. Startup and DATA admission inspect the configured Inboxes in one
+bounded connection and transaction, holding the selection and sorted account
+locks. Account count does not multiply authentication connections or extend
+admission deadlines.
+
+`postgres_receiving::Fanout` retains one operation, shared prepared DATA and
+header-anchor storage, and private provenance for at most sixteen accounts.
+Preparation validates the complete recipient partition, sorts account IDs and
+binds every account and its encoded provenance into one request digest. Each
+account receives only its own recipient metadata. Original body preparation,
+work meter and deadlines remain shared; SQL publication charges body I/O for
+every target before opening the transaction.
+
+Publication locks the current selection, then every account in ID order before
+reading receipts or writing any email. It uses the existing account write path
+for quotas, Inbox, thread, body, history and receiving receipts, and commits
+once after every target succeeds. A quota or Inbox refusal rolls everything
+back. Receipt lookup holds all account locks in the same order and requires
+either all matching receipts or none; a subset or digest mismatch refuses.
+Historical complete receipts remain settlement evidence after selection changes.
+The owner retains the entire operation after an uncertain COMMIT and stops new
+SMTP publication until settlement. Final protocol success verifies that the
+returned account set exactly covers the accepted envelope.
+
+The closed fanout driver admits 40 MiB outgoing bytes, 1 MiB incoming bytes
+and 1088 response frames per target account, for at most sixteen accounts.
+These are cumulative transport limits, not resident allocations; the existing
+per-frame, authentication, TLS and ten-second connection limits remain intact.
+Receipt inspection uses the same bounded account-count allowance. The DATA
+worker's output meter includes the separate 2-MiB fanout metadata reservation,
+including when the configured message ceiling is smaller than that metadata.

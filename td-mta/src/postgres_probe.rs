@@ -197,6 +197,27 @@ pub(crate) fn with_upload_client<T>(
     )
 }
 
+// One SMTP transaction publishes a separate blob and receipt per local account.
+pub(crate) fn with_fanout_client<T>(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    accounts: usize,
+    operation: impl for<'a> FnOnce(&'a tokio_postgres::Client) -> Pin<Box<dyn Future<Output = T> + 'a>>,
+) -> Result<T, Error> {
+    if !(1..=crate::config::identities::MAX_ACCOUNTS).contains(&accounts) {
+        return Err(Error::Invalid);
+    }
+    with_output_limit(
+        request,
+        trust,
+        deadline,
+        40 * 1024 * 1024 * accounts,
+        Input::fanout(accounts),
+        operation,
+    )
+}
+
 // At most 1000 retained recipient replies and one local notice, no remote body.
 pub(crate) fn with_notice_client<T>(
     request: &Request<'_>,

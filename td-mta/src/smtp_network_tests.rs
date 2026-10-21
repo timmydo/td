@@ -1,5 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 use super::*;
+use crate::ports::Commit;
 use crate::{
     admission::{DiskLimits, ViewMode, WorkLimits},
     config::{
@@ -439,7 +440,8 @@ fn known_final_result_and_service_close_share_one_nonrenewing_grace() {
         let mut w = Wire::default();
         pending_commit(&mut n, &mut w, timer);
         timer.0.store(3600001, Ordering::Relaxed);
-        n.committed(Ok(committed_result()), timer).unwrap();
+        n.committed(Ok(Commits::new([committed_result()]).unwrap()), timer)
+            .unwrap();
         let before = w.output.len();
         // No buffered following command may run after the original lifetime.
         w.input.extend(b"MAIL FROM:<>\r\n");
@@ -457,7 +459,8 @@ fn known_final_result_and_service_close_share_one_nonrenewing_grace() {
         let mut w = Wire::default();
         pending_commit(&mut n, &mut w, timer);
         timer.0.store(1800001, Ordering::Relaxed);
-        n.committed(Ok(committed_result()), timer).unwrap();
+        n.committed(Ok(Commits::new([committed_result()]).unwrap()), timer)
+            .unwrap();
         w.write_max = Some(1);
         for now in 1800001..1800006 {
             timer
@@ -491,13 +494,13 @@ fn unknown_commit_and_failed_completion_clock_never_emit_acceptance() {
         pending_commit(&mut n, &mut w, timer);
         timer.0.store(0, Ordering::Relaxed);
         assert_eq!(
-            n.committed(Ok(committed_result()), timer),
+            n.committed(Ok(Commits::new([committed_result()]).unwrap()), timer),
             Err(Error::Invalid)
         );
         timer.0.store(1, Ordering::Relaxed);
         assert_eq!(n.advance(&mut w, timer), Ok(Progress::Closed));
         assert_eq!(
-            n.committed(Ok(committed_result()), timer),
+            n.committed(Ok(Commits::new([committed_result()]).unwrap()), timer),
             Err(Error::Conflict)
         );
         assert!(!w.output.windows(16).any(|b| b == b"Message accepted"));
@@ -584,7 +587,8 @@ fn late_results_cannot_renew_the_original_transport_finishing_cap() {
                 original.tick().0 + if beyond_cap { 5000 } else { 4000 },
                 Ordering::Relaxed,
             );
-            n.committed(Ok(committed_result()), timer).unwrap();
+            n.committed(Ok(Commits::new([committed_result()]).unwrap()), timer)
+                .unwrap();
             w.write_max = Some(0);
             if !beyond_cap {
                 assert_eq!(n.advance(&mut w, timer), Ok(Progress::Pending));

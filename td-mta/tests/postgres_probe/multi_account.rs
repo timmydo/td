@@ -31,7 +31,10 @@ pub(super) fn exercise(
     let b = AccountId::from_bytes([0xcc; 16]);
     let socket = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = socket.local_addr().unwrap();
+    let smtp_socket = TcpListener::bind("127.0.0.1:0").unwrap();
+    let smtp_address = smtp_socket.local_addr().unwrap();
     let shared = format!("{shared}\n[account \"cccccccccccccccccccccccccccccccc\"]\nusername = \"user-b\"\n[alias \"second@example.test\"]\naccount = \"cccccccccccccccccccccccccccccccc\"\n[identity \"dddddddddddddddddddddddddddddddd\"]\naccount = \"cccccccccccccccccccccccccccccccc\"\nemail = \"second@example.test\"\n");
+    let shared = format!("{shared}\n[alias \"alias@example.test\"]\naccount = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n");
     let frontend = frontend
         .replace(
             "[server]",
@@ -42,6 +45,7 @@ pub(super) fn exercise(
             &format!("https://localhost:{}", address.port()),
         )
         .replace("bind = \"127.0.0.1:443\"", &format!("bind = \"{address}\""));
+    let frontend = format!("{frontend}\n[listener \"smtp\"]\nkind = \"direct_smtp\"\nbind = \"{smtp_address}\"\nserver_name = \"localhost\"\ncertificate = \"public\"\nsession_limit = 1\nper_peer_limit = 1\n");
     let candidate = configuration::prepare(
         request,
         trust,
@@ -50,7 +54,7 @@ pub(super) fn exercise(
         shared.as_bytes(),
         &[Profile {
             name: "multi",
-            roles: Roles::from_bits(2).unwrap(),
+            roles: Roles::from_bits(3).unwrap(),
             source: frontend.as_bytes(),
         }],
     )
@@ -121,6 +125,61 @@ pub(super) fn exercise(
     let (published, retired) = prepared.publish(&mut domain).unwrap();
     drop(retired);
     assert_eq!(published.bindings().count(), 2);
+    super::multi_receiving::exercise(fixture, request, trust, &published);
+    // Exercise the complete account ceiling with a small DATA reservation.
+    let mut expanded = shared.clone();
+    for index in 1..=14u8 {
+        let account = AccountId::from_bytes([index; 16]);
+        expanded.push_str(&format!("\n[account \"{account}\"]\nusername = \"extra{index}\"\n[alias \"extra{index}@example.test\"]\naccount = \"{account}\"\n"));
+        td_mta::postgres_accounts::publish(
+            request,
+            trust,
+            deadline(),
+            td_mta::postgres_accounts::prepare(epoch, account).unwrap(),
+        )
+        .unwrap();
+    }
+    let frontend = format!("{frontend}\n[limits]\nmessage_bytes = 1048576\n");
+    let candidate = configuration::prepare(
+        request,
+        trust,
+        deadline(),
+        epoch,
+        expanded.as_bytes(),
+        &[Profile {
+            name: "multi",
+            roles: Roles::from_bits(3).unwrap(),
+            source: frontend.as_bytes(),
+        }],
+    )
+    .unwrap();
+    let version = versions::Version::from_bytes([62; 16]);
+    versions::publish(request, trust, deadline(), version, &candidate).unwrap();
+    selection::publish(
+        request,
+        trust,
+        deadline(),
+        selection::prepare(
+            epoch,
+            published.binding().selection().generation,
+            version,
+            &candidate,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let prepared = runtime::load(
+        request,
+        trust,
+        deadline(),
+        epoch,
+        "multi",
+        domain.reserve().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(prepared.bindings().count(), 16);
+    let (_published, retired) = prepared.publish(&mut domain).unwrap();
+    drop(retired);
     super::create_runtime_login(fixture);
     super::grant_runtime_mail(fixture);
     let devices: Vec<_> = [a, b]
@@ -157,6 +216,7 @@ pub(super) fn exercise(
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
     }
     drop(socket);
+    drop(smtp_socket);
     let output = local.join("output");
     let mut child = ProbeChild(
         Command::new(env!("CARGO_BIN_EXE_td-mta"))
@@ -172,13 +232,19 @@ pub(super) fn exercise(
             .unwrap(),
     );
     let stop = Instant::now() + Duration::from_secs(20);
-    while !fs::read_to_string(&output)
-        .unwrap()
-        .contains("\"status\":\"ready\"")
-    {
-        assert!(Instant::now() < stop);
+    loop {
+        let status = fs::read_to_string(&output).unwrap();
+        if status.contains("\"status\":\"ready\"") {
+            break;
+        }
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "service exited: {status}"
+        );
+        assert!(Instant::now() < stop, "service startup timed out: {status}");
         thread::sleep(Duration::from_millis(20));
     }
+    super::multi_receiving::smtp(fixture, smtp_address, false);
     let basic = |name: &str, password: &[u8]| {
         let input = [name.as_bytes(), b":", password].concat();
         let encoded = super::certificate::pem("BASIC", &input);
@@ -275,6 +341,7 @@ pub(super) fn exercise(
         );
         assert!(wrong.starts_with("HTTP/1.1 401"), "{wrong}");
     }
+    super::multi_receiving::smtp(fixture, smtp_address, true);
     let stopped = Command::new(env!("CARGO_BIN_EXE_td-mta"))
         .args(["stop", "--runtime"])
         .arg(&runtime)

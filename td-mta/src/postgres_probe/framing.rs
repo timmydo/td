@@ -50,6 +50,14 @@ impl Input {
         }
     }
 
+    pub(super) fn fanout(accounts: usize) -> Self {
+        Self {
+            bytes: 1024 * 1024 * accounts,
+            frames: 1088 * accounts,
+            ..Self::new()
+        }
+    }
+
     pub(super) fn validation_checks(budget: super::ValidationBudget) -> Self {
         let single = Self::mutations();
         Self {

@@ -1849,9 +1849,10 @@ The existing 64-identity, address-cell and text reservations remain aggregate
 configuration limits, not per-account allowances.
 
 Cold profile preparation checks that every configured account is bootstrapped
-and builds a separate binding and identity catalog for each. JMAP-only profiles
+and builds a separate binding and identity catalog for each. JMAP profiles
 can serve all configured accounts through one endpoint, with a private Session
 and backend selected by the authenticated principal. Aggregate connection,
 request, upload, event and work admission limits remain process-wide.
-Profiles with receiving or relay roles still reject multiple accounts before
-publication until SMTP fanout and account-fair relay scheduling are wired.
+Receiving profiles accept the configured local accounts and commit each DATA
+transaction to every distinct recipient account together. Relay profiles still
+reject multiple accounts until account-fair scheduling is wired.

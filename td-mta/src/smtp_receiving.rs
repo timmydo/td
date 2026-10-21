@@ -878,7 +878,6 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                 let network = connection.network()?;
                 let result = self.storage.begin(
                     smtp_storage::Begin {
-                        account: self.routes.account(),
                         config_generation: self.policies.id().get(),
                         peer: slot.peer,
                         tls: connection.tls()?,
@@ -948,7 +947,11 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                             control.log(
                                 crate::observability::Kind::MetadataCommitted,
                                 None,
-                                Some(commit.sequence),
+                                commit
+                                    .iter()
+                                    .next()
+                                    .filter(|_| commit.iter().count() == 1)
+                                    .map(|entry| entry.sequence),
                             );
                         }
                         if completion.stop || matches!(result, Err(CommitFailure::Indeterminate(_)))

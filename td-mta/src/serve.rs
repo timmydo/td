@@ -344,6 +344,11 @@ fn run_once(options: &Options, reload: &AtomicBool) -> Result<(), ConfigFailure>
             } else {
                 None
             };
+            let mut receiving_bindings = Vec::new();
+            receiving_bindings
+                .try_reserve_exact(accounts.account_count())
+                .map_err(|_| config_failure("receiving", "capacity"))?;
+            receiving_bindings.extend(published.bindings().skip(1));
             let storage = if binding.roles().receive() {
                 Some(
                     td_mta::postgres_smtp_storage::Backend::new(
@@ -351,6 +356,7 @@ fn run_once(options: &Options, reload: &AtomicBool) -> Result<(), ConfigFailure>
                             loaded: &loaded,
                             executable: &executable,
                             binding,
+                            additional: &receiving_bindings,
                             slots: &slots,
                             clock: clock.as_ref(),
                             pending: &smtp_pending,

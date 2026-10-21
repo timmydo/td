@@ -1618,7 +1618,8 @@ and reopened storage. The direct receiving runtime described below
 connects these adapters with fixed workers on caller-bound listeners.
 The `serve` command activates direct receiving for receive profiles. The engine binds
 routing for its lifetime, accepts only configured recipients, retains accepted
-envelope spellings, and exposes one account for one atomic delivery. It
+envelope spellings with resolved account IDs, and publishes every distinct local
+recipient account in one PostgreSQL transaction. It
 advertises SIZE, 8BITMIME and
 enhanced status codes; optional STARTTLS hands the original command to
 the transport owner without generating 220. Only successful TLS
@@ -1770,9 +1771,12 @@ Every v1 inbound delivery files once in the account's Inbox, including when
 several accepted aliases match. Aliases select accounts, not folders; alias
 names remain envelope metadata. Provision exactly one Inbox before receipt
 and forbid its deletion or role reassignment while receiving is enabled.
-V1 has one account, so its final DATA success is one store transaction. Extending
-to multiple recipient accounts requires a durable delivery manifest before
-acknowledgement; independent partial writes cannot masquerade as atomic success.
+Final DATA success requires one PostgreSQL transaction covering every distinct
+accepted recipient account. Account-scoped receiving receipts share an operation
+and a digest of the complete target set and private provenance; inspection must
+find all matching receipts or none. Independent partial writes cannot masquerade
+as success. Each account's stored receipt contains only its accepted envelope
+recipients, preserving recipient privacy across accounts.
 
 Parse command/data boundaries across arbitrary network chunks. Strict CRLF,
 dot-stuffing and termination rules prevent SMTP smuggling. Never interpret DATA
@@ -2636,10 +2640,10 @@ and internal reload with a brief listener gap; uninterrupted generation swapping
 remains outside this deployment profile. Explicit external certificate inputs
 remain supported. No Certbot subprocess or dependency is introduced.
 
-Cold JMAP-only profile preparation retains one bounded binding, private identity
+Cold profile preparation retains one bounded binding, private identity
 catalog and Session per configured account. Authentication selects the account
 before dispatch, and all backends share the process admission limits. Every
 configured account must be bootstrapped before the profile can publish. Profiles
-with receiving or relay roles remain single-account until transactional fanout
-and bounded account rotation are implemented. RESOURCES.md accounts for the
+with relay roles remain single-account until bounded account rotation is
+implemented. Receiving uses one retained fanout and one shared prepared body. RESOURCES.md accounts for the
 aggregate startup metadata independently of message-body reservations.

@@ -51,10 +51,11 @@ changing that validator requires an explicit atomic implementation update.
 | Account startup metadata | 1 | 3145728 | 3145728 |
 | Cold reload overlap | 1 | 2097152 | 2097152 |
 | Process and allocator allowance | 1 | 8388608 | 8388608 |
-| **Total** | | | **81511680** |
+| SMTP fanout metadata | 1 | 2097152 | 2097152 |
+| **Total** | | | **83608832** |
 
-The total is approximately 77.74 MiB against a 128 MiB configured budget;
-the remaining 52706048 bytes are unassigned headroom, not another cache.
+The total is approximately 79.74 MiB against a 128 MiB configured budget;
+the remaining 50608896 bytes are unassigned headroom, not another cache.
 The default process ledger excludes database-server memory and WAL mappings.
 The two default TLS handshakes remain configurable within the process budget.
 The 64 MiB idle and 128 MiB workload RSS figures are provisional goals under
@@ -3723,7 +3724,7 @@ The same method meter survives all messages and transformations. Decoding,
 preview extraction and JSON stages retain their original cumulative charges;
 a small requested preview can still hit the work ceiling while validating a
 large source. The response spool cap independently limits emitted bytes.
-Default planned total is 81511680 bytes under the unchanged 128 MiB budget;
+Default planned total is 83608832 bytes under the unchanged 128 MiB budget;
 capacity-growth fixtures rebalance disposable cache within that budget.
 These are bounded implementation allocations and planner figures, not a new
 whole-service RSS or large-mailbox qualification claim.
@@ -3736,18 +3737,12 @@ have their separate 512-byte allowance; retained lists do not borrow the old
 96 KiB partition. Header backing additionally reserves one lookahead byte per
 part and two final bytes within that allowance and scratch.
 
-The larger per-part ledger can reject an old high-part-count configuration:
-with all other defaults, mime_parts above about 1900 no longer fits 128 MiB.
-The scalar maximum remains 4096; raising it requires rebalancing another
-reservation or increasing the admitted memory budget. Scalar maxima are not a
-promise that their combination fits the same memory budget.
-
-The reduced default headroom also affects previously admitted non-default
-settings: with other defaults, smtp_recipients 465..1000, https_connections 9,
-smtp_sessions 11..15, storage_views 6..8, or body_jobs 3..8 no longer fit the
-128 MiB plan. Existing deployments with raised concurrency or object limits
-must rebalance disposable cache or raise memory before this planner change.
-The reservation applies at startup even while live Mail is not advertised.
+Non-default concurrency and part-count combinations can exceed the fixed
+128-MiB budget even when each scalar is within its own allowed range. For
+example, 32 HTTPS connections with other defaults require reducing the index
+cache from 4 MiB to 1 MiB. The capacity-growth fixture pins that combination.
+The planner does not allow increasing the memory budget above 128 MiB;
+operators must rebalance cache, concurrency or object limits instead.
 CONFIG.md's resource validation uses this same combined plan; independent
 scalar maxima do not establish admission. Selection additionally retains up
 to 64 names (264 bytes each) and their parsed header properties, bounded by
@@ -4480,3 +4475,17 @@ assertions hold the two allocation shapes within that reservation. Native
 provider allocations and whole-process RSS qualification remain separate.
 Account count does not multiply HTTP workers, connection slots, read slots,
 body-operation admission, response retention or authentication rate budgets.
+
+
+## SMTP fanout metadata
+
+The fixed receiving job retains at most sixteen per-account encoded recipient
+buffers of 32 KiB each. A separate 2-MiB reservation covers those buffers,
+original and private receipt/provenance copies during preparation and historical
+inspection, and bounded account metadata. Header anchors and prepared body bytes
+are shared across targets and retained operation copies. Recipient count and
+accepted address bytes stay aggregate limits; the existing 320-byte per-recipient
+allowance includes the resolved account ID. No incoming body buffer, storage
+worker, outgoing transport or read pool is multiplied by account count. The
+original meter prepays publication I/O for every target, so a large fanout may
+refuse within the fixed work allowance even when each mailbox has quota.

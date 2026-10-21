@@ -10,7 +10,7 @@ use crate::{
     ports::{Clock, Commit, CommitFailure, Deadline, Error},
     postgres_receiving::{self, Message},
     postgres_smtp_receiving::{self as owner, Receiving},
-    smtp_storage::{Begin, Completion, Failure, Job, Storage},
+    smtp_storage::{Begin, Commits, Completion, Failure, Job, Storage},
 };
 use std::{
     net::IpAddr,
@@ -35,10 +35,7 @@ impl<'a> Backend<'a> {
         clock: Arc<RuntimeClock>,
         generation: u64,
     ) -> Result<Self, Error> {
-        if generation == 0
-            || !std::ptr::eq(owner.clock, clock.as_ref())
-            || !owner.binding.roles().receive()
-        {
+        if generation == 0 || !std::ptr::eq(owner.clock, clock.as_ref()) || !owner.valid() {
             return Err(Error::Invalid);
         }
         Ok(Self {
@@ -74,6 +71,7 @@ pub struct Delivery<'a, 'b> {
     ehlo: String,
     reverse: String,
     recipients: Vec<u8>,
+    account_recipients: Vec<(AccountId, Vec<u8>)>,
     peer: IpAddr,
     tls: ReceiptTls,
     extended: bool,
@@ -92,7 +90,7 @@ impl<'b> Storage for Backend<'b> {
         self.stopped.load(Ordering::Acquire)
     }
     fn ready(&self, account: AccountId, deadline: Deadline) -> Result<(), Error> {
-        if account != self.owner.binding.account() {
+        if self.owner.binding_for(account).is_none() {
             return Err(Error::Forbidden);
         }
         if self.stopped() {
@@ -113,8 +111,11 @@ impl<'b> Storage for Backend<'b> {
             input.session.delivery_context().map_err(Failure::Refused)?;
         let allowance = crate::receiving_headers::trace_allowance(settings.hostname)
             .map_err(Failure::Refused)?;
-        if input.account != self.owner.binding.account()
-            || envelope.account != input.account
+        if envelope.recipients.is_empty()
+            || envelope
+                .recipients
+                .iter()
+                .any(|recipient| self.owner.binding_for(recipient.account).is_none())
             || settings.message_bytes as u64 > self.capacity()
             || settings.trace_bytes < allowance
             || input.header_bytes == 0
@@ -138,7 +139,9 @@ impl<'b> Storage for Backend<'b> {
             Charge {
                 io_bytes: limits.foreground_io_bytes,
                 records: limits.foreground_records,
-                output_bytes: self.capacity() * 2 + 1024 * 1024,
+                output_bytes: self.capacity() * 2
+                    + 1024 * 1024
+                    + crate::limits::SMTP_FANOUT_METADATA_BYTES as u64,
                 ..Charge::default()
             },
         );
@@ -153,7 +156,7 @@ impl<'b> Storage for Backend<'b> {
                 ..Charge::default()
             },
         )?;
-        self.ready(input.account, input.deadline)
+        self.ready(self.owner.binding.account(), input.deadline)
             .map_err(Failure::Refused)?;
         let mut bytes = Vec::new();
         bytes
@@ -168,12 +171,48 @@ impl<'b> Storage for Backend<'b> {
         addresses
             .try_reserve_exact(envelope.recipients.len())
             .map_err(|_| Failure::Refused(Error::Capacity))?;
-        addresses.extend(envelope.recipients.iter().map(String::as_str));
+        addresses.extend(
+            envelope
+                .recipients
+                .iter()
+                .map(|recipient| recipient.address.as_str()),
+        );
         let length = ReceiptRecipients::encode(&addresses, &mut recipients)
             .map_err(|_| Failure::Refused(Error::Invalid))?
             .encoded()
             .len();
         recipients.truncate(length);
+        let mut account_recipients = Vec::new();
+        account_recipients
+            .try_reserve_exact(crate::config::identities::MAX_ACCOUNTS)
+            .map_err(|_| Failure::Refused(Error::Capacity))?;
+        for recipient in &envelope.recipients {
+            if account_recipients
+                .iter()
+                .any(|(account, _)| *account == recipient.account)
+            {
+                continue;
+            }
+            addresses.clear();
+            addresses.extend(
+                envelope
+                    .recipients
+                    .iter()
+                    .filter(|entry| entry.account == recipient.account)
+                    .map(|entry| entry.address.as_str()),
+            );
+            let mut encoded = Vec::new();
+            encoded
+                .try_reserve_exact(MAX_RECEIPT_BYTES)
+                .map_err(|_| Failure::Refused(Error::Capacity))?;
+            encoded.resize(MAX_RECEIPT_BYTES, 0);
+            let length = ReceiptRecipients::encode(&addresses, &mut encoded)
+                .map_err(|_| Failure::Refused(Error::Invalid))?
+                .encoded()
+                .len();
+            encoded.truncate(length);
+            account_recipients.push((recipient.account, encoded));
+        }
         let time = self.clock.sample().map_err(Failure::Refused)?;
         charge(&self.clock, &mut meter, Charge::default())?;
         Ok(Delivery {
@@ -189,6 +228,7 @@ impl<'b> Storage for Backend<'b> {
             ehlo: copy(&envelope.ehlo)?,
             reverse: copy(&envelope.reverse_path)?,
             recipients,
+            account_recipients,
             peer: input.peer,
             tls: input.tls,
             extended,
@@ -274,7 +314,23 @@ impl Job for Delivery<'_, '_> {
         )?;
         let recipients = ReceiptRecipients::decode(&self.recipients)
             .map_err(|_| Failure::Refused(Error::Invalid))?;
-        let result = self.backend.owner.create(
+        let mut targets = Vec::new();
+        targets
+            .try_reserve_exact(self.account_recipients.len())
+            .map_err(|_| Failure::Refused(Error::Capacity))?;
+        for (account, encoded) in &self.account_recipients {
+            targets.push(postgres_receiving::Target {
+                binding: self
+                    .backend
+                    .owner
+                    .binding_for(*account)
+                    .ok_or(Failure::Refused(Error::Forbidden))?,
+                recipients: ReceiptRecipients::decode(encoded)
+                    .map_err(|_| Failure::Refused(Error::Invalid))?,
+            });
+        }
+        let result = self.backend.owner.create_fanout(
+            &targets,
             &Message {
                 bytes: &self.bytes,
                 hostname: &self.hostname,
@@ -295,11 +351,12 @@ impl Job for Delivery<'_, '_> {
         );
         match result {
             Ok(outcome) => Ok(Completion {
-                outcome: Ok(Commit {
-                    account: self.backend.owner.binding.account(),
+                outcome: Commits::new(outcome.accounts.iter().map(|(account, result)| Commit {
+                    account: *account,
                     epoch: self.backend.owner.binding.epoch(),
-                    sequence: Sequence::from_u64(outcome.new_sequence),
-                }),
+                    sequence: Sequence::from_u64(result.new_sequence),
+                }))
+                .map_err(CommitFailure::Indeterminate),
                 stop: false,
             }),
             Err(owner::Error::Publication(postgres_receiving::Error::Indeterminate)) => {

@@ -11,7 +11,6 @@ pub fn trace_allowance(hostname: &str) -> Result<usize, Error> {
 }
 
 pub struct Begin<'a, 'cfg> {
-    pub account: AccountId,
     pub config_generation: u64,
     pub peer: IpAddr,
     pub tls: ReceiptTls,
@@ -29,7 +28,7 @@ pub enum Failure {
 }
 #[must_use = "a known durable outcome survives cleanup or accounting failure"]
 pub struct Completion {
-    pub outcome: Result<Commit, CommitFailure>,
+    pub outcome: Result<Commits, CommitFailure>,
     pub stop: bool,
 }
 pub trait Job: Send {
@@ -51,4 +50,35 @@ pub trait Storage: Sync {
         input: Begin<'_, '_>,
         random: &mut td_crypto::SystemEntropy,
     ) -> Result<Self::Job<'_>, Failure>;
+}
+
+/// Complete account set for one all-or-nothing accepted DATA publication.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Commits {
+    entries: [Option<Commit>; crate::config::identities::MAX_ACCOUNTS],
+}
+impl Commits {
+    pub fn new(commits: impl IntoIterator<Item = Commit>) -> Result<Self, Error> {
+        let mut result = Self {
+            entries: [None; crate::config::identities::MAX_ACCOUNTS],
+        };
+        let mut count = 0;
+        for commit in commits {
+            if result
+                .iter()
+                .any(|prior| prior.account == commit.account || prior.epoch != commit.epoch)
+            {
+                return Err(Error::Invalid);
+            }
+            *result.entries.get_mut(count).ok_or(Error::Capacity)? = Some(commit);
+            count += 1;
+        }
+        if count == 0 {
+            return Err(Error::Invalid);
+        }
+        Ok(result)
+    }
+    pub fn iter(&self) -> impl Iterator<Item = &Commit> {
+        self.entries.iter().flatten()
+    }
 }

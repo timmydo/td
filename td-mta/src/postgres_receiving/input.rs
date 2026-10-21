@@ -56,43 +56,7 @@ pub(super) fn prepare(
         4 * crate::format::MAX_VALUE_BYTES,
         2 * crate::format::MAX_VALUE_BYTES + allowance,
     )?;
-    let row = Row::Email(EmailRow {
-        blob,
-        thread,
-        received_at: message.received_at,
-        origin: EmailOrigin::Smtp(message.receipt),
-    });
-    let size = row.encoded_len().map_err(|_| Error::Integrity)?;
-    let mut encoded = Vec::new();
-    encoded
-        .try_reserve_exact(size)
-        .map_err(|_| Error::Capacity)?;
-    encoded.resize(size, 0);
-    row.encode(&mut encoded).map_err(|_| Error::Integrity)?;
-    let mut recipients = Vec::new();
-    for address in message
-        .receipt
-        .recipients
-        .iter()
-        .map_err(|_| Error::Integrity)?
-    {
-        recipients.try_reserve(1).map_err(|_| Error::Capacity)?;
-        recipients.push(copy(address.map_err(|_| Error::Integrity)?)?);
-    }
-    let provenance = Provenance {
-        peer: message.receipt.peer,
-        tls: match message.receipt.tls {
-            ReceiptTls::Plain => 0,
-            ReceiptTls::Tls12 => 1,
-            ReceiptTls::Tls13 => 2,
-        },
-        gateway: message.receipt.gateway.map(copy).transpose()?,
-        ehlo: copy(message.receipt.ehlo)?,
-        reverse: copy(message.receipt.reverse_path)?,
-        recipients,
-        encoded,
-        received_at: message.received_at,
-    };
+    let provenance = provenance(message, blob, thread)?;
     let trace = headers::trace(
         &message.receipt,
         message.hostname,
@@ -220,4 +184,48 @@ fn header_error(error: headers::HeaderError) -> Error {
         headers::HeaderError::HeaderLimit => Error::HeaderLimit,
         headers::HeaderError::Work(error) => Error::Input(error),
     }
+}
+
+pub(super) fn provenance(
+    message: &Message<'_>,
+    blob: BlobId,
+    thread: ThreadId,
+) -> Result<Provenance, Error> {
+    let row = Row::Email(EmailRow {
+        blob,
+        thread,
+        received_at: message.received_at,
+        origin: EmailOrigin::Smtp(message.receipt),
+    });
+    let size = row.encoded_len().map_err(|_| Error::Integrity)?;
+    let mut encoded = Vec::new();
+    encoded
+        .try_reserve_exact(size)
+        .map_err(|_| Error::Capacity)?;
+    encoded.resize(size, 0);
+    row.encode(&mut encoded).map_err(|_| Error::Integrity)?;
+    let mut recipients = Vec::new();
+    for address in message
+        .receipt
+        .recipients
+        .iter()
+        .map_err(|_| Error::Integrity)?
+    {
+        recipients.try_reserve(1).map_err(|_| Error::Capacity)?;
+        recipients.push(copy(address.map_err(|_| Error::Integrity)?)?);
+    }
+    Ok(Provenance {
+        peer: message.receipt.peer,
+        tls: match message.receipt.tls {
+            ReceiptTls::Plain => 0,
+            ReceiptTls::Tls12 => 1,
+            ReceiptTls::Tls13 => 2,
+        },
+        gateway: message.receipt.gateway.map(copy).transpose()?,
+        ehlo: copy(message.receipt.ehlo)?,
+        reverse: copy(message.receipt.reverse_path)?,
+        recipients,
+        encoded,
+        received_at: message.received_at,
+    })
 }

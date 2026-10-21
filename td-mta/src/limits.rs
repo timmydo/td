@@ -24,6 +24,14 @@ pub const TLS_GENERATION_BYTES: usize = 8 * MIB;
 pub const TLS_ESTABLISHED_PROCESSING_BYTES: usize = 4 * MIB;
 /// Aggregate retained account catalogs/Sessions and cold catalog copy overlap.
 pub const ACCOUNT_METADATA_BYTES: usize = 3 * MIB;
+/// Private per-account SMTP receipt buffers and retained fanout metadata copies.
+pub const SMTP_FANOUT_METADATA_BYTES: usize = 2 * MIB;
+const _: () = assert!(
+    crate::config::identities::MAX_ACCOUNTS * crate::format::row::MAX_RECEIPT_BYTES
+        + 3 * (crate::format::row::MAX_RECEIPT_BYTES + 128 * KIB)
+        + 256 * KIB
+        <= SMTP_FANOUT_METADATA_BYTES
+);
 const _: () = assert!(2 * crate::identity_catalog::MAX_BYTES + 256 * KIB <= ACCOUNT_METADATA_BYTES);
 const _: () = assert!(
     crate::identity_catalog::MAX_BYTES
@@ -156,7 +164,7 @@ impl Reservation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResourcePlan {
     limits: Limits,
-    reservations: [Reservation; 19],
+    reservations: [Reservation; 20],
     total_bytes: usize,
     log_disk_bytes: usize,
 }
@@ -353,6 +361,11 @@ impl Limits {
                 bytes_each: TLS_GENERATION_BYTES,
             },
             Reservation {
+                name: "SMTP fanout metadata",
+                count: 1,
+                bytes_each: SMTP_FANOUT_METADATA_BYTES,
+            },
+            Reservation {
                 name: "account metadata",
                 count: 1,
                 bytes_each: ACCOUNT_METADATA_BYTES,
@@ -397,7 +410,7 @@ mod tests {
     #[test]
     fn default_ledger_pins_documented_budget() -> Result<(), ResourceError> {
         let plan = Limits::default().plan()?;
-        assert_eq!(plan.total_bytes(), 81_511_680);
+        assert_eq!(plan.total_bytes(), 83_608_832);
         const { assert!(crate::format::MAX_VALUE_BYTES + crate::format::MAX_KEY_BYTES + 48 <= 68 * KIB) };
         assert_eq!(
             READ_VIEW_SCRATCH_BYTES,
