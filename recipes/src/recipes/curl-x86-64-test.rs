@@ -1,58 +1,65 @@
-use crate::ladder::{post_rust_inputs, post_rust_tool_farm, POST_RUST_SH};
+use crate::ladder::{
+    build_root_dynamic_cc, build_root_link_map_check, LinkedLibc, BUILD_ROOT_PATH as PATH,
+    BUILD_ROOT_SH as SH,
+};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
+// The static libcurl's archive shape, and verified local-socket HTTPS through
+// it. It runs in the Debian build root: the root's binutils read the archive,
+// and the probe links through `build_root_dynamic_cc` against td glibc, its
+// map proving every archive, libc and libgcc it loaded is td's.
+const PROBE_INPUTS: &[&str] = &[
+    "gcc-runtime",
+    "curl-x86-64",
+    "libressl-x86-64",
+    "zlib-x86-64",
+];
+
 pub fn recipe() -> Recipe {
-    let sgcc = "{in:gcc-x86-64-self}/stage/td/store/gcc-14.3.0-x86_64-self/bin/gcc";
-    let sbin = "{in:binutils-x86-64-self}/bin";
-    let xglibc = "{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64";
     let curl = "{in:curl-x86-64}";
     let tls = "{in:libressl-x86-64}";
     let zlib = "{in:zlib-x86-64}";
-    let path = format!("{{tools}}:{sbin}");
 
-    let mut steps = vec![
-        post_rust_tool_farm("{in:gawk-x86-64-self}/bin/gawk"),
+    let mut steps = build_root_dynamic_cc();
+    steps.extend([
         Step::MkDir {
             path: "{root}/archive".into(),
         },
         Step::run(
             "{root}/archive",
-            &[
-                "{in:binutils-x86-64-self}/bin/ar",
-                "x",
-                &format!("{curl}/lib/libcurl.a"),
-            ],
-        ),
+            &["/usr/bin/ar", "x", &format!("{curl}/lib/libcurl.a")],
+        )
+        .env("PATH", PATH),
         Step::run(
             "{root}/archive",
             &[
-                POST_RUST_SH,
+                SH,
                 "-c",
                 "objects=0; found_version=0; \
                  for object in *.o; do \
                      test -f \"$object\" || continue; objects=$((objects+1)); \
-                     info=$('{in:binutils-x86-64-self}/bin/readelf' --debug-dump=info \"$object\") || exit 1; \
-                     sections=$('{in:binutils-x86-64-self}/bin/readelf' -S \"$object\") || exit 1; \
+                     info=$(readelf --debug-dump=info \"$object\") || exit 1; \
+                     sections=$(readelf -S \"$object\") || exit 1; \
                      printf '%s\\n' \"$sections\" | grep -Eq '^[[:space:]]*\\[[[:space:]]*[0-9]+\\][[:space:]]+\\.debug_line[[:space:]]' || { echo \"libcurl member $object has no line table\" >&2; exit 1; }; \
-                     if '{in:binutils-x86-64-self}/bin/nm' --defined-only \"$object\" | grep -Eq '[[:space:]][TtWw][[:space:]]'; then \
+                     if nm --defined-only \"$object\" | grep -Eq '[[:space:]][TtWw][[:space:]]'; then \
                          printf '%s\\n' \"$info\" | grep -Eq 'DW_AT_comp_dir.*: /td-build/lib$' || { echo \"libcurl code member $object does not use /td-build/lib\" >&2; exit 1; }; \
                      fi; \
                      if printf '%s\\n' \"$info\" | grep -Fq 'version.c'; then found_version=1; fi; \
-                     header=$('{in:binutils-x86-64-self}/bin/readelf' -h \"$object\") || exit 1; \
+                     header=$(readelf -h \"$object\") || exit 1; \
                      printf '%s\\n' \"$header\" | grep -Eq 'Class:[[:space:]]+ELF64' || { echo \"libcurl member $object is not ELF64\" >&2; exit 1; }; \
                      printf '%s\\n' \"$header\" | grep -Eq 'Machine:[[:space:]]+Advanced Micro Devices X86-64' || { echo \"libcurl member $object is not x86-64\" >&2; exit 1; }; \
                      if printf '%s\\n' \"$info\" | grep -Eq 'guix-build|/gnu/store|/td/store|/td-build-root|/td-input'; then echo \"libcurl member $object retains a noncanonical build path\" >&2; exit 1; fi; \
                  done; \
                  test \"$objects\" -gt 0 || { echo 'libcurl.a has no objects' >&2; exit 1; }; \
                  test \"$found_version\" = 1 || { echo 'libcurl.a lacks version.c' >&2; exit 1; }; \
-                 '{in:binutils-x86-64-self}/bin/nm' -u *.o | grep -Eq '[[:space:]]U[[:space:]]+clock_gettime$' || { echo 'libcurl does not use the monotonic clock' >&2; exit 1; }",
+                 nm -u *.o | grep -Eq '[[:space:]]U[[:space:]]+clock_gettime$' || { echo 'libcurl does not use the monotonic clock' >&2; exit 1; }",
             ],
         )
-        .env("PATH", &path),
+        .env("PATH", PATH),
         Step::run(
             "{root}",
             &[
-                POST_RUST_SH,
+                SH,
                 "-c",
                 // td glibc's headers reach the line tables through the build
                 // root's sysroot copy, remapped below the canonical
@@ -61,8 +68,8 @@ pub fn recipe() -> Recipe {
                 "if grep -a -oE '(/gnu/store|/td/store|/td-input|/td-build-root|guix-build)[^[:cntrl:][:space:]]*' '{in:curl-x86-64}/lib/libcurl.a' | grep -Evq '^/td-build-root/sysroot/include(/|$)'; then echo 'libcurl archive retains a noncanonical store reference' >&2; exit 1; fi",
             ],
         )
-        .env("PATH", &path),
-    ];
+        .env("PATH", PATH),
+    ]);
     steps.push(Step::WriteFile {
         path: "{root}/curl-test.c".into(),
         content: r#"#include <curl/curl.h>
@@ -443,30 +450,32 @@ int main(void) {
         .into(),
         exec: false,
     });
+    // Compiled apart, so the link map loads the object from the build
+    // directory rather than gcc's temporary.
     steps.push(
         Step::run(
             "{root}",
             &[
-                sgcc,
-                "-isystem",
-                &format!("{xglibc}/include"),
-                "-B",
-                &format!("{sbin}/"),
-                "-B",
-                &format!("{xglibc}/lib"),
-                "-L",
-                &format!("{xglibc}/lib"),
-                "-static-libgcc",
-                "-Wl,--dynamic-linker",
-                &format!("-Wl,{xglibc}/lib/ld-linux-x86-64.so.2"),
-                "-Wl,--enable-new-dtags",
-                "-Wl,-rpath",
-                &format!("-Wl,{xglibc}/lib"),
+                "{root}/wb/cc",
                 &format!("-I{curl}/include"),
                 &format!("-I{tls}/include"),
+                "-pthread",
+                "-c",
+                "-o",
+                "{root}/curl-test.o",
+                "{root}/curl-test.c",
+            ],
+        )
+        .env("PATH", PATH),
+    );
+    steps.push(
+        Step::run(
+            "{root}",
+            &[
+                "{root}/wb/cc",
                 "-o",
                 "{root}/curl-test",
-                "{root}/curl-test.c",
+                "{root}/curl-test.o",
                 &format!("{curl}/lib/libcurl.a"),
                 &format!("{tls}/lib/libssl.a"),
                 &format!("{tls}/lib/libcrypto.a"),
@@ -474,20 +483,28 @@ int main(void) {
                 "-pthread",
             ],
         )
-        .env("PATH", &path),
+        .env("PATH", PATH)
+        .env("TD_LINK_MAP", "{root}/curl-test.map"),
     );
+    steps.push(build_root_link_map_check(
+        "{root}",
+        "{root}/curl-test.map",
+        "curl-test",
+        PROBE_INPUTS,
+        LinkedLibc::Shared,
+    ));
     steps.push(
         Step::run(
             "{root}",
             &[
-                POST_RUST_SH,
+                SH,
                 "-c",
                 "actual=$('{root}/curl-test'); status=$?; \
                  if test \"$status\" -ne 0; then echo \"curl HTTPS probe failed with status $status\" >&2; exit \"$status\"; fi; \
                  test \"$actual\" = 'curl 8.21.0 verified HTTPS and rejected hostname/trust failures' || { echo \"unexpected curl result: $actual\" >&2; exit 1; }",
             ],
         )
-        .env("PATH", &path),
+        .env("PATH", PATH),
     );
     steps.push(Step::MkDir {
         path: "{out}".into(),
@@ -503,17 +520,14 @@ int main(void) {
     });
 
     Recipe::mesboot("curl-x86-64-test", "1.0")
-        .native_inputs(&post_rust_inputs(
-            "gawk-x86-64-self",
-            &[
-                "curl-x86-64",
-                "libressl-x86-64",
-                "zlib-x86-64",
-                "gcc-x86-64-self",
-                "binutils-x86-64-self",
-                "glibc-x86-64",
-            ],
-        ))
+        .build_root()
+        .native_inputs(&[
+            "curl-x86-64",
+            "libressl-x86-64",
+            "zlib-x86-64",
+            "glibc-x86-64",
+            "gcc-runtime",
+        ])
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
@@ -530,28 +544,44 @@ mod tests {
     use super::recipe;
 
     #[test]
-    fn validation_uses_only_the_final_https_closure() {
+    fn validation_uses_only_the_final_https_closure_and_the_root() {
         let recipe = recipe();
+        crate::ladder::assert_build_root_test(
+            &recipe,
+            &[
+                "curl-x86-64",
+                "libressl-x86-64",
+                "zlib-x86-64",
+                "glibc-x86-64",
+                "gcc-runtime",
+            ],
+            &[],
+        );
         assert_eq!(
             recipe.native_inputs.as_deref(),
             Some(
                 [
-                    "td-sh",
-                    "td-txt",
-                    "td-util",
-                    "uutils",
-                    "gawk-x86-64-self",
                     "curl-x86-64",
                     "libressl-x86-64",
                     "zlib-x86-64",
-                    "gcc-x86-64-self",
-                    "binutils-x86-64-self",
                     "glibc-x86-64",
+                    "gcc-runtime",
                 ]
                 .map(str::to_string)
                 .as_slice()
             )
         );
         assert!(recipe.inputs.is_none());
+        crate::ladder::assert_probe_link_checked(
+            &recipe,
+            "curl-test",
+            &[
+                "gcc-runtime",
+                "curl-x86-64",
+                "libressl-x86-64",
+                "zlib-x86-64",
+            ],
+            crate::ladder::LinkedLibc::Shared,
+        );
     }
 }

@@ -1,10 +1,10 @@
-use crate::ladder::{post_rust_inputs, post_rust_tool_farm, POST_RUST_SH};
+use crate::ladder::{BUILD_ROOT_PATH, BUILD_ROOT_SH as SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 pub fn recipe() -> Recipe {
     let openssh = "{in:openssh-x86-64}";
-    let readelf = "{in:binutils-x86-64-self}/bin/readelf";
-    let path = format!("{openssh}/bin:{{tools}}");
+    let readelf = "/usr/bin/readelf";
+    let path = format!("{openssh}/bin:{BUILD_ROOT_PATH}");
     let binaries = [
         format!("{openssh}/bin/ssh"),
         format!("{openssh}/bin/sshd"),
@@ -24,7 +24,6 @@ pub fn recipe() -> Recipe {
     let enforced = super::system_x86_64::ssh_policy::Form::Enforced;
 
     let mut steps = vec![
-        post_rust_tool_farm("{in:gawk-x86-64-self}/bin/gawk"),
         Step::Require {
             paths: binaries.to_vec(),
             exec: true,
@@ -54,7 +53,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_RUST_SH,
+                SH,
                 "-c",
                 &format!(
                     "for binary in {}; do \
@@ -90,7 +89,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_RUST_SH,
+                SH,
                 "-c",
                 &format!(
                     "v=$('{openssh}/bin/ssh' -V 2>&1) || exit 1; \
@@ -123,7 +122,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_RUST_SH,
+                SH,
                 "-c",
                 &format!(
                     "for form in sshd_config sshd_config_enforced; do \
@@ -163,15 +162,11 @@ pub fn recipe() -> Recipe {
         exec: false,
     });
 
+    // glibc-x86-64 is the programs' loader; the inspection tools are the
+    // root's binutils, which built nothing here.
     Recipe::mesboot("openssh-x86-64-test", "1.0")
-        .native_inputs(&post_rust_inputs(
-            "gawk-x86-64-self",
-            &[
-                "openssh-x86-64",
-                "glibc-x86-64",
-                "binutils-x86-64-self",
-            ],
-        ))
+        .build_root()
+        .native_inputs(&["openssh-x86-64", "glibc-x86-64"])
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
@@ -188,23 +183,15 @@ mod tests {
     use super::recipe;
 
     #[test]
-    fn validation_uses_only_the_built_client_server_and_inspection_tools() {
+    fn validation_uses_only_the_built_client_server_and_the_roots_tools() {
         let recipe = recipe();
+        crate::ladder::assert_build_root_test(&recipe, &["openssh-x86-64", "glibc-x86-64"], &[]);
         assert_eq!(
             recipe.native_inputs.as_deref(),
             Some(
-                [
-                    "td-sh",
-                    "td-txt",
-                    "td-util",
-                    "uutils",
-                    "gawk-x86-64-self",
-                    "openssh-x86-64",
-                    "glibc-x86-64",
-                    "binutils-x86-64-self",
-                ]
-                .map(str::to_string)
-                .as_slice()
+                ["openssh-x86-64", "glibc-x86-64"]
+                    .map(str::to_string)
+                    .as_slice()
             )
         );
         assert!(recipe.inputs.is_none());

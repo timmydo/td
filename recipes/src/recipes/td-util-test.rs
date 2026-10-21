@@ -1,4 +1,7 @@
-use crate::ladder::{post_rust_inputs, post_rust_tool_farm, unpack_into, POST_RUST_SH};
+use crate::ladder::{
+    build_root_link_map_check, build_root_static_cc, unpack_into, LinkedLibc,
+    BUILD_ROOT_PATH as PATH, BUILD_ROOT_SH as SH,
+};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 // td-util-test: build-shape AND behavioural validation of the diagnostics multicall.
@@ -19,27 +22,27 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 // are gated on /proc actually being mounted in the sandbox so this recipe stays
 // green wherever it runs; the boot oracle is what exercises them on the image.
 //
-// The steps run under td-sh with the post-Rust tool farm, whose grep is td-txt
-// and whose coreutils are uutils. The farm's cmp, diff, gzip and the rest are
-// td-util's own, so no assertion about td-util is graded by one of them: the
-// subject is always invoked by its store path, and a byte comparison is the
-// shell's. The format crossings take oracles td did not write: zlib's own
-// minigzip, compiled here from zlib's source against zlib-x86-64's libz.a, and a
-// newc archive GNU cpio 2.15 wrote.
+// The steps run in the Debian build root under its bash with PATH the root's
+// /usr/bin alone: no tool on PATH is td-util's, so no assertion about
+// td-util is graded by td-util. The subject is always
+// invoked by its store path, and a byte comparison is the shell's. The format
+// crossings take oracles td did not write: zlib's own minigzip, compiled here
+// by the root's gcc from zlib's source against zlib-x86-64's libz.a (its link
+// map proves libz.a, libc.a and libgcc.a are td's), the root's GNU gzip, and
+// a newc archive GNU cpio 2.15 wrote.
+const MINIGZIP_INPUTS: &[&str] = &["gcc-runtime", "zlib-x86-64"];
+
 pub fn recipe() -> Recipe {
     let bin = "{in:td-util}/bin/td-util";
-    let readelf = "{in:binutils-x86-64-self}/bin/readelf";
-    let sgcc = "{in:gcc-x86-64-self}/stage/td/store/gcc-14.3.0-x86_64-self/bin/gcc";
-    let sbin = "{in:binutils-x86-64-self}/bin";
-    let xglibc = "{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64";
+    let readelf = "/usr/bin/readelf";
     let zlib = "{in:zlib-x86-64}";
-    let mut steps = vec![post_rust_tool_farm("{in:gawk-x86-64-self}/bin/gawk")];
+    let mut steps = Vec::new();
 
     steps.push(
         Step::run(
             "{root}",
             &[
-                POST_RUST_SH,
+                SH,
                 "-c",
                 &format!(
                     "h=$('{readelf}' -h '{bin}' 2>/dev/null) || {{ echo 'readelf -h failed on td-util' >&2; exit 1; }}; \
@@ -49,13 +52,13 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", "{tools}"),
+        .env("PATH", PATH),
     );
     steps.push(
         Step::run(
             "{root}",
             &[
-                POST_RUST_SH,
+                SH,
                 "-c",
                 &format!(
                     "lout=$('{readelf}' -l '{bin}' 2>/dev/null) || {{ echo 'readelf -l failed on td-util (cannot verify absence of PT_INTERP)' >&2; exit 1; }}; \
@@ -63,13 +66,13 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", "{tools}"),
+        .env("PATH", PATH),
     );
     steps.push(
         Step::run(
             "{root}",
             &[
-                POST_RUST_SH,
+                SH,
                 "-c",
                 &format!(
                     "dout=$('{readelf}' -d '{bin}' 2>/dev/null) || {{ echo 'readelf -d failed on td-util (cannot verify absence of dynamic NEEDED)' >&2; exit 1; }}; \
@@ -77,7 +80,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", "{tools}"),
+        .env("PATH", PATH),
     );
 
     // Applet roster: the /bin symlink farm this multicall will back is generated
@@ -87,7 +90,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_RUST_SH,
+                SH,
                 "-c",
                 &format!(
                     "l=$('{bin}' --list) || {{ echo 'td-util --list failed' >&2; exit 1; }}; \
@@ -99,7 +102,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", "{tools}"),
+        .env("PATH", PATH),
     );
 
     // Dispatch through BOTH entry forms, plus the documented exit codes. `which`
@@ -109,7 +112,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_RUST_SH,
+                SH,
                 "-c",
                 &format!(
                     "p='{{in:td-util}}/bin'; \
@@ -169,15 +172,16 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", "{tools}"),
+        .env("PATH", PATH),
     );
 
     // The build-tool applets in the SHIPPED binary (opt-level=s, panic=abort,
     // which cargo's tests never build), each crossed with an independent
-    // implementation: td gzip read by zlib's minigzip and the reverse, and a
-    // GNU cpio newc archive read by td cpio. minigzip -d copies a headerless
-    // stream through, so td gzip's output must also be a whole gzip member's
-    // size, and every comparison keeps the final newline with a sentinel.
+    // implementation: td gzip read by zlib's minigzip and by GNU gzip and the
+    // reverse, and a GNU cpio newc archive read by td cpio. minigzip -d
+    // copies a headerless stream through, so td gzip's output must also be a
+    // whole gzip member's size, and every comparison keeps the final newline
+    // with a sentinel.
     // The archive is GNU cpio 2.15's `-o -H newc --reproducible --owner=0:0`
     // output for t, t/a ("alpha"), t/s and t/s/b ("bravo"), transcribed byte
     // for byte as a printf format with the block padding after its trailer
@@ -187,32 +191,50 @@ pub fn recipe() -> Recipe {
     // argv, so this text names them nowhere — the count of 28 above pins
     // that they are served.
     steps.extend(unpack_into("td-util-test-source", "{root}/zlib"));
+    steps.extend(build_root_static_cc());
+    // Compiled apart, so the link map loads the object from the build
+    // directory rather than gcc's temporary.
     steps.push(
         Step::run(
             "{root}/zlib",
             &[
-                sgcc,
-                "-static",
+                "{root}/wb/cc",
                 "-O2",
-                "-isystem",
-                &format!("{xglibc}/include"),
-                &format!("-B{sbin}/"),
-                &format!("-B{xglibc}/lib"),
-                &format!("-L{xglibc}/lib"),
                 &format!("-I{zlib}/include"),
-                "test/minigzip.c",
-                &format!("{zlib}/lib/libz.a"),
+                "-c",
                 "-o",
-                "{root}/minigzip",
+                "{root}/minigzip.o",
+                "test/minigzip.c",
             ],
         )
-        .env("PATH", sbin),
+        .env("PATH", PATH),
     );
+    steps.push(
+        Step::run(
+            "{root}/zlib",
+            &[
+                "{root}/wb/cc",
+                "-o",
+                "{root}/minigzip",
+                "{root}/minigzip.o",
+                &format!("{zlib}/lib/libz.a"),
+            ],
+        )
+        .env("PATH", PATH)
+        .env("TD_LINK_MAP", "{root}/minigzip.map"),
+    );
+    steps.push(build_root_link_map_check(
+        "{root}/zlib",
+        "{root}/minigzip.map",
+        "minigzip",
+        MINIGZIP_INPUTS,
+        LinkedLibc::Archive,
+    ));
     steps.push(
         Step::run(
             "{root}",
             &[
-                POST_RUST_SH,
+                SH,
                 "-c",
                 &format!(
                     "mg='{{root}}/minigzip'; \
@@ -229,6 +251,10 @@ pub fn recipe() -> Recipe {
                      [ \"$(cat a.out; printf .)\" = \"$(printf 'a\\n.')\" ] || {{ echo 'td gzip round-tripped through minigzip to the wrong bytes' >&2; exit 1; }}; \
                      \"$mg\" < t/s/b > b.gz && '{bin}' zcat b.gz > b.out || {{ echo 'td zcat could not read zlib gzip' >&2; exit 1; }}; \
                      [ \"$(cat b.out; printf .)\" = \"$(printf 'b\\n.')\" ] || {{ echo 'td zcat decoded zlib gzip to the wrong bytes' >&2; exit 1; }}; \
+                     gzip -d -c < a.gz > a.gnu || {{ echo 'GNU gzip could not read td gzip' >&2; exit 1; }}; \
+                     [ \"$(cat a.gnu; printf .)\" = \"$(printf 'a\\n.')\" ] || {{ echo 'td gzip round-tripped through GNU gzip to the wrong bytes' >&2; exit 1; }}; \
+                     gzip -c < t/s/b > b.gnu.gz && '{bin}' zcat b.gnu.gz > b.gnu || {{ echo 'td zcat could not read GNU gzip' >&2; exit 1; }}; \
+                     [ \"$(cat b.gnu; printf .)\" = \"$(printf 'b\\n.')\" ] || {{ echo 'td zcat decoded GNU gzip to the wrong bytes' >&2; exit 1; }}; \
                      printf '07070100000000000041ED0000000000000000000000020000000100000000000000000000000000000000000000000000000200000000t\\00007070100000001000081A40000000000000000000000010000000100000006000000000000000000000000000000000000000400000000t/a\\000\\000\\000alpha\\n\\000\\00007070100000002000041ED0000000000000000000000020000000100000000000000000000000000000000000000000000000400000000t/s\\000\\000\\00007070100000003000081A40000000000000000000000010000000100000006000000000000000000000000000000000000000600000000t/s/b\\000bravo\\n\\000\\00007070100000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000B00000000TRAILER!!!\\000\\000\\000\\000' > g.cpio; \
                      [ \"$(wc -c < g.cpio)\" -eq 600 ] || {{ echo 'the GNU cpio fixture did not reproduce' >&2; exit 1; }}; \
                      [ \"$('{bin}' cpio -t -F g.cpio | tr '\\n' ' ')\" = 't t/a t/s t/s/b ' ] || {{ echo 'td cpio -t misread a GNU cpio newc archive' >&2; exit 1; }}; \
@@ -238,7 +264,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", "{tools}"),
+        .env("PATH", PATH),
     );
 
     // The /proc-backed applets, gated on /proc being mounted in this sandbox.
@@ -249,7 +275,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_RUST_SH,
+                SH,
                 "-c",
                 &format!(
                     "if [ -r /proc/meminfo ] && [ -r /proc/1/stat ]; then \
@@ -273,7 +299,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", "{tools}"),
+        .env("PATH", PATH),
     );
 
     steps.push(Step::MkDir {
@@ -281,7 +307,7 @@ pub fn recipe() -> Recipe {
     });
     steps.push(Step::WriteFile {
         path: "{out}/result".into(),
-        content: "PASS: td-util is a statically-linked ELF64 x86-64 executable (ET_EXEC) with no PT_INTERP and no dynamic NEEDED entry; it serves exactly twenty-eight applets, among them cat/chmod/chown/clear/cmp/cpio/diff/dmesg/free/gen_init_cpio/gunzip/gzip/less/ln/mkdir/mv/od/printf/ps/readlink/rm/sleep/test/uname/which/zcat, dispatches through both the argv[0] and `td-util <applet>` forms, renames with mv and refuses its unimplemented forms, honours its exit codes (`which` 1 = not resolved, 2 = usage; `test` 0 = true, 1 = false, 2 = bad expression), interoperates with zlib's minigzip and a GNU cpio newc archive, and parses /proc for free/ps/uname where /proc is mounted\n".into(),
+        content: "PASS: td-util is a statically-linked ELF64 x86-64 executable (ET_EXEC) with no PT_INTERP and no dynamic NEEDED entry; it serves exactly twenty-eight applets, among them cat/chmod/chown/clear/cmp/cpio/diff/dmesg/free/gen_init_cpio/gunzip/gzip/less/ln/mkdir/mv/od/printf/ps/readlink/rm/sleep/test/uname/which/zcat, dispatches through both the argv[0] and `td-util <applet>` forms, renames with mv and refuses its unimplemented forms, honours its exit codes (`which` 1 = not resolved, 2 = usage; `test` 0 = true, 1 = false, 2 = bad expression), interoperates with zlib's minigzip, GNU gzip and a GNU cpio newc archive, and parses /proc for free/ps/uname where /proc is mounted\n".into(),
         exec: false,
     });
     steps.push(Step::Require {
@@ -291,15 +317,8 @@ pub fn recipe() -> Recipe {
 
     Recipe::mesboot("td-util-test", "1.0")
         .source_input("zlib-x86-64-source")
-        .native_inputs(&post_rust_inputs(
-            "gawk-x86-64-self",
-            &[
-                "binutils-x86-64-self",
-                "gcc-x86-64-self",
-                "glibc-x86-64",
-                "zlib-x86-64",
-            ],
-        ))
+        .build_root()
+        .native_inputs(&["td-util", "zlib-x86-64", "glibc-x86-64", "gcc-runtime"])
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
@@ -309,4 +328,46 @@ exec "$TD_RECIPE_EVAL" check-run td-util-test 1
 "#,
         )
         .with_runner(CheckRunner::BuildOnly)])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::recipe;
+    use crate::types::Step;
+
+    /// td-util is never graded by its own tools: every step's PATH is the
+    /// root's /usr/bin alone, and td-util is declared as the subject only.
+    #[test]
+    fn td_util_is_graded_only_by_the_roots_tools_and_zlib() {
+        let recipe = recipe();
+        crate::ladder::assert_build_root_test(
+            &recipe,
+            &["td-util", "zlib-x86-64", "glibc-x86-64", "gcc-runtime"],
+            &["td-util"],
+        );
+        assert_eq!(
+            recipe.native_inputs.as_deref(),
+            Some(
+                ["td-util", "zlib-x86-64", "glibc-x86-64", "gcc-runtime"]
+                    .map(str::to_string)
+                    .as_slice()
+            )
+        );
+        for step in recipe.steps.as_deref().unwrap_or_default() {
+            if let Step::Run { argv, env, .. } = step {
+                let paths: Vec<&str> = env
+                    .iter()
+                    .filter(|(key, _)| key == "PATH")
+                    .map(|(_, value)| value.as_str())
+                    .collect();
+                assert_eq!(paths, [crate::ladder::BUILD_ROOT_PATH], "{argv:?}");
+            }
+        }
+        crate::ladder::assert_probe_link_checked(
+            &recipe,
+            "minigzip",
+            &["gcc-runtime", "zlib-x86-64"],
+            crate::ladder::LinkedLibc::Archive,
+        );
+    }
 }

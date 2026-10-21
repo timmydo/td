@@ -1,8 +1,10 @@
+use crate::ladder::BUILD_ROOT_PATH;
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 // Behavioral validation for the installed CA bundle. The parser accepts the
 // descriptive text curl puts between certificates, but strictly balances PEM
-// boundaries and requires nonempty base64-shaped content in every block.
+// boundaries and requires nonempty base64-shaped content in every block. It
+// runs under the Debian build root's awk.
 pub fn recipe() -> Recipe {
     let bundle = "{in:ca-certificates}/share/ca-certificates/ca-bundle.crt";
     let parser = r#"
@@ -77,10 +79,7 @@ END {
 }
 "#;
     let steps = vec![
-        Step::run(
-            "{root}",
-            &["{in:gawk-x86-64-self}/bin/gawk", parser, bundle],
-        ),
+        Step::run("{root}", &["/usr/bin/awk", parser, bundle]).env("PATH", BUILD_ROOT_PATH),
         Step::WriteFile {
             path: "{out}/result".into(),
             content: "PASS: installed CA bundle contains complete PEM certificates\n".into(),
@@ -93,7 +92,7 @@ END {
     ];
 
     Recipe::mesboot("ca-certificates-test", "1.0")
-        .native_inputs(&["gawk-x86-64-self"])
+        .build_root()
         .inputs(&["ca-certificates"])
         .steps(steps)
         .checks(vec![
@@ -106,4 +105,20 @@ exec "$TD_RECIPE_EVAL" check-run ca-certificates-test 1
             )
             .with_runner(CheckRunner::BuildOnly),
         ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::recipe;
+
+    #[test]
+    fn the_bundle_is_parsed_in_the_build_root() {
+        let recipe = recipe();
+        crate::ladder::assert_build_root_test(&recipe, &["ca-certificates"], &[]);
+        assert!(recipe.native_inputs.is_none());
+        assert_eq!(
+            recipe.inputs.as_deref(),
+            Some(["ca-certificates".to_string()].as_slice())
+        );
+    }
 }

@@ -261,29 +261,7 @@ fn assert_build_root_c(recipe: &Recipe, runtime: &[&str]) {
     for required in ["glibc-x86-64", "gcc-runtime"] {
         assert!(inputs.iter().any(|input| input == required), "{required}");
     }
-    for ladder in [
-        "gcc-x86-64-self",
-        "binutils-x86-64-self",
-        "make-x86-64-self",
-        "gcc-x86-64-native",
-        "binutils-x86-64-native",
-        "gawk-x86-64-self",
-    ]
-    .into_iter()
-    .chain(POST_RUST_TOOLS.iter().map(|(input, _, _)| *input))
-    {
-        assert!(!inputs.iter().any(|input| input == ladder), "{ladder}");
-    }
-    assert!(
-        !recipe
-            .steps
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .any(|step| matches!(step, Step::ToolFarm { .. })),
-        "{} builds on the post-Rust tool farm",
-        recipe.name
-    );
+    assert_no_ladder_tools(recipe, &[]);
     let wrapper = recipe
         .steps
         .clone()
@@ -309,6 +287,216 @@ fn assert_build_root_c(recipe: &Recipe, runtime: &[&str]) {
     ] {
         assert!(wrapper.contains(required), "missing {required}");
     }
+}
+
+/// Neither input channel names a ladder toolchain or a post-Rust farm
+/// provider other than one of `subjects`, and no step builds the farm.
+#[cfg(test)]
+fn assert_no_ladder_tools(recipe: &Recipe, subjects: &[&str]) {
+    let inputs: Vec<&String> = recipe
+        .native_inputs
+        .iter()
+        .chain(recipe.inputs.iter())
+        .flatten()
+        .collect();
+    for input in &inputs {
+        assert!(!is_ladder_recipe(input), "{} uses {input}", recipe.name);
+    }
+    for farm in POST_RUST_TOOLS
+        .iter()
+        .map(|(input, _, _)| *input)
+        .filter(|input| !subjects.contains(input))
+    {
+        assert!(!inputs.iter().any(|input| *input == farm), "{farm}");
+    }
+    assert!(
+        !recipe
+            .steps
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|step| matches!(step, Step::ToolFarm { .. })),
+        "{} builds on the post-Rust tool farm",
+        recipe.name
+    );
+}
+
+/// A ladder recipe by name: the stage0/Mes/TinyCC seeds and oyacc, the
+/// mesboot rungs, the GCC/binutils/make/gawk ladder with its stages and
+/// bridges, and the ladder's glibc-241.
+#[cfg(test)]
+fn is_ladder_recipe(name: &str) -> bool {
+    const SEEDS: &[&str] = &["stage0", "mes", "tcc", "oyacc", "glibc-241", "ripgrep-seed"];
+    const FAMILIES: &[&str] = &["binutils-", "make-", "gawk-", "gcc-"];
+    SEEDS.contains(&name)
+        || name.contains("mesboot")
+        || name.contains("-stage")
+        || name.contains("bridge")
+        || name.ends_with("-self")
+        || name.ends_with("-native")
+        || (name != "gcc-runtime" && FAMILIES.iter().any(|family| name.starts_with(family)))
+}
+
+/// A test recipe that runs in the Debian build root, declaring exactly
+/// `inputs`: no ladder tool or farm (a farm provider may be the test's
+/// subject), and every run step starts the root's bash, a root tool, a
+/// declared input or a file of its own build, with one PATH of declared
+/// inputs' directories and the root's /usr/bin, never a subject's.
+#[cfg(test)]
+pub(crate) fn assert_build_root_test(recipe: &Recipe, inputs: &[&str], subjects: &[&str]) {
+    use std::collections::BTreeSet;
+    assert!(
+        recipe.build_root,
+        "{} must declare the build root",
+        recipe.name
+    );
+    let declared: BTreeSet<&str> = recipe
+        .native_inputs
+        .iter()
+        .chain(recipe.inputs.iter())
+        .flatten()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        declared,
+        inputs.iter().copied().collect::<BTreeSet<_>>(),
+        "{}",
+        recipe.name
+    );
+    assert_no_ladder_tools(recipe, subjects);
+    let input_of = |text: &str| {
+        text.strip_prefix("{in:")
+            .and_then(|rest| rest.split_once('}'))
+            .map(|(name, _)| name.to_string())
+    };
+    for step in recipe.steps.as_deref().unwrap_or_default() {
+        let Step::Run { argv, env, .. } = step else {
+            continue;
+        };
+        let program = argv.first().map(String::as_str).unwrap_or_default();
+        assert!(
+            program == BUILD_ROOT_SH
+                || ["/usr/bin/", "{root}/"]
+                    .iter()
+                    .any(|prefix| program.starts_with(prefix))
+                || input_of(program).is_some_and(|name| inputs.contains(&name.as_str())),
+            "{}: runs {program}",
+            recipe.name
+        );
+        let paths: Vec<&str> = env
+            .iter()
+            .filter(|(key, _)| key == "PATH")
+            .map(|(_, value)| value.as_str())
+            .collect();
+        assert_eq!(paths.len(), 1, "{}: {program} PATH {paths:?}", recipe.name);
+        let path = paths.first().copied().unwrap_or_default();
+        // `{in:NAME}` holds a colon of its own.
+        for dir in path.replace("{in:", "{in=").split(':') {
+            let dir = dir.replace("{in=", "{in:");
+            let input = input_of(&dir);
+            assert!(
+                dir == BUILD_ROOT_PATH
+                    || input.as_deref().is_some_and(|name| {
+                        inputs.contains(&name) && !subjects.contains(&name)
+                    }),
+                "{}: PATH {path}",
+                recipe.name
+            );
+        }
+    }
+}
+
+/// A build-root test's C probe `{root}/OUTPUT`: linked by the recipe's
+/// `{root}/wb/cc` with its map at `{root}/OUTPUT.map`, then that map checked
+/// for `libc`, admitting exactly `inputs` (gcc-runtime among them), before
+/// anything runs the probe.
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+pub(crate) fn assert_probe_link_checked(
+    recipe: &Recipe,
+    output: &str,
+    inputs: &[&str],
+    libc: LinkedLibc,
+) {
+    use std::collections::BTreeSet;
+    let steps = recipe.steps.as_deref().unwrap_or_default();
+    let probe = format!("{{root}}/{output}");
+    let map = format!("{probe}.map");
+    let script = |step: &Step| match step {
+        Step::Run { argv, .. } => argv.get(2).cloned().unwrap_or_default(),
+        _ => String::new(),
+    };
+    let object = format!("{probe}.o");
+    let compiles: Vec<usize> = steps
+        .iter()
+        .enumerate()
+        .filter(|(_, step)| {
+            matches!(step, Step::Run { argv, .. }
+                if argv.iter().any(|arg| arg == "-c") && argv.iter().any(|arg| *arg == object))
+        })
+        .map(|(position, _)| position)
+        .collect();
+    assert!(!compiles.is_empty(), "{output} is compiled");
+    for &position in &compiles {
+        assert!(
+            matches!(steps.get(position), Some(Step::Run { argv, .. })
+                if argv.first().is_some_and(|arg| arg == "{root}/wb/cc")),
+            "{output} compiles through the wrapper"
+        );
+    }
+    let link = steps
+        .iter()
+        .position(|step| {
+            matches!(step, Step::Run { argv, env, .. }
+                if argv.first().is_some_and(|arg| arg == "{root}/wb/cc")
+                    && argv.join(" ").contains(&format!("-o {probe} "))
+                    && env.iter().any(|(key, value)| key == "TD_LINK_MAP" && *value == map))
+        })
+        .expect("the probe links through the wrapper and writes its map");
+    assert!(
+        compiles.iter().all(|&position| position < link),
+        "{output} compiles before its link"
+    );
+    let (check, text) = steps
+        .iter()
+        .map(script)
+        .enumerate()
+        .find(|(_, text)| {
+            text.contains(&format!("m='{map}'"))
+                && text.contains(&format!("= '{output}'"))
+                && text.contains(&format!("$sys/{}", libc.file()))
+        })
+        .expect("the probe's map is checked");
+    assert!(link < check, "{output}'s map is checked after its link");
+    // The admitted list is the `set --` line alone; `rt=` names gcc-runtime
+    // for the libgcc requirement whether or not it is admitted.
+    let allowed = text
+        .split_once("set -- ")
+        .and_then(|(_, rest)| rest.split_once("; rt="))
+        .map(|(allowed, _)| allowed)
+        .unwrap_or_default();
+    let admitted: BTreeSet<&str> = allowed
+        .split("{in:")
+        .skip(1)
+        .filter_map(|rest| rest.split_once('}').map(|(name, _)| name))
+        .collect();
+    assert_eq!(admitted, inputs.iter().copied().collect::<BTreeSet<_>>());
+    let runs: Vec<usize> = steps
+        .iter()
+        .enumerate()
+        .filter(|(position, step)| {
+            *position != link
+                && matches!(step, Step::Run { argv, .. }
+                    if argv.first().is_some_and(|arg| *arg == probe)
+                        || argv.iter().skip(1).any(|arg| arg.contains(&format!("'{probe}'"))))
+        })
+        .map(|(position, _)| position)
+        .collect();
+    assert!(!runs.is_empty(), "{output} runs");
+    assert!(
+        runs.iter().all(|&runs| check < runs),
+        "{output} runs only after its map check"
+    );
 }
 
 /// A direct-rustc recipe stages its sibling crates file by file, so a module
@@ -575,6 +763,27 @@ fn debug_line_validation_command(producer: &str, source: &str, source_root: &str
     format!("{producer} | awk -v source='{source}' -v root='{source_root}' '{DEBUG_LINE_AWK}'")
 }
 
+/// Where a debug-line validation runs: under td-sh with the post-Rust farm's
+/// awk, or in the Debian build root under its bash and awk.
+#[derive(Clone, Copy)]
+enum AwkHost {
+    PostRust,
+    BuildRoot,
+}
+
+impl AwkHost {
+    fn run(self, command: &str) -> Step {
+        match self {
+            AwkHost::PostRust => {
+                Step::run("{root}", &[POST_RUST_SH, "-c", command]).env("PATH", "{tools}")
+            }
+            AwkHost::BuildRoot => {
+                Step::run("{root}", &[BUILD_ROOT_SH, "-c", command]).env("PATH", BUILD_ROOT_PATH)
+            }
+        }
+    }
+}
+
 /// Validate one retained DWARF-5 source file against the line-table-only
 /// companion policy. Every directory and file entry resolves below a declared
 /// stable root; the named source must resolve below `source_root`. It runs
@@ -585,15 +794,54 @@ pub fn debug_line_source_root_check(
     source: &str,
     source_root: &str,
 ) -> Step {
+    debug_line_check(AwkHost::PostRust, readelf, debug, source, source_root)
+}
+
+/// `debug_line_source_root_check` for a build-root recipe: the root's
+/// readelf, awk and bash.
+pub fn build_root_debug_line_source_root_check(
+    debug: &str,
+    source: &str,
+    source_root: &str,
+) -> Step {
+    debug_line_check(
+        AwkHost::BuildRoot,
+        "/usr/bin/readelf",
+        debug,
+        source,
+        source_root,
+    )
+}
+
+fn debug_line_check(
+    host: AwkHost,
+    readelf: &str,
+    debug: &str,
+    source: &str,
+    source_root: &str,
+) -> Step {
     let producer = format!("'{readelf}' --debug-dump=rawline '{debug}' 2>/dev/null");
-    let command = debug_line_validation_command(&producer, source, source_root);
-    Step::run("{root}", &[POST_RUST_SH, "-c", &command]).env("PATH", "{tools}")
+    host.run(&debug_line_validation_command(
+        &producer,
+        source,
+        source_root,
+    ))
 }
 
 /// Execute the shared parser against hostile captured-table shapes. This is a
 /// recipe step so the oracle uses the same declared awk as production: the
 /// post-Rust farm's, under td-sh.
 pub fn debug_line_validator_regression_steps() -> Vec<Step> {
+    debug_line_regression(AwkHost::PostRust)
+}
+
+/// `debug_line_validator_regression_steps` under the build root's awk, the
+/// one `build_root_debug_line_source_root_check` runs.
+pub fn build_root_debug_line_validator_regression_steps() -> Vec<Step> {
+    debug_line_regression(AwkHost::BuildRoot)
+}
+
+fn debug_line_regression(host: AwkHost) -> Vec<Step> {
     const GOOD: &str = r#"  Offset: 0
   DWARF Version: 5
  The Directory Table
@@ -706,7 +954,7 @@ pub fn debug_line_validator_regression_steps() -> Vec<Step> {
             content: DEBUG_LINE_AWK.into(),
             exec: false,
         },
-        Step::run("{root}", &[POST_RUST_SH, "-c", &command]).env("PATH", "{tools}"),
+        host.run(&command),
     ]
 }
 
@@ -2242,6 +2490,61 @@ mod tests {
             "dynamic-file rawline fixture passed",
         ] {
             assert!(command.contains(required), "regression omits {required}");
+        }
+    }
+
+    #[test]
+    fn build_root_line_checks_run_the_roots_readelf_awk_and_bash() {
+        let step =
+            super::build_root_debug_line_source_root_check("/out/x.debug", "main.c", "/td-build");
+        let Step::Run { argv, env, .. } = step else {
+            panic!("line-table check is not executable");
+        };
+        assert_eq!(argv.first().map(String::as_str), Some(super::BUILD_ROOT_SH));
+        assert!(env
+            .iter()
+            .any(|(k, v)| k == "PATH" && v == super::BUILD_ROOT_PATH));
+        let command = argv.get(2).expect("line-table check command");
+        assert!(command.contains("'/usr/bin/readelf' --debug-dump=rawline"));
+        let steps = super::build_root_debug_line_validator_regression_steps();
+        let Some(Step::Run { argv, env, .. }) = steps.get(1) else {
+            panic!("line-table regression check is not executable");
+        };
+        assert_eq!(argv.first().map(String::as_str), Some(super::BUILD_ROOT_SH));
+        assert!(env
+            .iter()
+            .any(|(k, v)| k == "PATH" && v == super::BUILD_ROOT_PATH));
+        let command = argv.get(2).expect("line-table regression command");
+        assert!(command.contains("traversal rawline fixture passed"));
+    }
+
+    #[test]
+    fn ladder_recipes_are_recognised_by_name() {
+        for ladder in [
+            "gawk-mesboot",
+            "bash-mesboot",
+            "gcc-x86-64-self",
+            "binutils-x86-64",
+            "make-441",
+            "gcc-x86-64-stage1",
+            "gcc-10-bridge",
+            "gcc-aarch64-cross",
+            "ripgrep-seed",
+            "tcc",
+            "stage0",
+            "oyacc",
+            "glibc-241",
+        ] {
+            assert!(super::is_ladder_recipe(ladder), "{ladder}");
+        }
+        for root in [
+            "gcc-runtime",
+            "glibc-x86-64",
+            "zlib-x86-64",
+            "td-util",
+            "curl-x86-64-test",
+        ] {
+            assert!(!super::is_ladder_recipe(root), "{root}");
         }
     }
 

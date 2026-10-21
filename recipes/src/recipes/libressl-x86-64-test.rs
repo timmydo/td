@@ -1,4 +1,7 @@
-use crate::ladder::{post_rust_inputs, post_rust_tool_farm, POST_RUST_SH};
+use crate::ladder::{
+    build_root_dynamic_cc, build_root_link_map_check, LinkedLibc, BUILD_ROOT_PATH as PATH,
+    BUILD_ROOT_SH as SH,
+};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 // Behavioral validation for the static TLS foundation. The test links a fresh
@@ -7,14 +10,15 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 // the localhost certificate, rejects a hostname mismatch, and exchanges data.
 // This catches a partial archive, missing compatibility object, broken public
 // headers, or an accidental link against ambient TLS before curl inherits it.
-pub fn recipe() -> Recipe {
-    let sgcc = "{in:gcc-x86-64-self}/stage/td/store/gcc-14.3.0-x86_64-self/bin/gcc";
-    let sbin = "{in:binutils-x86-64-self}/bin";
-    let xglibc = "{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64";
-    let tls = "{in:libressl-x86-64}";
-    let path = format!("{{tools}}:{sbin}");
+// It runs in the Debian build root: the root's binutils read the archives,
+// and the probe links through `build_root_dynamic_cc` against td glibc, its
+// map proving every archive, libc and libgcc it loaded is td's.
+const PROBE_INPUTS: &[&str] = &["gcc-runtime", "libressl-x86-64"];
 
-    let mut steps = vec![post_rust_tool_farm("{in:gawk-x86-64-self}/bin/gawk")];
+pub fn recipe() -> Recipe {
+    let tls = "{in:libressl-x86-64}";
+
+    let mut steps = build_root_dynamic_cc();
     for (name, archive, source, comp_dir_pattern, compat_members) in [
         (
             "crypto",
@@ -34,30 +38,29 @@ pub fn recipe() -> Recipe {
         steps.push(Step::MkDir {
             path: format!("{{root}}/archive/{name}"),
         });
-        steps.push(Step::run(
-            &format!("{{root}}/archive/{name}"),
-            &[
-                "{in:binutils-x86-64-self}/bin/ar",
-                "x",
-                &format!("{tls}/lib/{archive}"),
-            ],
-        ));
+        steps.push(
+            Step::run(
+                &format!("{{root}}/archive/{name}"),
+                &["/usr/bin/ar", "x", &format!("{tls}/lib/{archive}")],
+            )
+            .env("PATH", PATH),
+        );
         steps.push(
             Step::run(
                 &format!("{{root}}/archive/{name}"),
                 &[
-                    POST_RUST_SH,
+                    SH,
                     "-c",
                     &format!(
                         "found_source=0; objects=0; \
                          for object in *.o; do \
                              test -f \"$object\" || continue; objects=$((objects+1)); \
-                             info=$('{{in:binutils-x86-64-self}}/bin/readelf' --debug-dump=info \"$object\") || exit 1; \
-                             sections=$('{{in:binutils-x86-64-self}}/bin/readelf' -S \"$object\") || exit 1; \
+                             info=$(readelf --debug-dump=info \"$object\") || exit 1; \
+                             sections=$(readelf -S \"$object\") || exit 1; \
                              printf '%s\\n' \"$sections\" | grep -Eq '^[[:space:]]*\\[[[:space:]]*[0-9]+\\][[:space:]]+\\.debug_line[[:space:]]' || {{ echo \"LibreSSL {archive} member $object has no line table\" >&2; exit 1; }}; \
                              printf '%s\\n' \"$info\" | grep -Eq 'DW_AT_comp_dir.*: {comp_dir_pattern}' || {{ echo \"LibreSSL {archive} member $object does not use a canonical LibreSSL source root\" >&2; exit 1; }}; \
                              if printf '%s\\n' \"$info\" | grep -Fq '{source}'; then found_source=1; fi; \
-                             header=$('{{in:binutils-x86-64-self}}/bin/readelf' -h \"$object\") || exit 1; \
+                             header=$(readelf -h \"$object\") || exit 1; \
                              printf '%s\\n' \"$header\" | grep -Eq 'Class:[[:space:]]+ELF64' || {{ echo \"LibreSSL {archive} member $object is not ELF64\" >&2; exit 1; }}; \
                              printf '%s\\n' \"$header\" | grep -Eq 'Machine:[[:space:]]+Advanced Micro Devices X86-64' || {{ echo \"LibreSSL {archive} member $object is not x86-64\" >&2; exit 1; }}; \
                              if printf '%s\\n' \"$info\" | grep -Eq 'guix-build|/gnu/store|/td-build-root'; then echo \"LibreSSL {archive} member $object retains a foreign build path\" >&2; exit 1; fi; \
@@ -70,21 +73,21 @@ pub fn recipe() -> Recipe {
                     ),
                 ],
             )
-            .env("PATH", &path),
+            .env("PATH", PATH),
         );
     }
     steps.push(
         Step::run(
             "{root}",
             &[
-                POST_RUST_SH,
+                SH,
                 "-c",
                 "for archive in '{in:libressl-x86-64}/lib/libcrypto.a' '{in:libressl-x86-64}/lib/libssl.a'; do \
                      if grep -a -Fq '/gnu/store' \"$archive\"; then echo 'LibreSSL archive retains a foreign store reference' >&2; exit 1; fi; \
                  done",
             ],
         )
-        .env("PATH", &path),
+        .env("PATH", PATH),
     );
     steps.push(Step::WriteFile {
         path: "{root}/tls-test.c".into(),
@@ -255,47 +258,57 @@ int main(void) {
         .into(),
         exec: false,
     });
+    // Compiled apart, so the link map loads the object from the build
+    // directory rather than gcc's temporary.
     steps.push(
         Step::run(
             "{root}",
             &[
-                sgcc,
-                "-isystem",
-                &format!("{xglibc}/include"),
-                "-B",
-                &format!("{sbin}/"),
-                "-B",
-                &format!("{xglibc}/lib"),
-                "-L",
-                &format!("{xglibc}/lib"),
-                "-static-libgcc",
-                "-Wl,--dynamic-linker",
-                &format!("-Wl,{xglibc}/lib/ld-linux-x86-64.so.2"),
-                "-Wl,--enable-new-dtags",
-                "-Wl,-rpath",
-                &format!("-Wl,{xglibc}/lib"),
+                "{root}/wb/cc",
                 &format!("-I{tls}/include"),
-                "-o",
-                "{root}/tls-test",
-                "{root}/tls-test.c",
-                &format!("{tls}/lib/libssl.a"),
-                &format!("{tls}/lib/libcrypto.a"),
                 "-pthread",
+                "-c",
+                "-o",
+                "{root}/tls-test.o",
+                "{root}/tls-test.c",
             ],
         )
-        .env("PATH", &path),
+        .env("PATH", PATH),
     );
     steps.push(
         Step::run(
             "{root}",
             &[
-                POST_RUST_SH,
+                "{root}/wb/cc",
+                "-o",
+                "{root}/tls-test",
+                "{root}/tls-test.o",
+                &format!("{tls}/lib/libssl.a"),
+                &format!("{tls}/lib/libcrypto.a"),
+                "-pthread",
+            ],
+        )
+        .env("PATH", PATH)
+        .env("TD_LINK_MAP", "{root}/tls-test.map"),
+    );
+    steps.push(build_root_link_map_check(
+        "{root}",
+        "{root}/tls-test.map",
+        "tls-test",
+        PROBE_INPUTS,
+        LinkedLibc::Shared,
+    ));
+    steps.push(
+        Step::run(
+            "{root}",
+            &[
+                SH,
                 "-c",
                 "actual=$('{root}/tls-test') || { echo 'LibreSSL verified-handshake probe failed' >&2; exit 1; }; \
                  [ \"$actual\" = 'LibreSSL 4.3.2 verified TLS handshake OK' ] || { echo \"unexpected LibreSSL result: $actual\" >&2; exit 1; }",
             ],
         )
-        .env("PATH", &path),
+        .env("PATH", PATH),
     );
     steps.push(Step::MkDir {
         path: "{out}".into(),
@@ -311,19 +324,12 @@ int main(void) {
     });
 
     Recipe::mesboot("libressl-x86-64-test", "1.0")
-        .native_inputs(&post_rust_inputs(
-            "gawk-x86-64-self",
-            &[
-                "libressl-x86-64",
-                "gcc-x86-64-self",
-                "binutils-x86-64-self",
-                "glibc-x86-64",
-            ],
-        ))
+        .build_root()
+        .native_inputs(&["libressl-x86-64", "glibc-x86-64", "gcc-runtime"])
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
-echo ">> recipe-check libressl-x86-64-test: build LibreSSL from source with td's final native toolchain and create a TLS client context from its static archives"
+echo ">> recipe-check libressl-x86-64-test: build LibreSSL from source in the Debian build root and drive a verified TLS handshake through its static archives"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run libressl-x86-64-test 1
 "#,
@@ -336,26 +342,27 @@ mod tests {
     use super::recipe;
 
     #[test]
-    fn validation_uses_only_the_final_tls_and_toolchain_outputs() {
+    fn validation_uses_only_the_final_tls_outputs_and_the_root() {
         let recipe = recipe();
+        crate::ladder::assert_build_root_test(
+            &recipe,
+            &["libressl-x86-64", "glibc-x86-64", "gcc-runtime"],
+            &[],
+        );
         assert_eq!(
             recipe.native_inputs.as_deref(),
             Some(
-                [
-                    "td-sh",
-                    "td-txt",
-                    "td-util",
-                    "uutils",
-                    "gawk-x86-64-self",
-                    "libressl-x86-64",
-                    "gcc-x86-64-self",
-                    "binutils-x86-64-self",
-                    "glibc-x86-64",
-                ]
-                .map(str::to_string)
-                .as_slice()
+                ["libressl-x86-64", "glibc-x86-64", "gcc-runtime"]
+                    .map(str::to_string)
+                    .as_slice()
             )
         );
         assert!(recipe.inputs.is_none());
+        crate::ladder::assert_probe_link_checked(
+            &recipe,
+            "tls-test",
+            &["gcc-runtime", "libressl-x86-64"],
+            crate::ladder::LinkedLibc::Shared,
+        );
     }
 }

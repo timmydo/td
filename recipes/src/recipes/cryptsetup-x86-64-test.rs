@@ -1,21 +1,20 @@
 use super::cryptsetup_x86_64::VERSION_LINE;
-use crate::ladder::{post_rust_inputs, post_rust_tool_farm, POST_RUST_SH};
+use crate::ladder::{BUILD_ROOT_PATH as PATH, BUILD_ROOT_SH as SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 // Check the realized cryptsetup's compiled-in surface: the exact feature line,
 // no external token loader, AES-XTS LUKS defaults and a shipped debug
 // companion. LUKS2 I/O needs the target kernel's AF_ALG and device mapper,
 // which the build host need not provide, so encrypted read/write belongs to
-// the QEMU oracle (td-install/ENCRYPTION.md, acceptance evidence).
+// the QEMU oracle (td-install/ENCRYPTION.md, acceptance evidence). The checks
+// run in the Debian build root under its bash and grep.
 pub fn recipe() -> Recipe {
     let cs = "{in:cryptsetup-x86-64}";
-    let path = "{tools}";
     let steps = vec![
-        post_rust_tool_farm("{in:gawk-x86-64-self}/bin/gawk"),
         Step::run(
             "{root}",
             &[
-                POST_RUST_SH,
+                SH,
                 "-c",
                 &format!(
                     "v=$('{cs}/bin/cryptsetup' --version) || exit 1; \
@@ -27,7 +26,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", path),
+        .env("PATH", PATH),
         Step::MkDir {
             path: "{out}".into(),
         },
@@ -43,7 +42,8 @@ pub fn recipe() -> Recipe {
     ];
 
     Recipe::mesboot("cryptsetup-x86-64-test", "1.0")
-        .native_inputs(&post_rust_inputs("gawk-x86-64-self", &["cryptsetup-x86-64"]))
+        .build_root()
+        .native_inputs(&["cryptsetup-x86-64"])
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
@@ -53,4 +53,19 @@ exec "$TD_RECIPE_EVAL" check-run cryptsetup-x86-64-test 1
 "#,
         )
         .with_runner(CheckRunner::BuildOnly)])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::recipe;
+
+    #[test]
+    fn the_checks_run_in_the_build_root() {
+        let recipe = recipe();
+        crate::ladder::assert_build_root_test(&recipe, &["cryptsetup-x86-64"], &[]);
+        assert_eq!(
+            recipe.native_inputs.as_deref(),
+            Some(["cryptsetup-x86-64".to_string()].as_slice())
+        );
+    }
 }

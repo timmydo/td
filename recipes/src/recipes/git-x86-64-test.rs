@@ -1,18 +1,29 @@
 use crate::ladder::{
-    debug_line_source_root_check, debug_line_validator_regression_steps, post_rust_inputs,
-    post_rust_tool_farm, POST_RUST_SH,
+    build_root_debug_line_source_root_check, build_root_debug_line_validator_regression_steps,
+    BUILD_ROOT_PATH, BUILD_ROOT_SH as SH,
 };
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
+
+// Git's shipped ELFs, scripts and line tables, its local and service
+// workflows, and its HTTPS and SSH dispatch. It runs in the Debian build
+// root: the root's bash, coreutils, grep and readelf grade it, and the
+// root's awk validates the line tables.
+
+// The shipped scripts that start with a shebang, per directory: Git's ten
+// SCRIPT_SH programs, and the fourteen hook samples (upstream's perl
+// fsmonitor-watchman.sample and thirteen `#!/bin/sh`). Exact per directory,
+// so neither count can be met by the other's scripts.
+const SHEBANG_SCRIPTS_LIBEXEC: usize = 10;
+const SHEBANG_SCRIPTS_HOOKS: usize = 14;
 
 pub fn recipe() -> Recipe {
     let git = "{in:git-x86-64}";
     let curl_test = "{in:curl-x86-64-test}";
     let openssh = "{in:openssh-x86-64}";
     let openssh_test = "{in:openssh-x86-64-test}";
-    let readelf = "{in:binutils-x86-64-self}/bin/readelf";
-    let path = format!("{git}/bin:{git}/libexec/git-core:{openssh}/bin:{{tools}}");
+    let readelf = "/usr/bin/readelf";
+    let path = format!("{git}/bin:{git}/libexec/git-core:{openssh}/bin:{BUILD_ROOT_PATH}");
     let mut steps = vec![
-        post_rust_tool_farm("{in:gawk-x86-64-self}/bin/gawk"),
         Step::Require {
             paths: vec![
                 format!("{git}/bin/git"),
@@ -44,7 +55,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_RUST_SH,
+                SH,
                 "-c",
                 &format!(
                     "grep -Fq 'PASS: curl 8.21.0 performs verified local-socket HTTPS' '{curl_test}/result' || \
@@ -67,18 +78,20 @@ pub fn recipe() -> Recipe {
                              if grep -a -Fq \"$forbidden\" \"$binary\"; then echo \"Git binary retains forbidden path $forbidden\" >&2; exit 1; fi; \
                          done; \
                      done; \
-                     r=0; grep -r -a -l -F -e '{{in:td-sh}}' -e /usr/bin/bash '{git}' > build-shell.refs || r=$?; \
-                     [ \"$r\" = 1 ] || {{ echo \"Git output names a build shell (grep status $r):\" >&2; cat build-shell.refs >&2; exit 1; }}; \
-                     scripts=0; \
-                     for script in '{git}'/libexec/git-core/* '{git}'/share/git-core/templates/hooks/*; do \
-                         [ -f \"$script\" ] || continue; \
-                         IFS= read -r first < \"$script\" || continue; \
-                         case $first in '#!'*) ;; *) continue;; esac; \
-                         scripts=$((scripts+1)); \
-                         [ \"$first\" = '#!/bin/sh' ] || [ \"${{script##*/}}\" = fsmonitor-watchman.sample ] || \
-                             {{ echo \"$script starts $first, not #!/bin/sh\" >&2; exit 1; }}; \
-                     done; \
-                     [ $scripts -ge 10 ] || {{ echo \"only $scripts shipped scripts carry a shebang\" >&2; exit 1; }}"
+                     r=0; grep -r -a -l -F -e /bin/bash '{git}' > build-shell.refs || r=$?; \
+                     [ \"$r\" = 1 ] || {{ echo \"Git output names the build root's bash (grep status $r):\" >&2; cat build-shell.refs >&2; exit 1; }}; \
+                     for pair in 'libexec/git-core {SHEBANG_SCRIPTS_LIBEXEC}' 'share/git-core/templates/hooks {SHEBANG_SCRIPTS_HOOKS}'; do \
+                         dir=${{pair% *}}; want=${{pair##* }}; scripts=0; \
+                         for script in '{git}'/$dir/*; do \
+                             [ -f \"$script\" ] || continue; \
+                             IFS= read -r first < \"$script\" || continue; \
+                             case $first in '#!'*) ;; *) continue;; esac; \
+                             scripts=$((scripts+1)); \
+                             [ \"$first\" = '#!/bin/sh' ] || [ \"${{script##*/}}\" = fsmonitor-watchman.sample ] || \
+                                 {{ echo \"$script starts $first, not #!/bin/sh\" >&2; exit 1; }}; \
+                         done; \
+                         [ $scripts = $want ] || {{ echo \"$dir ships $scripts scripts with a shebang, expected $want\" >&2; exit 1; }}; \
+                     done"
                 ),
             ],
         )
@@ -90,14 +103,14 @@ pub fn recipe() -> Recipe {
             path: "{root}/work".into(),
         },
         // GIT_SSH is executed directly; GIT_SSH_COMMAND would go through the
-        // compiled /bin/sh, which the sandbox lacks. The probe runs the
+        // compiled /bin/sh, here the root's dash. The probe runs the
         // verified ssh and records each call's status: git's -G variant
         // check exits 0, and the connection attempt 255, ssh's own failure,
         // where a failure to run ssh at all is 126 or 127.
         Step::WriteFile {
             path: "{root}/ssh-probe".into(),
             content: format!(
-                "#!{POST_RUST_SH}\n\
+                "#!{SH}\n\
                  '{openssh}/bin/ssh' -F /dev/null -o BatchMode=yes \"$@\"\n\
                  s=$?\n\
                  printf '%s ' \"$s\" >> '{{root}}/ssh-status'\n\
@@ -106,7 +119,7 @@ pub fn recipe() -> Recipe {
             exec: true,
         },
     ];
-    steps.extend(debug_line_validator_regression_steps());
+    steps.extend(build_root_debug_line_validator_regression_steps());
     for (debug, source) in [
         (format!("{git}/lib/debug/bin/git.debug"), "git.c"),
         (
@@ -118,8 +131,7 @@ pub fn recipe() -> Recipe {
             "sh-i18n--envsubst.c",
         ),
     ] {
-        steps.push(debug_line_source_root_check(
-            readelf,
+        steps.push(build_root_debug_line_source_root_check(
             &debug,
             source,
             "/td-build",
@@ -129,7 +141,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}/work",
             &[
-                POST_RUST_SH,
+                SH,
                 "-c",
                 "git init -b main repo || exit 1; \
                  cd repo || exit 1; \
@@ -196,17 +208,14 @@ pub fn recipe() -> Recipe {
     });
 
     Recipe::mesboot("git-x86-64-test", "1.0")
-        .native_inputs(&post_rust_inputs(
-            "gawk-x86-64-self",
-            &[
-                "git-x86-64",
-                "curl-x86-64-test",
-                "openssh-x86-64",
-                "openssh-x86-64-test",
-                "glibc-x86-64",
-                "binutils-x86-64-self",
-            ],
-        ))
+        .build_root()
+        .native_inputs(&[
+            "git-x86-64",
+            "curl-x86-64-test",
+            "openssh-x86-64",
+            "openssh-x86-64-test",
+            "glibc-x86-64",
+        ])
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
@@ -225,21 +234,26 @@ mod tests {
     #[test]
     fn validation_composes_git_with_both_verified_transport_oracles() {
         let recipe = recipe();
+        crate::ladder::assert_build_root_test(
+            &recipe,
+            &[
+                "git-x86-64",
+                "curl-x86-64-test",
+                "openssh-x86-64",
+                "openssh-x86-64-test",
+                "glibc-x86-64",
+            ],
+            &[],
+        );
         assert_eq!(
             recipe.native_inputs.as_deref(),
             Some(
                 [
-                    "td-sh",
-                    "td-txt",
-                    "td-util",
-                    "uutils",
-                    "gawk-x86-64-self",
                     "git-x86-64",
                     "curl-x86-64-test",
                     "openssh-x86-64",
                     "openssh-x86-64-test",
                     "glibc-x86-64",
-                    "binutils-x86-64-self",
                 ]
                 .map(str::to_string)
                 .as_slice()
@@ -262,5 +276,19 @@ mod tests {
         assert!(commands.iter().all(|command| {
             command.contains("/td-build") && !command.contains("DW_AT_comp_dir")
         }));
+
+        let shebangs = recipe
+            .steps
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|step| {
+                matches!(step, Step::Run { argv, .. } if argv.get(2).is_some_and(|script| {
+                    script.contains("'libexec/git-core 10'")
+                        && script.contains("'share/git-core/templates/hooks 14'")
+                        && script.contains("[ $scripts = $want ]")
+                }))
+            });
+        assert!(shebangs, "each script directory is counted on its own");
     }
 }
