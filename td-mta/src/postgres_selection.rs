@@ -54,6 +54,12 @@ pub struct Change {
     request_digest: [u8; 32],
 }
 impl Change {
+    pub(crate) fn epoch(self) -> StoreEpoch {
+        self.epoch
+    }
+    pub(crate) fn matches_candidate(self, candidate: &Candidate) -> bool {
+        self.epoch == candidate.epoch() && &self.source_digest == candidate.digest()
+    }
     pub fn operation(self) -> ConfigurationSelectionId {
         self.operation
     }

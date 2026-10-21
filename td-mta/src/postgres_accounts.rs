@@ -37,6 +37,13 @@ pub struct Creation {
     inbox: MailboxId,
 }
 impl Creation {
+    pub(crate) fn retained(epoch: StoreEpoch, account: AccountId, inbox: MailboxId) -> Self {
+        Self {
+            epoch,
+            account,
+            inbox,
+        }
+    }
     pub fn epoch(self) -> StoreEpoch {
         self.epoch
     }

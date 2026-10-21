@@ -2531,11 +2531,13 @@ fn real_postgres_executable_receives_and_serves_database_profiles() {
     acme::real_postgres_acme_fences_ownership_and_pins_complete_pairs();
     recovery::real_postgres_restore_quarantines_pending_delivery_and_changes_epoch();
     recovery::real_postgres_recovery_uncertain_commit_keeps_retained_new_epoch();
+    exercise_configuration(ConfigurationExercise::AccountAdmin);
     exercise_configuration(ConfigurationExercise::MultiAccount);
     exercise_configuration(ConfigurationExercise::Serving);
 }
 
 enum ConfigurationExercise {
+    AccountAdmin,
     MultiAccount,
     Serving,
     ReceivingTls,
@@ -3197,6 +3199,10 @@ per_peer_limit = 1
         td_mta::postgres_accounts::prepare(epoch, account).unwrap(),
     )
     .unwrap();
+    if matches!(exercise, ConfigurationExercise::AccountAdmin) {
+        account_workflow::exercise(&fixture, &request, &trust, epoch, &connection);
+        return;
+    }
     if matches!(exercise, ConfigurationExercise::MultiAccount) {
         multi_account::exercise(&fixture, &request, &trust, epoch, &shared, &desktop);
         return;
@@ -3310,7 +3316,7 @@ per_peer_limit = 1
         );
         if name == "desktop" {
             match exercise {
-                ConfigurationExercise::MultiAccount => {
+                ConfigurationExercise::AccountAdmin | ConfigurationExercise::MultiAccount => {
                     panic!("multi-account fixture must return before singleton exercises")
                 }
                 ConfigurationExercise::Client
@@ -12279,3 +12285,12 @@ mod acme;
 
 #[path = "postgres_probe/recovery.rs"]
 mod recovery;
+
+#[path = "postgres_probe/account_workflow.rs"]
+mod account_workflow;
+
+#[test]
+#[ignore = "real local PostgreSQL 17 tools required"]
+fn real_postgres_account_administration_resumes_and_preserves_other_accounts() {
+    exercise_configuration(ConfigurationExercise::AccountAdmin);
+}

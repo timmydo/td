@@ -197,7 +197,10 @@ fn field<'a>(bytes: &mut &'a [u8]) -> Result<&'a [u8], Error> {
     let count = number(take(bytes, 8)?)?;
     take(bytes, count)
 }
-fn decode(mut bytes: &[u8], epoch: StoreEpoch) -> Result<(&[u8], Vec<Profile<'_>>), Error> {
+pub(crate) fn decode(
+    mut bytes: &[u8],
+    epoch: StoreEpoch,
+) -> Result<(&[u8], Vec<Profile<'_>>), Error> {
     if bytes.len() > MAX_WIRE
         || take(&mut bytes, configuration::DIGEST_DOMAIN.len())? != configuration::DIGEST_DOMAIN
     {

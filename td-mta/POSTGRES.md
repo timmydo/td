@@ -6544,3 +6544,81 @@ multi-account release transaction. Expiring leases remain the fallback if cleanu
 cannot complete. Claim receipt counts do not grow with idle scheduling turns.
 Account-scoped route ownership and health match the existing database keys;
 there is no schema migration or global smart-host concurrency promise.
+
+## Account administration workflow
+
+`postgres account-list --connection-file PATH [--epoch HEX]` reports the
+selected generation/version and account, receiving-alias and sending-identity
+records. Account IDs remain stable when the name or login username changes.
+The record `section` distinguishes account, alias, identity and identity_address;
+`id` is the stanza label. Names and addresses are JSON-escaped. This is a
+configuration observation, not proof that a process serves that generation.
+Current listing and editing revalidate referenced materials; expired or invalid
+certificates can prevent them, as for config-check.
+
+The following owner-side commands replace manual source decoding and SQL:
+
+```text
+td-mta postgres account-create --connection-file PATH --address EMAIL \
+  [--name NAME] [--username USER] --operation-file PATH
+td-mta postgres account-update --connection-file PATH --account ID \
+  [--name NAME] [--username USER] --operation-file PATH
+td-mta postgres account-alias-add --connection-file PATH --account ID \
+  --address EMAIL --operation-file PATH
+td-mta postgres account-alias-remove --connection-file PATH --account ID \
+  --address EMAIL --operation-file PATH
+td-mta postgres account-apply --connection-file PATH --operation-file PATH
+td-mta postgres account-operation-inspect --connection-file PATH --operation-file PATH
+```
+
+Create/update/alias commands accept an optional `--epoch`; otherwise they
+inspect the database epoch before preparing the operation. Create defaults
+name and username to the address. The address's domain must already be
+configured. It generates an account, Inbox and sending identity, and adds an
+explicit receiving alias. Other folders can be created by the client. An
+alias alone never grants permission to send from that address. Update changes
+only supplied name/username fields, not aliases, identities, credentials,
+account IDs or stored messages. No destructive account deletion is offered.
+These commands retain the existing 16-account bound.
+
+The operation file must not exist and must have a checked private mode-0700
+parent with trusted ancestors. It is created exclusively as mode 0600, then
+both file and parent are synced **before any database mutation**. A bounded,
+versioned, SHA-256-checked record retains the exact account/Inbox IDs, source
+bytes, configuration version and compare-and-swap selection request. It
+contains configuration material references, not resolved material secrets.
+The checksum detects corruption, not a malicious operator; PostgreSQL owner
+credentials remain the authority. Source input remains bounded to 2 MiB;
+operation framing allows another 2048 bytes. No subprocess implements editing
+or SQL, and unrelated source bytes/comments are retained.
+
+Each command validates the complete edited configuration, bootstraps a new
+account if required, stores the immutable version, and selects it against the
+original observed generation. A first-to-second-account change makes the old
+singleton postmaster explicit in every profile where it was implicit. Every
+profile still passes the ordinary routing, identity, material and quota checks.
+Concurrent changes return a conflict rather than silently rebasing.
+
+These steps are resumable, not one cross-operation transaction. Failure can
+leave bootstrapped account storage or an unselected configuration version;
+it cannot partially select a configuration. Keep the operation file and use
+`account-apply` after interruption or an uncertain result. It reuses the exact
+bootstrap and version IDs, syncs the loaded file and parent before writes,
+and resolves the selection receipt before current
+material validation. Never remove the file and retry create with fresh IDs to
+resolve uncertainty. A missing receipt is not proof an earlier request cannot
+still commit. A known generation conflict requires a newly prepared edit of
+current configuration; retain the original for inspection.
+
+Successful selection fences old instances; restart **every affected mail
+instance** before considering the account available. Output always says
+`profile_activated:false` and marks receipts historical. Reapplying an old
+successful operation reports its original receipt without replacing a newer
+selection. It does not prove that version is still selected. Credentials use
+the existing `device-create`, `device-list` and `device-revoke` commands; a
+username change does not revoke them.
+
+Native tests exercise executable create/list/alias commands, protected
+operation permissions, first-to-second postmaster preservation, exact replay,
+conflicting edits, and selection commit uncertainty. They verify unrelated
+accounts and identities survive and account storage is not duplicated.

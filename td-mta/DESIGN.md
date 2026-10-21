@@ -1515,6 +1515,18 @@ Current commands use stable JSON output and exit codes:
 | `postgres schema-init`, `postgres schema-inspect`, `postgres schema-upgrade` | Explicit database schema administration |
 | `postgres account-init`, `postgres account-inspect` | Account initialization and inspection |
 
+The owner-side `postgres account-create`, `account-update`, `account-alias-add`
+and `account-alias-remove` commands edit the selected immutable source set,
+validate every profile and retain an operation file before database writes.
+Creation provisions the Inbox, receiving address and one sending identity;
+alias edits change receiving only. The first account remains the implicit
+postmaster when a second is added. `account-apply` resumes the same operation;
+`account-operation-inspect` resolves its historical selection receipt.
+Concurrent edits conflict rather than overwriting a newer generation.
+`account-list` reports selected account, alias and identity configuration.
+None of these commands starts or restarts a service or provisions a device
+password. POSTGRES.md owns their retention and partial-completion contract.
+
 POSTGRES.md specifies arguments and the remaining database commands. The
 private Unix control socket carries status and stop only; database changes
 use authenticated PostgreSQL connections. Its directory permissions establish
@@ -1523,7 +1535,9 @@ Physical backup and recovery use PostgreSQL tooling. Readiness does not
 contact Migadu or a CA. Configuration errors do not echo supplied secrets.
 
 Listener address changes, data-root changes, and pool sizing require restart.
-Aliases, device revocations, and validated certificates can reload. Revocation
+Account and alias configuration changes also require restart. Device
+revocations are observed from PostgreSQL; managed certificates trigger bounded
+drain and reload. Revocation
 is rechecked before a mutation commits; a connection is not permanent authority.
 Reload has bounded coexistence memory and records the effective generation.
 

@@ -781,3 +781,51 @@ and confirm that they present the intended certificate and expiration. Keep
 the old files and selected configuration receipt for diagnosing a failed
 rotation. Do not claim live reload or automatic ACME support from this manual
 procedure.
+
+## Add or edit a mailbox
+
+Run administration as the installation's service owner with its protected
+owner connection file. Choose a fresh operation filename in a private
+mode-0700 operator directory. For an already configured domain:
+
+```text
+td-mta postgres account-create --connection-file /private/owner-connection \
+  --address person@example.net --name "Person" \
+  --operation-file /private/operators/person-create.operation
+```
+
+The result identifies the new account and selected configuration. Restart the
+frontend, receiving and relay instances using your supervisor. Then provision
+a client password using the returned account ID and the store epoch reported
+by `account-list`:
+
+```text
+td-mta postgres account-list --connection-file /private/owner-connection
+td-mta postgres device-create --connection-file /private/owner-connection \
+  --epoch EPOCH --account ACCOUNT --label "td-mail laptop"
+```
+
+Device creation outputs the generated password once. Keep it in the client's
+private credential file; do not put it in a command line or ordinary log.
+Configure td-mail with the HTTPS discovery URL and the new address as username.
+Use `--username` during creation if a different login is wanted.
+
+`account-update` changes display name/login; `account-alias-add` and
+`account-alias-remove` change receiving addresses. They each take a fresh
+`--operation-file` and also require mail instance restart after selection.
+Aliases are local mailbox routes, never forwarding destinations or additional
+sending identities. The domain and smarthost sender authorization are configured
+separately. These commands do not change DNS or provider configuration.
+
+If a command is interrupted, retain its operation file and run:
+
+```text
+td-mta postgres account-operation-inspect --connection-file /private/owner-connection \
+  --operation-file /private/operators/person-create.operation
+td-mta postgres account-apply --connection-file /private/owner-connection \
+  --operation-file /private/operators/person-create.operation
+```
+
+A receipt describes that operation's publication, not current service readiness.
+Use `account-list` to inspect the current selection and service readiness checks
+after restart. See POSTGRES.md for partial completion and concurrent-edit rules.

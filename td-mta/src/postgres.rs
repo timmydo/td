@@ -8,6 +8,7 @@ use std::{
 use td_mta::{postgres_input::Loaded, postgres_probe, postgres_resolver, postgres_schema};
 
 mod account;
+mod account_admin;
 mod audit;
 mod blob_audit;
 mod configuration;
@@ -84,6 +85,9 @@ fn arguments(operation: Operation, mut args: impl Iterator<Item = OsString>) -> 
 
 pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<ExitCode> {
     let command = args.next();
+    if let Some(command) = command.as_deref().and_then(account_admin::Command::parse) {
+        return account_admin::run(command, args);
+    }
     if command.as_deref() == Some(OsStr::new("recovery-release")) {
         return recovery::run(args);
     }

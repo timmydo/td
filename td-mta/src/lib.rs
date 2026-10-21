@@ -285,3 +285,6 @@ pub mod postgres_logs;
 pub mod acme;
 
 pub mod postgres_acme;
+
+pub mod account_configuration;
+pub mod postgres_account_admin;
