@@ -345,18 +345,22 @@ fn assert_no_ladder_tools(recipe: &Recipe, subjects: &[&str]) {
 
 /// A ladder recipe by name: the stage0/Mes/TinyCC seeds and oyacc, the
 /// mesboot rungs, the GCC/binutils/make/gawk ladder with its stages and
-/// bridges, and the ladder's glibc-241.
+/// bridges, and the ladder's glibc-241. gcc-runtime and its stage1 build
+/// in the Debian build root.
 #[cfg(test)]
 fn is_ladder_recipe(name: &str) -> bool {
     const SEEDS: &[&str] = &["stage0", "mes", "tcc", "oyacc", "glibc-241", "ripgrep-seed"];
     const FAMILIES: &[&str] = &["binutils-", "make-", "gawk-", "gcc-"];
+    if name == "gcc-runtime" || name.starts_with("gcc-runtime-") {
+        return false;
+    }
     SEEDS.contains(&name)
         || name.contains("mesboot")
         || name.contains("-stage")
         || name.contains("bridge")
         || name.ends_with("-self")
         || name.ends_with("-native")
-        || (name != "gcc-runtime" && FAMILIES.iter().any(|family| name.starts_with(family)))
+        || FAMILIES.iter().any(|family| name.starts_with(family))
 }
 
 /// A test recipe that runs in the Debian build root, declaring exactly
@@ -2513,7 +2517,7 @@ mod tests {
             "gcc-x86-64-self",
             "binutils-x86-64",
             "make-441",
-            "gcc-x86-64-stage1",
+            "gcc-x86-64-stage2",
             "gcc-10-bridge",
             "gcc-aarch64-cross",
             "ripgrep-seed",
@@ -2526,6 +2530,7 @@ mod tests {
         }
         for root in [
             "gcc-runtime",
+            "gcc-runtime-stage1",
             "glibc-x86-64",
             "zlib-x86-64",
             "td-util",
@@ -2579,6 +2584,14 @@ mod tests {
         "gcc-x86-64-native-test",
         "gcc-x86-64-stage2-test",
         "glibc-241",
+        // glibc-241's build tools, which the ladder's glibc-x86-64 also took
+        // before it moved into the Debian build root; bootstrap-root exports
+        // until the ladder goes.
+        "bison-mesboot",
+        "glibc-mesboot-shared",
+        "m4-mesboot",
+        "make-441",
+        "python-mesboot",
         "hello",
         "hello-test",
         "make-test",

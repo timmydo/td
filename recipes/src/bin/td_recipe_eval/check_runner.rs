@@ -9613,17 +9613,20 @@ mod tests {
                 "freedesktop-platform-25-08-source".to_string(),
             ]
         );
-        // The members built in the Debian build root: the kernel, the
-        // upstream toolchain's runtime, zlib, cryptsetup with its libraries,
-        // OpenSSH, Git with curl and LibreSSL, and td-link, whose throwaway
-        // first stage the root's GCC links.
+        // The members built in the Debian build root: the kernel, glibc and
+        // the static libgcc it links, the upstream toolchain's runtime,
+        // zlib, cryptsetup with its libraries, OpenSSH, Git with curl and
+        // LibreSSL, and td-link, whose throwaway first stage the root's GCC
+        // links.
         assert_eq!(
             answer.build_root_members,
             [
                 "cryptsetup-x86-64",
                 "curl-x86-64",
                 "gcc-runtime",
+                "gcc-runtime-stage1",
                 "git-x86-64",
+                "glibc-x86-64",
                 "json-c-x86-64",
                 "libdevmapper-x86-64",
                 "libressl-x86-64",
@@ -13279,7 +13282,7 @@ chmod 755 '{}'
     fn a_cut_walk_stages_the_root_instead_of_climbing_the_ladder() {
         let cut: BTreeSet<&str> = crate::bootstrap_root::CUT.iter().copied().collect();
         let ladder = crate::bootstrap_root::ladder().unwrap();
-        let nodes = recipe_closure_cut(&["rust-toolchain"], &cut).unwrap();
+        let nodes = recipe_closure_cut(&["gcc-x86-64-self"], &cut).unwrap();
         assert!(nodes.iter().all(|n| !ladder.contains(&n.stem)));
         let seeds = classify_graph_inputs(&nodes).unwrap();
         let staged: BTreeSet<&str> = seeds
@@ -13293,7 +13296,7 @@ chmod 755 '{}'
         assert!(staged.iter().all(|k| cut.contains(k)));
         assert!(!seeds.iter().any(|s| matches!(s, SeedInput::Stage0 { .. })));
         // The same target walked whole climbs from stage0.
-        let full = recipe_closure_full(&["rust-toolchain"]).unwrap();
+        let full = recipe_closure_full(&["gcc-x86-64-self"]).unwrap();
         assert!(full.iter().any(|n| n.stem == "gcc-mesboot"));
         let full_seeds = classify_graph_inputs(&full).unwrap();
         assert!(full_seeds
@@ -13308,7 +13311,7 @@ chmod 755 '{}'
     fn a_ladder_side_recipe_climbs_from_stage0() {
         assert!(crate::bootstrap_root::ladder_side("gcc-14").unwrap());
         assert!(crate::bootstrap_root::ladder_side("gcc-10-bridge-test").unwrap());
-        assert!(!crate::bootstrap_root::ladder_side("gcc-x86-64-stage1").unwrap());
+        assert!(!crate::bootstrap_root::ladder_side("gcc-x86-64-stage2").unwrap());
         assert!(!crate::bootstrap_root::ladder_side("rust-toolchain").unwrap());
     }
 

@@ -182,7 +182,19 @@ deleted; its findings are summarized under "Facts" below.
    (same 2.41 source, frame pointers, companions; the root gains gawk
    and python3). Its link uses a static libgcc built from td glibc's
    installed headers first, never the root's libgcc, and gcc-runtime is
-   then rebuilt against the new glibc.
+   then rebuilt against the new glibc. Landed: `gcc-runtime-stage1`
+   runs glibc's configure and `install-headers` in the root and builds
+   libgcc.a, libgcc_eh.a and the crtbegin/crtend objects (no libgcc_s,
+   which would need a libc to link) against them with gcc-runtime's
+   compiler proper, and proves each object holding code was compiled by
+   that GCC 14.3.0; glibc-x86-64 builds with Debian's gcc, `-B` that
+   runtime first, refuses the root's g++, records every link, and
+   proves from each recorded link's map that nothing was loaded from
+   the root. ldd, sotruss and tzselect become `#!/bin/sh` scripts,
+   smoke-tested under the root's dash; xtrace (bash, addr2line) and
+   mtrace (Perl) are not shipped. The ladder's GCCs now build against
+   it, and gcc-x86-64-stage1, whose one consumer was the ladder glibc,
+   is gone.
 9. **Test HTTPS origin.** Replace `openssl s_server/s_client` with a
    small rustls tool on td-net; LibreSSL's command leaves the image.
    Landed: td-net's `td-test-https` applet (mint, serve, probe), and

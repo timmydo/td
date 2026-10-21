@@ -50,14 +50,16 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     let gcc_tree = runner.ladder_out_from(&gcc_out, "gcc-x86-64-self")?;
     let binutils_tree = runner.ladder_out_from(&gcc_out, "binutils-x86-64-self")?;
     // The proof's shell and text tools are the bootstrap root's userland:
-    // nothing later exists before this check.
+    // nothing later exists before this check. The toolchain's closure is
+    // built in the Debian root, so they come from GCC's plan.
+    let gcc = "gcc-x86-64-self";
     let sh = format!(
         "{}/sh",
-        root_userland_bin(runner, &build_out, "bash-mesboot")?
+        root_userland_bin(runner, gcc, &gcc_out, "bash-mesboot")?
     );
     let userland = ROOT_USERLAND
         .iter()
-        .map(|stem| root_userland_bin(runner, &build_out, stem))
+        .map(|stem| root_userland_bin(runner, gcc, &gcc_out, stem))
         .collect::<Result<Vec<_>, _>>()?
         .join(":");
     println!(
@@ -365,9 +367,9 @@ fn prove_td_shell_userland(
         .env("TD_SHELL_NATIVE_LOCK", lock_s)
         .env("TD_PERSIST_STORE", tdstore_s)
         .env("TD_PERSIST_DB", persist_db_s);
-    // A toolchain built above the pinned root references root items, which
+    // The GCC built above the pinned root references root items, which
     // only the root db vouches; td-builder authenticates it at intake.
-    if let Some(db) = runner.bootstrap_root_db_for("rust-toolchain")? {
+    if let Some(db) = runner.bootstrap_root_db_for("gcc-x86-64-self")? {
         cmd.env("TD_SHELL_NATIVE_ROOT_DB", path_str(&db)?);
     }
     // The shell asks this evaluator for each recipe it builds; the command
@@ -443,14 +445,16 @@ const ROOT_USERLAND: &[&str] = &[
 ];
 
 /// A root userland rung's `bin` directory under `/td/store`: the pinned
-/// root's item when the plan started at the cut, which stages it into the
-/// check's store, else the plan's own build of the rung from stage0.
+/// root's item when `target`'s plan started at the cut, which stages it
+/// into the check's store, else that plan's own build of the rung from
+/// stage0.
 fn root_userland_bin(
     runner: &RecipeCheckRunner,
+    target: &str,
     build_out: &Path,
     stem: &str,
 ) -> Result<String, String> {
-    let base = if runner.bootstrap_root_db_for("rust-toolchain")?.is_some() {
+    let base = if runner.bootstrap_root_db_for(target)?.is_some() {
         crate::bootstrap_root::root()?
             .exports
             .iter()

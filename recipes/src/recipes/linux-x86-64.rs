@@ -72,8 +72,8 @@ use crate::types::{Recipe, Step, TextEdit};
 // selected on x86_64 7.x) and modpost link libelf through pkg-config, and
 // timeconst.h needs bc; the build root carries all of them. Avoided by config
 // (audited): openssl (no module signing / trusted keys), pahole (BTF off),
-// python and kmod; perl, cpio and rsync are in the root but this config runs
-// none of them. INITRAMFS_SOURCE stays "" and IKHEADERS/modules stay off.
+// python and kmod; perl, python3, cpio and rsync are in the root but this
+// config runs none of them. INITRAMFS_SOURCE stays "" and IKHEADERS/modules stay off.
 // The external initramfs below is packed by td-util's gen_init_cpio, the same
 // packer system-x86-64 uses.
 pub fn recipe() -> Recipe {

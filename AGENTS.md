@@ -195,6 +195,9 @@ checks establish. A source-bootstrap claim names the root as a build-tool
 trust root, as it names the upstream Rust toolchain, for every output whose
 build closure includes a root-built output; the stage0 provenance
 statements above hold only for outputs whose closure excludes both.
+td glibc is itself root-built, so every output that links it has a
+root-built output in its closure: until the ladder is deleted, those
+statements cover no shipped output above glibc.
 
 Changing the root's packages is a reviewed lock change. Until the ladder is
 deleted (increment 11 of that plan) both paths coexist.

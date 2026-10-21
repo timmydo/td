@@ -65,8 +65,9 @@ pub fn direct_rustc_args(build_root: &str, source_root: &str) -> Vec<String> {
 /// explicit coverage boundary rather than silently trusted unwinds.
 pub const ASSEMBLY_EXCEPTIONS: &[(&str, &str)] = &[
     ("glibc-x86-64", "upstream glibc sysdeps/x86_64 assembly"),
+    // The static libgcc glibc links, built in the Debian build root.
     (
-        "gcc-x86-64-stage1",
+        "gcc-runtime-stage1",
         "upstream stage1 GCC libgcc x86_64 assembly",
     ),
     (
@@ -152,6 +153,10 @@ pub const BUILD_ROOT_LINKED: &[&str] = &[
     "td-link",
 ];
 
+/// The build-root output that links gcc-runtime-stage1's start files and
+/// libgcc instead: glibc, which gcc-runtime is built against.
+pub const BUILD_ROOT_STAGE1_LINKED: &str = "glibc-x86-64";
+
 /// Conservative transitive assembly boundaries for a linked output. Every
 /// split target may contain glibc startup code and libgcc; Rust outputs also
 /// contain standard-library/compiler-runtime code.
@@ -161,7 +166,7 @@ pub fn output_assembly_exceptions(recipe: &str) -> Vec<(&'static str, &'static s
         .copied()
         .filter(|(source, _)| {
             *source == "glibc-x86-64"
-                || (*source == "gcc-x86-64-stage1" && recipe == "glibc-x86-64")
+                || (*source == "gcc-runtime-stage1" && recipe == BUILD_ROOT_STAGE1_LINKED)
                 || (*source == "gcc-x86-64-native"
                     && matches!(recipe, "binutils-x86-64-self" | "gcc-x86-64-self"))
                 || (*source == "gcc-x86-64-self"
@@ -326,7 +331,7 @@ mod tests {
             [
                 ("glibc-x86-64", "upstream glibc sysdeps/x86_64 assembly"),
                 (
-                    "gcc-x86-64-stage1",
+                    "gcc-runtime-stage1",
                     "upstream stage1 GCC libgcc x86_64 assembly"
                 ),
                 (
@@ -398,7 +403,7 @@ mod tests {
             vec![
                 ("glibc-x86-64", "upstream glibc sysdeps/x86_64 assembly"),
                 (
-                    "gcc-x86-64-stage1",
+                    "gcc-runtime-stage1",
                     "upstream stage1 GCC libgcc x86_64 assembly"
                 ),
             ]

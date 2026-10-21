@@ -82,7 +82,7 @@ pub fn recipe() -> Recipe {
     // Assemble this gcc's libstdc++.a WITHOUT `find` (re #469): the same libtool
     // convenience-archive `find` that broke gcc-mesboot's libstdc++.a would break
     // gcc-14's too, leaving it partial. gcc-14's i686 libstdc++ is what the C++
-    // build-side generator programs of gcc-x86-64-stage1/stage2/native link
+    // build-side generator programs of gcc-x86-64-stage2/native link
     // against (CXX_FOR_BUILD = this gcc-14 g++), so it must be complete.
     steps.push(libtool_extract_without_find("{src}/ltmain.sh"));
     steps.push(gcc14_libstdcxx_stamp_fixups());

@@ -134,7 +134,12 @@ mod tests {
         compile_directory_consumers.dedup();
         assert_eq!(
             compile_directory_consumers,
-            ["curl-x86-64-test", "libressl-x86-64-test", "zlib-x86-64"]
+            [
+                "curl-x86-64-test",
+                "gcc-runtime-stage1",
+                "libressl-x86-64-test",
+                "zlib-x86-64"
+            ]
         );
     }
 
@@ -467,7 +472,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("assembly exception names missing recipe {stem}"));
             if matches!(
                 stem,
-                "gcc-x86-64-stage1" | "gcc-x86-64-native" | "rust-toolchain"
+                "gcc-runtime-stage1" | "gcc-x86-64-native" | "rust-toolchain"
             ) {
                 continue;
             }
@@ -485,14 +490,15 @@ mod tests {
             );
         }
 
-        // These compiler rungs are build-only provenance for libgcc objects
-        // linked into later outputs, and rust-toolchain is the prebuilt std
-        // every Rust output links. They need no companions of their own, but
-        // the marker on each split consumer must name the actual source.
+        // gcc-runtime-stage1 and the native compiler rung are build-only
+        // provenance for libgcc objects linked into later outputs, and
+        // rust-toolchain is the prebuilt std every Rust output links. They
+        // need no companions of their own, but the marker on each split
+        // consumer must name the actual source.
         assert!(
             td_engine::target_profile::output_assembly_exceptions("glibc-x86-64")
                 .iter()
-                .any(|(source, _)| *source == "gcc-x86-64-stage1")
+                .any(|(source, _)| *source == "gcc-runtime-stage1")
         );
         for stem in ["binutils-x86-64-self", "gcc-x86-64-self"] {
             assert!(td_engine::target_profile::output_assembly_exceptions(stem)
@@ -654,8 +660,9 @@ mod tests {
     }
 
     /// A build-root recipe that splits companions links code that ships, and
-    /// takes its start files and libgcc from gcc-runtime; the profiler's
-    /// boundary list names exactly those recipes.
+    /// takes its start files and libgcc from gcc-runtime, or, for glibc,
+    /// from gcc-runtime-stage1; the profiler's boundary lists name exactly
+    /// those recipes.
     #[test]
     fn build_root_linked_outputs_match_the_profile_boundary() {
         let mut linked: Vec<&str> = all()
@@ -673,6 +680,7 @@ mod tests {
             .collect();
         linked.sort_unstable();
         let mut expected = td_engine::target_profile::BUILD_ROOT_LINKED.to_vec();
+        expected.push(td_engine::target_profile::BUILD_ROOT_STAGE1_LINKED);
         expected.sort_unstable();
         assert_eq!(linked, expected);
     }

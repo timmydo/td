@@ -58,31 +58,7 @@ const PROBE: &str = "#include <stdio.h>\n\
                      }\n";
 
 pub fn recipe() -> Recipe {
-    let target_flags = "-g1 -O2 -fPIC -fno-omit-frame-pointer \
-                        -ffile-prefix-map={root}=/td-build-root -ffile-prefix-map={src}=/td-build";
-    let mut steps = unpack_into("gcc-runtime-source", "{src}");
-    for t in ["gmp63", "mpfr421", "mpc131"] {
-        steps.extend(unpack_keep_top(t, "{src}"));
-    }
-    for (target, link) in [
-        ("gmp-6.3.0", "{src}/gmp"),
-        ("mpfr-4.2.1", "{src}/mpfr"),
-        ("mpc-1.3.1", "{src}/mpc"),
-    ] {
-        steps.push(Step::Symlink {
-            target: target.into(),
-            link: link.into(),
-        });
-    }
-    // libgcc appends plain `-g` to the caller's flags and `-g0` for
-    // crtbegin/crtend; pin both to the bounded line-table policy.
-    steps.push(Step::substitute_text(
-        "{src}/libgcc/Makefile.in",
-        vec![
-            TextEdit::new("LIBGCC2_DEBUG_CFLAGS = -g", "LIBGCC2_DEBUG_CFLAGS = -g1", 1),
-            TextEdit::new("$(MULTILIB_CFLAGS) -g0 \\", "$(MULTILIB_CFLAGS) -g1 \\", 1),
-        ],
-    ));
+    let mut steps = gcc_source("gcc-runtime-source");
     steps.push(Step::CopyTree {
         from: format!("{GLIBC}/include"),
         dest: "{root}/sysroot/include".into(),
@@ -109,82 +85,15 @@ pub fn recipe() -> Recipe {
         )
         .env("PATH", PATH),
     );
-    steps.push(Step::MkDir {
-        path: "{src}/bld".into(),
-    });
-    steps.push(
-        Step::run(
-            "{src}/bld",
-            &[
-                SH,
-                "../configure",
-                "--prefix=/gcc-runtime",
-                "--build=x86_64-pc-linux-gnu",
-                "--host=x86_64-pc-linux-gnu",
-                "--target=x86_64-pc-linux-gnu",
-                "--with-as=/usr/bin/as",
-                "--with-ld=/usr/bin/ld",
-                "--with-build-sysroot={root}/sysroot",
-                "--with-native-system-header-dir=/include",
-                "--enable-languages=c",
-                "--enable-shared",
-                "--enable-threads=posix",
-                "--enable-linker-build-id",
-                "--disable-bootstrap",
-                "--disable-multilib",
-                "--disable-nls",
-                "--disable-libatomic",
-                "--disable-libgomp",
-                "--disable-libitm",
-                "--disable-libquadmath",
-                "--disable-libsanitizer",
-                "--disable-libssp",
-                "--disable-libvtv",
-                "--disable-lto",
-                "--disable-plugin",
-                "--disable-libcc1",
-                "--disable-decimal-float",
-                "--disable-werror",
-            ],
-        )
-        .env("PATH", PATH)
-        .env("CONFIG_SHELL", SH)
-        .env("CC", "/usr/bin/gcc")
-        .env("CXX", "/usr/bin/g++"),
-    );
-    let flags = format!("CFLAGS_FOR_TARGET={target_flags}");
+    steps.extend(gcc_configure(PREFIX));
     for goal in ["all-gcc", "all-target-libgcc"] {
-        steps.push(
-            Step::run(
-                "{src}/bld",
-                &[
-                    "/usr/bin/make",
-                    "-j{jobs}",
-                    &format!("SHELL={SH}"),
-                    "MAKEINFO=true",
-                    &flags,
-                    goal,
-                ],
-            )
-            .env("PATH", PATH)
-            .env("CONFIG_SHELL", SH),
-        );
+        steps.push(gcc_make(true, &[TARGET_CFLAGS, goal]));
     }
-    steps.push(
-        Step::run(
-            "{src}/bld",
-            &[
-                "/usr/bin/make",
-                &format!("SHELL={SH}"),
-                "MAKEINFO=true",
-                "install-target-libgcc",
-                "DESTDIR={root}/inst",
-            ],
-        )
-        .env("PATH", PATH)
-        .env("CONFIG_SHELL", SH),
-    );
-    steps.push(search_probe());
+    steps.push(gcc_make(
+        false,
+        &["install-target-libgcc", "DESTDIR={root}/inst"],
+    ));
+    steps.push(search_probe(PREFIX, true));
     steps.push(Step::MkDir {
         path: "{out}/lib".into(),
     });
@@ -232,32 +141,142 @@ exec "$TD_RECIPE_EVAL" check-run gcc-runtime 1
         .with_runner(CheckRunner::BuildOnly)])
 }
 
+/// GCC's install prefix, which must not exist in the build root.
+const PREFIX: &str = "/gcc-runtime";
+
+/// libgcc's compile flags: the shipped target profile, made position
+/// independent.
+pub(crate) const TARGET_CFLAGS: &str = "CFLAGS_FOR_TARGET=-g1 -O2 -fPIC -fno-omit-frame-pointer \
+                                        -ffile-prefix-map={root}=/td-build-root \
+                                        -ffile-prefix-map={src}=/td-build";
+
+/// GCC 14.3.0's source in `{src}` from `source`, the recipe's own source
+/// input, with gmp, mpfr and mpc in tree and libgcc's own debug flags pinned
+/// to the target profile.
+pub(crate) fn gcc_source(source: &str) -> Vec<Step> {
+    let mut steps = unpack_into(source, "{src}");
+    for t in ["gmp63", "mpfr421", "mpc131"] {
+        steps.extend(unpack_keep_top(t, "{src}"));
+    }
+    for (target, link) in [
+        ("gmp-6.3.0", "{src}/gmp"),
+        ("mpfr-4.2.1", "{src}/mpfr"),
+        ("mpc-1.3.1", "{src}/mpc"),
+    ] {
+        steps.push(Step::Symlink {
+            target: target.into(),
+            link: link.into(),
+        });
+    }
+    // libgcc appends plain `-g` to the caller's flags and `-g0` for
+    // crtbegin/crtend; pin both to the bounded line-table policy.
+    steps.push(Step::substitute_text(
+        "{src}/libgcc/Makefile.in",
+        vec![
+            TextEdit::new("LIBGCC2_DEBUG_CFLAGS = -g", "LIBGCC2_DEBUG_CFLAGS = -g1", 1),
+            TextEdit::new("$(MULTILIB_CFLAGS) -g0 \\", "$(MULTILIB_CFLAGS) -g1 \\", 1),
+        ],
+    ));
+    steps
+}
+
+/// Configure GCC in `{src}/bld`, installing under `prefix`: Debian's gcc and
+/// g++ build the compiler proper, whose target headers, start files and
+/// libc come from the sysroot at `{root}/sysroot` alone.
+pub(crate) fn gcc_configure(prefix: &str) -> Vec<Step> {
+    let prefix = format!("--prefix={prefix}");
+    vec![
+        Step::MkDir {
+            path: "{src}/bld".into(),
+        },
+        Step::run(
+            "{src}/bld",
+            &[
+                SH,
+                "../configure",
+                &prefix,
+                "--build=x86_64-pc-linux-gnu",
+                "--host=x86_64-pc-linux-gnu",
+                "--target=x86_64-pc-linux-gnu",
+                "--with-as=/usr/bin/as",
+                "--with-ld=/usr/bin/ld",
+                "--with-build-sysroot={root}/sysroot",
+                "--with-native-system-header-dir=/include",
+                "--enable-languages=c",
+                "--enable-shared",
+                "--enable-threads=posix",
+                "--enable-linker-build-id",
+                "--disable-bootstrap",
+                "--disable-multilib",
+                "--disable-nls",
+                "--disable-libatomic",
+                "--disable-libgomp",
+                "--disable-libitm",
+                "--disable-libquadmath",
+                "--disable-libsanitizer",
+                "--disable-libssp",
+                "--disable-libvtv",
+                "--disable-lto",
+                "--disable-plugin",
+                "--disable-libcc1",
+                "--disable-decimal-float",
+                "--disable-werror",
+            ],
+        )
+        .env("PATH", PATH)
+        .env("CONFIG_SHELL", SH)
+        .env("CC", "/usr/bin/gcc")
+        .env("CXX", "/usr/bin/g++"),
+    ]
+}
+
+/// GCC's top-level make in `{src}/bld`, `parallel` or not, with `args`.
+pub(crate) fn gcc_make(parallel: bool, args: &[&str]) -> Step {
+    let shell = format!("SHELL={SH}");
+    let mut argv = vec!["/usr/bin/make"];
+    if parallel {
+        argv.push("-j{jobs}");
+    }
+    argv.push(&shell);
+    argv.push("MAKEINFO=true");
+    argv.extend_from_slice(args);
+    Step::run("{src}/bld", &argv)
+        .env("PATH", PATH)
+        .env("CONFIG_SHELL", SH)
+}
+
 /// The just-built compiler, run as libgcc's build runs it.
 const XGCC: &str = "{src}/bld/gcc/xgcc -B{src}/bld/gcc/ --sysroot={root}/sysroot";
 
-/// The just-built compiler finds start files and libc in the td glibc
-/// sysroot, searches no include or library directory outside its build tree,
-/// that sysroot and its unpopulated install prefix, and hands ld the sysroot,
-/// under which every one of ld's own search directories lies.
-fn search_probe() -> Step {
-    let script = format!(
-        r#"set -e
-[ ! -e /gcc-runtime ] || {{ echo '/gcc-runtime exists in the build root' >&2; exit 1; }}
-x='{XGCC}'
-inside() {{
-  case $(realpath -m "$1") in
-    '{{src}}/bld/'*|'{{root}}/sysroot/'*|/gcc-runtime/*) ;;
-    *) echo "$2 outside the build and sysroot: $1" >&2; exit 1;;
-  esac
-}}
-for f in crti.o crt1.o libc.so; do
+/// The just-built compiler searches no include or library directory outside
+/// its build tree, the sysroot and its unpopulated install `prefix`, and
+/// hands ld the sysroot, under which every one of ld's own search
+/// directories lies. With `libc`, it also finds start files and libc in the
+/// td glibc sysroot.
+pub(crate) fn search_probe(prefix: &str, libc: bool) -> Step {
+    let libc_files = if libc {
+        r#"for f in crti.o crt1.o libc.so; do
   p=$($x -print-file-name=$f)
   case $(realpath -m "$p") in
-    '{{root}}/sysroot/'*) ;;
+    '{root}/sysroot/'*) ;;
     *) echo "$f resolves to $p" >&2; exit 1;;
   esac
 done
-dirs=$($x -print-search-dirs | sed -n 's/^libraries: =//p')
+"#
+    } else {
+        ""
+    };
+    let script = format!(
+        r#"set -e
+[ ! -e {prefix} ] || {{ echo '{prefix} exists in the build root' >&2; exit 1; }}
+x='{XGCC}'
+inside() {{
+  case $(realpath -m "$1") in
+    '{{src}}/bld/'*|'{{root}}/sysroot/'*|{prefix}/*) ;;
+    *) echo "$2 outside the build and sysroot: $1" >&2; exit 1;;
+  esac
+}}
+{libc_files}dirs=$($x -print-search-dirs | sed -n 's/^libraries: =//p')
 [ -n "$dirs" ] || {{ echo 'no library search dirs' >&2; exit 1; }}
 IFS=:
 for d in $dirs; do inside "$d" 'library search dir'; done
