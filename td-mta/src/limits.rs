@@ -22,6 +22,15 @@ pub const TLS_HANDSHAKE_BYTES: usize = 4 * MIB;
 pub const TLS_GENERATION_BYTES: usize = 8 * MIB;
 /// Main-thread TLS work can decode control messages after Finished.
 pub const TLS_ESTABLISHED_PROCESSING_BYTES: usize = 4 * MIB;
+/// Aggregate retained account catalogs/Sessions and cold catalog copy overlap.
+pub const ACCOUNT_METADATA_BYTES: usize = 3 * MIB;
+const _: () = assert!(2 * crate::identity_catalog::MAX_BYTES + 256 * KIB <= ACCOUNT_METADATA_BYTES);
+const _: () = assert!(
+    crate::identity_catalog::MAX_BYTES
+        + crate::config::identities::MAX_ACCOUNTS * crate::jmap_session::MAX_BYTES
+        + 256 * KIB
+        <= ACCOUNT_METADATA_BYTES
+);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResourceError {
@@ -147,7 +156,7 @@ impl Reservation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResourcePlan {
     limits: Limits,
-    reservations: [Reservation; 18],
+    reservations: [Reservation; 19],
     total_bytes: usize,
     log_disk_bytes: usize,
 }
@@ -344,6 +353,11 @@ impl Limits {
                 bytes_each: TLS_GENERATION_BYTES,
             },
             Reservation {
+                name: "account metadata",
+                count: 1,
+                bytes_each: ACCOUNT_METADATA_BYTES,
+            },
+            Reservation {
                 name: "cold reload overlap",
                 count: 1,
                 bytes_each: 2 * MIB,
@@ -383,7 +397,7 @@ mod tests {
     #[test]
     fn default_ledger_pins_documented_budget() -> Result<(), ResourceError> {
         let plan = Limits::default().plan()?;
-        assert_eq!(plan.total_bytes(), 78_365_952);
+        assert_eq!(plan.total_bytes(), 81_511_680);
         const { assert!(crate::format::MAX_VALUE_BYTES + crate::format::MAX_KEY_BYTES + 48 <= 68 * KIB) };
         assert_eq!(
             READ_VIEW_SCRATCH_BYTES,
@@ -674,10 +688,17 @@ mod tests {
         }
         .plan()?;
         assert!(plan.total_bytes() > Limits::default().plan()?.total_bytes());
-        assert!(Limits {
+        let maximum_pool = Limits {
             https_connections: 32,
-            memory_budget_bytes: 128 * MIB,
             ..Limits::default()
+        };
+        assert!(matches!(
+            maximum_pool.plan(),
+            Err(ResourceError::MemoryBudget { .. })
+        ));
+        assert!(Limits {
+            index_cache_bytes: Limits::default().index_cache_bytes - ACCOUNT_METADATA_BYTES,
+            ..maximum_pool
         }
         .plan()
         .is_ok());

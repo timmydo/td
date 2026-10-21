@@ -17,7 +17,7 @@ pub const API_PATH: &str = "/jmap/api";
 pub const UPLOAD_TEMPLATE: &str = "/jmap/upload/{accountId}";
 pub const DOWNLOAD_TEMPLATE: &str = "/jmap/download/{accountId}/{blobId}/{name}?type={type}";
 pub const EVENT_TEMPLATE: &str = "/jmap/events?types={types}&closeafter={closeafter}&ping={ping}";
-const MAX_BYTES: usize = 32 * 1024;
+pub(crate) const MAX_BYTES: usize = 32 * 1024;
 
 /// Per-endpoint limits enforced by the runtime within its shared pool.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

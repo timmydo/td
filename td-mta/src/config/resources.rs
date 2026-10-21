@@ -419,7 +419,7 @@ mod tests {
         assert_eq!(actual.admission().work().request_seconds, 600);
         assert_eq!(actual.timeouts().execution_seconds(), 600);
         assert_eq!(actual.timeouts().limits().minimum_rate, 32768);
-        assert_eq!(actual.resources().total_bytes(), 78_365_952);
+        assert_eq!(actual.resources().total_bytes(), 81_511_680);
     }
     #[test]
     fn duplicates_keep_first_location_and_poison_candidate() {

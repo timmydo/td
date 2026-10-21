@@ -2635,3 +2635,11 @@ listener. Managed certificate changes currently cause bounded mail-service drain
 and internal reload with a brief listener gap; uninterrupted generation swapping
 remains outside this deployment profile. Explicit external certificate inputs
 remain supported. No Certbot subprocess or dependency is introduced.
+
+Cold JMAP-only profile preparation retains one bounded binding, private identity
+catalog and Session per configured account. Authentication selects the account
+before dispatch, and all backends share the process admission limits. Every
+configured account must be bootstrapped before the profile can publish. Profiles
+with receiving or relay roles remain single-account until transactional fanout
+and bounded account rotation are implemented. RESOURCES.md accounts for the
+aggregate startup metadata independently of message-body reservations.

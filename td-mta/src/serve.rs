@@ -244,29 +244,50 @@ fn run_once(options: &Options, reload: &AtomicBool) -> Result<(), ConfigFailure>
                         .map_err(|error| adapter("https-listen", error))?,
                 );
             }
-            let session = if mailbox_access {
-                Some(
-                    td_mta::jmap_session::Session::mail_submission(
+            let accounts = candidate
+                .identities()
+                .map_err(|_| config_failure("configuration", "invariant"))?;
+            let mut sessions = Vec::new();
+            let mut authentication_accounts = Vec::new();
+            if mailbox_access {
+                sessions
+                    .try_reserve_exact(accounts.account_count())
+                    .map_err(|_| config_failure("session", "capacity"))?;
+                authentication_accounts
+                    .try_reserve_exact(accounts.account_count())
+                    .map_err(|_| config_failure("authentication", "capacity"))?;
+                for index in 0..accounts.account_count() {
+                    let account = accounts
+                        .account_at(index)
+                        .map_err(|_| config_failure("configuration", "invariant"))?
+                        .ok_or_else(|| config_failure("configuration", "invariant"))?;
+                    let binding = published
+                        .binding_for(account.id)
+                        .ok_or_else(|| config_failure("configuration", "invariant"))?;
+                    let session = td_mta::jmap_session::Session::mail_submission(
                         view.origin()
                             .map_err(|_| config_failure("configuration", "invariant"))?,
-                        candidate
-                            .identities()
-                            .map_err(|_| config_failure("configuration", "invariant"))?
-                            .account()
-                            .map_err(|_| config_failure("configuration", "invariant"))?,
+                        account,
                         resources,
                         td_mta::jmap_session::Concurrency {
                             uploads: 1,
                             requests: 1,
                         },
                     )
-                    .map_err(|error| adapter("session", error))?,
-                )
-            } else {
-                None
-            };
-            let api_service = match (responses.as_ref(), session.as_ref()) {
-                (Some(responses), Some(session)) => Some(td_mta::postgres_http_api::Service {
+                    .map_err(|error| adapter("session", error))?;
+                    sessions.push((binding, session));
+                    authentication_accounts.push((account.username, binding));
+                }
+            }
+            let mut api_services = Vec::new();
+            api_services
+                .try_reserve_exact(sessions.len())
+                .map_err(|_| config_failure("https", "capacity"))?;
+            for (binding, session) in &sessions {
+                let responses = responses
+                    .as_ref()
+                    .ok_or_else(|| config_failure("https", "invariant"))?;
+                api_services.push(td_mta::postgres_http_api::Service {
                     loaded: &loaded,
                     executable: &executable,
                     binding,
@@ -279,19 +300,8 @@ fn run_once(options: &Options, reload: &AtomicBool) -> Result<(), ConfigFailure>
                     clock: clock.as_ref(),
                     admission: plans.admission(),
                     timeouts: plans.timeouts(),
-                }),
-                (None, None) => None,
-                _ => return Err(config_failure("https", "invariant")),
-            };
-            let authentication_accounts = [(
-                candidate
-                    .identities()
-                    .map_err(|_| config_failure("configuration", "invariant"))?
-                    .account()
-                    .map_err(|_| config_failure("configuration", "invariant"))?
-                    .username,
-                binding,
-            )];
+                });
+            }
             let authentication = if mailbox_access {
                 Some(
                     td_mta::postgres_http_auth::Authentication::new(
@@ -307,13 +317,15 @@ fn run_once(options: &Options, reload: &AtomicBool) -> Result<(), ConfigFailure>
             };
             let https_ready = AtomicBool::new(false);
             let relay_ready = AtomicBool::new(false);
-            let backend_refs = api_service
-                .as_ref()
-                .map(|service| [service as &dyn td_mta::https_upload::Backend]);
-            let backends = backend_refs
-                .as_ref()
-                .map(|values| values.as_slice())
-                .unwrap_or(&[]);
+            let mut backends = Vec::new();
+            backends
+                .try_reserve_exact(api_services.len())
+                .map_err(|_| config_failure("https", "capacity"))?;
+            backends.extend(
+                api_services
+                    .iter()
+                    .map(|service| service as &dyn td_mta::https_upload::Backend),
+            );
             let https = if let Some(authentication) = authentication.as_ref() {
                 Some(td_mta::https::Https {
                     listeners: &https_listeners,
@@ -326,7 +338,7 @@ fn run_once(options: &Options, reload: &AtomicBool) -> Result<(), ConfigFailure>
                     resources,
                     timeouts: plans.timeouts(),
                     clock: clock.clone(),
-                    backends,
+                    backends: &backends,
                     ready: &https_ready,
                 })
             } else {

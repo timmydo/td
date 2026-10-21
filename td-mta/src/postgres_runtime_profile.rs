@@ -127,6 +127,7 @@ impl Binding {
 /// on the cold control worker until the runtime can admit all selected roles.
 pub struct Prepared {
     binding: Binding,
+    additional: Vec<Binding>,
     configuration: ResolvedProfile,
     policies: PreparedGeneration<TlsPolicies>,
 }
@@ -134,6 +135,7 @@ pub struct Prepared {
 /// Constructed only by cold publication of the original prepared profile.
 pub struct PublishedProfile {
     binding: Binding,
+    additional: Vec<Binding>,
     pub(crate) configuration: ResolvedProfile,
     pub(crate) policies: GenerationLease<TlsPolicies>,
 }
@@ -141,8 +143,15 @@ impl PublishedProfile {
     pub fn configuration(&self) -> &ResolvedProfile {
         &self.configuration
     }
+    /// First configured account; request dispatch must select by authenticated account.
     pub fn binding(&self) -> &Binding {
         &self.binding
+    }
+    pub fn bindings(&self) -> impl Iterator<Item = &Binding> {
+        std::iter::once(&self.binding).chain(self.additional.iter())
+    }
+    pub fn binding_for(&self, account: AccountId) -> Option<&Binding> {
+        self.bindings().find(|binding| binding.account() == account)
     }
 }
 /// Publication changed nothing; the original cold preparation is recoverable.
@@ -176,6 +185,7 @@ impl Prepared {
     ) -> Result<(PublishedProfile, RetiredGeneration<TlsPolicies>), PublishRefusal> {
         let Self {
             binding,
+            additional,
             configuration,
             policies,
         } = self;
@@ -183,6 +193,7 @@ impl Prepared {
             Ok((policies, retired)) => Ok((
                 PublishedProfile {
                     binding,
+                    additional,
                     configuration,
                     policies,
                 },
@@ -192,20 +203,33 @@ impl Prepared {
                 error: refusal.error(),
                 prepared: Prepared {
                     binding,
+                    additional,
                     configuration,
                     policies: refusal.into_prepared(),
                 },
             }),
         }
     }
+    /// First configured account; request dispatch must select by authenticated account.
     pub fn binding(&self) -> &Binding {
         &self.binding
+    }
+    pub fn bindings(&self) -> impl Iterator<Item = &Binding> {
+        std::iter::once(&self.binding).chain(self.additional.iter())
+    }
+    pub fn binding_for(&self, account: AccountId) -> Option<&Binding> {
+        self.bindings().find(|binding| binding.account() == account)
     }
     pub fn configuration(&self) -> &ResolvedProfile {
         &self.configuration
     }
-    pub fn into_parts(self) -> (Binding, ResolvedProfile, PreparedGeneration<TlsPolicies>) {
-        (self.binding, self.configuration, self.policies)
+    pub fn into_parts(
+        self,
+    ) -> Result<(Binding, ResolvedProfile, PreparedGeneration<TlsPolicies>), Error> {
+        if !self.additional.is_empty() {
+            return Err(Error::Account);
+        }
+        Ok((self.binding, self.configuration, self.policies))
     }
 }
 
@@ -270,43 +294,14 @@ pub fn load(
         .candidate()
         .identities()
         .map_err(|_| Error::Account)?;
-    let account = catalog.account().map_err(|_| Error::Account)?.id;
-    let mut identities = Vec::new();
-    identities
-        .try_reserve_exact(catalog.len())
-        .map_err(|_| Error::Capacity)?;
-    for index in 0..catalog.len() {
-        let identity = catalog
-            .identity(index)
-            .map_err(|_| Error::Account)?
-            .ok_or(Error::Account)?;
-        let mut email = String::new();
-        email
-            .try_reserve_exact(identity.email.len())
-            .map_err(|_| Error::Capacity)?;
-        email.push_str(identity.email);
-        identities.push(SendingIdentity {
-            id: identity.id,
-            email,
-        });
-    }
-    let identities = Arc::new(identities);
-    postgres_accounts::inspect(request, trust, deadline, epoch, account)
-        .map_err(Error::Bootstrap)?;
     let roles = configuration.roles();
+    // Receiving fanout and route scheduling must be admitted before those roles
+    // can activate more than one account.
+    if catalog.account_count() > 1 && (roles.receive() || roles.relay()) {
+        return Err(Error::Account);
+    }
     let relay_policy = if roles.relay() {
         Some(TlsPolicies::prepared_relay(&policies).map_err(Error::TlsPolicy)?)
-    } else {
-        None
-    };
-    let identity_catalog = if roles.jmap() {
-        Some(Arc::new(
-            crate::identity_catalog::Catalog::prepare(
-                configuration.resolved_text(),
-                &td_crypto::Provider,
-            )
-            .map_err(Error::IdentityCatalog)?,
-        ))
     } else {
         None
     };
@@ -321,6 +316,77 @@ pub fn load(
     let upload_maximum = limits.message_bytes;
     let upload_expiry_seconds = limits.upload_expiry_seconds;
     let work = *configuration.candidate().resources().admission().work();
+    let mut bindings = Vec::new();
+    bindings
+        .try_reserve_exact(catalog.account_count())
+        .map_err(|_| Error::Capacity)?;
+    for account_index in 0..catalog.account_count() {
+        let account = catalog
+            .account_at(account_index)
+            .map_err(|_| Error::Account)?
+            .ok_or(Error::Account)?
+            .id;
+        let mut identities = Vec::new();
+        identities
+            .try_reserve_exact(catalog.len())
+            .map_err(|_| Error::Capacity)?;
+        for index in 0..catalog.len() {
+            let identity = catalog
+                .identity(index)
+                .map_err(|_| Error::Account)?
+                .ok_or(Error::Account)?;
+            if identity.account != account {
+                continue;
+            }
+            let mut email = String::new();
+            email
+                .try_reserve_exact(identity.email.len())
+                .map_err(|_| Error::Capacity)?;
+            email.push_str(identity.email);
+            identities.push(SendingIdentity {
+                id: identity.id,
+                email,
+            });
+        }
+        postgres_accounts::inspect(request, trust, deadline, epoch, account)
+            .map_err(Error::Bootstrap)?;
+        let identity_catalog = if roles.jmap() {
+            Some(Arc::new(
+                crate::identity_catalog::Catalog::prepare_for_account(
+                    configuration.resolved_text(),
+                    account,
+                    &td_crypto::Provider,
+                )
+                .map_err(Error::IdentityCatalog)?,
+            ))
+        } else {
+            None
+        };
+        bindings.push(Binding {
+            epoch,
+            selection: selected,
+            account,
+            profile: name.clone(),
+            roles,
+            route: route.clone(),
+            relay_policy,
+            quotas,
+            upload_maximum,
+            upload_expiry_seconds,
+            work,
+            header_maximum,
+            recipient_maximum,
+            identities: Arc::new(identities),
+            identity_catalog,
+        });
+    }
+    let mut bindings = bindings.into_iter();
+    let binding = bindings.next().ok_or(Error::Account)?;
+    let mut additional = Vec::new();
+    additional
+        .try_reserve_exact(bindings.len())
+        .map_err(|_| Error::Capacity)?;
+    additional.extend(bindings);
     drop(candidate);
     if selection::observe(request, trust, deadline, epoch).map_err(Error::Selection)?
         != Some(selected)
@@ -331,23 +397,8 @@ pub fn load(
         return Err(Error::Deadline);
     }
     Ok(Prepared {
-        binding: Binding {
-            epoch,
-            selection: selected,
-            account,
-            profile: name,
-            roles,
-            route,
-            relay_policy,
-            quotas,
-            upload_maximum,
-            upload_expiry_seconds,
-            work,
-            header_maximum,
-            recipient_maximum,
-            identities,
-            identity_catalog,
-        },
+        binding,
+        additional,
         configuration,
         policies,
     })

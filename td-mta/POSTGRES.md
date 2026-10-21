@@ -6441,6 +6441,17 @@ Credentials remain request-owned and zeroed on drop; no worker pool, read
 capacity, body-operation concurrency or authentication-rate allowance is
 multiplied by the number of accounts.
 
-The server's cold profile loader still requires one account at this stage.
-The HTTPS mechanism can dispatch multiple registered backends, but activating
-multiple configured database accounts remains a separate runtime step.
+Cold preparation constructs a bounded binding registry, verifies every
+configured account's bootstrap, and prepares only that account's sending
+identities and visible catalog in its binding. One final selection observation
+fences the entire registry. Publication retains the bindings with the same
+configuration and TLS generation; an absent account never falls back to the
+first binding. The compatibility binding accessor is for common profile facts,
+not request dispatch. Extracting a singleton binding refuses multiple accounts.
+
+JMAP-only profiles register one Session and backend per account. All backends
+share read slots, pending-mutation ownership, response admission and body
+operation capacity. Each Session names only its authenticated account. Three
+MiB of startup metadata reservation covers the aggregate catalog preparation,
+bindings and up to sixteen Session documents. Receiving and relay profiles
+still reject multiple accounts before publication at this intermediate step.

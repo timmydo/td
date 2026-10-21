@@ -159,8 +159,9 @@ all three resource planners before a structural candidate can be returned.
 ## 3. Account, domains and aliases
 
 One to 16 `[account "ID"]` stanzas are structurally supported. IDs and
-case-sensitive usernames must be unique. Runtime publication currently
-requires a single account until account-scoped serving is wired. Fields are:
+case-sensitive usernames must be unique. JMAP-only profiles can serve all configured accounts. Profiles with receiving
+or relay roles still require one account until fanout and scheduling are wired.
+Fields are:
 
 | Field | Type/default | Constraint |
 | --- | --- | --- |

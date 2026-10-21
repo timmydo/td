@@ -48,12 +48,13 @@ changing that validator requires an explicit atomic implementation update.
 | TLS handshake headroom | 2 | 4194304 | 8388608 |
 | Established TLS processing | 1 | 4194304 | 4194304 |
 | Certificate generations | 2 | 8388608 | 16777216 |
+| Account startup metadata | 1 | 3145728 | 3145728 |
 | Cold reload overlap | 1 | 2097152 | 2097152 |
 | Process and allocator allowance | 1 | 8388608 | 8388608 |
-| **Total** | | | **78365952** |
+| **Total** | | | **81511680** |
 
-The total is approximately 74.74 MiB against a 128 MiB configured budget;
-the remaining 55851776 bytes are unassigned headroom, not another cache.
+The total is approximately 77.74 MiB against a 128 MiB configured budget;
+the remaining 52706048 bytes are unassigned headroom, not another cache.
 The default process ledger excludes database-server memory and WAL mappings.
 The two default TLS handshakes remain configurable within the process budget.
 The 64 MiB idle and 128 MiB workload RSS figures are provisional goals under
@@ -3722,7 +3723,7 @@ The same method meter survives all messages and transformations. Decoding,
 preview extraction and JSON stages retain their original cumulative charges;
 a small requested preview can still hit the work ceiling while validating a
 large source. The response spool cap independently limits emitted bytes.
-Default planned total is 78365952 bytes under the unchanged 128 MiB budget;
+Default planned total is 81511680 bytes under the unchanged 128 MiB budget;
 capacity-growth fixtures rebalance disposable cache within that budget.
 These are bounded implementation allocations and planner figures, not a new
 whole-service RSS or large-mailbox qualification claim.
@@ -4465,3 +4466,17 @@ existing pending owner retains only the prepared message/manifests after an
 unknown COMMIT. Filename, media type and description limits are 255, 127 and
 1024 bytes per part; composition uses fixed encoder/header scratch. This is
 a finite memory/work bound, not maximum-size throughput qualification.
+
+## Multiple-account startup metadata
+
+A profile prepares at most sixteen account bindings and 32-KiB Sessions. The
+64 sending identities and 192-KiB canonical visible-identity limit remain
+aggregate, so the sum of compact retained catalogs stays below the existing
+single-catalog JSON expansion bound. Preparation is sequential; only one
+full-capacity JSON scratch and its compact copy overlap previously retained
+catalogs. A separate 3-MiB planned account-metadata reservation includes that
+copy peak, all Sessions, and 256 KiB for binding/registry metadata. Static
+assertions hold the two allocation shapes within that reservation. Native
+provider allocations and whole-process RSS qualification remain separate.
+Account count does not multiply HTTP workers, connection slots, read slots,
+body-operation admission, response retention or authentication rate budgets.

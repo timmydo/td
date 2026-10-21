@@ -1848,8 +1848,10 @@ change. Unknown accounts are errors, not empty or default-account catalogs.
 The existing 64-identity, address-cell and text reservations remain aggregate
 configuration limits, not per-account allowances.
 
-This structural support does not yet enable multiple serving accounts:
-`postgres_runtime_profile` still requires the singleton accessor and rejects
-multi-account configurations before publication. Runtime principal selection,
-SMTP fanout and relay scheduling must replace that restriction together before
-such a configuration can be served.
+Cold profile preparation checks that every configured account is bootstrapped
+and builds a separate binding and identity catalog for each. JMAP-only profiles
+can serve all configured accounts through one endpoint, with a private Session
+and backend selected by the authenticated principal. Aggregate connection,
+request, upload, event and work admission limits remain process-wide.
+Profiles with receiving or relay roles still reject multiple accounts before
+publication until SMTP fanout and account-fair relay scheduling are wired.

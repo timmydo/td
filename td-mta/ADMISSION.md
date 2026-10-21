@@ -558,6 +558,10 @@ connection slots. The runtime also applies its shared HTTPS pool and event
 stream ceiling; simultaneous traffic can exhaust that shared capacity.
 The prepared document retains its bounded 32 KiB allocation and should be
 shared for the selected configuration, rather than rebuilt per connection.
+A multi-account profile retains one document per account (at most sixteen).
+Authenticated account selection chooses exactly one document; the documents
+share the same global request/upload admission. RESOURCES.md accounts for their
+aggregate startup allocation.
 
 ### Prepared EventSource frames
 

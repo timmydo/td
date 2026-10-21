@@ -2512,6 +2512,9 @@ fn real_postgres_smtp_worker_preserves_starttls_receipts() {
     exercise_configuration(ConfigurationExercise::ReceivingTls);
 }
 
+#[path = "postgres_probe/multi_account.rs"]
+mod multi_account;
+
 #[path = "postgres_probe/serving.rs"]
 mod serving;
 #[path = "postgres_probe/serving_relay.rs"]
@@ -2524,10 +2527,12 @@ fn real_postgres_executable_receives_and_serves_database_profiles() {
     acme::real_postgres_acme_fences_ownership_and_pins_complete_pairs();
     recovery::real_postgres_restore_quarantines_pending_delivery_and_changes_epoch();
     recovery::real_postgres_recovery_uncertain_commit_keeps_retained_new_epoch();
+    exercise_configuration(ConfigurationExercise::MultiAccount);
     exercise_configuration(ConfigurationExercise::Serving);
 }
 
 enum ConfigurationExercise {
+    MultiAccount,
     Serving,
     ReceivingTls,
     ReceivingTransport,
@@ -3188,6 +3193,10 @@ per_peer_limit = 1
         td_mta::postgres_accounts::prepare(epoch, account).unwrap(),
     )
     .unwrap();
+    if matches!(exercise, ConfigurationExercise::MultiAccount) {
+        multi_account::exercise(&fixture, &request, &trust, epoch, &shared, &desktop);
+        return;
+    }
     let mut serving = fixture.request();
     serving.user = "mail_runtime";
     serving.mode = td_mta::postgres_probe::Mode::Runtime;
@@ -3297,6 +3306,9 @@ per_peer_limit = 1
         );
         if name == "desktop" {
             match exercise {
+                ConfigurationExercise::MultiAccount => {
+                    panic!("multi-account fixture must return before singleton exercises")
+                }
                 ConfigurationExercise::Client
                 | ConfigurationExercise::SendClient
                 | ConfigurationExercise::Serving => {}
@@ -3358,7 +3370,7 @@ per_peer_limit = 1
             exercise_smtp_receiving_owner(&fixture, prepared.binding());
             exercise_smtp_storage(&fixture, prepared.binding());
         }
-        let (binding, configuration, policies) = prepared.into_parts();
+        let (binding, configuration, policies) = prepared.into_parts().unwrap();
         assert_eq!(
             configuration
                 .candidate()
@@ -9338,7 +9350,7 @@ fn exercise_submission_publication(
         domain.reserve().unwrap(),
     )
     .unwrap();
-    let (relay_binding, _relay_configuration, relay_prepared) = relay.into_parts();
+    let (relay_binding, _relay_configuration, relay_prepared) = relay.into_parts().unwrap();
     drop(domain.publish(relay_prepared).unwrap());
     let relay_policies = domain.current().unwrap();
     assert!(relay_binding.serves_route(first.route()));
