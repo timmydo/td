@@ -24,6 +24,8 @@ pub const TLS_GENERATION_BYTES: usize = 8 * MIB;
 pub const TLS_ESTABLISHED_PROCESSING_BYTES: usize = 4 * MIB;
 /// Aggregate retained account catalogs/Sessions and cold catalog copy overlap.
 pub const ACCOUNT_METADATA_BYTES: usize = 3 * MIB;
+/// Subreservation inside account metadata for persistent relay leases and copies.
+pub const RELAY_ACCOUNT_METADATA_BYTES: usize = 128 * KIB;
 /// Private per-account SMTP receipt buffers and retained fanout metadata copies.
 pub const SMTP_FANOUT_METADATA_BYTES: usize = 2 * MIB;
 const _: () = assert!(
@@ -32,11 +34,15 @@ const _: () = assert!(
         + 256 * KIB
         <= SMTP_FANOUT_METADATA_BYTES
 );
-const _: () = assert!(2 * crate::identity_catalog::MAX_BYTES + 256 * KIB <= ACCOUNT_METADATA_BYTES);
+const _: () = assert!(
+    2 * crate::identity_catalog::MAX_BYTES + 256 * KIB + RELAY_ACCOUNT_METADATA_BYTES
+        <= ACCOUNT_METADATA_BYTES
+);
 const _: () = assert!(
     crate::identity_catalog::MAX_BYTES
         + crate::config::identities::MAX_ACCOUNTS * crate::jmap_session::MAX_BYTES
         + 256 * KIB
+        + RELAY_ACCOUNT_METADATA_BYTES
         <= ACCOUNT_METADATA_BYTES
 );
 

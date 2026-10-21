@@ -216,8 +216,10 @@ explicit operation; no automatic fallback to another profile's route exists.
 Preserve QUEUE.md's immutable outgoing bytes/envelope, per-recipient states,
 uncertainty latch, retry limits, cancellation and retained failure notices.
 Replace its process-local worker fence with durable route/attempt ownership.
-The default one concurrent delivery per route is database-wide, not one per
-process. Route pauses, backoff and repair generations are shared too.
+The one concurrent delivery limit per account/route pair is database-wide.
+Route pauses, backoff and repair generations share that account/route scope.
+Each foreground process has one outbound worker across its configured accounts;
+different processes may deliver different accounts concurrently.
 
 A short transaction locks a due route and eligible recipient batch, installs
 an owner boot ID, fresh attempt ID, increasing fencing generation and database
@@ -3471,7 +3473,7 @@ same attempt operation. Route health changes no recipient or account sequence;
 recipient settlement remains a separate fenced operation after transport closes.
 Publish a fresh route failure before that settlement retires the attempt. This
 prevents delayed reports for retired attempts from undoing a later success;
-the single active attempt per route keeps that ordering across new dispatch.
+the single active attempt per account/route keeps that ordering across new dispatch.
 
 Fresh and retry attempt publication now inspect durable route health under
 those same locks. Backward database time, an outstanding repair latch or a
@@ -6142,8 +6144,8 @@ records per read. There is no complete-message allocation.
 
 ## 213. Local terminal-delivery notices
 
-Each foreground relay worker attempts at most one pending local notice every
-five seconds, independently of route backoff, repair holds and expiry clock
+The shared foreground relay worker attempts at most one pending local notice
+per account every five seconds, independently of route backoff, repair holds and expiry clock
 confirmation. Only already completed submissions with notification Pending
 qualify. The current selected relay profile and live route lease authorize
 its account; an older submission destination does not strand local notices
@@ -6453,8 +6455,8 @@ JMAP profiles register one Session and backend per account. All backends
 share read slots, pending-mutation ownership, response admission and body
 operation capacity. Each Session names only its authenticated account. Three
 MiB of startup metadata reservation covers the aggregate catalog preparation,
-bindings and up to sixteen Session documents. Relay profiles still reject
-multiple accounts before publication at this intermediate step.
+bindings and up to sixteen Session documents. All serving roles use this
+bounded account registry.
 
 
 ## Transactional incoming delivery across accounts
@@ -6494,3 +6496,51 @@ per-frame, authentication, TLS and ten-second connection limits remain intact.
 Receipt inspection uses the same bounded account-count allowance. The DATA
 worker's output meter includes the separate 2-MiB fanout metadata reservation,
 including when the configured message ceiling is smaller than that metadata.
+
+
+## Foreground relay scheduling across accounts
+
+One foreground worker rotates through at most sixteen configured accounts.
+A separate expiry cursor retains an account’s turn across local or database
+rate-limit refusals, advancing after an admitted attempt or no due work.
+Accounts without a live lease are skipped. This prevents a busy account from
+repeatedly consuming the shared expiry allowance ahead of later accounts.
+Each turn settles prior custody, checks periodic local failure notices and
+explicit repair work, checks expiry and interrupted attempts, and selects at
+most one SMTP attempt. Fresh/retry selection alternates independently for each
+account. Busy leases and paused routes advance the cursor; one 250-ms idle
+pause follows a complete pass. An SMTP attempt retains its existing 120-second
+bound, so another account may wait behind a slow peer. This is bounded rotation,
+not a per-account latency guarantee. Unsettled publication prevents rotation.
+
+The process retains one claim operation, boot identity and owner generation per
+account instead of acquiring and releasing on each turn. Historical acquisition
+receipts require fresh owner observation and successful renewal before dispatch.
+Newly acquired accounts enter a bounded registry and wait for renewal acknowledgement.
+The renewal worker snapshots that registry without holding its mutex over SQL,
+then renews all registered leases in one transaction every five seconds or when
+new claims arrive. It locks configuration, sorted accounts and then owner rows,
+samples database UTC after locks, and validates all generations before updating.
+A stale member rolls the batch back. All I/O shares one ten-second deadline;
+uncertain renewal stops the process. Lock contention on one account can therefore
+affect this process's availability. It cannot grant stale transport authority.
+
+Registry acknowledgements match the exact claim operation and generation.
+Published slots are never replaced while the worker runs. One fresh database
+UTC sample initializes the shared queue-clock guard; historical receipt time
+and later account acquisition never reset it. Renewal timestamps do not feed
+that guard out of order. Existing five-minute restart/retry and explicit expiry
+confirmation rules continue across the entire process.
+
+An explicit route-repair request remains pending until every configured account
+has been visited. An account without a repair hold completes a fresh observation;
+a held account still requires the existing newer-configuration and receipt
+fences. A busy account leaves the request pending, and a refusal is visible.
+A request serial prevents completion of an earlier refused request from finishing
+a newer request. No timer clears a repair hold.
+
+Shutdown closes foreground custody and joins renewal before one bounded
+multi-account release transaction. Expiring leases remain the fallback if cleanup
+cannot complete. Claim receipt counts do not grow with idle scheduling turns.
+Account-scoped route ownership and health match the existing database keys;
+there is no schema migration or global smart-host concurrency promise.

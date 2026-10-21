@@ -27,6 +27,18 @@ pub(super) struct Relay {
 }
 impl Relay {
     pub(super) fn new(fixture: &Fixture, socket: TcpListener, dns: UdpSocket) -> Self {
+        Self::build(fixture, socket, dns, "cloud", false)
+    }
+    pub(super) fn multi(fixture: &Fixture, socket: TcpListener, dns: UdpSocket) -> Self {
+        Self::build(fixture, socket, dns, "multi", true)
+    }
+    fn build(
+        fixture: &Fixture,
+        socket: TcpListener,
+        dns: UdpSocket,
+        profile: &str,
+        multi: bool,
+    ) -> Self {
         let done = Arc::new(AtomicBool::new(false));
         let accepted = Arc::new(AtomicUsize::new(0));
         let interrupted = Arc::new(AtomicBool::new(false));
@@ -40,7 +52,7 @@ impl Relay {
             &trust,
             deadline(),
             epoch,
-            "cloud",
+            profile,
             domain.reserve().unwrap(),
         )
         .unwrap();
@@ -133,14 +145,17 @@ impl Relay {
                 );
                 write(&mut peer, b"235 authenticated\r\n");
                 let mail = line(&mut peer);
-                assert!(mail.starts_with(b"MAIL FROM:<main@example.test>"));
+                assert!(
+                    mail.starts_with(b"MAIL FROM:<main@example.test>")
+                        || (multi && mail.starts_with(b"MAIL FROM:<second@example.test>"))
+                );
                 connections += 1;
-                if connections == 2 {
+                if !multi && connections == 2 {
                     assert!(mail
                         .windows(b"BODY=8BITMIME".len())
                         .any(|w| w == b"BODY=8BITMIME"));
                 }
-                if connections == 4 {
+                if !multi && connections == 4 {
                     interrupt.store(true, Ordering::Release);
                     let end = Instant::now() + Duration::from_secs(15);
                     loop {
@@ -153,7 +168,7 @@ impl Relay {
                     }
                     continue;
                 }
-                if connections == 7 {
+                if !multi && connections == 7 {
                     waiting.store(true, Ordering::Release);
                     let end = Instant::now() + Duration::from_secs(15);
                     while !release.load(Ordering::Acquire) && !server_done.load(Ordering::Acquire) {
@@ -172,11 +187,11 @@ impl Relay {
                     closed.store(true, Ordering::Release);
                     continue;
                 }
-                if connections == 6 {
+                if !multi && connections == 6 {
                     write(&mut peer, b"550 permanent fixture refusal\r\n");
                     continue;
                 }
-                if connections == 1 {
+                if !multi && connections == 1 {
                     write(&mut peer, b"451 temporary fixture failure\r\n");
                     continue;
                 }
@@ -195,9 +210,9 @@ impl Relay {
                     assert!(body.len() < 65536);
                 }
                 assert!(body.windows(8).any(|w| w == b"Subject:"));
-                if connections == 2 {
+                if !multi && connections == 2 {
                     assert!(body.windows(5).any(|w| w == "café".as_bytes()));
-                } else {
+                } else if !multi {
                     assert!(body
                         .windows(b"multipart/mixed".len())
                         .any(|w| w == b"multipart/mixed"));

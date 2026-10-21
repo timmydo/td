@@ -2643,7 +2643,8 @@ remain supported. No Certbot subprocess or dependency is introduced.
 Cold profile preparation retains one bounded binding, private identity
 catalog and Session per configured account. Authentication selects the account
 before dispatch, and all backends share the process admission limits. Every
-configured account must be bootstrapped before the profile can publish. Profiles
-with relay roles remain single-account until bounded account rotation is
-implemented. Receiving uses one retained fanout and one shared prepared body. RESOURCES.md accounts for the
-aggregate startup metadata independently of message-body reservations.
+configured account must be bootstrapped before the profile can publish.
+Receiving uses one retained fanout and one shared prepared body. Relay scheduling
+rotates account-scoped leases through one foreground worker and one shared
+queue-clock guard. RESOURCES.md accounts for aggregate startup and relay
+metadata independently of message-body reservations.

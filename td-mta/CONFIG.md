@@ -1854,5 +1854,8 @@ can serve all configured accounts through one endpoint, with a private Session
 and backend selected by the authenticated principal. Aggregate connection,
 request, upload, event and work admission limits remain process-wide.
 Receiving profiles accept the configured local accounts and commit each DATA
-transaction to every distinct recipient account together. Relay profiles still
-reject multiple accounts until account-fair scheduling is wired.
+transaction to every distinct recipient account together. Relay profiles rotate
+through all configured accounts with one delivery worker. A busy account lease
+or paused route does not prevent other accounts from being selected. Persistent
+leases, retry selection and failure notices remain account-scoped; transport,
+body, read and queue-clock limits remain shared by the process.

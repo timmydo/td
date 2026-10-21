@@ -295,11 +295,6 @@ pub fn load(
         .identities()
         .map_err(|_| Error::Account)?;
     let roles = configuration.roles();
-    // Relay scheduling must rotate through accounts before that role can activate
-    // more than one account.
-    if catalog.account_count() > 1 && roles.relay() {
-        return Err(Error::Account);
-    }
     let relay_policy = if roles.relay() {
         Some(TlsPolicies::prepared_relay(&policies).map_err(Error::TlsPolicy)?)
     } else {

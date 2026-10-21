@@ -480,3 +480,107 @@ fn update(
     });
     finish(result, &attempted)
 }
+
+/// Renew a bounded account registry under one connection and original deadline.
+/// Returns fresh database UTC sampled after all locks, not a receipt timestamp.
+pub fn renew_many(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    leases: &[(&Claim, u64)],
+) -> Result<i64, Error> {
+    update_many(request, trust, deadline, leases, false)
+}
+/// All owned SMTP transports must be closed before this bounded cleanup call.
+pub fn release_many(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    leases: &[(&Claim, u64)],
+) -> Result<(), Error> {
+    if leases.is_empty() {
+        return Ok(());
+    }
+    update_many(request, trust, deadline, leases, true).map(|_| ())
+}
+fn update_many(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    leases: &[(&Claim, u64)],
+    release: bool,
+) -> Result<i64, Error> {
+    if leases.is_empty() || leases.len() > crate::config::identities::MAX_ACCOUNTS {
+        return Err(Error::Capacity);
+    }
+    let first = leases.first().ok_or(Error::Integrity)?.0;
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(leases.len())
+        .map_err(|_| Error::Capacity)?;
+    for (index, (claim, generation)) in leases.iter().enumerate() {
+        if *generation == 0
+            || claim.binding.epoch() != first.binding.epoch()
+            || claim.binding.selection() != first.binding.selection()
+            || claim.binding.profile() != first.binding.profile()
+            || leases
+                .iter()
+                .take(index)
+                .any(|(prior, _)| prior.binding.account() == claim.binding.account())
+        {
+            return Err(Error::Policy);
+        }
+        values.push(((*claim).clone(), *generation));
+    }
+    values.sort_unstable_by_key(|(claim, _)| claim.binding.account());
+    let attempted = Arc::new(AtomicBool::new(false));
+    let marker = attempted.clone();
+    let result = postgres_probe::with_mutation_client(request, trust, deadline, move |client| {
+        Box::pin(async move {
+            client
+                .batch_execute("SET lock_timeout=8000; SET statement_timeout=8000")
+                .await
+                .map_err(|_| Error::Database)?;
+            let first = &values.first().ok_or(Error::Integrity)?.0;
+            if !begin(client, first, !release, true).await? {
+                return Err(Error::Policy);
+            }
+            // The first account was locked by begin. Acquire every other account
+            // before any owner row, preserving the account-before-owner hierarchy.
+            for (claim, _) in values.iter().skip(1) {
+                client
+                    .query_one(
+                        "SELECT id FROM td_mta.accounts WHERE id=$1 FOR UPDATE",
+                        &[&claim.binding.account().as_bytes().as_slice()],
+                    )
+                    .await
+                    .map_err(|_| Error::Database)?;
+            }
+            let mut owners = Vec::new();
+            owners
+                .try_reserve_exact(values.len())
+                .map_err(|_| Error::Capacity)?;
+            for (claim, _) in &values {
+                owners.push(owner(client, claim).await?.ok_or(Error::Stale)?);
+            }
+            let timestamp = now(client).await?;
+            let expires_at = timestamp.checked_add(LEASE_MS).ok_or(Error::Clock)?;
+            for ((claim, generation), owner) in values.iter().zip(&owners) {
+                current(owner, claim, *generation, timestamp, !release)?;
+            }
+            for (claim, _) in &values {
+                let changed = if release {
+                client.execute("UPDATE td_mta.route_owners SET owner_boot=NULL,operation=NULL,expires_at=NULL,last_clock=$3 WHERE account=$1 AND route_name=$2", &[&claim.binding.account().as_bytes().as_slice(), &claim.binding.route().name(), &timestamp]).await
+            } else {
+                client.execute("UPDATE td_mta.route_owners SET expires_at=$3,last_clock=$4 WHERE account=$1 AND route_name=$2", &[&claim.binding.account().as_bytes().as_slice(), &claim.binding.route().name(), &expires_at, &timestamp]).await
+            }.map_err(|_| Error::Database)?;
+                if changed != 1 {
+                    return Err(Error::Integrity);
+                }
+            }
+            commit(client, &marker).await?;
+            Ok(timestamp)
+        })
+    });
+    finish(result, &attempted)
+}

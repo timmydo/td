@@ -21,12 +21,14 @@ use crate::{
 };
 use std::{
     sync::{
-        atomic::{AtomicBool, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant},
 };
 use td_crypto::{Entropy, SystemEntropy, TrustStore};
+
+mod multi;
 
 type Buffers = (Box<[u8; TLS_WIRE_BYTES]>, Box<[u8; TLS_WIRE_BYTES]>);
 #[derive(Debug)]
@@ -70,23 +72,46 @@ fn pause(control: &Control, duration: Duration) {
 pub struct QueueControl {
     confirm: AtomicBool,
     confirmed: AtomicBool,
-    repair: AtomicU8,
+    repair: AtomicU64,
 }
 impl QueueControl {
     pub fn request_confirmation(&self) {
         self.confirm.store(true, Ordering::Release);
     }
     pub fn request_repair(&self) {
-        let _ = self
-            .repair
-            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-            .or_else(|_| {
-                self.repair
-                    .compare_exchange(3, 1, Ordering::AcqRel, Ordering::Acquire)
-            });
+        let mut current = self.repair.load(Ordering::Acquire);
+        for _ in 0..32 {
+            if !matches!(current & 3, 0 | 3) {
+                return;
+            }
+            let Some(next) = (current & !3).checked_add(4).map(|next| next | 1) else {
+                return;
+            };
+            match self.repair.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+    fn repair_request(&self) -> Option<u64> {
+        let current = self.repair.load(Ordering::Acquire);
+        (current & 3 == 1).then_some(current)
+    }
+    fn finish_repair(&self, request: u64, success: bool) {
+        let _ = self.repair.compare_exchange(
+            request,
+            (request & !3) | if success { 2 } else { 3 },
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
     }
     pub fn repair_status(&self) -> &'static str {
-        match self.repair.load(Ordering::Acquire) {
+        match self.repair.load(Ordering::Acquire) & 3 {
             1 => "requested",
             2 => "repaired",
             3 => "refused",
@@ -108,148 +133,58 @@ pub struct Worker<'a, 'r> {
 }
 impl Worker<'_, '_> {
     pub fn run(&self, control: &Control, ready: &AtomicBool) -> Result<(), Error> {
-        let mut bytes = [0; 16];
-        database(SystemEntropy::try_new())?
-            .fill(&mut bytes)
-            .map_err(|_| Error::Custody)?;
-        let claim = database(owners::prepare(
-            self.profile.binding(),
-            BootId::from_bytes(bytes),
-        ))?;
-        // Busy is an ordinary standby, including a previous process's lease.
-        ready.store(true, Ordering::Release);
-        let grant = loop {
-            if control.stop_requested() {
-                return Ok(());
-            }
-            match owners::acquire(
-                self.request,
-                self.trust,
-                Instant::now() + Duration::from_secs(10),
-                &claim,
-            ) {
-                Ok(grant) => break grant,
-                Err(owners::Error::Busy | owners::Error::Connection(_)) => {
-                    pause(control, Duration::from_secs(1))
-                }
-                Err(owners::Error::Indeterminate) => {
-                    // Reinspection/reacquisition keeps this exact claim identity.
-                    pause(control, Duration::from_secs(1));
-                }
-                Err(_) => return Err(Error::Database),
-            }
-        };
-        let guard = Arc::new(Mutex::new(database(Guard::new(Time {
-            utc_ms: grant.claimed_at,
-            monotonic: self.clock.sample()?.monotonic,
-        }))?));
-        let slots = database(ReadSlots::new(2))?;
-        let settlement = database(ReadSlots::new(1))?;
-        let pending = Pending::default();
-        let worker = Dispatches {
-            connection: Connection {
-                request: self.request,
-                trust: self.trust,
-                slots: &slots,
-                clock: self.clock.clone(),
-            },
-            guard,
-            pending: &pending,
-        };
-        let done = AtomicBool::new(false);
-        let result = std::thread::scope(|scope| {
-            let renew = std::thread::Builder::new()
-                .name("relay-lease".into())
-                .spawn_scoped(scope, || {
-                    while !done.load(Ordering::Acquire) {
-                        let next = Instant::now() + Duration::from_secs(5);
-                        while !done.load(Ordering::Acquire) && Instant::now() < next {
-                            std::thread::sleep(Duration::from_millis(50));
-                        }
-                        if done.load(Ordering::Acquire) {
-                            break;
-                        }
-                        if owners::renew(
-                            self.request,
-                            self.trust,
-                            Instant::now() + Duration::from_secs(10),
-                            &claim,
-                            grant.generation,
-                        )
-                        .is_err()
-                        {
-                            control.stop();
-                            return Err(Error::Database);
-                        }
-                    }
-                    Ok(())
-                })
-                .map_err(|_| Error::Worker)?;
-            // Unwinding must also release the scoped renewal worker.
-            struct Finish<'a>(&'a AtomicBool);
-            impl Drop for Finish<'_> {
-                fn drop(&mut self) {
-                    self.0.store(true, Ordering::Release);
-                }
-            }
-            let finish = Finish(&done);
-            let result = self.schedule(&worker, &settlement, &claim, grant.generation, control);
-            drop(finish);
-            let renewed = renew.join().map_err(|_| Error::Worker)?;
-            result.and(renewed)
-        });
-        // All transports and pending live owners are closed before release.
-        let released = owners::release(
-            self.request,
-            self.trust,
-            Instant::now() + Duration::from_secs(10),
-            &claim,
-            grant.generation,
-        );
-        result.and(database(released))
+        multi::run(self, control, ready)
     }
-    fn schedule(
+    #[allow(clippy::too_many_arguments)]
+    fn schedule_turn(
         &self,
         worker: &Dispatches<'_, '_>,
         settlement: &ReadSlots,
+        source_slots: &ReadSlots,
         claim: &owners::Claim,
         generation: u64,
         control: &Control,
-    ) -> Result<(), Error> {
-        let mut buffers = (Box::new([0; TLS_WIRE_BYTES]), Box::new([0; TLS_WIRE_BYTES]));
-        let source_slots = database(ReadSlots::new(2))?;
-        let mut retry = false;
-        let mut notice_at = Instant::now();
-        while !control.stop_requested() {
-            settle(worker, settlement, control)?;
-            if Instant::now() >= notice_at {
-                let _slot = database(worker.connection.slots.acquire())?;
-                if let Err(error) = crate::postgres_failure_notice::publish_next(
+        state: &mut multi::AccountState,
+        expiry_turn: Option<&mut multi::ExpiryTurn>,
+        mut buffers: Buffers,
+    ) -> Result<Buffers, Error> {
+        settle(worker, settlement, control)?;
+        if Instant::now() >= state.notice_at {
+            let _slot = database(worker.connection.slots.acquire())?;
+            if let Err(error) = crate::postgres_failure_notice::publish_next(
+                self.request,
+                self.trust,
+                Instant::now() + Duration::from_secs(5),
+                claim,
+                generation,
+            ) {
+                control.log(
+                    crate::observability::Kind::DeliveryNoticeDeferred { error },
+                    None,
+                    None,
+                );
+                // Serialize behind COMMIT or rollback before short-lock reads.
+                database(owners::renew(
                     self.request,
                     self.trust,
-                    Instant::now() + Duration::from_secs(5),
+                    Instant::now() + Duration::from_secs(10),
                     claim,
                     generation,
-                ) {
-                    control.log(
-                        crate::observability::Kind::DeliveryNoticeDeferred { error },
-                        None,
-                        None,
-                    );
-                    // Serialize behind COMMIT or rollback before short-lock reads.
-                    database(owners::renew(
-                        self.request,
-                        self.trust,
-                        Instant::now() + Duration::from_secs(10),
-                        claim,
-                        generation,
-                    ))?;
-                }
-                notice_at = Instant::now() + Duration::from_secs(5);
+                ))?;
             }
-            if self.queue.repair.load(Ordering::Acquire) == 1 {
-                let value = database(crate::postgres_route_repair::prepare(claim, generation))?;
-                let repaired = health(
+            state.notice_at = Instant::now() + Duration::from_secs(5);
+        }
+        if let Some(request) = self.queue.repair_request().filter(|_| !state.repaired) {
+            let needed = database(crate::postgres_route_repair::needed(
+                self.request,
+                self.trust,
+                Instant::now() + Duration::from_secs(10),
+                claim,
+                generation,
+            ))?;
+            let value = database(crate::postgres_route_repair::prepare(claim, generation))?;
+            let repaired = !needed
+                || health(
                     control,
                     || {
                         crate::postgres_route_repair::publish(
@@ -268,130 +203,140 @@ impl Worker<'_, '_> {
                         )
                     },
                 )?;
-                self.queue
-                    .repair
-                    .store(if repaired { 2 } else { 3 }, Ordering::Release);
-            }
-            let cap = until(&self.clock, 10_000)?;
-            let expiry = database(worker.candidates(
-                claim,
-                generation,
-                Kind::Expiry,
-                None,
-                cap,
-                &mut meter(cap),
-            ))?;
-            let sample = Time {
-                utc_ms: expiry.observed_at,
-                monotonic: self.clock.sample()?.monotonic,
-            };
-            let status = {
-                let mut guard = worker.guard.lock().map_err(|_| Error::Custody)?;
-                if self.queue.confirm.swap(false, Ordering::AcqRel) {
-                    let _ = guard.confirm(sample);
-                }
-                guard.observe(sample).map_err(|_| Error::Custody)?
-            };
-            self.queue.confirmed.store(status.expiry, Ordering::Release);
-            if status.expiry {
-                if let Some(candidate) = expiry.candidates.first() {
-                    let value = database(crate::postgres_queue_expiry::prepare(
-                        claim,
-                        generation,
-                        candidate.submission,
-                    ))?;
-                    match worker.expire(value, cap, &mut meter(cap)) {
-                        Ok(_) => (),
-                        Err(dispatch::Error::Expiry(
-                            crate::postgres_queue_expiry::Error::Clock(_)
-                            | crate::postgres_queue_expiry::Error::RateLimited,
-                        )) => (),
-                        Err(_) => settle(worker, settlement, control)?,
-                    }
-                }
-            }
-            // Includes a Prepared commit whose response/deadline was lost locally.
-            if let Some((id, prior)) = database(recovery::active(
-                self.request,
-                self.trust,
-                Instant::now() + Duration::from_secs(10),
-                claim,
-                generation,
-            ))? {
-                let value = database(if prior == generation {
-                    recovery::interrupted(claim, generation, id)
-                } else {
-                    recovery::prepare(claim, generation, id)
-                })?;
-                recover(worker, settlement, control, value)?;
-                pause(control, Duration::from_secs(1));
-                continue;
-            }
-            let cap = until(&self.clock, 10_000)?;
-            let page = match worker.candidates(
-                claim,
-                generation,
-                if retry { Kind::Retry } else { Kind::Fresh },
-                None,
-                cap,
-                &mut meter(cap),
-            ) {
-                Ok(page) => page,
-                Err(dispatch::Error::Candidates(
-                    crate::postgres_queue_candidates::Error::RouteHealth(_),
-                )) => {
-                    pause(control, Duration::from_secs(1));
-                    continue;
-                }
-                Err(_) => return Err(Error::Database),
-            };
-            let status = database(worker.guard.lock().map_err(|_| Error::Custody))?
-                .observe(Time {
-                    utc_ms: page.observed_at,
-                    monotonic: self.clock.sample()?.monotonic,
-                })
-                .map_err(|_| Error::Custody)?;
-            let allowed = if retry {
-                status.retry
+            if repaired {
+                state.repaired = true;
             } else {
-                status.fresh_dispatch
-            };
-            if let Some(candidate) = page.candidates.first().filter(|_| allowed) {
-                let cap = until(&self.clock, 120_000)?;
-                let mut db = meter(cap);
-                match worker.publish_prepared(
+                self.queue.finish_repair(request, false);
+            }
+        }
+        let cap = until(&self.clock, 10_000)?;
+        let expiry = database(worker.candidates(
+            claim,
+            generation,
+            Kind::Expiry,
+            None,
+            cap,
+            &mut meter(cap),
+        ))?;
+        let sample = Time {
+            utc_ms: expiry.observed_at,
+            monotonic: self.clock.sample()?.monotonic,
+        };
+        let status = {
+            let mut guard = worker.guard.lock().map_err(|_| Error::Custody)?;
+            if self.queue.confirm.swap(false, Ordering::AcqRel) {
+                let _ = guard.confirm(sample);
+            }
+            guard.observe(sample).map_err(|_| Error::Custody)?
+        };
+        self.queue.confirmed.store(status.expiry, Ordering::Release);
+        if let Some(turn) = expiry_turn {
+            let mut limited = false;
+            if let Some(candidate) = expiry.candidates.first().filter(|_| status.expiry) {
+                let value = database(crate::postgres_queue_expiry::prepare(
                     claim,
                     generation,
-                    dispatch::Input {
-                        submission: candidate.submission,
-                        retry,
-                        deadline: cap,
-                    },
-                    &mut db,
-                ) {
-                    Ok(prepared) => {
-                        buffers = self.deliver(
-                            prepared,
-                            worker,
-                            settlement,
-                            &source_slots,
-                            control,
-                            buffers,
-                            cap,
-                            &mut db,
-                            claim,
-                            generation,
-                        )?;
+                    candidate.submission,
+                ))?;
+                match worker.expire(value, cap, &mut meter(cap)) {
+                    Ok(_) => (),
+                    Err(dispatch::Error::Expiry(
+                        crate::postgres_queue_expiry::Error::Clock(
+                            crate::queue_clock::Error::RateLimited,
+                        )
+                        | crate::postgres_queue_expiry::Error::RateLimited,
+                    )) => limited = true,
+                    Err(dispatch::Error::Expiry(crate::postgres_queue_expiry::Error::Clock(_))) => {
                     }
-                    Err(_) => {
-                        settle(worker, settlement, control)?;
-                    }
+                    Err(_) => settle(worker, settlement, control)?,
                 }
             }
-            retry = !retry;
-            pause(control, Duration::from_millis(250));
+            if !limited {
+                turn.advance();
+            }
         }
-        Ok(())
+        // Includes a Prepared commit whose response/deadline was lost locally.
+        if let Some((id, prior)) = database(recovery::active(
+            self.request,
+            self.trust,
+            Instant::now() + Duration::from_secs(10),
+            claim,
+            generation,
+        ))? {
+            let value = database(if prior == generation {
+                recovery::interrupted(claim, generation, id)
+            } else {
+                recovery::prepare(claim, generation, id)
+            })?;
+            recover(worker, settlement, control, value)?;
+            return Ok(buffers);
+        }
+        let cap = until(&self.clock, 10_000)?;
+        let page = match worker.candidates(
+            claim,
+            generation,
+            if state.retry {
+                Kind::Retry
+            } else {
+                Kind::Fresh
+            },
+            None,
+            cap,
+            &mut meter(cap),
+        ) {
+            Ok(page) => page,
+            Err(dispatch::Error::Candidates(
+                crate::postgres_queue_candidates::Error::RouteHealth(_),
+            )) => {
+                return Ok(buffers);
+            }
+            Err(_) => return Err(Error::Database),
+        };
+        let status = database(worker.guard.lock().map_err(|_| Error::Custody))?
+            .observe(Time {
+                utc_ms: page.observed_at,
+                monotonic: self.clock.sample()?.monotonic,
+            })
+            .map_err(|_| Error::Custody)?;
+        let allowed = if state.retry {
+            status.retry
+        } else {
+            status.fresh_dispatch
+        };
+        if let Some(candidate) = page.candidates.first().filter(|_| allowed) {
+            let cap = until(&self.clock, 120_000)?;
+            let mut db = meter(cap);
+            match worker.publish_prepared(
+                claim,
+                generation,
+                dispatch::Input {
+                    submission: candidate.submission,
+                    retry: state.retry,
+                    deadline: cap,
+                },
+                &mut db,
+            ) {
+                Ok(prepared) => {
+                    buffers = self.deliver(
+                        prepared,
+                        worker,
+                        settlement,
+                        source_slots,
+                        control,
+                        buffers,
+                        cap,
+                        &mut db,
+                        claim,
+                        generation,
+                    )?;
+                }
+                Err(_) => {
+                    settle(worker, settlement, control)?;
+                }
+            }
+        }
+        state.retry = !state.retry;
+        Ok(buffers)
     }
     fn success(
         &self,
@@ -704,5 +649,27 @@ fn health(
             return Err(Error::Custody);
         }
         pause(control, Duration::from_secs(1));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    #[test]
+    fn repair_completion_cannot_finish_a_newer_request() {
+        let control = QueueControl::default();
+        assert_eq!(control.repair_status(), "idle");
+        control.request_repair();
+        let old = control.repair_request().unwrap();
+        control.finish_repair(old, false);
+        assert_eq!(control.repair_status(), "refused");
+        control.request_repair();
+        let new = control.repair_request().unwrap();
+        assert_ne!(old, new);
+        control.finish_repair(old, true);
+        assert_eq!(control.repair_status(), "requested");
+        control.finish_repair(new, true);
+        assert_eq!(control.repair_status(), "repaired");
     }
 }

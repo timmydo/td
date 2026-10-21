@@ -111,6 +111,34 @@ pub fn inspect(
     })
     .map_err(Error::Connection)?
 }
+/// Fresh observation for an explicit process-wide repair request. An account
+/// without a hold needs no mutation; this observation grants no delivery rights.
+pub fn needed(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    claim: &Claim,
+    generation: u64,
+) -> Result<bool, Error> {
+    let claim = claim.clone();
+    postgres_probe::with_mailbox_client(request, trust, deadline, move |client| {
+        Box::pin(async move {
+            if !owners::begin(client, &claim, true, false)
+                .await
+                .map_err(Error::Owner)?
+            {
+                return Err(Error::Policy);
+            }
+            owners::check_locked(client, &claim, generation)
+                .await
+                .map_err(Error::Owner)?;
+            Ok(health::current(client, &claim)
+                .await?
+                .is_some_and(|state| state.repair_generation.is_some()))
+        })
+    })
+    .map_err(Error::Connection)?
+}
 pub fn publish(
     request: &Request<'_>,
     trust: &TrustStore,

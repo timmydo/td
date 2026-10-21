@@ -4489,3 +4489,15 @@ allowance includes the resolved account ID. No incoming body buffer, storage
 worker, outgoing transport or read pool is multiplied by account count. The
 original meter prepays publication I/O for every target, so a large fanout may
 refuse within the fixed work allowance even when each mailbox has quota.
+
+
+## Relay account registry
+
+A 128-KiB subreservation inside the existing 3-MiB account metadata row covers
+sixteen persistent claim slots, per-account scheduling state and bounded claim
+copies for renewal snapshots, SQL and foreground custody. Static assertions
+include bounded profile/route names and keep both cold catalog overlap and
+Session preparation within the original row. The planner total is unchanged.
+One renewal thread, foreground worker, pending owner, body source pool and TLS
+buffer pair serve all accounts. Cumulative database work remains bounded by
+the existing transaction deadlines and driver limits.

@@ -140,7 +140,12 @@ obligations.
 
 ## 3. Attempt and restart transitions
 
-The single route dispatches at most one SMTP transaction at a time. Select
+Each account/route pair dispatches at most one SMTP transaction at a time
+across database instances. Each foreground process additionally retains one
+outbound worker shared by its configured accounts. Different processes may
+therefore deliver different accounts concurrently, including through the same
+smart host. Route health and backoff are shared within each account/route pair.
+Select
 at most 100 eligible recipients for one attempt, in ascending ordinal order;
 a submission with more recipients is dispatched in batches. All recipients
 in that batch receive the same new random AttemptId and checked increment

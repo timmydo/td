@@ -2516,6 +2516,8 @@ fn real_postgres_smtp_worker_preserves_starttls_receipts() {
 mod multi_account;
 #[path = "postgres_probe/multi_receiving.rs"]
 mod multi_receiving;
+#[path = "postgres_probe/multi_relay.rs"]
+mod multi_relay;
 
 #[path = "postgres_probe/serving.rs"]
 mod serving;

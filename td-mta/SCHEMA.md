@@ -159,8 +159,9 @@ all three resource planners before a structural candidate can be returned.
 ## 3. Account, domains and aliases
 
 One to 16 `[account "ID"]` stanzas are structurally supported. IDs and
-case-sensitive usernames must be unique. JMAP and receiving profiles can serve all configured accounts. Profiles with
-relay roles still require one account until account-fair scheduling is wired.
+case-sensitive usernames must be unique. JMAP, receiving and relay profiles
+serve all configured accounts with shared process resource limits. Relay
+scheduling rotates accounts while retaining one outbound worker.
 Fields are:
 
 | Field | Type/default | Constraint |
