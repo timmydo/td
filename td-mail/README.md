@@ -402,8 +402,24 @@ The window opens before any account is connected, so the credential and
 discovery round trips never hold it; the mailbox list loads once the
 connection is decided. Every account is opened at start and stays open,
 each with its own backend: one connection is made at a time, the shown
-account's first, and `a` in the mailbox list shows the next account at
-once, without connecting it again. If an account cannot be reached
+account's first. With two or more accounts the window keeps an account
+tree at its left: each account's heading, with its inbox's unread count
+(`...` until its folders are listed, `offline` when the fetch failed),
+and its folders under it. Tab moves the keys to the tree and back
+(Escape or `q` give them back too, and any other key gives them back
+and acts in the view); `n`/`p`, the arrows, the page keys, Home and End
+move in it, and Return, Space or a press opens an entry in place of the
+views: a heading opens the account's own page (its folder list, where it
+is set up and reconnected), a folder opens that folder's mail over it,
+so `q` returns to the account's page. The account already shown keeps
+its page and what it cached; another's page starts from the folders the
+tree holds. Opening is refused while a draft is open, and the tree never
+has the keys while one is edited. The tree draws its cursor only while
+it has the keys. A window narrower than three trees shows the tree over
+the views only while it has the keys. Switching accounts connects
+nothing again; the tree's counts follow each account's folder fetches,
+and with `sync_interval` set, every idle interval asks every account,
+whatever view is shown. If an account cannot be reached
 (server down, network not up yet, placeholder credentials), td-mail lists
 what its cache holds instead of exiting, and everything it cannot serve
 from the cache says why the connection failed

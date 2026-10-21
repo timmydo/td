@@ -17,6 +17,11 @@ pub const GLOBAL: Table = Table {
     bindings: &[
         ("?", "show_keys", "Show this list of keys (F1 too)"),
         ("c", "compose", "Compose new email"),
+        (
+            "Tab",
+            "account_tree",
+            "With two or more accounts: move the keys to the account tree and back",
+        ),
     ],
 };
 
@@ -29,7 +34,6 @@ pub const MAILBOX_LIST: Table = Table {
         ("p/k/Up", "prev", "Previous mailbox"),
         ("Return", "open", "Open mailbox"),
         ("g", "refresh", "Refresh"),
-        ("a", "next_account", "Show the next account"),
         ("R", "reconnect", "Connect the shown account again"),
         (
             "s",
@@ -270,6 +274,27 @@ pub const COMPOSE: Table = Table {
     ],
 };
 
+pub const ACCOUNT_TREE: Table = Table {
+    id: "account_tree",
+    title: "Account Tree",
+    bindings: &[
+        ("n/j/Down", "next", "Next account or folder"),
+        ("p/k/Up", "prev", "Previous account or folder"),
+        ("PageUp/PageDown", "page", "A page up or down"),
+        ("Home/End", "ends", "First or last entry"),
+        (
+            "Return/Space",
+            "open",
+            "Open the account's page, or the folder over it",
+        ),
+        (
+            "Tab/Escape/q",
+            "back",
+            "Give the keys back to the view; any other key goes there too",
+        ),
+    ],
+};
+
 const TABLES: &[&Table] = &[
     &GLOBAL,
     &MAILBOX_LIST,
@@ -279,6 +304,7 @@ const TABLES: &[&Table] = &[
     &DRAFTS,
     &SENT,
     &COMPOSE,
+    &ACCOUNT_TREE,
 ];
 
 /// The key list's sections: `first`'s, the view shown, then the rest in
@@ -352,7 +378,8 @@ mod tests {
                 "Email View",
                 "Drafts",
                 "Sent Draft",
-                "Compose"
+                "Compose",
+                "Account Tree"
             ]
         );
         assert_eq!(
@@ -373,7 +400,8 @@ mod tests {
                 "Thread View",
                 "Drafts",
                 "Sent Draft",
-                "Compose"
+                "Compose",
+                "Account Tree"
             ]
         );
         assert!(viewing[0].rows.contains(&Row {

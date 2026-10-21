@@ -23,7 +23,6 @@ const LABELS: &[&str] = &[
     "Drafts",
     "Folder",
     "Mark read",
-    "Account",
     "Reconnect",
     keys::BUTTON,
     "Quit",
@@ -35,7 +34,6 @@ const KEYS: &[Key] = &[
     Key::Char('D'),
     Key::Menu(Menu::Folder),
     Key::Char('u'),
-    Key::Char('a'),
     Key::Char('R'),
     Key::Char('?'),
     Key::Char('q'),
@@ -44,25 +42,19 @@ const CREATE_LABELS: &[&str] = &["Create", "Cancel"];
 const CREATE_KEYS: &[Key] = &[Key::Enter, Key::Escape];
 const DELETE_LABELS: &[&str] = &["Delete", "Cancel"];
 const DELETE_KEYS: &[Key] = &[Key::Char('y'), Key::Escape];
-const SETUP_SCREEN_LABELS: &[&str] = &["Set up", "Reconnect", "Account", keys::BUTTON, "Quit"];
+const SETUP_SCREEN_LABELS: &[&str] = &["Set up", "Reconnect", keys::BUTTON, "Quit"];
 const SETUP_SCREEN_KEYS: &[Key] = &[
     Key::Char('s'),
     Key::Char('R'),
-    Key::Char('a'),
     Key::Char('?'),
     Key::Char('q'),
 ];
 /// A placeholder the form can set up: it has no server to reconnect.
-const PLACEHOLDER_SETUP_LABELS: &[&str] = &["Set up", "Account", keys::BUTTON, "Quit"];
-const PLACEHOLDER_SETUP_KEYS: &[Key] = &[
-    Key::Char('s'),
-    Key::Char('a'),
-    Key::Char('?'),
-    Key::Char('q'),
-];
+const PLACEHOLDER_SETUP_LABELS: &[&str] = &["Set up", keys::BUTTON, "Quit"];
+const PLACEHOLDER_SETUP_KEYS: &[Key] = &[Key::Char('s'), Key::Char('?'), Key::Char('q')];
 /// A placeholder the form cannot change: only its own keys act.
-const PLACEHOLDER_LABELS: &[&str] = &["Account", keys::BUTTON, "Quit"];
-const PLACEHOLDER_KEYS: &[Key] = &[Key::Char('a'), Key::Char('?'), Key::Char('q')];
+const PLACEHOLDER_LABELS: &[&str] = &[keys::BUTTON, "Quit"];
+const PLACEHOLDER_KEYS: &[Key] = &[Key::Char('?'), Key::Char('q')];
 const SETUP_LABELS: &[&str] = &["OK", "Cancel"];
 const SETUP_KEYS: &[Key] = &[Key::Enter, Key::Escape];
 
@@ -423,21 +415,16 @@ impl MailboxListView {
         });
     }
 
-    /// The account after the current one, round; none with one account.
-    fn next_account_name(&self) -> Option<String> {
-        if self.account_names.len() < 2 {
-            return None;
-        }
-        let current_idx = self
-            .account_names
-            .iter()
-            .position(|n| n == &self.current_account)
-            .unwrap_or(0);
-        let next_idx = (current_idx + 1) % self.account_names.len();
-        self.account_names.get(next_idx).cloned()
+    /// The folders the account tree holds, shown until the list's own
+    /// fetch answers: not a refresh, so the time and any error stand.
+    pub fn seed(&mut self, folders: &[Mailbox]) {
+        let mut folders = folders.to_vec();
+        Self::sort_mailboxes(&mut folders);
+        self.mailboxes = folders;
+        self.loading = false;
     }
 
-    fn sort_mailboxes(mailboxes: &mut [Mailbox]) {
+    pub fn sort_mailboxes(mailboxes: &mut [Mailbox]) {
         mailboxes.sort_by(|a, b| {
             let rank = |m: &Mailbox| -> u32 {
                 match m.role.as_deref() {
@@ -509,8 +496,8 @@ impl MailboxListView {
         // started offline connects nothing.
         let reconnect = self.setup.online && !self.setup.placeholder;
         let account_hint = match (self.account_names.len() > 1, reconnect) {
-            (true, false) => " a:account",
-            (true, true) => " a:account R:reconnect",
+            (true, false) => " Tab:accounts",
+            (true, true) => " Tab:accounts R:reconnect",
             (false, false) => "",
             (false, true) => " R:reconnect",
         };
@@ -598,6 +585,19 @@ impl MailboxListView {
 }
 
 impl View for MailboxListView {
+    /// The cursor put on the folder and opened as Return opens it; none
+    /// when the list does not hold it.
+    fn open_folder(&mut self, id: &str) -> Option<ViewAction> {
+        self.cursor = self.mailboxes.iter().position(|m| m.id == id)?;
+        // A name being typed or a delete being asked is left, unconfirmed,
+        // so the Return opens the folder and confirms nothing.
+        self.create_mode = false;
+        self.create_input.clear();
+        self.delete_confirm_mode = false;
+        self.setup_step = None;
+        Some(self.handle_key(Key::Enter, 0))
+    }
+
     fn keys(&self) -> Option<&'static crate::keybindings::Table> {
         Some(&crate::keybindings::MAILBOX_LIST)
     }
@@ -668,9 +668,7 @@ impl View for MailboxListView {
                 return ViewAction::Continue;
             }
             // A placeholder has no server: only its own keys do anything.
-            if self.screen() == Some(Screen::Placeholder)
-                && !matches!(key, Key::Char('a' | '?' | 'q'))
-            {
+            if self.screen() == Some(Screen::Placeholder) && !matches!(key, Key::Char('?' | 'q')) {
                 return ViewAction::Continue;
             }
         }
@@ -832,14 +830,6 @@ impl View for MailboxListView {
                 ViewAction::Compose(draft.into())
             }
             Key::Char('D') => ViewAction::Drafts,
-            Key::Char('a') => {
-                if let Some(next) = self.next_account_name() {
-                    ViewAction::SwitchAccount(next)
-                } else {
-                    self.status_message = Some("No other account is configured".to_string());
-                    ViewAction::Continue
-                }
-            }
             // The answer to the fetch the session sends behind the
             // reconnect replaces what the list shows.
             Key::Char('R') => {
@@ -1182,10 +1172,10 @@ mod tests {
     }
 
     /// `R` asks for the account's connection again, the list loading
-    /// until the fetch behind it answers; `a` with one account goes
-    /// nowhere and says so.
+    /// until the fetch behind it answers; `a` is no key of the list's,
+    /// the account tree being where another account is opened.
     #[test]
-    fn r_reconnects_and_a_needs_another_account() {
+    fn r_reconnects_and_a_opens_no_account() {
         let (mut view, cmd_rx) = make_view();
         view.on_response(&BackendResponse::Mailboxes(Err("offline".to_string())));
         assert!(matches!(
@@ -1212,10 +1202,7 @@ mod tests {
             view.handle_key(Key::Char('a'), 10),
             ViewAction::Continue
         ));
-        assert!(view
-            .scene()
-            .status
-            .starts_with("No other account is configured"));
+        assert!(!KEYS.contains(&Key::Char('a')));
     }
 
     #[test]
@@ -1512,7 +1499,7 @@ mod tests {
         )
         .with_setup(setup(false));
         view.on_response(&failed(&refused));
-        assert!(view.scene().status.contains(" a:account R:reconnect"));
+        assert!(view.scene().status.contains(" Tab:accounts R:reconnect"));
 
         // Not on the portal, the bare error stands.
         let (view, _cmd_rx) = make_view();

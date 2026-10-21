@@ -41,6 +41,17 @@ fn describe(error: td_ui::editor_error::Error, what: &str) -> String {
     }
 }
 
+/// Where the account tree goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Side {
+    /// No tree: one account, or a narrow window's view has the keys.
+    None,
+    /// A column this many pixels wide at the body's left.
+    Column(u32),
+    /// The whole body: a narrow window's tree has the keys.
+    Full,
+}
+
 /// The scene's regions over the surface.
 #[derive(Clone, Copy)]
 pub struct Layout {
@@ -48,6 +59,8 @@ pub struct Layout {
     pub entry: Option<TextEntry>,
     pub list: Option<List>,
     pub pane: Option<Rect>,
+    /// The account tree, where `Side` puts one.
+    pub sidebar: Option<List>,
     /// The band between the entry, or the bar, and the status row, which
     /// the list or the pane fills, and the finder when one is open.
     pub body: Rect,
@@ -56,9 +69,9 @@ pub struct Layout {
 
 impl Layout {
     /// The bar at the top, the status at the bottom, and between them
-    /// the entry's band when the scene has one, then the list or the
-    /// pane.
-    pub fn new(surface: Surface, scene: &Scene<'_>) -> Self {
+    /// the account tree where `side` puts it, and beside it the entry's
+    /// band when the scene has one, then the list or the pane.
+    pub fn new(surface: Surface, scene: &Scene<'_>, side: Side) -> Self {
         let s = surface.scale.value();
         let row = (ROW * s) as u32;
         let bar = Bar::new(surface, scene.labels);
@@ -76,9 +89,30 @@ impl Layout {
             entry: None,
             list: None,
             pane: None,
+            sidebar: None,
             body,
             status,
         };
+        match side {
+            Side::None => {}
+            Side::Full => {
+                layout.sidebar = List::new(surface, body);
+                if layout.sidebar.is_some() {
+                    return layout;
+                }
+            }
+            Side::Column(width) if width < body.width => {
+                layout.sidebar = List::new(surface, Rect { width, ..body });
+                if layout.sidebar.is_some() {
+                    body = Rect {
+                        x: body.x + i64::from(width),
+                        width: body.width - width,
+                        ..body
+                    };
+                }
+            }
+            Side::Column(_) => {}
+        }
         if scene.entry.is_some() {
             // A body too short for the band gets none of it, and a band
             // the widget refuses leaves the body its rows.
@@ -771,6 +805,9 @@ fn admit(text: &str, truncate: bool) -> Option<String> {
 pub struct Frame<'a> {
     pub surface: Surface,
     pub scene: &'a Scene<'a>,
+    /// The account tree and where it goes.
+    pub sidebar: &'a super::sidebar::Sidebar,
+    pub side: Side,
     pub first: usize,
     pub entry_first: usize,
     pub pane: &'a Pane,
@@ -786,7 +823,7 @@ impl Composition for Frame<'_> {
     }
 
     fn emit(&self, damage: Rect, sink: &mut dyn FnMut(Draw)) {
-        let layout = Layout::new(self.surface, self.scene);
+        let layout = Layout::new(self.surface, self.scene, self.side);
         if let Some(clip) = damage.intersection(self.surface.bounds()) {
             sink(Draw {
                 clip,
@@ -810,6 +847,31 @@ impl Composition for Frame<'_> {
                     focused: true,
                     caret_visible: true,
                 },
+                damage,
+                sink,
+            );
+        }
+        if let Some(list) = layout.sidebar {
+            let tree = self.sidebar;
+            let total = tree.len();
+            let end = total.min(tree.first.saturating_add(list.rows()));
+            let rows: Vec<_> = (tree.first..end).map(|index| tree.row(index)).collect();
+            list.emit(
+                rows.iter().map(|row| Item {
+                    label: row.label.as_str(),
+                    meta: row.meta.as_str(),
+                    enabled: true,
+                    marked: row.marked,
+                }),
+                tree.first,
+                // The cursor is drawn only while the tree has the keys,
+                // so the highlighted row says which side has them.
+                if tree.focused {
+                    tree.cursor()
+                } else {
+                    usize::MAX
+                },
+                total,
                 damage,
                 sink,
             );

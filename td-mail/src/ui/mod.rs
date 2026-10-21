@@ -10,6 +10,7 @@
 
 pub mod frame;
 pub mod input;
+pub mod sidebar;
 pub mod views;
 
 use crate::attach;
@@ -19,8 +20,9 @@ use crate::config::{AccountConfig, PasswordSource, RetentionPolicyConfig, SpamCo
 use crate::regex::UserRegex;
 use crate::rules::CompiledRule;
 use crate::spam::SharedModel;
-use frame::{Draft, Dropdown, Frame, Layout, Pane};
+use frame::{Draft, Dropdown, Frame, Layout, Pane, Side};
 use input::{Key, Menu};
+use sidebar::{Entry, Sidebar};
 use std::collections::VecDeque;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -341,9 +343,11 @@ struct Session {
     /// Every account's backend, by its place in `setup.accounts`, open
     /// for the whole session.
     live: Vec<Live>,
-    /// The account the stack shows; the others' answers are drained and
-    /// dropped, their backends kept connected.
+    /// The account the stack shows; the others' answers are drained,
+    /// their folder lists kept by the tree, their backends connected.
     current: usize,
+    /// The account tree beside the views, with two or more accounts.
+    sidebar: Sidebar,
     mouse: bool,
     /// The surface the frame is laid out for, as the window last gave it.
     surface: Surface,
@@ -399,6 +403,7 @@ impl Session {
             ));
         };
         let stack = ViewStack::new(Box::new(setup.mailbox_view(&open.cmd_tx, account)));
+        let sidebar = Sidebar::new(&setup.account_names, current);
         let mut session = Session {
             sync_interval: setup.sync_interval_secs.map(Duration::from_secs),
             setup,
@@ -406,6 +411,7 @@ impl Session {
             pane: Pane::new()?,
             live,
             current,
+            sidebar,
             mouse,
             surface,
             title: String::new(),
@@ -433,6 +439,37 @@ impl Session {
         self.dirty = true;
     }
 
+    /// Where the account tree goes on `surface`: with two or more
+    /// accounts, a column beside the views in a window three trees wide,
+    /// and over the body of a narrower one while the tree has the keys,
+    /// which it never has while a draft is being edited.
+    fn side_on(&self, surface: Surface) -> Side {
+        if self.setup.accounts.len() < 2 {
+            return Side::None;
+        }
+        let width = sidebar::CELLS * td_ui::CELL_WIDTH * surface.scale.value();
+        if surface.width >= 3 * width {
+            Side::Column(width as u32)
+        } else if self.sidebar.focused && !self.editing(true) {
+            Side::Full
+        } else {
+            Side::None
+        }
+    }
+
+    fn side(&self) -> Side {
+        self.side_on(self.surface)
+    }
+
+    /// The tree is drawn and has the keys.
+    fn tree_focused(&self) -> bool {
+        self.sidebar.focused
+            && !self.editing(true)
+            && self
+                .shape()
+                .is_some_and(|shape| shape.layout.sidebar.is_some())
+    }
+
     fn shape(&self) -> Option<Shape> {
         let view = self.stack.current()?;
         let scene = view.scene();
@@ -441,7 +478,7 @@ impl Session {
             Body::Text { .. } | Body::Edit { .. } => None,
         };
         Some(Shape {
-            layout: Layout::new(self.surface, &scene),
+            layout: Layout::new(self.surface, &scene, self.side()),
             total,
             keys: scene.keys,
         })
@@ -495,7 +532,6 @@ impl Session {
             }
             ViewAction::Quit => self.quit("q or the bar's Quit"),
             ViewAction::Compose(draft) => self.compose(&draft),
-            ViewAction::SwitchAccount(name) => self.switch_account(&name),
             ViewAction::Reconnect => {
                 self.reconnect(self.current);
                 // After the reconnect's ask, so the backend holds it until
@@ -650,68 +686,67 @@ impl Session {
             return false;
         };
         let key = |key, repeated| finder::Event::Key { key, repeated };
-        let event = match *input {
-            Input::Key { chord, repeat } => match chord {
-                "Up" => key(finder::Key::Up, repeat),
-                "Down" => key(finder::Key::Down, repeat),
-                "PageUp" => key(finder::Key::PageUp, repeat),
-                "PageDown" => key(finder::Key::PageDown, repeat),
-                "Home" => key(finder::Key::Home, repeat),
-                "End" => key(finder::Key::End, repeat),
-                "Return" => key(finder::Key::Activate, repeat),
-                "C-Return" => key(finder::Key::Accept, repeat),
-                "Backspace" => key(finder::Key::Backspace, repeat),
-                "M-Up" | "^" => key(finder::Key::Parent, repeat),
-                "Escape" => key(finder::Key::Escape, repeat),
-                "Space" => finder::Event::Insert(' '),
-                "C-h" => {
-                    if !repeat {
-                        self.last_user_activity = Instant::now();
-                        self.toggle_hidden();
+        let event =
+            match *input {
+                Input::Key { chord, repeat } => match chord {
+                    "Up" => key(finder::Key::Up, repeat),
+                    "Down" => key(finder::Key::Down, repeat),
+                    "PageUp" => key(finder::Key::PageUp, repeat),
+                    "PageDown" => key(finder::Key::PageDown, repeat),
+                    "Home" => key(finder::Key::Home, repeat),
+                    "End" => key(finder::Key::End, repeat),
+                    "Return" => key(finder::Key::Activate, repeat),
+                    "C-Return" => key(finder::Key::Accept, repeat),
+                    "Backspace" => key(finder::Key::Backspace, repeat),
+                    "M-Up" | "^" => key(finder::Key::Parent, repeat),
+                    "Escape" => key(finder::Key::Escape, repeat),
+                    "Space" => finder::Event::Insert(' '),
+                    "C-h" => {
+                        if !repeat {
+                            self.last_user_activity = Instant::now();
+                            self.toggle_hidden();
+                        }
+                        return true;
                     }
-                    return true;
-                }
-                _ => {
-                    let mut chars = chord.chars();
-                    match (chars.next(), chars.next()) {
-                        (Some(c), None) if !c.is_control() => finder::Event::Insert(c),
-                        _ => finder::Event::Other,
+                    _ => {
+                        let mut chars = chord.chars();
+                        match (chars.next(), chars.next()) {
+                            (Some(c), None) if !c.is_control() => finder::Event::Insert(c),
+                            _ => finder::Event::Other,
+                        }
                     }
+                },
+                Input::Pointer { phase, x, y, .. } => match phase {
+                    PointerPhase::Press => finder::Event::Press { x, y },
+                    PointerPhase::Move => finder::Event::Move { x, y },
+                    PointerPhase::Release => finder::Event::Release { x, y },
+                },
+                Input::Wheel { rows, .. } => finder::Event::Wheel {
+                    x: list.x,
+                    y: list.y,
+                    rows,
+                },
+                Input::Resize(surface) => {
+                    let Some(rect) = self.stack.current().map(|view| {
+                        Layout::new(surface, &view.scene(), self.side_on(surface)).body
+                    }) else {
+                        return false;
+                    };
+                    finder::Event::Resize { surface, rect }
                 }
-            },
-            Input::Pointer { phase, x, y, .. } => match phase {
-                PointerPhase::Press => finder::Event::Press { x, y },
-                PointerPhase::Move => finder::Event::Move { x, y },
-                PointerPhase::Release => finder::Event::Release { x, y },
-            },
-            Input::Wheel { rows, .. } => finder::Event::Wheel {
-                x: list.x,
-                y: list.y,
-                rows,
-            },
-            Input::Resize(surface) => {
-                let Some(rect) = self
-                    .stack
-                    .current()
-                    .map(|view| Layout::new(surface, &view.scene()).body)
-                else {
+                Input::Close => {
+                    if let Some(chooser) = self.chooser.take() {
+                        self.attach_chosen(chooser.tab, None);
+                    }
                     return false;
-                };
-                finder::Event::Resize { surface, rect }
-            }
-            Input::Close => {
-                if let Some(chooser) = self.chooser.take() {
-                    self.attach_chosen(chooser.tab, None);
                 }
-                return false;
-            }
-            Input::Focus(_)
-            | Input::Paste(_)
-            | Input::PasteImage { .. }
-            | Input::CancelPointer
-            | Input::Hover(_)
-            | Input::Context { .. } => return false,
-        };
+                Input::Focus(_)
+                | Input::Paste(_)
+                | Input::PasteImage { .. }
+                | Input::CancelPointer
+                | Input::Hover(_)
+                | Input::Context { .. } => return false,
+            };
         let pointed = matches!(input, Input::Pointer { .. } | Input::Wheel { .. });
         if pointed && !self.mouse {
             return true;
@@ -1076,6 +1111,9 @@ impl Session {
     /// one is up.
     fn scene<'a>(&'a self, slot: &'a Slot) -> Scene<'a> {
         let mut scene = slot.view.scene();
+        if self.tree_focused() {
+            scene.status = "Accounts | n/p:move RET:open Tab/Esc:back".to_string();
+        }
         if let Some(note) = &self.note {
             scene.status = note.clone();
         }
@@ -1096,33 +1134,105 @@ impl Session {
         self.live.get(self.current).map(|live| live.cmd_tx.clone())
     }
 
-    /// Shows the named account's mailbox list in place of what the stack
-    /// held. Its backend stays as it is, connected or connecting, and
-    /// answers the list's fetch from what it holds.
-    fn switch_account(&mut self, name: &str) {
-        if let Some(index) = self.setup.accounts.iter().position(|a| a.name == name) {
-            self.show_account(index, "switch_account");
+    /// The mailbox list of the account at `index`, and its folders'
+    /// fetch sent; `seeded`, it shows the folders the tree holds until
+    /// the fetch answers, which a set-up does not, its old folders being
+    /// another server's. Its backend stays as it is.
+    fn account_view(&self, index: usize, origin: &str, seeded: bool) -> Option<MailboxListView> {
+        let account = self.setup.accounts.get(index)?;
+        let live = self.live.get(index)?;
+        let mut view = self.setup.mailbox_view(&live.cmd_tx, account);
+        if let Some(folders) = self.sidebar.folders(index).filter(|_| seeded) {
+            view.seed(folders);
         }
-    }
-
-    /// The stack replaced by the mailbox list of the account at `index`,
-    /// which fetches its folders.
-    fn show_account(&mut self, index: usize, origin: &str) {
-        let (Some(account), Some(live)) = (self.setup.accounts.get(index), self.live.get(index))
-        else {
-            return;
-        };
-        let mailbox_view = self.setup.mailbox_view(&live.cmd_tx, account);
         let _ = live.cmd_tx.send(BackendCommand::FetchMailboxes {
             origin: origin.to_string(),
         });
+        Some(view)
+    }
+
+    /// The stack replaced by `view`, the account at `index`'s.
+    fn replace_stack(&mut self, index: usize, view: MailboxListView) {
         self.current = index;
-        let old = std::mem::replace(&mut self.stack, ViewStack::new(Box::new(mailbox_view)));
+        let old = std::mem::replace(&mut self.stack, ViewStack::new(Box::new(view)));
         for slot in old.into_slots() {
             self.pane.close(slot.text);
         }
         self.last_idle_sync = Instant::now();
         self.redraw();
+    }
+
+    /// The stack replaced by the mailbox list of the account at `index`,
+    /// unseeded: a set-up's, whose old folders are another server's.
+    fn show_account(&mut self, index: usize, origin: &str) {
+        if let Some(view) = self.account_view(index, origin, false) {
+            self.replace_stack(index, view);
+        }
+    }
+
+    /// The account at `index`'s page, and the folder `id` opened over it
+    /// as Return on its row opens it, so `q` from the folder is the
+    /// page. The account shown keeps its page, popped to, with what it
+    /// caches; another's replaces the stack, seeded from the tree.
+    fn open_page(&mut self, index: usize, id: Option<&str>) {
+        if index == self.current {
+            for slot in self.stack.pop_to_root() {
+                self.pane.close(slot.text);
+            }
+            // The page is refreshed as a pop reveals it, its cached
+            // folders marked stale, so the folder opened over it asks.
+            if let Some(root) = self.stack.root_mut() {
+                root.on_reveal();
+            }
+        } else {
+            let Some(view) = self.account_view(index, "sidebar", true) else {
+                return;
+            };
+            self.replace_stack(index, view);
+        }
+        let opened = id.and_then(|id| self.stack.root_mut()?.open_folder(id));
+        if let Some(action) = opened {
+            self.act(action);
+        }
+        self.redraw();
+    }
+
+    /// Opens a tree entry in place of the views, an account's page or a
+    /// folder over it, and gives the views the keys. A draft open on the
+    /// stack keeps it, so nothing being written is closed unasked.
+    fn open_entry(&mut self, entry: Entry) {
+        if self.stack.has_draft() {
+            self.note("Not opened: close the draft first".to_string());
+            return;
+        }
+        self.sidebar.select(entry.clone());
+        self.sidebar.focused = false;
+        match entry {
+            Entry::Account(index) => self.open_page(index, None),
+            Entry::Folder { account, id } => self.open_page(account, Some(&id)),
+        }
+    }
+
+    /// A key while the tree has the keys: its moves, and the entry
+    /// opened; whether it took the key, any other being the view's.
+    fn tree_key(&mut self, key: Key) -> bool {
+        let rows = self
+            .shape()
+            .and_then(|shape| shape.layout.sidebar)
+            .map_or(frame::PAGE_ROWS, |list| list.rows().max(1)) as isize;
+        match key {
+            Key::Char('n' | 'j') | Key::Down | Key::ScrollDown => self.sidebar.move_by(1),
+            Key::Char('p' | 'k') | Key::Up | Key::ScrollUp => self.sidebar.move_by(-1),
+            Key::PageDown => self.sidebar.move_by(rows),
+            Key::PageUp => self.sidebar.move_by(-rows),
+            Key::Home => self.sidebar.move_by(isize::MIN),
+            Key::End => self.sidebar.move_by(isize::MAX),
+            Key::Enter | Key::Char(' ') => self.open_entry(self.sidebar.selected()),
+            Key::Escape | Key::Char('q') => self.sidebar.focused = false,
+            _ => return false,
+        }
+        self.redraw();
+        true
     }
 
     /// Asks the connector for the account at `index`'s connection again,
@@ -1235,6 +1345,15 @@ impl Session {
             self.act(ViewAction::ShowKeys);
             return;
         }
+        // Any other key gives the views the keys back and is theirs, so a
+        // form or a draft it opens has them.
+        if self.tree_focused() {
+            if self.tree_key(key) {
+                return;
+            }
+            self.sidebar.focused = false;
+            self.redraw();
+        }
         let page = self.page();
         match self.stack.handle_key(key, page) {
             Some(action) => self.act(action),
@@ -1244,10 +1363,11 @@ impl Session {
 
     /// A chord: every one is the pane's while a draft is edited, but
     /// Ctrl-Enter, which sends it, and none is while its view asks about
-    /// it, when only the client's keys reach the view; otherwise the
-    /// client's key when it names one, and else the pane's, when a text
-    /// is shown, so a chord the client does not claim (an arrow with
-    /// Shift, Tab, a copy) reaches the document.
+    /// it, when only the client's keys reach the view; otherwise Tab,
+    /// with two or more accounts, moves the keys to the account tree or
+    /// back, then the client's key when it names one, and else the
+    /// pane's, when a text is shown, so a chord the client does not claim
+    /// (an arrow with Shift, a copy) reaches the document.
     fn chord(&mut self, chord: &str) {
         if self.editing(false) {
             self.last_user_activity = Instant::now();
@@ -1264,6 +1384,13 @@ impl Session {
             if let Some(key) = input::key(chord) {
                 self.key(key);
             }
+            return;
+        }
+        // Tab moves the keys between the views and the account tree.
+        if chord == "Tab" && self.setup.accounts.len() > 1 {
+            self.last_user_activity = Instant::now();
+            self.sidebar.focused = !self.sidebar.focused;
+            self.redraw();
             return;
         }
         match input::key(chord) {
@@ -1500,6 +1627,20 @@ impl Session {
         let Some(shape) = self.shape() else {
             return;
         };
+        // A press on the tree opens the entry under it; one anywhere else
+        // gives the views the keys, a bar label being the view's.
+        if let Some(row) = shape.layout.sidebar.and_then(|list| list.hit(x, y)) {
+            if phase == PointerPhase::Press && !self.pane.drag {
+                if let Some(entry) = self.sidebar.entry(self.sidebar.first.saturating_add(row)) {
+                    self.open_entry(entry);
+                }
+                return;
+            }
+        }
+        if phase == PointerPhase::Press && self.sidebar.focused {
+            self.sidebar.focused = false;
+            self.redraw();
+        }
         // A view asking about its draft has the pointer too: the bar's
         // labels answer, and the pane is not touched meanwhile.
         let asking = self.editing(true) && !self.editing(false);
@@ -1560,6 +1701,12 @@ impl Session {
     /// Wheel travel in rows: over a list, one scroll key per row, bounded;
     /// over a text, the pane's scroll.
     fn wheel(&mut self, rows: isize) {
+        if self.tree_focused() {
+            self.sidebar
+                .move_by(rows.clamp(-(WHEEL_EVENTS as isize), WHEEL_EVENTS as isize));
+            self.redraw();
+            return;
+        }
         let Some(shape) = self.shape() else {
             return;
         };
@@ -1592,11 +1739,16 @@ impl Session {
     fn lay_out(&mut self) {
         self.refresh_title();
         let surface = self.surface;
+        let side = self.side();
         let Some(slot) = self.stack.top_mut() else {
             return;
         };
         let scene = slot.view.scene();
-        let layout = Layout::new(surface, &scene);
+        let layout = Layout::new(surface, &scene, side);
+        if let Some(list) = layout.sidebar {
+            let tree = &mut self.sidebar;
+            tree.first = list.reveal(tree.len(), tree.cursor(), tree.first);
+        }
         match &scene.body {
             Body::List {
                 total, selected, ..
@@ -1637,6 +1789,8 @@ impl Session {
         let frame = Frame {
             surface: self.surface,
             scene: &scene,
+            sidebar: &self.sidebar,
+            side: self.side(),
             first: slot.first,
             entry_first: slot.entry_first,
             pane: &self.pane,
@@ -1676,6 +1830,9 @@ impl Handler for Session {
     }
 
     fn keys(&self) -> Vec<td_ui::keys::Section> {
+        if self.tree_focused() {
+            return crate::keybindings::sections(Some(&crate::keybindings::ACCOUNT_TREE));
+        }
         crate::keybindings::sections(self.stack.current().and_then(|view| view.keys()))
     }
 
@@ -1792,6 +1949,12 @@ impl Handler for Session {
         for index in 0..self.live.len() {
             while let Some(response) = self.live.get(index).and_then(|l| l.resp_rx.try_recv().ok())
             {
+                if let BackendResponse::Mailboxes(result) = &response {
+                    self.sidebar.listed(index, result);
+                    if self.side() != Side::None {
+                        self.redraw();
+                    }
+                }
                 if index != self.current {
                     continue;
                 }
@@ -1818,10 +1981,27 @@ impl Handler for Session {
             if self.last_user_activity.elapsed() >= interval
                 && self.last_idle_sync.elapsed() >= interval
             {
-                if let Some(view) = self.stack.current_mut() {
-                    if view.trigger_idle_sync() {
-                        self.last_idle_sync = Instant::now();
+                let synced = self
+                    .stack
+                    .current_mut()
+                    .is_some_and(|view| view.trigger_idle_sync());
+                // The tree's counts, whatever view is on top: the accounts
+                // not shown, and the shown one while a view is over its
+                // page. On top, the page syncs itself, and declines while
+                // it asks a question a listing under it could change.
+                let several = self.setup.accounts.len() > 1;
+                if several {
+                    let over_page = self.stack.depth() > 1;
+                    for (index, live) in self.live.iter().enumerate() {
+                        if index != self.current || over_page {
+                            let _ = live.cmd_tx.send(BackendCommand::FetchMailboxes {
+                                origin: "idle_sync.sidebar".to_string(),
+                            });
+                        }
                     }
+                }
+                if synced || several {
+                    self.last_idle_sync = Instant::now();
                 }
             }
         }
@@ -1849,6 +2029,8 @@ impl Handler for Session {
             let frame = Frame {
                 surface,
                 scene: &scene,
+                sidebar: &self.sidebar,
+                side: self.side(),
                 first: slot.first,
                 entry_first: slot.entry_first,
                 pane: &self.pane,
@@ -2119,9 +2301,11 @@ mod frame_tests {
         assert!(cmd_rx.try_recv().is_err(), "a backend was replaced");
     }
 
-    /// Every account keeps its backend for the session: `a` shows the
-    /// next account's list over its own backend, which fetches its
-    /// folders, and only the shown account's answers reach a view. `R`
+    /// Every account keeps its backend for the session: Tab gives the
+    /// account tree the keys, and Return on the next account's heading
+    /// shows its list over its own backend, which fetches its folders;
+    /// only the shown account's answers reach a view, and the tree keeps
+    /// every account's folders. `R`
     /// asks the connector for the shown account again behind
     /// `Connecting`, the folders' fetch after it, so the backend holds
     /// the fetch until the connection is decided; setting an account up
@@ -2152,8 +2336,12 @@ mod frame_tests {
             },
         ];
         let mut session = Session::new(setup, live, 0, false).unwrap();
-        key(&mut session, "a");
+        key(&mut session, "Tab");
+        assert!(session.shown().contains("Accounts | "));
+        key(&mut session, "j");
+        key(&mut session, "Return");
         assert_eq!(session.current, 1);
+        assert!(!session.sidebar.focused);
         assert!(matches!(
             work_cmds.try_recv(),
             Ok(BackendCommand::FetchMailboxes { .. })
@@ -2175,9 +2363,16 @@ mod frame_tests {
         assert_eq!(session.poll(0), Flow::Continue);
         let shown = session.shown();
         assert!(
-            shown.contains("WorkInbox") && !shown.contains("TestOnly"),
+            shown.contains("WorkInbox") && shown.contains("TestOnly"),
             "{shown}"
         );
+        let scene = session.stack.current().unwrap().scene();
+        let rows: Vec<String> = match &scene.body {
+            Body::List { total, row, .. } => (0..*total).map(|i| row(i).label).collect(),
+            _ => panic!("expected the folder list"),
+        };
+        assert_eq!(rows, ["WorkInbox"]);
+        drop(scene);
         // The account switched away from is not shut down.
         assert!(test_cmds.try_recv().is_err());
 
@@ -2219,6 +2414,256 @@ mod frame_tests {
             Ok(BackendCommand::FetchMailboxes { origin }) if origin == "set_up_account"
         ));
         assert!(test_cmds.try_recv().is_err());
+    }
+
+    /// The account tree lists every account's folders beside the views.
+    /// Return on a folder opens it over its account's page on that
+    /// account's backend, so `q` from it is the account's page; a window
+    /// too narrow for the tree beside the views shows it over them while
+    /// it has the keys; and with a draft open a press on the tree keeps
+    /// the views and says why.
+    #[test]
+    fn the_account_tree_opens_an_accounts_folder_and_spares_a_draft() {
+        let state = crate::testing::tempdir().unwrap();
+        let mut setup = setup();
+        setup.draft_dir = Some(state.path().join("drafts"));
+        let mut work = account();
+        work.name = "work".to_string();
+        setup.accounts = vec![account(), work];
+        setup.account_names = vec!["test".to_string(), "work".to_string()];
+        let (test_tx, _test_cmds) = mpsc::channel();
+        let (test_answer, test_rx) = mpsc::channel();
+        let (work_tx, work_cmds) = mpsc::channel();
+        let (work_answer, work_rx) = mpsc::channel();
+        let live = vec![
+            Live {
+                cmd_tx: test_tx,
+                resp_rx: test_rx,
+            },
+            Live {
+                cmd_tx: work_tx,
+                resp_rx: work_rx,
+            },
+        ];
+        let mut session = Session::new(setup, live, 0, true).unwrap();
+        test_answer
+            .send(BackendResponse::Mailboxes(Ok(vec![mailbox(
+                "t1", "INBOX", "inbox", 3, 1,
+            )])))
+            .unwrap();
+        work_answer
+            .send(BackendResponse::Mailboxes(Ok(vec![
+                mailbox("w2", "Projects", "", 4, 0),
+                mailbox("w1", "INBOX", "inbox", 5, 2),
+            ])))
+            .unwrap();
+        assert_eq!(session.poll(0), Flow::Continue);
+        let shown = session.shown();
+        assert!(shown.contains("  Projects"), "{shown}");
+
+        key(&mut session, "Tab");
+        key(&mut session, "End");
+        key(&mut session, "Return");
+        assert_eq!(session.current, 1);
+        assert_eq!(session.stack.depth(), 2);
+        let sent: Vec<_> = work_cmds.try_iter().collect();
+        assert!(
+            sent.iter().any(|command| matches!(
+                command,
+                BackendCommand::QueryEmails { mailbox_id, .. } if mailbox_id == "w2"
+            )),
+            "the folder was not asked of the work account's backend"
+        );
+        key(&mut session, "q");
+        assert_eq!(session.stack.depth(), 1);
+        assert_eq!(session.current, 1);
+
+        session.surface = Surface::new(400, 600, Default::default()).unwrap();
+        assert_eq!(session.side(), Side::None);
+        key(&mut session, "Tab");
+        assert_eq!(session.side(), Side::Full);
+        key(&mut session, "Escape");
+        assert_eq!(session.side(), Side::None);
+        session.surface = Surface::new(800, 600, Default::default()).unwrap();
+
+        key(&mut session, "c");
+        assert!(session.editing(false));
+        let row = session
+            .shape()
+            .and_then(|shape| shape.layout.sidebar)
+            .and_then(|list| list.row(0))
+            .unwrap();
+        press(&mut session, row.x + 4, row.y + 4);
+        assert_eq!(session.current, 1);
+        assert!(session.editing(false));
+        assert_eq!(
+            session.note.as_deref(),
+            Some("Not opened: close the draft first")
+        );
+    }
+
+    /// A session over the accounts `test` and `work`, the first shown,
+    /// each listed with an inbox and `work` with a second folder too;
+    /// the state directory, and each account's commands.
+    fn two_accounts() -> (
+        Session,
+        crate::testing::TempDir,
+        Receiver<BackendCommand>,
+        Receiver<BackendCommand>,
+    ) {
+        let state = crate::testing::tempdir().unwrap();
+        let mut setup = setup();
+        setup.draft_dir = Some(state.path().join("drafts"));
+        let mut work = account();
+        work.name = "work".to_string();
+        setup.accounts = vec![account(), work];
+        setup.account_names = vec!["test".to_string(), "work".to_string()];
+        let (test_tx, test_cmds) = mpsc::channel();
+        let (test_answer, test_rx) = mpsc::channel();
+        let (work_tx, work_cmds) = mpsc::channel();
+        let (work_answer, work_rx) = mpsc::channel();
+        let live = vec![
+            Live {
+                cmd_tx: test_tx,
+                resp_rx: test_rx,
+            },
+            Live {
+                cmd_tx: work_tx,
+                resp_rx: work_rx,
+            },
+        ];
+        let mut session = Session::new(setup, live, 0, true).unwrap();
+        test_answer
+            .send(BackendResponse::Mailboxes(Ok(vec![mailbox(
+                "t1", "INBOX", "inbox", 3, 1,
+            )])))
+            .unwrap();
+        work_answer
+            .send(BackendResponse::Mailboxes(Ok(vec![
+                mailbox("w2", "Projects", "", 4, 0),
+                mailbox("w1", "INBOX", "inbox", 5, 2),
+            ])))
+            .unwrap();
+        assert_eq!(session.poll(0), Flow::Continue);
+        (session, state, test_cmds, work_cmds)
+    }
+
+    /// A key the tree does not take gives the views the keys and is
+    /// theirs: `+` opens the folder entry, which then takes `n`, `j` and
+    /// Return; `c` opens a draft the tree never hides, even in a narrow
+    /// window, where the view shows again; and `q` in the tree only
+    /// gives the keys back.
+    #[test]
+    fn a_key_the_tree_does_not_take_is_the_views() {
+        let (mut session, _state, test_cmds, _work_cmds) = two_accounts();
+        while test_cmds.try_recv().is_ok() {}
+        key(&mut session, "Tab");
+        assert!(session.tree_focused());
+        assert_eq!(session.keys()[0].title, "Account Tree");
+        key(&mut session, "q");
+        assert!(!session.quitting);
+        assert!(!session.sidebar.focused);
+
+        key(&mut session, "Tab");
+        key(&mut session, "+");
+        assert!(!session.sidebar.focused);
+        for chord in ["n", "j", "Return"] {
+            key(&mut session, chord);
+        }
+        assert_eq!(session.current, 0);
+        assert!(matches!(
+            test_cmds.try_recv(),
+            Ok(BackendCommand::CreateMailbox { name }) if name == "nj"
+        ));
+
+        session.surface = Surface::new(400, 600, Default::default()).unwrap();
+        key(&mut session, "Tab");
+        assert_eq!(session.side(), Side::Full);
+        key(&mut session, "c");
+        assert!(session.editing(false));
+        assert!(!session.sidebar.focused);
+        assert_eq!(session.side(), Side::None);
+        assert!(session.shape().unwrap().layout.pane.is_some());
+        assert!(!session.shown().contains("Accounts | "));
+    }
+
+    /// A press on a tree row opens its entry; a folder of the account
+    /// shown opens over that account's page, and a name the page was
+    /// being given is left unconfirmed; a press on a bar label is the
+    /// view's even while the tree has the keys; and the idle interval
+    /// asks every account for its folders whatever view is on top, the
+    /// shown one too while a folder is open.
+    #[test]
+    fn a_press_opens_a_tree_entry_and_the_idle_sync_asks_every_account() {
+        let (mut session, _state, test_cmds, work_cmds) = two_accounts();
+        while test_cmds.try_recv().is_ok() {}
+        // The tree: test, its INBOX, work, its INBOX and Projects.
+        let row = |session: &Session, index: usize| {
+            session
+                .shape()
+                .and_then(|shape| shape.layout.sidebar)
+                .and_then(|list| list.row(index))
+                .unwrap()
+        };
+        key(&mut session, "+");
+        key(&mut session, "f");
+        let inbox = row(&session, 1);
+        press(&mut session, inbox.x + 4, inbox.y + 4);
+        assert_eq!(session.current, 0);
+        assert_eq!(session.stack.depth(), 2);
+        let sent: Vec<_> = test_cmds.try_iter().collect();
+        assert!(sent.iter().any(|command| matches!(
+            command,
+            BackendCommand::QueryEmails { mailbox_id, .. } if mailbox_id == "t1"
+        )));
+        assert!(!sent
+            .iter()
+            .any(|command| matches!(command, BackendCommand::CreateMailbox { .. })));
+
+        session.sync_interval = Some(Duration::ZERO);
+        session.poll(0);
+        assert!(test_cmds.try_iter().any(|command| matches!(
+            command,
+            BackendCommand::FetchMailboxes { origin } if origin == "idle_sync.sidebar"
+        )));
+        session.sync_interval = None;
+
+        // The bar's first label is the email list's Open, not the tree's,
+        // whose selection is now the work account's heading.
+        key(&mut session, "Tab");
+        key(&mut session, "j");
+        let label = session.shape().unwrap().layout.bar.header(0).unwrap();
+        press(&mut session, label.x + 2, label.y + 2);
+        assert!(!session.sidebar.focused);
+        assert_eq!(session.current, 0);
+        assert_eq!(session.stack.depth(), 2);
+
+        let heading = row(&session, 2);
+        press(&mut session, heading.x + 4, heading.y + 4);
+        assert_eq!(session.current, 1);
+        assert_eq!(session.stack.depth(), 1);
+        while work_cmds.try_recv().is_ok() {}
+
+        // The shown page asking whether to delete a folder is not listed
+        // again under the question.
+        key(&mut session, "d");
+        session.sync_interval = Some(Duration::ZERO);
+        session.poll(0);
+        session.sync_interval = None;
+        assert!(!work_cmds
+            .try_iter()
+            .any(|command| matches!(command, BackendCommand::FetchMailboxes { .. })));
+        key(&mut session, "Escape");
+
+        session.sync_interval = Some(Duration::ZERO);
+        session.poll(0);
+        assert!(test_cmds.try_iter().any(|command| matches!(
+            command,
+            BackendCommand::FetchMailboxes { origin } if origin == "idle_sync.sidebar"
+        )));
+        assert!(work_cmds
+            .try_iter()
+            .any(|command| matches!(command, BackendCommand::FetchMailboxes { .. })));
     }
 
     /// The connector's queue keeps one request per account: a newer one
@@ -2750,7 +3195,7 @@ mod frame_tests {
         assert_eq!(session.shown(), text, "the view is as it was");
         let first = |session: &Session| session.keys().first().map(|section| section.title);
         assert_eq!(first(&session), Some("Mailbox List"));
-        assert_eq!(session.keys().len(), 8);
+        assert_eq!(session.keys().len(), 9);
         key(&mut session, "Return");
         assert_eq!(first(&session), Some("Email List"));
         key(&mut session, "?");

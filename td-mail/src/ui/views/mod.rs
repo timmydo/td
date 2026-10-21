@@ -143,7 +143,6 @@ pub enum ViewAction {
     Quit,
     /// Retain the draft and edit it in the pane.
     Compose(crate::compose::ComposeDraft),
-    SwitchAccount(String),
     /// Ask for the shown account's connection again, and fetch its
     /// folders once it is decided.
     Reconnect,
@@ -213,6 +212,11 @@ pub trait View {
     /// changed state and should re-render.
     fn on_reveal(&mut self) -> bool {
         false
+    }
+    /// Opens the folder `id` as the view's own open would, for the
+    /// account tree; none from a view that lists no folders.
+    fn open_folder(&mut self, _id: &str) -> Option<ViewAction> {
+        None
     }
     /// Whether the view is waiting on the backend for what it holds, so
     /// the window's close request is put to it rather than taken.
@@ -309,7 +313,23 @@ impl ViewStack {
         self.slots
     }
 
-    #[cfg(test)]
+    /// Every view but the root, popped, for their documents to close.
+    pub fn pop_to_root(&mut self) -> Vec<Slot> {
+        self.slots.split_off(self.slots.len().min(1))
+    }
+
+    /// The root view.
+    pub fn root_mut(&mut self) -> Option<&mut Box<dyn View>> {
+        self.slots.first_mut().map(|slot| &mut slot.view)
+    }
+
+    /// Whether a view on the stack edits a draft.
+    pub fn has_draft(&self) -> bool {
+        self.slots
+            .iter()
+            .any(|slot| matches!(slot.view.scene().body, Body::Edit { .. }))
+    }
+
     pub fn depth(&self) -> usize {
         self.slots.len()
     }
