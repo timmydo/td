@@ -144,6 +144,9 @@ pub enum ViewAction {
     /// Retain the draft and edit it in the pane.
     Compose(crate::compose::ComposeDraft),
     SwitchAccount(String),
+    /// Ask for the shown account's connection again, and fetch its
+    /// folders once it is decided.
+    Reconnect,
     /// Write the server and address the setup form was given into the
     /// configuration for the placeholder account, and open it again.
     SetUpAccount {

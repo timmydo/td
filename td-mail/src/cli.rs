@@ -341,7 +341,7 @@ fn cmd_connect(state: &mut CliState, input: &Value) -> Value {
         }
     };
 
-    let (cmd_tx, resp_rx) = backend::spawn(
+    let spawned = backend::spawn(
         client,
         false,
         false,
@@ -351,7 +351,13 @@ fn cmd_connect(state: &mut CliState, input: &Value) -> Value {
         state.rules_mailbox_regex.clone(),
         state.my_email_regex.clone(),
         state.config.spam.clone(),
+        // The one backend: the model as the last one saved it.
+        crate::spam::load_shared(),
     );
+    let (cmd_tx, resp_rx) = match spawned {
+        Ok(ends) => ends,
+        Err(e) => return err_response(&e),
+    };
 
     state.cmd_tx = Some(cmd_tx);
     state.resp_rx = Some(resp_rx);

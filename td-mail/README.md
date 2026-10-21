@@ -398,14 +398,24 @@ Each account sets exactly one of `secret = "portal"` or `password_command`.
 Legacy fallback is supported via `[jmap]` with `well_known_url`, `username`, and one of those;
 its portal credential is mail/default.
 
-The window opens before the first account is connected, so the credential and
+The window opens before any account is connected, so the credential and
 discovery round trips never hold it; the mailbox list loads once the
-connection is decided. If the account cannot be reached (server down, network
-not up yet, placeholder credentials), td-mail lists what its cache holds
-instead of exiting, and everything it cannot serve from the cache says
-why the connection failed (`... (offline mode: <reason>)`), as the log does;
-`a` in the mailbox list, which selects the next account and with one
-account reopens it, retries the connection.
+connection is decided. Every account is opened at start and stays open,
+each with its own backend: one connection is made at a time, the shown
+account's first, and `a` in the mailbox list shows the next account at
+once, without connecting it again. If an account cannot be reached
+(server down, network not up yet, placeholder credentials), td-mail lists
+what its cache holds instead of exiting, and everything it cannot serve
+from the cache says why the connection failed
+(`... (offline mode: <reason>)`), as the log does; `R` in the mailbox list
+asks for the shown account's connection again, ahead of any account still
+waiting its turn; an account already connected goes on serving with its
+connection meanwhile and refreshes its folders once the new one is made.
+Every account's backend scores and trains the one spam model, so
+training in one account is not lost to another's save. Each account
+costs the window a thread, and the packaged jail caps td-mail's tasks at
+32, so a configuration of more than about twenty accounts fails to
+start there.
 
 Optional rules file path defaults to `rules.toml` next to your config; override with `--rules=PATH`.
 

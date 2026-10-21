@@ -12,7 +12,40 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use td_json::{Json, ObjectBuilder, ToJson};
+
+/// The one model a session's backends share, as there is one model file:
+/// each trains and saves it under the lock, so no account's training is
+/// lost to another's save of an older copy. The lock is taken around a
+/// classification, a training or a save, never across a fetch.
+pub type SharedModel = Arc<Mutex<SpamModel>>;
+
+/// The model at `model_path`, or an empty one, to share.
+pub fn load_shared() -> SharedModel {
+    let model = model_path()
+        .map(|path| SpamModel::load(&path))
+        .unwrap_or_default();
+    log_info!(
+        "[Spam] loaded model ({} spam / {} ham trained)",
+        model.spam_messages(),
+        model.ham_messages()
+    );
+    Arc::new(Mutex::new(model))
+}
+
+/// The shared model, held. A thread that panicked holding it left a
+/// model each step of which is whole, so the poison is passed over.
+pub fn lock(model: &SharedModel) -> MutexGuard<'_, SpamModel> {
+    model.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The spam and ham messages the shared model was trained on, read
+/// under one hold of it.
+pub fn trained(model: &SharedModel) -> (u32, u32) {
+    let model = lock(model);
+    (model.spam_messages(), model.ham_messages())
+}
 
 /// Maximum number of most-significant tokens fed into the combiner. Bounds work
 /// and keeps a few extreme tokens from being diluted by a long body.

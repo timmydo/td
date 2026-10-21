@@ -18,8 +18,10 @@ use crate::compose;
 use crate::config::{AccountConfig, PasswordSource, RetentionPolicyConfig, SpamConfig};
 use crate::regex::UserRegex;
 use crate::rules::CompiledRule;
+use crate::spam::SharedModel;
 use frame::{Draft, Dropdown, Frame, Layout, Pane};
 use input::{Key, Menu};
+use std::collections::VecDeque;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -61,11 +63,15 @@ const DOUBLE_PRESS: Duration = Duration::from_millis(400);
 
 /// Wait on a fire-and-forget child in a detached thread so it does not linger
 /// as a zombie. `Child` has no reaping `Drop` impl, so a dropped handle leaks a
-/// PID slot for the lifetime of td-mail.
+/// PID slot for the lifetime of td-mail. A thread the jail's task cap
+/// refuses leaves the zombie, logged, rather than aborting the window.
 pub fn reap_in_background(mut child: std::process::Child) {
-    std::thread::spawn(move || {
+    let spawned = std::thread::Builder::new().spawn(move || {
         let _ = child.wait();
     });
+    if let Err(e) = spawned {
+        crate::log_error!("no thread to reap a child: {}", e);
+    }
 }
 
 /// What a session keeps of the configuration to open an account's views.
@@ -82,6 +88,8 @@ struct Setup {
     rules_mailbox_regex: Arc<UserRegex>,
     my_email_regex: Arc<UserRegex>,
     spam_config: SpamConfig,
+    /// The model every account's backend scores and trains with.
+    spam_model: SharedModel,
     offline: bool,
     /// Where drafts are retained: a test's directory, or none for the
     /// state directory the environment names, read as each draft is
@@ -133,20 +141,16 @@ impl Setup {
         })
     }
 
-    /// Opens an account: its backend starts with no connection, so the
-    /// window opens at once on the mailbox list's loading state. The
-    /// session offline fetches the mailboxes from the cache now; otherwise
-    /// the connector is asked for the account's connection, which can
-    /// take minutes to make, and the backend holds the fetch, and every
-    /// command a view sends meanwhile, until the connection is decided,
-    /// so nothing is answered from the cache that the connection then
-    /// supersedes and the window never says the client is offline while
-    /// it connects.
-    fn open_account(
-        &self,
-        account: &AccountConfig,
-        origin: &str,
-    ) -> (Sender<BackendCommand>, Receiver<BackendResponse>) {
+    /// Opens an account for the session: its backend starts with no
+    /// connection, so the window opens at once on the mailbox list's
+    /// loading state. The session offline fetches the mailboxes from the
+    /// cache now; otherwise the connector is asked for the account's
+    /// connection, which can take minutes to make, and the backend holds
+    /// the fetch, and every command a view sends meanwhile, until the
+    /// connection is decided, so nothing is answered from the cache that
+    /// the connection then supersedes and the window never says the
+    /// client is offline while it connects.
+    fn open_account(&self, account: &AccountConfig, origin: &str) -> Result<Live, String> {
         let rules = crate::rules::for_account(&self.rules, &account.name);
         let custom_headers = crate::rules::extract_custom_headers(&rules);
         let (cmd_tx, resp_rx) = backend::spawn(
@@ -159,61 +163,141 @@ impl Setup {
             self.rules_mailbox_regex.clone(),
             self.my_email_regex.clone(),
             self.spam_config.clone(),
-        );
+            self.spam_model.clone(),
+        )?;
         let _ = cmd_tx.send(BackendCommand::FetchMailboxes {
             origin: origin.to_string(),
         });
-        if let Some(connector) = &self.connector {
-            let _ = connector.send((account.clone(), cmd_tx.clone()));
+        if !self.offline {
+            self.ask_connection(account, &cmd_tx, false);
         }
-        (cmd_tx, resp_rx)
+        Ok(Live { cmd_tx, resp_rx })
+    }
+
+    /// Asks the connector for the account's connection, for the backend
+    /// `cmd_tx` reaches; `urgent` puts it first in the connector's queue.
+    /// A connector that is gone is the connection's failure, so the
+    /// backend never holds for a decision nothing will send.
+    fn ask_connection(
+        &self,
+        account: &AccountConfig,
+        cmd_tx: &Sender<BackendCommand>,
+        urgent: bool,
+    ) {
+        let request = ConnectRequest {
+            account: account.clone(),
+            cmd_tx: cmd_tx.clone(),
+            urgent,
+        };
+        let sent = match &self.connector {
+            Some(connector) => connector.send(request).is_ok(),
+            None => false,
+        };
+        if !sent {
+            crate::log_error!("[Connect] no connector for {}", account.name);
+            let _ = cmd_tx.send(BackendCommand::ConnectFailed(
+                "td-mail's connector is not running".to_string(),
+            ));
+        }
     }
 }
 
-/// A connection to make: the account, and the backend it is for.
-type ConnectRequest = (AccountConfig, Sender<BackendCommand>);
+/// An account the session has open, at its place in `Setup::accounts`:
+/// its backend's two channel ends, the same for the whole session, so a
+/// view keeps the sender it was made with whatever is shown meanwhile.
+struct Live {
+    cmd_tx: Sender<BackendCommand>,
+    resp_rx: Receiver<BackendResponse>,
+}
+
+/// A connection to make: the account, the backend it is for, and whether
+/// someone is waiting on it (a reconnect, a setup) rather than the
+/// session opening.
+struct ConnectRequest {
+    account: AccountConfig,
+    cmd_tx: Sender<BackendCommand>,
+    urgent: bool,
+}
+
+/// Queues `request` for the connector. It replaces one queued for the
+/// same account, whose backend is the same for the session, in that
+/// one's place; an urgent request goes first instead, so the account
+/// shown waits on no other account's round trips.
+fn enqueue(queue: &mut VecDeque<ConnectRequest>, request: ConnectRequest) {
+    let at = queue
+        .iter()
+        .position(|queued| queued.account.name == request.account.name);
+    if let Some(at) = at {
+        queue.remove(at);
+    }
+    match (request.urgent, at) {
+        (true, _) => queue.push_front(request),
+        (false, Some(at)) => queue.insert(at, request),
+        (false, None) => queue.push_back(request),
+    }
+}
 
 /// The connector: the session's one thread for the credential and
-/// discovery round trips, so however many times the account is switched
-/// while a connection is pending, one is in flight (the package caps the
-/// jail's tasks). It serves the latest request, since an account switched
-/// away from needs no connection, and sends the backend its connection,
-/// or the failure, on which the backend answers what it held; a backend
-/// shut down meanwhile has dropped its receiver, and the send fails
-/// unheard. A connection that fails leaves the account on its cache,
-/// logged; selecting the account again retries. The thread ends with the
-/// session, which holds the sender.
-fn spawn_connector() -> Sender<ConnectRequest> {
+/// discovery round trips, so one is in flight whatever the accounts (the
+/// package caps the jail's tasks). It serves the queue `enqueue` keeps
+/// and sends each backend its connection, or the failure, on which a
+/// backend without a client answers what it held. A failure is not sent
+/// while a newer request for the account is queued, so the backend's
+/// hold lasts until that request's decision rather than ending on a
+/// stale one. A connection that fails leaves the account on its cache,
+/// logged; a reconnect asks again. The thread ends with the session,
+/// which holds the sender.
+fn spawn_connector() -> Result<Sender<ConnectRequest>, String> {
     let (tx, rx) = mpsc::channel::<ConnectRequest>();
-    std::thread::spawn(move || {
-        while let Ok(mut request) = rx.recv() {
-            while let Ok(newer) = rx.try_recv() {
-                request = newer;
+    std::thread::Builder::new()
+        .spawn(move || {
+            let mut queue: VecDeque<ConnectRequest> = VecDeque::new();
+            loop {
+                if queue.is_empty() {
+                    match rx.recv() {
+                        Ok(request) => enqueue(&mut queue, request),
+                        Err(_) => break,
+                    }
+                }
+                for request in rx.try_iter() {
+                    enqueue(&mut queue, request);
+                }
+                let Some(ConnectRequest {
+                    account, cmd_tx, ..
+                }) = queue.pop_front()
+                else {
+                    continue;
+                };
+                crate::log_info!(
+                    "[Connect] connecting to {} ({})",
+                    account.name,
+                    account.well_known_url
+                );
+                let decision = match crate::connect_account(&account) {
+                    Ok(client) => {
+                        crate::log_info!("[Connect] connected to {}", account.name);
+                        BackendCommand::Connect(Box::new(client))
+                    }
+                    Err(e) => {
+                        crate::log_error!(
+                            "[Connect] {} failed: {}; on the cache until it is reconnected",
+                            account.name,
+                            e
+                        );
+                        for request in rx.try_iter() {
+                            enqueue(&mut queue, request);
+                        }
+                        if queue.iter().any(|newer| newer.account.name == account.name) {
+                            continue;
+                        }
+                        BackendCommand::ConnectFailed(e)
+                    }
+                };
+                let _ = cmd_tx.send(decision);
             }
-            let (account, cmd_tx) = request;
-            crate::log_info!(
-                "[Connect] connecting to {} ({})",
-                account.name,
-                account.well_known_url
-            );
-            let decision = match crate::connect_account(&account) {
-                Ok(client) => {
-                    crate::log_info!("[Connect] connected to {}", account.name);
-                    BackendCommand::Connect(Box::new(client))
-                }
-                Err(e) => {
-                    crate::log_error!(
-                        "[Connect] {} failed: {}; on the cache until it is selected again",
-                        account.name,
-                        e
-                    );
-                    BackendCommand::ConnectFailed(e)
-                }
-            };
-            let _ = cmd_tx.send(decision);
-        }
-    });
-    tx
+        })
+        .map_err(|e| format!("no thread for the connector: {e}"))?;
+    Ok(tx)
 }
 
 /// The frame's shape, read from the top view's scene before an input is
@@ -254,8 +338,12 @@ struct Session {
     setup: Setup,
     stack: ViewStack,
     pane: Pane,
-    cmd_tx: Sender<BackendCommand>,
-    resp_rx: Receiver<BackendResponse>,
+    /// Every account's backend, by its place in `setup.accounts`, open
+    /// for the whole session.
+    live: Vec<Live>,
+    /// The account the stack shows; the others' answers are drained and
+    /// dropped, their backends kept connected.
+    current: usize,
     mouse: bool,
     /// The surface the frame is laid out for, as the window last gave it.
     surface: Surface,
@@ -299,21 +387,25 @@ struct Session {
 }
 
 impl Session {
-    fn new(
-        setup: Setup,
-        stack: ViewStack,
-        cmd_tx: Sender<BackendCommand>,
-        resp_rx: Receiver<BackendResponse>,
-        mouse: bool,
-    ) -> Result<Self, String> {
+    /// A session over the accounts `live` holds open, one per account,
+    /// showing the mailbox list of the one at `current`.
+    fn new(setup: Setup, live: Vec<Live>, current: usize, mouse: bool) -> Result<Self, String> {
         let surface = Surface::new(800, 600, Default::default()).map_err(|e| e.to_string())?;
+        let (Some(account), Some(open)) = (setup.accounts.get(current), live.get(current)) else {
+            return Err(format!(
+                "no account at index {} of {}",
+                current,
+                setup.accounts.len()
+            ));
+        };
+        let stack = ViewStack::new(Box::new(setup.mailbox_view(&open.cmd_tx, account)));
         let mut session = Session {
             sync_interval: setup.sync_interval_secs.map(Duration::from_secs),
             setup,
             stack,
             pane: Pane::new()?,
-            cmd_tx,
-            resp_rx,
+            live,
+            current,
             mouse,
             surface,
             title: String::new(),
@@ -404,6 +496,17 @@ impl Session {
             ViewAction::Quit => self.quit("q or the bar's Quit"),
             ViewAction::Compose(draft) => self.compose(&draft),
             ViewAction::SwitchAccount(name) => self.switch_account(&name),
+            ViewAction::Reconnect => {
+                self.reconnect(self.current);
+                // After the reconnect's ask, so the backend holds it until
+                // the connection is decided; offline, the cache answers.
+                if let Some(cmd_tx) = self.cmd_tx() {
+                    let _ = cmd_tx.send(BackendCommand::FetchMailboxes {
+                        origin: "reconnect".to_string(),
+                    });
+                }
+                self.redraw();
+            }
             ViewAction::SetUpAccount {
                 account,
                 server,
@@ -797,11 +900,10 @@ impl Session {
         if let Some(path) = &prepared.attachment_dir {
             crate::log_info!("Draft attachments retained at {}", path.display());
         }
-        match ComposeView::open(
-            prepared.draft_path,
-            prepared.attachment_dir,
-            self.cmd_tx.clone(),
-        ) {
+        let Some(cmd_tx) = self.cmd_tx() else {
+            return;
+        };
+        match ComposeView::open(prepared.draft_path, prepared.attachment_dir, cmd_tx) {
             Ok(view) => self.act(ViewAction::Push(Box::new(view))),
             Err(e) => {
                 crate::log_error!("Failed to read the retained draft back: {}", e);
@@ -818,11 +920,11 @@ impl Session {
             Some(dir) => Ok(dir.clone()),
             None => compose::draft_dir(),
         };
+        let Some(cmd_tx) = self.cmd_tx() else {
+            return;
+        };
         match dir {
-            Ok(dir) => self.act(ViewAction::Push(Box::new(DraftsView::new(
-                dir,
-                self.cmd_tx.clone(),
-            )))),
+            Ok(dir) => self.act(ViewAction::Push(Box::new(DraftsView::new(dir, cmd_tx)))),
             Err(e) => {
                 crate::log_error!("No drafts to list: {}", e);
                 self.redraw();
@@ -989,27 +1091,57 @@ impl Session {
         }
     }
 
-    /// Switches to the named account as the session started on the first:
-    /// its mailbox list at once, its connection when the connector has
-    /// it. The old backend is told to shut down first; one still finishing
-    /// a request holds its store's lock a while longer, and the backend of
-    /// an account switched away from and back opens the store once it is
-    /// free, blocking nothing meanwhile.
+    /// The shown account's backend.
+    fn cmd_tx(&self) -> Option<Sender<BackendCommand>> {
+        self.live.get(self.current).map(|live| live.cmd_tx.clone())
+    }
+
+    /// Shows the named account's mailbox list in place of what the stack
+    /// held. Its backend stays as it is, connected or connecting, and
+    /// answers the list's fetch from what it holds.
     fn switch_account(&mut self, name: &str) {
-        let Some(account) = self.setup.accounts.iter().find(|a| a.name == name) else {
+        if let Some(index) = self.setup.accounts.iter().position(|a| a.name == name) {
+            self.show_account(index, "switch_account");
+        }
+    }
+
+    /// The stack replaced by the mailbox list of the account at `index`,
+    /// which fetches its folders.
+    fn show_account(&mut self, index: usize, origin: &str) {
+        let (Some(account), Some(live)) = (self.setup.accounts.get(index), self.live.get(index))
+        else {
             return;
         };
-        let _ = self.cmd_tx.send(BackendCommand::Shutdown);
-        let (cmd_tx, resp_rx) = self.setup.open_account(account, "switch_account");
-        let mailbox_view = self.setup.mailbox_view(&cmd_tx, account);
-        self.cmd_tx = cmd_tx;
-        self.resp_rx = resp_rx;
+        let mailbox_view = self.setup.mailbox_view(&live.cmd_tx, account);
+        let _ = live.cmd_tx.send(BackendCommand::FetchMailboxes {
+            origin: origin.to_string(),
+        });
+        self.current = index;
         let old = std::mem::replace(&mut self.stack, ViewStack::new(Box::new(mailbox_view)));
         for slot in old.into_slots() {
             self.pane.close(slot.text);
         }
         self.last_idle_sync = Instant::now();
         self.redraw();
+    }
+
+    /// Asks the connector for the account at `index`'s connection again,
+    /// first in its queue, for its backend: one without a client holds
+    /// what it is sent until the connection is decided, one with a client
+    /// goes on serving with it and keeps it if the new one fails. Whether
+    /// one was asked for: a session started offline asks for none.
+    fn reconnect(&mut self, index: usize) -> bool {
+        if self.setup.offline {
+            self.note("Not reconnected: td-mail was started --offline".to_string());
+            return false;
+        }
+        let (Some(account), Some(live)) = (self.setup.accounts.get(index), self.live.get(index))
+        else {
+            return false;
+        };
+        let _ = live.cmd_tx.send(BackendCommand::Connecting);
+        self.setup.ask_connection(account, &live.cmd_tx, true);
+        true
     }
 
     /// Writes the server and address the setup form was given into the
@@ -1032,10 +1164,16 @@ impl Session {
                     updated.name,
                     updated.well_known_url
                 );
-                if let Some(slot) = self.setup.accounts.iter_mut().find(|a| a.name == account) {
+                let Some(index) = self.setup.accounts.iter().position(|a| a.name == account) else {
+                    return;
+                };
+                if let Some(slot) = self.setup.accounts.get_mut(index) {
                     *slot = updated;
                 }
-                self.switch_account(account);
+                // The connection is asked for first, so the list's fetch
+                // waits for it rather than answering as the placeholder.
+                self.reconnect(index);
+                self.show_account(index, "set_up_account");
             }
             Err(e) => {
                 crate::log_error!("[Setup] {} not set up: {}", account, e);
@@ -1649,13 +1787,20 @@ impl Handler for Session {
 
     fn poll(&mut self, now: u64) -> Flow {
         // A backend that is gone answers nothing more; the views stay up
-        // on what they hold, as they did in the terminal.
-        while let Ok(response) = self.resp_rx.try_recv() {
-            if self.stack.handle_response(&response) {
-                self.redraw();
+        // on what they hold, as they did in the terminal. An account not
+        // shown has no view to answer.
+        for index in 0..self.live.len() {
+            while let Some(response) = self.live.get(index).and_then(|l| l.resp_rx.try_recv().ok())
+            {
+                if index != self.current {
+                    continue;
+                }
+                if self.stack.handle_response(&response) {
+                    self.redraw();
+                }
+                self.hold_draft();
+                self.take_pending();
             }
-            self.hold_draft();
-            self.take_pending();
         }
         self.take_pending();
         self.settle_close();
@@ -1745,16 +1890,16 @@ pub fn run(
     offline: bool,
     config_path: PathBuf,
 ) -> io::Result<()> {
-    // Read before the backend thread is spawned and the window opened, so
-    // an index the account list does not hold fails with nothing to close.
-    let Some(first) = accounts.get(current_account_idx) else {
+    // Read before the backend threads are spawned and the window opened,
+    // so an index the account list does not hold fails with nothing to
+    // close.
+    if current_account_idx >= accounts.len() {
         return Err(io::Error::other(format!(
             "no account at index {} of {}",
             current_account_idx,
             accounts.len()
         )));
-    };
-    let first = first.clone();
+    }
     let setup = Setup {
         account_names: accounts.iter().map(|a| a.name.clone()).collect(),
         accounts,
@@ -1767,9 +1912,14 @@ pub fn run(
         rules_mailbox_regex: Arc::new(rules_mailbox_regex),
         my_email_regex: Arc::new(my_email_regex),
         spam_config,
+        spam_model: crate::spam::load_shared(),
         offline,
         draft_dir: None,
-        connector: (!offline).then(spawn_connector),
+        connector: if offline {
+            None
+        } else {
+            Some(spawn_connector().map_err(io::Error::other)?)
+        },
         config_path: Some(config_path),
     };
 
@@ -1781,27 +1931,59 @@ pub fn run(
     .map_err(io::Error::other)?;
     let stream = td_ui::wayland::connect(endpoint).map_err(io::Error::other)?;
 
-    let (cmd_tx, resp_rx) = setup.open_account(&first, "startup");
-    let mailbox_view = setup.mailbox_view(&cmd_tx, &first);
-    let stack = ViewStack::new(Box::new(mailbox_view));
+    // Every account is opened, the shown one first, so its connection is
+    // the connector's first.
+    let mut opened: Vec<Option<Live>> = setup.accounts.iter().map(|_| None).collect();
+    let order = std::iter::once(current_account_idx)
+        .chain((0..setup.accounts.len()).filter(|&index| index != current_account_idx));
+    for index in order {
+        if let (Some(account), Some(slot)) = (setup.accounts.get(index), opened.get_mut(index)) {
+            *slot = Some(
+                setup
+                    .open_account(account, "startup")
+                    .map_err(io::Error::other)?,
+            );
+        }
+    }
+    let live: Vec<Live> = opened.into_iter().flatten().collect();
     let mut session =
-        Session::new(setup, stack, cmd_tx, resp_rx, mouse).map_err(io::Error::other)?;
+        Session::new(setup, live, current_account_idx, mouse).map_err(io::Error::other)?;
     let typeface = td_ui::pinned_face::load_or_note(
         "td-mail",
         std::env::var_os(td_ui::pinned_face::SETTING).as_deref(),
     );
     let outcome = td_ui::window::run(&mut session, stream, std::env::temp_dir(), typeface);
-    let _ = session.cmd_tx.send(BackendCommand::Shutdown);
-    // The backend answers what it held from the cache on the way out;
-    // wait for it to go, up to two seconds of silence, so a mutation it
-    // queues is written before the process ends. One mid-request is left
-    // to the exit.
+    for live in &session.live {
+        let _ = live.cmd_tx.send(BackendCommand::Shutdown);
+    }
+    // Each backend answers what it held from the cache on the way out;
+    // wait for them to go, up to two seconds of silence from all, so a
+    // mutation one queues is written before the process ends. One
+    // mid-request is left to the exit.
     let mut silent = 0;
     while silent < 20 {
-        match session.resp_rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(_) => {}
-            Err(mpsc::RecvTimeoutError::Timeout) => silent += 1,
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        let mut heard = false;
+        let mut open = false;
+        for live in &session.live {
+            loop {
+                match live.resp_rx.try_recv() {
+                    Ok(_) => heard = true,
+                    Err(mpsc::TryRecvError::Empty) => {
+                        open = true;
+                        break;
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => break,
+                }
+            }
+        }
+        if !open {
+            break;
+        }
+        if heard {
+            silent = 0;
+        } else {
+            silent += 1;
+            std::thread::sleep(Duration::from_millis(100));
         }
     }
     outcome.map_err(io::Error::other)
@@ -1864,6 +2046,7 @@ mod frame_tests {
                     .join("drafts"),
             ),
             connector: None,
+            spam_model: Arc::new(std::sync::Mutex::new(crate::spam::SpamModel::default())),
             config_path: None,
         }
     }
@@ -1899,9 +2082,7 @@ mod frame_tests {
         let setup = setup();
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let (resp_tx, resp_rx) = mpsc::channel();
-        let view = setup.mailbox_view(&cmd_tx, &account());
-        let stack = ViewStack::new(Box::new(view));
-        let mut session = Session::new(setup, stack, cmd_tx, resp_rx, mouse).unwrap();
+        let mut session = Session::new(setup, vec![Live { cmd_tx, resp_rx }], 0, mouse).unwrap();
         resp_tx
             .send(BackendResponse::Mailboxes(Ok(vec![
                 mailbox("1", "INBOX", "inbox", 12, 3),
@@ -1936,6 +2117,179 @@ mod frame_tests {
         assert!(note.contains("has changed since td-mail read it"), "{note}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
         assert!(cmd_rx.try_recv().is_err(), "a backend was replaced");
+    }
+
+    /// Every account keeps its backend for the session: `a` shows the
+    /// next account's list over its own backend, which fetches its
+    /// folders, and only the shown account's answers reach a view. `R`
+    /// asks the connector for the shown account again behind
+    /// `Connecting`, the folders' fetch after it, so the backend holds
+    /// the fetch until the connection is decided; setting an account up
+    /// asks the same way, before its list's fetch.
+    #[test]
+    fn accounts_keep_their_backends_and_r_reconnects_the_shown_one() {
+        let mut setup = setup();
+        let mut work = account();
+        work.name = "work".to_string();
+        work.well_known_url = "https://mail.example.com/.well-known/jmap".to_string();
+        setup.accounts = vec![account(), work];
+        setup.account_names = vec!["test".to_string(), "work".to_string()];
+        let (connector, requests) = mpsc::channel();
+        setup.connector = Some(connector);
+        setup.offline = false;
+        let (test_tx, test_cmds) = mpsc::channel();
+        let (test_answer, test_rx) = mpsc::channel();
+        let (work_tx, work_cmds) = mpsc::channel();
+        let (work_answer, work_rx) = mpsc::channel();
+        let live = vec![
+            Live {
+                cmd_tx: test_tx,
+                resp_rx: test_rx,
+            },
+            Live {
+                cmd_tx: work_tx,
+                resp_rx: work_rx,
+            },
+        ];
+        let mut session = Session::new(setup, live, 0, false).unwrap();
+        key(&mut session, "a");
+        assert_eq!(session.current, 1);
+        assert!(matches!(
+            work_cmds.try_recv(),
+            Ok(BackendCommand::FetchMailboxes { .. })
+        ));
+        test_answer
+            .send(BackendResponse::Mailboxes(Ok(vec![mailbox(
+                "t", "TestOnly", "inbox", 1, 1,
+            )])))
+            .unwrap();
+        work_answer
+            .send(BackendResponse::Mailboxes(Ok(vec![mailbox(
+                "w",
+                "WorkInbox",
+                "inbox",
+                2,
+                0,
+            )])))
+            .unwrap();
+        assert_eq!(session.poll(0), Flow::Continue);
+        let shown = session.shown();
+        assert!(
+            shown.contains("WorkInbox") && !shown.contains("TestOnly"),
+            "{shown}"
+        );
+        // The account switched away from is not shut down.
+        assert!(test_cmds.try_recv().is_err());
+
+        key(&mut session, "R");
+        assert!(matches!(
+            work_cmds.try_recv(),
+            Ok(BackendCommand::Connecting)
+        ));
+        let asked = requests.try_recv().unwrap();
+        assert_eq!(asked.account.name, "work");
+        assert!(asked.urgent);
+        assert!(matches!(
+            work_cmds.try_recv(),
+            Ok(BackendCommand::FetchMailboxes { origin }) if origin == "reconnect"
+        ));
+
+        let dir = crate::testing::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[account.test]\nwell_known_url = \"\"\nusername = \"me@example.com\"\npassword_command = \"true\"\n\
+             [account.work]\nwell_known_url = \"https://mail.example.com/.well-known/jmap\"\nusername = \"me@example.com\"\npassword_command = \"true\"\n",
+        )
+        .unwrap();
+        session.setup.config_path = Some(path);
+        session.set_up_account("work", "mx.td.dev", "me@td.dev");
+        assert_eq!(session.note, None);
+        assert!(matches!(
+            work_cmds.try_recv(),
+            Ok(BackendCommand::Connecting)
+        ));
+        let asked = requests.try_recv().unwrap();
+        assert_eq!(
+            asked.account.well_known_url,
+            "https://mx.td.dev/.well-known/jmap"
+        );
+        assert!(matches!(
+            work_cmds.try_recv(),
+            Ok(BackendCommand::FetchMailboxes { origin }) if origin == "set_up_account"
+        ));
+        assert!(test_cmds.try_recv().is_err());
+    }
+
+    /// The connector's queue keeps one request per account: a newer one
+    /// takes the older's place, and an urgent one goes first.
+    #[test]
+    fn the_connector_queue_keeps_one_request_per_account_urgent_first() {
+        let (cmd_tx, _cmd_rx) = mpsc::channel();
+        let request = |name: &str, url: &str, urgent: bool| {
+            let mut account = account();
+            account.name = name.to_string();
+            account.well_known_url = url.to_string();
+            ConnectRequest {
+                account,
+                cmd_tx: cmd_tx.clone(),
+                urgent,
+            }
+        };
+        let order = |queue: &VecDeque<ConnectRequest>| {
+            queue
+                .iter()
+                .map(|r| format!("{}={}", r.account.name, r.account.well_known_url))
+                .collect::<Vec<_>>()
+        };
+        let mut queue = VecDeque::new();
+        enqueue(&mut queue, request("a", "1", false));
+        enqueue(&mut queue, request("b", "1", false));
+        enqueue(&mut queue, request("c", "1", false));
+        enqueue(&mut queue, request("a", "2", false));
+        assert_eq!(order(&queue), ["a=2", "b=1", "c=1"]);
+        enqueue(&mut queue, request("c", "2", true));
+        assert_eq!(order(&queue), ["c=2", "a=2", "b=1"]);
+        enqueue(&mut queue, request("d", "1", true));
+        assert_eq!(order(&queue), ["d=1", "c=2", "a=2", "b=1"]);
+    }
+
+    /// A connector that is gone is the connection's failure: the backend
+    /// is told, so it holds nothing for a decision nothing would send.
+    #[test]
+    fn a_missing_connector_fails_the_connection() {
+        let mut setup = setup();
+        setup.offline = false;
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        setup.ask_connection(&account(), &cmd_tx, true);
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(BackendCommand::ConnectFailed(_))
+        ));
+        let (connector, requests) = mpsc::channel();
+        drop(requests);
+        setup.connector = Some(connector);
+        setup.ask_connection(&account(), &cmd_tx, false);
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(BackendCommand::ConnectFailed(_))
+        ));
+    }
+
+    /// Offline, `R` asks for no connection and says so; the list's fetch
+    /// is answered from the cache.
+    #[test]
+    fn r_offline_says_so_and_fetches_from_the_cache() {
+        let (mut session, cmd_rx, _resp_tx) = session(false);
+        key(&mut session, "R");
+        assert_eq!(
+            session.note.as_deref(),
+            Some("Not reconnected: td-mail was started --offline")
+        );
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(BackendCommand::FetchMailboxes { origin }) if origin == "reconnect"
+        ));
     }
 
     fn key(session: &mut Session, chord: &str) {
@@ -2092,7 +2446,7 @@ mod frame_tests {
     /// the pane shows it.
     fn show_message(session: &mut Session, resp_tx: &Sender<BackendResponse>, preview: String) {
         let view = views::email_view::EmailView::new(
-            session.cmd_tx.clone(),
+            session.cmd_tx().unwrap(),
             "me@example.com".to_string(),
             "e1".to_string(),
             Vec::new(),
@@ -3274,9 +3628,7 @@ mod frame_tests {
         setup.accounts = vec![work.clone()];
         let (cmd_tx, _cmd_rx) = mpsc::channel();
         let (_resp_tx, resp_rx) = mpsc::channel();
-        let view = setup.mailbox_view(&cmd_tx, &work);
-        let stack = ViewStack::new(Box::new(view));
-        let mut session = Session::new(setup, stack, cmd_tx, resp_rx, false).unwrap();
+        let mut session = Session::new(setup, vec![Live { cmd_tx, resp_rx }], 0, false).unwrap();
         key(&mut session, "c");
         assert!(
             text(&session).starts_with("From: Work <me@work.test>\nTo: \n"),
@@ -3903,9 +4255,7 @@ mod frame_tests {
         let setup = setup();
         let (cmd_tx, _cmd_rx) = mpsc::channel();
         let (resp_tx, resp_rx) = mpsc::channel();
-        let view = setup.mailbox_view(&cmd_tx, &account());
-        let stack = ViewStack::new(Box::new(view));
-        let mut empty = Session::new(setup, stack, cmd_tx, resp_rx, true).unwrap();
+        let mut empty = Session::new(setup, vec![Live { cmd_tx, resp_rx }], 0, true).unwrap();
         resp_tx
             .send(BackendResponse::Mailboxes(Ok(Vec::new())))
             .unwrap();

@@ -4,7 +4,7 @@ use crate::jmap::client::{JmapClient, JmapError};
 use crate::jmap::types::{Email, Identity, Mailbox};
 use crate::regex::UserRegex;
 use crate::rules::{self, CompiledRule};
-use crate::spam::{self, SpamModel};
+use crate::spam::{self, SharedModel};
 use crate::submit;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -144,10 +144,16 @@ pub enum BackendCommand {
     /// replaying what the cache queued.
     Connect(Box<JmapClient>),
     /// The connection could not be made, and why: the held commands are
-    /// answered from the cache, as the rest are until the account is
-    /// opened again, and every answer the cache cannot give names the
-    /// reason.
+    /// answered from the cache, as the rest are until a connection is
+    /// made, and every answer the cache cannot give names the reason; a
+    /// backend already online stays on the client it has.
     ConnectFailed(String),
+    /// A connection is asked for again (a reconnect, or the account set
+    /// up): a backend without a client holds every command until
+    /// `Connect` or `ConnectFailed` decides it, as one started connecting
+    /// does; one with a client goes on serving with it until `Connect`
+    /// replaces it.
+    Connecting,
     Shutdown,
 }
 
@@ -848,10 +854,11 @@ fn process_mutation_via_queue(
 /// (`Connect` or `ConnectFailed` follows), and the backend holds every
 /// command until it arrives; a backend started with a client, or without
 /// one and not connecting, answers at once. `reopen` says a store another
-/// handle holds at the start (the account's previous backend in the same
-/// client, finishing a request before it shuts down) is to be opened once
-/// it is free; the CLI's one backend has no predecessor and keeps what it
-/// opened.
+/// handle holds at the start (a second td-mail on the same account) is to
+/// be opened once it is free; the CLI keeps what it opened. `spam_model`
+/// is the session's, which every account's backend shares. A thread the
+/// system will not create (the jail caps its tasks) is an error, not a
+/// panic.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn(
     client: Option<JmapClient>,
@@ -863,14 +870,19 @@ pub fn spawn(
     rules_mailbox_regex: Arc<UserRegex>,
     my_email_regex: Arc<UserRegex>,
     spam_config: SpamConfig,
-) -> (
-    mpsc::Sender<BackendCommand>,
-    mpsc::Receiver<BackendResponse>,
-) {
+    spam_model: SharedModel,
+) -> Result<
+    (
+        mpsc::Sender<BackendCommand>,
+        mpsc::Receiver<BackendResponse>,
+    ),
+    String,
+> {
     let (cmd_tx, cmd_rx) = mpsc::channel::<BackendCommand>();
     let (resp_tx, resp_rx) = mpsc::channel::<BackendResponse>();
+    let name = account_name.clone();
 
-    thread::spawn(move || {
+    let spawned = thread::Builder::new().spawn(move || {
         let cache = match Cache::open(&account_name) {
             Ok(c) => {
                 log_info!("[Backend] Opened cache for account '{}'", account_name);
@@ -885,15 +897,6 @@ pub fn spawn(
                 None
             }
         };
-        let spam_model = spam::model_path()
-            .map(|path| SpamModel::load(&path))
-            .unwrap_or_default();
-        log_info!(
-            "[Spam] loaded model ({} spam / {} ham trained, enabled={})",
-            spam_model.spam_messages(),
-            spam_model.ham_messages(),
-            spam_config.enabled
-        );
         backend_loop(
             client,
             connecting,
@@ -909,8 +912,10 @@ pub fn spawn(
             spam_model,
         );
     });
-
-    (cmd_tx, resp_rx)
+    match spawned {
+        Ok(_) => Ok((cmd_tx, resp_rx)),
+        Err(e) => Err(format!("no thread for account {name}'s backend: {e}")),
+    }
 }
 
 /// An answer that could not be served offline: `what`, and the reason
@@ -1065,7 +1070,9 @@ fn handle_offline_command(
             return false;
         }
         // The loop takes the connection's decision before it gets here.
-        BackendCommand::Connect(_) | BackendCommand::ConnectFailed(_) => {}
+        BackendCommand::Connect(_)
+        | BackendCommand::ConnectFailed(_)
+        | BackendCommand::Connecting => {}
         // Offline mutations: queue and apply local projection.
         BackendCommand::MarkEmailRead { op_id, id, .. } => {
             let op = QueuedMutation::MarkRead {
@@ -1662,7 +1669,7 @@ fn backend_loop(
     cache: Option<Cache>,
     reopen: Option<String>,
     spam_config: SpamConfig,
-    mut spam_model: SpamModel,
+    spam_model: SharedModel,
 ) {
     let mut cached_mailboxes: Vec<Mailbox> = Vec::new();
     let mut command_seq: u64 = 0;
@@ -1710,9 +1717,8 @@ fn backend_loop(
         };
         command_seq = command_seq.wrapping_add(1);
 
-        // A store another handle held when this backend started (the
-        // account's previous backend, finishing a request before it shuts
-        // down, or a second td-mail) is opened once it is free: tried
+        // A store another handle held when this backend started (a second
+        // td-mail on the same account) is opened once it is free: tried
         // before each command, blocking nothing, until it is.
         if cache.is_none() {
             if let Some(name) = reopen.as_deref() {
@@ -1761,6 +1767,14 @@ fn backend_loop(
                         cache,
                     );
                 }
+                // A reconnect over a client the views were served by
+                // fetches the folders again, so what they show is the
+                // new connection's.
+                if client.is_some() {
+                    held.push_back(BackendCommand::FetchMailboxes {
+                        origin: "reconnected".to_string(),
+                    });
+                }
                 client = Some(*connected);
                 connecting = false;
                 offline_reason = None;
@@ -1772,6 +1786,14 @@ fn backend_loop(
                 if client.is_none() {
                     offline_reason = Some(reason);
                 }
+                continue;
+            }
+            // A backend with a client goes on serving with it while the
+            // new connection is made, and swaps it in on `Connect`; one
+            // without holds until the connection is decided.
+            BackendCommand::Connecting => {
+                log_info!("[Backend] cmd#{} Connecting", command_seq);
+                connecting = client.is_none();
                 continue;
             }
             BackendCommand::Shutdown if connecting => {
@@ -2575,15 +2597,18 @@ fn backend_loop(
                 } else {
                     spam::Label::Ham
                 };
-                let result = train_message(client, &mut spam_model, &id, label);
+                let result = train_message(client, &spam_model, &id, label);
                 match &result {
-                    Ok(()) => log_info!(
-                        "[Spam] trained {} as {} (model now {} spam / {} ham)",
-                        id,
-                        if is_spam { "spam" } else { "ham" },
-                        spam_model.spam_messages(),
-                        spam_model.ham_messages()
-                    ),
+                    Ok(()) => {
+                        let (spam_count, ham_count) = spam::trained(&spam_model);
+                        log_info!(
+                            "[Spam] trained {} as {} (model now {} spam / {} ham)",
+                            id,
+                            if is_spam { "spam" } else { "ham" },
+                            spam_count,
+                            ham_count
+                        )
+                    }
                     Err(e) => log_warn!("[Spam] training failed for {}: {}", id, e),
                 }
                 let _ = resp_tx.send(BackendResponse::MessageTrained {
@@ -2610,16 +2635,17 @@ fn backend_loop(
                 } else {
                     spam::Label::Ham
                 };
-                let result = train_mailbox(client, &mut spam_model, &mailbox_id, label, limit);
+                let result = train_mailbox(client, &spam_model, &mailbox_id, label, limit);
                 if let Ok((trained, failed)) = &result {
+                    let (spam_count, ham_count) = spam::trained(&spam_model);
                     log_info!(
                         "[Spam] bulk-trained mailbox {}: {} as {}, {} failed (model now {} spam / {} ham)",
                         mailbox_id,
                         trained,
                         if is_spam { "spam" } else { "ham" },
                         failed,
-                        spam_model.spam_messages(),
-                        spam_model.ham_messages()
+                        spam_count,
+                        ham_count
                     );
                 }
                 let _ = resp_tx.send(BackendResponse::MailboxTrained {
@@ -2654,7 +2680,9 @@ fn backend_loop(
                 let _ = resp_tx.send(BackendResponse::MessageClassified { id, result });
             }
             // The loop takes the connection's decision before it gets here.
-            BackendCommand::Connect(_) | BackendCommand::ConnectFailed(_) => {}
+            BackendCommand::Connect(_)
+            | BackendCommand::ConnectFailed(_)
+            | BackendCommand::Connecting => {}
             BackendCommand::Shutdown => {
                 break;
             }
@@ -3152,7 +3180,7 @@ fn settle_lost_send(
 /// persist the updated model to disk.
 fn train_message(
     client: &JmapClient,
-    model: &mut SpamModel,
+    model: &SharedModel,
     id: &str,
     label: spam::Label,
 ) -> Result<(), String> {
@@ -3162,6 +3190,7 @@ fn train_message(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "no raw message source available".to_string())?;
     let msg = spam::RawMessage::from_bytes(raw.as_bytes());
+    let mut model = spam::lock(model);
     model.train(&msg, label);
     model.save(&path)
 }
@@ -3170,7 +3199,7 @@ fn train_message(
 /// label, saving the model once at the end. Returns (trained, failed) counts.
 fn train_mailbox(
     client: &JmapClient,
-    model: &mut SpamModel,
+    model: &SharedModel,
     mailbox_id: &str,
     label: spam::Label,
     limit: u32,
@@ -3186,7 +3215,7 @@ fn train_mailbox(
         match client.get_email_raw(id) {
             Ok(Some(raw)) => {
                 let msg = spam::RawMessage::from_bytes(raw.as_bytes());
-                model.train(&msg, label);
+                spam::lock(model).train(&msg, label);
                 trained += 1;
             }
             Ok(None) => {
@@ -3199,14 +3228,14 @@ fn train_mailbox(
             }
         }
     }
-    model.save(&path)?;
+    spam::lock(model).save(&path)?;
     Ok((trained, failed))
 }
 
 /// Score a single message read-only. Returns (score, verdict).
 fn classify_message(
     client: &JmapClient,
-    model: &SpamModel,
+    model: &SharedModel,
     config: &SpamConfig,
     id: &str,
 ) -> Result<(f64, String), String> {
@@ -3215,7 +3244,7 @@ fn classify_message(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "no raw message source available".to_string())?;
     let msg = spam::RawMessage::from_bytes(raw.as_bytes());
-    let (score, verdict) = model.classify(
+    let (score, verdict) = spam::lock(model).classify(
         &msg,
         config.threshold,
         config.ham_threshold,
@@ -3227,7 +3256,7 @@ fn classify_message(
 /// Score a mailbox sample read-only (no mutations), for validating the model.
 fn classify_mailbox(
     client: &JmapClient,
-    model: &SpamModel,
+    model: &SharedModel,
     config: &SpamConfig,
     mailbox_id: &str,
     limit: u32,
@@ -3248,7 +3277,7 @@ fn classify_mailbox(
             }
         };
         let msg = spam::RawMessage::from_bytes(raw.as_bytes());
-        let (score, verdict) = model.classify(
+        let (score, verdict) = spam::lock(model).classify(
             &msg,
             config.threshold,
             config.ham_threshold,
@@ -3317,7 +3346,7 @@ fn fetch_rule_emails_chunked(
 /// Read-only bundle used to score messages during rule evaluation.
 struct SpamScorer<'a> {
     config: &'a SpamConfig,
-    model: &'a SpamModel,
+    model: &'a SharedModel,
 }
 
 fn mailbox_is_inbox(mailboxes: &[Mailbox], mailbox_id: &str) -> bool {
@@ -3343,7 +3372,7 @@ fn annotate_inbox_spam(
     let Some(scorer) = scorer else {
         return;
     };
-    if !scorer.config.enabled || !scorer.model.is_trained(scorer.config.min_training) {
+    if !scorer.config.enabled || !spam::lock(scorer.model).is_trained(scorer.config.min_training) {
         return;
     }
     if !mailbox_is_inbox(mailboxes, mailbox_id) {
@@ -3368,7 +3397,7 @@ fn annotate_inbox_spam(
             }
         };
         let msg = spam::RawMessage::from_bytes(raw.as_bytes());
-        let (score, verdict) = scorer.model.classify(
+        let (score, verdict) = spam::lock(scorer.model).classify(
             &msg,
             scorer.config.threshold,
             scorer.config.ham_threshold,
@@ -4035,7 +4064,7 @@ mod tests {
                 None,
                 None,
                 spam_config,
-                SpamModel::default(),
+                Arc::new(std::sync::Mutex::new(crate::spam::SpamModel::default())),
             );
         });
         let fetch = |origin: &str| BackendCommand::FetchMailboxes {
@@ -4115,6 +4144,29 @@ mod tests {
         cmd_tx.send(fetch("connect")).unwrap();
         let online = answer(&resp_rx);
         assert!(!online.contains("offline mode"), "{online}");
+        // A reconnect over a client goes on serving with it, and one that
+        // fails leaves the backend on the client it had.
+        cmd_tx.send(BackendCommand::Connecting).unwrap();
+        cmd_tx.send(fetch("reconnect")).unwrap();
+        let serving = answer(&resp_rx);
+        assert!(!serving.contains("offline mode"), "{serving}");
+        cmd_tx
+            .send(BackendCommand::ConnectFailed("timed out".into()))
+            .unwrap();
+        cmd_tx.send(fetch("after")).unwrap();
+        let still = answer(&resp_rx);
+        assert!(!still.contains("offline mode"), "{still}");
+        cmd_tx
+            .send(BackendCommand::Connect(Box::new(
+                JmapClient::unreachable_for_tests(),
+            )))
+            .unwrap();
+        // The new client fetches the folders the views show, unasked.
+        let refetched = answer(&resp_rx);
+        assert!(!refetched.contains("offline mode"), "{refetched}");
+        cmd_tx.send(fetch("replaced")).unwrap();
+        let replaced = answer(&resp_rx);
+        assert!(!replaced.contains("offline mode"), "{replaced}");
         cmd_tx.send(BackendCommand::Shutdown).unwrap();
         backend.join().unwrap();
         std::env::remove_var("XDG_RUNTIME_DIR");
@@ -4146,7 +4198,7 @@ mod tests {
                 None,
                 None,
                 spam_config,
-                SpamModel::default(),
+                Arc::new(std::sync::Mutex::new(crate::spam::SpamModel::default())),
             );
         });
         cmd_tx
@@ -4198,7 +4250,7 @@ mod tests {
                 None,
                 Some("backend_late_open".to_string()),
                 spam_config,
-                SpamModel::default(),
+                Arc::new(std::sync::Mutex::new(crate::spam::SpamModel::default())),
             );
         });
         let fetch = |origin: &str| BackendCommand::FetchMailboxes {

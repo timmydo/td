@@ -709,10 +709,10 @@ fn main() {
         eprintln!("Offline mode ({})", first_account.name);
     }
 
-    // Open the window before the first account connects; the connection
-    // is made behind it, so a server that is down, a network that is not
-    // up yet, or a placeholder account leaves the window open on what
-    // the cache holds, and selecting the account again retries.
+    // Open the window before any account connects; the connections are
+    // made behind it, so a server that is down, a network that is not up
+    // yet, or a placeholder account leaves the window open on what the
+    // cache holds, and a reconnect retries.
     let outcome = ui::run(
         config.accounts,
         0,

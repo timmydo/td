@@ -24,6 +24,7 @@ const LABELS: &[&str] = &[
     "Folder",
     "Mark read",
     "Account",
+    "Reconnect",
     keys::BUTTON,
     "Quit",
 ];
@@ -35,6 +36,7 @@ const KEYS: &[Key] = &[
     Key::Menu(Menu::Folder),
     Key::Char('u'),
     Key::Char('a'),
+    Key::Char('R'),
     Key::Char('?'),
     Key::Char('q'),
 ];
@@ -42,8 +44,17 @@ const CREATE_LABELS: &[&str] = &["Create", "Cancel"];
 const CREATE_KEYS: &[Key] = &[Key::Enter, Key::Escape];
 const DELETE_LABELS: &[&str] = &["Delete", "Cancel"];
 const DELETE_KEYS: &[Key] = &[Key::Char('y'), Key::Escape];
-const SETUP_SCREEN_LABELS: &[&str] = &["Set up", "Account", keys::BUTTON, "Quit"];
+const SETUP_SCREEN_LABELS: &[&str] = &["Set up", "Reconnect", "Account", keys::BUTTON, "Quit"];
 const SETUP_SCREEN_KEYS: &[Key] = &[
+    Key::Char('s'),
+    Key::Char('R'),
+    Key::Char('a'),
+    Key::Char('?'),
+    Key::Char('q'),
+];
+/// A placeholder the form can set up: it has no server to reconnect.
+const PLACEHOLDER_SETUP_LABELS: &[&str] = &["Set up", "Account", keys::BUTTON, "Quit"];
+const PLACEHOLDER_SETUP_KEYS: &[Key] = &[
     Key::Char('s'),
     Key::Char('a'),
     Key::Char('?'),
@@ -109,15 +120,8 @@ fn store_steps(name: &str) -> String {
     )
 }
 
-/// How the account is connected again: `a` reopens the one account, and
-/// moves on through several.
-fn again(accounts: usize) -> &'static str {
-    if accounts > 1 {
-        "select this account again with a"
-    } else {
-        "press a"
-    }
-}
+/// How the account is connected again.
+const AGAIN: &str = "press R";
 
 /// What the window says of an account that is still td-firstboot's
 /// placeholder: there is nothing to connect to, and `s` sets it up.
@@ -152,23 +156,22 @@ fn placeholder_text(account: &str, setup: &AccountSetup) -> String {
 /// What the window says when the credential portal did not hand over the
 /// account's password: how a password reaches the store, and what the
 /// portal said.
-fn credential_text(name: &str, error: &str, accounts: usize) -> String {
+fn credential_text(name: &str, error: &str) -> String {
     format!(
         "td-mail could not get this account's password from td's credential store.\n\n\
          The store hands an application its password only once it is enrolled with \
          hardware security keys and unlocked:\n\n\
          {}\n\
-         4. Then {} here to connect again.\n\n\
+         4. Then {AGAIN} here to connect again.\n\n\
          What td-mail was told: {error}",
         store_steps(name),
-        again(accounts)
     )
 }
 
 /// What the window says when a connection was tried and failed for a
 /// reason of the server's or the account's: what can be wrong, and how
 /// each is changed from here.
-fn unreachable_text(account: &str, setup: &AccountSetup, error: &str, accounts: usize) -> String {
+fn unreachable_text(account: &str, setup: &AccountSetup, error: &str) -> String {
     let mut text = format!(
         "td-mail could not connect the account \"{account}\" to {} as {}.\n\n",
         setup.server, setup.username
@@ -187,8 +190,7 @@ fn unreachable_text(account: &str, setup: &AccountSetup, error: &str, accounts: 
         ));
     }
     text.push_str(&format!(
-        "Then {} here to connect again.\n\nWhat td-mail was told: {error}",
-        again(accounts)
+        "Then {AGAIN} here to connect again.\n\nWhat td-mail was told: {error}"
     ));
     text
 }
@@ -210,6 +212,9 @@ pub struct MailboxListView {
     deleted_folder: String,
     retention_policies: Vec<RetentionPolicyConfig>,
     status_message: Option<String>,
+    /// `status_message` says a reconnect is asked for, until the folders'
+    /// next answer.
+    reconnect_noted: bool,
     pending_retention_preview: Option<Vec<RetentionCandidate>>,
     create_mode: bool,
     create_input: String,
@@ -260,6 +265,7 @@ impl MailboxListView {
             deleted_folder,
             retention_policies,
             status_message: None,
+            reconnect_noted: false,
             pending_retention_preview: None,
             create_mode: false,
             create_input: String::new(),
@@ -321,20 +327,16 @@ impl MailboxListView {
                 ),
             });
         }
-        let accounts = self.account_names.len();
         let error = self.error.as_deref().unwrap_or_default();
         match self.screen()? {
             Screen::Placeholder => Some(placeholder_text(&self.current_account, &self.setup)),
             Screen::Credential => {
                 let name = self.setup.portal.as_deref()?;
-                Some(credential_text(name, error, accounts))
+                Some(credential_text(name, error))
             }
-            Screen::Unreachable => Some(unreachable_text(
-                &self.current_account,
-                &self.setup,
-                error,
-                accounts,
-            )),
+            Screen::Unreachable => {
+                Some(unreachable_text(&self.current_account, &self.setup, error))
+            }
         }
     }
 
@@ -421,11 +423,9 @@ impl MailboxListView {
         });
     }
 
-    /// The account after the current one, round; with one account it is
-    /// that account, so selecting it again reopens it, which is how a
-    /// connection that failed is retried.
+    /// The account after the current one, round; none with one account.
     fn next_account_name(&self) -> Option<String> {
-        if self.account_names.is_empty() {
+        if self.account_names.len() < 2 {
             return None;
         }
         let current_idx = self
@@ -505,11 +505,14 @@ impl MailboxListView {
 
     /// The status row: the mode's keys, behind any message the view has.
     fn status_line(&self) -> String {
-        // With one account the key reopens it, which is the reconnect.
-        let account_hint = if self.account_names.len() > 1 {
-            " a:account"
-        } else {
-            " a:reconnect"
+        // A placeholder has no server to connect to again, and a session
+        // started offline connects nothing.
+        let reconnect = self.setup.online && !self.setup.placeholder;
+        let account_hint = match (self.account_names.len() > 1, reconnect) {
+            (true, false) => " a:account",
+            (true, true) => " a:account R:reconnect",
+            (false, false) => "",
+            (false, true) => " R:reconnect",
         };
         let base = if let Some(step) = self.setup_step {
             match step {
@@ -623,6 +626,8 @@ impl View for MailboxListView {
             (CREATE_LABELS, CREATE_KEYS)
         } else if self.delete_confirm_mode {
             (DELETE_LABELS, DELETE_KEYS)
+        } else if self.may_set_up() && self.screen() == Some(Screen::Placeholder) {
+            (PLACEHOLDER_SETUP_LABELS, PLACEHOLDER_SETUP_KEYS)
         } else if self.may_set_up() {
             (SETUP_SCREEN_LABELS, SETUP_SCREEN_KEYS)
         } else if self.screen() == Some(Screen::Placeholder) {
@@ -831,8 +836,18 @@ impl View for MailboxListView {
                 if let Some(next) = self.next_account_name() {
                     ViewAction::SwitchAccount(next)
                 } else {
+                    self.status_message = Some("No other account is configured".to_string());
                     ViewAction::Continue
                 }
+            }
+            // The answer to the fetch the session sends behind the
+            // reconnect replaces what the list shows.
+            Key::Char('R') => {
+                self.loading = true;
+                self.error = None;
+                self.status_message = Some(format!("Reconnecting {}...", self.current_account));
+                self.reconnect_noted = true;
+                ViewAction::Reconnect
             }
             Key::Char('?') => ViewAction::ShowKeys,
             Key::ScrollUp => {
@@ -881,6 +896,9 @@ impl View for MailboxListView {
         match response {
             BackendResponse::Mailboxes(result) => {
                 self.loading = false;
+                if std::mem::take(&mut self.reconnect_noted) {
+                    self.status_message = None;
+                }
                 match result {
                     Ok(mailboxes) => {
                         let mut mailboxes = mailboxes.clone();
@@ -1163,6 +1181,43 @@ mod tests {
         assert!(scene.status.starts_with("1/3 | "), "{}", scene.status);
     }
 
+    /// `R` asks for the account's connection again, the list loading
+    /// until the fetch behind it answers; `a` with one account goes
+    /// nowhere and says so.
+    #[test]
+    fn r_reconnects_and_a_needs_another_account() {
+        let (mut view, cmd_rx) = make_view();
+        view.on_response(&BackendResponse::Mailboxes(Err("offline".to_string())));
+        assert!(matches!(
+            view.handle_key(Key::Char('R'), 10),
+            ViewAction::Reconnect
+        ));
+        assert!(matches!(view.scene().body, Body::Text { .. }));
+        assert!(view
+            .scene()
+            .status
+            .starts_with("Reconnecting personal... | Loading..."));
+        // The session sends the fetch, behind its reconnect, and its
+        // answer ends the note.
+        assert!(cmd_rx.try_recv().is_err());
+        view.on_response(&folders());
+        assert!(
+            !view.scene().status.contains("Reconnecting"),
+            "{}",
+            view.scene().status
+        );
+        // A session started offline offers no reconnect.
+        assert!(!view.scene().status.contains("R:reconnect"));
+        assert!(matches!(
+            view.handle_key(Key::Char('a'), 10),
+            ViewAction::Continue
+        ));
+        assert!(view
+            .scene()
+            .status
+            .starts_with("No other account is configured"));
+    }
+
     #[test]
     fn a_press_on_a_row_selects_it_and_opens_that_folder() {
         let (mut view, cmd_rx) = make_view();
@@ -1291,11 +1346,11 @@ mod tests {
         assert!(text.contains("mail/personal"), "{text}");
         {
             let scene = view.scene();
-            assert_eq!(scene.labels, SETUP_SCREEN_LABELS);
-            assert_eq!(scene.keys, SETUP_SCREEN_KEYS);
+            assert_eq!(scene.labels, PLACEHOLDER_SETUP_LABELS);
+            assert_eq!(scene.keys, PLACEHOLDER_SETUP_KEYS);
             assert!(scene
                 .status
-                .starts_with("Not set up | s:set up a:reconnect"));
+                .starts_with("Not set up | s:set up ?:help q:quit"));
         }
         // The placeholder has no server: the folder keys do nothing.
         for key in ['+', 'd', 'g', 'u', 'X', 'c'] {
@@ -1369,7 +1424,7 @@ mod tests {
             text.contains("td-secret set mail/personal < FILE"),
             "{text}"
         );
-        assert!(text.contains("Then press a here"), "{text}");
+        assert!(text.contains("Then press R here"), "{text}");
         assert!(text.contains("401 Unauthorized"), "{text}");
         assert!(view.scene().status.starts_with("Not connected | s:set up"));
 
@@ -1430,17 +1485,17 @@ mod tests {
         assert!(text.contains("Ctrl+Alt+Esc, then E"), "{text}");
         assert!(text.contains("Ctrl+Alt+Esc, then U"), "{text}");
         assert!(text.contains("Ctrl+Alt+Esc, then W"), "{text}");
-        assert!(text.contains("4. Then press a here"), "{text}");
+        assert!(text.contains("4. Then press R here"), "{text}");
         assert!(
             text.contains("enroll or unlock through secure attention"),
             "{text}"
         );
         assert!(!text.contains("su "), "{text}");
-        assert!(view.scene().status.contains("a:reconnect"));
+        assert!(view.scene().status.contains("R:reconnect"));
         view.handle_key(Key::Char('s'), 10);
         assert!(view.scene().entry.is_none());
 
-        // With several accounts `a` moves on, and the text says so.
+        // With several accounts the status row names both keys.
         let (cmd_tx, _cmd_rx) = mpsc::channel();
         let mut view = MailboxListView::new(
             cmd_tx,
@@ -1457,7 +1512,7 @@ mod tests {
         )
         .with_setup(setup(false));
         view.on_response(&failed(&refused));
-        assert!(body_text(&view).contains("select this account again with a"));
+        assert!(view.scene().status.contains(" a:account R:reconnect"));
 
         // Not on the portal, the bare error stands.
         let (view, _cmd_rx) = make_view();
@@ -1495,7 +1550,7 @@ mod tests {
             let scene = view.scene();
             assert_eq!(scene.labels, PLACEHOLDER_LABELS);
             assert_eq!(scene.keys, PLACEHOLDER_KEYS);
-            assert_eq!(scene.status, "Not set up | a:reconnect ?:help q:quit");
+            assert_eq!(scene.status, "Not set up | ?:help q:quit");
         }
 
         // An account that cannot connect says why the form is not offered.

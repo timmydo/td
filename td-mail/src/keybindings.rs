@@ -29,11 +29,8 @@ pub const MAILBOX_LIST: Table = Table {
         ("p/k/Up", "prev", "Previous mailbox"),
         ("Return", "open", "Open mailbox"),
         ("g", "refresh", "Refresh"),
-        (
-            "a",
-            "next_account",
-            "Next account; with one, reopen it (reconnect)",
-        ),
+        ("a", "next_account", "Show the next account"),
+        ("R", "reconnect", "Connect the shown account again"),
         (
             "s",
             "set_up",

@@ -52,9 +52,11 @@ pub fn recipe() -> Recipe {
         })
         .and_then(|permissions| permissions.with_memory_high(192 * 1024 * 1024))
         .and_then(|permissions| permissions.with_memory_max(256 * 1024 * 1024))
-        // Tasks, threads included: the client keeps a backend thread beside
-        // the window's, and a cap hit aborts a program that td-svc will not
-        // restart, so the fixture's 32 rather than a tighter number.
+        // Tasks, threads included: the client keeps a backend thread per
+        // configured account and one connector beside the window's, and
+        // td-svc will not restart a program that exits on the cap (a
+        // backend it cannot start fails td-mail's start), so the
+        // fixture's 32 rather than a tighter number.
         .and_then(|permissions| permissions.with_pids_max(32))
         .and_then(|permissions| permissions.with_cpu_max(50_000, 100_000))
     else {
