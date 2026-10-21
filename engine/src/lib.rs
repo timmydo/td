@@ -57,6 +57,9 @@ pub mod crc32;
 // its pins, td-builder assembles and admits the root against it.
 pub mod debian_root;
 pub mod ed25519;
+// `embed_scan` reads Rust source for embeds and test modules: td-recipe-eval's
+// build script and td-builder's fingerprints read through one scanner.
+pub mod embed_scan;
 pub mod launcher;
 pub mod ostree;
 pub mod permissions;

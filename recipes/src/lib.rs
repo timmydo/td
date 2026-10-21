@@ -16,9 +16,6 @@ pub mod catalog;
 #[cfg(test)]
 #[path = "../../td-authd/src/primary_account.rs"]
 mod primary_account;
-// The build script's source scans, here for their tests only.
-#[cfg(test)]
-mod embed_scan;
 // The trees a local-source recipe's files name, for recipe tests.
 #[cfg(test)]
 mod source_closure;

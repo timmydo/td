@@ -1,14 +1,15 @@
-//! The scans `build.rs` runs over this crate's sources to learn which `td-*`
-//! directories a recipe reads: the wide one for a recipe file, where a stray
-//! name widens one recipe's reach, and the embed one for a shared module,
-//! whose reads are every recipe's. The build script includes this file by
-//! `#[path]`; the library includes it for these tests alone.
+//! The Rust-source scans td's control plane reads its own sources with:
+//! td-recipe-eval's build script (by `#[path]`) learns which `td-*`
+//! directories a recipe reads — the wide scan for a recipe file, where a
+//! stray name widens one recipe's reach, and the embed scan for a shared
+//! module, whose reads are every recipe's — and td-builder's fingerprints
+//! and embed guard read every embed through the same reader.
 
 /// The `td-*` directories `text` names: `td-sh/` with no identifier character
 /// before it, the rule `builder/src/affected.rs` reads crates by, so a store
 /// path's `xyz-td-sh-1.0/` is not one and `td-shell/` is not `td-sh/`. A name
 /// in a comment or a script counts and only widens. Sorted and deduped.
-pub(crate) fn td_dirs_named(text: &str) -> Vec<String> {
+pub fn td_dirs_named(text: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut from = 0usize;
     while let Some(at) = text.get(from..).and_then(|rest| rest.find("td-")) {
@@ -37,7 +38,7 @@ pub(crate) fn td_dirs_named(text: &str) -> Vec<String> {
 /// marker not followed by a literal (`include!(concat!(...))`) embeds
 /// nothing rather than the next string in the file, and comments are cut
 /// first, so a name in prose or an error string is never an embed.
-pub(crate) fn td_dirs_embedded(text: &str) -> Vec<String> {
+pub fn td_dirs_embedded(text: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for (_, literal) in embed_literals(&strip_comments(text)) {
         for dir in td_dirs_named(&literal) {
@@ -53,7 +54,7 @@ pub(crate) fn td_dirs_embedded(text: &str) -> Vec<String> {
 /// Each embed in `code`, which has had its comments cut: the byte where its
 /// marker starts and the literal it carries, by the rules `td_dirs_embedded`
 /// states, in marker then file order.
-pub(crate) fn embed_literals(code: &str) -> Vec<(usize, String)> {
+pub fn embed_literals(code: &str) -> Vec<(usize, String)> {
     let mut out: Vec<(usize, String)> = Vec::new();
     for (marker, attribute) in [
         ("#[path", true),
@@ -90,7 +91,7 @@ pub(crate) fn embed_literals(code: &str) -> Vec<(usize, String)> {
 /// function — gates nothing here, nor does any other spelling,
 /// `#[cfg(all(test, ...))]` included: a missed test embed only counts as a
 /// real one.
-pub(crate) fn cfg_test_spans(code: &str) -> Vec<(usize, usize)> {
+pub fn cfg_test_spans(code: &str) -> Vec<(usize, usize)> {
     const ATTR: &str = "#[cfg(test)]";
     let mut out = Vec::new();
     let mut at = 0usize;
@@ -204,7 +205,7 @@ fn literal_len_at(code: &str, at: usize) -> Option<usize> {
 /// name there may be a read `td_files_embedded` cannot resolve to a file —
 /// a `concat!` path, a `cfg_attr` mount — so it stands for its whole
 /// directory.
-pub(crate) fn td_dirs_named_beside_embeds(text: &str) -> Vec<String> {
+pub fn td_dirs_named_beside_embeds(text: &str) -> Vec<String> {
     let code = strip_comments(text);
     let mut cut = cfg_test_spans(&code);
     for (at, literal) in embed_literals(&code) {
@@ -222,24 +223,25 @@ pub(crate) fn td_dirs_named_beside_embeds(text: &str) -> Vec<String> {
 /// `text` with its comments cut and its `#[cfg(test)]` modules blanked,
 /// literals kept: the code a recipe's evaluation runs, and the embeds it
 /// compiles in.
-pub(crate) fn production_code(text: &str) -> String {
+pub fn production_code(text: &str) -> String {
     let code = strip_comments(text);
     let spans = cfg_test_spans(&code);
     blank(&code, &spans)
 }
 
 /// `code` with each byte span in `spans` (inclusive ends) replaced by
-/// spaces, so what is left keeps its token boundaries.
+/// spaces, one per byte, so what is left keeps its token boundaries and
+/// every byte offset.
 fn blank(code: &str, spans: &[(usize, usize)]) -> String {
-    code.char_indices()
-        .map(|(i, c)| {
-            if spans.iter().any(|(s, e)| *s <= i && i <= *e) {
-                ' '
-            } else {
-                c
-            }
-        })
-        .collect()
+    let mut out = String::with_capacity(code.len());
+    for (i, c) in code.char_indices() {
+        if spans.iter().any(|(s, e)| *s <= i && i <= *e) {
+            (0..c.len_utf8()).for_each(|_| out.push(' '));
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// What a recipe file's production code reads of its sibling recipes: the
@@ -254,7 +256,7 @@ fn blank(code: &str, spans: &[(usize, usize)]) -> String {
 /// super::*` names its own recipe, and a string that spells a path reads
 /// nothing. Whitespace around `::` is dropped, so a path split across lines
 /// reads as one.
-pub(crate) fn sibling_reads(text: &str, modules: &[&str]) -> (Vec<String>, bool) {
+pub fn sibling_reads(text: &str, modules: &[&str]) -> (Vec<String>, bool) {
     let code = squeeze_paths(&blank_literals(&production_code(text)));
     let ident_char = |c: char| c.is_ascii_alphanumeric() || c == '_';
     let mut reads: Vec<String> = Vec::new();
@@ -377,7 +379,7 @@ const IMPURE: &[&str] = &[
 /// The `IMPURE` names a recipe file's production code holds outside its
 /// literals and comments, in `IMPURE` order. A spelling scan: an alias
 /// (`use std::fs as f`) passes it, and review covers that.
-pub(crate) fn impure_names(text: &str) -> Vec<&'static str> {
+pub fn impure_names(text: &str) -> Vec<&'static str> {
     let code = squeeze_paths(&blank_literals(&production_code(text)));
     IMPURE
         .iter()
@@ -404,7 +406,46 @@ fn blank_literals(code: &str) -> String {
 /// Whether `code` (comments cut) embeds a file by a path this cannot read:
 /// an embed marker in code, not inside a literal, that carries no literal
 /// path (a `concat!` of pieces, a macro's argument).
-pub(crate) fn has_computed_embed(code: &str) -> bool {
+pub fn has_computed_embed(code: &str) -> bool {
+    computed_embeds(code) > 0
+}
+
+/// `has_computed_embed`, but for a build script's own output: an
+/// `include!(concat!(env!("OUT_DIR"), "/NAME"))`, spelled as rustfmt writes
+/// it, in code rather than inside a literal, whose one literal is a plain
+/// `/`-led path (letters, digits, `_`, `-`, `.` and `/`, so no escape can
+/// spell a dot) with no `..` component, compiles in a file the crate's
+/// build script generates, not a path the source names. Any other spelling
+/// counts as computed.
+pub fn has_computed_embed_beyond_out_dir(code: &str) -> bool {
+    const OUT_DIR: &str = "include!(concat!(env!(\"OUT_DIR\"), ";
+    let bare = blank_literals(code);
+    let admitted = code
+        .match_indices(OUT_DIR)
+        .filter(|(at, _)| {
+            let tail = at.saturating_add(OUT_DIR.len());
+            bare.get(*at..).is_some_and(|r| r.starts_with("include!"))
+                && code
+                    .get(tail..)
+                    .and_then(string_literal_span)
+                    .is_some_and(|(name, len)| {
+                        name.starts_with('/')
+                            && name.chars().all(|c| {
+                                c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/')
+                            })
+                            && !name.split('/').any(|part| part == "..")
+                            && code
+                                .get(tail.saturating_add(len)..)
+                                .is_some_and(|r| r.starts_with("))"))
+                    })
+        })
+        .count();
+    computed_embeds(code) > admitted
+}
+
+/// How many embed markers in `code` (comments cut), outside literals,
+/// carry no literal path.
+fn computed_embeds(code: &str) -> usize {
     let bare = blank_literals(code);
     let markers = ["#[path", "include_str!", "include_bytes!", "include!"]
         .iter()
@@ -414,7 +455,7 @@ pub(crate) fn has_computed_embed(code: &str) -> bool {
         .iter()
         .filter(|(at, _)| bare.get(*at..).is_some_and(|r| !r.starts_with(' ')))
         .count();
-    markers > literal
+    markers.saturating_sub(literal)
 }
 
 /// `code` with the whitespace on either side of each `::` removed.
@@ -433,7 +474,7 @@ fn squeeze_paths(code: &str) -> String {
 /// Whether `code` (comments cut) holds any embed marker at all, with a
 /// literal after it or not: a file that may read another, which a nested
 /// read through `concat!` or a macro would otherwise hide.
-pub(crate) fn has_embed_marker(code: &str) -> bool {
+pub fn has_embed_marker(code: &str) -> bool {
     ["#[path", "include_str!", "include_bytes!", "include!"]
         .iter()
         .any(|marker| code.contains(marker))
@@ -445,7 +486,7 @@ pub(crate) fn has_embed_marker(code: &str) -> bool {
 /// that lands under a `td-*` directory. A literal that leaves the repository
 /// when resolved stands for the `td-*` directories it names instead, which
 /// is the wider answer.
-pub(crate) fn td_files_embedded(dir: &str, text: &str) -> Vec<String> {
+pub fn td_files_embedded(dir: &str, text: &str) -> Vec<String> {
     let code = strip_comments(text);
     let tests = cfg_test_spans(&code);
     let mut out: Vec<String> = Vec::new();
@@ -479,7 +520,7 @@ pub(crate) fn td_files_embedded(dir: &str, text: &str) -> Vec<String> {
 
 /// Whether `code` (comments cut) declares a module whose body is another
 /// file — `mod name;` — and so reads more than its own bytes.
-pub(crate) fn declares_out_of_line_module(code: &str) -> bool {
+pub fn declares_out_of_line_module(code: &str) -> bool {
     let mut from = 0usize;
     while let Some(at) = code.get(from..).and_then(|rest| rest.find("mod")) {
         let start = from.saturating_add(at);
@@ -507,7 +548,7 @@ pub(crate) fn declares_out_of_line_module(code: &str) -> bool {
 /// `rel` joined onto repository-relative directory `dir` with `.` and `..`
 /// resolved; None where the result would leave the repository or `rel` is
 /// absolute.
-pub(crate) fn normalize_join(dir: &str, rel: &str) -> Option<String> {
+pub fn normalize_join(dir: &str, rel: &str) -> Option<String> {
     if rel.starts_with('/') {
         return None;
     }
@@ -527,14 +568,14 @@ pub(crate) fn normalize_join(dir: &str, rel: &str) -> Option<String> {
 /// The body of the string literal `text` begins with: `"..."` with `\"`
 /// escapes, or a raw `r"..."` / `r#"..."#` at any hash depth. None where
 /// `text` does not begin with one, or it never closes.
-pub(crate) fn string_literal_at(text: &str) -> Option<&str> {
+pub fn string_literal_at(text: &str) -> Option<&str> {
     string_literal_span(text).map(|(body, _)| body)
 }
 
 /// `string_literal_at` with the length of the whole literal beside the
 /// body — quotes, hashes and the `r` included — for a scan that steps over
 /// it.
-pub(crate) fn string_literal_span(text: &str) -> Option<(&str, usize)> {
+pub fn string_literal_span(text: &str) -> Option<(&str, usize)> {
     if let Some(rest) = text.strip_prefix('"') {
         let mut escaped = false;
         for (i, c) in rest.char_indices() {
@@ -563,7 +604,7 @@ pub(crate) fn string_literal_span(text: &str) -> Option<(&str, usize)> {
 /// The length of the char literal `rest` begins with — `'a'`, `'\n'`,
 /// `'\''`, `'\u{1F600}'`, `'"'` — or 1 for the bare quote of a lifetime, so
 /// a scan steps over the quote either way.
-pub(crate) fn char_literal_len(rest: &str) -> usize {
+pub fn char_literal_len(rest: &str) -> usize {
     let mut chars = rest.char_indices().skip(1);
     match chars.next() {
         // The escaped character is stepped over before the closing quote is
@@ -589,7 +630,7 @@ pub(crate) fn char_literal_len(rest: &str) -> usize {
 /// scan shares. The newlines inside a cut block are kept, so line numbers
 /// hold; a block that never closes runs to the end, where the compiler
 /// would refuse it.
-pub(crate) fn strip_comments(text: &str) -> String {
+pub fn strip_comments(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut at = 0usize;
     while let Some(rest) = text.get(at..).filter(|r| !r.is_empty()) {
@@ -652,7 +693,7 @@ fn block_comment_len(rest: &str, out: &mut String) -> usize {
 /// and block comments, `code` having had its comments cut. None where
 /// `open` is not a `{` or the block never closes. For `cfg_test_spans`, and
 /// the tests that read the evaluator's own sources by module.
-pub(crate) fn block_end(code: &str, open: usize) -> Option<usize> {
+pub fn block_end(code: &str, open: usize) -> Option<usize> {
     if !code.get(open..)?.starts_with('{') {
         return None;
     }
@@ -696,15 +737,14 @@ pub(crate) fn block_end(code: &str, open: usize) -> Option<usize> {
 mod tests {
     use super::*;
 
-    // Inputs are assembled at run time: this file is under the build
-    // script's own scan, and a `td-<name>/` spelled here would read as a
-    // name of this crate's, or as a crate it names without embedding.
+    // Inputs are assembled at run time: a `td-<name>/` spelled here would
+    // read, to a scan of this file, as a crate it names or embeds.
     fn d(name: &str) -> String {
         ["td-", name, "/"].concat()
     }
 
-    // So is the builder's include scan, which refuses a composed
-    // `include_str!` path: a fixture that needs one splices this in.
+    // Likewise a composed `include_str!` spelled in a fixture, which a
+    // scan of this file would read as one: a fixture splices this in.
     const STR: &str = "include_str!";
 
     #[test]
@@ -907,8 +947,7 @@ mod tests {
     /// one, or a marker spelled inside a string, is not.
     #[test]
     fn a_computed_embed_path_is_told_apart() {
-        // Spelled apart: the builder refuses a composed include in any tree
-        // file (`stage0::every_literal_include_in_the_tree_resolves`).
+        // Spelled apart, so a scan of this file reads no composed include.
         let inc = ["include", "_str!"].concat();
         for computed in [
             format!("const A: &str = {inc}(concat!(env!(\"D\"), \"/x.mk\"));\n"),
@@ -1086,5 +1125,38 @@ mod tests {
         assert_eq!(string_literal_at("r#\"unterminated"), None);
         assert_eq!(string_literal_at("concat!(\"x\")"), None);
         assert_eq!(string_literal_at(""), None);
+    }
+
+    /// A non-ASCII character in a literal before an embed leaves its
+    /// offset in place, so the embed reads as a literal one; only a build
+    /// script's `OUT_DIR` output is a composed embed the source may hold.
+    #[test]
+    fn offsets_survive_blanking_and_out_dir_output_is_admitted() {
+        let code = "const N: &str = \"\u{2014} dash\";\nconst A: &str = include_str!(\"a.txt\");\n";
+        assert_eq!(blank_literals(code).len(), code.len());
+        assert!(!has_computed_embed(code));
+        let generated = "mod r {\n    include!(concat!(env!(\"OUT_DIR\"), \"/registry.rs\"));\n}\n";
+        assert!(has_computed_embed(generated));
+        assert!(!has_computed_embed_beyond_out_dir(generated));
+        let other = "const X: &str = include_str!(concat!(env!(\"HOME\"), \"/x\"));\n";
+        assert!(has_computed_embed_beyond_out_dir(other));
+        assert!(has_computed_embed_beyond_out_dir(&format!(
+            "{generated}{other}"
+        )));
+        // A literal spelling the form admits nothing, nor does a climb,
+        // spelled plainly or by escapes, a name not under OUT_DIR, or a
+        // second piece.
+        let spelled = "const F: &str = r#\"include!(concat!(env!(\"OUT_DIR\"), \"/x.rs\"))\"#;\n";
+        assert!(has_computed_embed_beyond_out_dir(&format!(
+            "{spelled}{other}"
+        )));
+        for odd in [
+            "include!(concat!(env!(\"OUT_DIR\"), \"/../x.rs\"));\n",
+            "include!(concat!(env!(\"OUT_DIR\"), \"/\\x2e\\x2e/x.rs\"));\n",
+            "include!(concat!(env!(\"OUT_DIR\"), \"x.rs\"));\n",
+            "include!(concat!(env!(\"OUT_DIR\"), \"/\", env!(\"X\")));\n",
+        ] {
+            assert!(has_computed_embed_beyond_out_dir(odd), "{odd}");
+        }
     }
 }

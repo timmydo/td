@@ -934,9 +934,10 @@ fn stage0_memo_hit(meta: &Path, fp: &str, store: &Path, db: &Path) -> Result<Str
     Ok(cb.to_string())
 }
 
-/// Every path an `include_str!`/`include_bytes!` in `files` names, resolved
-/// against the file that names it, keeping only those that exist (so a literal
-/// in a comment cannot invent a root).
+/// Every path an embed in `files` names (`include_str!`, `include_bytes!`,
+/// `include!` or `#[path]`, as td_engine::embed_scan reads them), resolved
+/// against the file that names it, keeping only those that exist (so a
+/// marker spelled in a string cannot invent a root).
 ///
 /// DERIVED, not listed: the recipes crate embeds TARGET-crate sources from
 /// outside `recipes/` — td-init, td-login, td-util and eight more — and a fixed
@@ -944,94 +945,40 @@ fn stage0_memo_hit(meta: &Path, fp: &str, store: &Path, db: &Path) -> Result<Str
 /// that emits yesterday's source as this build's recipe. Deriving it means a new
 /// `include_str!` is covered without anyone remembering to edit this.
 fn embedded_include_paths(files: &[PathBuf]) -> Result<Vec<String>, String> {
+    use td_engine::embed_scan::{
+        embed_literals, has_computed_embed_beyond_out_dir, production_code, strip_comments,
+    };
     let mut out = Vec::new();
     for f in files {
         let (Some(dir), Ok(text)) = (f.parent(), std::fs::read_to_string(f)) else {
             continue;
         };
-        for (_, arg) in include_args(&text) {
-            match arg {
-                // Fail CLOSED on a composed path (`concat!`/`env!`): the literal
-                // scan cannot resolve one, and dropping it silently is how a
-                // compile input escapes the fingerprint — the whole hazard here.
-                // The crate already composes an `include!` this way, so treat a
-                // nested macro as a demand to extend this, not as no input.
-                IncludeArg::Composed => {
-                    return Err(format!(
-                        "{}: an include takes a composed path, which the fingerprint scan \
-                         cannot resolve — extend include_args before using this form",
-                        f.display()
-                    ));
-                }
-                // A literal naming nothing on disk is prose (`include_str!` in
-                // a comment), not an input; canonicalize so one file reached
-                // by two spellings hashes once.
-                IncludeArg::Literal(p) => {
-                    let joined = dir.join(p);
-                    if joined.is_file() {
-                        let c = std::fs::canonicalize(&joined).unwrap_or(joined);
-                        out.push(c.to_string_lossy().into_owned());
-                    }
-                }
-                IncludeArg::Other => {}
+        // Fail CLOSED on a composed path (`concat!`/`env!`) in compiled
+        // code: the literal scan cannot resolve one, and dropping it silently
+        // is how a compile input escapes the fingerprint — the whole hazard
+        // here. A build script's OUT_DIR output is the exception: the build
+        // script and the sources it scans are roots (recipes/build.rs also
+        // lists the repo's td-* crates, which is not). Any other nested macro
+        // is a demand to extend embed_scan, not no input.
+        if has_computed_embed_beyond_out_dir(&production_code(&text)) {
+            return Err(format!(
+                "{}: an embed takes a composed path, which the fingerprint scan \
+                 cannot resolve — extend embed_scan before using this form",
+                f.display()
+            ));
+        }
+        // A literal naming nothing on disk is prose, not an input; tests'
+        // embeds only widen. Canonicalize so one file reached by two
+        // spellings hashes once.
+        for (_, p) in embed_literals(&strip_comments(&text)) {
+            let joined = dir.join(p);
+            if joined.is_file() {
+                let c = std::fs::canonicalize(&joined).unwrap_or(joined);
+                out.push(c.to_string_lossy().into_owned());
             }
         }
     }
     Ok(out)
-}
-
-/// One `include_str!`/`include_bytes!` argument in Rust source text.
-#[derive(Debug, PartialEq)]
-enum IncludeArg<'a> {
-    /// A string literal, plain or raw: the path as written.
-    Literal(&'a str),
-    /// A macro call (`concat!`, `env!`), which a literal scan cannot resolve.
-    Composed,
-    /// Neither: the macro named in prose, or inside another literal.
-    Other,
-}
-
-/// Every `include_str!`/`include_bytes!` in `text`, by byte offset, with its
-/// argument. Whitespace and the opening parenthesis are skipped however the
-/// call is wrapped, so rustfmt's `include_str!(\n    "path"\n)` reads as
-/// the one-line form. The evaluator's fingerprint scan and the builder's
-/// embed guard both read embeds through this one reader.
-fn include_args(text: &str) -> Vec<(usize, IncludeArg<'_>)> {
-    let mut out = Vec::new();
-    for mac in ["include_str!", "include_bytes!"] {
-        for (at, _) in text.match_indices(mac) {
-            let after = text.get(at + mac.len()..).unwrap_or("");
-            let arg = after.trim_start_matches(|c: char| c == '(' || c.is_whitespace());
-            let ident = arg
-                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-                .unwrap_or(arg.len());
-            // `r"…"` or `r#"…"#`: the body and the closing delimiter.
-            let raw = arg.strip_prefix('r').and_then(|r| {
-                let body = r.trim_start_matches('#');
-                let hashes = r.len() - body.len();
-                Some((body.strip_prefix('"')?, format!("\"{}", "#".repeat(hashes))))
-            });
-            fn literal<'a>(body: &'a str, close: &str) -> IncludeArg<'a> {
-                body.find(close)
-                    .and_then(|end| body.get(..end))
-                    .map_or(IncludeArg::Other, IncludeArg::Literal)
-            }
-            let found = if let Some(body) = arg.strip_prefix('"') {
-                literal(body, "\"")
-            } else if let Some((body, close)) = raw {
-                literal(body, &close)
-            } else if arg.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
-                && arg.get(ident..ident + 1) == Some("!")
-            {
-                IncludeArg::Composed
-            } else {
-                IncludeArg::Other
-            };
-            out.push((at, found));
-        }
-    }
-    out.sort_by_key(|(at, _)| *at);
-    out
 }
 
 /// The evaluator's compile inputs — the mirror of the stage0 roots below, with
@@ -2206,55 +2153,41 @@ mod tests {
         assert_ne!(before, builder_source_fingerprint(&d).unwrap());
     }
 
-    /// Where `text`'s inline test module starts: the first column-0
-    /// `#[cfg(test)]` whose item, past further attributes, is `mod NAME {`.
-    /// What follows it is not compiled into the placed builder.
-    fn test_module_start(text: &str) -> usize {
-        let mut at = 0;
-        let mut lines = text.split_inclusive('\n');
-        while let Some(line) = lines.next() {
-            if line.trim_end() == "#[cfg(test)]" {
-                let mut rest = lines.clone();
-                let item = rest.find(|l| !l.starts_with("#["));
-                if item.is_some_and(|l| l.starts_with("mod ") && l.trim_end().ends_with('{')) {
-                    return at;
-                }
-            }
-            at += line.len();
-        }
-        text.len()
-    }
-
-    /// Every embed in builder/src's and engine/src's production code, read
-    /// through `include_args` as the evaluator's scan reads them, as the
-    /// repo-relative path of each literal that resolves, and an error for
-    /// each composed one.
+    /// Every embed in `text`'s production code (its comments cut and its
+    /// `#[cfg(test)]` modules blanked, wherever they sit), read through
+    /// embed_scan as the evaluator's scan reads them: the repo-relative
+    /// path of each literal, and an error for one that does not resolve or
+    /// a composed one.
     fn production_embeds(repo: &Path, file: &Path, text: &str) -> Vec<Result<String, String>> {
-        let production = text.get(..test_module_start(text)).unwrap();
-        include_args(production)
+        use td_engine::embed_scan::{
+            embed_literals, has_computed_embed_beyond_out_dir, production_code,
+        };
+        let code = production_code(text);
+        let mut out: Vec<Result<String, String>> = embed_literals(&code)
             .into_iter()
-            .filter_map(|(at, arg)| match arg {
-                IncludeArg::Composed => Some(Err(format!(
-                    "{}: composed include at byte {at}",
-                    file.display()
-                ))),
-                IncludeArg::Literal(p) => {
-                    let path = std::fs::canonicalize(file.parent().unwrap().join(p)).ok()?;
-                    Some(Ok(path
-                        .strip_prefix(repo)
-                        .unwrap()
-                        .to_string_lossy()
-                        .into_owned()))
-                }
-                IncludeArg::Other => None,
+            .map(|(_, p)| {
+                let joined = file.parent().unwrap().join(&p);
+                std::fs::canonicalize(&joined)
+                    .map(|path| {
+                        path.strip_prefix(repo)
+                            .unwrap()
+                            .to_string_lossy()
+                            .into_owned()
+                    })
+                    .map_err(|e| format!("{}: {p} does not resolve: {e}", file.display()))
             })
-            .collect()
+            .collect();
+        if has_computed_embed_beyond_out_dir(&code) {
+            out.push(Err(format!("{}: composed embed", file.display())));
+        }
+        out
     }
 
-    /// Every file builder/src or engine/src embeds outside its inline test
-    /// module lies under a fingerprint root, however the call is wrapped;
-    /// a composed include there fails closed, since its input cannot be
-    /// named. A new production embed must join BUILDER_FP_ROOTS.
+    /// Every file builder/src or engine/src embeds outside its test modules
+    /// (`include_str!`, `include_bytes!`, `include!` or `#[path]`, in any
+    /// delimiter and however wrapped) lies under a fingerprint root; a
+    /// composed embed there fails closed, since its input cannot be named.
+    /// A new production embed must join BUILDER_FP_ROOTS.
     #[test]
     fn every_builder_embed_is_fingerprinted() {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
@@ -2295,29 +2228,33 @@ mod tests {
         }
     }
 
-    /// The embed reader skips rustfmt's wrapping, reads raw literals, and
-    /// tells a composed path from prose; an inline test module's embeds
-    /// are not production ones.
+    /// The guard reads embeds as embed_scan does: wrapped by rustfmt, in
+    /// any delimiter, raw, and in production code that follows a test
+    /// module, while the test module's own embeds and prose are skipped and
+    /// a composed path fails closed.
     #[test]
-    fn include_args_reads_wrapped_raw_and_composed_forms() {
-        let text = "const A: &str = include_str!(\n    \"../a.txt\"\n);\n\
-                    const B: &[u8] = include_bytes!( r#\"b\"c\"# );\n\
-                    const C: &str = include_str!(concat!(env!(\"X\"), \"/c\"));\n\
+    fn production_embeds_follow_wrapping_delimiters_and_code_after_tests() {
+        let d = scratch("production-embeds");
+        for name in ["a.txt", "b.txt", "c.txt", "t.txt"] {
+            std::fs::write(d.join(name), name).unwrap();
+        }
+        let file = d.join("x.rs");
+        let text = "const A: &str = include_str!(\n    \"a.txt\"\n);\n\
+                    #[cfg(test)]\nmod tests {\n    const T: &str = include_str!(\"t.txt\");\n}\n\
+                    const B: &[u8] = include_bytes!{ r#\"b.txt\"# };\n\
+                    const C: &str = include_str![\"c.txt\"];\n\
                     // `include_str!`'d into the recipe\n";
-        let args: Vec<IncludeArg> = include_args(text).into_iter().map(|(_, a)| a).collect();
-        assert_eq!(
-            args,
-            [
-                IncludeArg::Literal("../a.txt"),
-                IncludeArg::Literal("b\"c"),
-                IncludeArg::Composed,
-                IncludeArg::Other,
-            ]
-        );
-        let split = "fn a() {}\n#[cfg(test)]\n#[allow(x)]\nmod tests {\n}\n";
-        assert_eq!(test_module_start(split), "fn a() {}\n".len());
-        let gated_item = "#[cfg(test)]\nfn helper() {}\n";
-        assert_eq!(test_module_start(gated_item), gated_item.len());
+        let d = std::fs::canonicalize(&d).unwrap();
+        let mut got: Vec<String> = production_embeds(&d, &d.join("x.rs"), text)
+            .into_iter()
+            .map(Result::unwrap)
+            .collect();
+        got.sort();
+        assert_eq!(got, ["a.txt", "b.txt", "c.txt"]);
+        let composed = "const C: &str = include_str!(concat!(env!(\"X\"), \"/c\"));\n";
+        assert!(production_embeds(&d, &file, composed)
+            .iter()
+            .any(Result::is_err));
     }
 
     /// The evaluator's fingerprint must follow `include_str!` OUT of recipes/:

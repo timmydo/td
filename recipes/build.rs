@@ -33,9 +33,11 @@ use std::path::{Path, PathBuf};
 #[allow(dead_code)]
 mod sha256;
 
-// The two scans over this crate's sources, kept in the library so its tests
-// cover them: a build script has no tests of its own.
-#[path = "src/embed_scan.rs"]
+// The two scans over this crate's sources, from the engine's source file as
+// sha256 is above: the engine's tests cover them, and td-builder reads
+// embeds through the same scanner, which uses parts this script does not.
+#[path = "../engine/src/embed_scan.rs"]
+#[allow(dead_code)]
 mod embed_scan;
 use embed_scan::{
     declares_out_of_line_module, embed_literals, has_computed_embed, has_embed_marker,

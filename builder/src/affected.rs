@@ -9657,7 +9657,7 @@ mod tests {
             "recipes/Cargo.toml",
             "recipes/Cargo.lock",
             "recipes/src/catalog.rs",
-            "recipes/src/embed_scan.rs",
+            "engine/src/embed_scan.rs",
             "recipes/src/fixtures/test.rs",
             "recipes/locks/uutils/Cargo.lock",
             "recipes/src/recipes/nested/td-boot.rs",

@@ -986,7 +986,7 @@ mod named_dirs_tests {
     /// (`no_recipe_check_runs_a_boot_harness`), so no check scope is owed.
     #[test]
     fn the_evaluator_embeds_crate_files_only_in_its_test_modules() {
-        use crate::embed_scan::{block_end, strip_comments};
+        use td_engine::embed_scan::{block_end, strip_comments};
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let root = manifest
             .parent()
