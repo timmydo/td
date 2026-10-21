@@ -9,8 +9,9 @@
 )] // grandfathered: the merged applets pre-date the rust-lint rules (AGENTS.md). These
    // network tools are not linted in the loop (the cargo-test gate's clippy leg covers only
    // the dependency-free engine crates); the [lints] table still guards new unsafe (forbid)
-   // and enforces under a local `cargo clippy`. The crate-level allow covers every applet
-   // module — the former per-file headers of fetch/feed/subst folded into this one.
+   // and enforces under a local `cargo clippy`. The allow folds the former per-file headers
+   // of fetch/feed/subst into this one. test_https is new and re-denies these lints at its
+   // top; with no clippy leg for this crate, a local `cargo clippy` is what enforces that.
 
 // td-net — td's OWN network tools as ONE multicall (busybox-style) control-plane binary,
 // merging the former fetch/ (td-fetch), feed/ (td-feed), and subst/ (td-subst) crates.
@@ -40,6 +41,7 @@ mod launch;
 mod ostree;
 mod sig;
 mod subst;
+mod test_https;
 #[cfg(test)]
 #[path = "../../td-fs/src/temp_dir.rs"]
 mod test_temp;
@@ -108,6 +110,7 @@ fn main() {
         "td-fetchd" => fetchd::run(&args),
         "td-egressd" => egress::run(&args),
         "td-launch" => launch::run(&args),
+        "td-test-https" => test_https::run(&args),
         // An application's name, linked to this binary: that application,
         // beside this binary, with a fetch service of its own (launch.rs).
         _ if launch::launches(std::ffi::OsStr::new(base)).is_some() => {
@@ -125,11 +128,12 @@ fn main() {
                 Some("fetchd") => "td-fetchd",
                 Some("egressd") => "td-egressd",
                 Some("launch") => "td-launch",
+                Some("test-https") => "td-test-https",
                 _ => {
                     eprintln!(
-                        "usage: td-net <fetch|feed|subst|deploy|fetchd|egressd|launch> ...\n  \
+                        "usage: td-net <fetch|feed|subst|deploy|fetchd|egressd|launch|test-https> ...\n  \
                          (or invoke via the td-fetch / td-feed / td-subst / td-deploy / \
-                         td-fetchd applet links)"
+                         td-fetchd / td-test-https applet links)"
                     );
                     std::process::exit(2);
                 }
@@ -144,6 +148,7 @@ fn main() {
                 "td-fetchd" => fetchd::run(&argv),
                 "td-egressd" => egress::run(&argv),
                 "td-launch" => launch::run(&argv),
+                "td-test-https" => test_https::run(&argv),
                 _ => subst::run(&argv),
             }
         }

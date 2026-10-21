@@ -550,10 +550,13 @@ console=yes
 ```
 
 The image's concrete table additionally orders `portal-evidence` after the
-QEMU-only TLS setup one-shot (without requiring it). LibreSSL's key generator
-writes raw dot progress to the shared console without line framing; waiting
-for it to settle lets td-svc's single-write `portal-evidence:` prefix remain
-an exact attributable line. This edge does not couple portal health to TLS.
+QEMU-only TLS setup one-shot (without requiring it), as it orders every
+exact-line evidence unit. On its failure path that one-shot still writes to
+the shared console without line framing (`set -eu`'s shell diagnostics,
+td-netd or td-test-https errors); waiting for it to settle lets td-svc's
+single-write `portal-evidence:` prefix remain an exact attributable line.
+The edges stay until QEMU evidence shows they can go. This edge does not
+couple portal health to TLS.
 
 `busd` needs its broker-owned `/run/td-bus/1000` runtime, published by
 firstboot after durable identity enrollment. Settings and the denied
@@ -1650,12 +1653,13 @@ and, only under the QEMU oracle's exact `td.autotest=1` kernel token, passes it
 a fixed HTTPS document whose full-viewport background has equal solid panels
 of exact RGB `#ff00ff` on the left and `#00ff00` on the right. A trusted root
 one-shot mints an ephemeral CA and localhost server identity, writes the exact
-certificate-install policy and document under `/run`, and a source-built
-LibreSSL command serves the document. The uid-1000 one-shot writes only the
-fresh automation profile into the application's private volatile runtime
-directory. td-jail binds that directory at `/run/user/1000/td-app`, admits the
-complete root-owned CA/policy pair into Firefox's synthetic immutable `/etc`,
-and Firefox receives the exact profile and `https://localhost:8443` URL.
+certificate-install policy and document under `/run`, and td-net's
+`td-test-https` applet serves the document over rustls. The uid-1000
+one-shot writes only the fresh automation profile into the application's
+private volatile runtime directory. td-jail binds that directory at
+`/run/user/1000/td-app`, admits the complete root-owned CA/policy pair into
+Firefox's synthetic immutable `/etc`, and Firefox receives the exact profile
+and `https://localhost:8443` URL.
 
 The profile carries only Mozilla's own
 `browser.preonboarding.enabled=false` and
@@ -7306,12 +7310,15 @@ and image commits — showing:
    automated support snapshot together with item 4's sandbox evidence**;
 6. one HTTPS page loading and rendering — served by a **declared
    in-guest TLS origin**, not from the public internet: a fixture server
-   on the guest uses the source-built static LibreSSL command. A trusted
-   autotest-only boot service mints a one-day CA and localhost server
-   identity under `/run`; neither private key nor certificate survives the
-   boot or enters a recipe output. Before minting it, the same privileged
-   service runs td-netd's DHCP-free loopback operation, so origin readiness
-   has an explicit localhost dependency and does not wait for a NIC. `td-jail`
+   on the guest is td-net's `td-test-https` applet, rustls with ring as
+   the crate's existing reviewed closure already links. A trusted
+   autotest-only boot service runs its `mint`, which generates a one-day
+   ECDSA P-256 CA and localhost server identity under `/run`; the CA's
+   private key exists only inside that process, and neither the server's
+   key nor any certificate survives the boot or enters a recipe output.
+   Before minting it, the same privileged service runs td-netd's DHCP-free
+   loopback operation, so origin readiness has an explicit localhost
+   dependency and does not wait for a NIC. `td-jail`
    admits the exact root-owned,
    mode-0444 CA/policy pair only for Firefox and only when its own bounded
    `/proc/cmdline` parser sees the exact `td.autotest=1` token, revalidates
@@ -7334,8 +7341,7 @@ and image commits — showing:
    starts, its readiness probe independently validates the same origin with
    the generated CA and refuses a failed chain. A Firefox that rendered with
    verification off would prove nothing about the part that could plausibly be
-   broken by confinement. LibreSSL 4.3.2's `s_server -accept` accepts a port
-   but no bind address, so the fixture listener binds every guest interface.
+   broken by confinement. The fixture listener binds IPv4 loopback only.
    `td.autotest=1` is an internal harness mode and is unsupported on a physical
    or otherwise attached machine: the system oracle uses `-nic none`, while
    the one network oracle uses the exact QEMU user-mode NAT backend with no
@@ -7693,7 +7699,7 @@ Each row is one landing or a small family, leaving the tree green.
 | 26 | **`td-audio` PulseAudio protocol and daemon — LANDED**: frames, tagstruct codec, the captured command table, session state machine and daemon serve `/run/td-audio/native`; `getsockopt(2)`/`SO_PEERCRED` joins surface #13. Permanent fixtures replay the captured schemas, mix two socket clients, and prove exact PCM through the session state machine. A one-time libpulse 16.1 run established compatibility; rung 26a selects the daemon into the image and rung 27h carries the Firefox-to-WAV proof | captured Pulse traffic plays through the bounded daemon and mixer without making the one-time host libpulse run a permanent gate |
 | 26a | **system and jail audio integration — LANDED**: `td-login` has an exact service-only credential path for the locked audio account; `td-seatd` assigns only ALSA playback PCMs to it; and td-svc starts the daemon after seat setup, probes its live socket as that identity, and orders Firefox behind that result. Every daemon start repeats the bounded playback-node assignment before dropping privilege, so a device that appeared after the seat oneshot is covered. Firefox's compiled `sockets=pulseaudio` policy derives the exact server/config environment. td-jail validates the owned server runtime and endpoint, then bind-mounts the stable directory read-only behind the private `/run/flatpak/pulse/native` alias. Replacement of a stale socket after a supervised daemon restart is therefore visible to existing clients instead of leaving their jail pinned to the dead inode; a missing mandatory runtime or endpoint still refuses launch rather than silently dropping the grant. Normal-system and interactive QEMU plans attach one explicit HDA codec to a host-silent backend; rung 27h changes only the deterministic physical-input boot to a bounded WAV capture | the system image can start Firefox against its mediated audio server without exposing ALSA devices to the browser |
 | 27 | **Firefox policy, first-window and deterministic offline-content image proof — LANDED**; browser-scale compositor admission bounds retained shm resources, copied surface bytes, output-relative commits, synchronized caches, callbacks and deferred releases without raising the 512-object ceiling. The initial proof selected a fresh volatile automation profile and fixed local document, then accepted only an app-id-matched buffer with the bounded exact background-pixel region after a comparison render attributed both colors in the successfully rendered output to that same surface, a process with Firefox's exact `-contentproc` argv token revalidated in the same cgroup, and a validated per-client high-water record. Rung 27a retains that authority and replaces the local-file transport with verified HTTPS. The profile uses Mozilla's test-only pre-onboarding bypass and is never selected on an ordinary boot. The broader §H workload remains the authority for later tuning | Firefox starts, creates its content-role process and paints deterministic content without manual inspection |
-| 27a | **Firefox HTTPS/NSS image proof — LANDED**; the source-built LibreSSL command supplies a guest-local TLS origin. The exact autotest boot brings up loopback without waiting for DHCP, then mints an ephemeral CA and localhost leaf under `/run`; td-jail's own exact boot-token gate admits only the complete root-owned mode-0444 CA and exact Firefox `Certificates.Install` policy pair, binds them into the immutable synthetic `/etc`, and Firefox imports that CA into its fresh test profile. The independently chain-verified origin serves the sentinel document, and the existing same-cgroup, resource and framebuffer attribution gates emit `TD-FIREFOX-HTTPS-CONTENT-READY` only after Firefox paints it. Ordinary boots have no fixture CA, policy, profile or origin. The all-interface LibreSSL test listener is supported only inside the pinned NIC-less or inbound-unreachable QEMU harness, never on a physical/attached autotest boot | Firefox's NSS and TLS path accepts a verified certificate and paints an HTTPS page without manual inspection |
+| 27a | **Firefox HTTPS/NSS image proof — LANDED**; td-net's rustls `td-test-https` applet supplies a guest-local TLS origin. The exact autotest boot brings up loopback without waiting for DHCP, then mints an ephemeral CA and localhost leaf under `/run`; td-jail's own exact boot-token gate admits only the complete root-owned mode-0444 CA and exact Firefox `Certificates.Install` policy pair, binds them into the immutable synthetic `/etc`, and Firefox imports that CA into its fresh test profile. The independently chain-verified origin serves the sentinel document, and the existing same-cgroup, resource and framebuffer attribution gates emit `TD-FIREFOX-HTTPS-CONTENT-READY` only after Firefox paints it. Ordinary boots have no fixture CA, policy, profile or origin. The loopback-only test listener and the autotest token are supported only inside the pinned NIC-less or inbound-unreachable QEMU harness, never on a physical/attached autotest boot | Firefox's NSS and TLS path accepts a verified certificate and paints an HTTPS page without manual inspection |
 | 27b | **Firefox renderer and nested-sandbox image proof — LANDED**; only the volatile QEMU profile enables Firefox's loopback-only Marionette server and privileged system access. A bounded protocol client runs one fixed browser-context script, validates Firefox's own `Troubleshoot.snapshot()` Wayland, Software WebRender and fallback level-6 sandbox facts, then maps Firefox's namespace-PID role report back to revalidated members of its active cgroup. Every reported live role must show no-new-privileges, seccomp mode 2 and at least two stacked filters; content, socket and one RDD or typed media-utility role are mandatory while the separate GPU role is conditional on Firefox creating it under Software WebRender. The independent `TD-FIREFOX-SUPPORT-READY` line is mandatory boot evidence; ordinary launches expose no remote-control listener | Firefox's own renderer and inner process sandboxes are proved without manual `about:support` inspection |
 | 27c | **Firefox physical-input image proof — LANDED**; the first system boot uses a bounded private QMP controller, the already enumerated virtio tablet, and the PC machine's PS/2 keyboard, while staged Firefox content/chrome probes and a compositor-owned cursor marker independently attest the semantic results. Because host QMP acknowledgements do not order those separate guest devices, the host sends one tablet position, waits for Firefox's compositor-observed cursor, sends a second in-window position, and withholds the key until a bounded content stage observes a trusted motion event targeting the test input in that second position's fixed surface-local X band plus document and input focus. The proof-only transparent input spans the content viewport vertically, so its target identity proves the point is web content without guessing Firefox's internal chrome offset. It then physically clicks that attested input point to establish compositor keyboard focus before typing. The remaining handshake proves typing, scrolling, native right-click menu opening, outside-click dismissal, and a painted Firefox cursor without sleeps or manual observation. The test page retains the authenticated magenta/lime framebuffer sentinel and adds only that fixed input, scroll extent, and cursor style | the supported Firefox path accepts real emulated input end to end; rung 27d extends the same handshake across clipboard paste |
 | 27d | **Firefox clipboard image proof — LANDED**; after the physical menu proof, the same marker-driven QMP controller waits for td-term's focus acknowledgement, clears its prompt, physically types `Welcome`, and waits until td-term attests the visible word's settled live grid and cell coordinates. It drags those exact cells, waits for a second marker proving the highlighted frame is visible, injects the terminal-owned copy chord, waits for `TD-TERM-CLIPBOARD-READY bytes=7`, then focuses Firefox and, once the clipboard stage's own browser-chrome session announces that it is open, injects `Control+L`. If the URL bar has not taken focus within one bounded wait, that session publishes an ordered exact retry marker and waits again; the host consumes them only while awaiting URL-bar arm and injects at most two additional physical `Control+L` chords; a third lapse is terminal, and the input unit announces it. One continuous bounded privileged browser-chrome session emits `TD-FIREFOX-CLIPBOARD-ARMED` only after the URL bar reports focused with its old value selected, then remains live while that gate admits physical `Control+V`. A second paste command is admitted by one exact retry marker only when the first boundary exposes no nonempty paste data and leaves that URL unchanged. Firefox may expose an empty `DataTransfer` while its default action consumes the asynchronous Wayland transfer, so the final gate accounts delayed insertions through the URL value: every nonempty event must be exact `Welcome`, the URL must be one or more exact `Welcome` copies no greater than the paste-event count, and an event that exposes exact data must have a corresponding final copy. The two paste commands plus eight total events are hard bounds. A separate Shift tap ends each paste command, and Firefox must observe its ordered keyup before classifying its batch, so success cannot precede an unobserved chord. The input unit completes only after that browser record and td-term's exact-payload transfer record. The proof-only terminal scan, markers and repeat suppression require the exact input-test boot token. Unit tests pin all QMP commands and marker gates; the full-system QEMU boot is the end-to-end authority | core selection crosses from td-term to Firefox without manual testing |

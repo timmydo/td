@@ -1429,7 +1429,9 @@ mod svc_timeouts {
     /// bound plus the explicit 10-second low-speed transfer bound. Keep the service
     /// above twice that reviewed 336-second worst case.
     pub const NETUP: u32 = 700;
-    /// Mints one RSA test authority and one server identity in the slow VM.
+    /// Brings up loopback and mints one P-256 test authority and server
+    /// identity in the slow VM; ECDSA keys take milliseconds, the rest is
+    /// headroom.
     pub const FIREFOX_TLS_SETUP: u32 = 120;
     /// One bounded sleep, then one cgroup read through td-jail's probe.
     pub const APPLICATION_EVIDENCE: u32 = 60;
@@ -1768,10 +1770,12 @@ fn build_td_svc_conf() -> String {
          # the exact live Settings, Request and unsupported-portal exchanges\n\
          # with console output, making routing, reply, directed-signal and\n\
          # refusal QEMU evidence rather than a startup assertion.\n\
-         # Wait for TLS setup because its key generator writes raw progress to\n\
-         # the console without line framing; once it settles, td-svc's one-write\n\
-         # service prefix is an attributable exact line. This is ordering only:\n\
-         # TLS setup is deliberately not required by portal evidence.\n\
+         # Wait for TLS setup: on its failure path it writes to the console\n\
+         # unframed (set -eu's shell diagnostics, td-netd or td-test-https\n\
+         # errors), so once it has settled td-svc's one-write service prefix\n\
+         # is an attributable exact line, as for every exact-line evidence\n\
+         # unit. The edges stay until QEMU evidence shows they can go. This is\n\
+         # ordering only: TLS setup is not required by portal evidence.\n\
          # td-recipe-eval requires exact {portal_runtime_marker},\n\
          # {portal_request_runtime_marker}, and\n\
          # {portal_unavailable_runtime_marker} lines.\n\
@@ -1857,7 +1861,7 @@ fn build_td_svc_conf() -> String {
          timeout={application_place}\n\
          \n\
          # Mail causes the portal credential receipt. Wait for TLS setup\n\
-         # so its unframed progress dots cannot split that console marker.\n\
+         # so its failure-path console text cannot split that marker.\n\
          [mail]\n\
          type=daemon\n\
          cgroup=session\n\
@@ -1875,8 +1879,9 @@ fn build_td_svc_conf() -> String {
          # the configuration td-firstboot provisioned and did not exit on it.\n\
          # requires= keeps a window whose readiness failed from being probed\n\
          # at all. The marker is one exact console line, so the probe waits for\n\
-         # TLS setup as the portal evidence does: its progress dots would\n\
-         # otherwise prefix it. Mutable user state cannot block bootsuccess.\n\
+         # TLS setup as the portal evidence does, so that one-shot's\n\
+         # failure-path console text cannot prefix it. Mutable user state\n\
+         # cannot block bootsuccess.\n\
          [mail-evidence]\n\
          type=oneshot\n\
          unless-exists={live_medium}\n\
@@ -1941,8 +1946,8 @@ fn build_td_svc_conf() -> String {
          # holding the keyboard. The compositor's session is prepared, and with\n\
          # it the setup intake bound, before its display listener exists. Its\n\
          # evidence lines are exact console lines, so it waits for TLS setup\n\
-         # as the other evidence does: the key generator's dots would split\n\
-         # them. It\n\
+         # as the other evidence does, so that one-shot's failure-path\n\
+         # console text cannot split them. It\n\
          # runs as its own service identity, unjailed and without disk\n\
          # authority, and reaches root's installation service only through\n\
          # td-authd's setup intake, which admits that identity alone. An\n\
@@ -1971,7 +1976,7 @@ fn build_td_svc_conf() -> String {
          requires=setup\n\
          timeout={application_place}\n\
          \n\
-         # The HTTPS origin uses a source-built TLS implementation. Setup mints\n\
+         # The HTTPS origin is td-net's rustls applet, td-test-https. Setup mints\n\
          # an ephemeral CA plus localhost identity under /run; the root-owned CA\n\
          # and exact policy are the only two extra files td-jail will admit into\n\
          # Firefox's synthetic /etc. Ordinary boots create neither file.\n\
@@ -3983,9 +3988,10 @@ fn profiler_application_roots(sys: &SystemDef) -> String {
     table
 }
 
-/// QEMU-only trusted setup for Firefox's real NSS/TLS proof. The authority,
-/// server identity and policy live on `/run`, so neither the CA nor its private
-/// key survives a boot or enters the installed browser's ordinary profile.
+/// QEMU-only trusted setup for Firefox's real NSS/TLS proof. The authority's
+/// certificate, server identity and policy live on `/run`, so none survives a
+/// boot or enters the installed browser's ordinary profile; the authority's
+/// private key never leaves `td-test-https mint`.
 fn build_firefox_tls_setup() -> String {
     format!(
         "#!/bin/sh\n\
@@ -3997,35 +4003,9 @@ fn build_firefox_tls_setup() -> String {
          /bin/td-netd loopback\n\
          root={root}\n\
          origin={origin}\n\
-         openssl=/bin/openssl\n\
-         OPENSSL_CONF=\"$root/openssl.cnf\"\n\
-         export OPENSSL_CONF\n\
          umask 077\n\
          /bin/mkdir -p \"$origin\"\n\
-         /bin/td-util printf '%s\\n' \
-           '[req]' \
-           'distinguished_name=dn' \
-           '[dn]' \
-           '[server]' \
-           'basicConstraints=critical,CA:FALSE' \
-           'keyUsage=critical,digitalSignature,keyEncipherment' \
-           'extendedKeyUsage=serverAuth' \
-           'subjectAltName=DNS:localhost,IP:127.0.0.1' \
-           > \"$OPENSSL_CONF\"\n\
-         \"$openssl\" req -new -x509 -newkey rsa:2048 -nodes -sha256 -days 1 \
-           -config \"$OPENSSL_CONF\" \
-           -set_serial 1 -subj '/CN=td Firefox autotest CA' \
-           -addext 'basicConstraints=critical,CA:TRUE' \
-           -addext 'keyUsage=critical,keyCertSign,cRLSign' \
-           -keyout \"$root/ca.key\" -out \"$root/ca.pem\"\n\
-         \"$openssl\" req -new -newkey rsa:2048 -nodes \
-           -config \"$OPENSSL_CONF\" \
-           -subj '/CN=localhost' -keyout \"$root/server.key\" \
-           -out \"$root/server.csr\"\n\
-         \"$openssl\" x509 -req -in \"$root/server.csr\" \
-           -CA \"$root/ca.pem\" -CAkey \"$root/ca.key\" -set_serial 2 \
-           -sha256 -days 1 -extfile \"$OPENSSL_CONF\" -extensions server \
-           -out \"$root/server.pem\"\n\
+         /bin/td-test-https mint \"$root\"\n\
          /bin/td-util printf '%s\\n' '{policy}' > \"$root/policies.json\"\n\
          /bin/td-util printf '%s\\n' '{document}' > \"$origin/content.html\"\n\
          /bin/td-util printf '%s\\n' '{soak_document}' > \"$origin/content-alt.html\"\n\
@@ -4082,11 +4062,8 @@ fn build_firefox_tls_setup() -> String {
     )
 }
 
-/// LibreSSL's `-accept` grammar takes only a port, so this listens on all guest
-/// interfaces. The autotest harness uses either `-nic none` or exact QEMU
-/// user-mode NAT without host forwarding; the token is unsupported elsewhere.
-/// `s_server` discards its accept-loop result, so any return is translated to a
-/// service failure; a requested stop is classified separately by td-svc.
+/// The guest-local origin listens on IPv4 loopback only. `serve` returns only
+/// on a setup error, and exec makes its exit the service's.
 fn build_firefox_tls_origin() -> String {
     format!(
         "#!/bin/sh\n\
@@ -4095,13 +4072,8 @@ fn build_firefox_tls_origin() -> String {
          *\" {autotest} \"*) :;;\n\
          *) exit 0;;\n\
          esac\n\
-         OPENSSL_CONF=/dev/null\n\
-         export OPENSSL_CONF\n\
-         cd {origin}\n\
-         /bin/openssl s_server \
-           -accept 8443 -cert {root}/server.pem -key {root}/server.key \
-           -WWW -quiet\n\
-         exit 1\n",
+         exec /bin/td-test-https serve --listen 127.0.0.1:8443 \
+           --cert {root}/server.pem --key {root}/server.key --root {origin}\n",
         autotest = AUTOTEST_CMDLINE_TOKEN,
         origin = FIREFOX_TLS_ORIGIN,
         root = FIREFOX_TLS_ROOT,
@@ -4116,14 +4088,9 @@ fn build_firefox_tls_ready() -> String {
          *\" {autotest} \"*) :;;\n\
          *) exit 0;;\n\
          esac\n\
-         OPENSSL_CONF=/dev/null\n\
-         export OPENSSL_CONF\n\
-         /bin/td-util printf 'GET /content.html HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n' | \
-           /bin/openssl s_client \
-             -connect 127.0.0.1:8443 -servername localhost \
-             -CAfile {root}/ca.pem -verify 5 -verify_return_error \
-             -quiet 2>/dev/null | \
-           /bin/grep 'TD-FIREFOX-HTTPS-CONTENT-V1' >/dev/null\n",
+         exec /bin/td-test-https probe --connect 127.0.0.1:8443 \
+           --server-name localhost --ca {root}/ca.pem \
+           --path /content.html --expect TD-FIREFOX-HTTPS-CONTENT-V1\n",
         autotest = AUTOTEST_CMDLINE_TOKEN,
         root = FIREFOX_TLS_ROOT,
     )
@@ -4741,17 +4708,6 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
         ),
         link: format!("{{root}}/real-root/bin/{}", td_boot_protocol::CRYPTSETUP),
     });
-    // The QEMU HTTPS origin needs only LibreSSL's static command and its debug
-    // companion. Keep the development archives and headers out of the image.
-    steps.push(Step::MkDir {
-        path: "{root}/real-root{in:libressl-x86-64}".into(),
-    });
-    for child in ["bin", "lib/debug"] {
-        steps.push(Step::CopyTree {
-            from: format!("{{in:libressl-x86-64}}/{child}"),
-            dest: format!("{{root}}/real-root{{in:libressl-x86-64}}/{child}"),
-        });
-    }
     // Stage the dynamically linked userland and every transitively referenced store item
     // at its canonical absolute path. uutils, ripgrep, fd and OpenSSH pull their
     // td glibc closures. The engine admits only direct recipe inputs, so a Rust bootstrap
@@ -4823,7 +4779,6 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
             "{in:git-x86-64}/bin/git-upload-archive",
         ),
         ("git-upload-pack", "{in:git-x86-64}/bin/git-upload-pack"),
-        ("openssl", "{in:libressl-x86-64}/bin/openssl"),
     ] {
         steps.push(Step::Symlink {
             target: target.into(),
@@ -4950,6 +4905,12 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
     steps.push(Step::Symlink {
         target: "{in:td-net}/bin/td-net".into(),
         link: "{root}/real-root/bin/td-deploy".into(),
+    });
+    // /bin/td-test-https — the QEMU-only Firefox HTTPS origin's mint, server
+    // and readiness probe (APPLICATIONS.md §B.8 item 6).
+    steps.push(Step::Symlink {
+        target: "{in:td-net}/bin/td-net".into(),
+        link: "{root}/real-root/bin/td-test-https".into(),
     });
     steps.push(Step::Symlink {
         target: "{in:td-portal}/bin/td-portal".into(),
@@ -5288,6 +5249,8 @@ fn shape_check() -> String {
      tdbusd=\"{root}/real-root{in:td-busd}/bin/td-busd\"; { [ -f \"$tdbusd\" ] && [ -x \"$tdbusd\" ]; } || { echo 'root tree: td-busd is not packed/executable at real-root{in:td-busd}/bin/td-busd - the /bin/td-busd symlink would dangle' >&2; exit 1; }; \
      [ \"$(readlink \"$root/bin/td-fetchd\" 2>/dev/null)\" = \"{in:td-net}/bin/td-net\" ] || { echo 'root tree: /bin/td-fetchd is not a symlink to the staged td-net multicall - the fetchd unit names it in full, so this is the only thing standing between that unit and exec-ing nothing' >&2; exit 1; }; \
      [ \"$(readlink \"$root/bin/td-feed\" 2>/dev/null)\" = \"{in:td-net}/bin/td-net\" ] || { echo 'root tree: /bin/td-feed must select the shipped source consumer' >&2; exit 1; }; \
+     [ \"$(readlink \"$root/bin/td-test-https\" 2>/dev/null)\" = \"{in:td-net}/bin/td-net\" ] || { echo 'root tree: /bin/td-test-https must select the Firefox HTTPS origin applet' >&2; exit 1; }; \
+     [ ! -e \"$root/bin/openssl\" ] && [ ! -L \"$root/bin/openssl\" ] || { echo 'root tree: an openssl command entered the image' >&2; exit 1; }; \
      tdfetchd=\"{root}/real-root{in:td-net}/bin/td-net\"; { [ -f \"$tdfetchd\" ] && [ -x \"$tdfetchd\" ]; } || { echo 'root tree: td-net is not packed/executable at real-root{in:td-net}/bin/td-net - the /bin/td-fetchd symlink would dangle and the fetchd unit would exec nothing' >&2; exit 1; }; \
      [ \"$(readlink \"$root/bin/td-portal\" 2>/dev/null)\" = \"{in:td-portal}/bin/td-portal\" ] || { echo 'root tree: /bin/td-portal is not a symlink to the staged Settings portal' >&2; exit 1; }; \
      tdportal=\"{root}/real-root{in:td-portal}/bin/td-portal\"; { [ -f \"$tdportal\" ] && [ -x \"$tdportal\" ]; } || { echo 'root tree: td-portal is not packed/executable at real-root{in:td-portal}/bin/td-portal - the portal supervisor, child, and live probe would all fail' >&2; exit 1; }; \
@@ -5349,11 +5312,6 @@ fn shape_check() -> String {
      done; \
      [ -s \"{root}/real-root{in:ca-certificates}/share/ca-certificates/ca-bundle.crt\" ] || { echo 'root tree: the pinned CA bundle is missing or empty' >&2; exit 1; }; \
      [ \"$(readlink \"$root/etc/ssl/certs/ca-certificates.crt\" 2>/dev/null)\" = \"{in:ca-certificates}/share/ca-certificates/ca-bundle.crt\" ] || { echo 'root tree: Git curl CA path does not resolve to the pinned bundle' >&2; exit 1; }; \
-     openssl=\"{root}/real-root{in:libressl-x86-64}/bin/openssl\"; openssltgt=\"{in:libressl-x86-64}/bin/openssl\"; \
-     { [ -f \"$openssl\" ] && [ -x \"$openssl\" ]; } || { echo 'root tree: the source-built LibreSSL command is not packed or executable' >&2; exit 1; }; \
-     [ \"$(readlink \"$root/bin/openssl\" 2>/dev/null)\" = \"$openssltgt\" ] || { echo 'root tree: /bin/openssl is not a symlink to the source-built LibreSSL command' >&2; exit 1; }; \
-     [ -f \"{root}/real-root{in:libressl-x86-64}/lib/debug/bin/openssl.debug\" ] || { echo 'root tree: the source-built LibreSSL command lacks its debug companion' >&2; exit 1; }; \
-     for dev in include lib/libcrypto.a lib/libssl.a; do [ ! -e \"{root}/real-root{in:libressl-x86-64}/$dev\" ] || { echo \"root tree: LibreSSL development path $dev entered the image\" >&2; exit 1; }; done; \
      for rel in bin/ssh bin/ssh-keygen bin/sshd libexec/sshd-session libexec/sshd-auth; do \
          openssh=\"{root}/real-root{in:openssh-x86-64}/$rel\"; \
          { [ -f \"$openssh\" ] && [ -x \"$openssh\" ]; } || { echo \"root tree: OpenSSH $rel is not packed/executable under real-root{in:openssh-x86-64}\" >&2; exit 1; }; \
@@ -5737,7 +5695,6 @@ pub fn recipe() -> Recipe {
                 "ca-certificates",
                 "tzdata",
                 "jetbrains-mono-nerd-font",
-                "libressl-x86-64",
                 "glibc-x86-64",
                 "openssh-x86-64",
                 "td-netd",
@@ -6545,15 +6502,7 @@ mod tests {
         );
         for required in [
             "/bin/td-netd loopback",
-            "openssl=/bin/openssl",
-            "OPENSSL_CONF=\"$root/openssl.cnf\"",
-            "export OPENSSL_CONF",
-            "distinguished_name=dn",
-            "-config \"$OPENSSL_CONF\"",
-            "req -new -x509 -newkey rsa:2048 -nodes -sha256 -days 1",
-            "basicConstraints=critical,CA:TRUE",
-            "x509 -req",
-            "subjectAltName=DNS:localhost,IP:127.0.0.1",
+            "/bin/td-test-https mint \"$root\"",
             FIREFOX_TLS_POLICY.trim_end(),
             FIREFOX_HTTPS_DOCUMENT,
             FIREFOX_HTTPS_SOAK_DOCUMENT,
@@ -6605,32 +6554,30 @@ mod tests {
         assert!(console_write < console_read);
         assert!(console_read < console_readback);
         assert!(console_readback < audit_begin);
-        assert_eq!(tls_setup.matches("-sha256").count(), 2);
+        // The authority's key never reaches a file: the mint signs the
+        // localhost identity in memory and writes three files only.
+        assert_eq!(tls_setup.matches("td-test-https").count(), 1);
+        assert!(!tls_setup.contains("ca.key"));
+        assert!(!tls_setup.contains(".csr"));
         let tls_origin = build_firefox_tls_origin();
-        assert!(tls_origin.contains("OPENSSL_CONF=/dev/null"));
-        assert!(tls_origin.contains(
-            "openssl s_server -accept 8443 \
-             -cert /run/td-firefox-autotest/server.pem \
-             -key /run/td-firefox-autotest/server.key -WWW -quiet"
+        // The origin listens on loopback only, which Firefox reaches by
+        // `localhost` and the ready probe by address.
+        assert!(tls_origin.ends_with(
+            "exec /bin/td-test-https serve --listen 127.0.0.1:8443 \
+             --cert /run/td-firefox-autotest/server.pem \
+             --key /run/td-firefox-autotest/server.key \
+             --root /run/td-firefox-autotest/origin\n"
         ));
-        assert!(!tls_origin.contains("exec /bin/openssl s_server"));
-        assert!(tls_origin.ends_with("exit 1\n"));
         let tls_ready = build_firefox_tls_ready();
-        for required in [
-            "OPENSSL_CONF=/dev/null",
-            "GET /content.html HTTP/1.0\\r\\nHost: localhost",
-            "openssl s_client",
-            "-connect 127.0.0.1:8443",
-            "-servername localhost",
-            "-CAfile /run/td-firefox-autotest/ca.pem",
-            "-verify 5",
-            "-verify_return_error",
-            "TD-FIREFOX-HTTPS-CONTENT-V1",
-        ] {
-            assert!(
-                tls_ready.contains(required),
-                "TLS ready omitted {required:?}"
-            );
+        assert!(tls_ready.ends_with(
+            "exec /bin/td-test-https probe --connect 127.0.0.1:8443 \
+             --server-name localhost --ca /run/td-firefox-autotest/ca.pem \
+             --path /content.html --expect TD-FIREFOX-HTTPS-CONTENT-V1\n"
+        ));
+        assert!(FIREFOX_TLS_URL.starts_with("https://localhost:8443/"));
+        for script in [&tls_setup, &tls_origin, &tls_ready] {
+            assert!(!script.contains("openssl"), "{script}");
+            assert!(!script.contains("OPENSSL"), "{script}");
         }
         for forbidden in [
             "acceptInsecureCerts",
@@ -7346,8 +7293,8 @@ mod tests {
                 Some(svc_timeouts::APPLICATION_EVIDENCE.to_string().as_str()),
                 "{evidence}"
             );
-            // The marker is one exact console line; TLS setup's progress dots
-            // would prefix it, so the probe waits for that unit's decision.
+            // The marker is one exact console line, so the probe waits for
+            // TLS setup's decision: its failure-path text cannot prefix it.
             assert_eq!(
                 unit_after(&evidence),
                 vec![unit, "firefox-tls-setup"],
@@ -8316,7 +8263,7 @@ mod tests {
             unit_key("setup-evidence", "requires").as_deref(),
             Some("setup")
         );
-        // Exact console lines: after TLS setup's unframed progress.
+        // Exact console lines: after TLS setup's unframed failure text.
         assert_eq!(unit_after("setup-evidence"), ["setup", "firefox-tls-setup"]);
         // The names are the ones their owners use.
         assert!(include_str!("../../../td-authd/src/disk_install.rs")
@@ -9221,28 +9168,16 @@ mod tests {
             )),
             "runtime store items must not bypass StageRuntimeClosure"
         );
-        let libressl_copies: Vec<(&str, &str)> = steps
-            .iter()
-            .filter_map(|step| match step {
-                Step::CopyTree { from, dest } if from.starts_with("{in:libressl-x86-64}/") => {
-                    Some((from.as_str(), dest.as_str()))
-                }
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            libressl_copies,
-            [
-                (
-                    "{in:libressl-x86-64}/bin",
-                    "{root}/real-root{in:libressl-x86-64}/bin",
-                ),
-                (
-                    "{in:libressl-x86-64}/lib/debug",
-                    "{root}/real-root{in:libressl-x86-64}/lib/debug",
-                ),
-            ],
-            "the image needs LibreSSL's command and debug companion, not its development tree"
+        // curl and Git link LibreSSL's archives statically; the image
+        // carries none of it and no `openssl` command.
+        assert!(
+            !steps.iter().any(|step| match step {
+                Step::CopyTree { from, .. } => from.contains("libressl"),
+                Step::Symlink { target, link } =>
+                    target.contains("libressl") || link.ends_with("/bin/openssl"),
+                _ => false,
+            }),
+            "LibreSSL entered the image"
         );
         for (name, target) in [
             ("rg", "{in:ripgrep}/bin/rg"),
@@ -9254,7 +9189,7 @@ mod tests {
                 "{in:git-x86-64}/bin/git-upload-archive",
             ),
             ("git-upload-pack", "{in:git-x86-64}/bin/git-upload-pack"),
-            ("openssl", "{in:libressl-x86-64}/bin/openssl"),
+            ("td-test-https", "{in:td-net}/bin/td-net"),
             ("rustc", "{in:rust-toolchain}/bin/rustc"),
             ("rustdoc", "{in:rust-toolchain}/bin/rustdoc"),
             ("cargo", "{in:rust-toolchain}/bin/cargo"),
@@ -9295,7 +9230,6 @@ mod tests {
 
         let native_inputs = recipe().native_inputs.expect("system native inputs");
         for required in [
-            "libressl-x86-64",
             "rust-toolchain",
             "gcc-runtime",
             "zlib-x86-64",
@@ -9308,7 +9242,12 @@ mod tests {
                 "shipped input {required} must be declared"
             );
         }
-        for forbidden in ["gcc-x86-64-native", "bash-mesboot", "python-mesboot"] {
+        for forbidden in [
+            "gcc-x86-64-native",
+            "bash-mesboot",
+            "python-mesboot",
+            "libressl-x86-64",
+        ] {
             assert!(
                 !native_inputs.iter().any(|input| input == forbidden),
                 "build-only input {forbidden} must not be a direct system input"

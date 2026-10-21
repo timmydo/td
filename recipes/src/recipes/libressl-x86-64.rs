@@ -1,13 +1,10 @@
-use crate::ladder::{
-    post_rust_inputs, post_rust_tool_farm, split_target_debug, unpack_into, POST_RUST_SH,
-};
+use crate::ladder::{post_rust_inputs, post_rust_tool_farm, unpack_into, POST_RUST_SH};
 use crate::types::{Recipe, Step, TextEdit};
 
 // LibreSSL 4.3.2 provides the OpenSSL-compatible TLS surface curl and Git will
-// consume. It exports static libssl.a + libcrypto.a, the public headers, and the
-// static OpenSSL-compatible command used by td's in-guest TLS test origin. The
-// libraries are absorbed into downstream runtime ELFs; the command applies td's
-// debug-companion policy at its own final link boundary.
+// consume. It exports static libssl.a + libcrypto.a and the public headers,
+// and no program: the libraries are absorbed into downstream runtime ELFs,
+// which carry td's debug-companion policy at their own final link boundary.
 //
 // Upstream's hand-written assembly is disabled. The portable C implementation
 // is compiled with td's target-wide frame-pointer, bounded line-table, and
@@ -152,31 +149,8 @@ pub fn recipe() -> Recipe {
         .env("SHELL", POST_RUST_SH)
         .env("SOURCE_DATE_EPOCH", "1"),
     );
-    // The system image invokes this exact source-built program to mint the
-    // volatile Firefox-test authority and serve the in-guest HTTPS origin.
-    steps.push(
-        Step::run(
-            "{src}",
-            &[
-                "{in:make-x86-64-self}/bin/make",
-                "-j{jobs}",
-                "-C",
-                "apps/openssl",
-                "install-exec-am",
-                "prefix={out}",
-                &format!("SHELL={POST_RUST_SH}"),
-            ],
-        )
-        .env("PATH", &path)
-        .env("CONFIG_SHELL", POST_RUST_SH)
-        .env("SHELL", POST_RUST_SH)
-        .env("SOURCE_DATE_EPOCH", "1"),
-    );
-    steps.push(split_target_debug("{out}"));
-    steps.push(Step::assert_static(&["{out}/bin/openssl"]));
     steps.push(Step::Require {
         paths: vec![
-            "{out}/bin/openssl".into(),
             "{out}/lib/libcrypto.a".into(),
             "{out}/lib/libssl.a".into(),
             "{out}/include/openssl/crypto.h".into(),
@@ -254,20 +228,15 @@ mod tests {
                     "{{in:make-x86-64-self}}/bin/make -C include/openssl install-data-am \
                      prefix={{out}} SHELL={POST_RUST_SH}"
                 ),
-                format!(
-                    "{{in:make-x86-64-self}}/bin/make -j{{jobs}} -C apps/openssl \
-                     install-exec-am prefix={{out}} SHELL={POST_RUST_SH}"
-                ),
             ]
         );
-        assert!(steps.iter().any(|step| matches!(
-            step,
-            Step::SplitDebugTree { root, .. } if root == "{out}"
-        )));
-        assert!(steps.iter().any(|step| matches!(
-            step,
-            Step::AssertStatic { paths } if paths == &["{out}/bin/openssl"]
-        )));
+        // Libraries and headers only: no `openssl` command, so no runtime
+        // ELF to split or check.
+        assert!(!steps.iter().any(|step| match step {
+            Step::SplitDebugTree { .. } | Step::AssertStatic { .. } => true,
+            Step::Require { paths, .. } => paths.iter().any(|path| path.contains("/bin/")),
+            _ => false,
+        }));
     }
 
     #[test]

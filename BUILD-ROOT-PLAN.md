@@ -173,6 +173,8 @@ deleted; its findings are summarized under "Facts" below.
    then rebuilt against the new glibc.
 9. **Test HTTPS origin.** Replace `openssl s_server/s_client` with a
    small rustls tool on td-net; LibreSSL's command leaves the image.
+   Landed: td-net's `td-test-https` applet (mint, serve, probe), and
+   LibreSSL builds no command.
 10. **Image switch.** system-x86-64 ships the upstream Rust toolchain,
     the link driver, td glibc and libgcc instead of GCC and binutils.
 11. **Delete the ladder.** `seed/` (stage0, patches, bootstrap-root,

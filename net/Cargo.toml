@@ -23,7 +23,8 @@ path = "src/main.rs"
 
 [dependencies]
 # Union of the three former crates' deps. ureq + sha2 are shared by all three;
-# ring (ed25519) is td-subst's only.
+# ring signs for td-subst and td-deploy (ed25519) and mints td-test-https's
+# P-256 test identities.
 ureq = { version = "2", default-features = false, features = ["tls"] }
 sha2 = "0.10"
 ring = "0.17"
