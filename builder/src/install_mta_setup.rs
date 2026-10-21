@@ -141,7 +141,7 @@ fn settings(args: &[String], home: &str) -> Result<Settings> {
     })
 }
 
-fn random_hex(bytes: usize) -> Result<String> {
+pub(super) fn random_hex(bytes: usize) -> Result<String> {
     let mut value = vec![0; bytes];
     File::open("/dev/urandom")
         .and_then(|mut f| f.read_exact(&mut value))

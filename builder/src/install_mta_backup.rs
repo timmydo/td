@@ -130,25 +130,38 @@ impl Drop for Temporary {
 }
 type PipeMessage = std::result::Result<(bool, usize, [u8; CHUNK]), String>;
 
-fn bounded_output(
+fn bounded_output(cmd: Command, output: &mut File, maximum: u64, diagnostic: &Path) -> Result<u64> {
+    let (bytes, status) = bounded_tool_output(cmd, output, maximum, diagnostic, TIMEOUT)?;
+    if status.success() {
+        Ok(bytes)
+    } else {
+        Err(format!(
+            "PostgreSQL tool failed ({status}); private diagnostic: {}",
+            diagnostic.display()
+        ))
+    }
+}
+
+pub(super) fn bounded_tool_output(
     mut cmd: Command,
     output: &mut File,
     maximum: u64,
     diagnostic: &Path,
-) -> Result<u64> {
+    timeout: Duration,
+) -> Result<(u64, std::process::ExitStatus)> {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd
         .spawn()
-        .map_err(|e| format!("start PostgreSQL tool: {e}"))?;
+        .map_err(|e| format!("start mail host tool: {e}"))?;
     let stdout = child
         .stdout
         .take()
-        .ok_or("PostgreSQL tool has no output pipe")?;
+        .ok_or("mail host tool has no output pipe")?;
     let stderr = child
         .stderr
         .take()
-        .ok_or("PostgreSQL tool has no diagnostic pipe")?;
-    let until = Instant::now() + TIMEOUT;
+        .ok_or("mail host tool has no diagnostic pipe")?;
+    let until = Instant::now() + timeout;
     std::thread::scope(|scope| {
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         let read_pipe = |mut pipe: Box<dyn Read + Send>,
@@ -180,10 +193,10 @@ fn bounded_output(
             Err(e) => {
                 let _ = crate::sys::kill_child_recorded(
                     &mut child,
-                    "backup output reader could not start",
+                    "mail tool output reader could not start",
                 );
                 let _ = child.wait();
-                return Err(format!("start backup output reader: {e}"));
+                return Err(format!("start mail tool output reader: {e}"));
             }
         };
         let error_reader = match std::thread::Builder::new()
@@ -195,11 +208,11 @@ fn bounded_output(
                 drop(receiver);
                 let _ = crate::sys::kill_child_recorded(
                     &mut child,
-                    "backup diagnostic reader could not start",
+                    "mail tool diagnostic reader could not start",
                 );
                 let _ = child.wait();
                 let _ = reader.join();
-                return Err(format!("start backup diagnostic reader: {e}"));
+                return Err(format!("start mail tool diagnostic reader: {e}"));
             }
         };
         let mut written = 0u64;
@@ -208,7 +221,7 @@ fn bounded_output(
             loop {
                 let left = until
                     .checked_duration_since(Instant::now())
-                    .ok_or("backup deadline exceeded")?;
+                    .ok_or("mail tool deadline exceeded")?;
                 match receiver.recv_timeout(left) {
                     Ok(Ok((stderr, n, bytes))) => {
                         let bytes = bytes.get(..n).ok_or("invalid output length")?;
@@ -222,32 +235,25 @@ fn bounded_output(
                         }
                         written = written
                             .checked_add(n as u64)
-                            .ok_or("backup size overflow")?;
+                            .ok_or("mail tool size overflow")?;
                         if written > maximum {
-                            return Err("backup output exceeds configured ceiling".into());
+                            return Err("mail tool output exceeds configured ceiling".into());
                         }
                         output
                             .write_all(bytes)
-                            .map_err(|e| format!("write backup: {e}"))?;
+                            .map_err(|e| format!("write tool output: {e}"))?;
                     }
-                    Ok(Err(e)) => return Err(format!("read PostgreSQL output: {e}")),
+                    Ok(Err(e)) => return Err(format!("read mail host tool output: {e}")),
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                    Err(_) => return Err("backup deadline exceeded".into()),
+                    Err(_) => return Err("mail tool deadline exceeded".into()),
                 }
             }
             loop {
                 if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
-                    return if status.success() {
-                        Ok(written)
-                    } else {
-                        Err(format!(
-                            "PostgreSQL tool failed ({status}); private diagnostic: {}",
-                            diagnostic.display()
-                        ))
-                    };
+                    return Ok((written, status));
                 }
                 if Instant::now() >= until {
-                    return Err("backup deadline exceeded".into());
+                    return Err("mail tool deadline exceeded".into());
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
@@ -256,17 +262,17 @@ fn bounded_output(
         if transfer.is_err() {
             let _ = crate::sys::kill_child_recorded(
                 &mut child,
-                "backup tool failed, exceeded a limit, or could not write output",
+                "mail host tool failed, exceeded a limit, or could not write output",
             );
         }
         let _ = child.wait();
         reader
             .join()
-            .map_err(|_| "backup output reader failed".to_string())?;
+            .map_err(|_| "mail tool output reader failed".to_string())?;
         error_reader
             .join()
-            .map_err(|_| "backup diagnostic reader failed".to_string())?;
-        if transfer.is_err() {
+            .map_err(|_| "mail tool diagnostic reader failed".to_string())?;
+        if !transfer.as_ref().is_ok_and(|(_, status)| status.success()) {
             let mut report = OpenOptions::new()
                 .write(true)
                 .create(true)
@@ -813,6 +819,10 @@ mod tests {
     #[test]
     fn pipe_fixture() {
         if let Ok(mode) = std::env::var("TD_MTA_BACKUP_FIXTURE") {
+            if mode == "sleep" {
+                std::thread::sleep(Duration::from_secs(5));
+                return;
+            }
             let mut out = std::io::stdout().lock();
             let mut err = std::io::stderr().lock();
             for _ in 0..16 {
@@ -866,6 +876,32 @@ mod tests {
                 > 262144
         );
     }
+    #[test]
+    fn bounded_tools_preserve_exit_status_and_enforce_short_deadline() {
+        let root = crate::test_temp::TempDir::new("mail-tool-status").unwrap();
+        let diagnostic = root.path().join("error");
+        let mut output = private_file(&root.path().join("output")).unwrap();
+        let (_, status) = bounded_tool_output(
+            fixture_command("fail"),
+            &mut output,
+            1024 * 1024,
+            &diagnostic,
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        assert_eq!(status.code(), Some(7));
+        let began = Instant::now();
+        assert!(bounded_tool_output(
+            fixture_command("sleep"),
+            &mut output,
+            1024 * 1024,
+            &diagnostic,
+            Duration::from_millis(100)
+        )
+        .is_err());
+        assert!(began.elapsed() < Duration::from_secs(4));
+    }
+
     #[test]
     fn receipt_freshness_uses_recorded_time_and_requires_matching_archive() {
         let archive = Archive {

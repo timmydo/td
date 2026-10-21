@@ -11,6 +11,8 @@ mod install_mta_backup;
 mod install_mta_operations;
 #[path = "install_mta_setup.rs"]
 mod install_mta_setup;
+#[path = "install_mta_tls.rs"]
+mod install_mta_tls;
 const HELP: &str = "Usage: ./install-td-mta [--prefix PATH]
        ./install-td-mta --services-only --connection-file PATH --state-dir PATH
            --profile NAME [--profile NAME ...] [--prefix PATH]
@@ -26,6 +28,7 @@ Generates both systemd user units and Shepherd definitions; does not enable them
 Database preparation and credentials remain explicit (td-mta/POSTGRES.md).
 --services-only uses the already installed executable without rebuilding.
 Use --setup-local --help to provision a new private local PostgreSQL account.
+Use --postgres-tls-renew --help for local PostgreSQL leaf renewal.
 Use --operations-services --help to generate backup and health schedules.
 Use --backup --help for bounded host PostgreSQL logical backups.
 Use --backup-status --help for read-only backup freshness checks.
@@ -432,6 +435,9 @@ fn install(root: &Path, opts: &Options) -> Result<()> {
 }
 
 pub(crate) fn run(args: &[String]) -> ExitCode {
+    if args.first().is_some_and(|v| v == "--postgres-tls-renew") {
+        return install_mta_tls::run(args.get(1..).unwrap_or_default());
+    }
     if args.first().is_some_and(|v| v == "--operations-services") {
         return install_mta_operations::run(args.get(1..).unwrap_or_default());
     }

@@ -12,10 +12,12 @@ const HELP: &str = "Usage: ./install-td-mta --operations-services --state-dir PA
   [--tls-certificate PATH ... --openssl-bin PATH]
   [--backup-service-file PATH --backup-service NAME --backup-destination PATH
    --postgres-bin PATH [--tool-library-dir PATH]]
+  [--postgres-tls-dir PATH --postgres-data-dir PATH --postgres-port N
+   --postgres-bin PATH --openssl-bin PATH [--tool-library-dir PATH]]
 
 Generates independent systemd timers and Shepherd timed services, without starting
 anything. Mail, certificate and backup freshness checks run every 15 minutes;
-backups run daily at 03:15 in the supervisor's local timezone. Certificate checks
+backups and private PostgreSQL leaf renewal run daily at 03:15 in the supervisor's local timezone. Certificate checks
 require 30 days remaining; backups must be at most two days old. PostgreSQL 17
 and protected backup credentials must already be provisioned. Backup limits are
 1 GiB/archive, 8 GiB/directory and 30 archives. See td-mta/DEPLOYMENT.md.
@@ -30,6 +32,11 @@ struct Options {
     tls: Vec<PathBuf>,
     openssl: Option<PathBuf>,
     backup: Option<Backup>,
+    renewal: Option<Renewal>,
+}
+struct Renewal {
+    argv: Vec<String>,
+    environment: Vec<String>,
 }
 struct Backup {
     service_file: PathBuf,
@@ -74,7 +81,10 @@ fn options(args: &[String], home: &str) -> Result<Options> {
             | "--backup-service"
             | "--backup-destination"
             | "--postgres-bin"
-            | "--tool-library-dir" => {
+            | "--tool-library-dir"
+            | "--postgres-tls-dir"
+            | "--postgres-data-dir"
+            | "--postgres-port" => {
                 if values.insert(flag.as_str(), value.as_str()).is_some() {
                     return Err(format!("duplicate {flag}"));
                 }
@@ -89,8 +99,6 @@ fn options(args: &[String], home: &str) -> Result<Options> {
         "--backup-service-file",
         "--backup-service",
         "--backup-destination",
-        "--postgres-bin",
-        "--tool-library-dir",
     ];
     let backup = if backup_keys.iter().any(|k| values.contains_key(k)) {
         let service = values
@@ -123,12 +131,74 @@ fn options(args: &[String], home: &str) -> Result<Options> {
     } else {
         None
     };
+    let renewal = if [
+        "--postgres-tls-dir",
+        "--postgres-data-dir",
+        "--postgres-port",
+    ]
+    .iter()
+    .any(|key| values.contains_key(key))
+    {
+        let postgres = required("--postgres-bin")?;
+        let openssl = required("--openssl-bin")?;
+        let tls_dir = required("--postgres-tls-dir")?;
+        let data = required("--postgres-data-dir")?;
+        let port = values
+            .get("--postgres-port")
+            .ok_or("missing --postgres-port")?
+            .parse::<u16>()
+            .map_err(|_| "invalid PostgreSQL port")?;
+        if port == 0 {
+            return Err("PostgreSQL port must be nonzero".into());
+        }
+        let mut environment = vec![format!("PATH={}", text(&postgres)?)];
+        if let Some(library) = path("--tool-library-dir")? {
+            environment.push(format!("LD_LIBRARY_PATH={}", text(&library)?));
+        }
+        if environment.iter().any(|value| value.contains(':')) {
+            return Err("tool directories cannot contain PATH separators".into());
+        }
+        Some(Renewal {
+            argv: vec![
+                "install-td-mta".into(),
+                "--postgres-tls-renew".into(),
+                "--tls-dir".into(),
+                text(&tls_dir)?.into(),
+                "--data-dir".into(),
+                text(&data)?.into(),
+                "--postgres-bin".into(),
+                text(&postgres)?.into(),
+                "--openssl-bin".into(),
+                text(&openssl)?.into(),
+                "--port".into(),
+                port.to_string(),
+            ],
+            environment,
+        })
+    } else {
+        None
+    };
+    if backup.is_none()
+        && renewal.is_none()
+        && ["--postgres-bin", "--tool-library-dir"]
+            .iter()
+            .any(|key| values.contains_key(key))
+    {
+        return Err("unused PostgreSQL tool settings".into());
+    }
     let connection = path("--connection-file")?;
     let openssl = path("--openssl-bin")?;
-    if certificates.is_empty() != connection.is_none() || tls.is_empty() != openssl.is_none() {
+    if certificates.is_empty() != connection.is_none()
+        || (tls.is_empty() && renewal.is_none()) != openssl.is_none()
+    {
         return Err("certificate profiles need --connection-file; TLS files need --openssl-bin (no unused options)".into());
     }
-    if mail.is_empty() && certificates.is_empty() && tls.is_empty() && backup.is_none() {
+    if mail.is_empty()
+        && certificates.is_empty()
+        && tls.is_empty()
+        && backup.is_none()
+        && renewal.is_none()
+    {
         return Err("select at least one operation".into());
     }
     Ok(Options {
@@ -140,6 +210,7 @@ fn options(args: &[String], home: &str) -> Result<Options> {
         tls,
         openssl,
         backup,
+        renewal,
     })
 }
 
@@ -147,19 +218,19 @@ struct Job {
     name: String,
     argv: Vec<String>,
     environment: Vec<String>,
-    backup: bool,
+    daily: bool,
 }
 
 fn jobs(opts: &Options) -> Result<Vec<Job>> {
     let bin = opts.prefix.join("bin/td-mta");
     let helper = opts.prefix.join("bin/td-mta-operator");
     let mut jobs = Vec::new();
-    let mut add = |name: String, argv: Vec<String>, environment: Vec<String>, backup| {
+    let mut add = |name: String, argv: Vec<String>, environment: Vec<String>, daily| {
         jobs.push(Job {
             name: format!("td-mta-maint-{name}"),
             argv,
             environment,
-            backup,
+            daily,
         });
     };
     for profile in &opts.mail {
@@ -251,6 +322,16 @@ fn jobs(opts: &Options) -> Result<Vec<Job>> {
             false,
         );
     }
+    if let Some(renewal) = &opts.renewal {
+        let mut argv = vec![text(&helper)?.into()];
+        argv.extend(renewal.argv.iter().cloned());
+        add(
+            "postgres-tls-renew".into(),
+            argv,
+            renewal.environment.clone(),
+            true,
+        );
+    }
     let mut names = BTreeSet::new();
     if jobs.iter().any(|j| !names.insert(&j.name)) {
         return Err("colliding operation names".into());
@@ -259,7 +340,7 @@ fn jobs(opts: &Options) -> Result<Vec<Job>> {
 }
 
 fn files(job: &Job, state: &Path) -> Result<Vec<(String, String)>> {
-    let seconds = if job.backup { 2700 } else { 120 };
+    let seconds = if job.daily { 2700 } else { 120 };
     let exec = job
         .argv
         .iter()
@@ -272,13 +353,13 @@ fn files(job: &Job, state: &Path) -> Result<Vec<(String, String)>> {
         .map(|v| format!("Environment={}\n", systemd(v)))
         .collect::<String>();
     let unit = format!("[Unit]\nDescription={}\n\n[Service]\nType=oneshot\nExecStart=:{exec}\n{env}UMask=0077\nTimeoutStartSec={seconds}\nNoNewPrivileges=yes\nPrivateTmp=yes\n", job.name);
-    let schedule = if job.backup {
+    let schedule = if job.daily {
         "OnCalendar=*-*-* 03:15:00\nPersistent=true\n"
     } else {
         "OnBootSec=2min\nOnUnitActiveSec=15min\n"
     };
     let timer = format!("[Unit]\nDescription=Schedule {}\n\n[Timer]\n{schedule}Unit={}.service\n\n[Install]\nWantedBy=timers.target\n", job.name, job.name);
-    let event = if job.backup {
+    let event = if job.daily {
         "(calendar-event #:hours '(3) #:minutes '(15))"
     } else {
         "(calendar-event #:minutes '(0 15 30 45))"
@@ -341,7 +422,7 @@ fn install(opts: &Options) -> Result<()> {
     directory(&opts.state, 0o700)?;
     directory(&opts.state.join(".operations"), 0o700)?;
     directory(&services, 0o700)?;
-    if opts.backup.is_some() {
+    if opts.backup.is_some() || opts.renewal.is_some() {
         // A stable command path keeps schedules independent of the source checkout.
         let releases = opts.prefix.join("lib/td-mta/host-tools");
         directory(&releases, 0o755)?;
@@ -351,6 +432,8 @@ fn install(opts: &Options) -> Result<()> {
             .as_nanos();
         let release = releases.join(format!("operator-{stamp}-{}", std::process::id()));
         fs::create_dir(&release).map_err(|e| e.to_string())?;
+        fs::set_permissions(&release, fs::Permissions::from_mode(0o755))
+            .map_err(|e| e.to_string())?;
         let binary = release.join("td-builder");
         fs::copy(std::env::current_exe().map_err(|e| e.to_string())?, &binary)
             .map_err(|e| e.to_string())?;
@@ -499,6 +582,36 @@ mod tests {
         assert!(backup[2].1.contains("#:hours '(3) #:minutes '(15)"));
         assert_eq!(jobs[1].argv.last().unwrap(), "172800");
         assert!(!jobs[0].argv.iter().any(|a| a == "--max-archive-bytes"));
+    }
+
+    #[test]
+    fn renewal_is_daily_without_forcing_issuance() {
+        let opts = options(
+            &args(&[
+                "--state-dir",
+                "/state",
+                "--postgres-tls-dir",
+                "/tls",
+                "--postgres-data-dir",
+                "/pg",
+                "--postgres-port",
+                "35432",
+                "--postgres-bin",
+                "/tools",
+                "--openssl-bin",
+                "/openssl",
+            ]),
+            "/home/a",
+        )
+        .unwrap();
+        let jobs = jobs(&opts).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert!(jobs[0].daily);
+        assert!(jobs[0].argv.iter().any(|v| v == "--postgres-tls-renew"));
+        assert!(!jobs[0].argv.iter().any(|v| v == "--force"));
+        assert!(files(&jobs[0], &opts.state).unwrap()[1]
+            .1
+            .contains("OnCalendar=*-*-* 03:15:00"));
     }
 
     #[test]

@@ -62,6 +62,7 @@ pub const HOST_ONLY: &[&str] = &[
     "install_mta_backup.rs",
     "install_mta_operations.rs",
     "install_mta_setup.rs",
+    "install_mta_tls.rs",
     "install_fonts.rs",
     "integration.rs",
     "main_integration.rs",

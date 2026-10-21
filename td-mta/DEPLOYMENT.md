@@ -129,7 +129,8 @@ independent scheduled operations with the same installer:
 
 Select any complete group independently: mail profiles, managed certificate
 profiles with their connection file, private certificate files with an explicit
-OpenSSL executable, or the four backup arguments. Repeat profiles/certificate
+OpenSSL executable, the four backup arguments, or the local PostgreSQL renewal
+group described below. Repeat profiles/certificate
 files up to 32 per kind. All paths are absolute. The mail state directory is the
 same one used when generating the foreground services. Provision the backup
 destination and credentials as described below; generation does not create or
@@ -637,6 +638,76 @@ status in the supervisor, and arrange operator notification appropriate to the
 host. A timer alone does not send an alert. Check free disk space and off-host
 backup copies separately; a recent local archive does not cover VM loss.
 
+## Automatic local PostgreSQL leaf renewal
+
+`./install-td-mta --postgres-tls-renew` renews the setup profile's private
+PostgreSQL leaf certificate under its existing CA and server key. It supports
+only the localhost/127.0.0.1 certificate and a loopback PostgreSQL endpoint.
+Run it as the cluster owner with PostgreSQL 17 and OpenSSL 3 or 4:
+
+```text
+./install-td-mta --postgres-tls-renew \
+  --tls-dir /home/alice/.local/state/td-mta/tls \
+  --data-dir /home/alice/.local/state/td-mta/postgres \
+  --postgres-bin /usr/lib/postgresql/17/bin --openssl-bin /usr/bin/openssl \
+  --port 35432
+```
+
+The TLS directory must contain private owned `ca.pem`, `ca.key`, `server.pem`
+and `server.key` files. Both directories and their physical ancestors must
+meet the private-path contract. PostgreSQL must already use that server
+certificate/key pair. Host-library provisioning remains the operator's
+responsibility, as for setup and backups. The helper checks key correspondence,
+local subject-alternative names and the old chain, allowing an expired leaf
+only for renewal. The CA must remain valid for at least 91 days; CA trust/key
+rotation is always explicit. A leaf with fewer than 30 days remaining is
+reissued for 90 days. `--force` exercises issuance immediately; never put that
+flag in the unattended schedule.
+
+The server key stays unchanged, so publication replaces only the certificate.
+The helper retains one `server.previous.pem`, syncs the replacement, asks
+`pg_ctl reload` to signal the named cluster, then establishes a new verified
+PostgreSQL TLS connection and compares its first presented certificate with
+the selected file. [OpenSSL's PostgreSQL STARTTLS probe](https://docs.openssl.org/3.0/man1/openssl-s_client/)
+uses explicit CA/name verification and fails on verification errors. A failure
+after publication leaves the candidate on disk and returns failure; it does
+not silently roll back or claim reload succeeded. A subsequent invocation also
+repairs a missed reload when a healthy on-disk certificate differs from the
+one being served. It never restarts PostgreSQL or mail services.
+
+One private lock excludes overlapping invocations. Tool output is bounded to
+64 KiB per command, diagnostics to 16 KiB, and execution to 30 seconds per
+command, at most 32 commands. Reserved `renew-work` scratch is reclaimed on
+normal return and after interruption; unexpected entries refuse cleanup.
+Private `renew-last-error` retains a tool diagnostic until a successful run.
+Supervisor results also cover validation failures before a tool can run.
+Previous certificates and the publication staging slot have fixed names;
+unattended renewal does not accumulate generations or new private keys.
+
+Generate its daily systemd/Shepherd schedule with the operations installer:
+
+```text
+./install-td-mta --operations-services --state-dir /home/alice/.local/state/td-mta \
+  --postgres-tls-dir /home/alice/.local/state/td-mta/tls \
+  --postgres-data-dir /home/alice/.local/state/td-mta/postgres \
+  --postgres-port 35432 --postgres-bin /usr/lib/postgresql/17/bin \
+  --openssl-bin /usr/bin/openssl
+```
+
+The generated `td-mta-maint-postgres-tls-renew` job uses the retained host
+helper. Enable it through the printed supervisor commands, as for backups.
+The daily job never forces issuance. It shares the daily schedule's bounded
+45-minute supervisor ceiling; private certificate health checks remain
+independent. For a hardened system service, allow writes only to its TLS
+directory and retain read access to the PostgreSQL data directory. Provision
+the service identity and tool runtime libraries explicitly.
+
+This updates PostgreSQL's local certificate files only. It does not change
+immutable certificate materials already imported into td-mta, a public ACME
+profile, another account's trust, or the CA. Installations using the same old
+leaf for mail listeners must separately update those stored materials using
+the procedure below. Failure notifications and CA rotation remain explicit.
+
 ## Renew a local private certificate
 
 A local `localhost` deployment uses its explicitly trusted private CA;
@@ -645,7 +716,9 @@ with `openssl x509 -in FILE -noout -dates`, and check the renewal threshold
 with `openssl x509 -in FILE -checkend 2592000 -noout`. Nonzero means renewal
 is due (or the input could not be checked); it is not an instruction to
 ignore verification. Schedule the operator check before either certificate
-expires. These are manual operator commands, not built-in automatic renewal.
+expires. The commands in this section are manual. The local PostgreSQL-only helper
+above provides automatic leaf renewal; other imported mail materials still
+require explicit configuration selection.
 
 Retain the CA certificate/key and prior server generation privately. Create
 new files in a new mode-0700 directory with umask 077. A 90-day leaf under an
