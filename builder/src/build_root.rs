@@ -64,6 +64,11 @@ const ALTERNATIVES: &[(&str, &str)] = &[
 /// Mount points the sandbox needs in a root it cannot write.
 const SKELETON: &[&str] = &["dev", "etc", "oldroot", "proc", "td/store", "tmp"];
 
+/// Directories each build gets a fresh tmpfs over, writable as the minimal
+/// root left them: tests stage fixtures under /home, /mnt and /var, and
+/// services their sockets under /run. /var's own `tmp` is recreated.
+pub(crate) const WRITABLE: &[&str] = &["home", "mnt", "run", "var"];
+
 /// The lock td-builder was compiled with.
 pub(crate) fn lock() -> Result<Lock, String> {
     debian_root::parse(LOCK)
@@ -287,7 +292,7 @@ fn add_alternatives(root: &Path) -> Result<(), String> {
 }
 
 fn add_skeleton(root: &Path) -> Result<(), String> {
-    for dir in SKELETON {
+    for dir in SKELETON.iter().chain(WRITABLE) {
         let path = root.join(dir);
         match fs::symlink_metadata(&path) {
             Ok(meta) if meta.is_dir() => {}
@@ -921,7 +926,10 @@ mod tests {
         let dir = tmp("skeleton");
         let root = image_root(dir.path());
         add_skeleton(&root).unwrap();
-        assert!(SKELETON.iter().all(|d| root.join(d).is_dir()));
+        assert!(SKELETON
+            .iter()
+            .chain(WRITABLE)
+            .all(|d| root.join(d).is_dir()));
         let bad = image_root(&dir.path().join("bad"));
         fs::write(bad.join("proc"), b"").unwrap();
         assert!(add_skeleton(&bad).unwrap_err().contains("proc"));

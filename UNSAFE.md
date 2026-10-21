@@ -274,8 +274,10 @@ also request noexec. A derivation that declares the Debian build root binds
 that verified, `BuildRoot`-typed item over the new root instead of mounting a
 tmpfs, and restricts only that top mount before the store, `/tmp`, `/dev`
 and `/proc` mount over it; its passwd and group are scratch files bound and
-restricted over the root's own, and its empty `/oldroot` stays after the
-pivot. Such a derivation builds in `/td/store` alone. Host exposure rbinds restrict the whole mounted tree.
+restricted over the root's own; a fresh tmpfs mounts over each of its
+`/home`, `/mnt`, `/run` and `/var` (hiding the image's dpkg state and caches,
+which no build reads), with `/var/tmp` recreated mode 1777; and its empty
+`/oldroot` stays after the pivot. Such a derivation builds in `/td/store` alone. Host exposure rbinds restrict the whole mounted tree.
 The private tmpfs parents holding item binds restrict only their top mount,
 preserving separately writable children. Mandatory failures refuse workload
 execution; optional host exposures are detached on failure. Linux 5.12 or

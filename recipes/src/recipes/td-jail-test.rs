@@ -1,6 +1,5 @@
 use crate::ladder::{
-    job_pids, post_rust_inputs, post_rust_tool_farm, POST_RUST_SH, TD_FIREFOX_BOOT_MARKER,
-    TD_JAIL_TRANSITION_MARKER,
+    BUILD_ROOT_PATH as PATH, BUILD_ROOT_SH as SH, TD_FIREFOX_BOOT_MARKER, TD_JAIL_TRANSITION_MARKER,
 };
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 use td_engine::application::ApplicationProvenance;
@@ -17,6 +16,17 @@ const HOST_DEGRADATION_CGROUP: &str =
     "TD-JAIL-HOST-DEGRADATION aggregate-memory-task-and-cpu-caps=unenforced reason=no-delegated-cgroup";
 const HOST_DEGRADATION_WAYLAND: &str =
     "TD-JAIL-HOST-DEGRADATION wayland-global-filter=unenforced reason=direct-host-socket";
+/// td-sh and td-util are the surrogate's runtime, copied into the jail and
+/// run only there.
+const INPUTS: &[&str] = &[
+    "td-jail",
+    "td-busd",
+    "td-compositor",
+    "td-jail-seccomp-probe",
+    "ca-certificates",
+    "td-sh",
+    "td-util",
+];
 
 struct HostFixture {
     manifest: String,
@@ -92,6 +102,12 @@ fn host_fixture() -> Result<HostFixture, String> {
     })
 }
 
+/// The steps run in the Debian build root under its bash, with PATH the
+/// root's /usr/bin alone and its readelf and GNU grep reading td-jail's shape.
+/// The root's `/` is read-only; the sandbox mounts a fresh writable tmpfs
+/// over /home, /mnt and /var, which the host fixture's trees live in. td-sh
+/// and td-util are no tool here: they are copied into the surrogate's
+/// runtime, which the jail runs.
 pub fn recipe() -> Recipe {
     let Ok(host) = host_fixture() else {
         return Recipe::mesboot("td-jail-test", "1.0").steps(vec![Step::Require {
@@ -101,16 +117,15 @@ pub fn recipe() -> Recipe {
     };
     let bin = "{in:td-jail}/bin/td-jail";
     let busd = "{in:td-busd}/bin/td-busd";
-    let readelf = "{in:binutils-x86-64-self}/bin/readelf";
+    let readelf = "/usr/bin/readelf";
     let probe = "{in:td-jail-seccomp-probe}/bin/td-jail-seccomp-probe";
-    let bg = job_pids();
-    let mut steps = vec![post_rust_tool_farm("{in:gawk-x86-64-self}/bin/gawk")];
+    let mut steps = Vec::new();
 
     steps.push(
         Step::run(
             "{root}",
             &[
-                POST_RUST_SH,
+                SH,
                 "-c",
                 &format!(
                     "h=$('{readelf}' -h '{bin}' 2>/dev/null) || {{ echo 'readelf -h failed on td-jail' >&2; exit 1; }}; \
@@ -124,7 +139,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", "{tools}"),
+        .env("PATH", PATH),
     );
 
     for path in [
@@ -226,26 +241,24 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_RUST_SH,
+                SH,
                 "-c",
                 &format!(
                     "chmod 0700 /home/td-jail-host/runtime || exit 1; \
                      mkdir -p /mnt/td-jail-fixture-pictures /var || exit 1; \
                      printf '%s\\n' td-jail-file-grant-v1 >/var/td-jail-fixture-file || exit 1; \
-                     {bg}bg '{{root}}/bus.pid' '{busd}' run --socket /home/td-jail-host/runtime/bus >/home/td-jail-host/bus.log 2>&1; bj=$!; \
-                     bg '{{root}}/wayland.pid' '{busd}' run --socket /home/td-jail-host/runtime/wayland-test >/home/td-jail-host/wayland.log 2>&1; wj=$!; \
-                     bg '{{root}}/pulse.pid' '{busd}' run --socket /home/td-jail-host/runtime/pulse/native >/home/td-jail-host/pulse.log 2>&1; aj=$!; \
-                     b=$(pid_of '{{root}}/bus.pid'); w=$(pid_of '{{root}}/wayland.pid'); a=$(pid_of '{{root}}/pulse.pid'); \
-                     [ -n \"$b\" ] && [ -n \"$w\" ] && [ -n \"$a\" ] || {{ kill $b $w $a 2>/dev/null; echo 'a td-busd authority never published its pid' >&2; exit 1; }}; \
+                     '{busd}' run --socket /home/td-jail-host/runtime/bus >/home/td-jail-host/bus.log 2>&1 & b=$!; \
+                     '{busd}' run --socket /home/td-jail-host/runtime/wayland-test >/home/td-jail-host/wayland.log 2>&1 & w=$!; \
+                     '{busd}' run --socket /home/td-jail-host/runtime/pulse/native >/home/td-jail-host/pulse.log 2>&1 & a=$!; \
                      n=0; while {{ [ ! -S /home/td-jail-host/runtime/bus ] || [ ! -S /home/td-jail-host/runtime/wayland-test ] || [ ! -S /home/td-jail-host/runtime/pulse/native ]; }} && [ \"$n\" -lt 10 ]; do n=$((n+1)); sleep 1; done; \
-                     if [ ! -S /home/td-jail-host/runtime/bus ] || [ ! -S /home/td-jail-host/runtime/wayland-test ] || [ ! -S /home/td-jail-host/runtime/pulse/native ]; then kill \"$b\" \"$w\" \"$a\" 2>/dev/null || :; wait \"$bj\" 2>/dev/null || :; wait \"$wj\" 2>/dev/null || :; wait \"$aj\" 2>/dev/null || :; echo 'td-jail host authorities did not become ready' >&2; exit 1; fi; \
+                     if [ ! -S /home/td-jail-host/runtime/bus ] || [ ! -S /home/td-jail-host/runtime/wayland-test ] || [ ! -S /home/td-jail-host/runtime/pulse/native ]; then kill \"$b\" \"$w\" \"$a\" 2>/dev/null || :; wait \"$b\" 2>/dev/null || :; wait \"$w\" 2>/dev/null || :; wait \"$a\" 2>/dev/null || :; echo 'td-jail host authorities did not become ready' >&2; exit 1; fi; \
                      o=$(XDG_RUNTIME_DIR=/home/td-jail-host/runtime WAYLAND_DISPLAY=wayland-test '{bin}' --host /home/td-jail-host/etc/td-app-host.conf {} selftest 2>&1); s=$?; \
                      c=0; cp /home/td-jail-host/packages/00000000000000000000000000000000-td-jail-fixture-0.1/shared-spec /home/td-jail-host/packages/00000000000000000000000000000000-td-jail-fixture-0.1/spec || c=$?; \
                      p=$(XDG_RUNTIME_DIR=/home/td-jail-host/runtime WAYLAND_DISPLAY=wayland-test '{bin}' --host /home/td-jail-host/etc/td-app-host.conf {} selftest --shared-network 2>&1); t=$?; \
                      f=$(XDG_RUNTIME_DIR=/home/td-jail-host/runtime WAYLAND_DISPLAY=wayland-test '{bin}' --host /home/td-jail-host/etc/td-app-host.conf firefox 2>&1); u=$?; \
-                     kill \"$a\" 2>/dev/null || :; wait \"$aj\" 2>/dev/null || :; \
+                     kill \"$a\" 2>/dev/null || :; wait \"$a\" 2>/dev/null || :; \
                      XDG_RUNTIME_DIR=/home/td-jail-host/runtime WAYLAND_DISPLAY=wayland-test '{bin}' --host /home/td-jail-host/etc/td-app-host.conf firefox >/home/td-jail-host/stale-pulse.log 2>&1 && v=0 || v=$?; \
-                     kill \"$b\" \"$w\" 2>/dev/null || :; wait \"$bj\" 2>/dev/null || :; wait \"$wj\" 2>/dev/null || :; \
+                     kill \"$b\" \"$w\" 2>/dev/null || :; wait \"$b\" 2>/dev/null || :; wait \"$w\" 2>/dev/null || :; \
                      [ \"$s\" -eq 0 ] || {{ echo \"td-jail host fixture failed: $o\" >&2; exit 1; }}; \
                      [ \"$c\" -eq 0 ] || {{ echo 'td-jail host shared spec could not replace the isolated spec' >&2; exit 1; }}; \
                      [ \"$t\" -eq 0 ] || {{ echo \"td-jail host shared-network fixture failed: $p\" >&2; exit 1; }}; \
@@ -264,14 +277,14 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", "{tools}"),
+        .env("PATH", PATH),
     );
 
     steps.push(
         Step::run(
             "{root}",
             &[
-                POST_RUST_SH,
+                SH,
                 "-c",
                 &format!(
                     "o=$(TD_JAIL_TEST_LEAK_FD=1 '{bin}' --probe-transition 2>&1) || {{ echo \"td-jail namespace transition probe failed: $o\" >&2; exit 1; }}; \
@@ -280,14 +293,14 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", "{tools}"),
+        .env("PATH", PATH),
     );
 
     steps.push(
         Step::run(
             "{root}",
             &[
-                POST_RUST_SH,
+                SH,
                 "-c",
                 &format!(
                     "'{bin}' --internal-write-seccomp-filter >'{{root}}/filter.bpf' || {{ echo 'td-jail could not export its compiled seccomp filter' >&2; exit 1; }}; \
@@ -295,7 +308,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", "{tools}"),
+        .env("PATH", PATH),
     );
 
     steps.push(Step::MkDir {
@@ -313,19 +326,8 @@ pub fn recipe() -> Recipe {
         exec: false,
     });
     Recipe::mesboot("td-jail-test", "1.0")
-        // post_rust_inputs adds the tool farm's providers, td-sh and td-util
-        // among them, which the surrogate's runtime also carries.
-        .native_inputs(&post_rust_inputs(
-            "gawk-x86-64-self",
-            &[
-                "td-jail",
-                "td-busd",
-                "td-compositor",
-                "td-jail-seccomp-probe",
-                "ca-certificates",
-                "binutils-x86-64-self",
-            ],
-        ))
+        .build_root()
+        .native_inputs(INPUTS)
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
@@ -341,8 +343,21 @@ exec "$TD_RECIPE_EVAL" check-run td-jail-test 1
 mod tests {
     use super::{
         host_fixture, HOST_DEGRADATION_CGROUP, HOST_DEGRADATION_WAYLAND, HOST_FIREFOX_MARKER,
-        HOST_FIREFOX_RUNTIME,
+        HOST_FIREFOX_RUNTIME, INPUTS,
     };
+
+    /// td-jail is graded by the Debian build root's bash, readelf and GNU
+    /// tools. td-sh and td-util pass as subjects because they are the
+    /// surrogate's runtime inside the jail, never a tool on PATH.
+    /// td-jail-seccomp-probe is still built by the ladder's GCC.
+    #[test]
+    fn td_jail_is_graded_only_by_the_roots_bash_and_tools() {
+        crate::ladder::assert_build_root_test(
+            &super::recipe(),
+            INPUTS,
+            &["td-jail", "td-sh", "td-util"],
+        );
+    }
 
     #[test]
     fn host_home_holds_every_firefox_source_the_jail_will_not_create() {
@@ -414,6 +429,12 @@ mod tests {
         for provider in ["td-sh", "td-util"] {
             assert!(inputs.iter().any(|input| input == provider));
         }
+        // They are the surrogate's payload, never a tool of the test's.
+        assert!(!recipe.steps.iter().flatten().any(|step| matches!(
+            step,
+            crate::types::Step::Run { argv, .. }
+                if argv.iter().any(|arg| arg.contains("{in:td-sh}") || arg.contains("{in:td-util}"))
+        )));
         assert!(recipe.steps.iter().flatten().any(|step| matches!(
             step,
             crate::types::Step::Run { argv, .. }

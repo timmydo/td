@@ -242,11 +242,12 @@ deleted; its findings are summarized under "Facts" below.
     there. The ladder's users move first, in parts; the deletion, the
     sweep and this file's removal are the last. Landed: the direct-rustc
     recipes build in the root and split with its objcopy, so no shipped
-    output's build declares the ladder's binutils; and ten td tests grade
-    their subjects in the root with its bash, readelf, grep and gawk.
-    Still on the ladder: td-jail-test's, td-svc-test's and
-    rust-userland-auto-test's readelf and tool farm, the rust-toolchain
-    check, td-jail-seccomp-probe, the crypto portable kit,
+    output's build declares the ladder's binutils; and the twelve td
+    tests grade their subjects in the root with its bash, readelf, grep
+    and gawk, under fresh writable /home, /mnt, /run and /var.
+    Still on the ladder: rust-userland-auto-test's readelf and tool
+    farm, the rust-toolchain check, td-jail-seccomp-probe (an input of
+    td-jail-test's), the crypto portable kit,
     system-x86-64's, kexec-spike-x86-64's and kexec-spike-x86-64-test's
     tool farm (gawk-x86-64-self), and the ladder's own fixtures (hello,
     hello-test), deleted with it.

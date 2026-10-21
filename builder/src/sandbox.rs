@@ -1731,6 +1731,19 @@ pub fn build(
          nobody:x:65534:65534:Nobody:/:/noshell\n"
     );
     let group_body = format!("root:x:0:\nnixbld:x:{GUEST_GID}:\nnogroup:x:65534:\n");
+    // A read-only build root gets a fresh tmpfs over each writable directory,
+    // as the minimal root's own tmpfs left them writable.
+    let writable: Vec<CString> = match &root_src {
+        Some(_) => crate::build_root::WRITABLE
+            .iter()
+            .map(|dir| {
+                CString::new(newroot.join(dir).as_os_str().as_encoded_bytes())
+                    .map_err(|e| err(format!("build-root mount point {dir}: {e}")))
+            })
+            .collect::<io::Result<_>>()?,
+        None => Vec::new(),
+    };
+    let var_tmp = newroot.join("var/tmp");
     // A read-only build root keeps its own /etc: the two files bind over its
     // passwd and group from scratch instead of being written into a tmpfs.
     let etc_binds = match &root_src {
@@ -1933,6 +1946,17 @@ pub fn build(
                     fs::write(&etc_passwd, &passwd_body)?;
                     fs::write(&etc_group, &group_body)?;
                 }
+            }
+            for dir in &writable {
+                sys::mount(Some(&tmpfs_c), dir, Some(&tmpfs_c), 0, None)?;
+            }
+            if !writable.is_empty() {
+                // Explicitly, as /tmp's is: create's mode passes the umask.
+                fs::create_dir(&var_tmp)?;
+                fs::set_permissions(
+                    &var_tmp,
+                    <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o1777),
+                )?;
             }
             // Pivot into the minimal root and drop the host root entirely.
             sys::pivot_root(&newroot_c, &oldroot_rel_c)?;

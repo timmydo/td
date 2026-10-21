@@ -174,7 +174,8 @@ layer plus pinned .debs from snapshot.debian.org, resolved into
 assembled by td-builder into one input-addressed store path whose NAR hash
 the lock pins. A recipe that declares `build_root` runs with that tree as
 its read-only sandbox `/`, so its steps may run Debian's gcc, binutils, make
-and the rest. What td enforces:
+and the rest, with writable scratch where the minimal root had it
+(`UNSAFE.md` lists the mounts). What td enforces:
 
 - its pins are a class of their own: no input channel, seed or source-pin
   lookup resolves one, and the sandbox binds as `/` only the path the
