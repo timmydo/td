@@ -821,6 +821,7 @@ mod tests {
     fn rust_userland_recipes_own_their_fixed_output_source_pins() {
         let platform: Vec<String> = [
             "rust-toolchain",
+            "td-link",
             "gcc-x86-64-self",
             "binutils-x86-64-self",
             "glibc-x86-64",

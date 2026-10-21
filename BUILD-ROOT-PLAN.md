@@ -15,7 +15,7 @@ deleted; its findings are summarized under "Facts" below.
 | libc | **glibc 2.41, built from source in the build root.** Rust target stays `x86_64-unknown-linux-gnu` |
 | GCC runtime | GCC's `libgcc` (libgcc_s.so.1, libgcc.a, libgcc_eh.a, crtbegin/crtend) built from the pinned GCC 14 source in the build root |
 | Rust | Upstream prebuilt gnu-host rustc/cargo/rust-std/clippy 1.96.0, retargeted onto td glibc/libgcc/zlib by the existing rust-stage0 transform (renamed `rust-dist`) |
-| Linking without GCC | `td-cc` becomes a GCC-free link driver: rustc's `cc`, forwarding to `rust-lld` with td's glibc and libgcc start-up files |
+| Linking without GCC | `td-link`, a GCC-free link driver: rustc's linker, forwarding to `rust-lld` with td's glibc and libgcc start-up files. `td-cc` stays the image's GCC launcher until the image switch |
 | Old ladder | Deleted entirely (stage0, Mes, TinyCC, GCC/glibc/binutils ladder, source-built Rust/LLVM, bootstrap-root) |
 | Self-hosting | Image ships upstream Rust + td-cc + glibc + libgcc; C rebuilds need the build root (fetched on demand, cached) |
 | Git | Upstream Git 2.55.0 from source in the build root (grit rejected) |
@@ -62,16 +62,20 @@ deleted; its findings are summarized under "Facts" below.
   runtime. Its default linker, `cc` from PATH, is passed
   `-fuse-ld=lld -B…/gcc-ld`, which td's GCC (configured `--with-ld`)
   consumes and ignores, so it links with GNU ld; an explicitly named gcc
-  infers a flavor without lld, and `-Clinker-features=-lld` pins GNU ld
-  either way. rust-lld first links in increment 7.
+  infers a flavor without lld, and `-Clinker-features=-lld` pinned GNU ld
+  either way until increment 7, when td-link and rust-lld took over every
+  Rust link.
 - After the cutover only json-c (cryptsetup's LUKS2 dependency) needed
   cmake, so it moved into the root with the cutover and the ladder's
   cmake went; AWS-LC already builds with its `cc` builder.
 - Toolchain size: today ~1,030 MiB (source-built Rust 576, GCC 255,
   binutils 114, glibc 86). After: upstream Rust ~650 + glibc ~86 +
-  libgcc/zlib/td-cc a few MiB ≈ 740 MiB, ~290 MiB smaller.
-- Not yet exercised: the gnu toolchain linking through a rust-lld driver
-  with GCC unreachable (the musl spike proved the same shape for musl).
+  libgcc/zlib/td-link a few MiB ≈ 740 MiB, ~290 MiB smaller.
+- The gnu toolchain links through td-link and rust-lld with GCC and
+  binutils unreachable (`td-link-test`, increment 7). A dynamic output
+  that links gcc-runtime's unwinder lookup, which calls glibc's
+  `_dl_find_object`, also needs `ld-linux-x86-64.so.2`, its own
+  interpreter.
 
 ## Increments (each one green, reviewed, landable; order matters)
 
@@ -143,17 +147,25 @@ deleted; its findings are summarized under "Facts" below.
    cite the source-built toolchain. Deletes the source-built
    stage1/stage2/LLVM path, `rust-stage0`, `td-util-boot` and
    `cmake-x86-64`.
-7. **A GCC-free Rust link driver.** Accepts rustc's gcc-style link
-   lines (`-Wl,…`, `-nodefaultlibs`, `-pie`, `-static`, `-static-pie`,
-   `-shared`, `-l…`, `-L…`, `-o`), selects td glibc/gcc-runtime crt
-   objects per output kind, runs `rust-lld`; refuses compile requests.
-   Every Rust recipe and the image's `cc` for Cargo switch to it, and
-   `-Clinker-features=-lld` leaves the target policy. Tests:
-   a dynamic PIE, a static ET_EXEC, a static PIE, a proc-macro dylib and
-   a cdylib, with no gcc or binutils reachable. C inside crates (`ring`,
-   AWS-LC, jemalloc, blake3, oniguruma, pcre2) compiles in the build root
-   against td glibc. Amends `crypto_policy.rs` and the td-crypto/td-mta
-   design docs for AWS-LC's compiler.
+7. **A GCC-free Rust link driver.** A new std-only crate, `td-link`
+   (td-link/DESIGN.md), accepts rustc's gcc-style link lines (`-Wl,…`,
+   `-nodefaultlibs`, `-pie`, `-static`, `-static-pie`, `-shared`, `-l…`,
+   `-L…`, `-o`, `@file`), selects td glibc/gcc-runtime crt objects per
+   output kind, runs `rust-lld`, links libgcc statically, and refuses
+   compile requests and unknown options. Its recipe bootstraps in the
+   build root and links itself twice, byte-identically. Every Rust recipe
+   switches to it, direct (`ladder::target_rustc`) and Cargo (its target
+   linker, which build scripts and proc macros also take, retiring the
+   static-link `cc` wrapper and the synthesized libgcc_eh.a), and
+   `-Clinker-features=-lld` leaves the target policy. `td-link-test`
+   links a dynamic PIE, a static ET_EXEC, a static PIE, a proc-macro
+   dylib and a cdylib with no gcc or binutils reachable. Rust outputs'
+   libgcc assembly boundary moves from gcc-x86-64-self to gcc-runtime.
+   7b. **C inside crates in the build root.** C compiled by build scripts
+   (`ring`, AWS-LC, jemalloc, blake3, oniguruma, pcre2) compiles in the
+   build root against td glibc instead of with gcc-x86-64-self, so Cargo
+   recipes drop their GCC and binutils for C. Amends `crypto_policy.rs`
+   and the td-crypto/td-mta design docs for AWS-LC's compiler.
 8. **C packages in the build root against td glibc**: LibreSSL (library
    only), curl, Git 2.55.0; popt, libdevmapper, util-linux libs,
    cryptsetup (static, as today); OpenSSH (`--without-openssl`). One
@@ -176,7 +188,8 @@ deleted; its findings are summarized under "Facts" below.
    Landed: td-net's `td-test-https` applet (mint, serve, probe), and
    LibreSSL builds no command.
 10. **Image switch.** system-x86-64 ships the upstream Rust toolchain,
-    the link driver, td glibc and libgcc instead of GCC and binutils.
+    td-link, td glibc and libgcc instead of GCC and binutils; Cargo in
+    the image takes td-link as its linker, and td-cc goes.
 11. **Delete the ladder.** `seed/` (stage0, patches, bootstrap-root,
     seed digests as applicable), stage0/Mes/TinyCC/mesboot/GCC/glibc
     ladder/binutils/make/gawk/cmake recipes, `ladder.rs`, `mes_boot.rs`,
@@ -194,8 +207,8 @@ deleted; its findings are summarized under "Facts" below.
 
 ## Risks
 
-- td-cc link driver correctness across output kinds is the main new
-  risk; step 6 lands it with tests before anything depends on it.
+- td-link correctness across output kinds is the main new risk; step 7
+  lands it with `td-link-test` beside the recipes that depend on it.
 - Docker Hub and snapshot.debian.org publish no retention guarantee; only
   the local cache protects (old digests back to 2017 still resolve).
 - glibc and libgcc built by Debian's gcc must stay reproducible run to run;

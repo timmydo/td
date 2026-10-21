@@ -18,29 +18,15 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 pub fn recipe() -> Recipe {
     let bin = "{in:td-photo}/bin/td-photo";
     // The fixture is linked static exactly as `static_local_source_program`
-    // links td-mail: the self-hosted toolchains install under a nested
-    // stage/td/store/<pkg> DESTDIR, rust-toolchain flat, and gcc-x86-64-self
-    // folds the unwinder into libgcc.a, so the libgcc_eh.a a `-static`
-    // rustc link asks for is synthesized from it.
+    // links td-mail, by td-link.
     let rustc = "{in:rust-toolchain}/bin/rustc";
-    let gcc = "{in:gcc-x86-64-self}/stage/td/store/gcc-14.3.0-x86_64-self/bin/gcc";
-    let gccbin = "{in:gcc-x86-64-self}/stage/td/store/gcc-14.3.0-x86_64-self/bin";
-    let bbin = "{in:binutils-x86-64-self}/bin";
-    let glib = "{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64/lib";
-    let objcopy = "{in:binutils-x86-64-self}/bin/objcopy";
-    let ranlib = "{in:binutils-x86-64-self}/bin/ranlib";
-    let libgcc_a = "{in:gcc-x86-64-self}/stage/td/store/gcc-14.3.0-x86_64-self/lib/gcc/x86_64-pc-linux-gnu/14.3.0/libgcc.a";
-    let linker = format!("-Clinker={gcc}");
-    let lib_b = format!("-Clink-arg=-B{glib}");
-    let bin_b = format!("-Clink-arg=-B{bbin}");
-    let path = format!("{bbin}:{gccbin}");
     let synth = "{out}/bin/td-photo-synth";
     let frame = "{root}/roll/DSC_0001.NEF";
     Recipe::mesboot("td-photo-test", "1.0")
         .native_inputs(&[
             "td-photo",
             "rust-toolchain",
-            "gcc-x86-64-self",
+            "td-link",
             "binutils-x86-64-self",
             "glibc-x86-64",
         ])
@@ -63,11 +49,6 @@ pub fn recipe() -> Recipe {
                 content: include_str!("../fixtures/td_photo_synth.rs").into(),
                 exec: false,
             },
-            Step::MkDir {
-                path: "{root}/eh".into(),
-            },
-            Step::run("{root}", &[objcopy, libgcc_a, "{root}/eh/libgcc_eh.a"]).env("PATH", &path),
-            Step::run("{root}", &[ranlib, "{root}/eh/libgcc_eh.a"]).env("PATH", &path),
             target_rustc(
                 "{src}",
                 rustc,
@@ -84,19 +65,11 @@ pub fn recipe() -> Recipe {
                     "relocation-model=static",
                     "-C",
                     "panic=abort",
-                    &linker,
-                    "-L",
-                    glib,
-                    &lib_b,
-                    &bin_b,
-                    "-Clink-arg=-L{root}/eh",
-                    "-Clink-arg=-static-libgcc",
                     "-o",
                     synth,
                     "{src}/synth.rs",
                 ],
             )
-            .env("PATH", &path)
             .env("SOURCE_DATE_EPOCH", "1"),
             Step::Require {
                 paths: vec![synth.into()],
@@ -159,7 +132,7 @@ mod tests {
             Some(vec![
                 "td-photo".into(),
                 "rust-toolchain".into(),
-                "gcc-x86-64-self".into(),
+                "td-link".into(),
                 "binutils-x86-64-self".into(),
                 "glibc-x86-64".into(),
             ])

@@ -12,8 +12,9 @@ use crate::types::Recipe;
 // Like ripgrep/fd, uutils builds as a `--auto` graph node; the read-only-root
 // system image also consumes it. `source_input`
 // wires TD_SRC from the pinned .crate; `native_inputs` name the build platform
-// (rust-toolchain for cargo/rustc, gcc/binutils/glibc-`self` for the native link
-// env the builder derives; it copies and unpacks the source itself);
+// (rust-toolchain for cargo/rustc, td-link to link, gcc/binutils/glibc-`self`
+// for the native C env the builder derives; it copies and unpacks the source
+// itself);
 // `cargo_lock` is the committed, checksum-pinned closure the `--auto` vendor gate
 // verifies against.
 pub fn recipe() -> Recipe {
@@ -21,6 +22,7 @@ pub fn recipe() -> Recipe {
         .source_input("uutils-source")
         .native_inputs(&[
             "rust-toolchain",
+            "td-link",
             "gcc-x86-64-self",
             "binutils-x86-64-self",
             "glibc-x86-64",

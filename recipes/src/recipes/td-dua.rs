@@ -18,10 +18,10 @@ pub fn recipe() -> Recipe {
         .local_source_trees(&["td-civil", "td-json", "td-ui", "td-compositor"])
         .native_inputs(&[
             "rust-toolchain",
+            "td-link",
             "gcc-x86-64-self",
             "binutils-x86-64-self",
             "glibc-x86-64",
-            "td-sh",
         ])
         .cargo_subdir("td-dua")
         .cargo_lock("td-dua/Cargo.lock")

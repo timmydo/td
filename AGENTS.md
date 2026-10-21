@@ -29,6 +29,8 @@ needs them:
 - For shared PNG decoding or encoding, read `td-png/DESIGN.md`.
 - For making or checking Btrfs volumes (`mkfs.btrfs`), read
   `td-btrfs/DESIGN.md`.
+- For the Rust link driver td's Rust recipes link through, read
+  `td-link/DESIGN.md`.
 - For disk encryption or session unlock, read `td-install/ENCRYPTION.md`.
 - For compositor/UI, service supervision, or installation, read the matching
   `td-compositor/DESIGN.md`, `td-svc/DESIGN.md`, or `td-install/DESIGN.md`;
@@ -210,11 +212,21 @@ build root: unmarked, executed by recipes, shipped in the image, and named
 by a source-bootstrap claim (`upstream-rust`) for every closure that
 contains it. Every Rust output links its prebuilt standard library. A
 stronger claim needs a separately specified diverse bootstrap or
-diverse-double-compilation proof. Until td's rust-lld link driver lands
-(`BUILD-ROOT-PLAN.md`), td's Rust recipes link through td's GCC and binutils
-with `-Clinker-features=-lld`; build scripts and proc macros, which Cargo
-links without target flags, get upstream's `-fuse-ld=lld`, which td's GCC,
-configured `--with-ld`, ignores.
+diverse-double-compilation proof. Every Rust output a td recipe builds,
+Cargo's build scripts and proc macros included, links through `td-link`
+(`td-link/DESIGN.md`): a dependency-free driver that takes rustc's
+gcc-style link line, refuses compile requests, unknown linker options,
+host library paths on its line and inputs that are not ELF objects or
+ordinary archives, and runs the toolchain's rust-lld with td glibc's and
+gcc-runtime's start files and libraries, so no GCC or binutils takes part
+in the link. td-link is itself a Debian build-root member: the root's GCC
+links its throwaway first stage, and its claim to link without GCC rests
+on its second and third stages linking byte-identically. GCC still links
+Rust in three places until the image switch (increment 10 of
+`BUILD-ROOT-PLAN.md`): the native control-plane build on a td host
+(`builder/src/stage0.rs`, `-Clinker` the host's `cc`), Cargo's default
+`cc` in the image, and td-cc's own launcher probes. C that Cargo build
+scripts compile still uses td's GCC until it moves into the build root.
 
 Cargo dependency sources are fixed-output inputs selected by committed
 `Cargo.lock` checksums. Builds run offline. Git dependencies are unsupported

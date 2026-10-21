@@ -210,18 +210,6 @@ const MODULES: &[(&str, &str)] = &[
 
 pub fn recipe() -> Recipe {
     let rustc = "{in:rust-toolchain}/bin/rustc";
-    let gcc = "{in:gcc-x86-64-self}/stage/td/store/gcc-14.3.0-x86_64-self/bin/gcc";
-    let gccbin = "{in:gcc-x86-64-self}/stage/td/store/gcc-14.3.0-x86_64-self/bin";
-    let bbin = "{in:binutils-x86-64-self}/bin";
-    let glib = "{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64/lib";
-    let objcopy = "{in:binutils-x86-64-self}/bin/objcopy";
-    let ranlib = "{in:binutils-x86-64-self}/bin/ranlib";
-    let libgcc_a = "{in:gcc-x86-64-self}/stage/td/store/gcc-14.3.0-x86_64-self/lib/gcc/x86_64-pc-linux-gnu/14.3.0/libgcc.a";
-
-    let linker = format!("-Clinker={gcc}");
-    let lib_b = format!("-Clink-arg=-B{glib}");
-    let bin_b = format!("-Clink-arg=-B{bbin}");
-    let path = format!("{bbin}:{gccbin}");
 
     let mut steps = Vec::new();
     for directory in [
@@ -388,13 +376,6 @@ pub fn recipe() -> Recipe {
         content: include_str!("../../../engine/src/sha256.rs").into(),
         exec: false,
     });
-    steps.push(Step::MkDir {
-        path: "{root}/eh".into(),
-    });
-    steps.push(
-        Step::run("{root}", &[objcopy, libgcc_a, "{root}/eh/libgcc_eh.a"]).env("PATH", &path),
-    );
-    steps.push(Step::run("{root}", &[ranlib, "{root}/eh/libgcc_eh.a"]).env("PATH", &path));
     // td-fido, the FIDO2 client its token operations run over, then td-tpm,
     // the TPM client its sealed-store formats run over and whose sessions
     // use td-fido, each with the shipped profile; the unwinding test
@@ -428,11 +409,7 @@ pub fn recipe() -> Recipe {
                 args.extend_from_slice(&["--extern", &fido]);
             }
             args.extend_from_slice(&["-o", &output, source]);
-            steps.push(
-                target_rustc("{src}", rustc, &args)
-                    .env("PATH", &path)
-                    .env("SOURCE_DATE_EPOCH", "1"),
-            );
+            steps.push(target_rustc("{src}", rustc, &args).env("SOURCE_DATE_EPOCH", "1"));
         }
     }
     // The library holds every module; the binary only calls its `run`.
@@ -466,7 +443,6 @@ pub fn recipe() -> Recipe {
                 "{src}/td-secret/src/lib.rs",
             ],
         )
-        .env("PATH", &path)
         .env("SOURCE_DATE_EPOCH", "1"),
     );
     steps.push(
@@ -492,19 +468,11 @@ pub fn recipe() -> Recipe {
                 "td_secret={root}/libtd_secret.rlib",
                 "-L",
                 "dependency={root}",
-                &linker,
-                "-L",
-                glib,
-                &lib_b,
-                &bin_b,
-                "-Clink-arg=-L{root}/eh",
-                "-Clink-arg=-static-libgcc",
                 "-o",
                 "{out}/bin/td-secret",
                 "{src}/td-secret/src/main.rs",
             ],
         )
-        .env("PATH", &path)
         .env("SOURCE_DATE_EPOCH", "1"),
     );
     steps.push(Step::Require {
@@ -532,19 +500,11 @@ pub fn recipe() -> Recipe {
                 "target-feature=+crt-static",
                 "-C",
                 "relocation-model=static",
-                &linker,
-                "-L",
-                glib,
-                &lib_b,
-                &bin_b,
-                "-Clink-arg=-L{root}/eh",
-                "-Clink-arg=-static-libgcc",
                 "-o",
                 "{root}/secret-tests",
                 "{src}/td-secret/src/lib.rs",
             ],
         )
-        .env("PATH", &path)
         .env("CARGO_MANIFEST_DIR", "{src}/td-secret")
         .env("SOURCE_DATE_EPOCH", "1"),
     );
@@ -572,22 +532,11 @@ pub fn recipe() -> Recipe {
             "target-feature=+crt-static",
             "-C",
             "relocation-model=static",
-            &linker,
-            "-L",
-            glib,
-            &lib_b,
-            &bin_b,
-            "-Clink-arg=-L{root}/eh",
-            "-Clink-arg=-static-libgcc",
             "-o",
             output,
             source,
         ]);
-        steps.push(
-            target_rustc("{src}", rustc, &args)
-                .env("PATH", &path)
-                .env("SOURCE_DATE_EPOCH", "1"),
-        );
+        steps.push(target_rustc("{src}", rustc, &args).env("SOURCE_DATE_EPOCH", "1"));
         steps.push(Step::run("{root}", &[output]));
     }
     steps.push(split_target_debug("{out}"));
@@ -596,7 +545,7 @@ pub fn recipe() -> Recipe {
     Recipe::mesboot("td-secret", "0.1")
         .native_inputs(&[
             "rust-toolchain",
-            "gcc-x86-64-self",
+            "td-link",
             "binutils-x86-64-self",
             "glibc-x86-64",
         ])

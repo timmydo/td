@@ -84,25 +84,7 @@ fn declared_modules() -> Vec<&'static str> {
 }
 
 pub fn recipe() -> Recipe {
-    // The self-hosted toolchains install under a nested stage/td/store/<pkg>
-    // DESTDIR (re the /td/store prefix); rust-toolchain installs flat.
     let rustc = "{in:rust-toolchain}/bin/rustc";
-    let gcc = "{in:gcc-x86-64-self}/stage/td/store/gcc-14.3.0-x86_64-self/bin/gcc";
-    let gccbin = "{in:gcc-x86-64-self}/stage/td/store/gcc-14.3.0-x86_64-self/bin";
-    let bbin = "{in:binutils-x86-64-self}/bin";
-    let glib = "{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64/lib";
-    // gcc-x86-64-self folds the unwinder objects INTO libgcc.a and never emits a
-    // separate static libgcc_eh.a. A `-static` rustc link still passes `-lgcc_eh`,
-    // so synthesize one from libgcc.a — the same workaround td-util documents.
-    let objcopy = "{in:binutils-x86-64-self}/bin/objcopy";
-    let ranlib = "{in:binutils-x86-64-self}/bin/ranlib";
-    let libgcc_a = "{in:gcc-x86-64-self}/stage/td/store/gcc-14.3.0-x86_64-self/lib/gcc/x86_64-pc-linux-gnu/14.3.0/libgcc.a";
-
-    // Bound so they outlive the argv slice; `&String` deref-coerces to `&str`.
-    let linker = format!("-Clinker={gcc}");
-    let lib_b = format!("-Clink-arg=-B{glib}");
-    let bin_b = format!("-Clink-arg=-B{bbin}");
-    let path = format!("{bbin}:{gccbin}");
 
     let mut steps = Vec::new();
     steps.push(Step::MkDir {
@@ -122,13 +104,6 @@ pub fn recipe() -> Recipe {
             exec: false,
         });
     }
-    steps.push(Step::MkDir {
-        path: "{root}/eh".into(),
-    });
-    steps.push(
-        Step::run("{root}", &[objcopy, libgcc_a, "{root}/eh/libgcc_eh.a"]).env("PATH", &path),
-    );
-    steps.push(Step::run("{root}", &[ranlib, "{root}/eh/libgcc_eh.a"]).env("PATH", &path));
     steps.push(
         target_rustc(
             "{src}",
@@ -149,19 +124,11 @@ pub fn recipe() -> Recipe {
                 // shared target policy deliberately preserves symbols.
                 "-C",
                 "panic=abort",
-                &linker,
-                "-L",
-                glib,
-                &lib_b,
-                &bin_b,
-                "-Clink-arg=-L{root}/eh",
-                "-Clink-arg=-static-libgcc",
                 "-o",
                 "{out}/bin/td-svc",
                 "{src}/main.rs",
             ],
         )
-        .env("PATH", &path)
         .env("SOURCE_DATE_EPOCH", "1"),
     );
     steps.push(Step::Require {
@@ -189,19 +156,11 @@ pub fn recipe() -> Recipe {
                 "target-feature=+crt-static",
                 "-C",
                 "relocation-model=static",
-                &linker,
-                "-L",
-                glib,
-                &lib_b,
-                &bin_b,
-                "-Clink-arg=-L{root}/eh",
-                "-Clink-arg=-static-libgcc",
                 "-o",
                 "{root}/pair-tests",
                 "{src}/pair-tests.rs",
             ],
         )
-        .env("PATH", &path)
         .env("TD_SVC_TEST_BINARY", "{out}/bin/td-svc")
         .env("SOURCE_DATE_EPOCH", "1"),
     );
@@ -214,7 +173,7 @@ pub fn recipe() -> Recipe {
     Recipe::mesboot("td-svc", "0.1")
         .native_inputs(&[
             "rust-toolchain",
-            "gcc-x86-64-self",
+            "td-link",
             "binutils-x86-64-self",
             "glibc-x86-64",
         ])

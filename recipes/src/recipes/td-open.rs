@@ -15,10 +15,10 @@ pub fn recipe() -> Recipe {
         .local_source_trees(&["td-busd", "td-secret"])
         .native_inputs(&[
             "rust-toolchain",
+            "td-link",
             "gcc-x86-64-self",
             "binutils-x86-64-self",
             "glibc-x86-64",
-            "td-sh",
         ])
         .cargo_subdir("td-open")
         .cargo_lock("td-open/Cargo.lock")

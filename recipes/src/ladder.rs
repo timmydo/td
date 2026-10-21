@@ -187,9 +187,13 @@ pub fn link_bins(rung: BinutilsRung) -> Step {
 /// output, not a host bash.
 pub const SH: &str = "{in:bash-mesboot}/bin/bash";
 
-/// One target-only direct-rustc invocation. The shared arguments follow every
-/// recipe's functional arguments so a local `-C` option cannot quietly override
-/// the target-wide frame/debug/build-ID policy.
+/// td-link, the linker of every td Rust output (`td-link/DESIGN.md`).
+pub const TD_LINK: &str = "{in:td-link}/bin/td-link";
+
+/// One target-only direct-rustc invocation, linked by td-link. The shared
+/// arguments follow every recipe's functional arguments so a local `-C`
+/// option cannot quietly override the target-wide frame/debug/build-ID
+/// policy.
 pub fn target_rustc(dir: &str, rustc: &str, args: &[&str]) -> Step {
     target_rustc_at_roots(dir, rustc, args, "{root}", "{src}")
 }
@@ -204,10 +208,28 @@ pub fn target_rustc_at_roots(
     build_root: &str,
     source_root: &str,
 ) -> Step {
+    rustc_step(dir, rustc, args, TD_LINK, build_root, source_root)
+}
+
+/// Direct rustc under the target policy with another linker: td-link's own
+/// bootstrap, and td-cc's proof of its compiler launcher.
+pub fn target_rustc_linked_by(dir: &str, rustc: &str, args: &[&str], linker: &str) -> Step {
+    rustc_step(dir, rustc, args, linker, "{root}", "{src}")
+}
+
+fn rustc_step(
+    dir: &str,
+    rustc: &str,
+    args: &[&str],
+    linker: &str,
+    build_root: &str,
+    source_root: &str,
+) -> Step {
     let mut argv =
-        Vec::with_capacity(1 + td_engine::target_profile::DIRECT_RUSTC_ARGS.len() + args.len());
+        Vec::with_capacity(2 + td_engine::target_profile::DIRECT_RUSTC_ARGS.len() + args.len());
     argv.push(rustc.to_string());
     argv.extend(args.iter().map(|arg| (*arg).to_string()));
+    argv.push(format!("-Clinker={linker}"));
     argv.extend(td_engine::target_profile::direct_rustc_args(
         build_root,
         source_root,
@@ -540,24 +562,7 @@ pub(crate) fn assert_sibling_sources_staged(recipe: Recipe, crates: &[&str]) {
 /// its `#[path]` modules name, as (`{src}/<repo-relative path>`, contents),
 /// staged where the include resolves as td-authd's are.
 pub fn static_local_source_program(name: &str, shared: &[(&str, &str)]) -> Recipe {
-    // The self-hosted toolchains install under a nested stage/td/store/<pkg>
-    // DESTDIR (re the /td/store prefix); rust-toolchain installs flat.
     let rustc = "{in:rust-toolchain}/bin/rustc";
-    let gcc = "{in:gcc-x86-64-self}/stage/td/store/gcc-14.3.0-x86_64-self/bin/gcc";
-    let gccbin = "{in:gcc-x86-64-self}/stage/td/store/gcc-14.3.0-x86_64-self/bin";
-    let bbin = "{in:binutils-x86-64-self}/bin";
-    let glib = "{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64/lib";
-    // gcc-x86-64-self folds the unwinder into libgcc.a and emits no static
-    // libgcc_eh.a, which a `-static` rustc link still asks for; synthesize one
-    // from libgcc.a as td-sh does.
-    let objcopy = "{in:binutils-x86-64-self}/bin/objcopy";
-    let ranlib = "{in:binutils-x86-64-self}/bin/ranlib";
-    let libgcc_a = "{in:gcc-x86-64-self}/stage/td/store/gcc-14.3.0-x86_64-self/lib/gcc/x86_64-pc-linux-gnu/14.3.0/libgcc.a";
-
-    let linker = format!("-Clinker={gcc}");
-    let lib_b = format!("-Clink-arg=-B{glib}");
-    let bin_b = format!("-Clink-arg=-B{bbin}");
-    let path = format!("{bbin}:{gccbin}");
     let source = format!("{{in:{name}-source}}");
     let binary = format!("{{out}}/bin/{name}");
     let main = format!("{{src}}/{name}/src/main.rs");
@@ -584,11 +589,6 @@ pub fn static_local_source_program(name: &str, shared: &[(&str, &str)]) -> Recip
         });
     }
     steps.extend([
-        Step::MkDir {
-            path: "{root}/eh".into(),
-        },
-        Step::run("{root}", &[objcopy, libgcc_a, "{root}/eh/libgcc_eh.a"]).env("PATH", &path),
-        Step::run("{root}", &[ranlib, "{root}/eh/libgcc_eh.a"]).env("PATH", &path),
         target_rustc(
             "{src}",
             rustc,
@@ -608,19 +608,11 @@ pub fn static_local_source_program(name: &str, shared: &[(&str, &str)]) -> Recip
                 // shared target policy deliberately preserves symbols.
                 "-C",
                 "panic=abort",
-                &linker,
-                "-L",
-                glib,
-                &lib_b,
-                &bin_b,
-                "-Clink-arg=-L{root}/eh",
-                "-Clink-arg=-static-libgcc",
                 "-o",
                 &binary,
                 &main,
             ],
         )
-        .env("PATH", &path)
         .env("SOURCE_DATE_EPOCH", "1"),
         Step::Require {
             paths: vec![binary.clone()],
@@ -635,12 +627,7 @@ pub fn static_local_source_program(name: &str, shared: &[(&str, &str)]) -> Recip
 
     Recipe::mesboot(name, "0.1")
         .local_source(name)
-        .native_inputs(&[
-            "rust-toolchain",
-            "gcc-x86-64-self",
-            "binutils-x86-64-self",
-            "glibc-x86-64",
-        ])
+        .native_inputs(&["rust-toolchain", "td-link", "binutils-x86-64-self"])
         .steps(steps)
 }
 

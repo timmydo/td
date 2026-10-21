@@ -17,10 +17,10 @@ pub fn recipe() -> Recipe {
         .local_source_trees(&["engine", "td-boot", "td-fs"])
         .native_inputs(&[
             "rust-toolchain",
+            "td-link",
             "gcc-x86-64-self",
             "binutils-x86-64-self",
             "glibc-x86-64",
-            "td-sh",
         ])
         .cargo_subdir("net")
         .cargo_lock("net/Cargo.lock")

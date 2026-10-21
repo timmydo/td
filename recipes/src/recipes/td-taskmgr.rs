@@ -6,10 +6,10 @@ pub fn recipe() -> Recipe {
         .local_source_trees(&["td-ui", "td-compositor", "td-fs", "td-test-compositor"])
         .native_inputs(&[
             "rust-toolchain",
+            "td-link",
             "gcc-x86-64-self",
             "binutils-x86-64-self",
             "glibc-x86-64",
-            "td-sh",
         ])
         .cargo_subdir("td-taskmgr")
         .cargo_lock("td-taskmgr/Cargo.lock")

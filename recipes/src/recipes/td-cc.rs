@@ -1,11 +1,10 @@
-use crate::ladder::{split_target_debug, target_rustc};
+use crate::ladder::{split_target_debug, target_rustc, target_rustc_linked_by};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 const MAIN: &str = include_str!("../../../td-cc/src/main.rs");
 
 pub fn recipe() -> Recipe {
     let gcc_root = "{in:gcc-x86-64-self}/stage/td/store/gcc-14.3.0-x86_64-self";
-    let gcc = format!("{gcc_root}/bin/gcc");
     let glibc = "{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64";
     let binutils = "{in:binutils-x86-64-self}";
     let path = format!("{binutils}/bin:{gcc_root}/bin");
@@ -56,18 +55,11 @@ pub fn recipe() -> Recipe {
                 "-Cpanic=abort",
                 "-Ctarget-feature=+crt-static",
                 "-Crelocation-model=static",
-                &format!("-Clinker={gcc}"),
-                &format!("-Clink-arg=-B{binutils}/bin/"),
-                &format!("-Clink-arg=-B{glibc}/lib/"),
-                &format!("-L{glibc}/lib"),
-                "-Clink-arg=-L{out}/lib",
-                "-Clink-arg=-static-libgcc",
                 "-o",
                 "{out}/bin/td-cc",
                 "{src}/main.rs",
             ],
         )
-        .env("PATH", &path)
         .env("TD_CC_GCC", gcc_root)
         .env("TD_CC_BINUTILS", binutils)
         .env("TD_CC_GLIBC", glibc)
@@ -169,8 +161,10 @@ pub fn recipe() -> Recipe {
         Step::run("{root}", &["{root}/cargo-target/debug/native-probe"])
             .env("PATH", "/nonexistent"),
     );
+    // td's recipes link through td-link; this proves the launcher still
+    // serves a static Rust link as the image's `cc`.
     steps.push(
-        target_rustc(
+        target_rustc_linked_by(
             "{root}/cargo-probe",
             "{in:rust-toolchain}/bin/rustc",
             &[
@@ -183,6 +177,7 @@ pub fn recipe() -> Recipe {
                 "-o",
                 "{root}/static-rust-probe",
             ],
+            "{out}/bin/cc",
         )
         .env("PATH", "{out}/bin"),
     );
@@ -191,6 +186,7 @@ pub fn recipe() -> Recipe {
     Recipe::mesboot("td-cc", "0.1")
         .native_inputs(&[
             "rust-toolchain",
+            "td-link",
             "gcc-x86-64-self",
             "binutils-x86-64-self",
             "glibc-x86-64",

@@ -8,6 +8,7 @@ pub fn recipe() -> Recipe {
         .source_input("ripgrep-source")
         .native_inputs(&[
             "rust-toolchain",
+            "td-link",
             "gcc-x86-64-self",
             "binutils-x86-64-self",
             "glibc-x86-64",

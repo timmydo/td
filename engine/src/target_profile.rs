@@ -6,15 +6,13 @@
 
 /// rustc arguments used by direct target recipes. `{root}` and `{src}` are
 /// expanded by the typed recipe engine so the ephemeral build directory never
-/// reaches DWARF and package source has the canonical `/td-build` root.
-pub const DIRECT_RUSTC_ARGS: [&str; 7] = [
+/// reaches DWARF and package source has the canonical `/td-build` root. The
+/// linker is not policy here: recipes name td-link (`td-link/DESIGN.md`).
+pub const DIRECT_RUSTC_ARGS: &[&str] = &[
     "-Cforce-frame-pointers=yes",
     "-Cdebuginfo=line-tables-only",
     "-Cstrip=none",
     "-Clink-arg=-Wl,--build-id=sha1",
-    // Upstream's gnu target links through rust-lld by default; recipes keep
-    // the declared GNU linker until the rust-lld link driver replaces it.
-    "-Clinker-features=-lld",
     "--remap-path-prefix={root}=/td-build-root",
     "--remap-path-prefix={src}=/td-build",
 ];
@@ -51,16 +49,14 @@ pub const ALWAYS_PRUNED_DEBUG_SECTIONS: &[&str] = &[
 /// ordinary recipe path uses `{root}` and `{src}`; the bounded reproducibility
 /// oracle supplies two different roots which must canonicalize to these same
 /// target-visible names.
-pub fn direct_rustc_args(build_root: &str, source_root: &str) -> [String; 7] {
-    [
-        DIRECT_RUSTC_ARGS[0].into(),
-        DIRECT_RUSTC_ARGS[1].into(),
-        DIRECT_RUSTC_ARGS[2].into(),
-        DIRECT_RUSTC_ARGS[3].into(),
-        DIRECT_RUSTC_ARGS[4].into(),
-        format!("--remap-path-prefix={build_root}=/td-build-root"),
-        format!("--remap-path-prefix={source_root}=/td-build"),
-    ]
+pub fn direct_rustc_args(build_root: &str, source_root: &str) -> Vec<String> {
+    DIRECT_RUSTC_ARGS
+        .iter()
+        .map(|arg| {
+            arg.replace("{root}=", &format!("{build_root}="))
+                .replace("{src}=", &format!("{source_root}="))
+        })
+        .collect()
 }
 
 /// Reviewed source classes whose hand-written assembly is not certified to
@@ -116,6 +112,8 @@ pub const RUST_PROFILED_RECIPES: &[&str] = &[
     "td-install-qemu-test",
     "td-jail",
     "td-kexec",
+    "td-link",
+    "td-link-test",
     "td-login",
     "td-mail",
     "td-net",
@@ -151,6 +149,7 @@ pub const BUILD_ROOT_LINKED: &[&str] = &[
     "cryptsetup-x86-64",
     "openssh-x86-64",
     "git-x86-64",
+    "td-link",
 ];
 
 /// Conservative transitive assembly boundaries for a linked output. Every
@@ -167,8 +166,15 @@ pub fn output_assembly_exceptions(recipe: &str) -> Vec<(&'static str, &'static s
                     && matches!(recipe, "binutils-x86-64-self" | "gcc-x86-64-self"))
                 || (*source == "gcc-x86-64-self"
                     && !matches!(recipe, "glibc-x86-64" | "binutils-x86-64-self")
-                    && !BUILD_ROOT_LINKED.contains(&recipe))
-                || (*source == "gcc-runtime" && BUILD_ROOT_LINKED.contains(&recipe))
+                    && !BUILD_ROOT_LINKED.contains(&recipe)
+                    // td-link links td-cc as well, but td-cc ships a
+                    // libgcc_eh.a copied from GCC's libgcc.a.
+                    && (recipe == "td-cc" || !RUST_PROFILED_RECIPES.contains(&recipe)))
+                // Build-root C and every Rust output, which td-link links,
+                // take gcc-runtime's start files and libgcc, not GCC's.
+                || (*source == "gcc-runtime"
+                    && (BUILD_ROOT_LINKED.contains(&recipe)
+                        || RUST_PROFILED_RECIPES.contains(&recipe)))
                 || (*source == "rust-toolchain" && RUST_PROFILED_RECIPES.contains(&recipe))
                 // A package's own crate assembly reaches that package alone.
                 || (*source == recipe && recipe == "td-net")
@@ -227,21 +233,18 @@ pub fn debug_companion_policy(recipe: &str) -> String {
 /// deployment rather than by any one producer.
 pub const DEPLOYMENT_DEBUG_CEILING_BYTES: u64 = 1_073_741_824;
 
-/// Compose the Cargo runner's target-only RUSTFLAGS. The three varying source
+/// Compose the Cargo runner's target-only RUSTFLAGS. The linker is Cargo's
+/// target linker, td-link, which Cargo also gives build scripts and proc
+/// macros. The three varying source
 /// roots are mapped separately so dependencies compiled from the vendor tree do
 /// not retain a sandbox pathname that the package-source mapping cannot cover.
-pub fn cargo_rustflags(
-    build_root: &str,
-    cargo_root: &str,
-    vendor_root: &str,
-    linker: &str,
-) -> String {
+pub fn cargo_rustflags(build_root: &str, cargo_root: &str, vendor_root: &str) -> String {
     format!(
         "--remap-path-prefix={build_root}=/td-build \
          --remap-path-prefix={cargo_root}=/td-cargo \
          --remap-path-prefix={vendor_root}=/td-cargo/vendor \
          -Cforce-frame-pointers=yes -Cdebuginfo=line-tables-only -Cstrip=none \
-         -Clink-arg=-Wl,--build-id=sha1 -Clinker-features=-lld -Clinker={linker}"
+         -Clink-arg=-Wl,--build-id=sha1"
     )
 }
 
@@ -275,13 +278,12 @@ mod tests {
 
     #[test]
     fn target_flags_pin_frames_lines_identity_and_all_varying_roots() {
-        let rust = cargo_rustflags("/tmp/build", "/tmp/cargo", "/tmp/vendor", "/td/gcc");
+        let rust = cargo_rustflags("/tmp/build", "/tmp/cargo", "/tmp/vendor");
         for required in [
             "-Cforce-frame-pointers=yes",
             "-Cdebuginfo=line-tables-only",
             "-Cstrip=none",
             "-Clink-arg=-Wl,--build-id=sha1",
-            "-Clinker-features=-lld",
             "--remap-path-prefix=/tmp/build=/td-build",
             "--remap-path-prefix=/tmp/cargo=/td-cargo",
             "--remap-path-prefix=/tmp/vendor=/td-cargo/vendor",
@@ -291,6 +293,9 @@ mod tests {
                 "missing target Rust policy: {required}"
             );
         }
+        // td-link is the linker, named outside the policy; no lld opt-out.
+        assert!(!rust.contains("linker"), "{rust}");
+        assert!(!DIRECT_RUSTC_ARGS.iter().any(|arg| arg.contains("linker")));
         let c = cargo_cflags("/tmp/build", "/tmp/cargo", "/tmp/vendor");
         for required in [
             "-fno-omit-frame-pointer",
@@ -308,7 +313,6 @@ mod tests {
                 "-Cdebuginfo=line-tables-only",
                 "-Cstrip=none",
                 "-Clink-arg=-Wl,--build-id=sha1",
-                "-Clinker-features=-lld",
                 "--remap-path-prefix=/scratch/one=/td-build-root",
                 "--remap-path-prefix=/source/one=/td-build",
             ]
@@ -351,7 +355,7 @@ mod tests {
             output_assembly_exceptions("td-boot"),
             vec![
                 ("glibc-x86-64", "upstream glibc sysdeps/x86_64 assembly"),
-                ("gcc-x86-64-self", "upstream GCC libgcc x86_64 assembly"),
+                ("gcc-runtime", "upstream GCC libgcc x86_64 assembly"),
                 (
                     "rust-toolchain",
                     "upstream Rust 1.96.0 prebuilt standard library and compiler-runtime"
@@ -362,7 +366,7 @@ mod tests {
             output_assembly_exceptions("td-net"),
             vec![
                 ("glibc-x86-64", "upstream glibc sysdeps/x86_64 assembly"),
-                ("gcc-x86-64-self", "upstream GCC libgcc x86_64 assembly"),
+                ("gcc-runtime", "upstream GCC libgcc x86_64 assembly"),
                 (
                     "rust-toolchain",
                     "upstream Rust 1.96.0 prebuilt standard library and compiler-runtime"
@@ -377,7 +381,7 @@ mod tests {
                 output_assembly_exceptions(application),
                 vec![
                     ("glibc-x86-64", "upstream glibc sysdeps/x86_64 assembly"),
-                    ("gcc-x86-64-self", "upstream GCC libgcc x86_64 assembly"),
+                    ("gcc-runtime", "upstream GCC libgcc x86_64 assembly"),
                     (
                         "rust-toolchain",
                         "upstream Rust 1.96.0 prebuilt standard library and compiler-runtime"
@@ -420,7 +424,36 @@ mod tests {
                 ("gcc-x86-64-self", "upstream GCC libgcc x86_64 assembly"),
             ]
         );
-        for stem in BUILD_ROOT_LINKED {
+        // td-cc is linked by td-link but ships a libgcc_eh.a copied from
+        // GCC's libgcc.a, so it keeps GCC's boundary beside gcc-runtime's.
+        assert_eq!(
+            output_assembly_exceptions("td-cc"),
+            vec![
+                ("glibc-x86-64", "upstream glibc sysdeps/x86_64 assembly"),
+                ("gcc-x86-64-self", "upstream GCC libgcc x86_64 assembly"),
+                ("gcc-runtime", "upstream GCC libgcc x86_64 assembly"),
+                (
+                    "rust-toolchain",
+                    "upstream Rust 1.96.0 prebuilt standard library and compiler-runtime"
+                ),
+            ]
+        );
+        // td-link builds in the root and is a Rust output.
+        assert_eq!(
+            output_assembly_exceptions("td-link"),
+            vec![
+                ("glibc-x86-64", "upstream glibc sysdeps/x86_64 assembly"),
+                ("gcc-runtime", "upstream GCC libgcc x86_64 assembly"),
+                (
+                    "rust-toolchain",
+                    "upstream Rust 1.96.0 prebuilt standard library and compiler-runtime"
+                ),
+            ]
+        );
+        for stem in BUILD_ROOT_LINKED
+            .iter()
+            .filter(|stem| !RUST_PROFILED_RECIPES.contains(stem))
+        {
             assert_eq!(
                 output_assembly_exceptions(stem),
                 vec![

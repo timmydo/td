@@ -1822,19 +1822,25 @@ pub fn run_rust() -> Result<(), String> {
             cinc.push(inc);
         }
     }
-    let mut path = path.join(":");
+    let path = path.join(":");
     let cargo = find_in_path(&path, "cargo").ok_or("cargo not found in TD_INPUTS")?;
     find_in_path(&path, "rustc").ok_or("rustc not found in TD_INPUTS")?;
     let objcopy = env::var("TD_RUST_OBJCOPY").map_err(|_| {
         "TD_RUST_OBJCOPY not set (exact declared target objcopy is required)".to_string()
     })?;
     require_executable_file(&objcopy, "target objcopy")?;
+    // td-link links every Rust output (td-link/DESIGN.md). Cargo's target
+    // linker reaches build scripts and proc macros as well.
+    let linker = find_in_path(&path, "td-link")
+        .ok_or("td-link not found in TD_INPUTS (a Rust recipe declares td-link, its linker)")?;
+    require_executable_file(&linker, "Rust linker td-link")?;
+    // The C compiler of crates with C build scripts (the `cc` crate honors CC).
     let gcc = env::var("TD_RUST_STORE_CC")
         .ok()
         .filter(|p| !p.is_empty())
         .or_else(|| find_in_path(&path, "gcc"))
-        .ok_or("gcc not found in TD_INPUTS and TD_RUST_STORE_CC is unset (linker)")?;
-    require_executable_file(&gcc, "native Rust linker")?;
+        .ok_or("gcc not found in TD_INPUTS and TD_RUST_STORE_CC is unset (C compiler)")?;
+    require_executable_file(&gcc, "native C compiler")?;
     // Optional C/C++ compiler for crates with C build scripts (the `cc` crate honors
     // CC/CXX). Absent for pure-Rust builds — harmless, since no C is compiled then.
     let gpp = env::var("TD_RUST_STORE_CXX")
@@ -1888,11 +1894,8 @@ pub fn run_rust() -> Result<(), String> {
         Err(env::VarError::NotPresent) => false,
         Err(e) => return Err(format!("TD_RUST_STATIC: {e}")),
     };
-    // The native /td/store toolchain, when the caller links against it: the
-    // dynamic linker a dynamic output bakes, and the `-B` roots through which
-    // the native gcc finds glibc's crt objects and libraries. A static link
-    // reaches libc.a and the static-PIE start file through nothing else, so it
-    // requires them up front rather than failing inside the first crate link.
+    // The native /td/store toolchain's loader and `-B` roots, for C build
+    // scripts that link a probe with the native gcc (below).
     let store_interp = env::var("TD_RUST_STORE_INTERP")
         .ok()
         .filter(|interp| !interp.is_empty());
@@ -1902,29 +1905,6 @@ pub fn run_rust() -> Result<(), String> {
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
         .collect();
-    if static_link && (store_interp.is_none() || store_bdirs.is_empty()) {
-        return Err("a static Rust link needs the native /td/store toolchain, \
-                    but TD_RUST_STORE_INTERP or TD_RUST_STORE_BDIR is unset"
-            .into());
-    }
-    // Cargo's explicit `--target` keeps proc macros and build scripts on its
-    // host side. That side does not inherit target RUSTFLAGS, so rustc asks
-    // PATH for the conventional linker name `cc`, which native td GCC lacks.
-    if static_link {
-        if let Some(interp) = store_interp.as_deref() {
-            let shell = find_in_path(&path, "td-sh")
-                .ok_or("td-sh not found in TD_INPUTS (native Rust host-link wrapper)")?;
-            path = install_native_rust_host_linker(
-                &cwd,
-                &shell,
-                &gcc,
-                interp,
-                &env::var("TD_RUST_STORE_RPATH").unwrap_or_default(),
-                &store_bdirs.join(":"),
-                &path,
-            )?;
-        }
-    }
     let build_abs = cwd.join(build_dir);
     let cargo_dir = cargo_workspace_dir(&build_abs, cargo_subdir.as_deref())?;
     if verify_cargo_lock {
@@ -1953,116 +1933,26 @@ pub fn run_rust() -> Result<(), String> {
         .ok_or("non-utf8 vendor path")?
         .to_string();
     // Reproducibility: remap the (varying) build dir + CARGO_HOME so file!()/debug
-    // paths don't leak into the binary; link via gcc (ld-wrapper) so the output
-    // gets a RUNPATH to the toolchain libs.
+    // paths don't leak into the binary. td-link, Cargo's target linker below,
+    // supplies td glibc's loader and run path, gcc-runtime's static libgcc and
+    // the start files of each output kind, so the flags name none of them.
     let mut rustflags =
-        td_engine::target_profile::cargo_rustflags(&build_abs, &cargo_home, &vendor_abs, &gcc);
+        td_engine::target_profile::cargo_rustflags(&build_abs, &cargo_home, &vendor_abs);
     let cflags = td_engine::target_profile::cargo_cflags(&build_abs, &cargo_home, &vendor_abs);
-    // Native /td/store toolchain (#258): the native gcc is a PLAIN gcc, NOT guix's ld-wrapper, so it
-    // injects no interp/RUNPATH. When TD_RUST_STORE_INTERP is set the caller is linking against the
-    // native /td/store toolchain — bake them explicitly (the #255 rustc-compile recipe): the dynamic
-    // linker = the /td/store ld, a RUNPATH per TD_RUST_STORE_RPATH dir so the produced binary resolves
-    // its libs (glibc, libgcc_s, libz) from /td/store at run time, and -B per TD_RUST_STORE_BDIR so the
-    // native gcc finds the glibc crt/lib at link time. Unset ⇒ the guix ld-wrapper path, unchanged.
-    // A static link pulls libc.a through the same -B roots and bakes neither an
-    // interpreter nor a run-path: there is nothing to resolve at run time.
     // `+crt-static` under the target's default `pic` relocation model is
-    // rustc's static-PIE link: gcc receives `-static-pie`, starts the image
-    // from glibc's `rcrt1.o`, and the output is ET_DYN with no interpreter, so
-    // the kernel randomizes its base as it does a dynamic executable's. Both
-    // applications parse what the network sends them, which is where a fixed
-    // text address would cost the most. The pinned `--target` below keeps
-    // these flags off proc macros and build scripts, which Cargo compiles for
-    // its host side and which cannot be static.
+    // rustc's static-PIE link: td-link receives `-static-pie`, starts the
+    // image from glibc's `rcrt1.o`, and the output is ET_DYN with no
+    // interpreter, so the kernel randomizes its base as it does a dynamic
+    // executable's. Both applications parse what the network sends them,
+    // which is where a fixed text address would cost the most. The pinned
+    // `--target` below keeps this flag off proc macros and build scripts,
+    // which Cargo compiles for its host side and which cannot be static.
     if static_link {
         rustflags.push_str(" -Ctarget-feature=+crt-static");
     }
-    if let Some(interp) = store_interp.as_deref() {
-        if !static_link {
-            rustflags.push_str(&format!(" -Clink-arg=-Wl,--dynamic-linker,{interp}"));
-        }
-        // The source-built native GCC is static, and td-native Rust outputs
-        // must not acquire an undeclared shared libgcc runtime edge.
-        rustflags.push_str(" -Clink-arg=-static-libgcc");
-        if !static_link {
-            for rp in env::var("TD_RUST_STORE_RPATH")
-                .unwrap_or_default()
-                .split(':')
-                .filter(|s| !s.is_empty())
-            {
-                rustflags.push_str(&format!(" -Clink-arg=-Wl,-rpath,{rp}"));
-            }
-        }
-        for b in &store_bdirs {
-            rustflags.push_str(&format!(" -Clink-arg=-B{b}"));
-        }
-    }
-    // The self toolchain folds the unwinder into libgcc.a while rustc's
-    // crt-static link still names libgcc_eh, which td-boot's and td-profiler's
-    // direct rustc links answer with the same alias. It is manufactured in the
-    // build scratch from the linker's own libgcc.a and is never installed.
-    if static_link {
-        let ranlib = find_in_path(&path, "ranlib")
-            .ok_or("ranlib not found in TD_INPUTS (a static Rust link needs libgcc_eh.a)")?;
-        // The probe sees the same `-B` roots as the link, so it names the
-        // archive `-lgcc` itself resolves to rather than one the driver would
-        // pick on a different search path.
-        let mut probe = Command::new(&gcc);
-        probe.arg("-print-libgcc-file-name");
-        for b in &store_bdirs {
-            probe.arg(format!("-B{b}"));
-        }
-        let probe = probe
-            .env_clear()
-            .envs(path_env.iter().map(|(k, v)| (k.clone(), v.clone())))
-            .output()
-            .map_err(|e| format!("{gcc} -print-libgcc-file-name: {e}"))?;
-        if !probe.status.success() {
-            return Err(format!(
-                "{gcc} -print-libgcc-file-name failed: {}",
-                probe.status
-            ));
-        }
-        let libgcc = String::from_utf8_lossy(&probe.stdout).trim().to_string();
-        // The alias is link input for every static output, so the archive it
-        // is made from must lie under a declared input, not wherever the driver
-        // happened to print.
-        if !inputs
-            .split(':')
-            .filter(|input| !input.is_empty())
-            .any(|input| Path::new(&libgcc).starts_with(input))
-        {
-            return Err(format!(
-                "static Rust link: {gcc} names a libgcc.a outside the declared inputs: {libgcc}"
-            ));
-        }
-        if !Path::new(&libgcc).is_file() {
-            return Err(format!(
-                "static Rust link: libgcc.a is not a file: {libgcc}"
-            ));
-        }
-        let eh_dir = cwd.join("td-rust-eh");
-        std::fs::create_dir_all(&eh_dir)
-            .map_err(|e| format!("create {}: {e}", eh_dir.display()))?;
-        let eh_dir = eh_dir
-            .to_str()
-            .ok_or("static Rust link: scratch path is not UTF-8")?
-            .to_string();
-        let libgcc_eh = format!("{eh_dir}/libgcc_eh.a");
-        run_cmd(
-            &objcopy,
-            &[&libgcc, &libgcc_eh],
-            ".",
-            &path_env,
-            &WATCH_PHASE,
-        )?;
-        run_cmd(&ranlib, &[&libgcc_eh], ".", &path_env, &WATCH_PHASE)?;
-        rustflags.push_str(&format!(" -Clink-arg=-L{eh_dir}"));
-    }
     // A crate's C build script drives the `cc` crate, whose compile+link reads LIBRARY_PATH
-    // for BOTH -l libraries and the crt startfiles (crt1.o/crti.o/crtn.o) — but only the
-    // rustc link gets TD_RUST_STORE_BDIR's glibc dir via -B above, and the native glibc's
-    // lib lives at a nested stage/td/store/<pkg>/lib path that is NOT any input's {p}/lib.
+    // for BOTH -l libraries and the crt startfiles (crt1.o/crti.o/crtn.o) — but the
+    // native glibc's lib lives at a nested stage/td/store/<pkg>/lib path that is NOT any input's {p}/lib.
     // Fold those same bdir dirs into LIBRARY_PATH so a C crypto crate (aws-lc-sys/ring) links
     // instead of redding with "cannot find crt1.o". Unset ⇒ empty ⇒ no-op (the pure-Rust and
     // self-host paths are unchanged); binutils' bin dir carries no libs so adding it is inert.
@@ -2072,8 +1962,8 @@ pub fn run_rust() -> Result<(), String> {
     // A C build script may compile *and run* a probe executable (aws-lc-sys's memcmp_check
     // links a binary and asserts it exits 0). The native gcc bakes no interp/RUNPATH, so
     // that probe cannot exec in the hermetic sandbox and the crate misreports it as a
-    // "compiler bug". Such probes honor LDFLAGS on their link, so mirror the same /td/store
-    // dynamic-linker + RUNPATH the rustc link gets above. The `cc` crate never reads LDFLAGS
+    // "compiler bug". Such probes honor LDFLAGS on their link, so give them the /td/store
+    // dynamic-linker + RUNPATH td-link gives a Rust link. The `cc` crate never reads LDFLAGS
     // for its object compiles, so this only reaches build scripts that link a runnable exe.
     // Unset TD_RUST_STORE_INTERP leaves only the deterministic build-ID policy.
     let mut ldflags = String::from("-Wl,--build-id=sha1");
@@ -2094,6 +1984,10 @@ pub fn run_rust() -> Result<(), String> {
         ("C_INCLUDE_PATH".into(), cinc.join(":")),
         ("CPLUS_INCLUDE_PATH".into(), cinc.join(":")),
         ("CC".into(), gcc.clone()),
+        (
+            "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER".into(),
+            linker.clone(),
+        ),
         ("CFLAGS".into(), cflags.clone()),
         ("CXXFLAGS".into(), cflags),
         ("HOME".into(), "/homeless-shelter".into()),
@@ -2186,78 +2080,6 @@ pub fn run_rust() -> Result<(), String> {
     }
     split_debug_tree(Path::new(&out), Path::new(&objcopy), &recipe_name)?;
     Ok(())
-}
-
-/// Install a scratch-only `cc` wrapper which gives Cargo's host-side links the
-/// same declared interpreter, search roots and static libgcc policy as target
-/// links. The wrapper is build machinery, never copied into the output.
-fn install_native_rust_host_linker(
-    cwd: &Path,
-    shell: &str,
-    gcc: &str,
-    interp: &str,
-    rpaths: &str,
-    bdirs: &str,
-    path: &str,
-) -> Result<String, String> {
-    for (name, value) in [("shell", shell), ("gcc", gcc), ("interpreter", interp)] {
-        if !safe_wrapper_word(value) {
-            return Err(format!(
-                "native Rust host-link {name} is not a safe absolute path"
-            ));
-        }
-    }
-    let dir = cwd.join("td-native-bin");
-    fs::create_dir_all(&dir).map_err(|error| format!("mkdir {}: {error}", dir.display()))?;
-    let wrapper = dir.join("cc");
-    let mut script = format!(
-        "#!{shell}\nexec \"{gcc}\" \"$@\" -static-libgcc -Wl,--dynamic-linker,\"{interp}\""
-    );
-    for rpath in rpaths.split(':').filter(|value| !value.is_empty()) {
-        if !safe_wrapper_word(rpath) {
-            return Err("native Rust host-link rpath is not a safe absolute path".into());
-        }
-        script.push_str(&format!(" -Wl,-rpath,\"{rpath}\""));
-    }
-    for bdir in bdirs.split(':').filter(|value| !value.is_empty()) {
-        if !safe_wrapper_word(bdir) {
-            return Err("native Rust host-link -B directory is not a safe absolute path".into());
-        }
-        script.push_str(&format!(" -B\"{bdir}\""));
-    }
-    script.push('\n');
-    fs::write(&wrapper, script).map_err(|error| {
-        format!(
-            "write native Rust host linker {}: {error}",
-            wrapper.display()
-        )
-    })?;
-    let mut permissions = fs::metadata(&wrapper)
-        .map_err(|error| {
-            format!(
-                "inspect native Rust host linker {}: {error}",
-                wrapper.display()
-            )
-        })?
-        .permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&wrapper, permissions).map_err(|error| {
-        format!(
-            "chmod native Rust host linker {}: {error}",
-            wrapper.display()
-        )
-    })?;
-    let dir = dir
-        .to_str()
-        .ok_or("native Rust host-link directory is not UTF-8")?;
-    Ok(format!("{dir}:{path}"))
-}
-
-fn safe_wrapper_word(value: &str) -> bool {
-    value.starts_with('/')
-        && !value
-            .bytes()
-            .any(|byte| matches!(byte, b'\0' | b'\n' | b'\r' | b'"' | b'\\' | b'$' | b'`'))
 }
 
 fn cargo_workspace_dir(source_root: &Path, subdir: Option<&str>) -> Result<PathBuf, String> {
@@ -5496,47 +5318,6 @@ mod tests {
         let (plain_args, plain_release_dir) = cargo_selection(Path::new("/build"), false).unwrap();
         assert!(plain_args.is_empty());
         assert_eq!(plain_release_dir, Path::new("/build/target/release"));
-    }
-
-    #[test]
-    fn native_rust_host_linker_is_a_scratch_only_declared_toolchain_wrapper() {
-        let _base_cleanup = crate::test_temp::TempDir::new("td-native-rust-host-linker").unwrap();
-        let base = _base_cleanup.join("fixture");
-        let _ = fs::remove_dir_all(&base);
-        fs::create_dir_all(&base).unwrap();
-        let path = install_native_rust_host_linker(
-            &base,
-            "/td/store/td-sh/bin/td-sh",
-            "/td/store/gcc/bin/gcc",
-            "/td/store/glibc/lib/ld-linux-x86-64.so.2",
-            "/td/store/glibc/lib:/td/store/zlib/lib",
-            "/td/store/binutils/bin:/td/store/glibc/lib",
-            "/td/store/rust/bin:/td/store/td-sh/bin",
-        )
-        .unwrap();
-        assert!(path.starts_with(base.join("td-native-bin").to_str().unwrap()));
-        let wrapper = fs::read_to_string(base.join("td-native-bin/cc")).unwrap();
-        for required in [
-            "#!/td/store/td-sh/bin/td-sh",
-            "exec \"/td/store/gcc/bin/gcc\" \"$@\"",
-            "-static-libgcc",
-            "-Wl,--dynamic-linker,\"/td/store/glibc/lib/ld-linux-x86-64.so.2\"",
-            "-Wl,-rpath,\"/td/store/glibc/lib\"",
-            "-B\"/td/store/binutils/bin\"",
-        ] {
-            assert!(wrapper.contains(required), "wrapper omits {required}");
-        }
-        assert!(!safe_wrapper_word("/td/store/path\nexec bad"));
-        assert!(!safe_wrapper_word("relative/path"));
-        assert_eq!(
-            fs::metadata(base.join("td-native-bin/cc"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o755
-        );
-        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]

@@ -10,10 +10,10 @@ pub fn recipe() -> Recipe {
         .local_source_trees(&["td-fs", "td-ui", "td-compositor"])
         .native_inputs(&[
             "rust-toolchain",
+            "td-link",
             "gcc-x86-64-self",
             "binutils-x86-64-self",
             "glibc-x86-64",
-            "td-sh",
         ])
         .cargo_subdir("td-review")
         .cargo_lock("td-review/Cargo.lock")

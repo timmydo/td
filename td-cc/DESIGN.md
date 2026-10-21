@@ -42,6 +42,12 @@ statically and split through the shared target debug policy. The image
 stages the launcher, Rust, GCC, binutils, and their declared runtime closure
 at their canonical store paths and provides ordinary /bin entry points.
 
+td's own Rust recipes do not link through this launcher: they name
+`td-link` (`td-link/DESIGN.md`). The launcher stays the image's `cc`, which
+Cargo there uses by default, until the image switch replaces GCC
+(`BUILD-ROOT-PLAN.md`); the recipe's static Rust probe keeps that path
+proved.
+
 Shipping these tools alone does not make a guest ready for the repository's
 whole workflow. The native control-plane helper path uses the same compiler
 launcher for static GNU links. Private writable build storage and workspace

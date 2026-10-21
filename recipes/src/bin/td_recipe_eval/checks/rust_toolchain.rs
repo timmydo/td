@@ -39,8 +39,12 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     let glibc_tree = runner.ladder_out_from(&build_out, "glibc-x86-64")?;
     let runtime_tree = runner.ladder_out_from(&build_out, "gcc-runtime")?;
     let zlib_tree = runner.ladder_out_from(&build_out, "zlib-x86-64")?;
-    // The toolchain's own closure holds no linker: the proofs link with the
-    // declared GCC and binutils the Rust recipes use.
+    // The proofs link through td-link, as every Rust recipe does. GCC is the
+    // C compiler `td shell` hands C build scripts, and binutils the readelf
+    // the proofs inspect with.
+    runner.prepare_recipe_target("td-link")?;
+    let link_out = runner.build_plan("td-link")?;
+    let link_tree = runner.ladder_out_from(&link_out, "td-link")?;
     runner.prepare_recipe_target("gcc-x86-64-self")?;
     let gcc_out = runner.build_plan("gcc-x86-64-self")?;
     let gcc_tree = runner.ladder_out_from(&gcc_out, "gcc-x86-64-self")?;
@@ -74,6 +78,8 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     let gcc_base = path_basename(&gcc_tree)?;
     let binutils_base = path_basename(&binutils_tree)?;
     let glibc_base = path_basename(&glibc_tree)?;
+    let link_base = path_basename(&link_tree)?;
+    let td_link = format!("{TD_STORE_DIR}/{link_base}/bin/td-link");
     let rust_path = format!("{TD_STORE_DIR}/{rust_base}");
     let gcc_path = format!("{TD_STORE_DIR}/{gcc_base}/{GCC_STAGE}");
     let binutils_path = format!("{TD_STORE_DIR}/{binutils_base}/bin");
@@ -93,18 +99,9 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     }
 
     let relinked = RELINKED.join(" ");
-    // td's recipes name GCC and pass `-Clinker-features=-lld`: GNU ld. The
-    // default linker, `cc` from PATH, gets upstream's `-fuse-ld=lld`, which
-    // td's GCC (configured `--with-ld`) consumes and ignores: GNU ld too.
-    let link_args = format!(
-        "-C link-arg=-B{binutils_path}/ \
-         -C link-arg=-B{glibc_path}/lib \
-         -C link-arg=-L{glibc_path}/lib \
-         -C link-arg=-static-libgcc \
-         -C link-arg=-Wl,--dynamic-linker,{glibc_path}/lib/ld-linux-x86-64.so.2 \
-         -C link-arg=-Wl,-rpath,{glibc_path}/lib"
-    );
-    let link = format!("-C linker={gcc_path}/bin/gcc {link_args}");
+    // td's recipes link through td-link, which runs rust-lld: every link
+    // below must carry LLD's comment.
+    let link = format!("-C linker={td_link}");
     let smoke = format!(
         "set -eu\n\
          test ! -e /gnu/store\n\
@@ -127,31 +124,22 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
          rc=0; grep -r -a -F -l /gnu/store bin lib >/dev/null || rc=$?; [ \"$rc\" = 1 ] || exit 86\n\
          cd /tmp\n\
          printf '%s\\n' 'fn main() {{ println!(\"42\"); }}' >/tmp/td-rust-smoke.rs\n\
-         '{rust_path}/bin/rustc' --edition=2021 /tmp/td-rust-smoke.rs -C linker-features=-lld {link} -o /tmp/td-rust-ld\n\
-         mkdir -p /tmp/td-default-cc\n\
-         printf '%s\\n' '#!{sh}' 'exec {gcc_path}/bin/gcc \"$@\"' >/tmp/td-default-cc/cc\n\
-         chmod +x /tmp/td-default-cc/cc\n\
-         PATH=\"/tmp/td-default-cc:$PATH\" '{rust_path}/bin/rustc' --edition=2021 /tmp/td-rust-smoke.rs {link_args} -o /tmp/td-rust-default\n\
+         '{rust_path}/bin/rustc' --edition=2021 /tmp/td-rust-smoke.rs {link} -o /tmp/td-rust-ld\n\
          test \"$(/tmp/td-rust-ld)\" = 42\n\
-         test \"$(/tmp/td-rust-default)\" = 42\n\
-         for p in ld default; do\n\
-           c=$(\"$readelf\" -p .comment \"/tmp/td-rust-$p\") || exit 89\n\
-           case $c in *'rustc version'*) ;; *) echo \"the $p link has no rustc comment\" >&2; exit 89;; esac\n\
-           case $c in *'Linker: LLD'*) echo \"the $p link used lld, not td's GNU ld\" >&2; exit 87;; esac\n\
-         done\n\
+         c=$(\"$readelf\" -p .comment /tmp/td-rust-ld) || exit 89\n\
+         case $c in *'rustc version'*) ;; *) echo 'the link has no rustc comment' >&2; exit 89;; esac\n\
+         case $c in *'Linker: LLD'*) ;; *) echo 'the td-link link did not use rust-lld' >&2; exit 87;; esac\n\
          mkdir -p /tmp/td-cargo-smoke/src /tmp/td-cargo-home /tmp/td-cargo-target\n\
          printf '%s\\n' '[package]' 'name = \"td-cargo-smoke\"' 'version = \"0.0.0\"' 'edition = \"2021\"' >/tmp/td-cargo-smoke/Cargo.toml\n\
          printf '%s\\n' 'fn main() {{ println!(\"43\"); }}' >/tmp/td-cargo-smoke/src/main.rs\n\
          PATH='{rust_path}/bin' RUSTC='{rust_path}/bin/rustc' CARGO_HOME=/tmp/td-cargo-home HOME=/tmp/td-cargo-home \
-         RUSTFLAGS='-C linker-features=-lld {link}' \
+         CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER='{td_link}' \
          '{rust_path}/bin/cargo' build --offline --manifest-path /tmp/td-cargo-smoke/Cargo.toml --target-dir /tmp/td-cargo-target\n\
          test \"$(/tmp/td-cargo-target/debug/td-cargo-smoke)\" = 43\n\
          mkdir -p /tmp/td-clippy-proof\n\
          cat >/tmp/td-clippy-proof/probe.rs\n\
-         '{rust_path}/bin/rustc' --edition=2021 /tmp/td-clippy-proof/probe.rs -C linker-features=-lld {link} -o /tmp/td-clippy-proof/probe\n\
-         printf '%s\\n' '#!{sh}' 'exec {gcc_path}/bin/gcc -B{binutils_path}/ -B{glibc_path}/lib -L{glibc_path}/lib -static-libgcc -Wl,--dynamic-linker,{glibc_path}/lib/ld-linux-x86-64.so.2 -Wl,-rpath,{glibc_path}/lib \"$@\"' >/tmp/td-clippy-proof/cc\n\
-         chmod +x /tmp/td-clippy-proof/cc\n\
-         (cd /tmp/td-clippy-proof && PATH='{rust_path}/bin' ./probe '{rust_path}/bin/cargo' '{rust_path}/bin/rustc' /tmp/td-clippy-proof/cc)\n\
+         '{rust_path}/bin/rustc' --edition=2021 /tmp/td-clippy-proof/probe.rs {link} -o /tmp/td-clippy-proof/probe\n\
+         (cd /tmp/td-clippy-proof && PATH='{rust_path}/bin' ./probe '{rust_path}/bin/cargo' '{rust_path}/bin/rustc' '{td_link}')\n\
          printf '%s\\n' RUST-TOOLCHAIN-OK\n"
     );
     let smoke_out = runner.store_ns_output(&[&sh, "-c", &smoke], Some(CLIPPY_PROBE))?;
@@ -163,19 +151,20 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     }
     prove_td_shell_userland(
         runner,
-        &[&build_out, &gcc_out],
+        &[&build_out, &link_out, &gcc_out],
         &gcc_path,
         &binutils_path,
         &glibc_path,
         &sh,
         &userland,
         rust_base,
+        link_base,
         gcc_base,
         binutils_base,
         glibc_base,
     )?;
     println!(
-        "PASS: rust-toolchain: upstream Rust 1.96.0 rustc/Cargo/Clippy/rust-lld run on td glibc, gcc-runtime and zlib, link through td's GCC, and td shell builds (or reuses from its cache) and runs ripgrep/fd/uutils with /gnu/store absent"
+        "PASS: rust-toolchain: upstream Rust 1.96.0 rustc/Cargo/Clippy/rust-lld run on td glibc, gcc-runtime and zlib, link through td-link and rust-lld, and td shell builds (or reuses from its cache) and runs ripgrep/fd/uutils with /gnu/store absent"
     );
     Ok(())
 }
@@ -190,6 +179,7 @@ fn prove_td_shell_userland(
     sh: &str,
     userland: &str,
     rust_base: &str,
+    link_base: &str,
     gcc_base: &str,
     binutils_base: &str,
     glibc_base: &str,
@@ -233,6 +223,7 @@ fn prove_td_shell_userland(
     let native_lock = product.join("native.lock");
     let lock = format!(
         "rust-toolchain {TD_STORE_DIR}/{rust_base} td-recipe-output\n\
+         td-link {TD_STORE_DIR}/{link_base} td-recipe-output\n\
          gcc-x86-64-self {TD_STORE_DIR}/{gcc_base} td-recipe-output\n\
          binutils-x86-64-self {TD_STORE_DIR}/{binutils_base} td-recipe-output\n\
          glibc-x86-64 {TD_STORE_DIR}/{glibc_base} td-recipe-output\n"
@@ -265,7 +256,7 @@ fn prove_td_shell_userland(
     let _shell_cache_lock = crate::check_runner::lock_file(&shell_cache_lock)?;
     reset_shell_cache_on_toolchain_change(&shell_cache, &lock)?;
 
-    // The toolchain's plan and the linker's each vouch their own outputs.
+    // The toolchain's, td-link's and GCC's plans each vouch their own outputs.
     let mut dbs = Vec::new();
     for build_out in build_outs {
         for db in runner.recipe_output_dbs(build_out)? {
@@ -334,7 +325,7 @@ fn prove_td_shell_userland(
            \"$readelf\" -S \"$debug\" | grep -F '.debug_line' >/dev/null\n\
            marker=\"$package/lib/debug/.td-assembly-exception\"\n\
            grep -F -x 'exception.0.source=glibc-x86-64' \"$marker\" >/dev/null\n\
-           grep -F -x 'exception.1.source=gcc-x86-64-self' \"$marker\" >/dev/null\n\
+           grep -F -x 'exception.1.source=gcc-runtime' \"$marker\" >/dev/null\n\
            grep -F -x 'exception.2.source=rust-toolchain' \"$marker\" >/dev/null\n\
            rc=0; grep -a -F /gnu/store \"$binary\" >/dev/null || rc=$?; [ \"$rc\" = 1 ] || exit 93\n\
          done\n\

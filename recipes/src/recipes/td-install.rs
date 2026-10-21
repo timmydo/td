@@ -169,18 +169,6 @@ const PROTECTOR_UPGRADE_BOOT_TESTS_RS: &str =
 
 pub fn recipe() -> Recipe {
     let rustc = "{in:rust-toolchain}/bin/rustc";
-    let gcc = "{in:gcc-x86-64-self}/stage/td/store/gcc-14.3.0-x86_64-self/bin/gcc";
-    let gccbin = "{in:gcc-x86-64-self}/stage/td/store/gcc-14.3.0-x86_64-self/bin";
-    let bbin = "{in:binutils-x86-64-self}/bin";
-    let glib = "{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64/lib";
-    let objcopy = "{in:binutils-x86-64-self}/bin/objcopy";
-    let ranlib = "{in:binutils-x86-64-self}/bin/ranlib";
-    let libgcc_a = "{in:gcc-x86-64-self}/stage/td/store/gcc-14.3.0-x86_64-self/lib/gcc/x86_64-pc-linux-gnu/14.3.0/libgcc.a";
-
-    let linker = format!("-Clinker={gcc}");
-    let lib_b = format!("-Clink-arg=-B{glib}");
-    let bin_b = format!("-Clink-arg=-B{bbin}");
-    let path = format!("{bbin}:{gccbin}");
 
     // The staged tree mirrors the repository, because the `#[path]` includes in
     // `main.rs` are relative and resolve through it: `../../engine/src/gpt.rs`
@@ -472,9 +460,6 @@ pub fn recipe() -> Recipe {
             content: FAT_RS.into(),
             exec: false,
         },
-        Step::MkDir {
-            path: "{root}/eh".into(),
-        },
     ];
     for (path, content) in TPM_AND_FIDO {
         steps.push(Step::WriteFile {
@@ -483,12 +468,6 @@ pub fn recipe() -> Recipe {
             exec: false,
         });
     }
-    // The self toolchain folds the unwinder into libgcc.a; rustc's static link
-    // still requests the conventional libgcc_eh.a name.
-    steps.push(
-        Step::run("{root}", &[objcopy, libgcc_a, "{root}/eh/libgcc_eh.a"]).env("PATH", &path),
-    );
-    steps.push(Step::run("{root}", &[ranlib, "{root}/eh/libgcc_eh.a"]).env("PATH", &path));
     // The sibling libraries, dependencies first, under the binary's profile.
     for (name, lib, externs) in [
         ("td_fido", "{src}/td-fido/src/lib.rs", &[][..]),
@@ -534,11 +513,7 @@ pub fn recipe() -> Recipe {
         ];
         args.extend_from_slice(externs);
         args.extend_from_slice(&["-o", &output, lib]);
-        steps.push(
-            target_rustc("{src}", rustc, &args)
-                .env("PATH", &path)
-                .env("SOURCE_DATE_EPOCH", "1"),
-        );
+        steps.push(target_rustc("{src}", rustc, &args).env("SOURCE_DATE_EPOCH", "1"));
     }
     steps.push(
         target_rustc(
@@ -568,19 +543,11 @@ pub fn recipe() -> Recipe {
                 // td-protector's own dependency, td-json, is found here.
                 "-L",
                 "dependency={root}",
-                &linker,
-                "-L",
-                glib,
-                &lib_b,
-                &bin_b,
-                "-Clink-arg=-L{root}/eh",
-                "-Clink-arg=-static-libgcc",
                 "-o",
                 "{out}/bin/td-install",
                 "{src}/td-install/src/main.rs",
             ],
         )
-        .env("PATH", &path)
         .env("SOURCE_DATE_EPOCH", "1"),
     );
     steps.push(Step::Require {
@@ -593,7 +560,7 @@ pub fn recipe() -> Recipe {
     Recipe::mesboot("td-install", "0.1")
         .native_inputs(&[
             "rust-toolchain",
-            "gcc-x86-64-self",
+            "td-link",
             "binutils-x86-64-self",
             "glibc-x86-64",
         ])

@@ -234,6 +234,8 @@ mod tests {
             "td-install-qemu-test",
             "td-jail",
             "td-kexec",
+            "td-link",
+            "td-link-test",
             "td-login",
             "td-netd",
             "td-photo-test",
@@ -249,6 +251,7 @@ mod tests {
             "td-vm-guest",
         ];
         let mut covered = Vec::new();
+        let mut td_link_stages = Vec::new();
         for (stem, recipe) in all() {
             let Some(steps) = recipe.steps.as_ref() else {
                 continue;
@@ -283,11 +286,39 @@ mod tests {
                     policy_position > source_position,
                     "{stem}: target policy must follow recipe-local rustc options"
                 );
-                for required in td_engine::target_profile::DIRECT_RUSTC_ARGS.iter().take(5) {
+                for required in td_engine::target_profile::DIRECT_RUSTC_ARGS
+                    .iter()
+                    .filter(|arg| !arg.starts_with("--remap-path-prefix="))
+                {
                     assert!(
                         argv.iter().any(|arg| arg == required),
                         "{stem}: direct rustc omitted {required}"
                     );
+                }
+                // td-link links every Rust output; only its own bootstrap
+                // and td-cc's proof of the compiler launcher name another.
+                let linkers: Vec<&str> = argv
+                    .iter()
+                    .filter_map(|arg| arg.strip_prefix("-Clinker="))
+                    .collect();
+                assert_eq!(linkers.len(), 1, "{stem}: one linker per rustc");
+                assert!(
+                    !argv.iter().any(|arg| arg.contains("linker-features")),
+                    "{stem}: td-link is the linker; no lld opt-out"
+                );
+                let linker = linkers.first().copied().unwrap_or_default();
+                match stem {
+                    "td-link" => {
+                        let output = argv
+                            .iter()
+                            .position(|arg| arg == "-o")
+                            .and_then(|at| argv.get(at + 1))
+                            .cloned()
+                            .unwrap_or_default();
+                        td_link_stages.push((linker.to_string(), output));
+                    }
+                    "td-cc" if linker == "{out}/bin/cc" => {}
+                    _ => assert_eq!(linker, crate::ladder::TD_LINK, "{stem}: links with td-link"),
                 }
                 let build_remaps: Vec<&str> = argv
                     .iter()
@@ -328,6 +359,16 @@ mod tests {
                     "{stem}: direct rustc must preserve symbols for its companion"
                 );
             }
+            if stem == "td-link" {
+                assert!(
+                    steps.iter().any(|step| matches!(
+                        step,
+                        crate::types::Step::CompareFiles { left, right }
+                            if left == "{out}/bin/td-link" && right == "{root}/stage3/td-link"
+                    )),
+                    "td-link: the shipped driver must reproduce itself"
+                );
+            }
             if stem == "td-boot" {
                 // Its td-fido, td-fat, td-tpm, td-json and td-protector
                 // rlibs, then the binary, under each of two roots.
@@ -354,16 +395,47 @@ mod tests {
                     "td-boot's reproducibility oracle must vary both remap inputs"
                 );
             }
+            if stem != "td-link" {
+                assert!(
+                    recipe
+                        .native_inputs
+                        .as_deref()
+                        .unwrap_or_default()
+                        .iter()
+                        .any(|input| input == "td-link"),
+                    "{stem}: a direct Rust recipe declares td-link, its linker"
+                );
+            }
+            // td-link-test ships no ELF, only its verdict; a build-root
+            // recipe splits with the root's objcopy.
+            let objcopy = if recipe.build_root {
+                "/usr/bin/objcopy"
+            } else {
+                "{in:binutils-x86-64-self}/bin/objcopy"
+            };
             assert!(
-                steps.iter().any(|step| matches!(
-                    step,
-                    crate::types::Step::SplitDebugTree { root, objcopy }
-                        if root == "{out}"
-                            && objcopy == "{in:binutils-x86-64-self}/bin/objcopy"
-                )),
+                stem == "td-link-test"
+                    || steps.iter().any(|step| matches!(
+                        step,
+                        crate::types::Step::SplitDebugTree { root, objcopy: used }
+                            if root == "{out}" && used == objcopy
+                    )),
                 "{stem}: missing target debug-companion split"
             );
         }
+        // td-link's bootstrap: only the throwaway first stage is linked by
+        // the root's GCC; it links the shipped driver, which links the third
+        // stage that CompareFiles holds byte-identical to it.
+        assert_eq!(
+            td_link_stages,
+            [
+                ("/usr/bin/gcc", "{root}/stage1/td-link"),
+                ("{root}/stage1/td-link", "{out}/bin/td-link"),
+                ("{out}/bin/td-link", "{root}/stage3/td-link"),
+            ]
+            .map(|(linker, output)| (linker.to_string(), output.to_string())),
+            "td-link must bootstrap through its own stages"
+        );
         assert_eq!(
             covered, expected,
             "the reviewed direct-rustc roster changed"
@@ -371,7 +443,7 @@ mod tests {
     }
 
     #[test]
-    fn every_cargo_target_declares_the_objcopy_used_by_the_runner() {
+    fn every_cargo_target_declares_the_objcopy_and_linker_the_runner_uses() {
         for (stem, recipe) in all() {
             if !matches!(recipe.build_system, crate::types::BuildSystem::Rust) {
                 continue;
@@ -380,6 +452,10 @@ mod tests {
             assert!(
                 inputs.iter().any(|input| input == "binutils-x86-64-self"),
                 "{stem}: Cargo target must declare binutils-x86-64-self for debug splitting"
+            );
+            assert!(
+                inputs.iter().any(|input| input == "td-link"),
+                "{stem}: Cargo target must declare td-link, its linker"
             );
         }
     }

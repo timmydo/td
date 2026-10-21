@@ -28,10 +28,10 @@ pub fn recipe() -> Recipe {
         ])
         .native_inputs(&[
             "rust-toolchain",
+            "td-link",
             "gcc-x86-64-self",
             "binutils-x86-64-self",
             "glibc-x86-64",
-            "td-sh",
         ])
         .cargo_subdir("td-setup")
         .cargo_lock("td-setup/Cargo.lock")

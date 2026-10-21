@@ -62,8 +62,13 @@ a named coverage boundary, not permission to certify the containing object as
 fully unwindable. Every split output records the conservative transitive union
 of applicable roster entries at `lib/debug/.td-assembly-exception`; this
 includes glibc startup and libgcc in downstream static executables, plus the
-Rust runtime and package-specific assembly where applicable. Offline analysis
-therefore does not need the recipe checkout to discover a boundary.
+Rust runtime and package-specific assembly where applicable. Every Rust
+output a recipe builds is linked by td-link (`td-link/DESIGN.md`) from
+gcc-runtime's start files and static libgcc, so its marker names
+gcc-runtime's libgcc assembly; td-cc's, whose launcher probes GCC still
+links until the image switch, also keeps gcc-x86-64-self's.
+Offline analysis therefore does not need the recipe checkout to discover a
+boundary.
 
 Rust compilation emits line-table debug information and ordinary symbols.
 Every varying build path is remapped before it reaches either artifact. The
