@@ -1696,7 +1696,7 @@ pub const TD_SANDBOX_KERNEL_MARKER: &str = "TD-SANDBOX-KERNEL-OK";
 /// and the compiled filter read back installed, and PID 1 reaps a filtered descendant.
 pub const TD_JAIL_TRANSITION_MARKER: &str = "TD-JAIL-TRANSITION-OK";
 
-/// Emitted only by the QEMU fixture after its non-shipped td-GCC probe installs
+/// Emitted only by the QEMU fixture after its non-shipped C probe installs
 /// td-jail's exported filter and observes the compiled errno and kill actions.
 pub const TD_JAIL_SECCOMP_PROBE_MARKER: &str = "TD-JAIL-SECCOMP-PROBE-OK";
 

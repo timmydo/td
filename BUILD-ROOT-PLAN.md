@@ -246,11 +246,11 @@ deleted; its findings are summarized under "Facts" below.
     tests grade their subjects in the root with its bash, readelf, grep
     and gawk, under fresh writable /home, /mnt, /run and /var; and the
     post-Rust tool farm holds no awk for td's own builds, so the image's
-    whole closure (system-x86-64) reaches no ladder recipe.
+    whole closure (system-x86-64) reaches no ladder recipe; and
+    td-jail-seccomp-probe compiles with the root's gcc against td glibc.
     Still on the ladder: rust-userland-auto-test's readelf and tool
-    farm, the rust-toolchain check, td-jail-seccomp-probe (an input of
-    td-jail-test's), the crypto portable kit, and the ladder's own
-    fixtures (hello, hello-test), deleted with it.
+    farm, the rust-toolchain check, the crypto portable kit, and the
+    ladder's own fixtures (hello, hello-test), deleted with it.
 12. **td-btrfs** (landed): std-only mkfs with `--rootdir/--subvol`;
     btrfs-progs, its pin and test are deleted; util-linux libs stay for
     cryptsetup.

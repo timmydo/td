@@ -1,11 +1,16 @@
+use crate::ladder::{
+    build_root_link_map_check, build_root_static_cc, LinkedLibc, BUILD_ROOT_PATH as PATH,
+};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
-const SGCC: &str = "{in:gcc-x86-64-self}/stage/td/store/gcc-14.3.0-x86_64-self/bin/gcc";
-const SBIN: &str = "{in:binutils-x86-64-self}/bin";
-const XGLIBC: &str = "{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64";
+// td-jail-seccomp-probe: a static C helper the host and target td-jail
+// seccomp oracles run. It builds in the Debian build root: its gcc compiles
+// it against td glibc, statically, with gcc-runtime's start files and
+// libgcc, and the link map proves libc.a and libgcc.a are td's.
+const PROBE_INPUTS: &[&str] = &["gcc-runtime"];
 
 pub fn recipe() -> Recipe {
-    let steps = vec![
+    let mut steps = vec![
         Step::MkDir {
             path: "{root}/probe".into(),
         },
@@ -17,43 +22,59 @@ pub fn recipe() -> Recipe {
         Step::MkDir {
             path: "{out}/bin".into(),
         },
-        Step::Run {
-            argv: vec![
-                SGCC.into(),
-                "-static".into(),
-                "-isystem".into(),
-                format!("{XGLIBC}/include"),
-                "-B".into(),
-                format!("{SBIN}/"),
-                "-B".into(),
-                format!("{XGLIBC}/lib"),
-                "-L".into(),
-                format!("{XGLIBC}/lib"),
-                "-o".into(),
-                "{out}/bin/td-jail-seccomp-probe".into(),
-                "{root}/probe/seccomp.c".into(),
+    ];
+    steps.extend(build_root_static_cc());
+    // Compiled apart, so the link map loads the object from the build
+    // directory rather than gcc's temporary.
+    steps.push(
+        Step::run(
+            "{root}/probe",
+            &[
+                "{root}/wb/cc",
+                "-c",
+                "-o",
+                "{root}/probe/seccomp.o",
+                "seccomp.c",
             ],
-            env: vec![("PATH".into(), SBIN.into())],
-            dir: "{root}/probe".into(),
-        },
+        )
+        .env("PATH", PATH),
+    );
+    steps.push(
+        Step::run(
+            "{root}/probe",
+            &[
+                "{root}/wb/cc",
+                "-o",
+                "{out}/bin/td-jail-seccomp-probe",
+                "{root}/probe/seccomp.o",
+            ],
+        )
+        .env("PATH", PATH)
+        .env("TD_LINK_MAP", "{root}/probe/seccomp.map"),
+    );
+    steps.push(build_root_link_map_check(
+        "{root}/probe",
+        "{root}/probe/seccomp.map",
+        "td-jail-seccomp-probe",
+        PROBE_INPUTS,
+        LinkedLibc::Archive,
+    ));
+    steps.extend([
         Step::Require {
             paths: vec!["{out}/bin/td-jail-seccomp-probe".into()],
             exec: true,
         },
         Step::assert_static(&["{out}/bin/td-jail-seccomp-probe"]),
-    ];
+    ]);
 
     Recipe::mesboot("td-jail-seccomp-probe", "1.0")
-        .native_inputs(&[
-            "gcc-x86-64-self",
-            "binutils-x86-64-self",
-            "glibc-x86-64",
-        ])
+        .build_root()
+        .native_inputs(&["glibc-x86-64", "gcc-runtime"])
         .steps(steps)
         .checks(vec![
             RecipeCheck::new(
                 r#"
-echo ">> recipe-check td-jail-seccomp-probe: build the static td-GCC helper used by host and target td-jail seccomp oracles"
+echo ">> recipe-check td-jail-seccomp-probe: build the static helper, compiled in the Debian build root against td glibc, used by host and target td-jail seccomp oracles"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run td-jail-seccomp-probe 1
 "#,
@@ -454,6 +475,35 @@ int main(int argc, char **argv) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn it_builds_in_the_root_against_td_glibc_and_gcc_runtime() {
+        let recipe = recipe();
+        crate::ladder::assert_build_root_static_c(&recipe);
+        crate::ladder::assert_build_root_test(&recipe, &["glibc-x86-64", "gcc-runtime"], &[]);
+        // The link writes its map, and the check that reads it admits
+        // gcc-runtime alone beside the build's own files.
+        let map = "{root}/probe/seccomp.map";
+        let steps = recipe.steps.unwrap_or_default();
+        let link = steps
+            .iter()
+            .position(|step| {
+                matches!(step, Step::Run { argv, env, .. }
+                    if argv.iter().any(|arg| arg == "{out}/bin/td-jail-seccomp-probe")
+                        && env.iter().any(|(key, value)| key == "TD_LINK_MAP" && value == map))
+            })
+            .expect("the link writes its map");
+        let check = steps
+            .iter()
+            .position(|step| {
+                matches!(step, Step::Run { argv, .. }
+                    if argv.iter().any(|arg| arg.contains(&format!("m='{map}'"))
+                        && arg.contains("= 'td-jail-seccomp-probe'")
+                        && arg.contains(r#""$(realpath -m '{src}')" "$(realpath -m '{in:gcc-runtime}')"; rt="#)))
+            })
+            .expect("the map is checked, admitting gcc-runtime alone");
+        assert!(link < check);
+    }
 
     #[test]
     fn inherited_mode_probes_the_installed_filter_then_execs_in_place() {

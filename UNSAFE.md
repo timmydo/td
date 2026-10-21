@@ -1920,7 +1920,8 @@ more than the kernel's 4096 instructions, and programs without a final return
 before the raw syscall sees them. The program is policy, never caller data.
 Its test interpreter executes the exact
 array over every rostered syscall and the argument-sensitive rules. A separate
-td-GCC-built, non-shipped C probe recipe consumes a bounded serialized copy and
+non-shipped C probe recipe, compiled in the Debian build root against td
+glibc, consumes a bounded serialized copy and
 checks the real kernel's errno and kill behavior on an unconstrained build host
 and in the QEMU target fixture. Its standalone mode additionally forks an
 unconfined i386 exit(0) through int 0x80, requiring normal exit, then repeats
