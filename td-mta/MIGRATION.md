@@ -1,5 +1,8 @@
 # Provisional JMAP migration
 
+[CUTOVER.md](CUTOVER.md) connects these commands to the operational cutover
+and rollback checklist, its current evidence and remaining acceptance gaps.
+
 `td-mta migration export` creates a resumable archive from an authenticated
 HTTPS JMAP account. `migration verify` checks that archive offline. These
 commands do not modify the source, freeze delivery, or approve a domain
