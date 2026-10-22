@@ -11532,7 +11532,19 @@ chmod 755 '{}'
             "deferral must not suppress a later attempt"
         );
         drop(reader);
-        runner.maybe_gc_store();
+        // A flock belongs to the open file description, so a child another
+        // test thread forked while `reader` was open shares it until that
+        // child execs or exits: once released, sweep until the lock is free.
+        let sweep_once_free = || {
+            for _ in 0..400 {
+                runner.maybe_gc_store();
+                if !dead.exists() {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        };
+        sweep_once_free();
         assert!(!dead.exists(), "what no record names goes");
         assert!(live.exists(), "a recorded output is kept");
         assert!(memo.exists(), "and the memo its record names");
@@ -11541,17 +11553,25 @@ chmod 755 '{}'
         assert!(stamp.exists());
 
         fs::create_dir_all(&dead).unwrap();
+        let newest = crate::gc_roots::newest(&lw).unwrap();
+        assert!(
+            !automatic_gc_due(&stamp, newest).unwrap(),
+            "no record since the sweep: nothing is due"
+        );
         runner.maybe_gc_store();
-        assert!(dead.exists(), "no record since the sweep: nothing is due");
-        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
-        set_times(&stamp, old, old);
+        assert!(dead.exists());
         runner.record_gc_roots(
             &key,
             ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-live-1.0".to_string()],
             Some(&memo),
             crate::gc_roots::Update::Replace,
         );
-        runner.maybe_gc_store();
+        // An unchanged record keeps its time, so "newer" is relative to the
+        // record itself, not to the clock: however long the test has run.
+        let newest = crate::gc_roots::newest(&lw).unwrap().unwrap();
+        let old = newest - std::time::Duration::from_secs(1);
+        set_times(&stamp, old, old);
+        sweep_once_free();
         assert!(!dead.exists(), "a newer record makes the sweep due");
         assert!(live.exists());
     }
