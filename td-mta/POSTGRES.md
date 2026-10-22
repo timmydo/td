@@ -611,8 +611,11 @@ The client shares the original ten-second worker limit, configured
 statement/lock timeouts and protocol byte caps. Owner initialization/upgrade
 permits 512 input frames for the twelve migrations and their ledger writes;
 probe, inspection and material operations retain 128. The per-frame 128 KiB
-and total 1 MiB input bounds, 64 KiB schema output bound, authentication
-checks and terminal budget refusal are unchanged. Fixed SQL and typed
+and total 1 MiB input bounds, authentication checks and terminal budget
+refusal are unchanged. Schema operations permit 128 KiB of post-TLS output,
+including startup/authentication and statement names. Driver statement names
+grow with a process-wide counter; schema initialization must still fit after
+long owner audit runs. Probe output remains bounded to 64 KiB. Fixed SQL and typed
 parameters are private to the crate; arbitrary driver execution is not a
 public API. Initialization errors before COMMIT drop the session and leave
 no committed namespace; migration errors preserve the previous schema. Once
@@ -769,7 +772,8 @@ Material operations retain the ten-second worker deadline, five-second
 statement timeout, one-second lock timeout, 128-KiB backend-frame bound,
 128-frame count and one-MiB input cap. Their post-TLS output cap is 256 KiB
 to carry a maximal trust bundle plus fixed SQL/authentication overhead;
-probe and schema operations retain 64 KiB. Each operation owns a cold,
+probe operations retain 64 KiB and schema operations permit 128 KiB.
+Each operation owns a cold,
 fallibly reserved copy of at most 128 KiB; driver encodings/row buffers and
 TLS/provider allocations are additional bounded inputs, not a complete RSS
 qualification. The returned Material owner intentionally has no Debug
@@ -5816,10 +5820,27 @@ delivery receipts, or change history. No whole-store, restore, serving or
 current authority follows. Independently collected body/counter reports must
 not be presented as one consistent account snapshot.
 
-The existing body-worker budgets and original ten-second deadline cover the
-complete sweep and acknowledged ROLLBACK. Success also checks the original
-deadline after worker destruction. Logical sweep bounds never renew wire or
-time budgets; a large account may refuse without a partial success report.
+A dedicated preparation-only audit worker derives checked cumulative wire,
+frame and command allowances from the caller's logical bounds. It reserves
+`5 * rows + parent_reads + 64` turns for the three passes, direct references,
+parent walks, schema checks, table-end probes and acknowledged ROLLBACK.
+Each turn admits at most 1 MiB input, 64 KiB output and 1088 frames, including
+at most 1001 SMTP receipt rows. Authentication shares the first window.
+Only completion admits the next window; idle bytes remain charged to the
+previous window, cumulative counters never replenish, and failures are
+terminal. Counters allocate no proportional memory. The existing 128 KiB
+frame, SCRAM sequence, row decoder and fixed scratch bounds remain in force.
+Overflow or a counter that does not fit the host refuses before connection.
+
+The caller supplies one deadline no more than an hour away. Connection and
+authentication still have at most ten seconds, individual SQL statements
+five seconds and locks one second. The original audit deadline covers every
+turn and acknowledged ROLLBACK and is checked after worker destruction.
+No turn, address attempt or logical allowance renews time. Runtime workers
+retain their ordinary bounds and cannot use this owner path. Connection
+failure during metadata reads retains its connection classification rather
+than being reported as canonical metadata corruption. A large account may
+refuse without a partial success report.
 Failures close the connection and perform no repair. Native PostgreSQL
 coverage exercises every table, compound cursor order, malformed rows,
 mailbox cycles, recipient coverage, SMTP receipt framing, caller bounds,
@@ -5856,8 +5877,13 @@ and verified body totals. Role registry membership, other mailbox policy,
 configuration, credentials, retained operation/delivery receipts and change
 history remain uncertified. This is not a complete PostgreSQL semantic audit,
 restore approval, delivery permission or service admission. Failure returns
-no partial report and performs no repair; all original connection budgets
-remain in force. Native coverage checks each component's refusal, unowned
+no partial report and performs no repair. The audit worker adds
+`2 * max_blobs + ceil(max_bytes / 524288)` turns to the metadata allowance:
+one manifest per blob, one independent rounding allowance per blob and
+streamed eight-chunk reads. Final enumeration and usage/role queries fit the
+fixed reserve. Body buffers retain at most eight 64 KiB chunks regardless of
+the account size. The same per-turn and cumulative limits apply. Native
+coverage checks each component's refusal, unowned
 and empty bodies, aggregate limits and a concurrent-change oracle: while the
 metadata scan is blocked after snapshot capture, another session commits
 body corruption, incorrect usage, a duplicate mailbox role and a new sequence.
@@ -5867,7 +5893,8 @@ the new damage. Null roles and duplicates in another account do not conflict.
 ## 204. Explicit bounded account audit command
 
 `postgres account-audit --connection-file PATH --epoch HEX --account ID
---max-rows N --max-parent-reads N --max-blobs N --max-bytes N` invokes section
+--max-rows N --max-parent-reads N --max-blobs N --max-bytes N
+[--timeout-seconds N]` invokes section
 203's composed historical audit. Every bound is required, unsigned decimal
 with at most 20 ASCII digits and checked u64 range; zero is allowed. Duplicate,
 unknown, incomplete and malformed options refuse before opening the protected
@@ -5882,8 +5909,11 @@ metadata row count, verified blob/byte totals and the five usage counters.
 and `body_digests_verified` are true for that historical snapshot only;
 `semantic_verified:false` preserves all section 203 exclusions. The report
 never approves restore or serving and grants no current authority. This
-PostgreSQL command retains the ordinary ten-second ceiling, independently of
-the old local-store verify command's maintenance timeout.
+command defaults to ten seconds. Optional `--timeout-seconds` accepts one
+unsigned decimal value from 1 through 3600; duplicates and values outside
+that range refuse before opening files. The explicit owner timeout does not
+change runtime service deadlines, per-statement bounds or the ten-second
+connection/authentication ceiling.
 
 Fixed error codes distinguish missing accounts, epochs, aggregate body
 limits, metadata checks, usage integrity, body checks and database failures.
@@ -6023,16 +6053,21 @@ and absence of repair or credential output.
 ## 209. Explicit historical canonical metadata audit command
 
 `postgres metadata-audit --connection-file PATH --epoch HEX --account ID
---max-rows N --max-parent-reads N` exposes section 202's canonical metadata
-verifier independently of body and usage checks. Every flag is required
-exactly once. Limits use unsigned ASCII decimal with at most twenty digits
+--max-rows N --max-parent-reads N [--timeout-seconds N]` exposes section
+202's canonical metadata verifier independently of body and usage checks.
+Connection, epoch, account and both logical bounds are required exactly once.
+The optional timeout follows section 204's 1 through 3600 second range and
+ten-second default. Limits use unsigned ASCII decimal with at most twenty
+digits
 and must fit u64; zero is valid and can cause a bounded scan refusal. Unknown,
 duplicate, missing and malformed arguments refuse before protected-file
 access. Body-limit flags belong to account-audit and are refused here.
 
 One trusted UTC sample supplies lease-reference policy. DNS and verification
-share the original ten-second deadline; explicit logical limits do not renew
-worker wire or time budgets. Only pre-connection transport failures permit
+share the original selected deadline; DNS retains a five-second ceiling.
+Logical limits select section 202's finite cumulative worker allowance;
+no operation renews wire or time budgets. Only pre-connection transport
+failures permit
 address fallback. Failure emits fixed categories without SQL or secrets and
 never changes a row or returns a partial success report.
 

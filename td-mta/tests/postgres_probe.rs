@@ -506,6 +506,15 @@ fn command_probe(fixture: &Fixture, expected: bool) -> String {
 }
 
 fn command_output(arguments: &[&str], root: &std::path::Path, expected: i32) -> String {
+    command_output_with_timeout(arguments, root, expected, Duration::from_secs(15))
+}
+
+fn command_output_with_timeout(
+    arguments: &[&str],
+    root: &std::path::Path,
+    expected: i32,
+    timeout: Duration,
+) -> String {
     let output_path = root.join("probe-output");
     let output = File::create(&output_path).unwrap();
     let mut child = ProbeChild(
@@ -518,7 +527,7 @@ fn command_output(arguments: &[&str], root: &std::path::Path, expected: i32) -> 
             .spawn()
             .unwrap(),
     );
-    let stop = Instant::now() + Duration::from_secs(15);
+    let stop = Instant::now() + timeout;
     loop {
         if let Some(status) = child.0.try_wait().unwrap() {
             assert_eq!(status.code(), Some(expected));
@@ -2545,6 +2554,7 @@ fn real_postgres_executable_receives_and_serves_database_profiles() {
     exercise_configuration(ConfigurationExercise::Reconcile);
     exercise_configuration(ConfigurationExercise::Unmapped);
     exercise_configuration(ConfigurationExercise::FolderReconcile);
+    audit_scaling::exercise();
     exercise_configuration(ConfigurationExercise::MultiAccount);
     exercise_configuration(ConfigurationExercise::Serving);
 }
@@ -12365,3 +12375,6 @@ mod folder_reconcile;
 fn real_postgres_folder_reconciliation() {
     exercise_configuration(ConfigurationExercise::FolderReconcile);
 }
+
+#[path = "postgres_probe/audit_scaling.rs"]
+mod audit_scaling;

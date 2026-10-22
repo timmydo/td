@@ -36,7 +36,8 @@ pub fn inspect(
     utc_ms: i64,
     limits: Limits,
 ) -> Result<CompleteMetadata, Error> {
-    let result = postgres_probe::with_body_worker(request, trust, deadline, |worker| {
+    let budget = postgres_probe::AuditBudget::new(limits, 0, 0).map_err(Error::Connection)?;
+    let result = postgres_probe::with_audit_worker(request, trust, deadline, budget, |worker| {
         let report = audit(worker, epoch, account, utc_ms, limits)?;
         worker
             .run(|client| Box::pin(async move { client.batch_execute("ROLLBACK").await }))
@@ -80,10 +81,14 @@ pub(crate) fn audit(
         let mut view = view::View {
             identity,
             worker: Mutex::new(&mut *worker),
+            failure: None,
         };
         while sweep
             .advance(&mut view, &mut key, &mut value)
-            .map_err(Error::Metadata)?
+            .map_err(|error| {
+                view.failure
+                    .map_or(Error::Metadata(error), Error::Connection)
+            })?
             != metadata_sweep::Step::Complete
         {}
     }

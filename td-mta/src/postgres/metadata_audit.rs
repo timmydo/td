@@ -1,10 +1,10 @@
 //! Explicit historical canonical metadata inspection with caller bounds.
-use super::{account, audit::unsigned, report_error, with_addresses, AttemptError};
+use super::{account, audit::unsigned, report_error, with_addresses_timeout, AttemptError};
 use std::{
     ffi::OsString,
     io::{self, Write},
     process::ExitCode,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use td_mta::{
     ids::{AccountId, StoreEpoch},
@@ -15,11 +15,13 @@ use td_mta::{
 const COMMAND: &str = "postgres-metadata-audit";
 struct Options {
     account: account::Options,
+    timeout: Duration,
     limits: metadata_sweep::Limits,
 }
 fn arguments(mut args: impl Iterator<Item = OsString>) -> Option<Options> {
     let (mut connection, mut epoch, mut account) = (None, None, None);
     let (mut rows, mut parents) = (None, None);
+    let mut timeout = None;
     while let Some(flag) = args.next() {
         let value = args.next()?.into_string().ok()?;
         match flag.to_str()? {
@@ -28,10 +30,18 @@ fn arguments(mut args: impl Iterator<Item = OsString>) -> Option<Options> {
             "--account" if account.is_none() => account = Some(AccountId::parse(&value).ok()?),
             "--max-rows" if rows.is_none() => rows = Some(unsigned(&value)?),
             "--max-parent-reads" if parents.is_none() => parents = Some(unsigned(&value)?),
+            "--timeout-seconds" if timeout.is_none() => {
+                let seconds = unsigned(&value)?;
+                if !(1..=td_mta::postgres_probe::MAX_AUDIT_DURATION.as_secs()).contains(&seconds) {
+                    return None;
+                }
+                timeout = Some(Duration::from_secs(seconds));
+            }
             _ => return None,
         }
     }
     Some(Options {
+        timeout: timeout.unwrap_or(Duration::from_secs(10)),
         account: account::Options {
             connection: connection?,
             epoch: epoch?,
@@ -63,7 +73,7 @@ pub(super) fn run(args: impl Iterator<Item = OsString>) -> io::Result<ExitCode> 
         report_error(COMMAND, "clock", "invalid-time")?;
         return Ok(ExitCode::FAILURE);
     };
-    let result = with_addresses(&loaded, |request, deadline| {
+    let result = with_addresses_timeout(&loaded, options.timeout, |request, deadline| {
         audit::inspect(
             request,
             &loaded.trust,
@@ -106,6 +116,50 @@ fn classify(error: audit::Error) -> AttemptError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn audit_timeout_is_explicit_bounded_and_not_repeatable() {
+        let base = vec![
+            "--connection-file",
+            "/private/db",
+            "--epoch",
+            "00000000000000000000000000000000",
+            "--account",
+            "01010101010101010101010101010101",
+            "--max-rows",
+            "100",
+            "--max-parent-reads",
+            "100",
+        ];
+        assert_eq!(
+            arguments(base.iter().map(OsString::from)).map(|options| options.timeout),
+            Some(Duration::from_secs(10))
+        );
+        for seconds in ["1", "60", "3600"] {
+            assert!(arguments(
+                base.iter()
+                    .copied()
+                    .chain(["--timeout-seconds", seconds])
+                    .map(OsString::from)
+            )
+            .is_some());
+        }
+        for seconds in ["0", "3601", "18446744073709551615", "+1", "-1", "１"] {
+            assert!(arguments(
+                base.iter()
+                    .copied()
+                    .chain(["--timeout-seconds", seconds])
+                    .map(OsString::from)
+            )
+            .is_none());
+        }
+        assert!(arguments(
+            base.iter()
+                .copied()
+                .chain(["--timeout-seconds", "60", "--timeout-seconds", "60"])
+                .map(OsString::from)
+        )
+        .is_none());
+    }
     #[test]
     fn metadata_bounds_are_required_and_body_flags_refused() {
         let base = [

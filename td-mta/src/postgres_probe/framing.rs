@@ -84,6 +84,15 @@ impl Input {
         }
     }
 
+    pub(super) fn audit(budget: super::AuditBudget) -> Self {
+        Self {
+            window: Some(Windows::new(budget.turns)),
+            bytes: budget.input,
+            frames: budget.frames,
+            ..Self::new()
+        }
+    }
+
     pub(super) fn window(&self) -> Option<Windows> {
         self.window.clone()
     }
@@ -363,6 +372,46 @@ mod tests {
         }
         assert!(input.accept(&frame(b'N', b"\0")).is_err());
         assert!(Input::reconciliation().accept(&frame(b'Z', b"I")).is_err());
+    }
+
+    #[test]
+    fn owner_audits_bound_each_turn_and_keep_finite_cumulative_counters() {
+        let budget = super::super::AuditBudget::new(
+            crate::metadata_sweep::Limits {
+                rows: 0,
+                parent_reads: 0,
+            },
+            0,
+            0,
+        )
+        .unwrap();
+        let mut input = Input::audit(budget);
+        let window = input.window().unwrap();
+        input.accept(&authenticated()).unwrap();
+        for turn in 0..budget.turns {
+            window.begin().unwrap();
+            for _ in if turn == 0 { 5 } else { 0 }..1088 {
+                input.accept(&frame(b'N', b"\0")).unwrap();
+            }
+            input.admit_output(64 * 1024).unwrap();
+            input.output(64 * 1024).unwrap();
+            window.finish().unwrap();
+        }
+        assert!(window.begin().is_err());
+        assert!(input.accept(&[]).is_err());
+        let mut input = Input::audit(budget);
+        let window = input.window().unwrap();
+        window.begin().unwrap();
+        for _ in 0..1088 {
+            input.accept(&frame(b'N', b"\0")).unwrap();
+        }
+        assert!(input.accept(&frame(b'N', b"\0")).is_err());
+        assert!(window.begin().is_err());
+        assert!(Input::audit(budget).accept(&frame(b'Z', b"I")).is_err());
+        assert!(Input::audit(budget)
+            .accept(&frame(b'D', &[0; 128 * 1024]))
+            .is_err());
+        assert!(Input::audit(budget).admit_output(64 * 1024 + 1).is_err());
     }
 
     #[test]

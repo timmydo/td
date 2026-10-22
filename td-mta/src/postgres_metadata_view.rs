@@ -20,6 +20,7 @@ pub(super) struct View<'a> {
     // The view never leaves the worker thread. Mutex supplies Sync without
     // sharing the connection or changing ReadView's contract.
     pub worker: Mutex<&'a mut Worker>,
+    pub failure: Option<postgres_probe::Error>,
 }
 
 fn field<'a, T: FromSql<'a>>(row: &'a SqlRow, name: &str) -> Result<T, Error> {
@@ -167,7 +168,7 @@ impl View<'_> {
         }
         statement.push_str(&format!(" ORDER BY {columns} LIMIT 1"));
         let account = self.identity.account;
-        self.worker.get_mut().map_err(|_|Error::Corrupt)?.run(move |client| Box::pin(async move {
+        let result = self.worker.get_mut().map_err(|_|Error::Corrupt)?.run(move |client| Box::pin(async move {
             let params:Vec<&(dyn ToSql+Sync)>=values.iter().map(|p|p.as_ref() as &(dyn ToSql+Sync)).collect();
             let rows=client.query(&statement,&params).await.map_err(|_|Error::Corrupt)?;
             let Some(row)=rows.into_iter().next() else {return Ok(None)};
@@ -176,7 +177,14 @@ impl View<'_> {
                 client.query("SELECT ordinal,address FROM td_mta.smtp_receipt_recipients WHERE account=$1 AND email_id=$2 ORDER BY ordinal LIMIT 1001",&[&account.as_bytes().as_slice(),&id]).await.map_err(|_|Error::Corrupt)?
             } else {Vec::new()};
             Ok(Some((row,receipts)))
-        })).map_err(connection)?
+        }));
+        match result {
+            Ok(result) => result,
+            Err(error) => {
+                self.failure = Some(error);
+                Err(connection(error))
+            }
+        }
     }
     fn decode<'a>(
         &self,

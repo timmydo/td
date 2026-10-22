@@ -61,7 +61,9 @@ pub fn inspect(
     utc_ms: i64,
     limits: Limits,
 ) -> Result<Report, Error> {
-    let result = postgres_probe::with_body_worker(request, trust, deadline, |worker| {
+    let budget = postgres_probe::AuditBudget::new(limits.metadata, limits.blobs, limits.bytes)
+        .map_err(Error::Connection)?;
+    let result = postgres_probe::with_audit_worker(request, trust, deadline, budget, |worker| {
         let metadata =
             postgres_metadata_audit::audit(worker, epoch, account, utc_ms, limits.metadata)
                 .map_err(Error::Metadata)?;

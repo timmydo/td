@@ -68,6 +68,8 @@ const QUERY: &str = "SELECT pg_catalog.current_setting('server_version_num'), \
     pg_catalog.current_setting('transaction_read_only'), \
     pg_catalog.current_setting('fsync'), pg_catalog.current_setting('full_page_writes')";
 pub(crate) const MAX_DURATION: Duration = Duration::from_secs(10);
+/// Maximum caller-selected duration for historical owner audits only.
+pub const MAX_AUDIT_DURATION: Duration = Duration::from_secs(3600);
 #[cfg(test)]
 const BODY_CHECK_TURNS: usize = 8;
 
@@ -307,7 +309,8 @@ pub(crate) fn with_schema_client<T>(
         request,
         trust,
         deadline,
-        64 * 1024,
+        // Prepared names grow with the driver's process-wide statement counter.
+        128 * 1024,
         Input::schema(),
         operation,
     )
@@ -351,6 +354,28 @@ pub(crate) fn with_body_worker<T>(
     operation: impl FnOnce(&mut Worker) -> T,
 ) -> Result<T, Error> {
     let mut worker = body_worker(request, trust, deadline)?;
+    Ok(operation(&mut worker))
+}
+
+pub(crate) fn with_audit_worker<T>(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    budget: AuditBudget,
+    operation: impl FnOnce(&mut Worker) -> T,
+) -> Result<T, Error> {
+    if request.mode != Mode::Preparation {
+        return Err(Error::Invalid);
+    }
+    let mut worker = connect_authenticated_bounded(
+        request,
+        trust,
+        deadline,
+        budget.output,
+        Input::audit(budget),
+        MAX_AUDIT_DURATION,
+    )?;
+    worker.audit_windows = true;
     Ok(operation(&mut worker))
 }
 
@@ -415,8 +440,20 @@ fn connect_authenticated(
     output_limit: usize,
     input: Input,
 ) -> Result<Worker, Error> {
+    connect_authenticated_bounded(request, trust, deadline, output_limit, input, MAX_DURATION)
+}
+
+fn connect_authenticated_bounded(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    output_limit: usize,
+    input: Input,
+    maximum: Duration,
+) -> Result<Worker, Error> {
     let allowance = remaining(deadline)?;
-    if allowance > MAX_DURATION
+    let connect_deadline = deadline.min(Instant::now() + MAX_DURATION);
+    if allowance > maximum
         || request.server_name.is_empty()
         || request.server_name.len() > 253
         || request.user.is_empty()
@@ -439,7 +476,7 @@ fn connect_authenticated(
         ClientConfig::new(trust, tls_clock, TlsProtocol::Postgres).map_err(|_| Error::Tls)?,
     );
     let session = TlsSession::client(policy, request.server_name).map_err(|_| Error::Tls)?;
-    let socket = TcpStream::connect_timeout(&request.address, remaining(deadline)?)
+    let socket = TcpStream::connect_timeout(&request.address, remaining(connect_deadline)?)
         .map_err(|_| Error::Transport)?;
     let activity = Arc::new(AtomicBool::new(false));
     let transport = Network {
@@ -474,7 +511,7 @@ fn connect_authenticated(
     let mut context = Context::from_waker(&waker);
     let mut connect = pin!(config.connect_raw(Io::new(transport, false), connector));
     let (client, connection) = loop {
-        remaining(deadline)?;
+        remaining(connect_deadline)?;
         activity.store(false, Ordering::Relaxed);
         if let Poll::Ready(result) = connect.as_mut().poll(&mut context) {
             break result.map_err(|_| Error::Database)?;
@@ -491,6 +528,7 @@ fn connect_authenticated(
         failed: None,
         activity,
         validation_window,
+        audit_windows: false,
     })
 }
 
@@ -502,6 +540,7 @@ pub(crate) struct Worker {
     failed: Option<Error>,
     activity: Arc<AtomicBool>,
     validation_window: Option<windows::Windows>,
+    audit_windows: bool,
 }
 impl Worker {
     pub(crate) fn begin_validation_turn(&mut self) -> Result<(), Error> {
@@ -555,6 +594,13 @@ impl Worker {
             return Err(error);
         }
         let mut context = Context::from_waker(&self.waker);
+        let audit_window = self
+            .validation_window
+            .as_ref()
+            .filter(|_| self.audit_windows);
+        if let Some(window) = audit_window {
+            window.begin().map_err(|_| Error::Database)?;
+        }
         let mut operation = operation(&self.client);
         loop {
             if let Err(error) = remaining(self.deadline) {
@@ -563,6 +609,9 @@ impl Worker {
             }
             self.activity.store(false, Ordering::Relaxed);
             if let Poll::Ready(result) = operation.as_mut().poll(&mut context) {
+                if let Some(window) = audit_window {
+                    window.finish().map_err(|_| Error::Database)?;
+                }
                 return Ok(result);
             }
             match self.connection.as_mut().poll_message(&mut context) {
@@ -816,6 +865,8 @@ fn progress(result: Result<FlushProgress, crate::ports::Error>) -> Poll<io::Resu
     }
 }
 
+mod audit_budget;
+pub(crate) use audit_budget::AuditBudget;
 mod validation_budget;
 pub(crate) use validation_budget::ValidationBudget;
 mod framing;

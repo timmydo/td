@@ -239,23 +239,36 @@ impl From<postgres_schema::Error> for AttemptError {
 
 fn with_addresses<T>(
     loaded: &Loaded,
+    operation: impl FnMut(&postgres_probe::Request<'_>, Instant) -> Result<T, AttemptError>,
+) -> Result<T, (&'static str, &'static str)> {
+    with_addresses_timeout(loaded, Duration::from_secs(10), operation)
+}
+
+fn with_addresses_timeout<T>(
+    loaded: &Loaded,
+    timeout: Duration,
     mut operation: impl FnMut(&postgres_probe::Request<'_>, Instant) -> Result<T, AttemptError>,
 ) -> Result<T, (&'static str, &'static str)> {
     let executable = std::env::current_exe().map_err(|_| ("resolver", "executable"))?;
     // Cold files precede one shared DNS/connection/operation deadline.
     let now = Instant::now();
-    let deadline = now + Duration::from_secs(10);
-    let addresses =
-        postgres_resolver::resolve(&executable, &loaded.bootstrap, now + Duration::from_secs(5))
-            .map_err(|error| {
-                (
-                    "resolver",
-                    match error {
-                        postgres_resolver::Error::Deadline => "deadline",
-                        _ => "resolution-failed",
-                    },
-                )
-            })?;
+    let deadline = now
+        .checked_add(timeout)
+        .ok_or(("arguments", "invalid-timeout"))?;
+    let addresses = postgres_resolver::resolve(
+        &executable,
+        &loaded.bootstrap,
+        deadline.min(now + Duration::from_secs(5)),
+    )
+    .map_err(|error| {
+        (
+            "resolver",
+            match error {
+                postgres_resolver::Error::Deadline => "deadline",
+                _ => "resolution-failed",
+            },
+        )
+    })?;
     for address in addresses {
         match operation(&loaded.bootstrap.request(address), deadline) {
             Ok(value) => return Ok(value),
