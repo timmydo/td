@@ -5,6 +5,7 @@
 //! `$HOME/.td/flathub`. It follows the declared refs as hints, admits a
 //! candidate only under rules 1–5, and publishes a generation by replacing
 //! `current` with one rename. A refusal or failure leaves `current` as it was.
+//! `td-app ready NAME` names the generation td-jail may launch.
 #![deny(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -16,7 +17,7 @@
 )]
 
 use std::ffi::{CStr, OsStr};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -45,6 +46,12 @@ const MAX_REGISTRY_ROWS: usize = 256;
 const CHECKS_VERSION: &str = "td-app-checks-1";
 /// Every directory td-app lists holds a handful of entries; more is damage.
 const MAX_LISTED_ENTRIES: usize = 4096;
+const ENOTDIR: i32 = 20;
+const ELOOP: i32 = 40;
+/// A deploy or object graph being removed is renamed to this prefix
+/// first, so an interrupted removal never leaves a `files/` that reads as
+/// complete; the next collection finishes it.
+const REMOVING: &str = ".removing-";
 
 /// Checks the signature and ref bindings of one fetched commit (rules 1–2).
 type Verify = fn(&str, Checksum, &[u8], &[u8], u64) -> Result<Commit, String>;
@@ -60,6 +67,7 @@ struct Admission<'a> {
 
 #[derive(Debug, Eq, PartialEq)]
 enum Outcome {
+    Ready(Option<u64>),
     Throttled,
     Unchanged,
     Selected(u64),
@@ -582,8 +590,51 @@ fn remove_tree(path: &Path) -> Result<(), String> {
     fs::remove_dir_all(path).map_err(|error| format!("remove {}: {error}", path.display()))
 }
 
-/// Keep `current`, `previous`, the commits they name and `also`; nothing
-/// else in the cache survives.
+enum Hold {
+    /// No selection td-jail could have opened.
+    Debris,
+    /// The exclusive lock proving no td-jail holds it, kept until it is gone.
+    Free(File),
+    /// A running td-jail holds a shared lock for as long as it runs.
+    Held,
+}
+
+fn hold(selection: &Path) -> Result<Hold, String> {
+    // Only what td-jail could not have opened is debris: absent, a link,
+    // under a non-directory, or not a regular file. Any other failure ends
+    // collection rather than guess.
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(crate::feed::OPEN_REGULAR_NOFOLLOW)
+        .open(selection)
+    {
+        Ok(file) => file,
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                || matches!(error.raw_os_error(), Some(ELOOP | ENOTDIR)) =>
+        {
+            return Ok(Hold::Debris);
+        }
+        Err(error) => return Err(format!("open {}: {error}", selection.display())),
+    };
+    if !file
+        .metadata()
+        .map_err(|error| format!("stat {}: {error}", selection.display()))?
+        .is_file()
+    {
+        return Ok(Hold::Debris);
+    }
+    match file.try_lock() {
+        Ok(()) => Ok(Hold::Free(file)),
+        Err(TryLockError::WouldBlock) => Ok(Hold::Held),
+        Err(TryLockError::Error(error)) => Err(format!("lock {}: {error}", selection.display())),
+    }
+}
+
+/// Keep `current`, `previous`, every generation a running td-jail holds,
+/// the commits they name and `also`; nothing else in the cache survives. A
+/// generation goes only under an exclusive lock on its selection, so a
+/// td-jail that locks it afterwards finds it unlinked and asks again.
 fn collect(cache: &Path, also: &[String]) -> Result<(), String> {
     let mut keep_generations = Vec::new();
     let mut keep_commits: Vec<String> = also.to_vec();
@@ -594,14 +645,51 @@ fn collect(cache: &Path, also: &[String]) -> Result<(), String> {
         }
     }
     for (name, path) in list(&cache.join(GENERATIONS))? {
-        if !keep_generations.contains(&name) {
-            remove_tree(&path)?;
+        if keep_generations.contains(&name) {
+            continue;
+        }
+        let selection = path.join(SELECTION);
+        match hold(&selection)? {
+            Hold::Debris => remove_tree(&path)?,
+            Hold::Free(proof) => {
+                remove_tree(&path)?;
+                drop(proof);
+            }
+            Hold::Held => {
+                // A read that fails ends collection, as an open does; one
+                // that does not parse names nothing td-jail could launch.
+                if let Some(text) = read_text(&selection)? {
+                    if let Ok(selection) = Selection::parse(&text) {
+                        keep_commits.extend(selection.commits().map(str::to_string));
+                    }
+                }
+            }
         }
     }
     for area in [DEPLOY, OBJECTS] {
         for (name, path) in list(&cache.join(area))? {
             if !keep_commits.contains(&name) {
-                remove_tree(&path)?;
+                let doomed = if name.starts_with(REMOVING) {
+                    // Already cleared if its commit was listed first.
+                    if fs::symlink_metadata(&path).is_err() {
+                        continue;
+                    }
+                    path
+                } else if !flathub_app::valid_hex64(&name) {
+                    // Not a commit, so nothing reads it as complete.
+                    path
+                } else {
+                    let doomed = cache.join(area).join(format!("{REMOVING}{name}"));
+                    // An earlier removal of the same commit cut short.
+                    if fs::symlink_metadata(&doomed).is_ok() {
+                        remove_tree(&doomed)?;
+                    }
+                    fs::rename(&path, &doomed).map_err(|error| {
+                        format!("rename {} for removal: {error}", path.display())
+                    })?;
+                    doomed
+                };
+                remove_tree(&doomed)?;
             }
         }
     }
@@ -754,6 +842,23 @@ fn update(
     Ok(outcome)
 }
 
+/// The generation td-jail may launch: `current`, while it still serves the
+/// declaration. It takes no lock, so a launch never waits behind a fetch;
+/// collection never removes what `current` names.
+fn ready(
+    admission: &Admission<'_>,
+    cache: &Path,
+    source: FlathubSource,
+) -> Result<Option<u64>, String> {
+    let expected = expect(admission, source)?;
+    Ok(match read_pointer(cache, CURRENT)? {
+        Some((generation, selection)) if serves(cache, &selection, source, &expected)? => {
+            Some(generation)
+        }
+        _ => None,
+    })
+}
+
 /// The cache must belong to the account td-app runs as: as root it would
 /// leave entries the account cannot remove and follow links the account
 /// planted.
@@ -777,14 +882,22 @@ fn require_account(home: &Path) -> Result<(), String> {
 }
 
 fn usage() -> ! {
-    eprintln!("usage: td-app update NAME [--force]");
+    eprintln!("usage: td-app update NAME [--force] | td-app ready NAME");
     std::process::exit(2);
 }
 
+enum Verb {
+    Update { force: bool },
+    Ready,
+}
+
 pub fn run(args: &[String]) {
-    let (name, force) = match args.get(1..) {
-        Some([verb, name]) if verb == "update" => (name, false),
-        Some([verb, name, flag]) if verb == "update" && flag == "--force" => (name, true),
+    let (name, verb) = match args.get(1..) {
+        Some([verb, name]) if verb == "update" => (name, Verb::Update { force: false }),
+        Some([verb, name, flag]) if verb == "update" && flag == "--force" => {
+            (name, Verb::Update { force: true })
+        }
+        Some([verb, name]) if verb == "ready" => (name, Verb::Ready),
         _ => usage(),
     };
     let Some(source) = flathub_app::flathub_source(name) else {
@@ -804,15 +917,16 @@ pub fn run(args: &[String]) {
             validate: validate_dynamic,
             registry: Path::new(REGISTRY),
         };
-        update(
-            &admission,
-            &home.join(CACHE_DIR),
-            source,
-            force,
-            unix_now()?,
-        )
+        let cache = home.join(CACHE_DIR);
+        match verb {
+            Verb::Update { force } => update(&admission, &cache, source, force, unix_now()?),
+            Verb::Ready => ready(&admission, &cache, source).map(Outcome::Ready),
+        }
     })();
     match result {
+        // td-jail's answer: one line, a generation or `absent`.
+        Ok(Outcome::Ready(Some(generation))) => println!("{generation}"),
+        Ok(Outcome::Ready(None)) => println!("absent"),
         Ok(Outcome::Throttled) => println!("td-app: {name} was checked within a day"),
         Ok(Outcome::Unchanged) => println!("td-app: {name} is current"),
         Ok(Outcome::Selected(generation)) => {
@@ -1511,5 +1625,99 @@ mod tests {
             0o700
         );
         require_account(&fixture.home).unwrap();
+    }
+
+    impl Fixture {
+        fn ready(&self, source: FlathubSource) -> Result<Option<u64>, String> {
+            let admission = Admission {
+                repository: &self.url,
+                verify: verify_fixture,
+                validate: validate_fixture,
+                registry: &self.registry,
+            };
+            ready(&admission, &self.cache(), source)
+        }
+    }
+
+    #[test]
+    fn ready_names_current_only_while_it_serves_the_declaration() {
+        let fixture = Fixture::new("ready");
+        assert_eq!(fixture.ready(source(Some(APP))), Ok(None));
+        let runtime = publish_commit(&fixture.repository, RUNTIME, b"usr", 10, None, b"signed");
+        app_commit(&fixture, b"app", 20);
+        fixture.update(source(Some(APP)), false, NOW).unwrap();
+        assert_eq!(fixture.ready(source(Some(APP))), Ok(Some(1)));
+        // Another entry is another declaration the generation was not
+        // validated for.
+        let moved = FlathubSource {
+            entry: "/app/bin/firefox-bin",
+            ..source(Some(APP))
+        };
+        assert_eq!(fixture.ready(moved), Ok(None));
+        remove_tree(&fixture.cache().join(DEPLOY).join(&runtime)).unwrap();
+        assert_eq!(fixture.ready(source(Some(APP))), Ok(None));
+        // It reads and writes nothing it does not need: no lock file appears
+        // in a cache that has none.
+        let empty = Fixture::new("ready-empty");
+        assert_eq!(empty.ready(source(Some(APP))), Ok(None));
+        assert!(!empty.cache().exists());
+    }
+
+    #[test]
+    fn collection_spares_a_generation_a_launch_holds() {
+        let fixture = Fixture::new("held");
+        publish_commit(&fixture.repository, RUNTIME, b"usr", 10, None, b"signed");
+        let first = app_commit(&fixture, b"one", 20);
+        fixture.update(source(Some(APP)), true, NOW).unwrap();
+        let selection = fixture.cache().join(GENERATIONS).join("1").join(SELECTION);
+        let launch = File::open(&selection).unwrap();
+        launch.lock_shared().unwrap();
+        app_commit(&fixture, b"two", 30);
+        fixture.update(source(Some(APP)), true, NOW).unwrap();
+        app_commit(&fixture, b"three", 40);
+        fixture.update(source(Some(APP)), true, NOW).unwrap();
+        // Neither current nor previous, and still running.
+        assert_eq!(fixture.names(GENERATIONS), vec!["1", "2", "3"]);
+        assert!(deployed(&fixture.cache(), &first));
+        drop(launch);
+        app_commit(&fixture, b"four", 50);
+        fixture.update(source(Some(APP)), true, NOW).unwrap();
+        assert_eq!(fixture.names(GENERATIONS), vec!["3", "4"]);
+        assert!(!deployed(&fixture.cache(), &first));
+        // A launch that opened generation 1 before it went finds it unlinked.
+        assert!(!selection.exists());
+    }
+
+    /// A selection that cannot be opened for any reason but absence may
+    /// still be held: collection stops rather than remove it, and a removal
+    /// cut short is finished by the next one.
+    #[test]
+    fn collection_removes_only_what_it_proved_free() {
+        let fixture = Fixture::new("unproved");
+        publish_commit(&fixture.repository, RUNTIME, b"usr", 10, None, b"signed");
+        let first = app_commit(&fixture, b"one", 20);
+        fixture.update(source(Some(APP)), true, NOW).unwrap();
+        app_commit(&fixture, b"two", 30);
+        fixture.update(source(Some(APP)), true, NOW).unwrap();
+        let selection = fixture.cache().join(GENERATIONS).join("1").join(SELECTION);
+        fs::set_permissions(&selection, fs::Permissions::from_mode(0o000)).unwrap();
+        app_commit(&fixture, b"three", 40);
+        let error = fixture.update(source(Some(APP)), true, NOW).unwrap_err();
+        assert!(error.contains("open"), "{error}");
+        assert!(deployed(&fixture.cache(), &first));
+        fs::set_permissions(&selection, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let stale = fixture
+            .cache()
+            .join(DEPLOY)
+            .join(format!("{REMOVING}{first}"));
+        fs::create_dir_all(stale.join(FILES)).unwrap();
+        fixture.update(source(Some(APP)), true, NOW).unwrap();
+        assert!(!stale.exists());
+        assert!(!deployed(&fixture.cache(), &first));
+        assert!(!fixture
+            .names(DEPLOY)
+            .iter()
+            .any(|name| name.starts_with(REMOVING)));
     }
 }

@@ -16,6 +16,13 @@ mod authority;
 mod bus;
 mod cgroup;
 mod firefox;
+mod flathub;
+#[allow(dead_code, reason = "td-app's half of the shared cache contract")]
+#[cfg_attr(
+    not(feature = "target-recipe"),
+    path = "../../engine/src/flathub_app.rs"
+)]
+mod flathub_app;
 #[allow(dead_code, reason = "shared PATH alias discovery and wire contract")]
 #[cfg_attr(not(feature = "target-recipe"), path = "../../engine/src/host_path.rs")]
 mod host_path;
@@ -191,6 +198,11 @@ fn main() -> ExitCode {
     }
 }
 
+// Spelled as the control-plane crates spell it, so a module they also
+// compile names one guard.
+#[cfg(test)]
+use td_fs as test_temp;
+
 #[cfg(test)]
 mod confinement {
     #![allow(clippy::panic, clippy::unwrap_used)]
@@ -201,6 +213,7 @@ mod confinement {
     const BUS: &str = include_str!("bus.rs");
     const CGROUP: &str = include_str!("cgroup.rs");
     const FIREFOX: &str = include_str!("firefox.rs");
+    const FLATHUB: &str = include_str!("flathub.rs");
     const MAIN: &str = include_str!("main.rs");
     const PERMISSIONS: &str = include_str!("../../engine/src/permissions.rs");
     const PRIMARY_ACCOUNT: &str = include_str!("../../td-authd/src/primary_account.rs");
@@ -208,6 +221,27 @@ mod confinement {
     const SYS: &str = include_str!("sys.rs");
     const TRANSITION: &str = include_str!("transition.rs");
     const WORKSPACE: &str = include_str!("workspace.rs");
+
+    /// The cache path (APPLICATIONS.md §W.9) adds one program td-jail runs:
+    /// td-app, by its full path, with nothing of td-jail's environment, and
+    /// the generation it binds stays locked for the launch.
+    #[test]
+    fn the_cache_path_runs_only_td_app_and_holds_its_generation() {
+        let shipped = strip_comments(FLATHUB.split_once("#[cfg(test)]").unwrap().0);
+        assert!(!shipped.contains("unsafe"));
+        assert!(!shipped.contains("sys::"));
+        assert_eq!(shipped.matches("Command::new(").count(), 1);
+        assert!(shipped.contains("Command::new(TD_APP)"));
+        assert!(shipped.contains("const TD_APP: &str = \"/bin/td-app\";"));
+        assert_eq!(shipped.matches(".env_clear()").count(), 1);
+        assert!(shipped.contains("file.lock_shared()?;"));
+        let authority = strip_comments(AUTHORITY);
+        assert!(authority.contains("Ok((package_files, runtime_files, Some(generation.hold)))"));
+        assert!(authority.contains("        generation,\n    })"));
+        assert!(TRANSITION.contains(".chain(generation_descriptor)"));
+        // No grant reaches the cache a later launch binds.
+        assert!(authority.contains("canonical_candidate(&state.real_home.join(\".td\"))?,"));
+    }
 
     #[test]
     fn unsafe_is_confined_to_one_syscall_instruction() {
@@ -309,8 +343,8 @@ mod confinement {
             at(launch, "require_workspace_channel()?;")
                 < at(launch, "sys::unshare_namespaces(!plan.development)")
                 && at(launch, "sys::bring_up_loopback()")
-                    < at(launch, "close_inherited_descriptors(None)?;")
-                && at(launch, "close_inherited_descriptors(None)?;")
+                    < at(launch, "close_inherited_descriptors(&[])?;")
+                && at(launch, "close_inherited_descriptors(&[])?;")
                     < at(
                         launch,
                         "prepare_workspace_mount_plan(&plan, inside_identity)?;"
@@ -775,7 +809,10 @@ mod confinement {
                     .unwrap_or_else(|| panic!("launch unshare is absent"))
         );
         assert!(TRANSITION.contains("read_exact(&mut readiness)"));
-        assert!(TRANSITION.contains("close_inherited_descriptors(cleanup_descriptor)?;"));
+        assert!(TRANSITION.contains("close_inherited_descriptors(cleanup_descriptor.as_slice())?;"));
+        assert!(TRANSITION.contains(
+            "let preserved: Vec<u32> = cleanup_descriptor\n            .into_iter()\n            .chain(generation_descriptor)\n            .collect();\n        close_inherited_descriptors(&preserved)?;"
+        ));
         assert!(managed.contains("None if self.instance.is_none() => Ok(None)"));
         assert!(MAIN.contains("run_cgroup_cleanup_bootstrap(&membership)"));
         assert!(MAIN.contains("run_cgroup_cleanup_watcher(&membership)"));
@@ -844,7 +881,7 @@ mod confinement {
                 .find("application_cgroup.keepalive_descriptor()?")
                 .unwrap()
                 < shared_transition
-                    .find("close_inherited_descriptors(cleanup_descriptor)?")
+                    .find("close_inherited_descriptors(cleanup_descriptor.as_slice())?")
                     .unwrap()
         );
         assert!(
@@ -950,7 +987,7 @@ mod confinement {
         assert!(at("acquire_fresh_terminal()?") < at("crate::bus::register("));
         assert!(at("acquire_fresh_terminal()?") < at("sys::unshare_namespaces("));
         assert!(
-            at("close_inherited_descriptors(cleanup_descriptor)?")
+            at("close_inherited_descriptors(&preserved)?")
                 < at("stage2_output = if application.terminal")
         );
         assert!(at("stage2_output = if application.terminal") < at(".stdout(stage2_output)"));

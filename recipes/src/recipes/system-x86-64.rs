@@ -4893,6 +4893,12 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
         target: "{in:td-net}/bin/td-net".into(),
         link: "{root}/real-root/bin/td-feed".into(),
     });
+    // /bin/td-app — the Flathub cache's applet (APPLICATIONS.md §W.9), which
+    // td-jail runs by this full path as the application's account.
+    steps.push(Step::Symlink {
+        target: "{in:td-net}/bin/td-net".into(),
+        link: "{root}/real-root/bin/td-app".into(),
+    });
     steps.push(Step::Symlink {
         target: "{in:td-net}/bin/td-net".into(),
         link: "{root}/real-root/bin/td-deploy".into(),
@@ -5240,6 +5246,7 @@ fn shape_check() -> String {
      tdbusd=\"{root}/real-root{in:td-busd}/bin/td-busd\"; { [ -f \"$tdbusd\" ] && [ -x \"$tdbusd\" ]; } || { echo 'root tree: td-busd is not packed/executable at real-root{in:td-busd}/bin/td-busd - the /bin/td-busd symlink would dangle' >&2; exit 1; }; \
      [ \"$(readlink \"$root/bin/td-fetchd\" 2>/dev/null)\" = \"{in:td-net}/bin/td-net\" ] || { echo 'root tree: /bin/td-fetchd is not a symlink to the staged td-net multicall - the fetchd unit names it in full, so this is the only thing standing between that unit and exec-ing nothing' >&2; exit 1; }; \
      [ \"$(readlink \"$root/bin/td-feed\" 2>/dev/null)\" = \"{in:td-net}/bin/td-net\" ] || { echo 'root tree: /bin/td-feed must select the shipped source consumer' >&2; exit 1; }; \
+     [ \"$(readlink \"$root/bin/td-app\" 2>/dev/null)\" = \"{in:td-net}/bin/td-net\" ] || { echo 'root tree: /bin/td-app must select the Flathub cache applet td-jail runs' >&2; exit 1; }; \
      [ \"$(readlink \"$root/bin/td-test-https\" 2>/dev/null)\" = \"{in:td-net}/bin/td-net\" ] || { echo 'root tree: /bin/td-test-https must select the Firefox HTTPS origin applet' >&2; exit 1; }; \
      [ ! -e \"$root/bin/openssl\" ] && [ ! -L \"$root/bin/openssl\" ] || { echo 'root tree: an openssl command entered the image' >&2; exit 1; }; \
      tdfetchd=\"{root}/real-root{in:td-net}/bin/td-net\"; { [ -f \"$tdfetchd\" ] && [ -x \"$tdfetchd\" ]; } || { echo 'root tree: td-net is not packed/executable at real-root{in:td-net}/bin/td-net - the /bin/td-fetchd symlink would dangle and the fetchd unit would exec nothing' >&2; exit 1; }; \
@@ -15528,7 +15535,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
     #[test]
     fn td_net_is_packed_and_not_merely_symlinked() {
         let steps = real_root_steps(&SYSTEM).unwrap();
-        for applet in ["td-feed", "td-deploy"] {
+        for applet in ["td-feed", "td-deploy", "td-app"] {
             assert!(
                 steps.iter().any(|step| matches!(step,
                     Step::Symlink { target, link }

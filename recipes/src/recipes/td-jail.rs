@@ -17,6 +17,11 @@ const MODULES: &[(&str, &str)] = &[
     ("bus", include_str!("../../../td-jail/src/bus.rs")),
     ("cgroup", include_str!("../../../td-jail/src/cgroup.rs")),
     ("firefox", include_str!("../../../td-jail/src/firefox.rs")),
+    ("flathub", include_str!("../../../td-jail/src/flathub.rs")),
+    (
+        "flathub_app",
+        include_str!("../../../engine/src/flathub_app.rs"),
+    ),
     (
         "host_path",
         include_str!("../../../engine/src/host_path.rs"),

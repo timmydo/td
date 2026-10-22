@@ -11070,7 +11070,7 @@ holds for these payloads. Layout:
   objects/<commit>/           §B.3.1 object graph caches, one per commit
   deploy/<commit>/files/      materialized trees, app and runtime alike
   generations/<n>/selection   app ref+commit+timestamp, runtime ref+commit+timestamp
-  current -> generations/<n>  what td-jail launches
+  current -> generations/<n>  what td-app ready offers
   previous -> generations/<m> the generation before it
   admitted                    newest admitted timestamp per ref (rule 3)
   checked                     time of the last completed check
@@ -11088,14 +11088,18 @@ can include it.
 
 A generation is published by writing it completely, then replacing
 `current` with one `rename(2)`; the old `current` becomes `previous`.
-Only `current` and `previous` are retained: after every check that
-passed rules 1–4, generations, deploys and object graphs neither names
-are removed, except the commits that check tried, and so is anything
-else in the cache root. A refused candidate therefore keeps its deploy
-for the next attempt, and only the latest refused set survives. A
-deploy of `current` found missing is restored in place, with no new
-generation. A crash between replacing `previous` and `current` leaves
-both naming the old generation; that costs only the older rollback.
+Only `current`, `previous` and generations a running launch holds (see
+"What a launch holds") are retained: after every check that passed rules
+1–4, other generations, and deploys and object graphs none of them
+names, are removed, except the commits that check tried, and so is
+anything else in the cache root. A refused candidate therefore keeps
+its deploy for the next attempt, and only the latest refused set
+survives. A deploy or object graph is renamed aside before it is
+deleted, so an interrupted removal never leaves a `files/` that reads
+as complete. A deploy of `current` found missing is restored in place,
+with no new generation. A crash between replacing `previous` and
+`current` leaves both naming the old generation; that costs only the
+older rollback.
 The deploy trees follow §B.3.1's materialization rules, owned by the
 account rather than root, directories 0755 and files 0755/0644 from the
 executable bit.
@@ -11128,12 +11132,35 @@ an absence check and plain `rename(2)` under that lock instead of the
 builder's `RENAME_NOREPLACE`.
 
 **When it fetches.** td-jail, launching an application whose spec names
-a Flathub source, runs `td-app update NAME` before it resolves the
-package: if there is no `current` generation it waits for the fetch
-(the first launch is a download); otherwise the daily check runs
-detached and a new generation is used from the next launch, so a
-network failure never stops a working application from starting. The
-forced check is the same command with `--force`, requested as below.
+Flathub refs, first runs `/bin/td-app ready NAME` as the account, with
+only `HOME` in its environment. That takes no lock and answers with the
+generation `current` names while it still serves the declaration (the
+`serves` test above, `checks` included), or `absent`. With no serving
+generation td-jail waits for `td-app update NAME` and asks again: the
+first launch is a download, and an application whose package or policy
+changed under a system update, or whose deploy is damaged, does not
+start until a check has validated it again. Otherwise the daily check
+runs beside the launch, unwaited, and what it selects is used from the
+next launch, so a network failure never stops a working application.
+The forced check is the same command with `--force`, requested as
+below. Host mode refuses such a spec.
+
+**What a launch holds.** td-jail takes a shared `flock` on the
+generation's `selection` and keeps the descriptor in stage 1 for the
+life of the application; td-app collects only a generation whose
+selection it can lock exclusively, and unlinks it under that lock; a
+selection it cannot open or read, other than one absent, a link or not
+a regular file, ends the collection. So a running application's trees
+outlive any number of newer generations, and a td-jail that locks a
+generation just collected finds it unlinked and asks again (three
+times at most). The trees it binds must each be a
+direct directory `deploy/<commit>/files` of the cache under the
+account's canonical home, owned by the account and writable by no one
+else; their contents are not validated again at launch. Rule 5 ran at
+admission, and outside a jail only td-app and td-jail run as the
+account, neither of which writes a deploy it has selected. No jail sees
+the cache: `~/.td` may not be granted (the permission policy refuses
+it), and td-jail reserves it at launch as it reserves the state.
 
 **How a launch is requested.** Today nothing user-reachable starts an
 application: `td-authd application-start` is root-only and every
@@ -11154,11 +11181,11 @@ from a terminal.
 
 **The image no longer carries the payload.** At cutover the Firefox
 recipe stops naming `firefox-154-source` and the runtime; its package in
-`/td/store` keeps `manifest`, `spec` and `exports/launcher.tsv` and gains
-a `source=` line naming the repository, app ref and runtime ref, while
-the spec's `runtime=` names the runtime ref rather than a store path.
-td-jail resolves such a spec from the account's `current` generation
-instead of `/td/store`. `recipes/src/ostree_pins.rs`, the pinned graphs,
+`/td/store` keeps `manifest`, `spec` and `exports/launcher.tsv`, and the
+spec names the declared refs: `source=` the app ref, between `name=` and
+`runtime=`, and `runtime=` the runtime ref rather than a store path.
+td-jail resolves such a spec from the account's held generation instead
+of `/td/store`. `recipes/src/ostree_pins.rs`, the pinned graphs,
 the OSTree step of `./update`'s warm and `td-feed export/consume graphs`
 are deleted in the same landing, and roughly 1 GB leaves every image and
 §B.1's ×3 capacity accounting.
@@ -11177,10 +11204,17 @@ runtime twice. After cutover no Flathub byte is in the image.
 
 **Each half of a spec resolves on its own.** A spec's application tree
 comes either from its `/td/store` package (`files/`) or, when the spec
-carries `source=`, from the account's `current` generation; its runtime
-comes either from a `/td/store` runtime path or, when `runtime=` names a
+carries `source=`, from the account's held generation; its runtime comes
+either from a `/td/store` runtime path or, when `runtime=` names a
 Flathub ref, from the same generation. Firefox takes both from the
 cache, Claude Code only its runtime, mail and news neither.
+`flathub_app::spec_source` is the one rule the spec compiler and td-jail
+both apply: a `/td/store` runtime carries no `source=`; any other
+`runtime=` is the declaration's runtime ref, with `source=` exactly when
+the declaration names an app ref, and the loader policy is the one the
+declaration names. A runtime-only generation serves only the package it
+was validated with: td-jail refuses it when the registry's package
+differs from the selection's `package=`.
 
 **The QEMU oracles keep Firefox.** Most proofs of the jail, portals,
 audio, input, seccomp and network run through the autostarted Firefox
@@ -11204,15 +11238,17 @@ these applications; it is a hint whose answer must pass 1–5.
 (3) Move the materializer and the dynamic validator into td-engine,
 unchanged (landed third). (4) `td-app update`: cache, admission,
 generations, daily and forced checks, for an application or a runtime
-alone, as a command nothing launches yet (landed fourth; how the
-account reaches Flathub from outside its jail is (5)'s to settle).
-(5) Launch requests, the worker, the compositor launcher, and td-jail
-resolving each half of a spec from the store or the cache; td-jail must
-also keep a running generation's trees from being collected under it,
-and refuse a selection whose `checks` no longer match its declaration. (6) Cutover:
-the declaration-only Firefox package, Claude Code's runtime ref,
-autostart only under the autotest token, the oracles' feed transport,
-and deletion of the pins, payloads and graph transfer.
+alone, as a command nothing launches yet (landed fourth). (5) The
+spec's Flathub form, `td-app ready`, td-jail resolving each half from
+the store or a held generation, collection sparing held generations,
+and `/bin/td-app` in the image, with no shipped spec yet in that form
+(landed fifth). td-app reaches Flathub from outside any jail as the
+account, as the mail and news fetchers already reach their servers;
+td has no per-uid egress filter to widen. (6) Launch requests and the
+compositor launcher. (7) Cutover: the declaration-only Firefox package,
+Claude Code's runtime ref, autostart only under the autotest token, the
+oracles' feed transport, and deletion of the pins, payloads and graph
+transfer.
 
 ## X. Host mode — development only
 

@@ -985,6 +985,11 @@ fn validate_filesystem_location(location: &str, create: bool) -> Result<(), Stri
         if paths_overlap(relative, ".local/share/flatpak") {
             return Err("the per-user Flatpak repository may not be granted".into());
         }
+        // The jail's state and the account's Flathub cache (APPLICATIONS.md
+        // §W.9), whose selected trees are launched without being read again.
+        if paths_overlap(relative, ".td") {
+            return Err("td's per-account state may not be granted".into());
+        }
         return Ok(());
     }
     if !location.starts_with('/') {
@@ -1655,6 +1660,8 @@ mod tests {
             ("~/.local", false, "Flatpak repository"),
             ("~/.local/share", false, "Flatpak repository"),
             ("~/.local/share/flatpak", false, "Flatpak repository"),
+            ("~/.td", false, "per-account state"),
+            ("~/.td/flathub/generations", false, "per-account state"),
             ("/", false, "root `/`"),
             ("/", true, "root `/`"),
             ("/var/lib", false, "reserved filesystem tree"),

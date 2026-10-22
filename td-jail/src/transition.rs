@@ -1356,7 +1356,7 @@ fn cstring(value: &str) -> io::Result<CString> {
     CString::new(value).map_err(|_| io::Error::other(format!("path contains NUL: {value:?}")))
 }
 
-fn close_inherited_descriptors(preserve: Option<u32>) -> io::Result<()> {
+fn close_inherited_descriptors(preserve: &[u32]) -> io::Result<()> {
     let mut descriptors = Vec::new();
     for entry in fs::read_dir("/proc/self/fd")? {
         let name = entry?
@@ -1368,7 +1368,7 @@ fn close_inherited_descriptors(preserve: Option<u32>) -> io::Result<()> {
                 "/proc/self/fd contained nonnumeric entry {name:?}: {e}"
             ))
         })?;
-        if descriptor > 2 && Some(descriptor) != preserve {
+        if descriptor > 2 && !preserve.contains(&descriptor) {
             descriptors.push(descriptor);
         }
     }
@@ -4174,7 +4174,7 @@ fn start_probe_instance(
     sys::bring_up_loopback()
         .map_err(|e| io::Error::other(format!("bring up isolated loopback: {e}")))?;
     let test_leak = install_test_leak_if_requested()?;
-    close_inherited_descriptors(cleanup_descriptor)?;
+    close_inherited_descriptors(cleanup_descriptor.as_slice())?;
     if let Some(descriptor) = test_leak {
         require_descriptor_closed(descriptor)?;
     }
@@ -6143,9 +6143,10 @@ pub fn launch_application(application: LaunchPlan) -> io::Result<()> {
     // Recorded because two reviewers had to find it.
     //
     // The connection is opened and dropped rather than held. The descriptor
-    // sweep preserves only the cleanup keepalive, so no connection survives
-    // into phase two. That is the real reason §D compares the same PROCESS
-    // across the phases rather than the same connection.
+    // sweep preserves only the cleanup keepalive and a cache generation's
+    // lock, so no connection survives into phase two. That is the real
+    // reason §D compares the same PROCESS across the phases rather than the
+    // same connection.
     //
     // No predeclared service names yet. §D carries them for app-local
     // activation, which lands with the activation listener; an empty list is
@@ -6190,7 +6191,19 @@ pub fn launch_application(application: LaunchPlan) -> io::Result<()> {
             sys::bring_up_loopback()
                 .map_err(|e| io::Error::other(format!("bring up isolated loopback: {e}")))?;
         }
-        close_inherited_descriptors(cleanup_descriptor)?;
+        // The cache generation's lock stays with stage 1, which outlives the
+        // application: td-app collects no generation a launch holds.
+        let generation_descriptor = application
+            .generation
+            .as_ref()
+            .map(|file| u32::try_from(file.as_raw_fd()))
+            .transpose()
+            .map_err(|e| io::Error::other(format!("generation lock descriptor: {e}")))?;
+        let preserved: Vec<u32> = cleanup_descriptor
+            .into_iter()
+            .chain(generation_descriptor)
+            .collect();
+        close_inherited_descriptors(&preserved)?;
         prepare_mount_plan(inside_identity, &executable, Some(&application))?;
         prepare_capability_bridge()?;
 
@@ -6491,7 +6504,7 @@ pub fn launch_workspace(plan: WorkspacePlan) -> io::Result<()> {
         sys::bring_up_loopback()
             .map_err(|e| io::Error::other(format!("bring up isolated loopback: {e}")))?;
     }
-    close_inherited_descriptors(None)?;
+    close_inherited_descriptors(&[])?;
     prepare_workspace_mount_plan(&plan, inside_identity)?;
     prepare_capability_bridge()?;
 

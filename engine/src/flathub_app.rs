@@ -51,6 +51,31 @@ pub fn flathub_source(name: &str) -> Option<FlathubSource> {
         .copied()
 }
 
+/// Where a spec's halves come from. A `/td/store` runtime path takes both
+/// from the store and carries no `source=`; any other `runtime=` must be the
+/// declaration's runtime ref, with `source=` exactly when it names an app
+/// ref. The spec compiler and td-jail both hold specs to this.
+pub fn spec_source(
+    name: &str,
+    source: Option<&str>,
+    runtime: &str,
+) -> Result<Option<FlathubSource>, String> {
+    if runtime.starts_with('/') {
+        return match source {
+            None => Ok(None),
+            Some(_) => Err("an application source needs a Flathub runtime ref".into()),
+        };
+    }
+    let declared =
+        flathub_source(name).ok_or_else(|| format!("{name} declares no Flathub runtime ref"))?;
+    if runtime != declared.runtime || source != declared.application {
+        return Err(format!(
+            "{name}'s spec does not name its declared Flathub refs"
+        ));
+    }
+    Ok(Some(declared))
+}
+
 /// The cache, relative to the application account's home.
 pub const CACHE_DIR: &str = ".td/flathub";
 pub const LOCK: &str = "lock";
@@ -491,6 +516,39 @@ mod tests {
         ];
         for bad in refused {
             assert!(Selection::parse(&bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_spec_names_its_declared_refs_or_a_store_runtime() {
+        let store = "/td/store/0123456789abcdfghijklmnpqrsvwxyz-freedesktop-platform-25-08";
+        assert_eq!(spec_source("firefox", None, store), Ok(None));
+        assert_eq!(spec_source("mail", None, store), Ok(None));
+        let firefox = flathub_source("firefox").unwrap();
+        assert_eq!(
+            spec_source("firefox", firefox.application, firefox.runtime),
+            Ok(Some(firefox))
+        );
+        let claude = flathub_source("claude").unwrap();
+        assert_eq!(
+            spec_source("claude", None, claude.runtime),
+            Ok(Some(claude))
+        );
+        for (name, source, runtime) in [
+            ("firefox", firefox.application, store),
+            ("firefox", None, firefox.runtime),
+            ("claude", firefox.application, claude.runtime),
+            (
+                "firefox",
+                firefox.application,
+                "runtime/org.example.Other/x86_64/1",
+            ),
+            ("mail", None, claude.runtime),
+        ] {
+            assert!(
+                spec_source(name, source, runtime).is_err(),
+                "{name} {source:?} {runtime}"
+            );
         }
     }
 

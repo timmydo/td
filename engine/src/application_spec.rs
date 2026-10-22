@@ -8,6 +8,7 @@ use crate::application::{
     validate_application_identity, validate_entry, validate_environment_name,
     validate_environment_value, ApplicationManifest,
 };
+use crate::flathub_app;
 use crate::permissions::PermissionPolicy;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -133,6 +134,9 @@ const BASE_ENVIRONMENT: &[(&str, &str)] = &[
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ApplicationSpec {
     name: String,
+    /// The declared Flathub app ref, when the application tree comes from
+    /// the account's cache rather than the package (APPLICATIONS.md §W.9).
+    source: Option<String>,
     runtime: String,
     entry: String,
     environment: BTreeMap<String, String>,
@@ -141,14 +145,28 @@ pub struct ApplicationSpec {
 
 impl ApplicationSpec {
     /// Compile validated package metadata against the runtime path selected by
-    /// the derivation lock. Runtime-specific environment policy is closed: a
-    /// new runtime must gain a reviewed table entry before any spec can name it.
+    /// the derivation lock, or the application's declared Flathub runtime ref.
+    /// Runtime-specific environment policy is closed: a new runtime must gain
+    /// a reviewed table entry before any spec can name it.
     pub fn compile(
         manifest: &ApplicationManifest,
         runtime_path: &str,
         permissions: PermissionPolicy,
     ) -> Result<ApplicationSpec, String> {
-        validate_runtime_path(runtime_path)?;
+        let flathub = flathub_app::flathub_source(manifest.name())
+            .filter(|declared| declared.runtime == runtime_path);
+        match flathub {
+            Some(declared) if manifest.runtime() != declared.policy_runtime => {
+                return Err(format!(
+                    "application {} declares runtime {:?}, not its Flathub runtime's {:?}",
+                    manifest.name(),
+                    manifest.runtime(),
+                    declared.policy_runtime
+                ));
+            }
+            Some(_) => {}
+            None => validate_runtime_path(runtime_path)?,
+        }
         let mut environment: BTreeMap<String, String> = BASE_ENVIRONMENT
             .iter()
             .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
@@ -227,6 +245,9 @@ impl ApplicationSpec {
         }
         let spec = ApplicationSpec {
             name: manifest.name().to_string(),
+            source: flathub
+                .and_then(|declared| declared.application)
+                .map(str::to_string),
             runtime: runtime_path.to_string(),
             entry: manifest.entry().to_string(),
             environment,
@@ -243,6 +264,7 @@ impl ApplicationSpec {
         validate_file_shape(text)?;
         let mut format = None;
         let mut name = None;
+        let mut source = None;
         let mut runtime = None;
         let mut entry = None;
         let mut environment = BTreeMap::new();
@@ -290,6 +312,7 @@ impl ApplicationSpec {
                 None => match key {
                     "format" => set_once(&mut format, value, "format", line_number)?,
                     "name" => set_once(&mut name, value, "name", line_number)?,
+                    "source" => set_once(&mut source, value, "source", line_number)?,
                     "runtime" => set_once(&mut runtime, value, "runtime", line_number)?,
                     "entry" => set_once(&mut entry, value, "entry", line_number)?,
                     _ => {
@@ -359,6 +382,7 @@ impl ApplicationSpec {
             .map_err(|reason| format!("application spec permissions: {reason}"))?;
         let spec = ApplicationSpec {
             name,
+            source,
             runtime,
             entry,
             environment,
@@ -374,6 +398,9 @@ impl ApplicationSpec {
     pub fn to_keyfile(&self) -> String {
         let mut out = String::from("format=1\n");
         push_key(&mut out, "name", &self.name);
+        if let Some(source) = &self.source {
+            push_key(&mut out, "source", source);
+        }
         push_key(&mut out, "runtime", &self.runtime);
         push_key(&mut out, "entry", &self.entry);
         if !self.environment.is_empty() {
@@ -396,6 +423,10 @@ impl ApplicationSpec {
         &self.name
     }
 
+    pub fn source(&self) -> Option<&str> {
+        self.source.as_deref()
+    }
+
     pub fn runtime(&self) -> &str {
         &self.runtime
     }
@@ -416,7 +447,10 @@ impl ApplicationSpec {
 
     fn validate(&self) -> Result<(), String> {
         validate_application_identity(&self.name)?;
-        validate_runtime_path(&self.runtime)?;
+        let flathub = flathub_app::spec_source(&self.name, self.source.as_deref(), &self.runtime)?;
+        if flathub.is_none() {
+            validate_runtime_path(&self.runtime)?;
+        }
         validate_entry(&self.entry)?;
         if self.environment.len() > MAX_SPEC_ENVIRONMENT_ENTRIES {
             return Err(format!(
@@ -453,7 +487,9 @@ impl ApplicationSpec {
         }
         // The reviewed loader path, or None where the policy names no package
         // library root: that application is held to carrying no variable.
-        let loader_path = runtime_recipe_name(&self.runtime)
+        let loader_path = flathub
+            .map(|declared| declared.policy_runtime)
+            .or_else(|| runtime_recipe_name(&self.runtime))
             .and_then(|runtime| dynamic_application_policy(&self.name, runtime))
             .map(|policy| policy.library_paths().join(":"))
             .filter(|path| !path.is_empty());
@@ -830,6 +866,63 @@ mod tests {
             error.contains("Freedesktop 25.08 runtime policy"),
             "{error}"
         );
+    }
+
+    /// The declared runtime ref in place of a store path: Firefox's spec then
+    /// names its app ref too, and keeps every policy its store form had.
+    #[test]
+    fn a_flathub_spec_names_its_declared_refs() {
+        let firefox = flathub_source("firefox").unwrap();
+        let manifest =
+            ApplicationDeclaration::new("freedesktop-platform-25-08", "/app/bin/firefox")
+                .unwrap()
+                .manifest("firefox", "154.0", ApplicationProvenance::Foreign)
+                .unwrap();
+        let spec =
+            ApplicationSpec::compile(&manifest, firefox.runtime, PermissionPolicy::new()).unwrap();
+        assert_eq!(spec.source(), firefox.application);
+        assert_eq!(spec.runtime(), firefox.runtime);
+        let text = spec.to_keyfile();
+        assert!(text.starts_with(
+            "format=1\nname=firefox\nsource=app/org.mozilla.firefox/x86_64/stable\n\
+             runtime=runtime/org.freedesktop.Platform/x86_64/25.08\nentry=/app/bin/firefox\n"
+        ));
+        assert_eq!(ApplicationSpec::parse(&text).unwrap(), spec);
+        let environment = spec.environment().collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            environment.get("LD_LIBRARY_PATH"),
+            Some(&"/app/lib:/app/lib/firefox")
+        );
+        // A store runtime carries no source, and a ref names no other.
+        let store = "/td/store/0123456789abcdfghijklmnpqrsvwxyz-freedesktop-platform-25-08";
+        assert_eq!(
+            ApplicationSpec::compile(&manifest, store, PermissionPolicy::new())
+                .unwrap()
+                .source(),
+            None
+        );
+        let without_source = text.replace("source=app/org.mozilla.firefox/x86_64/stable\n", "");
+        assert!(ApplicationSpec::parse(&without_source).is_err());
+        let other = text.replace("x86_64/25.08", "x86_64/24.08");
+        assert!(ApplicationSpec::parse(&other).is_err());
+
+        let claude = flathub_source("claude").unwrap();
+        let manifest = ApplicationDeclaration::new("freedesktop-platform-25-08", claude.entry)
+            .unwrap()
+            .manifest("claude", "2.1.0", ApplicationProvenance::Foreign)
+            .unwrap();
+        let spec =
+            ApplicationSpec::compile(&manifest, claude.runtime, PermissionPolicy::new()).unwrap();
+        assert_eq!(spec.source(), None);
+        assert_eq!(ApplicationSpec::parse(&spec.to_keyfile()).unwrap(), spec);
+        // Only the declared runtime's policy may run on its ref.
+        let manifest = ApplicationDeclaration::new("static-runtime", claude.entry)
+            .unwrap()
+            .manifest("claude", "2.1.0", ApplicationProvenance::Foreign)
+            .unwrap();
+        let error = ApplicationSpec::compile(&manifest, claude.runtime, PermissionPolicy::new())
+            .unwrap_err();
+        assert!(error.contains("not its Flathub runtime"), "{error}");
     }
 
     /// A reviewed policy without a package library root compiles to NO loader

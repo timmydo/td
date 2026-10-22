@@ -29,6 +29,16 @@ pub mod shared;
 pub mod permissions {
     pub use td_engine::permissions::*;
 }
+// td-jail's authority, compiled by the td-jail recipe's tests, resolves
+// cache-served specs through these.
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../../td-jail/src/flathub.rs"]
+mod flathub;
+#[cfg(test)]
+pub mod flathub_app {
+    pub use td_engine::flathub_app::*;
+}
 // The deployment contract, loaded ONCE for the whole lib. Two recipes name it —
 // the installer check and the system image — and a `#[path]` include in each
 // would load the same file twice, giving them distinct types for one contract.

@@ -1,3 +1,4 @@
+use crate::flathub_app::{self, FlathubSource};
 use crate::permissions::{
     BusAccess, FilesystemAccess, PermissionPolicy, PermissionSocket, ResourceLimits,
     MAX_FILESYSTEM_ENTRIES, RESERVED_FILESYSTEM_TREES,
@@ -43,6 +44,7 @@ const CA_BUNDLE_PREFIX: &str = "ca-bundle=";
 const RESOLV_CONF_PREFIX: &str = "resolv-conf=";
 const SPEC_FORMAT: &str = "format=1";
 const NAME_PREFIX: &str = "name=";
+const SOURCE_PREFIX: &str = "source=";
 const RUNTIME_PREFIX: &str = "runtime=";
 const ENTRY_PREFIX: &str = "entry=";
 const ENVIRONMENT_SECTION: &str = "[Environment]";
@@ -177,6 +179,9 @@ pub(crate) struct LaunchPlan {
     pub(crate) isolate_network: bool,
     pub(crate) enforce_cgroup: bool,
     pub(crate) host_mode: bool,
+    /// For a spec served from the account's Flathub cache, the shared lock
+    /// on the generation it binds, which stage 1 keeps open for the launch.
+    pub(crate) generation: Option<File>,
 }
 
 #[derive(Clone, Debug)]
@@ -440,13 +445,8 @@ where
     let arguments = collect_arguments(arguments)?;
     let (package, spec) = read_application_spec(name, &config)?;
 
-    let package_files = canonical_child_directory(&package, "files", "application files")?;
-    let runtime = physical_store_directory(
-        &config.package_root,
-        Path::new(&spec.runtime),
-        "application runtime",
-    )?;
-    let runtime_files = canonical_child_directory(&runtime, "files", "application runtime files")?;
+    let (package_files, runtime_files, generation) =
+        resolve_trees(name, &package, &spec, &config, outside_identity.0)?;
 
     let relative_entry = spec
         .entry
@@ -715,7 +715,75 @@ where
         isolate_network,
         enforce_cgroup: config.enforce_cgroup,
         host_mode: config.host_mode,
+        generation,
     })
+}
+
+/// The application and runtime trees, each from `/td/store` or, for a spec
+/// naming Flathub refs, from the account's cache (APPLICATIONS.md §W.9).
+fn resolve_trees(
+    name: &str,
+    package: &Path,
+    spec: &ParsedSpec,
+    config: &ProductConfig,
+    uid: u32,
+) -> io::Result<(PathBuf, PathBuf, Option<File>)> {
+    let Some(source) = spec.flathub else {
+        let package_files = canonical_child_directory(package, "files", "application files")?;
+        let runtime = physical_store_directory(
+            &config.package_root,
+            Path::new(&spec.runtime),
+            "application runtime",
+        )?;
+        let runtime_files =
+            canonical_child_directory(&runtime, "files", "application runtime files")?;
+        return Ok((package_files, runtime_files, None));
+    };
+    if config.host_mode {
+        return Err(invalid("host mode resolves no Flathub cache"));
+    }
+    let home = config
+        .real_home
+        .as_deref()
+        .ok_or_else(|| invalid("a Flathub application needs its account's home"))?;
+    let generation = crate::flathub::hold_generation(source, home, uid)?;
+    let selection = &generation.selection;
+    if selection.name != name
+        || selection.runtime.exact_ref != source.runtime
+        || selection
+            .application
+            .as_ref()
+            .map(|row| row.exact_ref.as_str())
+            != source.application
+    {
+        return Err(invalid(format!(
+            "the cache's selection does not serve {name}'s declaration"
+        )));
+    }
+    let package_files = match &selection.application {
+        Some(application) => generation.tree(&application.commit, uid)?,
+        None => {
+            // td-app validated the runtime against one package; any other
+            // has not been.
+            let validated = selection
+                .package
+                .as_deref()
+                .ok_or_else(|| invalid("the cache's selection names no package"))?;
+            if physical_store_directory(
+                &config.package_root,
+                Path::new(validated),
+                "validated application package",
+            )? != package
+            {
+                return Err(invalid(format!(
+                    "the cache's runtime was validated against another {name} package"
+                )));
+            }
+            canonical_child_directory(package, "files", "application files")?
+        }
+    };
+    let runtime_files = generation.tree(&selection.runtime.commit, uid)?;
+    Ok((package_files, runtime_files, Some(generation.hold)))
 }
 
 /// Display ownership is separate from the assigned application's runtime.
@@ -1144,6 +1212,8 @@ pub(crate) fn validate_stage2_loader_library_path(value: Option<&str>) -> io::Re
 
 struct ParsedSpec {
     name: String,
+    /// The declaration whose Flathub refs the spec names, if it does.
+    flathub: Option<FlathubSource>,
     runtime: String,
     entry: String,
     environment: BTreeMap<String, String>,
@@ -1154,12 +1224,28 @@ struct ParsedSpec {
 
 fn parse_spec(text: &str) -> io::Result<ParsedSpec> {
     validate_text("application spec", text, MAX_APPLICATION_SPEC_BYTES)?;
-    let mut lines = text.lines();
+    let mut lines = text.lines().peekable();
     require_line(&mut lines, SPEC_FORMAT, "application spec format")?;
     let name = prefixed_line(&mut lines, NAME_PREFIX, "application name")?;
     validate_application_name(&name)?;
+    let source = if lines
+        .peek()
+        .is_some_and(|line| line.starts_with(SOURCE_PREFIX))
+    {
+        Some(prefixed_line(
+            &mut lines,
+            SOURCE_PREFIX,
+            "application source",
+        )?)
+    } else {
+        None
+    };
     let runtime = prefixed_line(&mut lines, RUNTIME_PREFIX, "application runtime")?;
-    require_store_child(Path::new(&runtime), "application runtime")?;
+    let flathub = flathub_app::spec_source(&name, source.as_deref(), &runtime)
+        .map_err(|error| invalid(format!("application spec: {error}")))?;
+    if flathub.is_none() {
+        require_store_child(Path::new(&runtime), "application runtime")?;
+    }
     let entry = prefixed_line(&mut lines, ENTRY_PREFIX, "application entry")?;
     validate_entry(&entry)?;
     require_line(&mut lines, "", "application spec section separator")?;
@@ -1230,8 +1316,9 @@ fn parse_spec(text: &str) -> io::Result<ParsedSpec> {
         )));
     }
     ResolvedResourceLimits::from_policy(permissions.resources())?;
-    let runtime_aliases = dynamic_runtime(&runtime)?;
-    let loader_library_path = reviewed_loader_library_path(&name, &runtime)?.map(str::to_string);
+    let runtime_aliases = dynamic_runtime(&runtime, flathub)?;
+    let loader_library_path =
+        reviewed_loader_library_path(&name, &runtime, flathub)?.map(str::to_string);
     if environment.get("LD_LIBRARY_PATH").map(String::as_str) != loader_library_path.as_deref() {
         return Err(invalid(
             "application spec does not carry its exact reviewed loader path",
@@ -1239,6 +1326,7 @@ fn parse_spec(text: &str) -> io::Result<ParsedSpec> {
     }
     Ok(ParsedSpec {
         name,
+        flathub,
         runtime,
         entry,
         environment,
@@ -1277,17 +1365,25 @@ fn runtime_output_name(runtime: &str) -> io::Result<&str> {
 /// platform, at its exact name or a versioned successor. Every entry on it
 /// finds its interpreter through the `/lib64` alias into `/usr`, whether or
 /// not the package carries a library path of its own, and a static
-/// empty-runtime application has no loader to alias.
-fn dynamic_runtime(runtime: &str) -> io::Result<bool> {
-    let output = runtime_output_name(runtime)?;
+/// empty-runtime application has no loader to alias. A Flathub runtime ref
+/// answers through the policy its declaration names.
+fn dynamic_runtime(runtime: &str, flathub: Option<FlathubSource>) -> io::Result<bool> {
+    let output = match flathub {
+        Some(source) => source.policy_runtime,
+        None => runtime_output_name(runtime)?,
+    };
     Ok(output == DYNAMIC_RUNTIME
         || output
             .strip_prefix(DYNAMIC_RUNTIME)
             .is_some_and(|suffix| suffix.starts_with('-')))
 }
 
-fn reviewed_loader_library_path(name: &str, runtime: &str) -> io::Result<Option<&'static str>> {
-    Ok(match (name, dynamic_runtime(runtime)?) {
+fn reviewed_loader_library_path(
+    name: &str,
+    runtime: &str,
+    flathub: Option<FlathubSource>,
+) -> io::Result<Option<&'static str>> {
+    Ok(match (name, dynamic_runtime(runtime, flathub)?) {
         ("firefox", true) => Some(FIREFOX_LIBRARY_PATH),
         _ => None,
     })
@@ -1870,6 +1966,9 @@ impl GrantBoundary {
             state.state_root.clone(),
             state.runtime.clone(),
             canonical_candidate(&state.real_home.join(".local/share/flatpak"))?,
+            // The account's Flathub cache beside the state (§W.9): nothing
+            // in a jail may write what a later launch binds.
+            canonical_candidate(&state.real_home.join(".td"))?,
             package_files.to_path_buf(),
             runtime_files.to_path_buf(),
             wayland_socket.to_path_buf(),
@@ -4450,6 +4549,43 @@ mod tests {
         assert!(validate_stage2_loader_library_path(Some("/app/lib")).is_err());
     }
 
+    /// The Flathub form (APPLICATIONS.md §W.9): the declared refs in place of
+    /// store paths, with the same loader policy as the store form.
+    #[test]
+    fn a_spec_may_name_its_declared_flathub_refs() {
+        let store =
+            "runtime=/td/store/0123456789abcdfghijklmnpqrsvwxyz-freedesktop-platform-25-08-25.08\n";
+        let refs = "source=app/org.mozilla.firefox/x86_64/stable\nruntime=runtime/org.freedesktop.Platform/x86_64/25.08\n";
+        let firefox = "format=1\nname=firefox\nruntime=/td/store/0123456789abcdfghijklmnpqrsvwxyz-freedesktop-platform-25-08-25.08\nentry=/app/bin/firefox\n\n[Environment]\nDBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus\nFLATPAK_ID=org.mozilla.firefox\nHOME=/home/td\nLD_LIBRARY_PATH=/app/lib:/app/lib/firefox\nWAYLAND_DISPLAY=wayland-0\nXDG_RUNTIME_DIR=/run/user/1000\n\n[Context]\nshared=network\nsockets=wayland\n".replace(store, refs);
+        let spec = parse_spec(&firefox).unwrap();
+        assert_eq!(spec.flathub, flathub_app::flathub_source("firefox"));
+        assert_eq!(
+            spec.loader_library_path.as_deref(),
+            Some(FIREFOX_LIBRARY_PATH)
+        );
+        assert!(spec.runtime_aliases);
+        let claude = "format=1\nname=claude\nruntime=runtime/org.freedesktop.Platform/x86_64/25.08\nentry=/app/bin/claude\n\n[Environment]\nDISABLE_UPDATES=1\nHOME=/home/td\nWAYLAND_DISPLAY=wayland-0\nXDG_RUNTIME_DIR=/run/user/1000\n\n[Context]\nshared=network\nsockets=wayland\n";
+        assert_eq!(
+            parse_spec(claude).unwrap().flathub,
+            flathub_app::flathub_source("claude")
+        );
+        for altered in [
+            // Firefox's declaration names its app ref, so its spec must.
+            firefox.replace("source=app/org.mozilla.firefox/x86_64/stable\n", ""),
+            // Out of order.
+            firefox.replace(refs, "runtime=runtime/org.freedesktop.Platform/x86_64/25.08\nsource=app/org.mozilla.firefox/x86_64/stable\n"),
+            // A source with a store runtime.
+            firefox.replace(refs, &format!("source=app/org.mozilla.firefox/x86_64/stable\n{store}")),
+            // Another runtime ref, or a source Claude's declaration lacks.
+            firefox.replace("x86_64/25.08", "x86_64/24.08"),
+            claude.replace("name=claude\n", "name=claude\nsource=app/org.mozilla.firefox/x86_64/stable\n"),
+            // An application with no declaration.
+            claude.replace("name=claude\n", "name=mail\n").replace("DISABLE_UPDATES=1\n", ""),
+        ] {
+            assert!(parse_spec(&altered).is_err(), "accepted {altered:?}");
+        }
+    }
+
     /// The aliases follow the runtime, not the package library path: the
     /// dynamic platform's loader is what every entry on it needs, and an
     /// empty runtime has none to alias. Claude Code's boot oracle found
@@ -4464,12 +4600,14 @@ mod tests {
             ("empty-runtime-1", false),
         ] {
             assert_eq!(
-                dynamic_runtime(&format!("/td/store/{DIGEST}-{runtime}")).unwrap(),
+                dynamic_runtime(&format!("/td/store/{DIGEST}-{runtime}"), None).unwrap(),
                 expected,
                 "{runtime}"
             );
         }
-        assert!(dynamic_runtime("/usr/lib/runtime").is_err());
+        assert!(dynamic_runtime("/usr/lib/runtime", None).is_err());
+        let firefox = flathub_app::flathub_source("firefox").unwrap();
+        assert!(dynamic_runtime(firefox.runtime, Some(firefox)).unwrap());
     }
 
     /// An application with no reviewed loader path is held to carrying NONE:
