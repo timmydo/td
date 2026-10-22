@@ -1,4 +1,5 @@
 //! Retained owner plans for in-place source folder metadata updates.
+pub mod deletion;
 pub use super::folders::FolderFence;
 pub use super::reconcile::Applied;
 use super::*;

@@ -594,7 +594,7 @@ async fn apply_create(
     Ok((next, results))
 }
 
-async fn apply_delete(
+pub(crate) async fn apply_delete(
     client: &Client,
     account: &[u8],
     target: Option<MailboxId>,

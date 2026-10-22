@@ -296,12 +296,15 @@ impl Source {
         }
         Ok(list.to_vec())
     }
-    pub fn absent(&self, ids: &[String], state: &str) -> Result<()> {
+    pub fn absent(&self, kind: &str, ids: &[String], state: &str) -> Result<()> {
         if ids.len() > 64 {
             return Err("migration-capacity");
         }
+        if !matches!(kind, "Email" | "Mailbox") {
+            return Err("migration-arguments");
+        }
         let result = self.call(
-            "Email/get",
+            &format!("{kind}/get"),
             json!({"accountId":self.account,"ids":ids,"properties":["id"]}),
         )?;
         absent_reply(&result, ids, state)

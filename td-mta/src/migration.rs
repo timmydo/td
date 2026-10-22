@@ -2,6 +2,7 @@
 mod archive;
 mod compare;
 mod deletions;
+mod folder_deletions;
 mod folder_reconcile;
 mod import;
 mod inventory;
@@ -115,7 +116,7 @@ fn arguments(mut args: impl Iterator<Item = OsString>) -> Result<Options> {
     while let Some(key) = args.next() {
         let key = key.into_string().map_err(|_| "migration-arguments")?;
         if key == "--mailboxes" {
-            if action != "plan" || mailboxes {
+            if !matches!(action, "plan" | "deletion-plan") || mailboxes {
                 return Err("migration-arguments");
             }
             mailboxes = true;
@@ -197,7 +198,17 @@ fn run(options: Options) -> Result<Json> {
     let mut archive = archive::Archive::open(get("--archive")?, maximum)?;
     if matches!(options.action.as_str(), "deletion-plan" | "deletion-apply") {
         let previous = archive::Archive::open(get("--previous-archive")?, maximum)?;
-        return deletions::run(&archive, &previous, &options);
+        let folders = options.mailboxes
+            || (options.action == "deletion-apply"
+                && reconcile::read_plan(get("--plan-file")?)?
+                    .get("format")
+                    .and_then(Json::as_u64)
+                    == Some(4));
+        return if folders {
+            folder_deletions::run(&archive, &previous, &options)
+        } else {
+            deletions::run(&archive, &previous, &options)
+        };
     }
     if options.action == "compare" {
         let against = archive::Archive::open(get("--against-archive")?, maximum)?;
@@ -518,7 +529,6 @@ mod tests {
             vec!["export", "--against-archive", "other"],
             vec!["export", "--previous-archive", "other"],
             vec!["deletion-plan", "--plan-file", "plan"],
-            vec!["deletion-plan", "--mailboxes"],
             vec!["deletion-apply", "--only-unmapped"],
             vec!["deletion-apply", "--against-archive", "other"],
         ] {
@@ -549,6 +559,7 @@ mod mailbox_plan_arguments {
     fn mailbox_selector_is_a_plan_only_single_flag() {
         let parse = |args: &[&str]| arguments(args.iter().map(OsString::from));
         assert!(parse(&["plan", "--mailboxes"]).is_ok_and(|v| v.mailboxes));
+        assert!(parse(&["deletion-plan", "--mailboxes"]).is_ok_and(|v| v.mailboxes));
         assert!(parse(&["plan"]).is_ok_and(|v| !v.mailboxes));
         assert!(parse(&["plan", "--mailboxes", "--mailboxes"]).is_err());
         for action in [

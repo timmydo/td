@@ -64,38 +64,8 @@ pub(super) fn run(
     } else {
         None
     };
-    // Retained private archives are the operator's recoverable before/after record.
-    previous.verify()?;
-    current.verify()?;
-    let source_account = string(source, "account")?;
-    inventory::run(
-        current,
-        get("--session")?,
-        source_account,
-        get("--username")?,
-        get("--password-file")?,
-        options.values.get("--ca-file").map(String::as_str),
-    )?;
-    let remote = source::Source::open(
-        get("--session")?,
-        source_account,
-        get("--username")?,
-        get("--password-file")?,
-        options.values.get("--ca-file").map(String::as_str),
-    )?;
-    let fence = || -> Result<()> {
-        if remote.state("Email")? != string(&now, "emailState")?
-            || remote.state("Mailbox")? != string(&now, "mailboxState")?
-        {
-            return Err("migration-source-changed");
-        }
-        Ok(())
-    };
-    fence()?;
-    for batch in ids.chunks(64) {
-        remote.absent(batch, string(&now, "emailState")?)?;
-    }
-    fence()?;
+    let remote = source_proof(current, previous, options, &now, &ids, "Email")?;
+    let fence = || source_fence(&remote, &now);
     let (loaded, address, authority) = import::connect(get("--connection-file")?, epoch, account)?;
     let request = loaded.bootstrap.request(address);
     let mut output = Vec::new();
@@ -115,7 +85,11 @@ pub(super) fn run(
             match operations.get(index).ok_or("migration-plan-objects")? {
                 None => json!({"id":id,"status":"skipped-retained-observation"}),
                 Some(baseline) => {
-                    remote.absent(std::slice::from_ref(id), string(&now, "emailState")?)?;
+                    remote.absent(
+                        "Email",
+                        std::slice::from_ref(id),
+                        string(&now, "emailState")?,
+                    )?;
                     let status = match deletion::apply(
                         &request,
                         &loaded.trust,
@@ -205,6 +179,77 @@ fn operations(
         return Err("migration-plan-objects");
     }
     Ok(result)
+}
+
+pub(super) fn source_fence(remote: &source::Source, manifest: &Json) -> Result<()> {
+    if remote.state("Email")? != string(manifest, "emailState")?
+        || remote.state("Mailbox")? != string(manifest, "mailboxState")?
+    {
+        return Err("migration-source-changed");
+    }
+    Ok(())
+}
+pub(super) fn source_proof(
+    current: &archive::Archive,
+    previous: &archive::Archive,
+    options: &Options,
+    now: &Json,
+    ids: &[String],
+    kind: &str,
+) -> Result<source::Source> {
+    let get = |key| {
+        options
+            .values
+            .get(key)
+            .map(String::as_str)
+            .ok_or("migration-arguments")
+    };
+    previous.verify()?;
+    current.verify()?;
+    let source_account = string(field(now, "source")?, "account")?;
+    inventory::run(
+        current,
+        get("--session")?,
+        source_account,
+        get("--username")?,
+        get("--password-file")?,
+        options.values.get("--ca-file").map(String::as_str),
+    )?;
+    let remote = source::Source::open(
+        get("--session")?,
+        source_account,
+        get("--username")?,
+        get("--password-file")?,
+        options.values.get("--ca-file").map(String::as_str),
+    )?;
+    source_fence(&remote, now)?;
+    if kind == "Mailbox" {
+        let found = remote.mailboxes(string(now, "mailboxState")?)?;
+        let actual: std::collections::BTreeSet<_> = found
+            .iter()
+            .map(|v| string(v, "id"))
+            .collect::<Result<_>>()?;
+        let expected: std::collections::BTreeSet<_> = array(now, "mailboxes")?
+            .iter()
+            .map(|v| string(v, "id"))
+            .collect::<Result<_>>()?;
+        if actual != expected {
+            return Err("migration-inventory-mismatch");
+        }
+    }
+    let state = string(
+        now,
+        if kind == "Mailbox" {
+            "mailboxState"
+        } else {
+            "emailState"
+        },
+    )?;
+    for batch in ids.chunks(64) {
+        remote.absent(kind, batch, state)?;
+    }
+    source_fence(&remote, now)?;
+    Ok(remote)
 }
 
 #[cfg(test)]

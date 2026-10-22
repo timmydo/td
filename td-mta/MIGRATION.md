@@ -7,7 +7,7 @@ and rollback checklist, its current evidence and remaining acceptance gaps.
 HTTPS JMAP account. `migration verify` checks that archive offline. These
 commands do not modify the source, freeze delivery, or approve a domain
 cutover. The insert-only PostgreSQL importer below consumes a retained archive;
-final reconciliation remains pending.
+owner-selected reconciliation is separate from importing.
 
 Create an empty mode-0700 archive directory under a private, stable parent.
 The password file must be mode 0400 or 0600 in a mode-0700 directory owned by
@@ -57,7 +57,8 @@ independent proof that the server has no orphaned or inaccessible messages.
 The manifest and successful JSON report explicitly say `provisional` and
 `cutoverReady: false`. Account Email and Mailbox states must match before,
 during and after enumeration; changes cause failure and require a rerun.
-There is no live changes-feed convergence or final-deletion authority yet.
+There is no live changes-feed convergence. Export itself grants no deletion
+authority; the explicit reconciliation commands below have separate checks.
 
 # Account-wide inventory check
 
@@ -454,4 +455,40 @@ absence, and importing the old source object cannot resurrect it. A lost
 commit response requires retrying the exact retained plan. Earlier deletions
 remain committed if a later source fence or local conflict fails; preserve
 the reports and resolve the failure rather than regenerating fences blindly.
-Folders are not deleted by this command. Every report remains provisional.
+Message plans leave folders untouched. Separate folder plans are described
+below. Every report remains provisional.
+
+
+# Explicit source folder deletions
+
+Use the same retained previous/current archives and source-access conditions
+as message deletion, adding `--mailboxes` to `deletion-plan`. The resulting
+format-4 plan contains `mailboxes` rather than `messages`. `deletion-apply`
+selects the folder operation from that retained plan; it does not take a new
+`--mailboxes` switch or reinterpret an Email deletion plan.
+
+The command checks account-wide Email inventory and independently enumerates
+current Mailbox IDs at the retained states. Every candidate must also receive
+an exact `Mailbox/get` `notFound` response. Apply refreshes the candidate's
+absence and Mailbox state immediately before the operation, with both account
+states fencing the complete pass. Permission loss is still indistinguishable
+from absence and requires the same explicit operator review.
+
+Only an unchanged, exclusively mapped, roleless empty leaf can be deleted.
+Plans report `has-child`, `has-email`, `role-protected` and `local-conflict`
+without selecting those objects. A new target membership or child after
+planning causes apply to refuse. No message is removed to empty a folder.
+
+Apply selected leaf entries, settle uncertainty by retrying that exact plan,
+then generate a fresh plan for parents that have become empty leaves. Parent
+observations in the first plan remain skipped even after a child deletion;
+replay never silently upgrades an observation into a destructive operation.
+Complete message moves/deletions before trying to remove their old folders.
+
+The owner boundary reuses ordinary Mailbox destruction under the account
+lock, preserving its role, child and membership checks. Deletion emits one
+Mailbox tombstone and advances the account sequence while keeping the source
+receipt. A repeated plan acknowledges absence, and import does not recreate
+that historical source folder. Mail, blobs, quotas and other folders remain
+untouched. Compare final inventories and archives after all observations and
+conflicts are resolved; a mixed result still grants no cutover approval.

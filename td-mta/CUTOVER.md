@@ -10,7 +10,7 @@ A successful provisional command never makes the whole deployment ready.
 
 ## Current evidence and remaining blockers
 
-The independent Stalwart 0.15.2 rehearsal has preserved 816 messages across
+The initial independent Stalwart 0.15.2 copy preserved 816 messages across
 eight folders, including duplicate messages, shared memberships, folder moves,
 keywords and more than one GiB of logical raw mail. Separate account-wide
 inventory and cross-server archive comparison checks passed. Source message
@@ -25,9 +25,11 @@ the exact td-mta export; do not round comparison timestamps to conceal the
 loss. Exact rollback remains a blocker unless the owner explicitly accepts
 this limited loss for emergency rollback.
 
-Source-deleted folders still require implementation and rehearsal. The live
-production account/alias inventory, active forwarding rules and external
-provider authorization must also be reviewed before scheduling a switch.
+The source-deleted empty-folder rehearsal removed a child before its parent
+through separate retained plans, preserving all 816 surviving target messages
+and their memberships, bodies and quota rows. The live production account/alias
+inventory, active forwarding rules and external provider authorization must
+still be reviewed before scheduling a switch.
 The independent Stalwart binary and scripts remain outside build/test code.
 
 ## Prepare without changing mail routing

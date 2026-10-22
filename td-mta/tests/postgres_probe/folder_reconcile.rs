@@ -244,6 +244,7 @@ pub fn exercise(
     );
     assert!(matches!(plan(&absent, &definitions), Plan::Absent));
     cli(fixture, connection, epoch, account);
+    deletion_checks(fixture, request, trust, &authority);
     // Fill the account with long-name local descendants, without source receipts.
     sql(fixture,"INSERT INTO td_mta.mailboxes SELECT a.id,decode(lpad(to_hex(n),32,'0'),'hex'),repeat('x',1020)||n::text,CASE WHEN n=1000 THEN (SELECT local_object FROM td_mta.imports WHERE source_object=convert_to('other','UTF8')) ELSE decode(lpad(to_hex(n-1),32,'0'),'hex') END,NULL,0,1,a.sequence FROM td_mta.accounts a CROSS JOIN generate_series(1000,1251) n");
     let largest = folder("other", "Large subtree", None, None);
@@ -349,4 +350,113 @@ fn cli(fixture: &Fixture, connection: &std::path::Path, epoch: StoreEpoch, accou
         ),
         "Incoming|3|0"
     );
+}
+
+fn deletion_checks(
+    fixture: &Fixture,
+    request: &Request<'_>,
+    trust: &TrustStore,
+    authority: &db::Authority,
+) {
+    use td_mta::postgres_imports::mailbox_reconcile::deletion::{self, Applied, Plan};
+    let parent = folder("delete-parent", "Delete parent", None, None);
+    let child = folder("delete-child", "Delete child", Some(b"delete-parent"), None);
+    let protected = folder("delete-protected", "Protected", None, Some("archive"));
+    let plan =
+        |value: &Mailbox| deletion::plan(request, trust, deadline(), authority, value).unwrap();
+    assert!(matches!(plan(&parent), Plan::Unmapped));
+    for value in [&parent, &child, &protected] {
+        db::publish_mailbox(request, trust, deadline(), authority, value).unwrap();
+    }
+    assert!(matches!(plan(&parent), Plan::HasChild));
+    assert!(matches!(plan(&protected), Plan::Role));
+    let baseline = match plan(&child) {
+        Plan::Delete(b) => b,
+        _ => panic!("expected leaf"),
+    };
+    let apply = |value: &Mailbox, baseline: &deletion::Baseline| {
+        deletion::apply(request, trust, deadline(), authority, value, baseline)
+    };
+    let id = baseline
+        .local
+        .iter()
+        .map(|v| format!("{v:02x}"))
+        .collect::<String>();
+    let invariant = untouched(fixture);
+    sql(fixture,&format!("INSERT INTO td_mta.memberships SELECT account,id,decode('{id}','hex'),changed FROM td_mta.emails LIMIT 1"));
+    assert!(matches!(plan(&child), Plan::HasEmail));
+    assert_eq!(apply(&child, &baseline), Err(db::Error::Conflict));
+    sql(
+        fixture,
+        &format!("DELETE FROM td_mta.memberships WHERE mailbox_id=decode('{id}','hex')"),
+    );
+    sql(
+        fixture,
+        &format!("UPDATE td_mta.mailboxes SET name='Local name' WHERE id=decode('{id}','hex')"),
+    );
+    assert!(matches!(plan(&child), Plan::Conflict));
+    assert_eq!(apply(&child, &baseline), Err(db::Error::Conflict));
+    sql(
+        fixture,
+        &format!("UPDATE td_mta.mailboxes SET name='Delete child' WHERE id=decode('{id}','hex')"),
+    );
+    let mut wrong = baseline.clone();
+    wrong.account = AccountId::from_bytes([0; 16]);
+    assert_eq!(apply(&child, &wrong), Err(db::Error::Invalid));
+    let mut wrong = baseline.clone();
+    wrong.changed += 1;
+    assert_eq!(apply(&child, &wrong), Err(db::Error::Conflict));
+    let old = state(fixture);
+    assert_eq!(apply(&child, &baseline), Ok(Applied::Deleted));
+    assert_ne!(state(fixture), old);
+    let settled = state(fixture);
+    assert_eq!(apply(&child, &baseline), Ok(Applied::Absent));
+    assert_eq!(state(fixture), settled);
+    assert!(
+        !db::publish_mailbox(request, trust, deadline(), authority, &child)
+            .unwrap()
+            .present
+    );
+    assert_eq!(state(fixture), settled);
+    assert_eq!(untouched(fixture), invariant);
+    let parent_baseline = match plan(&parent) {
+        Plan::Delete(b) => b,
+        _ => panic!("expected parent leaf"),
+    };
+    let old = u64::from_str_radix(
+        &sql(
+            fixture,
+            "SELECT encode(sequence,'hex') FROM td_mta.accounts",
+        ),
+        16,
+    )
+    .unwrap();
+    sql(fixture,"CREATE FUNCTION public.delay_folder_delete() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(11); RETURN OLD; END $$; CREATE CONSTRAINT TRIGGER delay_folder_delete AFTER DELETE ON td_mta.mailboxes DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_folder_delete()");
+    assert_eq!(
+        apply(&parent, &parent_baseline),
+        Err(db::Error::Indeterminate)
+    );
+    sql(
+        fixture,
+        "DROP TRIGGER delay_folder_delete ON td_mta.mailboxes",
+    );
+    assert!(matches!(
+        apply(&parent, &parent_baseline),
+        Ok(Applied::Deleted | Applied::Absent)
+    ));
+    assert_eq!(
+        u64::from_str_radix(
+            &sql(
+                fixture,
+                "SELECT encode(sequence,'hex') FROM td_mta.accounts"
+            ),
+            16
+        )
+        .unwrap(),
+        old + 1
+    );
+    assert_eq!(untouched(fixture), invariant);
+    assert_eq!(sql(fixture,"SELECT count(*) FROM td_mta.imports WHERE source_object IN (convert_to('delete-parent','UTF8'),convert_to('delete-child','UTF8'))"),"2");
+    // Restore this fixture's mailbox count before its separate 256-folder probe.
+    sql(fixture,"DELETE FROM td_mta.mailboxes WHERE id=(SELECT local_object FROM td_mta.imports WHERE source_object=convert_to('delete-protected','UTF8')); DELETE FROM td_mta.imports WHERE source_object=convert_to('delete-protected','UTF8')");
 }
