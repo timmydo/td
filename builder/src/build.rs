@@ -3984,7 +3984,10 @@ fn compile_application_tables_in(
                 "compileApplicationTables: package {package} metadata is not canonical"
             ));
         }
-        if !payload_paths.contains(expected_runtime.as_str()) {
+        // A declared Flathub runtime ref is fetched by td-app, not staged.
+        let flathub_runtime = td_engine::flathub_app::flathub_source(expected_name)
+            .is_some_and(|source| source.runtime == expected_runtime);
+        if !flathub_runtime && !payload_paths.contains(expected_runtime.as_str()) {
             return Err(format!(
                 "compileApplicationTables: runtime {expected_runtime} is not a declared payload"
             ));
@@ -6285,6 +6288,70 @@ mod tests {
             materialize_application_metadata_at(&other, Some(&encoded), None, None).unwrap_err();
         assert!(error.contains("requires the manifest"), "{error}");
         fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// A declared Flathub application pairs with its runtime ref, which no
+    /// build stages; an undeclared one still needs the runtime payload.
+    #[test]
+    fn application_tables_pair_a_flathub_package_with_its_runtime_ref() {
+        const REF: &str = "runtime/org.freedesktop.Platform/x86_64/25.08";
+        let _directory_cleanup = crate::test_temp::TempDir::new("td-flathub-tables").unwrap();
+        let store = _directory_cleanup.join("store");
+        let package = store.join("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-firefox-154.0");
+        fs::create_dir_all(package.join("exports")).unwrap();
+        let manifest = td_engine::application::ApplicationDeclaration::new(
+            "freedesktop-platform-25-08",
+            "/app/bin/firefox",
+        )
+        .unwrap()
+        .manifest(
+            "firefox",
+            "154.0",
+            td_engine::application::ApplicationProvenance::Foreign,
+        )
+        .unwrap();
+        let spec = td_engine::application_spec::ApplicationSpec::compile(
+            &manifest,
+            REF,
+            td_engine::permissions::PermissionPolicy::new(),
+        )
+        .unwrap();
+        let launcher = td_engine::launcher::LauncherDeclaration::new("Firefox", &["browser"])
+            .unwrap()
+            .bind("firefox")
+            .unwrap();
+        fs::write(package.join("manifest"), manifest.to_keyfile()).unwrap();
+        fs::write(package.join("spec"), spec.to_keyfile()).unwrap();
+        fs::write(package.join("exports/launcher.tsv"), launcher.to_tsv()).unwrap();
+        let package = package.to_string_lossy().into_owned();
+        let payloads = vec![("firefox".to_string(), package.clone())];
+        let registry = _directory_cleanup.join("image/etc/td-applications.tsv");
+        compile_application_tables_in(
+            &["firefox".into()],
+            std::slice::from_ref(&package),
+            &[REF.into()],
+            &payloads,
+            &registry,
+            &_directory_cleanup.join("image/etc/td-launcher.tsv"),
+            &store.to_string_lossy(),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(&registry).unwrap(),
+            format!("firefox\t{package}\n")
+        );
+
+        let error = compile_application_tables_in(
+            &["firefox".into()],
+            std::slice::from_ref(&package),
+            &["runtime/org.freedesktop.Platform/x86_64/24.08".into()],
+            &payloads,
+            &_directory_cleanup.join("other/registry.tsv"),
+            &_directory_cleanup.join("other/launcher.tsv"),
+            &store.to_string_lossy(),
+        )
+        .unwrap_err();
+        assert!(error.contains("is not a declared payload"), "{error}");
     }
 
     #[test]

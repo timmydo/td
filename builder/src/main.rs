@@ -5891,6 +5891,79 @@ fn parse_application_permissions(
     Ok(Some(policy))
 }
 
+/// The declared Flathub runtime ref of an application whose recipe stages no
+/// runtime payload (APPLICATIONS.md §W.9). td-app fetches that runtime into
+/// the account's cache and validates the package against it at admission, so
+/// nothing in the build reads it. A recipe that stages the runtime keeps the
+/// store form.
+fn flathub_application_runtime(
+    name: &str,
+    declaration: &td_engine::application::ApplicationDeclaration,
+    alist: &json::Json,
+) -> Result<Option<&'static str>, String> {
+    let staged = match alist.get("payloadInputs") {
+        None => false,
+        Some(json::Json::Arr(inputs)) => inputs
+            .iter()
+            .any(|input| input.as_str() == Some(declaration.runtime())),
+        Some(_) => {
+            return Err("recipe: `payloadInputs' must be an ARRAY of input names".into());
+        }
+    };
+    if staged {
+        return Ok(None);
+    }
+    let Some(source) = td_engine::flathub_app::flathub_source(name)
+        .filter(|source| source.policy_runtime == declaration.runtime())
+    else {
+        return Ok(None);
+    };
+    // td-app validates the declared entry; td-jail launches the spec's.
+    if declaration.entry() != source.entry {
+        return Err(format!(
+            "recipe `{name}': entry {:?} is not its Flathub declaration's {:?}",
+            declaration.entry(),
+            source.entry
+        ));
+    }
+    Ok(Some(source.runtime))
+}
+
+/// A Flathub-runtime application has no build-time validator, so nothing
+/// after its materialization would stop package code from running: it is a
+/// mesboot recipe of native copies alone, and td-app validates it at
+/// admission.
+fn validate_flathub_application_steps(
+    name: &str,
+    build_system: &str,
+    runtime: &str,
+    alist: &json::Json,
+) -> Result<(), String> {
+    if build_system != "mesboot" {
+        return Err(format!(
+            "recipe `{name}': an application on the Flathub ref {runtime} must be a \
+             mesboot recipe of native copies"
+        ));
+    }
+    let steps = match alist.get("steps") {
+        None => &[][..],
+        Some(steps) => steps
+            .as_arr()
+            .ok_or_else(|| format!("recipe `{name}': `steps' must be an array"))?,
+    };
+    for step in steps {
+        let operation = sole_object_field(step).map(|(operation, _)| operation);
+        if !matches!(operation, Some("copyTree" | "copyFile")) {
+            return Err(format!(
+                "recipe `{name}': its runtime is the Flathub ref {runtime}, which no build \
+                 stages, so td-app validates the package at admission; until then only \
+                 native copyTree and copyFile steps may touch it"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn resolve_application_runtime<'a>(
     declaration: &td_engine::application::ApplicationDeclaration,
     payloads: &std::collections::BTreeSet<String>,
@@ -6106,11 +6179,18 @@ fn assemble_recipe_drv(
         parse_application_permissions(&alist, application_declaration.is_some())?;
     let application_launcher =
         parse_application_launcher(&alist, application_declaration.is_some())?;
+    let flathub_runtime = match application_declaration.as_ref() {
+        Some(declaration) => flathub_application_runtime(name, declaration, &alist)?,
+        None => None,
+    };
+    if let Some(runtime) = flathub_runtime {
+        validate_flathub_application_steps(name, build_system, runtime, &alist)?;
+    }
     validate_application_step_contract(
         name,
         &alist,
         application_declaration.as_ref(),
-        foreign_source,
+        foreign_source && flathub_runtime.is_none(),
     )?;
     let application_manifest = match application_declaration.as_ref() {
         Some(declaration) => {
@@ -6124,11 +6204,12 @@ fn assemble_recipe_drv(
                     )
                 }
             };
-            let provenance = if mark_of(name, &alist)? || contains_payload {
-                td_engine::application::ApplicationProvenance::Foreign
-            } else {
-                td_engine::application::ApplicationProvenance::Source
-            };
+            let provenance =
+                if mark_of(name, &alist)? || contains_payload || flathub_runtime.is_some() {
+                    td_engine::application::ApplicationProvenance::Foreign
+                } else {
+                    td_engine::application::ApplicationProvenance::Source
+                };
             Some(
                 declaration
                     .manifest(name, version, provenance)
@@ -6240,7 +6321,10 @@ fn assemble_recipe_drv(
         application_launcher_export.as_ref(),
     ) {
         (Some(declaration), Some(manifest), Some(permissions), Some(_)) => {
-            let runtime = resolve_application_runtime(declaration, &payloads, &entries)?;
+            let runtime = match flathub_runtime {
+                Some(runtime) => runtime,
+                None => resolve_application_runtime(declaration, &payloads, &entries)?,
+            };
             Some(
                 td_engine::application_spec::ApplicationSpec::compile(
                     manifest,
@@ -17591,6 +17675,108 @@ daemon build START (2/2 active)
             let entries = lock::parse(text, "fixture-source").unwrap();
             let error = resolve_application_runtime(&declaration, &payloads, &entries).unwrap_err();
             assert!(error.contains(reason), "{reason}: {error}");
+        }
+    }
+
+    /// A declared Flathub application that stages no runtime compiles its
+    /// spec against the runtime ref, is foreign without a payload, and needs
+    /// no build-time validator; td-app validates it at admission.
+    #[test]
+    fn a_flathub_application_without_a_runtime_payload_names_its_refs() {
+        let _dir_cleanup = crate::test_temp::TempDir::new("td-application-flathub").unwrap();
+        let dir = _dir_cleanup.join("fixture");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mes = "mes /gnu/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-mes-0.24 td-recipe-output\n";
+        let firefox_lock = dir.join("firefox.lock");
+        std::fs::write(&firefox_lock, mes).unwrap();
+        let claude_lock = dir.join("claude.lock");
+        std::fs::write(
+            &claude_lock,
+            format!(
+                "claude-source /gnu/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-claude source\n{mes}"
+            ),
+        )
+        .unwrap();
+        let spec_of = |recipe: &str| {
+            let lock = if recipe.contains(r#""name":"claude""#) {
+                &claude_lock
+            } else {
+                &firefox_lock
+            };
+            let (_path, _file, drv, _source) =
+                assemble_recipe_drv(recipe, lock.to_str().unwrap(), &dir, None)?;
+            let value = |key: &str| {
+                drv.env
+                    .iter()
+                    .find(|(name, _)| name == key)
+                    .map(|(_, value)| json::parse(value).unwrap().as_str().unwrap().to_string())
+                    .unwrap()
+            };
+            Ok::<_, String>((
+                value("TD_APPLICATION_MANIFEST"),
+                td_engine::application_spec::ApplicationSpec::parse(&value("TD_APPLICATION_SPEC"))
+                    .unwrap(),
+            ))
+        };
+        let application = r#""application":{"runtime":"freedesktop-platform-25-08","entry":"/app/bin/firefox"},"applicationLauncher":{"displayName":"Firefox","searchTerms":[]},"applicationPermissions":"format=1\n""#;
+        let firefox = format!(
+            r#"{{"name":"firefox","version":"154.0","buildSystem":"mesboot",{application},"steps":[]}}"#
+        );
+        let (manifest, spec) = spec_of(&firefox).unwrap();
+        assert!(manifest.contains("\nprovenance=foreign\n"), "{manifest}");
+        assert_eq!(
+            spec.runtime(),
+            "runtime/org.freedesktop.Platform/x86_64/25.08"
+        );
+        assert_eq!(spec.source(), Some("app/org.mozilla.firefox/x86_64/stable"));
+
+        let claude = r#"{"name":"claude","version":"2","buildSystem":"mesboot","sourceInput":"claude-source","foreign":true,"foreignSource":true,"application":{"runtime":"freedesktop-platform-25-08","entry":"/app/bin/claude"},"applicationLauncher":{"displayName":"Claude","searchTerms":[]},"applicationPermissions":"format=1\n","steps":[{"copyFile":{"file":"{payload:claude-source}","to":"{out}/files/bin/claude","exec":true}}]}"#;
+        let (_, spec) = spec_of(claude).unwrap();
+        assert_eq!(
+            spec.runtime(),
+            "runtime/org.freedesktop.Platform/x86_64/25.08"
+        );
+        assert_eq!(spec.source(), None);
+
+        // No validator, and nothing but native copies: nothing else stands
+        // between the build and the foreign bytes.
+        for step in [
+            r#"{"validateDynamicApplication":{"entry":"/app/bin/claude","runtime":"freedesktop-platform-25-08","libraryPaths":[],"optionalTargets":[],"optionalLinks":0}}"#,
+            r#"{"run":{"argv":["{out}/files/bin/claude"],"dir":"{out}","env":[]}}"#,
+            r#"{"mkDir":"{out}/files/lib"}"#,
+        ] {
+            let extended = claude.replace(r#"}}]}"#, &format!("}}}},{step}]}}"));
+            let error = spec_of(&extended).unwrap_err();
+            assert!(
+                error.contains("only native copyTree and copyFile"),
+                "{error}"
+            );
+        }
+        let error =
+            spec_of(&firefox.replace(r#""steps":[]"#, r#""steps":{"run":{}}"#)).unwrap_err();
+        assert!(error.contains("`steps' must be an array"), "{error}");
+        let gnu = firefox
+            .replace("mesboot", "gnu")
+            .replace(r#","steps":[]"#, "");
+        let error = spec_of(&gnu).unwrap_err();
+        assert!(error.contains("must be a mesboot recipe"), "{error}");
+        let error = spec_of(&claude.replace(
+            r#""entry":"/app/bin/claude""#,
+            r#""entry":"/app/bin/other""#,
+        ))
+        .unwrap_err();
+        assert!(
+            error.contains("is not its Flathub declaration's"),
+            "{error}"
+        );
+
+        // An undeclared application, or a declared one on another runtime,
+        // keeps the store rule.
+        let undeclared = firefox.replace(r#""name":"firefox""#, r#""name":"browser""#);
+        let other_runtime = firefox.replace("freedesktop-platform-25-08", "empty-runtime");
+        for recipe in [undeclared, other_runtime] {
+            let error = spec_of(&recipe).unwrap_err();
+            assert!(error.contains("must be a declared payload"), "{error}");
         }
     }
 

@@ -1248,6 +1248,12 @@ fn parse_spec(text: &str) -> io::Result<ParsedSpec> {
     }
     let entry = prefixed_line(&mut lines, ENTRY_PREFIX, "application entry")?;
     validate_entry(&entry)?;
+    // td-app validated the declared entry; launch no other.
+    if flathub.is_some_and(|declared| declared.entry != entry) {
+        return Err(invalid(format!(
+            "application spec entry {entry:?} is not its Flathub declaration's"
+        )));
+    }
     require_line(&mut lines, "", "application spec section separator")?;
     require_line(
         &mut lines,
@@ -4581,6 +4587,8 @@ mod tests {
             claude.replace("name=claude\n", "name=claude\nsource=app/org.mozilla.firefox/x86_64/stable\n"),
             // An application with no declaration.
             claude.replace("name=claude\n", "name=mail\n").replace("DISABLE_UPDATES=1\n", ""),
+            // An entry td-app never validated.
+            firefox.replace("entry=/app/bin/firefox\n", "entry=/app/bin/other\n"),
         ] {
             assert!(parse_spec(&altered).is_err(), "accepted {altered:?}");
         }

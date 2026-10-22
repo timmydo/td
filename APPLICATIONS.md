@@ -829,7 +829,8 @@ in each metadata path,
 parses the canonical manifest, spec and export, and requires all three
 identities to agree. The package itself and the exact runtime named by its spec
 must both be declared payloads, and the spec's exact runtime must equal the
-runtime paired with that package. It then emits two sorted, duplicate-free
+runtime paired with that package; a Flathub application's runtime is instead
+its declared runtime ref (§W.9), which no build stages. It then emits two sorted, duplicate-free
 immutable files:
 
 - `/etc/td-launcher.tsv` keeps the three columns above for the compositor;
@@ -946,7 +947,8 @@ apart matters because they have different readers. The manifest is the
 *declaration* — what this package is, written for a human and for the
 recipe checks. The spec is the immutable compiler output derived from it at
 build time — effective environment, typed grants/defaults, the entry point,
-and the runtime's full store path. It is the only package metadata `td-jail`
+and the runtime's full store path, or for a Flathub application its declared
+refs (§W.9). It is the only package metadata `td-jail`
 parses; the jail resolves grants into the machine-specific mount plan later.
 
 The manifest is td's own format — a small keyfile in the shape
@@ -995,7 +997,9 @@ package PID namespace. An application declaration that contains a direct
 image recipe, but it cannot make the contained application's own manifest claim
 `source`. This provenance is deliberately an answer about the recipe's direct
 staging, not its transitive runtime closure; the landed store-level closure
-query answers that separate question.
+query answers that separate question. A package whose runtime is its declared
+Flathub ref (§W.9) is foreign as well: its application or runtime bytes come
+from Flathub though no payload edge says so.
 
 `Recipe::application_launcher` separately carries the typed display name and
 search terms. The derivation assembler binds the final recipe name into its TSV
@@ -1218,7 +1222,13 @@ root-owned package directory to be world-traversable by the uid-1000 application
 Every foreign-source application requires exactly one check whose entry and
 runtime are bound to the builder-authenticated manifest. Assembly admits only
 native unpack/mkdir/copy steps before that terminal validation, so package code
-cannot race or mutate the approved tree. The native archive reader and copy step
+cannot race or mutate the approved tree. The exception is an application whose
+runtime is its declared Flathub ref (§W.9): no build stages that runtime, so
+it carries no validator, must be a mesboot recipe whose every step is a native
+`copyTree` or `copyFile`, and must declare the table's entry; td-app runs the
+same dynamic validator against the fetched runtime before any launch. Its
+copied bytes therefore reach the store and the image unvalidated, read there
+only as data (image packing, the profiler's walk) and never executed. The native archive reader and copy step
 do not materialize device entries or xattrs, and the copy step refuses a symlink
 in any source-path component or any special-file source rather than
 dereferencing it; final validation rejects
@@ -11251,10 +11261,18 @@ and `/bin/td-app` in the image, with no shipped spec yet in that form
 (landed fifth). td-app reaches Flathub from outside any jail as the
 account, as the mail and news fetchers already reach their servers;
 td has no per-uid egress filter to widen. (6) Launch requests and the
-compositor launcher (landed sixth). (7) Cutover: the declaration-only Firefox package,
-Claude Code's runtime ref, autostart only under the autotest token, the
-oracles' feed transport, and deletion of the pins, payloads and graph
-transfer.
+compositor launcher (landed sixth). (7) The builder and the profiler
+index accept the Flathub form: an application in the declaration table
+whose recipe stages no runtime payload compiles its spec against the
+declared runtime ref, is foreign without a payload, and carries no
+build-time validator, since td-app validates it at admission; the
+tables step pairs it with that ref, and the profiler's root policy names
+the ref and adds no image root (landed seventh). (8) td-app's feed
+transport and the host export that replaces the graph transfer. (9) The
+oracle boots that run an application reach that feed. (10) Cutover: the
+declaration-only Firefox package, Claude Code's runtime ref, autostart
+only under the autotest token, and deletion of the pins, payloads and
+graph transfer.
 
 ## X. Host mode — development only
 

@@ -92,30 +92,19 @@ pub fn registry_exclusions(
                 "application package identity disagrees with root policy for {name:?}"
             ));
         }
-        if !store_identity(&runtime, &policy.runtime_identity) {
-            return Err(format!(
-                "application runtime identity disagrees with root policy for {name:?}"
-            ));
-        }
-        if !policy
-            .runtime_identity
-            .strip_prefix(&manifest.runtime)
-            .is_some_and(|version| version.starts_with('-') && version.len() > 1)
-        {
-            return Err(format!(
-                "application runtime recipe disagrees with manifest for {name:?}"
-            ));
-        }
+        let runtime = runtime_root(name, runtime, &manifest.runtime, &policy)?;
         let roots = match policy.package_provenance {
             Provenance::Source => &mut source_roots,
             Provenance::Foreign => &mut foreign_roots,
         };
         roots.insert(package);
-        let roots = match policy.runtime_provenance {
-            Provenance::Source => &mut source_roots,
-            Provenance::Foreign => &mut foreign_roots,
-        };
-        roots.insert(runtime);
+        if let Some(runtime) = runtime {
+            let roots = match policy.runtime_provenance {
+                Provenance::Source => &mut source_roots,
+                Provenance::Foreign => &mut foreign_roots,
+            };
+            roots.insert(runtime);
+        }
     }
     if !policies.is_empty() {
         return Err("application root policy has rows absent from the registry".into());
@@ -764,10 +753,74 @@ fn application_manifest(text: &str, expected_name: &str) -> Result<ApplicationMa
     })
 }
 
-fn application_runtime(text: &str, expected_name: &str) -> Result<PathBuf, String> {
+/// A spec's runtime: a store root in the image, or a Flathub runtime ref
+/// td-app fetches into the account's cache (APPLICATIONS.md §W.9), which puts
+/// nothing in the image.
+#[derive(Debug, PartialEq, Eq)]
+enum SpecRuntime {
+    Store(PathBuf),
+    Flathub(String),
+}
+
+/// The image root a policy row admits for a spec's runtime, if any. A Flathub
+/// ref must be named exactly by its row, as foreign.
+fn runtime_root(
+    name: &str,
+    runtime: SpecRuntime,
+    manifest_runtime: &str,
+    policy: &ApplicationRootPolicy,
+) -> Result<Option<PathBuf>, String> {
+    let runtime = match runtime {
+        SpecRuntime::Flathub(reference) => {
+            if policy.runtime_identity != reference
+                || policy.runtime_provenance != Provenance::Foreign
+            {
+                return Err(format!(
+                    "application Flathub runtime disagrees with root policy for {name:?}"
+                ));
+            }
+            return Ok(None);
+        }
+        SpecRuntime::Store(runtime) => runtime,
+    };
+    if !store_identity(&runtime, &policy.runtime_identity) {
+        return Err(format!(
+            "application runtime identity disagrees with root policy for {name:?}"
+        ));
+    }
+    if !policy
+        .runtime_identity
+        .strip_prefix(manifest_runtime)
+        .is_some_and(|version| version.starts_with('-') && version.len() > 1)
+    {
+        return Err(format!(
+            "application runtime recipe disagrees with manifest for {name:?}"
+        ));
+    }
+    Ok(Some(runtime))
+}
+
+/// The shape only: the builder admitted the spec against td's declaration
+/// table, and the policy row must name the ref byte for byte.
+fn flathub_runtime_ref(value: &str) -> bool {
+    let parts: Vec<&str> = value.split('/').collect();
+    value.len() <= 255
+        && parts.len() == 4
+        && parts.first() == Some(&"runtime")
+        && parts.iter().all(|part| {
+            !part.is_empty()
+                && *part != "."
+                && *part != ".."
+                && part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+        })
+}
+
+fn application_runtime(text: &str, expected_name: &str) -> Result<SpecRuntime, String> {
     let fields = metadata_header(
         text,
-        &["format", "name", "runtime", "entry"],
+        &["format", "name", "source?", "runtime", "entry"],
         "application spec",
     )?;
     if fields.get("format").copied() != Some("1")
@@ -777,16 +830,26 @@ fn application_runtime(text: &str, expected_name: &str) -> Result<PathBuf, Strin
             "application spec identity disagrees with registry name {expected_name:?}"
         ));
     }
-    let runtime = PathBuf::from(
-        fields
-            .get("runtime")
-            .copied()
-            .ok_or("application spec lacks its runtime")?,
-    );
+    let runtime = fields
+        .get("runtime")
+        .copied()
+        .ok_or("application spec lacks its runtime")?;
+    if !runtime.starts_with('/') {
+        if !flathub_runtime_ref(runtime) {
+            return Err(
+                "application spec runtime is neither a store root nor a Flathub ref".into(),
+            );
+        }
+        return Ok(SpecRuntime::Flathub(runtime.to_string()));
+    }
+    if fields.contains_key("source") {
+        return Err("application spec names a source beside a store runtime".into());
+    }
+    let runtime = PathBuf::from(runtime);
     if !store_root(&runtime) {
         return Err("application spec runtime is not one canonical store root".into());
     }
-    Ok(runtime)
+    Ok(SpecRuntime::Store(runtime))
 }
 
 fn metadata_header<'a>(
@@ -896,7 +959,10 @@ fn text_field(value: &str) -> Result<&str, String> {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
-    use super::{build, debug_path, registry_exclusions, validate_line_attribution_marker};
+    use super::{
+        application_runtime, build, debug_path, registry_exclusions, runtime_root,
+        validate_line_attribution_marker, ApplicationRootPolicy, Provenance, SpecRuntime,
+    };
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
 
@@ -1053,6 +1119,66 @@ mod tests {
         assert!(!other_row.contains("line-attribution-boundary=1"));
         assert!(!contents.contains("hash-foreign-1"));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_flathub_runtime_adds_no_image_root_and_must_match_its_row() {
+        const REF: &str = "runtime/org.freedesktop.Platform/x86_64/25.08";
+        let spec = format!(
+            "format=1\nname=firefox\nsource=app/org.mozilla.firefox/x86_64/stable\nruntime={REF}\nentry=/app/bin/firefox\n"
+        );
+        let runtime = application_runtime(&spec, "firefox").unwrap();
+        assert_eq!(runtime, SpecRuntime::Flathub(REF.into()));
+        let policy = |identity: &str, provenance| ApplicationRootPolicy {
+            package_identity: "firefox-154.0".into(),
+            package_provenance: Provenance::Foreign,
+            runtime_identity: identity.into(),
+            runtime_provenance: provenance,
+        };
+        let manifest_runtime = "freedesktop-platform-25-08";
+        assert_eq!(
+            runtime_root(
+                "firefox",
+                SpecRuntime::Flathub(REF.into()),
+                manifest_runtime,
+                &policy(REF, Provenance::Foreign)
+            ),
+            Ok(None)
+        );
+        for row in [
+            policy(REF, Provenance::Source),
+            policy("freedesktop-platform-25-08-25.08", Provenance::Foreign),
+        ] {
+            assert!(runtime_root(
+                "firefox",
+                SpecRuntime::Flathub(REF.into()),
+                manifest_runtime,
+                &row
+            )
+            .is_err());
+        }
+        let store = PathBuf::from("/td/store/hash-freedesktop-platform-25-08-25.08");
+        assert_eq!(
+            runtime_root(
+                "firefox",
+                SpecRuntime::Store(store.clone()),
+                manifest_runtime,
+                &policy("freedesktop-platform-25-08-25.08", Provenance::Foreign)
+            ),
+            Ok(Some(store))
+        );
+        for invalid in [
+            spec.replace(REF, "runtime/org.freedesktop.Platform/../25.08"),
+            spec.replace(REF, "runtime/org.freedesktop.Platform/x86_64/25 08"),
+            spec.replace(REF, "app/org.mozilla.firefox/x86_64/stable"),
+            spec.replace(REF, "/td/store/hash-runtime-1"),
+            spec.replace("source=", "origin="),
+        ] {
+            assert!(
+                application_runtime(&invalid, "firefox").is_err(),
+                "{invalid}"
+            );
+        }
     }
 
     #[test]

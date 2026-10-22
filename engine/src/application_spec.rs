@@ -448,8 +448,16 @@ impl ApplicationSpec {
     fn validate(&self) -> Result<(), String> {
         validate_application_identity(&self.name)?;
         let flathub = flathub_app::spec_source(&self.name, self.source.as_deref(), &self.runtime)?;
-        if flathub.is_none() {
-            validate_runtime_path(&self.runtime)?;
+        match flathub {
+            None => validate_runtime_path(&self.runtime)?,
+            // td-app validates the declared entry; this is what launches.
+            Some(declared) if declared.entry != self.entry => {
+                return Err(format!(
+                    "application {} launches {:?}, not its Flathub declaration's {:?}",
+                    self.name, self.entry, declared.entry
+                ));
+            }
+            Some(_) => {}
         }
         validate_entry(&self.entry)?;
         if self.environment.len() > MAX_SPEC_ENVIRONMENT_ENTRIES {
@@ -923,6 +931,14 @@ mod tests {
         let error = ApplicationSpec::compile(&manifest, claude.runtime, PermissionPolicy::new())
             .unwrap_err();
         assert!(error.contains("not its Flathub runtime"), "{error}");
+        // td-app validates the declared entry, so a ref launches no other.
+        let manifest = ApplicationDeclaration::new("freedesktop-platform-25-08", "/app/bin/other")
+            .unwrap()
+            .manifest("claude", "2.1.0", ApplicationProvenance::Foreign)
+            .unwrap();
+        let error = ApplicationSpec::compile(&manifest, claude.runtime, PermissionPolicy::new())
+            .unwrap_err();
+        assert!(error.contains("not its Flathub declaration's"), "{error}");
     }
 
     /// A reviewed policy without a package library root compiles to NO loader
