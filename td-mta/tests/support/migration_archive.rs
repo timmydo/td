@@ -1,4 +1,5 @@
 //! CLI archive checks run by the mandatory native service leg's private root.
+
 use std::{fs, os::unix::fs::PermissionsExt, path::Path, process::Command};
 use td_crypto::{Digest, Sha256};
 use td_json::{json, Json};
@@ -98,4 +99,72 @@ pub fn exercise() {
     assert_eq!(unknown.stderr, b"migration-archive-entry\n");
     fs::remove_file(root.join("unexpected")).unwrap();
     assert!(verify(root.path(), "1048576").status.success());
+}
+
+pub fn export_from_td_mta(
+    session: &str,
+    account: &str,
+    password: &[u8],
+    ca: &Path,
+) -> (Json, Vec<String>) {
+    let root = td_fs::TempDir::new("migration-roundtrip").unwrap();
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let archive = root.join("archive");
+    fs::create_dir(&archive).unwrap();
+    fs::set_permissions(&archive, fs::Permissions::from_mode(0o700)).unwrap();
+    let secret = root.join("password");
+    write(&secret, password);
+    let invoke = || {
+        Command::new(env!("CARGO_BIN_EXE_td-mta"))
+            .args(["migration", "export", "--archive"])
+            .arg(&archive)
+            .args([
+                "--max-bytes",
+                "104857600",
+                "--session",
+                session,
+                "--account",
+                account,
+                "--username",
+                "user",
+                "--password-file",
+            ])
+            .arg(&secret)
+            .arg("--ca-file")
+            .arg(ca)
+            .output()
+            .unwrap()
+    };
+    let first = invoke();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let second = invoke();
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert_eq!(first.stdout, second.stdout);
+    let checked = verify(&archive, "104857600");
+    assert!(checked.status.success());
+    let manifest = td_json::parse_slice(&fs::read(archive.join("manifest.json")).unwrap()).unwrap();
+    let mut digests = Vec::new();
+    for record in manifest["messages"].as_array().unwrap() {
+        let digest = record["body"].as_str().unwrap();
+        let raw = fs::read(archive.join(format!("{digest}.eml"))).unwrap();
+        let mut hash = Sha256::try_new().unwrap();
+        hash.update(&raw).unwrap();
+        let actual: String = hash
+            .finish()
+            .unwrap()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(actual, digest);
+        digests.push(actual);
+    }
+    (manifest, digests)
 }

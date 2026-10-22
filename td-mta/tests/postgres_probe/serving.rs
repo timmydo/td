@@ -159,6 +159,27 @@ pub(super) fn exercise(
     assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
     assert!(reply.contains("urn:ietf:params:jmap:mail"), "{reply}");
     assert!(reply.contains("urn:ietf:params:jmap:submission"), "{reply}");
+    let session = td_json::parse(reply.split_once("\r\n\r\n").unwrap().1).unwrap();
+    let source_account = session["accounts"]
+        .as_obj()
+        .unwrap()
+        .first()
+        .unwrap()
+        .0
+        .as_str();
+    let (exported, body_digests) = super::migration_archive::export_from_td_mta(
+        &format!(
+            "https://localhost:{}/.well-known/jmap",
+            https_address.port()
+        ),
+        source_account,
+        device.password(),
+        &ca,
+    );
+    assert_eq!(exported["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(exported["mailboxes"].as_array().unwrap().len(), 1);
+    assert_eq!(body_digests,vec![sql(fixture,"SELECT encode(sha256(string_agg(bytes,''::bytea ORDER BY ordinal)),'hex') FROM td_mta.blob_chunks GROUP BY account,blob_id")]);
+
     let post = |body: &str| {
         let (mut tls, _) = super::smtp_transport::upgrade_protocol(
             TcpStream::connect(https_address).unwrap(),

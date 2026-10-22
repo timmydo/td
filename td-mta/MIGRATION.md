@@ -44,7 +44,11 @@ Raw files are streamed without MIME rewriting. No settings, identities,
 passwords, rules, contacts or calendars are exported.
 
 Enumeration uses Mailbox/query and per-mailbox Email/query, with source-ID
-deduplication. It deliberately does not treat an empty unfiltered Email/query
+deduplication. A correctly correlated Mailbox/query `unknownMethod` response
+permits bounded Mailbox/get with `ids: null` instead. This supports td-mta
+rollback exports. Other errors never trigger that fallback. The get-all result
+must match the original Mailbox state, contain unique IDs within the folder
+ceiling, and have no missing objects. It deliberately does not treat an empty unfiltered Email/query
 as proof that the account is empty. This is per-mailbox coverage, not an
 independent proof that the server has no orphaned or inaccessible messages.
 The manifest and successful JSON report explicitly say `provisional` and
@@ -84,8 +88,12 @@ at most 8 MiB, accumulated source metadata 16 MiB, and a serialized manifest
 silently from a successful snapshot.
 
 Requests have a 60-second deadline, bounded DNS and connect attempts, a
-24-hour invocation network deadline and a 200,000-request ceiling. HTTP
-headers are limited to 16 KiB and 100 fields. Bodies accept Content-Length,
+24-hour invocation network deadline and a 200,000-request ceiling. Successive
+requests wait at least 200 ms after the preceding response, within the same
+invocation deadline, to stay below td-mta's per-peer authentication ceiling.
+Other traffic can still exhaust that shared allowance: a non-200 response
+stops the export, whose retained bodies can be resumed. HTTP headers are
+limited to 16 KiB and 100 fields. Bodies accept Content-Length,
 chunked framing without extensions/trailers (at most 65,536 chunks), or clean
 TLS EOF. Compression, ambiguous framing and truncated bodies are refused.
 Sink bytes are provisional until the entire response succeeds. ACME uses
@@ -146,5 +154,6 @@ command with `migration-indeterminate-retry-same-archive`; retain the archive
 and repeat that command to settle the same source receipts. Do not replace
 its source instance to bypass an error. A successful report is explicitly
 `imported-provisional` with `cutoverReady: false`. It is not final inventory
-reconciliation or authority to change DNS. Exporting td-mta for rollback still
-needs a Mailbox/get fallback for its unsupported Mailbox/query method.
+reconciliation or authority to change DNS. Exporting td-mta uses the bounded Mailbox/get fallback above; a verified
+archive still requires a separate reverse import and reconciliation before
+redirecting delivery to the old service.

@@ -18,6 +18,7 @@ pub(super) struct Source {
     download: String,
     deadline: Instant,
     requests: Cell<usize>,
+    last_response: Cell<Option<Instant>>,
 }
 impl Source {
     pub fn open(
@@ -81,6 +82,7 @@ impl Source {
             download: String::new(),
             deadline: Instant::now() + Duration::from_secs(24 * 3600),
             requests: Cell::new(0),
+            last_response: Cell::new(None),
         };
         let session = source.json("GET", endpoint, &[])?;
         if field(&session, "accounts")?.get(account).is_none() {
@@ -113,6 +115,13 @@ impl Source {
         if count >= 200_000 {
             return Err("migration-request-capacity");
         }
+        let wait = request_wait(self.last_response.get(), Instant::now(), self.deadline)?;
+        if !wait.is_zero() {
+            std::thread::sleep(wait);
+        }
+        if Instant::now() >= self.deadline {
+            return Err("migration-network-deadline");
+        }
         self.requests.set(count + 1);
         let response = Client {
             executable: &self.executable,
@@ -133,6 +142,7 @@ impl Source {
             sink,
         )
         .map_err(|_| "migration-https-failed")?;
+        self.last_response.set(Some(Instant::now()));
         if response.status != 200 {
             return Err("migration-http-status");
         }
@@ -150,6 +160,35 @@ impl Source {
         let request=json!({"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail"],"methodCalls":[[method,arguments,"export"]]}).to_string();
         let response = self.json("POST", &self.api, request.as_bytes())?;
         reply(&response, method, &self.account)
+    }
+    pub fn mailboxes(&self, state: &str) -> Result<Vec<Json>> {
+        match self.query("Mailbox", None, MAILBOX_LIMIT) {
+            Ok(ids) => {
+                let mut output = Vec::new();
+                let mut bytes = 0usize;
+                for batch in ids.chunks(64) {
+                    for mailbox in self.get("Mailbox", batch, state)? {
+                        bytes = bytes
+                            .checked_add(mailbox.to_string().len())
+                            .filter(|n| *n <= INDEX_LIMIT / 2)
+                            .ok_or("migration-capacity")?;
+                        output.push(mailbox);
+                    }
+                }
+                Ok(output)
+            }
+            Err("migration-jmap-unknown-method") => {
+                let result = self.call(
+                    "Mailbox/get",
+                    json!({
+                        "accountId": self.account, "ids": null,
+                        "properties": ["id","name","parentId","role","sortOrder","isSubscribed"]
+                    }),
+                )?;
+                all_mailboxes(&result, state)
+            }
+            Err(error) => Err(error),
+        }
     }
     pub fn state(&self, kind: &str) -> Result<String> {
         let result = self.call(
@@ -272,6 +311,20 @@ impl Source {
         Ok(url)
     }
 }
+// Leave room below td-mta's eight authenticated requests per peer-second.
+fn request_wait(last: Option<Instant>, now: Instant, deadline: Instant) -> Result<Duration> {
+    let next = match last {
+        Some(last) => last
+            .checked_add(Duration::from_millis(200))
+            .ok_or("migration-network-deadline")?,
+        None => now,
+    };
+    if now >= deadline || next >= deadline {
+        return Err("migration-network-deadline");
+    }
+    Ok(next.saturating_duration_since(now))
+}
+
 fn encode(value: &str) -> String {
     let mut out = String::new();
     for b in value.bytes() {
@@ -293,13 +346,18 @@ fn reply(response: &Json, method: &str, account: &str) -> Result<Json> {
         .first()
         .and_then(Json::as_array)
         .ok_or("migration-jmap-response")?;
-    if tuple.len() != 3
-        || tuple.first().and_then(Json::as_str) != Some(method)
-        || tuple.get(2).and_then(Json::as_str) != Some("export")
-    {
+    if tuple.len() != 3 || tuple.get(2).and_then(Json::as_str) != Some("export") {
         return Err("migration-jmap-method-failed");
     }
     let value = tuple.get(1).ok_or("migration-jmap-response")?;
+    if tuple.first().and_then(Json::as_str) == Some("error")
+        && value.get("type").and_then(Json::as_str) == Some("unknownMethod")
+    {
+        return Err("migration-jmap-unknown-method");
+    }
+    if tuple.first().and_then(Json::as_str) != Some(method) {
+        return Err("migration-jmap-method-failed");
+    }
     if string(value, "accountId")? != account {
         return Err("migration-account-mismatch");
     }
@@ -337,6 +395,7 @@ mod tests {
                 .into(),
             deadline: Instant::now(),
             requests: Cell::new(0),
+            last_response: Cell::new(None),
         };
         assert_eq!(
             source.download_url("x?y#z").unwrap(),
@@ -349,6 +408,96 @@ mod tests {
         ] {
             source.download = bad.into();
             assert!(source.download_url("blob").is_err());
+        }
+    }
+}
+
+fn all_mailboxes(result: &Json, state: &str) -> Result<Vec<Json>> {
+    if string(result, "state")? != state {
+        return Err("migration-source-changed");
+    }
+    if !array(result, "notFound")?.is_empty() {
+        return Err("migration-source-missing-object");
+    }
+    let list = array(result, "list")?;
+    if list.len() > MAILBOX_LIMIT {
+        return Err("migration-capacity");
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for mailbox in list {
+        let id = string(mailbox, "id")?;
+        identifier(id)?;
+        if !seen.insert(id) {
+            return Err("migration-duplicate-id");
+        }
+    }
+    Ok(list.to_vec())
+}
+
+#[cfg(test)]
+mod fallback_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    #[test]
+    fn request_pacing_stays_below_peer_limit_without_renewing_deadline() {
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(60);
+        let peer = std::net::IpAddr::from([127, 0, 0, 1]);
+        let mut unpaced = crate::http_auth::Attempts::default();
+        assert!((0..8).all(|_| unpaced.admit(peer, 0)));
+        assert!(!unpaced.admit(peer, 0));
+        for offset in [0, 199, 999] {
+            let mut attempts = crate::http_auth::Attempts::default();
+            let mut now = start + Duration::from_millis(offset);
+            let mut last = None;
+            for _ in 0..20 {
+                now += request_wait(last, now, deadline).unwrap();
+                assert!(attempts.admit(peer, now.duration_since(start).as_millis() as u64));
+                last = Some(now);
+            }
+        }
+        assert!(request_wait(Some(start), start, start + Duration::from_millis(199)).is_err());
+        assert!(request_wait(None, deadline, deadline).is_err());
+        assert_eq!(
+            request_wait(Some(start), start + Duration::from_secs(1), deadline).unwrap(),
+            Duration::ZERO
+        );
+    }
+    #[test]
+    fn only_correlated_unknown_method_is_distinguished() {
+        let unknown = json!({"methodResponses":[["error",{"type":"unknownMethod"},"export"]]});
+        assert_eq!(
+            reply(&unknown, "Mailbox/query", "a").unwrap_err(),
+            "migration-jmap-unknown-method"
+        );
+        for bad in [
+            json!({"methodResponses":[["error",{"type":"unknownMethod"},"other"]]}),
+            json!({"methodResponses":[["error",{"type":"serverFail"},"export"]]}),
+            json!({"methodResponses":[["error",{"type":"unknownMethod"},"export","extra"]]}),
+            json!({"methodResponses":[["error",{"type":"unknownMethod"},"export"],["error",{"type":"unknownMethod"},"export"]]}),
+        ] {
+            assert_ne!(
+                reply(&bad, "Mailbox/query", "a").unwrap_err(),
+                "migration-jmap-unknown-method"
+            );
+        }
+    }
+    #[test]
+    fn get_all_fallback_checks_state_completeness_uniqueness_and_bound() {
+        let value = json!({"state":"s","notFound":[],"list":[{"id":"one"},{"id":"two"}]});
+        assert_eq!(all_mailboxes(&value, "s").unwrap().len(), 2);
+        assert_eq!(
+            all_mailboxes(&value, "changed").unwrap_err(),
+            "migration-source-changed"
+        );
+        for bad in [
+            json!({"state":"s","notFound":["missing"],"list":[]}),
+            json!({"state":"s","notFound":[],"list":[{"id":"one"},{"id":"one"}]}),
+            json!({"state":"s","notFound":[],"list":[{"id":""}]}),
+            json!({"state":"s","notFound":[],"list":[{}]}),
+            json!({"state":"s","notFound":[],"list":vec![json!({"id":"x"});MAILBOX_LIMIT+1]}),
+        ] {
+            assert!(all_mailboxes(&bad, "s").is_err());
         }
     }
 }

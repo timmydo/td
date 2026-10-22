@@ -180,17 +180,13 @@ fn run(options: Options) -> Result<Json> {
 fn export(source: &source::Source, archive: &mut archive::Archive, binding: Json) -> Result<Json> {
     let mailbox_state = source.state("Mailbox")?;
     let email_state = source.state("Email")?;
-    let mailbox_ids = source.query("Mailbox", None, MAILBOX_LIMIT)?;
-    let mut mailboxes = Vec::new();
+    let mailboxes = source.mailboxes(&mailbox_state)?;
     let mut index_bytes = 0usize;
-    for ids in mailbox_ids.chunks(64) {
-        for mailbox in source.get("Mailbox", ids, &mailbox_state)? {
-            index_bytes = index_bytes
-                .checked_add(mailbox.to_string().len())
-                .filter(|n| *n <= INDEX_LIMIT / 2)
-                .ok_or("migration-capacity")?;
-            mailboxes.push(mailbox);
-        }
+    for mailbox in &mailboxes {
+        index_bytes = index_bytes
+            .checked_add(mailbox.to_string().len())
+            .filter(|n| *n <= INDEX_LIMIT / 2)
+            .ok_or("migration-capacity")?;
     }
     let mut emails = BTreeMap::new();
     for mailbox in &mailboxes {
