@@ -209,9 +209,12 @@ impl Source {
         let mut seen = std::collections::BTreeSet::new();
         loop {
             let mut args = json!({"accountId":self.account,"position":output.len(),"limit":64,"calculateTotal":true});
-            if let Some(id) = mailbox {
-                if let Json::Obj(ref mut fields) = args {
+            if let Json::Obj(ref mut fields) = args {
+                if let Some(id) = mailbox {
                     fields.push(("filter".to_owned(), json!({"inMailbox":id})));
+                } else if kind == "Email" {
+                    // Nonnegative sizes cover every Email, including empty bodies.
+                    fields.push(("filter".to_owned(), json!({"minSize":0})));
                 }
             }
             let result = self.call(&format!("{kind}/query"), args)?;

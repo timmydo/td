@@ -56,6 +56,38 @@ The manifest and successful JSON report explicitly say `provisional` and
 during and after enumeration; changes cause failure and require a rerun.
 There is no live changes-feed convergence or final-deletion authority yet.
 
+# Account-wide inventory check
+
+After exporting a quiet source, compare its retained message IDs with a
+separate account-wide query:
+
+```text
+td-mta migration inventory --archive /home/operator/mail-archive \
+  --max-bytes 10737418240 \
+  --session https://mail.example.test/.well-known/jmap \
+  --account SOURCE_ACCOUNT_ID --username user@example.test \
+  --password-file /home/operator/private/source.password
+```
+
+The URL, account and username must match the retained source binding before
+any network request. The command checks both retained Email and Mailbox
+states before and after a paged Email/query with `minSize: 0`. RFC 8621's
+nonnegative minimum includes every valid Email size, including zero. This
+avoids relying on an empty unfiltered query; an unsupported filter fails the
+check without falling back to a narrower enumeration. Every page must have
+the same query state and total, the expected position, and unique IDs within
+the existing limits. The final ID set must exactly equal the manifest's.
+Omitted, additional or duplicated IDs and changed source states refuse.
+
+The JSON report binds the result to the manifest digest, source and retained
+states. Coverage is the authenticated account view, not proof of access to
+hidden accounts or inaccessible messages. Confirm source access separately
+before a cutover. It does not rewrite the manifest or import or delete mail.
+`bodyDigestsVerified: false` means this command does not rehash archive bodies;
+use `migration verify` for that. `cutoverReady: false` remains explicit.
+A failed check grants no deletion authority. Refresh the export after source
+changes, and resolve an ID-set mismatch before using it as a final inventory.
+
 # Archive and bounds
 
 Version 1 uses `source.json`, `manifest.json`, SHA-256-named `.eml` body files

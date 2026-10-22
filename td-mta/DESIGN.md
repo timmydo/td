@@ -2097,6 +2097,11 @@ results or report an exact total before computing it. Exhausted work/time
 budgets return the appropriate explicit error; attachment binary contents are
 not decoded as documents. Index build, rebuild and query must obey section 5.
 
+Email/query accepts the identity predicate `minSize: 0` for account-wide
+migration inventory. Positive minimum sizes remain unsupported filters;
+negative sizes are invalid arguments. This does not change query ordering,
+account isolation, snapshot state or work limits.
+
 The active PostgreSQL search walks date/mailbox-filtered candidates in windows
 of 32 within one authenticated snapshot. One method work budget and deadline
 cover all candidate verification, header decoding, MIME traversal and matching;

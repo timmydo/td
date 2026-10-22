@@ -2,6 +2,7 @@
 mod archive;
 mod folder_reconcile;
 mod import;
+mod inventory;
 mod reconcile;
 mod source;
 mod unmapped;
@@ -96,6 +97,7 @@ struct Options {
 fn arguments(mut args: impl Iterator<Item = OsString>) -> Result<Options> {
     let action = match args.next().and_then(|s| s.into_string().ok()).as_deref() {
         Some("export") => "export",
+        Some("inventory") => "inventory",
         Some("verify") => "verify",
         Some("import") => "import",
         Some("plan") => "plan",
@@ -146,7 +148,8 @@ fn arguments(mut args: impl Iterator<Item = OsString>) -> Result<Options> {
                 ]
                 .contains(&key.as_str()))
             || (key == "--plan-file" && action != "apply")
-            || (action == "export" && ["--connection-file", "--epoch"].contains(&key.as_str()))
+            || (matches!(action, "export" | "inventory")
+                && ["--connection-file", "--epoch"].contains(&key.as_str()))
         {
             return Err("migration-arguments");
         }
@@ -223,6 +226,16 @@ fn run(options: Options) -> Result<Json> {
     let account = get("--account")?;
     let username = get("--username")?;
     identifier(account)?;
+    if options.action == "inventory" {
+        return inventory::run(
+            &archive,
+            session,
+            account,
+            username,
+            get("--password-file")?,
+            options.values.get("--ca-file").map(String::as_str),
+        );
+    }
     let source = source::Source::open(
         session,
         account,
@@ -475,6 +488,10 @@ mod tests {
             vec!["export", "--archive", "one", "--archive", "two"],
             vec!["export", "--password", "secret"],
             vec!["export", "--archive"],
+            vec!["inventory", "--connection-file", "owner"],
+            vec!["inventory", "--epoch", "epoch"],
+            vec!["inventory", "--plan-file", "plan"],
+            vec!["inventory", "--password", "secret"],
         ] {
             assert!(arguments(args.into_iter().map(OsString::from)).is_err());
         }
@@ -490,7 +507,7 @@ mod unmapped_arguments {
         assert!(parse(&["import", "--only-unmapped"]).is_ok_and(|v| v.only_unmapped));
         assert!(parse(&["import"]).is_ok_and(|v| !v.only_unmapped));
         assert!(parse(&["import", "--only-unmapped", "--only-unmapped"]).is_err());
-        for action in ["export", "verify", "plan", "apply"] {
+        for action in ["export", "inventory", "verify", "plan", "apply"] {
             assert!(parse(&[action, "--only-unmapped"]).is_err());
         }
     }
@@ -505,7 +522,7 @@ mod mailbox_plan_arguments {
         assert!(parse(&["plan", "--mailboxes"]).is_ok_and(|v| v.mailboxes));
         assert!(parse(&["plan"]).is_ok_and(|v| !v.mailboxes));
         assert!(parse(&["plan", "--mailboxes", "--mailboxes"]).is_err());
-        for action in ["export", "verify", "import", "apply"] {
+        for action in ["export", "inventory", "verify", "import", "apply"] {
             assert!(parse(&[action, "--mailboxes"]).is_err());
         }
     }

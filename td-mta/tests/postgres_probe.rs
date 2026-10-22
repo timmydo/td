@@ -6054,11 +6054,14 @@ fn exercise_read_dispatch(
         ["Email/query",{{"accountId":"{account}","filter":{{"operator":"AND","conditions":[{{"inMailbox":"{mailbox}"}},{{"inMailbox":"{missing}"}}]}},"calculateTotal":true}},"w3"],
         ["Email/query",{{"accountId":"{account}","filter":{{"after":"2024-01-01T00:00:0 Z"}}}},"w4"],
         ["Email/query",{{"accountId":"{account}","filter":{{"operator":"OR","conditions":[]}}}},"w5"],
-        ["Email/query",{{"accountId":"{account}","filter":{{"operator":"AND"}}}},"w6"]
+        ["Email/query",{{"accountId":"{account}","filter":{{"operator":"AND"}}}},"w6"],
+        ["Email/query",{{"accountId":"{account}","filter":{{"minSize":0}},"calculateTotal":true,"limit":0}},"w7"],
+        ["Email/query",{{"accountId":"{account}","filter":{{"minSize":1}}}},"w8"],
+        ["Email/query",{{"accountId":"{account}","filter":{{"minSize":-1}}}},"w9"]
     ]}}"##
     );
     let limits = Limits {
-        json_methods: 24,
+        json_methods: 27,
         ..Limits::default()
     };
     let mut bytes = vec![0; limits.json_bytes].into_boxed_slice();
@@ -6165,7 +6168,7 @@ fn exercise_read_dispatch(
         return;
     }
     let mut complete = result.unwrap();
-    assert_eq!(complete.responses().len(), 24);
+    assert_eq!(complete.responses().len(), 27);
     let mut encoder = complete.encoder().unwrap();
     while !encoder.count_step(&mut [0; 4096]).unwrap() {}
     let length = encoder.begin_output().unwrap();
@@ -6202,11 +6205,14 @@ fn exercise_read_dispatch(
         r#""list":[{{"id":"{second}"}},{{"id":"{first}"}}],"notFound":[]}},"h""#
     )));
     assert_eq!(output.matches(r#"["Email/get","#).count(), 4);
-    assert_eq!(output.matches(r#"["Email/query","#).count(), 5);
+    assert_eq!(output.matches(r#"["Email/query","#).count(), 7, "{output}");
+    assert!(output.contains(r#""position":0,"total":2,"ids":[]},"w7""#));
+    assert!(output.contains(r#"["error",{"type":"unsupportedFilter"},"w8"]"#));
+    assert!(output.contains(r#"["error",{"type":"invalidArguments"},"w9"]"#));
     assert!(output.contains(&format!(r#""position":0,"total":2,"ids":["{low}"]}},"j""#)));
     assert!(output.contains(&format!(r#""list":[{{"id":"{low}"}}],"notFound":[]}},"k""#)));
     assert!(output.contains(&format!(r#""position":1,"ids":["{high}"]}},"l""#)));
-    assert!(output.contains(r#"["error",{"type":"unsupportedFilter"},"m"]"#));
+    assert!(output.contains(r#""position":0,"limit":256,"ids":[]},"m""#));
     assert!(output.contains(r#""position":0,"total":2,"ids":[]},"n""#));
     assert_eq!(output.matches(r#""subject":"Snapshot""#).count(), 2);
     assert_eq!(output.matches(r#""preview":"snapshot text""#).count(), 2);

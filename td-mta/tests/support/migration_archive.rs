@@ -114,9 +114,9 @@ pub fn export_from_td_mta(
     fs::set_permissions(&archive, fs::Permissions::from_mode(0o700)).unwrap();
     let secret = root.join("password");
     write(&secret, password);
-    let invoke = || {
+    let invoke = |action| {
         Command::new(env!("CARGO_BIN_EXE_td-mta"))
-            .args(["migration", "export", "--archive"])
+            .args(["migration", action, "--archive"])
             .arg(&archive)
             .args([
                 "--max-bytes",
@@ -135,13 +135,13 @@ pub fn export_from_td_mta(
             .output()
             .unwrap()
     };
-    let first = invoke();
+    let first = invoke("export");
     assert!(
         first.status.success(),
         "{}",
         String::from_utf8_lossy(&first.stderr)
     );
-    let second = invoke();
+    let second = invoke("export");
     assert!(
         second.status.success(),
         "{}",
@@ -151,6 +151,56 @@ pub fn export_from_td_mta(
     let checked = verify(&archive, "104857600");
     assert!(checked.status.success());
     let manifest = td_json::parse_slice(&fs::read(archive.join("manifest.json")).unwrap()).unwrap();
+    let inventory = invoke("inventory");
+    assert!(
+        inventory.status.success(),
+        "{}",
+        String::from_utf8_lossy(&inventory.stderr)
+    );
+    let inventory = td_json::parse_slice(&inventory.stdout).unwrap();
+    assert_eq!(inventory["status"].as_str(), Some("inventory-matches"));
+    assert_eq!(
+        inventory["messages"].as_u64(),
+        Some(manifest["messages"].as_array().unwrap().len() as u64)
+    );
+    assert_eq!(inventory["bodyDigestsVerified"].as_bool(), Some(false));
+    assert_eq!(inventory["cutoverReady"].as_bool(), Some(false));
+    let mut incomplete = manifest.clone();
+    if let Json::Obj(fields) = &mut incomplete {
+        let records = fields
+            .iter_mut()
+            .find(|(key, _)| key == "messages")
+            .unwrap();
+        let mut retained = records.1.as_array().unwrap().to_vec();
+        assert!(retained.pop().is_some());
+        records.1 = json!(retained);
+    }
+    write(
+        &archive.join("manifest.json"),
+        incomplete.to_string().as_bytes(),
+    );
+    let rejected = invoke("inventory");
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("migration-inventory-mismatch"));
+    let mut altered = manifest.clone();
+    if let Json::Obj(fields) = &mut altered {
+        fields
+            .iter_mut()
+            .find(|(key, _)| key == "emailState")
+            .unwrap()
+            .1 = json!("stale-state");
+    }
+    write(
+        &archive.join("manifest.json"),
+        altered.to_string().as_bytes(),
+    );
+    let rejected = invoke("inventory");
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("migration-source-changed"));
+    write(
+        &archive.join("manifest.json"),
+        manifest.to_string().as_bytes(),
+    );
     let mut digests = Vec::new();
     for record in manifest["messages"].as_array().unwrap() {
         let digest = record["body"].as_str().unwrap();

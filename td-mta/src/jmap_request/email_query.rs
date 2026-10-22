@@ -53,6 +53,15 @@ impl Worker<'_, '_, '_, '_, '_> {
                 b"text" if result.search.is_none() => {
                     result.search = Some(self.search_operand(&item)?)
                 }
+                b"minSize" => {
+                    let size = self.query_integer(&item)?;
+                    if size < 0 {
+                        return Err(Error::InvalidArguments);
+                    }
+                    if size != 0 {
+                        return Err(Error::UnsupportedFilter);
+                    }
+                }
                 b"inMailbox" => {
                     let mailbox = self.push_string(&item)?.wire_id()?.local();
                     result.mailbox = Some(match result.mailbox {
