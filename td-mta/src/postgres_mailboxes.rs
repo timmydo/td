@@ -238,21 +238,25 @@ fn decode(row: &tokio_postgres::Row, identity: ViewIdentity) -> Result<Mailbox, 
 }
 
 fn hierarchy(mailboxes: &[Mailbox]) -> Result<(), Error> {
+    let ids: Vec<_> = mailboxes.iter().map(|m| (m.id, m.parent)).collect();
+    hierarchy_ids(&ids)
+}
+pub(crate) fn hierarchy_ids(mailboxes: &[(MailboxId, Option<MailboxId>)]) -> Result<(), Error> {
     if mailboxes
         .windows(2)
-        .any(|pair| pair.first().map(|row| row.id) >= pair.last().map(|row| row.id))
+        .any(|pair| pair.first().map(|row| row.0) >= pair.last().map(|row| row.0))
     {
         return Err(Error::Integrity);
     }
-    for mailbox in mailboxes {
-        let mut parent = mailbox.parent;
+    for (_, parent) in mailboxes {
+        let mut parent = *parent;
         let mut remaining = mailboxes.len();
         while let Some(id) = parent {
             remaining = remaining.checked_sub(1).ok_or(Error::Integrity)?;
             let index = mailboxes
-                .binary_search_by_key(&id, |row| row.id)
+                .binary_search_by_key(&id, |row| row.0)
                 .map_err(|_| Error::Integrity)?;
-            parent = mailboxes.get(index).ok_or(Error::Integrity)?.parent;
+            parent = mailboxes.get(index).ok_or(Error::Integrity)?.1;
         }
     }
     Ok(())

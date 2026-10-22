@@ -11,7 +11,7 @@ pub(super) fn run(
     connection: &str,
     epoch: &str,
     account: &str,
-    plan_file: Option<&str>,
+    retained: Option<Json>,
 ) -> Result<Json> {
     let epoch = StoreEpoch::parse(epoch).map_err(|_| "migration-invalid-epoch")?;
     let account = AccountId::parse(account).map_err(|_| "migration-invalid-account")?;
@@ -23,7 +23,6 @@ pub(super) fn run(
     let boxes = import::mailboxes(&manifest, instance, source_account)?;
     let messages = import::messages(&manifest, instance, source_account)?;
     let manifest_digest = digest(manifest.to_string().as_bytes())?;
-    let retained = plan_file.map(read_plan).transpose()?;
     if let Some(plan) = &retained {
         if integer(plan, "format")? != 1
             || string(plan, "epoch")? != hex(epoch.as_bytes())
@@ -130,12 +129,12 @@ pub(super) fn run(
         json!({"format":1,"status":"planned-provisional-metadata","epoch":hex(epoch.as_bytes()),"account":hex(account.as_bytes()),"source":source.clone(),"manifestSha256":manifest_digest,"messages":output,"cutoverReady":false}),
     )
 }
-fn append(output: &mut Vec<Json>, size: &mut usize, item: Json) -> Result<()> {
+pub(super) fn append(output: &mut Vec<Json>, size: &mut usize, item: Json) -> Result<()> {
     reserve(size, &item)?;
     output.push(item);
     Ok(())
 }
-fn reserve(size: &mut usize, item: &Json) -> Result<()> {
+pub(super) fn reserve(size: &mut usize, item: &Json) -> Result<()> {
     let id = string(item, "id")?;
     let report = json!({"id":id,"status":"skipped-retained-observation"});
     *size = size
@@ -144,7 +143,7 @@ fn reserve(size: &mut usize, item: &Json) -> Result<()> {
         .ok_or("migration-plan-capacity")?;
     Ok(())
 }
-fn read_plan(path: &str) -> Result<Json> {
+pub(super) fn read_plan(path: &str) -> Result<Json> {
     use crate::{
         operator_files::{Inputs, Role},
         store_fs::PrivateRoot,
@@ -163,7 +162,7 @@ fn read_plan(path: &str) -> Result<Json> {
         INDEX_LIMIT,
     )?)
 }
-fn fixed<const N: usize>(text: &str) -> Result<[u8; N]> {
+pub(super) fn fixed<const N: usize>(text: &str) -> Result<[u8; N]> {
     if text.len() != N * 2
         || !text
             .bytes()
@@ -256,7 +255,7 @@ fn operations(
     Ok(output)
 }
 
-fn code(error: database::Error) -> &'static str {
+pub(super) fn code(error: database::Error) -> &'static str {
     match error {
         database::Error::Indeterminate => "migration-indeterminate-retry-same-plan",
         error => import::code(error),

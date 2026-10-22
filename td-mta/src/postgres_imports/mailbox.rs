@@ -191,7 +191,7 @@ fn publish_policy(
     );
     settled(result, &attempted)
 }
-fn validate_name(name: &str, deadline: Instant) -> Result<(), Error> {
+pub(super) fn validate_name(name: &str, deadline: Instant) -> Result<(), Error> {
     use crate::{
         admission::work::{Charge, Meter},
         clock::RuntimeClock,

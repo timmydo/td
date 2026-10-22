@@ -1,5 +1,6 @@
 //! Provisional, resumable JMAP export. Archives grant no cutover authority.
 mod archive;
+mod folder_reconcile;
 mod import;
 mod reconcile;
 mod source;
@@ -89,6 +90,7 @@ pub fn command(args: impl Iterator<Item = OsString>) -> io::Result<std::process:
 struct Options {
     action: String,
     only_unmapped: bool,
+    mailboxes: bool,
     values: BTreeMap<String, String>,
 }
 fn arguments(mut args: impl Iterator<Item = OsString>) -> Result<Options> {
@@ -102,8 +104,16 @@ fn arguments(mut args: impl Iterator<Item = OsString>) -> Result<Options> {
     };
     let mut values = BTreeMap::new();
     let mut only_unmapped = false;
+    let mut mailboxes = false;
     while let Some(key) = args.next() {
         let key = key.into_string().map_err(|_| "migration-arguments")?;
+        if key == "--mailboxes" {
+            if action != "plan" || mailboxes {
+                return Err("migration-arguments");
+            }
+            mailboxes = true;
+            continue;
+        }
         if key == "--only-unmapped" {
             if action != "import" || only_unmapped {
                 return Err("migration-arguments");
@@ -151,6 +161,7 @@ fn arguments(mut args: impl Iterator<Item = OsString>) -> Result<Options> {
     Ok(Options {
         action: action.to_owned(),
         only_unmapped,
+        mailboxes,
         values,
     })
 }
@@ -173,16 +184,26 @@ fn run(options: Options) -> Result<Json> {
         return archive.verify();
     }
     if matches!(options.action.as_str(), "plan" | "apply") {
-        return reconcile::run(
+        let retained = if options.action == "apply" {
+            Some(reconcile::read_plan(get("--plan-file")?)?)
+        } else {
+            None
+        };
+        let run = if options.mailboxes
+            || retained
+                .as_ref()
+                .is_some_and(|p| p.get("format").and_then(Json::as_u64) == Some(2))
+        {
+            folder_reconcile::run
+        } else {
+            reconcile::run
+        };
+        return run(
             &archive,
             get("--connection-file")?,
             get("--epoch")?,
             get("--account")?,
-            if options.action == "apply" {
-                Some(get("--plan-file")?)
-            } else {
-                None
-            },
+            retained,
         );
     }
     if options.action == "import" {
@@ -471,6 +492,21 @@ mod unmapped_arguments {
         assert!(parse(&["import", "--only-unmapped", "--only-unmapped"]).is_err());
         for action in ["export", "verify", "plan", "apply"] {
             assert!(parse(&[action, "--only-unmapped"]).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod mailbox_plan_arguments {
+    use super::*;
+    #[test]
+    fn mailbox_selector_is_a_plan_only_single_flag() {
+        let parse = |args: &[&str]| arguments(args.iter().map(OsString::from));
+        assert!(parse(&["plan", "--mailboxes"]).is_ok_and(|v| v.mailboxes));
+        assert!(parse(&["plan"]).is_ok_and(|v| !v.mailboxes));
+        assert!(parse(&["plan", "--mailboxes", "--mailboxes"]).is_err());
+        for action in ["export", "verify", "import", "apply"] {
+            assert!(parse(&[action, "--mailboxes"]).is_err());
         }
     }
 }

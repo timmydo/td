@@ -12,6 +12,7 @@ use tokio_postgres::Client;
 mod email;
 mod folders;
 mod mailbox;
+pub mod mailbox_reconcile;
 pub mod reconcile;
 pub use email::{publish as publish_email, publish_unmapped as publish_unmapped_email};
 pub use mailbox::{publish as publish_mailbox, publish_unmapped as publish_unmapped_mailbox};

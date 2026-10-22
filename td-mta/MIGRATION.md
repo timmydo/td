@@ -233,8 +233,8 @@ stopping at the first changed message; plan/apply can then update existing
 messages, followed by import for new messages. An absent, locally changed or
 otherwise unsupported mapped message can still stop ordinary import before
 new messages are reached. Use the explicit new-object mode below to skip
-mapped objects without claiming synchronization. Folder changes and explicit
-source-deletion evidence remain separate work. Omission from an archive never authorizes deletion.
+mapped objects without claiming synchronization. Folder changes use the separate folder plan below. Explicit
+source-deletion evidence remains separate work. Omission from an archive never authorizes deletion.
 Every report continues to carry `cutoverReady: false`.
 
 # Importing only unmapped objects
@@ -285,3 +285,44 @@ owner, epoch, selection, maintenance, quota and uncertain-commit handling.
 Earlier creations remain committed if a later object fails; keep the same
 archive after uncertainty. Reports retain `cutoverReady: false`. Skips and
 source omissions never authorize deletion or a domain switch.
+
+# Reconciling existing folders
+
+Use `migration plan --mailboxes` with the same archive, connection, epoch and
+account arguments to retain a folder-only plan. `migration apply --plan-file`
+recognizes its versioned format. Existing Email plans retain their original
+meaning. Keep each plan in a private file and keep its exact archive through
+retry, as with Email plans.
+
+Folder plans support names, parent changes, sort order and subscription state
+of existing mapped folders. The folder ID stays unchanged, preserving Email
+memberships and descendant parent references. Local-only descendants move
+with their parent too. Raw bytes, received dates, Email/Blob/Thread identities,
+keywords and body accounting are untouched. Role-bearing folders may be
+renamed or moved, but changing their role is refused. There is no folder
+creation, merging, deletion, temporary rename or automatic name-swap sequence.
+
+Each update binds its local ID, old receipt digest and sequence, desired
+digest and the destination ancestor IDs. Under the account write lock,
+apply reconstructs current folder metadata and refuses local edits, stale
+receipts, ambiguous source mappings or a folder shared with another source
+namespace. It checks the desired destination chain and the complete candidate
+local graph (at most 256 folders), rejecting missing parents, cycles,
+duplicate sibling names and duplicate roles. Incoming mail may advance a
+folder's ordinary change sequence without invalidating its metadata plan.
+
+A successful update emits one Mailbox update and advances the source receipt
+and account sequence together. Receipt replay acknowledges the current source
+digest without resetting later local edits; a missing folder stays absent.
+The existing uncertainty/retry rules apply. Folder operations use the same
+10-second deadline and bounded reconciliation transport as Email operations.
+
+Plan observations distinguish `role-source-change`, `folder-conflict`,
+`local-conflict`, `historical-object-absent`, `unmapped`, and matches from
+actual `update` entries. A destination ancestor needing its own update can
+remain a conflict until that update is applied and a fresh plan is generated.
+Earlier folder updates stay committed if a later one fails. Neither a mixed
+result nor a replay establishes account-wide synchronization. Replan after
+completion, resolve every exception, and verify the desired source inventory
+separately. Reports retain `cutoverReady: false`; source omissions still do
+not authorize deletion.
