@@ -16,6 +16,7 @@ pub(super) fn exercise(
     relay: TcpListener,
     dns: std::net::UdpSocket,
 ) {
+    super::migration_archive::exercise();
     let relay = super::serving_relay::Relay::new(fixture, relay, dns);
     let smtp_address = smtp.local_addr().unwrap();
     let https_address = https.local_addr().unwrap();

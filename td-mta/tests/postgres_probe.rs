@@ -19,6 +19,15 @@ mod certificate;
 #[path = "support/termination_sender.rs"]
 mod termination_sender;
 
+#[path = "support/migration_archive.rs"]
+mod migration_archive;
+
+#[test]
+#[ignore = "requires private trusted TMPDIR"]
+fn migration_archive_cli_preserves_and_verifies_snapshots() {
+    migration_archive::exercise();
+}
+
 #[path = "support/postgres_mail_client.rs"]
 mod mail_client;
 
