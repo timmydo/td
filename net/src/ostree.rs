@@ -39,6 +39,8 @@ pub(crate) struct AcquireSpec {
     exact_ref: String,
     commit: Checksum,
     content: Checksum,
+    /// An upstream fetch must find Flathub's signature on the commit.
+    signed: bool,
 }
 
 impl AcquireSpec {
@@ -50,11 +52,13 @@ impl AcquireSpec {
     ) -> Result<Self, String> {
         let repository = normalize_repository(repository)?;
         ostree::validate_exact_ref(exact_ref)?;
+        let signed = crate::flathub::requires_signature(&repository)?;
         Ok(Self {
             repository,
             exact_ref: exact_ref.to_string(),
             commit: Checksum::from_hex(commit)?,
             content: Checksum::from_hex(content)?,
+            signed,
         })
     }
 
@@ -192,6 +196,13 @@ fn normalize_repository(repository: &str) -> Result<String, String> {
     }
     if authority.contains('@') || authority.contains('\\') {
         return Err("OSTree repository URL authority contains userinfo or a backslash".into());
+    }
+    // The HTTP client percent-decodes and IDNA-maps a host; a host spelled any
+    // way but plainly could otherwise name Flathub without being recognised.
+    if !authority.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b':' | b'[' | b']')
+    }) {
+        return Err("OSTree repository URL authority is not plain ASCII host text".into());
     }
     let secure = scheme == "https";
     let loopback = if scheme == "http" {
@@ -866,6 +877,53 @@ fn build_graph(
     build_graph_with_limits(spec, root, mode, GRAPH_LIMITS)
 }
 
+/// An upstream Flathub fetch also requires Flathub's signature on the pinned
+/// commit. Feed transport and cache reuse fetch none; the reviewed commit
+/// checksum is the only authority there.
+fn require_flathub_signature(
+    spec: &AcquireSpec,
+    root: &Path,
+    policy: FetchPolicy<'_>,
+) -> Result<(), String> {
+    if !spec.signed {
+        return Ok(());
+    }
+    let deadline = policy
+        .deadline
+        .ok_or_else(|| "OSTree network fetch has no absolute graph deadline".to_string())?;
+    let commit_path = object_path(root, ObjectKey::new(ObjectKind::Commit, spec.commit))?;
+    let commit_bytes = read_regular_bounded(&commit_path, ObjectKind::Commit.max_transfer()?)?;
+    let checksum = spec.commit.to_hex();
+    let (fanout, rest) = checksum.split_at(2);
+    let url = format!("{}/objects/{fanout}/{rest}.commitmeta", spec.repository);
+    let download = root.join("commitmeta.download");
+    let limit = ostree::MAX_COMMITMETA_BYTES as u64;
+    let budget = AtomicU64::new(0);
+    let fetched = crate::http::get_to_file_accounted_no_redirects_before(
+        &url, &download, limit, &budget, limit, deadline,
+    )
+    .and_then(|_| read_regular_bounded(&download, limit));
+    let _ = fs::remove_file(&download);
+    let commitmeta = fetched?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| format!("system clock is before the epoch: {error}"))?
+        .as_secs();
+    let signed = crate::flathub::verify_commit(
+        &spec.exact_ref,
+        spec.commit,
+        &commit_bytes,
+        &commitmeta,
+        now,
+    )?;
+    eprintln!(
+        "td-feed: OSTree commit {checksum} carries a good Flathub signature by {} made at {}",
+        crate::flathub::SIGNING_SUBKEY_FINGERPRINT,
+        signed.signed_at
+    );
+    Ok(())
+}
+
 fn admit_depth(depth: usize, limits: GraphLimits) -> Result<(), String> {
     if depth >= limits.depth {
         return Err(format!(
@@ -917,6 +975,9 @@ fn build_graph_from(
         policy,
     )?;
     let commit = parse_cached_commit(root, spec.commit)?;
+    if policy.feed.is_none() && policy.mode == FetchMode::FetchMissing {
+        require_flathub_signature(spec, root, policy)?;
+    }
 
     add_new_objects(
         spec,
@@ -2407,6 +2468,73 @@ mod tests {
         out
     }
 
+    #[test]
+    fn upstream_flathub_fetch_requires_a_signature_before_any_tree() {
+        let commit = fixture_hex(include_str!(
+            "../../engine/tests/fixtures/flathub-firefox-7985364b.commit.hex"
+        ));
+        let checksum = digest(&commit);
+        let parsed = ostree::parse_commit_verified(checksum, &commit).unwrap();
+        let commit_key = format!(
+            "/{}",
+            ObjectKey::new(ObjectKind::Commit, checksum)
+                .relative_path()
+                .unwrap()
+        );
+        let meta_key = commit_key.replace(".commit", ".commitmeta");
+        let own = fixture_hex(include_str!(
+            "../../engine/tests/fixtures/flathub-firefox-7985364b.commitmeta.hex"
+        ));
+        let foreign = fixture_hex(include_str!(
+            "../../engine/tests/fixtures/flathub-freedesktop-25.08.commitmeta.hex"
+        ));
+        for (label, meta, expected) in [
+            ("absent", None, "404"),
+            ("foreign", Some(foreign), "no Flathub signature"),
+            // Past the signature, the fetch reaches the unserved root tree.
+            ("own", Some(own), ".dir"),
+        ] {
+            let mut objects = BTreeMap::new();
+            objects.insert(commit_key.clone(), commit.clone());
+            if let Some(meta) = meta {
+                objects.insert(meta_key.clone(), meta);
+            }
+            let Some((repository, _server)) = serve_objects(objects, 3) else {
+                return;
+            };
+            let spec = AcquireSpec {
+                repository,
+                exact_ref: "app/org.mozilla.firefox/x86_64/stable".into(),
+                commit: checksum,
+                content: parsed.content_checksum(),
+                signed: true,
+            };
+            let root = crate::test_temp::TempDir::new("ostree-signed").unwrap();
+            let error =
+                build_graph_with_limits(&spec, &root, FetchMode::FetchMissing, GRAPH_LIMITS)
+                    .unwrap_err();
+            assert!(error.contains(expected), "{label}: {error}");
+            assert_eq!(
+                label == "own",
+                !error.contains("signature") && !error.contains("commitmeta"),
+                "{label}: {error}"
+            );
+            assert!(!root.join("commitmeta.download").exists());
+        }
+    }
+
+    #[test]
+    fn feed_transport_and_cache_reuse_ask_for_no_signature() {
+        let mut fixture = FeedFixture::new("unsigned-transport");
+        fixture.spec.signed = true;
+        fixture.export();
+        let feed = ConsumerServer::start(fixture.root.join("store"), None);
+        assert!(fixture.consume("guest", &feed.base).unwrap().1);
+        let (_, fetched) = acquire(&fixture.spec, &fixture.root.join("guest")).unwrap();
+        assert!(!fetched);
+        assert_eq!(fixture.upstream.count(), 0);
+    }
+
     fn firefox_spec() -> AcquireSpec {
         AcquireSpec::parse(
             "https://dl.flathub.org/repo/",
@@ -2435,6 +2563,16 @@ mod tests {
         assert!(normalize_repository("http://localhost:80@example.com/repo").is_err());
         assert!(normalize_repository("http://127.0.0.1:80.evil.example/repo").is_err());
         assert!(normalize_repository("https://user@example.com/repo").is_err());
+        for encoded in [
+            "https://dl%2Eflathub%2Eorg/repo",
+            "https://\u{ff44}l.flathub.org/repo",
+            "https://dl\u{3002}flathub\u{3002}org/repo",
+            "https://dl.flathub.org_/repo",
+        ] {
+            assert!(normalize_repository(encoded)
+                .unwrap_err()
+                .contains("plain ASCII"));
+        }
         assert!(normalize_repository("https://example.com/repo?ref=stable").is_err());
     }
 

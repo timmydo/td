@@ -28,9 +28,11 @@ same kind of package and the choice is per application (§B.3).
 That removes the network stack, the signature trust root and the repository
 format from the **target**. There is no target-side OSTree client, GVariant
 reader, OpenPGP verification, HTTP or TLS. §B.3.1 selects a bounded
-control-plane reader for exact Flathub commit graphs; the signature that
-authorizes each commit is still checked by a human when the pin is reviewed,
-the same way td already trusts the kernel tarball and Rust release.
+control-plane reader for exact Flathub commit graphs. The pinned commit
+checksum is the authority, as for the kernel tarball and Rust release; a
+fresh upstream fetch additionally requires Flathub's signature on that
+commit, verified by the control plane against a compiled signing key
+(§B.3.1).
 
 The cost is that the curated set is td's to maintain: a seed bump is a
 pin review plus a rebuild, and no application td has not packaged can be
@@ -1303,6 +1305,36 @@ The importer contract is narrower than Flatpak:
    hashes. A branch name alone is a refusal. Pin review records the signing-key
    fingerprint and independently verifies the signatures; the fixed commit
    and every fetched object hash then preserve that decision during builds.
+   An upstream fetch also re-checks it by machine: before any tree object
+   is requested, `td-feed warm ostree` fetches the commit's detached
+   `.commitmeta` (at most 64 KiB, outside the graph's transfer accounting)
+   and requires one of its `ostree.gpgsigs` to verify over the exact commit
+   bytes. `net/src/openpgp.rs` admits one OpenPGP v4 signature packet of
+   class 0x00 by an RSA key of at least 2048 bits with SHA-256 or SHA-512,
+   refuses partial or indeterminate lengths, non-canonical integers,
+   unknown critical hashed subpackets, an issuer hint naming another key,
+   expiry, and a creation time before the key or more than a day ahead of
+   the clock; `ring` performs the PKCS #1 check. `net/src/flathub.rs`
+   compiles Flathub's exact v4 RSA-4096 signing subkey packet, `54A6 CDDD
+   8919 FB20 4200 D8AC 5627 02E9 E3ED 7EE8` under the primary key above,
+   derives its fingerprint rather than trusting a constant, and requires
+   the commit to bind only the requested ref in the `org.flathub.Stable`
+   collection (`ostree.collection-binding` and
+   `ostree.collection-refs-binding` beside the ref checks below). A good
+   signature over another commit, or a signed commit presented under
+   another ref, is refused. The check is selected when the pin is parsed:
+   `https://dl.flathub.org/repo` requires it, and any other spelling of a
+   `flathub.org` host (a port, a capital, a trailing dot, another path or
+   subdomain) is refused rather than fetched unsigned, and every repository
+   authority must be plain ASCII host text, so a percent-encoded or Unicode
+   spelling the HTTP client would decode cannot name it unrecognised. Feed
+   transport and cache reuse fetch no signature, and a consumer cannot tell
+   whether its source ran the check: there the reviewed commit checksum
+   remains the only authority. Graphs warmed before this check existed,
+   including every cached Firefox 154 graph, whose commit Flathub has since
+   pruned, were never machine-checked. Key revocation and the subkey's
+   recorded expiry (2027-06-14) are not consulted; replacing or retiring
+   the subkey is a reviewed edit to that file.
 2. Only the two commit-reachable `files/` trees are materialized. Summary
    browsing, updates, installation state, exports, permissions and activation
    metadata are not imported. No application runtime, launcher or image service
@@ -2070,7 +2102,7 @@ for one has to argue past this rather than rediscover it:
 |---|---|
 | **target-side OSTree client** (repo modes, `.filez`/`.dirtree`/`.dirmeta`, GVariant) | Still refused. §B.3.1 selects a bounded control-plane deploy importer for reviewed exact commits; it does not put repository or installation machinery in the distribution. |
 | **runtime summary browsing, refs and updates** | Still refused. The control-plane importer may resolve only the exact pinned commit/object graph. A pin bump plus a rebuild is td's update mechanism; a mutable ref is discovery input at review time, never derivation input. |
-| **OpenPGP verification** | The signature is checked by a human at pin review, as it is for every other fixed-output input. An implementation on the target would be a parser for attacker-supplied input serving a trust decision already made elsewhere. |
+| **OpenPGP verification** | Not in any application, launcher or image service. The signature is checked by a human at pin review, as it is for every other fixed-output input, and the control plane's upstream Flathub fetch re-checks it with the bounded single-packet verifier of §B.3.1; nothing reads a keyring, armor, summary signature or trust database. |
 | **HTTP/TLS on the target** | One thing on the target fetches: `td-fetchd`, the fetch service applet of the target-built `td-net` (§W.8), which a jailed application reaches over a socket under `sockets=fetch`. The applications themselves carry no TLS, resolve no names and hold no network; the control plane's `td-net` does this under the existing dependency exception, and the target's copy is the same tier rebuilt on the target toolchain. |
 | **a target-side `fsck`/`verify` verb** | Refused. A package is in a read-only image admitted by a signed manifest, so a userspace hash sweep would re-check it with a weaker mechanism (§B.5). This refusal has flipped three times as the layout moved, which is the entry's real content: **a refusal argued from a layout is only as settled as the layout.** |
 | **OCI / container registries** | A second foreign format with the same objection as the first. The selected Firefox experiment uses Flathub's signed OSTree commits directly; an OCI translation would add a second parser without removing the first. |

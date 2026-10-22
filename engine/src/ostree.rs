@@ -15,6 +15,9 @@ pub const MAX_TREE_ENTRIES: usize = 262_144;
 pub const MAX_NAME_BYTES: usize = 255;
 pub const MAX_COMMIT_METADATA_ENTRIES: usize = 64;
 pub const MAX_COMMIT_ARRAY_ENTRIES: usize = 4_096;
+pub const MAX_COMMITMETA_BYTES: usize = 64 * 1024;
+pub const MAX_COMMIT_SIGNATURES: usize = 16;
+pub const MAX_SIGNATURE_BYTES: usize = 16 * 1024;
 pub const MAX_ARCHIVE_INPUT_BYTES: usize = 257 * 1024 * 1024;
 pub const MAX_ARCHIVE_FILE_BYTES: usize = 256 * 1024 * 1024;
 pub const MAX_ARCHIVE_HEADER_BYTES: usize = 8 * 1024;
@@ -224,6 +227,8 @@ fn hex_digit(nibble: u8) -> char {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Commit {
+    /// Seconds since the epoch, as the publisher recorded them.
+    pub timestamp: u64,
     pub root_tree: Checksum,
     pub root_meta: Checksum,
     pub metadata: CommitMetadata,
@@ -394,6 +399,7 @@ fn parse_commit(bytes: &[u8]) -> Result<Commit, String> {
 
     let timestamp_start = align_up(body_end, 8, "commit timestamp")?;
     require_zero_padding(bytes, body_end, timestamp_start, "commit timestamp")?;
+    let timestamp = u64_be_at(bytes, timestamp_start, "commit timestamp")?;
     let root_tree_start = timestamp_start
         .checked_add(8)
         .ok_or_else(|| "commit timestamp offset overflow".to_string())?;
@@ -406,6 +412,7 @@ fn parse_commit(bytes: &[u8]) -> Result<Commit, String> {
         "commit root metadata",
     )?;
     Ok(Commit {
+        timestamp,
         root_tree,
         root_meta,
         metadata,
@@ -469,6 +476,52 @@ fn parse_commit_metadata(bytes: &[u8]) -> Result<CommitMetadata, String> {
         }
     }
     Ok(metadata)
+}
+
+/// Extract the detached OpenPGP signatures from a `.commitmeta` object.
+///
+/// The detached metadata is not covered by the commit checksum, so nothing but
+/// `ostree.gpgsigs` is read from it, and each signature is still only a
+/// candidate until a verifier accepts it over the commit bytes.
+pub fn parse_commitmeta_signatures(bytes: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+    if bytes.is_empty() || bytes.len() > MAX_COMMITMETA_BYTES {
+        return Err(format!(
+            "commit detached metadata size must be in 1..={MAX_COMMITMETA_BYTES} bytes"
+        ));
+    }
+    let entries = variable_array_aligned(
+        bytes,
+        MAX_COMMIT_METADATA_ENTRIES,
+        8,
+        "commit detached metadata",
+    )?;
+    let mut signatures = None;
+    for entry in entries {
+        let (key, value, value_type) = parse_metadata_entry(entry)?;
+        if key != "ostree.gpgsigs" {
+            continue;
+        }
+        if signatures.is_some() {
+            return Err("commit detached metadata repeats ostree.gpgsigs".into());
+        }
+        require_variant_type(value_type, "aay", key)?;
+        let values = variable_array(value, MAX_COMMIT_SIGNATURES, key)?;
+        let mut parsed = Vec::with_capacity(values.len());
+        for signature in values {
+            if signature.len() > MAX_SIGNATURE_BYTES {
+                return Err(format!(
+                    "commit signature is {} bytes; limit is {MAX_SIGNATURE_BYTES}",
+                    signature.len()
+                ));
+            }
+            parsed.push(signature.to_vec());
+        }
+        signatures = Some(parsed);
+    }
+    match signatures {
+        Some(found) if !found.is_empty() => Ok(found),
+        _ => Err("commit detached metadata carries no ostree.gpgsigs signature".into()),
+    }
 }
 
 fn parse_metadata_entry(bytes: &[u8]) -> Result<(&str, &[u8], &str), String> {
@@ -1999,6 +2052,93 @@ mod tests {
         assert!(parse_commit_verified(wrong, &bytes)
             .unwrap_err()
             .contains("checksum mismatch"));
+    }
+
+    #[test]
+    fn current_firefox_commit_carries_its_publication_time() {
+        let bytes = fixture_hex(include_str!(
+            "../tests/fixtures/flathub-firefox-7985364b.commit.hex"
+        ));
+        let expected =
+            Checksum::from_hex("7985364b35b83cfe5aa17a00932df1c2d1dae69e5c592aa637a53ff1d53fdabc")
+                .unwrap();
+        let commit = parse_commit_verified(expected, &bytes).unwrap();
+        assert_eq!(commit.timestamp, 1_792_501_610);
+        commit
+            .metadata
+            .require_exact_ref("app/org.mozilla.firefox/x86_64/stable")
+            .unwrap();
+        assert_eq!(
+            commit.metadata.collection_binding.as_deref(),
+            Some("org.flathub.Stable")
+        );
+        assert_eq!(
+            parse_commit(&commit_with(Vec::new(), Vec::new()))
+                .unwrap()
+                .timestamp,
+            1
+        );
+    }
+
+    #[test]
+    fn detached_metadata_yields_only_its_signatures() {
+        for fixture in [
+            include_str!("../tests/fixtures/flathub-firefox-7985364b.commitmeta.hex"),
+            include_str!("../tests/fixtures/flathub-freedesktop-25.08.commitmeta.hex"),
+        ] {
+            let signatures = parse_commitmeta_signatures(&fixture_hex(fixture)).unwrap();
+            assert_eq!(signatures.len(), 1);
+            // One old-format OpenPGP signature packet with a two-byte length.
+            assert_eq!(signatures[0].first(), Some(&0x89));
+            assert_eq!(signatures[0].len(), 566);
+        }
+
+        let signature = vec![0x89, 0, 1, 4];
+        let other = metadata_entry("xa.unsigned", text("ignored"), "s");
+        let sigs = metadata_entry("ostree.gpgsigs", array(&[signature.clone()]), "aay");
+        assert_eq!(
+            parse_commitmeta_signatures(&array_aligned(&[other.clone(), sigs.clone()], 8)).unwrap(),
+            vec![signature.clone()]
+        );
+        assert!(parse_commitmeta_signatures(&array_aligned(&[other], 8))
+            .unwrap_err()
+            .contains("no ostree.gpgsigs"));
+        assert!(parse_commitmeta_signatures(&array_aligned(
+            &[metadata_entry("ostree.gpgsigs", Vec::new(), "aay")],
+            8
+        ))
+        .unwrap_err()
+        .contains("no ostree.gpgsigs"));
+        assert!(
+            parse_commitmeta_signatures(&array_aligned(&[sigs.clone(), sigs], 8))
+                .unwrap_err()
+                .contains("repeats")
+        );
+        assert!(parse_commitmeta_signatures(&array_aligned(
+            &[metadata_entry("ostree.gpgsigs", text("x"), "s")],
+            8
+        ))
+        .unwrap_err()
+        .contains("expected \"aay\""));
+        let many = vec![signature; MAX_COMMIT_SIGNATURES + 1];
+        assert!(parse_commitmeta_signatures(&array_aligned(
+            &[metadata_entry("ostree.gpgsigs", array(&many), "aay")],
+            8
+        ))
+        .unwrap_err()
+        .contains("limit"));
+        assert!(parse_commitmeta_signatures(&array_aligned(
+            &[metadata_entry(
+                "ostree.gpgsigs",
+                array(&[vec![0; MAX_SIGNATURE_BYTES + 1]]),
+                "aay"
+            )],
+            8
+        ))
+        .unwrap_err()
+        .contains("limit"));
+        assert!(parse_commitmeta_signatures(&[]).is_err());
+        assert!(parse_commitmeta_signatures(&vec![0; MAX_COMMITMETA_BYTES + 1]).is_err());
     }
 
     #[test]
