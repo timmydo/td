@@ -11021,8 +11021,11 @@ the exact app ref (`app/org.mozilla.firefox/x86_64/stable`), the one
 runtime ref it accepts (`runtime/org.freedesktop.Platform/x86_64/25.08`),
 the entry, td's permission policy, launcher presentation, environment
 and the dynamic-library policy, which is keyed by application and
-runtime branch, never by commit. Flathub's signing key is compiled into
-td-net (§B.3.1). The payload bytes are *not* reviewed: whatever commit
+runtime branch, never by commit. The repository and refs, the entry
+and the policy's runtime key are one table, `FLATHUB_SOURCES` in
+`engine/src/flathub_app.rs`, which td-app reads and the cutover's specs
+are compiled from. Flathub's signing key is compiled into td-net
+(§B.3.1). The payload bytes are *not* reviewed: whatever commit
 the ref names when a machine asks is admitted only if all of these hold:
 
 1. one of its detached signatures verifies under the compiled key, with
@@ -11071,19 +11074,53 @@ holds for these payloads. Layout:
   previous -> generations/<m> the generation before it
   admitted                    newest admitted timestamp per ref (rule 3)
   checked                     time of the last completed check
+  .work/                      the ref, commit and commitmeta being checked
 ```
+
+`selection` is `format=1`, `name=` the declaration, `checks=` a SHA-256
+over rule 5's inputs that no commit carries (the entry, the store
+package and the dynamic-library policy), then either
+`app=REF<TAB>COMMIT<TAB>TIME` or `package=` the `/td/store` package that
+supplies the application tree, then `runtime=` in the row form. A pointer
+names exactly `generations/<n>` with no leading zero. Both are parsed by
+`engine/src/flathub_app.rs`, which uses no other module so that td-jail
+can include it.
 
 A generation is published by writing it completely, then replacing
 `current` with one `rename(2)`; the old `current` becomes `previous`.
-Only `current` and `previous` are retained: deploys and object graphs
-neither names are removed after a successful flip. The deploy trees
-follow §B.3.1's materialization rules, owned by the account rather than
-root, directories 0755 and files 0755/0644 from the executable bit.
+Only `current` and `previous` are retained: after every check that
+passed rules 1–4, generations, deploys and object graphs neither names
+are removed, except the commits that check tried, and so is anything
+else in the cache root. A refused candidate therefore keeps its deploy
+for the next attempt, and only the latest refused set survives. A
+deploy of `current` found missing is restored in place, with no new
+generation. A crash between replacing `previous` and `current` leaves
+both naming the old generation; that costs only the older rollback.
+The deploy trees follow §B.3.1's materialization rules, owned by the
+account rather than root, directories 0755 and files 0755/0644 from the
+executable bit.
 
 **Who fetches: `td-app`, a td-net applet.** `td-app update NAME
 [--force]` runs as the application's account, resolves the ref through
 `refs/heads/<ref>` (a mutable hint, never authority), and performs 1–5.
-Without `--force` it does nothing if `checked` is less than 24 hours old.
+It refuses to run as root or with a `HOME` another uid owns. Without
+`--force` it does nothing if `checked` is less than 24 hours old (and
+not in the future) and `current` still serves the declaration: the same
+name, refs and `checks`, with every deploy it names complete. A changed
+declaration, store package or policy, or a missing deploy, is therefore
+never throttled. `checked` is written only by a check that completed:
+a fetch failure or a refused candidate leaves it, so the next launch
+asks again. Before any tree is fetched it reads the ref, the commit and
+its commitmeta and applies 1–4. Rule 3's floor is the newest row for
+the ref in `admitted`, `current` or `previous`, so a lost or stale
+`admitted` never admits a commit older than one already selected. It
+then acquires and materializes each new commit (an existing
+`deploy/<commit>/files` is complete, since it appears by one rename; a
+deploy without one is cleared first), validates under rule 5 (for a
+runtime-only source, against the application's `/td/store` package,
+read from `/etc/td-applications.tsv` under td-jail's rules before
+anything is fetched), writes `admitted`, and only then publishes. An
+unchanged check rewrites `admitted` too.
 The materializer and the dynamic validator move from the builder into
 td-engine so the image build and td-app share one implementation; td-net
 stays free of `unsafe`, so publication uses the account-private lock and
@@ -11165,14 +11202,17 @@ these applications; it is a hint whose answer must pass 1–5.
 **Increments.** (1) The Flathub signature verifier on the pinned path
 (§B.3.1, landed first). (2) This design and its AGENTS.md amendment.
 (3) Move the materializer and the dynamic validator into td-engine,
-unchanged (landed third). (4) `td-app update`: cache, admission, generations, daily and
-forced checks, for an application or a runtime alone, as a command
-nothing launches yet. (5) Launch requests, the worker, the compositor
-launcher, and td-jail resolving each half of a spec from the store or
-the cache. (6) Cutover: the declaration-only Firefox package, Claude
-Code's runtime ref, autostart only under the autotest token, the
-oracles' feed transport, and deletion of the pins, payloads and graph
-transfer.
+unchanged (landed third). (4) `td-app update`: cache, admission,
+generations, daily and forced checks, for an application or a runtime
+alone, as a command nothing launches yet (landed fourth; how the
+account reaches Flathub from outside its jail is (5)'s to settle).
+(5) Launch requests, the worker, the compositor launcher, and td-jail
+resolving each half of a spec from the store or the cache; td-jail must
+also keep a running generation's trees from being collected under it,
+and refuse a selection whose `checks` no longer match its declaration. (6) Cutover:
+the declaration-only Firefox package, Claude Code's runtime ref,
+autostart only under the autotest token, the oracles' feed transport,
+and deletion of the pins, payloads and graph transfer.
 
 ## X. Host mode — development only
 

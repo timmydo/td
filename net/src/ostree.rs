@@ -1910,7 +1910,7 @@ fn acquire_from(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::feed::tests::ConsumerServer;
     use std::net::TcpListener;
@@ -2276,7 +2276,7 @@ mod tests {
         bytes
     }
 
-    fn archive_regular(contents: &[u8]) -> (Checksum, Vec<u8>) {
+    pub(crate) fn archive_regular(contents: &[u8]) -> (Checksum, Vec<u8>) {
         let header = tuple(
             vec![
                 u64::try_from(contents.len())
@@ -2310,11 +2310,20 @@ mod tests {
         (digest(&canonical), archive)
     }
 
-    fn commit(exact_ref: &str, root_tree: Checksum, root_meta: Checksum) -> Vec<u8> {
-        let entries = vec![
+    fn commit_at(
+        exact_ref: &str,
+        root_tree: Checksum,
+        root_meta: Checksum,
+        timestamp: u64,
+        flatpak_metadata: Option<&str>,
+    ) -> Vec<u8> {
+        let mut entries = vec![
             metadata_entry("ostree.ref-binding", array(&[text(exact_ref)]), "as"),
             metadata_entry("xa.ref", text(exact_ref), "s"),
         ];
+        if let Some(metadata) = flatpak_metadata {
+            entries.push(metadata_entry("xa.metadata", text(metadata), "s"));
+        }
         tuple(
             vec![
                 array_aligned(&entries, 8),
@@ -2322,7 +2331,7 @@ mod tests {
                 Vec::new(),
                 text("fixture"),
                 text("fixture"),
-                1u64.to_be_bytes().to_vec(),
+                timestamp.to_be_bytes().to_vec(),
                 root_tree.as_bytes().to_vec(),
                 root_meta.as_bytes().to_vec(),
             ],
@@ -2337,7 +2346,18 @@ mod tests {
 
     fn synthetic_graph_with_files(
         exact_ref: &str,
+        files: Vec<(String, Checksum, Vec<u8>)>,
+    ) -> (AcquireSpec, BTreeMap<String, Vec<u8>>) {
+        synthetic_graph_at(exact_ref, files, 1, None)
+    }
+
+    /// One commit of `exact_ref` at `timestamp` whose `files/` holds
+    /// `files`, with `xa.metadata` when given.
+    pub(crate) fn synthetic_graph_at(
+        exact_ref: &str,
         mut files: Vec<(String, Checksum, Vec<u8>)>,
+        timestamp: u64,
+        flatpak_metadata: Option<&str>,
     ) -> (AcquireSpec, BTreeMap<String, Vec<u8>>) {
         files.sort_by(|left, right| left.0.cmp(&right.0));
         let files_meta_bytes = dirmeta();
@@ -2352,7 +2372,7 @@ mod tests {
         let root_meta = digest(&root_meta_bytes);
         let root_tree_bytes = dirtree(&[], &[dirtree_directory("files", files_tree, files_meta)]);
         let root_tree = digest(&root_tree_bytes);
-        let commit_bytes = commit(exact_ref, root_tree, root_meta);
+        let commit_bytes = commit_at(exact_ref, root_tree, root_meta, timestamp, flatpak_metadata);
         let commit_checksum = digest(&commit_bytes);
         let parsed = ostree::parse_commit_verified(commit_checksum, &commit_bytes).unwrap();
         let spec = AcquireSpec::parse(

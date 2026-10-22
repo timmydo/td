@@ -19,9 +19,10 @@
 //! installer `#[path]`-includes them (together with `crc32`) exactly as
 //! td-boot includes `sha256`. Neither bin uses `gpt` or `fat`.
 //!
-//! The control-plane-only `gzip` module holds the one std-only DEFLATE
-//! implementation shared by builder source extraction, `td-net`'s bounded
-//! OSTree acquisition and the `ostree_deploy` materializer; `xz` is its LZMA2
+//! The `gzip` module holds the one std-only DEFLATE implementation shared
+//! by builder source extraction, `td-net`'s bounded OSTree acquisition
+//! (on the target only through `td-app`) and the `ostree_deploy`
+//! materializer; `xz` is its LZMA2
 //! counterpart, shared by builder source extraction and `td-net`'s Debian
 //! index resolution. No target binary `#[path]`-includes either.
 //!
@@ -30,7 +31,9 @@
 //! builder so the image build and `td-net`'s on-demand Flathub admission
 //! (APPLICATIONS.md §W.9) run one implementation. The builder keeps the ELF
 //! writers, and passes `ostree_deploy` its `renameat2` publication: this
-//! crate stays free of syscalls.
+//! crate stays free of syscalls. `flathub_app` holds §W.9's declarations
+//! and the pure half of its admission: the cache's state formats and
+//! rules 3 and 4.
 //!
 //! `sha512` and `ed25519` arrive with AUTHENTICATED deployments, and are
 //! target-side in that same way — which is why the crate's first line no
@@ -79,6 +82,7 @@ pub mod principals;
 pub mod ed25519_sign;
 pub mod exit;
 pub mod fat;
+pub mod flathub_app;
 pub mod gpt;
 pub mod gzip;
 pub mod host_path;

@@ -588,6 +588,7 @@ fn at_line(line: usize, reason: &str) -> String {
 mod tests {
     use super::*;
     use crate::application::{ApplicationDeclaration, ApplicationProvenance};
+    use crate::flathub_app::{flathub_source, valid_ref, FLATHUB_SOURCES};
     use crate::permissions::{BusAccess, FilesystemAccess, PermissionSocket};
 
     fn manifest() -> ApplicationManifest {
@@ -1001,5 +1002,27 @@ mod tests {
             ApplicationSpec::parse(&text.replace("-empty-runtime-1", "/nested-runtime")).is_err()
         );
         assert!(ApplicationSpec::parse(&format!("{text}[Unknown]\nx=y\n")).is_err());
+    }
+
+    #[test]
+    fn flathub_declarations_are_sorted_unique_and_name_their_policies() {
+        let names: Vec<&str> = FLATHUB_SOURCES.iter().map(|source| source.name).collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(names, sorted);
+        for source in FLATHUB_SOURCES {
+            crate::ostree::validate_exact_ref(source.runtime).unwrap();
+            assert!(valid_ref(source.runtime) && source.runtime.starts_with("runtime/"));
+            if let Some(application) = source.application {
+                crate::ostree::validate_exact_ref(application).unwrap();
+                assert!(valid_ref(application) && application.starts_with("app/"));
+            }
+            assert!(source.entry.starts_with("/app/"));
+            assert!(dynamic_application_policy(source.name, source.policy_runtime).is_some());
+        }
+        assert_eq!(flathub_source("firefox").unwrap().entry, "/app/bin/firefox");
+        assert!(flathub_source("claude").unwrap().application.is_none());
+        assert!(flathub_source("mail").is_none());
     }
 }

@@ -20,7 +20,7 @@ use td_engine::ostree::{self, Checksum, Commit};
 
 use crate::openpgp::{self, RsaKey};
 
-pub(crate) const REPOSITORY: &str = "https://dl.flathub.org/repo";
+pub(crate) const REPOSITORY: &str = td_engine::flathub_app::REPOSITORY;
 pub(crate) const COLLECTION: &str = "org.flathub.Stable";
 pub(crate) const SIGNING_SUBKEY_FINGERPRINT: &str = "54A6CDDD8919FB204200D8AC562702E9E3ED7EE8";
 

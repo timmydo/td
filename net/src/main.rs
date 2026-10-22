@@ -31,6 +31,7 @@
 // binary on demand; an operator who uses td-subst links that name or runs
 // `td-net subst`. Invoking a bare
 // `td-net` with no applet selector is a usage error (exit 2) by design.
+mod app;
 mod deploy;
 mod egress;
 mod feed;
@@ -105,6 +106,7 @@ fn main() {
         .and_then(|s| s.to_str())
         .unwrap_or("");
     match base {
+        "td-app" => app::run(&args),
         "td-fetch" => fetch::run(&args),
         "td-feed" => feed::run(&args),
         "td-subst" => subst::run(&args),
@@ -123,6 +125,7 @@ fn main() {
         // name so each applet's basename/output is unchanged — then dispatch.
         _ => {
             let applet = match args.get(1).map(String::as_str) {
+                Some("app") => "td-app",
                 Some("fetch") => "td-fetch",
                 Some("feed") => "td-feed",
                 Some("subst") => "td-subst",
@@ -133,7 +136,7 @@ fn main() {
                 Some("test-https") => "td-test-https",
                 _ => {
                     eprintln!(
-                        "usage: td-net <fetch|feed|subst|deploy|fetchd|egressd|launch|test-https> ...\n  \
+                        "usage: td-net <app|fetch|feed|subst|deploy|fetchd|egressd|launch|test-https> ...\n  \
                          (or invoke via the td-fetch / td-feed / td-subst / td-deploy / \
                          td-fetchd / td-test-https applet links)"
                     );
@@ -144,6 +147,7 @@ fn main() {
             argv.push(applet.to_string());
             argv.extend_from_slice(args.get(2..).unwrap_or(&[]));
             match applet {
+                "td-app" => app::run(&argv),
                 "td-fetch" => fetch::run(&argv),
                 "td-feed" => feed::run(&argv),
                 "td-deploy" => deploy::run(&argv),

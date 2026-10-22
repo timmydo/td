@@ -1227,7 +1227,7 @@ fn slice<'a>(bytes: &'a [u8], start: usize, end: usize, what: &str) -> Result<&'
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn offset(value: usize, width: usize) -> Vec<u8> {
@@ -1238,7 +1238,7 @@ mod tests {
         }
     }
 
-    fn fixture_hex(text: &str) -> Vec<u8> {
+    pub(crate) fn fixture_hex(text: &str) -> Vec<u8> {
         let digits: Vec<u8> = text
             .bytes()
             .filter(|byte| !byte.is_ascii_whitespace())
@@ -2164,5 +2164,27 @@ mod tests {
         assert!(ObjectKind::parse("file").is_err());
         assert!(validate_exact_ref("app/example.App/x86_64/stable").is_ok());
         assert!(validate_exact_ref("usr/example.App/x86_64/stable").is_err());
+    }
+
+    #[test]
+    fn current_firefox_commit_names_the_accepted_runtime() {
+        let bytes = fixture_hex(include_str!(
+            "../tests/fixtures/flathub-firefox-7985364b.commit.hex"
+        ));
+        let commit = parse_commit_verified(
+            Checksum::from_hex("7985364b35b83cfe5aa17a00932df1c2d1dae69e5c592aa637a53ff1d53fdabc")
+                .unwrap(),
+            &bytes,
+        )
+        .unwrap();
+        let metadata = commit.metadata.flatpak_metadata.unwrap();
+        let firefox = crate::flathub_app::flathub_source("firefox").unwrap();
+        crate::flathub_app::require_runtime(&metadata, firefox.runtime).unwrap();
+        assert!(crate::flathub_app::require_runtime(
+            &metadata,
+            "runtime/org.freedesktop.Platform/x86_64/24.08"
+        )
+        .unwrap_err()
+        .contains("only"));
     }
 }
