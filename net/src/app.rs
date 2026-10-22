@@ -6,6 +6,10 @@
 //! candidate only under rules 1–5, and publishes a generation by replacing
 //! `current` with one rename. A refusal or failure leaves `current` as it was.
 //! `td-app ready NAME` names the generation td-jail may launch.
+//!
+//! A provisioned feed (td-vm/DESIGN.md) is tried first for every ref and
+//! is transport only: whatever it serves passes the same rules. The host
+//! fills it with `td-feed export flathub`, which runs [`export`].
 #![deny(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -16,6 +20,7 @@
     clippy::indexing_slicing
 )]
 
+use std::collections::BTreeSet;
 use std::ffi::{CStr, OsStr};
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{Read, Write};
@@ -60,10 +65,19 @@ type Validate = fn(&Path, &str, &Path, &[String], &[String], usize) -> Result<()
 
 struct Admission<'a> {
     repository: &'a str,
+    /// A td-feed base serving refs under FEED_REFS and graphs under
+    /// `ostree/COMMIT/`.
+    feed: Option<&'a str>,
     verify: Verify,
     validate: Validate,
     registry: &'a Path,
 }
+
+/// Where a feed names the commit it holds for a ref.
+const FEED_REFS: &str = "flathub/refs/heads";
+/// In the host export cache: the commits whose graphs the last export
+/// published, so the next one removes those no ref names.
+const EXPORTED: &str = "exported";
 
 #[derive(Debug, Eq, PartialEq)]
 enum Outcome {
@@ -86,6 +100,10 @@ struct Candidate {
     admitted: Admitted,
     content: Checksum,
     metadata: Option<String>,
+    /// The detached signature metadata, which a feed export republishes.
+    commitmeta: Vec<u8>,
+    /// Whether the feed served this ref, so its graph comes from there too.
+    from_feed: bool,
 }
 
 fn verify_flathub(
@@ -280,22 +298,40 @@ fn resolve(
     now: u64,
     deadline: Instant,
 ) -> Result<Candidate, String> {
-    let head = fetch_small(
-        &format!("{}/refs/heads/{exact_ref}", admission.repository),
-        &work.join("ref"),
-        MAX_REF_BYTES,
-        deadline,
-    )?;
+    let from_feed = match admission.feed {
+        Some(base) => fetch_small(
+            &format!("{base}/{FEED_REFS}/{exact_ref}"),
+            &work.join("ref"),
+            MAX_REF_BYTES,
+            deadline,
+        )
+        .map_err(|error| eprintln!("td-app: the feed has no {exact_ref} ({error}); asking Flathub"))
+        .ok(),
+        None => None,
+    };
+    let (head, from_feed) = match from_feed {
+        Some(head) => (head, true),
+        None => (
+            fetch_small(
+                &format!("{}/refs/heads/{exact_ref}", admission.repository),
+                &work.join("ref"),
+                MAX_REF_BYTES,
+                deadline,
+            )?,
+            false,
+        ),
+    };
     let hex = std::str::from_utf8(&head)
         .ok()
         .map(|text| text.strip_suffix('\n').unwrap_or(text))
         .ok_or_else(|| format!("{exact_ref} does not name a commit"))?;
     let commit = Checksum::from_hex(hex).map_err(|error| format!("{exact_ref}: {error}"))?;
+    let repository = match admission.feed {
+        Some(base) if from_feed => crate::ostree::feed_graph_base(base, commit),
+        _ => admission.repository.to_string(),
+    };
     let commit_bytes = fetch_small(
-        &object_url(
-            admission.repository,
-            ObjectKey::new(ObjectKind::Commit, commit),
-        )?,
+        &object_url(&repository, ObjectKey::new(ObjectKind::Commit, commit))?,
         &work.join("commit"),
         ObjectKind::Commit.max_transfer()?,
         deadline,
@@ -303,7 +339,7 @@ fn resolve(
     let commitmeta_limit = u64::try_from(ostree::MAX_COMMITMETA_BYTES)
         .map_err(|_| "commitmeta limit does not fit u64".to_string())?;
     let commitmeta = fetch_small(
-        &commitmeta_url(admission.repository, commit)?,
+        &commitmeta_url(&repository, commit)?,
         &work.join("commitmeta"),
         commitmeta_limit,
         deadline,
@@ -324,6 +360,8 @@ fn resolve(
         },
         content: parsed.content_checksum(),
         metadata: parsed.metadata.flatpak_metadata,
+        commitmeta,
+        from_feed,
     })
 }
 
@@ -370,7 +408,14 @@ fn deploy(
         hex,
         &candidate.content.to_hex(),
     )?;
-    crate::ostree::acquire(&spec, &objects)?;
+    match admission.feed {
+        Some(base) if candidate.from_feed => {
+            crate::ostree::acquire_from_feed(&spec, &objects, base, |_| Ok(()))?;
+        }
+        _ => {
+            crate::ostree::acquire(&spec, &objects)?;
+        }
+    }
     private_dir(&out)?;
     fs::set_permissions(&out, fs::Permissions::from_mode(0o755))
         .map_err(|error| format!("chmod {}: {error}", out.display()))?;
@@ -881,6 +926,203 @@ fn require_account(home: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// The host half of the feed transport: resolve every declared ref
+/// against Flathub under rules 1–2, fetch its graph into `cache`, and
+/// publish the graph, its commitmeta and last the ref into a td-feed
+/// store, so a ref the feed names always has its graph. Graphs no
+/// declared ref names any more leave the cache.
+fn export(
+    admission: &Admission<'_>,
+    refs: &[&str],
+    cache: &Path,
+    store: &Path,
+    now: u64,
+) -> Result<Vec<String>, String> {
+    prepare_cache(cache)?;
+    let _lock = lock(cache)?;
+    let work = cache.join(WORK);
+    if fs::symlink_metadata(&work).is_ok() {
+        remove_tree(&work)?;
+    }
+    private_dir(&work)?;
+    let deadline = Instant::now()
+        .checked_add(RESOLVE_TIME)
+        .ok_or("resolve deadline overflows")?;
+    // The graphs this export may remove later: those it recorded before
+    // and those it creates now. A graph already in the store, such as one
+    // `export graphs` pinned, is never its own.
+    let exported_path = cache.join(EXPORTED);
+    // Only a record that is not a file starts again; any other failure to
+    // read it is reported, since starting again abandons what it owned.
+    if fs::symlink_metadata(&exported_path).is_ok_and(|metadata| !metadata.is_file()) {
+        eprintln!(
+            "td-feed: {} is not a file; the export's record starts again",
+            exported_path.display()
+        );
+        remove_tree(&exported_path)?;
+    }
+    let mut owned: BTreeSet<String> = read_text(&exported_path)?
+        .unwrap_or_default()
+        .lines()
+        .filter(|commit| flathub_app::valid_hex64(commit))
+        .map(str::to_string)
+        .collect();
+    let store_graph = |commit: Checksum| {
+        store.join(crate::ostree::feed_graph_base("", commit).trim_start_matches('/'))
+    };
+    let mut resolved = Vec::with_capacity(refs.len());
+    for &exact_ref in refs {
+        let candidate = resolve(admission, &work, exact_ref, &[], now, deadline)?;
+        let commit = Checksum::from_hex(&candidate.admitted.commit)?;
+        let spec = AcquireSpec::parse(
+            admission.repository,
+            exact_ref,
+            &candidate.admitted.commit,
+            &candidate.content.to_hex(),
+        )?;
+        let objects = cache.join(OBJECTS).join(&candidate.admitted.commit);
+        crate::ostree::acquire(&spec, &objects)?;
+        // Recorded before any of it is published, so no failure leaks it.
+        if fs::symlink_metadata(store_graph(commit)).is_err()
+            && owned.insert(candidate.admitted.commit.clone())
+        {
+            write_state(&exported_path, &render_commits(&owned))?;
+        }
+        crate::ostree::export_feed(&spec, &objects, store, |_| Ok(()))?;
+        let graph = crate::ostree::feed_graph_base("", commit);
+        let graph = graph.trim_start_matches('/');
+        publish_to_feed(
+            &work,
+            &candidate.commitmeta,
+            &store.join(commitmeta_url(graph, commit)?),
+        )?;
+        resolved.push((exact_ref, candidate.admitted.commit));
+    }
+    // The refs move only once every graph is in place, so the feed never
+    // names a new application beside a runtime graph it still lacks.
+    for (exact_ref, commit) in &resolved {
+        publish_to_feed(
+            &work,
+            format!("{commit}\n").as_bytes(),
+            &store.join(FEED_REFS).join(exact_ref),
+        )?;
+    }
+    remove_tree(&work)?;
+    // An owned graph leaves the store once no ref file there names it, a
+    // ref no longer declared included, so the feed never names a graph it
+    // lacks.
+    let named = feed_ref_commits(&store.join(FEED_REFS))?;
+    let mut removed = Vec::new();
+    for commit in owned.iter().filter(|commit| !named.contains(*commit)) {
+        let graph = store_graph(Checksum::from_hex(commit)?);
+        if fs::symlink_metadata(&graph).is_ok() {
+            remove_tree(&graph)?;
+        }
+        removed.push(commit.clone());
+    }
+    for commit in removed {
+        owned.remove(&commit);
+    }
+    write_state(&exported_path, &render_commits(&owned))?;
+    // The host cache keeps the graphs exported now and their ostree
+    // siblings, which the client names by its hash of the graph's name.
+    let kept: BTreeSet<&str> = resolved.iter().map(|(_, commit)| commit.as_str()).collect();
+    let siblings: BTreeSet<String> = kept
+        .iter()
+        .map(|commit| crate::feed::hex_sha256(commit.as_bytes()))
+        .collect();
+    for (name, path) in list(&cache.join(OBJECTS))? {
+        let stale = if flathub_app::valid_hex64(&name) {
+            !kept.contains(name.as_str())
+        } else {
+            name.strip_prefix('.')
+                .and_then(|rest| {
+                    rest.strip_suffix(".td-ostree.lock")
+                        .or_else(|| rest.strip_suffix(".td-ostree-transaction"))
+                })
+                .is_some_and(|identity| {
+                    flathub_app::valid_hex64(identity) && !siblings.contains(identity)
+                })
+        };
+        if stale {
+            remove_tree(&path)?;
+        }
+    }
+    Ok(resolved
+        .iter()
+        .map(|(exact_ref, commit)| format!("{exact_ref} {commit}"))
+        .collect())
+}
+
+fn render_commits(commits: &BTreeSet<String>) -> String {
+    commits.iter().map(|commit| format!("{commit}\n")).collect()
+}
+
+/// Every commit a ref file under `refs` names; refs are four segments deep.
+fn feed_ref_commits(refs: &Path) -> Result<BTreeSet<String>, String> {
+    let mut named = BTreeSet::new();
+    if fs::symlink_metadata(refs).is_err() {
+        return Ok(named);
+    }
+    let mut pending = vec![(refs.to_path_buf(), 0usize)];
+    while let Some((directory, depth)) = pending.pop() {
+        for (name, path) in list(&directory)? {
+            if name.starts_with('.') || name.ends_with(".sha256") {
+                continue;
+            }
+            let metadata = fs::symlink_metadata(&path)
+                .map_err(|error| format!("stat {}: {error}", path.display()))?;
+            if metadata.is_dir() && depth < 3 {
+                pending.push((path, depth + 1));
+            } else if metadata.is_file() && depth == 3 {
+                if let Some(commit) = read_text(&path)?
+                    .as_deref()
+                    .and_then(|text| text.strip_suffix('\n'))
+                    .filter(|commit| flathub_app::valid_hex64(commit))
+                {
+                    named.insert(commit.to_string());
+                }
+            }
+        }
+    }
+    Ok(named)
+}
+
+/// Publish `bytes` at `destination` through td-feed's checked writer.
+fn publish_to_feed(work: &Path, bytes: &[u8], destination: &Path) -> Result<(), String> {
+    let staged = work.join("publish");
+    fs::write(&staged, bytes).map_err(|error| format!("write {}: {error}", staged.display()))?;
+    let published =
+        crate::feed::export_verified_file(&staged, destination, &crate::feed::hex_sha256(bytes));
+    let _ = fs::remove_file(&staged);
+    published
+}
+
+/// `td-feed export flathub`: the host account's own cache, the feed's store.
+pub(crate) fn export_to(store: &Path) -> Result<Vec<String>, String> {
+    let home = std::env::var_os("HOME").ok_or("HOME is not set")?;
+    let admission = Admission {
+        repository: flathub_app::REPOSITORY,
+        feed: None,
+        verify: verify_flathub,
+        validate: validate_dynamic,
+        registry: Path::new(REGISTRY),
+    };
+    let mut refs: Vec<&str> = flathub_app::FLATHUB_SOURCES
+        .iter()
+        .flat_map(|source| source.application.into_iter().chain([source.runtime]))
+        .collect();
+    refs.sort_unstable();
+    refs.dedup();
+    export(
+        &admission,
+        &refs,
+        &Path::new(&home).join(".td/flathub-export"),
+        store,
+        unix_now()?,
+    )
+}
+
 fn usage() -> ! {
     eprintln!("usage: td-app update NAME [--force] | td-app ready NAME");
     std::process::exit(2);
@@ -911,8 +1153,14 @@ pub fn run(args: &[String]) {
             return Err(format!("HOME {} is not absolute", home.display()));
         }
         require_account(home)?;
+        // Only an update fetches; `ready` answers td-jail without it.
+        let feed = match verb {
+            Verb::Update { .. } => crate::feed::provisioned_feed_base()?,
+            Verb::Ready => None,
+        };
         let admission = Admission {
             repository: flathub_app::REPOSITORY,
+            feed: feed.as_deref(),
             verify: verify_flathub,
             validate: validate_dynamic,
             registry: Path::new(REGISTRY),
@@ -1088,6 +1336,7 @@ mod tests {
         registry: PathBuf,
         repository: Repository,
         url: String,
+        feed: Option<String>,
     }
 
     impl Fixture {
@@ -1105,6 +1354,7 @@ mod tests {
                 registry,
                 repository,
                 url,
+                feed: None,
             }
         }
 
@@ -1115,6 +1365,7 @@ mod tests {
         fn update(&self, source: FlathubSource, force: bool, now: u64) -> Result<Outcome, String> {
             let admission = Admission {
                 repository: &self.url,
+                feed: self.feed.as_deref(),
                 verify: verify_fixture,
                 validate: validate_fixture,
                 registry: &self.registry,
@@ -1190,6 +1441,332 @@ mod tests {
         assert!(!fixture.cache().join(WORK).exists());
         let mode = fs::metadata(fixture.cache()).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
+    }
+
+    impl Fixture {
+        /// Export both refs from this fixture's Flathub into a fresh feed
+        /// store, as `td-feed export flathub` does on the host.
+        fn export(&self, host: &Path) -> Result<Vec<String>, String> {
+            let admission = Admission {
+                repository: &self.url,
+                feed: None,
+                verify: verify_fixture,
+                validate: validate_fixture,
+                registry: &self.registry,
+            };
+            export(
+                &admission,
+                &[APP, RUNTIME],
+                &host.join("cache"),
+                &host.join("store"),
+                NOW,
+            )
+        }
+    }
+
+    /// The feed is transport only: an update takes each ref, its commit,
+    /// commitmeta and graph from an exported feed and never asks Flathub,
+    /// and still verifies them as it would Flathub's.
+    #[test]
+    fn an_exported_feed_serves_an_update_without_flathub() {
+        let mut fixture = Fixture::new("feed");
+        let runtime = publish_commit(&fixture.repository, RUNTIME, b"usr", 10, None, b"signed");
+        let app = publish_commit(
+            &fixture.repository,
+            APP,
+            b"app",
+            20,
+            Some(APP_METADATA),
+            b"signed",
+        );
+        let host = crate::test_temp::TempDir::new("td-app-feed-host").unwrap();
+        assert_eq!(
+            fixture.export(&host).unwrap(),
+            vec![format!("{APP} {app}"), format!("{RUNTIME} {runtime}")]
+        );
+        let store = host.join("store");
+        assert_eq!(
+            fs::read_to_string(store.join(FEED_REFS).join(RUNTIME)).unwrap(),
+            format!("{runtime}\n")
+        );
+        fixture.repository.lock().unwrap().clear();
+        let feed = crate::feed::tests::ConsumerServer::start(store.clone(), None);
+        fixture.feed = Some(feed.base.clone());
+        assert_eq!(
+            fixture.update(source(Some(APP)), false, NOW),
+            Ok(Outcome::Selected(1))
+        );
+        let (_, selection) = fixture.current().unwrap();
+        assert_eq!(selection.runtime.commit, runtime);
+        assert_eq!(selection.application.unwrap().commit, app);
+        assert_eq!(
+            fs::read(
+                fixture
+                    .cache()
+                    .join(DEPLOY)
+                    .join(&app)
+                    .join("files/payload")
+            )
+            .unwrap(),
+            b"app"
+        );
+
+        // A feed whose signature does not verify is refused like Flathub.
+        let forged = Fixture::new("feed-forged");
+        publish_commit(&forged.repository, RUNTIME, b"usr", 10, None, b"forged");
+        publish_commit(
+            &forged.repository,
+            APP,
+            b"app",
+            20,
+            Some(APP_METADATA),
+            b"forged",
+        );
+        let host = crate::test_temp::TempDir::new("td-app-feed-forged").unwrap();
+        assert!(forged.export(&host).is_err());
+    }
+
+    /// Replace one file of a feed store, sidecar included, as a hostile or
+    /// broken host could.
+    fn rewrite_feed_file(path: &Path, bytes: Option<&[u8]>) {
+        let sidecar = PathBuf::from(format!("{}.sha256", path.display()));
+        match bytes {
+            Some(bytes) => {
+                fs::write(path, bytes).unwrap();
+                fs::write(&sidecar, format!("{}\n", crate::feed::hex_sha256(bytes))).unwrap();
+            }
+            None => {
+                fs::remove_file(path).unwrap();
+                fs::remove_file(&sidecar).unwrap();
+            }
+        }
+    }
+
+    /// A ref the feed answers is the feed's alone, and still held to rules
+    /// 1–3: a forged signature, a commit below the floor and a graph the
+    /// feed cannot complete each refuse the update, with no fallback to the
+    /// Flathub that would have answered.
+    #[test]
+    fn a_feed_answer_is_held_to_the_rules_without_fallback() {
+        let mut fixture = Fixture::new("feed-rules");
+        let runtime = publish_commit(&fixture.repository, RUNTIME, b"usr", 10, None, b"signed");
+        publish_commit(
+            &fixture.repository,
+            APP,
+            b"app",
+            20,
+            Some(APP_METADATA),
+            b"signed",
+        );
+        let host = crate::test_temp::TempDir::new("td-app-feed-rules").unwrap();
+        fixture.export(&host).unwrap();
+        let store = host.join("store");
+        let commit = Checksum::from_hex(&runtime).unwrap();
+        let graph = store.join(crate::ostree::feed_graph_base("", commit).trim_start_matches('/'));
+        let commitmeta = graph.join(commitmeta_url("", commit).unwrap().trim_start_matches('/'));
+        let feed = crate::feed::tests::ConsumerServer::start(store.clone(), None);
+        fixture.feed = Some(feed.base.clone());
+
+        rewrite_feed_file(&commitmeta, Some(b"forged"));
+        let error = fixture.update(source(Some(APP)), false, NOW).unwrap_err();
+        assert!(error.contains("does not verify"), "{error}");
+        assert!(fixture.current().is_none());
+        rewrite_feed_file(&commitmeta, Some(b"signed"));
+
+        // A graph object the feed lost.
+        let object = fs::read_dir(graph.join("objects"))
+            .unwrap()
+            .flat_map(|fanout| fs::read_dir(fanout.unwrap().path()).unwrap())
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().is_some_and(|kind| kind == "filez"))
+            .unwrap();
+        let lost = fs::read(&object).unwrap();
+        rewrite_feed_file(&object, None);
+        assert!(fixture.update(source(Some(APP)), false, NOW).is_err());
+        assert!(fixture.current().is_none());
+        rewrite_feed_file(&object, Some(&lost));
+        assert_eq!(
+            fixture.update(source(Some(APP)), false, NOW),
+            Ok(Outcome::Selected(1))
+        );
+
+        // An older signed commit than the account admitted.
+        let older = Fixture::new("feed-older");
+        publish_commit(&older.repository, RUNTIME, b"old", 5, None, b"signed");
+        publish_commit(
+            &older.repository,
+            APP,
+            b"old",
+            6,
+            Some(APP_METADATA),
+            b"signed",
+        );
+        let stale = crate::test_temp::TempDir::new("td-app-feed-stale").unwrap();
+        older.export(&stale).unwrap();
+        let stale_feed = crate::feed::tests::ConsumerServer::start(stale.join("store"), None);
+        fixture.feed = Some(stale_feed.base.clone());
+        let error = fixture.update(source(Some(APP)), true, NOW).unwrap_err();
+        assert!(error.contains("does not supersede"), "{error}");
+        assert_eq!(fixture.current().unwrap().0, 1);
+    }
+
+    /// A feed that lacks a ref is no answer: td-app asks Flathub.
+    #[test]
+    fn a_feed_without_the_ref_falls_back_to_flathub() {
+        let mut fixture = Fixture::new("feed-empty");
+        publish_commit(&fixture.repository, RUNTIME, b"usr", 10, None, b"signed");
+        publish_commit(
+            &fixture.repository,
+            APP,
+            b"app",
+            20,
+            Some(APP_METADATA),
+            b"signed",
+        );
+        let empty = crate::test_temp::TempDir::new("td-app-feed-empty").unwrap();
+        let store = empty.join("store");
+        fs::create_dir(&store).unwrap();
+        let feed = crate::feed::tests::ConsumerServer::start(store, None);
+        fixture.feed = Some(feed.base.clone());
+        assert_eq!(
+            fixture.update(source(Some(APP)), false, NOW),
+            Ok(Outcome::Selected(1))
+        );
+        // It was asked for both refs first.
+        assert_eq!(feed.count(), 2);
+    }
+
+    /// The host cache keeps only the graphs the declared refs name now.
+    #[test]
+    fn export_keeps_only_the_graphs_it_exported() {
+        let fixture = Fixture::new("feed-prune");
+        let old = publish_commit(&fixture.repository, RUNTIME, b"usr", 10, None, b"signed");
+        let app = publish_commit(
+            &fixture.repository,
+            APP,
+            b"app",
+            20,
+            Some(APP_METADATA),
+            b"signed",
+        );
+        let host = crate::test_temp::TempDir::new("td-app-feed-prune").unwrap();
+        fixture.export(&host).unwrap();
+        let new = publish_commit(&fixture.repository, RUNTIME, b"usr2", 30, None, b"signed");
+        fixture.export(&host).unwrap();
+        let names: Vec<String> = fs::read_dir(host.join("cache").join(OBJECTS))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        let kept: Vec<String> = names
+            .iter()
+            .filter(|name| !name.starts_with('.'))
+            .cloned()
+            .collect();
+        assert_eq!(sorted(kept), sorted(vec![app.clone(), new.clone()]));
+        let lock = |commit: &str| {
+            format!(
+                ".{}.td-ostree.lock",
+                crate::feed::hex_sha256(commit.as_bytes())
+            )
+        };
+        assert!(
+            names.contains(&lock(&new)) && names.contains(&lock(&app)),
+            "{names:?}"
+        );
+        assert!(!names.contains(&lock(&old)), "{names:?}");
+        assert_eq!(
+            fs::read_to_string(host.join("store").join(FEED_REFS).join(RUNTIME)).unwrap(),
+            format!("{new}\n")
+        );
+        // The store loses the graph the moved ref named, and nothing else.
+        let graph = |commit: &str| {
+            let base = crate::ostree::feed_graph_base("", Checksum::from_hex(commit).unwrap());
+            host.join("store").join(base.trim_start_matches('/'))
+        };
+        assert!(!graph(&old).exists());
+        assert!(graph(&new).exists() && graph(&app).exists());
+    }
+
+    /// The store keeps a graph the export did not create, such as a pinned
+    /// one, and a graph any ref file there still names, such as a ref no
+    /// longer declared.
+    #[test]
+    fn export_removes_only_its_own_graphs_no_ref_names() {
+        let fixture = Fixture::new("feed-owned");
+        let runtime = publish_commit(&fixture.repository, RUNTIME, b"usr", 10, None, b"signed");
+        let app = publish_commit(
+            &fixture.repository,
+            APP,
+            b"app",
+            20,
+            Some(APP_METADATA),
+            b"signed",
+        );
+        let host = crate::test_temp::TempDir::new("td-app-feed-owned").unwrap();
+        let store = host.join("store");
+        let graph = |commit: &str| {
+            let base = crate::ostree::feed_graph_base("", Checksum::from_hex(commit).unwrap());
+            store.join(base.trim_start_matches('/'))
+        };
+        // Another export placed the runtime's graph first.
+        fs::create_dir_all(graph(&runtime)).unwrap();
+        fixture.export(&host).unwrap();
+        // A ref the declaration has dropped still names the application.
+        let dropped = store
+            .join(FEED_REFS)
+            .join("app/org.example.Old/x86_64/stable");
+        fs::create_dir_all(dropped.parent().unwrap()).unwrap();
+        fs::write(&dropped, format!("{app}\n")).unwrap();
+        publish_commit(&fixture.repository, RUNTIME, b"usr2", 30, None, b"signed");
+        publish_commit(
+            &fixture.repository,
+            APP,
+            b"app2",
+            40,
+            Some(APP_METADATA),
+            b"signed",
+        );
+        fixture.export(&host).unwrap();
+        assert!(graph(&runtime).exists(), "not this export's to remove");
+        assert!(graph(&app).exists(), "a ref still names it");
+        fs::remove_file(&dropped).unwrap();
+        fixture.export(&host).unwrap();
+        assert!(!graph(&app).exists());
+        assert!(graph(&runtime).exists());
+
+        // An export that fails part way has recorded the graph it published.
+        let admission = Admission {
+            repository: &fixture.url,
+            feed: None,
+            verify: verify_fixture,
+            validate: validate_fixture,
+            registry: &fixture.registry,
+        };
+        let moved = publish_commit(
+            &fixture.repository,
+            APP,
+            b"app3",
+            50,
+            Some(APP_METADATA),
+            b"signed",
+        );
+        let partial = export(
+            &admission,
+            &[APP, "runtime/org.example.Absent/x86_64/1"],
+            &host.join("cache"),
+            &store,
+            NOW,
+        );
+        assert!(partial.is_err());
+        assert!(graph(&moved).exists());
+        let record = host.join("cache").join(EXPORTED);
+        assert!(fs::read_to_string(&record).unwrap().contains(&moved));
+
+        // A damaged record starts again instead of failing every export.
+        fs::remove_file(&record).unwrap();
+        fs::create_dir(&record).unwrap();
+        fixture.export(&host).unwrap();
+        assert!(record.is_file());
     }
 
     #[test]
@@ -1631,6 +2208,7 @@ mod tests {
         fn ready(&self, source: FlathubSource) -> Result<Option<u64>, String> {
             let admission = Admission {
                 repository: &self.url,
+                feed: self.feed.as_deref(),
                 verify: verify_fixture,
                 validate: validate_fixture,
                 registry: &self.registry,

@@ -235,10 +235,15 @@ fn object_url(spec: &AcquireSpec, key: ObjectKey, feed: Option<&str>) -> Result<
 
 fn feed_path(spec: &AcquireSpec, key: ObjectKey) -> Result<String, String> {
     Ok(format!(
-        "ostree/{}/{}",
-        spec.commit.to_hex(),
+        "{}/{}",
+        feed_graph_base("", spec.commit).trim_start_matches('/'),
         key.relative_path()?
     ))
+}
+
+/// Where a feed serves one commit's graph, laid out as a repository.
+pub(crate) fn feed_graph_base(base: &str, commit: Checksum) -> String {
+    format!("{base}/ostree/{}", commit.to_hex())
 }
 
 fn read_regular_bounded(path: &Path, max_bytes: u64) -> Result<Vec<u8>, String> {

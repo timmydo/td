@@ -2698,13 +2698,24 @@ fn consume_source_pins(pins: &[SourcePin], dest: &Path, base: &str) -> Result<()
 }
 
 fn vm_feed_base(path: &Path, owner: u32) -> Result<String, String> {
+    read_vm_feed(path, owner)?
+        .ok_or_else(|| "requires TD_FEED_BASE or a provisioned VM feed endpoint".into())
+}
+
+/// The endpoint, or `None` when there is no file: one open decides, so a
+/// file removed in between reads as absent rather than as damage.
+fn read_vm_feed(path: &Path, owner: u32) -> Result<Option<String>, String> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     // Refuse a final symlink and avoid blocking on a substituted special file.
-    let file = std::fs::OpenOptions::new()
+    let file = match std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(OPEN_REGULAR_NOFOLLOW)
         .open(path)
-        .map_err(|e| format!("requires TD_FEED_BASE or a provisioned VM feed endpoint: {e}"))?;
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("open VM feed endpoint {}: {error}", path.display())),
+    };
     let meta = file.metadata().map_err(|e| e.to_string())?;
     if !meta.is_file() || meta.uid() != owner || meta.mode() & 0o022 != 0 {
         return Err("VM feed endpoint is not a compositor-owned regular file".into());
@@ -2724,7 +2735,16 @@ fn vm_feed_base(path: &Path, owner: u32) -> Result<String, String> {
                 .filter(|port| *port != 0 && port.to_string() == text)
         })
         .ok_or("VM feed endpoint must be canonical http://10.0.2.2:PORT")?;
-    Ok(format!("http://10.0.2.2:{port}"))
+    Ok(Some(format!("http://10.0.2.2:{port}")))
+}
+
+/// The VM feed endpoint when the host has provisioned one; td-app tries
+/// it before Flathub.
+pub(crate) fn provisioned_feed_base() -> Result<Option<String>, String> {
+    read_vm_feed(
+        &Path::new(td_engine::permissions::TD_COMPOSITOR_RUNTIME_PATH).join("vm-feed"),
+        td_engine::permissions::TD_COMPOSITOR_UID,
+    )
 }
 
 fn configured_consumer_feed_base() -> Result<String, String> {
@@ -3388,6 +3408,16 @@ pub fn run(a: &[String]) {
                 die(format!("{action} vendors: {error}"));
             }
         }
+        Some("export") if a.len() == 3 && a.get(2).map(String::as_str) == Some("flathub") => {
+            match crate::app::export_to(&feed_dir().join("store")) {
+                Ok(exported) => {
+                    for line in exported {
+                        println!("td-feed: exported {line}");
+                    }
+                }
+                Err(error) => die(format!("export flathub: {error}")),
+            }
+        }
         Some(action @ ("export" | "consume"))
             if a.len() == 3 && a.get(2).map(String::as_str) == Some("graphs") =>
         {
@@ -3497,7 +3527,7 @@ pub fn run(a: &[String]) {
                  td-feed warm ostree REPOSITORY REF COMMIT CONTENT DEST\n  \
                  td-feed debian-root resolve LOCK\n  \
                  td-feed serve STORE ADDR\n  \
-                 td-feed export sources  (publish existing host archives; no downloads)\n  td-feed consume sources  (TD_FEED_BASE or VM endpoint; no upstream fallback)\n  td-feed export cargo LOCK ARCHIVES\n  td-feed consume cargo LOCK ARCHIVES\n  td-feed export vendors [TARGET]\n  td-feed consume vendors [TARGET]\n  td-feed export graphs\n  td-feed consume graphs\n  td-feed ensure-serve\n  td-feed cargo-proxy STORE ADDR\n  td-feed selftest\n  \
+                 td-feed export sources  (publish existing host archives; no downloads)\n  td-feed consume sources  (TD_FEED_BASE or VM endpoint; no upstream fallback)\n  td-feed export cargo LOCK ARCHIVES\n  td-feed consume cargo LOCK ARCHIVES\n  td-feed export vendors [TARGET]\n  td-feed consume vendors [TARGET]\n  td-feed export graphs\n  td-feed consume graphs\n  td-feed export flathub  (declared Flathub refs, verified, for td-app; HOME cache)\n  td-feed ensure-serve\n  td-feed cargo-proxy STORE ADDR\n  td-feed selftest\n  \
                  td-feed cargo-proxy-selftest\n  td-feed warm-selftest"
             );
             std::process::exit(2);
@@ -3857,6 +3887,10 @@ pub(crate) mod tests {
         let path = dir.join("feed");
         let uid = std::fs::metadata(&dir).unwrap().uid();
         assert!(super::vm_feed_base(&path, uid).is_err());
+        // td-app reads no file as no feed, and anything else as the file.
+        assert_eq!(super::read_vm_feed(&path, uid), Ok(None));
+        std::os::unix::fs::symlink(dir.join("absent"), dir.join("dangling")).unwrap();
+        assert!(super::read_vm_feed(&dir.join("dangling"), uid).is_err());
         std::fs::write(&path, b"http://10.0.2.2:1234").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert_eq!(

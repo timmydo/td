@@ -11236,11 +11236,20 @@ differs from the selection's `package=`.
 audio, input, seccomp and network run through the autostarted Firefox
 (§H). Under the autotest token Firefox still starts at boot, and its
 first-run fetch uses the VM feed endpoint as transport: the integration
-tier's host warm runs the same `td-app` admission against Flathub and
-exports the admitted refs, commits, detached metadata and objects into
-the feed, and the guest re-verifies everything, signature included,
-before admitting it. The cost is that oracles need the network at warm
-time and the Firefox version they test floats with Flathub.
+tier's host warm is to run `td-feed export flathub`, which resolves every
+declared ref against Flathub under rules 1–2, fetches its graph, and
+publishes the graph, its detached metadata and last the ref into the
+feed, and the guest re-verifies everything, signature included, under
+all five rules before admitting it. td-app asks a provisioned feed first
+for each ref and asks Flathub when the feed lacks it; a ref the feed
+serves takes its commit, metadata and graph from the feed alone, and a
+feed answer that fails a rule is a refusal, not a reason to ask Flathub.
+The feed is trusted for freshness and availability, never integrity:
+whoever runs it can hold an account at any Flathub-signed commit at or
+above its floor, which on a fresh account is any such commit, so a feed
+belongs to the host that runs the guest. The cost is that oracles need
+the network at warm time and the Firefox version they test floats with
+Flathub.
 
 **What this reverses in §B.6.** A bounded OSTree client (exact refs,
 commits, detached metadata and `files/` objects, no summary browsing,
@@ -11268,7 +11277,8 @@ declared runtime ref, is foreign without a payload, and carries no
 build-time validator, since td-app validates it at admission; the
 tables step pairs it with that ref, and the profiler's root policy names
 the ref and adds no image root (landed seventh). (8) td-app's feed
-transport and the host export that replaces the graph transfer. (9) The
+transport and the host export that replaces the graph transfer (landed
+eighth). (9) The
 oracle boots that run an application reach that feed. (10) Cutover: the
 declaration-only Firefox package, Claude Code's runtime ref, autostart
 only under the autotest token, and deletion of the pins, payloads and

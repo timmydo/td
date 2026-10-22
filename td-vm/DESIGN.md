@@ -442,8 +442,22 @@ ordinary non-secret data in its volatile `/run/td-compositor/1000/vm-feed`.
 `td-feed consume sources` uses that compositor-owned regular file when
 `TD_FEED_BASE` is unset. An explicit environment value wins. This avoids
 changing login environments or requiring a new terminal after configuration.
-The explicit Cargo archive consumer described below uses the same endpoint.
-Host producer warm commands do not implicitly adopt it.
+The explicit Cargo archive consumer described below uses the same endpoint,
+and so does `td-app` (APPLICATIONS.md §W.9): it asks the feed first for each
+declared Flathub ref and asks Flathub only when the feed lacks one. Fill it
+with `td-feed export flathub` on the host, which resolves the declared refs
+against Flathub, verifies their signatures, fetches each graph into the
+account's `~/.td/flathub-export` cache, and publishes the graphs, their
+detached metadata and last the refs into td-feed's store. It later removes
+only graphs it created there, once no ref file names them; a graph already
+in the store when it first reached it is left. Until the cutover removes
+`export graphs`, a pinned commit this export placed first is its own, so run
+`export graphs` after it when both are in use. The guest
+verifies all of it again, but takes the feed's word for which signed commit
+is current, so the feed decides freshness, not integrity. Only `td-app
+update` reads the endpoint; a present file that is not canonical fails the
+update rather than sending it to Flathub. Host producer warm commands do
+not implicitly adopt it.
 
 The source archive consumer is `TD_FEED_BASE=http://HOST:PORT td-feed consume
 sources`. It resolves the checkout's recipe source pins, reads verified host
