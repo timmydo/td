@@ -231,8 +231,57 @@ Ordinary `migration import` retains its historical insert-only semantics.
 For supported present-message changes, import can establish new folders before
 stopping at the first changed message; plan/apply can then update existing
 messages, followed by import for new messages. An absent, locally changed or
-otherwise unsupported mapped message can still stop that later import before
-new messages are reached. There is no implicit skip or receipt advancement to
-hide that exception. Folder changes and explicit source-deletion evidence
-remain separate work. Omission from an archive never authorizes deletion.
+otherwise unsupported mapped message can still stop ordinary import before
+new messages are reached. Use the explicit new-object mode below to skip
+mapped objects without claiming synchronization. Folder changes and explicit
+source-deletion evidence remain separate work. Omission from an archive never authorizes deletion.
 Every report continues to carry `cutoverReady: false`.
+
+# Importing only unmapped objects
+
+Add `--only-unmapped` to `migration import` when a newer archive contains
+new mail alongside changed or locally deleted mapped objects:
+
+```text
+td-mta migration import --only-unmapped \
+  --archive /private/archive --max-bytes 1073741824 \
+  --connection-file /private/owner.connection --epoch EPOCH --account ACCOUNT
+```
+
+An existing exact destination-account/source-instance/source-account/kind/ID
+receipt causes a skip, regardless of its digest or whether the local object
+still exists. Skipping does not update the receipt, reset local metadata,
+resurrect a deleted object, charge storage, or publish JMAP changes. A skip
+means previously mapped, not currently synchronized. Reports distinguish
+`skippedMappedMailboxes`, `skippedMappedMessages`, newly created objects and
+`adoptedMailboxes` (a newly mapped preexisting Inbox).
+`historicalObjectsAbsent` counts skipped mappings whose local objects were
+absent when observed. Use retained plan/apply
+to inspect or reconcile existing message metadata separately.
+
+Archive structure and source binding remain validated. Skipped objects need
+neither body reads nor conversion into td-mta's narrower local metadata
+representation. Every body actually published is rehashed. New objects and
+their required folder definitions must satisfy all local representation and
+capacity limits; an unrelated skipped folder cannot become an unchecked
+creation dependency.
+
+A preliminary receipt lookup avoids unnecessary work. Creation rechecks
+receipt existence under the account write lock, so a competing import that
+establishes a receipt causes a skip, never duplication or overwrite. Under
+that same lock, new messages validate every referenced folder and ancestor;
+new child folders validate their parent and ancestors. Desired source folder
+metadata must match both the receipt and reconstructed current local folder.
+Missing, renamed, reparented or ambiguously mapped dependencies refuse the
+new object. Unrelated changed folders may be skipped. Ordinary import keeps
+its existing historical replay semantics.
+
+Each guarded Email publication keeps the 10-second operation deadline and
+40 MiB outbound allowance, with a 4 MiB inbound and 2,048-frame allowance for
+full dependency metadata. Guarded mailbox publication has 2 MiB outbound and
+the same inbound/frame limits. At most 256 required folder definitions and
+ancestors are admitted. Publication otherwise shares ordinary import's
+owner, epoch, selection, maintenance, quota and uncertain-commit handling.
+Earlier creations remain committed if a later object fails; keep the same
+archive after uncertainty. Reports retain `cutoverReady: false`. Skips and
+source omissions never authorize deletion or a domain switch.

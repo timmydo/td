@@ -2543,11 +2543,13 @@ fn real_postgres_executable_receives_and_serves_database_profiles() {
     exercise_configuration(ConfigurationExercise::AccountAdmin);
     exercise_configuration(ConfigurationExercise::Imports);
     exercise_configuration(ConfigurationExercise::Reconcile);
+    exercise_configuration(ConfigurationExercise::Unmapped);
     exercise_configuration(ConfigurationExercise::MultiAccount);
     exercise_configuration(ConfigurationExercise::Serving);
 }
 
 enum ConfigurationExercise {
+    Unmapped,
     Reconcile,
     Imports,
     AccountAdmin,
@@ -3212,6 +3214,10 @@ per_peer_limit = 1
         td_mta::postgres_accounts::prepare(epoch, account).unwrap(),
     )
     .unwrap();
+    if matches!(exercise, ConfigurationExercise::Unmapped) {
+        unmapped::exercise(&fixture, &request, &trust, epoch, &connection);
+        return;
+    }
     if matches!(exercise, ConfigurationExercise::Reconcile) {
         reconciliation::exercise(&fixture, &request, &trust, epoch, &connection);
         return;
@@ -3340,7 +3346,8 @@ per_peer_limit = 1
                 ConfigurationExercise::AccountAdmin
                 | ConfigurationExercise::MultiAccount
                 | ConfigurationExercise::Imports
-                | ConfigurationExercise::Reconcile => {
+                | ConfigurationExercise::Reconcile
+                | ConfigurationExercise::Unmapped => {
                     panic!("multi-account fixture must return before singleton exercises")
                 }
                 ConfigurationExercise::Client
@@ -12334,4 +12341,12 @@ fn real_postgres_import_reconciliation() {
 fn real_postgres_imports_preserve_source_snapshots() {
     exercise_configuration(ConfigurationExercise::Imports);
     exercise_configuration(ConfigurationExercise::Reconcile);
+}
+
+#[path = "postgres_probe/unmapped.rs"]
+mod unmapped;
+#[test]
+#[ignore = "real local PostgreSQL tools required"]
+fn real_postgres_import_unmapped() {
+    exercise_configuration(ConfigurationExercise::Unmapped);
 }

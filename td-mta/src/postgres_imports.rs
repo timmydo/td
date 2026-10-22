@@ -10,10 +10,11 @@ use std::time::Instant;
 use td_crypto::TrustStore;
 use tokio_postgres::Client;
 mod email;
+mod folders;
 mod mailbox;
 pub mod reconcile;
-pub use email::publish as publish_email;
-pub use mailbox::publish as publish_mailbox;
+pub use email::{publish as publish_email, publish_unmapped as publish_unmapped_email};
+pub use mailbox::{publish as publish_mailbox, publish_unmapped as publish_unmapped_mailbox};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
     Owner,
@@ -42,6 +43,8 @@ pub struct Authority {
 pub struct Outcome {
     pub local_object: [u8; 16],
     pub created: bool,
+    /// This invocation committed a new receipt, including Inbox adoption.
+    pub recorded: bool,
     pub present: bool,
 }
 pub fn prepare(
@@ -125,11 +128,11 @@ async fn begin(client: &Client, authority: &Authority) -> Result<u64, Error> {
     }
     Ok(old)
 }
-async fn mapped(
+async fn mapped_policy(
     client: &Client,
     authority: &Authority,
     key: &Key,
-    digest: &[u8; 32],
+    digest: Option<&[u8; 32]>,
     old: u64,
 ) -> Result<Option<Outcome>, Error> {
     let account = authority.account.as_bytes().as_slice();
@@ -138,7 +141,10 @@ async fn mapped(
         return Ok(None);
     };
     let stored: &[u8] = row.try_get(2).map_err(|_| Error::Integrity)?;
-    if stored != digest {
+    if stored.len() != 32 {
+        return Err(Error::Integrity);
+    }
+    if digest.is_some_and(|digest| stored != digest) {
         return Err(Error::SourceChanged);
     }
     if sequence(row.try_get(3).map_err(|_| Error::Integrity)?)? > old {
@@ -165,6 +171,7 @@ async fn mapped(
     Ok(Some(Outcome {
         local_object,
         created: false,
+        recorded: false,
         present,
     }))
 }
@@ -223,12 +230,38 @@ pub fn inspect(
     key: &Key,
     digest: &[u8; 32],
 ) -> Result<Option<Outcome>, Error> {
+    inspect_policy(request, trust, deadline, authority, key, Some(digest))
+}
+/// Presence of an exact source receipt is a skip, not synchronization evidence.
+pub fn inspect_mapping(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    authority: &Authority,
+    key: &Key,
+) -> Result<Option<Outcome>, Error> {
+    if !matches!(
+        key.kind,
+        crate::format::key::SourceKind::Mailbox | crate::format::key::SourceKind::Email
+    ) {
+        return Err(Error::Invalid);
+    }
+    inspect_policy(request, trust, deadline, authority, key, None)
+}
+fn inspect_policy(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    authority: &Authority,
+    key: &Key,
+    digest: Option<&[u8; 32]>,
+) -> Result<Option<Outcome>, Error> {
     if request.mode != Mode::Preparation {
         return Err(Error::Owner);
     }
     let authority = authority.clone();
     let key = key.clone();
-    let digest = *digest;
+    let digest = digest.copied();
     postgres_probe::with_mailbox_client(request, trust, deadline, move |client| {
         Box::pin(async move {
             let receipt = crate::postgres_schema::lock_and_inspect(client)
@@ -251,11 +284,11 @@ pub fn inspect(
                 )
                 .await
                 .map_err(|_| Error::Database)?;
-            mapped(
+            mapped_policy(
                 client,
                 &authority,
                 &key,
-                &digest,
+                digest.as_ref(),
                 sequence(row.try_get(0).map_err(|_| Error::Integrity)?)?,
             )
             .await
@@ -359,4 +392,7 @@ fn settled<T>(
         Err(_) if attempted.load(std::sync::atomic::Ordering::Relaxed) => Err(Error::Indeterminate),
         Err(error) => Err(Error::Connection(error)),
     }
+}
+fn fixed<const N: usize>(value: &[u8]) -> Result<[u8; N], Error> {
+    value.try_into().map_err(|_| Error::Integrity)
 }

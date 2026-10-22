@@ -3,6 +3,7 @@ mod archive;
 mod import;
 mod reconcile;
 mod source;
+mod unmapped;
 use std::{
     collections::BTreeMap,
     ffi::OsString,
@@ -87,6 +88,7 @@ pub fn command(args: impl Iterator<Item = OsString>) -> io::Result<std::process:
 }
 struct Options {
     action: String,
+    only_unmapped: bool,
     values: BTreeMap<String, String>,
 }
 fn arguments(mut args: impl Iterator<Item = OsString>) -> Result<Options> {
@@ -99,8 +101,16 @@ fn arguments(mut args: impl Iterator<Item = OsString>) -> Result<Options> {
         _ => return Err("migration-arguments"),
     };
     let mut values = BTreeMap::new();
+    let mut only_unmapped = false;
     while let Some(key) = args.next() {
         let key = key.into_string().map_err(|_| "migration-arguments")?;
+        if key == "--only-unmapped" {
+            if action != "import" || only_unmapped {
+                return Err("migration-arguments");
+            }
+            only_unmapped = true;
+            continue;
+        }
         if ![
             "--archive",
             "--max-bytes",
@@ -140,6 +150,7 @@ fn arguments(mut args: impl Iterator<Item = OsString>) -> Result<Options> {
     }
     Ok(Options {
         action: action.to_owned(),
+        only_unmapped,
         values,
     })
 }
@@ -175,7 +186,12 @@ fn run(options: Options) -> Result<Json> {
         );
     }
     if options.action == "import" {
-        return import::run(
+        let run = if options.only_unmapped {
+            unmapped::run
+        } else {
+            import::run
+        };
+        return run(
             &archive,
             get("--connection-file")?,
             get("--epoch")?,
@@ -440,6 +456,21 @@ mod tests {
             vec!["export", "--archive"],
         ] {
             assert!(arguments(args.into_iter().map(OsString::from)).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod unmapped_arguments {
+    use super::*;
+    #[test]
+    fn only_unmapped_is_an_import_only_single_flag() {
+        let parse = |args: &[&str]| arguments(args.iter().map(OsString::from));
+        assert!(parse(&["import", "--only-unmapped"]).is_ok_and(|v| v.only_unmapped));
+        assert!(parse(&["import"]).is_ok_and(|v| !v.only_unmapped));
+        assert!(parse(&["import", "--only-unmapped", "--only-unmapped"]).is_err());
+        for action in ["export", "verify", "plan", "apply"] {
+            assert!(parse(&[action, "--only-unmapped"]).is_err());
         }
     }
 }

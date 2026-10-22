@@ -202,6 +202,7 @@ pub(crate) fn with_import_client<T>(
     request: &Request<'_>,
     trust: &TrustStore,
     deadline: Instant,
+    guarded: bool,
     operation: impl for<'a> FnOnce(&'a tokio_postgres::Client) -> Pin<Box<dyn Future<Output = T> + 'a>>,
 ) -> Result<T, Error> {
     with_output_limit(
@@ -209,7 +210,33 @@ pub(crate) fn with_import_client<T>(
         trust,
         deadline,
         40 * 1024 * 1024,
-        Input::imports(),
+        if guarded {
+            Input::reconciliation()
+        } else {
+            Input::imports()
+        },
+        operation,
+    )
+}
+
+// New-only mailbox creation also checks bounded parent/ancestor metadata.
+pub(crate) fn with_import_mailbox_client<T>(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    guarded: bool,
+    operation: impl for<'a> FnOnce(&'a tokio_postgres::Client) -> Pin<Box<dyn Future<Output = T> + 'a>>,
+) -> Result<T, Error> {
+    with_output_limit(
+        request,
+        trust,
+        deadline,
+        if guarded { 2 * 1024 * 1024 } else { 128 * 1024 },
+        if guarded {
+            Input::reconciliation()
+        } else {
+            Input::mutations()
+        },
         operation,
     )
 }

@@ -2228,7 +2228,8 @@ keywords/read state when available at little extra cost. Stable remote IDs are
 recorded for resumability, not reused as local pathnames. The provisional
 export/verify commands and their archive bounds are specified in
 `MIGRATION.md`, including its resumable insert-only PostgreSQL importer and
-retained plans for existing-message keyword/membership reconciliation;
+retained plans for existing-message keyword/membership reconciliation,
+and explicit only-unmapped import with same-transaction folder checks;
 they do not grant final-cutover authority. No identities, rules,
 contacts, calendars, account passwords, or server configuration are migrated.
 

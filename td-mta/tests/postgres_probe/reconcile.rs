@@ -374,7 +374,9 @@ fn bounds(
         .collect();
     let mailbox_refs: Vec<_> = sources.iter().map(|s| s.as_bytes()).collect();
     let keyword_refs: Vec<_> = keywords.iter().map(String::as_str).collect();
-    let body = b"Message-ID: <capacity@example.test>\r\n\r\npayload";
+    let mut large = b"Message-ID: <capacity@example.test>\r\n\r\npayload".to_vec();
+    large.resize(32 * 1024 * 1024, b'x');
+    let body = large.as_slice();
     let mut hash = td_crypto::Sha256::try_new().unwrap();
     hash.update(body).unwrap();
     let digest = hash.finish().unwrap();
@@ -392,7 +394,19 @@ fn bounds(
         .unwrap()
     };
     let initial = value(&keyword_refs);
-    db::publish_email(request, trust, deadline(), authority, &initial, body).unwrap();
+    assert!(
+        db::publish_unmapped_email(
+            request,
+            trust,
+            deadline(),
+            authority,
+            &initial,
+            body,
+            &folders
+        )
+        .unwrap()
+        .recorded
+    );
     let extra = "z".repeat(255);
     let mut flags = keyword_refs;
     flags[0] = &extra;
