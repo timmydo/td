@@ -400,3 +400,55 @@ result nor a replay establishes account-wide synchronization. Replan after
 completion, resolve every exception, and verify the desired source inventory
 separately. Reports retain `cutoverReady: false`; source omissions still do
 not authorize deletion.
+
+# Explicit source message deletions
+
+Preserve a complete private copy of the preceding archive before refreshing
+it. The previous and current archives must retain the identical `source.json`
+binding; an unrelated fresh export is not a deletion baseline. Retain both
+archives and the exact plan throughout reconciliation and recovery.
+
+With the source quiescent, its account permissions checked, and its current
+export complete, generate a separate deletion plan:
+
+```text
+td-mta migration deletion-plan --archive /home/operator/current-archive \
+  --previous-archive /home/operator/previous-archive --max-bytes 10737418240 \
+  --session https://mail.example.test/.well-known/jmap --username user@example.test \
+  --password-file /home/operator/private/source.password \
+  --connection-file /home/operator/private/owner.connection \
+  --epoch TARGET_EPOCH --account TARGET_ACCOUNT
+```
+
+Here `--account` identifies the PostgreSQL target; the source account comes
+from the matching archive binding. The explicit Session and username must
+match that binding. Optional `--ca-file` retains command-local trust. Capture
+successful JSON into a mode-0600 plan in a private parent, inspect every
+entry, and use the identical arguments with `deletion-apply` and
+`--plan-file /home/operator/private/deletions.json` to apply it.
+
+Both commands verify both archives, compare the current archive with a fresh
+account-wide query, and require explicit `Email/get` `notFound` responses for
+every candidate at the retained state. Apply checks each candidate's absence and the retained Email state again
+before its deletion. Both account states fence the complete pass; a final check
+checks completion. Source omission alone never grants deletion authority.
+`notFound` can also mean lost visibility: neither the protocol nor this tool
+can prove that the source permissions remained sufficient. The operator must
+verify access and deliberately select source deletions while the source is
+quiet; these commands do not freeze it or synchronize two live writers.
+
+A `delete` entry binds both manifest digests, source identity, target epoch
+and account, local object, historical blob, old source digest and receipt
+sequence. Under the target account lock, apply verifies the retained receipt,
+exclusive source mapping and current message metadata. Changed local mail,
+changed receipts and other sources refuse; unmapped and already absent
+objects are observations. Target-only new mail is never a candidate.
+
+Deletion reuses the ordinary Email destruction transaction for membership,
+keywords, thread ownership, shared-body retention, quota release and JMAP
+history. It keeps the import receipt permanently: repeating the plan observes
+absence, and importing the old source object cannot resurrect it. A lost
+commit response requires retrying the exact retained plan. Earlier deletions
+remain committed if a later source fence or local conflict fails; preserve
+the reports and resolve the failure rather than regenerating fences blindly.
+Folders are not deleted by this command. Every report remains provisional.

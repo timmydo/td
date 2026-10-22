@@ -296,6 +296,16 @@ impl Source {
         }
         Ok(list.to_vec())
     }
+    pub fn absent(&self, ids: &[String], state: &str) -> Result<()> {
+        if ids.len() > 64 {
+            return Err("migration-capacity");
+        }
+        let result = self.call(
+            "Email/get",
+            json!({"accountId":self.account,"ids":ids,"properties":["id"]}),
+        )?;
+        absent_reply(&result, ids, state)
+    }
     pub fn download_url(&self, blob: &str) -> Result<String> {
         identifier(blob)?;
         let mut url = self.download.clone();
@@ -501,6 +511,53 @@ mod fallback_tests {
             json!({"state":"s","notFound":[],"list":vec![json!({"id":"x"});MAILBOX_LIMIT+1]}),
         ] {
             assert!(all_mailboxes(&bad, "s").is_err());
+        }
+    }
+}
+
+fn absent_reply(result: &Json, ids: &[String], state: &str) -> Result<()> {
+    if string(result, "state")? != state {
+        return Err("migration-source-changed");
+    }
+    if !array(result, "list")?.is_empty() {
+        return Err("migration-source-object-present");
+    }
+    let mut remaining: std::collections::BTreeSet<_> = ids.iter().map(String::as_str).collect();
+    if remaining.len() != ids.len() {
+        return Err("migration-duplicate-id");
+    }
+    for id in array(result, "notFound")? {
+        if !remaining.remove(id.as_str().ok_or("migration-invalid-id")?) {
+            return Err("migration-unrequested-object");
+        }
+    }
+    if !remaining.is_empty() {
+        return Err("migration-source-absence-unproven");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod absence_tests {
+    use super::*;
+    #[test]
+    fn absence_requires_exact_not_found_and_unchanged_state() {
+        let ids = vec!["one".to_owned(), "two".to_owned()];
+        assert!(absent_reply(
+            &json!({"state":"e","list":[],"notFound":["two","one"]}),
+            &ids,
+            "e"
+        )
+        .is_ok());
+        for response in [
+            json!({"state":"other","list":[],"notFound":["one","two"]}),
+            json!({"state":"e","list":[{"id":"one"}],"notFound":["two"]}),
+            json!({"state":"e","list":[],"notFound":["one"]}),
+            json!({"state":"e","list":[],"notFound":["one","one"]}),
+            json!({"state":"e","list":[],"notFound":["one","other"]}),
+            json!({"state":"e","list":[],"notFound":["one","two","extra"]}),
+        ] {
+            assert!(absent_reply(&response, &ids, "e").is_err());
         }
     }
 }

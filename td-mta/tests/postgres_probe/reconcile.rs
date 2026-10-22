@@ -218,6 +218,7 @@ pub fn exercise(
     assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "0");
     cli(fixture, connection, epoch, account);
     bounds(fixture, request, trust, &authority, folders);
+    deletion_checks(fixture, request, trust, &authority);
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -431,4 +432,124 @@ fn bounds(
         "256"
     );
     assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.keywords WHERE email_id=(SELECT local_object FROM td_mta.imports WHERE source_object=convert_to('capacity','UTF8'))"), "256");
+}
+
+fn deletion_checks(
+    fixture: &Fixture,
+    request: &Request<'_>,
+    trust: &TrustStore,
+    authority: &db::Authority,
+) {
+    use td_mta::postgres_imports::reconcile::deletion::{self, Applied, Plan};
+    let raw = b"Message-ID: <deletion@example.test>\r\n\r\nkeep raw";
+    let value = email("delete-one", raw, &["$seen"]);
+    let other = email("delete-two", raw, &["$seen"]);
+    let plan =
+        |value: &Email| deletion::plan(request, trust, deadline(), authority, value).unwrap();
+    assert!(matches!(plan(&value), Plan::Unmapped));
+    let first = db::publish_email(request, trust, deadline(), authority, &value, raw).unwrap();
+    let second = db::publish_email(request, trust, deadline(), authority, &other, raw).unwrap();
+    let retained = match plan(&value) {
+        Plan::Delete(b) => b,
+        _ => panic!("expected delete"),
+    };
+    let apply = |baseline: &deletion::Baseline| {
+        deletion::apply(request, trust, deadline(), authority, &value, baseline)
+    };
+    let id = hex(&first.local_object);
+    let other_id = hex(&second.local_object);
+    let invariant = || {
+        sql(fixture,&format!("SELECT encode(e.blob_id,'hex'),encode(e.thread_id,'hex'),e.received_at,b.length,encode(b.digest,'hex') FROM td_mta.emails e JOIN td_mta.blobs b ON b.account=e.account AND b.id=e.blob_id WHERE e.id=decode('{other_id}','hex')"))
+    };
+    let untouched = invariant();
+    let before = sql(fixture, "SELECT count(*),sum(length) FROM td_mta.blobs");
+    sql(fixture,&format!("INSERT INTO td_mta.imports SELECT account,source_instance,source_kind,source_account,convert_to('delete-alias','UTF8'),local_object,historical_blob,source_digest,changed FROM td_mta.imports WHERE local_object=decode('{id}','hex')"));
+    assert!(matches!(plan(&value), Plan::Conflict));
+    assert_eq!(apply(&retained), Err(db::Error::Conflict));
+    sql(
+        fixture,
+        "DELETE FROM td_mta.imports WHERE source_object=convert_to('delete-alias','UTF8')",
+    );
+    let mut wrong = retained.clone();
+    wrong.account = AccountId::from_bytes([0; 16]);
+    assert_eq!(apply(&wrong), Err(db::Error::Invalid));
+    let mut wrong = retained.clone();
+    wrong.local = second.local_object;
+    assert_eq!(apply(&wrong), Err(db::Error::Conflict));
+    let mut wrong = retained.clone();
+    wrong.changed += 1;
+    assert_eq!(apply(&wrong), Err(db::Error::Conflict));
+    sql(
+        fixture,
+        &format!("UPDATE td_mta.keywords SET keyword='local' WHERE email_id=decode('{id}','hex')"),
+    );
+    assert!(matches!(plan(&value), Plan::Conflict));
+    assert_eq!(apply(&retained), Err(db::Error::Conflict));
+    sql(
+        fixture,
+        &format!("UPDATE td_mta.keywords SET keyword='$seen' WHERE email_id=decode('{id}','hex')"),
+    );
+    assert_eq!(apply(&retained), Ok(Applied::Deleted));
+    assert_eq!(invariant(), untouched);
+    assert_ne!(
+        sql(fixture, "SELECT count(*),sum(length) FROM td_mta.blobs"),
+        before
+    );
+    assert_eq!(
+        sql(
+            fixture,
+            &format!("SELECT count(*) FROM td_mta.emails WHERE id=decode('{id}','hex')")
+        ),
+        "0"
+    );
+    assert_eq!(
+        sql(
+            fixture,
+            &format!("SELECT count(*) FROM td_mta.imports WHERE local_object=decode('{id}','hex')")
+        ),
+        "1"
+    );
+    assert_eq!(sql(fixture,&format!("SELECT count(*) FROM td_mta.changes WHERE object=decode('{id}','hex') AND kind=3 AND action=3")),"1");
+    let after=sql(fixture,"SELECT encode(sequence,'hex'),(SELECT count(*) FROM td_mta.changes), (SELECT sum(body_bytes) FROM td_mta.account_usage) FROM td_mta.accounts");
+    assert_eq!(apply(&retained), Ok(Applied::Absent));
+    assert!(matches!(plan(&value), Plan::Absent));
+    assert!(
+        !db::publish_email(request, trust, deadline(), authority, &value, raw)
+            .unwrap()
+            .present
+    );
+    assert_eq!(after,sql(fixture,"SELECT encode(sequence,'hex'),(SELECT count(*) FROM td_mta.changes), (SELECT sum(body_bytes) FROM td_mta.account_usage) FROM td_mta.accounts"));
+    let second_plan = match plan(&other) {
+        Plan::Delete(b) => b,
+        _ => panic!("expected delete"),
+    };
+    let old = u64::from_str_radix(
+        &sql(
+            fixture,
+            "SELECT encode(sequence,'hex') FROM td_mta.accounts",
+        ),
+        16,
+    )
+    .unwrap();
+    sql(fixture,"CREATE FUNCTION public.delay_import_delete() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(11); RETURN OLD; END $$; CREATE CONSTRAINT TRIGGER delay_import_delete AFTER DELETE ON td_mta.emails DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_import_delete()");
+    assert_eq!(
+        deletion::apply(request, trust, deadline(), authority, &other, &second_plan),
+        Err(db::Error::Indeterminate)
+    );
+    sql(fixture, "DROP TRIGGER delay_import_delete ON td_mta.emails");
+    assert!(matches!(
+        deletion::apply(request, trust, deadline(), authority, &other, &second_plan),
+        Ok(Applied::Deleted | Applied::Absent)
+    ));
+    assert_eq!(
+        u64::from_str_radix(
+            &sql(
+                fixture,
+                "SELECT encode(sequence,'hex') FROM td_mta.accounts"
+            ),
+            16
+        )
+        .unwrap(),
+        old + 1
+    );
 }

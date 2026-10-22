@@ -1,6 +1,7 @@
 //! Provisional, resumable JMAP export. Archives grant no cutover authority.
 mod archive;
 mod compare;
+mod deletions;
 mod folder_reconcile;
 mod import;
 mod inventory;
@@ -104,6 +105,8 @@ fn arguments(mut args: impl Iterator<Item = OsString>) -> Result<Options> {
         Some("import") => "import",
         Some("plan") => "plan",
         Some("apply") => "apply",
+        Some("deletion-plan") => "deletion-plan",
+        Some("deletion-apply") => "deletion-apply",
         _ => return Err("migration-arguments"),
     };
     let mut values = BTreeMap::new();
@@ -128,6 +131,7 @@ fn arguments(mut args: impl Iterator<Item = OsString>) -> Result<Options> {
         if ![
             "--archive",
             "--against-archive",
+            "--previous-archive",
             "--max-bytes",
             "--session",
             "--account",
@@ -153,7 +157,9 @@ fn arguments(mut args: impl Iterator<Item = OsString>) -> Result<Options> {
             || (key == "--against-archive" && action != "compare")
             || (action == "compare"
                 && !["--archive", "--against-archive", "--max-bytes"].contains(&key.as_str()))
-            || (key == "--plan-file" && action != "apply")
+            || (key == "--plan-file" && !matches!(action, "apply" | "deletion-apply"))
+            || (key == "--previous-archive"
+                && !matches!(action, "deletion-plan" | "deletion-apply"))
             || (matches!(action, "export" | "inventory")
                 && ["--connection-file", "--epoch"].contains(&key.as_str()))
         {
@@ -189,6 +195,10 @@ fn run(options: Options) -> Result<Json> {
         return Err("migration-arguments");
     }
     let mut archive = archive::Archive::open(get("--archive")?, maximum)?;
+    if matches!(options.action.as_str(), "deletion-plan" | "deletion-apply") {
+        let previous = archive::Archive::open(get("--previous-archive")?, maximum)?;
+        return deletions::run(&archive, &previous, &options);
+    }
     if options.action == "compare" {
         let against = archive::Archive::open(get("--against-archive")?, maximum)?;
         return compare::run(&archive, &against);
@@ -506,6 +516,11 @@ mod tests {
             vec!["compare", "--connection-file", "owner"],
             vec!["compare", "--session", "https://example.test"],
             vec!["export", "--against-archive", "other"],
+            vec!["export", "--previous-archive", "other"],
+            vec!["deletion-plan", "--plan-file", "plan"],
+            vec!["deletion-plan", "--mailboxes"],
+            vec!["deletion-apply", "--only-unmapped"],
+            vec!["deletion-apply", "--against-archive", "other"],
         ] {
             assert!(arguments(args.into_iter().map(OsString::from)).is_err());
         }

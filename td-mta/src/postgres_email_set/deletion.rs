@@ -55,15 +55,32 @@ pub(super) async fn apply(
     change: &Change,
     old: u64,
 ) -> Result<(u64, Vec<UpdateResult>), Error> {
-    let account = change.binding.account();
+    let emails: Vec<_> = change.updates.iter().map(|update| update.email).collect();
+    apply_ids(client, change.binding.account(), &emails, old).await
+}
+
+// Caller holds the account publication lock and owns authorization/settlement.
+pub(crate) async fn apply_ids(
+    client: &Client,
+    account: crate::ids::AccountId,
+    emails: &[EmailId],
+    old: u64,
+) -> Result<(u64, Vec<UpdateResult>), Error> {
+    if emails.len() > MAX_UPDATES {
+        return Err(Error::Capacity);
+    }
     let account = account.as_bytes().as_slice();
     let before = old.to_be_bytes();
     let mut requested = Vec::new();
     requested
-        .try_reserve_exact(change.updates.len())
+        .try_reserve_exact(emails.len())
         .map_err(|_| Error::Capacity)?;
-    for update in &change.updates {
-        requested.push(update.email.as_bytes().as_slice());
+    for email in emails {
+        let id = email.as_bytes().as_slice();
+        if requested.contains(&id) {
+            return Err(Error::Invalid);
+        }
+        requested.push(id);
     }
     let rows = client.query("SELECT q.ordinality,e.id,e.changed,e.blob_id,b.changed,e.thread_id,t.changed,k.n,k.valid,a.n,a.valid FROM unnest($2::bytea[]) WITH ORDINALITY q(id,ordinality) LEFT JOIN td_mta.emails e ON e.account=$1 AND e.id=q.id LEFT JOIN td_mta.blobs b ON b.account=e.account AND b.id=e.blob_id LEFT JOIN td_mta.threads t ON t.account=e.account AND t.id=e.thread_id CROSS JOIN LATERAL (SELECT count(*) n,coalesce(bool_and(changed<=$3),true) valid FROM (SELECT changed FROM td_mta.keywords WHERE account=e.account AND email_id=e.id LIMIT 257) v) k CROSS JOIN LATERAL (SELECT count(*) n,coalesce(bool_and(changed<=$3),true) valid FROM (SELECT changed FROM td_mta.thread_anchors WHERE account=e.account AND email_id=e.id LIMIT 2) v) a ORDER BY q.ordinality", &[&account,&requested,&before.as_slice()]).await.map_err(|_| Error::Database)?;
     if rows.len() != requested.len() {

@@ -1,4 +1,5 @@
 //! Owner-selected source metadata reconciliation, with retained receipt fences.
+pub mod deletion;
 use super::*;
 use crate::{
     format::key::SourceKind,
