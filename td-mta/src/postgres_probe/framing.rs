@@ -58,6 +58,14 @@ impl Input {
         }
     }
 
+    pub(super) fn reconciliation() -> Self {
+        Self {
+            bytes: 4 * 1024 * 1024,
+            frames: 2048,
+            ..Self::new()
+        }
+    }
+
     pub(super) fn fanout(accounts: usize) -> Self {
         Self {
             bytes: 1024 * 1024 * accounts,
@@ -338,6 +346,23 @@ mod tests {
             }
             assert!(input.accept(&packet).is_err());
         }
+    }
+
+    #[test]
+    fn reconciliation_budget_bounds_full_metadata_without_replenishment() {
+        let mut input = Input::reconciliation();
+        let packet = frame(b'D', &[0; 128 * 1024 - 4]);
+        for _ in 0..31 {
+            assert!(input.accept(&packet).is_ok());
+        }
+        assert!(input.accept(&packet).is_err());
+        assert!(input.accept(&[]).is_err());
+        let mut input = Input::reconciliation();
+        for _ in 0..2048 {
+            assert!(input.accept(&frame(b'N', b"\0")).is_ok());
+        }
+        assert!(input.accept(&frame(b'N', b"\0")).is_err());
+        assert!(Input::reconciliation().accept(&frame(b'Z', b"I")).is_err());
     }
 
     #[test]

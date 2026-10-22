@@ -1,6 +1,7 @@
 //! Provisional, resumable JMAP export. Archives grant no cutover authority.
 mod archive;
 mod import;
+mod reconcile;
 mod source;
 use std::{
     collections::BTreeMap,
@@ -93,6 +94,8 @@ fn arguments(mut args: impl Iterator<Item = OsString>) -> Result<Options> {
         Some("export") => "export",
         Some("verify") => "verify",
         Some("import") => "import",
+        Some("plan") => "plan",
+        Some("apply") => "apply",
         _ => return Err("migration-arguments"),
     };
     let mut values = BTreeMap::new();
@@ -108,18 +111,21 @@ fn arguments(mut args: impl Iterator<Item = OsString>) -> Result<Options> {
             "--ca-file",
             "--connection-file",
             "--epoch",
+            "--plan-file",
         ]
         .contains(&key.as_str())
             || (action == "verify" && !["--archive", "--max-bytes"].contains(&key.as_str()))
-            || (action == "import"
+            || (matches!(action, "import" | "plan" | "apply")
                 && ![
                     "--archive",
                     "--max-bytes",
                     "--connection-file",
                     "--epoch",
                     "--account",
+                    "--plan-file",
                 ]
                 .contains(&key.as_str()))
+            || (key == "--plan-file" && action != "apply")
             || (action == "export" && ["--connection-file", "--epoch"].contains(&key.as_str()))
         {
             return Err("migration-arguments");
@@ -154,6 +160,19 @@ fn run(options: Options) -> Result<Json> {
     let mut archive = archive::Archive::open(get("--archive")?, maximum)?;
     if options.action == "verify" {
         return archive.verify();
+    }
+    if matches!(options.action.as_str(), "plan" | "apply") {
+        return reconcile::run(
+            &archive,
+            get("--connection-file")?,
+            get("--epoch")?,
+            get("--account")?,
+            if options.action == "apply" {
+                Some(get("--plan-file")?)
+            } else {
+                None
+            },
+        );
     }
     if options.action == "import" {
         return import::run(

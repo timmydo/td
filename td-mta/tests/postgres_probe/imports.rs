@@ -9,11 +9,11 @@ use td_mta::{
     postgres_imports as db,
     postgres_probe::Request,
 };
-fn write(path: &Path, bytes: &[u8]) {
+pub(super) fn write(path: &Path, bytes: &[u8]) {
     fs::write(path, bytes).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
 }
-fn key(id: &str, kind: SourceKind) -> Key {
+pub(super) fn key(id: &str, kind: SourceKind) -> Key {
     Key::new(
         InstanceId::from_bytes([5; 16]),
         kind,
@@ -22,7 +22,12 @@ fn key(id: &str, kind: SourceKind) -> Key {
     )
     .unwrap()
 }
-fn folder(id: &str, name: &str, parent: Option<&[u8]>, role: Option<&str>) -> snapshot::Mailbox {
+pub(super) fn folder(
+    id: &str,
+    name: &str,
+    parent: Option<&[u8]>,
+    role: Option<&str>,
+) -> snapshot::Mailbox {
     snapshot::Mailbox::new(
         key(id, SourceKind::Mailbox),
         snapshot::MailboxInput {
@@ -35,7 +40,7 @@ fn folder(id: &str, name: &str, parent: Option<&[u8]>, role: Option<&str>) -> sn
     )
     .unwrap()
 }
-fn email(id: &str, body: &[u8], keywords: &[&str]) -> snapshot::Email {
+pub(super) fn email(id: &str, body: &[u8], keywords: &[&str]) -> snapshot::Email {
     let mut hash = Sha256::try_new().unwrap();
     hash.update(body).unwrap();
     snapshot::Email::new(

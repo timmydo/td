@@ -11,6 +11,7 @@ use td_crypto::TrustStore;
 use tokio_postgres::Client;
 mod email;
 mod mailbox;
+pub mod reconcile;
 pub use email::publish as publish_email;
 pub use mailbox::publish as publish_mailbox;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -349,10 +350,10 @@ async fn commit(client: &Client, marker: &std::sync::atomic::AtomicBool) -> Resu
         .await
         .map_err(|_| Error::Indeterminate)
 }
-fn settled(
-    result: Result<Result<Outcome, Error>, postgres_probe::Error>,
+fn settled<T>(
+    result: Result<Result<T, Error>, postgres_probe::Error>,
     attempted: &std::sync::atomic::AtomicBool,
-) -> Result<Outcome, Error> {
+) -> Result<T, Error> {
     match result {
         Ok(result) => result,
         Err(_) if attempted.load(std::sync::atomic::Ordering::Relaxed) => Err(Error::Indeterminate),

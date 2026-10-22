@@ -214,6 +214,23 @@ pub(crate) fn with_import_client<T>(
     )
 }
 
+// Reconciliation reads complete bounded source and local folder metadata.
+pub(crate) fn with_reconcile_client<T>(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    operation: impl for<'a> FnOnce(&'a tokio_postgres::Client) -> Pin<Box<dyn Future<Output = T> + 'a>>,
+) -> Result<T, Error> {
+    with_output_limit(
+        request,
+        trust,
+        deadline,
+        2 * 1024 * 1024,
+        Input::reconciliation(),
+        operation,
+    )
+}
+
 // One SMTP transaction publishes a separate blob and receipt per local account.
 pub(crate) fn with_fanout_client<T>(
     request: &Request<'_>,

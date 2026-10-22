@@ -14,7 +14,7 @@ pub enum Error {
     Capacity,
     Digest,
 }
-#[derive(Clone)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct Key {
     pub(crate) instance: InstanceId,
     pub(crate) kind: SourceKind,

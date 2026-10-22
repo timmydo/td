@@ -24,27 +24,7 @@ pub(super) fn run(
     // immediately before use while the cooperative archive lock remains held.
     let mailboxes = mailboxes(&manifest, instance, source_account)?;
     let messages = messages(&manifest, instance, source_account)?;
-    let loaded = Loaded::open(connection, "migration").map_err(|_| "migration-connection-file")?;
-    let executable = std::env::current_exe().map_err(|_| "migration-resolver")?;
-    let addresses = crate::postgres_resolver::resolve(
-        &executable,
-        &loaded.bootstrap,
-        Instant::now() + Duration::from_secs(5),
-    )
-    .map_err(|_| "migration-resolver")?;
-    let mut selected = None;
-    for address in addresses {
-        let request = loaded.bootstrap.request(address);
-        match database::prepare(&request, &loaded.trust, deadline(), epoch, account) {
-            Ok(authority) => {
-                selected = Some((address, authority));
-                break;
-            }
-            Err(database::Error::Connection(_)) => {}
-            Err(error) => return Err(code(error)),
-        }
-    }
-    let (address, authority) = selected.ok_or("migration-database-connection")?;
+    let (loaded, address, authority) = connect(connection, epoch, account)?;
     let request = loaded.bootstrap.request(address);
     let mut created_mailboxes = 0usize;
     let mut created_messages = 0usize;
@@ -74,10 +54,38 @@ pub(super) fn run(
         json!({"status":"imported-provisional","mailboxes":mailboxes.len(),"messages":messages.len(),"createdMailboxes":created_mailboxes,"createdMessages":created_messages,"historicalObjectsAbsent":absent,"manifestSha256":digest(manifest.to_string().as_bytes())?,"cutoverReady":false}),
     )
 }
-fn deadline() -> Instant {
+pub(super) fn connect(
+    connection: &str,
+    epoch: StoreEpoch,
+    account: AccountId,
+) -> Result<(Loaded, std::net::IpAddr, database::Authority)> {
+    let loaded = Loaded::open(connection, "migration").map_err(|_| "migration-connection-file")?;
+    let executable = std::env::current_exe().map_err(|_| "migration-resolver")?;
+    let addresses = crate::postgres_resolver::resolve(
+        &executable,
+        &loaded.bootstrap,
+        Instant::now() + Duration::from_secs(5),
+    )
+    .map_err(|_| "migration-resolver")?;
+    let mut selected = None;
+    for address in addresses {
+        let request = loaded.bootstrap.request(address);
+        match database::prepare(&request, &loaded.trust, deadline(), epoch, account) {
+            Ok(authority) => {
+                selected = Some((address, authority));
+                break;
+            }
+            Err(database::Error::Connection(_)) => {}
+            Err(error) => return Err(code(error)),
+        }
+    }
+    let (address, authority) = selected.ok_or("migration-database-connection")?;
+    Ok((loaded, address, authority))
+}
+pub(super) fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(10)
 }
-fn code(error: database::Error) -> &'static str {
+pub(super) fn code(error: database::Error) -> &'static str {
     use database::Error as E;
     match error {
         E::Owner => "migration-owner-required",
@@ -103,7 +111,7 @@ fn optional<'a>(value: &'a Json, key: &str) -> Result<Option<&'a str>> {
         _ => Err("migration-invalid-field"),
     }
 }
-fn mailboxes(
+pub(super) fn mailboxes(
     manifest: &Json,
     instance: InstanceId,
     account: &[u8],
@@ -147,7 +155,7 @@ fn mailboxes(
     }
     Ok(output)
 }
-fn messages(
+pub(super) fn messages(
     manifest: &Json,
     instance: InstanceId,
     account: &[u8],

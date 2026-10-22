@@ -257,6 +257,14 @@ canonical source snapshot defined below, not a digest of local IDs or JMAP
 JSON spelling. Import's source kind, instance/account/object IDs stay in its
 key; compare key and digest together to resume an identical object.
 
+Owner-side metadata reconciliation may advance an Email receipt's source
+digest and PostgreSQL `changed` sequence together with its keyword/membership
+update. Its source key, local object and historical blob stay fixed. A retained
+plan compares both the old digest and sequence, so returning to an earlier
+digest does not revive an old transition. The latest receipt is not a journal
+of every source snapshot or proof that a particular historical plan executed.
+MIGRATION.md owns the current-state checks and retry reporting.
+
 ### Import source snapshot preimages
 
 These preimages are the migration interchange contract implemented by the

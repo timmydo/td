@@ -157,3 +157,82 @@ its source instance to bypass an error. A successful report is explicitly
 reconciliation or authority to change DNS. Exporting td-mta uses the bounded Mailbox/get fallback above; a verified
 archive still requires a separate reverse import and reconciliation before
 redirecting delivery to the old service.
+
+# Retained plans for existing message metadata
+
+`migration plan` compares a selected archive with already imported messages.
+`migration apply` changes only their keywords and folder memberships, using
+the exact retained plan. Raw bytes, received dates, blob ownership, thread
+assignment and storage accounting remain unchanged. These commands create
+and delete nothing, and do not rename or reparent folders.
+
+Store the plan outside the archive, in an owner-only directory, with mode
+0600. For example, after exporting, verifying and initially importing:
+
+```text
+umask 077
+td-mta migration plan --archive /private/archive --max-bytes 1073741824 \
+  --connection-file /private/owner.connection --epoch EPOCH --account ACCOUNT \
+  > /private/plan.json
+td-mta migration apply --archive /private/archive --max-bytes 1073741824 \
+  --connection-file /private/owner.connection --epoch EPOCH --account ACCOUNT \
+  --plan-file /private/plan.json
+```
+
+Inspect the plan before applying it. Each archive message has one status:
+
+- `update`: supported source metadata changes with an unchanged local copy.
+- `matches-at-observation`: source, receipt and local metadata matched when
+  inspected; this is not a promise that clients cannot change them afterward.
+- `historical-object-absent`: its mapped local message was deleted.
+- `local-conflict`: local metadata or provenance no longer matches its receipt,
+  including unmapped or ambiguous folder memberships.
+- `immutable-source-change`: source bytes, length or received date changed.
+- `folder-conflict`: a referenced folder or ancestor is missing, changed or
+  ambiguously mapped, or its source metadata changed.
+- `unmapped`: the message has not been imported.
+
+Only `update` entries are applied. Other entries remain explicit skipped
+observations, not successful reconciliation. An applied result distinguishes
+`updated`, `current-receipt-matches`, and `historical-object-absent`.
+The current-receipt result acknowledges the latest stored source digest; it
+does not prove execution of this particular historical plan, nor reset later
+local edits. Missing local messages are never recreated.
+
+A plan binds the exact desired manifest, source instance/account, destination
+epoch/account, and each update's local ID, historical blob, old source digest
+and receipt sequence. It also retains local IDs for referenced folders and
+their ancestors. Apply takes the account lock, checks these fences and current
+policy, reconstructs the complete local canonical snapshot, and checks folder
+metadata before publishing memberships, keywords, history and the advanced
+source receipt together. Returning to an old source digest after intervening
+updates does not make an old plan valid: its receipt sequence has changed.
+Unrelated incoming mail does not invalidate a plan merely by advancing the
+account's sequence.
+
+Keep the same plan and archive through partial failure or
+`migration-indeterminate-retry-same-plan`. Earlier successful object updates
+remain committed when a later object fails. Repeating the retained plan
+settles those receipts without refreshing old expectations. Generate a fresh
+plan after apply to inspect current metadata. Each observation is independently
+locked; the plan is not an account-wide snapshot or proof of source chronology.
+The operator selects the desired archive; opaque JMAP states and export times
+do not establish that it is newer than a previously selected archive.
+
+Plan and apply inspect structural archive metadata and stored immutable-body
+digests; they do not re-audit archive or database body extents. Use `migration
+verify` and the database audit commands for those checks. Plans admit at most
+100,000 entries, 16 MiB of accumulated serialized entries and a 32 MiB input
+file. Each database operation has the existing 10-second deadline, with a
+2 MiB outbound, 4 MiB inbound and 2,048-frame protocol allowance. Folder,
+membership and keyword bounds remain 256; incomplete reconstruction refuses.
+
+Ordinary `migration import` retains its historical insert-only semantics.
+For supported present-message changes, import can establish new folders before
+stopping at the first changed message; plan/apply can then update existing
+messages, followed by import for new messages. An absent, locally changed or
+otherwise unsupported mapped message can still stop that later import before
+new messages are reached. There is no implicit skip or receipt advancement to
+hide that exception. Folder changes and explicit source-deletion evidence
+remain separate work. Omission from an archive never authorizes deletion.
+Every report continues to carry `cutoverReady: false`.
