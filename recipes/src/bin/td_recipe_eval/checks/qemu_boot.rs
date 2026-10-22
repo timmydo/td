@@ -17,7 +17,7 @@
 //!
 //! Trust model — host qemu is a control-plane TEST tool, not a target input.
 //! Every byte of the ARTIFACT under test is td-built and host-free: the bzImage
-//! is compiled by td's native GCC/binutils/glibc ladder, and the initramfs is
+//! is compiled by the Debian build root's pinned GCC, and the initramfs is
 //! td's statically-linked td-sh, td-init and td-util plus a shell /init.
 //! `qemu-system-x86_64` only supplies the virtual machine that RUNS that
 //! artifact — exactly as the

@@ -41,7 +41,7 @@ pub fn recipe() -> Recipe {
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
-echo ">> recipe-check td-portal-test: build-plan --auto builds td-portal (the supervised desktop portal, statically linked by the /td/store target Rust + native GCC/binutils/glibc toolchain) and asserts a static target executable whose own selftest runs green"
+echo ">> recipe-check td-portal-test: build-plan --auto builds td-portal (the supervised desktop portal, statically linked by the pinned Rust toolchain through td-link against td glibc) and asserts a static target executable whose own selftest runs green"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run td-portal-test 1
 "#,
