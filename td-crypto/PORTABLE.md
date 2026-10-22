@@ -7,8 +7,8 @@ inputs and the Debian build root's C toolchain. M03b2c supplies isolated
 compilation and static artifact
 qualification. M03b2d1 adds API confinement; M03b2d2 adds local TLS smoke.
 This is a host build path for the
-standalone td-mta executable; it does not grant the source-bootstrap provenance
-of td's target image graph. Nothing prepared here is automatically admitted
+standalone td-mta executable; it does not grant the provenance of td's
+target image graph. Nothing prepared here is automatically admitted
 as a target recipe input.
 
 ## x86-64 and aarch64 musl headers
@@ -281,7 +281,7 @@ they do not launch the installed receiver. The ARM build does not produce
 the x86-only clean-runtime CLI suite. Follow DEPLOYMENT.md's private pilot
 procedure for the executable's configuration, STARTTLS, receiving and restart
 checks before taking production mail. The full td distribution's
-architecture and source-bootstrap claims are unchanged.
+architecture and provenance claims are unchanged.
 
 ## X86-64 isolated compilation and artifact
 

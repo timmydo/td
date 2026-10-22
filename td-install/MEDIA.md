@@ -84,7 +84,7 @@ installer release command. It does not sign, parse deployment manifests,
 authenticate payloads, provision keys, validate PE executability or create a
 live environment. The profile producer must supply the validated source-built
 boot artifacts, signed deployment, and matching public trust roots required
-by INSTALLER.md. Arbitrary command-line files carry no source-bootstrap claim.
+by INSTALLER.md. Arbitrary command-line files carry no provenance claim.
 No host executable is added to the image by this tool. The same writer is
 used by the optical/USB boot and native installation oracles; those callers
 own their diagnostic profiles and signing. `./build-iso` composes the

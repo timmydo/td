@@ -59,9 +59,21 @@ save review work: the commit is the review and checkpoint unit.
 ## Host kernel
 
 The builder requires Linux 5.12 or newer with `mount_setattr` available to
-its namespace sandbox. Read-only binds add restrictions without clearing locked source flags; td's writable `/var` is mounted nosuid,nodev. A blocked
+its namespace sandbox. Read-only binds add restrictions without clearing
+locked source flags; td's writable `/var` is mounted nosuid,nodev. A blocked
 operation is a sandbox setup failure, with no writable-bind fallback. The
 value-pinned syscall boundary is recorded in `UNSAFE.md`.
+
+An x86-64 build host also needs i386 execution: `CONFIG_IA32_EMULATION=y`
+with compatibility execution enabled at boot, so neither `ia32_emulation=0`
+nor `CONFIG_IA32_EMULATION_DEFAULT_DISABLED=y` without `ia32_emulation=1`.
+td-jail-test runs td-jail's seccomp probe on the build host; unless the
+build already runs under an inherited filter, the probe first proves that an
+unconfined i386 `int 0x80` `exit(0)` runs there, then that td-jail's filter
+kills one. The probe runs no i386 ELF; x32 and `CONFIG_COMPAT_32BIT_TIME`
+are not required. td-jail's opt-in live development test
+(`td-jail/tests/development_launch.rs`, `#[ignore]`) does build and run a
+static i386 executable, so it also needs a `cc` that targets `-m32`.
 
 ## Ready
 

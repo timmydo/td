@@ -61,8 +61,9 @@ target distribution artifact graph.
 ## Trust zones
 
 td has three trust zones. Zone one is the target artifact graph, built from
-pinned sources. Zone two is the host control plane that evaluates and builds
-that graph but never enters it. Zone three is each marked foreign prebuilt
+pinned sources by the Debian build root's and the upstream Rust toolchain's
+compilers. Zone two is the host control plane that evaluates and builds that
+graph but never enters it. Zone three is each marked foreign prebuilt
 application payload. A zone-three payload may live in `/td/store` and ship in
 the image, but it is never a tool, compilation input, or execution input to a
 source-built output. Only the explicit read-only `payload_inputs` channel may
@@ -101,8 +102,9 @@ pinned sources, in the Debian build root
 ```
 
 No compiler in this graph is source-bootstrapped: the build root's GCC and
-binutils and the toolchain's rustc and LLVM compile every output, and a
-source-bootstrap claim names them as trust roots wherever they reach.
+binutils and the toolchain's rustc and LLVM compile every output, and the
+closure query's provenance claim (`APPLICATIONS.md` §B.8) names them as
+trust roots wherever they reach.
 What td establishes is that nothing undeclared enters a build. Recipe steps
 may execute only unmarked outputs of earlier recipes, executables created by
 the current build, and, in a recipe that declares it, the Debian build root's
@@ -124,7 +126,7 @@ payload in `/td/store`, not a build-tool trust root. The mark is load-bearing:
 - ordinary input channels refuse it; only `payload_inputs` may carry it as
   read-only data for image composition or runtime association;
 - no recipe may execute it, link against it, or name it as a tool;
-- closure queries exclude and report it in source-bootstrap claims;
+- closure queries exclude and report it in provenance claims;
 - its source pin carries a reviewed URL, compiled expected SHA-256, and the
   mark that propagates to derived outputs.
 
@@ -151,10 +153,10 @@ a pin carries a reviewed URL and SHA-256 like any source, and stays
 unmarked because nothing executes, links, or loads it as code: td's
 builder copies it into zone-one outputs, and td-built programs parse it
 under their own bounds. td-ui's font reader runs no hinting bytecode. It
-is data inside the target graph, not source-built: a source-bootstrap
-claim names it as upstream data. Adding a pin of this class is a
-reviewed pin; data a td program would execute or load as code belongs to
-no class here and needs an amendment to this file.
+is data inside the target graph, not source-built; the closure query
+counts it among the audited seeds rather than naming it. Adding a pin of
+this class is a reviewed pin; data a td program would execute or load as
+code belongs to no class here and needs an amendment to this file.
 
 ## Debian build root
 
@@ -183,8 +185,8 @@ What td does not enforce: static objects of the root's (`crt*.o`,
 compiled source, and the root carries no mark that propagates to outputs
 or to recipes that later use them. Recipes in the root must therefore link
 only against td-built libraries or none, which their review and their own
-checks establish. A source-bootstrap claim names the root as a build-tool
-trust root, as it names the upstream Rust toolchain, for every output whose
+checks establish. A provenance claim names the root as a build-tool trust
+root, as it names the upstream Rust toolchain, for every output whose
 build closure includes a root-built output. td glibc is itself root-built,
 so that is every output that links it.
 
@@ -200,8 +202,8 @@ gcc-runtime's libgcc_s and td zlib into the tree, and relinks every shipped
 executable onto td glibc's loader; it compiles nothing. The toolchain,
 rust-lld and its LLVM included, is a build-tool trust root like the Debian
 build root: unmarked, executed by recipes, shipped in the image, and named
-by a source-bootstrap claim (`upstream-rust`) for every closure that
-contains it. Every Rust output links its prebuilt standard library. A
+by a provenance claim (`upstream-rust`) for every closure that contains
+it. Every Rust output links its prebuilt standard library. A
 stronger claim needs a separately specified diverse bootstrap or
 diverse-double-compilation proof. Every Rust output a td recipe builds,
 Cargo's build scripts and proc macros included, links through `td-link`

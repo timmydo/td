@@ -263,7 +263,7 @@ static int prove_i386_boundary(int confined) {
         if (!WIFSIGNALED(status) || WTERMSIG(status) != SIGSYS)
             return fail("i386 syscall was not killed with SIGSYS");
     } else if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-        return fail("kernel cannot execute the source bootstrap i386 ABI");
+        return fail("the kernel cannot execute the i386 ABI: td-jail's probe needs IA32 emulation (DEVELOPMENT.md, Host kernel)");
     }
     return 0;
 }

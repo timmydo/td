@@ -17,8 +17,8 @@ compiler must be available; the builder handles the same host toolchain
 preparation as its mail checks. Dependency preparation may fetch declared
 archives; compilation is frozen/offline.
 
-This is a host build, not the portable release below or a source-bootstrapped
-td artifact. Retain the host runtime libraries/toolchain generation it links
+This is a host build, not the portable release below or a td target-graph
+artifact. Retain the host runtime libraries/toolchain generation it links
 against (including Guix profile packages). Each installation retains a new
 release under `PREFIX/lib/td-mta/releases/`, with debug information inside
 the executable, the build command receipt, manifests, lock and dependency
@@ -289,7 +289,7 @@ before starting. `BUILD-INPUTS` identifies inputs, not installed output bytes.
 Preserve the complete notices tree. Do not install only the runtime and discard its companion or provenance receipt.
 This portable build uses the pinned upstream Rust/musl kit and the pinned
 Debian build root's GCC and binutils described in PORTABLE.md; it is not the
-source-bootstrapped td system-image artifact.
+td system-image artifact.
 Prebuilt standard-library/libc code and provider assembly remain explicit
 profiling boundaries. This layout does not configure automatic discovery by
 host debuggers, and td-profiler currently indexes only canonical `/td/store`

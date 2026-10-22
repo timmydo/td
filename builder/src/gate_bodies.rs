@@ -3568,10 +3568,6 @@ fn sandbox_hardening(_root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-// --- toolchain-input-addressed (formerly tests/toolchain-input-addressed.sh) ---
-
-// --- toolchain-x86_64-input-addressed (formerly tests/toolchain-x86_64-input-addressed.sh) ---
-
 // --- the former shell gates and the build-recipes prelude ----------------------
 
 /// The stage0 td-builder placed as the shell gates' `load_stage0` placed it,

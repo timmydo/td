@@ -4402,7 +4402,7 @@ impl RecipeCheckRunner {
         // `local_seed_db_path`'s doc comment for why. Always passed: when no
         // local source was staged this run the file is absent, and the builder
         // drops an absent path before it can join its typed db list
-        // (`present_local_seed_db`), which is what makes always passing it
+        // (`present_seed_db`), which is what makes always passing it
         // safe — every db in that list is read per step.
         let local_seed_db = local_seed_db_path(&self.lw, &self.scratch_id());
         let local_seed_db_s = path_str(&local_seed_db)?;
@@ -5461,7 +5461,7 @@ impl RecipeCheckRunner {
 /// TARGETS' recipe graph as it builds, dependencies first.
 pub(crate) fn recipe_closure(targets: &[&str]) -> Result<Vec<RecipeNode>, String> {
     // The catalog is CONSTRUCTED once and then indexed. `catalog::lookup` builds
-    // all 98 recipes and searches linearly, and this walk asked it once per node
+    // every recipe and searches linearly, and this walk asked it once per node
     // and once more per EDGE, which is most of what a pure graph question costs.
     let catalog: BTreeMap<&str, Recipe> = catalog::all().into_iter().collect();
     let mut visiting = HashSet::new();
@@ -6075,7 +6075,7 @@ fn classify_graph_inputs_with(
     is_marked: impl Fn(&str) -> bool,
 ) -> Result<Vec<SeedInput>, String> {
     // Built ONCE, for `marked_names`' reason and with the same measurement
-    // behind it: `catalog::lookup` CONSTRUCTS all 98 recipes and then searches
+    // behind it: `catalog::lookup` CONSTRUCTS every recipe and then searches
     // linearly, and this asks it once per INPUT across the whole graph. It only
     // ever tests existence, so a stem set answers the same question.
     let catalog_stems: HashSet<&str> = catalog::all().into_iter().map(|(stem, _)| stem).collect();
@@ -6109,7 +6109,7 @@ fn classify_graph_inputs_with(
 }
 
 /// APPLICATIONS.md §B.8's containment answer for one closure: the marked paths
-/// it holds, so a caller can say "source-bootstrapped apart from these".
+/// it holds, so its provenance claim can say "apart from these".
 #[derive(Debug)]
 pub(crate) struct PayloadClosure {
     /// Every recipe the targets' closure reaches.
@@ -6376,7 +6376,7 @@ fn payload_closure_report(args: &[String]) -> Result<String, String> {
 }
 
 /// §B.8's closure query: what a target's closure CONTAINS that the
-/// source-bootstrapped claim does not cover.
+/// provenance claim does not cover.
 ///
 /// Containment is COMPUTED from the graph rather than declared beside it, for
 /// `is_foreign`'s reason — a declared set is a second source of truth for a
@@ -6389,7 +6389,7 @@ pub(crate) fn payload_closure(targets: &[&str]) -> Result<PayloadClosure, String
 }
 
 /// CLASSIFY, then report — which is the difference between a report and a
-/// claim. "Source-bootstrapped apart from these" is only true if every OTHER
+/// claim. "Built from pinned sources apart from these" is only true if every OTHER
 /// input has an admissible provenance, and that is exactly what the planning
 /// pass decides. Review found the query issuing that sentence over a graph it
 /// had never classified: a recipe naming an undeclared input was reported clean
@@ -8894,10 +8894,10 @@ mod tests {
     }
 
     /// The claim is CLASSIFIED before it is issued: a graph the planner would
-    /// refuse must not be reported as source-bootstrapped, which is what a
-    /// query that only counted marked paths did.
+    /// refuse must not be reported as built from pinned sources, which is what
+    /// a query that only counted marked paths did.
     #[test]
-    fn the_query_classifies_the_graph_before_claiming_it_is_source_bootstrapped() {
+    fn the_query_classifies_the_graph_before_issuing_its_provenance_claim() {
         let node = |stem: &str, recipe: Recipe| RecipeNode {
             stem: stem.to_string(),
             recipe,

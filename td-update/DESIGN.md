@@ -133,11 +133,15 @@ active staging. Only a successful producer and synced temporary archive
 can be renamed into the source cache. The target seed check remains the
 authority for admitting the resulting data into the target graph.
 
-No build needs i386 execution. The standard kernel still enables that ABI
-and `CONFIG_COMPAT_32BIT_TIME` for td-jail's probe: application confinement
-kills non-x86-64 syscall architectures, with
-the independent target probe checking both unconfined compatibility
-execution and confined rejection.
+The standard kernel enables the i386 ABI and `CONFIG_COMPAT_32BIT_TIME`.
+td-jail's development syscall policy admits ordinary x86-64 and i386 code
+(APPLICATIONS.md §C), and i386 programs that issue the 32-bit time
+syscalls (older libcs, raw syscalls) need them for their time and futex
+calls. Ordinary application confinement kills non-x86-64 syscall
+architectures, and the independent target probe checks both unconfined
+compatibility execution and confined rejection. The build host needs IA32
+emulation too, because td-jail-test runs that probe there (DEVELOPMENT.md,
+"Host kernel").
 
 The new evaluator warms declared fixed-output inputs for `system-x86-64`,
 then invokes `build-run` through the existing sandbox and recipe

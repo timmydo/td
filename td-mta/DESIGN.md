@@ -2255,9 +2255,9 @@ and abrupt-death recovery both need tests; signal integration cannot silently
 add an unsafe surface. Persistent state is outside the executable's directory.
 
 This standalone artifact does not automatically enter td's system image.
-Future image integration follows the source-bootstrap, profiling, service,
-credential and packaging contracts in the repository. A host musl build is
-useful for other distros but is not proof of a source-bootstrapped td artifact.
+Future image integration follows the target-graph provenance, profiling,
+service, credential and packaging contracts in the repository. A host musl
+build is useful for other distros but is not a td target-graph artifact.
 
 ## 14. Implementation ownership
 

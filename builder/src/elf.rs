@@ -21,9 +21,10 @@
 //!     dance; a too-long run-path (or adding one where none exists) errors loudly rather than
 //!     corrupting the file — a deliberate, visible boundary, not a silent truncation.
 //!
-//! Scope: 32- and 64-bit little-endian ELF. The bootstrap uses i686 and x86-64;
-//! the portable mail build also validates AArch64. Application launch checks
-//! remain explicitly x86-64. Other classes and endiannesses are rejected.
+//! Scope: 32- and 64-bit little-endian ELF. td's target is x86-64, with the
+//! i686 class still read and rewritten; the portable mail build also validates
+//! AArch64. Application launch checks remain explicitly x86-64. Other classes
+//! and endiannesses are rejected.
 
 #![allow(
     clippy::unwrap_used,
@@ -57,7 +58,7 @@ const EM_AARCH64: u16 = 183;
 const EV_CURRENT: u32 = 1;
 const DT_NULL: u64 = 0; // end of the dynamic array
                         // Backs the `read_needed`/`assert_static` DT_NEEDED query. assert_static is now
-                        // live in-crate: the bootstrap rungs' `Step::AssertStatic` calls it to reject a
+                        // live in-crate: a recipe's `Step::AssertStatic` calls it to reject a
                         // host loader/libc leak (re #469), so needed_slots → read_needed → assert_static
                         // is reachable and DT_NEEDED is used — no dead-code allow needed.
 const DT_NEEDED: u64 = 1; // .dynstr offset of a required shared-object name
@@ -2498,9 +2499,9 @@ fn assert_executable_bounded(
 /// Assert an ELF is FULLY STATIC — no program interpreter (`PT_INTERP`), no `DT_NEEDED`
 /// shared libraries, and no `DT_RPATH`/`DT_RUNPATH` run-path. This is a runtime-provenance
 /// contract (re #469): a *dynamically* linked binary drags a host loader + glibc back in at
-/// run time — exactly the host-runtime ingress #469 closes. Its consumer is the pre-libc
-/// bootstrap rungs — tcc/make/yacc are linked `-static`, and the `Step::AssertStatic` step
-/// fails the rung if one regresses to a host loader/libc.
+/// run time — exactly the host-runtime ingress #469 closes. Its consumer is the
+/// `Step::AssertStatic` step, which fails a recipe whose static output regresses to a
+/// host loader/libc.
 ///
 /// The check fails loudly (naming the offending entry) if a regression reintroduces any of
 /// them; a non-ELF file reds too (the parser rejects bad magic).
@@ -2552,8 +2553,8 @@ pub(crate) mod tests {
 
     // A minimal little-endian ELF buffer with exactly one PT_INTERP program header whose
     // string slot holds `interp` (NUL-terminated). `is64` selects ELFCLASS64 (x86-64) or
-    // ELFCLASS32 (i686 — the class the bootstrap toolchain cc1/as/ld actually is). Enough
-    // for the reader/writer; not a runnable binary (no sections), which is all this needs.
+    // ELFCLASS32 (i686). Enough for the reader/writer; not a runnable binary (no
+    // sections), which is all this needs.
     pub(crate) fn synth_interp_elf(interp: &str, is64: bool) -> Vec<u8> {
         let (ehdr, phentsize) = if is64 {
             (64usize, 56usize)
@@ -3359,7 +3360,7 @@ pub(crate) mod tests {
 
     #[test]
     fn grows_interp_elf32() {
-        // the i686 class grows the same way (the bootstrap toolchain is i686).
+        // the i686 class grows the same way.
         let _dir_cleanup = crate::test_temp::TempDir::new("elf-test-l32").unwrap();
         let dir = _dir_cleanup.join("fixture");
         std::fs::create_dir_all(&dir).unwrap();
@@ -3470,8 +3471,7 @@ pub(crate) mod tests {
 
     #[test]
     fn reads_and_sets_rpath_elf32() {
-        // i686 run-path round-trip — the class the bootstrap toolchain ar/ranlib actually
-        // are, so a /td/store run-path can be baked to drop their LD_LIBRARY_PATH wrappers.
+        // i686 run-path round-trip: a /td/store run-path baked into a 32-bit ELF.
         let _dir_cleanup = crate::test_temp::TempDir::new("elf-test-rp32").unwrap();
         let dir = _dir_cleanup.join("fixture");
         std::fs::create_dir_all(&dir).unwrap();

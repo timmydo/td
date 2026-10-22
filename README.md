@@ -21,8 +21,8 @@ build, and nothing in the root is mutable.
   pinned by SHA-256.)
 - **Rust-first userland** — the core file and text tools are Rust uutils, and
   the boot/login/shell path is td's own static Rust multicalls. No
-  third-party multicall is shipped: the image packs nothing td did not
-  build from source.
+  prebuilt multicall is shipped: every multicall in the image, uutils
+  included, is one td built from source.
 - **Content-addressed** — store paths, offline builds, and fixed-output
   sources verified by SHA-256. Deployment updates are verified into a hidden
   directory, flushed, atomically published by manifest hash, and activated
@@ -165,16 +165,16 @@ git pull --ff-only
 ./update
 ```
 
-The updater builds with the installed toolchain and the source-bootstrap
-graph. The first build fetches declared sources and builds the graph locally;
-later builds reuse local outputs. When installation is requested, press
-Ctrl+Alt+Escape, then I. Review the deployment ID and type the two digits the
-prompt shows to approve, or press Escape to cancel; Enter does not approve. A
-request left unapproved makes the next wait, longer each time. The authorized
-operation signs with this installation's key and installs the successor.
-Restart explicitly to boot it; the previous deployment remains available for
-recovery. Use `./update build` to stop after building without requesting
-installation.
+The updater builds the recipe graph with the installed toolchain and the
+pinned Debian build root. The first build fetches declared sources and builds
+the graph locally; later builds reuse local outputs. When installation is
+requested, press Ctrl+Alt+Escape, then I. Review the deployment ID and type
+the two digits the prompt shows to approve, or press Escape to cancel; Enter
+does not approve. A request left unapproved makes the next wait, longer each
+time. The authorized operation signs with this installation's key and installs
+the successor. Restart explicitly to boot it; the previous deployment remains
+available for recovery. Use `./update build` to stop after building without
+requesting installation.
 
 The checkout, build cache and other user state persist across updates and
 rollback. The source bundle is companion data outside the signed deployment;

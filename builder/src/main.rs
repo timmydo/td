@@ -6199,13 +6199,13 @@ fn assemble_recipe_drv(
         }
     }
     // Every build system needs its own source EXCEPT a mesboot recipe that EXPLICITLY
-    // declares it has none (make-test, #429: it only RUNS a sibling rung's output) — its
+    // declares it has none (#429: one that only RUNS another recipe's output) — its
     // recipe carries no `sourceInput`, so --auto synthesizes no `<name>-source` line, and
     // requiring one here would force back the removed nominal-source alias hack. Scoped to
     // BOTH conditions (build system AND the recipe's own declaration), not build_system
-    // alone: a mesboot rung that DOES declare a `sourceInput` (every rung but make-test)
-    // still hard-errors here if its lock ends up missing the source line — catching that
-    // mistake immediately at drv-assembly time instead of a confusing failure deep in step
+    // alone: a mesboot recipe that DOES declare a `sourceInput` still
+    // hard-errors here if its lock ends up missing the source line — catching
+    // that mistake immediately at drv-assembly time instead of a confusing failure deep in step
     // execution when a `{in:<name>-source}` template has nothing to resolve.
     let declares_no_source = build_system == "mesboot" && source_input.is_none();
     if source.is_empty() && !declares_no_source {
@@ -7967,8 +7967,8 @@ fn auto_seed_provenance(
 /// by `auto_seed_provenance` (canonical store item, present in SEED-STORE — re #469).
 /// The recipe's own declared `sourceInput` (if any) becomes the required
 /// `<name>-source` line, resolved and gated the same way; a recipe with no
-/// `sourceInput` (e.g. make-test, which only RUNS a sibling rung's output, not
-/// compiles one) gets no source line. Reads + parses NAME's recipe JSON exactly once
+/// `sourceInput` (one that only RUNS another recipe's output) gets no source
+/// line. Reads + parses NAME's recipe JSON exactly once
 /// (shared between the sourceInput check and the declared-inputs loop below).
 fn auto_synthesize_lock(
     recipe_dir: &str,

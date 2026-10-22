@@ -66,8 +66,9 @@ Settled by the maintainer; these are premises, not conclusions.
 
 ## Trust
 
-A third-party application is a **third zone**. Zone one is the
-source-bootstrapped target graph; zone two is the host control plane;
+A third-party application is a **third zone**. Zone one is the target
+graph, built from pinned sources by the Debian build root's and the
+upstream Rust toolchain's compilers; zone two is the host control plane;
 zone three is a foreign prebuilt application, confined to one jail.
 
 Zone three lives **in** `/td/store`, admitted by the §B.8 marker rather
@@ -75,8 +76,8 @@ than excluded by a layout. The marker's job is to keep the property that
 matters while giving up the one that cannot be kept: a foreign payload is
 never a tool, compilation or execution input to anything td builds, its
 `PT_INTERP` is absent from the image root so it cannot be executed
-outside a jail, and it is excluded from the source-bootstrapped claim in
-a way a closure query can check.
+outside a jail, and it is excluded from the provenance claim in a way a
+closure query can check.
 
 The claim that results is narrower than "the store contains no foreign
 binary", and the narrowing is deliberate:
@@ -2244,7 +2245,8 @@ of the closure query that was the point. The distinction is real rather
 than a carve-out: **a derived output is one built FROM a payload, and an
 image is one that CONTAINS it.** Deriving takes the taint; containing
 takes a different mark, `contains_payloads: {paths}`, which is what the
-closure query reads to answer "source-bootstrapped apart from these".
+closure query reads for its provenance claim, "built from pinned sources
+by the declared trust roots, apart from these".
 A containment edge is exactly `payload_inputs` and nothing else, which
 is why the channel had to exist before this rule could be stated: the
 graph could not otherwise tell the two apart, and neither could a
@@ -2430,7 +2432,7 @@ a scan:
   build's own tree** as part of the same half, and review is what found
   that it had to be: `glob:` splices directory entries straight into
   argv, and `{in:<any input>}/..` is the store directory — so
-  `glob:{in:mes}/../*-firefox-140` names a payload on a command line
+  `glob:{in:zlib-x86-64}/../*-firefox-140` names a payload on a command line
   with no `{payload:}` and no `{in:PAYLOAD}`, defeating this bullet
   through a template that resolves something else entirely. Every
   `glob:` in the tree already reads `{root}`, so the confinement costs
@@ -2605,11 +2607,10 @@ header check with no graph view.
 
 #### The closure query, and the edge it would otherwise miss
 
-Assertion 3 — that a closure query can answer *"source-bootstrapped apart
-from these marked paths"* — is buildable today: `store_db_read.rs`'s
-`closure`/`closure_roots` and `ladder.rs`'s existing graph-partition
-invariant with its reviewed exception list are the machinery and the
-precedent.
+Assertion 3 — that a closure query can answer *"built from pinned sources
+by the declared trust roots, apart from these marked paths"* — is buildable
+today: `store_db_read.rs`'s `closure`/`closure_roots` are the machinery,
+and the payload mark's propagation is the precedent.
 
 One gap has to be closed for it to be true. td discovers closure edges by
 **scanning output bytes for store hashes** (`builder/src/scan.rs`), and a
@@ -3448,7 +3449,9 @@ two ioctls the truncation *is* the point.
    a direct loss notice printed before the asynchronously queued begin record,
    plus malformed records, a uid other than 1000, and every syscall/action
    class outside the compiled deny roster. The target kernel enables i386
-   execution so the standalone probe below can prove the kill; x32 stays off.
+   execution for the development policy (§C), which admits ordinary i386
+   code, and so the standalone probe below can prove the kill; x32 stays
+   off.
    The unchanged outer filter kills a non-x86-64 audit architecture before
    examining syscall numbers. The standalone kernel probe requires i386
    exit(0) to work before filtering and to die with SIGSYS afterward.

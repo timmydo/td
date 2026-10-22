@@ -249,7 +249,7 @@ fn run_inner(root: &Path, action: &str, manifest: &str) -> Result<Option<Release
         cmd.args(["--release", "--bin", "td-mta"])
             .env("CARGO_PROFILE_RELEASE_DEBUG", "1")
             .env("CARGO_PROFILE_RELEASE_STRIP", "none");
-        let mut receipt = String::from("td-mta native host release; debug retained in executable\nNot portable or source-bootstrapped. Retain host compiler/runtime packages.\n");
+        let mut receipt = String::from("td-mta native host release; debug retained in executable\nNot portable or a td target-graph artifact. Retain host compiler/runtime packages.\n");
         receipt.push_str(&format!("command {cmd:?}\n"));
         let executable = fixture_executable(
             cmd,

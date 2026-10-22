@@ -246,18 +246,16 @@ struct Watch {
 }
 
 /// Default phase bound: make can legitimately be silent for a long time while
-/// one big translation unit compiles. 4 hours is comfortably past the corpus'
-/// worst single-file case: GCC 14.3.0's final codegen builds machine-generated,
-/// multi-megabyte translation units (insn-recog.cc, insn-automata.cc,
-/// insn-dfatab.cc, insn-latencytab.cc) that emit NOTHING for the whole compile,
-/// and under the slow gcc-mesboot 4.9.4 bootstrap compiler on a loaded shared
-/// box a single one of those can stay silent well past half an hour — the old
-/// 30-minute bound false-killed it as "wedged" (~36 min observed). The
-/// /td/store bootstrap chain does NOT run through run_cmd — bootstrap.rs /
-/// toolchain_x86_64.rs have their own runners — so this bound governs the
-/// generic recipe phases. This backstop is DELIBERATELY generous because it is
-/// the ONLY guard that fires on a *silent* wedge; the chatty/spin wedges have
-/// their own tight bounds that this change does NOT touch (WATCH_CONFIGURE's
+/// one big translation unit compiles. 4 hours is comfortably past the worst
+/// single-file case td has built: the retired ladder's GCC 14.3.0 codegen
+/// built machine-generated, multi-megabyte translation units (insn-recog.cc,
+/// insn-automata.cc, insn-dfatab.cc, insn-latencytab.cc) that emit NOTHING for
+/// the whole compile, and under its slow bootstrap compiler on a loaded shared
+/// box a single one of those could stay silent well past half an hour — the
+/// old 30-minute bound false-killed it as "wedged" (~36 min observed). This
+/// bound governs the generic recipe phases run through run_cmd. This backstop
+/// is DELIBERATELY generous because it is the ONLY guard that fires on a
+/// *silent* wedge; the chatty/spin wedges have their own tight bounds that this change does NOT touch (WATCH_CONFIGURE's
 /// 600s catches the #292 configure spin; the `repeat_secs` 300s below catches
 /// the #339 nested-make chatty spin) — both still red within minutes, so only a
 /// genuinely output-free hang waits out the 4 hours. No COUNT repeat bound

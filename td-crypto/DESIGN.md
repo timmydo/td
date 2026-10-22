@@ -1065,7 +1065,7 @@ AWS-LC version pair for entropy, comparison, P-256 signing and TLS. The owned
 SHA-256 implementation serves direct streaming digests only. Disable unused
 features and all undeclared build fallbacks.
 The portable musl artifact follows td-mta/DESIGN.md section 3; it does not
-inherit the source-bootstrap provenance of td's separate target image graph.
+inherit the provenance of td's separate target image graph.
 
 Use the checked source/cc build path. Disable system libcrypto discovery and
 fallback to CMake, bindgen or prebuilt NASM; put the pinned version's controls

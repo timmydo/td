@@ -156,7 +156,7 @@ together. Its operator layout places those files at `bin/td-mta` and
 `lib/debug/bin/td-mta.debug`. That separate portable build is documented in
 `td-crypto/PORTABLE.md`; its pinned upstream prebuilt std/libc and provider
 assembly remain profiling boundaries. It does not establish this target
-artifact graph's source-bootstrap or whole-closure frame-pointer coverage.
+artifact graph's provenance or whole-closure frame-pointer coverage.
 This mirrors the companion naming rule, not index discovery: td-profiler
 currently accepts runtime paths only under canonical `/td/store` children,
 so it does not discover this standalone `/opt` installation.

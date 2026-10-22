@@ -2418,25 +2418,24 @@ mod tests {
         // carry no serial-barrier dep and start subject to the slot pool. A future
         // cheap gate may be added without touching this file.
         // Heavy is the whole behavioral tier: the PR-sized gates AND the slow
-        // from-seed rungs + from-source corpus that used to be a separate Daily
-        // pool. The floor covers both halves — the pool may gain members but
-        // never lose one.
+        // from-source builds that used to be a separate Daily pool. The floor
+        // covers both halves — the pool may gain members but never lose one.
         let heavy = set.names(Pool::Heavy);
         // Thresholds ratchet DOWN as guix gates retire (the guix-removal workstream).
         // The guix-SEEDED corpus (the retired guix recipe-checks gate + the 35
         // corpus recipes) and the guix seed-capture/td-shell/subst gates were deleted — they
-        // built packages on guix's gcc-toolchain/rust, not td's mes-rooted /td/store
-        // toolchain — leaving only the /td/store store-native ladder, the store
-        // primitives, and the engine. These guard against ACCIDENTAL loss, not
+        // built packages on guix's gcc-toolchain/rust, not td's /td/store
+        // toolchain — leaving the /td/store recipe builds, the store primitives,
+        // and the engine. These guard against ACCIDENTAL loss, not
         // deliberate retirement — lower them in the same PR that removes gates.
         //
         // #397 lowered these floors: the 25 duplicate per-rung `bootstrap-<rung>.sh`
         // shell gates were retired (24 Daily + 1 Heavy — `bootstrap-cc`, the only one
         // of the 25 in the Heavy pool). The shell-helper cleanup then removed the
-        // compatibility-only chain-cache gate; recipe-owned checks and the x86_64
-        // gates are the surviving recipe-graph coverage. Deleting the stage0 ladder
-        // then retired its seven gates (bootstrap-seed/-mes, the two toolchain
-        // input-addressed gates and the three x86_64 GCC recipe gates). Floors are set
+        // compatibility-only chain-cache gate. Deleting the stage0 ladder then
+        // retired its seven gates (bootstrap-seed/-mes, the two toolchain
+        // input-addressed gates and the three x86_64 GCC recipe gates), leaving
+        // recipe-owned checks as the recipe-graph coverage. Floors are set
         // to the EXACT post-retirement counts
         // (zero headroom, matching the pre-#397 convention: 19/32/51 were exact matches
         // too) — these guard against ACCIDENTAL loss, so slack beyond the deliberate

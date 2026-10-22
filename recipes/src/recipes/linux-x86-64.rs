@@ -333,9 +333,13 @@ pub fn recipe() -> Recipe {
     //    laptop's devices, so /dev/fb0 there stays virtio-gpu's.
     //
     //    COMPAT_32BIT_TIME has a visible prompt, so allnoconfig turns it off.
-    //    It and IA32_EMULATION stay on for td-jail's i386 seccomp probe, which
-    //    proves confinement kills compatibility syscalls (UNSAFE.md); no build
-    //    needs i386 execution.
+    //    It and IA32_EMULATION stay on because td-jail's development syscall
+    //    policy admits ordinary i386 code beside x86-64 (APPLICATIONS.md §C),
+    //    and i386 code that issues the 32-bit time syscalls (older libcs, raw
+    //    syscalls) needs COMPAT_32BIT_TIME for its time and futex calls; and the QEMU oracle's seccomp probe runs an
+    //    unconfined i386 syscall before proving td-jail's filter kills one
+    //    (UNSAFE.md). td-jail-test runs the same probe on the build host
+    //    (DEVELOPMENT.md, Host kernel).
     //
     //    EFI needs ACPI; EFI_STUB selects the already enabled RELOCATABLE.
     //
@@ -909,7 +913,7 @@ pub fn recipe() -> Recipe {
                  grep -q '^CONFIG_NET_NS=y' .config || { echo 'NET_NS off — a jail without shared=network could not be cut off from the network stack' >&2; exit 1; }; \
                  grep -q '^CONFIG_AUDIT=y' .config || { echo 'AUDIT off — the physical Firefox proof cannot account for outer seccomp denials' >&2; exit 1; }; \
                  grep -q '^CONFIG_AUDITSYSCALL=y' .config || { echo 'AUDITSYSCALL off — x86 seccomp audit records cannot carry syscall identity' >&2; exit 1; }; \
-                 grep -q '^CONFIG_COMPAT_32BIT_TIME=y$' .config || { echo 'COMPAT_32BIT_TIME off — i386 compatibility execution would lack its futex and clock syscalls' >&2; exit 1; }; \
+                 grep -q '^CONFIG_COMPAT_32BIT_TIME=y$' .config || { echo 'COMPAT_32BIT_TIME off — i386 code under the td-jail development policy would lack its futex and clock syscalls' >&2; exit 1; }; \
                  grep -q '^CONFIG_IA32_EMULATION=y$' .config || { echo 'IA32_EMULATION off — the td-jail probe cannot prove confinement kills i386 syscalls' >&2; exit 1; }; \
                  grep -q '^# CONFIG_IA32_EMULATION_DEFAULT_DISABLED is not set$' .config || { echo 'IA32 emulation disabled at boot — the td-jail probe needs compatibility execution' >&2; exit 1; }; \
                  grep -q '^# CONFIG_X86_X32_ABI is not set$' .config || { echo 'X86_X32_ABI on — x32 calls could reach an unmodelled compatibility ABI instead of the deliberate kill probe' >&2; exit 1; }; \
