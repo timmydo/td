@@ -54,7 +54,17 @@ const UNREADABLE: u8 = 0x0c;
 
 enum Work {
     Program(Program),
+    Supervised(Supervised),
     Secret(std::sync::Arc<crate::secret_client::Attempt>),
+}
+
+/// What root may be asked of the configured application's units
+/// (APPLICATIONS.md §W.9): start it, or check its Flathub cache now. The
+/// request names no unit; root holds both names.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Supervised {
+    Start,
+    Update,
 }
 
 #[derive(Clone)]
@@ -514,6 +524,14 @@ impl Launcher {
         }
     }
 
+    pub fn supervise(&self, request: Supervised) -> Result<(), String> {
+        match self.send.try_send(Work::Supervised(request)) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err("authority request already pending".into()),
+            Err(TrySendError::Disconnected(_)) => Err("program authority is unavailable".into()),
+        }
+    }
+
     pub fn launch_selected(&self, terminal: Program) -> Result<(), String> {
         match self.send.try_send(Work::Program(terminal)) {
             Ok(()) => Ok(()),
@@ -542,6 +560,13 @@ impl Queued {
             },
             Self(receive),
         )
+    }
+
+    pub(crate) fn supervised(&self) -> Option<Supervised> {
+        match self.0.try_recv() {
+            Ok(Work::Supervised(request)) => Some(request),
+            _ => None,
+        }
     }
 
     pub(crate) fn attempt(&self) -> Option<std::sync::Arc<crate::secret_client::Attempt>> {
@@ -769,6 +794,25 @@ impl Processes {
     }
 }
 
+/// One supervised request: root starts the unit and answers at once, so
+/// nothing is retained or polled.
+fn supervise(
+    wire: &mut impl Exchange,
+    request: Supervised,
+) -> Result<Option<&'static str>, String> {
+    let byte = match request {
+        Supervised::Start => 0x0d,
+        Supervised::Update => 0x0e,
+    };
+    match wire.exchange(&[byte])?.as_slice() {
+        [0x84] => Ok(None),
+        [0xff, 1] => Ok(Some("the application's supervisor is already being asked")),
+        [0xff, 2] => Ok(Some("program authority could not ask the supervisor")),
+        [0xff, 3] => Ok(Some("a live session starts only the installer")),
+        _ => Err("invalid supervised request response".into()),
+    }
+}
+
 fn worker(
     mut wire: impl Exchange,
     receive: Receiver<Work>,
@@ -782,6 +826,11 @@ fn worker(
         secrets.set_revocation(login.revocation());
         match work {
             Ok(Work::Secret(attempt)) => secrets.start(&mut wire, attempt)?,
+            Ok(Work::Supervised(request)) => {
+                if let Some(error) = supervise(&mut wire, request)? {
+                    let _ = writeln!(std::io::stderr().lock(), "td-compositor: {error}");
+                }
+            }
             Ok(Work::Program(terminal)) => {
                 if let Some(error) = processes.start(&mut wire, terminal)? {
                     let _ = writeln!(std::io::stderr().lock(), "td-compositor: {error}");
@@ -1404,6 +1453,22 @@ mod tests {
                 .unwrap()
                 .is_some());
             assert!(processes.handles.is_empty());
+        }
+    }
+
+    #[test]
+    fn supervised_requests_are_one_byte_and_one_answer() {
+        let mut started = wire(vec![vec![0x84], vec![0x84]]);
+        assert_eq!(supervise(&mut started, Supervised::Start), Ok(None));
+        assert_eq!(supervise(&mut started, Supervised::Update), Ok(None));
+        assert_eq!(started.requests, [vec![0x0d], vec![0x0e]]);
+        for answer in [vec![0xff, 1], vec![0xff, 2], vec![0xff, 3]] {
+            assert!(supervise(&mut wire(vec![answer]), Supervised::Start)
+                .unwrap()
+                .is_some());
+        }
+        for answer in [vec![], vec![0x84, 0], vec![0x81], vec![0xff, 4]] {
+            assert!(supervise(&mut wire(vec![answer]), Supervised::Update).is_err());
         }
     }
 

@@ -13,6 +13,11 @@ use std::time::{Duration, Instant};
 const LIMIT: usize = 16;
 const CHECK_TIMEOUT: Duration = Duration::from_secs(2);
 const VERSION: &[u8] = b"TDLA003\n";
+/// Where a live boot mounts its install medium (td-install/MEDIA.md): that
+/// session runs only the installer, whose table skips the application.
+const LIVE_MEDIUM: &str = "/run/td-media";
+/// How long a `td-svc start` client may take, as revocation bounds its own.
+const SUPERVISED_TIME: Duration = Duration::from_secs(12);
 
 pub(crate) struct Config {
     user: String,
@@ -75,6 +80,14 @@ impl Config {
             &self.owner.to_string(),
             &self.compositor.to_string(),
         ]);
+        command
+    }
+
+    /// Root asks its own supervisor to start the configured application's
+    /// fixed unit: td-svc runs it as the application's account.
+    fn supervised(unit: Supervised) -> Command {
+        let mut command = Command::new("/bin/td-svc");
+        command.args(["start", unit.name()]);
         command
     }
 
@@ -377,7 +390,26 @@ enum Request {
     Start(Program),
     Poll(u64),
     Heartbeat,
+    Supervised(Supervised),
     Secret(crate::session::Request),
+}
+
+/// The configured application's units (APPLICATIONS.md §W.9): the
+/// application itself, and the oneshot that checks its Flathub cache now.
+/// The peer names neither; it selects one of these two.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Supervised {
+    Start,
+    Update,
+}
+
+impl Supervised {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Start => "firefox",
+            Self::Update => "firefox-update",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -499,6 +531,8 @@ fn request(bytes: &[u8]) -> Result<Request, String> {
         [0x0a] => Ok(Request::Start(Program::Review)),
         [0x0b] => Ok(Request::Start(Program::Dua)),
         [0x0c] => Ok(Request::Start(Program::Agent)),
+        [0x0d] => Ok(Request::Supervised(Supervised::Start)),
+        [0x0e] => Ok(Request::Supervised(Supervised::Update)),
         [2, rest @ ..] if rest.len() == 8 => {
             let handle =
                 u64::from_be_bytes(rest.try_into().map_err(|_| "invalid terminal handle")?);
@@ -517,20 +551,71 @@ struct Launches {
     children: BTreeMap<u64, Child>,
     next: u64,
     generation: String,
+    /// At most one `td-svc start` per unit in flight, reaped by a later
+    /// request (heartbeats arrive every quarter second) and killed past
+    /// SUPERVISED_TIME.
+    supervised: BTreeMap<Supervised, (Child, Instant)>,
 }
 
 impl Launches {
+    /// The client's stdio is null, so its failure is said here, in root's log.
+    fn reap_supervised(&mut self) {
+        self.supervised.retain(|unit, (child, started)| {
+            let ended = match child.try_wait() {
+                Ok(None) if started.elapsed() < SUPERVISED_TIME => return true,
+                Ok(None) => {
+                    let _ = child.kill();
+                    child
+                        .wait()
+                        .map(|_| "it did not finish in time".to_string())
+                }
+                Ok(Some(status)) if status.success() => return false,
+                Ok(Some(status)) => Ok(status.to_string()),
+                Err(error) => Err(error),
+            };
+            let detail = ended.unwrap_or_else(|error| format!("wait: {error}"));
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "td-authd: td-svc start {}: {detail}",
+                unit.name()
+            );
+            false
+        });
+    }
+
     fn new(generation: String) -> Self {
         Self {
             children: BTreeMap::new(),
             next: 1,
             generation,
+            supervised: BTreeMap::new(),
         }
     }
 
     fn answer(&mut self, config: &Config, request: Request) -> Result<Vec<u8>, String> {
+        self.reap_supervised();
         match request {
             Request::Secret(_) => Err("secret request reached terminal dispatcher".into()),
+            Request::Supervised(unit) => {
+                // The live table skips the application; td-svc's `start`
+                // would not.
+                if std::fs::symlink_metadata(LIVE_MEDIUM).is_ok() {
+                    return Ok(vec![0xff, 3]);
+                }
+                if self.supervised.contains_key(&unit) {
+                    return Ok(vec![0xff, 1]);
+                }
+                match spawn(&mut Config::supervised(unit)) {
+                    Ok(child) => {
+                        self.supervised.insert(unit, (child, Instant::now()));
+                        Ok(vec![0x84])
+                    }
+                    Err(why) => {
+                        let _ = writeln!(std::io::stderr().lock(), "td-authd: {why}");
+                        Ok(vec![0xff, 2])
+                    }
+                }
+            }
             Request::Heartbeat => Ok(vec![0x83]),
             Request::Start(terminal) => {
                 if self.children.len() >= LIMIT {

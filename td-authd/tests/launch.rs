@@ -145,6 +145,14 @@ fn the_caller_can_only_start_poll_or_keep_the_channel_alive() {
     assert_eq!(request(&[0x0a]).unwrap(), Request::Start(Program::Review));
     assert_eq!(request(&[0x0b]).unwrap(), Request::Start(Program::Dua));
     assert_eq!(request(&[0x0c]).unwrap(), Request::Start(Program::Agent));
+    assert_eq!(
+        request(&[0x0d]).unwrap(),
+        Request::Supervised(Supervised::Start)
+    );
+    assert_eq!(
+        request(&[0x0e]).unwrap(),
+        Request::Supervised(Supervised::Update)
+    );
     assert_eq!(request(&[3]).unwrap(), Request::Heartbeat);
     let mut poll = vec![2];
     poll.extend_from_slice(&17u64.to_be_bytes());
@@ -164,7 +172,9 @@ fn the_caller_can_only_start_poll_or_keep_the_channel_alive() {
         vec![0x0a, 0],
         vec![0x0b, 0],
         vec![0x0c, 0],
-        vec![0x0d],
+        vec![0x0d, 0],
+        vec![0x0e, 0],
+        vec![0x0f],
         vec![2],
         vec![2, 0],
         vec![2; 10],

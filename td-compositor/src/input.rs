@@ -2583,7 +2583,13 @@ impl LiveInputTarget {
                 .map_err(|_| "runtime lock poisoned".to_string())?
                 .activate_application()?;
             if !activated {
-                eprintln!("td-compositor: configured application has no mapped window");
+                // Root starts its supervised unit; its window maps when it
+                // is up, and the card activates it then.
+                if let Err(error) = self.launches.start_application() {
+                    eprintln!(
+                        "td-compositor: configured application has no mapped window: {error}"
+                    );
+                }
             }
             return Ok(());
         }
@@ -6697,6 +6703,7 @@ mod tests {
                 Bound::Launch(LaunchRequest::Review) => "CODE REVIEW",
                 Bound::Launch(LaunchRequest::Dua) => "DISK USAGE",
                 Bound::Launch(LaunchRequest::Agent) => "CODING AGENT",
+                Bound::Launch(LaunchRequest::UpdateApplication) => "UPDATE",
                 Bound::Launcher(_) | Bound::Pointer(_, Pointing::Launcher) => "OPEN LAUNCHER",
                 Bound::Help(_) => "THIS HELP",
                 Bound::Screenshot(_) => "SCREENSHOT",

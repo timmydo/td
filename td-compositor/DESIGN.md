@@ -2733,8 +2733,11 @@ The launcher is a compositor-owned overlay, so opening it never depends on an
 already-running client. Its registry has a terminal entry that starts a
 `td-term`, one application entry for the admitted application the image names
 with `--launcher-application` (otherwise an input-monitor entry that starts
-`td-ui-demo`), six desktop-program entries in authority mode, and an
-explicit close entry. The desktop programs are system tools the image
+`td-ui-demo`), in authority mode that application's update entry and six
+desktop-program entries, and an explicit close entry. The update entry,
+labelled `UPDATE` and the name, issues private request 0e, which has root
+start the unit that checks the application's Flathub cache
+(APPLICATIONS.md §W.9). The desktop programs are system tools the image
 ships beside the terminal: Task Manager, Text Editor, Photos, Code
 Review, Disk Usage and Coding Agent issue fixed private requests 07, 08,
 09, 0a, 0b and 0c, and
@@ -2750,7 +2753,7 @@ defers, and it grows the card. The application entry's uppercase label and
 lowercase search term are derived from the exact bounded application name; the
 compositor does not carry a fixture- or Firefox-specific card. The terminal is
 FIRST, so it is what an unfiltered Enter opens. The card reserves space
-for nine entries; direct mode shows three.
+for ten entries; direct mode shows three.
 `registry_entries_are_searchable_and_fit_the_card` refuses overflow. Each entry
 owns a label, lowercase search terms, and a typed launch request. The pure
 launcher model stores a bounded 64-byte ASCII filter, requires every
@@ -2788,7 +2791,9 @@ launcher client or application-runtime path. An application name must use the
 image grammar. The supervised service owns the boot-started application
 instance: the application card activates a retained matching mapped surface,
 switching workspaces and leaving an unrelated fullscreen view if necessary. It
-reports a missing mapped surface and never starts another process. A direct
+never starts another process: with no mapped surface it asks the authority
+(request 0d) to have root start the application's supervised unit, which
+td-svc answers as already running if it is, and reports a refusal. A direct
 `/bin/<application>` request remains a separate supported route and no
 single-instance lock has landed. Direct `td-ui-demo` and `td-term` requests
 select their program and take the same two run flags. The compositor derives a
@@ -5556,7 +5561,12 @@ in the report answers today.
 `--terminal-authority stdin` selects the root-created private channel in place
 of `--terminal-client PATH`. Exactly one is required. Authority mode requires
 the supervised application card; that card activates its existing Wayland
-surface and never invokes a program. The image selects this client through
+surface and never invokes a program. When it finds no surface it asks the
+authority, with the name-free request `0d`, to have root start the
+application's supervised unit, and an "UPDATE NAME" row shown beside it in
+authority mode asks with `0e` for the unit that checks the application's
+Flathub cache (APPLICATIONS.md §W.9); each is answered at once and leaves
+no handle. The image selects this client through
 the paired service at UID 993.
 The direct launcher remains available for host development.
 
@@ -5570,9 +5580,9 @@ delegate an endpoint. The application protocol then completes its version and
 session-admission handshake before graphical startup proceeds.
 
 One worker owns the channel and every process handle. Input submits ordinary
-terminal launches, the private VM bridge may submit a fixed task-terminal
-launch, and physical input submits secret attempts through a capacity-one
-nonblocking queue; an
+terminal launches and the application's two supervised requests, the
+private VM bridge may submit a fixed task-terminal launch, and physical
+input submits secret attempts through a capacity-one nonblocking queue; an
 already-pending request is a reported refusal, never an input-thread wait.
 The worker serializes starts and polls one retained handle per loop iteration.
 It waits at most 250 ms for a new request before polling; sustained launches

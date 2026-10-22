@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 
 const CARD_WIDTH: usize = 480;
-const CARD_HEIGHT: usize = 462;
+const CARD_HEIGHT: usize = 504;
 const CARD: [u8; 4] = [0x20, 0x18, 0x28, 0];
 const HIGHLIGHT: [u8; 4] = [0x58, 0x30, 0x70, 0];
 const CARD_PADDING: usize = 24;
@@ -14,9 +14,11 @@ const MAX_LAUNCHED_CLIENTS: usize = 16;
 const MAX_APPLICATION_NAME_BYTES: usize = 32;
 const RESERVED_APPLICATION_NAMES: &[&str] = &["td-jail", "td-jail-reaper-probe"];
 const UI_ENTRY_INDEX: usize = 1;
+/// The configured application's update row, shown only with the authority.
+const UPDATE_ENTRY_INDEX: usize = UI_ENTRY_INDEX + 1;
 /// The rows before the authority's desktop programs: terminal, then the
-/// application or monitor.
-const LEADING_ENTRIES: usize = UI_ENTRY_INDEX + 1;
+/// application or monitor, then the application's update.
+const LEADING_ENTRIES: usize = UPDATE_ENTRY_INDEX + 1;
 /// The leading rows, the desktop programs, and close, which is always last.
 const ENTRY_COUNT: usize = LEADING_ENTRIES + AUTHORITY_ENTRIES.len() + 1;
 /// Where the first row's text starts below the card's top, how far apart
@@ -55,6 +57,8 @@ pub enum LaunchRequest {
     Review,
     Dua,
     Agent,
+    /// Check the configured application's Flathub cache now.
+    UpdateApplication,
 }
 
 impl LaunchRequest {
@@ -68,7 +72,7 @@ impl LaunchRequest {
             Self::Review => Some(crate::authority::Program::Review),
             Self::Dua => Some(crate::authority::Program::Dua),
             Self::Agent => Some(crate::authority::Program::Agent),
-            Self::UiDemo | Self::Terminal => None,
+            Self::UiDemo | Self::Terminal | Self::UpdateApplication => None,
         }
     }
 }
@@ -139,6 +143,8 @@ const DIRECT_UI_ENTRY: Entry = Entry {
 struct ApplicationEntry {
     label: String,
     search: String,
+    update_label: String,
+    update_search: String,
 }
 
 fn entry_at(
@@ -155,6 +161,14 @@ fn entry_at(
                 request: Some(LaunchRequest::UiDemo),
             }),
             None => Some(DIRECT_UI_ENTRY),
+        },
+        UPDATE_ENTRY_INDEX => match application {
+            Some(application) if authority => Some(Entry {
+                label: &application.update_label,
+                search: &application.update_search,
+                request: Some(LaunchRequest::UpdateApplication),
+            }),
+            _ => None,
         },
         index if index == ENTRY_COUNT - 1 => Some(CLOSE_ENTRY),
         index if authority => index
@@ -296,9 +310,22 @@ impl LaunchBackend {
         }
     }
 
+    /// The configured application has no window: ask root to start its
+    /// unit, which does nothing if it is already running.
+    pub fn start_application(&self) -> Result<(), String> {
+        match self {
+            Self::Authority(authority) => authority.supervise(crate::authority::Supervised::Start),
+            Self::Direct(_) => Err("starting the application requires the paired authority".into()),
+        }
+    }
+
     pub fn launch(&mut self, request: LaunchRequest) -> Result<Vec<String>, String> {
         match self {
             Self::Direct(processes) => processes.launch(request),
+            Self::Authority(authority) if request == LaunchRequest::UpdateApplication => {
+                authority.supervise(crate::authority::Supervised::Update)?;
+                Ok(Vec::new())
+            }
             Self::Authority(authority) if request == LaunchRequest::Terminal => {
                 authority.launch()?;
                 Ok(Vec::new())
@@ -391,6 +418,8 @@ impl Launcher {
         self.application = application.map(|name| ApplicationEntry {
             label: name.to_ascii_uppercase(),
             search: name.to_ascii_lowercase(),
+            update_label: format!("UPDATE {}", name.to_ascii_uppercase()),
+            update_search: format!("update check {}", name.to_ascii_lowercase()),
         });
         self.refresh_matches();
     }
@@ -759,6 +788,9 @@ pub(crate) fn launch_command(
         }
         (LaunchRequest::UiDemo, Some(_)) => {
             return Err("configured launcher application is activation-only".to_string());
+        }
+        (LaunchRequest::UpdateApplication, _) => {
+            return Err("application updates require the paired authority".into());
         }
         (LaunchRequest::UiDemo, None) => (
             options
@@ -1423,6 +1455,71 @@ mod tests {
 #[cfg(test)]
 mod authority_entry_tests {
     use super::*;
+
+    /// The configured application's update row (APPLICATIONS.md §W.9): only
+    /// beside its card and only when root can be asked, and opening the card
+    /// still comes first for its name.
+    #[test]
+    fn the_update_row_follows_the_application_and_the_authority() {
+        let mut launcher = Launcher::new();
+        launcher.set_application(Some("firefox"));
+        launcher.apply(LauncherAction::Open);
+        assert!(!launcher.matched_labels().contains(&"UPDATE FIREFOX"));
+        launcher.set_authority(true);
+        launcher.apply(LauncherAction::Open);
+        assert_eq!(
+            launcher.matched_labels().get(..3),
+            Some(&["NEW TERMINAL", "FIREFOX", "UPDATE FIREFOX"][..])
+        );
+        for character in "firefox".chars() {
+            launcher.apply(LauncherAction::Insert(character));
+        }
+        assert_eq!(launcher.matched_labels(), ["FIREFOX", "UPDATE FIREFOX"]);
+        assert_eq!(
+            launcher.apply(LauncherAction::Activate),
+            Some(LaunchRequest::UiDemo)
+        );
+        launcher.apply(LauncherAction::Open);
+        for character in "update".chars() {
+            launcher.apply(LauncherAction::Insert(character));
+        }
+        assert_eq!(launcher.matched_labels(), ["UPDATE FIREFOX"]);
+        assert_eq!(
+            launcher.apply(LauncherAction::Activate),
+            Some(LaunchRequest::UpdateApplication)
+        );
+        assert!(LaunchRequest::UpdateApplication
+            .authority_program()
+            .is_none());
+        launcher.set_application(None);
+        launcher.apply(LauncherAction::Open);
+        assert!(!launcher
+            .matched_labels()
+            .iter()
+            .any(|label| label.starts_with("UPDATE")));
+    }
+
+    /// The card's start and the update row each queue one name-free
+    /// request for the worker.
+    #[test]
+    fn the_backend_asks_root_for_the_applications_units() {
+        let (authority, queued) = crate::authority::Queued::launcher();
+        let mut backend = LaunchBackend::Authority(authority);
+        backend.start_application().unwrap();
+        assert_eq!(
+            queued.supervised(),
+            Some(crate::authority::Supervised::Start)
+        );
+        assert_eq!(
+            backend.launch(LaunchRequest::UpdateApplication),
+            Ok(Vec::new())
+        );
+        assert_eq!(
+            queued.supervised(),
+            Some(crate::authority::Supervised::Update)
+        );
+    }
+
     #[test]
     fn desktop_program_entries_are_enabled_only_for_the_fixed_authority() {
         let mut launcher = Launcher::new();

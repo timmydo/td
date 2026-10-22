@@ -11162,22 +11162,28 @@ account, neither of which writes a deploy it has selected. No jail sees
 the cache: `~/.td` may not be granted (the permission policy refuses
 it), and td-jail reserves it at launch as it reserves the state.
 
-**How a launch is requested.** Today nothing user-reachable starts an
-application: `td-authd application-start` is root-only and every
-application is a boot-time td-svc unit. Firefox's unit gains
-`unless-exists=` on a path the init script creates on every boot that
-does not carry the autotest token, so a normal boot skips it and an
-oracle boot starts it; it becomes `restart=never`, so closing Firefox
-keeps it closed. A fixed root worker unit, the `vm-power` pattern
-(td-svc/DESIGN.md §8), reads newline requests from a root-owned FIFO
-that only the session owner's uid may write: `start NAME` becomes
-`td-svc start NAME` and `update NAME` becomes `td-svc start NAME-update`,
-a oneshot that runs `td-app update NAME --force` as the account. NAME
-must be a row of the launcher table; nothing else is accepted. The
-compositor's launcher writes `start NAME` when an activated application
-has no window, which also delivers §W.7's plan (1) for every shipped
-application; `td-app request update firefox` writes the update request
-from a terminal.
+**How a launch is requested.** Over the compositor's existing private
+channel to root td-authd (td-authd/DESIGN.md, "Fixed program launch
+prerequisite"), which already pins the compositor's credentials and
+process: two one-byte requests that name nothing. `0d` asks root to run
+`td-svc start firefox`, `0e` `td-svc start firefox-update`; root holds
+both names, keeps at most one of each in flight, and answers at once
+(`84`). On a live boot both are refused, since that session runs only
+the installer. The launcher sends `0d` when the application's card finds no
+window, and `0e` from an "UPDATE FIREFOX" row beside the card, shown
+only with the authority, which is the forced check. `firefox-update` is
+a oneshot that runs `td-app update firefox --force` as `tda65536`, with
+`unless-exists=/` so that only a `start` ever runs it, and an hour's
+timeout. Starting the application's unit grants the human nothing it
+could not do by asking for a terminal, and the update runs as the
+application's account, so neither is an elevation (principle 7). A
+polled root worker reading a FIFO, considered first, would have needed
+a second authenticated path; the compositor runs as its own uid, not the
+human's, so the request is the compositor's either way. At cutover
+Firefox's unit gains `unless-exists=` on a path the init script creates
+on every boot that does not carry the autotest token, so a normal boot
+skips it and an oracle boot starts it, and it becomes `restart=never`,
+so closing Firefox keeps it closed.
 
 **The image no longer carries the payload.** At cutover the Firefox
 recipe stops naming `firefox-154-source` and the runtime; its package in
@@ -11245,7 +11251,7 @@ and `/bin/td-app` in the image, with no shipped spec yet in that form
 (landed fifth). td-app reaches Flathub from outside any jail as the
 account, as the mail and news fetchers already reach their servers;
 td has no per-uid egress filter to widen. (6) Launch requests and the
-compositor launcher. (7) Cutover: the declaration-only Firefox package,
+compositor launcher (landed sixth). (7) Cutover: the declaration-only Firefox package,
 Claude Code's runtime ref, autostart only under the autotest token, the
 oracles' feed transport, and deletion of the pins, payloads and graph
 transfer.

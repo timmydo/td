@@ -2828,6 +2828,10 @@ arguments, request 0a of /bin/td-review with the one fixed argument
 --choose-repo, and request 0c of /bin/td-agent with no arguments and
 three fixed environment variables, each started in the verified account
 home. They add no raw syscall, descriptor or credential operation.
+Requests 0d and 0e start no human program: root itself runs the fixed
+/bin/td-svc client with `start firefox` or `start firefox-update`
+through the same cleared spawn, and nothing else; they add no raw
+syscall, descriptor or credential operation either.
 Confinement pins the complete startup and launch sources as well as the raw
 channel boundary.
 

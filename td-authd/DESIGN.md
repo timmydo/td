@@ -528,8 +528,10 @@ Primary resolution precedes the startup audit; its bounded account read
 closes the file before the audit and retains no descriptor or child.
 The image compositor runs at its reserved identity and uses this channel
 for human terminals and the task manager. The configured application card
-activates a supervised window. Direct compositor spawning remains a
-host-development mode.
+activates a supervised window; when there is none it asks root to start
+the application's unit, and an update row beside it asks for the unit
+that checks the application's Flathub cache (APPLICATIONS.md §W.9).
+Direct compositor spawning remains a host-development mode.
 
 Startup requires all four root uid/gid columns, one thread, and only fd
 0/1/2 inherited from the trusted supervisor. It proves each standard
@@ -591,9 +593,29 @@ Subsequent payloads are exact byte records:
 | `0a` | `81` plus a process handle for the human code review window |
 | `0b` | `81` plus a process handle for the human disk usage analyzer |
 | `0c` | `81` plus a process handle for the human coding agent |
+| `0d` | `84` once root has started `/bin/td-svc start firefox` |
+| `0e` | `84` once root has started `/bin/td-svc start firefox-update` |
 
-A full table returns `ff 01`; a spawn failure returns `ff 02`. Every other
-request, trailing byte, unknown handle, wait error, timeout or transport
+`0d` and `0e` create no handle. Root runs the fixed td-svc client itself,
+with the same cleared environment, `/` and null standard descriptors,
+holds at most one of each kind in flight (`ff 01` while one runs, `ff
+02` if it cannot start), reaps each at a later request, logs a client
+that failed, and kills one still running after 12 seconds, as
+revocation bounds its own. On a live boot, while `/run/td-media`
+exists, both answer `ff 03`: the live table skips the application, and
+td-svc's `start` would run a skipped unit. There is no rate limit
+beyond one in flight: `0d` restarts a unit td-svc holds in backoff,
+and `0e` runs the forced check, which ignores td-app's daily
+throttle, each time the last one finished. The compositor already
+owns the session's input, so neither gives it more than repeating a
+click. The peer names no unit: both names are root's, and
+neither unit grants the human anything a launch does not, since the
+application runs as its own account and the update is td-app's forced
+check as that account.
+
+For a launch, a full table returns `ff 01`; a spawn failure returns
+`ff 02`. Every other request, trailing byte, unknown handle, wait error
+on a launched terminal (a supervised client's is logged), timeout or transport
 failure ends this channel generation, including ordinary peer EOF. td-svc
 already counts either peer's exit, even zero, as pair failure and applies
 its failure backoff. A malformed request therefore ends the graphical
@@ -713,7 +735,7 @@ no passphrase prompt, since td-pinentry runs only on a host. A terminal
 start of td-agent with those variables has the same reach; the card
 adds a way to start.
 
-An authority older than one of requests `07` through `0c` closes the
+An authority older than one of requests `07` through `0e` closes the
 entire launch channel on it; its paired compositor then restarts. The image ships
 both peers atomically. Those records were additive within TDLA002, without
 negotiation or mixed-version compatibility. The login requests `1b` and `1c`

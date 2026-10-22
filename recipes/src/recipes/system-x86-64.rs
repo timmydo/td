@@ -1393,6 +1393,7 @@ const TD_SVC_UNITS: &[&str] = &[
     "firefox-tls-origin",
     "firefox-autotest",
     "firefox",
+    "firefox-update",
     "firefox-evidence",
     "terminal-authority-evidence",
     "firefox-input",
@@ -1437,6 +1438,10 @@ mod svc_timeouts {
     pub const APPLICATION_EVIDENCE: u32 = 60;
     /// One control-channel request: a line in, and a line or a short report out.
     pub const APPLICATION_PLACE: u32 = 30;
+    /// A forced Flathub check: resolving two refs and, when either moved,
+    /// downloading and materializing a runtime or application of about a
+    /// gigabyte on a slow link, then the dynamic validator over both.
+    pub const APPLICATION_UPDATE: u32 = 3600;
     /// The script's own retry loop is clamped to BOOT_SUCCESS_RETRY_MAX_SECS iterations,
     /// but each runs a large probe farm (nine `exec-primary` blocks) and can run four
     /// transactional `td-boot update` passes plus a `rollback`, so an iteration is worth
@@ -2028,6 +2033,18 @@ fn build_td_svc_conf() -> String {
          ready-timeout={firefox_ready_timeout}\n\
          restart=always\n\
          \n\
+         # A check of Firefox's Flathub cache now (APPLICATIONS.md §W.9), as\n\
+         # its account: the launcher's update row asks td-authd, which asks\n\
+         # td-svc to start it. The root always exists, so it never runs at boot.\n\
+         [firefox-update]\n\
+         type=oneshot\n\
+         cgroup=session\n\
+         unless-exists=/\n\
+         exec=/bin/td-login exec-service-as tda65536 -- /bin/td-app update {firefox_name} --force\n\
+         after=td-firstboot\n\
+         requires=td-firstboot\n\
+         timeout={application_update}\n\
+         \n\
          # This application is test evidence, not deployment health. The exact\n\
          # compositor, live-cgroup and Firefox support probes must succeed before\n\
          # trusted unit code prints the marker, but mutable user state cannot\n\
@@ -2234,6 +2251,7 @@ fn build_td_svc_conf() -> String {
         application_workspace = TERMINAL_APPLICATION_WORKSPACE,
         application_evidence = svc_timeouts::APPLICATION_EVIDENCE,
         application_place = svc_timeouts::APPLICATION_PLACE,
+        application_update = svc_timeouts::APPLICATION_UPDATE,
         placed_marker = TD_APPLICATIONS_PLACED_MARKER,
         firefox_content_marker = TD_FIREFOX_CONTENT_MARKER,
         firefox_support_marker = TD_FIREFOX_SUPPORT_MARKER,
@@ -5922,6 +5940,47 @@ mod tests {
         );
     }
 
+    /// td-authd starts the configured application's units by name for the
+    /// compositor (APPLICATIONS.md §W.9): both exist, the update runs td-app
+    /// as Firefox's account, and neither the update nor anything else
+    /// runs it at boot.
+    #[test]
+    fn the_supervised_requests_name_real_units() {
+        const LAUNCH: &str = include_str!("../../../td-authd/src/launch.rs");
+        assert!(LAUNCH.contains(
+            "Self::Start => \"firefox\",\n            Self::Update => \"firefox-update\","
+        ));
+        assert!(unit_key("firefox", "exec").is_some());
+        // Root refuses both on a live boot by the path that gates the units.
+        assert!(LAUNCH.contains(&format!("const LIVE_MEDIUM: &str = \"{LIVE_MEDIUM}\";")));
+        assert_eq!(
+            unit_key("firefox", "unless-exists").as_deref(),
+            Some(LIVE_MEDIUM)
+        );
+        assert_eq!(
+            unit_key("firefox-update", "type").as_deref(),
+            Some("oneshot")
+        );
+        assert_eq!(
+            unit_key("firefox-update", "unless-exists").as_deref(),
+            Some("/")
+        );
+        assert_eq!(
+            unit_key("firefox-update", "exec").as_deref(),
+            Some("/bin/td-login exec-service-as tda65536 -- /bin/td-app update firefox --force")
+        );
+        assert!(unit_key("firefox", "exec")
+            .is_some_and(|exec| exec.contains("application-start 1000 firefox ")));
+        assert_eq!(
+            unit_key("firefox-update", "requires").as_deref(),
+            Some("td-firstboot")
+        );
+        assert_eq!(
+            unit_key("firefox-update", "timeout"),
+            Some(svc_timeouts::APPLICATION_UPDATE.to_string())
+        );
+    }
+
     /// td-secret's login worker relies on td-svc to serialize it across
     /// td-authd processes (td-secret/DESIGN.md, "Login-key worker"): only
     /// one unit runs the serving authority, the pair-exec unit whose leaf
@@ -8110,6 +8169,9 @@ mod tests {
                     .collect();
                 match paths.as_slice() {
                     [] => None,
+                    // An on-demand unit (APPLICATIONS.md §W.9): the root
+                    // always exists, so only td-svc's `start` runs it.
+                    [path] if path.as_str() == "/" && name == "firefox-update" => None,
                     [path] => {
                         assert_eq!(path.as_str(), LIVE_MEDIUM, "{name}");
                         Some(name)

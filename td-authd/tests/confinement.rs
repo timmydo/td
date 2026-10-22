@@ -969,7 +969,14 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert_eq!(launch.matches(".spawn(").count(), 1);
     assert_eq!(launch.matches(".exec()").count(), 1);
     assert_eq!(launch.matches(".process_group(0)").count(), 1);
-    assert_eq!(launch.matches("Command::new(").count(), 4);
+    assert_eq!(launch.matches("Command::new(").count(), 5);
+    // The one root command a peer can cause beside the credential helper:
+    // its supervisor starting one of two fixed units.
+    assert!(launch.contains(
+        "Command::new(\"/bin/td-svc\");\n        command.args([\"start\", unit.name()]);"
+    ));
+    assert!(launch
+        .contains("Self::Start => \"firefox\",\n            Self::Update => \"firefox-update\","));
     assert_eq!(launch.matches(".stdin(Stdio::null())").count(), 1);
     assert_eq!(launch.matches(".stdout(Stdio::null())").count(), 1);
     assert_eq!(launch.matches(".stderr(Stdio::null())").count(), 1);
@@ -1171,7 +1178,7 @@ const LOGIN_STATE_FINGERPRINT: u64 = 0x10b1af1d87d02b94;
 const SHARED_LOGIN_STATE_FINGERPRINT: u64 = 0x36b736e5dda17cc6;
 const SHARED_HOSTNAME_FINGERPRINT: u64 = 0x49026f28c1db76ec;
 
-const LAUNCH_FINGERPRINT: u64 = 0x73229ac7c8bf6263;
+const LAUNCH_FINGERPRINT: u64 = 0xc671407f5365e81d;
 const MAIN_FINGERPRINT: u64 = 0xd03c9fa382ca5d9a;
 const SESSION_FINGERPRINT: u64 = 0x595c2dcc5491ebac;
 
