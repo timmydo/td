@@ -1,4 +1,4 @@
-use crate::ladder::{BUILD_ROOT_PATH as PATH, BUILD_ROOT_SH as SH};
+use crate::shared::{BUILD_ROOT_PATH as PATH, BUILD_ROOT_SH as SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 // td-sh-test: build-shape validation of the target-built shell.
@@ -117,6 +117,6 @@ mod tests {
     /// by its own: the root's bash is the independent shell.
     #[test]
     fn td_sh_is_graded_only_by_the_roots_bash_and_tools() {
-        crate::ladder::assert_build_root_test(&super::recipe(), &["td-sh"], &["td-sh"]);
+        crate::shared::assert_build_root_test(&super::recipe(), &["td-sh"], &["td-sh"]);
     }
 }

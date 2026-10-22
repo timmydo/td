@@ -1,4 +1,4 @@
-use crate::ladder::{BUILD_ROOT_PATH as PATH, BUILD_ROOT_SH as SH};
+use crate::shared::{BUILD_ROOT_PATH as PATH, BUILD_ROOT_SH as SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 // td-firstboot-test: build-shape AND behavioural validation of the per-machine
@@ -379,7 +379,7 @@ mod tests {
     fn only_the_roots_tools_are_on_path() {
         let recipe = super::recipe();
         let subjects = ["td-firstboot", "td-mail", "td-news"];
-        crate::ladder::assert_build_root_test(&recipe, &subjects, &subjects);
+        crate::shared::assert_build_root_test(&recipe, &subjects, &subjects);
         let stubs: Vec<&str> = recipe
             .steps
             .iter()

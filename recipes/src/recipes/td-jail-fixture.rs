@@ -3,11 +3,11 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 use td_engine::launcher::LauncherDeclaration;
 use td_engine::permissions::{FilesystemAccess, PermissionPolicy, PermissionSocket};
 
-const APPLICATION_ENTRY: &str = crate::ladder::TD_JAIL_FIXTURE_ENTRY;
-const APPLICATION_ALIAS: &str = crate::ladder::TD_JAIL_FIXTURE_ALIAS;
-const APPLICATION_NAME: &str = crate::ladder::TD_JAIL_FIXTURE_NAME;
-const APPLICATION_DISPLAY_NAME: &str = crate::ladder::TD_JAIL_FIXTURE_DISPLAY_NAME;
-const APPLICATION_SEARCH_TERMS: &[&str] = crate::ladder::TD_JAIL_FIXTURE_SEARCH_TERMS;
+const APPLICATION_ENTRY: &str = crate::shared::TD_JAIL_FIXTURE_ENTRY;
+const APPLICATION_ALIAS: &str = crate::shared::TD_JAIL_FIXTURE_ALIAS;
+const APPLICATION_NAME: &str = crate::shared::TD_JAIL_FIXTURE_NAME;
+const APPLICATION_DISPLAY_NAME: &str = crate::shared::TD_JAIL_FIXTURE_DISPLAY_NAME;
+const APPLICATION_SEARCH_TERMS: &[&str] = crate::shared::TD_JAIL_FIXTURE_SEARCH_TERMS;
 
 pub fn recipe() -> Recipe {
     let Ok(declaration) = ApplicationDeclaration::new("empty-runtime", APPLICATION_ENTRY)
@@ -23,28 +23,28 @@ pub fn recipe() -> Recipe {
         .with_socket(PermissionSocket::Wayland)
         .and_then(|permissions| {
             permissions.with_filesystem(
-                crate::ladder::TD_JAIL_FIXTURE_DOWNLOAD_PERMISSION,
+                crate::shared::TD_JAIL_FIXTURE_DOWNLOAD_PERMISSION,
                 FilesystemAccess::ReadWrite,
                 true,
             )
         })
         .and_then(|permissions| {
             permissions.with_filesystem(
-                crate::ladder::TD_JAIL_FIXTURE_PICTURES_PERMISSION,
+                crate::shared::TD_JAIL_FIXTURE_PICTURES_PERMISSION,
                 FilesystemAccess::ReadOnly,
                 true,
             )
         })
         .and_then(|permissions| {
             permissions.with_filesystem(
-                crate::ladder::TD_JAIL_FIXTURE_GRANT_FILE,
+                crate::shared::TD_JAIL_FIXTURE_GRANT_FILE,
                 FilesystemAccess::ReadOnly,
                 false,
             )
         })
         .and_then(|permissions| {
             permissions.with_filesystem(
-                crate::ladder::TD_JAIL_FIXTURE_GRANT_ROOT,
+                crate::shared::TD_JAIL_FIXTURE_GRANT_ROOT,
                 FilesystemAccess::ReadOnly,
                 false,
             )
@@ -117,8 +117,8 @@ mod tests {
                 .to_keyfile(),
             format!(
                 "format=2\n\n[Context]\nsockets=wayland\n\n[Filesystem]\n{}=ro\n{}=ro\nxdg-download=rw:create\nxdg-pictures=ro:create\n\n[Resources]\nmemory-high=50331648\nmemory-max=67108864\npids-max=32\ncpu-max=50000 100000\n",
-                crate::ladder::TD_JAIL_FIXTURE_GRANT_ROOT,
-                crate::ladder::TD_JAIL_FIXTURE_GRANT_FILE,
+                crate::shared::TD_JAIL_FIXTURE_GRANT_ROOT,
+                crate::shared::TD_JAIL_FIXTURE_GRANT_FILE,
             )
         );
     }

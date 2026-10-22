@@ -1,4 +1,4 @@
-use crate::ladder::{
+use crate::shared::{
     build_root_dynamic_cc, build_root_link_map_check, unpack_into, LinkedLibc, BUILD_ROOT_PATH,
     BUILD_ROOT_SH as SH,
 };
@@ -312,6 +312,6 @@ mod tests {
 
     #[test]
     fn compiler_policy_follows_package_flags() {
-        crate::ladder::assert_build_root_dynamic_c(&recipe());
+        crate::shared::assert_build_root_dynamic_c(&recipe());
     }
 }

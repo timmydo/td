@@ -1,4 +1,4 @@
-use crate::ladder::{
+use crate::shared::{
     build_root_link_map_check, build_root_static_cc, unpack_into, unpack_keep_top, LinkedLibc,
     BUILD_ROOT_PATH, BUILD_ROOT_SH as SH,
 };
@@ -199,7 +199,7 @@ mod tests {
     #[test]
     fn shipped_binary_follows_the_target_profile_and_is_split() {
         let recipe = recipe();
-        crate::ladder::assert_build_root_static_c(&recipe);
+        crate::shared::assert_build_root_static_c(&recipe);
         let inputs = recipe.native_inputs.clone().unwrap_or_default();
         for required in [
             "util-linux-libs-x86-64",

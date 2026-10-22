@@ -1,4 +1,4 @@
-use crate::ladder::{BUILD_ROOT_PATH as PATH, BUILD_ROOT_SH as SH};
+use crate::shared::{BUILD_ROOT_PATH as PATH, BUILD_ROOT_SH as SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 // td-txt-test: build-shape validation of the target-built text userland.
@@ -139,6 +139,6 @@ mod tests {
     /// never by its own: no grep on PATH is td-txt.
     #[test]
     fn td_txt_is_graded_only_by_the_roots_grep_and_tools() {
-        crate::ladder::assert_build_root_test(&super::recipe(), &["td-txt"], &["td-txt"]);
+        crate::shared::assert_build_root_test(&super::recipe(), &["td-txt"], &["td-txt"]);
     }
 }

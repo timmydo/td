@@ -1,4 +1,4 @@
-use crate::ladder::{
+use crate::shared::{
     build_root_dynamic_cc, build_root_link_map_check, unpack_into, LinkedLibc, BUILD_ROOT_PATH,
     BUILD_ROOT_SH as SH,
 };
@@ -390,7 +390,7 @@ mod tests {
     #[test]
     fn build_root_wrapper_and_config_keep_the_target_profile() {
         let recipe = recipe();
-        crate::ladder::assert_build_root_dynamic_c(&recipe);
+        crate::shared::assert_build_root_dynamic_c(&recipe);
         let config = recipe
             .steps
             .unwrap_or_default()

@@ -5,7 +5,7 @@ use crate::types::Recipe;
 /// It speaks the installation service's two protocols through the
 /// service's own codecs.
 pub fn recipe() -> Recipe {
-    crate::ladder::static_local_source_program(
+    crate::shared::static_local_source_program(
         "td-install-qemu-test",
         &[
             (

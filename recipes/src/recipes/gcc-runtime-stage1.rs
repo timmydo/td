@@ -1,6 +1,6 @@
 use super::gcc_runtime::{gcc_configure, gcc_make, gcc_source, search_probe, TARGET_CFLAGS};
 use super::glibc_x86_64::{glibc_configure, KERNEL_HEADER_DIRS, PREFIX as GLIBC_PREFIX};
-use crate::ladder::{unpack_into, unpack_keep_top, BUILD_ROOT_PATH as PATH, BUILD_ROOT_SH as SH};
+use crate::shared::{unpack_into, unpack_keep_top, BUILD_ROOT_PATH as PATH, BUILD_ROOT_SH as SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 // gcc-runtime-stage1 is the static GCC 14.3.0 runtime glibc-x86-64 links:

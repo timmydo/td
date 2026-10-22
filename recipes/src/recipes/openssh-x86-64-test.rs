@@ -1,4 +1,4 @@
-use crate::ladder::{BUILD_ROOT_PATH, BUILD_ROOT_SH as SH};
+use crate::shared::{BUILD_ROOT_PATH, BUILD_ROOT_SH as SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 pub fn recipe() -> Recipe {
@@ -185,7 +185,7 @@ mod tests {
     #[test]
     fn validation_uses_only_the_built_client_server_and_the_roots_tools() {
         let recipe = recipe();
-        crate::ladder::assert_build_root_test(&recipe, &["openssh-x86-64", "glibc-x86-64"], &[]);
+        crate::shared::assert_build_root_test(&recipe, &["openssh-x86-64", "glibc-x86-64"], &[]);
         assert_eq!(
             recipe.native_inputs.as_deref(),
             Some(

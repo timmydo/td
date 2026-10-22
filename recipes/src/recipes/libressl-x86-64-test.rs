@@ -1,4 +1,4 @@
-use crate::ladder::{
+use crate::shared::{
     build_root_dynamic_cc, build_root_link_map_check, LinkedLibc, BUILD_ROOT_PATH as PATH,
     BUILD_ROOT_SH as SH,
 };
@@ -344,7 +344,7 @@ mod tests {
     #[test]
     fn validation_uses_only_the_final_tls_outputs_and_the_root() {
         let recipe = recipe();
-        crate::ladder::assert_build_root_test(
+        crate::shared::assert_build_root_test(
             &recipe,
             &["libressl-x86-64", "glibc-x86-64", "gcc-runtime"],
             &[],
@@ -358,11 +358,11 @@ mod tests {
             )
         );
         assert!(recipe.inputs.is_none());
-        crate::ladder::assert_probe_link_checked(
+        crate::shared::assert_probe_link_checked(
             &recipe,
             "tls-test",
             &["gcc-runtime", "libressl-x86-64"],
-            crate::ladder::LinkedLibc::Shared,
+            crate::shared::LinkedLibc::Shared,
         );
     }
 }

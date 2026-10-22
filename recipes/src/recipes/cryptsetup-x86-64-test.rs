@@ -1,5 +1,5 @@
 use super::cryptsetup_x86_64::VERSION_LINE;
-use crate::ladder::{BUILD_ROOT_PATH as PATH, BUILD_ROOT_SH as SH};
+use crate::shared::{BUILD_ROOT_PATH as PATH, BUILD_ROOT_SH as SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 // Check the realized cryptsetup's compiled-in surface: the exact feature line,
@@ -62,7 +62,7 @@ mod tests {
     #[test]
     fn the_checks_run_in_the_build_root() {
         let recipe = recipe();
-        crate::ladder::assert_build_root_test(&recipe, &["cryptsetup-x86-64"], &[]);
+        crate::shared::assert_build_root_test(&recipe, &["cryptsetup-x86-64"], &[]);
         assert_eq!(
             recipe.native_inputs.as_deref(),
             Some(["cryptsetup-x86-64".to_string()].as_slice())

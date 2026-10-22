@@ -23,8 +23,8 @@ mod source_closure;
 // (one copy for td-recipe-eval + td-builder). Re-exported so `crate::json::` /
 // `td_recipe::json::` paths are unchanged.
 pub use td_engine::json;
-pub mod ladder;
 pub mod ostree_pins;
+pub mod shared;
 #[cfg(test)]
 pub mod permissions {
     pub use td_engine::permissions::*;

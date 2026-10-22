@@ -1,4 +1,4 @@
-use crate::ladder::{BUILD_ROOT_GLIBC, BUILD_ROOT_PATH as PATH, BUILD_ROOT_SH as SH};
+use crate::shared::{BUILD_ROOT_GLIBC, BUILD_ROOT_PATH as PATH, BUILD_ROOT_SH as SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 // rust-userland-auto-test: the runtime contract of the Rust userland the
@@ -179,7 +179,7 @@ mod tests {
     /// The four programs are graded only by the root's bash and tools.
     #[test]
     fn the_userland_is_graded_only_by_the_roots_bash_and_tools() {
-        crate::ladder::assert_build_root_test(
+        crate::shared::assert_build_root_test(
             &super::recipe(),
             super::INPUTS,
             &["ripgrep", "fd", "td-news", "td-mail"],

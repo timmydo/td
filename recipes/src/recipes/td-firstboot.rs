@@ -1,4 +1,4 @@
-use crate::ladder::{split_target_debug, target_rustc};
+use crate::shared::{split_target_debug, target_rustc};
 use crate::types::{Recipe, Step};
 
 // td-firstboot — target-built static binary that mints td's PER-MACHINE identity.
@@ -388,7 +388,7 @@ pub fn recipe() -> Recipe {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ladder::{
+    use crate::shared::{
         TD_FIRSTBOOT_HOST_KEY_PREFIX, TD_FIRSTBOOT_NEW_MARKER, TD_FIRSTBOOT_STABLE_MARKER,
         TD_PRINCIPALS_MARKER,
     };
@@ -429,7 +429,7 @@ mod tests {
     /// out of the embedded source the way the markers are.
     #[test]
     fn the_shipped_binary_provisions_under_the_state_root_the_ladder_declares() {
-        let state_root = crate::ladder::TD_APPLICATION_CONFIG_TEXT
+        let state_root = crate::shared::TD_APPLICATION_CONFIG_TEXT
             .lines()
             .find_map(|line| line.strip_prefix("state-root="))
             .expect("the jail configuration text names a state root");

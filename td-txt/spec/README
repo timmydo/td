@@ -3338,7 +3338,7 @@ td-txt-authored case files
     A follow-up this entry once claimed is NOT available, and the reason is
     kept so it is not proposed a second time. glibc's build wants `grep -ob U`
     and the recipes replaced it with an awk program -- but not because td-txt
-    refused the option. `recipes/src/ladder.rs` gives the real reason: the grep
+    refused the option. `recipes/src/shared.rs` gives the real reason: the grep
     on that rung's PATH is `grep-mesboot0` 2.4, which PREDATES `-o`. td-txt
     cannot be that grep at any price, its own `native_inputs` naming
     `glibc-x86-64` and `rust-toolchain` -- so it is built long after the rung

@@ -1,4 +1,4 @@
-use crate::ladder::{BUILD_ROOT_GLIBC, BUILD_ROOT_PATH as PATH, BUILD_ROOT_SH as SH};
+use crate::shared::{BUILD_ROOT_GLIBC, BUILD_ROOT_PATH as PATH, BUILD_ROOT_SH as SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 // rust-toolchain-test: the shape of the shipped upstream Rust toolchain and
@@ -215,7 +215,7 @@ mod tests {
     /// and tools: the runtime libraries are inputs for their paths alone.
     #[test]
     fn the_toolchain_is_graded_only_by_the_roots_bash_and_tools() {
-        crate::ladder::assert_build_root_test(
+        crate::shared::assert_build_root_test(
             &super::recipe(),
             super::INPUTS,
             &["rust-toolchain", "td-link", "ripgrep", "fd", "uutils"],

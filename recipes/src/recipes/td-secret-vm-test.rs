@@ -1,4 +1,4 @@
-use crate::ladder::split_target_debug;
+use crate::shared::split_target_debug;
 use crate::types::{Recipe, Step};
 
 // Reuses td-authd/ and td-secret/ embeds, including td-firstboot/ and td-busd/.

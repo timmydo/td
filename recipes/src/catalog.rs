@@ -322,7 +322,7 @@ mod tests {
                         td_link_stages.push((linker.to_string(), output));
                     }
                     "td-link-test" if linker == "cc" => {}
-                    _ => assert_eq!(linker, crate::ladder::TD_LINK, "{stem}: links with td-link"),
+                    _ => assert_eq!(linker, crate::shared::TD_LINK, "{stem}: links with td-link"),
                 }
                 let build_remaps: Vec<&str> = argv
                     .iter()
@@ -417,7 +417,7 @@ mod tests {
                 stem == "td-link-test" || recipe.build_root,
                 "{stem}: a direct Rust recipe builds in the build root"
             );
-            crate::ladder::assert_no_tool_farm(&recipe, &[]);
+            crate::shared::assert_no_tool_farm(&recipe, &[]);
             let objcopy = "/usr/bin/objcopy";
             assert!(
                 stem == "td-link-test"
@@ -468,7 +468,7 @@ mod tests {
                 ["rust-toolchain", "td-link", "glibc-x86-64"],
                 "{stem}: a Cargo target's toolchain, linker and C headers"
             );
-            crate::ladder::assert_no_tool_farm(&recipe, &[]);
+            crate::shared::assert_no_tool_farm(&recipe, &[]);
             // Only these build scripts compile C, each to an exact count.
             let objects = match stem {
                 "td-net" => Some(30),

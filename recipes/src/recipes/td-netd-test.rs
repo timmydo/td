@@ -1,4 +1,4 @@
-use crate::ladder::{BUILD_ROOT_PATH as PATH, BUILD_ROOT_SH as SH};
+use crate::shared::{BUILD_ROOT_PATH as PATH, BUILD_ROOT_SH as SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 // td-netd-test: shape validation of the target-built network daemon. Its
@@ -99,6 +99,6 @@ mod tests {
     /// td-netd is examined only by the Debian build root's tools, never by its own.
     #[test]
     fn td_netd_is_examined_only_by_the_roots_tools() {
-        crate::ladder::assert_build_root_test(&super::recipe(), &["td-netd"], &["td-netd"]);
+        crate::shared::assert_build_root_test(&super::recipe(), &["td-netd"], &["td-netd"]);
     }
 }

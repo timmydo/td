@@ -3847,7 +3847,7 @@ already marked successful it returns before doing anything else, so it stays
 an observation.
 
 Two clocks run over that loop and both had to move. `svc_timeouts::BOOTSUCCESS`
-is td-svc's backstop on the unit; `ladder::DEFAULT_BOOT_TIMEOUT_SECS` is the
+is td-svc's backstop on the unit; `shared::DEFAULT_BOOT_TIMEOUT_SECS` is the
 host's ceiling on the whole boot, and it is declared in `ladder` rather than
 beside the oracle so the guest side can assert the relation between them. A
 host that gives up first turns a diagnosable unhealthy boot into a bare

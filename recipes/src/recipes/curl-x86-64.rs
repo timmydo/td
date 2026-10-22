@@ -1,4 +1,4 @@
-use crate::ladder::{build_root_static_cc, unpack_into, BUILD_ROOT_PATH, BUILD_ROOT_SH as SH};
+use crate::shared::{build_root_static_cc, unpack_into, BUILD_ROOT_PATH, BUILD_ROOT_SH as SH};
 use crate::types::{Recipe, Step};
 
 // Static libcurl for Git's HTTP and HTTPS transports. This is intentionally a
@@ -230,7 +230,7 @@ mod tests {
     #[test]
     fn build_root_wrapper_and_cflags_keep_the_target_profile() {
         let recipe = recipe();
-        crate::ladder::assert_build_root_static_c(&recipe);
+        crate::shared::assert_build_root_static_c(&recipe);
         let cflags = recipe
             .steps
             .unwrap_or_default()

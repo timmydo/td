@@ -8,10 +8,10 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 use td_engine::launcher::LauncherDeclaration;
 use td_engine::permissions::{PermissionPolicy, PermissionSocket};
 
-const APPLICATION_NAME: &str = crate::ladder::TD_NEWS_NAME;
-const APPLICATION_ENTRY: &str = crate::ladder::TD_NEWS_ENTRY;
-const APPLICATION_DISPLAY_NAME: &str = crate::ladder::TD_NEWS_DISPLAY_NAME;
-const APPLICATION_SEARCH_TERMS: &[&str] = crate::ladder::TD_NEWS_SEARCH_TERMS;
+const APPLICATION_NAME: &str = crate::shared::TD_NEWS_NAME;
+const APPLICATION_ENTRY: &str = crate::shared::TD_NEWS_ENTRY;
+const APPLICATION_DISPLAY_NAME: &str = crate::shared::TD_NEWS_DISPLAY_NAME;
+const APPLICATION_SEARCH_TERMS: &[&str] = crate::shared::TD_NEWS_SEARCH_TERMS;
 /// The source-built static binary this package wraps, and its recipe.
 const PROGRAM: &str = "td-news";
 const PROGRAM_RECIPE: &str = "td-news";

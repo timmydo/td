@@ -1,4 +1,4 @@
-use crate::ladder::{
+use crate::shared::{
     build_root_static_cc, unpack_into, unpack_keep_top, BUILD_ROOT_PATH, BUILD_ROOT_SH as SH,
 };
 use crate::types::{Recipe, Step};
@@ -9,7 +9,7 @@ use crate::types::{Recipe, Step};
 // libdevmapper.a and libdevmapper.h.
 //
 // Built in the Debian build root against td glibc and gcc-runtime
-// (`ladder::build_root_static_cc`), under the shipped target profile
+// (`shared::build_root_static_cc`), under the shipped target profile
 // (td-profiler/DESIGN.md §2), because its objects are linked into cryptsetup.
 pub fn recipe() -> Recipe {
     let path = format!("{{root}}/wb:{BUILD_ROOT_PATH}");
@@ -124,6 +124,6 @@ pub fn recipe() -> Recipe {
 mod tests {
     #[test]
     fn archives_are_compiled_in_the_build_root_under_the_target_profile() {
-        crate::ladder::assert_build_root_static_c(&super::recipe());
+        crate::shared::assert_build_root_static_c(&super::recipe());
     }
 }

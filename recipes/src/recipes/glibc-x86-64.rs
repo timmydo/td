@@ -1,4 +1,4 @@
-use crate::ladder::{
+use crate::shared::{
     relocate_ld_scripts, unpack_into, unpack_keep_top, BUILD_ROOT_PATH as PATH, BUILD_ROOT_SH as SH,
 };
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step, TextEdit};

@@ -1,4 +1,4 @@
-use crate::ladder::{split_target_debug, target_rustc};
+use crate::shared::{split_target_debug, target_rustc};
 use crate::types::{Recipe, Step};
 
 // td-txt — target-built static text userland (busybox `grep`/`sed` replacement).

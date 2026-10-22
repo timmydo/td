@@ -1,4 +1,4 @@
-use crate::ladder::{split_target_debug, target_rustc};
+use crate::shared::{split_target_debug, target_rustc};
 use crate::types::{Recipe, Step};
 
 // Every source below is written out with a WriteFile, which the ladder
@@ -325,13 +325,13 @@ pub fn recipe() -> Recipe {
 mod tests {
     use super::super::system_x86_64::{ROOTCHECK_ETC_NAME, SHADOW_ETC_NAME};
     use super::*;
-    use crate::ladder::{
+    use crate::shared::{
         TD_APPLICATION_CONFIG_PATH, TD_APPLICATION_LAUNCHER_TABLE, TD_APPLICATION_REGISTRY,
         TD_JAIL_FIXTURE_ALIAS, TD_JAIL_FIXTURE_DOWNLOAD_TARGET, TD_JAIL_FIXTURE_ENTRY,
         TD_JAIL_FIXTURE_GRANT_FILE, TD_JAIL_FIXTURE_GRANT_ROOT, TD_JAIL_FIXTURE_PICTURES_TARGET,
         TD_POINTER_ABSOLUTE_MARKER, TD_UI_CLIENT_RUNTIME_MARKER, TD_WAYLAND_RUNTIME_MARKER,
     };
-    use crate::ladder::{TD_COMPOSITOR_FLIP_MARKER, TD_COMPOSITOR_KMS_MARKER};
+    use crate::shared::{TD_COMPOSITOR_FLIP_MARKER, TD_COMPOSITOR_KMS_MARKER};
 
     #[test]
     fn embedded_rust_does_not_contain_live_recipe_templates() {

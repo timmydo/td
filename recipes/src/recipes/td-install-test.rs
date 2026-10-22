@@ -1,4 +1,4 @@
-use crate::ladder::{BUILD_ROOT_PATH as PATH, BUILD_ROOT_SH as SH};
+use crate::shared::{BUILD_ROOT_PATH as PATH, BUILD_ROOT_SH as SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 use crate::td_boot_protocol;
@@ -528,7 +528,7 @@ mod tests {
     #[test]
     fn only_the_roots_tools_are_on_path() {
         let subjects = ["td-install", "td-boot", "td-btrfs"];
-        crate::ladder::assert_build_root_test(&super::recipe(), &subjects, &subjects);
+        crate::shared::assert_build_root_test(&super::recipe(), &subjects, &subjects);
     }
 
     /// The deployment id the check looks for is the one td-boot will compute:

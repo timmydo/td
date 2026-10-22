@@ -1,4 +1,4 @@
-use crate::ladder::{BUILD_ROOT_PATH as PATH, BUILD_ROOT_SH as SH};
+use crate::shared::{BUILD_ROOT_PATH as PATH, BUILD_ROOT_SH as SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 const GOOD_ID: &str = "ba7dfe039aae6703b7c58003bf32909c9b9df7801d4d18bd72bf3fa8425ecd0b";
@@ -147,6 +147,6 @@ mod tests {
     /// td-boot is graded only by the Debian build root's tools, never by its own.
     #[test]
     fn td_boot_is_graded_only_by_the_roots_tools() {
-        crate::ladder::assert_build_root_test(&super::recipe(), &["td-boot"], &["td-boot"]);
+        crate::shared::assert_build_root_test(&super::recipe(), &["td-boot"], &["td-boot"]);
     }
 }

@@ -1,4 +1,4 @@
-use crate::ladder::{split_target_debug, target_rustc_at_roots};
+use crate::shared::{split_target_debug, target_rustc_at_roots};
 use crate::types::{Recipe, Step};
 
 // Target-built static deployment verifier and kexec boot shim. The shipped
@@ -599,7 +599,7 @@ mod tests {
     // td-boot's own files are `builder/src/affected.rs`'s staging guard's.
     #[test]
     fn every_sibling_crate_source_is_staged() {
-        crate::ladder::assert_sibling_sources_staged(
+        crate::shared::assert_sibling_sources_staged(
             super::recipe(),
             &["td-tpm", "td-fido", "td-json", "td-protector", "td-fat"],
         );

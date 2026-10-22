@@ -1,4 +1,4 @@
-use crate::ladder::{BUILD_ROOT_PATH as PATH, BUILD_ROOT_SH as SH};
+use crate::shared::{BUILD_ROOT_PATH as PATH, BUILD_ROOT_SH as SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 // td-svc-test: build-shape AND behavioural validation of the service supervisor.
@@ -676,6 +676,6 @@ mod tests {
     /// bash.
     #[test]
     fn td_svc_is_graded_only_by_the_roots_bash_and_tools() {
-        crate::ladder::assert_build_root_test(&super::recipe(), &["td-svc"], &["td-svc"]);
+        crate::shared::assert_build_root_test(&super::recipe(), &["td-svc"], &["td-svc"]);
     }
 }

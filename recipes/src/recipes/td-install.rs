@@ -1,4 +1,4 @@
-use crate::ladder::{split_target_debug, target_rustc};
+use crate::shared::{split_target_debug, target_rustc};
 use crate::types::{Recipe, Step};
 
 // Target-built static disk installer. The shipped source reuses the engine's
@@ -567,7 +567,7 @@ pub fn recipe() -> Recipe {
 mod tests {
     #[test]
     fn every_sibling_crate_source_is_staged() {
-        crate::ladder::assert_sibling_sources_staged(
+        crate::shared::assert_sibling_sources_staged(
             super::recipe(),
             &["td-tpm", "td-fido", "td-json", "td-protector", "td-fat"],
         );

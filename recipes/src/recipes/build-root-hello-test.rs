@@ -1,4 +1,4 @@
-use crate::ladder::{BUILD_ROOT_PATH, BUILD_ROOT_SH};
+use crate::shared::{BUILD_ROOT_PATH, BUILD_ROOT_SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 // The Debian build root (AGENTS.md) as a sandbox root: its gcc

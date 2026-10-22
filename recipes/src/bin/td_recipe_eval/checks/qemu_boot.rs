@@ -68,85 +68,85 @@ use td_recipe::td_boot_protocol;
 
 /// The initramfs /init prints this exact line on ttyS0 once the kernel has reached
 /// userspace and executed its static td-sh. Sourced from the SHARED
-/// `ladder::USERLAND_MARKER` const so the /init script (linux-x86-64.rs), the cpio
-/// shape check (ladder.rs), and this boot oracle can never disagree on the string.
-const MARKER: &str = td_recipe::ladder::USERLAND_MARKER;
+/// `shared::USERLAND_MARKER` const so the /init script (linux-x86-64.rs), the cpio
+/// shape check (shared.rs), and this boot oracle can never disagree on the string.
+const MARKER: &str = td_recipe::shared::USERLAND_MARKER;
 
 /// The line the guest `/init` prints once it has mounted the attached virtio-blk
 /// disk as READ-ONLY erofs and read the sentinel back (re #549). The sole success
 /// criterion of the `qemu-boot-erofs` mode — seeing it proves the source-built
 /// kernel's EROFS_FS + VIRTIO_BLK config can mount a td-written erofs image
-/// read-only. Shared with the /init script and the shape check via `td_recipe::ladder`.
-const EROFS_MARKER: &str = td_recipe::ladder::EROFS_MARKER;
+/// read-only. Shared with the /init script and the shape check via `td_recipe::shared`.
+const EROFS_MARKER: &str = td_recipe::shared::EROFS_MARKER;
 
 /// The sentinel file the probe erofs image carries and the guest `/init` reads back;
 /// shared so the image the oracle builds and the path the /init reads never desync.
-const EROFS_PROBE_SENTINEL: &str = td_recipe::ladder::EROFS_PROBE_SENTINEL;
+const EROFS_PROBE_SENTINEL: &str = td_recipe::shared::EROFS_PROBE_SENTINEL;
 
 /// The exact token the probe sentinel holds. The guest `/init` reads the file back
 /// with `cat` and string-COMPARES it (not merely `test -f`), so a green result
 /// proves the erofs DATA block is readable, not just that the inode exists. Shared so
 /// the bytes the oracle writes and the token the /init expects can never desync.
-const EROFS_PROBE_CONTENT: &str = td_recipe::ladder::EROFS_PROBE_CONTENT;
+const EROFS_PROBE_CONTENT: &str = td_recipe::shared::EROFS_PROBE_CONTENT;
 
 /// The greeter line the real-root login shell prints via `/etc/profile` once the
 /// two-stage boot (#550) has switch_root'ed into the erofs root and reached an
 /// interactive auto-login shell — the primary success criterion of `qemu-boot-system`.
-/// Shared with the recipe (system-x86-64.rs) via `td_recipe::ladder` so the printed
+/// Shared with the recipe (system-x86-64.rs) via `td_recipe::shared` so the printed
 /// line and the oracle key can never desync.
-const GREETER_MARKER: &str = td_recipe::ladder::GREETER_MARKER;
+const GREETER_MARKER: &str = td_recipe::shared::GREETER_MARKER;
 
 /// Printed after unprivileged uutils behavior probes pass; shape checks cover only static closure.
-const UUTILS_RUNTIME_MARKER: &str = td_recipe::ladder::UUTILS_RUNTIME_MARKER;
+const UUTILS_RUNTIME_MARKER: &str = td_recipe::shared::UUTILS_RUNTIME_MARKER;
 
 /// Printed after unprivileged ripgrep and fd searches return exact expected results.
-const RIPGREP_FD_RUNTIME_MARKER: &str = td_recipe::ladder::RIPGREP_FD_RUNTIME_MARKER;
+const RIPGREP_FD_RUNTIME_MARKER: &str = td_recipe::shared::RIPGREP_FD_RUNTIME_MARKER;
 
 /// Printed after the installed Git client completes an unprivileged local
 /// clone/commit/push/reclone workflow and reads its pinned CA bundle.
-const GIT_RUNTIME_MARKER: &str = td_recipe::ladder::GIT_RUNTIME_MARKER;
+const GIT_RUNTIME_MARKER: &str = td_recipe::shared::GIT_RUNTIME_MARKER;
 
 /// Printed by the root-owned health target after an unprivileged SSH loopback self-test.
-const SSHD_MARKER: &str = td_recipe::ladder::SSHD_MARKER;
+const SSHD_MARKER: &str = td_recipe::shared::SSHD_MARKER;
 
 /// Printed under the autotest token once root's field reads `!` and the seeded root
 /// key's SSH login is refused (APPLICATIONS.md §L.1, L7).
-const ROOT_SSH_REFUSED_MARKER: &str = td_recipe::ladder::ROOT_SSH_REFUSED_MARKER;
+const ROOT_SSH_REFUSED_MARKER: &str = td_recipe::shared::ROOT_SSH_REFUSED_MARKER;
 
 /// Printed beside it once a listing of `/bin` holds `sh` and no `su`.
-const SU_ABSENT_MARKER: &str = td_recipe::ladder::SU_ABSENT_MARKER;
+const SU_ABSENT_MARKER: &str = td_recipe::shared::SU_ABSENT_MARKER;
 
 /// Printed by the root-owned health target after every td-util farm name runs unprivileged.
-const TD_UTIL_RUNTIME_MARKER: &str = td_recipe::ladder::TD_UTIL_RUNTIME_MARKER;
+const TD_UTIL_RUNTIME_MARKER: &str = td_recipe::shared::TD_UTIL_RUNTIME_MARKER;
 /// Printed by the root-owned health target once `/bin/grep` and `/bin/sed` — td-txt — gave
 /// the RIGHT answers over the live `/proc` and `/etc`, not merely exited 0.
-const TD_TXT_RUNTIME_MARKER: &str = td_recipe::ladder::TD_TXT_RUNTIME_MARKER;
+const TD_TXT_RUNTIME_MARKER: &str = td_recipe::shared::TD_TXT_RUNTIME_MARKER;
 /// Printed by the greeter once every `/bin` name the static td-init boot-glue multicall
 /// serves has been exercised — the reversible ones by running, the irreversible ones
 /// (`reboot`/`poweroff`/`halt`/`switch_root`) by refusing a bad argument with a diagnostic.
-const TD_INIT_RUNTIME_MARKER: &str = td_recipe::ladder::TD_INIT_RUNTIME_MARKER;
+const TD_INIT_RUNTIME_MARKER: &str = td_recipe::shared::TD_INIT_RUNTIME_MARKER;
 /// Printed by the root-owned health target after `td-login exec-primary` switched to the
 /// unprivileged login user AND the switched process read its own credentials back out of
 /// `/proc/self/status` and they matched exactly. This is the only marker that asserts the
 /// RESULT of a credential change rather than that something ran.
-const TD_LOGIN_RUNTIME_MARKER: &str = td_recipe::ladder::TD_LOGIN_RUNTIME_MARKER;
+const TD_LOGIN_RUNTIME_MARKER: &str = td_recipe::shared::TD_LOGIN_RUNTIME_MARKER;
 /// Printed by the root-owned health target once a real client, as the unprivileged
 /// login user, completed the `EXTERNAL` handshake against the session bus td-svc
 /// started and read back a well-formed `OK <guid>`. The broker's own tests bind a
 /// socket inside one process; this is the only place the UNIT, the uid it runs as
 /// and the broker-owned runtime firstboot published are exercised at once.
-const TD_BUSD_RUNTIME_MARKER: &str = td_recipe::ladder::TD_BUSD_RUNTIME_MARKER;
+const TD_BUSD_RUNTIME_MARKER: &str = td_recipe::shared::TD_BUSD_RUNTIME_MARKER;
 /// Printed by the unprivileged live portal probe after a routed Properties.Get
 /// and Settings.ReadAll return the exact immutable session policy.
-const TD_PORTAL_RUNTIME_MARKER: &str = td_recipe::ladder::TD_PORTAL_RUNTIME_MARKER;
+const TD_PORTAL_RUNTIME_MARKER: &str = td_recipe::shared::TD_PORTAL_RUNTIME_MARKER;
 const TD_SECRET_CONSOLE_MARKER: &str = "portal: TD-SECRET-LOCKED app=mail name=main";
 const TD_PORTAL_CONSOLE_MARKER: &str =
     "portal-evidence: TD-PORTAL-READY namespaces=2 settings=11 version=1";
-const TD_PORTAL_REQUEST_RUNTIME_MARKER: &str = td_recipe::ladder::TD_PORTAL_REQUEST_RUNTIME_MARKER;
+const TD_PORTAL_REQUEST_RUNTIME_MARKER: &str = td_recipe::shared::TD_PORTAL_REQUEST_RUNTIME_MARKER;
 const TD_PORTAL_REQUEST_CONSOLE_MARKER: &str =
     "portal-evidence: TD-PORTAL-REQUEST-READY response=2";
 const TD_PORTAL_UNAVAILABLE_RUNTIME_MARKER: &str =
-    td_recipe::ladder::TD_PORTAL_UNAVAILABLE_RUNTIME_MARKER;
+    td_recipe::shared::TD_PORTAL_UNAVAILABLE_RUNTIME_MARKER;
 const TD_PORTAL_UNAVAILABLE_CONSOLE_MARKER: &str =
     "portal-evidence: TD-PORTAL-UNAVAILABLE-READY interfaces=5 error=UnknownInterface";
 /// Printed by the greeter's kernel-capability farm, as the unprivileged login user,
@@ -155,9 +155,9 @@ const TD_PORTAL_UNAVAILABLE_CONSOLE_MARKER: &str =
 /// mounted cgroup2 and so waits for td-svc's delegation. The producer already greps
 /// the resolved `.config`; this is what makes a kernel regression red the IMAGE
 /// rather than the first application to be jailed.
-const TD_SANDBOX_KERNEL_MARKER: &str = td_recipe::ladder::TD_SANDBOX_KERNEL_MARKER;
-const TD_COMPOSITOR_KMS_MARKER: &str = td_recipe::ladder::TD_COMPOSITOR_KMS_MARKER;
-const TD_COMPOSITOR_FLIP_MARKER: &str = td_recipe::ladder::TD_COMPOSITOR_FLIP_MARKER;
+const TD_SANDBOX_KERNEL_MARKER: &str = td_recipe::shared::TD_SANDBOX_KERNEL_MARKER;
+const TD_COMPOSITOR_KMS_MARKER: &str = td_recipe::shared::TD_COMPOSITOR_KMS_MARKER;
+const TD_COMPOSITOR_FLIP_MARKER: &str = td_recipe::shared::TD_COMPOSITOR_FLIP_MARKER;
 
 /// The longest DRM report this will read back, past which the line is not one
 /// this check understands.
@@ -180,74 +180,74 @@ const TD_COMPOSITOR_FLIP_MARKER: &str = td_recipe::ladder::TD_COMPOSITOR_FLIP_MA
 /// else, and that overlap is bytes retained between two reads of a console
 /// log.
 const DRM_REPORT_MAX: usize = 384;
-const TD_JAIL_TRANSITION_MARKER: &str = td_recipe::ladder::TD_JAIL_TRANSITION_MARKER;
-const TD_JAIL_SECCOMP_PROBE_MARKER: &str = td_recipe::ladder::TD_JAIL_SECCOMP_PROBE_MARKER;
+const TD_JAIL_TRANSITION_MARKER: &str = td_recipe::shared::TD_JAIL_TRANSITION_MARKER;
+const TD_JAIL_SECCOMP_PROBE_MARKER: &str = td_recipe::shared::TD_JAIL_SECCOMP_PROBE_MARKER;
 /// APPLICATIONS.md §H item 12. What it attests is stated once, on
-/// `td_recipe::ladder::TD_JAIL_KILL_REAPS_MARKER`; read it there.
-const TD_JAIL_KILL_REAPS_MARKER: &str = td_recipe::ladder::TD_JAIL_KILL_REAPS_MARKER;
-const TD_FIREFOX_BOOT_MARKER: &str = td_recipe::ladder::TD_FIREFOX_BOOT_MARKER;
-const TD_FIREFOX_CONTENT_MARKER: &str = td_recipe::ladder::TD_FIREFOX_CONTENT_MARKER;
-const TD_FIREFOX_SUPPORT_MARKER: &str = td_recipe::ladder::TD_FIREFOX_SUPPORT_MARKER;
+/// `td_recipe::shared::TD_JAIL_KILL_REAPS_MARKER`; read it there.
+const TD_JAIL_KILL_REAPS_MARKER: &str = td_recipe::shared::TD_JAIL_KILL_REAPS_MARKER;
+const TD_FIREFOX_BOOT_MARKER: &str = td_recipe::shared::TD_FIREFOX_BOOT_MARKER;
+const TD_FIREFOX_CONTENT_MARKER: &str = td_recipe::shared::TD_FIREFOX_CONTENT_MARKER;
+const TD_FIREFOX_SUPPORT_MARKER: &str = td_recipe::shared::TD_FIREFOX_SUPPORT_MARKER;
 const TD_TERMINAL_AUTHORITY_ARMED_MARKER: &str =
-    td_recipe::ladder::TD_TERMINAL_AUTHORITY_ARMED_MARKER;
+    td_recipe::shared::TD_TERMINAL_AUTHORITY_ARMED_MARKER;
 const TD_TERMINAL_AUTHORITY_READY_MARKER: &str =
-    td_recipe::ladder::TD_TERMINAL_AUTHORITY_READY_MARKER;
-const TD_TERMINAL_AUTHORITY_MARKER: &str = td_recipe::ladder::TD_TERMINAL_AUTHORITY_MARKER;
-const TD_FIREFOX_INPUT_ARMED_MARKER: &str = td_recipe::ladder::TD_FIREFOX_INPUT_ARMED_MARKER;
-const TD_FIREFOX_INPUT_FOCUSED_MARKER: &str = td_recipe::ladder::TD_FIREFOX_INPUT_FOCUSED_MARKER;
-const TD_FIREFOX_INPUT_MENU_MARKER: &str = td_recipe::ladder::TD_FIREFOX_INPUT_MENU_MARKER;
-const TD_FIREFOX_INPUT_MARKER: &str = td_recipe::ladder::TD_FIREFOX_INPUT_MARKER;
-const TD_FIREFOX_SOAK_MARKER: &str = td_recipe::ladder::TD_FIREFOX_SOAK_MARKER;
-const TD_FIREFOX_SECCOMP_AUDIT_MARKER: &str = td_recipe::ladder::TD_FIREFOX_SECCOMP_AUDIT_MARKER;
-const TD_CLAUDE_TERMINAL_MARKER: &str = td_recipe::ladder::TD_CLAUDE_TERMINAL_MARKER;
-const TD_TERM_CLIPBOARD_FOCUS_PREFIX: &str = td_recipe::ladder::TD_TERM_CLIPBOARD_FOCUS_PREFIX;
-const SETUP_INPUT_CMDLINE_TOKEN: &str = td_recipe::ladder::SETUP_INPUT_CMDLINE_TOKEN;
-const TD_SETUP_SHOWN_PREFIX: &str = td_recipe::ladder::TD_SETUP_SHOWN_PREFIX;
+    td_recipe::shared::TD_TERMINAL_AUTHORITY_READY_MARKER;
+const TD_TERMINAL_AUTHORITY_MARKER: &str = td_recipe::shared::TD_TERMINAL_AUTHORITY_MARKER;
+const TD_FIREFOX_INPUT_ARMED_MARKER: &str = td_recipe::shared::TD_FIREFOX_INPUT_ARMED_MARKER;
+const TD_FIREFOX_INPUT_FOCUSED_MARKER: &str = td_recipe::shared::TD_FIREFOX_INPUT_FOCUSED_MARKER;
+const TD_FIREFOX_INPUT_MENU_MARKER: &str = td_recipe::shared::TD_FIREFOX_INPUT_MENU_MARKER;
+const TD_FIREFOX_INPUT_MARKER: &str = td_recipe::shared::TD_FIREFOX_INPUT_MARKER;
+const TD_FIREFOX_SOAK_MARKER: &str = td_recipe::shared::TD_FIREFOX_SOAK_MARKER;
+const TD_FIREFOX_SECCOMP_AUDIT_MARKER: &str = td_recipe::shared::TD_FIREFOX_SECCOMP_AUDIT_MARKER;
+const TD_CLAUDE_TERMINAL_MARKER: &str = td_recipe::shared::TD_CLAUDE_TERMINAL_MARKER;
+const TD_TERM_CLIPBOARD_FOCUS_PREFIX: &str = td_recipe::shared::TD_TERM_CLIPBOARD_FOCUS_PREFIX;
+const SETUP_INPUT_CMDLINE_TOKEN: &str = td_recipe::shared::SETUP_INPUT_CMDLINE_TOKEN;
+const TD_SETUP_SHOWN_PREFIX: &str = td_recipe::shared::TD_SETUP_SHOWN_PREFIX;
 /// More page states than any wizard script waits through.
 const MAX_SETUP_SHOWN: usize = 512;
-const TD_TERM_CLIPBOARD_TARGET_PREFIX: &str = td_recipe::ladder::TD_TERM_CLIPBOARD_TARGET_PREFIX;
+const TD_TERM_CLIPBOARD_TARGET_PREFIX: &str = td_recipe::shared::TD_TERM_CLIPBOARD_TARGET_PREFIX;
 const TD_TERM_CLIPBOARD_SELECTION_MARKER: &str =
-    td_recipe::ladder::TD_TERM_CLIPBOARD_SELECTION_MARKER;
-const TD_TERM_CLIPBOARD_MARKER: &str = td_recipe::ladder::TD_TERM_CLIPBOARD_MARKER;
-const TD_TERM_CLIPBOARD_SENT_MARKER: &str = td_recipe::ladder::TD_TERM_CLIPBOARD_SENT_MARKER;
+    td_recipe::shared::TD_TERM_CLIPBOARD_SELECTION_MARKER;
+const TD_TERM_CLIPBOARD_MARKER: &str = td_recipe::shared::TD_TERM_CLIPBOARD_MARKER;
+const TD_TERM_CLIPBOARD_SENT_MARKER: &str = td_recipe::shared::TD_TERM_CLIPBOARD_SENT_MARKER;
 const TD_FIREFOX_CLIPBOARD_REFOCUS_ARMED_MARKER: &str =
-    td_recipe::ladder::TD_FIREFOX_CLIPBOARD_REFOCUS_ARMED_MARKER;
+    td_recipe::shared::TD_FIREFOX_CLIPBOARD_REFOCUS_ARMED_MARKER;
 const TD_FIREFOX_CLIPBOARD_WINDOW_ARMED_MARKER: &str =
-    td_recipe::ladder::TD_FIREFOX_CLIPBOARD_WINDOW_ARMED_MARKER;
+    td_recipe::shared::TD_FIREFOX_CLIPBOARD_WINDOW_ARMED_MARKER;
 const TD_FIREFOX_CLIPBOARD_SESSION_READY_MARKER: &str =
-    td_recipe::ladder::TD_FIREFOX_CLIPBOARD_SESSION_READY_MARKER;
-const TD_FIREFOX_INPUT_FAILED_MARKER: &str = td_recipe::ladder::TD_FIREFOX_INPUT_FAILED_MARKER;
+    td_recipe::shared::TD_FIREFOX_CLIPBOARD_SESSION_READY_MARKER;
+const TD_FIREFOX_INPUT_FAILED_MARKER: &str = td_recipe::shared::TD_FIREFOX_INPUT_FAILED_MARKER;
 const TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_ONE_MARKER: &str =
-    td_recipe::ladder::TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_ONE_MARKER;
+    td_recipe::shared::TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_ONE_MARKER;
 const TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_TWO_MARKER: &str =
-    td_recipe::ladder::TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_TWO_MARKER;
+    td_recipe::shared::TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_TWO_MARKER;
 const TD_FIREFOX_CLIPBOARD_ARMED_MARKER: &str =
-    td_recipe::ladder::TD_FIREFOX_CLIPBOARD_ARMED_MARKER;
+    td_recipe::shared::TD_FIREFOX_CLIPBOARD_ARMED_MARKER;
 const TD_FIREFOX_CLIPBOARD_RETRY_MARKER: &str =
-    td_recipe::ladder::TD_FIREFOX_CLIPBOARD_RETRY_MARKER;
-const TD_FIREFOX_CLIPBOARD_MARKER: &str = td_recipe::ladder::TD_FIREFOX_CLIPBOARD_MARKER;
-const TD_FIREFOX_DOWNLOAD_ARMED_MARKER: &str = td_recipe::ladder::TD_FIREFOX_DOWNLOAD_ARMED_MARKER;
-const TD_FIREFOX_DOWNLOAD_MARKER: &str = td_recipe::ladder::TD_FIREFOX_DOWNLOAD_MARKER;
+    td_recipe::shared::TD_FIREFOX_CLIPBOARD_RETRY_MARKER;
+const TD_FIREFOX_CLIPBOARD_MARKER: &str = td_recipe::shared::TD_FIREFOX_CLIPBOARD_MARKER;
+const TD_FIREFOX_DOWNLOAD_ARMED_MARKER: &str = td_recipe::shared::TD_FIREFOX_DOWNLOAD_ARMED_MARKER;
+const TD_FIREFOX_DOWNLOAD_MARKER: &str = td_recipe::shared::TD_FIREFOX_DOWNLOAD_MARKER;
 const TD_FIREFOX_FILE_CHOOSER_ARMED_MARKER: &str =
-    td_recipe::ladder::TD_FIREFOX_FILE_CHOOSER_ARMED_MARKER;
+    td_recipe::shared::TD_FIREFOX_FILE_CHOOSER_ARMED_MARKER;
 const TD_FIREFOX_FILE_CHOOSER_REFOCUS_ARMED_MARKER: &str =
-    td_recipe::ladder::TD_FIREFOX_FILE_CHOOSER_REFOCUS_ARMED_MARKER;
+    td_recipe::shared::TD_FIREFOX_FILE_CHOOSER_REFOCUS_ARMED_MARKER;
 const TD_FIREFOX_FILE_CHOOSER_FOCUSED_MARKER: &str =
-    td_recipe::ladder::TD_FIREFOX_FILE_CHOOSER_FOCUSED_MARKER;
-const TD_FIREFOX_FILE_CHOOSER_MARKER: &str = td_recipe::ladder::TD_FIREFOX_FILE_CHOOSER_MARKER;
+    td_recipe::shared::TD_FIREFOX_FILE_CHOOSER_FOCUSED_MARKER;
+const TD_FIREFOX_FILE_CHOOSER_MARKER: &str = td_recipe::shared::TD_FIREFOX_FILE_CHOOSER_MARKER;
 const TD_PORTAL_FILE_CHOOSER_PRESENTED_PREFIX: &str = "portal: TD-PORTAL-FILE-CHOOSER-PRESENTED ";
 #[cfg(test)]
 const TD_PORTAL_FILE_CHOOSER_COMPLETED_MARKER: &str = "TD-PORTAL-FILE-CHOOSER-COMPLETED";
 const TD_APPLICATION_CURSOR_PREFIX: &str =
     "TD-APPLICATION-CURSOR-READY app-id=org.mozilla.firefox ";
-const FIREFOX_INPUT_CMDLINE_TOKEN: &str = td_recipe::ladder::FIREFOX_INPUT_CMDLINE_TOKEN;
-const FIREFOX_AUDIT_CMDLINE_TOKEN: &str = td_recipe::ladder::FIREFOX_AUDIT_CMDLINE_TOKEN;
-const KERNEL_AUDIT_CMDLINE_TOKEN: &str = td_recipe::ladder::KERNEL_AUDIT_CMDLINE_TOKEN;
-const KERNEL_AUDIT_OFF_CMDLINE_TOKEN: &str = td_recipe::ladder::KERNEL_AUDIT_OFF_CMDLINE_TOKEN;
+const FIREFOX_INPUT_CMDLINE_TOKEN: &str = td_recipe::shared::FIREFOX_INPUT_CMDLINE_TOKEN;
+const FIREFOX_AUDIT_CMDLINE_TOKEN: &str = td_recipe::shared::FIREFOX_AUDIT_CMDLINE_TOKEN;
+const KERNEL_AUDIT_CMDLINE_TOKEN: &str = td_recipe::shared::KERNEL_AUDIT_CMDLINE_TOKEN;
+const KERNEL_AUDIT_OFF_CMDLINE_TOKEN: &str = td_recipe::shared::KERNEL_AUDIT_OFF_CMDLINE_TOKEN;
 const FIREFOX_AUDIT_BACKLOG_CMDLINE_TOKEN: &str =
-    td_recipe::ladder::FIREFOX_AUDIT_BACKLOG_CMDLINE_TOKEN;
+    td_recipe::shared::FIREFOX_AUDIT_BACKLOG_CMDLINE_TOKEN;
 const FIREFOX_AUDIT_LOG_BUFFER_CMDLINE_TOKEN: &str =
-    td_recipe::ladder::FIREFOX_AUDIT_LOG_BUFFER_CMDLINE_TOKEN;
+    td_recipe::shared::FIREFOX_AUDIT_LOG_BUFFER_CMDLINE_TOKEN;
 const TD_PROFILER_ATTRIBUTION_MARKER: &str = td_recipe::td_profiler_contract::ATTRIBUTION_MARKER;
 const TD_PROFILER_EVIDENCE_CONSOLE_PREFIX: &str = "profiler-evidence: ";
 const TD_JAIL_SECCOMP_PROBE_PATH: &str = "@var/lib/td-test/td-jail-seccomp-probe";
@@ -265,95 +265,95 @@ AAAAC3NzaC1lZDI1NTE5AAAAIK0uXleFgR7j5hIDzeLfwwdu8isqRbVRkCjqczyhQ+p3 \
 td-qemu-root-refusal\n";
 
 /// Printed after the unprivileged software compositor paints and listens.
-const TD_WAYLAND_RUNTIME_MARKER: &str = td_recipe::ladder::TD_WAYLAND_RUNTIME_MARKER;
+const TD_WAYLAND_RUNTIME_MARKER: &str = td_recipe::shared::TD_WAYLAND_RUNTIME_MARKER;
 
 /// Printed by the compositor for a device that answered `EVIOCGABS` with a span
 /// on both axes. Attached headless the tablet delivers no motion, so what this
 /// proves is enumeration and the ANSWER — which is the half no unit test can
 /// reach, the gate machine having no absolute device.
-const TD_POINTER_ABSOLUTE_MARKER: &str = td_recipe::ladder::TD_POINTER_ABSOLUTE_MARKER;
+const TD_POINTER_ABSOLUTE_MARKER: &str = td_recipe::shared::TD_POINTER_ABSOLUTE_MARKER;
 /// Printed by the FIRST client the machine now starts: the terminal, after a frame
 /// at a compositor-chosen size and a PTY the kernel agrees is that grid.
-const TD_TERM_RUNTIME_MARKER: &str = td_recipe::ladder::TD_TERM_RUNTIME_MARKER;
+const TD_TERM_RUNTIME_MARKER: &str = td_recipe::shared::TD_TERM_RUNTIME_MARKER;
 // Printed by the `mail-evidence` and `news-evidence` units under the autotest
 // token: td-jail found the client itself, by the program its entry runs as,
 // still in its jail instance a few seconds after its td-term window reported
 // ready, so the program started on the configuration td-firstboot provisioned
 // and did not exit on it.
-const TD_MAIL_BOOT_MARKER: &str = td_recipe::ladder::TD_MAIL_BOOT_MARKER;
-const TD_FETCH_BOOT_MARKER: &str = td_recipe::ladder::TD_FETCH_BOOT_MARKER;
-const TD_NEWS_BOOT_MARKER: &str = td_recipe::ladder::TD_NEWS_BOOT_MARKER;
-const TD_APPLICATIONS_PLACED_MARKER: &str = td_recipe::ladder::TD_APPLICATIONS_PLACED_MARKER;
+const TD_MAIL_BOOT_MARKER: &str = td_recipe::shared::TD_MAIL_BOOT_MARKER;
+const TD_FETCH_BOOT_MARKER: &str = td_recipe::shared::TD_FETCH_BOOT_MARKER;
+const TD_NEWS_BOOT_MARKER: &str = td_recipe::shared::TD_NEWS_BOOT_MARKER;
+const TD_APPLICATIONS_PLACED_MARKER: &str = td_recipe::shared::TD_APPLICATIONS_PLACED_MARKER;
 
 /// The line `/etc/rootcheck` prints once it has confirmed `/` is a READ-ONLY erofs
 /// mount (re #550). `qemu-boot-system` asserts it to prove the switched-into root is
 /// the immutable erofs image, not a writable copy.
-const SYSTEM_ROOT_RO_MARKER: &str = td_recipe::ladder::SYSTEM_ROOT_RO_MARKER;
+const SYSTEM_ROOT_RO_MARKER: &str = td_recipe::shared::SYSTEM_ROOT_RO_MARKER;
 
 /// Printed after root fails to create a probe below deployment-owned `/etc`.
-const SYSTEM_ETC_RO_MARKER: &str = td_recipe::ladder::SYSTEM_ETC_RO_MARKER;
+const SYSTEM_ETC_RO_MARKER: &str = td_recipe::shared::SYSTEM_ETC_RO_MARKER;
 
 /// Printed after `/var` is proven to be writable Btrfs, `/run` and `/tmp` are
 /// writable tmpfs mounts, and the immutable `/home` and `/root` links resolve
 /// into writable `/var` state.
-const SYSTEM_STATE_WRITABLE_MARKER: &str = td_recipe::ladder::SYSTEM_STATE_WRITABLE_MARKER;
-const SYSTEM_STATE_OWNER_MARKER: &str = td_recipe::ladder::SYSTEM_STATE_OWNER_MARKER;
-const SYSTEM_ETC_MUTABLE_MARKER: &str = td_recipe::ladder::SYSTEM_ETC_MUTABLE_MARKER;
-const SYSTEM_LOGIN_DIRECTORY_MARKER: &str = td_recipe::ladder::SYSTEM_LOGIN_DIRECTORY_MARKER;
-const TD_FIRSTBOOT_NEW_MARKER: &str = td_recipe::ladder::TD_FIRSTBOOT_NEW_MARKER;
-const TD_FIRSTBOOT_STABLE_MARKER: &str = td_recipe::ladder::TD_FIRSTBOOT_STABLE_MARKER;
+const SYSTEM_STATE_WRITABLE_MARKER: &str = td_recipe::shared::SYSTEM_STATE_WRITABLE_MARKER;
+const SYSTEM_STATE_OWNER_MARKER: &str = td_recipe::shared::SYSTEM_STATE_OWNER_MARKER;
+const SYSTEM_ETC_MUTABLE_MARKER: &str = td_recipe::shared::SYSTEM_ETC_MUTABLE_MARKER;
+const SYSTEM_LOGIN_DIRECTORY_MARKER: &str = td_recipe::shared::SYSTEM_LOGIN_DIRECTORY_MARKER;
+const TD_FIRSTBOOT_NEW_MARKER: &str = td_recipe::shared::TD_FIRSTBOOT_NEW_MARKER;
+const TD_FIRSTBOOT_STABLE_MARKER: &str = td_recipe::shared::TD_FIRSTBOOT_STABLE_MARKER;
 const TD_COMPOSITOR_DEVICES_PRIVATE_MARKER: &str =
-    td_recipe::ladder::TD_COMPOSITOR_DEVICES_PRIVATE_MARKER;
-const TD_PRINCIPALS_MARKER: &str = td_recipe::ladder::TD_PRINCIPALS_MARKER;
-const TD_FIRSTBOOT_HOST_KEY_PREFIX: &str = td_recipe::ladder::TD_FIRSTBOOT_HOST_KEY_PREFIX;
-const SYSTEM_PERSIST_WRITE_MARKER: &str = td_recipe::ladder::SYSTEM_PERSIST_WRITE_MARKER;
-const SYSTEM_PERSIST_READ_MARKER: &str = td_recipe::ladder::SYSTEM_PERSIST_READ_MARKER;
-const SYSTEM_BOOT_SUCCESS_MARKER: &str = td_recipe::ladder::SYSTEM_BOOT_SUCCESS_MARKER;
-const SYSTEM_DEPLOY_INSTALL_MARKER: &str = td_recipe::ladder::SYSTEM_DEPLOY_INSTALL_MARKER;
-const SYSTEM_DEPLOY_ROLLBACK_MARKER: &str = td_recipe::ladder::SYSTEM_DEPLOY_ROLLBACK_MARKER;
-const SYSTEM_SHUTDOWN_MARKER: &str = td_recipe::ladder::SYSTEM_SHUTDOWN_MARKER;
+    td_recipe::shared::TD_COMPOSITOR_DEVICES_PRIVATE_MARKER;
+const TD_PRINCIPALS_MARKER: &str = td_recipe::shared::TD_PRINCIPALS_MARKER;
+const TD_FIRSTBOOT_HOST_KEY_PREFIX: &str = td_recipe::shared::TD_FIRSTBOOT_HOST_KEY_PREFIX;
+const SYSTEM_PERSIST_WRITE_MARKER: &str = td_recipe::shared::SYSTEM_PERSIST_WRITE_MARKER;
+const SYSTEM_PERSIST_READ_MARKER: &str = td_recipe::shared::SYSTEM_PERSIST_READ_MARKER;
+const SYSTEM_BOOT_SUCCESS_MARKER: &str = td_recipe::shared::SYSTEM_BOOT_SUCCESS_MARKER;
+const SYSTEM_DEPLOY_INSTALL_MARKER: &str = td_recipe::shared::SYSTEM_DEPLOY_INSTALL_MARKER;
+const SYSTEM_DEPLOY_ROLLBACK_MARKER: &str = td_recipe::shared::SYSTEM_DEPLOY_ROLLBACK_MARKER;
+const SYSTEM_SHUTDOWN_MARKER: &str = td_recipe::shared::SYSTEM_SHUTDOWN_MARKER;
 const BOOKKEEPING_UNAVAILABLE_MARKER: &str = td_boot_protocol::BOOKKEEPING_UNAVAILABLE_MARKER;
 
 /// The kernel-cmdline token `qemu-boot-system` appends so the greeter self-exits and
 /// the VM powers off — a headless "exit powers off" proof with no terminal to type
-/// into. Shared with the recipe's `/etc/profile` autotest gate via `td_recipe::ladder`.
-const AUTOTEST_CMDLINE_TOKEN: &str = td_recipe::ladder::AUTOTEST_CMDLINE_TOKEN;
-const PERSIST_WRITE_CMDLINE_TOKEN: &str = td_recipe::ladder::PERSIST_WRITE_CMDLINE_TOKEN;
-const PERSIST_READ_CMDLINE_TOKEN: &str = td_recipe::ladder::PERSIST_READ_CMDLINE_TOKEN;
-const DEPLOY_INSTALL_CMDLINE_TOKEN: &str = td_recipe::ladder::DEPLOY_INSTALL_CMDLINE_TOKEN;
-const BOOT_FAIL_TARGET_CMDLINE_TOKEN: &str = td_recipe::ladder::BOOT_FAIL_TARGET_CMDLINE_TOKEN;
+/// into. Shared with the recipe's `/etc/profile` autotest gate via `td_recipe::shared`.
+const AUTOTEST_CMDLINE_TOKEN: &str = td_recipe::shared::AUTOTEST_CMDLINE_TOKEN;
+const PERSIST_WRITE_CMDLINE_TOKEN: &str = td_recipe::shared::PERSIST_WRITE_CMDLINE_TOKEN;
+const PERSIST_READ_CMDLINE_TOKEN: &str = td_recipe::shared::PERSIST_READ_CMDLINE_TOKEN;
+const DEPLOY_INSTALL_CMDLINE_TOKEN: &str = td_recipe::shared::DEPLOY_INSTALL_CMDLINE_TOKEN;
+const BOOT_FAIL_TARGET_CMDLINE_TOKEN: &str = td_recipe::shared::BOOT_FAIL_TARGET_CMDLINE_TOKEN;
 
 /// The networking markers trusted target units print under the nettest token: the
 /// link came up + DHCP applied, td-netd resolved and reached the test host, Git read
 /// an upstream HEAD over verified HTTPS, and Firefox loaded a public HTTPS document.
-/// `qemu-boot-net` asserts all five. Shared with the recipe via `td_recipe::ladder`.
-const SYSTEM_NET_UP_MARKER: &str = td_recipe::ladder::SYSTEM_NET_UP_MARKER;
-const SYSTEM_NET_RESOLVE_MARKER: &str = td_recipe::ladder::SYSTEM_NET_RESOLVE_MARKER;
-const SYSTEM_NET_REACH_MARKER: &str = td_recipe::ladder::SYSTEM_NET_REACH_MARKER;
-const GIT_HTTPS_RUNTIME_MARKER: &str = td_recipe::ladder::GIT_HTTPS_RUNTIME_MARKER;
-const FIREFOX_NETWORK_RUNTIME_MARKER: &str = td_recipe::ladder::FIREFOX_NETWORK_RUNTIME_MARKER;
-const GIT_HTTPS_TEST_URL: &str = td_recipe::ladder::GIT_HTTPS_TEST_URL;
-const FIREFOX_NETWORK_TEST_URL: &str = td_recipe::ladder::FIREFOX_NETWORK_TEST_URL;
+/// `qemu-boot-net` asserts all five. Shared with the recipe via `td_recipe::shared`.
+const SYSTEM_NET_UP_MARKER: &str = td_recipe::shared::SYSTEM_NET_UP_MARKER;
+const SYSTEM_NET_RESOLVE_MARKER: &str = td_recipe::shared::SYSTEM_NET_RESOLVE_MARKER;
+const SYSTEM_NET_REACH_MARKER: &str = td_recipe::shared::SYSTEM_NET_REACH_MARKER;
+const GIT_HTTPS_RUNTIME_MARKER: &str = td_recipe::shared::GIT_HTTPS_RUNTIME_MARKER;
+const FIREFOX_NETWORK_RUNTIME_MARKER: &str = td_recipe::shared::FIREFOX_NETWORK_RUNTIME_MARKER;
+const GIT_HTTPS_TEST_URL: &str = td_recipe::shared::GIT_HTTPS_TEST_URL;
+const FIREFOX_NETWORK_TEST_URL: &str = td_recipe::shared::FIREFOX_NETWORK_TEST_URL;
 
 /// The kernel-cmdline token `qemu-boot-net` appends so `/etc/netup` runs its
 /// four-marker resolve+reach+Git HTTPS self-test and Firefox evidence adds the
-/// fifth marker. Shared via `td_recipe::ladder` with both recipe gates.
-const NETTEST_CMDLINE_TOKEN: &str = td_recipe::ladder::NETTEST_CMDLINE_TOKEN;
+/// fifth marker. Shared via `td_recipe::shared` with both recipe gates.
+const NETTEST_CMDLINE_TOKEN: &str = td_recipe::shared::NETTEST_CMDLINE_TOKEN;
 
 /// The OUTER /init prints this on ttyS0 before it execs td-kexec — stage-1 reached
 /// userspace. `qemu-boot-kexec` asserts it as a diagnostic that the second boot came
-/// from our helper. Shared with the kexec-spike-x86-64 recipe via `td_recipe::ladder`.
-const KEXEC_STAGE1_MARKER: &str = td_recipe::ladder::KEXEC_STAGE1_MARKER;
+/// from our helper. Shared with the kexec-spike-x86-64 recipe via `td_recipe::shared`.
+const KEXEC_STAGE1_MARKER: &str = td_recipe::shared::KEXEC_STAGE1_MARKER;
 
 /// The kexec'd INNER /init prints this on ttyS0 once the SECOND kernel reaches
 /// userspace — the `qemu-boot-kexec` success criterion, unreachable without a working
-/// kexec_file_load(2) + reboot(LINUX_REBOOT_CMD_KEXEC). Shared via `td_recipe::ladder`.
-const KEXEC_STAGE2_MARKER: &str = td_recipe::ladder::KEXEC_STAGE2_MARKER;
+/// kexec_file_load(2) + reboot(LINUX_REBOOT_CMD_KEXEC). Shared via `td_recipe::shared`.
+const KEXEC_STAGE2_MARKER: &str = td_recipe::shared::KEXEC_STAGE2_MARKER;
 
 /// Default wall-clock ceiling — declared in `ladder` rather than here so the guest
 /// side can assert it outlasts the loop it is waiting for; see there.
-const DEFAULT_BOOT_TIMEOUT_SECS: u64 = td_recipe::ladder::DEFAULT_BOOT_TIMEOUT_SECS;
-const GUEST_WAIT_MARGIN_SECS: u64 = td_recipe::ladder::QEMU_GUEST_WAIT_MARGIN_SECS;
+const DEFAULT_BOOT_TIMEOUT_SECS: u64 = td_recipe::shared::DEFAULT_BOOT_TIMEOUT_SECS;
+const GUEST_WAIT_MARGIN_SECS: u64 = td_recipe::shared::QEMU_GUEST_WAIT_MARGIN_SECS;
 // The dynamic Firefox jail may use 1.25 GiB while the compositor, terminal and
 // next kexec kernel remain live. Keep the guest above that enforced application
 // ceiling rather than making host memory pressure look like a browser failure.
@@ -2265,7 +2265,7 @@ fn validate_system_boot(
              ({TD_JAIL_KILL_REAPS_MARKER:?}) was absent — killing stage 1 did not reap the \
              whole instance or the detached cleanup watcher did not remove its populated \
              application cgroup. What the marker attests is on \
-             `td_recipe::ladder::TD_JAIL_KILL_REAPS_MARKER`; what its ABSENCE means is one of \
+             `td_recipe::shared::TD_JAIL_KILL_REAPS_MARKER`; what its ABSENCE means is one of \
              these: the instance outlived stage 1, so a dead launcher leaves a jailed \
              process running with no supervisor — either PID 1 did not exit, or it exited and \
              the kernel did not tear the namespace down under it. Or both processes exited, \
@@ -2877,8 +2877,8 @@ pub(crate) fn run_net(runner: &RecipeCheckRunner) -> Result<(), String> {
 
     println!(
         "   [qemu-boot-net] {qemu} boots the recipe-built deployment with a user-mode NIC; /etc/netup DHCP-configures the link, td-netd resolves + reaches {}:{}, Git reads HEAD from {} over verified HTTPS, and Firefox loads {}\n              kernel:        {}\n              initramfs:     {}\n              Btrfs volume:  {}",
-        td_recipe::ladder::NETTEST_DEFAULT_HOST,
-        td_recipe::ladder::NETTEST_DEFAULT_PORT,
+        td_recipe::shared::NETTEST_DEFAULT_HOST,
+        td_recipe::shared::NETTEST_DEFAULT_PORT,
         GIT_HTTPS_TEST_URL,
         FIREFOX_NETWORK_TEST_URL,
         bzimage.display(),
@@ -4316,7 +4316,7 @@ fn stage_volume_trust_roots(
     // reads an empty channel as nothing to do. A published volume carrying it
     // would be shipping the test's furniture to strangers.
     if purpose == VolumePurpose::Fixture {
-        let idle = seed.join(td_recipe::ladder::DEPLOY_IDLE_CHANNEL);
+        let idle = seed.join(td_recipe::shared::DEPLOY_IDLE_CHANNEL);
         fs::create_dir_all(&idle)
             .map_err(|e| format!("create fixture idle channel {}: {e}", idle.display()))?;
         fs::set_permissions(&idle, fs::Permissions::from_mode(0o755))
@@ -4333,7 +4333,7 @@ fn stage_volume_trust_roots(
     )];
     if purpose == VolumePurpose::Fixture {
         roots.push((
-            td_recipe::ladder::DEPLOY_WRONG_KEY,
+            td_recipe::shared::DEPLOY_WRONG_KEY,
             decoy.trusted_key_line(),
         ));
     }
@@ -4485,7 +4485,7 @@ fn guest_success_wait_secs(timeout: Duration) -> u64 {
 fn autotest_wait_token(timeout: Duration) -> String {
     format!(
         "{}{}",
-        td_recipe::ladder::BOOT_SUCCESS_WAIT_CMDLINE_PREFIX,
+        td_recipe::shared::BOOT_SUCCESS_WAIT_CMDLINE_PREFIX,
         guest_success_wait_secs(timeout)
     )
 }
@@ -7463,8 +7463,8 @@ fn latch_application_cursor(found: &mut bool, haystack: &[u8], starts_at_stream_
         let Some(height) = height.parse::<usize>().ok() else {
             continue;
         };
-        if (1..=td_recipe::ladder::FIREFOX_CURSOR_MAX_DIMENSION).contains(&width)
-            && (1..=td_recipe::ladder::FIREFOX_CURSOR_MAX_DIMENSION).contains(&height)
+        if (1..=td_recipe::shared::FIREFOX_CURSOR_MAX_DIMENSION).contains(&width)
+            && (1..=td_recipe::shared::FIREFOX_CURSOR_MAX_DIMENSION).contains(&height)
         {
             *found = true;
             return;
@@ -10414,7 +10414,7 @@ mod tests {
         let scene = include_str!("../../../../../td-compositor/src/scene.rs");
         assert!(scene.contains(&format!(
             "const MAX_CURSOR_DIMENSION: usize = {};",
-            td_recipe::ladder::FIREFOX_CURSOR_MAX_DIMENSION
+            td_recipe::shared::FIREFOX_CURSOR_MAX_DIMENSION
         )));
     }
 
@@ -10541,7 +10541,7 @@ mod tests {
         stage_volume_trust_roots(&seed, &trust, VolumePurpose::Published).unwrap();
         assert!(seed.join(td_boot_protocol::VOLUME_TRUSTED_KEY).is_file());
         assert!(
-            !seed.join(td_recipe::ladder::DEPLOY_WRONG_KEY).exists(),
+            !seed.join(td_recipe::shared::DEPLOY_WRONG_KEY).exists(),
             "a published volume shipped the oracle's decoy trust root"
         );
 
@@ -10550,7 +10550,7 @@ mod tests {
         stage_volume_trust_roots(&fixture_seed, &trust, VolumePurpose::Fixture).unwrap();
         assert!(
             fixture_seed
-                .join(td_recipe::ladder::DEPLOY_WRONG_KEY)
+                .join(td_recipe::shared::DEPLOY_WRONG_KEY)
                 .is_file(),
             "the oracle still needs its decoy"
         );
@@ -10621,7 +10621,7 @@ mod tests {
         // them: without this, deleting `stage_volume_trust_roots` outright would
         // leave the whole gate green.
         let real = fs::read(seed.join(td_boot_protocol::VOLUME_TRUSTED_KEY)).unwrap();
-        let decoy = fs::read(seed.join(td_recipe::ladder::DEPLOY_WRONG_KEY)).unwrap();
+        let decoy = fs::read(seed.join(td_recipe::shared::DEPLOY_WRONG_KEY)).unwrap();
         assert_eq!(
             real,
             trust.trusted_key_line(),
@@ -10640,7 +10640,7 @@ mod tests {
         );
         for relative in [
             td_boot_protocol::VOLUME_TRUSTED_KEY,
-            td_recipe::ladder::DEPLOY_WRONG_KEY,
+            td_recipe::shared::DEPLOY_WRONG_KEY,
         ] {
             // `--rootdir` copies a mode in verbatim, so an ambient umask would
             // otherwise decide what the fixture's trust root looks like.
@@ -10660,7 +10660,7 @@ mod tests {
         // directory (a file gives ENOTDIR), empty (a candidate makes the pass
         // install something and print an id), and 0755 as `td-install` leaves
         // the real one.
-        let idle = seed.join(td_recipe::ladder::DEPLOY_IDLE_CHANNEL);
+        let idle = seed.join(td_recipe::shared::DEPLOY_IDLE_CHANNEL);
         let staged =
             fs::metadata(&idle).unwrap_or_else(|e| panic!("the idle channel must be staged: {e}"));
         assert!(staged.is_dir(), "the idle channel must be a directory");
@@ -11144,7 +11144,7 @@ mod tests {
         digest.update(&authorized_blob);
         assert_eq!(
             format!("SHA256:{}", b64_encode_unpadded(&digest.finalize())),
-            td_recipe::ladder::ROOT_SSH_REFUSAL_KEY_FINGERPRINT
+            td_recipe::shared::ROOT_SSH_REFUSAL_KEY_FINGERPRINT
         );
     }
 
@@ -11250,11 +11250,11 @@ mod tests {
     fn the_first_client_evidence_is_the_terminals_marker() {
         assert_eq!(
             TD_TERM_RUNTIME_MARKER,
-            td_recipe::ladder::TD_TERM_RUNTIME_MARKER
+            td_recipe::shared::TD_TERM_RUNTIME_MARKER
         );
         assert_ne!(
             TD_TERM_RUNTIME_MARKER,
-            td_recipe::ladder::TD_UI_CLIENT_RUNTIME_MARKER
+            td_recipe::shared::TD_UI_CLIENT_RUNTIME_MARKER
         );
         assert!(all_console_markers().contains(&TD_TERM_RUNTIME_MARKER));
     }
@@ -12975,7 +12975,7 @@ mod tests {
         assert_eq!(guest_success_wait_secs(Duration::from_secs(1)), 1);
         assert_eq!(
             autotest_wait_token(Duration::from_secs(300)),
-            format!("{}270", td_recipe::ladder::BOOT_SUCCESS_WAIT_CMDLINE_PREFIX)
+            format!("{}270", td_recipe::shared::BOOT_SUCCESS_WAIT_CMDLINE_PREFIX)
         );
     }
 

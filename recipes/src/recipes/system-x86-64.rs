@@ -8,7 +8,7 @@ use ssh_policy::{
 #[cfg(test)]
 use ssh_policy::SSHD_AUTHORIZED_KEYS;
 
-use crate::ladder::{
+use crate::shared::{
     entry_program, post_rust_inputs, post_rust_tool_farm, AUTOTEST_CMDLINE_TOKEN,
     BOOT_FAIL_TARGET_CMDLINE_TOKEN, BOOT_SUCCESS_WAIT_CMDLINE_PREFIX, DEPLOY_INSTALL_CMDLINE_TOKEN,
     FIREFOX_AUDIT_BACKLOG_CMDLINE_TOKEN, FIREFOX_AUDIT_CMDLINE_TOKEN,
@@ -199,9 +199,9 @@ struct SystemDef {
     applications: &'static [ShippedApplication],
 }
 
-const APPLICATION_REGISTRY: &str = crate::ladder::TD_APPLICATION_REGISTRY;
-const APPLICATION_LAUNCHER_TABLE: &str = crate::ladder::TD_APPLICATION_LAUNCHER_TABLE;
-const APPLICATION_CONFIG: &str = crate::ladder::TD_APPLICATION_CONFIG_PATH;
+const APPLICATION_REGISTRY: &str = crate::shared::TD_APPLICATION_REGISTRY;
+const APPLICATION_LAUNCHER_TABLE: &str = crate::shared::TD_APPLICATION_LAUNCHER_TABLE;
+const APPLICATION_CONFIG: &str = crate::shared::TD_APPLICATION_CONFIG_PATH;
 const PROFILER_OBJECT_INDEX: &str = "/etc/td-profiler-objects.tsv";
 const PROFILER_APPLICATION_ROOTS: &str = "/etc/td-profiler-application-roots.tsv";
 const PROFILER_CAPTURE_ROOT: &str = "/var/lib/td-profiler/captures";
@@ -3039,7 +3039,7 @@ const SANDBOX_KERNEL_CGROUP2_CONTROLLERS: &[(&str, &str, &str)] = &[
 /// Controller files whose presence witnesses scheduler features narrower than
 /// the controller itself.
 const SANDBOX_KERNEL_CGROUP2_NODES: &[(&str, &str, &str, &str)] = &[(
-    crate::ladder::TD_APPLICATION_CGROUP_SESSION,
+    crate::shared::TD_APPLICATION_CGROUP_SESSION,
     "cpu.weight",
     "CONFIG_FAIR_GROUP_SCHED",
     "fair-scheduler cgroup accounting does not exist",
@@ -3047,7 +3047,7 @@ const SANDBOX_KERNEL_CGROUP2_NODES: &[(&str, &str, &str, &str)] = &[(
 
 /// Rows compiled into controller files only with the named scheduler feature.
 const SANDBOX_KERNEL_CGROUP2_ROWS: &[(&str, &str, &str, &str, &str)] = &[(
-    crate::ladder::TD_APPLICATION_CGROUP_SESSION,
+    crate::shared::TD_APPLICATION_CGROUP_SESSION,
     "cpu.stat",
     "nr_periods",
     "CONFIG_CFS_BANDWIDTH",
@@ -3221,10 +3221,10 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
     // Named rather than spelled, so a renamed key or a reworded refusal cannot
     // leave the oracle's negative pass quietly satisfied by any failure at all.
     let trusted_key = td_boot_protocol::VOLUME_TRUSTED_KEY;
-    let wrong_key = crate::ladder::DEPLOY_WRONG_KEY;
+    let wrong_key = crate::shared::DEPLOY_WRONG_KEY;
     let unauthenticated = td_boot_protocol::MANIFEST_UNAUTHENTICATED;
     let channel = td_boot_protocol::VOLUME_CHANNEL_DIR;
-    let idle_channel = crate::ladder::DEPLOY_IDLE_CHANNEL;
+    let idle_channel = crate::shared::DEPLOY_IDLE_CHANNEL;
     let update = td_boot_protocol::UPDATE_VERB;
     // The human may read its private self-test key but must not own the public
     // AuthorizedKeysFile that grants it access. Under the QEMU autotest token, a
@@ -3925,7 +3925,7 @@ fn build_mutable_state() -> String {
 }
 
 fn build_application_config() -> String {
-    crate::ladder::TD_APPLICATION_CONFIG_TEXT.to_string()
+    crate::shared::TD_APPLICATION_CONFIG_TEXT.to_string()
 }
 
 fn application_etc_name(path: &'static str) -> &'static str {
@@ -6763,8 +6763,8 @@ mod tests {
         );
         assert!(
             u64::from(APPLICATION_GREETER_WAIT_ITERATIONS)
-                <= crate::ladder::DEFAULT_BOOT_TIMEOUT_SECS
-                    .saturating_sub(crate::ladder::QEMU_GUEST_WAIT_MARGIN_SECS)
+                <= crate::shared::DEFAULT_BOOT_TIMEOUT_SECS
+                    .saturating_sub(crate::shared::QEMU_GUEST_WAIT_MARGIN_SECS)
                     .saturating_sub(u64::from(BOOT_SUCCESS_ITERATION_BUDGET_SECS)),
             "the default guest wait must preserve the complete Firefox evidence window"
         );
@@ -6797,7 +6797,7 @@ mod tests {
         assert!(firefox_probe.contains(&format!(
             "const FIREFOX_NETWORK_TEST_URL: &str = \
              \"{}\";",
-            crate::ladder::FIREFOX_NETWORK_TEST_URL
+            crate::shared::FIREFOX_NETWORK_TEST_URL
         )));
         assert!(firefox_probe.contains(&format!("\"{FIREFOX_NETWORK_RUNTIME_MARKER}\"")));
         assert!(evidence.contains(&format!(
@@ -7575,7 +7575,7 @@ mod tests {
 
         assert!(seat.contains(&format!(
             "const PRIVATE_DEVICES_MARKER: &str = \"{}\";",
-            crate::ladder::TD_COMPOSITOR_DEVICES_PRIVATE_MARKER
+            crate::shared::TD_COMPOSITOR_DEVICES_PRIVATE_MARKER
         )));
         assert_eq!(unit_key("seat-access-evidence", "log"), None);
         assert_eq!(unit_key("seat-access-evidence", "console"), None);
@@ -7781,9 +7781,9 @@ mod tests {
         let required = serial
             .saturating_add(guest)
             .saturating_add(predecessor)
-            .saturating_add(crate::ladder::QEMU_GUEST_WAIT_MARGIN_SECS);
+            .saturating_add(crate::shared::QEMU_GUEST_WAIT_MARGIN_SECS);
         assert!(
-            crate::ladder::DEFAULT_BOOT_TIMEOUT_SECS >= required,
+            crate::shared::DEFAULT_BOOT_TIMEOUT_SECS >= required,
             "the host gives up after {}s while the guest's boot-success loop may run \
              {}s ({BOOT_SUCCESS_RETRY_MAX_SECS} iterations x \
              {BOOT_SUCCESS_ITERATION_BUDGET_SECS}s), after {}s of serial identity/root \
@@ -7791,11 +7791,11 @@ mod tests {
              {}s ceilings; the VM would be killed mid-loop or before its {}s diagnostic \
              margin elapsed, and the failure would be reported with no guest-side \
              reason in it",
-            crate::ladder::DEFAULT_BOOT_TIMEOUT_SECS,
+            crate::shared::DEFAULT_BOOT_TIMEOUT_SECS,
             guest,
             serial,
             predecessor,
-            crate::ladder::QEMU_GUEST_WAIT_MARGIN_SECS
+            crate::shared::QEMU_GUEST_WAIT_MARGIN_SECS
         );
     }
 
@@ -8267,11 +8267,11 @@ mod tests {
         let evidence = include_str!("../../../td-setup/src/evidence.rs");
         assert!(evidence.contains(&format!(
             "pub const PROOF_CMDLINE_TOKEN: &str = \"{}\";",
-            crate::ladder::SETUP_INPUT_CMDLINE_TOKEN
+            crate::shared::SETUP_INPUT_CMDLINE_TOKEN
         )));
         assert!(evidence.contains(&format!(
             "pub const SHOWN_PREFIX: &str = \"{}\";",
-            crate::ladder::TD_SETUP_SHOWN_PREFIX
+            crate::shared::TD_SETUP_SHOWN_PREFIX
         )));
         assert_eq!(unit_key("setup", "log"), None);
         // Nor does the autotest greeter reboot the live session under it.
@@ -8279,7 +8279,7 @@ mod tests {
         let park = format!(
             "case \" $(/bin/td-util cat /proc/cmdline) \" in *\" {} \"*) \
              while :; do /bin/td-util sleep 300; done;; esac\n",
-            crate::ladder::SETUP_INPUT_CMDLINE_TOKEN
+            crate::shared::SETUP_INPUT_CMDLINE_TOKEN
         );
         let parked = profile.find(&park).unwrap();
         assert!(parked > profile.find(GREETER_MARKER).unwrap());
@@ -13126,7 +13126,7 @@ mod tests {
 in it'; healthy=0; elif [ -s {out} ]; then",
             update = td_boot_protocol::UPDATE_VERB,
             volume = "/run/td-volume",
-            idle = crate::ladder::DEPLOY_IDLE_CHANNEL,
+            idle = crate::shared::DEPLOY_IDLE_CHANNEL,
             key = td_boot_protocol::VOLUME_TRUSTED_KEY,
             out = "/run/td-idle-id",
         );
@@ -13219,7 +13219,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         assert!(
             bootsuccess.contains(&format!(
                 "/run/td-volume/{}",
-                crate::ladder::DEPLOY_WRONG_KEY
+                crate::shared::DEPLOY_WRONG_KEY
             )) && bootsuccess.contains(&format!(
                 "/run/td-volume/{}",
                 td_boot_protocol::VOLUME_TRUSTED_KEY
@@ -13233,7 +13233,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         );
         // Bound rather than compared as `Option`s: `None < Some(_)` is true,
         // so a MISSING wrong key would satisfy the ordering it is meant to fail.
-        let wrong_at = bootsuccess.find(crate::ladder::DEPLOY_WRONG_KEY).unwrap();
+        let wrong_at = bootsuccess.find(crate::shared::DEPLOY_WRONG_KEY).unwrap();
         let real_at = bootsuccess
             .find(td_boot_protocol::VOLUME_TRUSTED_KEY)
             .unwrap();

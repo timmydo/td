@@ -1,4 +1,4 @@
-use crate::ladder::{split_target_debug, target_rustc};
+use crate::shared::{split_target_debug, target_rustc};
 use crate::types::{Recipe, Step};
 
 // td-login — target-built static multicall for td's credential switch.
@@ -304,14 +304,14 @@ mod tests {
             "const SESSION_PROCS: &str = {:?};",
             format!(
                 "{}/cgroup.procs",
-                crate::ladder::TD_APPLICATION_CGROUP_SESSION
+                crate::shared::TD_APPLICATION_CGROUP_SESSION
             )
         )));
         assert!(cgroup.contains(&format!(
             "const SESSION_MEMBERSHIP: &str = {:?};",
             format!(
                 "0::{}/session",
-                crate::ladder::TD_APPLICATION_CGROUP_MEMBERSHIP_ROOT
+                crate::shared::TD_APPLICATION_CGROUP_MEMBERSHIP_ROOT
             )
         )));
     }

@@ -1,4 +1,4 @@
-use crate::ladder::{
+use crate::shared::{
     BUILD_ROOT_PATH as PATH, BUILD_ROOT_SH as SH, TD_FIREFOX_BOOT_MARKER, TD_JAIL_TRANSITION_MARKER,
 };
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
@@ -270,8 +270,8 @@ pub fn recipe() -> Recipe {
                      [ \"$p\" = \"$e\" ] || {{ echo \"td-jail host shared-network degradation report changed: $p\" >&2; exit 1; }}; \
                      [ \"$f\" = \"$e\" ] || {{ echo \"td-jail host Firefox-spec degradation report changed: $f\" >&2; exit 1; }}; \
                      [ \"$(cat /home/td-jail-host/runtime/td-app/firefox/dynamic-ready)\" = '{HOST_FIREFOX_MARKER}' ] || {{ echo 'td-jail host Firefox-spec marker is absent or wrong' >&2; exit 1; }}",
-                    crate::ladder::TD_JAIL_FIXTURE_NAME,
-                    crate::ladder::TD_JAIL_FIXTURE_NAME,
+                    crate::shared::TD_JAIL_FIXTURE_NAME,
+                    crate::shared::TD_JAIL_FIXTURE_NAME,
                     HOST_DEGRADATION_CGROUP,
                     HOST_DEGRADATION_WAYLAND,
                 ),
@@ -351,7 +351,7 @@ mod tests {
     /// surrogate's runtime inside the jail, never a tool on PATH.
     #[test]
     fn td_jail_is_graded_only_by_the_roots_bash_and_tools() {
-        crate::ladder::assert_build_root_test(
+        crate::shared::assert_build_root_test(
             &super::recipe(),
             INPUTS,
             &["td-jail", "td-sh", "td-util"],

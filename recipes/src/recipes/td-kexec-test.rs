@@ -1,4 +1,4 @@
-use crate::ladder::{BUILD_ROOT_PATH as PATH, BUILD_ROOT_SH as SH};
+use crate::shared::{BUILD_ROOT_PATH as PATH, BUILD_ROOT_SH as SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 // td-kexec-test: behavioral validation of the target-built guest kexec helper.
@@ -100,6 +100,6 @@ mod tests {
     /// td-kexec is examined only by the Debian build root's tools, never by its own.
     #[test]
     fn td_kexec_is_examined_only_by_the_roots_tools() {
-        crate::ladder::assert_build_root_test(&super::recipe(), &["td-kexec"], &["td-kexec"]);
+        crate::shared::assert_build_root_test(&super::recipe(), &["td-kexec"], &["td-kexec"]);
     }
 }

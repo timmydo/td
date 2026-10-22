@@ -29,7 +29,7 @@ pub fn recipe() -> Recipe {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ladder::TD_TERM_RUNTIME_MARKER;
+    use crate::shared::TD_TERM_RUNTIME_MARKER;
 
     #[test]
     fn static_checkout_package_has_the_complete_toolkit_source_closure() {

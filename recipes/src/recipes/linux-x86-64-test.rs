@@ -1,4 +1,4 @@
-use crate::ladder::{initramfs_cpio_shape_check, BUILD_ROOT_PATH as PATH, BUILD_ROOT_SH as SH};
+use crate::shared::{initramfs_cpio_shape_check, BUILD_ROOT_PATH as PATH, BUILD_ROOT_SH as SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 // linux-x86-64-test: behavioral validation of the source-built kernel (#529).
@@ -25,7 +25,7 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 //      executable entry point, checked by the bounded Rust header reader.
 //      This is a format check, not a firmware boot or Secure Boot proof.
 //   6. initramfs.cpio is a real, COMPLETE newc cpio carrying the whole bootable
-//      userland — via the shared `initramfs_cpio_shape_check` helper (ladder.rs)
+//      userland — via the shared `initramfs_cpio_shape_check` helper (shared.rs)
 //      that the producer rung runs too, so the two cannot drift. It parses the
 //      archive with td-util `cpio -t` (a real newc walk that reds on a truncated/
 //      corrupt stream) and asserts init, bin/td-sh, bin/sh, bin/td-init,

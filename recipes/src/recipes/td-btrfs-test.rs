@@ -1,4 +1,4 @@
-use crate::ladder::{BUILD_ROOT_PATH as PATH, BUILD_ROOT_SH as SH};
+use crate::shared::{BUILD_ROOT_PATH as PATH, BUILD_ROOT_SH as SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 // Build a populated Btrfs volume in a regular file with the target-built
@@ -135,6 +135,6 @@ mod tests {
     /// store path, its own `check` reading what its mkfs wrote.
     #[test]
     fn only_the_roots_tools_are_on_path() {
-        crate::ladder::assert_build_root_test(&super::recipe(), &["td-btrfs"], &["td-btrfs"]);
+        crate::shared::assert_build_root_test(&super::recipe(), &["td-btrfs"], &["td-btrfs"]);
     }
 }

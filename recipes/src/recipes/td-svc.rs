@@ -1,4 +1,4 @@
-use crate::ladder::{split_target_debug, target_rustc};
+use crate::shared::{split_target_debug, target_rustc};
 use crate::types::{Recipe, Step};
 
 // td-svc — target-built static service supervisor.
@@ -244,22 +244,22 @@ mod tests {
             .expect("cgroup source");
         assert!(cgroup.contains(&format!(
             "const DELEGATE: &str = {:?};",
-            crate::ladder::TD_APPLICATION_CGROUP_ROOT
+            crate::shared::TD_APPLICATION_CGROUP_ROOT
         )));
         assert!(cgroup.contains(&format!(
             "const SESSION: &str = {:?};",
-            crate::ladder::TD_APPLICATION_CGROUP_SESSION
+            crate::shared::TD_APPLICATION_CGROUP_SESSION
         )));
         assert!(cgroup.contains(&format!(
             "const SYSTEM: &str = {:?};",
-            crate::ladder::TD_SERVICE_CGROUP_ROOT
+            crate::shared::TD_SERVICE_CGROUP_ROOT
         )));
         // One roster, and a subtree write built FROM it. The literal
         // "+cpu +memory +pids" this used to pin was a second copy of the same
         // three names, so the two could disagree while both tests passed.
         let roster = format!(
             "const CONTROLLERS: &[&str] = &[{}];",
-            crate::ladder::TD_CGROUP_CONTROLLERS
+            crate::shared::TD_CGROUP_CONTROLLERS
                 .iter()
                 .map(|c| format!("{c:?}"))
                 .collect::<Vec<_>>()

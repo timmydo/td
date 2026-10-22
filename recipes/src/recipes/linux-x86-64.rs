@@ -1,4 +1,4 @@
-use crate::ladder::{
+use crate::shared::{
     initramfs_cpio_shape_check, unpack_into, BUILD_ROOT_PATH as PATH, BUILD_ROOT_SH as SH,
     EROFS_MARKER, EROFS_PROBE_CONTENT, EROFS_PROBE_SENTINEL, USERLAND_MARKER,
 };
@@ -764,7 +764,7 @@ pub fn recipe() -> Recipe {
                    'CONFIG_SND_HDA_CODEC_HDMI=y' >> .config"
                     .replace(
                         "@EFI_CMDLINE@",
-                        &format!("{:?}", crate::ladder::efi_default_cmdline()),
+                        &format!("{:?}", crate::shared::efi_default_cmdline()),
                     ),
             ],
         )
@@ -965,7 +965,7 @@ pub fn recipe() -> Recipe {
                  grep -q '^CONFIG_SND_HDA_CODEC_CONEXANT=y' .config || { echo 'SND_HDA_CODEC_CONEXANT off — the T430s Conexant codec falls back to the generic parser' >&2; exit 1; }; \
                  grep -q '^CONFIG_SND_HDA_CODEC_HDMI=y' .config || { echo 'SND_HDA_CODEC_HDMI off — HDMI and DisplayPort audio codecs stay hidden' >&2; exit 1; }; \
                  grep -q '^CONFIG_SND_HDA_CODEC_HDMI_INTEL=y' .config || { echo 'SND_HDA_CODEC_HDMI_INTEL off — Intel HDMI and DisplayPort audio has no codec driver' >&2; exit 1; }; \
-                 if grep -q '^CONFIG_IPC_NS=y' .config; then echo 'IPC_NS on — it is default y behind SYSVIPC||POSIX_MQUEUE, so pinning either brings it along unasked; td-jail omits CLONE_NEWIPC and APPLICATIONS.md §0 defers it deliberately' >&2; exit 1; fi".replace("@EFI_CMDLINE@", &format!("{:?}", crate::ladder::efi_default_cmdline())),
+                 if grep -q '^CONFIG_IPC_NS=y' .config; then echo 'IPC_NS on — it is default y behind SYSVIPC||POSIX_MQUEUE, so pinning either brings it along unasked; td-jail omits CLONE_NEWIPC and APPLICATIONS.md §0 defers it deliberately' >&2; exit 1; fi".replace("@EFI_CMDLINE@", &format!("{:?}", crate::shared::efi_default_cmdline())),
             ],
         )
         .env("PATH", PATH),
@@ -1150,7 +1150,7 @@ pub fn recipe() -> Recipe {
     });
     // [initramfs] the packed userland must be a real, COMPLETE newc cpio carrying
     // the whole bootable userland — not merely a well-formed header. The shared
-    // `initramfs_cpio_shape_check` helper (recipes/src/ladder.rs) parses the archive
+    // `initramfs_cpio_shape_check` helper (recipes/src/shared.rs) parses the archive
     // with td-util `cpio -t` — a real newc walk that reds on a truncated/corrupt
     // stream and yields the exact member names — then asserts init, bin/td-sh,
     // bin/sh, bin/td-init, bin/td-util and dev/console are all present and the
@@ -1329,7 +1329,7 @@ mod tests {
                 "{symbol}"
             );
         }
-        let cmdline = format!("{:?}", crate::ladder::efi_default_cmdline());
+        let cmdline = format!("{:?}", crate::shared::efi_default_cmdline());
         assert!(cmdline.contains("console=tty0 console=ttyS0,115200"));
         assert!(text.contains(&format!("'CONFIG_CMDLINE={cmdline}'")));
         assert!(text.contains(&format!("grep -Fxq 'CONFIG_CMDLINE={cmdline}' .config")));

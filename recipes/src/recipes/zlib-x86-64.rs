@@ -1,4 +1,4 @@
-use crate::ladder::{
+use crate::shared::{
     build_root_glibc_cc, build_root_link_map_check, unpack_into, LinkedLibc,
     BUILD_ROOT_GLIBC as GLIBC, BUILD_ROOT_PATH as PATH, BUILD_ROOT_SH as SH,
 };

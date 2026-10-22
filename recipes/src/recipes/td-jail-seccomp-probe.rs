@@ -1,4 +1,4 @@
-use crate::ladder::{
+use crate::shared::{
     build_root_link_map_check, build_root_static_cc, LinkedLibc, BUILD_ROOT_PATH as PATH,
 };
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
@@ -479,8 +479,8 @@ mod tests {
     #[test]
     fn it_builds_in_the_root_against_td_glibc_and_gcc_runtime() {
         let recipe = recipe();
-        crate::ladder::assert_build_root_static_c(&recipe);
-        crate::ladder::assert_build_root_test(&recipe, &["glibc-x86-64", "gcc-runtime"], &[]);
+        crate::shared::assert_build_root_static_c(&recipe);
+        crate::shared::assert_build_root_test(&recipe, &["glibc-x86-64", "gcc-runtime"], &[]);
         // The link writes its map, and the check that reads it admits
         // gcc-runtime alone beside the build's own files.
         let map = "{root}/probe/seccomp.map";

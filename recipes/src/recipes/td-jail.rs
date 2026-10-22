@@ -1,4 +1,4 @@
-use crate::ladder::{split_target_debug, target_rustc};
+use crate::shared::{split_target_debug, target_rustc};
 use crate::types::{Recipe, Step};
 
 const MAIN_RS: &str = include_str!("../../../td-jail/src/main.rs");
@@ -174,11 +174,11 @@ mod tests {
     #[test]
     fn recipe_embeds_the_transition_marker() {
         let transition = source("transition").expect("transition source");
-        assert!(transition.contains(crate::ladder::TD_JAIL_TRANSITION_MARKER));
+        assert!(transition.contains(crate::shared::TD_JAIL_TRANSITION_MARKER));
     }
 
     /// The §H item 12 marker is a literal in td-jail and a constant in
-    /// `ladder.rs`, in different crates with no compiler relationship. The
+    /// `shared.rs`, in different crates with no compiler relationship. The
     /// boot oracle reads the ladder one and the guest prints the td-jail
     /// one, so if they ever differ the marker simply never appears and the
     /// boot fails with the row's absence diagnostic rather than with the
@@ -188,7 +188,7 @@ mod tests {
         let transition = source("transition").expect("transition source");
         assert!(transition.contains(&format!(
             "pub const KILL_REAPS_MARKER: &str = \"{}\";",
-            crate::ladder::TD_JAIL_KILL_REAPS_MARKER
+            crate::shared::TD_JAIL_KILL_REAPS_MARKER
         )));
     }
 
@@ -461,12 +461,12 @@ mod tests {
         let authority = source("authority").expect("authority source");
         assert!(authority.contains(&format!(
             "pub(crate) const CGROUP_ROOT: &str = {:?};",
-            crate::ladder::TD_APPLICATION_CGROUP_ROOT
+            crate::shared::TD_APPLICATION_CGROUP_ROOT
         )));
         let cgroup = source("cgroup").expect("cgroup source");
         assert!(cgroup.contains(&format!(
             "const DELEGATE_COMPONENT: &str = {:?};",
-            crate::ladder::TD_APPLICATION_CGROUP_MEMBERSHIP_ROOT.trim_start_matches('/')
+            crate::shared::TD_APPLICATION_CGROUP_MEMBERSHIP_ROOT.trim_start_matches('/')
         )));
     }
 
@@ -615,27 +615,27 @@ mod tests {
         )));
         assert!(authority.contains(&format!(
             "const CONFIG: &str = {:?};",
-            crate::ladder::TD_APPLICATION_CONFIG_TEXT
+            crate::shared::TD_APPLICATION_CONFIG_TEXT
         )));
         assert!(authority.contains(&format!(
             "const CONFIG_PATH: &str = {:?};",
-            crate::ladder::TD_APPLICATION_CONFIG_PATH
+            crate::shared::TD_APPLICATION_CONFIG_PATH
         )));
         assert!(authority.contains(&format!(
             "const PACKAGE_ROOT: &str = {:?};",
-            crate::ladder::TD_APPLICATION_PACKAGE_ROOT
+            crate::shared::TD_APPLICATION_PACKAGE_ROOT
         )));
         assert!(authority.contains(&format!(
             "const STATE_ROOT: &str = {:?};",
-            crate::ladder::TD_APPLICATION_STATE_ROOT
+            crate::shared::TD_APPLICATION_STATE_ROOT
         )));
         assert!(authority.contains(&format!(
             "pub(crate) const RUNTIME_ROOT_NAME: &str = {:?};",
-            crate::ladder::TD_APPLICATION_RUNTIME_ROOT
+            crate::shared::TD_APPLICATION_RUNTIME_ROOT
         )));
         assert!(authority.contains(&format!(
             "const REGISTRY_PATH: &str = {:?};",
-            crate::ladder::TD_APPLICATION_REGISTRY
+            crate::shared::TD_APPLICATION_REGISTRY
         )));
         assert!(authority.contains("let mut builder = fs::DirBuilder::new();"));
         assert!(authority.contains("builder.mode(0o700);"));
@@ -686,14 +686,14 @@ mod tests {
         }
 
         let declaration =
-            ApplicationDeclaration::new("empty-runtime", crate::ladder::TD_JAIL_FIXTURE_ENTRY)
+            ApplicationDeclaration::new("empty-runtime", crate::shared::TD_JAIL_FIXTURE_ENTRY)
                 .and_then(|declaration| {
-                    declaration.with_alias(crate::ladder::TD_JAIL_FIXTURE_ALIAS)
+                    declaration.with_alias(crate::shared::TD_JAIL_FIXTURE_ALIAS)
                 })
                 .expect("fixture declaration");
         let manifest = declaration
             .manifest(
-                crate::ladder::TD_JAIL_FIXTURE_NAME,
+                crate::shared::TD_JAIL_FIXTURE_NAME,
                 "0.1",
                 ApplicationProvenance::Source,
             )
@@ -801,14 +801,14 @@ mod tests {
         }
         let package = "/td/store/0123456789abcdefghijklmnopqrstuv-td-jail-fixture-0.1";
         let registry = ApplicationRegistry::new(vec![(
-            crate::ladder::TD_JAIL_FIXTURE_NAME.to_string(),
+            crate::shared::TD_JAIL_FIXTURE_NAME.to_string(),
             package.to_string(),
         )])
         .expect("fixture registry");
         assert_eq!(
             target_authority::test_registry_entry(
                 &registry.to_tsv(),
-                crate::ladder::TD_JAIL_FIXTURE_NAME,
+                crate::shared::TD_JAIL_FIXTURE_NAME,
             )
             .expect("td-jail must consume the exact registry emitted by the compiler"),
             Some(PathBuf::from(package))

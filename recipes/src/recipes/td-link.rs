@@ -1,4 +1,4 @@
-use crate::ladder::{target_rustc_linked_by, BUILD_ROOT_GLIBC as GLIBC, BUILD_ROOT_PATH as PATH};
+use crate::shared::{target_rustc_linked_by, BUILD_ROOT_GLIBC as GLIBC, BUILD_ROOT_PATH as PATH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 // td-link, the linker of every td Rust output (td-link/DESIGN.md): rustc's

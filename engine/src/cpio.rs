@@ -105,7 +105,8 @@
 //! wrong shape for a thing that installs a trust root. Control bytes are in
 //! that list for a duller reason than the rest: nothing in the format objects
 //! to a newline, but the recipes assert archive membership with `grep -q -x -F`
-//! (`recipes/src/ladder.rs:440`), which a name containing one silently breaks.
+//! (`recipes/src/shared.rs`'s `initramfs_cpio_shape_check`), which a name
+//! containing one silently breaks.
 //!
 //! The limit of all of them is worth stating, since it bounds what the harness
 //! may assume. These rules constrain the NAME; they cannot constrain where the

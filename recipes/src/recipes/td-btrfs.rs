@@ -1,4 +1,4 @@
-use crate::ladder::{split_target_debug, target_rustc};
+use crate::shared::{split_target_debug, target_rustc};
 use crate::types::{Recipe, Step};
 
 // Target-built static td-btrfs (td-btrfs/DESIGN.md): `mkfs.btrfs`, which the
@@ -138,6 +138,6 @@ pub fn recipe() -> Recipe {
 mod tests {
     #[test]
     fn every_crate_source_is_staged() {
-        crate::ladder::assert_sibling_sources_staged(super::recipe(), &["td-btrfs"]);
+        crate::shared::assert_sibling_sources_staged(super::recipe(), &["td-btrfs"]);
     }
 }

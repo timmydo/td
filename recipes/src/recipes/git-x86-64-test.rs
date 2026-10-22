@@ -1,4 +1,4 @@
-use crate::ladder::{
+use crate::shared::{
     build_root_debug_line_source_root_check, build_root_debug_line_validator_regression_steps,
     BUILD_ROOT_PATH, BUILD_ROOT_SH as SH,
 };
@@ -234,7 +234,7 @@ mod tests {
     #[test]
     fn validation_composes_git_with_both_verified_transport_oracles() {
         let recipe = recipe();
-        crate::ladder::assert_build_root_test(
+        crate::shared::assert_build_root_test(
             &recipe,
             &[
                 "git-x86-64",

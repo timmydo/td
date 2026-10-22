@@ -1,4 +1,4 @@
-use crate::ladder::{
+use crate::shared::{
     build_root_link_map_check, build_root_static_cc, unpack_into, LinkedLibc,
     BUILD_ROOT_PATH as PATH, BUILD_ROOT_SH as SH,
 };
@@ -340,7 +340,7 @@ mod tests {
     #[test]
     fn td_util_is_graded_only_by_the_roots_tools_and_zlib() {
         let recipe = recipe();
-        crate::ladder::assert_build_root_test(
+        crate::shared::assert_build_root_test(
             &recipe,
             &["td-util", "zlib-x86-64", "glibc-x86-64", "gcc-runtime"],
             &["td-util"],
@@ -360,14 +360,14 @@ mod tests {
                     .filter(|(key, _)| key == "PATH")
                     .map(|(_, value)| value.as_str())
                     .collect();
-                assert_eq!(paths, [crate::ladder::BUILD_ROOT_PATH], "{argv:?}");
+                assert_eq!(paths, [crate::shared::BUILD_ROOT_PATH], "{argv:?}");
             }
         }
-        crate::ladder::assert_probe_link_checked(
+        crate::shared::assert_probe_link_checked(
             &recipe,
             "minigzip",
             &["gcc-runtime", "zlib-x86-64"],
-            crate::ladder::LinkedLibc::Archive,
+            crate::shared::LinkedLibc::Archive,
         );
     }
 }

@@ -9,7 +9,7 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
-use td_recipe::{ladder, td_boot_protocol};
+use td_recipe::{shared, td_boot_protocol};
 
 use crate::atlas::{Slot, Style, PAGE_WIDTH};
 use crate::face::Face;
@@ -194,7 +194,7 @@ impl Guest {
         let mut guest = Self::spawn(options, pass, deadline, disk, "")?;
         guest.until(Duration::from_secs(1800), |line| {
             observe(line)?;
-            Ok((line == ladder::SYSTEM_BOOT_SUCCESS_MARKER).then_some(()))
+            Ok((line == shared::SYSTEM_BOOT_SUCCESS_MARKER).then_some(()))
         })?;
         guest.qmp = Some(Qmp::connect_until(
             &options.work.join(format!("qmp-{pass}.sock")),
@@ -1463,11 +1463,11 @@ struct FailureEvidence {
 }
 
 const FAILURE_MARKERS: &[&str] = &[
-    ladder::SYSTEM_ROOT_RO_MARKER,
-    ladder::SYSTEM_ETC_RO_MARKER,
-    ladder::SYSTEM_STATE_WRITABLE_MARKER,
-    ladder::SYSTEM_STATE_OWNER_MARKER,
-    ladder::SYSTEM_SHUTDOWN_MARKER,
+    shared::SYSTEM_ROOT_RO_MARKER,
+    shared::SYSTEM_ETC_RO_MARKER,
+    shared::SYSTEM_STATE_WRITABLE_MARKER,
+    shared::SYSTEM_STATE_OWNER_MARKER,
+    shared::SYSTEM_SHUTDOWN_MARKER,
 ];
 
 impl FailureEvidence {
@@ -1490,8 +1490,8 @@ impl FailureEvidence {
             )?;
         }
         if line.starts_with(td_boot_protocol::ATTEMPTS_EXHAUSTED_MARKER)
-            || line == ladder::SYSTEM_BOOT_SUCCESS_MARKER
-            || line == ladder::GREETER_MARKER
+            || line == shared::SYSTEM_BOOT_SUCCESS_MARKER
+            || line == shared::GREETER_MARKER
             || line.contains("Kernel panic")
         {
             return Err(format!(
@@ -1621,7 +1621,7 @@ fn rollback(
             pass,
             deadline,
             &disk,
-            ladder::BOOT_FAIL_TARGET_CMDLINE_TOKEN,
+            shared::BOOT_FAIL_TARGET_CMDLINE_TOKEN,
         )?;
         guest.failed_boot(
             successor,
@@ -2134,7 +2134,7 @@ mod tests {
             assert!(evidence.finish().is_err());
         }
         for line in [
-            ladder::SYSTEM_BOOT_SUCCESS_MARKER.to_string(),
+            shared::SYSTEM_BOOT_SUCCESS_MARKER.to_string(),
             "TD-GREETER-OK".into(),
             "Kernel panic - not syncing".into(),
             format!(

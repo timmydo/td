@@ -85,7 +85,7 @@ use std::process::ExitCode;
 
 /// The markers the qemu boot oracle greps for. DUPLICATED as
 /// `TD_FIRSTBOOT_NEW_MARKER` / `TD_FIRSTBOOT_STABLE_MARKER` /
-/// `TD_FIRSTBOOT_HOST_KEY_PREFIX` in `recipes/src/ladder.rs` — this crate is built
+/// `TD_FIRSTBOOT_HOST_KEY_PREFIX` in `recipes/src/shared.rs` — this crate is built
 /// from its own source, so it cannot share the consts. The td-firstboot recipe's
 /// unit tests read these literals back out of this file and assert they match, so
 /// the two copies cannot drift.

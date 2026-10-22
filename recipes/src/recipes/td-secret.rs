@@ -1,4 +1,4 @@
-use crate::ladder::{split_target_debug, target_rustc};
+use crate::shared::{split_target_debug, target_rustc};
 use crate::types::{Recipe, Step};
 const LIB_RS: &str = include_str!("../../../td-secret/src/lib.rs");
 const MAIN_RS: &str = include_str!("../../../td-secret/src/main.rs");

@@ -1,4 +1,4 @@
-use crate::ladder::{target_rustc, target_rustc_linked_by};
+use crate::shared::{target_rustc, target_rustc_linked_by};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 // td-link-test: every output kind td-link links, with no GCC or binutils in

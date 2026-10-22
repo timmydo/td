@@ -123,10 +123,10 @@ pub(crate) fn write_image_with_payloads(
         for extent in &esp.extents {
             write_at(&mut out, image.esp_offset + extent.offset, &extent.bytes)?;
         }
-        let boot_path = format!(r"\EFI\BOOT\{}", td_recipe::ladder::EFI_BOOT_FILE);
+        let boot_path = format!(r"\EFI\BOOT\{}", td_recipe::shared::EFI_BOOT_FILE);
         for placement in &esp.placements {
             let source = match placement.path.as_str() {
-                td_recipe::ladder::EFI_INITRD_PATH => &mut initramfs,
+                td_recipe::shared::EFI_INITRD_PATH => &mut initramfs,
                 name if name == boot_path => &mut kernel,
                 _ => return Err(format!("unexpected ESP file {}", placement.path)),
             };
@@ -176,7 +176,7 @@ fn layout(
                     "BOOT".into(),
                     fat::Node::Dir(vec![
                         (
-                            td_recipe::ladder::EFI_BOOT_FILE.into(),
+                            td_recipe::shared::EFI_BOOT_FILE.into(),
                             fat::Node::Stream(kernel_len),
                         ),
                         ("INITRD".into(), fat::Node::Stream(initramfs_len)),

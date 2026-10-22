@@ -55,7 +55,7 @@ use super::setup_input::{
 use super::*;
 use std::rc::Rc;
 
-const TD_SETUP_LIVE_MARKER: &str = td_recipe::ladder::TD_SETUP_LIVE_MARKER;
+const TD_SETUP_LIVE_MARKER: &str = td_recipe::shared::TD_SETUP_LIVE_MARKER;
 /// The live volume is half of RAM and the live session runs on the rest.
 const LIVE_MEMORY_MIB: &str = "4096";
 /// The destination the wizard should list: the only virtio disk. The
@@ -146,7 +146,7 @@ pub(super) fn drive_wizard(run: &LiveRun<'_>) -> Result<BootResult, String> {
     let tokens = format!(
         "{AUTOTEST_CMDLINE_TOKEN} {} {}",
         autotest_wait_token(timeout),
-        td_recipe::ladder::SETUP_INPUT_CMDLINE_TOKEN
+        td_recipe::shared::SETUP_INPUT_CMDLINE_TOKEN
     );
     let result = boot_source(
         run.qemu,
@@ -538,7 +538,7 @@ fn restarted(console: &str) -> bool {
     let lines: Vec<&str> = console.lines().map(str::trim_end).collect();
     let shutdown = lines
         .iter()
-        .rposition(|line| *line == td_recipe::ladder::SYSTEM_SHUTDOWN_MARKER);
+        .rposition(|line| *line == td_recipe::shared::SYSTEM_SHUTDOWN_MARKER);
     let restart = lines
         .iter()
         .rposition(|line| line.ends_with(KERNEL_RESTART));
@@ -577,7 +577,7 @@ mod tests {
 
     #[test]
     fn only_an_orderly_restart_ends_the_live_session() {
-        let marker = td_recipe::ladder::SYSTEM_SHUTDOWN_MARKER;
+        let marker = td_recipe::shared::SYSTEM_SHUTDOWN_MARKER;
         assert!(restarted(&format!(
             "{marker}\n[  812.004211] reboot: Restarting system\n"
         )));

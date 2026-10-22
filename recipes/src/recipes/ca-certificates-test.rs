@@ -1,4 +1,4 @@
-use crate::ladder::BUILD_ROOT_PATH;
+use crate::shared::BUILD_ROOT_PATH;
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 // Behavioral validation for the installed CA bundle. The parser accepts the
@@ -114,7 +114,7 @@ mod tests {
     #[test]
     fn the_bundle_is_parsed_in_the_build_root() {
         let recipe = recipe();
-        crate::ladder::assert_build_root_test(&recipe, &["ca-certificates"], &[]);
+        crate::shared::assert_build_root_test(&recipe, &["ca-certificates"], &[]);
         assert!(recipe.native_inputs.is_none());
         assert_eq!(
             recipe.inputs.as_deref(),

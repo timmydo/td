@@ -1,4 +1,4 @@
-use crate::ladder::{build_root_static_cc, unpack_into, BUILD_ROOT_PATH, BUILD_ROOT_SH as SH};
+use crate::shared::{build_root_static_cc, unpack_into, BUILD_ROOT_PATH, BUILD_ROOT_SH as SH};
 use crate::types::{Recipe, Step, TextEdit};
 
 // LibreSSL 4.3.2 provides the OpenSSL-compatible TLS surface curl and Git will
@@ -153,7 +153,7 @@ pub fn recipe() -> Recipe {
 #[cfg(test)]
 mod tests {
     use super::{recipe, SH};
-    use crate::ladder::assert_build_root_static_c;
+    use crate::shared::assert_build_root_static_c;
     use crate::types::Step;
 
     #[test]

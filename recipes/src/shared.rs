@@ -1,6 +1,5 @@
 //! Shared step builders and contract constants for td's recipes (#378
-//! slices 2+3). The module's name is historical: it first held the stage0
-//! bootstrap ladder's rung helpers. Conventions:
+//! slices 2+3). Conventions:
 //! - A C recipe builds in the Debian build root (`Recipe::build_root`) with
 //!   its bash and tools (`BUILD_ROOT_SH`, `BUILD_ROOT_PATH`) and compiles
 //!   through `build_root_*_cc` against td glibc.
@@ -850,7 +849,7 @@ pub fn post_rust_inputs<'a>(extras: &[&'a str]) -> Vec<&'a str> {
 /// The exact line the bootable-kernel rung's td-sh `/init` prints on ttyS0 once
 /// the kernel has reached userspace, and that the host-side `qemu-boot` tool asserts
 /// on. SINGLE SOURCE OF TRUTH shared by the `/init` script, both initramfs shape
-/// checks, and the boot tool (`checks/qemu_boot.rs`, via `td_recipe::ladder`), so the
+/// checks, and the boot tool (`checks/qemu_boot.rs`, via `td_recipe::shared`), so the
 /// producer, the gated shape check, and the boot oracle can never silently desync.
 pub const USERLAND_MARKER: &str = "TD-USERLAND-OK";
 

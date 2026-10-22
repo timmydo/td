@@ -1,7 +1,7 @@
 use crate::types::Recipe;
 
 #[cfg(test)]
-use crate::ladder::TD_JAIL_FIXTURE_DOWNLOAD_TARGET;
+use crate::shared::TD_JAIL_FIXTURE_DOWNLOAD_TARGET;
 #[cfg(test)]
 const SYSTEM_X86_64_RS: &str = include_str!("system-x86-64.rs");
 #[cfg(test)]
@@ -54,7 +54,7 @@ pub fn recipe() -> Recipe {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ladder::{
+    use crate::shared::{
         TD_PORTAL_REQUEST_RUNTIME_MARKER, TD_PORTAL_RUNTIME_MARKER,
         TD_PORTAL_UNAVAILABLE_RUNTIME_MARKER,
     };

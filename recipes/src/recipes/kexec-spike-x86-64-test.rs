@@ -1,4 +1,4 @@
-use crate::ladder::{
+use crate::shared::{
     post_rust_inputs, post_rust_tool_farm, KEXEC_STAGE1_MARKER, KEXEC_STAGE2_MARKER, POST_RUST_SH,
 };
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};

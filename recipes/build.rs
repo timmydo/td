@@ -131,7 +131,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // (`lib.rs` places td-boot's protocol and td-profiler's contract by
     // `#[path]`), and any recipe may use one, so what they EMBED is every
     // recipe's. Only what they embed: a shared module multiplies into every
-    // recipe, and `ladder.rs`'s doc comments cite the compositor sources
+    // recipe, and `shared.rs`'s doc comments cite the compositor sources
     // whose markers it duplicates, which would make every check a reader of
     // td-compositor. A recipe file keeps the wide rule, where a stray name
     // widens one recipe's reach and not all of them. The evaluator's own

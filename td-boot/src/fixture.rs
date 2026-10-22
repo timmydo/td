@@ -124,7 +124,7 @@ pub fn manifest(tag: &str, digest: impl Fn(&[u8]) -> String) -> String {
 /// `Option` rather than a panic: this file is ordinary compiled code in the
 /// recipes generator, where the crate's no-panic rule applies.
 // A loop rather than the searching iterator adaptor, whose bare name is what
-// `ladder.rs` reads as the host search utility in any body a recipe STAGES.
+// `shared.rs` reads as the host search utility in any body a recipe STAGES.
 // Nothing stages this file today — that is the point of the `cfg(test)` on its
 // module — so this is a precaution rather than a present requirement, kept
 // because it costs a line and becomes load-bearing the moment anything does.
