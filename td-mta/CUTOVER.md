@@ -8,6 +8,18 @@ approves the concrete account inventory, routing changes and maintenance window.
 The current migration commands are documented in [MIGRATION.md](MIGRATION.md).
 A successful provisional command never makes the whole deployment ready.
 
+## Owner-approved migration scope
+
+The owner confirms td-mail is the only client. IMAP, POP and SMTP client
+submission compatibility are not migration requirements; observed open
+connections alone do not expand that scope. Preserve td-mail's JMAP flows.
+
+SPF, DKIM, DMARC and spam-processing feature parity are explicitly excluded
+from this migration. Do not make their implementation a cutover prerequisite.
+This exclusion does not waive recipient validation, account isolation,
+forwarding restrictions, open-relay rejection or outbound-provider sender
+authorization. No production routing change is authorized by this scope.
+
 ## Current evidence and remaining blockers
 
 The initial independent Stalwart 0.15.2 copy preserved 816 messages across
