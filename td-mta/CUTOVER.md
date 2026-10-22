@@ -22,8 +22,9 @@ and Inbox membership, but Stalwart 0.15.2 returned its received time at whole
 second precision: `2026-10-22T07:47:21.998Z` became
 `2026-10-22T07:47:21Z`. This is a failed exact-date acceptance check. Preserve
 the exact td-mta export; do not round comparison timestamps to conceal the
-loss. Exact rollback remains a blocker unless the owner explicitly accepts
-this limited loss for emergency rollback.
+loss. The owner accepts loss of fractional seconds for emergency rollback.
+This specific precision difference is no longer a cutover blocker; all other
+message and metadata preservation checks remain required.
 
 The source-deleted empty-folder rehearsal removed a child before its parent
 through separate retained plans, preserving all 816 surviving target messages
@@ -96,8 +97,9 @@ quiet td-mta account, retain exact raw bodies and metadata, and reconcile into
 the rollback server using retained object mappings to avoid duplicate imports.
 
 Independently export and compare the rollback destination. Apply the received-
-time precision acceptance decision above explicitly; a failed exact comparison
-must remain a reported failure, even if emergency operation is approved. Do not
+time precision acceptance above explicitly: report fractional-second loss
+as an accepted difference while preserving the exact export. Other comparison
+failures still require investigation and resolution before routing changes. Do not
 send queued submissions twice while moving responsibility between services.
 Restore routing and client endpoints only after the destination and queue
 ownership are verified. Keep both stores and the exact rollback archive for
