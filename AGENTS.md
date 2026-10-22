@@ -133,6 +133,16 @@ payload in `/td/store`, not a build-tool trust root. The mark is load-bearing:
 Adding an application is a reviewed pin. Adding a class of foreign output is
 an amendment to this file.
 
+Flathub applications and runtimes are the second class (`APPLICATIONS.md`
+§W.9, landing in increments). Their bytes are neither pinned nor in
+`/td/store` or the image: what is reviewed is the application's declaration
+(repository, exact app and runtime refs and td's own policy) and Flathub's
+signing key compiled into td-net. The payload is fetched on demand into the
+application account's private cache and admitted only under that signature,
+exact ref bindings, a monotonic commit time and §B.3.1's bounds and
+validators. It is never an input to any recipe, is outside every closure
+and source-bootstrap claim, and runs only through the same confinement.
+
 The image asserts that a dynamic payload's `PT_INTERP` is absent from the
 image root, but this does not prove the bytes can execute only in a jail: an
 explicit store `ld.so` can load them, and static payloads have no interpreter.
@@ -141,8 +151,10 @@ compilation input, or execution input to a source-built output. td's supported
 run path puts applications behind td-owned namespace, seccomp, D-Bus, portal,
 and Wayland boundaries. See `APPLICATIONS.md` §B.8.
 
-Applications currently ship inside the system image, so independent
-side-by-side application retention is deferred (`APPLICATIONS.md` §W.2).
+Image-shipped applications ride the system deployment, so independent
+side-by-side retention is deferred for them (`APPLICATIONS.md` §W.2); a
+Flathub application keeps its current and previous generations in its
+account's cache (§W.9).
 
 ## Pinned upstream data
 

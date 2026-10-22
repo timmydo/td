@@ -2100,8 +2100,8 @@ for one has to argue past this rather than rediscover it:
 
 | not built | why |
 |---|---|
-| **target-side OSTree client** (repo modes, `.filez`/`.dirtree`/`.dirmeta`, GVariant) | Still refused. §B.3.1 selects a bounded control-plane deploy importer for reviewed exact commits; it does not put repository or installation machinery in the distribution. |
-| **runtime summary browsing, refs and updates** | Still refused. The control-plane importer may resolve only the exact pinned commit/object graph. A pin bump plus a rebuild is td's update mechanism; a mutable ref is discovery input at review time, never derivation input. |
+| **target-side OSTree client** (repo modes, `.filez`/`.dirtree`/`.dirmeta`, GVariant) | Refused in general. §B.3.1 selects a bounded deploy importer; §W.9 runs the same bounded reader on the target for signed Flathub applications only, with no repository modes, summary or installation machinery. |
+| **runtime summary browsing, refs and updates** | Summary browsing stays refused. A mutable ref is never derivation input: a pinned graph resolves only its exact commit. §W.9's applications follow one declared ref per application and runtime, as a hint whose answer must pass its admission rules. |
 | **OpenPGP verification** | Not in any application, launcher or image service. The signature is checked by a human at pin review, as it is for every other fixed-output input, and the control plane's upstream Flathub fetch re-checks it with the bounded single-packet verifier of §B.3.1; nothing reads a keyring, armor, summary signature or trust database. |
 | **HTTP/TLS on the target** | One thing on the target fetches: `td-fetchd`, the fetch service applet of the target-built `td-net` (§W.8), which a jailed application reaches over a socket under `sockets=fetch`. The applications themselves carry no TLS, resolve no names and hold no network; the control plane's `td-net` does this under the existing dependency exception, and the target's copy is the same tier rebuilt on the target toolchain. |
 | **a target-side `fsck`/`verify` verb** | Refused. A package is in a read-only image admitted by a signed manifest, so a userspace hash sweep would re-check it with a weaker mechanism (§B.5). This refusal has flipped three times as the layout moved, which is the entry's real content: **a refusal argued from a layout is only as settled as the layout.** |
@@ -10990,6 +10990,181 @@ into the toolkit (`td-ui/DESIGN.md`, "Editor core"), unchanged in
 behavior, so neither depends on td-editor any more: each names td-ui
 alone, its lock lists the crate and the toolkit, and its recipe stages
 no editor tree. The td-pass notebook window embeds the same pane.
+
+### W.9 Flathub applications on demand
+
+**Status: decided by the repository user, landing in increments.** Until
+the cutover increment below lands, the pinned Firefox of §B.3.1 still
+ships in the image and everything earlier in this document about it
+holds. This section is the target; where it and an earlier section
+disagree, the earlier one describes the code that exists today.
+
+**Why.** An exact-commit pin assumes its URL is permanent, and Flathub's
+is not: it prunes superseded commits within weeks. The Firefox 154 pin
+(`86ba63a1…`) returned 404 two months after review, so every fresh
+install's update failed at its warm step, and every later bump would rot
+the same way, for fresh installs and for every older checkout. A pin
+also left the fastest-moving program on the machine moving at the
+system's cadence (§W.2). Pinning the bytes is therefore the wrong unit
+for Flathub. td pins who may sign them instead.
+
+**What is reviewed, and what is not.** The application's *declaration*
+stays in git and ships in the image: the repository (`https://dl.flathub.org/repo`),
+the exact app ref (`app/org.mozilla.firefox/x86_64/stable`), the one
+runtime ref it accepts (`runtime/org.freedesktop.Platform/x86_64/25.08`),
+the entry, td's permission policy, launcher presentation, environment
+and the dynamic-library policy, which is keyed by application and
+runtime branch, never by commit. Flathub's signing key is compiled into
+td-net (§B.3.1). The payload bytes are *not* reviewed: whatever commit
+the ref names when a machine asks is admitted only if all of these hold:
+
+1. one of its detached signatures verifies under the compiled key, with
+   the §B.3.1 verifier, over the exact commit bytes;
+2. `xa.ref`, `ostree.ref-binding`, `ostree.collection-binding` and
+   `ostree.collection-refs-binding` name exactly the requested ref in
+   `org.flathub.Stable`, so a signed commit of another application or
+   branch cannot be substituted;
+3. its timestamp is not older than the newest commit this cache has
+   admitted for that ref, and an equal timestamp admits only the same
+   commit, so an old signed commit cannot be replayed as an update;
+4. the application commit's `xa.metadata` `[Application]` `runtime=`
+   names exactly the accepted runtime ref, and the runtime commit passes
+   1–3 for that ref;
+5. both graphs pass §B.3.1's bounds and both trees the deploy-tree rules
+   and the dynamic validator, the checks the image build runs today.
+
+A refused candidate leaves the current generation in place and is
+reported. A new runtime branch (26.08) or a new Flathub subkey is a
+reviewed change to the declaration or to `net/src/flathub.rs`; until it
+lands, newer commits that need it are refused and the old generation
+keeps running. Key revocation is not consulted, and a freeze attack
+(serving an old but not older-than-admitted signed commit) is not
+detected; the signature, not freshness, is the claim.
+
+**Where the bytes live: the application account's own home.** Firefox
+runs as its own account, `tda65536`, whose home is
+`/var/lib/td/applications/65536`. Its cache is
+`/var/lib/td/applications/65536/.td/flathub/`, owned by that account,
+mode 0700, beside the jail's `.td/app` state and never mounted into a
+jail: td-jail binds only the selected generation's two `files/` trees,
+read-only, at `/app` and `/usr`. It is per account on the machine, so it
+needs no access to any human home and no system location. The cost is
+that the cache is writable by the account the application runs as;
+outside the jail only td's own launch and update processes run as that
+account, and §B.1's "not writable by the uid that runs it" no longer
+holds for these payloads. Layout:
+
+```text
+.td/flathub/
+  lock                        one writer at a time
+  objects/<commit>/           §B.3.1 object graph caches, one per commit
+  deploy/<commit>/files/      materialized trees, app and runtime alike
+  generations/<n>/selection   app ref+commit+timestamp, runtime ref+commit+timestamp
+  current -> generations/<n>  what td-jail launches
+  previous -> generations/<m> the generation before it
+  admitted                    newest admitted timestamp per ref (rule 3)
+  checked                     time of the last completed check
+```
+
+A generation is published by writing it completely, then replacing
+`current` with one `rename(2)`; the old `current` becomes `previous`.
+Only `current` and `previous` are retained: deploys and object graphs
+neither names are removed after a successful flip. The deploy trees
+follow §B.3.1's materialization rules, owned by the account rather than
+root, directories 0755 and files 0755/0644 from the executable bit.
+
+**Who fetches: `td-app`, a td-net applet.** `td-app update NAME
+[--force]` runs as the application's account, resolves the ref through
+`refs/heads/<ref>` (a mutable hint, never authority), and performs 1–5.
+Without `--force` it does nothing if `checked` is less than 24 hours old.
+The materializer and the dynamic validator move from the builder into
+td-engine so the image build and td-app share one implementation; td-net
+stays free of `unsafe`, so publication uses the account-private lock and
+plain `rename(2)` instead of the builder's `RENAME_NOREPLACE`.
+
+**When it fetches.** td-jail, launching an application whose spec names
+a Flathub source, runs `td-app update NAME` before it resolves the
+package: if there is no `current` generation it waits for the fetch
+(the first launch is a download); otherwise the daily check runs
+detached and a new generation is used from the next launch, so a
+network failure never stops a working application from starting. The
+forced check is the same command with `--force`, requested as below.
+
+**How a launch is requested.** Today nothing user-reachable starts an
+application: `td-authd application-start` is root-only and every
+application is a boot-time td-svc unit. Firefox's unit gains
+`unless-exists=` on a path the init script creates on every boot that
+does not carry the autotest token, so a normal boot skips it and an
+oracle boot starts it; it becomes `restart=never`, so closing Firefox
+keeps it closed. A fixed root worker unit, the `vm-power` pattern
+(td-svc/DESIGN.md §8), reads newline requests from a root-owned FIFO
+that only the session owner's uid may write: `start NAME` becomes
+`td-svc start NAME` and `update NAME` becomes `td-svc start NAME-update`,
+a oneshot that runs `td-app update NAME --force` as the account. NAME
+must be a row of the launcher table; nothing else is accepted. The
+compositor's launcher writes `start NAME` when an activated application
+has no window, which also delivers §W.7's plan (1) for every shipped
+application; `td-app request update firefox` writes the update request
+from a terminal.
+
+**The image no longer carries the payload.** At cutover the Firefox
+recipe stops naming `firefox-154-source` and the runtime; its package in
+`/td/store` keeps `manifest`, `spec` and `exports/launcher.tsv` and gains
+a `source=` line naming the repository, app ref and runtime ref, while
+the spec's `runtime=` names the runtime ref rather than a store path.
+td-jail resolves such a spec from the account's `current` generation
+instead of `/td/store`. `recipes/src/ostree_pins.rs`, the pinned graphs,
+the OSTree step of `./update`'s warm and `td-feed export/consume graphs`
+are deleted in the same landing, and roughly 1 GB leaves every image and
+§B.1's ×3 capacity accounting.
+
+**Claude Code keeps its binary and fetches its runtime.** Its payload is
+Anthropic's release, pinned in `recipes/src/source_pins.rs` at a
+permanent URL, and stays in the image. It runs on the same Flathub
+runtime, which supplies not only glibc but the bash, grep, sed and
+find its Bash tool runs, and that runtime pin would rot the same way.
+Its declaration therefore names the runtime ref while its `files/` stays
+in `/td/store`, and its account, `tda65539`, fetches the runtime into its
+own cache under the same rules: rule 4 is replaced by the declaration's
+runtime ref, and rules 1–3 and 5 apply to the runtime commit. The two
+accounts do not share a cache, so a machine running both downloads the
+runtime twice. After cutover no Flathub byte is in the image.
+
+**Each half of a spec resolves on its own.** A spec's application tree
+comes either from its `/td/store` package (`files/`) or, when the spec
+carries `source=`, from the account's `current` generation; its runtime
+comes either from a `/td/store` runtime path or, when `runtime=` names a
+Flathub ref, from the same generation. Firefox takes both from the
+cache, Claude Code only its runtime, mail and news neither.
+
+**The QEMU oracles keep Firefox.** Most proofs of the jail, portals,
+audio, input, seccomp and network run through the autostarted Firefox
+(§H). Under the autotest token Firefox still starts at boot, and its
+first-run fetch uses the VM feed endpoint as transport: the integration
+tier's host warm runs the same `td-app` admission against Flathub and
+exports the admitted refs, commits, detached metadata and objects into
+the feed, and the guest re-verifies everything, signature included,
+before admitting it. The cost is that oracles need the network at warm
+time and the Firefox version they test floats with Flathub.
+
+**What this reverses in §B.6.** A bounded OSTree client (exact refs,
+commits, detached metadata and `files/` objects, no summary browsing,
+no repository modes) and OpenPGP verification now run on the target, in
+td-net's `td-app`, because a machine now makes the admission decision a
+reviewer used to make. Following a mutable ref is no longer refused for
+these applications; it is a hint whose answer must pass 1–5.
+
+**Increments.** (1) The Flathub signature verifier on the pinned path
+(§B.3.1, landed first). (2) This design and its AGENTS.md amendment.
+(3) Move the materializer and the dynamic validator into td-engine,
+unchanged. (4) `td-app update`: cache, admission, generations, daily and
+forced checks, for an application or a runtime alone, as a command
+nothing launches yet. (5) Launch requests, the worker, the compositor
+launcher, and td-jail resolving each half of a spec from the store or
+the cache. (6) Cutover: the declaration-only Firefox package, Claude
+Code's runtime ref, autostart only under the autotest token, the
+oracles' feed transport, and deletion of the pins, payloads and graph
+transfer.
 
 ## X. Host mode — development only
 
