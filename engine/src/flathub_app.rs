@@ -78,6 +78,11 @@ pub fn spec_source(
 
 /// The cache, relative to the application account's home.
 pub const CACHE_DIR: &str = ".td/flathub";
+/// A feed endpoint named on the kernel command line, for a guest no VM
+/// bridge serves (the QEMU oracles): the deployment init writes the token's
+/// value here, root-owned, and td-app reads it after the bridge's.
+pub const BOOT_FEED: &str = "/run/td-feed";
+pub const BOOT_FEED_TOKEN: &str = "td.feed=";
 pub const LOCK: &str = "lock";
 pub const OBJECTS: &str = "objects";
 pub const DEPLOY: &str = "deploy";

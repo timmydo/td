@@ -11235,7 +11235,9 @@ differs from the selection's `package=`.
 **The QEMU oracles keep Firefox.** Most proofs of the jail, portals,
 audio, input, seccomp and network run through the autostarted Firefox
 (§H). Under the autotest token Firefox still starts at boot, and its
-first-run fetch uses the VM feed endpoint as transport: the integration
+first-run fetch uses a host feed as transport, named to the guest by a
+`td.feed=` token beside the autotest one (an oracle runs no VM bridge
+to name it): the integration
 tier's host warm is to run `td-feed export flathub`, which resolves every
 declared ref against Flathub under rules 1–2, fetches its graph, and
 publishes the graph, its detached metadata and last the ref into the
@@ -11278,8 +11280,11 @@ build-time validator, since td-app validates it at admission; the
 tables step pairs it with that ref, and the profiler's root policy names
 the ref and adds no image root (landed seventh). (8) td-app's feed
 transport and the host export that replaces the graph transfer (landed
-eighth). (9) The
-oracle boots that run an application reach that feed. (10) Cutover: the
+eighth). (9) A guest's endpoint from its kernel command line: on an
+autotest boot the deployment init writes a `td.feed=` token to
+`/run/td-feed`, which td-app reads when no VM bridge gave one (landed
+ninth); the oracles' own wiring lands with the cutover, which is the
+first thing that needs it. (10) Cutover: the
 declaration-only Firefox package, Claude Code's runtime ref, autostart
 only under the autotest token, and deletion of the pins, payloads and
 graph transfer.

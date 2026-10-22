@@ -456,8 +456,15 @@ in the store when it first reached it is left. Until the cutover removes
 verifies all of it again, but takes the feed's word for which signed commit
 is current, so the feed decides freshness, not integrity. Only `td-app
 update` reads the endpoint; a present file that is not canonical fails the
-update rather than sending it to Flathub. Host producer warm commands do
-not implicitly adopt it.
+update rather than sending it to Flathub. A guest no bridge serves, such
+as a QEMU oracle, can be given the same endpoint on its kernel command line
+as `td.feed=http://10.0.2.2:PORT`: on a boot that also carries the autotest
+token, the deployment init writes it to a root-owned `/run/td-feed`, which
+td-app reads when the bridge's file is absent; a second `td.feed=` refuses
+the boot. The autotest condition keeps it an oracle channel: on a physical
+machine `10.0.2.2` is an ordinary address, and whoever edits the firmware's
+load options would otherwise choose its feed. Host producer warm commands
+adopt neither endpoint.
 
 The source archive consumer is `TD_FEED_BASE=http://HOST:PORT td-feed consume
 sources`. It resolves the checkout's recipe source pins, reads verified host

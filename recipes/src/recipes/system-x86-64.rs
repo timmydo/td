@@ -1314,6 +1314,9 @@ const SETUP_INTAKE_SOCKET: &str = "/run/td-authd/1000/setup";
 /// windows and their evidence name it in `unless-exists=`: a live session
 /// opens the wizard and nothing else.
 const LIVE_MEDIUM: &str = "/run/td-media";
+/// Where td-app finds a feed the kernel command line named (APPLICATIONS.md
+/// §W.9): td-net reads it, root-owned, when no VM bridge gave one.
+const BOOT_FEED: &str = td_engine::flathub_app::BOOT_FEED;
 /// td-setup's smallest supported page (td-setup/src/lib.rs).
 const SETUP_MIN_WIDTH: u16 = 752;
 const SETUP_MIN_HEIGHT: u16 = 480;
@@ -2357,8 +2360,11 @@ fn build_deployment_init(sys: &SystemDef) -> String {
      /bin/mount -t devtmpfs dev /dev\n\
      /bin/mount -t proc proc /proc\n\
      /bin/mount -t sysfs sysfs /sys\n\
+     autotest=\n\
      deployment=\n\
      deployment_seen=\n\
+     feed=\n\
+     feed_seen=\n\
      live=\n\
      volume=\n\
      for word in $(/bin/td-util cat /proc/cmdline); do\n\
@@ -2368,6 +2374,10 @@ fn build_deployment_init(sys: &SystemDef) -> String {
            deployment_seen=1; deployment=${word#td.deployment=} ;;\n\
          td.live=1) live=1 ;;\n\
          td.volume=*) volume=${word#td.volume=} ;;\n\
+         td.autotest=1) autotest=1 ;;\n\
+         td.feed=*) \
+           /bin/td-util test -z \"$feed_seen\" || { echo 'td-init: duplicate td.feed endpoint' >&2; exit 1; }; \
+           feed_seen=1; feed=${word#td.feed=} ;;\n\
        esac\n\
      done\n\
      /bin/td-util test -n \"$deployment\" || { echo 'td-init: missing td.deployment handoff' >&2; exit 1; }\n\
@@ -2404,6 +2414,10 @@ fn build_deployment_init(sys: &SystemDef) -> String {
      /bin/umount /sys\n\
      /bin/td-util printf '%s\\n' \"$deployment\" > /sysroot/run/td-deployment\n\
      /bin/td-util chmod 0600 /sysroot/run/td-deployment\n\
+     if /bin/td-util test -n \"$feed\" && /bin/td-util test -n \"$autotest\"; then\n\
+       /bin/td-util printf '%s' \"$feed\" > /sysroot{BOOT_FEED}\n\
+       /bin/td-util chmod 0644 /sysroot{BOOT_FEED}\n\
+     fi\n\
      /bin/td-util mkdir -p /sysroot/run/td-volume\n\
      /bin/mount -o move /volume /sysroot/run/td-volume\n\
      if /bin/td-util test -n \"$live\"; then\n\
@@ -11750,6 +11764,29 @@ mod tests {
             )),
             "{branch}"
         );
+    }
+
+    /// A `td.feed=` token's value reaches td-app's boot endpoint on the
+    /// fresh /run, root-owned and world-readable, only on an autotest boot
+    /// (the oracles'), and a second token refuses the boot; td-net checks
+    /// the value.
+    #[test]
+    fn a_boot_feed_token_becomes_td_apps_endpoint() {
+        let init = build_deployment_init(&SYSTEM);
+        let token = td_engine::flathub_app::BOOT_FEED_TOKEN;
+        assert!(init.contains(&format!("feed_seen=1; feed=${{word#{token}}} ;;")));
+        assert!(init.contains(&format!("{token}*) /bin/td-util test -z \"$feed_seen\"")));
+        assert!(init.contains(&format!("{}) autotest=1 ;;", AUTOTEST_CMDLINE_TOKEN)));
+        let write = format!("/bin/td-util printf '%s' \"$feed\" > /sysroot{BOOT_FEED}\n");
+        let guard =
+            "if /bin/td-util test -n \"$feed\" && /bin/td-util test -n \"$autotest\"; then\n";
+        let at = |needle: &str| init.find(needle).unwrap();
+        assert!(at("mount -t tmpfs -o mode=0755 tmpfs /sysroot/run") < at(guard));
+        // The string continuation drops indentation: the write is the
+        // guard's first line.
+        assert_eq!(at(guard) + guard.len(), at(&write));
+        assert!(init.contains(&format!("/bin/td-util chmod 0644 /sysroot{BOOT_FEED}\n")));
+        assert_eq!(init.matches(BOOT_FEED).count(), 2);
     }
 
     /// The first pass must select through td-boot. The selected pass must bind

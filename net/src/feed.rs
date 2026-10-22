@@ -2714,18 +2714,21 @@ fn read_vm_feed(path: &Path, owner: u32) -> Result<Option<String>, String> {
     {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(format!("open VM feed endpoint {}: {error}", path.display())),
+        Err(error) => return Err(format!("open feed endpoint {}: {error}", path.display())),
     };
     let meta = file.metadata().map_err(|e| e.to_string())?;
     if !meta.is_file() || meta.uid() != owner || meta.mode() & 0o022 != 0 {
-        return Err("VM feed endpoint is not a compositor-owned regular file".into());
+        return Err(format!(
+            "feed endpoint {} is not a regular file of uid {owner} without group or other write",
+            path.display()
+        ));
     }
     let mut base = String::new();
     file.take(129)
         .read_to_string(&mut base)
         .map_err(|e| e.to_string())?;
     if base.len() > 128 {
-        return Err("VM feed endpoint exceeds limit".into());
+        return Err(format!("feed endpoint {} exceeds limit", path.display()));
     }
     let port = base
         .strip_prefix("http://10.0.2.2:")
@@ -2734,17 +2737,46 @@ fn read_vm_feed(path: &Path, owner: u32) -> Result<Option<String>, String> {
                 .ok()
                 .filter(|port| *port != 0 && port.to_string() == text)
         })
-        .ok_or("VM feed endpoint must be canonical http://10.0.2.2:PORT")?;
+        .ok_or_else(|| {
+            format!(
+                "feed endpoint {} must be canonical http://10.0.2.2:PORT",
+                path.display()
+            )
+        })?;
     Ok(Some(format!("http://10.0.2.2:{port}")))
 }
 
-/// The VM feed endpoint when the host has provisioned one; td-app tries
-/// it before Flathub.
+/// The feed endpoint a guest was given, which td-app tries before
+/// Flathub: the VM bridge's, else the one the kernel command line named.
 pub(crate) fn provisioned_feed_base() -> Result<Option<String>, String> {
-    read_vm_feed(
-        &Path::new(td_engine::permissions::TD_COMPOSITOR_RUNTIME_PATH).join("vm-feed"),
-        td_engine::permissions::TD_COMPOSITOR_UID,
-    )
+    let endpoints = feed_endpoints();
+    let endpoints: Vec<(&Path, u32)> = endpoints
+        .iter()
+        .map(|(path, owner)| (path.as_path(), *owner))
+        .collect();
+    first_feed(&endpoints)
+}
+
+/// In order, each with the only uid that may own it.
+fn feed_endpoints() -> [(PathBuf, u32); 2] {
+    [
+        (
+            Path::new(td_engine::permissions::TD_COMPOSITOR_RUNTIME_PATH).join("vm-feed"),
+            td_engine::permissions::TD_COMPOSITOR_UID,
+        ),
+        (PathBuf::from(td_engine::flathub_app::BOOT_FEED), 0),
+    ]
+}
+
+/// The first endpoint present, each held to its owner; a present one that
+/// is not canonical is an error, never a reason to read the next.
+fn first_feed(endpoints: &[(&Path, u32)]) -> Result<Option<String>, String> {
+    for (path, owner) in endpoints {
+        if let Some(base) = read_vm_feed(path, *owner)? {
+            return Ok(Some(base));
+        }
+    }
+    Ok(None)
 }
 
 fn configured_consumer_feed_base() -> Result<String, String> {
@@ -3879,6 +3911,22 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// td-app asks the bridge's endpoint, owned by the compositor, then
+    /// the boot's, owned by root.
+    #[test]
+    fn td_app_reads_the_bridge_endpoint_then_the_boot_one() {
+        assert_eq!(
+            super::feed_endpoints(),
+            [
+                (
+                    PathBuf::from("/run/td-compositor/1000/vm-feed"),
+                    td_engine::permissions::TD_COMPOSITOR_UID
+                ),
+                (PathBuf::from("/run/td-feed"), 0),
+            ]
+        );
+    }
+
     #[test]
     fn vm_feed_file_checks_the_opened_object_owner_mode_and_bound() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -3891,6 +3939,34 @@ pub(crate) mod tests {
         assert_eq!(super::read_vm_feed(&path, uid), Ok(None));
         std::os::unix::fs::symlink(dir.join("absent"), dir.join("dangling")).unwrap();
         assert!(super::read_vm_feed(&dir.join("dangling"), uid).is_err());
+        // The bridge's endpoint first, then the boot's; a bad first one
+        // does not fall through.
+        let boot = dir.join("boot");
+        std::fs::write(&boot, b"http://10.0.2.2:2345").unwrap();
+        std::fs::set_permissions(&boot, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            super::first_feed(&[(&path, uid), (&boot, uid)]),
+            Ok(Some("http://10.0.2.2:2345".into()))
+        );
+        assert_eq!(super::first_feed(&[(&path, uid)]), Ok(None));
+        std::fs::write(&path, b"http://10.0.2.2:1234").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            super::first_feed(&[(&path, uid), (&boot, uid)]),
+            Ok(Some("http://10.0.2.2:1234".into()))
+        );
+        // A present first endpoint ends the walk, whatever the second is.
+        std::fs::write(&boot, b"http://other:1").unwrap();
+        assert_eq!(
+            super::first_feed(&[(&path, uid), (&boot, uid)]),
+            Ok(Some("http://10.0.2.2:1234".into()))
+        );
+        std::fs::write(&boot, b"http://10.0.2.2:2345").unwrap();
+        std::fs::write(&path, b"http://other:1234").unwrap();
+        assert!(super::first_feed(&[(&path, uid), (&boot, uid)]).is_err());
+        std::fs::remove_file(&path).unwrap();
+        assert!(super::first_feed(&[(&path, uid), (&boot, uid.wrapping_add(1))]).is_err());
+        std::fs::remove_file(&boot).unwrap();
         std::fs::write(&path, b"http://10.0.2.2:1234").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert_eq!(
