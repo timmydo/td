@@ -966,10 +966,12 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         return;
     }
 
+    // A tombstone: the hand-run mirror manifest and its Guix-era generator.
+    // Nothing in the tree read it (td-feed warms from compiled pins), so a
+    // deleting diff needs only the preflights that would see a reader.
     if p == "tests/td-feed.index" {
-        // The shared feed index is a pinned manifest for the source/crate bytes
-        // consumed by recipe graph warmers.
-        add_chain_targets(sel);
+        sel.add_preflight("shell-syntax");
+        sel.add_preflight("cargo-test");
         return;
     }
 
@@ -1762,7 +1764,7 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
 /// The shell scripts' syntax check, one `bash -n` per script: given several
 /// names at once, bash checks the first and hands the rest to it as its
 /// arguments.
-const SHELL_SYNTAX: &str = "for f in start build-qcow build-iso test-iso host-preflight.sh install-fonts install-apps tests/*.sh ci/*.sh tools/*.sh; do bash -n \"$f\" || exit 1; done";
+const SHELL_SYNTAX: &str = "for f in start build-qcow build-iso test-iso host-preflight.sh install-fonts install-apps tests/*.sh ci/*.sh; do bash -n \"$f\" || exit 1; done";
 
 /// The repository-wide format check, as the preflights spell it: this binary's
 /// `gate-crates fmt --all` (`check_format`).
@@ -2288,6 +2290,10 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     ] {
         assert_target!(tombstone, "recipe-checks");
     }
+    assert_preflight!("tests/td-feed.index", "shell-syntax");
+    assert_preflight!("tests/td-feed.index", "cargo-test");
+    assert_no_target!("tests/td-feed.index", "check");
+    assert_no_target!("tests/td-feed.index", "recipe-checks");
     // The stage0 ladder's deleting diff routes to what read it.
     for tombstone in [
         "builder/src/gate_defs/360-bootstrap-seed.rs",
@@ -11956,7 +11962,7 @@ mod tests {
                 "  check.sh",
                 "",
                 "Selected checks:",
-                "  for f in start build-qcow build-iso test-iso host-preflight.sh install-fonts install-apps tests/*.sh ci/*.sh tools/*.sh; do bash -n \"$f\" || exit 1; done",
+                "  for f in start build-qcow build-iso test-iso host-preflight.sh install-fonts install-apps tests/*.sh ci/*.sh; do bash -n \"$f\" || exit 1; done",
                 &full_cargo,
                 "  td-builder check check",
                 defers,
