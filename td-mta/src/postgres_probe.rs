@@ -197,6 +197,23 @@ pub(crate) fn with_upload_client<T>(
     )
 }
 
+// Owner import adds bounded source-mapping rows to a full-size body write.
+pub(crate) fn with_import_client<T>(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    operation: impl for<'a> FnOnce(&'a tokio_postgres::Client) -> Pin<Box<dyn Future<Output = T> + 'a>>,
+) -> Result<T, Error> {
+    with_output_limit(
+        request,
+        trust,
+        deadline,
+        40 * 1024 * 1024,
+        Input::imports(),
+        operation,
+    )
+}
+
 // One SMTP transaction publishes a separate blob and receipt per local account.
 pub(crate) fn with_fanout_client<T>(
     request: &Request<'_>,

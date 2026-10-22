@@ -1,5 +1,6 @@
 //! Provisional, resumable JMAP export. Archives grant no cutover authority.
 mod archive;
+mod import;
 mod source;
 use std::{
     collections::BTreeMap,
@@ -84,13 +85,14 @@ pub fn command(args: impl Iterator<Item = OsString>) -> io::Result<std::process:
     }
 }
 struct Options {
-    verify: bool,
+    action: String,
     values: BTreeMap<String, String>,
 }
 fn arguments(mut args: impl Iterator<Item = OsString>) -> Result<Options> {
-    let verify = match args.next().and_then(|s| s.into_string().ok()).as_deref() {
-        Some("export") => false,
-        Some("verify") => true,
+    let action = match args.next().and_then(|s| s.into_string().ok()).as_deref() {
+        Some("export") => "export",
+        Some("verify") => "verify",
+        Some("import") => "import",
         _ => return Err("migration-arguments"),
     };
     let mut values = BTreeMap::new();
@@ -104,9 +106,21 @@ fn arguments(mut args: impl Iterator<Item = OsString>) -> Result<Options> {
             "--username",
             "--password-file",
             "--ca-file",
+            "--connection-file",
+            "--epoch",
         ]
         .contains(&key.as_str())
-            || (verify && !["--archive", "--max-bytes"].contains(&key.as_str()))
+            || (action == "verify" && !["--archive", "--max-bytes"].contains(&key.as_str()))
+            || (action == "import"
+                && ![
+                    "--archive",
+                    "--max-bytes",
+                    "--connection-file",
+                    "--epoch",
+                    "--account",
+                ]
+                .contains(&key.as_str()))
+            || (action == "export" && ["--connection-file", "--epoch"].contains(&key.as_str()))
         {
             return Err("migration-arguments");
         }
@@ -118,7 +132,10 @@ fn arguments(mut args: impl Iterator<Item = OsString>) -> Result<Options> {
             return Err("migration-arguments");
         }
     }
-    Ok(Options { verify, values })
+    Ok(Options {
+        action: action.to_owned(),
+        values,
+    })
 }
 fn run(options: Options) -> Result<Json> {
     let get = |key| {
@@ -135,8 +152,16 @@ fn run(options: Options) -> Result<Json> {
         return Err("migration-arguments");
     }
     let mut archive = archive::Archive::open(get("--archive")?, maximum)?;
-    if options.verify {
+    if options.action == "verify" {
         return archive.verify();
+    }
+    if options.action == "import" {
+        return import::run(
+            &archive,
+            get("--connection-file")?,
+            get("--epoch")?,
+            get("--account")?,
+        );
     }
     let session = get("--session")?;
     let account = get("--account")?;

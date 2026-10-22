@@ -1,9 +1,10 @@
-# Provisional JMAP export
+# Provisional JMAP migration
 
 `td-mta migration export` creates a resumable archive from an authenticated
 HTTPS JMAP account. `migration verify` checks that archive offline. These
-commands do not import into PostgreSQL, modify the source, freeze delivery,
-or approve a domain cutover. Final reconciliation and import remain pending.
+commands do not modify the source, freeze delivery, or approve a domain
+cutover. The insert-only PostgreSQL importer below consumes a retained archive;
+final reconciliation remains pending.
 
 Create an empty mode-0700 archive directory under a private, stable parent.
 The password file must be mode 0400 or 0600 in a mode-0700 directory owned by
@@ -92,3 +93,58 @@ the same transport with its existing shorter deadline and smaller body cap.
 
 Compatibility checks against an independently run Stalwart instance are
 manual operator evidence. Stalwart is not a repository build or test input.
+
+# Insert-only PostgreSQL import
+
+Create the destination account with the supported `postgres account-create`
+workflow first. Select its configuration and retain the current store epoch.
+Import uses the schema-owner connection file, never an application password:
+
+```text
+td-mta migration import --archive /home/operator/mail-archive \
+  --max-bytes 10737418240 \
+  --connection-file /home/operator/private/owner.connection \
+  --epoch STORE_EPOCH_HEX --account DESTINATION_ACCOUNT_ID
+```
+
+The command retains the archive lock, validates the manifest and converts its
+metadata before writing. It rehashes each bounded raw body immediately before
+publication. Folder parents precede children. The existing Inbox is adopted
+only if its name, parent, role, sort order and subscription exactly match.
+Other role or sibling-name conflicts are refused. Source folders cannot share
+one local mapping. Names must satisfy the normal NFC and control-character
+rules. Local limits are 256 folders, 256 memberships and 256 keywords per
+message; the archive can represent more than this importer can publish.
+Unrepresentable objects fail explicitly. Partial progress remains resumable.
+One import connection has a ten-second deadline, 40 MiB outbound budget,
+1 MiB inbound budget and 2,048 protocol-frame budget. Body writes and the
+full supported membership/keyword sets share those finite allowances.
+
+Each object publishes in one durable account transaction. Email publication
+includes its exact raw bytes, imported origin, received timestamp, complete
+memberships, canonical lowercase keywords, locally selected thread, quota
+charge, JMAP history and source receipt. No Received header is inserted and
+no original header is removed. Thread evidence uses the same bounded header
+parser as receiving. Submillisecond timestamps, leap seconds, non-UTCDate
+spellings and keyword case-fold collisions are refused rather than changed
+silently. Millisecond dates before the Unix epoch remain exact. Root headers
+must fit the existing 1 MiB parser bound. Parsing never rewrites raw bytes.
+
+Source receipts use the instance/account/object key and FORMAT.md's canonical
+snapshot digest. Distinct source email IDs always create distinct local
+emails, including identical bodies. Repeating an unchanged archive returns
+historical success without resetting flags, folders, dates or quota counters.
+A locally deleted mapped object is reported in `historicalObjectsAbsent` and
+is never recreated. A missing mapped folder prevents new messages from using
+it. Changed source snapshots fail with `migration-source-changed`; this
+increment does not update or delete previously imported objects.
+
+Owner authorization, the store epoch, current selected configuration,
+maintenance state and account quotas fence new writes. Receipt inspection
+waits behind an outstanding account writer. An uncertain COMMIT stops the
+command with `migration-indeterminate-retry-same-archive`; retain the archive
+and repeat that command to settle the same source receipts. Do not replace
+its source instance to bypass an error. A successful report is explicitly
+`imported-provisional` with `cutoverReady: false`. It is not final inventory
+reconciliation or authority to change DNS. Exporting td-mta for rollback still
+needs a Mailbox/get fallback for its unsupported Mailbox/query method.

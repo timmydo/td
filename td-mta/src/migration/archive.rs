@@ -247,7 +247,7 @@ impl Archive {
     pub fn publish(&mut self, manifest: &Json) -> Result<()> {
         self.write_json("manifest.json", manifest)
     }
-    pub fn verify(&self) -> Result<Json> {
+    pub fn snapshot(&self) -> Result<Json> {
         let source = self.json("source.json")?;
         validate_source(&source)?;
         let manifest = self.json("manifest.json")?;
@@ -255,6 +255,20 @@ impl Archive {
         if field(&manifest, "source")? != &source {
             return Err("migration-source-mismatch");
         }
+        Ok(manifest)
+    }
+    pub fn read_body(&self, body: &str, size: u64) -> Result<Vec<u8>> {
+        if !hash_name(body) || size > crate::outbound_http::MAX_BODY as u64 {
+            return Err("migration-invalid-body");
+        }
+        let bytes = read_bounded(self.open_file(&format!("{body}.eml"))?, size as usize)?;
+        if bytes.len() as u64 != size || digest(&bytes)? != body {
+            return Err("migration-body-digest");
+        }
+        Ok(bytes)
+    }
+    pub fn verify(&self) -> Result<Json> {
+        let manifest = self.snapshot()?;
         let records = array(&manifest, "messages")?;
         let mut bytes = 0u64;
         for record in records {

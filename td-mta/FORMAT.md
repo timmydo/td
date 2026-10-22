@@ -259,8 +259,8 @@ key; compare key and digest together to resume an identical object.
 
 ### Import source snapshot preimages
 
-These preimages are a migration interchange contract; the M21 exporter/importer
-will implement them. All lengths/counts use the conventions in section 1.
+These preimages are the migration interchange contract implemented by the
+provisional archive importer. All lengths/counts use the conventions in section 1.
 Mailbox name, role and sortOrder have the same constraints as local rows;
 RFC 8621 section 2 requires sortOrder below 2^31 despite the broader generic
 UnsignedInt range. Unrepresentable source fields are reported, not truncated:

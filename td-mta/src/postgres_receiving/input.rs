@@ -141,41 +141,7 @@ pub(super) fn prepare(
             .write_filtered(trace.as_bytes(), &mut append, &mut work)
             .map_err(header_error)?;
     }
-    let mut anchors = Vec::new();
-    anchors.try_reserve_exact(65).map_err(|_| Error::Capacity)?;
-    let mut scratch = [0; crate::format::key::MAX_ANCHOR_BYTES];
-    for ring in [&header.identifiers.references, &header.identifiers.reply] {
-        for index in 0..32 {
-            let Some(item) = ring.newest(index) else {
-                break;
-            };
-            if let Some(id) = headers::candidate(&header.source, item, &mut scratch, &mut work)
-                .map_err(Error::Input)?
-            {
-                charge(clock, work.meter, id.len(), id.len())?;
-                anchors.push(copy(id)?);
-            }
-        }
-    }
-    let own = header
-        .identifiers
-        .own
-        .map(|item| {
-            headers::candidate(&header.source, item, &mut scratch, &mut work)
-                .map_err(Error::Input)?
-                .map(|id| {
-                    charge(clock, work.meter, id.len(), id.len())?;
-                    copy(id)
-                })
-                .transpose()
-        })
-        .transpose()?
-        .flatten()
-        .unwrap_or_default();
-    if !own.is_empty() {
-        charge(clock, work.meter, own.len(), own.len())?;
-        anchors.push(copy(&own)?);
-    }
+    let (anchors, own) = header.thread_identifiers(&mut work).map_err(Error::Input)?;
     charge(clock, work.meter, 0, 0)?;
     Ok((bytes, anchors, own, provenance))
 }

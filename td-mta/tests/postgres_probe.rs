@@ -2541,11 +2541,13 @@ fn real_postgres_executable_receives_and_serves_database_profiles() {
     recovery::real_postgres_restore_quarantines_pending_delivery_and_changes_epoch();
     recovery::real_postgres_recovery_uncertain_commit_keeps_retained_new_epoch();
     exercise_configuration(ConfigurationExercise::AccountAdmin);
+    exercise_configuration(ConfigurationExercise::Imports);
     exercise_configuration(ConfigurationExercise::MultiAccount);
     exercise_configuration(ConfigurationExercise::Serving);
 }
 
 enum ConfigurationExercise {
+    Imports,
     AccountAdmin,
     MultiAccount,
     Serving,
@@ -3208,6 +3210,10 @@ per_peer_limit = 1
         td_mta::postgres_accounts::prepare(epoch, account).unwrap(),
     )
     .unwrap();
+    if matches!(exercise, ConfigurationExercise::Imports) {
+        imports::exercise(&fixture, &request, &trust, epoch, &connection);
+        return;
+    }
     if matches!(exercise, ConfigurationExercise::AccountAdmin) {
         account_workflow::exercise(&fixture, &request, &trust, epoch, &connection);
         return;
@@ -3325,7 +3331,9 @@ per_peer_limit = 1
         );
         if name == "desktop" {
             match exercise {
-                ConfigurationExercise::AccountAdmin | ConfigurationExercise::MultiAccount => {
+                ConfigurationExercise::AccountAdmin
+                | ConfigurationExercise::MultiAccount
+                | ConfigurationExercise::Imports => {
                     panic!("multi-account fixture must return before singleton exercises")
                 }
                 ConfigurationExercise::Client
@@ -12302,4 +12310,12 @@ mod account_workflow;
 #[ignore = "real local PostgreSQL 17 tools required"]
 fn real_postgres_account_administration_resumes_and_preserves_other_accounts() {
     exercise_configuration(ConfigurationExercise::AccountAdmin);
+}
+
+#[path = "postgres_probe/imports.rs"]
+mod imports;
+#[test]
+#[ignore = "real local PostgreSQL tools and private trusted TMPDIR required"]
+fn real_postgres_imports_preserve_source_snapshots() {
+    exercise_configuration(ConfigurationExercise::Imports);
 }

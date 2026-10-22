@@ -290,6 +290,37 @@ impl Headers {
             }
         }
     }
+    /// Shared nearest-first thread evidence from original root headers.
+    pub fn thread_identifiers(&self, work: &mut Work<'_>) -> Result<(Vec<String>, String), Error> {
+        let mut anchors = Vec::new();
+        anchors.try_reserve_exact(65).map_err(|_| Error::Capacity)?;
+        let mut scratch = [0; crate::format::key::MAX_ANCHOR_BYTES];
+        for ring in [&self.identifiers.references, &self.identifiers.reply] {
+            for index in 0..32 {
+                let Some(item) = ring.newest(index) else {
+                    break;
+                };
+                if let Some(id) = candidate(&self.source, item, &mut scratch, work)? {
+                    anchors.push(copy_identifier(id, work)?);
+                }
+            }
+        }
+        let own = self
+            .identifiers
+            .own
+            .map(|item| {
+                candidate(&self.source, item, &mut scratch, work)?
+                    .map(|id| copy_identifier(id, work))
+                    .transpose()
+            })
+            .transpose()?
+            .flatten()
+            .unwrap_or_default();
+        if !own.is_empty() {
+            anchors.push(copy_identifier(&own, work)?);
+        }
+        Ok((anchors, own))
+    }
     pub fn write_filtered(
         &self,
         trace: &[u8],
@@ -459,4 +490,30 @@ pub(crate) fn trace(
         return Err(ports::Error::Capacity);
     }
     Ok(output)
+}
+
+fn copy_identifier(id: &str, work: &mut Work<'_>) -> Result<String, Error> {
+    let now = work.tick()?;
+    work.meter
+        .charge(
+            now,
+            td_mime::work::Charge {
+                io_bytes: id.len() as u64,
+                output_bytes: id.len() as u64,
+                records: 1,
+                unlinks: 0,
+            },
+        )
+        .map_err(|e| {
+            if e == td_mime::work::Stop::Deadline {
+                Error::Deadline
+            } else {
+                Error::Capacity
+            }
+        })?;
+    let mut copy = String::new();
+    copy.try_reserve_exact(id.len())
+        .map_err(|_| Error::Capacity)?;
+    copy.push_str(id);
+    Ok(copy)
 }

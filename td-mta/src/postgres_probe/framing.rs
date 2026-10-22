@@ -50,6 +50,14 @@ impl Input {
         }
     }
 
+    pub(super) fn imports() -> Self {
+        // A 32 MiB body plus 256 source mappings and relationship writes.
+        Self {
+            frames: 2048,
+            ..Self::new()
+        }
+    }
+
     pub(super) fn fanout(accounts: usize) -> Self {
         Self {
             bytes: 1024 * 1024 * accounts,
@@ -312,22 +320,24 @@ mod tests {
 
     #[test]
     fn mutation_budget_is_finite_and_keeps_authentication_and_byte_limits() {
-        let mut input = Input::mutations();
-        for _ in 0..1088 {
-            assert!(input.accept(&frame(b'N', b"\0")).is_ok());
+        for factory in [Input::mutations as fn() -> Input, Input::imports] {
+            let mut input = factory();
+            let mut admitted = 0;
+            while input.accept(&frame(b'N', b"\0")).is_ok() {
+                admitted += 1;
+                assert!(admitted <= 2048);
+            }
+            assert!([1088, 2048].contains(&admitted));
+            assert!(input.accept(&[]).is_err());
+            assert!(factory().accept(&frame(b'Z', b"I")).is_err());
+            assert!(factory().accept(&frame(b'D', &[0; 128 * 1024])).is_err());
+            let mut input = factory();
+            let packet = frame(b'D', &[0; 128 * 1024 - 4]);
+            for _ in 0..7 {
+                assert!(input.accept(&packet).is_ok());
+            }
+            assert!(input.accept(&packet).is_err());
         }
-        assert!(input.accept(&frame(b'N', b"\0")).is_err());
-        assert!(input.accept(&[]).is_err());
-        assert!(Input::mutations().accept(&frame(b'Z', b"I")).is_err());
-        assert!(Input::mutations()
-            .accept(&frame(b'D', &[0; 128 * 1024]))
-            .is_err());
-        let mut input = Input::mutations();
-        let packet = frame(b'D', &[0; 128 * 1024 - 4]);
-        for _ in 0..7 {
-            assert!(input.accept(&packet).is_ok());
-        }
-        assert!(input.accept(&packet).is_err());
     }
 
     #[test]
