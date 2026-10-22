@@ -30,7 +30,9 @@ use std::path::Path;
 /// Spelled by VALUE because this crate has no libc. Both are pinned by TEST
 /// rather than by assertion — a symlink opened with `O_NOFOLLOW` must fail and
 /// a FIFO opened with `O_NONBLOCK` must not block — so a wrong number is a red
-/// test rather than a flag that silently does nothing.
+/// test rather than a flag that silently does nothing. Those tests run on the
+/// x86_64 host only: aarch64's values are cross-built, never run, so they rest
+/// on the libc crate's and arm64's `asm/fcntl.h`'s definitions.
 /// These two numbers are per-TARGET, and getting one wrong is silent rather
 /// than loud: `build_open_how` masks flag bits it does not know instead of
 /// refusing them, so a wrong `O_NOFOLLOW` is an open that follows symlinks
@@ -38,11 +40,18 @@ use std::path::Path;
 /// `0o400000` is `O_LARGEFILE` and `O_NOFOLLOW` is `0o100000` — and the BSDs
 /// differ in both. So the target is pinned WHOLE, in the shape `td-svc` and
 /// `td-init` already use for their syscall numbers, rather than by a
-/// whitelist of architectures that look close enough.
-#[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
-compile_error!("td-fs pins O_NONBLOCK/O_NOFOLLOW for x86_64-linux only");
+/// whitelist of architectures that look close enough. aarch64-linux is pinned
+/// because the crypto portable kit cross-builds its mail smoke there.
+#[cfg(not(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    target_os = "linux"
+)))]
+compile_error!("td-fs pins O_NONBLOCK/O_NOFOLLOW for x86_64-linux and aarch64-linux only");
 const O_NONBLOCK: i32 = 0o4000;
+#[cfg(target_arch = "x86_64")]
 const O_NOFOLLOW: i32 = 0o400000;
+#[cfg(target_arch = "aarch64")]
+const O_NOFOLLOW: i32 = 0o100000;
 
 fn refused(message: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
