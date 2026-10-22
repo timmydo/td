@@ -271,9 +271,18 @@ impl Archive {
         let manifest = self.snapshot()?;
         let records = array(&manifest, "messages")?;
         let mut bytes = 0u64;
+        let mut verified = BTreeMap::new();
         for record in records {
             let size = integer(field(record, "email")?, "size")?;
-            self.verify_body(string(record, "body")?, size)?;
+            let body = string(record, "body")?;
+            if let Some(previous) = verified.get(body) {
+                if *previous != size {
+                    return Err("migration-body-size");
+                }
+            } else {
+                self.verify_body(body, size)?;
+                verified.insert(body, size);
+            }
             bytes = bytes.checked_add(size).ok_or("migration-capacity")?;
         }
         Ok(

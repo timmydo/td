@@ -210,7 +210,7 @@ pub(super) fn messages(
     }
     Ok(output)
 }
-fn utc_ms(value: &str) -> Result<i64> {
+pub(super) fn utc_ms(value: &str) -> Result<i64> {
     let bytes = value.as_bytes();
     if bytes.len() < 20
         || bytes.get(4) != Some(&b'-')

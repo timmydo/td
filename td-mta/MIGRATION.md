@@ -88,6 +88,45 @@ use `migration verify` for that. `cutoverReady: false` remains explicit.
 A failed check grants no deletion authority. Refresh the export after source
 changes, and resolve an ID-set mismatch before using it as a final inventory.
 
+# Comparing independently exported accounts
+
+Export and verify both quiet endpoints, then compare their private archives:
+
+```text
+td-mta migration compare --archive /home/operator/source-archive \
+  --against-archive /home/operator/target-archive --max-bytes 10737418240
+```
+
+The two directories must be distinct; the command holds both cooperative
+archive locks and applies `--max-bytes` independently to each. It contacts no
+server and writes no mail. Both source bindings and manifests must validate.
+A successful result also rehashes every distinct referenced body in both archives.
+Missing, corrupt, public or linked body files refuse success.
+
+Comparison ignores server-assigned object IDs. It matches folders by their
+exact name and complete parent hierarchy, then compares roles, sort orders
+and subscription flags, including empty folders. Separate path components
+are encoded unambiguously; a slash inside a name is not a hierarchy separator.
+Duplicate sibling paths are ambiguous and refused. Bounded SHA-256 parent
+fingerprints avoid materializing every full path for deep hierarchies.
+
+Messages compare by raw-body SHA-256, byte length, received time, full folder
+membership and keywords. Counts are retained for identical messages, so a
+missing duplicate cannot be hidden by set deduplication. Received times use
+the importer's exact millisecond representation; submillisecond information
+is refused. Keywords use the importer's ASCII case normalization, with
+case-fold collisions refused. Message order and JSON property order do not
+matter. Derived thread IDs, blob IDs and MIME part IDs are not portable
+source metadata and are not compared.
+
+`archives-match` binds both manifest digests and source bindings in its report,
+with message/folder counts and `bodyDigestsVerified: true`. A mismatch exits
+unsuccessfully with a fixed diagnostic; it never repairs either side or grants
+deletion authority. An archive comparison is historical: run the separate
+`migration inventory` check against each endpoint while it remains quiet.
+It does not cover accounts outside those authenticated views, provider routes,
+credentials, rules or server settings. `cutoverReady: false` remains explicit.
+
 # Archive and bounds
 
 Version 1 uses `source.json`, `manifest.json`, SHA-256-named `.eml` body files
@@ -95,7 +134,10 @@ and SHA-256-of-source-email-ID `.json` resume records. Remote identifiers are
 never used directly as filenames. `manifest.json` contains the complete
 source binding, baseline states, selected JMAP metadata and body digests.
 Verification checks source binding, unique object IDs, folder references and
-cycles, memberships, sizes and raw-body digests. Digests detect accidental
+cycles, memberships, sizes and raw-body digests. During one locked verification,
+each physical body file is hashed once; every repeated reference must declare
+the same size, and message counts and logical bytes still include duplicates.
+No successful-body cache survives the command. Digests detect accidental
 corruption; an operator who can rewrite an archive can rewrite its digests.
 
 A cooperative exclusive `LOCK` protects export and verification. Files are

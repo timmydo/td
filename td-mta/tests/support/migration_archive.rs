@@ -43,6 +43,32 @@ pub fn exercise() {
     assert_eq!(report["messages"].as_u64(), Some(2));
     assert_eq!(report["messageBytes"].as_u64(), Some(6));
     assert_eq!(report["cutoverReady"].as_bool(), Some(false));
+    compare_archives(root.path(), &manifest, &body);
+    let mut inconsistent = manifest.clone();
+    if let Json::Obj(fields) = &mut inconsistent {
+        let messages = &mut fields
+            .iter_mut()
+            .find(|(key, _)| key == "messages")
+            .unwrap()
+            .1;
+        let mut records = messages.as_array().unwrap().to_vec();
+        if let Json::Obj(fields) = records.get_mut(1).unwrap() {
+            if let Json::Obj(email) =
+                &mut fields.iter_mut().find(|(key, _)| key == "email").unwrap().1
+            {
+                email.iter_mut().find(|(key, _)| key == "size").unwrap().1 = json!(4);
+            }
+        }
+        *messages = json!(records);
+    }
+    write(
+        &root.join("manifest.json"),
+        inconsistent.to_string().as_bytes(),
+    );
+    let inconsistent = verify(root.path(), "1048576");
+    assert!(!inconsistent.status.success());
+    assert_eq!(inconsistent.stderr, b"migration-body-size\n");
+    write(&root.join("manifest.json"), manifest.to_string().as_bytes());
     let lock = td_mta::store_fs::PrivateRoot::open(root.path().to_str().unwrap())
         .unwrap()
         .try_lock()
@@ -217,4 +243,76 @@ pub fn export_from_td_mta(
         digests.push(actual);
     }
     (manifest, digests)
+}
+
+fn compare_archives(left: &Path, manifest: &Json, body: &str) {
+    let right = td_fs::TempDir::new("migration-compare").unwrap();
+    fs::set_permissions(right.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let source = json!({"version":1,"instance":"fedcba9876543210fedcba9876543210","session":"https://target.example.test/session","account":"different-account","username":"target-user"});
+    let mut target = manifest.clone();
+    if let Json::Obj(fields) = &mut target {
+        fields
+            .iter_mut()
+            .find(|(key, _)| key == "source")
+            .unwrap()
+            .1 = source.clone();
+    }
+    write(&right.join("source.json"), source.to_string().as_bytes());
+    write(&right.join("manifest.json"), target.to_string().as_bytes());
+    let raw = right.join(format!("{body}.eml"));
+    write(&raw, b"raw");
+    let invoke = || {
+        Command::new(env!("CARGO_BIN_EXE_td-mta"))
+            .args(["migration", "compare", "--archive"])
+            .arg(left)
+            .arg("--against-archive")
+            .arg(right.path())
+            .args(["--max-bytes", "1048576"])
+            .output()
+            .unwrap()
+    };
+    let result = invoke();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let report = td_json::parse_slice(&result.stdout).unwrap();
+    assert_eq!(report["status"].as_str(), Some("archives-match"));
+    assert_eq!(report["messages"].as_u64(), Some(2));
+    assert_eq!(report["bodyDigestsVerified"].as_bool(), Some(true));
+    assert_eq!(report["cutoverReady"].as_bool(), Some(false));
+    write(&raw, b"bad");
+    let bad = invoke();
+    assert!(!bad.status.success());
+    assert_eq!(bad.stderr, b"migration-body-digest\n");
+    write(&raw, b"raw");
+    let mut incomplete = target.clone();
+    if let Json::Obj(fields) = &mut incomplete {
+        fields
+            .iter_mut()
+            .find(|(key, _)| key == "messages")
+            .unwrap()
+            .1 = json!([target["messages"].as_array().unwrap().first().unwrap()]);
+    }
+    write(
+        &right.join("manifest.json"),
+        incomplete.to_string().as_bytes(),
+    );
+    let bad = invoke();
+    assert!(!bad.status.success());
+    assert_eq!(bad.stderr, b"migration-archives-differ\n");
+    write(&right.join("manifest.json"), target.to_string().as_bytes());
+    let lock = td_mta::store_fs::PrivateRoot::open(right.path().to_str().unwrap())
+        .unwrap()
+        .try_lock()
+        .unwrap();
+    let blocked = invoke();
+    assert!(!blocked.status.success());
+    assert_eq!(blocked.stderr, b"migration-archive-locked\n");
+    drop(lock);
+    assert_eq!(
+        fs::read(left.join("manifest.json")).unwrap(),
+        manifest.to_string().as_bytes()
+    );
 }

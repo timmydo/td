@@ -1,5 +1,6 @@
 //! Provisional, resumable JMAP export. Archives grant no cutover authority.
 mod archive;
+mod compare;
 mod folder_reconcile;
 mod import;
 mod inventory;
@@ -99,6 +100,7 @@ fn arguments(mut args: impl Iterator<Item = OsString>) -> Result<Options> {
         Some("export") => "export",
         Some("inventory") => "inventory",
         Some("verify") => "verify",
+        Some("compare") => "compare",
         Some("import") => "import",
         Some("plan") => "plan",
         Some("apply") => "apply",
@@ -125,6 +127,7 @@ fn arguments(mut args: impl Iterator<Item = OsString>) -> Result<Options> {
         }
         if ![
             "--archive",
+            "--against-archive",
             "--max-bytes",
             "--session",
             "--account",
@@ -147,6 +150,9 @@ fn arguments(mut args: impl Iterator<Item = OsString>) -> Result<Options> {
                     "--plan-file",
                 ]
                 .contains(&key.as_str()))
+            || (key == "--against-archive" && action != "compare")
+            || (action == "compare"
+                && !["--archive", "--against-archive", "--max-bytes"].contains(&key.as_str()))
             || (key == "--plan-file" && action != "apply")
             || (matches!(action, "export" | "inventory")
                 && ["--connection-file", "--epoch"].contains(&key.as_str()))
@@ -183,6 +189,10 @@ fn run(options: Options) -> Result<Json> {
         return Err("migration-arguments");
     }
     let mut archive = archive::Archive::open(get("--archive")?, maximum)?;
+    if options.action == "compare" {
+        let against = archive::Archive::open(get("--against-archive")?, maximum)?;
+        return compare::run(&archive, &against);
+    }
     if options.action == "verify" {
         return archive.verify();
     }
@@ -492,6 +502,10 @@ mod tests {
             vec!["inventory", "--epoch", "epoch"],
             vec!["inventory", "--plan-file", "plan"],
             vec!["inventory", "--password", "secret"],
+            vec!["compare", "--password-file", "secret"],
+            vec!["compare", "--connection-file", "owner"],
+            vec!["compare", "--session", "https://example.test"],
+            vec!["export", "--against-archive", "other"],
         ] {
             assert!(arguments(args.into_iter().map(OsString::from)).is_err());
         }
@@ -507,7 +521,7 @@ mod unmapped_arguments {
         assert!(parse(&["import", "--only-unmapped"]).is_ok_and(|v| v.only_unmapped));
         assert!(parse(&["import"]).is_ok_and(|v| !v.only_unmapped));
         assert!(parse(&["import", "--only-unmapped", "--only-unmapped"]).is_err());
-        for action in ["export", "inventory", "verify", "plan", "apply"] {
+        for action in ["export", "inventory", "verify", "compare", "plan", "apply"] {
             assert!(parse(&[action, "--only-unmapped"]).is_err());
         }
     }
@@ -522,7 +536,14 @@ mod mailbox_plan_arguments {
         assert!(parse(&["plan", "--mailboxes"]).is_ok_and(|v| v.mailboxes));
         assert!(parse(&["plan"]).is_ok_and(|v| !v.mailboxes));
         assert!(parse(&["plan", "--mailboxes", "--mailboxes"]).is_err());
-        for action in ["export", "inventory", "verify", "import", "apply"] {
+        for action in [
+            "export",
+            "inventory",
+            "verify",
+            "compare",
+            "import",
+            "apply",
+        ] {
             assert!(parse(&[action, "--mailboxes"]).is_err());
         }
     }
