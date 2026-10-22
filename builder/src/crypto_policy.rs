@@ -220,6 +220,20 @@ unicode-properties v0.1.4|default,emoji,general-category
 whoami v2.1.3|default,std,wasi-wasite,wasm-web
 ";
 
+/// Vendored directory names (`name-version`) of the packages the mail graph
+/// compiles. Locked-only packages contribute no code to an artifact.
+pub(crate) fn active_vendor_dirs() -> BTreeSet<String> {
+    ACTIVE
+        .lines()
+        .chain(POSTGRES_ACTIVE.lines())
+        .filter_map(|line| {
+            let (name, rest) = line.split_once(" v")?;
+            let version = rest.split(['|', ' ']).next()?;
+            Some(format!("{name}-{version}"))
+        })
+        .collect()
+}
+
 pub(crate) fn active_graph(root: &Path, name: &str, output: &str) -> Result<(), String> {
     if !admitted(name) {
         return Err(format!(
@@ -437,6 +451,34 @@ mod tests {
             assert!(manifest_pin("td-other", &manifest).is_err());
             assert!(lock_pin("td-other", &lock).is_err());
         }
+    }
+
+    #[test]
+    fn active_vendor_dirs_name_every_active_package_and_no_locked_only_one() {
+        let dirs = active_vendor_dirs();
+        assert_eq!(
+            dirs.len(),
+            ACTIVE.lines().count() + POSTGRES_ACTIVE.lines().count()
+        );
+        assert!(dirs.contains("aws-lc-rs-1.18.1"));
+        assert!(dirs.contains("async-trait-0.1.92"));
+        assert!(dirs.contains("whoami-2.1.3"));
+        assert!(!dirs.contains("objc2-core-foundation-0.3.2"));
+        assert!(!dirs.contains("wasite-1.0.2"));
+        // A name or version that drifted from the lock would match no vendored
+        // directory, and its notice would silently stop being required.
+        let lock = std::fs::read_to_string(root().join("td-mta/Cargo.lock")).unwrap();
+        let mut locked = BTreeSet::new();
+        let mut name = None;
+        for line in lock.lines() {
+            if let Some(value) = line.strip_prefix("name = ") {
+                name = Some(value.trim_matches('"').to_string());
+            } else if let (Some(value), Some(name)) = (line.strip_prefix("version = "), &name) {
+                locked.insert(format!("{name}-{}", value.trim_matches('"')));
+            }
+        }
+        let missing: Vec<_> = dirs.difference(&locked).collect();
+        assert!(missing.is_empty(), "not in td-mta/Cargo.lock: {missing:?}");
     }
 
     #[test]

@@ -2218,24 +2218,11 @@ fn build_architecture(
             true,
         )?;
     }
-    for package in fs::read_dir(&vendor).map_err(|e| format!("read vendor notices: {e}"))? {
-        let package = package.map_err(|e| format!("vendor notice entry: {e}"))?;
-        if !package
-            .file_type()
-            .map_err(|e| format!("vendor notice type: {e}"))?
-            .is_dir()
-            || retain_notices(
-                &package.path(),
-                &artifacts.join("notices/vendor").join(package.file_name()),
-                0,
-            )? == 0
-        {
-            return Err(format!(
-                "vendor package lacks notices: {}",
-                package.path().display()
-            ));
-        }
-    }
+    vendor_notices(
+        &vendor,
+        &artifacts.join("notices/vendor"),
+        &crate::crypto_policy::active_vendor_dirs(),
+    )?;
     retain_notices(&inputs.rust, &artifacts.join("notices/rust"), 0)?;
     retain_notices(&inputs.headers, &artifacts.join("notices/musl"), 0)?;
     write_new(&artifacts.join("BUILD-INPUTS"), receipt.as_bytes())?;
@@ -2250,6 +2237,33 @@ fn build_architecture(
         },
         &digest,
     )
+}
+
+// Every package the artifact compiles must carry a notice. A locked-only
+// package (a macOS or wasm backend) is vendored but compiled into nothing, so
+// its notices are kept when it ships them and not required when it does not.
+fn vendor_notices(
+    vendor: &Path,
+    destination: &Path,
+    active: &std::collections::BTreeSet<String>,
+) -> Result<()> {
+    for package in fs::read_dir(vendor).map_err(|e| format!("read vendor notices: {e}"))? {
+        let package = package.map_err(|e| format!("vendor notice entry: {e}"))?;
+        let name = package.file_name();
+        let required = name.to_str().is_some_and(|name| active.contains(name));
+        if !package
+            .file_type()
+            .map_err(|e| format!("vendor notice type: {e}"))?
+            .is_dir()
+            || (retain_notices(&package.path(), &destination.join(&name), 0)? == 0 && required)
+        {
+            return Err(format!(
+                "vendor package lacks notices: {}",
+                package.path().display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn retain_notices(source: &Path, destination: &Path, depth: usize) -> Result<usize> {
@@ -3224,6 +3238,26 @@ mod tests {
         assert!(!target.join("third_party/fiat/implementation.c").exists());
         symlink("LICENSE", source.join("NOTICE")).unwrap();
         assert!(retain_notices(&source, &scratch.0.join("bad"), 0).is_err());
+    }
+
+    #[test]
+    fn vendor_notices_are_required_only_of_compiled_packages() {
+        let scratch = crate::test_temp::TempDir::new("td-crypto-vendor-notices").unwrap();
+        let vendor = scratch.join("vendor");
+        fs::create_dir_all(vendor.join("active-1.0.0")).unwrap();
+        fs::create_dir_all(vendor.join("locked-only-1.0.0/src")).unwrap();
+        fs::create_dir_all(vendor.join("noticed-1.0.0")).unwrap();
+        fs::write(vendor.join("noticed-1.0.0/LICENSE-MIT"), "mit").unwrap();
+        let active: std::collections::BTreeSet<String> =
+            ["active-1.0.0".to_string()].into_iter().collect();
+        assert!(vendor_notices(&vendor, &scratch.join("a"), &active).is_err());
+        fs::write(vendor.join("active-1.0.0/LICENSE"), "text").unwrap();
+        vendor_notices(&vendor, &scratch.join("b"), &active).unwrap();
+        assert!(scratch.join("b/active-1.0.0/LICENSE").is_file());
+        assert!(scratch.join("b/noticed-1.0.0/LICENSE-MIT").is_file());
+        assert!(!scratch.join("b/locked-only-1.0.0").exists());
+        fs::write(vendor.join("stray"), "").unwrap();
+        assert!(vendor_notices(&vendor, &scratch.join("c"), &active).is_err());
     }
 
     #[test]
