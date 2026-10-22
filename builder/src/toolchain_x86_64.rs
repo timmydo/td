@@ -716,10 +716,10 @@ mod tests {
         let tree = d.join("tree");
         fs::create_dir_all(tree.join("bin")).unwrap();
         fs::create_dir_all(tree.join("lib/deep")).unwrap();
-        let interp = crate::elf::tests::synth_interp_elf("/lib64/ld-linux-x86-64.so.2", true);
+        let interp = crate::elf_synth::synth_interp_elf("/lib64/ld-linux-x86-64.so.2", true);
         fs::write(tree.join("bin/rustc"), &interp).unwrap();
         fs::write(tree.join("lib/deep/stray"), &interp).unwrap();
-        let library = crate::elf::tests::synth_needed_elf(&["libc.so.6"], true);
+        let library = crate::elf_synth::synth_needed_elf(&["libc.so.6"], true);
         fs::write(tree.join("lib/libfoo.so"), library).unwrap();
         std::os::unix::fs::symlink("../bin/rustc", tree.join("lib/link")).unwrap();
         fs::write(tree.join("bin/script"), b"#!/bin/sh\n").unwrap();

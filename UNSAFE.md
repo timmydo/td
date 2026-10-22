@@ -11,8 +11,8 @@ and the code disagree, one of them is a bug.
 In the control-plane engine `unsafe` is confined to the raw-syscall layer
 in `builder/src/sys.rs` and the low-level conversions in `nar.rs` and
 `sandbox.rs`. Those three files carry `#![allow(unsafe_code)]` so builder
-can stay `libc`-free. `ostree.rs` calls one safe syscall wrapper and carries
-no unsafe allowance. Every other
+can stay `libc`-free. `builder/src/ostree.rs` passes one safe syscall wrapper to
+td-engine's `ostree_deploy` materializer and carries no unsafe allowance. Every other
 engine crate (the shared `engine` lib and
 `recipes`/`fetch`/`feed`/`subst`) `forbid`s `unsafe_code`. There are TWENTY-THREE
 numbered target-side exceptions, TWENTY-ONE of them live, each a standalone
@@ -209,7 +209,9 @@ application runtime reaches this surface.
 
 That host-side layer includes `renameat2(2)` with both directory descriptors
 fixed to `AT_FDCWD` and flags fixed to `RENAME_NOREPLACE`. Its only caller is
-the authenticated OSTree deploy materializer. Stable `std::fs::rename`
+`builder/src/ostree.rs`, which passes it as the publication of td-engine's
+authenticated OSTree deploy materializer (`ostree_deploy`) for
+`td-builder ostree-materialize`. Stable `std::fs::rename`
 replaces an empty destination directory, so checking absence before a large
 deploy is decoded leaves a writer race in which one complete result can
 silently replace another. The raw wrapper makes absence part of the atomic

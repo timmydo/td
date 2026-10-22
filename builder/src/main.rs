@@ -17,7 +17,6 @@
 //!     `td-builder check` rung.
 
 mod affected;
-mod application;
 mod build;
 mod build_daemon;
 mod build_root;
@@ -35,6 +34,11 @@ mod crypto_portable;
 mod drv;
 mod efi;
 mod elf;
+// Shared with td-engine's reader tests, which use fixtures this crate does not.
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../../engine/src/elf_synth.rs"]
+mod elf_synth;
 mod native_tests;
 // The build script compiles it in by path and the tests read it; the binary
 // itself never does.

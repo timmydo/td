@@ -1518,6 +1518,12 @@ no-follow timestamp setter; recursive store interning ignores timestamps and
 the deterministic image writer restamps every node, so they are not artifact
 authority. The real Firefox and runtime caches materialize with exactly the
 357/14,346 object, 480/18,196 path and decoded-byte counts recorded above.
+The materializer is td-engine's `ostree_deploy`, which takes the no-replace
+rename as a parameter: `ostree-materialize` passes the builder's
+`renameat2` wrapper. §W.9's td-app will check absence and then `rename(2)`
+under its cache lock, which is safe from an intervening directory only
+because td-app alone publishes into that cache; the guarantees above are
+the builder's.
 
 **Typed recipe pins, automatic warming and marked store admission have
 LANDED.** `OstreePin` is a separate recipe type rather than a multi-object
@@ -2116,8 +2122,9 @@ served the repository client:
 |---|---|
 | `builder/src/sandbox.rs` | **rewrite** as `td-jail` — the namespace mechanics are the model, but its build-user ids, offline network, `/gnu/store` paths and trust model are all wrong here |
 | `builder/src/store.rs` | **read, do not port** — the store semantics are the control plane's, and with packages in the store there is nothing on the target that creates a store path |
-| `builder/src/elf.rs` | **never** — see §G |
-| `engine/src/gzip.rs` | **reuse only in the control plane** — builder source extraction and the bounded deploy importer share this std-only gzip/raw-DEFLATE implementation; nothing on the target decompresses a package |
+| `builder/src/elf.rs` | **never** — see §G. Its writers stay in the builder; the read-only half (header parser, `PT_INTERP`, run-path and `DT_NEEDED` readers, the bounded link search, executable and static assertions) is `engine/src/elf.rs`, shared with the image build |
+| `engine/src/dynamic_application.rs`, `engine/src/ostree_deploy.rs`, `engine/src/elf.rs` | **reuse on the target for §W.9 alone** — the dynamic validator, the deploy materializer and the read-only ELF inspection they use, moved from the builder (the ELF readers lose their panicking indexing, nothing else) so the image build and `td-app` run one implementation; the materializer's no-replace publication is a parameter, so td-engine gains no syscall |
+| `engine/src/gzip.rs` | **reuse in the control plane, and on the target for §W.9 alone** — builder source extraction and the bounded deploy importer share this std-only gzip/raw-DEFLATE implementation; on the target only `td-app` decompresses, and only Flathub objects it has authenticated |
 | `net/src/http.rs`, `td-feed` | **reuse in the control plane, and on the target through `td-fetchd` alone** — exact immutable OSTree objects use td-net's bounded HTTP/TLS fetcher and a commit-specific authenticated local cache; the target's one network client is the same tier's fetch service (§W.8), and there is no target repository client |
 | `builder/src/xz.rs`, `bzip2.rs`, `erofs.rs`, `tar.rs`, `oci.rs` | do not port — these serve source extraction or the image writer on the control plane |
 | `builder/src/nar.rs` | **needed, but only in the control plane** — `read_nar` is how host mode materializes a package (§X.1). Nothing on the target extracts an archive. §X.6 records the arbitrary-file-write this design found in it, fixed on main before this landed |
@@ -11080,7 +11087,8 @@ Without `--force` it does nothing if `checked` is less than 24 hours old.
 The materializer and the dynamic validator move from the builder into
 td-engine so the image build and td-app share one implementation; td-net
 stays free of `unsafe`, so publication uses the account-private lock and
-plain `rename(2)` instead of the builder's `RENAME_NOREPLACE`.
+an absence check and plain `rename(2)` under that lock instead of the
+builder's `RENAME_NOREPLACE`.
 
 **When it fetches.** td-jail, launching an application whose spec names
 a Flathub source, runs `td-app update NAME` before it resolves the
@@ -11157,7 +11165,7 @@ these applications; it is a hint whose answer must pass 1–5.
 **Increments.** (1) The Flathub signature verifier on the pinned path
 (§B.3.1, landed first). (2) This design and its AGENTS.md amendment.
 (3) Move the materializer and the dynamic validator into td-engine,
-unchanged. (4) `td-app update`: cache, admission, generations, daily and
+unchanged (landed third). (4) `td-app update`: cache, admission, generations, daily and
 forced checks, for an application or a runtime alone, as a command
 nothing launches yet. (5) Launch requests, the worker, the compositor
 launcher, and td-jail resolving each half of a spec from the store or

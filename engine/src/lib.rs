@@ -21,9 +21,16 @@
 //!
 //! The control-plane-only `gzip` module holds the one std-only DEFLATE
 //! implementation shared by builder source extraction, `td-net`'s bounded
-//! OSTree acquisition and the later deploy materializer; `xz` is its LZMA2
+//! OSTree acquisition and the `ostree_deploy` materializer; `xz` is its LZMA2
 //! counterpart, shared by builder source extraction and `td-net`'s Debian
 //! index resolution. No target binary `#[path]`-includes either.
+//!
+//! `elf` (the read-only ELF inspection), `dynamic_application` (the
+//! offline loader-graph validator) and `ostree_deploy` moved here from the
+//! builder so the image build and `td-net`'s on-demand Flathub admission
+//! (APPLICATIONS.md §W.9) run one implementation. The builder keeps the ELF
+//! writers, and passes `ostree_deploy` its `renameat2` publication: this
+//! crate stays free of syscalls.
 //!
 //! `sha512` and `ed25519` arrive with AUTHENTICATED deployments, and are
 //! target-side in that same way — which is why the crate's first line no
@@ -53,12 +60,17 @@ pub mod crc32;
 // `debian_root` parses recipes/src/debian-root.lock: td-recipe-eval lists
 // its pins, td-builder assembles and admits the root against it.
 pub mod debian_root;
+pub mod dynamic_application;
 pub mod ed25519;
+pub mod elf;
+#[cfg(test)]
+mod elf_synth;
 // `embed_scan` reads Rust source for embeds and test modules: td-recipe-eval's
 // build script and td-builder's fingerprints read through one scanner.
 pub mod embed_scan;
 pub mod launcher;
 pub mod ostree;
+pub mod ostree_deploy;
 pub mod permissions;
 pub mod principals;
 // SIGNING is a separate module because, of the two ed25519 files, td-boot
@@ -77,3 +89,7 @@ pub mod sha256;
 pub mod sha512;
 pub mod target_profile;
 pub mod xz;
+
+#[cfg(test)]
+#[path = "../../td-fs/src/temp_dir.rs"]
+mod test_temp;

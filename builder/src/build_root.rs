@@ -971,12 +971,12 @@ mod tests {
             |name: &str, bytes: Vec<u8>| fs::write(out.join("bin").join(name), bytes).unwrap();
         elf(
             "store-interp",
-            crate::elf::tests::synth_interp_elf(&format!("{store}/x/ld.so"), true),
+            crate::elf_synth::synth_interp_elf(&format!("{store}/x/ld.so"), true),
         );
         check_output(&root, &output, &[], dir.path()).unwrap();
         elf(
             "debian",
-            crate::elf::tests::synth_interp_elf("/lib64/ld-linux-x86-64.so.2", true),
+            crate::elf_synth::synth_interp_elf("/lib64/ld-linux-x86-64.so.2", true),
         );
         let error = check_output(&root, &output, &[], dir.path()).unwrap_err();
         assert!(error.contains("outside the store"), "{error}");
@@ -984,12 +984,12 @@ mod tests {
 
         elf(
             "origin",
-            crate::elf::tests::synth_dyn_elf("$ORIGIN/../lib", true, true),
+            crate::elf_synth::synth_dyn_elf("$ORIGIN/../lib", true, true),
         );
         check_output(&root, &output, &[], dir.path()).unwrap();
         elf(
             "climbs",
-            crate::elf::tests::synth_dyn_elf("$ORIGIN/../../../usr/lib", true, true),
+            crate::elf_synth::synth_dyn_elf("$ORIGIN/../../../usr/lib", true, true),
         );
         let error = check_output(&root, &output, &[], dir.path()).unwrap_err();
         assert!(
@@ -999,7 +999,7 @@ mod tests {
         fs::remove_file(out.join("bin/climbs")).unwrap();
         elf(
             "usr-lib",
-            crate::elf::tests::synth_dyn_elf("$ORIGIN:/usr/lib", true, true),
+            crate::elf_synth::synth_dyn_elf("$ORIGIN:/usr/lib", true, true),
         );
         let error = check_output(&root, &output, &[], dir.path()).unwrap_err();
         assert!(error.contains("searches /usr/lib"), "{error}");
@@ -1115,7 +1115,7 @@ mod tests {
         fs::remove_dir_all(out.join("lib/debug/via")).unwrap();
         // A file there that pairs with nothing is judged itself, and its
         // refusal says why it was not taken as a companion.
-        let debian = crate::elf::tests::synth_interp_elf("/lib64/ld-linux-x86-64.so.2", true);
+        let debian = crate::elf_synth::synth_interp_elf("/lib64/ld-linux-x86-64.so.2", true);
         fs::write(out.join("lib/debug/bin/orphan.debug"), &debian).unwrap();
         let error = check_output(&root, &output, &[], dir.path()).unwrap_err();
         assert!(

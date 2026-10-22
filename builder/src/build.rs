@@ -5022,7 +5022,7 @@ pub fn run_mesboot() -> Result<(), String> {
                         "application runtime {runtime_name:?} is not a declared payload"
                     ))
                 })?;
-            crate::application::validate_dynamic_application(
+            td_engine::dynamic_application::validate_dynamic_application(
                 Path::new(&ctx.out),
                 &entry,
                 Path::new(runtime),

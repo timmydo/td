@@ -22,7 +22,7 @@ const MAX_LOADER_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_RPATH_ANCESTORS: usize = 64;
 const MAX_RPATH_ANCESTRY_BYTES: usize = 64 * 1024;
 const MAX_SHEBANG_BYTES: usize = 256;
-const MAX_DYNAMIC_ELF_BYTES: u64 = td_engine::ostree::MAX_ARCHIVE_FILE_BYTES as u64;
+const MAX_DYNAMIC_ELF_BYTES: u64 = crate::ostree::MAX_ARCHIVE_FILE_BYTES as u64;
 const MAX_DYNAMIC_STRING_BYTES: usize = 64 * 1024;
 const MAX_DYNAMIC_TEXT_BYTES: usize = 16 * 1024 * 1024;
 
@@ -1055,8 +1055,7 @@ fn validate_loader_graph(
         }
         if let Some(interpreter) = &search.interpreter {
             account_loader_edge(&mut edges)?;
-            let resolved =
-                resolve_elf_interpreter(namespace, &object, &interpreter, allowed_roots)?;
+            let resolved = resolve_elf_interpreter(namespace, &object, interpreter, allowed_roots)?;
             pending.push_back(PendingObject {
                 object: resolved,
                 required_elf: RequiredElf::Executable,
@@ -1088,7 +1087,7 @@ fn validate_loader_graph(
     Ok(())
 }
 
-pub(crate) fn validate_dynamic_application(
+pub fn validate_dynamic_application(
     out: &Path,
     entry: &str,
     runtime: &Path,
@@ -1127,6 +1126,13 @@ pub(crate) fn validate_dynamic_application(
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic,
+        clippy::unwrap_used
+    )]
+
     use super::*;
     use std::os::unix::fs::symlink;
 
@@ -1273,7 +1279,7 @@ mod tests {
 
         fs::create_dir_all(app.join("bin")).unwrap();
         let entry = app.join("bin/wrong-arch");
-        let mut wrong_arch = crate::elf::tests::synth_needed_elf(&[], true);
+        let mut wrong_arch = crate::elf_synth::synth_needed_elf(&[], true);
         wrong_arch[0x12..0x14].copy_from_slice(&3u16.to_le_bytes());
         fs::write(&entry, wrong_arch).unwrap();
         make_executable(&entry);
@@ -1496,7 +1502,7 @@ mod tests {
         let bash = usr.join("bin/bash");
         fs::write(
             &bash,
-            crate::elf::tests::synth_needed_elf(&["libmissing.so"], true),
+            crate::elf_synth::synth_needed_elf(&["libmissing.so"], true),
         )
         .unwrap();
         make_executable(&bash);
@@ -1505,7 +1511,7 @@ mod tests {
             validate_dynamic_application(&package, "/app/bin/firefox", &runtime, &paths, &[], 0)
                 .unwrap_err();
         assert!(error.contains("libmissing.so"), "{error}");
-        let mut wrong_role = crate::elf::tests::synth_needed_elf(&[], true);
+        let mut wrong_role = crate::elf_synth::synth_needed_elf(&[], true);
         wrong_role[0x10..0x12].copy_from_slice(&1u16.to_le_bytes());
         fs::write(usr.join("lib/libmissing.so"), wrong_role).unwrap();
         let error =
@@ -1514,7 +1520,7 @@ mod tests {
         assert!(error.contains("wrong ELF role"), "{error}");
         fs::write(
             usr.join("lib/libmissing.so"),
-            crate::elf::tests::synth_needed_elf(&[], true),
+            crate::elf_synth::synth_needed_elf(&[], true),
         )
         .unwrap();
         validate_dynamic_application(&package, "/app/bin/firefox", &runtime, &paths, &[], 0)

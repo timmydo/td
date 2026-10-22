@@ -3,7 +3,8 @@ use crate::types::{Recipe, Step};
 
 const MAIN_RS: &str = include_str!("../../../td-jail/src/main.rs");
 #[cfg(test)]
-const BUILDER_APPLICATION_RS: &str = include_str!("../../../builder/src/application.rs");
+const ENGINE_DYNAMIC_APPLICATION_RS: &str =
+    include_str!("../../../engine/src/dynamic_application.rs");
 const MODULES: &[(&str, &str)] = &[
     (
         "app_policy",
@@ -607,7 +608,7 @@ mod tests {
         let authority = source("authority").expect("authority source");
         let transition = source("transition").expect("transition source");
         let alias_rows = "    (\"bin\", \"/usr/bin\"),\n    (\"lib\", \"/usr/lib\"),\n    (\"lib64\", \"/usr/lib64\"),\n    (\"sbin\", \"/usr/sbin\"),\n";
-        assert!(BUILDER_APPLICATION_RS.contains(&format!(
+        assert!(ENGINE_DYNAMIC_APPLICATION_RS.contains(&format!(
             "const APPLICATION_ALIASES: &[(&str, &str)] = &[\n{alias_rows}];"
         )));
         assert!(transition.contains(&format!(
