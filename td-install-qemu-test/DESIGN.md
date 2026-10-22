@@ -3,7 +3,7 @@
 This crate is a diagnostic PID-1 program for `td-recipe-eval qemu-install`
 and the live installation phases of `qemu-install-system`,
 `qemu-install-encrypted` and `qemu-boot-encrypted`.
-It is built from source through the ordinary Rust ladder and is never packed
+It is built from source through the ordinary Rust recipe graph and is never packed
 in the system or graphical installer profile. It adds no user-facing device
 admission, account configuration or signing identity. In
 `qemu-install-system` it is td-authd's end of the installation service's

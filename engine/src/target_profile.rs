@@ -70,11 +70,6 @@ pub const ASSEMBLY_EXCEPTIONS: &[(&str, &str)] = &[
         "gcc-runtime-stage1",
         "upstream stage1 GCC libgcc x86_64 assembly",
     ),
-    (
-        "gcc-x86-64-native",
-        "upstream native GCC libgcc x86_64 assembly",
-    ),
-    ("gcc-x86-64-self", "upstream GCC libgcc x86_64 assembly"),
     // libgcc built in the Debian build root.
     ("gcc-runtime", "upstream GCC libgcc x86_64 assembly"),
     // Every Rust output links upstream's prebuilt std, whose frame pointers
@@ -157,8 +152,9 @@ pub const BUILD_ROOT_LINKED: &[&str] = &[
 pub const BUILD_ROOT_STAGE1_LINKED: &str = "glibc-x86-64";
 
 /// Conservative transitive assembly boundaries for a linked output. Every
-/// split target may contain glibc startup code and libgcc; Rust outputs also
-/// contain standard-library/compiler-runtime code.
+/// split target may contain glibc startup code; one linked in the build root
+/// or by td-link also contains gcc-runtime's libgcc, glibc gcc-runtime-stage1's,
+/// and Rust outputs the standard library and compiler runtime.
 pub fn output_assembly_exceptions(recipe: &str) -> Vec<(&'static str, &'static str)> {
     ASSEMBLY_EXCEPTIONS
         .iter()
@@ -166,12 +162,6 @@ pub fn output_assembly_exceptions(recipe: &str) -> Vec<(&'static str, &'static s
         .filter(|(source, _)| {
             *source == "glibc-x86-64"
                 || (*source == "gcc-runtime-stage1" && recipe == BUILD_ROOT_STAGE1_LINKED)
-                || (*source == "gcc-x86-64-native"
-                    && matches!(recipe, "binutils-x86-64-self" | "gcc-x86-64-self"))
-                || (*source == "gcc-x86-64-self"
-                    && !matches!(recipe, "glibc-x86-64" | "binutils-x86-64-self")
-                    && !BUILD_ROOT_LINKED.contains(&recipe)
-                    && !RUST_PROFILED_RECIPES.contains(&recipe))
                 // Build-root C and every Rust output, which td-link links,
                 // take gcc-runtime's start files and libgcc, not GCC's.
                 || (*source == "gcc-runtime"
@@ -331,11 +321,6 @@ mod tests {
                     "gcc-runtime-stage1",
                     "upstream stage1 GCC libgcc x86_64 assembly"
                 ),
-                (
-                    "gcc-x86-64-native",
-                    "upstream native GCC libgcc x86_64 assembly"
-                ),
-                ("gcc-x86-64-self", "upstream GCC libgcc x86_64 assembly"),
                 ("gcc-runtime", "upstream GCC libgcc x86_64 assembly"),
                 (
                     "rust-toolchain",
@@ -347,10 +332,7 @@ mod tests {
         // The toolchain is the boundary's source, not one of its outputs.
         assert_eq!(
             output_assembly_exceptions("rust-toolchain"),
-            vec![
-                ("glibc-x86-64", "upstream glibc sysdeps/x86_64 assembly"),
-                ("gcc-x86-64-self", "upstream GCC libgcc x86_64 assembly"),
-            ]
+            vec![("glibc-x86-64", "upstream glibc sysdeps/x86_64 assembly")]
         );
         assert_eq!(DEPLOYMENT_DEBUG_CEILING_BYTES, 1_073_741_824);
         assert_eq!(
@@ -403,27 +385,6 @@ mod tests {
                     "gcc-runtime-stage1",
                     "upstream stage1 GCC libgcc x86_64 assembly"
                 ),
-            ]
-        );
-        assert_eq!(
-            output_assembly_exceptions("binutils-x86-64-self"),
-            vec![
-                ("glibc-x86-64", "upstream glibc sysdeps/x86_64 assembly"),
-                (
-                    "gcc-x86-64-native",
-                    "upstream native GCC libgcc x86_64 assembly"
-                ),
-            ]
-        );
-        assert_eq!(
-            output_assembly_exceptions("gcc-x86-64-self"),
-            vec![
-                ("glibc-x86-64", "upstream glibc sysdeps/x86_64 assembly"),
-                (
-                    "gcc-x86-64-native",
-                    "upstream native GCC libgcc x86_64 assembly"
-                ),
-                ("gcc-x86-64-self", "upstream GCC libgcc x86_64 assembly"),
             ]
         );
         // td-link builds in the root and is a Rust output.

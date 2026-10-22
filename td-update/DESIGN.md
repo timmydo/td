@@ -119,7 +119,7 @@ uncompressed GNU tar output. That pass is a port of the pinned unifdef 2.5
 needs no C compiler.
 No compiler, make, shell, sed, tar or xz executable participates in header
 preparation.
-The generated i386 and x86_64 archives retain their existing seed digests.
+The generated x86_64 archive retains its existing seed digest.
 A future selection-policy change requires updating this implementation.
 
 The input archive is bounded to 512 MiB and verified before extraction;
@@ -131,19 +131,16 @@ cache's shared header lease travels on stdin through the builder, compiler
 and sanitizer, so orphaned producers keep crash recovery from removing
 active staging. Only a successful producer and synced temporary archive
 can be renamed into the source cache. The target seed check remains the
-authority for admitting the resulting data into the bootstrap graph.
+authority for admitting the resulting data into the target graph.
 
-The running kernel must support i386 execution: the source bootstrap builds
-32-bit Mes and an early GNU toolchain before reaching native x86-64 tools.
-The standard kernel enables that ABI and `CONFIG_COMPAT_32BIT_TIME`: the
-early glibc needs the legacy i386 futex and clock syscalls. Without them,
-Python's parallel byte-compilation cannot synchronize its workers.
-Application confinement still kills non-x86-64 syscall architectures, with
+No build needs i386 execution. The standard kernel still enables that ABI
+and `CONFIG_COMPAT_32BIT_TIME` for td-jail's probe: application confinement
+kills non-x86-64 syscall architectures, with
 the independent target probe checking both unconfined compatibility
 execution and confined rejection.
 
 The new evaluator warms declared fixed-output inputs for `system-x86-64`,
-then invokes `build-run` through the existing sandbox and source-bootstrap
+then invokes `build-run` through the existing sandbox and recipe
 graph. It receives the exact builder just compiled through
 `TD_BUILDER_SELF`. No host cache is imported, no application payload becomes
 a compilation input, and the logical target prefix remains `/td/store`.
@@ -216,12 +213,12 @@ Serial output is bounded to 256 MiB per boot and one MiB per line. A
 64-line queue applies backpressure; teardown closes it before joining the
 reader, so a blocked producer cannot prevent cleanup.
 
-The guest uses its own source checkout, source-built compilers and local
+The guest uses its own source checkout, its own toolchain and local
 caches. No host executable or store output is imported by this command.
 An existing warm installation provides a bounded regression; a fresh
 installation exercises upstream fetching and the cold build path. Reports
 must identify which fixture was supplied rather than imply that a warm
-pass rebuilt the entire bootstrap ladder.
+pass rebuilt the entire recipe graph.
 
 On the first boot, the oracle waits up to ten minutes for the initializer
 to publish the checkout's `update` symlink. This wait also respects the

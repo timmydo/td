@@ -29,7 +29,7 @@ pub fn recipe() -> Recipe {
     let tu = "{in:td-util}/bin/td-util";
     let stage1 = KEXEC_STAGE1_MARKER;
     let stage2 = KEXEC_STAGE2_MARKER;
-    let mut steps = vec![post_rust_tool_farm(None)];
+    let mut steps = vec![post_rust_tool_farm()];
 
     steps.push(
         Step::run(
@@ -98,7 +98,7 @@ pub fn recipe() -> Recipe {
     });
 
     Recipe::mesboot("kexec-spike-x86-64-test", "1.0")
-        .native_inputs(&post_rust_inputs(None, &["kexec-spike-x86-64"]))
+        .native_inputs(&post_rust_inputs(&["kexec-spike-x86-64"]))
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"

@@ -59,12 +59,7 @@ save review work: the commit is the review and checkpoint unit.
 ## Host kernel
 
 The builder requires Linux 5.12 or newer with `mount_setattr` available to
-its namespace sandbox. The source-bootstrap ladder also executes i386 Mes
-and GNU intermediates, so x86-64 build hosts and installed td kernels need
-`CONFIG_IA32_EMULATION=y` with compatibility execution enabled at boot
-and `CONFIG_COMPAT_32BIT_TIME=y` for the early glibc futex and clock
-syscalls. Enabling ELF execution alone is insufficient; x32 is not required.
-Read-only binds add restrictions without clearing locked source flags; td's writable `/var` is mounted nosuid,nodev. A blocked
+its namespace sandbox. Read-only binds add restrictions without clearing locked source flags; td's writable `/var` is mounted nosuid,nodev. A blocked
 operation is a sandbox setup failure, with no writable-bind fallback. The
 value-pinned syscall boundary is recorded in `UNSAFE.md`.
 
@@ -174,8 +169,8 @@ first, to say where check time goes. A run that fails before the check
 starts (the ladder lock, the memo dir) writes no record. A check that
 runs also prints `[time] CHECK: setup, key, lock, build, test` seconds
 and records them; the summary shows the last run's. A small check's
-time is mostly `build`: re-planning and staging its whole closure from
-stage0, already-built rungs included.
+time is mostly `build`: re-planning and staging its whole closure,
+already-built recipes included.
 
 A branch's `ready` leaves to main the recipe checks only main's churn
 re-keys. `affected-checks --run` sets `TD_CHECK_DEFER_ENGINE`, and a
@@ -189,7 +184,7 @@ newest, since worktrees on other bases record passes of the same check in
 the shared memo; only a well-formed pass whose components hash to the
 key it is filed under counts. A change to anything else the check reads
 — its script, a recipe in its closure or the sources it embeds, a lock,
-a local source, the seed patches — runs it, as does a check with no
+a local source — runs it, as does a check with no
 such pass. The evaluator's own sources key a check in two
 parts: `evaluator-checks`, what is a check's own content though every
 key holds it — the Rust check bodies under
@@ -198,8 +193,7 @@ key holds it — the Rust check bodies under
 evaluator's code reads, and a crate file the shared modules compile in,
 such as the TZif reader tzdata#1 asserts — which never defers, and
 `evaluator`, the rest of its code, which may. The builder-engine
-component also hides the seed tables td-builder compiles in, among them
-`seed/bootstrap-root.txt`, the root every post-cut check builds on, so
+component also hides the seed tables td-builder compiles in, so
 a branch whose diff touches `seed/` defers nothing, and the selection
 says so; the same changes arriving from main are main's to run. So a
 branch that touches only the builder engine, the evaluator's shared
@@ -252,7 +246,8 @@ dir.
 
 ## Reclaiming the shared build cache
 
-The ladder work dir under `~/.td/build-daemon/ladder-shared-v1` keeps every
+The shared work dir under `~/.td/build-daemon/ladder-shared-v1` (the name
+is historical) keeps every
 output every worktree has built. Collection keeps what each worktree's last
 runs needed and nothing else; there is no age window. Every build records,
 under `gc-roots/`, per worktree and per target, the store basename of each
@@ -287,8 +282,7 @@ worktree's record still roots until a live worktree's record of the same
 build or check is at least as new or already names all it names, and of several
 gone ones only the newest does, so removing a worktree does not collect
 what its successor is about to reuse. So a key no live worktree builds
-again keeps its last gone record, one per key; the bootstrap root's
-ladder is one key across re-pins for that reason. Records that are never
+again keeps its last gone record, one per key. Records that are never
 judged gone (a main checkout, a root that is not a git checkout, the old
 path of a `git worktree move`) root until their record is replaced;
 removing their directory under `gc-roots/` releases them. A record from
@@ -326,55 +320,12 @@ it holds one toolchain's builds; two worktrees on different toolchains
 empty it in turn. `gc-store` leaves it and `clear-store` drops it.
 
 Fetched and host-generated seeds are pinned by the seed digest table the
-evaluator compiles in (`seed/seed-digests.txt`); regenerate it after a pin,
-seed patch, or stage0 source change and commit it with the change:
+evaluator compiles in (`seed/seed-digests.txt`); regenerate it after a pin
+change and commit it with the change:
 
 ```text
 td-recipe-eval seed-digests > seed/seed-digests.txt
 ```
-
-The ladder below the gcc-14 cut is pinned the same way, by
-`seed/bootstrap-root.txt`: the cut's sixteen exports
-(`bootstrap_root::CUT`), every store item in their reference closure by
-basename, NAR hash and references, the builder ABI they were built under,
-and a digest over the ladder's recipes and the seeds it stages. A graph
-whose targets are not ladder rungs stops at the exports and stages them
-from the pinned root, so a builder ABI bump rebuilds only what lies above
-the cut. The first such build on a machine materializes the root: it
-builds the ladder from stage0 under the pinned ABI, which on a warm
-machine is a cache hit, and admits the result only if every item
-reproduces the pin. Nothing is downloaded or published (principle 5).
-
-A pin builds the ladder under its own ABI token, `<abi>-root`, never the
-compiled `store::BUILDER_ABI`: a graph cut at the root types its exports
-AuditedSeed where a full climb types them RecipeOutput, the reuse key
-binds that origin, and the two must therefore never share an output
-path. The root keeps its token across later ABI bumps; the first pin
-records plain `4`, which the bump to 5 retired. A ladder-side check (a
-rung's own test, such as gcc-10-bridge-test) still climbs from stage0 at
-the compiled ABI, so each bump re-climbs the ladder for it once. A bump
-that changes what the ladder's rungs produce makes a cold machine's
-admission fail with the differing items named; re-pin then, and use
-`bootstrap-root check` to see the drift. An admitted root is re-verified
-once per run and re-admitted if it no longer matches. Re-pinning leaves
-the old root's items in the seed store; only `clear-store` reclaims
-them.
-
-Changing a ladder recipe, or a seed it stages, makes the pin stale; the
-`cargo-test` preflight reds until it is re-pinned, and a cut build refuses
-to start. Re-pin, review the diff, and commit it with the change:
-
-```text
-td-recipe-eval bootstrap-root pin
-```
-
-`td-recipe-eval bootstrap-root check` is the on-demand stage0 proof and
-not part of `check`: it rebuilds the ladder from stage0 into a private,
-empty build cache under the pinned ABI and reports every item that does
-not reproduce. `bootstrap-root status` says whether the root is pinned,
-current and admitted here; `TD_BOOTSTRAP_FROM_STAGE0=1` makes one
-invocation build every graph from stage0. Building a ladder rung, or a
-recipe that builds from one below the cut, always climbs from stage0.
 
 A recipe built from the checkout's own trees (a `local_source`, with any
 sibling `local_source_trees`) is pinned differently: DECLARATION-only, by

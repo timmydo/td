@@ -327,7 +327,7 @@ Evaluator preparation is Rust-owned; the existing script entry point delegates
 to its memoized builder operation. Its source fingerprint covers that Rust
 implementation as well as the script entry point. The helpers remain control
 plane programs: compiling one inside td does not admit it as a target recipe
-tool or replace the source-bootstrap artifact graph.
+tool or replace the target artifact graph.
 
 The native build sandboxes also accommodate the standard kernel's disabled
 SysV IPC and POSIX message queues. They inspect only their freshly mounted

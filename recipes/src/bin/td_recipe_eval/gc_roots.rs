@@ -54,14 +54,9 @@ pub(crate) struct Roots {
     pub(crate) dropped: usize,
 }
 
-/// The record key for a build of TARGET, apart for the bootstrap root's
-/// ladder (built under the pinned ABI, at other basenames than the compiled
-/// ABI's), but one key across root pins, so a re-pin replaces it.
-pub(crate) fn build_key(target: &str, root: bool) -> String {
-    match root {
-        true => format!("build-{}@root", safe(target)),
-        false => format!("build-{}", safe(target)),
-    }
+/// The record key for a build of TARGET.
+pub(crate) fn build_key(target: &str) -> String {
+    format!("build-{}", safe(target))
 }
 
 /// How `record` treats what KEY's record already holds.
@@ -485,9 +480,8 @@ mod tests {
     }
 
     #[test]
-    fn keys_are_per_target_root_and_check() {
-        assert_eq!(build_key("rust-x86-64", false), "build-rust-x86-64");
-        assert_eq!(build_key("gcc", true), "build-gcc@root");
+    fn keys_are_per_target_and_check() {
+        assert_eq!(build_key("rust-x86-64"), "build-rust-x86-64");
         assert_eq!(check_key("td-sh/x", 2), "check-td-sh_x.2");
     }
 

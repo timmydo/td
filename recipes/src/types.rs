@@ -33,17 +33,15 @@ fn arr(xs: &[String]) -> Json {
 }
 
 /// Build systems td knows how to lower (mirrors `BuildSystem` in td-spec.d.ts).
-/// `Stage0` is the SEED executor (#378) — see the engine's build::run_stage0.
-/// (Named `stage0`, not `seed`: `seed` is taken by the lock input class and the
-/// guix seed store.) `Mesboot` is the bootstrap-RUNG executor (#378 slices 2+3):
-/// the recipe carries typed `steps` (below) and the engine's build::run_mesboot
-/// executes them — the toolchain ladder rungs (mes → tcc → … → glibc-2.41).
+/// `Mesboot` is the typed-STEP executor (#378 slices 2+3): the recipe carries
+/// typed `steps` (below) and the engine's build::run_mesboot executes them.
+/// The name is historical (it first ran the stage0 bootstrap ladder's rungs)
+/// and is part of every derivation's JSON, so renaming it re-keys every output.
 #[derive(Clone)]
 pub enum BuildSystem {
     Gnu,
     Rust,
     Cmake,
-    Stage0,
     Mesboot,
     /// The upstream Rust dist TRANSFORM: NOT a compile. It assembles the pinned
     /// rustc/rust-std/Cargo/Clippy release components, links in its declared
@@ -58,14 +56,13 @@ impl BuildSystem {
             BuildSystem::Gnu => "gnu",
             BuildSystem::Rust => "rust",
             BuildSystem::Cmake => "cmake",
-            BuildSystem::Stage0 => "stage0",
             BuildSystem::Mesboot => "mesboot",
             BuildSystem::RustDist => "rust-dist",
         }
     }
 }
 
-/// A bootstrap-rung build STEP (the `mesboot` build system, #378 slices 2+3).
+/// A typed build STEP (the `mesboot` build system, #378 slices 2+3).
 /// Steps are DATA — the engine (build::run_mesboot) executes them in order; the
 /// only processes spawned are `Run` steps' argv (td interprets NO shell — a
 /// configure script runs because its argv names the declared bash input).
@@ -82,8 +79,7 @@ pub enum Step {
         env: Vec<(String, String)>,
         dir: String,
     },
-    /// Symlink name → target under {tools} (the rung's PATH farm; replaces the
-    /// ladder's per-rung `bin/` symlink dirs + `ls /gnu/store/*pkg*` scavenging).
+    /// Symlink name → target under {tools} (the recipe's PATH farm).
     ToolFarm {
         links: Vec<(String, String)>,
     },
@@ -103,16 +99,6 @@ pub enum Step {
         input: String,
         dest: String,
         keep_top: bool,
-    },
-    /// The ENGINE-NATIVE mes bootstrap rung (builder's `mes_boot::run`, re
-    /// #469): the Rust port of the mes tarball's configure.sh, bootstrap.sh,
-    /// and install.sh. The only subprocesses are stage0 recipe outputs (kaem
-    /// driving upstream's own kaem.run) and the just-built mes running
-    /// upstream's mescc.scm — the rung declares NO host shell or coreutils.
-    MesBoot {
-        source: String,
-        nyacc: String,
-        stage0: String,
     },
     /// Copy files (flat) into dest, made user-writable (build trees are written into).
     CopyFiles {
@@ -207,12 +193,6 @@ pub enum Step {
         path: String,
         bytes: u64,
     },
-    /// Rewrite `#!/bin/sh`-style shebangs under dir to the given shell (the
-    /// engine's own patch_shebangs — the sandbox has no /bin/sh).
-    PatchShebangs {
-        dir: String,
-        shell: String,
-    },
     /// Rewrite glibc text linker scripts under `dir/*.so`, stripping
     /// `<prefix>/lib/` from their member names. Real ELF shared objects are
     /// skipped by the engine's GNU-ld-script marker check.
@@ -227,12 +207,10 @@ pub enum Step {
         exec: bool,
     },
     /// Apply literal, fail-closed text edits to a file in place — the host-free
-    /// stand-in for `patch`/`sed` (re #469: the sandbox ships neither, and
-    /// stage0's `replace` cannot carry the space-bearing, multi-line strings a
-    /// real patch hunk needs through kaem's quote-stripping tokenizer). Each
+    /// stand-in for `patch`/`sed` (re #469: a td recipe declares neither). Each
     /// edit replaces EVERY occurrence of `from` with `to`, requiring exactly
     /// `expect` (≥ 1) occurrences first, so a drift in the pinned source — or a
-    /// transcription slip — reds the rung instead of silently doing nothing.
+    /// transcription slip — reds the build instead of silently doing nothing.
     /// Edits apply in order (an edit sees the previous edits' result). Only
     /// `file` is template-expanded; `from`/`to` are LITERAL source text, so C
     /// braces and `{…}` pass through untouched. The engine also reds an empty
@@ -244,12 +222,12 @@ pub enum Step {
     },
     /// Assert each product is a FULLY STATIC ELF — no `PT_INTERP` (host loader),
     /// no `DT_NEEDED` (host libc), no `DT_RPATH`/`DT_RUNPATH` — the runtime-
-    /// provenance gate for the pre-libc rungs (re #469). tcc/make/yacc are all
-    /// linked `-static`; a regression that reintroduced a program interpreter or
-    /// a `libc.so` dependency would drag a host loader + glibc back in at run
-    /// time — exactly the host-runtime ingress #469 closes. This reds the rung,
+    /// provenance gate for a program that must run without a loader (re #469).
+    /// A regression that reintroduced a program interpreter or a `libc.so`
+    /// dependency would drag a host loader + glibc back in at run time —
+    /// exactly the host-runtime ingress #469 closes. This reds the build,
     /// naming the offending binary and leak, so the leak never reaches a later
-    /// rung. Fails closed on a non-ELF too (the parser rejects bad magic).
+    /// recipe. Fails closed on a non-ELF too (the parser rejects bad magic).
     AssertStatic {
         paths: Vec<String>,
     },
@@ -420,18 +398,6 @@ impl Step {
                     ("keepTop".into(), Json::Bool(*keep_top)),
                 ]),
             )]),
-            Step::MesBoot {
-                source,
-                nyacc,
-                stage0,
-            } => Json::Obj(vec![(
-                "mesBoot".into(),
-                Json::Obj(vec![
-                    ("source".into(), Json::Str(source.clone())),
-                    ("nyacc".into(), Json::Str(nyacc.clone())),
-                    ("stage0".into(), Json::Str(stage0.clone())),
-                ]),
-            )]),
             Step::CopyFiles { files, dest } => Json::Obj(vec![(
                 "copyFiles".into(),
                 Json::Obj(vec![
@@ -536,13 +502,6 @@ impl Step {
                 Json::Obj(vec![
                     ("path".into(), Json::Str(path.clone())),
                     ("bytes".into(), Json::Str(bytes.to_string())),
-                ]),
-            )]),
-            Step::PatchShebangs { dir, shell } => Json::Obj(vec![(
-                "patchShebangs".into(),
-                Json::Obj(vec![
-                    ("dir".into(), Json::Str(dir.clone())),
-                    ("shell".into(), Json::Str(shell.clone())),
                 ]),
             )]),
             Step::RelocateLdScripts { dir, prefix } => Json::Obj(vec![(
@@ -1005,14 +964,13 @@ pub struct Recipe {
     pub name: String,
     pub version: String,
     pub source: Option<Source>,
-    /// The MAP KEY (in the `build-plan --auto` tool/source map `ladder_setup`
-    /// interns) that resolves to this recipe's OWN `<name>-source` lock entry
-    /// (#429) — distinct from `source` (an actual declared upstream fetch): a
-    /// mesboot rung's source is a recipe-pinned tarball ALREADY interned
-    /// under some other name (e.g. gcc-mesboot1 builds from the map key
-    /// `gcc-464-core`, not `gcc-mesboot1-source`), so this just names which
-    /// interned entry to alias in. `None` means the recipe has no source of its
-    /// own (e.g. make-test, which only RUNS a sibling rung's output) — the
+    /// The MAP KEY (in the `build-plan --auto` source map the runner interns)
+    /// that resolves to this recipe's OWN `<name>-source` lock entry (#429) —
+    /// distinct from `source` (an actual declared upstream fetch): a recipe's
+    /// source may be a pinned tarball interned under another name (e.g.
+    /// gcc-runtime builds from the map key `gcc-14-source`), so this names
+    /// which interned entry to alias in. `None` means the recipe has no source
+    /// of its own (e.g. a test that only RUNS a sibling's output) — the
     /// synthesizer then emits no `<name>-source` line at all.
     pub source_input: Option<String>,
     pub build_system: BuildSystem,
@@ -1037,7 +995,7 @@ pub struct Recipe {
     /// closing it would cost, and this doc deliberately claims no more than the
     /// two properties above.
     pub payload_inputs: Option<Vec<String>>,
-    /// Build inside the Debian build root (BUILD-ROOT-PLAN.md): the pinned
+    /// Build inside the Debian build root (AGENTS.md, "Debian build root"): the pinned
     /// root is the sandbox's read-only `/`, so steps may run its C tools.
     /// It is not an input: no `{in:...}` names it and no output may
     /// reference it or carry its interpreter.
@@ -1202,14 +1160,8 @@ impl Recipe {
     pub fn cmake(name: &str, version: &str) -> Recipe {
         Recipe::base(name, version, BuildSystem::Cmake)
     }
-    /// The stage0 SEED build system (#378): the pinned upstream source tarball
-    /// rides in through the lock's `<name>-source` entry, unpacked and interned
-    /// by the caller.
-    pub fn stage0(name: &str, version: &str) -> Recipe {
-        Recipe::base(name, version, BuildSystem::Stage0)
-    }
-    /// A bootstrap-ladder rung (#378 slices 2+3): typed `steps` executed by the
-    /// engine's build::run_mesboot; `native_inputs` name the prior rungs.
+    /// A typed-step recipe (#378 slices 2+3): `steps` executed by the engine's
+    /// build::run_mesboot; `native_inputs` name the recipes it builds on.
     pub fn mesboot(name: &str, version: &str) -> Recipe {
         Recipe::base(name, version, BuildSystem::Mesboot)
     }
@@ -1265,9 +1217,9 @@ impl Recipe {
         self.source = Some(src);
         self
     }
-    /// Declare the tool/source MAP KEY this rung's own `<name>-source` lock
+    /// Declare the tool/source MAP KEY this recipe's own `<name>-source` lock
     /// entry resolves from (see `source_input`'s doc comment). A recipe with no
-    /// source of its own (make-test) simply never calls this.
+    /// source of its own (a test) simply never calls this.
     pub fn source_input(mut self, key: &str) -> Recipe {
         self.source_input = Some(key.into());
         self.add_source_pin_for_key(key);
@@ -1280,8 +1232,7 @@ impl Recipe {
         self.add_ostree_pins_for_keys(xs.iter().copied());
         self
     }
-    /// Owned-string variant of `inputs`, for `ladder::mesboot0_inputs(...)` which
-    /// assembles the extras + MESBOOT0_TOOLS list at runtime.
+    /// Owned-string variant of `inputs`, for a list assembled at runtime.
     pub fn inputs_owned(mut self, xs: Vec<String>) -> Recipe {
         self.add_source_pins_for_keys(xs.iter().map(String::as_str));
         self.add_ostree_pins_for_keys(xs.iter().map(String::as_str));
@@ -1465,7 +1416,7 @@ impl Recipe {
                 .is_some_and(|pins| pins.iter().any(|pin| pin.key == *source && pin.foreign()))
     }
 
-    /// The build system as its JSON/lowering token ("gnu"/"rust"/"cmake"/"stage0").
+    /// The build system as its JSON/lowering token ("gnu"/"rust"/"cmake"/"mesboot").
     pub fn build_system_name(&self) -> &'static str {
         self.build_system.as_str()
     }
@@ -1690,7 +1641,7 @@ mod tests {
     fn the_containment_edge_attaches_no_source_pin() {
         // A REAL pin key: with a made-up one nothing attaches on any channel and
         // the test cannot tell a channel that attaches from one that does not.
-        const REAL: &str = "stage0-source";
+        const REAL: &str = "zlib-x86-64-source";
         assert!(crate::source_pins::by_key(REAL).is_some(), "fixture guard");
         let data = Recipe::gnu("image", "1").payload_inputs(&[REAL]);
         assert!(
@@ -1713,11 +1664,11 @@ mod tests {
 
     #[test]
     fn source_pins_are_recipe_metadata_not_build_json() {
-        let r = Recipe::gnu("stage0", "1.9.1").source_input("stage0-source");
+        let r = Recipe::gnu("zlib", "1.3.1").source_input("zlib-x86-64-source");
         assert_eq!(r.source_pins.as_ref().unwrap().len(), 1);
         assert_eq!(
             r.to_json().to_canonical(),
-            r#"{"buildSystem":"gnu","name":"stage0","sourceInput":"stage0-source","version":"1.9.1"}"#
+            r#"{"buildSystem":"gnu","name":"zlib","sourceInput":"zlib-x86-64-source","version":"1.3.1"}"#
         );
     }
 
@@ -1756,7 +1707,7 @@ mod tests {
         );
 
         let other = Recipe::mesboot("other", "1")
-            .source_input("stage0-source")
+            .source_input("zlib-x86-64-source")
             .inputs(&["ripgrep-seed-source"]);
         assert!(
             other.is_foreign(),
@@ -1893,21 +1844,6 @@ mod tests {
             );
             assert!(recipe.is_foreign());
         }
-    }
-
-    // The wire contract builder::build::run_mesboot dispatches on ("mesBoot"
-    // + the three expandable fields) — a drift here strands the step.
-    #[test]
-    fn mes_boot_step_emits_the_engine_dispatch_shape() {
-        let s = Step::MesBoot {
-            source: "{in:mes-source}".into(),
-            nyacc: "{in:nyacc}".into(),
-            stage0: "{in:stage0}".into(),
-        };
-        assert_eq!(
-            s.to_json().to_canonical(),
-            r#"{"mesBoot":{"nyacc":"{in:nyacc}","source":"{in:mes-source}","stage0":"{in:stage0}"}}"#
-        );
     }
 
     #[test]

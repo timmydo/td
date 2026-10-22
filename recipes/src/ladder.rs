@@ -1,18 +1,15 @@
-//! Shared step builders for the bootstrap-ladder rungs (#378 slices 2+3).
-//!
-//! Every rung recipe (recipes/src/recipes/{mes,tcc,…}.rs) composes its typed
-//! `Step` list from these helpers. Conventions:
-//! - `BASH` is the td-built bootstrap shell (`bash-mesboot`, bash 2.05b built
-//!   entirely from source — no host tools). Every rung that needs a POSIX shell
-//!   declares it as a typed RecipeOutput edge, never the leaked host bash.
-//! - `MESBOOT0_TOOLS` are the td-built tcc-era userland (coreutils/sed/grep/
-//!   gawk/diffutils `-mesboot0` providers) EVERY rung declares as lock inputs;
-//!   `mesboot0_path()` / `mesboot0_inputs()` lay them onto a rung's PATH and
-//!   input list ({tools} farm first, then the td shell, then the providers).
+//! Shared step builders and contract constants for td's recipes (#378
+//! slices 2+3). The module's name is historical: it first held the stage0
+//! bootstrap ladder's rung helpers. Conventions:
+//! - A C recipe builds in the Debian build root (`Recipe::build_root`) with
+//!   its bash and tools (`BUILD_ROOT_SH`, `BUILD_ROOT_PATH`) and compiles
+//!   through `build_root_*_cc` against td glibc.
+//! - A recipe past the Rust toolchain that needs no C compiler may run under
+//!   td-sh with the post-Rust tool farm (`post_rust_tool_farm`).
 //! - Unpacking is ENGINE-NATIVE (`Step::Unpack` — td's own std-only
-//!   tar/gzip/bzip2/xz readers), so no rung declares an unpacker package.
+//!   tar/gzip/bzip2/xz readers), so no recipe declares an unpacker package.
 
-use crate::types::{Recipe, Step, TextEdit};
+use crate::types::{Recipe, Step};
 
 pub use crate::td_boot_protocol::{EFI_BOOT_FILE, EFI_INITRD_PATH};
 pub fn efi_default_cmdline() -> String {
@@ -77,116 +74,6 @@ pub const TD_APPLICATION_CONFIG_TEXT: &str = concat!(
     "cgroup-root=/sys/fs/cgroup/td-user-1000\n",
 );
 
-/// The td-built bootstrap shell (catalog stem). `bash-mesboot` is bash 2.05b
-/// built from source with no host tools (baked Makefiles + engine-native
-/// patches + `oyacc`), so every rung declares it as a RecipeOutput edge.
-pub const BASH: &str = "bash-mesboot";
-
-/// The td-built tcc-era userland (catalog stems) EVERY rung declares as its
-/// scripting toolset. Each is the `-mesboot0` provider recipe built from source
-/// under tcc + mes libc — coreutils/sed/grep/gawk/diffutils as
-/// `AuditedSeed`/`RecipeOutput` edges, never bare host names.
-///
-/// GNU findutils is deliberately absent as an evidenced DEAD axis for this
-/// bootstrap toolset. A later build may expose `find`/`xargs` only through a
-/// ToolFarm link to a declared multicall that serves them (td-util); the
-/// `no_bootstrap_step_invokes_host_find_or_xargs` guard below enforces that
-/// provenance instead of permitting an ambient PATH lookup.
-pub const MESBOOT0_TOOLS: &[&str] = &[
-    "coreutils-mesboot0",
-    "sed-mesboot0",
-    "grep-mesboot0",
-    "gawk-mesboot0",
-    "diffutils-mesboot0",
-];
-
-/// The rung PATH template: the `{tools}` farm first, then the td shell, then the
-/// td-built `MESBOOT0_TOOLS` packages. Every Run step that needs the scripting
-/// userland uses this.
-pub fn mesboot0_path() -> String {
-    let mut p = String::from("{tools}");
-    p.push_str(&format!(":{{in:{BASH}}}/bin"));
-    for t in MESBOOT0_TOOLS {
-        p.push_str(&format!(":{{in:{t}}}/bin"));
-    }
-    p
-}
-
-/// A rung's full lock-input list: the rung-specific `extras` FIRST, then the td
-/// shell `BASH`, then the td-built `MESBOOT0_TOOLS` — in lockstep with the order
-/// `mesboot0_path()` lays down, so a rung's inputs cannot drift out of step with
-/// the PATH nodes and red only at execution deep in the chain. Pair with
-/// `Recipe::inputs_owned`.
-pub fn mesboot0_inputs(extras: &[&str]) -> Vec<String> {
-    extras
-        .iter()
-        .copied()
-        .chain(std::iter::once(BASH))
-        .chain(MESBOOT0_TOOLS.iter().copied())
-        .map(|s| s.to_string())
-        .collect()
-}
-
-/// The tool-farm step that symlinks a prior binutils rung's executables into
-/// `{tools}` (as/ld/ar/ranlib/nm/strip/…). These names are explicit because a
-/// command glob may not enumerate a staged input (APPLICATIONS.md section B.8).
-#[derive(Clone, Copy)]
-pub enum BinutilsRung {
-    Mesboot0,
-    Mesboot1,
-    Mesboot,
-    V244,
-}
-
-impl BinutilsRung {
-    fn catalog_stem(self) -> &'static str {
-        match self {
-            BinutilsRung::Mesboot0 => "binutils-mesboot0",
-            BinutilsRung::Mesboot1 => "binutils-mesboot1",
-            BinutilsRung::Mesboot => "binutils-mesboot",
-            BinutilsRung::V244 => "binutils-244",
-        }
-    }
-}
-
-pub fn link_bins(rung: BinutilsRung) -> Step {
-    let mut names = vec![
-        "addr2line",
-        "ar",
-        "as",
-        "c++filt",
-        "gprof",
-        "ld",
-        "nm",
-        "objcopy",
-        "objdump",
-        "ranlib",
-        "readelf",
-        "size",
-        "strings",
-        "strip",
-    ];
-    if matches!(rung, BinutilsRung::V244) {
-        names.extend(["elfedit", "ld.bfd"]);
-    }
-    let binutils_rung = rung.catalog_stem();
-    Step::ToolFarm {
-        links: names
-            .into_iter()
-            .map(|name| {
-                (
-                    name.to_string(),
-                    format!("{{in:{binutils_rung}}}/bin/{name}"),
-                )
-            })
-            .collect(),
-    }
-}
-
-/// The declared shell (the sandbox has no /bin/sh): the td-built `bash-mesboot`
-/// output, not a host bash.
-pub const SH: &str = "{in:bash-mesboot}/bin/bash";
-
 /// td-link, the linker of every td Rust output (`td-link/DESIGN.md`).
 pub const TD_LINK: &str = "{in:td-link}/bin/td-link";
 
@@ -249,14 +136,8 @@ pub fn split_target_debug(root: &str) -> Step {
     Step::split_debug_tree(root, "/usr/bin/objcopy")
 }
 
-/// `split_target_debug` for the ladder's own recipes, which build outside
-/// the root with the source-built binutils.
-pub fn ladder_split_debug(root: &str) -> Step {
-    Step::split_debug_tree(root, "{in:binutils-x86-64-self}/bin/objcopy")
-}
-
 /// A build-root C recipe that uses `build_root_static_cc`: td glibc and
-/// gcc-runtime declared, no ladder toolchain or post-Rust tool farm, and
+/// gcc-runtime declared, no post-Rust tool farm, and
 /// the target profile after the package's flags.
 #[cfg(test)]
 pub(crate) fn assert_build_root_static_c(recipe: &Recipe) {
@@ -290,7 +171,7 @@ fn assert_build_root_c(recipe: &Recipe, runtime: &[&str]) {
     for required in ["glibc-x86-64", "gcc-runtime"] {
         assert!(inputs.iter().any(|input| input == required), "{required}");
     }
-    assert_no_ladder_tools(recipe, &[]);
+    assert_no_tool_farm(recipe, &[]);
     let wrapper = recipe
         .steps
         .clone()
@@ -318,19 +199,17 @@ fn assert_build_root_c(recipe: &Recipe, runtime: &[&str]) {
     }
 }
 
-/// Neither input channel names a ladder toolchain or a post-Rust farm
-/// provider other than one of `subjects`, and no step builds the farm.
+/// Neither input channel names a post-Rust farm provider other than one of
+/// `subjects`, and no step builds the farm: a build-root recipe takes its
+/// tools from the root.
 #[cfg(test)]
-pub(crate) fn assert_no_ladder_tools(recipe: &Recipe, subjects: &[&str]) {
+pub(crate) fn assert_no_tool_farm(recipe: &Recipe, subjects: &[&str]) {
     let inputs: Vec<&String> = recipe
         .native_inputs
         .iter()
         .chain(recipe.inputs.iter())
         .flatten()
         .collect();
-    for input in &inputs {
-        assert!(!is_ladder_recipe(input), "{} uses {input}", recipe.name);
-    }
     for farm in POST_RUST_TOOLS
         .iter()
         .map(|(input, _, _)| *input)
@@ -350,29 +229,8 @@ pub(crate) fn assert_no_ladder_tools(recipe: &Recipe, subjects: &[&str]) {
     );
 }
 
-/// A ladder recipe by name: the stage0/Mes/TinyCC seeds and oyacc, the
-/// mesboot rungs, the GCC/binutils/make/gawk ladder with its stages and
-/// bridges, and the ladder's glibc-241. gcc-runtime and its stage1 build
-/// in the Debian build root.
-#[cfg(test)]
-fn is_ladder_recipe(name: &str) -> bool {
-    const SEEDS: &[&str] = &["stage0", "mes", "tcc", "oyacc", "glibc-241", "ripgrep-seed"];
-    const FAMILIES: &[&str] = &["binutils-", "make-", "gawk-", "gcc-"];
-    if name == "gcc-runtime" || name.starts_with("gcc-runtime-") {
-        return false;
-    }
-    SEEDS.contains(&name)
-        || name.contains("mesboot")
-        || name.contains("-stage")
-        || name.contains("bridge")
-        || name.ends_with("-self")
-        || name.ends_with("-native")
-        || FAMILIES.iter().any(|family| name.starts_with(family))
-}
-
 /// A test recipe that runs in the Debian build root, declaring exactly
-/// `inputs`: no ladder tool or farm (a farm provider may be the test's
-/// subject), and every run step starts the root's bash, a root tool, a
+/// `inputs`: no tool farm (a farm provider may be the test's subject), and every run step starts the root's bash, a root tool, a
 /// declared input or a file of its own build, with one PATH of declared
 /// inputs' directories and the root's /usr/bin, never a subject's.
 #[cfg(test)]
@@ -396,7 +254,7 @@ pub(crate) fn assert_build_root_test(recipe: &Recipe, inputs: &[&str], subjects:
         "{}",
         recipe.name
     );
-    assert_no_ladder_tools(recipe, subjects);
+    assert_no_tool_farm(recipe, subjects);
     let input_of = |text: &str| {
         text.strip_prefix("{in:")
             .and_then(|rest| rest.split_once('}'))
@@ -763,66 +621,22 @@ fn debug_line_validation_command(producer: &str, source: &str, source_root: &str
     format!("{producer} | awk -v source='{source}' -v root='{source_root}' '{DEBUG_LINE_AWK}'")
 }
 
-/// Where a debug-line validation runs: under td-sh with the post-Rust farm's
-/// awk, or in the Debian build root under its bash and awk.
-#[derive(Clone, Copy)]
-enum AwkHost {
-    PostRust,
-    BuildRoot,
-}
-
-impl AwkHost {
-    fn run(self, command: &str) -> Step {
-        match self {
-            AwkHost::PostRust => {
-                Step::run("{root}", &[POST_RUST_SH, "-c", command]).env("PATH", "{tools}")
-            }
-            AwkHost::BuildRoot => {
-                Step::run("{root}", &[BUILD_ROOT_SH, "-c", command]).env("PATH", BUILD_ROOT_PATH)
-            }
-        }
-    }
+/// A step running COMMAND in the Debian build root under its bash and tools.
+fn build_root_run(command: &str) -> Step {
+    Step::run("{root}", &[BUILD_ROOT_SH, "-c", command]).env("PATH", BUILD_ROOT_PATH)
 }
 
 /// Validate one retained DWARF-5 source file against the line-table-only
-/// companion policy. Every directory and file entry resolves below a declared
-/// stable root; the named source must resolve below `source_root`. It runs
-/// under td-sh with the post-Rust farm's awk, so the recipe builds that farm
-/// with one (`post_rust_tool_farm(Some(..))`).
-pub fn debug_line_source_root_check(
-    readelf: &str,
-    debug: &str,
-    source: &str,
-    source_root: &str,
-) -> Step {
-    debug_line_check(AwkHost::PostRust, readelf, debug, source, source_root)
-}
-
-/// `debug_line_source_root_check` for a build-root recipe: the root's
-/// readelf, awk and bash.
+/// companion policy, with the build root's readelf, awk and bash. Every
+/// directory and file entry resolves below a declared stable root; the
+/// named source must resolve below `source_root`.
 pub fn build_root_debug_line_source_root_check(
     debug: &str,
     source: &str,
     source_root: &str,
 ) -> Step {
-    debug_line_check(
-        AwkHost::BuildRoot,
-        "/usr/bin/readelf",
-        debug,
-        source,
-        source_root,
-    )
-}
-
-fn debug_line_check(
-    host: AwkHost,
-    readelf: &str,
-    debug: &str,
-    source: &str,
-    source_root: &str,
-) -> Step {
-    let producer = format!("'{readelf}' --debug-dump=rawline '{debug}' 2>/dev/null");
-    host.run(&debug_line_validation_command(
+    let producer = format!("'/usr/bin/readelf' --debug-dump=rawline '{debug}' 2>/dev/null");
+    build_root_run(&debug_line_validation_command(
         &producer,
         source,
         source_root,
@@ -831,18 +645,8 @@ fn debug_line_check(
 
 /// Execute the shared parser against hostile captured-table shapes. This is a
 /// recipe step so the oracle uses the same declared awk as production: the
-/// post-Rust farm's, under td-sh.
-pub fn debug_line_validator_regression_steps() -> Vec<Step> {
-    debug_line_regression(AwkHost::PostRust)
-}
-
-/// `debug_line_validator_regression_steps` under the build root's awk, the
-/// one `build_root_debug_line_source_root_check` runs.
+/// build root's, the one `build_root_debug_line_source_root_check` runs.
 pub fn build_root_debug_line_validator_regression_steps() -> Vec<Step> {
-    debug_line_regression(AwkHost::BuildRoot)
-}
-
-fn debug_line_regression(host: AwkHost) -> Vec<Step> {
     const GOOD: &str = r#"  Offset: 0
   DWARF Version: 5
  The Directory Table
@@ -985,7 +789,7 @@ fn debug_line_regression(host: AwkHost) -> Vec<Step> {
             content: DEBUG_LINE_AWK.into(),
             exec: false,
         },
-        host.run(&command),
+        build_root_run(&command),
     ]
 }
 
@@ -993,13 +797,9 @@ fn debug_line_regression(host: AwkHost) -> Vec<Step> {
 /// toolchain, so no recipe that uses it can be on its own input path.
 pub const POST_RUST_SH: &str = "{in:td-sh}/bin/td-sh";
 
-/// The post-Rust build userland: the tool names gawk's build and every
-/// post-Rust farm call, each with exactly one td provider. td-txt, td-util
-/// and uutils dispatch on argv[0]. Not served: egrep and fgrep, which
-/// autoconf's probes replace with `grep -E` and `grep -F`, and tar, which no
-/// farm build needs (configure's tar probe falls back to none, which only
-/// `make dist` reads). `awk` is per recipe
-/// (`post_rust_tool_farm`): the awk that builds gawk cannot be gawk.
+/// The post-Rust build userland: the tool names every post-Rust farm call
+/// needs, each with exactly one td provider. td-txt, td-util and uutils
+/// dispatch on argv[0]. No awk: no td build runs one.
 const POST_RUST_TOOLS: &[(&str, &str, &[&str])] = &[
     ("td-sh", "{in:td-sh}/bin/td-sh", &["sh"]),
     ("td-txt", "{in:td-txt}/bin/td-txt", &["grep", "sed"]),
@@ -1022,12 +822,10 @@ const POST_RUST_TOOLS: &[(&str, &str, &[&str])] = &[
     ),
 ];
 
-/// The `{tools}` farm for a post-Rust build: `POST_RUST_TOOLS`, plus `awk`
-/// from `awk` (an `{in:...}` executable) for the ladder's own builds, which
-/// run it; td's never do. Put `{tools}` on PATH ahead of the recipe's
-/// toolchain directories.
-pub fn post_rust_tool_farm(awk: Option<&str>) -> Step {
-    let mut links: Vec<(String, String)> = POST_RUST_TOOLS
+/// The `{tools}` farm for a post-Rust build: `POST_RUST_TOOLS`. Put
+/// `{tools}` on PATH ahead of the recipe's toolchain directories.
+pub fn post_rust_tool_farm() -> Step {
+    let links: Vec<(String, String)> = POST_RUST_TOOLS
         .iter()
         .flat_map(|(_, target, names)| {
             names
@@ -1035,20 +833,16 @@ pub fn post_rust_tool_farm(awk: Option<&str>) -> Step {
                 .map(move |name| ((*name).to_string(), (*target).to_string()))
         })
         .collect();
-    if let Some(awk) = awk {
-        links.push(("awk".into(), awk.into()));
-    }
     Step::ToolFarm { links }
 }
 
 /// The inputs `post_rust_tool_farm` links to, in lockstep with it: the
-/// providers, then `awk_input` if any, then the recipe's own `extras`. Pair
-/// with `Recipe::native_inputs`.
-pub fn post_rust_inputs<'a>(awk_input: Option<&'a str>, extras: &[&'a str]) -> Vec<&'a str> {
+/// providers, then the recipe's own `extras`. Pair with
+/// `Recipe::native_inputs`.
+pub fn post_rust_inputs<'a>(extras: &[&'a str]) -> Vec<&'a str> {
     POST_RUST_TOOLS
         .iter()
         .map(|(input, _, _)| *input)
-        .chain(awk_input)
         .chain(extras.iter().copied())
         .collect()
 }
@@ -2036,7 +1830,7 @@ pub const KEXEC_STAGE2_MARKER: &str = "TD-KEXEC-BOOT2";
 /// not bytes — covering both markers the boot oracles assert on.
 ///
 /// `td_util` is the absolute path to the td-util multicall; `grep`/`od`/`wc` come
-/// from the mesboot0 userland, so callers keep `PATH = mesboot0_path()`.
+/// from the caller's PATH.
 pub fn initramfs_cpio_shape_check(initramfs: &str, td_util: &str) -> String {
     let marker = USERLAND_MARKER;
     let erofs_marker = EROFS_MARKER;
@@ -2074,51 +1868,6 @@ pub fn unpack_keep_top(input: &str, dest: &str) -> Vec<Step> {
     }]
 }
 
-/// Apply a patch input with the td-built patch rung: `patch --force -p1 -i X`
-/// in {src}, env-cleared (exactly the ladder's `env -i patch …`).
-pub fn apply_patch(patch_rung: &str, patch_input: &str) -> Step {
-    Step::run(
-        "{src}",
-        &[
-            &format!("{{in:{patch_rung}}}/bin/patch"),
-            "--force",
-            "-p1",
-            "-i",
-            &format!("{{in:{patch_input}}}"),
-        ],
-    )
-}
-
-/// Default binutils 2.20.1a's `ar` and `ranlib` to their `D` mode, as
-/// `--enable-deterministic-archives` does from 2.23: otherwise each archive
-/// member and symbol map records the build's wall clock, and no ladder archive
-/// reproduces the pinned root. `u` is dropped rather than fatal under `D`, as
-/// upstream does, since automake's `ar cru` would otherwise abort. `ar -M`
-/// scripts bypass the flag and stay nondeterministic; no rung uses them.
-pub fn deterministic_ar() -> Step {
-    Step::substitute_text(
-        "{src}/binutils/ar.c",
-        vec![
-            TextEdit::new("int deterministic = 0;", "int deterministic = 1;", 1),
-            TextEdit::new(
-                "\tfatal (_(\"`u' is not meaningful with the `D' option.\"));",
-                "\tnewer_only = 0;",
-                1,
-            ),
-        ],
-    )
-}
-
-/// `sed -i EXPR FILE…` via the td-built `sed-mesboot0` on `mesboot0_path()` (dir
-/// {src} unless absolute). `sed -i` writes a temp file and renames, so it never
-/// touches stdin or a non-syncable fd — the mes-libc bugs sed-mesboot0 patches
-/// don't apply here.
-pub fn sed_i(expr: &str, files: &[&str]) -> Step {
-    let mut argv: Vec<&str> = vec!["{in:sed-mesboot0}/bin/sed", "-i", expr];
-    argv.extend_from_slice(files);
-    Step::run("{src}", &argv).env("PATH", &mesboot0_path())
-}
-
 /// Relocate every staged glibc GNU ld script under `lib/*.so` to bare member
 /// names by stripping the configured store prefix. Real ELF shared objects are
 /// left untouched.
@@ -2127,213 +1876,6 @@ pub fn relocate_ld_scripts(stage: &str, store_prefix: &str) -> Step {
         dir: format!("{stage}/lib"),
         prefix: store_prefix.into(),
     }
-}
-
-/// Make libtool assemble a static library (e.g. libstdc++.a) from its
-/// convenience archives WITHOUT `find` (re #469, #477's retired-axis guard).
-///
-/// `ltmain.sh`'s `func_extract_archives` merges each per-language convenience
-/// archive (libc++11convenience.a &c.) into the final `.a` by `cd`-ing into a
-/// scratch dir, `ar x`-ing the members flat into it, then enumerating them with
-/// `find $my_xdir -name \*.o -print`. The mesboot userland ships no `find`
-/// (retired in #477), so that enumeration returns nothing, `ar rc` appends
-/// nothing, and the archive silently ends up with only its directly-compiled
-/// objects — a partial libstdc++.a missing std::string/std::vector/iostream.
-/// GCC's own C++ generators (gensupport, genattrtab under GCC 14) then fail to
-/// link against it.
-///
-/// `ar x` extracts object members flat, one level deep (libtool's own `ar t`
-/// pass aborts on duplicate member names within an archive), so a *terminal*
-/// glob over `$my_xdir` captures exactly what the recursive `find` would — and
-/// unlike a non-terminal glob it expands correctly under bash-mesboot (bash
-/// 2.05b on mes libc). `test -f` drops the no-match literal; `printf '%s\n'`
-/// prints one path per line, exactly like `find … -print`.
-///
-/// We replace only the `find` COMMAND, leaving libtool's surrounding backticks
-/// and its `| [sort |] $NL2SP` post-pipe intact: that command is byte-identical
-/// across the two libtool versions td builds (GCC 4.9.4 pipes `find … | $NL2SP`;
-/// GCC 14.3.0 pipes `find … | sort | $NL2SP` for a deterministic archive), so
-/// one edit serves both and 14.3.0 keeps its sort. The `count: 1` fail-closes if
-/// a future source bump drifts the line. This ELIMINATES the find need rather
-/// than satisfying it with a host/find provider.
-pub fn libtool_extract_without_find(ltmain: &str) -> Step {
-    Step::substitute_text(
-        ltmain,
-        vec![TextEdit::new(
-            "find $my_xdir -name \\*.$objext -print -o -name \\*.lo -print",
-            "for f in $my_xdir/*.$objext $my_xdir/*.lo; do test -f \"$f\" && printf '%s\\n' \"$f\"; done",
-            1,
-        )],
-    )
-}
-
-/// Make GCC 14's libstdc++ stamp rules independent of the absent `date` tool.
-///
-/// The stamp contents are never read; make uses only each file's existence and
-/// mtime. A shell-builtin no-op plus redirection therefore preserves the rule's
-/// semantics without adding another bootstrap-userland executable. Patch both
-/// the ordinary convenience archive and the optional debug-tree stamp so every
-/// C++-enabled GCC 14 rung has the same host-free source shape.
-pub fn gcc14_libstdcxx_stamp_fixups() -> Step {
-    Step::substitute_text(
-        "{src}/libstdc++-v3/src/Makefile.in",
-        vec![
-            TextEdit::new(
-                "\tdate > stamp-libstdc++convenience;",
-                "\t: > stamp-libstdc++convenience;",
-                1,
-            ),
-            TextEdit::new("\tdate > stamp-debug;", "\t: > stamp-debug;", 1),
-        ],
-    )
-}
-
-/// Select GCC's cp-based include-tree installer when bootstrap `tar` is absent.
-///
-/// Modern GCC configure otherwise chooses `install-headers-tar` for the native
-/// i686/x86_64 hosts used by this ladder. The source ships an equivalent
-/// `install-headers-cp` target, backed by the already-declared mesboot coreutils.
-pub fn gcc_install_headers_without_tar() -> Step {
-    Step::substitute_text(
-        "{src}/gcc/Makefile.in",
-        vec![TextEdit::new(
-            "INSTALL_HEADERS_DIR = @build_install_headers_dir@",
-            "INSTALL_HEADERS_DIR = install-headers-cp",
-            1,
-        )],
-    )
-}
-
-/// The bash-mesboot `configure` fixups every modern GCC rung needs before its
-/// `configure` runs (re #469). bash 2.05b (mes libc) cannot expand the
-/// non-terminal `*/config-lang.in` globs configure uses to discover language
-/// front-ends, and its automake dependency-style probe runs each depmode as
-/// `env $depcmd` but the mesboot userland ships no `env` (so every depmode exits
-/// 127 and the probe aborts with "no usable dependency style found"). `LANGS`
-/// is the exact, sorted set of language fragments shipped by the selected GCC
-/// tarball. Pre-expand both globs to that set (a working shell's expansion
-/// verbatim) and rewrite the probe to the POSIX builtin `eval "$depcmd"`.
-/// `--enable-languages` still selects only what each rung asks for. The edit
-/// counts fail-closed if a future source bump drifts.
-pub fn gcc_configure_fixups(langs: &[&str]) -> Vec<Step> {
-    let top = langs
-        .iter()
-        .map(|l| format!("${{srcdir}}/gcc/{l}/config-lang.in"))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let gcc = langs
-        .iter()
-        .map(|l| format!("${{srcdir}}/{l}/config-lang.in"))
-        .collect::<Vec<_>>()
-        .join(" ");
-    vec![
-        Step::substitute_text(
-            "{src}/configure",
-            vec![TextEdit::new("${srcdir}/gcc/*/config-lang.in", &top, 2)],
-        ),
-        Step::substitute_text(
-            "{src}/gcc/configure",
-            vec![TextEdit::new("${srcdir}/*/config-lang.in", &gcc, 2)],
-        ),
-        Step::substitute_text(
-            "{src}/gcc/configure",
-            vec![TextEdit::new("env $depcmd", "eval \"$depcmd\"", 1)],
-        ),
-        Step::substitute_text(
-            "{src}/libcpp/configure",
-            vec![TextEdit::new("env $depcmd", "eval \"$depcmd\"", 1)],
-        ),
-    ]
-}
-
-/// GCC 14.3.0 ships twelve language fragments. Every GCC 14 rung uses the same
-/// release tarball, so this wrapper keeps their call sites declarative while the
-/// shared implementation also serves the GCC 10.5.0 bridge.
-pub fn gcc14_configure_fixups() -> Vec<Step> {
-    gcc_configure_fixups(&[
-        "ada", "c", "cp", "d", "fortran", "go", "jit", "lto", "m2", "objc", "objcp", "rust",
-    ])
-}
-
-/// Disable GCC's build-host signal-name self-test. The bootstrap libc's
-/// `sys_siglist` is deliberately a stub, so executing this development-only
-/// diagnostic crashes even when the compiler itself is sound. Installed
-/// compiler behavior is covered by rung-specific checks and downstream builds.
-pub fn gcc_disable_selftest() -> Step {
-    Step::substitute_text(
-        "{src}/gcc/Makefile.in",
-        vec![TextEdit::new(
-            "all.internal: start.encap rest.encap doc selftest",
-            "all.internal: start.encap rest.encap doc",
-            1,
-        )],
-    )
-}
-
-/// Make glibc 2.41's architecture selection and syscall generation work with
-/// the mesboot shell/userland. Its configure asks bash-mesboot to expand the
-/// non-terminal `sysdeps/*/preconfigure` glob; that shell leaves it literal, so
-/// x86_64 never becomes x86_64/64 and the matching arch-syscall.h is omitted.
-/// Pre-expand the exact sorted fragment set shipped by the pinned release.
-///
-/// make-syscalls.sh also uses GNU grep's newer `-o` option to enumerate the
-/// byte offsets of `U` argument markers, while the declared grep-mesboot0 2.4
-/// predates that option. The awk loop emits the identical zero-based `N:U`
-/// records from the same colon-prefixed signature using the already-declared
-/// gawk provider. Finally, elf/Makefile repeats the non-terminal
-/// `build/*/stamp.os` glob while generating librtld.mk; GNU make's wildcard
-/// function supplies the same existing-file set without relying on the shell.
-pub fn glibc241_host_free_fixups() -> Vec<Step> {
-    let preconfigure = [
-        "aarch64",
-        "alpha",
-        "arc",
-        "arm",
-        "csky",
-        "hppa",
-        "i386",
-        "loongarch",
-        "m68k",
-        "microblaze",
-        "mips",
-        "or1k",
-        "powerpc",
-        "riscv",
-        "s390",
-        "sh",
-        "sparc",
-        "x86_64",
-    ]
-    .iter()
-    .map(|arch| format!("${{srcdir}}/sysdeps/{arch}/preconfigure"))
-    .collect::<Vec<_>>()
-    .join(" ");
-    vec![
-        Step::substitute_text(
-            "{src}/configure",
-            vec![TextEdit::new(
-                "$srcdir/sysdeps/*/preconfigure",
-                &preconfigure,
-                1,
-            )],
-        ),
-        Step::substitute_text(
-            "{src}/sysdeps/unix/make-syscalls.sh",
-            vec![TextEdit::new(
-                "grep -ob U",
-                r#"awk '{ for (i = 1; i <= length($0); ++i) if (substr($0, i, 1) == "U") print i - 1 ":U" }'"#,
-                1,
-            )],
-        ),
-        Step::substitute_text(
-            "{src}/elf/Makefile",
-            vec![TextEdit::new(
-                "$(common-objpfx)*/stamp.os",
-                "$(wildcard $(common-objpfx)*/stamp.os)",
-                1,
-            )],
-        ),
-    ]
 }
 
 #[cfg(test)]
@@ -2465,54 +2007,6 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
-    fn line_only_source_check_uses_the_shared_dwarf5_parser() {
-        let step = super::debug_line_source_root_check(
-            "/tools/readelf",
-            "/output/lib/debug/bin/tool.debug",
-            "main.c",
-            "/td-build",
-        );
-        let Step::Run { argv, env, .. } = step else {
-            panic!("line-table check is not executable");
-        };
-        assert_eq!(argv.first().map(String::as_str), Some(super::POST_RUST_SH));
-        assert!(env.iter().any(|(k, v)| k == "PATH" && v == "{tools}"));
-        let command = argv.get(2).expect("line-table check command");
-        for required in [
-            "--debug-dump=rawline",
-            "-v source='main.c'",
-            "-v root='/td-build'",
-            "unsupported DWARF version",
-        ] {
-            assert!(command.contains(required), "line check omits {required}");
-        }
-        assert!(!command.contains("DW_AT_comp_dir"));
-    }
-
-    #[test]
-    fn line_only_parser_regressions_wire_one_real_recipe_probe() {
-        let steps = super::debug_line_validator_regression_steps();
-        assert!(matches!(steps.first(), Some(Step::WriteFile { .. })));
-        let Some(Step::Run { argv, env, .. }) = steps.get(1) else {
-            panic!("line-table regression check is not executable");
-        };
-        assert_eq!(argv.first().map(String::as_str), Some(super::POST_RUST_SH));
-        assert!(env.iter().any(|(k, v)| k == "PATH" && v == "{tools}"));
-        let command = argv.get(2).expect("line-table regression command");
-        for required in [
-            "canonical rawline fixture was rejected",
-            "wrong-directory rawline fixture passed",
-            "traversal rawline fixture passed",
-            "spaced-path rawline fixture passed",
-            "DWARF-4 rawline fixture passed",
-            "statement-scratch rawline fixture passed",
-            "dynamic-file rawline fixture passed",
-        ] {
-            assert!(command.contains(required), "regression omits {required}");
-        }
-    }
-
-    #[test]
     fn build_root_line_checks_run_the_roots_readelf_awk_and_bash() {
         let step =
             super::build_root_debug_line_source_root_check("/out/x.debug", "main.c", "/td-build");
@@ -2534,36 +2028,16 @@ mod tests {
             .iter()
             .any(|(k, v)| k == "PATH" && v == super::BUILD_ROOT_PATH));
         let command = argv.get(2).expect("line-table regression command");
-        assert!(command.contains("traversal rawline fixture passed"));
-    }
-
-    #[test]
-    fn ladder_recipes_are_recognised_by_name() {
-        for ladder in [
-            "gawk-mesboot",
-            "bash-mesboot",
-            "gcc-x86-64-self",
-            "binutils-x86-64",
-            "make-441",
-            "gcc-x86-64-stage2",
-            "gcc-10-bridge",
-            "ripgrep-seed",
-            "tcc",
-            "stage0",
-            "oyacc",
-            "glibc-241",
+        for required in [
+            "canonical rawline fixture was rejected",
+            "wrong-directory rawline fixture passed",
+            "traversal rawline fixture passed",
+            "spaced-path rawline fixture passed",
+            "DWARF-4 rawline fixture passed",
+            "statement-scratch rawline fixture passed",
+            "dynamic-file rawline fixture passed",
         ] {
-            assert!(super::is_ladder_recipe(ladder), "{ladder}");
-        }
-        for root in [
-            "gcc-runtime",
-            "gcc-runtime-stage1",
-            "glibc-x86-64",
-            "zlib-x86-64",
-            "td-util",
-            "curl-x86-64-test",
-        ] {
-            assert!(!super::is_ladder_recipe(root), "{root}");
+            assert!(command.contains(required), "regression omits {required}");
         }
     }
 
@@ -2594,60 +2068,7 @@ mod tests {
         );
     }
 
-    const POST_BOOTSTRAP_BOUNDARY_OUTPUTS: &[&str] = &[
-        "rust-toolchain",
-        "gcc-x86-64-self",
-        "binutils-x86-64-self",
-        "glibc-x86-64",
-        // The upstream toolchain's runtime, built in the Debian build root.
-        "gcc-runtime",
-        "zlib-x86-64",
-    ];
-    // These independent target artifacts and checks deliberately run before
-    // self-hosting but are not ancestors of rust-toolchain. New recipes default
-    // to the far side of the boundary and must not grow this list silently.
-    const BOOTSTRAP_SIDE_CONSUMERS: &[&str] = &[
-        "gcc-10-bridge-test",
-        "gcc-x86-64-native-test",
-        "gcc-x86-64-stage2-test",
-        "glibc-241",
-        // glibc-241's build tools, which the ladder's glibc-x86-64 also took
-        // before it moved into the Debian build root; bootstrap-root exports
-        // until the ladder goes.
-        "bison-mesboot",
-        "glibc-mesboot-shared",
-        "m4-mesboot",
-        "make-441",
-        "python-mesboot",
-        "hello",
-        "hello-test",
-        "make-test",
-        // GNU Make built by the native GCC: the driver that builds
-        // make-x86-64-self and gawk-x86-64-self, and no longer an ancestor
-        // of any boundary output.
-        "make-x86-64",
-        "sed-mesboot",
-    ];
-    const SELF_HOSTED_PHASE_MARKERS: &[&str] =
-        &["rust-toolchain", "gcc-x86-64-self", "binutils-x86-64-self"];
-    const POST_BOOTSTRAP_PROTECTED_INPUT_EXCEPTIONS: &[(&str, &str)] = &[
-        // Identity/codegen audits deliberately look back across the boundary.
-        ("gcc-x86-64-self-test", "gcc-x86-64-native"),
-        ("gcc-x86-64-self-test", "binutils-x86-64-native"),
-        // Rebuild GNU Make once with the final compiler. The preceding Make is
-        // only the build driver; later packages consume make-x86-64-self.
-        // The frozen UAPI input is a fixed-output source governed by the seed
-        // provenance gate, not a catalog recipe this exception table can name.
-        ("make-x86-64-self", "make-x86-64"),
-        // The build-only gawk the ladder's own post-Rust builds take their
-        // awk from.
-        // Its own configure needs an awk and its build a make, and both of
-        // the post-Rust ones would be built with it, so it takes the root's
-        // gawk and the bootstrap Make, once, as make-x86-64-self does.
-        ("gawk-x86-64-self", "gawk-mesboot"),
-        ("gawk-x86-64-self", "make-x86-64"),
-    ];
-    const RECIPE_SHEBANG_INTERPRETERS: &[&str] = &[super::SH, super::POST_RUST_SH];
+    const RECIPE_SHEBANG_INTERPRETERS: &[&str] = &[super::POST_RUST_SH];
     const GUEST_LITERAL_SHEBANGS: &[(&str, &str)] = &[
         ("linux-x86-64", "{root}/initramfs/init"),
         ("kexec-spike-x86-64", "{root}/inner-init"),
@@ -2678,7 +2099,6 @@ mod tests {
         ("system-x86-64", "{root}/real-root/etc/bootsuccess"),
         ("system-x86-64", "{root}/real-root/etc/bootfail"),
     ];
-    type RunStep<'a> = (&'a [String], &'a [(String, String)], &'a str);
 
     /// True if `cmd` appears in `s` as a whole command word. Every
     /// non-alphanumeric character is a boundary EXCEPT `_`, so `/usr/bin/find`,
@@ -3145,7 +2565,7 @@ mod tests {
     /// Makefiles/kaem scripts are written `exec: false` and then run over by a
     /// Run step), ToolFarm links, and the `to` side of the literal SubstituteText
     /// edits (the host-free `patch`/`sed` stand-in). Engine-native steps that
-    /// carry only paths (Unpack/CopyTree/Symlink/PatchShebangs/…) cannot invoke a
+    /// carry only paths (Unpack/CopyTree/Symlink/…) cannot invoke a
     /// tool, so they contribute nothing. Shared by the catalog-walk guard and its
     /// coverage test so both exercise exactly the same extraction — EXCEPT a
     /// ToolFarm, which the guard now reads through `farm_invocation` instead,
@@ -3155,8 +2575,8 @@ mod tests {
     ///
     /// Only a SubstituteText's `to` is a command surface: `from` is the text being
     /// REMOVED from a source file, so a `find`/`xargs` there is being deleted, not
-    /// invoked (e.g. the gcc-mesboot ltmain.sh edit that replaces libtool's
-    /// convenience-archive `find` with a bash-mesboot glob loop). Scanning `from`
+    /// invoked (e.g. an ltmain.sh edit that replaces libtool's
+    /// convenience-archive `find` with a glob loop). Scanning `from`
     /// would misfire on exactly the patches that eliminate a host-tool call.
     fn command_texts(step: &Step) -> Vec<&str> {
         match step {
@@ -3185,40 +2605,6 @@ mod tests {
             .chain(recipe.payload_inputs.iter().flatten())
             .map(String::as_str)
             .collect()
-    }
-
-    fn collect_recipe_closure(
-        recipes: &[(&'static str, Recipe)],
-        stem: &str,
-        closure: &mut HashSet<String>,
-    ) {
-        let Some((_, recipe)) = recipes.iter().find(|(candidate, _)| *candidate == stem) else {
-            return;
-        };
-        if !closure.insert(stem.to_string()) {
-            return;
-        }
-        for input in direct_recipe_inputs(recipe) {
-            collect_recipe_closure(recipes, input, closure);
-        }
-    }
-
-    fn bootstrap_partition(
-        recipes: &[(&'static str, Recipe)],
-    ) -> (HashSet<String>, HashSet<String>) {
-        // The bootstrap is everything the boundary outputs are built from.
-        let mut bootstrap_recipes = HashSet::new();
-        for &boundary_output in POST_BOOTSTRAP_BOUNDARY_OUTPUTS {
-            collect_recipe_closure(recipes, boundary_output, &mut bootstrap_recipes);
-        }
-        let mut bootstrap_interior = bootstrap_recipes.clone();
-        for &boundary_output in POST_BOOTSTRAP_BOUNDARY_OUTPUTS {
-            assert!(
-                bootstrap_interior.remove(boundary_output),
-                "post-bootstrap boundary output is not a catalog recipe: {boundary_output}"
-            );
-        }
-        (bootstrap_recipes, bootstrap_interior)
     }
 
     fn command_glob_is_build_local(pattern: &str) -> bool {
@@ -3250,110 +2636,9 @@ mod tests {
             }
         }
         assert!(!command_glob_is_build_local("{root}/../input/*"));
-        assert!(!command_glob_is_build_local("{in:binutils-mesboot0}/bin/*"));
+        assert!(!command_glob_is_build_local("{in:td-util}/bin/*"));
         assert!(command_glob_is_build_local("{src}/objects/*.o"));
         assert!(command_glob_is_build_local("{tools}/wrappers/*"));
-    }
-
-    #[test]
-    fn bootstrap_side_consumers_remain_pre_self_hosting() {
-        let recipes = catalog::all();
-        let (bootstrap_recipes, bootstrap_interior) = bootstrap_partition(&recipes);
-        for &allowed_stem in BOOTSTRAP_SIDE_CONSUMERS {
-            let recipe = recipes
-                .iter()
-                .find(|(stem, _)| *stem == allowed_stem)
-                .map(|(_, recipe)| recipe);
-            assert!(
-                recipe.is_some(),
-                "bootstrap-side consumer must remain in the catalog: {allowed_stem}"
-            );
-            let Some(recipe) = recipe else {
-                continue;
-            };
-            assert!(
-                !bootstrap_recipes.contains(allowed_stem),
-                "bootstrap-side consumer moved into the rust-toolchain closure: {allowed_stem}"
-            );
-            assert!(
-                direct_recipe_inputs(recipe)
-                    .iter()
-                    .any(|input| bootstrap_interior.contains(*input)),
-                "bootstrap-side consumer no longer uses a bootstrap input: {allowed_stem}"
-            );
-            let mut closure = HashSet::new();
-            collect_recipe_closure(&recipes, allowed_stem, &mut closure);
-            assert!(
-                !SELF_HOSTED_PHASE_MARKERS
-                    .iter()
-                    .any(|marker| closure.contains(*marker)),
-                "bootstrap-side consumer crossed the self-hosted boundary: {allowed_stem}"
-            );
-        }
-    }
-
-    fn post_bootstrap_back_edges(recipes: &[(&'static str, Recipe)]) -> Vec<(String, String)> {
-        let (bootstrap_recipes, bootstrap_interior) = bootstrap_partition(recipes);
-        let mut protected_inputs = bootstrap_interior;
-        protected_inputs.extend(BOOTSTRAP_SIDE_CONSUMERS.iter().map(|stem| stem.to_string()));
-        let mut back_edges = Vec::new();
-        for (stem, recipe) in recipes {
-            if bootstrap_recipes.contains(*stem) || BOOTSTRAP_SIDE_CONSUMERS.contains(stem) {
-                continue;
-            }
-            for input in direct_recipe_inputs(recipe) {
-                let boundary_probe = POST_BOOTSTRAP_PROTECTED_INPUT_EXCEPTIONS.iter().any(
-                    |(allowed_stem, allowed_input)| stem == allowed_stem && input == *allowed_input,
-                );
-                if protected_inputs.contains(input) && !boundary_probe {
-                    back_edges.push((stem.to_string(), input.to_string()));
-                }
-            }
-        }
-        back_edges.sort();
-        back_edges
-    }
-
-    /// Only the Rust-toolchain closure and explicitly reviewed bootstrap-side
-    /// consumers may declare an internal tool rung. Every other catalog recipe
-    /// defaults to the far side of the boundary. The exact exceptions are
-    /// separately reviewed audit, transition, or kernel-toolchain edges.
-    #[test]
-    fn post_bootstrap_recipes_use_only_reviewed_boundary_inputs() {
-        let back_edges = post_bootstrap_back_edges(&catalog::all());
-        assert!(
-            back_edges.is_empty(),
-            "post-bootstrap recipes directly use protected bootstrap inputs: {back_edges:?}"
-        );
-    }
-
-    #[test]
-    fn post_bootstrap_boundary_guard_rejects_a_new_back_edge() {
-        let mut recipes = catalog::all();
-        recipes.push((
-            "synthetic-post-bootstrap",
-            Recipe::mesboot("synthetic-post-bootstrap", "0")
-                .native_inputs(&["glibc-x86-64"])
-                .inputs_owned(vec!["bash-mesboot".into(), "binutils-x86-64-native".into()]),
-        ));
-        let mut synthetic_closure = HashSet::new();
-        collect_recipe_closure(&recipes, "synthetic-post-bootstrap", &mut synthetic_closure);
-        for &marker in SELF_HOSTED_PHASE_MARKERS {
-            assert!(
-                !synthetic_closure.contains(marker),
-                "the negative control must prove the marker-free boundary"
-            );
-        }
-        assert_eq!(
-            post_bootstrap_back_edges(&recipes),
-            vec![
-                ("synthetic-post-bootstrap".into(), "bash-mesboot".into()),
-                (
-                    "synthetic-post-bootstrap".into(),
-                    "binutils-x86-64-native".into(),
-                ),
-            ]
-        );
     }
 
     #[test]
@@ -3489,118 +2774,12 @@ mod tests {
         }
     }
 
-    fn self_hosted_audit_value(value: &str) -> String {
-        value
-            .replace("{in:gcc-x86-64-native}", "{in:gcc-x86-64-self}")
-            .replace("-x86_64-native", "-x86_64-self")
-            .replace("{in:binutils-x86-64-native}", "{in:binutils-x86-64-self}")
-            .replace("native-c.s", "self-c.s")
-            .replace("native-cxx.s", "self-cxx.s")
-    }
-
-    #[test]
-    fn gcc_native_boundary_exception_is_same_codegen_only() {
-        let recipes = catalog::all();
-        let recipe = recipes
-            .iter()
-            .find(|(stem, _)| *stem == "gcc-x86-64-self-test")
-            .map(|(_, recipe)| recipe);
-        assert!(
-            recipe.is_some(),
-            "gcc-x86-64-self-test must remain in the catalog"
-        );
-        let Some(recipe) = recipe else {
-            return;
-        };
-        let native_gcc_token = "{in:gcc-x86-64-native}";
-        let native_binutils_token = "{in:binutils-x86-64-native}";
-        let native_tokens = [native_gcc_token, native_binutils_token];
-        let canonical = recipe.to_json().to_canonical();
-        assert_eq!(
-            canonical.matches(native_gcc_token).count(),
-            2,
-            "only the C and C++ native compiler probes may name gcc-native"
-        );
-        assert_eq!(
-            canonical.matches(native_binutils_token).count(),
-            4,
-            "only the C and C++ native compiler probes may name binutils-native"
-        );
-        let run_steps: Vec<RunStep<'_>> = recipe
-            .steps
-            .iter()
-            .flatten()
-            .filter_map(|step| match step {
-                Step::Run { argv, env, dir } => {
-                    Some((argv.as_slice(), env.as_slice(), dir.as_str()))
-                }
-                _ => None,
-            })
-            .collect();
-        let native_steps: Vec<RunStep<'_>> = run_steps
-            .iter()
-            .copied()
-            .filter(|(argv, env, dir)| {
-                argv.iter()
-                    .chain(env.iter().flat_map(|(key, value)| [key, value]))
-                    .any(|value| native_tokens.iter().any(|token| value.contains(token)))
-                    || native_tokens.iter().any(|token| dir.contains(token))
-            })
-            .collect();
-        assert_eq!(
-            native_steps.len(),
-            2,
-            "the native exception is exactly the C and C++ same-codegen probes"
-        );
-
-        for (argv, env, dir) in native_steps {
-            assert!(
-                argv.iter().any(|arg| arg == "-S")
-                    && argv
-                        .iter()
-                        .any(|arg| arg.ends_with("/codegen.c") || arg.ends_with("/codegen.cc"))
-                    && argv
-                        .iter()
-                        .any(|arg| arg.ends_with("/native-c.s") || arg.ends_with("/native-cxx.s")),
-                "the native compiler may only emit assembly for the codegen fixture"
-            );
-            let paired_argv: Vec<String> = argv
-                .iter()
-                .map(|value| self_hosted_audit_value(value))
-                .collect();
-            let paired_env: Vec<(String, String)> = env
-                .iter()
-                .map(|(key, value)| (self_hosted_audit_value(key), self_hosted_audit_value(value)))
-                .collect();
-            let paired_dir = self_hosted_audit_value(dir);
-            assert!(
-                run_steps
-                    .iter()
-                    .any(|(candidate_argv, candidate_env, candidate_dir)| {
-                        *candidate_argv == paired_argv.as_slice()
-                            && *candidate_env == paired_env.as_slice()
-                            && *candidate_dir == paired_dir.as_str()
-                    }),
-                "each native codegen probe must retain an identical self-hosted counterpart"
-            );
-        }
-    }
-
-    /// Dead-axis lock: GNU findutils is absent from the tool tier after an
-    /// exhaustive sweep found no rung invokes ambient `find`/`xargs` (not in any Run
-    /// argv, WriteFile body, ToolFarm link, or SubstituteText edit — and neither
-    /// is in the autoconf `configure`/`make` vocabulary these tarballs drive).
-    /// This walks the WHOLE catalog and fails if any rung reintroduces a host
-    /// `find`/`xargs` invocation, which would silently need the removed PATH node
-    /// back. A rung may expose one only through a ToolFarm link to an explicitly
-    /// declared td-built multicall that serves it.
-    ///
     /// Coverage note: it scans every catalog-authored surface that becomes a
     /// command or an interpreted script/Makefile — Run argv, ANY WriteFile body
     /// (baked Makefiles/kaem scripts are written `exec: false` and then run over
     /// by a Run step), ToolFarm links, and the literal SubstituteText edits (the
     /// host-free `patch`/`sed` stand-in). Engine-native steps that carry only
-    /// paths (Unpack/CopyTree/Symlink/PatchShebangs/…) cannot invoke a tool.
+    /// paths (Unpack/CopyTree/Symlink/…) cannot invoke a tool.
     #[test]
     fn no_bootstrap_step_invokes_host_find_or_xargs() {
         for (stem, recipe) in catalog::all() {
@@ -3661,7 +2840,7 @@ mod tests {
         // recipe declares ANOTHER native input, so this pins the input's
         // identity rather than merely that the field is populated.
         let undeclared = Recipe::gnu("probe", "1")
-            .native_inputs(&["gcc-x86-64-native"])
+            .native_inputs(&["gcc-runtime"])
             .steps(vec![Step::ToolFarm {
                 links: vec![("find".into(), MC.into())],
             }]);
@@ -3754,7 +2933,7 @@ mod tests {
         // whole reason the roster has to exist. This is the assertion that
         // matters most here.
         assert_eq!(host_tool_invocation("td-sh", &recipe), found);
-        assert_eq!(host_tool_invocation("gcc-mesboot", &recipe), found);
+        assert_eq!(host_tool_invocation("glibc-x86-64", &recipe), found);
 
         // Per FILE: another `.rs` in the SAME rostered recipe keeps the full
         // literal scan, so the entry covers the body a human read and not
@@ -4410,8 +3589,17 @@ mod tests {
 
     #[test]
     fn guard_ignores_find_on_the_removed_from_side() {
-        let removes_find = super::libtool_extract_without_find("{src}/ltmain.sh");
-        // The helper's `from` names `find`; its `to` (the glob loop) does not.
+        // libtool's convenience-archive extraction, as an edit that replaces
+        // its `find` with a glob loop.
+        let removes_find = Step::substitute_text(
+            "{src}/ltmain.sh",
+            vec![crate::types::TextEdit::new(
+                "find $my_xdir -name \\*.$objext -print -o -name \\*.lo -print",
+                "for f in $my_xdir/*.$objext $my_xdir/*.lo; do test -f \"$f\" && printf '%s\\n' \"$f\"; done",
+                1,
+            )],
+        );
+        // The edit's `from` names `find`; its `to` (the glob loop) does not.
         assert!(
             !command_texts(&removes_find)
                 .iter()

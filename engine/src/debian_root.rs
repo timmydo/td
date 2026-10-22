@@ -1,5 +1,5 @@
-//! The Debian build root's lock (`recipes/src/debian-root.lock`,
-//! BUILD-ROOT-PLAN.md): its pinned image layer and .debs, in unpack order,
+//! The Debian build root's lock (`recipes/src/debian-root.lock`, AGENTS.md
+//! "Debian build root"): its pinned image layer and .debs, in unpack order,
 //! and the NAR hash of the tree they assemble into. Shared by td-recipe-eval,
 //! which lists the pins for caching, and td-builder, which assembles and
 //! authenticates the tree. `td-feed debian-root resolve` writes the pin rows;

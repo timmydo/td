@@ -115,8 +115,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 /// the host-only ones `engine_set` names, this script, this crate's manifest,
 /// the engine crate's `src/` and manifest, the workspace manifest and lock,
 /// the repo's cargo config where present, since it shapes the binary as the
-/// manifests do, `seed/seed-digests.txt`, `seed/local-source-roster.txt` and
-/// `seed/bootstrap-root.txt`, which `main.rs` compiles in, and
+/// manifests do, `seed/seed-digests.txt` and `seed/local-source-roster.txt`,
+/// which `main.rs` compiles in, and
 /// `recipes/src/debian-root.lock`, which `build_root.rs` compiles in — as
 /// (path, file digest) pairs in path order. `td-builder
 /// engine-fingerprint` prints it, and the evaluator keys a recipe check's
@@ -143,7 +143,6 @@ fn engine_source_fingerprint(manifest_dir: &Path) -> Result<String, Box<dyn Erro
         "Cargo.lock",
         "seed/seed-digests.txt",
         "seed/local-source-roster.txt",
-        "seed/bootstrap-root.txt",
         "recipes/src/debian-root.lock",
     ]
     .iter()

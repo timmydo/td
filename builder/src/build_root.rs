@@ -1,4 +1,4 @@
-//! build_root — the Debian build root (BUILD-ROOT-PLAN.md, increment 3).
+//! build_root — the Debian build root (AGENTS.md, "Debian build root").
 //!
 //! A C build environment, never a source of shipped bytes: the lock's pinned
 //! Debian image layer with its .debs unpacked over it in lock order,

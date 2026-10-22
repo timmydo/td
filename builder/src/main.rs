@@ -18,8 +18,6 @@
 
 mod affected;
 mod application;
-mod bootstrap;
-mod bootstrap_root;
 mod build;
 mod build_daemon;
 mod build_root;
@@ -57,7 +55,6 @@ mod integration;
 mod kernel_headers;
 mod lock;
 mod main_integration;
-mod mes_boot;
 mod nar;
 mod oci;
 mod ostree;
@@ -5791,7 +5788,20 @@ const APPLICATION_PHASE_RUNNERS: &[&str] = &[
     "cmake-build",
     "mesboot-build",
 ];
-const NON_APPLICATION_PHASE_RUNNERS: &[&str] = &["stage0-build", "rust-dist-build"];
+const NON_APPLICATION_PHASE_RUNNERS: &[&str] = &["rust-dist-build"];
+
+/// The single shared sources cache: `$HOME/.td/sources` (HOME unset/empty -> relative), the
+/// flat pin-filename-keyed dir recipes read their warmed tarballs and generated
+/// kernel-headers from. Shared across ALL worktrees with NO env override; keep identical to
+/// the feed/recipes copies (`var_os`, so a non-UTF-8 HOME resolves the same in all three).
+/// Deliberately NOT under `~/.td/build-daemon` (bound read-write into build sandboxes) — a
+/// pinned tarball is re-verified by sha256 on every read anyway.
+pub(crate) fn shared_sources_dir() -> PathBuf {
+    match std::env::var_os("HOME") {
+        Some(h) if !h.is_empty() => PathBuf::from(h).join(".td/sources"),
+        _ => PathBuf::from(".td/sources"),
+    }
+}
 
 fn push_drv_field(spec: &mut String, directive: &str, value: &str) -> Result<(), String> {
     if directive
@@ -6061,10 +6071,7 @@ fn assemble_recipe_drv(
         // cmake: td's own cmake phase runner (build::run_cmake), the cmake-build-system
         // replacement — out-of-source cmake configure -> make -> make install in Rust.
         "cmake" => "cmake-build",
-        // stage0: the seed executor (build::run_stage0, #378) — place the pinned
-        // stage0-posix tree writable and exec its kaem interpreter; no build inputs.
-        "stage0" => "stage0-build",
-        // mesboot: the bootstrap-RUNG executor (build::run_mesboot, #378 slices
+        // mesboot: the typed-step executor (build::run_mesboot, #378 slices
         // 2+3) — the recipe's typed steps run in the sandbox over staged inputs.
         "mesboot" => "mesboot-build",
         // rust-dist: assemble the pinned upstream Rust release components and
@@ -6348,28 +6355,7 @@ fn assemble_recipe_drv(
         "cmake" => {
             push_drv_env(&mut spec, "TD_CONFIGURE_FLAGS", &cflags)?;
         }
-        // stage0: sealed — source + builder are the WHOLE closure. Any other build
-        // material (inputs, crates/vendor tree) or unrunnable field (configureFlags/
-        // phases — run_stage0 reads only TD_SRC/out) is a hard error, never ignored.
-        "stage0" => {
-            if !inputs.is_empty() {
-                return Err(format!(
-                    "recipe: buildSystem \"stage0\" takes no build inputs (the seed needs nothing), but the lock carries {}",
-                    inputs.join(" ")
-                ));
-            }
-            if !vendor.is_empty() || vendor_dir.is_some() {
-                return Err(
-                    "recipe: buildSystem \"stage0\" takes no vendored crates — a crate-class lock entry or vendor tree would stage a store path into the sealed seed sandbox".into(),
-                );
-            }
-            if alist.get("configureFlags").is_some() || alist.get("phases").is_some() {
-                return Err(
-                    "recipe: buildSystem \"stage0\" supports no configureFlags/phases — the seed runner would silently ignore them, so declaring them is an error".into(),
-                );
-            }
-        }
-        // mesboot: the bootstrap-rung step executor (#378 slices 2+3). The typed
+        // mesboot: the typed-step executor (#378 slices 2+3). The typed
         // steps are hashed as drv data; the sandbox materializes them as the
         // builder's steps file rather than forwarding them through execve.
         // {in:NAME} templates resolve through TD_INPUT_MAP (lock entry name ->
@@ -6860,7 +6846,6 @@ fn build_plan(
     builder_store: Option<(&str, &str, &str)>,
     persist: Option<(&str, &str)>,
     local_seed_db: Option<&str>,
-    root_db: Option<&str>,
 ) -> Result<(), String> {
     use std::collections::BTreeMap;
     let plan =
@@ -6898,23 +6883,19 @@ fn build_plan(
     // source case and must not enter `td_dbs`: every entry there is read
     // unconditionally per step (found in the confirmation review). A path
     // that exists but is not a file is a caller error, not vacuous.
-    let local_seed_db = present_local_seed_db(local_seed_db)?;
+    let local_seed_db = present_seed_db(local_seed_db, "local-source seed")?;
     if let Some(db) = local_seed_db {
         authenticate_local_seed_db(db, Path::new(seed_store), scratch)?;
     }
-    // The bootstrap-root db: the pinned ladder outputs a cut plan stages as
-    // AuditedSeed, authenticated against the compiled manifest. Unlike the
-    // other two it is never named speculatively, so a named one must exist.
-    if let Some(db) = root_db {
-        bootstrap_root::authenticate_db(db, Path::new(seed_store))?;
-    }
     let mut built: BTreeMap<String, String> = BTreeMap::new();
-    let mut td_dbs: Vec<(String, sandbox::InputOrigin)> =
-        vec![(seed_db.to_string(), sandbox::InputOrigin::AuditedSeed)];
-    if let Some(db) = local_seed_db {
-        td_dbs.push((db.to_string(), sandbox::InputOrigin::AuditedSeed));
-    }
-    if let Some(db) = root_db {
+    // The keyed db follows the same rule: a graph that interns no pinned seed
+    // (one built wholly in the build root from local sources) leaves it
+    // unwritten, and an absent entry would red the first step that reads it.
+    let mut td_dbs: Vec<(String, sandbox::InputOrigin)> = Vec::new();
+    for db in [present_seed_db(Some(seed_db), "seed")?, local_seed_db]
+        .into_iter()
+        .flatten()
+    {
         td_dbs.push((db.to_string(), sandbox::InputOrigin::AuditedSeed));
     }
     let mut build_root_admitted = false;
@@ -7094,10 +7075,10 @@ fn build_plan(
 /// The compiled-seed-digest key a build-plan lock entry is gated by. A recipe's
 /// OWN source entry is named `{name}-source` (`src_key`) so its steps can reference
 /// `{in:{name}-source}` uniformly, but its digest is pinned under the recipe's
-/// `sourceInput` KEY — which may be a shared seed the rung renames locally
-/// (gcc-mesboot0-source <- patch-gcc-boot-2.95.3, mesboot-headers-source <-
-/// linux-headers). Resolve that source entry to its pin key; gate every other seed
-/// by its own name. For a conventional rung (sourceInput == `{name}-source`) the two
+/// `sourceInput` KEY — which may be a shared seed the recipe renames locally
+/// (linux-x86-64-source <- linux-kernel-source, gcc-runtime-source <- gcc-14-source).
+/// Resolve that source entry to its pin key; gate every other seed by its own name.
+/// For a conventional recipe (sourceInput == `{name}-source`) the two
 /// coincide, so this is a no-op. `alist` is the entry's own recipe JSON.
 fn seed_gate_key<'a>(entry_name: &'a str, src_key: &str, alist: &'a json::Json) -> &'a str {
     if entry_name == src_key {
@@ -7398,8 +7379,26 @@ fn auto_map_lookup(
 /// never best-effort).
 const SEED_DIGESTS: &str = include_str!("../../seed/seed-digests.txt");
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only rows pinned ahead of the compiled table (`tests::intern_pinned_seed`):
+    /// the table pins no seed whose bytes live in the repo, so provenance tests pin
+    /// their own fixtures. Per thread, so tests cannot see each other's rows.
+    static TEST_SEED_ROWS: std::cell::RefCell<Vec<(String, &'static str)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// The compiled expected basename for a seed key, if pinned.
 fn seed_digests_expected(key: &str) -> Result<Option<&'static str>, String> {
+    #[cfg(test)]
+    if let Some(base) = TEST_SEED_ROWS.with(|rows| {
+        rows.borrow()
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, base)| *base)
+    }) {
+        return Ok(Some(base));
+    }
     for (n, line) in SEED_DIGESTS.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -7428,6 +7427,8 @@ fn seed_digests_expected(key: &str) -> Result<Option<&'static str>, String> {
 /// rejects a db row outside it.
 fn compiled_pinned_basenames() -> Result<std::collections::HashSet<&'static str>, String> {
     let mut pinned = std::collections::HashSet::new();
+    #[cfg(test)]
+    TEST_SEED_ROWS.with(|rows| pinned.extend(rows.borrow().iter().map(|(_, base)| *base)));
     for (n, line) in SEED_DIGESTS.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -7506,9 +7507,6 @@ fn local_source_roster_expected(
 enum SeedOrigin {
     Digest(&'static str),
     LocalSource,
-    /// A pinned bootstrap-root export (`seed/bootstrap-root.txt`): the
-    /// ladder output a post-cut recipe names, at its pinned basename.
-    BootstrapRoot(&'static str),
 }
 
 /// Refuse a seed key pinned by BOTH tables (re #469 local-source-roster
@@ -7538,17 +7536,6 @@ fn classify_seed_key(key: &str) -> Result<Option<SeedOrigin>, String> {
     let digest = seed_digests_expected(key)?;
     let roster = local_source_roster_expected(key)?;
     reject_if_pinned_both_ways(key, digest.is_some(), roster.is_some())?;
-    if let Some(exp) = bootstrap_root::export(key)? {
-        // An export names a recipe stem; a seed table names a pinned
-        // source. One key cannot be both a built rung and a fetched input.
-        if digest.is_some() || roster.is_some() {
-            return Err(format!(
-                "provenance rejected: seed key `{key}' is both a seed/bootstrap-root.txt \
-                 export and a seed-table key"
-            ));
-        }
-        return Ok(Some(SeedOrigin::BootstrapRoot(exp)));
-    }
     // `reject_if_pinned_both_ways` already refused `(Some, Some)`, so the only
     // question left is which single table (if either) admits the key.
     if let Some(exp) = digest {
@@ -7830,10 +7817,10 @@ fn authenticate_seed_db(dbp: &str, items_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Resolve the optional per-run local-source seed db to `Some` only when it
-/// is present: `None` or an absent path is the no-local-source case, a
-/// present non-file is refused.
-fn present_local_seed_db(dbp: Option<&str>) -> Result<Option<&str>, String> {
+/// Resolve an optional plan seed db to `Some` only when it is present: `None`
+/// or an absent path is a graph that interned nothing there, a present
+/// non-file is refused.
+fn present_seed_db<'a>(dbp: Option<&'a str>, label: &str) -> Result<Option<&'a str>, String> {
     let Some(dbp) = dbp else {
         return Ok(None);
     };
@@ -7843,7 +7830,7 @@ fn present_local_seed_db(dbp: Option<&str>) -> Result<Option<&str>, String> {
     }
     if !path.is_file() {
         return Err(format!(
-            "plan local-source seed db {dbp}: exists but is not a regular file"
+            "plan {label} db {dbp}: exists but is not a regular file"
         ));
     }
     Ok(Some(dbp))
@@ -7950,13 +7937,6 @@ fn auto_seed_provenance(
             verify_local_source_roster_basename(key, base, scratch)
                 .map_err(|e| format!("--auto: recipe `{name}' input `{key}': {e}"))?;
         }
-        Some(SeedOrigin::BootstrapRoot(exp)) if exp != base => {
-            return Err(format!(
-                "--auto: provenance rejected: recipe `{name}' input `{key}' resolves to \
-                 `{base}' but seed/bootstrap-root.txt exports `{exp}'"
-            ))
-        }
-        Some(SeedOrigin::BootstrapRoot(_)) => {}
     }
     let on_disk = seed_store.join(base);
     if !on_disk.exists() {
@@ -8008,8 +7988,8 @@ fn auto_synthesize_lock(
         auto_seed_provenance(store_prefix, seed_store, name, key, &path, scratch)?;
         // The source lock entry is named `{name}-source` — the recipe references its
         // own source as `{in:{name}-source}` regardless of which pinned seed provides
-        // it (gcc-mesboot0-source <- patch-gcc-boot-2.95.3, mesboot-headers-source <-
-        // linux-headers). The sourceInput KEY it is digest-gated by is recovered at the
+        // it (linux-x86-64-source <- linux-kernel-source). The sourceInput KEY it is
+        // digest-gated by is recovered at the
         // build-plan re-gate from the recipe's own sourceInput (see the Seed|Source arm).
         out.push_str(&format!("{name}-source {path} source\n"));
     }
@@ -8047,7 +8027,7 @@ fn auto_synthesize_lock(
 /// operator invoking this arm directly with a forged map is outside the
 /// boundary, the same trust class as pointing TD_RECIPE_EVAL at old code.
 ///
-/// Usage: build-plan --auto TARGET RECIPE-DIR MAP-FILE SEED-STORE SEED-DB SCRATCH [LOCAL-SEED-DB [ROOT-DB]]
+/// Usage: build-plan --auto TARGET RECIPE-DIR MAP-FILE SEED-STORE SEED-DB SCRATCH [LOCAL-SEED-DB]
 ///
 /// `LOCAL-SEED-DB` is OPTIONAL (re #469 local-source-roster blocker fix): the
 /// runner's per-run db of local-source registrations, kept separate from the
@@ -8057,9 +8037,6 @@ fn auto_synthesize_lock(
 /// for anything that names no local-source-roster key; a plan that DOES need
 /// one then reds at per-entry provenance (`auto_seed_provenance`) or
 /// manifest assembly, naming the key, never silently succeeding.
-///
-/// `ROOT-DB` is the bootstrap-root db (`bootstrap_root`), named only for a
-/// plan cut at the pinned root; its items live in SEED-STORE.
 #[allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -8080,7 +8057,6 @@ fn build_plan_auto(
     builder_store: Option<(&str, &str, &str)>,
     persist: Option<(&str, &str)>,
     local_seed_db: Option<&str>,
-    root_db: Option<&str>,
 ) -> Result<(), String> {
     if !auto_is_owned(recipe_dir, target) {
         return Err(format!(
@@ -8139,62 +8115,7 @@ fn build_plan_auto(
         builder_store,
         persist,
         local_seed_db,
-        root_db,
     )
-}
-
-/// The `bootstrap-root` verbs (see the dispatch arm).
-fn run_bootstrap_root(args: &[String]) -> Result<(), String> {
-    let usage = || {
-        "usage: bootstrap-root admit SEED-STORE ROOT-DB SRC-DIR... | \
-         bootstrap-root verify SEED-STORE ROOT-DB | bootstrap-root abi | \
-         bootstrap-root measure [--seeds SEED-STORE] SRC-DIR... -- EXPORT-PATH..."
-            .to_string()
-    };
-    match args {
-        [verb, seed_store, root_db, dirs @ ..] if verb == "admit" && !dirs.is_empty() => {
-            let dirs: Vec<PathBuf> = dirs.iter().map(PathBuf::from).collect();
-            bootstrap_root::admit(&dirs, Path::new(seed_store), Path::new(root_db))
-        }
-        [verb, seed_store, root_db] if verb == "verify" => {
-            bootstrap_root::verify(root_db, Path::new(seed_store))
-        }
-        [verb] if verb == "abi" => {
-            let abi = store::builder_abi_token();
-            println!("{}", abi.strip_prefix("td-builder-abi-").unwrap_or(&abi));
-            Ok(())
-        }
-        [verb, rest @ ..] if verb == "measure" => {
-            let (seeds, rest) = match rest {
-                [flag, seed, rest @ ..] if flag == "--seeds" => (vec![PathBuf::from(seed)], rest),
-                _ => (Vec::new(), rest),
-            };
-            let mut halves = rest.splitn(2, |a| a == "--");
-            let (Some(dirs), Some(exports)) = (halves.next(), halves.next()) else {
-                return Err(usage());
-            };
-            if dirs.is_empty() || exports.is_empty() {
-                return Err(usage());
-            }
-            let dirs: Vec<PathBuf> = dirs.iter().map(PathBuf::from).collect();
-            let items = bootstrap_root::measure(&dirs, &seeds, exports)?;
-            let abi = store::builder_abi_token();
-            println!(
-                "builder-abi {}",
-                abi.strip_prefix("td-builder-abi-").unwrap_or(&abi)
-            );
-            for item in items {
-                let refs = if item.refs.is_empty() {
-                    "-".to_string()
-                } else {
-                    item.refs.join(",")
-                };
-                println!("item {} {} {refs}", item.base, item.nar);
-            }
-            Ok(())
-        }
-        _ => Err(usage()),
-    }
 }
 
 /// Emit PKG's recipe JSON from td's Rust catalog via `td-recipe-eval emit` — the
@@ -9594,13 +9515,7 @@ fn main() -> ExitCode {
                 }
             }
         }
-        // bootstrap-recipe <name> | --list — run a structured source-bootstrap rung
-        // (the tests/bootstrap-*.sh drivers as typed Rust data; see bootstrap.rs).
         Some("worktree-gc") => worktree_gc::cli(args.get(2..).unwrap_or(&[])),
-        Some("bootstrap-recipe") => bootstrap::cli(&args),
-        // toolchain-recipe <name> — build a /td/store toolchain rung as a structured Rust
-        // recipe (see toolchain_x86_64.rs).
-        Some("toolchain-recipe") => toolchain_x86_64::cli(&args),
         Some("kernel-headers") => match kernel_headers::run_cli(args.get(2..).unwrap_or(&[])) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
@@ -10734,83 +10649,6 @@ fn main() -> ExitCode {
                 }
             }
         }
-        // INPUT-ADDRESSED add: like store-add-recursive, but the store path's digest is
-        // KEY (a hash of the artifact's DECLARED INPUTS — `toolchain-key`), NOT the tree's
-        // recursive NAR hash. So a NON-byte-reproducible tree (the modern toolchain: cc1
-        // stamp, ar/install mtimes) lands at a STABLE path: identical across rebuilds, and
-        // computable from the lock BEFORE the build (the prereq for td-subst chain-caching).
-        // The tree is still REGISTERED with its real NAR hash + size (naming and content-
-        // integrity are orthogonal — the daemon's `output:` semantics), so closure/verify
-        // are unchanged. Usage:
-        //   store-add-input-addressed NAME KEY SRC STORE-DIR OUT-DB    (prints the path)
-        Some("store-add-input-addressed") if args.len() == 7 => {
-            let (name, key, src, store_dir, out_db) =
-                (&args[2], &args[3], &args[4], &args[5], &args[6]);
-            let run = || -> Result<String, String> {
-                use store_db::{Table, Value};
-                // Input-addressed path: digest = KEY (declared inputs), not the content.
-                let path = store::input_addressed_path(key, name);
-                let base = path
-                    .rsplit('/')
-                    .next()
-                    .filter(|_| store::name_from_store_path(&path).is_some())
-                    .ok_or_else(|| format!("computed path {path} is malformed (bad KEY/NAME?)"))?
-                    .to_string();
-                // Canonically restore the tree into the td-owned store.
-                std::fs::create_dir_all(store_dir).map_err(|e| e.to_string())?;
-                let disk = Path::new(store_dir).join(&base);
-                copy_canonical(Path::new(src), &disk)?;
-                // Register the REAL NAR hash + size of the placed tree (self-references
-                // among the single-path closure — the store-add-recursive registration).
-                let closure = vec![path.clone()];
-                let mut s = scan::Scanner::new(&closure).map_err(|e| e.to_string())?;
-                nar::write_nar(&mut s, &disk).map_err(|e| e.to_string())?;
-                let (hash, size, refs) = s.finish();
-                let valid = vec![(
-                    1i64,
-                    vec![
-                        Value::Null,
-                        Value::Text(path.clone()),
-                        Value::Text(hash),
-                        Value::Int(1),
-                        Value::Null, // deriver — set by the producer's drv when there is one
-                        Value::Int(size as i64),
-                    ],
-                )];
-                let mut ref_rows = Vec::new();
-                let mut rid = 1i64;
-                for r in &refs {
-                    if r == &path {
-                        ref_rows.push((rid, vec![Value::Int(1), Value::Int(1)]));
-                        rid += 1;
-                    }
-                }
-                let tables = [
-                    Table {
-                        name: "ValidPaths",
-                        sql: "CREATE TABLE ValidPaths (id integer primary key, path text, hash text, registrationTime integer, deriver text, narSize integer)",
-                        rows: valid,
-                    },
-                    Table {
-                        name: "Refs",
-                        sql: "CREATE TABLE Refs (referrer integer, reference integer)",
-                        rows: ref_rows,
-                    },
-                ];
-                std::fs::write(out_db, store_db::write_db(&tables)).map_err(|e| e.to_string())?;
-                Ok(path)
-            };
-            match run() {
-                Ok(path) => {
-                    println!("{path}");
-                    ExitCode::SUCCESS
-                }
-                Err(e) => {
-                    eprintln!("td-builder: store-add-input-addressed {name}: {e}");
-                    ExitCode::FAILURE
-                }
-            }
-        }
         // bootstrap brick 2: PLACE a tree WITH references into a td-owned store,
         // content-addressed — the builder analog of store-add-recursive (which REFUSES a
         // referenced tree). td restores the tree into STORE-DIR, computes its
@@ -11104,57 +10942,6 @@ fn main() -> ExitCode {
                 }
                 Err(e) => {
                     eprintln!("td-builder: store-commit: {e}");
-                    ExitCode::FAILURE
-                }
-            }
-        }
-        // toolchain stable key: print the INPUT key of a td-toolchain.lock — sha256 over
-        // its declared inputs (sources + patches + name + recipe-rev), order-independent.
-        // The input-addressed toolchain path (toolchain-path) is named by this key, so it
-        // is stable across non-reproducible rebuilds. Usage: toolchain-key LOCK
-        Some("toolchain-key") if args.len() == 3 => {
-            match std::fs::read_to_string(&args[2])
-                .map_err(|e| e.to_string())
-                .and_then(|c| store::ToolchainLock::parse(&c))
-            {
-                Ok(lock) => {
-                    println!("{}", lock.key());
-                    ExitCode::SUCCESS
-                }
-                Err(e) => {
-                    eprintln!("td-builder: toolchain-key {}: {e}", args[2]);
-                    ExitCode::FAILURE
-                }
-            }
-        }
-        // toolchain stable path: print the INPUT-ADDRESSED store path for a component of
-        // the toolchain (or the toolchain itself when NAME is omitted), under the active
-        // store_dir() (set TD_STORE_DIR=/td/store for the /td/store path). This is the
-        // path the producer interns the built tree at (store-add-input-addressed) and the
-        // path a td-subst consumer computes from the lock BEFORE fetching — the 2a stable key.
-        // Usage: toolchain-path LOCK [NAME]
-        Some("toolchain-path") if args.len() == 3 || args.len() == 4 => {
-            let name = args.get(3).map(String::as_str);
-            match std::fs::read_to_string(&args[2])
-                .map_err(|e| e.to_string())
-                .and_then(|c| store::ToolchainLock::parse(&c))
-            {
-                Ok(lock) => {
-                    if let Some(n) = name {
-                        if !lock.components.iter().any(|c| c == n) && n != lock.name {
-                            eprintln!(
-                                "td-builder: toolchain-path: `{n}` is not a component of {} (have: {})",
-                                lock.name,
-                                lock.components.join(", ")
-                            );
-                            return ExitCode::FAILURE;
-                        }
-                    }
-                    println!("{}", lock.path_for(name));
-                    ExitCode::SUCCESS
-                }
-                Err(e) => {
-                    eprintln!("td-builder: toolchain-path {}: {e}", args[2]);
                     ExitCode::FAILURE
                 }
             }
@@ -11967,11 +11754,10 @@ fn main() -> ExitCode {
         // poisons a db every worktree on the same digest table shares. A
         // direct invocation naming no LOCAL-SEED-DB works exactly as before
         // the split for any plan that needs no local source.
-        Some("build-plan") if (9..=11).contains(&args.len()) && args[2] == "--auto" => {
+        Some("build-plan") if (9..=10).contains(&args.len()) && args[2] == "--auto" => {
             let (target, recipe_dir, map_file, seed_store, seed_db, scratch) =
                 (&args[3], &args[4], &args[5], &args[6], &args[7], &args[8]);
             let local_seed_db = args.get(9).map(String::as_str);
-            let root_db = args.get(10).map(String::as_str);
             let bov = match builder_store_env() {
                 Ok(b) => b,
                 Err(e) => {
@@ -12000,7 +11786,6 @@ fn main() -> ExitCode {
                 builder_store,
                 persist,
                 local_seed_db,
-                root_db,
             ) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
@@ -12014,13 +11799,6 @@ fn main() -> ExitCode {
         // caller-writable TD_EXTRA_DBS env, and nothing invoked it — the live
         // reproducibility oracle is the daemon's CHECK verb (`daemon_check_one`),
         // whose two independent builds run the typed realize_drv path.
-        // bootstrap-root admit SEED-STORE ROOT-DB SRC-DIR... — admit the pinned
-        // bootstrap root from the dirs a ladder build left its outputs in.
-        // bootstrap-root measure SRC-DIR... -- EXPORT-PATH... — print the
-        // `item` rows of the exports' reference closure, plus the ABI they
-        // were built under. bootstrap-root verify SEED-STORE ROOT-DB —
-        // authenticate an admitted root. bootstrap-root abi — the effective
-        // ABI revision. See bootstrap_root.rs.
         // build-root assemble SOURCES SEED-STORE SEED-DB — place the pinned
         // Debian build root and its db. build-root pin SOURCES LOCK WORK —
         // write the assembled tree's hash into the lock. build-root path —
@@ -12029,13 +11807,6 @@ fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("td-builder: build-root: {e}");
-                ExitCode::FAILURE
-            }
-        },
-        Some("bootstrap-root") => match run_bootstrap_root(args.get(2..).unwrap_or_default()) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                eprintln!("td-builder: bootstrap-root: {e}");
                 ExitCode::FAILURE
             }
         },
@@ -12155,7 +11926,7 @@ fn main() -> ExitCode {
         // synthetic /proc and /dev, and its own loopback-only netns), toward
         // replacing `guix shell -C`. With
         // `--expose-cwd` it adds the full loop env (worktree + host tokens,
-        // caller PATH + TD_SUBST_*/TD_DAEMON_* preserved, chdir into the
+        // caller PATH + TD_CHECK_*/TD_DAEMON_* preserved, chdir into the
         // cwd) so a real rung runs as under `guix shell -C`.
         //
         // GUIX-LESS provisioning (host-sandbox-stage0 inc2 — the full-suite VM):
@@ -12299,20 +12070,6 @@ fn main() -> ExitCode {
                             sandbox_host_runtime = Some(inside);
                         }
                     }
-                    // The persistent signed substitute store (~/.td/subst) —
-                    // READ-ONLY: the loop FETCHES the lock-keyed toolchain closure from it
-                    // (x64-toolchain-subst) over its own loopback netns instead of rebuilding ~98 min
-                    // from seed, and never writes it. Like the host /gnu/store + guix cache, it is a
-                    // declared, exposed input — no network egress (resolve-toolchain serves loopback).
-                    let subst = format!("{home}/.td/subst");
-                    if Path::new(&subst).is_dir() {
-                        binds.push(sandbox::Bind {
-                            src: subst,
-                            dest: None,
-                            readonly: true,
-                            ro_optional: false,
-                        });
-                    }
                     // The ONE shared build daemon's socket + output store (~/.td/build-daemon,
                     // started on the host by the `td-builder check` prelude). The corpus build
                     // (inside this sandbox) SUBMITS drvs to it over the socket and reads its
@@ -12331,7 +12088,7 @@ fn main() -> ExitCode {
                     }
                     // The shared warmed-source cache (~/.td/sources, populated HOST-SIDE by
                     // `td-feed warm sources` before this sandbox starts) — READ-ONLY: the
-                    // from-source bootstrap gates STAGE the pinned tarballs + generated
+                    // recipe gates STAGE the pinned tarballs + generated
                     // kernel-headers from it (verified against their sha256) and never write
                     // it from inside. Same absolute path inside so the resolver finds it.
                     // Deliberately RO, unlike ~/.td/build-daemon above: recipe build steps must
@@ -12362,15 +12119,10 @@ fn main() -> ExitCode {
                     path_env = std::env::var("PATH").unwrap_or_default();
                     workdir = cwd;
                     for (k, v) in std::env::vars() {
-                        // TD_SUBST_* = the host-provisioned
-                        // substitute resolver knobs (TD_SUBST_BIN/STORE/PUBKEY) the toolchain gates
-                        // read to FETCH the lock-keyed closure instead of building from seed;
                         // TD_DAEMON_* = the shared build daemon's socket (TD_DAEMON_SOCKET) the
                         // corpus build submits to. TD_CHECK_* includes the
                         // host-owned memory-token policy and gate controls.
-                        if (k.starts_with("TD_CHECK_")
-                            || k.starts_with("TD_SUBST_")
-                            || k.starts_with("TD_DAEMON_"))
+                        if (k.starts_with("TD_CHECK_") || k.starts_with("TD_DAEMON_"))
                             && k != crate::check_memory::HOST_RUNTIME_ENV
                             && k != crate::check_memory::TOKEN_DIR_ENV
                         {
@@ -12563,16 +12315,7 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        // td's stage0-posix SEED build system (#378): see build::run_stage0.
-        // Sibling of autotools-build/rust-build/cmake-build; same env contract.
-        Some("stage0-build") if args.len() == 2 => match build::run_stage0() {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                eprintln!("td-builder: stage0-build: {e}");
-                ExitCode::FAILURE
-            }
-        },
-        // td's bootstrap-RUNG step executor (#378 slices 2+3): see
+        // td's typed-step executor (#378 slices 2+3): see
         // build::run_mesboot. Same env-driven derivation-builder contract.
         Some("mesboot-build") if args.len() == 2 => match build::run_mesboot() {
             Ok(()) => ExitCode::SUCCESS,
@@ -14083,26 +13826,20 @@ daemon build START (2/2 active)
         f()
     }
 
-    // Intern the REAL repo bytes of a compiled-table PATCH seed under its key —
-    // the one seed class whose bytes live in the repo (cold-CI safe), so
-    // green-path tests exercise the same compiled seed-digest gate production
-    // does: the derived basename must agree with seed/seed-digests.txt.
-    fn intern_real_patch_seed(seeds: &Path, key: &str) -> String {
-        let stem = key.strip_prefix("patch-").unwrap();
-        let bytes = std::fs::read(
-            seed_repo_root()
-                .join("seed/patches")
-                .join(format!("{stem}.patch")),
-        )
-        .unwrap();
-        let path = intern_test_seed(seeds, key, &bytes);
-        let base = path.rsplit('/').next().unwrap();
-        assert_eq!(
-            seed_digests_expected(key).unwrap(),
-            Some(base),
-            "repo patch bytes must derive the pinned basename for {key} — regenerate \
-             seed/seed-digests.txt if the patch changed"
-        );
+    // Intern fixture bytes for `key` and pin their derived basename in this thread's
+    // test rows, so green-path tests exercise the same compiled seed-digest gate
+    // production does without a seed whose bytes live in the repo. The bytes are a
+    // function of the key, so a second intern under the same key agrees.
+    fn intern_pinned_seed(seeds: &Path, key: &str) -> String {
+        std::fs::create_dir_all(seeds).unwrap();
+        let path = intern_test_seed(seeds, key, format!("pinned fixture {key}\n").as_bytes());
+        let base: &'static str = Box::leak(path.rsplit('/').next().unwrap().to_string().into());
+        TEST_SEED_ROWS.with(|rows| {
+            let mut rows = rows.borrow_mut();
+            rows.retain(|(k, _)| k != key);
+            rows.push((key.to_string(), base));
+        });
+        assert_eq!(seed_digests_expected(key).unwrap(), Some(base));
         path
     }
 
@@ -14875,10 +14612,10 @@ daemon build START (2/2 active)
             refs: vec![],
             deriver: "/td/store/x.drv".to_string(),
         };
-        // Green: the interned repo patch derives a pinned basename.
+        // Green: the interned fixture derives a pinned basename.
         let items = d.join("items");
         std::fs::create_dir_all(&items).unwrap();
-        let path = intern_real_patch_seed(&items, "patch-glibc-boot-2.16.0");
+        let path = intern_pinned_seed(&items, "fixture-seed-a");
         let base = path.rsplit('/').next().unwrap();
         let hash = nar_hash_path(&items.join(base)).unwrap();
         let good_db = d.join("seed-good.db");
@@ -14900,47 +14637,6 @@ daemon build START (2/2 active)
         // Absent db: authenticates vacuously — no rows means no authority.
         authenticate_seed_db(&d.join("absent.db").to_string_lossy(), &items).unwrap();
         std::fs::remove_dir_all(&d).ok();
-    }
-
-    // Every compiled-table row backed by an in-repo patch file must recompute
-    // from those bytes — the cold-CI freshness gate for the table: a changed
-    // patch without a regenerated table reds here, not first at ladder time.
-    #[test]
-    fn seed_digest_patch_rows_recompute_from_the_repo_bytes() {
-        let mut verified = 0usize;
-        for line in SEED_DIGESTS.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let mut it = line.split_whitespace();
-            let (Some(key), Some(pinned)) = (it.next(), it.next()) else {
-                panic!("malformed row {line}");
-            };
-            let Some(stem) = key.strip_prefix("patch-") else {
-                continue;
-            };
-            let file = seed_repo_root()
-                .join("seed/patches")
-                .join(format!("{stem}.patch"));
-            if !file.is_file() {
-                continue; // a `patch-`-prefixed SOURCE pin (tarball), not a repo patch
-            }
-            let nar = nar_hash_path(&file).unwrap();
-            let hex = nar.strip_prefix("sha256:").unwrap();
-            let derived = store::make_store_path_in("/td/store", "source", hex, key);
-            let derived_base = derived.rsplit('/').next().unwrap();
-            assert_eq!(
-                derived_base, pinned,
-                "seed/seed-digests.txt row for {key} does not match the repo patch bytes — \
-                 regenerate with `td-recipe-eval seed-digests`"
-            );
-            verified += 1;
-        }
-        assert!(
-            verified > 0,
-            "no in-repo patch rows verified — table missing patches?"
-        );
     }
 
     // store_path_recursive computes the address store_add_recursive would intern at,
@@ -15364,47 +15060,41 @@ daemon build START (2/2 active)
         let d = _d_cleanup.join("fixture");
         let seeds = d.join("seed-store");
         std::fs::create_dir_all(&seeds).unwrap();
-        // Seed inputs must be REAL compiled-table keys with their audited repo
-        // bytes — the table gate reds anything else at synthesis now.
+        // Seed inputs must be pinned keys with their pinned bytes — the table gate
+        // reds anything else at synthesis now.
         std::fs::write(
-            d.join("gcc-mesboot0.json"),
-            r#"{"name":"gcc-mesboot0","sourceInput":"patch-gcc-boot-2.95.3","nativeInputs":["binutils-mesboot0"],"inputs":["patch-glibc-boot-2.16.0","patch-glibc-boot-2.2.5"]}"#,
+            d.join("fixture-rung.json"),
+            r#"{"name":"fixture-rung","sourceInput":"fixture-source-seed","nativeInputs":["fixture-tool"],"inputs":["fixture-seed-a","fixture-seed-b"]}"#,
         )
         .unwrap();
-        std::fs::write(
-            d.join("binutils-mesboot0.json"),
-            r#"{"name":"binutils-mesboot0"}"#,
-        )
-        .unwrap();
+        std::fs::write(d.join("fixture-tool.json"), r#"{"name":"fixture-tool"}"#).unwrap();
         let mut map = std::collections::BTreeMap::new();
-        let src = intern_real_patch_seed(&seeds, "patch-gcc-boot-2.95.3");
-        let in_a = intern_real_patch_seed(&seeds, "patch-glibc-boot-2.16.0");
-        let in_b = intern_real_patch_seed(&seeds, "patch-glibc-boot-2.2.5");
-        map.insert("patch-gcc-boot-2.95.3".to_string(), src.clone());
-        map.insert("patch-glibc-boot-2.16.0".to_string(), in_a.clone());
-        map.insert("patch-glibc-boot-2.2.5".to_string(), in_b.clone());
+        let src = intern_pinned_seed(&seeds, "fixture-source-seed");
+        let in_a = intern_pinned_seed(&seeds, "fixture-seed-a");
+        let in_b = intern_pinned_seed(&seeds, "fixture-seed-b");
+        map.insert("fixture-source-seed".to_string(), src.clone());
+        map.insert("fixture-seed-a".to_string(), in_a.clone());
+        map.insert("fixture-seed-b".to_string(), in_b.clone());
         let got = auto_synthesize_lock(
             &d.to_string_lossy(),
             &map,
-            "gcc-mesboot0",
+            "fixture-rung",
             "/td/store",
             &seeds,
             &d,
         )
         .unwrap();
-        assert!(got.contains(&format!("gcc-mesboot0-source {src} source")));
-        assert!(
-            got.contains("binutils-mesboot0 /td/store/pending-binutils-mesboot0 td-recipe-output")
-        );
-        assert!(got.contains(&format!("patch-glibc-boot-2.16.0 {in_a} seed")));
-        assert!(got.contains(&format!("patch-glibc-boot-2.2.5 {in_b} seed")));
+        assert!(got.contains(&format!("fixture-rung-source {src} source")));
+        assert!(got.contains("fixture-tool /td/store/pending-fixture-tool td-recipe-output"));
+        assert!(got.contains(&format!("fixture-seed-a {in_a} seed")));
+        assert!(got.contains(&format!("fixture-seed-b {in_b} seed")));
         std::fs::remove_dir_all(&d).ok();
     }
 
     // build_plan re-gates every seed/source lock entry by its digest key. A recipe's
     // own source is named `{name}-source` in the lock (so steps reference
     // `{in:{name}-source}`) but pinned under its `sourceInput` key — which for a
-    // shared/renamed seed differs (gcc-mesboot0-source <- patch-gcc-boot-2.95.3,
+    // shared/renamed seed differs (fixture-rung-source <- fixture-source-seed,
     // mesboot-headers-source <- linux-headers). seed_gate_key must recover the pin key
     // for that entry, and gate every other seed by its own name; else the re-gate reds
     // a valid rung with "no compiled expected digest" for `{name}-source`.
@@ -15419,12 +15109,8 @@ daemon build START (2/2 active)
         );
         // A sibling seed entry gates by its OWN name even though a sourceInput exists.
         assert_eq!(
-            seed_gate_key(
-                "patch-glibc-boot-2.16.0",
-                "mesboot-headers-source",
-                &renamed
-            ),
-            "patch-glibc-boot-2.16.0"
+            seed_gate_key("fixture-seed-a", "mesboot-headers-source", &renamed),
+            "fixture-seed-a"
         );
         // A conventional rung (sourceInput == `{name}-source`) is unchanged.
         let conventional = json::parse(r#"{"name":"mes","sourceInput":"mes-source"}"#).unwrap();
@@ -15455,13 +15141,13 @@ daemon build START (2/2 active)
         let d = _d_cleanup.join("fixture");
         let seeds = d.join("seed-store");
         std::fs::create_dir_all(&seeds).unwrap();
-        // Green: the audited repo bytes at the pinned basename pass.
-        let good = intern_real_patch_seed(&seeds, "patch-glibc-boot-2.16.0");
+        // Green: the pinned bytes at the pinned basename pass.
+        let good = intern_pinned_seed(&seeds, "fixture-seed-a");
         auto_seed_provenance(
             "/td/store",
             &seeds,
-            "glibc-mesboot0",
-            "patch-glibc-boot-2.16.0",
+            "fixture-consumer",
+            "fixture-seed-a",
             &good,
             &d,
         )
@@ -15484,12 +15170,13 @@ daemon build START (2/2 active)
         // Red 2: a pinned key resolving to an item that content-addresses
         // honestly but was never derived from the pins — the forged
         // map/store/db triple `build-plan --auto` used to accept.
-        let forged = intern_test_seed(&seeds, "patch-glibc-boot-2.2.5", b"not the audited patch");
+        intern_pinned_seed(&d.join("pinned-elsewhere"), "fixture-seed-b");
+        let forged = intern_test_seed(&seeds, "fixture-seed-b", b"not the audited patch");
         let err = auto_seed_provenance(
             "/td/store",
             &seeds,
-            "glibc-mesboot0",
-            "patch-glibc-boot-2.2.5",
+            "fixture-consumer",
+            "fixture-seed-b",
             &forged,
             &d,
         )
@@ -15506,8 +15193,8 @@ daemon build START (2/2 active)
         auto_seed_provenance(
             "/td/store",
             &seeds,
-            "glibc-mesboot0",
-            "patch-glibc-boot-2.16.0",
+            "fixture-consumer",
+            "fixture-seed-a",
             &good,
             &d,
         )
@@ -15858,22 +15545,22 @@ daemon build START (2/2 active)
     // before it can reach `td_dbs` (whose entries are read per step), while a
     // present non-file is refused rather than skipped.
     #[test]
-    fn present_local_seed_db_drops_an_absent_path_and_refuses_a_non_file() {
+    fn present_seed_db_drops_an_absent_path_and_refuses_a_non_file() {
         let _d_cleanup = crate::test_temp::TempDir::new("td-present-local-db").unwrap();
         let d = _d_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(d.join("a-directory")).unwrap();
         std::fs::write(d.join("a-file.db"), b"").unwrap();
-        assert_eq!(present_local_seed_db(None).unwrap(), None);
+        assert_eq!(present_seed_db(None, "seed").unwrap(), None);
         let absent = d.join("absent.db").to_string_lossy().into_owned();
-        assert_eq!(present_local_seed_db(Some(&absent)).unwrap(), None);
+        assert_eq!(present_seed_db(Some(&absent), "seed").unwrap(), None);
         let file = d.join("a-file.db").to_string_lossy().into_owned();
         assert_eq!(
-            present_local_seed_db(Some(&file)).unwrap(),
+            present_seed_db(Some(&file), "seed").unwrap(),
             Some(file.as_str())
         );
         let dir = d.join("a-directory").to_string_lossy().into_owned();
-        let err = present_local_seed_db(Some(&dir)).unwrap_err();
+        let err = present_seed_db(Some(&dir), "local-source seed").unwrap_err();
         assert!(err.contains("not a regular file"), "{err}");
         std::fs::remove_dir_all(&d).ok();
     }
@@ -16008,7 +15695,6 @@ daemon build START (2/2 active)
                 &seeds.to_string_lossy(),
                 &d.join("seed.db").to_string_lossy(),
                 &d.join("scratch"),
-                None,
                 None,
                 None,
                 None,
@@ -16297,17 +15983,13 @@ daemon build START (2/2 active)
         std::fs::create_dir_all(&seeds).unwrap();
         std::fs::write(
             d.join("mes.json"),
-            r#"{"name":"mes","inputs":["patch-glibc-boot-2.16.0"]}"#,
+            r#"{"name":"mes","inputs":["fixture-seed-a"]}"#,
         )
         .unwrap();
-        let pinned = seed_digests_expected("patch-glibc-boot-2.16.0")
-            .unwrap()
-            .unwrap();
+        let elsewhere = intern_pinned_seed(&d.join("pinned-elsewhere"), "fixture-seed-a");
+        let pinned = elsewhere.rsplit('/').next().unwrap();
         let mut map = std::collections::BTreeMap::new();
-        map.insert(
-            "patch-glibc-boot-2.16.0".to_string(),
-            format!("/td/store/{pinned}"),
-        );
+        map.insert("fixture-seed-a".to_string(), format!("/td/store/{pinned}"));
         let err = auto_synthesize_lock(&d.to_string_lossy(), &map, "mes", "/td/store", &seeds, &d)
             .unwrap_err();
         assert!(err.contains("provenance rejected"), "{err}");
@@ -16366,41 +16048,41 @@ daemon build START (2/2 active)
         let seeds = d.join("seed-store");
         std::fs::create_dir_all(&seeds).unwrap();
         let mut map = std::collections::BTreeMap::new();
-        let in_a = intern_real_patch_seed(&seeds, "patch-glibc-boot-2.16.0");
-        let in_b = intern_real_patch_seed(&seeds, "patch-glibc-boot-2.2.5");
-        map.insert("patch-glibc-boot-2.16.0".to_string(), in_a);
-        map.insert("patch-glibc-boot-2.2.5".to_string(), in_b.clone());
+        let in_a = intern_pinned_seed(&seeds, "fixture-seed-a");
+        let in_b = intern_pinned_seed(&seeds, "fixture-seed-b");
+        map.insert("fixture-seed-a".to_string(), in_a);
+        map.insert("fixture-seed-b".to_string(), in_b.clone());
         std::fs::write(
-            d.join("gcc-mesboot0.json"),
-            r#"{"name":"gcc-mesboot0","inputs":["patch-glibc-boot-2.16.0"]}"#,
+            d.join("fixture-rung.json"),
+            r#"{"name":"fixture-rung","inputs":["fixture-seed-a"]}"#,
         )
         .unwrap();
         let before = auto_synthesize_lock(
             &d.to_string_lossy(),
             &map,
-            "gcc-mesboot0",
+            "fixture-rung",
             "/td/store",
             &seeds,
             &d,
         )
         .unwrap();
-        assert!(before.contains("patch-glibc-boot-2.16.0"));
-        assert!(!before.contains("patch-glibc-boot-2.2.5"));
+        assert!(before.contains("fixture-seed-a"));
+        assert!(!before.contains("fixture-seed-b"));
         std::fs::write(
-            d.join("gcc-mesboot0.json"),
-            r#"{"name":"gcc-mesboot0","inputs":["patch-glibc-boot-2.16.0","patch-glibc-boot-2.2.5"]}"#,
+            d.join("fixture-rung.json"),
+            r#"{"name":"fixture-rung","inputs":["fixture-seed-a","fixture-seed-b"]}"#,
         )
         .unwrap();
         let after = auto_synthesize_lock(
             &d.to_string_lossy(),
             &map,
-            "gcc-mesboot0",
+            "fixture-rung",
             "/td/store",
             &seeds,
             &d,
         )
         .unwrap();
-        assert!(after.contains(&format!("patch-glibc-boot-2.2.5 {in_b} seed")));
+        assert!(after.contains(&format!("fixture-seed-b {in_b} seed")));
         assert_ne!(
             before, after,
             "synthesized lock did not change when declared inputs changed"
@@ -17601,10 +17283,7 @@ daemon build START (2/2 active)
                 "application-capable phase runner {runner} has the wrong dispatch"
             );
         }
-        for (runner, build_fn) in [
-            ("stage0-build", "run_stage0"),
-            ("rust-dist-build", "run_rust_dist"),
-        ] {
+        for (runner, build_fn) in [("rust-dist-build", "run_rust_dist")] {
             assert!(NON_APPLICATION_PHASE_RUNNERS.contains(&runner));
             let call = format!("match build::{build_fn}()");
             assert!(
@@ -17845,10 +17524,6 @@ daemon build START (2/2 active)
             (
                 r#"{"name":"fixture","version":"1","buildSystem":"gnu","foreign":"true","application":{"runtime":"runtime","entry":"/app/bin/app"},"applicationLauncher":{"displayName":"Fixture","searchTerms":[]},"applicationPermissions":"format=1\n"}"#.to_string(),
                 "not a boolean",
-            ),
-            (
-                r#"{"name":"fixture","version":"1","buildSystem":"stage0","application":{"runtime":"runtime","entry":"/app/bin/app"}}"#.to_string(),
-                "does not admit application metadata",
             ),
             (
                 r#"{"name":"fixture","version":"1","buildSystem":"rust-dist","application":{"runtime":"runtime","entry":"/app/bin/app"}}"#.to_string(),

@@ -427,9 +427,9 @@ fn pack(output: &mut impl Write, files: &BTreeMap<String, Vec<u8>>) -> Result<()
 
 pub(crate) fn run_cli(args: &[String]) -> Result<()> {
     let [archive, checksum, arch, work] = args else {
-        return Err("usage: kernel-headers SOURCE SHA256 i386|x86_64 NEW-WORK-DIR".into());
+        return Err("usage: kernel-headers SOURCE SHA256 x86_64 NEW-WORK-DIR".into());
     };
-    if !matches!(arch.as_str(), "i386" | "x86_64")
+    if arch != "x86_64"
         || Path::new(archive).file_name().and_then(|s| s.to_str()) != Some("linux-4.14.67.tar.xz")
         || checksum.len() != 64
         || !checksum

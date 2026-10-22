@@ -1926,7 +1926,7 @@ checks the real kernel's errno and kill behavior on an unconstrained build host
 and in the QEMU target fixture. Its standalone mode additionally forks an
 unconfined i386 exit(0) through int 0x80, requiring normal exit, then repeats
 that pointer-free call after installing the filter and requires SIGSYS.
-The kernel enables this ABI for source-bootstrap execution; the filter
+The kernel enables this ABI so that this probe can prove the kill; the filter
 still kills every non-x86-64 architecture before decoding syscall numbers.
 Only that exact standalone helper's i386-exit kill joins its existing x32
 kill as excluded concurrent activity in the Firefox audit parser. It never

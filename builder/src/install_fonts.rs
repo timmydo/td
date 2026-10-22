@@ -334,7 +334,7 @@ fn install_fonts(root: &Path) -> Result<PathBuf, String> {
     }
     let plan = parse_plan(&String::from_utf8_lossy(&output.stdout))?;
     let dest = data.join(&plan.dir);
-    let cache = crate::bootstrap::shared_sources_dir();
+    let cache = crate::shared_sources_dir();
     fs::create_dir_all(&cache).map_err(|e| format!("create {}: {e}", cache.display()))?;
     let mut cold: Vec<&Pin> = plan
         .pins()

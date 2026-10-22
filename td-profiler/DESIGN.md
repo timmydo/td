@@ -31,16 +31,16 @@ Frame pointers are a property of the shipped target platform, not an opt-in
 debug profile. Every source-built user-mode object which can execute in the
 shipped system uses them, including:
 
-- the native compiler, libc, source-built libraries, and userland closure;
+- td glibc, libgcc, source-built libraries, and the userland closure;
 - target-built td control-plane programs and Rust userland;
 - registry dependency crates, build-script C/C++ objects, and direct `rustc`
   recipes.
 
 The policy covers the whole compiled closure because one omitted frame pointer
 can truncate every caller above it. Optimization, link-time optimization, and
-panic strategy remain independent choices. Bootstrap seeds, build-only
-intermediates which cannot execute in the shipped system, the kernel and
-firmware are separate contracts. Marked foreign application payloads cannot
+panic strategy remain independent choices. The Debian build root's tools,
+build-only intermediates which cannot execute in the shipped system, the
+kernel and firmware are separate contracts. Marked foreign application payloads cannot
 acquire frame pointers after the fact; §7 defines their explicit fallback.
 
 The Rust toolchain td ships is upstream's prebuilt release (AGENTS.md "Rust
@@ -780,8 +780,7 @@ identify the deployment that produced them.
 Frame-pointer call chains are the fast, always-on path for source-built td
 user mode. Coverage degrades explicitly:
 
-- a marked foreign payload or executable bootstrap seed may lack frame pointers
-  or debug information;
+- a marked foreign payload may lack frame pointers or debug information;
 - reviewed hand-written assembly may not preserve a frame chain;
 - the upstream Rust toolchain's objects have no companions, and the prebuilt
   standard library Rust outputs link has incomplete frame pointers;

@@ -1,25 +1,24 @@
 # td
 
-An immutable, Rust-first Linux distribution — built entirely from source,
-from a tiny auditable seed all the way up to the running image.
+An immutable, Rust-first Linux distribution — built from pinned sources all
+the way up to the running image.
 
 td boots onto a **read-only, content-addressed root**. Every package lives
 at its own `/td/store/<hash>-name` path, and the system you run is exactly
-the artifact graph that was built — from the `stage0-posix` seed on up. No
-host compiler and no downloaded binary ends up in the image you boot, and
-nothing in the root is mutable.
+the artifact graph that was built. No host compiler or host library enters a
+build, and nothing in the root is mutable.
 
 ## Highlights
 
 - **Immutable** — the root filesystem is a read-only erofs image. `/bin`
   is a pure symlink farm into `/td/store`; there is no `/usr` or `/sbin`.
   `/var` is persistent Btrfs state; `/run` and `/tmp` are volatile tmpfs.
-- **Built from source** — the C platform is bootstrapped from the tiny
-  `stage0-posix` seed through an iterative GCC/glibc ladder; Rust is
+- **Built from source** — glibc, libgcc, the kernel and every C library td
+  ships compile from pinned sources in a pinned Debian build root; Rust is
   upstream's pinned 1.96.0 release, retargeted onto td's glibc. Host
-  `/bin`, `/usr`, and ambient `PATH` never enter a build. (The downloaded
-  trust roots — that Rust release and the Debian build root that compiles
-  the kernel and the Rust runtime's C libraries — are pinned by SHA-256.)
+  `/bin`, `/usr`, and ambient `PATH` never enter a build. (Those two
+  downloaded trust roots, the Rust release and the Debian build root, are
+  pinned by SHA-256.)
 - **Rust-first userland** — the core file and text tools are Rust uutils, and
   the boot/login/shell path is td's own static Rust multicalls. No
   third-party multicall is shipped: the image packs nothing td did not
@@ -148,7 +147,7 @@ TD_VM_MEMORY=12288 "$HOME/td-installation/start"
 
 This gives the guest 12 GiB, matching the native update regression's memory
 allocation. The launcher's default 2 GiB is for booting and exploring the
-system. A first build reconstructs the bootstrap graph and can take many
+system. A first build builds the whole recipe graph and can take
 hours; subsequent updates reuse the retained build cache.
 
 This launcher keeps guest writes in the installation disk across boots.

@@ -27,7 +27,7 @@ use crate::types::{Recipe, Step};
 // stage-1), and the packer is td-util's gen_init_cpio. The inner cpio is packed first, then
 // embedded as a `file` in the outer cpio.
 pub fn recipe() -> Recipe {
-    let mut steps = vec![post_rust_tool_farm(None)];
+    let mut steps = vec![post_rust_tool_farm()];
 
     // ── Inner initramfs: static td-sh and td-init + a /init that prints STAGE2 then
     //    resets. td-init's `reboot` issues reboot(2) directly; `-f` is a no-op. ──
@@ -133,9 +133,6 @@ pub fn recipe() -> Recipe {
     Recipe::mesboot("kexec-spike-x86-64", "0.1")
         // post_rust_inputs adds the tool farm's providers, td-sh among them,
         // which both initramfs also pack.
-        .native_inputs(&post_rust_inputs(
-            None,
-            &["linux-x86-64", "td-kexec", "td-init"],
-        ))
+        .native_inputs(&post_rust_inputs(&["linux-x86-64", "td-kexec", "td-init"]))
         .steps(steps)
 }

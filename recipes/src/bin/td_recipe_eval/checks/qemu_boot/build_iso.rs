@@ -243,7 +243,7 @@ pub(crate) fn run(
 ) -> Result<(), String> {
     println!(
         "   [build-iso] building the td distro (system-x86-64). An unchanged tree is\n            \
-         reused whole; a cold tree climbs the whole ladder from stage0.\n"
+         reused whole; a cold tree builds every recipe.\n"
     );
     let (kernel, selector, deployment) = build_system(runner)?;
     static SEQ: AtomicU64 = AtomicU64::new(0);

@@ -48,9 +48,6 @@
 // See td-install/DESIGN.md §§5–7 for the shared-source contract.
 pub mod application;
 pub mod application_spec;
-// `bootstrap_root` parses `seed/bootstrap-root.txt`, which td-recipe-eval
-// writes and td-builder admits seeds against — one parser for both.
-pub mod bootstrap_root;
 pub mod cpio;
 pub mod crc32;
 // `debian_root` parses recipes/src/debian-root.lock: td-recipe-eval lists

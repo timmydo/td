@@ -19,11 +19,8 @@ const MAX_OSTREE_OWNER_BYTES: u64 = 4 * 1024;
 const MAX_OSTREE_ADMISSION_BYTES: u64 = 4 * 1024;
 
 fn forward_inherited_check_policy(command: &mut Command) {
-    // The stage0 opt-out decides every nested evaluator's graph too.
-    for key in [JOB_BUDGET_ENV, crate::bootstrap_root::FULL_ENV] {
-        if let Some(value) = env::var_os(key) {
-            command.env(key, value);
-        }
+    if let Some(value) = env::var_os(JOB_BUDGET_ENV) {
+        command.env(JOB_BUDGET_ENV, value);
     }
 }
 
@@ -372,17 +369,6 @@ fn reap_then_check_memoized(
     runner.check_verdict_memoized(stem, index, key)
 }
 
-/// `td-recipe-eval clear-store` — the EXPLICIT cold reset, and the ONLY path that destroys
-/// persisted build state now that `setup()` never wipes. It clears BOTH machine-wide warm
-/// caches so the next build genuinely cold-climbs from the compiled pins:
-///  1. the ladder work dir (seed store/db, the shared build-cache, every per-invocation
-///     scratch) — held under the ladder lock so it can never race a live build or boot;
-///  2. the signed substitute store (`~/.td/subst`) — otherwise the next toolchain build would
-///     FETCH the prior published closure instead of rebuilding from seed, and `clear-store`
-///     would not actually force a cold build (the substitute is optimization-only, so a cold
-///     machine simply has none). Resolved the same way the loop exposes it.
-/// Resolves the SAME ladder tree `new()` builds into: the one shared ladder under
-/// `~/.td/build-daemon` (HOME-derived).
 /// `verify-store`: run the persistent build cache's integrity fsck (`td-builder store-verify`)
 /// against THIS ladder's build cache — the on-disk check the warm reuse path skips. Opt-in and
 /// separate from `run`, so a build/boot never pays for it; run it explicitly to detect rot.
@@ -399,17 +385,19 @@ pub fn verify_store_cli(args: &[String]) -> Result<(), String> {
     runner.verify_store()
 }
 
+/// `td-recipe-eval clear-store` — the EXPLICIT cold reset, and the ONLY path that destroys
+/// persisted build state now that `setup()` never wipes. It clears the shared work dir (seed
+/// store/db, the shared build-cache, every per-invocation scratch) under its lock, so it can
+/// never race a live build or boot, and the next build is genuinely cold. Resolves the SAME
+/// tree `new()` builds into: the one shared work dir under `~/.td/build-daemon`
+/// (HOME-derived).
 pub fn clear_store_cli(args: &[String]) -> Result<(), String> {
     if !args.is_empty() {
         return Err("usage: clear-store".to_string());
     }
     let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
     let home = env::var_os("HOME").map(PathBuf::from);
-    clear_ladder(&ladder_work_dir(&root, home.as_deref()))?;
-    if let Some(subst) = subst_store_dir(home.as_deref()) {
-        clear_subst_store(&subst)?;
-    }
-    Ok(())
+    clear_ladder(&ladder_work_dir(&root, home.as_deref()))
 }
 
 /// `build-root-seed`: place the pinned Debian build root in the seed store, as
@@ -549,40 +537,6 @@ fn reap_unrooted_memos(
         }
     }
     Ok((seen, unrooted))
-}
-
-/// The machine-wide signed substitute store `clear-store` also resets: an explicit
-/// `TD_SUBST_STORE` wins, else the HOME-derived `~/.td/subst` — the exact resolution the loop
-/// (`check_loop::subst_env`) uses to EXPOSE it, so clearing hits precisely what a later build
-/// would fetch from. None when neither is available (no store to clear).
-fn subst_store_dir(home: Option<&Path>) -> Option<PathBuf> {
-    match env::var("TD_SUBST_STORE") {
-        Ok(v) if !v.trim().is_empty() => Some(PathBuf::from(v)),
-        _ => home.map(|h| h.join(".td/subst")),
-    }
-}
-
-/// Reset the substitute store under the same too-shallow/`..` guard as the ladder. No
-/// commit-lock dance: nothing here holds an open fd we must swap aside, so it is a plain
-/// rename-aside-then-reap — a concurrent reader (another worktree's fetch) keeps its open
-/// inode and degrades to a from-seed miss rather than seeing a half-deleted tree. Factored
-/// from `clear_store_cli` so the fs-level test drives it against a throwaway dir.
-fn clear_subst_store(store: &Path) -> Result<(), String> {
-    reject_unsafe_clear_target(store)?;
-    if !store.exists() {
-        println!(
-            "clear-store: substitute store {} was already absent",
-            store.display()
-        );
-        return Ok(());
-    }
-    let tomb = clearing_tombstone_path(store);
-    remove_path_if_exists(&tomb)?;
-    fs::rename(store, &tomb)
-        .map_err(|e| format!("clear-store: swap {} aside: {e}", store.display()))?;
-    remove_path_if_exists(&tomb)?;
-    println!("clear-store: reset substitute store {}", store.display());
-    Ok(())
 }
 
 /// Reset one ladder work dir under its lock. Factored from `clear_store_cli` so the fs-level
@@ -1282,7 +1236,7 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
 /// distro and write a redistributable demo VM: the boot payloads plus a
 /// POSIX-sh `start`
 /// launcher, so somebody with qemu and no td checkout can boot the system
-/// without climbing the bootstrap ladder first.
+/// without building the distribution first.
 ///
 /// Sibling of `run_cli`, and deliberately NOT terminal-gated: `run` needs a
 /// terminal because it hands the guest one, and this boots nothing. It is the
@@ -1646,192 +1600,14 @@ pub fn seed_digests_cli() -> Result<(), String> {
          # content hash. Compiled into td-recipe-eval (enforced after every seed\n\
          # derivation) and td-builder (enforced at build-plan lock synthesis).\n\
          # Regenerate with `td-recipe-eval seed-digests > seed/seed-digests.txt`\n\
-         # (warm source cache required) when a pin, seed patch, or the stage0\n\
-         # source changes. Hand-editing a row is self-defeating: the runner\n\
+         # (warm source cache required) when a pin changes. Hand-editing a row\n\
+         # is self-defeating: the runner\n\
          # re-derives from the pins every run and reds on disagreement."
     );
     for (k, b) in &rows {
         println!("{k} {b}");
     }
     Ok(())
-}
-
-/// `bootstrap-root status|pin|check` (AGENTS.md, "Target artifact graph").
-///
-/// - `status` says whether the root is pinned, still describes the ladder,
-///   and is admitted on this machine.
-/// - `pin` builds the ladder below the cut from stage0 under the current
-///   builder ABI (warm rungs reuse the shared build cache), measures the
-///   exports' reference closure and rewrites `seed/bootstrap-root.txt`.
-/// - `check` is the on-demand stage0 proof: it rebuilds the ladder from
-///   stage0 into a private, empty build cache under the pinned ABI and
-///   reports every item whose bytes or references differ from the pin.
-pub(crate) fn bootstrap_root_cli(verb: &str) -> Result<(), String> {
-    let root_dir = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
-    let root = crate::bootstrap_root::root()?;
-    if verb == "status" {
-        let runner = RecipeCheckRunner::new(root_dir, "bootstrap-root-status")?;
-        if !root.is_pinned() {
-            println!("bootstrap root: unpinned; every graph builds from stage0");
-            return Ok(());
-        }
-        println!(
-            "bootstrap root: {} exports, {} items, builder ABI {}",
-            root.exports.len(),
-            root.items.len(),
-            root.builder_abi
-        );
-        match crate::bootstrap_root::require_current() {
-            Ok(_) => println!("ladder: matches the pin"),
-            Err(e) => println!("ladder: STALE — {e}"),
-        }
-        println!(
-            "admitted here: {}",
-            if runner.bootstrap_root_present(root) {
-                "yes"
-            } else {
-                "no (the first cut build materializes it)"
-            }
-        );
-        return Ok(());
-    }
-    let (scratch, check) = match verb {
-        "pin" => ("bootstrap-root-pin", false),
-        "check" => ("bootstrap-root-check", true),
-        _ => return Err("usage: bootstrap-root status|pin|check".to_string()),
-    };
-    if check && !root.is_pinned() {
-        return Err("seed/bootstrap-root.txt is unpinned; nothing to check".to_string());
-    }
-    let runner = RecipeCheckRunner::new(root_dir.clone(), scratch)?.with_streamed_progress();
-    let _lock = lock_ladder_for_run(&runner)?;
-    let opts = if check {
-        crate::bootstrap_root::require_current()?;
-        let private = runner.scratch.join("check-cache");
-        PlanOpts {
-            builder_abi: Some(root.builder_abi.clone()),
-            cache: Some((private.join("store"), private.join("db"))),
-        }
-    } else {
-        // The ladder for a pin builds under its own ABI token, never the
-        // compiled one (`store::BUILDER_ABI`), and the measurement below runs
-        // under the same token.
-        let mut abi = runner.builder_command();
-        abi.arg("bootstrap-root").arg("abi");
-        let effective = command_output(&mut abi, "td-builder bootstrap-root abi")?;
-        PlanOpts {
-            builder_abi: Some(crate::bootstrap_root::pin_abi(effective.trim())),
-            cache: None,
-        }
-    };
-    let mut exports: Vec<(String, String)> = Vec::new();
-    for stem in crate::bootstrap_root::CUT {
-        let out = runner.build_ladder_target(stem, &opts)?;
-        let steps = parse_step_map(
-            &fs::read_to_string(&out).map_err(|e| format!("read {}: {e}", out.display()))?,
-        );
-        let base = steps
-            .get(*stem)
-            .ok_or_else(|| format!("bootstrap root: no STEP output for {stem}"))?;
-        exports.push((stem.to_string(), base.clone()));
-    }
-    let (cache_store, _) = opts
-        .cache
-        .clone()
-        .unwrap_or_else(|| runner.build_cache_paths());
-    let mut cmd = runner.builder_command();
-    match &opts.builder_abi {
-        Some(abi) => cmd.env("TD_BUILDER_ABI", abi),
-        None => cmd.env_remove("TD_BUILDER_ABI"),
-    };
-    // Items come from the build cache alone, for pin and check alike: a root
-    // is only ladder outputs, so a reference into the seed store fails as
-    // absent, and `check` cannot be answered by the admitted pin.
-    cmd.arg("bootstrap-root")
-        .arg("measure")
-        .arg("--seeds")
-        .arg(path_str(&runner.store)?)
-        .arg(path_str(&cache_store)?)
-        .arg("--");
-    for (_, base) in &exports {
-        cmd.arg(format!("{TD_STORE_DIR}/{base}"));
-    }
-    let measured = command_output(&mut cmd, "td-builder bootstrap-root measure")?;
-    let mut text = format!(
-        "format 1\nladder {}\n",
-        crate::bootstrap_root::current_ladder_digest(crate::bootstrap_root::CUT)?
-    );
-    for (stem, base) in &exports {
-        text.push_str(&format!("export {stem} {base}\n"));
-    }
-    text.push_str(&measured);
-    let built = td_engine::bootstrap_root::Root::parse(&text)?;
-    if check {
-        let report = bootstrap_root_diff(root, &built);
-        if report.is_empty() {
-            println!(
-                "bootstrap root: stage0 reproduces all {} pinned items",
-                root.items.len()
-            );
-            return Ok(());
-        }
-        return Err(format!(
-            "bootstrap root: stage0 does NOT reproduce the pin:\n  {}",
-            report.join("\n  ")
-        ));
-    }
-    let path = root_dir.join("seed/bootstrap-root.txt");
-    fs::write(&path, built.render()).map_err(|e| format!("write {}: {e}", path.display()))?;
-    println!(
-        "bootstrap root: pinned {} exports and {} items under builder ABI {} into {}",
-        built.exports.len(),
-        built.items.len(),
-        built.builder_abi,
-        path.display()
-    );
-    Ok(())
-}
-
-/// Every difference between the pinned root and one rebuilt from stage0.
-fn bootstrap_root_diff(
-    pinned: &td_engine::bootstrap_root::Root,
-    built: &td_engine::bootstrap_root::Root,
-) -> Vec<String> {
-    let mut out = Vec::new();
-    if pinned.builder_abi != built.builder_abi {
-        out.push(format!(
-            "builder ABI: pinned {}, rebuilt {}",
-            pinned.builder_abi, built.builder_abi
-        ));
-    }
-    for (stem, base) in &pinned.exports {
-        if built.export(stem) != Some(base.as_str()) {
-            out.push(format!(
-                "export {stem}: pinned {base}, rebuilt {}",
-                built.export(stem).unwrap_or("nothing")
-            ));
-        }
-    }
-    for item in &pinned.items {
-        match built.item(&item.base) {
-            None => out.push(format!("{}: not in the rebuilt closure", item.base)),
-            Some(got) if got.nar != item.nar => out.push(format!(
-                "{}: pinned {}, rebuilt {}",
-                item.base, item.nar, got.nar
-            )),
-            Some(got) if got.refs != item.refs => out.push(format!(
-                "{}: references pinned {:?}, rebuilt {:?}",
-                item.base, item.refs, got.refs
-            )),
-            Some(_) => {}
-        }
-    }
-    for item in &built.items {
-        if pinned.item(&item.base).is_none() {
-            out.push(format!("{}: rebuilt but not pinned", item.base));
-        }
-    }
-    out
 }
 
 /// local-source-roster: print (or, with `check`, verify) the catalog's
@@ -1845,7 +1621,7 @@ fn bootstrap_root_diff(
 /// pins — see its doc comment), which is exactly why editing a `td-*` source
 /// tree cannot move a row here. A row changes only when a recipe adds,
 /// removes, or renames a `local_source`/`local_source_trees` declaration.
-/// Deliberately not a `RecipeCheckRunner`: no ladder lock, no stage0
+/// Deliberately not a `RecipeCheckRunner`: no build lock, no builder
 /// placement, no store or db — this is wired to the recipes surface, which
 /// is edited constantly, and must stay a cheap, lock-free preflight.
 pub fn local_source_roster_cli(check: bool) -> Result<(), String> {
@@ -2108,8 +1884,9 @@ fn claim_scratch(scratch_root: &Path, name: &str) -> Result<(PathBuf, File), Str
 /// The ladder work dir — the tree `check-run`/`build-run` build into and the explicit
 /// `clear-store` nukes: the one shared daemon ladder under `~/.td/build-daemon` (HOME-derived),
 /// falling back to a repo-local dir only when HOME is unset. Shared by `new()` (which builds
-/// here) and `clear_store_cli` (which resets it), so both name the identical tree. There is no
-/// cold-ladder override — a from-stage0 climb is an explicit `clear-store`, nothing else.
+/// here) and `clear_store_cli` (which resets it), so both name the identical tree. A cold
+/// rebuild from the seeds is an explicit `clear-store`, nothing else. The `ladder` names are
+/// historical: renaming them would orphan every machine's shared cache.
 fn ladder_work_dir(root: &Path, home: Option<&Path>) -> PathBuf {
     // Fixed trust/layout epoch (same basename in both branches). Bump only on a trust/layout
     // change, not a pin. The repo-local fallback is HOME-unset only.
@@ -2301,28 +2078,17 @@ fn ladder_lock_path(lw: &Path) -> PathBuf {
 /// reclaim on demand, and an opt-in
 /// `TD_CHECK_LADDER_CACHE_CAP_BYTES` enables a coarse high-watermark eviction of the whole
 /// `build-cache/` (store + db + `db.receipts` sidecars — the coherent unit the builder writes).
-/// How one `build_plan_with` differs from an ordinary build.
-#[derive(Default)]
-struct PlanOpts {
-    /// `TD_BUILDER_ABI` for the builder: the ABI the bootstrap root's paths
-    /// were pinned under.
-    builder_abi: Option<String>,
-    /// A build-output cache other than the shared one: `bootstrap-root
-    /// check`'s private, initially empty cache.
-    cache: Option<(PathBuf, PathBuf)>,
-}
-
 fn build_cache_paths(lw: &Path) -> (PathBuf, PathBuf) {
     let base = lw.join("build-cache");
     (base.join("store"), base.join("db"))
 }
 
-/// sha256 over the evaluator binary, the builder's engine fingerprint, every
-/// `seed/patches/*.patch`, and every committed `cargo_locks` file, in a fixed
-/// order — the pure-plan fingerprint that keys the build-run reuse memo. Recipes
-/// and seed pins are compiled INTO the binaries (a change rebuilds them and
-/// re-keys; the builder's fingerprint covers what a build can execute and not
-/// its host tooling); a patch change alters a hashed file; and a rust rung's committed
+/// sha256 over the evaluator binary, the builder's engine fingerprint, and
+/// every committed `cargo_locks` file, in a fixed order — the pure-plan
+/// fingerprint that keys the build-run reuse memo. Recipes and seed pins are
+/// compiled INTO the binaries (a change rebuilds them and re-keys; the
+/// builder's fingerprint covers what a build can execute and not its host
+/// tooling); and a rust recipe's committed
 /// `Cargo.lock` is the one build input read from the repo at build time rather
 /// than compiled in, so a lock bump (which changes that rung's output) must
 /// re-key here too. A `local_source` recipe (#469) is the same shape as a lock:
@@ -2336,7 +2102,6 @@ fn build_cache_paths(lw: &Path) -> (PathBuf, PathBuf) {
 fn plan_fingerprint(
     eval: &Path,
     builder_engine: &str,
-    patches_dir: &Path,
     repo_root: &Path,
     cargo_locks: &[String],
     local_sources: &[String],
@@ -2345,74 +2110,28 @@ fn plan_fingerprint(
     let bytes = fs::read(eval).map_err(|e| format!("read {}: {e}", eval.display()))?;
     hash_field(&mut h, &bytes);
     hash_field(&mut h, builder_engine.as_bytes());
-    hash_repo_inputs(&mut h, patches_dir, repo_root, cargo_locks, local_sources)?;
+    hash_repo_inputs(&mut h, repo_root, cargo_locks, local_sources)?;
     Ok(crate::sha256::to_base16(&h.finalize()))
 }
 
 /// The plan inputs read from the REPO at build time rather than compiled in —
-/// the seed patches, and the closure's committed cargo locks and local-source
-/// trees — hashed into `h` in a fixed, length-delimited order. Shared by the
+/// the closure's committed cargo locks and local-source trees — hashed into
+/// `h` in a fixed, length-delimited order. Shared by the
 /// build-run memo's fingerprint and the check verdict key, so the two cannot
 /// disagree about what a build reads. `cargo_locks` and `local_sources` must
 /// each be sorted and deduped by the caller; a declared lock or source dir
 /// that cannot be read fails closed.
 fn hash_repo_inputs(
     h: &mut crate::sha256::Sha256,
-    patches_dir: &Path,
     repo_root: &Path,
     cargo_locks: &[String],
     local_sources: &[String],
 ) -> Result<(), String> {
-    hash_seed_patches(h, patches_dir)?;
     for rel in cargo_locks {
         hash_cargo_lock(h, repo_root, rel)?;
     }
     for rel in local_sources {
         hash_local_source(h, repo_root, rel)?;
-    }
-    Ok(())
-}
-
-/// The seed patches' part of `hash_repo_inputs`.
-fn hash_seed_patches(h: &mut crate::sha256::Sha256, patches_dir: &Path) -> Result<(), String> {
-    // Only a MISSING patch dir hashes as zero patches (a tree that GAINS the dir
-    // re-keys by growing the hashed list). Any other read error — and any entry
-    // error — fails closed: silently dropping a patch from the key would let a
-    // stale memo survive a real patch change and serve wrong bytes.
-    let mut names: Vec<String> = match fs::read_dir(patches_dir) {
-        Ok(rd) => {
-            let mut v = Vec::new();
-            for entry in rd {
-                let entry =
-                    entry.map_err(|e| format!("read_dir entry {}: {e}", patches_dir.display()))?;
-                // Skip a directory that happens to be named `*.patch`: `fs::read`
-                // on it below would fail the whole fingerprint (and thus the
-                // build). A file_type() error still fails closed.
-                let ft = entry
-                    .file_type()
-                    .map_err(|e| format!("file_type {}: {e}", entry.path().display()))?;
-                if ft.is_dir() {
-                    continue;
-                }
-                if let Some(name) = entry.file_name().to_str() {
-                    if name.ends_with(".patch") {
-                        v.push(name.to_string());
-                    }
-                }
-            }
-            v
-        }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
-        Err(e) => return Err(format!("read_dir {}: {e}", patches_dir.display())),
-    };
-    names.sort();
-    for name in &names {
-        let p = patches_dir.join(name);
-        let bytes = fs::read(&p).map_err(|e| format!("read {}: {e}", p.display()))?;
-        h.update(&(name.len() as u64).to_le_bytes());
-        h.update(name.as_bytes());
-        h.update(&(bytes.len() as u64).to_le_bytes());
-        h.update(&bytes);
     }
     Ok(())
 }
@@ -3351,11 +3070,6 @@ pub(crate) struct RecipeCheckRunner {
     /// Store paths this pin table's seed db vouches: `None` until first asked, then
     /// kept current as this run registers — see `db_vouches`.
     vouched: std::sync::Mutex<Option<HashSet<String>>>,
-    /// Targets whose prepared graph stages the bootstrap root: their plan
-    /// names the root db (`build_plan`).
-    rooted: std::sync::Mutex<HashSet<String>>,
-    /// Whether this run has verified (or admitted) the bootstrap root.
-    root_verified: std::sync::Mutex<bool>,
     /// The exclusive claim on `scratch`, held for this runner's whole life: it is what
     /// tells a peer's reaper that this tree is live (see `claim_scratch`). `None` only
     /// in tests, which construct the struct directly and share no ladder.
@@ -3431,9 +3145,6 @@ fn store_path_recursive_with(
 
 #[derive(Debug)]
 pub(crate) enum SeedInput {
-    Stage0 {
-        key: String,
-    },
     Source {
         key: String,
         pin: SourcePin,
@@ -3446,10 +3157,6 @@ pub(crate) enum SeedInput {
         key: String,
         arch: &'static str,
     },
-    Patch {
-        key: String,
-        patch: String,
-    },
     /// An IN-TREE source directory (#469 local-source provenance): `path` is the
     /// repo-relative dir the recipe's `local_source` names, `trees` the sibling
     /// dirs its `local_source_trees` stage beside it. Interned by copying the
@@ -3461,24 +3168,15 @@ pub(crate) enum SeedInput {
         path: String,
         trees: Vec<String>,
     },
-    /// A pinned bootstrap-root export (`seed/bootstrap-root.txt`): a ladder
-    /// rung a cut graph stages at its pinned path instead of building. Its
-    /// key is the rung's stem.
-    BootstrapRoot {
-        key: String,
-    },
 }
 
 impl SeedInput {
     pub(crate) fn key(&self) -> &str {
         match self {
-            SeedInput::Stage0 { key }
-            | SeedInput::Source { key, .. }
+            SeedInput::Source { key, .. }
             | SeedInput::Ostree { key, .. }
             | SeedInput::LinuxHeaders { key, .. }
-            | SeedInput::Patch { key, .. }
-            | SeedInput::LocalSource { key, .. }
-            | SeedInput::BootstrapRoot { key } => key,
+            | SeedInput::LocalSource { key, .. } => key,
         }
     }
 }
@@ -3539,8 +3237,6 @@ impl RecipeCheckRunner {
             daemon_dir,
             stream_progress: false,
             vouched: std::sync::Mutex::new(None),
-            rooted: std::sync::Mutex::new(HashSet::new()),
-            root_verified: std::sync::Mutex::new(false),
             _scratch_lock: Some(scratch_lock),
             // A runner a confined check's build spawned (a nested
             // `build-run`, `check-run`) holds to the same builds.
@@ -3642,7 +3338,7 @@ impl RecipeCheckRunner {
         if checked == 0 {
             return Err(format!(
                 "nothing to verify: neither a seed db under {} nor the build cache db {} \
-                 exists — build the ladder first (e.g. `td-recipe-eval run system-x86-64`)",
+                 exists — build something first (e.g. `td-recipe-eval run system-x86-64`)",
                 self.db.parent().unwrap_or(&self.lw).display(),
                 cache_db.display()
             ));
@@ -3790,8 +3486,8 @@ impl RecipeCheckRunner {
         fs::write(&stamp, b"").map_err(|e| format!("write {}: {e}", stamp.display()))
     }
 
-    /// Every pin table's seed db on this ladder, and the bootstrap root's, sorted so a
-    /// failure names the same one run to run. Dotfiles are skipped: the table generator and cold-seed candidate
+    /// Every pin table's seed db on this ladder, sorted so a failure names the
+    /// same one run to run. Dotfiles are skipped: the table generator and cold-seed candidate
     /// paths keep their disposable dbs here too, and neither is authority.
     fn seed_dbs(&self) -> Result<Vec<PathBuf>, String> {
         let Some(dir) = self.db.parent() else {
@@ -4184,43 +3880,6 @@ impl RecipeCheckRunner {
         self.store_add_recursive_into(intern_name, &file, db)
     }
 
-    fn intern_patch(&self, intern_name: &str, patch: &str, db: &Path) -> Result<String, String> {
-        let file = self
-            .root
-            .join("seed")
-            .join("patches")
-            .join(format!("{patch}.patch"));
-        if !file.is_file() {
-            return Err(format!("ladder: missing {}", file.display()));
-        }
-        self.store_add_recursive_into(intern_name, &file, db)
-    }
-
-    fn intern_stage0_source(&self, intern_name: &str, db: &Path) -> Result<String, String> {
-        let tarball = self.stage0_source_tarball()?;
-        let extract = self.scratch.join("stage0-source-extract");
-        remove_path_if_exists(&extract)?;
-        fs::create_dir_all(&extract).map_err(|e| format!("mkdir {}: {e}", extract.display()))?;
-        let tar_s = path_str(&tarball)?;
-        let extract_s = path_str(&extract)?;
-        let mut cmd = self.builder_command();
-        cmd.arg("tar-gz-extract").arg(tar_s).arg(extract_s);
-        command_output(&mut cmd, "td-builder tar-gz-extract stage0 source")?;
-        let stage0 = single_subdir_path(&extract)?;
-        clean_stage0_build_dirs(&stage0)?;
-        if !stage0
-            .join("bootstrap-seeds/POSIX/AMD64/hex0-seed")
-            .is_file()
-            || !stage0.join("AMD64/mescc-tools-seed-kaem.kaem").is_file()
-        {
-            return Err(format!(
-                "{} did not unpack to the expected stage0 source tree",
-                tarball.display()
-            ));
-        }
-        self.store_add_recursive_into(intern_name, &stage0, db)
-    }
-
     /// Stage an IN-TREE source directory for hashing (#469 local-source
     /// provenance): resolve the repo-relative path and copy the committed source
     /// (minus `target`/`.git`) into scratch. The staged tree is what both the
@@ -4324,20 +3983,6 @@ impl RecipeCheckRunner {
         }
         self.stage_store_path(&derived)?;
         Ok(derived)
-    }
-
-    fn stage0_source_tarball(&self) -> Result<PathBuf, String> {
-        let pin = source_pin_for_key("stage0-source")?;
-        validate_source_file_basename(&pin)?;
-        let tarball = self.sources_dir.join(&pin.file);
-        if !tarball.is_file() {
-            return Err(format!(
-                "ladder: pinned stage0 source not warm ({}) - run 'td-feed warm sources'",
-                tarball.display()
-            ));
-        }
-        verify_source_pin(&tarball, &pin)?;
-        Ok(tarball)
     }
 
     /// The content-addressed store path `src` WOULD intern at — computed, nothing
@@ -4518,14 +4163,6 @@ impl RecipeCheckRunner {
     fn emit_recipe_graph(&self, nodes: &[RecipeNode]) -> Result<(), String> {
         fs::create_dir_all(&self.recipes)
             .map_err(|e| format!("mkdir {}: {e}", self.recipes.display()))?;
-        // `build-plan --auto` builds an input whose JSON is present. A cut
-        // graph stages the root's exports instead, so a JSON an earlier
-        // full-ladder plan in this run left behind must not outlive it.
-        for stem in crate::bootstrap_root::CUT {
-            if !nodes.iter().any(|n| n.stem == *stem) {
-                remove_path_if_exists(&self.recipes.join(format!("{stem}.json")))?;
-            }
-        }
         for node in nodes {
             fs::write(
                 self.recipes.join(format!("{}.json", node.stem)),
@@ -4560,21 +4197,12 @@ impl RecipeCheckRunner {
         let tdstore = self.scratch.join("tdstore");
         fs::create_dir_all(&tdstore).map_err(|e| format!("mkdir {}: {e}", tdstore.display()))?;
         let mut entries: Vec<(String, String)> = Vec::new();
-        let mut rooted = false;
         for input in classify_graph_inputs(nodes)? {
-            rooted |= matches!(input, SeedInput::BootstrapRoot { .. });
             let derived = self.ensure_seed_input(&input)?;
             entries.push((input.key().to_string(), derived));
         }
         if nodes.iter().any(|node| node.recipe.build_root) {
             self.ensure_build_root()?;
-        }
-        if let Ok(mut set) = self.rooted.lock() {
-            if rooted {
-                set.insert(target.to_string());
-            } else {
-                set.remove(target);
-            }
         }
         self.write_auto_map(target, &entries)
     }
@@ -4617,9 +4245,6 @@ impl RecipeCheckRunner {
     fn ensure_seed_input(&self, input: &SeedInput) -> Result<String, String> {
         if let SeedInput::LocalSource { key, path, trees } = input {
             return self.ensure_local_source(key, path, trees);
-        }
-        if let SeedInput::BootstrapRoot { key } = input {
-            return self.ensure_root_export(key);
         }
         if let SeedInput::Ostree { pin, .. } = input {
             validate_ostree_pin(pin)?;
@@ -4733,154 +4358,23 @@ impl RecipeCheckRunner {
 
     fn derive_seed_input_into(&self, input: &SeedInput, db: &Path) -> Result<String, String> {
         match input {
-            SeedInput::Stage0 { key } => self.intern_stage0_source(key, db),
             SeedInput::Source { key, pin } => self.intern_source(key, pin, db),
             SeedInput::Ostree { key, pin } => self.intern_ostree(key, pin, db),
             SeedInput::LinuxHeaders { key, arch } => self.intern_linux_headers(key, arch, db),
-            SeedInput::Patch { key, patch } => self.intern_patch(key, patch, db),
             SeedInput::LocalSource { key, path, trees } => {
                 self.intern_local_source(key, path, trees, db)
             }
-            SeedInput::BootstrapRoot { key } => Err(format!(
-                "bootstrap-root export `{key}' is built by the ladder, not derived from a pin"
-            )),
         }
-    }
-
-    /// The local db admitting this checkout's pinned root, keyed by the
-    /// manifest so worktrees pinning different roots never share one.
-    /// Beside the keyed seed dbs, so admission commits into the seed store
-    /// under the seed store's own commit lock (`lock_store_commit`).
-    fn bootstrap_root_db(&self) -> PathBuf {
-        let key = crate::bootstrap_root::manifest_key();
-        self.lw.join("seed-db").join(format!(
-            "bootstrap-root-{}.db",
-            key.get(..16).unwrap_or(&key)
-        ))
-    }
-
-    /// The root db TARGET's prepared graph stages, if it stages the root:
-    /// what its plan, and any build that consumes its outputs, must name.
-    pub(crate) fn bootstrap_root_db_for(&self, target: &str) -> Result<Option<PathBuf>, String> {
-        Ok(self
-            .rooted
-            .lock()
-            .map_err(|_| "bootstrap root: poisoned target set".to_string())?
-            .contains(target)
-            .then(|| self.bootstrap_root_db()))
-    }
-
-    fn bootstrap_root_present(&self, root: &td_engine::bootstrap_root::Root) -> bool {
-        self.bootstrap_root_db().is_file()
-            && root
-                .items
-                .iter()
-                .all(|item| self.store.join(&item.base).symlink_metadata().is_ok())
-    }
-
-    /// The pinned root, admitted into this machine's seed store: built once
-    /// from stage0 here when it is not, then admitted against the pin. The
-    /// builder re-authenticates the db and every item's bytes per plan.
-    fn ensure_bootstrap_root(&self) -> Result<&'static td_engine::bootstrap_root::Root, String> {
-        let root = crate::bootstrap_root::require_current()?;
-        let mut verified = self
-            .root_verified
-            .lock()
-            .map_err(|_| "bootstrap root: poisoned verification".to_string())?;
-        if *verified {
-            return Ok(root);
-        }
-        if self.bootstrap_root_present(root) {
-            // Re-hashed once per run: a rotted or replaced item would
-            // otherwise fail every plan's authentication with nothing to
-            // repair it.
-            match self.verify_bootstrap_root() {
-                Ok(()) => {
-                    *verified = true;
-                    return Ok(root);
-                }
-                // Admission re-checks under the lock and repairs in place.
-                Err(e) => {
-                    eprintln!("bootstrap root: re-admitting after a failed verification: {e}")
-                }
-            }
-        }
-        eprintln!(
-            "bootstrap root: not admitted on this machine; building the ladder below the \
-             gcc-14 cut from stage0 under builder ABI {} (once per machine)",
-            root.builder_abi
-        );
-        let opts = PlanOpts {
-            builder_abi: Some(root.builder_abi.clone()),
-            cache: None,
-        };
-        for stem in crate::bootstrap_root::CUT {
-            self.build_ladder_target(stem, &opts)?;
-        }
-        let (cache_store, _) = self.build_cache_paths();
-        self.admit_bootstrap_root(&[cache_store, self.store.clone()])?;
-        *verified = true;
-        Ok(root)
-    }
-
-    fn verify_bootstrap_root(&self) -> Result<(), String> {
-        let mut cmd = self.builder_command();
-        cmd.arg("bootstrap-root")
-            .arg("verify")
-            .arg(path_str(&self.store)?)
-            .arg(path_str(&self.bootstrap_root_db())?);
-        command_output(&mut cmd, "td-builder bootstrap-root verify").map(|_| ())
-    }
-
-    fn admit_bootstrap_root(&self, src_dirs: &[PathBuf]) -> Result<(), String> {
-        let db = self.bootstrap_root_db();
-        if let Some(parent) = db.parent() {
-            fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
-        }
-        let mut cmd = self.builder_command();
-        cmd.arg("bootstrap-root")
-            .arg("admit")
-            .arg(path_str(&self.store)?)
-            .arg(path_str(&db)?);
-        for dir in src_dirs {
-            cmd.arg(path_str(dir)?);
-        }
-        command_output(&mut cmd, "td-builder bootstrap-root admit").map(|_| ())
-    }
-
-    /// One ladder rung, planned from stage0 whatever the cut, outside any
-    /// check's build confinement: the root is shared machine state, not part
-    /// of the requesting check's verdict.
-    fn build_ladder_target(&self, stem: &str, opts: &PlanOpts) -> Result<PathBuf, String> {
-        let graph = recipe_closure_full(&[stem])?;
-        self.ensure_graph_inputs(stem, &graph)?;
-        self.emit_recipe_graph(&graph)?;
-        self.build_plan_with(stem, opts)
-    }
-
-    /// A cut graph's export: the root, admitted and staged into this run's
-    /// td-store beside the outputs a plan stages there.
-    fn ensure_root_export(&self, key: &str) -> Result<String, String> {
-        let root = self.ensure_bootstrap_root()?;
-        let base = root
-            .export(key)
-            .ok_or_else(|| format!("seed/bootstrap-root.txt exports no `{key}'"))?;
-        // Staged like every seed: an independent copy, so an edit to the
-        // operator-visible td-store can never reach the admitted bytes.
-        for item in &root.items {
-            self.stage_store_path(&format!("{TD_STORE_DIR}/{}", item.base))?;
-        }
-        Ok(format!("{TD_STORE_DIR}/{base}"))
     }
 
     pub(crate) fn build_plan(&self, target: &str) -> Result<PathBuf, String> {
         self.build_clock.time(|| {
             self.ensure_build_allowed(target)?;
-            self.build_plan_with(target, &PlanOpts::default())
+            self.build_plan_unclocked(target)
         })
     }
 
-    fn build_plan_with(&self, target: &str, opts: &PlanOpts) -> Result<PathBuf, String> {
+    fn build_plan_unclocked(&self, target: &str) -> Result<PathBuf, String> {
         // The auto map is the FRESH per-run map prepare_recipe_target wrote from this
         // graph's re-derived, pin-verified seeds (every non-owned input is an interned
         // seed source). There is no tools map — a host executable is not an admissible
@@ -4912,7 +4406,6 @@ impl RecipeCheckRunner {
         // safe — every db in that list is read per step.
         let local_seed_db = local_seed_db_path(&self.lw, &self.scratch_id());
         let local_seed_db_s = path_str(&local_seed_db)?;
-        let root_db = self.bootstrap_root_db_for(target)?;
         let mut cmd = Command::new(&self.tb);
         cmd.current_dir(&self.root)
             .env_clear()
@@ -4947,14 +4440,6 @@ impl RecipeCheckRunner {
             .arg(path_str(&self.db)?)
             .arg(scratch)
             .arg(local_seed_db_s);
-        if let Some(db) = &root_db {
-            cmd.arg(path_str(db)?);
-        }
-        // The ladder rebuilt for the root keeps the ABI its paths were pinned
-        // under, so its outputs land at the pinned basenames.
-        if let Some(abi) = &opts.builder_abi {
-            cmd.env("TD_BUILDER_ABI", abi);
-        }
         // Cross-run reuse is ALWAYS on (re #469 build speed): point the chain at the
         // DEDICATED build-output cache (build_cache_paths, under the ladder work dir), kept
         // SEPARATE from the seed store/db (self.store/self.db). Each UNCHANGED rung is reused
@@ -4964,8 +4449,8 @@ impl RecipeCheckRunner {
         // rebuilds, so the rung under development always rebuilds. The cache is SHARED across
         // worktrees and content-addressed, so a pin change is just a different-drv miss
         // (rebuild), never a wipe — divergent branches reuse each other's unchanged rungs.
-        // The ONLY way to force a from-stage0 cold climb is the explicit `clear-store`, which
-        // resets the whole ladder. Automatic GC keeps what each worktree's last runs
+        // The ONLY way to force a cold rebuild is the explicit `clear-store`, which resets
+        // the whole work dir. Automatic GC keeps what each worktree's last runs
         // recorded (`gc_roots`, written below); the optional
         // TD_CHECK_LADDER_CACHE_CAP_BYTES cap evicts the entire build cache.
         // Concurrent writers to the cache are the ordinary case now that build-runs hold
@@ -4982,10 +4467,7 @@ impl RecipeCheckRunner {
         // OUTPUT committed there would be rejected as an unpinned seed. Keeping the cache a
         // distinct store/db pair keeps the seed authority clean and makes reuse compatible
         // with #468 (which then reuses through the same persistent_realization).
-        let (cache_store, cache_db) = opts
-            .cache
-            .clone()
-            .unwrap_or_else(|| self.build_cache_paths());
+        let (cache_store, cache_db) = self.build_cache_paths();
         cmd.env("TD_PERSIST_STORE", path_str(&cache_store)?)
             .env("TD_PERSIST_DB", path_str(&cache_db)?);
         // Host-side human commands stream the build's stdout AND stderr live so a cold
@@ -4994,22 +4476,13 @@ impl RecipeCheckRunner {
         // `check-run` never streams so its captured log stays byte-identical. All paths
         // return the same (status, stdout, stderr) triple, so the file/tail/scan below is shared.
         let stream = self.stream_progress && !quiet_requested();
-        // A rung is a root once its STEP line says it is committed, so a build stopped
-        // part way keeps what it finished for its retry; a private cache (the
-        // bootstrap-root proof's) is not the shared one the records root.
-        let key = crate::gc_roots::build_key(target, opts.builder_abi.is_some());
-        let recorder = opts.cache.is_none().then(|| {
-            (
-                self.lw.clone(),
-                self.root.clone(),
-                key.clone(),
-                self.scratch_id(),
-            )
-        });
+        // An output is a root once its STEP line says it is committed, so a build stopped
+        // part way keeps what it finished for its retry.
+        let key = crate::gc_roots::build_key(target);
+        let (lw, root, tag) = (self.lw.clone(), self.root.clone(), self.scratch_id());
+        let record_key = key.clone();
         let on_line = move |line: &[u8]| {
-            let Some((lw, root, key, tag)) = &recorder else {
-                return;
-            };
+            let (lw, root, key, tag) = (&lw, &root, &record_key, &tag);
             let steps = parse_step_map(&String::from_utf8_lossy(line));
             if steps.is_empty() {
                 return;
@@ -5038,7 +4511,7 @@ impl RecipeCheckRunner {
             .map_err(|e| format!("write {}: {e}", err_file.display()))?;
         // A completed build's rungs replace its record: what it no longer names is no
         // longer this worktree's to keep. A failed one keeps what it added line by line.
-        if opts.cache.is_none() && status.success() {
+        if status.success() {
             let steps = parse_step_map(&String::from_utf8_lossy(&stdout_bytes));
             let update = crate::gc_roots::Update::ReplaceOutputs;
             self.record_gc_roots(&key, steps.into_values(), None, update);
@@ -5327,8 +4800,8 @@ impl RecipeCheckRunner {
     }
 
     /// The compiled-plan fingerprint for TARGET: sha256 over the running evaluator
-    /// binary, the staged builder's engine fingerprint, every
-    /// `seed/patches/*.patch`, and every committed `Cargo.lock` a rung in
+    /// binary, the staged builder's engine fingerprint, and every committed
+    /// `Cargo.lock` a recipe in
     /// TARGET's closure vendors from, and the builder's engine fingerprint (its
     /// engine equally determines the output bytes a reuse skips; its host
     /// tooling determines none of them) and the closure's
@@ -5342,22 +4815,13 @@ impl RecipeCheckRunner {
         let eval = env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
         let closure = recipe_closure(&[target])?;
         let (locks, local_sources) = closure_repo_inputs(&closure);
-        let fingerprint = plan_fingerprint(
+        plan_fingerprint(
             &eval,
             &self.builder_engine_fingerprint()?,
-            &self.root.join("seed/patches"),
             &self.root,
             &locks,
             &local_sources,
-        )?;
-        // Whether the graph stops at the pinned root is decided at run time
-        // (`TD_BOOTSTRAP_FROM_STAGE0`), so it keys the memo too: a stage0
-        // run must not reuse what a cut run recorded.
-        Ok(if crate::bootstrap_root::cut_for(&[target])?.is_some() {
-            fingerprint
-        } else {
-            td_engine::sha256::hex_digest(format!("{fingerprint} from-stage0").as_bytes())
-        })
+        )
     }
 
     /// The verdict memo key for check `index` of `stem`: sha256 over every
@@ -5464,10 +4928,6 @@ impl RecipeCheckRunner {
         out.push((
             "builder-engine".to_string(),
             self.builder_engine_fingerprint()?,
-        ));
-        out.push((
-            "seed-patches".to_string(),
-            digest_of(|h| hash_seed_patches(h, &self.root.join("seed/patches")))?,
         ));
         let (locks, local_sources) = closure_repo_inputs(&closure);
         for rel in &locks {
@@ -5829,7 +5289,7 @@ impl RecipeCheckRunner {
         // A hit. Record the memo and every tree it names as this run's roots, which
         // is what lets an unchanged plan keep hitting here after a sweep.
         self.record_gc_roots(
-            &crate::gc_roots::build_key(target, false),
+            &crate::gc_roots::build_key(target),
             map.values().cloned(),
             Some(&self.build_run_memo_path(target, fingerprint)),
             crate::gc_roots::Update::Replace,
@@ -5867,7 +5327,7 @@ impl RecipeCheckRunner {
             staged.push(dst);
         }
         eprintln!(
-            "   [reuse] {target} unchanged (plan {}): skipped seed-inputs, planning, and the ladder climb",
+            "   [reuse] {target} unchanged (plan {}): skipped seed-inputs, planning, and the build",
             fingerprint.get(..12).unwrap_or(fingerprint)
         );
         Ok(Some(staged))
@@ -5932,7 +5392,7 @@ impl RecipeCheckRunner {
         fs::rename(&tmp, &path)
             .map_err(|e| format!("rename {} -> {}: {e}", tmp.display(), path.display()))?;
         self.record_gc_roots(
-            &crate::gc_roots::build_key(target, false),
+            &crate::gc_roots::build_key(target),
             steps.values().cloned(),
             Some(&path),
             crate::gc_roots::Update::Replace,
@@ -5998,33 +5458,8 @@ impl RecipeCheckRunner {
     }
 }
 
-/// TARGETS' recipe graph as it builds: stopped at the pinned bootstrap root
-/// when one applies (`bootstrap_root::cut_for`), whose exports then stage
-/// as `SeedInput::BootstrapRoot` seeds instead of recipe nodes.
+/// TARGETS' recipe graph as it builds, dependencies first.
 pub(crate) fn recipe_closure(targets: &[&str]) -> Result<Vec<RecipeNode>, String> {
-    let Some(cut) = crate::bootstrap_root::cut_for(targets)? else {
-        return recipe_closure_full(targets);
-    };
-    let nodes = recipe_closure_cut(targets, &cut)?;
-    // A cut graph builds nothing below the cut: a rung here would build on
-    // root items typed AuditedSeed at the paths a full climb types otherwise.
-    let ladder = crate::bootstrap_root::ladder()?;
-    if let Some(node) = nodes.iter().find(|n| ladder.contains(&n.stem)) {
-        return Err(format!(
-            "bootstrap root: {} reaches ladder rung `{}' past the cut",
-            targets.join(" "),
-            node.stem
-        ));
-    }
-    Ok(nodes)
-}
-
-/// TARGETS' whole graph down to stage0, whatever the root says.
-pub(crate) fn recipe_closure_full(targets: &[&str]) -> Result<Vec<RecipeNode>, String> {
-    recipe_closure_cut(targets, &BTreeSet::new())
-}
-
-fn recipe_closure_cut(targets: &[&str], cut: &BTreeSet<&str>) -> Result<Vec<RecipeNode>, String> {
     // The catalog is CONSTRUCTED once and then indexed. `catalog::lookup` builds
     // all 98 recipes and searches linearly, and this walk asked it once per node
     // and once more per EDGE, which is most of what a pure graph question costs.
@@ -6034,7 +5469,6 @@ fn recipe_closure_cut(targets: &[&str], cut: &BTreeSet<&str>) -> Result<Vec<Reci
     let mut out = Vec::new();
     let mut walk = Walk {
         catalog: &catalog,
-        cut,
         visiting: &mut visiting,
         emitted: &mut emitted,
         out: &mut out,
@@ -6047,8 +5481,6 @@ fn recipe_closure_cut(targets: &[&str], cut: &BTreeSet<&str>) -> Result<Vec<Reci
 
 struct Walk<'a> {
     catalog: &'a BTreeMap<&'a str, Recipe>,
-    /// Stems the walk does not enter: the bootstrap root's exports.
-    cut: &'a BTreeSet<&'a str>,
     visiting: &'a mut HashSet<String>,
     emitted: &'a mut HashSet<String>,
     out: &'a mut Vec<RecipeNode>,
@@ -6165,13 +5597,8 @@ pub(crate) fn checks_reaching(scope: &[&str]) -> Result<BTreeMap<String, String>
         let mut closure = Vec::new();
         let (mut visiting, mut emitted) = (HashSet::new(), HashSet::new());
         let roots = owner_roots(stem, recipe);
-        let root_refs: Vec<&str> = roots.iter().map(String::as_str).collect();
-        // The graph the check builds: a ladder edit reaches a post-cut check
-        // only through the pin, whose staleness `cargo-test` reports.
-        let cut = crate::bootstrap_root::cut_for(&root_refs)?.unwrap_or_default();
         let mut walk = Walk {
             catalog: &catalog,
-            cut: &cut,
             visiting: &mut visiting,
             emitted: &mut emitted,
             out: &mut closure,
@@ -6272,7 +5699,7 @@ fn visit_recipe(stem: &str, walk: &mut Walk) -> Result<(), String> {
         .get(stem)
         .ok_or_else(|| format!("ladder: no td recipe for `{stem}'"))?
         .clone();
-    let enters = |walk: &Walk, dep: &str| walk.catalog.contains_key(dep) && !walk.cut.contains(dep);
+    let enters = |walk: &Walk, dep: &str| walk.catalog.contains_key(dep);
     if let Some(native_inputs) = &recipe.native_inputs {
         for dep in native_inputs {
             if enters(walk, dep) {
@@ -6318,9 +5745,9 @@ fn push_seed_input(inputs: &mut Vec<SeedInput>, seen: &mut HashSet<String>, inpu
 ///
 ///   - **RecipeOutput** — the input names another td recipe in the catalog,
 ///     realized by an earlier plan step;
-///   - **AuditedSeed** — the input names a pinned, hash-verified source /
-///     seed patch / stage0 artifact, interned into the ladder store by td's
-///     own addToStore.
+///   - **AuditedSeed** — the input names a pinned, hash-verified source or
+///     the frozen kernel headers, interned into the store by td's own
+///     addToStore.
 ///
 /// ANYTHING else is rejected HERE, during planning — there is no host-tool
 /// class, no lock of store paths, no PATH lookup, and no store discovery.
@@ -6330,11 +5757,11 @@ fn push_seed_input(inputs: &mut Vec<SeedInput>, seen: &mut HashSet<String>, inpu
 /// is still a declared dependency, so it is classified here like any other. A
 /// channel that skipped this would be one whose paths reach a build with no
 /// provenance class at all, which is precisely the ingress #469 exists to stop.
-/// A rung that declares scaffolding the chain has not built
+/// A recipe that declares a host tool no recipe builds
 /// (bash, coreutils, make, …) fails closed with `PROVENANCE_REJECTED` until
 /// that tool exists as a recipe output. Deliberately pure — no subprocess, no
 /// filesystem — so the entry points run it BEFORE any ambient execution
-/// (stage0 placement, interning): a rejected graph executes NOTHING.
+/// (builder placement, interning): a rejected graph executes NOTHING.
 pub(crate) fn classify_graph_inputs(nodes: &[RecipeNode]) -> Result<Vec<SeedInput>, String> {
     // Built ONCE per call. `catalog::lookup` CONSTRUCTS every recipe in the
     // catalog and then searches linearly, and the marked-ness question is asked
@@ -6465,15 +5892,6 @@ fn visit_step_templates(
             visit("unpack.input", input, true)?;
             visit("unpack.dest", dest, false)?;
         }
-        Step::MesBoot {
-            source,
-            nyacc,
-            stage0,
-        } => {
-            visit("mesBoot.source", source, false)?;
-            visit("mesBoot.nyacc", nyacc, false)?;
-            visit("mesBoot.stage0", stage0, false)?;
-        }
         Step::CopyFiles { files, dest } => {
             for file in files {
                 visit("copyFiles.files", file, false)?;
@@ -6543,10 +5961,6 @@ fn visit_step_templates(
         }
         Step::MkDir { path } => visit("mkDir.path", path, false)?,
         Step::Truncate { path, bytes: _ } => visit("truncate.path", path, false)?,
-        Step::PatchShebangs { dir, shell } => {
-            visit("patchShebangs.dir", dir, false)?;
-            visit("patchShebangs.shell", shell, false)?;
-        }
         Step::RelocateLdScripts { dir, prefix } => {
             visit("relocateLdScripts.dir", dir, false)?;
             visit("relocateLdScripts.prefix", prefix, false)?;
@@ -6665,7 +6079,6 @@ fn classify_graph_inputs_with(
     // linearly, and this asks it once per INPUT across the whole graph. It only
     // ever tests existence, so a stem set answers the same question.
     let catalog_stems: HashSet<&str> = catalog::all().into_iter().map(|(stem, _)| stem).collect();
-    let node_stems: HashSet<&str> = nodes.iter().map(|n| n.stem.as_str()).collect();
     let mut seen = HashSet::new();
     let mut seed_inputs = Vec::new();
     for node in nodes {
@@ -6684,17 +6097,6 @@ fn classify_graph_inputs_with(
             .flatten()
         {
             if catalog_stems.contains(input.as_str()) {
-                // A cut walk stops at the root's exports: an export the
-                // graph does not build is staged from the pinned root.
-                if !node_stems.contains(input.as_str())
-                    && crate::bootstrap_root::CUT.contains(&input.as_str())
-                {
-                    push_seed_input(
-                        &mut seed_inputs,
-                        &mut seen,
-                        SeedInput::BootstrapRoot { key: input.clone() },
-                    );
-                }
                 continue;
             }
             match seed_input_for_recipe_input(input)? {
@@ -6713,11 +6115,11 @@ pub(crate) struct PayloadClosure {
     /// Every recipe the targets' closure reaches.
     pub(crate) members: usize,
     /// Distinct audited SEED INPUTS the closure declares — the pinned sources,
-    /// stage0 artifacts, seed patches and local sources the planning pass
-    /// classified. Reported because the count above it must not be read as
-    /// "nothing prebuilt is in here": `rust-toolchain` is the upstream Rust
-    /// release and a member of this very closure, and stage0-posix is a seed.
-    /// Both are td's declared trust roots, which AGENTS.md's claim names as
+    /// frozen kernel headers and local sources the planning pass classified.
+    /// Reported because the count above it must not be read as "nothing
+    /// prebuilt is in here": `rust-toolchain` is the upstream Rust release
+    /// and a member of this very closure, and the Debian build root builds
+    /// most of it. Both are td's declared trust roots, which AGENTS.md's claim names as
     /// its exception; §B.8's mark is about APPLICATION payloads and says
     /// nothing about them.
     pub(crate) seeds: usize,
@@ -7168,39 +6570,11 @@ fn warm_operator_inputs(runner: &RecipeCheckRunner, targets: &[&str]) {
 }
 
 fn special_seed_input(key: &str) -> Result<Option<SeedInput>, String> {
-    if key == "stage0-source" {
-        return Ok(Some(SeedInput::Stage0 {
-            key: key.to_string(),
-        }));
-    }
-    if key == "linux-headers" {
-        return Ok(Some(SeedInput::LinuxHeaders {
-            key: key.to_string(),
-            arch: "i386",
-        }));
-    }
     if key == "linux-headers-x86-64" {
         return Ok(Some(SeedInput::LinuxHeaders {
             key: key.to_string(),
             arch: "x86_64",
         }));
-    }
-    if let Some(patch) = key.strip_prefix("patch-") {
-        if patch.is_empty() {
-            return Err(format!("ladder: malformed patch input `{key}'"));
-        }
-        // A pinned source whose key happens to start with `patch-` (the GNU
-        // patch program's own `patch-mesboot-source`) is a Source, not a
-        // seed/patches/*.patch file — the pin table wins over the prefix
-        // convention. Every run hits this (seeds re-derive from their pins
-        // each run; there is no map short-circuit): the misclassification
-        // fails the whole chain on intern_patch's missing-file check.
-        if source_pins::by_key(key).is_none() {
-            return Ok(Some(SeedInput::Patch {
-                key: key.to_string(),
-                patch: patch.to_string(),
-            }));
-        }
     }
     Ok(None)
 }
@@ -7458,7 +6832,7 @@ fn dir_size_capped(path: &Path, cap: u64) -> u64 {
 /// the explicit `clear-store`, and a rare over-cap
 /// eviction is opt-in for operators who want bounded auto-reclaim (an implicit default-cap
 /// eviction would itself be a surprise cold-climb). The `TD_CHECK_` prefix is load-bearing —
-/// the `td-builder check` sandbox forwards only `TD_CHECK_*` / `TD_SUBST_*` / `TD_DAEMON_*`,
+/// the `td-builder check` sandbox forwards only `TD_CHECK_*` / `TD_DAEMON_*`,
 /// so a bare `TD_LADDER_…` name would be stripped before it reached the in-sandbox runner.
 fn explicit_ladder_cache_cap() -> Option<u64> {
     parse_cache_cap(env::var("TD_CHECK_LADDER_CACHE_CAP_BYTES").ok().as_deref())
@@ -8074,33 +7448,6 @@ fn make_file_user_writable(path: &Path, meta: &fs::Metadata) -> Result<(), Strin
     fs::set_permissions(path, perms).map_err(|e| format!("chmod u+rw {}: {e}", path.display()))
 }
 
-fn single_subdir_path(dir: &Path) -> Result<PathBuf, String> {
-    let mut subdirs = Vec::new();
-    for path in read_dir_sorted(dir)? {
-        if path.is_dir() {
-            subdirs.push(path);
-        }
-    }
-    match subdirs.len() {
-        1 => subdirs
-            .pop()
-            .ok_or_else(|| format!("expected one top-level dir under {}", dir.display())),
-        n => Err(format!(
-            "expected one top-level dir under {}, found {n}",
-            dir.display()
-        )),
-    }
-}
-
-fn clean_stage0_build_dirs(root: &Path) -> Result<(), String> {
-    for dir in ["AMD64/artifact", "AMD64/bin"] {
-        let path = root.join(dir);
-        remove_path_if_exists(&path)?;
-        fs::create_dir_all(&path).map_err(|e| format!("mkdir {}: {e}", path.display()))?;
-    }
-    Ok(())
-}
-
 fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
     let meta = fs::symlink_metadata(src)?;
     let ftype = meta.file_type();
@@ -8474,30 +7821,6 @@ mod tests {
                 },
             ),
             (
-                "mesBoot.source",
-                Step::MesBoot {
-                    source: bad(BAD),
-                    nyacc: "{in:nyacc}".into(),
-                    stage0: "{in:stage0}".into(),
-                },
-            ),
-            (
-                "mesBoot.nyacc",
-                Step::MesBoot {
-                    source: "{src}".into(),
-                    nyacc: bad(BAD),
-                    stage0: "{in:stage0}".into(),
-                },
-            ),
-            (
-                "mesBoot.stage0",
-                Step::MesBoot {
-                    source: "{src}".into(),
-                    nyacc: "{in:nyacc}".into(),
-                    stage0: bad(BAD),
-                },
-            ),
-            (
                 "copyFiles.files",
                 Step::CopyFiles {
                     files: vec![bad(BAD)],
@@ -8650,20 +7973,6 @@ mod tests {
                 },
             ),
             (
-                "patchShebangs.dir",
-                Step::PatchShebangs {
-                    dir: bad(BAD),
-                    shell: "{in:bash}/bin/bash".into(),
-                },
-            ),
-            (
-                "patchShebangs.shell",
-                Step::PatchShebangs {
-                    dir: "{src}".into(),
-                    shell: bad(BAD),
-                },
-            ),
-            (
                 "relocateLdScripts.dir",
                 Step::RelocateLdScripts {
                     dir: bad(BAD),
@@ -8702,7 +8011,7 @@ mod tests {
                 Step::AssertEfiApplication { path: bad(BAD) },
             ),
         ];
-        assert_eq!(cases.len(), 39, "every expanded, non-data field is listed");
+        assert_eq!(cases.len(), 34, "every expanded, non-data field is listed");
         let mut expected: HashSet<(&'static str, bool)> =
             cases.iter().map(|(field, _)| (*field, false)).collect();
         assert_eq!(expected.len(), cases.len(), "field labels must be distinct");
@@ -8975,7 +8284,7 @@ mod tests {
     /// refusal or prove the audit runs over every closure node.
     #[test]
     fn the_planning_pass_audits_payload_templates_on_every_node() {
-        const PAYLOAD: &str = "gcc-mesboot0";
+        const PAYLOAD: &str = "zlib-x86-64";
         let clean = || RecipeNode {
             stem: "clean".into(),
             recipe: Recipe::mesboot("clean", "1"),
@@ -8984,7 +8293,7 @@ mod tests {
             stem: "image".into(),
             recipe: Recipe::mesboot("image", "1")
                 .payload_inputs(&[PAYLOAD])
-                .steps(vec![Step::run("{root}", &["{in:gcc-mesboot0}/bin/gcc"])]),
+                .steps(vec![Step::run("{root}", &["{in:zlib-x86-64}/bin/gcc"])]),
         };
         for nodes in [vec![clean(), dirty()], vec![dirty(), clean()]] {
             let error = classify_graph_inputs_with(&nodes, |_| false)
@@ -9126,11 +8435,11 @@ mod tests {
         // classification accepts it and this refusal is the only thing that can
         // red. A made-up name would be rejected anyway, for a different reason,
         // and the test would pass with the refusal deleted.
-        const MARKED: &str = "gcc-mesboot0";
+        const MARKED: &str = "zlib-x86-64";
         let clean = || {
             node(
                 "clean",
-                Recipe::mesboot("clean", "0").inputs(&["binutils-mesboot0"]),
+                Recipe::mesboot("clean", "0").inputs(&["gcc-runtime"]),
             )
         };
         let dirty = || node("dirty", Recipe::mesboot("dirty", "0").inputs(&[MARKED]));
@@ -9337,7 +8646,7 @@ mod tests {
             );
         }
         assert!(
-            names > 40,
+            names > 30,
             "{names} pins — the sweep must have something to do"
         );
         // The ALIASES too, since `by_key` resolves one to the pin and
@@ -9360,11 +8669,11 @@ mod tests {
         };
         // Real catalog stems, so the graph classifies cleanly and the refusal
         // is the only thing that can red it. A made-up name reds anyway.
-        const MARKED: &str = "gcc-mesboot0";
+        const MARKED: &str = "zlib-x86-64";
         let clean = || {
             node(
                 "clean",
-                Recipe::mesboot("clean", "0").inputs(&["binutils-mesboot0"]),
+                Recipe::mesboot("clean", "0").inputs(&["gcc-runtime"]),
             )
         };
         let dirty = || {
@@ -9577,7 +8886,7 @@ mod tests {
         // A SMALLER target answers with fewer members, which is what tells a
         // query that reads its argument from one that answers the same thing
         // whatever it is asked.
-        let smaller = payload_closure_report(&["binutils-mesboot0".to_string()]).unwrap();
+        let smaller = payload_closure_report(&["zlib-x86-64".to_string()]).unwrap();
         assert!(
             members(&smaller) > 0 && members(&smaller) < members(&default),
             "{smaller}"
@@ -9607,7 +8916,7 @@ mod tests {
         // refusal attributable to the provenance and not to the fixture.
         let good = vec![node(
             "rung",
-            Recipe::gnu("rung", "1").inputs(&["binutils-mesboot0"]),
+            Recipe::gnu("rung", "1").inputs(&["gcc-runtime"]),
         )];
         assert_eq!(payload_closure_of(&good, |_| false).unwrap().members, 1);
     }
@@ -9615,26 +8924,6 @@ mod tests {
     /// The shipped deployment's exact containment answer. The two imported
     /// packages and their shared runtime must be listed as foreign recipes and
     /// source pins while the image that stages them remains unmarked.
-    /// Nothing the image builds reaches the stage0 ladder: no member of its
-    /// uncut closure is on the ladder's side of the bootstrap-root cut, and
-    /// cutting there, whatever the environment asks, removes nothing.
-    #[test]
-    fn the_deployment_reaches_no_ladder_recipe() {
-        let targets = [PAYLOAD_CLOSURE_DEFAULT];
-        let full = recipe_closure_full(&targets).unwrap();
-        let ladder: Vec<&str> = full
-            .iter()
-            .map(|node| node.stem.as_str())
-            .filter(|stem| crate::bootstrap_root::ladder_side(stem).unwrap())
-            .collect();
-        assert!(ladder.is_empty(), "the deployment builds {ladder:?}");
-        let cut: BTreeSet<&str> = crate::bootstrap_root::CUT.iter().copied().collect();
-        assert_eq!(
-            recipe_closure_cut(&targets, &cut).unwrap().len(),
-            full.len()
-        );
-    }
-
     #[test]
     fn the_shipped_deployment_reports_only_its_three_foreign_payloads() {
         let answer = payload_closure(&[PAYLOAD_CLOSURE_DEFAULT]).unwrap();
@@ -9879,10 +9168,10 @@ chmod 755 '{}'
     // closure must refuse at argv validation — not red after the whole build.
     #[test]
     fn build_cli_refuses_output_outside_target_closure() {
-        let err = build_cli(&["stage0".to_string(), "mes".to_string()])
-            .expect_err("mes is not in stage0's closure");
+        let err = build_cli(&["zlib-x86-64".to_string(), "td-util".to_string()])
+            .expect_err("td-util is not in zlib-x86-64's closure");
         assert!(
-            err.contains("not in the recipe closure of 'stage0'"),
+            err.contains("not in the recipe closure of 'zlib-x86-64'"),
             "got: {err}"
         );
     }
@@ -9966,6 +9255,16 @@ chmod 755 '{}'
     // longer sufficient — the db must also carry the row (see `db_vouches`) —
     // and reading it for real would need the builder this runner deliberately lacks.
     // `a_warm_tree_this_tables_db_does_not_vouch_is_re_registered` covers the gate itself.
+    /// A real pinned source: the table pins it, and nothing here fetches it.
+    const PINNED: &str = "zlib-x86-64-source";
+
+    fn pinned_source(key: &str) -> SeedInput {
+        SeedInput::Source {
+            key: key.to_string(),
+            pin: source_pin_for_key(key).unwrap(),
+        }
+    }
+
     #[test]
     fn warm_seed_store_answers_for_a_pin_but_never_for_a_local_source() {
         let lw = env::temp_dir().join(format!("td-warm-seed-{}", process::id()));
@@ -9975,23 +9274,18 @@ chmod 755 '{}'
         fs::create_dir_all(&runner.root).unwrap();
         fs::create_dir_all(&runner.store).unwrap();
         fs::create_dir_all(&runner.scratch).unwrap();
-        fs::create_dir_all(runner.store.join(pinned_basename("stage0-source"))).unwrap();
+        fs::create_dir_all(runner.store.join(pinned_basename(PINNED))).unwrap();
         *runner.vouched.lock().unwrap() = Some(
-            ["stage0-source"]
+            [PINNED]
                 .iter()
                 .map(|k| format!("{TD_STORE_DIR}/{}", pinned_basename(k)))
                 .collect(),
         );
 
         let warm = runner
-            .ensure_seed_input(&SeedInput::Stage0 {
-                key: "stage0-source".into(),
-            })
+            .ensure_seed_input(&pinned_source(PINNED))
             .expect("a pinned seed interned at its table basename is a warm hit");
-        assert_eq!(
-            warm,
-            format!("{TD_STORE_DIR}/{}", pinned_basename("stage0-source"))
-        );
+        assert_eq!(warm, format!("{TD_STORE_DIR}/{}", pinned_basename(PINNED)));
 
         // A REAL roster key (`td-mail-source`/`td-mail`, re #469
         // local-source-roster split's runtime declaration cross-check), so
@@ -10027,21 +9321,16 @@ chmod 755 '{}'
         fs::create_dir_all(&runner.root).unwrap();
         fs::create_dir_all(&runner.store).unwrap();
         fs::create_dir_all(&runner.scratch).unwrap();
-        fs::create_dir_all(runner.store.join(pinned_basename("stage0-source"))).unwrap();
+        fs::create_dir_all(runner.store.join(pinned_basename(PINNED))).unwrap();
         // No db at all — a pin table that has never run on this ladder.
         assert!(!runner.db.exists());
         assert!(
-            !runner.db_vouches(&format!(
-                "{TD_STORE_DIR}/{}",
-                pinned_basename("stage0-source")
-            )),
+            !runner.db_vouches(&format!("{TD_STORE_DIR}/{}", pinned_basename(PINNED))),
             "an absent db vouches nothing, which is the fail-closed direction"
         );
 
         let err = runner
-            .ensure_seed_input(&SeedInput::Stage0 {
-                key: "stage0-source".into(),
-            })
+            .ensure_seed_input(&pinned_source(PINNED))
             .expect_err("a warm tree the db does not vouch must re-register, not short-circuit");
         assert!(
             err.contains("store-path-recursive"),
@@ -10056,9 +9345,10 @@ chmod 755 '{}'
     // called `seed_digests::require`. B still used that ancestor table; its next
     // build authenticated the whole shared db and rejected A's unpinned row.
     //
-    // Drive both sides with a real td-builder. First a small compiled-table patch
-    // takes the cold success path through candidate derivation, the table gate,
-    // and keyed-db promotion. Then a tiny worktree-only source verifies its pin
+    // Drive both sides with a real td-builder. First a tiny source this test pins
+    // beside the compiled table (`seed_digests::pin_for_test`) takes the cold
+    // success path through candidate derivation, the table gate, and keyed-db
+    // promotion. Then a tiny worktree-only source verifies its pin
     // and enters the shared content-addressed store, but the compiled table rejects
     // its not-yet-added key. That rejection must leave the existing authority db
     // byte-identical. Verified red with candidate interning changed back to
@@ -10089,12 +9379,29 @@ chmod 755 '{}'
             !runner.db.exists(),
             "this table starts with no authority rows"
         );
+        let pinned_bytes = b"a source this table pins\n";
+        let pinned_file = "worktree-b-pinned-source.tar";
+        let pinned_path = runner.sources_dir.join(pinned_file);
+        fs::write(&pinned_path, pinned_bytes).unwrap();
+        let pinned_key = "worktree-b-pinned-source";
+        let derived = runner
+            .store_path_recursive(pinned_key, &pinned_path)
+            .unwrap();
+        crate::seed_digests::pin_for_test(
+            pinned_key,
+            derived.strip_prefix(&format!("{TD_STORE_DIR}/")).unwrap(),
+        );
         let authorized = runner
-            .ensure_seed_input(&SeedInput::Patch {
-                key: "patch-binutils-boot-2.20.1a".into(),
-                patch: "binutils-boot-2.20.1a".into(),
+            .ensure_seed_input(&SeedInput::Source {
+                key: pinned_key.to_string(),
+                pin: SourcePin::new(
+                    pinned_key,
+                    "https://example.invalid/b",
+                    &sha256sum(pinned_bytes),
+                    pinned_file,
+                ),
             })
-            .expect("a compiled-table patch promotes after its cold derivation");
+            .expect("a pinned source promotes after its cold derivation");
         assert!(
             runner.db_vouches(&authorized),
             "the successful promotion must register the authorized row"
@@ -10104,7 +9411,7 @@ chmod 755 '{}'
         assert_eq!(
             items_before_rejection.len(),
             1,
-            "the authorized patch is the first shared store item"
+            "the authorized source is the first shared store item"
         );
 
         let bytes = b"a worktree-only pinned source\n";
@@ -10135,7 +9442,7 @@ chmod 755 '{}'
         let candidate = shared_items
             .iter()
             .find(|item| !items_before_rejection.contains(item))
-            .expect("the shared store contains A's candidate in addition to B's patch");
+            .expect("the shared store contains A's candidate in addition to B's source");
         let a_table_db = runner
             .db
             .parent()
@@ -10248,8 +9555,8 @@ chmod 755 '{}'
         }
         fs::create_dir_all(&runner.store).unwrap();
         fs::create_dir_all(&runner.scratch).unwrap();
-        // A retained ladder: one interned seed plus its KEYED db.
-        fs::create_dir_all(runner.store.join(pinned_basename("stage0-source"))).unwrap();
+        // A retained store: one interned seed plus its KEYED db.
+        fs::create_dir_all(runner.store.join(pinned_basename("zlib-x86-64-source"))).unwrap();
         fs::create_dir_all(runner.db.parent().unwrap()).unwrap();
         fs::write(&runner.db, b"the retained seed registrations").unwrap();
         let store_before = dir_listing(&runner.store);
@@ -10559,15 +9866,15 @@ chmod 755 '{}'
     #[test]
     fn auto_map_serializes_the_current_graph_seeds_as_name_space_path_lines() {
         let entries = vec![
-            ("mes-source".to_string(), "/td/store/aaa-mes".to_string()),
+            ("gcc-14-source".to_string(), "/td/store/aaa-gcc".to_string()),
             (
-                "stage0-source".to_string(),
-                "/td/store/bbb-stage0".to_string(),
+                "zlib-x86-64-source".to_string(),
+                "/td/store/bbb-zlib".to_string(),
             ),
         ];
         assert_eq!(
             serialize_auto_map(&entries),
-            "mes-source /td/store/aaa-mes\nstage0-source /td/store/bbb-stage0\n"
+            "gcc-14-source /td/store/aaa-gcc\nzlib-x86-64-source /td/store/bbb-zlib\n"
         );
         // No entries ⇒ an empty map (not a stray newline).
         assert_eq!(serialize_auto_map(&[]), "");
@@ -10589,23 +9896,6 @@ chmod 755 '{}'
     }
 
     #[test]
-    fn pinned_patch_prefixed_source_is_a_source_not_a_seed_patch() {
-        // `patch-mesboot-source` pins the GNU patch PROGRAM's tarball; the
-        // `patch-` prefix convention must not shadow it into a (nonexistent)
-        // seed/patches/mesboot-source.patch — that broke every cold-host
-        // chain build at the first mesboot rung.
-        assert!(special_seed_input("patch-mesboot-source")
-            .unwrap()
-            .is_none());
-        match special_seed_input("patch-binutils-boot-2.20.1a").unwrap() {
-            Some(SeedInput::Patch { patch, .. }) => {
-                assert_eq!(patch, "binutils-boot-2.20.1a")
-            }
-            _ => panic!("expected the binutils-boot seed patch input"),
-        }
-    }
-
-    #[test]
     fn trailing_pid_parses_only_a_numeric_suffix() {
         // scratch_name appends `-<pid>` — the reaper keys on exactly that.
         assert_eq!(trailing_pid("build-oyacc-4059"), Some(4059));
@@ -10623,7 +9913,7 @@ chmod 755 '{}'
     fn scratch_name_round_trips_through_trailing_pid() {
         // Whatever scratch_name emits stays recognizable as one of our trees — both
         // as emitted and after a claim has disambiguated it.
-        let n = scratch_name("build", &["oyacc"]);
+        let n = scratch_name("build", &["zlib-x86-64"]);
         assert_eq!(trailing_pid(&n), Some(process::id()));
         assert!(reapable_scratch(&n));
         assert!(reapable_scratch(&format!("{n}.2")));
@@ -10919,8 +10209,6 @@ chmod 755 '{}'
             daemon_dir: None,
             stream_progress: false,
             vouched: std::sync::Mutex::new(None),
-            rooted: std::sync::Mutex::new(HashSet::new()),
-            root_verified: std::sync::Mutex::new(false),
             // Not claimed: this runner shares no ladder with anything.
             _scratch_lock: None,
             allowed_builds: None,
@@ -11081,37 +10369,6 @@ chmod 755 '{}'
         let err = clear_store_cli(&["extra".to_string()]).unwrap_err();
         assert!(err.contains("usage: clear-store"));
         let _ = fs::remove_dir_all(env::temp_dir().join(format!("td-clear-{}", process::id())));
-    }
-
-    // `clear-store` also resets the signed substitute store, so a post-clear toolchain build
-    // cold-climbs from seed instead of fetching the prior publish. Driven through
-    // `clear_subst_store` (the env-free core) against a throwaway tree.
-    #[test]
-    fn clear_store_nukes_the_substitute_store() {
-        let store = env::temp_dir()
-            .join(format!("td-subst-clear-{}", process::id()))
-            .join(".td")
-            .join("subst");
-        let tomb = clearing_tombstone_path(&store);
-        let _ = fs::remove_dir_all(&store);
-        let _ = fs::remove_dir_all(&tomb);
-        // A populated store: the stashed td-subst binary + a signed narinfo, as a publisher leaves it.
-        fs::create_dir_all(&store).unwrap();
-        fs::write(store.join("td-subst"), b"bin").unwrap();
-        fs::write(store.join("abc.narinfo"), b"StorePath: /td/store/abc").unwrap();
-
-        clear_subst_store(&store).unwrap();
-
-        // The whole store is gone and the swap-aside tombstone did not leak.
-        assert!(!store.exists());
-        assert!(!tomb.exists());
-        // Idempotent: clearing an already-absent store is a no-op Ok.
-        clear_subst_store(&store).unwrap();
-        assert!(!store.exists());
-        // The too-shallow guard still fires (a bare `$HOME` is not a substitute store).
-        assert!(clear_subst_store(Path::new("/a")).is_err());
-        let _ =
-            fs::remove_dir_all(env::temp_dir().join(format!("td-subst-clear-{}", process::id())));
     }
 
     // The coarse GC evicts the whole build-cache when it exceeds the cap, and does so
@@ -11770,60 +11027,50 @@ chmod 755 '{}'
 
     #[test]
     fn recipe_closure_is_derived_from_catalog_edges() {
-        let graph = recipe_closure_full(&["hello-test"]).unwrap();
+        let graph = recipe_closure(&["rust-toolchain"]).unwrap();
         let stems: Vec<&str> = graph.iter().map(|node| node.stem.as_str()).collect();
 
         for expected in [
-            "stage0",
-            "mes",
-            "gcc-x86-64-stage2",
-            "gcc-x86-64-native",
-            "binutils-x86-64-native",
-            "make-x86-64",
-            "hello",
-            "hello-test",
+            "glibc-x86-64",
+            "gcc-runtime",
+            "zlib-x86-64",
+            "rust-toolchain",
         ] {
             assert!(
                 stems.iter().any(|stem| stem == &expected),
-                "missing {expected} from hello-test closure: {stems:?}"
+                "missing {expected} from rust-toolchain closure: {stems:?}"
             );
         }
 
-        let hello_pos = stems.iter().position(|stem| stem == &"hello").unwrap();
-        let test_pos = stems.iter().position(|stem| stem == &"hello-test").unwrap();
+        let glibc_pos = stems
+            .iter()
+            .position(|stem| stem == &"glibc-x86-64")
+            .unwrap();
+        let rust_pos = stems
+            .iter()
+            .position(|stem| stem == &"rust-toolchain")
+            .unwrap();
         assert!(
-            hello_pos < test_pos,
+            glibc_pos < rust_pos,
             "dependency should be emitted before dependent: {stems:?}"
         );
-
-        // With a pinned root the same target's build graph stops at the cut.
-        if crate::bootstrap_root::root().unwrap().is_pinned() {
-            let cut = recipe_closure(&["hello-test"]).unwrap();
-            let cut: Vec<&str> = cut.iter().map(|node| node.stem.as_str()).collect();
-            assert!(cut.contains(&"hello"), "{cut:?}");
-            for below in ["stage0", "mes", "gcc-14", "glibc-mesboot"] {
-                assert!(!cut.contains(&below), "{below} in the cut graph: {cut:?}");
-            }
-        }
     }
 
-    /// The real bootstrap graph is host-free: planning provenance ACCEPTS every
-    /// real target, because each rung in every target's closure resolves each
+    /// The real graph is host-free: planning provenance ACCEPTS every real
+    /// target, because each recipe in every target's closure resolves each
     /// input to a catalog recipe output or a pinned seed. This is a regression
     /// guard — a reintroduced host input would red here, before any build. The
     /// `synthetic_recipes_with_forbidden_inputs_are_rejected_at_planning` test
     /// below keeps the negative direction covered.
     #[test]
-    fn real_bootstrap_graph_is_host_free_at_planning() {
+    fn real_graph_is_host_free_at_planning() {
         for target in [
-            "make-test",
-            "gcc-x86-64-stage2-test",
-            "gcc-x86-64-native-test",
-            "gcc-x86-64-self-test",
             // The kernel's test pulls its whole closure, the build root
             // among it.
             "linux-x86-64-test",
-            "hello-test",
+            "rust-toolchain-test",
+            "build-root-hello-test",
+            "system-x86-64",
         ] {
             if let Err(err) = ensure_targets_provenance(&[target]) {
                 panic!("{target}: expected host-free provenance to pass, got: {err}");
@@ -11878,7 +11125,7 @@ chmod 755 '{}'
                 "`{tool}' must not classify as a seed input"
             );
         }
-        assert!(seed_input_for_recipe_input("stage0-source")
+        assert!(seed_input_for_recipe_input("zlib-x86-64-source")
             .unwrap()
             .is_some());
         assert!(seed_input_for_recipe_input("linux-headers-x86-64")
@@ -11913,8 +11160,6 @@ chmod 755 '{}'
             daemon_dir: None,
             stream_progress: false,
             vouched: std::sync::Mutex::new(None),
-            rooted: std::sync::Mutex::new(HashSet::new()),
-            root_verified: std::sync::Mutex::new(false),
             _scratch_lock: None,
             allowed_builds: None,
         };
@@ -11974,8 +11219,11 @@ chmod 755 '{}'
         }
         let owner = catalog::lookup("rust-toolchain").unwrap();
         assert_eq!(owner_roots("rust-toolchain", &owner), roots);
-        let hello = catalog::lookup("hello-test").unwrap();
-        assert_eq!(owner_roots("hello-test", &hello), ["hello-test"]);
+        let hello = catalog::lookup("build-root-hello-test").unwrap();
+        assert_eq!(
+            owner_roots("build-root-hello-test", &hello),
+            ["build-root-hello-test"]
+        );
 
         let lw = env::temp_dir().join(format!("td-allowed-builds-{}", process::id()));
         let free = shared_test_runner(&lw);
@@ -12025,23 +11273,21 @@ chmod 755 '{}'
     /// beside a reached entry too, so the gate runs every check.
     #[test]
     fn a_recipe_source_reaches_the_checks_of_its_readers() {
-        // uutils is in rust-toolchain's declared builds, and in the owner
-        // closure of every check built on the post-Rust tool farm, the
-        // build-only gawk's first; that set grows as recipes move onto it.
+        // uutils is in rust-toolchain's declared builds and an input of
+        // rust-toolchain-test.
         for scope in [
             "recipes/src/recipes/uutils.rs",
             "recipes/locks/uutils/Cargo.lock",
         ] {
             let reach = checks_reaching(&[scope]).expect(scope);
-            for check in [
-                "gawk-x86-64-self-test",
-                "make-x86-64-self-test",
-                "rust-toolchain",
-            ] {
+            for check in ["rust-toolchain-test", "rust-toolchain"] {
                 assert!(reach.contains_key(check), "{scope}: {reach:?}");
             }
-            // The bootstrap side builds before uutils exists.
-            assert!(!reach.contains_key("hello-test"), "{scope}: {reach:?}");
+            // Below the Rust toolchain, nothing builds uutils.
+            assert!(
+                !reach.contains_key("build-root-hello-test"),
+                "{scope}: {reach:?}"
+            );
             assert!(reach["rust-toolchain"].contains(scope), "{reach:?}");
         }
         // td-jail-test names firefox's module; so does system-x86-64,
@@ -12050,30 +11296,17 @@ chmod 755 '{}'
         assert!(firefox.contains_key("td-jail-test"), "{firefox:?}");
         let why = &firefox["openssh-x86-64-test"];
         assert!(why.contains("system-x86-64's module"), "{why}");
-        assert!(!firefox.contains_key("hello-test"), "{firefox:?}");
-        // A data file reaches what builds on the recipe embedding it: with a
-        // pinned root, only the checks that still build the ladder.
-        let mk = checks_reaching(&["recipes/src/recipes/bash-mesboot.mk"]).unwrap();
-        assert!(!mk.is_empty());
         assert!(
-            mk.values().all(|why| why.contains("bash-mesboot reads")),
-            "{mk:?}"
+            !firefox.contains_key("build-root-hello-test"),
+            "{firefox:?}"
         );
-        if crate::bootstrap_root::root().unwrap().is_pinned() {
-            assert!(!mk.contains_key("hello-test"), "{mk:?}");
-            for stem in mk.keys() {
-                let roots = owner_roots(stem, &catalog::lookup(stem).unwrap());
-                let refs: Vec<&str> = roots.iter().map(String::as_str).collect();
-                assert!(
-                    crate::bootstrap_root::cut_for_with(&refs, false)
-                        .unwrap()
-                        .is_none(),
-                    "{stem} is reached but builds above the cut"
-                );
-            }
-        } else {
-            assert!(mk.contains_key("hello-test"), "{mk:?}");
-        }
+        // A data file reaches what builds on the recipe embedding it.
+        let probe = checks_reaching(&["recipes/src/probes/rust_clippy.rs"]).unwrap();
+        assert!(probe.contains_key("rust-toolchain-test"), "{probe:?}");
+        assert!(
+            probe.values().all(|why| why.contains(" reads")),
+            "{probe:?}"
+        );
         for scope in [
             "recipes/src/types.rs",
             "recipes/build.rs",
@@ -12279,7 +11512,7 @@ chmod 755 '{}'
         let seed = runner.store.join("seed-sentinel");
         fs::write(&seed, b"seed").unwrap();
         let stamp = lw.join("automatic-gc");
-        let key = crate::gc_roots::build_key("test", false);
+        let key = crate::gc_roots::build_key("test");
 
         runner.maybe_gc_store();
         assert!(dead.exists(), "nothing recorded: nothing is collected");
@@ -13101,7 +12334,6 @@ chmod 755 '{}'
             "sources system-x86-64",
             "recipe td-btrfs",
             "builder-engine",
-            "seed-patches",
         ] {
             assert!(names.contains(&name), "{name}: {names:?}");
         }
@@ -13382,81 +12614,6 @@ chmod 755 '{}'
         );
     }
 
-    #[test]
-    fn a_cut_walk_stages_the_root_instead_of_climbing_the_ladder() {
-        let cut: BTreeSet<&str> = crate::bootstrap_root::CUT.iter().copied().collect();
-        let ladder = crate::bootstrap_root::ladder().unwrap();
-        let nodes = recipe_closure_cut(&["gcc-x86-64-self"], &cut).unwrap();
-        assert!(nodes.iter().all(|n| !ladder.contains(&n.stem)));
-        let seeds = classify_graph_inputs(&nodes).unwrap();
-        let staged: BTreeSet<&str> = seeds
-            .iter()
-            .filter_map(|s| match s {
-                SeedInput::BootstrapRoot { key } => Some(key.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert!(staged.contains("gcc-14") && staged.contains("glibc-mesboot"));
-        assert!(staged.iter().all(|k| cut.contains(k)));
-        assert!(!seeds.iter().any(|s| matches!(s, SeedInput::Stage0 { .. })));
-        // The same target walked whole climbs from stage0.
-        let full = recipe_closure_full(&["gcc-x86-64-self"]).unwrap();
-        assert!(full.iter().any(|n| n.stem == "gcc-mesboot"));
-        let full_seeds = classify_graph_inputs(&full).unwrap();
-        assert!(full_seeds
-            .iter()
-            .any(|s| matches!(s, SeedInput::Stage0 { .. })));
-        assert!(!full_seeds
-            .iter()
-            .any(|s| matches!(s, SeedInput::BootstrapRoot { .. })));
-    }
-
-    #[test]
-    fn a_ladder_side_recipe_climbs_from_stage0() {
-        assert!(crate::bootstrap_root::ladder_side("gcc-14").unwrap());
-        assert!(crate::bootstrap_root::ladder_side("gcc-10-bridge-test").unwrap());
-        assert!(!crate::bootstrap_root::ladder_side("gcc-x86-64-stage2").unwrap());
-        assert!(!crate::bootstrap_root::ladder_side("rust-toolchain").unwrap());
-    }
-
-    #[test]
-    fn the_stage0_check_names_every_drifted_item() {
-        use td_engine::bootstrap_root::{Item, Root};
-        let a = "0123456789abcdfghijklmnpqrsvwxyz-a-1".to_string();
-        let b = "0123456789abcdfghijklmnpqrsvwxyy-b-1".to_string();
-        let nar = |c: char| format!("sha256:{}", c.to_string().repeat(64));
-        let pinned = Root {
-            builder_abi: "4".to_string(),
-            ladder: "1".repeat(64),
-            exports: vec![("a".to_string(), a.clone())],
-            items: vec![
-                Item {
-                    base: a.clone(),
-                    nar: nar('0'),
-                    refs: vec![b.clone()],
-                },
-                Item {
-                    base: b.clone(),
-                    nar: nar('0'),
-                    refs: Vec::new(),
-                },
-            ],
-        };
-        assert!(bootstrap_root_diff(&pinned, &pinned).is_empty());
-        let mut built = pinned.clone();
-        built.items[1].nar = nar('1');
-        let report = bootstrap_root_diff(&pinned, &built);
-        assert_eq!(report.len(), 1);
-        assert!(report[0].starts_with(&b), "{report:?}");
-        built.items.pop();
-        built.items[0].refs.clear();
-        let report = bootstrap_root_diff(&pinned, &built);
-        assert!(report
-            .iter()
-            .any(|r| r.contains("not in the rebuilt closure")));
-        assert!(report.iter().any(|r| r.contains("references pinned")));
-    }
-
     // The STEP map takes the LAST line for a stem (matching ladder_out_from) and
     // keeps only the basename; a malformed/traversal STEP path is dropped.
     #[test]
@@ -13475,24 +12632,21 @@ chmod 755 '{}'
     }
 
     // The fingerprint changes if ANY of the evaluator bytes, the builder's engine
-    // fingerprint, or a patch changes; it is stable when nothing changes; a
-    // missing patch dir is fine; and the length-delimiting defeats a
-    // concatenation collision.
+    // fingerprint, a lock or a local source changes; it is stable when nothing
+    // changes; and the length-delimiting defeats a concatenation collision.
     #[test]
-    fn plan_fingerprint_changes_with_any_input_and_tolerates_no_patch_dir() {
+    fn plan_fingerprint_changes_with_any_input() {
         let tmp = env::temp_dir().join(format!("td-fp-test-{}", process::id()));
         let _ = fs::remove_dir_all(&tmp);
-        let patches = tmp.join("seed/patches");
-        fs::create_dir_all(&patches).unwrap();
+        fs::create_dir_all(&tmp).unwrap();
         let eval = tmp.join("td-recipe-eval");
         fs::write(&eval, b"EVAL-v1").unwrap();
-        fs::write(patches.join("a.patch"), b"patch-a").unwrap();
         // A committed cargoLock read relative to the repo root (here `tmp`).
         fs::create_dir_all(tmp.join("recipes/locks/x")).unwrap();
         fs::write(tmp.join("recipes/locks/x/Cargo.lock"), b"lock-v1").unwrap();
         let locks = vec!["recipes/locks/x/Cargo.lock".to_string()];
         let fp = |builder: &str, locks: &[String], srcs: &[String]| {
-            plan_fingerprint(&eval, builder, &patches, &tmp, locks, srcs).unwrap()
+            plan_fingerprint(&eval, builder, &tmp, locks, srcs).unwrap()
         };
 
         let base = fp("BUILDER-v1", &locks, &[]);
@@ -13505,14 +12659,10 @@ chmod 755 '{}'
         // A builder engine change re-keys.
         let after_builder = fp("BUILDER-v2", &locks, &[]);
         assert_ne!(after_eval, after_builder);
-        // Patch change re-keys.
-        fs::write(patches.join("a.patch"), b"patch-a2").unwrap();
-        let after_patch = fp("BUILDER-v2", &locks, &[]);
-        assert_ne!(after_builder, after_patch);
         // A committed cargoLock bump re-keys (the repo-read build input).
         fs::write(tmp.join("recipes/locks/x/Cargo.lock"), b"lock-v2").unwrap();
         let after_lock = fp("BUILDER-v2", &locks, &[]);
-        assert_ne!(after_patch, after_lock);
+        assert_ne!(after_builder, after_lock);
         // Dropping the lock from the closure (no rust rung) re-keys and is stable.
         let nolock = fp("BUILDER-v2", &[], &[]);
         assert_ne!(after_lock, nolock);
@@ -13537,27 +12687,18 @@ chmod 755 '{}'
         fs::write(srcdir.join("target/junk"), b"artifact").unwrap();
         assert_eq!(after_src_edit, fp("BUILDER-v2", &[], &srcs));
 
-        // A missing patch dir is fine (hashes as zero patches) and stable.
-        let nopatch = tmp.join("gone");
-        let f1 = plan_fingerprint(&eval, "BUILDER-v2", &nopatch, &tmp, &[], &[]).unwrap();
-        assert_eq!(
-            f1,
-            plan_fingerprint(&eval, "BUILDER-v2", &nopatch, &tmp, &[], &[]).unwrap()
-        );
-
         // Length-delimiting: splitting a byte across the eval/builder boundary must
         // NOT collide (naive concatenation would).
         fs::write(&eval, b"ab").unwrap();
-        let split_a = plan_fingerprint(&eval, "c", &nopatch, &tmp, &[], &[]).unwrap();
+        let split_a = plan_fingerprint(&eval, "c", &tmp, &[], &[]).unwrap();
         fs::write(&eval, b"a").unwrap();
-        let split_b = plan_fingerprint(&eval, "bc", &nopatch, &tmp, &[], &[]).unwrap();
+        let split_b = plan_fingerprint(&eval, "bc", &tmp, &[], &[]).unwrap();
         assert_ne!(split_a, split_b);
 
         // A declared-but-missing lock fails closed (never silently ignored).
         assert!(plan_fingerprint(
             &eval,
             "BUILDER-v2",
-            &nopatch,
             &tmp,
             &["recipes/locks/gone/Cargo.lock".to_string()],
             &[]
@@ -13567,7 +12708,6 @@ chmod 755 '{}'
         assert!(plan_fingerprint(
             &eval,
             "BUILDER-v2",
-            &nopatch,
             &tmp,
             &[],
             &["tests/gone-src".to_string()]
@@ -13665,7 +12805,7 @@ chmod 755 '{}'
         // Writing the memo recorded it; a hit must record it again on its own.
         let records = lw.join("gc-roots");
         fs::remove_dir_all(&records).unwrap();
-        let key = crate::gc_roots::build_key("system-x86-64", false);
+        let key = crate::gc_roots::build_key("system-x86-64");
         let root = fs::canonicalize(&lw).unwrap();
 
         // HIT: both outputs staged into tdstore, as independent copies (mutating the

@@ -14,7 +14,7 @@
 // that is neither closed nor readable, and with no read timeout the applet blocks in
 // `read_to_end` forever. That is not hypothetical — a `td-feed warm sources` on this
 // repo's own host took ~900 KB of a gnu.org tarball over a black-holed IPv6 path and
-// then held the entire cold ladder climb for twenty minutes, printing nothing, with
+// then held the entire cold build for twenty minutes, printing nothing, with
 // the kernel still reporting the connection ESTABLISHED.
 //
 // `timeout_read` is a per-read deadline (`socket.set_read_timeout`), NOT a transfer

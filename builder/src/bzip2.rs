@@ -717,7 +717,6 @@ fn range(input: &[u8], start: usize, len: usize) -> Result<&[u8], String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     // `printf 'hello world\n' | bzip2 -9` — one block, level 9.
     const HELLO_BZ2_HEX: &str = "425a68393141592653594eece83600000251800010400006449080200031\
@@ -762,34 +761,6 @@ mod tests {
             out.push((x >> 16) as u8);
         }
         out
-    }
-
-    fn sources_path(name: &str) -> Option<PathBuf> {
-        let path = crate::bootstrap::shared_sources_dir().join(name);
-        path.exists().then_some(path)
-    }
-
-    fn decompress_tarball(name: &str, min_len: usize) -> Option<usize> {
-        let Some(path) = sources_path(name) else {
-            eprintln!("skipping: {name} not present in the shared sources cache");
-            return None;
-        };
-        let data = std::fs::read(&path).unwrap();
-        let started = std::time::Instant::now();
-        let out = decompress(&data).unwrap();
-        eprintln!(
-            "decompressed {name}: {} -> {} bytes in {:?}",
-            data.len(),
-            out.len(),
-            started.elapsed()
-        );
-        assert!(out.len() > min_len, "only {} bytes decoded", out.len());
-        assert_eq!(
-            &out[257..262],
-            b"ustar",
-            "first tar header lacks ustar magic"
-        );
-        Some(out.len())
     }
 
     #[test]
@@ -874,18 +845,6 @@ mod tests {
             err.contains("bzip2 output exceeds 5 byte limit"),
             "got: {err}"
         );
-    }
-
-    #[test]
-    fn decompresses_tcc_tarball() {
-        decompress_tarball("tcc-0.9.27.tar.bz2", 500_000);
-    }
-
-    #[test]
-    fn decompresses_binutils_tarball() {
-        // Larger and multi-block: exercises selector tables and the combined
-        // stream CRC across many blocks.
-        decompress_tarball("binutils-2.20.1a.tar.bz2", 500_000);
     }
 
     fn hex_bytes(hex: &str) -> Vec<u8> {

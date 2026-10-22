@@ -77,11 +77,11 @@ use crate::types::{Recipe, Step, TextEdit};
 // The external initramfs below is packed by td-util's gen_init_cpio, the same
 // packer system-x86-64 uses.
 pub fn recipe() -> Recipe {
-    // A rung's own source lands in TD_INPUT_MAP under the LOCAL name `{name}-source`
+    // A recipe's own source lands in TD_INPUT_MAP under the LOCAL name `{name}-source`
     // (`linux-x86-64-source`), synthesized from the recipe NAME — NOT under its
-    // `sourceInput` PIN KEY. When the two differ (this rung renames the shared
-    // `linux-kernel-source` pin locally, exactly as gcc-x86-64-native renames
-    // `gcc-14-source` / make-441 renames `make-x86-64-source`), steps MUST reference
+    // `sourceInput` PIN KEY. When the two differ (this recipe renames the shared
+    // `linux-kernel-source` pin locally, as gcc-runtime renames `gcc-14-source`),
+    // steps MUST reference
     // the local `{in:linux-x86-64-source}`; `{in:linux-kernel-source}` is not a map key
     // and expands to nothing ("no input `linux-kernel-source' in TD_INPUT_MAP"). The
     // pin key stays on `.source_input(...)` below, which is what gates/fetches the bytes.
@@ -333,7 +333,9 @@ pub fn recipe() -> Recipe {
     //    laptop's devices, so /dev/fb0 there stays virtio-gpu's.
     //
     //    COMPAT_32BIT_TIME has a visible prompt, so allnoconfig turns it off.
-    //    IA32_EMULATION alone leaves old glibc without futex/time syscalls.
+    //    It and IA32_EMULATION stay on for td-jail's i386 seccomp probe, which
+    //    proves confinement kills compatibility syscalls (UNSAFE.md); no build
+    //    needs i386 execution.
     //
     //    EFI needs ACPI; EFI_STUB selects the already enabled RELOCATABLE.
     //
@@ -907,9 +909,9 @@ pub fn recipe() -> Recipe {
                  grep -q '^CONFIG_NET_NS=y' .config || { echo 'NET_NS off — a jail without shared=network could not be cut off from the network stack' >&2; exit 1; }; \
                  grep -q '^CONFIG_AUDIT=y' .config || { echo 'AUDIT off — the physical Firefox proof cannot account for outer seccomp denials' >&2; exit 1; }; \
                  grep -q '^CONFIG_AUDITSYSCALL=y' .config || { echo 'AUDITSYSCALL off — x86 seccomp audit records cannot carry syscall identity' >&2; exit 1; }; \
-                 grep -q '^CONFIG_COMPAT_32BIT_TIME=y$' .config || { echo 'COMPAT_32BIT_TIME off — bootstrap glibc needs legacy i386 futex and clock syscalls' >&2; exit 1; }; \
-                 grep -q '^CONFIG_IA32_EMULATION=y$' .config || { echo 'IA32_EMULATION off — the source bootstrap cannot execute its i386 Mes and GNU ladder' >&2; exit 1; }; \
-                 grep -q '^# CONFIG_IA32_EMULATION_DEFAULT_DISABLED is not set$' .config || { echo 'IA32 emulation disabled at boot — the source bootstrap needs compatibility execution' >&2; exit 1; }; \
+                 grep -q '^CONFIG_COMPAT_32BIT_TIME=y$' .config || { echo 'COMPAT_32BIT_TIME off — i386 compatibility execution would lack its futex and clock syscalls' >&2; exit 1; }; \
+                 grep -q '^CONFIG_IA32_EMULATION=y$' .config || { echo 'IA32_EMULATION off — the td-jail probe cannot prove confinement kills i386 syscalls' >&2; exit 1; }; \
+                 grep -q '^# CONFIG_IA32_EMULATION_DEFAULT_DISABLED is not set$' .config || { echo 'IA32 emulation disabled at boot — the td-jail probe needs compatibility execution' >&2; exit 1; }; \
                  grep -q '^# CONFIG_X86_X32_ABI is not set$' .config || { echo 'X86_X32_ABI on — x32 calls could reach an unmodelled compatibility ABI instead of the deliberate kill probe' >&2; exit 1; }; \
                  grep -q '^CONFIG_SECCOMP=y' .config || { echo 'SECCOMP off — seccomp(2) returns ENOSYS, so td-jail ships namespaces with no syscall filter' >&2; exit 1; }; \
                  grep -q '^CONFIG_SECCOMP_FILTER=y' .config || { echo 'SECCOMP_FILTER off — no BPF syscall filtering. It is unprompted (def_bool y on HAVE_ARCH_SECCOMP_FILTER && SECCOMP && NET), so it cannot be pinned: something took SECCOMP or NET away' >&2; exit 1; }; \

@@ -135,17 +135,17 @@ pub(crate) fn run(runner: &RecipeCheckRunner, lock: File) -> Result<(), String> 
     // Build the distro image; its closure includes the kernel, so a single build
     // plan yields the complete deployment bundle.
     // Announce the build up front — an otherwise-silent wait — and the runner streams
-    // the builder's per-rung stderr live from here on (each `td-builder: build-plan
-    // step ...` line is one rung landing).
+    // the builder's per-recipe stderr live from here on (each `td-builder: build-plan
+    // step ...` line is one recipe landing).
     println!(
         "   [run] building the td distro ({SYSTEM}); its closure pulls in the {KERNEL} kernel.\n         \
          An unchanged tree is reused whole (a `[reuse]` line below) and returns at once; otherwise\n         \
-         only changed rungs rebuild, so a warm tree finishes in minutes. The first build (or the\n         \
-         first after a `td-recipe-eval clear-store`) cold-climbs the whole ladder from stage0 and\n         \
-         can take many minutes. Per-rung progress streams below.\n"
+         only changed recipes rebuild, so a warm tree finishes in minutes. The first build (or the\n         \
+         first after a `td-recipe-eval clear-store`) builds every recipe cold and\n         \
+         can take many minutes. Per-recipe progress streams below.\n"
     );
     // Build (or reuse whole) the distro and stage its single deployment output
-    // into tdstore; a warm memo hit skips the climb entirely.
+    // into tdstore; a warm memo hit skips the build entirely.
     let trees = runner.build_and_stage(SYSTEM, &[SYSTEM])?;
     let system_tree = trees
         .first()

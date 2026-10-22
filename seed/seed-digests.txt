@@ -6,54 +6,27 @@
 # content hash. Compiled into td-recipe-eval (enforced after every seed
 # derivation) and td-builder (enforced at build-plan lock synthesis).
 # Regenerate with `td-recipe-eval seed-digests > seed/seed-digests.txt`
-# (warm source cache required) when a pin, seed patch, or the stage0
-# source changes. Hand-editing a row is self-defeating: the runner
+# (warm source cache required) when a pin changes. Hand-editing a row
+# is self-defeating: the runner
 # re-derives from the pins every run and reds on disagreement.
-bash-mesboot-source 0w2mkw1b4ll6wfq48nsmp9l13b3za98g-bash-mesboot-source
-binutils-244-source 8xzd2kk7j2pj9fhkmab3ajhgpmccgidj-binutils-244-source
-binutils-mesboot-source 455cqqkkwpx94h5km91l46wldq80dgyl-binutils-mesboot-source
-bison-mesboot-source 091gccsyc4qcsnk4r6p99mqkk259f3ar-bison-mesboot-source
 ca-certificates-source 1nh4w1q566ga153y3h427ai268h934nx-ca-certificates-source
 claude-code-source 38p8258xch0p61w26g2k7h6in56jzyh9-claude-code-source
-coreutils-mesboot0-source 7dkw301jma5vnzc6x5i09nmh2dn7ak0q-coreutils-mesboot0-source
 cryptsetup-x86-64-source v3g69yip0g4zybh9yw2hlp3zzcfy98fc-cryptsetup-x86-64-source
 curl-x86-64-source 985mgjp6q4y958wwzqs984nkh399jnac-curl-x86-64-source
-diffutils-mesboot0-source ilin34x3xf4shlhs892wchsc0vjyqwb8-diffutils-mesboot0-source
 fd-source rsp3qagl8x7gh5hqpzy93adwfv5pv2ay-fd-source
 firefox-154-source 40asdrhyln3x194j276abhb2j2i7a04z-firefox-154-source
 freedesktop-platform-25-08-source cgynxza1vd3h30gd4hjl7vp82hdqlyj3-freedesktop-platform-25-08-source
-gawk-mesboot-source 128bh62a669ds6v5q6v2sih5a1qk51wj-gawk-mesboot-source
-gawk-mesboot0-source zdx7nfqxa7pddqpip7bpa13d79d5p7q2-gawk-mesboot0-source
-gawk-x86-64-self-source rbfx88q567m5rj981dn1vrblnknj3m8g-gawk-x86-64-self-source
-gcc-10-bridge-source zy6cavi7zz0ay4z9x3r8128vrld0pvnb-gcc-10-bridge-source
 gcc-14-source 2h3c0xxmf2jf5hywqbmlsnww6cwkq4nq-gcc-14-source
-gcc-464-core 50l0crhlqjqajvfkvjj31bxz842h5fkm-gcc-464-core
-gcc-464-gpp 364rq9bch5a1cli1ifbhihic3vdl52ch-gcc-464-gpp
-gcc-494-source c5ddkcv6f1k52y8za3b6sbq04lpf191p-gcc-494-source
-gcc-core-source vf4mh5x4hyynyi9j8bah0frd4fsyxpp3-gcc-core-source
 git-x86-64-source q7x6s60i03qm90sldhz5fz1812n1qk3h-git-x86-64-source
-glibc-216-source wvrdmqvnxn33akmzz6h5zr1k5s07dx14-glibc-216-source
 glibc-241-source 2lavxgwvm5ppn98l05pqa7sszb4kfkk4-glibc-241-source
-glibc-mesboot0-source 534qradv895g6ygp2dmrniyzpvz4sc5a-glibc-mesboot0-source
-gmp kb9mnqdvrr77gcgsc746pa1xmpaiazc0-gmp
 gmp63 a1sfm9d525pjz2if348xssl3wprnr21f-gmp63
-grep-mesboot0-source 664n3hm5dz2hyn5py2frds5cc3r4nid4-grep-mesboot0-source
-hello-source r2gr5vy54san8vw8ry4mmjm93ivybbpv-hello-source
 jetbrains-mono-nerd-font-source 632myin1d84lnr23d9ma4f4iwgs13bk2-jetbrains-mono-nerd-font-source
 json-c-x86-64-source csb78c2cixywmxii4vxp4ab11q5273p5-json-c-x86-64-source
 libdevmapper-x86-64-source 14i35fjwswmcjr5jp6p00vhh8b2m99d4-libdevmapper-x86-64-source
 libressl-x86-64-source vmx5274krlcs393la52x3iggv4kparn4-libressl-x86-64-source
-linux-headers hg590f1sggdwv8z3yvs4yz90cr0vnvfd-linux-headers
 linux-headers-x86-64 r4mg86l36d6x7c08wqj8v2fdkx23sxjv-linux-headers-x86-64
 linux-kernel-source m7dscgpgid10mwpbj97yxhi0civ8k3av-linux-kernel-source
-m4-mesboot-source 6n6m3fhhqcdnmkf92nw1a1q8pakzflx5-m4-mesboot-source
-make-mesboot-source rsml6snylx4zpf1isi6h9mi1v3g6qya7-make-mesboot-source
-make-mesboot0-source prv2pgbxapfby18j22f39al25q2ava5i-make-mesboot0-source
-make-x86-64-source 957gwrna22f6idxmqsi36mnl2syy4wiy-make-x86-64-source
-mes-source lfcpi8i0ibf60snpa02jxs02dqva7aw1-mes-source
-mpc 0yri90zk0l2pf6g3id2bji6mbmxf8clv-mpc
 mpc131 n09rmavjm1bn6gdc1s22n98g9hi10yah-mpc131
-mpfr fmix8a94cf9k1pljgqbaxd2xb2826k72-mpfr
 mpfr421 q1q1frz86nxa7p76pl3r8lb01hv51b6v-mpfr421
 nerd-fonts-codicons-license-source ma6jj9n0qgmk2p4nr8r9x2axnbf2wkip-nerd-fonts-codicons-license-source
 nerd-fonts-font-awesome-license-source 933m2kl6wlld9mma2bwcxvqyjd4wfqbh-nerd-fonts-font-awesome-license-source
@@ -64,29 +37,14 @@ nerd-fonts-pomicons-license-source 070xshvd1kg9i2nbhf7f5ca4pjjb4dxb-nerd-fonts-p
 nerd-fonts-powerline-extra-license-source rqafa2h34k4pcd02p46256hcm2bg9l9m-nerd-fonts-powerline-extra-license-source
 nerd-fonts-powerline-symbols-license-source l6byrv5ddn1xvnysn7lrpjmr53pfzlna-nerd-fonts-powerline-symbols-license-source
 nerd-fonts-weather-icons-license-source jsmpd2zdj5zkna7diqcrzyirzngh7rdm-nerd-fonts-weather-icons-license-source
-nyacc 6rs0scnal207ixn5sd1li8r8yk7cyp6i-nyacc
 openssh-x86-64-source 3dvyp8vnz1xmmn740czhzz0db92jhwr5-openssh-x86-64-source
-oyacc-source w5c2ziy1z8hnrbnylnyi8b19916fi32i-oyacc-source
-patch-binutils-boot-2.20.1a 93pjhga2p78scynm6nbfbzb69rk7ckr2-patch-binutils-boot-2.20.1a
-patch-gcc-boot-2.95.3 srn2fpr2p2rny43l2j7218hsmwijk1rq-patch-gcc-boot-2.95.3
-patch-gcc-boot-4.6.4 sv9nwgy6k421ivq29j9pyvrvjwgjay1x-patch-gcc-boot-4.6.4
-patch-glibc-boot-2.16.0 rrxkmri38krpp2lcq17d3r6iy5syq9qk-patch-glibc-boot-2.16.0
-patch-glibc-boot-2.2.5 qcs888irnnqm8bybmlbgapyvbbc844ka-patch-glibc-boot-2.2.5
-patch-glibc-bootstrap-system-2.16.0 nggbvl93zgr74xf9x50331yfgsw4hh0r-patch-glibc-bootstrap-system-2.16.0
-patch-glibc-bootstrap-system-2.2.5 wjhcnyy2wspd9bf312ql84gfmvivixs2-patch-glibc-bootstrap-system-2.2.5
-patch-mesboot-source r3w1jmlradg89l3av29y1ifp7y312pk9-patch-mesboot-source
 popt-x86-64-source i2hswa2a3s6kzvqrzl9hz4gvgavsx4yh-popt-x86-64-source
-python-mesboot-source 460ch0an5nlsgs5i9ppdk6b890fnvw1y-python-mesboot-source
 ripgrep-seed-source vg4gdaxl18mqlbhybnn2pq7lpwm3wm2q-ripgrep-seed-source
 ripgrep-source ma4kmnnyn1hlimj2rw6hq7p07h8g2p3x-ripgrep-source
 rust-cargo-dist f8wnk26zf00vamwc8b4ix61a7njji7yd-rust-cargo-dist
 rust-clippy-dist qw713yaddz7n6hfnxcipy173hxic1hh2-rust-clippy-dist
 rust-rustc-dist h6ys76xx8ddx53hwn9ja662kycmxrcls-rust-rustc-dist
 rust-std-dist dwjgr6wbk88ay81n4qxlwy9xnjjqmk5s-rust-std-dist
-sed-mesboot-source 331jp1sj5iyjhnb35391k2sjjkqrawk1-sed-mesboot-source
-sed-mesboot0-source i6y1c09pssxjdc60wmdf96vf11hxa56c-sed-mesboot0-source
-stage0-source ma16im40lnb5dldxwglzzs7iqpzfiz4m-stage0-source
-tcc-source mhwyc6lcd16pxbln8kwvc4ia5zisf8fn-tcc-source
 tzdata-source p7yjpvl5kwdfqqdgakzww94zx5mdz86r-tzdata-source
 util-linux-libs-x86-64-source 06vhdikawhfyswkhrxs905cm3qbpqj4r-util-linux-libs-x86-64-source
 uutils-source rkmjdm6nicq3js0xhdyqk4rl3r9ki4xv-uutils-source

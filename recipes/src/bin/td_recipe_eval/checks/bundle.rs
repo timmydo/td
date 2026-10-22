@@ -2,7 +2,7 @@
 //!
 //! `td-recipe-eval run` builds the distro and boots it immediately, which is
 //! the right tool for whoever has the checkout — and useless to everyone else,
-//! because the build climbs the whole stage0-posix ladder first. This produces
+//! because the build compiles the whole distribution first. This produces
 //! the same boot as a DIRECTORY of prebuilt files plus a POSIX-sh launcher, so
 //! somebody with qemu and no td checkout can try the system in the time it
 //! takes to download it.
@@ -109,8 +109,8 @@ pub(crate) fn run(
 ) -> Result<(), String> {
     println!(
         "   [bundle] building the td distro ({SYSTEM}); its closure pulls in the kernel.\n            \
-         An unchanged tree is reused whole and returns at once; a cold tree climbs the\n            \
-         whole ladder from stage0 and can take a long time. Per-rung progress streams below.\n"
+         An unchanged tree is reused whole and returns at once; a cold tree builds every\n            \
+         recipe and can take a long time. Per-recipe progress streams below.\n"
     );
     let outputs = if options.installation {
         vec![SYSTEM, "td-net"]
@@ -1046,9 +1046,9 @@ fn readme(deployment_id: &str, format: DiskFormat) -> String {
         "# td — bootable demo system (x86-64)\n\
          \n\
          A prebuilt td system and a launcher, so you can try td under QEMU without\n\
-         building it. Building td from source climbs the entire stage0-posix\n\
-         bootstrap ladder — a tiny auditable seed, Mes/MesCC, TinyCC, a GCC/glibc\n\
-         ladder, then Rust — and takes hours on a fast machine. This takes a\n\
+         building it. Building td from source compiles glibc, the kernel and\n\
+         every td program in a pinned Debian build root with the upstream Rust\n\
+         toolchain, and takes a long while on a fast machine. This takes a\n\
          download.\n\
          \n\
          Deployment id: `{deployment_id}`\n\

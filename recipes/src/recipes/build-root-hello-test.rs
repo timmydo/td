@@ -1,7 +1,7 @@
 use crate::ladder::{BUILD_ROOT_PATH, BUILD_ROOT_SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
-// The Debian build root (BUILD-ROOT-PLAN.md) as a sandbox root: its gcc
+// The Debian build root (AGENTS.md) as a sandbox root: its gcc
 // compiles a freestanding program that makes its two syscalls itself, so the
 // output links nothing of the root, and the build runs it. The output gate
 // (build_root.rs) refuses an interpreter or RUNPATH outside the store; this

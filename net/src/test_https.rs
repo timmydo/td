@@ -1,5 +1,5 @@
 // td-test-https — a test HTTPS origin and its verifying client, on the
-// rustls and ring this crate already links (BUILD-ROOT-PLAN.md increment 9).
+// rustls and ring this crate already links.
 // The system image's autotest-only Firefox proof uses it in place of
 // LibreSSL's `openssl req`/`x509`/`s_server`/`s_client`
 // (APPLICATIONS.md §B.8 item 6):

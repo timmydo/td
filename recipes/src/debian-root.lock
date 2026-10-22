@@ -1,4 +1,4 @@
-# recipes/src/debian-root.lock — the Debian build root (BUILD-ROOT-PLAN.md).
+# recipes/src/debian-root.lock — the Debian build root (AGENTS.md).
 #
 # A pinned Debian image layer plus the .debs unpacked over it form the
 # sandbox root recipes compile C in. Nothing from it ships: it is a build

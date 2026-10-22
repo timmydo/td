@@ -27,8 +27,7 @@ use td_recipe::types::{OstreePin, Recipe, SourcePin};
 
 use crate::check_runner::{
     classify_graph_inputs, is_executable, linux_version_from_file, ostree_cache_is_warm,
-    recipe_closure, recipe_closure_full, source_pin_for_key, RecipeCheckRunner, RecipeNode,
-    SeedInput,
+    recipe_closure, source_pin_for_key, RecipeCheckRunner, RecipeNode, SeedInput,
 };
 
 /// One `td-feed warm crate`/`warm crate-local` job: the argv that populates
@@ -233,9 +232,9 @@ fn should_verify_ostree(cache: &Path, pin: &OstreePin, verify_all: bool, admitte
     verify_all || (ostree_cache_is_warm(cache, pin) && !admitted)
 }
 
-/// Classify `target`'s closure the way the ladder itself does, then keep only the
-/// inputs that are not on disk. Patches and in-tree local sources are committed
-/// bytes — never fetched, so never cold.
+/// Classify `target`'s closure the way a build does, then keep only the inputs
+/// that are not on disk. In-tree local sources are committed bytes — never
+/// fetched, so never cold.
 fn survey(
     root: &Path,
     sources_dir: &Path,
@@ -246,22 +245,8 @@ fn survey(
     let mut sources: Vec<SourcePin> = Vec::new();
     let mut ostree: Vec<OstreePin> = Vec::new();
     let mut headers: Vec<&'static str> = Vec::new();
-    let mut inputs = classify_graph_inputs(&graph)?;
-    if inputs
-        .iter()
-        .any(|i| matches!(i, SeedInput::BootstrapRoot { .. }))
-    {
-        // A machine without the pinned root materializes it by building the
-        // ladder from stage0, so that ladder's sources are this graph's too.
-        let ladder = recipe_closure_full(crate::bootstrap_root::CUT)?;
-        inputs.extend(classify_graph_inputs(&ladder)?);
-    }
-    for input in inputs {
+    for input in classify_graph_inputs(&graph)? {
         match input {
-            // Stage0's tarball is pinned under its own key, like any other source.
-            SeedInput::Stage0 { key } => {
-                push_cold_source(&mut sources, sources_dir, source_pin_for_key(&key)?)
-            }
             SeedInput::Source { pin, .. } => push_cold_source(&mut sources, sources_dir, pin),
             SeedInput::Ostree { pin, .. } => {
                 let cache = ostree_dir.join(&pin.cache);
@@ -274,9 +259,7 @@ fn survey(
                     headers.push(arch);
                 }
             }
-            SeedInput::Patch { .. }
-            | SeedInput::LocalSource { .. }
-            | SeedInput::BootstrapRoot { .. } => {}
+            SeedInput::LocalSource { .. } => {}
         }
     }
     let mut build_root = Vec::new();
@@ -625,8 +608,7 @@ mod tests {
 
     // The whole point of the preflight: on a machine with nothing cached, the
     // distro target's own closure is what says which pins to fetch — the
-    // upstream Rust release among them, and no longer the stage0 seed, which
-    // nothing the image builds reaches.
+    // upstream Rust release among them.
     #[test]
     fn cold_sources_are_surveyed_from_the_target_closure() {
         let root = scratch("cold-root");
@@ -636,10 +618,6 @@ mod tests {
         assert!(
             files.iter().any(|f| f.starts_with("rustc-1.96.0-")),
             "the Rust toolchain must be reported cold: {files:?}"
-        );
-        assert!(
-            !files.iter().any(|f| f.starts_with("stage0-posix-")),
-            "the image's closure reaches the stage0 seed: {files:?}"
         );
         assert!(
             cold.headers.contains(&"x86_64"),
@@ -679,7 +657,7 @@ mod tests {
         )
         .unwrap();
         assert!(warm.build_root.is_empty());
-        let none = survey(&root, &sources, &root.join("ostree"), &["make-test"]).unwrap();
+        let none = survey(&root, &sources, &root.join("ostree"), &["ca-certificates"]).unwrap();
         assert!(none.build_root.is_empty());
     }
 

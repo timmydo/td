@@ -2848,7 +2848,7 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
 
    What is NOT proven is a real boot. The oracle for that is
    `qemu-boot-system`, which wants a warm store — a cold one means building
-   the whole ladder. What stands in for it is that nothing can boot an
+   the whole graph. What stands in for it is that nothing can boot an
    unprovisioned selector: `VerifiedSelector` keeps its path private and
    both provisioning exits append the trusted key through the same helper.
    `provision_selector` also binds the volume. The one bare copy,

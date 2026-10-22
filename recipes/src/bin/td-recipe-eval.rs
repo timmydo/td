@@ -25,9 +25,10 @@
 //!                         ORACLE passed here with every input it boots
 //!                         unchanged, else `miss KEY WHY`; forget or record a
 //!                         pass under KEY
-//!   clear-store           reset the ladder work dir (seed store/db + shared
+//!   clear-store           reset the shared work dir (seed store/db + shared
 //!                         build-cache); the next build re-derives seeds and
-//!                         cold-climbs. The only path that clears persisted state
+//!                         rebuilds from them. The only path that clears
+//!                         persisted state
 //!   gc-store [--dry-run]  reclaim shared build-cache entries and memos no
 //!                         worktree's last run of a build or check needed;
 //!                         what those runs recorded stays, with everything it
@@ -87,8 +88,6 @@ use std::process::exit;
 
 use td_recipe::catalog;
 
-#[path = "td_recipe_eval/bootstrap_root.rs"]
-mod bootstrap_root;
 #[path = "td_recipe_eval/check_runner.rs"]
 mod check_runner;
 #[path = "td_recipe_eval/checks/mod.rs"]
@@ -639,15 +638,6 @@ fn main() {
                 die_runner(&e);
             }
         }
-        Some("bootstrap-root") => {
-            let verb = match (args.get(2), args.get(3)) {
-                (Some(verb), None) => verb.as_str(),
-                _ => die("usage: bootstrap-root status|pin|check"),
-            };
-            if let Err(e) = check_runner::bootstrap_root_cli(verb) {
-                die_runner(&e);
-            }
-        }
         Some("local-source-roster") => {
             let check = match (args.get(2).map(String::as_str), args.get(3)) {
                 (None, _) => false,
@@ -662,7 +652,7 @@ fn main() {
                 die(&e);
             }
         }
-        _ => die("usage: td-recipe-eval list|emit|check-list|check-count|check-script|check-run|build-run|check-history|clear-store|gc-store|qemu-secret|qemu-secret-system|qemu-login-system|qemu-boot|qemu-boot-uefi|qemu-boot-media|qemu-install|qemu-install-system|qemu-install-encrypted|qemu-boot-encrypted|qemu-boot-live|compose-iso|build-iso|test-iso|qemu-boot-erofs|qemu-boot-system|qemu-deploy-rollback|qemu-update|qemu-boot-net|qemu-boot-kexec|run|bundle|warm|verify-store|payload-closure|application-closure|vendor-warm-args|source-pins|build-root-pins|build-root-seed|source-pin|ostree-pins|ostree-pin|seed-digests|local-source-roster|bootstrap-root ..."),
+        _ => die("usage: td-recipe-eval list|emit|check-list|check-count|check-script|check-run|build-run|check-history|clear-store|gc-store|qemu-secret|qemu-secret-system|qemu-login-system|qemu-boot|qemu-boot-uefi|qemu-boot-media|qemu-install|qemu-install-system|qemu-install-encrypted|qemu-boot-encrypted|qemu-boot-live|compose-iso|build-iso|test-iso|qemu-boot-erofs|qemu-boot-system|qemu-deploy-rollback|qemu-update|qemu-boot-net|qemu-boot-kexec|run|bundle|warm|verify-store|payload-closure|application-closure|vendor-warm-args|source-pins|build-root-pins|build-root-seed|source-pin|ostree-pins|ostree-pin|seed-digests|local-source-roster"),
     }
 }
 
@@ -675,17 +665,11 @@ mod tests {
     #[test]
     fn checked_recipes_own_their_check_bodies() {
         for stem in [
-            "make-test",
-            "gcc-10-bridge-test",
-            "gcc-x86-64-stage2-test",
-            "gcc-x86-64-native-test",
-            "gcc-x86-64-self-test",
             "linux-x86-64-test",
             "td-btrfs-test",
             "ca-certificates-test",
             "td-boot-test",
             "td-install-test",
-            "hello-test",
             "rust-userland-auto-test",
             "rust-toolchain-test",
         ] {
@@ -697,19 +681,14 @@ mod tests {
 
     #[test]
     fn unchecked_recipes_have_zero_check_bodies() {
-        let mes = catalog::lookup("mes").unwrap();
-        assert_eq!(recipe_checks(&mes).len(), 0);
+        let uutils = catalog::lookup("uutils").unwrap();
+        assert_eq!(recipe_checks(&uutils).len(), 0);
     }
 
     #[test]
     fn recipe_check_bodies_delegate_to_the_rust_runner() {
         for (stem, count) in [
-            ("make-test", 1),
             ("rust-toolchain", 1),
-            ("gcc-10-bridge-test", 1),
-            ("gcc-x86-64-stage2-test", 1),
-            ("gcc-x86-64-native-test", 1),
-            ("gcc-x86-64-self-test", 1),
             ("linux-x86-64-test", 1),
             // linux-x86-64 itself registers NO check: its qemu boot is a
             // host-side tool (`td-recipe-eval qemu-boot`), not a sandboxed gate
@@ -719,7 +698,6 @@ mod tests {
             ("ca-certificates-test", 1),
             ("td-boot-test", 1),
             ("td-install-test", 1),
-            ("hello-test", 1),
             ("rust-userland-auto-test", 1),
             ("rust-toolchain-test", 1),
             ("tzdata", 1),
@@ -742,35 +720,10 @@ mod tests {
     #[test]
     fn source_pins_cli_surface_has_the_reviewed_count() {
         let pins = td_recipe::source_pins::all();
-        // 32 migrated legacy locks + oyacc-6.6 (the bash shell's `yacc`) +
-        // bash-2.05b (the from-source bootstrap shell, re #469) + sed-4.2.2
-        // (the gcc-mesboot1-era `sed` provider, re #469) + sed-4.0.9 (the
-        // tcc-era `sed` cycle-breaker, re #469) + coreutils-5.0 (the tcc-era
-        // coreutils cycle-breaker, re #469) + grep-2.4 (the tcc-era `grep`
-        // cycle-breaker, re #469) + gawk-3.0.4 (the tcc-era `gawk`
-        // cycle-breaker, re #469) + diffutils-2.7 (the tcc-era `diffutils`
-        // cycle-breaker, re #469) + m4-1.4.19 (the glibc-rung `bison`
-        // provider's macro processor, re #469) + bison-3.8.2 (the glibc-rung
-        // parser generator, re #469) + Python-3.11.1 (the glibc-rung python3,
-        // re #469) + GCC 10.5.0 (the compatibility bridge between
-        // gcc-mesboot 4.9.4 and GCC 14.3.0) + the linux-x86-64 kernel source +
-        // the upstream Rust 1.96.0 rustc, rust-std, Cargo and Clippy release
-        // components + coreutils-0.9.0 (the
-        // uutils, ripgrep, and fd userland `.crate` sources) + util-linux
-        // 2.42.2 (cryptsetup's libuuid and libblkid) + the ripgrep 15.2.0
-        // static application seed + curl's
-        // dated Mozilla CA extract + OpenSSH Portable 10.5p1, the
-        // Claude Code 2.1.260 native Linux x86-64 binary, IANA timezone
-        // data 2026d, and the Nerd Fonts v3.5.1 JetBrains Mono release with
-        // nine licence notices + cryptsetup 2.8.8 with json-c 0.18, popt 1.19
-        // and LVM2 2.03.43 (the LUKS2 userspace and its static libraries) +
-        // gawk 5.4.1 (the build-only awk after rust-toolchain). BusyBox's pin
-        // left with its last consumer; the kernel's flex, elfutils and bc left
-        // when it moved into the Debian build root; btrfs-progs left when
-        // td-btrfs replaced it; CMake and the Rust source and its bootstrap
-        // snapshot left with the source-built toolchain.
-        assert_eq!(pins.len(), 74);
-        assert!(pins.iter().any(|pin| pin.key == "stage0-source"));
+        // source_pins::tests::catalog_carries_all_legacy_source_locks names
+        // each of them.
+        assert_eq!(pins.len(), 38);
+        assert!(pins.iter().all(|pin| pin.key != "stage0-source"));
         // The build root lists through `build-root-pins` alone.
         assert!(pins.iter().all(|pin| !pin.key.starts_with("debian-root-")));
         assert!(pins.iter().any(|pin| pin.key == "ca-certificates-source"));
@@ -787,8 +740,6 @@ mod tests {
         ] {
             assert!(pins.iter().any(|pin| pin.key == key), "{key}");
         }
-        assert!(pins.iter().any(|pin| pin.key == "oyacc-source"));
-        assert!(pins.iter().any(|pin| pin.key == "bash-mesboot-source"));
         assert!(pins.iter().any(|pin| pin.key == "uutils-source"));
         assert!(pins
             .iter()
@@ -921,14 +872,14 @@ mod tests {
     // discriminates a mismatch, not a vacuous always-equal check.
     #[test]
     fn a_mismatched_recipe_is_discriminated() {
-        let make = catalog::lookup("make-test")
-            .expect("make-test recipe must exist (negative-control fixture)");
-        let hello = catalog::lookup("hello-test")
-            .expect("hello-test recipe must exist (negative-control fixture)");
+        let td_boot = catalog::lookup("td-boot-test")
+            .expect("td-boot-test recipe must exist (negative-control fixture)");
+        let td_install = catalog::lookup("td-install-test")
+            .expect("td-install-test recipe must exist (negative-control fixture)");
         assert_ne!(
-            make.to_json().to_canonical(),
-            hello.to_json().to_canonical(),
-            "make-test and hello-test canon-equal — a JSON comparison would not discriminate a mismatch"
+            td_boot.to_json().to_canonical(),
+            td_install.to_json().to_canonical(),
+            "td-boot-test and td-install-test canon-equal — a JSON comparison would not discriminate a mismatch"
         );
     }
 }

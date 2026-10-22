@@ -29,9 +29,8 @@
 //! comparing against the wrong table.
 //!
 //! Regenerate with `td-recipe-eval seed-digests > seed/seed-digests.txt`
-//! (warm source cache required) whenever a pin, a seed patch, or the stage0
-//! source changes; the coverage test and the ladder's first run both red
-//! until the committed table agrees.
+//! (warm source cache required) whenever a pin changes; the coverage test
+//! and the first build both red until the committed table agrees.
 
 const TABLE: &str = include_str!("../../../../seed/seed-digests.txt");
 
@@ -97,7 +96,31 @@ pub(crate) fn table_digest() -> Result<String, String> {
 
 /// The compiled expected basename for a seed key, if pinned.
 pub(crate) fn expected(key: &str) -> Result<Option<&'static str>, String> {
+    #[cfg(test)]
+    if let Some(base) = TEST_ROWS.with(|rows| {
+        rows.borrow()
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, b)| *b)
+    }) {
+        return Ok(Some(base));
+    }
     Ok(rows()?.into_iter().find(|(k, _)| *k == key).map(|(_, b)| b))
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_ROWS: std::cell::RefCell<Vec<(&'static str, &'static str)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Pin KEY to BASE beside the compiled rows, for this test thread only: a
+/// cold seed's success path needs a row no fixture in the tree carries.
+#[cfg(test)]
+pub(crate) fn pin_for_test(key: &str, base: &str) {
+    let key: &'static str = Box::leak(key.to_string().into_boxed_str());
+    let base: &'static str = Box::leak(base.to_string().into_boxed_str());
+    TEST_ROWS.with(|rows| rows.borrow_mut().push((key, base)));
 }
 
 /// Enforce the table against a freshly DERIVED basename: the key must be
@@ -158,7 +181,7 @@ mod tests {
     fn compiled_table_parses_and_pins_the_special_seeds() {
         let rows = rows().unwrap();
         assert!(!rows.is_empty(), "compiled table must not be empty");
-        for key in ["stage0-source", "linux-headers", "linux-headers-x86-64"] {
+        for key in ["linux-headers-x86-64", "gcc-14-source", "glibc-241-source"] {
             assert!(
                 rows.iter().any(|(k, _)| *k == key),
                 "compiled table must pin `{key}'"

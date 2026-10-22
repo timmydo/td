@@ -136,7 +136,7 @@ deployment manifest and writes, through the same writer as `compose-iso`:
   the verified store deployment, the manifest, and its new signature.
 
 The default output is `dist/td-install-x86-64.iso` in the checkout; `--out`
-names another file, relative to the caller, outside the ladder work tree
+names another file, relative to the caller, outside the shared work tree
 (which `clear-store` deletes). An existing file is refused. `--force` admits
 only a regular file whose primary volume descriptor identifies a td
 installation medium, as td-boot identifies one. The image is staged as a

@@ -8,8 +8,7 @@
 //! rationale comments live with each step):
 //!   1. the netns-probe discrimination check,
 //!   2. stage0 provisioning (the guix-free loop-container provider, #294),
-//!   3. the evaluator placement and the warm prelude (subst store,
-//!      source/crate warms),
+//!   3. the evaluator placement and the warm prelude (source/crate warms),
 //!   4. the sandboxed gate run: TB host-sandbox --expose-cwd --no-daemon
 //!      --store-item-at SRC DEST -- TB gate-run. The sandbox mounts NO store
 //!      directory and NO userland: its one store item is the stage0
@@ -414,63 +413,6 @@ pub(crate) fn tree_key(root: &Path, gate_runner: &Path) -> Option<String> {
     Some(crate::sha256::to_base16(&h.finalize()))
 }
 
-/// The substitute-store exposure (x64-toolchain-subst, human 2026-06-28;
-/// native since #318 axis 2 — was tools/warm-subst.sh): if a persistent signed
-/// substitute store exists (~/.td/subst: a stashed td-subst binary + published
-/// closure narinfos), expose TD_SUBST_* to the loop sandbox (host-sandbox binds
-/// ~/.td/subst ro + preserves TD_SUBST_*). The toolchain gates then FETCH the
-/// lock-keyed closure instead of rebuilding ~98 min from seed, FALLING BACK to
-/// from-seed on ANY miss. This NEVER fetches or builds td-subst; a COLD machine
-/// exposes nothing and the gate builds from seed (the substitute is an
-/// optimization, never a correctness dependency).
-///
-/// NOTE: nothing in-tree PRODUCES that store today — the publisher retired with
-/// the per-rung shell gates (#444) and the daily runner that drove it. This is
-/// the consumer half, kept live and inert until a producer returns.
-fn subst_env(root: &Path) -> Vec<(String, String)> {
-    let store = match std::env::var("TD_SUBST_STORE") {
-        Ok(v) if !v.trim().is_empty() => PathBuf::from(v),
-        _ => match std::env::var("HOME") {
-            Ok(h) => Path::new(&h).join(".td/subst"),
-            Err(_) => return Vec::new(),
-        },
-    };
-    subst_env_at(&store, &root.join("tests/td-subst.pub"))
-}
-
-/// A USABLE store = a stashed td-subst binary + at least one signed narinfo +
-/// the pinned trust anchor. Any missing piece => expose nothing.
-fn subst_env_at(store: &Path, pubkey: &Path) -> Vec<(String, String)> {
-    use std::os::unix::fs::PermissionsExt as _;
-    let bin = store.join("td-subst");
-    let executable = std::fs::metadata(&bin)
-        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false);
-    if !executable {
-        return Vec::new();
-    }
-    let has_narinfo = std::fs::read_dir(store)
-        .map(|rd| {
-            rd.flatten()
-                .any(|e| e.path().extension().is_some_and(|x| x == "narinfo"))
-        })
-        .unwrap_or(false);
-    if !has_narinfo {
-        return Vec::new();
-    }
-    if !std::fs::metadata(pubkey)
-        .map(|m| m.is_file() && m.len() > 0)
-        .unwrap_or(false)
-    {
-        return Vec::new();
-    }
-    vec![
-        (s("TD_SUBST_BIN"), bin.display().to_string()),
-        (s("TD_SUBST_STORE"), store.display().to_string()),
-        (s("TD_SUBST_PUBKEY"), pubkey.display().to_string()),
-    ]
-}
-
 /// A gate's cached td-built binary out of its newstore dir: the
 /// lexicographically-first EXECUTABLE `<newstore>/*/bin/<bin>` — the
 /// deterministic pick the shell's `ls | head -1` made, with the shell's `-x`
@@ -617,9 +559,9 @@ fn warm_td_crate_closure_resolving(
     }
 }
 
-/// Generate the host-produced Linux UAPI header seeds
-/// (`$HOME/.td/sources/linux-headers-<ver>-{i386,x86_64}.tar`) the toolchain
-/// rungs intern, before any gate interns them (heavy_warms runs later).
+/// Generate the host-produced Linux UAPI header seed
+/// (`$HOME/.td/sources/linux-headers-<ver>-x86_64.tar`) td glibc's build
+/// interns, before any gate interns it (heavy_warms runs later).
 ///
 /// `newstore_bin` picks a td-built `td-feed` by store hash, so a pre-#536 binary
 /// that still writes the seed as `.tar.gz` can win — it exits 0 yet the `.tar` the
@@ -627,7 +569,7 @@ fn warm_td_crate_closure_resolving(
 /// arch once with the current source-built `feed/`. Best-effort and idempotent;
 /// the intern is the fail-closed enforcement (issue #546).
 fn warm_kernel_headers_seed(root: &Path) {
-    const ARCHES: &[&str] = &["i386", "x86_64"];
+    const ARCHES: &[&str] = &["x86_64"];
     // Bound the cargo fallback like warm_td_crate_closure; the warm itself is
     // already `timeout`-wrapped.
     let deadline = warm_timeout_secs().map(|n| Instant::now() + Duration::from_secs(n));
@@ -704,7 +646,7 @@ fn warm_kh_arches(root: &Path, tdfeed: &Path, arches: &[&str]) -> Vec<String> {
                  for {arch}"
             );
         }
-        if !kh_seed_present(&crate::bootstrap::shared_sources_dir(), arch) {
+        if !kh_seed_present(&crate::shared_sources_dir(), arch) {
             missing.push((*arch).to_string());
         }
     }
@@ -1247,8 +1189,6 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
         }
         None => {}
     }
-    child_envs.extend(subst_env(&root));
-
     if heavy_warm {
         let eval = placed.as_deref().ok().filter(|p| !p.is_empty());
         heavy_warms(&root, eval);
@@ -1429,66 +1369,6 @@ mod tests {
 
     use super::*;
 
-    fn scratch(name: &str) -> crate::test_temp::TempDir {
-        crate::test_temp::TempDir::new(&format!("td-subst-env-{name}")).unwrap()
-    }
-
-    /// A usable store: executable td-subst + a narinfo + a non-empty pubkey.
-    fn populate(store: &Path, pubkey: &Path) {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::write(store.join("td-subst"), b"#!/bin/sh\n").unwrap();
-        std::fs::set_permissions(
-            store.join("td-subst"),
-            std::fs::Permissions::from_mode(0o755),
-        )
-        .unwrap();
-        std::fs::write(store.join("x.narinfo"), b"StorePath: /x\n").unwrap();
-        std::fs::write(pubkey, b"pinned-trust-anchor\n").unwrap();
-    }
-
-    #[test]
-    fn subst_env_exposes_a_usable_store() {
-        let d = scratch("usable");
-        let (store, pubkey) = (d.join("subst"), d.join("td-subst.pub"));
-        std::fs::create_dir_all(&store).unwrap();
-        populate(&store, &pubkey);
-        let envs = subst_env_at(&store, &pubkey);
-        let keys: Vec<&str> = envs.iter().map(|(k, _)| k.as_str()).collect();
-        assert_eq!(keys, ["TD_SUBST_BIN", "TD_SUBST_STORE", "TD_SUBST_PUBKEY"]);
-        assert!(envs
-            .iter()
-            .any(|(k, v)| k == "TD_SUBST_BIN" && v.ends_with("/td-subst")));
-    }
-
-    #[test]
-    fn subst_env_is_empty_when_any_piece_is_missing() {
-        // Each missing piece independently means "expose nothing" — the gate
-        // then builds from seed (the substitute is never a correctness dep).
-        for missing in ["bin", "exec-bit", "narinfo", "pubkey"] {
-            let d = scratch(missing);
-            let (store, pubkey) = (d.join("subst"), d.join("td-subst.pub"));
-            std::fs::create_dir_all(&store).unwrap();
-            populate(&store, &pubkey);
-            match missing {
-                "bin" => std::fs::remove_file(store.join("td-subst")).unwrap(),
-                "exec-bit" => {
-                    use std::os::unix::fs::PermissionsExt as _;
-                    std::fs::set_permissions(
-                        store.join("td-subst"),
-                        std::fs::Permissions::from_mode(0o644),
-                    )
-                    .unwrap();
-                }
-                "narinfo" => std::fs::remove_file(store.join("x.narinfo")).unwrap(),
-                _ => std::fs::write(&pubkey, b"").unwrap(),
-            }
-            assert!(
-                subst_env_at(&store, &pubkey).is_empty(),
-                "missing {missing} must expose nothing"
-            );
-        }
-    }
-
     #[test]
     fn parse_timeout_secs_accepts_timeout1_durations() {
         // Bare seconds and the timeout(1) integer suffixes — the ONE
@@ -1506,6 +1386,10 @@ mod tests {
         for bad in ["", "s", "m", "-5", "1.5", "5x", "m30", "30 m"] {
             assert_eq!(parse_timeout_secs(bad), None, "`{bad}` must not parse");
         }
+    }
+
+    fn scratch(name: &str) -> crate::test_temp::TempDir {
+        crate::test_temp::TempDir::new(&format!("td-check-loop-{name}")).unwrap()
     }
 
     #[test]

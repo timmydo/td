@@ -7,7 +7,7 @@
 //! `provision-cc`. Same contract, no `sh`:
 //!
 //! The standard td system (`ID=td` in `/etc/os-release`) uses its installed
-//! source-built GNU Rust/C toolchain instead. It never installs a musl target
+//! Rust toolchain, linked through td-link, instead. It never installs a musl target
 //! or replacement Rust toolchain. Both configurations produce statically linked
 //! helpers checked with `assert_static`; selecting the native configuration
 //! grants no target-artifact provenance. The musl details below describe other
@@ -66,7 +66,7 @@ pub(crate) struct ProvisionEnv {
     pub(crate) rust_version: String,
     /// The PATH searched for rustc/cargo/rustup and the system cc.
     pub(crate) search_path: String,
-    /// The standard td system uses its source-built GNU toolchain.
+    /// The standard td system uses its installed toolchain.
     pub(crate) native_td: bool,
 }
 
@@ -1022,9 +1022,8 @@ fn embedded_include_paths(files: &[PathBuf]) -> Result<Vec<String>, String> {
 /// The evaluator's compile inputs — the mirror of the stage0 roots below, with
 /// `recipes/` in place of `builder/`, PLUS everything the crate embeds (above)
 /// and the helper implementation/entry script a memo hit skips.
-/// The seed-digest table and the bootstrap-root manifest are `include_str!`d
-/// into td-recipe-eval too, so a new pin must not leave a stale compiled
-/// table in force.
+/// The seed-digest table is `include_str!`d into td-recipe-eval too, so a
+/// new pin must not leave a stale compiled table in force.
 fn recipe_eval_fp_roots(root: &Path) -> Result<Vec<String>, String> {
     let mut roots: Vec<String> = [
         "recipes/src",
@@ -1036,7 +1035,6 @@ fn recipe_eval_fp_roots(root: &Path) -> Result<Vec<String>, String> {
         "Cargo.lock",
         "seed/seed-digests.txt",
         "seed/local-source-roster.txt",
-        "seed/bootstrap-root.txt",
         "tests/recipe-eval-tool.sh",
         "builder/src/stage0.rs",
     ]
@@ -1276,7 +1274,6 @@ const BUILDER_FP_ROOTS: &[&str] = &[
     "Cargo.lock",
     "seed/seed-digests.txt",
     "seed/local-source-roster.txt",
-    "seed/bootstrap-root.txt",
     "recipes/src/debian-root.lock",
 ];
 
@@ -2292,7 +2289,7 @@ mod tests {
         }
         assert!(missing.is_empty(), "embeds outside the roots: {missing:?}");
         // The scan sees the embeds it guards.
-        for want in ["recipes/src/debian-root.lock", "seed/bootstrap-root.txt"] {
+        for want in ["recipes/src/debian-root.lock", "seed/seed-digests.txt"] {
             assert!(
                 found.iter().any(|f| f == want),
                 "{want} not found: {found:?}"

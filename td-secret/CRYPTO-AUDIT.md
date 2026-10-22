@@ -39,8 +39,8 @@ The production invocation uses edition 2021, `-C opt-level=s`, target
 `-C relocation-model=static`, `-C panic=abort`,
 `-Cforce-frame-pointers=yes`, `-Cdebuginfo=line-tables-only`, `-Cstrip=none`,
 SHA-1 linker build IDs and the recipe's `/td-build-root` and `/td-build`
-path remappings. It links with the declared source-built GCC 14.3.0,
-binutils 2.44 and glibc 2.41; no new compiler option or dependency was added.
+path remappings. td-link links it with rust-lld against td glibc 2.41 and
+gcc-runtime's libgcc; no new compiler option or dependency was added.
 The exact store paths and link arguments are emitted by `build-run`.
 
 Use the debug companion's `nm -S -C` symbols to identify code ranges, and

@@ -530,17 +530,6 @@ fn tee_stream(
     }
 }
 
-/// A phase-watched run_cmd for sibling modules (mes_boot): same supervision
-/// as every mesboot Run step, without exporting the Watch type.
-pub(crate) fn run_cmd_phase(
-    prog: &str,
-    args: &[&str],
-    cwd: &str,
-    envs: &[(String, String)],
-) -> Result<(), String> {
-    run_cmd(prog, args, cwd, envs, &WATCH_PHASE)
-}
-
 /// Run a command with a CLEAN environment (`envs` only), in `cwd`, echoing it to
 /// the build log. Fail-closed: a non-zero exit aborts the build. Supervised by
 /// `watch` (#308): the child runs in its OWN process group with stdout/stderr
@@ -2762,9 +2751,8 @@ pub(crate) fn make_tree_writable(root: &Path) -> Result<(), String> {
 }
 
 /// Recursively copy a store tree to `dst`, making the copy user-writable (store
-/// trees are read-only; the kaem build writes its artifacts INTO its tree). File
-/// exec bits are preserved; symlinks are recreated. Pure `std` — the stage0 rung
-/// has NO build inputs, so there is no coreutils `cp` in its sandbox to shell to.
+/// trees are read-only, and a build writes into its copy). File exec bits are
+/// preserved; symlinks are recreated. Pure `std`, so no `cp` need be declared.
 pub(crate) fn copy_tree_writable(src: &Path, dst: &Path) -> Result<(), String> {
     fs::create_dir_all(dst).map_err(|e| format!("mkdir {}: {e}", dst.display()))?;
     fs::set_permissions(dst, fs::Permissions::from_mode(0o755))
@@ -2925,213 +2913,6 @@ fn validate_static_application(out: &Path, entry: &str, runtime: &Path) -> Resul
     crate::elf::assert_x86_64_executable(&entry_path)
         .and_then(|()| crate::elf::assert_static(&entry_path))
         .map_err(|e| format!("application entry {}: {e}", entry_path.display()))
-}
-
-/// Scan a tree for `/gnu/store` in any regular file's CONTENTS or any symlink's
-/// TARGET (a grep-style content walk misses a dangling guix symlink); first hit
-/// errors. The stage0 seal's output half, enforced in the ENGINE per build.
-fn require_no_gnu_store(dir: &Path) -> Result<(), String> {
-    let entries = fs::read_dir(dir).map_err(|e| format!("read dir {}: {e}", dir.display()))?;
-    for entry in entries {
-        let entry = entry.map_err(|e| format!("read dir {}: {e}", dir.display()))?;
-        let ft = entry
-            .file_type()
-            .map_err(|e| format!("file type {}: {e}", entry.path().display()))?;
-        let p = entry.path();
-        let leak = if ft.is_dir() {
-            require_no_gnu_store(&p)?;
-            false
-        } else if ft.is_symlink() {
-            let target = fs::read_link(&p).map_err(|e| format!("readlink {}: {e}", p.display()))?;
-            target.to_string_lossy().contains("/gnu/store")
-        } else if ft.is_file() {
-            crate::bootstrap::contains_gnu_store(&p)
-                .map_err(|e| format!("read {}: {e}", p.display()))?
-        } else {
-            false
-        };
-        if leak {
-            return Err(format!(
-                "stage0 output {} contains /gnu/store bytes — the seed rung is sealed (north star: no guix bytes)",
-                p.display()
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// stage0-build — td's stage0-posix SEED build "system" (#378 slice 1; sibling of
-/// `run`/`run_rust`/`run_cmake`). TD_SRC is the interned unpacked stage0 seed tree: place a
-/// writable copy, mark the two binary seeds executable, exec the kaem interpreter
-/// over the two pinned scripts (hex0-seed → … → M2, blood-elf-0, kaem-0 → M1,
-/// hex2, kaem), install AMD64/{bin,artifact} into $out. The ONLY place a raw
-/// binary seed is exec'd — an engine BuildSystem, so the recipe graph is total.
-///
-/// The SEAL: no build inputs (assemble_recipe_drv hard-errors on any), so the
-/// copy/install are native Rust (no coreutils in this sandbox); the kaem steps
-/// run with an EMPTY env (`env -i` as engine policy); and any /gnu/store byte or
-/// symlink target in the output REDS the build HERE. The one /gnu/store still
-/// staged is td-builder's own runtime libc (the host seed) — unreachable by the
-/// env-cleared build; retires when td-builder self-hosts on the recipe toolchain.
-pub fn run_stage0() -> Result<(), String> {
-    let out = env::var("out").map_err(|_| "out not set".to_string())?;
-    let src = env::var("TD_SRC").map_err(|_| "TD_SRC not set".to_string())?;
-    if !Path::new(&src).is_dir() {
-        return Err(format!(
-            "TD_SRC {src} is not a directory (want the interned unpacked stage0 seed tree)"
-        ));
-    }
-
-    // Writable working copy — the kaem build writes artifacts INTO its tree.
-    let tree = Path::new("stage0-tree");
-    copy_tree_writable(Path::new(&src), tree)?;
-    for d in ["AMD64/artifact", "AMD64/bin"] {
-        remove_path_if_exists(&tree.join(d))?;
-        fs::create_dir_all(tree.join(d)).map_err(|e| format!("mkdir {d}: {e}"))?;
-    }
-    for seed in [
-        "bootstrap-seeds/POSIX/AMD64/hex0-seed",
-        "bootstrap-seeds/POSIX/AMD64/kaem-optional-seed",
-    ] {
-        let p = tree.join(seed);
-        crate::bootstrap::make_executable(&p)
-            .map_err(|e| format!("chmod +x {}: {e}", p.display()))?;
-    }
-
-    // The two kaem steps, env EMPTY (env -i): the scripts drive everything through
-    // relative paths inside the tree; nothing outside it is reachable.
-    let cwd = tree.to_string_lossy();
-    run_cmd(
-        "./bootstrap-seeds/POSIX/AMD64/kaem-optional-seed",
-        &["./AMD64/mescc-tools-seed-kaem.kaem"],
-        &cwd,
-        &[],
-        &WATCH_PHASE,
-    )?;
-    run_cmd(
-        "./AMD64/artifact/kaem-0",
-        &["./AMD64/mescc-tools-mini-kaem.kaem"],
-        &cwd,
-        &[],
-        &WATCH_PHASE,
-    )?;
-
-    // Phases 12-23 of upstream's AMD64/kaem.run, driven directly (kaem.run
-    // itself is a bash wrapper; its whole job is these two kaem invocations
-    // plus the env block reproduced here). Full-kaem rebuilds M2-Planet from
-    // its C sources and builds M2-Mesoplanet, blood-elf, and get_machine into
-    // AMD64/bin; mescc-tools-extra then compiles the POSIX file tools (cp,
-    // chmod, mkdir, rm, replace, match, catm, untar, ungz, unbz2, unxz, wrap,
-    // sha256sum) with M2-Mesoplanet — the tools the mes/tcc rungs need so
-    // their build scripts stop depending on host coreutils (re #469).
-    let env_kv = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
-        pairs
-            .iter()
-            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
-            .collect()
-    };
-    let full_env = env_kv(&[
-        ("ARCH", "amd64"),
-        ("ARCH_DIR", "AMD64"),
-        ("BASE_ADDRESS", "0x00600000"),
-        ("BLOOD_FLAG", "--64"),
-        ("ENDIAN_FLAG", "--little-endian"),
-    ]);
-    run_cmd(
-        "./AMD64/bin/kaem",
-        &[
-            "--verbose",
-            "--strict",
-            "--file",
-            "AMD64/mescc-tools-full-kaem.kaem",
-        ],
-        &cwd,
-        &full_env,
-        &WATCH_PHASE,
-    )?;
-    let extra_env = env_kv(&[
-        ("ARCH", "amd64"),
-        ("M2LIBC", "../M2libc"),
-        ("TOOLS", "../AMD64/bin"),
-        ("BINDIR", "../AMD64/bin"),
-        ("OPERATING_SYSTEM", "Linux"),
-        ("EXE_SUFFIX", ""),
-    ]);
-    let extra_cwd = tree.join("mescc-tools-extra");
-    run_cmd(
-        "../AMD64/bin/kaem",
-        &["--verbose", "--strict", "--file", "mescc-tools-extra.kaem"],
-        &extra_cwd.to_string_lossy(),
-        &extra_env,
-        &WATCH_PHASE,
-    )?;
-    // Upstream's own pinned answer file: every binary the chain produced must
-    // sha256-match the stage0-posix release's recorded hashes — the strongest
-    // output check available, and it runs with the just-built sha256sum.
-    run_cmd(
-        "./AMD64/bin/sha256sum",
-        &["-c", "amd64.answers"],
-        &cwd,
-        &[],
-        &WATCH_PHASE,
-    )?;
-
-    // Install the built tool dirs — the exact paths the chain's downstream rungs
-    // read ($tc/AMD64/bin/{M1,hex2,kaem}, $tc/AMD64/artifact/{M2,blood-elf-0,…}).
-    for d in ["AMD64/bin", "AMD64/artifact"] {
-        copy_tree_writable(&tree.join(d), &Path::new(&out).join(d))?;
-    }
-    // Fail HERE (a named tool), not as an opaque exec failure three rungs later.
-    for b in [
-        "AMD64/bin/M1",
-        "AMD64/bin/hex2",
-        "AMD64/bin/kaem",
-        "AMD64/bin/M2-Planet",
-        "AMD64/bin/M2-Mesoplanet",
-        "AMD64/bin/blood-elf",
-        "AMD64/bin/get_machine",
-        "AMD64/bin/cp",
-        "AMD64/bin/chmod",
-        "AMD64/bin/mkdir",
-        "AMD64/bin/rm",
-        "AMD64/bin/replace",
-        "AMD64/bin/match",
-        "AMD64/bin/catm",
-        "AMD64/bin/untar",
-        "AMD64/bin/ungz",
-        "AMD64/bin/unbz2",
-        "AMD64/bin/unxz",
-        "AMD64/bin/wrap",
-        "AMD64/bin/sha256sum",
-        "AMD64/artifact/M2",
-        "AMD64/artifact/blood-elf-0",
-        "AMD64/artifact/kaem-0",
-    ] {
-        let p = Path::new(&out).join(b);
-        let meta = fs::metadata(&p)
-            .map_err(|_| format!("seed build did not produce {b} (expected under $out)"))?;
-        // A regular file with an exec bit — a directory also has 0o111, so the
-        // mode alone would pass a misplaced tree here.
-        if !meta.is_file() || meta.permissions().mode() & 0o111 == 0 {
-            return Err(format!("seed build product {b} is not an executable file"));
-        }
-    }
-    // The output half of the seal: no /gnu/store byte leaves this build.
-    require_no_gnu_store(Path::new(&out))
-}
-
-fn remove_path_if_exists(path: &Path) -> Result<(), String> {
-    match fs::symlink_metadata(path) {
-        Ok(meta) => {
-            if meta.file_type().is_dir() {
-                fs::remove_dir_all(path).map_err(|e| format!("remove {}: {e}", path.display()))
-            } else {
-                fs::remove_file(path).map_err(|e| format!("remove {}: {e}", path.display()))
-            }
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(format!("stat {}: {e}", path.display())),
-    }
 }
 
 /// The template context for mesboot steps: `{root}` `{src}` `{out}` `{tools}`
@@ -4889,8 +4670,8 @@ fn split_debug_tree(root: &Path, objcopy: &Path, recipe_name: &str) -> Result<()
     Ok(())
 }
 
-/// mesboot-build — td's bootstrap-RUNG build "system" (#378 slices 2+3; sibling
-/// of `run`/`run_rust`/`run_cmake`/`run_stage0`). Executes the recipe's typed
+/// mesboot-build — td's typed-step build "system" (#378 slices 2+3; sibling
+/// of `run`/`run_rust`/`run_cmake`). Executes the recipe's typed
 /// steps (materialized from the drv's `TD_STEPS` data; see recipes/src/types.rs
 /// `Step`) over the staged inputs (TD_INPUT_MAP: lock name → store path,
 /// `{in:NAME}` templates). The engine interprets NO shell: a `run` step spawns
@@ -5044,23 +4825,14 @@ pub fn run_mesboot() -> Result<(), String> {
                 .map_err(|e| err(format!("chmod {path}: {e}")))?;
         } else if let Some(o) = step.get("unpack") {
             // Engine-native source unpack (re #469): td's own std-only
-            // tar/gzip/bzip2/xz readers — the rungs declare no unpacker
-            // packages, so `{in:tar}`-shaped host edges are gone from the
-            // graph. keepTop=false strips the unique top-level dir
+            // tar/gzip/bzip2/xz readers, so no recipe declares an unpacker
+            // package. keepTop=false strips the unique top-level dir
             // (`--strip-components=1`); anything else is a hard error.
             let input = ctx.expand_data(&field(o, "input")?).map_err(err)?;
             let dest = ctx.expand(&field(o, "dest")?).map_err(err)?;
             let keep_top = o.get("keepTop").is_some_and(Json::is_true);
             crate::tar::unpack_archive(Path::new(&input), Path::new(&dest), keep_top)
                 .map_err(err)?;
-        } else if let Some(o) = step.get("mesBoot") {
-            // The engine-native mes rung (re #469): configure + bootstrap +
-            // install of the pinned mes tarball, spawning only stage0 recipe
-            // outputs and the just-built mes — no host shell or coreutils.
-            let source = ctx.expand(&field(o, "source")?).map_err(err)?;
-            let nyacc = ctx.expand(&field(o, "nyacc")?).map_err(err)?;
-            let stage0 = ctx.expand(&field(o, "stage0")?).map_err(err)?;
-            crate::mes_boot::run(&source, &nyacc, &stage0, &ctx.out).map_err(err)?;
         } else if let Some(o) = step.get("copyFiles") {
             let dest = ctx.expand(&field(o, "dest")?).map_err(err)?;
             for f in ctx
@@ -5186,10 +4958,6 @@ pub fn run_mesboot() -> Result<(), String> {
             if got != bytes {
                 return Err(err(format!("truncate {path}: asked {bytes}, got {got}")));
             }
-        } else if let Some(o) = step.get("patchShebangs") {
-            let dir = ctx.expand(&field(o, "dir")?).map_err(err)?;
-            let shell = ctx.expand(&field(o, "shell")?).map_err(err)?;
-            patch_shebangs(Path::new(&dir), &shell).map_err(err)?;
         } else if let Some(o) = step.get("relocateLdScripts") {
             let dir = ctx.expand(&field(o, "dir")?).map_err(err)?;
             let prefix = ctx.expand(&field(o, "prefix")?).map_err(err)?;
@@ -7079,42 +6847,10 @@ mod tests {
     }
 
     #[test]
-    fn stage0_output_seal_reds_a_gnu_store_byte_and_passes_a_clean_tree() {
-        // The stage0 SEAL's output half (#378): any /gnu/store byte in the seed
-        // rung's output must red the BUILD in the engine. Verified-red by
-        // construction: the poisoned tree errors, the clean twin passes.
-        let _d_cleanup = crate::test_temp::TempDir::new("td-stage0-seal").unwrap();
-        let d = _d_cleanup.join("fixture");
-        let sub = d.join("AMD64/bin");
-        fs::create_dir_all(&sub).unwrap();
-        fs::write(sub.join("M1"), b"clean bytes").unwrap();
-        std::os::unix::fs::symlink("../artifact/M2", sub.join("clean-link")).unwrap();
-        assert!(require_no_gnu_store(&d).is_ok(), "a clean tree must pass");
-        // Red 1: a /gnu/store byte in file CONTENTS.
-        fs::write(sub.join("kaem"), b"oops /gnu/store/abc-glibc leak").unwrap();
-        let err = require_no_gnu_store(&d).expect_err("a /gnu/store byte must red");
-        assert!(
-            err.contains("/gnu/store"),
-            "diagnostic names the leak: {err}"
-        );
-        fs::remove_file(sub.join("kaem")).unwrap();
-        // Red 2: a symlink whose TARGET points into /gnu/store — invisible to a
-        // grep -r content walk, so the engine scan must catch it itself.
-        std::os::unix::fs::symlink("/gnu/store/abc-glibc/lib/ld.so", sub.join("leak-link"))
-            .unwrap();
-        let err = require_no_gnu_store(&d).expect_err("a /gnu/store symlink target must red");
-        assert!(
-            err.contains("leak-link"),
-            "diagnostic names the symlink: {err}"
-        );
-        fs::remove_dir_all(&d).unwrap();
-    }
-
-    #[test]
-    fn stage0_copy_tree_writable_preserves_exec_and_adds_write() {
-        // run_stage0's working copy: store trees are read-only (0444/0555) and the
-        // kaem build must write into its tree; exec bits must survive the copy.
-        let _d_cleanup = crate::test_temp::TempDir::new("td-stage0-copy").unwrap();
+    fn copy_tree_writable_preserves_exec_and_adds_write() {
+        // Store trees are read-only (0444/0555) and a build writes into its copy;
+        // exec bits must survive the copy.
+        let _d_cleanup = crate::test_temp::TempDir::new("td-copy-writable").unwrap();
         let d = _d_cleanup.join("fixture");
         let src = d.join("src");
         fs::create_dir_all(&src).unwrap();

@@ -2434,13 +2434,15 @@ mod tests {
         // shell gates were retired (24 Daily + 1 Heavy — `bootstrap-cc`, the only one
         // of the 25 in the Heavy pool). The shell-helper cleanup then removed the
         // compatibility-only chain-cache gate; recipe-owned checks and the x86_64
-        // gates are the surviving recipe-graph coverage. Floors are set to the EXACT
-        // post-retirement counts
+        // gates are the surviving recipe-graph coverage. Deleting the stage0 ladder
+        // then retired its seven gates (bootstrap-seed/-mes, the two toolchain
+        // input-addressed gates and the three x86_64 GCC recipe gates). Floors are set
+        // to the EXACT post-retirement counts
         // (zero headroom, matching the pre-#397 convention: 19/32/51 were exact matches
         // too) — these guard against ACCIDENTAL loss, so slack beyond the deliberate
         // retirement just lets a future PR silently drop more gates unnoticed.
         assert!(
-            heavy.len() >= 23,
+            heavy.len() >= 16,
             "heavy pool shrank below the retirement floor: {}",
             heavy.len()
         );

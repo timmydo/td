@@ -5461,7 +5461,7 @@ fn selector_template_dir() -> &'static str {
 pub fn recipe() -> Recipe {
     // The recipe's own shell steps run under td-sh with the post-Rust tool
     // farm; nothing the farm links is packed by that route.
-    let mut steps = vec![post_rust_tool_farm(None)];
+    let mut steps = vec![post_rust_tool_farm()];
     steps.push(Step::MkDir {
         path: "{out}".into(),
     });
@@ -5675,57 +5675,54 @@ pub fn recipe() -> Recipe {
         // post_rust_inputs adds the tool farm's providers (td-sh, td-txt,
         // td-util, uutils, all also packed), so the farm and this list cannot
         // drift apart.
-        .native_inputs(&post_rust_inputs(
-            None,
-            &[
-                "linux-x86-64",
-                "td-btrfs",
-                "cryptsetup-x86-64",
-                "ripgrep",
-                "fd",
-                "git-x86-64",
-                "ca-certificates",
-                "tzdata",
-                "jetbrains-mono-nerd-font",
-                "glibc-x86-64",
-                "openssh-x86-64",
-                "td-netd",
-                "td-boot",
-                "td-kexec",
-                "td-init",
-                "td-firstboot",
-                "td-login",
-                "td-authd",
-                "td-svc",
-                "td-profiler",
-                "td-taskmgr",
-                "td-review",
-                "td-agent",
-                "td-term",
-                "td-term-terminfo",
-                "td-photo",
-                "td-editor",
-                "td-pass",
-                "td-dua",
-                "td-jail",
-                "td-seatd",
-                "td-vm-guest",
-                "td-update",
-                "td-install",
-                "td-setup",
-                "td-audio",
-                "td-compositor",
-                "td-busd",
-                "td-portal",
-                "td-secret",
-                "td-net",
-                "rust-toolchain",
-                // The upstream toolchain's runtime, which its lib/ links to.
-                "gcc-runtime",
-                "zlib-x86-64",
-                "td-link",
-            ],
-        ))
+        .native_inputs(&post_rust_inputs(&[
+            "linux-x86-64",
+            "td-btrfs",
+            "cryptsetup-x86-64",
+            "ripgrep",
+            "fd",
+            "git-x86-64",
+            "ca-certificates",
+            "tzdata",
+            "jetbrains-mono-nerd-font",
+            "glibc-x86-64",
+            "openssh-x86-64",
+            "td-netd",
+            "td-boot",
+            "td-kexec",
+            "td-init",
+            "td-firstboot",
+            "td-login",
+            "td-authd",
+            "td-svc",
+            "td-profiler",
+            "td-taskmgr",
+            "td-review",
+            "td-agent",
+            "td-term",
+            "td-term-terminfo",
+            "td-photo",
+            "td-editor",
+            "td-pass",
+            "td-dua",
+            "td-jail",
+            "td-seatd",
+            "td-vm-guest",
+            "td-update",
+            "td-install",
+            "td-setup",
+            "td-audio",
+            "td-compositor",
+            "td-busd",
+            "td-portal",
+            "td-secret",
+            "td-net",
+            "rust-toolchain",
+            // The upstream toolchain's runtime, which its lib/ links to.
+            "gcc-runtime",
+            "zlib-x86-64",
+            "td-link",
+        ]))
         .steps(steps);
     let application_inputs = application_payload_inputs(&SYSTEM);
     if application_inputs.is_empty() {
@@ -9225,15 +9222,7 @@ mod tests {
                 "shipped input {required} must be declared"
             );
         }
-        for forbidden in [
-            "gcc-x86-64-native",
-            "gcc-x86-64-self",
-            "binutils-x86-64-self",
-            "gawk-x86-64-self",
-            "bash-mesboot",
-            "python-mesboot",
-            "libressl-x86-64",
-        ] {
+        for forbidden in ["libressl-x86-64", "gcc-runtime-stage1"] {
             assert!(
                 !native_inputs.iter().any(|input| input == forbidden),
                 "build-only input {forbidden} must not be a direct system input"

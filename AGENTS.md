@@ -55,16 +55,16 @@ amend the corresponding document in the same landing.
 
 # Build and trust model
 
-td has two bootstrap graphs. Do not confuse the host control plane with the
+td has two build graphs. Do not confuse the host control plane with the
 target distribution artifact graph.
 
 ## Trust zones
 
-td has three trust zones. Zone one is the source-bootstrapped target artifact
-graph. Zone two is the host control plane that evaluates and builds that graph
-but never enters it. Zone three is each marked foreign prebuilt application
-payload. A zone-three payload may live in `/td/store` and ship in the image,
-but it is never a tool, compilation input, or execution input to a
+td has three trust zones. Zone one is the target artifact graph, built from
+pinned sources. Zone two is the host control plane that evaluates and builds
+that graph but never enters it. Zone three is each marked foreign prebuilt
+application payload. A zone-three payload may live in `/td/store` and ship in
+the image, but it is never a tool, compilation input, or execution input to a
 source-built output. Only the explicit read-only `payload_inputs` channel may
 carry it into image composition or runtime association; td runs it only
 through the application confinement path described below and in
@@ -89,33 +89,25 @@ the distribution closure.
 
 ## Target artifact graph
 
-The target graph begins with the tiny, auditable stage0-posix seed and builds
-directly into `/td/store`:
+The target graph builds directly into `/td/store` from pinned upstream
+sources with two build-tool trust roots, the pinned Debian build root and the
+upstream Rust toolchain (both below):
 
 ```text
-stage0-posix -> Mes/MesCC -> TinyCC -> early GNU tools
-  -> iterative binutils/GCC/glibc ladder -> native GNU build platform
+pinned sources, in the Debian build root
+  -> td glibc, gcc-runtime's libgcc, the kernel, C libraries and td-link
   -> upstream Rust toolchain, retargeted onto td glibc
   -> target-built td control plane, tools, and Rust userland -> image
 ```
 
-The stage0/Mes ladder is the provenance boundary: every later target executable
-descends from declared seeds and source, except the upstream Rust toolchain
-(below) and the standard library and code generation it contributes to every
-Rust output. That keeps undeclared host binaries out and makes the
-from-scratch chain reproducible and checkable. Default builds
-start at the gcc-14 cut instead: `seed/bootstrap-root.txt` pins the ladder's
-outputs there by path, NAR hash and references, each machine builds them once
-from stage0 and admits only bytes equal to the pin, and graphs above the cut
-stage them as audited seeds.
-The pin is never downloaded or published; `td-recipe-eval bootstrap-root check`
-rebuilds the ladder from stage0 on demand and reports any item that does not
-reproduce. `DEVELOPMENT.md` says when to re-pin. The compiler/libc path is
-iterative. Recipe steps may execute only audited seed executables, unmarked
-outputs of earlier recipes, executables created by the current build, and,
-in a recipe that declares it, the Debian build root's tools (below). Host
-`/bin`, `/usr`, ambient `PATH`, and arbitrary host store paths are never target
-inputs.
+No compiler in this graph is source-bootstrapped: the build root's GCC and
+binutils and the toolchain's rustc and LLVM compile every output, and a
+source-bootstrap claim names them as trust roots wherever they reach.
+What td establishes is that nothing undeclared enters a build. Recipe steps
+may execute only unmarked outputs of earlier recipes, executables created by
+the current build, and, in a recipe that declares it, the Debian build root's
+tools. Host `/bin`, `/usr`, ambient `PATH`, and arbitrary host store paths are
+never target inputs.
 
 `td-builder build` stages declared inputs and sets compatibility `NIX_STORE`
 to the active td store. A `TD_STORE_DIR=/td/store` build is hashed for and
@@ -124,11 +116,10 @@ dependency.
 
 ## Foreign application payloads
 
-td's bootstrap graph contains no foreign binary other than its declared
-bootstrap seeds, the Debian build root's tools, the upstream Rust toolchain
-and the non-executable pinned upstream data below. A
-third-party application is a marked foreign prebuilt
-payload in `/td/store`, not a bootstrap seed. The mark is load-bearing:
+td's target graph contains no foreign binary other than the Debian build
+root's tools, the upstream Rust toolchain and the non-executable pinned
+upstream data below. A third-party application is a marked foreign prebuilt
+payload in `/td/store`, not a build-tool trust root. The mark is load-bearing:
 
 - ordinary input channels refuse it; only `payload_inputs` may carry it as
   read-only data for image composition or runtime association;
@@ -167,9 +158,9 @@ no class here and needs an amendment to this file.
 
 ## Debian build root
 
-td is moving its C toolchain off the stage0 ladder (`BUILD-ROOT-PLAN.md`).
-The build root is a build environment, not an input: a pinned Debian image
-layer plus pinned .debs from snapshot.debian.org, resolved into
+td's C toolchain is the Debian build root. It is a build environment, not
+an input: a pinned Debian image layer plus pinned .debs from
+snapshot.debian.org, resolved into
 `recipes/src/debian-root.lock` by `td-feed debian-root resolve`, and
 assembled by td-builder into one input-addressed store path whose NAR hash
 the lock pins. A recipe that declares `build_root` runs with that tree as
@@ -194,14 +185,10 @@ or to recipes that later use them. Recipes in the root must therefore link
 only against td-built libraries or none, which their review and their own
 checks establish. A source-bootstrap claim names the root as a build-tool
 trust root, as it names the upstream Rust toolchain, for every output whose
-build closure includes a root-built output; the stage0 provenance
-statements above hold only for outputs whose closure excludes both.
-td glibc is itself root-built, so every output that links it has a
-root-built output in its closure: until the ladder is deleted, those
-statements cover no shipped output above glibc.
+build closure includes a root-built output. td glibc is itself root-built,
+so that is every output that links it.
 
-Changing the root's packages is a reviewed lock change. Until the ladder is
-deleted (increment 11 of that plan) both paths coexist.
+Changing the root's packages is a reviewed lock change.
 
 ## Rust toolchain and dependencies
 
@@ -248,30 +235,30 @@ td-built tools, the pinned Rust toolchain and, for C and assembly, the
 Debian build root's compiler and archiver. New td-owned shipped userland
 should be Rust built with that toolchain.
 
-The final image uses uutils for its core userland and does not carry the GNU
-bootstrap userland forward. glibc and libgcc, the kernel, boot/firmware
-components, and explicitly reviewed non-Rust packages are the exceptions;
-it ships no C compiler.
+The final image uses uutils for its core userland and carries no GNU
+userland. glibc and libgcc, the kernel, boot/firmware components, and
+explicitly reviewed non-Rust packages are the exceptions; it ships no C
+compiler.
 
 ## Target user-mode profiling contract
 
 Every source-built user-mode artifact that ships and can appear in a runtime
-stack keeps frame pointers. This includes the source-built compiler, libc and
-userland closure; td-owned programs, dependency crates, and native objects
-compiled by Cargo build scripts. The upstream Rust toolchain is not
-source-built: its own objects carry no debug companions, and the prebuilt
-standard library every Rust output links keeps frame pointers in only part
-of its code; `td-profiler/DESIGN.md` names both as coverage boundaries. It is one target-wide policy, not a per-recipe release-profile
-choice. A recipe may not weaken it without amending this contract and
-`td-profiler/DESIGN.md`.
+stack keeps frame pointers. This includes td glibc, libgcc, the source-built
+libraries and userland closure; td-owned programs, dependency crates, and
+native objects compiled by Cargo build scripts. The upstream Rust toolchain is
+not source-built: its own objects carry no debug companions, and the prebuilt
+standard library every Rust output links keeps frame pointers in only part of
+its code; `td-profiler/DESIGN.md` names both as coverage boundaries. It is one
+target-wide policy, not a per-recipe release-profile choice. A recipe may not
+weaken it without amending this contract and `td-profiler/DESIGN.md`.
 
 Every such ELF also has a deterministic, path-remapped debug companion in the
-same recipe output and system image. Bootstrap seeds, build-only intermediates,
-the kernel, firmware, marked foreign payloads, the upstream Rust toolchain,
-hand-written assembly, and the exact coverage and reproducibility rules are
-specified in `td-profiler/DESIGN.md`; profiler output reports every boundary
-explicitly. The image's object index leaves the toolchain out, so its frames
-report as unresolved symbol coverage.
+same recipe output and system image. The Debian build root, build-only
+intermediates, the kernel, firmware, marked foreign payloads, the upstream
+Rust toolchain, hand-written assembly, and the exact coverage and
+reproducibility rules are specified in `td-profiler/DESIGN.md`; profiler
+output reports every boundary explicitly. The image's object index leaves the
+toolchain out, so its frames report as unresolved symbol coverage.
 
 The first `td-profiler/DESIGN.md` implementation increment enforces the
 producer side in compiler flags, per-output runtime/debug pair checks, size

@@ -81,8 +81,8 @@ a way a closure query can check.
 The claim that results is narrower than "the store contains no foreign
 binary", and the narrowing is deliberate:
 
-> td's bootstrap graph contains no foreign binary other than its
-> declared bootstrap seeds, and no foreign APPLICATION binary is an
+> td's target graph contains no foreign binary other than its
+> declared build-tool trust roots, and no foreign APPLICATION binary is an
 > input to anything td builds. A curated set of applications ships in
 > the store as marked sandboxed-application outputs — foreign prebuilt
 > payloads that bring their own root and libc, are consumed by nothing,
@@ -1031,10 +1031,10 @@ After PID-namespace teardown prevents any package descendant from running
 further code, the outer sandbox parent recognizes the four application-capable
 runners and materializes the manifest, spec and `exports/launcher.tsv` as mode
 0644 metadata. It creates `exports/` as mode 0755 without following a symlink.
-None of the three values is passed into the package PID namespace. The sealed
-`stage0` seed and the `rust-dist` toolchain transform refuse application
-metadata at assembly; their outer post-build verifier only reserves the root
-names and can never write metadata.
+None of the three values is passed into the package PID namespace. The
+`rust-dist` toolchain transform refuses application metadata at assembly; its
+outer post-build verifier only reserves the root names and can never write
+metadata.
 This is not a `Step`: applications built with GNU, CMake or Cargo get the same
 declaration as a mesboot recipe, and there is no second generic file writer that
 can evade step-level guards. The fixed writer decodes and re-parses all three
@@ -2283,26 +2283,18 @@ itself had, answered with a number rather than with a fixture.
 
 **The second line is NOT spelled `source-bootstrapped`, and that is a
 correction review forced rather than a wording preference.** The count is
-members minus marked payloads, and two members of this very closure are
-prebuilt: `rust-toolchain` is the upstream Rust release, and `stage0`
-is the stage0-posix seed. Both are td's declared trust roots, which
-AGENTS.md's claim names as its own exceptions — "no foreign binary other
-than its declared bootstrap seeds, the Debian build root's tools, the
-upstream Rust toolchain" — and §B.8's mark is about APPLICATION payloads
+members minus marked payloads, and members of this very closure are
+prebuilt or built by prebuilt tools: `rust-toolchain` is the upstream Rust
+release, and the Debian build root compiles every C member. Both are td's
+declared trust roots, which AGENTS.md's claim names as its own exceptions —
+"no foreign binary other than the Debian build root's tools, the upstream
+Rust toolchain" — and §B.8's mark is about APPLICATION payloads
 and says nothing about them. A line spelled
 `source-bootstrapped 66` would therefore deny something td declares, and
 a reader parsing it as "nothing prebuilt is in here" would be wrong. So
 the wire says `unmarked`, the design sentence stays what it is, and
 `audited-seeds` — the distinct seed inputs the planning pass classified —
 is printed beside it so the seeds are visible rather than absent.
-
-With a pinned bootstrap root (AGENTS.md, "Target artifact graph") the
-query walks the graph that builds: the ladder below the gcc-14 cut is not a
-member, and the cut's exports are counted among `audited-seeds`. Their
-descent from stage0 rests on the pin, which this machine built from stage0
-and admits only when the bytes equal it; `td-recipe-eval bootstrap-root
-check` re-proves it on demand, and `TD_BOOTSTRAP_FROM_STAGE0=1` makes the
-query walk the whole chain.
 
 A member built in the Debian build root (AGENTS.md, "Debian build root")
 is source-built by tools td did not build, so the answer names the root
@@ -3456,7 +3448,7 @@ two ioctls the truncation *is* the point.
    a direct loss notice printed before the asynchronously queued begin record,
    plus malformed records, a uid other than 1000, and every syscall/action
    class outside the compiled deny roster. The target kernel enables i386
-   execution for the source bootstrap's Mes and GNU ladder; x32 stays off.
+   execution so the standalone probe below can prove the kill; x32 stays off.
    The unchanged outer filter kills a non-x86-64 audit architecture before
    examining syscall numbers. The standalone kernel probe requires i386
    exit(0) to work before filtering and to die with SIGSYS afterward.

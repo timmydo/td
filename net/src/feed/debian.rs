@@ -1,5 +1,5 @@
 // debian — `td-feed debian-root resolve LOCK`: re-resolve the Debian build
-// root's committed lock (BUILD-ROOT-PLAN.md, increment 2).
+// root's committed lock (AGENTS.md, "Debian build root").
 //
 // The lock's input lines name an image tag, a snapshot.debian.org timestamp,
 // the archives to read and the packages wanted. This resolves the tag to its

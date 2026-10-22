@@ -1,9 +1,8 @@
 //! The package catalog — every td recipe, declared in Rust.
 //!
-//! Keyed by a stable STEM (not the recipe name): the `-perturbed`
-//! self-discrimination twins deliberately share a recipe `name` with their base
-//! (e.g. `hello-perturbed` is name `hello`), so the stem is the stable key. The
-//! `recipe-rs` gate proves the surface is self-consistent.
+//! Keyed by a stable STEM, the recipe's file name, not its `name`: two recipes
+//! may share a name. The `recipe-rs` gate proves the surface is
+//! self-consistent.
 //!
 //! Each recipe lives in its own self-registering file `src/recipes/<stem>.rs`
 //! (github issue #295): the file name IS the stem, `pub fn recipe() -> Recipe`
@@ -14,7 +13,7 @@
 
 use crate::types::Recipe;
 
-/// Look up a recipe by `.ts` file stem (e.g. "hello", "gzip-perturbed").
+/// Look up a recipe by file stem (e.g. "zlib-x86-64").
 pub fn lookup(stem: &str) -> Option<Recipe> {
     all().into_iter().find(|(s, _)| *s == stem).map(|(_, r)| r)
 }
@@ -418,7 +417,7 @@ mod tests {
                 stem == "td-link-test" || recipe.build_root,
                 "{stem}: a direct Rust recipe builds in the build root"
             );
-            crate::ladder::assert_no_ladder_tools(&recipe, &[]);
+            crate::ladder::assert_no_tool_farm(&recipe, &[]);
             let objcopy = "/usr/bin/objcopy";
             assert!(
                 stem == "td-link-test"
@@ -451,7 +450,7 @@ mod tests {
 
     /// A Cargo target builds in the Debian build root, whose gcc compiles its
     /// build scripts' C against td glibc's headers and whose objcopy splits
-    /// its companions; td-link links it. No ladder tool is an input.
+    /// its companions; td-link links it. No tool farm is an input.
     #[test]
     fn every_cargo_target_builds_in_the_root_with_td_link_and_td_glibc() {
         let mut cargo = Vec::new();
@@ -469,7 +468,7 @@ mod tests {
                 ["rust-toolchain", "td-link", "glibc-x86-64"],
                 "{stem}: a Cargo target's toolchain, linker and C headers"
             );
-            crate::ladder::assert_no_ladder_tools(&recipe, &[]);
+            crate::ladder::assert_no_tool_farm(&recipe, &[]);
             // Only these build scripts compile C, each to an exact count.
             let objects = match stem {
                 "td-net" => Some(30),
@@ -508,10 +507,7 @@ mod tests {
         for &(stem, _) in td_engine::target_profile::ASSEMBLY_EXCEPTIONS {
             let recipe = lookup(stem)
                 .unwrap_or_else(|| panic!("assembly exception names missing recipe {stem}"));
-            if matches!(
-                stem,
-                "gcc-runtime-stage1" | "gcc-x86-64-native" | "rust-toolchain"
-            ) {
+            if matches!(stem, "gcc-runtime-stage1" | "rust-toolchain") {
                 continue;
             }
             let generic_cargo_split =
@@ -528,21 +524,15 @@ mod tests {
             );
         }
 
-        // gcc-runtime-stage1 and the native compiler rung are build-only
-        // provenance for libgcc objects linked into later outputs, and
-        // rust-toolchain is the prebuilt std every Rust output links. They
-        // need no companions of their own, but the marker on each split
-        // consumer must name the actual source.
+        // gcc-runtime-stage1 is build-only provenance for the libgcc objects
+        // glibc links, and rust-toolchain is the prebuilt std every Rust
+        // output links. They need no companions of their own, but the marker
+        // on each split consumer must name the actual source.
         assert!(
             td_engine::target_profile::output_assembly_exceptions("glibc-x86-64")
                 .iter()
                 .any(|(source, _)| *source == "gcc-runtime-stage1")
         );
-        for stem in ["binutils-x86-64-self", "gcc-x86-64-self"] {
-            assert!(td_engine::target_profile::output_assembly_exceptions(stem)
-                .iter()
-                .any(|(source, _)| *source == "gcc-x86-64-native"));
-        }
         assert!(
             td_engine::target_profile::output_assembly_exceptions("td-util")
                 .iter()
@@ -697,27 +687,26 @@ mod tests {
         }
     }
 
-    /// A post-Rust tool farm links an awk only for the ladder's own builds;
-    /// a recipe whose farm has none runs none, so that the image and the
-    /// kexec spike need no ladder gawk.
+    /// The post-Rust tool farm links no awk, so a recipe built on it runs
+    /// none: the image and the kexec spike need no gawk.
     #[test]
-    fn a_farm_without_awk_runs_none() {
+    fn a_post_rust_farm_recipe_runs_no_awk() {
         let mut checked = 0;
         for (stem, recipe) in all() {
             let steps = recipe.steps.as_deref().unwrap_or_default();
-            let farm_has_awk = steps.iter().any(|step| match step {
+            let post_rust_farm = steps.iter().any(|step| match step {
                 crate::types::Step::ToolFarm { links } => {
-                    links.iter().any(|(name, _)| name == "awk")
+                    assert!(
+                        !links.iter().any(|(name, _)| name == "awk"),
+                        "{stem}: a tool farm links awk"
+                    );
+                    links
+                        .iter()
+                        .any(|(_, target)| target.contains("{in:td-sh}"))
                 }
                 _ => false,
             });
-            let post_rust_farm = steps.iter().any(|step| match step {
-                crate::types::Step::ToolFarm { links } => links
-                    .iter()
-                    .any(|(_, target)| target.contains("{in:td-sh}")),
-                _ => false,
-            });
-            if !post_rust_farm || farm_has_awk {
+            if !post_rust_farm {
                 continue;
             }
             checked += 1;
@@ -803,13 +792,9 @@ mod tests {
 
     #[test]
     fn source_built_runtime_toolchain_keeps_frames_lines_ids_and_remapped_paths() {
-        for (stem, expected_tail_uses) in [
-            ("binutils-x86-64-self", 2),
-            ("gcc-runtime", 0),
-            ("gcc-x86-64-self", 4),
-            ("glibc-x86-64", 1),
-            ("zlib-x86-64", 1),
-        ] {
+        for (stem, expected_tail_uses) in
+            [("gcc-runtime", 0), ("glibc-x86-64", 1), ("zlib-x86-64", 1)]
+        {
             let recipe = lookup(stem).unwrap_or_else(|| panic!("missing target recipe {stem}"));
             let json = recipe.to_json().to_canonical();
             for required in [
@@ -978,9 +963,8 @@ mod named_dirs_tests {
             assert!(files.contains(&kept), "{kept} not fingerprinted");
         }
         for per_recipe in [
-            "recipes/src/recipes/hello.rs",
+            "recipes/src/recipes/zlib-x86-64.rs",
             "recipes/src/recipes/uutils.rs",
-            "recipes/src/recipes/bash-mesboot.mk",
         ] {
             assert!(!files.contains(&per_recipe), "{per_recipe} fingerprinted");
         }

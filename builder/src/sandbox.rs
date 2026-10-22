@@ -2034,7 +2034,7 @@ pub struct Bind {
 /// `guix shell -C` — NOT the host device tree); the host filesystem is otherwise
 /// gone. `path_env` is the full PATH; an empty value stays empty. `home` is HOME;
 /// `workdir` is the cwd to enter after pivot (empty → `/`); `extra_env` is
-/// caller-preserved env (e.g. the `TD_SUBST_*`/`TD_DAEMON_*` knobs). Runs `cmd args` and
+/// caller-preserved env (e.g. the `TD_CHECK_*`/`TD_DAEMON_*` knobs). Runs `cmd args` and
 /// returns its exit status. Unshares
 /// NEWUSER|NEWNS|NEWPID|NEWNET|NEWIPC|NEWUTS and runs the command as PID 1 of the
 /// new PID namespace with a private /proc mounted by that PID-1 process — full
@@ -2214,7 +2214,7 @@ pub fn host_shell(
     command.env("HOME", home);
     command.env("TMPDIR", "/tmp");
     command.env("TD_HOST_SANDBOX", "1");
-    // Caller-preserved env (e.g. the TD_SUBST_*/TD_DAEMON_* knobs).
+    // Caller-preserved env (e.g. the TD_CHECK_*/TD_DAEMON_* knobs).
     for (k, v) in extra_env {
         command.env(k, v);
     }
@@ -2817,7 +2817,7 @@ mod tests {
         let error = configure_builder_env(
             &mut bootstrap_application,
             &builder,
-            &["stage0-build".to_string()],
+            &["rust-dist-build".to_string()],
             &env,
             steps_file,
         )

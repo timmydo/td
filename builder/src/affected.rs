@@ -589,29 +589,29 @@ fn target_included_consumers(p: &str) -> Option<&'static str> {
         .find_map(|&(src, consumers)| (src == p).then_some(consumers))
 }
 
-fn add_recipe_graph_targets(sel: &mut Selection) {
-    sel.add_target("bootstrap-x86_64-toolchain-store-native");
-    sel.add_target("bootstrap-x86_64-native-gcc-store-native");
-    sel.add_target("bootstrap-x86_64-self-gcc-store-native");
+// The recipe graph's consumers of a pinned input: the recipe-owned checks,
+// which build and check every recipe that reads it. The per-rung gates of the
+// stage0 ladder (#397) and its x86_64 toolchain gates were deleted with it.
+fn add_chain_targets(sel: &mut Selection) {
     sel.add_target("recipe-checks");
 }
 
-// The 25 per-rung `bootstrap-<rung>.sh` gates that used to prove each i686
-// mesboot→store-native rung individually are retired (#397): their `build_*`
-// shell ladders were 80-95% duplicate of the recipe graph runner. There are now
-// two live consumers of the i686 base graph's pinned inputs: recipe-owned
-// checks, and the x86_64 gates whose cross/native/self rungs sit on top of the
-// same stage0→mes→tcc→…→gcc-14→binutils-244→glibc-241 graph. The old
-// "downstream slice" concept (CHAIN + add_chain, a 28-entry dependency array
-// sliced per arm) is gone — every pinned input routes to that consumer set.
-// What's accepted as lost: per-rung double-build reproducibility, the
-// `store-ns` sandboxed no-guix round-trip, and the `subst-export`/`nar-restore`
-// round-trip that some of the deep store-native rungs' scripts also checked —
-// nothing ports those checks elsewhere. The remaining recipe-owned checks
-// are the live coverage.
-fn add_chain_targets(sel: &mut Selection) {
-    add_recipe_graph_targets(sel);
-}
+/// Paths the stage0 ladder's deletion removed: its gate defs, the pinned
+/// bootstrap root, the toolchain locks and their resolver, and the shell
+/// drivers its gates had already absorbed. Only a deleting diff names them.
+const LADDER_TOMBSTONES: &str = "builder/src/gate_defs/360-bootstrap-seed.rs|\
+builder/src/gate_defs/364-bootstrap-mes.rs|\
+builder/src/gate_defs/414-bootstrap-x86_64-toolchain-store-native.rs|\
+builder/src/gate_defs/414-toolchain-input-addressed.rs|\
+builder/src/gate_defs/418-toolchain-x86_64-input-addressed.rs|\
+builder/src/gate_defs/422-bootstrap-x86_64-native-gcc-store-native.rs|\
+builder/src/gate_defs/426-bootstrap-x86_64-self-gcc-store-native.rs|\
+seed/bootstrap-root.txt|seed/patches/*|seed/stage0/*|\
+tests/td-toolchain.lock|tests/td-toolchain-x86_64.lock|tests/td-toolchain-x86_64-native.lock|\
+tools/resolve-toolchain.sh|tests/toolchain-input-addressed.sh|\
+tests/toolchain-x86_64-input-addressed.sh|tests/bootstrap-x86_64-native-gcc-store-native.sh|\
+tests/bootstrap-x86_64-self-gcc-store-native.sh|tests/bootstrap-x86_64-toolchain-store-native.sh|\
+tests/x86_64-cross-fns.sh|tests/x86_64-subst-lib.sh";
 
 // ---------------------------------------------------------------------------
 // map_path — the `case` ladder, arm-for-arm with the shell (first match wins).
@@ -652,6 +652,17 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
             "{p} touches the loop spine: validated by the full check (the runner runs \
              itself over every gate)."
         ));
+        return;
+    }
+
+    // The stage0 ladder's tombstones: what their deletion can break is what read
+    // them, the planners and builder suites and the recipe graph.
+    if pattern_matches(LADDER_TOMBSTONES, p) {
+        sel.add_preflight("shell-syntax");
+        sel.add_preflight("cargo-test");
+        sel.add_target("recipe-rs");
+        add_build_gate_targets(root, sel);
+        add_chain_targets(sel);
         return;
     }
 
@@ -720,8 +731,6 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
             "recipe-checks",
             "store-native-profile",
             "sandbox-hardening",
-            "toolchain-input-addressed",
-            "toolchain-x86_64-input-addressed",
         ] {
             sel.add_target(g);
         }
@@ -830,8 +839,6 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         sel.add_preflight("shell-syntax");
         sel.add_preflight("cargo-test");
         sel.add_target("recipe-rs");
-        sel.add_target("bootstrap-seed");
-        sel.add_target("bootstrap-mes");
         add_build_gate_targets(root, sel);
         add_chain_targets(sel);
         return;
@@ -843,8 +850,6 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
     if pattern_matches("seed/sources/*.lock", p) {
         sel.add_preflight("shell-syntax");
         sel.add_target("recipe-rs");
-        sel.add_target("bootstrap-seed");
-        sel.add_target("bootstrap-mes");
         add_build_gate_targets(root, sel);
         add_chain_targets(sel);
         return;
@@ -887,10 +892,7 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
     // seed/local-source-roster.txt below) — every row here is a fetched or
     // host-generated pin, which needs a warm-cache `seed-digests` run to
     // check directly.
-    // seed/bootstrap-root.txt — the pinned bootstrap root, compiled into both
-    // planners like the digest table: a row change moves what every post-cut
-    // build admits as its toolchain, so it routes the same way.
-    if p == "seed/seed-digests.txt" || p == "seed/bootstrap-root.txt" {
+    if p == "seed/seed-digests.txt" {
         sel.add_preflight("cargo-test");
         sel.add_target("recipe-rs");
         add_build_gate_targets(root, sel);
@@ -971,37 +973,6 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         return;
     }
 
-    // Tombstone (#460): the shell body became the native gate_bodies::toolchain_input_addressed;
-    // the deleting diff still routes to the gate that absorbed the logic.
-    if p == "tests/toolchain-input-addressed.sh" {
-        sel.add_target("toolchain-input-addressed");
-        return;
-    }
-
-    if p == "tests/td-toolchain-x86_64.lock" {
-        sel.add_preflight("shell-syntax");
-        sel.add_target("toolchain-x86_64-input-addressed");
-        sel.add_target("bootstrap-x86_64-toolchain-store-native");
-        return;
-    }
-
-    // #410: the tests/td-toolchain-rust-x86_64.lock mapping was removed with the rust-toolchain
-    // recipe-graph cutover — that gate-assembled lock and its consumer gate (416) are retired.
-    // Tombstone (#460): the shell body became gate_bodies::toolchain_x86_64_input_addressed. The
-    // gate def (418-*.rs) is handled by the generic gate_defs/*.rs arm above; the deleted shell
-    // still routes to the gate that absorbed the logic.
-    if p == "tests/toolchain-x86_64-input-addressed.sh" {
-        sel.add_target("toolchain-x86_64-input-addressed");
-        return;
-    }
-
-    if p == "tests/td-toolchain.lock" {
-        sel.add_preflight("shell-syntax");
-        sel.add_target("toolchain-input-addressed");
-        sel.add_target("toolchain-x86_64-input-addressed");
-        return;
-    }
-
     // Tombstones of the build phase: tests/build-recipes.sh and its helper
     // tests/cache-lib.sh became gate_bodies.rs's build-recipes body and
     // PlacedStage0, and tests/stage0-builder.sh became builder/src/stage0.rs
@@ -1023,68 +994,12 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         return;
     }
 
-    // bootstrap-seed / bootstrap-mes have NO shell driver — they are STRUCTURED Rust
-    // recipes (`td-builder bootstrap-recipe {seed,mes}`, builder/src/bootstrap.rs,
-    // rust-migration C2; the old tests/bootstrap-{seed,mes}.sh were deleted). Source
-    // pin edits now live in recipes/src/source_pins.rs and route through the recipe
-    // crate arm above, which selects the recipe engine plus all build gates.
-
     // Tombstones for the deleted shell recipe-graph compatibility helpers. The
     // deleting diff maps to the current Rust recipe-graph consumers.
     if pattern_matches(
         "tests/bootstrap-chain.sh|tests/ladder-lib.sh|tests/chain-cache.sh|tests/chain-cache-lib.sh|tests/repro-lib.sh",
         p,
     ) {
-        add_chain_targets(sel);
-        return;
-    }
-
-    // --- the i686 mesboot→store-native recipe graph's vendored patches (#397) ---
-    // Source pin changes are recipe edits now; patch byte changes still route to
-    // the live graph consumers: recipe-owned checks and the x86_64 gates.
-    if pattern_matches("seed/patches/binutils-boot-*.patch|seed/patches/gcc-boot-2.95.3.patch|seed/patches/glibc-boot-2.2.5.patch|seed/patches/glibc-bootstrap-system-2.2.5.patch|seed/patches/gcc-boot-4.6.4.patch|seed/patches/glibc-boot-2.16.0.patch|seed/patches/glibc-bootstrap-system-2.16.0.patch", p)
-    {
-        sel.add_preflight("shell-syntax");
-        add_chain_targets(sel);
-        return;
-    }
-    // Tombstones for the retired x86_64 shell drivers/libs. The live orchestration is
-    // recipe-owned; these deleting diffs still route to the gates that delegate
-    // into td-recipe-eval check-run.
-    if pattern_matches("tests/bootstrap-x86_64-native-gcc-store-native.sh", p) {
-        sel.add_target("bootstrap-x86_64-native-gcc-store-native");
-        return;
-    }
-    if pattern_matches("tests/bootstrap-x86_64-self-gcc-store-native.sh", p) {
-        sel.add_target("bootstrap-x86_64-self-gcc-store-native");
-        return;
-    }
-    // The NATIVE x86_64 toolchain's input-addressed key file: consumed by the native gcc gate (422,
-    // builds+interns the native toolchain at these lock paths) and the self-host gate (426, obtains the
-    // native toolchain as its builder).
-    // (A recipe-rev bump here re-keys the path.) The rust runtime gate (416) that also fetched this as
-    // the linker was retired with the rust-toolchain recipe-graph cutover (#410).
-    if pattern_matches("tests/td-toolchain-x86_64-native.lock", p) {
-        sel.add_target("bootstrap-x86_64-native-gcc-store-native");
-        sel.add_target("bootstrap-x86_64-self-gcc-store-native");
-        return;
-    }
-    if pattern_matches(
-        "tests/bootstrap-x86_64-toolchain-store-native.sh|tests/x86_64-cross-fns.sh|tests/x86_64-subst-lib.sh|builder/src/gate_defs/414-bootstrap-x86_64-toolchain-store-native.rs",
-        p,
-    ) {
-        sel.add_target("bootstrap-x86_64-toolchain-store-native");
-        // The old shared libs also defined the rung-X2 native driver, fetch-or-build
-        // obtainers, and rung-X3 self-host helpers; their deletion still routes to
-        // all three x86_64 gates.
-        sel.add_target("bootstrap-x86_64-native-gcc-store-native");
-        sel.add_target("bootstrap-x86_64-self-gcc-store-native");
-        return;
-    }
-
-    if glob_match("seed/stage0/*", p) {
-        sel.add_preflight("shell-syntax");
-        sel.add_target("bootstrap-seed");
         add_chain_targets(sel);
         return;
     }
@@ -1529,8 +1444,8 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
     // (`dependency_free_locks` -> `assert_dependency_free`), so that half is
     // equal rather than a superset; the suite is what still differs, and in
     // the safe direction. `check` would add the cheap+heavy pools and
-    // build-recipes on top — the source-bootstrap ladder from the stage0 seed,
-    // an hour of mes/tcc/gcc that cannot read a host-side crate. Bounded means
+    // build-recipes on top — the recipe graph, which cannot read a host-side
+    // crate. Bounded means
     // bounded by what the diff can break; a selection nothing in it inspects is
     // latency, and latency is what gets a pre-push check skipped.
     if pattern_matches("td-vm/*", p) {
@@ -1551,7 +1466,7 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
     // The full check added only gate 325's in-sandbox, networkless copy of
     // those same legs (the host legs are offline too: frozen, with verified
     // source replacement), a recipe-checks scope no recipe reads (so every
-    // check), and the bootstrap ladder; the portable musl build is its own
+    // check), and the recipe graph; the portable musl build is its own
     // command.
     if (p.starts_with("td-crypto/")
         || p.starts_with("td-header/")
@@ -1644,7 +1559,7 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
     }
 
     // td-pinentry is a host program `./install-apps` builds with the host's
-    // cargo. No recipe builds it, so neither the bootstrap ladder nor the
+    // cargo. No recipe builds it, so neither the recipe graph nor the
     // image can read it; the cargo-test preflight is every tier that does:
     // its suite, lints and lock, and its native compositor cases.
     if p.starts_with("td-pinentry/") && !p.contains("..") {
@@ -2004,8 +1919,7 @@ fn format_output(
                 } else {
                     o.push_str(
                         "  recipe-checks defers nothing: the change touches seed/, whose tables \
-                         a check's key holds only in its builder-engine component \
-                         (its patches have their own)\n",
+                         a check's key holds only in its builder-engine component\n",
                     );
                 }
             }
@@ -2373,9 +2287,19 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
         "tests/repro-lib.sh",
     ] {
         assert_target!(tombstone, "recipe-checks");
-        assert_target!(tombstone, "bootstrap-x86_64-toolchain-store-native");
-        assert_target!(tombstone, "bootstrap-x86_64-native-gcc-store-native");
-        assert_target!(tombstone, "bootstrap-x86_64-self-gcc-store-native");
+    }
+    // The stage0 ladder's deleting diff routes to what read it.
+    for tombstone in [
+        "builder/src/gate_defs/360-bootstrap-seed.rs",
+        "builder/src/gate_defs/426-bootstrap-x86_64-self-gcc-store-native.rs",
+        "seed/patches/glibc-boot-2.16.0.patch",
+        "seed/stage0/AMD64/hex0_AMD64.hex0",
+        "tests/td-toolchain.lock",
+        "tools/resolve-toolchain.sh",
+    ] {
+        assert_target!(tombstone, "recipe-checks");
+        assert_target!(tombstone, "recipe-rs");
+        assert_no_target!(tombstone, "check");
     }
 
     // A gate-file change still selects the dispatcher's own self-test preflight
@@ -2399,25 +2323,16 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     // #460: the four former tests/*.sh gate bodies became native gate_bodies fns.
     assert_target!("builder/src/gate_bodies.rs", "store-native-profile");
     assert_target!("builder/src/gate_bodies.rs", "sandbox-hardening");
-    assert_target!("builder/src/gate_bodies.rs", "toolchain-input-addressed");
-    assert_target!(
-        "builder/src/gate_bodies.rs",
-        "toolchain-x86_64-input-addressed"
-    );
     // Their deleted shell drivers are tombstoned to the gate that absorbed each.
     assert_target!("tests/store-native-profile.sh", "store-native-profile");
     assert_target!("tests/sandbox-hardening.sh", "sandbox-hardening");
-    assert_target!(
-        "tests/toolchain-input-addressed.sh",
-        "toolchain-input-addressed"
-    );
     // The Rust td-recipe crate IS the package + spec surface (boa/TS retired): a
     // catalog edit runs recipe-rs and the package build gates.
     assert_target!("recipes/src/catalog.rs", "recipe-rs");
     // Recipes are one self-registering file each under src/recipes/ (issue #295);
     // the nested path must select the same gate (glob `*` crosses `/`).
-    assert_target!("recipes/src/recipes/make-test.rs", "recipe-rs");
-    assert_target!("recipes/src/recipes/make-test.rs", "recipe-checks");
+    assert_target!("recipes/src/recipes/zlib-x86-64.rs", "recipe-rs");
+    assert_target!("recipes/src/recipes/zlib-x86-64.rs", "recipe-checks");
     assert_target!("recipes/build.rs", "recipe-rs");
     assert_target!("recipes/Cargo.toml", "recipe-rs");
     // A recipe file can add, remove, or rename a `local_source`/
@@ -2432,7 +2347,8 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     // like a seed/seed-digests.txt row change — the build gates must run too
     // (found in review: this arm omitted them while its sibling arms did not).
     assert_target!("seed/local-source-roster.txt", "build-recipes");
-    // The bootstrap-root manifest moves what every post-cut build stages.
+    // The retired bootstrap-root manifest's deleting diff routes as the
+    // digest table does.
     assert_preflight!("seed/bootstrap-root.txt", "cargo-test");
     assert_target!("seed/bootstrap-root.txt", "recipe-rs");
     assert_target!("seed/bootstrap-root.txt", "build-recipes");
@@ -3134,25 +3050,10 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("td-boot/Cargo.toml", "recipe-checks");
     // protocol.rs is the deployment contract three OTHER trees compile: two
     // recipes and — since the manifest header and bound moved into it — td-net.
-    // What distinguishes it from the rest of td-boot is the chain targets: no
-    // gate builds td-net from source, the recipe-graph WARM does, so a break
-    // that only reaches the signer runs nothing without them. `td-boot/src/
-    // main.rs` selecting none of the three is the other half of the pin — the
-    // rule has to be about this file and not about the crate.
+    // No gate builds td-net from source, the recipe-graph WARM does, so a break
+    // that only reaches the signer must still select the recipe checks.
     assert_target!("td-boot/src/protocol.rs", "check");
     assert_target!("td-boot/src/protocol.rs", "recipe-checks");
-    assert_target!(
-        "td-boot/src/protocol.rs",
-        "bootstrap-x86_64-toolchain-store-native"
-    );
-    assert_target!(
-        "td-boot/src/protocol.rs",
-        "bootstrap-x86_64-native-gcc-store-native"
-    );
-    assert_target!(
-        "td-boot/src/protocol.rs",
-        "bootstrap-x86_64-self-gcc-store-native"
-    );
     assert_preflight!("td-boot/src/protocol.rs", "cargo-test");
     // td-fs is in that same class and pinned the same way: td-net
     // `#[path]`-includes it so the signer refuses what the verifier refuses,
@@ -3160,40 +3061,12 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     // would compile td-boot and td-install and build no net at all.
     assert_target!("td-fs/src/real_file.rs", "check");
     assert_target!("td-fs/src/real_file.rs", "recipe-checks");
-    assert_target!(
-        "td-fs/src/real_file.rs",
-        "bootstrap-x86_64-toolchain-store-native"
-    );
-    assert_target!(
-        "td-fs/src/real_file.rs",
-        "bootstrap-x86_64-native-gcc-store-native"
-    );
-    assert_target!(
-        "td-fs/src/real_file.rs",
-        "bootstrap-x86_64-self-gcc-store-native"
-    );
     assert_preflight!("td-fs/src/real_file.rs", "cargo-test");
     assert_preflight!("td-fs/src/real_file.rs", "net-test");
     assert_preflight!("td-fs/src/replace.rs", "net-test");
     assert_preflight!("td-boot/src/protocol.rs", "net-test");
     // The crate root is in td-net's staged tree too, so it routes the same.
     assert_target!("td-fs/src/lib.rs", "check");
-    assert_target!(
-        "td-fs/src/lib.rs",
-        "bootstrap-x86_64-toolchain-store-native"
-    );
-    assert_no_target!(
-        "td-boot/src/main.rs",
-        "bootstrap-x86_64-toolchain-store-native"
-    );
-    assert_no_target!(
-        "td-boot/src/main.rs",
-        "bootstrap-x86_64-native-gcc-store-native"
-    );
-    assert_no_target!(
-        "td-boot/src/main.rs",
-        "bootstrap-x86_64-self-gcc-store-native"
-    );
     // td-review is a static target recipe packed into the image: its source
     // takes the host suite (the only tier for its git-driving tests) and the
     // static-link proof through recipe-checks.
@@ -3221,9 +3094,8 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
         assert_target!(path, "recipe-checks");
         assert_target!(path, "check");
     }
-    // The bootstrap ladder cannot read a host-side crate: selecting it for
-    // td-vm bought nothing and cost the hour that makes a pre-push check get
-    // skipped.
+    // The recipe graph cannot read a host-side crate: selecting it for td-vm
+    // buys nothing and costs the hours that make a pre-push check get skipped.
     for path in [
         "td-vm/src/bin/td-vm.rs",
         "td-vm/src/bin/td-vm-git.rs",
@@ -3253,66 +3125,9 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     // cargo-test preflight runs both, and it must not escalate to the full check.
     assert_preflight!("tests/review-record.cases", "cargo-test");
     assert_no_target!("tests/review-record.cases", "check");
-    assert_target!("tests/td-toolchain.lock", "toolchain-input-addressed");
-    assert_target!(
-        "tests/td-toolchain.lock",
-        "toolchain-x86_64-input-addressed"
-    );
-    assert_target!(
-        "tests/td-toolchain-x86_64.lock",
-        "toolchain-x86_64-input-addressed"
-    );
-    assert_target!(
-        "tests/td-toolchain-x86_64.lock",
-        "bootstrap-x86_64-toolchain-store-native"
-    );
-    assert_target!(
-        "tests/x86_64-subst-lib.sh",
-        "bootstrap-x86_64-toolchain-store-native"
-    );
-    assert_target!(
-        "tests/bootstrap-x86_64-native-gcc-store-native.sh",
-        "bootstrap-x86_64-native-gcc-store-native"
-    );
-    assert_target!(
-        "tests/bootstrap-x86_64-self-gcc-store-native.sh",
-        "bootstrap-x86_64-self-gcc-store-native"
-    );
-    assert_target!(
-        "tests/x86_64-cross-fns.sh",
-        "bootstrap-x86_64-self-gcc-store-native"
-    );
-    assert_target!(
-        "builder/src/gate_defs/426-bootstrap-x86_64-self-gcc-store-native.rs",
-        "bootstrap-x86_64-self-gcc-store-native"
-    );
-    assert_target!(
-        "builder/src/gate_defs/422-bootstrap-x86_64-native-gcc-store-native.rs",
-        "bootstrap-x86_64-native-gcc-store-native"
-    );
-    assert_target!(
-        "tests/x86_64-cross-fns.sh",
-        "bootstrap-x86_64-native-gcc-store-native"
-    );
-    assert_target!(
-        "tests/toolchain-x86_64-input-addressed.sh",
-        "toolchain-x86_64-input-addressed"
-    );
-    assert_target!(
-        "builder/src/gate_defs/418-toolchain-x86_64-input-addressed.rs",
-        "toolchain-x86_64-input-addressed"
-    );
     // Recipe-owned source pins route through the recipe-engine gate and the build gates.
     assert_target!("recipes/src/source_pins.rs", "recipe-rs");
     assert_target!("recipes/src/source_pins.rs", "recipe-checks");
-    assert_target!("recipes/src/source_pins.rs", "bootstrap-seed");
-    assert_target!("recipes/src/source_pins.rs", "bootstrap-mes");
-    // bootstrap-seed / bootstrap-mes are structured Rust recipes (no shell driver):
-    // source-pin edits route via the recipe crate; the recipe code
-    // (builder/src/bootstrap.rs) validates on the check-engine smoke + cargo-test.
-    assert_target!("seed/stage0/AMD64/hex0_AMD64.hex0", "bootstrap-seed");
-    assert_target!("builder/src/bootstrap.rs", "check-engine");
-    assert_branch_policy!("builder/src/bootstrap.rs", "the full check would be waived");
     // The td-builder build engine validates on the check-engine SMOKE tier.
     assert_target!("builder/src/sandbox.rs", "check-engine");
     assert_branch_policy!("builder/src/main.rs", "the full check would be waived");
@@ -3325,12 +3140,6 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_runs!("new/unmapped.file", "check");
     assert_preflight!("new/tree/src/lib.rs", "cargo-test");
     assert_branch_policy!("new/unmapped.file", "the full check would be waived");
-    // A chain diff names BOTH its focused target (bootstrap-seed) and the proof of
-    // the whole ladder (recipe-checks) — #397: the per-rung bootstrap-gcc-mesboot
-    // gate this used to name is retired. Both RUN now; the tier that used to
-    // hold recipe-checks back is gone.
-    assert_runs!("seed/stage0/AMD64/hex0_AMD64.hex0", "bootstrap-seed");
-    assert_target!("seed/stage0/AMD64/hex0_AMD64.hex0", "recipe-checks");
     assert_runs!("recipes/src/source_pins.rs", "recipe-rs");
     assert_runs!("recipes/src/catalog.rs", "recipe-rs");
 
@@ -6849,20 +6658,16 @@ mod tests {
             "engine/src/nar.rs",
             "recipes/src/bin/td_recipe_eval/check_runner.rs",
             "recipes/src/bin/td_recipe_eval/checks/tzdata.rs",
-            "recipes/src/recipes/gcc-14.rs",
+            "recipes/src/recipes/zlib-x86-64.rs",
             "td-sh/src/lib.rs",
         ])));
-        for blocking in [
-            "seed/bootstrap-root.txt",
-            "seed/seed-digests.txt",
-            "seed/local-source-roster.txt",
-        ] {
+        for blocking in ["seed/seed-digests.txt", "seed/local-source-roster.txt"] {
             assert!(
                 !defers_engine(&paths(&["builder/src/store.rs", blocking])),
                 "{blocking}"
             );
         }
-        let pin = path_output(&root, "seed/bootstrap-root.txt");
+        let pin = path_output(&root, "seed/seed-digests.txt");
         assert!(pin.contains(" recipe-checks "), "{pin}");
         assert!(pin.contains("  recipe-checks defers nothing"), "{pin}");
         assert!(!pin.contains("TD_CHECK_DEFER_ENGINE"), "{pin}");

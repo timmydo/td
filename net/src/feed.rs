@@ -389,7 +389,7 @@ fn write_atomic(dst: &Path, bytes: &[u8]) -> Result<(), String> {
 
 /// GET `url` (http/https), returning the body or an error string. Carries the shared
 /// read timeout + bounded retry (`http`) — warming a cold source set is exactly where
-/// one silent peer used to stall the whole ladder climb.
+/// one silent peer used to stall a whole cold build.
 fn try_get(url: &str) -> Result<Vec<u8>, String> {
     crate::http::get_body(url)
 }
@@ -1479,7 +1479,7 @@ fn cargo_proxy_selftest() {
 // shell scripts into one typed, in-process subcommand (move-off-shell). These run on the
 // HOST during `td-builder check`'s network-permitted prelude (the offline loop has no
 // egress) and are BEST-EFFORT by design: a runner without required host tools/network warns to
-// stderr and skips (exit 0) — the heavy `rust-*` / `bootstrap-*` gates that CONSUME the
+// stderr and skips (exit 0) — the recipe gates that CONSUME the
 // warmed outputs fail loudly if they actually run cold. The crown-jewel win over the
 // shell: the cargo-proxy is bound IN-PROCESS, so we know its loopback address immediately
 // — no background process, no log-file scrape, no `sed` parse, no sleep-poll.
@@ -2449,7 +2449,7 @@ fn resolve_feed_dir(td_feed_dir: Option<&str>, home: Option<&str>) -> PathBuf {
 }
 
 /// The single shared sources cache: `$HOME/.td/sources` (HOME unset/empty -> relative). The
-/// flat, pin-filename-keyed dir the recipe ladder reads its warmed tarballs and generated
+/// flat, pin-filename-keyed dir recipes read their warmed tarballs and generated
 /// kernel-headers from. Shared across ALL worktrees with NO env override, so one
 /// `td-feed warm sources` warms every tree. Deliberately NOT under `~/.td/build-daemon`
 /// (which is bound read-write into every build sandbox); a pinned tarball is re-verified
@@ -2743,14 +2743,13 @@ fn consume_sources(root: &Path) -> Result<(), String> {
     let base = configured_consumer_feed_base()?;
     let pins = recipe_source_pins_result(root)?;
     consume_source_pins(&pins, &sources_dir(), &base)?;
-    warm_kernel_headers_from_pins(root, "i386", &pins);
     warm_kernel_headers_from_pins(root, "x86_64", &pins);
     Ok(())
 }
 
-/// warm sources — fetch the recipe-owned pinned source-bootstrap tarballs into the shared
-/// sources cache (`sources_dir()`, `$HOME/.td/sources`) for the offline heavy `bootstrap-*`
-/// gates, then produce the i386 and x86_64 Linux UAPI headers. Routes through the SHARED feed
+/// warm sources — fetch the recipe-owned pinned source tarballs into the shared sources
+/// cache (`sources_dir()`, `$HOME/.td/sources`) for offline recipe builds, then produce the
+/// x86_64 Linux UAPI headers. Routes through the SHARED feed
 /// for cross-worktree
 /// single egress: it uses an exported TD_FEED_BASE, else brings the shared daemon up itself
 /// (`shared_feed`), so egress does not depend on the caller's env; a direct GET is only the
@@ -2764,9 +2763,8 @@ fn warm_sources(root: &Path) -> Result<(), String> {
     }
     warm_pins("sources", &pins, &dest)?;
 
-    // Derived inputs: the sanitized Linux UAPI headers for the glibc rungs, produced FROM the
-    // pinned linux source (the sandbox can't run the kernel build). Both lanes, best-effort.
-    warm_kernel_headers_from_pins(root, "i386", &pins);
+    // Derived input: the sanitized Linux UAPI headers td glibc builds against, produced FROM
+    // the pinned linux source (the sandbox can't run the kernel build). Best-effort.
     warm_kernel_headers_from_pins(root, "x86_64", &pins);
     Ok(())
 }
@@ -3787,8 +3785,8 @@ pub(crate) mod tests {
     #[test]
     fn abandoned_kernel_header_trees_and_outputs_are_swept() {
         let dir = unique_tmp_dir("kernel-header-sweep");
-        let stale_tree = dir.join(".td-feed-kh-work-i386-1-0");
-        let stale_output = dir.join(".td-feed-kh-output-1-i386-1-0.tmp");
+        let stale_tree = dir.join(".td-feed-kh-work-x86_64-1-0");
+        let stale_output = dir.join(".td-feed-kh-output-1-x86_64-1-0.tmp");
         let unrelated = dir.join("linux-source.tar.xz");
         std::fs::create_dir_all(&stale_tree).unwrap();
         std::fs::write(stale_tree.join("partial"), b"partial").unwrap();
@@ -4630,16 +4628,13 @@ pub(crate) mod tests {
             sha256: "3f4b056dc27233a78f7a4a35ed6fdcfd0a9680ec40b611a898bb6c8b905070ba".into(),
             file: file.into(),
         }];
-        for arch in ["i386", "x86_64"] {
-            super::prepare_kernel_headers(&root, arch, &pins, &cache);
-            let bytes =
-                std::fs::read(cache.join(format!("linux-headers-4.14.67-{arch}.tar"))).unwrap();
-            assert_eq!(bytes.len(), 5160960);
-            assert_eq!(
-                super::hex_sha256(&bytes),
-                "e395d859211f8924fdf19a2ef7ee37e2d92bb1fdbc5fa083a2bdf03f6fd04ce0"
-            );
-        }
+        super::prepare_kernel_headers(&root, "x86_64", &pins, &cache);
+        let bytes = std::fs::read(cache.join("linux-headers-4.14.67-x86_64.tar")).unwrap();
+        assert_eq!(bytes.len(), 5160960);
+        assert_eq!(
+            super::hex_sha256(&bytes),
+            "e395d859211f8924fdf19a2ef7ee37e2d92bb1fdbc5fa083a2bdf03f6fd04ce0"
+        );
         assert!(std::fs::read_dir(&cache).unwrap().all(|entry| {
             !entry
                 .unwrap()
