@@ -6680,3 +6680,27 @@ aggregate 64-identity limit still apply. An account may become receive-only
 when its last identity is removed, but the configuration must retain at least
 one identity globally. Removal prevents future submissions after activation;
 it does not cancel already accepted messages or rewrite their envelopes.
+
+## Legacy message storage (schema 32)
+
+Owner-authorized migration may preserve raw messages up to 64 MiB. Schema 32
+widens only the immutable blob length and chunk ordinal constraints, retaining
+64 KiB chunks and at most 1024 chunks. Earlier migration checksums are unchanged;
+existing databases require the explicit owner schema upgrade. Ordinary SMTP,
+upload, draft and submission preparation keep their 32 MiB admission limits.
+Account quotas continue to charge every imported byte.
+
+The owner import connection admits at most 72 MiB outgoing bytes and 4096 input
+frames. Input bytes remain 1 MiB, or 4 MiB for the guarded new-only import.
+Stored-body verification and replay allow 256 MiB incoming bytes with the
+existing 8192-frame and 512 KiB outgoing limits. Raw JMAP downloads use the
+64 MiB stored-body ceiling; configured network admission limits do not hide
+successfully imported bodies. Authentication, per-frame bounds, deadlines and
+bounded chunk buffers remain in force. MIME parsing retains its own limits.
+
+Full stored-body verification and raw download have an absolute 30-second
+ceiling, including replay: the 64 MiB debug fixture exhausted ten seconds after
+verification alone consumed eight. Connection establishment and fresh device
+reauthorization retain their ten-second caps, shortened by the original body
+deadline. Ordinary JMAP snapshot methods retain their existing ten-second cap.
+Progress never renews an admitted operation's deadline.

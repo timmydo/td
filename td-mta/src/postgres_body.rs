@@ -14,7 +14,7 @@ use td_crypto::{Crypto, Digest, Provider, TrustStore};
 
 const CHUNK: u64 = 65536;
 const BATCH: u64 = 8;
-pub const MAX_BODY_BYTES: u64 = 32 * 1024 * 1024;
+pub const MAX_BODY_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -202,9 +202,12 @@ pub fn with_pinned_blob<T>(
         // A new primary transaction sees revocations after the body snapshot.
         let presented = Presented::parse(password).ok_or(Error::Unauthenticated)?;
         let binding = binding.clone();
-        postgres_probe::with_mailbox_client(request, trust, deadline, |client| {
-            Box::pin(reauthorize_blob(client, binding, presented, expires))
-        })
+        postgres_probe::with_mailbox_client(
+            request,
+            trust,
+            deadline.min(Instant::now() + postgres_probe::MAX_DURATION),
+            |client| Box::pin(reauthorize_blob(client, binding, presented, expires)),
+        )
         .map_err(Error::Connection)??;
         let mut pin =
             crate::store_fs::PinnedBlob::from_verified(&mut body, metadata.blob, metadata.body)

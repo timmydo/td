@@ -404,7 +404,7 @@ fn real_postgres_schema_initialization_is_atomic_and_locked() {
     );
     wait_command(&mut shared);
     let receipt = initialize(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 31);
+    assert_eq!(receipt.version, 32);
     assert_eq!(
         inspect(&fixture.request(), &trust, deadline()).unwrap(),
         receipt
@@ -481,7 +481,7 @@ CREATE EVENT TRIGGER td_schema_delay ON ddl_command_end WHEN TAG IN ('CREATE TAB
         inspect(&fixture.request(), &trust, deadline())
             .unwrap()
             .version,
-        31
+        32
     );
     assert_eq!(
         initialize(&fixture.request(), &trust, deadline()),
@@ -615,7 +615,7 @@ fn real_postgres_schema_commands_prepare_and_inspect_one_epoch() {
     };
     assert!(invoke("schema-inspect", 1).contains("schema-operation-failed"));
     let initialized = invoke("schema-init", 0);
-    assert!(initialized.contains("\"schema_version\":31"));
+    assert!(initialized.contains("\"schema_version\":32"));
     assert!(initialized.contains(
         "\"ledger_checked\":true,\"serving_schema_checked\":false,\"profile_checked\":false"
     ));
@@ -860,7 +860,7 @@ fn real_postgres_runtime_credentials_separate_mail_writes_from_owner_authority()
     }
     sql(
         &fixture,
-        "UPDATE td_mta.schema_migrations SET version=99 WHERE version=31",
+        "UPDATE td_mta.schema_migrations SET version=99 WHERE version=32",
     );
     assert_eq!(
         probe(&serving, &trust, deadline()),
@@ -868,7 +868,7 @@ fn real_postgres_runtime_credentials_separate_mail_writes_from_owner_authority()
     );
     sql(
         &fixture,
-        "UPDATE td_mta.schema_migrations SET version=31 WHERE version=99",
+        "UPDATE td_mta.schema_migrations SET version=32 WHERE version=99",
     );
     assert_eq!(
         schema::inspect(&serving, &trust, deadline()).unwrap(),
@@ -1050,7 +1050,7 @@ fn real_postgres_material_schema_upgrade_preserves_epoch_and_rolls_back() {
     );
     wait_command(&mut held);
     let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 31);
+    assert_eq!(receipt.version, 32);
     assert_eq!(receipt.store_epoch.as_bytes(), &[1; 16]);
     assert_eq!(
         upgrade(&fixture.request(), &trust, deadline()).unwrap(),
@@ -1552,7 +1552,7 @@ fn real_postgres_mail_schema_bounds_references_and_rollback() {
     let digest = "decode(repeat('00',32),'hex')";
     sql(&fixture, &format!("INSERT INTO td_mta.accounts VALUES ({a},{max},{high}),({b},{zero},{zero}); INSERT INTO td_mta.blob_ids VALUES ({a},{a}),({a},{b})"));
     assert_eq!(sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='td_mta' AND c.relkind='r' AND c.relpersistence<>'p'"), "0");
-    assert_eq!(sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='td_mta' AND c.relkind='r'"), "49");
+    assert_eq!(sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='td_mta' AND c.relkind='r'"), "52");
     // Each expected refusal rolls back its own subtransaction. An unexpected
     // success raises a different SQLSTATE and fails psql with ON_ERROR_STOP.
     let refuse = |statement: String, state: &str| {
@@ -1678,7 +1678,7 @@ fn real_postgres_mail_schema_bounds_references_and_rollback() {
         "23503",
     );
     refuse(
-        format!("INSERT INTO td_mta.blobs VALUES ({a},{a},33554433,{digest},0,{zero},513)"),
+        format!("INSERT INTO td_mta.blobs VALUES ({a},{a},67108865,{digest},0,{zero},1025)"),
         "23514",
     );
     refuse(
@@ -1689,7 +1689,7 @@ fn real_postgres_mail_schema_bounds_references_and_rollback() {
     sql(&fixture, &format!("INSERT INTO td_mta.blob_chunks SELECT {a},{a},n,decode(repeat('42',65536),'hex') FROM generate_series(0,511) n"));
     assert_eq!(sql(&fixture, "SELECT count(*),sum(octet_length(bytes)),max(octet_length(bytes)) FROM td_mta.blob_chunks"), "512|33554432|65536");
     refuse(
-        format!("INSERT INTO td_mta.blob_chunks VALUES ({a},{b},512,decode('42','hex'))"),
+        format!("INSERT INTO td_mta.blob_chunks VALUES ({a},{b},1024,decode('42','hex'))"),
         "23514",
     );
     refuse(
@@ -1759,7 +1759,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
     use td_mta::postgres_schema::{inspect, upgrade, Error as SchemaError};
     for previous_version in [
         2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-        27, 28,
+        27, 28, 31,
     ] {
         let fixture = Fixture::new();
         let trust = TrustStore::from_pem(&fixture.ca).unwrap();
@@ -1792,6 +1792,9 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             include_str!("../src/postgres_submission_cancel.sql"),
             include_str!("../src/postgres_final_capacity.sql"),
             include_str!("../src/postgres_runtime_barrier.sql"),
+            include_str!("../src/postgres_logs.sql"),
+            include_str!("../src/postgres_acme.sql"),
+            include_str!("../src/postgres_recovery.sql"),
         ]
         .iter()
         .take(previous_version)
@@ -1846,6 +1849,8 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
         };
         if previous_version == 8 {
             sql(&fixture, "INSERT INTO td_mta.accounts VALUES(decode(repeat('7f',16),'hex'),decode('0000000000000001','hex'),decode('0000000000000000','hex')); INSERT INTO td_mta.flag_receipts VALUES(decode(repeat('7f',16),'hex'),decode(repeat('01',16),'hex'),decode(repeat('02',32),'hex'),decode('0000000000000001','hex'),decode('0000000000000001','hex')); ALTER TABLE td_mta.flag_receipts ADD COLUMN results bytea");
+        } else if previous_version == 31 {
+            sql(&fixture, "ALTER TABLE td_mta.blob_chunks RENAME CONSTRAINT blob_chunks_ordinal_check TO obstructed_ordinal_check");
         } else {
             sql(
                 &fixture,
@@ -1865,6 +1870,9 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
                 &fixture,
                 "ALTER TABLE td_mta.flag_receipts DROP COLUMN results",
             );
+        } else if previous_version == 31 {
+            assert!(sql(&fixture, "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid='td_mta.blobs'::regclass AND conname='blobs_length_check'").contains("33554432"));
+            sql(&fixture, "ALTER TABLE td_mta.blob_chunks RENAME CONSTRAINT obstructed_ordinal_check TO blob_chunks_ordinal_check");
         } else {
             sql(&fixture, &format!("DROP TABLE td_mta.{obstruction}"));
         }
@@ -1894,7 +1902,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             sql(&fixture,"UPDATE td_mta.recipients SET state=7,uncertain=1,phase=4,reason=9,next_attempt_at=1");
         }
         let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
-        assert_eq!(receipt.version, 31);
+        assert_eq!(receipt.version, 32);
         assert_eq!(
             sql(
                 &fixture,
@@ -4168,7 +4176,7 @@ fn real_postgres_email_bodies_are_verified_bounded_and_snapshot_pinned() {
         let result = body::with_email(
             &request,
             &trust,
-            Instant::now() + Duration::from_secs(10),
+            Instant::now() + Duration::from_secs(30),
             selected,
             device.password(),
             |metadata, reader| {
@@ -4225,6 +4233,47 @@ fn real_postgres_email_bodies_are_verified_bounded_and_snapshot_pinned() {
     let unused = |_: body::Metadata, _: &mut dyn BlobReader| -> Result<(), ports::Error> {
         panic!("unverified or unauthorized callback");
     };
+    let mut runtime = fixture.request();
+    runtime.mode = td_mta::postgres_probe::Mode::Runtime;
+    assert_eq!(
+        body::with_email(
+            &runtime,
+            &trust,
+            deadline(),
+            selected,
+            device.password(),
+            unused
+        ),
+        Err(body::Error::Connection(Error::RuntimeRole))
+    );
+    create_runtime_login(&fixture);
+    grant_runtime_mail(&fixture);
+    runtime.user = "mail_runtime";
+    sql(&fixture, "UPDATE td_mta.runtime_barrier SET blocked=true");
+    assert_eq!(
+        body::with_email(
+            &runtime,
+            &trust,
+            deadline(),
+            selected,
+            device.password(),
+            unused
+        ),
+        Err(body::Error::Connection(Error::RuntimeMaintenance))
+    );
+    sql(&fixture, "UPDATE td_mta.runtime_barrier SET blocked=false; REVOKE SELECT ON td_mta.emails FROM mail_runtime");
+    assert_eq!(
+        body::with_email(
+            &runtime,
+            &trust,
+            deadline(),
+            selected,
+            device.password(),
+            unused
+        ),
+        Err(body::Error::Connection(Error::RuntimePrivileges))
+    );
+    grant_runtime_mail(&fixture);
     assert_eq!(
         body::with_email(&request, &trust, deadline(), selected, b"bad", unused),
         Err(body::Error::Unauthenticated)

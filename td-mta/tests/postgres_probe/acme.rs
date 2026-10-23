@@ -27,7 +27,7 @@ pub(super) fn real_postgres_acme_fences_ownership_and_pins_complete_pairs() {
         "DROP TABLE td_mta.acme_profiles; DELETE FROM td_mta.schema_migrations WHERE version>=30",
     );
     let upgraded = postgres_schema::upgrade(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(upgraded.version, 31);
+    assert_eq!(upgraded.version, 32);
     assert_eq!(upgraded.store_epoch, epoch);
     create_runtime_login(&fixture);
     grant_runtime_mail(&fixture);

@@ -121,7 +121,7 @@ pub struct Email {
 impl Email {
     pub fn new(key: Key, input: EmailInput<'_>) -> Result<Self, Error> {
         if key.kind != SourceKind::Email
-            || input.length > 32 * 1024 * 1024
+            || input.length > crate::postgres_body::MAX_BODY_BYTES
             || input.mailboxes.is_empty()
             || input.mailboxes.len() > 256
             || input.keywords.len() > 256
@@ -215,6 +215,26 @@ mod tests {
     }
     fn hex(value: &[u8]) -> String {
         value.iter().map(|b| format!("{b:02x}")).collect()
+    }
+    #[test]
+    fn legacy_message_size_is_bounded_independently_of_network_admission() {
+        for length in [43_041_897, 64 * 1024 * 1024, 64 * 1024 * 1024 + 1] {
+            let result = Email::new(
+                key(SourceKind::Email),
+                EmailInput {
+                    body_digest: [0; 32],
+                    length,
+                    received_at: 0,
+                    mailboxes: &[b"inbox"],
+                    keywords: &[],
+                },
+            );
+            assert_eq!(result.is_ok(), length <= 64 * 1024 * 1024);
+        }
+        assert_eq!(
+            crate::limits::Limits::default().message_bytes,
+            32 * 1024 * 1024
+        );
     }
     #[test]
     fn canonical_email_ignores_order_and_case_but_preserves_metadata() {

@@ -1290,7 +1290,8 @@ Initial default ceilings (validated together at startup):
 | Event-source connections within the HTTPS pool | 2 |
 | Concurrent smart-host deliveries | 1 |
 | Concurrent body/search jobs | 2 |
-| Raw message or uploaded blob | 32 MiB hard maximum, streamed |
+| Incoming message or uploaded blob | 32 MiB hard maximum, streamed |
+| Owner-imported legacy message and stored-body reads | 64 MiB hard maximum |
 | Aggregate header bytes / MIME nesting / MIME parts | 256 KiB / 32 / 1024 |
 | SMTP recipients per transaction | 100 |
 | JMAP JSON request / methods per request | 1 MiB / 16 |

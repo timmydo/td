@@ -143,7 +143,7 @@ impl Service<'_, '_, '_> {
         }
         sender.check()?;
         let started_at = sender.last;
-        let until = Deadline::after(started_at, 10_000)?.min(request.deadline);
+        let until = Deadline::after(started_at, 30_000)?.min(request.deadline);
         sender.deadline = until;
         let deadline = self.clock.deadline_instant(until)?;
         // Verification retains one snapshot while fresh authorization opens
@@ -184,7 +184,7 @@ impl Service<'_, '_, '_> {
                 postgres_body::BlobRequest {
                     binding: self.binding,
                     blob: request.target.blob(),
-                    maximum: self.resources.limits().message_bytes as u64,
+                    maximum: postgres_body::MAX_BODY_BYTES,
                 },
                 request.credentials.password(),
                 |_, pin| {

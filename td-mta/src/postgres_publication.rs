@@ -78,7 +78,7 @@ pub(crate) async fn write_blob(
     value: Blob<'_>,
     deadline: Instant,
 ) -> Result<(), Error> {
-    if value.bytes.len() > 32 * 1024 * 1024 {
+    if value.bytes.len() as u64 > crate::postgres_body::MAX_BODY_BYTES {
         return Err(Error::Capacity);
     }
     let account = value.account.as_bytes().as_slice();

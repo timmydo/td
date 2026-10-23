@@ -68,6 +68,7 @@ const QUERY: &str = "SELECT pg_catalog.current_setting('server_version_num'), \
     pg_catalog.current_setting('transaction_read_only'), \
     pg_catalog.current_setting('fsync'), pg_catalog.current_setting('full_page_writes')";
 pub(crate) const MAX_DURATION: Duration = Duration::from_secs(10);
+pub(crate) const MAX_BODY_DURATION: Duration = Duration::from_secs(30);
 /// Maximum caller-selected duration for historical owner audits only.
 pub const MAX_AUDIT_DURATION: Duration = Duration::from_secs(3600);
 #[cfg(test)]
@@ -211,12 +212,8 @@ pub(crate) fn with_import_client<T>(
         request,
         trust,
         deadline,
-        40 * 1024 * 1024,
-        if guarded {
-            Input::reconciliation()
-        } else {
-            Input::imports()
-        },
+        72 * 1024 * 1024,
+        Input::imports(guarded),
         operation,
     )
 }
@@ -384,7 +381,14 @@ pub(crate) fn body_worker(
     trust: &TrustStore,
     deadline: Instant,
 ) -> Result<Worker, Error> {
-    connect_worker(request, trust, deadline, 512 * 1024, Input::body())
+    connect_worker_bounded(
+        request,
+        trust,
+        deadline,
+        512 * 1024,
+        Input::body(),
+        MAX_BODY_DURATION,
+    )
 }
 
 // Only retained validators use this worker: every exposed turn qualifies schema
@@ -409,7 +413,19 @@ fn connect_worker(
     output_limit: usize,
     input: Input,
 ) -> Result<Worker, Error> {
-    let mut worker = connect_authenticated(request, trust, deadline, output_limit, input)?;
+    connect_worker_bounded(request, trust, deadline, output_limit, input, MAX_DURATION)
+}
+
+fn connect_worker_bounded(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    output_limit: usize,
+    input: Input,
+    maximum: Duration,
+) -> Result<Worker, Error> {
+    let mut worker =
+        connect_authenticated_bounded(request, trust, deadline, output_limit, input, maximum)?;
     if request.mode == Mode::Runtime {
         worker.run(|client| {
             Box::pin(async move {

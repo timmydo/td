@@ -50,10 +50,15 @@ impl Input {
         }
     }
 
-    pub(super) fn imports() -> Self {
-        // A 32 MiB body plus 256 source mappings and relationship writes.
+    pub(super) fn imports(guarded: bool) -> Self {
+        // A 64 MiB body plus 256 source mappings and relationship writes.
         Self {
-            frames: 2048,
+            bytes: if guarded {
+                4 * 1024 * 1024
+            } else {
+                1024 * 1024
+            },
+            frames: 4096,
             ..Self::new()
         }
     }
@@ -144,7 +149,7 @@ impl Input {
 
     pub(super) fn body() -> Self {
         Self {
-            bytes: 128 * 1024 * 1024,
+            bytes: 256 * 1024 * 1024,
             frames: 8192,
             ..Self::new()
         }
@@ -310,7 +315,7 @@ mod tests {
             .is_err());
         let packet = frame(b'D', &[0; 128 * 1024 - 4]);
         let mut input = Input::body();
-        for _ in 0..1023 {
+        for _ in 0..2047 {
             assert!(input.accept(&packet).is_ok());
         }
         assert!(input.accept(&packet).is_err());
@@ -337,14 +342,14 @@ mod tests {
 
     #[test]
     fn mutation_budget_is_finite_and_keeps_authentication_and_byte_limits() {
-        for factory in [Input::mutations as fn() -> Input, Input::imports] {
+        for factory in [Input::mutations as fn() -> Input, || Input::imports(false)] {
             let mut input = factory();
             let mut admitted = 0;
             while input.accept(&frame(b'N', b"\0")).is_ok() {
                 admitted += 1;
-                assert!(admitted <= 2048);
+                assert!(admitted <= 4096);
             }
-            assert!([1088, 2048].contains(&admitted));
+            assert!([1088, 4096].contains(&admitted));
             assert!(input.accept(&[]).is_err());
             assert!(factory().accept(&frame(b'Z', b"I")).is_err());
             assert!(factory().accept(&frame(b'D', &[0; 128 * 1024])).is_err());
@@ -355,6 +360,22 @@ mod tests {
             }
             assert!(input.accept(&packet).is_err());
         }
+    }
+
+    #[test]
+    fn guarded_import_keeps_finite_metadata_and_frame_allowances() {
+        let mut input = Input::imports(true);
+        for _ in 0..4096 {
+            assert!(input.accept(&frame(b'N', b"\0")).is_ok());
+        }
+        assert!(input.accept(&frame(b'N', b"\0")).is_err());
+        let mut input = Input::imports(true);
+        let packet = frame(b'D', &[0; 128 * 1024 - 4]);
+        for _ in 0..31 {
+            assert!(input.accept(&packet).is_ok());
+        }
+        assert!(input.accept(&packet).is_err());
+        assert!(Input::imports(true).accept(&frame(b'Z', b"I")).is_err());
     }
 
     #[test]

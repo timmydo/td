@@ -165,8 +165,9 @@ at most 8 MiB, accumulated source metadata 16 MiB, and a serialized manifest
 32 MiB. Oversize or unrepresentable objects fail the command, never disappear
 silently from a successful snapshot. Message metadata, including the archive
 size ceiling, is validated during enumeration before any bodies are downloaded.
-The PostgreSQL importer still has a separate 32 MiB stored-message ceiling;
-a verified larger archive is retained evidence, not proof that it can be imported.
+The owner-authorized PostgreSQL importer and stored-body readers accept up to
+64 MiB per message. Incoming SMTP, uploads and newly composed submissions retain
+their separate 32 MiB admission ceiling.
 
 Requests have a 60-second deadline, bounded DNS and connect attempts, a
 24-hour invocation network deadline and a 200,000-request ceiling. Successive
@@ -205,8 +206,8 @@ one local mapping. Names must satisfy the normal NFC and control-character
 rules. Local limits are 256 folders, 256 memberships and 256 keywords per
 message; the archive can represent more than this importer can publish.
 Unrepresentable objects fail explicitly. Partial progress remains resumable.
-One import connection has a ten-second deadline, 40 MiB outbound budget,
-1 MiB inbound budget and 2,048 protocol-frame budget. Body writes and the
+One import connection has a ten-second deadline, 72 MiB outbound budget,
+1 MiB inbound budget and 4,096 protocol-frame budget. Body writes and the
 full supported membership/keyword sets share those finite allowances.
 
 Each object publishes in one durable account transaction. Email publication
@@ -358,9 +359,9 @@ new object. Unrelated changed folders may be skipped. Ordinary import keeps
 its existing historical replay semantics.
 
 Each guarded Email publication keeps the 10-second operation deadline and
-40 MiB outbound allowance, with a 4 MiB inbound and 2,048-frame allowance for
-full dependency metadata. Guarded mailbox publication has 2 MiB outbound and
-the same inbound/frame limits. At most 256 required folder definitions and
+72 MiB outbound allowance, with a 4 MiB inbound and 4,096-frame allowance for
+full dependency metadata. Guarded mailbox publication has 2 MiB outbound,
+4 MiB inbound and 2,048 frames. At most 256 required folder definitions and
 ancestors are admitted. Publication otherwise shares ordinary import's
 owner, epoch, selection, maintenance, quota and uncertain-commit handling.
 Earlier creations remain committed if a later object fails; keep the same

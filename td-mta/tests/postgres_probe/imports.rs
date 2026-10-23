@@ -304,7 +304,7 @@ pub fn exercise(
     let keywords: Vec<String> = (0..256).map(|n| format!("flag{n}")).collect();
     let keyword_refs: Vec<&str> = keywords.iter().map(String::as_str).collect();
     let mut large = b"Message-ID: <large@example.test>\r\n\r\n".to_vec();
-    large.resize(32 * 1024 * 1024, b'x');
+    large.resize(64 * 1024 * 1024, b'x');
     let mut hash = Sha256::try_new().unwrap();
     hash.update(&large).unwrap();
     let largest = snapshot::Email::new(
@@ -319,9 +319,16 @@ pub fn exercise(
     )
     .unwrap();
     assert!(
-        db::publish_email(request, trust, deadline(), &authority, &largest, &large)
-            .unwrap()
-            .created
+        db::publish_email(
+            request,
+            trust,
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+            &authority,
+            &largest,
+            &large
+        )
+        .unwrap()
+        .created
     );
     assert_eq!(sql(fixture,"SELECT count(*) FROM td_mta.memberships WHERE email_id=(SELECT local_object FROM td_mta.imports WHERE source_object=convert_to('largest','UTF8'))"),"256");
     assert_eq!(sql(fixture,"SELECT count(*) FROM td_mta.keywords WHERE email_id=(SELECT local_object FROM td_mta.imports WHERE source_object=convert_to('largest','UTF8'))"),"256");
