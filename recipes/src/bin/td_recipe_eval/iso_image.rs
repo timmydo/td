@@ -9,7 +9,7 @@ use td_engine::{fat, gpt, iso9660};
 use td_recipe::td_fs;
 
 const MIB: u64 = 1024 * 1024;
-const ESP_BYTES: u64 = 64 * MIB;
+const ESP_BYTES: u64 = iso9660::MIN_ESP_BYTES;
 const MAX_BOOT_BYTES: u64 = 256 * MIB;
 const MAX_PAYLOAD_BYTES: u64 = 64 * 1024 * MIB;
 const MAX_PAYLOADS: usize = 64;
@@ -155,7 +155,7 @@ fn layout(
     files: Vec<iso9660::FileSpec>,
 ) -> Result<(iso9660::Image, fat::Image<'static>), String> {
     // Grow only the firmware partition. Deployment payloads remain ISO files.
-    for esp_bytes in [ESP_BYTES, 128 * MIB, 256 * MIB, 512 * MIB] {
+    for esp_bytes in [ESP_BYTES, 64 * MIB, 128 * MIB, 256 * MIB, 512 * MIB] {
         let image = iso9660::build(&iso9660::Volume {
             disk_guid: gpt::Guid([0x41; 16]),
             esp_guid: gpt::Guid([0x42; 16]),
@@ -484,6 +484,20 @@ mod tests {
         assert!(Input::open(&path, MAX_BOOT_BYTES).is_err());
         file.set_len(MAX_PAYLOAD_BYTES + 1).unwrap();
         assert!(Input::open(&path, MAX_PAYLOAD_BYTES).is_err());
+    }
+
+    #[test]
+    fn minimum_esp_is_fat32_and_grows_when_boot_files_need_it() {
+        let (image, esp) = layout(8 * MIB, 11 * MIB, vec![]).unwrap();
+        assert_eq!(esp.total_bytes, 33 * MIB);
+        assert_eq!(image.total_bytes, 35 * MIB);
+        let boot = &esp.extents.iter().find(|e| e.offset == 0).unwrap().bytes;
+        let reserved = u16::from_le_bytes(boot[14..16].try_into().unwrap()) as u64;
+        let fat_sectors = u32::from_le_bytes(boot[36..40].try_into().unwrap()) as u64;
+        let clusters = (esp.total_bytes / 512 - reserved - 2 * fat_sectors) / u64::from(boot[13]);
+        assert!(clusters >= 65_525);
+        let (_, larger) = layout(20 * MIB, 20 * MIB, vec![]).unwrap();
+        assert_eq!(larger.total_bytes, 64 * MIB);
     }
 
     #[test]

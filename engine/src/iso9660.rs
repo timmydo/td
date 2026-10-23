@@ -6,6 +6,8 @@
 use crate::gpt;
 
 pub const BLOCK: u64 = 2048;
+// Smallest whole-MiB FAT32 volume with 512-byte clusters and two FATs.
+pub const MIN_ESP_BYTES: u64 = 33 * 1024 * 1024;
 pub const ESP_OFFSET: u64 = 1024 * 1024;
 const ROOT_BLOCK: u32 = 22;
 const MAX_FILE: u64 = 64 * 1024 * 1024 * 1024;
@@ -184,10 +186,10 @@ pub fn build(volume: &Volume) -> Result<Image, String> {
         return Err("ISO disk and ESP GUIDs must differ".into());
     }
     if volume.files.len() > 64
-        || !(64 * 1024 * 1024..=512 * 1024 * 1024).contains(&volume.esp_bytes)
+        || !(MIN_ESP_BYTES..=512 * 1024 * 1024).contains(&volume.esp_bytes)
         || !volume.esp_bytes.is_multiple_of(ESP_OFFSET)
     {
-        return Err("ISO needs at most 64 files and a 64–512 MiB ESP aligned to 1 MiB".into());
+        return Err("ISO needs at most 64 files and a 33–512 MiB ESP aligned to 1 MiB".into());
     }
     let mut files = Vec::with_capacity(volume.files.len());
     for file in &volume.files {
@@ -378,6 +380,15 @@ mod tests {
 
     fn le32(data: &[u8], at: usize) -> u32 {
         u32::from_le_bytes(data[at..at + 4].try_into().unwrap())
+    }
+
+    #[test]
+    fn esp_size_lower_bound_keeps_fat32_possible() {
+        let mut spec = volume(&[]);
+        spec.esp_bytes = MIN_ESP_BYTES;
+        assert!(build(&spec).is_ok());
+        spec.esp_bytes -= 1024 * 1024;
+        assert!(build(&spec).is_err());
     }
 
     #[test]

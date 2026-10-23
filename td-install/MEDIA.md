@@ -22,7 +22,7 @@ boot catalog 19, little/big-endian root path tables 20/21 and the root
 directory from block 22 precede a one-MiB-aligned ESP. The backup GPT ends
 at the image's final byte, after the payload and inside the ISO volume.
 
-The caller supplies a FAT32 ESP of 64–512 MiB, in whole MiB units. Both the
+The caller supplies a FAT32 ESP of 33–512 MiB, in whole MiB units. Both the
 GPT ESP entry and the EFI El Torito no-emulation entry identify that same
 region. The catalog platform is 0xEF and its validation checksum sums to
 zero. The catalog sector count is one, UEFI's encoding for image-to-disc-end;
@@ -63,8 +63,11 @@ td-recipe-eval compose-iso OUTPUT KERNEL INITRAMFS [ISO-NAME=FILE ...]
 It writes the kernel to `EFI/BOOT/BOOTX64.EFI` and the supplied live
 initramfs to `EFI/BOOT/INITRD`. Optional named payloads occupy the ISO root.
 The boot inputs are nonempty regular files, each at most 256 MiB. The FAT32
-ESP uses the smallest of 64, 128, 256 and 512 MiB that fits both files and
-metadata; their combined size must fit 512 MiB less FAT metadata. Each of at
+ESP uses the smallest of 33, 64, 128, 256 and 512 MiB that fits both files and
+metadata. The 33 MiB minimum retains at least 65,525 data clusters with
+512-byte sectors and clusters, so firmware identifies it as FAT32. This
+affects only installation media, not the installed disk’s ESP. The boot
+files’ combined size must fit 512 MiB less FAT metadata. Each of at
 most 64 payloads is a nonempty regular file of at most 64 GiB. Level-3
 sections permit files larger than four GiB. Files stream
 through held descriptors; composition does not buffer the deployment in RAM.
