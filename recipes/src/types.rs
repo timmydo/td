@@ -1786,7 +1786,7 @@ mod tests {
         };
         assert_eq!(
             pack.to_json().to_canonical(),
-            r#"{"packErofs":{"format":"zstd-extents-v1","output":"{out}/deployment/root.erofs","root":"{root}/real-root"}}"#
+            r#"{"packErofs":{"format":"zstd-shared-extents-v2","output":"{out}/deployment/root.erofs","root":"{root}/real-root"}}"#
         );
 
         let manifest = Step::Sha256Manifest {

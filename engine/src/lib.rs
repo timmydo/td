@@ -99,4 +99,4 @@ pub mod xz;
 mod test_temp;
 
 /// Hash-visible EROFS producer format. Change when packed bytes change.
-pub const EROFS_FORMAT: &str = "zstd-extents-v1";
+pub const EROFS_FORMAT: &str = "zstd-shared-extents-v2";

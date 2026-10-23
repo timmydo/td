@@ -4,7 +4,9 @@
 //! block 1. Directories and symlinks use FLAT_PLAIN. Nonempty regular files
 //! use COMPRESSED_FULL with the extent-map advice and 16-byte extent records.
 //! Each logical 128-KiB extent is an independent zstd frame, or raw bytes if
-//! compression would expand it. Extent payloads are packed without padding;
+//! compression would expand it. Identical encoded extents share physical bytes,
+//! with separate inode identities, modes and link counts. Unique payloads are
+//! packed without padding in first-occurrence order;
 //! inode IDs address 32-byte slots, including each file's extent metadata.
 //! The superblock advertises zstd and its 128-KiB maximum window.
 //!
@@ -341,6 +343,56 @@ struct Extent {
     bytes: Vec<u8>,
 }
 
+/// Physical sharing never merges inodes. Hashes select candidates only; compare
+/// the encoded format and bytes before sharing, including on a hash collision.
+struct PackedExtents<'a> {
+    unique: Vec<&'a Extent>,
+    offsets: Vec<Vec<u64>>,
+    len: u64,
+}
+
+fn pack_extents(extents: &[Vec<Extent>]) -> io::Result<PackedExtents<'_>> {
+    let mut packed = PackedExtents {
+        unique: Vec::new(),
+        offsets: Vec::with_capacity(extents.len()),
+        len: 0,
+    };
+    let mut candidates: HashMap<(u32, [u8; 32]), Vec<(usize, u64)>> = HashMap::new();
+    for node in extents {
+        let mut offsets = Vec::with_capacity(node.len());
+        for extent in node {
+            let mut hash = crate::sha256::Sha256::new();
+            hash.update(&extent.bytes);
+            let bucket = candidates
+                .entry((extent.plen, hash.finalize()))
+                .or_default();
+            let shared = bucket.iter().find_map(|&(index, offset)| {
+                packed
+                    .unique
+                    .get(index)
+                    .filter(|other| other.bytes == extent.bytes)
+                    .map(|_| offset)
+            });
+            let offset = match shared {
+                Some(offset) => offset,
+                None => {
+                    let offset = packed.len;
+                    packed.len = packed
+                        .len
+                        .checked_add(extent.bytes.len() as u64)
+                        .ok_or_else(|| io::Error::other("erofs extent region overflow"))?;
+                    bucket.push((packed.unique.len(), offset));
+                    packed.unique.push(extent);
+                    offset
+                }
+            };
+            offsets.push(offset);
+        }
+        packed.offsets.push(offsets);
+    }
+    Ok(packed)
+}
+
 /// Compress every extent of every regular file, in parallel. Each extent is its own
 /// frame, so the result does not depend on scheduling.
 fn compress_extents(nodes: &[Node]) -> io::Result<Vec<Vec<Extent>>> {
@@ -549,8 +601,8 @@ pub fn build_image(root: &Path) -> io::Result<Vec<u8>> {
         nlink.push(links);
     }
     let packed_start = u64::from(cursor) * BLOCK_SIZE as u64;
-    let packed_len: u64 = extents.iter().flatten().map(|e| e.bytes.len() as u64).sum();
-    let total_blocks = u32::try_from((packed_start + packed_len).div_ceil(BLOCK_SIZE as u64))
+    let packed = pack_extents(&extents)?;
+    let total_blocks = u32::try_from((packed_start + packed.len).div_ceil(BLOCK_SIZE as u64))
         .map_err(|_| io::Error::other("erofs image exceeds the 32-bit block-address capacity"))?;
 
     // ---- assemble ----
@@ -599,7 +651,6 @@ pub fn build_image(root: &Path) -> io::Result<Vec<u8>> {
 
     // Inode table (blocks 1..): per node in nid order, a 32-byte compact inode, and for a
     // compressed file its map header, padding and extent records, padded to whole slots.
-    let mut pcursor = packed_start;
     for (idx, n) in nodes.iter().enumerate() {
         let slot_start = img.len();
         let links = u64::from(nlink.get(idx).copied().unwrap_or(1));
@@ -623,11 +674,16 @@ pub fn build_image(root: &Path) -> io::Result<Vec<u8>> {
             put(&mut img, 0, 2);
             img.resize(slot_start + EXTENT_RECORDS_OFFSET, 0);
             for (k, e) in node_extents.iter().enumerate() {
+                let offset = packed
+                    .offsets
+                    .get(idx)
+                    .and_then(|row| row.get(k))
+                    .ok_or_else(|| io::Error::other("internal: missing extent placement"))?;
+                let pcursor = packed_start + offset;
                 put(&mut img, u64::from(e.plen), 4); //       plen | format
                 put(&mut img, pcursor & 0xFFFF_FFFF, 4); //   pstart_lo
                 put(&mut img, pcursor >> 32, 4); //           pstart_hi
                 put(&mut img, (k * EXTENT_SIZE) as u64, 4); // lstart_lo
-                pcursor += e.bytes.len() as u64;
             }
         } else {
             let size = plain.get(idx).map_or(0, |d| d.len()) as u64;
@@ -656,8 +712,8 @@ pub fn build_image(root: &Path) -> io::Result<Vec<u8>> {
         img.extend_from_slice(d);
         pad_to_block(&mut img);
     }
-    // The packed extents, back to back, in the order their records name them.
-    for e in extents.iter().flatten() {
+    // Each physical extent appears once, in first-occurrence order.
+    for e in packed.unique {
         img.extend_from_slice(&e.bytes);
     }
     pad_to_block(&mut img);
@@ -899,6 +955,55 @@ mod tests {
             );
         }
         assert!(img.len() < EXTENT_SIZE + 32 * BLOCK_SIZE);
+    }
+
+    #[test]
+    fn duplicate_extents_share_bytes_without_merging_file_metadata() {
+        let d = tmpdir("shared");
+        let mut state = 91u64;
+        let random: Vec<u8> = (0..EXTENT_SIZE)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect();
+        let mut contents = vec![b'a'; EXTENT_SIZE];
+        contents.extend_from_slice(&random);
+        contents.extend_from_slice(b"partial last extent");
+        fs::write(d.join("a"), &contents).unwrap();
+        set_mode(&d.join("a"), 0o600);
+        let single = build_image(&d).unwrap();
+        fs::write(d.join("b"), &contents).unwrap();
+        set_mode(&d.join("b"), 0o755);
+        fs::hard_link(d.join("a"), d.join("hardlink")).unwrap();
+        fs::write(d.join("partial"), b"partial last extent").unwrap();
+        fs::write(d.join("different"), b"partial last extenT").unwrap();
+        let img = build_image(&d).unwrap();
+        assert_eq!(img, build_image(&d).unwrap());
+        let a = lookup(&img, &["a"]);
+        let b = lookup(&img, &["b"]);
+        let partial = lookup(&img, &["partial"]);
+        let different = lookup(&img, &["different"]);
+        let start = |ino: &RInode, k: usize| rd_u64(&img, ino.off + 52 + k * 16);
+        assert_ne!(a.off, b.off);
+        assert_eq!((a.mode & 0o777, b.mode & 0o777), (0o600, 0o755));
+        assert_eq!((a.nlink, b.nlink), (2, 1));
+        assert_eq!(lookup(&img, &["hardlink"]).off, a.off);
+        for k in 0..3 {
+            assert_eq!(start(&a, k), start(&b, k));
+        }
+        assert_eq!(rd_u32(&img, a.off + 48) >> 28, 4);
+        assert_eq!(rd_u32(&img, a.off + 64) >> 28, 0);
+        assert_eq!(start(&a, 2), start(&partial, 0));
+        assert_ne!(start(&partial, 0), start(&different, 0));
+        for ino in [&a, &b] {
+            assert_eq!(read_file(&img, ino), contents);
+        }
+        assert_eq!(read_file(&img, &partial), b"partial last extent");
+        assert_eq!(read_file(&img, &different), b"partial last extenT");
+        assert!(img.len() <= single.len() + BLOCK_SIZE);
     }
 
     #[test]

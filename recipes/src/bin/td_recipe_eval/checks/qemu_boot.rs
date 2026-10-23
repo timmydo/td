@@ -4390,7 +4390,7 @@ pub(crate) fn check_persistent_volume(btrfs: &Path, output: &Path) -> Result<(),
 }
 
 /// Build a tiny probe erofs image with the control-plane `td-builder mkfs-erofs`
-/// writer (#548): a one-file rootfs holding the sentinel the guest `/init` reads
+/// writer (#548): a rootfs holding duplicate copies of the sentinel the guest `/init` reads
 /// back. Returns the image path (raw erofs bytes) to attach as a virtio-blk disk.
 /// The rootfs and image live in the runner's per-invocation scratch and are rebuilt
 /// fresh (any stale copy removed first) so a prior run's bytes can never be reused.
@@ -4406,6 +4406,11 @@ fn build_probe_image(runner: &RecipeCheckRunner) -> Result<PathBuf, String> {
     // an inode-exists check.
     fs::write(&sentinel, format!("{EROFS_PROBE_CONTENT}\n"))
         .map_err(|e| format!("write {}: {e}", sentinel.display()))?;
+
+    // Sort the source copy before the sentinel: the guest reads a second inode
+    // whose compressed extent points back to the first copy's physical bytes.
+    fs::copy(&sentinel, root.join("000-shared-source"))
+        .map_err(|e| format!("copy EROFS sharing probe: {e}"))?;
 
     let img = scratch.join("erofs-probe.img");
     let _ = fs::remove_file(&img);
