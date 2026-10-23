@@ -27,6 +27,7 @@ pub enum Error {
     Transport,
     Deadline,
     Sink,
+    Status(u16),
 }
 pub struct Response {
     pub status: u16,
@@ -65,6 +66,23 @@ impl Client<'_> {
     pub fn exchange(
         &self,
         request: Request<'_>,
+        sink: impl FnMut(&[u8]) -> Result<(), Error>,
+    ) -> Result<Response, Error> {
+        self.exchange_inner(request, None, sink)
+    }
+    /// Refuse non-200 status after bounded headers, before any sink call.
+    /// The socket is discarded without accepting or retaining its error body.
+    pub fn exchange_success(
+        &self,
+        request: Request<'_>,
+        sink: impl FnMut(&[u8]) -> Result<(), Error>,
+    ) -> Result<Response, Error> {
+        self.exchange_inner(request, Some(200), sink)
+    }
+    fn exchange_inner(
+        &self,
+        request: Request<'_>,
+        expected_status: Option<u16>,
         mut sink: impl FnMut(&[u8]) -> Result<(), Error>,
     ) -> Result<Response, Error> {
         if !matches!(request.method, "GET" | "HEAD" | "POST")
@@ -177,7 +195,13 @@ impl Client<'_> {
             transport: &mut transport,
             deadline,
         };
-        receive(reader, method == "HEAD", request.body_limit, &mut sink)
+        receive_checked(
+            reader,
+            method == "HEAD",
+            request.body_limit,
+            expected_status,
+            &mut sink,
+        )
     }
 }
 fn pause_check(deadline: Instant) -> Result<(), Error> {
@@ -277,10 +301,20 @@ fn copy_exact(
 }
 /// Sink output is provisional until this returns success. Each socket has one
 /// response and is discarded, so bytes beyond its framed body are never reused.
+#[cfg(test)]
 fn receive(
     input: impl Read,
     head: bool,
     maximum: usize,
+    sink: &mut impl FnMut(&[u8]) -> Result<(), Error>,
+) -> Result<Response, Error> {
+    receive_checked(input, head, maximum, None, sink)
+}
+fn receive_checked(
+    input: impl Read,
+    head: bool,
+    maximum: usize,
+    expected_status: Option<u16>,
     sink: &mut impl FnMut(&[u8]) -> Result<(), Error>,
 ) -> Result<Response, Error> {
     let mut reader = BufReader::with_capacity(8192, input);
@@ -354,6 +388,9 @@ fn receive(
     }
     if length.is_some() && chunked {
         return Err(Error::Protocol);
+    }
+    if expected_status.is_some_and(|expected| status != expected) {
+        return Err(Error::Status(status));
     }
     if head || status == 204 || status == 304 {
         return Ok(response);
@@ -433,6 +470,63 @@ mod tests {
             Ok(())
         })?;
         Ok((response, body))
+    }
+    #[test]
+    fn success_only_refuses_busy_before_touching_even_a_zero_capacity_sink() {
+        let bytes = b"HTTP/1.1 429 Busy\r\nContent-Length: 1000000000\r\n\r\nerror bytes";
+        for width in 1..bytes.len() {
+            let mut calls = 0;
+            assert_eq!(
+                receive_checked(
+                    Fragmented { bytes, width },
+                    false,
+                    0,
+                    Some(200),
+                    &mut |_| {
+                        calls += 1;
+                        Err(Error::Sink)
+                    }
+                )
+                .err(),
+                Some(Error::Status(429))
+            );
+            assert_eq!(calls, 0);
+        }
+        let busy = b"HTTP/1.1 429 Busy\r\nContent-Length: 4\r\n\r\noops";
+        let mut called = false;
+        assert_eq!(
+            receive_checked(busy.as_slice(), false, 64, Some(200), &mut |_| {
+                called = true;
+                Err(Error::Sink)
+            })
+            .err(),
+            Some(Error::Status(429))
+        );
+        assert!(!called);
+        let malformed = b"HTTP/1.1 429 Busy\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\nx";
+        assert_eq!(
+            receive_checked(malformed.as_slice(), false, 0, Some(200), &mut |_| Err(
+                Error::Sink
+            ))
+            .err(),
+            Some(Error::Protocol)
+        );
+        let mut bytes = Vec::new();
+        let ok = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+        assert_eq!(
+            receive_checked(ok.as_slice(), false, 5, Some(200), &mut |part| {
+                bytes.extend_from_slice(part);
+                Ok(())
+            })
+            .unwrap()
+            .bytes,
+            5
+        );
+        assert_eq!(bytes, b"hello");
+        assert_eq!(
+            receive_checked(ok.as_slice(), false, 4, Some(200), &mut |_| Ok(())).err(),
+            Some(Error::Capacity)
+        );
     }
     #[test]
     fn all_framings_survive_every_small_fragment_width() {

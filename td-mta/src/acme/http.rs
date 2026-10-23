@@ -57,7 +57,7 @@ impl Exchange for Https<'_> {
             outbound_http::Error::Invalid => Error::Invalid,
             outbound_http::Error::Capacity => Error::Capacity,
             outbound_http::Error::Crypto => Error::Crypto,
-            outbound_http::Error::Protocol => Error::Protocol,
+            outbound_http::Error::Protocol | outbound_http::Error::Status(_) => Error::Protocol,
             outbound_http::Error::Deadline => Error::Deadline,
             outbound_http::Error::Transport | outbound_http::Error::Sink => Error::Transport,
         })?;

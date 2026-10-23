@@ -108,45 +108,54 @@ impl Source {
         url: &str,
         body: &[u8],
         maximum: usize,
-        sink: impl FnMut(&[u8]) -> std::result::Result<(), crate::outbound_http::Error>,
+        mut sink: impl FnMut(&[u8]) -> std::result::Result<(), crate::outbound_http::Error>,
     ) -> Result<crate::outbound_http::Response> {
         self.same_origin(url)?;
-        let count = self.requests.get();
-        if count >= 200_000 {
-            return Err("migration-request-capacity");
+        // These are only authenticated read methods and raw GETs. A refused
+        // status cannot have touched the caller's JSON/body sink.
+        for attempt in 0..=BUSY_DELAYS.len() {
+            let count = self.requests.get();
+            if count >= 200_000 {
+                return Err("migration-request-capacity");
+            }
+            let wait = request_wait(self.last_response.get(), Instant::now(), self.deadline)?;
+            if !wait.is_zero() {
+                std::thread::sleep(wait);
+            }
+            if Instant::now() >= self.deadline {
+                return Err("migration-network-deadline");
+            }
+            self.requests.set(count + 1);
+            let response = Client {
+                executable: &self.executable,
+                origin: &self.endpoint,
+                trust: &self.trust,
+                deadline: self.deadline,
+            }
+            .exchange_success(
+                Request {
+                    method,
+                    url,
+                    body,
+                    content_type: "application/json",
+                    accept: "application/json, message/rfc822, application/octet-stream",
+                    authorization: Some(&self.authorization),
+                    body_limit: maximum,
+                },
+                &mut sink,
+            );
+            self.last_response.set(Some(Instant::now()));
+            match response {
+                Ok(response) => return Ok(response),
+                Err(crate::outbound_http::Error::Status(429)) => {
+                    let delay = busy_delay(attempt, Instant::now(), self.deadline)?;
+                    std::thread::sleep(delay);
+                }
+                Err(crate::outbound_http::Error::Status(_)) => return Err("migration-http-status"),
+                Err(_) => return Err("migration-https-failed"),
+            }
         }
-        let wait = request_wait(self.last_response.get(), Instant::now(), self.deadline)?;
-        if !wait.is_zero() {
-            std::thread::sleep(wait);
-        }
-        if Instant::now() >= self.deadline {
-            return Err("migration-network-deadline");
-        }
-        self.requests.set(count + 1);
-        let response = Client {
-            executable: &self.executable,
-            origin: &self.endpoint,
-            trust: &self.trust,
-            deadline: self.deadline,
-        }
-        .exchange(
-            Request {
-                method,
-                url,
-                body,
-                content_type: "application/json",
-                accept: "application/json, message/rfc822, application/octet-stream",
-                authorization: Some(&self.authorization),
-                body_limit: maximum,
-            },
-            sink,
-        )
-        .map_err(|_| "migration-https-failed")?;
-        self.last_response.set(Some(Instant::now()));
-        if response.status != 200 {
-            return Err("migration-http-status");
-        }
-        Ok(response)
+        Err("migration-http-busy")
     }
     fn json(&self, method: &str, url: &str, body: &[u8]) -> Result<Json> {
         let mut bytes = Vec::new();
@@ -327,6 +336,16 @@ impl Source {
         Ok(url)
     }
 }
+const BUSY_DELAYS: &[u64] = &[1, 2, 4, 8];
+fn busy_delay(attempt: usize, now: Instant, deadline: Instant) -> Result<Duration> {
+    let seconds = *BUSY_DELAYS.get(attempt).ok_or("migration-http-busy")?;
+    let delay = Duration::from_secs(seconds);
+    if now.checked_add(delay).is_none_or(|next| next >= deadline) {
+        return Err("migration-network-deadline");
+    }
+    Ok(delay)
+}
+
 // Leave room below td-mta's eight authenticated requests per peer-second.
 fn request_wait(last: Option<Instant>, now: Instant, deadline: Instant) -> Result<Duration> {
     let next = match last {
@@ -384,6 +403,19 @@ fn reply(response: &Json, method: &str, account: &str) -> Result<Json> {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+    #[test]
+    fn busy_backoff_stops_before_the_original_deadline_and_attempt_ceiling() {
+        let now = Instant::now();
+        let end = now + Duration::from_secs(30);
+        assert_eq!(busy_delay(0, now, end), Ok(Duration::from_secs(1)));
+        assert_eq!(busy_delay(3, now, end), Ok(Duration::from_secs(8)));
+        assert_eq!(busy_delay(4, now, end), Err("migration-http-busy"));
+        assert_eq!(
+            busy_delay(0, now, now + Duration::from_secs(1)),
+            Err("migration-network-deadline")
+        );
+        assert_eq!(busy_delay(0, end, now), Err("migration-network-deadline"));
+    }
     #[test]
     fn response_is_bound_to_method_call_and_account() {
         let good = json!({"methodResponses":[["Email/get",{"accountId":"a","list":[]},"export"]]});
