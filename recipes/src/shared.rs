@@ -786,10 +786,10 @@ pub const EROFS_PROBE_SENTINEL: &str = "td-erofs-probe.ok";
 /// The exact CONTENT the probe writes into `EROFS_PROBE_SENTINEL`, which the guest
 /// `/init` reads back with `cat` and string-compares before printing `EROFS_MARKER`.
 /// Comparing the CONTENT (not just `test -f` on the name) forces the kernel to read
-/// the file's DATA blocks off the erofs image — proving the flat-plain data layout
-/// and block addressing, not merely that the inode/dirent parse. A single shell-safe
+/// the file's compressed extent off the erofs image. Repetition makes this token
+/// compressible, proving zstd decoding as well as inode and extent addressing. A single shell-safe
 /// token (no spaces/quotes/newline) so the `[ "$x" = "..." ]` compare stays trivial.
-pub const EROFS_PROBE_CONTENT: &str = "td-erofs-ro-readback-ok";
+pub const EROFS_PROBE_CONTENT: &str = "td-erofs-zstd-readback-ok-td-erofs-zstd-readback-ok-td-erofs-zstd-readback-ok-td-erofs-zstd-readback-ok-td-erofs-zstd-readback-ok-td-erofs-zstd-readback-ok-td-erofs-zstd-readback-ok-td-erofs-zstd-readback-ok-td-erofs-zstd-readback-ok-td-erofs-zstd-readback-ok-td-erofs-zstd-readback-ok-td-erofs-zstd-readback-ok-td-erofs-zstd-readback-ok-td-erofs-zstd-readback-ok-td-erofs-zstd-readback-ok-td-erofs-zstd-readback-ok-";
 
 // ── system-x86-64 two-stage boot markers (re #550) ──────────────────────────────
 // The distro's persistent boot — the initramfs selects a deployment from Btrfs,

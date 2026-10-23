@@ -474,6 +474,7 @@ impl Step {
             Step::PackErofs { root, output } => Json::Obj(vec![(
                 "packErofs".into(),
                 Json::Obj(vec![
+                    ("format".into(), Json::Str(td_engine::EROFS_FORMAT.into())),
                     ("root".into(), Json::Str(root.clone())),
                     ("output".into(), Json::Str(output.clone())),
                 ]),
@@ -1863,7 +1864,7 @@ mod tests {
         };
         assert_eq!(
             pack.to_json().to_canonical(),
-            r#"{"packErofs":{"output":"{out}/deployment/root.erofs","root":"{root}/real-root"}}"#
+            r#"{"packErofs":{"format":"zstd-extents-v1","output":"{out}/deployment/root.erofs","root":"{root}/real-root"}}"#
         );
 
         let manifest = Step::Sha256Manifest {

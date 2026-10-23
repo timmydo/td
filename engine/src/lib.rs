@@ -97,3 +97,6 @@ pub mod xz;
 #[cfg(test)]
 #[path = "../../td-fs/src/temp_dir.rs"]
 mod test_temp;
+
+/// Hash-visible EROFS producer format. Change when packed bytes change.
+pub const EROFS_FORMAT: &str = "zstd-extents-v1";

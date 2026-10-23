@@ -1,66 +1,19 @@
-//! erofs.rs — td-native, zero-dep, DETERMINISTIC **erofs** (Enhanced Read-Only File
-//! System) image writer.
+//! Deterministic EROFS image writer for the control-plane packer.
 //!
-//! This is increment 1 of the read-only-root arc (issue #548, re #541). td's minimal
-//! distro is moving to a two-stage boot: a tiny static-busybox initramfs mounts a
-//! disk-backed, **read-only** erofs image carrying `/td/store` and `switch_root`s into
-//! it. A read-only root is the natural physical form of the content-addressed,
-//! immutable-by-hash `/td/store`. This module builds that image.
+//! Linux 7.1.4 format: 4096-byte blocks, compact 32-byte inodes, metadata at
+//! block 1. Directories and symlinks use FLAT_PLAIN. Nonempty regular files
+//! use COMPRESSED_FULL with the extent-map advice and 16-byte extent records.
+//! Each logical 128-KiB extent is an independent zstd frame, or raw bytes if
+//! compression would expand it. Extent payloads are packed without padding;
+//! inode IDs address 32-byte slots, including each file's extent metadata.
+//! The superblock advertises zstd and its 128-KiB maximum window.
 //!
-//! Trust model: this is a **control-plane** packer, exposed as the `td-builder
-//! mkfs-erofs` subcommand and run only with `ControlPlaneBuilder` provenance as a
-//! derivation implementation — never from a recipe's `PATH`/argv. It is a build-time
-//! tool (like the `oci.rs` docker-archive writer and the NAR codec), never a shipped
-//! target artifact.
-//!
-//! Format — a minimal, maximally-compatible subset of the erofs on-disk layout, pinned
-//! field-for-field against the target kernel's `fs/erofs/erofs_fs.h` (Linux 7.1.4):
-//!
-//! * 4096-byte blocks (`blkszbits=12`; the erofs block size must be `<= PAGE_SHIFT`,
-//!   which is 12 on x86_64). `dirblkbits=0` — the kernel *rejects* any non-zero value
-//!   and derives the directory block size from `blkszbits`.
-//! * **Compact 32-byte inodes** only (`islotbits=5`). A node id (`nid`) is the inode's
-//!   index; its byte offset is `meta_blkaddr*4096 + nid*32`. `meta_blkaddr=1`, so the
-//!   inode table starts at block 1 (block 0 holds the boot area + superblock). 32
-//!   divides 4096, so an inode never straddles a block.
-//! * **`EROFS_INODE_FLAT_PLAIN`** datalayout for every inode: a node's data lives in
-//!   whole blocks starting at `startblk_lo` (a 32-bit block address — we never set the
-//!   48BIT feature, so the kernel forces `startblk_hi=0`). Simplest correct layout; no
-//!   tail-packing/inline, so a small file/symlink rounds up to a block (uncompressed,
-//!   correctness-first — compression is a later, dependency-gated increment).
-//! * Bit 4 of `i_format` is left clear, so the kernel reads `i_nb` as an explicit
-//!   nlink (not the 48-bit `startblk_hi`) and expects the `.` dirent on disk (we emit
-//!   it). `i_format` is therefore 0 (compact version 0, FLAT_PLAIN datalayout 0) for
-//!   every inode.
-//! * Directories: each 4096-byte block is `[erofs_dirent; K]` (12 bytes each, sorted by
-//!   name) then the names packed contiguously, then NUL padding. `nameoff` of the first
-//!   dirent is `K*12`; the kernel derives `K = nameoff/12` and binary-searches, so
-//!   dirents must be **globally sorted by name** across the whole directory and blocks
-//!   filled in order. A block's last name is bounded by `strnlen(name, blocksize -
-//!   nameoff)`, so the trailing NUL pad terminates it. `.`/`..` are ordinary sorted
-//!   entries (nid of self / parent).
-//!
-//! Determinism (prime directive 1): entries are emitted in sorted order; uid/gid are
-//! normalized to 0 (a store root is root-owned, like the packed initramfs); mtimes are
-//! 0 (`epoch=0` + per-inode `i_mtime=0`); uuid/volume-name/build_time are zeroed. The
-//! same staged tree always packs to byte-identical bytes. File modes are PRESERVED
-//! (including suid/sgid/sticky); symlinks carry the conventional `0777`.
-//!
-//! Fidelity: filenames and symlink targets are handled as raw bytes (erofs/Linux permit
-//! any non-NUL sequence, not just UTF-8). Multiply-linked regular files are DEDUPLICATED
-//! by source `(st_dev, st_ino)` — one inode, one copy of the data — and each inode's
-//! nlink is the number of directory entries that reference it, so hard links keep a
-//! single identity and are not silently duplicated.
-//!
-//! Scope: the whole image (and every file's bytes) is assembled in memory before it is
-//! written. That is fine for the trees packed here; streaming the image to keep peak
-//! memory bounded when packing the full multi-GB `/td/store` is a follow-up for the
-//! two-stage-boot increment (#550), which is the first consumer of a store-sized tree.
-//!
-//! Validation: the tests round-trip through an in-module reader (the decode side of the
-//! same format) and assert determinism, nesting, symlinks, mode/suid preservation, hard
-//! links, and the special-inode (FIFO) path. A real-kernel mount is the boot test in the
-//! kernel-config increment (#549).
+//! Names and symlink targets retain raw bytes. Sorted traversal, root ownership,
+//! zero timestamps and deterministic compression produce identical images from
+//! identical trees. Modes and hard-link identity are preserved. The complete
+//! tree and output are held in memory; compact inodes limit files to <4 GiB.
+//! Unit tests round-trip the format; the kernel and integration boot oracles
+//! prove real-kernel mount and compressed data readback.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -83,6 +36,17 @@ const INODE_SIZE: usize = 32;
 const DIRENT_SIZE: usize = 12;
 /// The inode table starts at block 1 (block 0 = boot area + superblock).
 const META_BLKADDR: u32 = 1;
+const EXTENT_SIZE: usize = 128 * 1024;
+const EXTENT_RECORDS_OFFSET: usize = 48;
+const EXTENT_RECORD_SIZE: usize = 16;
+const EXTENT_FMT_ZSTD: u32 = 4 << 28;
+const I_FORMAT_COMPRESSED_FULL: u64 = 1 << 1;
+const ADVISE_EXTENTS_16B: u64 = 0x1 | (2 << 1);
+const SB_EXTSLOTS: u8 = 1;
+const INCOMPAT_COMPR_CFGS: u32 = 0x2;
+const COMPRESSION_ZSTD: u32 = 3;
+const ZSTD_CFG_LEN: u64 = 6;
+const ZSTD_WINDOWLOG: u8 = 7;
 
 // mode type bits (S_IFMT family) — std does not expose these as constants.
 const S_IFMT: u32 = 0o170000;
@@ -125,8 +89,7 @@ enum Body {
     },
 }
 
-/// One inode of the image, in assignment (nid) order. `nid == index into the node
-/// vector`, `ino == index + 1`.
+/// One inode in traversal order. Its nid is assigned after sizing extent maps.
 struct Node {
     /// Full mode: an `S_IF*` type bit OR the permission bits.
     mode: u16,
@@ -292,23 +255,29 @@ fn walk(
 
 /// Serialize one directory's data as a sequence of 4096-byte dirent blocks. Every entry
 /// (including the sorted `.`/`..`) is `[dirents][names][NUL pad]`; entries are packed
-/// greedily into blocks in global sort order.
+/// greedily into blocks in global sort order. `nids` maps a node index to its nid.
 fn build_dir_data(
     idx: usize,
     parent: usize,
     children: &[(Vec<u8>, usize)],
     nodes: &[Node],
+    nids: &[u64],
 ) -> io::Result<Vec<u8>> {
+    let nid_of = |i: usize| {
+        nids.get(i)
+            .copied()
+            .ok_or_else(|| io::Error::other("internal: node without a nid"))
+    };
     // (name-bytes, nid, file_type)
     let mut entries: Vec<(Vec<u8>, u64, u8)> = Vec::with_capacity(children.len() + 2);
-    entries.push((b".".to_vec(), idx as u64, FT_DIR));
-    entries.push((b"..".to_vec(), parent as u64, FT_DIR));
+    entries.push((b".".to_vec(), nid_of(idx)?, FT_DIR));
+    entries.push((b"..".to_vec(), nid_of(parent)?, FT_DIR));
     for (name, cidx) in children {
         let ft = match nodes.get(*cidx) {
             Some(n) => file_type_of(n.mode),
             None => return Err(io::Error::other("internal: dangling child index")),
         };
-        entries.push((name.clone(), *cidx as u64, ft));
+        entries.push((name.clone(), nid_of(*cidx)?, ft));
     }
     entries.sort_by(|a, b| a.0.cmp(&b.0));
 
@@ -365,6 +334,110 @@ fn put(out: &mut Vec<u8>, value: u64, n: usize) {
     out.extend_from_slice(le.get(..n).unwrap_or(&le));
 }
 
+/// One compressed extent as stored: its encoded length field (length plus format
+/// bits) and its bytes.
+struct Extent {
+    plen: u32,
+    bytes: Vec<u8>,
+}
+
+/// Compress every extent of every regular file, in parallel. Each extent is its own
+/// frame, so the result does not depend on scheduling.
+fn compress_extents(nodes: &[Node]) -> io::Result<Vec<Vec<Extent>>> {
+    let mut work: Vec<(usize, usize)> = Vec::new();
+    for (idx, n) in nodes.iter().enumerate() {
+        if let Body::File { data } = &n.body {
+            for k in 0..data.len().div_ceil(EXTENT_SIZE) {
+                work.push((idx, k));
+            }
+        }
+    }
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(work.len().max(1));
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let results: Vec<io::Result<Vec<(usize, Extent)>>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut done = Vec::new();
+                    loop {
+                        let w = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(&(idx, k)) = work.get(w) else {
+                            return Ok(done);
+                        };
+                        let chunk = match nodes.get(idx).map(|n| &n.body) {
+                            Some(Body::File { data }) => {
+                                let end = data.len().min((k + 1) * EXTENT_SIZE);
+                                data.get(k * EXTENT_SIZE..end).unwrap_or(&[])
+                            }
+                            _ => return Err(io::Error::other("internal: extent of a non-file")),
+                        };
+                        done.push((w, encode_extent(chunk)?));
+                    }
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| {
+                h.join()
+                    .unwrap_or_else(|_| Err(io::Error::other("erofs: compression thread failed")))
+            })
+            .collect()
+    });
+    let mut slots: Vec<Option<Extent>> = (0..work.len()).map(|_| None).collect();
+    for r in results {
+        for (w, e) in r? {
+            if let Some(slot) = slots.get_mut(w) {
+                *slot = Some(e);
+            }
+        }
+    }
+    let mut per_node: Vec<Vec<Extent>> = (0..nodes.len()).map(|_| Vec::new()).collect();
+    for (&(idx, _), slot) in work.iter().zip(slots) {
+        let e = slot.ok_or_else(|| io::Error::other("internal: extent not compressed"))?;
+        per_node
+            .get_mut(idx)
+            .ok_or_else(|| io::Error::other("internal: extent owner"))?
+            .push(e);
+    }
+    Ok(per_node)
+}
+
+/// A zstd frame when it is smaller than the extent, otherwise the bytes as they are
+/// (format 0, which the kernel copies without decoding).
+fn encode_extent(chunk: &[u8]) -> io::Result<Extent> {
+    let frame = crate::zstd::compress(chunk)?;
+    let len = |n: usize| u32::try_from(n).map_err(|_| io::Error::other("internal: extent length"));
+    if frame.len() < chunk.len() {
+        Ok(Extent {
+            plen: len(frame.len())? | EXTENT_FMT_ZSTD,
+            bytes: frame,
+        })
+    } else {
+        Ok(Extent {
+            plen: len(chunk.len())?,
+            bytes: chunk.to_vec(),
+        })
+    }
+}
+
+/// Inode slots a node occupies: one compact inode, plus for a compressed file its
+/// map header, alignment and one extent record per extent.
+fn slots_for(n: &Node) -> usize {
+    match &n.body {
+        Body::File { data } if !data.is_empty() => {
+            let records = data.len().div_ceil(EXTENT_SIZE);
+            ceil_div(
+                EXTENT_RECORDS_OFFSET + records * EXTENT_RECORD_SIZE,
+                INODE_SIZE,
+            )
+        }
+        _ => 1,
+    }
+}
+
 /// Build the complete erofs image bytes for the staged tree rooted at `root`.
 pub fn build_image(root: &Path) -> io::Result<Vec<u8>> {
     let root_meta = fs::symlink_metadata(root)?;
@@ -380,14 +453,25 @@ pub fn build_image(root: &Path) -> io::Result<Vec<u8>> {
     walk(root, 0, &mut nodes, &mut hardlinks)?;
     let ninodes = nodes.len();
 
-    // Pass 1: each node's raw data bytes (directories become dirent blocks).
-    let mut datas: Vec<Vec<u8>> = Vec::with_capacity(ninodes);
+    // Each node's nid is its first inode slot; a compressed file's extent records
+    // follow its inode in the slots after it.
+    let mut nids: Vec<u64> = Vec::with_capacity(ninodes);
+    let mut total_slots = 0usize;
+    for n in &nodes {
+        nids.push(total_slots as u64);
+        total_slots += slots_for(n);
+    }
+
+    // Pass 1: the plain data of directories and symlinks (directories become dirent
+    // blocks), and the compressed extents of regular files.
+    let mut plain: Vec<Vec<u8>> = Vec::with_capacity(ninodes);
     for (idx, n) in nodes.iter().enumerate() {
         let d = match &n.body {
-            Body::Dir { children, parent } => build_dir_data(idx, *parent, children, &nodes)?,
-            Body::File { data } => data.clone(),
+            Body::Dir { children, parent } => {
+                build_dir_data(idx, *parent, children, &nodes, &nids)?
+            }
             Body::Symlink { target } => target.clone(),
-            Body::Special { .. } => Vec::new(),
+            Body::File { .. } | Body::Special { .. } => Vec::new(),
         };
         // i_size is a 32-bit field in the compact inode. Files are checked at read time;
         // this also covers a directory whose dirent blocks would exceed 4 GiB.
@@ -396,8 +480,9 @@ pub fn build_image(root: &Path) -> io::Result<Vec<u8>> {
                 "erofs: inode data exceeds the 32-bit i_size limit",
             ));
         }
-        datas.push(d);
+        plain.push(d);
     }
+    let extents = compress_extents(&nodes)?;
 
     // How many directory entries across the whole tree reference each node. For a
     // hard-linked regular file this is its in-image link count; a directory's nlink is
@@ -413,17 +498,18 @@ pub fn build_image(root: &Path) -> io::Result<Vec<u8>> {
         }
     }
 
-    // Layout: block 0 = superblock; blocks [1 ..) = inode table; then data blocks.
-    let meta_blocks = ceil_div(ninodes * INODE_SIZE, BLOCK_SIZE);
+    // Layout: block 0 = superblock; then the inode table; then plain data blocks; then
+    // the packed extent region, byte-addressed and unaligned between extents.
+    let meta_blocks = ceil_div(total_slots * INODE_SIZE, BLOCK_SIZE);
     let data_start = META_BLKADDR as usize + meta_blocks;
 
-    // Pass 2: assign each node's starting data block (FLAT_PLAIN, contiguous, in nid
-    // order) and its explicit nlink (a directory's nlink is 2 + its subdirectory count).
+    // Pass 2: assign each plain node's starting data block (FLAT_PLAIN, contiguous, in
+    // nid order) and every node's explicit nlink (a directory's is 2 + its subdirs).
     let mut startblk: Vec<u32> = Vec::with_capacity(ninodes);
     let mut nlink: Vec<u16> = Vec::with_capacity(ninodes);
     let mut cursor = data_start as u32;
     for (idx, n) in nodes.iter().enumerate() {
-        let nblk = datas.get(idx).map_or(0, |d| ceil_div(d.len(), BLOCK_SIZE));
+        let nblk = plain.get(idx).map_or(0, |d| ceil_div(d.len(), BLOCK_SIZE));
         if nblk == 0 {
             startblk.push(0);
         } else {
@@ -462,18 +548,22 @@ pub fn build_image(root: &Path) -> io::Result<Vec<u8>> {
             .map_err(|_| io::Error::other("erofs: link count exceeds the 16-bit i_nb limit"))?;
         nlink.push(links);
     }
-    let total_blocks = cursor;
+    let packed_start = u64::from(cursor) * BLOCK_SIZE as u64;
+    let packed_len: u64 = extents.iter().flatten().map(|e| e.bytes.len() as u64).sum();
+    let total_blocks = u32::try_from((packed_start + packed_len).div_ceil(BLOCK_SIZE as u64))
+        .map_err(|_| io::Error::other("erofs image exceeds the 32-bit block-address capacity"))?;
 
     // ---- assemble ----
     let mut img: Vec<u8> = Vec::with_capacity(total_blocks as usize * BLOCK_SIZE);
 
-    // Block 0: [0..1024] boot area, then the 144-byte superblock, then zero pad.
+    // Block 0: [0..1024] boot area, the 144-byte superblock (one extension slot, so
+    // its whole struct is in use), then the zstd configuration record.
     img.resize(SUPER_OFFSET, 0);
     put(&mut img, MAGIC as u64, 4); //   0 magic
     put(&mut img, 0, 4); //               4 checksum (feature off)
     put(&mut img, 0, 4); //               8 feature_compat
     img.push(BLKSZBITS); //              12 blkszbits
-    img.push(0); //                      13 sb_extslots
+    img.push(SB_EXTSLOTS); //            13 sb_extslots (superblock = 128 + 16)
     put(&mut img, 0, 2); //              14 rootnid_2b (root nid = 0)
     put(&mut img, ninodes as u64, 8); // 16 inos
     put(&mut img, 0, 8); //              24 epoch
@@ -483,8 +573,8 @@ pub fn build_image(root: &Path) -> io::Result<Vec<u8>> {
     put(&mut img, 0, 4); //              44 xattr_blkaddr
     img.resize(img.len() + 16, 0); //    48 uuid[16]
     img.resize(img.len() + 16, 0); //    64 volume_name[16]
-    put(&mut img, 0, 4); //              80 feature_incompat
-    put(&mut img, 0, 2); //              84 u1 (compr algs)
+    put(&mut img, INCOMPAT_COMPR_CFGS.into(), 4); // 80 feature_incompat
+    put(&mut img, 1 << COMPRESSION_ZSTD, 2); // 84 available_compr_algs
     put(&mut img, 0, 2); //              86 extra_devices
     put(&mut img, 0, 2); //              88 devt_slotoff
     img.push(0); //                      90 dirblkbits (0 = use blkszbits; non-zero rejected)
@@ -499,38 +589,82 @@ pub fn build_image(root: &Path) -> io::Result<Vec<u8>> {
     put(&mut img, 0, 8); //             120 reserved2
     put(&mut img, 0, 8); //             128 metabox_nid
     put(&mut img, 0, 8); //             136 reserved3 (-> 144)
+                         // Compression configurations follow the superblock, one per available algorithm
+                         // in bit order, each a 2-byte length then the struct (`z_erofs_zstd_cfgs`).
+    put(&mut img, ZSTD_CFG_LEN, 2);
+    img.push(0); //                       format
+    img.push(ZSTD_WINDOWLOG); //          windowlog - 10
+    img.resize(img.len() + 4, 0); //      reserved[4]
     img.resize(BLOCK_SIZE, 0); // pad block 0
 
-    // Inode table (blocks 1..), one 32-byte compact inode per node in nid order.
+    // Inode table (blocks 1..): per node in nid order, a 32-byte compact inode, and for a
+    // compressed file its map header, padding and extent records, padded to whole slots.
+    let mut pcursor = packed_start;
     for (idx, n) in nodes.iter().enumerate() {
-        let size = datas.get(idx).map_or(0, |d| d.len()) as u64;
-        let start_or_rdev = match &n.body {
-            Body::Special { rdev } => u64::from(*rdev),
-            _ => u64::from(startblk.get(idx).copied().unwrap_or(0)),
-        };
+        let slot_start = img.len();
         let links = u64::from(nlink.get(idx).copied().unwrap_or(1));
-        put(&mut img, 0, 2); //                    i_format (compact, FLAT_PLAIN)
-        put(&mut img, 0, 2); //                    i_xattr_icount
-        put(&mut img, u64::from(n.mode), 2); //    i_mode
-        put(&mut img, links, 2); //                i_nb = nlink
-        put(&mut img, size, 4); //                 i_size
-        put(&mut img, 0, 4); //                    i_mtime (epoch delta = 0)
-        put(&mut img, start_or_rdev, 4); //        i_u (startblk_lo | rdev)
-        put(&mut img, (idx + 1) as u64, 4); //     i_ino
-        put(&mut img, 0, 2); //                    i_uid (root)
-        put(&mut img, 0, 2); //                    i_gid (root)
-        put(&mut img, 0, 4); //                    i_reserved
+        let node_extents = extents.get(idx).map_or(&[][..], |e| e.as_slice());
+        if let (Body::File { data }, false) = (&n.body, node_extents.is_empty()) {
+            let encoded: u64 = node_extents.iter().map(|e| e.bytes.len() as u64).sum();
+            put(&mut img, I_FORMAT_COMPRESSED_FULL, 2); // i_format
+            put(&mut img, 0, 2); //                    i_xattr_icount
+            put(&mut img, u64::from(n.mode), 2); //    i_mode
+            put(&mut img, links, 2); //                i_nb = nlink
+            put(&mut img, data.len() as u64, 4); //    i_size
+            put(&mut img, 0, 4); //                    i_mtime (epoch delta = 0)
+            put(&mut img, encoded.div_ceil(BLOCK_SIZE as u64), 4); // i_u = blocks_lo
+            put(&mut img, (idx + 1) as u64, 4); //     i_ino
+            put(&mut img, 0, 2); //                    i_uid (root)
+            put(&mut img, 0, 2); //                    i_gid (root)
+            put(&mut img, 0, 4); //                    i_reserved
+                                 // z_erofs_map_header: extent count, advise, extent count MSB.
+            put(&mut img, node_extents.len() as u64, 4);
+            put(&mut img, ADVISE_EXTENTS_16B, 2);
+            put(&mut img, 0, 2);
+            img.resize(slot_start + EXTENT_RECORDS_OFFSET, 0);
+            for (k, e) in node_extents.iter().enumerate() {
+                put(&mut img, u64::from(e.plen), 4); //       plen | format
+                put(&mut img, pcursor & 0xFFFF_FFFF, 4); //   pstart_lo
+                put(&mut img, pcursor >> 32, 4); //           pstart_hi
+                put(&mut img, (k * EXTENT_SIZE) as u64, 4); // lstart_lo
+                pcursor += e.bytes.len() as u64;
+            }
+        } else {
+            let size = plain.get(idx).map_or(0, |d| d.len()) as u64;
+            let start_or_rdev = match &n.body {
+                Body::Special { rdev } => u64::from(*rdev),
+                _ => u64::from(startblk.get(idx).copied().unwrap_or(0)),
+            };
+            put(&mut img, 0, 2); //                    i_format (compact, FLAT_PLAIN)
+            put(&mut img, 0, 2); //                    i_xattr_icount
+            put(&mut img, u64::from(n.mode), 2); //    i_mode
+            put(&mut img, links, 2); //                i_nb = nlink
+            put(&mut img, size, 4); //                 i_size
+            put(&mut img, 0, 4); //                    i_mtime (epoch delta = 0)
+            put(&mut img, start_or_rdev, 4); //        i_u (startblk_lo | rdev)
+            put(&mut img, (idx + 1) as u64, 4); //     i_ino
+            put(&mut img, 0, 2); //                    i_uid (root)
+            put(&mut img, 0, 2); //                    i_gid (root)
+            put(&mut img, 0, 4); //                    i_reserved
+        }
+        img.resize(slot_start + slots_for(n) * INODE_SIZE, 0);
     }
     pad_to_block(&mut img); // pad the metadata area to a block boundary
 
-    // Data blocks, in nid order, each block-padded (matches the assigned startblk).
-    for idx in 0..ninodes {
-        if let Some(d) = datas.get(idx) {
-            if !d.is_empty() {
-                img.extend_from_slice(d);
-                pad_to_block(&mut img);
-            }
-        }
+    // Plain data blocks, in nid order, each block-padded (matches the assigned startblk).
+    for d in plain.iter().filter(|d| !d.is_empty()) {
+        img.extend_from_slice(d);
+        pad_to_block(&mut img);
+    }
+    // The packed extents, back to back, in the order their records name them.
+    for e in extents.iter().flatten() {
+        img.extend_from_slice(&e.bytes);
+    }
+    pad_to_block(&mut img);
+    if img.len() != total_blocks as usize * BLOCK_SIZE {
+        return Err(io::Error::other(
+            "internal: erofs layout and image disagree",
+        ));
     }
 
     Ok(img)
@@ -556,6 +690,8 @@ mod tests {
     }
 
     struct RInode {
+        off: usize,
+        format: u16,
         mode: u16,
         nlink: u16,
         size: u64,
@@ -576,6 +712,8 @@ mod tests {
     fn read_inode(img: &[u8], meta_blkaddr: u32, nid: u64) -> RInode {
         let off = (meta_blkaddr as usize) * BLOCK_SIZE + (nid as usize) * INODE_SIZE;
         RInode {
+            off,
+            format: rd_u16(img, off),
             mode: rd_u16(img, off + 4),
             nlink: rd_u16(img, off + 6),
             size: u64::from(rd_u32(img, off + 8)),
@@ -615,8 +753,35 @@ mod tests {
     }
 
     fn read_file(img: &[u8], ino: &RInode) -> Vec<u8> {
-        let base = (ino.u as usize) * BLOCK_SIZE;
-        img[base..base + ino.size as usize].to_vec()
+        if ino.format == 0 {
+            let base = (ino.u as usize) * BLOCK_SIZE;
+            return img[base..base + ino.size as usize].to_vec();
+        }
+        assert_eq!(ino.format, 2);
+        assert_eq!(rd_u16(img, ino.off + 36), 5);
+        let count = rd_u32(img, ino.off + 32) as usize;
+        let mut out = Vec::new();
+        for k in 0..count {
+            let at = ino.off + 48 + k * 16;
+            let plen = rd_u32(img, at);
+            let start = u64::from(rd_u32(img, at + 4)) | (u64::from(rd_u32(img, at + 8)) << 32);
+            let logical = rd_u32(img, at + 12) as usize;
+            assert_eq!(logical, out.len());
+            let end = if k + 1 == count {
+                ino.size as usize
+            } else {
+                rd_u32(img, at + 28) as usize
+            };
+            let bytes = &img[start as usize..start as usize + (plen & 0x0fff_ffff) as usize];
+            match plen >> 28 {
+                0 => out.extend_from_slice(bytes),
+                4 => out.extend(crate::zstd::decompress(bytes, end - logical).unwrap()),
+                other => panic!("unexpected extent format {other}"),
+            }
+            assert_eq!(out.len(), end);
+        }
+        assert_eq!(out.len(), ino.size as usize);
+        out
     }
 
     /// Like `read_dir`, but returns raw name bytes (for non-UTF8 names).
@@ -702,6 +867,41 @@ mod tests {
     }
 
     #[test]
+    fn packed_extents_round_trip_mixed_data_and_boundaries() {
+        let d = tmpdir("extents");
+        let mut random = vec![0u8; EXTENT_SIZE];
+        let mut state = 42u64;
+        for byte in &mut random {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *byte = state as u8;
+        }
+        let mut mixed = vec![b'a'; EXTENT_SIZE];
+        mixed.extend_from_slice(&random);
+        mixed.extend_from_slice(b"last extent");
+        fs::write(d.join("mixed"), &mixed).unwrap();
+        fs::write(d.join("empty"), []).unwrap();
+        for n in 0..100 {
+            fs::write(d.join(format!("small{n}")), b"x").unwrap();
+        }
+        let img = build_image(&d).unwrap();
+        assert_eq!(img, build_image(&d).unwrap());
+        let ino = lookup(&img, &["mixed"]);
+        assert_eq!(read_file(&img, &ino), mixed);
+        assert_eq!(rd_u32(&img, ino.off + 48) >> 28, 4);
+        assert_eq!(rd_u32(&img, ino.off + 64) >> 28, 0);
+        assert!(read_file(&img, &lookup(&img, &["empty"])).is_empty());
+        for n in 0..100 {
+            assert_eq!(
+                read_file(&img, &lookup(&img, &[&format!("small{n}")])),
+                b"x"
+            );
+        }
+        assert!(img.len() < EXTENT_SIZE + 32 * BLOCK_SIZE);
+    }
+
+    #[test]
     fn superblock_is_well_formed() {
         let d = tmpdir("super");
         let root = d.join("r");
@@ -709,6 +909,10 @@ mod tests {
         make_rootfs(&root);
         let img = build_image(&root).unwrap();
         let (root_nid, blocks, meta) = read_super(&img);
+        assert_eq!(img[SUPER_OFFSET + 13], 1);
+        assert_eq!(rd_u32(&img, SUPER_OFFSET + 80), 2);
+        assert_eq!(rd_u16(&img, SUPER_OFFSET + 84), 8);
+        assert_eq!(&img[1168..1176], &[6, 0, 0, 7, 0, 0, 0, 0]);
         assert_eq!(root_nid, 0, "root nid must be 0");
         assert_eq!(meta, META_BLKADDR);
         assert_eq!(

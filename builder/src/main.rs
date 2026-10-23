@@ -83,6 +83,7 @@ mod toolchain_x86_64;
 mod unifdef;
 mod verdict_journal;
 mod worktree_gc;
+mod zstd;
 
 // The JSON value/parser/canonical writer, SHA-256 and CRC-32 live in the
 // shared, std-only td-engine (one copy for td-builder + td-recipe-eval).
@@ -9670,7 +9671,7 @@ fn main() -> ExitCode {
                 }
             }
         }
-        // mkfs-erofs: pack a staged directory tree into a deterministic, uncompressed,
+        // mkfs-erofs: pack a staged directory tree into a deterministic, zstd-compressed,
         // read-only **erofs** image (see erofs.rs). Control-plane capability for the
         // read-only-root arc (#548): the read-only `/td/store` real root the two-stage
         // boot mounts and switch_roots into. Never a recipe tool.

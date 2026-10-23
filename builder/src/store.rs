@@ -267,6 +267,10 @@ pub fn input_addressed_path(key_hex: &str, name: &str) -> String {
 /// yields stale reuse. The `tree_fingerprint` builder-source drift record and the
 /// rebuild-the-world are the backstops.
 ///
+/// PackErofs instead carries a checked, hash-visible engine::EROFS_FORMAT in
+/// its step JSON. Changes confined to that producer bump its format token,
+/// re-keying its consumers without invalidating unrelated package builds.
+///
 /// 5 separated the graphs above the retired stage0 bootstrap root from those
 /// below it, which no recipe builds any more.
 pub const BUILDER_ABI: u64 = 5;

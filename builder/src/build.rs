@@ -4796,6 +4796,9 @@ pub fn run_mesboot() -> Result<(), String> {
             )
             .map_err(err)?;
         } else if let Some(o) = step.get("packErofs") {
+            if field(o, "format")? != td_engine::EROFS_FORMAT {
+                return Err(err("unsupported EROFS producer format".into()));
+            }
             let root = ctx.expand(&field(o, "root")?).map_err(err)?;
             let output = ctx.expand(&field(o, "output")?).map_err(err)?;
             pack_erofs(Path::new(&root), Path::new(&output)).map_err(err)?;

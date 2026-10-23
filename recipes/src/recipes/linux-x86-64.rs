@@ -38,7 +38,7 @@ use crate::types::{Recipe, Step, TextEdit};
 // `/td/store` root — the block layer (BLOCK), the PCI bus and virtio-over-PCI
 // transport the `-M pc` qemu machine exposes (PCI, VIRTIO, VIRTIO_PCI), the
 // virtio block device the erofs image rides (VIRTIO_BLK → /dev/vda), the erofs
-// filesystem itself (EROFS_FS, uncompressed — matching the `td-builder
+// filesystem itself (EROFS_FS with zstd — matching the `td-builder
 // mkfs-erofs` writer, #548). Writable state is a direct `/var` mount; `/etc`
 // remains on EROFS, so OverlayFS is deliberately absent. BLK_DEV_INITRD stays
 // on: the kernel still boots via a minimal initramfs that then mounts and
@@ -408,6 +408,8 @@ pub fn recipe() -> Recipe {
                   /^#? *CONFIG_VIRTIO_BLK[ =]/d; \
                   /^#? *CONFIG_MISC_FILESYSTEMS[ =]/d; \
                   /^#? *CONFIG_EROFS_FS[ =]/d; \
+                  /^#? *CONFIG_EROFS_FS_ZIP[ =]/d; \
+                  /^#? *CONFIG_EROFS_FS_ZIP_ZSTD[ =]/d; \
                   /^#? *CONFIG_KEXEC[ =]/d; \
                   /^#? *CONFIG_KEXEC_FILE[ =]/d; \
                   /^#? *CONFIG_KEXEC_SIG[ =]/d; \
@@ -602,6 +604,8 @@ pub fn recipe() -> Recipe {
                    'CONFIG_VIRTIO_BLK=y' \
                    'CONFIG_MISC_FILESYSTEMS=y' \
                    'CONFIG_EROFS_FS=y' \
+                   'CONFIG_EROFS_FS_ZIP=y' \
+                   'CONFIG_EROFS_FS_ZIP_ZSTD=y' \
                    '# CONFIG_KEXEC is not set' \
                    'CONFIG_KEXEC_FILE=y' \
                    '# CONFIG_KEXEC_SIG is not set' \
@@ -800,6 +804,8 @@ pub fn recipe() -> Recipe {
                  grep -q '^CONFIG_VIRTIO_PCI=y' .config || { echo 'VIRTIO_PCI off - no virtio transport on the -M pc PCI bus' >&2; exit 1; }; \
                  grep -q '^CONFIG_VIRTIO_CONSOLE=y' .config || { echo 'VIRTIO_CONSOLE off - no td VM bridge' >&2; exit 1; }; \
                  grep -q '^CONFIG_VIRTIO_BLK=y' .config || { echo 'VIRTIO_BLK off - the erofs disk (/dev/vda) would not appear' >&2; exit 1; }; \
+                 grep -q '^CONFIG_EROFS_FS_ZIP=y' .config || exit 1; \
+                 grep -q '^CONFIG_EROFS_FS_ZIP_ZSTD=y' .config || exit 1; \
                  grep -q '^CONFIG_EROFS_FS=y' .config || { echo 'EROFS_FS off - the read-only erofs root could not be mounted' >&2; exit 1; }; \
                  if grep -q '^CONFIG_OVERLAY_FS=y' .config; then echo 'OVERLAY_FS on - /etc is immutable and writable state uses direct mounts; no overlay user remains' >&2; exit 1; fi; \
                  grep -q '^CONFIG_PRINTK=y' .config || { echo 'PRINTK off — no kernel console output' >&2; exit 1; }; \
