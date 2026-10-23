@@ -17693,7 +17693,10 @@ daemon build START (2/2 active)
             spec.runtime(),
             "runtime/org.freedesktop.Platform/x86_64/25.08"
         );
-        assert_eq!(spec.source(), None);
+        assert_eq!(
+            spec.source(),
+            Some(td_engine::flathub_app::CLAUDE_RELEASE_REF)
+        );
 
         // No validator, and nothing but native copies: nothing else stands
         // between the build and the foreign bytes.

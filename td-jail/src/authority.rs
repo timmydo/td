@@ -4570,7 +4570,7 @@ mod tests {
             Some(FIREFOX_LIBRARY_PATH)
         );
         assert!(spec.runtime_aliases);
-        let claude = "format=1\nname=claude\nruntime=runtime/org.freedesktop.Platform/x86_64/25.08\nentry=/app/bin/claude\n\n[Environment]\nDISABLE_UPDATES=1\nHOME=/home/td\nWAYLAND_DISPLAY=wayland-0\nXDG_RUNTIME_DIR=/run/user/1000\n\n[Context]\nshared=network\nsockets=wayland\n";
+        let claude = "format=1\nname=claude\nsource=app/com.anthropic.ClaudeCode/x86_64/latest\nruntime=runtime/org.freedesktop.Platform/x86_64/25.08\nentry=/app/bin/claude\n\n[Environment]\nDISABLE_UPDATES=1\nHOME=/home/td\nWAYLAND_DISPLAY=wayland-0\nXDG_RUNTIME_DIR=/run/user/1000\n\n[Context]\nshared=network\nsockets=wayland\n";
         assert_eq!(
             parse_spec(claude).unwrap().flathub,
             flathub_app::flathub_source("claude")
@@ -4582,9 +4582,9 @@ mod tests {
             firefox.replace(refs, "runtime=runtime/org.freedesktop.Platform/x86_64/25.08\nsource=app/org.mozilla.firefox/x86_64/stable\n"),
             // A source with a store runtime.
             firefox.replace(refs, &format!("source=app/org.mozilla.firefox/x86_64/stable\n{store}")),
-            // Another runtime ref, or a source Claude's declaration lacks.
+            // Another runtime ref, or an undeclared application source.
             firefox.replace("x86_64/25.08", "x86_64/24.08"),
-            claude.replace("name=claude\n", "name=claude\nsource=app/org.mozilla.firefox/x86_64/stable\n"),
+            claude.replace("app/com.anthropic.ClaudeCode/x86_64/latest", "app/org.mozilla.firefox/x86_64/stable"),
             // An application with no declaration.
             claude.replace("name=claude\n", "name=mail\n").replace("DISABLE_UPDATES=1\n", ""),
             // An entry td-app never validated.

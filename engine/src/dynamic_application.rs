@@ -22,7 +22,8 @@ const MAX_LOADER_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_RPATH_ANCESTORS: usize = 64;
 const MAX_RPATH_ANCESTRY_BYTES: usize = 64 * 1024;
 const MAX_SHEBANG_BYTES: usize = 256;
-const MAX_DYNAMIC_ELF_BYTES: u64 = crate::ostree::MAX_ARCHIVE_FILE_BYTES as u64;
+// Signed native releases can exceed the OSTree per-object transfer ceiling.
+pub const MAX_DYNAMIC_ELF_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_DYNAMIC_STRING_BYTES: usize = 64 * 1024;
 const MAX_DYNAMIC_TEXT_BYTES: usize = 16 * 1024 * 1024;
 
@@ -1286,6 +1287,30 @@ mod tests {
         let error = validate_entry(&namespace, "/app/bin/wrong-arch").unwrap_err();
         assert!(error.contains("expected EM_X86_64"), "{error}");
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_release_entry_can_exceed_ostree_size_but_remains_bounded() {
+        let root = scratch("native-release-size");
+        let app = root.join("app");
+        let usr = root.join("usr");
+        fs::create_dir_all(app.join("bin")).unwrap();
+        fs::create_dir_all(&usr).unwrap();
+        let path = app.join("bin/claude");
+        fs::write(&path, crate::elf_synth::synth_needed_elf(&[], true)).unwrap();
+        make_executable(&path);
+        let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(293_469_552).unwrap();
+        let namespace = Namespace {
+            app: &app,
+            usr: &usr,
+        };
+        assert!(validate_entry(&namespace, "/app/bin/claude")
+            .unwrap()
+            .is_none());
+        file.set_len(MAX_DYNAMIC_ELF_BYTES + 1).unwrap();
+        let error = validate_entry(&namespace, "/app/bin/claude").unwrap_err();
+        assert!(error.contains("limit"), "{error}");
     }
 
     #[test]

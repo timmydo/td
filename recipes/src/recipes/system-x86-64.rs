@@ -1743,7 +1743,7 @@ fn build_td_svc_conf() -> String {
          requires=td-firstboot\n\
          timeout=30\n\
          \n\
-         # Claude Code's runtime, fetched before the evidence below launches\n\
+         # Claude Code and its runtime, fetched before the evidence below launches\n\
          # it, as Firefox's is.\n\
          [claude-fetch]\n\
          type=oneshot\n\
@@ -6427,7 +6427,7 @@ mod tests {
             Step::WriteFile { path, content, exec: false }
                 if path == "{root}/real-root/etc/td-profiler-application-roots.tsv"
                     && content == "td-profiler-application-roots-v1\n\
-        claude\tclaude-2.1.260\tforeign\truntime/org.freedesktop.Platform/x86_64/25.08\tforeign\n\
+        claude\tclaude-latest\tforeign\truntime/org.freedesktop.Platform/x86_64/25.08\tforeign\n\
         firefox\tfirefox-stable\tforeign\truntime/org.freedesktop.Platform/x86_64/25.08\tforeign\n\
         mail\tmail-0.1\tsource\tstatic-runtime-1\tsource\n\
         news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"

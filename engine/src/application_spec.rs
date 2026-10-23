@@ -921,7 +921,7 @@ mod tests {
             .unwrap();
         let spec =
             ApplicationSpec::compile(&manifest, claude.runtime, PermissionPolicy::new()).unwrap();
-        assert_eq!(spec.source(), None);
+        assert_eq!(spec.source(), claude.application);
         assert_eq!(ApplicationSpec::parse(&spec.to_keyfile()).unwrap(), spec);
         // Only the declared runtime's policy may run on its ref.
         let manifest = ApplicationDeclaration::new("static-runtime", claude.entry)
@@ -1131,7 +1131,10 @@ mod tests {
             assert!(dynamic_application_policy(source.name, source.policy_runtime).is_some());
         }
         assert_eq!(flathub_source("firefox").unwrap().entry, "/app/bin/firefox");
-        assert!(flathub_source("claude").unwrap().application.is_none());
+        assert_eq!(
+            flathub_source("claude").unwrap().application,
+            Some(crate::flathub_app::CLAUDE_RELEASE_REF)
+        );
         assert!(flathub_source("mail").is_none());
     }
 }

@@ -8384,9 +8384,8 @@ mod tests {
     }
 
     /// The shipped deployment's exact containment answer. Both applications
-    /// must be listed as foreign recipes, and Claude's pinned bytes as a
-    /// source pin, while the image that stages them remains unmarked; Firefox
-    /// declares a Flathub ref, so it has no pin.
+    /// must be listed as foreign declarations while the image stays unmarked.
+    /// Their application bytes are fetched on demand, so neither has a pin.
     #[test]
     fn the_shipped_deployment_reports_only_its_two_foreign_payloads() {
         let answer = payload_closure(&[PAYLOAD_CLOSURE_DEFAULT]).unwrap();
@@ -8403,7 +8402,7 @@ mod tests {
             answer.foreign_members,
             ["claude".to_string(), "firefox".to_string()]
         );
-        assert_eq!(answer.pins, ["claude-code-source".to_string()]);
+        assert!(answer.pins.is_empty());
         // The members built in the Debian build root: the kernel, glibc and
         // the static libgcc it links, the upstream toolchain's runtime,
         // zlib, cryptsetup with its libraries, OpenSSH, Git with curl and

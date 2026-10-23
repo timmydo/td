@@ -9,7 +9,7 @@ use td_engine::permissions::{FilesystemAccess, PermissionPolicy, PermissionSocke
 /// §W.9), and td-app validates this package against it at admission.
 const RUNTIME: &str = "freedesktop-platform-25-08";
 const ENTRY: &str = "/app/bin/claude";
-const VERSION: &str = "2.1.260";
+const VERSION: &str = "latest";
 
 /// Memory and process ceilings for a coding agent: the native binary is a
 /// 215 MB Bun executable that spawns shells, build tools and subagents, so the
@@ -18,20 +18,10 @@ const MEMORY_HIGH_BYTES: u64 = 3 * 1024 * 1024 * 1024;
 const MEMORY_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const PIDS_MAX: u32 = 2048;
 
-/// The exact upstream Claude Code native release, admitted as a marked payload
-/// and placed at its entry name without being executed by the build. The
-/// vendor publishes each version as one glibc-dynamic ELF beside a manifest
-/// of SHA-256 sums, so the pin is checkable against upstream's own hash. A
-/// terminal program: the policy carries the fresh-terminal grant, so a launch
-/// has a pseudo-terminal of its own from `td-term --command` or is refused
-/// before anything runs (APPLICATIONS.md §C), and the system image's
-/// `claude-evidence` unit proves both halves at boot. Its updater is disabled
-/// because nothing in the private home may execute. The `~/src` grant makes
-/// the human workspace reachable inside the jail. The stock root authority
-/// starts at `/`; forwarding an operator's working directory needs a typed
-/// launch request (APPLICATIONS.md §A and rung 34). Later increments add
-/// a launcher card that opens it and the executable state subtree that lets
-/// the application update itself.
+/// A declaration of Anthropic's signed native release stream. td-app fetches
+/// and validates the binary and Flathub runtime before the jail launches it.
+/// The program's own updater stays disabled; only td-app publishes executable
+/// generations outside the jail's noexec private home.
 pub fn recipe() -> Recipe {
     if dynamic_application_policy("claude", RUNTIME).is_none() {
         return invalid_recipe("dynamic-policy");
@@ -69,21 +59,13 @@ pub fn recipe() -> Recipe {
         return invalid_recipe("permissions");
     };
     Recipe::mesboot("claude", VERSION)
-        .source_input("claude-code-source")
-        // `/app` is the package's `files/` root, so the entry lands at
-        // `files/bin/claude`. Nothing else touches it: no build stages the
-        // runtime, so td-app validates the package at admission.
-        .steps(vec![Step::CopyFile {
-            file: "{payload:claude-source}".into(),
-            to: "{out}/files/bin/claude".into(),
-            exec: true,
-        }])
+        .steps(vec![])
         .application(declaration)
         .application_launcher(launcher)
         .application_permissions(permissions)
         .checks(vec![RecipeCheck::new(
             r#"
-echo ">> recipe-check claude: package the pinned Claude Code payload without executing it"
+echo ">> recipe-check claude: compile the signed-release declaration without fetching payloads"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run claude 1
 "#,
@@ -92,12 +74,10 @@ exec "$TD_RECIPE_EVAL" check-run claude 1
 }
 
 fn invalid_recipe(field: &str) -> Recipe {
-    Recipe::mesboot("claude", VERSION)
-        .source_input("claude-code-source")
-        .steps(vec![Step::Require {
-            paths: vec![format!("{{out}}/invalid-claude-{field}")],
-            exec: false,
-        }])
+    Recipe::mesboot("claude", VERSION).steps(vec![Step::Require {
+        paths: vec![format!("{{out}}/invalid-claude-{field}")],
+        exec: false,
+    }])
 }
 
 #[cfg(test)]
@@ -105,16 +85,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn payload_is_placed_at_its_entry_and_its_runtime_is_fetched() {
+    fn declaration_fetches_both_binary_and_runtime() {
         let recipe = recipe();
         assert!(recipe.is_foreign());
-        assert!(recipe.is_foreign_source());
-        assert_eq!(recipe.source_input.as_deref(), Some("claude-code-source"));
+        assert!(!recipe.is_foreign_source());
+        assert!(recipe.source_input.is_none());
         // No build stages the runtime: td-app fetches the declared ref.
         assert_eq!(recipe.payload_inputs, None);
         let source = td_engine::flathub_app::flathub_source("claude").expect("declared");
         assert_eq!(recipe.flathub_runtime(), Some(source.runtime));
-        assert_eq!(source.application, None);
+        assert_eq!(
+            source.application,
+            Some(td_engine::flathub_app::CLAUDE_RELEASE_REF)
+        );
         assert_eq!(source.entry, ENTRY);
         let declaration = recipe.application.as_ref().expect("declaration");
         assert_eq!(declaration.runtime(), RUNTIME);
@@ -124,12 +107,7 @@ mod tests {
             declaration.environment().collect::<Vec<_>>(),
             vec![("DISABLE_UPDATES", "1"), ("SHELL", "/usr/bin/bash")]
         );
-        // A native copy alone: td-app validates the package at admission.
-        assert!(matches!(
-            recipe.steps.as_deref(),
-            Some([Step::CopyFile { file, to, exec: true }])
-                if file == "{payload:claude-source}" && to == "{out}/files/bin/claude"
-        ));
+        assert!(recipe.steps.as_deref().is_some_and(<[Step]>::is_empty));
         // The policy td-app's validator closes against names no package
         // library root: the whole loader graph is the runtime's.
         let policy = dynamic_application_policy("claude", RUNTIME).expect("dynamic policy");

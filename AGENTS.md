@@ -143,6 +143,15 @@ exact ref bindings, a monotonic commit time and §B.3.1's bounds and
 validators. It is never an input to any recipe, is outside every closure
 and source-bootstrap claim, and runs only through the same confinement.
 
+Claude Code's native release stream is the third class
+(`APPLICATIONS.md` §W.9). Its declaration and Anthropic RSA signing key
+are reviewed; td-app follows the latest-release hint, verifies the signed
+manifest and its version, size and SHA-256, and refuses a release older
+than one already admitted. The binary lives only in the same private
+account cache, outside the image, every recipe input and every build
+closure. It runs through the application confinement path with a fetched
+Flathub runtime; the program's own updater remains disabled.
+
 The image asserts that a dynamic payload's `PT_INTERP` is absent from the
 image root, but this does not prove the bytes can execute only in a jail: an
 explicit store `ld.so` can load them, and static payloads have no interpreter.

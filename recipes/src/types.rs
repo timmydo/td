@@ -1719,13 +1719,13 @@ mod tests {
         // the KEY rather than matched as text: a check-script body containing the
         // word would otherwise false-red it.
         for (stem, recipe) in crate::catalog::all() {
-            if matches!(stem, "ripgrep-seed" | "claude") {
+            if stem == "ripgrep-seed" {
                 assert!(recipe.to_json().get("foreign").is_some());
                 assert!(recipe.to_json().get("foreignSource").is_some());
                 continue;
             }
             // A Flathub application with no source of its own (§W.9).
-            if stem == "firefox" {
+            if matches!(stem, "firefox" | "claude") {
                 assert!(recipe.flathub_runtime().is_some());
                 assert!(recipe.to_json().get("foreign").is_some());
                 assert!(recipe.to_json().get("foreignSource").is_none());

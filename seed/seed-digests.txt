@@ -10,7 +10,6 @@
 # is self-defeating: the runner
 # re-derives from the pins every run and reds on disagreement.
 ca-certificates-source 1nh4w1q566ga153y3h427ai268h934nx-ca-certificates-source
-claude-code-source 38p8258xch0p61w26g2k7h6in56jzyh9-claude-code-source
 cryptsetup-x86-64-source v3g69yip0g4zybh9yw2hlp3zzcfy98fc-cryptsetup-x86-64-source
 curl-x86-64-source 985mgjp6q4y958wwzqs984nkh399jnac-curl-x86-64-source
 fd-source rsp3qagl8x7gh5hqpzy93adwfv5pv2ay-fd-source

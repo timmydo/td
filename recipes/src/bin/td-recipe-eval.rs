@@ -659,7 +659,7 @@ mod tests {
         let pins = td_recipe::source_pins::all();
         // source_pins::tests::catalog_carries_all_legacy_source_locks names
         // each of them.
-        assert_eq!(pins.len(), 38);
+        assert_eq!(pins.len(), 37);
         assert!(pins.iter().all(|pin| pin.key != "stage0-source"));
         // The build root lists through `build-root-pins` alone.
         assert!(pins.iter().all(|pin| !pin.key.starts_with("debian-root-")));
@@ -668,7 +668,7 @@ mod tests {
         assert!(pins
             .iter()
             .any(|pin| pin.key == "jetbrains-mono-nerd-font-source"));
-        assert!(pins.iter().any(|pin| pin.key == "claude-code-source"));
+        assert!(pins.iter().all(|pin| pin.key != "claude-code-source"));
         for key in [
             "rust-rustc-dist",
             "rust-std-dist",

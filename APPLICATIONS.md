@@ -1564,10 +1564,12 @@ objects and loader edges at 262,144, 32,768 and 262,144 respectively. Parsed
 objects are cached by resolved path and their declared file sizes share a
 2 GiB aggregate ceiling. Retained loader-state paths and RPATH ancestry share
 a separate 64 MiB aggregate ceiling. Each
-foreign ELF is admitted before allocation at 256 MiB, 262,144 dynamic-table
+foreign ELF is admitted before allocation at 512 MiB, 262,144 dynamic-table
 entries and references, 64 KiB per dynamic string and 16 MiB of aggregate
 dynamic text. `PT_DYNAMIC` must be aligned and carry its `DT_NULL` terminator
-inside the declared file range. Interpreter paths must be absolute.
+inside the declared file range. The ELF byte ceiling also bounds signed
+native-release downloads; OSTree retains its separate 256 MiB decoded-object
+ceiling. Interpreter paths must be absolute.
 Token-bearing `DT_NEEDED` names and duplicate run-path tags refuse. Required
 providers must have the
 executable entry point or shared-object ELF role, version, header table and
@@ -2140,9 +2142,8 @@ The roster was empty until the first application landed, which was exactly the
 condition under which every test over it passed with the rule inverted. The
 decision functions therefore still take their roster as an argument and are
 driven with fixtures, including through the production lookup over a real pin
-key. The real roster now contains exactly `ripgrep-seed-source` and
-`claude-code-source`; tests assert both the count and that these are the only
-marked pins. The wiring that supplies that roster remains pinned in source, so
+key. The real roster now contains exactly `ripgrep-seed-source`; tests
+assert both the count and that it is the only marked pin. The wiring that supplies that roster remains pinned in source, so
 replacing `FOREIGN` with an empty slice cannot silently return the seed to the
 ordinary trust class.
 
@@ -11158,24 +11159,59 @@ the Freedesktop 25.08 recipe, the graph cache's warm in `./update`,
 ostree-materialize` were deleted in the same landing, and roughly 1 GB
 left every image and §B.1's ×3 capacity accounting.
 
-**Claude Code keeps its binary and fetches its runtime.** Its payload is
-Anthropic's release, pinned in `recipes/src/source_pins.rs` at a
-permanent URL, and stays in the image. It runs on the same Flathub
-runtime, which supplies not only glibc but the bash, grep, sed and
-find its Bash tool runs, and that runtime pin would rot the same way.
-Its declaration therefore names the runtime ref while its `files/` stays
-in `/td/store`, and its account, `tda65539`, fetches the runtime into its
-own cache under the same rules: rule 4 is replaced by the declaration's
-runtime ref, and rules 1–3 and 5 apply to the runtime commit. The two
-accounts do not share a cache, so a machine running both downloads the
-runtime twice. After cutover no Flathub byte is in the image.
+**Claude Code follows Anthropic's signed native releases on demand.** Its
+recipe now carries only its declaration, permission policy and launcher;
+there is no Claude binary or source pin in the image. td-app fetches
+`https://downloads.claude.ai/claude-code-releases/latest` as a bounded,
+untrusted version hint, then that version's `manifest.json` and
+`manifest.json.sig`. The exact manifest bytes must verify with the
+compiled RSA-4096 key whose fingerprint is
+`31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE`, from Anthropic's published
+`https://downloads.claude.ai/keys/claude-code.asc`. The bounded OpenPGP
+verifier used for Flathub also verifies this detached signature; the
+manifest's version must equal the requested canonical `major.minor.patch`.
+Only `platforms["linux-x64"]` is selected, its binary must be `claude`,
+and its signed size and SHA-256 must match the downloaded
+`{version}/linux-x64/claude`. Manifests are at most 64 KiB, armored
+signatures 16 KiB, binaries 512 MiB. Downloads refuse redirects and have
+byte and time bounds. The dynamic validator then checks the binary
+against the declared Flathub runtime before publishing a generation.
+
+`app/com.anthropic.ClaudeCode/x86_64/latest` is this declaration's logical
+source selector, not an OSTree ref and never requested from Flathub. It
+uses the existing `app=` selection row: the content identity is SHA-256
+of the signed manifest, and the row's sequence field packs the three
+numeric version components into 21 bits each. Versions with leading
+zeroes, suffixes, extra components or components outside that range are
+refused. The floor is the highest sequence in `admitted`, `current` or
+`previous`; a lower version or a different manifest at the same version
+is refused. This prevents rollback after a successful admission, not a
+freeze or an old first install. Signing-key changes are reviewed code
+changes; online key revocation is not consulted.
+
+The binary is materialized as `deploy/<manifest-sha256>/files/bin/claude`
+through a complete private staging tree and rename. The application and
+runtime use the same generation selection, validation, current/previous
+retention and launch leases as Firefox. A failed signature, download,
+size/hash check or dynamic validation leaves current selected. The
+application's own updater remains disabled: only td-app writes executable
+generations outside the jail. Its runtime is still the exact accepted
+Freedesktop branch under Flathub's rules 1–3 and 5. Its account,
+`tda65539`, owns both trees. Accounts do not share a cache.
+
+The feed's Flathub export warms only OSTree refs; Claude's release always
+comes directly from Anthropic, including on autotest boots. The existing
+`claude-fetch` unit now fetches both binary and runtime before the
+terminal launch oracle, within its existing timeout. Thus those boots
+also need upstream release availability. Ordinary boots fetch neither;
+first launch and daily/forced checks use the same td-app commands.
 
 **Each half of a spec resolves on its own.** A spec's application tree
 comes either from its `/td/store` package (`files/`) or, when the spec
 carries `source=`, from the account's held generation; its runtime comes
 either from a `/td/store` runtime path or, when `runtime=` names a
 Flathub ref, from the same generation. Firefox takes both from the
-cache, Claude Code only its runtime, mail and news neither.
+cache, as does Claude Code; mail and news use neither.
 `flathub_app::spec_source` is the one rule the spec compiler and td-jail
 both apply: a `/td/store` runtime carries no `source=`; any other
 `runtime=` is the declaration's runtime ref, with `source=` exactly when

@@ -6,13 +6,14 @@
 //! none and uses no other module, so td-jail can `#[path]`-include it to
 //! read the same `selection` and pointers td-app writes.
 
-/// One declared application's Flathub refs. The bytes are not reviewed;
+/// One declared application with a Flathub runtime. The bytes are not reviewed;
 /// these names, Flathub's signing key and the admission rules are.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FlathubSource {
     /// The td application name: its registry row and launcher name.
     pub name: &'static str,
-    /// The app ref, or `None` when only the runtime is fetched and the
+    /// The app selector (an OSTree ref or CLAUDE_RELEASE_REF), or `None`
+    /// when only the runtime is fetched and the
     /// application tree stays in its `/td/store` package.
     pub application: Option<&'static str>,
     /// The one runtime ref the application accepts.
@@ -25,12 +26,15 @@ pub struct FlathubSource {
 
 pub const REPOSITORY: &str = "https://dl.flathub.org/repo";
 
+/// Logical application selector for Anthropic's release source; never an OSTree ref.
+pub const CLAUDE_RELEASE_REF: &str = "app/com.anthropic.ClaudeCode/x86_64/latest";
+
 const PLATFORM_25_08: &str = "runtime/org.freedesktop.Platform/x86_64/25.08";
 
 pub const FLATHUB_SOURCES: &[FlathubSource] = &[
     FlathubSource {
         name: "claude",
-        application: None,
+        application: Some(CLAUDE_RELEASE_REF),
         runtime: PLATFORM_25_08,
         entry: "/app/bin/claude",
         policy_runtime: "freedesktop-platform-25-08",
@@ -114,11 +118,12 @@ const PACKAGE_ROOT: &str = "/td/store/";
 const MAX_REF_BYTES: usize = 255;
 const MAX_NAME_BYTES: usize = 64;
 
-/// One admitted commit of one ref.
+/// One admitted content identity of one source selector.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Admitted {
     pub exact_ref: String,
     pub commit: String,
+    /// Flathub commit time, or the ordered numeric Claude release version.
     pub timestamp: u64,
 }
 
@@ -536,7 +541,7 @@ mod tests {
         );
         let claude = flathub_source("claude").unwrap();
         assert_eq!(
-            spec_source("claude", None, claude.runtime),
+            spec_source("claude", claude.application, claude.runtime),
             Ok(Some(claude))
         );
         for (name, source, runtime) in [
