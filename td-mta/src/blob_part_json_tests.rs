@@ -18,6 +18,9 @@ impl Timer {
             expires: AtomicU64::new(u64::MAX),
         }
     }
+    pub(crate) fn samples(&self) -> u64 {
+        self.calls.load(Ordering::Relaxed)
+    }
     pub(crate) fn after(&self, n: u64) {
         self.expires
             .store(self.calls.load(Ordering::Relaxed) + n, Ordering::Relaxed);

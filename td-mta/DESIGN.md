@@ -1882,6 +1882,14 @@ validating the remaining scalars after truncation so trailing diagnostics are
 retained. HTML truncation, response serialization and JMAP integration remain
 separate.
 
+JMAP preview, body-value serialization and text search may group at most 64
+existing scalar decoder turns between native snapshot checks. Every child turn still
+uses its original work meter and freshly sampled job clock; no deadline or
+budget is renewed. A fresh native check brackets each batch, including
+failure and completion, and all copied bytes remain provisional. Metadata
+preparation and the single-turn cursor interfaces retain their prior bounds.
+This avoids polling the PostgreSQL connection for every decoded scalar.
+
 ## 10. HTTP and JMAP
 
 The `http_request` module implements transport-independent HTTP/1.1 request

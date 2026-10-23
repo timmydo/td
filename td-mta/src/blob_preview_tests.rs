@@ -353,3 +353,69 @@ fn native_source_tail_remains_live_after_preview_cap() {
         });
     }
 }
+
+#[test]
+fn batched_decoding_preserves_bytes_and_diagnostics_with_fewer_snapshot_checks() {
+    let mut source = b"Content-Type: text/plain;charset=UTF-8\r\n\r\n".to_vec();
+    source.extend_from_slice("héllo ".repeat(1024).as_bytes());
+    source.push(0xff);
+    let run = |batch: bool| {
+        let timer = Timer::new();
+        let mut result = None;
+        exercise_part(1, &source, &timer, |original| {
+            let mut buffer = [0; 128];
+            let mut checkpoints = Checkpoints::default();
+            let mut cursor =
+                Cursor::new(original, &mut buffer, &mut checkpoints, &GoodClock, Tick(1)).unwrap();
+            let before = timer.samples();
+            let mut bytes = Vec::new();
+            let mut output = [0; 512];
+            for _ in 0..100_000 {
+                let progress = if batch {
+                    cursor.poll_batch(&mut output)
+                } else {
+                    cursor.poll(&mut output)
+                }
+                .unwrap();
+                bytes.extend_from_slice(&output[..progress.written]);
+                if progress.status == Status::Complete {
+                    let diagnostics = cursor.finish().unwrap().diagnostics;
+                    result = Some((bytes, diagnostics, timer.samples() - before));
+                    return;
+                }
+            }
+            panic!("decoding did not finish");
+        });
+        result.unwrap()
+    };
+    let (single, diagnostics, single_checks) = run(false);
+    let (batch, batch_diagnostics, batch_checks) = run(true);
+    assert_eq!(batch, single);
+    assert_eq!(batch_diagnostics, diagnostics);
+    assert!(batch_diagnostics.is_encoding_problem);
+    assert!(
+        batch_checks * 8 < single_checks,
+        "{batch_checks} vs {single_checks}"
+    );
+}
+
+#[test]
+fn batched_decoding_retires_provisional_bytes_when_its_clock_expires() {
+    let source = format!(
+        "Content-Type: text/plain;charset=UTF-8\r\n\r\n{}",
+        "body ".repeat(100)
+    );
+    let timer = Timer::new();
+    exercise_part(1, source.as_bytes(), &timer, |original| {
+        let mut buffer = [0; 128];
+        let mut checkpoints = Checkpoints::default();
+        let mut cursor =
+            Cursor::new(original, &mut buffer, &mut checkpoints, &timer, Tick(1)).unwrap();
+        timer.after(30);
+        let mut output = [0; 512];
+        let error = cursor.poll_batch(&mut output).unwrap_err();
+        assert!(cursor.value().is_none());
+        assert_eq!(cursor.poll_batch(&mut output).unwrap_err(), error);
+        assert!(cursor.finish().is_err());
+    });
+}

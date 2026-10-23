@@ -281,37 +281,44 @@ fn search_context(
         let clock = crate::mime_text::CheckedClock::new(clock, now(clock)?);
         let mut html = spec.html.then(td_html::extract::Extractor::new);
         let (mut scalar, mut ended) = (None, false);
-        loop {
+        'text: loop {
             reader.source_mut().check_deadline().map_err(storage)?;
-            if scalar.is_none() && !ended {
-                match reader.poll(&clock, part.structure.work).map_err(mime)? {
-                    crate::mime_text::Status::Scalar(c) => scalar = Some(c),
-                    crate::mime_text::Status::Complete => ended = true,
-                    crate::mime_text::Status::Yield => continue,
+            for _ in 0..crate::mime_response::framing::SCALAR_BATCH_TURNS {
+                if scalar.is_none() && !ended {
+                    match reader.poll(&clock, part.structure.work).map_err(mime)? {
+                        crate::mime_text::Status::Scalar(c) => scalar = Some(c),
+                        crate::mime_text::Status::Complete => ended = true,
+                        crate::mime_text::Status::Yield => continue,
+                    }
                 }
-            }
-            if let Some(html) = &mut html {
-                let progress =
-                    crate::html_text::poll_shared(html, scalar, ended, part.structure.work, &clock)
-                        .map_err(|error| match error {
-                            crate::html_text::Error::Work(stop) => mime(stop),
-                            _ => Error::MessageInterpretation,
-                        })?;
-                if progress.consumed {
-                    scalar = None;
-                }
-                if let Some(c) = progress.scalar {
-                    search.scalar(c, part.structure.work, &clock)?;
-                }
-                if progress.status == crate::html_text::Status::Complete {
-                    break;
-                }
-            } else {
-                if let Some(c) = scalar.take() {
-                    search.scalar(c, part.structure.work, &clock)?;
-                }
-                if ended {
-                    break;
+                if let Some(html) = &mut html {
+                    let progress = crate::html_text::poll_shared(
+                        html,
+                        scalar,
+                        ended,
+                        part.structure.work,
+                        &clock,
+                    )
+                    .map_err(|error| match error {
+                        crate::html_text::Error::Work(stop) => mime(stop),
+                        _ => Error::MessageInterpretation,
+                    })?;
+                    if progress.consumed {
+                        scalar = None;
+                    }
+                    if let Some(c) = progress.scalar {
+                        search.scalar(c, part.structure.work, &clock)?;
+                    }
+                    if progress.status == crate::html_text::Status::Complete {
+                        break 'text;
+                    }
+                } else {
+                    if let Some(c) = scalar.take() {
+                        search.scalar(c, part.structure.work, &clock)?;
+                    }
+                    if ended {
+                        break 'text;
+                    }
                 }
             }
         }
@@ -364,6 +371,28 @@ mod tests {
             );
         });
         outcome
+    }
+    #[test]
+    fn text_search_batches_snapshot_checks_and_preserves_tail_matches() {
+        let timer = crate::blob_part_json::tests::Timer::new();
+        let source = format!(
+            "Content-Type: text/html;charset=UTF-8\r\n\r\n<p>{} needle</p>",
+            "plain ".repeat(1024)
+        );
+        crate::store_fs::with_pinned_fixture(source.as_bytes(), &timer, |mut pin| {
+            let before = timer.samples();
+            assert_eq!(
+                search_verified(
+                    &mut pin,
+                    &Limits::default(),
+                    &mut Search::parse("needle").unwrap(),
+                    &Fixed,
+                    &mut work(100_000_000)
+                ),
+                Ok(true)
+            );
+            assert!(timer.samples() - before < 5000);
+        });
     }
     #[test]
     fn attached_identity_messages_search_headers_and_text_as_separate_fields() {

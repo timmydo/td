@@ -383,3 +383,33 @@ impl Frame {
         })
     }
 }
+
+pub(crate) const SCALAR_BATCH_TURNS: usize = 64;
+
+/// Keep native snapshot checks outside a bounded group of scalar turns.
+/// Each child still owns its original work meter and fresh clock checks.
+pub(crate) fn poll_json_batch<E: Copy>(
+    output: &mut [u8],
+    invalid: E,
+    mut poll: impl FnMut(&mut [u8]) -> Result<td_json::string::Progress, E>,
+) -> Result<td_json::string::Progress, E> {
+    use td_json::string::{Progress, Status};
+    let mut written = 0usize;
+    for _ in 0..SCALAR_BATCH_TURNS {
+        let progress = poll(output.get_mut(written..).ok_or(invalid)?)?;
+        written = written
+            .checked_add(progress.written)
+            .filter(|&n| n <= output.len())
+            .ok_or(invalid)?;
+        if progress.status != Status::Yield || written == output.len() {
+            return Ok(Progress {
+                written,
+                status: progress.status,
+            });
+        }
+    }
+    Ok(Progress {
+        written,
+        status: Status::Yield,
+    })
+}

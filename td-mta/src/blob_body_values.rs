@@ -381,6 +381,22 @@ impl Value<'_, '_, '_> {
         let result = self.step(now, output);
         self.outcome(result)
     }
+    /// Batch scalar decoding after metadata has completed.
+    pub fn poll_batch(
+        &mut self,
+        now: Tick,
+        output: &mut [u8],
+    ) -> Result<blob_body_value::Progress, Error> {
+        self.check_deadline(now)?;
+        let result = if self.metadata.is_some() {
+            self.step(now, output)
+        } else if let Some(encoded) = self.encoded.as_mut() {
+            encoded.poll_batch(output).map_err(Error::Value)
+        } else {
+            Err(Error::State)
+        };
+        self.outcome(result)
+    }
     fn step(&mut self, now: Tick, output: &mut [u8]) -> Result<blob_body_value::Progress, Error> {
         if let Some(child) = self.metadata.as_mut() {
             if child.poll(now).map_err(Error::Metadata)? == mime_part_headers::Status::Complete {

@@ -168,6 +168,15 @@ impl<'p, 'v, 'c, 'b, 'o, 'n, 'w, 'i, 't> Cursor<'p, 'v, 'c, 'b, 'o, 'n, 'w, 'i, 
         let result = self.step(now, output);
         self.outcome(result)
     }
+    /// Batch only scalar decoding; metadata retains its existing bounded turns.
+    pub fn poll_batch(&mut self, now: Tick, output: &mut [u8]) -> Result<Progress, Error> {
+        self.check_deadline(now)?;
+        let result = match self.stage.as_mut() {
+            Some(Stage::Preview(child)) => child.poll_batch(output).map_err(Error::Preview),
+            _ => self.step(now, output),
+        };
+        self.outcome(result)
+    }
     fn step(&mut self, now: Tick, output: &mut [u8]) -> Result<Progress, Error> {
         match self.stage.as_mut().ok_or(Error::State)? {
             Stage::Empty(original, position, _) => {

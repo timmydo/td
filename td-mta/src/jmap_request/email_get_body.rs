@@ -422,7 +422,7 @@ fn write_verified_inner(
         )
         .map_err(mime)?;
         loop {
-            let p = preview.poll(now(clock)?, &mut chunk).map_err(mime)?;
+            let p = preview.poll_batch(now(clock)?, &mut chunk).map_err(mime)?;
             worker.append(chunk.get(..p.written).ok_or(Error::State)?)?;
             if p.status == crate::blob_selected_preview::Status::Complete {
                 break;
@@ -474,7 +474,7 @@ fn write_verified_inner(
                         )
                         .map_err(mime)?;
                     loop {
-                        let p = value.poll(now(clock)?, &mut chunk).map_err(mime)?;
+                        let p = value.poll_batch(now(clock)?, &mut chunk).map_err(mime)?;
                         worker.append(chunk.get(..p.written).ok_or(Error::State)?)?;
                         if p.status == crate::blob_body_value::Status::Complete {
                             break;
