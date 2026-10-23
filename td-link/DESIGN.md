@@ -17,6 +17,18 @@ driver has the linker, libc and libgcc it links in its closure. A host
 Cargo build without them is test tooling and refuses to link. Nothing in
 the environment changes them.
 
+The image instead carries the `td-link-runtime` variant as `/bin/cc` and
+`/bin/td-link`. It compiles in the same glibc and gcc-runtime paths but no
+Rust store reference. With `RUSTC` set it asks that compiler for its sysroot
+and selects its `rust-lld`; the compiler launcher and Cargo set `RUSTC`,
+and the native bootstrap pins it before changing HOME to private scratch.
+With `RUSTC` unset it runs `/bin/td-rust path`, which prepares the pinned
+toolchain in the invoking account's cache and returns its root. Resolution
+or download errors stop the link. This runtime variant permits the account
+to select its compiler, as Cargo already does. The ordinary recipe driver never invokes the downloader and
+continues to use only its declared store inputs. Both variants use the
+same argument validation and link plan.
+
 ## What it accepts
 
 The driver accepts the arguments rustc 1.96's GNU-cc linker flavor

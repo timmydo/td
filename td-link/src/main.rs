@@ -67,8 +67,49 @@ fn run_lld(
     Ok(status)
 }
 
+/// Cargo and the native bootstrap pin RUSTC before isolating HOME. Keep
+/// the linker with that compiler instead of preparing a second cache.
+fn runtime_lld(rustc: Option<OsString>) -> Result<String, String> {
+    let mut command = if let Some(rustc) = rustc {
+        let mut command = Command::new(rustc);
+        command.args(["--print", "sysroot"]);
+        command
+    } else {
+        let mut command = Command::new("/bin/td-rust");
+        command.arg("path");
+        command
+    };
+    let output = command
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        .map_err(|e| format!("td-link: resolve Rust: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("td-link: resolve Rust exited {}", output.status));
+    }
+    let root = std::str::from_utf8(&output.stdout)
+        .map_err(|_| "td-link: invalid Rust path")?
+        .trim_end();
+    if !std::path::Path::new(root).is_absolute() || root.contains(['\n', '\r', '\0']) {
+        return Err("td-link: invalid Rust path".into());
+    }
+    Ok(format!(
+        "{root}/lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-lld"
+    ))
+}
+
 fn run() -> Result<ExitCode, String> {
-    let toolchain = compiled()?;
+    let compiled = compiled()?;
+    let downloaded;
+    let toolchain = if option_env!("TD_LINK_ON_DEMAND") == Some("1") {
+        downloaded = runtime_lld(std::env::var_os("RUSTC"))?;
+        Toolchain {
+            lld: &downloaded,
+            glibc: compiled.glibc,
+            runtime: compiled.runtime,
+        }
+    } else {
+        compiled
+    };
     let (args, response) = response::expand(std::env::args_os().skip(1).collect())?;
     let plan = plan::plan(args, &toolchain)?;
     plan.check_inputs()?;
@@ -106,6 +147,26 @@ mod tests {
         if option_env!("TD_LINK_LLD").is_none() {
             assert!(compiled().unwrap_err().contains("target recipe"));
         }
+    }
+
+    #[test]
+    fn runtime_linker_uses_selected_compiler_without_cache_lookup() {
+        let dir = TempDir::new("td-link-selected-rust").unwrap();
+        let compiler = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+        let output = Command::new(&compiler)
+            .args(["--print", "sysroot"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let root = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(
+            runtime_lld(Some(compiler)).unwrap(),
+            format!(
+                "{}/lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-lld",
+                root.trim_end()
+            )
+        );
+        assert!(runtime_lld(Some(dir.join("missing-compiler").into_os_string())).is_err());
     }
 
     /// The response file goes beside the output, holds the arguments LLD

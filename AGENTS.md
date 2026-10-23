@@ -215,16 +215,21 @@ Changing the root's packages is a reviewed lock change.
 
 ## Rust toolchain and dependencies
 
-td ships upstream's prebuilt Rust 1.96.0 for `x86_64-unknown-linux-gnu`: the
+td uses upstream's prebuilt Rust 1.96.0 for `x86_64-unknown-linux-gnu`: the
 rustc, rust-std, Cargo and Clippy release components, each a source pin with
 an upstream URL and its channel-manifest SHA-256. The `rust-toolchain`
 recipe's `rust-dist` transform assembles them, links td glibc,
 gcc-runtime's libgcc_s and td zlib into the tree, and relinks every shipped
 executable onto td glibc's loader; it compiles nothing. The toolchain,
 rust-lld and its LLVM included, is a build-tool trust root like the Debian
-build root: unmarked, executed by recipes, shipped in the image, and named
+build root: unmarked, executed by recipes, and named
 by a provenance claim (`upstream-rust`) for every closure that contains
-it. Every Rust output links its prebuilt standard library. A
+it. The image ships launchers, not the toolchain: `td-rust` downloads the
+same pinned components on first use into the invoking account's private
+cache. Recipe builds retain their declared `rust-toolchain` input; the
+account cache is never a target recipe input. `td-link/DESIGN.md` specifies
+the runtime linker and `APPLICATIONS.md` §G specifies the downloader.
+Every Rust output links its prebuilt standard library. A
 stronger claim needs a separately specified diverse bootstrap or
 diverse-double-compilation proof. Every Rust output a td recipe builds,
 Cargo's build scripts and proc macros included, links through `td-link`

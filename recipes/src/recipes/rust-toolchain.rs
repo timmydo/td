@@ -1,6 +1,6 @@
 use crate::types::{CheckRunner, Recipe, RecipeCheck};
 
-// rust-toolchain is the shipped Rust 1.96.0 toolchain: upstream's prebuilt
+// rust-toolchain is the recipe build input for Rust 1.96.0 toolchain: upstream's prebuilt
 // x86_64-unknown-linux-gnu rustc, rust-std, Cargo and Clippy release
 // components, pinned by their channel-manifest SHA-256. It is a declared
 // build-tool trust root (AGENTS.md "Rust toolchain"), not a source build.

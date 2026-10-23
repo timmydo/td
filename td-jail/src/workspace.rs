@@ -81,6 +81,7 @@ pub(crate) const HOST_ETC: &[&str] = &[
     "services",
     "shells",
     "ssl",
+    "td-rust.tsv",
     "terminfo",
     "timezone",
 ];

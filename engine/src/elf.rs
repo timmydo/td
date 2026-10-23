@@ -1,8 +1,7 @@
 //! Read-only ELF inspection shared by the image build and the target.
 //!
-//! The builder's ELF writer (`builder/src/elf.rs`) rewrites interpreters and
-//! run-paths for td's own toolchain; that stays in the builder and never
-//! reaches the target (APPLICATIONS.md §G). What lives here only reads: the
+//! The separate `elf_edit` module retargets the pinned Rust toolchain during
+//! builds and first-use downloads (APPLICATIONS.md §G). What lives here only reads: the
 //! class-dispatching header parser, the `PT_INTERP`, run-path and `DT_NEEDED`
 //! readers, the bounded link search the dynamic-application validator runs
 //! over hostile payloads, and the executable and static-shape assertions.

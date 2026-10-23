@@ -2065,7 +2065,8 @@ served the repository client:
 |---|---|
 | `builder/src/sandbox.rs` | **rewrite** as `td-jail` — the namespace mechanics are the model, but its build-user ids, offline network, `/gnu/store` paths and trust model are all wrong here |
 | `builder/src/store.rs` | **read, do not port** — the store semantics are the control plane's, and with packages in the store there is nothing on the target that creates a store path |
-| `builder/src/elf.rs` | **never** — see §G. Its writers stay in the builder; the read-only half (header parser, `PT_INTERP`, run-path and `DT_NEEDED` readers, the bounded link search, executable and static assertions) is `engine/src/elf.rs`, shared with the image build |
+| `builder/src/elf.rs` | **never** — see §G. Its debug handling stays in the builder; the read-only half (header parser, `PT_INTERP`, run-path and `DT_NEEDED` readers, the bounded link search, executable and static assertions) is `engine/src/elf.rs`, shared with the image build |
+| `engine/src/rust_dist.rs`, `engine/src/elf_edit.rs`, `engine/src/tar.rs` | **reuse for pinned Rust downloads only** — §G; application admission never invokes the ELF writer |
 | `engine/src/dynamic_application.rs`, `engine/src/ostree_deploy.rs`, `engine/src/elf.rs` | **reuse on the target for §W.9 alone** — the dynamic validator, the deploy materializer and the read-only ELF inspection they use, moved from the builder (the ELF readers lose their panicking indexing, nothing else) so `td-app` runs the implementation the image build ran on the pinned path; the materializer's no-replace publication is a parameter, so td-engine gains no syscall |
 | `engine/src/gzip.rs` | **reuse in the control plane, and on the target for §W.9 alone** — builder source extraction and the bounded deploy importer share this std-only gzip/raw-DEFLATE implementation; on the target only `td-app` decompresses, and only Flathub objects it has authenticated |
 | `net/src/http.rs`, `td-feed` | **reuse in the control plane, and on the target through `td-fetchd` and `td-app`** — exact immutable OSTree objects use td-net's bounded HTTP/TLS fetcher and a commit-specific authenticated local cache; the target's network clients are the same tier's fetch service (§W.8) and td-app's bounded Flathub reader (§W.9), and there is no target repository client |
@@ -2520,7 +2521,7 @@ linked**, asserted by `Step::AssertStatic` in about twenty-eight
 recipes; nothing in the image then had an interpreter at all. Same
 conclusion, and the difference mattered because the stated reason would
 survive td shipping one dynamically-linked binary and the real one would
-not. td now ships one such set: the upstream Rust toolchain, whose
+not. Dynamically linked td userland and the on-demand Rust toolchain
 executables carry td glibc's store loader as `PT_INTERP`, never `/lib64`;
 the conclusion still holds because no seed's `/lib64` interpreter
 resolves on the image root. So —
@@ -7041,6 +7042,42 @@ of memory bandwidth. **"Draws a window" does not imply watchable video.**
   `subdirectories`, `add-ld-path`, `versions`, `autodelete` and
   `no-autodownload` are parsed, and **unknown extension directives are
   refused rather than ignored**.
+
+**On-demand Rust.** The image's `/bin/rustc`, `rustdoc`, `cargo`,
+`cargo-clippy` and `clippy-driver` launch the `td-net rust` applet, also
+named `/bin/td-rust`. No compiler, LLVM or standard-library archive ships
+in the root image. `/etc/td-rust.tsv` contains the running deployment's
+four upstream component URLs and SHA-256 pins, version and td runtime
+paths. These are generated from the recipe pins. The account may prepare
+Rust explicitly with `td-rust fetch`; `td-rust path` also prepares it and
+prints its root. Development workspace jails bind this public configuration
+read-only with their other compiler configuration and retain their existing
+network and writable-home permissions. Isolated reviews prepare the account
+cache before confinement, copy it into their existing executable scratch,
+and select that copy through the controller's typed compiler field
+(`td-agent/DESIGN.md` §2). Their HOME stays noexec and their network stays
+isolated; they never mount or hardlink the account cache.
+
+First use downloads all four components with a shared 30-minute deadline
+and a 512 MiB bound per archive, verifies every checksum before unpacking,
+and uses `engine/src/rust_dist.rs` and `engine/src/elf_edit.rs` to assemble
+and retarget exactly those pinned tools onto td glibc. This is the sole
+runtime ELF-rewriting exception: application admission still never rewrites
+ELF. Recipe builds use the same transform with their declared store inputs.
+The shared tar readers are in `engine/src/tar.rs`; no external unpacker runs.
+
+The toolchain lives under `$HOME/.td-rust/<configuration-sha256>`, behind an
+account-owned 0700 directory and a kernel file lock. Staging is private,
+fully synced and renamed into place only after assembly succeeds. Failed
+or interrupted staging is discarded on the next attempt. Cached use checks
+the completion identity and executable shape without a network request;
+it does not rehash the whole toolchain and does not protect against the
+same account modifying its cache. A damaged published cache fails closed;
+removing that version directory permits a fresh download. The configuration
+format version must change if a transform change invalidates existing caches.
+Updates and rollback select their own configuration identity; old caches
+remain available, and the user may remove them when no longer needed.
+
 
 ---
 

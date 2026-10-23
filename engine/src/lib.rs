@@ -58,8 +58,12 @@
 // See td-install/DESIGN.md §§5–7 for the shared-source contract.
 pub mod application;
 pub mod application_spec;
+pub mod bzip2;
 pub mod cpio;
 pub mod crc32;
+pub mod elf_edit;
+pub mod rust_dist;
+pub mod tar;
 // `debian_root` parses recipes/src/debian-root.lock: td-recipe-eval lists
 // its pins, td-builder assembles and admits the root against it.
 pub mod debian_root;

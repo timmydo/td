@@ -312,7 +312,7 @@ metadata or paid completions. The parent PATH's canonical system/profile
 directories remain inherited under §8. Generic PATH aliases to executables
 in that closure are preserved by the workspace jail (APPLICATIONS.md §C),
 including a host-provided `~/.local/bin/cc` symlink. Standard compiler commands
-are the host's responsibility. td-agent creates no compiler executable,
+are the host's responsibility. td-agent creates no compiler wrapper,
 special argv[0] mode or dispatch variable. No agent-set CC or source linker
 edit is needed when the host supplies ordinary compiler commands, including
 for plain rustc. Compile/link compatibility is checked by probes.
@@ -345,6 +345,26 @@ explicit model-visible limitations, not test passes. On a td system, whose
 `cc` is td-link, the C probe reports that limitation and the Rust probe
 links. These probes establish
 basic compilation/linking, not every package's required tool or library.
+
+On td, review preparation first runs the installed `/bin/td-rust path`
+outside confinement to prepare the account's pinned compiler cache. It
+copies the selected tree into the review's existing executable scratch;
+regular files are independent copies, never hardlinks into the account
+cache. Links may resolve within that tree or the jail's existing system
+trees. Copying is bounded to 2 GiB, 20,000 entries and depth 64, and a
+failed copy is removed. Preparation errors are explicit limitations before
+paid completions. Hosts without `/etc/td-rust.tsv` keep their existing
+system compiler selection.
+
+The controller supplies the copied `bin` through a typed `rust_bin` field
+on review commands, not an inherited environment variable or model tool
+parameter. The tool host requires it inside an existing filesystem grant,
+prepends it to command PATH, and sets RUSTC and RUSTDOC there. This applies
+to probes, Cargo metadata, typed tests and review shell commands. The
+private HOME remains noexec, networking remains isolated, Cargo remains
+offline, and the account cache is never mounted in the review. Scratch
+cleanup removes the copy; subsequent reviews reuse the account's downloaded
+bytes. No new jail permission or filesystem grant is introduced.
 
 Repository reviews prepare a private Cargo home, expand explicit relative
 path dependencies and non-wildcard workspace members from tracked manifests,

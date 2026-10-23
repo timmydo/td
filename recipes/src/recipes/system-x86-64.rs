@@ -4830,8 +4830,9 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
         "{in:fd}".into(),
         "{in:openssh-x86-64}".into(),
         "{in:git-x86-64}".into(),
-        "{in:rust-toolchain}".into(),
-        "{in:td-link}".into(),
+        "{in:gcc-runtime}".into(),
+        "{in:zlib-x86-64}".into(),
+        "{in:td-link-runtime}".into(),
     ];
     runtime_roots.extend(
         application_payload_inputs(sys)
@@ -4966,22 +4967,42 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
         target: "{in:td-busd}/bin/td-busd".into(),
         link: "{root}/real-root/bin/td-busd".into(),
     });
-    // One standard image includes the Rust development toolchain: upstream
-    // Rust on td's runtime, linked through td-link. rustc's and Cargo's
-    // default linker is `cc` from PATH, so /bin/cc is td-link too: it links
-    // Rust and refuses to compile C, which builds in the Debian build root.
-    for name in ["rustc", "rustdoc", "cargo", "cargo-clippy", "clippy-driver"] {
+    // Small launchers fetch the pinned toolchain on first use.
+    for name in [
+        "td-rust",
+        "rustc",
+        "rustdoc",
+        "cargo",
+        "cargo-clippy",
+        "clippy-driver",
+    ] {
         steps.push(Step::Symlink {
-            target: format!("{{in:rust-toolchain}}/bin/{name}"),
+            target: "{in:td-net}/bin/td-net".into(),
             link: format!("{{root}}/real-root/bin/{name}"),
         });
     }
     for name in ["td-link", "cc"] {
         steps.push(Step::Symlink {
-            target: "{in:td-link}/bin/td-link".into(),
+            target: "{in:td-link-runtime}/bin/td-link".into(),
             link: format!("{{root}}/real-root/bin/{name}"),
         });
     }
+    let mut rust_config = format!("td-rust-v1\n{}\n{}\n{{in:gcc-runtime}}/lib/libgcc_s.so.1\n{{in:zlib-x86-64}}/lib/libz.so.1\n", super::rust_toolchain::recipe().version, crate::shared::BUILD_ROOT_GLIBC);
+    for (name, key) in [
+        ("rustc", "rust-rustc-dist"),
+        ("std", "rust-std-dist"),
+        ("cargo", "rust-cargo-dist"),
+        ("clippy", "rust-clippy-dist"),
+    ] {
+        let pin =
+            crate::source_pins::by_key(key).ok_or_else(|| format!("missing Rust pin {key}"))?;
+        rust_config.push_str(&format!("{name}\t{}\t{}\n", pin.url, pin.sha256));
+    }
+    steps.push(Step::WriteFile {
+        path: "{root}/real-root/etc/td-rust.tsv".into(),
+        content: rust_config,
+        exec: false,
+    });
     // /bin/td-fetchd — the fetch service (APPLICATIONS.md §W.8), an applet of
     // the target-built td-net multicall: the link's basename selects it, as
     // the applet links do on the host. Named in full by the fetchd unit's
@@ -5135,10 +5156,6 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
             "--exclude-registry",
             "{root}/real-root/etc/td-applications.tsv",
             "{root}/real-root/etc/td-profiler-application-roots.tsv",
-            // The upstream Rust toolchain ships no debug companions; its
-            // objects are a coverage boundary (td-profiler/DESIGN.md §7).
-            "--exclude-store-item",
-            "{in:rust-toolchain}",
         ],
     ));
     Ok(steps)
@@ -5337,7 +5354,6 @@ fn shape_check() -> String {
      [ \"$(head -n 1 \"$pindex\")\" = td-profiler-objects-v1 ] || { echo 'root tree: deployment profiler object index has the wrong header' >&2; exit 1; }; \
      netrow=$(grep -F \"{in:td-net}/bin/td-net\" \"$pindex\") || { echo 'root tree: deployment profiler object index omits td-net' >&2; exit 1; }; \
      case \"$netrow\" in *';assembly-boundary=1'*) : ;; *) echo 'root tree: deployment profiler object index omits the td-net assembly boundary' >&2; exit 1;; esac; \
-     if grep -F \"{in:rust-toolchain}/\" \"$pindex\" >/dev/null; then echo 'root tree: deployment profiler object index lists the companion-less upstream Rust toolchain' >&2; exit 1; fi; \
      [ \"$(readlink \"$root/bin/td-jail\" 2>/dev/null)\" = \"{in:td-jail}/bin/td-jail\" ] || { echo 'root tree: /bin/td-jail is not a symlink to the staged confinement boundary' >&2; exit 1; }; \
      tdj=\"{root}/real-root{in:td-jail}/bin/td-jail\"; { [ -f \"$tdj\" ] && [ -x \"$tdj\" ]; } || { echo 'root tree: td-jail is not packed and executable, so the running-kernel transition oracle cannot run' >&2; exit 1; }; \
      [ \"$(readlink \"$root/bin/td-seatd\" 2>/dev/null)\" = \"{in:td-seatd}/bin/td-seatd\" ] || { echo 'root tree: /bin/td-seatd is not a symlink to the staged single-user seat assigner' >&2; exit 1; }; \
@@ -5832,11 +5848,10 @@ pub fn recipe() -> Recipe {
             "td-portal",
             "td-secret",
             "td-net",
-            "rust-toolchain",
-            // The upstream toolchain's runtime, which its lib/ links to.
+            // Libraries retained for the on-demand compiler and linker.
             "gcc-runtime",
             "zlib-x86-64",
-            "td-link",
+            "td-link-runtime",
         ]))
         .steps(steps);
     let application_inputs = application_payload_inputs(&SYSTEM);
@@ -6449,8 +6464,6 @@ mod tests {
                     "--exclude-registry",
                     "{root}/real-root/etc/td-applications.tsv",
                     "{root}/real-root/etc/td-profiler-application-roots.tsv",
-                    "--exclude-store-item",
-                    "{in:rust-toolchain}",
                 ]
         )));
         assert!(recipe()
@@ -9319,8 +9332,9 @@ mod tests {
             "{in:fd}".to_string(),
             "{in:openssh-x86-64}".to_string(),
             "{in:git-x86-64}".to_string(),
-            "{in:rust-toolchain}".to_string(),
-            "{in:td-link}".to_string(),
+            "{in:gcc-runtime}".to_string(),
+            "{in:zlib-x86-64}".to_string(),
+            "{in:td-link-runtime}".to_string(),
             format!("{{payload:{CLAUDE_NAME}}}"),
             format!("{{payload:{FIREFOX_NAME}}}"),
             format!("{{payload:{TD_MAIL_NAME}}}"),
@@ -9381,13 +9395,13 @@ mod tests {
             ),
             ("git-upload-pack", "{in:git-x86-64}/bin/git-upload-pack"),
             ("td-test-https", "{in:td-net}/bin/td-net"),
-            ("rustc", "{in:rust-toolchain}/bin/rustc"),
-            ("rustdoc", "{in:rust-toolchain}/bin/rustdoc"),
-            ("cargo", "{in:rust-toolchain}/bin/cargo"),
-            ("cargo-clippy", "{in:rust-toolchain}/bin/cargo-clippy"),
-            ("clippy-driver", "{in:rust-toolchain}/bin/clippy-driver"),
-            ("td-link", "{in:td-link}/bin/td-link"),
-            ("cc", "{in:td-link}/bin/td-link"),
+            ("rustc", "{in:td-net}/bin/td-net"),
+            ("rustdoc", "{in:td-net}/bin/td-net"),
+            ("cargo", "{in:td-net}/bin/td-net"),
+            ("cargo-clippy", "{in:td-net}/bin/td-net"),
+            ("clippy-driver", "{in:td-net}/bin/td-net"),
+            ("td-link", "{in:td-link-runtime}/bin/td-link"),
+            ("cc", "{in:td-link-runtime}/bin/td-link"),
         ] {
             let link = format!("{{root}}/real-root/bin/{name}");
             let targets: Vec<&str> = steps
@@ -9407,14 +9421,43 @@ mod tests {
             );
         }
 
+        let rust_config = steps
+            .iter()
+            .find_map(|step| match step {
+                Step::WriteFile { path, content, .. }
+                    if path == "{root}/real-root/etc/td-rust.tsv" =>
+                {
+                    Some(content)
+                }
+                _ => None,
+            })
+            .expect("Rust fetch configuration");
+        assert!(rust_config.starts_with(&format!(
+            "td-rust-v1\n{}\n",
+            super::super::rust_toolchain::recipe().version
+        )));
+        for key in [
+            "rust-rustc-dist",
+            "rust-std-dist",
+            "rust-cargo-dist",
+            "rust-clippy-dist",
+        ] {
+            let pin = crate::source_pins::by_key(key).unwrap();
+            assert!(rust_config.contains(&format!("\t{}\t{}\n", pin.url, pin.sha256)));
+        }
         let native_inputs = recipe().native_inputs.expect("system native inputs");
-        for required in ["rust-toolchain", "gcc-runtime", "zlib-x86-64", "td-link"] {
+        for required in ["gcc-runtime", "zlib-x86-64", "td-link-runtime"] {
             assert!(
                 native_inputs.iter().any(|input| input == required),
                 "shipped input {required} must be declared"
             );
         }
-        for forbidden in ["libressl-x86-64", "gcc-runtime-stage1"] {
+        for forbidden in [
+            "libressl-x86-64",
+            "gcc-runtime-stage1",
+            "rust-toolchain",
+            "td-link",
+        ] {
             assert!(
                 !native_inputs.iter().any(|input| input == forbidden),
                 "build-only input {forbidden} must not be a direct system input"

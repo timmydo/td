@@ -8442,6 +8442,7 @@ mod tests {
                 "td-jail",
                 "td-kexec",
                 "td-link",
+                "td-link-runtime",
                 "td-login",
                 "td-mail",
                 "td-net",

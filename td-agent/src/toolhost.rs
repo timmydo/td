@@ -602,6 +602,7 @@ fn act(
                 runner,
                 cargo_home,
                 build_env,
+                rust_bin,
                 ..
             } = call
             {
@@ -612,6 +613,25 @@ fn act(
                 std::fs::create_dir_all(&target)
                     .map_err(|e| format!("{}: {e}", target.display()))?;
                 process.envs(build_env.iter().cloned());
+                if let Some(bin) = rust_bin {
+                    let bin = config.path(bin, "rust_bin")?;
+                    if !bin.is_dir() {
+                        return Err("prepared Rust bin is not a directory".into());
+                    }
+                    let inherited = process
+                        .get_envs()
+                        .find_map(|(key, value)| (key == "PATH").then_some(value).flatten())
+                        .map(std::ffi::OsStr::to_os_string)
+                        .unwrap_or_default();
+                    let path = std::env::join_paths(
+                        std::iter::once(bin.clone()).chain(std::env::split_paths(&inherited)),
+                    )
+                    .map_err(|error| format!("prepared Rust PATH: {error}"))?;
+                    process
+                        .env("PATH", path)
+                        .env("RUSTC", bin.join("rustc"))
+                        .env("RUSTDOC", bin.join("rustdoc"));
+                }
                 process
                     .env("CARGO_TARGET_DIR", target)
                     .env("CARGO_NET_OFFLINE", REVIEW_CARGO_OFFLINE);
@@ -1098,6 +1118,7 @@ mod tests {
                 cargo_args: None,
                 program: None,
                 build_env: Vec::new(),
+                rust_bin: None,
                 command: format!("head -c {expected} /dev/zero; printf '\\377'"),
                 timeout_ms: Some(30_000),
                 workdir: None,
@@ -1144,6 +1165,7 @@ mod tests {
         let done = act(&Call::ReviewShell {
             cargo_args: None,
             program: None, build_env: Vec::new(),
+                rust_bin: None,
             command: "(i=0; while [ $i -lt 8 ]; do printf .; sleep 0.1; i=$((i+1)); done; printf TRAILING) & printf EARLY".into(),
             timeout_ms: Some(5_000), workdir: None,
             target_dir: dir.join("target").display().to_string(),

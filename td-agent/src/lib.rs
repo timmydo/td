@@ -86,6 +86,7 @@ pub mod review_log;
 pub mod review_metrics;
 pub mod review_native;
 pub(crate) mod review_routing;
+mod review_rust;
 pub mod review_session;
 pub mod review_workspace;
 pub mod rules;

@@ -20,7 +20,6 @@ mod affected;
 mod build;
 mod build_daemon;
 mod build_root;
-mod bzip2;
 mod cargo_lock;
 mod check_host;
 mod check_loop;

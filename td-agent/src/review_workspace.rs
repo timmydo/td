@@ -533,6 +533,11 @@ impl Workspace {
                 cargo_args: Some(crate::review_cargo::arguments(arguments, &self.checkout)?),
                 program: None,
                 build_env: self.native.env.clone(),
+                rust_bin: self
+                    .native
+                    .rust_bin
+                    .as_ref()
+                    .map(|path| path.display().to_string()),
                 timeout_ms: Some(MAX_SHELL_TIMEOUT_MS),
                 workdir: None,
                 runner: self.runner.clone(),
@@ -562,6 +567,11 @@ impl Workspace {
                 cargo_args: Some(args),
                 program: None,
                 build_env: self.native.env.clone(),
+                rust_bin: self
+                    .native
+                    .rust_bin
+                    .as_ref()
+                    .map(|path| path.display().to_string()),
                 timeout_ms: Some(timeout_ms),
                 workdir: None,
                 runner: self.runner.clone(),
@@ -584,6 +594,11 @@ impl Workspace {
                 cargo_args: Some(args),
                 program: Some(program.into()),
                 build_env: self.native.env.clone(),
+                rust_bin: self
+                    .native
+                    .rust_bin
+                    .as_ref()
+                    .map(|path| path.display().to_string()),
                 timeout_ms: Some(15_000),
                 workdir: None,
                 runner: None,
@@ -610,6 +625,11 @@ impl Workspace {
                 cargo_args: None,
                 program: None,
                 build_env: self.native.env.clone(),
+                rust_bin: self
+                    .native
+                    .rust_bin
+                    .as_ref()
+                    .map(|path| path.display().to_string()),
                 timeout_ms: Some(
                     timeout_ms
                         .unwrap_or(DEFAULT_SHELL_TIMEOUT_MS)

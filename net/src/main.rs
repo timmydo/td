@@ -43,6 +43,13 @@ mod http;
 mod launch;
 mod openpgp;
 mod ostree;
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../../engine/src/elf_synth.rs"]
+mod rust_elf_synth;
+#[cfg(test)]
+use td_engine::elf;
+mod rust_toolchain;
 mod sig;
 mod subst;
 mod test_https;
@@ -106,6 +113,10 @@ fn main() {
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("");
+    if base == "td-rust" || rust_toolchain::is_tool(base) {
+        rust_toolchain::run(&args);
+        return;
+    }
     match base {
         "td-app" => app::run(&args),
         "td-fetch" => fetch::run(&args),
@@ -127,6 +138,7 @@ fn main() {
         _ => {
             let applet = match args.get(1).map(String::as_str) {
                 Some("app") => "td-app",
+                Some("rust") => "td-rust",
                 Some("fetch") => "td-fetch",
                 Some("feed") => "td-feed",
                 Some("subst") => "td-subst",
@@ -137,7 +149,7 @@ fn main() {
                 Some("test-https") => "td-test-https",
                 _ => {
                     eprintln!(
-                        "usage: td-net <app|fetch|feed|subst|deploy|fetchd|egressd|launch|test-https> ...\n  \
+                        "usage: td-net <app|rust|fetch|feed|subst|deploy|fetchd|egressd|launch|test-https> ...\n  \
                          (or invoke via the td-fetch / td-feed / td-subst / td-deploy / \
                          td-fetchd / td-test-https applet links)"
                     );
@@ -149,6 +161,7 @@ fn main() {
             argv.extend_from_slice(args.get(2..).unwrap_or(&[]));
             match applet {
                 "td-app" => app::run(&argv),
+                "td-rust" => rust_toolchain::run(&argv),
                 "td-fetch" => fetch::run(&argv),
                 "td-feed" => feed::run(&argv),
                 "td-deploy" => deploy::run(&argv),

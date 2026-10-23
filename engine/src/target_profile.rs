@@ -116,6 +116,7 @@ pub const RUST_PROFILED_RECIPES: &[&str] = &[
     "td-jail",
     "td-kexec",
     "td-link",
+    "td-link-runtime",
     "td-link-test",
     "td-login",
     "td-mail",

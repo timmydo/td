@@ -18,6 +18,7 @@ const TOOL_VARS: &[&str] = &["CC", "CXX", "AR", "CMAKE"];
 #[derive(Default)]
 pub(crate) struct Native {
     pub env: Vec<(String, String)>,
+    pub rust_bin: Option<PathBuf>,
 }
 
 fn system(path: &Path) -> bool {
@@ -126,6 +127,27 @@ pub(crate) fn prepare(
     }
     let aliases = crate::jail::host_aliases();
     let mut limitations = Vec::new();
+    match crate::review_rust::prepare(&workspace.scratch) {
+        Ok(bin) => workspace.native.rust_bin = bin,
+        Err(error) => limitations.push(format!("Rust preparation unavailable: {error}")),
+    }
+    journal.event(
+        "review_rust_toolchain",
+        Json::Obj(vec![
+            (
+                "bin".into(),
+                workspace
+                    .native
+                    .rust_bin
+                    .as_ref()
+                    .map_or(Json::Null, |path| Json::Str(path.display().to_string())),
+            ),
+            (
+                "publication".into(),
+                Json::Str("private copy in executable scratch; account cache unchanged".into()),
+            ),
+        ]),
+    )?;
     for key in PATH_VARS {
         if let Some(value) = std::env::var_os(key) {
             if !value.is_empty() && std::env::split_paths(&value).any(|p| p.as_os_str().is_empty())

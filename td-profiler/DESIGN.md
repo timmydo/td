@@ -44,10 +44,10 @@ build-only intermediates which cannot execute in the shipped system, the
 kernel and firmware are separate contracts. Marked foreign application payloads cannot
 acquire frame pointers after the fact; §7 defines their explicit fallback.
 
-The Rust toolchain td ships is upstream's prebuilt release (AGENTS.md "Rust
+The Rust toolchain td fetches on demand is upstream's prebuilt release (AGENTS.md "Rust
 toolchain"), not a source build. Its rustc, Cargo, Clippy, rust-lld and LLVM
-carry no debug companions, and the image's object index excludes its store
-item, so samples in them keep their raw addresses and report as unresolved
+carry no debug companions. The toolchain is absent from the image; its
+account-owned cache is outside the deployment's object index, so samples in them keep their raw addresses and report as unresolved
 (`symbol-coverage-unavailable`) without td attribution.
 Its prebuilt standard library, which every Rust output links, keeps frame
 pointers in only part of its code: each Rust output's assembly-exception

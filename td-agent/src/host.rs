@@ -99,6 +99,7 @@ pub enum Call {
         cargo_args: Option<Vec<String>>,
         program: Option<String>,
         build_env: Vec<(String, String)>,
+        rust_bin: Option<String>,
         timeout_ms: Option<u64>,
         workdir: Option<String>,
         target_dir: String,
@@ -490,6 +491,7 @@ impl Call {
                 cargo_args,
                 program,
                 build_env,
+                rust_bin,
                 timeout_ms,
                 workdir,
                 target_dir,
@@ -504,6 +506,7 @@ impl Call {
                     }),
                 ),
                 ("program", opt_str(program.as_deref())),
+                ("rust_bin", opt_str(rust_bin.as_deref())),
                 (
                     "build_env",
                     Json::Obj(
@@ -632,6 +635,7 @@ impl Call {
                 workdir: maybe("workdir")?,
                 program: maybe("program")?,
                 build_env: crate::review_native::decode_environment(args.get("build_env"))?,
+                rust_bin: maybe("rust_bin")?,
                 target_dir: text("target_dir")?,
                 runner: maybe("runner")?,
                 cargo_home: maybe("cargo_home")?,

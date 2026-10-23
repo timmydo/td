@@ -68,8 +68,11 @@ not a same-UID isolation boundary or an atomic no-replace syscall claim.
 ## Build command
 
 From the checkout root, `./update build` compiles that checkout's builder and
-recipe evaluator offline with the installed `/bin/cargo` and `/bin/rustc`,
-which link through `/bin/cc`, td-link. It selects the native GNU target
+recipe evaluator with the installed `/bin/cargo` and `/bin/rustc` launchers,
+which fetch the running deployment's pinned Rust toolchain on first use.
+`td-rust fetch` can prepare it ahead of time; subsequent compiler use and
+Cargo compilation are offline. A failed download stops before a deployment
+is built or activated. The compiler links through `/bin/cc`, td-link. It selects the native GNU target
 explicitly and keeps control-plane build outputs under
 `.td-build-cache/update-tools`. These locally compiled helpers retain
 control-plane roles; this does not admit them as target recipe tools.

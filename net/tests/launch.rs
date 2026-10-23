@@ -435,3 +435,25 @@ fn loopback_requires_explicit_launch_opt_in() {
     }
     peer.join().unwrap();
 }
+
+#[test]
+fn rust_help_needs_no_home_configuration_or_download() {
+    let output = Command::new(TD_NET)
+        .args(["rust", "--help"])
+        .env_remove("HOME")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8(output.stdout)
+        .unwrap()
+        .starts_with("usage: td-rust"));
+    let output = Command::new(TD_NET)
+        .args(["rust", "fetch", "unexpected"])
+        .env_remove("HOME")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8(output.stderr)
+        .unwrap()
+        .contains("take no arguments"));
+}

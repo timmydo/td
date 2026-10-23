@@ -23,6 +23,15 @@ const RUNTIME: &str = "{in:gcc-runtime}/lib";
 /// Compile td-link linked by `linker` into `output`, with the store paths
 /// it compiles in.
 fn stage(linker: &str, output: &str, link_args: &[&str]) -> Step {
+    stage_with_lld(
+        linker,
+        output,
+        link_args,
+        "{in:rust-toolchain}/lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-lld",
+    )
+}
+
+fn stage_with_lld(linker: &str, output: &str, link_args: &[&str], lld: &str) -> Step {
     let mut args = vec![
         "--edition=2021",
         "--target=x86_64-unknown-linux-gnu",
@@ -35,10 +44,7 @@ fn stage(linker: &str, output: &str, link_args: &[&str]) -> Step {
     args.extend_from_slice(link_args);
     args.extend_from_slice(&["-o", output, "{src}/main.rs"]);
     target_rustc_linked_by("{src}", RUSTC, &args, linker)
-        .env(
-            "TD_LINK_LLD",
-            "{in:rust-toolchain}/lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-lld",
-        )
+        .env("TD_LINK_LLD", lld)
         .env("TD_LINK_GLIBC", &format!("{GLIBC}/lib"))
         .env("TD_LINK_RUNTIME", RUNTIME)
         .env("SOURCE_DATE_EPOCH", "1")
@@ -93,4 +99,38 @@ exec "$TD_RECIPE_EVAL" check-run td-link 1
 "#,
         )
         .with_runner(CheckRunner::BuildOnly)])
+}
+
+/// The image's driver resolves its linker through the verified per-user cache.
+/// It contains no store reference to the recipe's build-only Rust toolchain.
+pub fn runtime_recipe() -> Recipe {
+    let mut steps = vec![Step::MkDir {
+        path: "{out}/bin".into(),
+    }];
+    for (name, content) in [
+        ("main.rs", MAIN_RS),
+        ("plan.rs", PLAN_RS),
+        ("response.rs", RESPONSE_RS),
+    ] {
+        steps.push(Step::WriteFile {
+            path: format!("{{src}}/{name}"),
+            content: content.into(),
+            exec: false,
+        });
+    }
+    steps.push(
+        stage_with_lld(
+            "{in:td-link}/bin/td-link",
+            "{out}/bin/td-link",
+            &[],
+            "on-demand",
+        )
+        .env("TD_LINK_ON_DEMAND", "1"),
+    );
+    steps.push(Step::split_debug_tree("{out}", "/usr/bin/objcopy"));
+    steps.push(Step::assert_static(&["{out}/bin/td-link"]));
+    Recipe::mesboot("td-link-runtime", "0.1")
+        .build_root()
+        .native_inputs(&["rust-toolchain", "td-link", "glibc-x86-64", "gcc-runtime"])
+        .steps(steps)
 }
