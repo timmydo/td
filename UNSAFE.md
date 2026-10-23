@@ -11,8 +11,7 @@ and the code disagree, one of them is a bug.
 In the control-plane engine `unsafe` is confined to the raw-syscall layer
 in `builder/src/sys.rs` and the low-level conversions in `nar.rs` and
 `sandbox.rs`. Those three files carry `#![allow(unsafe_code)]` so builder
-can stay `libc`-free. `builder/src/ostree.rs` passes one safe syscall wrapper to
-td-engine's `ostree_deploy` materializer and carries no unsafe allowance. Every other
+can stay `libc`-free. Every other
 engine crate (the shared `engine` lib and
 `recipes`/`fetch`/`feed`/`subst`) `forbid`s `unsafe_code`. There are TWENTY-THREE
 numbered target-side exceptions, TWENTY-ONE of them live, each a standalone
@@ -206,21 +205,6 @@ not a build-provenance boundary: both the host-seeded builder and the later
 target-built builder contain it. The latter is a distribution artifact used to
 build td on td, but the current boot image does not ship builder and no
 application runtime reaches this surface.
-
-That host-side layer includes `renameat2(2)` with both directory descriptors
-fixed to `AT_FDCWD` and flags fixed to `RENAME_NOREPLACE`. Its only caller is
-`builder/src/ostree.rs`, which passes it as the publication of td-engine's
-authenticated OSTree deploy materializer (`ostree_deploy`) for
-`td-builder ostree-materialize`. Stable `std::fs::rename`
-replaces an empty destination directory, so checking absence before a large
-deploy is decoded leaves a writer race in which one complete result can
-silently replace another. The raw wrapper makes absence part of the atomic
-publication operation. It accepts two NUL-free paths but no caller-selected
-directory descriptor or flags word. The materializer constructs both paths
-below `/proc/self/fd/N` while it holds `N` as the opened destination parent, so
-staging, publication, cleanup and parent synchronization retain one directory
-identity even if its caller-visible path is retargeted. A second caller,
-another flag, or another `*at` operation is an amendment here.
 
 The shared PID-namespace workload boundary uses `close_range(436)` with
 first descriptor 3 and last `u32::MAX`. Before its final fork, namespace

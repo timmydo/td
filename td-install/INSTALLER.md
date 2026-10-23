@@ -234,11 +234,13 @@ active (increment 7), with the parts named at the top remaining.
 The system image carries td-setup, and a live boot (`td.live=1`, which only
 the live selector's handoff sets; td-install/MEDIA.md "Live boot") opens it
 and nothing else: the live session is for installing td. Every stock session
-unit that opens a window (the shell's terminal, Firefox, mail and news),
-places those windows, or proves them in the autotest evidence names the live
-medium's mount, `/run/td-media`, in td-svc's `unless-exists=`
-(td-svc/DESIGN.md §3), so it settles ready without running and what requires
-it, such as boot health after the terminal, still runs. The session's
+unit that opens a window (the shell's terminal, mail and news), places those
+windows, or proves them in the autotest evidence names the live medium's
+mount, `/run/td-media`, in td-svc's `unless-exists=` (td-svc/DESIGN.md §3),
+so each settles ready without running and what requires it, such as boot
+health after the terminal, still runs. Firefox names
+`/run/td-applications-on-demand` instead, which a live boot also has
+(APPLICATIONS.md §W.9). The session's
 services, the secure attention path and td-authd's authority run as on an
 installed boot. The `[setup]` td-svc unit starts the wizard once the
 compositor serves (under the autotest token, also once TLS setup's console

@@ -925,7 +925,14 @@ pub const SYSTEM_PERSIST_READ_MARKER: &str = "TD-PERSIST-READ-OK";
 /// four identity probes after every Firefox oracle has published; the
 /// launches carry no deadline of their own, so a hung payload reds the boot
 /// at the greeter's cap rather than sooner.
-pub const DEFAULT_BOOT_TIMEOUT_SECS: u64 = 2974;
+///
+/// Raised by 900 seconds when the applications left the image
+/// (APPLICATIONS.md §W.9): an oracle's Firefox and Claude Code fetch from
+/// the host's feed before they start, each bounded by the 900-second
+/// `APPLICATION_FETCH` service, and the greeter's horizon starts before
+/// that fetch. Only a fresh volume's first boot spends it; a reused one's
+/// check finds its generation current and returns.
+pub const DEFAULT_BOOT_TIMEOUT_SECS: u64 = 3874;
 pub const QEMU_GUEST_WAIT_MARGIN_SECS: u64 = 30;
 
 /// Printed after the running system installs and activates a verified candidate

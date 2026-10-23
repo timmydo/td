@@ -2265,8 +2265,11 @@ fn require_new_installation(
 
 pub(super) fn system_target_capacity(payload_bytes: u64) -> Result<u64, String> {
     let alignment = td_boot_protocol::PARTITION_ALIGN_BYTES;
+    // Two GiB of writable state beside the deployment, and the application
+    // accounts' Flathub caches the application boot fills.
     payload_bytes
         .checked_add(2 * 1024 * 1024 * 1024)
+        .and_then(|bytes| bytes.checked_add(super::APPLICATION_CACHE_BYTES))
         .and_then(|bytes| bytes.checked_add(td_boot_protocol::ESP_BYTES))
         .and_then(|bytes| bytes.checked_add(2 * alignment))
         .and_then(|bytes| bytes.checked_add(alignment - 1))
@@ -3576,10 +3579,16 @@ mod tests {
     #[test]
     fn system_disk_capacity_is_aligned_bounded_and_checked() {
         let gib = 1024 * 1024 * 1024;
-        assert_eq!(system_target_capacity(0).unwrap(), 6 * gib);
+        let cache = super::super::APPLICATION_CACHE_BYTES;
+        let align = td_boot_protocol::PARTITION_ALIGN_BYTES;
+        let unaligned = 2 * gib + cache + td_boot_protocol::ESP_BYTES + 2 * align;
+        assert_eq!(
+            system_target_capacity(0).unwrap(),
+            unaligned.div_ceil(align) * align
+        );
         let size = system_target_capacity(7 * gib + 1).unwrap();
         assert_eq!(size % td_boot_protocol::PARTITION_ALIGN_BYTES, 0);
-        assert!(size > 9 * gib + td_boot_protocol::ESP_BYTES);
+        assert!(size > 9 * gib + cache + td_boot_protocol::ESP_BYTES);
         assert!(system_target_capacity(u64::MAX).is_err());
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let scratch = Scratch {

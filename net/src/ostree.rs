@@ -61,10 +61,6 @@ impl AcquireSpec {
             signed,
         })
     }
-
-    pub(crate) fn commit_hex(&self) -> String {
-        self.commit.to_hex()
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1920,6 +1916,12 @@ pub(crate) mod tests {
     use crate::feed::tests::ConsumerServer;
     use std::net::TcpListener;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    impl AcquireSpec {
+        pub(crate) fn commit_hex(&self) -> String {
+            self.commit.to_hex()
+        }
+    }
 
     struct FeedFixture {
         root: PathBuf,

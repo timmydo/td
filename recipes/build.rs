@@ -885,14 +885,10 @@ fn evaluator_source_fingerprint(
 /// to them); the boot harnesses beside them are `HOST_CHECK_SOURCES`.
 const CHECK_BODIES: &str = "recipes/src/bin/td_recipe_eval/checks/";
 
-/// The source, OSTree and build-root pins: the URL, digest and commit a recipe builds
+/// The source and build-root pins: the URL, digest and commit a recipe builds
 /// from, which its build JSON names only by key, so they reach a check's
 /// key only through the evaluator's sources.
-const PIN_TABLES: &[&str] = &[
-    "recipes/src/source_pins.rs",
-    "recipes/src/ostree_pins.rs",
-    "recipes/src/debian-root.lock",
-];
+const PIN_TABLES: &[&str] = &["recipes/src/source_pins.rs", "recipes/src/debian-root.lock"];
 
 /// The evaluator fingerprint's three parts (`evaluator_source_fingerprint`),
 /// with the files the recipe-check parts cover: all, and `checks`' alone.

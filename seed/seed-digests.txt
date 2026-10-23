@@ -14,8 +14,6 @@ claude-code-source 38p8258xch0p61w26g2k7h6in56jzyh9-claude-code-source
 cryptsetup-x86-64-source v3g69yip0g4zybh9yw2hlp3zzcfy98fc-cryptsetup-x86-64-source
 curl-x86-64-source 985mgjp6q4y958wwzqs984nkh399jnac-curl-x86-64-source
 fd-source rsp3qagl8x7gh5hqpzy93adwfv5pv2ay-fd-source
-firefox-154-source 40asdrhyln3x194j276abhb2j2i7a04z-firefox-154-source
-freedesktop-platform-25-08-source cgynxza1vd3h30gd4hjl7vp82hdqlyj3-freedesktop-platform-25-08-source
 gcc-14-source 2h3c0xxmf2jf5hywqbmlsnww6cwkq4nq-gcc-14-source
 git-x86-64-source q7x6s60i03qm90sldhz5fz1812n1qk3h-git-x86-64-source
 glibc-241-source 2lavxgwvm5ppn98l05pqa7sszb4kfkk4-glibc-241-source

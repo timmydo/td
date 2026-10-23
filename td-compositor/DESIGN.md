@@ -2788,8 +2788,9 @@ state with stale capture. The compositor requires an explicit absolute
 an absolute `--launcher-client` for direct `td-ui-demo`; the image instead
 supplies a `--launcher-application` with its paired app-id observer and no
 launcher client or application-runtime path. An application name must use the
-image grammar. The supervised service owns the boot-started application
-instance: the application card activates a retained matching mapped surface,
+image grammar. The supervised service owns the application instance,
+started on request or under the oracle's token (APPLICATIONS.md §W.9):
+the application card activates a retained matching mapped surface,
 switching workspaces and leaving an unrelated fullscreen view if necessary. It
 never starts another process: with no mapped surface it asks the authority
 (request 0d) to have root start the application's supervised unit, which

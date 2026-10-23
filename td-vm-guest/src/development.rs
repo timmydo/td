@@ -187,7 +187,6 @@ fn prepare_directories(home: &Path, work: &Path, uid: u32) -> Result<()> {
         home.join(".td/build-daemon/ladder-shared-v1/build-cache/store"),
         home.join(".td/build-daemon/ladder-shared-v1/scratch"),
         home.join(".td/sources"),
-        home.join(".td/ostree"),
         work.join(".td-build-cache"),
     ];
     for path in &roots {

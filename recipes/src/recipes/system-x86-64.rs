@@ -177,8 +177,12 @@ struct ShippedApplication {
     package_recipe: fn() -> Recipe,
     /// Stable external service identity for this installed application.
     external_uid: u32,
+    /// The runtime key the declaration names.
     runtime: &'static str,
-    runtime_recipe: fn() -> Recipe,
+    /// The recipe that builds that runtime as a payload input, or `None` when
+    /// it is the declaration's Flathub runtime ref, which td-app fetches into
+    /// the account's cache and no recipe builds (APPLICATIONS.md §W.9).
+    runtime_recipe: Option<fn() -> Recipe>,
 }
 
 /// The distro definition. EDIT THIS to tailor the system, then rebuild and
@@ -349,10 +353,15 @@ const SETUP_READY_TIMEOUT_SECS: u16 = 120;
 const FIREFOX_INPUT_EVIDENCE_WAIT_ITERATIONS: u16 = FIREFOX_EVIDENCE_WAIT_ITERATIONS
     + FIREFOX_SUPPORT_TIMEOUT_SECS * FIREFOX_SUPPORT_ATTEMPTS
     + FIREFOX_NETWORK_TIMEOUT_SECS;
-// The greeter may observe deployment health before Firefox's first ready
-// timeout starts the evidence unit. Its allowance includes that offset and
-// each separately bounded Firefox support and staged-input attempt.
-const FIREFOX_INPUT_PRE_SOAK_WAIT_ITERATIONS: u16 = FIREFOX_READY_TIMEOUT_SECS
+// An oracle's Firefox starts once its fetch from the host's feed has
+// finished (APPLICATIONS.md §W.9), bounded by the fetch unit's timeout.
+const FIREFOX_FETCH_WAIT_SECS: u16 = svc_timeouts::APPLICATION_FETCH as u16;
+// The greeter may observe deployment health before Firefox's fetch and
+// first ready timeout start the evidence unit. Its allowance includes that
+// offset and each separately bounded Firefox support and staged-input
+// attempt.
+const FIREFOX_INPUT_PRE_SOAK_WAIT_ITERATIONS: u16 = FIREFOX_FETCH_WAIT_SECS
+    + FIREFOX_READY_TIMEOUT_SECS
     + FIREFOX_INPUT_EVIDENCE_WAIT_ITERATIONS
     + FIREFOX_INPUT_TIMEOUT_SECS * FIREFOX_INPUT_ATTEMPTS * FIREFOX_RETRIED_INPUT_STAGES
     + FIREFOX_FOCUS_TIMEOUT_SECS
@@ -409,7 +418,7 @@ const SHIPPED_APPLICATIONS: &[ShippedApplication] = &[
         package_recipe: super::firefox::recipe,
         external_uid: 65536,
         runtime: "freedesktop-platform-25-08",
-        runtime_recipe: super::freedesktop_platform_25_08::recipe,
+        runtime_recipe: None,
     },
     // The two source-built applications: td-owned static programs on the
     // data-only runtime, each a td-ui window of its own at boot. Neither
@@ -420,7 +429,7 @@ const SHIPPED_APPLICATIONS: &[ShippedApplication] = &[
         package_recipe: super::mail::recipe,
         external_uid: 65537,
         runtime: "static-runtime",
-        runtime_recipe: super::static_runtime::recipe,
+        runtime_recipe: Some(super::static_runtime::recipe),
     },
     ShippedApplication {
         name: TD_NEWS_NAME,
@@ -428,19 +437,20 @@ const SHIPPED_APPLICATIONS: &[ShippedApplication] = &[
         package_recipe: super::news::recipe,
         external_uid: 65538,
         runtime: "static-runtime",
-        runtime_recipe: super::static_runtime::recipe,
+        runtime_recipe: Some(super::static_runtime::recipe),
     },
-    // Claude Code: a marked foreign payload on the freedesktop runtime, run as
-    // a terminal application with no bus name — the first foreign-payload
-    // terminal program, beside Firefox's foreign non-terminal one and the
-    // source-built td-ui window applications mail and news.
+    // Claude Code: a marked foreign payload on the Flathub freedesktop
+    // runtime its account fetches, run as a terminal application with no bus
+    // name — the foreign-payload terminal program, beside Firefox's foreign
+    // non-terminal one and the source-built td-ui window applications mail
+    // and news.
     ShippedApplication {
         name: CLAUDE_NAME,
         package: CLAUDE_NAME,
         package_recipe: super::claude::recipe,
         external_uid: 65539,
         runtime: "freedesktop-platform-25-08",
-        runtime_recipe: super::freedesktop_platform_25_08::recipe,
+        runtime_recipe: None,
     },
 ];
 
@@ -1314,6 +1324,13 @@ const SETUP_INTAKE_SOCKET: &str = "/run/td-authd/1000/setup";
 /// windows and their evidence name it in `unless-exists=`: a live session
 /// opens the wizard and nothing else.
 const LIVE_MEDIUM: &str = "/run/td-media";
+/// Present on every boot whose Flathub applications start only when asked
+/// (APPLICATIONS.md §W.9): the deployment init creates it unless the line
+/// carries the autotest token, and on every live boot. Firefox and the
+/// oracles' first fetches name it in `unless-exists=`, so an ordinary boot
+/// neither opens Firefox nor downloads anything, and an oracle's boot does
+/// both.
+const APPLICATIONS_ON_DEMAND: &str = "/run/td-applications-on-demand";
 /// Where td-app finds a feed the kernel command line named (APPLICATIONS.md
 /// §W.9): td-net reads it, root-owned, when no VM bridge gave one.
 const BOOT_FEED: &str = td_engine::flathub_app::BOOT_FEED;
@@ -1374,6 +1391,7 @@ const TD_SVC_UNITS: &[&str] = &[
     "firefox-files",
     "mail-files",
     "claude-files",
+    "claude-fetch",
     "claude-launch",
     "fetch-evidence",
     "portal-files",
@@ -1396,6 +1414,7 @@ const TD_SVC_UNITS: &[&str] = &[
     "firefox-tls-origin",
     "firefox-autotest",
     "firefox",
+    "firefox-fetch",
     "firefox-update",
     "firefox-evidence",
     "terminal-authority-evidence",
@@ -1445,6 +1464,10 @@ mod svc_timeouts {
     /// downloading and materializing a runtime or application of about a
     /// gigabyte on a slow link, then the dynamic validator over both.
     pub const APPLICATION_UPDATE: u32 = 3600;
+    /// An oracle's first fetch of an application or runtime from the host's
+    /// feed: about a gigabyte over QEMU's user network, materialized and
+    /// validated in the VM.
+    pub const APPLICATION_FETCH: u32 = 900;
     /// The script's own retry loop is clamped to BOOT_SUCCESS_RETRY_MAX_SECS iterations,
     /// but each runs a large probe farm (nine `exec-primary` blocks) and can run four
     /// transactional `td-boot update` passes plus a `rollback`, so an iteration is worth
@@ -1720,6 +1743,19 @@ fn build_td_svc_conf() -> String {
          requires=td-firstboot\n\
          timeout=30\n\
          \n\
+         # Claude Code's runtime, fetched before the evidence below launches\n\
+         # it, as Firefox's is.\n\
+         [claude-fetch]\n\
+         type=oneshot\n\
+         cgroup=session\n\
+         unless-exists={applications_on_demand}\n\
+         exec=/bin/td-login exec-service-as tda65539 -- /bin/td-app update {claude_name}\n\
+         after=td-firstboot,netup\n\
+         requires=td-firstboot\n\
+         timeout={application_fetch}\n\
+         log=/var/log/svc/claude-fetch.log\n\
+         console=yes\n\
+         \n\
          [claude-launch]\n\
          type=daemon\n\
          cgroup=session\n\
@@ -1732,8 +1768,8 @@ fn build_td_svc_conf() -> String {
          \n\
          # Boot evidence under the autotest token only: the probe, as the UI\n\
          # user, asks the service for a loopback URL and gets the policy's exact\n\
-         # refusal, which proves the socket, the framing and the policy in a VM\n\
-         # with no route out. The in-jail half is the mail and news markers:\n\
+         # refusal, which proves the socket, the framing and the policy without\n\
+         # depending on a route out. The in-jail half is the mail and news markers:\n\
          # their jails carry the grant and stage 2 refuses to launch without\n\
          # the socket bound. The marker waits for TLS setup like the other\n\
          # exact lines; the shell leader stays, so the unit keeps its leaf.\n\
@@ -2028,13 +2064,30 @@ fn build_td_svc_conf() -> String {
          [firefox]\n\
          type=daemon\n\
          cgroup=session\n\
-         unless-exists={live_medium}\n\
+         unless-exists={applications_on_demand}\n\
          exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) exec /bin/td-authd application-start {ui_uid} {firefox_name} direct -- --marionette --remote-allow-system-access --profile {firefox_autotest_profile} {firefox_tls_url};; *) exec /bin/td-authd application-start {ui_uid} {firefox_name} direct --;; esac'\n\
-         after=audio,busd,portal,wayland,firefox-files,firefox-handoff,firefox-autotest,firefox-tls-origin,placement-evidence\n\
+         after=audio,busd,portal,wayland,firefox-files,firefox-handoff,firefox-autotest,firefox-tls-origin,placement-evidence,firefox-fetch\n\
          requires=wayland,firefox-autotest,firefox-tls-origin,firefox-files,td-firstboot\n\
          ready=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) exec /bin/td-login exec-primary -- /bin/td-compositor probe-application {firefox_window_ready_socket} {firefox_app_id} {firefox_content_rgb_a} {firefox_content_rgb_b} --quiet;; *) exit 0;; esac'\n\
          ready-timeout={firefox_ready_timeout}\n\
-         restart=always\n\
+         restart=on-failure\n\
+         \n\
+         # An oracle's Firefox fetches before it starts, so its readiness\n\
+         # deadline measures a launch, not a download (APPLICATIONS.md §W.9):\n\
+         # the boot's feed, then Flathub. It runs exactly when Firefox\n\
+         # autostarts; anywhere else the first launch fetches. Its output is\n\
+         # copied to the console whole lines at a time, so a fallback or\n\
+         # failure line cannot split another unit's marker.\n\
+         [firefox-fetch]\n\
+         type=oneshot\n\
+         cgroup=session\n\
+         unless-exists={applications_on_demand}\n\
+         exec=/bin/td-login exec-service-as tda65536 -- /bin/td-app update {firefox_name}\n\
+         after=td-firstboot,netup\n\
+         requires=td-firstboot\n\
+         timeout={application_fetch}\n\
+         log=/var/log/svc/firefox-fetch.log\n\
+         console=yes\n\
          \n\
          # A check of Firefox's Flathub cache now (APPLICATIONS.md §W.9), as\n\
          # its account: the launcher's update row asks td-authd, which asks\n\
@@ -2131,7 +2184,7 @@ fn build_td_svc_conf() -> String {
          type=daemon\n\
          unless-exists={live_medium}\n\
          exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) :;; *) exit 0;; esac; n=0; while [ \"$n\" -lt {claude_pre_run_wait} ]; do firefox=$(/bin/td-util cat {firefox_completion_path} 2>/dev/null); if [ \"$firefox\" = {firefox_completion} ]; then case \" $(/bin/cat /proc/cmdline) \" in *\" {firefox_input_cmdline_token} \"*) input=$(/bin/td-util cat {firefox_input_completion_path} 2>/dev/null); [ \"$input\" = {firefox_input_final_completion} ] && break;; *) break;; esac; fi; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {claude_pre_run_wait} ] || exit 1; /bin/rm -f {claude_error_path} {claude_completion_tmp_path} || exit 1; process_before=$(/bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-process-token {firefox_name} --marionette) || exit 1; bus_before=$(/bin/td-login exec-primary -- /bin/td-busd application {bus_socket} {firefox_name}) || exit 1; if refused=$(/bin/td-login exec-service-as tda65539 -- /bin/env TERM=td-term /bin/{claude_name} --version 2>&1 </dev/null); then /bin/echo \"td-claude-evidence: a launch with no terminal of its own ran\"; exit 1; fi; if [ \"$refused\" = \"{claude_refused_line}\" ]; then :; else /bin/td-util printf \"%s\\n\" \"$refused\" > {claude_error_path}; /bin/echo \"td-claude-evidence: the launch with no terminal was refused for another reason, kept in {claude_error_path}\"; exit 1; fi; ran=$(/bin/td-login exec-service-as tda65539 -- /bin/td-term run --socket {wayland_socket} --ready-socket /run/user/65539/td-claude-evidence-ready --command /bin/{claude_name} --version 2>&1 </dev/null); if /bin/td-util printf \"%s\\n\" \"$ran\" | /bin/rg --quiet --line-regexp \"td-term: the terminal.s child exited with status 0\"; then :; else /bin/td-util printf \"%s\\n\" \"$ran\" > {claude_error_path}; /bin/echo \"td-claude-evidence: the launch inside a terminal did not report its child at status 0, kept in {claude_error_path}\"; exit 1; fi; if shell_ran=$(/bin/td-login exec-primary -- /bin/env TERM=td-term /bin/{claude_name} --version 2>&1 </dev/null); then :; else /bin/td-util printf \"%s\\n\" \"$shell_ran\" > {claude_error_path}; /bin/echo \"td-claude-evidence: human shell launch failed, kept in {claude_error_path}\"; exit 1; fi; process_after=$(/bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-process-token {firefox_name} --marionette) || exit 1; [ \"$process_after\" = \"$process_before\" ] || exit 1; bus_after=$(/bin/td-login exec-primary -- /bin/td-busd application {bus_socket} {firefox_name}) || exit 1; [ \"$bus_after\" = \"$bus_before\" ] || exit 1; /bin/echo \"{claude_marker}\" && /bin/td-util printf \"%s\\n\" {claude_completion} > {claude_completion_tmp_path} && /bin/td-util chmod 0644 {claude_completion_tmp_path} && /bin/mv {claude_completion_tmp_path} {claude_completion_path} && exit 0; exit 1'\n\
-         after=firefox-soak,claude-files,claude-launch\n\
+         after=firefox-soak,claude-files,claude-launch,claude-fetch\n\
          requires=td-firstboot,claude-files,claude-launch\n\
          restart=never\n\
          \n\
@@ -2247,6 +2300,8 @@ fn build_td_svc_conf() -> String {
         setup_min_width = SETUP_MIN_WIDTH,
         setup_ready_timeout = SETUP_READY_TIMEOUT_SECS,
         live_medium = LIVE_MEDIUM,
+        applications_on_demand = APPLICATIONS_ON_DEMAND,
+        application_fetch = svc_timeouts::APPLICATION_FETCH,
         mail_marker = TD_MAIL_BOOT_MARKER,
         news_marker = TD_NEWS_BOOT_MARKER,
         fetch_marker = TD_FETCH_BOOT_MARKER,
@@ -2417,6 +2472,10 @@ fn build_deployment_init(sys: &SystemDef) -> String {
      if /bin/td-util test -n \"$feed\" && /bin/td-util test -n \"$autotest\"; then\n\
        /bin/td-util printf '%s' \"$feed\" > /sysroot{BOOT_FEED}\n\
        /bin/td-util chmod 0644 /sysroot{BOOT_FEED}\n\
+     fi\n\
+     if /bin/td-util test -z \"$autotest\" || /bin/td-util test -n \"$live\"; then\n\
+       /bin/td-util printf 'on-demand\\n' > /sysroot{APPLICATIONS_ON_DEMAND}\n\
+       /bin/td-util chmod 0644 /sysroot{APPLICATIONS_ON_DEMAND}\n\
      fi\n\
      /bin/td-util mkdir -p /sysroot/run/td-volume\n\
      /bin/mount -o move /volume /sysroot/run/td-volume\n\
@@ -3978,11 +4037,28 @@ fn application_payload_inputs(sys: &SystemDef) -> Vec<&'static str> {
     let mut inputs: Vec<&str> = sys
         .applications
         .iter()
-        .flat_map(|application| [application.package, application.runtime])
+        .flat_map(|application| {
+            std::iter::once(application.package)
+                .chain(application.runtime_recipe.map(|_| application.runtime))
+        })
         .collect();
     inputs.sort_unstable();
     inputs.dedup();
     inputs
+}
+
+/// What the image names as an application's runtime: its staged payload,
+/// or the Flathub ref td-app fetches when no recipe builds it
+/// (APPLICATIONS.md §W.9). A missing declaration falls back to the payload
+/// form, which the tables step refuses as undeclared.
+fn shipped_runtime(application: &ShippedApplication) -> String {
+    match (
+        application.runtime_recipe,
+        td_engine::flathub_app::flathub_source(application.name),
+    ) {
+        (None, Some(source)) => source.runtime.to_string(),
+        _ => format!("{{payload:{}}}", application.runtime),
+    }
 }
 
 fn profiler_application_roots(sys: &SystemDef) -> String {
@@ -3991,9 +4067,19 @@ fn profiler_application_roots(sys: &SystemDef) -> String {
         .iter()
         .map(|application| {
             let package = (application.package_recipe)();
-            let runtime = (application.runtime_recipe)();
+            // A Flathub ref is named as itself, foreign, and adds no root.
+            let (runtime, provenance) = match application.runtime_recipe {
+                Some(recipe) => {
+                    let runtime = recipe();
+                    (
+                        format!("{}-{}", runtime.name, runtime.version),
+                        runtime.is_foreign(),
+                    )
+                }
+                None => (shipped_runtime(application), true),
+            };
             format!(
-                "{}\t{}-{}\t{}\t{}-{}\t{}\n",
+                "{}\t{}-{}\t{}\t{runtime}\t{}\n",
                 application.name,
                 package.name,
                 package.version,
@@ -4002,13 +4088,7 @@ fn profiler_application_roots(sys: &SystemDef) -> String {
                 } else {
                     "source"
                 },
-                runtime.name,
-                runtime.version,
-                if runtime.is_foreign() {
-                    "foreign"
-                } else {
-                    "source"
-                },
+                if provenance { "foreign" } else { "source" },
             )
         })
         .collect();
@@ -4773,11 +4853,7 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
             .iter()
             .map(|application| format!("{{payload:{}}}", application.package))
             .collect(),
-        runtimes: sys
-            .applications
-            .iter()
-            .map(|application| format!("{{payload:{}}}", application.runtime))
-            .collect(),
+        runtimes: sys.applications.iter().map(shipped_runtime).collect(),
         registry: format!("{{root}}/real-root{APPLICATION_REGISTRY}"),
         launcher: format!("{{root}}/real-root{APPLICATION_LAUNCHER_TABLE}"),
     });
@@ -5967,9 +6043,10 @@ mod tests {
         assert!(unit_key("firefox", "exec").is_some());
         // Root refuses both on a live boot by the path that gates the units.
         assert!(LAUNCH.contains(&format!("const LIVE_MEDIUM: &str = \"{LIVE_MEDIUM}\";")));
+        // At boot it starts only where the oracles ask for it.
         assert_eq!(
             unit_key("firefox", "unless-exists").as_deref(),
-            Some(LIVE_MEDIUM)
+            Some(APPLICATIONS_ON_DEMAND)
         );
         assert_eq!(
             unit_key("firefox-update", "type").as_deref(),
@@ -6350,8 +6427,8 @@ mod tests {
             Step::WriteFile { path, content, exec: false }
                 if path == "{root}/real-root/etc/td-profiler-application-roots.tsv"
                     && content == "td-profiler-application-roots-v1\n\
-        claude\tclaude-2.1.260\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n\
-        firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n\
+        claude\tclaude-2.1.260\tforeign\truntime/org.freedesktop.Platform/x86_64/25.08\tforeign\n\
+        firefox\tfirefox-stable\tforeign\truntime/org.freedesktop.Platform/x86_64/25.08\tforeign\n\
         mail\tmail-0.1\tsource\tstatic-runtime-1\tsource\n\
         news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         )));
@@ -6809,8 +6886,13 @@ mod tests {
             FIREFOX_READY_TIMEOUT_SECS * FIREFOX_READY_ATTEMPTS + FIREFOX_RETRY_MARGIN_SECS
         );
         assert_eq!(
+            u32::from(FIREFOX_FETCH_WAIT_SECS),
+            svc_timeouts::APPLICATION_FETCH
+        );
+        assert_eq!(
             FIREFOX_INPUT_PRE_SOAK_WAIT_ITERATIONS,
-            FIREFOX_READY_TIMEOUT_SECS
+            FIREFOX_FETCH_WAIT_SECS
+                + FIREFOX_READY_TIMEOUT_SECS
                 + FIREFOX_INPUT_EVIDENCE_WAIT_ITERATIONS
                 + FIREFOX_INPUT_TIMEOUT_SECS
                     * FIREFOX_INPUT_ATTEMPTS
@@ -8186,6 +8268,17 @@ mod tests {
                     // An on-demand unit (APPLICATIONS.md §W.9): the root
                     // always exists, so only td-svc's `start` runs it.
                     [path] if path.as_str() == "/" && name == "firefox-update" => None,
+                    // Started at boot only where the oracles ask; the init
+                    // creates this path on a live boot too.
+                    [path]
+                        if path.as_str() == APPLICATIONS_ON_DEMAND
+                            && matches!(
+                                name.as_str(),
+                                "firefox" | "firefox-fetch" | "claude-fetch"
+                            ) =>
+                    {
+                        Some(name)
+                    }
                     [path] => {
                         assert_eq!(path.as_str(), LIVE_MEDIUM, "{name}");
                         Some(name)
@@ -8198,7 +8291,9 @@ mod tests {
         let mut expected = vec![
             "applications-workspace",
             "claude-evidence",
+            "claude-fetch",
             "firefox",
+            "firefox-fetch",
             "firefox-evidence",
             "mail",
             "mail-evidence",
@@ -8484,8 +8579,11 @@ mod tests {
                     "firefox-autotest",
                     "firefox-tls-origin",
                     "placement-evidence",
+                    "firefox-fetch",
                 ],
             ),
+            ("firefox-fetch", vec!["td-firstboot", "netup"]),
+            ("claude-fetch", vec!["td-firstboot", "netup"]),
             ("firefox-evidence", vec!["firefox", "netup"]),
             (
                 "terminal-authority-evidence",
@@ -8495,7 +8593,12 @@ mod tests {
             ("firefox-soak", vec!["firefox-input"]),
             (
                 "claude-evidence",
-                vec!["firefox-soak", "claude-files", "claude-launch"],
+                vec![
+                    "firefox-soak",
+                    "claude-files",
+                    "claude-launch",
+                    "claude-fetch",
+                ],
             ),
             (
                 "bootsuccess",
@@ -8652,7 +8755,12 @@ mod tests {
         let exec = unit_key("claude-evidence", "exec").unwrap_or_default();
         assert_eq!(
             unit_after("claude-evidence"),
-            vec!["firefox-soak", "claude-files", "claude-launch"]
+            vec![
+                "firefox-soak",
+                "claude-files",
+                "claude-launch",
+                "claude-fetch"
+            ]
         );
         assert_eq!(
             unit_key("claude-evidence", "requires").as_deref(),
@@ -8862,7 +8970,7 @@ mod tests {
             package_recipe: without_permissions,
             external_uid: 65536,
             runtime: "empty-runtime",
-            runtime_recipe: super::super::empty_runtime::recipe,
+            runtime_recipe: Some(super::super::empty_runtime::recipe),
         }];
         let system = SystemDef {
             applications: MISSING,
@@ -8886,7 +8994,7 @@ mod tests {
                 package_recipe: super::super::td_jail_fixture::recipe,
                 external_uid: 65536,
                 runtime: "empty-runtime",
-                runtime_recipe: super::super::empty_runtime::recipe,
+                runtime_recipe: Some(super::super::empty_runtime::recipe),
             },
             ShippedApplication {
                 name: "two",
@@ -8894,7 +9002,7 @@ mod tests {
                 package_recipe: super::super::td_jail_fixture::recipe,
                 external_uid: 65536,
                 runtime: "empty-runtime",
-                runtime_recipe: super::super::empty_runtime::recipe,
+                runtime_recipe: Some(super::super::empty_runtime::recipe),
             },
         ];
         let system = SystemDef {
@@ -9162,7 +9270,7 @@ mod tests {
         // the boot window would permanently kill the application tier of a
         // machine whose broker recovers a second later.
         //
-        // Ordering alone recovers instead. Firefox's own `restart=always`
+        // Ordering alone recovers instead. Firefox's own `restart=on-failure`
         // retries the launch until the broker is answering, which is
         // self-healing where the strict edge was terminal — and it covers the
         // broker that is up but not yet serving as well as the one that never
@@ -9180,9 +9288,11 @@ mod tests {
              not be made strictly dependent on a broker whose restart backoff \
              td-svc cannot tell from a permanent failure"
         );
+        // A failed launch restarts; a window the human closed stays
+        // closed, since Firefox starts on demand (APPLICATIONS.md §W.9).
         assert_eq!(
             unit_key("firefox", "restart").as_deref(),
-            Some("always"),
+            Some("on-failure"),
             "Firefox is supervised and restartable"
         );
     }
@@ -9213,7 +9323,6 @@ mod tests {
             "{in:td-link}".to_string(),
             format!("{{payload:{CLAUDE_NAME}}}"),
             format!("{{payload:{FIREFOX_NAME}}}"),
-            "{payload:freedesktop-platform-25-08}".to_string(),
             format!("{{payload:{TD_MAIL_NAME}}}"),
             format!("{{payload:{TD_NEWS_NAME}}}"),
             "{payload:static-runtime}".to_string(),
@@ -9634,11 +9743,21 @@ mod tests {
                     "the compositor observer must match Firefox's authenticated alias"
                 );
             }
-            let runtime = (application.runtime_recipe)();
-            assert_eq!(
-                runtime.name, application.runtime,
-                "shipped application runtime provenance must come from its catalog recipe"
-            );
+            match application.runtime_recipe {
+                Some(runtime_recipe) => assert_eq!(
+                    runtime_recipe().name,
+                    application.runtime,
+                    "shipped application runtime provenance must come from its catalog recipe"
+                ),
+                // A fetched runtime is the declaration's own Flathub ref,
+                // under the policy it names (APPLICATIONS.md §W.9).
+                None => {
+                    let source = td_engine::flathub_app::flathub_source(application.name)
+                        .expect("a fetched runtime is declared");
+                    assert_eq!(source.policy_runtime, application.runtime);
+                    assert_eq!(package.flathub_runtime(), Some(source.runtime));
+                }
+            }
         }
     }
 
@@ -9862,7 +9981,7 @@ mod tests {
             package_recipe: super::super::td_jail_fixture::recipe,
             external_uid: 65539,
             runtime: "fixture-runtime",
-            runtime_recipe: super::super::empty_runtime::recipe,
+            runtime_recipe: Some(super::super::empty_runtime::recipe),
         }];
         let fixture = SystemDef {
             hostname: SYSTEM.hostname,
@@ -9924,13 +10043,12 @@ mod tests {
             Some(vec![
                 CLAUDE_NAME.into(),
                 FIREFOX_NAME.into(),
-                "freedesktop-platform-25-08".into(),
                 TD_MAIL_NAME.into(),
                 TD_NEWS_NAME.into(),
                 "static-runtime".into(),
             ]),
-            "each reviewed package and each runtime is one payload input, deduped \
-             and sorted; the two freedesktop apps share one runtime input"
+            "each reviewed package and each built runtime is one payload input, deduped \
+             and sorted; the Flathub runtime is fetched, not staged"
         );
     }
 
@@ -10544,7 +10662,7 @@ mod tests {
                 package_recipe: super::super::td_jail_fixture::recipe,
                 external_uid: 65539,
                 runtime: "runtime-rg",
-                runtime_recipe: super::super::empty_runtime::recipe,
+                runtime_recipe: Some(super::super::empty_runtime::recipe),
             },
             ShippedApplication {
                 name: "td-netd",
@@ -10552,7 +10670,7 @@ mod tests {
                 package_recipe: super::super::td_jail_fixture::recipe,
                 external_uid: 65540,
                 runtime: "runtime-netd",
-                runtime_recipe: super::super::empty_runtime::recipe,
+                runtime_recipe: Some(super::super::empty_runtime::recipe),
             },
         ];
         let fixture = SystemDef {
@@ -11787,6 +11905,56 @@ mod tests {
         assert_eq!(at(guard) + guard.len(), at(&write));
         assert!(init.contains(&format!("/bin/td-util chmod 0644 /sysroot{BOOT_FEED}\n")));
         assert_eq!(init.matches(BOOT_FEED).count(), 2);
+    }
+
+    /// An ordinary boot starts no Flathub application and fetches nothing:
+    /// the init marks every boot without the autotest token, and every live
+    /// one, as on demand, and Firefox and the oracles' fetches name that
+    /// mark. An oracle's boot fetches as each application's account, then
+    /// starts Firefox (APPLICATIONS.md §W.9).
+    #[test]
+    fn ordinary_boots_start_the_applications_on_demand() {
+        let init = build_deployment_init(&SYSTEM);
+        let guard =
+            "if /bin/td-util test -z \"$autotest\" || /bin/td-util test -n \"$live\"; then\n";
+        let write =
+            format!("/bin/td-util printf 'on-demand\\n' > /sysroot{APPLICATIONS_ON_DEMAND}\n");
+        let at = |needle: &str| init.find(needle).unwrap();
+        assert!(at("mount -t tmpfs -o mode=0755 tmpfs /sysroot/run") < at(guard));
+        assert_eq!(at(guard) + guard.len(), at(&write));
+        assert!(init.contains(&format!(
+            "/bin/td-util chmod 0644 /sysroot{APPLICATIONS_ON_DEMAND}\n"
+        )));
+        for (unit, account, name) in [
+            ("firefox-fetch", "tda65536", FIREFOX_NAME),
+            ("claude-fetch", "tda65539", CLAUDE_NAME),
+        ] {
+            assert_eq!(
+                unit_key(unit, "exec"),
+                Some(format!(
+                    "/bin/td-login exec-service-as {account} -- /bin/td-app update {name}"
+                ))
+            );
+            assert_eq!(unit_key(unit, "console").as_deref(), Some("yes"));
+            assert_eq!(
+                unit_key(unit, "log"),
+                Some(format!("/var/log/svc/{unit}.log"))
+            );
+            assert_eq!(unit_key(unit, "type").as_deref(), Some("oneshot"));
+            assert_eq!(
+                unit_key(unit, "unless-exists").as_deref(),
+                Some(APPLICATIONS_ON_DEMAND)
+            );
+            assert_eq!(
+                unit_key(unit, "timeout"),
+                Some(svc_timeouts::APPLICATION_FETCH.to_string())
+            );
+        }
+        assert_eq!(
+            unit_key("firefox", "unless-exists").as_deref(),
+            Some(APPLICATIONS_ON_DEMAND)
+        );
+        assert!(unit_after("firefox").contains(&"firefox-fetch".to_string()));
     }
 
     /// The first pass must select through td-boot. The selected pass must bind
@@ -15925,7 +16093,7 @@ mod principal_tests {
                 package_recipe: super::super::news::recipe,
                 external_uid: 65538,
                 runtime: "empty-runtime",
-                runtime_recipe: super::super::empty_runtime::recipe,
+                runtime_recipe: Some(super::super::empty_runtime::recipe),
             },
             ShippedApplication {
                 name: "mail",
@@ -15933,7 +16101,7 @@ mod principal_tests {
                 package_recipe: super::super::mail::recipe,
                 external_uid: 65537,
                 runtime: "empty-runtime",
-                runtime_recipe: super::super::empty_runtime::recipe,
+                runtime_recipe: Some(super::super::empty_runtime::recipe),
             },
         ];
         let sys = SystemDef {

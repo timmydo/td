@@ -33,6 +33,7 @@ pub(crate) mod build_iso;
 pub(crate) mod efi;
 pub(crate) mod encrypted;
 pub(crate) mod encrypted_boot;
+mod feed;
 pub(crate) mod guest_screens;
 pub(crate) mod install;
 pub(crate) mod live;
@@ -390,11 +391,12 @@ const FIREFOX_AUDIO_MAX_TRANSIENT_WINDOWS: usize = 7;
 const FIREFOX_AUDIO_MAX_TRANSIENT_RUNS: usize = 2;
 const FIREFOX_AUDIO_CAPTURE_MARGIN_SECS: u64 = 2;
 /// At 48 kHz stereo S16, the physical-input boot's host timeout remains below
-/// the 640 MiB absolute capture ceiling: Claude Code's terminal oracle took
-/// the timeout past the 512 MiB one, and the unit test below pins
-/// that the default timeout fits. QEMU records leading/trailing silence too,
-/// so the disk ceiling covers that whole bound while verification streams it.
-const MAX_AUDIO_CAPTURE_BYTES: u64 = 640 * 1024 * 1024;
+/// the 768 MiB absolute capture ceiling: Claude Code's terminal oracle took
+/// the timeout past the 512 MiB one, the applications' fetch (APPLICATIONS.md
+/// §W.9) past 640 MiB, and the unit test below pins that the default timeout
+/// fits. QEMU records leading/trailing silence too, so the disk ceiling covers
+/// that whole bound while verification streams it.
+const MAX_AUDIO_CAPTURE_BYTES: u64 = 768 * 1024 * 1024;
 const QMP_OUTPUT_HEIGHT: u32 = 800;
 // The file chooser's client rectangle, by td-compositor's
 // `portal_dialog_placement`: a frame three quarters of the output wide and of
@@ -473,17 +475,21 @@ const DRAIN_BUDGET: usize = 4 * 1024 * 1024;
 /// flooded — generous enough that a normal boot's few KiB of printk never trips it.
 const MAX_CONSOLE_BYTES: u64 = 64 * 1024 * 1024;
 const PERSISTENT_DEPLOYMENT_COPIES: u64 = 3;
-// The standard root includes Firefox and the source-built developer tools.
-// Reserve three GiB of non-debug payload per transactional copy (an
-// October 2026 root.erofs held 2.0 GiB of it), separately from each copy's
-// debug-ceiling allowance and the writable-state headroom. The sparse
-// volume does not allocate its whole logical size on the host.
+// Reserve three GiB of non-debug deployment payload per transactional copy,
+// separately from each copy's debug-ceiling allowance, writable-state
+// headroom and application caches. The sparse volume does not allocate
+// its whole logical size on the host.
 const PERSISTENT_NON_DEBUG_BYTES: u64 = 9 * 1024 * 1024 * 1024;
 const PERSISTENT_VOLUME_HEADROOM: u64 = 1024 * 1024 * 1024;
+/// The application accounts' Flathub caches on `/home` (APPLICATIONS.md
+/// §W.9): Firefox and its runtime, and Claude Code's own copy of that
+/// runtime, each with room for a generation being fetched.
+pub(crate) const APPLICATION_CACHE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const PERSISTENT_VOLUME_BYTES: u64 = td_engine::target_profile::DEPLOYMENT_DEBUG_CEILING_BYTES
     * PERSISTENT_DEPLOYMENT_COPIES
     + PERSISTENT_NON_DEBUG_BYTES
-    + PERSISTENT_VOLUME_HEADROOM;
+    + PERSISTENT_VOLUME_HEADROOM
+    + APPLICATION_CACHE_BYTES;
 // Published desktops need room for private development stores and checkouts.
 // This is virtual capacity; untouched space remains sparse on the host.
 pub(crate) const PUBLISHED_VOLUME_BYTES: u64 = 256 * 1024 * 1024 * 1024;
@@ -2790,14 +2796,15 @@ fn validate_persistent_shutdown(result: &BootResult, context: &str) -> Result<()
     Ok(())
 }
 
-/// One offline session boot, using the full system evidence contract.
+/// One session boot, with a user-mode NIC for the host's feed, using the full
+/// system evidence contract.
 pub(crate) fn run_session(runner: &RecipeCheckRunner) -> Result<(), String> {
     let qemu = find_qemu()?;
     let (bzimage, init_cpio, disk, btrfs) = build_persistent_system(runner)?;
     let wait_token = autotest_wait_token(boot_timeout());
     let tokens = format!("{AUTOTEST_CMDLINE_TOKEN} {wait_token}");
     println!(
-        "   [qemu-boot-session] {qemu} boots one fresh offline system session\n              kernel:        {}\n              initramfs:     {}\n              Btrfs volume:  {}",
+        "   [qemu-boot-session] {qemu} boots one fresh system session\n              kernel:        {}\n              initramfs:     {}\n              Btrfs volume:  {}",
         bzimage.display(), init_cpio.display(), disk.display()
     );
     let result = boot(
@@ -2833,7 +2840,7 @@ pub(crate) fn run_session(runner: &RecipeCheckRunner) -> Result<(), String> {
     validate_session_boot(&result)?;
     check_persistent_volume(&btrfs, &disk)?;
     println!(
-        "PASS: one offline system session proves firstboot identity, immutable root, \
+        "PASS: one system session proves firstboot identity, immutable root, \
         owned state, component health, compositor/terminal readiness, application placement, \
         browser support, Claude terminal admission and clean shutdown"
     );
@@ -4644,7 +4651,9 @@ struct BootPlan<'a> {
     extra_append: &'a str,
     /// `true`: attach a qemu user-mode (SLIRP) NIC on virtio-net-pci instead of `-nic
     /// none`, so the guest's td-netd can DHCP, resolve, and reach a host — the
-    /// `qemu-boot-net` mode. `false` (every other mode): no network, hermetic and offline.
+    /// `qemu-boot-net` mode, whose evidence is public reachability. A boot that
+    /// starts the system's applications gets the same NIC for the host's feed
+    /// (`feed::serves`) whatever this says; any other boot is offline.
     user_net: bool,
     /// Attach the exact HDA playback device the system audio service owns.
     audio: bool,
@@ -5078,8 +5087,9 @@ fn boot_source(
     //   headless run has no host cursor to drive it, but it still enumerates. The
     //   physical-input boot additionally injects acknowledged QMP events through
     //   this same device, proving both enumeration and delivery.
-    // Networking is attached conditionally below (a user-mode NIC for qemu-boot-net,
-    // else `-nic none`) — qemu's default is an implicit user-mode NIC, so every mode
+    // Networking is attached conditionally below (a user-mode NIC for
+    // qemu-boot-net and for a boot served the host's feed, else `-nic none`) —
+    // qemu's default is an implicit user-mode NIC, so every mode
     // sets one explicitly.
     // -no-user-config: ignore the host's qemu config files for a hermetic run.
     // -no-reboot: the guest's init ultimately issues reboot(2); qemu exits on the guest
@@ -5151,7 +5161,20 @@ fn boot_source(
     // Every non-audit oracle disables audit initialization explicitly. Merely
     // leaving the kernel's audit state off still permits unconditional seccomp
     // kill records to reach printk when CONFIG_AUDIT is compiled in.
-    let append = kernel_append(plan.extra_append);
+    // A boot that starts the system's applications fetches them from a
+    // feed of the host's (APPLICATIONS.md §W.9), reached over the user
+    // network and named on its line. The guard outlives QEMU's reaping.
+    let live = matches!(source, BootSource::LiveSetup { .. });
+    let feed = if feed::serves(live, plan.extra_append) {
+        Some(feed::FeedServer::start()?)
+    } else {
+        None
+    };
+    let extra_append = match &feed {
+        Some(server) => feed::append(plan.extra_append, server.endpoint()),
+        None => plan.extra_append.to_string(),
+    };
+    let append = kernel_append(&extra_append);
     // Firmware passes no command line of its own; the live medium's tokens
     // reach its kernel as a boot entry's load options, written into this
     // boot's own copy of the variables, never the template.
@@ -5269,16 +5292,18 @@ fn boot_source(
     if let Some(path) = qmp_path.as_deref() {
         cmd.arg("-qmp").arg(qmp_arg(path));
     }
-    // Networking: either a user-mode NIC (qemu-boot-net) or none (every other mode).
+    // Networking: a user-mode NIC for qemu-boot-net and for every boot that
+    // fetches the applications from the host's feed, else none.
     // SLIRP's user net provides DHCP (10.0.2.15/24, gw 10.0.2.2) and a DNS forwarder
     // (10.0.2.3), so the guest's td-netd can DHCP-configure, resolve, and reach a host
-    // with no host network config. virtio-net-pci is the NIC the guest's VIRTIO_NET
-    // driver binds; the guest autodetects it (eth0) and brings it up.
-    if plan.user_net {
+    // with no host network config; 10.0.2.2 is the host's loopback, where the feed
+    // listens. virtio-net-pci is the NIC the guest's VIRTIO_NET driver binds; the
+    // guest autodetects it (eth0) and brings it up.
+    if plan.user_net || feed.is_some() {
         cmd.args(["-netdev", QEMU_USER_NETDEV]);
         cmd.args(["-device", QEMU_USER_NET_DEVICE]);
     } else {
-        // -nic none: hermetic, offline; qemu's default is a user-mode NIC, so disable it.
+        // -nic none: offline; qemu's default is a user-mode NIC, so disable it.
         cmd.args(["-nic", "none"]);
     }
     if plan.audio {
@@ -11190,8 +11215,10 @@ mod tests {
             td_engine::target_profile::DEPLOYMENT_DEBUG_CEILING_BYTES
                 * PERSISTENT_DEPLOYMENT_COPIES
                 + PERSISTENT_NON_DEBUG_BYTES
-                + PERSISTENT_VOLUME_HEADROOM,
-            "transactional fixtures must fit three ceiling-sized debug trees plus non-debug payloads"
+                + PERSISTENT_VOLUME_HEADROOM
+                + APPLICATION_CACHE_BYTES,
+            "transactional fixtures must fit three ceiling-sized debug trees plus non-debug \
+             payloads and the applications' caches"
         );
         let seq = AtomicU64::new(2400);
         let dir = create_scratch_dir(&env::temp_dir(), &seq).unwrap();

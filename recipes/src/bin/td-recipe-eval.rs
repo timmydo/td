@@ -43,11 +43,12 @@
 //!                         VM — the boot payloads plus a POSIX-sh `start`
 //!                         launcher — so the system can be tried on a machine
 //!                         that has qemu and has never built td
-//!   warm [TARGET]         fetch missing declared inputs and reauthenticate every
-//!                         selected exact OSTree graph (default system-x86-64),
-//!                         building nothing. The host-side operator commands
-//!                         (`run`, `qemu-boot*`) prepare unadmitted graphs from
-//!                         a terminal
+//!   warm [TARGET] [--flathub]
+//!                         fetch missing declared inputs (default
+//!                         system-x86-64), building nothing; `--flathub` also
+//!                         exports the declared Flathub refs into the host's
+//!                         feed. The host-side operator commands (`run`,
+//!                         `qemu-boot*`) warm from a terminal
 //!   payload-closure [TARGET...]
 //!                         print APPLICATIONS.md §B.8's closure answer for
 //!                         TARGET (default system-x86-64): how many recipes
@@ -71,11 +72,6 @@
 //!                         reads them and holds that lock shared)
 //!   source-pin STEM       print the fixed-output source pin(s) owned by STEM
 //!                         in the same tab-separated form
-//!   ostree-pins           print exact foreign deploy pins as:
-//!                         <key>\t<repository>\t<ref>\t<commit>\t<content>
-//!                         \t<key fingerprint>\t<cache> followed by the
-//!                         reviewed graph counts as name=value fields
-//!   ostree-pin STEM       print the exact deploy pin(s) owned by STEM
 //!   install-fonts-plan    print what `td-builder install-fonts` installs:
 //!                         the outline face recipe's archive pin, members
 //!                         and notice pins, tab-separated
@@ -233,50 +229,6 @@ fn print_recipe_source_pins(stem: &str) {
     }
     for pin in pins {
         println!("{}\t{}\t{}\t{}", pin.key, pin.url, pin.sha256, pin.file);
-    }
-}
-
-fn format_ostree_pin(pin: &td_recipe::types::OstreePin) -> String {
-    format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\tobjects={}\tpaths={}\tdirectories={}\t\
-         regular={}\tsymlinks={}\tdecoded-bytes={}\tobserved-transfer-bytes={}",
-        pin.key,
-        pin.repository,
-        pin.exact_ref,
-        pin.commit,
-        pin.content,
-        pin.signing_key_fingerprint,
-        pin.cache,
-        pin.expected.objects,
-        pin.expected.paths,
-        pin.expected.directories,
-        pin.expected.regular_files,
-        pin.expected.symlinks,
-        pin.expected.decoded_bytes,
-        pin.expected.transfer_bytes
-    )
-}
-
-fn print_ostree_pin(pin: &td_recipe::types::OstreePin) {
-    println!("{}", format_ostree_pin(pin));
-}
-
-fn print_ostree_pins() {
-    for pin in td_recipe::ostree_pins::all() {
-        print_ostree_pin(&pin);
-    }
-}
-
-fn print_recipe_ostree_pins(stem: &str) {
-    let recipe = lookup_or_die(stem);
-    let Some(pins) = recipe.ostree_pins else {
-        die(&format!("recipe `{stem}' declares no exact OSTree pin"));
-    };
-    if pins.is_empty() {
-        die(&format!("recipe `{stem}' declares no exact OSTree pin"));
-    }
-    for pin in pins {
-        print_ostree_pin(&pin);
     }
 }
 
@@ -615,21 +567,6 @@ fn main() {
                 Err(e) => die(&e),
             }
         }
-        Some("ostree-pins") => {
-            if args.get(2).is_some() {
-                die("usage: ostree-pins");
-            }
-            print_ostree_pins();
-        }
-        Some("ostree-pin") => {
-            let stem = args
-                .get(2)
-                .unwrap_or_else(|| die("usage: ostree-pin STEM"));
-            if args.get(3).is_some() {
-                die("usage: ostree-pin STEM");
-            }
-            print_recipe_ostree_pins(stem);
-        }
         Some("seed-digests") => {
             if args.get(2).is_some() {
                 die("usage: seed-digests");
@@ -652,7 +589,7 @@ fn main() {
                 die(&e);
             }
         }
-        _ => die("usage: td-recipe-eval list|emit|check-list|check-count|check-script|check-run|build-run|check-history|clear-store|gc-store|qemu-secret|qemu-secret-system|qemu-login-system|qemu-boot|qemu-boot-uefi|qemu-boot-media|qemu-install|qemu-install-system|qemu-install-encrypted|qemu-boot-encrypted|qemu-boot-live|compose-iso|build-iso|test-iso|qemu-boot-erofs|qemu-boot-system|qemu-deploy-rollback|qemu-update|qemu-boot-net|qemu-boot-kexec|run|bundle|warm|verify-store|payload-closure|application-closure|vendor-warm-args|source-pins|build-root-pins|build-root-seed|source-pin|ostree-pins|ostree-pin|seed-digests|local-source-roster"),
+        _ => die("usage: td-recipe-eval list|emit|check-list|check-count|check-script|check-run|build-run|check-history|clear-store|gc-store|qemu-secret|qemu-secret-system|qemu-login-system|qemu-boot|qemu-boot-uefi|qemu-boot-media|qemu-install|qemu-install-system|qemu-install-encrypted|qemu-boot-encrypted|qemu-boot-live|compose-iso|build-iso|test-iso|qemu-boot-erofs|qemu-boot-system|qemu-deploy-rollback|qemu-update|qemu-boot-net|qemu-boot-kexec|run|bundle|warm|verify-store|payload-closure|application-closure|vendor-warm-args|source-pins|build-root-pins|build-root-seed|source-pin|seed-digests|local-source-roster"),
     }
 }
 
@@ -760,23 +697,6 @@ mod tests {
                 pins.iter().any(|pin| pin.key == key && !pin.foreign()),
                 "missing {key}"
             );
-        }
-    }
-
-    #[test]
-    fn ostree_pins_cli_surface_is_exact_and_tab_separated() {
-        let pins = td_recipe::ostree_pins::all();
-        assert_eq!(pins.len(), 2);
-        for pin in pins {
-            let line = format_ostree_pin(&pin);
-            let fields: Vec<&str> = line.split('\t').collect();
-            assert_eq!(fields.len(), 14, "{line}");
-            assert_eq!(fields.first(), Some(&pin.key.as_str()));
-            assert_eq!(fields.get(3), Some(&pin.commit.as_str()));
-            assert_eq!(fields.get(4), Some(&pin.content.as_str()));
-            assert_eq!(fields.get(6), Some(&pin.cache.as_str()));
-            let transfer = format!("observed-transfer-bytes={}", pin.expected.transfer_bytes);
-            assert_eq!(fields.last().copied(), Some(transfer.as_str()));
         }
     }
 

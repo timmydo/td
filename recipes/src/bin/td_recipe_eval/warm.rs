@@ -1,16 +1,14 @@
 //! Host prep for the INTERACTIVE operator commands (`run`, `qemu-boot*`): fetch
-//! missing declared inputs and reauthenticate a complete-looking exact OSTree
-//! graph until recipe admission records it, instead of stopping to tell the
-//! operator to run a warm command by hand.
+//! missing declared inputs instead of stopping to tell the operator to run a
+//! warm command by hand.
 //!
 //! Every other build entry point sits behind a prelude that warms first
 //! (`td-builder check`'s heavy_warms, which is where the gates' sources come
 //! from). The operator commands have no prelude, so on a cold checkout the very
 //! first `./start` reported a missing tarball as a hard error with a command to
-//! type. Fetching and offline OSTree authentication happen on the HOST, before
-//! the ladder lock, and only for pins the recipes already declare and `td-feed`
-//! authenticates by compiled checksums. A marker-complete but unadmitted graph
-//! therefore reaches td-feed's repair path; the build sandboxes stay offline.
+//! type. Fetching happens on the HOST, before the ladder lock, and only for
+//! pins the recipes already declare and `td-feed` authenticates by compiled
+//! checksums; the build sandboxes stay offline.
 //!
 //! Nothing it does can fail a BUILD. A warm that cannot happen (no network, no
 //! host toolchain for the fetcher, an unfamiliar rung) is reported and skipped;
@@ -19,15 +17,16 @@
 //! — which needs no inputs at all — reachable on a machine whose caches are cold.
 //! The explicit `warm` command is the one caller that treats the same report as
 //! a failure, because warming is all it was asked to do.
+use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use td_recipe::catalog;
-use td_recipe::types::{OstreePin, Recipe, SourcePin};
+use td_recipe::types::{Recipe, SourcePin};
 
 use crate::check_runner::{
-    classify_graph_inputs, is_executable, linux_version_from_file, ostree_cache_is_warm,
-    recipe_closure, source_pin_for_key, RecipeCheckRunner, RecipeNode, SeedInput,
+    classify_graph_inputs, is_executable, linux_version_from_file, recipe_closure,
+    source_pin_for_key, RecipeCheckRunner, RecipeNode, SeedInput,
 };
 
 /// One `td-feed warm crate`/`warm crate-local` job: the argv that populates
@@ -42,8 +41,6 @@ struct VendorJob {
 struct Cold {
     /// Pinned tarballs missing from the shared sources cache.
     sources: Vec<SourcePin>,
-    /// Exact reviewed deploy graphs missing from the shared OSTree cache.
-    ostree: Vec<OstreePin>,
     /// Kernel-header seed arches missing from the same cache.
     headers: Vec<&'static str>,
     /// Rust rungs whose vendored dep closure is missing.
@@ -56,7 +53,6 @@ struct Cold {
 impl Cold {
     fn is_empty(&self) -> bool {
         self.sources.is_empty()
-            && self.ostree.is_empty()
             && self.headers.is_empty()
             && self.vendors.is_empty()
             && self.build_root.is_empty()
@@ -74,15 +70,6 @@ impl Cold {
                 files.len(),
                 plural(files.len()),
                 elided(&files)
-            ));
-        }
-        if !self.ostree.is_empty() {
-            let keys: Vec<&str> = self.ostree.iter().map(|pin| pin.key.as_str()).collect();
-            parts.push(format!(
-                "{} exact OSTree graph{} ({})",
-                keys.len(),
-                plural(keys.len()),
-                elided(&keys)
             ));
         }
         if !self.headers.is_empty() {
@@ -116,74 +103,32 @@ impl Cold {
 }
 
 /// Warm missing declared inputs on the host before the caller takes the ladder
-/// lock (a multi-minute fetch must not hold it). Explicit mode also
-/// reauthenticates every selected OSTree graph; automatic mode does so for a
-/// complete-looking graph until exact recipe admission records it.
+/// lock (a multi-minute fetch must not hold it).
 ///
 /// `Err` is what could not be warmed, and it is the CALLER's to weigh: the
 /// commands that only piggy-back on this report it and build anyway, while the
 /// explicit `warm` command — whose whole job is this — fails on it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum WarmMode {
-    Explicit,
-    Automatic,
-}
-
-impl WarmMode {
-    fn verifies_all_ostree(self) -> bool {
-        matches!(self, WarmMode::Explicit)
-    }
-}
-
-pub(crate) fn preflight(
-    runner: &RecipeCheckRunner,
-    targets: &[&str],
-    mode: WarmMode,
-) -> Result<(), String> {
+pub(crate) fn preflight(runner: &RecipeCheckRunner, targets: &[&str]) -> Result<(), String> {
     let root = runner.repo_root();
-    let cold = survey(root, runner.sources_dir(), runner.ostree_dir(), targets).map_err(|e| {
+    let cold = survey(root, runner.sources_dir(), targets).map_err(|e| {
         format!(
             "could not survey the declared inputs of {}: {e}",
             targets.join(" ")
         )
     })?;
-    let graph = recipe_closure(targets)?;
-    let mut ostree_jobs = cold.ostree.clone();
-    for input in classify_graph_inputs(&graph)? {
-        let SeedInput::Ostree { pin, .. } = input else {
-            continue;
-        };
-        let cache = runner.ostree_dir().join(&pin.cache);
-        let admitted = runner.ostree_pin_is_admitted(&pin)?;
-        if should_verify_ostree(&cache, &pin, mode.verifies_all_ostree(), admitted)
-            && !ostree_jobs.iter().any(|held| held.key == pin.key)
-        {
-            ostree_jobs.push(pin);
-        }
-    }
-    if cold.is_empty() && ostree_jobs.is_empty() {
+    if cold.is_empty() {
         return Ok(());
     }
     // `warm sources` has no per-pin form: it fetches every recipe-owned pin that
     // is cold, which for a small target is more than that target needs. Say so
     // rather than promise a scope the fetcher does not have.
-    if !cold.is_empty() {
-        println!(
-            "   [warm] not cached yet — {}.\n         \
-             Fetching now (declared source archives use their compiled SHA-256 pins; exact\n         \
-             OSTree graphs use their commit/content checksums). The source fetch covers every\n         \
-             cold recipe pin, not only this target. Needs the network, and may build a toolchain\n         \
-             first. Cached archives skip their fetch; explicit OSTree warm still performs the\n         \
-             bounded offline authentication pass.\n",
-            cold.describe()
-        );
-    } else {
-        println!(
-            "   [warm] reauthenticating {} exact OSTree graph{} offline.\n",
-            ostree_jobs.len(),
-            plural(ostree_jobs.len())
-        );
-    }
+    println!(
+        "   [warm] not cached yet — {}.\n         \
+         Fetching now (declared source archives use their compiled SHA-256 pins). The\n         \
+         source fetch covers every cold recipe pin, not only this target. Needs the\n         \
+         network, and may build a toolchain first.\n",
+        cold.describe()
+    );
     let builder = runner.control_builder_path();
     let td_net = resolve_td_net(builder).map_err(|e| format!("no td-net fetch tool ({e})"))?;
 
@@ -198,19 +143,11 @@ pub(crate) fn preflight(
     for job in &cold.vendors {
         run_warm(&td_net, root, builder, &job.args);
     }
-    let mut failed_ostree = Vec::new();
-    for pin in &ostree_jobs {
-        let destination = runner.ostree_dir().join(&pin.cache);
-        let args = ostree_warm_args(pin, &destination)?;
-        if !run_warm(&td_net, root, builder, &args) {
-            failed_ostree.push(pin.key.clone());
-        }
-    }
 
     // Re-survey rather than trust the exit status: `td-feed`'s warms are
     // best-effort and report a failed pin without failing, so what is on disk
     // now is the only honest answer.
-    let cold = survey(root, runner.sources_dir(), runner.ostree_dir(), targets)
+    let cold = survey(root, runner.sources_dir(), targets)
         .map_err(|e| format!("could not re-survey the declared inputs: {e}"))?;
     if !cold.is_empty() {
         return Err(format!(
@@ -218,42 +155,20 @@ pub(crate) fn preflight(
             cold.describe()
         ));
     }
-    if !failed_ostree.is_empty() {
-        return Err(format!(
-            "exact OSTree graph verification or repair failed ({})",
-            failed_ostree.join(" ")
-        ));
-    }
     println!("   [warm] every declared input is cached.\n");
     Ok(())
-}
-
-fn should_verify_ostree(cache: &Path, pin: &OstreePin, verify_all: bool, admitted: bool) -> bool {
-    verify_all || (ostree_cache_is_warm(cache, pin) && !admitted)
 }
 
 /// Classify `target`'s closure the way a build does, then keep only the inputs
 /// that are not on disk. In-tree local sources are committed bytes — never
 /// fetched, so never cold.
-fn survey(
-    root: &Path,
-    sources_dir: &Path,
-    ostree_dir: &Path,
-    targets: &[&str],
-) -> Result<Cold, String> {
+fn survey(root: &Path, sources_dir: &Path, targets: &[&str]) -> Result<Cold, String> {
     let graph = recipe_closure(targets)?;
     let mut sources: Vec<SourcePin> = Vec::new();
-    let mut ostree: Vec<OstreePin> = Vec::new();
     let mut headers: Vec<&'static str> = Vec::new();
     for input in classify_graph_inputs(&graph)? {
         match input {
             SeedInput::Source { pin, .. } => push_cold_source(&mut sources, sources_dir, pin),
-            SeedInput::Ostree { pin, .. } => {
-                let cache = ostree_dir.join(&pin.cache);
-                if !ostree_cache_is_warm(&cache, &pin) {
-                    ostree.push(pin);
-                }
-            }
             SeedInput::LinuxHeaders { arch, .. } => {
                 if !headers.contains(&arch) && !header_seed_is_warm(sources_dir, arch)? {
                     headers.push(arch);
@@ -270,7 +185,6 @@ fn survey(
     }
     Ok(Cold {
         sources,
-        ostree,
         headers,
         vendors: cold_vendor_jobs(root, &graph)?,
         build_root,
@@ -484,29 +398,31 @@ fn crate_name_from_pin(file: &str, version: &str) -> Result<String, String> {
         .ok_or_else(|| format!("pinned file `{file}' is not `<name>-{version}.crate'"))
 }
 
+/// `td-feed export flathub`: every declared Flathub ref, resolved under the
+/// signature rules and published into the host's feed (APPLICATIONS.md
+/// §W.9). Fetching is this command's whole job, so a failure is its own.
+pub(crate) fn export_flathub(runner: &RecipeCheckRunner) -> Result<(), String> {
+    let builder = runner.control_builder_path();
+    let td_net = resolve_td_net(builder).map_err(|e| format!("no td-net fetch tool ({e})"))?;
+    let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
+    println!("   [warm] exporting the declared Flathub refs into the host's feed");
+    if run_warm(
+        &td_net,
+        &root,
+        builder,
+        &["export".to_string(), "flathub".to_string()],
+    ) {
+        Ok(())
+    } else {
+        Err("td-feed export flathub failed; the oracles' guests would fetch from Flathub".into())
+    }
+}
+
 /// Run one `td-feed` warm with the environment it needs, streaming its output so
 /// a multi-minute fetch is not a silent wait. `warm sources` resolves the
 /// recipe-owned pins by BUILDING an evaluator through tests/recipe-eval-tool.sh,
 /// which hard-requires TD_BUILDER_SELF — without it the warm dies on the unset
 /// variable before fetching anything.
-fn ostree_warm_args(pin: &OstreePin, destination: &Path) -> Result<Vec<String>, String> {
-    let destination = destination.to_str().ok_or_else(|| {
-        format!(
-            "OSTree cache destination is not UTF-8: {}",
-            destination.display()
-        )
-    })?;
-    Ok(vec![
-        s("warm"),
-        s("ostree"),
-        pin.repository.clone(),
-        pin.exact_ref.clone(),
-        pin.commit.clone(),
-        pin.content.clone(),
-        destination.to_string(),
-    ])
-}
-
 fn run_warm(td_net: &Path, root: &Path, builder: &Path, args: &[String]) -> bool {
     let mut cmd = Command::new(td_net);
     cmd.arg("feed");
@@ -539,7 +455,7 @@ fn run_warm(td_net: &Path, root: &Path, builder: &Path, args: &[String]) -> bool
 /// freshness there, so an edited net/ cannot leave a stale fetcher behind,
 /// except on a td host without a C compiler, which resolves the deployed
 /// td-net instead.
-fn resolve_td_net(builder: &Path) -> Result<PathBuf, String> {
+pub(crate) fn resolve_td_net(builder: &Path) -> Result<PathBuf, String> {
     println!("   [warm] resolving td's fetch tool (net/); a cold tree builds it once.\n");
     // stdout is the path; stderr is INHERITED, not captured — resolving can mean
     // a minutes-long cargo build, and swallowing its progress would make the
@@ -613,7 +529,7 @@ mod tests {
     fn cold_sources_are_surveyed_from_the_target_closure() {
         let root = scratch("cold-root");
         let sources = scratch("cold-sources");
-        let cold = survey(&root, &sources, &root.join("ostree"), &["system-x86-64"]).unwrap();
+        let cold = survey(&root, &sources, &["system-x86-64"]).unwrap();
         let files: Vec<&str> = cold.sources.iter().map(|p| p.file.as_str()).collect();
         assert!(
             files.iter().any(|f| f.starts_with("rustc-1.96.0-")),
@@ -637,159 +553,30 @@ mod tests {
         let sources = root.join("sources");
         fs::create_dir_all(&sources).unwrap();
         let pins = td_recipe::source_pins::build_root_pins().unwrap();
-        let cold = survey(
-            &root,
-            &sources,
-            &root.join("ostree"),
-            &["linux-x86-64-test"],
-        )
-        .unwrap();
+        let cold = survey(&root, &sources, &["linux-x86-64-test"]).unwrap();
         assert_eq!(cold.build_root.len(), pins.len());
         assert!(cold.describe().contains("build-root pin"));
         for pin in &pins {
             fs::write(sources.join(&pin.file), b"").unwrap();
         }
-        let warm = survey(
-            &root,
-            &sources,
-            &root.join("ostree"),
-            &["linux-x86-64-test"],
-        )
-        .unwrap();
+        let warm = survey(&root, &sources, &["linux-x86-64-test"]).unwrap();
         assert!(warm.build_root.is_empty());
-        let none = survey(&root, &sources, &root.join("ostree"), &["ca-certificates"]).unwrap();
+        let none = survey(&root, &sources, &["ca-certificates"]).unwrap();
         assert!(none.build_root.is_empty());
     }
 
     #[test]
-    fn firefox_surveys_and_completes_its_exact_graph_cache() {
-        let root = scratch("firefox-root");
-        let sources = scratch("firefox-sources");
-        let ostree = root.join("ostree");
-        let cold = survey(&root, &sources, &ostree, &["firefox"]).unwrap();
-        assert!(cold.sources.is_empty());
-        assert_eq!(cold.ostree.len(), 2);
-        let pin = cold
-            .ostree
-            .iter()
-            .find(|pin| pin.key == "firefox-154-source")
-            .expect("the Firefox pin is cold");
-        assert_eq!(pin.key, "firefox-154-source");
-
-        let cache = ostree.join(&pin.cache);
-        fs::create_dir_all(&cache).unwrap();
-        fs::write(cache.join("graph.v1"), b"authenticated graph").unwrap();
-        assert_eq!(
-            survey(&root, &sources, &ostree, &["firefox"])
-                .unwrap()
-                .ostree
-                .len(),
-            2,
-            "a graph without the exact owner record is an interrupted warm"
-        );
-        fs::write(cache.join("td-ostree-cache.v1"), b"wrong owner").unwrap();
-        assert_eq!(
-            survey(&root, &sources, &ostree, &["firefox"])
-                .unwrap()
-                .ostree
-                .len(),
-            2,
-            "a marker for another graph must not suppress warming"
-        );
-        fs::write(
-            cache.join("td-ostree-cache.v1"),
-            format!(
-                "format=1\nrepository={}\nref={}\ncommit={}\ncontent={}\n",
-                pin.repository, pin.exact_ref, pin.commit, pin.content
-            ),
-        )
-        .unwrap();
-        let platform = cold
-            .ostree
-            .iter()
-            .find(|candidate| candidate.key == "freedesktop-platform-25-08-source")
-            .expect("the platform pin is cold");
-        let platform_cache = ostree.join(&platform.cache);
-        fs::create_dir_all(&platform_cache).unwrap();
-        fs::write(platform_cache.join("graph.v1"), b"authenticated graph").unwrap();
-        fs::write(
-            platform_cache.join("td-ostree-cache.v1"),
-            format!(
-                "format=1\nrepository={}\nref={}\ncommit={}\ncontent={}\n",
-                platform.repository, platform.exact_ref, platform.commit, platform.content
-            ),
-        )
-        .unwrap();
-        let warm = survey(&root, &sources, &ostree, &["firefox"]).unwrap();
-        assert!(
-            warm.is_empty(),
-            "completed exact graph stayed cold: {}",
-            warm.describe()
-        );
-        let _ = fs::remove_dir_all(&root);
-        let _ = fs::remove_dir_all(&sources);
-    }
-
-    #[test]
-    fn marker_complete_unadmitted_cache_is_selected_for_offline_repair() {
-        let root = scratch("ostree-repair");
-        let pin =
-            td_recipe::ostree_pins::by_key("firefox-154-source").expect("reviewed Firefox pin");
-        fs::create_dir_all(root.join("objects/00")).unwrap();
-        fs::write(root.join("graph.v1"), b"manifest naming a corrupt object").unwrap();
-        fs::write(root.join("objects/00/corrupt.filez"), b"corrupt").unwrap();
-        fs::write(
-            root.join("td-ostree-cache.v1"),
-            format!(
-                "format=1\nrepository={}\nref={}\ncommit={}\ncontent={}\n",
-                pin.repository, pin.exact_ref, pin.commit, pin.content
-            ),
-        )
-        .unwrap();
-
-        assert!(should_verify_ostree(&root, &pin, false, false));
-        assert!(!should_verify_ostree(&root, &pin, false, true));
-        assert!(should_verify_ostree(&root, &pin, true, true));
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn explicit_warm_cli_wires_full_graph_verification() {
-        assert!(WarmMode::Explicit.verifies_all_ostree());
-        assert!(!WarmMode::Automatic.verifies_all_ostree());
+    fn explicit_warm_callers_skip_the_terminal_gate() {
         let runner = include_str!("check_runner.rs");
-        let wiring = "crate::warm::preflight(&runner, &targets, crate::warm::WarmMode::Explicit)";
+        let wiring = "crate::warm::preflight(&runner, &targets)?;";
         // Two call sites, and both are commands whose operator asked for the
         // fetch: `warm` itself, and `bundle`, which is built to run unattended
         // and so cannot lean on the terminal-gated automatic warm — a
         // backgrounded bundle on a cold checkout climbed the whole ladder
-        // before dying on an unvendored crate directory. Any further Explicit
+        // before dying on an unvendored crate directory. Any further fatal
         // caller should be a deliberate decision, which is what this count
         // keeps it.
         assert_eq!(runner.matches(wiring).count(), 2);
-    }
-
-    #[test]
-    fn ostree_warm_argv_refuses_lossy_cache_paths() {
-        use std::os::unix::ffi::OsStringExt;
-
-        let pin =
-            td_recipe::ostree_pins::by_key("firefox-154-source").expect("reviewed Firefox pin");
-        let args = ostree_warm_args(&pin, Path::new("/cache/firefox")).unwrap();
-        assert_eq!(
-            args,
-            vec![
-                "warm",
-                "ostree",
-                pin.repository.as_str(),
-                pin.exact_ref.as_str(),
-                pin.commit.as_str(),
-                pin.content.as_str(),
-                "/cache/firefox",
-            ]
-        );
-        let invalid = PathBuf::from(std::ffi::OsString::from_vec(vec![b'/', 0xff]));
-        assert!(ostree_warm_args(&pin, &invalid).is_err());
     }
 
     // …and the converse, which is what keeps a warm tree free of both the fetch
@@ -798,7 +585,7 @@ mod tests {
     fn a_fully_cached_tree_surveys_clean() {
         let root = scratch("warm-root");
         let sources = scratch("warm-sources");
-        let cold = survey(&root, &sources, &root.join("ostree"), &["system-x86-64"]).unwrap();
+        let cold = survey(&root, &sources, &["system-x86-64"]).unwrap();
         assert!(
             !cold.build_root.is_empty(),
             "the image's kernel builds in the root"
@@ -815,19 +602,6 @@ mod tests {
             )
             .unwrap();
         }
-        for pin in &cold.ostree {
-            let cache = root.join("ostree").join(&pin.cache);
-            fs::create_dir_all(&cache).unwrap();
-            fs::write(cache.join("graph.v1"), b"authenticated graph").unwrap();
-            fs::write(
-                cache.join("td-ostree-cache.v1"),
-                format!(
-                    "format=1\nrepository={}\nref={}\ncommit={}\ncontent={}\n",
-                    pin.repository, pin.exact_ref, pin.commit, pin.content
-                ),
-            )
-            .unwrap();
-        }
         for job in &cold.vendors {
             let vendor = root
                 .join(".td-build-cache/crate-vendor")
@@ -839,7 +613,7 @@ mod tests {
         // Crates alone are an INTERRUPTED warm — td-feed publishes the marker
         // last — and must still read cold, or the repair is skipped and the
         // build fails the vendor gate instead.
-        let partial = survey(&root, &sources, &root.join("ostree"), &["system-x86-64"]).unwrap();
+        let partial = survey(&root, &sources, &["system-x86-64"]).unwrap();
         assert_eq!(
             partial.vendors.len(),
             cold.vendors.len(),
@@ -865,7 +639,7 @@ mod tests {
             let digest = td_engine::sha256::sha256_file(&lock).unwrap();
             fs::write(vendor.join(".warm-complete"), format!("{digest}\n1\n")).unwrap();
         }
-        let after = survey(&root, &sources, &root.join("ostree"), &["system-x86-64"]).unwrap();
+        let after = survey(&root, &sources, &["system-x86-64"]).unwrap();
         assert!(
             after.is_empty(),
             "still cold after caching every declared input: {}",

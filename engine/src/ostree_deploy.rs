@@ -33,11 +33,10 @@ const REQUIRED_USR_ALIASES: &[&str] = &["bin", "lib", "lib64", "sbin"];
 static NEXT_STAGING_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Renames `old` to `new` and must fail, leaving both untouched, when `new`
-/// exists. The builder passes `renameat2(RENAME_NOREPLACE)`, which refuses
-/// even a concurrent writer's destination. An absence check followed by
-/// `rename(2)` meets this only for a caller that alone publishes into the
-/// parent, since `rename(2)` replaces an empty directory. td-engine has no
-/// syscall surface of its own.
+/// exists. An absence check followed by `rename(2)` meets this only for a
+/// caller that alone publishes into the parent, since `rename(2)` replaces an
+/// empty directory: td-net's `rename_absent` holds the cache lock for that.
+/// td-engine has no syscall surface of its own.
 pub type RenameNoReplace = fn(&CStr, &CStr) -> std::io::Result<()>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -854,9 +853,8 @@ mod tests {
     use super::*;
     use std::os::unix::fs::MetadataExt;
 
-    // Single-threaded stand-in for the builder's renameat2: the tests need a
-    // rename that refuses an existing destination, not the syscall's atomicity,
-    // which builder/src/sys.rs tests on its own.
+    // Single-threaded stand-in for td-net's `rename_absent`: the tests need a
+    // rename that refuses an existing destination, not the caller's lock.
     fn rename_absent(old: &CStr, new: &CStr) -> std::io::Result<()> {
         let old = Path::new(std::ffi::OsStr::from_bytes(old.to_bytes()));
         let new = Path::new(std::ffi::OsStr::from_bytes(new.to_bytes()));

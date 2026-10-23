@@ -4,16 +4,23 @@ use td_engine::application_spec::dynamic_application_policy;
 use td_engine::launcher::LauncherDeclaration;
 use td_engine::permissions::{BusAccess, FilesystemAccess, PermissionPolicy, PermissionSocket};
 
+/// The runtime policy the declaration names; td-app holds the fetched
+/// runtime to it at admission.
 const RUNTIME: &str = "freedesktop-platform-25-08";
 const ENTRY: &str = "/app/bin/firefox";
+/// The branch of the app ref it follows; the version itself floats with
+/// Flathub (APPLICATIONS.md §W.9).
+const VERSION: &str = "stable";
 
-/// The exact Flathub Firefox deploy, admitted only after the builder has
-/// resolved its launcher, every application ELF edge, and the selected 25.08
-/// runtime without executing imported bytes.
+/// Flathub's Firefox, as a declaration alone: the package carries its
+/// manifest, spec and launcher row, the spec names the app and runtime refs
+/// in td-engine's Flathub table, and the account's td-app fetches, verifies
+/// and validates both at its first launch (APPLICATIONS.md §W.9). No byte of
+/// it is in the image, so the recipe has no source, no payload and no steps.
 pub fn recipe() -> Recipe {
-    let Some(dynamic_policy) = dynamic_application_policy("firefox", RUNTIME) else {
+    if dynamic_application_policy("firefox", RUNTIME).is_none() {
         return invalid_recipe("dynamic-policy");
-    };
+    }
     let Ok(declaration) = ApplicationDeclaration::new(RUNTIME, ENTRY)
         .and_then(|value| value.with_alias("org.mozilla.firefox"))
         .and_then(|value| value.with_environment("GTK_USE_PORTAL", "1"))
@@ -42,34 +49,18 @@ pub fn recipe() -> Recipe {
     else {
         return invalid_recipe("permissions");
     };
-    Recipe::mesboot("firefox", "154.0")
-        .source_input("firefox-154-source")
-        .payload_inputs(&[RUNTIME])
-        .steps(vec![
-            Step::CopyTree {
-                from: "{payload:firefox-source}".into(),
-                dest: "{out}/files".into(),
-            },
-            Step::validate_dynamic_application(
-                &declaration,
-                dynamic_policy.library_paths(),
-                dynamic_policy.optional_targets(),
-                dynamic_policy.optional_links(),
-            ),
-        ])
+    Recipe::mesboot("firefox", VERSION)
+        .steps(Vec::new())
         .application(declaration)
         .application_launcher(launcher)
         .application_permissions(permissions)
 }
 
 fn invalid_recipe(field: &str) -> Recipe {
-    Recipe::mesboot("firefox", "154.0")
-        .source_input("firefox-154-source")
-        .payload_inputs(&[RUNTIME])
-        .steps(vec![Step::Require {
-            paths: vec![format!("{{out}}/invalid-firefox-{field}")],
-            exec: false,
-        }])
+    Recipe::mesboot("firefox", VERSION).steps(vec![Step::Require {
+        paths: vec![format!("{{out}}/invalid-firefox-{field}")],
+        exec: false,
+    }])
 }
 
 #[cfg(test)]
@@ -77,15 +68,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn deploy_is_bound_to_one_runtime_and_terminal_validator() {
+    fn the_package_is_a_declaration_whose_refs_td_app_fetches() {
         let recipe = recipe();
+        let source = td_engine::flathub_app::flathub_source("firefox").expect("declared");
+        assert_eq!(recipe.flathub_runtime(), Some(source.runtime));
+        assert_eq!(
+            source.application,
+            Some("app/org.mozilla.firefox/x86_64/stable")
+        );
+        assert_eq!(source.policy_runtime, RUNTIME);
         assert!(recipe.is_foreign());
-        assert!(recipe.is_foreign_source());
-        assert_eq!(recipe.source_input.as_deref(), Some("firefox-154-source"));
-        assert_eq!(recipe.payload_inputs, Some(vec![RUNTIME.into()]));
+        assert!(!recipe.is_foreign_source());
+        assert_eq!(recipe.source_input, None);
+        assert_eq!(recipe.payload_inputs, None);
+        assert!(recipe.steps.as_deref().is_some_and(<[Step]>::is_empty));
         let declaration = recipe.application.as_ref().expect("declaration");
         assert_eq!(declaration.runtime(), RUNTIME);
         assert_eq!(declaration.entry(), ENTRY);
+        assert_eq!(declaration.entry(), source.entry);
         assert_eq!(declaration.alias(), Some("org.mozilla.firefox"));
         assert_eq!(
             declaration.environment().collect::<Vec<_>>(),
@@ -95,30 +95,7 @@ mod tests {
                 ("MOZ_ENABLE_WAYLAND", "1"),
             ]
         );
-        assert!(matches!(
-            recipe.steps.as_deref(),
-            Some([
-                Step::CopyTree { from, dest },
-                Step::ValidateDynamicApplication {
-                    entry,
-                    runtime,
-                    library_paths,
-                    optional_targets,
-                    optional_links,
-                }
-            ])
-                if from == "{payload:firefox-source}"
-                    && dest == "{out}/files"
-                    && entry == ENTRY
-                    && runtime == RUNTIME
-                    && library_paths == dynamic_application_policy("firefox", RUNTIME)
-                        .expect("dynamic policy")
-                        .library_paths()
-                    && optional_targets == dynamic_application_policy("firefox", RUNTIME)
-                        .expect("dynamic policy")
-                        .optional_targets()
-                    && *optional_links == 102
-        ));
+        assert!(dynamic_application_policy("firefox", RUNTIME).is_some());
     }
 
     #[test]

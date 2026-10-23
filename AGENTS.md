@@ -134,7 +134,7 @@ Adding an application is a reviewed pin. Adding a class of foreign output is
 an amendment to this file.
 
 Flathub applications and runtimes are the second class (`APPLICATIONS.md`
-§W.9, landing in increments). Their bytes are neither pinned nor in
+§W.9). Their bytes are neither pinned nor in
 `/td/store` or the image: what is reviewed is the application's declaration
 (repository, exact app and runtime refs and td's own policy) and Flathub's
 signing key compiled into td-net. The payload is fetched on demand into the

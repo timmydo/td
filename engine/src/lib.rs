@@ -30,10 +30,10 @@
 //! offline loader-graph validator) and `ostree_deploy` moved here from the
 //! builder so the image build and `td-net`'s on-demand Flathub admission
 //! (APPLICATIONS.md §W.9) run one implementation. The builder keeps the ELF
-//! writers, and passes `ostree_deploy` its `renameat2` publication: this
-//! crate stays free of syscalls. `flathub_app` holds §W.9's declarations
-//! and the pure half of its admission: the cache's state formats and
-//! rules 3 and 4.
+//! writers, and td-net, `ostree_deploy`'s only caller, passes it the rename
+//! that publishes a deploy: this crate stays free of syscalls. `flathub_app`
+//! holds §W.9's declarations and the pure half of its admission: the cache's
+//! state formats and rules 3 and 4.
 //!
 //! `sha512` and `ed25519` arrive with AUTHENTICATED deployments, and are
 //! target-side in that same way — which is why the crate's first line no

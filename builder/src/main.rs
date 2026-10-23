@@ -61,7 +61,6 @@ mod lock;
 mod main_integration;
 mod nar;
 mod oci;
-mod ostree;
 mod ready;
 mod repo;
 mod run_capped;
@@ -9382,48 +9381,6 @@ fn main() -> ExitCode {
         // Internal process-lifetime boundary. It is intentionally absent from
         // user-facing help; check-host and gate-run construct it themselves.
         Some("check-pidns-run") => sandbox::pid_namespace_cli(args.get(2..).unwrap_or(&[])),
-        // Reconstruct only one exact commit's authenticated `files/' subtree
-        // from a cache populated by `td-feed warm ostree'. The result is a
-        // complete plain tree suitable for recursive content-addressed
-        // interning; no imported program executes here.
-        //
-        //   ostree-materialize CACHE REF COMMIT CONTENT DEST
-        Some("ostree-materialize") => match args.get(2..) {
-            Some([cache, exact_ref, commit, content, destination]) => {
-                match ostree::materialize(
-                    Path::new(cache),
-                    exact_ref,
-                    commit,
-                    content,
-                    Path::new(destination),
-                ) {
-                    Ok(stats) => {
-                        for warning in &stats.warnings {
-                            eprintln!("td-builder: ostree-materialize: warning: {warning}");
-                        }
-                        println!(
-                            "objects={} paths={} directories={} regular={} symlinks={} decoded-bytes={} transfer-bytes={}",
-                            stats.objects,
-                            stats.paths,
-                            stats.directories,
-                            stats.regular_files,
-                            stats.symlinks,
-                            stats.decoded_bytes,
-                            stats.transfer_bytes
-                        );
-                        ExitCode::SUCCESS
-                    }
-                    Err(error) => {
-                        eprintln!("td-builder: ostree-materialize: {error}");
-                        ExitCode::FAILURE
-                    }
-                }
-            }
-            _ => {
-                eprintln!("usage: td-builder ostree-materialize CACHE REF COMMIT CONTENT DEST");
-                ExitCode::from(2)
-            }
-        },
         // gate-run — td's OWN gate runner: the loop scheduler that replaced `make`
         // on the spine. The gates are compiled in (src/gate_defs/*.rs registry);
         // runs the requested tier/gates with cheap-serial + heavy-parallel
@@ -12440,7 +12397,6 @@ fn main() -> ExitCode {
             eprintln!("       td-builder gzip-decompress GZFILE OUTFILE");
             eprintln!("       td-builder nar-hash PATH");
             eprintln!("       td-builder nar-restore NARFILE DEST");
-            eprintln!("       td-builder ostree-materialize CACHE REF COMMIT CONTENT DEST");
             eprintln!("       td-builder tar-extract TARFILE DEST");
             eprintln!("       td-builder tar-gz-extract TAR_GZ_FILE DEST");
             eprintln!("       td-builder tar-bz2-extract TAR_BZ2_FILE DEST");

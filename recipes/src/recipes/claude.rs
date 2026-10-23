@@ -4,6 +4,9 @@ use td_engine::application_spec::dynamic_application_policy;
 use td_engine::launcher::LauncherDeclaration;
 use td_engine::permissions::{FilesystemAccess, PermissionPolicy, PermissionSocket};
 
+/// The runtime policy the declaration names. The runtime itself is the
+/// Flathub ref td-app fetches into the account's cache (APPLICATIONS.md
+/// §W.9), and td-app validates this package against it at admission.
 const RUNTIME: &str = "freedesktop-platform-25-08";
 const ENTRY: &str = "/app/bin/claude";
 const VERSION: &str = "2.1.260";
@@ -30,9 +33,9 @@ const PIDS_MAX: u32 = 2048;
 /// a launcher card that opens it and the executable state subtree that lets
 /// the application update itself.
 pub fn recipe() -> Recipe {
-    let Some(dynamic_policy) = dynamic_application_policy("claude", RUNTIME) else {
+    if dynamic_application_policy("claude", RUNTIME).is_none() {
         return invalid_recipe("dynamic-policy");
-    };
+    }
     let Ok(declaration) = ApplicationDeclaration::new(RUNTIME, ENTRY)
         // The runtime's /bin/sh is bash, but Claude Code's Bash tool reads
         // SHELL and wants bash or zsh by name.
@@ -67,22 +70,14 @@ pub fn recipe() -> Recipe {
     };
     Recipe::mesboot("claude", VERSION)
         .source_input("claude-code-source")
-        .payload_inputs(&[RUNTIME])
-        .steps(vec![
-            // `/app` is the package's `files/` root, so the entry lands at
-            // `files/bin/claude`.
-            Step::CopyFile {
-                file: "{payload:claude-source}".into(),
-                to: "{out}/files/bin/claude".into(),
-                exec: true,
-            },
-            Step::validate_dynamic_application(
-                &declaration,
-                dynamic_policy.library_paths(),
-                dynamic_policy.optional_targets(),
-                dynamic_policy.optional_links(),
-            ),
-        ])
+        // `/app` is the package's `files/` root, so the entry lands at
+        // `files/bin/claude`. Nothing else touches it: no build stages the
+        // runtime, so td-app validates the package at admission.
+        .steps(vec![Step::CopyFile {
+            file: "{payload:claude-source}".into(),
+            to: "{out}/files/bin/claude".into(),
+            exec: true,
+        }])
         .application(declaration)
         .application_launcher(launcher)
         .application_permissions(permissions)
@@ -99,7 +94,6 @@ exec "$TD_RECIPE_EVAL" check-run claude 1
 fn invalid_recipe(field: &str) -> Recipe {
     Recipe::mesboot("claude", VERSION)
         .source_input("claude-code-source")
-        .payload_inputs(&[RUNTIME])
         .steps(vec![Step::Require {
             paths: vec![format!("{{out}}/invalid-claude-{field}")],
             exec: false,
@@ -111,12 +105,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn payload_is_placed_at_its_entry_and_bound_to_one_runtime_validator() {
+    fn payload_is_placed_at_its_entry_and_its_runtime_is_fetched() {
         let recipe = recipe();
         assert!(recipe.is_foreign());
         assert!(recipe.is_foreign_source());
         assert_eq!(recipe.source_input.as_deref(), Some("claude-code-source"));
-        assert_eq!(recipe.payload_inputs, Some(vec![RUNTIME.into()]));
+        // No build stages the runtime: td-app fetches the declared ref.
+        assert_eq!(recipe.payload_inputs, None);
+        let source = td_engine::flathub_app::flathub_source("claude").expect("declared");
+        assert_eq!(recipe.flathub_runtime(), Some(source.runtime));
+        assert_eq!(source.application, None);
+        assert_eq!(source.entry, ENTRY);
         let declaration = recipe.application.as_ref().expect("declaration");
         assert_eq!(declaration.runtime(), RUNTIME);
         assert_eq!(declaration.entry(), ENTRY);
@@ -125,30 +124,14 @@ mod tests {
             declaration.environment().collect::<Vec<_>>(),
             vec![("DISABLE_UPDATES", "1"), ("SHELL", "/usr/bin/bash")]
         );
+        // A native copy alone: td-app validates the package at admission.
         assert!(matches!(
             recipe.steps.as_deref(),
-            Some([
-                Step::CopyFile { file, to, exec: true },
-                Step::ValidateDynamicApplication {
-                    entry,
-                    runtime,
-                    library_paths,
-                    optional_targets,
-                    optional_links: 0,
-                },
-            ]) if file == "{payload:claude-source}"
-                && to == "{out}/files/bin/claude"
-                && entry == ENTRY
-                && runtime == RUNTIME
-                && library_paths == dynamic_application_policy("claude", RUNTIME)
-                    .expect("dynamic policy")
-                    .library_paths()
-                && optional_targets == dynamic_application_policy("claude", RUNTIME)
-                    .expect("dynamic policy")
-                    .optional_targets()
+            Some([Step::CopyFile { file, to, exec: true }])
+                if file == "{payload:claude-source}" && to == "{out}/files/bin/claude"
         ));
-        // The policy the validator closes against is the one that names no
-        // package library root: the whole loader graph is the runtime's.
+        // The policy td-app's validator closes against names no package
+        // library root: the whole loader graph is the runtime's.
         let policy = dynamic_application_policy("claude", RUNTIME).expect("dynamic policy");
         assert!(policy.library_paths().is_empty());
         assert!(policy.optional_targets().is_empty());

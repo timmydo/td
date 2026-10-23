@@ -45,10 +45,8 @@ const SYS_PRCTL: usize = 157;
 const SYS_GETPPID: usize = 110;
 const SYS_SETPRIORITY: usize = 141;
 const SYS_PRLIMIT64: usize = 302;
-const SYS_RENAMEAT2: usize = 316;
 
 const AT_FDCWD: isize = -100;
-const RENAME_NOREPLACE: usize = 1;
 
 /// setpriority/getpriority `which`: act on a single process by PID (0 = self).
 const PRIO_PROCESS: usize = 0;
@@ -283,22 +281,6 @@ pub fn bring_loopback_up() -> io::Result<()> {
 /// reflink) are returned so the caller can fall back to a byte copy.
 pub fn reflink(dst_fd: i32, src_fd: i32) -> io::Result<()> {
     check(unsafe { syscall5(SYS_IOCTL, dst_fd as usize, FICLONE, src_fd as usize, 0, 0) })
-}
-
-/// Atomically rename `old` to `new` only when `new` is absent. Stable `std`
-/// exposes only replacement rename, which is unsafe for publishing a completed
-/// directory after a long materialization race window.
-pub fn rename_noreplace(old: &CStr, new: &CStr) -> io::Result<()> {
-    check(unsafe {
-        syscall5(
-            SYS_RENAMEAT2,
-            AT_FDCWD as usize,
-            old.as_ptr() as usize,
-            AT_FDCWD as usize,
-            new.as_ptr() as usize,
-            RENAME_NOREPLACE,
-        )
-    })
 }
 
 /// Write a diagnostic line to fd 2 (stderr) via the raw write(2) syscall —
@@ -1253,62 +1235,6 @@ mod tests {
     }
 
     use super::*;
-    use std::os::unix::ffi::OsStrExt;
-
-    #[test]
-    fn rename_noreplace_never_replaces_an_existing_directory() {
-        let _root_cleanup = crate::test_temp::TempDir::new("td-builder-rename-noreplace").unwrap();
-        let root = _root_cleanup.join("fixture");
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir(&root).unwrap();
-        let old = root.join("old");
-        let new = root.join("new");
-        std::fs::create_dir(&old).unwrap();
-        std::fs::create_dir(&new).unwrap();
-        let old_c = std::ffi::CString::new(old.as_os_str().as_bytes()).unwrap();
-        let new_c = std::ffi::CString::new(new.as_os_str().as_bytes()).unwrap();
-
-        let error = rename_noreplace(&old_c, &new_c).unwrap_err();
-
-        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
-        assert!(old.is_dir());
-        assert!(new.is_dir());
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn rename_noreplace_contract_is_value_and_caller_pinned() {
-        assert_eq!(SYS_RENAMEAT2, 316);
-        assert_eq!(AT_FDCWD, -100);
-        assert_eq!(RENAME_NOREPLACE, 1);
-        let shipped_sys = shipped_part(include_str!("sys.rs"));
-        assert_eq!(shipped_sys.matches("SYS_RENAMEAT2").count(), 2);
-        assert_eq!(shipped_sys.matches("RENAME_NOREPLACE").count(), 2);
-        assert_eq!(shipped_sys.matches("pub fn rename_noreplace(").count(), 1);
-        let compact: String = shipped_sys
-            .chars()
-            .filter(|character| !character.is_whitespace())
-            .collect();
-        assert!(compact.contains(
-            "syscall5(SYS_RENAMEAT2,AT_FDCWDasusize,old.as_ptr()asusize,AT_FDCWDasusize,new.as_ptr()asusize,RENAME_NOREPLACE,)"
-        ));
-
-        fn count_production_calls(path: &std::path::Path) -> usize {
-            let mut count = 0usize;
-            for entry in std::fs::read_dir(path).unwrap() {
-                let path = entry.unwrap().path();
-                if path.is_dir() {
-                    count += count_production_calls(&path);
-                } else if path.extension().and_then(|value| value.to_str()) == Some("rs") {
-                    let source = std::fs::read_to_string(path).unwrap();
-                    count += shipped_part(&source).matches("rename_noreplace").count();
-                }
-            }
-            count
-        }
-        let source_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        assert_eq!(count_production_calls(&source_root), 2);
-    }
 
     #[test]
     fn getuid_matches_proc_status() {

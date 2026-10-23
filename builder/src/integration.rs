@@ -24,8 +24,9 @@ struct Step {
 const STEPS: &[Step] = &[
     Step {
         name: "warm",
-        argv: &["warm", "system-x86-64"],
-        proves: "the system image's pinned inputs are present",
+        argv: &["warm", "system-x86-64", "--flathub"],
+        proves: "the system image's pinned inputs are present, and the host's feed holds the \
+                 Flathub applications the guests fetch",
     },
     Step {
         name: "qemu-boot-system",

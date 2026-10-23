@@ -323,6 +323,10 @@ table uses it for a live boot, whose initramfs alone mounts the install
 medium at `/run/td-media`: the stock session's window units name that path,
 so the live session opens only the installer (td-install/INSTALLER.md "Live
 startup") while boot health, which requires the terminal, still runs.
+Firefox and the oracles' first fetches name
+`/run/td-applications-on-demand` instead, which the init creates on every
+boot without the autotest token and on every live one, so they run at boot
+only on an oracle's (APPLICATIONS.md §W.9).
 Exiting 0 from a gated `exec=` would not do: a `restart=always` daemon that
 exits is restarted into the capped hold, and its strict dependents are
 skipped. Per **I5** a `tty=` unit may not declare it.

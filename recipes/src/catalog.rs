@@ -899,7 +899,6 @@ mod named_dirs_tests {
             "recipes/src/bin/td_recipe_eval/checks/rust_toolchain.rs",
             "recipes/src/recipes/jetbrains-mono-nerd-font.rs",
             "recipes/src/source_pins.rs",
-            "recipes/src/ostree_pins.rs",
         ] {
             assert!(checks.contains(&content), "{content} not check content");
         }

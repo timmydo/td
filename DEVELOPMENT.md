@@ -200,7 +200,7 @@ a local source — runs it, as does a check with no
 such pass. The evaluator's own sources key a check in two
 parts: `evaluator-checks`, what is a check's own content though every
 key holds it — the Rust check bodies under
-`recipes/src/bin/td_recipe_eval/checks/`, the source and OSTree pins
+`recipes/src/bin/td_recipe_eval/checks/`, the source pins
 (which a recipe's build JSON names only by key), a recipe file the
 evaluator's code reads, and a crate file the shared modules compile in,
 such as the TZif reader tzdata#1 asserts — which never defers, and
@@ -476,7 +476,10 @@ treats an evaluator path as a miss and lists every check.
 
 The system-level qemu oracles are a separate tier, `td-builder check
 integration`, which `check` alone does not include. It runs on the host,
-never in the gate sandbox: it warms the system image's inputs, then runs
+never in the gate sandbox: it warms the system image's inputs and
+exports the declared Flathub refs into the host's feed (`warm
+--flathub`, APPLICATIONS.md §W.9), which the oracles' guests fetch
+Firefox and Claude Code's runtime from, then runs
 `qemu-boot-system`, `qemu-deploy-rollback`, `qemu-boot-live` and
 `qemu-install-system`, each with a banner saying what it proves, its
 outcome and wall time, recorded in the check history as

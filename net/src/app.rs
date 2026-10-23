@@ -950,7 +950,7 @@ fn export(
         .ok_or("resolve deadline overflows")?;
     // The graphs this export may remove later: those it recorded before
     // and those it creates now. A graph already in the store, such as one
-    // `export graphs` pinned, is never its own.
+    // another export placed, is never its own.
     let exported_path = cache.join(EXPORTED);
     // Only a record that is not a file starts again; any other failure to
     // read it is reported, since starting again abandons what it owned.
@@ -1687,9 +1687,9 @@ mod tests {
         assert!(graph(&new).exists() && graph(&app).exists());
     }
 
-    /// The store keeps a graph the export did not create, such as a pinned
-    /// one, and a graph any ref file there still names, such as a ref no
-    /// longer declared.
+    /// The store keeps a graph the export did not create, such as one
+    /// another export placed, and a graph any ref file there still names,
+    /// such as a ref no longer declared.
     #[test]
     fn export_removes_only_its_own_graphs_no_ref_names() {
         let fixture = Fixture::new("feed-owned");

@@ -26,7 +26,6 @@
 //                      Also asserts both gates are load-bearing: a wrong pinned hash reds
 //                      warm, a corrupted store byte reds serve (sidecar mismatch).
 mod debian;
-mod graphs;
 mod vendor;
 
 use sha2::{Digest, Sha256};
@@ -3183,50 +3182,9 @@ fn warm_usage() -> ! {
     eprintln!(
         "usage:\n  td-feed warm index INDEX STORE        (also: td-feed warm INDEX STORE)\n  \
          td-feed warm crate CRATE VERSION [DEST]\n  td-feed warm crate-local SRCDIR DEST\n  \
-         td-feed warm sources\n  td-feed warm build-root\n  td-feed warm kernel-headers ARCH\n  \
-         td-feed warm ostree REPOSITORY REF COMMIT CONTENT DEST"
+         td-feed warm sources\n  td-feed warm build-root\n  td-feed warm kernel-headers ARCH"
     );
     std::process::exit(2);
-}
-
-fn warm_ostree(a: &[String]) -> Result<(), String> {
-    let repository = a
-        .get(3)
-        .ok_or_else(|| "warm ostree has no repository".to_string())?;
-    let exact_ref = a
-        .get(4)
-        .ok_or_else(|| "warm ostree has no exact ref".to_string())?;
-    let commit = a
-        .get(5)
-        .ok_or_else(|| "warm ostree has no commit".to_string())?;
-    let content = a
-        .get(6)
-        .ok_or_else(|| "warm ostree has no content checksum".to_string())?;
-    let destination = PathBuf::from(
-        a.get(7)
-            .ok_or_else(|| "warm ostree has no destination".to_string())?,
-    );
-    let parent = crate::ostree::destination_parent(&destination)?;
-    std::fs::create_dir_all(parent)
-        .map_err(|error| format!("mkdir {}: {error}", parent.display()))?;
-    require_disk_backed(parent).map_err(|error| error.to_string())?;
-    let spec = crate::ostree::AcquireSpec::parse(repository, exact_ref, commit, content)?;
-    let (stats, fetched) = crate::ostree::acquire(&spec, &destination)?;
-    println!(
-        "td-feed warm ostree: {} {} at {} — {} objects, {} paths ({} directories, {} regular, {} symlinks), {} decoded bytes, {} transfer bytes -> {}",
-        if fetched { "fetched" } else { "reused" },
-        spec.commit_hex(),
-        exact_ref,
-        stats.objects,
-        stats.paths,
-        stats.directories,
-        stats.regular_files,
-        stats.symlinks,
-        stats.decoded_bytes,
-        stats.transfer_bytes,
-        destination.display()
-    );
-    Ok(())
 }
 
 /// Extract `HOST:PORT` from a `serve` announcement line (`… on http://HOST:PORT/ …`).
@@ -3450,13 +3408,6 @@ pub fn run(a: &[String]) {
                 Err(error) => die(format!("export flathub: {error}")),
             }
         }
-        Some(action @ ("export" | "consume"))
-            if a.len() == 3 && a.get(2).map(String::as_str) == Some("graphs") =>
-        {
-            if let Err(error) = graphs::run(&repo_root(), action == "consume") {
-                die(format!("{action} graphs: {error}"));
-            }
-        }
         // warm <action> — the structured host-PREP orchestration (consolidated warm-*.sh).
         // The low-level `warm INDEX STORE` primitive (feed-shared gate, feed-ensure serve)
         // stays: dispatch on a known action keyword, else treat it as the legacy 2-arg form.
@@ -3491,11 +3442,6 @@ pub fn run(a: &[String]) {
                     }
                 }
                 Some("kernel-headers") if a.len() == 4 => warm_kernel_headers(&root, &a[3]),
-                Some("ostree") if a.len() == 8 => {
-                    if let Err(error) = warm_ostree(a) {
-                        die(format!("warm ostree: {error}"));
-                    }
-                }
                 // Legacy: `warm INDEX STORE` (a[2] is an index path, not an action keyword).
                 // Exclude every action keyword so a mis-argc'd action (e.g. `warm crate X`)
                 // reports usage instead of being misread as an index path.
@@ -3509,7 +3455,6 @@ pub fn run(a: &[String]) {
                                 | "sources"
                                 | "build-root"
                                 | "kernel-headers"
-                                | "ostree"
                         ) =>
                 {
                     warm_index(&a[2], &a[3])
@@ -3556,10 +3501,9 @@ pub fn run(a: &[String]) {
                 "usage:\n  td-feed warm INDEX STORE   (low-level; also: warm index INDEX STORE)\n  \
                  td-feed warm crate CRATE VERSION [DEST]\n  td-feed warm crate-local SRCDIR DEST\n  \
                  td-feed warm sources\n  td-feed warm build-root\n  td-feed warm kernel-headers ARCH\n  \
-                 td-feed warm ostree REPOSITORY REF COMMIT CONTENT DEST\n  \
                  td-feed debian-root resolve LOCK\n  \
                  td-feed serve STORE ADDR\n  \
-                 td-feed export sources  (publish existing host archives; no downloads)\n  td-feed consume sources  (TD_FEED_BASE or VM endpoint; no upstream fallback)\n  td-feed export cargo LOCK ARCHIVES\n  td-feed consume cargo LOCK ARCHIVES\n  td-feed export vendors [TARGET]\n  td-feed consume vendors [TARGET]\n  td-feed export graphs\n  td-feed consume graphs\n  td-feed export flathub  (declared Flathub refs, verified, for td-app; HOME cache)\n  td-feed ensure-serve\n  td-feed cargo-proxy STORE ADDR\n  td-feed selftest\n  \
+                 td-feed export sources  (publish existing host archives; no downloads)\n  td-feed consume sources  (TD_FEED_BASE or VM endpoint; no upstream fallback)\n  td-feed export cargo LOCK ARCHIVES\n  td-feed consume cargo LOCK ARCHIVES\n  td-feed export vendors [TARGET]\n  td-feed consume vendors [TARGET]\n  td-feed export flathub  (declared Flathub refs, verified, for td-app; HOME cache)\n  td-feed ensure-serve\n  td-feed cargo-proxy STORE ADDR\n  td-feed selftest\n  \
                  td-feed cargo-proxy-selftest\n  td-feed warm-selftest"
             );
             std::process::exit(2);

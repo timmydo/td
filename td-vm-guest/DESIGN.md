@@ -148,7 +148,7 @@ that account; their canonical paths must equal `/var/home/NAME` and its
 using `nodev,nosuid`. It separately requires `/td/store` to remain part
 of the read-only EROFS root. It prepares mode-0700, human-owned physical
 state at `~/.td/build-daemon/ladder-shared-v1`, including separate seed
-and build-output stores, plus `~/.td/{sources,ostree}` and the
+and build-output stores, plus `~/.td/sources` and the
 worktree's ignored `.td-build-cache`. These are the existing evaluator
 and builder paths; the logical store prefix seen inside a derivation
 remains `/td/store`. The helper does not bind, redirect or write the

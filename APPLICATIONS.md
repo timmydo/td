@@ -905,7 +905,7 @@ reviewed capacity landing**:
 | constant | today | capacity consequence |
 |---|---|---|
 | `td-boot/src/protocol.rs`'s `MIN_VOLUME_BYTES` | 5 GiB | three deployment-sized copies are transiently live during publish. The profiling policy permits 128 MiB of debug companions in each copy. The floor retains its existing capacity; actual non-debug payloads and Btrfs metadata plus `@var` must also fit. `td-install` enforces this as an admission floor, not a promise that every deployment fits; a larger update can still fail with `ENOSPC` while staging, before selectors change |
-| the QEMU oracle's `PERSISTENT_VOLUME_BYTES` / headroom | 10.375 GiB / 1 GiB, `copies = 3` | reserves 384 MiB for three ceiling-sized debug trees, nine GiB for three non-debug deployment copies, and one GiB of Btrfs/headroom. The oracle separately asserts that this remains at or above target admission's 5 GiB floor |
+| the QEMU oracle's `PERSISTENT_VOLUME_BYTES` / headroom | 14.375 GiB / 1 GiB, `copies = 3` | reserves 384 MiB for three ceiling-sized debug trees, nine GiB for three non-debug deployment copies, four GiB for application caches, and one GiB of Btrfs/headroom. The oracle separately asserts that this remains at or above target admission's 5 GiB floor |
 | `ESP_BYTES` | 512 MiB | **not** a problem — the ESP carries kernel and initramfs only. Named here because a reader would otherwise assume it is the partition that grows |
 
 The disk cost is therefore **2× the browser permanently and 3× across an
@@ -1025,14 +1025,15 @@ PATH=/app/bin:/usr/bin
 The permission policy sections follow in the same file without a second
 `format` key. `Recipe::application_permissions` supplies typed immutable
 defaults; an application without that policy, or a policy without an
-application, is refused. Runtime resolution requires one matching
-`payload_inputs` entry, one typed `td-recipe-output` lock row, and one
-direct canonical child of the active `/td/store`. The compiler currently
+application, is refused. A runtime a recipe builds resolves through one
+matching `payload_inputs` entry, one typed `td-recipe-output` lock row, and
+one direct canonical child of the active `/td/store`; a declared Flathub
+runtime resolves to its ref, which no build stages (§W.9). The compiler currently
 has exactly three reviewed runtime-major environment policies:
 `empty-runtime`, `static-runtime`, and `freedesktop-platform-25-08`;
 another runtime is refused until its policy is added deliberately. The
 parser accepts only the compiler's canonical bytes, including the full
-`/td/store` runtime path.
+`/td/store` runtime path or the declared Flathub ref.
 
 After PID-namespace teardown prevents any package descendant from running
 further code, the outer sandbox parent recognizes the four application-capable
@@ -1242,6 +1243,19 @@ below now does.
 
 #### B.3.1 The Firefox deploy-tree proof
 
+**Retired as a build input at §W.9's cutover.** The pinned path this
+section records — the reviewed commit pair as typed recipe pins, its host
+graph cache, `td-feed warm ostree`, the graph transfer, `td-builder
+ostree-materialize`, the evaluator's admission receipts and the Firefox
+and Freedesktop 25.08 recipes that copied the result into the image — was
+deleted when the applications left the image: it pinned bytes Flathub
+prunes, and the application commit below is already gone. What it
+established stays in force where §W.9 applies it on the target, in td-app:
+the signature check of item 1, the bounded object reader, decoders and
+acquisition bounds, the materialization rules and the dynamic validator.
+The commit pair, counts and sizes below remain the evidence of the review
+that chose this route.
+
 The selected binary-distribution route is a bounded, control-plane-only
 Flatpak deploy importer. It is not a Flatpak client on the target, and it is
 not permission compatibility. The importer converts one reviewed application
@@ -1313,10 +1327,10 @@ The importer contract is narrower than Flatpak:
 
 1. The input names an architecture, exact app/runtime refs and exact commit
    hashes. A branch name alone is a refusal. Pin review records the signing-key
-   fingerprint and independently verifies the signatures; the fixed commit
-   and every fetched object hash then preserve that decision during builds.
-   An upstream fetch also re-checks it by machine: before any tree object
-   is requested, `td-feed warm ostree` fetches the commit's detached
+   fingerprint and independently verified the signatures; on the pinned
+   path the fixed commit and every fetched object hash then preserved that
+   decision. A fetch re-checks it by machine, as td-app's does for every
+   commit (§W.9): before any tree object is requested, it fetches the commit's detached
    `.commitmeta` (at most 64 KiB, outside the graph's transfer accounting)
    and requires one of its `ostree.gpgsigs` to verify over the exact commit
    bytes. `net/src/openpgp.rs` admits one OpenPGP v4 signature packet of
@@ -1332,25 +1346,21 @@ The importer contract is narrower than Flatpak:
    collection (`ostree.collection-binding` and
    `ostree.collection-refs-binding` beside the ref checks below). A good
    signature over another commit, or a signed commit presented under
-   another ref, is refused. The check is selected when the pin is parsed:
-   `https://dl.flathub.org/repo` requires it, and any other spelling of a
+   another ref, is refused. `https://dl.flathub.org/repo` requires the
+   check, and any other spelling of a
    `flathub.org` host (a port, a capital, a trailing dot, another path or
    subdomain) is refused rather than fetched unsigned, and every repository
    authority must be plain ASCII host text, so a percent-encoded or Unicode
-   spelling the HTTP client would decode cannot name it unrecognised. Feed
-   transport and cache reuse fetch no signature, and a consumer cannot tell
-   whether its source ran the check: there the reviewed commit checksum
-   remains the only authority. Graphs warmed before this check existed,
-   including every cached Firefox 154 graph, whose commit Flathub has since
-   pruned, were never machine-checked. Key revocation and the subkey's
+   spelling the HTTP client would decode cannot name it unrecognised.
+   td-app also verifies a commit a feed serves, since a feed decides only
+   freshness (§W.9). Key revocation and the subkey's
    recorded expiry (2027-06-14) are not consulted; replacing or retiring
    the subkey is a reviewed edit to that file.
 2. Only the two commit-reachable `files/` trees are materialized. Summary
    browsing, updates, installation state, exports, permissions and activation
    metadata are not imported. No application runtime, launcher or image service
-   has OSTree or Flatpak code. The target-built control-plane programs retain
-   the same bounded importer so td can reproduce builds on td; the current boot
-   image does not ship those programs.
+   has Flatpak code, and the only OSTree code on the target is td-app's
+   bounded reader (§W.9).
 3. The object count, aggregate decoded bytes, path count, path length and file
    size are bounded before publication. Hash, type, mode or tree-reference
    mismatches fail closed, and a temporary tree is renamed into place only
@@ -1421,7 +1431,7 @@ semantic identities; the regular fixture is linked to the authenticated root
 dirtree. This is deliberately not a general repository client or GVariant
 implementation.
 
-`td-feed warm ostree` addresses only the immutable object URLs below an exact
+The acquisition addresses only the immutable object URLs below an exact
 commit. HTTPS object requests refuse redirects; the loopback-only HTTP test
 exception parses an exact authority and refuses userinfo. It walks only the
 authenticated `files/` subtree and admits at most
@@ -1443,9 +1453,8 @@ authentication and tree walk; missing, malformed or same-size corrupted
 objects are diagnosed before a fresh exact replacement is downloaded.
 
 A destination-derived lock and an exact graph-ownership record serialize td
-writers to that path. A destination is permanently bound to one reviewed pin;
-a pin bump uses a new destination, preserving the old application cache for
-the later side-by-side retention policy. An absent destination is reserved
+writers to that path. A destination is permanently bound to one exact
+commit. An absent destination is reserved
 before network work through recoverable transaction state. Ownership is
 checked before publication and again after the old directory is atomically
 moved into the private transaction; changed state is restored or preserved,
@@ -1455,46 +1464,15 @@ td invocations; they are not a security boundary against a hostile process
 running as the same host UID, which can mutate that UID's cache directly.
 Synthetic low-limit, redirect, ownership, missing-object, malformed-manifest
 and interruption regressions make those mechanisms load-bearing. The full
-Firefox and runtime graph counts above are permanent reviewed pin evidence and
-were reauthenticated offline during this landing, not downloaded test
+Firefox and runtime graph counts above were reviewed evidence,
+reauthenticated offline when the importer landed, not downloaded test
 fixtures. The `net-test` affected-checks preflight runs the td-net suite for
 net and td-engine changes.
 
-For development-VM download reuse, `td-feed export graphs` publishes the
-checkout's reviewed `ostree-pins` roster from existing host caches into the
-ordinary local feed. Export takes the same destination lock as warming,
-recovers its owned transaction state, reauthenticates the complete graph and
-checks the pin's structural/decoded accounting before publishing any object.
-Each exported object is reauthenticated and copied with a transport SHA-256
-sidecar under `ostree/COMMIT/objects/FANOUT`. No graph discovery, upstream
-acquisition or executable admission occurs during export.
-
-`td-feed consume graphs` uses `TD_FEED_BASE` or the compositor's VM endpoint
-to acquire those objects into the caller's private graph cache. The endpoint
-is transport only: ownership and manifests retain the reviewed upstream
-repository, ref, commit and content checksum. The consumer refuses redirects
-and upstream fallback, including on a missing or corrupt feed object. Every
-object still passes semantic authentication; a filez transport sidecar is
-never a substitute for its decoded identity. The full graph must also match
-the pin's structural and decoded counts before publication. Observed transfer
-size remains informational because recompression can change it.
-
-These explicit transfer commands share the existing graph bounds and
-transactional cache publication. Export publishes each object atomically;
-a later failure can leave a verified subset in the feed, which retry reuses.
-Only guest publication requires a complete graph. Warm private caches are reauthenticated
-without contacting the feed; a damaged cache remains in place until a complete
-replacement is ready. Warm, export and consume use the same regular-file lock
-inode. Export and consume have a two-minute contention limit; ordinary host
-warming retains its blocking wait for another cold producer. The consumer
-requires a disk-backed cache below HOME, like ordinary warming. Neither the
-host graph cache nor the feed is writable by a guest through this interface.
-This extends development control-plane acquisition only; application admission, foreign marks,
-materialization and runtime confinement retain their existing boundaries.
-
-**The transactional deploy-tree materializer has now LANDED.**
-`td-builder ostree-materialize` takes the cache plus the reviewed exact ref,
-commit and content checksums. It ignores the cache manifest as authority,
+**The transactional deploy-tree materializer.** td-engine's
+`ostree_deploy`, which td-app runs on the target (§W.9), takes the cache
+plus the exact ref, commit and content checksums. It ignores the cache
+manifest as authority,
 re-authenticates the commit and every reachable metadata/file object, repeats
 the acquisition graph bounds, and walks only `files/`. Unique regular objects
 are decoded once into private staging and hard-linked to authenticated paths
@@ -1510,10 +1488,12 @@ role input.
 Acquisition and materialization use the same engine-owned object-kind, suffix,
 fanout-path and deploy-path definitions as well as the same graph bounds.
 
-The destination must be absent. It appears through one
-`renameat2(RENAME_NOREPLACE)` only after the complete tree, files and directory
-metadata have been synchronized, so a concurrent writer or intervening empty
-directory is refused rather than replaced. That rename is the commit point:
+The destination must be absent. It appears through one no-replace
+publication, a parameter of the materializer, only after the complete tree,
+files and directory metadata have been synchronized. td-app checks absence
+and then `rename(2)`s under its cache lock, which is safe from an
+intervening directory only because td-app alone publishes into that cache.
+That rename is the commit point:
 pre-publication failure removes normal-process staging and leaves no
 destination, while a later parent-directory sync or empty-staging cleanup
 failure reports a warning beside the committed complete tree rather than a
@@ -1526,72 +1506,20 @@ caller that owns the cache scratch must also own bounded stale-staging cleanup.
 Symlink timestamps are staging-clock values because safe `std` has no
 no-follow timestamp setter; recursive store interning ignores timestamps and
 the deterministic image writer restamps every node, so they are not artifact
-authority. The real Firefox and runtime caches materialize with exactly the
+authority. The real Firefox and runtime caches materialized with exactly the
 357/14,346 object, 480/18,196 path and decoded-byte counts recorded above.
-The materializer is td-engine's `ostree_deploy`, which takes the no-replace
-rename as a parameter: `ostree-materialize` passes the builder's
-`renameat2` wrapper. §W.9's td-app will check absence and then `rename(2)`
-under its cache lock, which is safe from an intervening directory only
-because td-app alone publishes into that cache; the guarantees above are
-the builder's.
 
-**Typed recipe pins, automatic warming and marked store admission have
-LANDED.** `OstreePin` is a separate recipe type rather than a multi-object
-deploy disguised as a tarball `SourcePin`. Each pin records the upstream HTTPS
-repository, exact ref, commit and content checksums, reviewed Flathub signing
-fingerprint, cache identity, the permanent structural and decoded graph counts,
-and the observed transfer counts above. The
-fingerprint records the pin-review decision; build-time authority starts at the
-reviewed checksums and does not claim to repeat OpenPGP verification. Both the
-Firefox and Freedesktop source pins carry the foreign mark, and the mark
-propagates separately to their recipe outputs.
+**The pinned import, retired.** Until §W.9's cutover the commit pair
+above was a typed `OstreePin`, warmed into a host graph cache, materialized
+by the control plane and interned as marked seeds that the Firefox and
+Freedesktop 25.08 mesboot recipes copied into packages with native
+`CopyTree` steps alone; production builds admitted
+`cibdmpgbj2wjy6fzavqxydjnzyv9mxq4-firefox-154.0` and its platform. The
+pins, the cache and its transfer, the materializer command, the receipts
+and both recipes were deleted together, and roughly 1 GB left every image.
 
-`td-recipe-eval warm TARGET` now surveys exact graph caches alongside ordinary
-fixed-output sources and crate closures. A cold graph invokes the existing
-`td-feed warm ostree` command with only the compiled pin fields and a
-pin-specific destination under `$HOME/.td/ostree`. Explicit warm reauthenticates
-every selected exact graph offline and lets `td-feed` repair a missing or corrupt
-object. Automatic operator warming does the same for a marker-complete cache
-until that pin has been admitted. Thus a matching owner record and graph
-manifest suppress network work, but are not accepted as proof that the object
-bytes remain intact.
-
-Recipe preparation invokes the control-plane materializer, reauthenticates the
-complete object graph, compares its structural and decoded accounting with the
-pin, and recursively interns the resulting plain tree under the compiled
-seed-digest table before any recipe step runs. Observed transfer bytes are
-reported but deliberately not compared. After the compiled store basename gate
-passes, an atomic admission receipt binds every pin field and that basename. A
-retained store tree skips repeat materialization only while that exact receipt
-exists; changing the ref, commit, content, fingerprint, cache identity or
-accounting forces reauthentication even when the canonical `files/` tree and
-store basename are unchanged. The temporary materialized deploy is removed
-after store admission. The source inputs are absent from command-visible maps
-and mounted as no-exec data. Their two mesboot recipes contain only native
-`CopyTree` steps, so no imported executable runs during admission or package
-assembly.
-
-These roughly 1 GB external graphs do not register routine `RecipeCheck`
-bodies: the ordinary offline gate must not depend on an operator's mutable
-Flathub cache. Permanent tests cover typed pin propagation, authority receipts,
-warm repair selection, importer bounds and materializer behavior; the complete
-real-graph admissions and package builds are recorded landing evidence.
-
-The admitted source paths are
-`40asdrhyln3x194j276abhb2j2i7a04z-firefox-154-source` and
-`cgynxza1vd3h30gd4hjl7vp82hdqlyj3-freedesktop-platform-25-08-source`.
-Production `build-run` proofs created the marked package outputs
-`nar1h76vz8frc9krqi66glm45nrk9l5r-firefox-154.0` and
-`38kv5wnj4g55h8hplbf3f0hyrwzmhl2l-freedesktop-platform-25-08-25.08`.
-Those hashes record the tree-only import proof and are superseded when package
-metadata is added. The admitted package with that metadata and the validator
-below is
-`cibdmpgbj2wjy6fzavqxydjnzyv9mxq4-firefox-154.0`; a production graph build
-built it through the normal two-step platform-to-browser plan and published
-its canonical manifest, spec and launcher.
-
-**Dynamic-package admission has now LANDED.** Firefox's recipe binds the exact
-25.08 platform as a marked payload, generates its manifest and launcher, and
+**Dynamic-package admission has now LANDED.** Firefox's recipe declares the
+25.08 platform policy, generates its manifest and launcher, and
 compiles the first td policy: Wayland, shared network, one writable/create
 Downloads grant, the bare `org.mozilla.firefox` bus name and the
 `org.mozilla.firefox.*` suffix grant for its remote-control name. X11,
@@ -1611,8 +1539,10 @@ reviewed 1 GiB high, 1.25 GiB max, 1,024-task and one-CPU baseline above for
 first-window bring-up; later tuning requires measured jailed-browser evidence
 rather than an unreviewed package guess.
 
-The terminal `validateDynamicApplication` step runs only after native
-`CopyTree` or `CopyFile` and never executes imported code. It accepts the
+The dynamic validator, a recipe's terminal `validateDynamicApplication`
+step on a store runtime (no shipped recipe has one since §W.9's cutover)
+and td-app's rule 5 on a fetched one, never executes imported code. It
+accepts the
 bounded `#!/bin/bash` launcher only because `/bin/bash` resolves through the
 modeled `/bin -> /usr/bin` alias in the selected runtime, then closes Bash's
 own ELF graph. Other package scripts are inert data during admission. A direct
@@ -1667,8 +1597,8 @@ namespace, alias, symlink-before-`..`, entry, architecture, provider-root,
 indirect `/run/host`, optional-prefix and run-path cases, so the ordinary gate
 does not depend on the mutable graph cache.
 
-The resulting package is authenticated, fully described and selected into the
-image. **The dynamic jail mount policy has now LANDED.**
+The resulting declaration is authenticated, fully described and selected
+into the image. **The dynamic jail mount policy has now LANDED.**
 For the exact Firefox/Freedesktop 25.08 pair, td-jail admits only the
 compiler-owned `LD_LIBRARY_PATH` above; every other application/runtime pair
 must omit it and every other `LD_*` variable remains refused. That decision is
@@ -1696,8 +1626,9 @@ marker through the private volatile runtime bind. It does not execute imported
 Firefox bytes as a recipe tool.
 
 The independent target acceptance test is a headless QEMU boot of the built
-system image. The image selects the exact Firefox and Freedesktop 25.08 marked
-payloads, launches `/bin/firefox` through the immutable application registry,
+system image. The image selects Firefox's declaration; the guest fetches
+the app and runtime from the host's feed (§W.9), launches `/bin/firefox`
+through the immutable application registry,
 and, only under the QEMU oracle's exact `td.autotest=1` kernel token, passes it
 a fixed HTTPS document whose full-viewport background has equal solid panels
 of exact RGB `#ff00ff` on the left and `#00ff00` on the right. A trusted root
@@ -2117,9 +2048,9 @@ for one has to argue past this rather than rediscover it:
 | not built | why |
 |---|---|
 | **target-side OSTree client** (repo modes, `.filez`/`.dirtree`/`.dirmeta`, GVariant) | Refused in general. §B.3.1 selects a bounded deploy importer; §W.9 runs the same bounded reader on the target for signed Flathub applications only, with no repository modes, summary or installation machinery. |
-| **runtime summary browsing, refs and updates** | Summary browsing stays refused. A mutable ref is never derivation input: a pinned graph resolves only its exact commit. §W.9's applications follow one declared ref per application and runtime, as a hint whose answer must pass its admission rules. |
-| **OpenPGP verification** | Not in any application, launcher or image service. The signature is checked by a human at pin review, as it is for every other fixed-output input, and the control plane's upstream Flathub fetch re-checks it with the bounded single-packet verifier of §B.3.1; nothing reads a keyring, armor, summary signature or trust database. |
-| **HTTP/TLS on the target** | One thing on the target fetches: `td-fetchd`, the fetch service applet of the target-built `td-net` (§W.8), which a jailed application reaches over a socket under `sockets=fetch`. The applications themselves carry no TLS, resolve no names and hold no network; the control plane's `td-net` does this under the existing dependency exception, and the target's copy is the same tier rebuilt on the target toolchain. |
+| **runtime summary browsing, refs and updates** | Summary browsing stays refused. A mutable ref is never derivation input: no build reads a Flathub ref. §W.9's applications follow one declared ref per application and runtime, as a hint whose answer must pass its admission rules. |
+| **OpenPGP verification** | Not in any application, launcher or service. td-app (§W.9), an applet run as an application's account, verifies each Flathub commit with the bounded single-packet verifier of §B.3.1 against the key compiled into td-net; nothing reads a keyring, armor, summary signature or trust database. |
+| **HTTP/TLS on the target** | Two things on the target fetch, both applets of the target-built `td-net`: `td-fetchd` (§W.8), which a jailed application reaches over a socket under `sockets=fetch`, and td-app (§W.9), which fetches an account's Flathub applications outside any jail. The applications themselves carry no TLS, resolve no names and hold no network; the control plane's `td-net` does this under the existing dependency exception, and the target's copy is the same tier rebuilt on the target toolchain. |
 | **a target-side `fsck`/`verify` verb** | Refused. A package is in a read-only image admitted by a signed manifest, so a userspace hash sweep would re-check it with a weaker mechanism (§B.5). This refusal has flipped three times as the layout moved, which is the entry's real content: **a refusal argued from a layout is only as settled as the layout.** |
 | **OCI / container registries** | A second foreign format with the same objection as the first. The selected Firefox experiment uses Flathub's signed OSTree commits directly; an OCI translation would add a second parser without removing the first. |
 
@@ -2133,9 +2064,9 @@ served the repository client:
 | `builder/src/sandbox.rs` | **rewrite** as `td-jail` — the namespace mechanics are the model, but its build-user ids, offline network, `/gnu/store` paths and trust model are all wrong here |
 | `builder/src/store.rs` | **read, do not port** — the store semantics are the control plane's, and with packages in the store there is nothing on the target that creates a store path |
 | `builder/src/elf.rs` | **never** — see §G. Its writers stay in the builder; the read-only half (header parser, `PT_INTERP`, run-path and `DT_NEEDED` readers, the bounded link search, executable and static assertions) is `engine/src/elf.rs`, shared with the image build |
-| `engine/src/dynamic_application.rs`, `engine/src/ostree_deploy.rs`, `engine/src/elf.rs` | **reuse on the target for §W.9 alone** — the dynamic validator, the deploy materializer and the read-only ELF inspection they use, moved from the builder (the ELF readers lose their panicking indexing, nothing else) so the image build and `td-app` run one implementation; the materializer's no-replace publication is a parameter, so td-engine gains no syscall |
+| `engine/src/dynamic_application.rs`, `engine/src/ostree_deploy.rs`, `engine/src/elf.rs` | **reuse on the target for §W.9 alone** — the dynamic validator, the deploy materializer and the read-only ELF inspection they use, moved from the builder (the ELF readers lose their panicking indexing, nothing else) so `td-app` runs the implementation the image build ran on the pinned path; the materializer's no-replace publication is a parameter, so td-engine gains no syscall |
 | `engine/src/gzip.rs` | **reuse in the control plane, and on the target for §W.9 alone** — builder source extraction and the bounded deploy importer share this std-only gzip/raw-DEFLATE implementation; on the target only `td-app` decompresses, and only Flathub objects it has authenticated |
-| `net/src/http.rs`, `td-feed` | **reuse in the control plane, and on the target through `td-fetchd` alone** — exact immutable OSTree objects use td-net's bounded HTTP/TLS fetcher and a commit-specific authenticated local cache; the target's one network client is the same tier's fetch service (§W.8), and there is no target repository client |
+| `net/src/http.rs`, `td-feed` | **reuse in the control plane, and on the target through `td-fetchd` and `td-app`** — exact immutable OSTree objects use td-net's bounded HTTP/TLS fetcher and a commit-specific authenticated local cache; the target's network clients are the same tier's fetch service (§W.8) and td-app's bounded Flathub reader (§W.9), and there is no target repository client |
 | `builder/src/xz.rs`, `bzip2.rs`, `erofs.rs`, `tar.rs`, `oci.rs` | do not port — these serve source extraction or the image writer on the control plane |
 | `builder/src/nar.rs` | **needed, but only in the control plane** — `read_nar` is how host mode materializes a package (§X.1). Nothing on the target extracts an archive. §X.6 records the arbitrary-file-write this design found in it, fixed on main before this landed |
 | `engine` SHA-256 | **not needed** — nothing on the target hashes a package; the deployment's signed manifest is the integrity check |
@@ -2861,10 +2792,12 @@ PID 1 reports the raw application status through td-jail's bounded diagnostic.
 The old fixture was deliberately both autostarted and present in the launcher,
 so a button press could create a second instance over the same state roots.
 Firefox is stateful and does not inherit that policy. Its supervised service
-owns the boot-started instance; the compositor retains only matching mapped
-surface keys after readiness, and activating the Firefox card switches to and
-focuses one of those surfaces. If none is mapped, the card reports that fact
-and never starts another jail. A direct `/bin/firefox` request can still start
+owns the one instance, started on request or under the oracle's token
+(§W.9); the compositor retains only matching mapped surface keys after
+readiness, and activating the Firefox card switches to and focuses one of
+those surfaces. If none is mapped, the card asks root to start the
+service (`0d`) and never starts a jail itself. A direct `/bin/firefox`
+request can still start
 another instance, and no single-instance admission lock has landed.
 
 Probe mode alone overlays one read-only executable bind at
@@ -5334,7 +5267,7 @@ and `requires=busd` is still wrong for the reason recorded in the recipe:
 td-svc cannot distinguish a `restart=always` daemon inside its backoff
 from a permanently failed one, so one busd crash in the boot window would
 permanently kill the application tier of a machine whose broker recovers
-a second later. Firefox's own `restart=always` is what recovers, and
+a second later. Firefox's own `restart=on-failure` is what recovers, and
 it now covers the larger failure it always nominally covered. The gain is
 that the boot gate became an end-to-end test of this protocol: the image's
 one application cannot reach the screen without having registered.
@@ -6240,7 +6173,7 @@ not for a persistent Session lifecycle.
 | 1a | `.Background` | nothing | **LANDED as an explicit denial**: version 1 `RequestBackground` exercises the real bounded Request lifecycle and returns response 2 with false `background`/`autostart`. Persistent background execution and version-2 `SetStatus` remain unsupported. |
 | 2 | `.Account` | a consent dialog | uid 1000's passwd entry, empty image URI. |
 | 3 | `.FileChooser` | a surface | **`OpenFile` v3 LANDED for the authenticated Firefox Downloads grant** with modal keyboard-driven open-file, multiple-file, and directory modes. Standard `SaveFile` and `SaveFiles` are advertised but explicitly `NotSupported`; `choices`, selecting a non-all-files filter, and selection outside an existing grant are likewise refused. A bounded accept label and Firefox's selected all-files filter are rendered; `current_folder` remains a bounded hint rather than an access control. |
-| 4 | `.OpenURI` | nothing | **Version 1 `OpenURI` LANDED for `http`/`https`.** The handler is the image's browser, found rather than started: the portal exports the caller's Request, replies with it, lists the bus names under Firefox's §B.2 `org.mozilla.firefox.*` grant, resolves the owners of the first eight in sorted order and calls the first owner the broker's credentials place at Firefox's assigned UID with `td.AppId="firefox"`, through its remote-control `OpenURL(ay)` on `/org/mozilla/firefox/Remote` with Firefox's own command-line layout. A same-uid process holding such a name is passed over and never called. Response 0 means Firefox accepted the link; no browser, only unauthenticated holders, a refusal (including the broker's own error for a browser that left mid-call) or the 20-second deadline, enforced on the 10-second owner audit, is response 2. A caller's `Close` or departure ends its request at once, before any later stage is sent. A browser call that expired, or whose caller closed or left, stays counted until Firefox answers or leaves, because the broker holds it in its pending-reply table, and at eight such calls a request fails as `browser-unresponsive` rather than exhaust that table. The `activation_token` option is accepted and not yet forwarded, so on Wayland Firefox may open the tab without raising its window. Starting a stopped browser is td-svc's (`restart=always`), not the portal's, so a closed Firefox fails the request rather than widening the uid-991 portal into an application launcher. Each outcome is logged as `TD-PORTAL-OPEN-URI app=<caller|-> scheme=<http|https> response=<n> outcome=<word>`, never the link. Requests are bounded at 16, 4 per caller, and leave with their caller. **The fd-taking `OpenFile` LANDED as a copy**: the caller passes one descriptor; the portal requires a readable regular file of at most 64 MiB, copies it from its first byte into a fresh mode-0700 subdirectory of its writable view of Firefox's private `Opened` directory (td-authd/DESIGN.md, "Portal handoff"), under the descriptor's own last path element reduced to `[A-Za-z0-9._+-]`, and hands Firefox `file:///home/td/Opened/DIR/NAME` through the same authenticated exchange, logged with `scheme=file`. Every create is exclusive and resolved from a held directory descriptor without following links, because Firefox owns that directory on disk. The portal's bus reader adopts received descriptors at receipt to give this one an owner (UNSAFE.md §12). The newest 16 copies are kept, so the view holds at most about 1 GiB, and the directory is emptied when the portal starts, each removal bounded at 4096 entries four levels deep. `writable=true` is refused with NotSupported, since the handler gets a read-only copy. The Request handle is reserved before any byte is copied, so a refused token costs no copy; an unavailable view, a non-regular or oversized file then retires it and refuses with NotSupported, logged as `scheme=file response=- outcome=not-copied`. The copy is synchronous on the portal's loop, which a slow filesystem would stall; no jail mounts one today. **`file` URIs passed to `OpenURI` remain REFUSED, not merely restricted to "a path visible to the caller"** — which an earlier draft said and which does not follow: the handler runs in a *different* sandbox, so a path the caller can see is one the handler generally cannot, and launching it would open a file that is not there. Honouring `file:` needs the path to reach the handler's namespace, which is a Documents-portal job (deferred, no FUSE) or an explicit grant to the handler at launch. Refusing is the honest answer until one of those exists; "opened" and then blank is worse. |
+| 4 | `.OpenURI` | nothing | **Version 1 `OpenURI` LANDED for `http`/`https`.** The handler is the image's browser, found rather than started: the portal exports the caller's Request, replies with it, lists the bus names under Firefox's §B.2 `org.mozilla.firefox.*` grant, resolves the owners of the first eight in sorted order and calls the first owner the broker's credentials place at Firefox's assigned UID with `td.AppId="firefox"`, through its remote-control `OpenURL(ay)` on `/org/mozilla/firefox/Remote` with Firefox's own command-line layout. A same-uid process holding such a name is passed over and never called. Response 0 means Firefox accepted the link; no browser, only unauthenticated holders, a refusal (including the broker's own error for a browser that left mid-call) or the 20-second deadline, enforced on the 10-second owner audit, is response 2. A caller's `Close` or departure ends its request at once, before any later stage is sent. A browser call that expired, or whose caller closed or left, stays counted until Firefox answers or leaves, because the broker holds it in its pending-reply table, and at eight such calls a request fails as `browser-unresponsive` rather than exhaust that table. The `activation_token` option is accepted and not yet forwarded, so on Wayland Firefox may open the tab without raising its window. Starting a stopped browser is td-svc's, on the launcher's request (§W.9), not the portal's, so a Firefox that is closed, or not yet opened since boot now that it starts on demand, fails the request rather than widening the uid-991 portal into an application launcher; the calling application sees response 2. Each outcome is logged as `TD-PORTAL-OPEN-URI app=<caller|-> scheme=<http|https> response=<n> outcome=<word>`, never the link. Requests are bounded at 16, 4 per caller, and leave with their caller. **The fd-taking `OpenFile` LANDED as a copy**: the caller passes one descriptor; the portal requires a readable regular file of at most 64 MiB, copies it from its first byte into a fresh mode-0700 subdirectory of its writable view of Firefox's private `Opened` directory (td-authd/DESIGN.md, "Portal handoff"), under the descriptor's own last path element reduced to `[A-Za-z0-9._+-]`, and hands Firefox `file:///home/td/Opened/DIR/NAME` through the same authenticated exchange, logged with `scheme=file`. Every create is exclusive and resolved from a held directory descriptor without following links, because Firefox owns that directory on disk. The portal's bus reader adopts received descriptors at receipt to give this one an owner (UNSAFE.md §12). The newest 16 copies are kept, so the view holds at most about 1 GiB, and the directory is emptied when the portal starts, each removal bounded at 4096 entries four levels deep. `writable=true` is refused with NotSupported, since the handler gets a read-only copy. The Request handle is reserved before any byte is copied, so a refused token costs no copy; an unavailable view, a non-regular or oversized file then retires it and refuses with NotSupported, logged as `scheme=file response=- outcome=not-copied`. The copy is synchronous on the portal's loop, which a slow filesystem would stall; no jail mounts one today. **`file` URIs passed to `OpenURI` remain REFUSED, not merely restricted to "a path visible to the caller"** — which an earlier draft said and which does not follow: the handler runs in a *different* sandbox, so a path the caller can see is one the handler generally cannot, and launching it would open a file that is not there. Honouring `file:` needs the path to reach the handler's namespace, which is a Documents-portal job (deferred, no FUSE) or an explicit grant to the handler at launch. Refusing is the honest answer until one of those exists; "opened" and then blank is worse. |
 | 5 | `.Inhibit` | compositor idle state | **idle flag only.** Suspend/logout/user-switch are refused, because td has no session manager and returning success without an observable inhibitor violates the readback principle. **The mechanism is the private `create_idle_inhibitor` and NOT public `zwp_idle_inhibit_v1`** — a review found both specified, and they cannot both hold: advertising the public global to every sandbox lets an app inhibit idle *directly*, with no portal record of who did it and no way for the user to see or revoke it, which is exactly the attribution the private call exists to provide. §F's `zwp_idle_inhibit_v1` row is therefore **not** required for `.Inhibit` to be honest, which is what it used to say; if it is ever implemented it is for unconfined clients, and it must not be advertised on a jailed connection. |
 | 6 | `.Notification` | private protocol | bounded toasts with title/body/priority/actions and a bounded icon; markup, sound and arbitrary icon paths refused. |
 | 7 | `.Screenshot` | private protocol | full output and, with `interactive=true`, a compositor-selected window — **not** a window named by a bearer `parent_token`, see below. PNG encoded std-only, CRC-32 and Adler-32, with a **fixed-Huffman** DEFLATE encoder (~1–2k lines, no roster change). Not *stored* blocks: 1920×1080 stored is ~8.3 MiB per screenshot, and the portal returns a file the user keeps. |
@@ -7185,10 +7118,12 @@ packaged selftest, boot oracle — with **network never in the gate**.
    that fixture remains lower-level host regression coverage but has no
    `/bin` name, service, application-registry row or launcher role in the
    system image. Its executable personality remains inside the copied
-   `td-compositor` store output. The image now selects the exact marked Firefox
-   154.0 and Freedesktop 25.08 package outputs, exposes `/bin/firefox` through
-   td-jail, and starts it under supervision on a fixed document served by the
-   guest-local HTTPS fixture.
+   `td-compositor` store output. The image selects Firefox's declaration,
+   whose account fetches the app and runtime (§W.9; until that cutover it
+   carried the exact Firefox 154.0 and Freedesktop 25.08 packages), exposes
+   `/bin/firefox` through td-jail, and under the oracle's token starts it
+   under supervision on a fixed document served by the guest-local HTTPS
+   fixture.
    An exact QEMU kernel token selects a fresh `/run`-backed automation profile
    and the document; ordinary boots retain Firefox's own profile and first-run
    flow. `td-compositor` publishes its private observation
@@ -7223,8 +7158,9 @@ packaged selftest, boot oracle — with **network never in the gate**.
    wrong final origin, error-document URI, empty document, malformed reply or
    failed session cleanup drops the marker. This test remains operator-run
    because upstream reachability is not a reproducible build input. The
-   ordinary headless system oracle remains
-   NIC-less and deterministic.
+   ordinary headless system oracle's NIC since §W.9's cutover carries its
+   applications' fetch from the host's feed; its evidence does not depend
+   on public reachability.
    The evidence unit is not a dependency of `bootsuccess`, so user-owned state
    cannot decrement the deployment attempt counter. The application has no
    terminal or console descriptor with which to forge that evidence or alter
@@ -7387,11 +7323,12 @@ and image commits — showing:
    verification off would prove nothing about the part that could plausibly be
    broken by confinement. The fixture listener binds IPv4 loopback only.
    `td.autotest=1` is an internal harness mode and is unsupported on a physical
-   or otherwise attached machine: the system oracle uses `-nic none`, while
-   the one network oracle uses the exact QEMU user-mode NAT backend with no
-   `hostfwd`. Tests pin that it is the sole autotest plan with a NIC and that
-   its netdev string has no inbound forwarding. The network oracle therefore
-   retains outbound DHCP, DNS and HTTPS without making the fixture reachable
+   or otherwise attached machine. Every boot that starts the applications
+   uses the exact QEMU user-mode NAT backend with no `hostfwd`, so its
+   guest can fetch them from the host's feed (§W.9); the network oracle is
+   the one plan whose evidence is public reachability. Tests pin that the
+   netdev string has no inbound forwarding. The guests therefore
+   retain outbound DHCP, DNS and HTTPS without making the fixture reachable
    from the host or an external network. It now also makes the already-painted
    jailed Firefox leave the local origin, complete a public HTTPS navigation,
    and validate the resulting content document. This complements rather than
@@ -7723,7 +7660,7 @@ Each row is one landing or a small family, leaving the tree green.
 | 12f | **typed shared-network policy — LANDED**: the authenticated `shared=network` permission selects the compiled namespace set without `CLONE_NEWNET`; stage 1 requires the network namespace inode to remain unchanged and skips the isolated-loopback ioctl. Omitted policy retains `CLONE_NEWNET`, exact changed-inode readback and the up-loopback oracle. The host fixture launches both its isolated defaults and a derived shared-network variant; the shipped Firefox policy selects shared networking. `/etc/resolv.conf` is supplied by selective immutable `/etc`; mediated network policy remains later work | a declared application can use td's network stack without weakening the default isolated path |
 | 12g | **selective immutable `/etc` — LANDED**: a bounded tmpfs admits only the closed runtime configuration allowlist, synthesized passwd/group/host/NSS identity, one persisted per-application machine id, the pinned curl-rendered Mozilla CA bundle, and a read-only resolver bind only for declared shared networking. Stage 1 source-identity-checks every external file and recursively hardens selected runtime directories; stage 2 derives the exact tree from `/usr/etc`, checks synthesized contents, mount flags, nested mounts, PEM shape and write refusal. Host mode names fixture-owned CA and resolver inputs rather than borrowing ambient `/etc` | applications get libc/toolkit identity and trust data without seeing the host configuration |
 | 12h | **dynamic Firefox jail runtime — LANDED**: the exact Firefox/Freedesktop 25.08 pair is the sole target policy allowed to carry `LD_LIBRARY_PATH=/app/lib:/app/lib/firefox`; token-gated stage 2 revalidates the value after privileged stage 1 installs the four immutable `/usr` aliases, then reads those aliases back. Every application receives and stage 2 requires writable mode-0700 `$XDG_CACHE_HOME/tmp`. In this pre-image increment, a source-built surrogate ran under Firefox's real compiled spec through the complete host jail and broker path while imported Firefox bytes remained inert | the Firefox package has an automated confinement/runtime preflight without a manual desktop session |
-| 12i | **Firefox selected into the system image — LANDED**: the immutable application registry and `/bin/firefox` pair the exact Firefox 154.0 package with Freedesktop 25.08. The supervised service owns the boot-started instance; the compositor menu activates its observed mapped surface and never starts another jail. Direct `/bin/firefox` remains supported and no global single-instance lock has landed. Headless QEMU accepts an exact marker only after a surface asserting `org.mozilla.firefox` commits a buffer successfully painted to the framebuffer and an independent probe sees a live Firefox jail with its cgroup limits. Mutable Firefox state remains independent of deployment-health authority | **first real Firefox frame without manual testing** |
+| 12i | **Firefox selected into the system image — LANDED**: the immutable application registry and `/bin/firefox` pair the exact Firefox 154.0 package with Freedesktop 25.08 (since §W.9's cutover, Firefox's declaration with its Flathub refs). The supervised service owns the one instance, started on request or under the oracle's token since §W.9's cutover; the compositor menu activates its observed mapped surface and never starts another jail. Direct `/bin/firefox` remains supported and no global single-instance lock has landed. Headless QEMU accepts an exact marker only after a surface asserting `org.mozilla.firefox` commits a buffer successfully painted to the framebuffer and an independent probe sees a live Firefox jail with its cgroup limits. Mutable Firefox state remains independent of deployment-health authority | **first real Firefox frame without manual testing** |
 | 12j | **application timezone in the mount plan — LANDED**: the launch reads a bounded IANA zone name from the system's `/etc/timezone`, resolves the runtime's own compiled zone for it under `usr/share/zoneinfo`, pins it by identity, and read-only binds it at `/etc/localtime`, which glibc reads whenever `TZ` is unset. Resolution follows symlinks because a zoneinfo tree is made of them, and bounds where one may land: the canonical target and the zoneinfo root both stay inside the runtime. `TZif` magic is checked before the bind and again by stage 2 on the bound file, together with containment and the bound inode being the runtime's own file for the named zone. Unset is not a zone: with nothing named the runtime is never asked and nothing is bound, so a minimal runtime is unaffected; a named zone must be answerable and `UTC` is not special about it, and a malformed name refuses outright. Host mode reads no zone, its inputs being fixture-owned. Installation may seed the name as described in rung 12k; an unconfigured image keeps the unset path | a jailed application reads the operator's zone |
 | 12k | **installer zone writer — LANDED**: optional `td-install volume --timezone` seeds `/var/lib/td/timezone`, exposed through the reviewed optional `MUTABLE_ETC` link at `/etc/timezone`. First boot leaves the choice or absence intact. Static mail and news use a data-only runtime carrying source-built timezone files. A named operation to change the zone after installation remains pending | the operator can choose a zone, and it survives a deployment |
 | 13 | `td-busd` codec, auth, surface #10 | none |
@@ -7735,7 +7672,7 @@ Each row is one landing or a small family, leaving the tree green.
 | 19 | Wayland C: `xdg_positioner`/`xdg_popup`, click-outside dismissal and edge constraint solving LANDED | a menu appears where its client asked, takes the keyboard while it is up, closes when the operator presses outside it, and is flipped, slid or resized clear of an output edge as its positioner permits |
 | 20 | **clipboard producer and cross-client paste LANDED**: data-device v3 selection forwards a focus-scoped MIME offer and one bounded descriptor to its source. td-term adds visible pointer selection, bounded UTF-8 extraction, `Control+Shift+C`, three text MIME offers, exact endpoint ownership, eight-source/sync/offer ceilings and a four-entry nonblocking handoff whose five-second destination deadline restores prior status. The image oracle physically types `Welcome`, waits until its exact rendered cells are attested, selects them, waits for exact seven-byte source admission, then requires both td-term's exact-payload transfer record and Firefox's browser-chrome observation; client cursors landed separately (`1c4b7f88`) | a real terminal selection reaches Firefox through core Wayland clipboard without manual testing |
 | 21 | **xdg-foreign + private portal manager centred/modal presentation LANDED**; the dialog leaves tiling, retains its workspace home, stacks over application popups, captures keyboard/pointer input with owed-release preservation, and unwinds newest-first. A D-Bus dialog consumer remains | compositor-tested modal portal presentation without manual inspection |
-| 22 | **FileChooser `OpenFile`, modal surface and Firefox image oracle LANDED**: the bounded directory, filter, selection, URI and PSF2 pixel core is joined to asynchronous broker-authenticated D-Bus Request routing and the private Wayland manager. A host peer reads the real shm pixels, supplies the exact keymap, drives a protocol-level selection and checks the directed guest URI. The offline system boot additionally makes Firefox issue the call, hashes the captured centred modal pixels, selects physically, and validates the returned file bytes in content. Save, Documents, Screenshot and Notification remain absent; `OpenURI` has since landed (§E row 4) | a real modal chooser completes from Firefox without manual inspection |
+| 22 | **FileChooser `OpenFile`, modal surface and Firefox image oracle LANDED**: the bounded directory, filter, selection, URI and PSF2 pixel core is joined to asynchronous broker-authenticated D-Bus Request routing and the private Wayland manager. A host peer reads the real shm pixels, supplies the exact keymap, drives a protocol-level selection and checks the directed guest URI. The system boot additionally makes Firefox issue the call, hashes the captured centred modal pixels, selects physically, and validates the returned file bytes in content. Save, Documents, Screenshot and Notification remain absent; `OpenURI` has since landed (§E row 4) | a real modal chooser completes from Firefox without manual inspection |
 | 23 | **a pinned small GTK application as a seed package** | **first foreign-toolkit window** |
 | 24 | runtime compatibility sweep; the launcher table is read from the image | none |
 | 24a | **dedicated audio service identity — LANDED**: the immutable account table carries locked, non-login `audio` uid/gid 994, and the seat assignment receives both the distinct graphical and audio identities. It creates and reads back `/run/td-audio` as audio-owned mode 0755 while retaining `/run/user/1000` as tester-owned mode 0700. Sound-device ownership and the service-only `td-login` credential class wait for the first ALSA backend, because no daemon starts in this precursor and the current kernel intentionally creates no `/dev/snd` nodes | the privilege and socket-directory boundary exists before an adversarial audio parser does |
@@ -7749,8 +7686,8 @@ Each row is one landing or a small family, leaving the tree green.
 | 27d | **Firefox clipboard image proof — LANDED**; after the physical menu proof, the same marker-driven QMP controller waits for td-term's focus acknowledgement, clears its prompt, physically types `Welcome`, and waits until td-term attests the visible word's settled live grid and cell coordinates. It drags those exact cells, waits for a second marker proving the highlighted frame is visible, injects the terminal-owned copy chord, waits for `TD-TERM-CLIPBOARD-READY bytes=7`, then focuses Firefox and, once the clipboard stage's own browser-chrome session announces that it is open, injects `Control+L`. If the URL bar has not taken focus within one bounded wait, that session publishes an ordered exact retry marker and waits again; the host consumes them only while awaiting URL-bar arm and injects at most two additional physical `Control+L` chords; a third lapse is terminal, and the input unit announces it. One continuous bounded privileged browser-chrome session emits `TD-FIREFOX-CLIPBOARD-ARMED` only after the URL bar reports focused with its old value selected, then remains live while that gate admits physical `Control+V`. A second paste command is admitted by one exact retry marker only when the first boundary exposes no nonempty paste data and leaves that URL unchanged. Firefox may expose an empty `DataTransfer` while its default action consumes the asynchronous Wayland transfer, so the final gate accounts delayed insertions through the URL value: every nonempty event must be exact `Welcome`, the URL must be one or more exact `Welcome` copies no greater than the paste-event count, and an event that exposes exact data must have a corresponding final copy. The two paste commands plus eight total events are hard bounds. A separate Shift tap ends each paste command, and Firefox must observe its ordered keyup before classifying its batch, so success cannot precede an unobserved chord. The input unit completes only after that browser record and td-term's exact-payload transfer record. The proof-only terminal scan, markers and repeat suppression require the exact input-test boot token. Unit tests pin all QMP commands and marker gates; the full-system QEMU boot is the end-to-end authority | core selection crosses from td-term to Firefox without manual testing |
 | 27e | **Firefox download image proof — LANDED**; the authenticated local HTTPS page carries one fixed fixture link. After the clipboard proof, Firefox content focuses and validates that link before admitting a real emulated Enter key. A td-owned probe outside the jail accepts completion only after the exact 23-byte regular file is stable at the uid-1000 source of Firefox's `/home/td/Downloads` grant, with bounded mode, link, identity and duplicate/partial checks. The same trusted input-stage record follows the download and FileChooser markers, so neither a synthetic DOM click nor a stale file can pass; rung 27j owns final greeter completion | Firefox writes a verified HTTPS download through its declared persistent grant without manual testing |
 | 27f | **Firefox FileChooser image proof — LANDED**; after the independent download validation, Firefox content exposes a full-viewport focus control and a trusted physical click focuses the browser. A fresh bounded read-only probe validates that persistent click record and current focus, then the host sends physical `Control+O` to invoke Firefox's native Open File command without a DOM picker call or synthetic assignment. The host accepts one exact portal presentation record, validates the centred 960x562 chooser palette and selected row in a bounded 1280x800 PPM, and recomputes the announced client-buffer checksum from those displayed pixels before injecting Enter to select the file. Firefox must then load the exact granted `file:` URL as plain text with the fixture's exact contents before the private input-stage record. Ordinary boots expose none of the Marionette, QMP or fixture-page machinery | Firefox's broker-authenticated portal request, modal presentation, physical selection and directed result complete without manual testing |
-| 27g | **Firefox public-network image proof — LANDED**; the interactive runner replaces its explicit NIC absence with an explicit QEMU user-mode NIC and no host-to-guest forwarding. Guest-initiated SLIRP traffic can reach the operator host, LAN and public network. The operator-run network oracle retains td-netd DHCP/DNS/TCP and Git HTTPS evidence, then requires the jailed Firefox to navigate to the same public host, complete a verified HTTPS 200 document load and validate the final content origin/body inside one 60-second bounded Marionette session. The trusted evidence unit checks and prints one exact marker before its atomic completion, and the host accepts only that line. The deterministic system oracle remains NIC-less; public reachability is deliberately not a build gate | ordinary interactive Firefox can browse, and the same path has a repeatable non-manual public HTTPS check |
-| 27h | **Firefox Web Audio image proof — LANDED**; the deterministic audit-off physical-input boot uses its first trusted key to start one 440 Hz oscillator in Firefox, schedules 1.2 seconds at quarter gain plus a 500 ms 0.001-gain tail on the same audio clock, then closes the context after the oscillator ends and a bounded downstream-drain interval. The QEMU runs exposed cubeb's real 48 kHz stereo FLOAT32 stream, its 50 ms working target against a larger HDA ring, the built-in test loopback taking card 0 ahead of HDA, and TCG audio-clock progress that can outrun the frames cubeb delivers to HDA. `td-audio` now converts that one same-rate/channel shape into its fixed S16 mixer with saturating samples, negotiated-byte grants/indexes, one wire-frame-bounded scratch per connection and partial-frame refusal; default selection excludes the exact `snd-aloop` PCM while preserving explicit card/device access to it. The negotiated working target is raised to at least the selected device ring plus one transfer period, retaining bounded software refill headroom behind the initially primed ring. Pulse-compatible prebuffering, idle-output suppression and whole-period ALSA-ring priming keep continuous client frames contiguous instead of starting HDA on an empty period; moving the last private-queue frame into a live device ring is not an underflow; each stream rearms only if the shared playhead reaches its exhausted accepted endpoint before a refill extends it. `TRIGGER`, `DRAIN`, bounded shutdown, an initial completed prebuffer gate, a below-period target watermark, or an explicit zero prebuffer may release a complete shorter tail. The scheduled sub-oracle-floor tail and delayed close keep cubeb alive past the bounded downstream queues; that guest schedule is not evidence, and the host WAV duration and waveform checks remain authoritative. The selected HDA device writes through a private 48 kHz stereo S16 QEMU WAV backend. The proof-only codec disables QEMU's emulated gain/mute mixer because `td-audio` deliberately owns no ALSA control node, but retains the HDA PCM transport under test. QEMU writes silence for the whole bounded boot, so the host derives a live file ceiling from the selected timeout plus margin within an absolute 640 MiB bound, raised from 512 MiB when Claude Code's terminal oracle lengthened the timeout, and refuses a larger timeout before launch. The post-exit oracle streams that file through a fixed buffer, retains only the bounded active span, validates the canonical header, 900–1300 ms duration, peak and per-channel AC energy, no internal below-floor run over 64 frames, the median of each channel's overlapping 100 ms-window zero-crossing estimates inside 435–445 Hz, and both channels' mean correlation of at least 0.85 with one shared-frequency sine over those windows. No channel may have more than seven sub-0.9 windows or two contiguous transient runs. Window-local phase therefore tolerates the measured bounded HDA startup and recovery regions; half-window overlap makes repeated boundary-aligned phase resets cross too many measured windows or runs, so the combined checks reject silence, noise, an intermittent signal or an unrelated tone. The authoritative rung-27h landing run measured 1,174 ms active at fitted 440.00 Hz, 440.08/440.08 Hz median zero-crossing estimates, 5,792.4/5,792.4 AC RMS, 0.9990/0.9990 mean correlation, and no sub-0.9 transient window or run in either channel. Diagnostic failures report the exact active span, count above the sample floor and longest internal quiet run. Unit regressions reject malformed input, silence, DC with a negligible tone, a missing channel, a long quiet interval, repeated phase resets, a short tone, an overlong tone and low or high off-band frequencies, accept bounded phase-reset and clock-stretch fixtures, pin the exact float conversion, accounting, refill-before-endpoint continuity, device-ring-plus-period target floor, prebuffer/start continuity, mixed HDA/loopback selection and audio-clock tail, and pin the exact QEMU argv including comma-safe capture paths. The dedicated seccomp-audit variant repeats the real input/soak workload against a host-silent backend; other system boots and the interactive runner remain host-silent | Firefox Web Audio crosses cubeb, the jail's Pulse alias, `td-audio`, ALSA and emulated HDA into a machine-checked waveform without manual listening |
+| 27g | **Firefox public-network image proof — LANDED**; the interactive runner replaces its explicit NIC absence with an explicit QEMU user-mode NIC and no host-to-guest forwarding. Guest-initiated SLIRP traffic can reach the operator host, LAN and public network. The operator-run network oracle retains td-netd DHCP/DNS/TCP and Git HTTPS evidence, then requires the jailed Firefox to navigate to the same public host, complete a verified HTTPS 200 document load and validate the final content origin/body inside one 60-second bounded Marionette session. The trusted evidence unit checks and prints one exact marker before its atomic completion, and the host accepts only that line. The system oracle's boots carry the same NIC since §W.9's cutover, to fetch the applications from the host's feed; public reachability is still not evidence there and is deliberately not a build gate | ordinary interactive Firefox can browse, and the same path has a repeatable non-manual public HTTPS check |
+| 27h | **Firefox Web Audio image proof — LANDED**; the deterministic audit-off physical-input boot uses its first trusted key to start one 440 Hz oscillator in Firefox, schedules 1.2 seconds at quarter gain plus a 500 ms 0.001-gain tail on the same audio clock, then closes the context after the oscillator ends and a bounded downstream-drain interval. The QEMU runs exposed cubeb's real 48 kHz stereo FLOAT32 stream, its 50 ms working target against a larger HDA ring, the built-in test loopback taking card 0 ahead of HDA, and TCG audio-clock progress that can outrun the frames cubeb delivers to HDA. `td-audio` now converts that one same-rate/channel shape into its fixed S16 mixer with saturating samples, negotiated-byte grants/indexes, one wire-frame-bounded scratch per connection and partial-frame refusal; default selection excludes the exact `snd-aloop` PCM while preserving explicit card/device access to it. The negotiated working target is raised to at least the selected device ring plus one transfer period, retaining bounded software refill headroom behind the initially primed ring. Pulse-compatible prebuffering, idle-output suppression and whole-period ALSA-ring priming keep continuous client frames contiguous instead of starting HDA on an empty period; moving the last private-queue frame into a live device ring is not an underflow; each stream rearms only if the shared playhead reaches its exhausted accepted endpoint before a refill extends it. `TRIGGER`, `DRAIN`, bounded shutdown, an initial completed prebuffer gate, a below-period target watermark, or an explicit zero prebuffer may release a complete shorter tail. The scheduled sub-oracle-floor tail and delayed close keep cubeb alive past the bounded downstream queues; that guest schedule is not evidence, and the host WAV duration and waveform checks remain authoritative. The selected HDA device writes through a private 48 kHz stereo S16 QEMU WAV backend. The proof-only codec disables QEMU's emulated gain/mute mixer because `td-audio` deliberately owns no ALSA control node, but retains the HDA PCM transport under test. QEMU writes silence for the whole bounded boot, so the host derives a live file ceiling from the selected timeout plus margin within an absolute 768 MiB bound, raised from 512 MiB to 640 MiB when Claude Code's terminal oracle lengthened the timeout and to 768 MiB when the applications' fetch did, and refuses a larger timeout before launch. The post-exit oracle streams that file through a fixed buffer, retains only the bounded active span, validates the canonical header, 900–1300 ms duration, peak and per-channel AC energy, no internal below-floor run over 64 frames, the median of each channel's overlapping 100 ms-window zero-crossing estimates inside 435–445 Hz, and both channels' mean correlation of at least 0.85 with one shared-frequency sine over those windows. No channel may have more than seven sub-0.9 windows or two contiguous transient runs. Window-local phase therefore tolerates the measured bounded HDA startup and recovery regions; half-window overlap makes repeated boundary-aligned phase resets cross too many measured windows or runs, so the combined checks reject silence, noise, an intermittent signal or an unrelated tone. The authoritative rung-27h landing run measured 1,174 ms active at fitted 440.00 Hz, 440.08/440.08 Hz median zero-crossing estimates, 5,792.4/5,792.4 AC RMS, 0.9990/0.9990 mean correlation, and no sub-0.9 transient window or run in either channel. Diagnostic failures report the exact active span, count above the sample floor and longest internal quiet run. Unit regressions reject malformed input, silence, DC with a negligible tone, a missing channel, a long quiet interval, repeated phase resets, a short tone, an overlong tone and low or high off-band frequencies, accept bounded phase-reset and clock-stretch fixtures, pin the exact float conversion, accounting, refill-before-endpoint continuity, device-ring-plus-period target floor, prebuffer/start continuity, mixed HDA/loopback selection and audio-clock tail, and pin the exact QEMU argv including comma-safe capture paths. The dedicated seccomp-audit variant repeats the real input/soak workload against a host-silent backend; other system boots and the interactive runner remain host-silent | Firefox Web Audio crosses cubeb, the jail's Pulse alias, `td-audio`, ALSA and emulated HDA into a machine-checked waveform without manual listening |
 | 27i | **unsupported portal discovery proof — LANDED**; the live uid-1000 portal client asks the version property and `GetAll` for `ScreenCast`, `RemoteDesktop`, `Camera`, `Secret`, and `Print`, calls one real entry member on each, and accepts only complete exact error replies from the activated service's unique sender. Live introspection must omit every interface, and QEMU requires a distinct trusted service-prefixed marker after the whole sequence | unsupported capture, remote-control, camera, secret, and print capabilities fail closed rather than appearing to succeed |
 | 27j | **Firefox five-minute connection soak — LANDED**; one Marionette session alternates 31 exact guest-local HTTPS navigations at ten-second boundaries through at least 300 seconds. Before/after equality pins Firefox's application instance, pid and procfs start time; the bus GUID plus its exact broker-authenticated Firefox connection/pid set; and the compositor generation. Its live-latched readiness answer separately proves the publishing Wayland client did not depart. Only the final unit can publish the greeter's completion, and QEMU requires its exact soak line | browser, bus and compositor connections survive a bounded real navigation workload without manual observation |
 | 27k | **Firefox outer-seccomp denial audit — LANDED**; a dedicated physical-input variant alone enables the target kernel audit path and asks the standard outer filter to log non-allow decisions without changing their actions. A root-owned, executable-only bind of the existing non-shipped helper makes all 17 blocked calls under that installed filter, then replaces itself with Firefox in the same pid. After the full input workload and five-minute soak, a bounded root parser requires every helper denial, rejects loss, suppression, malformed ABI/uid/action data and any unrostered denial, and emits one exact host-required result. The variant retains all real input, browser, bus and compositor continuity evidence but uses the host-silent audio backend because kernel audit work measurably perturbs the separate TCG HDA waveform oracle | the shipped Firefox path proves its outer deny filter blocks the rostered probes while completing its real workload without an unrostered denial |
@@ -9722,7 +9659,7 @@ The experiments that settle what is left, none longer than a week:
 | # | experiment | settles |
 |---|---|---|
 | **E1 — package half answered (§B.3.1)** | inspect the signed Firefox 154.0 and Freedesktop 25.08 deploy commits without executing the app; map their exact `files/` trees to `/app` and `/usr` | the deploy hierarchy is the right package/runtime split and has no special or setid files. Publisher estimates total 993.7 MB deployed and 382.7 MB downloaded; the bounded importer records exact authenticated graph totals separately. Execution waits on the dynamic-runtime/jail, bus and Wayland stop line rather than using host `bwrap` as a substitute for td-jail |
-| **E1b — COMPLETE** | fetch, materialize and admit the same exact signed Flathub commits through a bounded control-plane importer | Exact-ref admission, commit/root/file authentication, bounded graph acquisition, offline cache re-authentication and repair, transactional cache publication, transactional `files/` reconstruction, typed recipe pins, automatic warming and marked recursive store admission are landed and exercised against both pins. Flathub publishes no stable deploy tarball, so an ambient `flatpak` recipe and a locally hosted export are both refused. §B.3.1 is the importer contract; dynamic runtime validation and jail integration are the next application increments |
+| **E1b — COMPLETE** | fetch, materialize and admit the same exact signed Flathub commits through a bounded control-plane importer | The pinned import was retired at §W.9's cutover; its reader, materializer and validator run in td-app. Exact-ref admission, commit/root/file authentication, bounded graph acquisition, offline cache re-authentication and repair, transactional cache publication, transactional `files/` reconstruction, typed recipe pins, automatic warming and marked recursive store admission are landed and exercised against both pins. Flathub publishes no stable deploy tarball, so an ambient `flatpak` recipe and a locally hosted export are both refused. §B.3.1 is the importer contract; dynamic runtime validation and jail integration are the next application increments |
 | **E2 — COMPLETE** | filter globals from GTK 4.22.1; exercise forced Cairo; compile in exact Freedesktop SDK 25.08 and run against the exact pinned Platform; run pinned Firefox 154.0 on no-dmabuf Weston and test its nested user namespace and `about:support` sandbox report | data-device is the GTK first-window blocker while subcompositor is class U; forced Cairo, pinned llvmpipe, and pinned Firefox all attach shm without dmabuf; stock Firefox denies nested user namespaces yet retains effective content sandbox level 6, selecting one standard td filter. The pinned Freedesktop runtime contains GTK 3 rather than GTK 4, so a future GTK 4 runtime selection repeats that identified part of the matrix |
 | **E3** | a Meson-world pilot — recipes for `pkgconf`, Ninja, Meson, a native CPython, then GLib and a Wayland-only `gtk3-demo` | td's *actual* per-package source cost, the number with the widest error bars. Near `cmake-x86-64`'s cost (a recipe since deleted) and the source track is real; a multi-week fight per package and the hybrid is permanent posture |
 | **E4 — COMPLETE** | the §0 cgroup pins plus live active membership and exact controller readback for Firefox gating the QEMU oracle; lower-level regressions retain the fixture's `memory.high=48M`, `memory.max=64M`, `pids.max=32`, and `cpu.max=50000 100000` case | §P's mechanism works on the target kernel, while the smaller exact fixture policy remains pinned below it |
@@ -11010,11 +10947,10 @@ no editor tree. The td-pass notebook window embeds the same pane.
 
 ### W.9 Flathub applications on demand
 
-**Status: decided by the repository user, landing in increments.** Until
-the cutover increment below lands, the pinned Firefox of §B.3.1 still
-ships in the image and everything earlier in this document about it
-holds. This section is the target; where it and an earlier section
-disagree, the earlier one describes the code that exists today.
+**Status: decided by the repository user; landed.** No Flathub byte is
+in the image: §B.3.1's pinned path is retired, and where this section and
+an earlier one disagree about Firefox or Claude Code's runtime, this one
+describes the code.
 
 **Why.** An exact-commit pin assumes its URL is permanent, and Flathub's
 is not: it prunes superseded commits within weeks. The Firefox 154 pin
@@ -11051,7 +10987,8 @@ the ref names when a machine asks is admitted only if all of these hold:
    names exactly the accepted runtime ref, and the runtime commit passes
    1–3 for that ref;
 5. both graphs pass §B.3.1's bounds and both trees the deploy-tree rules
-   and the dynamic validator, the checks the image build runs today.
+   and the dynamic validator, the checks the image build ran on the
+   pinned path.
 
 A refused candidate leaves the current generation in place and is
 reported. A new runtime branch (26.08) or a new Flathub subkey is a
@@ -11136,10 +11073,10 @@ read from `/etc/td-applications.tsv` under td-jail's rules before
 anything is fetched), writes `admitted`, and only then publishes. An
 unchanged check rewrites `admitted` too.
 The materializer and the dynamic validator move from the builder into
-td-engine so the image build and td-app share one implementation; td-net
+td-engine, where td-app runs the implementation the image build ran; td-net
 stays free of `unsafe`, so publication uses the account-private lock and
-an absence check and plain `rename(2)` under that lock instead of the
-builder's `RENAME_NOREPLACE`.
+an absence check and plain `rename(2)` under that lock instead of a
+no-replace rename.
 
 **When it fetches.** td-jail, launching an application whose spec names
 Flathub refs, first runs `/bin/td-app ready NAME` as the account, with
@@ -11189,22 +11126,37 @@ could not do by asking for a terminal, and the update runs as the
 application's account, so neither is an elevation (principle 7). A
 polled root worker reading a FIFO, considered first, would have needed
 a second authenticated path; the compositor runs as its own uid, not the
-human's, so the request is the compositor's either way. At cutover
-Firefox's unit gains `unless-exists=` on a path the init script creates
-on every boot that does not carry the autotest token, so a normal boot
-skips it and an oracle boot starts it, and it becomes `restart=never`,
-so closing Firefox keeps it closed.
+human's, so the request is the compositor's either way.
 
-**The image no longer carries the payload.** At cutover the Firefox
-recipe stops naming `firefox-154-source` and the runtime; its package in
-`/td/store` keeps `manifest`, `spec` and `exports/launcher.tsv`, and the
-spec names the declared refs: `source=` the app ref, between `name=` and
-`runtime=`, and `runtime=` the runtime ref rather than a store path.
-td-jail resolves such a spec from the account's held generation instead
-of `/td/store`. `recipes/src/ostree_pins.rs`, the pinned graphs,
-the OSTree step of `./update`'s warm and `td-feed export/consume graphs`
-are deleted in the same landing, and roughly 1 GB leaves every image and
-§B.1's ×3 capacity accounting.
+**Nothing starts or fetches at boot.** A link from mail or news (§E row
+4) therefore opens only once the human has opened Firefox; letting the
+portal ask for the start would need an authority path of its own and is
+later work. The deployment init creates
+`/run/td-applications-on-demand` on every boot that does not carry the
+autotest token, and on every live one. Firefox's unit names it in
+`unless-exists=`, so an ordinary boot skips Firefox and only a launch
+request starts it, and an oracle boot starts it. Its `restart=on-failure`
+retries a launch that failed, as one racing the session bus does, while a
+window the human closed stays closed. Under the token the oracle's
+applications fetch before they start, so their readiness deadlines
+measure a launch rather than a download: `firefox-fetch` and
+`claude-fetch` run `td-app update` as each account, bounded at 900
+seconds, name the same path, and order Firefox and Claude Code's evidence
+after them. Anywhere else the first launch fetches.
+
+**The image no longer carries the payload.** The Firefox recipe is a
+declaration alone: no source, no payload, no steps, and the version
+`stable`, the branch it follows. Its package in `/td/store` keeps
+`manifest`, `spec` and `exports/launcher.tsv`, and the spec names the
+declared refs: `source=` the app ref, between `name=` and `runtime=`, and
+`runtime=` the runtime ref rather than a store path. It is foreign
+without a foreign pin (`Recipe::flathub_runtime`, the builder's rule),
+since it runs bytes it does not carry. td-jail resolves such a spec from
+the account's held generation instead of `/td/store`. The OSTree pins,
+the Freedesktop 25.08 recipe, the graph cache's warm in `./update`,
+`td-feed warm ostree`, `td-feed export/consume graphs` and `td-builder
+ostree-materialize` were deleted in the same landing, and roughly 1 GB
+left every image and §B.1's ×3 capacity accounting.
 
 **Claude Code keeps its binary and fetches its runtime.** Its payload is
 Anthropic's release, pinned in `recipes/src/source_pins.rs` at a
@@ -11238,7 +11190,8 @@ audio, input, seccomp and network run through the autostarted Firefox
 first-run fetch uses a host feed as transport, named to the guest by a
 `td.feed=` token beside the autotest one (an oracle runs no VM bridge
 to name it): the integration
-tier's host warm is to run `td-feed export flathub`, which resolves every
+tier's warm, `td-recipe-eval warm system-x86-64 --flathub`, runs
+`td-feed export flathub`, which resolves every
 declared ref against Flathub under rules 1–2, fetches its graph, and
 publishes the graph, its detached metadata and last the ref into the
 feed, and the guest re-verifies everything, signature included, under
@@ -11249,9 +11202,16 @@ feed answer that fails a rule is a refusal, not a reason to ask Flathub.
 The feed is trusted for freshness and availability, never integrity:
 whoever runs it can hold an account at any Flathub-signed commit at or
 above its floor, which on a fresh account is any such commit, so a feed
-belongs to the host that runs the guest. The cost is that oracles need
-the network at warm time and the Firefox version they test floats with
-Flathub.
+belongs to the host that runs the guest. Each oracle boot whose line
+carries the autotest token, live ones aside, gets a private `td-feed
+serve` of that feed for its lifetime, QEMU's user-mode NIC with no
+inbound forward, and `td.feed=http://10.0.2.2:PORT`; the boot's host
+ceiling and the greeter's horizon each grow by the 900-second fetch, and
+the fixture volumes by 4 GiB of cache. `./update`'s warm does not
+export, so a system update needs no Flathub. The cost is that oracles
+need the network at warm time, their guests have the NIC's public reach,
+and the Firefox version they test floats with Flathub, which the oracle
+memo does not see.
 
 **What this reverses in §B.6.** A bounded OSTree client (exact refs,
 commits, detached metadata and `files/` objects, no summary browsing,
@@ -11284,10 +11244,10 @@ eighth). (9) A guest's endpoint from its kernel command line: on an
 autotest boot the deployment init writes a `td.feed=` token to
 `/run/td-feed`, which td-app reads when no VM bridge gave one (landed
 ninth); the oracles' own wiring lands with the cutover, which is the
-first thing that needs it. (10) Cutover: the
-declaration-only Firefox package, Claude Code's runtime ref, autostart
-only under the autotest token, and deletion of the pins, payloads and
-graph transfer.
+first thing that needs it. (10) Cutover: the declaration-only Firefox
+package, Claude Code's runtime ref, autostart and fetch only under the
+autotest token, the oracles' feed, and deletion of the pins, payloads
+and graph transfer (landed tenth).
 
 ## X. Host mode — development only
 
@@ -11737,8 +11697,9 @@ Three consequences that are easy to violate by accident:
 2. **Prefer upstreams that publish plain files.** Where a project ships only
    through a repository protocol of its own — a Flatpak runtime through
    OSTree, say — the choices are a distro's plain package files, building from
-   source, or §B.3.1's bounded control-plane import of exact upstream-hosted
-   objects. Never host a repackaged copy.
+   source, or §W.9's run-time fetch of upstream-hosted objects under
+   signature and admission rules (§B.3.1's exact-commit import rotted
+   when Flathub pruned the commit). Never host a repackaged copy.
 3. **Delta and chunking machinery is not needed** and should not be
    built speculatively. It optimizes repeated pulls from a server that
    does not exist.
