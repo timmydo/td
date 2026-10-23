@@ -6696,7 +6696,10 @@ Stored-body verification and replay allow 256 MiB incoming bytes with the
 existing 8192-frame and 512 KiB outgoing limits. Raw JMAP downloads use the
 64 MiB stored-body ceiling; configured network admission limits do not hide
 successfully imported bodies. Authentication, per-frame bounds, deadlines and
-bounded chunk buffers remain in force. MIME parsing retains its own limits.
+bounded chunk buffers remain in force. Email body/header projections and text
+search also use the stored-body ceiling rather than the current incoming
+message ceiling. MIME header, part, depth, work and output bounds remain
+independent and may still refuse an interpretation.
 
 Full stored-body verification and raw download have an absolute 30-second
 ceiling, including replay: the 64 MiB debug fixture exhausted ten seconds after

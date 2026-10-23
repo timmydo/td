@@ -6109,8 +6109,16 @@ fn exercise_read_dispatch(
         ["Email/query",{{"accountId":"{account}","filter":{{"minSize":-1}}}},"w9"]
     ]}}"##
     );
+    let smallest_body = [first_id, second_id]
+        .into_iter()
+        .map(|id| snapshot.email(id).unwrap().unwrap().body.length as usize)
+        .min()
+        .unwrap();
+    // These bodies predate a stricter incoming-message policy.
     let limits = Limits {
         json_methods: 27,
+        message_bytes: smallest_body - 1,
+        header_bytes: smallest_body - 1,
         ..Limits::default()
     };
     let mut bytes = vec![0; limits.json_bytes].into_boxed_slice();
@@ -7362,7 +7370,11 @@ fn exercise_read(
             }
             let options = td_mta::body_value_options::Options { fetch_text: true, ..Default::default() };
             let mut output = Output { bytes: Vec::new(), refuse: false };
-            dispatch::write_verified_email(&mut output, body, &td_mta::limits::Limits::default(), (&selected, options), &Clock, &mut work).unwrap();
+            // A later ingress policy must not hide an already stored body.
+            let read_limits = td_mta::limits::Limits { message_bytes: body.len() as usize - 1, header_bytes: body.len() as usize - 1, ..Default::default() };
+            read_limits.plan().unwrap();
+            assert!(body.len() > read_limits.message_bytes as u64);
+            dispatch::write_verified_email(&mut output, body, &read_limits, (&selected, options), &Clock, &mut work).unwrap();
             let text = std::str::from_utf8(&output.bytes).unwrap();
             assert!(text.contains("\"subject\":\"Snapshot\""));
             assert!(text.contains("sender@example.test"));

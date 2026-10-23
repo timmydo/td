@@ -248,7 +248,7 @@ impl Worker<'_, '_, '_, '_, '_> {
                     .email_metadata(id, &mut row)
                     .map_err(super::postgres_read_error)?
                     .ok_or(Error::State)?;
-                if metadata.size > limits.message_bytes as u64 {
+                if metadata.size > crate::postgres_body::MAX_BODY_BYTES {
                     return Err(Error::StorageCapacity);
                 }
                 let turns = metadata.size.div_ceil(4096);

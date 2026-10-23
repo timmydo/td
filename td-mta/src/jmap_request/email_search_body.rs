@@ -55,7 +55,7 @@ fn search_inner(
 ) -> Result<bool, Error> {
     search.reset();
     pin.check_deadline().map_err(storage)?;
-    if pin.len() > limits.message_bytes as u64 {
+    if pin.len() > crate::postgres_body::MAX_BODY_BYTES {
         return Err(Error::StorageCapacity);
     }
     if limits.mime_parts == 0 {

@@ -305,7 +305,7 @@ impl Worker<'_, '_, '_, '_, '_> {
                 if selected.body() || !selected.headers.is_empty() {
                     let result = match &mut view {
                         View::Postgres(view) => {
-                            if metadata.size > limits.message_bytes as u64 {
+                            if metadata.size > crate::postgres_body::MAX_BODY_BYTES {
                                 return Err(Error::StorageCapacity);
                             }
                             let turns = metadata.size.div_ceil(4096);

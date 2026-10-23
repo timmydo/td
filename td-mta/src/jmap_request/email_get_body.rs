@@ -227,7 +227,7 @@ fn write_verified_inner(
 ) -> Result<(), Error> {
     output.check()?;
     pin.check_deadline().map_err(storage)?;
-    if pin.len() > limits.message_bytes as u64 {
+    if pin.len() > crate::postgres_body::MAX_BODY_BYTES {
         return Err(Error::StorageCapacity);
     }
     let (selected, options) = selection;
