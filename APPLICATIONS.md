@@ -904,8 +904,8 @@ reviewed capacity landing**:
 
 | constant | today | capacity consequence |
 |---|---|---|
-| `td-boot/src/protocol.rs`'s `MIN_VOLUME_BYTES` | 5 GiB | three deployment-sized copies are transiently live during publish. The profiling policy budgets one GiB of debug companions in each copy, one GiB for all three copies' non-debug payloads, and one GiB for Btrfs metadata plus `@var`. `td-install` enforces this as an admission floor, not a promise that every deployment fits; a larger update can still fail with `ENOSPC` while staging, before selectors change |
-| the QEMU oracle's `PERSISTENT_VOLUME_BYTES` / headroom | 7 GiB / 1 GiB, `copies = 3` | reserves three GiB for ceiling-sized debug trees, three GiB for the three non-debug deployment copies that now include Firefox and its runtime, and one GiB of Btrfs/headroom. The oracle separately asserts that this remains at or above target admission's 5 GiB floor |
+| `td-boot/src/protocol.rs`'s `MIN_VOLUME_BYTES` | 5 GiB | three deployment-sized copies are transiently live during publish. The profiling policy permits 128 MiB of debug companions in each copy. The floor retains its existing capacity; actual non-debug payloads and Btrfs metadata plus `@var` must also fit. `td-install` enforces this as an admission floor, not a promise that every deployment fits; a larger update can still fail with `ENOSPC` while staging, before selectors change |
+| the QEMU oracle's `PERSISTENT_VOLUME_BYTES` / headroom | 10.375 GiB / 1 GiB, `copies = 3` | reserves 384 MiB for three ceiling-sized debug trees, nine GiB for three non-debug deployment copies, and one GiB of Btrfs/headroom. The oracle separately asserts that this remains at or above target admission's 5 GiB floor |
 | `ESP_BYTES` | 512 MiB | **not** a problem — the ESP carries kernel and initramfs only. Named here because a reader would otherwise assume it is the partition that grows |
 
 The disk cost is therefore **2× the browser permanently and 3× across an
@@ -1845,7 +1845,7 @@ wait, with a distinct 915-second service backstop. Ordinary boots retain the
 300-second evidence wait and never run the synthetic attribution workload. The
 evidence rules are unchanged: the accepted capture must still have complete
 bounded reports, zero loss, corruption and omitted diagnostics, and the exact
-source-line attribution sample. The longer proof-only window accommodates
+function attribution sample. The longer proof-only window accommodates
 report latency rather than accepting weaker evidence.
 
 The inspected Firefox entry is a short `#!/bin/bash` wrapper that sets

@@ -485,8 +485,8 @@ td-pass, and the sibling trees its closure mounts by path (td-secret,
 td-ui, td-compositor, td-authd, td-busd, td-firstboot and engine). Its
 lock names only td-pass, td-secret and td-ui, so the closure is std. The
 binary is static PIE with no interpreter, needed library or run path,
-built with the target's frame pointers and line tables, and its output
-carries the build-ID-matched debug companion. The system image copies
+built with the target's frame pointers, and its output carries the
+build-ID-matched, symbols-only debug companion. The system image copies
 the whole output and links `/bin/td-pass` to it, so the image's
 deployment index covers it and the same executable can be carried to a
 foreign host. On td itself the window refuses until td mode is built;

@@ -328,19 +328,20 @@ musl's and its own freestanding includes and the root's binutils, and
 `-march=x86-64 -mtune=generic`.
 Compiled Rust and C request frame pointers and level-1 debug information;
 release/bench profile stripping is explicitly disabled, and the artifact check
-requires structurally valid `.debug_line` data. Source/vendor/output paths map
-to `/td-build`, `/td-cargo/vendor` and
+requires an ordinary symbol table in every executable but the split receiver.
+Source/vendor/output paths map to `/td-build`, `/td-cargo/vendor` and
 `/td-build-root`. Upstream prebuilt std/libc and hand-written provider assembly
 remain profiling boundaries. This host portable artifact is not the target
 image's whole-closure profiling qualification.
 
 The linker requests a deterministic SHA-1 GNU build ID. After allocator-symbol
 inspection, the build root's `objcopy` creates `td-mta.debug` from the
-receiver, prunes non-line DWARF using the shared target profiling policy, then
-strips the runtime. The existing ELF pair validator requires matching build IDs,
-ordinary companion symbols, useful uncompressed line tables and a stripped
-runtime. The host repeats that validation on its private collected copy before
-running the process suite against the exact stripped receiver. Both files ship
+receiver, prunes all DWARF, line tables included, using the shared target
+profiling policy, then strips the runtime. The existing ELF pair validator
+requires matching build IDs, ordinary companion symbols, no companion DWARF
+and a stripped runtime. The host repeats that validation on its private
+collected copy before running the process suite against the exact stripped
+receiver. Both files ship
 in the same content-addressed artifact. Probe executables retain embedded debug
 data and never become installed service dependencies. This pair does not
 establish frame-pointer coverage for the upstream prebuilt std/libc or provider
@@ -408,7 +409,7 @@ Success prints `.td-build-cache/crypto-artifact-<NAR-sha256>`, containing:
 - `td-mta`: the installed receiving-only executable. Its supported store,
   configuration, `serve --smtp-only`, status and stop commands and remaining
   service limits are documented in td-mta/CONFIG.md and STORAGE.md.
-- `td-mta.debug`: the matching receiver symbols and line tables, mode 0644.
+- `td-mta.debug`: the matching receiver symbols, without line tables, mode 0644.
   Retain it with the executable; it is not a separate download.
 - `td-mta-cli-smoke`: the existing store/configuration/receiver process suite,
   selecting this exact `td-mta` under the separate fixture described above.

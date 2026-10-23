@@ -1,6 +1,5 @@
 use crate::contract::{
-    ATTRIBUTION_FUNCTION_FRAGMENT, ATTRIBUTION_MARKER, ATTRIBUTION_SOURCE_FILE, CAPTURE_MARKER,
-    MAX_EVIDENCE_WAIT_SECS,
+    ATTRIBUTION_FUNCTION_FRAGMENT, ATTRIBUTION_MARKER, CAPTURE_MARKER, MAX_EVIDENCE_WAIT_SECS,
 };
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
@@ -204,15 +203,10 @@ fn run_attribution_slice(duration: Duration) -> Result<(), String> {
     Ok(())
 }
 
-const ATTRIBUTION_SOURCE_LINE_START: u64 = line!() as u64 + 2;
 #[inline(never)]
 fn td_profiler_attribution_workload(mut state: u64) -> u64 {
     let mut round = 0u64;
     while round != 16_384 {
-        // Keep the hot instructions in this source file. Calling an inlined
-        // primitive helper such as rotate_left assigns its machine code to
-        // core's intrinsic source line, which makes a source-line proof depend
-        // on the profiler rarely sampling the surrounding loop machinery.
         state ^= state << 13;
         state ^= state >> 7;
         state ^= state << 17;
@@ -221,7 +215,6 @@ fn td_profiler_attribution_workload(mut state: u64) -> u64 {
     }
     state
 }
-const ATTRIBUTION_SOURCE_LINE_END: u64 = line!() as u64 - 1;
 
 fn current_captures(root: &Path, boot_id: &str) -> Result<CurrentCaptures, String> {
     let mut entries = Vec::new();
@@ -379,8 +372,8 @@ fn validate(
     }
     if require_attribution && !lines_contain_attribution(&capture.join("lines.jsonl"))? {
         return Err(format!(
-            "capture has no line-resolved {ATTRIBUTION_FUNCTION_FRAGMENT} sample in \
-             {ATTRIBUTION_SOURCE_FILE}:{ATTRIBUTION_SOURCE_LINE_START}..={ATTRIBUTION_SOURCE_LINE_END}"
+            "capture has no {ATTRIBUTION_FUNCTION_FRAGMENT} sample attributed to its function \
+             symbol with source-line resolution explicitly unavailable"
         ));
     }
     Ok(())
@@ -1012,7 +1005,6 @@ fn lines_contain_attribution(path: &Path) -> Result<bool, String> {
 
 fn attribution_rows(mut reader: impl BufRead) -> std::io::Result<bool> {
     let mut row = Vec::new();
-    let source_field = format!("\"source_file\":\"{ATTRIBUTION_SOURCE_FILE}\"");
     loop {
         row.clear();
         let read = {
@@ -1028,7 +1020,7 @@ fn attribution_rows(mut reader: impl BufRead) -> std::io::Result<bool> {
             discard_row_tail(&mut reader)?;
             continue;
         }
-        if attribution_row(&row, source_field.as_bytes()) {
+        if attribution_row(&row) {
             return Ok(true);
         }
     }
@@ -1049,14 +1041,14 @@ fn discard_row_tail(reader: &mut impl BufRead) -> std::io::Result<()> {
     }
 }
 
-fn attribution_row(row: &[u8], source_field: &[u8]) -> bool {
+/// One `lines.jsonl` row attributing the workload to its function symbol.
+/// Companions carry no line program, so the row must also report the source
+/// line unresolved rather than a fabricated location.
+fn attribution_row(row: &[u8]) -> bool {
     contains(row, b"\"symbol_resolved\":true")
-        && contains(row, b"\"line_resolved\":true")
+        && contains(row, b"\"line_resolved\":false")
         && contains(row, ATTRIBUTION_FUNCTION_FRAGMENT.as_bytes())
-        && contains(row, source_field)
-        && decimal(row, b"\"source_line\":").is_some_and(|line| {
-            (ATTRIBUTION_SOURCE_LINE_START..=ATTRIBUTION_SOURCE_LINE_END).contains(&line)
-        })
+        && contains(row, b"\"source_line\":null")
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
@@ -1064,27 +1056,6 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         && haystack
             .windows(needle.len())
             .any(|window| window == needle)
-}
-
-fn decimal(row: &[u8], label: &[u8]) -> Option<u64> {
-    let at = row
-        .windows(label.len())
-        .position(|window| window == label)?
-        .checked_add(label.len())?;
-    let mut value = 0u64;
-    let mut digits = 0usize;
-    let rest = row.get(at..)?;
-    for byte in rest {
-        if !byte.is_ascii_digit() {
-            break;
-        }
-        value = value.checked_mul(10)?.checked_add(u64::from(byte - b'0'))?;
-        digits = digits.saturating_add(1);
-    }
-    if digits == 0 || (digits > 1 && rest.first() == Some(&b'0')) {
-        return None;
-    }
-    matches!(rest.get(digits), Some(b',' | b'}')).then_some(value)
 }
 
 fn validate_mode(
@@ -1136,8 +1107,7 @@ mod tests {
         current_capture_diagnostic, current_captures, evidence_marker, number,
         selected_wait_timeout, validate_integrity_counters, validate_overview,
         validate_wait_request, wait, CurrentCaptures, ATTRIBUTION_FUNCTION_FRAGMENT,
-        ATTRIBUTION_MARKER, ATTRIBUTION_SOURCE_FILE, ATTRIBUTION_SOURCE_LINE_END,
-        ATTRIBUTION_SOURCE_LINE_START, CAPTURE_MARKER, MAX_ATTRIBUTION_ROW_BYTES,
+        ATTRIBUTION_MARKER, CAPTURE_MARKER, MAX_ATTRIBUTION_ROW_BYTES,
     };
     use std::io::Cursor;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -1313,43 +1283,43 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    fn attribution(line: u64) -> String {
+    fn attribution() -> String {
         let function = format!("_Rabc{ATTRIBUTION_FUNCTION_FRAGMENT}def");
         format!(
             "{{\"schema\":2,\"pid\":7,\"start_kind\":\"ticks\",\"start_value\":9,\
-             \"generation\":1,\"symbol_resolved\":true,\"line_resolved\":true,{},{},\
-             \"build_id\":\"0011\",\"function_address\":256,\"object_address\":null,{},\
-             \"source_line\":{line},\"source_column\":1,\"discriminator\":0,\"samples\":7}}\n",
+             \"generation\":1,\"symbol_resolved\":true,\"line_resolved\":false,{},{},\
+             \"build_id\":\"0011\",\"function_address\":256,\"object_address\":300,{},\
+             \"source_line\":null,\"source_column\":null,\"discriminator\":null,\"samples\":7}}\n",
             crate::json::named_bytes("object", b"/td/store/test/bin/td-profiler"),
             crate::json::named_bytes("function", function.as_bytes()),
-            crate::json::named_bytes("source_file", ATTRIBUTION_SOURCE_FILE.as_bytes()),
+            crate::json::named_bytes("source_file", b""),
         )
     }
 
-    fn source_field() -> String {
-        format!("\"source_file\":\"{ATTRIBUTION_SOURCE_FILE}\"")
-    }
-
     #[test]
-    fn attribution_requires_the_named_function_dwarf_source_and_function_line() {
-        let valid = attribution(ATTRIBUTION_SOURCE_LINE_START);
-        let source_field = source_field();
-        assert!(attribution_row(valid.as_bytes(), source_field.as_bytes()));
-        assert!(!attribution_row(
-            attribution(ATTRIBUTION_SOURCE_LINE_START.saturating_sub(1)).as_bytes(),
-            source_field.as_bytes(),
-        ));
+    fn attribution_requires_the_named_function_and_an_unresolved_line() {
+        let valid = attribution();
+        assert!(attribution_row(valid.as_bytes()));
         assert!(!attribution_row(
             valid
                 .replace(ATTRIBUTION_FUNCTION_FRAGMENT, "other_workload")
-                .as_bytes(),
-            source_field.as_bytes(),
+                .as_bytes()
         ));
         assert!(!attribution_row(
             valid
-                .replace(ATTRIBUTION_SOURCE_FILE, "/tmp/evidence.rs")
-                .as_bytes(),
-            source_field.as_bytes(),
+                .replace("\"symbol_resolved\":true", "\"symbol_resolved\":false")
+                .as_bytes()
+        ));
+        // A companion carries no line program: a resolved location would be
+        // fabricated, not evidence.
+        let fabricated = valid
+            .replace("\"line_resolved\":false", "\"line_resolved\":true")
+            .replace("\"source_line\":null", "\"source_line\":12");
+        assert!(!attribution_row(fabricated.as_bytes()));
+        assert!(!attribution_row(
+            valid
+                .replace("\"source_line\":null", "\"source_line\":12")
+                .as_bytes()
         ));
     }
 
@@ -1583,7 +1553,7 @@ mod tests {
     fn attribution_scan_skips_an_oversized_hostile_row_without_unbounded_allocation() {
         let mut input = vec![b'x'; MAX_ATTRIBUTION_ROW_BYTES as usize + 1];
         input.extend_from_slice(b"tail\n");
-        input.extend_from_slice(attribution(ATTRIBUTION_SOURCE_LINE_END).as_bytes());
+        input.extend_from_slice(attribution().as_bytes());
         assert!(attribution_rows(Cursor::new(input)).unwrap());
     }
 }

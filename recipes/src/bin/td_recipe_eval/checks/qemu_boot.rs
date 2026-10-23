@@ -474,10 +474,11 @@ const DRAIN_BUDGET: usize = 4 * 1024 * 1024;
 const MAX_CONSOLE_BYTES: u64 = 64 * 1024 * 1024;
 const PERSISTENT_DEPLOYMENT_COPIES: u64 = 3;
 // The standard root includes Firefox and the source-built developer tools.
-// Reserve two GiB of non-debug payload per transactional copy, separately
-// from each copy's one-GiB debug allowance and the writable-state headroom.
-// The sparse volume does not allocate its whole logical size on the host.
-const PERSISTENT_NON_DEBUG_BYTES: u64 = 6 * 1024 * 1024 * 1024;
+// Reserve three GiB of non-debug payload per transactional copy (an
+// October 2026 root.erofs held 2.0 GiB of it), separately from each copy's
+// debug-ceiling allowance and the writable-state headroom. The sparse
+// volume does not allocate its whole logical size on the host.
+const PERSISTENT_NON_DEBUG_BYTES: u64 = 9 * 1024 * 1024 * 1024;
 const PERSISTENT_VOLUME_HEADROOM: u64 = 1024 * 1024 * 1024;
 const PERSISTENT_VOLUME_BYTES: u64 = td_engine::target_profile::DEPLOYMENT_DEBUG_CEILING_BYTES
     * PERSISTENT_DEPLOYMENT_COPIES
@@ -2287,10 +2288,10 @@ fn validate_system_boot(
              absent — the root opener could not create \
              per-CPU perf events, the dedicated profiler identity could not publish its \
              bounded capture, the td-svc service name or console framing drifted, or persisted \
-             lines.jsonl did not attribute the deterministic {} workload to {} and a source \
-             line inside that function. Last serial output:\n{}",
+             lines.jsonl did not attribute the deterministic {} workload to its function \
+             symbol with source-line resolution explicitly unavailable. Last serial \
+             output:\n{}",
             td_recipe::td_profiler_contract::ATTRIBUTION_FUNCTION_FRAGMENT,
-            td_recipe::td_profiler_contract::ATTRIBUTION_SOURCE_FILE,
             tail(&result.console, 80)
         ));
     }

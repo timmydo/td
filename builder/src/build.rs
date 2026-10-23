@@ -2104,7 +2104,7 @@ pub fn run_rust() -> Result<(), String> {
     let bins_spec = env::var("TD_RUST_BINS").map_err(|_| "TD_RUST_BINS not set".to_string())?;
     let recipe_name =
         env::var("TD_RECIPE_NAME").map_err(|_| "TD_RECIPE_NAME not set".to_string())?;
-    require_debug_companion_policy(&recipe_name)?;
+    require_debug_companion_policy()?;
     let cargo_subdir = match env::var("TD_CARGO_SUBDIR") {
         Ok(value) => Some(value),
         Err(env::VarError::NotPresent) => None,
@@ -4383,39 +4383,10 @@ fn compare_files(left: &Path, right: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_line_exception_runtime(
-    root: &Path,
-    runtimes: &[PathBuf],
-    exception: td_engine::target_profile::LineAttributionException,
-) -> Result<(), String> {
-    let target = root.join(exception.runtime_relative_path);
-    if !runtimes.iter().any(|runtime| runtime == &target) {
-        return Err(format!(
-            "named line-attribution exception runtime is absent: {}",
-            target.display()
-        ));
-    }
-    let target_metadata = fs::metadata(&target)
-        .map_err(|e| format!("stat line-attribution exception {}: {e}", target.display()))?;
-    let target_inode = (target_metadata.dev(), target_metadata.ino());
-    for runtime in runtimes.iter().filter(|runtime| *runtime != &target) {
-        let metadata = fs::metadata(runtime)
-            .map_err(|e| format!("stat installed ELF {}: {e}", runtime.display()))?;
-        if (metadata.dev(), metadata.ino()) == target_inode {
-            return Err(format!(
-                "named line-attribution exception {} aliases ordinary runtime {}",
-                target.display(),
-                runtime.display(),
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn require_debug_companion_policy(recipe_name: &str) -> Result<(), String> {
+fn require_debug_companion_policy() -> Result<(), String> {
     let actual = env::var("TD_DEBUG_COMPANION_POLICY")
         .map_err(|_| "TD_DEBUG_COMPANION_POLICY is not set for debug splitting".to_string())?;
-    let expected = td_engine::target_profile::debug_companion_policy(recipe_name);
+    let expected = td_engine::target_profile::DEBUG_COMPANION_POLICY;
     if actual != expected {
         return Err(format!(
             "debug companion policy {actual:?} does not match builder policy {expected:?}"
@@ -4456,10 +4427,6 @@ fn split_debug_tree(root: &Path, objcopy: &Path, recipe_name: &str) -> Result<()
             root.display()
         ));
     }
-    let line_exception = td_engine::target_profile::line_attribution_exception(recipe_name);
-    if let Some(exception) = line_exception {
-        validate_line_exception_runtime(root, &runtimes, exception)?;
-    }
     let objcopy = objcopy
         .to_str()
         .ok_or_else(|| format!("non-UTF-8 objcopy path: {}", objcopy.display()))?;
@@ -4470,7 +4437,7 @@ fn split_debug_tree(root: &Path, objcopy: &Path, recipe_name: &str) -> Result<()
     // may expose one ELF through several hard links (glibc getconf does); a
     // later in-place objcopy of one name must not become the source for another
     // name's companion.
-    let mut companion_by_inode: std::collections::HashMap<(u64, u64), (PathBuf, PathBuf, bool)> =
+    let mut companion_by_inode: std::collections::HashMap<(u64, u64), (PathBuf, PathBuf)> =
         std::collections::HashMap::new();
     let mut pairs = Vec::with_capacity(runtimes.len());
     for runtime in &runtimes {
@@ -4490,8 +4457,6 @@ fn split_debug_tree(root: &Path, objcopy: &Path, recipe_name: &str) -> Result<()
         let relative_text = relative
             .to_str()
             .ok_or_else(|| format!("non-UTF-8 installed ELF path: {}", relative.display()))?;
-        let runtime_line_exception =
-            line_exception.filter(|exception| exception.runtime_relative_path == relative_text);
         let debug = debug_root.join(format!("{relative_text}.debug"));
         let parent = debug
             .parent()
@@ -4504,83 +4469,42 @@ fn split_debug_tree(root: &Path, objcopy: &Path, recipe_name: &str) -> Result<()
         let debug_text = debug
             .to_str()
             .ok_or_else(|| format!("non-UTF-8 debug companion path: {}", debug.display()))?;
-        let canonical_runtime = if let Some((first_debug, first_runtime, first_has_exception)) =
-            companion_by_inode.get(&inode)
-        {
-            if *first_has_exception != runtime_line_exception.is_some() {
-                return Err(format!(
-                    "named line-attribution exception {} aliases ordinary runtime {}",
-                    runtime.display(),
-                    first_runtime.display(),
-                ));
-            }
-            fs::hard_link(first_debug, &debug).map_err(|e| {
-                format!(
-                    "hard-link debug companion {} from {}: {e}",
-                    debug.display(),
-                    first_debug.display()
-                )
-            })?;
-            first_runtime.clone()
-        } else {
-            run_cmd(
-                objcopy,
-                &["--only-keep-debug", runtime_text, debug_text],
-                cwd,
-                &[],
-                &WATCH_PHASE,
-            )?;
-            let remove_debug_strings = runtime_line_exception.is_some()
-                || !crate::elf::debug_line_requires_debug_str(&debug)?;
-            let mut prune_args: Vec<String> =
-                td_engine::target_profile::ALWAYS_PRUNED_DEBUG_SECTIONS
+        let canonical_runtime =
+            if let Some((first_debug, first_runtime)) = companion_by_inode.get(&inode) {
+                fs::hard_link(first_debug, &debug).map_err(|e| {
+                    format!(
+                        "hard-link debug companion {} from {}: {e}",
+                        debug.display(),
+                        first_debug.display()
+                    )
+                })?;
+                first_runtime.clone()
+            } else {
+                run_cmd(
+                    objcopy,
+                    &["--only-keep-debug", runtime_text, debug_text],
+                    cwd,
+                    &[],
+                    &WATCH_PHASE,
+                )?;
+                // Keep ordinary symbols, the build-ID note and section headers;
+                // drop all DWARF, the line program and its string tables too.
+                let mut prune_args: Vec<String> = td_engine::target_profile::PRUNED_DEBUG_SECTIONS
                     .iter()
                     .map(|section| format!("--remove-section={section}"))
                     .collect();
-            // DWARF 2 through 4 carry line-table paths inline. DWARF 5 can
-            // reference `.debug_str`, so keep it only when a structurally
-            // checked directory/file format declares DW_FORM_strp. The named
-            // oversized-line exception deliberately makes no reader claim.
-            if remove_debug_strings {
-                prune_args.push("--remove-section=.debug_str".into());
-            }
-            prune_args.push(debug_text.into());
-            let prune_arg_refs: Vec<&str> = prune_args.iter().map(String::as_str).collect();
-            run_cmd(objcopy, &prune_arg_refs, cwd, &[], &WATCH_PHASE)?;
-            fs::set_permissions(&debug, fs::Permissions::from_mode(0o644))
-                .map_err(|e| format!("chmod debug companion {}: {e}", debug.display()))?;
-            if let Some(exception) = runtime_line_exception {
-                let bytes = fs::metadata(&debug)
-                    .map_err(|e| format!("stat debug companion {}: {e}", debug.display()))?
-                    .len();
-                if bytes > exception.max_companion_bytes {
-                    return Err(format!(
-                        "debug companion {} uses {bytes} bytes, exceeding named line-attribution exception ceiling {}",
-                        debug.display(),
-                        exception.max_companion_bytes,
-                    ));
-                }
-            }
-            companion_by_inode.insert(
-                inode,
-                (
-                    debug.clone(),
-                    runtime.clone(),
-                    runtime_line_exception.is_some(),
-                ),
-            );
-            runtime.clone()
-        };
-        pairs.push((
-            runtime.clone(),
-            debug,
-            canonical_runtime,
-            inode,
-            runtime_line_exception,
-        ));
+                prune_args.push(debug_text.into());
+                let prune_arg_refs: Vec<&str> = prune_args.iter().map(String::as_str).collect();
+                run_cmd(objcopy, &prune_arg_refs, cwd, &[], &WATCH_PHASE)?;
+                fs::set_permissions(&debug, fs::Permissions::from_mode(0o644))
+                    .map_err(|e| format!("chmod debug companion {}: {e}", debug.display()))?;
+                companion_by_inode.insert(inode, (debug.clone(), runtime.clone()));
+                runtime.clone()
+            };
+        pairs.push((runtime.clone(), debug, canonical_runtime, inode));
     }
     let mut stripped_inodes = std::collections::HashSet::new();
-    for (_, _, canonical_runtime, original_inode, _) in &pairs {
+    for (_, _, canonical_runtime, original_inode) in &pairs {
         if !stripped_inodes.insert(*original_inode) {
             continue;
         }
@@ -4602,7 +4526,7 @@ fn split_debug_tree(root: &Path, objcopy: &Path, recipe_name: &str) -> Result<()
     // installed relation rather than depending on that implementation detail.
     // If objcopy replaced the canonical name, every alias is reconnected to the
     // stripped bytes before pair validation.
-    for (runtime, _, canonical_runtime, _, _) in &pairs {
+    for (runtime, _, canonical_runtime, _) in &pairs {
         if runtime == canonical_runtime {
             continue;
         }
@@ -4620,17 +4544,8 @@ fn split_debug_tree(root: &Path, objcopy: &Path, recipe_name: &str) -> Result<()
             )
         })?;
     }
-    for (runtime, debug, _, _, runtime_line_exception) in &pairs {
-        if let Some(exception) = runtime_line_exception {
-            crate::elf::assert_debug_pair_with_line_limit(
-                runtime,
-                debug,
-                exception.max_line_section_bytes,
-                exception.require_complete_line_strings,
-            )?;
-        } else {
-            crate::elf::assert_debug_pair(runtime, debug)?;
-        }
+    for (runtime, debug, _, _) in &pairs {
+        crate::elf::assert_debug_pair(runtime, debug)?;
     }
     let exceptions = td_engine::target_profile::output_assembly_exceptions(recipe_name);
     if !exceptions.is_empty() {
@@ -4644,29 +4559,6 @@ fn split_debug_tree(root: &Path, objcopy: &Path, recipe_name: &str) -> Result<()
             .map_err(|e| format!("write assembly-exception marker {}: {e}", marker.display()))?;
         fs::set_permissions(&marker, fs::Permissions::from_mode(0o644))
             .map_err(|e| format!("chmod assembly-exception marker {}: {e}", marker.display()))?;
-    }
-    if let Some(exception) = line_exception {
-        let marker = debug_root.join(".td-line-attribution-exception");
-        let content = format!(
-            "format=1\noutput={recipe_name}\nruntime={}\nreader_ceiling_bytes={}\nadmitted_ceiling_bytes={}\ncompanion_ceiling_bytes={}\nreason={}\n",
-            exception.runtime_relative_path,
-            td_engine::target_profile::DEFAULT_PROFILE_LINE_SECTION_BYTES,
-            exception.max_line_section_bytes,
-            exception.max_companion_bytes,
-            exception.reason,
-        );
-        fs::write(&marker, content).map_err(|e| {
-            format!(
-                "write line-attribution-exception marker {}: {e}",
-                marker.display()
-            )
-        })?;
-        fs::set_permissions(&marker, fs::Permissions::from_mode(0o644)).map_err(|e| {
-            format!(
-                "chmod line-attribution-exception marker {}: {e}",
-                marker.display()
-            )
-        })?;
     }
     Ok(())
 }
@@ -4859,7 +4751,7 @@ pub fn run_mesboot() -> Result<(), String> {
         } else if let Some(o) = step.get("splitDebugTree") {
             let root = ctx.expand(&field(o, "root")?).map_err(err)?;
             let objcopy = ctx.expand(&field(o, "objcopy")?).map_err(err)?;
-            require_debug_companion_policy(&recipe_name).map_err(err)?;
+            require_debug_companion_policy().map_err(err)?;
             split_debug_tree(Path::new(&root), Path::new(&objcopy), &recipe_name).map_err(err)?;
         } else if let Some(o) = step.get("assertDebugSize") {
             let root = ctx.expand(&field(o, "root")?).map_err(err)?;
@@ -5426,35 +5318,6 @@ mod tests {
             release_dir,
             Path::new("/build/target/x86_64-unknown-linux-gnu/release")
         );
-    }
-
-    #[test]
-    fn line_exception_runtime_is_present_and_not_an_ordinary_alias() {
-        let _base_cleanup = crate::test_temp::TempDir::new("td-line-exception").unwrap();
-        let base = _base_cleanup.join("fixture");
-        let _ = fs::remove_dir_all(&base);
-        fs::create_dir_all(base.join("bin")).unwrap();
-        fs::create_dir_all(base.join("lib")).unwrap();
-        let exception = td_engine::target_profile::LineAttributionException {
-            runtime_relative_path: "lib/libdriver.so",
-            max_line_section_bytes: 128 * 1024 * 1024,
-            max_companion_bytes: 192 * 1024 * 1024,
-            require_complete_line_strings: true,
-            reason: "fixture",
-        };
-        let driver = base.join(exception.runtime_relative_path);
-        fs::write(&driver, b"driver").unwrap();
-
-        validate_line_exception_runtime(&base, std::slice::from_ref(&driver), exception).unwrap();
-        let missing = validate_line_exception_runtime(&base, &[], exception).unwrap_err();
-        assert!(missing.contains("runtime is absent"), "{missing}");
-
-        let alias = base.join("bin/rustc-driver-alias");
-        fs::hard_link(&driver, &alias).unwrap();
-        let aliased =
-            validate_line_exception_runtime(&base, &[driver, alias], exception).unwrap_err();
-        assert!(aliased.contains("aliases ordinary runtime"), "{aliased}");
-        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]

@@ -8,9 +8,10 @@ recipes, image, and this document disagree, one of them is a bug.
 A running td deployment continuously produces bounded, local files that show
 where every observed user-mode process spends CPU time. The files are useful
 without a hosted service or an interactive profiler UI: an authorized human
-or AI agent can read process summaries, function and source-line hot spots,
-folded stacks, and the provenance of the executable and symbols used to
-resolve each address.
+or AI agent can read process summaries, function hot spots, folded stacks,
+and the provenance of the executable and symbols used to resolve each
+address. Shipped debug companions carry symbols and no line program, so the
+reports state source-line attribution unavailable rather than guessing it.
 
 Sampling is statistical. A short-lived task may execute between samples, and
 the absence of samples does not prove that a task used no CPU. `td-profiler`
@@ -69,20 +70,17 @@ gcc-runtime's libgcc assembly.
 Offline analysis therefore does not need the recipe checkout to discover a
 boundary.
 
-Rust compilation emits line-table debug information and ordinary symbols.
-Every varying build path is remapped before it reaches either artifact. The
-canonical roots are `/td-build` for package source, `/td-build-root` for other
-build scratch, and `/td-cargo` for Cargo's working state; vendor source is
-mapped below `/td-cargo/vendor`. Line tables may also name headers or static
-objects from declared inputs below `/td/store`; those content-addressed paths
-are already stable inputs, not varying build paths to remap. C compiled in
-the Debian build root, a Cargo build script's included, may likewise name
-GCC's own freestanding headers below
-`/usr/lib/gcc/x86_64-linux-gnu/14/include`, which the pinned root fixes;
-the line-table validator admits that directory and nothing else of the
-root's. The Cargo runner hands build scripts' C the Rust objects' policy
-above as CFLAGS: `-O2 -g1 -fno-omit-frame-pointer` and the same three
-remaps. A crate's own flags follow CFLAGS, so a crate may raise `-g`,
+Rust compilation emits line-table debug information and ordinary symbols;
+the split below keeps only the symbols. The line tables still reach the
+linked image and so its build ID, which keeps each runtime's bytes
+independent of what its companion retains. Every varying build path is
+remapped before it reaches the compiled objects. The canonical roots are
+`/td-build` for package source, `/td-build-root` for other build scratch,
+and `/td-cargo` for Cargo's working state; vendor source is mapped below
+`/td-cargo/vendor`. The Cargo runner hands build scripts' C the Rust
+objects' policy above as CFLAGS: `-O2 -g1 -fno-omit-frame-pointer` and the
+same three remaps. `-g1` is what records the DWARF producer the runner
+checks. A crate's own flags follow CFLAGS, so a crate may raise `-g`,
 which the split prunes, or drop frame pointers; after the build the
 runner reads every C object's DWARF producer and refuses one that lacks
 `-fno-omit-frame-pointer` or names a later `-fomit-frame-pointer`. An
@@ -91,45 +89,6 @@ hand-written assembly, a coverage boundary as below. A plain `.s` leaves
 no dependency list, so its object is refused. Timestamps,
 archive ordering, and other build identity inputs remain pinned by the normal
 recipe reproducibility contract.
-
-A named source-line attribution exception admits one exact runtime ELF whose
-line program exceeds the dependency-free reader's 32-MiB `.debug_line` or
-one-million-range ceilings. The exception is bound to that runtime path; any
-other ELF in the recipe remains under the ordinary policy.
-The producer still structurally validates and retains the uncompressed line
-program under the exception's literal section ceiling, retains ordinary
-function symbols, and records
-`lib/debug/.td-line-attribution-exception`. It removes `.debug_info`,
-`.debug_abbrev`, `.debug_aranges`, `.debug_ranges`, `.debug_rnglists`,
-`.debug_frame`, `.debug_loc`, `.debug_loclists`, and `.debug_str` to bound the
-exception rather than retain full variable, type, range, and string payload.
-`.debug_line_str` remains. This policy does not claim that an external reader
-can resolve every retained line row unless the exception says so below. The
-resulting companion has the exception's literal file ceiling.
-The marker is exactly these seven LF-terminated rows, in this order, with no
-trailing section or content:
-
-```text
-format=1
-output=<recipe output name>
-runtime=<canonical relative runtime path>
-reader_ceiling_bytes=<td-profiler line-section ceiling>
-admitted_ceiling_bytes=<exception line-section ceiling>
-companion_ceiling_bytes=<exception companion ceiling>
-reason=<nonempty reviewed reason>
-```
-
-The index binds `output` to the runtime store item's output name, binds
-`runtime` to only that path within the item, requires the reader ceiling to
-equal its compiled limit, and requires
-`0 < reader < admitted <= companion`. A sibling ELF does not inherit the
-boundary.
-td-profiler deliberately refuses that oversized line program, preserves
-function attribution, and emits its existing explicit line-resolution
-diagnostic.
-
-No producer currently holds this exception. The upstream Rust toolchain,
-whose source-built driver once did, ships without companions.
 
 A recipe links each user-mode ELF with a deterministic GNU build ID, using the
 linker's SHA-1 build-id form. This is a pair check over linked bytes, not object
@@ -151,7 +110,7 @@ from its symbols. Debug files are not separate downloads and require no
 td-operated server.
 
 The standalone host-built musl td-mta artifact uses this same SHA-1 identity,
-non-line DWARF pruning and pair validator, retaining `td-mta` and `td-mta.debug`
+symbols-only pruning and pair validator, retaining `td-mta` and `td-mta.debug`
 together. Its operator layout places those files at `bin/td-mta` and
 `lib/debug/bin/td-mta.debug`. That separate portable build is documented in
 `td-crypto/PORTABLE.md`; its pinned upstream prebuilt std/libc and provider
@@ -181,36 +140,31 @@ rustc's `.debug_gdb_scripts` registration section is the known example and
 remains in both files. Pair validation distinguishes it by `SHF_ALLOC` rather
 than by a name allowlist.
 
-Companions carry ordinary symbols plus line tables, not full variable and type
-debugging information. The producer removes `.debug_info`, `.debug_abbrev`,
-`.debug_aranges`, `.debug_types`, `.debug_ranges`, `.debug_rnglists`,
-`.debug_frame`, `.debug_loc`, `.debug_loclists`, `.debug_str_offsets`,
-`.debug_addr`, `.debug_macro`, `.debug_macinfo`, `.debug_pubnames`,
-`.debug_pubtypes`, `.debug_gnu_pubnames`, `.debug_gnu_pubtypes`,
-`.debug_names`, `.debug_sup`, `.debug_cu_index`, `.debug_tu_index`, and
-`.gdb_index` from every companion. It also removes `.debug_str` when every
-line-table unit is DWARF 2 through 4, whose path tables are inline, or when a
-structural scan of every DWARF-5 directory and file format finds no
-`DW_FORM_strp`. A declared `DW_FORM_strp` keeps `.debug_str` and subjects it to
-the ordinary reader ceiling. A source-line exception removes it and then
-structurally rejects a retained line program which declares `DW_FORM_strp`.
+Companions carry ordinary symbols and no DWARF: `.symtab`, `.strtab`, the
+build-ID note, and the section headers `objcopy --only-keep-debug` leaves
+over its NOBITS allocated sections. The producer removes `.debug_info`,
+`.debug_abbrev`, `.debug_aranges`, `.debug_types`, `.debug_ranges`,
+`.debug_rnglists`, `.debug_frame`, `.debug_loc`, `.debug_loclists`,
+`.debug_str_offsets`, `.debug_addr`, `.debug_macro`, `.debug_macinfo`,
+`.debug_pubnames`, `.debug_pubtypes`, `.debug_gnu_pubnames`,
+`.debug_gnu_pubtypes`, `.debug_names`, `.debug_sup`, `.debug_cu_index`,
+`.debug_tu_index`, `.gdb_index`, and the line program with its string
+tables, `.debug_line`, `.debug_line_str` and `.debug_str`, from every
+companion. Pair validation requires exactly one well-formed `.symtab` and
+refuses any non-allocated `.debug_*`, `.zdebug_*` or `.gdb_index` section
+left in a companion, compressed or not, so a section the roster misses
+fails the build rather than shipping. Source-line attribution is
+therefore unavailable for every td-built object: in the October 2026
+image the line programs were 77 MiB of the companions' 100 MiB of
+sections, and symbols alone keep function attribution.
 The image recipe records the companions' total bytes and enforces a literal
 compiled ceiling kept outside the measuring code.
-The shipped deployment's ceiling is one GiB for the complete standard image.
-Changing it is reviewed with the corresponding size report. This keeps
-the always-available data useful for function and source-line attribution
-without turning every deployment into a full debugger SDK.
-
-The line program and any retained `.debug_line_str` or `.debug_str` path table
-remain uncompressed. Pair validation rejects both ELF `SHF_COMPRESSED` and
-legacy `.zdebug_*` forms for those sections, so the dependency-free runtime
-reader is the checked consumer of every ordinary accepted companion rather
-than silently relying on a decompressor that is absent from the image. It also
-rejects duplicate named line/string sections and sections above the runtime's
-32-MiB input ceiling. The named boundaries above raise only the corresponding
-producer's structural `.debug_line` ceiling; they do not relax the runtime
-reader. The runtime reads `.debug_str` only when a line-table `DW_FORM_strp`
-actually refers to it.
+The shipped deployment's ceiling is 128 MiB for the complete standard image.
+Changing it is reviewed with the corresponding size report. The last image
+built under the line-table policy reported 116,523,630 companion bytes and
+the first built under this one 34,388,814. This keeps the always-available
+data useful for function attribution without turning every deployment into
+a full debugger SDK.
 
 The deployment bundle records `deployment/debug-size` beside `root.erofs`.
 It remains a derived build report rather than a boot payload: the exact
@@ -225,18 +179,20 @@ that the same declared inputs produce the same runtime and debug bytes; it
 does not mean that enabling observability preserves an older store path. The
 stable control-plane builder identity therefore does not stand in for producer
 semantics: every debug-splitting derivation carries the compiled
-`line-tables-v2` policy token. Its derivation value also includes every field
-of a named recipe's effective source-line exception, so changing a path,
-ceiling, dependency requirement, or reason automatically moves that output.
-Ordinary recipes carry the version alone. A global splitter transform requires
-changing that version token. This increment moves it because the preceding
-non-line DWARF pruning applied to every companion without changing the stable
-builder identity. The double-build check remains the oracle. Increment 1 copies
+`symbols-v1` policy token. A global splitter transform requires changing that
+version token; `symbols-v1` replaced `line-tables-v2` when companions dropped
+their line programs. The double-build check remains the oracle. Increment 1 copies
 the same `td-boot`
 source below two different source and build roots, canonicalizes each with the
 shared direct-rustc policy, and performs two independent links and companion
 transforms. It compares both the installed runtime and companion byte for byte;
 the normal closure checks remain the wider reproducibility backstop.
+Git's shipped companions no longer contain DWARF against which to check
+source-path remapping. Its recipe still supplies the canonical compiler
+remaps, but its package check does not prove the pre-strip line program's
+paths. Static-archive `DW_AT_comp_dir` checks for zlib, curl, LibreSSL and
+gcc-runtime remain, as does the td-boot double-build oracle above; neither
+is a Git-specific pre-strip DWARF proof.
 
 ## 3. Collection boundary
 
@@ -458,17 +414,19 @@ writable subtree cannot inherit the EROFS claim.
 After identity selects an exact runtime object, its build ID is checked against
 the index and companion before symbols are used. A build ID never selects or
 authenticates an object. Function names come from the full symbol table; source
-file and line come from the remapped line table when supported. The report
+file and line come from a remapped line program only when the indexed
+companion carries one. Shipped companions do not (§2): each frame states
+`line_resolved` false, and the first lookup in an object per report records
+the bounded symbolization diagnostic `read indexed debug lines <companion>:
+debug companion has no .debug_line section`. The report
 retains the runtime store path, object-relative address, device/inode identity,
 and build ID even when a friendly name was found, so resolution can be audited
 and improved without collecting the workload again. The provenance token
-`assembly-boundary=1` carries the split output's conservative exception marker;
-`line-attribution-boundary=1` identifies the exact runtime named by a canonical
-line-attribution exception marker. A mapped callchain is reported complete only
-when every frame resolves and no resolved object carries the assembly token;
-missing symbol coverage is unresolved and that token makes the stack explicitly
-truncated. The line token reports an attribution limit without discarding a
-function-resolved frame.
+`assembly-boundary=1` carries the split output's conservative exception marker.
+A mapped callchain is reported complete only when every frame resolves and no
+resolved object carries the assembly token; missing symbol coverage is
+unresolved and that token makes the stack explicitly truncated. Line
+resolution never decides completeness or discards a function-resolved frame.
 An address in a symbol-table hole remains unresolved rather than receiving a
 hexadecimal pseudo-function. A zero-sized symbol covers its exact address only.
 Hotspots aggregate resolved instructions by process image, object, and
@@ -478,7 +436,9 @@ addresses remain in the structured stack evidence and do not split one
 resolved function into many hotspots. Recursive equal frames remain distinct
 after the one kernel-repeated leaf IP is removed.
 
-Line lookup parses bounded DWARF version 2 through 5 line programs from the
+When an indexed companion carries a line program, as one from an image
+built before §2 dropped them can under offline regeneration, line lookup
+parses bounded DWARF version 2 through 5 line programs from the
 exact indexed companion. It reports remapped source-path bytes, line, column,
 and discriminator over the line program's half-open address ranges. A malformed
 or unsupported line table is a bounded symbolization diagnostic, but it does
@@ -497,17 +457,12 @@ callchain.
 
 One ordinary object accepts at most 32 MiB of `.debug_line`, 32 MiB for either
 external line-string section, one million retained line ranges, and 4,096 bytes
-in one reported source path. A source-line producer exception is not
-accepted by this reader: function symbols remain available and source-line
-attribution fails explicitly at the 32-MiB check. One unit may
+in one reported source path. A line program over a ceiling fails line
+attribution explicitly while function symbols remain available. One unit may
 declare at most 200,000 combined transient file/directory entries. The
-producer's pre-prune dependency scan applies that same per-unit ceiling and
-admits at most 6,400,000
-directory/file form values across one object, so zero-width forms cannot
-amplify its work beyond a fixed bound. The section byte ceiling bounds the
-runtime reader's aggregate work across units. The section-name roster, symbol
-state, raw line-parser inputs, and all transient and retained line-parser heap
-state share the 128-MiB object-load ceiling. Unit rosters are released between
+section byte ceiling bounds the reader's aggregate work across units. The
+section-name roster, symbol state, raw line-parser inputs, and all transient
+and retained line-parser heap state share the 128-MiB object-load ceiling. Unit rosters are released between
 units, and duplicate temporary source paths are released after interning, so
 this is a peak rather than a lifetime-allocation counter. Cached parsed objects
 share the independently stated 128-MiB LRU ceiling. Crossing either fails line
@@ -786,6 +741,8 @@ user mode. Coverage degrades explicitly:
   object index has no row for it and the registry's root policy names its
   runtime ref without an image root;
 - reviewed hand-written assembly may not preserve a frame chain;
+- td-built companions carry no line program, so source lines are unavailable
+  while function symbols resolve;
 - the upstream Rust toolchain's objects have no companions, and the prebuilt
   standard library Rust outputs link has incomplete frame pointers;
 - an anonymous/JIT mapping may have no stable object;
@@ -838,30 +795,30 @@ design:
    expires. Ordinary evidence retains a 300-second image wait and does not run
    the synthetic workload. The proof reads the persisted `lines.jsonl` and
    emits a distinct host marker only after a row attributes samples to that
-   function,
-   the line-table-local `evidence.rs` source emitted by the bounded DWARF-v4
-   reader, and a line inside the function. Rejected completed captures are
-   immutable and scanned only once. Its hot loop uses primitive shift/XOR
-   instructions attributed directly to `evidence.rs`; an inlined library
-   intrinsic whose machine code
-   carries the library's source location is not valid evidence. Normal boots do
-   not run the synthetic workload and retain the generic complete-capture
-   evidence path. Both evidence paths require zero lost and corrupt perf
-   records, zero omitted diagnostics, and no analysis diagnostics. Fully
-   recorded, bounded symbolization diagnostics remain report data rather than
-   invalidating an otherwise complete capture; the QEMU path independently
-   requires the exact named function and source-line attribution it exists to
-   prove. The host recognizes that result as the exact
+   function's symbol and states its source line unresolved (`line_resolved`
+   false, a null line): companions carry no line program, so a resolved
+   location there would be fabricated. Rejected completed captures are
+   immutable and scanned only once. Normal boots do not run the synthetic
+   workload and retain the generic complete-capture evidence path. Both
+   evidence paths require zero lost and corrupt perf records, zero omitted
+   diagnostics, and no analysis diagnostics. Fully recorded, bounded
+   symbolization diagnostics, each object's unavailable-line diagnostic
+   among them, remain report data rather than invalidating an otherwise
+   complete capture; the QEMU path independently requires the exact named
+   function attribution it exists to prove. The host recognizes that result
+   as the exact
    `profiler-evidence: TD-PROFILER-ATTRIBUTION-OK` console line emitted through
    td-svc's service-name prefix, not as an unframed marker substring. A host
    where collection cannot be exercised instead requires a precise
    unsupported-permission diagnostic.
 
-The source-line reporting increment consumes the already-required line tables
-with a dependency-free bounded DWARF reader, adds deterministic `lines.jsonl`,
-and places the same source location on structured frames. It changes no
-sampling or raw-capture schema, so an older capture can gain line attribution
-through offline regeneration against the same indexed symbol closure.
+The source-line reporting increment added a dependency-free bounded DWARF
+reader, deterministic `lines.jsonl`, and the same source location on
+structured frames, without changing the sampling or raw-capture schema.
+Companions have since dropped their line programs (§2). The reader and report
+schema remain: shipped frames report their lines unresolved, and a capture
+regenerated offline against an index whose companions do carry line programs
+still gains line attribution.
 
 A release is conforming only when the built kernel exposes the required perf
 event ABI, the collector remains outside jails, every shipped source-built

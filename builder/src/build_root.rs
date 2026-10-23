@@ -551,9 +551,7 @@ enum Companion {
 /// output, under the nearest enclosing `lib/debug`. The prefix is empty
 /// for most outputs and the staged install prefix for glibc's. A companion
 /// keeps its runtime's program headers over NOBITS sections, so its
-/// interpreter and dynamic ranges hold no loader data. A named
-/// line-attribution exception's companion does not pair here; no recipe in
-/// the root has one.
+/// interpreter and dynamic ranges hold no loader data.
 fn companion(top: &Path, path: &Path) -> Companion {
     let Some((prefix, rel)) = path
         .ancestors()
@@ -1020,7 +1018,7 @@ mod tests {
         .unwrap();
         // As objcopy --only-keep-debug writes it: every allocated section
         // NOBITS, and PT_INTERP and PT_DYNAMIC kept with no file bytes.
-        let mut companion_bytes = synth_profiled_elf(&[id], true, true);
+        let mut companion_bytes = synth_profiled_elf(&[id], false, true);
         profile_section_u32(&mut companion_bytes, 7, 4, 8);
         let companion_bytes = with_loader_headers(companion_bytes, 0);
         fs::write(&debug, &companion_bytes).unwrap();
@@ -1093,7 +1091,7 @@ mod tests {
         fs::write(&debug, &loadable).unwrap();
         unpaired(&debug, "not debug-only");
         // Nor one whose interpreter segment holds file bytes.
-        let mut sections = synth_profiled_elf(&[id], true, true);
+        let mut sections = synth_profiled_elf(&[id], false, true);
         profile_section_u32(&mut sections, 7, 4, 8);
         fs::write(&debug, with_loader_headers(sections, 8)).unwrap();
         unpaired(&debug, "not debug-only");

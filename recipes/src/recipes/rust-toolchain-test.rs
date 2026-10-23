@@ -15,7 +15,7 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 //
 // The userland: ripgrep, fd and uutils' multicall each name td glibc's
 // loader, carry a debug companion with the runtime's Build ID, a runtime
-// with no .symtab and a companion with .symtab and .debug_line, the
+// with no .symtab and a companion with .symtab and no DWARF, the
 // assembly-exception marker naming glibc, gcc-runtime and the prebuilt std,
 // and no /gnu/store bytes. The rust-toolchain check's `td shell` proof
 // runs them; this recipe holds their ELF.
@@ -113,7 +113,8 @@ rc=0; printf '%s\n' "$sections" | grep -F .symtab >/dev/null || rc=$?
 [ "$rc" = 1 ] || fail '@PKG@ ships a .symtab'
 sections=$("$readelf" -S -W "$debug") || fail "readelf -S failed on @PKG@'s companion"
 printf '%s\n' "$sections" | grep -E '\] \.symtab +SYMTAB ' >/dev/null || fail "@PKG@'s companion has no .symtab"
-printf '%s\n' "$sections" | grep -E '\] \.debug_line +PROGBITS ' >/dev/null || fail "@PKG@'s companion has no .debug_line"
+rc=0; printf '%s\n' "$sections" | grep -E '\] \.(z?debug_[a-z_]*|gdb_index) +PROGBITS ' >/dev/null || rc=$?
+[ "$rc" = 1 ] || fail "@PKG@'s companion carries DWARF"
 marker="$package/lib/debug/.td-assembly-exception"
 for line in exception.0.source=glibc-x86-64 exception.1.source=gcc-runtime exception.2.source=rust-toolchain; do
   grep -F -x "$line" "$marker" >/dev/null || fail "@PKG@'s assembly-exception marker lacks $line"

@@ -6467,7 +6467,7 @@ fn assemble_recipe_drv(
                 push_drv_env(
                     &mut spec,
                     "TD_DEBUG_COMPANION_POLICY",
-                    &td_engine::target_profile::debug_companion_policy(name),
+                    td_engine::target_profile::DEBUG_COMPANION_POLICY,
                 )?;
             }
             push_drv_env(&mut spec, "TD_STEPS", &steps.to_json_string())?;
@@ -6514,7 +6514,7 @@ fn assemble_recipe_drv(
             push_drv_env(
                 &mut spec,
                 "TD_DEBUG_COMPANION_POLICY",
-                &td_engine::target_profile::debug_companion_policy(name),
+                td_engine::target_profile::DEBUG_COMPANION_POLICY,
             )?;
             if let Some(subdir) = cargo_subdir {
                 push_drv_env(&mut spec, "TD_CARGO_SUBDIR", subdir)?;
@@ -17921,13 +17921,13 @@ daemon build START (2/2 active)
         let recipe = r#"{"name":"fixture","version":"1","buildSystem":"mesboot","steps":[{"splitDebugTree":{"root":"{out}","objcopy":"{in:binutils}/bin/objcopy"}}]}"#;
         let (_path, _file, drv, _source) =
             assemble_recipe_drv(recipe, lock.to_str().unwrap(), &dir, None).unwrap();
-        let expected_policy = td_engine::target_profile::debug_companion_policy("fixture");
+        let expected_policy = td_engine::target_profile::DEBUG_COMPANION_POLICY;
         assert_eq!(
             drv.env
                 .iter()
                 .find(|(key, _)| key == "TD_DEBUG_COMPANION_POLICY")
                 .map(|(_, value)| value.as_str()),
-            Some(expected_policy.as_str()),
+            Some(expected_policy),
             "the typed splitter policy must re-key its derivation"
         );
 
@@ -18428,10 +18428,10 @@ daemon build START (2/2 active)
             assert!(env_of(&drv, gone).is_none(), "{gone}");
         }
         assert_eq!(env_of(&drv, "TD_RECIPE_NAME").as_deref(), Some("ripgrep"));
-        let expected_policy = td_engine::target_profile::debug_companion_policy("ripgrep");
+        let expected_policy = td_engine::target_profile::DEBUG_COMPANION_POLICY;
         assert_eq!(
             env_of(&drv, "TD_DEBUG_COMPANION_POLICY").as_deref(),
-            Some(expected_policy.as_str()),
+            Some(expected_policy),
             "the splitter policy is a derivation-hashed input"
         );
         assert_eq!(

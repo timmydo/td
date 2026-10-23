@@ -1496,8 +1496,9 @@ mod tests {
         unit
     }
 
-    #[test]
-    fn elf_loader_joins_symbols_to_uncompressed_line_sections() {
+    /// A companion with one function symbol `f` at 0x1000..0x1010 and, when
+    /// `with_lines`, a DWARF-4 line program naming `src/main.rs`.
+    fn companion_elf(with_lines: bool) -> Vec<u8> {
         const SECTION_COUNT: usize = 6;
         let mut elf = vec![0u8; 64 + SECTION_COUNT * 64];
         elf.get_mut(..7)
@@ -1579,14 +1580,28 @@ mod tests {
         section(&mut elf, 1, 1, 3, names_offset, names.len(), 0, 0);
         section(&mut elf, 2, 11, 2, symbols_offset, 48, 3, 24);
         section(&mut elf, 3, 19, 3, strings_offset, 3, 0, 0);
-        section(&mut elf, 4, 27, 1, lines_offset, lines.len(), 0, 0);
+        // Without lines the section is a second, empty-named-text section.
+        section(
+            &mut elf,
+            4,
+            if with_lines { 27 } else { 39 },
+            1,
+            lines_offset,
+            lines.len(),
+            0,
+            0,
+        );
         section(&mut elf, 5, 39, 1, 0, 0, 0, 0);
+        elf
+    }
 
+    #[test]
+    fn elf_loader_joins_symbols_to_uncompressed_line_sections() {
         let path = std::env::temp_dir().join(format!(
             "td-profiler-debug-lines-test-{}",
             std::process::id()
         ));
-        std::fs::write(&path, elf).unwrap();
+        std::fs::write(&path, companion_elf(true)).unwrap();
         let loaded = load_symbols(&path).unwrap();
         assert!(loaded.line_error.is_none(), "{:?}", loaded.line_error);
         let lines = loaded.lines.unwrap();
@@ -1594,5 +1609,63 @@ mod tests {
         assert_eq!(location.file, b"src/main.rs");
         assert_eq!(location.line, 10);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn symbols_only_companion_resolves_functions_and_reports_lines_unavailable() {
+        let _dir = td_fs::TempDir::new("td-profiler-symbols-only").unwrap();
+        let path = _dir.path().join("a.debug");
+        std::fs::write(&path, companion_elf(false)).unwrap();
+        let loaded = load_symbols(&path).unwrap();
+        assert!(loaded.lines.is_none());
+        assert_eq!(
+            loaded.line_error.as_deref(),
+            Some("debug companion has no .debug_line section")
+        );
+        let mut objects = BTreeMap::new();
+        objects.insert(
+            (8, 2, 42, 0),
+            Object {
+                runtime: "/td/store/x/bin/a".into(),
+                debug: "/td/store/x/lib/debug/bin/a.debug".into(),
+                build_id: vec![0; 20],
+                provenance: b"store-item=x".to_vec(),
+                segments: vec![],
+                symbols: Some(Ok(loaded)),
+                last_used: 0,
+                used: false,
+                line_error_reported: false,
+            },
+        );
+        let mut symbolizer = Symbolizer {
+            objects,
+            errors: vec![],
+            omitted_errors: 0,
+            persistent_error_count: 0,
+            persistent_omitted_errors: 0,
+            use_clock: 0,
+        };
+        let frame = |relative| Frame {
+            address: relative,
+            relative: Some(relative),
+            major: 8,
+            minor: 2,
+            inode: 42,
+            inode_generation: 0,
+            path: vec![],
+        };
+        for address in [0x1001, 0x1002] {
+            let resolved = symbolizer.resolve(&frame(address), 4096).unwrap();
+            assert_eq!(resolved.function, b"f");
+            assert!(resolved.source.is_none());
+        }
+        // One explicit diagnostic per object and report, never a location.
+        assert_eq!(
+            symbolizer.errors,
+            [
+                "read indexed debug lines /td/store/x/lib/debug/bin/a.debug: debug companion \
+                 has no .debug_line section"
+            ]
+        );
     }
 }

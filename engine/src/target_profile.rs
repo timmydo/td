@@ -8,6 +8,8 @@
 /// expanded by the typed recipe engine so the ephemeral build directory never
 /// reaches DWARF and package source has the canonical `/td-build` root. The
 /// linker is not policy here: recipes name td-link (`td-link/DESIGN.md`).
+/// The splitter drops the line tables; emitting them keeps each linked
+/// runtime, and so its build ID, independent of what companions retain.
 pub const DIRECT_RUSTC_ARGS: &[&str] = &[
     "-Cforce-frame-pointers=yes",
     "-Cdebuginfo=line-tables-only",
@@ -17,10 +19,13 @@ pub const DIRECT_RUSTC_ARGS: &[&str] = &[
     "--remap-path-prefix={src}=/td-build",
 ];
 
-/// Debug sections removed from every target companion after its line program
-/// and ordinary symbols have been copied out of the runtime. Keep the producer
-/// and recipe-side consumer guard on this one roster.
-pub const ALWAYS_PRUNED_DEBUG_SECTIONS: &[&str] = &[
+/// Debug sections removed from every target companion after its ordinary
+/// symbols have been copied out of the runtime: every DWARF section, the
+/// line program and its string tables included. A companion keeps `.symtab`,
+/// `.strtab` and the build-ID note. Keep the producers and the recipe-side
+/// consumer guard on this one roster; the pair validator refuses any DWARF
+/// section it misses.
+pub const PRUNED_DEBUG_SECTIONS: &[&str] = &[
     ".debug_info",
     ".debug_abbrev",
     ".debug_aranges",
@@ -43,6 +48,9 @@ pub const ALWAYS_PRUNED_DEBUG_SECTIONS: &[&str] = &[
     ".debug_cu_index",
     ".debug_tu_index",
     ".gdb_index",
+    ".debug_line",
+    ".debug_line_str",
+    ".debug_str",
 ];
 
 /// Materialize the direct-rustc policy for an independently rooted build. The
@@ -174,56 +182,14 @@ pub fn output_assembly_exceptions(recipe: &str) -> Vec<(&'static str, &'static s
         .collect()
 }
 
-/// The ordinary profiler reader accepts at most 32 MiB of line program per
-/// object. A named producer exception may retain a larger, structurally checked
-/// line program as producer evidence while td-profiler deliberately reports
-/// source-line attribution unavailable and keeps function symbols.
-pub const DEFAULT_PROFILE_LINE_SECTION_BYTES: u64 = 32 * 1024 * 1024;
-
 /// Hash-visible producer policy for every recipe which creates debug
 /// companions. The control-plane builder has a stable ABI identity, so a
 /// semantic splitter change must move this token to re-key realized outputs.
-pub const DEBUG_COMPANION_POLICY: &str = "line-tables-v2";
+pub const DEBUG_COMPANION_POLICY: &str = "symbols-v1";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LineAttributionException {
-    pub runtime_relative_path: &'static str,
-    pub max_line_section_bytes: u64,
-    pub max_companion_bytes: u64,
-    pub require_complete_line_strings: bool,
-    pub reason: &'static str,
-}
-
-/// Empty since td ships the upstream Rust toolchain, which has no companions;
-/// a producer whose line program outgrows the reader is named here.
-pub const LINE_ATTRIBUTION_EXCEPTIONS: &[(&str, LineAttributionException)] = &[];
-
-pub fn line_attribution_exception(recipe: &str) -> Option<LineAttributionException> {
-    LINE_ATTRIBUTION_EXCEPTIONS
-        .iter()
-        .find_map(|(output, exception)| (*output == recipe).then_some(*exception))
-}
-
-/// Complete derivation-hashed splitter policy for one recipe. The version
-/// moves for global transform changes; every exception field is included so a
-/// local admission change cannot reuse an output produced under older bounds.
-pub fn debug_companion_policy(recipe: &str) -> String {
-    match line_attribution_exception(recipe) {
-        Some(exception) => format!(
-            "{DEBUG_COMPANION_POLICY};runtime={};line={};companion={};complete-line-strings={};reason={}",
-            exception.runtime_relative_path,
-            exception.max_line_section_bytes,
-            exception.max_companion_bytes,
-            exception.require_complete_line_strings,
-            exception.reason,
-        ),
-        None => DEBUG_COMPANION_POLICY.to_string(),
-    }
-}
-
-/// The shipped image's one-GiB companion budget, measured over the whole
+/// The shipped image's 128-MiB companion budget, measured over the whole
 /// deployment rather than by any one producer.
-pub const DEPLOYMENT_DEBUG_CEILING_BYTES: u64 = 1_073_741_824;
+pub const DEPLOYMENT_DEBUG_CEILING_BYTES: u64 = 134_217_728;
 
 /// Compose the Cargo runner's target-only RUSTFLAGS. The linker is Cargo's
 /// target linker, td-link, which Cargo also gives build scripts and proc
@@ -257,15 +223,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn always_pruned_debug_roster_is_unique_and_excludes_line_data() {
-        let mut sections = ALWAYS_PRUNED_DEBUG_SECTIONS.to_vec();
+    fn pruned_debug_roster_is_unique_and_includes_line_data() {
+        let mut sections = PRUNED_DEBUG_SECTIONS.to_vec();
         sections.sort_unstable();
         sections.dedup();
-        assert_eq!(sections.len(), ALWAYS_PRUNED_DEBUG_SECTIONS.len());
-        assert!(ALWAYS_PRUNED_DEBUG_SECTIONS.contains(&".debug_info"));
-        for not_always_pruned in [".debug_line", ".debug_line_str", ".debug_str"] {
-            assert!(!ALWAYS_PRUNED_DEBUG_SECTIONS.contains(&not_always_pruned));
+        assert_eq!(sections.len(), PRUNED_DEBUG_SECTIONS.len());
+        for pruned in [
+            ".debug_info",
+            ".debug_line",
+            ".debug_line_str",
+            ".debug_str",
+        ] {
+            assert!(PRUNED_DEBUG_SECTIONS.contains(&pruned), "{pruned}");
         }
+        assert!(PRUNED_DEBUG_SECTIONS
+            .iter()
+            .all(|section| section.starts_with(".debug_") || *section == ".gdb_index"));
+        assert_eq!(DEBUG_COMPANION_POLICY, "symbols-v1");
     }
 
     #[test]
@@ -334,7 +308,7 @@ mod tests {
             output_assembly_exceptions("rust-toolchain"),
             vec![("glibc-x86-64", "upstream glibc sysdeps/x86_64 assembly")]
         );
-        assert_eq!(DEPLOYMENT_DEBUG_CEILING_BYTES, 1_073_741_824);
+        assert_eq!(DEPLOYMENT_DEBUG_CEILING_BYTES, 134_217_728);
         assert_eq!(
             output_assembly_exceptions("td-boot"),
             vec![
@@ -411,27 +385,6 @@ mod tests {
                 ],
                 "{stem}"
             );
-        }
-    }
-
-    #[test]
-    fn oversized_line_attribution_boundaries_are_an_explicit_roster() {
-        assert_eq!(DEFAULT_PROFILE_LINE_SECTION_BYTES, 32 * 1024 * 1024);
-        assert_eq!(DEBUG_COMPANION_POLICY, "line-tables-v2");
-        assert!(LINE_ATTRIBUTION_EXCEPTIONS.is_empty());
-        assert_eq!(line_attribution_exception("rust-toolchain"), None);
-        assert_eq!(line_attribution_exception("td-profiler"), None);
-        assert_eq!(debug_companion_policy("td-profiler"), "line-tables-v2");
-        let mut recipes = std::collections::BTreeSet::new();
-        for (recipe, exception) in LINE_ATTRIBUTION_EXCEPTIONS {
-            assert!(recipes.insert(recipe), "duplicate exception for {recipe}");
-            assert!(DEFAULT_PROFILE_LINE_SECTION_BYTES < exception.max_line_section_bytes);
-            assert!(exception.max_line_section_bytes <= exception.max_companion_bytes);
-            let policy = debug_companion_policy(recipe);
-            assert!(policy.contains(exception.runtime_relative_path));
-            assert!(policy.contains(&exception.max_line_section_bytes.to_string()));
-            assert!(policy.contains(&exception.max_companion_bytes.to_string()));
-            assert!(policy.contains(exception.reason));
         }
     }
 }

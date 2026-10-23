@@ -176,8 +176,8 @@ pub const ESP_BYTES: u64 = 512 * 1024 * 1024;
 pub const VOLUME_PARTITION_NAME: &str = "td-volume";
 // Three deployment-sized copies are transiently live while an update is
 // published before the oldest retained deployment is retired.  The profiled
-// image permits one GiB of debug companions in each copy; reserve another GiB
-// for their non-debug payloads and one GiB for Btrfs metadata plus @var.  This
+// image permits 128 MiB of debug companions in each copy. Non-debug payloads,
+// Btrfs metadata and @var also consume this retained capacity floor. This
 // is an admission floor rather than a promise that every deployment fits. A
 // larger update can still fail with ENOSPC while staging; selectors change only
 // after the complete deployment has been written, synced, and published.

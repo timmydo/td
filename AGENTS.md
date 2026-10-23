@@ -266,8 +266,10 @@ its code; `td-profiler/DESIGN.md` names both as coverage boundaries. It is one
 target-wide policy, not a per-recipe release-profile choice. A recipe may not
 weaken it without amending this contract and `td-profiler/DESIGN.md`.
 
-Every such ELF also has a deterministic, path-remapped debug companion in the
-same recipe output and system image. The Debian build root, build-only
+Every such ELF also has a deterministic debug companion in the same recipe
+output and system image. A companion carries the ordinary symbol table and no
+DWARF: profiler output attributes functions, and source lines are
+deliberately unavailable. The Debian build root, build-only
 intermediates, the kernel, firmware, marked foreign payloads, the upstream
 Rust toolchain, hand-written assembly, and the exact coverage and
 reproducibility rules are specified in `td-profiler/DESIGN.md`; profiler

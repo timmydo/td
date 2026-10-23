@@ -1,13 +1,9 @@
-use crate::shared::{
-    build_root_debug_line_source_root_check, build_root_debug_line_validator_regression_steps,
-    BUILD_ROOT_PATH, BUILD_ROOT_SH as SH,
-};
+use crate::shared::{BUILD_ROOT_PATH, BUILD_ROOT_SH as SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
-// Git's shipped ELFs, scripts and line tables, its local and service
-// workflows, and its HTTPS and SSH dispatch. It runs in the Debian build
-// root: the root's bash, coreutils, grep and readelf grade it, and the
-// root's awk validates the line tables.
+// Git's shipped ELFs and scripts, its local and service workflows, and
+// its HTTPS and SSH dispatch. It runs in the Debian build root: the root's
+// bash, coreutils, grep and readelf grade it.
 
 // The shipped scripts that start with a shebang, per directory: Git's ten
 // SCRIPT_SH programs, and the fourteen hook samples (upstream's perl
@@ -119,24 +115,6 @@ pub fn recipe() -> Recipe {
             exec: true,
         },
     ];
-    steps.extend(build_root_debug_line_validator_regression_steps());
-    for (debug, source) in [
-        (format!("{git}/lib/debug/bin/git.debug"), "git.c"),
-        (
-            format!("{git}/lib/debug/libexec/git-core/git-remote-http.debug"),
-            "remote-curl.c",
-        ),
-        (
-            format!("{git}/lib/debug/libexec/git-core/git-sh-i18n--envsubst.debug"),
-            "sh-i18n--envsubst.c",
-        ),
-    ] {
-        steps.push(build_root_debug_line_source_root_check(
-            &debug,
-            source,
-            "/td-build",
-        ));
-    }
     steps.push(
         Step::run(
             "{root}/work",
@@ -260,22 +238,6 @@ mod tests {
             )
         );
         assert!(recipe.inputs.is_none());
-
-        let commands: Vec<&String> = recipe
-            .steps
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|step| match step {
-                Step::Run { argv, .. } => argv.get(2),
-                _ => None,
-            })
-            .filter(|arg| arg.contains("--debug-dump=rawline"))
-            .collect();
-        assert_eq!(commands.len(), 3);
-        assert!(commands.iter().all(|command| {
-            command.contains("/td-build") && !command.contains("DW_AT_comp_dir")
-        }));
 
         let shebangs = recipe
             .steps

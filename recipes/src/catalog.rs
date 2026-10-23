@@ -97,12 +97,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn split_debug_consumers_require_only_retained_line_data() {
+    fn split_debug_consumers_require_only_retained_symbols() {
         let mut compile_directory_consumers = Vec::new();
         for (stem, recipe) in all() {
             for step in recipe.steps.as_deref().unwrap_or_default() {
                 let text = match step {
                     crate::types::Step::Run { argv, .. } => argv.join(" "),
+                    // Rust source a recipe compiles (td-profiler's reader)
+                    // names sections; it reads no companion at build time.
+                    crate::types::Step::WriteFile { path, .. }
+                        if stem == "td-profiler" && path.ends_with(".rs") =>
+                    {
+                        continue;
+                    }
                     crate::types::Step::WriteFile { content, .. } => content.clone(),
                     _ => continue,
                 };
@@ -116,12 +123,11 @@ mod tests {
                 if !text.contains("lib/debug") {
                     continue;
                 }
-                let non_line_dumps = text.replace("--debug-dump=rawline", "");
                 assert!(
-                    !non_line_dumps.contains("--debug-dump="),
-                    "{stem}: split debug companion requires a pruned debug dump"
+                    !text.contains("--debug-dump="),
+                    "{stem}: split debug companion carries no DWARF to dump"
                 );
-                for section in td_engine::target_profile::ALWAYS_PRUNED_DEBUG_SECTIONS {
+                for section in td_engine::target_profile::PRUNED_DEBUG_SECTIONS {
                     assert!(
                         !text.contains(section),
                         "{stem}: split debug companion requires pruned section {section}"
@@ -664,27 +670,6 @@ mod tests {
             ["td-install-qemu-test"],
             "a lone local-source crate joined; add it to builder/src/affected.rs local_source_crate"
         );
-    }
-
-    #[test]
-    fn every_line_attribution_exception_reaches_the_target_splitter() {
-        for (stem, _) in td_engine::target_profile::LINE_ATTRIBUTION_EXCEPTIONS {
-            let recipe = lookup(stem).unwrap_or_else(|| {
-                panic!("line-attribution exception names missing recipe {stem}")
-            });
-            let generic_cargo_split =
-                matches!(recipe.build_system, crate::types::BuildSystem::Rust);
-            let typed_split = recipe
-                .steps
-                .as_deref()
-                .unwrap_or_default()
-                .iter()
-                .any(|step| matches!(step, crate::types::Step::SplitDebugTree { .. }));
-            assert!(
-                generic_cargo_split || typed_split,
-                "{stem}: line-attribution exception would not reach the marker-producing splitter"
-            );
-        }
     }
 
     /// The post-Rust tool farm links no awk, so a recipe built on it runs

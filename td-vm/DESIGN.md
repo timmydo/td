@@ -276,7 +276,7 @@ bundles have a 256 GiB sparse disk and Btrfs filesystem, shared by the signed
 deployment and private writable `@var` state. Untouched capacity consumes no
 host space; writes grow each instance's overlay. Raw bundle publication across
 filesystems preserves zero chunks as holes, while still reading the full
-logical length. Boot/update fixtures retain their separate 10 GiB budget for
+logical length. Boot/update fixtures retain their separate 10.375 GiB budget for
 three deployments with debug companions. Existing bundles and instances keep
 their original size; importing a new bundle does not resize them. This is
 working space, not a claim that every cold distribution build fits. The guest

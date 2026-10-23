@@ -492,8 +492,7 @@ fn executable_architecture(path: &Path, architecture: Architecture) -> Result<()
 fn qualify_binary_architecture(path: &Path, architecture: Architecture) -> Result<()> {
     executable_architecture(path, architecture)?;
     crate::elf::assert_static_pie(path)?;
-    let _ = crate::elf::debug_line_requires_debug_str(path)?;
-    Ok(())
+    crate::elf::assert_symbol_table(path)
 }
 
 fn split_mail_debug(receipt: &mut String) -> Result<()> {
@@ -510,14 +509,10 @@ fn split_mail_debug_architecture(receipt: &mut String, architecture: Architectur
         path_text(runtime)?,
         path_text(debug)?,
     ]];
-    // Read the original line program before pruning any companion sections.
-    let mut prune: Vec<String> = td_engine::target_profile::ALWAYS_PRUNED_DEBUG_SECTIONS
+    let mut prune: Vec<String> = td_engine::target_profile::PRUNED_DEBUG_SECTIONS
         .iter()
         .map(|section| format!("--remove-section={section}"))
         .collect();
-    if !crate::elf::debug_line_requires_debug_str(runtime)? {
-        prune.push("--remove-section=.debug_str".into());
-    }
     prune.push(path_text(debug)?);
     commands.push(prune);
     commands.push(vec!["--strip-all".into(), path_text(runtime)?]);

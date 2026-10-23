@@ -267,7 +267,7 @@ together. Keep the previous archive when upgrading the executable.
 The other executables in that directory are test controllers and probes;
 they are not installed dependencies. The runtime is static PIE and has no
 shared-library or td-helper requirement. Its matching companion contains
-ordinary symbols and source-line data. Keep the pair from the same build.
+ordinary symbols and no source-line data. Keep the pair from the same build.
 
 A release installation can use this layout, outside persistent state:
 
