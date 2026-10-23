@@ -17,7 +17,7 @@ use std::{
 use td_crypto::{ClientConfig, ClockHandle, TlsProtocol, TlsSession, TrustStore};
 
 const MAX_HEAD: usize = 16384;
-pub const MAX_BODY: usize = 32 * 1024 * 1024;
+pub const MAX_BODY: usize = 64 * 1024 * 1024;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
     Invalid,

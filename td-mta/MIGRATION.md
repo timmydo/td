@@ -160,10 +160,13 @@ there is no automatic deletion of historical bodies. Filesystem metadata and
 allocation rounding are outside this logical-byte budget. Leave disk space
 for those overheads. Replacing a manifest temporarily needs room for both
 versions. There are at most 210,000 archive entries, 100,000 distinct source
-messages and 4,096 folders. A message is at most 32 MiB; JSON responses are
+messages and 4,096 folders. An archived message is at most 64 MiB; JSON responses are
 at most 8 MiB, accumulated source metadata 16 MiB, and a serialized manifest
 32 MiB. Oversize or unrepresentable objects fail the command, never disappear
-silently from a successful snapshot.
+silently from a successful snapshot. Message metadata, including the archive
+size ceiling, is validated during enumeration before any bodies are downloaded.
+The PostgreSQL importer still has a separate 32 MiB stored-message ceiling;
+a verified larger archive is retained evidence, not proof that it can be imported.
 
 Requests have a 60-second deadline, bounded DNS and connect attempts, a
 24-hour invocation network deadline and a 200,000-request ceiling. Successive

@@ -294,6 +294,7 @@ fn export(source: &source::Source, archive: &mut archive::Archive, binding: Json
         let ids = source.query("Email", Some(mailbox_id), OBJECT_LIMIT)?;
         for batch in ids.chunks(64) {
             for email in source.get("Email", batch, &email_state)? {
+                validate_email(&email)?;
                 let id = string(&email, "id")?.to_owned();
                 if let Some(previous) = emails.get(&id) {
                     if !same_metadata(previous, &email) {
@@ -313,7 +314,6 @@ fn export(source: &source::Source, archive: &mut archive::Archive, binding: Json
     }
     let mut records = Vec::new();
     for email in emails.into_values() {
-        validate_email(&email)?;
         let body = archive.body(source, &email)?;
         records.push(json!({"email":email,"body":body}));
     }
@@ -445,6 +445,24 @@ mod tests {
     }
     pub(super) fn manifest(source: Json, body: &str) -> Json {
         json!({"version":1,"provisional":true,"coverage":"per-mailbox-query","source":source,"mailboxState":"s1","emailState":"s2","mailboxes":[mailbox("inbox",Json::Null),mailbox("child",Json::Str("inbox".into()))],"messages":[{"email":email("one"),"body":body},{"email":email("two"),"body":body}]})
+    }
+    #[test]
+    fn archive_accepts_legacy_large_messages_but_keeps_a_hard_ceiling() {
+        for (size, expected) in [
+            (43_041_897u64, Ok(())),
+            (64 * 1024 * 1024, Ok(())),
+            (64 * 1024 * 1024 + 1, Err("migration-message-too-large")),
+        ] {
+            let mut value = email("large");
+            if let Json::Obj(ref mut pairs) = value {
+                for (key, v) in pairs {
+                    if key == "size" {
+                        *v = json!(size);
+                    }
+                }
+            }
+            assert_eq!(validate_email(&value), expected);
+        }
     }
     #[test]
     fn preserves_distinct_ids_identical_bodies_and_full_membership() {
