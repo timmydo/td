@@ -3,7 +3,7 @@ use crate::{
     clock::{RuntimeClock, TlsClockSource},
     config::{composition, load, materialize, profile::Roles, stanza, storage, stream, values},
     generations::{GenerationConstruction, GenerationSet, PreparedGeneration},
-    ids::StoreEpoch,
+    ids::{AccountId, StoreEpoch},
     postgres_probe::Request,
     postgres_profile_materials::{self, Loader},
     tls_policy::TlsPolicies,
@@ -21,6 +21,7 @@ pub enum Error {
     DuplicateProfile,
     SharedQuotas,
     RouteConflict,
+    OutboundProfile,
     Route(crate::postgres_routes::Error),
     Composition(composition::Error),
     Profile,
@@ -75,7 +76,8 @@ struct OwnedProfile {
 /// ```compile_fail,E0451
 /// use td_mta::{ids::StoreEpoch, postgres_configuration::{Candidate, SharedQuotas}};
 /// fn forge(epoch: StoreEpoch, quotas: SharedQuotas) -> Candidate {
-///     Candidate { epoch, shared: Vec::new(), profiles: Vec::new(), digest: [0; 32], quotas }
+///     Candidate { epoch, shared: Vec::new(), profiles: Vec::new(),
+///         digest: [0; 32], quotas, submission_routes: Vec::new() }
 /// }
 /// ```
 pub struct Candidate {
@@ -84,6 +86,7 @@ pub struct Candidate {
     profiles: Vec<OwnedProfile>,
     digest: [u8; 32],
     quotas: SharedQuotas,
+    submission_routes: Vec<(AccountId, crate::postgres_routes::Route)>,
 }
 impl Candidate {
     pub fn epoch(&self) -> StoreEpoch {
@@ -103,6 +106,17 @@ impl Candidate {
             .iter()
             .find(|entry| entry.name == profile)
             .map(|entry| &entry.route)
+    }
+    pub fn submission_route(
+        &self,
+        account: AccountId,
+        profile: &str,
+    ) -> Option<&crate::postgres_routes::Route> {
+        self.submission_routes
+            .iter()
+            .find(|(id, _)| *id == account)
+            .map(|(_, route)| route)
+            .or_else(|| self.route(profile))
     }
     pub fn profile_count(&self) -> usize {
         self.profiles.len()
@@ -178,6 +192,10 @@ pub fn prepare(
         .try_reserve_exact(ordered.len())
         .map_err(|_| Error::Capacity)?;
     let mut quotas = None;
+    let mut outbound_profiles = Vec::new();
+    outbound_profiles
+        .try_reserve_exact(crate::config::identities::MAX_ACCOUNTS)
+        .map_err(|_| Error::Capacity)?;
     let mut scratch = Vec::new();
     scratch
         .try_reserve_exact(stream::SCRATCH_BYTES)
@@ -225,6 +243,28 @@ pub fn prepare(
         if profiles.iter().any(|old| !route.compatible(&old.route)) {
             return Err(Error::RouteConflict);
         }
+        if profiles.is_empty() {
+            let catalog = resolved
+                .candidate()
+                .identities()
+                .map_err(|_| Error::Profile)?;
+            for index in 0..catalog.account_count() {
+                let account = catalog
+                    .account_at(index)
+                    .map_err(|_| Error::Profile)?
+                    .ok_or(Error::Profile)?
+                    .id;
+                if let Some(target) = catalog
+                    .outbound_profile(account)
+                    .map_err(|_| Error::Profile)?
+                {
+                    outbound_profiles.push((
+                        account,
+                        String::from_utf8(copy(target.as_bytes())?).map_err(|_| Error::Name)?,
+                    ));
+                }
+            }
+        }
         storage = resolved.into_storage();
         let name = String::from_utf8(copy(profile.name.as_bytes())?).map_err(|_| Error::Name)?;
         profiles.push(OwnedProfile {
@@ -235,12 +275,24 @@ pub fn prepare(
         });
     }
     drop(storage);
+    let mut submission_routes = Vec::new();
+    submission_routes
+        .try_reserve_exact(outbound_profiles.len())
+        .map_err(|_| Error::Capacity)?;
+    for (account, target) in outbound_profiles {
+        let profile = profiles
+            .iter()
+            .find(|profile| profile.name == target && profile.roles.relay())
+            .ok_or(Error::OutboundProfile)?;
+        submission_routes.push((account, profile.route.clone()));
+    }
     let mut candidate = Candidate {
         epoch,
         shared: copy(shared)?,
         profiles,
         digest: [0; 32],
         quotas: quotas.ok_or(Error::Profile)?,
+        submission_routes,
     };
     candidate.digest = digest(&candidate)?;
     if Instant::now() >= deadline {

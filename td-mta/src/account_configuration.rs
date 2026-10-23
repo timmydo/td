@@ -29,6 +29,7 @@ pub enum Edit<'a> {
         account: AccountId,
         name: Option<&'a str>,
         username: Option<&'a str>,
+        outbound_profile: Option<&'a str>,
     },
     IdentityAdd {
         account: AccountId,
@@ -211,7 +212,13 @@ pub fn edit(source: &[u8], edit: &Edit<'_>) -> Result<Vec<u8>, Error> {
                 }
             }
             if target_account {
-                if let Edit::Update { name, username, .. } = edit {
+                if let Edit::Update {
+                    name,
+                    username,
+                    outbound_profile,
+                    ..
+                } = edit
+                {
                     append(&mut out, line)?;
                     if !line.ends_with(b"\n") {
                         append(&mut out, b"\n")?;
@@ -221,6 +228,10 @@ pub fn edit(source: &[u8], edit: &Edit<'_>) -> Result<Vec<u8>, Error> {
                     }
                     if let Some(username) = username {
                         field(&mut out, b"username", username)?;
+                    }
+                    if let Some(profile) = outbound_profile.filter(|profile| !profile.is_empty()) {
+                        values::profile_name(profile).map_err(|_| Error::Invalid)?;
+                        field(&mut out, b"outbound_profile", profile)?;
                     }
                     return Ok(());
                 }
@@ -241,10 +252,20 @@ pub fn edit(source: &[u8], edit: &Edit<'_>) -> Result<Vec<u8>, Error> {
             return Ok(());
         }
         if target_account {
-            if let (Edit::Update { name, username, .. }, Statement::Assignment { key, .. }) =
-                (edit, statement)
+            if let (
+                Edit::Update {
+                    name,
+                    username,
+                    outbound_profile,
+                    ..
+                },
+                Statement::Assignment { key, .. },
+            ) = (edit, statement)
             {
-                if (key == "name" && name.is_some()) || (key == "username" && username.is_some()) {
+                if (key == "name" && name.is_some())
+                    || (key == "username" && username.is_some())
+                    || (key == "outbound_profile" && outbound_profile.is_some())
+                {
                     return Ok(());
                 }
             }
@@ -425,6 +446,7 @@ mod tests {
         let output = edit(
             source().as_bytes(),
             &Edit::Update {
+                outbound_profile: None,
                 account: A,
                 name: Some("A \\\" B"),
                 username: Some("new"),
@@ -440,6 +462,7 @@ mod tests {
             edit(
                 &output,
                 &Edit::Update {
+                    outbound_profile: None,
                     account: A,
                     name: Some("A \\\" B"),
                     username: Some("new")
@@ -598,6 +621,7 @@ mod tests {
             edit(
                 source().as_bytes(),
                 &Edit::Update {
+                    outbound_profile: None,
                     account: A,
                     name: Some("bad\nfield"),
                     username: None
@@ -609,6 +633,7 @@ mod tests {
             edit(
                 source().as_bytes(),
                 &Edit::Update {
+                    outbound_profile: None,
                     account: AccountId::from_bytes([2; 16]),
                     name: Some("new"),
                     username: None

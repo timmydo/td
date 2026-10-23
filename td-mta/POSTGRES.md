@@ -6597,7 +6597,7 @@ The following owner-side commands replace manual source decoding and SQL:
 td-mta postgres account-create --connection-file PATH --address EMAIL \
   [--name NAME] [--username USER] --operation-file PATH
 td-mta postgres account-update --connection-file PATH --account ID \
-  [--name NAME] [--username USER] --operation-file PATH
+  [--name NAME] [--username USER] [--outbound-profile NAME] --operation-file PATH
 td-mta postgres account-alias-add --connection-file PATH --account ID \
   --address EMAIL --operation-file PATH
 td-mta postgres account-alias-remove --connection-file PATH --account ID \
@@ -6612,7 +6612,7 @@ name and username to the address. The address's domain must already be
 configured. It generates an account, Inbox and sending identity, and adds an
 explicit receiving alias. Other folders can be created by the client. An
 alias alone never grants permission to send from that address. Update changes
-only supplied name/username fields, not aliases, identities, credentials,
+only supplied name, username and outbound-profile fields, not aliases, identities, credentials,
 account IDs or stored messages. No destructive account deletion is offered.
 These commands retain the existing 16-account bound.
 
@@ -6707,3 +6707,28 @@ verification alone consumed eight. Connection establishment and fresh device
 reauthorization retain their ten-second caps, shortened by the original body
 deadline. Ordinary JMAP snapshot methods retain their existing ten-second cap.
 Progress never renews an admitted operation's deadline.
+
+
+## Per-account submission routes
+
+An account's optional `outbound_profile` selects the route of a configured
+profile with the relay role. Complete candidate preparation refuses an unknown
+profile or one without relay capability. The account field belongs to shared
+configuration and is identical across profiles. Omitting it preserves the
+submitting profile's route. This selects only a named route and its destination
+evidence; no relay credentials are copied into the account or JMAP binding.
+
+Each binding retains separate submission and worker routes. New authenticated
+submissions bind and persist the account-selected route under the existing
+configuration/device fences. A relay worker retains its own profile's route,
+credentials and TLS policy, including when the same process also serves JMAP.
+Changing the account selection does not rewrite previously queued routes;
+retain workers for those routes until their accepted mail is settled. Native
+route ownership, destination matching and account isolation remain in force.
+An account route never grants a sending identity or unauthenticated relay.
+
+`postgres account-update --outbound-profile NAME` changes the selection through
+the retained operation workflow. An explicitly empty NAME removes the override
+and restores inheritance. `account-list` includes any explicit selection. All
+mail instances must restart after configuration publication, as for other
+account edits. These commands do not configure provider credentials or DNS.

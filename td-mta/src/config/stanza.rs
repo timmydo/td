@@ -157,7 +157,11 @@ impl Section {
             ],
             Self::Resolver => &[field!("address", Text, true)],
             Self::Logging => &[field!("minimum_severity", Text, false)],
-            Self::Account => &[field!("username", Text, true), field!("name", Text, false)],
+            Self::Account => &[
+                field!("username", Text, true),
+                field!("name", Text, false),
+                field!("outbound_profile", Text, false),
+            ],
             Self::Domain => &[
                 field!("mx_host", Text, false),
                 field!("mx_preference", Integer, false),
@@ -736,6 +740,7 @@ minimum_severity = "info"
 [account "0123456789abcdef0123456789abcdef"]
 username = "operator"
 name = ""
+outbound_profile = "relay"
 [domain "example.test"]
 mx_host = "mail.example.test"
 mx_preference = 10
@@ -831,7 +836,7 @@ per_peer_limit = 1
         }
         let stanza = p.finish().unwrap();
         assert_eq!(assigned, stanza.section().unwrap().fields().len());
-        assert_eq!(total_assigned, 54);
+        assert_eq!(total_assigned, 55);
         assert_eq!(count, 15);
     }
     #[test]

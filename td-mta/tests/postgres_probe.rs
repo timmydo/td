@@ -2558,6 +2558,7 @@ fn real_postgres_executable_receives_and_serves_database_profiles() {
     recovery::real_postgres_restore_quarantines_pending_delivery_and_changes_epoch();
     recovery::real_postgres_recovery_uncertain_commit_keeps_retained_new_epoch();
     exercise_configuration(ConfigurationExercise::AccountAdmin);
+    exercise_configuration(ConfigurationExercise::AccountRoutes);
     exercise_configuration(ConfigurationExercise::Imports);
     exercise_configuration(ConfigurationExercise::Reconcile);
     exercise_configuration(ConfigurationExercise::Unmapped);
@@ -2567,7 +2568,17 @@ fn real_postgres_executable_receives_and_serves_database_profiles() {
     exercise_configuration(ConfigurationExercise::Serving);
 }
 
+#[path = "postgres_probe/account_routes.rs"]
+mod account_routes;
+
+#[test]
+#[ignore = "requires PostgreSQL 17 tools"]
+fn real_postgres_account_routes_keep_submission_and_delivery_policies_separate() {
+    exercise_configuration(ConfigurationExercise::AccountRoutes);
+}
+
 enum ConfigurationExercise {
+    AccountRoutes,
     FolderReconcile,
     Unmapped,
     Reconcile,
@@ -3254,6 +3265,18 @@ per_peer_limit = 1
         account_workflow::exercise(&fixture, &request, &trust, epoch, &connection);
         return;
     }
+    if matches!(exercise, ConfigurationExercise::AccountRoutes) {
+        account_routes::exercise(
+            &fixture,
+            &request,
+            &trust,
+            epoch,
+            &shared,
+            &desktop,
+            &connection,
+        );
+        return;
+    }
     if matches!(exercise, ConfigurationExercise::MultiAccount) {
         multi_account::exercise(&fixture, &request, &trust, epoch, &shared, &desktop);
         return;
@@ -3368,6 +3391,7 @@ per_peer_limit = 1
         if name == "desktop" {
             match exercise {
                 ConfigurationExercise::AccountAdmin
+                | ConfigurationExercise::AccountRoutes
                 | ConfigurationExercise::MultiAccount
                 | ConfigurationExercise::Imports
                 | ConfigurationExercise::Reconcile

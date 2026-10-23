@@ -117,6 +117,7 @@ pub(super) fn exercise(
         deadline(),
         epoch,
         &Edit::Update {
+            outbound_profile: None,
             account,
             name: Some("Renamed"),
             username: None,
@@ -129,6 +130,7 @@ pub(super) fn exercise(
         deadline(),
         epoch,
         &Edit::Update {
+            outbound_profile: None,
             account,
             name: None,
             username: Some("different"),
@@ -202,6 +204,7 @@ pub(super) fn exercise(
         deadline(),
         epoch,
         &Edit::Update {
+            outbound_profile: None,
             account,
             name: Some("Final"),
             username: None,

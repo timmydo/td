@@ -824,11 +824,14 @@ fn apply_context(
             let id = AccountId::parse(c.label()?).map_err(|_| c.error(Code::Id, None, c.at))?;
             targets
                 .identities
-                .account(
+                .account_with_outbound_profile(
                     arena,
-                    id,
-                    c.required_text("username")?,
-                    c.text("name")?.unwrap_or(""),
+                    identities::AccountInput {
+                        id,
+                        username: c.required_text("username")?,
+                        name: c.text("name")?.unwrap_or(""),
+                        outbound_profile: c.text("outbound_profile")?,
+                    },
                     c.at,
                 )
                 .map_err(Error::from_identities)?;

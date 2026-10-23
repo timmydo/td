@@ -24,6 +24,7 @@ pub enum Code {
     Wildcard,
     SignaturePath,
     DuplicateAccount,
+    OutboundProfile,
     MissingAccount,
     DuplicateIdentity,
     MissingIdentity,
@@ -44,6 +45,7 @@ impl Code {
             Self::Mailbox => "config_identity_mailbox",
             Self::Wildcard => "config_identity_wildcard",
             Self::SignaturePath => "config_identity_signature_path",
+            Self::OutboundProfile => "config_identity_outbound_profile",
             Self::DuplicateAccount => "config_identity_duplicate_account",
             Self::MissingAccount => "config_identity_missing_account",
             Self::DuplicateIdentity => "config_identity_duplicate",
@@ -183,10 +185,17 @@ const _: [(); 1] = [(); (std::mem::size_of::<AddressSlot>() <= 32) as usize];
 const _: [(); 1] = [(); (MAX_ADDRESS_CELLS < u16::MAX as usize) as usize];
 #[derive(Clone, Copy)]
 struct Account {
+    outbound_profile: Option<text::Span>,
     id: AccountId,
     username: text::Span,
     name: text::Span,
     location: Location,
+}
+pub struct AccountInput<'a> {
+    pub id: AccountId,
+    pub username: &'a str,
+    pub name: &'a str,
+    pub outbound_profile: Option<&'a str>,
 }
 /// Fields already bound to one complete stanza; defaults are explicit here.
 pub struct IdentityInput<'a> {
@@ -311,6 +320,29 @@ impl<'a> Builder<'a> {
         name: &str,
         at: Location,
     ) -> Result<(), Error> {
+        self.account_with_outbound_profile(
+            arena,
+            AccountInput {
+                id,
+                username,
+                name,
+                outbound_profile: None,
+            },
+            at,
+        )
+    }
+    pub fn account_with_outbound_profile(
+        &mut self,
+        arena: &mut text::Builder<'_>,
+        input: AccountInput<'_>,
+        at: Location,
+    ) -> Result<(), Error> {
+        let AccountInput {
+            id,
+            username,
+            name,
+            outbound_profile,
+        } = input;
         self.operation(arena, at, |this, arena| {
             let text = arena.borrowed_view().map_err(|_| invariant())?;
             for old in this.accounts.iter().flatten() {
@@ -339,7 +371,15 @@ impl<'a> Builder<'a> {
             check_name(name, at)?;
             let username = store(arena, username, at)?;
             let name = store(arena, name, at)?;
+            let outbound_profile = outbound_profile
+                .map(|profile| {
+                    values::profile_name(profile)
+                        .map_err(|_| err(Code::OutboundProfile, Some(at)))?;
+                    store(arena, profile, at)
+                })
+                .transpose()?;
             *this.accounts.get_mut(index).ok_or_else(invariant)? = Some(Account {
+                outbound_profile,
                 id,
                 username,
                 name,
@@ -630,6 +670,18 @@ impl<'s, 't> View<'s, 't> {
             username: read(self.text, self.owner, account.username)?,
             name: read(self.text, self.owner, account.name)?,
         }))
+    }
+    pub fn outbound_profile(self, id: AccountId) -> Result<Option<&'t str>, Error> {
+        let account = self
+            .accounts
+            .iter()
+            .flatten()
+            .find(|account| account.id == id)
+            .ok_or_else(|| err(Code::UnknownAccount, None))?;
+        account
+            .outbound_profile
+            .map(|value| read(self.text, self.owner, value))
+            .transpose()
     }
     pub fn contains_account(self, id: AccountId) -> bool {
         self.accounts

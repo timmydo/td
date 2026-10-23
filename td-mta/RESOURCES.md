@@ -4473,6 +4473,8 @@ catalogs. A separate 3-MiB planned account-metadata reservation includes that
 copy peak, all Sessions, and 256 KiB for binding/registry metadata. Static
 assertions hold the two allocation shapes within that reservation. Native
 provider allocations and whole-process RSS qualification remain separate.
+Each binding retains both its worker route and its submission route, with at
+most 64 bytes per route name; these fit the existing binding metadata allowance.
 Account count does not multiply HTTP workers, connection slots, read slots,
 body-operation admission, response retention or authentication rate budgets.
 

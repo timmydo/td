@@ -68,7 +68,7 @@ pub struct Submission {
 }
 impl Submission {
     pub fn route(&self) -> &crate::postgres_routes::Route {
-        self.input.binding().route()
+        self.input.binding().submission_route()
     }
     pub fn operation(&self) -> SubmissionOperationId {
         self.operation
@@ -148,7 +148,7 @@ pub fn prepare_with_meter(
         &blob,
         &(input.bytes().len() as u64).to_be_bytes(),
         &body_digest,
-        binding.route().destination(),
+        binding.submission_route().destination(),
         &[u8::from(input.expected().is_some())],
         &input.expected().unwrap_or(0).to_be_bytes(),
         &(input.recipients().len() as u64).to_be_bytes(),
@@ -158,7 +158,7 @@ pub fn prepare_with_meter(
     }
     for text in [
         binding.profile(),
-        binding.route().name(),
+        binding.submission_route().name(),
         input.reverse_path(),
     ]
     .into_iter()
@@ -448,7 +448,7 @@ pub fn publish(
                     &value.blob.as_bytes().as_slice(), &input.reverse_path(), &send_at, &expires_at, &count, &changed])
                 .await.map_err(|_| Error::Database)? != 1 { return Err(Error::Integrity); }
             if client.execute("INSERT INTO td_mta.submission_routes(account,submission_id,submitting_profile,route_name,destination) VALUES($1,$2,$3,$4,$5)",
-                &[&account, &submission, &binding.profile(), &binding.route().name(), &binding.route().destination().as_slice()])
+                &[&account, &submission, &binding.profile(), &binding.submission_route().name(), &binding.submission_route().destination().as_slice()])
                 .await.map_err(|_| Error::Database)? != 1 { return Err(Error::Integrity); }
             let mut recipients = Vec::new();
             recipients

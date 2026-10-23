@@ -72,6 +72,7 @@ struct Options {
     address: Option<String>,
     name: Option<String>,
     username: Option<String>,
+    outbound_profile: Option<String>,
 }
 fn arguments(command: Command, mut args: impl Iterator<Item = OsString>) -> Option<Options> {
     let mut o = Options {
@@ -83,6 +84,7 @@ fn arguments(command: Command, mut args: impl Iterator<Item = OsString>) -> Opti
         address: None,
         name: None,
         username: None,
+        outbound_profile: None,
     };
     while let Some(flag) = args.next() {
         let value = args.next()?.into_string().ok()?;
@@ -140,6 +142,9 @@ fn arguments(command: Command, mut args: impl Iterator<Item = OsString>) -> Opti
             {
                 o.name = Some(value)
             }
+            "--outbound-profile" if command == Command::Update && o.outbound_profile.is_none() => {
+                o.outbound_profile = Some(value)
+            }
             "--username"
                 if matches!(command, Command::Create | Command::Update) && o.username.is_none() =>
             {
@@ -166,7 +171,10 @@ fn arguments(command: Command, mut args: impl Iterator<Item = OsString>) -> Opti
         || (matches!(command, Command::IdentityUpdate | Command::IdentityRemove)
             && o.identity.is_none())
         || (command == Command::IdentityUpdate && o.name.is_none() && o.address.is_none())
-        || (command == Command::Update && o.name.is_none() && o.username.is_none())
+        || (command == Command::Update
+            && o.name.is_none()
+            && o.username.is_none()
+            && o.outbound_profile.is_none())
     {
         return None;
     }
@@ -335,6 +343,7 @@ fn execute(command: Command, o: &Options) -> Result<(), (&'static str, &'static 
                 account,
                 name: o.name.as_deref(),
                 username: o.username.as_deref(),
+                outbound_profile: o.outbound_profile.as_deref(),
             },
             Command::AliasAdd | Command::AliasRemove => Edit::Alias {
                 account,
@@ -422,7 +431,12 @@ fn list(loaded: &Loaded, provided: Option<StoreEpoch>) -> Result<(), (&'static s
                 key,
                 value: Value::Text(value),
                 ..
-            } if open && matches!(key, "account" | "username" | "name" | "email" | "kind") => {
+            } if open
+                && matches!(
+                    key,
+                    "account" | "username" | "name" | "email" | "kind" | "outbound_profile"
+                ) =>
+            {
                 write!(
                     out,
                     ",{}:{}",
@@ -482,6 +496,35 @@ mod tests {
                 .map(OsString::from)
         )
         .is_none());
+    }
+    #[test]
+    fn outbound_profile_option_is_an_explicit_account_update() {
+        let base = [
+            "--connection-file",
+            "/private/connection",
+            "--operation-file",
+            "/private/op",
+            "--account",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ];
+        for profile in ["migadu", ""] {
+            let args: Vec<_> = base
+                .into_iter()
+                .chain(["--outbound-profile", profile])
+                .map(OsString::from)
+                .collect();
+            assert!(arguments(Command::Update, args.clone().into_iter()).is_some());
+            assert!(arguments(Command::AliasAdd, args.clone().into_iter()).is_none());
+            assert!(arguments(
+                Command::Update,
+                args.into_iter().chain([
+                    OsString::from("--outbound-profile"),
+                    OsString::from("other")
+                ])
+            )
+            .is_none());
+        }
+        assert!(arguments(Command::Update, base.map(OsString::from).into_iter()).is_none());
     }
     #[test]
     fn identity_options_require_owner_and_explicit_changes() {

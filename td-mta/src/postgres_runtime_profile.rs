@@ -41,6 +41,7 @@ pub struct Binding {
     profile: String,
     roles: Roles,
     route: crate::postgres_routes::Route,
+    submission_route: crate::postgres_routes::Route,
     relay_policy: Option<crate::ports::TlsPolicyId>,
     quotas: configuration::SharedQuotas,
     upload_maximum: usize,
@@ -111,6 +112,10 @@ impl Binding {
     }
     pub fn route(&self) -> &crate::postgres_routes::Route {
         &self.route
+    }
+    /// Route for new authenticated submissions, independent of this worker's relay.
+    pub fn submission_route(&self) -> &crate::postgres_routes::Route {
+        &self.submission_route
     }
     /// Passive eligibility only; dispatch must recheck policy and ownership.
     pub fn serves_route(&self, route: &crate::postgres_routes::Route) -> bool {
@@ -364,6 +369,10 @@ pub fn load(
             profile: name.clone(),
             roles,
             route: route.clone(),
+            submission_route: candidate
+                .submission_route(account, profile)
+                .ok_or(Error::MissingProfile)?
+                .clone(),
             relay_policy,
             quotas,
             upload_maximum,

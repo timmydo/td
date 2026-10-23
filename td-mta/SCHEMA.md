@@ -168,6 +168,7 @@ Fields are:
 | --- | --- | --- |
 | `username` | Text, required | 1..254 visible ASCII bytes, excluding colon; exact case-sensitive HTTP Basic username |
 | `name` | Text, empty | At most 4096 UTF-8 bytes; configured account display name |
+| `outbound_profile` | Optional text | Profile-name syntax, at most 64 bytes; selects a configured relay-capable profile for new submissions. Absent uses the submitting profile’s route. |
 
 Device application-password records remain service-managed `devices/` state.
 There are no password/token/verifier fields in the account stanza. Changing
@@ -660,7 +661,7 @@ retained text for the larger variants is:
 | ACME: directory, contact and CA path | 8445 |
 | Files certificate: label, mode and two paths | 8259 |
 | Identity address: label, kind, display name and email | 4390 |
-| Account: label, username and display name | 4382 |
+| Account: label, username, display name and outbound profile | 4446 |
 | Gateway: label, CA path and two hex pins | 4287 |
 | Server: hostname, raw origin and two address hints | 561 |
 | Domain: label, MX host, policy mode and certificate name | 557 |

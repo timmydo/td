@@ -811,8 +811,10 @@ private credential file; do not put it in a command line or ordinary log.
 Configure td-mail with the HTTPS discovery URL and the new address as username.
 Use `--username` during creation if a different login is wanted.
 
-`account-update` changes display name/login; `account-alias-add` and
-`account-alias-remove` change receiving addresses. They each take a fresh
+`account-update` changes display name/login and accepts `--outbound-profile NAME`
+to select an existing relay-capable profile for that account. An empty NAME
+clears the override. Previously queued mail retains its original route.
+`account-alias-add` and `account-alias-remove` change receiving addresses. They each take a fresh
 `--operation-file` and also require mail instance restart after selection.
 Aliases are local mailbox routes, never forwarding destinations or additional
 sending identities. The domain and smarthost sender authorization are configured
