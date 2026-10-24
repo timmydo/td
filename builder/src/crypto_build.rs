@@ -95,14 +95,17 @@ pub(crate) fn release(root: &Path) -> Result<Release> {
 }
 
 fn run_inner(root: &Path, action: &str, manifest: &str) -> Result<Option<Release>> {
-    if !matches!(action, "test" | "clippy" | "build") {
-        return Err("crypto-cargo accepts only test or clippy".into());
+    if !matches!(action, "test" | "clippy" | "build" | "perf") {
+        return Err("crypto-cargo accepts only test, clippy, build or perf".into());
     }
     let name = match manifest {
         "td-crypto/Cargo.toml" => "td-crypto",
         "td-mta/Cargo.toml" => "td-mta",
         _ => return Err("manifest has no crypto admission".into()),
     };
+    if action == "perf" && name != "td-mta" {
+        return Err("crypto-cargo perf measures only td-mta".into());
+    }
     validate(root)?;
     let variables = std::env::vars_os()
         .map(|(key, value)| {
@@ -150,7 +153,7 @@ fn run_inner(root: &Path, action: &str, manifest: &str) -> Result<Option<Release
         std::env::var("PATH").unwrap_or_default()
     );
     // Before any test runs, over the PATH the fixtures inherit.
-    if action == "test" && name == "td-mta" {
+    if matches!(action, "test" | "perf") && name == "td-mta" {
         postgres_bin(&path)?;
     }
     let vendor = crate::host_bin::prepare_mail_vendor(root)?;
@@ -240,6 +243,26 @@ fn run_inner(root: &Path, action: &str, manifest: &str) -> Result<Option<Release
     let graph =
         std::str::from_utf8(&output.stdout).map_err(|e| format!("crypto graph UTF-8: {e}"))?;
     crate::crypto_policy::active_graph(root, name, graph)?;
+    if action == "perf" {
+        // On demand only: no gate selects it. Release, as td-mta M23 measures,
+        // with the release build's profile so the two share artifacts.
+        let mut cmd = command("test", manifest);
+        cmd.env("TD_TEST_TRUSTED_ROOT", "private")
+            .env("CARGO_PROFILE_RELEASE_DEBUG", "1")
+            .env("CARGO_PROFILE_RELEASE_STRIP", "none")
+            .args([
+                "--release",
+                "--test",
+                "postgres_probe",
+                "--",
+                "--exact",
+                "real_postgres_performance_harness",
+                "--ignored",
+                "--nocapture",
+            ])
+            .stdout(Stdio::piped());
+        return crate::native_tests::run_cases(cmd).map(|()| None);
+    }
     let mut cmd = command(action, manifest);
     if action == "build" {
         std::fs::create_dir_all(&target_dir).map_err(|e| format!("release target: {e}"))?;
@@ -453,6 +476,24 @@ mod tests {
         ] {
             assert!(check_controls(std::iter::once((key.into(), value.into()))).is_err());
         }
+    }
+
+    /// Refused before validation reads the root, so no checkout is needed.
+    #[test]
+    fn perf_measures_only_td_mta_and_unknown_actions_refuse() {
+        let root = Path::new("/nonexistent-td-root");
+        assert_eq!(
+            run_inner(root, "perf", "td-crypto/Cargo.toml")
+                .err()
+                .as_deref(),
+            Some("crypto-cargo perf measures only td-mta")
+        );
+        assert_eq!(
+            run_inner(root, "bench", "td-mta/Cargo.toml")
+                .err()
+                .as_deref(),
+            Some("crypto-cargo accepts only test, clippy, build or perf")
+        );
     }
 
     #[test]

@@ -3264,6 +3264,12 @@ pub(crate) fn gate_crates_cli(args: &[String]) -> ExitCode {
             if let Err(e) = dependency_free_locks(&root) {
                 return fail(&e);
             }
+            // The gates warm before calling; the on-demand harness warms itself.
+            if action == "perf" && manifest == "td-mta/Cargo.toml" {
+                if let Err(e) = crate::check_loop::warm_mail_sources(&root) {
+                    return fail(&e);
+                }
+            }
             match crate::crypto_build::run(&root, action, manifest) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => fail(&e),
@@ -3400,7 +3406,10 @@ pub(crate) fn gate_crates_cli(args: &[String]) -> ExitCode {
             eprintln!("       td-builder gate-crates cargo-cmds");
             eprintln!("       td-builder gate-crates fmt --all [--write]");
             eprintln!("       td-builder gate-crates names");
-            eprintln!("       td-builder gate-crates crypto-cargo test|clippy --manifest-path CRATE/Cargo.toml");
+            eprintln!("       td-builder gate-crates crypto-cargo test|clippy|build --manifest-path CRATE/Cargo.toml");
+            eprintln!(
+                "       td-builder gate-crates crypto-cargo perf --manifest-path td-mta/Cargo.toml"
+            );
             eprintln!(
                 "       td-builder gate-crates crypto-musl-headers --archive musl-1.2.5.tar.gz [--arch x86_64|aarch64]"
             );

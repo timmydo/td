@@ -2568,6 +2568,17 @@ fn real_postgres_executable_receives_and_serves_database_profiles() {
     exercise_configuration(ConfigurationExercise::Serving);
 }
 
+#[path = "postgres_probe/performance.rs"]
+mod performance;
+
+/// On demand, never in a gate:
+/// `td-builder gate-crates crypto-cargo perf --manifest-path td-mta/Cargo.toml`.
+#[test]
+#[ignore = "on-demand performance harness; real local PostgreSQL 17 tools required"]
+fn real_postgres_performance_harness() {
+    exercise_configuration(ConfigurationExercise::Performance);
+}
+
 #[path = "postgres_probe/account_routes.rs"]
 mod account_routes;
 
@@ -2586,6 +2597,7 @@ enum ConfigurationExercise {
     AccountAdmin,
     MultiAccount,
     Serving,
+    Performance,
     ReceivingTls,
     ReceivingTransport,
     ReceivingOwner,
@@ -2661,10 +2673,12 @@ text_signature_file = "/postgres-material/{}"
 "#,
         Version::from_bytes([5; 16])
     );
-    let mut relay_socket = matches!(exercise, ConfigurationExercise::Serving)
-        .then(|| TcpListener::bind("127.0.0.1:0").unwrap());
-    let mut relay_dns = matches!(exercise, ConfigurationExercise::Serving)
-        .then(|| std::net::UdpSocket::bind("127.0.0.1:0").unwrap());
+    let serves_profiles = matches!(
+        exercise,
+        ConfigurationExercise::Serving | ConfigurationExercise::Performance
+    );
+    let mut relay_socket = serves_profiles.then(|| TcpListener::bind("127.0.0.1:0").unwrap());
+    let mut relay_dns = serves_profiles.then(|| std::net::UdpSocket::bind("127.0.0.1:0").unwrap());
     let desktop = format!(
         r#"[server]
 hostname = "localhost"
@@ -2707,6 +2721,7 @@ certificate = "public"
         ConfigurationExercise::Client
             | ConfigurationExercise::SendClient
             | ConfigurationExercise::Serving
+            | ConfigurationExercise::Performance
     )
     .then(|| TcpListener::bind("127.0.0.1:0").unwrap());
     let desktop = if let Some(socket) = &https_socket {
@@ -2725,7 +2740,7 @@ certificate = "public"
     } else {
         desktop
     };
-    let cloud_source = if matches!(exercise, ConfigurationExercise::Serving) {
+    let cloud_source = if serves_profiles {
         desktop
             .split("[listener \"https\"]")
             .next()
@@ -2748,6 +2763,7 @@ per_peer_limit = 1
         ConfigurationExercise::ReceivingTransport
             | ConfigurationExercise::ReceivingTls
             | ConfigurationExercise::Serving
+            | ConfigurationExercise::Performance
     )
     .then(|| TcpListener::bind("127.0.0.1:0").unwrap());
     let cloud = if let Some(socket) = &smtp_socket {
@@ -2755,7 +2771,21 @@ per_peer_limit = 1
     } else {
         cloud
     };
-    let cloud_roles = if matches!(exercise, ConfigurationExercise::Serving) {
+    // Concurrent loopback streams share one peer address.
+    let cloud = if matches!(exercise, ConfigurationExercise::Performance) {
+        let limits = "session_limit = 1\nper_peer_limit = 1\n";
+        assert_eq!(cloud.matches(limits).count(), 1, "cloud listener limits");
+        cloud.replace(
+            limits,
+            &format!(
+                "session_limit = {0}\nper_peer_limit = {0}\n[limits]\nsmtp_per_peer = {0}\n",
+                performance::SMTP_STREAMS_MAX
+            ),
+        )
+    } else {
+        cloud
+    };
+    let cloud_roles = if serves_profiles {
         5
     } else if matches!(exercise, ConfigurationExercise::Submissions) {
         7
@@ -3302,7 +3332,7 @@ per_peer_limit = 1
     } else {
         &request
     };
-    if matches!(exercise, ConfigurationExercise::Serving) {
+    if serves_profiles {
         create_runtime_login(&fixture);
         grant_runtime_mail(&fixture);
         acme::publish_fixture_pair(&fixture);
@@ -3327,13 +3357,17 @@ per_peer_limit = 1
         versions::publish(&request, &trust, deadline(), version, &managed).unwrap();
         let change = selection::prepare(epoch, 1, version, &managed).unwrap();
         selection::publish(&request, &trust, deadline(), change).unwrap();
-        serving::exercise(
-            &fixture,
+        let sockets = (
             smtp_socket.take().unwrap(),
             https_socket.take().unwrap(),
             relay_socket.take().unwrap(),
             relay_dns.take().unwrap(),
         );
+        if matches!(exercise, ConfigurationExercise::Performance) {
+            performance::exercise(&fixture, sockets.0, sockets.1, sockets.2, sockets.3);
+        } else {
+            serving::exercise(&fixture, sockets.0, sockets.1, sockets.2, sockets.3);
+        }
         return;
     }
     for (name, roles) in [("desktop", 2), ("cloud", cloud_roles)] {
@@ -3401,7 +3435,8 @@ per_peer_limit = 1
                 }
                 ConfigurationExercise::Client
                 | ConfigurationExercise::SendClient
-                | ConfigurationExercise::Serving => {}
+                | ConfigurationExercise::Serving
+                | ConfigurationExercise::Performance => {}
                 ConfigurationExercise::Submissions => {
                     exercise_submission_input(&fixture, &request, &trust, prepared.binding(), true)
                 }

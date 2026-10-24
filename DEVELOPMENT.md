@@ -1005,6 +1005,24 @@ processes are killed and reaped by their owning fixture, and all mailbox,
 credential, client-cache and download data live under private temporary roots.
 This host test preparation does not add a target artifact dependency.
 
+## Mail performance harness
+
+td-mta's performance harness runs on demand, never in a gate or `ready`:
+
+```text
+td-builder gate-crates crypto-cargo perf --manifest-path td-mta/Cargo.toml
+```
+
+It warms the td-mta sources itself, needs the same PostgreSQL 17 `PATH`,
+and runs the one ignored `real_postgres_performance_harness` case in
+release, with the release build's profile, under the private trusted
+root, through the same bounded output and passing-summary check.
+`TD_MTA_PERF_IDLE_SECONDS` (default 30), `TD_MTA_PERF_SMTP_STREAMS` (4,
+at most 4), `TD_MTA_PERF_SMTP_MESSAGES` (50 per stream, at most 1000)
+and `TD_MTA_PERF_JMAP_READERS` (2, at most 6) size it; the defaults take
+about six minutes. Its `td-mta-perf` lines are the report;
+td-mta/CONFORMANCE.md says what each measures.
+
 # Code review: two frontier models per commit
 
 Every increment receives two independent reviews of one exact commit:

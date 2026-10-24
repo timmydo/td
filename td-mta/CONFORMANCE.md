@@ -357,6 +357,89 @@ The private CA enters only the existing fetch test process. This establishes
 client/server compatibility for the flows described below, not production
 root-set, managed-provider, maximum-load or full release qualification.
 
+## On-demand performance harness
+
+`td-builder gate-crates crypto-cargo perf --manifest-path td-mta/Cargo.toml`
+runs the ignored `real_postgres_performance_harness` case. It reuses the
+foreground-service fixture's disposable cluster and selected
+configuration, with the cloud SMTP listener raised to four sessions from
+one peer, and starts the real `desktop` and `cloud` serving processes.
+DEVELOPMENT.md says how to run and size it. No gate or `ready` runs it,
+and nothing in it is a threshold: its assertions check only that the
+measured work happened, so a regression shows in the report, not as a
+failure.
+
+What it measures is the host-native release test build (glibc on x86-64
+Linux, not the static-musl artifact) inside the test runner's private
+root and network namespace, under the runner's `RLIMIT_DATA` ceiling,
+which the services inherit. Each scenario prints one `td-mta-perf
+{json}` line, in this order:
+
+- `configuration`: the sizing knobs, message mix, HTTPS pace, build
+  profile, target, kernel release and inherited data limit.
+- `startup`: milliseconds to the ready line, and RSS and VmHWM, per
+  profile.
+- `idle_desktop`, then `idle_desktop_cloud` once the cloud profile has
+  started: `pg_stat_database` deltas (sessions, abandoned, fatal and
+  killed sessions, commits, rollbacks, per-minute rates), sampled
+  `td-mta-postgres` connections, and per-process RSS. The two windows
+  separate each profile's idle database use. Each includes the harness's
+  own psql probes, about one session per five seconds, none abandoned.
+  Sessions count at connect, and abandoned, fatal and killed sessions
+  at exit; a backend that keeps committing can report its transactions
+  about ten seconds late, so commit and rollback counts can land in the
+  next window.
+- `smtp_intake`: concurrent plaintext loopback streams deliver
+  deterministic messages, one 256 KiB in ten and the rest 2 KiB, each to
+  the fixture's one local account. It reports throughput, milliseconds
+  from the final dot to 250 for small and large messages apart (a large
+  message's tail may still be in transit when the dot is sent), time to
+  acceptance including deferrals, 4xx deferrals by phase with how long
+  each refusal took, reconnects and refused greetings, the cloud
+  process's sampled peak RSS and VmHWM, and the database deltas. After a
+  deferral the stream sends RSET and retries the message after 50 ms, as
+  a sending MTA would retry later, at most 200 times. A 421 or close,
+  including the server's per-connection transaction limit, counts as a
+  reconnect, not a deferral. Every message must finally be stored; one
+  may be stored twice only after a close following its dot, which the
+  server uses when publication is uncertain, and `closed_after_dot` and
+  `duplicates` count those.
+- `jmap_fetch`: one client with a fresh device credential reads the
+  delivered mailbox one request at a time: five session discoveries,
+  256-ID `Email/query` pages, 64-ID `Email/get` batches for blob and
+  size, then every message's raw bytes from the session's download
+  template, each checked against its size. It reports per-request
+  latency, download throughput over the download phase, busy refusals,
+  the desktop process's RSS and the database deltas.
+- `jmap_concurrent`: readers each download the whole mailbox from
+  different offsets while one more client repeats an `Email/query`, so
+  downloads and API calls contend for the one body slot. It reports
+  download and query latency, throughput, refusals per endpoint, RSS and
+  the database deltas.
+- `idle_after_intake`: the first idle window's measures again, with both
+  profiles, after the JMAP scenarios.
+
+Every td-mta HTTPS response closes its connection, so each request is a
+new TLS connection from 127.0.0.1, and the server admits at most eight
+authentication attempts per peer per second, counted after each
+handshake. The harness spaces connection starts evenly at six a second
+across all its clients, so that limiter is not expected to refuse; the
+JMAP scenarios therefore measure contention at that rate and no
+higher. Latencies exclude that pacing but
+include the TLS handshake and the fixture TLS client, which polls in
+millisecond steps and builds its configuration per connection. Every
+collision on the shared body slot is a 429: one whose body names
+`maxConcurrentRequests` is a refused API call (`429_api_slot`), a plain
+one a refused download. A 503 is a storage or service failure, not
+contention. Each is retried after 50 ms, at most 1000 times; any other
+status fails.
+
+This is a first slice of DESIGN section 15 and IMPLEMENTATION M23, not
+their qualification: no 1 GiB corpus, search, queue retry or
+certificate rotation, one account, one host, loopback only, and RSS
+sampled every 20 ms, so a shorter peak can be missed; VmHWM bounds it.
+Page cache and cgroup memory are not recorded.
+
 ## Structured Email creation evidence
 
 The PostgreSQL real-client send fixture below exercises text and attachment
