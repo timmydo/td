@@ -30,6 +30,7 @@ mod crypto_headers;
 mod crypto_isolated;
 mod crypto_policy;
 mod crypto_portable;
+mod debian_runtime;
 mod drv;
 mod efi;
 mod elf;
@@ -6457,6 +6458,13 @@ fn assemble_recipe_drv(
                     "recipe: buildSystem \"mesboot\" supports no configureFlags/phases — rungs declare typed `steps'".into(),
                 );
             }
+            if steps
+                .as_arr()
+                .is_some_and(|steps| steps.iter().any(|step| step.get("debianRuntime").is_some()))
+                && build_root.is_none()
+            {
+                return Err("recipe: debianRuntime requires buildRoot".into());
+            }
             push_drv_env(&mut spec, "TD_RECIPE_NAME", name)?;
             if steps.as_arr().is_some_and(|steps| {
                 steps
@@ -7163,7 +7171,7 @@ fn build_plan(
 /// OWN source entry is named `{name}-source` (`src_key`) so its steps can reference
 /// `{in:{name}-source}` uniformly, but its digest is pinned under the recipe's
 /// `sourceInput` KEY — which may be a shared seed the recipe renames locally
-/// (linux-x86-64-source <- linux-kernel-source, gcc-runtime-source <- gcc-14-source).
+/// (for example, linux-x86-64-source <- linux-kernel-source).
 /// Resolve that source entry to its pin key; gate every other seed by its own name.
 /// For a conventional recipe (sourceInput == `{name}-source`) the two
 /// coincide, so this is a no-op. `alist` is the entry's own recipe JSON.

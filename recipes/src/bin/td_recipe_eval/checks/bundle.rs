@@ -1046,9 +1046,9 @@ fn readme(deployment_id: &str, format: DiskFormat) -> String {
         "# td — bootable demo system (x86-64)\n\
          \n\
          A prebuilt td system and a launcher, so you can try td under QEMU without\n\
-         building it. Building td from source compiles glibc, the kernel and\n\
+         building it. Building td compiles the kernel and\n\
          every td program in a pinned Debian build root with the upstream Rust\n\
-         toolchain, and takes a long while on a fast machine. This takes a\n\
+         toolchain, and imports Debian glibc and libgcc. This bundle takes a\n\
          download.\n\
          \n\
          Deployment id: `{deployment_id}`\n\

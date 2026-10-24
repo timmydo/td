@@ -62,41 +62,6 @@ const PINS: &[PinDef] = &[
         file: "git-2.55.0.tar.xz",
     },
     PinDef {
-        key: "gcc-14-source",
-        aliases: &[],
-        url: "https://ftp.gnu.org/gnu/gcc/gcc-14.3.0/gcc-14.3.0.tar.xz",
-        sha256: "e0dc77297625631ac8e50fa92fffefe899a4eb702592da5c32ef04e2293aca3a",
-        file: "gcc-14.3.0.tar.xz",
-    },
-    PinDef {
-        key: "gmp63",
-        aliases: &[],
-        url: "https://ftp.gnu.org/gnu/gmp/gmp-6.3.0.tar.xz",
-        sha256: "a3c2b80201b89e68616f4ad30bc66aee4927c3ce50e33929ca819d5c43538898",
-        file: "gmp-6.3.0.tar.xz",
-    },
-    PinDef {
-        key: "mpc131",
-        aliases: &[],
-        url: "https://ftp.gnu.org/gnu/mpc/mpc-1.3.1.tar.gz",
-        sha256: "ab642492f5cf882b74aa0cb730cd410a81edcdbec895183ce930e706c1c759b8",
-        file: "mpc-1.3.1.tar.gz",
-    },
-    PinDef {
-        key: "mpfr421",
-        aliases: &[],
-        url: "https://ftp.gnu.org/gnu/mpfr/mpfr-4.2.1.tar.xz",
-        sha256: "277807353a6726978996945af13e52829e3abd7a9a5b7fb2793894e18f1fcbb2",
-        file: "mpfr-4.2.1.tar.xz",
-    },
-    PinDef {
-        key: "glibc-241-source",
-        aliases: &[],
-        url: "https://ftp.gnu.org/gnu/glibc/glibc-2.41.tar.xz",
-        sha256: "a5a26b22f545d6b7d7b3dd828e11e428f24f4fac43c934fb071b6a7d0828e901",
-        file: "glibc-2.41.tar.xz",
-    },
-    PinDef {
         key: "jetbrains-mono-nerd-font-source",
         aliases: &[],
         // Pinned upstream data (AGENTS.md): the Nerd Fonts release archive of
@@ -204,10 +169,9 @@ const PINS: &[PinDef] = &[
     PinDef {
         key: "linux-source",
         // The 4.14.67 tree stays pinned ONLY as the source of the UAPI kernel
-        // headers (`linux-headers-x86-64`) td glibc, gcc-runtime and the
-        // build-root C packages build against. The bootable kernel is a
-        // SEPARATE, current pin (`linux-kernel-source`): bumping this one
-        // rebuilds glibc and everything above it.
+        // headers (`linux-headers-x86-64`) the build-root C packages use.
+        // The bootable kernel is a separate, current pin
+        // (`linux-kernel-source`); imported glibc carries Debian headers.
         aliases: &["linux-headers-x86-64"],
         url: "https://cdn.kernel.org/pub/linux/kernel/v4.x/linux-4.14.67.tar.xz",
         sha256: "3f4b056dc27233a78f7a4a35ed6fdcfd0a9680ec40b611a898bb6c8b905070ba",
@@ -456,8 +420,7 @@ mod tests {
 
     #[test]
     fn catalog_carries_all_legacy_source_locks() {
-        // The Linux 4.14 UAPI-header source, GCC 14.3.0 with GMP, MPFR and
-        // MPC (gcc-runtime's libgcc) and glibc 2.41 (td glibc) + the
+        // The Linux 4.14 UAPI-header source + the
         // linux-x86-64 kernel source (separate from the 4.14 UAPI-header
         // pin, re #529) + the upstream Rust 1.96.0 rustc, rust-std, Cargo and
         // Clippy release components +
@@ -480,8 +443,9 @@ mod tests {
         // Debian build root, and btrfs-progs left when td-btrfs replaced it.
         // CMake and the Rust source and its bootstrap snapshot left with the
         // source-built toolchain, and the stage0 ladder's 36 pins with the
-        // ladder.
-        assert_eq!(all().len(), 37);
+        // ladder. GCC, glibc, GMP, MPFR and MPC left when Debian runtime
+        // imports replaced the remaining source bootstrap.
+        assert_eq!(all().len(), 32);
     }
 
     /// A roster keyed by NAME can name nothing, and this workstream has twice

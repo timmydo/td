@@ -1,8 +1,8 @@
 # recipes/src/debian-root.lock — the Debian build root (AGENTS.md).
 #
 # A pinned Debian image layer plus the .debs unpacked over it form the
-# sandbox root recipes compile C in. Nothing from it ships: it is a build
-# environment, marked so no ordinary recipe input can name its pins.
+# sandbox root recipes compile C in. Only the reviewed glibc/libgcc runtime
+# exports ship; ordinary recipe input channels cannot name its pins.
 #
 # Edit the input lines below, then run
 #   td-feed debian-root resolve recipes/src/debian-root.lock
@@ -15,9 +15,9 @@
 #
 # `want` is the C build tool set: the kernel needs gcc, make, flex, bison,
 # bc, pkgconf and libelf-dev; rsync serves `make headers_install`, which
-# no recipe runs yet; cryptsetup's json-c needs cmake; gcc-runtime builds
-# GCC itself, which is C++, so it needs g++; glibc's build needs gawk
-# (Debian's awk is mawk) and python3; td-crypto's host-only portable kit
+# no recipe runs yet; cryptsetup's json-c needs cmake. This root also
+# supplies the imported glibc/libgcc runtime and development files.
+# td-crypto's host-only portable kit
 # (td-crypto/PORTABLE.md) cross-compiles AWS-LC's C for aarch64 with
 # gcc-aarch64-linux-gnu and binutils-aarch64-linux-gnu; the rest serve the
 # C packages and the C inside Rust crates.

@@ -1671,7 +1671,7 @@ See `td-compositor/DESIGN.md` for reader bounds and DST proof. Post-install
 account, keyboard and timezone setters remain separate increments.
 
 The `tzdata` recipe compiles the approved IANA 2026d data-only source
-with td's existing source-built glibc `zic`. Its output contains fat
+with td's imported Debian glibc `zic`. Its output contains fat
 TZif files at `share/zoneinfo`, including backward-compatible aliases,
 geographic tables, and the upstream version and license. It uses
 ordinary POSIX time without leap-second corrections. Fat output is

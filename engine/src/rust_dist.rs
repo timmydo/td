@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 //   out           the toolchain tree.
 //
 // The runtime libraries are symlinks into their own outputs, so each keeps its own
-// debug companion and the closure names them. Same pins + same inputs => the same
+// provenance and the closure names them; imported Debian libraries have no td companions. Same pins + same inputs => the same
 // tree (the double-build oracle proves it).
 
 /// The staged install-prefix subpath of the x86_64 glibc rung output (a mesboot rung

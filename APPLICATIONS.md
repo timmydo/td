@@ -70,7 +70,8 @@ Settled by the maintainer; these are premises, not conclusions.
 
 A third-party application is a **third zone**. Zone one is the target
 graph, built from pinned sources by the Debian build root's and the
-upstream Rust toolchain's compilers; zone two is the host control plane;
+upstream Rust toolchain's compilers, with imported Debian glibc/libgcc;
+zone two is the host control plane;
 zone three is a foreign prebuilt application, confined to one jail.
 
 Zone three lives **in** `/td/store`, admitted by the §B.8 marker rather
@@ -85,7 +86,7 @@ The claim that results is narrower than "the store contains no foreign
 binary", and the narrowing is deliberate:
 
 > td's target graph contains no foreign binary other than its
-> declared build-tool trust roots, and no foreign APPLICATION binary is an
+> declared build-tool and runtime trust roots, and no foreign APPLICATION binary is an
 > input to anything td builds. A curated set of applications ships in
 > the store as marked sandboxed-application outputs — foreign prebuilt
 > payloads that bring their own root and libc, are consumed by nothing,
@@ -2269,9 +2270,10 @@ itself had, answered with a number rather than with a fixture.
 correction review forced rather than a wording preference.** The count is
 members minus marked payloads, and members of this very closure are
 prebuilt or built by prebuilt tools: `rust-toolchain` is the upstream Rust
-release, and the Debian build root compiles every C member. Both are td's
+release, the Debian build root compiles the source-built C members, and
+`glibc-x86-64` and `gcc-runtime` import Debian runtime bytes. Both are td's
 declared trust roots, which AGENTS.md's claim names as its own exceptions —
-"no foreign binary other than the Debian build root's tools, the upstream
+"no foreign binary other than the Debian build root's tools and runtime exports, the upstream
 Rust toolchain" — and §B.8's mark is about APPLICATION payloads
 and says nothing about them. A line spelled
 `source-bootstrapped 66` would therefore deny something td declares, and
@@ -2280,8 +2282,8 @@ the wire says `unmarked`, the design sentence stays what it is, and
 `audited-seeds` — the distinct seed inputs the planning pass classified —
 is printed beside it so the seeds are visible rather than absent.
 
-A member built in the Debian build root (AGENTS.md, "Debian build root")
-is source-built by tools td did not build, so the answer names the root
+A member built or imported in the Debian build root (AGENTS.md, "Debian build root")
+uses tools or bytes td did not build, so the answer names the root
 beside it as a build-tool trust root, one fixed-arity line per such
 member, after the payload lines:
 
@@ -2291,6 +2293,11 @@ build-root	debian	linux-x86-64
 
 It is still counted as `unmarked`: the mark is about application
 payloads, and the kernel is compiled from its pinned source.
+
+The two imported Debian runtime members additionally report
+`upstream-runtime\tdebian\t<stem>`. They remain unmarked, like the
+upstream Rust toolchain, but are not source-built. Static consumers inherit
+their prebuilt code; a closure's runtime lines make that dependency visible.
 
 A marked pin is reported BESIDE the output built from it rather than
 instead of it: the archive's bytes are a store path of their own, so the
@@ -7753,7 +7760,7 @@ turned out not to be a td input at all: §O's own answer reads the
 *runtime's* zoneinfo. The application mount plan carries the zone NAME
 and binds the runtime's compiled file. Separately, the installer has
 an approved IANA `tzdata` source recipe compiled with td's existing
-source-built glibc `zic`; its data ships in the native-system image through
+imported Debian glibc `zic`; its data ships in the native-system image through
 `/etc/zoneinfo`, not as an application runtime input. What remains is
 the writer for that name and td's own clock, which are rungs 12k and 29
 rather than an unscheduled gap.

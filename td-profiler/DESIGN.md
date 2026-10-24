@@ -32,7 +32,7 @@ Frame pointers are a property of the shipped target platform, not an opt-in
 debug profile. Every source-built user-mode object which can execute in the
 shipped system uses them, including:
 
-- td glibc, libgcc, source-built libraries, and the userland closure;
+- source-built libraries and the userland closure;
 - target-built td control-plane programs and Rust userland;
 - registry dependency crates, build-script C/C++ objects, and direct `rustc`
   recipes.
@@ -54,6 +54,16 @@ pointers in only part of its code: each Rust output's assembly-exception
 marker names it (`rust-toolchain`) as a coverage boundary beside the
 compiler-runtime assembly. td's own crates and their dependencies keep the
 policy below.
+Debian's imported glibc and libgcc are also prebuilt coverage boundaries.
+Their shared objects and timezone tools carry no td debug companions; the
+image explicitly excludes their two store outputs from its object index,
+so samples there remain unresolved (`symbol-coverage-unavailable`). Every
+source-built output that can contain their static code carries the
+`glibc-x86-64` and, where applicable, `gcc-runtime` exception entries naming
+Debian's prebuilt runtime. The existing `assembly-boundary=1` wire token is
+conservative: it covers prebuilt code as well as hand-written assembly.
+No frame-pointer or complete-symbol guarantee is made for those bytes.
+
 Implementation increment 1 makes this a checked current claim.
 
 The compiler policy applies to compiler-generated code. Hand-written assembly
@@ -179,9 +189,10 @@ that the same declared inputs produce the same runtime and debug bytes; it
 does not mean that enabling observability preserves an older store path. The
 stable control-plane builder identity therefore does not stand in for producer
 semantics: every debug-splitting derivation carries the compiled
-`symbols-v1` policy token. A global splitter transform requires changing that
-version token; `symbols-v1` replaced `line-tables-v2` when companions dropped
-their line programs. The double-build check remains the oracle. Increment 1 copies
+`symbols-v2` policy token, including the imported Debian runtime boundaries.
+A global splitter transform requires changing that version token;
+`symbols-v1` replaced `line-tables-v2` when companions dropped their line
+programs. The double-build check remains the oracle. Increment 1 copies
 the same `td-boot`
 source below two different source and build roots, canonicalizes each with the
 shared direct-rustc policy, and performs two independent links and companion
@@ -190,8 +201,7 @@ the normal closure checks remain the wider reproducibility backstop.
 Git's shipped companions no longer contain DWARF against which to check
 source-path remapping. Its recipe still supplies the canonical compiler
 remaps, but its package check does not prove the pre-strip line program's
-paths. Static-archive `DW_AT_comp_dir` checks for zlib, curl, LibreSSL and
-gcc-runtime remain, as does the td-boot double-build oracle above; neither
+paths. Static-archive `DW_AT_comp_dir` checks for zlib, curl and LibreSSL remain, as does the td-boot double-build oracle above; neither
 is a Git-specific pre-strip DWARF proof.
 
 ## 3. Collection boundary
@@ -743,6 +753,7 @@ user mode. Coverage degrades explicitly:
 - reviewed hand-written assembly may not preserve a frame chain;
 - td-built companions carry no line program, so source lines are unavailable
   while function symbols resolve;
+- Debian glibc and libgcc have no td companions and no frame-pointer guarantee;
 - the upstream Rust toolchain's objects have no companions, and the prebuilt
   standard library Rust outputs link has incomplete frame pointers;
 - an anonymous/JIT mapping may have no stable object;

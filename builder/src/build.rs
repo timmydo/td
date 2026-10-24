@@ -4748,6 +4748,19 @@ pub fn run_mesboot() -> Result<(), String> {
             let exec = o.get("exec").is_some_and(Json::is_true);
             copy_single_file(Path::new(&ctx.out), Path::new(&file), Path::new(&to), exec)
                 .map_err(err)?;
+        } else if let Some(kind) = step.get("debianRuntime") {
+            if env::var_os("TD_BUILD_ROOT").is_none() {
+                return Err(err(
+                    "debianRuntime requires the pinned Debian build root".into()
+                ));
+            }
+            crate::debian_runtime::import(
+                Path::new("/"),
+                Path::new(&ctx.out),
+                kind.as_str()
+                    .ok_or_else(|| err("debianRuntime must name a kind".into()))?,
+            )
+            .map_err(err)?;
         } else if let Some(o) = step.get("splitDebugTree") {
             let root = ctx.expand(&field(o, "root")?).map_err(err)?;
             let objcopy = ctx.expand(&field(o, "objcopy")?).map_err(err)?;

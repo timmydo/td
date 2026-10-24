@@ -139,13 +139,31 @@ mod tests {
         compile_directory_consumers.dedup();
         assert_eq!(
             compile_directory_consumers,
-            [
-                "curl-x86-64-test",
-                "gcc-runtime-stage1",
-                "libressl-x86-64-test",
-                "zlib-x86-64"
-            ]
+            ["curl-x86-64-test", "libressl-x86-64-test", "zlib-x86-64"]
         );
+    }
+
+    #[test]
+    fn debian_runtime_replaces_the_source_bootstrap() {
+        assert!(lookup("gcc-runtime-stage1").is_none());
+        for (stem, kind) in [("glibc-x86-64", "glibc-v2"), ("gcc-runtime", "gcc-v1")] {
+            let recipe = lookup(stem).unwrap();
+            assert!(recipe.build_root);
+            assert!(recipe.source_input.is_none());
+            assert!(recipe.native_inputs.is_none());
+            assert!(
+                matches!(recipe.steps.as_deref(), Some([crate::types::Step::DebianRuntime { kind: actual }]) if actual == kind)
+            );
+        }
+        for key in [
+            "gcc-14-source",
+            "glibc-241-source",
+            "gmp63",
+            "mpfr421",
+            "mpc131",
+        ] {
+            assert!(crate::source_pins::all().iter().all(|pin| pin.key != key));
+        }
     }
 
     #[test]
@@ -514,7 +532,7 @@ mod tests {
         for &(stem, _) in td_engine::target_profile::ASSEMBLY_EXCEPTIONS {
             let recipe = lookup(stem)
                 .unwrap_or_else(|| panic!("assembly exception names missing recipe {stem}"));
-            if matches!(stem, "gcc-runtime-stage1" | "rust-toolchain") {
+            if matches!(stem, "glibc-x86-64" | "gcc-runtime" | "rust-toolchain") {
                 continue;
             }
             let generic_cargo_split =
@@ -531,15 +549,6 @@ mod tests {
             );
         }
 
-        // gcc-runtime-stage1 is build-only provenance for the libgcc objects
-        // glibc links, and rust-toolchain is the prebuilt std every Rust
-        // output links. They need no companions of their own, but the marker
-        // on each split consumer must name the actual source.
-        assert!(
-            td_engine::target_profile::output_assembly_exceptions("glibc-x86-64")
-                .iter()
-                .any(|(source, _)| *source == "gcc-runtime-stage1")
-        );
         assert!(
             td_engine::target_profile::output_assembly_exceptions("td-util")
                 .iter()
@@ -716,8 +725,8 @@ mod tests {
     }
 
     /// A build-root C recipe that splits companions links code that ships,
-    /// and takes its start files and libgcc from gcc-runtime, or, for glibc,
-    /// from gcc-runtime-stage1; the profiler's boundary lists name exactly
+    /// and takes its start files and libgcc from gcc-runtime;
+    /// the profiler's boundary lists name exactly
     /// those recipes. Direct Rust recipes, td-link's own aside, are
     /// `RUST_PROFILED_RECIPES`' to name.
     #[test]
@@ -739,7 +748,6 @@ mod tests {
             .collect();
         linked.sort_unstable();
         let mut expected = td_engine::target_profile::BUILD_ROOT_LINKED.to_vec();
-        expected.push(td_engine::target_profile::BUILD_ROOT_STAGE1_LINKED);
         expected.sort_unstable();
         assert_eq!(linked, expected);
     }
@@ -778,9 +786,7 @@ mod tests {
 
     #[test]
     fn source_built_runtime_toolchain_keeps_frames_lines_ids_and_remapped_paths() {
-        for (stem, expected_tail_uses) in
-            [("gcc-runtime", 0), ("glibc-x86-64", 1), ("zlib-x86-64", 1)]
-        {
+        for (stem, expected_tail_uses) in [("zlib-x86-64", 1)] {
             let recipe = lookup(stem).unwrap_or_else(|| panic!("missing target recipe {stem}"));
             let json = recipe.to_json().to_canonical();
             for required in [

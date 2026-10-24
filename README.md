@@ -13,8 +13,9 @@ build, and nothing in the root is mutable.
 - **Immutable** — the root filesystem is a read-only erofs image. `/bin`
   is a pure symlink farm into `/td/store`; there is no `/usr` or `/sbin`.
   `/var` is persistent Btrfs state; `/run` and `/tmp` are volatile tmpfs.
-- **Built from source** — glibc, libgcc, the kernel and every C library td
-  ships compile from pinned sources in a pinned Debian build root; Rust is
+- **Pinned build inputs** — the kernel and application libraries compile
+  from pinned sources in a pinned Debian build root. glibc and libgcc are
+  imported from that root without compilation; Rust is
   upstream's pinned 1.96.0 release, retargeted onto td's glibc. Host
   `/bin`, `/usr`, and ambient `PATH` never enter a build. (Those two
   downloaded trust roots, the Rust release and the Debian build root, are

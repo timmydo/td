@@ -62,8 +62,9 @@ target distribution artifact graph.
 
 td has three trust zones. Zone one is the target artifact graph, built from
 pinned sources by the Debian build root's and the upstream Rust toolchain's
-compilers. Zone two is the host control plane that evaluates and builds that
-graph but never enters it. Zone three is each marked foreign prebuilt
+compilers, with imported Debian glibc and libgcc. Zone two is the host control
+plane that evaluates and builds that graph but never enters it. Zone three is
+each marked foreign prebuilt
 application payload. A zone-three payload may live in `/td/store` and ship in
 the image, but it is never a tool, compilation input, or execution input to a
 source-built output. Only the explicit read-only `payload_inputs` channel may
@@ -91,19 +92,20 @@ the distribution closure.
 ## Target artifact graph
 
 The target graph builds directly into `/td/store` from pinned upstream
-sources with two build-tool trust roots, the pinned Debian build root and the
-upstream Rust toolchain (both below):
+sources and imported runtimes. Its trust roots are the pinned Debian build
+root (including its reviewed runtime exports) and the upstream Rust
+toolchain (both below):
 
 ```text
 pinned sources, in the Debian build root
-  -> td glibc, gcc-runtime's libgcc, the kernel, C libraries and td-link
+  -> imported Debian glibc and libgcc, the kernel, C libraries and td-link
   -> upstream Rust toolchain, retargeted onto td glibc
   -> target-built td control plane, tools, and Rust userland -> image
 ```
 
 No compiler in this graph is source-bootstrapped: the build root's GCC and
-binutils and the toolchain's rustc and LLVM compile every output, and the
-closure query's provenance claim (`APPLICATIONS.md` §B.8) names them as
+binutils and the toolchain's rustc and LLVM compile the source-built outputs;
+glibc and libgcc are imported prebuilt. The closure query's provenance claim (`APPLICATIONS.md` §B.8) names them as
 trust roots wherever they reach.
 What td establishes is that nothing undeclared enters a build. Recipe steps
 may execute only unmarked outputs of earlier recipes, executables created by
@@ -119,8 +121,8 @@ dependency.
 ## Foreign application payloads
 
 td's target graph contains no foreign binary other than the Debian build
-root's tools, the upstream Rust toolchain and the non-executable pinned
-upstream data below. A third-party application is a marked foreign prebuilt
+root's tools and reviewed runtime exports, the upstream Rust toolchain and
+the non-executable pinned upstream data below. A third-party application is a marked foreign prebuilt
 payload in `/td/store`, not a build-tool trust root. The mark is load-bearing:
 
 - ordinary input channels refuse it; only `payload_inputs` may carry it as
@@ -201,15 +203,23 @@ and the rest, with writable scratch where the minimal root had it
   no data, is judged by the runtime it pairs with), or a symlink to an
   absolute path outside the store.
 
-What td does not enforce: static objects of the root's (`crt*.o`,
-`libgcc.a`, `libc.a`) linked into an output are indistinguishable from
-compiled source, and the root carries no mark that propagates to outputs
-or to recipes that later use them. Recipes in the root must therefore link
-only against td-built libraries or none, which their review and their own
-checks establish. A provenance claim names the root as a build-tool trust
-root, as it names the upstream Rust toolchain, for every output whose
-build closure includes a root-built output. td glibc is itself root-built,
-so that is every output that links it.
+The `glibc-x86-64` and `gcc-runtime` recipes import a reviewed subset of
+that root into normal store outputs: Debian's glibc libraries, headers,
+startup objects and timezone tools, and its libgcc libraries and GCC startup
+objects. They compile nothing. `debianRuntime` names a versioned transform;
+its compiled file roster selects the bytes, normalizes the multiarch layout,
+rewrites libc/libm linker scripts and retargets ELF interpreters to the store.
+Changing the transform or roster requires advancing its version token.
+No package maintainer script runs. These are unmarked upstream runtime trust
+roots, not application payloads. The closure query names each with
+`upstream-runtime\tdebian\t<recipe>` alongside its build-root provenance.
+
+Other recipes link only against these declared store libraries and their
+own declared inputs, never ambient build-root libraries. Static objects
+cannot be distinguished after linking, so their link-map checks establish
+that boundary. The imported libraries and their code inside static outputs
+are profiler coverage boundaries, not source-built or frame-pointer claims.
+The source GCC/glibc bootstrap and its source pins are absent.
 
 Changing the root's packages is a reviewed lock change.
 
@@ -271,14 +281,16 @@ compiler.
 ## Target user-mode profiling contract
 
 Every source-built user-mode artifact that ships and can appear in a runtime
-stack keeps frame pointers. This includes td glibc, libgcc, the source-built
+stack keeps frame pointers. This includes the source-built
 libraries and userland closure; td-owned programs, dependency crates, and
 native objects compiled by Cargo build scripts. The upstream Rust toolchain is
 not source-built: its own objects carry no debug companions, and the prebuilt
 standard library every Rust output links keeps frame pointers in only part of
-its code; `td-profiler/DESIGN.md` names both as coverage boundaries. It is one
-target-wide policy, not a per-recipe release-profile choice. A recipe may not
-weaken it without amending this contract and `td-profiler/DESIGN.md`.
+its code; `td-profiler/DESIGN.md` names both as coverage boundaries. Debian
+glibc and libgcc likewise retain upstream coverage: their shared objects
+have no td companions and their static code is named in every affected
+output's coverage marker. It is one target-wide policy, not a per-recipe
+release-profile choice. A recipe may not weaken it without amending this contract and `td-profiler/DESIGN.md`.
 
 Every such ELF also has a deterministic debug companion in the same recipe
 output and system image. A companion carries the ordinary symbol table and no

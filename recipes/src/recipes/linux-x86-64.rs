@@ -80,7 +80,7 @@ pub fn recipe() -> Recipe {
     // A recipe's own source lands in TD_INPUT_MAP under the LOCAL name `{name}-source`
     // (`linux-x86-64-source`), synthesized from the recipe NAME — NOT under its
     // `sourceInput` PIN KEY. When the two differ (this recipe renames the shared
-    // `linux-kernel-source` pin locally, as gcc-runtime renames `gcc-14-source`),
+    // `linux-kernel-source` pin locally),
     // steps MUST reference
     // the local `{in:linux-x86-64-source}`; `{in:linux-kernel-source}` is not a map key
     // and expands to nothing ("no input `linux-kernel-source' in TD_INPUT_MAP"). The

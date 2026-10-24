@@ -981,7 +981,7 @@ needed by the crypto provider (the pinned Debian build root's), and their
 source/artifact checksums and provenance.
 Provision them before offline builds; ambient host tools cannot silently fill
 missing inputs. M03b2 owns these exact pins and a clean build fixture. This
-portability workflow is outside td's source-built glibc target artifact graph;
+portability workflow is outside td's Debian-runtime target artifact graph;
 it must not import host-built outputs into that graph or claim its provenance.
 
 Core adapters provide typed errors and caller-owned buffers for transport,

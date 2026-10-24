@@ -181,7 +181,7 @@ mod tests {
     fn compiled_table_parses_and_pins_the_special_seeds() {
         let rows = rows().unwrap();
         assert!(!rows.is_empty(), "compiled table must not be empty");
-        for key in ["linux-headers-x86-64", "gcc-14-source", "glibc-241-source"] {
+        for key in ["linux-headers-x86-64"] {
             assert!(
                 rows.iter().any(|(k, _)| *k == key),
                 "compiled table must pin `{key}'"

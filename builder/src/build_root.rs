@@ -1,6 +1,6 @@
 //! build_root — the Debian build root (AGENTS.md, "Debian build root").
 //!
-//! A C build environment, never a source of shipped bytes: the lock's pinned
+//! A C build environment and the source of the reviewed Debian runtime exports: the lock's pinned
 //! Debian image layer with its .debs unpacked over it in lock order,
 //! assembled into one input-addressed store path and mounted read-only as
 //! `/` for a recipe that declares `buildRoot` (sandbox.rs). The lock pins

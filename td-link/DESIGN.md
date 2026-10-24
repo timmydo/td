@@ -8,6 +8,11 @@ line rustc writes, adds td glibc's and gcc-runtime's start files, search
 paths and loader, and runs the upstream toolchain's `rust-lld` in its GNU
 flavor. No GCC or binutils is involved in a link it drives.
 
+The `glibc-x86-64` and `gcc-runtime` inputs are normalized imports from
+the pinned Debian build root, not td source builds. Their static code and
+shared libraries retain Debian's profiling coverage. Here "td glibc" means
+that declared store layout, not compiler provenance.
+
 ## Configuration
 
 The target recipe compiles three store paths into the driver: the
@@ -135,7 +140,7 @@ The `td-link` recipe builds in the Debian build root. A throwaway first
 stage is linked by the root's GCC with td glibc's and gcc-runtime's start
 files; it links the shipped driver, which then links itself again, and
 the two must be byte-identical. The linked bytes are rust-lld's, driven
-by td-link's own logic, with no object of the root's in them; that the
+by td-link's own logic, with only the declared imported Debian runtime objects, not ambient root libraries; that the
 second and third stages agree shows the root's GCC left no trace in the
 driver's behaviour. The root's `objcopy` then splits the static
 ET_EXEC's debug companion and strips the shipped file, as it does for

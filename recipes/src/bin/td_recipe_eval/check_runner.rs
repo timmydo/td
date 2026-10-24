@@ -5801,7 +5801,9 @@ fn visit_step_templates(
         }
         // These are validated manifest values, not templates. The builder
         // resolves `runtime` only through TD_PAYLOAD_MAP.
-        Step::ValidateStaticApplication { .. } | Step::ValidateDynamicApplication { .. } => {}
+        Step::DebianRuntime { .. }
+        | Step::ValidateStaticApplication { .. }
+        | Step::ValidateDynamicApplication { .. } => {}
     }
     Ok(())
 }
@@ -5950,12 +5952,14 @@ pub(crate) struct PayloadClosure {
     /// number the claim divides.
     pub(crate) pins: Vec<String>,
     /// Members built in the Debian build root (AGENTS.md "Debian build
-    /// root"), sorted: compiled from source by tools td did not build, so the
-    /// claim names the root as a build-tool trust root for each of them.
+    /// root"), sorted: source-built or imported from the declared root.
+    /// The claim names the root for each and identifies runtime imports below.
     pub(crate) build_root_members: Vec<String>,
     /// Members that are the upstream Rust release (`BuildSystem::RustDist`),
     /// sorted: prebuilt, so the claim names them as a trust root.
     pub(crate) upstream_rust_members: Vec<String>,
+    /// Members imported from Debian by a reviewed typed runtime transform.
+    pub(crate) debian_runtime_members: Vec<String>,
 }
 
 impl PayloadClosure {
@@ -5990,7 +5994,7 @@ impl PayloadClosure {
     }
 
     /// One `build-root	debian	<stem>` line per member built in the root,
-    /// then one `upstream-rust	dist	<stem>` line per prebuilt Rust member.
+    /// then the upstream Rust and Debian runtime members.
     pub(crate) fn trust_root_lines(&self) -> String {
         let root = self
             .build_root_members
@@ -6000,7 +6004,11 @@ impl PayloadClosure {
             .upstream_rust_members
             .iter()
             .map(|stem| format!("upstream-rust\tdist\t{stem}\n"));
-        root.chain(rust).collect()
+        let runtime = self
+            .debian_runtime_members
+            .iter()
+            .map(|stem| format!("upstream-runtime\tdebian\t{stem}\n"));
+        root.chain(rust).chain(runtime).collect()
     }
 }
 
@@ -6262,7 +6270,18 @@ fn contains_payloads(
     let mut pins = Vec::new();
     let mut build_root_members = Vec::new();
     let mut upstream_rust_members = Vec::new();
+    let mut debian_runtime_members = Vec::new();
     for node in nodes {
+        if node
+            .recipe
+            .steps
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|step| matches!(step, td_recipe::types::Step::DebianRuntime { .. }))
+        {
+            debian_runtime_members.push(node.stem.clone());
+        }
         if node.recipe.is_foreign() {
             foreign_members.push(node.stem.clone());
         }
@@ -6295,6 +6314,8 @@ fn contains_payloads(
     pins.dedup();
     build_root_members.sort();
     build_root_members.dedup();
+    debian_runtime_members.sort();
+    debian_runtime_members.dedup();
     upstream_rust_members.sort();
     upstream_rust_members.dedup();
     PayloadClosure {
@@ -6308,6 +6329,7 @@ fn contains_payloads(
         pins,
         build_root_members,
         upstream_rust_members,
+        debian_runtime_members,
     }
 }
 
@@ -8403,8 +8425,8 @@ mod tests {
             ["claude".to_string(), "firefox".to_string()]
         );
         assert!(answer.pins.is_empty());
-        // The members built in the Debian build root: the kernel, glibc and
-        // the static libgcc it links, the upstream toolchain's runtime,
+        // Members built in or imported from Debian: the kernel, glibc and
+        // libgcc, the upstream toolchain's runtime,
         // zlib, cryptsetup with its libraries, OpenSSH, Git with curl and
         // LibreSSL, and every Rust recipe: td-link, whose throwaway first
         // stage the root's GCC links, each Cargo recipe, whose build
@@ -8417,7 +8439,6 @@ mod tests {
                 "curl-x86-64",
                 "fd",
                 "gcc-runtime",
-                "gcc-runtime-stage1",
                 "git-x86-64",
                 "glibc-x86-64",
                 "json-c-x86-64",
@@ -8471,6 +8492,13 @@ mod tests {
             ]
         );
         assert_eq!(answer.upstream_rust_members, ["rust-toolchain"]);
+        assert_eq!(
+            answer.debian_runtime_members,
+            ["gcc-runtime", "glibc-x86-64"]
+        );
+        assert!(answer.trust_root_lines().ends_with(
+            "upstream-runtime\tdebian\tgcc-runtime\nupstream-runtime\tdebian\tglibc-x86-64\n"
+        ));
     }
 
     /// A fake `cargo` at `path`: `body` runs with the real cargo's argv, so a test

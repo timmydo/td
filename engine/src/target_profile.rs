@@ -67,19 +67,19 @@ pub fn direct_rustc_args(build_root: &str, source_root: &str) -> Vec<String> {
         .collect()
 }
 
-/// Reviewed source classes whose hand-written assembly is not certified to
-/// preserve an x86-64 frame chain. Compiler-generated functions around them
-/// still use the global policy; samples entering one of these ranges are an
+/// Reviewed prebuilt-code and assembly classes without certified frame chains.
+/// Source-built compiler-generated functions around them use the global policy;
+/// samples entering one of these ranges are an
 /// explicit coverage boundary rather than silently trusted unwinds.
 pub const ASSEMBLY_EXCEPTIONS: &[(&str, &str)] = &[
-    ("glibc-x86-64", "upstream glibc sysdeps/x86_64 assembly"),
-    // The static libgcc glibc links, built in the Debian build root.
     (
-        "gcc-runtime-stage1",
-        "upstream stage1 GCC libgcc x86_64 assembly",
+        "glibc-x86-64",
+        "Debian prebuilt glibc; frame pointers and symbols not guaranteed",
     ),
-    // libgcc built in the Debian build root.
-    ("gcc-runtime", "upstream GCC libgcc x86_64 assembly"),
+    (
+        "gcc-runtime",
+        "Debian prebuilt libgcc and startup objects; frame pointers and symbols not guaranteed",
+    ),
     // Every Rust output links upstream's prebuilt std, whose frame pointers
     // are incomplete, and its compiler-runtime assembly.
     (
@@ -148,7 +148,6 @@ pub const RUST_PROFILED_RECIPES: &[&str] = &[
 /// Build-root outputs that link gcc-runtime's start files and libgcc in
 /// place of GCC's.
 pub const BUILD_ROOT_LINKED: &[&str] = &[
-    "gcc-runtime",
     "zlib-x86-64",
     "cryptsetup-x86-64",
     "openssh-x86-64",
@@ -156,13 +155,9 @@ pub const BUILD_ROOT_LINKED: &[&str] = &[
     "td-link",
 ];
 
-/// The build-root output that links gcc-runtime-stage1's start files and
-/// libgcc instead: glibc, which gcc-runtime is built against.
-pub const BUILD_ROOT_STAGE1_LINKED: &str = "glibc-x86-64";
-
 /// Conservative transitive assembly boundaries for a linked output. Every
 /// split target may contain glibc startup code; one linked in the build root
-/// or by td-link also contains gcc-runtime's libgcc, glibc gcc-runtime-stage1's,
+/// or by td-link also contains gcc-runtime's libgcc,
 /// and Rust outputs the standard library and compiler runtime.
 pub fn output_assembly_exceptions(recipe: &str) -> Vec<(&'static str, &'static str)> {
     ASSEMBLY_EXCEPTIONS
@@ -170,7 +165,6 @@ pub fn output_assembly_exceptions(recipe: &str) -> Vec<(&'static str, &'static s
         .copied()
         .filter(|(source, _)| {
             *source == "glibc-x86-64"
-                || (*source == "gcc-runtime-stage1" && recipe == BUILD_ROOT_STAGE1_LINKED)
                 // Build-root C and every Rust output, which td-link links,
                 // take gcc-runtime's start files and libgcc, not GCC's.
                 || (*source == "gcc-runtime"
@@ -186,7 +180,7 @@ pub fn output_assembly_exceptions(recipe: &str) -> Vec<(&'static str, &'static s
 /// Hash-visible producer policy for every recipe which creates debug
 /// companions. The control-plane builder has a stable ABI identity, so a
 /// semantic splitter change must move this token to re-key realized outputs.
-pub const DEBUG_COMPANION_POLICY: &str = "symbols-v1";
+pub const DEBUG_COMPANION_POLICY: &str = "symbols-v2";
 
 /// The shipped image's 128-MiB companion budget, measured over the whole
 /// deployment rather than by any one producer.
@@ -240,7 +234,7 @@ mod tests {
         assert!(PRUNED_DEBUG_SECTIONS
             .iter()
             .all(|section| section.starts_with(".debug_") || *section == ".gdb_index"));
-        assert_eq!(DEBUG_COMPANION_POLICY, "symbols-v1");
+        assert_eq!(DEBUG_COMPANION_POLICY, "symbols-v2");
     }
 
     #[test]
@@ -291,12 +285,8 @@ mod tests {
         assert_eq!(
             ASSEMBLY_EXCEPTIONS,
             [
-                ("glibc-x86-64", "upstream glibc sysdeps/x86_64 assembly"),
-                (
-                    "gcc-runtime-stage1",
-                    "upstream stage1 GCC libgcc x86_64 assembly"
-                ),
-                ("gcc-runtime", "upstream GCC libgcc x86_64 assembly"),
+                ("glibc-x86-64", "Debian prebuilt glibc; frame pointers and symbols not guaranteed"),
+                ("gcc-runtime", "Debian prebuilt libgcc and startup objects; frame pointers and symbols not guaranteed"),
                 (
                     "rust-toolchain",
                     "upstream Rust 1.96.0 prebuilt standard library and compiler-runtime"
@@ -307,14 +297,17 @@ mod tests {
         // The toolchain is the boundary's source, not one of its outputs.
         assert_eq!(
             output_assembly_exceptions("rust-toolchain"),
-            vec![("glibc-x86-64", "upstream glibc sysdeps/x86_64 assembly")]
+            vec![(
+                "glibc-x86-64",
+                "Debian prebuilt glibc; frame pointers and symbols not guaranteed"
+            )]
         );
         assert_eq!(DEPLOYMENT_DEBUG_CEILING_BYTES, 134_217_728);
         assert_eq!(
             output_assembly_exceptions("td-boot"),
             vec![
-                ("glibc-x86-64", "upstream glibc sysdeps/x86_64 assembly"),
-                ("gcc-runtime", "upstream GCC libgcc x86_64 assembly"),
+                ("glibc-x86-64", "Debian prebuilt glibc; frame pointers and symbols not guaranteed"),
+                ("gcc-runtime", "Debian prebuilt libgcc and startup objects; frame pointers and symbols not guaranteed"),
                 (
                     "rust-toolchain",
                     "upstream Rust 1.96.0 prebuilt standard library and compiler-runtime"
@@ -324,8 +317,8 @@ mod tests {
         assert_eq!(
             output_assembly_exceptions("td-net"),
             vec![
-                ("glibc-x86-64", "upstream glibc sysdeps/x86_64 assembly"),
-                ("gcc-runtime", "upstream GCC libgcc x86_64 assembly"),
+                ("glibc-x86-64", "Debian prebuilt glibc; frame pointers and symbols not guaranteed"),
+                ("gcc-runtime", "Debian prebuilt libgcc and startup objects; frame pointers and symbols not guaranteed"),
                 (
                     "rust-toolchain",
                     "upstream Rust 1.96.0 prebuilt standard library and compiler-runtime"
@@ -339,8 +332,8 @@ mod tests {
             assert_eq!(
                 output_assembly_exceptions(application),
                 vec![
-                    ("glibc-x86-64", "upstream glibc sysdeps/x86_64 assembly"),
-                    ("gcc-runtime", "upstream GCC libgcc x86_64 assembly"),
+                    ("glibc-x86-64", "Debian prebuilt glibc; frame pointers and symbols not guaranteed"),
+                    ("gcc-runtime", "Debian prebuilt libgcc and startup objects; frame pointers and symbols not guaranteed"),
                     (
                         "rust-toolchain",
                         "upstream Rust 1.96.0 prebuilt standard library and compiler-runtime"
@@ -354,20 +347,17 @@ mod tests {
             .any(|(source, _)| *source == "td-net"));
         assert_eq!(
             output_assembly_exceptions("glibc-x86-64"),
-            vec![
-                ("glibc-x86-64", "upstream glibc sysdeps/x86_64 assembly"),
-                (
-                    "gcc-runtime-stage1",
-                    "upstream stage1 GCC libgcc x86_64 assembly"
-                ),
-            ]
+            vec![(
+                "glibc-x86-64",
+                "Debian prebuilt glibc; frame pointers and symbols not guaranteed"
+            ),]
         );
         // td-link builds in the root and is a Rust output.
         assert_eq!(
             output_assembly_exceptions("td-link"),
             vec![
-                ("glibc-x86-64", "upstream glibc sysdeps/x86_64 assembly"),
-                ("gcc-runtime", "upstream GCC libgcc x86_64 assembly"),
+                ("glibc-x86-64", "Debian prebuilt glibc; frame pointers and symbols not guaranteed"),
+                ("gcc-runtime", "Debian prebuilt libgcc and startup objects; frame pointers and symbols not guaranteed"),
                 (
                     "rust-toolchain",
                     "upstream Rust 1.96.0 prebuilt standard library and compiler-runtime"
@@ -381,8 +371,8 @@ mod tests {
             assert_eq!(
                 output_assembly_exceptions(stem),
                 vec![
-                    ("glibc-x86-64", "upstream glibc sysdeps/x86_64 assembly"),
-                    ("gcc-runtime", "upstream GCC libgcc x86_64 assembly"),
+                    ("glibc-x86-64", "Debian prebuilt glibc; frame pointers and symbols not guaranteed"),
+                    ("gcc-runtime", "Debian prebuilt libgcc and startup objects; frame pointers and symbols not guaranteed"),
                 ],
                 "{stem}"
             );

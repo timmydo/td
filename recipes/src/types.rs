@@ -72,6 +72,10 @@ impl BuildSystem {
 /// An unknown token is a hard error at execution.
 #[derive(Clone)]
 pub enum Step {
+    /// Import the pinned Debian root's reviewed libc or GCC runtime files.
+    DebianRuntime {
+        kind: String,
+    },
     /// Spawn argv[0] with argv[1..]; env EXACTLY as given (cleared otherwise —
     /// the chain's `env -i` + MAKEFLAGS= scrubbing, as engine policy); cwd=dir.
     Run {
@@ -405,6 +409,9 @@ impl Step {
                     ("dest".into(), Json::Str(dest.clone())),
                 ]),
             )]),
+            Step::DebianRuntime { kind } => {
+                Json::Obj(vec![("debianRuntime".into(), Json::Str(kind.clone()))])
+            }
             Step::CopyTree { from, dest } => Json::Obj(vec![(
                 "copyTree".into(),
                 Json::Obj(vec![
@@ -931,7 +938,7 @@ pub struct Recipe {
     /// that resolves to this recipe's OWN `<name>-source` lock entry (#429) —
     /// distinct from `source` (an actual declared upstream fetch): a recipe's
     /// source may be a pinned tarball interned under another name (e.g.
-    /// gcc-runtime builds from the map key `gcc-14-source`), so this names
+    /// linux-x86-64 builds from the map key `linux-kernel-source`), so this names
     /// which interned entry to alias in. `None` means the recipe has no source
     /// of its own (e.g. a test that only RUNS a sibling's output) — the
     /// synthesizer then emits no `<name>-source` line at all.
