@@ -148,16 +148,20 @@ impl Worker<'_, '_> {
         expiry_turn: Option<&mut multi::ExpiryTurn>,
         mut buffers: Buffers,
     ) -> Result<Buffers, Error> {
+        state.active = database(worker.pending.identity())?.is_some();
         settle(worker, settlement, control)?;
         if Instant::now() >= state.notice_at {
             let _slot = database(worker.connection.slots.acquire())?;
-            if let Err(error) = crate::postgres_failure_notice::publish_next(
+            let notice = crate::postgres_failure_notice::publish_next(
                 self.request,
                 self.trust,
                 Instant::now() + Duration::from_secs(5),
                 claim,
                 generation,
-            ) {
+            );
+            state.active |= notice.as_ref().is_ok_and(|published| *published);
+            if let Err(error) = notice {
+                state.active = true;
                 control.log(
                     crate::observability::Kind::DeliveryNoticeDeferred { error },
                     None,
@@ -175,6 +179,7 @@ impl Worker<'_, '_> {
             state.notice_at = Instant::now() + Duration::from_secs(5);
         }
         if let Some(request) = self.queue.repair_request().filter(|_| !state.repaired) {
+            state.active = true;
             let needed = database(crate::postgres_route_repair::needed(
                 self.request,
                 self.trust,
@@ -218,6 +223,7 @@ impl Worker<'_, '_> {
             cap,
             &mut meter(cap),
         ))?;
+        state.active |= !expiry.candidates.is_empty();
         let sample = Time {
             utc_ms: expiry.observed_at,
             monotonic: self.clock.sample()?.monotonic,
@@ -263,6 +269,7 @@ impl Worker<'_, '_> {
             claim,
             generation,
         ))? {
+            state.active = true;
             let value = database(if prior == generation {
                 recovery::interrupted(claim, generation, id)
             } else {
@@ -292,6 +299,7 @@ impl Worker<'_, '_> {
             }
             Err(_) => return Err(Error::Database),
         };
+        state.active |= !page.candidates.is_empty();
         let status = database(worker.guard.lock().map_err(|_| Error::Custody))?
             .observe(Time {
                 utc_ms: page.observed_at,

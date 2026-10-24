@@ -4,8 +4,26 @@ use std::sync::Condvar;
 
 pub(super) struct AccountState {
     pub retry: bool,
+    pub active: bool,
     pub notice_at: Instant,
     pub repaired: bool,
+}
+// Only a complete empty pass increases the wait; no lease or custody lives here.
+struct IdlePause(Duration);
+impl IdlePause {
+    fn new() -> Self {
+        Self(Duration::from_millis(250))
+    }
+    fn after_round(&mut self, active: bool) -> Duration {
+        if active {
+            self.0 = Duration::from_millis(250);
+        }
+        let pause = self.0;
+        if !active {
+            self.0 = self.0.saturating_mul(2).min(Duration::from_secs(2));
+        }
+        pause
+    }
 }
 // Hold the next account's place across a shared expiry rate-limit refusal.
 pub(super) struct ExpiryTurn {
@@ -205,6 +223,7 @@ pub(super) fn run(
         });
         states.push(AccountState {
             retry: false,
+            active: false,
             notice_at: Instant::now(),
             repaired: false,
         });
@@ -249,6 +268,8 @@ pub(super) fn run(
     };
     let mut buffers = (Box::new([0; TLS_WIRE_BYTES]), Box::new([0; TLS_WIRE_BYTES]));
     let mut repairing = None;
+    let mut idle = IdlePause::new();
+    let mut active_round = false;
     let mut expiry_turn = ExpiryTurn { cursor: 0, count };
     let result = std::thread::scope(|scope| {
         let renew = std::thread::Builder::new()
@@ -282,6 +303,7 @@ pub(super) fn run(
                         expiry_turn.current(cursor).then_some(&mut expiry_turn),
                         buffers,
                     )?;
+                    active_round |= state.active;
                     if let Some(request) =
                         repairing.filter(|_| states.iter().all(|state| state.repaired))
                     {
@@ -293,7 +315,8 @@ pub(super) fn run(
                 cursor = (cursor + 1) % count;
                 // One bounded foreground turn per account, including Busy.
                 if cursor == 0 {
-                    pause(control, Duration::from_millis(250));
+                    pause(control, idle.after_round(active_round));
+                    active_round = false;
                 }
             }
             Ok(())
@@ -331,6 +354,31 @@ fn leases(
 mod tests {
     use super::*;
     use crate::ports::Tick;
+
+    #[test]
+    fn empty_rounds_bound_scan_rate_and_activity_restores_prompt_polling() {
+        let mut idle = IdlePause::new();
+        let mut elapsed = Duration::ZERO;
+        let mut scans = 0;
+        while elapsed < Duration::from_secs(60) {
+            let pause = idle.after_round(false);
+            assert!(pause <= Duration::from_secs(2));
+            elapsed += pause;
+            scans += 1;
+        }
+        assert!(
+            scans <= 34,
+            "idle queue scanned {scans} times in one minute"
+        );
+        // Activity in any account restores the ordinary whole-pass wait.
+        for _ in 0..10 {
+            assert_eq!(idle.after_round(true), Duration::from_millis(250));
+        }
+        assert_eq!(idle.after_round(false), Duration::from_millis(250));
+        assert_eq!(idle.after_round(false), Duration::from_millis(500));
+        assert_eq!(idle.after_round(false), Duration::from_secs(1));
+        assert_eq!(idle.after_round(false), Duration::from_secs(2));
+    }
 
     #[test]
     fn competing_expiry_backlogs_alternate_across_rate_limits() {

@@ -6543,8 +6543,15 @@ repeatedly consuming the shared expiry allowance ahead of later accounts.
 Each turn settles prior custody, checks periodic local failure notices and
 explicit repair work, checks expiry and interrupted attempts, and selects at
 most one SMTP attempt. Fresh/retry selection alternates independently for each
-account. Busy leases and paused routes advance the cursor; one 250-ms idle
-pause follows a complete pass. An SMTP attempt retains its existing 120-second
+account. Busy leases and paused routes advance the cursor. A complete empty
+pass backs off its following pause from 250 ms through 500 ms and one second
+to a two-second cap. Any observed candidate, interrupted attempt, pending
+settlement, explicit repair, published notice or notice failure restores the
+250-ms pause for that pass. This is a polling hint, never cached queue absence
+or delivery authority. Fresh/retry alternation can require two idle passes
+to discover newly queued work; database work and other accounts add latency.
+Lease renewal keeps its independent five-second schedule, and shutdown still
+checks at most every 50 ms during a pause. An SMTP attempt retains its existing 120-second
 bound, so another account may wait behind a slow peer. This is bounded rotation,
 not a per-account latency guarantee. Unsettled publication prevents rotation.
 
