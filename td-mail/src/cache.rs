@@ -125,9 +125,21 @@ impl Cache {
         if emails.is_empty() {
             return;
         }
+        let entries: Vec<_> = emails
+            .iter()
+            .map(|email| {
+                let mut email = email.clone();
+                if email.is_summary() {
+                    if let Some(cached) = self.get_email(&email.id) {
+                        email.retain_cached_body(&cached);
+                    }
+                }
+                (Key::from_str(&email.id), encode(&email))
+            })
+            .collect();
         let mut txn = self.store.write();
-        for email in emails {
-            txn.insert(EMAILS, &Key::from_str(&email.id), &encode(email));
+        for (key, bytes) in entries {
+            txn.insert(EMAILS, &key, &bytes);
         }
         if let Err(e) = txn.commit() {
             log_warn!("[Cache] failed to commit emails: {}", e);
@@ -609,6 +621,43 @@ mod tests {
             attachments: None,
             extra: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn summaries_preserve_loaded_bodies_and_refresh_flags() {
+        let dir = crate::testing::tempdir().unwrap();
+        let _env = crate::testing::env_lock();
+        std::env::set_var("XDG_CACHE_HOME", dir.path());
+        let cache = Cache::open("summaries").unwrap();
+        let mut summary = make_test_email("e1");
+        summary
+            .extra
+            .insert("tdMailSummary".into(), td_json::Json::Bool(true));
+        cache.put_emails(std::slice::from_ref(&summary));
+        assert!(cache.get_email("e1").unwrap().is_summary());
+        let mut full = make_test_email("e1");
+        full.preview = Some("cached body preview".into());
+        full.body_values.insert(
+            "text".into(),
+            crate::jmap::types::BodyValue {
+                value: "complete body".into(),
+                is_encoding_problem: false,
+                is_truncated: false,
+            },
+        );
+        cache.put_emails(&[full]);
+        summary.keywords.insert("$seen".into(), true);
+        summary.mailbox_ids.insert("new-folder".into(), true);
+        cache.put_emails(&[summary]);
+        let loaded = cache.get_email("e1").unwrap();
+        assert!(!loaded.is_summary());
+        assert_eq!(
+            loaded.body_values.get("text").unwrap().value,
+            "complete body"
+        );
+        assert_eq!(loaded.preview.as_deref(), Some("cached body preview"));
+        assert!(loaded.keywords.contains_key("$seen"));
+        assert!(loaded.mailbox_ids.contains_key("new-folder"));
     }
 
     #[test]

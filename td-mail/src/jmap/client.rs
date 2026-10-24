@@ -953,6 +953,19 @@ impl JmapClient {
         ids: &[String],
         extra_properties: &[String],
     ) -> Result<Vec<Email>, JmapError> {
+        self.get_projected_emails(ids, extra_properties, true)
+    }
+
+    pub fn get_email_summaries(&self, ids: &[String]) -> Result<Vec<Email>, JmapError> {
+        self.get_projected_emails(ids, &[], false)
+    }
+
+    fn get_projected_emails(
+        &self,
+        ids: &[String],
+        extra_properties: &[String],
+        bodies: bool,
+    ) -> Result<Vec<Email>, JmapError> {
         let mut properties = vec![
             "id",
             "blobId",
@@ -962,18 +975,22 @@ impl JmapClient {
             "cc",
             "subject",
             "receivedAt",
-            "preview",
-            "textBody",
-            "htmlBody",
-            "bodyValues",
             "keywords",
             "mailboxIds",
-            "attachments",
         ];
+        if bodies {
+            properties.extend([
+                "preview",
+                "textBody",
+                "htmlBody",
+                "bodyValues",
+                "attachments",
+            ]);
+        }
         properties.extend(extra_properties.iter().map(String::as_str));
         let mut emails = Vec::new();
         for chunk in ids.chunks(50) {
-            if let Some(mut batch) = self.read_projection(chunk, &properties, true)? {
+            if let Some(mut batch) = self.read_projection(chunk, &properties, bodies)? {
                 emails.append(&mut batch);
                 continue;
             }
@@ -984,7 +1001,7 @@ impl JmapClient {
             for id in chunk {
                 let one = std::slice::from_ref(id);
                 if chunk.len() > 1 {
-                    if let Some(mut batch) = self.read_projection(one, &properties, true)? {
+                    if let Some(mut batch) = self.read_projection(one, &properties, bodies)? {
                         emails.append(&mut batch);
                         continue;
                     }
@@ -1012,6 +1029,13 @@ impl JmapClient {
                     log_warn!("[JMAP] Message {} has unreadable content", email.id);
                 }
                 emails.append(&mut stored);
+            }
+        }
+        for email in &mut emails {
+            if bodies {
+                email.extra.remove("tdMailSummary");
+            } else {
+                email.extra.insert("tdMailSummary".into(), Json::Bool(true));
             }
         }
         Ok(emails)

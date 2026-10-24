@@ -1006,9 +1006,20 @@ fn handle_offline_command(
             } else if let Some(ref cache) = cache {
                 if let Some(cached_emails) = cache.get_mailbox_emails(mailbox_id) {
                     let loaded = cached_emails.len() as u32;
+                    let emails = if origin.starts_with("cli")
+                        && origin != "cli.summaries"
+                        && cached_emails.iter().any(Email::is_summary)
+                    {
+                        Err(offline_error(
+                            "message bodies not cached; request headers_only for summaries",
+                            reason,
+                        ))
+                    } else {
+                        Ok(cached_emails)
+                    };
                     let _ = resp_tx.send(BackendResponse::Emails {
                         mailbox_id: mailbox_id.clone(),
-                        emails: Ok(cached_emails),
+                        emails,
                         total: None,
                         position: 0,
                         loaded,
@@ -1037,7 +1048,7 @@ fn handle_offline_command(
         }
         BackendCommand::GetEmail { id } => {
             let result = if let Some(ref cache) = cache {
-                if let Some(email) = cache.get_email(id) {
+                if let Some(email) = cache.get_email(id).filter(|email| !email.is_summary()) {
                     log_debug!("[Backend/offline] Cache hit for email {}", id);
                     Ok(email)
                 } else {
@@ -1053,7 +1064,7 @@ fn handle_offline_command(
         }
         BackendCommand::GetEmailForReply { id } => {
             let result = if let Some(ref cache) = cache {
-                if let Some(email) = cache.get_email(id) {
+                if let Some(email) = cache.get_email(id).filter(|email| !email.is_summary()) {
                     Ok(email)
                 } else {
                     Err(offline_error("email not cached", reason))
@@ -1161,7 +1172,12 @@ fn handle_offline_command(
         }
         BackendCommand::QueryThreadEmails { thread_id } => {
             let result = if let Some(cache) = cache {
-                Ok(cache.get_thread_emails(thread_id))
+                let emails = cache.get_thread_emails(thread_id);
+                if emails.iter().any(Email::is_summary) {
+                    Err(offline_error("message bodies not cached", reason))
+                } else {
+                    Ok(emails)
+                }
             } else {
                 Err(offline_error("cache unavailable", reason))
             };
@@ -1977,7 +1993,21 @@ fn backend_loop(
                     let mut emails = if query.ids.is_empty() {
                         Ok(Vec::new())
                     } else {
-                        fetch_emails_chunked(client, &query.ids, &custom_headers)
+                        if (origin == "cli.summaries" || !origin.starts_with("cli"))
+                            && rules.is_empty()
+                        {
+                            let mut summaries = Vec::new();
+                            for chunk in query.ids.chunks(EMAIL_GET_CHUNK_SIZE) {
+                                summaries.extend(
+                                    client
+                                        .get_email_summaries(chunk)
+                                        .map_err(|e| e.to_string())?,
+                                );
+                            }
+                            Ok(summaries)
+                        } else {
+                            fetch_emails_chunked(client, &query.ids, &custom_headers)
+                        }
                     }?;
 
                     // Cache fetched emails
@@ -2180,7 +2210,7 @@ fn backend_loop(
                 let cached_email = cache
                     .as_ref()
                     .and_then(|c| c.get_email(&id))
-                    .filter(|email| !email.is_unreadable());
+                    .filter(|email| !email.is_unreadable() && !email.is_summary());
                 let result = if let Some(email) = cached_email {
                     log_debug!("[Backend] Cache hit for email {}", id);
                     Ok(email)

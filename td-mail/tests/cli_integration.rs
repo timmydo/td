@@ -110,9 +110,17 @@ password_command = "echo test"
     /// td-mail ended and started again with the same configuration,
     /// against the same server and fetch socket.
     fn restart(&mut self) {
+        self.restart_with_offline(false);
+    }
+
+    fn restart_with_offline(&mut self, offline: bool) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let mut child = Command::new(env!("CARGO_BIN_EXE_td-mail"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_td-mail"));
+        if offline {
+            command.arg("--offline");
+        }
+        let mut child = command
             .arg("--cli")
             .arg(format!(
                 "--config={}",
@@ -2124,5 +2132,82 @@ fn test_invalid_filing_id_refuses_before_sending_or_writing_a_record() {
         assert!(h._server.created_emails().is_empty());
         assert!(h._server.submissions().is_empty());
         assert!(!dir.path().join("message.eml.lost").exists());
+    }
+}
+
+#[test]
+fn summary_listing_fetches_body_on_open_and_keeps_it_on_refresh() {
+    let mut h = CliHarness::start();
+    assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
+    let listing =
+        h.send(json!({"command":"query_emails", "mailbox_id":"mbox-inbox", "headers_only":true}));
+    assert!(listing["ok"].is_true(), "{listing}");
+    let calls = h.server().read_calls();
+    assert!(calls.iter().any(|call| call["properties"]
+        .as_array()
+        .is_some_and(|props| props.iter().any(|p| p.as_str() == Some("subject")))));
+    assert!(calls
+        .iter()
+        .all(|call| call["fetchTextBodyValues"].as_bool() != Some(true)));
+    assert!(calls.iter().all(
+        |call| !call["properties"]
+            .as_array()
+            .is_some_and(|props| props.iter().any(|p| matches!(
+                p.as_str(),
+                Some("bodyValues" | "textBody" | "htmlBody" | "preview" | "attachments")
+            )))
+    ));
+    let before = calls.len();
+    let opened = h.send(json!({"command":"get_email", "id":"email-001"}));
+    assert!(opened["ok"].is_true(), "{opened}");
+    assert_ne!(opened["body"].as_str(), Some("(no body)"));
+    assert!(h
+        .server()
+        .read_calls()
+        .get(before..)
+        .unwrap()
+        .iter()
+        .any(|call| call["fetchTextBodyValues"].as_bool() == Some(true)));
+    assert!(h
+        .send(json!({"command":"query_emails", "mailbox_id":"mbox-inbox", "headers_only":true}))
+        ["ok"]
+        .is_true());
+    let before = h.server().read_calls().len();
+    let cached = h.send(json!({"command":"get_email", "id":"email-001"}));
+    assert!(cached["ok"].is_true(), "{cached}");
+    assert_eq!(cached["body"], opened["body"]);
+    assert_eq!(h.server().read_calls().len(), before);
+}
+
+#[test]
+fn offline_summary_cache_does_not_claim_to_contain_message_bodies() {
+    let mut h = CliHarness::start();
+    assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
+    assert!(h
+        .send(json!({"command":"query_emails", "mailbox_id":"mbox-inbox", "headers_only":true}))
+        ["ok"]
+        .is_true());
+    h.restart_with_offline(true);
+    let connected = h.send(json!({"command":"connect", "account":"test"}));
+    assert!(
+        connected["ok"].is_true() && connected["offline"].is_true(),
+        "{connected}"
+    );
+    assert!(h
+        .send(json!({"command":"query_emails", "mailbox_id":"mbox-inbox", "headers_only":true}))
+        ["ok"]
+        .is_true());
+    for command in [
+        json!({"command":"query_emails", "mailbox_id":"mbox-inbox"}),
+        json!({"command":"triage_suggest", "mailbox_id":"mbox-inbox"}),
+        json!({"command":"get_email", "id":"email-001"}),
+        json!({"command":"get_thread", "thread_id":"thread-001"}),
+    ] {
+        let response = h.send(command);
+        assert!(!response["ok"].is_true(), "{response}");
+        assert!(
+            response["error"].as_str().unwrap().contains("cached"),
+            "{response}"
+        );
     }
 }

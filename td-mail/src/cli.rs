@@ -470,7 +470,12 @@ fn cmd_query_emails(state: &mut CliState, input: &Value) -> Value {
         .map(|s| s.to_string());
 
     if let Err(e) = state.send_cmd(BackendCommand::QueryEmails {
-        origin: "cli".to_string(),
+        origin: if input.get("headers_only").and_then(|v| v.as_bool()) == Some(true) {
+            "cli.summaries"
+        } else {
+            "cli"
+        }
+        .to_string(),
         mailbox_id: mailbox_id.clone(),
         page_size: limit,
         position,

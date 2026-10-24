@@ -626,3 +626,13 @@ connection and stops its fetch service when td-mail exits. The option permits
 loopback for this application's requests; certificate verification
 and the account's `tls_ca_file` origin scope still apply. The ordinary
 `~/.local/bin/td-mail` launch keeps the default loopback refusal.
+
+### Uncached mailbox loading
+
+Mailbox lists without automatic rules fetch headers and stored metadata first,
+without downloading previews, MIME part lists or full message bodies. Opening a message fetches its body on demand. Loaded bodies remain cached when
+later summary refreshes update flags and folder membership. Offline lists can
+show cached summaries, but opening a summary whose body was never downloaded
+reports that the message is not cached instead of displaying an empty body.
+Automatic rules retain full-message input; CLI queries retain full bodies unless
+`headers_only` is requested.

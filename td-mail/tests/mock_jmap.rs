@@ -1288,10 +1288,7 @@ impl MockJmapServer {
                             }
                         };
 
-                        if !args["fetchTextBodyValues"].is_true()
-                            && state.lock().unwrap().read_refusal.is_some()
-                        {
-                            let properties = args["properties"].as_array().unwrap();
+                        if let Some(properties) = args["properties"].as_array() {
                             for value in &mut list {
                                 if let Value::Obj(fields) = value {
                                     fields.retain(|(key, _)| {

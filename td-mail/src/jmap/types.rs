@@ -573,6 +573,26 @@ pub struct Email {
 }
 
 impl Email {
+    pub fn is_summary(&self) -> bool {
+        self.extra.get("tdMailSummary").and_then(Json::as_bool) == Some(true)
+    }
+
+    pub fn retain_cached_body(&mut self, cached: &Self) {
+        if !self.is_summary() || cached.is_summary() || cached.is_unreadable() {
+            return;
+        }
+        self.preview = cached.preview.clone();
+        self.text_body = cached.text_body.clone();
+        self.html_body = cached.html_body.clone();
+        self.body_values = cached.body_values.clone();
+        self.attachments = cached.attachments.clone();
+        self.reply_to = cached.reply_to.clone();
+        self.message_id = cached.message_id.clone();
+        self.references = cached.references.clone();
+        self.sent_at = cached.sent_at.clone();
+        self.extra.remove("tdMailSummary");
+    }
+
     pub fn is_unreadable(&self) -> bool {
         self.extra.get("tdMailUnreadable").and_then(Json::as_bool) == Some(true)
     }
