@@ -17,6 +17,13 @@
 //! jobs alone. It exits non-zero on any such complaint, including a table that
 //! yielded no jobs.
 //!
+//! Jobs without an explicit tty get output reopened on a console proven by
+//! a status-line write: /dev/console, then /dev/tty1, then /dev/kmsg. The
+//! selected device reports rejected candidates and their errors. This repairs
+//! stale inherited descriptors and serial consoles that open but return EIO.
+//! Before /dev is mounted, inherited output is retained and the next job retries.
+//! Stdin and explicitly named terminals retain their existing semantics.
+//!
 //! There is no built-in table. A table that will not open, or yields no jobs,
 //! fails the boot: PID 1 reports it and returns, and `main` lets that return
 //! panic the kernel, which td's `panic=-1` turns into a reboot; a pending
@@ -25,7 +32,9 @@
 //! §L.1, L7).
 
 use crate::sys;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Write};
+use std::os::unix::fs::FileTypeExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -83,7 +92,8 @@ impl Action {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
     /// The inittab id field: the terminal this job's stdio is opened on, bare
-    /// (`ttyS0`) or absolute. Empty means inherit init's own stdio.
+    /// (`ttyS0`) or absolute. Empty uses a probed console for output and
+    /// inherits init's stdin.
     pub tty: String,
     pub action: Action,
     pub argv: Vec<String>,
@@ -289,6 +299,51 @@ fn describe(entry: &Entry) -> String {
 /// `O_NOCTTY` — this open must not make the terminal INIT's own.
 const O_NOCTTY: i32 = 0o400;
 
+/// A registered serial console may open successfully but reject writes on
+/// physical hardware. Reopen and test output before giving it to a job; a
+/// successful open alone is not evidence that status messages can be printed.
+const JOB_OUTPUTS: &[&str] = &["/dev/console", "/dev/tty1", "/dev/kmsg"];
+
+fn select_job_output<W: Write>(
+    paths: &[&str],
+    mut open: impl FnMut(&str) -> io::Result<W>,
+) -> Result<W, String> {
+    let mut failures = Vec::new();
+    for path in paths {
+        let result = open(path).and_then(|mut output| {
+            let mut line = format!("init: job output on {path}");
+            if !failures.is_empty() {
+                line.push_str(&format!("; rejected {}", failures.join("; ")));
+            }
+            line.push('\n');
+            output.write_all(line.as_bytes())?;
+            output.flush()?;
+            Ok(output)
+        });
+        match result {
+            Ok(output) => return Ok(output),
+            Err(error) => failures.push(format!("{path}: {error}")),
+        }
+    }
+    Err(format!(
+        "no writable job console ({}); inheriting init's output",
+        failures.join("; ")
+    ))
+}
+
+fn job_output() -> Result<File, String> {
+    select_job_output(JOB_OUTPUTS, |path| {
+        let output = OpenOptions::new()
+            .write(true)
+            .custom_flags(O_NOCTTY)
+            .open(path)?;
+        if !output.metadata()?.file_type().is_char_device() {
+            return Err(io::Error::other("not a character device"));
+        }
+        Ok(output)
+    })
+}
+
 /// Start a job. When the entry names a terminal, the child's stdio is opened on
 /// it — `Stdio::from(File)` is the whole mechanism, so no `dup2` is needed.
 ///
@@ -316,7 +371,20 @@ fn start(entry: &Entry) -> Result<Child, String> {
             cmd.env(key, value);
         }
     }
-    if !entry.tty.is_empty() {
+    if entry.tty.is_empty() {
+        // This also repairs descriptors inherited across switch_root. Before
+        // the first sysinit mounts /dev, none of these nodes may exist yet;
+        // leave that mount job its inherited output and retry for the next.
+        match job_output() {
+            Ok(output) => match output.try_clone() {
+                Ok(errors) => {
+                    cmd.stdout(Stdio::from(output)).stderr(Stdio::from(errors));
+                }
+                Err(error) => log(&format!("duplicate job console: {error}")),
+            },
+            Err(error) => log(&error),
+        }
+    } else {
         let path = if entry.tty.starts_with('/') {
             entry.tty.clone()
         } else {
@@ -555,7 +623,7 @@ fn boot(entries: Vec<Entry>) -> ! {
 ///
 /// Matched anywhere in a word: the splitter groups `cmd>/dev/log` and `a|b`
 /// into ONE word each.
-const METACHARACTERS: [char; 14] = [
+const METACHARACTERS: &[char] = &[
     '>', '<', '|', '&', ';', '(', ')', '$', '`', '*', '?', '[', ']', '~',
 ];
 
@@ -569,8 +637,8 @@ const METACHARACTERS: [char; 14] = [
 /// Each execs the rest of its argv, so step over it and ask again of what is
 /// left. busybox is the same shape with its applet in argv[1].
 fn invokes_a_shell(argv: &[String]) -> bool {
-    const SHELLS: [&str; 5] = ["sh", "bash", "ash", "dash", "td-sh"];
-    const WRAPPERS: [&str; 5] = ["cttyhack", "setsid", "env", "nohup", "chroot"];
+    const SHELLS: &[&str] = &["sh", "bash", "ash", "dash", "td-sh"];
+    const WRAPPERS: &[&str] = &["cttyhack", "setsid", "env", "nohup", "chroot"];
     // `su` runs the target user's login shell whatever else it is given, so it
     // never reaches the wrapper walk below.
     const ALWAYS_A_SHELL: &str = "su";
@@ -1331,5 +1399,94 @@ mod tests {
         assert_eq!(once, vec![(22, "/bin/two".to_string())]);
         collect(&mut [], &mut once, 99, 0);
         assert_eq!(once.len(), 1, "an orphan must not disturb the once table");
+    }
+}
+
+#[cfg(test)]
+mod output_tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    struct Output {
+        bytes: Rc<RefCell<Vec<u8>>>,
+        write_error: bool,
+        flush_error: bool,
+    }
+
+    impl Write for Output {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.write_error {
+                return Err(io::Error::from_raw_os_error(5));
+            }
+            self.bytes.borrow_mut().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            if self.flush_error {
+                Err(io::Error::from_raw_os_error(5))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn an_open_but_unwritable_serial_console_falls_back_and_names_the_error() {
+        let bytes = Rc::new(RefCell::new(Vec::new()));
+        let mut attempted = Vec::new();
+        let result = select_job_output(JOB_OUTPUTS, |path| {
+            attempted.push(path.to_string());
+            Ok(Output {
+                bytes: bytes.clone(),
+                write_error: path == "/dev/console",
+                flush_error: false,
+            })
+        });
+        assert!(result.is_ok());
+        assert_eq!(attempted, ["/dev/console", "/dev/tty1"]);
+        let printed = String::from_utf8_lossy(&bytes.borrow()).into_owned();
+        assert!(printed.contains("init: job output on /dev/tty1"));
+        assert!(printed.contains("rejected /dev/console:"));
+        assert!(printed.contains("os error 5"));
+    }
+
+    #[test]
+    fn a_working_serial_console_is_kept() {
+        let mut attempted = Vec::new();
+        let result = select_job_output(JOB_OUTPUTS, |path| {
+            attempted.push(path.to_string());
+            Ok(Vec::<u8>::new())
+        });
+        assert!(result.is_ok());
+        assert_eq!(attempted, ["/dev/console"]);
+    }
+
+    #[test]
+    fn missing_terminals_and_flush_failures_reach_kmsg() {
+        let mut attempted = Vec::new();
+        let result = select_job_output(JOB_OUTPUTS, |path| {
+            attempted.push(path.to_string());
+            if path == "/dev/console" {
+                return Err(io::Error::from_raw_os_error(2));
+            }
+            Ok(Output {
+                bytes: Rc::new(RefCell::new(Vec::new())),
+                write_error: false,
+                flush_error: path == "/dev/tty1",
+            })
+        });
+        assert!(result.is_ok());
+        assert_eq!(attempted, JOB_OUTPUTS);
+    }
+
+    #[test]
+    fn an_unmounted_dev_does_not_prevent_the_mount_job_from_starting() {
+        let result =
+            select_job_output::<Vec<u8>>(JOB_OUTPUTS, |_| Err(io::Error::from_raw_os_error(2)));
+        assert!(
+            matches!(result, Err(error) if error.contains("inheriting init's output")
+            && JOB_OUTPUTS.iter().all(|path| error.contains(path)))
+        );
     }
 }
