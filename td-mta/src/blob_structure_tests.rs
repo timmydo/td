@@ -748,3 +748,103 @@ fn native_constructor_refuses_extent_outside_pin() {
         ));
     });
 }
+
+#[test]
+fn batched_structure_preserves_tree_and_work_with_fewer_native_checks() {
+    let mut bytes = b"Content-Type: multipart/mixed;boundary=x\r\n\r\n--x\r\nContent-Type: application/octet-stream\r\nContent-Transfer-Encoding: base64\r\n\r\n".to_vec();
+    for _ in 0..2048 {
+        bytes.extend_from_slice(
+            b"QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB\r\n",
+        );
+    }
+    bytes.extend_from_slice(b"!\r\n--x--\r\nepilogue");
+    let run = |batched| {
+        let native = Timer::new();
+        let job = Timer::new();
+        let mut result = None;
+        crate::store_fs::with_pinned_fixture(&bytes, &native, |mut source| {
+            let mut work = meter(capacity());
+            let mut budget = HeaderBudget::new();
+            let mut arena = [0; 1024];
+            let mut body = [0; 4096];
+            let mut parts = [Part::default(); 4];
+            let mut headers = [None; 4];
+            let mut cursor = Cursor::new(
+                &mut source,
+                settings(0, bytes.len()),
+                Buffers {
+                    header_bytes: &mut arena,
+                    body: &mut body,
+                    parts: &mut parts,
+                    headers: &mut headers,
+                },
+                &mut work,
+                &mut budget,
+                Tick(1),
+            )
+            .unwrap();
+            loop {
+                let before = job.calls.load(Ordering::Relaxed);
+                let status = if batched {
+                    cursor.poll_batch(&job).unwrap()
+                } else {
+                    cursor.poll(Tick(1)).unwrap()
+                };
+                assert!(job.calls.load(Ordering::Relaxed) - before <= 65);
+                if status == Status::Complete {
+                    break;
+                }
+            }
+            let retained = cursor.finish(Tick(1)).unwrap();
+            result = Some((
+                retained.parts.to_vec(),
+                retained.header_bytes,
+                retained.work.remaining(),
+                native.calls.load(Ordering::Relaxed),
+            ));
+        });
+        result.unwrap()
+    };
+    let scalar = run(false);
+    let batched = run(true);
+    assert_eq!(batched.0, scalar.0);
+    assert_eq!(batched.1, scalar.1);
+    assert_eq!(batched.2, scalar.2);
+    assert_eq!(batched.0.len(), 2);
+    assert!(batched.3 * 4 < scalar.3, "{} vs {}", batched.3, scalar.3);
+}
+
+#[test]
+fn batched_structure_clock_expiry_is_sticky_inside_the_batch() {
+    let bytes = b"Content-Type: multipart/mixed;boundary=x\n\n--x\n\na\n--x--\nepi";
+    let native = Timer::new();
+    let job = Timer::new();
+    crate::store_fs::with_pinned_fixture(bytes, &native, |mut source| {
+        let mut work = meter(capacity());
+        let mut budget = HeaderBudget::new();
+        let mut arena = [0; 1024];
+        let mut body = [0; 7];
+        let mut parts = [Part::default(); 4];
+        let mut headers = [None; 4];
+        let mut cursor = Cursor::new(
+            &mut source,
+            settings(0, bytes.len()),
+            Buffers {
+                header_bytes: &mut arena,
+                body: &mut body,
+                parts: &mut parts,
+                headers: &mut headers,
+            },
+            &mut work,
+            &mut budget,
+            Tick(1),
+        )
+        .unwrap();
+        job.after(3);
+        let error = cursor.poll_batch(&job).unwrap_err();
+        assert_eq!(job.calls.load(Ordering::Relaxed), 3);
+        assert_eq!(cursor.poll(Tick(1)), Err(error));
+        assert_eq!(cursor.poll_batch(&native), Err(error));
+        assert_eq!(cursor.finish(Tick(1)).err(), Some(error));
+    });
+}

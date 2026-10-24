@@ -290,7 +290,7 @@ fn write_verified_inner(
         now(clock)?,
     )
     .map_err(mime)?;
-    while cursor.poll(now(clock)?).map_err(mime)? != mime_structure::Status::Complete {
+    while cursor.poll_batch(clock).map_err(mime)? != mime_structure::Status::Complete {
         worker.check()?;
     }
     let mut original = cursor.finish(now(clock)?).map_err(mime)?;

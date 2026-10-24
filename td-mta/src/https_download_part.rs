@@ -85,9 +85,7 @@ pub(super) fn prepare(
         clock.sample()?.monotonic,
     )
     .map_err(structure)?;
-    while cursor.poll(clock.sample()?.monotonic).map_err(structure)?
-        != mime_structure::Status::Complete
-    {
+    while cursor.poll_batch(clock).map_err(structure)? != mime_structure::Status::Complete {
         sender.check()?;
     }
     let retained = cursor

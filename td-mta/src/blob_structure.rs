@@ -4,7 +4,7 @@ use crate::{
     admission::work::{Charge, Meter},
     mime_structure::{self, stream, Limits, Part, Status},
     nfc::HeaderBudget,
-    ports::{BlobReader, Error as PolicyError, Tick},
+    ports::{BlobReader, Clock, Error as PolicyError, Tick},
     root_headers,
     store_fs::PinnedBlob,
 };
@@ -98,6 +98,12 @@ impl<'p, 'v, 'c, 'b, 'r, 'o, 'w> Cursor<'p, 'v, 'c, 'b, 'r, 'o, 'w> {
             .ok_or(Error::State)?
             .check_deadline()
             .map_err(Error::Policy)?;
+        self.check_work(now)
+    }
+    fn check_work(&mut self, now: Tick) -> Result<(), Error> {
+        if let Some(reader) = self.reader.as_mut() {
+            return reader.check(now).map_err(Error::from);
+        }
         self.core
             .check_deadline(
                 now,
@@ -105,6 +111,16 @@ impl<'p, 'v, 'c, 'b, 'r, 'o, 'w> Cursor<'p, 'v, 'c, 'b, 'r, 'o, 'w> {
                 self.budget,
             )
             .map_err(Error::from)
+    }
+    fn check_native(&mut self) -> Result<(), Error> {
+        if let Some(source) = self.source.as_deref_mut() {
+            source.check_deadline().map_err(Error::Policy)
+        } else if let Some(reader) = self.reader.as_mut() {
+            reader.check_native().map_err(Error::Policy)
+        } else {
+            // A consuming collector refusal already retired its owners.
+            Ok(())
+        }
     }
     fn outcome<T>(&mut self, result: Result<T, Error>) -> Result<T, Error> {
         if let Err(error) = result {
@@ -118,11 +134,7 @@ impl<'p, 'v, 'c, 'b, 'r, 'o, 'w> Cursor<'p, 'v, 'c, 'b, 'r, 'o, 'w> {
         }
         let before = self.check(now);
         self.outcome(before)?;
-        let mut result = self.step(now);
-        if result == Ok(Status::Complete) && !self.parsed {
-            self.parsed = true;
-            result = Ok(Status::Yield);
-        }
+        let result = self.advance(now);
         let after = if result.is_ok() {
             self.check(now)
         } else if let Some(source) = self.source.as_deref_mut() {
@@ -134,6 +146,34 @@ impl<'p, 'v, 'c, 'b, 'r, 'o, 'w> Cursor<'p, 'v, 'c, 'b, 'r, 'o, 'w> {
             Ok(())
         };
         self.outcome(after.and(result))
+    }
+    /// Group bounded parser turns while retaining fresh clocks and work meters.
+    pub(crate) fn poll_batch(&mut self, clock: &dyn Clock) -> Result<Status, Error> {
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
+        let result = (|| {
+            self.check(clock.sample().map_err(Error::Policy)?.monotonic)?;
+            for _ in 0..64 {
+                let now = clock.sample().map_err(Error::Policy)?.monotonic;
+                self.check_work(now)?;
+                if self.advance(now)? == Status::Complete {
+                    return Ok(Status::Complete);
+                }
+            }
+            Ok(Status::Yield)
+        })();
+        let after = self.check_native();
+        self.outcome(after.and(result))
+    }
+    fn advance(&mut self, now: Tick) -> Result<Status, Error> {
+        let result = self.step(now);
+        if result == Ok(Status::Complete) && !self.parsed {
+            self.parsed = true;
+            Ok(Status::Yield)
+        } else {
+            result
+        }
     }
     fn step(&mut self, now: Tick) -> Result<Status, Error> {
         if self.parsed {
