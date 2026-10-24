@@ -1,5 +1,6 @@
 use super::imports::{email, folder, key};
 use super::{deadline, sql, Fixture};
+use std::time::{Duration, Instant};
 use td_crypto::TrustStore;
 use td_mta::{
     format::key::SourceKind,
@@ -399,7 +400,9 @@ fn bounds(
         db::publish_unmapped_email(
             request,
             trust,
-            deadline(),
+            // This exercises maximum import capacity, not a five-second
+            // throughput target. Keep the production worker's finite ceiling.
+            Instant::now() + Duration::from_secs(10),
             authority,
             &initial,
             body,
