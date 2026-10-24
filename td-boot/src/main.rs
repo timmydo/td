@@ -143,6 +143,7 @@ const MAX_MOUNTINFO_BYTES: u64 = 1024 * 1024;
 const UPDATE_LOCK_DIR: &str = "/run/td-boot-locks";
 
 enum Mode {
+    Initramfs,
     /// One FIDO2 session's HID worker: td-fido's root worker for the node
     /// the session admitted, started by `fido::Client` (run by nothing yet).
     FidoWorker {
@@ -352,7 +353,7 @@ fn invalid(message: impl Into<String>) -> io::Error {
 fn usage_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "usage: td-boot on-volume <boot|install|update|rollback|success|mount-root|mount-var> <arguments without device>\n       td-boot volume [UUID]\n       td-boot verify <volume-root>\n       td-boot root-loop <volume-root> <deployment-id> <loop-device>\n       td-boot boot <device> <mountpoint> <cmdline>\n       td-boot install <device> <mountpoint> <deployment-directory> [trusted-key]\n       td-boot update <device> <mountpoint> <volume> <channel> <trusted-key>\n       td-boot publish <volume-root> <deployment-directory> [trusted-key]\n       td-boot rollback <device> <mountpoint> <current-id> <previous-id>\n       td-boot success <device> <mountpoint> <deployment-id>\n       td-boot authenticate <deployment-directory> [trusted-key]\n       td-boot validate-source <deployment-directory> <trusted-key>\n       td-boot live-boot <mountpoint> <cmdline>\n       td-boot live-root <mountpoint> <deployment-id> <loop-device>\n       td-boot live-seed <mountpoint> <deployment-id> <seed-directory>\n       td-boot admit <run>\n       td-boot fido-worker <index> <inode> <rdev>",
+        "usage: td-boot initramfs /init\n       td-boot on-volume <boot|install|update|rollback|success|mount-root|mount-var> <arguments without device>\n       td-boot volume [UUID]\n       td-boot verify <volume-root>\n       td-boot root-loop <volume-root> <deployment-id> <loop-device>\n       td-boot boot <device> <mountpoint> <cmdline>\n       td-boot install <device> <mountpoint> <deployment-directory> [trusted-key]\n       td-boot update <device> <mountpoint> <volume> <channel> <trusted-key>\n       td-boot publish <volume-root> <deployment-directory> [trusted-key]\n       td-boot rollback <device> <mountpoint> <current-id> <previous-id>\n       td-boot success <device> <mountpoint> <deployment-id>\n       td-boot authenticate <deployment-directory> [trusted-key]\n       td-boot validate-source <deployment-directory> <trusted-key>\n       td-boot live-boot <mountpoint> <cmdline>\n       td-boot live-root <mountpoint> <deployment-id> <loop-device>\n       td-boot live-seed <mountpoint> <deployment-id> <seed-directory>\n       td-boot admit <run>\n       td-boot fido-worker <index> <inode> <rdev>",
     )
 }
 
@@ -369,6 +370,12 @@ fn parse_deployment_id(value: OsString) -> io::Result<String> {
 
 fn parse_args<I: Iterator<Item = OsString>>(mut args: I) -> io::Result<Mode> {
     match args.next().as_deref() {
+        Some(mode) if mode == "initramfs" => {
+            if args.next().as_deref() != Some(OsStr::new("/init")) || args.next().is_some() {
+                return Err(usage_error());
+            }
+            Ok(Mode::Initramfs)
+        }
         Some(mode) if mode == OsStr::new(fido::VERB) => {
             let mut text = || {
                 args.next()
@@ -3728,7 +3735,7 @@ fn live_cmdline(
         deployment_id,
         false,
         &format!(
-            "{} {}{} {}{ram_disk_kib}",
+            "{} {}{} {}{ram_disk_kib} panic=0",
             protocol::LIVE_CMDLINE_TOKEN,
             protocol::LIVE_TRUST_PREFIX,
             sha256::to_base16(key),
@@ -3896,9 +3903,17 @@ fn run_live_boot(mountpoint: &Path, base_cmdline: &OsStr) -> io::Result<()> {
         "memory summary",
         64 * 1024,
     )?)?;
+    let _ = writeln!(
+        mirror::stderr(),
+        "td-boot: live RAM disk {ram_disk_kib} KiB"
+    );
     let uuid = volume::Uuid::random()?;
     mount_medium(mountpoint)?;
     let result = (|| {
+        let _ = writeln!(
+            mirror::stderr(),
+            "td-boot: authenticating live manifest and verifying kernel/initramfs"
+        );
         let deployment = authenticated_media_deployment(mountpoint, &key)?;
         let cmdline = live_cmdline(base_cmdline, &uuid, ram_disk_kib, &deployment.id, &key)?;
         writeln!(
@@ -3970,6 +3985,10 @@ fn run_live_root(mountpoint: &Path, deployment_id: &str, loop_device: &Path) -> 
         deployment_id,
     )?;
     mount_medium(mountpoint)?;
+    let _ = writeln!(
+        mirror::stderr(),
+        "td-boot: verifying live root.erofs (this can take time)"
+    );
     let result = live_root_payload(mountpoint, deployment_id).and_then(|root| {
         run_command(
             &mut loop_command(root, loop_device),
@@ -4423,6 +4442,7 @@ fn mount_volume(device: &Path, mountpoint: &Path, var: bool) -> io::Result<()> {
 /// drives this function rather than `run_install` for exactly that reason.
 fn dispatch(mode: Mode) -> io::Result<()> {
     match mode {
+        Mode::Initramfs => run_initramfs(),
         Mode::FidoWorker { index, inode, rdev } => {
             fido::worker(&index, &inode, &rdev).map_err(io::Error::other)
         }
@@ -4502,6 +4522,83 @@ fn dispatch(mode: Mode) -> io::Result<()> {
     }
 }
 
+fn live_diagnostics(marker_present: bool, cmdline: &[u8]) -> bool {
+    marker_present || cmdline_has_token(cmdline, b"td.live=1")
+}
+
+/// The /init interpreter mounts the API filesystems before entering the shell.
+/// Live boots send shell errors and traces through printk to both consoles.
+fn run_initramfs() -> io::Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    if std::process::id() != 1 {
+        return Err(invalid("initramfs entry requires PID 1"));
+    }
+    // Open the cpio node, not devtmpfs: fd 2 must not pin /dev at its unmount.
+    let kernel_log = OpenOptions::new().write(true).open("/dev/kmsg");
+    let mut live = Path::new("/etc/td/live-media").exists();
+    let result = (|| {
+        for (kind, source, target) in [
+            ("devtmpfs", "dev", "/dev"),
+            ("proc", "proc", "/proc"),
+            ("sysfs", "sysfs", "/sys"),
+        ] {
+            run_command(
+                Command::new(TD_MOUNT).args(["-t", kind, source, target]),
+                &format!("initramfs mount {target}"),
+            )?;
+            if target == "/proc" {
+                let cmdline = read_bounded_real_file(
+                    Path::new("/proc/cmdline"),
+                    "kernel command line",
+                    MAX_CMDLINE_BYTES as u64,
+                )?;
+                live = live_diagnostics(live, &cmdline);
+                if live {
+                    for (path, value) in [
+                        ("/proc/sys/kernel/panic", "0\n"),
+                        ("/proc/sys/kernel/printk", "7\n"),
+                        ("/proc/sys/kernel/printk_devkmsg", "on\n"),
+                    ] {
+                        fs::write(path, value).map_err(|e| {
+                            io::Error::new(
+                                e.kind(),
+                                format!("configure live diagnostics {path}: {e}"),
+                            )
+                        })?;
+                    }
+                }
+            }
+        }
+        let mut shell = Command::new("/bin/sh");
+        if live {
+            let log = kernel_log
+                .as_ref()
+                .map_err(|e| io::Error::new(e.kind(), format!("open initramfs /dev/kmsg: {e}")))?;
+            let mut banner = log;
+            writeln!(
+                banner,
+                "td-init: live initramfs diagnostics; panic reboot disabled; shell trace follows"
+            )?;
+            shell.arg("-x").stderr(Stdio::from(log.try_clone()?));
+        }
+        // exec retains PID 1 for both the selector's kexec and switch_root.
+        Err(shell.arg("/init").exec())
+    })();
+    if live {
+        if let Err(error) = &result {
+            if let Ok(mut log) = kernel_log.as_ref() {
+                let _ = writeln!(
+                    log,
+                    "td-boot: initramfs setup failed: {error}; halted; restart manually"
+                );
+            }
+            halt(&format!("initramfs setup failed: {error}"));
+        }
+    }
+    result
+}
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -4519,6 +4616,64 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc;
     use std::time::Duration;
+
+    #[test]
+    fn initramfs_entry_and_live_diagnostics_are_narrow() {
+        assert!(matches!(
+            parse_args(["initramfs", "/init"].map(OsString::from).into_iter()).unwrap(),
+            Mode::Initramfs
+        ));
+        for args in [
+            vec!["initramfs"],
+            vec!["initramfs", "/other"],
+            vec!["initramfs", "/init", "extra"],
+        ] {
+            assert!(parse_args(args.into_iter().map(OsString::from)).is_err());
+        }
+        assert!(run_initramfs()
+            .unwrap_err()
+            .to_string()
+            .contains("requires PID 1"));
+        assert!(live_diagnostics(true, b""));
+        assert!(live_diagnostics(false, b"console=ttyS0 td.live=1\n"));
+        for line in [
+            b"td.live=10".as_slice(),
+            b"other=td.live=1",
+            b"td.live=0",
+            b"",
+        ] {
+            assert!(!live_diagnostics(false, line));
+        }
+    }
+
+    #[test]
+    fn initramfs_mounts_apis_before_exec_and_preserves_pid_one() {
+        let source = include_str!("main.rs");
+        let body = source
+            .split("fn run_initramfs() -> io::Result<()> {")
+            .nth(1)
+            .unwrap()
+            .split("fn main()")
+            .next()
+            .unwrap();
+        assert!(
+            body.find("requires PID 1").unwrap() < body.find("Command::new(TD_MOUNT)").unwrap()
+        );
+        assert!(
+            body.find("(\"devtmpfs\", \"dev\", \"/dev\")").unwrap()
+                < body.find("(\"proc\", \"proc\", \"/proc\")").unwrap()
+        );
+        assert!(body.contains("(\"sysfs\", \"sysfs\", \"/sys\")"));
+        assert!(
+            body.find("/proc/sys/kernel/panic").unwrap()
+                < body.find("shell.arg(\"/init\").exec()").unwrap()
+        );
+        assert!(body.contains("shell.arg(\"-x\").stderr(Stdio::from(log.try_clone()?))"));
+        assert!(
+            body.find("open(\"/dev/kmsg\")").unwrap()
+                < body.find("Command::new(TD_MOUNT)").unwrap()
+        );
+    }
 
     #[derive(Default)]
     struct DiagnosticWrites {
@@ -8663,12 +8818,13 @@ mod tests {
             line.to_str().unwrap(),
             format!(
                 "console=ttyS0 rdinit=/init td.volume={uuid} td.deployment={id} \
-                 td.live=1 td.trust={} brd.rd_size=2048",
+                 td.live=1 td.trust={} brd.rd_size=2048 panic=0",
                 "a5".repeat(32)
             )
         );
         assert_eq!(volume::handoff(line.as_bytes()).unwrap(), uuid);
         assert!(cmdline_has_token(line.as_bytes(), b"td.live=1"));
+        assert!(line.as_bytes().ends_with(b"panic=0"));
         assert_eq!(live_handoff_key(line.as_bytes()).unwrap(), key);
         for reserved in [
             "td.live=1",
@@ -9092,11 +9248,11 @@ mod tests {
         // Halts: the live selector's cap, the installed one's release
         // (`boot_encrypted`, two calls) and a selector update's failed
         // restart there, and the deployment initramfs's unlock
-        // (`on_volume`).
+        // (`on_volume`), and live early-init setup.
         assert_eq!(
             production.matches("halt(").count(),
-            6,
-            "its definition and the five calls"
+            7,
+            "its definition and the six calls"
         );
         let encrypted = source
             .split_once("\nfn boot_encrypted(")

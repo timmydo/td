@@ -161,6 +161,46 @@ has its own key, so a deployment signed for one medium does not authenticate
 under another, and an installed system's key is unrelated to the medium's.
 The medium holds no private key, no volume identity and no operator data.
 
+## Live boot diagnostics
+
+Both stock initramfs scripts use `#!/bin/td-boot initramfs`. That
+PID-1-only entry mounts devtmpfs, procfs and sysfs through td-init's
+existing mount applet, then execs `/bin/sh /init`, retaining PID 1 for
+kexec and switch_root. The scripts no longer mount those filesystems.
+
+The selector's live-media marker, or the deployment's exact `td.live=1`
+handoff token, enables diagnostics. After mounting procfs the entry sets
+`kernel.panic=0`, console log level 7 and `kernel.printk_devkmsg=on`.
+It opens the initramfs's mode-0600 `/dev/kmsg` character node (1:11)
+before mounting devtmpfs, so the retained descriptor cannot keep `/dev`
+busy at the deployment script's unmount. It uses that descriptor for the
+shell's standard error and enables `-x`,
+so executed boot commands and errors reach the kernel log and its VT and
+serial consoles, even when `/dev/console` is serial. td-boot buffers each
+diagnostic line before writing standard error, since each kmsg write is
+a separate record; flush and drop emit an unterminated tail. Standard output and
+input keep their inherited descriptors. Tracing covers only the live
+initramfs script, ending at its exec into td-boot or switch_root; it is
+never enabled for installed boots or the running system's init script.
+The live script must not expand secrets in commands while tracing is on.
+
+A setup failure on a recognized live boot reports and parks until reset;
+a later PID 1 exit leaves the kernel panic on screen. The live kexec
+handoff appends `panic=0`, so the second kernel also stops on a panic
+before userspace starts. The firmware-loaded kernel still has the common
+built-in `panic=-1` until this entry reaches procfs: failures before that
+point remain outside this diagnostic coverage. This profile changes no
+installed boot's panic or rollback policy and offers no recovery shell.
+
+Media discovery announces its search, each candidate before probing, and
+each result. Repeated notes are suppressed and at most 64 distinct notes
+are printed per discovery, including probes; a blocked read still has the
+kernel's command timeout, not a new userspace deadline. Stage messages
+identify RAM-disk sizing, manifest/kernel/initramfs verification and root
+image hashing. These diagnostics do not change media selection or signature
+checks. They are volatile; photograph the final screen or capture serial
+output before restarting.
+
 ## Interactive QEMU run
 
 `./test-iso ISO [--usb]` boots an existing nonempty regular ISO through OVMF

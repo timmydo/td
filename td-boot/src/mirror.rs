@@ -118,29 +118,38 @@ impl<E: Write, M: FnMut(&[u8])> Console<E, M> {
         }
     }
 
-    fn emit_lines(&mut self) {
+    fn emit_pending(&mut self) -> io::Result<()> {
+        let line = std::mem::take(&mut self.pending);
+        let result = self.err.write_all(&line);
+        (self.mirror)(&line);
+        result
+    }
+
+    fn emit_lines(&mut self) -> io::Result<()> {
         while let Some(end) = self.pending.iter().position(|b| *b == b'\n') {
             let rest = self.pending.split_off(end.saturating_add(1));
-            (self.mirror)(&self.pending);
+            let result = self.emit_pending();
             self.pending = rest;
+            result?;
         }
         if self.pending.len() >= LINE_MAX {
-            (self.mirror)(&self.pending);
-            self.pending.clear();
+            self.emit_pending()?;
         }
+        Ok(())
     }
 }
 
 impl<E: Write, M: FnMut(&[u8])> Write for Console<E, M> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let written = self.err.write(bytes)?;
-        self.pending
-            .extend_from_slice(bytes.get(..written).unwrap_or(bytes));
-        self.emit_lines();
-        Ok(written)
+        self.pending.extend_from_slice(bytes);
+        self.emit_lines()?;
+        Ok(bytes.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        if !self.pending.is_empty() {
+            self.emit_pending()?;
+        }
         self.err.flush()
     }
 }
@@ -148,7 +157,7 @@ impl<E: Write, M: FnMut(&[u8])> Write for Console<E, M> {
 impl<E: Write, M: FnMut(&[u8])> Drop for Console<E, M> {
     fn drop(&mut self) {
         if !self.pending.is_empty() {
-            (self.mirror)(&self.pending);
+            let _ = self.emit_pending();
         }
     }
 }
@@ -230,12 +239,57 @@ mod tests {
                 "vt tail"
             ]
         );
+        let errors: Vec<&String> = log.iter().filter(|l| l.starts_with("err ")).collect();
+        assert_eq!(
+            errors,
+            [
+                "err td-boot: one of 2\n",
+                "err two\n",
+                "err three\n",
+                "err tail"
+            ]
+        );
         let first_vt = log.iter().position(|l| l.starts_with("vt ")).unwrap();
         assert!(log[..first_vt].iter().all(|l| l.starts_with("err ")));
         assert!(
             log[first_vt - 1].ends_with('\n'),
             "the newline's write came first"
         );
+    }
+
+    #[test]
+    fn a_partial_line_flushes_and_stderr_failure_still_reaches_the_mirror() {
+        let lines = Rc::new(RefCell::new(Vec::new()));
+        let seen = Rc::clone(&lines);
+        let mut console = Console::new(Vec::new(), move |line: &[u8]| {
+            seen.borrow_mut().push(line.to_vec())
+        });
+        console.write_all(b"tail").unwrap();
+        assert!(console.err.is_empty());
+        console.flush().unwrap();
+        assert_eq!(console.err, b"tail");
+        drop(console);
+        assert_eq!(*lines.borrow(), vec![b"tail".to_vec()]);
+
+        struct Closed;
+        impl Write for Closed {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let seen = Rc::clone(&lines);
+        let mut console = Console::new(Closed, move |line: &[u8]| {
+            seen.borrow_mut().push(line.to_vec())
+        });
+        assert_eq!(
+            console.write_all(b"error\n").unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        drop(console);
+        assert_eq!(*lines.borrow(), vec![b"tail".to_vec(), b"error\n".to_vec()]);
     }
 
     /// A write that would block or is short abandons that line alone: the

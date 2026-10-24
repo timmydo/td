@@ -2363,12 +2363,9 @@ fn build_td_svc_conf() -> String {
 /// refuses the live tokens in any base line.
 fn build_selector_init() -> String {
     format!(
-        "#!/bin/sh\n\
+        "#!/bin/td-boot initramfs\n\
          set -e\n\
          set -f\n\
-         /bin/mount -t devtmpfs dev /dev\n\
-         /bin/mount -t proc proc /proc\n\
-         /bin/mount -t sysfs sysfs /sys\n\
          if /bin/td-util test -e /{marker}; then\n\
            exec /bin/td-boot live-boot /media \"$(/bin/td-util cat /proc/cmdline)\"\n\
          fi\n\
@@ -2409,12 +2406,9 @@ fn build_deployment_init(sys: &SystemDef) -> String {
     // mount flag prevents accidental writes, not a privileged remount by root.
     // The verified loop keeps root.erofs open, so the top-level mount cannot be
     // unmounted; move it below the new root's volatile /run instead.
-    let mut init = "#!/bin/sh\n\
+    let mut init = "#!/bin/td-boot initramfs\n\
      set -e\n\
      set -f\n\
-     /bin/mount -t devtmpfs dev /dev\n\
-     /bin/mount -t proc proc /proc\n\
-     /bin/mount -t sysfs sysfs /sys\n\
      autotest=\n\
      deployment=\n\
      deployment_seen=\n\
@@ -4467,7 +4461,7 @@ fn build_initramfs_spec(init: &str, phase: Phase) -> String {
             ));
         }
     }
-    s.push_str("nod /dev/console 0600 0 0 c 5 1\n");
+    s.push_str("nod /dev/console 0600 0 0 c 5 1\nnod /dev/kmsg 0600 0 0 c 1 11\n");
     s.push_str(&format!("file /init {{root}}/{init} 0755 0 0\n"));
     s
 }
@@ -11492,7 +11486,9 @@ mod tests {
             "{init}"
         );
         assert_eq!(init.matches("/bin/umount /sys\n").count(), 1);
-        let sysfs = init.find("/bin/mount -t sysfs").expect("sysfs mount");
+        let sysfs = init
+            .find("#!/bin/td-boot initramfs")
+            .expect("API filesystem entry");
         assert!(sysfs < admit);
     }
 
@@ -11518,7 +11514,11 @@ mod tests {
                 .expect("volatile run")
                 < at
         );
-        assert!(init.find("/bin/mount -t proc").expect("proc mount") < at);
+        assert!(
+            init.find("#!/bin/td-boot initramfs")
+                .expect("API filesystem entry")
+                < at
+        );
         assert!(at < init.find("/bin/umount /proc").expect("proc cleanup"));
         assert!(!init.contains(SSHD_CONFIG), "{init}");
         assert!(!init.contains("td-login-cutover"), "{init}");
@@ -12017,7 +12017,7 @@ mod tests {
         let init = build_deployment_init(&SYSTEM);
         assert!(
             selector.contains("exec /bin/td-boot on-volume boot /volume")
-                && selector.contains("mount -t sysfs sysfs /sys")
+                && selector.starts_with("#!/bin/td-boot initramfs\n")
                 && !selector.contains("root-loop")
                 && init.contains("root-loop")
                 && !init.contains("td-boot boot"),
@@ -12284,7 +12284,7 @@ mod tests {
             LOGIN_DIRECTORY_STEP,
             "/bin/td-firstboot ensure-login-directory /sysroot || :"
         );
-        assert!(init.starts_with("#!/bin/sh\nset -e\n"));
+        assert!(init.starts_with("#!/bin/td-boot initramfs\nset -e\n"));
         assert_eq!(init.matches("ensure-login-directory").count(), 1);
         // The render's form follows the state the step leaves (TOKEN-LOGIN.md,
         // "SSH"), so there is exactly one render and it comes next.
@@ -14236,8 +14236,8 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         assert!(selector.contains("dir /proc 0755 0 0"));
         let init = build_selector_init();
         let proc = init
-            .find("/bin/mount -t proc proc /proc")
-            .expect("proc mount");
+            .find("#!/bin/td-boot initramfs")
+            .expect("API filesystem entry");
         let boot = init.find("exec /bin/td-boot").expect("td-boot");
         assert!(proc < boot);
         assert!(!init.contains("umount"), "{init}");
@@ -14302,36 +14302,13 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
             deployment.contains("dir /sys 0755 0 0"),
             "the deployment initramfs has no /sys for sysfs to be mounted on"
         );
+        for spec in [&selector, &deployment] {
+            assert!(spec.contains("nod /dev/kmsg 0600 0 0 c 1 11\n"));
+        }
         let init = build_deployment_init(&SYSTEM);
-        let sysfs = init
-            .match_indices("mount -t sysfs sysfs /sys")
-            .next()
-            .map(|(at, _)| at);
-        let boot = init.match_indices("/bin/td-boot").next().map(|(at, _)| at);
-        assert!(
-            sysfs.is_some(),
-            "/init must mount sysfs; losetup's read-back has nothing to read otherwise"
-        );
-        assert!(
-            boot.is_none() || sysfs < boot,
-            "sysfs must be mounted BEFORE td-boot runs, not after"
-        );
-        // The loop node is created INTO the devtmpfs, so the mount must come first:
-        // before it, the node lands in the initramfs rootfs and is then shadowed by
-        // the mount, leaving td-boot with nothing to open and no error saying why.
-        let devtmpfs = init
-            .match_indices("mount -t devtmpfs dev /dev")
-            .next()
-            .map(|(at, _)| at);
-        let mknod = init.match_indices("/bin/mknod ").next().map(|(at, _)| at);
-        assert!(
-            devtmpfs.is_some() && mknod.is_some(),
-            "/init must mount devtmpfs and create the loop node"
-        );
-        assert!(
-            devtmpfs < mknod && mknod < init.find("/bin/td-boot root-loop"),
-            "mknod must run AFTER the devtmpfs mount and BEFORE td-boot binds the loop"
-        );
+        assert!(init.starts_with("#!/bin/td-boot initramfs\n"));
+        let mknod = init.find("/bin/mknod ").unwrap();
+        assert!(mknod < init.find("/bin/td-boot root-loop").unwrap());
         // ...and released before the pivot, with /proc and /dev. switch_root MOVES
         // whatever of the API mounts it finds, so leaving this one behind stacks a
         // second sysfs under the one sysinit mounts on the real root.
@@ -14348,7 +14325,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
             );
         }
         assert!(
-            build_selector_init().contains("mount -t sysfs sysfs /sys"),
+            build_selector_init().starts_with("#!/bin/td-boot initramfs\n"),
             "the selector needs sysfs for UUID volume discovery"
         );
         assert!(

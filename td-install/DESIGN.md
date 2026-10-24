@@ -1478,7 +1478,9 @@ loader converts these forward slashes to FAT separators; forward slashes
 also satisfy td-boot's unquoted printable command-line grammar.
 
 These are v1 QEMU product defaults, including serial diagnostics and immediate
-panic reboot. They apply to direct boots and kexec too. Audit policy remains
+panic reboot. They apply to direct boots and kexec too; live installation
+media override the panic policy from their early initramfs entry and live
+kexec handoff, as specified in MEDIA.md "Live boot diagnostics". Audit policy remains
 with the caller: non-audit direct-kernel tests pass `audit=0`, while the audit
 oracle passes `audit=1`. Linux permanently disables audit initialization on
 any earlier `audit=0`; a later `audit=1` cannot restore it. The built-in

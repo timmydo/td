@@ -2362,7 +2362,17 @@ mod tests {
                     continue;
                 }
                 let guest = (stem.to_string(), path.clone());
-                if shebang == "#!/bin/sh" && expected_guest_shebangs.contains(&guest) {
+                let initramfs = matches!(stem, "system-x86-64" | "system-secret-vm-test")
+                    && matches!(
+                        path.as_str(),
+                        "{root}/selector-init" | "{root}/deployment-init"
+                    );
+                let expected = if initramfs {
+                    "#!/bin/td-boot initramfs"
+                } else {
+                    "#!/bin/sh"
+                };
+                if shebang == expected && expected_guest_shebangs.contains(&guest) {
                     seen_guest_shebangs.insert(guest);
                     continue;
                 }
@@ -2375,7 +2385,7 @@ mod tests {
         );
         assert_eq!(
             seen_guest_shebangs, expected_guest_shebangs,
-            "the literal /bin/sh exceptions must remain exact packed-guest scripts"
+            "the literal guest interpreter exceptions must remain exact packed-guest scripts"
         );
     }
 

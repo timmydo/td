@@ -1090,7 +1090,7 @@ fn select_media(
     })
 }
 
-fn scan_media() -> io::Result<MediaScan> {
+fn scan_media(reported: &mut Vec<String>) -> io::Result<MediaScan> {
     let mut entries = Vec::new();
     for (index, entry) in fs::read_dir("/sys/class/block")?.enumerate() {
         if index >= MAX_DEVICES {
@@ -1109,7 +1109,22 @@ fn scan_media() -> io::Result<MediaScan> {
             continue;
         };
         let path = Path::new("/dev").join(name);
+        let _ = report_notes(
+            &mut crate::mirror::stderr(),
+            reported,
+            vec![format!("probing install medium {}", path.display())],
+        );
         let probed = probe_media(&entry.path(), &path);
+        let outcome = match &probed {
+            Ok(Some(_)) => "TD_INSTALL descriptor found".to_string(),
+            Ok(None) => "not td installation media or empty".to_string(),
+            Err(error) => format!("probe failed: {error}"),
+        };
+        let _ = report_notes(
+            &mut crate::mirror::stderr(),
+            reported,
+            vec![format!("install medium {}: {outcome}", path.display())],
+        );
         entries.push((path, probed));
     }
     select_media(entries)
@@ -1118,8 +1133,13 @@ fn scan_media() -> io::Result<MediaScan> {
 /// The one attached td installation medium, waiting for slow USB enumeration.
 pub(crate) fn find_medium() -> io::Result<Medium> {
     let started = Instant::now();
+    let mut reported = Vec::new();
+    let _ = writeln!(
+        crate::mirror::stderr(),
+        "td-boot: searching for install media (up to 30s between probes)"
+    );
     loop {
-        match scan_media()? {
+        match scan_media(&mut reported)? {
             MediaScan::Found(medium) => return Ok(medium),
             MediaScan::None(skipped) if started.elapsed() >= MEDIA_WAIT => {
                 let mut message = format!(
