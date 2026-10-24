@@ -98,6 +98,39 @@ from `/sys/class/graphics/fb0`; the compositor refuses any format other than
 32 bits per pixel and treats it as little-endian XRGB8888. Renderer tests pin
 that interpretation against a file-backed framebuffer.
 
+Panel brightness uses the dependency-free `td-backlight` crate, shared by
+seatd and the compositor. The kernel-owned `/sys/class/backlight` entries
+must resolve beneath `/sys/devices`; their brightness, maximum and type
+attributes must be regular files. Discovery is bounded to 64 entries and
+128-byte attributes. Native (`raw`) control wins over platform and firmware
+interfaces, with lexical names breaking ties, so an Intel panel uses
+`intel_backlight` ahead of an overlapping ACPI interface. No backlight is
+normal on external displays and QEMU; malformed or inaccessible controls
+produce diagnostics without failing graphical boot.
+
+Seat assignment delegates only that panel's `brightness` attribute to the
+compositor identity, mode 0644. Other users can read it for diagnosis but
+cannot write it; no parent, maximum, power or other sysfs control is delegated.
+The same bounded discovery is used for assignment, probe and use. Sysfs and
+its directory parents remain kernel-owned; this is the fixed-seat model
+above, not hotplug support. No new syscall surface or root command channel
+is involved. A compromised compositor can already blank its framebuffer;
+backlight control adds no authority over another account or hardware secret.
+
+After the first display paint, only the installed authority-paired compositor
+initializes the panel to at least 60 percent, preserving a brighter setting.
+This ordering repairs a dim inherited firmware/native-driver setting after
+the modeset. Development and headless compositors do not touch host brightness.
+Physical `KEY_BRIGHTNESSDOWN` (224) and `KEY_BRIGHTNESSUP` (225), including
+repeat events, adjust by five percent, clamped to 5–100 percent and rounded
+up to at least one hardware unit. Every write is read back. The keys work
+on the lock and attention screens, and their press, repeat and release events
+never reach Wayland clients or select a secure-attention operation. Security
+key keyboard interfaces remain excluded. Native automation has no brightness
+implementation. A short status notice shows the resulting percentage or
+failure; startup and failures also go to the compositor log. The startup floor
+is reapplied on compositor restart; brightness is not a persistent preference.
+
 A status bar owns the top 24 rows. It is BUILT IN rather than a client,
 because a client would need a way to be placed and to reserve space —
 layer-shell, or a private protocol standing in for it — and none of that is

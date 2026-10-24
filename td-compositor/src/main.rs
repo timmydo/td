@@ -568,6 +568,12 @@ fn run_compositor(options: RunOptions) -> Result<(), String> {
         .lock()
         .map_err(|_| "runtime lock poisoned".to_string())?
         .first_paint(connected.as_ref(), login.as_ref())?;
+    if options.terminal_authority {
+        runtime
+            .lock()
+            .map_err(|_| "runtime lock poisoned".to_string())?
+            .initialize_backlight();
+    }
     let inputs = input::start(&options.input, Arc::clone(&runtime), launches)?;
     // FATAL, like the Wayland listeners and unlike the status bar below. An
     // earlier draft reasoned from the bar — a session you can see beats one

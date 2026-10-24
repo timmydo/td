@@ -51,6 +51,8 @@ const REL_WHEEL: u16 = 8;
 const ABS_X: u16 = 0;
 const ABS_Y: u16 = 1;
 const KEY_ESC: u16 = 1;
+const KEY_BRIGHTNESSDOWN: u16 = 224;
+const KEY_BRIGHTNESSUP: u16 = 225;
 const KEY_1: u16 = 2;
 const KEY_2: u16 = 3;
 const KEY_3: u16 = 4;
@@ -388,6 +390,7 @@ struct KeyDecision {
     /// root's last `1a` answer is enrolled or unavailable.
     lock: bool,
     draining: bool,
+    brightness: Option<bool>,
     command: Option<Command>,
     launcher: Option<LauncherAction>,
     help: Option<HelpAction>,
@@ -434,6 +437,7 @@ impl KeyBindings {
             unlock: false,
             lock: false,
             draining: false,
+            brightness: None,
             command: None,
             launcher: None,
             help: None,
@@ -442,6 +446,16 @@ impl KeyBindings {
             forward: None,
             modifiers: None,
         };
+        // These physical controls remain usable on the lock and attention
+        // screens; neither half of the key pair is a client keyboard event.
+        if event.kind == EV_KEY && matches!(event.code, KEY_BRIGHTNESSDOWN | KEY_BRIGHTNESSUP) {
+            if matches!(event.value, KEY_PRESS | KEY_REPEAT)
+                && !self.attention_excluded.contains(&device)
+            {
+                decision.brightness = Some(event.code == KEY_BRIGHTNESSUP);
+            }
+            return decision;
+        }
         if event.kind != EV_KEY
             || event.code > MAX_XKB_EVDEV_KEY
             || event.value == KEY_REPEAT
@@ -1707,6 +1721,9 @@ struct PointerFrame {
 }
 
 trait InputTarget {
+    fn brightness(&mut self, _brighter: bool) -> Result<(), String> {
+        Ok(())
+    }
     fn confirm_install(&mut self, _timestamp: u128) -> Result<(), String> {
         Ok(())
     }
@@ -2606,6 +2623,12 @@ impl LiveInputTarget {
 }
 
 impl InputTarget for LiveInputTarget {
+    fn brightness(&mut self, brighter: bool) -> Result<(), String> {
+        self.runtime
+            .lock()
+            .map_err(|_| "runtime lock poisoned".to_string())?
+            .brightness(brighter)
+    }
     fn confirm_install(&mut self, timestamp: u128) -> Result<(), String> {
         if let Some(attempt) = &self.secret_attempt {
             attempt.confirm_install(&EvdevOrigin { _private: () }, timestamp)?;
@@ -3241,6 +3264,7 @@ fn apply_locked<T: InputTarget>(
         && !decision.lock
         && decision.attention.is_none()
         && decision.secret.is_none()
+        && decision.brightness.is_none()
         && decision.notice.is_none()
         && decision.confirm_install.is_none()
         // Redundant today, since each approval digit also yields a field
@@ -3338,6 +3362,9 @@ fn deliver_key_decision<T: InputTarget>(
     bindings: &mut KeyBindings,
     mut decision: KeyDecision,
 ) -> Result<(), String> {
+    if let Some(brighter) = decision.brightness {
+        runtime.brightness(brighter)?;
+    }
     if decision.draining {
         runtime.drain_attention()?;
     }
@@ -4152,6 +4179,56 @@ mod tests {
             }
         })
         .is_err());
+    }
+
+    #[test]
+    fn brightness_reaches_the_physical_target_while_locked_without_client_keys() {
+        let bindings = Mutex::new(KeyBindings::default());
+        let target = Mutex::new(RecordingTarget {
+            locked: true,
+            ..RecordingTarget::default()
+        });
+        let mut pointer = PointerMotion::default();
+        for value in [KEY_PRESS, KEY_REPEAT, KEY_RELEASE] {
+            apply(
+                &target,
+                key(KEY_BRIGHTNESSUP, value),
+                0,
+                &bindings,
+                &mut pointer,
+                None,
+            )
+            .unwrap();
+        }
+        let target = target.lock().unwrap();
+        assert_eq!(target.brightness_events, vec![true, true]);
+        assert!(target.keys.is_empty());
+        assert!(target.secret_roles.is_empty());
+        assert!(target.commands.is_empty());
+    }
+
+    #[test]
+    fn brightness_keys_are_consumed_and_work_during_attention() {
+        let mut bindings = KeyBindings::default();
+        for state in [
+            AttentionState::Closed,
+            AttentionState::Open,
+            AttentionState::Draining,
+        ] {
+            bindings.attention = state;
+            for (code, brighter) in [(KEY_BRIGHTNESSDOWN, false), (KEY_BRIGHTNESSUP, true)] {
+                for value in [KEY_PRESS, KEY_REPEAT] {
+                    let decision = bindings.feed(key(code, value));
+                    assert_eq!(decision.brightness, Some(brighter));
+                    assert!(decision.forward.is_none());
+                    assert!(decision.secret.is_none());
+                    assert!(decision.attention.is_none());
+                }
+                let release = bindings.feed(key(code, KEY_RELEASE));
+                assert!(release.brightness.is_none());
+                assert!(release.forward.is_none());
+            }
+        }
     }
 
     fn key(code: u16, value: i32) -> Event {
@@ -5694,6 +5771,7 @@ mod tests {
 
     #[derive(Default)]
     struct RecordingTarget {
+        brightness_events: Vec<bool>,
         attention_events: Vec<bool>,
         secret_roles: Vec<crate::secret_client::Selection>,
         notices: Vec<crate::attention::Notice>,
@@ -5762,6 +5840,10 @@ mod tests {
     }
 
     impl InputTarget for RecordingTarget {
+        fn brightness(&mut self, brighter: bool) -> Result<(), String> {
+            self.brightness_events.push(brighter);
+            Ok(())
+        }
         fn confirm_install(&mut self, timestamp: u128) -> Result<(), String> {
             self.confirmations.push(timestamp);
             Ok(())

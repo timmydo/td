@@ -377,7 +377,7 @@ fn checked_metadata(path: &Path, require_char: bool) -> Result<Metadata, String>
         return Err(format!("{} is not a character device", path.display()));
     }
     if !require_char && !kind.is_file() {
-        return Err(format!("{} is not a regular test file", path.display()));
+        return Err(format!("{} is not a regular file", path.display()));
     }
     Ok(metadata)
 }
@@ -680,6 +680,34 @@ fn denied_device_read(path: &Path) -> Result<(), String> {
     }
 }
 
+fn backlight_access(command: &str, account: Account) -> Result<(), String> {
+    let Some(panel) = td_backlight::discover().map_err(|e| e.to_string())? else {
+        return Ok(());
+    };
+    assign_backlight(&panel, command, account)
+}
+
+fn assign_backlight(
+    panel: &td_backlight::Panel,
+    command: &str,
+    account: Account,
+) -> Result<(), String> {
+    let path = panel.brightness_path();
+    checked_metadata(&path, false)?;
+    if command == "assign" {
+        unix_fs::lchown(&path, Some(account.uid), Some(account.gid)).map_err(|e| e.to_string())?;
+        fs::set_permissions(&path, Permissions::from_mode(0o644)).map_err(|e| e.to_string())?;
+    }
+    verify_owner_mode(&path, account, 0o644)?;
+    let _ = writeln!(
+        std::io::stderr(),
+        "td-seatd: backlight {} writable only by compositor uid {}",
+        panel.directory().display(),
+        account.uid
+    );
+    Ok(())
+}
+
 fn probe_access(assignment: Assignment) -> Result<(), String> {
     let mut status = String::new();
     File::open("/proc/self/status")
@@ -803,6 +831,12 @@ fn run(args: &[String]) -> Result<(), String> {
     if command == "assign" {
         assign_vm_port(&compositor_runtime(&runtime)?, assignment.compositor)?;
     }
+    if let Err(error) = backlight_access(command, assignment.compositor) {
+        let _ = writeln!(
+            std::io::stderr(),
+            "td-seatd: optional panel backlight unavailable: {error}"
+        );
+    }
     println!(
         "{READY_MARKER} uid={} gid={} framebuffer={} inputs={} runtime={} \
          compositor-uid={} compositor-gid={} compositor-runtime={} \
@@ -859,6 +893,47 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
         }
+    }
+
+    #[test]
+    fn only_the_selected_brightness_attribute_is_delegated() {
+        let root = td_fs::TempDir::new("td-seat-backlight").unwrap();
+        let devices = root.path().join("devices");
+        let class = root.path().join("class");
+        let device = devices.join("intel_backlight");
+        fs::create_dir_all(&device).unwrap();
+        fs::create_dir(&class).unwrap();
+        unix_fs::symlink(&device, class.join("intel_backlight")).unwrap();
+        for (name, value) in [
+            ("brightness", "1"),
+            ("max_brightness", "100"),
+            ("type", "raw"),
+        ] {
+            fs::write(device.join(name), value).unwrap();
+            fs::set_permissions(device.join(name), Permissions::from_mode(0o600)).unwrap();
+        }
+        let identity = fs::metadata(root.path()).unwrap();
+        let account = Account {
+            uid: identity.uid(),
+            gid: identity.gid(),
+        };
+        let panel = td_backlight::discover_in(&class, &devices)
+            .unwrap()
+            .unwrap();
+        assign_backlight(&panel, "assign", account).unwrap();
+        assign_backlight(&panel, "probe", account).unwrap();
+        assert_eq!(
+            fs::metadata(device.join("brightness")).unwrap().mode() & 0o777,
+            0o644
+        );
+        assert_eq!(
+            fs::metadata(device.join("max_brightness")).unwrap().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(device.join("type")).unwrap().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]

@@ -234,10 +234,41 @@ pub fn recipe() -> Recipe {
         });
     }
     steps.extend([
+        Step::WriteFile {
+            path: "{src}/backlight.rs".into(),
+            content: include_str!("../../../td-backlight/src/lib.rs").into(),
+            exec: false,
+        },
         target_rustc(
             "{src}",
             rustc,
             &[
+                "--edition",
+                "2021",
+                "--crate-type",
+                "rlib",
+                "--crate-name",
+                "td_backlight",
+                "--target",
+                "x86_64-unknown-linux-gnu",
+                "-C",
+                "opt-level=s",
+                "-C",
+                "target-feature=+crt-static",
+                "-C",
+                "relocation-model=static",
+                "-o",
+                "{src}/libtd_backlight.rlib",
+                "{src}/backlight.rs",
+            ],
+        )
+        .env("SOURCE_DATE_EPOCH", "1"),
+        target_rustc(
+            "{src}",
+            rustc,
+            &[
+                "--extern",
+                "td_backlight={src}/libtd_backlight.rlib",
                 "--edition",
                 "2021",
                 "--cfg",
@@ -282,6 +313,8 @@ pub fn recipe() -> Recipe {
             "{src}",
             rustc,
             &[
+                "--extern",
+                "td_backlight={src}/libtd_backlight.rlib",
                 "--edition",
                 "2021",
                 "--test",

@@ -20,6 +20,9 @@ path = "tools/import-unifont.rs"
 [features]
 target-recipe = []
 
+[dependencies]
+td-backlight = { path = "../td-backlight" }
+
 [workspace]
 
 [lints.clippy]

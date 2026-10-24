@@ -13,6 +13,12 @@ clippy-all-targets = true
 name = "td-seatd"
 path = "src/main.rs"
 
+[dependencies]
+td-backlight = { path = "../td-backlight" }
+
+[dev-dependencies]
+td-fs = { path = "../td-fs" }
+
 [workspace]
 
 [lints.clippy]

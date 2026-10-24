@@ -20,6 +20,7 @@ use crate::scene::{
     SurfaceKey, WindowGeometry,
 };
 use crate::screenshot::{Capture, Destination, Job, ScreenshotAction};
+use std::io::Write;
 // Production code asks the buffer whether a pixel is opaque rather than
 // comparing format numbers, so the enumerants are now a fixture vocabulary.
 #[cfg(test)]
@@ -658,6 +659,7 @@ pub struct Runtime {
     screenshots: Option<(SyncSender<crate::screenshot::Job>, bool)>,
     /// When the bar's screenshot notice gives way to the status line.
     notice_until: Option<std::time::Instant>,
+    backlight: Option<td_backlight::Panel>,
     /// xdg-foreign handles are compositor-wide bearer capabilities. The
     /// object maps stay on their owning client threads; this registry carries
     /// only the cross-client identity and relationship needed to resolve one.
@@ -880,6 +882,7 @@ impl Runtime {
             clipboard_writer: None,
             screenshots: None,
             notice_until: None,
+            backlight: None,
             foreign_exports: BTreeMap::new(),
             foreign_imports: BTreeMap::new(),
             toplevel_parents: BTreeMap::new(),
@@ -3223,6 +3226,54 @@ impl Runtime {
                 Err(error)
             }
         }
+    }
+
+    pub(crate) fn initialize_backlight(&mut self) {
+        match td_backlight::discover() {
+            Ok(Some(panel)) => {
+                match panel.ensure_visible() {
+                    Ok(percent) => {
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "td-compositor: backlight {} initialized to {percent}% after modeset",
+                            panel.directory().display()
+                        );
+                    }
+                    Err(error) => {
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "td-compositor: panel brightness initialization failed: {error}"
+                        );
+                    }
+                }
+                self.backlight = Some(panel);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "td-compositor: backlight discovery failed: {error}"
+                );
+            }
+        }
+    }
+
+    pub(crate) fn brightness(&mut self, brighter: bool) -> Result<(), String> {
+        let message = match &self.backlight {
+            Some(panel) => match panel.adjust(brighter) {
+                Ok(percent) => format!("BRIGHTNESS {percent}%"),
+                Err(error) => {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "td-compositor: brightness key failed: {error}"
+                    );
+                    "BRIGHTNESS UNAVAILABLE".into()
+                }
+            },
+            None => "NO PANEL BACKLIGHT".into(),
+        };
+        self.notice(message);
+        self.repaint()
     }
 
     pub fn command(&mut self, command: Command) -> Result<(), String> {
