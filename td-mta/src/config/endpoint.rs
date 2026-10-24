@@ -198,6 +198,27 @@ impl<'a> Origin<'a> {
         output.format(format_args!("{}", OriginDisplay(self)))
     }
 }
+/// Primary origin plus an explicit, bounded whitespace-separated alias list.
+pub const MAX_JMAP_ORIGINS: usize = 32;
+pub fn jmap_origins<'a>(primary: Origin<'a>, aliases: &'a str) -> Result<Vec<Origin<'a>>, Code> {
+    let mut origins = Vec::new();
+    origins
+        .try_reserve_exact(MAX_JMAP_ORIGINS)
+        .map_err(|_| Code::Origin)?;
+    origins.push(primary);
+    for text in aliases.split_ascii_whitespace() {
+        let origin = Origin::parse(text)?;
+        if origins.len() >= MAX_JMAP_ORIGINS
+            || origin.port() != primary.port()
+            || origins.iter().any(|prior| origin.same_origin(*prior))
+        {
+            return Err(Code::Origin);
+        }
+        origins.push(origin);
+    }
+    Ok(origins)
+}
+
 struct OriginDisplay<'a>(Origin<'a>);
 impl fmt::Display for OriginDisplay<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -309,6 +330,36 @@ fn mask6(bits: u8) -> Result<u128, Code> {
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+    #[test]
+    fn explicit_jmap_origins_refuse_duplicates_invalid_values_and_overflow() {
+        let primary = Origin::parse("https://primary.test").unwrap();
+        let origins = jmap_origins(primary, " https://alias.test/\tHTTPS://bad.test");
+        assert!(origins.is_err());
+        let origins =
+            jmap_origins(primary, " https://ALIAS.test/\thttps://third.test:443 ").unwrap();
+        assert_eq!(origins.len(), 3);
+        assert!(origins[1].same_origin(Origin::parse("https://alias.test").unwrap()));
+        for aliases in [
+            "https://PRIMARY.test:443/",
+            "https://alias.test https://ALIAS.test/",
+            "http://alias.test",
+            "https://*.test",
+            "https://alias.test/path",
+            "https://user@alias.test",
+            "https://alias.test\u{00a0}https://other.test",
+        ] {
+            assert!(jmap_origins(primary, aliases).is_err(), "{aliases}");
+        }
+        let aliases = (1..MAX_JMAP_ORIGINS)
+            .map(|i| format!("https://host{i}.test"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(
+            jmap_origins(primary, &aliases).unwrap().len(),
+            MAX_JMAP_ORIGINS
+        );
+        assert!(jmap_origins(primary, &(aliases + " https://overflow.test")).is_err());
+    }
     #[test]
     fn origin_canonicalization_and_rejected_authority_forms() {
         for (input, canonical) in [

@@ -6,8 +6,6 @@ use crate::bounded::TextBuffer;
 use std::{fmt, num::NonZeroU64};
 pub const MAX_NAMES_PER_CERTIFICATE: usize = 32;
 pub const MAX_BINDINGS: usize = certificate::MAX_PROFILES * MAX_NAMES_PER_CERTIFICATE;
-pub const MAX_DERIVED_BINDINGS: usize = listener::MAX_LISTENERS + super::routing::MAX_DOMAINS;
-const _: [(); 1] = [(); (MAX_DERIVED_BINDINGS <= MAX_BINDINGS) as usize];
 pub const MAX_CANONICAL_ORIGIN_BYTES: usize = 8 + values::MAX_DOMAIN_BYTES + 1 + 5;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Code {
@@ -262,11 +260,14 @@ fn checked_views<'s, 't>(
 }
 fn advertised_name(
     views: &Views<'_, '_>,
-    origin: Origin<'_>,
+    origins: &[Origin<'_>],
     name: &str,
     scratch: &mut [u8; values::MAX_CERTIFICATE_NAME_BYTES],
 ) -> Result<bool, Error> {
-    if name.eq_ignore_ascii_case(origin.host()) {
+    if origins
+        .iter()
+        .any(|origin| name.eq_ignore_ascii_case(origin.host()))
+    {
         return Ok(true);
     }
     for index in 0..views.listeners.len() {
@@ -298,6 +299,7 @@ fn advertised_name(
     Ok(false)
 }
 fn validate_links(
+    origins: &[Origin<'_>],
     views: &Views<'_, '_>,
     origin: Origin<'_>,
     origin_at: Location,
@@ -319,7 +321,9 @@ fn validate_links(
             let profile = certificate_index(views.certificates, profile, l.location)?;
             *used.get_mut(usize::from(profile)).ok_or_else(invariant)? = true;
         }
-        if l.kind == listener::Kind::Https && l.bind.port() != origin.port() {
+        if l.kind == listener::Kind::Https
+            && origins.iter().any(|origin| l.bind.port() != origin.port())
+        {
             return Err(conflict(Code::OriginPort, l.location, origin_at));
         }
         if let Some(name) = l.gateway {
@@ -374,7 +378,7 @@ fn validate_links(
             }
         }
         let local = d.mx_host.eq_ignore_ascii_case(hostname)
-            || advertised_name(views, origin, d.mx_host, scratch)?;
+            || advertised_name(views, origins, d.mx_host, scratch)?;
         if roles.receive() && local && !matching_direct {
             return Err(err(Code::DirectMx, Some(d.location)));
         }
@@ -392,9 +396,11 @@ fn validate_links(
             )?;
             *used.get_mut(usize::from(profile)).ok_or_else(invariant)? = true;
             let len = policy_name(scratch, d.name)?;
-            // HTTPS hosts are exactly the JMAP origin and enabled policy names.
+            // HTTPS hosts are exactly the JMAP origins and enabled policy names.
             // Canonical unique domains make policy-to-policy collisions impossible.
-            if name_text(scratch, len)?.eq_ignore_ascii_case(origin.host()) {
+            if origins.iter().any(|origin| {
+                name_text(scratch, len).is_ok_and(|name| name.eq_ignore_ascii_case(origin.host()))
+            }) {
                 for listener_index in 0..views.listeners.len() {
                     let l = views
                         .listeners
@@ -440,6 +446,7 @@ pub fn bind<'a>(
         bindings,
         origin,
         origin_at,
+        "",
         inputs,
         super::profile::Roles::LEGACY,
     )
@@ -449,29 +456,37 @@ pub(crate) fn bind_for_roles<'a>(
     bindings: &'a mut [BindingSlot],
     origin: Origin<'_>,
     origin_at: Location,
+    aliases: &str,
     inputs: Inputs<'a>,
     roles: super::profile::Roles,
 ) -> Result<Records<'a>, Error> {
     if bindings.is_empty() || bindings.len() > MAX_BINDINGS {
         return Err(err(Code::Capacity, None));
     }
+    let origins = super::endpoint::jmap_origins(origin, aliases)
+        .map_err(|_| err(Code::Invariant, Some(origin_at)))?;
     let mut scratch = [0; values::MAX_CERTIFICATE_NAME_BYTES];
     validate_links(
+        &origins,
         &checked_views(&inputs, arena)?,
         origin,
         origin_at,
         &mut scratch,
         roles,
     )?;
-    let mut origin_bytes = [0; MAX_CANONICAL_ORIGIN_BYTES];
-    let mut output = TextBuffer::new(&mut origin_bytes);
-    origin
-        .write_canonical(&mut output)
-        .map_err(|_| invariant())?;
-    let origin_handle = arena
-        .append(output.as_str().map_err(|_| invariant())?.as_bytes())
-        .map_err(|_| err(Code::Text, Some(origin_at)))?;
-    let origin_span = arena.compact(origin_handle).map_err(|_| invariant())?;
+    let mut origin_spans = [text::Span::EMPTY; super::endpoint::MAX_JMAP_ORIGINS];
+    for (index, origin) in origins.iter().copied().enumerate() {
+        let mut origin_bytes = [0; MAX_CANONICAL_ORIGIN_BYTES];
+        let mut output = TextBuffer::new(&mut origin_bytes);
+        origin
+            .write_canonical(&mut output)
+            .map_err(|_| invariant())?;
+        let handle = arena
+            .append(output.as_str().map_err(|_| invariant())?.as_bytes())
+            .map_err(|_| err(Code::Text, Some(origin_at)))?;
+        *origin_spans.get_mut(index).ok_or_else(invariant)? =
+            arena.compact(handle).map_err(|_| invariant())?;
+    }
     let mut names = Names {
         slots: bindings,
         count: 0,
@@ -508,6 +523,20 @@ pub(crate) fn bind_for_roles<'a>(
         };
         if let Some((profile, len, at)) = entry {
             names.add(arena, profile, name_text(&scratch, len)?, at)?;
+            let is_https = inputs
+                .listeners
+                .view_live(arena)
+                .map_err(|_| invariant())?
+                .listener(index)
+                .map_err(|_| invariant())?
+                .ok_or_else(invariant)?
+                .kind
+                == listener::Kind::Https;
+            if is_https {
+                for alias in origins.iter().skip(1) {
+                    names.add(arena, profile, alias.host(), at)?;
+                }
+            }
         }
     }
     let domain_count = inputs
@@ -547,14 +576,16 @@ pub(crate) fn bind_for_roles<'a>(
     Ok(Records {
         inputs,
         bindings: names.slots.get(..names.count).ok_or_else(invariant)?,
-        origin: origin_span,
+        origins: origin_spans,
+        origin_count: origins.len(),
         owner: names.owner,
     })
 }
 pub struct Records<'a> {
     inputs: Inputs<'a>,
     bindings: &'a [BindingSlot],
-    origin: text::Span,
+    origins: [text::Span; super::endpoint::MAX_JMAP_ORIGINS],
+    origin_count: usize,
     owner: NonZeroU64,
 }
 const _: [(); 1] = [(); (std::mem::size_of::<Records<'_>>() <= 1024) as usize];
@@ -602,8 +633,30 @@ impl fmt::Debug for RequiredName<'_> {
 }
 impl<'s, 't> View<'s, 't> {
     pub fn origin(self) -> Result<Origin<'t>, Error> {
-        Origin::parse(read(self.text, self.records.owner, self.records.origin)?)
-            .map_err(|_| invariant())
+        Origin::parse(read(
+            self.text,
+            self.records.owner,
+            *self.records.origins.first().ok_or_else(invariant)?,
+        )?)
+        .map_err(|_| invariant())
+    }
+    pub fn origins(self) -> Result<Vec<Origin<'t>>, Error> {
+        let mut output = Vec::new();
+        output
+            .try_reserve_exact(self.records.origin_count)
+            .map_err(|_| err(Code::Capacity, None))?;
+        for span in self
+            .records
+            .origins
+            .get(..self.records.origin_count)
+            .ok_or_else(invariant)?
+        {
+            output.push(
+                Origin::parse(read(self.text, self.records.owner, *span)?)
+                    .map_err(|_| invariant())?,
+            );
+        }
+        Ok(output)
     }
     pub fn binding_count(self) -> usize {
         self.records.bindings.len()
@@ -663,7 +716,8 @@ pub(super) struct Header {
     gateways: gateway::Header,
     domains: policy::Header,
     bindings: usize,
-    origin: text::Span,
+    origins: [text::Span; super::endpoint::MAX_JMAP_ORIGINS],
+    origin_count: usize,
     owner: NonZeroU64,
 }
 pub(super) struct Backing<'a> {
@@ -685,7 +739,8 @@ impl Records<'_> {
             gateways: self.inputs.gateways.seal(),
             domains: self.inputs.domains.seal(),
             bindings: self.bindings.len(),
-            origin: self.origin,
+            origins: self.origins,
+            origin_count: self.origin_count,
             owner: self.owner,
         }
     }
@@ -720,7 +775,8 @@ impl Header {
                 .bindings
                 .get(..self.bindings)
                 .ok_or_else(invariant)?,
-            origin: self.origin,
+            origins: self.origins,
+            origin_count: self.origin_count,
             owner: self.owner,
         })
     }
@@ -1410,14 +1466,15 @@ mod tests {
         assert!(slots.iter().all(|slot| slot.location.is_none()));
     }
     #[test]
-    fn all_listener_and_domain_consumers_fit_the_derived_ceiling() {
+    fn primary_origin_listener_and_domain_consumers_fit_the_reserved_cells() {
+        let needed = listener::MAX_LISTENERS + super::super::routing::MAX_DOMAINS;
         let _lock = lock();
         let profiles: Vec<_> = (0..16).map(|i| format!("profile{i}")).collect();
         let binds: Vec<_> = (0..16)
             .map(|i| format!("192.0.2.{}:{}", i + 1, if i == 0 { 25 } else { 443 }))
             .collect();
         let domains: Vec<_> = (0..256).map(|i| format!("domain{i}.test")).collect();
-        for capacity in [MAX_DERIVED_BINDINGS - 1, MAX_DERIVED_BINDINGS, MAX_BINDINGS] {
+        for capacity in [needed - 1, needed, MAX_BINDINGS] {
             let mut c = Config::base();
             c.listeners.clear();
             c.certificates.clear();
@@ -1455,7 +1512,7 @@ mod tests {
                 at(901),
                 inputs,
             );
-            if capacity < MAX_DERIVED_BINDINGS {
+            if capacity < needed {
                 assert_eq!(result.unwrap_err().code, Code::Capacity);
             } else {
                 assert_eq!(

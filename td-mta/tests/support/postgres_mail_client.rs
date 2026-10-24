@@ -305,7 +305,7 @@ pub(super) fn exercise(
         let listeners = [td_mta::https::BoundListener::new(socket, row, policies).unwrap()];
         let server = td_mta::https::Https {
             listeners: &listeners, policies, handshakes: &handshakes,
-            authentication: &authentication, origin: Origin::parse(&origin).unwrap(),
+            authentication: &authentication, origins: &[Origin::parse(&origin).unwrap()],
             resources, timeouts: &timeouts, clock: clock.clone(),
             backends: &[&backend], ready: &ready,
         };

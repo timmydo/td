@@ -273,6 +273,8 @@ struct ServerNames {
     origin: [u8; graph::MAX_CANONICAL_ORIGIN_BYTES + 1],
     origin_len: usize,
     origin_at: Location,
+    aliases: [u8; super::syntax::MAX_STRING_BYTES],
+    aliases_len: usize,
 }
 impl ServerNames {
     fn hostname(&self) -> Result<&str, Error> {
@@ -282,6 +284,10 @@ impl ServerNames {
                 .ok_or_else(invariant)?,
         )
         .map_err(|_| invariant())
+    }
+    fn aliases(&self) -> Result<&str, Error> {
+        std::str::from_utf8(self.aliases.get(..self.aliases_len).ok_or_else(invariant)?)
+            .map_err(|_| invariant())
     }
     fn origin(&self) -> Result<Origin<'_>, Error> {
         Origin::parse(
@@ -553,6 +559,7 @@ impl<'a, 'w> Builder<'a, 'w> {
             self.targets.bindings,
             names.origin()?,
             names.origin_at,
+            names.aliases()?,
             graph::Inputs {
                 listeners,
                 certificates,
@@ -763,7 +770,10 @@ fn apply_context(
             let hostname = c.required_text("hostname")?;
             values::dns_name(hostname).map_err(|_| c.value_error("hostname"))?;
             let origin = c.required_text("jmap_origin")?;
-            Origin::parse(origin).map_err(|_| c.value_error("jmap_origin"))?;
+            let primary = Origin::parse(origin).map_err(|_| c.value_error("jmap_origin"))?;
+            let aliases = c.text("jmap_origin_aliases")?.unwrap_or("");
+            super::endpoint::jmap_origins(primary, aliases)
+                .map_err(|_| c.value_error("jmap_origin_aliases"))?;
             let mut names = ServerNames {
                 hostname: [0; values::MAX_DOMAIN_BYTES],
                 hostname_len: hostname.len(),
@@ -771,7 +781,14 @@ fn apply_context(
                 origin: [0; graph::MAX_CANONICAL_ORIGIN_BYTES + 1],
                 origin_len: origin.len(),
                 origin_at: c.at("jmap_origin")?,
+                aliases: [0; super::syntax::MAX_STRING_BYTES],
+                aliases_len: aliases.len(),
             };
+            names
+                .aliases
+                .get_mut(..aliases.len())
+                .ok_or_else(invariant)?
+                .copy_from_slice(aliases.as_bytes());
             names
                 .hostname
                 .get_mut(..hostname.len())
@@ -1613,6 +1630,71 @@ certificate = "public"
         ));
         assert_eq!(error.context.unwrap().field, None);
         assert_eq!(error.context.unwrap().section, Section::Alias);
+    }
+    #[test]
+    fn jmap_aliases_are_canonical_required_certificate_names() {
+        let _guard = lock();
+        let source = SOURCE.replace("jmap_origin = \"https://jmap.example.test\"", "jmap_origin = \"https://jmap.example.test\"\njmap_origin_aliases = \"https://ALIAS.example.test:443/ https://third.example.test\"");
+        assert_ne!(source, SOURCE);
+        let mut storage = Backing::new();
+        let parsed = parse(&mut storage, &source).unwrap();
+        let graph = parsed.graph.view(parsed.text().unwrap()).unwrap();
+        let names: Vec<_> = graph
+            .origins()
+            .unwrap()
+            .iter()
+            .map(|origin| origin.host().to_owned())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "jmap.example.test",
+                "alias.example.test",
+                "third.example.test"
+            ]
+        );
+        for name in ["alias.example.test", "third.example.test"] {
+            assert!(
+                (0..graph.binding_count()).any(|i| graph.binding(i).unwrap().unwrap().name == name)
+            );
+        }
+        for aliases in [
+            "https://JMAP.example.test/",
+            "https://alias.test/path",
+            "https://alias.test:444",
+        ] {
+            let source = SOURCE.replace("jmap_origin = \"https://jmap.example.test\"", &format!("jmap_origin = \"https://jmap.example.test\"\njmap_origin_aliases = \"{aliases}\""));
+            let mut storage = Backing::new();
+            assert!(parse(&mut storage, &source).is_err());
+        }
+    }
+    #[test]
+    fn jmap_alias_mx_requires_matching_direct_smtp_name() {
+        let _guard = lock();
+        let source = SOURCE
+            .replace(
+                "[server]",
+                "[server]\njmap_origin_aliases = \"https://ALIAS.example.test\"",
+            )
+            .replace(
+                "[domain \"example.test\"]",
+                "[domain \"example.test\"]\nmx_host = \"Alias.Example.Test\"",
+            );
+        let mut storage = Backing::new();
+        let error = parse(&mut storage, &source).unwrap_err();
+        assert!(matches!(
+            error.cause,
+            Cause::Graph(graph::Error {
+                code: graph::Code::DirectMx,
+                ..
+            })
+        ));
+        let source = source.replace(
+            "server_name = \"mail.example.test\"",
+            "server_name = \"aLIAS.example.test\"",
+        );
+        let mut storage = Backing::new();
+        assert!(parse(&mut storage, &source).is_ok());
     }
     #[test]
     fn longest_raw_origin_fits_and_missing_port_fails_in_pending() {

@@ -866,3 +866,17 @@ certificate = "sts"
         }
     }
 }
+
+#[test]
+fn jmap_aliases_require_certificate_coverage_before_publication() {
+    let _serial = serial();
+    let source = source(false).replace(
+        "[server]",
+        "[server]\njmap_origin_aliases = \"https://alias.test\"",
+    );
+    let set = GenerationSet::at_startup();
+    assert!(Material::new().prepare(&set, &source).is_err());
+    assert!(Material::with_names(&["localhost", "alias.test"])
+        .prepare(&set, &source)
+        .is_ok());
+}

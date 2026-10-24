@@ -247,11 +247,14 @@ fn run_once(options: &Options, reload: &AtomicBool) -> Result<(), ConfigFailure>
             let accounts = candidate
                 .identities()
                 .map_err(|_| config_failure("configuration", "invariant"))?;
+            let origins = view
+                .origins()
+                .map_err(|_| config_failure("configuration", "invariant"))?;
             let mut sessions = Vec::new();
             let mut authentication_accounts = Vec::new();
             if mailbox_access {
                 sessions
-                    .try_reserve_exact(accounts.account_count())
+                    .try_reserve_exact(accounts.account_count() * origins.len())
                     .map_err(|_| config_failure("session", "capacity"))?;
                 authentication_accounts
                     .try_reserve_exact(accounts.account_count())
@@ -264,18 +267,19 @@ fn run_once(options: &Options, reload: &AtomicBool) -> Result<(), ConfigFailure>
                     let binding = published
                         .binding_for(account.id)
                         .ok_or_else(|| config_failure("configuration", "invariant"))?;
-                    let session = td_mta::jmap_session::Session::mail_submission(
-                        view.origin()
-                            .map_err(|_| config_failure("configuration", "invariant"))?,
-                        account,
-                        resources,
-                        td_mta::jmap_session::Concurrency {
-                            uploads: 1,
-                            requests: 1,
-                        },
-                    )
-                    .map_err(|error| adapter("session", error))?;
-                    sessions.push((binding, session));
+                    for origin in origins.iter().copied() {
+                        let session = td_mta::jmap_session::Session::mail_submission(
+                            origin,
+                            account,
+                            resources,
+                            td_mta::jmap_session::Concurrency {
+                                uploads: 1,
+                                requests: 1,
+                            },
+                        )
+                        .map_err(|error| adapter("session", error))?;
+                        sessions.push((binding, session));
+                    }
                     authentication_accounts.push((account.username, binding));
                 }
             }
@@ -326,24 +330,20 @@ fn run_once(options: &Options, reload: &AtomicBool) -> Result<(), ConfigFailure>
                     .iter()
                     .map(|service| service as &dyn td_mta::https_upload::Backend),
             );
-            let https = if let Some(authentication) = authentication.as_ref() {
-                Some(td_mta::https::Https {
+            let https = authentication
+                .as_ref()
+                .map(|authentication| td_mta::https::Https {
                     listeners: &https_listeners,
                     policies: &policies,
                     handshakes: &handshakes,
                     authentication,
-                    origin: view
-                        .origin()
-                        .map_err(|_| config_failure("configuration", "invariant"))?,
+                    origins: &origins,
                     resources,
                     timeouts: plans.timeouts(),
                     clock: clock.clone(),
                     backends: &backends,
                     ready: &https_ready,
-                })
-            } else {
-                None
-            };
+                });
             let mut receiving_bindings = Vec::new();
             receiving_bindings
                 .try_reserve_exact(accounts.account_count())

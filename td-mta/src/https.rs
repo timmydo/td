@@ -75,6 +75,7 @@ enum Phase {
     Drain,
 }
 struct Client {
+    origin: usize,
     peer: IpAddr,
     phase: Phase,
     pending: Option<TcpStream>,
@@ -127,7 +128,7 @@ pub struct Https<'a> {
     pub policies: &'a GenerationLease<TlsPolicies>,
     pub handshakes: &'a HandshakePool,
     pub authentication: &'a dyn http_auth::Authenticator,
-    pub origin: Origin<'a>,
+    pub origins: &'a [Origin<'a>],
     pub resources: &'a ResourcePlan,
     pub timeouts: &'a TimeoutPlan,
     pub clock: Arc<dyn Clock>,
@@ -135,24 +136,90 @@ pub struct Https<'a> {
     pub ready: &'a AtomicBool,
 }
 impl Https<'_> {
-    fn backend(&self, account: crate::ids::AccountId) -> Option<&dyn https_upload::Backend> {
-        self.backends
+    fn backend_origin<'b>(
+        &'b self,
+        backend: &'b dyn https_upload::Backend,
+    ) -> Result<Origin<'b>, Error> {
+        match backend.session() {
+            Some(session) => session.origin(),
+            None => self.origins.first().copied().ok_or(Error::Invalid),
+        }
+    }
+    fn backend(
+        &self,
+        account: crate::ids::AccountId,
+        selected: usize,
+    ) -> Option<&dyn https_upload::Backend> {
+        let origin = self.origins.get(selected)?;
+        self.backends.iter().copied().find(|backend| {
+            backend.account() == account
+                && self
+                    .backend_origin(*backend)
+                    .is_ok_and(|value| value.same_origin(*origin))
+        })
+    }
+    fn request_origin(&self, head: &http_request::Head<'_>) -> Result<usize, u16> {
+        let authority = if let Some(target) = head.target_origin {
+            let (scheme, authority) = target.split_once("://").ok_or(421u16)?;
+            if !scheme.eq_ignore_ascii_case("https") {
+                return Err(421);
+            }
+            authority
+        } else {
+            head.host
+        };
+        let index = self
+            .origins
             .iter()
-            .copied()
-            .find(|backend| backend.account() == account)
+            .position(|origin| http_auth::same_authority(*origin, authority))
+            .ok_or(421u16)?;
+        let origin = self.origins.get(index).ok_or(421u16)?;
+        if head
+            .origin
+            .is_some_and(|value| !Origin::parse(value).is_ok_and(|value| origin.same_origin(value)))
+        {
+            return Err(403);
+        }
+        Ok(index)
     }
     pub fn run(&self, control: &Control) -> Result<(), Error> {
         if self.listeners.is_empty() {
             return Err(Error::Invalid);
         }
-        if self.backends.len() > crate::config::identities::MAX_ACCOUNTS
-            || self.backends.iter().enumerate().any(|(index, backend)| {
-                self.backends
+        if self.origins.is_empty()
+            || self.origins.len() > crate::config::endpoint::MAX_JMAP_ORIGINS
+            || self.origins.iter().enumerate().any(|(index, origin)| {
+                self.origins
                     .iter()
                     .take(index)
-                    .any(|prior| prior.account() == backend.account())
+                    .any(|prior| prior.same_origin(*origin))
             })
+            || self.backends.len() > crate::config::identities::MAX_ACCOUNTS * self.origins.len()
         {
+            return Err(Error::Invalid);
+        }
+        let mut accounts = 0;
+        for (index, backend) in self.backends.iter().copied().enumerate() {
+            let origin = self.backend_origin(backend)?;
+            if !self
+                .origins
+                .iter()
+                .any(|allowed| allowed.same_origin(origin))
+            {
+                return Err(Error::Invalid);
+            }
+            let mut seen_account = false;
+            for prior in self.backends.iter().copied().take(index) {
+                if prior.account() == backend.account() {
+                    seen_account = true;
+                    if self.backend_origin(prior)?.same_origin(origin) {
+                        return Err(Error::Invalid);
+                    }
+                }
+            }
+            accounts += usize::from(!seen_account);
+        }
+        if accounts > crate::config::identities::MAX_ACCOUNTS {
             return Err(Error::Invalid);
         }
         for session in self.backends.iter().filter_map(|backend| backend.session()) {
@@ -620,6 +687,7 @@ impl Https<'_> {
                 let phase_deadline =
                     deadline(now, self.timeouts.limits().handshake_seconds)?.min(absolute);
                 let client = Client {
+                    origin: 0,
                     peer: address.ip(),
                     phase: Phase::Tls,
                     pending: Some(socket),
@@ -711,20 +779,12 @@ impl Https<'_> {
             }
             Phase::Authorize => {
                 let head = client.head.head().map_err(|_| Error::Invalid)?;
-                let status = if !head.target_origin.map_or_else(
-                    || http_auth::same_authority(self.origin, head.host),
-                    |value| {
-                        value.split_once("://").is_some_and(|(scheme, authority)| {
-                            scheme.eq_ignore_ascii_case("https")
-                                && http_auth::same_authority(self.origin, authority)
-                        })
-                    },
-                ) {
-                    421
-                } else if head.origin.is_some_and(|value| {
-                    !Origin::parse(value).is_ok_and(|origin| self.origin.same_origin(origin))
-                }) {
-                    403
+                let selection = self.request_origin(&head);
+                if let Ok(index) = selection {
+                    client.origin = index;
+                }
+                let status = if let Err(status) = selection {
+                    status
                 } else if !client.attempt_admitted && !attempts.admit(client.peer, time.monotonic.0)
                 {
                     429
@@ -737,7 +797,7 @@ impl Https<'_> {
                     match authentication {
                         Ok(Some(principal)) => {
                             let device = principal.device;
-                            if let Some(backend) = self.backend(principal.account) {
+                            if let Some(backend) = self.backend(principal.account, client.origin) {
                                 if let Some(account) = head.target.strip_prefix("/jmap/upload/") {
                                     if head.method != "POST" {
                                         405
@@ -958,7 +1018,9 @@ impl Https<'_> {
     fn download(&self, client: &mut Client, control: &Control) -> Result<(), Error> {
         use crate::https_download::{Failure, Request, Target};
         let principal = client.principal.ok_or(Error::Invalid)?;
-        let backend = self.backend(principal.account).ok_or(Error::Invalid)?;
+        let backend = self
+            .backend(principal.account, client.origin)
+            .ok_or(Error::Invalid)?;
         let target = match Target::parse(client.head.head().map_err(|_| Error::Invalid)?.target) {
             Ok(target) if target.account() == backend.account() => target,
             Ok(_) | Err(Error::NotFound) => {
@@ -1017,7 +1079,9 @@ impl Https<'_> {
     fn api(&self, client: &mut Client, control: &Control) -> Result<(), Error> {
         use crate::https_download::Failure;
         let principal = client.principal.ok_or(Error::Invalid)?;
-        let backend = self.backend(principal.account).ok_or(Error::Invalid)?;
+        let backend = self
+            .backend(principal.account, client.origin)
+            .ok_or(Error::Invalid)?;
         let head = client.head.head().map_err(|_| Error::Invalid)?;
         let framing = head.framing;
         let expect_continue = head.expect_continue;
@@ -1067,7 +1131,9 @@ impl Https<'_> {
     }
     fn upload(&self, client: &mut Client, control: &Control) -> Result<(), Error> {
         let principal = client.principal.ok_or(Error::Invalid)?;
-        let backend = self.backend(principal.account).ok_or(Error::Invalid)?;
+        let backend = self
+            .backend(principal.account, client.origin)
+            .ok_or(Error::Invalid)?;
         let head = client.head.head().map_err(|_| Error::Invalid)?;
         let now = self.clock.sample()?.monotonic;
         let configured_max =
@@ -1199,7 +1265,9 @@ impl Https<'_> {
         }
         state.last = now;
         let principal = client.principal.ok_or(Error::Invalid)?;
-        let backend = self.backend(principal.account).ok_or(Error::Invalid)?;
+        let backend = self
+            .backend(principal.account, client.origin)
+            .ok_or(Error::Invalid)?;
         let snapshot = match backend.event_snapshot(principal.device, client.absolute) {
             Ok(snapshot) => snapshot,
             Err(Error::Busy) => return Ok(true),

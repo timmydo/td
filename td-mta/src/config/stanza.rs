@@ -145,6 +145,7 @@ impl Section {
             Self::Server => &[
                 field!("hostname", Text, true),
                 field!("jmap_origin", Text, true),
+                field!("jmap_origin_aliases", Text, false),
                 field!("postmaster_account", Text, false),
                 field!("online_background", Boolean, false),
                 field!("public_ipv4", Text, false),
@@ -725,6 +726,7 @@ mod tests {
 [server]
 hostname = "mail.example.test"
 jmap_origin = "https://jmap.example.test"
+jmap_origin_aliases = "https://alias.example.test"
 postmaster_account = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 online_background = true
 public_ipv4 = "192.0.2.1"
@@ -836,7 +838,7 @@ per_peer_limit = 1
         }
         let stanza = p.finish().unwrap();
         assert_eq!(assigned, stanza.section().unwrap().fields().len());
-        assert_eq!(total_assigned, 55);
+        assert_eq!(total_assigned, 56);
         assert_eq!(count, 15);
     }
     #[test]

@@ -48,14 +48,14 @@ changing that validator requires an explicit atomic implementation update.
 | TLS handshake headroom | 2 | 4194304 | 8388608 |
 | Established TLS processing | 1 | 4194304 | 4194304 |
 | Certificate generations | 2 | 8388608 | 16777216 |
-| Account startup metadata | 1 | 3145728 | 3145728 |
+| Account startup metadata | 1 | 20971520 | 20971520 |
 | Cold reload overlap | 1 | 2097152 | 2097152 |
 | Process and allocator allowance | 1 | 8388608 | 8388608 |
 | SMTP fanout metadata | 1 | 2097152 | 2097152 |
-| **Total** | | | **83608832** |
+| **Total** | | | **101434624** |
 
-The total is approximately 79.74 MiB against a 128 MiB configured budget;
-the remaining 50608896 bytes are unassigned headroom, not another cache.
+The total is approximately 96.74 MiB against a 128 MiB configured budget;
+the remaining 32783104 bytes are unassigned headroom, not another cache.
 The default process ledger excludes database-server memory and WAL mappings.
 The two default TLS handshakes remain configurable within the process budget.
 The 64 MiB idle and 128 MiB workload RSS figures are provisional goals under
@@ -3724,7 +3724,7 @@ The same method meter survives all messages and transformations. Decoding,
 preview extraction and JSON stages retain their original cumulative charges;
 a small requested preview can still hit the work ceiling while validating a
 large source. The response spool cap independently limits emitted bytes.
-Default planned total is 83608832 bytes under the unchanged 128 MiB budget;
+Default planned total is 101434624 bytes under the unchanged 128 MiB budget;
 capacity-growth fixtures rebalance disposable cache within that budget.
 These are bounded implementation allocations and planner figures, not a new
 whole-service RSS or large-mailbox qualification claim.
@@ -4464,13 +4464,15 @@ a finite memory/work bound, not maximum-size throughput qualification.
 
 ## Multiple-account startup metadata
 
-A profile prepares at most sixteen account bindings and 32-KiB Sessions. The
+A profile prepares at most sixteen account bindings and one 32-KiB Session
+per account and configured JMAP origin, with at most 32 origins. The
 64 sending identities and 192-KiB canonical visible-identity limit remain
 aggregate, so the sum of compact retained catalogs stays below the existing
 single-catalog JSON expansion bound. Preparation is sequential; only one
 full-capacity JSON scratch and its compact copy overlap previously retained
-catalogs. A separate 3-MiB planned account-metadata reservation includes that
-copy peak, all Sessions, and 256 KiB for binding/registry metadata. Static
+catalogs. A separate 20-MiB planned account-metadata reservation includes that
+copy peak, all Sessions and their bounded retained origin strings, and
+256 KiB for binding/registry metadata. Static
 assertions hold the two allocation shapes within that reservation. Native
 provider allocations and whole-process RSS qualification remain separate.
 Each binding retains both its worker route and its submission route, with at
@@ -4495,11 +4497,12 @@ refuse within the fixed work allowance even when each mailbox has quota.
 
 ## Relay account registry
 
-A 128-KiB subreservation inside the existing 3-MiB account metadata row covers
+A 128-KiB subreservation inside the 20-MiB account metadata row covers
 sixteen persistent claim slots, per-account scheduling state and bounded claim
 copies for renewal snapshots, SQL and foreground custody. Static assertions
 include bounded profile/route names and keep both cold catalog overlap and
-Session preparation within the original row. The planner total is unchanged.
+Session preparation within that row. Multiple origins increase only cold
+metadata; worker counts and shared admission remain unchanged.
 One renewal thread, foreground worker, pending owner, body source pool and TLS
 buffer pair serve all accounts. Cumulative database work remains bounded by
 the existing transaction deadlines and driver limits.

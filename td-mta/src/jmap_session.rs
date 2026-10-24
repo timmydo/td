@@ -31,6 +31,7 @@ pub struct Concurrency {
 /// and td-mail read/flag/move/folder contracts before exposing this document.
 /// It conveys no authentication.
 pub struct Session {
+    origin: String,
     submission: bool,
     concurrency: Concurrency,
     bytes: Vec<u8>,
@@ -173,7 +174,13 @@ impl Session {
             .map_err(|_| Error::Capacity)?;
         let length = out.len();
         bytes.truncate(length);
+        let mut retained_origin = String::new();
+        retained_origin
+            .try_reserve_exact(origin.len())
+            .map_err(|_| Error::Capacity)?;
+        retained_origin.push_str(origin);
         Ok(Self {
+            origin: retained_origin,
             submission,
             bytes,
             state,
@@ -188,6 +195,9 @@ impl Session {
         } else {
             &[CORE, MAIL]
         }
+    }
+    pub fn origin(&self) -> Result<Origin<'_>, Error> {
+        Origin::parse(&self.origin).map_err(|_| Error::Invalid)
     }
     pub fn concurrency(&self) -> Concurrency {
         self.concurrency

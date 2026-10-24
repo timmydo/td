@@ -786,7 +786,7 @@ fn build<R: Read>(
                 selected
                     .try_reserve_exact(certificate::MAX_PROFILES)
                     .map_err(|_| Error::Capacity)?;
-                let origin = graph.origin().map_err(|_| Error::Invalid)?;
+                let origins = graph.origins().map_err(|_| Error::Invalid)?;
                 let domains = graph.domains().map_err(|_| Error::Invalid)?;
                 for (profile, full) in &identities {
                     let owns_origin = Some(*profile) == row.certificate;
@@ -803,7 +803,7 @@ fn build<R: Read>(
                         .try_reserve_exact(graph::MAX_NAMES_PER_CERTIFICATE)
                         .map_err(|_| Error::Capacity)?;
                     if owns_origin {
-                        names.push(origin.host());
+                        names.extend(origins.iter().map(|origin| origin.host()));
                     }
                     // Borrow canonical names already checked by identity admission.
                     for i in 0..domains.len() {

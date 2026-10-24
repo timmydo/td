@@ -1040,12 +1040,12 @@ targets remain unverified upstream names. This classification performs no DNS lo
 creates no gateway trust or forwarding authority.
 
 Derive certificate names from direct/gateway SMTP server names, each HTTPS
-listener's JMAP host and each enabled MTA-STS host. Retain lowercase names,
+listener's allowlisted JMAP hosts and each enabled MTA-STS host. Retain lowercase names,
 deduplicate within each profile and enforce 32 names per profile, 512 binding
-cells overall. At most 272 names can be derived from the current 16
-listeners and 256 domains; a compile-time check keeps that maximum within
-the conservative 512-cell reservation. Tests fill all 272 derived entries
-across 16 profiles and refuse a caller region one cell smaller. Every
+cells overall. Alias expansion is admitted within those same per-profile
+and aggregate caps; exceeding either refuses the candidate. Tests retain
+the 272-entry primary-origin listener/domain case and its one-cell-short
+refusal. Every
 declared certificate profile must have a consumer.
 The caller may supply fewer cells and receives a capacity error when they
 fill. Names are added in listener declaration order then canonical domain
@@ -1056,11 +1056,12 @@ The graph also retains read-only access to the enclosed routing table.
 Each binding cell fits 32 bytes in the existing 16 KiB partition. The whole
 borrowed graph header, including its four enclosed table headers, fits 1 KiB
 of global headroom; it replaces those headers rather than duplicating them.
-Canonical origin and required names use the existing shared 192 KiB text.
+Canonical origins and required names use the existing shared 192 KiB text.
 Required-name copies are charged here even when their consumer spelling is
 already stored; there is no unaccounted string pool.
 A 253-byte name scratch and 257-byte canonical-origin scratch live in the
-existing control-worker stack allowance; no heap allocation is introduced.
+existing control-worker stack allowance. Cold alias parsing reserves at most
+32 borrowed origins; each graph retains only canonical text spans.
 M04b2c3d stages the server origin (at most 258 raw bytes, including an
 optional final slash) and its field coordinate within the existing builder
 workspace, then passes it here for canonical storage. Default port 443 and
@@ -1070,7 +1071,7 @@ separate preserved spelling remains unchanged.
 Check order is binding-region size, all table owners, listener references
 and ports/peers, ACME HTTP-01, each domain's MX then MTA-STS port/reference/
 SNI rules, and unused profiles. All run before graph text or binding writes.
-Then store the canonical origin and derive names, checking per-profile and
+Then store the canonical origins and derive names, checking per-profile and
 caller-region capacity before each name append. Missing references therefore
 precede name-capacity failures; MTA-STS port errors precede its certificate
 lookup. An unused profile cannot consume graph text or binding cells.
@@ -1850,8 +1851,9 @@ configuration limits, not per-account allowances.
 
 Cold profile preparation checks that every configured account is bootstrapped
 and builds a separate binding and identity catalog for each. JMAP profiles
-can serve all configured accounts through one endpoint, with a private Session
-and backend selected by the authenticated principal. Aggregate connection,
+can serve all configured accounts through the explicit origin allowlist, with
+a private Session and backend selected by both authenticated principal and
+allowed request origin. Aggregate connection,
 request, upload, event and work admission limits remain process-wide.
 Receiving profiles accept the configured local accounts and commit each DATA
 transaction to every distinct recipient account together. Relay profiles rotate
@@ -1859,3 +1861,37 @@ through all configured accounts with one delivery worker. A busy account lease
 or paused route does not prevent other accounts from being selected. Persistent
 leases, retry selection and failure notices remain account-scoped; transport,
 body, read and queue-clock limits remain shared by the process.
+
+
+## JMAP origin allowlist
+
+`server.jmap_origin` remains the primary origin. Optional
+`server.jmap_origin_aliases` is a quoted ASCII-whitespace-separated list:
+
+```text
+[server]
+hostname = "mx.882015.xyz"
+jmap_origin = "https://mx.882015.xyz"
+jmap_origin_aliases = "https://mx.timmydouglas.com https://mx.timmyd.info"
+```
+
+The primary and aliases total at most 32 origins, fit the existing 4096-byte
+alias scalar limit, share the primary port, and must be canonically distinct.
+Existing DNS-only HTTPS origin syntax applies: no wildcard, credentials,
+path, query, fragment or IP literal. Every HTTPS listener's certificate must
+cover all configured JMAP hosts, within the existing 32-name certificate cap.
+Configuration and TLS preparation refuse incomplete coverage before serving.
+
+Origin-form requests select an allowed origin through Host; absolute-form
+requests retain their existing request-target authority precedence. Unknown
+authorities receive 421. A supplied browser Origin must equal the selected
+origin, including its port; another allowed hostname still receives 403.
+Forwarded headers and certificate SANs never expand the HTTP allowlist.
+Session URLs and API sessionState come from the same precomputed account and
+origin pair. No account, mailbox, sending identity or relay permission follows
+from selecting a hostname. Origin aliases add HTTP endpoints; SMTP recipient
+routing and MX configuration remain explicit and unchanged.
+
+The configuration source is stored with its immutable PostgreSQL version;
+adding aliases uses the existing import/check/select and service-restart
+workflow. Operators still provision certificates and DNS independently.

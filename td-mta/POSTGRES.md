@@ -6739,3 +6739,16 @@ the retained operation workflow. An explicitly empty NAME removes the override
 and restores inheritance. `account-list` includes any explicit selection. All
 mail instances must restart after configuration publication, as for other
 account edits. These commands do not configure provider credentials or DNS.
+
+
+## JMAP origin aliases
+
+Immutable configuration may declare `server.jmap_origin_aliases` beside the
+primary origin, using CONFIG.md's bounded explicit allowlist. Candidate
+preparation validates certificate coverage for every allowed JMAP hostname.
+The runtime prepares a private Session and PostgreSQL API backend for each
+account/origin pair, all sharing the same account binding, admission pools,
+credentials and persistent authority. URL and session-state selection remain
+consistent across discovery and API requests. Origin selection never selects
+another account or grants relay permission. No schema migration is required;
+configuration import/check/select and service restart activate the change.

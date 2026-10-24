@@ -94,7 +94,8 @@ omitted when all its fields have defaults.
 | --- | --- | --- |
 | `hostname` | DNS text, required | Outbound EHLO and loopback-fixture greeting identity |
 | `postmaster_account` | Account ID text, sole account if omitted | Required with multiple accounts; declared account receiving every reserved postmaster address |
-| `jmap_origin` | Origin text, required | Sole JMAP discovery/HTTP authority; never derived from Host |
+| `jmap_origin` | Origin text, required | Primary JMAP discovery/HTTP authority |
+| `jmap_origin_aliases` | Text, empty | ASCII-whitespace-separated additional HTTPS origins; at most 32 including the primary, all with the primary port; no duplicate canonical origins |
 | `online_background` | Boolean, true | Select OnlineBackground or ForegroundOnly resource planning |
 | `public_ipv4` | IP text, absent | Optional IPv4 address for `dns-plan`; never infer it from a wildcard/private bind |
 | `public_ipv6` | IP text, absent | Optional IPv6 address for `dns-plan` |
@@ -634,18 +635,20 @@ read or network operation.
 Graph binding cells use the existing 16 KiB partition. The enclosing
 borrowed graph header, including listener/certificate/gateway/domain
 headers, fits 1 KiB of global headroom and replaces the individual headers.
-Required names and canonical JMAP origin use shared non-routing text.
+Required names and canonical JMAP origins use shared non-routing text.
 Binding uses one 253-byte name scratch and one 257-byte canonical-origin
 scratch within the existing control-worker stack allowance. The whole
 loader stages at most 258 raw origin bytes plus its source coordinate in
-builder workspace until binding stores the canonical origin. Concrete
+builder workspace, plus at most 4096 raw alias bytes. Binding stores at most
+32 canonical origins and their inline span array in the graph header. Concrete
 combined layout and peak stack checks remain required before publication.
 
 Global options and lexical-root records fit 128 bytes of global headroom;
 their builder fits 256 bytes of existing workspace. Numeric address hints,
 flags and severity are inline, while roots use shared non-routing text.
-Hostname and origin are staged separately for their existing single
-canonical copies in domain-policy and graph records.
+Hostname and origins are staged separately for their canonical copies in
+domain-policy and graph records. Alias parsing uses a bounded 32-entry
+vector of borrowed origins during cold configuration.
 
 The loader owns one pending stanza within that same 36 KiB builder
 workspace. Reserve 13 KiB for the largest pending variant, including text

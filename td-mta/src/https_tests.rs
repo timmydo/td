@@ -202,7 +202,7 @@ fn https_enforces_auth_origin_framing_revocation_and_idle_deadlines() {
                 policies: &lease,
                 handshakes: &handshakes,
                 authentication: &authentication,
-                origin: Origin::parse(&origin_text).unwrap(),
+                origins: &[Origin::parse(&origin_text).unwrap()],
                 resources: &resource,
                 timeouts: &timeouts,
                 clock: clock.clone(),
@@ -510,7 +510,7 @@ fn stopped_upload_receipt(late: Option<bool>) {
                 policies: &lease,
                 handshakes: &handshakes,
                 authentication: &devices,
-                origin: Origin::parse(&origin_text).unwrap(),
+                origins: &[Origin::parse(&origin_text).unwrap()],
                 resources: &resource,
                 timeouts: &timeouts,
                 clock: clock.clone(),
@@ -662,7 +662,7 @@ fn download_failures_release_shared_slot_and_shutdown_joins_streaming() {
                 policies: &lease,
                 handshakes: &handshakes,
                 authentication: &devices,
-                origin: Origin::parse(&origin_text).unwrap(),
+                origins: &[Origin::parse(&origin_text).unwrap()],
                 resources: &resource,
                 timeouts: &timeouts,
                 clock: clock.clone(),
@@ -833,7 +833,7 @@ fn full_reply(client: &mut impl Transport) -> (u16, String, String) {
 }
 
 #[test]
-fn authenticated_account_selects_backend_even_when_device_ids_match() {
+fn account_and_allowed_origin_select_private_session_and_backend() {
     struct Accounts;
     impl http_auth::Authenticator for Accounts {
         fn authenticate(
@@ -892,14 +892,23 @@ fn authenticated_account_selects_backend_even_when_device_ids_match() {
         }
     }
     let _serial = serial();
-    let material = Material::new();
+    let material = Material::with_names(&["localhost", "alias.test"]);
     let socket = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = socket.local_addr().unwrap();
     let origin_text = format!("https://localhost:{}", address.port());
+    let alias_text = format!("https://alias.test:{}", address.port());
     let source = source(false)
+        .replace(
+            "[server]",
+            &format!("[server]\njmap_origin_aliases = \"{alias_text}\""),
+        )
         .replace("https://localhost", &origin_text)
         .replace("127.0.0.1:443", &address.to_string());
     let lease = material.published(&source);
+    let alias_lease = material.published(&source.replace(
+        "[relay]\nhost = \"localhost\"",
+        "[relay]\nhost = \"alias.test\"",
+    ));
     let resolved = resolved(&source);
     let resource = Limits::default().plan().unwrap();
     let admission = DiskLimits::default()
@@ -910,10 +919,10 @@ fn authenticated_account_selects_backend_even_when_device_ids_match() {
     let ready = AtomicBool::new(false);
     let control = Control::default();
     let handshakes = HandshakePool::new(2).unwrap();
-    let make = |id, username| Backend {
+    let make = |id, username, origin: &str| Backend {
         account: id,
         session: crate::jmap_session::Session::mail_submission(
-            Origin::parse(&origin_text).unwrap(),
+            Origin::parse(origin).unwrap(),
             crate::config::identities::AccountView {
                 id,
                 username,
@@ -928,37 +937,62 @@ fn authenticated_account_selects_backend_even_when_device_ids_match() {
         .unwrap(),
         calls: AtomicU64::new(0),
     };
-    let first = make(AccountId::from_bytes([0xaa; 16]), "first");
-    let second = make(AccountId::from_bytes([0xbb; 16]), "second");
+    let first = make(AccountId::from_bytes([0xaa; 16]), "first", &origin_text);
+    let first_alias = make(AccountId::from_bytes([0xaa; 16]), "first", &alias_text);
+    let second = make(AccountId::from_bytes([0xbb; 16]), "second", &origin_text);
+    let second_alias = make(AccountId::from_bytes([0xbb; 16]), "second", &alias_text);
     resolved.candidate().with_graph(|records, graph| {
         let rows = records.view(graph).unwrap().listeners().unwrap();
         let row = (0..rows.len()).filter_map(|i| rows.listener(i).unwrap()).find(|r| r.kind == Kind::Https).unwrap();
         let listeners = [BoundListener::new(socket, row, &lease).unwrap()];
-        let server = Https { backends: &[&first, &second], listeners: &listeners, policies: &lease,
-            handshakes: &handshakes, authentication: &Accounts, origin: Origin::parse(&origin_text).unwrap(),
+        let server = Https { backends: &[&first, &second, &first_alias, &second_alias], listeners: &listeners, policies: &lease,
+            handshakes: &handshakes, authentication: &Accounts, origins: &[Origin::parse(&origin_text).unwrap(), Origin::parse(&alias_text).unwrap()],
             resources: &resource, timeouts: &timeouts, clock: clock.clone(), ready: &ready };
         std::thread::scope(|scope| {
             let worker = scope.spawn(|| server.run(&control));
             let stop = Stop(&control);
             wait(|| ready.load(Ordering::Acquire));
+            for (origin, host, client_lease, offset) in [(&origin_text, "localhost", &lease, 0), (&alias_text, "alias.test", &alias_lease, 1)] {
             for (username, password, own, other) in [
                 ("first", "first-password", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "abbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
                 ("second", "second-password", "abbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
             ] {
+                std::thread::sleep(Duration::from_millis(250));
                 let authorization = base64(format!("{username}:{password}").as_bytes());
-                let mut peer = client(address, &lease, clock.clone());
-                send(&mut peer, format!("GET /.well-known/jmap HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: Basic {authorization}\r\n\r\n", address.port()).as_bytes());
+                let mut peer = client(address, client_lease, clock.clone());
+                send(&mut peer, format!("GET /.well-known/jmap HTTP/1.1\r\nHost: {host}:{}\r\nAuthorization: Basic {authorization}\r\n\r\n", address.port()).as_bytes());
                 let (status, _, body) = full_reply(&mut peer);
                 assert_eq!(status, 200);
+                let value = td_json::parse(&body).unwrap();
+                assert_eq!(value["apiUrl"].as_str(), Some(format!("{origin}/jmap/api").as_str()));
+                let expected = match (username, offset) {
+                    ("first", 0) => &first.session,
+                    ("first", _) => &first_alias.session,
+                    (_, 0) => &second.session,
+                    (_, _) => &second_alias.session,
+                };
+                assert_eq!(value["state"].as_str(), Some(expected.state().unwrap()));
                 assert!(body.contains(own), "{body}");
                 assert!(!body.contains(other), "{body}");
                 drop(peer);
                 for (target, expected) in [(other, 404), (own, 200)] {
-                    let mut peer = client(address, &lease, clock.clone());
-                    send(&mut peer, format!("POST /jmap/upload/{target} HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: Basic {authorization}\r\nContent-Type: text/plain\r\nContent-Length: 0\r\n\r\n", address.port()).as_bytes());
+                    std::thread::sleep(Duration::from_millis(250));
+                    let mut peer = client(address, client_lease, clock.clone());
+                    send(&mut peer, format!("POST /jmap/upload/{target} HTTP/1.1\r\nHost: {host}:{}\r\nAuthorization: Basic {authorization}\r\nContent-Type: text/plain\r\nContent-Length: 0\r\n\r\n", address.port()).as_bytes());
                     assert_eq!(full_reply(&mut peer).0, expected);
                 }
             }
+            }
+            assert_ne!(first.session.state().unwrap(), first_alias.session.state().unwrap());
+            for (host, origin, expected) in [("unlisted.test", &origin_text, 421), ("alias.test", &origin_text, 403), ("localhost", &alias_text, 403)] {
+                std::thread::sleep(Duration::from_millis(250));
+                let mut peer = client(address, &lease, clock.clone());
+                let authorization = base64(b"first:first-password");
+                send(&mut peer, format!("GET /.well-known/jmap HTTP/1.1\r\nHost: {host}:{}\r\nOrigin: {origin}\r\nAuthorization: Basic {authorization}\r\n\r\n", address.port()).as_bytes());
+                assert_eq!(full_reply(&mut peer).0, expected);
+            }
+            assert_eq!(first_alias.calls.load(Ordering::Relaxed), 1);
+            assert_eq!(second_alias.calls.load(Ordering::Relaxed), 1);
             assert_eq!(first.calls.load(Ordering::Relaxed), 1);
             assert_eq!(second.calls.load(Ordering::Relaxed), 1);
             drop(stop);

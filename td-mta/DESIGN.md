@@ -1982,13 +1982,17 @@ a healthy registry before serving again.
 TLS completes before HTTP parsing. The configured origin certificate's
 window is checked before readiness and every network scan; its failure stops
 the combined profile. Secondary HTTPS identities are checked by the provider
-at handshake time and do not govern the origin's readiness. Host must match the configured JMAP
-DNS origin and port (case-insensitive host, omitted port means 443). An Origin
-header must match that HTTPS origin; no CORS permission is emitted. A bounded
+at handshake time and do not govern the JMAP certificate's readiness.
+Request authority must match an explicitly configured JMAP origin and port
+(case-insensitive host, omitted port means 443). CONFIG.md owns the bounded
+primary/alias allowlist and absolute-target precedence. An Origin header must
+match the selected HTTPS origin; another configured alias is still cross-origin.
+No CORS permission is emitted. A bounded
 strict Basic decoder retains the exact username and password in a bounded,
 request-owned buffer. Authentication selects the account by case-sensitive
 username and verifies its generated device token. The resulting account/device
-principal selects the request backend; caller-supplied account IDs do not.
+principal and allowed request origin select the request backend;
+caller-supplied account IDs do not.
 Session discovery exposes only that account. Each request observes current
 revocation state.
 Upload publication acquires a fresh commit-time authorization guard; future
@@ -2684,7 +2688,8 @@ remains outside this deployment profile. Explicit external certificate inputs
 remain supported. No Certbot subprocess or dependency is introduced.
 
 Cold profile preparation retains one bounded binding, private identity
-catalog and Session per configured account. Authentication selects the account
+catalog per configured account and a Session per account/allowed-origin pair.
+Authentication selects the account
 before dispatch, and all backends share the process admission limits. Every
 configured account must be bootstrapped before the profile can publish.
 Receiving uses one retained fanout and one shared prepared body. Relay scheduling
