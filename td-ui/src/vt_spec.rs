@@ -2814,3 +2814,58 @@ fn a_line_wider_than_the_arena_is_refused() {
     assert!(history.lines.is_empty());
     assert_eq!((history.cells, history.stored), (0, 0));
 }
+
+#[test]
+fn osc52_is_bounded_write_only_utf8_and_chunk_independent() {
+    let stream = b"\x1b]52;c;aGVsbG8g4pyT\x1b\\";
+    for split in 0..=stream.len() {
+        let mut terminal = Terminal::new(2, 10).unwrap();
+        terminal.feed(&stream[..split]);
+        terminal.feed(&stream[split..]);
+        assert_eq!(terminal.take_clipboard_write().as_deref(), Some("hello ✓"));
+        assert!(terminal.take_clipboard_write().is_none());
+        assert!(terminal.replies().is_empty());
+    }
+    for bad in [
+        "?", "A", "Zg=", "Zh==", "Zm9=", "Zg===", "Z g==", "/w==", "AA=A",
+    ] {
+        let mut terminal = Terminal::new(1, 10).unwrap();
+        terminal.feed(format!("\x1b]52;c;{bad}\x07OK").as_bytes());
+        assert!(terminal.take_clipboard_write().is_none(), "{bad}");
+        assert!(terminal.replies().is_empty());
+        assert!(terminal.row_text(0).unwrap().starts_with("OK"));
+    }
+    let mut terminal = Terminal::new(1, 10).unwrap();
+    terminal.feed(b"\x1b]52;p;YQ==\x07\x1b]52;c;YQ==\x18");
+    assert!(terminal.take_clipboard_write().is_none());
+    terminal.feed(b"\x1b]52;;YQ\x07\x1b]52;c;Yg==\x07");
+    assert_eq!(
+        terminal.take_clipboard_write().as_deref(),
+        Some("b"),
+        "latest write coalesces"
+    );
+    terminal.feed(b"\x1b]52;c;\x07");
+    assert_eq!(
+        terminal.take_clipboard_write().as_deref(),
+        Some(""),
+        "empty write clears text"
+    );
+    let exact = format!("{}YQ==", "YWFh".repeat(MAX_CLIPBOARD / 3));
+    terminal.feed(format!("\x1b]52;c;{exact}\x07").as_bytes());
+    assert_eq!(
+        terminal.take_clipboard_write().unwrap().len(),
+        MAX_CLIPBOARD
+    );
+    let over = format!("{}YWE=", "YWFh".repeat(MAX_CLIPBOARD / 3));
+    terminal.feed(format!("\x1b]52;c;{over}\x07").as_bytes());
+    assert!(terminal.take_clipboard_write().is_none());
+    terminal.feed(
+        format!(
+            "\x1b]52;c;{}\x07\x1b[HOK",
+            "A".repeat(MAX_CLIPBOARD_OSC + 1)
+        )
+        .as_bytes(),
+    );
+    assert!(terminal.take_clipboard_write().is_none());
+    assert!(terminal.row_text(0).unwrap().starts_with("OK"));
+}

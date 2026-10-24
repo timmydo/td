@@ -91,6 +91,7 @@ const BELL_FLASH_MS: u64 = 100;
 /// otherwise set its rate. A clock rather than the frame callback, which a
 /// compositor may withhold from a hidden window.
 const TITLE_MS: u64 = 100;
+const CLIPBOARD_WRITE_MS: u64 = 100;
 
 /// Where the session's own identity is read from: the uid from the first,
 /// everything else from the second.
@@ -571,6 +572,9 @@ pub struct Window {
     /// The model or the view changed under a picture that did not.
     stale: bool,
     keymap_ready: bool,
+    clipboard_serial: Option<u32>,
+    pending_clipboard: Option<(u32, String)>,
+    clipboard_written: Option<u64>,
     viewport: keys::Viewport,
     selection: Option<render::Selection>,
     drag: Drag,
@@ -644,6 +648,9 @@ impl Window {
             backlog: false,
             stale: false,
             keymap_ready: false,
+            clipboard_serial: None,
+            pending_clipboard: None,
+            clipboard_written: None,
             viewport: keys::Viewport::new(),
             selection: None,
             drag: Drag::default(),
@@ -756,6 +763,7 @@ impl Window {
     }
 
     fn key(&mut self, serial: u32, key: u32, stroke: &Stroke) -> Result<()> {
+        self.clipboard_serial = Some(serial);
         let chord = stroke.chord.as_str();
         if self.search.is_some() {
             return self.search_key(serial, key, stroke);
@@ -774,7 +782,13 @@ impl Window {
             return Ok(());
         }
         if chord == COPY_CHORD {
-            return self.copy(serial);
+            if self.selection.is_some() || self.mouse_mode().is_none() {
+                return self.copy(serial);
+            }
+            // A mouse-reporting TUI owns the selection. Legacy encoding sends
+            // Control-C; this copy chord must never become a repeating key.
+            self.route(chord, stroke.text)?;
+            return Ok(());
         }
         if chord == PASTE_CHORD {
             if !self.paste(data::Board::Clipboard)? {
@@ -1623,6 +1637,28 @@ impl Window {
                 return Ok(());
             }
         };
+        self.pending_clipboard = None;
+        self.offer_clipboard(serial, text)
+    }
+
+    /// Coalesce child writes and wait for queued Wayland focus events first.
+    fn write_application_clipboard(&mut self, now: u64) -> Result<()> {
+        if self
+            .clipboard_written
+            .is_some_and(|at| now < at.saturating_add(CLIPBOARD_WRITE_MS))
+        {
+            return Ok(());
+        }
+        if let Some((serial, text)) = self.pending_clipboard.take() {
+            if self.client.input().focused && self.client.clipboard() {
+                self.offer_clipboard(serial, text)?;
+                self.clipboard_written = Some(now);
+            }
+        }
+        Ok(())
+    }
+
+    fn offer_clipboard(&mut self, serial: u32, text: String) -> Result<()> {
         if !self.client.clipboard() || !self.client.input().focused {
             self.ring();
             return Ok(());
@@ -1850,6 +1886,12 @@ impl Window {
         if let Some(until) = self.flash {
             wait = wait.min(until.saturating_sub(now));
         }
+        if self.pending_clipboard.is_some() {
+            let due = self
+                .clipboard_written
+                .map_or(0, |at| at.saturating_add(CLIPBOARD_WRITE_MS));
+            wait = wait.min(due.saturating_sub(now));
+        }
         if let Some(due) = self.title_due() {
             wait = wait.min(due.saturating_sub(now));
         }
@@ -1898,12 +1940,29 @@ impl Window {
     }
 
     fn output(&mut self, bytes: &[u8]) -> Result<()> {
-        self.clear_selection();
+        let selection = self.selected_text().ok().flatten();
+        let identity = (self.history().epoch, self.alternate(), self.view_top());
         let terminal = self
             .model
             .as_mut()
             .ok_or("the child wrote before the terminal had a model")?;
         terminal.feed(bytes);
+        let clipboard = terminal.take_clipboard_write();
+        if self.selection.is_some()
+            && (selection.is_none()
+                || identity != (self.history().epoch, self.alternate(), self.view_top())
+                || selection != self.selected_text().ok().flatten())
+        {
+            self.clear_selection();
+        }
+        if let Some(text) = clipboard {
+            if let Some(serial) = self
+                .clipboard_serial
+                .filter(|_| self.client.input().focused)
+            {
+                self.pending_clipboard = Some((serial, text));
+            }
+        }
         self.check_search();
         let Some(terminal) = self.model.as_mut() else {
             return Ok(());
@@ -2329,6 +2388,8 @@ impl App for Window {
                     stroke,
                 } => self.key(serial, key, &stroke)?,
                 KeyboardEvent::Focus(false) => {
+                    self.clipboard_serial = None;
+                    self.pending_clipboard = None;
                     self.board.incoming = None;
                 }
                 KeyboardEvent::Refused(error) => {
@@ -2341,6 +2402,8 @@ impl App for Window {
             Handled::Primary(event) => self.selection_event(data::Board::Primary, event),
             Handled::Capabilities { keyboard, pointer } => {
                 if !keyboard {
+                    self.clipboard_serial = None;
+                    self.pending_clipboard = None;
                     self.keymap_ready = false;
                     self.board.incoming = None;
                 }
@@ -2402,6 +2465,9 @@ impl App for Window {
                     self.client.cancel_repeat();
                 }
             }
+        }
+        if idle {
+            self.write_application_clipboard(now)?;
         }
         self.transfers(now, idle)?;
         if self.child.is_none() {
@@ -5120,8 +5186,8 @@ mod tests {
         let mut sent = String::new();
         reader.read_to_string(&mut sent).unwrap();
         assert_eq!(sent, "Welcome");
-        // Output clears what is shown; what was offered stays offered.
-        window.output(b"!").unwrap();
+        // Changed selected text clears what is shown, not the offered text.
+        window.output(b"\r!").unwrap();
         assert!(window.selection.is_none());
         assert_eq!(window.client.primary_source(), Some(source));
         // The compositor's cancel drops the text.
@@ -5256,6 +5322,129 @@ mod tests {
     }
 
     #[test]
+    fn copy_chord_reaches_a_mouse_reporting_child_only_without_our_selection() {
+        let (mut window, _peer) = presented();
+        focus(&mut window, 5);
+        modifiers(&mut window, SHIFT | CONTROL);
+        press(&mut window, 46);
+        assert!(
+            window.input.take_for_test().is_empty(),
+            "idle shell copy stays inert"
+        );
+        window.output(b"hello\x1b[?1000h").unwrap();
+        press(&mut window, 46);
+        assert_eq!(window.input.take_for_test(), b"\x03");
+        window.selection = selection((0, 0), (0, 4));
+        press(&mut window, 46);
+        assert!(window.input.take_for_test().is_empty());
+        assert_eq!(window.board.clipboard.text.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn application_clipboard_write_uses_the_focused_keys_serial_and_serves_text() {
+        let (mut window, peer) = presented();
+        window.output(b"\x1b]52;c;aGVsbG8=\x07").unwrap();
+        assert!(
+            window.board.clipboard.text.is_none(),
+            "no focused input yet"
+        );
+        focus(&mut window, 5);
+        modifiers(&mut window, CONTROL);
+        press(&mut window, 46);
+        assert_eq!(window.input.take_for_test(), b"\x03");
+        peer::drain(&peer).unwrap();
+        window.output(b"\x1b]52;c;aGVsbG8=\x07").unwrap();
+        window.write_application_clipboard(0).unwrap();
+        assert_eq!(window.board.clipboard.text.as_deref(), Some("hello"));
+        let (requests, _) = peer::drain(&peer).unwrap();
+        let set = requests
+            .iter()
+            .find(|m| m.object == DEVICE && m.opcode == 1)
+            .unwrap();
+        let mut body = Cursor::new(&set.payload);
+        let source = body.u32().unwrap();
+        assert_eq!(body.u32().unwrap(), 9, "copy uses the input event serial");
+        let (reader, writer) = UnixStream::pair().unwrap();
+        reader
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        peer::push_descriptor(window.client.connection(), OwnedFd::from(writer)).unwrap();
+        window
+            .event(text(source, 1, "text/plain;charset=utf-8"))
+            .unwrap();
+        window.transfers(0, true).unwrap();
+        let mut got = String::new();
+        std::io::Read::read_to_string(&mut &reader, &mut got).unwrap();
+        assert_eq!(got, "hello");
+        window.event(message(KEYBOARD, 2, &[10, SURFACE])).unwrap();
+        window.output(b"\x1b]52;c;YmFk\x07").unwrap();
+        window.write_application_clipboard(100).unwrap();
+        assert_eq!(window.board.clipboard.text.as_deref(), Some("hello"));
+        focus(&mut window, 11);
+        window.output(b"\x1b]52;c;YmFk\x07").unwrap();
+        window.write_application_clipboard(100).unwrap();
+        assert_eq!(
+            window.board.clipboard.text.as_deref(),
+            Some("hello"),
+            "old input cannot authorize a new focus"
+        );
+    }
+
+    #[test]
+    fn application_clipboard_coalesces_and_focus_loss_cancels_pending_writes() {
+        let (mut window, _peer) = presented();
+        focus(&mut window, 5);
+        press(&mut window, 30);
+        window.output(b"\x1b]52;c;YQ==\x07").unwrap();
+        assert!(window.board.clipboard.text.is_none());
+        window.write_application_clipboard(0).unwrap();
+        assert_eq!(window.board.clipboard.text.as_deref(), Some("a"));
+        for _ in 0..100 {
+            window.output(b"\x1b]52;c;Yg==\x07").unwrap();
+        }
+        window.output(b"\x1b]52;c;Yw==\x07").unwrap();
+        window.write_application_clipboard(99).unwrap();
+        assert_eq!(window.board.clipboard.text.as_deref(), Some("a"));
+        assert_eq!(window.next_wait(99), 1);
+        window.write_application_clipboard(100).unwrap();
+        assert_eq!(window.board.clipboard.text.as_deref(), Some("c"));
+        assert!(window.pending_clipboard.is_none());
+        window.output(b"\x1b]52;c;Yg==\x07").unwrap();
+        window.event(message(KEYBOARD, 2, &[10, SURFACE])).unwrap();
+        focus(&mut window, 11);
+        press(&mut window, 30);
+        window.write_application_clipboard(200).unwrap();
+        assert_eq!(window.board.clipboard.text.as_deref(), Some("c"));
+        assert!(window.pending_clipboard.is_none());
+        window.output(b"\rhello\x1b]52;c;Yg==\x07").unwrap();
+        window.selection = selection((0, 0), (0, 4));
+        window.copy(9).unwrap();
+        window.write_application_clipboard(300).unwrap();
+        assert_eq!(window.board.clipboard.text.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn selection_survives_cursor_style_and_unrelated_output_but_not_changed_text() {
+        let (mut window, _peer) = presented();
+        window.output(b"hello").unwrap();
+        window.selection = selection((0, 0), (0, 4));
+        for bytes in [
+            b"\x1b[?25l".as_slice(),
+            b"\x1b[31m",
+            b"\x1b[2;1Hspinner",
+            b"\x1b[1;1Hhello",
+        ] {
+            window.output(bytes).unwrap();
+            assert_eq!(window.selected_text().unwrap().as_deref(), Some("hello"));
+        }
+        window.output(b"\x1b[1;1Hj").unwrap();
+        assert!(window.selection.is_none());
+        window.selection = selection((0, 0), (0, 4));
+        window.output(b"\x1b[?1049h").unwrap();
+        assert!(window.selection.is_none());
+    }
+
+    #[test]
     fn output_during_a_drag_does_not_strand_the_rest_of_it() {
         let (mut window, _peer) = presented();
         window.output(b"Welcome to td").unwrap();
@@ -5277,8 +5466,17 @@ mod tests {
             .unwrap();
         window.event(message(POINTER, 5, &[])).unwrap();
         assert!(window.selection.is_some());
-        window.output(b"!").unwrap();
-        assert!(window.selection.is_none(), "output clears what it moved");
+        window.output(b"\rW").unwrap();
+        assert!(
+            window.selection.is_some(),
+            "an identical redraw keeps the range"
+        );
+        window.output(b"X").unwrap();
+        assert!(
+            window.selection.is_none(),
+            "changed selected text clears the range"
+        );
+        window.output(b"\rWelcome to td").unwrap();
         window
             .event(message(POINTER, 2, &[0, fixed(6, 8), fixed(0, 16)]))
             .unwrap();

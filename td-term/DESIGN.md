@@ -98,6 +98,7 @@ for td's shell and userland. It implements:
   encoding, mode 1006, each initially off and cleared by terminal reset,
   reported as §3 says;
 - OSC 0 and OSC 2 window titles, which §4's toplevel shows;
+- bounded, write-only OSC 52 clipboard requests, admitted as §3 says;
 - OSC 8 hyperlinks, which name the cells written in them, followed as
   §3 says; and
 - OSC 133;A shell-prompt marks, which §3's prompt chords jump between.
@@ -139,8 +140,8 @@ terminal implements it.
 
 Unsupported CSI operations are ignored as complete sequences. DCS, SOS,
 APC, and PM strings enter allocation-free streaming ignore states and cannot
-execute commands or open paths. An OSC's payload is kept, to 4 KiB, and an
-OSC 0, 2, 8 or 133;A is acted on when BEL or ESC, the start of ST, ends it;
+execute commands or open paths. An OSC's payload is kept, to 4 KiB except
+OSC 52 below, and an OSC 0, 2, 8, 52 or 133;A is acted on when BEL or ESC, the start of ST, ends it;
 one that outgrows the bound is dropped whole, and every other OSC,
 OSC 1's icon name among them, is ignored. CAN and SUB cancel a string.
 ESC either begins ST or recovers through the normal escape state.
@@ -180,7 +181,10 @@ Resource ceilings are part of the model contract:
   in no rendition), so short lines in a wide grid keep more lines;
 - at most 1 MiB of queued PTY output, 64 KiB of queued keyboard input, and
   64 KiB of queued terminal replies;
-- an OSC payload of at most 4 KiB, a title of at most 256 characters,
+- an OSC payload of at most 4 KiB (87,389 bytes for an exact `52;`
+  prefix, enough for a 64 KiB base64 clipboard write), one pending decoded
+  clipboard write of at most 64 KiB in each of model and adapter,
+  a title of at most 256 characters,
   and at most 1024 OSC 8 links, each with a URI of at most 2 KiB and an
   `id=` of at most 256 bytes; and
 - a grid of at most `vt::MAX_DIMENSION` (16,384) rows or columns and 1,048,576
@@ -668,9 +672,14 @@ is td-ui's (`vt_render`'s `Snapshot::span`, `Snapshot::select` and
 Leaving the surface abandons a drag still held and forgets the press count; a
 drag released past the edge comes as release, leave and frame, and that frame
 still finishes it. Reverse drags normalize only when text is copied. The
-renderer inverts every selected cell. Resizing, new terminal output, viewport
-movement, or a key press other than the copy and paste chords clears the
-range and schedules a repaint; a drag still held re-selects from its press
+renderer inverts every selected cell. Resizing, viewport movement, or a key
+press other than the copy and paste chords clears the range and schedules a
+repaint. Output keeps a nonempty selection while its copied text, history
+epoch, active screen and view's first logical row remain unchanged after
+each output chunk. Cursor motion, rendition changes and identical redraws
+therefore keep it; changed selected text, scrolling the live view, reset
+and a screen switch clear it. An over-limit selection clears on output.
+Comparison uses the same bounded text extraction as copy; a drag still held re-selects from its press
 point at its next motion, so the range it shows is over what is on screen
 then. A bare modifier is not a press the keymap reports, so the Control and
 Shift needed for the copy chord cannot erase it first. A selected row the
@@ -696,7 +705,7 @@ link read. A press past the drawn grid reads none, though a selection's
 clamp would reach the edge cell. The frame that closes the press decides:
 with a link it opens through td-ui's opener (`open`) and the press selects
 nothing, its drag and release ignored, so the selection a copy would take
-stays unless output clears it, as output clears any selection; without one
+stays unless output changes its text or view; without one
 it is a plain press. The link is read from the cells, not from what they
 look like, so text whose foreground is the colour of its background is part
 of it: what opens is what the row holds, which may be more than the person
@@ -790,7 +799,10 @@ whole or (but for motion) rung for. The entry's `kmous` is X10's prefix,
 xterm does; ncurses then sets mode 1000 itself.
 
 `C-S-c` -- the chord exactly, so an added Alt makes it another chord -- is a
-td-term command, not PTY input and not a repeat candidate. With a selection
+td-term copy command when td-term has a selection. Without one, it goes
+to a mouse-reporting child at the live view, as legacy Control-C, so an
+application can copy its own selection; elsewhere it stays a no-op, avoiding
+an accidental shell interrupt. It is never a repeat candidate. With a selection
 it needs a live data device and keyboard focus, or it rings. It offers the
 selection through
 td-ui's client, which creates a core `wl_data_source` advertising
@@ -829,7 +841,26 @@ unchanged. The whole encoded paste must fit the 64 KiB PTY input queue or none
 is admitted and the terminal rings its visual bell. Empty text is a no-op.
 Successful nonempty paste clears the visual selection and returns to the live
 viewport. Transfer, encoding, and queue failures leave the terminal usable.
-No terminal escape sequence reads or writes the host clipboard.
+`OSC 52 ; c ; BASE64` (or an empty target in place of `c`) requests a
+clipboard write. Only canonical standard base64, padded or unpadded, decoding
+to valid UTF-8 of at most 64 KiB is accepted; malformed payloads, nonzero
+unused bits, other selection targets and `?` queries are ignored whole.
+Empty text is a valid write. No escape sequence reads the clipboard or
+writes the primary selection. The pure model retains only the latest valid
+write until `take_clipboard_write`; the adapter likewise coalesces writes,
+applying at most one per 100 ms on an idle Wayland turn, after queued focus
+events, through the same source and transfer machinery as a local copy.
+It uses the last translated key's serial in the current keyboard focus;
+no key in this focus means no write. Focus or keyboard loss discards that
+serial and pending writes; a local copy supersedes a pending application
+write. A write observed without focus is discarded, never deferred until
+focus returns. A missing data device discards the request.
+
+This grants a child that has received keyboard input in the focused terminal
+clipboard-write authority, including remote programs over its PTY. It does
+not prove that a particular output sequence was caused by a copy shortcut;
+the serial is Wayland admission, not authentication. Clipboard reads remain
+unavailable to the child.
 
 The primary selection is td-term's where the compositor offers
 `zwp_primary_selection_device_manager_v1`, as sway does and td's compositor

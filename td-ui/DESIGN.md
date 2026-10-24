@@ -773,7 +773,9 @@ of its own files may name each module.
   consumer's tests are another crate.
 - `vt`: `Terminal`, the terminal model with its byte-stream parser (`new`
   at a grid, `feed`, `resize`, the `cell`, `row_text`, `cursor` and `mode`
-  reads, `take_replies` one reply at a time and `replies`, `ring` and
+  reads, `take_replies` one reply at a time and `replies`,
+  `take_clipboard_write` for the latest bounded OSC 52 write (admission
+  belongs to the adapter, per td-term §3), `ring` and
   `take_bell` for the coalesced bell, the history reads and `scrollback`,
   `wrapped`, `primary_wrapped` and `history_wrapped`, which rows an
   autowrap ended, `search`, the nearest match of a query older or newer

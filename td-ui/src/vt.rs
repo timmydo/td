@@ -17,6 +17,9 @@ const MAX_CSI_PARAMS: usize = 32;
 const MAX_REPLY_BYTES: usize = 64 * 1024;
 /// An OSC's payload past this is dropped whole.
 const MAX_OSC: usize = 4096;
+/// A clipboard write is bounded independently of other OSC strings.
+const MAX_CLIPBOARD: usize = 64 * 1024;
+const MAX_CLIPBOARD_OSC: usize = 5 + MAX_CLIPBOARD.div_ceil(3) * 4;
 /// The OSC 8 links the model remembers; a cell whose link has been
 /// forgotten is no link.
 const MAX_LINKS: usize = 1024;
@@ -1495,9 +1498,10 @@ pub struct Terminal {
     /// buffer alone makes a batch look like a single sequence.
     reply_ends: Vec<usize>,
     bell_pending: bool,
-    /// The OSC being received, and whether it outgrew `MAX_OSC`.
+    /// The OSC being received, and whether it outgrew its payload bound.
     osc: Vec<u8>,
     osc_overflow: bool,
+    clipboard_write: Option<String>,
     /// The OSC 8 links cells name, oldest first, ids rising, at most
     /// `MAX_LINKS`; an id is never given twice, so a forgotten link's
     /// cells can never name a later one.
@@ -1517,6 +1521,47 @@ struct Link {
     id: u32,
     key: Vec<u8>,
     uri: String,
+}
+
+/// OSC 52's canonical padded or unpadded base64, never a query or another
+/// selection target. MIME whitespace and nonzero trailing bits are refused.
+fn clipboard_text(encoded: &[u8]) -> Option<String> {
+    let unpadded = encoded
+        .strip_suffix(b"==")
+        .or_else(|| encoded.strip_suffix(b"="))
+        .unwrap_or(encoded);
+    let padding = encoded.len() - unpadded.len();
+    if unpadded.len() % 4 == 1
+        || (padding != 0
+            && (!encoded.len().is_multiple_of(4) || padding != (4 - unpadded.len() % 4) % 4))
+        || unpadded.len() * 6 / 8 > MAX_CLIPBOARD
+    {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(unpadded.len() * 6 / 8);
+    let mut bits = 0u16;
+    let mut count = 0;
+    for byte in unpadded {
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        };
+        bits = (bits << 6) | u16::from(value);
+        count += 6;
+        if count >= 8 {
+            count -= 8;
+            bytes.push((bits >> count) as u8);
+            bits &= (1 << count) - 1;
+        }
+    }
+    if bits != 0 {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
 }
 
 impl Terminal {
@@ -1546,11 +1591,18 @@ impl Terminal {
             bell_pending: false,
             osc: Vec::new(),
             osc_overflow: false,
+            clipboard_write: None,
             links: VecDeque::new(),
             next_link: 1,
             prompt_pending: false,
             title: None,
         })
+    }
+
+    /// Take the latest valid OSC 52 clipboard write. Reads are never answered.
+    /// The adapter owns focus, serial and clipboard policy.
+    pub fn take_clipboard_write(&mut self) -> Option<String> {
+        self.clipboard_write.take()
     }
 
     /// The window title the child set with OSC 0 or 2, while it has one.
@@ -2213,7 +2265,7 @@ impl Terminal {
         self.parser = ParserState::String(kind);
     }
 
-    /// A string's byte. An OSC's payload is kept, to `MAX_OSC`, and acted
+    /// A string's byte. An OSC's payload is kept to its bound and acted
     /// on when BEL or ESC (the start of ST) ends it; CAN and SUB cancel it.
     fn string_byte(&mut self, kind: StringKind, byte: u8) {
         if matches!(byte, 0x18 | 0x1a) {
@@ -2232,7 +2284,12 @@ impl Terminal {
             return;
         }
         if kind == StringKind::Osc {
-            if self.osc.len() < MAX_OSC {
+            let limit = if self.osc.starts_with(b"52;") {
+                MAX_CLIPBOARD_OSC
+            } else {
+                MAX_OSC
+            };
+            if self.osc.len() < limit {
                 self.osc.push(byte);
             } else {
                 self.osc_overflow = true;
@@ -2242,7 +2299,7 @@ impl Terminal {
     }
 
     /// An OSC this profile acts on: 0 or 2, the window title, 8, a
-    /// hyperlink, or 133;A, a shell prompt's start, whatever parameters
+    /// hyperlink, 52, a clipboard write, or 133;A, a shell prompt's start, whatever parameters
     /// follow. Any other is ignored.
     fn dispatch_osc(&mut self) {
         let mut payload = std::mem::take(&mut self.osc);
@@ -2253,6 +2310,13 @@ impl Terminal {
             self.osc_title(text);
         } else if let Some(rest) = payload.strip_prefix(b"8;") {
             self.osc_link(rest);
+        } else if let Some(encoded) = payload
+            .strip_prefix(b"52;c;")
+            .or_else(|| payload.strip_prefix(b"52;;"))
+        {
+            if let Some(text) = clipboard_text(encoded) {
+                self.clipboard_write = Some(text);
+            }
         } else if payload == b"133;A" || payload.starts_with(b"133;A;") {
             self.prompt_pending = true;
         }
