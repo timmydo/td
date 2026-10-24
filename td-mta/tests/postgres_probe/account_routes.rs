@@ -218,6 +218,13 @@ pub(super) fn exercise(
         assert_eq!(sql(fixture, &format!("SELECT route_name FROM td_mta.submission_routes WHERE account=decode('{account}','hex')")), expected_route);
         assert_eq!(sql(fixture, &format!("SELECT encode(destination,'hex') FROM td_mta.submission_routes WHERE account=decode('{account}','hex')")), binding.submission_route().destination().iter().map(|b| format!("{b:02x}")).collect::<String>());
     }
+    idle_hints(
+        fixture,
+        request,
+        trust,
+        front.binding_for(a).unwrap(),
+        relay.binding_for(a).unwrap(),
+    );
     let operation = fixture.root.join("routing.op");
     command_output(
         &[
@@ -296,4 +303,108 @@ pub(super) fn exercise(
         0,
     );
     assert!(!listing.contains("outbound_profile"));
+}
+
+fn idle_hints(
+    fixture: &Fixture,
+    request: &td_mta::postgres_probe::Request<'_>,
+    trust: &TrustStore,
+    front: &runtime::Binding,
+    relay: &runtime::Binding,
+) {
+    use td_mta::{
+        ids::BootId, postgres_queue_candidates as hints, postgres_route_owners as owners,
+    };
+    let front_claim = owners::prepare(front, BootId::from_bytes([91; 16])).unwrap();
+    let relay_claim = owners::prepare(relay, BootId::from_bytes([92; 16])).unwrap();
+    let front_grant = owners::acquire(request, trust, deadline(), &front_claim).unwrap();
+    let relay_grant = owners::acquire(request, trust, deadline(), &relay_claim).unwrap();
+    let idle = |claim: &owners::Claim, generation| {
+        hints::idle_observation(request, trust, deadline(), claim, generation)
+            .unwrap()
+            .is_some()
+    };
+    let account = relay.account();
+    // Another account has front-route work, while this account has relay work.
+    assert!(idle(&front_claim, front_grant.generation));
+    assert!(!idle(&relay_claim, relay_grant.generation));
+    assert!(matches!(
+        hints::idle_observation(
+            request,
+            trust,
+            deadline(),
+            &relay_claim,
+            relay_grant.generation + 1
+        ),
+        Err(hints::Error::Owner(owners::Error::Stale))
+    ));
+    assert!(hints::idle_observation(
+        request,
+        trust,
+        std::time::Instant::now(),
+        &relay_claim,
+        relay_grant.generation
+    )
+    .is_err());
+    let original_send = sql(
+        fixture,
+        &format!("SELECT send_at FROM td_mta.submissions WHERE account=decode('{account}','hex')"),
+    );
+    sql(fixture, &format!("UPDATE td_mta.submissions SET send_at=expires_at WHERE account=decode('{account}','hex')"));
+    assert!(!idle(&relay_claim, relay_grant.generation));
+    sql(fixture, &format!("UPDATE td_mta.submissions SET send_at={original_send},completed_at=1 WHERE account=decode('{account}','hex')"));
+    assert!(idle(&relay_claim, relay_grant.generation));
+    assert!(idle(&front_claim, front_grant.generation));
+    // Completed notices must survive an outbound-route change.
+    sql(
+        fixture,
+        &format!(
+            "UPDATE td_mta.submissions SET notification=1 WHERE account=decode('{account}','hex')"
+        ),
+    );
+    assert!(!idle(&front_claim, front_grant.generation));
+    assert!(!idle(&relay_claim, relay_grant.generation));
+    sql(
+        fixture,
+        &format!(
+            "UPDATE td_mta.submissions SET notification=0 WHERE account=decode('{account}','hex')"
+        ),
+    );
+    // A retained active attempt remains recovery work independently of a
+    // submission's completion marker. No publication is authorized by this hint.
+    sql(fixture, &format!("INSERT INTO td_mta.submission_attempts SELECT account,decode(repeat('5b',16),'hex'),decode(repeat('00',32),'hex'),submission_id,route_name,destination,decode(repeat('5c',16),'hex'),decode(repeat('5d',16),'hex'),decode('0000000000000001','hex'),0,decode('00000000','hex'),decode('0000000000000001','hex'),decode('0000000000000002','hex'),true FROM td_mta.submission_routes WHERE account=decode('{account}','hex')"));
+    assert!(!idle(&relay_claim, relay_grant.generation));
+    assert!(idle(&front_claim, front_grant.generation));
+    sql(
+        fixture,
+        "DELETE FROM td_mta.submission_attempts WHERE attempt_id=decode(repeat('5b',16),'hex')",
+    );
+    assert!(idle(&relay_claim, relay_grant.generation));
+    // A new round observes work added immediately after an empty observation.
+    sql(fixture, &format!("UPDATE td_mta.submissions SET completed_at=NULL WHERE account=decode('{account}','hex')"));
+    assert!(!idle(&relay_claim, relay_grant.generation));
+    owners::release(
+        request,
+        trust,
+        deadline(),
+        &front_claim,
+        front_grant.generation,
+    )
+    .unwrap();
+    owners::release(
+        request,
+        trust,
+        deadline(),
+        &relay_claim,
+        relay_grant.generation,
+    )
+    .unwrap();
+    assert!(hints::idle_observation(
+        request,
+        trust,
+        deadline(),
+        &relay_claim,
+        relay_grant.generation
+    )
+    .is_err());
 }

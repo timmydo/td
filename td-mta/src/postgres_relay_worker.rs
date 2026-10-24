@@ -150,6 +150,26 @@ impl Worker<'_, '_> {
     ) -> Result<Buffers, Error> {
         state.active = database(worker.pending.identity())?.is_some();
         settle(worker, settlement, control)?;
+        if !state.active && self.queue.repair_request().is_none() {
+            let observed = {
+                let _slot = database(worker.connection.slots.acquire())?;
+                database(crate::postgres_queue_candidates::idle_observation(
+                    self.request,
+                    self.trust,
+                    Instant::now() + Duration::from_secs(10),
+                    claim,
+                    generation,
+                ))?
+            };
+            if let Some(observed_at) = observed {
+                self.observe_queue_clock(worker, observed_at)?;
+                if let Some(turn) = expiry_turn {
+                    turn.advance();
+                }
+                state.retry = !state.retry;
+                return Ok(buffers);
+            }
+        }
         if Instant::now() >= state.notice_at {
             let _slot = database(worker.connection.slots.acquire())?;
             let notice = crate::postgres_failure_notice::publish_next(
@@ -224,18 +244,7 @@ impl Worker<'_, '_> {
             &mut meter(cap),
         ))?;
         state.active |= !expiry.candidates.is_empty();
-        let sample = Time {
-            utc_ms: expiry.observed_at,
-            monotonic: self.clock.sample()?.monotonic,
-        };
-        let status = {
-            let mut guard = worker.guard.lock().map_err(|_| Error::Custody)?;
-            if self.queue.confirm.swap(false, Ordering::AcqRel) {
-                let _ = guard.confirm(sample);
-            }
-            guard.observe(sample).map_err(|_| Error::Custody)?
-        };
-        self.queue.confirmed.store(status.expiry, Ordering::Release);
+        let status = self.observe_queue_clock(worker, expiry.observed_at)?;
         if let Some(turn) = expiry_turn {
             let mut limited = false;
             if let Some(candidate) = expiry.candidates.first().filter(|_| status.expiry) {
@@ -345,6 +354,25 @@ impl Worker<'_, '_> {
         }
         state.retry = !state.retry;
         Ok(buffers)
+    }
+    fn observe_queue_clock(
+        &self,
+        worker: &Dispatches<'_, '_>,
+        observed_at: i64,
+    ) -> Result<crate::queue_clock::Status, Error> {
+        let sample = Time {
+            utc_ms: observed_at,
+            monotonic: self.clock.sample()?.monotonic,
+        };
+        let status = {
+            let mut guard = worker.guard.lock().map_err(|_| Error::Custody)?;
+            if self.queue.confirm.swap(false, Ordering::AcqRel) {
+                let _ = guard.confirm(sample);
+            }
+            guard.observe(sample).map_err(|_| Error::Custody)?
+        };
+        self.queue.confirmed.store(status.expiry, Ordering::Release);
+        Ok(status)
     }
     fn success(
         &self,

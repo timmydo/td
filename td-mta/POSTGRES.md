@@ -6566,6 +6566,18 @@ checks at most every 50 ms during a pause. An SMTP attempt retains its existing 
 bound, so another account may wait behind a slow peer. This is bounded rotation,
 not a per-account latency guarantee. Unsettled publication prevents rotation.
 
+After settlement, a turn without pending custody or an explicit repair request
+first makes one owner-qualified absence read. It checks unfinished submissions
+and active attempts for that account, route and destination, plus completed
+pending failure notices anywhere in the account. An empty result replaces the
+separate notice, expiry, recovery and candidate reads for that turn only. Its
+fresh database UTC still feeds the queue-clock guard and explicit confirmation;
+the empty expiry turn advances and fresh/retry selection alternates. No absence
+survives into the next turn. A positive result uses the existing fenced paths
+and does not itself mark the round active: delayed or paused work must not pin
+polling at its shortest interval. Notice scheduling is unchanged until an actual
+notice check occurs. New work committed after the hint waits for another turn.
+
 The process retains one claim operation, boot identity and owner generation per
 account instead of acquiring and releasing on each turn. Historical acquisition
 receipts require fresh owner observation and successful renewal before dispatch.

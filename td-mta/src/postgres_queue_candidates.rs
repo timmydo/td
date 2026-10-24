@@ -46,6 +46,38 @@ pub struct Page {
     pub candidates: Vec<Candidate>,
     pub next: Option<Cursor>,
 }
+/// Fresh absence hint for one scheduling turn, never delivery authority.
+/// Notices are account-wide, matching their publisher; unfinished work and
+/// recovery belong to the selected route. A positive hint proves no eligibility.
+pub fn idle_observation(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    claim: &Claim,
+    generation: u64,
+) -> Result<Option<i64>, Error> {
+    let claim = claim.clone();
+    postgres_probe::with_mailbox_client(request, trust, deadline, move |client| {
+        Box::pin(async move {
+            if !owners::begin(client, &claim, true, false).await.map_err(Error::Owner)? {
+                return Err(Error::Policy);
+            }
+            owners::check_locked(client, &claim, generation).await.map_err(Error::Owner)?;
+            let binding = claim.binding();
+            let account = binding.account();
+            let work: bool = client.query_typed_one(
+                "SELECT EXISTS(SELECT 1 FROM td_mta.submissions s JOIN td_mta.submission_routes r ON r.account=s.account AND r.submission_id=s.id WHERE s.account=$1 AND r.route_name=$2 AND r.destination=$3 AND s.completed_at IS NULL) OR EXISTS(SELECT 1 FROM td_mta.submissions WHERE account=$1 AND completed_at IS NOT NULL AND notification=1) OR EXISTS(SELECT 1 FROM td_mta.submission_attempts WHERE account=$1 AND route_name=$2 AND destination=$3 AND active)",
+                &[
+                    (&account.as_bytes().as_slice(), tokio_postgres::types::Type::BYTEA),
+                    (&binding.route().name(), tokio_postgres::types::Type::TEXT),
+                    (&binding.route().destination().as_slice(), tokio_postgres::types::Type::BYTEA),
+                ],
+            ).await.map_err(|_| Error::Database)?.try_get(0).map_err(|_| Error::Integrity)?;
+            let observed_at = owners::check_locked(client, &claim, generation).await.map_err(Error::Owner)?;
+            Ok((!work).then_some(observed_at))
+        })
+    }).map_err(Error::Connection)?
+}
 /// Holds policy/account/route locks for this bounded read only. The returned
 /// page is not a snapshot continuation or a reservation; restart at None on
 /// the next scheduling pass. Recheck queue-clock guards and every publication
