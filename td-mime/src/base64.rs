@@ -62,13 +62,18 @@ impl Decoder {
                 status: Status::Complete,
             });
         }
-        let result = self.advance(input, output, last, now, meter);
+        // Small output windows cannot amortize quartet admission.
+        let result = if output.len() >= 4 {
+            self.advance::<true>(input, output, last, now, meter)
+        } else {
+            self.advance::<false>(input, output, last, now, meter)
+        };
         if let Err(error) = result {
             self.failure = Some(error);
         }
         result
     }
-    fn advance(
+    fn advance<const GROUP: bool>(
         &mut self,
         input: &[u8],
         output: &mut [u8],
@@ -82,7 +87,66 @@ impl Decoder {
             written: 0,
             status: Status::Yield,
         };
-        for _ in 0..STEP_TRANSITIONS {
+        let mut transitions = 0;
+        let mut prepaid = 0;
+        while transitions < STEP_TRANSITIONS {
+            if GROUP
+                && prepaid == 0
+                && self.pending == 0
+                && self.sextets == 0
+                && !self.ended
+                && !self.eof
+                && STEP_TRANSITIONS - transitions >= 7
+                && meter.remaining().io_bytes >= 4
+                && meter.remaining().output_bytes >= 3
+            {
+                if let (Some(input), Some(output)) = (
+                    input.get(progress.consumed..).and_then(|v| v.get(..4)),
+                    output
+                        .get_mut(progress.written..)
+                        .and_then(|v| v.get_mut(..3)),
+                ) {
+                    // Reserve the four source visits before inspecting this quartet.
+                    meter.charge(
+                        now,
+                        Charge {
+                            io_bytes: 4,
+                            ..Charge::default()
+                        },
+                    )?;
+                    let mut values = [0u8; 4];
+                    let mut ordinary = true;
+                    for (byte, value) in input.iter().zip(values.iter_mut()) {
+                        if let Some(decoded) = sextet(*byte) {
+                            *value = decoded;
+                        } else {
+                            ordinary = false;
+                        }
+                    }
+                    if ordinary {
+                        meter.charge(
+                            now,
+                            Charge {
+                                output_bytes: 3,
+                                ..Charge::default()
+                            },
+                        )?;
+                        let [a, b, c, d] = values;
+                        output.copy_from_slice(&[
+                            (a << 2) | (b >> 4),
+                            (b << 4) | (c >> 2),
+                            (c << 6) | d,
+                        ]);
+                        progress.consumed += 4;
+                        progress.written += 3;
+                        transitions += 7;
+                        continue;
+                    }
+                    // The scalar path consumes this reserved prefix within seven turns.
+                    prepaid = 4;
+                }
+            }
+            transitions += 1;
             if self.pending != 0 {
                 let Some(destination) = output.get_mut(progress.written) else {
                     progress.status = Status::NeedOutput;
@@ -103,13 +167,17 @@ impl Decoder {
                 progress.status = Status::Complete;
                 return Ok(progress);
             } else if let Some(&byte) = input.get(progress.consumed) {
-                meter.charge(
-                    now,
-                    Charge {
-                        io_bytes: 1,
-                        ..Charge::default()
-                    },
-                )?;
+                if prepaid != 0 {
+                    prepaid -= 1;
+                } else {
+                    meter.charge(
+                        now,
+                        Charge {
+                            io_bytes: 1,
+                            ..Charge::default()
+                        },
+                    )?;
+                }
                 self.byte(byte);
                 progress.consumed += 1;
             } else if last {
@@ -164,16 +232,9 @@ impl Decoder {
             self.tail();
             return;
         }
-        let value = match byte {
-            b'A'..=b'Z' => byte - b'A',
-            b'a'..=b'z' => byte - b'a' + 26,
-            b'0'..=b'9' => byte - b'0' + 52,
-            b'+' => 62,
-            b'/' => 63,
-            _ => {
-                self.problem = true;
-                return;
-            }
+        let Some(value) = sextet(byte) else {
+            self.problem = true;
+            return;
         };
         self.bits = (self.bits << 6) | u32::from(value);
         self.sextets += 1;
@@ -183,6 +244,17 @@ impl Decoder {
             self.bits = 0;
             self.sextets = 0;
         }
+    }
+}
+
+fn sextet(byte: u8) -> Option<u8> {
+    match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
     }
 }
 
@@ -434,6 +506,88 @@ mod tests {
                     ..Charge::default()
                 }
             );
+        }
+    }
+    fn decode_chunks(input: &[u8], fragment: usize, width: usize) -> (Vec<u8>, bool, Charge) {
+        let mut decoder = Decoder::default();
+        let mut work = meter(input.len() as u64, input.len() as u64);
+        let mut result = Vec::new();
+        let mut consumed = 0;
+        let mut output = vec![0; width];
+        for _ in 0..input.len() * 4 + 10 {
+            let end = (consumed + fragment).min(input.len());
+            let progress = decoder
+                .poll(
+                    &input[consumed..end],
+                    &mut output,
+                    end == input.len(),
+                    Tick(1),
+                    &mut work,
+                )
+                .unwrap();
+            consumed += progress.consumed;
+            result.extend_from_slice(&output[..progress.written]);
+            if progress.status == Status::Complete {
+                assert_eq!(consumed, input.len());
+                return (result, decoder.is_encoding_problem(), work.remaining());
+            }
+        }
+        panic!("decoder did not complete");
+    }
+    #[test]
+    fn quartet_path_matches_scalar_fragments_for_every_octet_and_output_width() {
+        for byte in 0..=255u8 {
+            for position in 0..8 {
+                let mut input = b"TWFu".repeat(70);
+                input[position] = byte;
+                input.extend_from_slice(b"\r\n TQ==Z");
+                let expected = decode_chunks(&input, 1, 1);
+                for width in [1, 2, 3, 4, 32, 257] {
+                    assert_eq!(
+                        decode_chunks(&input, input.len(), width),
+                        expected,
+                        "octet {byte} position {position} width {width}"
+                    );
+                }
+            }
+        }
+    }
+    #[test]
+    fn quartet_path_preserves_transition_boundary_and_pending_output() {
+        let input = b"TWFu".repeat(100);
+        let mut decoder = Decoder::default();
+        let mut work = meter(400, 300);
+        let mut output = [0; 300];
+        let progress = decoder
+            .poll(&input, &mut output, true, Tick(1), &mut work)
+            .unwrap();
+        assert_eq!(
+            progress,
+            Progress {
+                consumed: 148,
+                written: 108,
+                status: Status::Yield
+            }
+        );
+        assert_eq!(&output[..108], b"Man".repeat(36));
+        assert_eq!(work.remaining().io_bytes, 252);
+        assert_eq!(work.remaining().output_bytes, 192);
+        assert_eq!(decoder.pending, 3);
+        assert_eq!(decoder.output, 0x4d616e);
+        for (input_cap, output_cap, expected) in [(7, 6, Stop::IoBytes), (8, 4, Stop::OutputBytes)]
+        {
+            let mut decoder = Decoder::default();
+            let mut work = meter(input_cap, output_cap);
+            let mut output = [0; 6];
+            assert_eq!(
+                decoder.poll(b"TWFuTWFu", &mut output, true, Tick(1), &mut work),
+                Err(expected)
+            );
+            assert_eq!(&output[..3], b"Man");
+            if expected == Stop::OutputBytes {
+                assert_eq!(output, *b"ManM\0\0");
+            }
+            assert_eq!(decoder.failure(), Some(expected));
         }
     }
 }

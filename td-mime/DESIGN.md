@@ -226,3 +226,14 @@ has a compiled 160-byte ceiling. Cached completion and consuming finish
 freshly check the original meter; substitution and any refusal are terminal.
 Output remains provisional until finish. The mail allocation probe covers
 fragmented output, padding, completion and refusal without allocation.
+
+The MIME base64 decoder groups a complete alphabet quartet and its three
+output bytes when the existing input, output and 256-transition turn allowance
+can cover it. It reserves four source visits before classification and charges
+three output bytes before copying. Non-alphabet quartets spend that same
+reserved prefix through the scalar path within the current turn; short
+budgets, fragments and output windows retain scalar admission. Both paths
+preserve per-turn progress, byte charges, malformed-input diagnostics and
+partial output on refusal. Output windows of at most three bytes select the
+scalar implementation once per poll, without repeated quartet probes. Decoder state size and source-custody requirements
+are unchanged; no decoded content is cached or newly trusted.
