@@ -11,7 +11,11 @@
 //! tried afresh. A mirror that cannot be opened, or whose write fails with
 //! `EIO`, `ENXIO` or `EBADF`, is said once on standard error and dropped for
 //! the rest of the run. Standard error itself stays blocking. Nothing td-boot
-//! prints carries a secret.
+//! prints carries a secret. A complete write to either stderr or the screen
+//! satisfies a diagnostic. If both fail in an early-boot verb, a nonblocking,
+//! one-record /dev/kmsg write is the final fallback. Short writes do not count.
+//! Each emitted stderr record is flushed before its success is reported;
+//! fallback delivery is not invalidated by flushing the failed stderr again.
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
@@ -31,8 +35,46 @@ const EBADF: i32 = 9;
 /// A line longer than this without a newline is mirrored as it stands.
 const LINE_MAX: usize = 4096;
 
-/// The VT the run mirrors to, once `start` opened it.
-static MIRROR: Mutex<Option<Mirror<File>>> = Mutex::new(None);
+/// Early-boot output routes; absent for ordinary runtime commands.
+static OUTPUTS: Mutex<Option<Fallbacks<File>>> = Mutex::new(None);
+
+struct Fallbacks<V> {
+    screen: Option<Mirror<V>>,
+    warned: bool,
+}
+
+impl<V: Write> Fallbacks<V> {
+    fn line(
+        &mut self,
+        line: &[u8],
+        primary_error: Option<&io::Error>,
+        err: &mut dyn Write,
+        mut kernel_log: impl FnMut(&[u8]) -> bool,
+    ) -> bool {
+        let screen_ok = self
+            .screen
+            .as_mut()
+            .is_some_and(|screen| screen.line(line, err));
+        let Some(error) = primary_error else {
+            return screen_ok;
+        };
+        let delivered = screen_ok || kernel_log(line);
+        if delivered && !self.warned {
+            self.warned = true;
+            let target = if screen_ok { VT } else { "/dev/kmsg" };
+            let notice =
+                format!("td-boot: standard error failed: {error}; continuing output on {target}\n");
+            if screen_ok {
+                if let Some(screen) = self.screen.as_mut() {
+                    screen.line(notice.as_bytes(), err);
+                }
+            } else {
+                kernel_log(notice.as_bytes());
+            }
+        }
+        delivered
+    }
+}
 
 /// One mirror over `vt`.
 pub(crate) struct Mirror<V> {
@@ -46,9 +88,9 @@ impl<V: Write> Mirror<V> {
 
     /// One write of `line`, never waited on. A hard error drops the mirror,
     /// said once on `err`.
-    pub(crate) fn line(&mut self, line: &[u8], err: &mut dyn Write) {
+    pub(crate) fn line(&mut self, line: &[u8], err: &mut dyn Write) -> bool {
         let Some(vt) = self.vt.as_mut() else {
-            return;
+            return false;
         };
         match vt.write(line) {
             Err(error) if matches!(error.raw_os_error(), Some(EIO | ENXIO | EBADF)) => {
@@ -58,58 +100,78 @@ impl<V: Write> Mirror<V> {
                     "td-boot: console mirror {VT}: {error}; td-boot's lines are no longer \
                      mirrored there"
                 );
+                false
             }
+            Ok(written) => written == line.len(),
             // Short, would block, interrupted or any other error: this line
             // is abandoned and the next tried afresh.
-            _ => {}
+            _ => false,
         }
     }
 }
 
-/// Start mirroring when `active` says `/dev/console` is not the VT. Called
-/// once, before the verb's first line.
+/// Enable fallbacks only for the early-boot verbs. An unknown console identity
+/// suppresses duplicate screen writes, but still permits kmsg on stderr failure.
 pub(crate) fn start(active: &Path) {
-    if !console::read(active).vt_is_second() {
-        return;
-    }
-    let opened = OpenOptions::new()
+    let screen = if console::read(active).vt_is_second() {
+        match OpenOptions::new()
+            .write(true)
+            .custom_flags(O_NOCTTY | O_NONBLOCK)
+            .open(VT)
+        {
+            Ok(vt) => Some(Mirror::new(vt)),
+            Err(error) => {
+                let _ = writeln!(
+                    io::stderr(),
+                    "td-boot: console mirror {VT}: {error}; td-boot's lines are not mirrored there"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    *OUTPUTS.lock().unwrap_or_else(PoisonError::into_inner) = Some(Fallbacks {
+        screen,
+        warned: false,
+    });
+}
+
+fn kernel_log(line: &[u8]) -> bool {
+    // Open only for this record: no descriptor survives to pin devtmpfs.
+    let Ok(mut log) = OpenOptions::new()
         .write(true)
         .custom_flags(O_NOCTTY | O_NONBLOCK)
-        .open(VT);
-    match opened {
-        Ok(vt) => {
-            *MIRROR.lock().unwrap_or_else(PoisonError::into_inner) = Some(Mirror::new(vt));
-        }
-        Err(error) => {
-            let _ = writeln!(
-                io::stderr(),
-                "td-boot: console mirror {VT}: {error}; td-boot's lines are not mirrored there"
-            );
-        }
-    }
+        .open("/dev/kmsg")
+    else {
+        return false;
+    };
+    matches!(log.write(line), Ok(written) if written == line.len())
 }
 
-/// Mirror one whole line, if the run mirrors.
-fn mirror(line: &[u8]) {
-    let mut mirror = MIRROR.lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some(mirror) = mirror.as_mut() {
-        mirror.line(line, &mut io::stderr());
-    }
+/// Return success only when a fallback accepted the complete record.
+fn mirror(line: &[u8], primary_error: Option<&io::Error>) -> bool {
+    let mut outputs = OUTPUTS.lock().unwrap_or_else(PoisonError::into_inner);
+    outputs
+        .as_mut()
+        .is_some_and(|outputs| outputs.line(line, primary_error, &mut io::stderr(), kernel_log))
 }
 
 /// td-boot's console: standard error, each whole line then mirrored.
-pub(crate) struct Console<E: Write, M: FnMut(&[u8])> {
+pub(crate) struct Console<E: Write, M: FnMut(&[u8], Option<&io::Error>) -> bool> {
     err: E,
     mirror: M,
     pending: Vec<u8>,
 }
 
+type Fallback = fn(&[u8], Option<&io::Error>) -> bool;
+
 /// The console every td-boot line goes to.
-pub(crate) fn stderr() -> Console<io::Stderr, fn(&[u8])> {
+pub(crate) fn stderr() -> Console<io::Stderr, Fallback> {
     Console::new(io::stderr(), mirror)
 }
 
-impl<E: Write, M: FnMut(&[u8])> Console<E, M> {
+impl<E: Write, M: FnMut(&[u8], Option<&io::Error>) -> bool> Console<E, M> {
     pub(crate) fn new(err: E, mirror: M) -> Self {
         Self {
             err,
@@ -120,9 +182,13 @@ impl<E: Write, M: FnMut(&[u8])> Console<E, M> {
 
     fn emit_pending(&mut self) -> io::Result<()> {
         let line = std::mem::take(&mut self.pending);
-        let result = self.err.write_all(&line);
-        (self.mirror)(&line);
-        result
+        let result = self.err.write_all(&line).and_then(|()| self.err.flush());
+        let delivered = (self.mirror)(&line, result.as_ref().err());
+        if delivered {
+            Ok(())
+        } else {
+            result
+        }
     }
 
     fn emit_lines(&mut self) -> io::Result<()> {
@@ -139,7 +205,7 @@ impl<E: Write, M: FnMut(&[u8])> Console<E, M> {
     }
 }
 
-impl<E: Write, M: FnMut(&[u8])> Write for Console<E, M> {
+impl<E: Write, M: FnMut(&[u8], Option<&io::Error>) -> bool> Write for Console<E, M> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         self.pending.extend_from_slice(bytes);
         self.emit_lines()?;
@@ -150,11 +216,12 @@ impl<E: Write, M: FnMut(&[u8])> Write for Console<E, M> {
         if !self.pending.is_empty() {
             self.emit_pending()?;
         }
-        self.err.flush()
+        // Each emitted record was already flushed on its successful path.
+        Ok(())
     }
 }
 
-impl<E: Write, M: FnMut(&[u8])> Drop for Console<E, M> {
+impl<E: Write, M: FnMut(&[u8], Option<&io::Error>) -> bool> Drop for Console<E, M> {
     fn drop(&mut self) {
         if !self.pending.is_empty() {
             let _ = self.emit_pending();
@@ -163,7 +230,7 @@ impl<E: Write, M: FnMut(&[u8])> Drop for Console<E, M> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 mod tests {
     use super::*;
     use std::cell::RefCell;
@@ -217,11 +284,15 @@ mod tests {
             }
         }
         let mirrored = Rc::clone(&log);
-        let mut console = Console::new(ErrLog(Rc::clone(&log)), move |line: &[u8]| {
-            mirrored
-                .borrow_mut()
-                .push(format!("vt {}", String::from_utf8_lossy(line)));
-        });
+        let mut console = Console::new(
+            ErrLog(Rc::clone(&log)),
+            move |line: &[u8], _error: Option<&io::Error>| {
+                mirrored
+                    .borrow_mut()
+                    .push(format!("vt {}", String::from_utf8_lossy(line)));
+                true
+            },
+        );
         let (word, count) = ("one", 2);
         writeln!(console, "td-boot: {word} of {count}").unwrap();
         console.write_all(b"two\nthr").unwrap();
@@ -261,9 +332,13 @@ mod tests {
     fn a_partial_line_flushes_and_stderr_failure_still_reaches_the_mirror() {
         let lines = Rc::new(RefCell::new(Vec::new()));
         let seen = Rc::clone(&lines);
-        let mut console = Console::new(Vec::new(), move |line: &[u8]| {
-            seen.borrow_mut().push(line.to_vec())
-        });
+        let mut console = Console::new(
+            Vec::new(),
+            move |line: &[u8], _error: Option<&io::Error>| {
+                seen.borrow_mut().push(line.to_vec());
+                false
+            },
+        );
         console.write_all(b"tail").unwrap();
         assert!(console.err.is_empty());
         console.flush().unwrap();
@@ -281,8 +356,9 @@ mod tests {
             }
         }
         let seen = Rc::clone(&lines);
-        let mut console = Console::new(Closed, move |line: &[u8]| {
-            seen.borrow_mut().push(line.to_vec())
+        let mut console = Console::new(Closed, move |line: &[u8], _error: Option<&io::Error>| {
+            seen.borrow_mut().push(line.to_vec());
+            false
         });
         assert_eq!(
             console.write_all(b"error\n").unwrap_err().kind(),
@@ -290,6 +366,143 @@ mod tests {
         );
         drop(console);
         assert_eq!(*lines.borrow(), vec![b"tail".to_vec(), b"error\n".to_vec()]);
+    }
+
+    #[test]
+    fn volume_binding_survives_serial_eio_when_the_screen_receives_it() {
+        struct FailedSerial;
+        impl Write for FailedSerial {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::from_raw_os_error(EIO))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let (screen, shown) = vt(Vec::new());
+        let mut routes = Fallbacks {
+            screen: Some(screen),
+            warned: false,
+        };
+        let mut output = Console::new(
+            FailedSerial,
+            move |line: &[u8], error: Option<&io::Error>| {
+                routes.line(line, error, &mut io::sink(), |_| {
+                    panic!("a working screen must not require kmsg")
+                })
+            },
+        );
+        let uuid = crate::volume::Uuid::parse("12345678-1234-1234-1234-123456789abc").unwrap();
+        let result = crate::report_volume_binding(&mut output, &uuid, Path::new("/dev/sda2"));
+        assert!(
+            result.is_ok(),
+            "visible volume report aborted boot: {result:?}"
+        );
+        output.flush().unwrap();
+        let shown = String::from_utf8_lossy(&shown.borrow()).into_owned();
+        assert!(
+            shown.starts_with("TD-BOOT-VOLUME 12345678-1234-1234-1234-123456789abc /dev/sda2\n")
+        );
+        assert!(shown.contains("standard error failed: Input/output error (os error 5)"));
+        assert!(shown.contains("continuing output on /dev/tty1"));
+    }
+
+    #[test]
+    fn incomplete_screen_output_uses_kmsg_and_warns_only_once() {
+        for first in [
+            Ok(Some(3)),
+            Err(io::ErrorKind::WouldBlock.into()),
+            Err(io::Error::from_raw_os_error(EIO)),
+        ] {
+            let (screen, _) = vt(vec![first]);
+            let mut routes = Fallbacks {
+                screen: Some(screen),
+                warned: false,
+            };
+            let error = io::Error::from_raw_os_error(EIO);
+            let mut records = Vec::new();
+            assert!(
+                routes.line(b"volume binding\n", Some(&error), &mut io::sink(), |line| {
+                    records.push(line.to_vec());
+                    true
+                })
+            );
+            assert_eq!(records.first().unwrap(), b"volume binding\n");
+            assert_eq!(records.len(), 2);
+            assert!(String::from_utf8_lossy(&records[1]).contains("continuing output on /dev/kmsg"));
+            assert!(
+                routes.line(b"next\n", Some(&error), &mut io::sink(), |line| {
+                    records.push(line.to_vec());
+                    true
+                })
+            );
+            assert_eq!(
+                records
+                    .iter()
+                    .filter(|line| line.starts_with(b"td-boot: standard error failed:"))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn no_output_path_must_not_turn_a_missing_report_into_success() {
+        for screen in [None, Some(vt(vec![Ok(Some(1))]).0)] {
+            let mut routes = Fallbacks {
+                screen,
+                warned: false,
+            };
+            let error = io::Error::from_raw_os_error(EIO);
+            assert!(
+                !routes.line(b"volume binding\n", Some(&error), &mut io::sink(), |_| {
+                    false
+                })
+            );
+            assert!(!routes.warned);
+        }
+        let mut routes: Fallbacks<Vec<u8>> = Fallbacks {
+            screen: None,
+            warned: false,
+        };
+        assert!(
+            !routes.line(b"healthy stderr\n", None, &mut io::sink(), |_| {
+                panic!("a successful stderr write must not be duplicated into kmsg")
+            })
+        );
+    }
+
+    #[test]
+    fn a_failed_primary_flush_can_be_satisfied_by_a_complete_fallback() {
+        struct BadFlush;
+        impl Write for BadFlush {
+            fn write(&mut self, line: &[u8]) -> io::Result<usize> {
+                Ok(line.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::from_raw_os_error(EIO))
+            }
+        }
+        let delivered = Rc::new(RefCell::new(Vec::new()));
+        let seen = delivered.clone();
+        let mut console = Console::new(BadFlush, move |line: &[u8], error: Option<&io::Error>| {
+            assert_eq!(error.unwrap().raw_os_error(), Some(EIO));
+            seen.borrow_mut().push(line.to_vec());
+            true
+        });
+        console.write_all(b"full\ntail").unwrap();
+        console.flush().unwrap();
+        console.flush().unwrap();
+        drop(console);
+        assert_eq!(
+            *delivered.borrow(),
+            vec![b"full\n".to_vec(), b"tail".to_vec()]
+        );
+        let mut failed = Console::new(BadFlush, |_: &[u8], _: Option<&io::Error>| false);
+        assert_eq!(
+            failed.write_all(b"missing\n").unwrap_err().raw_os_error(),
+            Some(EIO)
+        );
     }
 
     /// A write that would block or is short abandons that line alone: the
@@ -337,9 +550,8 @@ mod tests {
     /// read or parsed: no line is written twice to one terminal.
     #[test]
     fn the_console_identity_decides_whether_to_mirror() {
-        let dir = std::env::temp_dir().join(format!("td-boot-mirror-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let active = dir.join("active");
+        let dir = crate::test_temp::TempDir::new("td-boot-mirror").unwrap();
+        let active = dir.path().join("active");
         for (text, second) in [
             (&b"tty0 ttyS0\n"[..], true),
             (b"ttyS0 tty0\n", false),
@@ -349,11 +561,10 @@ mod tests {
             std::fs::write(&active, text).unwrap();
             assert_eq!(console::read(&active).vt_is_second(), second, "{text:?}");
         }
-        assert!(!console::read(&dir.join("absent")).vt_is_second());
-        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(!console::read(&dir.path().join("absent")).vt_is_second());
         // With no mirror started, a line reaches standard error alone.
         let mut console = Console::new(Vec::new(), mirror);
         console.write_all(b"td-boot: x\n").unwrap();
-        assert!(MIRROR.lock().unwrap().is_none());
+        assert!(OUTPUTS.lock().unwrap().is_none());
     }
 }

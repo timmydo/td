@@ -597,7 +597,22 @@ tried afresh, so a stopped VT misses lines only while it is stopped; any
 other failed write that is not a hard error skips its line the same way. A
 mirror that cannot be opened, or whose write fails with a hard error
 (`EIO`, `ENXIO` or `EBADF`), is said once on standard error and dropped
-for the rest of the run. td-boot's own standard-error writes stay
+for the rest of the run.
+
+A diagnostic succeeds when its complete record reaches standard error
+(including its flush) or the screen. A serial `EIO` therefore cannot
+abort a boot whose screen received `TD-BOOT-VOLUME`. If both paths fail,
+these early-boot verbs try one nonblocking write of the complete record
+to `/dev/kmsg`; the descriptor is closed immediately, so it cannot pin
+`/dev` across a later unmount. A short or failed write is not delivery.
+When every path fails, the original standard-error error still propagates.
+The first successful fallback reports the standard-error failure and its
+selected device, best effort, once per process. A later flush does not
+revisit a failed standard-error sink after successful fallback delivery.
+Ordinary runtime commands retain their standard-error failure behavior;
+only the named early-boot verbs enable the fallbacks.
+
+td-boot's own standard-error writes stay
 blocking, as today, so a serial line held by flow control
 (XOFF from a console server) holds td-boot at its next line, as it does
 today, and so holds the VT's prompt too, which td-boot has not yet
