@@ -1518,7 +1518,9 @@ rendering. No name or policy fragment comes from argv, the environment
 or mutable home content. Both forms keep the per-machine persistent
 authorization file, which admits no account on a td image
 (td-login/TOKEN-LOGIN.md, "SSH"), and the distinct volatile,
-loopback-restricted human self-test key. A deployment older than L7
+loopback-restricted human self-test key. Only the ordinary form additionally
+consults the primary account's `.ssh/authorized_keys`; its contents authorize
+remote Ed25519 keys but never configure the server. A deployment older than L7
 reads that file as root's, so a rollback to one re-admits any root key
 it holds, among the root paths such a rollback restores (APPLICATIONS.md
 §L.1, "The rollback window"). It runs after
@@ -2008,3 +2010,57 @@ tail follows. These excerpts can expose earlier malformed records
 that the tail omits. They are diagnostic context, never substitute evidence
 for a missing, reordered or interleaved exact record. Output is limited to
 the console retained by the runner, not a complete boot transcript guarantee.
+
+## Installed Ethernet and remote access
+
+The boot-time `netup` attempt is followed by the supervised `network` service
+running `td-netd watch`. It polls physical Ethernet interfaces four times a second,
+raises their links, and configures the first connected one in lexical order
+with IPv4 DHCP. Wi-Fi association and static addressing are outside this
+service. Plugging in a cable after boot needs no administrative action.
+Unplugging it clears the address, default route and DNS settings; reconnecting
+or attaching a USB Ethernet adapter obtains a fresh lease. Failed DHCP attempts
+retry after 15 seconds. Boot and desktop health do not require a DHCP server.
+
+`td-netd status` shows the latest connection state, address, gateway and DNS
+servers, or the most recent failure. The root-only rotated service log is
+`/var/log/svc/network.log`; status is readable by the session owner.
+For slow transfers, run `td-netd diagnose` before and after the transfer:
+it reports negotiated link speed/duplex, MTU, device errors/drops, TCP
+configuration and cumulative TCP retransmission counters without elevation.
+`up` is
+the boot-time one-shot; it refuses while the watcher owns networking. The
+watcher inherits a successful boot lease through a root-only volatile record,
+so takeover does not interrupt downloads already in progress. Its lifetime
+uses kernel uptime including suspend; expired leases are cleared on resume.
+It broadcasts
+DHCPREQUEST at half the lease lifetime, retries failures, and clears an
+expired or explicitly rejected lease before acquiring another. Servers omitting a lifetime receive
+a five-minute revalidation window. A DHCP exchange has a bounded deadline
+even when unrelated packets arrive. The daemon owns one Ethernet connection
+at a time and changes neither loopback nor Wi-Fi on disconnect.
+
+For SSH, while no hardware login key is enrolled, put the other computer's
+Ed25519 **public** key in `~/.ssh/authorized_keys` on td:
+
+```text
+mkdir -p ~/.ssh
+chmod 700 ~/.ssh
+# Append the public key as one line to ~/.ssh/authorized_keys.
+chmod 600 ~/.ssh/authorized_keys
+td-netd status
+whoami
+```
+
+Then run `ssh ACCOUNT@ADDRESS` from the other computer using the displayed
+account and address. The SSH server already starts at boot. Login-key
+enrollment disables this remote path and revokes existing SSH sessions;
+`td-login/TOKEN-LOGIN.md` owns that policy. Root and password login are disabled.
+
+An installed machine can receive this through its source checkout without
+reinstalling: pull the published changes in `~/src/td`, run `./update`, approve
+the deployment on the physical secure-attention screen, and reboot.
+`td-update/DESIGN.md` specifies the build and activation flow. For an older
+image whose networking runs only at boot, connect Ethernet before rebooting
+to fetch the update. Updates build locally and need network access for missing
+pinned sources and toolchain inputs.

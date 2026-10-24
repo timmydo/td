@@ -733,14 +733,22 @@ path, is refused as `THREAT-MODEL.md` §3 specifies.
 
 ## SSH
 
-The primary account logs in over SSH only with the boot self-test's
-volatile key, from 127.0.0.1: the root-owned
+On a verifiably unenrolled machine, the primary account can authorize
+remote Ed25519 keys in its own `~/.ssh/authorized_keys`. OpenSSH resolves
+that relative path against the account database home, not an environment
+variable. The home and key file must not be writable by other users; use
+mode 0700 for `~/.ssh` and 0600 for `authorized_keys`. Add public keys
+only, one per line. Changes take effect on the next login without restarting
+the server. Password and root login remain disabled.
+
+The boot self-test also uses a volatile key, from 127.0.0.1: the root-owned
 `/run/td-ssh-selftest-authorized_keys` line is `restrict,from="127.0.0.1"`,
 and its private key is readable by UID 1000 itself, so it grants nothing
 the session lacks and nothing off the machine. `/etc/bootsuccess`
 generates both on every boot (`build_bootsuccess` in
 `recipes/src/recipes/system-x86-64.rs`), and the policy's `Match` block
-names that file (`td-firstboot/src/ssh_policy.rs`). Root has no SSH
+names that file and, only in the ordinary form, `.ssh/authorized_keys`
+(`td-firstboot/src/ssh_policy.rs`). Root has no SSH
 login in either form: both carry `PermitRootLogin no` (`APPLICATIONS.md`
 §L.1, L7), and root's shadow field is `!`. This is that rule's one
 statement; other documents point here.
@@ -764,14 +772,14 @@ renders the form that matches the login state, decided by the
 directory-and-name check alone, with no helper: a valid directory
 without the record name or the protected marker, on a boot without
 `/run/td-admit`, renders the ordinary policy, and anything else the
-enforced form. The ordinary policy is byte for byte the one rendered
-before this tier but for L7's root line, `PermitRootLogin no` where it
-was `PermitRootLogin prohibit-password`. The cutover renders it within a
-boot. The QEMU root-refusal fixture (`APPLICATIONS.md` §L.1, "Retiring
+enforced form. The cutover renders it within a boot, removing access
+to owner-managed remote keys on enrollment and terminating existing SSH
+sessions. Removing the last login key restores the ordinary form, including
+access through remote keys retained in the account's home. The QEMU root-refusal fixture (`APPLICATIONS.md` §L.1, "Retiring
 the escape hatch") runs on unenrolled images, and root is refused in
 both forms.
 
-The two forms differ in one place. The enforced form adds the line
+The enforced form omits `.ssh/authorized_keys` and adds the line
 `AllowUsers NAME` right after `PermitRootLogin no`, still in the global
 section before the primary's `Match User NAME` block, NAME being the
 admitted primary account; every other byte is the same. The shared

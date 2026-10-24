@@ -11,7 +11,10 @@
 //!   without waiting for an external interface or DHCP.
 //! * `td-netd up [IFACE]` — autodetect a link (or use IFACE), bring it up,
 //!   DHCP-configure it, and write resolv.conf. No usable interface is a clean
-//!   no-op (exit 0), so a diskless/NIC-less boot is unaffected.
+//!   no-op (exit 2), so boot can distinguish it from a configured link.
+//! * `td-netd watch` — supervise physical Ethernet carrier, DHCP and leases.
+//! * `td-netd status` — print the latest connection state and address.
+//! * `td-netd diagnose` — report link speed, errors and TCP configuration/counters.
 //! * `td-netd resolve NAME` — DNS A-query NAME via the configured nameserver and
 //!   print the first address.
 //! * `td-netd reach HOST PORT` — resolve HOST (if a name) and TCP-connect it.
@@ -41,8 +44,10 @@ use std::io::{self, Write};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream, UdpSocket};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::Path;
 use std::process::ExitCode;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
 compile_error!("td-netd is x86_64-linux only (raw syscall ABI)");
@@ -190,13 +195,21 @@ fn write_ifname(req: &mut [u8], name: &str) -> io::Result<()> {
 /// Bring `ifname` up: read the current flags, OR in IFF_UP, write back. IFF_RUNNING
 /// is a kernel-owned carrier flag ignored on SIOCSIFFLAGS, so it is not set here.
 fn set_link_up(fd: RawFd, ifname: &str) -> io::Result<()> {
+    set_link_enabled(fd, ifname, true)
+}
+
+fn set_link_enabled(fd: RawFd, ifname: &str, enabled: bool) -> io::Result<()> {
     let mut req = [0u8; IFREQ_LEN];
     write_ifname(&mut req, ifname)?;
     ioctl(fd, SIOCGIFFLAGS, req.as_mut_ptr())?;
     let cur: [u8; 2] = rd_bytes(&req, IFNAMSIZ, 2)
         .and_then(|b| b.try_into().ok())
         .ok_or_else(|| io::Error::other("SIOCGIFFLAGS returned a short ifreq"))?;
-    let flags = i16::from_ne_bytes(cur) | IFF_UP;
+    let flags = if enabled {
+        i16::from_ne_bytes(cur) | IFF_UP
+    } else {
+        i16::from_ne_bytes(cur) & !IFF_UP
+    };
     put(&mut req, IFNAMSIZ, &flags.to_ne_bytes());
     ioctl(fd, SIOCSIFFLAGS, req.as_mut_ptr())
 }
@@ -295,6 +308,7 @@ const DHCP_DISCOVER: u8 = 1;
 const DHCP_OFFER: u8 = 2;
 const DHCP_REQUEST: u8 = 3;
 const DHCP_ACK: u8 = 5;
+const DHCP_NAK: u8 = 6;
 const DHCP_HDR_LEN: usize = 240; // BOOTP header (236) + magic cookie (4)
 
 // DHCP option codes.
@@ -305,6 +319,7 @@ const OPT_MSG_TYPE: u8 = 53;
 const OPT_SERVER_ID: u8 = 54;
 const OPT_PARAM_LIST: u8 = 55;
 const OPT_REQUESTED_IP: u8 = 50;
+const OPT_LEASE_TIME: u8 = 51;
 const OPT_END: u8 = 255;
 const OPT_PAD: u8 = 0;
 
@@ -317,6 +332,8 @@ struct Lease {
     routers: Vec<[u8; 4]>,
     dns: Vec<[u8; 4]>,
     server_id: Option<[u8; 4]>,
+    seconds: Option<u32>,
+    requested_at: Option<Duration>,
     xid: u32,
 }
 
@@ -378,6 +395,7 @@ fn parse_dhcp(buf: &[u8]) -> Option<Lease> {
             OPT_MSG_TYPE => lease.msg_type = data.first().copied().unwrap_or(0),
             OPT_SUBNET => lease.subnet = data.try_into().ok(),
             OPT_SERVER_ID => lease.server_id = data.try_into().ok(),
+            OPT_LEASE_TIME => lease.seconds = rd_u32_be_arr(data),
             OPT_ROUTER => lease.routers = ip_list(data),
             OPT_DNS => lease.dns = ip_list(data),
             _ => {}
@@ -421,21 +439,51 @@ fn make_xid(mac: [u8; 6]) -> u32 {
 /// carrier lags); a non-matching broadcast is drained within the current window
 /// rather than costing a retransmit.
 fn dhcp_round(sock: &UdpSocket, pkt: &[u8], xid: u32, want: u8, tries: u32) -> io::Result<Lease> {
+    dhcp_round_window(sock, pkt, xid, want, tries, Duration::from_secs(2))
+}
+
+fn dhcp_round_window(
+    sock: &UdpSocket,
+    pkt: &[u8],
+    xid: u32,
+    want: u8,
+    tries: u32,
+    window: Duration,
+) -> io::Result<Lease> {
     let dst = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::BROADCAST, 67));
     // Room for an option-heavy reply; recv_from truncates anything larger, which
     // would then fail to parse.
     let mut buf = [0u8; 2048];
+    let requested_at = uptime()?;
     for _ in 0..tries {
+        let deadline = Instant::now() + window;
         sock.send_to(pkt, dst)?;
         // Drain replies arriving within this transmit's read-timeout window; only a
         // timeout (WouldBlock/TimedOut) breaks out to retransmit.
         loop {
+            if uptime()?.saturating_sub(requested_at) >= window.saturating_mul(tries) {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "DHCP exchange expired, including suspend time",
+                ));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            sock.set_read_timeout(Some(remaining))?;
             match sock.recv_from(&mut buf) {
                 Ok((n, _)) => {
-                    if let Some(lease) = buf.get(..n).and_then(parse_dhcp) {
-                        if lease.xid == xid && lease.msg_type == want {
-                            return Ok(lease);
+                    if let Some(reply) = buf.get(..n).and_then(|b| matching_reply(b, xid, want)) {
+                        let mut lease = reply?;
+                        if uptime()?.saturating_sub(requested_at) >= window.saturating_mul(tries) {
+                            return Err(io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                "DHCP response arrived after exchange expiry",
+                            ));
                         }
+                        lease.requested_at = Some(requested_at);
+                        return Ok(lease);
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
@@ -448,6 +496,24 @@ fn dhcp_round(sock: &UdpSocket, pkt: &[u8], xid: u32, want: u8, tries: u32) -> i
         io::ErrorKind::TimedOut,
         format!("no DHCP {want} within the retry budget"),
     ))
+}
+
+fn matching_reply(packet: &[u8], xid: u32, want: u8) -> Option<io::Result<Lease>> {
+    let lease = parse_dhcp(packet)?;
+    if lease.xid != xid {
+        return None;
+    }
+    if want == DHCP_ACK && lease.msg_type == DHCP_NAK {
+        return Some(Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "DHCP server rejected the lease",
+        )));
+    }
+    if lease.msg_type == want {
+        Some(Ok(lease))
+    } else {
+        None
+    }
 }
 
 /// The full DHCP handshake (DISCOVER→OFFER→REQUEST→ACK) over a broadcast UDP
@@ -473,6 +539,9 @@ fn dhcp_configure(mac: [u8; 6]) -> io::Result<Lease> {
     }
     if ack.dns.is_empty() {
         ack.dns = offer.dns.clone();
+    }
+    if ack.seconds.is_none() {
+        ack.seconds = offer.seconds;
     }
     Ok(ack)
 }
@@ -719,6 +788,7 @@ fn cmd_loopback() -> io::Result<ExitCode> {
 /// boot glue's UP marker: `SUCCESS` = an external link was configured; `2` = only
 /// loopback (no NIC), so the marker is NOT emitted; any error propagates as failure.
 fn cmd_up(iface_arg: Option<String>) -> io::Result<ExitCode> {
+    let _lock = network_lock()?;
     // Loopback and the static hosts table are always established first, so a
     // NIC-less boot still gets a complete localhost path through /run.
     let ctl = prepare_loopback()?;
@@ -734,51 +804,416 @@ fn cmd_up(iface_arg: Option<String>) -> io::Result<ExitCode> {
         }
     };
 
-    set_link_up(ctlfd, &ifname)?;
-    // A device-scoped route for the limited broadcast so the DHCP DISCOVER/REQUEST
-    // egress this interface before it has an address. EEXIST (a re-run) is benign.
-    if let Err(e) = add_broadcast_route(ctlfd, &ifname) {
+    let lease = acquire(ctlfd, &ifname)?;
+    apply_lease(ctlfd, &ifname, &lease)?;
+    report(&lease_status(&ifname, &lease))?;
+    Ok(ExitCode::SUCCESS)
+}
+
+// The supervisor and the one-shot boot command serialize all mutations. The
+// lock is persistent across process deaths; its kernel lock is not.
+fn network_lock() -> io::Result<fs::File> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open("/run/td-netd.lock")?;
+    file.try_lock()
+        .map_err(|e| io::Error::other(format!("network manager already running: {e}")))?;
+    Ok(file)
+}
+
+fn acquire(fd: RawFd, name: &str) -> io::Result<Lease> {
+    set_link_up(fd, name)?;
+    if let Err(e) = add_broadcast_route(fd, name) {
         if e.raw_os_error() != Some(17) {
             return Err(e);
         }
     }
+    dhcp_configure(get_mac(fd, name)?)
+}
 
-    let mac = get_mac(ctlfd, &ifname)?;
-    let lease = dhcp_configure(mac)?;
-
-    set_addr(ctlfd, &ifname, SIOCSIFADDR, lease.yiaddr)?;
+fn apply_lease(fd: RawFd, name: &str, lease: &Lease) -> io::Result<()> {
+    live_lease_start(lease, uptime()?)?;
+    if lease.yiaddr == [0; 4] || lease.subnet.is_none() || lease.seconds == Some(0) {
+        return Err(io::Error::other(
+            "DHCP ACK lacks a usable address, mask or lifetime",
+        ));
+    }
+    set_addr(fd, name, SIOCSIFADDR, lease.yiaddr)?;
     if let Some(mask) = lease.subnet {
-        set_addr(ctlfd, &ifname, SIOCSIFNETMASK, mask)?;
+        set_addr(fd, name, SIOCSIFNETMASK, mask)?;
     }
     if let Some(gw) = lease.routers.first().copied() {
-        if let Err(e) = add_default_route(ctlfd, gw) {
+        if let Err(e) = add_default_route(fd, gw) {
             if e.raw_os_error() != Some(17) {
                 return Err(e);
             }
         }
     }
+    fs::write(resolv_conf_path(), render_resolv_conf(&lease.dns))?;
+    write_handoff(name, lease)
+}
 
-    let path = resolv_conf_path();
-    fs::write(&path, render_resolv_conf(&lease.dns))
-        .map_err(|e| io::Error::new(e.kind(), format!("write {path}: {e}")))?;
-
-    let gw = lease
-        .routers
-        .first()
-        .map(|g| fmt_ip(*g))
-        .unwrap_or_else(|| "none".into());
-    let dns = lease
-        .dns
-        .iter()
-        .map(|d| fmt_ip(*d))
-        .collect::<Vec<_>>()
-        .join(",");
-    println!(
-        "td-netd: {ifname} up, address {} netmask {} gateway {gw} dns [{dns}]",
+fn lease_status(name: &str, lease: &Lease) -> String {
+    format!(
+        "{name}: connected, address {} netmask {} gateway {} dns [{}]",
         fmt_ip(lease.yiaddr),
         lease.subnet.map(fmt_ip).unwrap_or_else(|| "none".into()),
-    );
-    Ok(ExitCode::SUCCESS)
+        lease
+            .routers
+            .first()
+            .copied()
+            .map(fmt_ip)
+            .unwrap_or_else(|| "none".into()),
+        lease
+            .dns
+            .iter()
+            .copied()
+            .map(fmt_ip)
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+const STATUS_PATH: &str = "/run/td-network-status";
+
+fn report(message: &str) -> io::Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o644)
+        .open("/run/td-network-status.new")?;
+    writeln!(file, "{message}")?;
+    fs::rename("/run/td-network-status.new", STATUS_PATH)?;
+    let _ = writeln!(io::stderr(), "td-netd: {message}");
+    Ok(())
+}
+
+fn ethernet_interfaces() -> io::Result<Vec<String>> {
+    let mut names = Vec::new();
+    for entry in fs::read_dir("/sys/class/net")? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.join("device").exists()
+            && !path.join("wireless").exists()
+            && fs::read_to_string(path.join("type"))?.trim() == "1"
+        {
+            if let Some(name) = entry.file_name().to_str() {
+                names.push(name.to_owned());
+            }
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
+fn carrier(name: &str) -> bool {
+    fs::read_to_string(Path::new("/sys/class/net").join(name).join("carrier"))
+        .map(|s| s.trim() == "1")
+        .unwrap_or(false)
+}
+
+// Taking the link down flushes its routes, including the old default and the
+// DHCP broadcast route. Clear its address before re-enabling it for a new LAN.
+fn clear_interface(fd: RawFd, name: &str) -> io::Result<()> {
+    if Path::new("/sys/class/net").join(name).exists() {
+        set_link_enabled(fd, name, false)?;
+        set_addr(fd, name, SIOCSIFADDR, [0; 4])?;
+        set_link_up(fd, name)?;
+    }
+    match fs::remove_file(HANDOFF_PATH) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    fs::write(resolv_conf_path(), render_resolv_conf(&[]))
+}
+
+fn renewal_packet(mac: [u8; 6], xid: u32, address: [u8; 4]) -> Vec<u8> {
+    let mut packet = build_dhcp(DHCP_REQUEST, mac, xid, None, None);
+    put(&mut packet, 12, &address);
+    packet
+}
+
+fn renew(name: &str, current: &Lease, remaining: Duration) -> io::Result<Lease> {
+    let ctl = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))?;
+    let mac = get_mac(ctl.as_raw_fd(), name)?;
+    let xid = make_xid(mac);
+    let packet = renewal_packet(mac, xid, current.yiaddr);
+    // Replies may be broadcast even though ciaddr is already configured.
+    let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 68))?;
+    socket.set_broadcast(true)?;
+    let mut ack = dhcp_round_window(
+        &socket,
+        &packet,
+        xid,
+        DHCP_ACK,
+        1,
+        remaining.min(Duration::from_secs(2)),
+    )?;
+    if ack.yiaddr == [0; 4] {
+        ack.yiaddr = current.yiaddr;
+    }
+    if ack.subnet.is_none() {
+        ack.subnet = current.subnet;
+    }
+    if ack.routers.is_empty() {
+        ack.routers = current.routers.clone();
+    }
+    if ack.dns.is_empty() {
+        ack.dns = current.dns.clone();
+    }
+    if ack.seconds.is_none() {
+        ack.seconds = current.seconds;
+    }
+    Ok(ack)
+}
+
+fn lease_duration(lease: &Lease) -> Duration {
+    // Old servers without option 51 get a short bounded revalidation window.
+    Duration::from_secs(u64::from(lease.seconds.unwrap_or(300)))
+}
+
+const HANDOFF_PATH: &str = "/run/td-network-lease";
+
+// /proc uptime includes suspend time, unlike Instant. An address whose lease
+// expired while the laptop slept must not remain configured after resume.
+fn uptime() -> io::Result<Duration> {
+    let body = fs::read_to_string("/proc/uptime")?;
+    let value = body
+        .split_whitespace()
+        .next()
+        .and_then(|s| s.parse::<f64>().ok())
+        .ok_or_else(|| io::Error::other("invalid kernel uptime"))?;
+    Duration::try_from_secs_f64(value).map_err(io::Error::other)
+}
+
+fn encode_handoff(name: &str, lease: &Lease, acquired: Duration) -> String {
+    format!(
+        "{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+        name,
+        acquired.as_secs_f64(),
+        fmt_ip(lease.yiaddr),
+        lease.subnet.map(fmt_ip).unwrap_or_default(),
+        lease
+            .routers
+            .iter()
+            .copied()
+            .map(fmt_ip)
+            .collect::<Vec<_>>()
+            .join(","),
+        lease
+            .dns
+            .iter()
+            .copied()
+            .map(fmt_ip)
+            .collect::<Vec<_>>()
+            .join(","),
+        lease.seconds.unwrap_or(300)
+    )
+}
+
+fn decode_handoff(body: &str) -> Option<(String, Lease, Duration)> {
+    let mut lines = body.lines();
+    let name = lines.next()?;
+    if name.is_empty() || name.len() >= IFNAMSIZ || name.contains('/') {
+        return None;
+    }
+    let acquired = Duration::try_from_secs_f64(lines.next()?.parse().ok()?).ok()?;
+    let address = parse_ipv4(lines.next()?)?;
+    let mask = parse_ipv4(lines.next()?)?;
+    let routers = lines
+        .next()?
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(parse_ipv4)
+        .collect::<Option<Vec<_>>>()?;
+    let dns = lines
+        .next()?
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(parse_ipv4)
+        .collect::<Option<Vec<_>>>()?;
+    let seconds = lines.next()?.parse().ok()?;
+    if lines.next().is_some() || address == [0; 4] || seconds == 0 {
+        return None;
+    }
+    Some((
+        name.to_owned(),
+        Lease {
+            yiaddr: address,
+            subnet: Some(mask),
+            routers,
+            dns,
+            seconds: Some(seconds),
+            requested_at: Some(acquired),
+            ..Lease::default()
+        },
+        acquired,
+    ))
+}
+
+fn write_handoff(name: &str, lease: &Lease) -> io::Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open("/run/td-network-lease.new")?;
+    file.write_all(encode_handoff(name, lease, live_lease_start(lease, uptime()?)?).as_bytes())?;
+    fs::rename("/run/td-network-lease.new", HANDOFF_PATH)
+}
+
+fn read_handoff() -> io::Result<Option<(String, Lease, Duration)>> {
+    match fs::read_to_string(HANDOFF_PATH) {
+        Ok(body) => Ok(decode_handoff(&body)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+fn live_lease_start(lease: &Lease, now: Duration) -> io::Result<Duration> {
+    let start = lease
+        .requested_at
+        .ok_or_else(|| io::Error::other("DHCP lease lacks request time"))?;
+    if start > now || now.saturating_sub(start) >= lease_duration(lease) {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "DHCP lease expired before application",
+        ));
+    }
+    Ok(start)
+}
+
+fn renewal_retry(remaining: Duration) -> Duration {
+    (remaining / 2).min(Duration::from_secs(15))
+}
+
+fn cmd_watch() -> io::Result<ExitCode> {
+    let _lock = network_lock()?;
+    let ctl = prepare_loopback()?;
+    let fd = ctl.as_raw_fd();
+    let mut active = read_handoff()?;
+    let mut retry = uptime()?;
+    let mut last_status = String::new();
+    // Keep boot's working lease: network consumers are already eligible to run.
+    // A missing/invalid record means no configuration has a known lifetime.
+    let names = ethernet_interfaces()?;
+    if active
+        .as_ref()
+        .is_some_and(|(name, _, acquired)| !names.contains(name) || *acquired > retry)
+    {
+        active = None;
+    }
+    if let Some((name, lease, _)) = &active {
+        report(&lease_status(name, lease))?;
+    } else {
+        for name in names {
+            clear_interface(fd, &name)?;
+        }
+    }
+    loop {
+        let now = uptime()?;
+        let mut rejected = false;
+        if let Some((name, lease, acquired)) = &active {
+            if !carrier(name) || now.saturating_sub(*acquired) >= lease_duration(lease) {
+                report(&format!(
+                    "{name}: link lost or lease expired; clearing address and routes"
+                ))?;
+                clear_interface(fd, name)?;
+                active = None;
+                retry = now;
+                last_status.clear();
+            }
+        }
+        if let Some((name, lease, acquired)) = &mut active {
+            if now >= retry && now.saturating_sub(*acquired) >= lease_duration(lease) / 2 {
+                match renew(
+                    name,
+                    lease,
+                    lease_duration(lease).saturating_sub(now.saturating_sub(*acquired)),
+                ) {
+                    Ok(next) => {
+                        if next.yiaddr != lease.yiaddr
+                            || next.subnet != lease.subnet
+                            || next.routers != lease.routers
+                        {
+                            clear_interface(fd, name)?;
+                            add_broadcast_route(fd, name)?;
+                        }
+                        apply_lease(fd, name, &next)?;
+                        report(&lease_status(name, &next))?;
+                        *lease = next;
+                        *acquired = live_lease_start(lease, uptime()?)?;
+                    }
+                    Err(e) => {
+                        rejected = e.kind() == io::ErrorKind::AddrNotAvailable;
+                        report(&format!(
+                            "{name}: DHCP renewal failed: {e}; retrying before expiry"
+                        ))?;
+                    }
+                }
+                retry = uptime()?
+                    + renewal_retry(
+                        lease_duration(lease).saturating_sub(uptime()?.saturating_sub(*acquired)),
+                    );
+            }
+        } else if now >= retry {
+            let mut selected = None;
+            for name in ethernet_interfaces()? {
+                set_link_up(fd, &name)?;
+                if carrier(&name) {
+                    selected = Some(name);
+                    break;
+                }
+            }
+            if let Some(name) = selected {
+                report(&format!("{name}: carrier detected; requesting DHCP lease"))?;
+                match acquire(fd, &name).and_then(|lease| {
+                    apply_lease(fd, &name, &lease)?;
+                    Ok(lease)
+                }) {
+                    Ok(lease) => {
+                        report(&lease_status(&name, &lease))?;
+                        let acquired = live_lease_start(&lease, uptime()?)?;
+                        active = Some((name, lease, acquired));
+                    }
+                    Err(e) => {
+                        clear_interface(fd, &name)?;
+                        report(&format!("{name}: DHCP failed: {e}; retrying in 15 seconds"))?;
+                    }
+                }
+                retry = uptime()?
+                    + if active.is_some() {
+                        Duration::ZERO
+                    } else {
+                        Duration::from_secs(15)
+                    };
+                last_status.clear();
+            } else {
+                let waiting = "disconnected: plug in an Ethernet cable (DHCP)";
+                if last_status != waiting {
+                    report(waiting)?;
+                    last_status = waiting.into();
+                }
+            }
+        }
+        if rejected {
+            if let Some((name, _, _)) = active.take() {
+                clear_interface(fd, &name)?;
+                report(&format!(
+                    "{name}: rejected lease cleared; acquiring a new address"
+                ))?;
+                retry = uptime()?;
+                last_status.clear();
+            }
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
 }
 
 // ── Subcommand: resolve / reach ─────────────────────────────────────────────
@@ -796,6 +1231,58 @@ fn resolve_host(host: &str) -> io::Result<[u8; 4]> {
         io::Error::new(io::ErrorKind::NotFound, format!("no nameserver in {path}"))
     })?;
     dns_lookup(ns, host)
+}
+
+fn cmd_diagnose() -> io::Result<ExitCode> {
+    let mut out = io::stdout().lock();
+    writeln!(
+        out,
+        "{}",
+        fs::read_to_string(STATUS_PATH).unwrap_or_else(|e| format!("status unavailable: {e}"))
+    )?;
+    for name in ethernet_interfaces()? {
+        writeln!(out, "interface {name}")?;
+        for field in [
+            "carrier",
+            "operstate",
+            "speed",
+            "duplex",
+            "mtu",
+            "statistics/rx_bytes",
+            "statistics/tx_bytes",
+            "statistics/rx_errors",
+            "statistics/tx_errors",
+            "statistics/rx_dropped",
+            "statistics/tx_dropped",
+        ] {
+            let value = fs::read_to_string(Path::new("/sys/class/net").join(&name).join(field))
+                .unwrap_or_else(|e| format!("unavailable ({e})"));
+            writeln!(out, "  {field}: {}", value.trim())?;
+        }
+    }
+    for name in [
+        "tcp_congestion_control",
+        "tcp_rmem",
+        "tcp_wmem",
+        "tcp_window_scaling",
+        "tcp_sack",
+        "tcp_mtu_probing",
+    ] {
+        let value = fs::read_to_string(Path::new("/proc/sys/net/ipv4").join(name))
+            .unwrap_or_else(|e| format!("unavailable ({e})"));
+        writeln!(out, "{name}: {}", value.trim())?;
+    }
+    writeln!(
+        out,
+        "TCP counters (cumulative since boot; compare before and after a transfer):"
+    )?;
+    for line in fs::read_to_string("/proc/net/snmp")?
+        .lines()
+        .filter(|l| l.starts_with("Tcp:"))
+    {
+        writeln!(out, "{line}")?;
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 fn cmd_resolve(host: &str) -> io::Result<()> {
@@ -818,7 +1305,7 @@ fn cmd_reach(host: &str, port: u16) -> io::Result<()> {
 fn usage() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "usage: td-netd loopback | up [IFACE] | resolve NAME | reach HOST PORT",
+        "usage: td-netd loopback | up [IFACE] | watch | status | diagnose | resolve NAME | reach HOST PORT",
     )
 }
 
@@ -827,6 +1314,15 @@ fn run() -> io::Result<ExitCode> {
     let cmd = args.next().ok_or_else(usage)?;
     let rest: Vec<String> = args.map(|a| a.to_string_lossy().into_owned()).collect();
     match cmd.as_bytes() {
+        b"watch" if rest.is_empty() => cmd_watch(),
+        b"diagnose" if rest.is_empty() => cmd_diagnose(),
+        b"status" if rest.is_empty() => {
+            let status = fs::read_to_string(STATUS_PATH).map_err(|e| {
+                io::Error::new(e.kind(), format!("network status unavailable: {e}"))
+            })?;
+            write!(io::stdout(), "{status}")?;
+            Ok(ExitCode::SUCCESS)
+        }
         b"loopback" => {
             if !rest.is_empty() {
                 return Err(usage());
@@ -1024,6 +1520,7 @@ mod tests {
         pkt.extend_from_slice(&[OPT_ROUTER, 4, 10, 0, 2, 2]);
         pkt.extend_from_slice(&[OPT_DNS, 8, 10, 0, 2, 3, 8, 8, 8, 8]);
         pkt.extend_from_slice(&[OPT_SERVER_ID, 4, 10, 0, 2, 2]);
+        pkt.extend_from_slice(&[OPT_LEASE_TIME, 4, 0, 0, 0x0e, 0x10]);
         pkt.push(OPT_END);
 
         let lease = parse_dhcp(&pkt).expect("valid offer parses");
@@ -1034,6 +1531,103 @@ mod tests {
         assert_eq!(lease.routers, vec![[10, 0, 2, 2]]);
         assert_eq!(lease.dns, vec![[10, 0, 2, 3], [8, 8, 8, 8]]);
         assert_eq!(lease.server_id, Some([10, 0, 2, 2]));
+        assert_eq!(lease.seconds, Some(3600));
+        assert_eq!(lease_duration(&lease), Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn server_rejection_is_distinct_from_silence_and_unrelated_traffic() {
+        let mut packet = vec![0; DHCP_HDR_LEN];
+        packet[236..240].copy_from_slice(&DHCP_MAGIC);
+        packet[4..8].copy_from_slice(&42u32.to_be_bytes());
+        packet.extend_from_slice(&[OPT_MSG_TYPE, 1, DHCP_NAK, OPT_END]);
+        assert!(matching_reply(&packet, 41, DHCP_ACK).is_none());
+        assert!(matching_reply(&packet, 42, DHCP_OFFER).is_none());
+        assert_eq!(
+            matching_reply(&packet, 42, DHCP_ACK)
+                .unwrap()
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AddrNotAvailable
+        );
+    }
+
+    #[test]
+    fn boot_handoff_retains_address_routes_dns_and_acquisition_time() {
+        let lease = Lease {
+            yiaddr: [10, 0, 2, 15],
+            subnet: Some([255, 255, 255, 0]),
+            routers: vec![[10, 0, 2, 2]],
+            dns: vec![[10, 0, 2, 3]],
+            seconds: Some(9),
+            requested_at: Some(Duration::from_millis(1250)),
+            ..Lease::default()
+        };
+        let acquired = Duration::from_millis(1250);
+        assert_eq!(
+            decode_handoff(&encode_handoff("eth0", &lease, acquired)),
+            Some(("eth0".into(), lease, acquired))
+        );
+        assert!(decode_handoff("eth0\nNaN\n10.0.2.15\n255.255.255.0\n\n\n9\n").is_none());
+        assert!(decode_handoff("eth0\n1\n10.0.2.15\n255.255.255.0\n\n\n0\n").is_none());
+    }
+
+    #[test]
+    fn delayed_or_suspended_ack_cannot_restart_the_grants_lifetime() {
+        let lease = Lease {
+            requested_at: Some(Duration::from_secs(10)),
+            seconds: Some(5),
+            ..Lease::default()
+        };
+        assert_eq!(
+            live_lease_start(&lease, Duration::from_secs(12)).unwrap(),
+            Duration::from_secs(10)
+        );
+        assert!(live_lease_start(&lease, Duration::from_secs(15)).is_err());
+        assert!(live_lease_start(&lease, Duration::from_secs(1000)).is_err());
+        assert!(live_lease_start(&lease, Duration::from_secs(9)).is_err());
+    }
+
+    #[test]
+    fn retry_wait_preserves_time_for_short_leases() {
+        assert_eq!(
+            renewal_retry(Duration::from_secs(1)),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            renewal_retry(Duration::from_secs(8)),
+            Duration::from_secs(4)
+        );
+        assert_eq!(
+            renewal_retry(Duration::from_secs(60)),
+            Duration::from_secs(15)
+        );
+        assert_eq!(renewal_retry(Duration::ZERO), Duration::ZERO);
+    }
+
+    #[test]
+    fn renewal_uses_ciaddr_without_selecting_state_options() {
+        let packet = renewal_packet([1, 2, 3, 4, 5, 6], 42, [10, 0, 2, 15]);
+        assert_eq!(&packet[12..16], &[10, 0, 2, 15]);
+        assert_eq!(
+            lookup_tlv(&packet[DHCP_HDR_LEN..], OPT_MSG_TYPE),
+            Some(vec![DHCP_REQUEST])
+        );
+        assert_eq!(lookup_tlv(&packet[DHCP_HDR_LEN..], OPT_SERVER_ID), None);
+        assert_eq!(lookup_tlv(&packet[DHCP_HDR_LEN..], OPT_REQUESTED_IP), None);
+    }
+
+    #[test]
+    fn missing_lease_time_is_bounded_and_zero_expires_immediately() {
+        let mut lease = Lease::default();
+        assert_eq!(lease_duration(&lease), Duration::from_secs(300));
+        lease.seconds = Some(0);
+        assert_eq!(lease_duration(&lease), Duration::ZERO);
+        lease.seconds = Some(u32::MAX);
+        assert_eq!(
+            lease_duration(&lease),
+            Duration::from_secs(u64::from(u32::MAX))
+        );
     }
 
     #[test]

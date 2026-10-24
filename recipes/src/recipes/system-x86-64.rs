@@ -1383,6 +1383,7 @@ const TD_SVC_UNITS: &[&str] = &[
     "vm-guest",
     "audio",
     "netup",
+    "network",
     "busd",
     "fetchd",
     "egressd",
@@ -1657,6 +1658,14 @@ fn build_td_svc_conf() -> String {
          after=rootcheck\n\
          timeout={netup}\n\
          \n\
+         [network]\n\
+         type=daemon\n\
+         exec=/bin/td-netd watch\n\
+         after=netup\n\
+         restart=always\n\
+         log=/var/log/svc/network.log\n\
+         console=yes\n\
+\n\
          # Firstboot reserves the broker identity and prepares its protected\n\
          # runtime. Human clients cannot replace this service's socket.\n\
          [busd]\n\
@@ -8532,6 +8541,24 @@ mod tests {
     /// whose edges are settled in one pass, so an edge omitted because "nothing reads
     /// across them" buys CONCURRENCY that init's serial sysinit never had.
     #[test]
+    fn ethernet_watch_survives_boot_dhcp_failure_without_gating_the_desktop() {
+        assert_eq!(
+            unit_key("network", "exec").as_deref(),
+            Some("/bin/td-netd watch")
+        );
+        assert_eq!(unit_key("network", "type").as_deref(), Some("daemon"));
+        assert_eq!(unit_key("network", "after").as_deref(), Some("netup"));
+        assert_eq!(unit_key("network", "requires"), None);
+        assert_eq!(unit_key("network", "ready"), None);
+        assert_eq!(unit_key("network", "restart").as_deref(), Some("always"));
+        assert_eq!(
+            unit_key("network", "log").as_deref(),
+            Some("/var/log/svc/network.log")
+        );
+        assert!(!unit_after("bootsuccess").contains(&"network".to_owned()));
+    }
+
+    #[test]
     fn the_declared_edges_are_exactly_these() {
         let sysinit = ["hostname", "td-firstboot", "rootcheck", "netup"];
         let expected: Vec<(&str, Vec<&str>)> = vec![
@@ -8543,6 +8570,7 @@ mod tests {
             ("vm-power", vec!["seat"]),
             ("audio", vec!["seat"]),
             ("netup", vec!["rootcheck"]),
+            ("network", vec!["netup"]),
             ("busd", vec!["seat"]),
             ("fetchd", vec!["seat", "netup"]),
             ("egressd", vec!["seat", "netup"]),
@@ -11445,10 +11473,14 @@ mod tests {
                 !config.lines().any(|line| line.starts_with("Subsystem ")),
                 "the minimal server profile must not expose the unneeded SFTP subsystem"
             );
+            let remote = match form {
+                ssh_policy::Form::Ordinary => " .ssh/authorized_keys",
+                ssh_policy::Form::Enforced => "",
+            };
             assert!(
                 config.ends_with(&format!(
                     "\nMatch User alice\n\
-                     \tAuthorizedKeysFile {SSHD_SELFTEST_AUTHORIZED_KEYS}\n"
+                     \tAuthorizedKeysFile {SSHD_SELFTEST_AUTHORIZED_KEYS}{remote}\n"
                 )),
                 "the volatile boot key must authorize only the admitted primary account"
             );

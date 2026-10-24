@@ -70,7 +70,7 @@ root-owned account tables and publishes the server policy itself as root:root
 mode-0600 `/run/td-sshd.conf`, renaming into place a temporary it created
 exclusively without following a link, then writes the volatile cutover
 record naming the form it rendered (`td-authd/DESIGN.md` amendment 7).
-Only the admitted UID/GID-1000 account name selects its self-test Match
+Only the admitted UID/GID-1000 account name selects its SSH Match
 block and, in the enforced form below, the one `AllowUsers` entry. The
 policy's remaining bytes are compiled from the shared source used by the
 realized OpenSSH recipe test. The daemon requires this configuration file
@@ -93,12 +93,21 @@ credential transition or authentication method. Neither form admits root
 through the shared predicate (§3) under the root it renders, and
 renders the ordinary policy only where that state is unenrolled.
 Enrolled, and every unavailable cause including a failed
-read, renders the enforced form, which adds `AllowUsers` naming only
+read, renders the enforced form, which excludes owner-managed remote keys
+and adds `AllowUsers` naming only
 that admitted account after the root line (`TOKEN-LOGIN.md`, "SSH",
 pins the bytes). The stock image never contains a record and firstboot
 ensures the directory at every boot, so it renders the ordinary policy;
 the enforced form acts only where a record or an invalid directory
 exists.
+The ordinary form also consults `.ssh/authorized_keys` in that account's
+passwd home. The owner may authorize remote Ed25519 keys there; private-key
+possession grants that account's session authority, including access to its
+files, but grants no elevation or hardware-backed credential release.
+OpenSSH's default StrictModes checks apply to the home and authorization
+file. A process already running as that owner may add keys; same-UID
+isolation is not claimed. Enforced and unavailable login states never consult
+this file, and enrollment's SSH leaf teardown revokes existing sessions.
 The boot-health login uses a fresh volatile key for the unprivileged UI account,
 but its root-owned authorization line is constrained by OpenSSH `restrict` and
 `from="127.0.0.1"`; possession of that key cannot create a network-reachable

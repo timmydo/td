@@ -2317,14 +2317,35 @@ mod ssh_forms {
         BEFORE
             .replace(ROOT_BEFORE_L7, ROOT_REFUSED)
             .replace("Match User alice\n", &format!("Match User {name}\n"))
+            .replace(
+                "/run/td-ssh-selftest-authorized_keys\n",
+                "/run/td-ssh-selftest-authorized_keys .ssh/authorized_keys\n",
+            )
     }
 
-    /// td-login/TOKEN-LOGIN.md, "SSH": the enforced form's only difference.
+    /// The enforced form excludes owner-managed remote keys.
     fn enforced(name: &str) -> String {
-        ordinary(name).replace(
-            ROOT_REFUSED,
-            &format!("PermitRootLogin no\nAllowUsers {name}\n"),
-        )
+        BEFORE
+            .replace(
+                ROOT_BEFORE_L7,
+                &format!("PermitRootLogin no\nAllowUsers {name}\n"),
+            )
+            .replace("Match User alice\n", &format!("Match User {name}\n"))
+    }
+
+    #[test]
+    fn remote_keys_are_consulted_only_for_an_unenrolled_primary() {
+        for name in NAMES {
+            let ordinary = ssh_policy::config(name, ssh_policy::Form::Ordinary);
+            assert!(ordinary.ends_with(&format!(
+                "Match User {name}\n\tAuthorizedKeysFile /run/td-ssh-selftest-authorized_keys .ssh/authorized_keys\n"
+            )));
+            let enforced = ssh_policy::config(name, ssh_policy::Form::Enforced);
+            assert!(!enforced.contains(".ssh/authorized_keys"));
+            assert!(enforced.ends_with(&format!(
+                "Match User {name}\n\tAuthorizedKeysFile /run/td-ssh-selftest-authorized_keys\n"
+            )));
+        }
     }
 
     /// A root holding a valid `var/lib/td/login`, owned by the test's IDs.
@@ -2379,10 +2400,9 @@ mod ssh_forms {
         }
     }
 
-    /// The ordinary form is the policy from before the tier but for L7's
-    /// one line: root refused, and nothing else moved.
+    /// Ordinary boot admits the primary's remote keys but never root.
     #[test]
-    fn the_ordinary_form_refuses_root_and_is_otherwise_the_policy_before_the_tier() {
+    fn the_ordinary_form_refuses_root_and_consults_primary_remote_keys() {
         assert_eq!(BEFORE.matches(ROOT_BEFORE_L7).count(), 1);
         let ordinary_alice = ordinary("alice");
         assert_eq!(ordinary_alice.matches(ROOT_REFUSED).count(), 1);

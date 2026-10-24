@@ -128,11 +128,12 @@ pub fn recipe() -> Recipe {
                     "for form in sshd_config sshd_config_enforced; do \
                      case \"$form\" in sshd_config) admission='PermitRootLogin no';; \
                          *) admission=$(printf '%s\\n%s' 'PermitRootLogin no' 'AllowUsers alice');; esac; \
-                     for user in alice tester root; do \
+                     for user in alice tester root; do for addr in 127.0.0.1 192.0.2.20; do \
                          policy=$('{openssh}/bin/sshd' -h '{{root}}/keys/id_ed25519' \
                              -T -f \"{{root}}/$form\" \
-                             -C \"user=$user,host=localhost,addr=127.0.0.1\") || exit 1; \
-                         case \"$user\" in alice) expected='{selftest}';; \
+                             -C \"user=$user,host=localhost,addr=$addr\") || exit 1; \
+                         case \"$form:$user\" in sshd_config:alice) expected='{selftest} .ssh/authorized_keys';; \
+                             sshd_config_enforced:alice) expected='{selftest}';; \
                              *) expected='{persistent}';; esac; \
                          printf '%s\\n' \"$policy\" | grep -q -x -F \
                              \"AuthorizedKeysFile $expected\" || \
@@ -140,7 +141,7 @@ pub fn recipe() -> Recipe {
                          admitted=$(printf '%s\\n' \"$policy\" | grep -E '^(PermitRootLogin|AllowUsers|DenyUsers|AllowGroups|DenyGroups) ') || exit 1; \
                          test \"$admitted\" = \"$admission\" || \
                              {{ printf '%s\\n' \"unexpected admission in $form for $user\" \"$admitted\" >&2; exit 1; }}; \
-                     done; \
+                     done; done; \
                      done",
                     selftest = super::system_x86_64::ssh_policy::SSHD_SELFTEST_AUTHORIZED_KEYS,
                     persistent = super::system_x86_64::ssh_policy::SSHD_AUTHORIZED_KEYS,
@@ -154,7 +155,7 @@ pub fn recipe() -> Recipe {
     });
     steps.push(Step::WriteFile {
         path: "{out}/result".into(),
-        content: "PASS: OpenSSH Portable 10.5p1 provides the bounded ssh/sshd/ssh-keygen profile configured for seccomp_filter, with Ed25519, ML-KEM/SNTRUP/Curve25519 KEX, and ChaCha20-Poly1305; the built daemon checks the shared primary-account configuration, in its ordinary and enforced forms, with an ephemeral test host key, distinct primary/persistent authorization paths, and each form's effective PermitRootLogin (no, in both forms) and AllowUsers lines for each user (sshd -T reports the configuration; it attempts no login); every shipped ELF uses only td glibc and has a debug companion; libcrypto, libcrypt, zlib, and agent/PKCS#11/FIDO/SCP/SFTP-server binaries are absent\n".into(),
+        content: "PASS: OpenSSH Portable 10.5p1 provides the bounded ssh/sshd/ssh-keygen profile configured for seccomp_filter, with Ed25519, ML-KEM/SNTRUP/Curve25519 KEX, and ChaCha20-Poly1305; the built daemon checks the shared primary-account configuration, in its ordinary and enforced forms, with an ephemeral test host key, ordinary-only owner-managed remote keys, distinct primary/persistent authorization paths for loopback and remote addresses, and each form's effective PermitRootLogin (no, in both forms) and AllowUsers lines for each user (sshd -T reports the configuration; it attempts no login); every shipped ELF uses only td glibc and has a debug companion; libcrypto, libcrypt, zlib, and agent/PKCS#11/FIDO/SCP/SFTP-server binaries are absent\n".into(),
         exec: false,
     });
     steps.push(Step::Require {
