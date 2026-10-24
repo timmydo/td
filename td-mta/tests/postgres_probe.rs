@@ -7126,6 +7126,39 @@ fn exercise_read(
     let creation = devices::prepare_creation(binding.epoch(), account, "read fixture", 1).unwrap();
     devices::publish_creation(request, trust, deadline(), &creation).unwrap();
     let password = creation.password();
+    // Healthy one-shot operations and dropped read snapshots must send
+    // Terminate rather than reset sockets with open transactions.
+    let log_offset = fs::metadata(fixture.root.join("server.log")).unwrap().len() as usize;
+    let shutdown_slots = read::ReadSlots::new(1).unwrap();
+    for _ in 0..4 {
+        probe(request, trust, deadline()).unwrap();
+        let snapshot = read::Snapshot::open_runtime(
+            &shutdown_slots,
+            request,
+            trust,
+            deadline(),
+            binding,
+            password,
+        )
+        .unwrap();
+        drop(snapshot);
+    }
+    let closed_by = Instant::now() + Duration::from_secs(2);
+    loop {
+        let remaining = sql(fixture, "SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE application_name='td-mta-postgres'");
+        if remaining.trim() == "0" {
+            break;
+        }
+        assert!(
+            Instant::now() < closed_by,
+            "database sessions remain: {remaining}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let log = fs::read_to_string(fixture.root.join("server.log")).unwrap();
+    let teardown = &log[log_offset..];
+    assert!(!teardown.contains("Connection reset by peer"), "{teardown}");
+    assert!(!teardown.contains("unexpected EOF"), "{teardown}");
     exercise_http_auth(fixture, binding, password, creation.device_id());
     exercise_resolved_read(fixture, binding, password);
     let mailbox = MailboxId::from_bytes([0x33; 16]);

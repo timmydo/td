@@ -537,7 +537,7 @@ fn connect_authenticated_bounded(
         }
     };
     Ok(Worker {
-        client,
+        client: Some(client),
         connection: Box::pin(connection),
         deadline,
         waker,
@@ -549,7 +549,7 @@ fn connect_authenticated_bounded(
 }
 
 pub(crate) struct Worker {
-    client: tokio_postgres::Client,
+    client: Option<tokio_postgres::Client>,
     connection: Pin<Box<tokio_postgres::Connection<Io<Network>, Io<Secure>>>>,
     deadline: Instant,
     waker: Waker,
@@ -627,7 +627,8 @@ impl Worker {
         if let Some(window) = audit_window {
             window.begin().map_err(|_| Error::Database)?;
         }
-        let mut operation = operation(&self.client);
+        let client = self.client.as_ref().ok_or(Error::Database)?;
+        let mut operation = operation(client);
         loop {
             if let Err(error) = remaining(self.deadline) {
                 self.failed = Some(error);
@@ -649,6 +650,36 @@ impl Worker {
             }
             if !self.activity.load(Ordering::Relaxed) {
                 thread::park_timeout(Duration::from_millis(1));
+            }
+        }
+    }
+}
+
+impl Drop for Worker {
+    fn drop(&mut self) {
+        // Releasing the last sender lets the driver drain responses and send
+        // Terminate. Cleanup must neither renew a job nor alter its outcome.
+        drop(self.client.take());
+        if self.failed.is_some() {
+            return;
+        }
+        let until = self
+            .deadline
+            .min(Instant::now() + Duration::from_millis(100));
+        let mut context = Context::from_waker(&self.waker);
+        while Instant::now() < until {
+            self.activity.store(false, Ordering::Relaxed);
+            match self.connection.as_mut().poll_message(&mut context) {
+                Poll::Ready(None) | Poll::Ready(Some(Err(_))) => return,
+                Poll::Ready(Some(Ok(_))) => (),
+                Poll::Pending if !self.activity.load(Ordering::Relaxed) => {
+                    thread::park_timeout(
+                        until
+                            .saturating_duration_since(Instant::now())
+                            .min(Duration::from_millis(1)),
+                    );
+                }
+                Poll::Pending => (),
             }
         }
     }

@@ -395,8 +395,12 @@ The sole query uses pg_catalog-qualified functions to inspect server version,
 recovery/read-only state, fsync and full_page_writes. It refuses recovery,
 read-only sessions or disabled durability settings and returns only the
 numeric version. Startup options fix search_path, a five-second statement
-timeout and a one-second lock timeout. Success drops the connection; no mail
-or configuration is written. This does not validate a schema, enforce a
+timeout and a one-second lock timeout. Worker teardown releases the client
+and drives pending responses, PostgreSQL Terminate and TLS shutdown for at
+most 100 milliseconds within the original deadline. Failed or expired
+connections still abort; cleanup never changes a known operation outcome or
+retries a write. Terminate ends any remaining read transaction without a
+separate SQL round trip. The probe writes no mail or configuration. This does not validate a schema, enforce a
 supported-version range, or establish replication/failover durability.
 Provider diagnostics and credentials never enter the fixed error enum.
 The worker drives `poll_message` and drops asynchronous notices without
