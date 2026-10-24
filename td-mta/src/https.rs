@@ -31,7 +31,7 @@ use std::{
 
 type Wire = Box<[u8; TLS_WIRE_BYTES]>;
 const SCAN: Duration = Duration::from_millis(5);
-const PER_PEER: usize = 2;
+const PER_PEER: usize = 16;
 const DRAIN_BYTES: usize = 64 * 1024;
 const DRAIN_SECONDS: u64 = 5;
 

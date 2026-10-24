@@ -1998,7 +1998,7 @@ revocation state.
 Upload publication acquires a fresh commit-time authorization guard; future
 mutations must do the same.
 
-At most two active HTTPS connections per IP and the configured global count
+At most sixteen active HTTPS connections per IP and the configured global count
 are admitted. Authentication uses fixed one-second monotonic windows: 64
 attempts globally and eight per IP, with a 64-entry peer table that never
 evicts an unexpired entry. Invalid credential syntax consumes an attempt too;
