@@ -1018,6 +1018,7 @@ fn apply_context(
                         kind,
                         bind: c.required_text("bind")?,
                         server_name: c.text("server_name")?,
+                        server_name_aliases: c.text("server_name_aliases")?,
                         certificate: c.text("certificate")?,
                         gateway: c.text("gateway")?,
                         session_limit: c.integer("session_limit")?,
@@ -1630,6 +1631,29 @@ certificate = "public"
         ));
         assert_eq!(error.context.unwrap().field, None);
         assert_eq!(error.context.unwrap().section, Section::Alias);
+    }
+    #[test]
+    fn direct_smtp_aliases_bind_mx_and_certificate_names() {
+        let _guard = lock();
+        let source = SOURCE
+            .replace("server_name = \"mail.example.test\"", "server_name = \"mail.example.test\"\nserver_name_aliases = \"MX.Alias.Test second.alias.test\"")
+            .replace("[domain \"example.test\"]", "[domain \"example.test\"]\nmx_host = \"Mx.Alias.Test\"");
+        let mut storage = Backing::new();
+        let parsed = parse(&mut storage, &source).unwrap();
+        let graph = parsed.graph.view(parsed.text().unwrap()).unwrap();
+        for name in ["mx.alias.test", "second.alias.test"] {
+            assert!(
+                (0..graph.binding_count()).any(|i| graph.binding(i).unwrap().unwrap().name == name)
+            );
+        }
+        let listener = graph.listeners().unwrap().listener(0).unwrap().unwrap();
+        assert_eq!(listener.server_name, Some("mail.example.test"));
+        assert_eq!(
+            listener.server_name_aliases,
+            "mx.alias.test second.alias.test"
+        );
+        assert!(listener.serves_name("MX.ALIAS.TEST"));
+        assert!(!listener.serves_name("other.test"));
     }
     #[test]
     fn jmap_aliases_are_canonical_required_certificate_names() {

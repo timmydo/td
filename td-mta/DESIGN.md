@@ -2696,3 +2696,14 @@ Receiving uses one retained fanout and one shared prepared body. Relay schedulin
 rotates account-scoped leases through one foreground worker and one shared
 queue-clock guard. RESOURCES.md accounts for aggregate startup and relay
 metadata independently of message-body reservations.
+
+### Direct SMTP hostname aliases
+
+One direct SMTP listener may serve additional explicit MX hostnames through
+`server_name_aliases` (CONFIG.md and SCHEMA.md). Graph validation treats
+those names as local and requires the listener certificate to cover them.
+The listener's primary name remains its SMTP greeting and EHLO identity;
+the aliases grant neither recipient acceptance nor relay authority. TLS
+policy bindings retain the aliases so a policy prepared for another list
+cannot be attached as the same listener configuration. Gateway and HTTP
+listeners reject this setting.

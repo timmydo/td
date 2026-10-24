@@ -3,6 +3,7 @@ use super::{endpoint, syntax::Location, text, values};
 use crate::limits::ResourcePlan;
 use std::{fmt, net::SocketAddr, num::NonZeroU64};
 pub const MAX_LISTENERS: usize = 16;
+pub const MAX_SERVER_NAMES: usize = 32;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Kind {
     DirectSmtp,
@@ -33,6 +34,7 @@ pub enum Field {
     Name,
     Bind,
     ServerName,
+    ServerNameAliases,
     Certificate,
     Gateway,
     SessionLimit,
@@ -44,6 +46,7 @@ impl Field {
             Self::Name => "name",
             Self::Bind => "bind",
             Self::ServerName => "server_name",
+            Self::ServerNameAliases => "server_name_aliases",
             Self::Certificate => "certificate",
             Self::Gateway => "gateway",
             Self::SessionLimit => "session_limit",
@@ -147,6 +150,7 @@ pub struct Input<'a> {
     pub kind: Kind,
     pub bind: &'a str,
     pub server_name: Option<&'a str>,
+    pub server_name_aliases: Option<&'a str>,
     pub certificate: Option<&'a str>,
     pub gateway: Option<&'a str>,
     pub session_limit: Option<u64>,
@@ -161,6 +165,7 @@ impl fmt::Debug for Input<'_> {
 pub struct Slot {
     name: text::Span,
     server: text::Span,
+    server_aliases: text::Span,
     certificate: text::Span,
     gateway: text::Span,
     bind: Option<SocketAddr>,
@@ -173,6 +178,7 @@ impl Slot {
     pub const EMPTY: Self = Self {
         name: text::Span::EMPTY,
         server: text::Span::EMPTY,
+        server_aliases: text::Span::EMPTY,
         certificate: text::Span::EMPTY,
         gateway: text::Span::EMPTY,
         bind: None,
@@ -288,6 +294,46 @@ impl<'a> Builder<'a> {
             values::dns_name(host)
                 .map_err(|_| err(Code::Hostname, Some(Field::ServerName), Some(at)))?;
         }
+        if input.server_name_aliases.is_some() && input.kind != Kind::DirectSmtp {
+            return Err(err(
+                Code::Forbidden,
+                Some(Field::ServerNameAliases),
+                Some(at),
+            ));
+        }
+        let aliases = input.server_name_aliases.unwrap_or("");
+        if aliases.len() > super::syntax::MAX_STRING_BYTES {
+            return Err(err(
+                Code::Capacity,
+                Some(Field::ServerNameAliases),
+                Some(at),
+            ));
+        }
+        for (index, alias) in aliases.split_ascii_whitespace().enumerate() {
+            if index >= MAX_SERVER_NAMES - 1 {
+                return Err(err(
+                    Code::Capacity,
+                    Some(Field::ServerNameAliases),
+                    Some(at),
+                ));
+            }
+            values::dns_name(alias)
+                .map_err(|_| err(Code::Hostname, Some(Field::ServerNameAliases), Some(at)))?;
+            if input
+                .server_name
+                .is_some_and(|name| name.eq_ignore_ascii_case(alias))
+                || aliases
+                    .split_ascii_whitespace()
+                    .take(index)
+                    .any(|name| name.eq_ignore_ascii_case(alias))
+            {
+                return Err(err(
+                    Code::Duplicate,
+                    Some(Field::ServerNameAliases),
+                    Some(at),
+                ));
+            }
+        }
         for (field, value) in [
             (Field::Certificate, input.certificate),
             (Field::Gateway, input.gateway),
@@ -329,11 +375,20 @@ impl<'a> Builder<'a> {
             }
             None => text::Span::EMPTY,
         };
+        let mut alias_bytes = [0; super::syntax::MAX_STRING_BYTES];
+        let folded = alias_bytes.get_mut(..aliases.len()).ok_or_else(invariant)?;
+        folded.copy_from_slice(aliases.as_bytes());
+        folded.make_ascii_lowercase();
+        let alias_handle = arena
+            .append(folded)
+            .map_err(|_| err(Code::Text, Some(Field::ServerNameAliases), Some(at)))?;
+        let server_aliases = arena.compact(alias_handle).map_err(|_| invariant())?;
         let certificate = optional(arena, input.certificate, Field::Certificate, at)?;
         let gateway = optional(arena, input.gateway, Field::Gateway, at)?;
         *self.slots.get_mut(self.count).ok_or_else(invariant)? = Slot {
             name,
             server,
+            server_aliases,
             certificate,
             gateway,
             bind: Some(bind),
@@ -498,11 +553,22 @@ pub struct Listener<'t> {
     pub kind: Kind,
     pub bind: SocketAddr,
     pub server_name: Option<&'t str>,
+    pub server_name_aliases: &'t str,
     pub certificate: Option<&'t str>,
     pub gateway: Option<&'t str>,
     pub session_limit: Option<usize>,
     pub per_peer_limit: Option<usize>,
     pub location: Location,
+}
+impl Listener<'_> {
+    pub fn serves_name(&self, name: &str) -> bool {
+        self.server_name
+            .is_some_and(|server| name.eq_ignore_ascii_case(server))
+            || self
+                .server_name_aliases
+                .split_ascii_whitespace()
+                .any(|alias| name.eq_ignore_ascii_case(alias))
+    }
 }
 impl fmt::Debug for Listener<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -530,6 +596,7 @@ impl<'t> View<'_, 't> {
             } else {
                 None
             },
+            server_name_aliases: read(self.text, self.owner, s.server_aliases)?,
             certificate: if named_smtp || s.kind == Kind::Https {
                 Some(read(self.text, self.owner, s.certificate)?)
             } else {
@@ -591,6 +658,7 @@ mod tests {
             kind,
             bind,
             server_name: named.then_some("Mail.Example.test"),
+            server_name_aliases: None,
             certificate: (named || kind == Kind::Https).then_some("cert"),
             gateway: (kind == Kind::GatewaySmtp).then_some("upstream"),
             session_limit: kind.is_smtp().then_some(1),
@@ -607,6 +675,59 @@ mod tests {
                 bytes: vec![0; text::MAX_BYTES],
                 slots: vec![Slot::EMPTY; MAX_LISTENERS],
             }
+        }
+    }
+    #[test]
+    fn direct_aliases_are_bounded_unique_dns_names() {
+        let _lock = lock();
+        let too_many = (0..MAX_SERVER_NAMES)
+            .map(|i| format!("mx{i}.test"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        for (aliases, code) in [
+            ("MAIL.example.test", Code::Duplicate),
+            ("alias.test ALIAS.TEST", Code::Duplicate),
+            ("*.example.test", Code::Hostname),
+            ("https://example.test", Code::Hostname),
+            ("alias.test/", Code::Hostname),
+            (too_many.as_str(), Code::Capacity),
+        ] {
+            let mut storage = Storage::new();
+            let mut arena = text::Builder::new(&mut storage.bytes).unwrap();
+            let mut builder = Builder::new(&arena, &mut storage.slots).unwrap();
+            let mut row = input(Kind::DirectSmtp, "127.0.0.1:25");
+            row.server_name_aliases = Some(aliases);
+            let error = builder
+                .listener(&mut arena, "smtp", row, at(1))
+                .unwrap_err();
+            assert_eq!(error.code, code);
+            assert_eq!(error.field, Some(Field::ServerNameAliases));
+        }
+        {
+            let aliases = too_many.rsplit_once(' ').unwrap().0;
+            let mut storage = Storage::new();
+            let mut arena = text::Builder::new(&mut storage.bytes).unwrap();
+            let mut builder = Builder::new(&arena, &mut storage.slots).unwrap();
+            let mut row = input(Kind::DirectSmtp, "127.0.0.1:25");
+            row.server_name_aliases = Some(aliases);
+            builder.listener(&mut arena, "smtp", row, at(1)).unwrap();
+        }
+        for kind in [
+            Kind::GatewaySmtp,
+            Kind::Https,
+            Kind::Http01,
+            Kind::LoopbackSmtpFixture,
+        ] {
+            let mut storage = Storage::new();
+            let mut arena = text::Builder::new(&mut storage.bytes).unwrap();
+            let mut builder = Builder::new(&arena, &mut storage.slots).unwrap();
+            let mut row = input(kind, "127.0.0.1:80");
+            row.server_name_aliases = Some("alias.test");
+            let error = builder
+                .listener(&mut arena, "listener", row, at(1))
+                .unwrap_err();
+            assert_eq!(error.code, Code::Forbidden);
+            assert_eq!(error.field, Some(Field::ServerNameAliases));
         }
     }
     #[test]
@@ -1038,6 +1159,7 @@ mod tests {
             (Field::Name, "name"),
             (Field::Bind, "bind"),
             (Field::ServerName, "server_name"),
+            (Field::ServerNameAliases, "server_name_aliases"),
             (Field::Certificate, "certificate"),
             (Field::Gateway, "gateway"),
             (Field::SessionLimit, "session_limit"),

@@ -1031,16 +1031,17 @@ primary profile. Different HTTPS listeners may select different primary
 profiles when this creates no conflict within either listener's SNI table.
 
 Without direct SMTP ingress every domain needs an explicit upstream MX.
-A default MX must match a direct listener server name. An explicit MX equal
-to any hostname advertised here also needs a matching direct listener:
-global hostname, direct/gateway server name, JMAP origin or any enabled
-MTA-STS host. This prevents gateway-only or HTTPS-only names from being
+A default MX must match a direct listener server name or declared alias.
+An explicit MX equal to any hostname advertised here also needs a matching
+direct listener: global hostname, direct/gateway server name, direct SMTP
+alias, any allowed JMAP origin or any enabled MTA-STS host. This prevents gateway-only or HTTPS-only names from being
 classified as upstream merely because the MX is explicit. Other explicit
 targets remain unverified upstream names. This classification performs no DNS lookup and
 creates no gateway trust or forwarding authority.
 
-Derive certificate names from direct/gateway SMTP server names, each HTTPS
-listener's allowlisted JMAP hosts and each enabled MTA-STS host. Retain lowercase names,
+Derive certificate names from direct/gateway SMTP server names, direct SMTP
+aliases, each HTTPS listener's allowlisted JMAP hosts and each enabled
+MTA-STS host. Retain lowercase names,
 deduplicate within each profile and enforce 32 names per profile, 512 binding
 cells overall. Alias expansion is admitted within those same per-profile
 and aggregate caps; exceeding either refuses the candidate. Tests retain
@@ -1895,3 +1896,21 @@ routing and MX configuration remain explicit and unchanged.
 The configuration source is stored with its immutable PostgreSQL version;
 adding aliases uses the existing import/check/select and service-restart
 workflow. Operators still provision certificates and DNS independently.
+
+## Multiple MX names on one direct SMTP listener
+
+A direct SMTP listener may declare `server_name_aliases`, a quoted
+ASCII-whitespace-separated list of additional DNS names. The names are
+canonicalized to lowercase and must be unique, including against the
+primary `server_name`. At most 31 aliases fit the existing 4096-byte scalar;
+the certificate's existing 32-name and graph-wide 512-name caps still apply.
+Wildcards, URLs and invalid DNS names refuse configuration. Only direct
+SMTP listeners accept the field.
+
+Each alias qualifies as an explicitly served local MX and requires coverage
+by that listener's certificate. The SMTP greeting and EHLO still use
+`server_name`. STARTTLS retains its existing default-identity selection.
+Aliases do not create recipient addresses, authorize forwarding, trust a
+gateway or add HTTPS endpoints. Domain routing and JMAP origins remain
+explicit. Stored configuration and TLS binding equality retain the alias
+list across generation preparation and publication.

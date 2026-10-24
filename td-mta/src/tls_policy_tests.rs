@@ -880,3 +880,17 @@ fn jmap_aliases_require_certificate_coverage_before_publication() {
         .prepare(&set, &source)
         .is_ok());
 }
+
+#[test]
+fn smtp_aliases_require_certificate_coverage_before_publication() {
+    let _serial = serial();
+    let source = source(false).replace(
+        "server_name = \"localhost\"",
+        "server_name = \"localhost\"\nserver_name_aliases = \"alias.test\"",
+    );
+    let set = GenerationSet::at_startup();
+    assert!(Material::new().prepare(&set, &source).is_err());
+    assert!(Material::with_names(&["localhost", "alias.test"])
+        .prepare(&set, &source)
+        .is_ok());
+}

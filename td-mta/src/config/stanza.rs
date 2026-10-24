@@ -215,6 +215,7 @@ impl Section {
                 field!("kind", Text, true),
                 field!("bind", Text, true),
                 field!("server_name", Text, false),
+                field!("server_name_aliases", Text, false),
                 field!("certificate", Text, false),
                 field!("gateway", Text, false),
                 field!("session_limit", Integer, false),
@@ -790,6 +791,7 @@ network = "192.0.2.0/24"
 kind = "gateway_smtp"
 bind = "192.0.2.1:25"
 server_name = "mail.example.test"
+server_name_aliases = "alias.example.test"
 certificate = "public"
 gateway = "upstream"
 session_limit = 2
@@ -838,7 +840,7 @@ per_peer_limit = 1
         }
         let stanza = p.finish().unwrap();
         assert_eq!(assigned, stanza.section().unwrap().fields().len());
-        assert_eq!(total_assigned, 56);
+        assert_eq!(total_assigned, 57);
         assert_eq!(count, 15);
     }
     #[test]

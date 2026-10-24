@@ -194,9 +194,10 @@ A domain additionally has these policy fields:
 If no `direct_smtp` listener exists, structural validation requires an
 explicit `mx_host` for every domain, including gateway-only or loopback-only
 fixtures. The host receiving from a gateway is not implicitly its public MX. A
-defaulted MX must match a direct listener's `server_name`. If an explicit MX
-equals any name advertised by this host (global hostname, direct/gateway
-listener server name, JMAP origin host or any enabled MTA-STS policy host),
+defaulted MX must match a direct listener's `server_name` or an explicit
+`server_name_aliases` entry. If an explicit MX equals any name advertised
+by this host (global hostname, direct/gateway listener server name, direct
+SMTP alias, any allowed JMAP origin host or any enabled MTA-STS policy host),
 it also requires a matching direct listener name/certificate requirement.
 A gateway-only or HTTPS-only name cannot become a public MX by spelling it
 explicitly. Other explicit MX names designate an upstream endpoint whose
@@ -512,6 +513,7 @@ in this schema.
 | Field | Applicability |
 | --- | --- |
 | `server_name` | DNS text; required for direct/gateway SMTP, forbidden otherwise |
+| `server_name_aliases` | Optional whitespace-separated DNS names for direct SMTP only; at most 31, distinct from each other and `server_name` |
 | `certificate` | Profile name; required for direct/gateway SMTP and HTTPS, forbidden otherwise |
 | `gateway` | Profile name; required for network gateway SMTP, forbidden otherwise |
 | `session_limit` | Integer 1..smtp_sessions; required for SMTP roles, forbidden otherwise |
@@ -519,8 +521,12 @@ in this schema.
 
 Direct/gateway listeners emit their own `server_name` in the SMTP greeting and
 EHLO response; it may differ from the global hostname. It also supplies that
-listener's required certificate name. Loopback fixtures use the global
-hostname. HTTP-01 listeners bind port 80 only, including local fixtures.
+listener's required certificate name. Direct SMTP aliases add required
+certificate names and local-MX bindings without changing the greeting,
+STARTTLS identity-selection policy or recipient/relay authority. Aliases
+fit the existing 4096-byte scalar and 32-name certificate caps. They are
+forbidden on gateway, HTTPS, HTTP-01 and loopback listeners. Loopback
+fixtures use the global hostname. HTTP-01 listeners bind port 80 only, including local fixtures.
 
 Direct SMTP offers opportunistic STARTTLS under DESIGN.md's compatibility
 policy. Gateway SMTP requires STARTTLS and verified client identity plus peer

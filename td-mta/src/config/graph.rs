@@ -276,10 +276,7 @@ fn advertised_name(
             .listener(index)
             .map_err(|_| invariant())?
             .ok_or_else(invariant)?;
-        if listener
-            .server_name
-            .is_some_and(|server| name.eq_ignore_ascii_case(server))
-        {
+        if listener.serves_name(name) {
             return Ok(true);
         }
     }
@@ -369,11 +366,7 @@ fn validate_links(
                 .listener(listener_index)
                 .map_err(|_| invariant())?
                 .ok_or_else(invariant)?;
-            if l.kind == listener::Kind::DirectSmtp
-                && l.server_name
-                    .ok_or_else(invariant)?
-                    .eq_ignore_ascii_case(d.mx_host)
-            {
+            if l.kind == listener::Kind::DirectSmtp && l.serves_name(d.mx_host) {
                 matching_direct = true;
             }
         }
@@ -536,6 +529,24 @@ pub(crate) fn bind_for_roles<'a>(
                 for alias in origins.iter().skip(1) {
                     names.add(arena, profile, alias.host(), at)?;
                 }
+            }
+            for alias_index in 0..listener::MAX_SERVER_NAMES - 1 {
+                let copied = {
+                    let listeners = inputs.listeners.view_live(arena).map_err(|_| invariant())?;
+                    let row = listeners
+                        .listener(index)
+                        .map_err(|_| invariant())?
+                        .ok_or_else(invariant)?;
+                    row.server_name_aliases
+                        .split_ascii_whitespace()
+                        .nth(alias_index)
+                        .map(|alias| copy_name(&mut scratch, alias))
+                        .transpose()?
+                };
+                let Some(len) = copied else {
+                    break;
+                };
+                names.add(arena, profile, name_text(&scratch, len)?, at)?;
             }
         }
     }
@@ -843,6 +854,7 @@ mod tests {
             kind: listener::Kind::Https,
             bind,
             server_name: None,
+            server_name_aliases: None,
             certificate: Some("shared"),
             gateway: None,
             session_limit: None,
@@ -859,6 +871,7 @@ mod tests {
                             kind: listener::Kind::DirectSmtp,
                             bind: "127.0.0.1:25",
                             server_name: Some("Mail.Example.test"),
+                            server_name_aliases: None,
                             certificate: Some("shared"),
                             gateway: None,
                             session_limit: Some(1),
@@ -1084,6 +1097,7 @@ mod tests {
                 kind: listener::Kind::Http01,
                 bind: "127.0.0.1:80",
                 server_name: None,
+                server_name_aliases: None,
                 certificate: None,
                 gateway: None,
                 session_limit: None,
