@@ -519,8 +519,14 @@ names `console=tty0` before `console=ttyS0,115200`. Linux writes its
 messages to every console the command line names and makes the last one
 `/dev/console`, so kernel messages reach both the foreground virtual
 terminal (VT) and the serial line, while `/dev/console`, and with it the
-standard streams of both initramfs' init, stays `ttyS0`: serial
-diagnostics and the oracles' console capture and typing are unchanged.
+initial standard streams of both initramfs' init, stays `ttyS0`. The
+PID-1 initramfs entry probes output before starting mount helpers or the
+shell: a working console remains their stdout and stderr, while a failed
+console moves both to the cpio's `/dev/kmsg`. Input stays inherited.
+`MEDIA.md` "Live boot diagnostics" owns this setup and its logging policy;
+a child tool's diagnostic write must not inherit an already rejected
+serial sink. Healthy serial diagnostics and the oracles' console capture
+and typing are unchanged.
 The prefix appears once per kernel entry, so the selector-to-deployment
 `kexec` carries `console=tty0 `, 13 bytes with its separator, twice,
 inside the command-line budget DESIGN.md states.

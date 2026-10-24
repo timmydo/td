@@ -166,7 +166,18 @@ The medium holds no private key, no volume identity and no operator data.
 Both stock initramfs scripts use `#!/bin/td-boot initramfs`. That
 PID-1-only entry mounts devtmpfs, procfs and sysfs through td-init's
 existing mount applet, then execs `/bin/sh /init`, retaining PID 1 for
-kexec and switch_root. The scripts no longer mount those filesystems.
+kexec and switch_root. The scripts no longer mount those filesystems. Before mounting devtmpfs,
+the entry opens the cpio's `/dev/console` and proves output with a status
+line and flush. If opening, writing or flushing fails, it probes the cpio's
+`/dev/kmsg` instead and reports the console error there. The chosen output
+becomes both stdout and stderr for the mount helpers and the shell, so
+child tools such as primary-profile preparation do not inherit an unusable
+serial output. These descriptors refer to cpio nodes and cannot pin the
+later devtmpfs mount. Input remains inherited. Failure of both output
+paths refuses setup. After mounting procfs, kernel-log fallback enables
+console log level 7 and `kernel.printk_devkmsg=on` so errors are visible
+without userspace printk rate limiting. This applies to installed and live
+boots; it does not change the installed panic/rollback policy.
 
 The selector's live-media marker, or the deployment's exact `td.live=1`
 handoff token, enables diagnostics. After mounting procfs the entry sets
@@ -178,8 +189,8 @@ shell's standard error and enables `-x`,
 so executed boot commands and errors reach the kernel log and its VT and
 serial consoles, even when `/dev/console` is serial. td-boot buffers each
 diagnostic line before writing standard error, since each kmsg write is
-a separate record; flush and drop emit an unterminated tail. Standard output and
-input keep their inherited descriptors. Tracing covers only the live
+a separate record; flush and drop emit an unterminated tail. Standard output keeps the probed destination and
+input stays inherited. Tracing covers only the live
 initramfs script, ending at its exec into td-boot or switch_root; it is
 never enabled for installed boots or the running system's init script.
 The live script must not expand secrets in commands while tracing is on.

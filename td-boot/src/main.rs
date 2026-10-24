@@ -4526,6 +4526,34 @@ fn live_diagnostics(marker_present: bool, cmdline: &[u8]) -> bool {
     marker_present || cmdline_has_token(cmdline, b"td.live=1")
 }
 
+/// Probe the cpio console before giving it to the shell and every child.
+/// Merely opening a registered serial console does not prove it accepts writes.
+fn select_initramfs_output<W: Write>(
+    console: io::Result<W>,
+    kernel_log: impl FnOnce() -> io::Result<W>,
+) -> io::Result<(W, bool)> {
+    let error = match console.and_then(|mut output| {
+        output.write_all(b"td-boot: initramfs output on /dev/console\n")?;
+        output.flush()?;
+        Ok(output)
+    }) {
+        Ok(output) => return Ok((output, false)),
+        Err(error) => error,
+    };
+    let mut output = kernel_log().map_err(|fallback| {
+        io::Error::new(
+            fallback.kind(),
+            format!("initramfs console failed: {error}; open kernel log: {fallback}"),
+        )
+    })?;
+    let notice = format!(
+        "td-boot: initramfs /dev/console failed: {error}; stdout and stderr on /dev/kmsg\n"
+    );
+    output.write_all(notice.as_bytes())?;
+    output.flush()?;
+    Ok((output, true))
+}
+
 /// The /init interpreter mounts the API filesystems before entering the shell.
 /// Live boots send shell errors and traces through printk to both consoles.
 fn run_initramfs() -> io::Result<()> {
@@ -4534,17 +4562,32 @@ fn run_initramfs() -> io::Result<()> {
     if std::process::id() != 1 {
         return Err(invalid("initramfs entry requires PID 1"));
     }
-    // Open the cpio node, not devtmpfs: fd 2 must not pin /dev at its unmount.
+    // Retained output must use cpio nodes, never pin devtmpfs at its unmount.
     let kernel_log = OpenOptions::new().write(true).open("/dev/kmsg");
+    let mut selected_output = None;
     let mut live = Path::new("/etc/td/live-media").exists();
     let result = (|| {
+        let (output, kernel_output) = select_initramfs_output(
+            OpenOptions::new()
+                .write(true)
+                .custom_flags(0o400) // O_NOCTTY: PID 1 must not acquire a terminal.
+                .open("/dev/console"),
+            || match &kernel_log {
+                Ok(log) => log.try_clone(),
+                Err(error) => Err(io::Error::new(error.kind(), error.to_string())),
+            },
+        )?;
+        let output = selected_output.insert(output);
         for (kind, source, target) in [
             ("devtmpfs", "dev", "/dev"),
             ("proc", "proc", "/proc"),
             ("sysfs", "sysfs", "/sys"),
         ] {
             run_command(
-                Command::new(TD_MOUNT).args(["-t", kind, source, target]),
+                Command::new(TD_MOUNT)
+                    .args(["-t", kind, source, target])
+                    .stdout(Stdio::from(output.try_clone()?))
+                    .stderr(Stdio::from(output.try_clone()?)),
                 &format!("initramfs mount {target}"),
             )?;
             if target == "/proc" {
@@ -4555,15 +4598,17 @@ fn run_initramfs() -> io::Result<()> {
                 )?;
                 live = live_diagnostics(live, &cmdline);
                 if live {
+                    fs::write("/proc/sys/kernel/panic", "0\n")?;
+                }
+                if live || kernel_output {
                     for (path, value) in [
-                        ("/proc/sys/kernel/panic", "0\n"),
                         ("/proc/sys/kernel/printk", "7\n"),
                         ("/proc/sys/kernel/printk_devkmsg", "on\n"),
                     ] {
                         fs::write(path, value).map_err(|e| {
                             io::Error::new(
                                 e.kind(),
-                                format!("configure live diagnostics {path}: {e}"),
+                                format!("configure initramfs diagnostics {path}: {e}"),
                             )
                         })?;
                     }
@@ -4571,6 +4616,9 @@ fn run_initramfs() -> io::Result<()> {
             }
         }
         let mut shell = Command::new("/bin/sh");
+        shell
+            .stdout(Stdio::from(output.try_clone()?))
+            .stderr(Stdio::from(output.try_clone()?));
         if live {
             let log = kernel_log
                 .as_ref()
@@ -4585,6 +4633,9 @@ fn run_initramfs() -> io::Result<()> {
         // exec retains PID 1 for both the selector's kexec and switch_root.
         Err(shell.arg("/init").exec())
     })();
+    if let (Err(error), Some(output)) = (&result, &mut selected_output) {
+        let _ = writeln!(output, "td-boot: initramfs setup failed: {error}");
+    }
     if live {
         if let Err(error) = &result {
             if let Ok(mut log) = kernel_log.as_ref() {
@@ -4616,6 +4667,84 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc;
     use std::time::Duration;
+
+    #[test]
+    fn initramfs_output_is_probed_and_the_fallback_reaches_children() {
+        let dir = test_temp::TempDir::new("td-initramfs-output").unwrap();
+        let console_path = dir.path().join("console");
+        let log_path = dir.path().join("kernel-log");
+        let (output, fallback) =
+            select_initramfs_output(File::create(&console_path), || -> io::Result<File> {
+                panic!("healthy console must not use kernel log")
+            })
+            .unwrap();
+        assert!(!fallback);
+        drop(output);
+        assert!(fs::read_to_string(&console_path)
+            .unwrap()
+            .contains("initramfs output on /dev/console"));
+
+        // /dev/full accepts an open but refuses output, like the absent UART.
+        let (output, fallback) =
+            select_initramfs_output(OpenOptions::new().write(true).open("/dev/full"), || {
+                File::create(&log_path)
+            })
+            .unwrap();
+        assert!(fallback);
+        let status = Command::new("/bin/sh")
+            .args([
+                "-ec",
+                "printf 'child stdout\n'; printf 'child stderr\n' >&2",
+            ])
+            .stdout(Stdio::from(output.try_clone().unwrap()))
+            .stderr(Stdio::from(output))
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let log = fs::read_to_string(&log_path).unwrap();
+        assert!(log.contains("stdout and stderr on /dev/kmsg"));
+        assert!(log.contains("child stdout\nchild stderr\n"));
+    }
+
+    #[test]
+    fn initramfs_output_rejects_open_write_and_flush_failures() {
+        struct Sink {
+            fails_flush: bool,
+        }
+        impl Write for Sink {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                if self.fails_flush {
+                    Err(io::Error::from_raw_os_error(5))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        for console in [
+            Err(io::Error::from_raw_os_error(6)),
+            Ok(Sink { fails_flush: true }),
+        ] {
+            let (_, fallback) =
+                select_initramfs_output(console, || Ok(Sink { fails_flush: false })).unwrap();
+            assert!(fallback);
+        }
+        let error = select_initramfs_output::<Sink>(Err(io::Error::from_raw_os_error(5)), || {
+            Err(io::Error::from_raw_os_error(2))
+        })
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("console failed"));
+        assert!(error.to_string().contains("open kernel log"));
+        assert!(
+            select_initramfs_output(Err(io::Error::from_raw_os_error(5)), || Ok(Sink {
+                fails_flush: true
+            }),)
+            .is_err()
+        );
+    }
 
     #[test]
     fn initramfs_entry_and_live_diagnostics_are_narrow() {
@@ -4669,6 +4798,30 @@ mod tests {
                 < body.find("shell.arg(\"/init\").exec()").unwrap()
         );
         assert!(body.contains("shell.arg(\"-x\").stderr(Stdio::from(log.try_clone()?))"));
+        assert!(
+            body.find("select_initramfs_output(").unwrap()
+                < body.find("Command::new(TD_MOUNT)").unwrap()
+        );
+        assert_eq!(
+            body.matches(".stdout(Stdio::from(output.try_clone()?))")
+                .count(),
+            2
+        );
+        assert_eq!(
+            body.matches(".stderr(Stdio::from(output.try_clone()?))")
+                .count(),
+            2
+        );
+        assert!(body.contains("if live || kernel_output"));
+        assert!(
+            body.find("/etc/td/live-media").unwrap()
+                < body.find("select_initramfs_output(").unwrap()
+        );
+        assert!(
+            body.find("let result = (|| {").unwrap()
+                < body.find("select_initramfs_output(").unwrap()
+        );
+        assert!(body.contains("halt(&format!(\"initramfs setup failed: {error}\"))"));
         assert!(
             body.find("open(\"/dev/kmsg\")").unwrap()
                 < body.find("Command::new(TD_MOUNT)").unwrap()
