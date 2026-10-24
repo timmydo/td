@@ -558,10 +558,13 @@ It is `#[ignore]`d for plain `cargo test`; `ready` runs it, and so does:
 target/release/td-builder gate-crates native-compositor --manifest-path td-mail/Cargo.toml
 ```
 
-Read requests retry HTTP 429 or 503 at most twice when Retry-After is a decimal
-delay of one through five seconds. A 503 without Retry-After waits one second
-for td-mta's previous worker to retire. This covers authenticated read bursts
-and the handoff between API reads and downloads.
+Read requests retry HTTP 429 or 503 at most four times when Retry-After is a
+decimal delay of one through five seconds. Each pause is at least the supplied
+delay and backs off through one, two, four and five seconds, allowing a busy
+mailbox read to finish. A 503 without Retry-After uses the same backoff.
+The pauses total at most twenty seconds, in addition to the bounded HTTP
+attempts. This covers authenticated read bursts and the handoff between API
+reads and downloads.
 GET discovery/downloads and explicit Mail read batches use this bound; mutation
 batches, transport failures and other statuses remain errors, as do 429 without
 a supported delay, 503 with an unsupported supplied delay, and continued pressure. Delays are synchronous; ordinary mailbox

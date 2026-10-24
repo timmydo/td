@@ -164,12 +164,13 @@ fn read_backoff(
         });
         let delay =
             delay.or_else(|| (response.status == 503 && retry_after.is_none()).then_some(1));
-        if !matches!(response.status, 429 | 503) || retries == 2 {
+        if !matches!(response.status, 429 | 503) || retries == 4 {
             return Ok(response);
         }
         let Some(seconds) = delay else {
             return Ok(response);
         };
+        let seconds = seconds.max((1_u64 << retries).min(5));
         retries += 1;
         drop(response);
         wait(std::time::Duration::from_secs(seconds));
@@ -2477,11 +2478,31 @@ mod tests {
     }
 
     #[test]
+    fn read_busy_retry_outlasts_a_six_second_mailbox_read() {
+        use std::cell::Cell;
+        let elapsed = Cell::new(0);
+        let mut calls = 0;
+        let response = read_backoff(
+            || {
+                calls += 1;
+                Ok(td_fetch_client::Response {
+                    status: if elapsed.get() < 6 { 429 } else { 200 },
+                    headers: vec![("retry-after".into(), "1".into())],
+                    body: vec![],
+                })
+            },
+            |delay| elapsed.set(elapsed.get() + delay.as_secs()),
+        )
+        .unwrap();
+        assert_eq!((response.status, calls, elapsed.get()), (200, 4, 7));
+    }
+
+    #[test]
     fn read_rate_limit_delays_are_bounded_and_other_failures_are_not_replayed() {
         use td_fetch_client::{Error, Response};
         for (status, delay, attempts) in [
-            (429, "1", 3),
-            (429, "5", 3),
+            (429, "1", 5),
+            (429, "5", 5),
             (429, "0", 1),
             (429, "6", 1),
             (429, "999999999999999999999", 1),
@@ -2489,7 +2510,7 @@ mod tests {
             (429, "+1", 1),
             (429, "", 1),
             (401, "1", 1),
-            (503, "1", 3),
+            (503, "1", 5),
             (503, "6", 1),
             (503, "", 1),
             (200, "1", 1),
@@ -2512,9 +2533,13 @@ mod tests {
             assert_eq!(waits.len(), attempts - 1);
             assert_eq!(reply.status, status);
             assert_eq!(reply.body, [42]);
-            assert!(waits
-                .iter()
-                .all(|d| d.as_secs() == delay.parse::<u64>().unwrap()));
+            for (retry, duration) in waits.iter().enumerate() {
+                assert_eq!(
+                    duration.as_secs(),
+                    delay.parse::<u64>().unwrap().max((1_u64 << retry).min(5))
+                );
+            }
+            assert!(waits.iter().map(|d| d.as_secs()).sum::<u64>() <= 20);
         }
         let mut calls = 0;
         let mut waits = Vec::new();
@@ -2530,7 +2555,7 @@ mod tests {
             |duration| waits.push(duration.as_secs()),
         )
         .unwrap();
-        assert_eq!((calls, waits, reply.status), (3, vec![1, 1], 503));
+        assert_eq!((calls, waits, reply.status), (5, vec![1, 2, 4, 5], 503));
         let mut calls = 0;
         let mut waited = 0;
         let reply = read_backoff(
