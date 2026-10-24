@@ -5,7 +5,7 @@ use crate::{
     outbound_http::{Client, Request},
     store_fs::PrivateRoot,
 };
-use std::{cell::Cell, path::PathBuf};
+use std::{cell::Cell, io::Write, path::PathBuf};
 use td_crypto::TrustStore;
 
 pub(super) struct Source {
@@ -147,11 +147,14 @@ impl Source {
             self.last_response.set(Some(Instant::now()));
             match response {
                 Ok(response) => return Ok(response),
-                Err(crate::outbound_http::Error::Status(429)) => {
-                    let delay = busy_delay(attempt, Instant::now(), self.deadline)?;
+                Err(crate::outbound_http::Error::Status(status)) => {
+                    let _ = writeln!(
+                        std::io::stderr().lock(),
+                        "migration HTTP response status: {status}"
+                    );
+                    let delay = busy_delay(status, attempt, Instant::now(), self.deadline)?;
                     std::thread::sleep(delay);
                 }
-                Err(crate::outbound_http::Error::Status(_)) => return Err("migration-http-status"),
                 Err(_) => return Err("migration-https-failed"),
             }
         }
@@ -337,7 +340,10 @@ impl Source {
     }
 }
 const BUSY_DELAYS: &[u64] = &[1, 2, 4, 8];
-fn busy_delay(attempt: usize, now: Instant, deadline: Instant) -> Result<Duration> {
+fn busy_delay(status: u16, attempt: usize, now: Instant, deadline: Instant) -> Result<Duration> {
+    if !matches!(status, 429 | 503) {
+        return Err("migration-http-status");
+    }
     let seconds = *BUSY_DELAYS.get(attempt).ok_or("migration-http-busy")?;
     let delay = Duration::from_secs(seconds);
     if now.checked_add(delay).is_none_or(|next| next >= deadline) {
@@ -407,14 +413,25 @@ mod tests {
     fn busy_backoff_stops_before_the_original_deadline_and_attempt_ceiling() {
         let now = Instant::now();
         let end = now + Duration::from_secs(30);
-        assert_eq!(busy_delay(0, now, end), Ok(Duration::from_secs(1)));
-        assert_eq!(busy_delay(3, now, end), Ok(Duration::from_secs(8)));
-        assert_eq!(busy_delay(4, now, end), Err("migration-http-busy"));
-        assert_eq!(
-            busy_delay(0, now, now + Duration::from_secs(1)),
-            Err("migration-network-deadline")
-        );
-        assert_eq!(busy_delay(0, end, now), Err("migration-network-deadline"));
+        for status in [429, 503] {
+            assert_eq!(busy_delay(status, 0, now, end), Ok(Duration::from_secs(1)));
+            assert_eq!(busy_delay(status, 3, now, end), Ok(Duration::from_secs(8)));
+            assert_eq!(busy_delay(status, 4, now, end), Err("migration-http-busy"));
+            assert_eq!(
+                busy_delay(status, 0, now, now + Duration::from_secs(1)),
+                Err("migration-network-deadline")
+            );
+            assert_eq!(
+                busy_delay(status, 0, end, now),
+                Err("migration-network-deadline")
+            );
+        }
+        for status in [301, 401, 403, 404, 500, 502, 504] {
+            assert_eq!(
+                busy_delay(status, 0, now, end),
+                Err("migration-http-status")
+            );
+        }
     }
     #[test]
     fn response_is_bound_to_method_call_and_account() {

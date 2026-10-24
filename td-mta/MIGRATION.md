@@ -32,13 +32,15 @@ Session, API and expanded download URLs must all use the original HTTPS
 origin. Redirects, plaintext HTTP and cross-origin credential forwarding are
 refused. TLS hostname and chain verification remain enabled.
 
-HTTP 429 temporary admission refusals are retried at most four times after
-one, two, four and eight seconds. Each attempt consumes the original request
+HTTP 429 and 503 temporary admission/service refusals are retried at most
+four times after one, two, four and eight seconds. Each attempt consumes the original request
 count and 24-hour operation deadline. Redirects, other HTTP statuses, TLS,
 framing and transport failures are not retried. Status is checked after
-bounded headers and before invoking any JSON or body sink, so a 429 retry
+bounded headers and before invoking any JSON or body sink, so a retry
 cannot retain an error body or append it to message bytes. Each refused
 connection is discarded. Backoff never renews an operation's deadline.
+The command logs each refused HTTP status number to stderr, without URLs,
+credentials, response headers or response bodies.
 
 Repeat the identical export command after an interruption. The archive binds
 its generated source-instance identifier to the session URL, account and
@@ -181,7 +183,7 @@ Requests have a 60-second deadline, bounded DNS and connect attempts, a
 24-hour invocation network deadline and a 200,000-request ceiling. Successive
 requests wait at least 200 ms after the preceding response, within the same
 invocation deadline, to stay below td-mta's per-peer authentication ceiling.
-Other traffic can still exhaust that shared allowance: HTTP 429 uses the
+Other traffic can still exhaust that shared allowance: HTTP 429 and 503 use the
 bounded retry policy above; other non-200 responses stop export. Retained
 bodies can be resumed. HTTP headers are
 limited to 16 KiB and 100 fields. Bodies accept Content-Length,
