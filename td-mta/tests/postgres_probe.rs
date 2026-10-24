@@ -7485,6 +7485,48 @@ fn exercise_read(
             td_mta::ports::Error::Deadline
         )))
     );
+    let disconnected_pin = read::with_snapshot(
+        request,
+        trust,
+        deadline(),
+        binding,
+        password,
+        |view| {
+            view.with_interpreted_body(second.email, |_, pin| {
+            pin.check_deadline()?;
+            sql(fixture,"SELECT pg_terminate_backend(pid) FROM pg_catalog.pg_stat_activity WHERE application_name='td-mta-postgres' AND pid<>pg_backend_pid()");
+            thread::sleep(Duration::from_millis(100));
+            let failure = (0..64).find_map(|_| pin.check_deadline().err());
+            assert!(failure.is_some(), "resident pin hid a disconnected snapshot beyond its bounded checks");
+            assert!(pin.is_failed());
+            assert_eq!(pin.check_deadline().err(), failure);
+            Ok(())
+        })
+        },
+    );
+    assert!(disconnected_pin.is_err());
+    let disconnected_at_completion = read::with_snapshot(
+        request,
+        trust,
+        deadline(),
+        binding,
+        password,
+        |view| {
+            view.with_interpreted_body(second.email, |_, pin| {
+            pin.check_deadline()?;
+            sql(fixture,"SELECT pg_terminate_backend(pid) FROM pg_catalog.pg_stat_activity WHERE application_name='td-mta-postgres' AND pid<>pg_backend_pid()");
+            thread::sleep(Duration::from_millis(100));
+            Ok(())
+        })
+        },
+    );
+    assert!(
+        matches!(
+            disconnected_at_completion,
+            Err(read::Error::Body(postgres_body::Error::Read(_)))
+        ),
+        "callback completion must always poll connection health"
+    );
     sql(fixture,&format!("UPDATE td_mta.blob_chunks SET bytes=set_byte(bytes,0,0) WHERE blob_id=decode('{}','hex')",second.blob));
     let corrupt = read::with_snapshot(request, trust, deadline(), binding, password, |view| {
         let error = view

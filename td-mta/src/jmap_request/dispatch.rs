@@ -488,7 +488,7 @@ impl MailRead for crate::postgres_read::Snapshot<'_> {
         work: &mut crate::admission::work::Meter,
     ) -> Result<bool, Error> {
         let mut result = Err(Error::State);
-        self.with_pinned_body(id, |_, pin| {
+        self.with_interpreted_body(id, |_, pin| {
             result = email_get::search_verified(pin, limits, search, clock, work);
             Ok(())
         })
@@ -548,7 +548,7 @@ impl MailRead for crate::postgres_read::Snapshot<'_> {
         output: &mut dyn EmailOutput,
     ) -> Result<(), Error> {
         let mut result = Err(Error::State);
-        self.with_pinned_body(email, |metadata, pin| {
+        self.with_interpreted_body(email, |metadata, pin| {
             if metadata.blob != projection.metadata.blob
                 || metadata.body.length != projection.metadata.size
             {

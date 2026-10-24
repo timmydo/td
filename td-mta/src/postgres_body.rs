@@ -120,6 +120,25 @@ pub(crate) fn with_verified_pin<T>(
     deadline: Instant,
     read: impl FnOnce(&mut crate::store_fs::PinnedBlob<'_, '_>) -> Result<T, ports::Error>,
 ) -> Result<T, Error> {
+    with_pin_checks(worker, metadata, deadline, false, read)
+}
+
+pub(crate) fn with_interpreted_pin<T>(
+    worker: &mut Worker,
+    metadata: BlobMetadata,
+    deadline: Instant,
+    read: impl FnOnce(&mut crate::store_fs::PinnedBlob<'_, '_>) -> Result<T, ports::Error>,
+) -> Result<T, Error> {
+    with_pin_checks(worker, metadata, deadline, true, read)
+}
+
+fn with_pin_checks<T>(
+    worker: &mut Worker,
+    metadata: BlobMetadata,
+    deadline: Instant,
+    interpreted: bool,
+    read: impl FnOnce(&mut crate::store_fs::PinnedBlob<'_, '_>) -> Result<T, ports::Error>,
+) -> Result<T, Error> {
     let mut body = Body {
         worker,
         metadata,
@@ -127,6 +146,7 @@ pub(crate) fn with_verified_pin<T>(
         failed: None,
         cache: Vec::new(),
         cache_start: 0,
+        checks_left: interpreted.then_some(0),
     };
     body.verify().map_err(Error::Read)?;
     let mut pin =
@@ -134,6 +154,8 @@ pub(crate) fn with_verified_pin<T>(
             .map_err(Error::Read)?;
     let result = read(&mut pin);
     pin.check_deadline().map_err(Error::Read)?;
+    drop(pin);
+    body.check().map_err(Error::Read)?;
     result.map_err(Error::Read)
 }
 
@@ -197,6 +219,7 @@ pub fn with_pinned_blob<T>(
             failed: None,
             cache: Vec::new(),
             cache_start: 0,
+            checks_left: None,
         };
         body.verify().map_err(Error::Read)?;
         // A new primary transaction sees revocations after the body snapshot.
@@ -214,6 +237,8 @@ pub fn with_pinned_blob<T>(
                 .map_err(Error::Read)?;
         let result = read(metadata, &mut pin);
         pin.check_deadline().map_err(Error::Read)?;
+        drop(pin);
+        body.check().map_err(Error::Read)?;
         result.map_err(Error::Read)
     })
     .map_err(Error::Connection)?
@@ -449,6 +474,7 @@ struct Body<'a> {
     failed: Option<ports::Error>,
     cache: Vec<tokio_postgres::Row>,
     cache_start: u64,
+    checks_left: Option<u8>,
 }
 impl Body<'_> {
     fn check(&mut self) -> Result<(), ports::Error> {
@@ -566,6 +592,23 @@ impl BlobReader for Body<'_> {
 
 impl crate::store_fs::VerifiedSource for Body<'_> {
     fn check(&mut self) -> Result<(), ports::Error> {
-        Body::check(self)
+        if let Some(error) = self.failed {
+            return Err(error);
+        }
+        let result = match self.checks_left {
+            None => Body::check(self),
+            Some(0) => {
+                self.checks_left = Some(63);
+                Body::check(self)
+            }
+            Some(left) => {
+                self.checks_left = Some(left - 1);
+                self.worker.check_deadline().map_err(connection)
+            }
+        };
+        if let Err(error) = result {
+            self.failed = Some(error);
+        }
+        result
     }
 }

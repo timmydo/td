@@ -1894,6 +1894,13 @@ its original work meter on every turn. Header collection and source reads
 retain their own native checks. Completion and errors receive a native
 postcheck; a failed batch retires the cursor. Single-turn interfaces remain
 unchanged. This avoids polling PostgreSQL for each scalar or parser turn.
+JMAP interpretation of verified PostgreSQL body pins further groups at most 64 resident-cursor
+checks between connection-health polls. Each check still enforces the
+original native deadline and sticky failures. Body reads, verification,
+and final callback completion poll connection health unconditionally;
+no response can complete on a disconnected snapshot. Relay admission and
+raw-download pins retain unconditional checks on every call. This amortizes
+nonblocking TLS/socket probes without extending snapshot authority.
 
 ## 10. HTTP and JMAP
 
@@ -1999,7 +2006,10 @@ Upload publication acquires a fresh commit-time authorization guard; future
 mutations must do the same.
 
 At most sixteen active HTTPS connections per IP and the configured global count
-are admitted. Authentication uses fixed one-second monotonic windows: 64
+are admitted. Per-IP connection refusals emit the bounded, rate-limited
+admission-refused event before closing the unauthenticated socket. No peer
+address or credential is retained in that event. Authentication uses fixed
+one-second monotonic windows: 64
 attempts globally and eight per IP, with a 64-entry peer table that never
 evicts an unexpired entry. Invalid credential syntax consumes an attempt too;
 wrong authority or cross-origin requests are refused before verification.

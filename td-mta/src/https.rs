@@ -658,6 +658,13 @@ impl Https<'_> {
                     .count()
                     >= PER_PEER
                 {
+                    control.log(
+                        crate::observability::Kind::AdmissionRefused {
+                            reason: crate::observability::Refusal::Capacity,
+                        },
+                        None,
+                        None,
+                    );
                     continue;
                 }
                 if socket.set_nonblocking(true).is_err() {

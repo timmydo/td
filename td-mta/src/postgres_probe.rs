@@ -575,6 +575,16 @@ impl Worker {
         self.deadline = self.deadline.min(deadline);
         self.check()
     }
+    pub(crate) fn check_deadline(&mut self) -> Result<(), Error> {
+        if let Some(error) = self.failed {
+            return Err(error);
+        }
+        if let Err(error) = remaining(self.deadline) {
+            self.failed = Some(error);
+            return Err(error);
+        }
+        Ok(())
+    }
     // No query or round trip: drain available asynchronous messages so an idle
     // cached read cannot hide a terminal connection error behind a notice.
     pub(crate) fn check(&mut self) -> Result<(), Error> {

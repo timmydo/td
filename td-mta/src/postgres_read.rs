@@ -518,20 +518,42 @@ impl Snapshot<'_> {
         email: EmailId,
         read: impl FnOnce(Metadata, &mut crate::store_fs::PinnedBlob<'_, '_>) -> Result<T, ports::Error>,
     ) -> Result<T, Error> {
+        self.with_body_checks(email, false, read)
+    }
+    /// Interpret into provisional response storage, grouping resident checks.
+    /// The callback must not publish bytes or cross a fresh admission boundary.
+    /// Body reads and completion retain unconditional connection-health checks.
+    pub fn with_interpreted_body<T>(
+        &mut self,
+        email: EmailId,
+        read: impl FnOnce(Metadata, &mut crate::store_fs::PinnedBlob<'_, '_>) -> Result<T, ports::Error>,
+    ) -> Result<T, Error> {
+        self.with_body_checks(email, true, read)
+    }
+    fn with_body_checks<T>(
+        &mut self,
+        email: EmailId,
+        interpreted: bool,
+        read: impl FnOnce(Metadata, &mut crate::store_fs::PinnedBlob<'_, '_>) -> Result<T, ports::Error>,
+    ) -> Result<T, Error> {
         let metadata = self
             .email(email)?
             .ok_or(Error::Body(postgres_body::Error::Missing));
         let metadata = self.retain(metadata)?;
-        let result = postgres_body::with_verified_pin(
-            &mut self.worker,
-            BlobMetadata {
-                identity: metadata.identity,
-                blob: metadata.blob,
-                body: metadata.body,
-            },
-            self.deadline,
-            |body| read(metadata, body),
-        )
+        let blob = BlobMetadata {
+            identity: metadata.identity,
+            blob: metadata.blob,
+            body: metadata.body,
+        };
+        let result = if interpreted {
+            postgres_body::with_interpreted_pin(&mut self.worker, blob, self.deadline, |body| {
+                read(metadata, body)
+            })
+        } else {
+            postgres_body::with_verified_pin(&mut self.worker, blob, self.deadline, |body| {
+                read(metadata, body)
+            })
+        }
         .map_err(Error::Body);
         self.retain(result)
     }
