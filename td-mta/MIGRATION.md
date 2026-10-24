@@ -341,6 +341,14 @@ td-mta migration import --only-unmapped \
   --connection-file /private/owner.connection --epoch EPOCH --account ACCOUNT
 ```
 
+Existing-message mappings are inspected in groups of at most 256, using one
+authenticated database connection and one mapping query per group. Each group
+checks owner authority and the store epoch under the migration lock and holds
+the account share lock through observation. Unmapped objects still recheck
+receipts and publication policy in their individual write transactions. A group
+is bounded by the existing ten-second deadline and protocol budgets; it grants
+no later publication authority.
+
 An existing exact destination-account/source-instance/source-account/kind/ID
 receipt causes a skip, regardless of its digest or whether the local object
 still exists. Skipping does not update the receipt, reset local metadata,

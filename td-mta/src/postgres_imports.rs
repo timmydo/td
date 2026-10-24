@@ -141,23 +141,9 @@ async fn mapped_policy(
     let Some(row) = rows.first() else {
         return Ok(None);
     };
-    let stored: &[u8] = row.try_get(2).map_err(|_| Error::Integrity)?;
-    if stored.len() != 32 {
-        return Err(Error::Integrity);
-    }
-    if digest.is_some_and(|digest| stored != digest) {
-        return Err(Error::SourceChanged);
-    }
-    if sequence(row.try_get(3).map_err(|_| Error::Integrity)?)? > old {
-        return Err(Error::Integrity);
-    }
-    let local: &[u8] = row.try_get(0).map_err(|_| Error::Integrity)?;
-    let local_object: [u8; 16] = local.try_into().map_err(|_| Error::Integrity)?;
-    let blob: Option<&[u8]> = row.try_get(1).map_err(|_| Error::Integrity)?;
+    let local_object = mapped_row(row, key.kind, digest, old)?;
+    let local = local_object.as_slice();
     use crate::format::key::SourceKind;
-    if (key.kind == SourceKind::Email) != blob.is_some() || blob.is_some_and(|b| b.len() != 16) {
-        return Err(Error::Integrity);
-    }
     let sql = if key.kind == SourceKind::Mailbox {
         "SELECT EXISTS(SELECT 1 FROM td_mta.mailboxes WHERE account=$1 AND id=$2)"
     } else {
@@ -176,6 +162,90 @@ async fn mapped_policy(
         present,
     }))
 }
+fn mapped_row(
+    row: &tokio_postgres::Row,
+    kind: crate::format::key::SourceKind,
+    digest: Option<&[u8; 32]>,
+    old: u64,
+) -> Result<[u8; 16], Error> {
+    use crate::format::key::SourceKind;
+    let stored: &[u8] = row.try_get(2).map_err(|_| Error::Integrity)?;
+    if stored.len() != 32 {
+        return Err(Error::Integrity);
+    }
+    if digest.is_some_and(|digest| stored != digest) {
+        return Err(Error::SourceChanged);
+    }
+    if sequence(row.try_get(3).map_err(|_| Error::Integrity)?)? > old {
+        return Err(Error::Integrity);
+    }
+    let local: &[u8] = row.try_get(0).map_err(|_| Error::Integrity)?;
+    let local_object: [u8; 16] = local.try_into().map_err(|_| Error::Integrity)?;
+    let blob: Option<&[u8]> = row.try_get(1).map_err(|_| Error::Integrity)?;
+    if (kind == SourceKind::Email) != blob.is_some() || blob.is_some_and(|b| b.len() != 16) {
+        return Err(Error::Integrity);
+    }
+    Ok(local_object)
+}
+
+/// One bounded connection and mapping query per group of source objects.
+pub const MAX_MAPPING_BATCH: usize = 256;
+pub fn inspect_mappings(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    authority: &Authority,
+    keys: &[Key],
+) -> Result<Vec<Option<Outcome>>, Error> {
+    if request.mode != Mode::Preparation {
+        return Err(Error::Owner);
+    }
+    let first = keys.first().ok_or(Error::Invalid)?;
+    if keys.len() > MAX_MAPPING_BATCH
+        || !matches!(
+            first.kind,
+            crate::format::key::SourceKind::Mailbox | crate::format::key::SourceKind::Email
+        )
+        || keys.iter().any(|key| {
+            key.instance != first.instance || key.kind != first.kind || key.account != first.account
+        })
+    {
+        return Err(Error::Invalid);
+    }
+    let objects: Vec<Vec<u8>> = keys.iter().map(|key| key.object.clone()).collect();
+    let count = keys.len();
+    let first = first.clone();
+    let authority = authority.clone();
+    postgres_probe::with_batch_client(request, trust, deadline, move |client| {
+        Box::pin(async move {
+            let receipt = crate::postgres_schema::lock_and_inspect(client).await.map_err(|_| Error::Database)?;
+            if receipt.store_epoch != authority.epoch {
+                return Err(Error::Epoch);
+            }
+            client.batch_execute("BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL idle_in_transaction_session_timeout=10000").await.map_err(|_| Error::Database)?;
+            crate::postgres_maintenance::owner(client).await.map_err(|_| Error::Owner)?;
+            let row = client.query_one("SELECT sequence FROM td_mta.accounts WHERE id=$1 FOR SHARE", &[&authority.account.as_bytes().as_slice()]).await.map_err(|_| Error::Database)?;
+            let old = sequence(row.try_get(0).map_err(|_| Error::Integrity)?)?;
+            let rows = client.query("SELECT i.local_object,i.historical_blob,i.source_digest,i.changed,CASE WHEN $3::bigint=1 THEN EXISTS(SELECT 1 FROM td_mta.mailboxes m WHERE m.account=$1 AND m.id=i.local_object) ELSE EXISTS(SELECT 1 FROM td_mta.emails e WHERE e.account=$1 AND e.id=i.local_object) END,k.ordinal FROM unnest($5::bytea[]) WITH ORDINALITY AS k(object,ordinal) LEFT JOIN td_mta.imports i ON i.account=$1 AND i.source_instance=$2 AND i.source_kind=$3 AND i.source_account=$4 AND i.source_object=k.object ORDER BY k.ordinal", &[&authority.account.as_bytes().as_slice(),&first.instance.as_bytes().as_slice(),&i64::from(first.kind.tag()),&first.account.as_slice(),&objects]).await.map_err(|_| Error::Database)?;
+            if rows.len() != count {
+                return Err(Error::Integrity);
+            }
+            let mut outcomes = Vec::with_capacity(rows.len());
+            for (index, row) in rows.iter().enumerate() {
+                let ordinal: i64 = row.try_get(5).map_err(|_| Error::Integrity)?;
+                if usize::try_from(ordinal).ok() != index.checked_add(1) {
+                    return Err(Error::Integrity);
+                }
+                let local: Option<&[u8]> = row.try_get(0).map_err(|_| Error::Integrity)?;
+                outcomes.push(if local.is_some() {
+                    Some(Outcome { local_object: mapped_row(row, first.kind, None, old)?, created: false, recorded: false, present: row.try_get(4).map_err(|_| Error::Integrity)? })
+                } else { None });
+            }
+            Ok(outcomes)
+        })
+    }).map_err(Error::Connection)?
+}
+
 async fn record(
     client: &Client,
     authority: &Authority,
@@ -321,11 +391,17 @@ async fn unused(
     kind: i64,
     id: &[u8; 16],
 ) -> Result<(), Error> {
-    let sql=match kind {
-        1=>"SELECT EXISTS(SELECT 1 FROM td_mta.mailboxes WHERE account=$1 AND id=$2) OR EXISTS(SELECT 1 FROM td_mta.changes WHERE account=$1 AND kind=1 AND object=$2)",
-        2=>"SELECT EXISTS(SELECT 1 FROM td_mta.threads WHERE account=$1 AND id=$2) OR EXISTS(SELECT 1 FROM td_mta.changes WHERE account=$1 AND kind=2 AND object=$2)",
-        3=>"SELECT EXISTS(SELECT 1 FROM td_mta.emails WHERE account=$1 AND id=$2) OR EXISTS(SELECT 1 FROM td_mta.changes WHERE account=$1 AND kind=3 AND object=$2)",
-        _=>return Err(Error::Invalid),
+    let sql = match kind {
+        1 => {
+            "SELECT EXISTS(SELECT 1 FROM td_mta.mailboxes WHERE account=$1 AND id=$2) OR EXISTS(SELECT 1 FROM td_mta.changes WHERE account=$1 AND kind=1 AND object=$2)"
+        }
+        2 => {
+            "SELECT EXISTS(SELECT 1 FROM td_mta.threads WHERE account=$1 AND id=$2) OR EXISTS(SELECT 1 FROM td_mta.changes WHERE account=$1 AND kind=2 AND object=$2)"
+        }
+        3 => {
+            "SELECT EXISTS(SELECT 1 FROM td_mta.emails WHERE account=$1 AND id=$2) OR EXISTS(SELECT 1 FROM td_mta.changes WHERE account=$1 AND kind=3 AND object=$2)"
+        }
+        _ => return Err(Error::Invalid),
     };
     let used: bool = client
         .query_one(sql, &[&account.as_bytes().as_slice(), &id.as_slice()])

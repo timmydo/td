@@ -10,7 +10,10 @@ use td_mta::{
 };
 
 fn state(fixture: &Fixture) -> String {
-    sql(fixture, "SELECT encode(sequence,'hex'),body_bytes,blob_count,(SELECT count(*) FROM td_mta.imports),(SELECT count(*) FROM td_mta.changes) FROM td_mta.accounts JOIN td_mta.account_usage ON account=id")
+    sql(
+        fixture,
+        "SELECT encode(sequence,'hex'),body_bytes,blob_count,(SELECT count(*) FROM td_mta.imports),(SELECT count(*) FROM td_mta.changes) FROM td_mta.accounts JOIN td_mta.account_usage ON account=id",
+    )
 }
 pub fn exercise(
     fixture: &Fixture,
@@ -56,7 +59,10 @@ pub fn exercise(
     .unwrap();
     assert!(!skipped.recorded && !skipped.created && skipped.present);
     assert_eq!(before, state(fixture));
-    sql(fixture,"DELETE FROM td_mta.memberships WHERE email_id=(SELECT local_object FROM td_mta.imports WHERE source_object=convert_to('gone','UTF8')); DELETE FROM td_mta.keywords WHERE email_id=(SELECT local_object FROM td_mta.imports WHERE source_object=convert_to('gone','UTF8')); DELETE FROM td_mta.thread_anchors WHERE email_id=(SELECT local_object FROM td_mta.imports WHERE source_object=convert_to('gone','UTF8')); DELETE FROM td_mta.emails WHERE id=(SELECT local_object FROM td_mta.imports WHERE source_object=convert_to('gone','UTF8'))");
+    sql(
+        fixture,
+        "DELETE FROM td_mta.memberships WHERE email_id=(SELECT local_object FROM td_mta.imports WHERE source_object=convert_to('gone','UTF8')); DELETE FROM td_mta.keywords WHERE email_id=(SELECT local_object FROM td_mta.imports WHERE source_object=convert_to('gone','UTF8')); DELETE FROM td_mta.thread_anchors WHERE email_id=(SELECT local_object FROM td_mta.imports WHERE source_object=convert_to('gone','UTF8')); DELETE FROM td_mta.emails WHERE id=(SELECT local_object FROM td_mta.imports WHERE source_object=convert_to('gone','UTF8'))",
+    );
     let changed_gone = email("gone", body, &["$flagged"]);
     let before = state(fixture);
     let skipped = db::publish_unmapped_email(
@@ -116,7 +122,10 @@ pub fn exercise(
         .unwrap()
         .recorded
     );
-    sql(fixture,"UPDATE td_mta.imports SET source_object=convert_to('missing-child','UTF8') WHERE source_object=convert_to('child','UTF8')");
+    sql(
+        fixture,
+        "UPDATE td_mta.imports SET source_object=convert_to('missing-child','UTF8') WHERE source_object=convert_to('child','UTF8')",
+    );
     assert_eq!(
         db::publish_unmapped_email(request, trust, deadline(), &authority, &new, body, &folders),
         Err(db::Error::MissingMailbox)
@@ -125,8 +134,14 @@ pub fn exercise(
         db::publish_unmapped_mailbox(request, trust, deadline(), &authority, &child, &folders),
         Err(db::Error::MissingMailbox)
     );
-    sql(fixture,"UPDATE td_mta.imports SET source_object=convert_to('child','UTF8') WHERE source_object=convert_to('missing-child','UTF8')");
-    sql(fixture,"INSERT INTO td_mta.imports SELECT account,source_instance,source_kind,source_account,convert_to('alias','UTF8'),local_object,historical_blob,source_digest,changed FROM td_mta.imports WHERE source_object=convert_to('child','UTF8')");
+    sql(
+        fixture,
+        "UPDATE td_mta.imports SET source_object=convert_to('child','UTF8') WHERE source_object=convert_to('missing-child','UTF8')",
+    );
+    sql(
+        fixture,
+        "INSERT INTO td_mta.imports SELECT account,source_instance,source_kind,source_account,convert_to('alias','UTF8'),local_object,historical_blob,source_digest,changed FROM td_mta.imports WHERE source_object=convert_to('child','UTF8')",
+    );
     let aliased = state(fixture);
     assert_eq!(
         db::publish_unmapped_email(request, trust, deadline(), &authority, &new, body, &folders),
@@ -194,6 +209,43 @@ pub fn exercise(
         assert_eq!(first.local_object, second.local_object);
         assert_ne!(first.recorded, second.recorded);
     });
+    use super::imports::key;
+    use td_mta::format::key::SourceKind;
+    let keys = [
+        key("old", SourceKind::Email),
+        key("gone", SourceKind::Email),
+        key("not-mapped", SourceKind::Email),
+        key("old", SourceKind::Email),
+    ];
+    let outcomes = db::inspect_mappings(request, trust, deadline(), &authority, &keys).unwrap();
+    assert!(outcomes[0].unwrap().present);
+    assert!(!outcomes[1].unwrap().present);
+    assert!(outcomes[2].is_none());
+    assert_eq!(outcomes[0], outcomes[3]);
+    assert_eq!(
+        db::inspect_mappings(request, trust, deadline(), &authority, &[]),
+        Err(db::Error::Invalid)
+    );
+    assert_eq!(
+        db::inspect_mappings(
+            request,
+            trust,
+            deadline(),
+            &authority,
+            &vec![keys[0].clone(); db::MAX_MAPPING_BATCH + 1]
+        ),
+        Err(db::Error::Invalid)
+    );
+    assert_eq!(
+        db::inspect_mappings(
+            request,
+            trust,
+            deadline(),
+            &authority,
+            &[keys[0].clone(), key("inbox", SourceKind::Mailbox)]
+        ),
+        Err(db::Error::Invalid)
+    );
     cli(fixture, epoch, account, connection, body);
     sql(fixture, "UPDATE td_mta.runtime_barrier SET blocked=true");
     assert_eq!(
@@ -208,7 +260,10 @@ pub fn exercise(
         ),
         Err(db::Error::Policy)
     );
-    sql(fixture,"UPDATE td_mta.runtime_barrier SET blocked=false; UPDATE td_mta.config_selection SET generation=decode('0000000000000002','hex')");
+    sql(
+        fixture,
+        "UPDATE td_mta.runtime_barrier SET blocked=false; UPDATE td_mta.config_selection SET generation=decode('0000000000000002','hex')",
+    );
     assert_eq!(
         db::publish_unmapped_email(
             request,
@@ -260,7 +315,7 @@ fn cli(
         command
             .args(["migration", "import", "--archive"])
             .arg(archive.path())
-            .args(["--max-bytes", "1048576", "--connection-file"])
+            .args(["--max-bytes", "33554432", "--connection-file"])
             .arg(connection)
             .args([
                 "--epoch",
@@ -306,8 +361,20 @@ fn cli(
     assert_eq!(result["createdMessages"].as_u64(), Some(0));
     assert_eq!(result["skippedMappedMessages"].as_u64(), Some(3));
     assert_eq!(after, state(fixture));
-    assert_eq!(sql(fixture,"SELECT count(*) FROM td_mta.emails WHERE id=(SELECT local_object FROM td_mta.imports WHERE source_object=convert_to('gone','UTF8'))"),"0");
-    assert_eq!(sql(fixture,"SELECT keyword FROM td_mta.keywords WHERE email_id=(SELECT local_object FROM td_mta.imports WHERE source_object=convert_to('old','UTF8'))"),"$seen");
+    assert_eq!(
+        sql(
+            fixture,
+            "SELECT count(*) FROM td_mta.emails WHERE id=(SELECT local_object FROM td_mta.imports WHERE source_object=convert_to('gone','UTF8'))"
+        ),
+        "0"
+    );
+    assert_eq!(
+        sql(
+            fixture,
+            "SELECT keyword FROM td_mta.keywords WHERE email_id=(SELECT local_object FROM td_mta.imports WHERE source_object=convert_to('old','UTF8'))"
+        ),
+        "$seen"
+    );
     // The CLI also creates a new child while skipping all mapped Emails.
     let mut extended = manifest(true);
     if let Json::Obj(fields) = &mut extended {
@@ -334,4 +401,67 @@ fn cli(
     let result = td_json::parse_slice(&result.stdout).unwrap();
     assert_eq!(result["createdMailboxes"].as_u64(), Some(1));
     assert_eq!(result["skippedMappedMessages"].as_u64(), Some(3));
+    // A mostly mapped archive must not establish one connection per message.
+    sql(
+        fixture,
+        "INSERT INTO td_mta.imports SELECT account,source_instance,source_kind,source_account,convert_to('scale-'||n,'UTF8'),decode(md5('scale-'||n),'hex'),historical_blob,source_digest,changed FROM td_mta.imports CROSS JOIN generate_series(1,32768) n WHERE source_object=convert_to('old','UTF8')",
+    );
+    let mut scaled = extended.clone();
+    if let Json::Obj(fields) = &mut scaled {
+        let messages = &mut fields
+            .iter_mut()
+            .find(|(name, _)| name == "messages")
+            .unwrap()
+            .1;
+        if let Json::Arr(values) = messages {
+            for index in 1..=32768 {
+                values.push(record(
+                    &format!("scale-{index}"),
+                    old_body,
+                    boxes.clone(),
+                    json!({"$seen":true}),
+                ));
+            }
+            for index in 1..=43 {
+                values.push(record(
+                    &format!("addition-{index}"),
+                    new_body,
+                    json!({"newbox":true}),
+                    json!({"$seen":true}),
+                ));
+            }
+        } else {
+            panic!("message array");
+        }
+    }
+    write(
+        &archive.join("manifest.json"),
+        scaled.to_string().as_bytes(),
+    );
+    let connections = || {
+        sql(
+            fixture,
+            "SELECT sessions FROM pg_stat_database WHERE datname=current_database()",
+        )
+        .parse::<u64>()
+        .unwrap()
+    };
+    let before = connections();
+    let started = std::time::Instant::now();
+    let result = invoke(true);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let used = connections() - before;
+    eprintln!("mostly mapped import: 32768 historical mappings + 43 additions, {used} connections, {:.2}s", started.elapsed().as_secs_f64());
+    assert!(
+        used > 0 && used < 300,
+        "mostly mapped import opened {used} connections"
+    );
+    let result = td_json::parse_slice(&result.stdout).unwrap();
+    assert_eq!(result["createdMessages"].as_u64(), Some(43));
+    assert_eq!(result["skippedMappedMessages"].as_u64(), Some(32771));
+    assert_eq!(result["historicalObjectsAbsent"].as_u64(), Some(32769));
 }

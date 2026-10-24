@@ -70,56 +70,66 @@ pub(super) fn run(
         }
     }
     let messages = array(&manifest, "messages")?;
-    for record in messages {
-        let email = field(record, "email")?;
-        let key = Key::new(
-            instance,
-            SourceKind::Email,
-            source_account,
-            string(email, "id")?.as_bytes(),
-        )
-        .map_err(|_| "migration-unrepresentable")?;
-        if let Some(outcome) = database::inspect_mapping(
-            &request,
-            &loaded.trust,
-            import::deadline(),
-            &authority,
-            &key,
-        )
-        .map_err(import::code)?
-        {
-            absent += usize::from(!outcome.present);
-            skipped_messages += 1;
-            continue;
-        }
-        let converted = import::messages(
-            &json!({"messages":[record.clone()]}),
-            instance,
-            source_account,
-        )?;
-        let (value, body, size) = converted.first().ok_or("migration-invalid-field")?;
-        let ids: Vec<_> = value
-            .mailboxes
+    for records in messages.chunks(database::MAX_MAPPING_BATCH) {
+        let keys = records
             .iter()
-            .map(|id| std::str::from_utf8(id).map_err(|_| "migration-invalid-id"))
-            .collect::<Result<_>>()?;
-        let definitions = folders.definitions(&ids, instance, source_account)?;
-        let bytes = archive.read_body(body, *size)?;
-        let outcome = database::publish_unmapped_email(
+            .map(|record| {
+                let email = field(record, "email")?;
+                Key::new(
+                    instance,
+                    SourceKind::Email,
+                    source_account,
+                    string(email, "id")?.as_bytes(),
+                )
+                .map_err(|_| "migration-unrepresentable")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let outcomes = database::inspect_mappings(
             &request,
             &loaded.trust,
             import::deadline(),
             &authority,
-            value,
-            &bytes,
-            &definitions,
+            &keys,
         )
         .map_err(import::code)?;
-        absent += usize::from(!outcome.present);
-        if outcome.recorded {
-            created_messages += 1;
-        } else {
-            skipped_messages += 1;
+        if outcomes.len() != records.len() {
+            return Err("migration-integrity");
+        }
+        for (record, outcome) in records.iter().zip(outcomes) {
+            if let Some(outcome) = outcome {
+                absent += usize::from(!outcome.present);
+                skipped_messages += 1;
+                continue;
+            }
+            let converted = import::messages(
+                &json!({"messages":[record.clone()]}),
+                instance,
+                source_account,
+            )?;
+            let (value, body, size) = converted.first().ok_or("migration-invalid-field")?;
+            let ids: Vec<_> = value
+                .mailboxes
+                .iter()
+                .map(|id| std::str::from_utf8(id).map_err(|_| "migration-invalid-id"))
+                .collect::<Result<_>>()?;
+            let definitions = folders.definitions(&ids, instance, source_account)?;
+            let bytes = archive.read_body(body, *size)?;
+            let outcome = database::publish_unmapped_email(
+                &request,
+                &loaded.trust,
+                import::deadline(),
+                &authority,
+                value,
+                &bytes,
+                &definitions,
+            )
+            .map_err(import::code)?;
+            absent += usize::from(!outcome.present);
+            if outcome.recorded {
+                created_messages += 1;
+            } else {
+                skipped_messages += 1;
+            }
         }
     }
     Ok(json!({
