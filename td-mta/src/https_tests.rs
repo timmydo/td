@@ -178,7 +178,14 @@ fn https_enforces_auth_origin_framing_revocation_and_idle_deadlines() {
         .replace("127.0.0.1:443", &address.to_string());
     let lease = material.published(&source);
     let resolved = resolved(&source);
-    let resource = Limits::default().plan().unwrap();
+    let resource = Limits {
+        https_connections: 32,
+        json_bytes: 512 * 1024,
+        json_tokens: 16384,
+        ..Limits::default()
+    }
+    .plan()
+    .unwrap();
     let admission = DiskLimits::default()
         .plan(&resource, WorkLimits::default(), ViewMode::OnlineBackground)
         .unwrap();
@@ -220,8 +227,7 @@ fn https_enforces_auth_origin_framing_revocation_and_idle_deadlines() {
                     ready.load(Ordering::Acquire)
                 });
                 // Idle TCP peers consume connection capacity but no handshake permit.
-                let idle_a = TcpStream::connect(address).unwrap();
-                let idle_b = TcpStream::connect(address).unwrap();
+                let idle: Vec<_> = (0..16).map(|_| TcpStream::connect(address).unwrap()).collect();
                 std::thread::sleep(Duration::from_millis(50));
                 assert_eq!(handshakes.available(), 2);
                 let mut excess = TcpStream::connect(address).unwrap();
@@ -231,7 +237,11 @@ fn https_enforces_auth_origin_framing_revocation_and_idle_deadlines() {
                     Err(error) => error.kind() == io::ErrorKind::ConnectionReset,
                     Ok(_) => false,
                 });
-                drop((idle_a, idle_b, excess));
+                for socket in &idle {
+                    socket.set_nonblocking(true).unwrap();
+                    assert_eq!(socket.peek(&mut [0; 1]).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+                }
+                drop((idle, excess));
                 std::thread::sleep(Duration::from_millis(50));
                 // A full shared pool delays ClientHello admission instead of closing TCP.
                 let first = handshakes.reserve().unwrap();
@@ -316,7 +326,7 @@ fn https_enforces_auth_origin_framing_revocation_and_idle_deadlines() {
                 wait(|| post.close().unwrap() == FlushProgress::Complete);
                 wait(|| post.read(&mut [0; 32]).unwrap() == IoProgress::Closed);
                 std::thread::sleep(Duration::from_millis(20));
-                // Two unfinished bodies occupy the per-peer slots. A trickle must not
+                // Two unfinished bodies plus idle peers fill the cap. A trickle must not
                 // renew the shared close/drain deadline when the fake clock advances.
                 clock.1.fetch_add(2_000, Ordering::Relaxed);
                 let mut silent = client(address, &lease, clock.clone());
@@ -324,6 +334,8 @@ fn https_enforces_auth_origin_framing_revocation_and_idle_deadlines() {
                 let head = format!("POST /jmap HTTP/1.1\r\nHost: {host}\r\nAuthorization: Basic {authorization}\r\nContent-Length: 65536\r\n\r\n");
                 assert!(request(&mut silent, head.as_bytes()).starts_with("HTTP/1.1 404 "));
                 assert!(request(&mut trickle, head.as_bytes()).starts_with("HTTP/1.1 404 "));
+                std::thread::sleep(Duration::from_millis(100));
+                let idle: Vec<_> = (0..14).map(|_| TcpStream::connect(address).unwrap()).collect();
                 std::thread::sleep(Duration::from_millis(100));
                 let mut refused = TcpStream::connect(address).unwrap();
                 refused.set_nonblocking(true).unwrap();
@@ -339,7 +351,7 @@ fn https_enforces_auth_origin_framing_revocation_and_idle_deadlines() {
                 std::thread::sleep(Duration::from_millis(50));
                 let mut released = client(address, &lease, clock.clone());
                 released.abort();
-                drop((silent, trickle, refused, post));
+                drop((silent, trickle, refused, post, idle));
                 std::thread::sleep(Duration::from_millis(20));
                 let oversized = "x".repeat(8192);
                 let wrong_user = base64(b"wrong:password");

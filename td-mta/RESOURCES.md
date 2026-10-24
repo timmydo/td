@@ -3286,7 +3286,7 @@ origin/rate checks and hands credential lookup to the fixed authentication
 worker. The current local backend tries its registry mutex there and performs
 no credential file I/O. A network-owned 32-entry peer table avoids locking TLS slots for admission;
 a retired slot can retain its old peer charge until the next scan. The
-listener has a fixed two-connection per-IP cap.
+listener has a fixed sixteen-connection per-IP cap.
 Transient accept resource failures back off for five seconds. Session slots
 are the completion storage; no unbounded work queue or per-client thread exists.
 
