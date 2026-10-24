@@ -3764,10 +3764,10 @@ refusal. It is functional evidence only. The single body worker and existing
 request/authentication ceilings remain unchanged; this fixture makes no
 latency, concurrent-reader or whole-service RSS qualification claim.
 
-Shared-worker pressure can return 503, including at the boundary between API
-reads and downloads while a previous exchange retires. For reads, the client
-retries 429/503 at most twice using a one-to-five-second Retry-After, or one
-second for 503 without that header. Persistent pressure remains an error.
+Shared-worker pressure returns 429 with Retry-After: 1, including at the
+boundary between API reads and downloads while a previous exchange retires.
+For reads, the client retries 429/503 at most twice using a one-to-five-second
+Retry-After, or one second for service failures returning 503 without it. Persistent pressure remains an error.
 No seamless concurrent-read or contention-retry guarantee is made here.
 
 ## Active HTTPS authentication worker

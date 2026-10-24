@@ -595,6 +595,16 @@ fn download_failures_release_shared_slot_and_shutdown_joins_streaming() {
         ) -> Result<crate::https_upload::Response, Error> {
             Err(Error::Invalid)
         }
+        fn api(
+            &self,
+            _: crate::https_api::Request<'_>,
+            _: &mut dyn Transport,
+            control: &Control,
+        ) -> Result<(), Failure> {
+            self.entered.store(true, Ordering::Release);
+            wait(|| control.stop_requested() || self.release.load(Ordering::Acquire));
+            Err(Failure::Started(Error::Deadline))
+        }
         fn download(
             &self,
             _: Request<'_>,
@@ -726,10 +736,41 @@ fn download_failures_release_shared_slot_and_shutdown_joins_streaming() {
                     address.port()
                 );
                 send(&mut upload, post.as_bytes());
-                assert_eq!(upload_reply(&mut upload).0, 429);
+                let refused = full_reply(&mut upload);
+                assert_eq!(refused.0, 429);
+                assert!(refused.1.lines().any(|line| line == "Retry-After: 1"));
                 upload.abort();
+                let api_head = format!(
+                    "POST /jmap/api HTTP/1.1\r\nHost: localhost:{}\r\n\
+                     Authorization: Basic {authorization}\r\nContent-Type: application/json\r\nContent-Length: 0\r\n\r\n",
+                    address.port()
+                );
+                let mut api = client(address, &lease, clock.clone());
+                send(&mut api, api_head.as_bytes());
+                let refused = full_reply(&mut api);
+                assert_eq!(refused.0, 429);
+                assert!(refused.1.lines().any(|line| line == "Retry-After: 1"));
+                assert!(refused.2.contains("maxConcurrentRequests"));
+                api.abort();
                 late.release.store(true, Ordering::Release);
                 wait(|| matches!(blocked.read(&mut bytes), Ok(IoProgress::Closed) | Err(_)));
+                std::thread::sleep(Duration::from_millis(30));
+                clock.1.fetch_add(1_001, Ordering::Relaxed);
+                late.entered.store(false, Ordering::Release);
+                late.release.store(false, Ordering::Release);
+                let mut api = client(address, &lease, clock.clone());
+                send(&mut api, api_head.as_bytes());
+                wait(|| late.entered.load(Ordering::Acquire));
+                for request in [&get, &post, &api_head] {
+                    let mut other = client(address, &lease, clock.clone());
+                    send(&mut other, request.as_bytes());
+                    let refused = full_reply(&mut other);
+                    assert_eq!(refused.0, 429);
+                    assert!(refused.1.lines().any(|line| line == "Retry-After: 1"));
+                    other.abort();
+                }
+                late.release.store(true, Ordering::Release);
+                wait(|| matches!(api.read(&mut bytes), Ok(IoProgress::Closed) | Err(_)));
                 std::thread::sleep(Duration::from_millis(30));
                 late.mode.store(0, Ordering::Release);
                 let mut again = client(address, &lease, clock.clone());

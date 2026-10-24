@@ -2023,8 +2023,11 @@ immediately, while SMTP retains its orderly final-reply behavior. Fixed
 native/kernel work already running must return before joins complete.
 
 Authenticated raw downloads now use GET on the fixed download template.
-The body worker is shared with uploads and holds one transfer permit through
-flushing. It verifies the blob before headers, then streams under the same
+The body worker is shared with uploads and API requests and holds one permit
+through flushing. Every collision for this shared permit returns HTTP 429
+with Retry-After: 1 and emits a bounded admission-refused application event;
+API collisions also carry the JMAP maxConcurrentRequests problem. Actual
+storage/service failures remain distinct from this temporary contention. It verifies the blob before headers, then streams under the same
 snapshot and exchange deadline; storage owns account/device access. Filename
 and media template values are decoded once and cannot inject response
 headers. Pre-output errors return an HTTP refusal; after output starts an

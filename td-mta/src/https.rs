@@ -814,17 +814,11 @@ impl Https<'_> {
                                         != Some(backend.account())
                                     {
                                         404
-                                    } else if let Err(active) = body_active.compare_exchange(
-                                        0,
-                                        1,
-                                        Ordering::AcqRel,
-                                        Ordering::Acquire,
-                                    ) {
-                                        if active == 2 {
-                                            503
-                                        } else {
-                                            429
-                                        }
+                                    } else if body_active
+                                        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                                        .is_err()
+                                    {
+                                        429
                                     } else {
                                         client.body_slot = true;
                                         client.principal = Some(principal);
@@ -838,17 +832,11 @@ impl Https<'_> {
                                         || head.expect_continue
                                     {
                                         400
-                                    } else if let Err(active) = body_active.compare_exchange(
-                                        0,
-                                        1,
-                                        Ordering::AcqRel,
-                                        Ordering::Acquire,
-                                    ) {
-                                        if active == 2 {
-                                            503
-                                        } else {
-                                            429
-                                        }
+                                    } else if body_active
+                                        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                                        .is_err()
+                                    {
+                                        429
                                     } else {
                                         client.body_slot = true;
                                         client.principal = Some(principal);
@@ -864,17 +852,19 @@ impl Https<'_> {
                                         })
                                     }) {
                                         415
-                                    } else if let Err(active) = body_active.compare_exchange(
-                                        0,
-                                        2,
-                                        Ordering::AcqRel,
-                                        Ordering::Acquire,
-                                    ) {
-                                        if active == 2 {
-                                            return self.respond_body(client, 429, time.utc_ms,
-                                                br#"{"type":"urn:ietf:params:jmap:error:limit","status":429,"limit":"maxConcurrentRequests"}"#).map(|()| true);
-                                        }
-                                        503
+                                    } else if body_active
+                                        .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
+                                        .is_err()
+                                    {
+                                        control.log(
+                                            crate::observability::Kind::AdmissionRefused {
+                                                reason: crate::observability::Refusal::Capacity,
+                                            },
+                                            None,
+                                            None,
+                                        );
+                                        return self.respond_body(client, 429, time.utc_ms,
+                                            br#"{"type":"urn:ietf:params:jmap:error:limit","status":429,"limit":"maxConcurrentRequests"}"#).map(|()| true);
                                     } else {
                                         client.body_slot = true;
                                         client.principal = Some(principal);
