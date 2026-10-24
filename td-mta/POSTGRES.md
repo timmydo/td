@@ -1628,6 +1628,13 @@ existing local syntax validator. Body callbacks reuse the same complete
 SHA-256 verifier and chunk replay cache as existing downloads, on this
 snapshot's connection and original deadline.
 
+The snapshot retains at most one last successful Email metadata record so
+stored-field and MIME projection of that Email do not repeat its SQL lookup.
+A cache hit still checks the original connection, deadline and sticky failure;
+it cannot cross a snapshot or method reopening. Metadata, membership, keyword
+and chunk reads send their fixed parameter types with the query, avoiding a
+separate prepare/describe exchange without changing row validation or limits.
+
 Every method and final callback completion checks the original connection and
 deadline. A failed operation retires the whole view, including when its caller
 swallows the error. Missing Email metadata remains a normal absent result.

@@ -12,6 +12,7 @@ use crate::{
 };
 use std::time::Instant;
 use td_crypto::TrustStore;
+use tokio_postgres::types::Type;
 
 #[path = "postgres_read_submissions.rs"]
 mod submission_reads;
@@ -127,6 +128,7 @@ pub struct Snapshot<'a> {
     device: DeviceId,
     deadline: Instant,
     failed: Option<Error>,
+    metadata: Option<Metadata>,
     _worker_thread: std::marker::PhantomData<std::rc::Rc<()>>,
     _permit: ReadPermit<'a>,
 }
@@ -274,6 +276,7 @@ impl<'a> Snapshot<'a> {
             device,
             deadline,
             failed: None,
+            metadata: None,
             _worker_thread: std::marker::PhantomData,
             _permit: permit,
         };
@@ -481,6 +484,10 @@ impl Snapshot<'_> {
     /// exact same snapshot's chunks before calling its consumer.
     pub fn email(&mut self, email: EmailId) -> Result<Option<Metadata>, Error> {
         self.check()?;
+        // Stored fields and MIME projection share this immutable snapshot.
+        if let Some(metadata) = self.metadata.filter(|metadata| metadata.email == email) {
+            return Ok(Some(metadata));
+        }
         let identity = self.identity;
         let selected = ReadRequest {
             epoch: identity.epoch,
@@ -502,7 +509,9 @@ impl Snapshot<'_> {
             })
             .map_err(Error::Connection)
             .and_then(|result| result);
-        self.retain(result)
+        let metadata = self.retain(result)?;
+        self.metadata = metadata;
+        Ok(metadata)
     }
     pub fn with_body<T>(
         &mut self,
@@ -570,7 +579,7 @@ impl Snapshot<'_> {
         let identity = self.identity;
         let after = after.map(|value| *value.as_bytes());
         let result=self.worker.run(|client|Box::pin(async move {
-            let rows=client.query("SELECT m.mailbox_id,m.changed,b.changed FROM td_mta.memberships m LEFT JOIN td_mta.mailboxes b ON b.account=m.account AND b.id=m.mailbox_id WHERE m.account=$1 AND m.email_id=$2 AND ($3::bytea IS NULL OR m.mailbox_id>$3) ORDER BY m.mailbox_id LIMIT $4", &[&identity.account.as_bytes().as_slice(),&email.as_bytes().as_slice(),&after.as_ref().map(|bytes|bytes.as_slice()),&limit]).await.map_err(|_|Error::Database)?;
+            let rows=client.query_typed("SELECT m.mailbox_id,m.changed,b.changed FROM td_mta.memberships m LEFT JOIN td_mta.mailboxes b ON b.account=m.account AND b.id=m.mailbox_id WHERE m.account=$1 AND m.email_id=$2 AND ($3::bytea IS NULL OR m.mailbox_id>$3) ORDER BY m.mailbox_id LIMIT $4", &[(&identity.account.as_bytes().as_slice(),Type::BYTEA),(&email.as_bytes().as_slice(),Type::BYTEA),(&after.as_ref().map(|bytes|bytes.as_slice()),Type::BYTEA),(&limit,Type::INT8)]).await.map_err(|_|Error::Database)?;
             let mut values=Vec::new();
             values.try_reserve_exact(maximum).map_err(|_|Error::Capacity)?;
             let has_more=rows.len()>maximum;
@@ -606,7 +615,7 @@ impl Snapshot<'_> {
         let after = self.retain(after)?;
         let identity = self.identity;
         let result=self.worker.run(|client|Box::pin(async move {
-            let rows=client.query("SELECT keyword,changed FROM td_mta.keywords WHERE account=$1 AND email_id=$2 AND ($3::text IS NULL OR keyword>$3 COLLATE \"C\") ORDER BY keyword LIMIT $4", &[&identity.account.as_bytes().as_slice(),&email.as_bytes().as_slice(),&after,&limit]).await.map_err(|_|Error::Database)?;
+            let rows=client.query_typed("SELECT keyword,changed FROM td_mta.keywords WHERE account=$1 AND email_id=$2 AND ($3::text IS NULL OR keyword>$3 COLLATE \"C\") ORDER BY keyword LIMIT $4", &[(&identity.account.as_bytes().as_slice(),Type::BYTEA),(&email.as_bytes().as_slice(),Type::BYTEA),(&after,Type::TEXT),(&limit,Type::INT8)]).await.map_err(|_|Error::Database)?;
             let mut values=Vec::new();
             values.try_reserve_exact(maximum).map_err(|_|Error::Capacity)?;
             let has_more=rows.len()>maximum;

@@ -11,6 +11,7 @@ use crate::{
 };
 use std::time::Instant;
 use td_crypto::{Crypto, Digest, Provider, TrustStore};
+use tokio_postgres::types::Type;
 
 const CHUNK: u64 = 65536;
 const BATCH: u64 = 8;
@@ -95,7 +96,7 @@ pub(crate) async fn email_metadata(
     client: &tokio_postgres::Client,
     selected: ReadRequest,
 ) -> Result<Metadata, Error> {
-    let rows = client.query("SELECT a.sequence,a.floor,e.blob_id,e.thread_id,e.received_at,b.length,b.digest,b.created_at,b.chunk_count,e.changed,b.changed,t.changed,(SELECT count(*) FROM td_mta.blob_chunks c WHERE c.account=a.id AND c.blob_id=e.blob_id) FROM td_mta.accounts a JOIN td_mta.emails e ON e.account=a.id LEFT JOIN td_mta.blobs b ON b.account=e.account AND b.id=e.blob_id LEFT JOIN td_mta.threads t ON t.account=e.account AND t.id=e.thread_id WHERE a.id=$1 AND e.id=$2 LIMIT 2", &[&selected.account.as_bytes().as_slice(), &selected.email.as_bytes().as_slice()]).await.map_err(|_| Error::Database)?;
+    let rows = client.query_typed("SELECT a.sequence,a.floor,e.blob_id,e.thread_id,e.received_at,b.length,b.digest,b.created_at,b.chunk_count,e.changed,b.changed,t.changed,(SELECT count(*) FROM td_mta.blob_chunks c WHERE c.account=a.id AND c.blob_id=e.blob_id) FROM td_mta.accounts a JOIN td_mta.emails e ON e.account=a.id LEFT JOIN td_mta.blobs b ON b.account=e.account AND b.id=e.blob_id LEFT JOIN td_mta.threads t ON t.account=e.account AND t.id=e.thread_id WHERE a.id=$1 AND e.id=$2 LIMIT 2", &[(&selected.account.as_bytes().as_slice(), Type::BYTEA), (&selected.email.as_bytes().as_slice(), Type::BYTEA)]).await.map_err(|_| Error::Database)?;
     if rows.is_empty() {
         return Err(Error::Missing);
     }
@@ -264,7 +265,7 @@ async fn blob_snapshot(
         .await
         .map_err(Error::Credential)?
         .ok_or(Error::Unauthenticated)?;
-    let rows = client.query("SELECT a.sequence,a.floor,b.length,b.digest,b.created_at,b.chunk_count,b.changed,(SELECT count(*) FROM td_mta.blob_chunks c WHERE c.account=b.account AND c.blob_id=b.id),EXISTS(SELECT 1 FROM td_mta.emails e WHERE e.account=b.account AND e.blob_id=b.id) OR EXISTS(SELECT 1 FROM td_mta.submissions s WHERE s.account=b.account AND s.transmitted_blob_id=b.id),l.device_id,l.expires_at,l.changed,(extract(epoch FROM clock_timestamp())*1000)::bigint FROM td_mta.accounts a JOIN td_mta.blobs b ON b.account=a.id LEFT JOIN td_mta.leases l ON l.account=b.account AND l.blob_id=b.id WHERE a.id=$1 AND b.id=$2 LIMIT 2", &[&binding.account().as_bytes().as_slice(), &blob.as_bytes().as_slice()]).await.map_err(|_| Error::Database)?;
+    let rows = client.query_typed("SELECT a.sequence,a.floor,b.length,b.digest,b.created_at,b.chunk_count,b.changed,(SELECT count(*) FROM td_mta.blob_chunks c WHERE c.account=b.account AND c.blob_id=b.id),EXISTS(SELECT 1 FROM td_mta.emails e WHERE e.account=b.account AND e.blob_id=b.id) OR EXISTS(SELECT 1 FROM td_mta.submissions s WHERE s.account=b.account AND s.transmitted_blob_id=b.id),l.device_id,l.expires_at,l.changed,(extract(epoch FROM clock_timestamp())*1000)::bigint FROM td_mta.accounts a JOIN td_mta.blobs b ON b.account=a.id LEFT JOIN td_mta.leases l ON l.account=b.account AND l.blob_id=b.id WHERE a.id=$1 AND b.id=$2 LIMIT 2", &[(&binding.account().as_bytes().as_slice(), Type::BYTEA), (&blob.as_bytes().as_slice(), Type::BYTEA)]).await.map_err(|_| Error::Database)?;
     if rows.is_empty() {
         return Err(Error::Missing);
     }
@@ -500,7 +501,7 @@ impl Body<'_> {
         let account = self.metadata.identity.account;
         let blob = self.metadata.blob;
         let rows = self.worker.run(|client| Box::pin(async move {
-            client.query("SELECT ordinal,bytes FROM td_mta.blob_chunks WHERE account=$1 AND blob_id=$2 AND ordinal>=$3 AND ordinal<$4 ORDER BY ordinal LIMIT 8", &[&account.as_bytes().as_slice(), &blob.as_bytes().as_slice(), &(start as i64), &(end as i64)]).await
+            client.query_typed("SELECT ordinal,bytes FROM td_mta.blob_chunks WHERE account=$1 AND blob_id=$2 AND ordinal>=$3 AND ordinal<$4 ORDER BY ordinal LIMIT 8", &[(&account.as_bytes().as_slice(), Type::BYTEA), (&blob.as_bytes().as_slice(), Type::BYTEA), (&(start as i64), Type::INT8), (&(end as i64), Type::INT8)]).await
         })).map_err(connection)?.map_err(|_| database())?;
         if rows.len() as u64 != end - start {
             return Err(ports::Error::Corrupt);
