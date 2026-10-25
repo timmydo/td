@@ -4101,6 +4101,51 @@ fn real_postgres_mailbox_reads_bind_authentication_counts_and_state() {
             unread_threads: 2
         }
     );
+    sql(&fixture, &format!("BEGIN;
+        INSERT INTO td_mta.mailboxes SELECT decode('{account}','hex'),decode(repeat(n,16),'hex'),'Shared subset',NULL,NULL,0,1,decode('0000000000000001','hex') FROM (VALUES ('44'),('45')) v(n);
+        INSERT INTO td_mta.mailboxes VALUES (decode('{other}','hex'),decode(repeat('44',16),'hex'),'Other account',NULL,NULL,0,1,decode('0000000000000002','hex'));
+        INSERT INTO td_mta.memberships SELECT account,id,decode(repeat('44',16),'hex'),changed FROM td_mta.emails WHERE account=decode('{account}','hex') AND id IN (decode(lpad('2',32,'0'),'hex'),decode(lpad('3',32,'0'),'hex'),decode(lpad('4',32,'0'),'hex'));
+        COMMIT"));
+    let grouped = read().unwrap();
+    assert_eq!(grouped.mailboxes.len(), 3);
+    let subset = grouped
+        .mailboxes
+        .iter()
+        .find(|row| row.id.as_bytes() == &[0x44; 16])
+        .unwrap();
+    assert_eq!(
+        (
+            subset.counts.total_emails,
+            subset.counts.unread_emails,
+            subset.counts.total_threads,
+            subset.counts.unread_threads
+        ),
+        (3, 1, 2, 1)
+    );
+    let empty = grouped
+        .mailboxes
+        .iter()
+        .find(|row| row.id.as_bytes() == &[0x45; 16])
+        .unwrap();
+    assert_eq!(
+        (
+            empty.counts.total_emails,
+            empty.counts.unread_emails,
+            empty.counts.total_threads,
+            empty.counts.unread_threads
+        ),
+        (0, 0, 0, 0)
+    );
+    assert_eq!(
+        grouped
+            .mailboxes
+            .iter()
+            .find(|row| row.id == creation.inbox())
+            .unwrap()
+            .counts,
+        listing.mailboxes[0].counts
+    );
+    sql(&fixture, "DELETE FROM td_mta.memberships WHERE mailbox_id=decode(repeat('44',16),'hex'); DELETE FROM td_mta.mailboxes WHERE id IN (decode(repeat('44',16),'hex'),decode(repeat('45',16),'hex'))");
     sql(
         &fixture,
         "UPDATE td_mta.memberships SET changed=decode('0000000000000002','hex')",

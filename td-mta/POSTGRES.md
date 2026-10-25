@@ -1227,8 +1227,12 @@ one member in that mailbox is unread. A closed query limits returned rows to
 257 to detect overflow without returning a partial listing. The mailbox-only
 transport allows 512 frames within the ordinary one MiB input and 128 KiB
 individual-frame ceilings; other operations retain their previous budgets.
-Database aggregate work is subject to the statement and whole-operation
-limits, not a promise of bounded server scan cardinality.
+Counts are grouped across memberships of the bounded selected mailbox set,
+with account-scoped Email, Thread and keyword joins. Empty mailboxes retain
+zero counts. This avoids requiring a separate aggregate execution for each
+mailbox without retaining per-email rows in the caller. Database aggregate
+work is subject to the statement and whole-operation limits, not a promise
+of bounded server scan cardinality.
 
 Rows pass shared mailbox-format validation, sequence checks and bounded parent
 hierarchy validation. Count inputs must have valid referenced Emails/Threads

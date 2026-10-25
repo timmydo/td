@@ -69,10 +69,8 @@ pub struct Listing {
 const MAILBOXES: &str = "WITH selected AS MATERIALIZED (
     SELECT id,name,parent_id,role,sort_order,subscribed,changed
     FROM td_mta.mailboxes WHERE account=$1 ORDER BY id LIMIT 257
-) SELECT b.id,b.name,b.parent_id,b.role,b.sort_order,b.subscribed,b.changed,
-    c.total,c.unread,c.threads,c.unread_threads,c.valid
-FROM selected b CROSS JOIN LATERAL (
-    SELECT count(*) AS total,
+), counts AS (
+    SELECT m.mailbox_id,count(*) AS total,
         count(*) FILTER (WHERE s.email_id IS NULL AND d.email_id IS NULL) AS unread,
         count(DISTINCT e.thread_id) AS threads,
         count(DISTINCT e.thread_id) FILTER (WHERE s.email_id IS NULL AND d.email_id IS NULL) AS unread_threads,
@@ -81,12 +79,16 @@ FROM selected b CROSS JOIN LATERAL (
             AND (s.email_id IS NULL OR s.changed<=$2)
             AND (d.email_id IS NULL OR d.changed<=$2)),true) AS valid
     FROM td_mta.memberships m
+    JOIN selected selected_mailbox ON selected_mailbox.id=m.mailbox_id
     LEFT JOIN td_mta.emails e ON e.account=m.account AND e.id=m.email_id
     LEFT JOIN td_mta.threads t ON t.account=e.account AND t.id=e.thread_id
     LEFT JOIN td_mta.keywords s ON s.account=e.account AND s.email_id=e.id AND s.keyword='$seen'
     LEFT JOIN td_mta.keywords d ON d.account=e.account AND d.email_id=e.id AND d.keyword='$draft'
-    WHERE m.account=$1 AND m.mailbox_id=b.id
-) c ORDER BY b.id";
+    WHERE m.account=$1 GROUP BY m.mailbox_id
+) SELECT b.id,b.name,b.parent_id,b.role,b.sort_order,b.subscribed,b.changed,
+    coalesce(c.total,0),coalesce(c.unread,0),coalesce(c.threads,0),
+    coalesce(c.unread_threads,0),coalesce(c.valid,true)
+FROM selected b LEFT JOIN counts c ON c.mailbox_id=b.id ORDER BY b.id";
 
 /// Authenticate and read metadata/counts/state in one primary repeatable-read
 /// snapshot. Return nothing on overflow, corruption, authentication failure or
