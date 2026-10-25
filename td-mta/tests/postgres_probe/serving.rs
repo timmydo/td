@@ -15,6 +15,7 @@ pub(super) fn exercise(
     https: TcpListener,
     relay: TcpListener,
     dns: std::net::UdpSocket,
+    https_ipv4: TcpListener,
 ) {
     super::migration_archive::exercise();
     let relay = super::serving_relay::Relay::new(fixture, relay, dns);
@@ -79,7 +80,11 @@ pub(super) fn exercise(
         assert_eq!(status["write_failures"].as_u64(), Some(0));
         (child, runtime)
     };
-    drop((smtp, https));
+    assert_eq!(
+        https_ipv4.local_addr().unwrap().port(),
+        https_address.port()
+    );
+    drop((smtp, https, https_ipv4));
     let (mut cloud, cloud_runtime) = start("cloud");
     let (mut desktop, desktop_runtime) = start("desktop");
     let mut smtp = BufReader::new(TcpStream::connect(smtp_address).unwrap());
@@ -111,6 +116,14 @@ pub(super) fn exercise(
     );
     exchange(b"QUIT\r\n", "221");
     assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "1");
+    assert!(smtp_address.is_ipv6() && https_address.is_ipv6());
+    assert_eq!(
+        sql(
+            fixture,
+            "SELECT peer_family,octet_length(peer_octets) FROM td_mta.emails"
+        ),
+        "6|16"
+    );
     // SMTP envelopes and header claims confer no submission authority.
     for table in ["submissions", "recipients", "submission_routes"] {
         assert_eq!(

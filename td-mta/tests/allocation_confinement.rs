@@ -51,6 +51,18 @@ fn scan(root: &Path, path: &Path) {
                 &source,
                 "f7e46e8ad468ae532adc78bb332ddb5d71bc6b1daee69f2392ac39054c0562bc",
             );
+        } else if relative == "td-mta/src/listener_sys.rs" {
+            assert_eq!(words(&source, "unsafe"), 3);
+            assert_eq!(source.matches("#[allow(unsafe_code)]").count(), 2);
+            assert_eq!(source.matches("std::arch::asm!").count(), 2);
+            assert_eq!(
+                source.matches("OwnedFd::from_raw_fd(descriptor)").count(),
+                1
+            );
+            fingerprint(
+                &source,
+                "5dea72319cd76c44f9f891886f5590ac2ffb85b983c58fb58e78d444a3031c7f",
+            );
         } else if relative == "td-mta/tests/support/termination_sender.rs" {
             assert_eq!(words(&source, "unsafe"), 2);
             assert_eq!(source.matches("#[allow(unsafe_code)]").count(), 1);
@@ -112,6 +124,23 @@ fn scan(root: &Path, path: &Path) {
                 assert_eq!(words(&source, "signal_sys"), 1);
             }
             _ => assert_eq!(words(&source, "signal_sys"), 0, "{relative}"),
+        }
+        match relative {
+            "td-mta/src/main.rs" => {
+                assert_eq!(source.matches("mod listener_sys;").count(), 1);
+                assert_eq!(words(&source, "listener_sys"), 1);
+            }
+            "td-mta/src/serve.rs" => {
+                assert_eq!(
+                    source
+                        .matches("super::listener_sys::bind(row.bind)")
+                        .count(),
+                    2
+                );
+                assert_eq!(words(&source, "listener_sys"), 2);
+                assert!(!source.contains("TcpListener::bind"));
+            }
+            _ => assert_eq!(words(&source, "listener_sys"), 0, "{relative}"),
         }
         if relative == "td-mta/tests/postgres_probe.rs" {
             assert_eq!(

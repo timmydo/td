@@ -2400,7 +2400,7 @@ consumes the exact command and same socket through 220 flushing and an
 actual handshake, then resets SMTP and returns the TLS transport. Real
 TLS fixtures verify encrypted commands, EHLO reset, retained deadlines,
 failed-upgrade closure, cancellation and capacity release. The direct
-receiving runtime now attaches these owners to caller-bound IPv4 listeners,
+receiving runtime attaches these owners to caller-bound IPv4 or IPv6-only listeners,
 with fixed storage/TLS workers, global/listener/peer counts, retained
 completion slots, queued deadlines and observable readiness/shutdown/failure.
 Local fixtures cover durable plaintext and TLS receiving beside an idle

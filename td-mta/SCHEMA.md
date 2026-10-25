@@ -555,14 +555,11 @@ bind. HTTP-01 uses the separate control slots already specified in
 RESOURCES.md.
 
 Reject duplicate or overlapping binds of the same address family and port,
-including wildcard overlap. IPv6 binds are IPv6-only in the target runtime,
-with separate IPv4 binds when needed; M11 must implement and verify this
-explicit socket policy before opening them, with M03/M07 adapter support. Safe
-std alone does not establish IPV6_V6ONLY before bind: until an audited socket
-adapter and its UNSAFE.md/component amendments exist, runtime startup refuses
-IPv6 listeners. Structural acceptance of their requested layout never bypasses
-that gate. It is not inferred from ambient kernel defaults and authorizes no
-unreviewed syscall surface. Refuse mapped IPv6 bind spellings and
+including wildcard overlap. IPv6 binds are IPv6-only: the binary's confined listener adapter sets
+IPV6_V6ONLY before bind and the safe receiving adapter reads it back. Separate
+IPv4 binds are required when needed. This policy is independent of ambient
+kernel defaults; UNSAFE.md section 22 records the socket boundary.
+Refuse mapped IPv6 bind spellings and
 zone-qualified addresses.
 
 ## 9. Snapshot storage and construction

@@ -192,7 +192,7 @@ impl<'a> BoundListener<'a> {
         policies: &GenerationLease<TlsPolicies>,
     ) -> Result<Self, Error> {
         if row.kind != Kind::DirectSmtp
-            || !row.bind.is_ipv4()
+            || (row.bind.is_ipv6() && !crate::transport::ipv6_only(&socket)?)
             || row.bind.port() == 0
             || socket.local_addr().map_err(Error::from)? != row.bind
         {

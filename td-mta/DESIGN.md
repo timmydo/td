@@ -1006,8 +1006,8 @@ cryptography. Retaining Rustls means td-crypto still has an external TLS
 implementation even after AWS-LC is removed.
 
 The production library retains `forbid(unsafe_code)`. The binary denies it
-with one function-scoped exception in `signal_sys.rs`, recorded in
-UNSAFE.md section 22. On x86-64 and aarch64 Linux, serve blocks SIGINT and
+with function-scoped termination and listener exceptions recorded in
+UNSAFE.md section 22. The signal boundary stays in `signal_sys.rs`. On x86-64 and aarch64 Linux, serve blocks SIGINT and
 SIGTERM before starting workers, then consumes them synchronously with
 zero-timeout `rt_sigtimedwait` in its control loop. The two fixed raw
 operations are `rt_sigprocmask(SIG_BLOCK)` and `rt_sigtimedwait`, over an
@@ -1024,6 +1024,15 @@ disposition is rewritten or signal re-raised. Blocking native I/O during
 serving retains its existing limits. CONFIG.md owns shutdown timing and observations.
 The process test has the separate UNSAFE.md T3 boundary to signal only its
 retained children on both architectures.
+
+The separate binary-only `listener_sys.rs` boundary creates IPv6 stream
+sockets with close-on-exec, sets SO_REUSEADDR and IPV6_V6ONLY to one, binds
+the checked numeric address and listens with backlog 128. One scoped raw
+instruction and one fresh descriptor adoption are confined and fingerprinted
+as specified in UNSAFE.md section 22. OwnedFd closes all failure paths;
+IPv4 retains std binding. No pointer, descriptor or socket-option escape
+hatch enters the safe library. The configured port and family are verified
+again by the receiving adapters before readiness.
 The separate test executable
 `tests/rust_alloc_probe.rs` has the user-approved allocation instrumentation
 exception specified in UNSAFE.md T1. Its single scoped GlobalAlloc
@@ -1699,7 +1708,7 @@ preparation; only the native transaction can accept the message. A known
 successful commit remains successful when completion is observed after
 that deadline.
 
-The `smtp_receiving` runtime accepts caller-bound IPv4 direct listeners
+The `smtp_receiving` runtime accepts caller-bound IPv4 and IPv6-only direct listeners
 and retains one immutable routing/TLS configuration snapshot. It verifies
 the actual local socket address and complete TLS listener binding,
 including listener limits, greeting/trace compatibility and ingress spool
@@ -1987,8 +1996,12 @@ handshake cap; RESOURCES.md records its concrete buffers. Whole-service
 memory measurement remains section-5/M23 work; the existing Limits::plan
 arithmetic is unchanged.
 
-`serve --mailbox-access` runs the existing receiver plus the IPv4 `https`
-driver. IPv6 listeners remain refused pending the audited socket adapter.
+`serve --mailbox-access` runs the receiver plus the `https` driver over
+IPv4 or IPv6-only listeners. The binary's confined `listener_sys` adapter
+sets IPV6_V6ONLY before bind, independent of kernel defaults, and both safe
+protocol adapters verify that option for IPv6 caller-bound sockets. Separate
+IPv4 and IPv6 binds can share a port; scoped and mapped IPv6 binds remain
+refused. Library protocol/storage code still forbids unsafe code.
 A fixed HTTPS network thread scans bounded slots, with a separate fixed TLS
 worker. Native session construction and pending handshakes stay on that
 worker; idle sockets retain connection slots without taking handshake permits.

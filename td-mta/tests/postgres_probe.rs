@@ -2574,6 +2574,12 @@ fn real_postgres_executable_receives_and_serves_database_profiles() {
     exercise_configuration(ConfigurationExercise::Serving);
 }
 
+#[test]
+#[ignore = "real local PostgreSQL tools required"]
+fn real_postgres_ipv6_receiving_profiles() {
+    exercise_configuration(ConfigurationExercise::Serving);
+}
+
 #[path = "postgres_probe/performance.rs"]
 mod performance;
 
@@ -2723,6 +2729,11 @@ certificate = "public"
     } else {
         desktop
     };
+    let receiving_bind = if matches!(exercise, ConfigurationExercise::Serving) {
+        "[::1]:0"
+    } else {
+        "127.0.0.1:0"
+    };
     let mut https_socket = matches!(
         exercise,
         ConfigurationExercise::Client
@@ -2730,7 +2741,16 @@ certificate = "public"
             | ConfigurationExercise::Serving
             | ConfigurationExercise::Performance
     )
-    .then(|| TcpListener::bind("127.0.0.1:0").unwrap());
+    .then(|| TcpListener::bind(receiving_bind).unwrap());
+    // The private test namespace resolves localhost only to IPv4. Keep an
+    // explicit IPv4 listener for the exporter while driving SMTP/HTTPS over IPv6.
+    let https_ipv4 = matches!(exercise, ConfigurationExercise::Serving).then(|| {
+        TcpListener::bind((
+            std::net::Ipv4Addr::LOCALHOST,
+            https_socket.as_ref().unwrap().local_addr().unwrap().port(),
+        ))
+        .unwrap()
+    });
     let desktop = if let Some(socket) = &https_socket {
         let address = socket.local_addr().unwrap();
         desktop
@@ -2739,6 +2759,14 @@ certificate = "public"
                 &format!("https://localhost:{}", address.port()),
             )
             .replace("bind = \"127.0.0.1:443\"", &format!("bind = \"{address}\""))
+    } else {
+        desktop
+    };
+    let desktop = if let Some(socket) = &https_ipv4 {
+        format!(
+            "{desktop}[listener \"https-ipv4\"]\nkind = \"https\"\nbind = \"{}\"\ncertificate = \"public\"\n",
+            socket.local_addr().unwrap()
+        )
     } else {
         desktop
     };
@@ -2772,7 +2800,7 @@ per_peer_limit = 1
             | ConfigurationExercise::Serving
             | ConfigurationExercise::Performance
     )
-    .then(|| TcpListener::bind("127.0.0.1:0").unwrap());
+    .then(|| TcpListener::bind(receiving_bind).unwrap());
     let cloud = if let Some(socket) = &smtp_socket {
         cloud.replace("0.0.0.0:25", &socket.local_addr().unwrap().to_string())
     } else {
@@ -3379,7 +3407,14 @@ per_peer_limit = 1
         if matches!(exercise, ConfigurationExercise::Performance) {
             performance::exercise(&fixture, sockets.0, sockets.1, sockets.2, sockets.3);
         } else {
-            serving::exercise(&fixture, sockets.0, sockets.1, sockets.2, sockets.3);
+            serving::exercise(
+                &fixture,
+                sockets.0,
+                sockets.1,
+                sockets.2,
+                sockets.3,
+                https_ipv4.unwrap(),
+            );
         }
         return;
     }

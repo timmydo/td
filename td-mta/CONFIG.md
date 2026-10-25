@@ -584,7 +584,7 @@ implementations do bounded work and allocate nothing.
 `numeric_endpoint` parses at most 53 bytes into a std `SocketAddr`, rejects
 zero/noncanonical ports, mapped IPv6 and every zone spelling (including `%0`).
 IPv6 uses brackets. No bind-family policy or network action follows from that
-value; SCHEMA.md's IPv6 runtime adapter gate remains in force.
+value; the runtime separately enforces SCHEMA.md's IPv6-only socket policy.
 
 `Prefix::parse` accepts at most 49 bytes of numeric CIDR text, requires zero
 host bits and shortest decimal lengths 1..32 or 1..128, and refuses mapped
@@ -988,9 +988,9 @@ Each bind is a parsed numeric socket endpoint. Loopback fixtures require
 and conflicting binds retain both declaration coordinates. On the same
 address family and port, identical addresses or either unspecified address
 conflict. Separate IPv4 and IPv6 binds are structurally distinct. This does
-not establish IPV6_V6ONLY: runtime must still refuse IPv6 startup until M11
-supplies its audited socket adapter, as SCHEMA.md requires. No socket is
-opened here.
+not establish IPV6_V6ONLY itself: the runtime's confined socket adapter sets
+it before bind and verifies it before admitting the listener, as SCHEMA.md
+requires. No socket is opened during configuration decoding.
 
 SMTP roles require nonzero session and per-peer counts; per-peer cannot
 exceed the listener session limit. Checked integer conversion prevents

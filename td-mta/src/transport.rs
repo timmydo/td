@@ -6,6 +6,12 @@ use std::{
     time::Instant,
 };
 
+/// Confirm the caller established the configured IPv6-only family policy.
+#[allow(deprecated)]
+pub(crate) fn ipv6_only(listener: &std::net::TcpListener) -> Result<bool, Error> {
+    listener.only_v6().map_err(Error::from)
+}
+
 /// One socket operation never handles more than one application chunk.
 pub const SOCKET_CHUNK: usize = 16 * 1024;
 

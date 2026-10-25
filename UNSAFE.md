@@ -57,8 +57,9 @@ process-directed signals through retained procfs directory descriptors.
 The twenty-first, `td-install`, has one function-scoped instruction for two
 value-pinned loop-device requests, which reach a freshly formatted volume
 through the disk claim the installer already holds.
-The twenty-second, `td-mta`, retains a safe library and adds one binary-only
-Linux termination-signal instruction boundary, for x86-64 and aarch64.
+The twenty-second, `td-mta`, retains a safe library and confines its
+termination-signal and IPv6-listener boundaries to the binary, for x86-64
+and aarch64 Linux. The listener also adopts its newly created socket.
 Safe std owns local scratch-path and lock operations; §22 also records the
 admitted private PostgreSQL dependency boundary. The crypto admission
 is specified in [td-crypto/DESIGN.md](td-crypto/DESIGN.md). Test allocators
@@ -196,7 +197,7 @@ one.
 | 19 | `td-ui` | `recvmsg(2)`, `sendmsg(2)`, `fcntl(2)` pinned to `F_DUPFD_CLOEXEC` for the shared Wayland client transport and to `F_GETFL` and `F_SETFL` for the clipboard destination owner, `poll(2)` over exactly the connection's stream and its waker, `ioctl(2)` with five value-pinned PTY requests for the terminal's device, `setsid(2)` for a PTY child; plus one scoped descriptor adoption and one scoped pre-exec hook — see [§19](#19-td-ui--the-shared-wayland-client-transport) |
 | 20 | `td-taskmgr` | `pidfd_send_signal(2)`, retained procfs process directories, named signals or a fixed signal-zero self probe |
 | 21 | `td-install` | `ioctl(2)` with two value-pinned loop requests, `LOOP_CTL_GET_FREE` and `LOOP_CONFIGURE` — see [§21](#21-td-install--publishing-through-a-loop-over-the-claim) |
-| 22 | `td-mta` | binary-only `rt_sigprocmask(2)` with SIG_BLOCK and `rt_sigtimedwait(2)` with zero timeout, both pinned to SIGINT/SIGTERM; see [§22](#22-td-mta--termination-signals-and-private-postgresql-backend) |
+| 22 | `td-mta` | binary-only `rt_sigprocmask(2)` with SIG_BLOCK and `rt_sigtimedwait(2)` with zero timeout, both pinned to SIGINT/SIGTERM; IPv6-only `socket(2)`, `setsockopt(2)` with fixed SO_REUSEADDR/IPV6_V6ONLY, `bind(2)`, `listen(2)` and one fresh descriptor adoption; see [§22](#22-td-mta--termination-signals-and-private-postgresql-backend) |
 | 23 | `td-open` | the shared `recvmsg(2)`, `sendmsg(2)`, `close(2)` module of §12, called only to send one descriptor; no adoption or disposal call — see [§23](#23-td-open--one-descriptor-to-the-portal) |
 
 The control-plane exception (`builder/src/sys.rs`) is described under The
@@ -3434,12 +3435,13 @@ amends this section and `td-install/DESIGN.md`.
 
 ## 22. `td-mta` — termination signals and private PostgreSQL backend
 
-The library forbids `unsafe_code`. The binary denies it with exactly one
-function-scoped allowance in `signal_sys.rs`. Its private four-argument
-entry has one instruction per supported architecture: x86-64 `syscall`
+The library forbids `unsafe_code`. The binary denies it, with one
+function-scoped allowance in `signal_sys.rs` and two in `listener_sys.rs`.
+The signal module's private four-argument entry has one instruction per
+supported architecture: x86-64 `syscall`
 and aarch64 `svc 0`, selected at compile time. Other platforms refuse to
-compile. No FFI, pointer dereference, descriptor adoption or handler exists.
-The only two safe callers supply fixed operations:
+compile. The signal module has no FFI, pointer dereference, descriptor
+adoption or handler. Its only two safe callers supply fixed operations:
 
 - `block`: `rt_sigprocmask` (x86-64 14, aarch64 135), SIG_BLOCK (0), a
   pointer to the eight-byte mask containing SIGINT (2) and SIGTERM (15),
@@ -3471,6 +3473,33 @@ between bounded issuance turns and during scheduled waits. A network turn
 may delay shutdown by its 100-second cap plus bounded database operations.
 The mail coordinator also polls before starting another certificate-reload
 cycle. No additional syscall, mask, pointer shape or unsafe block is added.
+
+The binary's `listener_sys.rs` binds IPv6 sockets with an explicit
+IPv6-only policy before exposing a listener. IPv4 still uses safe std's
+binding path. Its private five-argument instruction admits exactly:
+
+- `socket` (x86-64 41, aarch64 198): AF_INET6 (10), SOCK_STREAM (1) plus
+  SOCK_CLOEXEC (0x80000), protocol 0.
+- `setsockopt` (54, 208): the newly owned socket, SOL_SOCKET/SO_REUSEADDR
+  (1/2) or IPPROTO_IPV6/IPV6_V6ONLY (41/26), a live four-byte signed 1,
+  and option length 4. Both options precede bind.
+- `bind` (49, 200): that socket and a live 28-byte repr(C) sockaddr_in6,
+  family 10, network-order port, sixteen address octets, zero flow and
+  scope. Scoped, mapped and nonzero-flow bind values are refused.
+- `listen` (50, 201): that socket and backlog 128.
+
+A second function-scoped allowance adopts exactly the successful socket
+result into OwnedFd, once. All subsequent errors close it through std;
+success transfers ownership into TcpListener. No arbitrary descriptor,
+option, syscall number or pointer enters the safe public binding function.
+No pointer is dereferenced by owned code or retained by the kernel. The
+instruction uses x86-64 syscall or aarch64 svc 0; layout size and the
+complete module/caller inventory are pinned by confinement tests. The safe
+SMTP and HTTPS adapters additionally read back IPV6_V6ONLY and refuse a
+caller-bound dual-stack socket. Ambient sysctl defaults grant no exception.
+Native tests bind both wildcard families on the same port, exchange bytes
+on each, refuse IPv4 through the IPv6 listener and rebind after use. Both
+architectures still need their own execution qualification.
 
 Filesystem operations use safe std APIs under STORAGE.md's stable-path
 contract. The separate test executables retain T1/T2/T3 below.

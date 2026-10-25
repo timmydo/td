@@ -2,7 +2,6 @@
 use super::{adapter, config_failure, control::Endpoint, lock_root, scope, ConfigFailure};
 use std::{
     io::{self, Write},
-    net::TcpListener,
     os::unix::fs::MetadataExt,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -174,8 +173,8 @@ fn run_once(options: &Options, reload: &AtomicBool) -> Result<(), ConfigFailure>
                     .map_err(|_| config_failure("configuration", "invariant"))?
                     .ok_or_else(|| config_failure("configuration", "invariant"))?;
                 match row.kind {
-                    Kind::DirectSmtp if row.bind.is_ipv4() => direct.push(row),
-                    Kind::Https if mailbox_access && row.bind.is_ipv4() => https_rows.push(row),
+                    Kind::DirectSmtp => direct.push(row),
+                    Kind::Https if mailbox_access => https_rows.push(row),
                     Kind::Https if !mailbox_access => (),
                     Kind::Http01 => (),
                     _ => return Err(config_failure("listeners", "unsupported-listener")),
@@ -220,7 +219,7 @@ fn run_once(options: &Options, reload: &AtomicBool) -> Result<(), ConfigFailure>
                 .try_reserve_exact(direct.len())
                 .map_err(|_| config_failure("listeners", "capacity"))?;
             for row in direct {
-                let socket = TcpListener::bind(row.bind).map_err(|error| {
+                let socket = super::listener_sys::bind(row.bind).map_err(|error| {
                     config_failure(
                         "listen",
                         match error.kind() {
@@ -237,7 +236,7 @@ fn run_once(options: &Options, reload: &AtomicBool) -> Result<(), ConfigFailure>
             }
             let mut https_listeners = Vec::new();
             for row in https_rows {
-                let socket = TcpListener::bind(row.bind)
+                let socket = super::listener_sys::bind(row.bind)
                     .map_err(|_| config_failure("https-listen", "io"))?;
                 https_listeners.push(
                     td_mta::https::BoundListener::new(socket, row, &policies)

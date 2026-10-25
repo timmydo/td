@@ -539,7 +539,14 @@ From, To, Bcc, Resent-To, X-Original-To, X-Forwarded-To, Received and
 Authentication-Results headers. After local acceptance, outbound submission,
 recipient and route tables remain empty, queue usage remains zero, and the
 fixture smart host has accepted no delivery. Authenticated JMAP submission
-then exercises the legitimate outbound path in the same fixture.
+then exercises the legitimate outbound path in the same fixture. The
+foreground receiver and HTTPS listener bind IPv6 loopback, and stored SMTP
+provenance is checked as family six with sixteen address octets. An explicit
+IPv4 HTTPS listener on the same port also serves the migration exporter,
+whose localhost lookup in the private test namespace resolves to IPv4. The
+normal native td-mail and receiving-worker fixtures retain IPv4 coverage. Binary
+listener tests additionally bind both wildcard families to one port and
+check that the IPv6 listener does not admit IPv4 connections.
 [CONFIG.md](CONFIG.md#local-recipient-routing) owns alias authority; aliases
 resolve to the local account and do not forward externally. td-mail rules
 currently change flags or mailbox membership and have no sending action.
