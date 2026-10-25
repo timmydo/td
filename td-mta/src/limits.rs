@@ -349,7 +349,7 @@ impl Limits {
             },
             Reservation {
                 name: "worker stacks",
-                count: 10,
+                count: 9 + self.tls_handshakes,
                 bytes_each: 256 * KIB,
             },
             Reservation {
@@ -427,7 +427,7 @@ mod tests {
     #[test]
     fn default_ledger_pins_documented_budget() -> Result<(), ResourceError> {
         let plan = Limits::default().plan()?;
-        assert_eq!(plan.total_bytes(), 119_932_160);
+        assert_eq!(plan.total_bytes(), 120_194_304);
         const { assert!(crate::format::MAX_VALUE_BYTES + crate::format::MAX_KEY_BYTES + 48 <= 68 * KIB) };
         assert_eq!(
             READ_VIEW_SCRATCH_BYTES,
@@ -478,7 +478,7 @@ mod tests {
             }
             .plan(),
             Err(ResourceError::MemoryBudget {
-                required: required + 4 * MIB,
+                required: required + 4 * MIB + 256 * KIB,
                 available: required
             })
         );
@@ -519,7 +519,7 @@ mod tests {
                     tls_handshakes: 3,
                     ..defaults
                 },
-                4 * MIB,
+                4 * MIB + 256 * KIB,
             ),
         ] {
             let plan = limits.plan()?;

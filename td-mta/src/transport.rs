@@ -64,6 +64,12 @@ impl TcpTransport {
         result.map(|_| ())
     }
 
+    /// A scheduler slice may expire without retiring a healthy connection.
+    pub(crate) fn wait_readable_slice(&mut self, until: Instant) -> Result<bool, Error> {
+        self.blocking_slice(until, true, |socket| socket.peek(&mut [0]))
+            .map(|count| count.is_some())
+    }
+
     pub(crate) fn write_until(
         &mut self,
         input: &[u8],
@@ -86,16 +92,28 @@ impl TcpTransport {
         &mut self,
         until: Instant,
         reading: bool,
-        mut operation: impl FnMut(&mut TcpStream) -> io::Result<usize>,
+        operation: impl FnMut(&mut TcpStream) -> io::Result<usize>,
     ) -> Result<usize, Error> {
+        self.blocking_slice(until, reading, operation)?
+            .ok_or_else(|| self.fail(Error::Deadline))
+    }
+
+    fn blocking_slice(
+        &mut self,
+        until: Instant,
+        reading: bool,
+        mut operation: impl FnMut(&mut TcpStream) -> io::Result<usize>,
+    ) -> Result<Option<usize>, Error> {
         let result = (|| {
             let socket = self.socket()?;
             socket.set_nonblocking(false).map_err(Error::from)?;
             loop {
-                let allowance = until
+                let Some(allowance) = until
                     .checked_duration_since(Instant::now())
                     .filter(|value| !value.is_zero())
-                    .ok_or(Error::Deadline)?;
+                else {
+                    return Ok(None);
+                };
                 if reading {
                     socket.set_read_timeout(Some(allowance))
                 } else {
@@ -103,7 +121,7 @@ impl TcpTransport {
                 }
                 .map_err(Error::from)?;
                 match operation(socket) {
-                    Ok(count) => return Ok(count),
+                    Ok(count) => return Ok(Some(count)),
                     Err(error)
                         if matches!(
                             error.kind(),

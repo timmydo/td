@@ -207,3 +207,24 @@ fn blocking_read_and_backpressured_write_stop_at_original_deadline() {
     assert!(start.elapsed() < Duration::from_secs(2));
     assert_eq!(adapter.flush(), Err(Error::Deadline));
 }
+
+#[test]
+fn readable_slice_timeout_keeps_connection_usable_and_restores_nonblocking() {
+    let (mut adapter, mut peer) = pair();
+    assert!(!adapter
+        .wait_readable_slice(Instant::now() + Duration::from_millis(20))
+        .unwrap());
+    assert_eq!(adapter.read(&mut [0]), Ok(IoProgress::Pending));
+    assert_eq!(
+        adapter.socket.as_ref().unwrap().read_timeout().unwrap(),
+        None
+    );
+    peer.write_all(b"x").unwrap();
+    assert!(adapter
+        .wait_readable_slice(Instant::now() + Duration::from_secs(2))
+        .unwrap());
+    let mut byte = [0];
+    assert_eq!(adapter.read(&mut byte), Ok(IoProgress::Bytes(1)));
+    assert_eq!(byte, *b"x");
+    assert_eq!(adapter.read(&mut byte), Ok(IoProgress::Pending));
+}

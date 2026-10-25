@@ -42,7 +42,7 @@ changing that validator requires an explicit atomic implementation update.
 | Log queue and formatting | 1 | 131072 | 131072 |
 | DNS, ACME and control scratch | 1 | 524288 | 524288 |
 | Slot queues and queue window | 1 | 131072 | 131072 |
-| Fixed worker stacks | 10 | 262144 | 2621440 |
+| Fixed worker stacks | 11 | 262144 | 2883584 |
 | Main stack allowance | 1 | 1048576 | 1048576 |
 | TLS session headroom | 17 | 524288 | 8912896 |
 | TLS handshake headroom | 2 | 4194304 | 8388608 |
@@ -52,10 +52,10 @@ changing that validator requires an explicit atomic implementation update.
 | Cold reload overlap | 1 | 2097152 | 2097152 |
 | Process and allocator allowance | 1 | 8388608 | 8388608 |
 | SMTP fanout metadata | 4 | 2097152 | 8388608 |
-| **Total** | | | **119932160** |
+| **Total** | | | **120194304** |
 
-The total is approximately 114.38 MiB against a 128 MiB configured budget;
-the remaining 14285568 bytes are unassigned headroom, not another cache.
+The total is approximately 114.63 MiB against a 128 MiB configured budget;
+the remaining 14023424 bytes are unassigned headroom, not another cache.
 The default process ledger excludes database-server memory and WAL mappings.
 The two default TLS handshakes remain configurable within the process budget.
 The 64 MiB idle and 128 MiB workload RSS figures are provisional goals under
@@ -3293,10 +3293,15 @@ guaranteed erasure of provider/compiler copies. Native TLS, thread stacks
 and allocation overhead still require integrated M23 measurement; no
 whole-service memory qualification is added here.
 
-The TLS worker constructs sessions and visits each eligible handshake at most
-once per ten milliseconds, under the receiver's shared HandshakePool. Network
-and TLS scans wait at most five milliseconds between passes and never wait on
-socket readiness. Each nonblocking network turn reads at most 16 KiB, parses
+The TLS pool has exactly `tls_handshakes` workers and retains the receiver's
+shared HandshakePool. Idle initial sockets take no handshake permit or
+blocking wait. An admitted handshake stays with one worker, which waits for
+wire input in at most 50 ms blocking slices within the original deadline.
+The socket returns to nonblocking mode after each wait; slice timeout does
+not retire it. Stop is checked between slices. Pending output uses bounded
+turns with a one-millisecond wait. Network scans and idle worker scans retain
+the five-millisecond bound. Stack planning counts nine other fixed roles
+plus these TLS workers; this is not a measured stack/RSS guarantee. Each nonblocking network turn reads at most 16 KiB, parses
 one head turn or advances one bounded response. The network thread admits
 origin/rate checks and hands credential lookup to the fixed authentication
 worker. The current local backend tries its registry mutex there and performs
@@ -3753,7 +3758,7 @@ The same method meter survives all messages and transformations. Decoding,
 preview extraction and JSON stages retain their original cumulative charges;
 a small requested preview can still hit the work ceiling while validating a
 large source. The response spool cap independently limits emitted bytes.
-Default planned total is 119932160 bytes under the unchanged 128 MiB budget;
+Default planned total is 120194304 bytes under the unchanged 128 MiB budget;
 capacity-growth fixtures rebalance disposable cache within that budget.
 These are bounded implementation allocations and planner figures, not a new
 whole-service RSS or large-mailbox qualification claim.

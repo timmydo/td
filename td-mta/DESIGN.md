@@ -1289,8 +1289,8 @@ heap, WAL and page resources; the process ledger does not bound that server. Mai
 live work and preserve foreground progress.
 
 Event-source streams hold connection slots but no storage read view between
-events. RESOURCES.md proposes nonblocking main-thread scheduling and ten
-planned worker stacks across fixed roles; event peers cannot occupy request/commit/control
+events. RESOURCES.md proposes nonblocking main-thread scheduling and
+planned stacks for nine fixed roles plus `tls_handshakes` HTTPS workers; event peers cannot occupy request/commit/control
 workers. Use safe std with a bounded round-robin socket scan and a wait
 based on deadlines, using the current proposed five-millisecond quantum.
 Established TLS record work is bounded per slot; disk, dial, handshake and DNS jobs use
@@ -2002,12 +2002,19 @@ sets IPV6_V6ONLY before bind, independent of kernel defaults, and both safe
 protocol adapters verify that option for IPv6 caller-bound sockets. Separate
 IPv4 and IPv6 binds can share a port; scoped and mapped IPv6 binds remain
 refused. Library protocol/storage code still forbids unsafe code.
-A fixed HTTPS network thread scans bounded slots, with a separate fixed TLS
-worker. Native session construction and pending handshakes stay on that
-worker; idle sockets retain connection slots without taking handshake permits.
-The worker peeks nonblocking for initial TLS bytes before reserving a shared
-permit, and retries a busy pool within the original handshake deadline.
-All socket operations are nonblocking. TLS wire progress admits at most one
+A fixed HTTPS network thread scans bounded slots, with a fixed TLS worker
+pool sized by the configured shared handshake limit. Native session
+construction and pending handshakes stay on those workers; idle sockets
+retain connection slots without taking handshake permits.
+Each worker peeks nonblocking for initial TLS bytes before reserving a
+shared permit, and retries a busy pool within the original handshake
+deadline. Once admitted, a handshake stays with one worker. When it needs
+wire input, that worker uses a blocking socket peek with at most a 50 ms
+slice, capped by the original deadline, then restores nonblocking mode.
+Slice expiry retains the connection; deadline expiry or I/O failure retires
+it. Stop is checked between slices. Pending TLS output receives bounded
+turns with a one-millisecond wait instead of spinning. Other socket turns
+remain nonblocking. TLS wire progress admits at most one
 input record per turn, using at most two reads so an available payload can
 follow its completed five-byte header immediately. Partial reads or pending
 input yield; no additional record is consumed. Output likewise admits at

@@ -254,10 +254,13 @@ remain enforced. A plan exceeding the configured budget is refused.
 For example, `memory_budget_bytes=268435456` permits a 256-MiB planning
 budget when increasing independently bounded concurrency. This is an example,
 not a measured default recommendation or an OS-enforced RSS limit. The
-current default plan is 119932160 bytes (about 114.38 MiB), including the
+current default plan is 120194304 bytes (about 114.63 MiB), including the
 4-MiB index cache. Bounded folder/keyword prefix prefetch adds 128 KiB per read
 view (768 KiB at the default six views); tightly sized budgets must allow
 this additional scratch reservation. It does not raise protocol limits.
+The HTTPS handshake worker count follows `tls_handshakes`; the stack plan
+adds 256 KiB for each worker beyond the former single HTTPS TLS worker
+(256 KiB at the default of two). This remains a planning estimate.
 Four SMTP DATA jobs added 6 MiB of fanout metadata to the
 older one-job plan. The default HTTPS pool has three workers and six read
 views, with one slot reserved from transfer admission for API calls. The

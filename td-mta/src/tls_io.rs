@@ -332,6 +332,30 @@ impl<T: Transport, B: TlsWireStorage> TlsIo<T, B> {
     }
 }
 
+impl<B: TlsWireStorage> TlsIo<crate::transport::TcpTransport, B> {
+    /// Wait only when the next handshake turn needs new wire input.
+    pub(crate) fn wait_handshake_input(
+        &mut self,
+        until: std::time::Instant,
+    ) -> Result<bool, Error> {
+        let result = (|| {
+            self.check_deadline(true)?;
+            let status = self.session.status();
+            if status.handshake.is_some()
+                || status.plaintext_pending != 0
+                || status.ciphertext_pending != 0
+                || self.output_end != 0
+            {
+                return Ok(false);
+            }
+            self.transport.wait_readable_slice(until)?;
+            self.check_deadline(true)?;
+            Ok(true)
+        })();
+        result.map_err(|error| self.fail(error))
+    }
+}
+
 fn check_deadlines(
     clock: &dyn Clock,
     deadline: Deadline,

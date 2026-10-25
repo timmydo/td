@@ -100,7 +100,6 @@ struct Client {
     absolute: Deadline,
     phase_deadline: Deadline,
     idle: Deadline,
-    tls_at: Tick,
 }
 struct EventState {
     stream: crate::jmap_events::Stream,
@@ -297,7 +296,9 @@ impl Https<'_> {
         Ok(index)
     }
     pub fn run(&self, control: &Control) -> Result<(), Error> {
-        if self.listeners.is_empty() {
+        if self.listeners.is_empty()
+            || self.handshakes.capacity() != self.resources.limits().tls_handshakes
+        {
             return Err(Error::Invalid);
         }
         if self.origins.is_empty()
@@ -366,35 +367,29 @@ impl Https<'_> {
         };
         let body_warm = AtomicU8::new(0);
         std::thread::scope(|scope| {
-            let worker = std::thread::Builder::new()
-                .name("https-tls".into())
-                .spawn_scoped(scope, || {
-                    while !done.load(Ordering::Acquire) {
-                        for cell in &slots {
-                            let mut slot = match cell.try_lock() {
-                                Ok(slot) => slot,
-                                Err(TryLockError::WouldBlock) => continue,
-                                Err(_) => {
-                                    control.fail();
-                                    return;
-                                }
-                            };
-                            let Some(client) =
-                                slot.as_mut().filter(|client| client.phase == Phase::Tls)
-                            else {
-                                continue;
-                            };
-                            let result = self.tls(client);
-                            if result.is_err() {
-                                *slot = None;
-                            }
+            let mut tls_workers = Vec::new();
+            tls_workers
+                .try_reserve_exact(self.handshakes.capacity())
+                .map_err(|_| Error::Capacity)?;
+            for index in 0..self.handshakes.capacity() {
+                match std::thread::Builder::new()
+                    .name(format!("https-tls-{index}"))
+                    .spawn_scoped(scope, || self.tls_worker(&slots, &done, control))
+                {
+                    Ok(worker) => tls_workers.push(worker),
+                    Err(error) => {
+                        done.store(true, Ordering::Release);
+                        for worker in tls_workers {
+                            worker.thread().unpark();
+                            let _ = worker.join();
                         }
-                        std::thread::park_timeout(SCAN);
+                        return Err(error.into());
                     }
-                })?;
-            let finish = Finish {
+                }
+            }
+            let finish = BodyFinish {
                 done: &done,
-                worker: worker.thread(),
+                workers: &tls_workers,
             };
             let mut uploaders: Vec<std::thread::ScopedJoinHandle<'_, ()>> = Vec::new();
             uploaders
@@ -413,7 +408,9 @@ impl Https<'_> {
                             uploader.thread().unpark();
                             let _ = uploader.join();
                         }
-                        let _ = worker.join();
+                        for worker in tls_workers {
+                            let _ = worker.join();
+                        }
                         return Err(error.into());
                     }
                 }
@@ -473,7 +470,9 @@ impl Https<'_> {
                     for uploader in uploaders {
                         let _ = uploader.join();
                     }
-                    let _ = worker.join();
+                    for worker in tls_workers {
+                        let _ = worker.join();
+                    }
                     return Err(error.into());
                 }
             };
@@ -492,7 +491,7 @@ impl Https<'_> {
             } else if body_warm.load(Ordering::Acquire) == body_count {
                 self.network(
                     &slots,
-                    &worker,
+                    &tls_workers,
                     &uploaders,
                     &verifier,
                     &body_active,
@@ -517,9 +516,11 @@ impl Https<'_> {
                     return Err(Error::WriterStopped);
                 }
             }
-            if worker.join().is_err() {
-                control.fail();
-                return Err(Error::WriterStopped);
+            for worker in tls_workers {
+                if worker.join().is_err() {
+                    control.fail();
+                    return Err(Error::WriterStopped);
+                }
             }
             let retired = slots.iter().any(|slot| {
                 slot.lock().map_or(true, |slot| {
@@ -633,15 +634,62 @@ impl Https<'_> {
         client.phase = Phase::Authorize;
         Ok(())
     }
+    fn tls_worker(&self, slots: &[Mutex<Option<Client>>], done: &AtomicBool, control: &Control) {
+        // Network owns shutdown: an early worker exit would look like failure.
+        while !done.load(Ordering::Acquire) {
+            for cell in slots {
+                let mut slot = match cell.try_lock() {
+                    Ok(slot) => slot,
+                    Err(TryLockError::WouldBlock) => continue,
+                    Err(_) => {
+                        control.fail();
+                        return;
+                    }
+                };
+                let Some(client) = slot.as_mut().filter(|client| client.phase == Phase::Tls) else {
+                    continue;
+                };
+                let result = (|| {
+                    loop {
+                        if done.load(Ordering::Acquire) || control.stop_requested() {
+                            return Err(Error::WriterStopped);
+                        }
+                        self.tls(client)?;
+                        if client.phase != Phase::Tls {
+                            return Ok(());
+                        }
+                        let Some(connection) = client.connection.as_mut() else {
+                            return Ok(());
+                        };
+                        let now = self.clock.monotonic()?;
+                        let remaining = client
+                            .phase_deadline
+                            .min(client.absolute)
+                            .tick()
+                            .0
+                            .checked_sub(now.0)
+                            .filter(|n| *n != 0)
+                            .ok_or(Error::Deadline)?;
+                        let until = Instant::now() + Duration::from_millis(remaining.min(50));
+                        if !connection.wait_handshake_input(until)? {
+                            // Pending TLS output gets another bounded turn; avoid spinning
+                            // when a peer is not draining its receive window.
+                            std::thread::park_timeout(Duration::from_millis(1));
+                        }
+                    }
+                })();
+                if result.is_err() {
+                    *slot = None;
+                }
+            }
+            std::thread::park_timeout(SCAN);
+        }
+    }
     fn tls(&self, client: &mut Client) -> Result<(), Error> {
         let now = self.clock.sample()?.monotonic;
-        if now < client.tls_at {
-            return Ok(());
-        }
         if client.phase_deadline.expired(now) {
             return Err(Error::Deadline);
         }
-        client.tls_at = Tick(now.0.checked_add(10).ok_or(Error::Invalid)?);
         if let Some(socket) = client.pending.as_ref() {
             let mut first = [0; 1];
             match socket.peek(&mut first) {
@@ -698,7 +746,6 @@ impl Https<'_> {
         let connection = client.connection.as_mut().ok_or(Error::Invalid)?;
         let result = connection.handshake(client.phase_deadline)?;
         let now = self.clock.sample()?.monotonic;
-        client.tls_at = Tick(now.0.checked_add(10).ok_or(Error::Invalid)?);
         if matches!(result, Handshake::Complete(_)) {
             if let Some(timing) = client.timing.take() {
                 timing.finish(crate::performance::Outcome::Success);
@@ -714,7 +761,7 @@ impl Https<'_> {
     fn network(
         &self,
         slots: &[Mutex<Option<Client>>],
-        worker: &std::thread::ScopedJoinHandle<'_, ()>,
+        tls_workers: &[std::thread::ScopedJoinHandle<'_, ()>],
         uploaders: &[std::thread::ScopedJoinHandle<'_, ()>],
         verifier: &std::thread::ScopedJoinHandle<'_, ()>,
         body_active: &BodyPool,
@@ -734,7 +781,7 @@ impl Https<'_> {
         let mut accept_after = Tick(0);
         let mut event_count = 0usize;
         while !control.stop_requested() {
-            if worker.is_finished()
+            if tls_workers.iter().any(|worker| worker.is_finished())
                 || uploaders.iter().any(|worker| worker.is_finished())
                 || verifier.is_finished()
             {
@@ -917,11 +964,12 @@ impl Https<'_> {
                     absolute,
                     phase_deadline,
                     idle: phase_deadline,
-                    tls_at: now,
                 };
                 *peers.get_mut(index).ok_or(Error::Invalid)? = Some(address.ip());
                 *slot = Some(client);
-                worker.thread().unpark();
+                for worker in tls_workers {
+                    worker.thread().unpark();
+                }
             }
             std::thread::sleep(SCAN);
         }

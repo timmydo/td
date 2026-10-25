@@ -89,6 +89,15 @@ impl<B: TlsWireStorage> SessionReservation<B> {
 }
 
 impl<B: TlsWireStorage> TlsConnection<B> {
+    pub(crate) fn wait_handshake_input(
+        &mut self,
+        until: std::time::Instant,
+    ) -> Result<bool, Error> {
+        self.live()?;
+        let result = self.io.wait_handshake_input(until);
+        result.map_err(|error| self.fail(error))
+    }
+
     /// Retained relay policy plus successful configured-host verification.
     /// This does not establish current queue/account mutation authority.
     pub(crate) fn verified_relay_transport(

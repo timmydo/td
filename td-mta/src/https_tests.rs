@@ -263,6 +263,22 @@ fn https_enforces_auth_origin_framing_revocation_and_idle_deadlines() {
                 }
                 drop((idle, excess));
                 std::thread::sleep(Duration::from_millis(50));
+                // An admitted but incomplete TLS record must not monopolize the
+                // bounded handshake pool or delay another connection's handshake.
+                let mut stalled = TcpStream::connect(address).unwrap();
+                stalled.write_all(&[22]).unwrap();
+                wait(|| handshakes.available() == 1);
+                let mut alongside = client(address, &lease, clock.clone());
+                alongside.abort();
+                clock.1.fetch_add(61_000, Ordering::Relaxed);
+                wait(|| handshakes.available() == 2);
+                stalled.set_nonblocking(true).unwrap();
+                wait(|| match stalled.read(&mut [0]) {
+                    Ok(0) => true,
+                    Err(error) => error.kind() == io::ErrorKind::ConnectionReset,
+                    _ => false,
+                });
+                drop(stalled);
                 // A full shared pool delays ClientHello admission instead of closing TCP.
                 let first = handshakes.reserve().unwrap();
                 let second = handshakes.reserve().unwrap();
@@ -297,7 +313,7 @@ fn https_enforces_auth_origin_framing_revocation_and_idle_deadlines() {
                                 | io::ErrorKind::ConnectionReset
                         )),
                     }
-                    clock.1.store(11_000, Ordering::Relaxed);
+                    clock.1.fetch_add(11_000, Ordering::Relaxed);
                     plain.set_nonblocking(true).unwrap();
                     wait(|| match plain.read(&mut bytes) {
                         Ok(0) => true,
@@ -464,8 +480,14 @@ fn https_enforces_auth_origin_framing_revocation_and_idle_deadlines() {
                 clock.1.fetch_add(31_000, Ordering::Relaxed);
                 let mut scratch = [0; 1];
                 wait(|| matches!(idle.read(&mut scratch), Err(_) | Ok(IoProgress::Closed)));
+                let mut stopping = TcpStream::connect(address).unwrap();
+                stopping.write_all(&[22]).unwrap();
+                wait(|| handshakes.available() == 1);
+                let stopping_at = std::time::Instant::now();
                 drop(stop);
                 assert!(worker.join().unwrap().is_ok());
+                assert!(stopping_at.elapsed() < Duration::from_secs(2));
+                drop(stopping);
                 assert!(authentication.closed.load(Ordering::Acquire));
                 assert_eq!(handshakes.available(), handshakes.capacity());
             });
