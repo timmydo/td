@@ -254,14 +254,18 @@ remain enforced. A plan exceeding the configured budget is refused.
 For example, `memory_budget_bytes=268435456` permits a 256-MiB planning
 budget when increasing independently bounded concurrency. This is an example,
 not a measured default recommendation or an OS-enforced RSS limit. The
-current default plan is 112780544 bytes (about 107.56 MiB), including the
+current default plan is 119145728 bytes (about 113.63 MiB), including the
 4-MiB index cache. Four SMTP DATA jobs added 6 MiB of fanout metadata to the
-older one-job plan. Two HTTPS body workers add two read views, one planned
-worker stack and one additional established-TLS processing allowance, about
-4.82 MiB. The default `storage_views` is four; explicit values of two or
-three retain one HTTPS body worker. `body_jobs=1` also retains one worker.
-Operators with a tightly sized explicit budget must
-revalidate it against the complete plan after upgrading. Keep the current
+older one-job plan. The default HTTPS pool has three workers and six read
+views, with one slot reserved from transfer admission for API calls. The
+third worker, extra body job and read views add about 6.07 MiB to the prior
+two-worker planning estimate. Explicit `body_jobs` and `storage_views`
+values still bound the pool: its count is the minimum of three,
+`https_connections`, `body_jobs` and `storage_views / 2`. A single worker
+has no separate API reservation; two workers allow one transfer plus API
+work, and three allow two transfers plus API work. Uploads remain capped
+at one within transfer capacity. Operators with a tightly sized explicit
+budget must revalidate it against the complete plan after upgrading. Keep the current
 default until representative concurrency measurements justify a change.
 
 ### `[disk]`
@@ -1823,9 +1827,11 @@ accessible raw blob or transfer-decoded direct MIME attachment; other methods
 receive 405 with Allow: GET. GET bodies
 and Expect are rejected. The name and media type are template values, not
 stored blob metadata. Downloads, uploads and API requests share the bounded
-body-worker pool (at most two workers). API concurrency advertises its
+body-worker pool (at most three workers). API concurrency advertises its
 configured count; uploads retain a separate one-exchange ceiling. These
-maxima are not additive reservations. Full-pool or upload-capacity
+maxima are not additive reservations. With at least two workers, transfers
+cannot occupy the final worker, preserving API capacity. Full-pool, transfer
+or upload-capacity
 contention receives 429 with Retry-After regardless of request kind.
 Raw downloads form part of the advertised Core capability.
 

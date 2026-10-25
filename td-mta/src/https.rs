@@ -114,17 +114,24 @@ impl Drop for Client {
         std::hint::black_box(&mut self.input);
     }
 }
+#[derive(Clone, Copy, PartialEq)]
+enum BodyKind {
+    Upload,
+    Download,
+    Api,
+}
 struct BodyPool {
     active: Arc<AtomicU8>,
+    transfers: Arc<AtomicU8>,
     uploading: Arc<AtomicBool>,
     maximum: u8,
 }
 impl BodyPool {
-    fn admit(&self, slot: &mut Option<BodyPermit>, upload: bool) -> bool {
+    fn admit(&self, slot: &mut Option<BodyPermit>, kind: BodyKind) -> bool {
         if slot.is_some() {
             return false;
         }
-        let upload = if upload {
+        let upload = if kind == BodyKind::Upload {
             if self
                 .uploading
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -136,28 +143,46 @@ impl BodyPool {
         } else {
             None
         };
-        let mut active = self.active.load(Ordering::Acquire);
-        for _ in 0..3 {
-            if active >= self.maximum {
+        let transfer = if kind != BodyKind::Api {
+            let maximum = self.maximum.saturating_sub(1).max(1);
+            let Some(permit) = CountPermit::acquire(&self.transfers, maximum) else {
                 return false;
+            };
+            Some(permit)
+        } else {
+            None
+        };
+        let Some(active) = CountPermit::acquire(&self.active, self.maximum) else {
+            return false;
+        };
+        *slot = Some(BodyPermit {
+            _active: active,
+            _transfer: transfer,
+            _upload: upload,
+        });
+        true
+    }
+}
+struct CountPermit(Arc<AtomicU8>);
+impl CountPermit {
+    fn acquire(counter: &Arc<AtomicU8>, maximum: u8) -> Option<Self> {
+        let mut active = counter.load(Ordering::Acquire);
+        for _ in 0..4 {
+            if active >= maximum {
+                return None;
             }
-            match self.active.compare_exchange(
-                active,
-                active + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    *slot = Some(BodyPermit {
-                        active: self.active.clone(),
-                        _upload: upload,
-                    });
-                    return true;
-                }
+            match counter.compare_exchange(active, active + 1, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return Some(Self(counter.clone())),
                 Err(current) => active = current,
             }
         }
-        false
+        None
+    }
+}
+impl Drop for CountPermit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 struct UploadPermit(Arc<AtomicBool>);
@@ -167,13 +192,9 @@ impl Drop for UploadPermit {
     }
 }
 struct BodyPermit {
-    active: Arc<AtomicU8>,
+    _active: CountPermit,
+    _transfer: Option<CountPermit>,
     _upload: Option<UploadPermit>,
-}
-impl Drop for BodyPermit {
-    fn drop(&mut self) {
-        self.active.fetch_sub(1, Ordering::AcqRel);
-    }
 }
 struct BodyFinish<'a, 'scope> {
     done: &'a AtomicBool,
@@ -334,6 +355,7 @@ impl Https<'_> {
         }
         let body_active = BodyPool {
             active: Arc::new(AtomicU8::new(0)),
+            transfers: Arc::new(AtomicU8::new(0)),
             uploading: Arc::new(AtomicBool::new(false)),
             maximum: body_count,
         };
@@ -977,7 +999,9 @@ impl Https<'_> {
                                         != Some(backend.account())
                                     {
                                         404
-                                    } else if !body_active.admit(&mut client.body_slot, true) {
+                                    } else if !body_active
+                                        .admit(&mut client.body_slot, BodyKind::Upload)
+                                    {
                                         body_busy()
                                     } else {
                                         client.principal = Some(principal);
@@ -991,7 +1015,9 @@ impl Https<'_> {
                                         || head.expect_continue
                                     {
                                         400
-                                    } else if !body_active.admit(&mut client.body_slot, false) {
+                                    } else if !body_active
+                                        .admit(&mut client.body_slot, BodyKind::Download)
+                                    {
                                         body_busy()
                                     } else {
                                         client.principal = Some(principal);
@@ -1007,7 +1033,9 @@ impl Https<'_> {
                                         })
                                     }) {
                                         415
-                                    } else if !body_active.admit(&mut client.body_slot, false) {
+                                    } else if !body_active
+                                        .admit(&mut client.body_slot, BodyKind::Api)
+                                    {
                                         let status = body_busy();
                                         control.log(
                                             crate::observability::Kind::AdmissionRefused {

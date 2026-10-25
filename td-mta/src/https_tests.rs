@@ -194,8 +194,8 @@ fn https_enforces_auth_origin_framing_revocation_and_idle_deadlines() {
     let resolved = resolved(&source);
     let resource = Limits {
         https_connections: 32,
-        json_bytes: 320 * 1024,
-        json_tokens: 8192,
+        json_bytes: 256 * 1024,
+        json_tokens: 4096,
         ..Limits::default()
     }
     .plan()
@@ -1095,6 +1095,15 @@ fn account_and_allowed_origin_select_private_session_and_backend() {
 
 #[test]
 fn two_body_workers_keep_other_permits_when_an_exchange_fails() {
+    exercise_body_pool(1);
+}
+
+#[test]
+fn two_downloads_leave_api_capacity_after_an_exchange_fails() {
+    exercise_body_pool(2);
+}
+
+fn exercise_body_pool(transfers: u64) {
     use crate::https_download::Failure;
     struct Parallel {
         entered: AtomicU64,
@@ -1181,7 +1190,13 @@ fn two_body_workers_keep_other_permits_when_an_exchange_fails() {
         .replace("127.0.0.1:443", &address.to_string());
     let lease = material.published(&source);
     let resolved = resolved(&source);
-    let resource = Limits::default().plan().unwrap();
+    let resource = Limits {
+        body_jobs: transfers as usize + 1,
+        storage_views: 2 * (transfers as usize + 1),
+        ..Limits::default()
+    }
+    .plan()
+    .unwrap();
     let admission = DiskLimits::default()
         .plan(&resource, WorkLimits::default(), ViewMode::OnlineBackground)
         .unwrap();
@@ -1212,9 +1227,17 @@ fn two_body_workers_keep_other_permits_when_an_exchange_fails() {
             let account = format!("a{}", "aa".repeat(16));
             let get = format!("GET /jmap/download/{account}/b{}/a?type=text%2Fplain HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: Basic {authorization}\r\n\r\n", "11".repeat(16), address.port());
             let api = format!("POST /jmap/api HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: Basic {authorization}\r\nContent-Type: application/json\r\nContent-Length: 0\r\n\r\n", address.port());
-            let mut first = client(address, &lease, clock.clone());
-            send(&mut first, get.as_bytes());
-            wait(|| backend.entered.load(Ordering::Acquire) == 1);
+            let mut downloads = Vec::new();
+            for count in 1..=transfers {
+                let mut download = client(address, &lease, clock.clone());
+                send(&mut download, get.as_bytes());
+                wait(|| backend.entered.load(Ordering::Acquire) == count);
+                downloads.push(download);
+            }
+            let mut excess_transfer = client(address, &lease, clock.clone());
+            send(&mut excess_transfer, get.as_bytes());
+            assert_eq!(full_reply(&mut excess_transfer).0, 429);
+            excess_transfer.abort();
             backend.fail_next.store(true, Ordering::Release);
             let mut failed = client(address, &lease, clock.clone());
             send(&mut failed, api.as_bytes());
@@ -1223,21 +1246,23 @@ fn two_body_workers_keep_other_permits_when_an_exchange_fails() {
             wait(|| matches!(failed.read(&mut scratch), Ok(IoProgress::Closed) | Err(_)));
             let mut second = client(address, &lease, clock.clone());
             send(&mut second, api.as_bytes());
-            wait(|| backend.entered.load(Ordering::Acquire) == 2);
+            wait(|| backend.entered.load(Ordering::Acquire) == transfers + 1);
             let mut full = client(address, &lease, clock.clone());
-            send(&mut full, get.as_bytes());
+            send(&mut full, api.as_bytes());
             assert_eq!(full_reply(&mut full).0, 429);
             full.abort();
             backend.release.store(true, Ordering::Release);
-            assert_eq!(full_reply(&mut first).0, 200);
+            for download in &mut downloads {
+                assert_eq!(full_reply(download).0, 200);
+            }
             assert_eq!(full_reply(&mut second).0, 200);
-            for connection in [&mut first, &mut second] {
+            for connection in downloads.iter_mut().chain(std::iter::once(&mut second)) {
                 wait(|| matches!(connection.read(&mut scratch), Ok(IoProgress::Closed) | Err(_)));
             }
             let mut again = client(address, &lease, clock.clone());
             send(&mut again, get.as_bytes());
             assert_eq!(full_reply(&mut again).0, 200);
-            assert_eq!(backend.entered.load(Ordering::Acquire), 3);
+            assert_eq!(backend.entered.load(Ordering::Acquire), transfers + 2);
             wait(|| matches!(again.read(&mut scratch), Ok(IoProgress::Closed) | Err(_)));
             drop(stop);
             worker.join().unwrap().unwrap();

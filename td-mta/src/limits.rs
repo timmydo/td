@@ -124,8 +124,8 @@ limits! {
         https_connections: 8, 1, 32;
         tls_handshakes: 2, 1, 8;
         event_streams: 2, 0, 8;
-        body_jobs: 2, 1, 8;
-        storage_views: 4, 1, 8;
+        body_jobs: 3, 1, 8;
+        storage_views: 6, 1, 8;
         message_bytes: MAX_MESSAGE_BYTES, 1, MAX_MESSAGE_BYTES;
         header_bytes: 256 * KIB, 1, MIB;
         mime_depth: 32, 1, 64;
@@ -187,7 +187,8 @@ impl ResourcePlan {
         self.limits
             .body_jobs
             .min(self.limits.storage_views / 2)
-            .min(2)
+            .min(self.limits.https_connections)
+            .min(3)
     }
     pub fn reservations(&self) -> &[Reservation] {
         &self.reservations
@@ -348,7 +349,7 @@ impl Limits {
             },
             Reservation {
                 name: "worker stacks",
-                count: 9,
+                count: 10,
                 bytes_each: 256 * KIB,
             },
             Reservation {
@@ -368,7 +369,7 @@ impl Limits {
             },
             Reservation {
                 name: "established TLS processing",
-                count: 2,
+                count: 3,
                 bytes_each: TLS_ESTABLISHED_PROCESSING_BYTES,
             },
             Reservation {
@@ -426,7 +427,7 @@ mod tests {
     #[test]
     fn default_ledger_pins_documented_budget() -> Result<(), ResourceError> {
         let plan = Limits::default().plan()?;
-        assert_eq!(plan.total_bytes(), 112_780_544);
+        assert_eq!(plan.total_bytes(), 119_145_728);
         const { assert!(crate::format::MAX_VALUE_BYTES + crate::format::MAX_KEY_BYTES + 48 <= 68 * KIB) };
         assert_eq!(
             READ_VIEW_SCRATCH_BYTES,
@@ -529,7 +530,7 @@ mod tests {
                 .ok_or(ResourceError::Inconsistent(
                     "missing TLS processing reservation",
                 ))?;
-            assert_eq!(record.count, 2);
+            assert_eq!(record.count, 3);
             assert_eq!(record.bytes_each, 4 * MIB);
         }
         Ok(())
@@ -769,8 +770,8 @@ mod tests {
             Err(ResourceError::MemoryBudget { .. })
         ));
         assert!(Limits {
-            json_bytes: 320 * KIB,
-            json_tokens: 8192,
+            json_bytes: 256 * KIB,
+            json_tokens: 4096,
             ..maximum_pool
         }
         .plan()

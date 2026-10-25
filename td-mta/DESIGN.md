@@ -1280,7 +1280,7 @@ heap, WAL and page resources; the process ledger does not bound that server. Mai
 live work and preserve foreground progress.
 
 Event-source streams hold connection slots but no storage read view between
-events. RESOURCES.md proposes nonblocking main-thread scheduling and nine
+events. RESOURCES.md proposes nonblocking main-thread scheduling and ten
 planned worker stacks across fixed roles; event peers cannot occupy request/commit/control
 workers. Use safe std with a bounded round-robin socket scan and a wait
 based on deadlines, using the current proposed five-millisecond quantum.
@@ -1308,7 +1308,7 @@ Initial default ceilings (validated together at startup):
 | Active HTTPS connections | 8, with a separate cap of 2 TLS handshakes |
 | Event-source connections within the HTTPS pool | 2 |
 | Concurrent smart-host deliveries | 1 |
-| Concurrent body/search jobs | 2 |
+| Concurrent body/search jobs | 3 |
 | Incoming message or uploaded blob | 32 MiB hard maximum, streamed |
 | Owner-imported legacy message and stored-body reads | 64 MiB hard maximum |
 | Aggregate header bytes / MIME nesting / MIME parts | 256 KiB / 32 / 1024 |
@@ -1317,7 +1317,7 @@ Initial default ceilings (validated together at startup):
 | JMAP object IDs per get/set / query page | 256 / 256 |
 | JSON nesting / parser tokens per request | 32 / 32768 |
 | Combined resident index cache | 4 MiB |
-| Storage read views | 4, each with bounded row/key/cursor scratch and a database snapshot |
+| Storage read views | 6, each with bounded row/key/cursor scratch and a database snapshot |
 | Bodies retained by upload leases | 128 MiB per account, expiry after 24 hours |
 | Retained submission storage | 256 MiB and 1000 submissions |
 | Maintenance sort scratch on disk | 64 MiB per account |
@@ -2053,7 +2053,7 @@ native/kernel work already running must return before joins complete.
 
 Authenticated raw downloads now use GET on the fixed download template.
 The bounded body-worker pool is shared with uploads and API requests. It
-runs up to two exchanges, limited by `body_jobs` and two read views per
+runs up to three exchanges, limited by `body_jobs`, HTTPS slots and two read views per
 worker. Each exchange owns a permit through flushing or retirement.
 A full pool returns HTTP 429
 with Retry-After: 1 and emits a bounded admission-refused application event;
