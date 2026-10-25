@@ -74,6 +74,7 @@ password_command = "echo test"
             .arg("--cli")
             .arg(format!("--config={}", config_path.display()))
             .env("XDG_RUNTIME_DIR", fetch.runtime_dir())
+            .env("XDG_STATE_HOME", config_dir.path().join("state"))
             .env("XDG_CACHE_HOME", config_dir.path().join("cache"))
             .env("XDG_DOWNLOAD_DIR", config_dir.path().join("downloads"));
         if offline {
@@ -127,6 +128,7 @@ password_command = "echo test"
                 self._config_dir.path().join("config.toml").display()
             ))
             .env("XDG_RUNTIME_DIR", self._fetch.runtime_dir())
+            .env("XDG_STATE_HOME", self._config_dir.path().join("state"))
             .env("XDG_CACHE_HOME", self._config_dir.path().join("cache"))
             .env(
                 "XDG_DOWNLOAD_DIR",
@@ -2279,4 +2281,21 @@ fn offline_summary_cache_does_not_claim_to_contain_message_bodies() {
             "{response}"
         );
     }
+}
+
+#[test]
+fn request_logs_report_timings_without_message_payloads() {
+    let mut h = CliHarness::start();
+    assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
+    assert!(h.send(json!({"command":"get_email", "id":"email-001"}))["ok"].is_true());
+    let log =
+        std::fs::read_to_string(h._config_dir.path().join("state/td-mail/td-mail.log")).unwrap();
+    assert!(
+        log.contains("HTTP methods=Email/get attempt=1 elapsed_ms="),
+        "{log}"
+    );
+    assert!(log.contains("status=200 request_bytes="), "{log}");
+    assert!(log.contains("attempts=1 retry_wait_ms=0"), "{log}");
+    assert!(!log.contains("Request body:"));
+    assert!(!log.contains("Response body ("));
 }

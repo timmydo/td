@@ -691,11 +691,6 @@ fn filter_noop_actions(actions: &[Action], email: &Email, mailboxes: &[Mailbox])
 pub fn resolve_mailbox_id(name: &str, mailboxes: &[Mailbox]) -> Option<String> {
     // First try exact name match
     if let Some(mbox) = mailboxes.iter().find(|m| m.name == name) {
-        log_debug!(
-            "[Rules] Resolved mailbox '{}' by exact name -> {}",
-            name,
-            mbox.id
-        );
         return Some(mbox.id.clone());
     }
 
@@ -705,7 +700,6 @@ pub fn resolve_mailbox_id(name: &str, mailboxes: &[Mailbox]) -> Option<String> {
         .iter()
         .find(|m| m.role.as_ref().map(|r| r.to_lowercase()) == Some(lower.clone()))
     {
-        log_debug!("[Rules] Resolved mailbox '{}' by role -> {}", name, mbox.id);
         return Some(mbox.id.clone());
     }
 
@@ -735,7 +729,6 @@ pub fn resolve_mailbox_id(name: &str, mailboxes: &[Mailbox]) -> Option<String> {
                 path.reverse();
                 let full_path = path.join("/");
                 if full_path == name {
-                    log_debug!("[Rules] Resolved mailbox '{}' by path -> {}", name, mbox.id);
                     return Some(mbox.id.clone());
                 }
             }

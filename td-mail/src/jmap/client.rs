@@ -173,6 +173,12 @@ fn read_backoff(
         };
         let seconds = seconds.max((1_u64 << retries).min(5));
         retries += 1;
+        log_info!(
+            "[JMAP] Read retry={} status={} wait_ms={}",
+            retries,
+            response.status,
+            seconds * 1000
+        );
         drop(response);
         wait(std::time::Duration::from_secs(seconds));
     }
@@ -622,12 +628,22 @@ impl JmapClient {
 
         // Writing a value cannot fail, so there is no serialize error to report.
         let request_json = request.to_json().to_string();
-        log_debug!("[JMAP] Request body: {}", truncate_str(&request_json, 500));
+        let methods = request
+            .method_calls
+            .iter()
+            .map(|call| call.0)
+            .collect::<Vec<_>>()
+            .join(",");
+        let started = std::time::Instant::now();
+        let attempts = std::cell::Cell::new(0_u32);
+        let wait_ms = std::cell::Cell::new(0_u128);
 
         // The fetch service carries the request; a status of 400 or more is
         // an error here rather than a reply, as it was before.
         let send = || {
-            td_fetch_client::request_with_ca(
+            attempts.set(attempts.get().saturating_add(1));
+            let attempt_started = std::time::Instant::now();
+            let result = td_fetch_client::request_with_ca(
                 "POST",
                 &self.api_url,
                 &[
@@ -637,14 +653,34 @@ impl JmapClient {
                 request_json.as_bytes(),
                 RESPONSE_LIMIT,
                 self.trust.roots_for(&self.api_url),
-            )
+            );
+            log_info!(
+                "[JMAP] HTTP methods={} attempt={} elapsed_ms={} status={} request_bytes={} response_bytes={}",
+                methods,
+                attempts.get(),
+                attempt_started.elapsed().as_millis(),
+                result.as_ref().map(|response| response.status).unwrap_or(0),
+                request_json.len(),
+                result.as_ref().map(|response| response.body.len()).unwrap_or(0)
+            );
+            result
         };
         let response = if read_batch(&request) {
-            read_backoff(send, std::thread::sleep)
+            read_backoff(send, |delay| {
+                wait_ms.set(wait_ms.get().saturating_add(delay.as_millis()));
+                std::thread::sleep(delay);
+            })
         } else {
             send()
-        }
-        .map_err(|e| {
+        };
+        log_info!(
+            "[JMAP] Call methods={} elapsed_ms={} attempts={} retry_wait_ms={}",
+            methods,
+            started.elapsed().as_millis(),
+            attempts.get(),
+            wait_ms.get()
+        );
+        let response = response.map_err(|e| {
             log_error!("[JMAP] API call failed: {}", e);
             JmapError::Http(e.to_string())
         })?;
@@ -657,12 +693,6 @@ impl JmapClient {
         }
         let response_text = String::from_utf8(response.body)
             .map_err(|e| JmapError::Parse(format!("Failed to read response: {}", e)))?;
-
-        log_debug!(
-            "[JMAP] Response body ({} bytes): {}",
-            response_text.len(),
-            truncate_str(&response_text, 1000)
-        );
 
         let parsed = td_json::parse(&response_text)
             .map_err(|e| e.to_string())

@@ -642,3 +642,16 @@ Automatic rules retain full-message input in matching folders, even for
 `headers_only` queries. Thread and keyword lookups use at most 256 IDs per call.
 CLI queries retain full bodies unless
 `headers_only` is requested.
+
+### Diagnostic logs
+
+`$XDG_STATE_HOME/td-mail/td-mail.log` (normally
+`~/.local/state/td-mail/td-mail.log`) records JMAP method names, HTTP attempt
+latency, status, request/response byte counts, total transport latency and
+retry waits. Status zero means a transport error. Timings include fetch-service
+work and network/server time; they do not identify server stages by themselves.
+Ordinary API payloads are not logged. Logs are best-effort: contending writers
+skip entries. Each line is capped, and the file rolls over in place at 16 MiB,
+with a marker indicating that older entries were discarded. This also bounds
+an existing oversized log on its next write. Copy a diagnostic log before
+reproducing a problem if its older entries need preservation.
