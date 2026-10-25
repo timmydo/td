@@ -3746,12 +3746,16 @@ have their separate 512-byte allowance; retained lists do not borrow the old
 96 KiB partition. Header backing additionally reserves one lookahead byte per
 part and two final bytes within that allowance and scratch.
 
-Non-default concurrency and part-count combinations can exceed the fixed
-128-MiB budget even when each scalar is within its own allowed range. For
-example, 32 HTTPS connections with other defaults require reducing the index
-cache from 4 MiB to 1 MiB. The capacity-growth fixture pins that combination.
-The planner does not allow increasing the memory budget above 128 MiB;
-operators must rebalance cache, concurrency or object limits instead.
+Non-default concurrency and part-count combinations can exceed the default
+128-MiB budget even when each scalar is within its own allowed range. The
+operator may raise the positive `memory_budget_bytes` planning limit, up to
+the platform's `usize` range, or rebalance cache, concurrency and object
+limits. Raising the budget does not raise any individual bound or allocate
+an arena of that size. The provisional default remains 128 MiB pending
+representative concurrent peak measurements. The capacity-growth fixture
+also retains a 32-HTTPS-connection configuration with `json_bytes=393216`
+and `json_tokens=16384`, keeping the default index cache. Its plan requires
+131843328 bytes; it is one way to fit within the default, not a requirement.
 CONFIG.md's resource validation uses this same combined plan; independent
 scalar maxima do not establish admission. Selection additionally retains up
 to 64 names (264 bytes each) and their parsed header properties, bounded by

@@ -145,7 +145,7 @@ limits! {
         sort_disk_bytes: 64 * MIB, 1, 256 * MIB;
         log_file_bytes: 8 * MIB, 1, 64 * MIB;
         retained_logs: 4, 1, 16;
-        memory_budget_bytes: 128 * MIB, 1, 128 * MIB;
+        memory_budget_bytes: 128 * MIB, 1, usize::MAX;
     }
     fixed {
         outbound_deliveries: 1;
@@ -557,10 +557,53 @@ mod tests {
     }
 
     #[test]
+    fn operator_budget_can_fund_concurrency_without_relaxing_individual_bounds(
+    ) -> Result<(), ResourceError> {
+        let expanded = Limits {
+            https_connections: 32,
+            memory_budget_bytes: 256 * MIB,
+            ..Limits::default()
+        };
+        let plan = expanded.plan()?;
+        assert!(plan.total_bytes() > 128 * MIB);
+        assert!(plan.total_bytes() < expanded.memory_budget_bytes);
+        assert!(matches!(
+            Limits {
+                memory_budget_bytes: plan.total_bytes() - 1,
+                ..expanded
+            }
+            .plan(),
+            Err(ResourceError::MemoryBudget { .. })
+        ));
+        assert!(matches!(
+            Limits {
+                https_connections: 33,
+                memory_budget_bytes: usize::MAX,
+                ..expanded
+            }
+            .plan(),
+            Err(ResourceError::OutOfRange {
+                field: "https_connections",
+                ..
+            })
+        ));
+        assert_eq!(
+            Limits {
+                memory_budget_bytes: usize::MAX,
+                ..Limits::default()
+            }
+            .plan()?
+            .total_bytes(),
+            Limits::default().plan()?.total_bytes()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn larger_memory_budget_does_not_enable_parallel_relay_attempts() {
         let limits = Limits {
             outbound_deliveries: 2,
-            memory_budget_bytes: 128 * MIB,
+            memory_budget_bytes: 256 * MIB,
             ..Limits::default()
         };
         assert_eq!(

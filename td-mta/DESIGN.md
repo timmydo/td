@@ -1264,7 +1264,11 @@ cache sizes and scheduling quanta are implementation choices to validate
 against progress, fairness and measured workloads. RESOURCES.md records the
 current proposal and implemented limits. Its byte partitions and TLS
 allowances are planning estimates, not mandatory per-component ceilings.
-Limits::plan retains its process planning validation. PostgreSQL owns server
+Limits::plan checks the ledger against an operator-configurable positive
+memory budget while retaining individual connection, queue, message and
+allocation bounds. The provisional 128-MiB default is a planning limit, not
+a measured RSS guarantee; recommend a revised default only after concurrent
+peak measurements. PostgreSQL owns server
 heap, WAL and page resources; the process ledger does not bound that server. Maintenance must share bounded capacity with
 live work and preserve foreground progress.
 

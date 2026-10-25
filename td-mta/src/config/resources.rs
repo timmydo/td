@@ -422,6 +422,26 @@ mod tests {
         assert_eq!(actual.resources().total_bytes(), 107_726_080);
     }
     #[test]
+    fn operator_memory_budget_accepts_a_larger_bounded_configuration() {
+        let mut builder = Builder::default();
+        builder.begin(Section::Limits, location(1)).unwrap();
+        for (field, value) in [
+            ("memory_budget_bytes", 268435456),
+            ("https_connections", 32),
+        ] {
+            builder
+                .assign(Section::Limits, field, Value::Integer(value), location(2))
+                .unwrap();
+        }
+        let actual = builder
+            .finish(admission::ViewMode::OnlineBackground)
+            .unwrap();
+        assert_eq!(actual.resources().limits().memory_budget_bytes, 268435456);
+        assert_eq!(actual.resources().limits().https_connections, 32);
+        assert!(actual.resources().total_bytes() > 134217728);
+    }
+
+    #[test]
     fn duplicates_keep_first_location_and_poison_candidate() {
         let mut b = Builder::default();
         b.begin(Section::Limits, location(1)).unwrap();

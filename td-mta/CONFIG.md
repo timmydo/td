@@ -241,15 +241,24 @@ error even when the supplied value equals the constant.
 `upload_expiry_seconds`, `queue_disk_bytes`, `queue_submissions`,
 `sort_disk_bytes`, `log_file_bytes`, `retained_logs`, `memory_budget_bytes`.
 
-The default and compiled maximum `memory_budget_bytes` are 134217728
-(128 MiB). The default `index_cache_bytes` is 4194304 (4 MiB). Together they
-fund the checked process ledger in RESOURCES.md. PostgreSQL server memory,
-WAL and pages are outside that ledger. These reservations are not measured
-RSS limits. A smaller explicit
-budget is accepted only when the complete configured plan fits it; changing
-the budget alone does not change connection counts. DESIGN section 5 treats
-RSS figures as provisional goals and the ledger as existing planner behavior;
-replacing this configuration rule requires a separate atomic code change.
+`memory_budget_bytes` is the operator's positive process-planning limit in
+bytes, up to the platform's `usize` range. The provisional default remains
+134217728 (128 MiB); it is not a compiled maximum. Choose a budget after
+measuring peak RSS and cgroup memory under the intended concurrent workload,
+including large SMTP messages and body downloads. PostgreSQL server memory,
+WAL, page cache and other services need their own headroom. A larger budget
+alone allocates no memory and changes no connection, queue, message or
+individual allocation limit. Those bounds and checked ledger arithmetic
+remain enforced. A plan exceeding the configured budget is refused.
+
+For example, `memory_budget_bytes=268435456` permits a 256-MiB planning
+budget when increasing independently bounded concurrency. This is an example,
+not a measured default recommendation or an OS-enforced RSS limit. The
+current default plan is 107726080 bytes (about 102.74 MiB), including the
+4-MiB index cache. Four SMTP DATA jobs added 6 MiB of fanout metadata to the
+older one-job plan. Operators with a tightly sized explicit budget must
+revalidate it against the complete plan after upgrading. Keep the current
+default until representative concurrency measurements justify a change.
 
 ### `[disk]`
 
