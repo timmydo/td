@@ -952,6 +952,14 @@ pub const SYSTEM_DEPLOY_ROLLBACK_MARKER: &str = "TD-DEPLOY-ROLLBACK-OK";
 /// the deployment successful.
 pub const SYSTEM_BOOT_SUCCESS_MARKER: &str = "TD-BOOT-SUCCESS-OK";
 
+/// Printed by a server's `/etc/healthwatch` when the health transaction
+/// ended without recording success, just before it asks td-svc to reboot.
+pub const SERVER_HEALTH_REBOOT_MARKER: &str = "TD-SERVER-HEALTH-REBOOT";
+
+/// Printed by a server's `/etc/healthwatch` when it read the recorded
+/// success and leaves the machine running.
+pub const SERVER_HEALTH_STEADY_MARKER: &str = "TD-SERVER-HEALTH-STEADY";
+
 /// Printed by the system's shutdown script after syncing and unmounting @var.
 pub const SYSTEM_SHUTDOWN_MARKER: &str = "TD-SHUTDOWN-OK";
 
@@ -1764,6 +1772,13 @@ mod tests {
         ),
         ("system-x86-64", "{root}/real-root/etc/bootsuccess"),
         ("system-x86-64", "{root}/real-root/etc/bootfail"),
+        ("server-x86-64", "{root}/selector-init"),
+        ("server-x86-64", "{root}/deployment-init"),
+        ("server-x86-64", "{root}/real-root/etc/shutdown"),
+        ("server-x86-64", "{root}/real-root/etc/rootcheck"),
+        ("server-x86-64", "{root}/real-root/etc/netup"),
+        ("server-x86-64", "{root}/real-root/etc/bootsuccess"),
+        ("server-x86-64", "{root}/real-root/etc/healthwatch"),
     ];
 
     /// True if `cmd` appears in `s` as a whole command word. Every
@@ -2349,11 +2364,13 @@ mod tests {
                     continue;
                 }
                 let guest = (stem.to_string(), path.clone());
-                let initramfs = matches!(stem, "system-x86-64" | "system-secret-vm-test")
-                    && matches!(
-                        path.as_str(),
-                        "{root}/selector-init" | "{root}/deployment-init"
-                    );
+                let initramfs = matches!(
+                    stem,
+                    "system-x86-64" | "system-secret-vm-test" | "server-x86-64"
+                ) && matches!(
+                    path.as_str(),
+                    "{root}/selector-init" | "{root}/deployment-init"
+                );
                 let expected = if initramfs {
                     "#!/bin/td-boot initramfs"
                 } else {
@@ -2396,9 +2413,11 @@ mod tests {
     #[test]
     fn boot_recipes_use_the_kernel_only_for_boot_artifacts() {
         let recipes = catalog::all();
-        for (stem, packed_kernel_references, copied_kernel_references) in
-            [("kexec-spike-x86-64", 1, 1), ("system-x86-64", 0, 1)]
-        {
+        for (stem, packed_kernel_references, copied_kernel_references) in [
+            ("kexec-spike-x86-64", 1, 1),
+            ("system-x86-64", 0, 1),
+            ("server-x86-64", 0, 1),
+        ] {
             let recipe = recipes
                 .iter()
                 .find(|(candidate, _)| *candidate == stem)

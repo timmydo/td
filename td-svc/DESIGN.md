@@ -398,9 +398,10 @@ table uses it where a dependency's failure makes the dependent
 meaningless rather than merely degraded — the graphical chain (`wayland
 requires=seat`, `terminal requires=wayland`, `bootsuccess
 requires=terminal`) and the session bus (`busd
-requires=seat,td-firstboot`) — and per **I5** it can never apply to a
-`tty=` service. An earlier version of this paragraph said no shipped
-unit needed it, which the graphical chain already contradicted.
+requires=seat,td-firstboot`), and on the server `bootsuccess
+requires=sshd,hostname` (§10, "Profiles") — and per **I5** it can never
+apply to a `tty=` service. An earlier version of this paragraph said no
+shipped unit needed it, which the graphical chain already contradicted.
 
 The broker runs through `exec-service-as tdb1000` in its system service
 leaf. Firstboot reserves its UID and prepares its protected runtime;
@@ -1586,6 +1587,77 @@ with `TIOCSCTTY`, so it and everything it execs carry the device in
 on the device the unit's `tty=` names — not on the child's own `tty_nr`,
 which is 0 because td-svc opens the console `O_NOCTTY` — and so reaches
 the login tree without touching the boot path at all.
+
+### Profiles
+
+The system recipe generates the table for one of two profiles. The
+desktop (`system-x86-64`) is everything above. The server
+(`server-x86-64`) runs the same supervisor, inittab and boot path. Its
+accounts are the desktop's root, primary (UID 1000), profiler and
+OpenSSH privilege-separation accounts, without the compositor, broker,
+portal, audio or installer accounts. Its principal table still
+reserves the primary session's identities, which the account preflight
+requires; no account holds them. Its table is the desktop's units
+restricted to what a headless machine needs: hostname, td-firstboot,
+rootcheck, the profiler and its evidence, netup, network, sshd and
+bootsuccess, plus the server's own healthwatch. Each shared unit is
+the desktop's stanza key for key, which a recipe test holds, except
+two. td-firstboot provisions the identity alone, with no application
+homes or session principals. bootsuccess requires sshd's readiness and
+the hostname instead of graphical readiness, so a candidate whose only
+way in does not listen is never acknowledged.
+
+The server has no greeter. No unit holds `tty=`, no console logs anyone
+in, and ttyS0 carries only boot output. Without a greeter there is no
+failed-candidate park, so bootfail is absent and healthwatch takes its
+place. It is ordered `after=bootsuccess` with no strict edge, so it
+runs once bootsuccess has decided: it succeeded, failed, timed out, or
+was skipped because sshd or the hostname failed. If the health record
+(`/run/td-boot-success-ok`) reads success, healthwatch prints
+`TD-SERVER-HEALTH-STEADY` and the machine stays up. Otherwise it prints
+`TD-SERVER-HEALTH-REBOOT` and asks td-svc to reboot. A candidate
+therefore spends its attempts unattended and td-boot's countdown falls
+back to the previous deployment (td-boot owns that contract). A
+machine with no console would otherwise hold an unreachable candidate
+until someone power-cycled it. No shipped path delivers a candidate to
+a server yet: it carries no updater, and an operator replaces the
+machine instead. The countdown governs the first such path to land,
+and today the oracle's installed fixture.
+
+An acknowledged deployment that fails health reboots too, so a fault
+that persists across boots repeats as a reboot loop, unbounded; a
+bound on consecutive reboots of an acknowledged deployment is a later
+refinement. Retrying is the only repair a headless machine can make
+itself, and I5's console has no server equivalent. Because a failure
+costs a reboot, a server's health transaction retries for its full
+ceiling by default, where the desktop's gives up sooner. Because
+bootsuccess requires sshd, an sshd whose first start fails or does
+not become ready in time fails the boot even if its restart would
+have recovered; on a server that is the right answer for a candidate
+and one extra reboot for an acknowledged deployment.
+
+`qemu-boot-server` boots both sequences. In the first a pending
+candidate is acknowledged, and every healthy boot runs until
+healthwatch's steady marker, so a record bootsuccess and healthwatch
+disagreed on would fail it. In the second every attempt a candidate
+gets is rebooted by healthwatch, until the previous deployment is
+selected.
+
+The shape check asserts the server's start order — profiler evidence
+and sshd before bootsuccess, and healthwatch after it, plus the sysinit
+edges both profiles share. It also sweeps `/bin` for every name the
+desktop links and the server does not, a list derived from both
+profiles' staging rather than written out. The server keeps what its
+own units and probes run (td-jail and its product configuration
+`/etc/td-app.conf`, git, ripgrep, fd and the uutils userland), the
+login-key record codec td-secret, cryptsetup and td-btrfs for the
+installer-shared volume tools, and td-net's source and Rust launchers
+so the machine can build td itself.
+
+No remote key reaches a server yet. Its sshd renders the policy
+td-login/TOKEN-LOGIN.md "SSH" describes, and nothing on the image
+writes the primary account's `~/.ssh/authorized_keys`, so only the
+boot's loopback self-test key is admitted.
 
 ## 11. Evicting a previous supervisor's services
 

@@ -225,15 +225,16 @@ td-recipe-eval list                  # list every recipe
 td-recipe-eval build-run <name>      # build one recipe into /td/store
 td-recipe-eval qemu-boot-session     # one offline graphical session (pass/fail)
 td-recipe-eval qemu-boot-system      # install/update/recovery boot sequence
+td-recipe-eval qemu-boot-server      # headless server image: health, unattended rollback
 td-recipe-eval qemu-install          # disposable offline ISO installation test
 td-recipe-eval qemu-boot-live        # live wizard installs a disk, which then boots through firmware
 ```
 
 `td-builder check integration` runs the system-level oracles —
-`qemu-boot-system`, `qemu-deploy-rollback`, `qemu-boot-live` and
-`qemu-install-system` — on the host; `td-builder main-integration run`
-runs it on main after landings, after every recipe check, and a branch's
-`ready` never does (`DEVELOPMENT.md`).
+`qemu-boot-system`, `qemu-boot-server`, `qemu-deploy-rollback`,
+`qemu-boot-live` and `qemu-install-system` — on the host;
+`td-builder main-integration run` runs it on main after landings, after
+every recipe check, and a branch's `ready` never does (`DEVELOPMENT.md`).
 
 To build a bootable live ISO of the system, signed with a key made for that
 ISO alone:

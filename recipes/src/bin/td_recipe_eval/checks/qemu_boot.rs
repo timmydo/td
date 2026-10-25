@@ -41,6 +41,7 @@ pub(crate) mod media;
 pub(crate) mod recovery_screen;
 pub(crate) mod secret;
 pub(crate) mod serial_shell;
+pub(crate) mod server;
 pub(crate) mod setup_input;
 pub(crate) mod test_iso;
 pub(crate) mod update;
@@ -3268,9 +3269,17 @@ pub(crate) struct VerifiedSelector(PathBuf);
 fn build_system(
     runner: &RecipeCheckRunner,
 ) -> Result<(PathBuf, VerifiedSelector, PathBuf), String> {
-    runner.prepare_recipe_target("system-x86-64")?;
-    let build_out = runner.build_plan("system-x86-64")?;
-    let system_tree = runner.ladder_out_from(&build_out, "system-x86-64")?;
+    build_system_stem(runner, "system-x86-64")
+}
+
+/// A system profile's kernel, verified selector and deployment directory.
+fn build_system_stem(
+    runner: &RecipeCheckRunner,
+    stem: &str,
+) -> Result<(PathBuf, VerifiedSelector, PathBuf), String> {
+    runner.prepare_recipe_target(stem)?;
+    let build_out = runner.build_plan(stem)?;
+    let system_tree = runner.ladder_out_from(&build_out, stem)?;
     let deployment = system_tree.join("deployment");
     let (bzimage, _, _) = verify_deployment(&deployment)?;
     let selector = verify_selector(&system_tree.join("boot"))?;
@@ -4822,6 +4831,26 @@ fn boot(
     boot_with_timeout(qemu, bzimage, initramfs, plan, scratch_base, boot_timeout())
 }
 
+/// `boot` for a profile that ships no applications: no feed is served.
+fn boot_headless(
+    qemu: &str,
+    bzimage: &Path,
+    initramfs: &Path,
+    plan: BootPlan<'_>,
+    scratch_base: &Path,
+) -> Result<BootResult, String> {
+    boot_source(
+        qemu,
+        BootSource::Headless {
+            kernel: bzimage,
+            initramfs,
+        },
+        plan,
+        scratch_base,
+        boot_timeout(),
+    )
+}
+
 #[derive(Clone, Copy)]
 enum FirmwareAttachment {
     Virtio,
@@ -4843,6 +4872,12 @@ enum BootSource<'a> {
         initramfs: &'a Path,
     },
     DirectReordered {
+        kernel: &'a Path,
+        initramfs: &'a Path,
+    },
+    /// A direct boot of a profile that ships no applications (the server),
+    /// and so is served no application feed.
+    Headless {
         kernel: &'a Path,
         initramfs: &'a Path,
     },
@@ -5141,8 +5176,11 @@ fn boot_source(
     // A boot that starts the system's applications fetches them from a
     // feed of the host's (APPLICATIONS.md §W.9), reached over the user
     // network and named on its line. The guard outlives QEMU's reaping.
-    let live = matches!(source, BootSource::LiveSetup { .. });
-    let feed = if feed::serves(live, plan.extra_append) {
+    let applications = !matches!(
+        source,
+        BootSource::LiveSetup { .. } | BootSource::Headless { .. }
+    );
+    let feed = if feed::serves(applications, plan.extra_append) {
         Some(feed::FeedServer::start()?)
     } else {
         None
@@ -5234,7 +5272,8 @@ fn boot_source(
     }
     match source {
         BootSource::Direct { kernel, initramfs }
-        | BootSource::DirectReordered { kernel, initramfs } => {
+        | BootSource::DirectReordered { kernel, initramfs }
+        | BootSource::Headless { kernel, initramfs } => {
             cmd.arg("-kernel")
                 .arg(kernel)
                 .arg("-initrd")

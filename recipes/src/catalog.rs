@@ -754,12 +754,20 @@ mod tests {
 
     #[test]
     fn the_deployment_has_an_external_debug_ceiling() {
-        for (stem, expected_scope, expected_report, expected_ceiling) in [(
-            "system-x86-64",
-            "deployment",
-            "{out}/deployment/debug-size",
-            td_engine::target_profile::DEPLOYMENT_DEBUG_CEILING_BYTES,
-        )] {
+        for (stem, expected_scope, expected_report, expected_ceiling) in [
+            (
+                "system-x86-64",
+                "deployment",
+                "{out}/deployment/debug-size",
+                td_engine::target_profile::DEPLOYMENT_DEBUG_CEILING_BYTES,
+            ),
+            (
+                "server-x86-64",
+                "deployment",
+                "{out}/deployment/debug-size",
+                td_engine::target_profile::DEPLOYMENT_DEBUG_CEILING_BYTES,
+            ),
+        ] {
             let recipe = lookup(stem).unwrap_or_else(|| panic!("missing recipe {stem}"));
             let sizes: Vec<(&str, &str, u64)> = recipe
                 .steps

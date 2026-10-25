@@ -480,8 +480,8 @@ never in the gate sandbox: it warms the system image's inputs and
 exports the declared Flathub refs into the host's feed (`warm
 --flathub`, APPLICATIONS.md §W.9), which the oracles' guests fetch
 Firefox and its runtime from, then runs
-`qemu-boot-system`, `qemu-deploy-rollback`, `qemu-boot-live` and
-`qemu-install-system`, each with a banner saying what it proves, its
+`qemu-boot-system`, `qemu-boot-server`, `qemu-deploy-rollback`,
+`qemu-boot-live` and `qemu-install-system`, each with a banner saying what it proves, its
 outcome and wall time, recorded in the check history as
 `integration:STEP` (`td-recipe-eval check-history integration`). On its
 own it runs only those steps; beside gate goals (`td-builder check check
@@ -542,8 +542,8 @@ selection prints that the tier is deferred to main, and names in its
 notes a change to the boot path — the code, manifest, lock or build
 script of td-boot, td-btrfs, td-firstboot, td-init, td-install,
 td-install-qemu-test, td-json, td-kexec, td-login, td-protector, td-sh,
-td-svc or td-tpm, or the recipe of the same name; the linux-x86-64 or
-system-x86-64 recipe; the
+td-svc or td-tpm, or the recipe of the same name; the linux-x86-64,
+system-x86-64 or server-x86-64 recipe; the
 oracles' code; or `builder/src/integration.rs`. The cost is that a
 boot-breaking change is found on main, after it lands. A branch that
 expects to touch the boot can run the tier by hand with `td-builder

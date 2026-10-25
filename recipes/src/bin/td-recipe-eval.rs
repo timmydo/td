@@ -463,6 +463,12 @@ fn main() {
                 die_runner(&e);
             }
         }
+        Some("qemu-boot-server") => {
+            let rest = args.get(2..).unwrap_or(&[]);
+            if let Err(e) = check_runner::qemu_boot_server_cli(rest) {
+                die_runner(&e);
+            }
+        }
         Some("qemu-deploy-rollback") => {
             let rest = args.get(2..).unwrap_or(&[]);
             if let Err(e) = check_runner::qemu_deploy_rollback_cli(rest) {

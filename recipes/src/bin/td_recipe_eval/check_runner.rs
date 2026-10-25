@@ -774,6 +774,10 @@ const ORACLES: &[(&str, &[&str])] = &[
         "qemu-boot-system",
         &["system-x86-64", "td-btrfs", "td-jail-seccomp-probe"],
     ),
+    (
+        "qemu-boot-server",
+        &["server-x86-64", "td-btrfs", "td-jail-seccomp-probe"],
+    ),
     ("qemu-boot-live", &["system-x86-64"]),
     ("qemu-deploy-rollback", &["system-x86-64", "td-btrfs"]),
     (
@@ -1095,6 +1099,28 @@ pub fn qemu_boot_system_cli(args: &[String]) -> Result<(), String> {
     warm_operator_inputs(&runner, targets);
     let _lock = lock_ladder_for_run(&runner)?;
     crate::checks::qemu_boot::run_system(&runner)
+}
+
+/// `td-recipe-eval qemu-boot-server [server-x86-64]` — the headless profile's
+/// boot proof: one persistent volume, booted through the selector to the
+/// deployment's health acknowledgement, with OpenSSH up and nothing graphical
+/// started. Host-side, like every qemu oracle.
+pub fn qemu_boot_server_cli(args: &[String]) -> Result<(), String> {
+    const STEM: &str = crate::checks::qemu_boot::server::STEM;
+    if args.len() > 1 || args.first().is_some_and(|stem| stem != STEM) {
+        return Err(format!("usage: qemu-boot-server [{STEM}]"));
+    }
+    oracle_host(false)?;
+    let targets = oracle_targets("qemu-boot-server")?;
+    ensure_targets_provenance(targets)?;
+    let root = env::current_dir().map_err(|error| format!("current dir: {error}"))?;
+    let name = scratch_name("qemu-boot", &[STEM]);
+    let runner = RecipeCheckRunner::new(root, &name)?
+        .with_streamed_progress()
+        .with_allowed_builds(oracle_reach(targets)?);
+    warm_operator_inputs(&runner, targets);
+    let _lock = lock_ladder_for_run(&runner)?;
+    crate::checks::qemu_boot::server::run(&runner)
 }
 
 /// One offline graphical session, with the full system boot evidence contract.
@@ -10077,6 +10103,7 @@ chmod 755 '{}'
             "qemu_install_system_cli",
             "qemu_boot_erofs_cli",
             "qemu_boot_system_cli",
+            "qemu_boot_server_cli",
             "qemu_boot_session_cli",
             "qemu_boot_net_cli",
             "qemu_boot_kexec_cli",
@@ -11513,6 +11540,7 @@ chmod 755 '{}'
             "qemu_boot_media_cli",
             "qemu_boot_net_cli",
             "qemu_boot_session_cli",
+            "qemu_boot_server_cli",
             "qemu_boot_system_cli",
             "qemu_boot_uefi_cli",
             "qemu_deploy_rollback_cli",

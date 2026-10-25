@@ -12,10 +12,11 @@ use std::process::{Child, Command, Stdio};
 const FEED_TOKEN: &str = td_engine::flathub_app::BOOT_FEED_TOKEN;
 
 /// Whether a boot starts the system's applications, and so needs a feed:
-/// every boot whose line carries the autotest token except a live one, whose
-/// session opens the installer alone.
-pub(super) fn serves(live: bool, extra_append: &str) -> bool {
-    !live
+/// every boot whose line carries the autotest token, unless its source
+/// starts none — a live medium's session opens the installer alone, and a
+/// headless profile ships no applications.
+pub(super) fn serves(applications: bool, extra_append: &str) -> bool {
+    applications
         && extra_append
             .split_ascii_whitespace()
             .any(|token| token == td_recipe::shared::AUTOTEST_CMDLINE_TOKEN)
@@ -123,14 +124,14 @@ mod tests {
     #[test]
     fn a_boot_that_starts_the_applications_is_told_its_feed() {
         let autotest = td_recipe::shared::AUTOTEST_CMDLINE_TOKEN;
-        assert!(serves(false, autotest));
-        assert!(serves(false, &format!("td.wait=1 {autotest}")));
+        assert!(serves(true, autotest));
+        assert!(serves(true, &format!("td.wait=1 {autotest}")));
         assert!(
-            !serves(true, autotest),
-            "a live session opens the installer"
+            !serves(false, autotest),
+            "a live session or headless profile starts no applications"
         );
-        assert!(!serves(false, ""));
-        assert!(!serves(false, &format!("x{autotest}")));
+        assert!(!serves(true, ""));
+        assert!(!serves(true, &format!("x{autotest}")));
         assert_eq!(append("", "http://10.0.2.2:1"), "td.feed=http://10.0.2.2:1");
         assert_eq!(
             append(autotest, "http://10.0.2.2:1"),

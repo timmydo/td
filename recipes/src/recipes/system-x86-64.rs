@@ -17,19 +17,20 @@ use crate::shared::{
     GIT_RUNTIME_MARKER, GREETER_MARKER, KERNEL_AUDIT_CMDLINE_TOKEN, NETTEST_CMDLINE_TOKEN,
     NETTEST_DEFAULT_HOST, NETTEST_DEFAULT_PORT, PERSIST_READ_CMDLINE_TOKEN,
     PERSIST_WRITE_CMDLINE_TOKEN, POST_RUST_SH, RIPGREP_FD_RUNTIME_MARKER,
-    ROOT_SSH_REFUSAL_KEY_FINGERPRINT, ROOT_SSH_REFUSED_MARKER, SETUP_INPUT_CMDLINE_TOKEN,
-    SSHD_MARKER, SU_ABSENT_MARKER, SYSTEM_BOOT_SUCCESS_MARKER, SYSTEM_DEPLOY_INSTALL_MARKER,
-    SYSTEM_DEPLOY_ROLLBACK_MARKER, SYSTEM_ETC_MUTABLE_MARKER, SYSTEM_ETC_RO_MARKER,
-    SYSTEM_LOGIN_DIRECTORY_MARKER, SYSTEM_NET_REACH_MARKER, SYSTEM_NET_RESOLVE_MARKER,
-    SYSTEM_NET_UP_MARKER, SYSTEM_PERSIST_READ_MARKER, SYSTEM_PERSIST_WRITE_MARKER,
-    SYSTEM_ROOT_RO_MARKER, SYSTEM_SHUTDOWN_MARKER, SYSTEM_STATE_OWNER_MARKER,
-    SYSTEM_STATE_WRITABLE_MARKER, TD_APPLICATIONS_PLACED_MARKER, TD_BUSD_RUNTIME_MARKER,
-    TD_FETCH_BOOT_MARKER, TD_FIREFOX_BOOT_MARKER, TD_FIREFOX_CONTENT_MARKER,
-    TD_FIREFOX_INPUT_FAILED_MARKER, TD_FIREFOX_SECCOMP_AUDIT_MARKER, TD_FIREFOX_SOAK_MARKER,
-    TD_FIREFOX_SUPPORT_MARKER, TD_INIT_RUNTIME_MARKER, TD_JAIL_KILL_REAPS_MARKER,
-    TD_JAIL_SECCOMP_PROBE_MARKER, TD_JAIL_TRANSITION_MARKER, TD_LOGIN_RUNTIME_MARKER,
-    TD_MAIL_BOOT_MARKER, TD_MAIL_ENTRY, TD_MAIL_NAME, TD_NEWS_BOOT_MARKER, TD_NEWS_ENTRY,
-    TD_NEWS_NAME, TD_PORTAL_REQUEST_RUNTIME_MARKER, TD_PORTAL_RUNTIME_MARKER,
+    ROOT_SSH_REFUSAL_KEY_FINGERPRINT, ROOT_SSH_REFUSED_MARKER, SERVER_HEALTH_REBOOT_MARKER,
+    SERVER_HEALTH_STEADY_MARKER, SETUP_INPUT_CMDLINE_TOKEN, SSHD_MARKER, SU_ABSENT_MARKER,
+    SYSTEM_BOOT_SUCCESS_MARKER, SYSTEM_DEPLOY_INSTALL_MARKER, SYSTEM_DEPLOY_ROLLBACK_MARKER,
+    SYSTEM_ETC_MUTABLE_MARKER, SYSTEM_ETC_RO_MARKER, SYSTEM_LOGIN_DIRECTORY_MARKER,
+    SYSTEM_NET_REACH_MARKER, SYSTEM_NET_RESOLVE_MARKER, SYSTEM_NET_UP_MARKER,
+    SYSTEM_PERSIST_READ_MARKER, SYSTEM_PERSIST_WRITE_MARKER, SYSTEM_ROOT_RO_MARKER,
+    SYSTEM_SHUTDOWN_MARKER, SYSTEM_STATE_OWNER_MARKER, SYSTEM_STATE_WRITABLE_MARKER,
+    TD_APPLICATIONS_PLACED_MARKER, TD_BUSD_RUNTIME_MARKER, TD_FETCH_BOOT_MARKER,
+    TD_FIREFOX_BOOT_MARKER, TD_FIREFOX_CONTENT_MARKER, TD_FIREFOX_INPUT_FAILED_MARKER,
+    TD_FIREFOX_SECCOMP_AUDIT_MARKER, TD_FIREFOX_SOAK_MARKER, TD_FIREFOX_SUPPORT_MARKER,
+    TD_INIT_RUNTIME_MARKER, TD_JAIL_KILL_REAPS_MARKER, TD_JAIL_SECCOMP_PROBE_MARKER,
+    TD_JAIL_TRANSITION_MARKER, TD_LOGIN_RUNTIME_MARKER, TD_MAIL_BOOT_MARKER, TD_MAIL_ENTRY,
+    TD_MAIL_NAME, TD_NEWS_BOOT_MARKER, TD_NEWS_ENTRY, TD_NEWS_NAME,
+    TD_PORTAL_REQUEST_RUNTIME_MARKER, TD_PORTAL_RUNTIME_MARKER,
     TD_PORTAL_UNAVAILABLE_RUNTIME_MARKER, TD_SANDBOX_KERNEL_MARKER, TD_SETUP_LIVE_MARKER,
     TD_TXT_RUNTIME_MARKER, TD_UTIL_RUNTIME_MARKER, UUTILS_RUNTIME_MARKER,
 };
@@ -185,9 +186,24 @@ struct ShippedApplication {
     runtime_recipe: Option<fn() -> Recipe>,
 }
 
+/// Which system a definition builds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Profile {
+    /// The graphical single-user system: seat, compositor, terminal, session
+    /// bus, portal, the shipped applications and the serial-console greeter.
+    Desktop,
+    /// The headless system (td-svc/DESIGN.md §10, "Profiles"): td-svc runs the
+    /// boot-glue units and OpenSSH, and nothing graphical is packed. No console
+    /// logs anyone in, and no elevation operation is granted.
+    Server,
+}
+
 /// The distro definition. EDIT THIS to tailor the system, then rebuild and
 /// `td-recipe-eval run`.
 struct SystemDef {
+    /// The recipe stem, and the name of its output.
+    stem: &'static str,
+    profile: Profile,
     hostname: &'static str,
     os_name: &'static str,
     os_version: &'static str,
@@ -469,8 +485,48 @@ fn valid_home(uid: u32, home: &str) -> bool {
     })
 }
 
+// Locked (`!`): no td-login path or sshd admits root
+// (APPLICATIONS.md §L.1, L7).
+const ROOT_ACCOUNT: User = User {
+    name: "root",
+    uid: 0,
+    gid: 0,
+    gecos: "root",
+    home: "/root",
+    shell: "/bin/sh",
+    groups: &[],
+    passwordless: false,
+    service_only: false,
+};
+
+const PROFILER_ACCOUNT: User = User {
+    name: PROFILER_USER,
+    uid: PROFILER_UID,
+    gid: PROFILER_GID,
+    gecos: "System Profiler",
+    home: "/home/profiler",
+    shell: "/bin/sh",
+    groups: &[],
+    passwordless: false,
+    service_only: false,
+};
+
+const PRIMARY_ACCOUNT: User = User {
+    name: "tester",
+    uid: 1000,
+    gid: 1000,
+    gecos: "Test User",
+    home: "/home/tester",
+    shell: "/bin/sh",
+    groups: &["wheel"],
+    passwordless: true,
+    service_only: false,
+};
+
 // ── EDIT THIS to tailor the distro ─────────────────────────────────────────────
 const SYSTEM: SystemDef = SystemDef {
+    stem: "system-x86-64",
+    profile: Profile::Desktop,
     hostname: "td",
     os_name: "td",
     os_version: "0.1",
@@ -485,30 +541,8 @@ const SYSTEM: SystemDef = SystemDef {
            Type 'exit' (or Ctrl-D) to power off the VM; Ctrl-A X quits qemu.\n\n",
     autologin: "tester",
     users: &[
-        // Locked (`!`): no td-login path or sshd admits root
-        // (APPLICATIONS.md §L.1, L7).
-        User {
-            name: "root",
-            uid: 0,
-            gid: 0,
-            gecos: "root",
-            home: "/root",
-            shell: "/bin/sh",
-            groups: &[],
-            passwordless: false,
-            service_only: false,
-        },
-        User {
-            name: PROFILER_USER,
-            uid: PROFILER_UID,
-            gid: PROFILER_GID,
-            gecos: "System Profiler",
-            home: "/home/profiler",
-            shell: "/bin/sh",
-            groups: &[],
-            passwordless: false,
-            service_only: false,
-        },
+        ROOT_ACCOUNT,
+        PROFILER_ACCOUNT,
         User {
             name: PORTAL_USER,
             uid: PORTAL_RESERVED_UID,
@@ -564,20 +598,32 @@ const SYSTEM: SystemDef = SystemDef {
             passwordless: false,
             service_only: true,
         },
-        User {
-            name: "tester",
-            uid: 1000,
-            gid: 1000,
-            gecos: "Test User",
-            home: "/home/tester",
-            shell: "/bin/sh",
-            groups: &["wheel"],
-            passwordless: true,
-            service_only: false,
-        },
+        PRIMARY_ACCOUNT,
     ],
     applications: SHIPPED_APPLICATIONS,
 };
+
+/// The server variant: the same boot path and primary account, no session
+/// service accounts, no graphical stack and no shipped applications
+/// (td-svc/DESIGN.md §10, "Profiles"). `autologin` names the primary account the
+/// health probes run as; no console logs it in.
+const SERVER: SystemDef = SystemDef {
+    stem: "server-x86-64",
+    profile: Profile::Server,
+    hostname: "td-server",
+    motd: "\n  td server - a source-built, Rust-first Linux.\n  \
+           td-svc supervises the system units and OpenSSH; nothing graphical runs.\n  \
+           The system is immutable: rebuild the image and replace the machine to change it.\n\n",
+    users: &[ROOT_ACCOUNT, PROFILER_ACCOUNT, PRIMARY_ACCOUNT],
+    applications: &[],
+    ..SYSTEM
+};
+
+impl SystemDef {
+    fn desktop(&self) -> bool {
+        self.profile == Profile::Desktop
+    }
+}
 
 const UI_USER: &str = "tester";
 const UI_UID: u32 = td_engine::application_spec::APPLICATION_UID;
@@ -1387,6 +1433,27 @@ const TD_SVC_UNITS: &[&str] = &[
     "greeter",
 ];
 
+/// The server's `TD_SVC_UNITS`: every unit `build_server_td_svc_conf` declares.
+const SERVER_TD_SVC_UNITS: &[&str] = &[
+    "hostname",
+    "td-firstboot",
+    "rootcheck",
+    "profiler",
+    "profiler-evidence",
+    "netup",
+    "network",
+    "bootsuccess",
+    "healthwatch",
+    "sshd",
+];
+
+fn td_svc_units(sys: &SystemDef) -> &'static [&'static str] {
+    match sys.profile {
+        Profile::Desktop => TD_SVC_UNITS,
+        Profile::Server => SERVER_TD_SVC_UNITS,
+    }
+}
+
 /// Each generated oneshot's `timeout=`.
 ///
 /// td-svc defaults one when a table omits it — a oneshot that hangs never settles, and
@@ -1459,6 +1526,8 @@ mod svc_timeouts {
     pub const BOOTSUCCESS: u32 = 1600;
     /// The park handshake: a grep and a 1s sleep, clamped to BOOT_FAIL_PARK_WAIT_SECS.
     pub const BOOTFAIL: u32 = 300;
+    /// One record read, then the reboot request, as bootfail's ends.
+    pub const HEALTHWATCH: u32 = 300;
 }
 
 /// What the firefox-input unit runs when a stage gives up: a marker the host
@@ -1502,7 +1571,135 @@ fn firefox_input_give_up() -> String {
 /// requires graphical readiness and hostname activation, so either failure
 /// prevents an update from being marked healthy. The
 /// serial console has no such dependency and remains available when graphics fail.
-fn build_td_svc_conf() -> String {
+fn build_td_svc_conf(sys: &SystemDef) -> String {
+    match sys.profile {
+        Profile::Desktop => build_desktop_td_svc_conf(),
+        Profile::Server => build_server_td_svc_conf(),
+    }
+}
+
+/// The server's table: the desktop's boot-glue, profiler, network and OpenSSH
+/// units, stanza for stanza (`server_units_are_the_desktops_stanzas` holds
+/// that), and a health target that requires what a server is for.
+///
+/// Left out, and why:
+///   every graphical, bus, portal, fetch and application unit, with their
+///     evidence units: nothing that serves them is packed;
+///   release-source and vm-guest/vm-power: in-guest self-update and the
+///     development VM bridge, neither of which an immutable server has;
+///   greeter: no console logs anyone in on a server, so ttyS0 carries boot
+///     output and nothing reads from it;
+///   bootfail: it parks a failed candidate through the greeter's handshake.
+///     healthwatch takes its place: it reboots a boot whose health did not
+///     record success, and that reboot moves a candidate to its next attempt.
+///
+/// td-firstboot provisions the identity only: there is no application home
+/// to seed and no session principal to enroll.
+///
+/// bootsuccess requires sshd's readiness (its loopback bind) and the
+/// hostname, so a candidate whose only way in does not listen is not marked
+/// healthy.
+fn build_server_td_svc_conf() -> String {
+    let sysinit = "hostname,td-firstboot,rootcheck,netup";
+    format!(
+        "# Generated by the server-x86-64 recipe. Edit build_server_td_svc_conf, not this file.\n\
+         #\n\
+         # PID 1 (/etc/inittab) mounts /dev, /proc and /sys, then respawns td-svc with\n\
+         # this table. Ordering lives here as a graph; `td-svc check` validates it at\n\
+         # image-build time.\n\
+         \n\
+         [hostname]\n\
+         type=oneshot\n\
+         exec=/bin/td-firstboot hostname\n\
+         timeout={hostname}\n\
+         \n\
+         [td-firstboot]\n\
+         type=oneshot\n\
+         exec=/bin/td-firstboot provision\n\
+         after=hostname\n\
+         timeout={firstboot}\n\
+         \n\
+         [rootcheck]\n\
+         type=oneshot\n\
+         exec=/etc/rootcheck\n\
+         after=td-firstboot\n\
+         timeout={rootcheck}\n\
+         \n\
+         [profiler]\n\
+         type=daemon\n\
+         exec=/bin/td-profiler collect --uid {profiler_uid} --gid {profiler_read_gid} --duration-secs {profiler_capture_secs} --deployment {{out}} --profiler-build {{in:td-profiler}}\n\
+         after=rootcheck\n\
+         requires=rootcheck\n\
+         restart=on-failure\n\
+         log=/var/log/svc/td-profiler.log\n\
+         console=yes\n\
+         \n\
+         [profiler-evidence]\n\
+         type=oneshot\n\
+         exec=/bin/td-profiler evidence {profiler_capture_root} --timeout-secs {profiler_evidence_timeout_secs} --attribution-timeout-secs {profiler_attribution_evidence_timeout_secs} --uid {profiler_uid} --gid {profiler_read_gid} --attribution-cmdline-token {profiler_attribution_cmdline_token}\n\
+         after=profiler\n\
+         requires=profiler\n\
+         timeout={profiler_evidence_service_timeout_secs}\n\
+         log=/var/log/svc/td-profiler-evidence.log\n\
+         console=yes\n\
+         \n\
+         [netup]\n\
+         type=oneshot\n\
+         exec=/etc/netup\n\
+         after=rootcheck\n\
+         timeout={netup}\n\
+         \n\
+         [network]\n\
+         type=daemon\n\
+         exec=/bin/td-netd watch\n\
+         after=netup\n\
+         restart=always\n\
+         log=/var/log/svc/network.log\n\
+         console=yes\n\
+         \n\
+         [bootsuccess]\n\
+         type=oneshot\n\
+         exec=/etc/bootsuccess\n\
+         after={sysinit},profiler-evidence,sshd\n\
+         requires=sshd,hostname\n\
+         timeout={bootsuccess}\n\
+         \n\
+         # Ordering, not a strict edge: bootsuccess failing, timing out or\n\
+         # being skipped over an unmet requirement is a decision too, and\n\
+         # each one ends in a reboot that spends the candidate's attempt.\n\
+         [healthwatch]\n\
+         type=oneshot\n\
+         exec=/etc/{HEALTHWATCH_ETC_NAME}\n\
+         after=bootsuccess\n\
+         timeout={healthwatch}\n\
+         \n\
+         [sshd]\n\
+         type=daemon\n\
+         exec=/bin/sshd -D -e -f {SSHD_CONFIG}\n\
+         after={sysinit}\n\
+         ready=/bin/td-netd reach 127.0.0.1 22\n\
+         restart=always\n\
+         log=/var/log/svc/sshd.log\n\
+         console=yes\n\
+         stop=leaf\n",
+        hostname = svc_timeouts::HOSTNAME,
+        firstboot = svc_timeouts::FIRSTBOOT,
+        rootcheck = svc_timeouts::ROOTCHECK,
+        netup = svc_timeouts::NETUP,
+        bootsuccess = svc_timeouts::BOOTSUCCESS,
+        healthwatch = svc_timeouts::HEALTHWATCH,
+        profiler_uid = PROFILER_UID,
+        profiler_read_gid = PROFILER_READ_GID,
+        profiler_capture_secs = PROFILER_CAPTURE_SECS,
+        profiler_capture_root = PROFILER_CAPTURE_ROOT,
+        profiler_evidence_timeout_secs = PROFILER_EVIDENCE_TIMEOUT_SECS,
+        profiler_attribution_evidence_timeout_secs = PROFILER_ATTRIBUTION_EVIDENCE_TIMEOUT_SECS,
+        profiler_evidence_service_timeout_secs = PROFILER_EVIDENCE_SERVICE_TIMEOUT_SECS,
+        profiler_attribution_cmdline_token = AUTOTEST_CMDLINE_TOKEN,
+    )
+}
+
+fn build_desktop_td_svc_conf() -> String {
     // The sysinit set, in one place: every post-sysinit unit names all of it.
     let sysinit = "hostname,td-firstboot,rootcheck,netup";
     format!(
@@ -2424,8 +2621,11 @@ fn build_deployment_init(sys: &SystemDef) -> String {
         "primary_home=$(/bin/td-firstboot prepare-primary-profile /sysroot) || exit 1\n\
          {LOGIN_DIRECTORY_STEP}\n\
          /bin/td-firstboot render-primary-sshd /sysroot || exit 1\n\
-         /bin/umount /proc\n\
-         downloads=\"$primary_home/Downloads\"\n\
+         /bin/umount /proc\n"
+    ));
+    if sys.desktop() {
+        init.push_str(&format!(
+            "downloads=\"$primary_home/Downloads\"\n\
          if /bin/td-util readlink \"/sysroot$downloads\" >/dev/null 2>&1; then\n\
            echo 'td-init: Firefox Downloads source is a symlink; grant disabled' >&2\n\
          elif /bin/td-util test -e \"/sysroot$downloads\" && ! /bin/td-util test -d \"/sysroot$downloads\"; then\n\
@@ -2438,14 +2638,17 @@ fn build_deployment_init(sys: &SystemDef) -> String {
            /bin/td-util chmod 0600 /sysroot{FIREFOX_XDG_MOUNT_MARKER}\n\
          else\n\
            echo 'td-init: cannot prepare Firefox Downloads source; grant disabled' >&2\n\
-         fi\n\
-         /bin/sh -c 'umask 077; /bin/td-util mkdir -p /sysroot/var/root'\n\
+         fi\n"
+        ));
+    }
+    init.push_str(
+        "/bin/sh -c 'umask 077; /bin/td-util mkdir -p /sysroot/var/root'\n\
          /bin/td-util rm -rf /sysroot/var/run\n\
          /bin/td-util ln -s /run /sysroot/var/run\n\
          /bin/td-util chown 0:0 /sysroot/var/log /sysroot/var/root\n\
          /bin/td-util chmod 0755 /sysroot/var/log\n\
-         /bin/td-util chmod 0700 /sysroot/var/root\n"
-    ));
+         /bin/td-util chmod 0700 /sysroot/var/root\n",
+    );
     // Each persistent home is its user's from the moment it exists: td-firstboot
     // provisions the applications' configuration into it at sysinit,
     // before rootcheck, and refuses a home the user does not own.
@@ -2501,7 +2704,18 @@ fn build_tty_session() -> String {
         .into()
 }
 
-fn build_shutdown() -> String {
+fn build_shutdown(sys: &SystemDef) -> String {
+    if !sys.desktop() {
+        // No application or portal files to release and no Downloads bind.
+        return format!(
+            "#!/bin/sh\n\
+             ok=1\n\
+             /bin/td-init sync || {{ echo 'td-shutdown: sync failed' >&2; ok=0; }}\n\
+             /bin/umount /var || {{ echo 'td-shutdown: umount /var failed' >&2; ok=0; }}\n\
+             /bin/umount -a -r --exclude /run || {{ echo 'td-shutdown: final unmount failed' >&2; ok=0; }}\n\
+             /bin/td-util test \"$ok\" = 1 && echo {SYSTEM_SHUTDOWN_MARKER}\n"
+        );
+    }
     // Run by td-svc once every service is down, immediately before it hands off to the
     // power applet. Keep this a strict tripwire, but attempt every safety step after
     // any failure.
@@ -3175,6 +3389,13 @@ fn td_util_probe_command(applet: &str) -> String {
 }
 
 fn build_bootsuccess(sys: &SystemDef) -> String {
+    // A failed health transaction reboots a server (healthwatch), so a
+    // token-free server boot retries its probes for the full ceiling.
+    let retry_default = if sys.desktop() {
+        BOOT_SUCCESS_RETRY_SECS
+    } else {
+        BOOT_SUCCESS_RETRY_MAX_SECS
+    };
     let mut uutils_behavior_probes = String::new();
     for probe in UUTILS_BEHAVIOR_PROBES {
         uutils_behavior_probes.push_str(&uutils_behavior_probe(probe));
@@ -3215,6 +3436,24 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
     let channel = td_boot_protocol::VOLUME_CHANNEL_DIR;
     let idle_channel = crate::shared::DEPLOY_IDLE_CHANNEL;
     let update = td_boot_protocol::UPDATE_VERB;
+    // The running session bus is a desktop health leg, with its grace sweeps;
+    // a server packs no broker.
+    let (busd_probe, busd_ready) = if sys.desktop() {
+        (
+            format!(
+                "if {PRIMARY_PROBE_LAUNCHER} /bin/sh -c \
+                 'b=$(/bin/td-busd probe {SESSION_BUS_SOCKET} 2>&1) || \
+                 {{ echo \"td-busd: the session bus did not answer on {SESSION_BUS_SOCKET}: \
+                 $b\"; \
+                 exit 1; }}'; then \
+                 [ \"$mtb\" = 1 ] || {{ echo {TD_BUSD_RUNTIME_MARKER}; mtb=1; }}; \
+                 else btb=$((btb+1)); fi; "
+            ),
+            "&& { [ \"$mtb\" = 1 ] || [ \"$btb\" -ge \"$bg\" ]; } ",
+        )
+    } else {
+        (String::new(), "")
+    };
     // The human may read its private self-test key but must not own the public
     // AuthorizedKeysFile that grants it access. Under the QEMU autotest token, a
     // separately preseeded root-only fixture authorizes a loopback root key in the
@@ -3223,21 +3462,21 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
     format!(
         "#!/bin/sh\n\
          set -f\n\
-         finish() {{ /bin/td-util printf '%s\\n' \"$1\" > /run/td-boot-success-ok; \
-         /bin/td-util chmod 0644 /run/td-boot-success-ok; }}\n\
-         fail() {{ finish td-boot-failure-v1; exit 1; }}\n\
+         finish() {{ /bin/td-util printf '%s\\n' \"$1\" > {HEALTH_RECORD}; \
+         /bin/td-util chmod 0644 {HEALTH_RECORD}; }}\n\
+         fail() {{ finish {HEALTH_RECORD_FAILURE}; exit 1; }}\n\
          /bin/grep -q -F '{BOOT_FAIL_TARGET_CMDLINE_TOKEN}' /proc/cmdline && exit 0\n\
          /bin/td-util test \"$(/bin/td-util cat /run/td-rootcheck-ok 2>/dev/null)\" = td-rootcheck-v1 || fail\n\
          {health_user_setup}\n\
          deployment=$(/bin/td-util cat /run/td-deployment 2>/dev/null)\n\
          /bin/td-util test -n \"$deployment\" || fail\n\
-         wait={BOOT_SUCCESS_RETRY_SECS}; refusal_fixture=0\n\
+         wait={retry_default}; refusal_fixture=0\n\
          for token in $(/bin/td-util cat /proc/cmdline); do \
          case \"$token\" in \
          {AUTOTEST_CMDLINE_TOKEN}) refusal_fixture=1;; \
          {BOOT_SUCCESS_WAIT_CMDLINE_PREFIX}*) \
          wait=${{token#{BOOT_SUCCESS_WAIT_CMDLINE_PREFIX}}};; esac; done\n\
-         case \"$wait\" in ''|*[!0-9]*|0) wait={BOOT_SUCCESS_RETRY_SECS};; esac\n\
+         case \"$wait\" in ''|*[!0-9]*|0) wait={retry_default};; esac\n\
          [ \"$wait\" -gt {BOOT_SUCCESS_RETRY_MAX_SECS} ] && wait={BOOT_SUCCESS_RETRY_MAX_SECS}\n\
          /bin/rm -f /run/td-ssh-selftest /run/td-ssh-selftest.pub \
          {SSHD_SELFTEST_AUTHORIZED_KEYS} /run/td-ssh-known-hosts\n\
@@ -3437,20 +3676,12 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          if {PRIMARY_PROBE_LAUNCHER} /bin/sh -c \
          '{td_txt_probes}[ \"$t\" = 1 ]'; then \
          [ \"$mtt\" = 1 ] || {{ echo {TD_TXT_RUNTIME_MARKER}; mtt=1; }}; else healthy=0; fi; \
-         if {PRIMARY_PROBE_LAUNCHER} /bin/sh -c \
-         'b=$(/bin/td-busd probe {SESSION_BUS_SOCKET} 2>&1) || \
-         {{ echo \"td-busd: the session bus did not answer on {SESSION_BUS_SOCKET}: \
-         $b\"; \
-         exit 1; }}'; then \
-         [ \"$mtb\" = 1 ] || {{ echo {TD_BUSD_RUNTIME_MARKER}; mtb=1; }}; \
-         else btb=$((btb+1)); fi; \
-         [ \"$msk\" = 1 ] || healthy=0; \
+         {busd_probe}[ \"$msk\" = 1 ] || healthy=0; \
          [ \"$mtj\" = 1 ] || healthy=0; \
          [ \"$mtk\" = 1 ] || healthy=0; \
          [ \"$mts\" = 1 ] || healthy=0; \
          if [ \"$healthy\" = 1 ] \
-         && {{ [ \"$mtb\" = 1 ] || [ \"$btb\" -ge \"$bg\" ]; }} \
-         && /bin/td-boot on-volume success /run/td-update \"$deployment\" >/run/td-success-id; then \
+         {busd_ready}&& /bin/td-boot on-volume success /run/td-update \"$deployment\" >/run/td-success-id; then \
          if /bin/grep -q -F '{DEPLOY_INSTALL_CMDLINE_TOKEN}' /proc/cmdline; then \
          if /bin/td-boot on-volume {update} /run/td-update /run/td-volume \
          /run/td-volume/{channel} /run/td-volume/{wrong_key} \
@@ -3494,7 +3725,7 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          fi; \
          if [ \"$healthy\" = 1 ]; then \
          echo {SYSTEM_BOOT_SUCCESS_MARKER}; \
-         finish td-boot-success-v1; exit 0; fi; \
+         finish {HEALTH_RECORD_SUCCESS}; exit 0; fi; \
          fi; \
          n=$((n+1)); /bin/td-util sleep 1; \
          done\n\
@@ -3538,6 +3769,18 @@ fn build_profile(sys: &SystemDef) -> String {
     // Just /bin — the store-native symlink farm. There is no /usr or /sbin in this image
     // (every /bin entry resolves into /td/store), so keep PATH honest and minimal.
     s.push_str("export PATH=/bin\n");
+    if !sys.desktop() {
+        // A server's login shells are OpenSSH sessions: no compositor
+        // runtime to name, no greeter to report and no session to park.
+        s.push_str("export PS1='\\u@\\h:\\w\\$ '\n");
+        s.push_str("cat <<'__TD_MOTD__'\n");
+        s.push_str(sys.motd);
+        if !sys.motd.ends_with('\n') {
+            s.push('\n');
+        }
+        s.push_str("__TD_MOTD__\n");
+        return s;
+    }
     s.push_str(&format!("export XDG_RUNTIME_DIR=/run/user/{UI_UID}\n"));
     s.push_str(&format!("export WAYLAND_DISPLAY={WAYLAND_SOCKET}\n"));
     s.push_str("export PS1='\\u@\\h:\\w\\$ '\n");
@@ -3601,18 +3844,18 @@ fn build_profile(sys: &SystemDef) -> String {
          input_required=0; case \" $(/bin/td-util cat /proc/cmdline) \" in \
          *\" {firefox_input_cmdline_token} \"*) input_required=1;; esac; \
          n=0; firefox_wait=0; while [ \"$n\" -lt \"$wait\" ]; do \
-         status=$(/bin/td-util cat /run/td-boot-success-ok 2>/dev/null); \
+         status=$(/bin/td-util cat {HEALTH_RECORD} 2>/dev/null); \
          firefox=$(/bin/td-util cat {firefox_evidence_path} 2>/dev/null); \
          firefox_complete=$(/bin/td-util cat {firefox_completion_path} 2>/dev/null); \
          input_ok=1; if [ \"$input_required\" = 1 ]; then input_ok=0; \
          input=$(/bin/td-util cat {firefox_input_completion_path} 2>/dev/null); \
          [ \"$input\" = {firefox_input_completion} ] && input_ok=1; fi; \
-         [ \"$status\" = td-boot-success-v1 ] && [ \"$firefox\" = {firefox_evidence} ] && \
+         [ \"$status\" = {HEALTH_RECORD_SUCCESS} ] && [ \"$firefox\" = {firefox_evidence} ] && \
          [ \"$firefox_complete\" = {firefox_completion} ] && [ \"$input_ok\" = 1 ] && break; \
-         if [ \"$status\" = td-boot-success-v1 ]; then \
+         if [ \"$status\" = {HEALTH_RECORD_SUCCESS} ]; then \
          firefox_wait=$((firefox_wait+1)); \
          [ \"$firefox_wait\" -ge {firefox_greeter_wait} ] && break; fi; \
-         [ \"$status\" = td-boot-failure-v1 ] && break; \
+         [ \"$status\" = {HEALTH_RECORD_FAILURE} ] && break; \
          n=$((n+1)); /bin/td-util sleep 1; done; \
          exit 0; fi\n",
         firefox_evidence = FIREFOX_EVIDENCE,
@@ -3741,6 +3984,16 @@ struct ImmutableEtc {
     /// Which reader only knows the `/etc` name, and why the store path cannot
     /// be given to it directly.
     why: &'static str,
+    /// Whether only the desktop packs the target.
+    desktop_only: bool,
+}
+
+/// The `IMMUTABLE_ETC` entries `sys` packs.
+fn immutable_etc(sys: &SystemDef) -> Vec<&'static ImmutableEtc> {
+    IMMUTABLE_ETC
+        .iter()
+        .filter(|entry| sys.desktop() || !entry.desktop_only)
+        .collect()
 }
 
 const IMMUTABLE_ETC: &[ImmutableEtc] = &[
@@ -3749,6 +4002,7 @@ const IMMUTABLE_ETC: &[ImmutableEtc] = &[
         target: "{in:tzdata}/share/zoneinfo",
         why: "The installer settings consumer needs a stable zoneinfo \
               path because its binary cannot name a content-addressed data hash",
+        desktop_only: false,
     },
     ImmutableEtc {
         etc: "terminfo",
@@ -3756,12 +4010,14 @@ const IMMUTABLE_ETC: &[ImmutableEtc] = &[
         why: "ncurses resolves TERM through TERMINFO, and td-term hands its child \
               TERMINFO=/etc/terminfo because a content-addressed store path is not \
               a name any child could have been given",
+        desktop_only: false,
     },
     ImmutableEtc {
         etc: "ssl/certs/ca-certificates.crt",
         target: "{in:ca-certificates}/share/ca-certificates/ca-bundle.crt",
         why: "The static curl transport used by Git needs this CA bundle path, \
               while the pinned Mozilla extract remains immutable store content",
+        desktop_only: false,
     },
     ImmutableEtc {
         etc: "fonts/jetbrains-mono-nerd",
@@ -3769,6 +4025,7 @@ const IMMUTABLE_ETC: &[ImmutableEtc] = &[
         why: "td-ui programs read their outline face by a fixed name, which a \
               jailed program under static-runtime spells the same way; a \
               content-addressed store path is neither",
+        desktop_only: true,
     },
 ];
 
@@ -3850,12 +4107,12 @@ fn build_ssh_config() -> String {
 /// Every parent directory needed by either `/etc` table, including intermediate
 /// parents. The same list drives staging and the fail-closed directory and symlink
 /// sweeps, so adding a nested immutable name cannot create an unchecked subtree.
-fn etc_dirs() -> Vec<&'static str> {
+fn etc_dirs(sys: &SystemDef) -> Vec<&'static str> {
     let mut dirs = Vec::new();
     for path in MUTABLE_ETC
         .iter()
         .map(|entry| entry.etc)
-        .chain(IMMUTABLE_ETC.iter().map(|entry| entry.etc))
+        .chain(immutable_etc(sys).into_iter().map(|entry| entry.etc))
     {
         for (index, _) in path.match_indices('/') {
             if let Some(dir) = path.get(..index) {
@@ -4148,6 +4405,9 @@ fn build_bus_application_policy(sys: &SystemDef) -> Result<String, String> {
 /// marks the ones getty/init reference as executables. Shared by the real-root staging
 /// (written under `{root}/real-root/etc`) and the shape check (which asserts they landed).
 fn etc_files(sys: &SystemDef) -> Result<Vec<(&'static str, String, bool)>, String> {
+    if !sys.desktop() {
+        return Ok(server_etc_files(sys));
+    }
     Ok(vec![
         (
             application_etc_name(BUS_APPLICATION_POLICY),
@@ -4187,14 +4447,14 @@ fn etc_files(sys: &SystemDef) -> Result<Vec<(&'static str, String, bool)>, Strin
             false,
         ),
         ("inittab", build_inittab(), false),
-        (td_svc_conf_etc_name(), build_td_svc_conf(), false),
+        (td_svc_conf_etc_name(), build_td_svc_conf(sys), false),
         ("profile", build_profile(sys), false),
         // Executable glue (mode 0755): getty execs autologin; init respawns tty-session
         // and runs rootcheck at sysinit. They live in /etc so /bin stays a pure
         // store-symlink farm.
         ("autologin", build_autologin(sys)?, true),
         ("tty-session", build_tty_session(), true),
-        ("shutdown", build_shutdown(), true),
+        ("shutdown", build_shutdown(sys), true),
         (ROOTCHECK_ETC_NAME, build_rootcheck(sys), true),
         ("netup", build_netup(), true),
         ("firefox-tls-setup", build_firefox_tls_setup(), true),
@@ -4203,6 +4463,73 @@ fn etc_files(sys: &SystemDef) -> Result<Vec<(&'static str, String, bool)>, Strin
         ("bootsuccess", build_bootsuccess(sys), true),
         ("bootfail", build_bootfail(), true),
     ])
+}
+
+/// The server's generated /etc: the desktop's set without the session, bus,
+/// portal, application and elevation tables, the greeter's glue, the Firefox
+/// fixtures and the failed-candidate park, none of which a server runs.
+fn server_etc_files(sys: &SystemDef) -> Vec<(&'static str, String, bool)> {
+    vec![
+        ("passwd", build_passwd(sys), false),
+        (
+            application_etc_name(PRINCIPALS_PATH),
+            build_principals(sys),
+            false,
+        ),
+        ("group", build_group(sys), false),
+        (SHADOW_ETC_NAME, build_shadow(sys), false),
+        ("hostname-default", format!("{}\n", sys.hostname), false),
+        ("os-release", build_os_release(sys), false),
+        ("ssh/ssh_config", build_ssh_config(), false),
+        ("mutable-state", build_mutable_state(), false),
+        (
+            application_etc_name(PROFILER_APPLICATION_ROOTS),
+            profiler_application_roots(sys),
+            false,
+        ),
+        // td-jail keeps its product mode: the file's presence is what
+        // refuses `--host` and reserves `workspace` to td's account.
+        (
+            application_etc_name(APPLICATION_CONFIG),
+            build_application_config(),
+            false,
+        ),
+        ("inittab", build_inittab(), false),
+        (td_svc_conf_etc_name(), build_td_svc_conf(sys), false),
+        ("profile", build_profile(sys), false),
+        ("shutdown", build_shutdown(sys), true),
+        (ROOTCHECK_ETC_NAME, build_rootcheck(sys), true),
+        ("netup", build_netup(), true),
+        ("bootsuccess", build_bootsuccess(sys), true),
+        (HEALTHWATCH_ETC_NAME, build_healthwatch(), true),
+    ]
+}
+
+/// The server's failed-health reboot (td-svc/DESIGN.md §10, "Profiles").
+const HEALTHWATCH_ETC_NAME: &str = "healthwatch";
+
+/// The health transaction's record: bootsuccess writes one of the two values
+/// on its way out, and the desktop session and the server's healthwatch read
+/// it, so all three name it here. td-secret's login VM fixture
+/// (`login_system_vm.rs`) reads it too, with its own literals.
+const HEALTH_RECORD: &str = "/run/td-boot-success-ok";
+const HEALTH_RECORD_SUCCESS: &str = "td-boot-success-v1";
+const HEALTH_RECORD_FAILURE: &str = "td-boot-failure-v1";
+
+/// Runs once bootsuccess has decided, whatever it decided: a recorded success
+/// ends it, anything else asks td-svc to reboot, so an unacknowledged
+/// candidate's boot, whose attempt td-boot consumed at selection, ends and
+/// the next selection counts down until td-boot can fall back.
+/// A server has no console to repair it from and no greeter to park.
+fn build_healthwatch() -> String {
+    format!(
+        "#!/bin/sh\n\
+         set -f\n\
+         if [ \"$(/bin/td-util cat {HEALTH_RECORD} 2>/dev/null)\" = {HEALTH_RECORD_SUCCESS} ]; then \
+         echo {SERVER_HEALTH_STEADY_MARKER}; exit 0; fi\n\
+         echo {SERVER_HEALTH_REBOOT_MARKER}\n\
+         exec /bin/td-svc reboot >/dev/console 2>&1\n"
+    )
 }
 
 /// The login-key tier marker (td-login/TOKEN-LOGIN.md, "Deployments"): the
@@ -4447,14 +4774,18 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
         from: "{in:td-firstboot}".into(),
         dest: "{root}/real-root{in:td-firstboot}".into(),
     });
-    steps.push(Step::CopyTree {
-        from: "{in:td-authd}".into(),
-        dest: "{root}/real-root{in:td-authd}".into(),
-    });
-    steps.push(Step::Symlink {
-        target: "{in:td-authd}/bin/td-authd".into(),
-        link: "{root}/real-root/bin/td-authd".into(),
-    });
+    // The session and elevation authority: a server has no session to serve
+    // and grants no elevation.
+    if sys.desktop() {
+        steps.push(Step::CopyTree {
+            from: "{in:td-authd}".into(),
+            dest: "{root}/real-root{in:td-authd}".into(),
+        });
+        steps.push(Step::Symlink {
+            target: "{in:td-authd}/bin/td-authd".into(),
+            link: "{root}/real-root/bin/td-authd".into(),
+        });
+    }
     // td-login the same way, and for the same reason as td-util plus one of its own: a
     // `login` that cannot run without the dynamic closure locks an operator out of the
     // console exactly when the closure is what broke.
@@ -4475,158 +4806,170 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
         from: "{in:td-profiler}".into(),
         dest: "{root}/real-root{in:td-profiler}".into(),
     });
-    steps.push(Step::CopyTree {
-        from: "{in:td-taskmgr}".into(),
-        dest: "{root}/real-root{in:td-taskmgr}".into(),
-    });
-    steps.push(Step::Symlink {
-        target: "{in:td-taskmgr}/bin/td-taskmgr".into(),
-        link: "{root}/real-root/bin/td-taskmgr".into(),
-    });
-    // td-review, the integrator's review and landing window: a static
-    // system-tree program over the image's own `/bin/git`.
-    steps.push(Step::CopyTree {
-        from: "{in:td-review}".into(),
-        dest: "{root}/real-root{in:td-review}".into(),
-    });
-    steps.push(Step::Symlink {
-        target: "{in:td-review}/bin/td-review".into(),
-        link: "{root}/real-root/bin/td-review".into(),
-    });
-    // td-agent, the coding agent's window (td-agent/DESIGN.md §8): a static
-    // system-tree program of td's account that runs its tools through
-    // `/bin/td-jail --workspace` and `/bin/td-txt`, its workspaces' network
-    // through the egress relay below, and its model requests through the
-    // fetch service.
-    steps.push(Step::CopyTree {
-        from: "{in:td-agent}".into(),
-        dest: "{root}/real-root{in:td-agent}".into(),
-    });
-    steps.push(Step::Symlink {
-        target: "{in:td-agent}/bin/td-agent".into(),
-        link: "{root}/real-root/bin/td-agent".into(),
-    });
-    // td-term, the terminal (td-term/DESIGN.md): a static system-tree program
-    // the session starts and the launcher opens, and its compiled terminfo
-    // entry, a data package `/etc/terminfo` names.
-    steps.push(Step::CopyTree {
-        from: "{in:td-term}".into(),
-        dest: "{root}/real-root{in:td-term}".into(),
-    });
-    steps.push(Step::Symlink {
-        target: "{in:td-term}/bin/td-term".into(),
-        link: "{root}/real-root/bin/td-term".into(),
-    });
+    // The td-ui window programs, the terminal among them, have no display
+    // on a server. td-term's terminfo entry stays: an SSH client running in
+    // td-term names TERM=td-term.
+    if sys.desktop() {
+        steps.push(Step::CopyTree {
+            from: "{in:td-taskmgr}".into(),
+            dest: "{root}/real-root{in:td-taskmgr}".into(),
+        });
+        steps.push(Step::Symlink {
+            target: "{in:td-taskmgr}/bin/td-taskmgr".into(),
+            link: "{root}/real-root/bin/td-taskmgr".into(),
+        });
+        // td-review, the integrator's review and landing window: a static
+        // system-tree program over the image's own `/bin/git`.
+        steps.push(Step::CopyTree {
+            from: "{in:td-review}".into(),
+            dest: "{root}/real-root{in:td-review}".into(),
+        });
+        steps.push(Step::Symlink {
+            target: "{in:td-review}/bin/td-review".into(),
+            link: "{root}/real-root/bin/td-review".into(),
+        });
+        // td-agent, the coding agent's window (td-agent/DESIGN.md §8): a static
+        // system-tree program of td's account that runs its tools through
+        // `/bin/td-jail --workspace` and `/bin/td-txt`, its workspaces' network
+        // through the egress relay below, and its model requests through the
+        // fetch service.
+        steps.push(Step::CopyTree {
+            from: "{in:td-agent}".into(),
+            dest: "{root}/real-root{in:td-agent}".into(),
+        });
+        steps.push(Step::Symlink {
+            target: "{in:td-agent}/bin/td-agent".into(),
+            link: "{root}/real-root/bin/td-agent".into(),
+        });
+        // td-term, the terminal (td-term/DESIGN.md): a static system-tree program
+        // the session starts and the launcher opens, and its compiled terminfo
+        // entry, a data package `/etc/terminfo` names.
+        steps.push(Step::CopyTree {
+            from: "{in:td-term}".into(),
+            dest: "{root}/real-root{in:td-term}".into(),
+        });
+        steps.push(Step::Symlink {
+            target: "{in:td-term}/bin/td-term".into(),
+            link: "{root}/real-root/bin/td-term".into(),
+        });
+    }
     steps.push(Step::CopyTree {
         from: "{in:td-term-terminfo}".into(),
         dest: "{root}/real-root{in:td-term-terminfo}".into(),
     });
-    // td-photo, the photo tool, a static system-tree program run from the
-    // terminal (td-photo/DESIGN.md).
-    steps.push(Step::CopyTree {
-        from: "{in:td-photo}".into(),
-        dest: "{root}/real-root{in:td-photo}".into(),
-    });
-    steps.push(Step::Symlink {
-        target: "{in:td-photo}/bin/td-photo".into(),
-        link: "{root}/real-root/bin/td-photo".into(),
-    });
-    // td-pass, the encrypted notebook (td-pass/DESIGN.md): the same static
-    // executable a foreign host runs. On td it refuses until td mode is
-    // built, so the image carries the artifact and its debug companion.
-    steps.push(Step::CopyTree {
-        from: "{in:td-pass}".into(),
-        dest: "{root}/real-root{in:td-pass}".into(),
-    });
-    steps.push(Step::Symlink {
-        target: "{in:td-pass}/bin/td-pass".into(),
-        link: "{root}/real-root/bin/td-pass".into(),
-    });
-    // td-dua, the disk usage analyzer, a static system-tree program run from
-    // the terminal (td-dua/DESIGN.md).
-    steps.push(Step::CopyTree {
-        from: "{in:td-dua}".into(),
-        dest: "{root}/real-root{in:td-dua}".into(),
-    });
-    steps.push(Step::Symlink {
-        target: "{in:td-dua}/bin/td-dua".into(),
-        link: "{root}/real-root/bin/td-dua".into(),
-    });
-    // td-editor, the text editor, a static system-tree program run from the
-    // terminal (td-editor/DESIGN.md).
-    steps.push(Step::CopyTree {
-        from: "{in:td-editor}".into(),
-        dest: "{root}/real-root{in:td-editor}".into(),
-    });
-    steps.push(Step::Symlink {
-        target: "{in:td-editor}/bin/td-editor".into(),
-        link: "{root}/real-root/bin/td-editor".into(),
-    });
+    if sys.desktop() {
+        // td-photo, the photo tool, a static system-tree program run from the
+        // terminal (td-photo/DESIGN.md).
+        steps.push(Step::CopyTree {
+            from: "{in:td-photo}".into(),
+            dest: "{root}/real-root{in:td-photo}".into(),
+        });
+        steps.push(Step::Symlink {
+            target: "{in:td-photo}/bin/td-photo".into(),
+            link: "{root}/real-root/bin/td-photo".into(),
+        });
+        // td-pass, the encrypted notebook (td-pass/DESIGN.md): the same static
+        // executable a foreign host runs. On td it refuses until td mode is
+        // built, so the image carries the artifact and its debug companion.
+        steps.push(Step::CopyTree {
+            from: "{in:td-pass}".into(),
+            dest: "{root}/real-root{in:td-pass}".into(),
+        });
+        steps.push(Step::Symlink {
+            target: "{in:td-pass}/bin/td-pass".into(),
+            link: "{root}/real-root/bin/td-pass".into(),
+        });
+        // td-dua, the disk usage analyzer, a static system-tree program run from
+        // the terminal (td-dua/DESIGN.md).
+        steps.push(Step::CopyTree {
+            from: "{in:td-dua}".into(),
+            dest: "{root}/real-root{in:td-dua}".into(),
+        });
+        steps.push(Step::Symlink {
+            target: "{in:td-dua}/bin/td-dua".into(),
+            link: "{root}/real-root/bin/td-dua".into(),
+        });
+        // td-editor, the text editor, a static system-tree program run from the
+        // terminal (td-editor/DESIGN.md).
+        steps.push(Step::CopyTree {
+            from: "{in:td-editor}".into(),
+            dest: "{root}/real-root{in:td-editor}".into(),
+        });
+        steps.push(Step::Symlink {
+            target: "{in:td-editor}/bin/td-editor".into(),
+            link: "{root}/real-root/bin/td-editor".into(),
+        });
+    }
     // td-jail is static so the running-kernel transition oracle does not depend
     // on the dynamic userland it helps confine.
     steps.push(Step::CopyTree {
         from: "{in:td-jail}".into(),
         dest: "{root}/real-root{in:td-jail}".into(),
     });
-    steps.push(Step::CopyTree {
-        from: "{in:td-update}".into(),
-        dest: "{root}/real-root{in:td-update}".into(),
-    });
-    steps.push(Step::Symlink {
-        target: "{in:td-update}/bin/td-update".into(),
-        link: "{root}/real-root/bin/td-update".into(),
-    });
-    // The installer core a live boot serves from, started by td-authd for
-    // the installer wizard below.
-    steps.push(Step::CopyTree {
-        from: "{in:td-install}".into(),
-        dest: "{root}/real-root{in:td-install}".into(),
-    });
-    steps.push(Step::Symlink {
-        target: "{in:td-install}/bin/td-install".into(),
-        link: "{root}/real-root/bin/td-install".into(),
-    });
-    // The installer wizard, a static td-ui client the live session starts
-    // ([setup]); it holds no disk authority.
-    steps.push(Step::CopyTree {
-        from: "{in:td-setup}".into(),
-        dest: "{root}/real-root{in:td-setup}".into(),
-    });
-    steps.push(Step::Symlink {
-        target: "{in:td-setup}/bin/td-setup".into(),
-        link: "{root}/real-root/bin/td-setup".into(),
-    });
-    // The software UI is static and owns no dynamic runtime closure.
-    steps.push(Step::CopyTree {
-        from: "{in:td-vm-guest}".into(),
-        dest: "{root}/real-root{in:td-vm-guest}".into(),
-    });
-    steps.push(Step::Symlink {
-        target: "{in:td-vm-guest}/bin/td-vm-guest".into(),
-        link: "{root}/real-root/bin/td-vm-guest".into(),
-    });
-    steps.push(Step::Symlink {
-        target: "{in:td-vm-guest}/bin/td-vm-ssh".into(),
-        link: "{root}/real-root/bin/td-vm-ssh".into(),
-    });
-    steps.push(Step::CopyTree {
-        from: "{in:td-seatd}".into(),
-        dest: "{root}/real-root{in:td-seatd}".into(),
-    });
-    steps.push(Step::CopyTree {
-        from: "{in:td-audio}".into(),
-        dest: "{root}/real-root{in:td-audio}".into(),
-    });
-    steps.push(Step::CopyTree {
-        from: "{in:td-compositor}".into(),
-        dest: "{root}/real-root{in:td-compositor}".into(),
-    });
-    // The session bus broker: static, dependency-free, and copied directly like
-    // the rest of the session substrate above it.
-    steps.push(Step::CopyTree {
-        from: "{in:td-busd}".into(),
-        dest: "{root}/real-root{in:td-busd}".into(),
-    });
+    // In-guest update, installation, the installer wizard, the development
+    // VM bridge and the graphical session substrate: an immutable server is
+    // replaced, not updated or installed from, and has no seat or session.
+    if sys.desktop() {
+        steps.push(Step::CopyTree {
+            from: "{in:td-update}".into(),
+            dest: "{root}/real-root{in:td-update}".into(),
+        });
+        steps.push(Step::Symlink {
+            target: "{in:td-update}/bin/td-update".into(),
+            link: "{root}/real-root/bin/td-update".into(),
+        });
+        // The installer core a live boot serves from, started by td-authd for
+        // the installer wizard below.
+        steps.push(Step::CopyTree {
+            from: "{in:td-install}".into(),
+            dest: "{root}/real-root{in:td-install}".into(),
+        });
+        steps.push(Step::Symlink {
+            target: "{in:td-install}/bin/td-install".into(),
+            link: "{root}/real-root/bin/td-install".into(),
+        });
+        // The installer wizard, a static td-ui client the live session starts
+        // ([setup]); it holds no disk authority.
+        steps.push(Step::CopyTree {
+            from: "{in:td-setup}".into(),
+            dest: "{root}/real-root{in:td-setup}".into(),
+        });
+        steps.push(Step::Symlink {
+            target: "{in:td-setup}/bin/td-setup".into(),
+            link: "{root}/real-root/bin/td-setup".into(),
+        });
+        // The software UI is static and owns no dynamic runtime closure.
+        steps.push(Step::CopyTree {
+            from: "{in:td-vm-guest}".into(),
+            dest: "{root}/real-root{in:td-vm-guest}".into(),
+        });
+        steps.push(Step::Symlink {
+            target: "{in:td-vm-guest}/bin/td-vm-guest".into(),
+            link: "{root}/real-root/bin/td-vm-guest".into(),
+        });
+        steps.push(Step::Symlink {
+            target: "{in:td-vm-guest}/bin/td-vm-ssh".into(),
+            link: "{root}/real-root/bin/td-vm-ssh".into(),
+        });
+        steps.push(Step::CopyTree {
+            from: "{in:td-seatd}".into(),
+            dest: "{root}/real-root{in:td-seatd}".into(),
+        });
+        steps.push(Step::CopyTree {
+            from: "{in:td-audio}".into(),
+            dest: "{root}/real-root{in:td-audio}".into(),
+        });
+        steps.push(Step::CopyTree {
+            from: "{in:td-compositor}".into(),
+            dest: "{root}/real-root{in:td-compositor}".into(),
+        });
+        // The session bus broker: static, dependency-free, and copied directly like
+        // the rest of the session substrate above it.
+        steps.push(Step::CopyTree {
+            from: "{in:td-busd}".into(),
+            dest: "{root}/real-root{in:td-busd}".into(),
+        });
+    }
     // The fetch service (APPLICATIONS.md §W.8): the target-built td-net
     // multicall, static, copied whole like the session substrate; the
     // /bin/td-fetchd link below selects its applet by name.
@@ -4637,10 +4980,12 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
     // The activated Settings portal is a separate static process. Its root
     // supervisor and unprivileged child execute the same binary, while the
     // broker retains the capability that authorizes only that direct child.
-    steps.push(Step::CopyTree {
-        from: "{in:td-portal}".into(),
-        dest: "{root}/real-root{in:td-portal}".into(),
-    });
+    if sys.desktop() {
+        steps.push(Step::CopyTree {
+            from: "{in:td-portal}".into(),
+            dest: "{root}/real-root{in:td-portal}".into(),
+        });
+    }
     // The CA extract is immutable data, not an executable runtime closure. Copy
     // the package at its canonical store path so IMMUTABLE_ETC can expose the
     // conventional filename without duplicating the bundle in /etc.
@@ -4649,10 +4994,12 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
         dest: "{root}/real-root{in:ca-certificates}".into(),
     });
     // The outline face is pinned upstream data with no ELF runtime closure.
-    steps.push(Step::CopyTree {
-        from: "{in:jetbrains-mono-nerd-font}".into(),
-        dest: "{root}/real-root{in:jetbrains-mono-nerd-font}".into(),
-    });
+    if sys.desktop() {
+        steps.push(Step::CopyTree {
+            from: "{in:jetbrains-mono-nerd-font}".into(),
+            dest: "{root}/real-root{in:jetbrains-mono-nerd-font}".into(),
+        });
+    }
     // Timezone data is an immutable package with no ELF runtime closure.
     steps.push(Step::CopyTree {
         from: "{in:tzdata}".into(),
@@ -4834,31 +5181,33 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
         target: "{in:td-jail}/bin/td-jail".into(),
         link: "{root}/real-root/bin/td-jail".into(),
     });
-    steps.push(Step::Symlink {
-        target: "{in:td-seatd}/bin/td-seatd".into(),
-        link: "{root}/real-root/bin/td-seatd".into(),
-    });
-    steps.push(Step::Symlink {
-        target: "{in:td-audio}/bin/td-audio".into(),
-        link: "{root}/real-root/bin/td-audio".into(),
-    });
-    steps.push(Step::Symlink {
-        target: "{in:td-compositor}/bin/td-compositor".into(),
-        link: "{root}/real-root/bin/td-compositor".into(),
-    });
-    // /bin/td-ctl — the control client. A name in `/bin` because a person in a
-    // terminal is who runs it, and the session hands it its socket through the
-    // environment the compositor was started with.
-    steps.push(Step::Symlink {
-        target: "{in:td-compositor}/bin/td-ctl".into(),
-        link: "{root}/real-root/bin/td-ctl".into(),
-    });
-    // /bin/td-busd — the session bus. Named in full by the busd unit's exec and
-    // ready lines; no basename dispatch and no applet farm.
-    steps.push(Step::Symlink {
-        target: "{in:td-busd}/bin/td-busd".into(),
-        link: "{root}/real-root/bin/td-busd".into(),
-    });
+    if sys.desktop() {
+        steps.push(Step::Symlink {
+            target: "{in:td-seatd}/bin/td-seatd".into(),
+            link: "{root}/real-root/bin/td-seatd".into(),
+        });
+        steps.push(Step::Symlink {
+            target: "{in:td-audio}/bin/td-audio".into(),
+            link: "{root}/real-root/bin/td-audio".into(),
+        });
+        steps.push(Step::Symlink {
+            target: "{in:td-compositor}/bin/td-compositor".into(),
+            link: "{root}/real-root/bin/td-compositor".into(),
+        });
+        // /bin/td-ctl — the control client. A name in `/bin` because a person in a
+        // terminal is who runs it, and the session hands it its socket through the
+        // environment the compositor was started with.
+        steps.push(Step::Symlink {
+            target: "{in:td-compositor}/bin/td-ctl".into(),
+            link: "{root}/real-root/bin/td-ctl".into(),
+        });
+        // /bin/td-busd — the session bus. Named in full by the busd unit's exec and
+        // ready lines; no basename dispatch and no applet farm.
+        steps.push(Step::Symlink {
+            target: "{in:td-busd}/bin/td-busd".into(),
+            link: "{root}/real-root/bin/td-busd".into(),
+        });
+    }
     // Small launchers fetch the pinned toolchain on first use.
     for name in [
         "td-rust",
@@ -4899,41 +5248,48 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
     // the target-built td-net multicall: the link's basename selects it, as
     // the applet links do on the host. Named in full by the fetchd unit's
     // exec, ready and evidence lines.
-    steps.push(Step::Symlink {
-        target: "{in:td-net}/bin/td-net".into(),
-        link: "{root}/real-root/bin/td-fetchd".into(),
-    });
-    // /bin/td-egressd — the egress relay (td-agent/DESIGN.md §10), the same
-    // multicall's applet, named in full by the egressd unit.
-    steps.push(Step::Symlink {
-        target: "{in:td-net}/bin/td-net".into(),
-        link: "{root}/real-root/bin/td-egressd".into(),
-    });
+    if sys.desktop() {
+        steps.push(Step::Symlink {
+            target: "{in:td-net}/bin/td-net".into(),
+            link: "{root}/real-root/bin/td-fetchd".into(),
+        });
+        // /bin/td-egressd — the egress relay (td-agent/DESIGN.md §10), the same
+        // multicall's applet, named in full by the egressd unit.
+        steps.push(Step::Symlink {
+            target: "{in:td-net}/bin/td-net".into(),
+            link: "{root}/real-root/bin/td-egressd".into(),
+        });
+    }
     // The explicit source-cache consumer shares the already shipped multicall.
     steps.push(Step::Symlink {
         target: "{in:td-net}/bin/td-net".into(),
         link: "{root}/real-root/bin/td-feed".into(),
     });
-    // /bin/td-app — the Flathub cache's applet (APPLICATIONS.md §W.9), which
-    // td-jail runs by this full path as the application's account.
-    steps.push(Step::Symlink {
-        target: "{in:td-net}/bin/td-net".into(),
-        link: "{root}/real-root/bin/td-app".into(),
-    });
-    steps.push(Step::Symlink {
-        target: "{in:td-net}/bin/td-net".into(),
-        link: "{root}/real-root/bin/td-deploy".into(),
-    });
-    // /bin/td-test-https — the QEMU-only Firefox HTTPS origin's mint, server
-    // and readiness probe (APPLICATIONS.md §B.8 item 6).
-    steps.push(Step::Symlink {
-        target: "{in:td-net}/bin/td-net".into(),
-        link: "{root}/real-root/bin/td-test-https".into(),
-    });
-    steps.push(Step::Symlink {
-        target: "{in:td-portal}/bin/td-portal".into(),
-        link: "{root}/real-root/bin/td-portal".into(),
-    });
+    // The application cache, the installation identity primitive, the
+    // Firefox fixture origin and the portal: a server ships no application,
+    // retains no signing identity, and has no session.
+    if sys.desktop() {
+        // /bin/td-app — the Flathub cache's applet (APPLICATIONS.md §W.9), which
+        // td-jail runs by this full path as the application's account.
+        steps.push(Step::Symlink {
+            target: "{in:td-net}/bin/td-net".into(),
+            link: "{root}/real-root/bin/td-app".into(),
+        });
+        steps.push(Step::Symlink {
+            target: "{in:td-net}/bin/td-net".into(),
+            link: "{root}/real-root/bin/td-deploy".into(),
+        });
+        // /bin/td-test-https — the QEMU-only Firefox HTTPS origin's mint, server
+        // and readiness probe (APPLICATIONS.md §B.8 item 6).
+        steps.push(Step::Symlink {
+            target: "{in:td-net}/bin/td-net".into(),
+            link: "{root}/real-root/bin/td-test-https".into(),
+        });
+        steps.push(Step::Symlink {
+            target: "{in:td-portal}/bin/td-portal".into(),
+            link: "{root}/real-root/bin/td-portal".into(),
+        });
+    }
     // /bin/td-util is the multicall's own entry (`td-util <applet>`, and `--list`); the loop
     // below is the argv[0] farm the diagnostics names resolve through.
     steps.push(Step::Symlink {
@@ -4991,7 +5347,7 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
     // persistent ones once per machine by td-firstboot. A dangling symlink is the
     // correct shipped state: it is what makes "this file is per-machine" a property
     // of the image rather than a convention.
-    for dir in etc_dirs() {
+    for dir in etc_dirs(sys) {
         steps.push(Step::MkDir {
             path: format!("{{root}}/real-root/etc/{dir}"),
         });
@@ -5005,7 +5361,7 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
     // The immutable /etc: names that resolve INTO the store. Unlike the table
     // above these are not dangling — the target is image content — and nothing
     // ever writes through them.
-    for entry in IMMUTABLE_ETC {
+    for entry in immutable_etc(sys) {
         steps.push(Step::Symlink {
             target: entry.target.into(),
             link: format!("{{root}}/real-root/etc/{}", entry.etc),
@@ -5083,8 +5439,15 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
 /// each into a named build error on a per-change check instead of an unbootable artifact on
 /// a nightly one. The boot ITSELF is still exercised by `td-recipe-eval run` and the headless
 /// `qemu-boot-system` oracle; this only moves the cheaply-decidable half earlier.
-fn shape_check() -> String {
-    "selector='{out}/boot/selector-initramfs.cpio'; selector_manifest='{out}/boot/manifest'; init='{out}/deployment/initramfs.cpio'; root='{root}/real-root'; disk='{out}/deployment/root.erofs'; manifest='{out}/deployment/manifest'; tu='{in:td-util}/bin/td-util'; \
+fn shape_check(sys: &SystemDef) -> String {
+    let immutable = immutable_etc(sys);
+    // Only the server's section names it; the desktop strips it unread.
+    let server_absent_bin = if sys.desktop() {
+        String::new()
+    } else {
+        server_absent_bin_sweep()
+    };
+    profile_sections(sys.profile, "selector='{out}/boot/selector-initramfs.cpio'; selector_manifest='{out}/boot/manifest'; init='{out}/deployment/initramfs.cpio'; root='{root}/real-root'; disk='{out}/deployment/root.erofs'; manifest='{out}/deployment/manifest'; tu='{in:td-util}/bin/td-util'; \
      for archive in \"$selector\" \"$init\"; do \
          sz=$(wc -c < \"$archive\"); \
          [ \"$sz\" -ge 65536 ] || { echo \"initramfs $archive: implausibly small ($sz bytes) - the static shell alone is larger\" >&2; exit 1; }; \
@@ -5142,13 +5505,15 @@ fn shape_check() -> String {
      [ -f \"$root/init\" ] || [ -L \"$root/init\" ] || { echo 'root tree: /init missing' >&2; exit 1; }; \
      case $(readlink \"$root/init\") in /td/store/*) : ;; *) echo 'root tree: /init is not a symlink into /td/store' >&2; exit 1;; esac; \
      case $(readlink \"$root/bin/sh\") in /td/store/*) : ;; *) echo 'root tree: /bin/sh is not a symlink into /td/store - the store-native /bin farm regressed' >&2; exit 1;; esac; \
-     for f in passwd group shadow hostname-default os-release @BUS_APPLICATION_POLICY_NAME@ @TD_PORTAL_SETTINGS_NAME@ mutable-state inittab @TD_SVC_CONF_NAME@ @APPLICATION_CONFIG_NAME@ profile autologin tty-session shutdown rootcheck netup bootsuccess bootfail; do \
+     for f in @ETC_FILES@; do \
          [ -f \"$root/etc/$f\" ] || { echo \"root tree: /etc/$f missing\" >&2; exit 1; }; \
          if [ -L \"$root/etc/$f\" ]; then echo \"root tree: /etc/$f is a symlink - immutable image config must be a regular file in the erofs, not a hole in the read-only /etc\" >&2; exit 1; fi; \
      done; \
      [ \"$(ls -ld \"$root/etc/passwd\" | cut -c1-10)\" = -rw-r--r-- ] || { echo 'root tree: passwd must have mode 0644 for shared account admission' >&2; exit 1; }; \
+     @DESKTOP{@\
      [ \"$(ls -ld \"$root/etc/@BUS_APPLICATION_POLICY_NAME@\" | cut -c1-10)\" = -r--r--r-- ] || { echo 'root tree: bus application policy must have mode 0444' >&2; exit 1; }; \
      [ -f \"$root/etc/@ELEVATION_TABLE_NAME@\" ] && [ ! -L \"$root/etc/@ELEVATION_TABLE_NAME@\" ] && [ \"$(ls -ld \"$root/etc/@ELEVATION_TABLE_NAME@\" | cut -c1-10)\" = -r--r--r-- ] || { echo 'root tree: the elevation principal table must be a regular file of mode 0444' >&2; exit 1; }; \
+     @}DESKTOP@\
      for f in @APPLICATION_REGISTRY_NAME@ @APPLICATION_LAUNCHER_NAME@; do \
          [ -f \"$root/etc/$f\" ] || { echo \"root tree: /etc/$f missing - compileApplicationTables did not materialize the application image contract\" >&2; exit 1; }; \
          if [ -L \"$root/etc/$f\" ]; then echo \"root tree: /etc/$f is a symlink - application selection must be immutable image content\" >&2; exit 1; fi; \
@@ -5252,6 +5617,7 @@ fn shape_check() -> String {
      case \"$netrow\" in *';assembly-boundary=1'*) : ;; *) echo 'root tree: deployment profiler object index omits the td-net assembly boundary' >&2; exit 1;; esac; \
      [ \"$(readlink \"$root/bin/td-jail\" 2>/dev/null)\" = \"{in:td-jail}/bin/td-jail\" ] || { echo 'root tree: /bin/td-jail is not a symlink to the staged confinement boundary' >&2; exit 1; }; \
      tdj=\"{root}/real-root{in:td-jail}/bin/td-jail\"; { [ -f \"$tdj\" ] && [ -x \"$tdj\" ]; } || { echo 'root tree: td-jail is not packed and executable, so the running-kernel transition oracle cannot run' >&2; exit 1; }; \
+     @DESKTOP{@\
      [ \"$(readlink \"$root/bin/td-seatd\" 2>/dev/null)\" = \"{in:td-seatd}/bin/td-seatd\" ] || { echo 'root tree: /bin/td-seatd is not a symlink to the staged single-user seat assigner' >&2; exit 1; }; \
      seat=\"{root}/real-root{in:td-seatd}/bin/td-seatd\"; { [ -f \"$seat\" ] && [ -x \"$seat\" ]; } || { echo 'root tree: td-seatd is not packed and executable' >&2; exit 1; }; \
      [ \"$(readlink \"$root/bin/td-audio\" 2>/dev/null)\" = \"{in:td-audio}/bin/td-audio\" ] || { echo 'root tree: /bin/td-audio is not a symlink to the staged audio daemon' >&2; exit 1; }; \
@@ -5265,16 +5631,27 @@ fn shape_check() -> String {
      [ \"$(readlink \"$root/bin/td-busd\" 2>/dev/null)\" = \"{in:td-busd}/bin/td-busd\" ] || { echo 'root tree: /bin/td-busd is not a symlink to the staged session bus broker - the busd unit names it in full, so this is the only thing standing between that unit and exec-ing nothing' >&2; exit 1; }; \
      tdbusd=\"{root}/real-root{in:td-busd}/bin/td-busd\"; { [ -f \"$tdbusd\" ] && [ -x \"$tdbusd\" ]; } || { echo 'root tree: td-busd is not packed/executable at real-root{in:td-busd}/bin/td-busd - the /bin/td-busd symlink would dangle' >&2; exit 1; }; \
      [ \"$(readlink \"$root/bin/td-fetchd\" 2>/dev/null)\" = \"{in:td-net}/bin/td-net\" ] || { echo 'root tree: /bin/td-fetchd is not a symlink to the staged td-net multicall - the fetchd unit names it in full, so this is the only thing standing between that unit and exec-ing nothing' >&2; exit 1; }; \
+     @}DESKTOP@\
      [ \"$(readlink \"$root/bin/td-feed\" 2>/dev/null)\" = \"{in:td-net}/bin/td-net\" ] || { echo 'root tree: /bin/td-feed must select the shipped source consumer' >&2; exit 1; }; \
+     @DESKTOP{@\
      [ \"$(readlink \"$root/bin/td-app\" 2>/dev/null)\" = \"{in:td-net}/bin/td-net\" ] || { echo 'root tree: /bin/td-app must select the Flathub cache applet td-jail runs' >&2; exit 1; }; \
      [ \"$(readlink \"$root/bin/td-test-https\" 2>/dev/null)\" = \"{in:td-net}/bin/td-net\" ] || { echo 'root tree: /bin/td-test-https must select the Firefox HTTPS origin applet' >&2; exit 1; }; \
+     @}DESKTOP@\
      [ ! -e \"$root/bin/openssl\" ] && [ ! -L \"$root/bin/openssl\" ] || { echo 'root tree: an openssl command entered the image' >&2; exit 1; }; \
+     @DESKTOP{@\
      tdfetchd=\"{root}/real-root{in:td-net}/bin/td-net\"; { [ -f \"$tdfetchd\" ] && [ -x \"$tdfetchd\" ]; } || { echo 'root tree: td-net is not packed/executable at real-root{in:td-net}/bin/td-net - the /bin/td-fetchd symlink would dangle and the fetchd unit would exec nothing' >&2; exit 1; }; \
+     @}DESKTOP@\
+     @SERVER{@\
+     tdnet=\"{root}/real-root{in:td-net}/bin/td-net\"; { [ -f \"$tdnet\" ] && [ -x \"$tdnet\" ]; } || { echo 'root tree: td-net is not packed/executable at real-root{in:td-net}/bin/td-net - /bin/td-feed and the Rust launchers would dangle' >&2; exit 1; }; \
+     @SERVER_ABSENT_BIN@ \
+     @}SERVER@\
+     @DESKTOP{@\
      [ \"$(readlink \"$root/bin/td-portal\" 2>/dev/null)\" = \"{in:td-portal}/bin/td-portal\" ] || { echo 'root tree: /bin/td-portal is not a symlink to the staged Settings portal' >&2; exit 1; }; \
      tdportal=\"{root}/real-root{in:td-portal}/bin/td-portal\"; { [ -f \"$tdportal\" ] && [ -x \"$tdportal\" ]; } || { echo 'root tree: td-portal is not packed/executable at real-root{in:td-portal}/bin/td-portal - the portal supervisor, child, and live probe would all fail' >&2; exit 1; }; \
      for a in @APPLICATIONS@; do \
          if [ -e \"$root/bin/$a\" ] || [ -L \"$root/bin/$a\" ]; then echo \"root tree: /bin/$a is packed, but td-authd starts $a by argv[0] and a shell launch would only be refused\" >&2; exit 1; fi; \
      done; \
+     @}DESKTOP@\
      [ -f \"@TERMINFO_ENTRY@\" ] || { echo 'root tree: the td-term terminfo entry is not packed, so /etc/terminfo resolves to a tree without it' >&2; exit 1; }; \
      [ \"$(ls -ld \"@TERMINFO_ENTRY@\" | cut -c1-10)\" = -r--r--r-- ] || { echo 'root tree: the td-term terminfo entry is not read-only (0444), the mode td-jail admits it at, so every terminal launch would be refused' >&2; exit 1; }; \
      tdsplan=$(\"$tds\" check -f \"$root@TD_SVC_CONF@\" 2>&1) || { echo 'td-svc check REJECTED the unit table this image ships - the boot would run a table the supervisor only partly understood. Its diagnostics:' >&2; printf '%s\\n' \"$tdsplan\" >&2; exit 1; }; \
@@ -5286,18 +5663,29 @@ fn shape_check() -> String {
      : 'the plan identical. the_declared_edges_are_exactly_these pins the edge set on'; \
      : 'the host; this pins that td-svc itself still resolves them this way.'; \
      svcpos() { printf '%s\\n' \"$tdsplan\" | grep -n -E \"^[0-9]+\\. $1\\$\" | cut -d: -f1; }; \
+     @DESKTOP{@\
      hn=$(svcpos hostname); fb=$(svcpos td-firstboot); rc=$(svcpos rootcheck); pf=$(svcpos profiler); pe=$(svcpos profiler-evidence); st=$(svcpos seat); au=$(svcpos audio); nu=$(svcpos netup); wl=$(svcpos wayland); tm=$(svcpos terminal); ff=$(svcpos firefox); fe=$(svcpos firefox-evidence); bs=$(svcpos bootsuccess); sd=$(svcpos sshd); gr=$(svcpos greeter); bd=$(svcpos busd); po=$(svcpos portal); pv=$(svcpos portal-evidence); \
+     @}DESKTOP@\
+     @SERVER{@\
+     hn=$(svcpos hostname); fb=$(svcpos td-firstboot); rc=$(svcpos rootcheck); pf=$(svcpos profiler); pe=$(svcpos profiler-evidence); nu=$(svcpos netup); bs=$(svcpos bootsuccess); hw=$(svcpos healthwatch); sd=$(svcpos sshd); \
+     @}SERVER@\
      [ \"$hn\" -lt \"$fb\" ] || { echo 'td-svc would not serialize hostname before td-firstboot - init ran every sysinit line to completion before the next, and td-svc starts settled units in the same pass' >&2; exit 1; }; \
      [ \"$fb\" -lt \"$rc\" ] || { echo 'td-svc would start rootcheck before td-firstboot - rootcheck asserts the identity td-firstboot mints is readable' >&2; exit 1; }; \
      [ \"$rc\" -lt \"$pf\" ] && [ \"$pf\" -lt \"$pe\" ] || { echo 'td-svc would not serialize rootcheck -> profiler -> profiler evidence' >&2; exit 1; }; \
      [ \"$rc\" -lt \"$nu\" ] || { echo 'td-svc would start netup before rootcheck - networking must follow the read-only-root self-check' >&2; exit 1; }; \
      [ \"$nu\" -lt \"$sd\" ] || { echo 'td-svc would start sshd before netup - sshd binds loopback, which netup brings up' >&2; exit 1; }; \
      [ \"$fb\" -lt \"$sd\" ] || { echo 'td-svc would start sshd before td-firstboot - sshd is fail-closed on the host key td-firstboot mints, so it would refuse to start on every boot' >&2; exit 1; }; \
+     @DESKTOP{@\
      [ \"$nu\" -lt \"$gr\" ] || { echo 'td-svc would start the greeter before netup' >&2; exit 1; }; \
      [ \"$rc\" -lt \"$st\" ] && [ \"$st\" -lt \"$wl\" ] && [ \"$wl\" -lt \"$tm\" ] && [ \"$wl\" -lt \"$ff\" ] && [ \"$ff\" -lt \"$fe\" ] && [ \"$tm\" -lt \"$bs\" ] && [ \"$pe\" -lt \"$bs\" ] || { echo 'td-svc would not serialize rootcheck -> seat -> wayland, wayland -> terminal + Firefox evidence, and profiler evidence -> independent bootsuccess' >&2; exit 1; }; \
      [ \"$st\" -lt \"$au\" ] && [ \"$au\" -lt \"$ff\" ] || { echo 'td-svc would not serialize seat -> audio -> Firefox' >&2; exit 1; }; \
      [ \"$st\" -lt \"$bd\" ] && [ \"$bd\" -lt \"$bs\" ] || { echo 'td-svc would not serialize seat -> busd -> bootsuccess - the broker binds in the UID-992 runtime td-firstboot publishes, and /etc/bootsuccess probes the RUNNING broker rather than a selftest' >&2; exit 1; }; \
      [ \"$bd\" -lt \"$po\" ] && [ \"$po\" -lt \"$pv\" ] && [ \"$po\" -lt \"$ff\" ] || { echo 'td-svc would not serialize busd -> portal -> live portal evidence and Firefox' >&2; exit 1; }; \
+     @}DESKTOP@\
+     @SERVER{@\
+     [ \"$pe\" -lt \"$bs\" ] && [ \"$sd\" -lt \"$bs\" ] || { echo 'td-svc would not serialize profiler evidence and sshd before bootsuccess - a server is healthy only once its way in listens' >&2; exit 1; }; \
+     [ \"$bs\" -lt \"$hw\" ] || { echo 'td-svc would start healthwatch before bootsuccess decided - a server would reboot a healthy boot' >&2; exit 1; }; \
+     @}SERVER@\
      mkdir -p '{root}/pivot-probe' && cp \"$tdi\" '{root}/pivot-probe/init' || { echo 'root tree: could not build the switch_root probe NEWROOT' >&2; exit 1; }; \
      tdipiv=$(\"$tdi\" switch_root '{root}/pivot-probe' /init 2>&1) && { echo 'td-init switch_root ACCEPTED a NEWROOT that is not a mount point - the last refusal standing between a bad pivot and a panicked kernel is gone' >&2; exit 1; }; \
      case \"$tdipiv\" in *'not a mount point'*) : ;; *) echo \"td-init switch_root refused a non-mount NEWROOT for the WRONG reason, so the mount-point guard is untested: $tdipiv\" >&2; exit 1;; esac; \
@@ -5350,7 +5738,9 @@ fn shape_check() -> String {
      [ \"$(head -n 1 \"$manifest\")\" = td-deployment-v1 ] || { echo 'manifest: unsupported or missing td-deployment-v1 header' >&2; exit 1; }; \
      for a in bzImage initramfs.cpio root.erofs; do \
          grep -q -E \"^[0-9a-f]{64}  $a$\" \"$manifest\" || { echo \"manifest: missing strict SHA-256 entry for $a\" >&2; exit 1; }; \
-     done"
+     done")
+        .replace("@ETC_FILES@", &shape_etc_files(sys).join(" "))
+        .replace("@SERVER_ABSENT_BIN@", &server_absent_bin)
         // Validate EVERY packed applet, not just the greeter-critical few. Names are all
         // shell-safe identifiers, so a space-joined `for` list is safe unquoted. Compare
         // symlink text without resolving it: a /bin link names its target as the booted
@@ -5365,8 +5755,8 @@ fn shape_check() -> String {
         .replace("@TD_SH_APPLETS@", &TD_SH_APPLETS.join(" "))
         .replace("@TD_INIT_APPLETS@", &td_init_applets().join(" "))
         .replace("@TD_LOGIN_APPLETS@", &TD_LOGIN_APPLETS.join(" "))
-        .replace("@APPLICATIONS@", &application_names(&SYSTEM).join(" "))
-        .replace("@TD_SVC_UNITS@", &TD_SVC_UNITS.join(" "))
+        .replace("@APPLICATIONS@", &application_names(sys).join(" "))
+        .replace("@TD_SVC_UNITS@", &td_svc_units(sys).join(" "))
         .replace("@TD_SVC_CONF@", TD_SVC_CONF)
         .replace("@TERMINFO_ENTRY@", TERMINFO_ENTRY)
         .replace("@PROFILER_OBJECT_INDEX@", PROFILER_OBJECT_INDEX)
@@ -5387,7 +5777,7 @@ fn shape_check() -> String {
             "@APPLICATION_LAUNCHER_NAME@",
             application_etc_name(APPLICATION_LAUNCHER_TABLE),
         )
-        .replace("@APPLICATION_COUNT@", &SYSTEM.applications.len().to_string())
+        .replace("@APPLICATION_COUNT@", &sys.applications.len().to_string())
         .replace("@BUS_APPLICATION_POLICY_NAME@", application_etc_name(BUS_APPLICATION_POLICY))
         .replace("@ELEVATION_TABLE_NAME@", application_etc_name(ELEVATION_TABLE))
 
@@ -5405,7 +5795,7 @@ fn shape_check() -> String {
         .replace("@MUTABLE_ETC_NAMES@", &mutable_etc_names().join(" "))
         .replace(
             "@IMMUTABLE_ETC@",
-            &IMMUTABLE_ETC
+            &immutable
                 .iter()
                 .map(|entry| format!("{}={}", entry.etc, entry.target))
                 .collect::<Vec<_>>()
@@ -5413,19 +5803,19 @@ fn shape_check() -> String {
         )
         .replace(
             "@IMMUTABLE_ETC_NAMES@",
-            &IMMUTABLE_ETC
+            &immutable
                 .iter()
                 .map(|entry| entry.etc)
                 .collect::<Vec<_>>()
                 .join(" "),
         )
-        .replace("@IMMUTABLE_ETC_COUNT@", &IMMUTABLE_ETC.len().to_string())
+        .replace("@IMMUTABLE_ETC_COUNT@", &immutable.len().to_string())
         // Each reason rides into the generated script as a `:` no-op, the form
         // this file already uses for in-script commentary. A hole in the
         // read-only /etc should say why it is there where it is checked.
         .replace(
             "@IMMUTABLE_ETC_WHY@",
-            &IMMUTABLE_ETC
+            &immutable
                 .iter()
                 .map(|entry| format!(": '/etc/{}: {}'", entry.etc, entry.why))
                 .collect::<Vec<_>>()
@@ -5435,9 +5825,100 @@ fn shape_check() -> String {
         // symlinks the table does not name. Globs rather than a recursive walk
         // because the ladder guard bans the host directory-walk tools by name, and
         // because the table is what decides which directories can hold one.
-        .replace("@ETC_GLOBS@", &etc_globs().join(" "))
-        .replace("@ETC_DIRS@", &etc_dirs().join(" "))
+        .replace("@ETC_GLOBS@", &etc_globs(sys).join(" "))
+        .replace("@ETC_DIRS@", &etc_dirs(sys).join(" "))
         .replace("@MUTABLE_ETC_COUNT@", &MUTABLE_ETC.len().to_string())
+}
+
+/// The generated /etc files the shape check requires as regular files.
+fn shape_etc_files(sys: &SystemDef) -> Vec<&'static str> {
+    if sys.desktop() {
+        vec![
+            "passwd",
+            "group",
+            "shadow",
+            "hostname-default",
+            "os-release",
+            application_etc_name(BUS_APPLICATION_POLICY),
+            td_portal_settings_etc_name(),
+            "mutable-state",
+            "inittab",
+            td_svc_conf_etc_name(),
+            application_etc_name(APPLICATION_CONFIG),
+            "profile",
+            "autologin",
+            "tty-session",
+            "shutdown",
+            "rootcheck",
+            "netup",
+            "bootsuccess",
+            "bootfail",
+        ]
+    } else {
+        vec![
+            "passwd",
+            "group",
+            "shadow",
+            "hostname-default",
+            "os-release",
+            "mutable-state",
+            "inittab",
+            td_svc_conf_etc_name(),
+            application_etc_name(APPLICATION_CONFIG),
+            "profile",
+            "shutdown",
+            "rootcheck",
+            "netup",
+            "bootsuccess",
+            HEALTHWATCH_ETC_NAME,
+        ]
+    }
+}
+
+const DESKTOP_OPEN: &str = "@DESKTOP{@";
+const DESKTOP_CLOSE: &str = "@}DESKTOP@";
+const SERVER_OPEN: &str = "@SERVER{@";
+const SERVER_CLOSE: &str = "@}SERVER@";
+
+/// `text` with `profile`'s marked sections kept and the other profile's
+/// removed, markers and all. Sections do not nest. An unmatched marker is
+/// left in place, where the shell reads it as a command that does not exist,
+/// so a malformed table fails the build rather than checking less.
+fn profile_sections(profile: Profile, text: &str) -> String {
+    let (keep, drop) = match profile {
+        Profile::Desktop => ((DESKTOP_OPEN, DESKTOP_CLOSE), (SERVER_OPEN, SERVER_CLOSE)),
+        Profile::Server => ((SERVER_OPEN, SERVER_CLOSE), (DESKTOP_OPEN, DESKTOP_CLOSE)),
+    };
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    loop {
+        let next_keep = rest.find(keep.0);
+        let next_drop = rest.find(drop.0);
+        let (at, (open, close), kept) = match (next_keep, next_drop) {
+            (Some(k), Some(d)) if k < d => (k, keep, true),
+            (Some(k), None) => (k, keep, true),
+            (_, Some(d)) => (d, drop, false),
+            (None, None) => break,
+        };
+        let body_start = at + open.len();
+        let Some(body_len) = rest.get(body_start..).and_then(|body| body.find(close)) else {
+            break;
+        };
+        let (Some(before), Some(body), Some(after)) = (
+            rest.get(..at),
+            rest.get(body_start..body_start + body_len),
+            rest.get(body_start + body_len + close.len()..),
+        ) else {
+            break;
+        };
+        out.push_str(before);
+        if kept {
+            out.push_str(body);
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out
 }
 
 /// The `/etc`-relative paths of the table, for the allowlist sweep.
@@ -5449,16 +5930,16 @@ fn mutable_etc_names() -> Vec<&'static str> {
 /// `*` and `.*` (a dot-name is not matched by `*`), plus the same pair inside every
 /// directory the table declares. The dir-allowlist leg above is what makes that
 /// scope a proof rather than a guess: no OTHER directory may exist under /etc.
-fn etc_globs() -> Vec<String> {
+fn etc_globs(sys: &SystemDef) -> Vec<String> {
     let mut globs = vec!["*".to_string(), ".*".to_string()];
-    for dir in etc_dirs() {
+    for dir in etc_dirs(sys) {
         globs.push(format!("{dir}/*"));
         globs.push(format!("{dir}/.*"));
     }
     globs
 }
 
-fn invalid_system_policy(why: &str) -> Recipe {
+fn invalid_system_policy(sys: &SystemDef, why: &str) -> Recipe {
     let reason: String = why
         .chars()
         .map(|character| {
@@ -5469,7 +5950,7 @@ fn invalid_system_policy(why: &str) -> Recipe {
             }
         })
         .collect();
-    Recipe::mesboot("system-x86-64", "0.2").steps(vec![Step::Require {
+    Recipe::mesboot(sys.stem, "0.2").steps(vec![Step::Require {
         paths: vec![format!(
             "{{out}}/invalid-system-application-policy--{reason}"
         )],
@@ -5486,6 +5967,82 @@ fn selector_template_dir() -> &'static str {
 }
 
 pub fn recipe() -> Recipe {
+    system_recipe(&SYSTEM)
+}
+
+/// The headless variant (`server-x86-64`), built by the same steps.
+pub(super) fn server_recipe() -> Recipe {
+    system_recipe(&SERVER)
+}
+
+/// The packages only the desktop packs: the session substrate, the td-ui
+/// programs, in-guest update and installation, the development VM bridge,
+/// the session authority and the outline face.
+const DESKTOP_INPUTS: &[&str] = &[
+    "jetbrains-mono-nerd-font",
+    "td-authd",
+    "td-taskmgr",
+    "td-review",
+    "td-agent",
+    "td-term",
+    "td-photo",
+    "td-editor",
+    "td-pass",
+    "td-dua",
+    "td-seatd",
+    "td-vm-guest",
+    "td-update",
+    "td-install",
+    "td-setup",
+    "td-audio",
+    "td-compositor",
+    "td-busd",
+    "td-portal",
+];
+
+/// `inputs` without `DESKTOP_INPUTS` unless `sys` is the desktop.
+fn profile_inputs(sys: &SystemDef, inputs: &[&'static str]) -> Vec<&'static str> {
+    inputs
+        .iter()
+        .copied()
+        .filter(|input| sys.desktop() || !DESKTOP_INPUTS.contains(input))
+        .collect()
+}
+
+/// The desktop's `/bin` names the server does not pack, from both profiles'
+/// staging, so the server shape check's absent list cannot drift from it.
+fn desktop_only_bin() -> Result<Vec<String>, String> {
+    let links = |sys: &SystemDef| -> Result<std::collections::BTreeSet<String>, String> {
+        Ok(real_root_steps(sys)?
+            .iter()
+            .filter_map(|step| match step {
+                Step::Symlink { link, .. } => link
+                    .strip_prefix("{root}/real-root/bin/")
+                    .map(str::to_string),
+                _ => None,
+            })
+            .collect())
+    };
+    let server = links(&SERVER)?;
+    Ok(links(&SYSTEM)?.difference(&server).cloned().collect())
+}
+
+/// The server shape check's sweep over `desktop_only_bin`; a roster that
+/// cannot be derived fails the check rather than emptying it.
+fn server_absent_bin_sweep() -> String {
+    match desktop_only_bin() {
+        Ok(names) if !names.is_empty() => format!(
+            "for a in {}; do \
+             if [ -e \"$root/bin/$a\" ] || [ -L \"$root/bin/$a\" ]; then echo \"root tree: /bin/$a is packed, but a server packs no graphical, session, application, update or installation program\" >&2; exit 1; fi; \
+             done;",
+            names.join(" ")
+        ),
+        _ => "echo 'root tree: the desktop-only /bin roster could not be derived' >&2; exit 1;"
+            .to_string(),
+    }
+}
+
+fn system_recipe(sys: &SystemDef) -> Recipe {
     // The recipe's own shell steps run under td-sh with the post-Rust tool
     // farm; nothing the farm links is packed by that route.
     let mut steps = vec![post_rust_tool_farm()];
@@ -5498,11 +6055,19 @@ pub fn recipe() -> Recipe {
     //    staged copy is made writable by its owner, so the td-term terminfo
     //    entry goes back to 0444, the mode td-jail's terminal grant admits
     //    the file it binds at; the packer keeps modes as staged.
-    let root_steps = match real_root_steps(&SYSTEM) {
+    let root_steps = match real_root_steps(sys) {
         Ok(steps) => steps,
-        Err(why) => return invalid_system_policy(&why),
+        Err(why) => return invalid_system_policy(sys, &why),
     };
     steps.extend(root_steps);
+    // Both profiles reserve the primary session's principals; the elevation
+    // and bus tables are the desktop's alone.
+    let mut read_only_tables = format!(" '{{root}}/real-root{PRINCIPALS_PATH}'");
+    if sys.desktop() {
+        read_only_tables.push_str(&format!(
+            " '{{root}}/real-root{ELEVATION_TABLE}' '{{root}}/real-root{BUS_APPLICATION_POLICY}'"
+        ));
+    }
     steps.push(
         Step::run(
             "{out}",
@@ -5510,7 +6075,7 @@ pub fn recipe() -> Recipe {
                 POST_RUST_SH,
                 "-c",
                 &format!(
-                    "chmod 0755 '{{root}}/real-root' && chmod 0600 '{{root}}/real-root/etc/shadow' && chmod 0444 '{TERMINFO_ENTRY}' '{{root}}/real-root{PRINCIPALS_PATH}' '{{root}}/real-root{ELEVATION_TABLE}' '{{root}}/real-root{BUS_APPLICATION_POLICY}'"
+                    "chmod 0755 '{{root}}/real-root' && chmod 0600 '{{root}}/real-root/etc/shadow' && chmod 0444 '{TERMINFO_ENTRY}'{read_only_tables}"
                 ),
             ],
         )
@@ -5550,7 +6115,7 @@ pub fn recipe() -> Recipe {
     });
     steps.push(Step::WriteFile {
         path: "{root}/deployment-init".into(),
-        content: build_deployment_init(&SYSTEM),
+        content: build_deployment_init(sys),
         exec: true,
     });
     steps.push(Step::WriteFile {
@@ -5646,9 +6211,9 @@ pub fn recipe() -> Recipe {
         ],
         exec: false,
     });
-    steps.push(Step::run("{out}", &[POST_RUST_SH, "-c", &shape_check()]).env("PATH", "{tools}"));
+    steps.push(Step::run("{out}", &[POST_RUST_SH, "-c", &shape_check(sys)]).env("PATH", "{tools}"));
 
-    let recipe = Recipe::mesboot("system-x86-64", "0.2")
+    let recipe = Recipe::mesboot(sys.stem, "0.2")
         // This recipe's own steps run under td-sh with the post-Rust tool farm,
         //   which holds no awk (catalog's `a_farm_without_awk_runs_none`), so no
         //   ladder output is an input; `nothing_on_the_image_is_busybox` holds the image
@@ -5702,55 +6267,58 @@ pub fn recipe() -> Recipe {
         // post_rust_inputs adds the tool farm's providers (td-sh, td-txt,
         // td-util, uutils, all also packed), so the farm and this list cannot
         // drift apart.
-        .native_inputs(&post_rust_inputs(&[
-            "linux-x86-64",
-            "td-btrfs",
-            "cryptsetup-x86-64",
-            "ripgrep",
-            "fd",
-            "git-x86-64",
-            "ca-certificates",
-            "tzdata",
-            "jetbrains-mono-nerd-font",
-            "glibc-x86-64",
-            "openssh-x86-64",
-            "td-netd",
-            "td-boot",
-            "td-kexec",
-            "td-init",
-            "td-firstboot",
-            "td-login",
-            "td-authd",
-            "td-svc",
-            "td-profiler",
-            "td-taskmgr",
-            "td-review",
-            "td-agent",
-            "td-term",
-            "td-term-terminfo",
-            "td-photo",
-            "td-editor",
-            "td-pass",
-            "td-dua",
-            "td-jail",
-            "td-seatd",
-            "td-vm-guest",
-            "td-update",
-            "td-install",
-            "td-setup",
-            "td-audio",
-            "td-compositor",
-            "td-busd",
-            "td-portal",
-            "td-secret",
-            "td-net",
-            // Libraries retained for the on-demand compiler and linker.
-            "gcc-runtime",
-            "zlib-x86-64",
-            "td-link-runtime",
-        ]))
+        .native_inputs(&post_rust_inputs(&profile_inputs(
+            sys,
+            &[
+                "linux-x86-64",
+                "td-btrfs",
+                "cryptsetup-x86-64",
+                "ripgrep",
+                "fd",
+                "git-x86-64",
+                "ca-certificates",
+                "tzdata",
+                "jetbrains-mono-nerd-font",
+                "glibc-x86-64",
+                "openssh-x86-64",
+                "td-netd",
+                "td-boot",
+                "td-kexec",
+                "td-init",
+                "td-firstboot",
+                "td-login",
+                "td-authd",
+                "td-svc",
+                "td-profiler",
+                "td-taskmgr",
+                "td-review",
+                "td-agent",
+                "td-term",
+                "td-term-terminfo",
+                "td-photo",
+                "td-editor",
+                "td-pass",
+                "td-dua",
+                "td-jail",
+                "td-seatd",
+                "td-vm-guest",
+                "td-update",
+                "td-install",
+                "td-setup",
+                "td-audio",
+                "td-compositor",
+                "td-busd",
+                "td-portal",
+                "td-secret",
+                "td-net",
+                // Libraries retained for the on-demand compiler and linker.
+                "gcc-runtime",
+                "zlib-x86-64",
+                "td-link-runtime",
+            ],
+        )))
         .steps(steps);
-    let application_inputs = application_payload_inputs(&SYSTEM);
+    let application_inputs = application_payload_inputs(sys);
     if application_inputs.is_empty() {
         recipe
     } else {
@@ -5827,7 +6395,7 @@ mod tests {
 
     #[test]
     fn human_literal_commands_and_the_stock_console_resolve_the_primary_account() {
-        let config = build_td_svc_conf();
+        let config = build_td_svc_conf(&SYSTEM);
         assert!(config.contains("exec=/bin/td-login exec-primary -- /bin/td-update init"));
         assert!(!config.contains(&format!("/bin/td-login exec-as {UI_USER} --")));
         assert!(!config.contains("/bin/su"));
@@ -5873,7 +6441,10 @@ mod tests {
     /// still reading positions would pass for the wrong reason: it would keep passing
     /// after someone deleted an `after=` and left the stanzas in a lucky order.
     fn parse_td_svc_conf() -> Vec<(String, Vec<(String, String)>)> {
-        let table = build_td_svc_conf();
+        parse_table(&build_td_svc_conf(&SYSTEM))
+    }
+
+    pub(super) fn parse_table(table: &str) -> Vec<(String, Vec<(String, String)>)> {
         let mut units: Vec<(String, Vec<(String, String)>)> = Vec::new();
         for raw in table.lines() {
             let line = raw.trim();
@@ -6420,7 +6991,7 @@ mod tests {
     /// that comes up missing a service with no diagnostic anywhere.
     #[test]
     fn every_job_the_inittab_used_to_run_still_runs() {
-        let table = build_td_svc_conf();
+        let table = build_td_svc_conf(&SYSTEM);
         let inittab = build_inittab();
         for command in [
             "/bin/td-firstboot hostname",
@@ -6457,7 +7028,7 @@ mod tests {
 
     #[test]
     fn generated_service_comments_begin_at_column_zero() {
-        let services = build_td_svc_conf();
+        let services = build_td_svc_conf(&SYSTEM);
         for line in services
             .lines()
             .filter(|line| line.trim_start().starts_with('#'))
@@ -7197,7 +7768,7 @@ mod tests {
         assert!(unit_key("firefox-soak", "requires").is_none());
 
         assert!(
-            !build_td_svc_conf().contains("/bin/td-ui-demo"),
+            !build_td_svc_conf(&SYSTEM).contains("/bin/td-ui-demo"),
             "the synthetic client must not remain on the system boot path"
         );
     }
@@ -7477,7 +8048,7 @@ mod tests {
             .split("#[cfg(test)]")
             .next()
             .unwrap();
-        let shutdown = build_shutdown();
+        let shutdown = build_shutdown(&SYSTEM);
         for (app, variant, location, consumer) in [
             ("firefox", "FirefoxDownloads", "xdg-download", "firefox"),
             ("mail", "MailDownloads", "xdg-download", "mail"),
@@ -7738,7 +8309,7 @@ mod tests {
     /// are needed.
     #[test]
     fn the_sshd_unit_is_captured_and_still_reaches_the_console() {
-        let table = build_td_svc_conf();
+        let table = build_td_svc_conf(&SYSTEM);
         let sshd = table
             .split("[sshd]")
             .nth(1)
@@ -8042,7 +8613,7 @@ mod tests {
         // The shape check names the binary, its companion, and both
         // initramfs's copies and links; nothing refuses cryptsetup in
         // either any longer.
-        let check = shape_check();
+        let check = shape_check(&SYSTEM);
         for needle in [
             "\"$root/bin/cryptsetup\"",
             "{in:cryptsetup-x86-64}/bin/cryptsetup.static",
@@ -8775,7 +9346,7 @@ mod tests {
         };
         let why = real_root_steps(&system).err().unwrap();
         assert!(why.contains("fixture has no application permissions"));
-        let recipe = invalid_system_policy(&why);
+        let recipe = invalid_system_policy(&system, &why);
         assert!(
             matches!(recipe.steps.as_deref(), Some([Step::Require { paths, exec: false }])
             if paths == &["{out}/invalid-system-application-policy--fixture-has-no-application-permissions"])
@@ -8880,8 +9451,8 @@ mod tests {
             .unwrap();
         assert_eq!(file.1, text);
         assert!(!file.2);
-        assert!(shape_check().contains(application_etc_name(BUS_APPLICATION_POLICY)));
-        assert!(shape_check().contains(&format!(
+        assert!(shape_check(&SYSTEM).contains(application_etc_name(BUS_APPLICATION_POLICY)));
+        assert!(shape_check(&SYSTEM).contains(&format!(
             "$(ls -ld \"$root{BUS_APPLICATION_POLICY}\" | cut -c1-10)\" = -r--r--r--"
         )));
         let mode_step = format!("'{{root}}/real-root{BUS_APPLICATION_POLICY}'");
@@ -8914,7 +9485,7 @@ mod tests {
             .any(|(name, contents, exec)| *name == "td-elevation.tsv"
                 && *contents == build_elevation_table()
                 && !exec));
-        assert!(shape_check().contains(
+        assert!(shape_check(&SYSTEM).contains(
             "[ \"$(ls -ld \"$root/etc/td-elevation.tsv\" | cut -c1-10)\" = -r--r--r-- ]"
         ));
         let mode_step = format!("'{{root}}/real-root{ELEVATION_TABLE}'");
@@ -9810,6 +10381,8 @@ mod tests {
             runtime_recipe: Some(super::super::empty_runtime::recipe),
         }];
         let fixture = SystemDef {
+            stem: SYSTEM.stem,
+            profile: SYSTEM.profile,
             hostname: SYSTEM.hostname,
             os_name: SYSTEM.os_name,
             os_version: SYSTEM.os_version,
@@ -9982,7 +10555,7 @@ mod tests {
         // The build-time half, asserted the way the td-init legs above it are. Match each
         // leg's whole condition, not just the loop header: the header survives every
         // weakening the legs can suffer, `-L` included.
-        let shape = shape_check();
+        let shape = shape_check(&SYSTEM);
         assert!(
             shape.contains(&format!(
                 "for a in {}; do if [ -e \"$root/bin/$a\" ] || [ -L \"$root/bin/$a\" ]; then",
@@ -10468,6 +11041,8 @@ mod tests {
 
     fn application_name_collisions(sys: &SystemDef) -> Vec<&'static str> {
         let without_applications = SystemDef {
+            stem: sys.stem,
+            profile: sys.profile,
             hostname: sys.hostname,
             os_name: sys.os_name,
             os_version: sys.os_version,
@@ -10509,6 +11084,8 @@ mod tests {
             },
         ];
         let fixture = SystemDef {
+            stem: SYSTEM.stem,
+            profile: SYSTEM.profile,
             hostname: SYSTEM.hostname,
             os_name: SYSTEM.os_name,
             os_version: SYSTEM.os_version,
@@ -10518,7 +11095,7 @@ mod tests {
             applications: COLLIDING,
         };
         assert_eq!(application_name_collisions(&fixture), vec!["rg", "td-netd"]);
-        let shape = shape_check();
+        let shape = shape_check(&SYSTEM);
         assert!(!shape.contains("= /bin/td-jail ]"));
         assert!(shape.contains(&format!(
             "for a in {FIREFOX_NAME} {TD_MAIL_NAME} {TD_NEWS_NAME}; do \
@@ -10995,7 +11572,7 @@ mod tests {
     /// runs inside the image build, which is why it is asserted here.
     #[test]
     fn the_etc_symlink_sweep_counts_both_tables() {
-        let check = shape_check();
+        let check = shape_check(&SYSTEM);
         let names = |table: &[&str]| format!("for a in {}; do", table.join(" "));
         let immutable: Vec<&str> = IMMUTABLE_ETC.iter().map(|entry| entry.etc).collect();
         let mutable = mutable_etc_names();
@@ -11157,7 +11734,7 @@ mod tests {
                 entry.etc
             );
         }
-        for dir in etc_dirs() {
+        for dir in etc_dirs(&SYSTEM) {
             let path = format!("{{root}}/real-root/etc/{dir}");
             assert!(
                 steps
@@ -11647,7 +12224,7 @@ mod tests {
              from the ended login session - otherwise its errors go to a descriptor returning \
              EIO and a greeter that cannot reach td-svc looks like a hang with no explanation"
         );
-        let shutdown = build_shutdown();
+        let shutdown = build_shutdown(&SYSTEM);
         let xdg_guard = format!("if /bin/td-util test -e {FIREFOX_XDG_MOUNT_MARKER}; then");
         let download_unmount = "/bin/umount \"$downloads\" || {";
         assert!(
@@ -12851,22 +13428,25 @@ mod tests {
         }
 
         let launch = format!("{PRIMARY_PROBE_LAUNCHER} /bin/sh -c '");
-        let mut bodies = 0;
-        for (name, script, _) in etc_files(&SYSTEM).unwrap() {
-            assert!(!script.contains("/bin/su"), "{name} still runs /bin/su");
-            for (at, _) in script.match_indices(&launch) {
-                let rest = script.get(at + launch.len()..).unwrap();
-                let body = rest.split_once('\'').map(|(body, _)| body).unwrap();
-                let problems = primary_probe_inherited_reads(body);
-                assert!(
-                    problems.is_empty(),
-                    "an exec-primary probe in /etc/{name} {problems:?}: {body}"
-                );
-                bodies += 1;
+        // Rootcheck's two, bootsuccess's thirteen and netup's one; the
+        // server's bootsuccess has no session-bus probe.
+        for (sys, expected) in [(&SYSTEM, 16), (&SERVER, 15)] {
+            let mut bodies = 0;
+            for (name, script, _) in etc_files(sys).unwrap() {
+                assert!(!script.contains("/bin/su"), "{name} still runs /bin/su");
+                for (at, _) in script.match_indices(&launch) {
+                    let rest = script.get(at + launch.len()..).unwrap();
+                    let body = rest.split_once('\'').map(|(body, _)| body).unwrap();
+                    let problems = primary_probe_inherited_reads(body);
+                    assert!(
+                        problems.is_empty(),
+                        "an exec-primary probe in /etc/{name} {problems:?}: {body}"
+                    );
+                    bodies += 1;
+                }
             }
+            assert_eq!(bodies, expected, "{:?}", sys.profile);
         }
-        // Rootcheck's two, bootsuccess's thirteen and netup's one.
-        assert_eq!(bodies, 16);
     }
 
     /// The read-only-root self-check must emit both diagnostic markers the headless
@@ -12946,7 +13526,7 @@ mod tests {
             "the write marker must require a fresh path and a successful sync"
         );
         let bootsuccess = build_bootsuccess(&SYSTEM);
-        let services = build_td_svc_conf();
+        let services = build_td_svc_conf(&SYSTEM);
         let bootfail = build_bootfail();
         let profile = build_profile(&SYSTEM);
         assert!(
@@ -13520,7 +14100,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
     /// into a cargo-test failure.
     #[test]
     fn shape_check_asks_the_initramfs_for_members_it_actually_packs() {
-        let check = shape_check();
+        let check = shape_check(&SYSTEM);
         let specs = [
             (
                 "selector",
@@ -13729,7 +14309,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         // `ls -ld` and `cut`, because the check runs under the post-Rust tool
         // farm, which links no `stat`: a check that named `stat` would
         // refuse every image build.
-        let check = shape_check();
+        let check = shape_check(&SYSTEM);
         assert!(
             check.contains(&format!(
                 "[ \"$(ls -ld \"{TERMINFO_ENTRY}\" | cut -c1-10)\" = -r--r--r-- ]"
@@ -13909,7 +14489,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         // with the rest because a symlink to a target the build tree does not
         // hold is DANGLING, which `-e` alone reads as absent: exactly how a
         // repacked multiplexer entry would slip through.
-        let shape = shape_check();
+        let shape = shape_check(&SYSTEM);
         for leg in [r#"if [ -e "$root/bin/busybox" ] || [ -L "$root/bin/busybox" ]; then"#] {
             assert!(
                 shape.contains(leg),
@@ -13923,7 +14503,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         // store path is outside the image's staging paths, which take only
         // declared inputs (StageRuntimeClosure refuses any other reference).
         assert!(
-            shape_check().contains("\"$tu\" cpio -t"),
+            shape_check(&SYSTEM).contains("\"$tu\" cpio -t"),
             "shape_check no longer parses the archives with td-util's cpio"
         );
         assert!(
@@ -14005,7 +14585,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
             .unwrap();
         assert!(written[0] < packed);
         // The build's own listing of both archives agrees.
-        let check = shape_check();
+        let check = shape_check(&SYSTEM);
         assert!(
             check.contains("printf '%s\\n' \"$init_list\" | grep -q -x -F etc/td-login-tier || {")
         );
@@ -14206,7 +14786,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
             )) && !deployment.contains(&format!("slink /bin/{reboot} ")),
             "only the selector initramfs may link /bin/{reboot}"
         );
-        let shape = shape_check();
+        let shape = shape_check(&SYSTEM);
         for leg in [
             "grep -q -x -F 'bin/reboot -> {in:td-init}/bin/td-init'",
             "printf '%s\\n' \"$init_list\" | grep -q -x -F bin/reboot; then",
@@ -14634,7 +15214,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
             !bootsuccess.contains(TD_FIREFOX_SUPPORT_MARKER),
             "browser support evidence must not control deployment boot success"
         );
-        let services = build_td_svc_conf();
+        let services = build_td_svc_conf(&SYSTEM);
         let evidence_probe = services
             .find(&format!(
                 "/bin/td-compositor probe-application {FIREFOX_WINDOW_READY_SOCKET} \
@@ -14916,7 +15496,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         // line of the shipped inittab" and "the pivot's fail-early refusal is gone" into a
         // named per-change failure instead of an image that does not come up; they run in the
         // recipe-checks tier, so nothing else here would notice their deletion.
-        let shape = shape_check();
+        let shape = shape_check(&SYSTEM);
         assert!(
             shape.contains("init --dry-run -f \"$root/etc/inittab\""),
             "shape_check must dry-run the image's OWN /etc/inittab through the packed td-init \
@@ -14962,7 +15542,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         // setuid exec cannot reach the switch. This is the other half: the shipped
         // artifact is inspected, because the crate's own tests can only see modes
         // td-login itself constructs, never the one the packer left on the file.
-        let shape = shape_check();
+        let shape = shape_check(&SYSTEM);
         assert!(
             shape.contains("*[sS]*)") && shape.contains("setuid/setgid bit"),
             "the shape check must refuse a packed td-login carrying a setuid or \
@@ -15309,6 +15889,24 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
     /// a per-file assertion would not have noticed.
     #[test]
     fn reboots_run_the_teardown_first() {
+        assert_eq!(
+            power_initiators(&SYSTEM),
+            2,
+            "expected exactly the two known power initiators (tty-session, bootfail), each \
+             asking td-svc; a new one must ask it too, and a vanished one means this stopped \
+             covering it"
+        );
+        assert_eq!(
+            power_initiators(&SERVER),
+            1,
+            "a server's one power initiator is healthwatch"
+        );
+    }
+
+    /// Every generated /etc file of `sys` asks td-svc for a power transition
+    /// rather than running an applet or the teardown itself; the count of
+    /// such requests.
+    fn power_initiators(sys: &SystemDef) -> usize {
         // The refusal PROBES name the applets on purpose — with a bogus argument they must
         // refuse — so strip the generated probe segments first; they are the one invocation
         // that does not end a boot.
@@ -15316,7 +15914,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         // script switched to either would escape a reboot-only scan while the count still held.
         const POWER: &[&str] = &["reboot", "poweroff", "halt"];
         let mut initiators = 0;
-        for (name, body, _) in etc_files(&SYSTEM).unwrap() {
+        for (name, body, _) in etc_files(sys).unwrap() {
             let mut body = body;
             for (applet, probe) in TD_INIT_FARM {
                 body = body.replace(&td_init_probe(applet, probe), "");
@@ -15343,12 +15941,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
                  stopped; running it here unmounts /var out from under them"
             );
         }
-        assert_eq!(
-            initiators, 2,
-            "expected exactly the two known power initiators (tty-session, bootfail), each \
-             asking td-svc; a new one must ask it too, and a vanished one means this stopped \
-             covering it"
-        );
+        initiators
     }
 
     /// td-netd must be packed and symlinked into /bin, and resolv.conf/hosts must be
@@ -15407,7 +16000,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
     /// would verify nothing at all and stay green. Cheaper to assert none survive.
     #[test]
     fn the_shape_check_ships_no_unreplaced_placeholders() {
-        let shape = shape_check();
+        let shape = shape_check(&SYSTEM);
         let mut left: Vec<String> = Vec::new();
         let mut rest = shape.as_str();
         while let Some(open) = rest.find('@') {
@@ -15909,7 +16502,7 @@ mod principal_tests {
                 &build_shadow(&SYSTEM),
             )
             .unwrap();
-        assert!(build_td_svc_conf().contains("--application-primary --enroll-principals\n"));
+        assert!(build_td_svc_conf(&SYSTEM).contains("--application-primary --enroll-principals\n"));
         assert!(etc_files(&SYSTEM)
             .unwrap()
             .iter()
@@ -15947,5 +16540,351 @@ mod principal_tests {
         assert_eq!(registry.application(UI_UID, "mail").unwrap().uid, 65537);
         assert_eq!(registry.application(UI_UID, "news").unwrap().uid, 65538);
         assert!(text.ends_with("application\t1000\tmail\t65537\napplication\t1000\tnews\t65538\n"));
+    }
+}
+
+#[cfg(test)]
+mod server_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    fn value<'a>(keys: &'a [(String, String)], key: &str) -> Option<&'a str> {
+        keys.iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.as_str())
+    }
+
+    fn except(keys: &[(String, String)], changed: &[&str]) -> Vec<(String, String)> {
+        keys.iter()
+            .filter(|(key, _)| !changed.contains(&key.as_str()))
+            .cloned()
+            .collect()
+    }
+
+    /// Every server unit is the desktop's stanza key for key, but the two a
+    /// server changes on purpose, so a fix to a shared unit reaches both
+    /// profiles or neither.
+    #[test]
+    fn server_units_are_the_desktops_stanzas() {
+        let desktop = tests::parse_table(&build_td_svc_conf(&SYSTEM));
+        let server = tests::parse_table(&build_td_svc_conf(&SERVER));
+        let names: Vec<&str> = server.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, SERVER_TD_SVC_UNITS);
+        for (name, keys) in &server {
+            // The server's own unit: the reboot a greeter's park would own.
+            if name == "healthwatch" {
+                assert_eq!(value(keys, "type"), Some("oneshot"));
+                assert_eq!(value(keys, "exec"), Some("/etc/healthwatch"));
+                assert_eq!(value(keys, "after"), Some("bootsuccess"));
+                assert_eq!(value(keys, "requires"), None);
+                assert!(!desktop.iter().any(|(unit, _)| unit == name));
+                continue;
+            }
+            let stock = desktop
+                .iter()
+                .find(|(unit, _)| unit == name)
+                .map(|(_, keys)| keys)
+                .unwrap_or_else(|| panic!("{name} is not a desktop unit"));
+            match name.as_str() {
+                "td-firstboot" => {
+                    assert_eq!(value(keys, "exec"), Some("/bin/td-firstboot provision"));
+                    assert_eq!(except(keys, &["exec"]), except(stock, &["exec"]));
+                }
+                "bootsuccess" => {
+                    assert_eq!(value(keys, "requires"), Some("sshd,hostname"));
+                    assert_eq!(
+                        value(keys, "after"),
+                        Some("hostname,td-firstboot,rootcheck,netup,profiler-evidence,sshd")
+                    );
+                    assert_eq!(
+                        except(keys, &["after", "requires"]),
+                        except(stock, &["after", "requires"])
+                    );
+                }
+                _ => assert_eq!(keys, stock, "{name}"),
+            }
+        }
+    }
+
+    /// The server declares and stages none of the desktop's packages, and
+    /// `DESKTOP_INPUTS` names only packages the desktop really declares.
+    #[test]
+    fn the_server_packs_nothing_graphical() {
+        let server = server_recipe();
+        let desktop = recipe();
+        let server_inputs = server.native_inputs.clone().unwrap_or_default();
+        let desktop_inputs = desktop.native_inputs.clone().unwrap_or_default();
+        let canonical = server.to_json().to_canonical();
+        for input in DESKTOP_INPUTS {
+            assert!(desktop_inputs.iter().any(|name| name == input), "{input}");
+            assert!(!server_inputs.iter().any(|name| name == input), "{input}");
+            assert!(!canonical.contains(&format!("{{in:{input}}}")), "{input}");
+        }
+        assert_eq!(server.name, "server-x86-64");
+        assert!(server.payload_inputs.is_none());
+        assert!(!canonical.contains("{payload:"));
+        for kept in [
+            "openssh-x86-64",
+            "td-svc",
+            "td-netd",
+            "td-jail",
+            "td-term-terminfo",
+        ] {
+            assert!(server_inputs.iter().any(|name| name == kept), "{kept}");
+        }
+        assert_eq!(
+            desktop_inputs.len() - DESKTOP_INPUTS.len(),
+            server_inputs.len()
+        );
+        // An allowlist over the denylist above: a package newly added to
+        // the shared inputs reaches the server only by being named here.
+        let mut sorted = server_inputs.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            sorted,
+            [
+                "ca-certificates",
+                "cryptsetup-x86-64",
+                "fd",
+                "gcc-runtime",
+                "git-x86-64",
+                "glibc-x86-64",
+                "linux-x86-64",
+                "openssh-x86-64",
+                "ripgrep",
+                "td-boot",
+                "td-btrfs",
+                "td-firstboot",
+                "td-init",
+                "td-jail",
+                "td-kexec",
+                "td-link-runtime",
+                "td-login",
+                "td-net",
+                "td-netd",
+                "td-profiler",
+                "td-secret",
+                "td-sh",
+                "td-svc",
+                "td-term-terminfo",
+                "td-txt",
+                "td-util",
+                "tzdata",
+                "uutils",
+                "zlib-x86-64",
+            ]
+        );
+    }
+
+    /// The shape check's absent sweep is the desktop's `/bin` roster minus
+    /// the server's, so every desktop program is covered by construction.
+    #[test]
+    fn the_server_sweeps_every_desktop_only_bin_name() {
+        let names = desktop_only_bin().unwrap();
+        for name in [
+            "td-seatd",
+            "td-compositor",
+            "td-ctl",
+            "td-busd",
+            "td-portal",
+            "td-authd",
+            "td-update",
+            "td-install",
+            "td-setup",
+            "td-vm-guest",
+            "td-term",
+            "td-taskmgr",
+            "td-review",
+            "td-agent",
+            "td-photo",
+            "td-pass",
+            "td-dua",
+            "td-editor",
+            "td-fetchd",
+            "td-app",
+            "td-test-https",
+        ] {
+            assert!(names.iter().any(|packed| packed == name), "{name}");
+        }
+        let server = real_root_steps(&SERVER).unwrap();
+        for step in &server {
+            if let Step::Symlink { link, .. } = step {
+                assert!(
+                    !names
+                        .iter()
+                        .any(|name| *link == format!("{{root}}/real-root/bin/{name}")),
+                    "{link}"
+                );
+            }
+        }
+        assert!(shape_check(&SERVER).contains("td-taskmgr"));
+    }
+
+    #[test]
+    fn profile_sections_keep_one_profile_and_strip_every_marker() {
+        let text = "a; @DESKTOP{@d; @}DESKTOP@b; @SERVER{@s; @}SERVER@c";
+        assert_eq!(profile_sections(Profile::Desktop, text), "a; d; b; c");
+        assert_eq!(profile_sections(Profile::Server, text), "a; b; s; c");
+        // An unmatched marker stays where the shell will refuse to run it.
+        assert_eq!(
+            profile_sections(Profile::Server, "a; @DESKTOP{@b"),
+            "a; @DESKTOP{@b"
+        );
+        for sys in [&SYSTEM, &SERVER] {
+            let check = shape_check(sys);
+            for marker in [DESKTOP_OPEN, DESKTOP_CLOSE, SERVER_OPEN, SERVER_CLOSE] {
+                assert!(!check.contains(marker), "{:?}: {marker}", sys.profile);
+            }
+            let placeholder = check.split('@').skip(1).step_by(2).find(|word| {
+                !word.is_empty()
+                    && word
+                        .bytes()
+                        .all(|byte| byte.is_ascii_uppercase() || byte == b'_')
+            });
+            assert_eq!(placeholder, None, "{:?}", sys.profile);
+        }
+        let server = shape_check(&SERVER);
+        assert!(server.contains("a server packs no graphical"));
+        assert!(!server.contains("{in:td-seatd}"));
+        assert!(!shape_check(&SYSTEM).contains("a server packs no graphical"));
+    }
+
+    #[test]
+    fn no_console_logs_anyone_into_a_server() {
+        let files = etc_files(&SERVER).unwrap();
+        let names: Vec<&str> = files.iter().map(|(name, _, _)| *name).collect();
+        for absent in [
+            "autologin",
+            "tty-session",
+            "bootfail",
+            "firefox-tls-setup",
+            application_etc_name(ELEVATION_TABLE),
+            application_etc_name(BUS_APPLICATION_POLICY),
+            td_portal_settings_etc_name(),
+        ] {
+            assert!(!names.contains(&absent), "{absent}");
+        }
+        // td-jail ships, so its product configuration does too.
+        assert!(names.contains(&application_etc_name(APPLICATION_CONFIG)));
+        let healthwatch = build_healthwatch();
+        assert!(healthwatch.contains("exec /bin/td-svc reboot"));
+        assert!(healthwatch.contains(SERVER_HEALTH_REBOOT_MARKER));
+        assert!(healthwatch.contains(&format!(
+            "= {HEALTH_RECORD_SUCCESS} ]; then echo {SERVER_HEALTH_STEADY_MARKER}; exit 0; fi"
+        )));
+        assert!(
+            build_bootsuccess(&SERVER).contains(&format!("finish {HEALTH_RECORD_SUCCESS}; exit 0"))
+        );
+        assert!(healthwatch.contains(HEALTH_RECORD));
+        // A failure reboots a server, so its token-free health retries for
+        // the whole ceiling; the desktop keeps its shorter default.
+        for (sys, retry) in [
+            (&SERVER, BOOT_SUCCESS_RETRY_MAX_SECS),
+            (&SYSTEM, BOOT_SUCCESS_RETRY_SECS),
+        ] {
+            let script = build_bootsuccess(sys);
+            assert!(script.contains(&format!("wait={retry}; refusal_fixture=0")));
+            assert!(script.contains(&format!("0) wait={retry};; esac")));
+        }
+        for required in shape_etc_files(&SERVER) {
+            assert!(names.contains(&required), "{required}");
+        }
+        // The account preflight needs the primary session's reservations;
+        // a server reserves no application.
+        let principals = files
+            .iter()
+            .find(|(name, _, _)| *name == application_etc_name(PRINCIPALS_PATH))
+            .map(|(_, contents, _)| contents.as_str());
+        assert_eq!(principals, Some(build_principals(&SERVER).as_str()));
+        assert!(!build_principals(&SERVER).contains("application\t"));
+        let table = build_td_svc_conf(&SERVER);
+        assert!(!table.contains("tty="));
+        assert!(!table.contains("login-primary"));
+        assert!(!table.contains("--enroll-principals"));
+        let profile = build_profile(&SERVER);
+        assert!(!profile.contains(GREETER_MARKER));
+        assert!(!profile.contains("WAYLAND_DISPLAY"));
+        assert!(profile.contains(SERVER.motd));
+        assert!(!build_bootsuccess(&SERVER).contains("td-busd"));
+        assert!(build_bootsuccess(&SYSTEM).contains("/bin/td-busd probe"));
+        assert!(!build_shutdown(&SERVER).contains("td-authd"));
+        assert!(!build_deployment_init(&SERVER).contains("Downloads"));
+        assert!(build_deployment_init(&SYSTEM).contains("Downloads"));
+    }
+
+    #[test]
+    fn a_server_has_no_desktop_service_account() {
+        let passwd = build_passwd(&SERVER);
+        for user in [
+            COMPOSITOR_USER,
+            BROKER_USER,
+            PORTAL_USER,
+            AUDIO_USER,
+            INSTALLER_USER,
+        ] {
+            assert!(!passwd.contains(&format!("{user}:")), "{user}");
+        }
+        let primary = SERVER
+            .users
+            .iter()
+            .find(|user| user.name == SERVER.autologin)
+            .unwrap();
+        assert_eq!(primary.uid, UI_UID);
+        assert!(passwd.contains(&format!("{SSHD_PRIVSEP_USER}:")));
+        assert!(build_shadow(&SERVER).contains(ROOT_SHADOW_LINE));
+    }
+
+    /// The account invariants `system_def_is_self_consistent` holds for the
+    /// desktop that do not depend on a seat or a console login.
+    #[test]
+    fn the_servers_accounts_are_self_consistent() {
+        let users = SERVER.users;
+        for user in users {
+            for (what, same) in [
+                ("name", users.iter().filter(|u| u.name == user.name).count()),
+                ("uid", users.iter().filter(|u| u.uid == user.uid).count()),
+                ("gid", users.iter().filter(|u| u.gid == user.gid).count()),
+            ] {
+                assert_eq!(same, 1, "{} has a shared {what}", user.name);
+            }
+            assert!(!(user.passwordless && user.service_only), "{}", user.name);
+            assert!(
+                !(user.uid == 0 && (user.passwordless || user.service_only)),
+                "root must stay locked"
+            );
+            if user.service_only {
+                assert_eq!(user.shell, "/bin/false", "{}", user.name);
+            }
+            assert_ne!(user.uid, SSHD_PRIVSEP_UID, "{}", user.name);
+            assert_ne!(user.gid, SSHD_PRIVSEP_GID, "{}", user.name);
+            assert!(valid_account_name(user.name), "{}", user.name);
+            assert!(valid_home(user.uid, user.home), "{}", user.name);
+            assert!(
+                user.shell
+                    .strip_prefix("/bin/")
+                    .is_some_and(|a| TD_SH_APPLETS.contains(&a) || UUTILS_APPLETS.contains(&a)),
+                "{}",
+                user.name
+            );
+        }
+        // `exec-primary`, which every health probe runs through, resolves
+        // the primary from passwd and refuses a locked account.
+        let primary = crate::primary_account::parse(&build_passwd(&SERVER)).unwrap();
+        assert_eq!(primary.name(), SERVER.autologin);
+        assert!(users
+            .iter()
+            .any(|user| user.name == SERVER.autologin && user.passwordless && user.uid != 0));
+        let groups = build_group(&SERVER);
+        let gids: Vec<&str> = groups
+            .lines()
+            .filter_map(|line| line.split(':').nth(2))
+            .collect();
+        for gid in &gids {
+            assert_eq!(
+                gids.iter().filter(|other| other == &gid).count(),
+                1,
+                "{gid}"
+            );
+        }
     }
 }

@@ -34,6 +34,11 @@ const STEPS: &[Step] = &[
         proves: "the system image boots to its services and session",
     },
     Step {
+        name: "qemu-boot-server",
+        argv: &["qemu-boot-server"],
+        proves: "the headless server image boots to its system units and OpenSSH with nothing graphical, and a candidate that fails health reboots itself until it rolls back",
+    },
+    Step {
         name: "qemu-deploy-rollback",
         argv: &["qemu-deploy-rollback"],
         proves: "an approved deploy-rollback selects the previous system, and an approved set-hostname names the system, at the next boot",
@@ -335,7 +340,7 @@ mod tests {
         assert_eq!(code, 0);
         assert!(
             line.contains(
-                "of 4 oracle(s), 1 passed (0 from the memo), 1 unprovisioned, 0 failed, 2 not run"
+                "of 5 oracle(s), 1 passed (0 from the memo), 1 unprovisioned, 0 failed, 3 not run"
             ),
             "{line}"
         );
@@ -347,13 +352,14 @@ mod tests {
         let (line, code) = verdict(&warm_gap);
         assert_eq!(code, td_engine::exit::EXIT_UNPROVISIONED);
         assert!(
-            line.contains("0 passed (0 from the memo), 0 unprovisioned, 0 failed, 4 not run"),
+            line.contains("0 passed (0 from the memo), 0 unprovisioned, 0 failed, 5 not run"),
             "{line}"
         );
         // Every oracle from the memo, warm skipped: a pass that booted nothing,
         // counted as passed and said to be the memo's.
         let all_memo = [
             ("qemu-boot-system", Outcome::Memo, s(0)),
+            ("qemu-boot-server", Outcome::Memo, s(0)),
             ("qemu-deploy-rollback", Outcome::Memo, s(0)),
             ("qemu-boot-live", Outcome::Memo, s(0)),
             ("qemu-install-system", Outcome::Memo, s(0)),
@@ -361,7 +367,7 @@ mod tests {
         let (line, code) = verdict(&all_memo);
         assert_eq!(code, 0);
         assert!(
-            line.contains("4 passed (4 from the memo), 0 unprovisioned"),
+            line.contains("5 passed (5 from the memo), 0 unprovisioned"),
             "{line}"
         );
         assert_eq!(Outcome::Memo.word(), "memo");
