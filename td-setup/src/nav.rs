@@ -1,6 +1,7 @@
 //! The step buttons: Back and Next at the right of every step page's
 //! footer row, so the wizard can be walked with the pointer as with
-//! Escape and Return. A button is a view of the page's own keys: it holds
+//! Escape and Return. Welcome labels the two slots Reinstall and Fresh
+//! install, with Reinstall following its R shortcut. A button is a view of the page's own keys: it holds
 //! no state and authorizes nothing the key would not.
 //!
 //! The two are fixed slots of one width, Next always rightmost and Back
@@ -12,7 +13,7 @@ use td_ui::chrome::{Button, Status, BUTTON_MARGIN};
 use td_ui::raster::{Draw, Rect, Surface};
 use td_ui::CELL_WIDTH;
 
-/// What a step button does: what Escape or Return does on its page.
+/// A step slot; the page maps it to its action (R or Return on welcome).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Go {
     Back,
@@ -27,16 +28,16 @@ pub struct Steps {
     pub next: Option<(&'static str, bool)>,
 }
 
-/// Welcome's one step button, which the live window and the still
+/// Welcome's two installation choices, which the live window and the still
 /// preview both paint.
 pub const WELCOME: Steps = Steps {
-    back: None,
-    next: Some(("Next", true)),
+    back: Some("Reinstall"),
+    next: Some(("Fresh install", true)),
 };
 
-/// The cells a label may take, the longest's ("Withdraw"); a slot is a
+/// The cells a label may take, the longest's ("Fresh install"); a slot is a
 /// cell wider each side.
-const LABEL_CELLS: usize = 8;
+const LABEL_CELLS: usize = 13;
 const SLOT_CELLS: usize = LABEL_CELLS + 2;
 
 /// The two slots laid out on a surface's footer row, flush right.
@@ -159,10 +160,13 @@ mod tests {
             let back = nav.back.unwrap().1.rect();
             let next = nav.next.unwrap().2.rect();
             // Next ends a cell from the right; Back a cell before it; both
-            // ten cells wide, inside the row's margins.
+            // fifteen cells wide, inside the row's margins.
             assert_eq!(next.x + i64::from(next.width), 800 * s - 8 * s);
             assert_eq!(back.x + i64::from(back.width), next.x - 8 * s);
-            assert_eq!((back.width, next.width), ((80 * s) as u32, (80 * s) as u32));
+            assert_eq!(
+                (back.width, next.width),
+                ((120 * s) as u32, (120 * s) as u32)
+            );
             assert_eq!(next.y, footer.y + 2 * s);
             assert_eq!(next.y + i64::from(next.height), footer.y + 22 * s);
             assert_eq!(nav.hit(back.x + s, back.y + 4 * s), Some(Go::Back));
@@ -192,12 +196,12 @@ mod tests {
         }
         let lone = Nav::new(surface, WELCOME).unwrap();
         assert_eq!(lone.next.unwrap().2.rect(), next);
-        // Labels are centred: Back two cells in, Withdraw none.
-        assert_eq!(centred("Back"), "  Back");
-        assert_eq!(centred("Withdraw"), "Withdraw");
-        assert_eq!(centred("Install"), "Install");
+        // Labels are centred within the shared slots.
+        assert_eq!(centred("Back"), "    Back");
+        assert_eq!(centred("Withdraw"), "  Withdraw");
+        assert_eq!(centred("Install"), "   Install");
         let long = Steps {
-            back: Some("Withdrawn!"),
+            back: Some("Label too long"),
             next: None,
         };
         assert!(Nav::new(surface, long).is_none());

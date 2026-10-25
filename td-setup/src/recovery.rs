@@ -22,8 +22,7 @@ use td_ui::{CELL_HEIGHT, CELL_WIDTH};
 const INSET: usize = CELL_WIDTH;
 const ASKING_FOOTER: &str = "Recovery key \u{b7} step 6 of 6";
 const SHOWN_FOOTER: &str = "Recovery key \u{b7} step 6 of 6 \u{b7} Return to type it back";
-const TYPE_BACK_FOOTER: &str =
-    "Recovery key \u{b7} step 6 of 6 \u{b7} Return confirms \u{b7} Escape shows it again";
+const TYPE_BACK_FOOTER: &str = "Recovery key \u{b7} step 6 of 6 \u{b7} Escape shows the key again";
 /// The type-back field's row, and the rows under it.
 const FIELD_ROW: usize = 5;
 const FEEDBACK_ROW: usize = 7;

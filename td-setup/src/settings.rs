@@ -19,7 +19,7 @@ const PLACEHOLDERS: [&str; 4] = [
     "Select a layout",
     "Select a time zone",
 ];
-const FOOTER: &str = "Account and region \u{b7} step 3 of 6 \u{b7} Return on Time zone to review";
+const FOOTER: &str = "Account and region \u{b7} step 3 of 6";
 /// The row under the last field that says what became of a review.
 const NOTICE_ROW: usize = 18;
 /// The one keyboard layout the installer offers.

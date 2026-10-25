@@ -64,8 +64,9 @@ Networking can be configured after booting the installed system.
 
 ## Reinstall while keeping personal files
 
-On welcome, `r` chooses reinstall; Return chooses the existing whole-disk
-installation. Reinstall lists eligible disks through the same media exclusion
+On welcome, the Reinstall button (or `r`) chooses reinstall; Fresh install
+(or Return) chooses whole-disk installation. Both are clickable footer
+buttons. Reinstall lists eligible disks through the same media exclusion
 and exclusive-claim checks. Return on the chosen disk asks root to inspect
 its existing installation. It skips editable account settings. The review
 names the saved account, hostname, timezone and unchanged filesystem UUID,
@@ -262,12 +263,13 @@ welcome whole again.
 Every step page shows step buttons at the right of its footer row,
 laid out by td-setup's `nav` over td-ui's `Button`: Back where Escape
 steps back and Next where Return steps on, each named for what it does
-there: Next on welcome, the disk list and the shown recovery key, Review
-on settings, Install on the review, Confirm on the type-back, and
+there: Reinstall and Fresh install on welcome, Next on the disk list and
+the shown recovery key, Review on settings, Install on the review, Confirm on the type-back, and
 Withdraw alone on the consent view; the waiting, unavailable and refused
-notices have Back alone. The two are fixed slots ten cells wide, Next
-always rightmost and Back always left of it, a lone Back or Withdraw
-included, so a button never sits where the next page puts the other
+notices have Back alone. The two are fixed slots fifteen cells wide, Next
+always rightmost and Back always left of it; on welcome these slots choose
+Fresh install and Reinstall respectively. A lone Back or Withdraw is
+kept in its slot, so a button never sits where the next page puts the other
 kind. Next is painted as the default step, in the selection's colour,
 and disabled while Return would do nothing: with no disk selected, while
 a proposal or an execute is outstanding, or while a typed key is with

@@ -124,7 +124,7 @@ fn the_welcome_screen_discloses_the_storage_rule_and_auto_login_and_no_pin() {
         "Either way",
         "signs in automatically",
         "no password or PIN",
-        "erased",
+        "erase the selected disk",
     ] {
         assert!(prose.contains(phrase), "content discloses {phrase:?}");
     }
@@ -233,7 +233,7 @@ fn the_disclosure_prose_renders_below_the_rule() {
     // The first body row begins the first paragraph.
     assert!(rows
         .get(&72)
-        .is_some_and(|line| line.starts_with("Press R to reinstall td")));
+        .is_some_and(|line| line.starts_with("Choose Reinstall to keep")));
 }
 
 #[test]

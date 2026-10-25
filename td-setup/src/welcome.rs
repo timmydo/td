@@ -26,9 +26,10 @@ pub const HEADING: &str = "Install td";
 /// the review says which, and that the account signs in automatically
 /// with no password or PIN either way.
 pub const BODY: &[&str] = &[
-    "Press R to reinstall td and keep your personal files, account and settings. \
-     This requires an existing unencrypted td installation. Or press Return \
-     for a new installation. The selected disk will be erased.",
+    "Choose Reinstall to keep your personal files, account and settings. \
+     This requires an existing unencrypted td installation. Choose Fresh install \
+     to erase the selected disk and install a new system. Both choices show a review \
+     before changing the disk.",
     "For a new installation, storage will be encrypted to this computer when it has a usable TPM 2.0 \
      and a screen and keyboard its startup recovery prompt can use. \
      Otherwise it is not encrypted, and anyone who has the disk can read its \
@@ -43,7 +44,7 @@ pub const BODY: &[&str] = &[
 /// The status-row footer naming this step of the wizard. INSTALLER.md's
 /// sequence is welcome, destination disk, account and regional settings,
 /// review, installation progress, completion: six steps.
-pub const FOOTER: &str = "R: Reinstall and keep files \u{b7} Return: New installation";
+pub const FOOTER: &str = "Choose an installation mode \u{b7} step 1 of 6";
 
 /// The left and right text margin, in reference pixels: one cell, matching
 /// the chrome bands' inset.

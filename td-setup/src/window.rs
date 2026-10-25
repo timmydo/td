@@ -622,11 +622,13 @@ impl Wizard {
         }
     }
 
-    /// A step button: Back is the page's Escape and Next its Return, but
+    /// Welcome chooses reinstall or fresh install. Elsewhere Back is
+    /// the page's Escape and Next its Return, but
     /// on settings Next asks for the review from whichever field has the
     /// focus, as Return on the time zone does.
     fn go(&mut self, go: Go) -> Action {
         match (go, &self.page) {
+            (Go::Back, Page::Welcome) => self.key("r"),
             (Go::Back, _) => self.key("Escape"),
             (Go::Next, Page::Settings) => {
                 self.propose();
@@ -3865,8 +3867,8 @@ mod tests {
         assert_eq!(
             wizard.steps(),
             Steps {
-                back: None,
-                next: Some(("Next", true)),
+                back: Some("Reinstall"),
+                next: Some(("Fresh install", true)),
             }
         );
         let mut wizard_listed = listed();
@@ -3910,7 +3912,13 @@ mod tests {
         wizard.executing = Some([1; 32]);
         assert_eq!(wizard.steps(), both("Back", "Install", false));
         wizard.page = Page::Recovery(KeyStep::Shown);
-        assert_eq!(wizard.steps(), crate::nav::WELCOME);
+        assert_eq!(
+            wizard.steps(),
+            Steps {
+                back: None,
+                next: Some(("Next", true))
+            }
+        );
         wizard.page = Page::Recovery(KeyStep::TypeBack);
         assert_eq!(wizard.steps(), both("Back", "Confirm", true));
         wizard.confirming = true;
@@ -3963,6 +3971,27 @@ mod tests {
         let footer = surface.height as i64 - 12;
         let nav = Nav::new(surface, window.front.wizard.steps())?;
         (0..surface.width as i64).find(|x| nav.hit(*x, footer) == Some(go))
+    }
+
+    #[test]
+    fn both_welcome_buttons_choose_their_installation_mode_by_pointer() {
+        for (go, preserve) in [(Go::Back, true), (Go::Next, false)] {
+            let (mut window, _peer) = window();
+            window.front.wizard = Wizard::new();
+            shown_settled(&mut window);
+            let x = slot(&window, go).unwrap() + 4;
+            let y = window.surface().unwrap().height as i64 - 12;
+            window.pointer(pointer::Event::Motion((x * 256) as i32, (y * 256) as i32));
+            for pressed in [true, false] {
+                window.pointer(pointer::Event::Button {
+                    serial: 1,
+                    button: BUTTON_LEFT,
+                    pressed,
+                });
+            }
+            assert_eq!(window.front.wizard.preserve, preserve);
+            assert_ne!(window.front.wizard.page, Page::Welcome);
+        }
     }
 
     #[test]
