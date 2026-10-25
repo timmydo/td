@@ -632,10 +632,13 @@ and the account's `tls_ca_file` origin scope still apply. The ordinary
 
 ### Uncached mailbox loading
 
-Mailbox lists without automatic rules fetch headers and stored metadata first,
+Mailbox lists outside the configured automatic-rule folder scope fetch headers
+and stored metadata first,
 without downloading previews, MIME part lists or full message bodies. Opening a message fetches its body on demand. Loaded bodies remain cached when
 later summary refreshes update flags and folder membership. Offline lists can
 show cached summaries, but opening a summary whose body was never downloaded
 reports that the message is not cached instead of displaying an empty body.
-Automatic rules retain full-message input; CLI queries retain full bodies unless
+Automatic rules retain full-message input in matching folders, even for
+`headers_only` queries. Thread and keyword lookups use at most 256 IDs per call.
+CLI queries retain full bodies unless
 `headers_only` is requested.

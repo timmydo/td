@@ -1452,6 +1452,38 @@ fn thread_larger_than_256_preserves_all_members_in_bounded_batches() {
 }
 
 #[test]
+fn mailbox_listing_counts_large_threads_in_bounded_keyword_batches() {
+    let mut h = CliHarness::start();
+    h.server().seed_large_thread(300);
+    assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
+    let response = h.send(json!({
+        "command":"query_emails", "mailbox_id":"mbox-inbox", "headers_only":true
+    }));
+    assert!(response["ok"].is_true(), "{response}");
+    assert_eq!(
+        response["thread_counts"]["large-thread"]["total"].as_u64(),
+        Some(300)
+    );
+    assert_eq!(
+        response["thread_counts"]["large-thread"]["unread"].as_u64(),
+        Some(300)
+    );
+    let calls = h.server().read_calls();
+    let keyword_calls: Vec<_> = calls
+        .iter()
+        .filter(|call| {
+            call["properties"]
+                .as_array()
+                .is_some_and(|properties| properties.len() == 3)
+        })
+        .collect();
+    assert_eq!(keyword_calls.len(), 2);
+    assert!(keyword_calls
+        .iter()
+        .all(|call| call["ids"].as_array().unwrap().len() <= 256));
+}
+
+#[test]
 fn stored_metadata_failure_remains_an_error() {
     let mut h = CliHarness::start();
     assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
@@ -2177,6 +2209,43 @@ fn summary_listing_fetches_body_on_open_and_keeps_it_on_refresh() {
     assert!(cached["ok"].is_true(), "{cached}");
     assert_eq!(cached["body"], opened["body"]);
     assert_eq!(h.server().read_calls().len(), before);
+}
+
+#[test]
+fn summary_listing_only_fetches_bodies_where_automatic_rules_apply() {
+    for (pattern, expect_bodies) in [("^Archive$", false), ("(?i)^inbox$", true)] {
+        let mut h =
+            CliHarness::start_with_mail_config(&format!("rules_mailbox_regex = \"{pattern}\""));
+        std::fs::write(
+            h._config_dir.path().join("rules.toml"),
+            r#"
+[[rule]]
+name = "folder-rule"
+[rule.match]
+header = "Subject"
+regex = "a subject phrase that is absent"
+[rule.actions]
+flag = true
+"#,
+        )
+        .unwrap();
+        h.restart();
+        assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
+        assert!(h.send(json!({"command":"list_mailboxes"}))["ok"].is_true());
+        let listing = h.send(json!({
+            "command":"query_emails", "mailbox_id":"mbox-inbox", "headers_only":true
+        }));
+        assert!(listing["ok"].is_true(), "{listing}");
+        let calls = h.server().read_calls();
+        assert!(!calls.is_empty());
+        assert_eq!(
+            calls
+                .iter()
+                .any(|call| call["fetchTextBodyValues"].as_bool() == Some(true)),
+            expect_bodies,
+            "rule scope {pattern}: {calls:?}"
+        );
+    }
 }
 
 #[test]

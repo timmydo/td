@@ -10,6 +10,7 @@ use td_json::{json, Json, ObjectBuilder, ToJson};
 /// this client never had a cap of its own.
 const RESPONSE_LIMIT: Option<u64> = None;
 const FLAG_BATCH_MAX: usize = 256;
+const METADATA_GET_BATCH_MAX: usize = 256;
 
 // An oversized or incomplete reconciliation remains uncertain; it never
 // authorizes another send. Each get stays below td-mta's object limit.
@@ -2030,6 +2031,14 @@ impl JmapClient {
     }
 
     pub fn get_email_keywords(&self, ids: &[String]) -> Result<Vec<Email>, JmapError> {
+        let mut result = Vec::new();
+        for chunk in ids.chunks(METADATA_GET_BATCH_MAX) {
+            result.extend(self.get_email_keywords_batch(chunk)?);
+        }
+        Ok(result)
+    }
+
+    fn get_email_keywords_batch(&self, ids: &[String]) -> Result<Vec<Email>, JmapError> {
         if ids.is_empty() {
             return Ok(vec![]);
         }
@@ -2067,6 +2076,14 @@ impl JmapClient {
     }
 
     pub fn get_threads(&self, ids: &[String]) -> Result<Vec<super::types::Thread>, JmapError> {
+        let mut result = Vec::new();
+        for chunk in ids.chunks(METADATA_GET_BATCH_MAX) {
+            result.extend(self.get_threads_batch(chunk)?);
+        }
+        Ok(result)
+    }
+
+    fn get_threads_batch(&self, ids: &[String]) -> Result<Vec<super::types::Thread>, JmapError> {
         if ids.is_empty() {
             return Ok(vec![]);
         }

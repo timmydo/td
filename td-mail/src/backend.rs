@@ -1990,11 +1990,17 @@ fn backend_loop(
                     let total = query.total;
                     let position = query.position;
                     let loaded = query.ids.len() as u32;
+                    let mailbox_name = cached_mailboxes
+                        .iter()
+                        .find(|m| m.id.as_str() == mailbox_id.as_str())
+                        .map(|m| m.name.clone())
+                        .unwrap_or_default();
+                    let apply_rules =
+                        !rules.is_empty() && rules_mailbox_regex.is_match(&mailbox_name);
                     let mut emails = if query.ids.is_empty() {
                         Ok(Vec::new())
                     } else {
-                        if (origin == "cli.summaries" || !origin.starts_with("cli"))
-                            && rules.is_empty()
+                        if (origin == "cli.summaries" || !origin.starts_with("cli")) && !apply_rules
                         {
                             let mut summaries = Vec::new();
                             for chunk in query.ids.chunks(EMAIL_GET_CHUNK_SIZE) {
@@ -2026,12 +2032,7 @@ fn backend_loop(
 
                     // Apply filtering rules (only to unprocessed emails)
                     if !rules.is_empty() {
-                        let mailbox_name = cached_mailboxes
-                            .iter()
-                            .find(|m| m.id.as_str() == mailbox_id.as_str())
-                            .map(|m| m.name.clone())
-                            .unwrap_or_default();
-                        if rules_mailbox_regex.is_match(&mailbox_name) {
+                        if apply_rules {
                             let mut emails_for_rules = if let Some(ref cache) = cache {
                                 let all_ids: Vec<String> =
                                     emails.iter().map(|e| e.id.clone()).collect();
@@ -2136,12 +2137,16 @@ fn backend_loop(
 
                     // Build thread counts map (unread, total) scoped to current mailbox
                     let mut thread_counts = HashMap::new();
-                    let thread_ids: Vec<String> =
+                    let mut thread_ids: Vec<String> =
                         emails.iter().filter_map(|e| e.thread_id.clone()).collect();
+                    thread_ids.sort_unstable();
+                    thread_ids.dedup();
                     if !thread_ids.is_empty() {
                         if let Ok(threads) = client.get_threads(&thread_ids) {
-                            let all_email_ids: Vec<String> =
+                            let mut all_email_ids: Vec<String> =
                                 threads.iter().flat_map(|t| t.email_ids.clone()).collect();
+                            all_email_ids.sort_unstable();
+                            all_email_ids.dedup();
                             let keyword_emails = client
                                 .get_email_keywords(&all_email_ids)
                                 .unwrap_or_default();
