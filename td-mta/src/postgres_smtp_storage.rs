@@ -294,13 +294,7 @@ impl Job for Delivery<'_, '_> {
             return Err(Failure::Refused(Error::Conflict));
         }
         let deadline = deadline.min(self.deadline);
-        if deadline.expired(
-            self.backend
-                .clock
-                .sample()
-                .map_err(Failure::Refused)?
-                .monotonic,
-        ) {
+        if deadline.expired(self.backend.clock.monotonic().map_err(Failure::Refused)?) {
             self.failure = Some(Failure::Refused(Error::Deadline));
             return Err(Failure::Refused(Error::Deadline));
         }
@@ -399,7 +393,7 @@ fn copy(value: &str) -> Result<String, Failure> {
 }
 fn charge(clock: &RuntimeClock, meter: &mut Meter, amount: Charge) -> Result<(), Failure> {
     meter
-        .charge(clock.sample().map_err(Failure::Refused)?.monotonic, amount)
+        .charge(clock.monotonic().map_err(Failure::Refused)?, amount)
         .map_err(|error| {
             Failure::Refused(if error == Stop::Deadline {
                 Error::Deadline

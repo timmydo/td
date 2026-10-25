@@ -36,14 +36,21 @@ impl RuntimeClock {
     }
 
     fn sample_at(&self, utc: SystemTime, monotonic: Instant) -> Result<Time, Error> {
-        let elapsed = monotonic
-            .checked_duration_since(self.origin)
-            .ok_or(Error::Invalid)?;
+        let monotonic = self.monotonic_at(monotonic)?;
         let utc = utc.duration_since(UNIX_EPOCH).map_err(|_| Error::Invalid)?;
         Ok(Time {
             utc_ms: i64::try_from(utc.as_millis()).map_err(|_| Error::Invalid)?,
-            monotonic: Tick(u64::try_from(elapsed.as_millis()).map_err(|_| Error::Invalid)?),
+            monotonic,
         })
+    }
+
+    fn monotonic_at(&self, now: Instant) -> Result<Tick, Error> {
+        let elapsed = now
+            .checked_duration_since(self.origin)
+            .ok_or(Error::Invalid)?;
+        Ok(Tick(
+            u64::try_from(elapsed.as_millis()).map_err(|_| Error::Invalid)?,
+        ))
     }
 }
 
@@ -56,6 +63,9 @@ impl Default for RuntimeClock {
 impl Clock for RuntimeClock {
     fn sample(&self) -> Result<Time, Error> {
         self.sample_at(SystemTime::now(), Instant::now())
+    }
+    fn monotonic(&self) -> Result<Tick, Error> {
+        self.monotonic_at(Instant::now())
     }
 }
 
@@ -141,6 +151,12 @@ mod tests {
         );
         let backwards = clock.origin.checked_sub(Duration::from_millis(1)).unwrap();
         assert_eq!(clock.sample_at(UNIX_EPOCH, backwards), Err(Error::Invalid));
+        assert_eq!(clock.monotonic_at(backwards), Err(Error::Invalid));
+        assert_eq!(clock.monotonic_at(future), Ok(Tick(1234)));
+        let before = clock.monotonic().unwrap();
+        let combined = clock.sample().unwrap();
+        let after = clock.monotonic().unwrap();
+        assert!(before <= combined.monotonic && combined.monotonic <= after);
         let large = UNIX_EPOCH
             .checked_add(Duration::from_millis(i64::MAX as u64 + 1))
             .unwrap();
@@ -160,6 +176,21 @@ mod tests {
             self.calls.fetch_add(1, Ordering::Relaxed);
             *self.value.lock().unwrap()
         }
+    }
+
+    #[test]
+    fn default_monotonic_preserves_injected_clock_errors_and_ticks() {
+        let clock = Injected {
+            value: Mutex::new(Err(Error::Deadline)),
+            calls: AtomicUsize::new(0),
+        };
+        assert_eq!(clock.monotonic(), Err(Error::Deadline));
+        *clock.value.lock().unwrap() = Ok(Time {
+            utc_ms: 9999,
+            monotonic: Tick(42),
+        });
+        assert_eq!(clock.monotonic(), Ok(Tick(42)));
+        assert_eq!(clock.calls.load(Ordering::Relaxed), 2);
     }
 
     #[test]

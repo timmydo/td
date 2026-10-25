@@ -67,7 +67,7 @@ impl<'a> Network<'a> {
         plan: &TimeoutPlan,
         clock: &(impl Clock + ?Sized),
     ) -> Result<Self, Error> {
-        let now = clock.sample()?.monotonic;
+        let now = clock.monotonic()?;
         let session_deadline = after(now, SESSION_SECONDS)?;
         let transport_deadline = after(session_deadline.tick(), FINISH_SECONDS)?;
         Ok(Self {
@@ -207,11 +207,11 @@ impl<'a> Network<'a> {
     }
 
     fn now(&mut self, clock: &(impl Clock + ?Sized)) -> Result<Tick, Error> {
-        let result = clock.sample().and_then(|time| {
-            if time.monotonic < self.last {
+        let result = clock.monotonic().and_then(|now| {
+            if now < self.last {
                 Err(Error::Invalid)
             } else {
-                Ok(time.monotonic)
+                Ok(now)
             }
         });
         match result {

@@ -85,6 +85,10 @@ pub struct Time {
 }
 pub trait Clock: Send + Sync {
     fn sample(&self) -> Result<Time, Error>;
+    /// Fresh tick in the same domain as sample; UTC is unnecessary for deadlines.
+    fn monotonic(&self) -> Result<Tick, Error> {
+        self.sample().map(|time| time.monotonic)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

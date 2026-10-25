@@ -411,11 +411,11 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
             return Err(Error::Capacity);
         }
         let startup = after(
-            self.clock.sample()?.monotonic,
+            self.clock.monotonic()?,
             self.admission.work().admission_seconds,
         )?;
         loop {
-            if startup.expired(self.clock.sample()?.monotonic) {
+            if startup.expired(self.clock.monotonic()?) {
                 return Err(Error::Deadline);
             }
             match self.storage.ready(self.routes.account(), startup) {
@@ -888,7 +888,7 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
         control: &Control,
     ) -> Result<(), Error> {
         let clock = self.clock.as_ref();
-        let now = clock.sample()?.monotonic;
+        let now = clock.monotonic()?;
         if cap.expired(now) {
             return self.storage_refused(slot, work, Error::Deadline, control);
         }
@@ -918,7 +918,7 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                 match result {
                     Ok(job) => {
                         slot.delivery = Some(job);
-                        if cap.expired(clock.sample()?.monotonic) {
+                        if cap.expired(clock.monotonic()?) {
                             return self.storage_refused(slot, work, Error::Deadline, control);
                         }
                         slot.connection()?
@@ -1015,7 +1015,7 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
         }
         let work = Work::Write;
         let clock = self.clock.as_ref();
-        if cap.expired(clock.sample()?.monotonic) {
+        if cap.expired(clock.monotonic()?) {
             return self.storage_refused(slot, work, Error::Deadline, control);
         }
         let bytes = match slot
@@ -1033,7 +1033,7 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
         if let Err(error) = result {
             return self.delivery_refused(slot, work, error, control);
         }
-        if cap.expired(clock.sample()?.monotonic) {
+        if cap.expired(clock.monotonic()?) {
             return self.storage_refused(slot, work, Error::Deadline, control);
         }
         slot.connection()?
@@ -1101,7 +1101,7 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
     }
 
     fn tls(&self, slot: &mut Slot<'s, 'cfg, B>, cap: Deadline) -> Result<(), Error> {
-        let now = self.clock.sample()?.monotonic;
+        let now = self.clock.monotonic()?;
         if cap.expired(now) {
             return Err(Error::Deadline);
         }

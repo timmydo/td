@@ -985,7 +985,14 @@ portability workflow is outside td's Debian-runtime target artifact graph;
 it must not import host-built outputs into that graph or claim its provenance.
 
 Core adapters provide typed errors and caller-owned buffers for transport,
-clock, cryptography and fault-injected persistence. Network workers cannot
+clock, cryptography and fault-injected persistence. Deadline-only consumers
+may sample a fresh monotonic tick without reading UTC. That tick shares the
+combined clock sample's origin and conversion; the default adapter derives
+it from a combined sample so injected errors and ticks remain observable.
+RuntimeClock reads Instant directly for this operation. SMTP transport and
+DATA accounting retain their existing check frequency and regression checks;
+certificate validity and received timestamps still use combined samples.
+Network workers cannot
 bypass the store's commit API. TLS framing/cryptographic verification belongs
 to td-crypto; mail STARTTLS transitions, deadline/lease accounting and gateway
 allowlist authorization belong to td-mta. API section 1.1 owns that integration.
