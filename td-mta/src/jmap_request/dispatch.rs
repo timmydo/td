@@ -435,6 +435,7 @@ fn reborrow_read<'short, 'long: 'short>(
 
 // This preparation seam disappears with the local database adapter at cutover.
 trait MailRead: crate::email_response::Source<Error = crate::postgres_read::Error> {
+    fn prefetch_metadata(&mut self, ids: &[crate::ids::EmailId]) -> Result<(), Error>;
     fn search_email(
         &mut self,
         id: crate::ids::EmailId,
@@ -479,6 +480,9 @@ trait MailRead: crate::email_response::Source<Error = crate::postgres_read::Erro
     ) -> Result<(), Error>;
 }
 impl MailRead for crate::postgres_read::Snapshot<'_> {
+    fn prefetch_metadata(&mut self, ids: &[crate::ids::EmailId]) -> Result<(), Error> {
+        self.prefetch_metadata(ids).map_err(postgres_read_error)
+    }
     fn search_email(
         &mut self,
         id: crate::ids::EmailId,

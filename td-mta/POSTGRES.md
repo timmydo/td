@@ -1642,12 +1642,23 @@ existing local syntax validator. Body callbacks reuse the same complete
 SHA-256 verifier and chunk replay cache as existing downloads, on this
 snapshot's connection and original deadline.
 
-The snapshot retains at most one last successful Email metadata record so
-stored-field and MIME projection of that Email do not repeat its SQL lookup.
-A cache hit still checks the original connection, deadline and sticky failure;
-it cannot cross a snapshot or method reopening. Metadata, membership, keyword
-and chunk reads send their fixed parameter types with the query, avoiding a
-separate prepare/describe exchange without changing row validation or limits.
+Email/get prefetches passive metadata in windows of at most sixteen requested
+IDs using one typed, account-scoped query. Its explicit seventeen-row ceiling
+and strict returned-ID ordering reject duplicates or unexpected rows. Every
+returned row passes the same manifest, chunk-count, referenced-thread and
+sequence validator as a single lookup, and must match the exact snapshot
+identity. A fixed window retains requested IDs and explicit absent results;
+only complete successful validation replaces the old window. Request order,
+duplicate handling and notFound assembly remain in the JMAP layer.
+
+The snapshot also retains its existing last successful metadata record for
+unprefetched single reads. Both caches still check the original connection,
+deadline and sticky failure on every access and cannot cross a snapshot or
+method reopening. Prefetching does not authorize body output: body callbacks
+still verify the same snapshot's complete bytes. Membership and keyword reads
+retain their existing pagination. Metadata, membership, keyword and chunk
+reads send fixed parameter types with the query, avoiding a separate
+prepare/describe exchange without changing row validation or limits.
 
 Every method and final callback completion checks the original connection and
 deadline. A failed operation retires the whole view, including when its caller

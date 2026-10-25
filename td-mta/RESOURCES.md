@@ -457,6 +457,15 @@ explicitly under DESIGN section 5 without a speculative ledger proof.
 | Log, 128 KiB | 384 queued fixed event cells of at most 256 bytes (96 KiB); 16 KiB encoder/output; 16 KiB rotation/drop counters and emergency status |
 | Cold reload, 2 MiB | Two immutable configuration snapshots of at most 1 MiB each, including referenced credential data; reject a third live generation |
 
+The PostgreSQL metadata prefetch window retains at most sixteen requested IDs
+and optional metadata rows plus the existing single-row cache. A compile-time
+size check keeps those retained cells within the 5 KiB selected-metadata
+partition. Temporary query rows, decoded metadata and replacement storage are
+bounded by the same sixteen-row window (seventeen-row refusal sentinel) and
+use the typed-row/native-bookkeeping partition. No membership/keyword
+collection or body bytes enter this cache; existing protocol caps and body
+reservations remain unchanged.
+
 The resolver's 128 KiB includes 128 cache entries of at most 384 bytes
 (48 KiB), a 64 KiB packet/TCP buffer and 16 KiB question/name/alias-chain,
 address-result and cursor state. Cache keys are configured endpoint index plus

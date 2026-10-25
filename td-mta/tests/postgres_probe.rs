@@ -6202,6 +6202,15 @@ fn exercise_read_dispatch(
     } else {
         (&second, &first)
     };
+    let window_missing: Vec<_> = (0..33_u128)
+        .map(|n| format!("e{:032x}", 0xed00 + n))
+        .collect();
+    let window_not_found = window_missing
+        .iter()
+        .map(|id| format!("\"{id}\""))
+        .collect::<Vec<_>>()
+        .join(",");
+    let window_ids = format!("\"{second}\",{window_not_found},\"{first}\",\"{second}\"");
     let input = format!(
         r##"{{"using":["{CORE}","{MAIL}","{SUBMISSION}"],"methodCalls":[
         ["Mailbox/get",{{"accountId":"{account}","ids":["{mailbox}","{mailbox}","{missing}"],"properties":["name","totalEmails","myRights"]}},"a"],
@@ -6230,7 +6239,8 @@ fn exercise_read_dispatch(
         ["Email/query",{{"accountId":"{account}","filter":{{"operator":"AND"}}}},"w6"],
         ["Email/query",{{"accountId":"{account}","filter":{{"minSize":0}},"calculateTotal":true,"limit":0}},"w7"],
         ["Email/query",{{"accountId":"{account}","filter":{{"minSize":1}}}},"w8"],
-        ["Email/query",{{"accountId":"{account}","filter":{{"minSize":-1}}}},"w9"]
+        ["Email/query",{{"accountId":"{account}","filter":{{"minSize":-1}}}},"w9"],
+        ["Email/get",{{"accountId":"{account}","ids":[{window_ids}],"properties":["id"]}},"window"]
     ]}}"##
     );
     let smallest_body = [first_id, second_id]
@@ -6240,7 +6250,7 @@ fn exercise_read_dispatch(
         .unwrap();
     // These bodies predate a stricter incoming-message policy.
     let limits = Limits {
-        json_methods: 27,
+        json_methods: 28,
         message_bytes: smallest_body - 1,
         header_bytes: smallest_body - 1,
         ..Limits::default()
@@ -6349,7 +6359,7 @@ fn exercise_read_dispatch(
         return;
     }
     let mut complete = result.unwrap();
-    assert_eq!(complete.responses().len(), 27);
+    assert_eq!(complete.responses().len(), 28);
     let mut encoder = complete.encoder().unwrap();
     while !encoder.count_step(&mut [0; 4096]).unwrap() {}
     let length = encoder.begin_output().unwrap();
@@ -6385,7 +6395,8 @@ fn exercise_read_dispatch(
     assert!(output.contains(&format!(
         r#""list":[{{"id":"{second}"}},{{"id":"{first}"}}],"notFound":[]}},"h""#
     )));
-    assert_eq!(output.matches(r#"["Email/get","#).count(), 4);
+    assert_eq!(output.matches(r#"["Email/get","#).count(), 5);
+    assert!(output.contains(&format!(r#""list":[{{"id":"{second}"}},{{"id":"{first}"}}],"notFound":[{window_not_found}]}},"window""#)));
     assert_eq!(output.matches(r#"["Email/query","#).count(), 7, "{output}");
     assert!(output.contains(r#""position":0,"total":2,"ids":[]},"w7""#));
     assert!(output.contains(r#"["error",{"type":"unsupportedFilter"},"w8"]"#));
@@ -7208,6 +7219,9 @@ fn exercise_resolved_read(
     drop(replacement);
 }
 
+#[path = "postgres_probe/metadata_prefetch.rs"]
+mod metadata_prefetch;
+
 fn exercise_read(
     fixture: &Fixture,
     request: &Request<'_>,
@@ -7309,6 +7323,14 @@ fn exercise_read(
     sql(
         fixture,
         &format!("UPDATE td_mta.emails SET received_at=0 WHERE account=decode('{account}','hex')"),
+    );
+    metadata_prefetch::exercise(
+        fixture,
+        request,
+        trust,
+        binding,
+        password,
+        [first.email, second.email],
     );
     let slots = read::ReadSlots::new(1).unwrap();
     let mut owned =
@@ -7465,6 +7487,7 @@ fn exercise_read(
     };
     read::with_snapshot(request,trust,deadline(),binding,password,|view| {
         assert_eq!(view.identity().committed_sequence.number(),3);
+        view.prefetch_metadata(&[first.email, second.email])?;
         check_mailbox(view, 2)?;
         let original = stored(view, first.email)?.unwrap();
         assert!(original.contains("\"keywords\":{\"$draft\":true,\"$seen\":true}"));

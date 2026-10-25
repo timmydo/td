@@ -277,80 +277,92 @@ impl Worker<'_, '_, '_, '_, '_> {
             self.append(state.as_bytes())?;
             self.append(br#"","list":["#)?;
             let mut first = true;
-            for item in &mut requested {
-                self.check()?;
-                let Some(id) = item.id else {
-                    continue;
-                };
-                let Some(metadata) = view.metadata(id, &mut row)? else {
-                    continue;
-                };
-                if !first {
-                    self.append(b",")?;
+            let mut ids = Vec::new();
+            ids.try_reserve_exact(crate::postgres_body::MAX_METADATA_IDS)
+                .map_err(|_| Error::StorageCapacity)?;
+            for window in requested.chunks_mut(crate::postgres_body::MAX_METADATA_IDS) {
+                ids.clear();
+                ids.extend(window.iter().filter_map(|item| item.id));
+                match &mut view {
+                    View::Postgres(view) => view.prefetch_metadata(&ids)?,
                 }
-                first = false;
-                let mut sink_error = None;
-                let found = view.members(id, selected.stored, &mut row, |bytes| {
-                    self.append(bytes).map_err(|e| {
-                        sink_error = Some(e);
-                        crate::ports::Error::Invalid
-                    })
-                });
-                if let Some(error) = sink_error {
-                    return Err(error);
-                }
-                if !found? {
-                    return Err(Error::State);
-                }
-                if selected.body() || !selected.headers.is_empty() {
-                    let result = match &mut view {
-                        View::Postgres(view) => {
-                            if metadata.size > crate::postgres_body::MAX_BODY_BYTES {
-                                return Err(Error::StorageCapacity);
+                for item in window {
+                    self.check()?;
+                    let Some(id) = item.id else {
+                        continue;
+                    };
+                    let Some(metadata) = view.metadata(id, &mut row)? else {
+                        continue;
+                    };
+                    if !first {
+                        self.append(b",")?;
+                    }
+                    first = false;
+                    let mut sink_error = None;
+                    let found = view.members(id, selected.stored, &mut row, |bytes| {
+                        self.append(bytes).map_err(|e| {
+                            sink_error = Some(e);
+                            crate::ports::Error::Invalid
+                        })
+                    });
+                    if let Some(error) = sink_error {
+                        return Err(error);
+                    }
+                    if !found? {
+                        return Err(Error::State);
+                    }
+                    if selected.body() || !selected.headers.is_empty() {
+                        let result = match &mut view {
+                            View::Postgres(view) => {
+                                if metadata.size > crate::postgres_body::MAX_BODY_BYTES {
+                                    return Err(Error::StorageCapacity);
+                                }
+                                let turns = metadata.size.div_ceil(4096);
+                                for _ in 0..turns {
+                                    self.check()?;
+                                }
+                                work.charge(
+                                    body::now(clock.as_ref())?,
+                                    crate::admission::work::Charge {
+                                        io_bytes: turns
+                                            .checked_mul(4096)
+                                            .ok_or(Error::StorageCapacity)?,
+                                        records: turns,
+                                        ..Default::default()
+                                    },
+                                )
+                                .map_err(|stop| match stop {
+                                    crate::admission::work::Stop::Deadline => {
+                                        Error::ExecutionDeadline
+                                    }
+                                    _ => Error::StorageCapacity,
+                                })?;
+                                view.email_body(
+                                    id,
+                                    BodyProjection {
+                                        metadata,
+                                        limits,
+                                        selection: &selected,
+                                        options,
+                                        clock: clock.as_ref(),
+                                        work: &mut work,
+                                    },
+                                    self,
+                                )
                             }
-                            let turns = metadata.size.div_ceil(4096);
-                            for _ in 0..turns {
-                                self.check()?;
-                            }
-                            work.charge(
-                                body::now(clock.as_ref())?,
-                                crate::admission::work::Charge {
-                                    io_bytes: turns
-                                        .checked_mul(4096)
-                                        .ok_or(Error::StorageCapacity)?,
-                                    records: turns,
-                                    ..Default::default()
-                                },
-                            )
-                            .map_err(|stop| match stop {
+                        };
+                        self.check()?;
+                        if let Some(stop) = work.stopped() {
+                            return Err(match stop {
                                 crate::admission::work::Stop::Deadline => Error::ExecutionDeadline,
                                 _ => Error::StorageCapacity,
-                            })?;
-                            view.email_body(
-                                id,
-                                BodyProjection {
-                                    metadata,
-                                    limits,
-                                    selection: &selected,
-                                    options,
-                                    clock: clock.as_ref(),
-                                    work: &mut work,
-                                },
-                                self,
-                            )
+                            });
                         }
-                    };
-                    self.check()?;
-                    if let Some(stop) = work.stopped() {
-                        return Err(match stop {
-                            crate::admission::work::Stop::Deadline => Error::ExecutionDeadline,
-                            _ => Error::StorageCapacity,
-                        });
+                        result?;
                     }
-                    result?;
+                    self.append(b"}")?;
+                    item.found = true;
                 }
-                self.append(b"}")?;
-                item.found = true;
             }
             self.append(br#"],"notFound":["#)?;
             self.get_not_found(&requested)?;

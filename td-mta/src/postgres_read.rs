@@ -118,6 +118,11 @@ impl Drop for ReadPermit<'_> {
     }
 }
 
+type MetadataWindow = [Option<(EmailId, Option<Metadata>)>; postgres_body::MAX_METADATA_IDS];
+const _: () = assert!(
+    std::mem::size_of::<MetadataWindow>() + std::mem::size_of::<Option<Metadata>>() <= 5 * 1024
+);
+
 /// Owns one authenticated snapshot and its original deadline and budgets.
 /// Worker-local: its poll waker is bound to the thread that opened it.
 /// The connection drops before its reserved slot becomes available again.
@@ -129,6 +134,7 @@ pub struct Snapshot<'a> {
     deadline: Instant,
     failed: Option<Error>,
     metadata: Option<Metadata>,
+    metadata_window: MetadataWindow,
     _worker_thread: std::marker::PhantomData<std::rc::Rc<()>>,
     _permit: ReadPermit<'a>,
 }
@@ -277,6 +283,7 @@ impl<'a> Snapshot<'a> {
             deadline,
             failed: None,
             metadata: None,
+            metadata_window: [None; postgres_body::MAX_METADATA_IDS],
             _worker_thread: std::marker::PhantomData,
             _permit: permit,
         };
@@ -480,11 +487,66 @@ impl Snapshot<'_> {
             .and_then(|result| result.map_err(Error::Mailboxes));
         self.retain(result)
     }
+    /// Prefetch only passive metadata inside this snapshot; missing IDs are
+    /// retained explicitly. Complete validation precedes window replacement.
+    pub fn prefetch_metadata(&mut self, emails: &[EmailId]) -> Result<(), Error> {
+        self.check()?;
+        let result = (|| {
+            if emails.len() > postgres_body::MAX_METADATA_IDS {
+                return Err(Error::Capacity);
+            }
+            let mut window = [None; postgres_body::MAX_METADATA_IDS];
+            if emails.is_empty() {
+                return Ok(window);
+            }
+            let mut ids = Vec::new();
+            ids.try_reserve_exact(emails.len())
+                .map_err(|_| Error::Capacity)?;
+            ids.extend_from_slice(emails);
+            let identity = self.identity;
+            let rows = self
+                .worker
+                .run(|client| {
+                    Box::pin(async move {
+                        postgres_body::email_metadata_batch(
+                            client,
+                            identity.epoch,
+                            identity.account,
+                            postgres_body::MAX_BODY_BYTES,
+                            &ids,
+                        )
+                        .await
+                    })
+                })
+                .map_err(Error::Connection)?
+                .map_err(Error::Body)?;
+            if rows.iter().any(|row| row.identity != identity) {
+                return Err(Error::Integrity);
+            }
+            for (index, email) in emails.iter().copied().enumerate() {
+                let value = rows.iter().find(|row| row.email == email).copied();
+                *window.get_mut(index).ok_or(Error::Integrity)? = Some((email, value));
+            }
+            Ok(window)
+        })();
+        let window = self.retain(result)?;
+        self.metadata_window = window;
+        self.metadata = None;
+        Ok(())
+    }
     /// Metadata alone does not authorize body output; with_body verifies the
     /// exact same snapshot's chunks before calling its consumer.
     pub fn email(&mut self, email: EmailId) -> Result<Option<Metadata>, Error> {
         self.check()?;
         // Stored fields and MIME projection share this immutable snapshot.
+        if let Some((_, metadata)) = self
+            .metadata_window
+            .iter()
+            .flatten()
+            .find(|(id, _)| *id == email)
+        {
+            return Ok(*metadata);
+        }
         if let Some(metadata) = self.metadata.filter(|metadata| metadata.email == email) {
             return Ok(Some(metadata));
         }

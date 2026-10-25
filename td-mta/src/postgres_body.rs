@@ -16,6 +16,7 @@ use tokio_postgres::types::Type;
 const CHUNK: u64 = 65536;
 const BATCH: u64 = 8;
 pub const MAX_BODY_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_METADATA_IDS: usize = 16;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -96,14 +97,63 @@ pub(crate) async fn email_metadata(
     client: &tokio_postgres::Client,
     selected: ReadRequest,
 ) -> Result<Metadata, Error> {
-    let rows = client.query_typed("SELECT a.sequence,a.floor,e.blob_id,e.thread_id,e.received_at,b.length,b.digest,b.created_at,b.chunk_count,e.changed,b.changed,t.changed,(SELECT count(*) FROM td_mta.blob_chunks c WHERE c.account=a.id AND c.blob_id=e.blob_id) FROM td_mta.accounts a JOIN td_mta.emails e ON e.account=a.id LEFT JOIN td_mta.blobs b ON b.account=e.account AND b.id=e.blob_id LEFT JOIN td_mta.threads t ON t.account=e.account AND t.id=e.thread_id WHERE a.id=$1 AND e.id=$2 LIMIT 2", &[(&selected.account.as_bytes().as_slice(), Type::BYTEA), (&selected.email.as_bytes().as_slice(), Type::BYTEA)]).await.map_err(|_| Error::Database)?;
-    if rows.is_empty() {
-        return Err(Error::Missing);
+    email_metadata_batch(
+        client,
+        selected.epoch,
+        selected.account,
+        selected.maximum,
+        &[selected.email],
+    )
+    .await?
+    .pop()
+    .ok_or(Error::Missing)
+}
+
+pub(crate) async fn email_metadata_batch(
+    client: &tokio_postgres::Client,
+    epoch: StoreEpoch,
+    account: AccountId,
+    maximum: u64,
+    emails: &[EmailId],
+) -> Result<Vec<Metadata>, Error> {
+    if emails.len() > MAX_METADATA_IDS || maximum > MAX_BODY_BYTES {
+        return Err(Error::Capacity);
     }
-    if rows.len() != 1 {
+    if emails.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut ids = Vec::new();
+    ids.try_reserve_exact(emails.len())
+        .map_err(|_| Error::Capacity)?;
+    ids.extend(emails.iter().map(|id| id.as_bytes().as_slice()));
+    let rows = client.query_typed("SELECT a.sequence,a.floor,e.blob_id,e.thread_id,e.received_at,b.length,b.digest,b.created_at,b.chunk_count,e.changed,b.changed,t.changed,(SELECT count(*) FROM td_mta.blob_chunks c WHERE c.account=a.id AND c.blob_id=e.blob_id),e.id FROM td_mta.accounts a JOIN td_mta.emails e ON e.account=a.id LEFT JOIN td_mta.blobs b ON b.account=e.account AND b.id=e.blob_id LEFT JOIN td_mta.threads t ON t.account=e.account AND t.id=e.thread_id WHERE a.id=$1 AND e.id=ANY($2) ORDER BY e.id LIMIT 17", &[(&account.as_bytes().as_slice(), Type::BYTEA), (&ids, Type::BYTEA_ARRAY)]).await.map_err(|_| Error::Database)?;
+    if rows.len() > emails.len() {
         return Err(Error::Integrity);
     }
-    metadata(rows.first().ok_or(Error::Integrity)?, selected)
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(rows.len())
+        .map_err(|_| Error::Capacity)?;
+    let mut previous: Option<EmailId> = None;
+    for row in rows {
+        let bytes: &[u8] = row.try_get(13).map_err(|_| Error::Integrity)?;
+        let email = EmailId::from_bytes(bytes.try_into().map_err(|_| Error::Integrity)?);
+        if !emails.contains(&email) || previous.is_some_and(|id| id.as_bytes() >= email.as_bytes())
+        {
+            return Err(Error::Integrity);
+        }
+        values.push(metadata(
+            &row,
+            ReadRequest {
+                epoch,
+                account,
+                email,
+                maximum,
+            },
+        )?);
+        previous = Some(email);
+    }
+    Ok(values)
 }
 
 pub(crate) fn with_verified_body<T>(
