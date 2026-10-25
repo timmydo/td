@@ -10,7 +10,8 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 // as DT_RPATH) and needed libraries (td glibc's, never libgcc_s), that LLD
 // linked them, that an unwind passes through gcc-runtime's unwinder, that a
 // thread runs and that the proc macro expanded (td-link/DESIGN.md). The static
-// ET_EXEC is linked once more as the image links a plain rustc: through `cc`,
+// ET_EXEC is linked once more as the image links a plain rustc: through the
+// realized runtime driver as `cc`, with RUSTC selecting its toolchain,
 // rustc's default linker name, found on a PATH whose `cc` is td-link; it must
 // run and be byte-identical.
 const MACRO_RS: &str = include_str!("../probes/td_link_macro.rs");
@@ -103,11 +104,11 @@ pub fn recipe() -> Recipe {
         ];
         steps.push(Step::run("{root}", &run).env("PATH", "/nonexistent"));
     }
-    // The image's /bin/cc is td-link. rustc resolves `cc` on PATH and
+    // The image's /bin/cc is the runtime driver. rustc resolves `cc` on PATH and
     // infers its linker flavour from that name, so this link is the one a
     // plain `rustc` or `cargo build` on a td system makes.
     steps.push(Step::Symlink {
-        target: "{in:td-link}/bin/td-link".into(),
+        target: "{in:td-link-runtime}/bin/td-link".into(),
         link: "{root}/cc/cc".into(),
     });
     steps.push(
@@ -131,6 +132,7 @@ pub fn recipe() -> Recipe {
             "cc",
         )
         .env("PATH", "{root}/cc")
+        .env("RUSTC", RUSTC)
         .env("SOURCE_DATE_EPOCH", "1")
         .env("TD_LINK_TEST_INTERP", INTERP),
     );
@@ -162,7 +164,7 @@ pub fn recipe() -> Recipe {
     });
 
     Recipe::mesboot("td-link-test", "1.0")
-        .native_inputs(&["rust-toolchain", "td-link", "glibc-x86-64"])
+        .native_inputs(&["rust-toolchain", "td-link", "td-link-runtime", "glibc-x86-64"])
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"

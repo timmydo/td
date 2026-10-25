@@ -32,7 +32,9 @@ toolchain in the invoking account's cache and returns its root. Resolution
 or download errors stop the link. This runtime variant permits the account
 to select its compiler, as Cargo already does. The ordinary recipe driver never invokes the downloader and
 continues to use only its declared store inputs. Both variants use the
-same argument validation and link plan.
+same argument validation and link plan. Runtime path construction uses positional
+formatting so recipe template expansion cannot replace a Rust format capture
+with the build directory.
 
 ## What it accepts
 
@@ -176,3 +178,8 @@ host C paths (`stage0::provision_c_compiler`) therefore pass over a `cc`
 that resolves to td-link, to a `gcc` beside it that does not, and with
 none read the host as having no C compiler; a `TD_CC_HOME` whose `cc` is
 td-link is broken.
+
+The `cc` leg of `td-link-test` uses the realized runtime variant with
+`RUSTC` selecting the declared compiler. It must link and execute the
+same static program byte-for-byte as the recipe driver; host source tests
+alone cannot detect recipe substitution inside embedded Rust source.

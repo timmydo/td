@@ -93,7 +93,8 @@ fn runtime_lld(rustc: Option<OsString>) -> Result<String, String> {
         return Err("td-link: invalid Rust path".into());
     }
     Ok(format!(
-        "{root}/lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-lld"
+        "{}/lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-lld",
+        root
     ))
 }
 

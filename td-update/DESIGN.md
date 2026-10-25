@@ -288,3 +288,26 @@ must select it as current without consuming or exhausting an attempt. Both
 recovery boots verify the user file, edited source and signing identity.
 The result records `automatic_rollback_verified=true` only after both pass.
 Keep all three overlays with their backing files when retaining this evidence.
+
+## Recovering an older runtime linker
+
+An image with the runtime-linker recipe substitution bug rejects rustc's
+`-B.../gcc-ld` argument: the linker's selected path contains the temporary
+recipe build root instead of the account's compiler root. This fails during
+checkout-tool compilation, before deployment installation. Pulling source
+alone does not replace the already installed `/bin/cc`.
+
+For that specific failure, an ordinary account can create a private temporary
+alias for the erroneous root, then run the update that contains the fix:
+
+```text
+mkdir -m 700 /tmp/guix-build-td-link-runtime-0.1.drv-0 && ln -s "$(td-rust path)/lib" /tmp/guix-build-td-link-runtime-0.1.drv-0/lib && ./update
+```
+
+Proceed only if the directory creation succeeds; do not reuse an existing
+path owned by someone else. The alias changes no installed file and needs
+no root access. It lasts only until temporary files are cleared, so keep it
+until the update finishes. The corrected deployment resolves its runtime
+linker directly from the selected compiler and no longer needs this alias.
+This workaround covers the observed linker failure; it does not establish
+that later source preparation, building or deployment activation will pass.
