@@ -8,6 +8,10 @@ existing deployment or SQLite data conversion requirement.
 [CONFIG.md](CONFIG.md#foreground-postgresql-service) owns foreground serving.
 Relay scheduling is active; configuration reload requires process restart.
 
+The live Azure host serving `mx.timmydouglas.com`, `mx.timmyd.info` and
+`mx.882015.xyz` has a separate [production runbook](PRODUCTION.md), including
+SSH access, source selection, binary updates, verification and rollback.
+
 ## Install for the current host user
 
 From the checkout, run `./install-td-mta`. It builds a native release with
