@@ -35,6 +35,7 @@ pub(crate) mod encrypted;
 pub(crate) mod encrypted_boot;
 mod feed;
 pub(crate) mod guest_screens;
+mod host_login;
 pub(crate) mod install;
 pub(crate) mod live;
 pub(crate) mod media;
@@ -728,6 +729,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
             devices: Devices::ALL,
             screen: None,
             shell: None,
+            host_login: None,
         },
         runner.scratch_dir(),
     )?;
@@ -790,6 +792,7 @@ pub(crate) fn run_erofs(runner: &RecipeCheckRunner) -> Result<(), String> {
             devices: Devices::ALL,
             screen: None,
             shell: None,
+            host_login: None,
         },
         runner.scratch_dir(),
     )?;
@@ -837,6 +840,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         &trust,
         Some(&seccomp_probe),
         VolumePurpose::Fixture,
+        None,
         None,
     )?;
     if fixture.initial_id == fixture.alternate_id {
@@ -931,6 +935,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
             devices: Devices::ALL,
             screen: None,
             shell: None,
+            host_login: None,
         },
         runner.scratch_dir(),
     )?;
@@ -1113,6 +1118,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         &trust,
         Some(&seccomp_probe),
         VolumePurpose::Fixture,
+        None,
         None,
     )?;
     if failure_fixture.initial_id != fixture.initial_id
@@ -1300,6 +1306,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         &trust,
         Some(&seccomp_probe),
         VolumePurpose::Fixture,
+        None,
         None,
     )?;
     if fallback_fixture.initial_id != failure_fixture.initial_id
@@ -1528,6 +1535,7 @@ fn boot_system_once(
             devices: Devices::ALL,
             screen: None,
             shell: None,
+            host_login: None,
         },
         scratch,
         boot_timeout(),
@@ -1571,6 +1579,7 @@ fn boot_failed_target_once(
             devices: Devices::ALL,
             screen: None,
             shell: None,
+            host_login: None,
         },
         scratch,
     )?;
@@ -2804,6 +2813,7 @@ pub(crate) fn run_session(runner: &RecipeCheckRunner) -> Result<(), String> {
             devices: Devices::ALL,
             screen: None,
             shell: None,
+            host_login: None,
         },
         runner.scratch_dir(),
     )?;
@@ -2895,6 +2905,7 @@ pub(crate) fn run_net(runner: &RecipeCheckRunner) -> Result<(), String> {
             devices: Devices::ALL,
             screen: None,
             shell: None,
+            host_login: None,
         },
         runner.scratch_dir(),
     )?;
@@ -3046,6 +3057,7 @@ pub(crate) fn run_kexec(runner: &RecipeCheckRunner) -> Result<(), String> {
             devices: Devices::ALL,
             screen: None,
             shell: None,
+            host_login: None,
         },
         runner.scratch_dir(),
     )?;
@@ -3306,6 +3318,7 @@ fn build_persistent_system(
         Some(&seccomp_probe),
         VolumePurpose::Fixture,
         None,
+        None,
     )?;
     Ok((bzimage, initramfs, volume, btrfs))
 }
@@ -3395,6 +3408,7 @@ pub(crate) fn create_persistent_volume(
         None,
         purpose,
         None,
+        None,
     )
     .map(|_| ())
 }
@@ -3423,6 +3437,7 @@ pub(crate) fn create_release_volume(
             VolumePurpose::Published
         },
         Some(source),
+        None,
     )
     .map(|_| ())
 }
@@ -3481,6 +3496,7 @@ fn create_persistent_volume_layout(
     seccomp_probe: Option<&Path>,
     purpose: VolumePurpose,
     source: Option<&Path>,
+    account: Option<&crate::checks::provisioned_account::ProvisionedAccount>,
 ) -> Result<VolumeFixture, String> {
     if matches!(&trust.signing, SigningIdentity::Installation { .. })
         != (purpose == VolumePurpose::Installation)
@@ -3530,6 +3546,9 @@ fn create_persistent_volume_layout(
     let _seed_cleanup = Scratch { dir: seed.clone() };
 
     populate_persistent_seed(deployment, &seed, &deployment_id, trust, purpose)?;
+    if let Some(account) = account {
+        account.stage(&seed)?;
+    }
     trust.stage_installation_identity(&seed)?;
     if let Some(source) = source {
         super::release_source::copy_to_volume(source, &seed)?;
@@ -4664,6 +4683,10 @@ struct BootPlan<'a> {
     /// and the greeter are seen; a marker kill waits for every report, and
     /// a boot that ends without them fails.
     shell: Option<&'a [serial_shell::ShellStep]>,
+    /// SSH logins from the host once the marker is seen, over a loopback
+    /// forward only this plan's user network gets; a marker kill waits for
+    /// them, and the login records its outcome for the caller.
+    host_login: Option<&'a host_login::HostLogin>,
     /// Typed at console prompts as they arrive, over the same serial
     /// socket the shell uses; the marker kill waits for the last.
     answers: Option<&'a serial_shell::ConsoleAnswers<'a>>,
@@ -5315,7 +5338,11 @@ fn boot_source(
     // with no host network config; 10.0.2.2 is the host's loopback, where the feed
     // listens. virtio-net-pci is the NIC the guest's VIRTIO_NET driver binds; the
     // guest autodetects it (eth0) and brings it up.
-    if plan.user_net || feed.is_some() {
+    // A host login adds its one loopback forward to the guest's sshd.
+    if let Some(login) = plan.host_login {
+        cmd.arg("-netdev").arg(login.netdev()?);
+        cmd.args(["-device", QEMU_USER_NET_DEVICE]);
+    } else if plan.user_net || feed.is_some() {
         cmd.args(["-netdev", QEMU_USER_NETDEV]);
         cmd.args(["-device", QEMU_USER_NET_DEVICE]);
     } else {
@@ -5462,6 +5489,7 @@ fn boot_source(
         .zip(qmp_path.clone())
         .map(|(expect, path)| ScreenWatch::new(expect, path));
     let mut shell = plan.shell.map(serial_shell::SerialShell::new);
+    let mut host_login = plan.host_login.map(host_login::HostLogin::start);
     let mut responder = plan
         .answers
         .map(|answers| serial_shell::ConsoleResponder::new(answers, CAP));
@@ -5569,6 +5597,17 @@ fn boot_source(
                 ));
             }
         }
+        if let Some(login) = host_login.as_mut() {
+            if let Err(error) = login.poll(evidence.target) {
+                let _ = child.kill();
+                let _ = child.wait();
+                let console = String::from_utf8_lossy(&buf);
+                return Err(format!(
+                    "{error}. Last serial output:\n{}",
+                    tail(&console, 80)
+                ));
+            }
+        }
         // On the VT when the plan says so, else on the serial line.
         let answered = match (responder.as_mut(), vt_typist.as_mut(), serial_port.as_mut()) {
             (Some(responder), Some(typist), _) => {
@@ -5627,6 +5666,7 @@ fn boot_source(
         });
         let waits = screen.as_ref().is_some_and(|watch| !watch.seen)
             || shell.as_ref().is_some_and(|controller| !controller.done())
+            || host_login.as_ref().is_some_and(|login| !login.done())
             || responder
                 .as_ref()
                 .is_some_and(|responder| !responder.done())
@@ -13536,6 +13576,7 @@ mod tests {
             devices: Devices::ALL,
             screen: None,
             shell: None,
+            host_login: None,
         };
         let kernel = Path::new("/nonexistent/bzImage");
         let live = BootSource::LiveSetup {
@@ -13622,6 +13663,7 @@ mod tests {
                     check: &check,
                 }),
                 shell: (other == "shell").then_some(&shell[..]),
+                host_login: None,
             };
             let source = BootSource::Direct {
                 kernel,

@@ -168,6 +168,7 @@ pub(super) fn drive_wizard(run: &LiveRun<'_>) -> Result<BootResult, String> {
             devices: Devices::ALL,
             screen: None,
             shell: None,
+            host_login: None,
         },
         run.scratch,
         timeout,

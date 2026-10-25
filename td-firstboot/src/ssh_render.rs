@@ -53,9 +53,13 @@ pub(crate) fn boot_render(
     primary: &str,
     boot_id: &Path,
     owner: login_state::Owner,
+    provisioned: ssh_policy::Provisioned,
 ) -> Result<ssh_policy::Form, String> {
     let boot = BootId::read(boot_id)?;
-    let form = publish_policy(root, primary, owner)?;
+    if provisioned == ssh_policy::Provisioned::Server {
+        check_provisioned_keys(root, owner)?;
+    }
+    let form = publish_policy(root, primary, owner, provisioned)?;
     cutover::publish(
         &root.join(cutover::RECORD),
         cutover::record(&boot, reduced(form)).as_bytes(),
@@ -65,25 +69,91 @@ pub(crate) fn boot_render(
     Ok(form)
 }
 
+/// Bytes a provisioned keys file may hold: 64 keys and their comments.
+const PROVISIONED_KEYS_LIMIT: u64 = 64 * 1024;
+
+/// The server's provisioned keys are `owner`'s alone to write: absent, or
+/// one regular, singly linked, mode-0644 file of bounded size that `owner`
+/// owns, under directories `owner` owns that no group or other may write.
+/// StrictModes would also accept a file the account owned, which would let
+/// the account rewrite the keys only the volume's builder may set.
+fn check_provisioned_keys(root: &Path, owner: login_state::Owner) -> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let relative = ssh_policy::SSHD_PROVISIONED_AUTHORIZED_KEYS.trim_start_matches('/');
+    let path = root.join(relative);
+    let mut directory = root.to_path_buf();
+    let parents: Vec<_> = Path::new(relative)
+        .parent()
+        .map(|parent| parent.components().collect())
+        .unwrap_or_default();
+    for component in parents {
+        directory.push(component);
+        let meta = match std::fs::symlink_metadata(&directory) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(format!("{}: {error}", directory.display())),
+        };
+        if !meta.is_dir() || meta.uid() != owner.uid || meta.mode() & 0o022 != 0 {
+            return Err(format!(
+                "provisioned keys directory {} requires a directory owned by {} that no \
+                 group or other may write",
+                directory.display(),
+                owner.uid
+            ));
+        }
+    }
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(principals::O_NOFOLLOW | principals::O_NONBLOCK)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("{}: {error}", path.display())),
+    };
+    let meta = file
+        .metadata()
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    if !meta.is_file()
+        || (meta.uid(), meta.gid()) != (owner.uid, owner.gid)
+        || meta.mode() & 0o7777 != 0o644
+        || meta.nlink() != 1
+        || meta.len() > PROVISIONED_KEYS_LIMIT
+    {
+        return Err(format!(
+            "provisioned keys {} require one {}:{} mode-0644 regular file of at most \
+             {PROVISIONED_KEYS_LIMIT} bytes",
+            path.display(),
+            owner.uid,
+            owner.gid
+        ));
+    }
+    Ok(())
+}
+
 /// The running boot's render: the policy alone, and the line
-/// `render-ssh-policy` prints for the form it published.
+/// `render-ssh-policy` prints for the form it published. Only td-authd
+/// asks for it, and only the desktop ships td-authd, so it renders the
+/// desktop's keys.
 pub(crate) fn running_render(
     root: &Path,
     primary: &str,
     owner: login_state::Owner,
 ) -> Result<String, String> {
-    publish_policy(root, primary, owner).map(|form| format!("{}\n", reduced(form).word()))
+    publish_policy(root, primary, owner, ssh_policy::Provisioned::No)
+        .map(|form| format!("{}\n", reduced(form).word()))
 }
 
 fn publish_policy(
     root: &Path,
     primary: &str,
     owner: login_state::Owner,
+    provisioned: ssh_policy::Provisioned,
 ) -> Result<ssh_policy::Form, String> {
     let form = selected(root, owner);
     cutover::publish(
         &root.join(POLICY),
-        ssh_policy::config(primary, form).as_bytes(),
+        ssh_policy::config(primary, form, provisioned).as_bytes(),
         owner.uid,
         owner.gid,
     )?;
@@ -148,11 +218,31 @@ mod tests {
         }
 
         fn boot(&self) -> Result<ssh_policy::Form, String> {
-            boot_render(&self.root, "alice", &self.root.join("boot_id"), self.owner)
+            boot_render(
+                &self.root,
+                "alice",
+                &self.root.join("boot_id"),
+                self.owner,
+                ssh_policy::Provisioned::No,
+            )
         }
 
         fn running(&self) -> Result<String, String> {
             running_render(&self.root, "alice", self.owner)
+        }
+
+        fn server_boot(&self) -> Result<ssh_policy::Form, String> {
+            boot_render(
+                &self.root,
+                "alice",
+                &self.root.join("boot_id"),
+                self.owner,
+                ssh_policy::Provisioned::Server,
+            )
+        }
+
+        fn keys(&self) -> PathBuf {
+            self.root.join("var/lib/td/authorized-keys")
         }
 
         fn enroll(&self) {
@@ -180,6 +270,97 @@ mod tests {
         }
     }
 
+    /// A server's render publishes its form when the provisioned keys are
+    /// absent or the owner's alone, and publishes nothing otherwise.
+    #[test]
+    fn the_server_render_admits_only_owner_held_provisioned_keys() {
+        let root = Root::new();
+        assert_eq!(root.server_boot(), Ok(ssh_policy::Form::Ordinary));
+        assert_eq!(
+            root.read(POLICY),
+            ssh_policy::config(
+                "alice",
+                ssh_policy::Form::Ordinary,
+                ssh_policy::Provisioned::Server
+            )
+            .as_bytes()
+        );
+        std::fs::write(root.keys(), b"ssh-ed25519 AAAA k\n").unwrap();
+        std::fs::set_permissions(root.keys(), std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(root.server_boot(), Ok(ssh_policy::Form::Ordinary));
+        // The desktop never looks at the file.
+        std::fs::set_permissions(root.keys(), std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert_eq!(root.boot(), Ok(ssh_policy::Form::Ordinary));
+
+        let refused = |setup: &dyn Fn(&Root)| {
+            let root = Root::new();
+            setup(&root);
+            assert!(root.server_boot().is_err());
+            assert!(std::fs::symlink_metadata(root.root.join(POLICY)).is_err());
+            assert!(std::fs::symlink_metadata(root.root.join(RECORD)).is_err());
+        };
+        let write = |root: &Root, mode: u32| {
+            std::fs::write(root.keys(), b"ssh-ed25519 AAAA k\n").unwrap();
+            std::fs::set_permissions(root.keys(), std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        // Owned by anyone but the render's owner, file or directory alike.
+        let root = Root::new();
+        write(&root, 0o644);
+        assert_eq!(check_provisioned_keys(&root.root, root.owner), Ok(()));
+        for foreign in [
+            login_state::Owner {
+                uid: root.owner.uid.wrapping_add(1),
+                gid: root.owner.gid,
+            },
+            login_state::Owner {
+                uid: root.owner.uid,
+                gid: root.owner.gid.wrapping_add(1),
+            },
+        ] {
+            assert!(check_provisioned_keys(&root.root, foreign).is_err());
+        }
+        std::fs::remove_file(root.keys()).unwrap();
+        let foreign_uid = login_state::Owner {
+            uid: root.owner.uid.wrapping_add(1),
+            gid: root.owner.gid,
+        };
+        // An absent file under directories another uid owns is still refused.
+        assert!(check_provisioned_keys(&root.root, foreign_uid).is_err());
+        refused(&|root| write(root, 0o664));
+        refused(&|root| write(root, 0o600));
+        refused(&|root| {
+            write(root, 0o644);
+            std::fs::hard_link(root.keys(), root.root.join("run/second")).unwrap();
+        });
+        refused(&|root| {
+            write(root, 0o644);
+            let moved = root.root.join("run/keys");
+            std::fs::rename(root.keys(), &moved).unwrap();
+            std::os::unix::fs::symlink(&moved, root.keys()).unwrap();
+        });
+        refused(&|root| {
+            std::fs::create_dir(root.keys()).unwrap();
+        });
+        refused(&|root| {
+            write(root, 0o644);
+            let file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(root.keys())
+                .unwrap();
+            file.set_len(PROVISIONED_KEYS_LIMIT + 1).unwrap();
+        });
+        refused(&|root| {
+            write(root, 0o644);
+            let td = root.root.join("var/lib/td");
+            std::fs::set_permissions(td, std::fs::Permissions::from_mode(0o775)).unwrap();
+        });
+        refused(&|root| {
+            write(root, 0o644);
+            let lib = root.root.join("var/lib");
+            std::fs::set_permissions(lib, std::fs::Permissions::from_mode(0o757)).unwrap();
+        });
+    }
+
     /// td-authd/DESIGN.md amendment 7's three lines, written out.
     #[test]
     fn the_record_is_the_amendments_exact_bytes_for_both_forms() {
@@ -193,7 +374,12 @@ mod tests {
         root.published(POLICY);
         assert_eq!(
             root.read(POLICY),
-            ssh_policy::config("alice", ssh_policy::Form::Ordinary).as_bytes()
+            ssh_policy::config(
+                "alice",
+                ssh_policy::Form::Ordinary,
+                ssh_policy::Provisioned::No
+            )
+            .as_bytes()
         );
         root.enroll();
         assert_eq!(root.boot(), Ok(ssh_policy::Form::Enforced));
@@ -203,7 +389,12 @@ mod tests {
         );
         assert_eq!(
             root.read(POLICY),
-            ssh_policy::config("alice", ssh_policy::Form::Enforced).as_bytes()
+            ssh_policy::config(
+                "alice",
+                ssh_policy::Form::Enforced,
+                ssh_policy::Provisioned::No
+            )
+            .as_bytes()
         );
         root.published(RECORD);
         root.published(POLICY);
@@ -228,7 +419,12 @@ mod tests {
         let running = root.read(POLICY);
         assert_eq!(
             running,
-            ssh_policy::config("alice", ssh_policy::Form::Enforced).as_bytes()
+            ssh_policy::config(
+                "alice",
+                ssh_policy::Form::Enforced,
+                ssh_policy::Provisioned::No
+            )
+            .as_bytes()
         );
         // The record still names what stage 1 rendered.
         assert!(String::from_utf8(root.read(RECORD))

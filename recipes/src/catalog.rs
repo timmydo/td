@@ -1142,6 +1142,9 @@ mod named_dirs_tests {
             in_tests >= 4,
             "the test modules' own embeds prove the spans: {in_tests}"
         );
-        assert_eq!(mounted, 7, "the fingerprinted face and Unifont mounts");
+        assert_eq!(
+            mounted, 9,
+            "the fingerprinted face, Unifont and server-account mounts"
+        );
     }
 }

@@ -56,6 +56,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
                 devices: Devices::ALL,
                 screen: None,
                 shell: None,
+                host_login: None,
             },
             &scratch.dir,
             if present {

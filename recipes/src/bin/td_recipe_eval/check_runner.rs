@@ -11433,6 +11433,7 @@ chmod 755 '{}'
         const HARNESSES: &[&str] = &[
             "accel",
             "bundle",
+            "provisioned_account",
             "qemu_boot",
             "release_source",
             "run",

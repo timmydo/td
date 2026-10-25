@@ -2636,6 +2636,7 @@ pub(super) fn plan<'a>(path: &'a Path, read_only: bool, marker: &'a str) -> Boot
         devices: Devices::ALL,
         screen: None,
         shell: None,
+        host_login: None,
     }
 }
 

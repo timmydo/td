@@ -6,6 +6,9 @@ pub const SSHD_AUTHORIZED_KEYS: &str = "/etc/ssh/authorized_keys";
 pub const SSHD_SELFTEST_AUTHORIZED_KEYS: &str = "/run/td-ssh-selftest-authorized_keys";
 /// Relative to the admitted account's passwd home, never the server HOME.
 pub const SSHD_USER_AUTHORIZED_KEYS: &str = ".ssh/authorized_keys";
+/// Root-owned keys a server image's provisioning seeds for the primary
+/// account; only a server's policy names them (td-login/TOKEN-LOGIN.md, "SSH").
+pub const SSHD_PROVISIONED_AUTHORIZED_KEYS: &str = "/var/lib/td/authorized-keys";
 pub const OPENSSH_KEX_ALGORITHMS: &str =
     "mlkem768x25519-sha256,sntrup761x25519-sha512,curve25519-sha256";
 pub const OPENSSH_KEY_ALGORITHMS: &str = "ssh-ed25519";
@@ -22,8 +25,24 @@ pub enum Form {
     Enforced,
 }
 
+/// Whether the primary's `Match` block also names the provisioned keys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Provisioned {
+    /// The desktop: the self-test key and, in the ordinary form, the
+    /// account's own keys.
+    No,
+    /// A server: the root-owned provisioned keys too, in both forms. The
+    /// image's builder wrote them, not the account, so the enforced form's
+    /// withdrawal of owner-managed keys does not reach them.
+    Server,
+}
+
 /// The caller supplies the already admitted primary account name, never raw input.
-pub fn config(primary_name: &str, form: Form) -> String {
+pub fn config(primary_name: &str, form: Form, provisioned: Provisioned) -> String {
+    let provisioned_keys = match provisioned {
+        Provisioned::No => String::new(),
+        Provisioned::Server => format!(" {SSHD_PROVISIONED_AUTHORIZED_KEYS}"),
+    };
     let allow = match form {
         Form::Ordinary => String::new(),
         Form::Enforced => format!("AllowUsers {primary_name}\n"),
@@ -63,6 +82,6 @@ pub fn config(primary_name: &str, form: Form) -> String {
          MaxSessions 4\n\
          PidFile /run/sshd.pid\n\
          Match User {primary_name}\n\
-         \tAuthorizedKeysFile {SSHD_SELFTEST_AUTHORIZED_KEYS}{remote_keys}\n"
+         \tAuthorizedKeysFile {SSHD_SELFTEST_AUTHORIZED_KEYS}{provisioned_keys}{remote_keys}\n"
     )
 }

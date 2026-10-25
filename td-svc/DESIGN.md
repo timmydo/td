@@ -1654,10 +1654,29 @@ login-key record codec td-secret, cryptsetup and td-btrfs for the
 installer-shared volume tools, and td-net's source and Rust launchers
 so the machine can build td itself.
 
-No remote key reaches a server yet. Its sshd renders the policy
-td-login/TOKEN-LOGIN.md "SSH" describes, and nothing on the image
-writes the primary account's `~/.ssh/authorized_keys`, so only the
-boot's loopback self-test key is admitted.
+A server is reached through its provisioned account, which its
+persistent volume carries. The volume names the primary account and
+its Ed25519 public keys. The name goes in `/var/lib/td/username`,
+which renames the primary at boot as an installation's saved name does.
+The keys go in the root-owned, mode-0644
+`/var/lib/td/authorized-keys`. Only a server's SSH policy names that
+file, in both its forms, and its render refuses a file the account
+could have written (td-login/TOKEN-LOGIN.md, "SSH"). The account has
+no password and no console login, and administration stays what
+APPLICATIONS.md §L.1 describes.
+
+td-recipe-eval's persistent-volume layout is today's only writer of
+the pair; no installer, bundle or image path stages it yet. It refuses
+any name the guest would refuse, which would leave the volume
+unreachable. That means one outside the guest's grammar, a reserved
+session or application form, or the name of another account or group
+in the image's tables. It also refuses any key line that is not one
+`ssh-ed25519` key without options. `qemu-boot-server` stages the
+account "ada" with a key made for the run. It logs in from the host
+over a loopback-only forward as that account with that key, and holds
+the host key the client accepted to the one the console reported. The
+same key must be refused as root, and a key the server was never given
+must be refused.
 
 ## 11. Evicting a previous supervisor's services
 

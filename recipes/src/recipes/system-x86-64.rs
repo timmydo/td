@@ -2494,6 +2494,16 @@ const LOGIN_DIRECTORY_STEP: &str = "/bin/td-firstboot ensure-login-directory /sy
 /// no refusal, so `|| :` keeps `set -e` from failing the boot.
 const ADMIT_STEP: &str = "/bin/td-boot admit /sysroot/run || :";
 
+/// The deployment init's SSH policy render. A server's also names the
+/// primary's root-owned provisioned keys (td-svc/DESIGN.md §10, "Profiles").
+fn sshd_render_step(sys: &SystemDef) -> &'static str {
+    if sys.desktop() {
+        "/bin/td-firstboot render-primary-sshd /sysroot || exit 1"
+    } else {
+        "/bin/td-firstboot render-primary-sshd --provisioned-keys /sysroot || exit 1"
+    }
+}
+
 /// The selected deployment initramfs requires exactly one td.deployment handoff,
 /// validates that manifest and root payload, and enters the immutable root.
 fn build_deployment_init(sys: &SystemDef) -> String {
@@ -2620,8 +2630,9 @@ fn build_deployment_init(sys: &SystemDef) -> String {
     init.push_str(&format!(
         "primary_home=$(/bin/td-firstboot prepare-primary-profile /sysroot) || exit 1\n\
          {LOGIN_DIRECTORY_STEP}\n\
-         /bin/td-firstboot render-primary-sshd /sysroot || exit 1\n\
-         /bin/umount /proc\n"
+         {}\n\
+         /bin/umount /proc\n",
+        sshd_render_step(sys)
     ));
     if sys.desktop() {
         init.push_str(&format!(
@@ -11779,7 +11790,7 @@ mod tests {
                 &["PermitRootLogin no", "AllowUsers alice", "Match User alice"][..],
             ),
         ] {
-            let config = ssh_policy::config("alice", form);
+            let config = ssh_policy::config("alice", form, ssh_policy::Provisioned::No);
             for required in [
                 format!("HostKey {SSHD_HOST_KEY}"),
                 format!("AuthorizedKeysFile {SSHD_AUTHORIZED_KEYS}"),
@@ -16832,6 +16843,38 @@ mod server_tests {
         assert_eq!(primary.uid, UI_UID);
         assert!(passwd.contains(&format!("{SSHD_PRIVSEP_USER}:")));
         assert!(build_shadow(&SERVER).contains(ROOT_SHADOW_LINE));
+    }
+
+    /// A server's one SSH policy render also admits the provisioned keys;
+    /// the desktop's is unchanged.
+    #[test]
+    fn only_the_servers_render_admits_provisioned_keys() {
+        for (sys, step) in [
+            (
+                &SYSTEM,
+                "/bin/td-firstboot render-primary-sshd /sysroot || exit 1",
+            ),
+            (
+                &SERVER,
+                "/bin/td-firstboot render-primary-sshd --provisioned-keys /sysroot || exit 1",
+            ),
+        ] {
+            let init = build_deployment_init(sys);
+            assert_eq!(init.matches("render-primary-sshd").count(), 1);
+            assert_eq!(init.lines().filter(|line| line.trim() == step).count(), 1);
+        }
+        let policy = ssh_policy::config(
+            "alice",
+            ssh_policy::Form::Ordinary,
+            ssh_policy::Provisioned::Server,
+        );
+        assert!(policy.contains(&format!(
+            "{SSHD_SELFTEST_AUTHORIZED_KEYS} {}",
+            ssh_policy::SSHD_PROVISIONED_AUTHORIZED_KEYS
+        )));
+        // The flag td-firstboot parses is the one the init passes.
+        assert!(include_str!("../../../td-firstboot/src/main.rs")
+            .contains("const PROVISIONED_KEYS_FLAG: &str = \"--provisioned-keys\";"));
     }
 
     /// The account invariants `system_def_is_self_consistent` holds for the

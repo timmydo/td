@@ -9064,7 +9064,9 @@ automatic rollback or physical access ("The v1 operations", Recovery).
 The server profile (`server-x86-64`, td-svc/DESIGN.md §10, "Profiles")
 runs no td-authd and offers none of these operations: it is administered
 by building a new image and replacing the machine, and its unattended
-recovery is that same automatic rollback.
+recovery is that same automatic rollback. Its SSH login is the
+unprivileged primary account, with the keys its persistent volume was
+provisioned with and, in the ordinary form, the account's own.
 
 **Retiring the escape hatch.** The escape hatch was root's remaining
 administrative surface: the `su` applet, root's empty shadow field, root

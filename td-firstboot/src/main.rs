@@ -93,6 +93,9 @@ const NEW_MARKER: &str = "TD-FIRSTBOOT-NEW-OK";
 const STABLE_MARKER: &str = "TD-FIRSTBOOT-STABLE-OK";
 const PRINCIPALS_MARKER: &str = "TD-PRINCIPALS-ENROLLED";
 const HOST_KEY_PREFIX: &str = "TD-FIRSTBOOT-HOSTKEY ";
+/// `render-primary-sshd`'s server form: the policy also names the root-owned
+/// provisioned keys (td-svc/DESIGN.md §10, "Profiles").
+const PROVISIONED_KEYS_FLAG: &str = "--provisioned-keys";
 
 /// Where per-machine state lives. The recipe's `MUTABLE_ETC` table points every
 /// persistent `/etc` symlink at this directory, and its unit tests read this
@@ -291,7 +294,7 @@ fn usage() -> String {
          td-firstboot stage-primary-name ROOT NAME OUT prepares new account tables without activating them\n  \
          td-firstboot ensure-login-directory ROOT creates an absent ROOT/var/lib/td/login, refuses an invalid one, and removes its tmp- entries\n  \
          td-firstboot check-login-directory ROOT checks ROOT/var/lib/td/login without writing\n  \
-         td-firstboot render-primary-sshd ROOT publishes ROOT/{policy} for the validated primary account in the form ROOT's login state selects, then ROOT/{record} naming that form for this boot\n  \
+         td-firstboot render-primary-sshd [--provisioned-keys] ROOT publishes ROOT/{policy} for the validated primary account in the form ROOT's login state selects, then ROOT/{record} naming that form for this boot; --provisioned-keys, a server's, also admits the primary's root-owned provisioned keys\n  \
          td-firstboot render-ssh-policy publishes /{policy} the same way for the running boot and prints the form it published\n  \
          td-firstboot prepare-primary-profile ROOT publishes the selected primary account and prepares its home before users start\n  \
          td-firstboot check-launch-session USER UID COMPOSITOR_UID verifies live reservations\n  \
@@ -318,13 +321,14 @@ fn run_with_primary(
             return login_directory::check(&root)
                 .map_err(|reason| Failure::Failed(format!("login directory invalid: {reason}")));
         }
-        Invocation::RenderPrimarySshd(root) => {
+        Invocation::RenderPrimarySshd(root, provisioned) => {
             let primary = principals::primary_in_root(&root).map_err(Failure::Failed)?;
             ssh_render::boot_render(
                 &root,
                 primary.name(),
                 Path::new(cutover::BOOT_ID),
                 login_state::Owner::ROOT,
+                provisioned,
             )
             .map_err(Failure::Failed)?;
             return Ok(());
@@ -505,7 +509,7 @@ enum Invocation {
     PreparePrimaryProfile(PathBuf),
     EnsureLoginDirectory(PathBuf),
     CheckLoginDirectory(PathBuf),
-    RenderPrimarySshd(PathBuf),
+    RenderPrimarySshd(PathBuf, ssh_policy::Provisioned),
     RenderSshPolicy,
     CheckLaunchSession(String, u32, u32),
     CheckLaunchApplication(u32, String),
@@ -531,10 +535,19 @@ fn parse(args: &[String]) -> Result<Invocation, Failure> {
         .first()
         .is_some_and(|verb| verb == "render-primary-sshd")
     {
-        let [_, root] = args else {
-            return Err(Failure::Usage("render-primary-sshd requires ROOT".into()));
+        return match args {
+            [_, root] if root != PROVISIONED_KEYS_FLAG => Ok(Invocation::RenderPrimarySshd(
+                PathBuf::from(root),
+                ssh_policy::Provisioned::No,
+            )),
+            [_, flag, root] if flag == PROVISIONED_KEYS_FLAG => Ok(Invocation::RenderPrimarySshd(
+                PathBuf::from(root),
+                ssh_policy::Provisioned::Server,
+            )),
+            _ => Err(Failure::Usage(format!(
+                "render-primary-sshd requires [{PROVISIONED_KEYS_FLAG}] ROOT"
+            ))),
         };
-        return Ok(Invocation::RenderPrimarySshd(PathBuf::from(root)));
     }
     if args.first().is_some_and(|verb| verb == "render-ssh-policy") {
         return if args.len() == 1 {
@@ -1665,7 +1678,7 @@ mod tests {
             | Invocation::PreparePrimaryProfile(_)
             | Invocation::EnsureLoginDirectory(_)
             | Invocation::CheckLoginDirectory(_)
-            | Invocation::RenderPrimarySshd(_)
+            | Invocation::RenderPrimarySshd(..)
             | Invocation::RenderSshPolicy
             | Invocation::StagePrimaryName(_, _, _)
             | Invocation::CheckLaunchApplication(..)
@@ -2265,7 +2278,11 @@ mod ssh_forms {
     /// The policy for the admitted `primary` account, in the form the login
     /// state under the same `root` selects.
     fn sshd_policy(primary: &str, root: &Path, owner: login_state::Owner) -> String {
-        ssh_policy::config(primary, ssh_render::selected(root, owner))
+        ssh_policy::config(
+            primary,
+            ssh_render::selected(root, owner),
+            ssh_policy::Provisioned::No,
+        )
     }
 
     /// The policy as rendered before the login-key tier and APPLICATIONS.md
@@ -2336,15 +2353,47 @@ mod ssh_forms {
     #[test]
     fn remote_keys_are_consulted_only_for_an_unenrolled_primary() {
         for name in NAMES {
-            let ordinary = ssh_policy::config(name, ssh_policy::Form::Ordinary);
+            let ordinary = ssh_policy::config(
+                name,
+                ssh_policy::Form::Ordinary,
+                ssh_policy::Provisioned::No,
+            );
             assert!(ordinary.ends_with(&format!(
                 "Match User {name}\n\tAuthorizedKeysFile /run/td-ssh-selftest-authorized_keys .ssh/authorized_keys\n"
             )));
-            let enforced = ssh_policy::config(name, ssh_policy::Form::Enforced);
+            let enforced = ssh_policy::config(
+                name,
+                ssh_policy::Form::Enforced,
+                ssh_policy::Provisioned::No,
+            );
             assert!(!enforced.contains(".ssh/authorized_keys"));
             assert!(enforced.ends_with(&format!(
                 "Match User {name}\n\tAuthorizedKeysFile /run/td-ssh-selftest-authorized_keys\n"
             )));
+        }
+    }
+
+    /// A server's policy adds its provisioned keys to the primary's block in
+    /// both forms and changes nothing else; the desktop never names them.
+    #[test]
+    fn only_a_server_policy_names_the_provisioned_keys() {
+        use ssh_policy::{Form, Provisioned};
+        for name in NAMES {
+            for form in [Form::Ordinary, Form::Enforced] {
+                let desktop = ssh_policy::config(name, form, ssh_policy::Provisioned::No);
+                assert!(!desktop.contains(ssh_policy::SSHD_PROVISIONED_AUTHORIZED_KEYS));
+                let server = ssh_policy::config(name, form, Provisioned::Server);
+                assert_eq!(
+                    server,
+                    desktop.replace(
+                        "/run/td-ssh-selftest-authorized_keys",
+                        "/run/td-ssh-selftest-authorized_keys /var/lib/td/authorized-keys"
+                    )
+                );
+                assert_eq!(server.matches("/var/lib/td/authorized-keys").count(), 1);
+                let block = server.split_once(&format!("Match User {name}\n"));
+                assert!(block.is_some_and(|(_, block)| block.contains("authorized-keys")));
+            }
         }
     }
 
@@ -2410,7 +2459,11 @@ mod ssh_forms {
         assert!(!ordinary_alice.contains("AllowUsers"));
         for name in NAMES {
             assert_eq!(
-                ssh_policy::config(name, ssh_policy::Form::Ordinary),
+                ssh_policy::config(
+                    name,
+                    ssh_policy::Form::Ordinary,
+                    ssh_policy::Provisioned::No
+                ),
                 ordinary(name)
             );
         }
@@ -2431,7 +2484,11 @@ mod ssh_forms {
     #[test]
     fn the_enforced_form_refuses_root_and_admits_only_the_primary() {
         for name in NAMES {
-            let policy = ssh_policy::config(name, ssh_policy::Form::Enforced);
+            let policy = ssh_policy::config(
+                name,
+                ssh_policy::Form::Enforced,
+                ssh_policy::Provisioned::No,
+            );
             assert_eq!(policy, enforced(name));
             let lines: Vec<&str> = policy.lines().collect();
             let rule = |prefix: &str| {
@@ -2456,7 +2513,11 @@ mod ssh_forms {
             assert!(!policy.contains("DenyUsers") && !policy.contains("AllowGroups"));
         }
         assert_eq!(
-            ssh_policy::config("alice", ssh_policy::Form::Enforced),
+            ssh_policy::config(
+                "alice",
+                ssh_policy::Form::Enforced,
+                ssh_policy::Provisioned::No
+            ),
             BEFORE.replace(
                 "PermitRootLogin prohibit-password\n",
                 "PermitRootLogin no\nAllowUsers alice\n"
@@ -2615,12 +2676,21 @@ mod principal_arguments {
     fn server_policy_requires_only_the_verified_root() {
         let args = ["render-primary-sshd", "/sysroot"].map(str::to_owned);
         assert!(
-            matches!(parse(&args), Ok(Invocation::RenderPrimarySshd(root))
+            matches!(parse(&args), Ok(Invocation::RenderPrimarySshd(root, ssh_policy::Provisioned::No))
+            if root == Path::new("/sysroot"))
+        );
+        let args = ["render-primary-sshd", "--provisioned-keys", "/sysroot"].map(str::to_owned);
+        assert!(
+            matches!(parse(&args), Ok(Invocation::RenderPrimarySshd(root, ssh_policy::Provisioned::Server))
             if root == Path::new("/sysroot"))
         );
         for args in [
             vec!["render-primary-sshd"],
+            vec!["render-primary-sshd", "--provisioned-keys"],
             vec!["render-primary-sshd", "/sysroot", "root"],
+            vec!["render-primary-sshd", "/sysroot", "--provisioned-keys"],
+            vec!["render-primary-sshd", "--provisioned-key", "/sysroot"],
+            vec!["render-primary-sshd", "--provisioned-keys", "/sysroot", "x"],
         ] {
             let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
             assert!(matches!(parse(&args), Err(Failure::Usage(_))));

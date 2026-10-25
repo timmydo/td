@@ -2050,6 +2050,7 @@ const BOOT_FILES: &[&str] = &[
     "recipes/src/bin/td_recipe_eval/checks/qemu_boot.rs",
     "recipes/src/bin/td_recipe_eval/checks/qemu_boot/",
     "recipes/src/bin/td_recipe_eval/checks/accel.rs",
+    "recipes/src/bin/td_recipe_eval/checks/provisioned_account.rs",
     "builder/src/integration.rs",
 ];
 

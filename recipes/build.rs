@@ -424,9 +424,12 @@ const HOST_CHECK_SOURCES: &[&str] = &[
     "recipes/src/bin/td_recipe_eval/checks/bundle.rs",
     "recipes/src/bin/td_recipe_eval/checks/qemu_boot.rs",
     "recipes/src/bin/td_recipe_eval/checks/qemu_boot/",
+    "recipes/src/bin/td_recipe_eval/checks/provisioned_account.rs",
     "recipes/src/bin/td_recipe_eval/checks/release_source.rs",
     "recipes/src/bin/td_recipe_eval/checks/run.rs",
     "recipes/src/bin/td_recipe_eval/checks/vm_profile.rs",
+    "td-authd/src/primary_account.rs",
+    "td-encoding/src/lib.rs",
     "td-ui/src/atlas.rs",
     "td-ui/src/coverage.rs",
     "td-ui/src/face.rs",
@@ -796,6 +799,10 @@ fn evaluator_source_fingerprint(
         // the screen oracles draw the compositor's chrome text, and
         // td-setup's recovery key, with them.
         "td-ui/src/atlas.rs",
+        // Mounted by checks/provisioned_account.rs: key blobs and the
+        // guest's primary-name grammar.
+        "td-authd/src/primary_account.rs",
+        "td-encoding/src/lib.rs",
         "td-ui/src/coverage.rs",
         "td-ui/src/face.rs",
         "td-ui/src/face_file.rs",

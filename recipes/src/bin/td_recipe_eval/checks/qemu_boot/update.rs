@@ -1301,6 +1301,7 @@ pub(crate) fn run_deploy_rollback(runner: &crate::check_runner::RecipeCheckRunne
         None,
         super::VolumePurpose::Fixture,
         None,
+        None,
     )?;
     let (current, previous) = (fixture.alternate_id, fixture.initial_id);
     if current == previous {

@@ -19,8 +19,10 @@
 //! recorded failure, a timeout and a skip over an unmet requirement reach it
 //! through the same `after=` decision, which td-svc's own tests hold.
 
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 
+use super::host_login::HostLogin;
 use super::{
     autotest_wait_token, boot_headless, boot_timeout, build_btrfs_tools, build_system_stem,
     build_td_jail_seccomp_probe, check_persistent_volume, create_persistent_volume_layout,
@@ -46,6 +48,10 @@ pub(crate) const STEM: &str = "server-x86-64";
 
 const HEALTH_REBOOT_MARKER: &str = td_recipe::shared::SERVER_HEALTH_REBOOT_MARKER;
 const HEALTH_STEADY_MARKER: &str = td_recipe::shared::SERVER_HEALTH_STEADY_MARKER;
+
+/// The provisioned primary's name: not the image's default, so the boot
+/// shows the saved name was taken.
+const ACCOUNT: &str = "ada";
 
 /// No display: nothing on a server draws. The direct-boot PC machine keeps
 /// its built-in i8042 keyboard controller, which only q35 can leave out.
@@ -74,13 +80,23 @@ impl Boot<'_> {
     /// One boot past the health acknowledgement to healthwatch's steady
     /// state, which ends it.
     fn healthy(&self, tokens: &str, label: &str) -> Result<BootResult, String> {
-        self.run(tokens, HEALTH_STEADY_MARKER, true, label)
+        self.run(tokens, HEALTH_STEADY_MARKER, true, None, label)
+    }
+
+    /// `healthy`, then the host's SSH logins before the boot ends.
+    fn healthy_with_login(
+        &self,
+        tokens: &str,
+        login: &HostLogin,
+        label: &str,
+    ) -> Result<BootResult, String> {
+        self.run(tokens, HEALTH_STEADY_MARKER, true, Some(login), label)
     }
 
     /// One boot that must end itself: health fails, healthwatch reboots,
     /// and QEMU (`-no-reboot`) exits.
     fn failing(&self, tokens: &str, label: &str) -> Result<BootResult, String> {
-        self.run(tokens, HEALTH_REBOOT_MARKER, false, label)
+        self.run(tokens, HEALTH_REBOOT_MARKER, false, None, label)
     }
 
     fn run(
@@ -88,6 +104,7 @@ impl Boot<'_> {
         tokens: &str,
         target: &str,
         kill_on_marker: bool,
+        host_login: Option<&HostLogin>,
         label: &str,
     ) -> Result<BootResult, String> {
         let result = boot_headless(
@@ -113,6 +130,7 @@ impl Boot<'_> {
                 devices: HEADLESS,
                 screen: None,
                 shell: None,
+                host_login,
             },
             self.scratch,
         )?;
@@ -135,9 +153,19 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     let (bzimage, selector, deployment) = build_system_stem(runner, STEM)?;
     let (mkfs, btrfs) = build_btrfs_tools(runner)?;
     let seccomp_probe = build_td_jail_seccomp_probe(runner)?;
-    let trust = RunTrust::generate()?;
+    // The provisioned files must be guest root's, as an image's are.
+    let builder = PathBuf::from(runner.builder_command().get_program());
+    let trust = RunTrust::generate_root_owned(builder)?;
     let initramfs = provision_selector(&selector, runner.scratch_dir(), &trust)?;
     let volume = runner.scratch_dir().join("server-volume.btrfs");
+    let client = runner.scratch_dir().join("server-ssh-client");
+    match fs::remove_dir_all(&client) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            return Err(format!("remove stale {}: {error}", client.display()));
+        }
+        _ => {}
+    }
+    let login = HostLogin::prepare(&client, STEM, ACCOUNT)?;
     let fresh_volume = || {
         create_persistent_volume_layout(
             &deployment,
@@ -150,6 +178,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
             Some(&seccomp_probe),
             VolumePurpose::Fixture,
             None,
+            Some(login.account()),
         )
     };
     let fixture = fresh_volume()?;
@@ -201,8 +230,13 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     require_same_identity(&install, &pending, "install", "pending candidate")?;
     check_persistent_volume(&btrfs, &volume)?;
 
-    let acknowledged = boot.healthy(&healthy_tokens, "acknowledged boot")?;
+    // The provisioned account is the primary, and the host logs in as it
+    // with the provisioned key and is refused with any other.
+    let acknowledged = boot.healthy_with_login(&healthy_tokens, &login, "acknowledged boot")?;
     validate_healthy(&acknowledged, Identity::Reused, "acknowledged boot")?;
+    login.verdict(acknowledged.evidence.host_key.as_deref())?;
+    // The run's private keys are kept only for a failure's diagnosis.
+    fs::remove_dir_all(&client).map_err(|error| format!("remove {}: {error}", client.display()))?;
     require_selected_deployment(
         &acknowledged,
         td_boot_protocol::SELECTED_CURRENT_MARKER,
@@ -289,7 +323,9 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         "PASS: server-x86-64 boots headless under qemu - an installed candidate boots pending, \
          records health ({SYSTEM_BOOT_SUCCESS_MARKER}, then {HEALTH_STEADY_MARKER}) with the \
          same host identity and is then \
-         current; one whose every attempt fails health is rebooted by healthwatch \
+         current, where the host logs in over SSH as the provisioned account {ACCOUNT:?} with \
+         its provisioned key, on the host key the console reported, and is refused as root \
+         and with another key; one whose every attempt fails health is rebooted by healthwatch \
          ({HEALTH_REBOOT_MARKER}, {SYSTEM_SHUTDOWN_MARKER}) until td-boot falls back to the \
          previous deployment unattended. Every healthy boot reports the read-only root and \
          /etc, writable state, OpenSSH loopback ({SSHD_MARKER}) and root's refusal \

@@ -108,6 +108,12 @@ OpenSSH's default StrictModes checks apply to the home and authorization
 file. A process already running as that owner may add keys; same-UID
 isolation is not claimed. Enforced and unavailable login states never consult
 this file, and enrollment's SSH leaf teardown revokes existing sessions.
+A server image's policy also names root-owned keys its volume's builder
+provisioned (`TOKEN-LOGIN.md`, "SSH"), in both forms. Possessing one grants
+the same session authority and nothing more. The account cannot change them,
+and its render refuses a keys file the account could have written. Revoking
+one takes a new persistent volume: a new image over the same volume keeps
+these keys, and anything the account added to its own `authorized_keys`.
 The boot-health login uses a fresh volatile key for the unprivileged UI account,
 but its root-owned authorization line is constrained by OpenSSH `restrict` and
 `from="127.0.0.1"`; possession of that key cannot create a network-reachable
