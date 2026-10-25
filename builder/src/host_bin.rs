@@ -316,6 +316,7 @@ pub(crate) fn host_cargo_bin(
     command
         .args(["build", "--release", "--quiet", "--target", target])
         .current_dir(root.join(dir))
+        .env("CARGO_TARGET_DIR", root.join(dir).join("target"))
         .env("PATH", &new_path)
         // Pin the compiler itself: an inherited RUSTC would build with a
         // different rustc than the one we read the triple from, and an inherited

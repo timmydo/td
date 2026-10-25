@@ -356,6 +356,7 @@ fn install(root: &Path, opts: &Options) -> Result<()> {
     let bin_dir = opts.prefix.join("bin");
     let bin = bin_dir.join("td-mta");
     if !opts.services_only {
+        crate::check_loop::warm_mail_sources(root)?;
         let built = crate::crypto_build::release(root)?;
         let executable = &built.executable;
         let releases = opts.prefix.join("lib/td-mta/releases");
