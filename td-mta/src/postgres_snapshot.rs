@@ -30,6 +30,18 @@ pub(crate) async fn begin(
         return Err(Error::Epoch);
     }
     client.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL idle_in_transaction_session_timeout=10000").await.map_err(|_|Error::Database)?;
+    observe(client, binding, presented).await
+}
+
+// The caller owns a freshly qualified transaction and its migration lock.
+pub(crate) async fn observe(
+    client: &Client,
+    binding: &Binding,
+    presented: Presented,
+) -> Result<ViewIdentity, Error> {
+    if !binding.roles().jmap() {
+        return Err(Error::Policy);
+    }
     let selected = client
         .query_one(
             "SELECT generation,version_id FROM td_mta.config_selection WHERE singleton=true",

@@ -5,25 +5,30 @@ use crate::{
     http_auth::{Authenticator, Principal},
     ports::{Deadline, Error},
     postgres_input::Loaded,
-    postgres_probe::{self, Mode},
+    postgres_probe::{self, AuthenticationSession, Mode},
     postgres_resolver,
     postgres_runtime_profile::Binding,
-    postgres_snapshot,
 };
 use std::{
     path::Path,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{Mutex, TryLockError},
+    thread::{self, ThreadId},
     time::{Duration, Instant},
 };
 
 /// Preparation adapter, not a serving entry point. The HTTPS service must use
-/// this same RuntimeClock. One call may run; no queue or background connection.
+/// this same RuntimeClock. One fixed thread runs calls with no waiter queue.
+/// Its retained connection has finite lifetime and byte/frame/job allowances.
 pub struct Authentication<'a> {
     loaded: &'a Loaded,
     executable: &'a Path,
     accounts: &'a [(&'a str, &'a Binding)],
     clock: &'a RuntimeClock,
-    active: AtomicBool,
+    state: Mutex<State>,
+}
+struct State {
+    owner: Option<ThreadId>,
+    session: Option<AuthenticationSession>,
 }
 impl<'a> Authentication<'a> {
     pub fn new(
@@ -58,14 +63,11 @@ impl<'a> Authentication<'a> {
             executable,
             accounts,
             clock,
-            active: AtomicBool::new(false),
+            state: Mutex::new(State {
+                owner: None,
+                session: None,
+            }),
         })
-    }
-}
-struct Permit<'a>(&'a AtomicBool);
-impl Drop for Permit<'_> {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
     }
 }
 impl Authenticator for Authentication<'_> {
@@ -89,12 +91,65 @@ impl Authenticator for Authentication<'_> {
         if Presented::parse(password).is_none() {
             return Ok(None);
         }
-        self.active
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| Error::Busy)?;
-        let _permit = Permit(&self.active);
+        let mut state = self.state.try_lock().map_err(|error| match error {
+            TryLockError::WouldBlock => Error::Busy,
+            TryLockError::Poisoned(_) => Error::Invalid,
+        })?;
+        let owner = thread::current().id();
+        if state.owner.is_some_and(|prior| prior != owner) {
+            return Err(Error::Invalid);
+        }
+        state.owner = Some(owner);
+        if state
+            .session
+            .as_ref()
+            .is_some_and(|session| !session.reusable(deadline))
+        {
+            if let Some(session) = state.session.take() {
+                session.retire(deadline);
+            }
+        }
+        let reused = state.session.is_some();
+        if state.session.is_none() {
+            state.session = Some(self.connect(deadline)?);
+        }
+        let presented = Presented::parse(password).ok_or(Error::Invalid)?;
+        let result = state
+            .session
+            .as_mut()
+            .ok_or(Error::Invalid)?
+            .authenticate(binding, presented, deadline);
+        let result = if Instant::now() >= deadline {
+            Err(Error::Deadline)
+        } else {
+            result
+        };
+        if reused {
+            crate::performance::record(
+                crate::performance::Phase::DbReuse,
+                Duration::ZERO,
+                if result.is_ok() {
+                    crate::performance::Outcome::Success
+                } else {
+                    crate::performance::Outcome::Failed
+                },
+            );
+        }
+        if result.is_err() {
+            drop(state.session.take());
+        }
+        match result {
+            Ok(principal) => Ok(Some(principal)),
+            Err(Error::Forbidden) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+}
+impl Authentication<'_> {
+    fn connect(&self, deadline: Instant) -> Result<AuthenticationSession, Error> {
         let dns_deadline = deadline.min(
-            now.checked_add(Duration::from_secs(5))
+            Instant::now()
+                .checked_add(Duration::from_secs(5))
                 .ok_or(Error::Invalid)?,
         );
         let addresses =
@@ -106,27 +161,12 @@ impl Authenticator for Authentication<'_> {
         for address in addresses {
             let mut request = self.loaded.bootstrap.request(address);
             request.mode = Mode::Runtime;
-            let presented = Presented::parse(password).ok_or(Error::Invalid)?;
-            let device = presented.id();
-            let binding = (*binding).clone();
-            let account = binding.account();
-            let result = postgres_probe::with_client(
-                &request,
-                &self.loaded.trust,
-                deadline,
-                move |client| {
-                    Box::pin(
-                        async move { postgres_snapshot::begin(client, &binding, presented).await },
-                    )
-                },
-            );
+            let result = AuthenticationSession::open(&request, &self.loaded.trust, deadline);
             if Instant::now() >= deadline {
                 return Err(Error::Deadline);
             }
             match result {
-                Ok(Ok(_)) => return Ok(Some(Principal { account, device })),
-                Ok(Err(postgres_snapshot::Error::Unauthenticated)) => return Ok(None),
-                Ok(Err(_)) => return Err(Error::Invalid),
+                Ok(session) => return Ok(session),
                 Err(postgres_probe::Error::Transport) => continue,
                 Err(postgres_probe::Error::Deadline) => return Err(Error::Deadline),
                 Err(_) => return Err(Error::Invalid),

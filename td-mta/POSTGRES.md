@@ -76,12 +76,15 @@ absent; refuse even an existing empty namespace and never replace a store.
 Incompatible upgrades require all instances to drain and stop; no mixed-version
 deployment is promised initially. Serving database connections acquire a shared
 session-level advisory lock on the fixed migration key before checking schema
-compatibility and retain it until closure. The BodyChecks validator is the
-explicit exception (section 180): each turn takes the same key's shared
-transaction-level lock, fully revalidates schema/epoch and Runtime access before
-Body queries, and acknowledges rollback before returning. Its idle connection
-retains no migration lock and grants no authority to skip the next turn's
-qualification. The migrator takes the conflicting exclusive lock with a finite
+compatibility and retain it until closure. Retained Body/Envelope validators
+(sections 180 and 187) instead take the same key's shared transaction-level
+lock on each turn, fully revalidate schema/epoch and Runtime access before
+application reads, and acknowledge rollback before returning. The fixed HTTPS
+authentication worker (below) acquires the session lock once per job before
+opening its repeatable-read snapshot and explicitly acknowledges its unlock
+after rollback. Neither kind of idle retained connection holds a migration
+lock or grants authority to skip the next turn's qualification.
+The migrator takes the conflicting exclusive lock with a finite
 deadline and refuses while a serving session or validation turn holds a shared
 lock. After migration, a returning old process must reacquire the appropriate
 shared lock and validate the new schema before application SQL; stale pools
@@ -5955,8 +5958,8 @@ After role and privilege checks, common runtime qualification requires exactly
 one `(singleton=true, blocked=false)` row. A blocked or missing singleton
 refuses with the distinct maintenance error; query/type failures also refuse.
 
-This check applies to each new Runtime connection and the existing retained
-validators' per-turn runtime qualification. It does not revoke already-admitted
+This check applies to each new ordinary Runtime connection and retained
+validators' and HTTPS authentication turns' runtime qualification. It does not revoke already-admitted
 network I/O or make a previously captured snapshot see newer rows. Existing
 operations retain their original finite limits and migration locks. Owner
 Preparation schema inspection remains available while the barrier is set;
@@ -6517,6 +6520,55 @@ operation capacity. Each Session names only its authenticated account. Three
 MiB of startup metadata reservation covers the aggregate catalog preparation,
 bindings and up to sixteen Session documents. All serving roles use this
 bounded account registry.
+
+### Retained HTTPS authentication sessions
+
+The fixed authentication worker retains at most one PostgreSQL session across
+requests, shared by every configured account and origin. Its adapter binds to
+the first calling thread, uses a nonblocking mutex with no waiter queue, and
+refuses another thread. Credentials and account/device authority remain
+request-owned; the retained session caches neither authentication results nor
+configuration, schema, privilege or maintenance observations.
+
+Each admitted job acquires the shared session migration lock once, inspects
+the complete schema ledger and expected epoch, and repeats primary/durability,
+Runtime-role, exact privilege and maintenance checks. Only then does it begin
+a new READ ONLY REPEATABLE READ transaction, observe the selected configuration,
+authenticate the presented device and check its account snapshot. Taking the
+session lock before BEGIN prevents a snapshot from retaining a pre-migration
+ledger after acquiring the barrier. This path calls no nested session-lock
+helper. Success requires acknowledged ROLLBACK, an acknowledged true result
+from the single matching advisory unlock, and a final deadline check. No
+transaction or migration/account lock survives between jobs. SQL/credential refusals, failed
+cleanup, expired jobs, framing failures and disconnected sessions retire the
+connection. A failure never silently retries the admitted job.
+
+A session admits at most 64 jobs within sixty seconds of creation. Each job
+keeps its own original deadline, capped at ten seconds including initial DNS,
+TCP, TLS and SCRAM. Before starting a later job whose complete allowance would
+outlive the session, the adapter closes the old connection and performs fresh
+DNS/TLS/SCRAM admission. Idle expiration is checked on the next request, not by
+a new task: an inert expired socket may remain until that request or service
+shutdown. Its TLS lifetime and every operation deadline still prevent use
+beyond the original session cap. Shutdown drops the retained connection after
+joining the fixed worker, without polling its driver from another thread.
+
+Authentication and the first job share the initial one-MiB input, 1088-frame
+and 64-KiB output window. A completed job admits another such window while the
+sixty-four-MiB input, 69632-frame and four-MiB output session totals only
+decrease. Per-frame and SCRAM limits remain unchanged. Available idle messages
+consume the preceding window before the next starts; parser state, connection
+authentication and sticky failures are never reset. Windows are work limits,
+not resident allocations. The existing one-authentication-worker capacity
+covers the retained socket and TLS buffers, independently of account count.
+
+API reads, downloads, post-verification reauthorization and mutation connections
+retain their existing admission and teardown paths. This increment changes no
+write retry, uncertain-COMMIT or receipt-settlement behavior. Native fixtures
+check 64 jobs on one backend, rotation, idle lock release, wrong-thread refusal,
+fresh policy/schema/epoch/privilege/maintenance checks, failed unlock, revocation and disconnect
+retirement. A focused fixture reports cold and warm authentication times; those
+measurements do not establish end-to-end HTTP or download performance.
 
 
 ## Transactional incoming delivery across accounts

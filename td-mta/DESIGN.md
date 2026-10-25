@@ -2693,6 +2693,11 @@ only the initial observation; mutations and body admission keep their existing
 fresh authorization boundaries. The PostgreSQL verifier owns the database-backed device check. The backend contract requires bounded completion
 under the supplied deadline. Service shutdown joins the verifier along with
 the existing workers; database lookup must never run on the network reactor.
+The fixed PostgreSQL verifier retains one finite session across jobs. Each job
+repeats qualification and device authentication in a fresh transaction and
+acknowledges rollback before returning; idle sessions retain no migration lock
+or account authority. POSTGRES.md owns its lifetime, cumulative protocol
+allowances, thread ownership, retirement and reconnect rules.
 
 ## Native ACME deployment profile
 

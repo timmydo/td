@@ -2464,6 +2464,12 @@ fn real_postgres_email_views_keep_metadata_values_and_bodies_on_one_snapshot() {
 }
 
 #[test]
+#[ignore = "requires local PostgreSQL 17 tools"]
+fn real_postgres_https_authentication_reuses_only_closed_qualified_sessions() {
+    exercise_configuration(ConfigurationExercise::HttpAuthentication);
+}
+
+#[test]
 #[ignore = "requires local PostgreSQL binaries"]
 fn real_postgres_email_queries_bind_order_pages_and_totals_to_one_snapshot() {
     exercise_configuration(ConfigurationExercise::Query);
@@ -2589,6 +2595,7 @@ fn real_postgres_account_routes_keep_submission_and_delivery_policies_separate()
 }
 
 enum ConfigurationExercise {
+    HttpAuthentication,
     AccountRoutes,
     FolderReconcile,
     Unmapped,
@@ -3323,6 +3330,7 @@ per_peer_limit = 1
         exercise,
         ConfigurationExercise::Flags
             | ConfigurationExercise::Read
+            | ConfigurationExercise::HttpAuthentication
             | ConfigurationExercise::HttpDrafts
             | ConfigurationExercise::HttpUploads
             | ConfigurationExercise::ReceivingOwner
@@ -3481,6 +3489,28 @@ per_peer_limit = 1
                 }
                 ConfigurationExercise::Read => {
                     exercise_read(&fixture, profile_request, &trust, prepared.binding(), false)
+                }
+                ConfigurationExercise::HttpAuthentication => {
+                    let creation = td_mta::postgres_devices::prepare_creation(
+                        epoch,
+                        account,
+                        "auth fixture",
+                        1,
+                    )
+                    .unwrap();
+                    td_mta::postgres_devices::publish_creation(
+                        &request,
+                        &trust,
+                        deadline(),
+                        &creation,
+                    )
+                    .unwrap();
+                    exercise_http_auth(
+                        &fixture,
+                        prepared.binding(),
+                        creation.password(),
+                        creation.device_id(),
+                    );
                 }
                 ConfigurationExercise::Changes => {
                     exercise_changes(&fixture, &request, &trust, prepared.binding())
@@ -5948,6 +5978,9 @@ fn exercise_changes(
     ));
 }
 
+#[path = "postgres_probe/authentication_reuse.rs"]
+mod authentication_reuse;
+
 fn exercise_http_auth(
     fixture: &Fixture,
     binding: &td_mta::postgres_runtime_profile::Binding,
@@ -6008,20 +6041,40 @@ fn exercise_http_auth(
         assert!(Instant::now() < stop);
         thread::sleep(Duration::from_millis(5));
     }
-    thread::scope(|scope| {
-        let worker = scope.spawn(|| auth.authenticate("reader", password, until()));
-        let stop = deadline();
-        while sql(fixture, "SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE application_name='td-mta-postgres' AND wait_event_type='Lock'") != "1" {
+    {
+        // The production adapter belongs to one fixed authentication thread.
+        let concurrent = td_mta::postgres_http_auth::Authentication::new(
+            &connection,
+            executable,
+            &accounts,
+            &clock,
+        )
+        .unwrap();
+        thread::scope(|scope| {
+            let worker = scope.spawn(|| concurrent.authenticate("reader", password, until()));
+            let stop = deadline();
+            while sql(fixture, "SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE application_name='td-mta-postgres' AND wait_event_type='Lock'") != "1" {
             assert!(!worker.is_finished(), "authentication ended before lock contention");
             assert!(Instant::now() < stop);
             thread::sleep(Duration::from_millis(5));
         }
-        assert_eq!(
-            auth.authenticate("reader", password, until()),
-            Err(Error::Busy)
-        );
-        assert_eq!(worker.join().unwrap(), Err(Error::Invalid));
-    });
+            assert_eq!(
+                concurrent.authenticate("reader", password, until()),
+                Err(Error::Busy)
+            );
+            assert_eq!(
+                sql(
+                    fixture,
+                    &format!(
+                        "SELECT pg_catalog.pg_try_advisory_xact_lock({})",
+                        td_mta::postgres_schema::MIGRATION_KEY,
+                    )
+                ),
+                "f"
+            );
+            assert_eq!(worker.join().unwrap(), Err(Error::Invalid));
+        });
+    }
     for _ in 0..3 {
         let short = Deadline::after(clock.sample().unwrap().monotonic, 500).unwrap();
         assert_eq!(
@@ -6096,6 +6149,11 @@ fn exercise_http_auth(
         auth.authenticate("reader", password, until()),
         Ok(Some(principal))
     );
+    drop(auth);
+    let auth =
+        td_mta::postgres_http_auth::Authentication::new(&connection, executable, &accounts, &clock)
+            .unwrap();
+    authentication_reuse::exercise(fixture, &auth, password, principal, until);
 }
 
 fn exercise_read_dispatch(

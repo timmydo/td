@@ -472,9 +472,31 @@ fn connect_authenticated_bounded(
     input: Input,
     maximum: Duration,
 ) -> Result<Worker, Error> {
+    connect_authenticated_until(
+        request,
+        trust,
+        deadline,
+        deadline,
+        output_limit,
+        input,
+        maximum,
+    )
+}
+
+fn connect_authenticated_until(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    connect_deadline: Instant,
+    output_limit: usize,
+    input: Input,
+    maximum: Duration,
+) -> Result<Worker, Error> {
     let mut timing = crate::performance::Timer::start(crate::performance::Phase::DbConnect);
     let allowance = remaining(deadline)?;
-    let connect_deadline = deadline.min(Instant::now() + MAX_DURATION);
+    let connect_deadline = connect_deadline
+        .min(deadline)
+        .min(Instant::now() + MAX_DURATION);
     if allowance > maximum
         || request.server_name.is_empty()
         || request.server_name.len() > 253
@@ -493,6 +515,9 @@ fn connect_authenticated_bounded(
     let now = clock.sample().map_err(|_| Error::Deadline)?.monotonic;
     let milliseconds = transport_milliseconds(allowance)?;
     let cap = Deadline::after(now, milliseconds).map_err(|_| Error::Invalid)?;
+    let handshake_cap = Deadline::after(now, transport_milliseconds(remaining(connect_deadline)?)?)
+        .map_err(|_| Error::Invalid)?
+        .min(cap);
     let tls_clock = Arc::new(ClockHandle::new(TlsClockSource::new(clock.clone())));
     let policy = Arc::new(
         ClientConfig::new(trust, tls_clock, TlsProtocol::Postgres).map_err(|_| Error::Tls)?,
@@ -529,6 +554,7 @@ fn connect_authenticated_bounded(
         session,
         clock,
         cap,
+        handshake_cap,
         output_limit,
         input,
     };
@@ -795,6 +821,7 @@ struct Connector {
     session: TlsSession,
     clock: Arc<dyn Clock>,
     cap: Deadline,
+    handshake_cap: Deadline,
     output_limit: usize,
     input: Input,
 }
@@ -812,7 +839,7 @@ impl tls::TlsConnect<Io<Network>> for Connector {
                 self.session,
                 self.clock,
                 self.cap,
-                self.cap,
+                self.handshake_cap,
                 Box::new([0; TLS_WIRE_BYTES]),
                 Box::new([0; TLS_WIRE_BYTES]),
             )
@@ -947,6 +974,8 @@ fn progress(result: Result<FlushProgress, crate::ports::Error>) -> Poll<io::Resu
 
 mod audit_budget;
 pub(crate) use audit_budget::AuditBudget;
+mod authentication;
+pub(crate) use authentication::AuthenticationSession;
 mod validation_budget;
 pub(crate) use validation_budget::ValidationBudget;
 mod framing;

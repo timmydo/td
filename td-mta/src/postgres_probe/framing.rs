@@ -50,6 +50,16 @@ impl Input {
         }
     }
 
+    pub(super) fn authentication() -> Self {
+        let single = Self::mutations();
+        Self {
+            window: Some(Windows::new(super::authentication::TURNS)),
+            bytes: single.bytes * super::authentication::TURNS,
+            frames: single.frames * super::authentication::TURNS,
+            ..single
+        }
+    }
+
     pub(super) fn imports(guarded: bool) -> Self {
         // A 64 MiB body plus 256 source mappings and relationship writes.
         Self {
@@ -266,6 +276,38 @@ mod tests {
         }
         bytes.extend(frame(b'Z', b"I"));
         bytes
+    }
+
+    #[test]
+    fn authentication_jobs_share_first_window_and_never_refill_session_totals() {
+        let mut input = Input::authentication();
+        let window = input.window().unwrap();
+        input.accept(&authenticated()).unwrap();
+        for turn in 0..super::super::authentication::TURNS {
+            window.begin().unwrap();
+            for _ in if turn == 0 { 5 } else { 0 }..1088 {
+                input.accept(&frame(b'N', b"\0")).unwrap();
+            }
+            input.admit_output(64 * 1024).unwrap();
+            input.output(64 * 1024).unwrap();
+            window.finish().unwrap();
+            assert_eq!(input.authentication, 4);
+        }
+        assert_eq!(input.frames, 0);
+        assert!(window.begin().is_err());
+        assert!(input.accept(&frame(b'N', b"\0")).is_err());
+
+        let mut input = Input::authentication();
+        let window = input.window().unwrap();
+        input.accept(&authenticated()).unwrap();
+        window.begin().unwrap();
+        window.finish().unwrap();
+        // Closed-turn notices remain charged before a new job is admitted.
+        for _ in 5..1088 {
+            input.accept(&frame(b'N', b"\0")).unwrap();
+        }
+        assert!(input.accept(&frame(b'N', b"\0")).is_err());
+        assert!(window.begin().is_err());
     }
 
     #[test]

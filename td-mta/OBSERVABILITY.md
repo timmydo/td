@@ -436,7 +436,7 @@ It is not exposed over public HTTP and supplies no mutation operation.
 | `db_runtime` | Runtime role, privileges and maintenance qualification |
 | `db_work` | One driver-run operation, possibly containing multiple SQL statements and qualification; success means the driver returned its operation result, not that an inner SQL/application result succeeded |
 | `db_close` | Worker cleanup, including bounded Terminate/close progress; failure includes already-failed or deadline-retired sessions |
-| `db_reuse` | Reserved zero-duration observation for successful retained-session reuse |
+| `db_reuse` | Zero-duration retained-authentication attempts, including failed turns |
 | `body_verify` | Complete body chunk reads and digest verification |
 | `body_replay` | Verified download callback, including chunk replay and socket output |
 | `smtp_admission` | One storage-worker admission attempt, including database readiness; retry is busy |
