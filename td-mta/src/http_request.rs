@@ -139,6 +139,15 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> HeadReader<B> {
         }
         parse(self.storage.as_ref().get(..self.used).ok_or(Error::Limit)?)
     }
+    /// Retire this parser and recover cleared backing for a fresh request owner.
+    pub fn into_storage(mut self) -> B
+    where
+        B: Default,
+    {
+        self.storage.as_mut().fill(0);
+        std::hint::black_box(self.storage.as_mut());
+        std::mem::take(&mut self.storage)
+    }
     /// EOF before the complete head is a terminal failure.
     pub fn eof(&mut self) -> Result<(), Error> {
         if let Some(error) = self.failure {

@@ -546,7 +546,16 @@ IPv4 HTTPS listener on the same port also serves the migration exporter,
 whose localhost lookup in the private test namespace resolves to IPv4. The
 normal native td-mail and receiving-worker fixtures retain IPv4 coverage. Binary
 listener tests additionally bind both wildcard families to one port and
-check that the IPv6 listener does not admit IPv4 connections.
+check that the IPv6 listener does not admit IPv4 connections. Persistent
+HTTP coverage pipelines discovery requests that change account and allowed
+origin, then proves a new wrong password is refused, the 32-request limit
+closes, and idle reuse expires. The native fixture also pipelines a real API
+body (counted or chunked) followed by discovery, a complete JMAP problem
+followed by discovery, and a raw download followed by discovery, checking
+response boundaries and downloaded bytes against PostgreSQL. Four idle
+persistent API connections prove the three body permits are released. Parser backing
+reuse clears the previous Authorization bytes. Ordinary close-request and
+uncertain-publication cases remain covered.
 [CONFIG.md](CONFIG.md#local-recipient-routing) owns alias authority; aliases
 resolve to the local account and do not forward externally. td-mail rules
 currently change flags or mailbox membership and have no sending action.

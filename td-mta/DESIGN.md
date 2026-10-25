@@ -2022,14 +2022,31 @@ most one record and two writes per turn, finishing the framing tail beyond
 the socket chunk immediately when writable. Pending output yields without
 retrying; short writes retain the unsent tail. Original deadlines still
 bracket the turn. Request-head parsing uses at most 16 KiB per turn. The current
-profile permits one request per connection and sends Connection: close with
-all responses. Authenticated upload POSTs use the shared bounded body worker
-specified in ADMISSION.md, with quota admission before 100 Continue and
-commit-time device authorization. Other refusals need not consume the body.
-After responding it applies RESOURCES.md's bounded write-half closure.
-Refusals may drain bounded unread data; successful uploads already consumed
-their body and do not drain. Downloads also close without drain. Slots remain
-active until retired.
+profile permits at most 32 sequential requests per connection within the
+original TLS/session lifetime. Authenticated discovery, complete API replies
+and successful downloads may use HTTP/1.1 persistence unless the request
+asks for Connection: close. Complete JMAP problem responses remain eligible
+only after their HTTP request body has been fully framed. Between requests the idle allowance is at most
+five seconds; new headers and each body/execution phase retain their own
+configured deadlines. Pipelined requests execute in order, never concurrently
+on one connection. Already-read next-request bytes are preserved within the
+16-KiB input bound. API body decoding returns a bounded tail only after full
+framing completion; its temporary copy adds 16 KiB per planned body job.
+
+Before another request, clear credentials, principal, authentication result,
+origin selection and response state, retire the cleared head parser, and
+release body admission. Every request authenticates and selects its account
+and allowed origin afresh; commit-time authority is unchanged. A completed
+backend response must explicitly authorize reuse after its complete framing
+and flush. Backend failures, framing failures, HTTP authentication/routing/admission
+refusals, uploads, EventSource and the request-count limit close the
+connection.
+Authenticated upload POSTs use the shared bounded body worker specified in
+ADMISSION.md, with quota admission before 100 Continue and commit-time device
+authorization. Other refusals need not consume the body. When retiring a
+connection, apply RESOURCES.md's bounded write-half closure. Refusals may
+drain bounded unread data; successful uploads and downloads do not drain.
+Connection slots remain charged until retired.
 Authenticated GET /.well-known/jmap returns Core and Mail Session
 metadata; unknown targets get 404. Submission remains unadvertised.
 Non-POST upload methods get 405 with Allow: POST. Missing, invalid and revoked

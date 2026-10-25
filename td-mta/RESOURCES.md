@@ -34,7 +34,7 @@ changing that validator requires an explicit atomic implementation update.
 | --- | ---: | ---: | ---: |
 | SMTP slots | 8 | 376064 | 3008512 |
 | HTTPS slots | 8 | 1703936 | 13631488 |
-| Body/search jobs | 3 | 1310720 | 3932160 |
+| Body/search jobs | 3 | 1327104 | 3981312 |
 | Storage read views | 6 | 430080 | 2580480 |
 | Resident index cache | 1 | 4194304 | 4194304 |
 | Outbound slots | 1 | 572672 | 572672 |
@@ -52,10 +52,10 @@ changing that validator requires an explicit atomic implementation update.
 | Cold reload overlap | 1 | 2097152 | 2097152 |
 | Process and allocator allowance | 1 | 8388608 | 8388608 |
 | SMTP fanout metadata | 4 | 2097152 | 8388608 |
-| **Total** | | | **120194304** |
+| **Total** | | | **120243456** |
 
-The total is approximately 114.63 MiB against a 128 MiB configured budget;
-the remaining 14023424 bytes are unassigned headroom, not another cache.
+The total is approximately 114.67 MiB against a 128 MiB configured budget;
+the remaining 13974272 bytes are unassigned headroom, not another cache.
 The default process ledger excludes database-server memory and WAL mappings.
 The two default TLS handshakes remain configurable within the process budget.
 The 64 MiB idle and 128 MiB workload RSS figures are provisional goals under
@@ -454,7 +454,7 @@ explicitly under DESIGN section 5 without a speculative ledger proof.
 
 | Reservation | Partition |
 | --- | --- |
-| Body work, 512 KiB/job | Bounded part metadata, one 192 KiB generated fragment, decode rings, normalization/parser state and output staging; header and per-part arrays are separate |
+| Body work, 528 KiB/job | Bounded part metadata, one 192 KiB generated fragment, decode rings, normalization/parser state and output staging; header and per-part arrays are separate; 16 KiB for a completed HTTP body's pipelined tail copy |
 | Read cursor/value, 420 KiB/view | 68 KiB row input/reserve; 64 KiB retained result value; 1 KiB key; 5 KiB selected metadata; 1 KiB pool bookkeeping; 4 KiB pinned-body input/reader state; 149 KiB typed row/change cursors, native wrapper bookkeeping and reference validation scratch; 128 KiB bounded value-prefetch rows, copies and replacement overlap |
 | Outbound scratch, 128 KiB | 64 KiB body transfer; 16 KiB reply assembly; 16 KiB SMTP/TLS handoff state; 32 KiB transaction-planning/ID/diagnostic scratch |
 | DNS/control, 512 KiB | 128 KiB resolver + 384 KiB control as detailed below |
@@ -3310,6 +3310,14 @@ a retired slot can retain its old peer charge until the next scan. The
 listener has a fixed sixteen-connection per-IP cap.
 Transient accept resource failures back off for five seconds. Session slots
 are the completion storage; no unbounded work queue or per-client thread exists.
+An HTTP connection admits at most 32 requests under its original absolute
+lifetime and waits at most five idle seconds between requests. Its fixed
+head backing is cleared and reused. Body permits are released before waiting
+for the next request; all prior request authority is discarded. The existing
+16-KiB plaintext input retains next-request bytes, and each body job reserves
+an additional 16-KiB temporary copy when API framing completes with a tail.
+That copy is cleared on drop. These bounds permit ordered pipelining without
+an unbounded queue or concurrent requests on one connection.
 
 Control publishes credentials on its existing fixed worker while holding the
 registry mutex. The snapshot has a 64 KiB file cap and at most 256 records;
@@ -3758,7 +3766,7 @@ The same method meter survives all messages and transformations. Decoding,
 preview extraction and JSON stages retain their original cumulative charges;
 a small requested preview can still hit the work ceiling while validating a
 large source. The response spool cap independently limits emitted bytes.
-Default planned total is 120194304 bytes under the unchanged 128 MiB budget;
+Default planned total is 120243456 bytes under the unchanged 128 MiB budget;
 capacity-growth fixtures rebalance disposable cache within that budget.
 These are bounded implementation allocations and planner figures, not a new
 whole-service RSS or large-mailbox qualification claim.

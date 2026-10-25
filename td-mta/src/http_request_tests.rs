@@ -355,3 +355,25 @@ fn absolute_targets_and_last_event_id_are_bounded_single_fields() {
         b"GET / HTTP/1.1\r\nHost: mail.example\r\nLast-Event-ID: one\r\nLast-Event-ID: two\r\n\r\n",
     );
 }
+
+#[test]
+fn retiring_head_clears_credentials_before_backing_reuse() {
+    let mut first = HeadReader::new(vec![0; HEAD_BYTES]);
+    assert!(
+        first
+            .feed(b"GET / HTTP/1.1\r\nHost: example.test\r\nAuthorization: Basic secret\r\n\r\n")
+            .unwrap()
+            .complete
+    );
+    let backing = first.into_storage();
+    assert!(backing.iter().all(|byte| *byte == 0));
+    let mut second = HeadReader::new(backing);
+    assert!(
+        second
+            .feed(b"GET /next HTTP/1.1\r\nHost: example.test\r\n\r\n")
+            .unwrap()
+            .complete
+    );
+    assert!(second.head().unwrap().authorization.is_none());
+    assert_eq!(second.head().unwrap().target, "/next");
+}

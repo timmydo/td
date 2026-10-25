@@ -650,7 +650,7 @@ fn download_failures_release_shared_slot_and_shutdown_joins_streaming() {
             _: crate::https_api::Request<'_>,
             _: &mut dyn Transport,
             control: &Control,
-        ) -> Result<(), Failure> {
+        ) -> Result<crate::https_api::Completion, Failure> {
             self.entered.store(true, Ordering::Release);
             wait(|| control.stop_requested() || self.release.load(Ordering::Acquire));
             Err(Failure::Started(Error::Deadline))
@@ -660,7 +660,7 @@ fn download_failures_release_shared_slot_and_shutdown_joins_streaming() {
             _: Request<'_>,
             transport: &mut dyn Transport,
             control: &Control,
-        ) -> Result<(), Failure> {
+        ) -> Result<crate::https_api::Completion, Failure> {
             match self.mode.load(Ordering::Acquire) {
                 0 => Err(Failure::Before(Error::Corrupt)),
                 1 => {
@@ -922,7 +922,10 @@ fn upload_reply(client: &mut impl Transport) -> (u16, String) {
     (status, body)
 }
 fn full_reply(client: &mut impl Transport) -> (u16, String, String) {
-    let mut bytes = Vec::new();
+    framed_reply(client, &mut Vec::new())
+}
+fn framed_reply(client: &mut impl Transport, bytes: &mut Vec<u8>) -> (u16, String, String) {
+    let mut response_length = 0;
     let mut scratch = [0; 1024];
     wait(|| {
         match client.read(&mut scratch).unwrap() {
@@ -940,9 +943,10 @@ fn full_reply(client: &mut impl Transport) -> (u16, String, String) {
             .unwrap()
             .parse()
             .unwrap();
-        bytes.len() == end + 4 + length
+        response_length = end + 4 + length;
+        bytes.len() >= response_length
     });
-    let response = String::from_utf8(bytes).unwrap();
+    let response = String::from_utf8(bytes.drain(..response_length).collect()).unwrap();
     let (head, body) = response.split_once("\r\n\r\n").unwrap();
     (
         head.split_whitespace().nth(1).unwrap().parse().unwrap(),
@@ -985,7 +989,7 @@ fn account_and_allowed_origin_select_private_session_and_backend() {
             request: crate::https_api::Request<'_>,
             transport: &mut dyn Transport,
             _: &Control,
-        ) -> Result<(), crate::https_download::Failure> {
+        ) -> Result<crate::https_api::Completion, crate::https_download::Failure> {
             assert_eq!(
                 request.credentials.username(),
                 if self.0.account == AccountId::from_bytes([0xaa; 16]) {
@@ -1005,7 +1009,7 @@ fn account_and_allowed_origin_select_private_session_and_backend() {
                 .as_bytes(),
             );
             self.0.api_calls.fetch_add(1, Ordering::Release);
-            Ok(())
+            Ok(crate::https_api::Completion::closed())
         }
     }
     impl crate::https_upload::Backend for Backend {
@@ -1111,6 +1115,47 @@ fn account_and_allowed_origin_select_private_session_and_backend() {
             let worker = scope.spawn(|| server.run(&control));
             let stop = Stop(&control);
             wait(|| ready.load(Ordering::Acquire));
+            // Two pipelined discovery requests must select authority afresh,
+            // even when account and allowed origin change on the same TLS connection.
+            let discovery = |username: &str, password: &str, host: &str| {
+                let authorization = base64(format!("{username}:{password}").as_bytes());
+                format!("GET /.well-known/jmap HTTP/1.1\r\nHost: {host}:{}\r\nAuthorization: Basic {authorization}\r\n\r\n", address.port())
+            };
+            let mut peer = client(address, &lease, clock.clone());
+            let pipeline = discovery("first", "first-password", "localhost")
+                + &discovery("second", "second-password", "alias.test");
+            send(&mut peer, pipeline.as_bytes());
+            let mut buffered = Vec::new();
+            for expected in [&first.session, &second_alias.session] {
+                let (status, head, body) = framed_reply(&mut peer, &mut buffered);
+                assert_eq!(status, 200);
+                assert!(head.contains("Connection: keep-alive"));
+                assert_eq!(body.as_bytes(), expected.bytes());
+            }
+            send(&mut peer, discovery("first", "wrong-password", "localhost").as_bytes());
+            let (status, head, _) = framed_reply(&mut peer, &mut buffered);
+            assert_eq!(status, 401);
+            assert!(head.contains("Connection: close"));
+            drop(peer);
+            // Successful authentication refunds per-peer admission; the request
+            // count still retires this connection after its thirty-second response.
+            let mut peer = client(address, &lease, clock.clone());
+            for index in 1..=32 {
+                clock.1.fetch_add(1_000, Ordering::Relaxed);
+                send(&mut peer, discovery("first", "first-password", "localhost").as_bytes());
+                let (status, head, _) = full_reply(&mut peer);
+                assert_eq!(status, 200);
+                assert!(head.contains(if index == 32 { "Connection: close" } else { "Connection: keep-alive" }));
+            }
+            wait(|| matches!(peer.read(&mut [0]), Ok(IoProgress::Closed) | Err(_)));
+            drop(peer);
+            let mut peer = client(address, &lease, clock.clone());
+            send(&mut peer, discovery("first", "first-password", "localhost").as_bytes());
+            assert_eq!(full_reply(&mut peer).0, 200);
+            std::thread::sleep(Duration::from_millis(50));
+            clock.1.fetch_add(5_001, Ordering::Relaxed);
+            wait(|| matches!(peer.read(&mut [0]), Ok(IoProgress::Closed) | Err(_)));
+            drop(peer);
             for (username, password, host, client_lease, expected) in [
                 ("first", "first-password", "localhost", &lease, &first),
                 ("first", "first-password", "alias.test", &alias_lease, &first_alias),
@@ -1199,7 +1244,7 @@ fn exercise_body_pool(transfers: u64) {
             &self,
             transport: &mut dyn Transport,
             control: &Control,
-        ) -> Result<(), Failure> {
+        ) -> Result<crate::https_api::Completion, Failure> {
             if self.fail_next.swap(false, Ordering::AcqRel) {
                 return Err(Failure::Before(Error::Corrupt));
             }
@@ -1222,7 +1267,7 @@ fn exercise_body_pool(transfers: u64) {
                     transport.flush().unwrap() == FlushProgress::Complete
                 }
             });
-            Ok(())
+            Ok(crate::https_api::Completion::closed())
         }
     }
     impl crate::https_upload::Backend for Parallel {
@@ -1242,7 +1287,7 @@ fn exercise_body_pool(transfers: u64) {
             _: crate::https_download::Request<'_>,
             transport: &mut dyn Transport,
             control: &Control,
-        ) -> Result<(), Failure> {
+        ) -> Result<crate::https_api::Completion, Failure> {
             self.exchange(transport, control)
         }
         fn api(
@@ -1250,7 +1295,7 @@ fn exercise_body_pool(transfers: u64) {
             _: crate::https_api::Request<'_>,
             transport: &mut dyn Transport,
             control: &Control,
-        ) -> Result<(), Failure> {
+        ) -> Result<crate::https_api::Completion, Failure> {
             self.exchange(transport, control)
         }
     }

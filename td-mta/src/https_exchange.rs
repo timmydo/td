@@ -6,6 +6,27 @@ use crate::{
 };
 use std::time::Duration;
 
+/// A flushed response with explicit permission to reuse its framed connection.
+pub struct Completion {
+    pub(crate) keep_alive: bool,
+    pub(crate) tail: Vec<u8>,
+}
+impl Completion {
+    pub const fn closed() -> Self {
+        Self {
+            keep_alive: false,
+            tail: Vec::new(),
+        }
+    }
+}
+
+impl Drop for Completion {
+    fn drop(&mut self) {
+        self.tail.fill(0);
+        std::hint::black_box(&mut self.tail);
+    }
+}
+
 pub(crate) struct Sender<'a> {
     pub(crate) transport: &'a mut dyn Transport,
     pub(crate) control: &'a Control,
@@ -15,6 +36,7 @@ pub(crate) struct Sender<'a> {
     pub(crate) idle: Deadline,
     pub(crate) last: Tick,
     pub(crate) started: bool,
+    pub(crate) completion: Completion,
     pub(crate) maintenance: Option<&'a dyn Fn()>,
 }
 impl<'a> Sender<'a> {
@@ -37,6 +59,7 @@ impl<'a> Sender<'a> {
             last,
             started: false,
             maintenance: None,
+            completion: Completion::closed(),
         })
     }
     pub(crate) fn check(&mut self) -> Result<(), Error> {

@@ -6761,6 +6761,7 @@ fn exercise_http_read(
             before_write: &inspect,
         };
         let request = td_mta::https_api::Request {
+            keep_alive: false,
             device,
             credentials: &credentials,
             framing: if chunked {
@@ -7061,6 +7062,7 @@ fn exercise_http_read(
         };
         let result = service.download(
             td_mta::https_download::Request {
+                keep_alive: false,
                 target: &target,
                 device,
                 credentials: &credentials,

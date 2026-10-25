@@ -59,7 +59,7 @@ impl https_api::Worker for ApiWorker<'_, '_, '_, '_> {
         request: Request<'_>,
         transport: &mut dyn Transport,
         control: &Control,
-    ) -> Result<(), Failure> {
+    ) -> Result<https_api::Completion, Failure> {
         self.service
             .serve_api(request, transport, control, Some(&self.cached))
     }
@@ -109,7 +109,7 @@ impl https_upload::Backend for Service<'_, '_, '_> {
         request: crate::https_download::Request<'_>,
         transport: &mut dyn Transport,
         control: &Control,
-    ) -> Result<(), Failure> {
+    ) -> Result<https_api::Completion, Failure> {
         self.send_download(request, transport, control)
     }
     fn api(
@@ -117,7 +117,7 @@ impl https_upload::Backend for Service<'_, '_, '_> {
         request: Request<'_>,
         transport: &mut dyn Transport,
         control: &Control,
-    ) -> Result<(), Failure> {
+    ) -> Result<https_api::Completion, Failure> {
         self.serve_api(request, transport, control, None)
     }
 }
@@ -233,7 +233,7 @@ impl<'s, 'sr, 'a> Service<'s, 'sr, 'a> {
         transport: &mut dyn Transport,
         control: &Control,
         cache: Option<&RefCell<Option<CachedRead<'s>>>>,
-    ) -> Result<(), Failure> {
+    ) -> Result<https_api::Completion, Failure> {
         let maintenance = || {
             if let Some(cache) = cache {
                 retire_cached(cache);
@@ -264,14 +264,15 @@ impl<'s, 'sr, 'a> Service<'s, 'sr, 'a> {
             } else {
                 Failure::Before(error)
             }
-        })
+        })?;
+        Ok(sender.completion)
     }
     fn send_download(
         &self,
         request: crate::https_download::Request<'_>,
         transport: &mut dyn Transport,
         control: &Control,
-    ) -> Result<(), Failure> {
+    ) -> Result<https_api::Completion, Failure> {
         let mut sender = Sender::new(
             transport,
             control,
@@ -280,6 +281,7 @@ impl<'s, 'sr, 'a> Service<'s, 'sr, 'a> {
             request.deadline,
         )
         .map_err(Failure::Before)?;
+        sender.completion.keep_alive = request.keep_alive;
         let result = self.download_body(&request, &mut sender);
         result.map_err(|error| {
             if sender.started {
@@ -287,7 +289,8 @@ impl<'s, 'sr, 'a> Service<'s, 'sr, 'a> {
             } else {
                 Failure::Before(error)
             }
-        })
+        })?;
+        Ok(sender.completion)
     }
     fn download_body(
         &self,

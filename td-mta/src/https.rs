@@ -71,12 +71,15 @@ enum Phase {
     Api,
     Events,
     Response,
+    Complete,
     Close,
     Drain,
 }
 struct Client {
     timing: Option<crate::performance::Timer>,
     response_outcome: crate::performance::Outcome,
+    keep_alive: bool,
+    requests: usize,
     origin: usize,
     peer: IpAddr,
     phase: Phase,
@@ -111,6 +114,10 @@ struct ApiWorker<'a> {
     account: crate::ids::AccountId,
     origin: usize,
     worker: Option<Box<dyn crate::https_api::Worker + 'a>>,
+}
+fn clear_head(client: &mut Client) {
+    let previous = std::mem::replace(&mut client.head, HeadReader::new(Box::<[u8]>::default()));
+    client.head = HeadReader::new(previous.into_storage());
 }
 impl Drop for Client {
     fn drop(&mut self) {
@@ -941,6 +948,8 @@ impl Https<'_> {
                 let client = Client {
                     timing: None,
                     response_outcome: crate::performance::Outcome::Failed,
+                    keep_alive: false,
+                    requests: 0,
                     origin: 0,
                     peer: address.ip(),
                     phase: Phase::Tls,
@@ -992,11 +1001,15 @@ impl Https<'_> {
         }
         match client.phase {
             Phase::Head => {
-                let progress = client
-                    .connection
-                    .as_mut()
-                    .ok_or(Error::Invalid)?
-                    .read(&mut client.input)?;
+                let progress = if client.input_used != 0 {
+                    IoProgress::Bytes(client.input_used)
+                } else {
+                    client
+                        .connection
+                        .as_mut()
+                        .ok_or(Error::Invalid)?
+                        .read(&mut client.input)?
+                };
                 match progress {
                     IoProgress::Pending => (),
                     IoProgress::Closed => return Ok(false),
@@ -1023,7 +1036,11 @@ impl Https<'_> {
                                 .min(client.phase_deadline);
                         match result {
                             Ok(progress) if progress.complete => {
-                                let target = client.head.head().map_err(|_| Error::Invalid)?.target;
+                                client.requests =
+                                    client.requests.checked_add(1).ok_or(Error::Capacity)?;
+                                let head = client.head.head().map_err(|_| Error::Invalid)?;
+                                client.keep_alive = !head.close && client.requests < 32;
+                                let target = head.target;
                                 client.timing =
                                     Some(crate::performance::Timer::start(request_phase(target)));
                                 client.phase = Phase::Authorize;
@@ -1077,6 +1094,7 @@ impl Https<'_> {
                                         body_busy()
                                     } else {
                                         client.principal = Some(principal);
+                                        client.keep_alive = false;
                                         client.phase = Phase::Upload;
                                         return Ok(true);
                                     }
@@ -1179,6 +1197,7 @@ impl Https<'_> {
                                             time.monotonic,
                                         )?;
                                         client.principal = Some(principal);
+                                        client.keep_alive = false;
                                         self.begin_events(
                                             client,
                                             stream,
@@ -1238,11 +1257,41 @@ impl Https<'_> {
                     if let Some(timing) = client.timing.take() {
                         timing.finish(client.response_outcome);
                     }
-                    client.phase = Phase::Close;
+                    client.phase = if client.keep_alive {
+                        Phase::Complete
+                    } else {
+                        Phase::Close
+                    };
                     let now = self.clock.sample()?.monotonic;
                     client.phase_deadline = deadline(now, DRAIN_SECONDS)?.min(client.absolute);
                     client.idle = client.phase_deadline;
                 }
+            }
+            Phase::Complete => {
+                if !client.keep_alive || client.stop_after_response {
+                    return Err(Error::Invalid);
+                }
+                clear_head(client);
+                client.credentials = None;
+                client.principal = None;
+                client.authentication = None;
+                client.attempt = None;
+                client.body_slot.take();
+                client.origin = 0;
+                client.keep_alive = false;
+                client.response.clear();
+                client.sent = 0;
+                client.drain_left = DRAIN_BYTES;
+                client.response_outcome = crate::performance::Outcome::Failed;
+                client.phase = Phase::Head;
+                client.phase_deadline =
+                    deadline(time.monotonic, self.timeouts.limits().header_seconds)?
+                        .min(client.absolute);
+                client.idle = deadline(
+                    time.monotonic,
+                    self.timeouts.limits().header_idle_seconds.min(5),
+                )?
+                .min(client.phase_deadline);
             }
             Phase::Close => {
                 if client.connection.as_mut().ok_or(Error::Invalid)?.close()?
@@ -1290,13 +1339,11 @@ impl Https<'_> {
                 .map_err(|_| Error::Invalid)?,
         )?
         .min(client.absolute);
-        client.absolute = operation;
-        client.head = HeadReader::new(Vec::new().into_boxed_slice());
-        client.input.fill(0);
-        client.input_used = 0;
+        clear_head(client);
         client.drain_left = 0;
         let result = backend.download(
             Request {
+                keep_alive: client.keep_alive,
                 target: &target,
                 device: principal.device,
                 credentials: client.credentials.as_ref().ok_or(Error::Invalid)?,
@@ -1307,11 +1354,16 @@ impl Https<'_> {
         );
         client.credentials = None;
         match result {
-            Ok(()) => {
+            Ok(completion) => {
+                client.keep_alive &= completion.keep_alive;
                 if let Some(timing) = client.timing.take() {
                     timing.finish(crate::performance::Outcome::Success);
                 }
-                client.phase = Phase::Close;
+                client.phase = if client.keep_alive {
+                    Phase::Complete
+                } else {
+                    Phase::Close
+                };
                 client.phase_deadline =
                     deadline(self.clock.sample()?.monotonic, DRAIN_SECONDS)?.min(operation);
                 client.idle = client.phase_deadline;
@@ -1345,7 +1397,7 @@ impl Https<'_> {
         let head = client.head.head().map_err(|_| Error::Invalid)?;
         let framing = head.framing;
         let expect_continue = head.expect_continue;
-        client.head = HeadReader::new(Vec::new().into_boxed_slice());
+        clear_head(client);
         if worker
             .as_ref()
             .is_none_or(|slot| slot.account != principal.account || slot.origin != client.origin)
@@ -1358,6 +1410,7 @@ impl Https<'_> {
             });
         }
         let request = crate::https_api::Request {
+            keep_alive: client.keep_alive,
             device: principal.device,
             credentials: client.credentials.as_ref().ok_or(Error::Invalid)?,
             framing,
@@ -1378,11 +1431,25 @@ impl Https<'_> {
         client.input_used = 0;
         client.drain_left = 0;
         match result {
-            Ok(()) => {
+            Ok(completion) => {
+                client.keep_alive &= completion.keep_alive;
+                if client.keep_alive {
+                    let count = completion.tail.len();
+                    client
+                        .input
+                        .get_mut(..count)
+                        .ok_or(Error::Capacity)?
+                        .copy_from_slice(&completion.tail);
+                    client.input_used = count;
+                }
                 if let Some(timing) = client.timing.take() {
                     timing.finish(crate::performance::Outcome::Success);
                 }
-                client.phase = Phase::Close;
+                client.phase = if client.keep_alive {
+                    Phase::Complete
+                } else {
+                    Phase::Close
+                };
                 client.phase_deadline =
                     deadline(self.clock.sample()?.monotonic, DRAIN_SECONDS)?.min(client.absolute);
                 client.idle = client.phase_deadline;
@@ -1442,7 +1509,7 @@ impl Https<'_> {
             return self.respond(client, 431, self.clock.sample()?.utc_ms);
         };
         media_out.copy_from_slice(media.as_bytes());
-        client.head = HeadReader::new(Vec::new().into_boxed_slice());
+        clear_head(client);
         let media = std::str::from_utf8(media_bytes.get(..media_len).ok_or(Error::Invalid)?)
             .map_err(|_| Error::Invalid)?;
         let result = backend.receive(
@@ -1512,7 +1579,7 @@ impl Https<'_> {
         client.input_used = 0;
         client.drain_left = 0;
         client.credentials = None;
-        client.head = HeadReader::new(Vec::new().into_boxed_slice());
+        clear_head(client);
         client.response.clear();
         client
             .response
@@ -1619,6 +1686,11 @@ impl Https<'_> {
             503 => crate::performance::Outcome::Unavailable,
             _ => crate::performance::Outcome::Failed,
         };
+        client.keep_alive &= status == 200
+            && client
+                .head
+                .head()
+                .is_ok_and(|head| head.target == "/.well-known/jmap");
         let get = client.head.head().is_ok_and(|head| {
             head.target.starts_with("/jmap/download/")
                 || head.target.starts_with("/jmap/events?")
@@ -1633,11 +1705,13 @@ impl Https<'_> {
             }
         }
         client.drain_left = client.drain_left.saturating_sub(client.input_used);
-        client.input.fill(0);
-        client.input_used = 0;
+        if !client.keep_alive {
+            client.input.fill(0);
+            client.input_used = 0;
+        }
         // Retire credentials before allocating or waiting on Session output.
         client.credentials = None;
-        client.head = HeadReader::new(Vec::new().into_boxed_slice());
+        clear_head(client);
         client
             .response
             .try_reserve(512usize.checked_add(body.len()).ok_or(Error::Capacity)?)
@@ -1657,7 +1731,7 @@ impl Https<'_> {
             415 => "Unsupported Media Type",
             _ => "Service Unavailable",
         };
-        write!(&mut client.response, "HTTP/1.1 {status} {reason}\r\nDate: {}\r\nConnection: close\r\nContent-Length: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n", http_date(utc_ms)?, body.len())?;
+        write!(&mut client.response, "HTTP/1.1 {status} {reason}\r\nDate: {}\r\nConnection: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n", http_date(utc_ms)?, if client.keep_alive { "keep-alive" } else { "close" }, body.len())?;
         if status == 401 {
             client.response.extend_from_slice(
                 b"WWW-Authenticate: Basic realm=\"td-mta\", charset=\"UTF-8\"\r\n",

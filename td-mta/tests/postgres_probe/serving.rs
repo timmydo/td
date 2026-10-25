@@ -180,6 +180,77 @@ pub(super) fn exercise(
         .unwrap()
         .0
         .as_str();
+    let api_body = format!(
+        r#"{{"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail"],"methodCalls":[["Mailbox/get",{{"accountId":"{source_account}"}},"persistent"]]}}"#
+    );
+    // Preserve next requests for counted/chunked bodies and complete JMAP errors.
+    for (body, chunked, status) in [
+        (api_body.as_str(), false, 200),
+        (api_body.as_str(), true, 200),
+        ("not JSON", true, 400),
+    ] {
+        let (mut tls, _) = super::smtp_transport::upgrade_protocol(
+            TcpStream::connect(https_address).unwrap(),
+            Arc::new(td_mta::clock::RuntimeClock::new()),
+            &fixture.ca,
+            td_crypto::TlsProtocol::Http1,
+        );
+        let (framing, wire) = if chunked {
+            (
+                "Transfer-Encoding: chunked".to_owned(),
+                format!("{:x}\r\n{body}\r\n0\r\n\r\n", body.len()),
+            )
+        } else {
+            (format!("Content-Length: {}", body.len()), body.to_owned())
+        };
+        write!(tls, "POST /jmap/api HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: Basic {encoded}\r\nContent-Type: application/json\r\n{framing}\r\n\r\n{wire}GET /.well-known/jmap HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: Basic {encoded}\r\nConnection: close\r\n\r\n", https_address.port(), https_address.port()).unwrap();
+        tls.flush().unwrap();
+        let (head, body) = persistent_reply(&mut tls);
+        assert!(
+            head.starts_with(&format!("HTTP/1.1 {status} "))
+                && head.contains("Connection: keep-alive")
+        );
+        let response = td_json::parse_slice(&body).unwrap();
+        if status == 200 {
+            assert_eq!(
+                response["methodResponses"][0][0].as_str(),
+                Some("Mailbox/get")
+            );
+            assert_eq!(
+                response["methodResponses"][0][1]["accountId"].as_str(),
+                Some(source_account)
+            );
+        } else {
+            assert_eq!(
+                response["type"].as_str(),
+                Some("urn:ietf:params:jmap:error:notJSON")
+            );
+        }
+        let (head, body) = persistent_reply(&mut tls);
+        assert!(head.starts_with("HTTP/1.1 200 ") && head.contains("Connection: close"));
+        assert_eq!(td_json::parse_slice(&body).unwrap(), session);
+        assert_eq!(tls.read(&mut [0]).unwrap(), 0);
+    }
+    // Idle persistent connections must release the three shared API/body permits.
+    let mut retained = Vec::new();
+    for _ in 0..4 {
+        let (mut tls, _) = super::smtp_transport::upgrade_protocol(
+            TcpStream::connect(https_address).unwrap(),
+            Arc::new(td_mta::clock::RuntimeClock::new()),
+            &fixture.ca,
+            td_crypto::TlsProtocol::Http1,
+        );
+        write!(tls, "POST /jmap/api HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: Basic {encoded}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{api_body}", https_address.port(), api_body.len()).unwrap();
+        tls.flush().unwrap();
+        let (head, _) = persistent_reply(&mut tls);
+        assert!(head.starts_with("HTTP/1.1 200 ") && head.contains("Connection: keep-alive"));
+        retained.push(tls);
+    }
+    let first = retained.first_mut().unwrap();
+    write!(first, "GET /.well-known/jmap HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: Basic {encoded}\r\nConnection: close\r\n\r\n", https_address.port()).unwrap();
+    first.flush().unwrap();
+    assert!(persistent_reply(first).0.starts_with("HTTP/1.1 200 "));
+    drop(retained);
     let (exported, body_digests) = super::migration_archive::export_from_td_mta(
         &format!(
             "https://localhost:{}/.well-known/jmap",
@@ -193,6 +264,35 @@ pub(super) fn exercise(
     assert_eq!(exported["mailboxes"].as_array().unwrap().len(), 1);
     assert_eq!(body_digests,vec![sql(fixture,"SELECT encode(sha256(string_agg(bytes,''::bytea ORDER BY ordinal)),'hex') FROM td_mta.blob_chunks GROUP BY account,blob_id")]);
 
+    // A raw download also releases transfer capacity while keeping TLS reusable.
+    {
+        let blob = td_mta::ids::BlobId::parse(&sql(
+            fixture,
+            "SELECT encode(blob_id,'hex') FROM td_mta.emails LIMIT 1",
+        ))
+        .unwrap();
+        let mut blob_bytes = [0; td_mta::wire::IdKind::WIRE_BYTES];
+        let blob = td_mta::wire::encode_id(blob, &mut blob_bytes).unwrap();
+        let (mut tls, _) = super::smtp_transport::upgrade_protocol(
+            TcpStream::connect(https_address).unwrap(),
+            Arc::new(td_mta::clock::RuntimeClock::new()),
+            &fixture.ca,
+            td_crypto::TlsProtocol::Http1,
+        );
+        write!(tls, "GET /jmap/download/{source_account}/{blob}/mail.eml?type=message%2Frfc822 HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: Basic {encoded}\r\n\r\nGET /.well-known/jmap HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: Basic {encoded}\r\nConnection: close\r\n\r\n", https_address.port(), https_address.port()).unwrap();
+        tls.flush().unwrap();
+        let (head, body) = persistent_reply(&mut tls);
+        assert!(head.starts_with("HTTP/1.1 200 ") && head.contains("Connection: keep-alive"));
+        let hex = body
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(hex, sql(fixture, "SELECT encode(string_agg(bytes,''::bytea ORDER BY ordinal),'hex') FROM td_mta.blob_chunks GROUP BY account,blob_id"));
+        let (head, body) = persistent_reply(&mut tls);
+        assert!(head.starts_with("HTTP/1.1 200 ") && head.contains("Connection: close"));
+        assert_eq!(td_json::parse_slice(&body).unwrap(), session);
+        assert_eq!(tls.read(&mut [0]).unwrap(), 0);
+    }
     let post = |body: &str| {
         let (mut tls, _) = super::smtp_transport::upgrade_protocol(
             TcpStream::connect(https_address).unwrap(),
@@ -735,4 +835,25 @@ pub(super) fn exercise(
     let page = td_json::parse(std::str::from_utf8(&output.stdout).unwrap()).unwrap();
     assert_eq!(page["records"].as_array().unwrap().len(), 1);
     assert_eq!(page["retention_days"].as_u64(), Some(30));
+}
+
+fn persistent_reply(stream: &mut impl Read) -> (String, Vec<u8>) {
+    let mut head = Vec::new();
+    while !head.ends_with(b"\r\n\r\n") {
+        assert!(head.len() < 16 * 1024);
+        let mut byte = [0];
+        stream.read_exact(&mut byte).unwrap();
+        head.push(byte[0]);
+    }
+    let head = String::from_utf8(head).unwrap();
+    let length: usize = head
+        .lines()
+        .find_map(|line| line.strip_prefix("Content-Length: "))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(length <= 1024 * 1024);
+    let mut body = vec![0; length];
+    stream.read_exact(&mut body).unwrap();
+    (head, body)
 }

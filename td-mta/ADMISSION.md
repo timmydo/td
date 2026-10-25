@@ -58,7 +58,7 @@ milliseconds, not a five-millisecond network timeout.
 | HTTP headers | 15 seconds idle, 30 seconds total |
 | HTTP request/upload body | 15 seconds idle; total derived from admitted bytes below |
 | HTTP response/download | 15 seconds idle; total derived from retained/download bytes below |
-| HTTP keepalive | 15 seconds idle, at most 100 requests per connection |
+| HTTP keepalive | 5 seconds idle, at most 32 requests per connection |
 | Event stream | One hour maximum; no input-idle timer while subscribed; 15-second output-stall timer only while an event/ping is pending |
 | Inbound SMTP | 300 seconds command/DATA idle; DATA 1800 seconds total; at most 100 transactions per connection |
 | Smart-host SMTP | 300 seconds greeting/ordinary-command reply, 120 seconds DATA initiation, 180 seconds per 16 KiB DATA write block, 600 seconds final-DATA reply |
@@ -69,7 +69,8 @@ milliseconds, not a five-millisecond network timeout.
 
 Timers may be raised to at most 16 times their default; lowering them is not a
 v1 option. The 60-second online control lease, five-second HTTP-01 lifetime,
-one-hour event lifetime and connection request/transaction counts are fixed.
+five-second HTTP keepalive wait, one-hour event lifetime and connection
+request/transaction counts are fixed.
 The timer plan stores each configurable phase separately. The 120-second
 HTTP transfer minimum and 30-second base term can each be raised up to 16
 times their defaults; the configured minimum rate is 4096..65536 bytes/second.

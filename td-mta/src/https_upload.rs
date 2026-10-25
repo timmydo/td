@@ -118,7 +118,7 @@ pub trait Backend: Sync {
         _request: crate::https_api::Request<'_>,
         _transport: &mut dyn Transport,
         _control: &Control,
-    ) -> Result<(), crate::https_download::Failure> {
+    ) -> Result<crate::https_api::Completion, crate::https_download::Failure> {
         Err(crate::https_download::Failure::Before(Error::NotFound))
     }
 
@@ -127,7 +127,7 @@ pub trait Backend: Sync {
         _request: crate::https_download::Request<'_>,
         _transport: &mut dyn Transport,
         _control: &Control,
-    ) -> Result<(), crate::https_download::Failure> {
+    ) -> Result<crate::https_api::Completion, crate::https_download::Failure> {
         Err(crate::https_download::Failure::Before(Error::NotFound))
     }
 }

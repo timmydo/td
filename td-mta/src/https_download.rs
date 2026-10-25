@@ -73,6 +73,8 @@ impl Target {
     }
 }
 pub struct Request<'a> {
+    /// Reuse is permitted only after the exact response body has been flushed.
+    pub keep_alive: bool,
     pub target: &'a Target,
     pub device: DeviceId,
     pub credentials: &'a crate::http_auth::BasicCredentials,
@@ -123,12 +125,17 @@ pub(crate) fn send_verified(
     header
         .format(format_args!(
             concat!(
-                "HTTP/1.1 200 OK\r\nDate: {}\r\nConnection: close\r\n",
+                "HTTP/1.1 200 OK\r\nDate: {}\r\nConnection: {}\r\n",
                 "Content-Length: {}\r\nContent-Type: {}\r\n",
                 "Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n",
                 "Content-Disposition: attachment; filename*=UTF-8''"
             ),
             crate::https::http_date(clock.sample()?.utc_ms)?,
+            if sender.completion.keep_alive {
+                "keep-alive"
+            } else {
+                "close"
+            },
             length,
             media
         ))

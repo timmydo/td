@@ -816,6 +816,7 @@ fn exercise_rule_projection(
     backend
         .api(
             td_mta::https_api::Request {
+                keep_alive: false,
                 device,
                 credentials: &credentials,
                 framing: td_mta::http_request::Framing::Length(body.len() as u64),

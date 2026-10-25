@@ -306,7 +306,7 @@ impl Limits {
                 count: self.body_jobs,
                 bytes_each: sum(
                     "body job",
-                    &[self.header_bytes, mime_descriptors, 512 * KIB],
+                    &[self.header_bytes, mime_descriptors, 528 * KIB],
                 )?,
             },
             Reservation {
@@ -427,7 +427,7 @@ mod tests {
     #[test]
     fn default_ledger_pins_documented_budget() -> Result<(), ResourceError> {
         let plan = Limits::default().plan()?;
-        assert_eq!(plan.total_bytes(), 120_194_304);
+        assert_eq!(plan.total_bytes(), 120_243_456);
         const { assert!(crate::format::MAX_VALUE_BYTES + crate::format::MAX_KEY_BYTES + 48 <= 68 * KIB) };
         assert_eq!(
             READ_VIEW_SCRATCH_BYTES,

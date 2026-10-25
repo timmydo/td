@@ -14,7 +14,11 @@ use crate::{
 use std::{thread, time::Duration};
 use td_json::arena;
 
+pub use crate::https_exchange::Completion;
+
 pub struct Request<'a> {
+    /// The backend may honor this only after complete body framing and flush.
+    pub keep_alive: bool,
     pub device: DeviceId,
     pub credentials: &'a crate::http_auth::BasicCredentials,
     pub framing: Framing,
@@ -34,7 +38,7 @@ pub trait Worker {
         request: Request<'_>,
         transport: &mut dyn crate::ports::Transport,
         control: &crate::smtp_receiving::Control,
-    ) -> Result<(), crate::https_download::Failure>;
+    ) -> Result<Completion, crate::https_download::Failure>;
 }
 
 #[derive(Debug)]
@@ -172,6 +176,16 @@ impl<'a> Exchange<'a> {
                 .copy_from_slice(output.get(..next.written).ok_or(Error::Invalid)?);
             length = end;
             if next.complete {
+                if request.keep_alive {
+                    let tail = input.get(next.consumed..used).ok_or(Error::Invalid)?;
+                    sender
+                        .completion
+                        .tail
+                        .try_reserve_exact(tail.len())
+                        .map_err(|_| Error::Capacity)?;
+                    sender.completion.tail.extend_from_slice(tail);
+                    sender.completion.keep_alive = true;
+                }
                 break;
             }
             if next.consumed != used {
@@ -306,12 +320,13 @@ fn headers(sender: &mut Sender<'_>, status: u16, media: &str, length: u64) -> Re
     };
     out.format(format_args!(
         concat!(
-            "HTTP/1.1 {} {}\r\nDate: {}\r\nConnection: close\r\n",
+            "HTTP/1.1 {} {}\r\nDate: {}\r\nConnection: {}\r\n",
             "Content-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n\r\n"
         ),
         status,
         reason,
         crate::https::http_date(sender.clock.sample()?.utc_ms)?,
+        if sender.completion.keep_alive { "keep-alive" } else { "close" },
         media,
         length,
     ))
