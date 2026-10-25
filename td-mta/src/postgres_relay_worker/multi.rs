@@ -144,15 +144,18 @@ impl Registry {
         self.wake.notify_all();
         Ok(())
     }
-    fn renew(&self, worker: &Worker<'_, '_>) -> Result<i64, Error> {
+    fn renew(
+        &self,
+        worker: &Worker<'_, '_>,
+        renewer: Option<&mut owners::Renewer>,
+    ) -> Result<i64, Error> {
         let snapshot = self.snapshot()?;
         let leases = leases(&snapshot)?;
-        let observed = database(owners::renew_many(
-            worker.request,
-            worker.trust,
-            Instant::now() + Duration::from_secs(10),
-            &leases,
-        ))?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let observed = database(match renewer {
+            Some(renewer) => renewer.renew(worker.request, worker.trust, deadline, &leases),
+            None => owners::renew_many(worker.request, worker.trust, deadline, &leases),
+        })?;
         let mut slots = self.slots.lock().map_err(|_| Error::Worker)?;
         for (index, claim, grant) in snapshot {
             let slot = slots.get_mut(index).ok_or(Error::Worker)?;
@@ -167,6 +170,7 @@ impl Registry {
         Ok(observed)
     }
     fn renewal_worker(&self, worker: &Worker<'_, '_>, control: &Control) -> Result<(), Error> {
+        let mut renewer = owners::Renewer::default();
         while !self.done.load(Ordering::Acquire) && !control.stop_requested() {
             let slots = self.slots.lock().map_err(|_| Error::Worker)?;
             if slots
@@ -184,7 +188,7 @@ impl Registry {
             if self.done.load(Ordering::Acquire) || control.stop_requested() {
                 break;
             }
-            if let Err(error) = self.renew(worker) {
+            if let Err(error) = self.renew(worker, Some(&mut renewer)) {
                 control.stop();
                 return Err(error);
             }
@@ -241,7 +245,7 @@ pub(super) fn run(
         }
         registry.acquire(worker, cursor)?;
         if !registry.snapshot()?.is_empty() {
-            break registry.renew(worker)?;
+            break registry.renew(worker, None)?;
         }
         cursor = (cursor + 1) % count;
         if cursor == 0 {

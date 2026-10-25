@@ -4592,6 +4592,14 @@ releasing its permit.
 
 ## Relay account registry
 
+The existing renewal thread retains at most one database session across jobs.
+Its per-job wire allowance remains 1 MiB input, 128 KiB output and 1088 frames;
+sixteen turns and sixty seconds bound cumulative traffic. These are processing
+limits, not preallocated buffers, and no read permit is borrowed from foreground
+work. Initial renewal and final release remain one-shot; shutdown retires the
+thread-owned session. This reduces idle handshakes, not the five-second lease
+transaction cadence or account-lock contention.
+
 A 128-KiB subreservation inside the 20-MiB account metadata row covers
 sixteen persistent claim slots, per-account scheduling state and bounded claim
 copies for renewal snapshots, SQL and foreground custody. Static assertions

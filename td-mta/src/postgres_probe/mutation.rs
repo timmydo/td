@@ -1,4 +1,4 @@
-//! Worker-owned SMTP transactions with outcome-preserving retirement.
+//! Worker-owned closed mutation transactions with outcome-preserving retirement.
 use super::{
     connect_authenticated_until,
     retained::{Bounds, LIFETIME},
@@ -11,6 +11,7 @@ use crate::{
         fanout::{self, Publication},
         Fanout, FanoutOutcome,
     },
+    postgres_route_owners as owners,
     postgres_runtime_profile::Binding,
     postgres_schema,
 };
@@ -26,25 +27,41 @@ use td_crypto::TrustStore;
 
 pub(super) const TURNS: usize = 16;
 
-pub(crate) struct SmtpSession {
+pub(crate) struct MutationSession {
     worker: Worker,
     bounds: Bounds,
     epoch: StoreEpoch,
-    accounts: usize,
+    // None selects the fixed renewal budget, never SMTP publication credit.
+    accounts: Option<usize>,
     retired: bool,
     clean_idle: bool,
 }
-impl SmtpSession {
-    pub(crate) fn open(
+impl MutationSession {
+    pub(crate) fn open_smtp(
         request: &Request<'_>,
         trust: &TrustStore,
         deadline: Instant,
         accounts: usize,
     ) -> Result<Self, Error> {
-        if request.mode != Mode::Runtime
-            || super::remaining(deadline)? > MAX_DURATION
-            || !(1..=crate::config::identities::MAX_ACCOUNTS).contains(&accounts)
-        {
+        if !(1..=crate::config::identities::MAX_ACCOUNTS).contains(&accounts) {
+            return Err(Error::Invalid);
+        }
+        Self::open_kind(request, trust, deadline, Some(accounts))
+    }
+    pub(crate) fn open_renewal(
+        request: &Request<'_>,
+        trust: &TrustStore,
+        deadline: Instant,
+    ) -> Result<Self, Error> {
+        Self::open_kind(request, trust, deadline, None)
+    }
+    fn open_kind(
+        request: &Request<'_>,
+        trust: &TrustStore,
+        deadline: Instant,
+        accounts: Option<usize>,
+    ) -> Result<Self, Error> {
+        if request.mode != Mode::Runtime || super::remaining(deadline)? > MAX_DURATION {
             return Err(Error::Invalid);
         }
         let bounds = Bounds::with_turns(Instant::now(), TURNS)?;
@@ -53,8 +70,11 @@ impl SmtpSession {
             trust,
             bounds.expires,
             deadline,
-            TURNS * 40 * 1024 * 1024 * accounts,
-            Input::retained_fanout(accounts),
+            TURNS * accounts.map_or(128 * 1024, |count| 40 * 1024 * 1024 * count),
+            match accounts {
+                Some(count) => Input::retained_fanout(count),
+                None => Input::retained_mutations(),
+            },
             LIFETIME,
         )?;
         worker.deadline = deadline;
@@ -102,13 +122,16 @@ impl SmtpSession {
     fn begin(
         &mut self,
         epoch: StoreEpoch,
-        accounts: usize,
+        accounts: Option<usize>,
         deadline: Instant,
     ) -> Result<(), Error> {
         if !self.reusable(deadline)
             || epoch != self.epoch
-            || accounts == 0
-            || accounts > self.accounts
+            || !match (accounts, self.accounts) {
+                (Some(count), Some(maximum)) => count != 0 && count <= maximum,
+                (None, None) => true,
+                _ => false,
+            }
         {
             return Err(Error::Invalid);
         }
@@ -116,12 +139,16 @@ impl SmtpSession {
         self.bounds.admit(Instant::now(), deadline)?;
         self.worker.deadline = deadline;
         self.worker.check()?;
-        self.worker
-            .validation_window
-            .as_ref()
-            .ok_or(Error::Invalid)?
-            .begin_fanout(accounts)
-            .map_err(|_| Error::Database)?;
+        match accounts {
+            Some(count) => self
+                .worker
+                .validation_window
+                .as_ref()
+                .ok_or(Error::Invalid)?
+                .begin_fanout(count)
+                .map_err(|_| Error::Database)?,
+            None => self.worker.begin_validation_turn()?,
+        }
         self.worker.run(move |client| Box::pin(async move {
             client.batch_execute("BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL synchronous_commit=on; SET LOCAL idle_in_transaction_session_timeout=10000").await.map_err(|_| Error::Database)?;
             let row = client.query_typed_one("SELECT m.store_epoch,b.blocked FROM td_mta.schema_migrations m CROSS JOIN td_mta.runtime_barrier b WHERE m.version=1 AND b.singleton=true", &[]).await.map_err(|_| Error::Database)?;
@@ -157,7 +184,7 @@ impl SmtpSession {
     ) -> Result<(), receiving::Error> {
         let result = (|| {
             let epoch = bindings.first().ok_or(receiving::Error::Integrity)?.epoch();
-            self.begin(epoch, bindings.len(), deadline)
+            self.begin(epoch, Some(bindings.len()), deadline)
                 .map_err(receiving::Error::Connection)?;
             self.worker
                 .run(move |client| {
@@ -179,7 +206,7 @@ impl SmtpSession {
         let attempted = Arc::new(AtomicBool::new(false));
         let marker = attempted.clone();
         let result = (|| {
-            self.begin(fanout.epoch()?, fanout.count(), deadline)
+            self.begin(fanout.epoch()?, Some(fanout.count()), deadline)
                 .map_err(receiving::Error::Connection)?;
             let fanout = fanout.clone();
             match self.worker.run(move |client| {
@@ -207,8 +234,47 @@ impl SmtpSession {
             }
         }
     }
+    pub(crate) fn renew(
+        &mut self,
+        values: Vec<(owners::Claim, u64)>,
+        deadline: Instant,
+    ) -> Result<i64, owners::Error> {
+        let attempted = Arc::new(AtomicBool::new(false));
+        let marker = attempted.clone();
+        let result = (|| {
+            let epoch = values
+                .first()
+                .ok_or(owners::Error::Integrity)?
+                .0
+                .binding()
+                .epoch();
+            self.begin(epoch, None, deadline)
+                .map_err(owners::Error::Connection)?;
+            match self.worker.run(move |client| {
+                Box::pin(
+                    async move { owners::update_many_body(client, &values, false, &marker).await },
+                )
+            }) {
+                Ok(result) => result,
+                Err(_) if attempted.load(Ordering::Relaxed) => Err(owners::Error::Indeterminate),
+                Err(error) => Err(owners::Error::Connection(error)),
+            }
+        })();
+        match result {
+            Ok(timestamp) => {
+                if self.finish(false).is_err() {
+                    self.retired = true;
+                }
+                Ok(timestamp)
+            }
+            Err(error) => {
+                self.retired = true;
+                Err(error)
+            }
+        }
+    }
 }
-impl Drop for SmtpSession {
+impl Drop for MutationSession {
     fn drop(&mut self) {
         if self.bounds.owner != thread::current().id() {
             self.worker.failed = Some(Error::Database);

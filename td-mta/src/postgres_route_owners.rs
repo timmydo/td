@@ -530,6 +530,30 @@ fn update_many(
     leases: &[(&Claim, u64)],
     release: bool,
 ) -> Result<i64, Error> {
+    let values = prepare_leases(leases)?;
+    let attempted = Arc::new(AtomicBool::new(false));
+    let marker = attempted.clone();
+    let result =
+        postgres_probe::with_scoped_mutation_client(request, trust, deadline, move |scope| {
+            Box::pin(async move {
+                let first = &values.first().ok_or(Error::Integrity)?.0;
+                if scope
+                    .inspect_schema()
+                    .await
+                    .map_err(Error::Schema)?
+                    .store_epoch
+                    != first.binding.epoch()
+                {
+                    return Err(Error::Epoch);
+                }
+                let client = scope.client();
+                begin_transaction(client).await?;
+                update_many_body(client, &values, release, &marker).await
+            })
+        });
+    finish(result, &attempted)
+}
+fn prepare_leases(leases: &[(&Claim, u64)]) -> Result<Vec<(Claim, u64)>, Error> {
     if leases.is_empty() || leases.len() > crate::config::identities::MAX_ACCOUNTS {
         return Err(Error::Capacity);
     }
@@ -553,61 +577,132 @@ fn update_many(
         values.push(((*claim).clone(), *generation));
     }
     values.sort_unstable_by_key(|(claim, _)| claim.binding.account());
-    let attempted = Arc::new(AtomicBool::new(false));
-    let marker = attempted.clone();
-    let result = postgres_probe::with_scoped_mutation_client(
-        request,
-        trust,
-        deadline,
-        move |scope| {
-            Box::pin(async move {
-                scope
-                    .client()
-                    .batch_execute("SET lock_timeout=8000; SET statement_timeout=8000")
-                    .await
-                    .map_err(|_| Error::Database)?;
-                let first = &values.first().ok_or(Error::Integrity)?.0;
-                let (client, current_policy) = begin_scoped(scope, first, !release, true).await?;
-                if !current_policy {
-                    return Err(Error::Policy);
-                }
-                // The first account was locked by begin. Acquire every other account
-                // before any owner row, preserving the account-before-owner hierarchy.
-                for (claim, _) in values.iter().skip(1) {
-                    client
-                        .query_one(
-                            "SELECT id FROM td_mta.accounts WHERE id=$1 FOR UPDATE",
-                            &[&claim.binding.account().as_bytes().as_slice()],
-                        )
-                        .await
-                        .map_err(|_| Error::Database)?;
-                }
-                let mut owners = Vec::new();
-                owners
-                    .try_reserve_exact(values.len())
-                    .map_err(|_| Error::Capacity)?;
-                for (claim, _) in &values {
-                    owners.push(owner(client, claim).await?.ok_or(Error::Stale)?);
-                }
-                let timestamp = now(client).await?;
-                let expires_at = timestamp.checked_add(LEASE_MS).ok_or(Error::Clock)?;
-                for ((claim, generation), owner) in values.iter().zip(&owners) {
-                    current(owner, claim, *generation, timestamp, !release)?;
-                }
-                for (claim, _) in &values {
-                    let changed = if release {
-                client.execute("UPDATE td_mta.route_owners SET owner_boot=NULL,operation=NULL,expires_at=NULL,last_clock=$3 WHERE account=$1 AND route_name=$2", &[&claim.binding.account().as_bytes().as_slice(), &claim.binding.route().name(), &timestamp]).await
+    Ok(values)
+}
+pub(crate) async fn update_many_body(
+    client: &Client,
+    values: &[(Claim, u64)],
+    release: bool,
+    marker: &AtomicBool,
+) -> Result<i64, Error> {
+    client
+        .batch_execute("SET LOCAL lock_timeout=8000; SET LOCAL statement_timeout=8000")
+        .await
+        .map_err(|_| Error::Database)?;
+    let first = &values.first().ok_or(Error::Integrity)?.0;
+    if !lock_account_policy(client, first, !release, true).await? {
+        return Err(Error::Policy);
+    }
+    // The first account was locked by the fresh policy check. Acquire every other account
+    // before any owner row, preserving the account-before-owner hierarchy.
+    for (claim, _) in values.iter().skip(1) {
+        client
+            .query_one(
+                "SELECT id FROM td_mta.accounts WHERE id=$1 FOR UPDATE",
+                &[&claim.binding.account().as_bytes().as_slice()],
+            )
+            .await
+            .map_err(|_| Error::Database)?;
+    }
+    let mut owners = Vec::new();
+    owners
+        .try_reserve_exact(values.len())
+        .map_err(|_| Error::Capacity)?;
+    for (claim, _) in values {
+        owners.push(owner(client, claim).await?.ok_or(Error::Stale)?);
+    }
+    let timestamp = now(client).await?;
+    let expires_at = timestamp.checked_add(LEASE_MS).ok_or(Error::Clock)?;
+    for ((claim, generation), owner) in values.iter().zip(&owners) {
+        current(owner, claim, *generation, timestamp, !release)?;
+    }
+    for (claim, _) in values {
+        let changed = if release {
+client.execute("UPDATE td_mta.route_owners SET owner_boot=NULL,operation=NULL,expires_at=NULL,last_clock=$3 WHERE account=$1 AND route_name=$2", &[&claim.binding.account().as_bytes().as_slice(), &claim.binding.route().name(), &timestamp]).await
             } else {
-                client.execute("UPDATE td_mta.route_owners SET expires_at=$3,last_clock=$4 WHERE account=$1 AND route_name=$2", &[&claim.binding.account().as_bytes().as_slice(), &claim.binding.route().name(), &expires_at, &timestamp]).await
+client.execute("UPDATE td_mta.route_owners SET expires_at=$3,last_clock=$4 WHERE account=$1 AND route_name=$2", &[&claim.binding.account().as_bytes().as_slice(), &claim.binding.route().name(), &expires_at, &timestamp]).await
             }.map_err(|_| Error::Database)?;
-                    if changed != 1 {
-                        return Err(Error::Integrity);
-                    }
-                }
-                commit(client, &marker).await?;
-                Ok(timestamp)
-            })
-        },
-    );
-    finish(result, &attempted)
+        if changed != 1 {
+            return Err(Error::Integrity);
+        }
+    }
+    commit(client, marker).await?;
+    Ok(timestamp)
+}
+
+/// One renewal thread's finite mutation session; no lease authority is cached.
+#[derive(Default)]
+pub struct Renewer {
+    session: Option<postgres_probe::MutationSession>,
+}
+impl Renewer {
+    fn close(&mut self) {
+        if let Some(session) = self.session.take() {
+            let now = Instant::now();
+            session.retire(
+                now.checked_add(std::time::Duration::from_millis(100))
+                    .unwrap_or(now),
+            );
+        }
+    }
+    pub fn renew(
+        &mut self,
+        request: &Request<'_>,
+        trust: &TrustStore,
+        deadline: Instant,
+        leases: &[(&Claim, u64)],
+    ) -> Result<i64, Error> {
+        let values = prepare_leases(leases)?;
+        if self
+            .session
+            .as_ref()
+            .is_some_and(|session| !session.reusable(deadline))
+        {
+            self.close();
+        }
+        if self
+            .session
+            .as_mut()
+            .is_some_and(|session| session.check_idle(deadline).is_err())
+        {
+            self.close();
+        }
+        let reused = self.session.is_some();
+        if self.session.is_none() {
+            self.session = Some(
+                postgres_probe::MutationSession::open_renewal(request, trust, deadline)
+                    .map_err(Error::Connection)?,
+            );
+        }
+        let result = self
+            .session
+            .as_mut()
+            .ok_or(Error::Integrity)?
+            .renew(values, deadline);
+        if reused {
+            crate::performance::record(
+                crate::performance::Phase::DbReuse,
+                std::time::Duration::ZERO,
+                if result.is_ok() {
+                    crate::performance::Outcome::Success
+                } else {
+                    crate::performance::Outcome::Failed
+                },
+            );
+        }
+        if result.is_err()
+            || self
+                .session
+                .as_ref()
+                .is_some_and(|session| session.needs_retirement(Instant::now()))
+        {
+            self.close();
+        }
+        result
+    }
+}
+impl Drop for Renewer {
+    fn drop(&mut self) {
+        self.close();
+    }
 }

@@ -33,7 +33,7 @@ pub struct Backend<'a> {
 struct SessionState<'a> {
     owner: Option<ThreadId>,
     connection: Option<(
-        crate::postgres_probe::SmtpSession,
+        crate::postgres_probe::MutationSession,
         crate::postgres_read::ReadPermit<'a>,
     )>,
 }
@@ -98,7 +98,7 @@ impl Backend<'_> {
         &self,
         until: Deadline,
         operation: impl FnOnce(
-            &mut crate::postgres_probe::SmtpSession,
+            &mut crate::postgres_probe::MutationSession,
             Deadline,
         ) -> Result<T, owner::Error>,
     ) -> Result<T, owner::Error> {
@@ -153,7 +153,7 @@ impl Backend<'_> {
             for address in addresses {
                 let mut request = self.owner.loaded.bootstrap.request(address);
                 request.mode = crate::postgres_probe::Mode::Runtime;
-                match crate::postgres_probe::SmtpSession::open(
+                match crate::postgres_probe::MutationSession::open_smtp(
                     &request,
                     &self.owner.loaded.trust,
                     deadline,

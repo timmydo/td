@@ -470,6 +470,7 @@ fn scoped_qualification(
         }
     }
     retained_idle(fixture, &runtime, trust, &claim, grant.generation);
+    retained_renewal(fixture, &runtime, trust, &claim, grant.generation);
     sql(fixture, "ALTER SYSTEM RESET log_statement");
     sql(fixture, "SELECT pg_reload_conf()");
 
@@ -652,4 +653,124 @@ fn retained_idle(
     );
     assert!(other.observe(deadline(), claim, generation).is_ok());
     other.close();
+}
+
+fn retained_renewal(
+    fixture: &Fixture,
+    request: &td_mta::postgres_probe::Request<'_>,
+    trust: &TrustStore,
+    claim: &td_mta::postgres_route_owners::Claim,
+    generation: u64,
+) {
+    use super::body_checks::{backend, closed, quiet};
+    use td_mta::{postgres_probe as probe, postgres_route_owners as owners, postgres_schema};
+    quiet(fixture);
+    let offset = std::fs::metadata(fixture.root.join("server.log"))
+        .unwrap()
+        .len() as usize;
+    let mut renewer = owners::Renewer::default();
+    let leases = [(claim, generation)];
+    renewer.renew(request, trust, deadline(), &leases).unwrap();
+    let pid = backend(fixture);
+    for _ in 1..15 {
+        renewer.renew(request, trust, deadline(), &leases).unwrap();
+    }
+    assert_eq!(backend(fixture), pid);
+    assert_eq!(sql(fixture, &format!("SELECT state||'|'||(xact_start IS NULL)::text FROM pg_catalog.pg_stat_activity WHERE pid={pid}")), "idle|true");
+    assert!(sql(fixture, &format!("BEGIN; SELECT pg_catalog.pg_try_advisory_xact_lock({}); SELECT id FROM td_mta.accounts FOR UPDATE NOWAIT; SELECT singleton FROM td_mta.config_selection FOR UPDATE NOWAIT; SELECT account FROM td_mta.route_owners FOR UPDATE NOWAIT; ROLLBACK", postgres_schema::MIGRATION_KEY)).lines().any(|line| line == "f"));
+    let log = std::fs::read_to_string(fixture.root.join("server.log")).unwrap();
+    assert_eq!(log[offset..].lines().filter(|line| line.contains("execute ") && line.contains("SELECT version, checksum, store_epoch FROM td_mta.schema_migrations ORDER BY version")).count(), 1);
+    renewer.renew(request, trust, deadline(), &leases).unwrap();
+    closed(fixture, &pid);
+    renewer.renew(request, trust, deadline(), &leases).unwrap();
+    let pid = backend(fixture);
+    sql(fixture, &format!("SELECT pg_terminate_backend({pid})"));
+    closed(fixture, &pid);
+    renewer.renew(request, trust, deadline(), &leases).unwrap();
+    assert_ne!(backend(fixture), pid);
+    let selection = sql(
+        fixture,
+        "SELECT encode(generation,'hex') FROM td_mta.config_selection",
+    );
+    let epoch = sql(
+        fixture,
+        "SELECT encode(store_epoch,'hex') FROM td_mta.schema_migrations LIMIT 1",
+    );
+    for (change, restore, error) in [
+        (
+            "UPDATE td_mta.runtime_barrier SET blocked=true".to_owned(),
+            "UPDATE td_mta.runtime_barrier SET blocked=false".to_owned(),
+            owners::Error::Connection(probe::Error::RuntimeMaintenance),
+        ),
+        (
+            "UPDATE td_mta.config_selection SET generation=decode('0000000000000063','hex')"
+                .to_owned(),
+            format!("UPDATE td_mta.config_selection SET generation=decode('{selection}','hex')"),
+            owners::Error::Policy,
+        ),
+        (
+            "UPDATE td_mta.schema_migrations SET store_epoch=decode(repeat('ee',16),'hex')"
+                .to_owned(),
+            format!("UPDATE td_mta.schema_migrations SET store_epoch=decode('{epoch}','hex')"),
+            owners::Error::Connection(probe::Error::RuntimeSchema),
+        ),
+    ] {
+        renewer.renew(request, trust, deadline(), &leases).unwrap();
+        let pid = backend(fixture);
+        sql(fixture, &change);
+        assert_eq!(
+            renewer.renew(request, trust, deadline(), &leases),
+            Err(error)
+        );
+        closed(fixture, &pid);
+        sql(fixture, &restore);
+    }
+    renewer.renew(request, trust, deadline(), &leases).unwrap();
+    let pid = backend(fixture);
+    let baseline = sql(
+        fixture,
+        "SELECT string_agg(expires_at::text,',' ORDER BY account) FROM td_mta.route_owners",
+    );
+    assert_eq!(
+        renewer.renew(request, trust, deadline(), &[(claim, generation + 1)]),
+        Err(owners::Error::Stale)
+    );
+    closed(fixture, &pid);
+    assert_eq!(
+        sql(
+            fixture,
+            "SELECT string_agg(expires_at::text,',' ORDER BY account) FROM td_mta.route_owners"
+        ),
+        baseline
+    );
+    renewer.renew(request, trust, deadline(), &leases).unwrap();
+    let pid = backend(fixture);
+    sql(fixture, "CREATE FUNCTION public.delay_retained_renewal() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(2); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_retained_renewal AFTER UPDATE ON td_mta.route_owners DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_retained_renewal()");
+    assert_eq!(
+        renewer.renew(
+            request,
+            trust,
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+            &leases
+        ),
+        Err(owners::Error::Indeterminate)
+    );
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    closed(fixture, &pid);
+    sql(
+        fixture,
+        "DROP TRIGGER delay_retained_renewal ON td_mta.route_owners",
+    );
+    drop(renewer);
+    assert_eq!(
+        sql(
+            fixture,
+            &format!(
+                "SELECT pg_catalog.pg_try_advisory_xact_lock({})",
+                postgres_schema::MIGRATION_KEY
+            )
+        ),
+        "t"
+    );
+    owners::observe(request, trust, deadline(), claim, generation).unwrap();
 }

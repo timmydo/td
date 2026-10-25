@@ -160,7 +160,7 @@ impl Receiving<'_> {
 
     pub(crate) fn ready_cached(
         &self,
-        session: &mut postgres_probe::SmtpSession,
+        session: &mut postgres_probe::MutationSession,
         until: Deadline,
     ) -> Result<(), Error> {
         if !self.valid() {
@@ -224,7 +224,7 @@ impl Receiving<'_> {
         message: &Message<'_>,
         until: Deadline,
         meter: &mut Meter,
-        session: &mut postgres_probe::SmtpSession,
+        session: &mut postgres_probe::MutationSession,
     ) -> Result<changes::FanoutOutcome, Error> {
         self.create_fanout_inner(targets, message, until, meter, Some(session))
     }
@@ -234,7 +234,7 @@ impl Receiving<'_> {
         message: &Message<'_>,
         until: Deadline,
         meter: &mut Meter,
-        session: Option<&mut postgres_probe::SmtpSession>,
+        session: Option<&mut postgres_probe::MutationSession>,
     ) -> Result<changes::FanoutOutcome, Error> {
         if !self.valid()
             || targets

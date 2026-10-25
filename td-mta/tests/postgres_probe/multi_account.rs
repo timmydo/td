@@ -189,11 +189,11 @@ pub(super) fn exercise(
     let (published, retired) = prepared.publish(&mut domain).unwrap();
     drop(retired);
     use td_mta::postgres_route_owners as owners;
+    super::create_runtime_login(fixture);
+    super::grant_runtime_mail(fixture);
     let (held, grant) = super::multi_relay::leases(fixture, request, trust, &published);
     let held_live = std::cell::Cell::new(true);
     let relay = super::serving_relay::Relay::multi(fixture, relay_socket, relay_dns);
-    super::create_runtime_login(fixture);
-    super::grant_runtime_mail(fixture);
     let devices: Vec<_> = [a, b]
         .into_iter()
         .map(|account| {

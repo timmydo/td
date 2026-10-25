@@ -60,6 +60,17 @@ impl Input {
         }
     }
 
+    pub(super) fn retained_mutations() -> Self {
+        let single = Self::mutations();
+        let turns = super::mutation::TURNS;
+        Self {
+            window: Some(Windows::mutations(turns)),
+            bytes: single.bytes * turns,
+            frames: single.frames * turns,
+            ..single
+        }
+    }
+
     pub(super) fn imports(guarded: bool) -> Self {
         // A 64 MiB body plus 256 source mappings and relationship writes.
         Self {
@@ -91,7 +102,7 @@ impl Input {
 
     pub(super) fn retained_fanout(accounts: usize) -> Self {
         let single = Self::fanout(accounts);
-        let turns = super::smtp::TURNS;
+        let turns = super::mutation::TURNS;
         Self {
             window: Some(Windows::fanout(turns, accounts)),
             bytes: single.bytes * turns,
@@ -530,6 +541,33 @@ mod tests {
                 .accept(&frame(b'D', &[0; 128 * 1024]))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn retained_mutations_keep_original_job_limits_and_finite_turns() {
+        let mut input = Input::retained_mutations();
+        let window = input.window().unwrap();
+        input.accept(&authenticated()).unwrap();
+        for turn in 0..super::super::mutation::TURNS {
+            window.begin().unwrap();
+            for _ in if turn == 0 { 5 } else { 0 }..1088 {
+                input.accept(&frame(b'N', b"\0")).unwrap();
+            }
+            input.admit_output(128 * 1024).unwrap();
+            input.output(128 * 1024).unwrap();
+            window.finish().unwrap();
+        }
+        assert_eq!(input.frames, 0);
+        assert!(window.begin().is_err());
+        assert!(input.accept(&[]).is_err());
+        assert!(Input::retained_mutations()
+            .admit_output(128 * 1024 + 1)
+            .is_err());
+        let mut input = Input::retained_mutations();
+        for _ in 0..1088 {
+            input.accept(&frame(b'N', b"\0")).unwrap();
+        }
+        assert!(input.accept(&frame(b'N', b"\0")).is_err());
     }
 
     #[test]

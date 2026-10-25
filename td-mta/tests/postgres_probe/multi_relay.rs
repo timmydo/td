@@ -35,18 +35,28 @@ pub(super) fn leases(
         owners::renew_many(request, trust, deadline(), &[leases[0], leases[0]]),
         Err(owners::Error::Policy)
     );
+    let mut runtime = fixture.request();
+    runtime.user = "mail_runtime";
+    runtime.mode = td_mta::postgres_probe::Mode::Runtime;
+    let mut renewer = owners::Renewer::default();
+    renewer.renew(&runtime, trust, deadline(), &leases).unwrap();
+    let pid = super::body_checks::backend(fixture);
+    renewer.renew(&runtime, trust, deadline(), &leases).unwrap();
+    assert_eq!(super::body_checks::backend(fixture), pid);
     let baseline = sql(fixture, "SELECT string_agg(encode(account,'hex')||':'||expires_at::text,',' ORDER BY account) FROM td_mta.route_owners");
     leases[0].1 += 1;
     assert_eq!(
-        owners::renew_many(request, trust, deadline(), &leases),
+        renewer.renew(&runtime, trust, deadline(), &leases),
         Err(owners::Error::Stale)
     );
     assert_eq!(sql(fixture, "SELECT string_agg(encode(account,'hex')||':'||expires_at::text,',' ORDER BY account) FROM td_mta.route_owners"), baseline);
+    super::body_checks::closed(fixture, &pid);
     leases[0].1 -= 1;
+    renewer.renew(&runtime, trust, deadline(), &leases).unwrap();
     sql(fixture, "CREATE FUNCTION public.delay_multi_lease() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(0.25); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_multi_lease AFTER UPDATE ON td_mta.route_owners DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_multi_lease()");
     assert_eq!(
-        owners::renew_many(
-            request,
+        renewer.renew(
+            &runtime,
             trust,
             std::time::Instant::now() + std::time::Duration::from_secs(2),
             &leases
@@ -65,6 +75,7 @@ pub(super) fn leases(
         ),
         "1"
     );
+    drop(renewer);
     for (claim, grant) in claims.iter().zip(&grants) {
         owners::observe(request, trust, deadline(), claim, grant.generation).unwrap();
     }

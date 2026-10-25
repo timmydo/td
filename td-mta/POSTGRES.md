@@ -6803,11 +6803,27 @@ also retires exhausted or near-expiry idle sessions even when no account owns
 a usable lease; this local maintenance issues no SQL. Account
 count does not multiply retained sessions or extend any allowance.
 
-The standalone absence helper and batched renewal/release still consume a
-callback-scoped client whose Runtime qualification carries its inspected schema
-receipt under the same session lock. Preparation connections inspect the schema
-at transaction entry. Renewal, publication and uncertain-COMMIT handling are
-unchanged; no write connection is retained by this read-session increment.
+The standalone absence helper, initial foreground renewal and final release
+consume callback-scoped clients. Periodic renewal retains one qualified mutation
+session on the renewal thread, sharing the SMTP mutation lifecycle but not its
+publication wire allowance. Its sixteen-turn, sixty-second lifetime has finite
+cumulative bounds and the existing per-job limits: 128 KiB output, 1 MiB input
+and 1088 input frames. No account or transaction is retained between renewals;
+the migration lock remains held until connection close. Each new READ COMMITTED
+transaction checks epoch and maintenance before the existing fresh configuration,
+sorted account and owner checks. Lock and statement timeouts are transaction-local
+and remain eight seconds within the original ten-second operation deadline.
+
+Observable idle failure or exhausted lifetime permits replacement only before
+SQL admission, under the same deadline. Any admitted error retires the connection
+and preserves the worker's fail-stop path; no renewal is replayed. COMMIT is
+marked immediately before its attempt. An unknown outcome remains Indeterminate;
+a positively acknowledged COMMIT survives later cleanup failure, which retires
+the session. Exhausted, retired or near-expiry sessions close after the job,
+before the renewal worker waits again. Shutdown closes the thread-owned session
+before joining. Initial
+renewal is deliberately one-shot so a retained session never crosses threads.
+Preparation connections still inspect the schema at transaction entry.
 
 Registry acknowledgements match the exact claim operation and generation.
 Published slots are never replaced while the worker runs. One fresh database

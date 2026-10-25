@@ -27,6 +27,9 @@ impl Windows {
     pub(super) fn new(turns: usize) -> Self {
         Self::bounded(turns, INPUT, OUTPUT, FRAMES)
     }
+    pub(super) fn mutations(turns: usize) -> Self {
+        Self::bounded(turns, INPUT, 128 * 1024, FRAMES)
+    }
     pub(super) fn body(turns: usize) -> Self {
         Self::bounded(turns, 256 * 1024 * 1024, 512 * 1024, 8192)
     }
