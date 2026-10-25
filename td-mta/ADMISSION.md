@@ -118,7 +118,8 @@ retained slot reserves completion capacity before dispatch. Finalization
 captures the configured commit deadline once, before queueing, and retries
 keep it. Begin-DATA ticket contention may retry only before admission,
 under the original queued admission cap. The PostgreSQL adapter admits four
-resident DATA jobs across all listeners and accounts; the fixed storage worker
+resident DATA jobs across all listeners and accounts, at most two per actual
+socket peer address; the fixed storage worker
 continues to serialize publication. A paused DATA sender consumes one permit,
 and exhaustion waits before 354 without allocating another incoming body.
 

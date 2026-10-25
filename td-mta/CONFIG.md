@@ -231,6 +231,12 @@ execution constants. Fixed transaction sizes/counts and the single outbound
 worker are not operator keys; spelling them in a file is an unknown-field
 error even when the supplied value equals the constant.
 
+SMTP DATA residency has separate fixed bounds: four jobs total, at most two
+per socket peer address, including peers behind a shared NAT. Raising
+`smtp_sessions` or `smtp_per_peer` does not raise those DATA bounds. Saturation
+waits before 354 within the existing admission deadline and then temporarily
+refuses; it does not allocate an extra message buffer.
+
 ### `[limits]`
 
 `smtp_sessions`, `smtp_per_peer`, `https_connections`, `tls_handshakes`,

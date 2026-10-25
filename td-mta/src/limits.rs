@@ -30,6 +30,9 @@ pub const RELAY_ACCOUNT_METADATA_BYTES: usize = 128 * KIB;
 pub const SMTP_FANOUT_METADATA_BYTES: usize = 2 * MIB;
 /// Resident incoming DATA jobs; publication still uses one fixed worker.
 pub const SMTP_DATA_JOBS: usize = 4;
+/// Keep capacity for another socket peer independently of connection limits.
+pub const SMTP_DATA_PER_PEER: usize = 2;
+const _: () = assert!(SMTP_DATA_PER_PEER > 0 && SMTP_DATA_PER_PEER < SMTP_DATA_JOBS);
 const _: () = assert!(
     crate::config::identities::MAX_ACCOUNTS * crate::format::row::MAX_RECEIPT_BYTES
         + 3 * (crate::format::row::MAX_RECEIPT_BYTES + 128 * KIB)

@@ -3192,7 +3192,8 @@ foreground service constructs this PostgreSQL storage adapter; durable restart
 custody for uncertain operations remains a separate requirement. The runtime
 PostgreSQL fixture drives the SMTP session through admission, DATA and commit,
 including discarded ingress, sticky refusal, generation/clock mismatch,
-four-job ingress capacity, release after refusal/discard, success, delayed
+four-job mixed-peer ingress capacity, two-job same-peer capacity,
+release after refusal/discard, success, delayed
 COMMIT, fencing of admitted siblings and historical settlement.
 
 ## 108. Real SMTP worker qualification
@@ -3207,8 +3208,10 @@ database rollback produces 451, preserves the ready worker and permits a
 later successful transaction on that connection. A partial DATA sender stays
 paused until another connection has received final success, with exactly that
 second delivery durable before the paused sender completes. Shutdown discards
-four unfinished DATA jobs, joins the workers and leaves no additional message
-or receipt. These concurrency regressions run over plaintext and STARTTLS. Another
+two unfinished same-peer DATA jobs, joins the workers and leaves no additional message
+or receipt. A third same-peer DATA attempt receives 451 without 354 while
+the two unfinished jobs remain admitted. These concurrency regressions run
+over plaintext and STARTTLS. Another
 regression holds one admitted job immediately before publication and proves
 that a second job consumes its DATA line before that gate is released. No
 receipt exists for either message until publication proceeds; both final

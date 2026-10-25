@@ -528,13 +528,19 @@ pub(super) fn exercise(
             client.get_mut().write_all(b"Subject: abandoned\r\n\r\npartial\r\n").unwrap();
             client.get_mut().flush().unwrap();
             let mut abandoned = Vec::new();
-            for _ in 1..td_mta::limits::SMTP_DATA_JOBS {
+            for _ in 1..td_mta::limits::SMTP_DATA_PER_PEER {
                 let mut extra = connect(fixture, address, tls, clock.clone());
                 envelope(&mut extra);
                 extra.get_mut().write_all(b"Subject: abandoned sibling\r\n\r\npartial\r\n").unwrap();
                 extra.get_mut().flush().unwrap();
                 abandoned.push(extra);
             }
+            let mut excess = connect(fixture, address, tls, clock.clone());
+            command(&mut excess, b"MAIL FROM:<sender@example.test>\r\n", "250");
+            command(&mut excess, b"RCPT TO:<main@example.test>\r\n", "250");
+            command(&mut excess, b"DATA\r\n", "451");
+            assert_eq!(control.state(), State::Ready);
+            drop(excess);
             drop(stop);
             server.join().unwrap().unwrap();
             drop(abandoned);

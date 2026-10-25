@@ -4554,7 +4554,7 @@ original meter prepays publication I/O for every target, so a large fanout may
 refuse within the fixed work allowance even when each mailbox has quota.
 
 The PostgreSQL SMTP adapter separately admits at most four resident incoming
-DATA buffers, each reserved up front to the configured message ceiling minus
+DATA buffers, at most two per socket peer address, each reserved up front to the configured message ceiling minus
 trace allowance. A paused sender retains its buffer and permit but no database
 connection or storage-worker execution time. The singleton storage worker
 serializes preparation and publication, retaining at most one additional
@@ -4567,7 +4567,11 @@ allocator overhead and native database/protocol allocations remain additional. T
 are additional to the planning ledger above, as are the active attachment and
 relay reservations. The four-job bound prevents connection-count amplification
 but does not qualify the provisional 128-MiB workload RSS goal. Saturation waits
-before 354 within the original admission deadline; it allocates no fifth body.
+before 354 within the original admission deadline; it allocates no fifth body
+or third same-peer body. Four peer labels are retained beside the atomic
+permits. Admission uses a nonblocking mutex acquisition; permit release is
+only an atomic store, including network-loop disposal. Stale labels in free
+slots do not count toward a peer limit.
 The same fixed storage worker retains at most one qualified PostgreSQL session
 and one read-slot permit across jobs. The connection's finite wire windows are
 work allowances, not body allocations. Startup and independent unknown-outcome

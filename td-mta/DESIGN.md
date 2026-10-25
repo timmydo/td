@@ -1751,6 +1751,12 @@ its owning worker; Busy maintenance defers without stopping service. No database
 transaction spans peer input. POSTGRES specifies its independent connection,
 per-job authority, wire allowances and durable-outcome retirement rules.
 
+DATA admission additionally permits at most two resident jobs per socket peer
+address across the four total jobs, independent of connection limits. A peer
+behind NAT shares that allowance; this is address fairness, not sender identity
+or a defense against distributed senders. It uses the existing bounded
+pre-354 retry path and leaves HTTPS connection limits unchanged.
+
 Global, per-listener and per-peer counts include queued, handshaking,
 closing and retiring connections. Saturation attempts one bounded 421
 write before closure. Runtime status distinguishes startup, ready,

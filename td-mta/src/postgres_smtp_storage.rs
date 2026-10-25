@@ -26,7 +26,7 @@ pub struct Backend<'a> {
     owner: Receiving<'a>,
     clock: Arc<RuntimeClock>,
     generation: u64,
-    admitted: [AtomicBool; crate::limits::SMTP_DATA_JOBS],
+    admitted: Admissions,
     stopped: AtomicBool,
     session: Mutex<SessionState<'a>>,
 }
@@ -60,7 +60,7 @@ impl<'a> Backend<'a> {
             owner,
             clock,
             generation,
-            admitted: [const { AtomicBool::new(false) }; crate::limits::SMTP_DATA_JOBS],
+            admitted: Admissions::new(),
             stopped: AtomicBool::new(false),
             session: Mutex::new(SessionState {
                 owner: None,
@@ -197,6 +197,44 @@ impl Backend<'_> {
         result
     }
 }
+struct Admissions {
+    occupied: [AtomicBool; crate::limits::SMTP_DATA_JOBS],
+    peers: Mutex<[Option<IpAddr>; crate::limits::SMTP_DATA_JOBS]>,
+}
+impl Admissions {
+    fn new() -> Self {
+        Self {
+            occupied: [const { AtomicBool::new(false) }; crate::limits::SMTP_DATA_JOBS],
+            peers: Mutex::new([None; crate::limits::SMTP_DATA_JOBS]),
+        }
+    }
+    fn acquire(&self, peer: IpAddr) -> Result<Permit<'_>, Failure> {
+        let mut peers = self.peers.try_lock().map_err(|error| match error {
+            TryLockError::WouldBlock => Failure::Retry,
+            TryLockError::Poisoned(_) => Failure::Refused(Error::Invalid),
+        })?;
+        if self
+            .occupied
+            .iter()
+            .zip(peers.iter())
+            .filter(|(busy, label)| busy.load(Ordering::Acquire) && **label == Some(peer))
+            .count()
+            >= crate::limits::SMTP_DATA_PER_PEER
+        {
+            return Err(Failure::Retry);
+        }
+        for (occupied, label) in self.occupied.iter().zip(peers.iter_mut()) {
+            if occupied
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                *label = Some(peer);
+                return Ok(Permit(occupied));
+            }
+        }
+        Err(Failure::Retry)
+    }
+}
 struct Permit<'a>(&'a AtomicBool);
 impl Drop for Permit<'_> {
     fn drop(&mut self) {
@@ -285,16 +323,7 @@ impl<'b> Storage for Backend<'b> {
         if self.stopped() {
             return Err(Failure::Refused(Error::WriterStopped));
         }
-        let permit = self
-            .admitted
-            .iter()
-            .find(|admitted| {
-                admitted
-                    .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                    .is_ok()
-            })
-            .map(Permit)
-            .ok_or(Failure::Retry)?;
+        let permit = self.admitted.acquire(input.peer)?;
         let limits = self.owner.binding.work();
         let maximum = input.session.incoming_limit();
         let mut meter = Meter::new(
@@ -576,5 +605,39 @@ fn owner_error(error: owner::Error) -> Error {
         owner::Error::Publication(P::Quota) => Error::Quota,
         owner::Error::Publication(P::Indeterminate) => Error::WriterStopped,
         _ => Error::Busy,
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn peer_capacity_preserves_other_peers_and_releases_without_lock() {
+        let slots = Admissions::new();
+        let first = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let second = IpAddr::V6(Ipv6Addr::LOCALHOST);
+        let a = slots.acquire(first).unwrap();
+        let b = slots.acquire(first).unwrap();
+        assert!(matches!(slots.acquire(first), Err(Failure::Retry)));
+        let c = slots.acquire(second).unwrap();
+        let d = slots.acquire(second).unwrap();
+        assert!(matches!(
+            slots.acquire(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            Err(Failure::Retry)
+        ));
+        let lock = slots.peers.lock().unwrap();
+        std::thread::scope(|scope| scope.spawn(|| drop(a)).join().unwrap());
+        assert!(matches!(slots.acquire(first), Err(Failure::Retry)));
+        drop(lock);
+        let replacement = slots.acquire(first).unwrap();
+        assert!(matches!(slots.acquire(first), Err(Failure::Retry)));
+        drop((b, c, d, replacement));
+        let fresh = slots.acquire(second).unwrap();
+        let fresh2 = slots.acquire(second).unwrap();
+        assert!(matches!(slots.acquire(second), Err(Failure::Retry)));
+        drop((fresh, fresh2));
     }
 }

@@ -12458,15 +12458,25 @@ fn exercise_smtp_storage(fixture: &Fixture, binding: &td_mta::postgres_runtime_p
             sql(fixture, &format!("UPDATE td_mta.config_selection SET generation=decode('{generation}','hex') WHERE singleton=true"));
         }
         let mut others = Vec::new();
-        for _ in 1..td_mta::limits::SMTP_DATA_JOBS {
-            others.push(storage.begin(begin(clock.clone(), 7), &mut random).unwrap());
+        for index in 1..td_mta::limits::SMTP_DATA_JOBS {
+            let mut other = begin(clock.clone(), 7);
+            if index >= td_mta::limits::SMTP_DATA_PER_PEER {
+                other.peer = "192.0.2.3".parse().unwrap();
+            }
+            others.push(storage.begin(other, &mut random).unwrap());
         }
         assert!(matches!(
             storage.begin(begin(clock.clone(), 7), &mut random),
             Err(Failure::Retry)
         ));
         drop(others.pop());
-        others.push(storage.begin(begin(clock.clone(), 7), &mut random).unwrap());
+        assert!(matches!(
+            storage.begin(begin(clock.clone(), 7), &mut random),
+            Err(Failure::Retry)
+        ));
+        let mut replacement = begin(clock.clone(), 7);
+        replacement.peer = "192.0.2.3".parse().unwrap();
+        others.push(storage.begin(replacement, &mut random).unwrap());
         if case == 0 {
             drop(job);
             assert_eq!(
