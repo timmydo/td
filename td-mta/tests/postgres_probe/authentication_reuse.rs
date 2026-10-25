@@ -29,7 +29,7 @@ pub(super) fn exercise(
         ),
         "idle|true"
     );
-    assert!(sql(fixture, &format!("BEGIN; SELECT pg_catalog.pg_try_advisory_xact_lock({}); SELECT id FROM td_mta.accounts FOR UPDATE NOWAIT; SELECT singleton FROM td_mta.config_selection FOR UPDATE NOWAIT; ROLLBACK", td_mta::postgres_schema::MIGRATION_KEY)).lines().any(|line| line == "t"));
+    assert!(sql(fixture, &format!("BEGIN; SELECT pg_catalog.pg_try_advisory_xact_lock({}); SELECT id FROM td_mta.accounts FOR UPDATE NOWAIT; SELECT singleton FROM td_mta.config_selection FOR UPDATE NOWAIT; ROLLBACK", td_mta::postgres_schema::MIGRATION_KEY)).lines().any(|line| line == "f"));
     thread::scope(|scope| {
         assert_eq!(
             scope.spawn(authenticate).join().unwrap(),
@@ -53,7 +53,7 @@ pub(super) fn exercise(
     body_checks::closed(fixture, &pid);
     assert_ne!(body_checks::backend(fixture), pid);
 
-    // A credential refusal rolls back and releases its locks before the
+    // A credential refusal rolls back its transaction before the
     // same connection can authenticate the next presented credential.
     let failures = || {
         std::fs::read_to_string(fixture.root.join("server.log"))
@@ -113,7 +113,7 @@ pub(super) fn exercise(
                 td_mta::postgres_schema::MIGRATION_KEY
             )
         ),
-        "t"
+        "f"
     );
     assert_eq!(
         failures(),
@@ -144,16 +144,10 @@ pub(super) fn exercise(
             "UPDATE td_mta.schema_migrations SET store_epoch=decode('eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee','hex')".into(),
             format!("UPDATE td_mta.schema_migrations SET store_epoch=decode('{epoch}','hex')"),
         ),
-        (
-            "UPDATE td_mta.schema_migrations SET checksum=decode(repeat('00',32),'hex') WHERE version=1".into(),
-            format!("UPDATE td_mta.schema_migrations SET checksum=decode('{checksum}','hex') WHERE version=1"),
-        ),
-        ("ALTER ROLE mail_runtime CREATEDB".into(), "ALTER ROLE mail_runtime NOCREATEDB".into()),
-        ("GRANT TRUNCATE ON td_mta.blobs TO mail_runtime".into(), "REVOKE TRUNCATE ON td_mta.blobs FROM mail_runtime".into()),
         ("UPDATE td_mta.runtime_barrier SET blocked=true".into(), "UPDATE td_mta.runtime_barrier SET blocked=false".into()),
         (
-            "REVOKE EXECUTE ON FUNCTION pg_catalog.pg_advisory_unlock_shared(bigint) FROM PUBLIC".into(),
-            "GRANT EXECUTE ON FUNCTION pg_catalog.pg_advisory_unlock_shared(bigint) TO PUBLIC".into(),
+            "REVOKE SELECT ON td_mta.devices FROM mail_runtime".into(),
+            "GRANT SELECT ON td_mta.devices TO mail_runtime".into(),
         ),
     ] {
         let pid = body_checks::backend(fixture);
@@ -167,6 +161,24 @@ pub(super) fn exercise(
         sql(fixture, &restore);
         assert_eq!(authenticate(), Ok(Some(principal)));
         assert_ne!(body_checks::backend(fixture), pid);
+    }
+    // Full ledger and excess-privilege qualification belongs to connection
+    // admission. Supported schema/role changes stop serving instances first.
+    for (change, restore) in [
+        (
+            "UPDATE td_mta.schema_migrations SET checksum=decode(repeat('00',32),'hex') WHERE version=1".to_owned(),
+            format!("UPDATE td_mta.schema_migrations SET checksum=decode('{checksum}','hex') WHERE version=1"),
+        ),
+        ("ALTER ROLE mail_runtime CREATEDB".into(), "ALTER ROLE mail_runtime NOCREATEDB".into()),
+        ("GRANT TRUNCATE ON td_mta.blobs TO mail_runtime".into(), "REVOKE TRUNCATE ON td_mta.blobs FROM mail_runtime".into()),
+    ] {
+        let pid = body_checks::backend(fixture);
+        assert_eq!(auth.close(), Ok(()));
+        body_checks::closed(fixture, &pid);
+        sql(fixture, &change);
+        assert_eq!(authenticate(), Err(Error::Invalid), "{change}");
+        sql(fixture, &restore);
+        assert_eq!(authenticate(), Ok(Some(principal)));
     }
     let pid = body_checks::backend(fixture);
     assert_eq!(

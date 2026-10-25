@@ -1,8 +1,8 @@
 //! One fixed HTTPS authentication worker's finite, closed read transactions.
 use super::{connect_authenticated_until, Error, Input, Mode, Request, Worker, MAX_DURATION};
 use crate::{
-    device_credentials::Presented, http_auth::Principal, ports, postgres_runtime_profile::Binding,
-    postgres_schema, postgres_snapshot,
+    device_credentials::Presented, http_auth::Principal, ids::StoreEpoch, ports,
+    postgres_runtime_profile::Binding, postgres_schema, postgres_snapshot,
 };
 use std::{
     thread::{self, ThreadId},
@@ -54,6 +54,7 @@ pub(crate) struct AuthenticationSession {
     bounds: Bounds,
     retired: bool,
     clean_idle: bool,
+    epoch: StoreEpoch,
 }
 impl AuthenticationSession {
     pub(crate) fn open(
@@ -78,11 +79,21 @@ impl AuthenticationSession {
             LIFETIME,
         )?;
         worker.deadline = deadline;
+        let schema = worker.run(|client| {
+            Box::pin(async move {
+                let receipt = postgres_schema::lock_and_inspect(client)
+                    .await
+                    .map_err(|_| Error::RuntimeSchema)?;
+                super::qualify_runtime(client).await?;
+                Ok(receipt)
+            })
+        })??;
         Ok(Self {
             worker,
             bounds,
             retired: false,
             clean_idle: false,
+            epoch: schema.store_epoch,
         })
     }
     pub(crate) fn reusable(&self, deadline: Instant) -> bool {
@@ -128,14 +139,14 @@ impl AuthenticationSession {
         presented: Presented,
         deadline: Instant,
     ) -> Result<Principal, ports::Error> {
-        if self.retired {
+        if self.retired || binding.epoch() != self.epoch {
             return Err(ports::Error::Invalid);
         }
         self.clean_idle = false;
         self.bounds
             .admit(Instant::now(), deadline)
             .map_err(connection)?;
-        // Only acknowledged rollback and unlock permit a new job allowance.
+        // Only acknowledged rollback permits a new job allowance.
         // TLS and cumulative byte/frame/turn limits retain the session bounds.
         self.worker.deadline = deadline;
         self.worker.check().map_err(connection)?;
@@ -146,30 +157,26 @@ impl AuthenticationSession {
             .worker
             .run(|client| {
                 Box::pin(async move {
-                    // Acquire before BEGIN: a repeatable-read snapshot created
-                    // before the lock could retain a pre-migration ledger.
-                    let schema = postgres_schema::lock_and_inspect(client)
-                        .await.map_err(|_| ports::Error::Invalid)?;
-                    if schema.store_epoch != binding.epoch() {
-                        return Err(ports::Error::Invalid);
-                    }
-                    super::qualify_runtime(client).await.map_err(connection)?;
                     client.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL idle_in_transaction_session_timeout=10000")
                         .await.map_err(|_| ports::Error::Invalid)?;
+                    // The session migration lock protects the connect-time ledger
+                    // and role qualification. Fresh jobs still fence maintenance
+                    // and store replacement within their own read snapshot.
+                    let row = client.query_typed_one(
+                        "SELECT m.store_epoch,b.blocked FROM td_mta.schema_migrations m CROSS JOIN td_mta.runtime_barrier b WHERE m.version=1 AND b.singleton=true",
+                        &[],
+                    ).await.map_err(|_| ports::Error::Invalid)?;
+                    let epoch: &[u8] = row.try_get(0).map_err(|_| ports::Error::Invalid)?;
+                    let blocked: bool = row.try_get(1).map_err(|_| ports::Error::Invalid)?;
+                    if epoch != binding.epoch().as_bytes().as_slice() || blocked {
+                        return Err(ports::Error::Invalid);
+                    }
                     let authenticated = match postgres_snapshot::observe(client, &binding, presented).await {
                         Ok(_) => true,
                         Err(postgres_snapshot::Error::Unauthenticated) => false,
                         Err(_) => return Err(ports::Error::Invalid),
                     };
                     client.batch_execute("ROLLBACK").await.map_err(|_| ports::Error::Invalid)?;
-                    let unlocked: bool = client.query_typed_one(
-                        "SELECT pg_catalog.pg_advisory_unlock_shared($1)",
-                        &[(&postgres_schema::MIGRATION_KEY, tokio_postgres::types::Type::INT8)],
-                    ).await.map_err(|_| ports::Error::Invalid)?
-                        .try_get(0).map_err(|_| ports::Error::Invalid)?;
-                    if !unlocked {
-                        return Err(ports::Error::Invalid);
-                    }
                     Ok(authenticated.then_some(Principal { account: binding.account(), device }))
                 })
             })

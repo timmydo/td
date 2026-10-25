@@ -80,10 +80,12 @@ compatibility and retain it until closure. Retained Body/Envelope validators
 (sections 180 and 187) instead take the same key's shared transaction-level
 lock on each turn, fully revalidate schema/epoch and Runtime access before
 application reads, and acknowledge rollback before returning. The fixed HTTPS
-authentication worker (below) acquires the session lock once per job before
-opening its repeatable-read snapshot and explicitly acknowledges its unlock
-after rollback. Neither kind of idle retained connection holds a migration
-lock or grants authority to skip the next turn's qualification.
+authentication worker (below) acquires the session lock at connection admission,
+qualifies the schema and runtime role once, and retains that lock until closure.
+Its jobs still check epoch, maintenance, selected configuration and credentials
+in fresh snapshots, acknowledging rollback before reuse. Body/Envelope
+validators retain their per-turn qualification and release their migration
+locks between turns.
 The migrator takes the conflicting exclusive lock with a finite
 deadline and refuses while a serving session or validation turn holds a shared
 lock. After migration, a returning old process must reacquire the appropriate
@@ -2077,7 +2079,9 @@ COMMIT;
 
 This is a fresh-role setup, not repair of inherited or preexisting grants.
 Validate with the runtime connection specification afterward. Owner commands
-retain their separate credential. Before a schema upgrade, drain/stop all
+retain their separate credential. Drain/stop serving instances before changing
+their runtime role or privilege contract; reconnect requalifies it. Before a
+schema upgrade, drain/stop all
 instances and revoke runtime schema/table/column grants; the existing private
 migration ACL check still applies. Reapply the new version's exact grants and
 recheck before restart. Do not install default privileges on future tables.
@@ -2094,8 +2098,11 @@ operator commands. Runtime mode authenticates TLS/SCRAM, checks primary and
 durability settings, acquires the shared migration lock, validates the current
 schema and checks the dedicated runtime role/table privileges before admitting
 an operation's SQL. A new connection repeats all of those checks; a previous
-cold receipt never substitutes for them. The lock and connection remain held
-through the operation. BodyChecks instead authenticates at open and performs
+cold receipt never substitutes for them. Retained HTTPS authentication holds
+that qualification and migration lock for its finite connection lifetime,
+with fresh job fences as specified under Retained HTTPS authentication
+sessions. Other operation-owned connections hold the lock through their
+operation. BodyChecks instead authenticates at open and performs
 this qualification inside every closed validation transaction (sections 2 and
 180), before any Body queries. No prior turn supplies cached qualification.
 Mail helpers still enforce their own epoch, current configuration, device,
@@ -2298,29 +2305,23 @@ requests; PostgreSQL fixtures separately prove database revocation fences.
 
 ## 65. PostgreSQL HTTPS authentication adapter
 
-The prepared `postgres_http_auth::Authentication` implements the fixed HTTPS
-worker's credential interface. It resolves the protected bootstrap hostname
-anew on each lookup, forces runtime mode on every connection, and checks the
-selected profile, store epoch and device under one fresh primary snapshot.
-Only transport failures try another bounded resolved address. The connection
-and snapshot close before returning a device observation; later operations
-still require their own fresh authorization and publication fence.
+`postgres_http_auth::Authentication` implements the fixed HTTPS worker's
+credential interface. Its bounded registry selects an account binding, and
+fresh snapshots check configuration, store epoch, maintenance and device.
+The current connection lifecycle, connect-time qualification, idle recovery
+and finite reuse bounds are specified under Retained HTTPS authentication
+sessions. DNS runs on connection admission rather than on every lookup.
+Later operations require their own fresh authorization and publication fence.
 
-One atomic permit bounds concurrent lookup, including DNS; contention returns
-Busy without a queue. The original HTTPS deadline converts through the same
-RuntimeClock origin without a fresh allowance. A ten-second lookup ceiling
-and five-second DNS ceiling only shorten it. Results are refused after expiry.
-Malformed and inactive/wrong credentials return no device; configuration,
-schema, privilege and connection failures remain service errors, not invalid
-password observations. Errors carry no endpoint, secret or provider text.
-
-This adapter remains inactive until the runtime integration supplies its
-bootstrap, binding and shared clock. Service readiness/backoff and independent
-health/settlement capacity remain runtime integration obligations. The real PostgreSQL
-read fixture checks valid, malformed, wrong and revoked credentials, expired
-deadlines, rejection of owner credentials and subsequent successful lookup.
-A held table lock checks concurrent Busy refusal, finite lock failure and
-in-flight deadline expiry, followed by successful lookup after release.
+One nonblocking mutex bounds concurrent lookup, including DNS; contention
+returns Busy without a queue. The original HTTPS deadline converts through
+the same RuntimeClock origin without a fresh allowance. A ten-second lookup
+ceiling and five-second DNS ceiling only shorten it. Results are refused
+after expiry. Malformed and inactive/wrong credentials return no principal;
+configuration, schema, privilege and connection failures remain service
+errors, not invalid-password observations. Errors carry no endpoint, secret
+or provider text. The native fixture checks these distinctions, revocation,
+lock contention, deadlines and subsequent successful lookup.
 
 ## 66. Response retention without a mail database
 
@@ -5985,7 +5986,8 @@ one `(singleton=true, blocked=false)` row. A blocked or missing singleton
 refuses with the distinct maintenance error; query/type failures also refuse.
 
 This check applies to each new ordinary Runtime connection and retained
-validators' and HTTPS authentication turns' runtime qualification. It does not revoke already-admitted
+validators' runtime qualification. HTTPS authentication performs a fresh
+maintenance fence in each job snapshot. Neither check revokes already-admitted
 network I/O or make a previously captured snapshot see newer rows. Existing
 operations retain their original finite limits and migration locks. Owner
 Preparation schema inspection remains available while the barrier is set;
@@ -6554,26 +6556,32 @@ requests, shared by every configured account and origin. Its adapter binds to
 the first calling thread, uses a nonblocking mutex with no waiter queue, and
 refuses another thread. Credentials and account/device authority remain
 request-owned; the retained session caches neither authentication results nor
-configuration, schema, privilege or maintenance observations.
+configuration or maintenance observations. Full schema and Runtime-role
+qualification belongs to connection admission, protected by the shared
+session migration lock held until that connection closes.
 
-Each admitted job acquires the shared session migration lock once, inspects
-the complete schema ledger and expected epoch, and repeats primary/durability,
-Runtime-role, exact privilege and maintenance checks. Only then does it begin
-a new READ ONLY REPEATABLE READ transaction, observe the selected configuration,
-authenticate the presented device and check its account snapshot. Taking the
-session lock before BEGIN prevents a snapshot from retaining a pre-migration
-ledger after acquiring the barrier. This path calls no nested session-lock
-helper. Success requires acknowledged ROLLBACK, an acknowledged true result
-from the single matching advisory unlock, and a final deadline check. No
-transaction or migration/account lock survives between jobs. A wrong credential
-also requires acknowledged rollback, unlock and final checks before returning
-unauthenticated; that clean refusal retains the session without caching an
+Connection admission acquires the shared session migration lock once, inspects
+the complete schema ledger and qualifies primary/durability, Runtime-role,
+exact privileges and maintenance. Schema and role administration stops all
+serving instances first; it must not modify the protected contract behind a
+live connection. PostgreSQL continues to enforce each statement's privileges.
+The closed SQL surface cannot exploit newly added privileges. These checks
+repeat on every reconnect, including recovery after an idle disconnect.
+
+Each job begins a new READ ONLY REPEATABLE READ transaction. One typed query
+checks the pinned store epoch and current maintenance barrier; selected
+configuration, presented device and account snapshot remain freshly observed.
+The migration lock predates every job snapshot, preventing an upgrade from
+crossing connection qualification. Success and wrong-password refusal both
+require acknowledged ROLLBACK and final deadline/window checks. No transaction
+or account lock survives between jobs; the one shared migration lock does.
+Wrong-password refusals retain the clean connection without caching an
 authentication result. SQL failures, failed cleanup, expired jobs and framing
-failures retire the connection. Before submitting a later job, the adapter
-polls the clean idle driver without queuing SQL. An already-observable idle
-connection failure permits one fresh connection under the original deadline.
-A failure after job submission never silently retries the admitted job; a
-connection lost after the idle check can therefore still fail that request.
+failures retire it. Before submitting a later job, the adapter polls the clean
+idle driver without queuing SQL. An already-observable idle failure permits
+one fresh connection under the original deadline. No failure after job
+submission retries that job; a disconnect racing the idle check can still
+fail the request.
 
 A session admits at most 64 jobs within sixty seconds of creation. Each job
 keeps its own original deadline, capped at ten seconds including initial DNS,
@@ -6586,8 +6594,8 @@ is exhausted. This maintenance performs no authorization query, driver health
 poll or new task. A shutdown guard closes retained resources on that same
 worker before it exits, including early failure paths.
 
-Only a clean idle session whose job completed with acknowledged rollback,
-unlock and final checks may use a separate termination allowance. Consuming
+Only a clean idle session whose job completed with acknowledged rollback
+and final checks may use a separate termination allowance. Consuming
 retirement bounds that allowance by the caller deadline, original session
 expiry and the existing 100-ms driver cleanup ceiling. It cannot perform
 another job, renew TLS or replenish byte/frame windows. Failed or unfinished
@@ -6607,9 +6615,10 @@ covers the retained socket and TLS buffers, independently of account count.
 API reads, downloads, post-verification reauthorization and mutation connections
 retain their existing admission and teardown paths. This increment changes no
 write retry, uncertain-COMMIT or receipt-settlement behavior. Native fixtures
-check 64 jobs on one backend, rotation, idle lock release, wrong-thread refusal,
-fresh policy/schema/epoch/privilege/maintenance checks, failed unlock, revocation and disconnect
-retirement. A focused fixture reports cold and warm authentication times; those
+check 64 jobs on one backend, rotation, idle migration-lock retention and
+release on close, wrong-thread refusal, fresh policy/epoch/maintenance checks,
+statement privilege enforcement, cold ledger/excess-privilege qualification,
+credential refusals and idle disconnect recovery. A focused fixture reports cold and warm authentication times; those
 measurements do not establish end-to-end HTTP or download performance.
 
 

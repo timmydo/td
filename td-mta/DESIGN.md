@@ -2698,11 +2698,15 @@ only the initial observation; mutations and body admission keep their existing
 fresh authorization boundaries. The PostgreSQL verifier owns the database-backed device check. The backend contract requires bounded completion
 under the supplied deadline. Service shutdown joins the verifier along with
 the existing workers; database lookup must never run on the network reactor.
-The fixed PostgreSQL verifier retains one finite session across jobs. Each job
-repeats qualification and device authentication in a fresh transaction and
-acknowledges rollback before returning; idle sessions retain no migration lock
-or account authority. POSTGRES.md owns its lifetime, cumulative protocol
-allowances, thread ownership, retirement and reconnect rules.
+The fixed PostgreSQL verifier retains one finite session across jobs. It
+qualifies the complete schema and runtime role once at connection admission,
+holding the shared migration lock until that session closes. Schema and role
+administration stops serving instances first. Each job checks epoch,
+maintenance, configuration and device in a fresh transaction, and acknowledges
+rollback before returning success or a wrong-password refusal. Idle sessions
+retain no transaction or account authority. PostgreSQL still enforces each
+statement's privileges. POSTGRES.md owns the session's lifetime, cumulative
+protocol allowances, thread ownership, retirement and pre-submission recovery.
 The same authentication worker runs throttled local idle maintenance outside
 client-slot locks and closes retained resources before thread exit, including
 early failure paths. Neither hook performs authentication queries or starts a
