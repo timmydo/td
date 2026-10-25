@@ -1074,7 +1074,8 @@ impl JmapClient {
     }
 
     /// None is td-mta's deterministic interpretation refusal, never transport,
-    /// storage, work-budget or authentication failure.
+    /// storage or authentication failure. Aggregate work refusals split only
+    /// read-only ID batches; a singleton refusal remains an error.
     fn read_projection(
         &self,
         ids: &[String],
@@ -1103,6 +1104,29 @@ impl JmapClient {
             return EmailGetResponse::from_json(&method.1)
                 .map(|response| Some(response.list))
                 .map_err(JmapError::Parse);
+        }
+        if method.0 == "error"
+            && method.1.get("type").and_then(Json::as_str) == Some("serverFail")
+            && method.1.get("description").and_then(Json::as_str) == Some("storageWorkLimit")
+            && ids.len() > 1
+        {
+            let (left, right) = ids
+                .split_at_checked(ids.len() / 2)
+                .ok_or_else(|| JmapError::Api("Invalid read batch split".into()))?;
+            log_warn!(
+                "[JMAP] Splitting work-limited Email/get batch of {} into {} and {}",
+                ids.len(),
+                left.len(),
+                right.len()
+            );
+            let Some(mut emails) = self.read_projection(left, properties, bodies)? else {
+                return Ok(None);
+            };
+            let Some(mut tail) = self.read_projection(right, properties, bodies)? else {
+                return Ok(None);
+            };
+            emails.append(&mut tail);
+            return Ok(Some(emails));
         }
         if method.0 == "error"
             && method.1.get("type").and_then(Json::as_str) == Some("serverFail")

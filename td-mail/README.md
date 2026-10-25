@@ -523,7 +523,14 @@ single-message isolation. The unreadable message retains its stored identity,
 filing and date. Its subject and body remain absent; the window shows an
 unreadable notice and CLI JSON sets `unreadable: true`. Rules, spam annotation
 and automatic triage exclude it, and a later online open retries its content.
-Authentication, transport, storage and work-budget errors remain errors.
+Authentication, transport and other storage errors remain errors. A
+`serverFail/storageWorkLimit` on a multi-message read splits its ID batch
+in half, preserving the requested fields and order. Splitting stops at one
+message: a singleton refusal is still an error, never an unreadable placeholder.
+Each original batch has at most 50 IDs, so work-limit recovery performs at
+most 99 read requests, including the original, and logs every split. Interpretation refusal during
+recovery still uses the separate single-message isolation below. Only
+read projections use this recovery; mutations are never replayed by it.
 
 CLI JSON also exposes the original `blob_id`. Pass that value to
 `download_attachment` with a unique `name` ending in `.eml` and

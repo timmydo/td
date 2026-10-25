@@ -1351,13 +1351,40 @@ fn unreadable_message_isolated_without_hiding_its_batch() {
 }
 
 #[test]
-fn storage_work_refusal_does_not_trigger_message_recovery() {
+fn singleton_work_refusal_remains_an_error_after_bounded_splitting() {
     let mut h = CliHarness::start();
     assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
     h.server().refuse_read("email-001", "storageWorkLimit");
     let response = h.send(json!({"command":"query_emails", "mailbox_id":"mbox-inbox", "limit":50}));
     assert!(!response["ok"].is_true(), "{response}");
-    assert_eq!(h.server().read_calls().len(), 1);
+    let calls = h.server().read_calls();
+    assert!(calls.len() <= 7);
+    assert_eq!(calls.last().unwrap()["ids"].as_array().unwrap().len(), 1);
+    assert!(calls.iter().all(|call| call["properties"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|property| property.as_str() == Some("subject"))));
+}
+
+#[test]
+fn aggregate_work_refusal_splits_reads_without_losing_messages() {
+    let mut h = CliHarness::start();
+    h.server().seed_large_thread(50);
+    h.server().limit_read_batch(1);
+    assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
+    let response = h.send(json!({"command":"get_thread", "thread_id":"large-thread"}));
+    assert!(response["ok"].is_true(), "{response}");
+    let emails = response["emails"].as_array().unwrap();
+    assert_eq!(emails.len(), 50);
+    for (index, email) in emails.iter().enumerate() {
+        assert_eq!(
+            email["id"].as_str(),
+            Some(format!("large-{index:04}").as_str())
+        );
+        assert!(!email["unreadable"].is_true());
+    }
+    assert_eq!(h.server().read_calls().len(), 99);
 }
 
 #[test]

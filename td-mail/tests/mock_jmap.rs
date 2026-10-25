@@ -76,6 +76,7 @@ struct MockState {
     mailbox_create_mode: u8,
     omit_filing_field: Option<String>,
     read_refusal: Option<(String, String)>,
+    read_batch_limit: Option<usize>,
     refuse_stored: bool,
     read_calls: Vec<Value>,
     flag_refusal: Option<String>,
@@ -241,6 +242,7 @@ impl MockState {
             mailbox_create_mode: 0,
             omit_filing_field: None,
             read_refusal: None,
+            read_batch_limit: None,
             refuse_stored: false,
             read_calls: Vec::new(),
             flag_refusal: None,
@@ -781,6 +783,10 @@ impl MockJmapServer {
     }
 
     #[allow(dead_code)]
+    pub fn limit_read_batch(&self, maximum: usize) {
+        self.state.lock().unwrap().read_batch_limit = Some(maximum);
+    }
+
     pub fn refuse_read(&self, id: &str, description: &str) {
         let mut state = self.state.lock().unwrap();
         state.read_refusal = Some((id.into(), description.into()));
@@ -1241,31 +1247,39 @@ impl MockJmapServer {
                     let refused = {
                         let mut guard = state.lock().unwrap();
                         guard.read_calls.push(args.clone());
-                        guard.read_refusal.as_ref().and_then(|(id, reason)| {
-                            let stored = [
-                                "id",
-                                "blobId",
-                                "threadId",
-                                "receivedAt",
-                                "size",
-                                "keywords",
-                                "mailboxIds",
-                            ];
-                            let derived = args["properties"].as_array().is_none_or(|properties| {
-                                properties
-                                    .iter()
-                                    .any(|p| !stored.contains(&p.as_str().unwrap_or("")))
-                            });
-                            if !requested_ids.contains(&id.as_str()) {
-                                None
-                            } else if derived {
-                                Some(reason.clone())
-                            } else if guard.refuse_stored {
-                                Some("storageWorkLimit".into())
-                            } else {
-                                None
-                            }
-                        })
+                        if guard
+                            .read_batch_limit
+                            .is_some_and(|limit| requested_ids.len() > limit)
+                        {
+                            Some("storageWorkLimit".into())
+                        } else {
+                            guard.read_refusal.as_ref().and_then(|(id, reason)| {
+                                let stored = [
+                                    "id",
+                                    "blobId",
+                                    "threadId",
+                                    "receivedAt",
+                                    "size",
+                                    "keywords",
+                                    "mailboxIds",
+                                ];
+                                let derived =
+                                    args["properties"].as_array().is_none_or(|properties| {
+                                        properties
+                                            .iter()
+                                            .any(|p| !stored.contains(&p.as_str().unwrap_or("")))
+                                    });
+                                if !requested_ids.contains(&id.as_str()) {
+                                    None
+                                } else if derived {
+                                    Some(reason.clone())
+                                } else if guard.refuse_stored {
+                                    Some("storageWorkLimit".into())
+                                } else {
+                                    None
+                                }
+                            })
+                        }
                     };
                     if let Some(reason) = refused {
                         json!(["error", {"type":"serverFail", "description":reason}, call_id])
