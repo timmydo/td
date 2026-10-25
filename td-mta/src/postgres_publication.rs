@@ -4,7 +4,7 @@ use crate::{
     postgres_configuration::SharedQuotas,
 };
 use std::time::Instant;
-use tokio_postgres::Client;
+use tokio_postgres::{types::Type, Client};
 
 pub(crate) const CHUNK: usize = 65536;
 
@@ -27,7 +27,7 @@ pub(crate) async fn charge(
     caps: SharedQuotas,
     charges: [u64; 5],
 ) -> Result<Usage, Error> {
-    let usage = client.query_one("SELECT body_bytes,blob_count,upload_bytes,queue_bytes,queue_submissions FROM td_mta.account_usage WHERE account=$1", &[&account.as_bytes().as_slice()]).await.map_err(|_| Error::Database)?;
+    let usage = client.query_typed_one("SELECT body_bytes,blob_count,upload_bytes,queue_bytes,queue_submissions FROM td_mta.account_usage WHERE account=$1", &[(&account.as_bytes().as_slice(), Type::BYTEA)]).await.map_err(|_| Error::Database)?;
     let limits = [
         caps.body_bytes,
         caps.blob_count,
@@ -57,7 +57,7 @@ impl Usage {
     /// Publish only in the same account transaction that computed the charge.
     pub(crate) async fn publish(self, client: &Client, account: AccountId) -> Result<(), Error> {
         let [body, blobs, uploads, queue, submissions] = self.0;
-        if client.execute("UPDATE td_mta.account_usage SET body_bytes=$2,blob_count=$3,upload_bytes=$4,queue_bytes=$5,queue_submissions=$6 WHERE account=$1", &[&account.as_bytes().as_slice(),&body,&blobs,&uploads,&queue,&submissions]).await.map_err(|_|Error::Database)?!=1 { return Err(Error::Integrity); }
+        if client.execute_typed("UPDATE td_mta.account_usage SET body_bytes=$2,blob_count=$3,upload_bytes=$4,queue_bytes=$5,queue_submissions=$6 WHERE account=$1", &[(&account.as_bytes().as_slice(), Type::BYTEA),(&body, Type::INT8),(&blobs, Type::INT8),(&uploads, Type::INT8),(&queue, Type::INT8),(&submissions, Type::INT8)]).await.map_err(|_|Error::Database)?!=1 { return Err(Error::Integrity); }
         Ok(())
     }
 }
@@ -86,9 +86,9 @@ pub(crate) async fn write_blob(
     let length = i64::try_from(value.bytes.len()).map_err(|_| Error::Capacity)?;
     let chunks = i64::try_from(value.bytes.len().div_ceil(CHUNK)).map_err(|_| Error::Capacity)?;
     if client
-        .execute(
+        .execute_typed(
             "INSERT INTO td_mta.blob_ids VALUES($1,$2) ON CONFLICT DO NOTHING",
-            &[&account, &blob],
+            &[(&account, Type::BYTEA), (&blob, Type::BYTEA)],
         )
         .await
         .map_err(|_| Error::Database)?
@@ -97,16 +97,16 @@ pub(crate) async fn write_blob(
         return Err(Error::Conflict);
     }
     if client
-        .execute(
+        .execute_typed(
             "INSERT INTO td_mta.blobs VALUES($1,$2,$3,$4,$5,$6,$7)",
             &[
-                &account,
-                &blob,
-                &length,
-                &value.digest.as_slice(),
-                &value.created_at,
-                &value.changed.to_be_bytes().as_slice(),
-                &chunks,
+                (&account, Type::BYTEA),
+                (&blob, Type::BYTEA),
+                (&length, Type::INT8),
+                (&value.digest.as_slice(), Type::BYTEA),
+                (&value.created_at, Type::INT8),
+                (&value.changed.to_be_bytes().as_slice(), Type::BYTEA),
+                (&chunks, Type::INT8),
             ],
         )
         .await
@@ -124,7 +124,7 @@ pub(crate) async fn write_blob(
         batch.clear();
         batch.extend(bytes.chunks(CHUNK));
         let ordinal = i64::try_from(index * 8).map_err(|_| Error::Capacity)?;
-        if client.execute("INSERT INTO td_mta.blob_chunks SELECT $1,$2,$3+ordinality-1,bytes FROM unnest($4::bytea[]) WITH ORDINALITY chunks(bytes,ordinality)", &[&account,&blob,&ordinal,&batch]).await.map_err(|_|Error::Database)?!=batch.len() as u64 { return Err(Error::Integrity); }
+        if client.execute_typed("INSERT INTO td_mta.blob_chunks SELECT $1,$2,$3+ordinality-1,bytes FROM unnest($4::bytea[]) WITH ORDINALITY chunks(bytes,ordinality)", &[(&account, Type::BYTEA),(&blob, Type::BYTEA),(&ordinal, Type::INT8),(&batch, Type::BYTEA_ARRAY)]).await.map_err(|_|Error::Database)?!=batch.len() as u64 { return Err(Error::Integrity); }
     }
     Ok(())
 }
@@ -141,7 +141,7 @@ pub(crate) async fn select_thread(
         .try_reserve_exact(requested.len())
         .map_err(|_| Error::Capacity)?;
     anchors.extend(requested.iter().map(String::as_str));
-    let rows=client.query("SELECT a.email_id,e.thread_id,a.changed,e.changed,t.changed FROM unnest($2::text[]) WITH ORDINALITY requested(message_id,position) JOIN LATERAL (SELECT email_id,changed FROM td_mta.thread_anchors WHERE account=$1 AND message_id=requested.message_id ORDER BY email_id LIMIT 1) a ON true LEFT JOIN td_mta.emails e ON e.account=$1 AND e.id=a.email_id LEFT JOIN td_mta.threads t ON t.account=e.account AND t.id=e.thread_id ORDER BY requested.position LIMIT 1", &[&account.as_bytes().as_slice(),&anchors]).await.map_err(|_|Error::Database)?;
+    let rows=client.query_typed("SELECT a.email_id,e.thread_id,a.changed,e.changed,t.changed FROM unnest($2::text[]) WITH ORDINALITY requested(message_id,position) JOIN LATERAL (SELECT email_id,changed FROM td_mta.thread_anchors WHERE account=$1 AND message_id=requested.message_id ORDER BY email_id LIMIT 1) a ON true LEFT JOIN td_mta.emails e ON e.account=$1 AND e.id=a.email_id LEFT JOIN td_mta.threads t ON t.account=e.account AND t.id=e.thread_id ORDER BY requested.position LIMIT 1", &[(&account.as_bytes().as_slice(), Type::BYTEA),(&anchors, Type::TEXT_ARRAY)]).await.map_err(|_|Error::Database)?;
     let Some(row) = rows.first() else {
         return Ok((fresh, true));
     };
