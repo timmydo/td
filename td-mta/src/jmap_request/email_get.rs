@@ -228,6 +228,7 @@ impl Worker<'_, '_, '_, '_, '_> {
         if account.wire_id()?.local() != Some(self.account) {
             return Err(Error::AccountNotFound);
         }
+        let started = std::time::Instant::now();
         let mut read = self.read.take();
         let result = (|| {
             let mut view = View::Postgres(super::reborrow_read(
@@ -373,6 +374,30 @@ impl Worker<'_, '_, '_, '_, '_> {
             Ok(start..end)
         })();
         self.read = read;
+        crate::performance::record(
+            crate::performance::Phase::JmapEmailGet,
+            started.elapsed(),
+            if result.is_ok() {
+                crate::performance::Outcome::Success
+            } else {
+                crate::performance::Outcome::Failed
+            },
+        );
+        if let Some(stop) = work.stopped() {
+            use crate::{admission::work::Stop, performance::Phase};
+            let phase = match stop {
+                Stop::IoBytes => Phase::JmapWorkIo,
+                Stop::Records => Phase::JmapWorkRecords,
+                Stop::OutputBytes => Phase::JmapWorkOutput,
+                Stop::Deadline => Phase::JmapWorkDeadline,
+                Stop::Unlinks => Phase::JmapWorkOther,
+            };
+            crate::performance::record(
+                phase,
+                started.elapsed(),
+                crate::performance::Outcome::Failed,
+            );
+        }
         result
     }
 }

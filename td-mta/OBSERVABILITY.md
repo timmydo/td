@@ -377,16 +377,17 @@ can create gaps. Returned JSON remains data, never executable instructions.
 ## Performance summaries
 
 The service records fixed process-local counters at operation boundaries, never
-per byte or poll. After one initial minute, then hourly, the diagnostic writer
+per byte or poll. The counter table is bounded to 4 KiB (2,376 bytes on the
+current x86-64 host); status encoding remains bounded to 8 KiB. After one initial minute, then hourly, the diagnostic writer
 submits one `performance` event for each changed phase. Each phase has its own fixed rate bucket; neither
 addresses, account IDs, object IDs, URLs nor SQL can create labels. The same queue,
 severity filter, global ingestion limit, retention ring and physical-pressure
 stop apply. There is no synchronous journal fallback and no per-request event
 flood. These info records require `minimum_severity = info`. Additional summaries
 can shorten history under the existing ring; 30 days remains an age ceiling,
-not a guaranteed retention interval. At the current 27-phase ceiling, four
-profiles add at most 2,592 hourly summary rows per day (plus initial snapshots).
-The 65,536-row ring can hold about 25 days of those rows alone; other events,
+not a guaranteed retention interval. At the current 33-phase ceiling, four
+profiles add at most 3,168 hourly summary rows per day (plus initial snapshots).
+The 65,536-row ring can hold about 20 days of those rows alone; other events,
 frequent restarts and physical pressure can shorten that interval.
 
 Each sample is a cumulative process observation: `calls` counts finished spans,
@@ -445,6 +446,8 @@ It is not exposed over public HTTP and supplies no mutation operation.
 | `smtp_admission` | One storage-worker admission attempt, including database readiness; retry is busy |
 | `smtp_data` | Successful DATA admission through recognition of its terminating dot, including the 354 reply, peer arrival and network scheduling; retirement or refusal before completion counts as failure |
 | `smtp_commit_wait` | Completed DATA queued through the first storage-worker publication attempt; expiry or retirement before service counts as failure; excludes later busy retry delays |
+| `jmap_email_get` | Email/get projection time after argument validation through retained result publication; failed JMAP methods count even when the enclosing HTTP response is 200 |
+| `jmap_work_io`, `jmap_work_records`, `jmap_work_output`, `jmap_work_deadline`, `jmap_work_other` | Email/get projections whose shared MIME work meter stopped, split by its sticky reason; duration is the whole projection. Other storage capacity failures do not increment these counters. No message IDs or content are retained. |
 | `smtp_prepare` | Resident SMTP input validation, header preparation and digests for the complete account fanout; excludes DNS and database publication |
 | `smtp_publish` | SMTP receipt inspection and database publication; one-shot paths include connection setup and pre-effect address fallback, while retained SMTP session setup is measured by `db_connect` inside `smtp_commit`; an unknown COMMIT outcome counts as failure without changing settlement or replay policy |
 | `smtp_commit` | One storage-worker preparation/publication attempt; known durable success remains success even when ancillary cleanup stops service |
@@ -471,7 +474,7 @@ sum them as independent components**. Compare their counts and means to isolate
 connection setup, repeated qualification, body work and waiting; subtract only
 when the nesting and matching sample population are known.
 
-The fixed metrics table is below 2 KiB. Recording uses a try-lock on one fixed
+Recording uses a try-lock on one fixed
 cell, without allocation, I/O or waiting; contention loses only a diagnostic
 observation. The logger retains one fixed previous-sample array. Neither metrics
 nor their loss can renew a deadline, retry a mutation, hold account authority or

@@ -35,6 +35,12 @@ pub enum Phase {
     SmtpCommitWait,
     SmtpPrepare,
     SmtpPublish,
+    JmapEmailGet,
+    JmapWorkIo,
+    JmapWorkRecords,
+    JmapWorkOutput,
+    JmapWorkDeadline,
+    JmapWorkOther,
 }
 impl Phase {
     pub const ALL: &'static [Self] = &[
@@ -65,6 +71,12 @@ impl Phase {
         Self::SmtpCommitWait,
         Self::SmtpPrepare,
         Self::SmtpPublish,
+        Self::JmapEmailGet,
+        Self::JmapWorkIo,
+        Self::JmapWorkRecords,
+        Self::JmapWorkOutput,
+        Self::JmapWorkDeadline,
+        Self::JmapWorkOther,
     ];
     pub const fn code(self) -> &'static str {
         match self {
@@ -95,6 +107,12 @@ impl Phase {
             Self::SmtpCommitWait => "smtp_commit_wait",
             Self::SmtpPrepare => "smtp_prepare",
             Self::SmtpPublish => "smtp_publish",
+            Self::JmapEmailGet => "jmap_email_get",
+            Self::JmapWorkIo => "jmap_work_io",
+            Self::JmapWorkRecords => "jmap_work_records",
+            Self::JmapWorkOutput => "jmap_work_output",
+            Self::JmapWorkDeadline => "jmap_work_deadline",
+            Self::JmapWorkOther => "jmap_work_other",
         }
     }
 }
@@ -344,7 +362,7 @@ mod tests {
     }
     #[test]
     fn phase_table_is_complete_unique_and_small() {
-        assert!(std::mem::size_of_val(&CELLS) <= 2048);
+        assert!(std::mem::size_of_val(&CELLS) <= 4096);
         for (index, phase) in Phase::ALL.iter().enumerate() {
             assert_eq!(*phase as usize, index);
             assert_eq!(
