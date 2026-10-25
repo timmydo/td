@@ -866,7 +866,7 @@ impl Https<'_> {
                                         .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
                                         .is_err()
                                     {
-                                        429
+                                        body_busy()
                                     } else {
                                         client.body_slot = true;
                                         client.principal = Some(principal);
@@ -884,7 +884,7 @@ impl Https<'_> {
                                         .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
                                         .is_err()
                                     {
-                                        429
+                                        body_busy()
                                     } else {
                                         client.body_slot = true;
                                         client.principal = Some(principal);
@@ -904,6 +904,7 @@ impl Https<'_> {
                                         .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
                                         .is_err()
                                     {
+                                        let status = body_busy();
                                         control.log(
                                             crate::observability::Kind::AdmissionRefused {
                                                 reason: crate::observability::Refusal::Capacity,
@@ -911,7 +912,7 @@ impl Https<'_> {
                                             None,
                                             None,
                                         );
-                                        return self.respond_body(client, 429, time.utc_ms,
+                                        return self.respond_body(client, status, time.utc_ms,
                                             br#"{"type":"urn:ietf:params:jmap:error:limit","status":429,"limit":"maxConcurrentRequests"}"#).map(|()| true);
                                     } else {
                                         client.body_slot = true;
@@ -1475,6 +1476,15 @@ impl Https<'_> {
         Ok(())
     }
 }
+fn body_busy() -> u16 {
+    crate::performance::record(
+        crate::performance::Phase::HttpBodyBusy,
+        Duration::ZERO,
+        crate::performance::Outcome::Busy,
+    );
+    429
+}
+
 fn request_phase(target: &str) -> crate::performance::Phase {
     use crate::performance::Phase;
     match target {

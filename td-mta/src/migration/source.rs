@@ -505,6 +505,9 @@ mod fallback_tests {
     use super::*;
     #[test]
     fn request_pacing_stays_below_peer_limit_without_renewing_deadline() {
+        let _serial = crate::generations::TEST_CONSTRUCTION_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let start = Instant::now();
         let deadline = start + Duration::from_secs(60);
         let peer = std::net::IpAddr::from([127, 0, 0, 1]);

@@ -752,6 +752,7 @@ fn download_failures_release_shared_slot_and_shutdown_joins_streaming() {
                 let mut blocked = client(address, &lease, clock.clone());
                 send(&mut blocked, get.as_bytes());
                 wait(|| late.entered.load(Ordering::Acquire));
+                let busy_before = crate::performance::snapshot(crate::performance::Phase::HttpBodyBusy).unwrap();
                 let mut upload = client(address, &lease, clock.clone());
                 let post = format!(
                     "POST /jmap/upload/{account} HTTP/1.1\r\nHost: localhost:{}\r\n\
@@ -792,6 +793,16 @@ fn download_failures_release_shared_slot_and_shutdown_joins_streaming() {
                     assert!(refused.1.lines().any(|line| line == "Retry-After: 1"));
                     other.abort();
                 }
+                let busy_after = crate::performance::snapshot(crate::performance::Phase::HttpBodyBusy).unwrap();
+                assert_eq!(busy_after.calls - busy_before.calls, 5);
+                assert_eq!(busy_after.busy - busy_before.busy, 5);
+                assert_eq!(busy_after.total_us, 0);
+                let mut abandoned = client(address, &lease, clock.clone());
+                send(&mut abandoned, api_head.as_bytes());
+                wait(|| crate::performance::snapshot(crate::performance::Phase::HttpBodyBusy)
+                    .is_some_and(|sample| sample.calls == busy_after.calls + 1));
+                // The decision is observable without consuming the refusal response.
+                abandoned.abort();
                 late.release.store(true, Ordering::Release);
                 wait(|| matches!(api.read(&mut bytes), Ok(IoProgress::Closed) | Err(_)));
                 std::thread::sleep(Duration::from_millis(30));

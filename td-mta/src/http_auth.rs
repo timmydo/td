@@ -173,6 +173,17 @@ impl Default for Attempts {
 }
 impl Attempts {
     pub fn admit(&mut self, address: IpAddr, monotonic_ms: u64) -> bool {
+        let admitted = self.try_admit(address, monotonic_ms);
+        if !admitted {
+            crate::performance::record(
+                crate::performance::Phase::HttpAuthRefused,
+                std::time::Duration::ZERO,
+                crate::performance::Outcome::Busy,
+            );
+        }
+        admitted
+    }
+    fn try_admit(&mut self, address: IpAddr, monotonic_ms: u64) -> bool {
         let second = monotonic_ms / 1000;
         if second < self.second {
             return false;
@@ -261,7 +272,13 @@ mod tests {
         }
     }
     #[test]
+    #[allow(clippy::unwrap_used)]
     fn rate_windows_bound_global_and_peer_work() {
+        let _serial = crate::generations::TEST_CONSTRUCTION_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let before =
+            crate::performance::snapshot(crate::performance::Phase::HttpAuthRefused).unwrap();
         let mut attempts = Attempts::default();
         let ip = IpAddr::from([127, 0, 0, 1]);
         for _ in 0..PEER_ATTEMPTS {
@@ -276,5 +293,10 @@ mod tests {
         assert!(!attempts.admit(IpAddr::from([127, 0, 0, 9]), 999));
         assert!(attempts.admit(ip, 1000));
         assert!(!attempts.admit(ip, 999));
+        let after =
+            crate::performance::snapshot(crate::performance::Phase::HttpAuthRefused).unwrap();
+        assert!(after.calls >= before.calls + 3);
+        assert_eq!(after.busy - before.busy, after.calls - before.calls);
+        assert_eq!(after.total_us, 0);
     }
 }

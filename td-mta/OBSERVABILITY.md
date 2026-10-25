@@ -384,9 +384,9 @@ severity filter, global ingestion limit, retention ring and physical-pressure
 stop apply. There is no synchronous journal fallback and no per-request event
 flood. These info records require `minimum_severity = info`. Additional summaries
 can shorten history under the existing ring; 30 days remains an age ceiling,
-not a guaranteed retention interval. At the current 21-phase ceiling, four
-profiles add at most 2,016 hourly summary rows per day (plus initial snapshots).
-The 65,536-row ring can hold about 32 days of those rows alone; other events,
+not a guaranteed retention interval. At the current 23-phase ceiling, four
+profiles add at most 2,208 hourly summary rows per day (plus initial snapshots).
+The 65,536-row ring can hold about 29 days of those rows alone; other events,
 frequent restarts and physical pressure can shorten that interval.
 
 Each sample is a cumulative process observation: `calls` counts finished spans,
@@ -427,6 +427,8 @@ It is not exposed over public HTTP and supplies no mutation operation.
 | `http_session`, `http_api`, `http_download`, `http_upload` | Complete parsed head through final response flush, including authentication queue/lookup and worker waiting; excludes TCP/TLS and header arrival |
 | `http_other` | Other parsed endpoints; event streams measure preparation only, not stream lifetime |
 | `http_tls` | First observed TCP input through TLS handshake completion, including handshake admission waiting; excludes silent accepted sockets and TCP establishment. Retirement before completion counts as failure |
+| `http_body_busy` | Zero-duration decisions refusing an upload, download or API request because the shared body/API slot is occupied; recorded before attempting the response |
+| `http_auth_refused` | Zero-duration authentication-attempt admission refusals: per-peer/global rate bounds, full peer table or backwards admission clock; recorded before attempting the response |
 | `http_auth` | One authentication worker attempt, including credential parsing and database authorization |
 | `db_resolve` | The owned resolver helper and its complete reply |
 | `db_connect` | One attempted PostgreSQL connection, including local TLS setup, TCP and startup; excludes DNS and runtime qualification |
@@ -443,7 +445,10 @@ It is not exposed over public HTTP and supplies no mutation operation.
 | `smtp_admission` | One storage-worker admission attempt, including database readiness; retry is busy |
 | `smtp_commit` | One storage-worker preparation/publication attempt; known durable success remains success even when ancillary cleanup stops service |
 
-HTTP `busy` means a flushed 429 response and `unavailable` means a flushed 503.
+For timed HTTP endpoint spans, `busy` means a flushed 429 response and
+`unavailable` means a flushed 503. The two zero-duration admission counters
+record `busy` at the refusal decision even if the peer disconnects before
+response completion. They explain these two causes, not every possible 429.
 Other outer HTTP refusals, interrupted requests and unfinished spans count as
 failures. A streamed API completion counts as success even for its HTTP400
 request-problem response; this aggregate is not a complete HTTP status ledger.
