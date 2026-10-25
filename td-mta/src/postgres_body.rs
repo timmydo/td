@@ -236,7 +236,12 @@ pub fn with_pinned_blob<T>(
         let mut pin =
             crate::store_fs::PinnedBlob::from_verified(&mut body, metadata.blob, metadata.body)
                 .map_err(Error::Read)?;
+        let mut timing = crate::performance::Timer::start(crate::performance::Phase::BodyReplay);
         let result = read(metadata, &mut pin);
+        if result.is_ok() {
+            timing.succeeded();
+        }
+        drop(timing);
         pin.check_deadline().map_err(Error::Read)?;
         drop(pin);
         body.check().map_err(Error::Read)?;
@@ -521,6 +526,7 @@ impl Body<'_> {
     }
 
     fn verify(&mut self) -> Result<(), ports::Error> {
+        let mut timing = crate::performance::Timer::start(crate::performance::Phase::BodyVerify);
         let mut digest = Provider.sha256()?;
         let chunks = self.len().div_ceil(CHUNK);
         let mut start = 0;
@@ -538,7 +544,9 @@ impl Body<'_> {
         if !Provider.equal_digest(&digest.finish()?, &self.metadata.body.digest) {
             return Err(ports::Error::Corrupt);
         }
-        self.check()
+        self.check()?;
+        timing.succeeded();
+        Ok(())
     }
 
     fn read(&mut self, offset: u64, output: &mut [u8]) -> Result<usize, ports::Error> {

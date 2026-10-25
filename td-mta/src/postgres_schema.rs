@@ -217,6 +217,7 @@ pub fn inspect(
 
 /// The caller must retain this same session through all application SQL.
 pub(crate) async fn lock_and_inspect(client: &Client) -> Result<Receipt, Error> {
+    let mut timing = crate::performance::Timer::start(crate::performance::Phase::DbSchema);
     version(client).await?;
     let locked: bool = client
         .query_one(
@@ -230,7 +231,11 @@ pub(crate) async fn lock_and_inspect(client: &Client) -> Result<Receipt, Error> 
     if !locked {
         return Err(Error::Busy);
     }
-    ledger(client, true).await
+    let result = ledger(client, true).await;
+    if result.is_ok() {
+        timing.succeeded();
+    }
+    result
 }
 
 // Caller has begun a transaction; its acknowledged rollback releases this
@@ -247,6 +252,7 @@ pub(crate) async fn lock_exclusive_transaction_and_inspect(
 }
 
 async fn lock_transaction(client: &Client, exclusive: bool) -> Result<Receipt, Error> {
+    let mut timing = crate::performance::Timer::start(crate::performance::Phase::DbSchema);
     version(client).await?;
     let locked: bool = client
         .query_typed_one(
@@ -264,7 +270,11 @@ async fn lock_transaction(client: &Client, exclusive: bool) -> Result<Receipt, E
     if !locked {
         return Err(Error::Busy);
     }
-    ledger(client, true).await
+    let result = ledger(client, true).await;
+    if result.is_ok() {
+        timing.succeeded();
+    }
+    result
 }
 
 async fn ledger(client: &Client, require_current: bool) -> Result<Receipt, Error> {

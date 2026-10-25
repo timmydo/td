@@ -440,13 +440,18 @@ fn connect_worker_bounded(
 }
 
 pub(crate) async fn qualify_runtime(client: &tokio_postgres::Client) -> Result<(), Error> {
-    crate::postgres_runtime_access::qualify(client)
+    let mut timing = crate::performance::Timer::start(crate::performance::Phase::DbRuntime);
+    let result = crate::postgres_runtime_access::qualify(client)
         .await
         .map_err(|error| match error {
             crate::postgres_runtime_access::Error::Role => Error::RuntimeRole,
             crate::postgres_runtime_access::Error::Maintenance => Error::RuntimeMaintenance,
             _ => Error::RuntimePrivileges,
-        })
+        });
+    if result.is_ok() {
+        timing.succeeded();
+    }
+    result
 }
 
 fn connect_authenticated(
@@ -467,6 +472,7 @@ fn connect_authenticated_bounded(
     input: Input,
     maximum: Duration,
 ) -> Result<Worker, Error> {
+    let mut timing = crate::performance::Timer::start(crate::performance::Phase::DbConnect);
     let allowance = remaining(deadline)?;
     let connect_deadline = deadline.min(Instant::now() + MAX_DURATION);
     if allowance > maximum
@@ -492,8 +498,11 @@ fn connect_authenticated_bounded(
         ClientConfig::new(trust, tls_clock, TlsProtocol::Postgres).map_err(|_| Error::Tls)?,
     );
     let session = TlsSession::client(policy, request.server_name).map_err(|_| Error::Tls)?;
+    let mut tcp_timing = crate::performance::Timer::start(crate::performance::Phase::DbTcp);
     let socket = TcpStream::connect_timeout(&request.address, remaining(connect_deadline)?)
         .map_err(|_| Error::Transport)?;
+    tcp_timing.succeeded();
+    drop(tcp_timing);
     let activity = Arc::new(AtomicBool::new(false));
     let transport = Network {
         transport: TcpTransport::from_stream(socket).map_err(|_| Error::Transport)?,
@@ -525,6 +534,8 @@ fn connect_authenticated_bounded(
     };
     let waker = Waker::from(Arc::new(WorkerWake(thread::current())));
     let mut context = Context::from_waker(&waker);
+    let mut handshake_timing =
+        crate::performance::Timer::start(crate::performance::Phase::DbHandshake);
     let mut connect = pin!(config.connect_raw(Io::new(transport, false), connector));
     let (client, connection) = loop {
         remaining(connect_deadline)?;
@@ -536,6 +547,9 @@ fn connect_authenticated_bounded(
             thread::park_timeout(Duration::from_millis(1));
         }
     };
+    handshake_timing.succeeded();
+    drop(handshake_timing);
+    timing.succeeded();
     Ok(Worker {
         client: Some(client),
         connection: Box::pin(connection),
@@ -616,6 +630,7 @@ impl Worker {
             &'a tokio_postgres::Client,
         ) -> Pin<Box<dyn Future<Output = T> + 'a>>,
     ) -> Result<T, Error> {
+        let mut timing = crate::performance::Timer::start(crate::performance::Phase::DbWork);
         if let Some(error) = self.failed {
             return Err(error);
         }
@@ -639,6 +654,7 @@ impl Worker {
                 if let Some(window) = audit_window {
                     window.finish().map_err(|_| Error::Database)?;
                 }
+                timing.succeeded();
                 return Ok(result);
             }
             match self.connection.as_mut().poll_message(&mut context) {
@@ -657,6 +673,7 @@ impl Worker {
 
 impl Drop for Worker {
     fn drop(&mut self) {
+        let mut timing = crate::performance::Timer::start(crate::performance::Phase::DbClose);
         // Releasing the last sender lets the driver drain responses and send
         // Terminate. Cleanup must neither renew a job nor alter its outcome.
         drop(self.client.take());
@@ -670,7 +687,11 @@ impl Drop for Worker {
         while Instant::now() < until {
             self.activity.store(false, Ordering::Relaxed);
             match self.connection.as_mut().poll_message(&mut context) {
-                Poll::Ready(None) | Poll::Ready(Some(Err(_))) => return,
+                Poll::Ready(None) => {
+                    timing.succeeded();
+                    return;
+                }
+                Poll::Ready(Some(Err(_))) => return,
                 Poll::Ready(Some(Ok(_))) => (),
                 Poll::Pending if !self.activity.load(Ordering::Relaxed) => {
                     thread::park_timeout(
@@ -785,6 +806,7 @@ impl tls::TlsConnect<Io<Network>> for Connector {
 
     fn connect(self, raw: Io<Network>) -> Self::Future {
         Box::pin(async move {
+            let mut timing = crate::performance::Timer::start(crate::performance::Phase::DbTls);
             let mut secure = TlsIo::new(
                 raw.transport,
                 self.session,
@@ -801,6 +823,7 @@ impl tls::TlsConnect<Io<Network>> for Connector {
                 Err(_) => Poll::Ready(Err(refused())),
             })
             .await?;
+            timing.succeeded();
             let mut io = Io::new(secure, true);
             io.output_left = self.output_limit;
             io.input = Some(self.input);

@@ -216,6 +216,25 @@ fn exchange_queue(
     let start = Instant::now();
     let mut bytes = [0; 256];
     let request = line(stream, start, &mut bytes, true)?;
+    if request == b"PERFORMANCE-STATUS\n" {
+        let Some(logger) = control.logging() else {
+            return send(
+                stream,
+                start,
+                b"{\"schema\":1,\"command\":\"performance-status\",\"status\":\"unavailable\"}\n",
+            );
+        };
+        let mut bytes = [0; td_mta::performance::MAX_STATUS_BYTES];
+        let mut output = td_mta::bounded::TextBuffer::new(&mut bytes);
+        logger
+            .performance_status(&mut output)
+            .map_err(|_| io::ErrorKind::InvalidData)?;
+        return send(
+            stream,
+            start,
+            output.as_bytes().map_err(|_| io::ErrorKind::InvalidData)?,
+        );
+    }
     if request == b"LOG-STATUS\n" {
         let value = control.logging_status();
         let response=match value {Some(status)=>format!("{{\"schema\":1,\"command\":\"logging-status\",\"status\":\"ok\",\"dropped\":{},\"write_failures\":{},\"degraded\":{}}}\n",status.dropped,status.write_failures,status.degraded),None=>"{\"schema\":1,\"command\":\"logging-status\",\"status\":\"unavailable\"}\n".to_owned()};
@@ -361,10 +380,63 @@ pub(super) fn logging_request(runtime: &str) -> Result<String, ConfigFailure> {
     Ok(json.to_string())
 }
 
+pub(super) fn performance_request(runtime: &str) -> Result<String, ConfigFailure> {
+    let (_root, mut stream) = connect(runtime)?;
+    let start = Instant::now();
+    send(&mut stream, start, b"PERFORMANCE-STATUS\n").map_err(io_failure)?;
+    stream
+        .shutdown(std::net::Shutdown::Write)
+        .map_err(io_failure)?;
+    let mut bytes = [0; td_mta::performance::MAX_STATUS_BYTES];
+    let response = line(&mut stream, start, &mut bytes, false).map_err(io_failure)?;
+    let text =
+        std::str::from_utf8(response).map_err(|_| config_failure("control", "invalid-response"))?;
+    let json = td_json::parse(text).map_err(|_| config_failure("control", "invalid-response"))?;
+    if json.get("schema").and_then(td_json::Json::as_u64) != Some(1)
+        || json.get("command").and_then(td_json::Json::as_str) != Some("performance-status")
+    {
+        return Err(config_failure("control", "invalid-response"));
+    }
+    Ok(json.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    #[test]
+    fn private_performance_snapshot_is_bounded_and_does_not_change_service_state() {
+        use std::sync::Arc;
+        let (producer, _writer) = td_mta::application_log::Producer::new(
+            Arc::new(td_mta::clock::RuntimeClock::new()),
+            7,
+            td_mta::observability::Severity::Info,
+        )
+        .unwrap();
+        let control = Control::with_logging(producer);
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        client.write_all(b"PERFORMANCE-STATUS\n").unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+        exchange(&mut server, &control, true).unwrap();
+        let mut bytes = [0; td_mta::performance::MAX_STATUS_BYTES];
+        let response = line(&mut client, Instant::now(), &mut bytes, false).unwrap();
+        let json = td_json::parse(std::str::from_utf8(response).unwrap()).unwrap();
+        assert_eq!(
+            json.get("command").and_then(td_json::Json::as_str),
+            Some("performance-status")
+        );
+        assert_eq!(
+            json.get("config_generation")
+                .and_then(td_json::Json::as_u64),
+            Some(7)
+        );
+        assert!(json
+            .get("phases")
+            .and_then(|v| v.get("http_download"))
+            .is_some());
+        assert_eq!(control.state(), State::Starting);
+    }
 
     #[test]
     fn runtime_path_reserves_the_linux_socket_name_and_terminator() {

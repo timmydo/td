@@ -75,6 +75,8 @@ enum Phase {
     Drain,
 }
 struct Client {
+    timing: Option<crate::performance::Timer>,
+    response_outcome: crate::performance::Outcome,
     origin: usize,
     peer: IpAddr,
     phase: Phase,
@@ -411,6 +413,7 @@ impl Https<'_> {
         })
     }
     fn authenticate(&self, client: &mut Client) -> Result<(), Error> {
+        let mut timing = crate::performance::Timer::start(crate::performance::Phase::HttpAuth);
         let before = self.clock.sample()?.monotonic;
         let deadline = client.absolute.min(client.phase_deadline).min(client.idle);
         if deadline.expired(before) {
@@ -436,9 +439,15 @@ impl Https<'_> {
             return Err(Error::Deadline);
         }
         match result {
-            Err(Error::Busy) => return Ok(()),
+            Err(Error::Busy) => {
+                timing.finish(crate::performance::Outcome::Busy);
+                return Ok(());
+            }
             Err(Error::WriterStopped) => return Err(Error::WriterStopped),
             _ => (),
+        }
+        if matches!(result, Ok(Some(_))) {
+            timing.succeeded();
         }
         client.authentication = Some(result);
         client.phase = Phase::Authorize;
@@ -694,6 +703,8 @@ impl Https<'_> {
                 let phase_deadline =
                     deadline(now, self.timeouts.limits().handshake_seconds)?.min(absolute);
                 let client = Client {
+                    timing: None,
+                    response_outcome: crate::performance::Outcome::Failed,
                     origin: 0,
                     peer: address.ip(),
                     phase: Phase::Tls,
@@ -774,7 +785,12 @@ impl Https<'_> {
                             deadline(time.monotonic, self.timeouts.limits().header_idle_seconds)?
                                 .min(client.phase_deadline);
                         match result {
-                            Ok(progress) if progress.complete => client.phase = Phase::Authorize,
+                            Ok(progress) if progress.complete => {
+                                let target = client.head.head().map_err(|_| Error::Invalid)?.target;
+                                client.timing =
+                                    Some(crate::performance::Timer::start(request_phase(target)));
+                                client.phase = Phase::Authorize;
+                            }
                             Ok(_) => (),
                             Err(http_request::Error::Limit) => {
                                 self.respond(client, 431, time.utc_ms)?
@@ -983,6 +999,9 @@ impl Https<'_> {
                         IoProgress::Closed => return Ok(false),
                     }
                 } else if connection.flush()? == FlushProgress::Complete {
+                    if let Some(timing) = client.timing.take() {
+                        timing.finish(client.response_outcome);
+                    }
                     client.phase = Phase::Close;
                     let now = self.clock.sample()?.monotonic;
                     client.phase_deadline = deadline(now, DRAIN_SECONDS)?.min(client.absolute);
@@ -1053,6 +1072,9 @@ impl Https<'_> {
         client.credentials = None;
         match result {
             Ok(()) => {
+                if let Some(timing) = client.timing.take() {
+                    timing.finish(crate::performance::Outcome::Success);
+                }
                 client.phase = Phase::Close;
                 client.phase_deadline =
                     deadline(self.clock.sample()?.monotonic, DRAIN_SECONDS)?.min(operation);
@@ -1104,6 +1126,9 @@ impl Https<'_> {
         client.drain_left = 0;
         match result {
             Ok(()) => {
+                if let Some(timing) = client.timing.take() {
+                    timing.finish(crate::performance::Outcome::Success);
+                }
                 client.phase = Phase::Close;
                 client.phase_deadline =
                     deadline(self.clock.sample()?.monotonic, DRAIN_SECONDS)?.min(client.absolute);
@@ -1250,6 +1275,9 @@ impl Https<'_> {
             last: now,
         });
         client.sent = 0;
+        if let Some(timing) = client.timing.take() {
+            timing.finish(crate::performance::Outcome::Success);
+        }
         client.phase = Phase::Events;
         client.phase_deadline = client.absolute;
         client.idle = idle;
@@ -1332,6 +1360,12 @@ impl Https<'_> {
         body: &[u8],
     ) -> Result<(), Error> {
         use std::io::Write;
+        client.response_outcome = match status {
+            200..300 => crate::performance::Outcome::Success,
+            429 => crate::performance::Outcome::Busy,
+            503 => crate::performance::Outcome::Unavailable,
+            _ => crate::performance::Outcome::Failed,
+        };
         let get = client.head.head().is_ok_and(|head| {
             head.target.starts_with("/jmap/download/")
                 || head.target.starts_with("/jmap/events?")
@@ -1409,6 +1443,17 @@ impl Https<'_> {
         Ok(())
     }
 }
+fn request_phase(target: &str) -> crate::performance::Phase {
+    use crate::performance::Phase;
+    match target {
+        "/jmap/api" => Phase::HttpApi,
+        "/.well-known/jmap" => Phase::HttpSession,
+        value if value.starts_with("/jmap/download/") => Phase::HttpDownload,
+        value if value.starts_with("/jmap/upload/") => Phase::HttpUpload,
+        _ => Phase::HttpOther,
+    }
+}
+
 /// No framing or deadline renewal: these bytes can never become another request.
 fn drain(
     connection: &mut impl Transport,
@@ -1511,6 +1556,24 @@ pub(crate) fn http_date(utc_ms: i64) -> Result<String, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn timing_labels_are_closed_and_never_retain_target_ids() {
+        use crate::performance::Phase as Metric;
+        for (target, phase) in [
+            ("/.well-known/jmap", Metric::HttpSession),
+            ("/jmap/api", Metric::HttpApi),
+            (
+                "/jmap/download/private-account/private-blob",
+                Metric::HttpDownload,
+            ),
+            ("/jmap/upload/private-account", Metric::HttpUpload),
+            ("/unknown/private-string", Metric::HttpOther),
+        ] {
+            assert_eq!(request_phase(target), phase);
+            assert!(!phase.code().contains("private"));
+        }
+    }
+
     #[test]
     #[allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
     fn discarded_data_is_bounded_cleared_and_never_written() {

@@ -206,6 +206,10 @@ fn notice_error(error: crate::postgres_failure_notice::Error) -> &'static str {
 /// No free-form strings, addresses, credentials or message fields are accepted.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Kind {
+    Performance {
+        phase: crate::performance::Phase,
+        sample: crate::performance::Sample,
+    },
     DeliveryNoticeDeferred {
         error: crate::postgres_failure_notice::Error,
     },
@@ -263,6 +267,7 @@ pub enum Kind {
 impl Kind {
     pub const fn code(self) -> &'static str {
         match self {
+            Self::Performance { .. } => "performance",
             Self::DeliveryNoticeDeferred { .. } => "delivery_notice_deferred",
             Self::RelayConnectionFailed { .. } => "relay_connection_failed",
             Self::RelayStepFailed { .. } => "relay_step_failed",
@@ -300,7 +305,8 @@ impl Kind {
                 outcome: Delivery::Retry | Delivery::PermanentFailure | Delivery::Unknown,
             } => Severity::Warning,
             Self::LogWriteFailed { .. } | Self::ServiceStopped { failed: true } => Severity::Error,
-            Self::ServiceStopped { failed: false }
+            Self::Performance { .. }
+            | Self::ServiceStopped { failed: false }
             | Self::BootStarted
             | Self::ConfigActivated
             | Self::ListenerReady { .. }
@@ -329,7 +335,8 @@ impl Kind {
             } => Some("inspect_submission"),
             Self::CertificateRenewalFailed => Some("inspect_certificate"),
             Self::LogSuppressed { .. } | Self::LogWriteFailed { .. } => Some("inspect_logging"),
-            Self::BootStarted
+            Self::Performance { .. }
+            | Self::BootStarted
             | Self::ConfigActivated
             | Self::ListenerReady { .. }
             | Self::ConnectionOpened { .. }
@@ -375,6 +382,10 @@ impl fmt::Display for EventJson<'_> {
             e.kind.severity().code()
         )?;
         match e.kind {
+            Kind::Performance { phase, sample } => write!(f,
+                ",\"phase\":\"{}\",\"calls\":{},\"failures\":{},\"busy\":{},\"unavailable\":{},\"total_us\":{},\"max_us\":{},\"lost\":{}",
+                phase.code(), sample.calls, sample.failures, sample.busy, sample.unavailable,
+                sample.total_us, sample.max_us, sample.lost)?,
             Kind::DeliveryNoticeDeferred { error } => {
                 write!(f, ",\"error\":\"{}\"", notice_error(error))?
             }
@@ -631,6 +642,20 @@ mod tests {
                 stage: RelayStep::Final,
             },
         ];
+        for phase in crate::performance::Phase::ALL {
+            result.push(Kind::Performance {
+                phase: *phase,
+                sample: crate::performance::Sample {
+                    calls: u64::MAX,
+                    failures: u64::MAX,
+                    busy: u64::MAX,
+                    unavailable: u64::MAX,
+                    total_us: u64::MAX,
+                    max_us: u64::MAX,
+                    lost: u64::MAX,
+                },
+            });
+        }
         for protocol in [Protocol::Smtp, Protocol::Jmap, Protocol::Relay] {
             result.push(Kind::TlsFailed { protocol });
             for version in [TlsVersion::V12, TlsVersion::V13] {
@@ -800,6 +825,7 @@ mod tests {
     // Independent v1 contract oracle; a new variant requires an explicit policy.
     fn policy(kind: Kind) -> (&'static str, &'static str, &'static str) {
         match kind {
+            Kind::Performance { .. } => ("performance", "info", "[]"),
             Kind::DeliveryNoticeDeferred { .. } => {
                 ("delivery_notice_deferred", "warning", "[\"inspect_relay\"]")
             }

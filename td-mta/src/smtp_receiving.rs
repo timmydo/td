@@ -874,6 +874,8 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
         }
         match work {
             Work::Begin => {
+                let timing =
+                    crate::performance::Timer::start(crate::performance::Phase::SmtpAdmission);
                 let connection = slot.connection.as_ref().ok_or(Error::Conflict)?;
                 let network = connection.network()?;
                 let result = self.storage.begin(
@@ -888,6 +890,11 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                     },
                     random,
                 );
+                timing.finish(match &result {
+                    Ok(_) => crate::performance::Outcome::Success,
+                    Err(smtp_storage::Failure::Retry) => crate::performance::Outcome::Busy,
+                    Err(_) => crate::performance::Outcome::Failed,
+                });
                 match result {
                     Ok(job) => {
                         slot.delivery = Some(job);
@@ -933,13 +940,23 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                     .data_written(Ok(()), clock)?;
             }
             Work::Commit { prepared } => {
+                let timing =
+                    crate::performance::Timer::start(crate::performance::Phase::SmtpCommit);
                 let job = slot.delivery.as_mut().ok_or(Error::Conflict)?;
                 if !prepared {
                     if let Err(error) = job.prepare(cap) {
                         return self.delivery_refused(slot, work, error, control);
                     }
                 }
-                match job.commit() {
+                let completed = job.commit();
+                timing.finish(match &completed {
+                    Ok(completion) if completion.outcome.is_ok() => {
+                        crate::performance::Outcome::Success
+                    }
+                    Err(smtp_storage::Failure::Retry) => crate::performance::Outcome::Busy,
+                    _ => crate::performance::Outcome::Failed,
+                });
+                match completed {
                     Ok(completion) => {
                         // Preserve the native outcome even when accounting or cleanup failed.
                         let result = completion.outcome;

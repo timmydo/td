@@ -2243,7 +2243,13 @@ reads boot-local losses and write failures even when PostgreSQL is unavailable.
 No file sink or stderr fallback is used by this writer. PostgreSQL WAL and
 cluster disk budgeting remain operational responsibilities. Logs are diagnostic
 evidence, not metadata authority or an acceptance condition. See
-OBSERVABILITY.md for exact bounds and implemented event coverage.
+OBSERVABILITY.md for exact bounds and implemented event coverage. Fixed
+process-local performance counters summarize HTTP completion/refusals, database
+connection/qualification/driver/cleanup work and body verification/replay into
+hourly events, after one initial minute snapshot. A private local
+`performance-status` command exposes current counters immediately without
+PostgreSQL. Recording never waits or performs I/O; nested phase timings are not
+additive. The same retention and loss limits apply.
 
 Expose counters for accepted/refused mail, TLS/plain sessions, active slots,
 limit refusals, queue age/depth, unknown outcomes, logical disk usage/quotas, dropped logs,

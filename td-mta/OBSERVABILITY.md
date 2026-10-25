@@ -56,6 +56,7 @@ input shape; it is not a substring filter. Normal events always have empty
 
 | Code | Additional facts | Severity | Recommended action |
 | --- | --- | --- | --- |
+| `performance` | fixed `phase`, unsigned `calls`, `failures`, `busy`, `unavailable`, `total_us`, `max_us`, `lost` | info | none |
 | `boot_started` | none | info | none |
 | `config_activated` | none | info | none |
 | `listener_ready` | `protocol` | info | none |
@@ -372,3 +373,94 @@ numeric cursor, database suppression and capacity-eviction counts. It uses the
 same protected connection and schema/epoch checks as other operator commands.
 The cursor does not pin a snapshot across requests: concurrent expiry/eviction
 can create gaps. Returned JSON remains data, never executable instructions.
+
+## Performance summaries
+
+The service records fixed process-local counters at operation boundaries, never
+per byte or poll. After one initial minute, then hourly, the diagnostic writer
+submits one `performance` event for each changed phase. Each phase has its own fixed rate bucket; neither
+addresses, account IDs, object IDs, URLs nor SQL can create labels. The same queue,
+severity filter, global ingestion limit, retention ring and physical-pressure
+stop apply. There is no synchronous journal fallback and no per-request event
+flood. These info records require `minimum_severity = info`. Additional summaries
+can shorten history under the existing ring; 30 days remains an age ceiling,
+not a guaranteed retention interval. At the current 20-phase ceiling, four
+profiles add at most 1,920 hourly summary rows per day (plus initial snapshots).
+The 65,536-row ring can hold about 34 days of those rows alone; other events,
+frequent restarts and physical pressure can shorten that interval.
+
+Each sample is a cumulative process observation: `calls` counts finished spans,
+`total_us` sums their monotonic elapsed microseconds and `max_us` is their largest
+elapsed time. `failures`, `busy` and `unavailable` partition nonsuccess outcomes;
+ordinary success is the remaining count. `lost` counts observations skipped by
+nonblocking counter contention. All values saturate at u64::MAX, where they are
+lower bounds. Samples are coherent per phase, not across phases. There is no
+snapshot reset, so a later summary recovers cumulative observations across a
+lost intermediate summary. Abrupt termination can lose the final partial hour;
+a quiet phase whose last summary was lost need not produce another record.
+Process counters survive in-process configuration reload; a new process starts
+at zero. The event boot ID identifies a logger generation, so a new boot ID
+requires a new baseline even when process counters survived a reload. They are diagnostic evidence, not an operation or delivery ledger.
+
+For two records from one process and phase, subtract `calls` and `total_us` to
+compute interval throughput and mean latency. `max_us` is a process maximum,
+not a percentile or interval maximum. Do not calculate exact rates after lost
+observations or saturation. Read records using `postgres logs` and its existing
+pagination; the database profile and event boot/configuration metadata identify
+the producer. No request identifier or mailbox name is recorded.
+
+
+For immediate diagnostics, `td-mta performance-status --runtime PATH` reads the
+current counters through the existing private mode-0600 local control socket.
+It needs neither PostgreSQL nor info-level event logging and does not reset any
+counter. Capture before and after the operation, seconds apart, to measure its
+cost without waiting for historical persistence. It returns schema-1 JSON with
+`command`, `status`, `boot_id`, `config_generation`, nullable `utc_ms` and a
+`phases` object keyed by the closed names below. Every value is the same numeric
+sample as an event; a contended/poisoned cell is null, never a fabricated zero.
+The response is at most 8 KiB including LF, with unchanged two-second control
+exchange limits. A service lacking a logging owner returns `unavailable`.
+It is not exposed over public HTTP and supplies no mutation operation.
+
+| Phase | Timed boundary |
+| --- | --- |
+| `http_session`, `http_api`, `http_download`, `http_upload` | Complete parsed head through final response flush, including authentication queue/lookup and worker waiting; excludes TCP/TLS and header arrival |
+| `http_other` | Other parsed endpoints; event streams measure preparation only, not stream lifetime |
+| `http_auth` | One authentication worker attempt, including credential parsing and database authorization |
+| `db_resolve` | The owned resolver helper and its complete reply |
+| `db_connect` | One attempted PostgreSQL connection, including local TLS setup, TCP and startup; excludes DNS and runtime qualification |
+| `db_tcp` | Numeric TCP connection attempt |
+| `db_handshake` | PostgreSQL SSL negotiation, TLS and startup/SCRAM together |
+| `db_tls` | TLS construction and handshake within `db_handshake` |
+| `db_schema` | Version, migration-lock and schema-ledger qualification |
+| `db_runtime` | Runtime role, privileges and maintenance qualification |
+| `db_work` | One driver-run operation, possibly containing multiple SQL statements and qualification; success means the driver returned its operation result, not that an inner SQL/application result succeeded |
+| `db_close` | Worker cleanup, including bounded Terminate/close progress; failure includes already-failed or deadline-retired sessions |
+| `db_reuse` | Reserved zero-duration observation for successful retained-session reuse |
+| `body_verify` | Complete body chunk reads and digest verification |
+| `body_replay` | Verified download callback, including chunk replay and socket output |
+| `smtp_admission` | One storage-worker admission attempt, including database readiness; retry is busy |
+| `smtp_commit` | One storage-worker preparation/publication attempt; known durable success remains success even when ancillary cleanup stops service |
+
+HTTP `busy` means a flushed 429 response and `unavailable` means a flushed 503.
+Other outer HTTP refusals, interrupted requests and unfinished spans count as
+failures. A streamed API completion counts as success even for its HTTP400
+request-problem response; this aggregate is not a complete HTTP status ledger.
+HTTP success only establishes transport completion: JMAP method errors inside a
+successful HTTP response remain JMAP errors. A failed response transmission does
+not count as a flushed refusal. HTTP authentication busy retries count separately
+from final HTTP responses. SMTP spans exclude DATA arrival and storage-worker
+queue wait; admission success is permission to receive DATA, not acceptance.
+SMTP commit success reflects the retained durable outcome; failures include
+indeterminate outcomes and do not authorize replay. Neither a counter nor a log
+entry proves that the peer received its final reply. Database timings include the diagnostic writer's own
+connections. Qualification/driver/connection and body/request spans nest: **do not
+sum them as independent components**. Compare their counts and means to isolate
+connection setup, repeated qualification, body work and waiting; subtract only
+when the nesting and matching sample population are known.
+
+The fixed metrics table is below 2 KiB. Recording uses a try-lock on one fixed
+cell, without allocation, I/O or waiting; contention loses only a diagnostic
+observation. The logger retains one fixed previous-sample array. Neither metrics
+nor their loss can renew a deadline, retry a mutation, hold account authority or
+change a known publication result.

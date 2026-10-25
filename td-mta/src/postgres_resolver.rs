@@ -45,9 +45,14 @@ pub fn resolve_host(
     if !executable.is_absolute() {
         return Err(Error::Invalid);
     }
+    let mut timing = crate::performance::Timer::start(crate::performance::Phase::DbResolve);
     let mut command = Command::new(executable);
     command.arg("--internal-postgres-resolve");
-    resolve_command(command, host, deadline)
+    let result = resolve_command(command, host, deadline);
+    if result.is_ok() {
+        timing.succeeded();
+    }
+    result
 }
 
 fn resolve_command(

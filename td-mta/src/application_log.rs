@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use td_crypto::{Entropy, SystemEntropy};
 
 const QUEUE: usize = 384;
-const KINDS: usize = 27;
+const KINDS: usize = 27 + crate::performance::Phase::ALL.len();
 pub struct Producer {
     sender: SyncSender<Event>,
     clock: Arc<RuntimeClock>,
@@ -125,6 +125,17 @@ impl Producer {
             add(&self.dropped, 1);
         }
     }
+    pub fn performance_status(
+        &self,
+        output: &mut crate::bounded::TextBuffer<'_>,
+    ) -> Result<(), crate::bounded::Error> {
+        crate::performance::encode_status(
+            output,
+            self.boot,
+            self.generation,
+            self.clock.sample().ok().map(|time| time.utc_ms),
+        )
+    }
     pub fn writer_failed(&self) {
         add(&self.failures, 1);
         self.degraded.store(true, Ordering::Relaxed);
@@ -139,6 +150,7 @@ impl Producer {
 }
 fn bucket(kind: Kind) -> usize {
     match kind {
+        Kind::Performance { phase, .. } => 27 + phase as usize,
         Kind::DeliveryNoticeDeferred { .. } => 25,
         Kind::BootStarted => 0,
         Kind::ConfigActivated => 1,
@@ -179,6 +191,27 @@ fn bucket(kind: Kind) -> usize {
         Kind::RelayStepFailed { .. } => 19,
     }
 }
+struct PerformanceSchedule {
+    last: Instant,
+    interval: Duration,
+}
+impl PerformanceSchedule {
+    fn new(now: Instant) -> Self {
+        Self {
+            last: now,
+            interval: Duration::from_secs(60),
+        }
+    }
+    fn due(&mut self, now: Instant) -> bool {
+        if now.saturating_duration_since(self.last) < self.interval {
+            return false;
+        }
+        self.last = now;
+        self.interval = Duration::from_secs(3600);
+        true
+    }
+}
+
 impl Writer {
     fn collect(&self, batch: &mut Vec<Event>, stopping: impl FnOnce() -> bool) -> bool {
         let stopping = stopping();
@@ -206,7 +239,27 @@ impl Writer {
         let mut last_maintenance = None;
         let mut last_summary = None;
         let mut reported = 0;
+        let mut performance_schedule = PerformanceSchedule::new(Instant::now());
+        let mut observed =
+            [crate::performance::Sample::default(); crate::performance::Phase::ALL.len()];
         loop {
+            if performance_schedule.due(Instant::now()) {
+                for (phase, prior) in crate::performance::Phase::ALL.iter().zip(&mut observed) {
+                    if let Some(sample) = crate::performance::snapshot(*phase) {
+                        if sample != *prior {
+                            producer.emit(
+                                Kind::Performance {
+                                    phase: *phase,
+                                    sample,
+                                },
+                                None,
+                                None,
+                            );
+                            *prior = sample;
+                        }
+                    }
+                }
+            }
             let stopping = self.collect(&mut batch, || finished.load(Ordering::Acquire));
             let dropped = producer.dropped.load(Ordering::Relaxed);
             if rank(Severity::Warning) >= rank(producer.minimum)
@@ -291,6 +344,25 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
     #[test]
+    fn performance_history_has_one_initial_snapshot_then_an_hourly_budget() {
+        let now = Instant::now();
+        let mut schedule = PerformanceSchedule::new(now);
+        for seconds in 0..60 {
+            assert!(!schedule.due(now + Duration::from_secs(seconds)));
+        }
+        assert!(schedule.due(now + Duration::from_secs(60)));
+        for seconds in 60..3660 {
+            assert!(!schedule.due(now + Duration::from_secs(seconds)));
+        }
+        assert!(schedule.due(now + Duration::from_secs(3660)));
+        assert!(!schedule.due(now));
+        assert!(!schedule.due(now + Duration::from_secs(3660)));
+        // Missing many intervals emits once, never catches up a log flood.
+        assert!(schedule.due(now + Duration::from_secs(86_400)));
+        assert!(!schedule.due(now + Duration::from_secs(86_400)));
+    }
+
+    #[test]
     fn shutdown_publication_is_observed_before_the_final_drain() {
         let (producer, writer) =
             Producer::new(Arc::new(RuntimeClock::new()), 1, Severity::Info).unwrap();
@@ -334,6 +406,39 @@ mod tests {
         assert_eq!(writer.receiver.try_iter().count(), 4);
         assert!(std::mem::size_of::<Option<Event>>() <= 256);
     }
+    #[test]
+    fn performance_buckets_keep_each_phase_and_do_not_expand_with_counts() {
+        let (producer, writer) =
+            Producer::new(Arc::new(RuntimeClock::new()), 1, Severity::Info).unwrap();
+        for phase in crate::performance::Phase::ALL {
+            for n in 1..=100 {
+                producer.emit(
+                    Kind::Performance {
+                        phase: *phase,
+                        sample: crate::performance::Sample {
+                            calls: n,
+                            busy: n,
+                            ..Default::default()
+                        },
+                    },
+                    None,
+                    None,
+                );
+            }
+        }
+        let events: Vec<_> = writer.receiver.try_iter().collect();
+        assert_eq!(events.len(), crate::performance::Phase::ALL.len());
+        assert_eq!(
+            producer.status().dropped,
+            99 * crate::performance::Phase::ALL.len() as u64
+        );
+        for (event, phase) in events.iter().zip(crate::performance::Phase::ALL) {
+            assert!(
+                matches!(event.kind, Kind::Performance { phase: found, sample } if found == *phase && sample.calls == 1 && sample.busy == 1)
+            );
+        }
+    }
+
     #[test]
     fn severity_queue_disconnect_and_saturated_loss_are_observable() {
         let (producer, writer) =

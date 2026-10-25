@@ -121,6 +121,7 @@ pub mod observability;
 pub mod operator_files;
 pub mod outbound_dial;
 pub mod ownership;
+pub mod performance;
 pub mod ports;
 pub mod postgres_account_audit;
 pub mod postgres_accounts;
