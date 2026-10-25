@@ -1997,7 +1997,10 @@ permit, and retries a busy pool within the original handshake deadline.
 All socket operations are nonblocking. TLS wire progress admits at most one
 input record per turn, using at most two reads so an available payload can
 follow its completed five-byte header immediately. Partial reads or pending
-input yield; no additional record is consumed. Original deadlines still
+input yield; no additional record is consumed. Output likewise admits at
+most one record and two writes per turn, finishing the framing tail beyond
+the socket chunk immediately when writable. Pending output yields without
+retrying; short writes retain the unsent tail. Original deadlines still
 bracket the turn. Request-head parsing uses at most 16 KiB per turn. The current
 profile permits one request per connection and sends Connection: close with
 all responses. Authenticated upload POSTs use the shared bounded body worker

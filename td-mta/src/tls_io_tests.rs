@@ -115,6 +115,9 @@ struct Peer {
     link: Arc<Mutex<Link>>,
     side: usize,
     read_limit: usize,
+    write_limit: usize,
+    write_capacity: usize,
+    inject_pending: bool,
 }
 fn peers() -> (Peer, Peer, Arc<Mutex<Link>>) {
     let link = Arc::new(Mutex::new(Link {
@@ -129,11 +132,17 @@ fn peers() -> (Peer, Peer, Arc<Mutex<Link>>) {
             link: link.clone(),
             side: 0,
             read_limit: 1,
+            write_limit: 7,
+            write_capacity: 7,
+            inject_pending: true,
         },
         Peer {
             link: link.clone(),
             side: 1,
             read_limit: 1,
+            write_limit: 7,
+            write_capacity: 7,
+            inject_pending: true,
         },
         link,
     )
@@ -174,10 +183,13 @@ impl Transport for Peer {
             return Err(Error::Invalid);
         }
         link.calls[self.side] += 1;
-        if link.calls[self.side].is_multiple_of(3) {
+        if self.inject_pending && link.calls[self.side].is_multiple_of(3) {
             return Ok(IoProgress::Pending);
         }
-        let count = input.len().min(7 - link.data[peer].len());
+        let count = input
+            .len()
+            .min(self.write_limit)
+            .min(self.write_capacity.saturating_sub(link.data[peer].len()));
         if count == 0 {
             return Ok(IoProgress::Pending);
         }
@@ -1067,5 +1079,33 @@ fn available_record_payload_progresses_with_its_header_without_reading_ahead() {
         assert_eq!(server.input_used, 0);
         assert_eq!(server.input_target, 5);
         assert!(server.session.status().ciphertext_pending > 0);
+    }
+}
+
+#[test]
+fn full_record_output_finishes_its_socket_chunk_tail_in_one_turn() {
+    for write_limit in [crate::transport::SOCKET_CHUNK, 1] {
+        with_pair(|client, server, _| {
+            handshakes(client, server);
+            client.flush().unwrap();
+            client.transport.write_limit = write_limit;
+            client.transport.write_capacity = TLS_WIRE_BYTES * 2;
+            client.transport.inject_pending = false;
+            let before = client.transport.link.lock().unwrap().calls[0];
+            let bytes = vec![42; PLAIN_BYTES];
+            assert_eq!(
+                client.write(&bytes).unwrap(),
+                IoProgress::Bytes(bytes.len())
+            );
+            let calls = client.transport.link.lock().unwrap().calls[0] - before;
+            assert_eq!(calls, 2);
+            if write_limit == crate::transport::SOCKET_CHUNK {
+                assert_eq!(client.output_end, 0);
+                assert_eq!(client.session.status().ciphertext_pending, 0);
+            } else {
+                assert_eq!(client.output_start, 2);
+                assert!(client.output_end > client.output_start);
+            }
+        });
     }
 }

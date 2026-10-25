@@ -224,25 +224,31 @@ impl<T: Transport, B: TlsWireStorage> TlsIo<T, B> {
                 return Ok(());
             }
         }
-        let tail = self
-            .output
-            .as_deref()
-            .ok_or(Error::Invalid)?
-            .get(self.output_start..self.output_end)
-            .ok_or(Error::Invalid)?;
-        match self.transport.write(tail)? {
-            IoProgress::Bytes(count) if count > 0 && count <= tail.len() => {
-                self.output_start = self.output_start.checked_add(count).ok_or(Error::Invalid)?;
-                if self.output_start == self.output_end {
-                    self.output_start = 0;
-                    self.output_end = 0;
-                    self.output_target = 5;
+        // A TLS record can exceed the socket chunk by its framing bytes.
+        // Finish that tail without imposing another scheduler tick.
+        for _ in 0..2 {
+            let tail = self
+                .output
+                .as_deref()
+                .ok_or(Error::Invalid)?
+                .get(self.output_start..self.output_end)
+                .ok_or(Error::Invalid)?;
+            match self.transport.write(tail)? {
+                IoProgress::Bytes(count) if count > 0 && count <= tail.len() => {
+                    self.output_start =
+                        self.output_start.checked_add(count).ok_or(Error::Invalid)?;
+                    if self.output_start == self.output_end {
+                        self.output_start = 0;
+                        self.output_end = 0;
+                        self.output_target = 5;
+                        return Ok(());
+                    }
                 }
-                Ok(())
+                IoProgress::Pending => return Ok(()),
+                _ => return Err(Error::Invalid),
             }
-            IoProgress::Pending => Ok(()),
-            _ => Err(Error::Invalid),
         }
+        Ok(())
     }
 
     fn drain_output(&mut self) -> Result<(), Error> {
