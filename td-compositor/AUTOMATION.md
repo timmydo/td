@@ -108,8 +108,10 @@ reject signs and overflow. The existing US keymap determines text. Duplicate
 downs and unmatched ups are idempotent; repeat is client-owned, with no
 synthetic repeat request. Keys pass through the same logical binding policy
 and normal Runtime keyboard/modifier delivery as evdev, including consumed
-compositor workspace chords and the help overlay. Launcher opening and
-process-launch chords report unavailable; they never start a process.
+compositor workspace chords, the help overlay and `Super+q`'s polite
+close of the focused window, a request no stronger than typing into that
+window. Launcher opening and process-launch chords report unavailable;
+they never start a process.
 Ctrl+Alt+Esc is ordinary untrusted input here, never secure attention.
 
 The seat belongs to the headless process generation, not an individual

@@ -1,6 +1,9 @@
 #![deny(unsafe_code)]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+#[path = "../../td-fs/src/temp_dir.rs"]
+mod temp_dir;
+
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
@@ -689,6 +692,58 @@ fn keyboard_grant_routes_workspace_chords_across_one_shot_connections() {
         );
         assert!(!session.exists());
     }
+}
+
+/// `Super+q` through the input grant reaches a real client as
+/// `xdg_toplevel.close`, which the demo answers by exiting: the
+/// compositor asks and the client leaves, and nothing is killed.
+#[test]
+fn super_q_asks_the_focused_native_client_to_close() {
+    let root = temp_dir::TempDir::new("td-headless-close").unwrap();
+    let session = root.path().join("session");
+    let mut command = headless(&session);
+    command.args(["--input-control", "enabled"]);
+    let mut compositor = Process::start(
+        &mut command,
+        &root.path().join("compositor.log"),
+        "TD-COMPOSITOR-HEADLESS-READY",
+    );
+    let ready = compositor.ready();
+    let identity = ready_session(&ready);
+    let control = session.join("td-control");
+    let client_log = root.path().join("client.log");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_td-compositor"));
+    command
+        .arg0("td-ui-demo")
+        .args(["run", "--socket"])
+        .arg(session.join("wayland-0"))
+        .arg("--ready-socket")
+        .arg(root.path().join("client.ready"));
+    let mut client = Process::start(&mut command, &client_log, "TD-UI-CLIENT-READY");
+    client.ready();
+    assert!(request(&control, b"layout\n").contains("visible=true focused=true"));
+    for (index, line) in ["key 1 125 down\n", "key 2 16 down\n", "release-keys 3\n"]
+        .into_iter()
+        .enumerate()
+    {
+        assert_eq!(
+            input_request(&control, identity, line),
+            input_receipt(identity, index as u64 + 1)
+        );
+    }
+    assert!(!client.wait().success());
+    let said = fs::read_to_string(&client_log).unwrap();
+    assert!(
+        said.contains("compositor requested that the demo close"),
+        "{said}"
+    );
+    let deadline = Instant::now() + TIMEOUT;
+    while request(&control, b"layout\n").contains("window id=") {
+        assert!(Instant::now() < deadline, "the closed window stayed mapped");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    compositor.child.stdin.take();
+    assert!(compositor.wait().success());
 }
 
 #[test]

@@ -392,6 +392,8 @@ struct KeyDecision {
     draining: bool,
     brightness: Option<bool>,
     command: Option<Command>,
+    /// `Super+q`: ask the focused window to close.
+    close: bool,
     launcher: Option<LauncherAction>,
     help: Option<HelpAction>,
     screenshot: Option<ScreenshotAction>,
@@ -439,6 +441,7 @@ impl KeyBindings {
             draining: false,
             brightness: None,
             command: None,
+            close: false,
             launcher: None,
             help: None,
             screenshot: None,
@@ -702,6 +705,13 @@ impl KeyBindings {
         if event.code == KEY_T {
             self.consumed.insert(physical);
             decision.launch = Some(LaunchRequest::Terminal);
+            return decision;
+        }
+        // A polite close of the focused window, which the runtime resolves
+        // and the client may refuse; nothing is ever killed.
+        if event.code == KEY_Q {
+            self.consumed.insert(physical);
+            decision.close = true;
             return decision;
         }
         if let Some(direction) = direction(event.code) {
@@ -1767,6 +1777,9 @@ trait InputTarget {
     fn attention(&mut self, visible: bool) -> Result<u128, String>;
     fn drain_attention(&mut self) -> Result<(), String>;
     fn command(&mut self, command: Command) -> Result<(), String>;
+    /// `Super+q`: ask the focused window to close. Required, so a target
+    /// cannot silently make the chord do nothing.
+    fn close(&mut self) -> Result<(), String>;
     fn launcher(&mut self, action: LauncherAction) -> Result<bool, String>;
     /// Answers whether the sheet is up afterwards, as `launcher` does: the
     /// adapter must know to route the NEXT key to it.
@@ -2541,6 +2554,12 @@ impl InputTarget for AutomationTarget<'_> {
         self.runtime.command(command)
     }
 
+    // Asking, like typing into the window, which this keyboard already may.
+    fn close(&mut self) -> Result<(), String> {
+        self.runtime.close_focused();
+        Ok(())
+    }
+
     fn launcher(&mut self, _action: LauncherAction) -> Result<bool, String> {
         Err("headless keyboard has no launcher".into())
     }
@@ -2737,6 +2756,14 @@ impl InputTarget for LiveInputTarget {
             .lock()
             .map_err(|_| "runtime lock poisoned".to_string())?
             .command(command)
+    }
+
+    fn close(&mut self) -> Result<(), String> {
+        self.runtime
+            .lock()
+            .map_err(|_| "runtime lock poisoned".to_string())?
+            .close_focused();
+        Ok(())
     }
 
     fn launch(&mut self, request: LaunchRequest) -> Result<(), String> {
@@ -3272,6 +3299,7 @@ fn apply_locked<T: InputTarget>(
         && decision.approval.is_none()
         && decision.field.is_none()
         && decision.command.is_none()
+        && !decision.close
         && decision.launcher.is_none()
         && decision.help.is_none()
         && decision.screenshot.is_none()
@@ -3371,12 +3399,14 @@ fn deliver_key_decision<T: InputTarget>(
     // The lock surface runs no ordinary binding (td-login/TOKEN-LOGIN.md,
     // "Session lock"); the runtime withholds keys from clients itself.
     let bindings_ordinary = decision.command.is_some()
+        || decision.close
         || decision.launcher.is_some()
         || decision.help.is_some()
         || decision.screenshot.is_some()
         || decision.launch.is_some();
     if bindings_ordinary && runtime.session_locked() {
         decision.command = None;
+        decision.close = false;
         decision.launcher = None;
         decision.help = None;
         decision.screenshot = None;
@@ -3441,6 +3471,9 @@ fn deliver_key_decision<T: InputTarget>(
     }
     if let Some(command) = decision.command {
         runtime.command(command)?;
+    }
+    if decision.close {
+        runtime.close()?;
     }
     if let Some(action) = decision.launcher {
         let visible = runtime.launcher(action)?;
@@ -5791,6 +5824,7 @@ mod tests {
         draining_error: Option<String>,
         modifiers_error: Option<String>,
         commands: Vec<Command>,
+        closes: usize,
         launcher_actions: Vec<LauncherAction>,
         launcher_visible: bool,
         keys: Vec<KeyInput>,
@@ -5932,6 +5966,11 @@ mod tests {
             Ok(())
         }
 
+        fn close(&mut self) -> Result<(), String> {
+            self.closes += 1;
+            Ok(())
+        }
+
         fn launch(&mut self, request: LaunchRequest) -> Result<(), String> {
             self.launched.push(request);
             Ok(())
@@ -6063,6 +6102,10 @@ mod tests {
 
         fn command(&mut self, command: Command) -> Result<(), String> {
             self.recording.command(command)
+        }
+
+        fn close(&mut self) -> Result<(), String> {
+            self.recording.close()
         }
 
         fn launch(&mut self, request: LaunchRequest) -> Result<(), String> {
@@ -6713,6 +6756,8 @@ mod tests {
         Launch(LaunchRequest),
         Help(HelpAction),
         Screenshot(ScreenshotAction),
+        /// `Super+q`'s polite close.
+        Close,
         /// The paired profile's session lock.
         Lock,
         /// Documented but not a key, so this row is exercised elsewhere. The
@@ -6789,6 +6834,7 @@ mod tests {
                 Bound::Launcher(_) | Bound::Pointer(_, Pointing::Launcher) => "OPEN LAUNCHER",
                 Bound::Help(_) => "THIS HELP",
                 Bound::Screenshot(_) => "SCREENSHOT",
+                Bound::Close => "CLOSE WINDOW",
                 Bound::Lock => "LOCK SCREEN",
             }
         }
@@ -6807,6 +6853,7 @@ mod tests {
             KEY_F => "F",
             KEY_S => "S",
             KEY_T => "T",
+            KEY_Q => "Q",
             KEY_ENTER => "ENTER",
             KEY_L => "L",
             // `?` IS the shifted `/`, so the glyph absorbs the modifier
@@ -6874,6 +6921,7 @@ mod tests {
                 KEY_T,
                 Bound::Launch(LaunchRequest::Terminal),
             ),
+            (&[KEY_LEFTMETA], KEY_Q, Bound::Close),
             (
                 &[KEY_LEFTMETA],
                 KEY_ENTER,
@@ -6928,13 +6976,15 @@ mod tests {
                 decision.help,
                 decision.screenshot,
                 decision.lock,
+                decision.close,
             ) {
-                (Some(command), None, None, None, None, false) => Bound::Command(command),
-                (None, Some(action), None, None, None, false) => Bound::Launcher(action),
-                (None, None, Some(request), None, None, false) => Bound::Launch(request),
-                (None, None, None, Some(action), None, false) => Bound::Help(action),
-                (None, None, None, None, Some(action), false) => Bound::Screenshot(action),
-                (None, None, None, None, None, true) => Bound::Lock,
+                (Some(command), None, None, None, None, false, false) => Bound::Command(command),
+                (None, Some(action), None, None, None, false, false) => Bound::Launcher(action),
+                (None, None, Some(request), None, None, false, false) => Bound::Launch(request),
+                (None, None, None, Some(action), None, false, false) => Bound::Help(action),
+                (None, None, None, None, Some(action), false, false) => Bound::Screenshot(action),
+                (None, None, None, None, None, true, false) => Bound::Lock,
+                (None, None, None, None, None, false, true) => Bound::Close,
                 other => panic!("{} produced {other:?}", row.keys),
             };
             assert_eq!(&actual, expected, "{} / {}", row.keys, row.action);
@@ -6972,7 +7022,9 @@ mod tests {
 
     #[test]
     fn any_non_modifier_key_dismisses_the_sheet_and_runs_no_command() {
-        for code in [KEY_T, KEY_V, KEY_2, KEY_ESC, KEY_A, KEY_ENTER, KEY_SLASH] {
+        for code in [
+            KEY_T, KEY_V, KEY_2, KEY_ESC, KEY_A, KEY_ENTER, KEY_SLASH, KEY_Q,
+        ] {
             let mut bindings = KeyBindings::default();
             press(&mut bindings, KEY_LEFTMETA);
             bindings.feed(key(KEY_SLASH, KEY_PRESS));
@@ -6983,6 +7035,7 @@ mod tests {
             let dismissed = bindings.feed(key(code, KEY_PRESS));
             assert_eq!(dismissed.help, Some(HelpAction::Close), "{code}");
             assert!(dismissed.command.is_none(), "{code}");
+            assert!(!dismissed.close, "{code}");
             assert!(dismissed.launch.is_none(), "{code}");
             assert!(dismissed.launcher.is_none(), "{code}");
             assert!(dismissed.forward.is_none(), "{code}");
@@ -7362,6 +7415,8 @@ mod tests {
         press(&mut bindings, KEY_LEFTMETA);
         let chord = bindings.feed(key(KEY_T, KEY_PRESS));
         assert!(chord.launch.is_none() && chord.screenshot.is_none() && chord.forward.is_none());
+        let chord = bindings.feed(key(KEY_Q, KEY_PRESS));
+        assert!(!chord.close && chord.screenshot.is_none() && chord.forward.is_none());
     }
 
     #[test]
@@ -7454,14 +7509,64 @@ mod tests {
         // Super is still DOWN. The overlay owns every non-modifier key, so a
         // chord neither runs behind it nor types into its query: `Super+t`
         // must not start a second terminal, `Super+v` must not split.
-        for code in [KEY_T, KEY_V, KEY_H, KEY_F, KEY_2, KEY_RIGHT] {
+        for code in [KEY_T, KEY_V, KEY_H, KEY_F, KEY_2, KEY_RIGHT, KEY_Q] {
             let held = bindings.feed(key(code, KEY_PRESS));
             assert!(held.launch.is_none(), "{code}");
             assert!(held.command.is_none(), "{code}");
+            assert!(!held.close, "{code}");
             assert!(held.launcher.is_none(), "{code}");
             assert!(held.forward.is_none(), "{code}");
             bindings.feed(key(code, KEY_RELEASE));
         }
+    }
+
+    #[test]
+    fn super_q_asks_for_a_close_and_never_reaches_the_client() {
+        let mut bindings = KeyBindings::default();
+        // Bare, the key is the client's text.
+        let bare = bindings.feed(key(KEY_Q, KEY_PRESS));
+        assert!(!bare.close);
+        assert!(bare.forward.is_some());
+        bindings.feed(key(KEY_Q, KEY_RELEASE));
+        for modifiers in [&[KEY_LEFTMETA][..], &[KEY_RIGHTMETA, KEY_LEFTSHIFT][..]] {
+            for modifier in modifiers {
+                bindings.feed(key(*modifier, KEY_PRESS));
+            }
+            let chord = bindings.feed(key(KEY_Q, KEY_PRESS));
+            assert!(chord.close);
+            assert!(chord.command.is_none() && chord.launch.is_none());
+            assert!(chord.forward.is_none());
+            assert!(bindings.feed(key(KEY_Q, KEY_RELEASE)).forward.is_none());
+            for modifier in modifiers {
+                bindings.feed(key(*modifier, KEY_RELEASE));
+            }
+        }
+    }
+
+    #[test]
+    fn the_adapter_hands_super_q_to_the_target_as_one_close() {
+        let target = Mutex::new(RecordingTarget::default());
+        let bindings = Mutex::new(KeyBindings::default());
+        let mut pointer = PointerMotion::default();
+        for event in [
+            key(KEY_LEFTMETA, KEY_PRESS),
+            key(KEY_Q, KEY_PRESS),
+            key(KEY_Q, KEY_RELEASE),
+        ] {
+            apply(&target, event, 0, &bindings, &mut pointer, None).unwrap();
+        }
+        let target = target.lock().unwrap();
+        assert_eq!(target.closes, 1);
+        assert_eq!(target.commands, []);
+        // Super's own transition reaches the client; the chord's key never.
+        assert!(target
+            .keys
+            .iter()
+            .any(|input| input.key == u32::from(KEY_LEFTMETA)));
+        assert!(target
+            .keys
+            .iter()
+            .all(|input| input.key != u32::from(KEY_Q)));
     }
 
     #[test]
@@ -7470,12 +7575,13 @@ mod tests {
         press(&mut bindings, KEY_LEFTMETA);
         // Only the bound chords are stolen; everything else is the client's,
         // which is what the terminal's own untranslated-chord rule turns on.
-        let unbound = bindings.feed(key(KEY_Q, KEY_PRESS));
+        let unbound = bindings.feed(key(KEY_Z, KEY_PRESS));
         assert!(unbound.command.is_none());
+        assert!(!unbound.close);
         assert!(unbound.launch.is_none());
         assert!(unbound.launcher.is_none());
         assert!(unbound.forward.is_some());
-        assert!(bindings.feed(key(KEY_Q, KEY_RELEASE)).forward.is_some());
+        assert!(bindings.feed(key(KEY_Z, KEY_RELEASE)).forward.is_some());
     }
 
     #[test]
@@ -12151,6 +12257,28 @@ mod tests {
         })
     }
 
+    /// Nothing behind the attention screen is asked to close: `Super+q`
+    /// there is the screen's, not a binding.
+    #[test]
+    fn super_q_closes_nothing_behind_the_attention_screen() {
+        let target = Mutex::new(RecordingTarget::default());
+        let bindings = attention_bindings(None);
+        read_reports(&target, &bindings, 0, &chord_reports(10));
+        assert_eq!(target.lock().unwrap().attention_events, [true]);
+        read_reports(
+            &target,
+            &bindings,
+            0,
+            &with_held(KEY_LEFTMETA, &[KEY_Q], 20),
+        );
+        let target = target.lock().unwrap();
+        assert_eq!(target.closes, 0);
+        assert!(target
+            .keys
+            .iter()
+            .all(|input| input.key != u32::from(KEY_Q)));
+    }
+
     /// On the lock surface the chord is the selection: it opens attention
     /// straight into a login unlock, with no menu, and that is the
     /// lifetime's one operation. Escape ends it, and the next chord is a
@@ -12257,13 +12385,14 @@ mod tests {
     fn the_lock_surface_runs_no_binding() {
         let target = locked_target();
         let bindings = attention_bindings(None);
-        let chords = [KEY_T, KEY_ENTER, KEY_SLASH, KEY_1, KEY_LEFT, KEY_F];
+        let chords = [KEY_T, KEY_ENTER, KEY_SLASH, KEY_1, KEY_LEFT, KEY_F, KEY_Q];
         read_reports(&target, &bindings, 0, &with_held(KEY_LEFTMETA, &chords, 10));
         let target = target.lock().unwrap();
         assert!(target.launched.is_empty());
         assert!(target.launcher_actions.is_empty());
         assert!(target.help_actions.is_empty());
         assert!(target.commands.is_empty());
+        assert_eq!(target.closes, 0);
         assert!(target.secret_roles.is_empty());
         let bindings = bindings.lock().unwrap();
         assert!(!bindings.launcher_open && !bindings.help_open);

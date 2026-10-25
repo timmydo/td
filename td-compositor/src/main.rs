@@ -3349,8 +3349,8 @@ pub struct MappedRegion {
         ));
         // The runtime withholds a client's paint, focus and input while a
         // lock is owed, and nothing on a private screen; Print captures
-        // nothing then either.
-        assert_eq!(occurrences(runtime, "self.resume_withholds()"), 8);
+        // nothing then either, and `Super+q` closes nothing.
+        assert_eq!(occurrences(runtime, "self.resume_withholds()"), 9);
         assert!(runtime.contains(
             "        !self.scene.private_screen() && self.resume.as_ref().is_some_and(|resume| resume.holds())\n"
         ));

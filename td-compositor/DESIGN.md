@@ -523,6 +523,9 @@ binding in this list but Print is ONE chord on `Super`:
   the same commands and needs no chord to arrive;
 - `Super+t` starts a terminal, which is the one registry entry anybody opens
   repeatedly;
+- `Super+q` asks the focused window to close, with the protocol's
+  `xdg_toplevel.close` (section 3, after the title rules). It is a
+  request, never a kill: a client that ignores it keeps its window;
 - `Super+?` shows this table on screen. `?` is Shift+`/` here and Shift is
   not required, since the sheet is what someone reaches for when they do NOT
   know the bindings and demanding an exact chord to see them would be the
@@ -598,8 +601,9 @@ keymap, so the glyph names (`?`, `V`, `T`) are literals — remapping a key in
 `keys.rs` would make the sheet lie with the suite green. The card is
 sized FROM the table too, so adding a row cannot push the last one past the
 bottom edge, and every pixel is clipped to it on an output too small to
-hold it. Its rows are 24 pixels apart, which holds the paired card's
-twenty rows, Print's among them, whole on an 800x600 output (538 rows).
+hold it. Its rows are 23 pixels apart, which holds the paired card's
+twenty-one rows, Print's and `Super+q`'s among them, whole on an 800x600
+output (541 rows).
 
 ### Screenshots
 
@@ -661,10 +665,10 @@ offers copy alone. A save there needs a human-side writer the authority
 starts, a separate increment.
 
 Everything in that table is taken FROM the focused client, and this list
-takes more than the one it replaces: the four arrows, Enter, and `t`/`v`/`h`
-where `b/f/p/n`, `x` and the digits were taken before. Anything else under
-Super still reaches the client, which is what td-term's own
-untranslated-chord rule below turns on.
+takes more than the one it replaces: the four arrows, Enter, and
+`t`/`v`/`h`/`q` where `b/f/p/n`, `x` and the digits were taken before.
+Anything else under Super still reaches the client, which is what
+td-term's own untranslated-chord rule below turns on.
 
 A prefix buys keys at the cost of a press, and this table is nowhere near
 running out of them: the movement bindings were `Super+b/f/p/n` and the
@@ -3034,6 +3038,34 @@ dead one's name, which matters more for the field a caller ADDRESSES windows
 by than for the one it only reads. An input
 region can be dropped with the pixels only because the client re-supplies one
 on every commit; nothing re-supplies a title.
+
+`Super+q` is the one event td sends a toplevel that no layout change
+explains: `xdg_toplevel.close`, the protocol's polite request. The runtime
+chooses the window when the key arrives — the portal's modal dialog while
+one is up, otherwise the focused tile's topmost mapped child dialog or the
+tile itself, which in a tabbed or stacked group is the visible member and
+in fullscreen the fullscreen window — and queues it per client by
+wl_surface; the client's configure worker sends it after that wake's
+configures. Repeats before the worker runs are one event. A destroyed
+toplevel or a departed client takes its queued close with it, and the
+worker takes the queue with the client's toplevel registrations held, so
+the event reaches the toplevel the surface wore at the key or nothing: one
+created later on the same surface is never sent it. A grabbing menu is not
+a window and does not move the target; the menu goes with its window.
+Nothing is asked behind an overlay (the overlay owns the key first), on
+the attention screen or the lock surface (neither runs an ordinary
+binding, and `Runtime::close_focused` refuses a private screen itself),
+or while a resume withholds input.
+
+The compositor never signals a process, and a client that does not answer
+keeps its window: what a close means is the client's. td-ui hands it to its
+handler as `Input::Close` (td-ui/DESIGN.md), so each td program decides,
+and may ask about unsaved work; td-term in the desktop profile ends with
+status zero and its child hears the hangup, while the session's own
+terminal unit exits and its supervisor restarts it. The headless input
+grant may send the chord, since asking is no more than typing into the
+window, which that grant already can. The control channel has no request
+for it: its vocabulary is the layout's (section 15), and a close is not.
 
 Every tile that carries decoration has a title band across its top, 20
 pixels tall, holding the retained title in one row of text cells ("Chrome

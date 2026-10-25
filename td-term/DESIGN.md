@@ -502,8 +502,8 @@ means and which modifier roles are left over, and hands td-term a chord --
 `C-`, `M-` and `S-` in that order, each at most once, then the character or
 the key's name (`a`, `C-c`, `M-S-a`, `S-Tab`, `F5`). A modifier the keymap
 gives no role, Super among them, makes the keymap refuse the press, so an
-untranslated chord such as `Super+q` reaches the child as nothing rather than
-as `q`.
+untranslated chord such as `Super+z` reaches the child as nothing rather than
+as `z`.
 
 `td_ui::vt_keys` encodes a chord. `action(chord, modes, viewing)` returns
 exactly one of three things -- bytes for the child, a move of the scrollback

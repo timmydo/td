@@ -82,6 +82,7 @@ const XDG_WM_BASE_ERROR_INVALID_POSITIONER: u32 = 5;
 /// it once WRONG, so a bump has to be read against that.
 const XDG_WM_BASE_VERSION: u32 = 1;
 const XDG_SURFACE_CONFIGURE: u16 = 0;
+const XDG_TOPLEVEL_CLOSE: u16 = 1;
 const WL_BUFFER_RELEASE: u16 = 0;
 const WL_CALLBACK_DONE: u16 = 0;
 const XDG_POPUP_CONFIGURE: u16 = 0;
@@ -997,6 +998,17 @@ fn send_configure(
     outbound.send(&surface)
 }
 
+fn send_toplevel_close(
+    outbound: &Arc<Mutex<Outbound>>,
+    registration: &ConfigureRegistration,
+) -> Result<(), String> {
+    let close = wire::Builder::new().message(registration.toplevel, XDG_TOPLEVEL_CLOSE)?;
+    outbound
+        .lock()
+        .map_err(|_| "Wayland outbound lock poisoned".to_string())?
+        .send(&close)
+}
+
 fn view_status(
     snapshot: &BTreeMap<SurfaceKey, ViewLayout>,
     key: SurfaceKey,
@@ -1052,13 +1064,14 @@ fn configure_worker(
         if stop.is_stopped() {
             return Ok(());
         }
-        let (snapshot, shown) = {
+        let (snapshot, shown, closing) = {
             let mut runtime = runtime
                 .lock()
                 .map_err(|_| "runtime lock poisoned".to_string())?;
             (
                 runtime.layout_snapshot(),
                 runtime.take_presented_callbacks(client),
+                runtime.close_requested(client),
             )
         };
         let configurations = configurations
@@ -1066,6 +1079,30 @@ fn configure_worker(
             .map_err(|_| "configure registration lock poisoned".to_string())?;
         for (key, registration) in configurations.iter() {
             update_configure(&outbound, registration, view_status(&snapshot, *key)?)?;
+        }
+        // `Super+q`'s request, after the configures it may follow. Taken
+        // with the registrations held, so a toplevel destroyed meanwhile has
+        // already taken its request with it and one created after cannot be
+        // found in its place. Nesting is deadlock-free because no thread
+        // takes the registrations while holding the runtime lock. A surface
+        // that no longer wears a toplevel has nothing to close, and a
+        // request queued after the check above brings its own wake.
+        let closes = if closing {
+            runtime
+                .lock()
+                .map_err(|_| "runtime lock poisoned".to_string())?
+                .take_close_requests(client)
+        } else {
+            Vec::new()
+        };
+        for surface in closes {
+            let key = SurfaceKey {
+                client,
+                object: surface,
+            };
+            if let Some(registration) = configurations.get(&key) {
+                send_toplevel_close(&outbound, registration)?;
+            }
         }
         // After the configures: a client drawing on `done` then draws at
         // the size it was just told.
@@ -11146,6 +11183,38 @@ mod tests {
         drop(connected);
         worker.join().unwrap().unwrap();
         fs::remove_file(framebuffer_path).unwrap();
+    }
+
+    /// `Super+q`'s request reaches the focused client as the protocol's
+    /// `xdg_toplevel.close`, on the real connection, and only once.
+    #[test]
+    fn a_close_request_reaches_the_focused_toplevel_on_the_wire() {
+        let dir = crate::temp_dir::TempDir::new("td-wayland-close").unwrap();
+        let framebuffer_path = dir.path().join("fb");
+        let framebuffer =
+            Framebuffer::test_file(&framebuffer_path, 640, 400 + BAR_HEIGHT, 640 * 4).unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        runtime.lock().unwrap().repaint().unwrap();
+        let (server, client) = UnixStream::pair().unwrap();
+        let thread_runtime = Arc::clone(&runtime);
+        let keymap = test_keymap();
+        let worker = thread::spawn(move || serve_client(server, 77, thread_runtime, keymap));
+        let mut connected = crate::client::present_for_test(client, dir.path()).unwrap();
+        assert_eq!(
+            runtime.lock().unwrap().focused_toplevel(),
+            Some(SurfaceKey {
+                client: 77,
+                object: 7,
+            })
+        );
+        assert!(runtime.lock().unwrap().close_focused());
+        // A size the demo is never given: the wait ends only at an event
+        // the demo refuses, which is the close.
+        let error = connected.wait_for((1, 1), true, true).unwrap_err();
+        assert_eq!(error, "compositor requested that the demo close");
+        assert!(runtime.lock().unwrap().take_close_requests(77).is_empty());
+        drop(connected);
+        worker.join().unwrap().unwrap();
     }
 
     /// `set_title` was read for wire validity and dropped, so nothing the

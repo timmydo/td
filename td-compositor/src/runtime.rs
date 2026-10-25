@@ -623,6 +623,9 @@ pub struct Runtime {
     /// client. Still the client's to bound, and what a newer callback must
     /// not overtake.
     paced_in_transit: BTreeMap<u64, usize>,
+    /// `Super+q`'s polite close, per client by wl_surface, until the
+    /// client's configure worker sends each `xdg_toplevel.close`.
+    close_requests: BTreeMap<u64, BTreeSet<u32>>,
     headless_output: Option<crate::headless::OutputStamp>,
     headless_action: u64,
     clipboard_control: Option<ClipboardControl>,
@@ -865,6 +868,7 @@ impl Runtime {
             presented: Arc::new(PresentationClock::default()),
             paced_callbacks: BTreeMap::new(),
             paced_in_transit: BTreeMap::new(),
+            close_requests: BTreeMap::new(),
             headless_output: None,
             headless_action: 0,
             clipboard_control: None,
@@ -2703,6 +2707,7 @@ impl Runtime {
     /// nor an observed app-id candidate belongs to a future role object.
     pub fn forget_toplevel_state(&mut self, key: SurfaceKey) -> Result<(), String> {
         self.scene.forget_title(key);
+        self.forget_close_request(key);
         if let Some(ready) = self.application_ready.as_mut() {
             if ready.candidates.remove(&key) {
                 ready
@@ -3286,6 +3291,61 @@ impl Runtime {
         // still means the same thing to it.
         self.owed_damage = Damage::Whole;
         self.settle(true)
+    }
+
+    /// `Super+q`: ask the window the keyboard would reach to close, by the
+    /// one event the protocol has for it. A polite request only — a client
+    /// that ignores it keeps its window, and no process is signalled. The
+    /// window is the portal's modal dialog while one is up, and otherwise
+    /// the focused tile's topmost mapped child dialog or the tile itself,
+    /// which is the visible tab of a tabbed or stacked group and the
+    /// fullscreen window; a grabbing menu is not a window and does not move
+    /// it. Nothing is asked behind an overlay, on the attention screen or
+    /// the lock surface, or while a resume withholds input. Answers whether
+    /// a request was queued for the client's configure worker.
+    pub fn close_focused(&mut self) -> bool {
+        if self.scene.modal() || self.resume_withholds() {
+            return false;
+        }
+        let Some(key) = self
+            .scene
+            .portal_modal()
+            .or_else(|| self.scene.focused().map(|key| self.topmost_parented(key)))
+        else {
+            return false;
+        };
+        self.close_requests
+            .entry(key.client)
+            .or_default()
+            .insert(key.object);
+        self.wake_layout(key.client);
+        true
+    }
+
+    /// Whether `Super+q` queued a close for this client, which its
+    /// configure worker asks before taking the runtime lock again.
+    pub fn close_requested(&self, client: u64) -> bool {
+        self.close_requests.contains_key(&client)
+    }
+
+    /// The wl_surfaces whose toplevel `Super+q` asked to close, taken by
+    /// the client's configure worker, its registrations held, to send once
+    /// this lock is released.
+    pub fn take_close_requests(&mut self, client: u64) -> Vec<u32> {
+        self.close_requests
+            .remove(&client)
+            .map(|surfaces| surfaces.into_iter().collect())
+            .unwrap_or_default()
+    }
+
+    /// A close still queued for a toplevel that went is not the next one's.
+    fn forget_close_request(&mut self, key: SurfaceKey) {
+        if let Some(surfaces) = self.close_requests.get_mut(&key.client) {
+            surfaces.remove(&key.object);
+            if surfaces.is_empty() {
+                self.close_requests.remove(&key.client);
+            }
+        }
     }
 
     pub fn launcher(&mut self, action: LauncherAction) -> Result<Option<LaunchRequest>, String> {
@@ -4377,6 +4437,7 @@ impl Runtime {
         self.subscribers.remove(&id);
         self.paced_callbacks.remove(&id);
         self.paced_in_transit.remove(&id);
+        self.close_requests.remove(&id);
     }
 
     #[cfg(test)]
@@ -8140,6 +8201,148 @@ mod tests {
         receiver.recv().unwrap();
         assert!(stop.is_stopped());
         runtime.unsubscribe(7);
+    }
+
+    /// `Super+q` asks the window the keyboard would reach, once per
+    /// surface until its configure worker takes it, and never behind an
+    /// overlay, on a private screen or for a toplevel that went.
+    #[test]
+    fn super_q_queues_one_close_for_the_window_the_keyboard_reaches() {
+        let dir = crate::temp_dir::TempDir::new("td-runtime-close").unwrap();
+        let framebuffer =
+            Framebuffer::test_file(&dir.path().join("fb"), 320, 240, 320 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let (receiver, stop) = runtime.subscribe(7).unwrap().split();
+        receiver.try_recv().unwrap();
+        let key = |object| SurfaceKey { client: 7, object };
+        // Nothing focused, nothing asked.
+        assert!(!runtime.close_focused());
+        assert!(runtime.take_close_requests(7).is_empty());
+        runtime.commit(key(1), surface([1, 2, 3, 0])).unwrap();
+        runtime.commit(key(2), surface([4, 5, 6, 0])).unwrap();
+        while receiver.try_recv().is_ok() {}
+        let focused = runtime.scene.focused().unwrap();
+        assert!(runtime.close_focused());
+        // Asked twice before the worker runs is one event, and the worker
+        // is woken to send it.
+        assert!(runtime.close_focused());
+        receiver.try_recv().unwrap();
+        assert_eq!(runtime.take_close_requests(7), [focused.object]);
+        assert!(runtime.take_close_requests(7).is_empty());
+
+        // The visible tab of a group, and a fullscreen window, are the
+        // focused tile.
+        runtime
+            .command(Command::SetPresentation(Presentation::Tabbed))
+            .unwrap();
+        runtime.command(Command::Focus(Direction::Left)).unwrap();
+        let tab = runtime.scene.focused().unwrap();
+        assert!(runtime.close_focused());
+        assert_eq!(runtime.take_close_requests(7), [tab.object]);
+        runtime.command(Command::ToggleFullscreen).unwrap();
+        assert!(runtime.close_focused());
+        assert_eq!(runtime.take_close_requests(7), [tab.object]);
+        runtime.command(Command::ToggleFullscreen).unwrap();
+
+        // A mapped child dialog over the focused window is what the
+        // keyboard reaches, so it is what is asked.
+        let other = if tab == key(1) { key(2) } else { key(1) };
+        assert_eq!(runtime.set_local_parent(other, Some(tab)), Ok(Some(tab)));
+        runtime.focus_surface(tab).unwrap();
+        assert!(runtime.close_focused());
+        assert_eq!(runtime.take_close_requests(7), [other.object]);
+
+        // Nothing behind an overlay or on a private screen.
+        assert!(runtime.help(HelpAction::Toggle).unwrap());
+        assert!(!runtime.close_focused());
+        assert!(!runtime.help(HelpAction::Close).unwrap());
+        runtime.launcher(LauncherAction::Open).unwrap();
+        assert!(runtime.launcher_visible());
+        assert!(!runtime.close_focused());
+        runtime.launcher(LauncherAction::Close).unwrap();
+        let (jobs, _queued) = mpsc::sync_channel(1);
+        runtime.enable_screenshots(jobs, false);
+        assert!(runtime.screenshot(ScreenshotAction::Take).unwrap());
+        assert!(!runtime.close_focused());
+        assert!(!runtime.screenshot(ScreenshotAction::Cancel).unwrap());
+        runtime.scene.set_attention(true);
+        assert!(!runtime.close_focused());
+        runtime.scene.set_attention(false);
+
+        // A toplevel that went takes its queued close with it, and so does
+        // a client that went.
+        assert!(runtime.close_focused());
+        runtime.forget_toplevel_state(other).unwrap();
+        assert!(runtime.take_close_requests(7).is_empty());
+        assert!(runtime.close_focused());
+        runtime.unsubscribe(7);
+        assert!(runtime.take_close_requests(7).is_empty());
+        stop.stop();
+
+        runtime.scene.lock();
+        assert!(!runtime.close_focused());
+        assert!(runtime.take_close_requests(7).is_empty());
+    }
+
+    /// A grabbing menu holds the keyboard but is not a window, so the close
+    /// goes to the window under it; the portal's modal dialog is what the
+    /// keyboard reaches over its application, so the close cancels it.
+    #[test]
+    fn super_q_skips_a_menu_and_takes_the_portal_dialog_first() {
+        let dir = crate::temp_dir::TempDir::new("td-runtime-close-modal").unwrap();
+        let framebuffer =
+            Framebuffer::test_file(&dir.path().join("fb"), 240, 240, 240 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let application = SurfaceKey {
+            client: 1,
+            object: 4,
+        };
+        let menu = SurfaceKey {
+            client: 1,
+            object: 20,
+        };
+        let dialog = SurfaceKey {
+            client: 2,
+            object: 6,
+        };
+        let _registrations = lend_popups(&mut runtime, 1, &[menu.object]);
+        runtime.commit(application, surface([1, 2, 3, 0])).unwrap();
+        runtime.grab_popup(menu).unwrap();
+        let placement = PopupPlacement {
+            parent: application,
+            x: 5,
+            y: 7,
+            width: 10,
+            height: 10,
+        };
+        let paint =
+            Surface::from_shm_pixels(10, 10, [7u8, 8, 9, 0].repeat(100), SHM_XRGB8888).unwrap();
+        runtime
+            .commit_popup(menu, Some(paint), placement, None, None)
+            .unwrap();
+        assert_eq!(runtime.keyboard_target(), Some(menu));
+        assert!(runtime.close_focused());
+        assert_eq!(runtime.take_close_requests(1), [application.object]);
+        runtime.unmap_popup(menu).unwrap();
+
+        runtime.commit(dialog, surface([4, 5, 6, 0])).unwrap();
+        runtime
+            .export_foreign_toplevel(application, "close-parent".to_string())
+            .unwrap();
+        let manager = PortalManagerIdentity {
+            client: 2,
+            object: 20,
+            generation: 1,
+        };
+        assert_eq!(
+            runtime.set_portal_parent(dialog, "close-parent", manager, 1),
+            Ok(Some(application))
+        );
+        runtime.focus_surface(application).unwrap();
+        assert_eq!(runtime.scene.portal_modal(), Some(dialog));
+        assert!(runtime.close_focused());
+        assert!(runtime.take_close_requests(1).is_empty());
+        assert_eq!(runtime.take_close_requests(2), [dialog.object]);
     }
 
     #[test]

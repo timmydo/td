@@ -654,7 +654,8 @@ While locked:
 - Applications keep running. They receive no focus and no input from any
   source; new windows map behind the lock. Frame callbacks are not
   throttled. Audio and network continue.
-- Ordinary bindings (terminal, launcher, help, workspaces) are suppressed.
+- Ordinary bindings (terminal, launcher, help, workspaces, screenshot,
+  close) are suppressed.
   Control-socket and automation requests that inject input or capture output
   refuse; bridge clipboard snapshots already require keyboard focus.
 - Queued credential writes and installations stay unselectable; their own
