@@ -59,14 +59,28 @@ pub fn idle_observation(
     let claim = claim.clone();
     postgres_probe::with_scoped_mailbox_client(request, trust, deadline, move |scope| {
         Box::pin(async move {
-            let (client, current_policy) = owners::begin_scoped(scope, &claim, true, false).await.map_err(Error::Owner)?;
+            let (client, current_policy) = owners::begin_scoped(scope, &claim, true, false)
+                .await
+                .map_err(Error::Owner)?;
             if !current_policy {
                 return Err(Error::Policy);
             }
-            owners::check_locked(client, &claim, generation).await.map_err(Error::Owner)?;
-            let binding = claim.binding();
-            let account = binding.account();
-            let work: bool = client.query_typed_one(
+            idle_query(client, &claim, generation).await
+        })
+    })
+    .map_err(Error::Connection)?
+}
+async fn idle_query(
+    client: &tokio_postgres::Client,
+    claim: &Claim,
+    generation: u64,
+) -> Result<Option<i64>, Error> {
+    owners::check_locked(client, claim, generation)
+        .await
+        .map_err(Error::Owner)?;
+    let binding = claim.binding();
+    let account = binding.account();
+    let work: bool = client.query_typed_one(
                 "SELECT EXISTS(SELECT 1 FROM td_mta.submissions s JOIN td_mta.submission_routes r ON r.account=s.account AND r.submission_id=s.id WHERE s.account=$1 AND r.route_name=$2 AND r.destination=$3 AND s.completed_at IS NULL) OR EXISTS(SELECT 1 FROM td_mta.submissions WHERE account=$1 AND completed_at IS NOT NULL AND notification=1) OR EXISTS(SELECT 1 FROM td_mta.submission_attempts WHERE account=$1 AND route_name=$2 AND destination=$3 AND active)",
                 &[
                     (&account.as_bytes().as_slice(), tokio_postgres::types::Type::BYTEA),
@@ -74,11 +88,129 @@ pub fn idle_observation(
                     (&binding.route().destination().as_slice(), tokio_postgres::types::Type::BYTEA),
                 ],
             ).await.map_err(|_| Error::Database)?.try_get(0).map_err(|_| Error::Integrity)?;
-            let observed_at = owners::check_locked(client, &claim, generation).await.map_err(Error::Owner)?;
-            Ok((!work).then_some(observed_at))
-        })
-    }).map_err(Error::Connection)?
+    let observed_at = owners::check_locked(client, claim, generation)
+        .await
+        .map_err(Error::Owner)?;
+    Ok((!work).then_some(observed_at))
 }
+
+/// One foreground worker's finite idle connection, shared across account turns.
+/// Its slot remains reserved until close; no observation authorizes delivery.
+pub struct IdleReader<'a, 'r> {
+    slots: &'a crate::postgres_read::ReadSlots,
+    request: &'a Request<'r>,
+    trust: &'a TrustStore,
+    session: Option<(
+        postgres_probe::ReadSession,
+        crate::postgres_read::ReadPermit<'a>,
+    )>,
+}
+impl<'a, 'r> IdleReader<'a, 'r> {
+    pub fn new(
+        slots: &'a crate::postgres_read::ReadSlots,
+        request: &'a Request<'r>,
+        trust: &'a TrustStore,
+    ) -> Self {
+        Self {
+            slots,
+            request,
+            trust,
+            session: None,
+        }
+    }
+    pub(crate) fn maintain(&mut self) {
+        if self
+            .session
+            .as_ref()
+            .is_some_and(|(session, _)| session.needs_retirement(Instant::now()))
+        {
+            self.close();
+        }
+    }
+    pub fn close(&mut self) {
+        if let Some((session, permit)) = self.session.take() {
+            let now = Instant::now();
+            session.retire(
+                now.checked_add(std::time::Duration::from_millis(100))
+                    .unwrap_or(now),
+            );
+            drop(permit);
+        }
+    }
+    pub fn observe(
+        &mut self,
+        deadline: Instant,
+        claim: &Claim,
+        generation: u64,
+    ) -> Result<Option<i64>, Error> {
+        if self
+            .session
+            .as_ref()
+            .is_some_and(|(session, _)| !session.reusable(deadline))
+        {
+            self.close();
+        }
+        if self
+            .session
+            .as_mut()
+            .is_some_and(|(session, _)| session.check_idle(deadline).is_err())
+        {
+            self.close();
+        }
+        let reused = self.session.is_some();
+        if self.session.is_none() {
+            let permit = self.slots.acquire().map_err(|_| Error::Busy)?;
+            let session = postgres_probe::ReadSession::open(self.request, self.trust, deadline)
+                .map_err(Error::Connection)?;
+            self.session = Some((session, permit));
+        }
+        let claim = claim.clone();
+        let result = self
+            .session
+            .as_mut()
+            .ok_or(Error::Integrity)?
+            .0
+            .read(
+                claim.binding().epoch(),
+                postgres_probe::ReadIsolation::ReadCommitted,
+                deadline,
+                move |client| {
+                    Box::pin(async move {
+                        if !owners::lock_account_policy(client, &claim, true, false)
+                            .await
+                            .map_err(Error::Owner)?
+                        {
+                            return Err(Error::Policy);
+                        }
+                        idle_query(client, &claim, generation).await
+                    })
+                },
+            )
+            .map_err(Error::Connection)
+            .and_then(|result| result);
+        if reused {
+            crate::performance::record(
+                crate::performance::Phase::DbReuse,
+                std::time::Duration::ZERO,
+                if result.is_ok() {
+                    crate::performance::Outcome::Success
+                } else {
+                    crate::performance::Outcome::Failed
+                },
+            );
+        }
+        if result.is_err() {
+            self.close();
+        }
+        result
+    }
+}
+impl Drop for IdleReader<'_, '_> {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
 /// Holds policy/account/route locks for this bounded read only. The returned
 /// page is not a snapshot continuation or a reservation; restart at None on
 /// the next scheduling pass. Recheck queue-clock guards and every publication

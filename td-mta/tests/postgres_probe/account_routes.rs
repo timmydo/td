@@ -469,6 +469,7 @@ fn scoped_qualification(
             );
         }
     }
+    retained_idle(fixture, &runtime, trust, &claim, grant.generation);
     sql(fixture, "ALTER SYSTEM RESET log_statement");
     sql(fixture, "SELECT pg_reload_conf()");
 
@@ -552,4 +553,103 @@ fn scoped_qualification(
         "t"
     );
     owners::release_many(&runtime, trust, deadline(), &[(&claim, grant.generation)]).unwrap();
+}
+
+fn retained_idle(
+    fixture: &Fixture,
+    request: &td_mta::postgres_probe::Request<'_>,
+    trust: &TrustStore,
+    claim: &td_mta::postgres_route_owners::Claim,
+    generation: u64,
+) {
+    use td_mta::{
+        postgres_queue_candidates::{self as hints, IdleReader},
+        postgres_read::ReadSlots,
+        postgres_route_owners as owners, postgres_schema,
+    };
+    owners::renew(request, trust, deadline(), claim, generation).unwrap();
+    let expected = hints::idle_observation(request, trust, deadline(), claim, generation)
+        .unwrap()
+        .is_some();
+    super::body_checks::quiet(fixture);
+    let offset = std::fs::metadata(fixture.root.join("server.log"))
+        .unwrap()
+        .len() as usize;
+    let slots = ReadSlots::new(1).unwrap();
+    let mut reader = IdleReader::new(&slots, request, trust);
+    assert_eq!(
+        reader
+            .observe(deadline(), claim, generation)
+            .unwrap()
+            .is_some(),
+        expected
+    );
+    let pid = super::body_checks::backend(fixture);
+    for _ in 1..64 {
+        assert_eq!(
+            reader
+                .observe(deadline(), claim, generation)
+                .unwrap()
+                .is_some(),
+            expected
+        );
+    }
+    assert_eq!(super::body_checks::backend(fixture), pid);
+    assert_eq!(sql(fixture, &format!("SELECT state||'|'||(xact_start IS NULL)::text FROM pg_catalog.pg_stat_activity WHERE pid={pid}")), "idle|true");
+    assert!(sql(fixture, &format!("BEGIN; SELECT pg_catalog.pg_try_advisory_xact_lock({}); SELECT id FROM td_mta.accounts FOR UPDATE NOWAIT; SELECT singleton FROM td_mta.config_selection FOR UPDATE NOWAIT; SELECT account FROM td_mta.route_owners FOR UPDATE NOWAIT; ROLLBACK", postgres_schema::MIGRATION_KEY)).lines().any(|line| line == "f"));
+    let log = std::fs::read_to_string(fixture.root.join("server.log")).unwrap();
+    let reads = log[offset..].lines().filter(|line| line.contains("execute ") && line.contains("SELECT version, checksum, store_epoch FROM td_mta.schema_migrations ORDER BY version")).count();
+    assert_eq!(
+        reads, 1,
+        "one ledger qualification across 64 idle observations"
+    );
+    let mut other = IdleReader::new(&slots, request, trust);
+    assert_eq!(
+        other.observe(deadline(), claim, generation),
+        Err(hints::Error::Busy)
+    );
+    assert_eq!(
+        reader
+            .observe(deadline(), claim, generation)
+            .unwrap()
+            .is_some(),
+        expected
+    );
+    super::body_checks::closed(fixture, &pid);
+    assert_ne!(super::body_checks::backend(fixture), pid);
+    let pid = super::body_checks::backend(fixture);
+    assert!(matches!(
+        reader.observe(deadline(), claim, generation + 1),
+        Err(hints::Error::Owner(owners::Error::Stale))
+    ));
+    super::body_checks::closed(fixture, &pid);
+    assert!(other.observe(deadline(), claim, generation).is_ok());
+    other.close();
+    assert!(reader.observe(deadline(), claim, generation).is_ok());
+    let pid = super::body_checks::backend(fixture);
+    sql(fixture, "UPDATE td_mta.runtime_barrier SET blocked=true");
+    assert_eq!(
+        reader.observe(deadline(), claim, generation),
+        Err(hints::Error::Connection(
+            td_mta::postgres_probe::Error::RuntimeMaintenance
+        ))
+    );
+    super::body_checks::closed(fixture, &pid);
+    sql(fixture, "UPDATE td_mta.runtime_barrier SET blocked=false");
+    assert!(reader.observe(deadline(), claim, generation).is_ok());
+    let pid = super::body_checks::backend(fixture);
+    drop(reader);
+    super::body_checks::closed(fixture, &pid);
+    assert_eq!(
+        sql(
+            fixture,
+            &format!(
+                "SELECT pg_catalog.pg_try_advisory_xact_lock({})",
+                postgres_schema::MIGRATION_KEY
+            )
+        ),
+        "t"
+    );
+    assert!(other.observe(deadline(), claim, generation).is_ok());
+    other.close();
 }

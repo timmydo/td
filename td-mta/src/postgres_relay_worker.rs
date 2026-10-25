@@ -145,17 +145,18 @@ impl Worker<'_, '_> {
         generation: u64,
         control: &Control,
         state: &mut multi::AccountState,
+        idle_reader: &mut crate::postgres_queue_candidates::IdleReader<'_, '_>,
         expiry_turn: Option<&mut multi::ExpiryTurn>,
         mut buffers: Buffers,
     ) -> Result<Buffers, Error> {
         state.active = database(worker.pending.identity())?.is_some();
+        if state.active || self.queue.repair_request().is_some() {
+            idle_reader.close();
+        }
         settle(worker, settlement, control)?;
         if !state.active && self.queue.repair_request().is_none() {
             let observed = {
-                let _slot = database(worker.connection.slots.acquire())?;
-                database(crate::postgres_queue_candidates::idle_observation(
-                    self.request,
-                    self.trust,
+                database(idle_reader.observe(
                     Instant::now() + Duration::from_secs(10),
                     claim,
                     generation,
@@ -170,6 +171,8 @@ impl Worker<'_, '_> {
                 return Ok(buffers);
             }
         }
+        // Active work must recover the foreground slot before acquiring custody.
+        idle_reader.close();
         if Instant::now() >= state.notice_at {
             let _slot = database(worker.connection.slots.acquire())?;
             let notice = crate::postgres_failure_notice::publish_next(

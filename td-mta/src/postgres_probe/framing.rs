@@ -50,12 +50,12 @@ impl Input {
         }
     }
 
-    pub(super) fn authentication() -> Self {
+    pub(super) fn retained() -> Self {
         let single = Self::mutations();
         Self {
-            window: Some(Windows::new(super::authentication::TURNS)),
-            bytes: single.bytes * super::authentication::TURNS,
-            frames: single.frames * super::authentication::TURNS,
+            window: Some(Windows::new(super::retained::TURNS)),
+            bytes: single.bytes * super::retained::TURNS,
+            frames: single.frames * super::retained::TURNS,
             ..single
         }
     }
@@ -280,10 +280,10 @@ mod tests {
 
     #[test]
     fn authentication_jobs_share_first_window_and_never_refill_session_totals() {
-        let mut input = Input::authentication();
+        let mut input = Input::retained();
         let window = input.window().unwrap();
         input.accept(&authenticated()).unwrap();
-        for turn in 0..super::super::authentication::TURNS {
+        for turn in 0..super::super::retained::TURNS {
             window.begin().unwrap();
             for _ in if turn == 0 { 5 } else { 0 }..1088 {
                 input.accept(&frame(b'N', b"\0")).unwrap();
@@ -297,7 +297,7 @@ mod tests {
         assert!(window.begin().is_err());
         assert!(input.accept(&frame(b'N', b"\0")).is_err());
 
-        let mut input = Input::authentication();
+        let mut input = Input::retained();
         let window = input.window().unwrap();
         input.accept(&authenticated()).unwrap();
         window.begin().unwrap();

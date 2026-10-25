@@ -4295,6 +4295,18 @@ receipt settlement remains on independently admitted capacity. Candidate
 observations do not change queue-clock admission or grant SMTP permission.
 
 
+The foreground relay's idle absence reader retains one of its existing ordinary
+read permits across empty account turns; it is shared by every account in that
+worker. Its connection closes before active work, repair, settlement or permit
+release. The common retained-read profile admits at most 64 ten-second jobs
+within one immutable sixty-second TLS lifetime. Each job has a one-MiB input,
+1088-frame and 64-KiB output window; cold qualification shares the first window.
+Cumulative limits remain 64 MiB input, 69632 frames and 4 MiB output. These are
+work bounds, not resident allocations. Reuse adds no worker, connection slot,
+queue, account-specific session or message-sized buffer. Every successful job
+acknowledges rollback; only the shared migration lock survives until close.
+
+
 Worker route acquisition prepays 2 MiB+192 KiB I/O and 4096 records across
 one receipt connection and at most one mutation connection, using one ordinary
 slot sequentially. Their existing protocol ceilings remain 1 MiB input per

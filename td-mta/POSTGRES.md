@@ -80,9 +80,11 @@ compatibility and retain it until closure. Retained Body/Envelope validators
 (sections 180 and 187) instead take the same key's shared transaction-level
 lock on each turn, fully revalidate schema/epoch and Runtime access before
 application reads, and acknowledge rollback before returning. The fixed HTTPS
-authentication worker (below) acquires the session lock at connection admission,
+authentication worker and foreground relay idle reader (below) acquire the
+session lock at connection admission,
 qualifies the schema and runtime role once, and retains that lock until closure.
-Its jobs still check epoch, maintenance, selected configuration and credentials
+Their jobs still check epoch, maintenance and selected configuration;
+authentication observes credentials and idle reads observe route ownership
 in fresh snapshots, acknowledging rollback before reuse. Body/Envelope
 validators retain their per-turn qualification and release their migration
 locks between turns.
@@ -2098,8 +2100,8 @@ operator commands. Runtime mode authenticates TLS/SCRAM, checks primary and
 durability settings, acquires the shared migration lock, validates the current
 schema and checks the dedicated runtime role/table privileges before admitting
 an operation's SQL. A new connection repeats all of those checks; a previous
-cold receipt never substitutes for them. Retained HTTPS authentication holds
-that qualification and migration lock for its finite connection lifetime,
+cold receipt never substitutes for them. Retained HTTPS authentication and foreground relay idle readers hold
+that qualification and migration lock for their finite connection lifetimes,
 with fresh job fences as specified under Retained HTTPS authentication
 sessions. Other operation-owned connections hold the lock through their
 operation. BodyChecks instead authenticates at open and performs
@@ -6707,17 +6709,32 @@ A stale member rolls the batch back. All I/O shares one ten-second deadline;
 uncertain renewal stops the process. Lock contention on one account can therefore
 affect this process's availability. It cannot grant stale transport authority.
 
-The absence read and batched renewal/release consume a callback-scoped client
-whose Runtime connection qualification carries its freshly inspected schema
-receipt. The shared session migration lock remains held continuously through
-the operation, so its transaction entry checks the expected epoch without
-repeating that same connection's schema queries or recursive lock acquisition.
-The scope supplies its own client and cannot escape the callback; neither
-receipt nor authority is reused by a later job. Preparation connections still
-inspect the schema at transaction entry. Runtime role, privilege, maintenance,
-selected configuration, account locks, owner generation and database-time checks
-retain their existing order and freshness. Connection, wire, deadline and
-uncertain-COMMIT bounds are unchanged.
+The foreground worker retains one qualified idle-reader connection across
+account turns and empty-round pauses. It holds one existing ordinary read
+permit until connection close. The shared finite read-session implementation
+also backs HTTPS authentication: at most 64 jobs in sixty seconds, immutable
+TLS lifetime, finite cumulative/per-job wire windows, one owning thread and
+ten-second job deadlines. Connection admission qualifies schema and runtime
+role once and holds the migration lock until close. Each idle job begins a
+fresh READ COMMITTED transaction, checks epoch and maintenance, locks current
+configuration/account/owner rows, and acknowledges ROLLBACK before returning.
+No account lock, transaction or absence observation survives the job. Idle
+checks retain no authority to send. Failure retires the session; an observable
+idle disconnect can reconnect before a job, never replay an admitted one.
+
+The worker closes this reader before pending settlement, explicit repair,
+positive-hint processing, delivery custody and final lease release. Rotation,
+shutdown and error cleanup close the connection before releasing its permit;
+clean idle cleanup has the existing bounded termination allowance. Each loop
+also retires exhausted or near-expiry idle sessions even when no account owns
+a usable lease; this local maintenance issues no SQL. Account
+count does not multiply retained sessions or extend any allowance.
+
+The standalone absence helper and batched renewal/release still consume a
+callback-scoped client whose Runtime qualification carries its inspected schema
+receipt under the same session lock. Preparation connections inspect the schema
+at transaction entry. Renewal, publication and uncertain-COMMIT handling are
+unchanged; no write connection is retained by this read-session increment.
 
 Registry acknowledgements match the exact claim operation and generation.
 Published slots are never replaced while the worker runs. One fresh database

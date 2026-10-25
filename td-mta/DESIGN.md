@@ -1238,6 +1238,14 @@ changing these goals. Record RSS and cgroup memory separately, including
 page-cache effects, workload, concurrency and sampling limitations. A ledger
 sum or isolated allocation probe establishes neither result.
 
+Initial latency targets are the first 50 uncached summaries within 0.5 seconds
+and 256 within two seconds in local td-mail, and SMTP acknowledgement within
+0.5 seconds after DATA finishes for a one-MiB message. Report median and p95
+under a small concurrent workload, including the reader/sender counts, network
+path and cold/warm state. These are performance goals, not permission to weaken
+durable publication or authorization. A server method timing alone does not
+establish the client-visible first-row target.
+
 Prefer reusable buffers and borrowed views where they simplify ownership and
 streaming. Bounded per-request allocations are permitted. There is no global
 zero-allocation contract and no requirement to allocate and touch every

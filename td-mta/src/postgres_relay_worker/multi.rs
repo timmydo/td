@@ -269,6 +269,8 @@ pub(super) fn run(
     let mut buffers = (Box::new([0; TLS_WIRE_BYTES]), Box::new([0; TLS_WIRE_BYTES]));
     let mut repairing = None;
     let mut idle = IdlePause::new();
+    let mut idle_reader =
+        crate::postgres_queue_candidates::IdleReader::new(&slots, worker.request, worker.trust);
     let mut active_round = false;
     let mut expiry_turn = ExpiryTurn { cursor: 0, count };
     let result = std::thread::scope(|scope| {
@@ -282,6 +284,7 @@ pub(super) fn run(
         let finish = Finish(&registry);
         let result = (|| {
             while !control.stop_requested() {
+                idle_reader.maintain();
                 let request = worker.queue.repair_request();
                 if request != repairing {
                     for state in &mut states {
@@ -300,6 +303,7 @@ pub(super) fn run(
                         grant.generation,
                         control,
                         state,
+                        &mut idle_reader,
                         expiry_turn.current(cursor).then_some(&mut expiry_turn),
                         buffers,
                     )?;
@@ -325,6 +329,7 @@ pub(super) fn run(
         let renewed = renew.join().map_err(|_| Error::Worker)?;
         result.and(renewed)
     });
+    idle_reader.close();
     // Close foreground custody and join renewal before one bounded release.
     let snapshot = registry.snapshot()?;
     let leases = leases(&snapshot)?;
