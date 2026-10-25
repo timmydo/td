@@ -4560,7 +4560,14 @@ DATA buffers, at most two per socket peer address, each reserved up front to the
 trace allowance. A paused sender retains its buffer and permit but no database
 connection or storage-worker execution time. The singleton storage worker
 serializes preparation and publication, retaining at most one additional
-filtered body and one uncertain operation. At the 32-MiB message ceiling the
+filtered body and one uncertain operation. Body preparation preserves the
+original per-line scan, record and output charges and validates CRLF plus the
+1000-byte line ceiling before copying. Its body-only loop samples the clock
+once per bounded turn of at most 64 KiB plus 999 bytes, and again before
+returning; headers retain their existing parser checks. This avoids repeated
+clock reads for every short body line without replenishing the original meter
+or changing publication-before-acknowledgement. A deadline can expire during
+one bounded turn; the next clock check refuses the prepared result. At the 32-MiB message ceiling the
 incoming capacities total at most 128 MiB and filtered payload at most another
 32 MiB. Preparation requests one exact reservation for the received length plus
 the bounded trace allowance, including the possible header/body separator.
