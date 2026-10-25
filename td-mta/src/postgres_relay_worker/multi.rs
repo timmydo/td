@@ -271,6 +271,7 @@ pub(super) fn run(
         pending: &pending,
     };
     let mut buffers = (Box::new([0; TLS_WIRE_BYTES]), Box::new([0; TLS_WIRE_BYTES]));
+    let mut dns_cache = crate::dns_owner::Cache::default();
     let mut repairing = None;
     let mut idle = IdlePause::new();
     let mut idle_reader =
@@ -308,6 +309,7 @@ pub(super) fn run(
                         control,
                         state,
                         &mut idle_reader,
+                        &mut dns_cache,
                         expiry_turn.current(cursor).then_some(&mut expiry_turn),
                         buffers,
                     )?;

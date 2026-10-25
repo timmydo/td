@@ -85,6 +85,7 @@ pub struct Scratch<'a> {
     pub plain: &'a mut [u8],
     pub encoded: &'a mut [u8],
     pub dns: &'a mut [u8],
+    pub dns_cache: &'a mut crate::dns_owner::Cache,
 }
 impl Scratch<'_> {
     fn ehlo(&mut self) -> ehlo::Scratch<'_> {
@@ -361,6 +362,7 @@ fn setup<B: TlsWireStorage, E: Entropy>(
                     &clock,
                     entropy,
                     scratch.dns,
+                    scratch.dns_cache,
                 )?;
                 let result = resolver.resolve(host, cap, &mut addresses)?;
                 hostname_bytes

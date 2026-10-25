@@ -479,8 +479,10 @@ existing protocol caps and body reservations remain unchanged.
 
 The resolver's 128 KiB includes 128 cache entries of at most 384 bytes
 (48 KiB), a 64 KiB packet/TCP buffer and 16 KiB question/name/alias-chain,
-address-result and cursor state. Cache keys are configured endpoint index plus
-configuration generation, not copied DNS names/CNAME chains. SCHEMA.md selects
+address-result and cursor state. The retained worker cache has two endpoint slots and fits 2 KiB including
+canonical configured names, ordered numeric resolver endpoints, generation
+and the shared clock binding. It fits within the existing resolver reservation;
+no packet buffer or cache is allocated per attempt. CNAME chains are not cached. SCHEMA.md selects
 1..4 explicit numeric resolver endpoints and restricts ACME operational URLs to
 the directory origin. Offline migration may own one additional bounded endpoint
 slot for its explicit source origin, released at job exit. Entries retain

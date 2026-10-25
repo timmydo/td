@@ -1464,7 +1464,9 @@ scheduling and cache integration remain separate owners.
 The prepared `dns_owner::Configured` implements the Resolver port for one
 exclusively owned fixed worker. Construct it from the active configuration's
 outbound and certificate views, a nonzero configuration generation, the shared
-runtime clock, worker-local entropy and the single reserved packet cell. It
+runtime clock, worker-local entropy, the single reserved packet cell and a
+mutable cache owned by the relay worker across delivery attempts. Rebuilding
+the borrowed resolver for another attempt does not reset the cache. It
 admits only the configured relay hostname and optional ACME directory hostname,
 case-insensitively. No raw-host registration API admits incoming names, alias
 targets or arbitrary application destinations. The service owner has two fixed
@@ -1472,7 +1474,11 @@ endpoint slots; offline migration's separately authorized temporary destination
 is outside this service owner. Constructing the port does not start a worker
 or activate outbound delivery.
 
-The cache key is endpoint slot plus configuration generation. Entries retain
+The cache binding includes configuration generation, canonical configured
+hostnames (including optional ACME presence), and ordered numeric resolver
+endpoints. Any binding change clears both slots. The first binding pins an
+Arc of the runtime clock; a different clock domain is refused before use.
+Entries retain
 only final addresses and absolute expiry, never alias paths, and a hit requires
 strictly future expiry. Unknown names, expired caller deadlines and insufficient
 output capacity refuse before network work. Expired entries are retired before

@@ -146,6 +146,7 @@ impl Worker<'_, '_> {
         control: &Control,
         state: &mut multi::AccountState,
         idle_reader: &mut crate::postgres_queue_candidates::IdleReader<'_, '_>,
+        dns_cache: &mut crate::dns_owner::Cache,
         expiry_turn: Option<&mut multi::ExpiryTurn>,
         mut buffers: Buffers,
     ) -> Result<Buffers, Error> {
@@ -346,6 +347,7 @@ impl Worker<'_, '_> {
                         buffers,
                         cap,
                         &mut db,
+                        dns_cache,
                         claim,
                         generation,
                     )?;
@@ -419,6 +421,7 @@ impl Worker<'_, '_> {
         buffers: Buffers,
         cap: Deadline,
         db: &mut Meter,
+        dns_cache: &mut crate::dns_owner::Cache,
         claim: &owners::Claim,
         generation: u64,
     ) -> Result<Buffers, Error> {
@@ -446,6 +449,7 @@ impl Worker<'_, '_> {
                 plain: &mut plain,
                 encoded: &mut encoded,
                 dns: &mut dns,
+                dns_cache,
             },
             database(SystemEntropy::try_new())?,
             &mut wire,

@@ -10,6 +10,7 @@ use crate::{
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     num::NonZeroU64,
+    sync::Arc,
 };
 use td_mime::work::{Charge, Meter};
 
@@ -28,6 +29,41 @@ struct Entry {
     resolution: Resolution,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Binding {
+    generation: NonZeroU64,
+    names: [Option<crate::dns_wire::Name>; SLOTS],
+    servers: [SocketAddr; outbound::MAX_RESOLVERS],
+    server_count: usize,
+}
+
+/// Two bounded endpoint entries shared across attempts on one runtime clock.
+#[derive(Default)]
+pub struct Cache {
+    clock: Option<Arc<RuntimeClock>>,
+    binding: Option<Binding>,
+    entries: [Option<Entry>; SLOTS],
+}
+impl Cache {
+    fn bind(&mut self, clock: &Arc<RuntimeClock>, binding: Binding) -> Result<(), Error> {
+        if self
+            .clock
+            .as_ref()
+            .is_some_and(|held| !Arc::ptr_eq(held, clock))
+        {
+            return Err(Error::Invalid);
+        }
+        if self.binding.as_ref() != Some(&binding) {
+            self.entries.fill(None);
+            self.binding = Some(binding);
+        }
+        if self.clock.is_none() {
+            self.clock = Some(clock.clone());
+        }
+        Ok(())
+    }
+}
+
 /// Build on the owning worker from the active configuration. Entropy must be
 /// initialized there; packet storage is the single reserved resolver cell.
 /// Configuration borrows and generation remain fixed for this owner's life.
@@ -38,7 +74,7 @@ pub struct Configured<'a, E> {
     names: [Option<&'a str>; SLOTS],
     servers: [SocketAddr; outbound::MAX_RESOLVERS],
     server_count: usize,
-    cache: [Option<Entry>; SLOTS],
+    cache: &'a mut Cache,
     packet: &'a mut [u8],
 }
 impl<'a, E: Entropy> Configured<'a, E> {
@@ -46,10 +82,18 @@ impl<'a, E: Entropy> Configured<'a, E> {
         outbound: outbound::View<'_, 'a>,
         certificates: certificate::View<'_, 'a>,
         generation: NonZeroU64,
-        clock: &'a RuntimeClock,
+        clock: &'a Arc<RuntimeClock>,
         entropy: E,
         packet: &'a mut [u8],
+        cache: &'a mut Cache,
     ) -> Result<Self, Error> {
+        if cache
+            .clock
+            .as_ref()
+            .is_some_and(|held| !Arc::ptr_eq(held, clock))
+        {
+            return Err(Error::Invalid);
+        }
         let packet = packet.get_mut(..PACKET_BYTES).ok_or(Error::Capacity)?;
         let relay = outbound.relay().map_err(|_| Error::Invalid)?;
         let acme = certificates.acme().map_err(|_| Error::Invalid)?;
@@ -65,14 +109,37 @@ impl<'a, E: Entropy> Configured<'a, E> {
                 .ok_or(Error::Invalid)?
                 .endpoint;
         }
+        let names = [Some(relay.host), acme.map(|acme| acme.directory.host())];
+        let binding = Binding {
+            generation,
+            names: [
+                names
+                    .first()
+                    .copied()
+                    .flatten()
+                    .map(crate::dns_wire::Name::from_host)
+                    .transpose()
+                    .map_err(|_| Error::Invalid)?,
+                names
+                    .get(1)
+                    .copied()
+                    .flatten()
+                    .map(crate::dns_wire::Name::from_host)
+                    .transpose()
+                    .map_err(|_| Error::Invalid)?,
+            ],
+            servers,
+            server_count,
+        };
+        cache.bind(clock, binding)?;
         Ok(Self {
             clock,
             entropy,
             generation,
-            names: [Some(relay.host), acme.map(|acme| acme.directory.host())],
+            names,
             servers,
             server_count,
-            cache: [None; SLOTS],
+            cache,
             packet,
         })
     }
@@ -91,11 +158,16 @@ impl<'a, E: Entropy> Configured<'a, E> {
             .ok_or(Error::Forbidden)
     }
     fn cached(&self, index: usize, now: Tick) -> Option<Entry> {
-        self.cache.get(index).copied().flatten().filter(|entry| {
-            entry.generation == self.generation
-                && entry.index == index
-                && entry.resolution.valid_until > now
-        })
+        self.cache
+            .entries
+            .get(index)
+            .copied()
+            .flatten()
+            .filter(|entry| {
+                entry.generation == self.generation
+                    && entry.index == index
+                    && entry.resolution.valid_until > now
+            })
     }
 }
 impl<E: Entropy> Resolver for Configured<'_, E> {
@@ -118,7 +190,7 @@ impl<E: Entropy> Resolver for Configured<'_, E> {
             None => {
                 // Retire expired data before any fallible lookup. There is no
                 // stale-on-error path, negative cache or background refresh.
-                *self.cache.get_mut(index).ok_or(Error::Invalid)? = None;
+                *self.cache.entries.get_mut(index).ok_or(Error::Invalid)? = None;
                 let configured = self
                     .names
                     .get(index)
@@ -151,14 +223,14 @@ impl<E: Entropy> Resolver for Configured<'_, E> {
                 };
                 let now = self.now(deadline)?;
                 if resolution.valid_until > now {
-                    *self.cache.get_mut(index).ok_or(Error::Invalid)? = Some(entry);
+                    *self.cache.entries.get_mut(index).ok_or(Error::Invalid)? = Some(entry);
                 }
                 entry
             }
         };
         let now = self.now(deadline)?;
         if from_cache && entry.resolution.valid_until <= now {
-            *self.cache.get_mut(index).ok_or(Error::Invalid)? = None;
+            *self.cache.entries.get_mut(index).ok_or(Error::Invalid)? = None;
             return Err(Error::Dns);
         }
         output
@@ -174,6 +246,7 @@ impl<E: Entropy> Resolver for Configured<'_, E> {
     }
 }
 const _: () = assert!(std::mem::size_of::<Entry>() <= 384);
+const _: () = assert!(std::mem::size_of::<Cache>() <= 2048);
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
@@ -181,6 +254,7 @@ mod tests {
     use super::*;
     use crate::config::{syntax::Location, text};
     use std::{cell::Cell, net::UdpSocket, num::NonZeroU32, rc::Rc, thread, time::Duration};
+    #[derive(Clone)]
     struct Random {
         count: Rc<Cell<u16>>,
         fail: Rc<Cell<bool>>,
@@ -270,8 +344,8 @@ mod tests {
         bytes
     }
     #[test]
-    fn configured_names_use_cache_but_zero_ttl_requeries() {
-        for ttl in [0, 60] {
+    fn rebuilt_resolvers_reuse_positive_cache_but_not_zero_ttl_or_missing_family() {
+        for (ttl, both) in [(0, true), (60, true), (60, false)] {
             let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
             socket
                 .set_read_timeout(Some(Duration::from_secs(2)))
@@ -279,17 +353,57 @@ mod tests {
             let endpoint = socket.local_addr().unwrap();
             thread::scope(|scope| {
                 scope.spawn(|| {
-                    for _ in 0..if ttl == 0 { 4 } else { 2 } {
+                    for _ in 0..if ttl == 0 || !both { 4 } else { 2 } {
                         let mut bytes = [0; 512];
                         let (size, peer) = socket.recv_from(&mut bytes).unwrap();
-                        socket.send_to(&answer(&bytes[..size], ttl), peer).unwrap();
+                        let mut response = answer(&bytes[..size], ttl);
+                        if !both && bytes[size - 3] == 28 {
+                            response.truncate(size);
+                            response[7] = 0;
+                        }
+                        socket.send_to(&response, peer).unwrap();
                     }
                 });
                 fixture(endpoint, |out, cert| {
-                    let clock = RuntimeClock::new();
+                    let clock = Arc::new(RuntimeClock::new());
+                    let mut cache = Cache::default();
                     let entropy = random();
                     let count = entropy.count.clone();
                     let mut packet = vec![0; PACKET_BYTES];
+                    let deadline =
+                        Deadline::after(clock.sample().unwrap().monotonic, 2000).unwrap();
+                    let sentinel = IpAddr::from([203, 0, 113, 9]);
+                    let mut output = [sentinel; MAX_ADDRESSES];
+                    let mut expiry = None;
+                    for host in ["relay.test", "RELAY.TEST"] {
+                        let mut owner = Configured::new(
+                            out,
+                            cert,
+                            NonZeroU64::new(1).unwrap(),
+                            &clock,
+                            entropy.clone(),
+                            &mut packet,
+                            &mut cache,
+                        )
+                        .unwrap();
+
+                        let result = owner.resolve(host, deadline, &mut output).unwrap();
+                        assert_eq!(result.count, if both { 2 } else { 1 });
+                        assert!(output[0].is_ipv4());
+                        if both {
+                            assert!(output[1].is_ipv6());
+                        } else {
+                            assert_eq!(output[1], sentinel);
+                        }
+                        if ttl != 0 && both {
+                            if let Some(expiry) = expiry {
+                                assert_eq!(result.valid_until, expiry);
+                            }
+                            expiry = Some(result.valid_until);
+                        }
+                        assert!(output[2..].iter().all(|a| *a == sentinel));
+                    }
+                    assert_eq!(count.get(), if ttl == 0 || !both { 4 } else { 2 });
                     let mut owner = Configured::new(
                         out,
                         cert,
@@ -297,21 +411,10 @@ mod tests {
                         &clock,
                         entropy,
                         &mut packet,
+                        &mut cache,
                     )
                     .unwrap();
-                    let deadline =
-                        Deadline::after(clock.sample().unwrap().monotonic, 2000).unwrap();
-                    let sentinel = IpAddr::from([203, 0, 113, 9]);
-                    let mut output = [sentinel; MAX_ADDRESSES];
-                    for host in ["relay.test", "RELAY.TEST"] {
-                        let result = owner.resolve(host, deadline, &mut output).unwrap();
-                        assert_eq!(result.count, 2);
-                        assert!(output[0].is_ipv4());
-                        assert!(output[1].is_ipv6());
-                        assert!(output[2..].iter().all(|a| *a == sentinel));
-                    }
-                    assert_eq!(count.get(), if ttl == 0 { 4 } else { 2 });
-                    assert_eq!(owner.cache[0].is_some(), ttl != 0);
+                    assert_eq!(owner.cache.entries[0].is_some(), ttl != 0 && both);
                     let before = output;
                     assert_eq!(
                         owner.resolve("incoming.example.test", deadline, &mut output),
@@ -328,16 +431,88 @@ mod tests {
         }
     }
     #[test]
+    fn cache_binding_retires_changed_configuration_and_rejects_clock_domains() {
+        let clock = Arc::new(RuntimeClock::new());
+        let generation = NonZeroU64::new(1).unwrap();
+        let binding = Binding {
+            generation,
+            names: [
+                Some(crate::dns_wire::Name::from_host("Relay.Test").unwrap()),
+                Some(crate::dns_wire::Name::from_host("Ca.Test").unwrap()),
+            ],
+            servers: [SocketAddr::from((Ipv4Addr::LOCALHOST, 53)); outbound::MAX_RESOLVERS],
+            server_count: 1,
+        };
+        let entry = Entry {
+            generation,
+            index: 0,
+            values: [IpAddr::from([192, 0, 2, 1]); MAX_ADDRESSES],
+            resolution: Resolution {
+                count: 1,
+                valid_until: Tick(1000),
+            },
+        };
+        let mut cache = Cache::default();
+        cache.bind(&clock, binding.clone()).unwrap();
+        cache.entries[0] = Some(entry);
+        let mut case_only = binding.clone();
+        case_only.names[0] = Some(crate::dns_wire::Name::from_host("relay.test").unwrap());
+        cache.bind(&clock.clone(), case_only).unwrap();
+        assert!(cache.entries[0].is_some());
+        assert_eq!(
+            cache.bind(&Arc::new(RuntimeClock::new()), binding.clone()),
+            Err(Error::Invalid)
+        );
+        assert!(cache.entries[0].is_some());
+        let mut variants = Vec::new();
+        let mut changed = binding.clone();
+        changed.generation = NonZeroU64::new(2).unwrap();
+        variants.push(changed);
+        for index in 0..SLOTS {
+            let mut changed = binding.clone();
+            changed.names[index] = Some(crate::dns_wire::Name::from_host("other.test").unwrap());
+            variants.push(changed);
+        }
+        let mut changed = binding.clone();
+        changed.names[1] = None;
+        variants.push(changed);
+        let mut changed = binding.clone();
+        changed.servers[0].set_port(5353);
+        variants.push(changed);
+        let mut changed = binding.clone();
+        changed.servers[0].set_ip(IpAddr::from([127, 0, 0, 2]));
+        variants.push(changed);
+        let mut changed = binding.clone();
+        changed.server_count = 2;
+        variants.push(changed);
+        for changed in variants {
+            cache.bind(&clock, binding.clone()).unwrap();
+            cache.entries[0] = Some(entry);
+            cache.bind(&clock, changed).unwrap();
+            assert!(cache.entries.iter().all(Option::is_none));
+        }
+    }
+
+    #[test]
     fn cache_keys_expiry_and_refusals_preserve_output() {
         fixture(SocketAddr::from((Ipv4Addr::LOCALHOST, 53)), |out, cert| {
-            let clock = RuntimeClock::new();
+            let clock = Arc::new(RuntimeClock::new());
+            let mut cache = Cache::default();
             let entropy = random();
             let count = entropy.count.clone();
             let fail = entropy.fail.clone();
             let mut packet = vec![0; PACKET_BYTES];
             let generation = NonZeroU64::new(4).unwrap();
-            let mut owner =
-                Configured::new(out, cert, generation, &clock, entropy, &mut packet).unwrap();
+            let mut owner = Configured::new(
+                out,
+                cert,
+                generation,
+                &clock,
+                entropy,
+                &mut packet,
+                &mut cache,
+            )
+            .unwrap();
             let deadline = Deadline::after(clock.sample().unwrap().monotonic, 2000).unwrap();
             let entry = Entry {
                 generation,
@@ -348,18 +523,18 @@ mod tests {
                     valid_until: Tick(1000),
                 },
             };
-            owner.cache[0] = Some(entry);
+            owner.cache.entries[0] = Some(entry);
             assert!(owner.cached(0, Tick(999)).is_some());
             assert!(owner.cached(0, Tick(1000)).is_none());
             assert!(owner.cached(1, Tick(0)).is_none());
-            owner.cache[0] = Some(Entry {
+            owner.cache.entries[0] = Some(Entry {
                 generation: NonZeroU64::new(5).unwrap(),
                 ..entry
             });
             assert!(owner.cached(0, Tick(0)).is_none());
-            owner.cache[0] = Some(Entry { index: 1, ..entry });
+            owner.cache.entries[0] = Some(Entry { index: 1, ..entry });
             assert!(owner.cached(0, Tick(0)).is_none());
-            owner.cache[0] = Some(Entry {
+            owner.cache.entries[0] = Some(Entry {
                 resolution: Resolution {
                     valid_until: Tick(0),
                     ..entry.resolution
@@ -373,7 +548,7 @@ mod tests {
                 owner.resolve("relay.test", deadline, &mut output),
                 Err(Error::Entropy)
             );
-            assert!(owner.cache[0].is_none());
+            assert!(owner.cache.entries[0].is_none());
             assert_eq!(
                 owner.resolve(
                     "relay.test",

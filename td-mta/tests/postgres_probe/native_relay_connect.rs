@@ -258,6 +258,7 @@ fn call_with_work<'w, 'a, 'r>(
         [0; td_mta::dns_transport::PACKET_BYTES],
     );
     let pool = HandshakePool::new(1).unwrap();
+    let mut dns_cache = td_mta::dns_owner::Cache::default();
     let result = connect::connect(
         prepared,
         profile,
@@ -273,6 +274,7 @@ fn call_with_work<'w, 'a, 'r>(
             plain: &mut plain,
             encoded: &mut encoded,
             dns: &mut dns,
+            dns_cache: &mut dns_cache,
         },
         SystemEntropy::try_new().unwrap(),
         wire,
