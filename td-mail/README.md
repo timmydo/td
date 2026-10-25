@@ -650,8 +650,19 @@ CLI queries retain full bodies unless
 latency, status, request/response byte counts, total transport latency and
 retry waits. Status zero means a transport error. Timings include fetch-service
 work and network/server time; they do not identify server stages by themselves.
-Ordinary API payloads are not logged. Logs are best-effort: contending writers
-skip entries. Each line is capped, and the file rolls over in place at 16 MiB,
-with a marker indicating that older entries were discarded. This also bounds
-an existing oversized log on its next write. Copy a diagnostic log before
-reproducing a problem if its older entries need preservation.
+Routine transport timing entries omit API payloads and credentials. Other
+messages can include account/server names, message IDs, paths, browser URLs
+and provider or password-command error text; the log is not a complete
+redaction boundary. The file is created with mode 0600, and opening an older
+log corrects its permissions to 0600.
+
+Writers serialize with a process-shared file lock, including warnings and
+errors; contention waits instead of silently skipping an entry. Disk/lock
+failures report entries to stderr, including entries after failed startup
+initialization. Each message is capped at 16 KiB before its timestamp and
+level are added.
+At 16 MiB, in-place compaction retains up to the most recent 8 MiB of complete
+lines and adds a marker. This also bounds an oversized old log on its next
+write. Compaction keeps the inode shared by running writers; it is not an
+audit archive or crash-durable storage. Copy logs before reproducing a problem
+if older history needs preservation.
