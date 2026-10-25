@@ -1,6 +1,7 @@
 //! Fixed human-session program launches for the separately owned compositor.
 
 use crate::channel::Channel;
+use crate::inspection::Inspection;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Read, Write};
@@ -18,6 +19,12 @@ const VERSION: &[u8] = b"TDLA003\n";
 const LIVE_MEDIUM: &str = "/run/td-media";
 /// How long a `td-svc start` client may take, as revocation bounds its own.
 const SUPERVISED_TIME: Duration = Duration::from_secs(12);
+/// `0f`'s bounds: at most one `td-svc status` client in flight, started at
+/// most this often, each with this long to answer in at most this many
+/// bytes, a status line being under 200.
+const STATE_INTERVAL: Duration = Duration::from_secs(1);
+const STATE_TIME: Duration = Duration::from_secs(5);
+const STATE_REPLY: usize = 256;
 
 pub(crate) struct Config {
     user: String,
@@ -89,6 +96,13 @@ impl Config {
         let mut command = Command::new("/bin/td-svc");
         command.args(["start", unit.name()]);
         command
+    }
+
+    /// `0f`'s client: td-svc's status line for the application's unit.
+    fn unit_status() -> Result<Inspection, String> {
+        let mut command = Command::new("/bin/td-svc");
+        command.args(["status", Supervised::Start.name()]);
+        Inspection::printing(command, STATE_REPLY, STATE_TIME)
     }
 
     fn terminal(&self, generation: &str, handle: u64, terminal: Program) -> Command {
@@ -388,6 +402,8 @@ enum Request {
     Poll(u64),
     Heartbeat,
     Supervised(Supervised),
+    /// `0f`: the application unit's state, as root last read it.
+    UnitState,
     Secret(crate::session::Request),
 }
 
@@ -405,6 +421,172 @@ impl Supervised {
         match self {
             Self::Start => "firefox",
             Self::Update => "firefox-update",
+        }
+    }
+}
+
+/// `0f`'s answer byte: what root last read of the application's unit, so
+/// the compositor can say a launch is under way or failed. It describes
+/// the unit td-svc supervises, never the application's own output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UnitState {
+    /// Not running and not failed: never started, stopped, or exited 0.
+    Idle,
+    /// A start is being asked, or td-svc has the unit on its way up.
+    Starting,
+    /// td-svc holds a live leader for it, which need not have a window
+    /// yet: a first launch's download runs inside it.
+    Running,
+    /// It failed, which td-svc may yet retry, or is held in backoff, or
+    /// root's start request failed.
+    Failed,
+    /// No start was asked yet and nothing read, or td-svc's line had
+    /// another shape.
+    Unknown,
+}
+
+impl UnitState {
+    fn byte(self) -> u8 {
+        match self {
+            Self::Idle => 0,
+            Self::Starting => 1,
+            Self::Running => 2,
+            Self::Failed => 3,
+            Self::Unknown => 4,
+        }
+    }
+}
+
+/// td-svc's `status NAME` reply for `name`, exactly one
+/// `NAME STATE pid=PID failures=N[ leaf=unproven]` line (td-svc/DESIGN.md
+/// §8), or `None` for any other shape.
+fn unit_state(reply: &str, name: &str) -> Option<UnitState> {
+    let line = reply.strip_suffix('\n')?;
+    let mut fields = line.split(' ');
+    if fields.next()? != name {
+        return None;
+    }
+    let state = fields.next()?;
+    let digits = |text: &str| !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
+    let live = match fields.next()?.strip_prefix("pid=")? {
+        "-" => false,
+        pid if digits(pid) => true,
+        _ => return None,
+    };
+    if !digits(fields.next()?.strip_prefix("failures=")?) {
+        return None;
+    }
+    // td-svc appends the leaf only to a stop in flight.
+    match fields.next() {
+        None => {}
+        Some("leaf=unproven") if state == "stopping" => {}
+        Some(_) => return None,
+    }
+    if fields.next().is_some() {
+        return None;
+    }
+    Some(match (state, live) {
+        ("ready", true) => UnitState::Running,
+        ("ready" | "skipped" | "stopped", _) => UnitState::Idle,
+        ("down" | "starting" | "stopping", _) => UnitState::Starting,
+        ("failed" | "held", _) => UnitState::Failed,
+        _ => return None,
+    })
+}
+
+/// `0f`'s reader: one bounded `td-svc status` client at a time, started by
+/// a request at most once per STATE_INTERVAL and read without blocking by
+/// later ones. A start request opens a new epoch, so a client that began
+/// before it cannot answer for the unit after it.
+struct UnitProbe {
+    status: fn() -> Result<Inspection, String>,
+    client: Option<(Inspection, u64)>,
+    began: Option<Instant>,
+    epoch: u64,
+    /// A start was asked: until a read answers for it, the unit is
+    /// starting.
+    asked: bool,
+    last: Option<UnitState>,
+    /// The last start request's client failed, and no read since has seen
+    /// the unit starting or running.
+    start_failed: bool,
+}
+
+impl UnitProbe {
+    fn new(status: fn() -> Result<Inspection, String>) -> Self {
+        Self {
+            status,
+            client: None,
+            began: None,
+            epoch: 0,
+            asked: false,
+            last: None,
+            start_failed: false,
+        }
+    }
+
+    /// A start request is about to be made: nothing read before it holds.
+    /// `began` stands, so a start never lets a status client start sooner.
+    fn restart(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
+        self.asked = true;
+        self.last = None;
+        self.start_failed = false;
+    }
+
+    fn advance(&mut self) {
+        let Some((client, epoch)) = self.client.as_mut() else {
+            return;
+        };
+        let reply = match client.answered() {
+            Ok(None) => return,
+            Ok(Some(Some((bytes, true)))) => Some(bytes),
+            // Busy, unreachable, oversized or late: the last read stands.
+            Ok(Some(_)) | Err(_) => None,
+        };
+        let current = *epoch == self.epoch;
+        self.client = None;
+        let Some(bytes) = reply.filter(|_| current) else {
+            return;
+        };
+        let state = std::str::from_utf8(&bytes)
+            .ok()
+            .and_then(|text| unit_state(text, Supervised::Start.name()));
+        if matches!(state, Some(UnitState::Starting | UnitState::Running)) {
+            self.start_failed = false;
+        }
+        self.last = Some(state.unwrap_or(UnitState::Unknown));
+    }
+
+    /// The answer, after starting a client if one is due. `asking` says a
+    /// start request's client is still in flight.
+    fn answer(&mut self, asking: bool) -> UnitState {
+        self.advance();
+        let due = self
+            .began
+            .is_none_or(|began| began.elapsed() >= STATE_INTERVAL);
+        if !asking && self.client.is_none() && due {
+            match (self.status)() {
+                Ok(client) => {
+                    self.client = Some((client, self.epoch));
+                    self.began = Some(Instant::now());
+                }
+                Err(why) => {
+                    let _ = writeln!(std::io::stderr().lock(), "td-authd: {why}");
+                    self.began = Some(Instant::now());
+                }
+            }
+        }
+        if asking {
+            UnitState::Starting
+        } else if self.start_failed {
+            UnitState::Failed
+        } else {
+            self.last.unwrap_or(if self.asked {
+                UnitState::Starting
+            } else {
+                UnitState::Unknown
+            })
         }
     }
 }
@@ -525,6 +707,7 @@ fn request(bytes: &[u8]) -> Result<Request, String> {
         [0x0c] => Ok(Request::Start(Program::Agent)),
         [0x0d] => Ok(Request::Supervised(Supervised::Start)),
         [0x0e] => Ok(Request::Supervised(Supervised::Update)),
+        [0x0f] => Ok(Request::UnitState),
         [2, rest @ ..] if rest.len() == 8 => {
             let handle =
                 u64::from_be_bytes(rest.try_into().map_err(|_| "invalid terminal handle")?);
@@ -547,11 +730,13 @@ struct Launches {
     /// request (heartbeats arrive every quarter second) and killed past
     /// SUPERVISED_TIME.
     supervised: BTreeMap<Supervised, (Child, Instant)>,
+    unit: UnitProbe,
 }
 
 impl Launches {
     /// The client's stdio is null, so its failure is said here, in root's log.
     fn reap_supervised(&mut self) {
+        let probe = &mut self.unit;
         self.supervised.retain(|unit, (child, started)| {
             let ended = match child.try_wait() {
                 Ok(None) if started.elapsed() < SUPERVISED_TIME => return true,
@@ -566,6 +751,9 @@ impl Launches {
                 Err(error) => Err(error),
             };
             let detail = ended.unwrap_or_else(|error| format!("wait: {error}"));
+            if *unit == Supervised::Start {
+                probe.start_failed = true;
+            }
             let _ = writeln!(
                 std::io::stderr().lock(),
                 "td-authd: td-svc start {}: {detail}",
@@ -576,16 +764,25 @@ impl Launches {
     }
 
     fn new(generation: String) -> Self {
+        Self::with_status(generation, Config::unit_status)
+    }
+
+    fn with_status(generation: String, status: fn() -> Result<Inspection, String>) -> Self {
         Self {
             children: BTreeMap::new(),
             next: 1,
             generation,
             supervised: BTreeMap::new(),
+            unit: UnitProbe::new(status),
         }
     }
 
     fn answer(&mut self, config: &Config, request: Request) -> Result<Vec<u8>, String> {
         self.reap_supervised();
+        // Every launch request and heartbeat reaps a finished status
+        // client, so one the peer stopped asking about is not left a
+        // zombie.
+        self.unit.advance();
         match request {
             Request::Secret(_) => Err("secret request reached terminal dispatcher".into()),
             Request::Supervised(unit) => {
@@ -597,6 +794,9 @@ impl Launches {
                 if self.supervised.contains_key(&unit) {
                     return Ok(vec![0xff, 1]);
                 }
+                if unit == Supervised::Start {
+                    self.unit.restart();
+                }
                 match spawn(&mut Config::supervised(unit)) {
                     Ok(child) => {
                         self.supervised.insert(unit, (child, Instant::now()));
@@ -604,9 +804,19 @@ impl Launches {
                     }
                     Err(why) => {
                         let _ = writeln!(std::io::stderr().lock(), "td-authd: {why}");
+                        if unit == Supervised::Start {
+                            self.unit.start_failed = true;
+                        }
                         Ok(vec![0xff, 2])
                     }
                 }
+            }
+            Request::UnitState => {
+                if std::fs::symlink_metadata(LIVE_MEDIUM).is_ok() {
+                    return Ok(vec![0xff, 3]);
+                }
+                let asking = self.supervised.contains_key(&Supervised::Start);
+                Ok(vec![0x85, self.unit.answer(asking).byte()])
             }
             Request::Heartbeat => Ok(vec![0x83]),
             Request::Start(terminal) => {

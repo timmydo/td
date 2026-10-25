@@ -152,6 +152,7 @@ fn the_caller_can_only_start_poll_or_keep_the_channel_alive() {
         request(&[0x0e]).unwrap(),
         Request::Supervised(Supervised::Update)
     );
+    assert_eq!(request(&[0x0f]).unwrap(), Request::UnitState);
     assert_eq!(request(&[3]).unwrap(), Request::Heartbeat);
     let mut poll = vec![2];
     poll.extend_from_slice(&17u64.to_be_bytes());
@@ -174,7 +175,7 @@ fn the_caller_can_only_start_poll_or_keep_the_channel_alive() {
         vec![0x0c, 0],
         vec![0x0d, 0],
         vec![0x0e, 0],
-        vec![0x0f],
+        vec![0x0f, 0],
         vec![2],
         vec![2, 0],
         vec![2; 10],
@@ -703,5 +704,333 @@ fn only_launches_placed_in_the_account_require_the_primary_account() {
         let requires_account = !matches!(program, Program::Home | Program::TaskManager);
         assert_eq!(loaded, requires_account);
         assert_eq!(result.is_err(), requires_account);
+    }
+}
+
+#[test]
+fn only_td_svcs_exact_status_line_for_the_unit_names_a_state() {
+    use UnitState::*;
+    for (line, state) in [
+        ("firefox ready pid=17 failures=0\n", Running),
+        ("firefox ready pid=- failures=0\n", Idle),
+        ("firefox skipped pid=- failures=0\n", Idle),
+        ("firefox stopped pid=- failures=0\n", Idle),
+        ("firefox down pid=- failures=0\n", Starting),
+        ("firefox starting pid=17 failures=1\n", Starting),
+        (
+            "firefox stopping pid=- failures=0 leaf=unproven\n",
+            Starting,
+        ),
+        ("firefox failed pid=- failures=2\n", Failed),
+        ("firefox held pid=- failures=9\n", Failed),
+    ] {
+        assert_eq!(unit_state(line, "firefox"), Some(state), "{line:?}");
+    }
+    for line in [
+        "",
+        "firefox ready pid=17 failures=0",
+        "firefox ready pid=17 failures=0\n\n",
+        "firefox ready pid=17 failures=0\nfirefox ready pid=17 failures=0\n",
+        "firefox-update ready pid=17 failures=0\n",
+        "mail ready pid=17 failures=0\n",
+        "firefox  ready pid=17 failures=0\n",
+        "firefox ready pid= failures=0\n",
+        "firefox ready pid=1x failures=0\n",
+        "firefox ready pid=17 failures=\n",
+        "firefox ready pid=17\n",
+        "firefox ready pid=17 failures=0 leaf=proven\n",
+        "firefox ready pid=17 failures=0 leaf=unproven\n",
+        "firefox failed pid=- failures=0 leaf=unproven\n",
+        "firefox ready pid=17 failures=0 leaf=unproven x\n",
+        "firefox running pid=17 failures=0\n",
+        "error: unknown service firefox\n",
+    ] {
+        assert_eq!(unit_state(line, "firefox"), None, "{line:?}");
+    }
+}
+
+fn status_reply(line: &'static [u8]) -> Result<crate::inspection::Inspection, String> {
+    crate::inspection::tests::printed(line, 0, false, STATE_REPLY, STATE_TIME)
+}
+
+fn running() -> Result<crate::inspection::Inspection, String> {
+    status_reply(b"firefox ready pid=17 failures=0\n")
+}
+
+fn idle() -> Result<crate::inspection::Inspection, String> {
+    status_reply(b"firefox ready pid=- failures=0\n")
+}
+
+fn busy() -> Result<crate::inspection::Inspection, String> {
+    crate::inspection::tests::printed(
+        b"error: supervisor did not answer in time\n",
+        1,
+        false,
+        STATE_REPLY,
+        STATE_TIME,
+    )
+}
+
+/// Asks `0f` until the answer is not `from`, or fails after five seconds.
+fn answer_after(probe: &mut UnitProbe, from: UnitState) -> UnitState {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let state = probe.answer(false);
+        if state != from {
+            return state;
+        }
+        assert!(Instant::now() < deadline, "still {from:?}");
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn the_unit_state_is_read_by_one_bounded_client_at_a_time() {
+    let mut probe = UnitProbe::new(running);
+    assert_eq!(probe.answer(false), UnitState::Unknown);
+    assert!(probe.client.is_some());
+    assert_eq!(
+        answer_after(&mut probe, UnitState::Unknown),
+        UnitState::Running
+    );
+    // Within the interval the last read answers and no client starts.
+    assert!(probe.client.is_none());
+    probe.began = Some(Instant::now());
+    assert_eq!(probe.answer(false), UnitState::Running);
+    assert!(probe.client.is_none());
+    // A start request in flight answers starting and starts no client,
+    // and a start does not let one start sooner once it is over.
+    probe.restart();
+    assert_eq!(probe.answer(true), UnitState::Starting);
+    assert!(probe.client.is_none());
+    assert_eq!(probe.answer(false), UnitState::Starting);
+    assert!(probe.client.is_none());
+}
+
+#[test]
+fn a_read_that_began_before_a_start_request_cannot_answer_for_it() {
+    let mut probe = UnitProbe::new(idle);
+    assert_eq!(probe.answer(false), UnitState::Unknown);
+    probe.restart();
+    probe.status = running;
+    // The idle client is drained and discarded, then a fresh one reads;
+    // until it does, the start is starting.
+    assert_eq!(
+        answer_after(&mut probe, UnitState::Starting),
+        UnitState::Running
+    );
+}
+
+#[test]
+fn a_failed_start_request_stands_until_the_unit_is_seen_going_up() {
+    let mut probe = UnitProbe::new(idle);
+    probe.restart();
+    probe.start_failed = true;
+    assert_eq!(probe.answer(false), UnitState::Failed);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while probe.last.is_none() {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(5));
+        assert_eq!(probe.answer(false), UnitState::Failed);
+    }
+    assert_eq!(probe.last, Some(UnitState::Idle));
+    probe.status = running;
+    probe.began = None;
+    assert_eq!(
+        answer_after(&mut probe, UnitState::Failed),
+        UnitState::Running
+    );
+    assert!(!probe.start_failed);
+}
+
+#[test]
+fn a_busy_or_failed_client_leaves_the_last_read_standing() {
+    let mut probe = UnitProbe::new(running);
+    probe.answer(false);
+    assert_eq!(
+        answer_after(&mut probe, UnitState::Unknown),
+        UnitState::Running
+    );
+    probe.status = busy;
+    probe.began = None;
+    assert_eq!(probe.answer(false), UnitState::Running);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while probe.client.is_some() {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(5));
+        probe.advance();
+    }
+    assert_eq!(probe.last, Some(UnitState::Running));
+}
+
+fn late() -> Result<crate::inspection::Inspection, String> {
+    crate::inspection::tests::printed(
+        b"firefox failed pid=- failures=1\n",
+        0,
+        true,
+        STATE_REPLY,
+        Duration::from_millis(50),
+    )
+}
+
+#[test]
+fn a_client_past_its_bound_is_killed_and_answers_nothing() {
+    let mut probe = UnitProbe::new(running);
+    probe.answer(false);
+    assert_eq!(
+        answer_after(&mut probe, UnitState::Unknown),
+        UnitState::Running
+    );
+    probe.status = late;
+    probe.began = None;
+    probe.answer(false);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while probe.client.is_some() {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(5));
+        probe.advance();
+    }
+    assert_eq!(probe.last, Some(UnitState::Running));
+}
+
+#[test]
+#[ignore = "exec-only failing supervised client fixture"]
+fn failing_supervised_probe() {
+    std::process::exit(1);
+}
+
+fn supervised_child(test: &str) -> Child {
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command.args(["--exact", test, "--ignored"]);
+    spawn(&mut command).unwrap()
+}
+
+/// Heartbeats until no supervised client is left.
+fn reap_all(launches: &mut Launches) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !launches.supervised.is_empty() {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(5));
+        assert_eq!(
+            launches.answer(&config(), Request::Heartbeat).unwrap(),
+            [0x83]
+        );
+    }
+}
+
+#[test]
+fn a_start_request_that_failed_reads_failed_and_an_update_does_not() {
+    let generation = "000102030405060708090a0b0c0d0e0f".to_string();
+    let mut launches = Launches::with_status(generation.clone(), idle);
+    launches.unit.restart();
+    launches.supervised.insert(
+        Supervised::Start,
+        (
+            supervised_child("launch::tests::failing_supervised_probe"),
+            Instant::now(),
+        ),
+    );
+    reap_all(&mut launches);
+    assert_eq!(
+        launches.answer(&config(), Request::UnitState).unwrap(),
+        [0x85, 3]
+    );
+    let mut updated = Launches::with_status(generation, idle);
+    updated.supervised.insert(
+        Supervised::Update,
+        (
+            supervised_child("launch::tests::failing_supervised_probe"),
+            Instant::now(),
+        ),
+    );
+    reap_all(&mut updated);
+    assert!(!updated.unit.start_failed);
+    assert_eq!(
+        updated.answer(&config(), Request::UnitState).unwrap(),
+        [0x85, 4]
+    );
+}
+
+#[test]
+fn a_start_in_flight_reads_starting_and_starts_no_status_client() {
+    let mut launches = Launches::with_status("000102030405060708090a0b0c0d0e0f".into(), running);
+    launches.supervised.insert(
+        Supervised::Start,
+        (
+            supervised_child("launch::tests::delayed_validator_probe"),
+            Instant::now(),
+        ),
+    );
+    assert_eq!(
+        launches.answer(&config(), Request::UnitState).unwrap(),
+        [0x85, 1]
+    );
+    assert!(launches.unit.client.is_none());
+    if let Some((mut child, _)) = launches.supervised.remove(&Supervised::Start) {
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+}
+
+#[test]
+fn a_start_that_cannot_spawn_reads_failed_until_the_unit_goes_up() {
+    // The host has no supervisor client to start, which is the case under
+    // test; a host that has one is not this fixture.
+    if std::path::Path::new("/bin/td-svc").exists() {
+        return;
+    }
+    let mut launches = Launches::with_status("000102030405060708090a0b0c0d0e0f".into(), running);
+    assert_eq!(
+        launches
+            .answer(&config(), Request::Supervised(Supervised::Start))
+            .unwrap(),
+        [0xff, 2]
+    );
+    assert_eq!(launches.unit.epoch, 1);
+    assert_eq!(
+        launches.answer(&config(), Request::UnitState).unwrap(),
+        [0x85, 3]
+    );
+    // A read of the unit running clears it.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let answer = launches.answer(&config(), Request::UnitState).unwrap();
+        if answer == [0x85, 2] {
+            break;
+        }
+        assert_eq!(answer, [0x85, 3]);
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn the_unit_state_request_answers_85_and_its_state() {
+    let mut launches = Launches::with_status("000102030405060708090a0b0c0d0e0f".into(), running);
+    assert_eq!(
+        launches.answer(&config(), Request::UnitState).unwrap(),
+        [0x85, 4]
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let answer = launches.answer(&config(), Request::UnitState).unwrap();
+        if answer == [0x85, 2] {
+            break;
+        }
+        assert_eq!(answer, [0x85, 4]);
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(5));
+    }
+    // A heartbeat reaps a finished client too.
+    launches.unit.began = None;
+    launches.answer(&config(), Request::UnitState).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while launches.unit.client.is_some() {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(5));
+        assert_eq!(
+            launches.answer(&config(), Request::Heartbeat).unwrap(),
+            [0x83]
+        );
     }
 }

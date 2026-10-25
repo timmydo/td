@@ -955,12 +955,26 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert_eq!(launch.matches(".spawn(").count(), 1);
     assert_eq!(launch.matches(".exec()").count(), 1);
     assert_eq!(launch.matches(".process_group(0)").count(), 1);
-    assert_eq!(launch.matches("Command::new(").count(), 5);
-    // The one root command a peer can cause beside the credential helper:
-    // its supervisor starting one of two fixed units.
+    assert_eq!(launch.matches("Command::new(").count(), 6);
+    // The root commands a peer can cause beside the credential helper:
+    // its supervisor starting one of two fixed units, and reading the
+    // application unit's status line.
     assert!(launch.contains(
         "Command::new(\"/bin/td-svc\");\n        command.args([\"start\", unit.name()]);"
     ));
+    assert!(launch.contains(
+        "Command::new(\"/bin/td-svc\");\n        command.args([\"status\", Supervised::Start.name()]);"
+    ));
+    // `0f`'s bounds come only from its constants.
+    for bound in [
+        "const STATE_INTERVAL: Duration = Duration::from_secs(1);",
+        "const STATE_TIME: Duration = Duration::from_secs(5);",
+        "const STATE_REPLY: usize = 256;",
+        "Inspection::printing(command, STATE_REPLY, STATE_TIME)",
+    ] {
+        assert_eq!(launch.matches(bound).count(), 1, "{bound}");
+    }
+    assert_eq!(launch.matches("Inspection::printing(").count(), 1);
     assert!(launch
         .contains("Self::Start => \"firefox\",\n            Self::Update => \"firefox-update\","));
     assert_eq!(launch.matches(".stdin(Stdio::null())").count(), 1);
@@ -1117,7 +1131,7 @@ const LOGIN_STATE_FINGERPRINT: u64 = 0x10b1af1d87d02b94;
 const SHARED_LOGIN_STATE_FINGERPRINT: u64 = 0x36b736e5dda17cc6;
 const SHARED_HOSTNAME_FINGERPRINT: u64 = 0x49026f28c1db76ec;
 
-const LAUNCH_FINGERPRINT: u64 = 0xa3d30e165f4955e6;
+const LAUNCH_FINGERPRINT: u64 = 0xe8e1e42a1f942569;
 const MAIN_FINGERPRINT: u64 = 0xe3ccbc9cef47cdd6;
 const SESSION_FINGERPRINT: u64 = 0x7fe467e679358f5e;
 
