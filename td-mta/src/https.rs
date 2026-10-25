@@ -582,8 +582,7 @@ impl Https<'_> {
                 let result = if client.body_slot.is_none() {
                     Err(Error::Invalid)
                 } else if client.phase == Phase::Download {
-                    api_worker = None;
-                    self.download(client, control)
+                    self.download(client, control, &mut api_worker)
                 } else if client.phase == Phase::Api {
                     self.api(client, control, &mut api_worker)
                 } else {
@@ -1316,7 +1315,12 @@ impl Https<'_> {
         }
         Ok(true)
     }
-    fn download(&self, client: &mut Client, control: &Control) -> Result<(), Error> {
+    fn download<'a>(
+        &'a self,
+        client: &mut Client,
+        control: &Control,
+        worker: &mut Option<ApiWorker<'a>>,
+    ) -> Result<(), Error> {
         use crate::https_download::{Failure, Request, Target};
         let principal = client.principal.ok_or(Error::Invalid)?;
         let backend = self
@@ -1341,17 +1345,30 @@ impl Https<'_> {
         .min(client.absolute);
         clear_head(client);
         client.drain_left = 0;
-        let result = backend.download(
-            Request {
-                keep_alive: client.keep_alive,
-                target: &target,
-                device: principal.device,
-                credentials: client.credentials.as_ref().ok_or(Error::Invalid)?,
-                deadline: operation,
-            },
-            client.connection.as_mut().ok_or(Error::Invalid)?,
-            control,
-        );
+        if worker
+            .as_ref()
+            .is_none_or(|slot| slot.account != principal.account || slot.origin != client.origin)
+        {
+            *worker = None;
+            *worker = Some(ApiWorker {
+                account: principal.account,
+                origin: client.origin,
+                worker: backend.api_worker(),
+            });
+        }
+        let request = Request {
+            keep_alive: client.keep_alive,
+            target: &target,
+            device: principal.device,
+            credentials: client.credentials.as_ref().ok_or(Error::Invalid)?,
+            deadline: operation,
+        };
+        let transport = client.connection.as_mut().ok_or(Error::Invalid)?;
+        let result = worker
+            .as_mut()
+            .and_then(|slot| slot.worker.as_mut())
+            .and_then(|worker| worker.download(&request, transport, control))
+            .unwrap_or_else(|| backend.download(request, transport, control));
         client.credentials = None;
         match result {
             Ok(completion) => {

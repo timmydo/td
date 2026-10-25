@@ -30,6 +30,15 @@ pub struct Request<'a> {
 /// State created, maintained and dropped by one bounded HTTPS body worker.
 /// It must establish fresh request authority before each operation.
 pub trait Worker {
+    fn download(
+        &mut self,
+        _request: &crate::https_download::Request<'_>,
+        _transport: &mut dyn crate::ports::Transport,
+        _control: &crate::smtp_receiving::Control,
+    ) -> Option<Result<Completion, crate::https_download::Failure>> {
+        None
+    }
+
     fn maintain(&mut self) -> Result<(), Error> {
         Ok(())
     }

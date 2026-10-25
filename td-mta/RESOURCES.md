@@ -4592,3 +4592,14 @@ metadata; worker counts and shared admission remain unchanged.
 One renewal thread, foreground worker, pending owner, body source pool and TLS
 buffer pair serve all accounts. Cumulative database work remains bounded by
 the existing transaction deadlines and driver limits.
+
+
+## Retained download check connection
+
+A fixed HTTPS body worker alternates between its API reader and download
+checker; switching drops the former cache. A warm download retains one read
+permit for its checker and reserves one for its fresh body snapshot. Peak
+capacity remains two permits per download, and idle retention remains one per
+worker. No thread, message-sized buffer or peer registry is added. The 30-second
+body allowance is unchanged; POSTGRES specifies the check session's finite
+wire windows, ten-second transactions and output-time retirement.

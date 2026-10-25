@@ -35,7 +35,11 @@ impl Drop for CachedRead<'_> {
 }
 struct ApiWorker<'w, 's, 'sr, 'a> {
     service: &'w Service<'s, 'sr, 'a>,
-    cached: RefCell<Option<CachedRead<'s>>>,
+    cached: WorkerCache<'s>,
+}
+enum WorkerCache<'s> {
+    Api(RefCell<Option<CachedRead<'s>>>),
+    Download(crate::postgres_body::AuthorizationCache<'s>),
 }
 fn retire_cached(cache: &RefCell<Option<CachedRead<'_>>>) {
     let Ok(mut cache) = cache.try_borrow_mut() else {
@@ -51,7 +55,10 @@ fn retire_cached(cache: &RefCell<Option<CachedRead<'_>>>) {
 }
 impl https_api::Worker for ApiWorker<'_, '_, '_, '_> {
     fn maintain(&mut self) -> Result<(), Error> {
-        retire_cached(&self.cached);
+        match &self.cached {
+            WorkerCache::Api(cache) => retire_cached(cache),
+            WorkerCache::Download(cache) => cache.maintain(),
+        }
         Ok(())
     }
     fn api(
@@ -60,8 +67,31 @@ impl https_api::Worker for ApiWorker<'_, '_, '_, '_> {
         transport: &mut dyn Transport,
         control: &Control,
     ) -> Result<https_api::Completion, Failure> {
+        if !matches!(self.cached, WorkerCache::Api(_)) {
+            self.cached = WorkerCache::Api(RefCell::new(None));
+        }
+        let WorkerCache::Api(cache) = &self.cached else {
+            return Err(Failure::Before(Error::Invalid));
+        };
         self.service
-            .serve_api(request, transport, control, Some(&self.cached))
+            .serve_api(request, transport, control, Some(cache))
+    }
+    fn download(
+        &mut self,
+        request: &crate::https_download::Request<'_>,
+        transport: &mut dyn Transport,
+        control: &Control,
+    ) -> Option<Result<https_api::Completion, Failure>> {
+        if !matches!(self.cached, WorkerCache::Download(_)) {
+            self.cached = WorkerCache::Download(crate::postgres_body::AuthorizationCache::new());
+        }
+        let WorkerCache::Download(cache) = &self.cached else {
+            return Some(Err(Failure::Before(Error::Invalid)));
+        };
+        Some(
+            self.service
+                .send_download(request, transport, control, Some(cache)),
+        )
     }
 }
 
@@ -90,7 +120,7 @@ impl https_upload::Backend for Service<'_, '_, '_> {
     fn api_worker(&self) -> Option<Box<dyn https_api::Worker + '_>> {
         Some(Box::new(ApiWorker {
             service: self,
-            cached: RefCell::new(None),
+            cached: WorkerCache::Api(RefCell::new(None)),
         }))
     }
     fn session(&self) -> Option<&Session> {
@@ -110,7 +140,7 @@ impl https_upload::Backend for Service<'_, '_, '_> {
         transport: &mut dyn Transport,
         control: &Control,
     ) -> Result<https_api::Completion, Failure> {
-        self.send_download(request, transport, control)
+        self.send_download(&request, transport, control, None)
     }
     fn api(
         &self,
@@ -269,9 +299,10 @@ impl<'s, 'sr, 'a> Service<'s, 'sr, 'a> {
     }
     fn send_download(
         &self,
-        request: crate::https_download::Request<'_>,
+        request: &crate::https_download::Request<'_>,
         transport: &mut dyn Transport,
         control: &Control,
+        cache: Option<&crate::postgres_body::AuthorizationCache<'s>>,
     ) -> Result<https_api::Completion, Failure> {
         let mut sender = Sender::new(
             transport,
@@ -281,8 +312,19 @@ impl<'s, 'sr, 'a> Service<'s, 'sr, 'a> {
             request.deadline,
         )
         .map_err(Failure::Before)?;
+        let maintenance = || {
+            if let Some(cache) = cache {
+                cache.maintain();
+            }
+        };
+        sender.maintenance = Some(&maintenance);
         sender.completion.keep_alive = request.keep_alive;
-        let result = self.download_body(&request, &mut sender);
+        let result = self.download_body(request, &mut sender, cache);
+        if result.is_err() {
+            if let Some(cache) = cache {
+                cache.clear();
+            }
+        }
         result.map_err(|error| {
             if sender.started {
                 Failure::Started(error)
@@ -296,6 +338,7 @@ impl<'s, 'sr, 'a> Service<'s, 'sr, 'a> {
         &self,
         request: &crate::https_download::Request<'_>,
         sender: &mut Sender<'_>,
+        cache: Option<&crate::postgres_body::AuthorizationCache<'s>>,
     ) -> Result<(), Error> {
         use crate::{
             admission::work::{Charge, Meter},
@@ -323,7 +366,12 @@ impl<'s, 'sr, 'a> Service<'s, 'sr, 'a> {
         // Verification retains one snapshot while fresh authorization opens
         // another connection. Reserve both before launching the DNS helper.
         let _body_slot = self.slots.acquire().map_err(read_error)?;
-        let _auth_slot = self.slots.acquire().map_err(read_error)?;
+        let _auth_slot = if let Some(cache) = cache {
+            cache.reserve(self.slots, deadline).map_err(read_error)?;
+            None
+        } else {
+            Some(self.slots.acquire().map_err(read_error)?)
+        };
         let dns_deadline = deadline.min(
             std::time::Instant::now()
                 .checked_add(std::time::Duration::from_secs(5))
@@ -349,9 +397,12 @@ impl<'s, 'sr, 'a> Service<'s, 'sr, 'a> {
             },
         );
         for address in addresses {
+            if let Some(cache) = cache {
+                cache.reserve(self.slots, deadline).map_err(read_error)?;
+            }
             let mut connection = self.loaded.bootstrap.request(address);
             connection.mode = postgres_probe::Mode::Runtime;
-            let result = postgres_body::with_pinned_blob(
+            let result = postgres_body::with_pinned_blob_cached(
                 &connection,
                 &self.loaded.trust,
                 deadline,
@@ -361,6 +412,7 @@ impl<'s, 'sr, 'a> Service<'s, 'sr, 'a> {
                     maximum: postgres_body::MAX_BODY_BYTES,
                 },
                 request.credentials.password(),
+                cache,
                 |_, pin| {
                     crate::https_download::send_verified(
                         pin,

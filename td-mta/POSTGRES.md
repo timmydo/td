@@ -7036,3 +7036,33 @@ next job reuses a connection only after acknowledged transaction termination
 and successful deadline and protocol-window checks. Expiry maintenance and
 clean idle retirement use the existing bounded termination allowance; an
 unfinished or failed job never gains time through cleanup.
+
+
+## Retained HTTPS download authorization
+
+Each fixed HTTPS body worker keeps either its API read cache or one download
+authorization cache, never both. Account or origin changes, uploads and worker
+exit discard that state. Standalone download callers keep the one-shot path.
+A download still opens a fresh repeatable-read body snapshot, authenticates and
+verifies its complete digest, then uses a separate READ COMMITTED transaction
+for current configuration, account, credential and upload-expiry checks. Only
+this second connection is retained. Its acknowledged ROLLBACK precedes output;
+no snapshot, row lock or authorization result survives a request.
+
+The authorization session is Runtime-qualified once under the shared migration
+lock. Each turn checks epoch and maintenance before the existing selection-lock,
+account-lock, credential and database-clock checks. The ordinary retained-read
+profile bounds it to 64 turns and an immutable 60-second lifetime, with 1 MiB
+input, 64 KiB output and 1088 frames per turn. Existing cumulative wire ceilings
+remain independent limits. Initial qualification consumes the first window.
+Idle disconnect replacement occurs only before body verification; an admitted
+failed authorization is not replayed. Every failed download retires its cache.
+
+Reserve two read permits before DNS: one for the body and one for the retained
+check, or two transient permits for a standalone call. A retained connection
+must cover the original body deadline before verification starts; otherwise it
+is retired first. Verification and replay retain their 30-second bound, while
+the fresh authorization turn is capped at ten seconds and the original body
+deadline. Cache borrows end before output. Sender maintenance can retire the
+idle checker during slow response writes, and fixed-worker maintenance retires
+it while no request is active. A worker retains at most one idle permit.

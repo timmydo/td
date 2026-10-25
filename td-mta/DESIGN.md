@@ -2845,3 +2845,12 @@ the aliases grant neither recipient acceptance nor relay authority. TLS
 policy bindings retain the aliases so a policy prepared for another list
 cannot be attached as the same listener configuration. Gateway and HTTP
 listeners reject this setting.
+
+
+The fixed HTTPS body workers retain one backend cache selected by account and
+origin. API reads and download authorization use alternative cache variants;
+uploads retire the worker cache. Download body verification and replay keep one
+fresh snapshot, while a retained connection performs fresh authorization in a
+separate transaction after verification and before response bytes. POSTGRES
+owns its authority and retirement rules; RESOURCES owns its unchanged active
+connection count.

@@ -9,7 +9,10 @@ use crate::{
     postgres_runtime_profile::Binding,
     postgres_schema,
 };
-use std::time::Instant;
+use std::{
+    cell::RefCell,
+    time::{Duration, Instant},
+};
 use td_crypto::{Crypto, Digest, Provider, TrustStore};
 use tokio_postgres::types::Type;
 
@@ -63,6 +66,146 @@ pub struct BlobRequest<'a> {
     pub binding: &'a Binding,
     pub blob: BlobId,
     pub maximum: u64,
+}
+
+/// One finite authorization session, owned and retired by its HTTPS worker.
+pub(crate) struct AuthorizationCache<'a>(RefCell<Option<AuthorizationSlot<'a>>>);
+struct AuthorizationSlot<'a> {
+    reused: bool,
+    session: Option<postgres_probe::ReadSession>,
+    _permit: crate::postgres_read::ReadPermit<'a>,
+}
+impl Drop for AuthorizationSlot<'_> {
+    fn drop(&mut self) {
+        if let Some(session) = self.session.take() {
+            session.retire(Instant::now() + Duration::from_millis(100));
+        }
+    }
+}
+impl<'a> AuthorizationCache<'a> {
+    pub(crate) fn new() -> Self {
+        Self(RefCell::new(None))
+    }
+    pub(crate) fn clear(&self) {
+        if let Ok(mut slot) = self.0.try_borrow_mut() {
+            *slot = None;
+        }
+    }
+    pub(crate) fn maintain(&self) {
+        let Ok(mut slot) = self.0.try_borrow_mut() else {
+            return;
+        };
+        if slot.as_ref().is_some_and(|slot| {
+            slot.session
+                .as_ref()
+                .is_none_or(|s| s.needs_retirement(Instant::now()))
+        }) {
+            *slot = None;
+        }
+    }
+    pub(crate) fn reserve(
+        &self,
+        slots: &'a crate::postgres_read::ReadSlots,
+        through: Instant,
+    ) -> Result<(), crate::postgres_read::Error> {
+        let mut slot = self
+            .0
+            .try_borrow_mut()
+            .map_err(|_| crate::postgres_read::Error::Busy)?;
+        if slot
+            .as_ref()
+            .and_then(|slot| slot.session.as_ref())
+            .is_some_and(|s| !s.reusable(through))
+        {
+            *slot = None;
+        }
+        if slot.is_none() {
+            *slot = Some(AuthorizationSlot {
+                reused: false,
+                session: None,
+                _permit: slots.acquire()?,
+            });
+        }
+        Ok(())
+    }
+    fn prepare(
+        &self,
+        request: &Request<'_>,
+        trust: &TrustStore,
+        through: Instant,
+    ) -> Result<(), Error> {
+        let deadline = through.min(Instant::now() + postgres_probe::MAX_DURATION);
+        let mut slot = self
+            .0
+            .try_borrow_mut()
+            .map_err(|_| Error::Read(ports::Error::Busy))?;
+        let slot = slot.as_mut().ok_or(Error::Capacity)?;
+        if slot
+            .session
+            .as_mut()
+            .is_some_and(|s| !s.reusable(through) || s.check_idle(deadline).is_err())
+        {
+            if let Some(session) = slot.session.take() {
+                session.retire(deadline);
+            }
+        }
+        slot.reused = slot.session.is_some();
+        if slot.session.is_none() {
+            slot.session = Some(
+                postgres_probe::ReadSession::open(request, trust, deadline)
+                    .map_err(Error::Connection)?,
+            );
+        }
+        Ok(())
+    }
+    fn authorize(
+        &self,
+        binding: Binding,
+        presented: Presented,
+        expires: Option<i64>,
+        through: Instant,
+    ) -> Result<(), Error> {
+        let deadline = through.min(Instant::now() + postgres_probe::MAX_DURATION);
+        let mut slot = self
+            .0
+            .try_borrow_mut()
+            .map_err(|_| Error::Read(ports::Error::Busy))?;
+        let reused = slot.as_ref().is_some_and(|slot| slot.reused);
+        let session = slot
+            .as_mut()
+            .and_then(|s| s.session.as_mut())
+            .ok_or(Error::Capacity)?;
+        let result = session
+            .read(
+                binding.epoch(),
+                postgres_probe::ReadIsolation::ReadCommitted,
+                deadline,
+                move |client| Box::pin(reauthorize_body(client, binding, presented, expires)),
+            )
+            .map_err(|error| {
+                if error == postgres_probe::Error::Transport {
+                    Error::Database
+                } else {
+                    Error::Connection(error)
+                }
+            })
+            .and_then(|result| result);
+        if reused {
+            crate::performance::record(
+                crate::performance::Phase::DbReuse,
+                Duration::ZERO,
+                if result.is_ok() {
+                    crate::performance::Outcome::Success
+                } else {
+                    crate::performance::Outcome::Failed
+                },
+            );
+        }
+        if result.is_err() {
+            *slot = None;
+        }
+        result
+    }
 }
 
 /// Read only a body referenced by the selected account's Email. Upload leases
@@ -242,6 +385,36 @@ pub fn with_pinned_blob<T>(
     password: &[u8],
     read: impl FnOnce(BlobMetadata, &mut crate::store_fs::PinnedBlob<'_, '_>) -> Result<T, ports::Error>,
 ) -> Result<T, Error> {
+    with_pinned_blob_cached(request, trust, deadline, selected, password, None, read)
+}
+
+pub(crate) fn with_pinned_blob_cached<T>(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    selected: BlobRequest<'_>,
+    password: &[u8],
+    cache: Option<&AuthorizationCache<'_>>,
+    read: impl FnOnce(BlobMetadata, &mut crate::store_fs::PinnedBlob<'_, '_>) -> Result<T, ports::Error>,
+) -> Result<T, Error> {
+    let result = with_pinned_blob_inner(request, trust, deadline, selected, password, cache, read);
+    if result.is_err() {
+        if let Some(cache) = cache {
+            cache.clear();
+        }
+    }
+    result
+}
+
+fn with_pinned_blob_inner<T>(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    selected: BlobRequest<'_>,
+    password: &[u8],
+    cache: Option<&AuthorizationCache<'_>>,
+    read: impl FnOnce(BlobMetadata, &mut crate::store_fs::PinnedBlob<'_, '_>) -> Result<T, ports::Error>,
+) -> Result<T, Error> {
     let binding = selected.binding;
     if !binding.roles().jmap() {
         return Err(Error::Policy);
@@ -251,6 +424,9 @@ pub fn with_pinned_blob<T>(
     }
     let presented = Presented::parse(password).ok_or(Error::Unauthenticated)?;
     let snapshot_binding = binding.clone();
+    if let Some(cache) = cache {
+        cache.prepare(request, trust, deadline)?;
+    }
     postgres_probe::with_body_worker(request, trust, deadline, |worker| {
         let (metadata, expires) = worker
             .run(|client| {
@@ -276,13 +452,17 @@ pub fn with_pinned_blob<T>(
         // A new primary transaction sees revocations after the body snapshot.
         let presented = Presented::parse(password).ok_or(Error::Unauthenticated)?;
         let binding = binding.clone();
-        postgres_probe::with_mailbox_client(
-            request,
-            trust,
-            deadline.min(Instant::now() + postgres_probe::MAX_DURATION),
-            |client| Box::pin(reauthorize_blob(client, binding, presented, expires)),
-        )
-        .map_err(Error::Connection)??;
+        if let Some(cache) = cache {
+            cache.authorize(binding, presented, expires, deadline)?;
+        } else {
+            postgres_probe::with_mailbox_client(
+                request,
+                trust,
+                deadline.min(Instant::now() + postgres_probe::MAX_DURATION),
+                |client| Box::pin(reauthorize_blob(client, binding, presented, expires)),
+            )
+            .map_err(Error::Connection)??;
+        }
         let mut pin =
             crate::store_fs::PinnedBlob::from_verified(&mut body, metadata.blob, metadata.body)
                 .map_err(Error::Read)?;
@@ -411,6 +591,14 @@ async fn reauthorize_blob(
         return Err(Error::Epoch);
     }
     client.batch_execute("BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL idle_in_transaction_session_timeout=10000").await.map_err(|_|Error::Database)?;
+    reauthorize_body(client, binding, presented, expires).await
+}
+async fn reauthorize_body(
+    client: &tokio_postgres::Client,
+    binding: Binding,
+    presented: Presented,
+    expires: Option<i64>,
+) -> Result<(), Error> {
     check_selection(client, &binding, true).await?;
     client
         .query_typed_one(

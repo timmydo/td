@@ -6626,6 +6626,7 @@ fn exercise_http_read(
     drafts: bool,
 ) {
     use http_fixture::{credentials, Wire};
+    use std::io::Write;
     use std::sync::Arc;
     use td_mta::{
         admission::{timers::NetworkLimits, DiskLimits, ViewMode, WorkLimits},
@@ -7048,7 +7049,6 @@ fn exercise_http_read(
     let raw = email["blobId"].as_str().unwrap();
     let part = email["textBody"][0]["blobId"].as_str().unwrap();
     let download = |blob: &str, secret: &[u8], fail_write| {
-        api_worker.borrow_mut().take();
         let target = td_mta::https_download::Target::parse(&format!(
             "/jmap/download/{account}/{blob}/snapshot.txt?type=text%2Fplain"
         ))
@@ -7060,17 +7060,22 @@ fn exercise_http_read(
             output: Vec::new(),
             fail_write,
         };
-        let result = service.download(
-            td_mta::https_download::Request {
-                keep_alive: false,
-                target: &target,
-                device,
-                credentials: &credentials,
-                deadline: until(),
-            },
-            &mut wire,
-            &control,
-        );
+        let request = td_mta::https_download::Request {
+            keep_alive: false,
+            target: &target,
+            device,
+            credentials: &credentials,
+            deadline: until(),
+        };
+        let mut worker = api_worker.borrow_mut();
+        if worker.is_none() {
+            *worker = service.api_worker();
+        }
+        let result = worker
+            .as_mut()
+            .unwrap()
+            .download(&request, &mut wire, &control)
+            .unwrap();
         (result, String::from_utf8(wire.output).unwrap())
     };
     let (result, raw_wire) = download(raw, password, false);
@@ -7082,9 +7087,79 @@ fn exercise_http_read(
         message.contains("Subject:\r\n =?UTF-8?B?U25hcHNob3Q=?=\r\n"),
         "{message}"
     );
+    let download_pid = retained_pid();
+    assert_eq!(sql(fixture, "SELECT count(*) FROM pg_stat_activity WHERE usename='mail_runtime' AND state LIKE 'idle in transaction%'"), "0");
     let (result, part_wire) = download(part, password, false);
     result.unwrap();
+    assert_eq!(
+        retained_pid(),
+        download_pid,
+        "raw and MIME downloads reuse the authorization session"
+    );
+    assert_eq!(
+        sql(
+            fixture,
+            &format!("SELECT pg_terminate_backend({download_pid})")
+        ),
+        "t"
+    );
+    download(raw, password, false).0.unwrap();
+    assert_ne!(retained_pid(), download_pid);
     assert_eq!(part_wire.split_once("\r\n\r\n").unwrap().1, "snapshot text");
+    // The cached checker must observe changes committed after body snapshot
+    // establishment, before a single successful response byte is emitted.
+    for policy in [false, true] {
+        download(raw, password, false).0.unwrap();
+        let generation = sql(
+            fixture,
+            "SELECT encode(generation,'hex') FROM td_mta.config_selection WHERE singleton=true",
+        );
+        let mut blocker = ProbeChild(
+            sql_command(fixture)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let mut input = blocker.0.stdin.take().unwrap();
+        input
+            .write_all(b"BEGIN; LOCK td_mta.blob_chunks IN ACCESS EXCLUSIVE MODE;\n")
+            .unwrap();
+        input.flush().unwrap();
+        let wait = Instant::now() + Duration::from_secs(3);
+        while sql(fixture, "SELECT count(*) FROM pg_locks WHERE relation='td_mta.blob_chunks'::regclass AND mode='AccessExclusiveLock' AND granted") != "1" {
+            assert!(Instant::now() < wait);
+            thread::sleep(Duration::from_millis(5));
+        }
+        thread::scope(|scope| {
+            let update = scope.spawn(|| {
+                let wait = Instant::now() + Duration::from_secs(3);
+                while sql(fixture, "SELECT count(*) FROM pg_stat_activity WHERE application_name='td-mta-postgres' AND wait_event_type='Lock' AND query LIKE 'SELECT a.sequence,a.floor,b.length%'") != "1" {
+                    assert!(Instant::now() < wait);
+                    thread::sleep(Duration::from_millis(5));
+                }
+                if policy {
+                    sql(fixture, "UPDATE td_mta.config_selection SET generation=decode('000000000000ffff','hex') WHERE singleton=true");
+                } else {
+                    sql(fixture, &format!("UPDATE td_mta.devices SET revoked_at=1,revocation_id=decode(repeat('ee',16),'hex'),revocation_digest=decode(repeat('ee',32),'hex') WHERE id=decode('{device}','hex')"));
+                }
+                input.write_all(b"COMMIT;\n\\q\n").unwrap();
+                input.flush().unwrap();
+            });
+            let (result, wire) = download(raw, password, false);
+            assert!(matches!(
+                result,
+                Err(td_mta::https_download::Failure::Before(Error::Forbidden))
+            ));
+            assert!(wire.is_empty());
+            update.join().unwrap();
+        });
+        drop(input);
+        wait_command(&mut blocker);
+        sql(fixture, &format!("UPDATE td_mta.config_selection SET generation=decode('{generation}','hex') WHERE singleton=true; UPDATE td_mta.devices SET revoked_at=NULL,revocation_id=NULL,revocation_digest=NULL WHERE id=decode('{device}','hex')"));
+        download(raw, password, false).0.unwrap();
+    }
     let mut locator = td_mta::wire::PartLocator::decode(part).unwrap();
     locator.offset += 1;
     let mut locator_bytes = [0; 255];
