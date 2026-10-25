@@ -384,9 +384,9 @@ severity filter, global ingestion limit, retention ring and physical-pressure
 stop apply. There is no synchronous journal fallback and no per-request event
 flood. These info records require `minimum_severity = info`. Additional summaries
 can shorten history under the existing ring; 30 days remains an age ceiling,
-not a guaranteed retention interval. At the current 25-phase ceiling, four
-profiles add at most 2,400 hourly summary rows per day (plus initial snapshots).
-The 65,536-row ring can hold about 27 days of those rows alone; other events,
+not a guaranteed retention interval. At the current 27-phase ceiling, four
+profiles add at most 2,592 hourly summary rows per day (plus initial snapshots).
+The 65,536-row ring can hold about 25 days of those rows alone; other events,
 frequent restarts and physical pressure can shorten that interval.
 
 Each sample is a cumulative process observation: `calls` counts finished spans,
@@ -445,6 +445,8 @@ It is not exposed over public HTTP and supplies no mutation operation.
 | `smtp_admission` | One storage-worker admission attempt, including database readiness; retry is busy |
 | `smtp_data` | Successful DATA admission through recognition of its terminating dot, including the 354 reply, peer arrival and network scheduling; retirement or refusal before completion counts as failure |
 | `smtp_commit_wait` | Completed DATA queued through the first storage-worker publication attempt; expiry or retirement before service counts as failure; excludes later busy retry delays |
+| `smtp_prepare` | Resident SMTP input validation, header preparation and digests for the complete account fanout; excludes DNS and database publication |
+| `smtp_publish` | SMTP receipt inspection and database publication, including their connection setup and existing pre-effect address fallback; an unknown COMMIT outcome counts as failure without changing settlement or replay policy |
 | `smtp_commit` | One storage-worker preparation/publication attempt; known durable success remains success even when ancillary cleanup stops service |
 
 For timed HTTP endpoint spans, `busy` means a flushed 429 response and

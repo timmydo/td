@@ -219,8 +219,14 @@ impl Receiving<'_> {
         // Retain only one prepared message; ingress admission remains external.
         let _slot = self.slots.acquire().map_err(|_| ports::Error::Busy)?;
         let addresses = addresses(self.loaded, self.executable, deadline)?;
-        let change = changes::prepare_fanout(targets, message, deadline, meter, self.clock)
-            .map_err(Error::Publication)?;
+        let change = {
+            let mut timing =
+                crate::performance::Timer::start(crate::performance::Phase::SmtpPrepare);
+            let change = changes::prepare_fanout(targets, message, deadline, meter, self.clock)
+                .map_err(Error::Publication)?;
+            timing.succeeded();
+            change
+        };
         let length = change
             .length()
             .checked_mul(change.count() as u64)
@@ -239,6 +245,7 @@ impl Receiving<'_> {
             .map_err(stop)?;
         *pending = Some(change);
         let change = pending.as_ref().ok_or(ports::Error::Invalid)?;
+        let mut timing = crate::performance::Timer::start(crate::performance::Phase::SmtpPublish);
         let mut outcome = Err(changes::Error::Connection(postgres_probe::Error::Transport));
         for address in addresses {
             let mut connection = self.loaded.bootstrap.request(address);
@@ -251,6 +258,10 @@ impl Receiving<'_> {
                 break;
             }
         }
+        if outcome.is_ok() {
+            timing.succeeded();
+        }
+        drop(timing);
         if !matches!(outcome, Err(changes::Error::Indeterminate)) {
             *pending = None;
         }
