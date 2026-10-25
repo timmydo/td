@@ -4560,8 +4560,10 @@ connection or storage-worker execution time. The singleton storage worker
 serializes preparation and publication, retaining at most one additional
 filtered body and one uncertain operation. At the 32-MiB message ceiling the
 incoming capacities total at most 128 MiB and filtered payload at most another
-32 MiB. The growable filtered buffer can reserve more capacity than its length;
-native database/protocol allocations remain additional. These body allocations
+32 MiB. Preparation requests one exact reservation for the received length plus
+the bounded trace allowance, including the possible header/body separator.
+Filtered output stays within that reservation without amortized buffer growth;
+allocator overhead and native database/protocol allocations remain additional. These body allocations
 are additional to the planning ledger above, as are the active attachment and
 relay reservations. The four-job bound prevents connection-count amplification
 but does not qualify the provisional 128-MiB workload RSS goal. Saturation waits

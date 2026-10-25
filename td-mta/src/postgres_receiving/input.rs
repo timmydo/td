@@ -76,18 +76,25 @@ pub(super) fn prepare(
         last: &mut last,
     };
     let mut header = headers::Headers::new(message.header_bytes).map_err(header_error)?;
+    let output_limit = message
+        .bytes
+        .len()
+        .checked_add(allowance)
+        .filter(|size| *size <= maximum)
+        .ok_or(Error::Capacity)?;
     let mut bytes = Vec::new();
+    // Filtering only removes input; allowance includes trace and separator.
+    bytes
+        .try_reserve_exact(output_limit)
+        .map_err(|_| Error::Capacity)?;
     let mut append = |part: &[u8]| {
         if bytes
             .len()
             .checked_add(part.len())
-            .is_none_or(|size| size > maximum)
+            .is_none_or(|size| size > output_limit)
         {
             return Err(crate::ports::Error::Capacity);
         }
-        bytes
-            .try_reserve(part.len())
-            .map_err(|_| crate::ports::Error::Capacity)?;
         bytes.extend_from_slice(part);
         Ok(())
     };
