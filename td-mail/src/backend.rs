@@ -168,6 +168,13 @@ pub enum BackendResponse {
         name: String,
         result: Result<(), String>,
     },
+    /// Incomplete first-page summaries for an empty interactive folder view.
+    /// Never advances pagination or marks the mailbox cache refreshed.
+    EmailListPreview {
+        mailbox_id: String,
+        emails: Vec<Email>,
+        total: Option<u32>,
+    },
     Emails {
         mailbox_id: String,
         emails: Result<Vec<Email>, String>,
@@ -1976,6 +1983,7 @@ fn backend_loop(
                     }
                 }
 
+                let query_started = std::time::Instant::now();
                 let result = (|| {
                     let query = client
                         .query_emails(
@@ -2003,12 +2011,35 @@ fn backend_loop(
                         if (origin == "cli.summaries" || !origin.starts_with("cli")) && !apply_rules
                         {
                             let mut summaries = Vec::new();
-                            for chunk in query.ids.chunks(EMAIL_GET_CHUNK_SIZE) {
+                            for (index, chunk) in query.ids.chunks(EMAIL_GET_CHUNK_SIZE).enumerate()
+                            {
                                 summaries.extend(
                                     client
                                         .get_email_summaries(chunk)
                                         .map_err(|e| e.to_string())?,
                                 );
+                                if index == 0
+                                    && can_serve_cached_first
+                                    && position == 0
+                                    && !summaries.is_empty()
+                                {
+                                    let preview_count = summaries.len().min(EMAIL_GET_CHUNK_SIZE);
+                                    let _ = resp_tx.send(BackendResponse::EmailListPreview {
+                                        mailbox_id: mailbox_id.clone(),
+                                        emails: summaries
+                                            .iter()
+                                            .take(preview_count)
+                                            .cloned()
+                                            .collect(),
+                                        total,
+                                    });
+                                    log_info!(
+                                        "[Backend] cmd#{} first_summaries={} elapsed_ms={}",
+                                        command_seq,
+                                        preview_count,
+                                        query_started.elapsed().as_millis()
+                                    );
+                                }
                             }
                             Ok(summaries)
                         } else {

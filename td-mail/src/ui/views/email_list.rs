@@ -1128,6 +1128,22 @@ impl View for EmailListView {
 
     fn on_response(&mut self, response: &BackendResponse) -> bool {
         match response {
+            BackendResponse::EmailListPreview {
+                mailbox_id,
+                emails,
+                total,
+            } if *mailbox_id == self.mailbox_id
+                && self.loading
+                && !self.loading_more
+                && self.active_search.is_none()
+                && self.emails.is_empty()
+                && self.pending_write_ops.is_empty() =>
+            {
+                self.emails = emails.clone();
+                self.total = *total;
+                self.error = None;
+                true
+            }
             BackendResponse::Emails {
                 mailbox_id,
                 emails,
@@ -1145,6 +1161,28 @@ impl View for EmailListView {
                     Ok(emails) => {
                         self.last_refreshed = Some(SystemTime::now());
                         if *position == 0 {
+                            // A list response can precede mutations queued from its preview.
+                            let pending_keywords: Vec<_> = self
+                                .pending_write_ops
+                                .values()
+                                .filter_map(|operation| {
+                                    let (id, seen) = match operation {
+                                        PendingWriteOp::Seen { email_id, .. } => (email_id, true),
+                                        PendingWriteOp::Flag { email_id, .. } => (email_id, false),
+                                        PendingWriteOp::Move { .. } => return None,
+                                    };
+                                    let email = self.emails.iter().find(|email| email.id == *id)?;
+                                    Some((
+                                        id.clone(),
+                                        seen,
+                                        email.keywords.contains_key(if seen {
+                                            "$seen"
+                                        } else {
+                                            "$flagged"
+                                        }),
+                                    ))
+                                })
+                                .collect();
                             // Collect IDs of emails with in-flight move/destroy
                             // ops so we can filter them out of incoming data.
                             // These emails were optimistically removed and must
@@ -1159,19 +1197,21 @@ impl View for EmailListView {
                                 .collect();
                             if inflight_move_ids.is_empty() {
                                 self.emails = emails.clone();
-                                self.pending_write_ops.clear();
                             } else {
                                 self.emails = emails
                                     .iter()
                                     .filter(|e| !inflight_move_ids.contains(e.id.as_str()))
                                     .cloned()
                                     .collect();
-                                // Only clear flag/seen ops — move ops are still
-                                // in flight and must be kept for rollback.
-                                self.pending_write_ops
-                                    .retain(|_, op| matches!(op, PendingWriteOp::Move { .. }));
                             }
                             self.thread_counts = thread_counts.clone();
+                            for (id, seen, value) in pending_keywords {
+                                if seen {
+                                    self.set_email_seen_state(&id, value);
+                                } else {
+                                    self.set_email_flag_state(&id, value);
+                                }
+                            }
                         } else {
                             self.thread_counts
                                 .extend(thread_counts.iter().map(|(k, v)| (k.clone(), *v)));
@@ -1918,5 +1958,141 @@ mod tests {
         view.loading = true;
         assert_eq!(message(&view.scene()), "Loading emails...");
         assert_eq!(view.scene().status, "Loading... | q:back");
+    }
+    #[test]
+    fn first_summary_preview_keeps_pagination_pending_until_the_final_response() {
+        let (mut view, _) = make_view();
+        view.emails.clear();
+        view.thread_counts.clear();
+        view.loading = true;
+        view.next_query_position = 0;
+        view.last_loaded_count = 0;
+        let preview = BackendResponse::EmailListPreview {
+            mailbox_id: view.mailbox_id.clone(),
+            emails: vec![make_email("preview", "preview-thread")],
+            total: Some(100),
+        };
+        assert!(view.on_response(&preview));
+        assert_eq!(view.emails.len(), 1);
+        assert!(view.loading);
+        assert!(!view.can_load_more());
+        assert_eq!(view.next_query_position, 0);
+        assert_eq!(view.last_loaded_count, 0);
+        assert!(view.last_refreshed.is_none());
+        let final_response = BackendResponse::Emails {
+            mailbox_id: view.mailbox_id.clone(),
+            emails: Ok(vec![make_email("final", "final-thread")]),
+            total: Some(100),
+            position: 0,
+            loaded: 50,
+            thread_counts: HashMap::from([("final-thread".into(), (1, 1))]),
+        };
+        assert!(view.on_response(&final_response));
+        assert_eq!(
+            view.emails.first().map(|email| email.id.as_str()),
+            Some("final")
+        );
+        assert!(!view.loading);
+        assert_eq!(view.next_query_position, 50);
+        assert!(view.last_refreshed.is_some());
+        assert_eq!(view.thread_counts.get("final-thread"), Some(&(1, 1)));
+    }
+
+    #[test]
+    fn a_preview_does_not_replace_existing_rows_or_a_filtered_query() {
+        let (mut view, _) = make_view();
+        view.loading = true;
+        let preview = BackendResponse::EmailListPreview {
+            mailbox_id: view.mailbox_id.clone(),
+            emails: vec![make_email("preview", "preview-thread")],
+            total: Some(100),
+        };
+        assert!(!view.on_response(&preview));
+        assert_eq!(view.emails.len(), 3);
+        view.emails.clear();
+        view.active_search = Some("search".into());
+        assert!(!view.on_response(&preview));
+        assert!(view.emails.is_empty());
+        view.active_search = None;
+        let foreign = BackendResponse::EmailListPreview {
+            mailbox_id: "another-folder".into(),
+            emails: vec![make_email("foreign", "foreign-thread")],
+            total: Some(1),
+        };
+        assert!(!view.on_response(&foreign));
+        assert!(view.emails.is_empty());
+    }
+    #[test]
+    fn preview_completion_preserves_keyword_actions_and_their_results() {
+        for succeed in [false, true] {
+            let (mut view, _receiver) = make_view();
+            view.emails.clear();
+            view.thread_counts.clear();
+            view.loading = true;
+            let preview = BackendResponse::EmailListPreview {
+                mailbox_id: view.mailbox_id.clone(),
+                emails: vec![make_email("preview", "preview-thread")],
+                total: Some(1),
+            };
+            assert!(view.on_response(&preview));
+            view.handle_key(Key::Char('f'), 24);
+            assert!(view.open_single_email().is_some());
+            let operations: Vec<_> = view
+                .pending_write_ops
+                .iter()
+                .map(|(id, operation)| {
+                    (
+                        *id,
+                        match operation {
+                            PendingWriteOp::Flag { .. } => EmailMutationAction::SetFlagged(true),
+                            PendingWriteOp::Seen { .. } => EmailMutationAction::MarkRead,
+                            PendingWriteOp::Move { .. } => panic!("unexpected move"),
+                        },
+                    )
+                })
+                .collect();
+            assert_eq!(operations.len(), 2);
+            let completed = BackendResponse::Emails {
+                mailbox_id: view.mailbox_id.clone(),
+                emails: Ok(vec![make_email("preview", "preview-thread")]),
+                total: Some(1),
+                position: 0,
+                loaded: 1,
+                thread_counts: HashMap::from([("preview-thread".into(), (1, 1))]),
+            };
+            assert!(view.on_response(&completed));
+            assert!(view
+                .emails
+                .first()
+                .is_some_and(|email| email.keywords.contains_key("$flagged")
+                    && email.keywords.contains_key("$seen")));
+            assert_eq!(view.thread_counts.get("preview-thread"), Some(&(0, 1)));
+            for (op_id, action) in operations {
+                assert!(view.on_response(&BackendResponse::EmailMutation {
+                    op_id,
+                    id: "preview".into(),
+                    action,
+                    result: if succeed {
+                        Ok(())
+                    } else {
+                        Err("refused".into())
+                    },
+                }));
+            }
+            assert!(view.pending_write_ops.is_empty());
+            let email = view.emails.first().unwrap();
+            assert_eq!(email.keywords.contains_key("$flagged"), succeed);
+            assert_eq!(email.keywords.contains_key("$seen"), succeed);
+            assert_eq!(
+                view.thread_counts.get("preview-thread"),
+                Some(&(usize::from(!succeed), 1))
+            );
+            if !succeed {
+                assert!(view
+                    .status_message
+                    .as_ref()
+                    .is_some_and(|message| message.contains("refused")));
+            }
+        }
     }
 }

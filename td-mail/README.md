@@ -643,6 +643,14 @@ Automatic rules retain full-message input in matching folders, even for
 CLI queries retain full bodies unless
 `headers_only` is requested.
 
+An empty, unfiltered interactive folder view shows its first summary batch
+(up to 50 messages) while later batches and thread counts are still loading.
+This preview does not advance pagination or mark the folder refreshed; the
+final response replaces it. Existing rows and filtered views keep their
+normal refresh behavior. CLI commands still receive one complete response.
+The diagnostic log records first-summary count and elapsed milliseconds.
+
+
 ### Diagnostic logs
 
 `$XDG_STATE_HOME/td-mail/td-mail.log` (normally
