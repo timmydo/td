@@ -412,8 +412,10 @@ count (compiled maximum 32). Each mutex-protected slot owns its protocol,
 transport, optional ingress job and one phase: empty, network, queued,
 completed, retry or retiring. Worker scans replace separate work queues:
 each worker performs at most one operation per eligible slot per pass.
-Only the matching worker executes a queued operation. Main acknowledges
-completed phases before further socket work or redispatch. Reuse requires
+Only the matching worker executes a queued operation. DATA line copies do
+not enter that queue: main copies at most one decoded line into the slot's
+admitted buffer per turn, under the slot mutex, with no storage or peer I/O.
+Main acknowledges completed phases before further socket work or redispatch. Reuse requires
 worker retirement followed by main releasing the peer/listener count.
 There are no queued references that can outlive this phase, so these slots
 need neither scalar reuse tokens nor a separate completion-credit ledger.
@@ -425,8 +427,8 @@ are rescheduled no sooner than ten milliseconds after completion and keep
 the original handshake deadline. Storage coordination retries retain the
 captured operation deadline and wait at least five milliseconds after a
 contention result. Plain/TLS socket progress and SMTP parsing
-use the existing bounded Network turns. Storage consumes one decoded
-line per turn; header completion and atomic native publication retain
+use the existing bounded Network turns. Main copies one decoded DATA
+line per connection turn; header completion and atomic native publication retain
 their existing configured byte/work/time bounds, not a new parser quantum.
 
 The storage worker creates and retains its worker-local entropy handle.
@@ -435,7 +437,9 @@ and connection slots bound native owners and fixed wire buffers. The storage
 worker retires normal connections; the TLS worker disposes failed upgrades
 it owns. Movable TLS state has no thread identity requirement, and ordinary
 spool cleanup cannot hold the TLS worker behind a storage commit. Main
-never drops a live delivery or native TLS owner during its network loop.
+never drops a native TLS owner during its network loop. A refused DATA
+copy may release its resident delivery memory and permit there, without
+native storage I/O; other delivery disposal remains worker-owned.
 After worker failure, the loop stops and joins both workers before
 terminal cleanup, including disposal of poisoned
 slots without resuming their operations. Blocking kernel I/O remains a

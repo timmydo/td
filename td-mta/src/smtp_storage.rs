@@ -1,4 +1,4 @@
-//! Storage boundary used only on the fixed SMTP worker.
+//! Admitted SMTP jobs: bounded DATA copies and fixed-worker publication.
 use crate::{
     format::row::ReceiptTls,
     ids::AccountId,
@@ -32,6 +32,8 @@ pub struct Completion {
     pub stop: bool,
 }
 pub trait Job: Send {
+    /// Copy one decoded line (at most 1000 bytes) into admitted memory.
+    /// Called on the network loop: no database, filesystem, peer I/O or waits.
     fn write(&mut self, bytes: &[u8]) -> Result<(), Failure>;
     fn prepare(&mut self, deadline: Deadline) -> Result<(), Failure>;
     fn commit(&mut self) -> Result<Completion, Failure>;

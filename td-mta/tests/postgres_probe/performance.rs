@@ -36,6 +36,7 @@ struct Knobs {
     streams: u64,
     messages: u64,
     readers: u64,
+    large_bytes: usize,
 }
 
 fn knob(name: &str, default: u64, maximum: u64) -> u64 {
@@ -56,7 +57,7 @@ fn knob(name: &str, default: u64, maximum: u64) -> u64 {
 
 impl Knobs {
     fn from_env() -> Self {
-        Self {
+        let knobs = Self {
             idle_seconds: knob("TD_MTA_PERF_IDLE_SECONDS", 30, 3600),
             streams: knob(
                 "TD_MTA_PERF_SMTP_STREAMS",
@@ -65,8 +66,60 @@ impl Knobs {
             ),
             messages: knob("TD_MTA_PERF_SMTP_MESSAGES", 50, 1000),
             readers: knob("TD_MTA_PERF_JMAP_READERS", 2, JMAP_READERS_MAX),
-        }
+            large_bytes: {
+                let value = usize::try_from(knob(
+                    "TD_MTA_PERF_LARGE_BYTES",
+                    LARGE_BYTES as u64,
+                    16 * 1024 * 1024,
+                ))
+                .unwrap();
+                assert!(
+                    value >= SMALL_BYTES * 2,
+                    "TD_MTA_PERF_LARGE_BYTES must be at least 4096"
+                );
+                value
+            },
+        };
+        assert!(
+            knobs.fits_body_quota(td_mta::admission::DiskLimits::default().body_bytes),
+            "performance workload exceeds fixture body quota; reduce message size or count"
+        );
+        knobs
     }
+    fn fits_body_quota(&self, quota: u64) -> bool {
+        // Full-line rounding and the trusted receiver's trace fit within 4 KiB.
+        let bound = (|| {
+            let large = self.messages / LARGE_EVERY;
+            let small = self.messages.checked_sub(large)?;
+            let payload = large
+                .checked_mul(u64::try_from(self.large_bytes).ok()?)?
+                .checked_add(small.checked_mul(SMALL_BYTES as u64)?)?;
+            payload
+                .checked_add(self.messages.checked_mul(4096)?)?
+                .checked_mul(self.streams)
+        })();
+        bound.is_some_and(|bytes| bytes <= quota)
+    }
+}
+
+#[test]
+fn performance_workload_refuses_permanent_quota_exhaustion() {
+    let quota = td_mta::admission::DiskLimits::default().body_bytes;
+    let mut knobs = Knobs {
+        idle_seconds: 30,
+        streams: 4,
+        messages: 50,
+        readers: 2,
+        large_bytes: LARGE_BYTES,
+    };
+    assert!(knobs.fits_body_quota(quota));
+    knobs.messages = 1000;
+    knobs.large_bytes = 16 * 1024 * 1024;
+    assert!(!knobs.fits_body_quota(quota));
+    knobs.large_bytes = 1024 * 1024;
+    assert!(knobs.fits_body_quota(quota));
+    knobs.messages = u64::MAX;
+    assert!(!knobs.fits_body_quota(quota));
 }
 
 /// `VmRSS` and `VmHWM` in KiB; HWM is the kernel's peak since exec.
@@ -254,9 +307,9 @@ fn idle(fixture: &Fixture, scenario: &str, services: &[&Service], seconds: u64) 
 
 /// A deterministic message: every tenth is large, the rest small, with
 /// 76-character lines that never begin with a dot.
-fn message(stream: u64, index: u64) -> Vec<u8> {
+fn message(stream: u64, index: u64, large_bytes: usize) -> Vec<u8> {
     let size = if index % LARGE_EVERY == LARGE_EVERY - 1 {
-        LARGE_BYTES
+        large_bytes
     } else {
         SMALL_BYTES
     };
@@ -404,7 +457,7 @@ struct Intake {
 }
 
 impl Intake {
-    fn stream(smtp: SocketAddr, stream: u64, messages: u64) -> Self {
+    fn stream(smtp: SocketAddr, stream: u64, messages: u64, large_bytes: usize) -> Self {
         let mut intake = Self {
             deferrals: vec![0; PHASES.len()],
             ..Self::default()
@@ -412,7 +465,7 @@ impl Intake {
         let (mut connection, refused) = Stream::connect(smtp);
         intake.greeting_refusals += refused;
         for index in 0..messages {
-            let body = message(stream, index);
+            let body = message(stream, index, large_bytes);
             intake.bytes += body.len();
             let started = Instant::now();
             let mut attempts = 0;
@@ -480,7 +533,7 @@ impl Intake {
     }
 }
 
-/// Count, p50/p90/p99 and max of `values`, which this sorts.
+/// Count, p50/p90/p95/p99 and max of `values`, which this sorts.
 fn distribution(values: &mut [f64]) -> String {
     values.sort_by(f64::total_cmp);
     let at = |fraction: f64| {
@@ -488,10 +541,11 @@ fn distribution(values: &mut [f64]) -> String {
         values.get(rank).copied().unwrap_or(0.0)
     };
     format!(
-        "{{\"count\":{},\"p50\":{:.1},\"p90\":{:.1},\"p99\":{:.1},\"max\":{:.1}}}",
+        "{{\"count\":{},\"p50\":{:.1},\"p90\":{:.1},\"p95\":{:.1},\"p99\":{:.1},\"max\":{:.1}}}",
         values.len(),
         at(0.5),
         at(0.9),
+        at(0.95),
         at(0.99),
         at(1.0)
     )
@@ -523,7 +577,8 @@ fn intake(fixture: &Fixture, smtp: SocketAddr, cloud: &Service, knobs: &Knobs) {
     let workers = (0..knobs.streams)
         .map(|stream| {
             let messages = knobs.messages;
-            thread::spawn(move || Intake::stream(smtp, stream, messages))
+            let large_bytes = knobs.large_bytes;
+            thread::spawn(move || Intake::stream(smtp, stream, messages, large_bytes))
         })
         .collect::<Vec<_>>();
     let mut intake = Intake::default();
@@ -959,7 +1014,7 @@ pub(super) fn exercise(
     report(
         "configuration",
         &format!(
-            "\"idle_seconds\":{},\"smtp_streams\":{},\"smtp_messages_per_stream\":{},\"jmap_readers\":{},\"small_bytes\":{SMALL_BYTES},\"large_bytes\":{LARGE_BYTES},\"large_every\":{LARGE_EVERY},\"https_paced_per_second\":{PACED_PER_SECOND},\"profile\":\"{}\",\"target\":\"{}-{}-{}\",\"kernel\":\"{}\",\"rlimit_data\":\"{}\"",
+            "\"idle_seconds\":{},\"smtp_streams\":{},\"smtp_messages_per_stream\":{},\"jmap_readers\":{},\"small_bytes\":{SMALL_BYTES},\"large_bytes\":{large_bytes},\"large_every\":{LARGE_EVERY},\"https_paced_per_second\":{PACED_PER_SECOND},\"profile\":\"{}\",\"target\":\"{}-{}-{}\",\"kernel\":\"{}\",\"rlimit_data\":\"{}\"",
             knobs.idle_seconds,
             knobs.streams,
             knobs.messages,
@@ -972,6 +1027,7 @@ pub(super) fn exercise(
                 .unwrap()
                 .trim(),
             data_limit(),
+            large_bytes = knobs.large_bytes,
         ),
     );
     let desktop = Service::start(&local, &connection, "desktop");

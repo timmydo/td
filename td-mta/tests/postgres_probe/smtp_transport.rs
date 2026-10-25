@@ -3,7 +3,7 @@ use super::{sql, Fixture, PASSWORD};
 use std::{
     io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
-    sync::{mpsc, Arc},
+    sync::{mpsc, Arc, Condvar, Mutex},
     time::{Duration, Instant},
 };
 use td_mta::{
@@ -16,11 +16,116 @@ use td_mta::{
     postgres_smtp_receiving::{Pending, Receiving as Owner},
     postgres_smtp_storage::Backend,
     smtp_receiving::{BoundListener, Control, Receiving, State},
+    smtp_storage::{self, Job, Storage},
     tls_admission::HandshakePool,
     tls_io::{TlsIo, TLS_WIRE_BYTES},
     tls_policy::TlsPolicies,
     transport::TcpTransport,
 };
+
+#[derive(Default)]
+struct CopyState {
+    entered: bool,
+    observed: bool,
+    released: bool,
+}
+#[derive(Default)]
+struct CopyProbe {
+    state: Mutex<CopyState>,
+    changed: Condvar,
+}
+impl CopyProbe {
+    fn wait(&self, condition: impl Fn(&CopyState) -> bool) -> bool {
+        let until = Instant::now() + Duration::from_secs(5);
+        let mut state = self.state.lock().unwrap();
+        while !condition(&state) {
+            let Some(remaining) = until.checked_duration_since(Instant::now()) else {
+                return false;
+            };
+            state = self.changed.wait_timeout(state, remaining).unwrap().0;
+        }
+        true
+    }
+    fn release(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.released = true;
+            self.changed.notify_all();
+        }
+    }
+}
+struct ReleaseCopy(Arc<CopyProbe>);
+impl Drop for ReleaseCopy {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+struct ObservedStorage<'a, B> {
+    inner: &'a B,
+    probe: Arc<CopyProbe>,
+}
+struct ObservedJob<J> {
+    inner: J,
+    probe: Arc<CopyProbe>,
+    gated: bool,
+}
+impl<B: Storage> Storage for ObservedStorage<'_, B> {
+    type Job<'a>
+        = ObservedJob<B::Job<'a>>
+    where
+        Self: 'a;
+    fn capacity(&self) -> u64 {
+        self.inner.capacity()
+    }
+    fn ready(
+        &self,
+        account: td_mta::ids::AccountId,
+        deadline: Deadline,
+    ) -> Result<(), td_mta::ports::Error> {
+        self.inner.ready(account, deadline)
+    }
+    fn stopped(&self) -> bool {
+        self.inner.stopped()
+    }
+    fn begin(
+        &self,
+        input: smtp_storage::Begin<'_, '_>,
+        random: &mut td_crypto::SystemEntropy,
+    ) -> Result<Self::Job<'_>, smtp_storage::Failure> {
+        Ok(ObservedJob {
+            inner: self.inner.begin(input, random)?,
+            probe: self.probe.clone(),
+            gated: false,
+        })
+    }
+}
+impl<J: Job> Job for ObservedJob<J> {
+    fn write(&mut self, bytes: &[u8]) -> Result<(), smtp_storage::Failure> {
+        self.inner.write(bytes)?;
+        if bytes == b"Subject: held publication\r\n" {
+            self.gated = true;
+        }
+        if bytes == b"Subject: independent DATA copy\r\n" {
+            self.probe.state.lock().unwrap().observed = true;
+            self.probe.changed.notify_all();
+        }
+        Ok(())
+    }
+    fn prepare(&mut self, deadline: Deadline) -> Result<(), smtp_storage::Failure> {
+        self.inner.prepare(deadline)
+    }
+    fn commit(&mut self) -> Result<smtp_storage::Completion, smtp_storage::Failure> {
+        if self.gated {
+            self.probe.state.lock().unwrap().entered = true;
+            self.probe.changed.notify_all();
+            if !self.probe.wait(|state| state.released) {
+                return Err(smtp_storage::Failure::Refused(
+                    td_mta::ports::Error::Deadline,
+                ));
+            }
+        }
+        self.inner.commit()
+    }
+}
 
 trait Duplex: Read + Write {}
 impl<T: Read + Write> Duplex for T {}
@@ -226,6 +331,53 @@ fn concurrent_data(
     command(&mut fast, b"QUIT\r\n", "221");
 }
 
+fn copy_during_publication(
+    fixture: &Fixture,
+    address: std::net::SocketAddr,
+    tls: bool,
+    clock: Arc<RuntimeClock>,
+    probe: Arc<CopyProbe>,
+) {
+    let release = ReleaseCopy(probe.clone());
+    let initial: usize = sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts")
+        .parse()
+        .unwrap();
+    let mut held = connect(fixture, address, tls, clock.clone());
+    envelope(&mut held);
+    let mut copying = connect(fixture, address, tls, clock);
+    envelope(&mut copying);
+    held.get_mut()
+        .write_all(b"Subject: held publication\r\n\r\nbody\r\n.\r\n")
+        .unwrap();
+    held.get_mut().flush().unwrap();
+    assert!(
+        probe.wait(|state| state.entered),
+        "publication did not reach gate"
+    );
+    copying
+        .get_mut()
+        .write_all(b"Subject: independent DATA copy\r\n\r\nbody\r\n")
+        .unwrap();
+    copying.get_mut().flush().unwrap();
+    assert!(
+        probe.wait(|state| state.observed),
+        "DATA copy waited behind publication"
+    );
+    assert_eq!(
+        sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"),
+        initial.to_string()
+    );
+    drop(release);
+    reply(&mut held, "250");
+    command(&mut copying, b".\r\n", "250");
+    assert_eq!(
+        sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"),
+        (initial + 2).to_string()
+    );
+    command(&mut held, b"QUIT\r\n", "221");
+    command(&mut copying, b"QUIT\r\n", "221");
+}
+
 pub(super) fn exercise(
     fixture: &Fixture,
     binding: &Binding,
@@ -264,6 +416,11 @@ pub(super) fn exercise(
         policies.id().get(),
     )
     .unwrap();
+    let probe = Arc::new(CopyProbe::default());
+    let storage = ObservedStorage {
+        inner: &storage,
+        probe: probe.clone(),
+    };
     let validated = configuration.candidate().resources();
     let pool = HandshakePool::new(validated.resources().limits().tls_handshakes).unwrap();
     configuration.candidate().with_graph(|records, graph| {
@@ -357,6 +514,7 @@ pub(super) fn exercise(
             assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"), "2");
 
             concurrent_data(fixture, address, tls, clock.clone());
+            copy_during_publication(fixture, address, tls, clock.clone(), probe.clone());
 
             // Shutdown discards a partially received message and joins the workers.
             envelope(&mut client);
@@ -382,9 +540,9 @@ pub(super) fn exercise(
             drop(client);
             assert_eq!(control.state(), State::Stopped);
             assert_eq!(pending.operation().unwrap(), None);
-            assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"), "4");
-            assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "4");
-            assert_eq!(sql(fixture, &format!("SELECT count(*) FROM td_mta.emails WHERE tls={version} AND ehlo='sender.example.test' AND reverse_path='sender@example.test'")), "4");
+            assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"), "6");
+            assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "6");
+            assert_eq!(sql(fixture, &format!("SELECT count(*) FROM td_mta.emails WHERE tls={version} AND ehlo='sender.example.test' AND reverse_path='sender@example.test'")), "6");
         });
     }).unwrap();
 }

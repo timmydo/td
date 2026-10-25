@@ -390,8 +390,14 @@ which the services inherit. Each scenario prints one `td-mta-perf
   about ten seconds late, so commit and rollback counts can land in the
   next window.
 - `smtp_intake`: concurrent plaintext loopback streams deliver
-  deterministic messages, one 256 KiB in ten and the rest 2 KiB, each to
-  the fixture's one local account. It reports throughput, milliseconds
+  deterministic messages, one approximately 256 KiB in ten and the rest
+  2 KiB, each to the fixture's one local account. `TD_MTA_PERF_LARGE_BYTES`
+  changes the large-message target (4096..16777216 bytes); use 1048576 for the
+  one-MiB acceptance goal. Generated headers and complete 76-character lines
+  may exceed the target slightly. Combined message size/count settings must
+  fit the fixture's 4-GiB body quota, including a conservative 4-KiB overhead
+  per message; otherwise the harness refuses before starting its workload.
+  Distributions include p50, p90, p95 and p99. It reports throughput, milliseconds
   from the final dot to 250 for small and large messages apart (a large
   message's tail may still be in transit when the dot is sent), time to
   acceptance including deferrals, 4xx deferrals by phase with how long

@@ -590,7 +590,7 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                                         progress = true;
                                     }
                                     Ok(Progress::Work) => {
-                                        let dispatched = self.dispatch(&mut slot, now);
+                                        let dispatched = self.dispatch(&mut slot, now, control);
                                         if dispatched.is_err() {
                                             slot.phase = Phase::Retire;
                                         }
@@ -757,7 +757,12 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
         }
     }
 
-    fn dispatch(&self, slot: &mut Slot<'s, 'cfg, B>, now: Tick) -> Result<(), Error> {
+    fn dispatch(
+        &self,
+        slot: &mut Slot<'s, 'cfg, B>,
+        now: Tick,
+        control: &Control,
+    ) -> Result<(), Error> {
         let network = slot.connection()?.network()?;
         let (work, seconds) = match network.session().pending() {
             Pending::BeginData { .. } => (Work::Begin, self.admission.work().admission_seconds),
@@ -769,10 +774,11 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
             Pending::StartTls { .. } => (Work::Tls, self.timeouts.limits().handshake_seconds),
             _ => return Err(Error::Conflict),
         };
-        slot.phase = Phase::Queued {
-            work,
-            deadline: after(now, seconds)?.min(network.deadline()),
-        };
+        let deadline = after(now, seconds)?.min(network.deadline());
+        if matches!(work, Work::Write) {
+            return self.write_data(slot, deadline, control);
+        }
+        slot.phase = Phase::Queued { work, deadline };
         Ok(())
     }
 
@@ -916,29 +922,7 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                     Err(error) => return self.delivery_refused(slot, work, error, control),
                 }
             }
-            Work::Write => {
-                let bytes = match slot
-                    .connection
-                    .as_ref()
-                    .ok_or(Error::Conflict)?
-                    .network()?
-                    .session()
-                    .pending()
-                {
-                    Pending::Data(bytes) => bytes,
-                    _ => return Err(Error::Conflict),
-                };
-                let result = slot.delivery.as_mut().ok_or(Error::Conflict)?.write(bytes);
-                if let Err(error) = result {
-                    return self.delivery_refused(slot, work, error, control);
-                }
-                if cap.expired(clock.sample()?.monotonic) {
-                    return self.storage_refused(slot, work, Error::Deadline, control);
-                }
-                slot.connection()?
-                    .network_mut()?
-                    .data_written(Ok(()), clock)?;
-            }
+            Work::Write => return self.write_data(slot, cap, control),
             Work::Commit { prepared } => {
                 let timing =
                     crate::performance::Timer::start(crate::performance::Phase::SmtpCommit);
@@ -992,6 +976,49 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
             }
             Work::Tls => return Err(Error::Conflict),
         }
+        if self.storage.stopped() {
+            control.fail();
+        }
+        slot.phase = Phase::Done;
+        Ok(())
+    }
+
+    fn write_data(
+        &self,
+        slot: &mut Slot<'s, 'cfg, B>,
+        cap: Deadline,
+        control: &Control,
+    ) -> Result<(), Error> {
+        if control.state() == State::Failed {
+            slot.phase = Phase::Retire;
+            return Ok(());
+        }
+        let work = Work::Write;
+        let clock = self.clock.as_ref();
+        if cap.expired(clock.sample()?.monotonic) {
+            return self.storage_refused(slot, work, Error::Deadline, control);
+        }
+        let bytes = match slot
+            .connection
+            .as_ref()
+            .ok_or(Error::Conflict)?
+            .network()?
+            .session()
+            .pending()
+        {
+            Pending::Data(bytes) => bytes,
+            _ => return Err(Error::Conflict),
+        };
+        let result = slot.delivery.as_mut().ok_or(Error::Conflict)?.write(bytes);
+        if let Err(error) = result {
+            return self.delivery_refused(slot, work, error, control);
+        }
+        if cap.expired(clock.sample()?.monotonic) {
+            return self.storage_refused(slot, work, Error::Deadline, control);
+        }
+        slot.connection()?
+            .network_mut()?
+            .data_written(Ok(()), clock)?;
         if self.storage.stopped() {
             control.fail();
         }

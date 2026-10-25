@@ -3085,11 +3085,14 @@ and stale-policy refusal.
 
 ## 105. SMTP worker storage boundary
 
-The fixed SMTP receiving worker accesses storage through `smtp_storage`.
-The boundary admits a job from the trusted connection's session, account,
-configuration generation and observed peer/TLS facts. Jobs own DATA writes,
-preparation and publication; the worker retains the existing routing, TLS,
-deadline, retry and shutdown state machine. A known durable result remains
+SMTP receiving accesses storage through `smtp_storage`. The fixed worker
+admits a job from the trusted connection's session, account, configuration
+generation and observed peer/TLS facts, and performs preparation and
+publication. The network loop copies one decoded DATA line into admitted
+memory per connection turn, under the same slot ownership and original
+deadline. `Job::write` is bounded and performs no database, filesystem or
+peer I/O; it does not wait on another slot's publication. Routing, TLS,
+retry, fail-stop and shutdown behavior retain their existing fences. A known durable result remains
 separate from cleanup/accounting stop flags; uncertain publication still
 retires the active service under the existing production policy.
 
@@ -3137,8 +3140,9 @@ publication owner serialize preparation and publication. Four full-capacity
 incoming buffers plus that filtered body have a 160-MiB payload ceiling;
 allocator capacity and native protocol buffers are additional. This finite
 bound is not qualification of the provisional 128-MiB workload RSS goal.
-Each decoded line is at most 1000 bytes. A failed write remains failed, and
-publication can be attempted only once.
+Each decoded line is at most 1000 bytes. The network loop performs its
+bounded memory copy and refuses further copies after service failure. A
+failed write remains failed, and publication can be attempted only once.
 The trusted connection owner still supplies routing and observed peer/TLS
 facts; no gateway authority is inferred from message content.
 
@@ -3168,7 +3172,11 @@ later successful transaction on that connection. A partial DATA sender stays
 paused until another connection has received final success, with exactly that
 second delivery durable before the paused sender completes. Shutdown discards
 four unfinished DATA jobs, joins the workers and leaves no additional message
-or receipt. These concurrency regressions run over plaintext and STARTTLS.
+or receipt. These concurrency regressions run over plaintext and STARTTLS. Another
+regression holds one admitted job immediately before publication and proves
+that a second job consumes its DATA line before that gate is released. No
+receipt exists for either message until publication proceeds; both final
+successes must correspond to durable receipts.
 
 This qualifies the plaintext direct-SMTP transport path in the prepared
 runtime. It does not activate a production PostgreSQL listener, qualify a new

@@ -1710,8 +1710,11 @@ a TLS failure. This gate also applies to
 plaintext SMTP, which would otherwise never construct a TLS session.
 
 One network loop visits bounded connection slots in rotating order. One
-fixed storage worker performs admission, streaming writes and publication;
-one fixed TLS worker constructs sessions and advances handshakes. Idle
+fixed storage worker performs admission and publication; one fixed TLS
+worker constructs sessions and advances handshakes. The network loop copies
+one decoded DATA line of at most 1000 bytes per connection turn into its
+admitted resident buffer. That copy performs no database, filesystem or peer
+I/O and cannot queue behind another connection's publication. Idle
 connections and pending handshakes retain slots but do not occupy a worker.
 Each slot retains its own queued operation and completion, so dispatch
 reserves result capacity before effects without a separate completion
@@ -1726,7 +1729,8 @@ stopping, stopped and failed. Shutdown stops accepting and permits up to
 five seconds of existing connection progress before retirement; a known
 final DATA reply retains its existing bounded finishing allowance. It never
 accepts incomplete DATA. Native cleanup runs on fixed workers during
-normal operation. An unexpected worker failure stops new mutations and
+normal operation; refusal of a bounded DATA copy may release its resident
+memory and permit on the network loop, without native storage I/O. An unexpected worker failure stops new mutations and
 fails status; terminal teardown after joining workers may block and never
 resumes a poisoned transaction. No thread replacement or kernel-I/O
 cancellation is promised. RESOURCES records the concrete slot ownership.
@@ -1752,7 +1756,8 @@ seconds for write shutdown and discard. Draining stops after 64 KiB of
 additional reads or EOF; buffered tails are discarded immediately. This
 is best effort: a bounded close can still reset with unread peer input
 and cannot guarantee receipt of a refusal. Drained bytes never become
-commands. Storage job disposal remains on a worker. These bounded turns
+commands. Storage job disposal remains on a worker except resident-memory
+and permit release after a refused network-loop DATA copy. These bounded turns
 do not establish runtime queue admission or fairness.
 
 A service-unavailable operation queues 421 at an empty command boundary;

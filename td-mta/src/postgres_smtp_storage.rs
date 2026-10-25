@@ -1,4 +1,4 @@
-//! PostgreSQL DATA storage on the fixed SMTP worker.
+//! Admitted DATA memory with PostgreSQL publication on the SMTP worker.
 use crate::{
     admission::work::{Charge, Meter, Stop},
     clock::RuntimeClock,
