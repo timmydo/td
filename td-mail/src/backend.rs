@@ -1679,6 +1679,53 @@ fn replay_queued_mutations(
     }
 }
 
+const BACKGROUND_BODIES_MAX: usize = 1024;
+
+#[derive(Default)]
+struct BackgroundBodies(VecDeque<String>);
+
+impl BackgroundBodies {
+    fn queue(&mut self, emails: &[Email]) {
+        for email in emails.iter().filter(|email| email.is_summary()) {
+            if self.0.contains(&email.id) {
+                continue;
+            }
+            if self.0.len() == BACKGROUND_BODIES_MAX {
+                self.0.pop_front();
+            }
+            self.0.push_back(email.id.clone());
+        }
+    }
+
+    fn warm_one(&mut self, client: &JmapClient, cache: &Cache) {
+        let Some(id) = self.0.pop_front() else {
+            return;
+        };
+        if !cache.get_email(&id).is_some_and(|email| email.is_summary()) {
+            return;
+        }
+        let started = std::time::Instant::now();
+        let result = client.get_email(&id).map_err(|error| error.to_string());
+        let result = result.and_then(|email| match email {
+            Some(email) if email.id == id => cache.fill_cached_body(&email),
+            _ => Ok(false),
+        });
+        match result {
+            Ok(stored) => log_debug!(
+                "[Backend] offline_body stored={} elapsed_ms={} pending={}",
+                stored,
+                started.elapsed().as_millis(),
+                self.0.len()
+            ),
+            Err(error) => {
+                // A failing connection must not be retried for every queued ID.
+                self.0.clear();
+                log_warn!("[Backend] offline body caching paused: {}", error);
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn backend_loop(
     client: Option<JmapClient>,
@@ -1704,6 +1751,7 @@ fn backend_loop(
     // connection then supersedes, and no fetch fails as offline while
     // the client is connecting.
     let mut held: VecDeque<BackendCommand> = VecDeque::new();
+    let mut background_bodies = BackgroundBodies::default();
     // Why the loop is offline, when a connection was tried and failed:
     // named in every answer served from the cache until one is made.
     let mut offline_reason: Option<String> = None;
@@ -1733,10 +1781,24 @@ fn backend_loop(
                     Err(_) => break,
                 }
             }
-            None => match cmd_rx.recv() {
-                Ok(cmd) => cmd,
-                Err(_) => break,
-            },
+            None => {
+                if !connecting && !background_bodies.0.is_empty() {
+                    if let (Some(client), Some(cache)) = (client.as_ref(), cache.as_ref()) {
+                        match cmd_rx.try_recv() {
+                            Ok(cmd) => held.push_back(cmd),
+                            Err(mpsc::TryRecvError::Disconnected) => break,
+                            Err(mpsc::TryRecvError::Empty) => {
+                                background_bodies.warm_one(client, cache);
+                            }
+                        }
+                        continue;
+                    }
+                }
+                match cmd_rx.recv() {
+                    Ok(cmd) => cmd,
+                    Err(_) => break,
+                }
+            }
         };
         command_seq = command_seq.wrapping_add(1);
 
@@ -1779,6 +1841,7 @@ fn backend_loop(
         // online replays it.
         match cmd {
             BackendCommand::Connect(connected) => {
+                background_bodies.0.clear();
                 log_info!("[Backend] cmd#{} Connect", command_seq);
                 if let Some(cache) = cache.as_ref() {
                     replay_queued_mutations(
@@ -2222,6 +2285,12 @@ fn backend_loop(
                     }
                     Err(e) => (Err(e), None, position, 0, HashMap::new()),
                 };
+
+                if !origin.starts_with("cli") && cache.is_some() {
+                    if let Ok(emails) = &emails {
+                        background_bodies.queue(emails);
+                    }
+                }
 
                 let _ = resp_tx.send(BackendResponse::Emails {
                     mailbox_id,
@@ -3870,6 +3939,211 @@ fn received_days(received: &str) -> Option<i64> {
 mod tests {
     use super::*;
     use crate::cache::Cache;
+
+    #[test]
+    fn background_body_queue_is_bounded_and_stops_after_transport_failure() {
+        let _env = crate::testing::env_lock();
+        let dir = td_fs::TempDir::new("mail-background-failure").unwrap();
+        std::env::set_var("XDG_CACHE_HOME", dir.path());
+        std::env::set_var("XDG_RUNTIME_DIR", dir.path());
+        let emails = (0..=BACKGROUND_BODIES_MAX)
+            .map(|id| {
+                Email::from_json(&td_json::json!({
+                    "id":format!("m{id}"),"tdMailSummary":true,"keywords":{},"mailboxIds":{}
+                }))
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let cache = Cache::open("failure").unwrap();
+        cache.put_emails(&emails);
+        let mut pending = BackgroundBodies::default();
+        pending.queue(&emails);
+        assert_eq!(pending.0.len(), BACKGROUND_BODIES_MAX);
+        assert_eq!(pending.0.front().map(String::as_str), Some("m1"));
+        pending.queue(emails.get(1..).unwrap());
+        assert_eq!(pending.0.len(), BACKGROUND_BODIES_MAX);
+        pending.warm_one(&JmapClient::unreachable_for_tests(), &cache);
+        assert!(
+            pending.0.is_empty(),
+            "do not try every ID against a failed transport"
+        );
+        assert!(cache.get_email("m1").unwrap().is_summary());
+        pending.queue(emails.get(..1).unwrap());
+        cache.remove_email("m0");
+        pending.warm_one(&JmapClient::unreachable_for_tests(), &cache);
+        assert!(cache.get_email("m0").is_none());
+    }
+
+    #[test]
+    fn interactive_listing_warms_offline_body_then_yields_to_shutdown() {
+        use std::io::{BufRead, Read, Write};
+        use std::os::unix::net::UnixListener;
+        use std::time::{Duration, Instant};
+
+        let _env = crate::testing::env_lock();
+        let dir = td_fs::TempDir::new("mail-background-bodies").unwrap();
+        std::env::set_var("XDG_CACHE_HOME", dir.path());
+        std::env::set_var("XDG_RUNTIME_DIR", dir.path());
+        std::fs::create_dir(dir.join("td-fetch")).unwrap();
+        let listener = UnixListener::bind(dir.join("td-fetch/socket")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (body_started, body_wait) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let server = thread::spawn(move || {
+            for step in 0..3 {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "missing fetch step {step}");
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("accept: {error}"),
+                    }
+                };
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                socket
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
+                let mut length = None;
+                loop {
+                    let mut line = String::new();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    if line == "\n" {
+                        break;
+                    }
+                    if let Some(value) = line.strip_prefix("body ") {
+                        length = Some(value.trim().parse::<usize>().unwrap());
+                    }
+                }
+                let mut bytes = vec![0; length.unwrap()];
+                reader.read_exact(&mut bytes).unwrap();
+                let request = td_json::parse(std::str::from_utf8(&bytes).unwrap()).unwrap();
+                let call = &request["methodCalls"][0];
+                let expected = if step == 0 {
+                    "Email/query"
+                } else {
+                    "Email/get"
+                };
+                assert_eq!(call[0].as_str(), Some(expected));
+                let result = match step {
+                    0 => {
+                        td_json::json!({"accountId":"account","ids":["a","b"],"position":0,"total":2,"queryState":"q"})
+                    }
+                    1 => {
+                        assert_ne!(call[1]["fetchTextBodyValues"].as_bool(), Some(true));
+                        td_json::json!({"accountId":"account","state":"s","notFound":[],"list":[
+                            {"id":"a","subject":"first","keywords":{},"mailboxIds":{"inbox":true}},
+                            {"id":"b","subject":"second","keywords":{},"mailboxIds":{"inbox":true}}
+                        ]})
+                    }
+                    _ => {
+                        assert_eq!(call[1]["ids"], td_json::json!(["a"]));
+                        assert_eq!(call[1]["fetchTextBodyValues"].as_bool(), Some(true));
+                        body_started.send(()).unwrap();
+                        released.recv_timeout(Duration::from_secs(5)).unwrap();
+                        td_json::json!({"accountId":"account","state":"s","notFound":[],"list":[
+                            {"id":"a","subject":"stale","keywords":{},"mailboxIds":{"inbox":true},
+                            "textBody":[{"partId":"1"}],"bodyValues":{"1":{"value":"available offline","isTruncated":false,"isEncodingProblem":false}}}
+                        ]})
+                    }
+                };
+                let reply = td_json::json!({"methodResponses":[[expected,result,call[2].clone()]]})
+                    .to_string();
+                write!(
+                    socket,
+                    "td-fetch 1\nstatus 200\nbody {}\n\n{}",
+                    reply.len(),
+                    reply
+                )
+                .unwrap();
+            }
+            listener
+        });
+        let cache = Cache::open("background").unwrap();
+        let (commands, cmd_rx) = mpsc::channel();
+        let (resp_tx, responses) = mpsc::channel();
+        let backend = thread::spawn(move || {
+            backend_loop(
+                Some(JmapClient::unreachable_for_tests()),
+                false,
+                cmd_rx,
+                resp_tx,
+                Arc::new(Vec::new()),
+                Arc::new(Vec::new()),
+                Arc::new(UserRegex::compile(".*").unwrap()),
+                Arc::new(UserRegex::compile(".*").unwrap()),
+                Some(cache),
+                None,
+                SpamConfig {
+                    enabled: false,
+                    threshold: 0.9,
+                    ham_threshold: 0.1,
+                    min_training: 1,
+                },
+                Arc::new(std::sync::Mutex::new(crate::spam::SpamModel::default())),
+            )
+        });
+        commands
+            .send(BackendCommand::QueryEmails {
+                origin: "interactive".into(),
+                mailbox_id: "inbox".into(),
+                page_size: 50,
+                position: 0,
+                search_query: None,
+                received_after: None,
+                received_before: None,
+            })
+            .unwrap();
+        assert!(matches!(
+            responses.recv_timeout(Duration::from_secs(5)).unwrap(),
+            BackendResponse::EmailListPreview { .. }
+        ));
+        assert!(matches!(
+            responses.recv_timeout(Duration::from_secs(5)).unwrap(),
+            BackendResponse::Emails { emails: Ok(_), .. }
+        ));
+        body_wait.recv_timeout(Duration::from_secs(5)).unwrap();
+        commands.send(BackendCommand::Shutdown).unwrap();
+        release.send(()).unwrap();
+        let listener = server.join().unwrap();
+        backend.join().unwrap();
+        assert!(
+            listener.accept().is_err(),
+            "shutdown must precede the second body request"
+        );
+        assert!(
+            responses.try_recv().is_err(),
+            "hydration emits no UI response"
+        );
+        let cache = Cache::open("background").unwrap();
+        assert!(!cache.get_email("a").unwrap().is_summary());
+        assert!(cache.get_email("b").unwrap().is_summary());
+        assert_eq!(
+            cache.get_email("a").unwrap().subject.as_deref(),
+            Some("first")
+        );
+        assert_eq!(cache.filter_unprocessed(&["a".into()]), vec!["a"]);
+        let (tx, rx) = mpsc::channel();
+        handle_offline_command(
+            &BackendCommand::GetEmail { id: "a".into() },
+            &tx,
+            &Some(cache),
+            &mut Vec::new(),
+            1,
+            Some("offline"),
+        );
+        match rx.recv().unwrap() {
+            BackendResponse::EmailBody { result, .. } => {
+                assert_eq!(result.unwrap().body_values["1"].value, "available offline")
+            }
+            _ => panic!("offline body response"),
+        }
+    }
 
     #[test]
     fn newer_moves_supersede_pending_rule_destinations_and_refuse_legacy_selections() {

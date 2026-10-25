@@ -634,10 +634,19 @@ and the account's `tls_ca_file` origin scope still apply. The ordinary
 
 Mailbox lists outside the configured automatic-rule folder scope fetch headers
 and stored metadata first,
-without downloading previews, MIME part lists or full message bodies. Opening a message fetches its body on demand. Loaded bodies remain cached when
+without downloading previews, MIME part lists or full message bodies. After
+the interactive listing is delivered, the backend downloads missing bodies
+for offline reading, one message between checks for queued commands. Opening
+a message fetches its body on demand. Loaded bodies remain cached when
 later summary refreshes update flags and folder membership. Offline lists can
 show cached summaries, but opening a summary whose body was never downloaded
 reports that the message is not cached instead of displaying an empty body.
+Background caching is best effort: it keeps at most 1024 pending IDs per
+account, dropping the oldest pending IDs when full, and stops on a fetch or
+cache-write failure until another listing schedules work. Closing the client
+discards pending work. A command arriving during a body request waits for that
+request and its existing retry/deadline policy; background reads do not mark
+messages read, run rules, or replace local flags and folder membership.
 Automatic rules retain full-message input in matching folders, even for
 `headers_only` queries. Thread and keyword lookups use at most 256 IDs per call.
 CLI queries retain full bodies unless

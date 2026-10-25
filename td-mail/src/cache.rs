@@ -146,6 +146,21 @@ impl Cache {
         }
     }
 
+    /// Fill only an existing summary; local flags, moves and deletions win.
+    pub fn fill_cached_body(&self, body: &Email) -> Result<bool, String> {
+        let Some(mut current) = self.get_email(&body.id) else {
+            return Ok(false);
+        };
+        if !current.is_summary() || body.is_summary() || body.is_unreadable() {
+            return Ok(false);
+        }
+        current.retain_cached_body(body);
+        let mut txn = self.store.write();
+        txn.insert(EMAILS, &Key::from_str(&current.id), &encode(&current));
+        txn.commit().map_err(|error| error.to_string())?;
+        Ok(true)
+    }
+
     pub fn get_mailbox_emails(&self, mailbox_id: &str) -> Option<Vec<Email>> {
         let txn = self.store.read();
         let index_table = txn.table(MAILBOX_INDEX)?;
@@ -658,6 +673,40 @@ mod tests {
         assert_eq!(loaded.preview.as_deref(), Some("cached body preview"));
         assert!(loaded.keywords.contains_key("$seen"));
         assert!(loaded.mailbox_ids.contains_key("new-folder"));
+    }
+
+    #[test]
+    fn background_bodies_preserve_mutations_and_never_restore_deleted_rows() {
+        let dir = td_fs::TempDir::new("mail-background-cache").unwrap();
+        let _env = crate::testing::env_lock();
+        std::env::set_var("XDG_CACHE_HOME", dir.path());
+        let cache = Cache::open("background").unwrap();
+        let mut summary = make_test_email("e1");
+        summary
+            .extra
+            .insert("tdMailSummary".into(), td_json::Json::Bool(true));
+        summary.keywords.insert("$seen".into(), true);
+        summary.keywords.insert("$flagged".into(), true);
+        summary.mailbox_ids.insert("moved".into(), true);
+        cache.put_emails(std::slice::from_ref(&summary));
+        let mut body = make_test_email("e1");
+        body.mailbox_ids.insert("old".into(), true);
+        body.preview = Some("body for offline reading".into());
+        let mut refused = body.clone();
+        refused.mark_unreadable();
+        assert!(!cache.fill_cached_body(&refused).unwrap());
+        assert!(cache.get_email("e1").unwrap().is_summary());
+        assert!(cache.fill_cached_body(&body).unwrap());
+        let stored = cache.get_email("e1").unwrap();
+        assert_eq!(stored.keywords, summary.keywords);
+        assert_eq!(stored.mailbox_ids, summary.mailbox_ids);
+        assert_eq!(stored.preview, body.preview);
+        assert!(!stored.is_summary());
+        assert!(!cache.fill_cached_body(&body).unwrap());
+        cache.remove_email("e1");
+        assert!(!cache.fill_cached_body(&body).unwrap());
+        assert!(cache.get_email("e1").is_none());
+        assert!(!cache.is_rules_processed("e1"));
     }
 
     #[test]
