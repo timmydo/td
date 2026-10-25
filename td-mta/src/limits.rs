@@ -13,7 +13,7 @@ pub const OUTBOUND_RECIPIENT_BATCH: usize = 100;
 pub const OPERATION_SLOT_BYTES: usize = 32;
 pub const CHANGE_SLOT_BYTES: usize = 24;
 /// Separate bounded row/result, key, cursor and retained change scratch.
-pub const READ_VIEW_SCRATCH_BYTES: usize = 292 * KIB;
+pub const READ_VIEW_SCRATCH_BYTES: usize = 420 * KIB;
 /// Planned provider session ceiling, not a measured worst-case bound.
 pub const TLS_SESSION_BYTES: usize = 512 * KIB;
 /// Planned provider construction/handshake ceiling; qualification remains required.
@@ -427,7 +427,7 @@ mod tests {
     #[test]
     fn default_ledger_pins_documented_budget() -> Result<(), ResourceError> {
         let plan = Limits::default().plan()?;
-        assert_eq!(plan.total_bytes(), 119_145_728);
+        assert_eq!(plan.total_bytes(), 119_932_160);
         const { assert!(crate::format::MAX_VALUE_BYTES + crate::format::MAX_KEY_BYTES + 48 <= 68 * KIB) };
         assert_eq!(
             READ_VIEW_SCRATCH_BYTES,
@@ -435,6 +435,7 @@ mod tests {
                 + crate::format::MAX_VALUE_BYTES
                 + crate::format::MAX_KEY_BYTES
                 + 63 * KIB
+                + 128 * KIB
                 + CHANGE_SLOT_BYTES * crate::format::MAX_TRANSACTION_OPERATIONS
         );
         assert_eq!(plan.limits().memory_budget_bytes, 128 * MIB);

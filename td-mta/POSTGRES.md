@@ -1672,8 +1672,22 @@ The snapshot also retains its existing last successful metadata record for
 unprefetched single reads. Both caches still check the original connection,
 deadline and sticky failure on every access and cannot cross a snapshot or
 method reopening. Prefetching does not authorize body output: body callbacks
-still verify the same snapshot's complete bytes. Membership and keyword reads
-retain their existing pagination. Metadata, membership, keyword and chunk
+still verify the same snapshot's complete bytes. For selected mailboxIds and
+keywords, two additional typed, account-scoped batch queries prefetch bounded
+prefixes for the same IDs. Each lateral subquery aggregates at most nine
+values and their validation fields into one protocol row. This avoids
+spending one protocol frame per value and then repeating it during fallback.
+Sets shorter than nine are complete; a nine-value prefix is conservatively
+marked has_more. Cached reads can return a short page, and requests at or
+beyond its tail continue through the existing paginated reader. No returned
+prefix value is reread. Unselected sets issue no query. Every retained value,
+reference and change sequence receives the same validation as an individual
+read; unknown IDs, duplicate/unsorted values, unequal arrays and excess rows
+fail the snapshot. Empty sets are explicit and do not prove Email existence.
+Cached pages preserve exclusive-after ordering and has_more, and retain the
+same connection, deadline and sticky-error checks. The value window is cleared
+when metadata is replaced and never crosses a snapshot. The nine-value and
+sixteen-ID limits bound only the optimization, not mailbox capabilities. Metadata, membership, keyword and chunk
 reads send fixed parameter types with the query, avoiding a separate
 prepare/describe exchange without changing row validation or limits.
 

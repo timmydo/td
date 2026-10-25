@@ -284,7 +284,7 @@ impl Worker<'_, '_, '_, '_, '_> {
                 ids.clear();
                 ids.extend(window.iter().filter_map(|item| item.id));
                 match &mut view {
-                    View::Postgres(view) => view.prefetch_metadata(&ids)?,
+                    View::Postgres(view) => view.prefetch_metadata(&ids, selected.stored)?,
                 }
                 for item in window {
                     self.check()?;

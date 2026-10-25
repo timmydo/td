@@ -92,6 +92,12 @@ impl Stored {
         };
         Ok(())
     }
+    pub(crate) fn selects_mailboxes(self) -> bool {
+        self.has(MAILBOXES)
+    }
+    pub(crate) fn selects_keywords(self) -> bool {
+        self.has(KEYWORDS)
+    }
     fn has(self, field: u8) -> bool {
         self.0 & field != 0
     }

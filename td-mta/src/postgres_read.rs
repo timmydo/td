@@ -14,6 +14,9 @@ use std::time::Instant;
 use td_crypto::TrustStore;
 use tokio_postgres::types::Type;
 
+#[path = "postgres_read_values.rs"]
+mod value_reads;
+
 #[path = "postgres_read_submissions.rs"]
 mod submission_reads;
 pub use submission_reads::{
@@ -135,6 +138,7 @@ pub struct Snapshot<'a> {
     failed: Option<Error>,
     metadata: Option<Metadata>,
     metadata_window: MetadataWindow,
+    value_window: value_reads::Window,
     _worker_thread: std::marker::PhantomData<std::rc::Rc<()>>,
     _permit: Option<ReadPermit<'a>>,
 }
@@ -339,6 +343,7 @@ impl<'a> Snapshot<'a> {
             failed: None,
             metadata: None,
             metadata_window: [None; postgres_body::MAX_METADATA_IDS],
+            value_window: value_reads::Window::default(),
             _worker_thread: std::marker::PhantomData,
             _permit: permit,
         };
@@ -587,7 +592,42 @@ impl Snapshot<'_> {
         })();
         let window = self.retain(result)?;
         self.metadata_window = window;
+        self.value_window = value_reads::Window::default();
         self.metadata = None;
+        Ok(())
+    }
+    /// Prefetch bounded value prefixes; pagination continues after their tail.
+    pub fn prefetch_values(
+        &mut self,
+        emails: &[EmailId],
+        mailboxes: bool,
+        keywords: bool,
+    ) -> Result<(), Error> {
+        self.check()?;
+        if emails.len() > postgres_body::MAX_METADATA_IDS {
+            return self.retain(Err(Error::Capacity));
+        }
+        if !mailboxes && !keywords {
+            self.value_window = value_reads::Window::default();
+            return Ok(());
+        }
+        let mut ids = Vec::new();
+        let reserve = ids
+            .try_reserve_exact(emails.len())
+            .map_err(|_| Error::Capacity);
+        self.retain(reserve)?;
+        ids.extend_from_slice(emails);
+        let identity = self.identity;
+        let result = self
+            .worker
+            .run(|client| {
+                Box::pin(async move {
+                    value_reads::Window::read(client, identity, &ids, mailboxes, keywords).await
+                })
+            })
+            .map_err(Error::Connection)
+            .and_then(|result| result);
+        self.value_window = self.retain(result)?;
         Ok(())
     }
     /// Metadata alone does not authorize body output; with_body verifies the
@@ -695,6 +735,12 @@ impl Snapshot<'_> {
         self.check()?;
         let result = self.value_limit(maximum);
         let limit = self.retain(result)?;
+        let result = self
+            .value_window
+            .mailboxes(self.identity, email, after, maximum);
+        if let Some(values) = self.retain(result)? {
+            return Ok(values);
+        }
         let identity = self.identity;
         let after = after.map(|value| *value.as_bytes());
         let result=self.worker.run(|client|Box::pin(async move {
@@ -729,6 +775,12 @@ impl Snapshot<'_> {
                 .validate_local()
                 .map_err(|_| Error::Invalid);
             self.retain(valid)?;
+        }
+        let result = self
+            .value_window
+            .keywords(self.identity, email, after, maximum);
+        if let Some(values) = self.retain(result)? {
+            return Ok(values);
         }
         let after = after.map(copy_text).transpose();
         let after = self.retain(after)?;

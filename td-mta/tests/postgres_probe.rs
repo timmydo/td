@@ -7700,6 +7700,7 @@ fn exercise_read(
     read::with_snapshot(request,trust,deadline(),binding,password,|view| {
         assert_eq!(view.identity().committed_sequence.number(),3);
         view.prefetch_metadata(&[first.email, second.email])?;
+        view.prefetch_values(&[first.email, second.email], true, true)?;
         check_mailbox(view, 2)?;
         let original = stored(view, first.email)?.unwrap();
         assert!(original.contains("\"keywords\":{\"$draft\":true,\"$seen\":true}"));

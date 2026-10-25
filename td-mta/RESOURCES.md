@@ -35,7 +35,7 @@ changing that validator requires an explicit atomic implementation update.
 | SMTP slots | 8 | 376064 | 3008512 |
 | HTTPS slots | 8 | 1703936 | 13631488 |
 | Body/search jobs | 3 | 1310720 | 3932160 |
-| Storage read views | 6 | 299008 | 1794048 |
+| Storage read views | 6 | 430080 | 2580480 |
 | Resident index cache | 1 | 4194304 | 4194304 |
 | Outbound slots | 1 | 572672 | 572672 |
 | Sort runs and merge buffers | 1 | 1048576 | 1048576 |
@@ -52,10 +52,10 @@ changing that validator requires an explicit atomic implementation update.
 | Cold reload overlap | 1 | 2097152 | 2097152 |
 | Process and allocator allowance | 1 | 8388608 | 8388608 |
 | SMTP fanout metadata | 4 | 2097152 | 8388608 |
-| **Total** | | | **119145728** |
+| **Total** | | | **119932160** |
 
-The total is approximately 113.63 MiB against a 128 MiB configured budget;
-the remaining 15072000 bytes are unassigned headroom, not another cache.
+The total is approximately 114.38 MiB against a 128 MiB configured budget;
+the remaining 14285568 bytes are unassigned headroom, not another cache.
 The default process ledger excludes database-server memory and WAL mappings.
 The two default TLS handshakes remain configurable within the process budget.
 The 64 MiB idle and 128 MiB workload RSS figures are provisional goals under
@@ -256,7 +256,7 @@ encoded-header adapters or combined service RSS.
 - Body job: headers, 512 bytes per MIME part and its projections, 512 KiB
   decode/metadata/output scratch.
   Nested parsing and transfer decoding share that reservation.
-- Read view: 292 KiB caller-owned key/value/cursor scratch and one cold
+- Read view: 420 KiB caller-owned key/value/cursor scratch and one cold
   PostgreSQL snapshot. Database-client bounds are specified in POSTGRES.md;
   the process planning entry is not a database-server heap reservation.
 
@@ -455,7 +455,7 @@ explicitly under DESIGN section 5 without a speculative ledger proof.
 | Reservation | Partition |
 | --- | --- |
 | Body work, 512 KiB/job | Bounded part metadata, one 192 KiB generated fragment, decode rings, normalization/parser state and output staging; header and per-part arrays are separate |
-| Read cursor/value, 292 KiB/view | 68 KiB row input/reserve; 64 KiB retained result value; 1 KiB key; 5 KiB selected metadata; 1 KiB pool bookkeeping; 4 KiB pinned-body input/reader state; 149 KiB typed row/change cursors, native wrapper bookkeeping and reference validation scratch |
+| Read cursor/value, 420 KiB/view | 68 KiB row input/reserve; 64 KiB retained result value; 1 KiB key; 5 KiB selected metadata; 1 KiB pool bookkeeping; 4 KiB pinned-body input/reader state; 149 KiB typed row/change cursors, native wrapper bookkeeping and reference validation scratch; 128 KiB bounded value-prefetch rows, copies and replacement overlap |
 | Outbound scratch, 128 KiB | 64 KiB body transfer; 16 KiB reply assembly; 16 KiB SMTP/TLS handoff state; 32 KiB transaction-planning/ID/diagnostic scratch |
 | DNS/control, 512 KiB | 128 KiB resolver + 384 KiB control as detailed below |
 | Log, 128 KiB | 384 queued fixed event cells of at most 256 bytes (96 KiB); 16 KiB encoder/output; 16 KiB rotation/drop counters and emergency status |
@@ -466,9 +466,12 @@ and optional metadata rows plus the existing single-row cache. A compile-time
 size check keeps those retained cells within the 5 KiB selected-metadata
 partition. Temporary query rows, decoded metadata and replacement storage are
 bounded by the same sixteen-row window (seventeen-row refusal sentinel) and
-use the typed-row/native-bookkeeping partition. No membership/keyword
-collection or body bytes enter this cache; existing protocol caps and body
-reservations remain unchanged.
+use the typed-row/native-bookkeeping partition. A separate 128 KiB planning
+reservation covers the membership/keyword prefix cache and query/replacement
+copies: sixteen IDs, at most nine retained values per selected set,
+aggregated into one protocol row per ID, with keyword length capped at 255 bytes. Larger
+sets continue after the cached tail through the paginated reader. No body bytes enter either cache;
+existing protocol caps and body reservations remain unchanged.
 
 The resolver's 128 KiB includes 128 cache entries of at most 384 bytes
 (48 KiB), a 64 KiB packet/TCP buffer and 16 KiB question/name/alias-chain,
@@ -3750,7 +3753,7 @@ The same method meter survives all messages and transformations. Decoding,
 preview extraction and JSON stages retain their original cumulative charges;
 a small requested preview can still hit the work ceiling while validating a
 large source. The response spool cap independently limits emitted bytes.
-Default planned total is 119145728 bytes under the unchanged 128 MiB budget;
+Default planned total is 119932160 bytes under the unchanged 128 MiB budget;
 capacity-growth fixtures rebalance disposable cache within that budget.
 These are bounded implementation allocations and planner figures, not a new
 whole-service RSS or large-mailbox qualification claim.
