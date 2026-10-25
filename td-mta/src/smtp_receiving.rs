@@ -285,12 +285,16 @@ struct Slot<'s, 'cfg, B: Storage + 's> {
     listener: usize,
     peer: IpAddr,
     final_reply: bool,
+    data_timing: Option<crate::performance::Timer>,
+    commit_wait: Option<crate::performance::Timer>,
 }
 impl<'cfg, B: Storage> Slot<'_, 'cfg, B> {
     fn connection(&mut self) -> Result<&mut Connection<'cfg>, Error> {
         self.connection.as_mut().ok_or(Error::Conflict)
     }
     fn retire(&mut self) {
+        self.data_timing.take();
+        self.commit_wait.take();
         self.delivery.take();
         self.connection.take();
         self.phase = Phase::Empty;
@@ -439,6 +443,8 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                 listener: 0,
                 peer: IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
                 final_reply: false,
+                data_timing: None,
+                commit_wait: None,
             }));
             occupied.push(None);
         }
@@ -778,6 +784,14 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
         if matches!(work, Work::Write) {
             return self.write_data(slot, deadline, control);
         }
+        if matches!(work, Work::Commit { .. }) {
+            if let Some(timing) = slot.data_timing.take() {
+                timing.finish(crate::performance::Outcome::Success);
+            }
+            slot.commit_wait = Some(crate::performance::Timer::start(
+                crate::performance::Phase::SmtpCommitWait,
+            ));
+        }
         slot.phase = Phase::Queued { work, deadline };
         Ok(())
     }
@@ -910,6 +924,9 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                         slot.connection()?
                             .network_mut()?
                             .data_ready(Ok(()), clock)?;
+                        slot.data_timing = Some(crate::performance::Timer::start(
+                            crate::performance::Phase::SmtpData,
+                        ));
                     }
                     Err(smtp_storage::Failure::Retry) => {
                         slot.phase = Phase::Retry {
@@ -924,6 +941,9 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
             }
             Work::Write => return self.write_data(slot, cap, control),
             Work::Commit { prepared } => {
+                if let Some(timing) = slot.commit_wait.take() {
+                    timing.finish(crate::performance::Outcome::Success);
+                }
                 let timing =
                     crate::performance::Timer::start(crate::performance::Phase::SmtpCommit);
                 let job = slot.delivery.as_mut().ok_or(Error::Conflict)?;
@@ -1033,6 +1053,8 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
         error: smtp_storage::Failure,
         control: &Control,
     ) -> Result<(), Error> {
+        slot.data_timing.take();
+        slot.commit_wait.take();
         if matches!(error, smtp_storage::Failure::HeaderLimit) {
             slot.delivery.take();
             slot.connection()?
@@ -1058,6 +1080,8 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
         error: Error,
         control: &Control,
     ) -> Result<(), Error> {
+        slot.data_timing.take();
+        slot.commit_wait.take();
         slot.delivery.take();
         let network = slot.connection()?.network_mut()?;
         match work {

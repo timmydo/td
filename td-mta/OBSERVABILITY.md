@@ -384,9 +384,9 @@ severity filter, global ingestion limit, retention ring and physical-pressure
 stop apply. There is no synchronous journal fallback and no per-request event
 flood. These info records require `minimum_severity = info`. Additional summaries
 can shorten history under the existing ring; 30 days remains an age ceiling,
-not a guaranteed retention interval. At the current 23-phase ceiling, four
-profiles add at most 2,208 hourly summary rows per day (plus initial snapshots).
-The 65,536-row ring can hold about 29 days of those rows alone; other events,
+not a guaranteed retention interval. At the current 25-phase ceiling, four
+profiles add at most 2,400 hourly summary rows per day (plus initial snapshots).
+The 65,536-row ring can hold about 27 days of those rows alone; other events,
 frequent restarts and physical pressure can shorten that interval.
 
 Each sample is a cumulative process observation: `calls` counts finished spans,
@@ -443,6 +443,8 @@ It is not exposed over public HTTP and supplies no mutation operation.
 | `body_verify` | Complete body chunk reads and digest verification |
 | `body_replay` | Verified download callback, including chunk replay and socket output |
 | `smtp_admission` | One storage-worker admission attempt, including database readiness; retry is busy |
+| `smtp_data` | Successful DATA admission through recognition of its terminating dot, including the 354 reply, peer arrival and network scheduling; retirement or refusal before completion counts as failure |
+| `smtp_commit_wait` | Completed DATA queued through the first storage-worker publication attempt; expiry or retirement before service counts as failure; excludes later busy retry delays |
 | `smtp_commit` | One storage-worker preparation/publication attempt; known durable success remains success even when ancillary cleanup stops service |
 
 For timed HTTP endpoint spans, `busy` means a flushed 429 response and
@@ -455,8 +457,10 @@ request-problem response; this aggregate is not a complete HTTP status ledger.
 HTTP success only establishes transport completion: JMAP method errors inside a
 successful HTTP response remain JMAP errors. A failed response transmission does
 not count as a flushed refusal. HTTP authentication busy retries count separately
-from final HTTP responses. SMTP spans exclude DATA arrival and storage-worker
-queue wait; admission success is permission to receive DATA, not acceptance.
+from final HTTP responses. SMTP admission and commit spans exclude DATA
+arrival and storage-worker queue wait; the separate DATA and initial commit
+wait spans expose those boundaries. Admission success is permission to
+receive DATA, not acceptance.
 SMTP commit success reflects the retained durable outcome; failures include
 indeterminate outcomes and do not authorize replay. Neither a counter nor a log
 entry proves that the peer received its final reply. Database timings include the diagnostic writer's own

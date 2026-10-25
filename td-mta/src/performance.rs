@@ -31,6 +31,8 @@ pub enum Phase {
     HttpTls,
     HttpBodyBusy,
     HttpAuthRefused,
+    SmtpData,
+    SmtpCommitWait,
 }
 impl Phase {
     pub const ALL: &'static [Self] = &[
@@ -57,6 +59,8 @@ impl Phase {
         Self::HttpTls,
         Self::HttpBodyBusy,
         Self::HttpAuthRefused,
+        Self::SmtpData,
+        Self::SmtpCommitWait,
     ];
     pub const fn code(self) -> &'static str {
         match self {
@@ -83,6 +87,8 @@ impl Phase {
             Self::HttpTls => "http_tls",
             Self::HttpBodyBusy => "http_body_busy",
             Self::HttpAuthRefused => "http_auth_refused",
+            Self::SmtpData => "smtp_data",
+            Self::SmtpCommitWait => "smtp_commit_wait",
         }
     }
 }
