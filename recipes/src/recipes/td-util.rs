@@ -210,6 +210,30 @@ pub fn build(name: &str, rust: &str) -> Recipe {
 mod tests {
     use super::{ENGINE, MAIN_RS, MODULES};
 
+    #[test]
+    fn embedded_sources_do_not_contain_recipe_template_tokens() {
+        let sources = std::iter::once(("main", MAIN_RS))
+            .chain(MODULES.iter().copied())
+            .chain(ENGINE.iter().map(|(name, _, source)| (*name, *source)));
+        const TOKENS: &[&str] = &[
+            "{root}",
+            "{src}",
+            "{out}",
+            "{tools}",
+            "{jobs}",
+            "{in:",
+            "{payload:",
+        ];
+        for (name, source) in sources {
+            for &token in TOKENS {
+                assert!(
+                    !source.contains(token),
+                    "embedded {name}.rs contains {token}: WriteFile would interpret source as a recipe template"
+                );
+            }
+        }
+    }
+
     /// Every `mod NAME;` in main.rs must have its source embedded here.
     ///
     /// The recipe writes `{src}/NAME.rs` per MODULES entry and rustc resolves the

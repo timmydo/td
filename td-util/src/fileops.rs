@@ -119,14 +119,14 @@ pub fn mv(args: &[String]) -> Result<u8, String> {
         }
         rest.push(a.as_str());
     }
-    let (Some(src), Some(dst), 2) = (rest.first(), rest.get(1), rest.len()) else {
+    let (Some(source), Some(dst), 2) = (rest.first(), rest.get(1), rest.len()) else {
         return Err(usage.to_string());
     };
-    let src_path = Path::new(src);
+    let src_path = Path::new(source);
     let dst_path = Path::new(dst);
     let target = if dst_path.is_dir() {
         let Some(name) = src_path.file_name() else {
-            return Err(format!("{src}: no final component to move into {dst}"));
+            return Err(format!("{source}: no final component to move into {dst}"));
         };
         dst_path.join(name)
     } else {
@@ -135,10 +135,10 @@ pub fn mv(args: &[String]) -> Result<u8, String> {
     match std::fs::rename(src_path, &target) {
         Ok(()) => Ok(0),
         Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => Err(format!(
-            "{src} -> {}: crosses devices; this mv only renames",
+            "{source} -> {}: crosses devices; this mv only renames",
             target.display()
         )),
-        Err(e) => Err(format!("{src} -> {}: {e}", target.display())),
+        Err(e) => Err(format!("{source} -> {}: {e}", target.display())),
     }
 }
 
