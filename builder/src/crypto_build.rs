@@ -349,10 +349,13 @@ fn run_inner(root: &Path, action: &str, manifest: &str) -> Result<Option<Release
         ] {
             let mut fixture = command("test", manifest);
             fixture
+                .env("CARGO_PROFILE_RELEASE_DEBUG", "1")
+                .env("CARGO_PROFILE_RELEASE_STRIP", "none")
                 .env("TD_MTA_TEST_MAIL", &mail)
                 .env("TD_MTA_TEST_FETCH", &fetch)
                 .env("TD_TEST_TRUSTED_ROOT", "private")
                 .args([
+                    "--release",
                     "--test",
                     "postgres_probe",
                     "--",

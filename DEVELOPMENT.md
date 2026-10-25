@@ -987,7 +987,13 @@ Cargo artifact records identify the helper executables inside the selected
 target directory. Ambient TD_MTA_TEST_MAIL and TD_MTA_TEST_FETCH cannot replace
 them. After ordinary tests, the wrapper runs the exact ignored PostgreSQL read,
 plain-text send and foreground-service cases. Each requires a positive passing
-libtest summary and exit success. Host preparation must put PostgreSQL 17 on
+libtest summary and exit success. These three native cases use the host release
+profile with debug information retained, matching the native MTA build and
+performance harness. Their real operation deadlines include hashing and TLS;
+an unoptimized full-size body hash can exhaust a deadline before database work
+starts. Ordinary unit and documentation tests retain the test profile. This
+does not change target compiler flags or relax an operation deadline.
+Host preparation must put PostgreSQL 17 on
 `PATH`: the directory of the first `initdb` there must also hold `postgres`,
 `pg_ctl`, `psql`, `pg_dump` and `pg_restore`, and `postgres --version` must
 report release 17. The restore fixture uses the same installation for its
