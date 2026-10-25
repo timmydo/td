@@ -439,14 +439,14 @@ It is not exposed over public HTTP and supplies no mutation operation.
 | `db_runtime` | Runtime role, privileges and maintenance qualification |
 | `db_work` | One driver-run operation, possibly containing multiple SQL statements and qualification; success means the driver returned its operation result, not that an inner SQL/application result succeeded |
 | `db_close` | Worker cleanup, including bounded Terminate/close progress; failure includes already-failed or deadline-retired sessions |
-| `db_reuse` | Zero-duration retained authentication, relay idle-read and HTTPS API-read attempts, including failed turns |
+| `db_reuse` | Zero-duration retained authentication, relay idle-read, HTTPS API-read and SMTP attempts, including failed turns |
 | `body_verify` | Complete body chunk reads and digest verification |
 | `body_replay` | Verified download callback, including chunk replay and socket output |
 | `smtp_admission` | One storage-worker admission attempt, including database readiness; retry is busy |
 | `smtp_data` | Successful DATA admission through recognition of its terminating dot, including the 354 reply, peer arrival and network scheduling; retirement or refusal before completion counts as failure |
 | `smtp_commit_wait` | Completed DATA queued through the first storage-worker publication attempt; expiry or retirement before service counts as failure; excludes later busy retry delays |
 | `smtp_prepare` | Resident SMTP input validation, header preparation and digests for the complete account fanout; excludes DNS and database publication |
-| `smtp_publish` | SMTP receipt inspection and database publication, including their connection setup and existing pre-effect address fallback; an unknown COMMIT outcome counts as failure without changing settlement or replay policy |
+| `smtp_publish` | SMTP receipt inspection and database publication; one-shot paths include connection setup and pre-effect address fallback, while retained SMTP session setup is measured by `db_connect` inside `smtp_commit`; an unknown COMMIT outcome counts as failure without changing settlement or replay policy |
 | `smtp_commit` | One storage-worker preparation/publication attempt; known durable success remains success even when ancillary cleanup stops service |
 
 For timed HTTP endpoint spans, `busy` means a flushed 429 response and

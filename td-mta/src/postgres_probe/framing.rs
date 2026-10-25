@@ -89,6 +89,17 @@ impl Input {
         }
     }
 
+    pub(super) fn retained_fanout(accounts: usize) -> Self {
+        let single = Self::fanout(accounts);
+        let turns = super::smtp::TURNS;
+        Self {
+            window: Some(Windows::fanout(turns, accounts)),
+            bytes: single.bytes * turns,
+            frames: single.frames * turns,
+            ..single
+        }
+    }
+
     pub(super) fn validation_checks(budget: super::ValidationBudget) -> Self {
         let single = Self::mutations();
         Self {

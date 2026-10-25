@@ -44,6 +44,14 @@ pub trait Storage: Sync {
     type Job<'a>: Job
     where
         Self: 'a;
+    /// Called only by the fixed storage worker, including idle scans.
+    fn maintain(&self) -> Result<(), Error> {
+        Ok(())
+    }
+    /// Retire worker-owned resources before that worker exits.
+    fn close(&self) -> Result<(), Error> {
+        Ok(())
+    }
     fn capacity(&self) -> u64;
     fn ready(&self, account: AccountId, deadline: Deadline) -> Result<(), Error>;
     fn stopped(&self) -> bool;

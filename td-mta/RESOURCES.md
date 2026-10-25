@@ -4568,6 +4568,13 @@ are additional to the planning ledger above, as are the active attachment and
 relay reservations. The four-job bound prevents connection-count amplification
 but does not qualify the provisional 128-MiB workload RSS goal. Saturation waits
 before 354 within the original admission deadline; it allocates no fifth body.
+The same fixed storage worker retains at most one qualified PostgreSQL session
+and one read-slot permit across jobs. The connection's finite wire windows are
+work allowances, not body allocations. Startup and independent unknown-outcome
+settlement use their existing one-shot capacity; retained admission/publication
+does not reserve an additional read slot per message. No transaction is retained
+while a sender supplies DATA, and worker shutdown closes the connection before
+releasing its permit.
 
 
 ## Relay account registry

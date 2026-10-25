@@ -69,6 +69,13 @@ struct ObservedJob<J> {
     gated: bool,
 }
 impl<B: Storage> Storage for ObservedStorage<'_, B> {
+    fn maintain(&self) -> Result<(), td_mta::ports::Error> {
+        self.inner.maintain()
+    }
+    fn close(&self) -> Result<(), td_mta::ports::Error> {
+        self.inner.close()
+    }
+
     type Job<'a>
         = ObservedJob<B::Job<'a>>
     where

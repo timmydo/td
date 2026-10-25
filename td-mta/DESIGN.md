@@ -1743,6 +1743,14 @@ queue. Main uses try_lock and skips slots owned by workers. Known native
 results are applied to the retained protocol owner before releasing the
 slot, including when ancillary accounting stops further admission.
 
+The PostgreSQL adapter retains one finite session on the fixed storage worker
+for fresh admission and publication transactions. Startup readiness remains
+one-shot before that worker starts. The network and TLS workers never own or
+retire the cached session. Idle maintenance and a shutdown guard release it on
+its owning worker; Busy maintenance defers without stopping service. No database
+transaction spans peer input. POSTGRES specifies its independent connection,
+per-job authority, wire allowances and durable-outcome retirement rules.
+
 Global, per-listener and per-peer counts include queued, handshaking,
 closing and retiring connections. Saturation attempts one bounded 421
 write before closure. Runtime status distinguishes startup, ready,

@@ -17,6 +17,12 @@ pub struct FanoutOutcome {
     pub accounts: Vec<(AccountId, Outcome)>,
 }
 impl Fanout {
+    pub(crate) fn epoch(&self) -> Result<crate::ids::StoreEpoch, Error> {
+        self.deliveries
+            .first()
+            .map(|delivery| delivery.binding.epoch())
+            .ok_or(Error::Integrity)
+    }
     pub fn operation(&self) -> ReceivingOperationId {
         self.operation
     }
@@ -241,50 +247,9 @@ pub fn publish_fanout(
             Box::pin(async move {
                 let binding = &fanout.deliveries.first().ok_or(Error::Integrity)?.binding;
                 begin(client, binding).await?;
-                let selected = client.query_one("SELECT generation,version_id FROM td_mta.config_selection WHERE singleton=true FOR SHARE", &[]).await.map_err(|_| Error::Database)?;
-                let generation = sequence(selected.try_get(0).map_err(|_| Error::Integrity)?)?;
-                let version: Option<&[u8]> = selected.try_get(1).map_err(|_| Error::Integrity)?;
-                let mut states = Vec::new();
-                states
-                    .try_reserve_exact(fanout.deliveries.len())
-                    .map_err(|_| Error::Capacity)?;
-                // All account locks precede every receipt or publication observation.
-                // Preparation sorts the targets, independent of envelope RCPT order.
-                for delivery in &fanout.deliveries {
-                    states.push(
-                        client
-                            .query_one(
-                                "SELECT sequence,floor FROM td_mta.accounts WHERE id=$1 FOR UPDATE",
-                                &[&delivery.binding.account().as_bytes().as_slice()],
-                            )
-                            .await
-                            .map_err(|_| Error::Database)?,
-                    );
-                }
-                if let Some(outcome) = receipts(client, &fanout).await? {
-                    return Ok(outcome);
-                }
-                if generation != binding.selection().generation
-                    || version != Some(binding.selection().version.as_bytes().as_slice())
-                {
-                    return Err(Error::Policy);
-                }
-                let mut accounts = Vec::new();
-                accounts
-                    .try_reserve_exact(fanout.deliveries.len())
-                    .map_err(|_| Error::Capacity)?;
-                for (delivery, state) in fanout.deliveries.iter().zip(&states) {
-                    accounts.push((
-                        delivery.binding.account(),
-                        write_delivery(client, delivery, state, deadline).await?,
-                    ));
-                }
-                marker.store(true, Ordering::Relaxed);
-                client
-                    .batch_execute("COMMIT")
+                publish_body(client, &fanout, deadline, &marker)
                     .await
-                    .map_err(|_| Error::Indeterminate)?;
-                Ok(FanoutOutcome { accounts })
+                    .map(Publication::outcome)
             })
         },
     );
@@ -295,6 +260,70 @@ pub fn publish_fanout(
     }
 }
 
+pub(crate) enum Publication {
+    Existing(FanoutOutcome),
+    Committed(FanoutOutcome),
+}
+impl Publication {
+    pub(crate) fn outcome(self) -> FanoutOutcome {
+        match self {
+            Self::Existing(value) | Self::Committed(value) => value,
+        }
+    }
+}
+pub(crate) async fn publish_body(
+    client: &Client,
+    fanout: &Fanout,
+    deadline: Instant,
+    marker: &AtomicBool,
+) -> Result<Publication, Error> {
+    let binding = &fanout.deliveries.first().ok_or(Error::Integrity)?.binding;
+    let selected = client.query_one("SELECT generation,version_id FROM td_mta.config_selection WHERE singleton=true FOR SHARE", &[]).await.map_err(|_| Error::Database)?;
+    let generation = sequence(selected.try_get(0).map_err(|_| Error::Integrity)?)?;
+    let version: Option<&[u8]> = selected.try_get(1).map_err(|_| Error::Integrity)?;
+    let mut states = Vec::new();
+    states
+        .try_reserve_exact(fanout.deliveries.len())
+        .map_err(|_| Error::Capacity)?;
+    // All account locks precede every receipt or publication observation.
+    // Preparation sorts the targets, independent of envelope RCPT order.
+    for delivery in &fanout.deliveries {
+        states.push(
+            client
+                .query_one(
+                    "SELECT sequence,floor FROM td_mta.accounts WHERE id=$1 FOR UPDATE",
+                    &[&delivery.binding.account().as_bytes().as_slice()],
+                )
+                .await
+                .map_err(|_| Error::Database)?,
+        );
+    }
+    if let Some(outcome) = receipts(client, fanout).await? {
+        return Ok(Publication::Existing(outcome));
+    }
+    if generation != binding.selection().generation
+        || version != Some(binding.selection().version.as_bytes().as_slice())
+    {
+        return Err(Error::Policy);
+    }
+    let mut accounts = Vec::new();
+    accounts
+        .try_reserve_exact(fanout.deliveries.len())
+        .map_err(|_| Error::Capacity)?;
+    for (delivery, state) in fanout.deliveries.iter().zip(&states) {
+        accounts.push((
+            delivery.binding.account(),
+            write_delivery(client, delivery, state, deadline).await?,
+        ));
+    }
+    marker.store(true, Ordering::Relaxed);
+    client
+        .batch_execute("COMMIT")
+        .await
+        .map_err(|_| Error::Indeterminate)?;
+    Ok(Publication::Committed(FanoutOutcome { accounts }))
+}
+
 /// Check all configured Inboxes under one connection and original deadline.
 /// This is startup/admission evidence; publication rechecks the entire transaction.
 pub fn ready_many(
@@ -303,6 +332,22 @@ pub fn ready_many(
     deadline: Instant,
     bindings: &[&Binding],
 ) -> Result<(), Error> {
+    let values = ready_bindings(bindings)?;
+    let result =
+        postgres_probe::with_fanout_client(request, trust, deadline, values.len(), move |client| {
+            Box::pin(async move {
+                begin(client, values.first().ok_or(Error::Integrity)?).await?;
+                ready_body(client, &values).await
+            })
+        })
+        .map_err(Error::Connection)?;
+    if Instant::now() >= deadline {
+        return Err(Error::Connection(postgres_probe::Error::Deadline));
+    }
+    result
+}
+
+pub(crate) fn ready_bindings(bindings: &[&Binding]) -> Result<Vec<Binding>, Error> {
     if bindings.is_empty() || bindings.len() > crate::config::identities::MAX_ACCOUNTS {
         return Err(Error::Capacity);
     }
@@ -326,29 +371,31 @@ pub fn ready_many(
         values.push((*binding).clone());
     }
     values.sort_unstable_by_key(Binding::account);
-    let result = postgres_probe::with_fanout_client(request, trust, deadline, values.len(), move |client| {
-        Box::pin(async move {
-            let first = values.first().ok_or(Error::Integrity)?;
-            begin(client, first).await?;
-            let selected = client.query_one("SELECT generation,version_id FROM td_mta.config_selection WHERE singleton=true FOR SHARE", &[]).await.map_err(|_| Error::Database)?;
-            let generation = sequence(selected.try_get(0).map_err(|_| Error::Integrity)?)?;
-            let version: Option<&[u8]> = selected.try_get(1).map_err(|_| Error::Integrity)?;
-            if generation != first.selection().generation || version != Some(first.selection().version.as_bytes().as_slice()) {
-                return Err(Error::Policy);
-            }
-            for binding in &values {
-                let state = client.query_one("SELECT sequence,floor FROM td_mta.accounts WHERE id=$1 FOR SHARE", &[&binding.account().as_bytes().as_slice()]).await.map_err(|_| Error::Database)?;
-                let sequence = sequence(state.try_get(0).map_err(|_| Error::Integrity)?)?;
-                if super::sequence(state.try_get(1).map_err(|_| Error::Integrity)?)? > sequence {
-                    return Err(Error::Integrity);
-                }
-                inbox(client, binding.account(), sequence).await?;
-            }
-            Ok(())
-        })
-    }).map_err(Error::Connection)?;
-    if Instant::now() >= deadline {
-        return Err(Error::Connection(postgres_probe::Error::Deadline));
+    Ok(values)
+}
+pub(crate) async fn ready_body(client: &Client, values: &[Binding]) -> Result<(), Error> {
+    let first = values.first().ok_or(Error::Integrity)?;
+    let selected = client.query_one("SELECT generation,version_id FROM td_mta.config_selection WHERE singleton=true FOR SHARE", &[]).await.map_err(|_| Error::Database)?;
+    let generation = sequence(selected.try_get(0).map_err(|_| Error::Integrity)?)?;
+    let version: Option<&[u8]> = selected.try_get(1).map_err(|_| Error::Integrity)?;
+    if generation != first.selection().generation
+        || version != Some(first.selection().version.as_bytes().as_slice())
+    {
+        return Err(Error::Policy);
     }
-    result
+    for binding in values {
+        let state = client
+            .query_one(
+                "SELECT sequence,floor FROM td_mta.accounts WHERE id=$1 FOR SHARE",
+                &[&binding.account().as_bytes().as_slice()],
+            )
+            .await
+            .map_err(|_| Error::Database)?;
+        let sequence = sequence(state.try_get(0).map_err(|_| Error::Integrity)?)?;
+        if super::sequence(state.try_get(1).map_err(|_| Error::Integrity)?)? > sequence {
+            return Err(Error::Integrity);
+        }
+        inbox(client, binding.account(), sequence).await?;
+    }
+    Ok(())
 }

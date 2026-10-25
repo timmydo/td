@@ -16,8 +16,10 @@ use std::{
     net::IpAddr,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex, TryLockError,
     },
+    thread::{self, ThreadId},
+    time::{Duration, Instant},
 };
 
 pub struct Backend<'a> {
@@ -26,6 +28,22 @@ pub struct Backend<'a> {
     generation: u64,
     admitted: [AtomicBool; crate::limits::SMTP_DATA_JOBS],
     stopped: AtomicBool,
+    session: Mutex<SessionState<'a>>,
+}
+struct SessionState<'a> {
+    owner: Option<ThreadId>,
+    connection: Option<(
+        crate::postgres_probe::SmtpSession,
+        crate::postgres_read::ReadPermit<'a>,
+    )>,
+}
+impl SessionState<'_> {
+    fn close(&mut self, deadline: Instant) {
+        if let Some((connection, permit)) = self.connection.take() {
+            connection.retire(deadline);
+            drop(permit);
+        }
+    }
 }
 impl<'a> Backend<'a> {
     /// `generation` names the pinned local TLS/policy generation used by the
@@ -44,7 +62,139 @@ impl<'a> Backend<'a> {
             generation,
             admitted: [const { AtomicBool::new(false) }; crate::limits::SMTP_DATA_JOBS],
             stopped: AtomicBool::new(false),
+            session: Mutex::new(SessionState {
+                owner: None,
+                connection: None,
+            }),
         })
+    }
+}
+impl Backend<'_> {
+    fn maintain_session(&self, closing: bool) -> Result<(), Error> {
+        let mut state = self.session.try_lock().map_err(|error| match error {
+            TryLockError::WouldBlock => Error::Busy,
+            TryLockError::Poisoned(_) => Error::Invalid,
+        })?;
+        if state
+            .owner
+            .is_some_and(|owner| owner != thread::current().id())
+        {
+            return Err(Error::Invalid);
+        }
+        let now = Instant::now();
+        if state
+            .connection
+            .as_ref()
+            .is_some_and(|(session, _)| closing || session.needs_retirement(now))
+        {
+            state.close(
+                now.checked_add(Duration::from_millis(100))
+                    .ok_or(Error::Invalid)?,
+            );
+        }
+        Ok(())
+    }
+    fn with_session<T>(
+        &self,
+        until: Deadline,
+        operation: impl FnOnce(
+            &mut crate::postgres_probe::SmtpSession,
+            Deadline,
+        ) -> Result<T, owner::Error>,
+    ) -> Result<T, owner::Error> {
+        let now = Instant::now();
+        let deadline = self.clock.deadline_instant(until)?.min(
+            now.checked_add(Duration::from_secs(10))
+                .ok_or(Error::Invalid)?,
+        );
+        if now >= deadline {
+            return Err(Error::Deadline.into());
+        }
+        let mut state = self.session.try_lock().map_err(|error| match error {
+            TryLockError::WouldBlock => Error::Busy,
+            TryLockError::Poisoned(_) => Error::Invalid,
+        })?;
+        let owner = thread::current().id();
+        if state.owner.is_some_and(|prior| prior != owner) {
+            return Err(Error::Invalid.into());
+        }
+        state.owner = Some(owner);
+        if state
+            .connection
+            .as_ref()
+            .is_some_and(|(session, _)| !session.reusable(deadline))
+        {
+            state.close(deadline);
+        }
+        // This probe precedes the new SQL job; replacement cannot replay it.
+        if state
+            .connection
+            .as_mut()
+            .is_some_and(|(session, _)| session.check_idle(deadline).is_err())
+        {
+            state.close(deadline);
+        }
+        let reused = state.connection.is_some();
+        if state.connection.is_none() {
+            let permit = self.owner.slots.acquire().map_err(|_| Error::Busy)?;
+            let addresses = crate::postgres_resolver::resolve(
+                self.owner.executable,
+                &self.owner.loaded.bootstrap,
+                deadline.min(
+                    now.checked_add(Duration::from_secs(5))
+                        .ok_or(Error::Invalid)?,
+                ),
+            )
+            .map_err(|error| match error {
+                crate::postgres_resolver::Error::Deadline => Error::Deadline,
+                _ => Error::Dns,
+            })?;
+            let mut connection = None;
+            for address in addresses {
+                let mut request = self.owner.loaded.bootstrap.request(address);
+                request.mode = crate::postgres_probe::Mode::Runtime;
+                match crate::postgres_probe::SmtpSession::open(
+                    &request,
+                    &self.owner.loaded.trust,
+                    deadline,
+                    1 + self.owner.additional.len(),
+                ) {
+                    Ok(session) => {
+                        connection = Some(session);
+                        break;
+                    }
+                    Err(crate::postgres_probe::Error::Transport) => (),
+                    Err(error) => {
+                        return Err(owner::Error::Publication(
+                            postgres_receiving::Error::Connection(error),
+                        ))
+                    }
+                }
+            }
+            state.connection = Some((connection.ok_or(Error::Dns)?, permit));
+        }
+        let cap = self.clock.deadline_before(deadline)?;
+        let result = operation(&mut state.connection.as_mut().ok_or(Error::Invalid)?.0, cap);
+        if reused {
+            crate::performance::record(
+                crate::performance::Phase::DbReuse,
+                Duration::ZERO,
+                if result.is_ok() {
+                    crate::performance::Outcome::Success
+                } else {
+                    crate::performance::Outcome::Failed
+                },
+            );
+        }
+        if result.is_err()
+            || state
+                .connection
+                .as_ref()
+                .is_some_and(|(session, _)| !session.reusable(deadline))
+        {
+            state.close(deadline);
+        }
+        result
     }
 }
 struct Permit<'a>(&'a AtomicBool);
@@ -84,6 +234,12 @@ impl<'b> Storage for Backend<'b> {
         = Delivery<'a, 'b>
     where
         Self: 'a;
+    fn maintain(&self) -> Result<(), Error> {
+        self.maintain_session(false)
+    }
+    fn close(&self) -> Result<(), Error> {
+        self.maintain_session(true)
+    }
     fn capacity(&self) -> u64 {
         self.owner.binding.upload_maximum().min(32 * 1024 * 1024) as u64
     }
@@ -163,8 +319,10 @@ impl<'b> Storage for Backend<'b> {
                 ..Charge::default()
             },
         )?;
-        self.ready(self.owner.binding.account(), input.deadline)
-            .map_err(Failure::Refused)?;
+        self.with_session(input.deadline, |session, cap| {
+            self.owner.ready_cached(session, cap)
+        })
+        .map_err(|error| Failure::Refused(owner_error(error)))?;
         let mut bytes = Vec::new();
         bytes
             .try_reserve_exact(maximum)
@@ -339,26 +497,33 @@ impl Job for Delivery<'_, '_> {
                     .map_err(|_| Failure::Refused(Error::Invalid))?,
             });
         }
-        let result = self.backend.owner.create_fanout(
-            &targets,
-            &Message {
-                bytes: &self.bytes,
-                hostname: &self.hostname,
-                extended: self.extended,
-                header_bytes: self.header_bytes,
-                received_at: self.received_at,
-                receipt: SmtpReceipt {
-                    peer: self.peer,
-                    gateway: None,
-                    tls: self.tls,
-                    ehlo: &self.ehlo,
-                    reverse_path: &self.reverse,
-                    recipients,
-                },
-            },
-            deadline,
-            &mut self.meter,
-        );
+        let original = Deadline::after(crate::ports::Tick(0), self.meter.deadline().tick().0)
+            .map_err(Failure::Refused)?;
+        let result = self
+            .backend
+            .with_session(deadline.min(original), |session, cap| {
+                self.backend.owner.create_fanout_cached(
+                    &targets,
+                    &Message {
+                        bytes: &self.bytes,
+                        hostname: &self.hostname,
+                        extended: self.extended,
+                        header_bytes: self.header_bytes,
+                        received_at: self.received_at,
+                        receipt: SmtpReceipt {
+                            peer: self.peer,
+                            gateway: None,
+                            tls: self.tls,
+                            ehlo: &self.ehlo,
+                            reverse_path: &self.reverse,
+                            recipients,
+                        },
+                    },
+                    cap,
+                    &mut self.meter,
+                    session,
+                )
+            });
         match result {
             Ok(outcome) => Ok(Completion {
                 outcome: Commits::new(outcome.accounts.iter().map(|(account, result)| Commit {

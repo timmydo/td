@@ -18,7 +18,7 @@ use std::{
 };
 use td_crypto::{Crypto, Digest, Entropy, Provider, SystemEntropy, TrustStore};
 use tokio_postgres::Client;
-mod fanout;
+pub(crate) mod fanout;
 mod input;
 pub use fanout::{
     inspect_fanout, prepare_fanout, publish_fanout, ready_many, Fanout, FanoutOutcome, Target,

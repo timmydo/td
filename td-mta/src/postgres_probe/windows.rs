@@ -9,6 +9,7 @@ const FRAMES: usize = 1088;
 pub(super) struct Windows(Arc<Mutex<State>>);
 struct State {
     limits: (usize, usize, usize),
+    maximum: (usize, usize, usize),
     bytes: usize,
     output: usize,
     frames: usize,
@@ -29,9 +30,18 @@ impl Windows {
     pub(super) fn body(turns: usize) -> Self {
         Self::bounded(turns, 256 * 1024 * 1024, 512 * 1024, 8192)
     }
+    pub(super) fn fanout(turns: usize, accounts: usize) -> Self {
+        Self::bounded(
+            turns,
+            INPUT * accounts,
+            40 * 1024 * 1024 * accounts,
+            FRAMES * accounts,
+        )
+    }
     fn bounded(turns: usize, input: usize, output: usize, frames: usize) -> Self {
         Self(Arc::new(Mutex::new(State {
             limits: (input, output, frames),
+            maximum: (input, output, frames),
             bytes: input,
             output,
             frames,
@@ -50,11 +60,47 @@ impl Windows {
         result
     }
     pub(super) fn begin(&self) -> Result<(), ()> {
+        self.begin_limits(None)
+    }
+    pub(super) fn begin_fanout(&self, accounts: usize) -> Result<(), ()> {
+        if !(1..=crate::config::identities::MAX_ACCOUNTS).contains(&accounts) {
+            return Err(());
+        }
+        self.begin_limits(Some((
+            INPUT * accounts,
+            40 * 1024 * 1024 * accounts,
+            FRAMES * accounts,
+        )))
+    }
+    fn begin_limits(&self, limits: Option<(usize, usize, usize)>) -> Result<(), ()> {
         self.apply(|state| {
             if state.phase == Phase::Active {
                 return Err(());
             }
             state.left = state.left.checked_sub(1).ok_or(())?;
+            if let Some(limits) = limits {
+                if limits.0 > state.maximum.0
+                    || limits.1 > state.maximum.1
+                    || limits.2 > state.maximum.2
+                {
+                    return Err(());
+                }
+                if state.phase == Phase::First {
+                    state.bytes = limits
+                        .0
+                        .checked_sub(state.limits.0 - state.bytes)
+                        .ok_or(())?;
+                    state.output = limits
+                        .1
+                        .checked_sub(state.limits.1 - state.output)
+                        .ok_or(())?;
+                    state.frames = limits
+                        .2
+                        .checked_sub(state.limits.2 - state.frames)
+                        .ok_or(())?;
+                }
+                state.limits = limits;
+            }
             if state.phase == Phase::Closed {
                 state.bytes = state.limits.0;
                 state.output = state.limits.1;
@@ -109,6 +155,35 @@ impl Windows {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fanout_windows_charge_first_qualification_and_actual_account_count() {
+        let window = Windows::fanout(3, 16);
+        window.input(100).unwrap();
+        window.output(200).unwrap();
+        window.frame().unwrap();
+        window.begin_fanout(1).unwrap();
+        window.input(INPUT - 100).unwrap();
+        window.output(40 * 1024 * 1024 - 200).unwrap();
+        for _ in 1..FRAMES {
+            window.frame().unwrap();
+        }
+        window.finish().unwrap();
+        window.begin_fanout(16).unwrap();
+        window.input(16 * INPUT).unwrap();
+        window.output(16 * 40 * 1024 * 1024).unwrap();
+        window.finish().unwrap();
+        window.begin_fanout(1).unwrap();
+        assert!(window.output(40 * 1024 * 1024 + 1).is_err());
+        assert!(window.finish().is_err());
+        assert!(window.begin_fanout(16).is_err());
+        let window = Windows::fanout(1, 1);
+        window.begin_fanout(1).unwrap();
+        window.finish().unwrap();
+        assert!(window.begin_fanout(1).is_err());
+        let window = Windows::fanout(2, 1);
+        assert!(window.begin_fanout(2).is_err());
+    }
 
     #[test]
     fn body_turns_keep_the_original_per_job_allowances_and_finite_count() {

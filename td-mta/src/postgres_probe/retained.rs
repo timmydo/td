@@ -12,28 +12,31 @@ use tokio_postgres::Client;
 
 pub(super) const TURNS: usize = 64;
 pub(super) const BODY_TURNS: usize = 8;
-const LIFETIME: Duration = Duration::from_secs(60);
+pub(super) const LIFETIME: Duration = Duration::from_secs(60);
 
-struct Bounds {
-    owner: ThreadId,
-    expires: Instant,
+pub(super) struct Bounds {
+    pub(super) owner: ThreadId,
+    pub(super) expires: Instant,
     left: usize,
 }
 impl Bounds {
     fn new(now: Instant) -> Result<Self, Error> {
+        Self::with_turns(now, TURNS)
+    }
+    pub(super) fn with_turns(now: Instant, turns: usize) -> Result<Self, Error> {
         Ok(Self {
             owner: thread::current().id(),
             expires: now.checked_add(LIFETIME).ok_or(Error::Invalid)?,
-            left: TURNS,
+            left: turns,
         })
     }
-    fn needs_retirement(&self, now: Instant) -> bool {
+    pub(super) fn needs_retirement(&self, now: Instant) -> bool {
         self.left == 0 || self.expires.saturating_duration_since(now) <= MAX_DURATION
     }
-    fn reusable(&self, deadline: Instant) -> bool {
+    pub(super) fn reusable(&self, deadline: Instant) -> bool {
         self.left != 0 && deadline <= self.expires && self.owner == thread::current().id()
     }
-    fn admit(&mut self, now: Instant, deadline: Instant) -> Result<(), Error> {
+    pub(super) fn admit(&mut self, now: Instant, deadline: Instant) -> Result<(), Error> {
         if self.owner != thread::current().id() {
             return Err(Error::Invalid);
         }

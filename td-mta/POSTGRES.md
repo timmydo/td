@@ -6991,3 +6991,45 @@ credentials and persistent authority. URL and session-state selection remain
 consistent across discovery and API requests. Origin selection never selects
 another account or grants relay permission. No schema migration is required;
 configuration import/check/select and service restart activate the change.
+
+
+## Retained SMTP worker session
+
+The fixed non-TLS SMTP storage worker retains at most one PostgreSQL connection
+for admission and publication, shared across its configured account registry.
+The backend mutex refuses another thread and never queues a waiter. Jobs carry
+resident DATA and a backend reference, not the connection. Startup readiness
+uses the one-shot path before worker startup. Idle maintenance and shutdown
+retire the connection on the owning worker; its read-slot permit is released
+only after disposal. Independent pending-receipt settlement retains its own
+one-shot capacity.
+
+Admission fully qualifies schema, Runtime privileges and the shared session
+migration lock once. Each SQL job begins a fresh READ COMMITTED transaction,
+checks epoch and the current maintenance barrier, and uses the existing current
+configuration, account and Inbox checks. Publication preserves sorted account
+locks, receipt matching before stale-selection rejection, quota enforcement and
+synchronous COMMIT. It performs no separate pre-publication receipt connection:
+matching receipts are checked inside the publication transaction. No transaction
+or account/policy lock survives between jobs or while DATA arrives.
+
+A session lasts at most 60 seconds and 16 SQL jobs, counting readiness and
+publication separately. Every job retains its original deadline and ten-second
+ceiling. Each job admits only its actual account count: input is one MiB,
+output 40 MiB and frame count 1088 per account. Session totals are sixteen times
+those allowances at the configured maximum account count. Qualification shares
+the first window; idle bytes retain their preceding charge, fragmented framing
+and sticky failures survive windows, and cumulative budgets never replenish.
+These wire-work allowances do not allocate equivalent resident buffers.
+
+Only an observed idle failure before starting a new job may replace the
+connection transparently. Once a job starts, failure does not replay its SQL.
+COMMIT attempted without acknowledged success remains Indeterminate, retains
+Pending custody, stops the backend and emits no final 250. A confirmed COMMIT
+or matching historical receipt remains success even if later rollback,
+deadline, framing completion or retirement fails; such failure discards the
+connection separately. Ordinary refused jobs conservatively retire it. The
+next job reuses a connection only after acknowledged transaction termination
+and successful deadline and protocol-window checks. Expiry maintenance and
+clean idle retirement use the existing bounded termination allowance; an
+unfinished or failed job never gains time through cleanup.

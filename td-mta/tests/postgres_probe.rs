@@ -12374,6 +12374,7 @@ fn exercise_smtp_storage(fixture: &Fixture, binding: &td_mta::postgres_runtime_p
         .parse()
         .unwrap();
     let mut random = td_crypto::SystemEntropy::try_new().unwrap();
+    let mut prior_pid = None;
     for case in 0..4 {
         let mut session = Session::new(
             &routes,
@@ -12426,6 +12427,36 @@ fn exercise_smtp_storage(fixture: &Fixture, binding: &td_mta::postgres_runtime_p
             ));
         }
         let mut job = storage.begin(begin(clock.clone(), 7), &mut random).unwrap();
+        let pid: i32 = sql(fixture, "SELECT pid FROM pg_catalog.pg_stat_activity WHERE application_name='td-mta-postgres' AND usename='mail_runtime' AND state='idle'").parse().unwrap();
+        assert_eq!(sql(fixture, "SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE application_name='td-mta-postgres' AND usename='mail_runtime' AND state LIKE 'idle in transaction%'"), "0");
+        if case == 1 {
+            assert_eq!(Some(pid), prior_pid);
+        }
+        if case == 2 {
+            assert_ne!(Some(pid), prior_pid);
+        }
+        if case == 0 {
+            prior_pid = Some(pid);
+        }
+        std::thread::scope(|scope| {
+            assert_eq!(
+                scope.spawn(|| storage.maintain()).join().unwrap(),
+                Err(Error::Invalid)
+            );
+        });
+
+        if case == 2 {
+            let generation = sql(
+                fixture,
+                "SELECT encode(generation,'hex') FROM td_mta.config_selection WHERE singleton=true",
+            );
+            sql(fixture, "UPDATE td_mta.config_selection SET generation=decode('000000000000ffff','hex') WHERE singleton=true");
+            assert!(matches!(
+                storage.begin(begin(clock.clone(), 7), &mut random),
+                Err(Failure::Refused(Error::Forbidden))
+            ));
+            sql(fixture, &format!("UPDATE td_mta.config_selection SET generation=decode('{generation}','hex') WHERE singleton=true"));
+        }
         let mut others = Vec::new();
         for _ in 1..td_mta::limits::SMTP_DATA_JOBS {
             others.push(storage.begin(begin(clock.clone(), 7), &mut random).unwrap());
@@ -12455,6 +12486,13 @@ fn exercise_smtp_storage(fixture: &Fixture, binding: &td_mta::postgres_runtime_p
                 Err(Failure::Refused(Error::Invalid))
             );
             drop(job);
+            assert_eq!(
+                sql(
+                    fixture,
+                    &format!("SELECT pg_catalog.pg_terminate_backend({pid})")
+                ),
+                "t"
+            );
             continue;
         }
         session.data_ready(Ok(())).unwrap();
@@ -12478,6 +12516,7 @@ fn exercise_smtp_storage(fixture: &Fixture, binding: &td_mta::postgres_runtime_p
             sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"),
             (initial + u64::from(case == 3)).to_string()
         );
+        assert_eq!(sql(fixture, "SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE application_name='td-mta-postgres' AND usename='mail_runtime' AND state LIKE 'idle in transaction%'"), "0");
         session.feed(b".\r\n").unwrap();
         assert!(matches!(session.pending(), Action::Commit));
         job.prepare(until(10_000)).unwrap();
@@ -12558,6 +12597,18 @@ fn exercise_smtp_storage(fixture: &Fixture, binding: &td_mta::postgres_runtime_p
             ));
         }
     }
+    storage.close().unwrap();
+    Receiving {
+        loaded: &loaded,
+        executable,
+        binding,
+        additional: &[],
+        slots: &slots,
+        clock: &clock,
+        pending: &pending,
+    }
+    .ready(until(10_000))
+    .unwrap();
 }
 
 fn exercise_smtp_receiving_owner(

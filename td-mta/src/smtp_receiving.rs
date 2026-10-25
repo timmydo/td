@@ -31,6 +31,15 @@ use std::{
 };
 
 type Wire = Box<[u8; TLS_WIRE_BYTES]>;
+struct StorageClose<'a, B: smtp_storage::Storage>(&'a B, &'a Control);
+impl<B: smtp_storage::Storage> Drop for StorageClose<'_, B> {
+    fn drop(&mut self) {
+        if self.0.close().is_err() {
+            self.1.fail();
+        }
+    }
+}
+
 const SCAN: Duration = Duration::from_millis(5);
 const NETWORK_TURNS: usize = 16;
 
@@ -825,6 +834,7 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
         main: &std::thread::Thread,
         control: &Control,
     ) {
+        let _close = (!tls).then(|| StorageClose(self.storage, control));
         let mut random = if tls {
             None
         } else {
@@ -840,6 +850,15 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
         started.fetch_add(1, Ordering::Release);
         main.unpark();
         while !finished.load(Ordering::Acquire) {
+            if !tls {
+                match self.storage.maintain() {
+                    Ok(()) | Err(Error::Busy) => (),
+                    Err(_) => {
+                        control.fail();
+                        main.unpark();
+                    }
+                }
+            }
             let mut progress = false;
             for cell in slots {
                 let mut slot = match cell.try_lock() {

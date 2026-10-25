@@ -1123,6 +1123,8 @@ mod audit_budget;
 pub(crate) use audit_budget::AuditBudget;
 mod retained;
 pub(crate) use retained::{ReadIsolation, ReadSession};
+mod smtp;
+pub(crate) use smtp::SmtpSession;
 mod authentication;
 pub(crate) use authentication::AuthenticationSession;
 mod validation_budget;

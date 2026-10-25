@@ -158,6 +158,34 @@ impl Receiving<'_> {
         )))
     }
 
+    pub(crate) fn ready_cached(
+        &self,
+        session: &mut postgres_probe::SmtpSession,
+        until: Deadline,
+    ) -> Result<(), Error> {
+        if !self.valid() {
+            return Err(ports::Error::Forbidden.into());
+        }
+        let pending = self
+            .pending
+            .change
+            .try_lock()
+            .map_err(|_| ports::Error::Busy)?;
+        if pending.is_some() {
+            return Err(ports::Error::Busy.into());
+        }
+        let mut bindings = Vec::new();
+        bindings
+            .try_reserve_exact(1 + self.additional.len())
+            .map_err(|_| ports::Error::Capacity)?;
+        bindings.push(self.binding);
+        bindings.extend(self.additional.iter().copied());
+        let values = changes::fanout::ready_bindings(&bindings).map_err(Error::Publication)?;
+        session
+            .ready(values, phase(self.clock, until)?)
+            .map_err(Error::Publication)
+    }
+
     /// Publish completed, caller-admitted SMTP input. The trusted caller owns
     /// peer, gateway, recipient and ingress authority; receipt facts are passive.
     pub fn create(
@@ -188,6 +216,26 @@ impl Receiving<'_> {
         until: Deadline,
         meter: &mut Meter,
     ) -> Result<changes::FanoutOutcome, Error> {
+        self.create_fanout_inner(targets, message, until, meter, None)
+    }
+    pub(crate) fn create_fanout_cached(
+        &self,
+        targets: &[Target<'_>],
+        message: &Message<'_>,
+        until: Deadline,
+        meter: &mut Meter,
+        session: &mut postgres_probe::SmtpSession,
+    ) -> Result<changes::FanoutOutcome, Error> {
+        self.create_fanout_inner(targets, message, until, meter, Some(session))
+    }
+    fn create_fanout_inner(
+        &self,
+        targets: &[Target<'_>],
+        message: &Message<'_>,
+        until: Deadline,
+        meter: &mut Meter,
+        session: Option<&mut postgres_probe::SmtpSession>,
+    ) -> Result<changes::FanoutOutcome, Error> {
         if !self.valid()
             || targets
                 .iter()
@@ -217,8 +265,16 @@ impl Receiving<'_> {
             return Err(ports::Error::Busy.into());
         }
         // Retain only one prepared message; ingress admission remains external.
-        let _slot = self.slots.acquire().map_err(|_| ports::Error::Busy)?;
-        let addresses = addresses(self.loaded, self.executable, deadline)?;
+        let _slot = if session.is_none() {
+            Some(self.slots.acquire().map_err(|_| ports::Error::Busy)?)
+        } else {
+            None
+        };
+        let addresses = if session.is_none() {
+            addresses(self.loaded, self.executable, deadline)?
+        } else {
+            Vec::new()
+        };
         let change = {
             let mut timing =
                 crate::performance::Timer::start(crate::performance::Phase::SmtpPrepare);
@@ -246,18 +302,24 @@ impl Receiving<'_> {
         *pending = Some(change);
         let change = pending.as_ref().ok_or(ports::Error::Invalid)?;
         let mut timing = crate::performance::Timer::start(crate::performance::Phase::SmtpPublish);
-        let mut outcome = Err(changes::Error::Connection(postgres_probe::Error::Transport));
-        for address in addresses {
-            let mut connection = self.loaded.bootstrap.request(address);
-            connection.mode = Mode::Runtime;
-            outcome = changes::publish_fanout(&connection, &self.loaded.trust, deadline, change);
-            if !matches!(
-                outcome,
-                Err(changes::Error::Connection(postgres_probe::Error::Transport))
-            ) {
-                break;
+        let outcome = if let Some(session) = session {
+            session.publish(change, deadline)
+        } else {
+            let mut outcome = Err(changes::Error::Connection(postgres_probe::Error::Transport));
+            for address in addresses {
+                let mut connection = self.loaded.bootstrap.request(address);
+                connection.mode = Mode::Runtime;
+                outcome =
+                    changes::publish_fanout(&connection, &self.loaded.trust, deadline, change);
+                if !matches!(
+                    outcome,
+                    Err(changes::Error::Connection(postgres_probe::Error::Transport))
+                ) {
+                    break;
+                }
             }
-        }
+            outcome
+        };
         if outcome.is_ok() {
             timing.succeeded();
         }
