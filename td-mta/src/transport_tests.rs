@@ -155,3 +155,55 @@ fn tcp_abort_drop_and_errors_fence_both_directions() {
     assert_eq!(adapter.progress(Ok(0), false), Err(error));
     assert_eq!(adapter.flush(), Err(error));
 }
+
+#[test]
+fn blocking_read_wait_preserves_bytes_eof_and_nonblocking_idle_checks() {
+    let (mut adapter, mut peer) = pair();
+    let sender = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(20));
+        peer.write_all(b"x").unwrap();
+        peer
+    });
+    adapter
+        .wait_readable(Instant::now() + Duration::from_secs(2))
+        .unwrap();
+    let peer = sender.join().unwrap();
+    let mut byte = [0];
+    assert_eq!(adapter.read(&mut byte), Ok(IoProgress::Bytes(1)));
+    assert_eq!(byte, *b"x");
+    assert_eq!(adapter.read(&mut byte), Ok(IoProgress::Pending));
+    assert_eq!(
+        adapter.socket.as_ref().unwrap().read_timeout().unwrap(),
+        None
+    );
+    peer.shutdown(Shutdown::Write).unwrap();
+    adapter
+        .wait_readable(Instant::now() + Duration::from_secs(2))
+        .unwrap();
+    assert_eq!(adapter.read(&mut byte), Ok(IoProgress::Closed));
+}
+
+#[test]
+fn blocking_read_and_backpressured_write_stop_at_original_deadline() {
+    let (mut adapter, _peer) = pair();
+    let start = Instant::now();
+    assert_eq!(
+        adapter.wait_readable(start + Duration::from_millis(40)),
+        Err(Error::Deadline)
+    );
+    assert!(start.elapsed() < Duration::from_secs(2));
+    assert_eq!(adapter.read(&mut [0]), Err(Error::Deadline));
+    let (mut adapter, _peer) = pair();
+    let start = Instant::now();
+    let until = start + Duration::from_millis(100);
+    let bytes = [7; SOCKET_CHUNK];
+    loop {
+        match adapter.write_until(&bytes, until) {
+            Ok(IoProgress::Bytes(_)) => {}
+            Err(Error::Deadline) => break,
+            other => panic!("unexpected backpressure result: {other:?}"),
+        }
+    }
+    assert!(start.elapsed() < Duration::from_secs(2));
+    assert_eq!(adapter.flush(), Err(Error::Deadline));
+}

@@ -12,7 +12,7 @@ use std::{
     pin::{pin, Pin},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     task::{Context, Poll, Wake, Waker},
     thread,
@@ -614,8 +614,12 @@ fn connect_authenticated_until(
     tcp_timing.succeeded();
     drop(tcp_timing);
     let activity = Arc::new(AtomicBool::new(false));
-    let transport = Network {
+    let socket = Arc::new(Mutex::new(DriverSocket {
         transport: TcpTransport::from_stream(socket).map_err(|_| Error::Transport)?,
+        deadline: connect_deadline,
+    }));
+    let transport = Network {
+        socket: socket.clone(),
         activity: activity.clone(),
     };
     let mut config = Config::new();
@@ -643,7 +647,7 @@ fn connect_authenticated_until(
         output_limit,
         input,
     };
-    let waker = Waker::from(Arc::new(WorkerWake(thread::current())));
+    let waker = Waker::from(Arc::new(WorkerWake(thread::current(), activity.clone())));
     let mut context = Context::from_waker(&waker);
     let mut handshake_timing =
         crate::performance::Timer::start(crate::performance::Phase::DbHandshake);
@@ -655,12 +659,13 @@ fn connect_authenticated_until(
             break result.map_err(|_| Error::Database)?;
         }
         if !activity.load(Ordering::Relaxed) {
-            thread::park_timeout(Duration::from_millis(1));
+            wait_socket(&socket, connect_deadline)?;
         }
     };
     handshake_timing.succeeded();
     drop(handshake_timing);
     timing.succeeded();
+    socket.lock().map_err(|_| Error::Transport)?.deadline = deadline;
     Ok(Worker {
         client: Some(client),
         connection: Box::pin(connection),
@@ -668,6 +673,7 @@ fn connect_authenticated_until(
         waker,
         failed: None,
         activity,
+        socket,
         validation_window,
         audit_windows: false,
     })
@@ -680,6 +686,7 @@ pub(crate) struct Worker {
     waker: Waker,
     failed: Option<Error>,
     activity: Arc<AtomicBool>,
+    socket: Arc<Mutex<DriverSocket>>,
     validation_window: Option<windows::Windows>,
     audit_windows: bool,
 }
@@ -698,6 +705,7 @@ impl Worker {
     }
     pub(crate) fn constrain_deadline(&mut self, deadline: Instant) -> Result<(), Error> {
         self.deadline = self.deadline.min(deadline);
+        self.socket.lock().map_err(|_| Error::Transport)?.deadline = self.deadline;
         self.check()
     }
     pub(crate) fn check_deadline(&mut self) -> Result<(), Error> {
@@ -713,6 +721,7 @@ impl Worker {
     // No query or round trip: drain available asynchronous messages so an idle
     // cached read cannot hide a terminal connection error behind a notice.
     pub(crate) fn check(&mut self) -> Result<(), Error> {
+        self.socket.lock().map_err(|_| Error::Transport)?.deadline = self.deadline;
         if let Some(error) = self.failed {
             return Err(error);
         }
@@ -741,6 +750,7 @@ impl Worker {
             &'a tokio_postgres::Client,
         ) -> Pin<Box<dyn Future<Output = T> + 'a>>,
     ) -> Result<T, Error> {
+        self.socket.lock().map_err(|_| Error::Transport)?.deadline = self.deadline;
         let mut timing = crate::performance::Timer::start(crate::performance::Phase::DbWork);
         if let Some(error) = self.failed {
             return Err(error);
@@ -769,14 +779,18 @@ impl Worker {
                 return Ok(result);
             }
             match self.connection.as_mut().poll_message(&mut context) {
-                Poll::Ready(Some(Ok(_))) | Poll::Pending => {}
+                Poll::Ready(Some(Ok(_))) => continue,
+                Poll::Pending => {}
                 Poll::Ready(Some(Err(_))) | Poll::Ready(None) => {
                     self.failed = Some(Error::Database);
                     return Err(Error::Database);
                 }
             }
             if !self.activity.load(Ordering::Relaxed) {
-                thread::park_timeout(Duration::from_millis(1));
+                if let Err(error) = wait_socket(&self.socket, self.deadline) {
+                    self.failed = Some(error);
+                    return Err(error);
+                }
             }
         }
     }
@@ -794,6 +808,11 @@ impl Drop for Worker {
         let until = self
             .deadline
             .min(Instant::now() + Duration::from_millis(100));
+        if let Ok(mut socket) = self.socket.lock() {
+            socket.deadline = until;
+        } else {
+            return;
+        }
         let mut context = Context::from_waker(&self.waker);
         while Instant::now() < until {
             self.activity.store(false, Ordering::Relaxed);
@@ -805,11 +824,9 @@ impl Drop for Worker {
                 Poll::Ready(Some(Err(_))) => return,
                 Poll::Ready(Some(Ok(_))) => (),
                 Poll::Pending if !self.activity.load(Ordering::Relaxed) => {
-                    thread::park_timeout(
-                        until
-                            .saturating_duration_since(Instant::now())
-                            .min(Duration::from_millis(1)),
-                    );
+                    if wait_socket(&self.socket, until).is_err() {
+                        return;
+                    }
                 }
                 Poll::Pending => (),
             }
@@ -854,20 +871,42 @@ fn remaining(deadline: Instant) -> Result<Duration, Error> {
         .ok_or(Error::Deadline)
 }
 
-struct WorkerWake(thread::Thread);
+struct WorkerWake(thread::Thread, Arc<AtomicBool>);
 impl Wake for WorkerWake {
     fn wake(self: Arc<Self>) {
+        self.1.store(true, Ordering::Relaxed);
         self.0.unpark();
     }
     fn wake_by_ref(self: &Arc<Self>) {
+        self.1.store(true, Ordering::Relaxed);
         self.0.unpark();
     }
 }
 
 // TLS can consume an encrypted header and report no plaintext yet. Track
 // actual socket progress below it so the worker does not sleep on that work.
-struct Network {
+struct DriverSocket {
     transport: TcpTransport,
+    deadline: Instant,
+}
+
+fn wait_socket(socket: &Mutex<DriverSocket>, deadline: Instant) -> Result<(), Error> {
+    socket
+        .lock()
+        .map_err(|_| Error::Transport)?
+        .transport
+        .wait_readable(deadline)
+        .map_err(|error| {
+            if error == crate::ports::Error::Deadline {
+                Error::Deadline
+            } else {
+                Error::Transport
+            }
+        })
+}
+
+struct Network {
+    socket: Arc<Mutex<DriverSocket>>,
     activity: Arc<AtomicBool>,
 }
 impl Network {
@@ -883,21 +922,43 @@ impl Network {
 }
 impl Transport for Network {
     fn read(&mut self, output: &mut [u8]) -> Result<IoProgress, crate::ports::Error> {
-        let result = self.transport.read(output);
+        let result = self
+            .socket
+            .lock()
+            .map_err(|_| crate::ports::Error::Invalid)?
+            .transport
+            .read(output);
         self.progress(result)
     }
     fn write(&mut self, input: &[u8]) -> Result<IoProgress, crate::ports::Error> {
-        let result = self.transport.write(input);
+        let result = {
+            let mut socket = self
+                .socket
+                .lock()
+                .map_err(|_| crate::ports::Error::Invalid)?;
+            let deadline = socket.deadline;
+            socket.transport.write_until(input, deadline)
+        };
         self.progress(result)
     }
     fn flush(&mut self) -> Result<FlushProgress, crate::ports::Error> {
-        self.transport.flush()
+        self.socket
+            .lock()
+            .map_err(|_| crate::ports::Error::Invalid)?
+            .transport
+            .flush()
     }
     fn close(&mut self) -> Result<FlushProgress, crate::ports::Error> {
-        self.transport.close()
+        self.socket
+            .lock()
+            .map_err(|_| crate::ports::Error::Invalid)?
+            .transport
+            .close()
     }
     fn abort(&mut self) {
-        self.transport.abort();
+        if let Ok(mut socket) = self.socket.lock() {
+            socket.transport.abort();
+        }
     }
 }
 
@@ -950,8 +1011,9 @@ impl tls::TlsStream for Io<Secure> {
     }
 }
 
-// Private to the periodically polled worker above: socket Pending does not
-// register an external reactor. Driver channel wakeups unpark this worker.
+// Private to this worker: read Pending never blocks a driver write. After
+// a complete poll with no socket or channel progress, the owner waits for
+// readability. No external reactor or concurrent operation uses this socket.
 struct Io<T> {
     transport: T,
     input: Option<Input>,
@@ -1102,7 +1164,10 @@ mod tests {
         peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
         let activity = Arc::new(AtomicBool::new(false));
         let mut network = Network {
-            transport: TcpTransport::from_stream(socket).unwrap(),
+            socket: Arc::new(Mutex::new(DriverSocket {
+                transport: TcpTransport::from_stream(socket).unwrap(),
+                deadline: Instant::now() + Duration::from_secs(5),
+            })),
             activity: activity.clone(),
         };
         let mut byte = [0];
@@ -1174,7 +1239,10 @@ mod tests {
         let window = io.input.as_ref().unwrap().window().unwrap();
         window.begin().unwrap();
         window.output(64 * 1024 - 2).unwrap();
-        let waker = Waker::from(Arc::new(WorkerWake(thread::current())));
+        let waker = Waker::from(Arc::new(WorkerWake(
+            thread::current(),
+            Arc::new(AtomicBool::new(false)),
+        )));
         let mut context = Context::from_waker(&waker);
         assert!(Pin::new(&mut io)
             .poll_write(&mut context, b"ab")

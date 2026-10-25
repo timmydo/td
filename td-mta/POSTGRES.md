@@ -383,12 +383,21 @@ cleartext-password, trust and other authentication methods. The pinned
 driver selects SCRAM-SHA-256 and verifies its server signature; its
 100,000-iteration ceiling bounds the server-directed password work.
 
-The private async adapter is used only by this periodically polled worker,
-which parks at most one millisecond between turns. It uses no Tokio runtime,
-network/time driver, background task or concurrent query. Driver channel
-wakeups unpark that same thread. All loop turns and final success check the
-original deadline; TCP connect and TLS retain finite bounds. Native crypto
-work remains subject to TLS.md's between-call deadline limitations.
+The private async adapter belongs to one worker. Reads during driver polls
+remain nonblocking: the pinned driver polls reads before flushing writes, so
+blocking there could prevent the request from reaching PostgreSQL. Socket
+writes block only under the current operation deadline. After a complete
+poll without socket progress or a driver channel wakeup, the worker waits
+for socket readability with a deadline-bounded peek that consumes no bytes.
+The adapter restores nonblocking mode before the next driver poll. Idle
+health checks never wait for readability. One private synchronized owner
+shares this socket between the adapter and its worker; no cloned socket,
+Tokio runtime, network/time driver, background task or concurrent query is
+introduced. Connect, TLS handshake, each retained job and teardown use their
+own existing deadline, without renewal. Cleanup waits at most its existing
+100-ms allowance. All loop turns and final success check the original
+deadline. Native crypto work remains subject to TLS.md's between-call
+deadline limitations.
 
 Before driver intake, cap backend frames at 128 KiB including their length
 word, 128 frames and one MiB total for the entire connection. Fragmented

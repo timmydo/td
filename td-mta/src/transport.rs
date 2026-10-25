@@ -3,6 +3,7 @@ use crate::ports::{Error, FlushProgress, IoProgress, Transport};
 use std::{
     io::{self, ErrorKind, Read, Write},
     net::{Shutdown, SocketAddr, TcpStream},
+    time::Instant,
 };
 
 /// One socket operation never handles more than one application chunk.
@@ -48,6 +49,74 @@ impl TcpTransport {
     /// Transport origin only; this address does not grant gateway authorization.
     pub fn peer_addr(&self) -> SocketAddr {
         self.peer
+    }
+
+    // Only the PostgreSQL owner uses these waits, between complete driver
+    // polls. Restore nonblocking mode before returning to the TLS adapter.
+    pub(crate) fn wait_readable(&mut self, until: Instant) -> Result<(), Error> {
+        let result = self.blocking(until, true, |socket| socket.peek(&mut [0]));
+        result.map(|_| ())
+    }
+
+    pub(crate) fn write_until(
+        &mut self,
+        input: &[u8],
+        until: Instant,
+    ) -> Result<IoProgress, Error> {
+        if input.is_empty() {
+            return Ok(IoProgress::Pending);
+        }
+        if self.write_closed {
+            return self.write(input);
+        }
+        let bytes = input
+            .get(..input.len().min(SOCKET_CHUNK))
+            .ok_or(Error::Invalid)?;
+        let count = self.blocking(until, false, |socket| socket.write(bytes))?;
+        self.progress(Ok(count), false)
+    }
+
+    fn blocking(
+        &mut self,
+        until: Instant,
+        reading: bool,
+        mut operation: impl FnMut(&mut TcpStream) -> io::Result<usize>,
+    ) -> Result<usize, Error> {
+        let result = (|| {
+            let socket = self.socket()?;
+            socket.set_nonblocking(false).map_err(Error::from)?;
+            loop {
+                let allowance = until
+                    .checked_duration_since(Instant::now())
+                    .filter(|value| !value.is_zero())
+                    .ok_or(Error::Deadline)?;
+                if reading {
+                    socket.set_read_timeout(Some(allowance))
+                } else {
+                    socket.set_write_timeout(Some(allowance))
+                }
+                .map_err(Error::from)?;
+                match operation(socket) {
+                    Ok(count) => return Ok(count),
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            ErrorKind::Interrupted | ErrorKind::WouldBlock | ErrorKind::TimedOut
+                        ) => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        })();
+        let restored = (|| {
+            let socket = self.socket()?;
+            socket.set_nonblocking(true).map_err(Error::from)?;
+            socket.set_read_timeout(None).map_err(Error::from)?;
+            socket.set_write_timeout(None).map_err(Error::from)
+        })();
+        match result.and_then(|count| restored.map(|()| count)) {
+            Ok(count) => Ok(count),
+            Err(error) => Err(self.fail(error)),
+        }
     }
 
     fn socket(&mut self) -> Result<&mut TcpStream, Error> {
