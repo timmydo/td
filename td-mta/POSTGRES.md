@@ -6656,6 +6656,18 @@ A stale member rolls the batch back. All I/O shares one ten-second deadline;
 uncertain renewal stops the process. Lock contention on one account can therefore
 affect this process's availability. It cannot grant stale transport authority.
 
+The absence read and batched renewal/release consume a callback-scoped client
+whose Runtime connection qualification carries its freshly inspected schema
+receipt. The shared session migration lock remains held continuously through
+the operation, so its transaction entry checks the expected epoch without
+repeating that same connection's schema queries or recursive lock acquisition.
+The scope supplies its own client and cannot escape the callback; neither
+receipt nor authority is reused by a later job. Preparation connections still
+inspect the schema at transaction entry. Runtime role, privilege, maintenance,
+selected configuration, account locks, owner generation and database-time checks
+retain their existing order and freshness. Connection, wire, deadline and
+uncertain-COMMIT bounds are unchanged.
+
 Registry acknowledgements match the exact claim operation and generation.
 Published slots are never replaced while the worker runs. One fresh database
 UTC sample initializes the shared queue-clock guard; historical receipt time

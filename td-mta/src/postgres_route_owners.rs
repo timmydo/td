@@ -115,6 +115,26 @@ pub(crate) async fn begin(
     begin_transaction(client).await?;
     lock_account_policy(client, claim, policy, write).await
 }
+pub(crate) async fn begin_scoped<'a>(
+    scope: postgres_probe::ScopedClient<'a>,
+    claim: &Claim,
+    policy: bool,
+    write: bool,
+) -> Result<(&'a Client, bool), Error> {
+    if scope
+        .inspect_schema()
+        .await
+        .map_err(Error::Schema)?
+        .store_epoch
+        != claim.binding.epoch()
+    {
+        return Err(Error::Epoch);
+    }
+    let client = scope.client();
+    begin_transaction(client).await?;
+    let current = lock_account_policy(client, claim, policy, write).await?;
+    Ok((client, current))
+}
 pub(crate) async fn begin_transaction(client: &Client) -> Result<(), Error> {
     client.batch_execute("BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL synchronous_commit=on; SET LOCAL idle_in_transaction_session_timeout=10000").await.map_err(|_|Error::Database)
 }
@@ -535,52 +555,59 @@ fn update_many(
     values.sort_unstable_by_key(|(claim, _)| claim.binding.account());
     let attempted = Arc::new(AtomicBool::new(false));
     let marker = attempted.clone();
-    let result = postgres_probe::with_mutation_client(request, trust, deadline, move |client| {
-        Box::pin(async move {
-            client
-                .batch_execute("SET lock_timeout=8000; SET statement_timeout=8000")
-                .await
-                .map_err(|_| Error::Database)?;
-            let first = &values.first().ok_or(Error::Integrity)?.0;
-            if !begin(client, first, !release, true).await? {
-                return Err(Error::Policy);
-            }
-            // The first account was locked by begin. Acquire every other account
-            // before any owner row, preserving the account-before-owner hierarchy.
-            for (claim, _) in values.iter().skip(1) {
-                client
-                    .query_one(
-                        "SELECT id FROM td_mta.accounts WHERE id=$1 FOR UPDATE",
-                        &[&claim.binding.account().as_bytes().as_slice()],
-                    )
+    let result = postgres_probe::with_scoped_mutation_client(
+        request,
+        trust,
+        deadline,
+        move |scope| {
+            Box::pin(async move {
+                scope
+                    .client()
+                    .batch_execute("SET lock_timeout=8000; SET statement_timeout=8000")
                     .await
                     .map_err(|_| Error::Database)?;
-            }
-            let mut owners = Vec::new();
-            owners
-                .try_reserve_exact(values.len())
-                .map_err(|_| Error::Capacity)?;
-            for (claim, _) in &values {
-                owners.push(owner(client, claim).await?.ok_or(Error::Stale)?);
-            }
-            let timestamp = now(client).await?;
-            let expires_at = timestamp.checked_add(LEASE_MS).ok_or(Error::Clock)?;
-            for ((claim, generation), owner) in values.iter().zip(&owners) {
-                current(owner, claim, *generation, timestamp, !release)?;
-            }
-            for (claim, _) in &values {
-                let changed = if release {
+                let first = &values.first().ok_or(Error::Integrity)?.0;
+                let (client, current_policy) = begin_scoped(scope, first, !release, true).await?;
+                if !current_policy {
+                    return Err(Error::Policy);
+                }
+                // The first account was locked by begin. Acquire every other account
+                // before any owner row, preserving the account-before-owner hierarchy.
+                for (claim, _) in values.iter().skip(1) {
+                    client
+                        .query_one(
+                            "SELECT id FROM td_mta.accounts WHERE id=$1 FOR UPDATE",
+                            &[&claim.binding.account().as_bytes().as_slice()],
+                        )
+                        .await
+                        .map_err(|_| Error::Database)?;
+                }
+                let mut owners = Vec::new();
+                owners
+                    .try_reserve_exact(values.len())
+                    .map_err(|_| Error::Capacity)?;
+                for (claim, _) in &values {
+                    owners.push(owner(client, claim).await?.ok_or(Error::Stale)?);
+                }
+                let timestamp = now(client).await?;
+                let expires_at = timestamp.checked_add(LEASE_MS).ok_or(Error::Clock)?;
+                for ((claim, generation), owner) in values.iter().zip(&owners) {
+                    current(owner, claim, *generation, timestamp, !release)?;
+                }
+                for (claim, _) in &values {
+                    let changed = if release {
                 client.execute("UPDATE td_mta.route_owners SET owner_boot=NULL,operation=NULL,expires_at=NULL,last_clock=$3 WHERE account=$1 AND route_name=$2", &[&claim.binding.account().as_bytes().as_slice(), &claim.binding.route().name(), &timestamp]).await
             } else {
                 client.execute("UPDATE td_mta.route_owners SET expires_at=$3,last_clock=$4 WHERE account=$1 AND route_name=$2", &[&claim.binding.account().as_bytes().as_slice(), &claim.binding.route().name(), &expires_at, &timestamp]).await
             }.map_err(|_| Error::Database)?;
-                if changed != 1 {
-                    return Err(Error::Integrity);
+                    if changed != 1 {
+                        return Err(Error::Integrity);
+                    }
                 }
-            }
-            commit(client, &marker).await?;
-            Ok(timestamp)
-        })
-    });
+                commit(client, &marker).await?;
+                Ok(timestamp)
+            })
+        },
+    );
     finish(result, &attempted)
 }

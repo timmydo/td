@@ -407,4 +407,149 @@ fn idle_hints(
         relay_grant.generation
     )
     .is_err());
+    scoped_qualification(fixture, request, trust, relay);
+}
+
+fn scoped_qualification(
+    fixture: &Fixture,
+    preparation: &td_mta::postgres_probe::Request<'_>,
+    trust: &TrustStore,
+    binding: &runtime::Binding,
+) {
+    use td_mta::{
+        ids::BootId, postgres_probe as probe, postgres_queue_candidates as hints,
+        postgres_route_owners as owners, postgres_schema as schema,
+    };
+    super::create_runtime_login(fixture);
+    super::grant_runtime_mail(fixture);
+    let mut runtime = fixture.request();
+    runtime.user = "mail_runtime";
+    runtime.mode = probe::Mode::Runtime;
+    let claim = owners::prepare(binding, BootId::from_bytes([93; 16])).unwrap();
+    let grant = owners::acquire(preparation, trust, deadline(), &claim).unwrap();
+    let idle =
+        |request| hints::idle_observation(request, trust, deadline(), &claim, grant.generation);
+    let renew =
+        |request| owners::renew_many(request, trust, deadline(), &[(&claim, grant.generation)]);
+
+    // Count executed ledger reads on real sessions, rather than trusting a
+    // source pattern or a mock that cannot observe recursive session locks.
+    sql(fixture, "ALTER SYSTEM SET log_statement='all'");
+    sql(fixture, "SELECT pg_reload_conf()");
+    let until = deadline();
+    while sql(fixture, "SHOW log_statement") != "all" {
+        assert!(std::time::Instant::now() < until);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    for request in [preparation, &runtime] {
+        for renewal in [false, true] {
+            let offset = std::fs::metadata(fixture.root.join("server.log"))
+                .unwrap()
+                .len() as usize;
+            if renewal {
+                renew(request).unwrap();
+            } else {
+                idle(request).unwrap();
+            }
+            super::body_checks::quiet(fixture);
+            let log = std::fs::read_to_string(fixture.root.join("server.log")).unwrap();
+            let reads = log[offset..].lines().filter(|line| {
+                line.contains("execute ") && line.contains("SELECT version, checksum, store_epoch FROM td_mta.schema_migrations ORDER BY version")
+            }).count();
+            assert_eq!(reads, 1, "one schema qualification per operation");
+            assert_eq!(
+                sql(
+                    fixture,
+                    &format!(
+                        "SELECT pg_catalog.pg_try_advisory_xact_lock({})",
+                        schema::MIGRATION_KEY
+                    )
+                ),
+                "t"
+            );
+        }
+    }
+    sql(fixture, "ALTER SYSTEM RESET log_statement");
+    sql(fixture, "SELECT pg_reload_conf()");
+
+    let checksum = sql(
+        fixture,
+        "SELECT encode(checksum,'hex') FROM td_mta.schema_migrations WHERE version=1",
+    );
+    sql(fixture, "UPDATE td_mta.schema_migrations SET checksum=decode(repeat('00',32),'hex') WHERE version=1");
+    assert_eq!(
+        idle(&runtime),
+        Err(hints::Error::Connection(probe::Error::RuntimeSchema))
+    );
+    assert_eq!(
+        renew(&runtime),
+        Err(owners::Error::Connection(probe::Error::RuntimeSchema))
+    );
+    assert_eq!(
+        idle(preparation),
+        Err(hints::Error::Owner(owners::Error::Schema(
+            schema::Error::Version
+        )))
+    );
+    assert_eq!(
+        renew(preparation),
+        Err(owners::Error::Schema(schema::Error::Version))
+    );
+    sql(fixture, &format!("UPDATE td_mta.schema_migrations SET checksum=decode('{checksum}','hex') WHERE version=1"));
+
+    let epoch = sql(
+        fixture,
+        "SELECT encode(store_epoch,'hex') FROM td_mta.schema_migrations LIMIT 1",
+    );
+    sql(
+        fixture,
+        "UPDATE td_mta.schema_migrations SET store_epoch=decode(repeat('ee',16),'hex')",
+    );
+    for request in [preparation, &runtime] {
+        assert_eq!(
+            idle(request),
+            Err(hints::Error::Owner(owners::Error::Epoch))
+        );
+        assert_eq!(renew(request), Err(owners::Error::Epoch));
+    }
+    sql(
+        fixture,
+        &format!("UPDATE td_mta.schema_migrations SET store_epoch=decode('{epoch}','hex')"),
+    );
+    for (change, restore, error) in [
+        (
+            "UPDATE td_mta.runtime_barrier SET blocked=true",
+            "UPDATE td_mta.runtime_barrier SET blocked=false",
+            probe::Error::RuntimeMaintenance,
+        ),
+        (
+            "ALTER ROLE mail_runtime CREATEDB",
+            "ALTER ROLE mail_runtime NOCREATEDB",
+            probe::Error::RuntimeRole,
+        ),
+        (
+            "REVOKE SELECT ON td_mta.emails FROM mail_runtime",
+            "GRANT SELECT ON td_mta.emails TO mail_runtime",
+            probe::Error::RuntimePrivileges,
+        ),
+    ] {
+        renew(&runtime).unwrap();
+        sql(fixture, change);
+        assert_eq!(idle(&runtime), Err(hints::Error::Connection(error)));
+        assert_eq!(renew(&runtime), Err(owners::Error::Connection(error)));
+        sql(fixture, restore);
+        idle(&runtime).unwrap();
+    }
+    super::body_checks::quiet(fixture);
+    assert_eq!(
+        sql(
+            fixture,
+            &format!(
+                "SELECT pg_catalog.pg_try_advisory_xact_lock({})",
+                schema::MIGRATION_KEY
+            )
+        ),
+        "t"
+    );
+    owners::release_many(&runtime, trust, deadline(), &[(&claim, grant.generation)]).unwrap();
 }

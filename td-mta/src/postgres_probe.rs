@@ -132,6 +132,76 @@ pub(crate) fn with_mailbox_client<T>(
     )
 }
 
+/// One fresh operation's client and continuously held migration qualification.
+/// Construction stays here; neither the client nor its receipt can be replaced.
+pub(crate) struct ScopedClient<'a> {
+    client: &'a tokio_postgres::Client,
+    runtime_schema: Option<crate::postgres_schema::Receipt>,
+}
+impl<'a> ScopedClient<'a> {
+    pub(crate) fn client(&self) -> &'a tokio_postgres::Client {
+        self.client
+    }
+    pub(crate) async fn inspect_schema(
+        &self,
+    ) -> Result<crate::postgres_schema::Receipt, crate::postgres_schema::Error> {
+        match self.runtime_schema {
+            Some(receipt) => Ok(receipt),
+            None => crate::postgres_schema::lock_and_inspect(self.client).await,
+        }
+    }
+}
+
+pub(crate) fn with_scoped_mailbox_client<T>(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    operation: impl for<'a> FnOnce(ScopedClient<'a>) -> Pin<Box<dyn Future<Output = T> + 'a>>,
+) -> Result<T, Error> {
+    with_scoped_output_limit(
+        request,
+        trust,
+        deadline,
+        64 * 1024,
+        Input::mailboxes(),
+        operation,
+    )
+}
+
+pub(crate) fn with_scoped_mutation_client<T>(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    operation: impl for<'a> FnOnce(ScopedClient<'a>) -> Pin<Box<dyn Future<Output = T> + 'a>>,
+) -> Result<T, Error> {
+    with_scoped_output_limit(
+        request,
+        trust,
+        deadline,
+        128 * 1024,
+        Input::mutations(),
+        operation,
+    )
+}
+
+fn with_scoped_output_limit<T>(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    output_limit: usize,
+    input: Input,
+    operation: impl for<'a> FnOnce(ScopedClient<'a>) -> Pin<Box<dyn Future<Output = T> + 'a>>,
+) -> Result<T, Error> {
+    let (mut worker, runtime_schema) =
+        connect_worker_with_schema(request, trust, deadline, output_limit, input, MAX_DURATION)?;
+    worker.run(move |client| {
+        operation(ScopedClient {
+            client,
+            runtime_schema,
+        })
+    })
+}
+
 // At most 256 Email rows and 257 distinct mailbox rows, with protocol overhead.
 pub(crate) fn with_mutation_client<T>(
     request: &Request<'_>,
@@ -424,19 +494,34 @@ fn connect_worker_bounded(
     input: Input,
     maximum: Duration,
 ) -> Result<Worker, Error> {
+    connect_worker_with_schema(request, trust, deadline, output_limit, input, maximum)
+        .map(|(worker, _)| worker)
+}
+
+fn connect_worker_with_schema(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    output_limit: usize,
+    input: Input,
+    maximum: Duration,
+) -> Result<(Worker, Option<crate::postgres_schema::Receipt>), Error> {
     let mut worker =
         connect_authenticated_bounded(request, trust, deadline, output_limit, input, maximum)?;
-    if request.mode == Mode::Runtime {
-        worker.run(|client| {
+    let runtime_schema = if request.mode == Mode::Runtime {
+        Some(worker.run(|client| {
             Box::pin(async move {
-                crate::postgres_schema::lock_and_inspect(client)
+                let receipt = crate::postgres_schema::lock_and_inspect(client)
                     .await
                     .map_err(|_| Error::RuntimeSchema)?;
-                qualify_runtime(client).await
+                qualify_runtime(client).await?;
+                Ok(receipt)
             })
-        })??;
-    }
-    Ok(worker)
+        })??)
+    } else {
+        None
+    };
+    Ok((worker, runtime_schema))
 }
 
 pub(crate) async fn qualify_runtime(client: &tokio_postgres::Client) -> Result<(), Error> {
