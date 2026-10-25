@@ -153,6 +153,79 @@ fn envelope(stream: &mut BufReader<impl Read + Write>) {
     command(stream, b"DATA\r\n", "354");
 }
 
+fn connect(
+    fixture: &Fixture,
+    address: std::net::SocketAddr,
+    tls: bool,
+    clock: Arc<RuntimeClock>,
+) -> BufReader<Box<dyn Duplex>> {
+    let stream = TcpStream::connect(address).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    let mut client = BufReader::new(stream);
+    reply(&mut client, "220");
+    command(&mut client, b"EHLO sender.example.test\r\n", "250");
+    let wire: Box<dyn Duplex> = if tls {
+        command(&mut client, b"STARTTLS\r\n", "220");
+        assert!(client.buffer().is_empty());
+        let (driver, _) = upgrade(client.into_inner(), clock.clone(), &fixture.ca);
+        Box::new(driver)
+    } else {
+        Box::new(client.into_inner())
+    };
+    let mut client = BufReader::new(wire);
+    if tls {
+        command(&mut client, b"EHLO sender.example.test\r\n", "250");
+    }
+    client
+}
+
+fn concurrent_data(
+    fixture: &Fixture,
+    address: std::net::SocketAddr,
+    tls: bool,
+    clock: Arc<RuntimeClock>,
+) {
+    let initial: u64 = sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts")
+        .parse()
+        .unwrap();
+    let mut slow = connect(fixture, address, tls, clock.clone());
+    envelope(&mut slow);
+    slow.get_mut()
+        .write_all(b"Subject: concurrent slow\r\n\r\npartial\r\n")
+        .unwrap();
+    slow.get_mut().flush().unwrap();
+    // Keep the first sender in DATA until another sender has durably completed.
+    let mut fast = connect(fixture, address, tls, clock);
+    envelope(&mut fast);
+    command(
+        &mut fast,
+        b"Subject: concurrent fast\r\n\r\nbody\r\n.\r\n",
+        "250",
+    );
+    assert_eq!(
+        sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"),
+        (initial + 1).to_string()
+    );
+    command(&mut slow, b".\r\n", "250");
+    assert_eq!(
+        sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"),
+        (initial + 2).to_string()
+    );
+    for subject in ["concurrent slow", "concurrent fast"] {
+        assert_eq!(
+            sql(fixture, &format!("SELECT count(*) FROM td_mta.blob_chunks WHERE pg_catalog.encode(bytes,'escape') LIKE '%Subject: {subject}%'")),
+            "1"
+        );
+    }
+    command(&mut slow, b"QUIT\r\n", "221");
+    command(&mut fast, b"QUIT\r\n", "221");
+}
+
 pub(super) fn exercise(
     fixture: &Fixture,
     binding: &Binding,
@@ -283,12 +356,23 @@ pub(super) fn exercise(
             command(&mut client, b"Subject: after refusal\r\n\r\nbody\r\n.\r\n", "250");
             assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"), "2");
 
+            concurrent_data(fixture, address, tls, clock.clone());
+
             // Shutdown discards a partially received message and joins the workers.
             envelope(&mut client);
             client.get_mut().write_all(b"Subject: abandoned\r\n\r\npartial\r\n").unwrap();
             client.get_mut().flush().unwrap();
+            let mut abandoned = Vec::new();
+            for _ in 1..td_mta::limits::SMTP_DATA_JOBS {
+                let mut extra = connect(fixture, address, tls, clock.clone());
+                envelope(&mut extra);
+                extra.get_mut().write_all(b"Subject: abandoned sibling\r\n\r\npartial\r\n").unwrap();
+                extra.get_mut().flush().unwrap();
+                abandoned.push(extra);
+            }
             drop(stop);
             server.join().unwrap().unwrap();
+            drop(abandoned);
             match client.read(&mut [0]) {
                 Ok(0) => (),
                 Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => (),
@@ -298,9 +382,9 @@ pub(super) fn exercise(
             drop(client);
             assert_eq!(control.state(), State::Stopped);
             assert_eq!(pending.operation().unwrap(), None);
-            assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"), "2");
-            assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "2");
-            assert_eq!(sql(fixture, &format!("SELECT count(*) FROM td_mta.emails WHERE tls={version} AND ehlo='sender.example.test' AND reverse_path='sender@example.test'")), "2");
+            assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"), "4");
+            assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "4");
+            assert_eq!(sql(fixture, &format!("SELECT count(*) FROM td_mta.emails WHERE tls={version} AND ehlo='sender.example.test' AND reverse_path='sender@example.test'")), "4");
         });
     }).unwrap();
 }

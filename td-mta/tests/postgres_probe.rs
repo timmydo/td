@@ -2772,7 +2772,12 @@ per_peer_limit = 1
         cloud
     };
     // Concurrent loopback streams share one peer address.
-    let cloud = if matches!(exercise, ConfigurationExercise::Performance) {
+    let cloud = if matches!(
+        exercise,
+        ConfigurationExercise::Performance
+            | ConfigurationExercise::ReceivingTransport
+            | ConfigurationExercise::ReceivingTls
+    ) {
         let limits = "session_limit = 1\nper_peer_limit = 1\n";
         assert_eq!(cloud.matches(limits).count(), 1, "cloud listener limits");
         cloud.replace(
@@ -12064,11 +12069,25 @@ fn exercise_smtp_storage(fixture: &Fixture, binding: &td_mta::postgres_runtime_p
             storage.begin(begin(clock.clone(), 8), &mut random),
             Err(Failure::Refused(Error::Forbidden))
         ));
+        for _ in 0..td_mta::limits::SMTP_DATA_JOBS {
+            let mut expired = begin(clock.clone(), 7);
+            expired.deadline = until(0);
+            assert!(matches!(
+                storage.begin(expired, &mut random),
+                Err(Failure::Refused(Error::Deadline))
+            ));
+        }
         let mut job = storage.begin(begin(clock.clone(), 7), &mut random).unwrap();
+        let mut others = Vec::new();
+        for _ in 1..td_mta::limits::SMTP_DATA_JOBS {
+            others.push(storage.begin(begin(clock.clone(), 7), &mut random).unwrap());
+        }
         assert!(matches!(
             storage.begin(begin(clock.clone(), 7), &mut random),
             Err(Failure::Retry)
         ));
+        drop(others.pop());
+        others.push(storage.begin(begin(clock.clone(), 7), &mut random).unwrap());
         if case == 0 {
             drop(job);
             assert_eq!(
@@ -12115,6 +12134,13 @@ fn exercise_smtp_storage(fixture: &Fixture, binding: &td_mta::postgres_runtime_p
         assert!(matches!(session.pending(), Action::Commit));
         job.prepare(until(10_000)).unwrap();
         if case == 3 {
+            // A separately admitted and prepared job cannot publish after an
+            // uncertain sibling, even when historical settlement later succeeds.
+            let other = others.first_mut().unwrap();
+            other.write(b"Subject: fenced sibling\r\n").unwrap();
+            other.write(b"\r\n").unwrap();
+            other.write(b"body\r\n").unwrap();
+            other.prepare(until(10_000)).unwrap();
             sql(fixture, "CREATE FUNCTION public.delay_storage_receiving() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(4); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_storage_receiving AFTER INSERT ON td_mta.receiving_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_storage_receiving()");
         }
         let completed = job.commit().unwrap();
@@ -12150,6 +12176,19 @@ fn exercise_smtp_storage(fixture: &Fixture, binding: &td_mta::postgres_runtime_p
                 Err(Error::WriterStopped)
             );
             assert!(pending.operation().unwrap().is_some());
+            let other = others.first_mut().unwrap();
+            assert!(matches!(
+                other.commit(),
+                Err(Failure::Refused(Error::WriterStopped))
+            ));
+            assert_eq!(
+                others.get_mut(1).unwrap().write(b"body\r\n"),
+                Err(Failure::Refused(Error::WriterStopped))
+            );
+            assert_eq!(
+                others.get_mut(2).unwrap().prepare(until(10_000)),
+                Err(Failure::Refused(Error::WriterStopped))
+            );
             thread::sleep(Duration::from_secs(5));
             sql(
                 fixture,
@@ -12165,6 +12204,10 @@ fn exercise_smtp_storage(fixture: &Fixture, binding: &td_mta::postgres_runtime_p
                 (initial + 2).to_string()
             );
             assert!(storage.stopped());
+            assert!(matches!(
+                others.first_mut().unwrap().commit(),
+                Err(Failure::Refused(Error::WriterStopped))
+            ));
         }
     }
 }

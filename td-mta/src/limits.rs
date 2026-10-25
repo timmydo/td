@@ -28,6 +28,8 @@ pub const ACCOUNT_METADATA_BYTES: usize = 20 * MIB;
 pub const RELAY_ACCOUNT_METADATA_BYTES: usize = 128 * KIB;
 /// Private per-account SMTP receipt buffers and retained fanout metadata copies.
 pub const SMTP_FANOUT_METADATA_BYTES: usize = 2 * MIB;
+/// Resident incoming DATA jobs; publication still uses one fixed worker.
+pub const SMTP_DATA_JOBS: usize = 4;
 const _: () = assert!(
     crate::config::identities::MAX_ACCOUNTS * crate::format::row::MAX_RECEIPT_BYTES
         + 3 * (crate::format::row::MAX_RECEIPT_BYTES + 128 * KIB)
@@ -370,7 +372,7 @@ impl Limits {
             },
             Reservation {
                 name: "SMTP fanout metadata",
-                count: 1,
+                count: SMTP_DATA_JOBS,
                 bytes_each: SMTP_FANOUT_METADATA_BYTES,
             },
             Reservation {
@@ -418,7 +420,7 @@ mod tests {
     #[test]
     fn default_ledger_pins_documented_budget() -> Result<(), ResourceError> {
         let plan = Limits::default().plan()?;
-        assert_eq!(plan.total_bytes(), 101_434_624);
+        assert_eq!(plan.total_bytes(), 107_726_080);
         const { assert!(crate::format::MAX_VALUE_BYTES + crate::format::MAX_KEY_BYTES + 48 <= 68 * KIB) };
         assert_eq!(
             READ_VIEW_SCRATCH_BYTES,
@@ -718,7 +720,7 @@ mod tests {
             Err(ResourceError::MemoryBudget { .. })
         ));
         assert!(Limits {
-            json_bytes: 512 * KIB,
+            json_bytes: 384 * KIB,
             json_tokens: 16384,
             ..maximum_pool
         }

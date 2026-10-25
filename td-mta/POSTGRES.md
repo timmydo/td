@@ -3080,28 +3080,39 @@ including unchanged account state and absent publication effects.
 `postgres_smtp_storage` implements the fixed worker's storage boundary for
 direct SMTP. Its constructor pins the receiving owner, one shared runtime
 clock and the local policy generation. Begin checks the routed account,
-generation and configured message/header/recipient bounds, takes one ingress
-permit and observes fresh receiving readiness before admitting DATA. The
-permit and resident buffer survive worker turns without a database transaction
+generation and configured message/header/recipient bounds, takes one of four
+ingress permits and observes fresh receiving readiness before admitting DATA.
+The permit and resident buffer survive worker turns without a database transaction
 or mutex guard spanning peer input. Dropping the job releases that capacity.
+The shared bound is independent of listener and account counts. Exhaustion
+retries before 354 under the original queued admission deadline. A sender
+waiting in DATA does not hold another sender's permit or the storage worker.
 
 The original absolute deadline and profile work allowance cover bounded DATA
 copies, receipt metadata, preparation and publication. Admission prepays one
-incoming buffer of at most 32 MiB; preparation may retain one additional
-filtered body under the same meter. Each decoded line is at most 1000 bytes.
-A failed write remains failed, and publication can be attempted only once.
+incoming buffer of at most 32 MiB per admitted job; preparation may retain one
+additional filtered body under the same meter. The single storage worker and
+publication owner serialize preparation and publication. Four full-capacity
+incoming buffers plus that filtered body have a 160-MiB payload ceiling;
+allocator capacity and native protocol buffers are additional. This finite
+bound is not qualification of the provisional 128-MiB workload RSS goal.
+Each decoded line is at most 1000 bytes. A failed write remains failed, and
+publication can be attempted only once.
 The trusted connection owner still supplies routing and observed peer/TLS
 facts; no gateway authority is inferred from message content.
 
 Known publication yields the account, epoch and sequence required for SMTP's
 final success reply. Unknown COMMIT retains the original operation in the
 publication owner, stops this backend and produces no final SMTP receipt.
+Already admitted jobs refuse further writes, preparation and publication;
+the receiving worker retires every uncommitted sibling without publication.
 Historical settlement does not automatically restart this backend. The
 foreground service constructs this PostgreSQL storage adapter; durable restart
 custody for uncertain operations remains a separate requirement. The runtime
 PostgreSQL fixture drives the SMTP session through admission, DATA and commit,
 including discarded ingress, sticky refusal, generation/clock mismatch,
-single ingress capacity, success, delayed COMMIT and historical settlement.
+four-job ingress capacity, release after refusal/discard, success, delayed
+COMMIT, fencing of admitted siblings and historical settlement.
 
 ## 108. Real SMTP worker qualification
 
@@ -3112,8 +3123,11 @@ TLS policy. The runtime database role supplies readiness and publication.
 The fixture checks the SMTP greeting, envelope admission, DATA and final
 success reply against durable receiving receipts and Email rows. A known
 database rollback produces 451, preserves the ready worker and permits a
-later successful transaction on that connection. Shutdown discards unfinished
-DATA, joins the workers and leaves no additional message or receipt.
+later successful transaction on that connection. A partial DATA sender stays
+paused until another connection has received final success, with exactly that
+second delivery durable before the paused sender completes. Shutdown discards
+four unfinished DATA jobs, joins the workers and leaves no additional message
+or receipt. These concurrency regressions run over plaintext and STARTTLS.
 
 This qualifies the plaintext direct-SMTP transport path in the prepared
 runtime. It does not activate a production PostgreSQL listener, qualify a new

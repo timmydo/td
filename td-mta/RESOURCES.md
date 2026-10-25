@@ -51,11 +51,11 @@ changing that validator requires an explicit atomic implementation update.
 | Account startup metadata | 1 | 20971520 | 20971520 |
 | Cold reload overlap | 1 | 2097152 | 2097152 |
 | Process and allocator allowance | 1 | 8388608 | 8388608 |
-| SMTP fanout metadata | 1 | 2097152 | 2097152 |
-| **Total** | | | **101434624** |
+| SMTP fanout metadata | 4 | 2097152 | 8388608 |
+| **Total** | | | **107726080** |
 
-The total is approximately 96.74 MiB against a 128 MiB configured budget;
-the remaining 32783104 bytes are unassigned headroom, not another cache.
+The total is approximately 102.74 MiB against a 128 MiB configured budget;
+the remaining 26491648 bytes are unassigned headroom, not another cache.
 The default process ledger excludes database-server memory and WAL mappings.
 The two default TLS handshakes remain configurable within the process budget.
 The 64 MiB idle and 128 MiB workload RSS figures are provisional goals under
@@ -3724,7 +3724,7 @@ The same method meter survives all messages and transformations. Decoding,
 preview extraction and JSON stages retain their original cumulative charges;
 a small requested preview can still hit the work ceiling while validating a
 large source. The response spool cap independently limits emitted bytes.
-Default planned total is 101434624 bytes under the unchanged 128 MiB budget;
+Default planned total is 107726080 bytes under the unchanged 128 MiB budget;
 capacity-growth fixtures rebalance disposable cache within that budget.
 These are bounded implementation allocations and planner figures, not a new
 whole-service RSS or large-mailbox qualification claim.
@@ -4483,8 +4483,9 @@ body-operation admission, response retention or authentication rate budgets.
 
 ## SMTP fanout metadata
 
-The fixed receiving job retains at most sixteen per-account encoded recipient
-buffers of 32 KiB each. A separate 2-MiB reservation covers those buffers,
+Each of at most four admitted receiving jobs retains at most sixteen per-account
+encoded recipient buffers of 32 KiB each. A separate 2-MiB reservation per job
+covers those buffers,
 original and private receipt/provenance copies during preparation and historical
 inspection, and bounded account metadata. Header anchors and prepared body bytes
 are shared across targets and retained operation copies. Recipient count and
@@ -4493,6 +4494,20 @@ allowance includes the resolved account ID. No incoming body buffer, storage
 worker, outgoing transport or read pool is multiplied by account count. The
 original meter prepays publication I/O for every target, so a large fanout may
 refuse within the fixed work allowance even when each mailbox has quota.
+
+The PostgreSQL SMTP adapter separately admits at most four resident incoming
+DATA buffers, each reserved up front to the configured message ceiling minus
+trace allowance. A paused sender retains its buffer and permit but no database
+connection or storage-worker execution time. The singleton storage worker
+serializes preparation and publication, retaining at most one additional
+filtered body and one uncertain operation. At the 32-MiB message ceiling the
+incoming capacities total at most 128 MiB and filtered payload at most another
+32 MiB. The growable filtered buffer can reserve more capacity than its length;
+native database/protocol allocations remain additional. These body allocations
+are additional to the planning ledger above, as are the active attachment and
+relay reservations. The four-job bound prevents connection-count amplification
+but does not qualify the provisional 128-MiB workload RSS goal. Saturation waits
+before 354 within the original admission deadline; it allocates no fifth body.
 
 
 ## Relay account registry

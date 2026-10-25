@@ -180,7 +180,7 @@ fn https_enforces_auth_origin_framing_revocation_and_idle_deadlines() {
     let resolved = resolved(&source);
     let resource = Limits {
         https_connections: 32,
-        json_bytes: 512 * 1024,
+        json_bytes: 384 * 1024,
         json_tokens: 16384,
         ..Limits::default()
     }

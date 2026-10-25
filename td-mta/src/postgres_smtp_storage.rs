@@ -24,7 +24,7 @@ pub struct Backend<'a> {
     owner: Receiving<'a>,
     clock: Arc<RuntimeClock>,
     generation: u64,
-    admitted: AtomicBool,
+    admitted: [AtomicBool; crate::limits::SMTP_DATA_JOBS],
     stopped: AtomicBool,
 }
 impl<'a> Backend<'a> {
@@ -42,7 +42,7 @@ impl<'a> Backend<'a> {
             owner,
             clock,
             generation,
-            admitted: AtomicBool::new(false),
+            admitted: [const { AtomicBool::new(false) }; crate::limits::SMTP_DATA_JOBS],
             stopped: AtomicBool::new(false),
         })
     }
@@ -60,7 +60,6 @@ enum Stage {
 }
 pub struct Delivery<'a, 'b> {
     backend: &'a Backend<'b>,
-    _permit: Permit<'a>,
     meter: Meter,
     deadline: Deadline,
     stage: Stage,
@@ -77,6 +76,8 @@ pub struct Delivery<'a, 'b> {
     extended: bool,
     header_bytes: usize,
     received_at: i64,
+    // Release capacity after this job's resident allocations have been dropped.
+    _permit: Permit<'a>,
 }
 impl<'b> Storage for Backend<'b> {
     type Job<'a>
@@ -128,10 +129,16 @@ impl<'b> Storage for Backend<'b> {
         if self.stopped() {
             return Err(Failure::Refused(Error::WriterStopped));
         }
-        self.admitted
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .map_err(|_| Failure::Retry)?;
-        let permit = Permit(&self.admitted);
+        let permit = self
+            .admitted
+            .iter()
+            .find(|admitted| {
+                admitted
+                    .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+            })
+            .map(Permit)
+            .ok_or(Failure::Retry)?;
         let limits = self.owner.binding.work();
         let maximum = input.session.incoming_limit();
         let mut meter = Meter::new(
@@ -217,7 +224,6 @@ impl<'b> Storage for Backend<'b> {
         charge(&self.clock, &mut meter, Charge::default())?;
         Ok(Delivery {
             backend: self,
-            _permit: permit,
             meter,
             deadline: input.deadline,
             stage: Stage::Writing,
@@ -234,11 +240,15 @@ impl<'b> Storage for Backend<'b> {
             extended,
             header_bytes: input.header_bytes,
             received_at: time.utc_ms,
+            _permit: permit,
         })
     }
 }
 impl Delivery<'_, '_> {
     fn write_inner(&mut self, bytes: &[u8]) -> Result<(), Failure> {
+        if self.backend.stopped() {
+            return Err(Failure::Refused(Error::WriterStopped));
+        }
         if !matches!(self.stage, Stage::Writing) || bytes.len() > 1000 || !bytes.ends_with(b"\r\n")
         {
             return Err(Failure::Refused(Error::Invalid));
@@ -277,6 +287,9 @@ impl Job for Delivery<'_, '_> {
         if let Some(error) = self.failure {
             return Err(error);
         }
+        if self.backend.stopped() {
+            return Err(Failure::Refused(Error::WriterStopped));
+        }
         if !matches!(self.stage, Stage::Writing) {
             return Err(Failure::Refused(Error::Conflict));
         }
@@ -302,6 +315,9 @@ impl Job for Delivery<'_, '_> {
         let Stage::Prepared(deadline) = self.stage else {
             return Err(Failure::Refused(Error::Conflict));
         };
+        if self.backend.stopped() {
+            return Err(Failure::Refused(Error::WriterStopped));
+        }
         self.stage = Stage::Done;
         charge(
             &self.backend.clock,
