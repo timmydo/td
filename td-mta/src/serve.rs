@@ -274,7 +274,7 @@ fn run_once(options: &Options, reload: &AtomicBool) -> Result<(), ConfigFailure>
                             resources,
                             td_mta::jmap_session::Concurrency {
                                 uploads: 1,
-                                requests: 1,
+                                requests: resources.https_body_workers(),
                             },
                         )
                         .map_err(|error| adapter("session", error))?;

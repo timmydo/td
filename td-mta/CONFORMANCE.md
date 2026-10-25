@@ -419,7 +419,7 @@ which the services inherit. Each scenario prints one `td-mta-perf
   the desktop process's RSS and the database deltas.
 - `jmap_concurrent`: readers each download the whole mailbox from
   different offsets while one more client repeats an `Email/query`, so
-  downloads and API calls contend for the one body slot. It reports
+  downloads and API calls contend for the bounded body-worker pool. It reports
   download and query latency, throughput, refusals per endpoint, RSS and
   the database deltas.
 - `idle_after_intake`: the first idle window's measures again, with both
@@ -434,7 +434,7 @@ JMAP scenarios therefore measure contention at that rate and no
 higher. Latencies exclude that pacing but
 include the TLS handshake and the fixture TLS client, which polls in
 millisecond steps and builds its configuration per connection. Every
-collision on the shared body slot is a 429: one whose body names
+refusal at the full shared body-worker pool is a 429: one whose body names
 `maxConcurrentRequests` is a refused API call (`429_api_slot`), a plain
 one a refused download. A 503 is a storage or service failure, not
 contention. Each is retried after 50 ms, at most 1000 times; any other

@@ -35,27 +35,27 @@ changing that validator requires an explicit atomic implementation update.
 | SMTP slots | 8 | 376064 | 3008512 |
 | HTTPS slots | 8 | 1703936 | 13631488 |
 | Body/search jobs | 2 | 1310720 | 2621440 |
-| Storage read views | 2 | 299008 | 598016 |
+| Storage read views | 4 | 299008 | 1196032 |
 | Resident index cache | 1 | 4194304 | 4194304 |
 | Outbound slots | 1 | 572672 | 572672 |
 | Sort runs and merge buffers | 1 | 1048576 | 1048576 |
 | Log queue and formatting | 1 | 131072 | 131072 |
 | DNS, ACME and control scratch | 1 | 524288 | 524288 |
 | Slot queues and queue window | 1 | 131072 | 131072 |
-| Fixed worker stacks | 8 | 262144 | 2097152 |
+| Fixed worker stacks | 9 | 262144 | 2359296 |
 | Main stack allowance | 1 | 1048576 | 1048576 |
 | TLS session headroom | 17 | 524288 | 8912896 |
 | TLS handshake headroom | 2 | 4194304 | 8388608 |
-| Established TLS processing | 1 | 4194304 | 4194304 |
+| Established TLS processing | 2 | 4194304 | 8388608 |
 | Certificate generations | 2 | 8388608 | 16777216 |
 | Account startup metadata | 1 | 20971520 | 20971520 |
 | Cold reload overlap | 1 | 2097152 | 2097152 |
 | Process and allocator allowance | 1 | 8388608 | 8388608 |
 | SMTP fanout metadata | 4 | 2097152 | 8388608 |
-| **Total** | | | **107726080** |
+| **Total** | | | **112780544** |
 
-The total is approximately 102.74 MiB against a 128 MiB configured budget;
-the remaining 26491648 bytes are unassigned headroom, not another cache.
+The total is approximately 107.56 MiB against a 128 MiB configured budget;
+the remaining 21437184 bytes are unassigned headroom, not another cache.
 The default process ledger excludes database-server memory and WAL mappings.
 The two default TLS handshakes remain configurable within the process budget.
 The 64 MiB idle and 128 MiB workload RSS figures are provisional goals under
@@ -3309,8 +3309,17 @@ control request/reply buffers have 256-byte/12-KiB caps. Successful publication
 precedes password output. Authentication attempts use a fixed 64-entry table,
 64 attempts globally and eight per IP per one-second monotonic window. Native
 work already executing is joined on shutdown, not forcibly canceled. The
-current HTTPS profile uses a separate fixed body worker for uploads, raw
-downloads and retained Core API responses; ADMISSION.md owns those lifetimes.
+current HTTPS profile uses at most two fixed body workers for uploads, raw
+downloads and retained Core API responses. Worker count is the smaller of
+two, `body_jobs` and `storage_views / 2`; each exchange reserves capacity for
+its snapshot and fresh authorization read. Startup refuses a zero worker
+count. Four default read views permit both workers; explicit two/three-view
+configurations or `body_jobs=1` retain one. Each admitted exchange owns one
+RAII permit through flushing or retirement, so an error cannot release
+another worker's capacity. Client mutex ownership keeps each exchange on
+one worker at a time. Uploads additionally own a single ingress permit,
+matching the shared native upload buffer and advertised upload concurrency.
+ADMISSION.md owns request lifetimes.
 Discovery retires the 32 KiB credential head and decoded credentials before
 allocating its at-most 32 KiB Session response. EventSource retains only its fixed frame and passive
 snapshot; it never holds a store view or a response file. The prepared
@@ -3737,7 +3746,7 @@ The same method meter survives all messages and transformations. Decoding,
 preview extraction and JSON stages retain their original cumulative charges;
 a small requested preview can still hit the work ceiling while validating a
 large source. The response spool cap independently limits emitted bytes.
-Default planned total is 107726080 bytes under the unchanged 128 MiB budget;
+Default planned total is 112780544 bytes under the unchanged 128 MiB budget;
 capacity-growth fixtures rebalance disposable cache within that budget.
 These are bounded implementation allocations and planner figures, not a new
 whole-service RSS or large-mailbox qualification claim.
@@ -3757,9 +3766,9 @@ the platform's `usize` range, or rebalance cache, concurrency and object
 limits. Raising the budget does not raise any individual bound or allocate
 an arena of that size. The provisional default remains 128 MiB pending
 representative concurrent peak measurements. The capacity-growth fixture
-also retains a 32-HTTPS-connection configuration with `json_bytes=393216`
-and `json_tokens=16384`, keeping the default index cache. Its plan requires
-131843328 bytes; it is one way to fit within the default, not a requirement.
+also retains a 32-HTTPS-connection configuration with `json_bytes=327680`
+and `json_tokens=8192`, keeping the default index cache. Its plan requires
+130606336 bytes; it is one way to fit within the default, not a requirement.
 CONFIG.md's resource validation uses this same combined plan; independent
 scalar maxima do not establish admission. Selection additionally retains up
 to 64 names (264 bytes each) and their parsed header properties, bounded by
@@ -3777,8 +3786,8 @@ quoted-printable, empty parts and forged ranges/encoding/container requests.
 
 The native td-mail read fixture exercises these workers serially through the
 real fetch transport with four small messages, including an interpretation
-refusal. It is functional evidence only. The single body worker and existing
-request/authentication ceilings remain unchanged; this fixture makes no
+refusal. It is functional evidence only. It does not qualify the bounded
+body-worker pool or change authentication ceilings; this fixture makes no
 latency, concurrent-reader or whole-service RSS qualification claim.
 
 Shared-worker pressure returns 429 with Retry-After: 1, including at the

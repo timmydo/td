@@ -216,7 +216,28 @@ pub(super) fn exercise(
             &fixture.ca,
             td_crypto::TlsProtocol::Http1,
         );
-        write!(tls, "POST /jmap/upload/{account_wire} HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: Basic {}\r\nContent-Type: application/octet-stream\r\nContent-Length: 3\r\nConnection: close\r\n\r\n", https_address.port(), encoded).unwrap();
+        write!(tls, "POST /jmap/upload/{account_wire} HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: Basic {}\r\nContent-Type: application/octet-stream\r\nContent-Length: 3\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n", https_address.port(), encoded).unwrap();
+        tls.flush().unwrap();
+        let mut interim = [0; 25];
+        tls.read_exact(&mut interim).unwrap();
+        assert_eq!(&interim, b"HTTP/1.1 100 Continue\r\n\r\n");
+        // The actual native ingress is held until the first body arrives.
+        let (mut overlap, _) = super::smtp_transport::upgrade_protocol(
+            TcpStream::connect(https_address).unwrap(),
+            Arc::new(td_mta::clock::RuntimeClock::new()),
+            &fixture.ca,
+            td_crypto::TlsProtocol::Http1,
+        );
+        write!(overlap, "POST /jmap/upload/{account_wire} HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: Basic {}\r\nContent-Type: application/octet-stream\r\nContent-Length: 3\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n", https_address.port(), encoded).unwrap();
+        overlap.flush().unwrap();
+        let mut refused = String::new();
+        overlap.read_to_string(&mut refused).unwrap();
+        assert!(refused.starts_with("HTTP/1.1 429"), "{refused}");
+        assert!(refused.to_ascii_lowercase().contains("retry-after: 1"));
+        let echoed = post(
+            r#"{"using":["urn:ietf:params:jmap:core"],"methodCalls":[["Core/echo",{"heldUpload":true},"overlap"]]}"#,
+        );
+        assert_eq!(echoed["methodResponses"][0][0].as_str(), Some("Core/echo"));
         tls.write_all(&[0, 1, 255]).unwrap();
         tls.flush().unwrap();
         let mut reply = String::new();
@@ -616,8 +637,14 @@ pub(super) fn exercise(
     super::acme::publish_fixture_pair(fixture);
     let until = std::time::Instant::now() + Duration::from_secs(50);
     loop {
-        assert!(cloud.0.try_wait().unwrap().is_none());
-        assert!(desktop.0.try_wait().unwrap().is_none());
+        for (profile, child) in [("cloud", &mut cloud), ("desktop", &mut desktop)] {
+            let status = child.0.try_wait().unwrap();
+            assert!(
+                status.is_none(),
+                "{profile} exited during certificate reload: {status:?}: {}",
+                fs::read_to_string(local.join(format!("{profile}-output"))).unwrap()
+            );
+        }
         if ["cloud", "desktop"].iter().all(|profile| {
             fs::read_to_string(local.join(format!("{profile}-output")))
                 .unwrap()

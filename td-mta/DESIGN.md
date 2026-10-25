@@ -1280,8 +1280,8 @@ heap, WAL and page resources; the process ledger does not bound that server. Mai
 live work and preserve foreground progress.
 
 Event-source streams hold connection slots but no storage read view between
-events. RESOURCES.md proposes nonblocking main-thread scheduling and eight
-workers across six roles; event peers cannot occupy request/commit/control
+events. RESOURCES.md proposes nonblocking main-thread scheduling and nine
+planned worker stacks across fixed roles; event peers cannot occupy request/commit/control
 workers. Use safe std with a bounded round-robin socket scan and a wait
 based on deadlines, using the current proposed five-millisecond quantum.
 Established TLS record work is bounded per slot; disk, dial, handshake and DNS jobs use
@@ -1317,7 +1317,7 @@ Initial default ceilings (validated together at startup):
 | JMAP object IDs per get/set / query page | 256 / 256 |
 | JSON nesting / parser tokens per request | 32 / 32768 |
 | Combined resident index cache | 4 MiB |
-| Storage read views | 2, each with bounded row/key/cursor scratch and a database snapshot |
+| Storage read views | 4, each with bounded row/key/cursor scratch and a database snapshot |
 | Bodies retained by upload leases | 128 MiB per account, expiry after 24 hours |
 | Retained submission storage | 256 MiB and 1000 submissions |
 | Maintenance sort scratch on disk | 64 MiB per account |
@@ -2052,10 +2052,12 @@ immediately, while SMTP retains its orderly final-reply behavior. Fixed
 native/kernel work already running must return before joins complete.
 
 Authenticated raw downloads now use GET on the fixed download template.
-The body worker is shared with uploads and API requests and holds one permit
-through flushing. Every collision for this shared permit returns HTTP 429
+The bounded body-worker pool is shared with uploads and API requests. It
+runs up to two exchanges, limited by `body_jobs` and two read views per
+worker. Each exchange owns a permit through flushing or retirement.
+A full pool returns HTTP 429
 with Retry-After: 1 and emits a bounded admission-refused application event;
-API collisions also carry the JMAP maxConcurrentRequests problem. Actual
+Refused API calls also carry the JMAP maxConcurrentRequests problem. Actual
 storage/service failures remain distinct from this temporary contention. It verifies the blob before headers, then streams under the same
 snapshot and exchange deadline; storage owns account/device access. Filename
 and media template values are decoded once and cannot inject response

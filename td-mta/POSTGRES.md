@@ -5119,6 +5119,17 @@ reauthorization, Email/query pagination/counts and thread membership windows.
 Their nullable parameters retain explicit bytea or bigint types; predicates,
 ordering, result-cardinality checks and authorization boundaries are unchanged.
 
+HTTPS uses up to two body workers, each retaining its own request snapshot,
+credentials and original deadline. The worker count reserves two read slots
+per concurrent exchange for verification plus fresh authorization. Session
+API concurrency advertises this same configured worker count; upload
+concurrency remains one because the native ingress buffer is shared. A
+separate upload permit refuses overlapping uploads with 429 before backend
+admission, without preventing an independent API/download exchange. No read
+result or authority crosses workers. Existing pending-publication guards
+still serialize or refuse conflicting mutations; parallel readers do not
+promise parallel writes or change unknown-COMMIT settlement.
+
 Native fixtures verify two checks on one backend, idle state after rollback,
 and an independent connection acquiring exclusive migration and conflicting
 row locks between turns. Policy, runtime-role, privilege and reply changes refuse the

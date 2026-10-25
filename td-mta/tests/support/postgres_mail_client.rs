@@ -216,7 +216,7 @@ pub(super) fn exercise(
         resources,
         td_mta::jmap_session::Concurrency {
             uploads: 1,
-            requests: 1,
+            requests: resources.https_body_workers(),
         },
     )
     .unwrap();

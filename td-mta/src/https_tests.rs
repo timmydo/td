@@ -194,8 +194,8 @@ fn https_enforces_auth_origin_framing_revocation_and_idle_deadlines() {
     let resolved = resolved(&source);
     let resource = Limits {
         https_connections: 32,
-        json_bytes: 384 * 1024,
-        json_tokens: 16384,
+        json_bytes: 320 * 1024,
+        json_tokens: 8192,
         ..Limits::default()
     }
     .plan()
@@ -678,7 +678,12 @@ fn download_failures_release_shared_slot_and_shutdown_joins_streaming() {
         .replace("127.0.0.1:443", &address.to_string());
     let lease = material.published(&source);
     let resolved = resolved(&source);
-    let resource = Limits::default().plan().unwrap();
+    let resource = Limits {
+        body_jobs: 1,
+        ..Limits::default()
+    }
+    .plan()
+    .unwrap();
     let admission = DiskLimits::default()
         .plan(&resource, WorkLimits::default(), ViewMode::OnlineBackground)
         .unwrap();
@@ -1018,7 +1023,7 @@ fn account_and_allowed_origin_select_private_session_and_backend() {
             &resource,
             crate::jmap_session::Concurrency {
                 uploads: 1,
-                requests: 1,
+                requests: resource.https_body_workers(),
             },
         )
         .unwrap(),
@@ -1082,6 +1087,158 @@ fn account_and_allowed_origin_select_private_session_and_backend() {
             assert_eq!(second_alias.calls.load(Ordering::Relaxed), 1);
             assert_eq!(first.calls.load(Ordering::Relaxed), 1);
             assert_eq!(second.calls.load(Ordering::Relaxed), 1);
+            drop(stop);
+            worker.join().unwrap().unwrap();
+        });
+    }).unwrap();
+}
+
+#[test]
+fn two_body_workers_keep_other_permits_when_an_exchange_fails() {
+    use crate::https_download::Failure;
+    struct Parallel {
+        entered: AtomicU64,
+        release: AtomicBool,
+        fail_next: AtomicBool,
+    }
+    impl Parallel {
+        fn exchange(
+            &self,
+            transport: &mut dyn Transport,
+            control: &Control,
+        ) -> Result<(), Failure> {
+            if self.fail_next.swap(false, Ordering::AcqRel) {
+                return Err(Failure::Before(Error::Corrupt));
+            }
+            self.entered.fetch_add(1, Ordering::AcqRel);
+            wait(|| control.stop_requested() || self.release.load(Ordering::Acquire));
+            if control.stop_requested() {
+                return Err(Failure::Started(Error::Deadline));
+            }
+            let bytes = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+            let mut offset = 0;
+            wait(|| {
+                if offset < bytes.len() {
+                    match transport.write(&bytes[offset..]).unwrap() {
+                        IoProgress::Bytes(n) => offset += n,
+                        IoProgress::Pending => (),
+                        IoProgress::Closed => panic!("closed before test response"),
+                    }
+                    false
+                } else {
+                    transport.flush().unwrap() == FlushProgress::Complete
+                }
+            });
+            Ok(())
+        }
+    }
+    impl crate::https_upload::Backend for Parallel {
+        fn account(&self) -> AccountId {
+            AccountId::from_bytes([0xaa; 16])
+        }
+        fn receive(
+            &self,
+            _: crate::https_upload::Request<'_>,
+            _: &mut dyn Transport,
+            _: &Control,
+        ) -> Result<crate::https_upload::Response, Error> {
+            Err(Error::Invalid)
+        }
+        fn download(
+            &self,
+            _: crate::https_download::Request<'_>,
+            transport: &mut dyn Transport,
+            control: &Control,
+        ) -> Result<(), Failure> {
+            self.exchange(transport, control)
+        }
+        fn api(
+            &self,
+            _: crate::https_api::Request<'_>,
+            transport: &mut dyn Transport,
+            control: &Control,
+        ) -> Result<(), Failure> {
+            self.exchange(transport, control)
+        }
+    }
+    let _serial = serial();
+    let mut devices = TestCredentials::new(AccountId::from_bytes([0xaa; 16]));
+    let (_, password) = devices
+        .create(
+            "parallel",
+            1,
+            &mut td_crypto::SystemEntropy::try_new().unwrap(),
+        )
+        .unwrap();
+    let authorization = base64(&[b"private-user:".as_slice(), password.expose()].concat());
+    let devices = Mutex::new(devices);
+    let material = Material::new();
+    let socket = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = socket.local_addr().unwrap();
+    let origin_text = format!("https://localhost:{}", address.port());
+    let source = source(false)
+        .replace("https://localhost", &origin_text)
+        .replace("127.0.0.1:443", &address.to_string());
+    let lease = material.published(&source);
+    let resolved = resolved(&source);
+    let resource = Limits::default().plan().unwrap();
+    let admission = DiskLimits::default()
+        .plan(&resource, WorkLimits::default(), ViewMode::OnlineBackground)
+        .unwrap();
+    let timeouts = NetworkLimits::default().plan(&admission).unwrap();
+    let clock = Arc::new(Now(Instant::now(), AtomicU64::new(0)));
+    let backend = Parallel {
+        entered: AtomicU64::new(0),
+        release: AtomicBool::new(false),
+        fail_next: AtomicBool::new(false),
+    };
+    let ready = AtomicBool::new(false);
+    let control = Control::default();
+    let handshakes = HandshakePool::new(2).unwrap();
+    resolved.candidate().with_graph(|records, graph| {
+        let rows = records.view(graph).unwrap().listeners().unwrap();
+        let row = (0..rows.len()).filter_map(|i| rows.listener(i).unwrap()).find(|r| r.kind == Kind::Https).unwrap();
+        let listeners = [BoundListener::new(socket, row, &lease).unwrap()];
+        let server = Https {
+            backends: &[&backend], listeners: &listeners, policies: &lease,
+            handshakes: &handshakes, authentication: &devices,
+            origins: &[Origin::parse(&origin_text).unwrap()], resources: &resource,
+            timeouts: &timeouts, clock: clock.clone(), ready: &ready,
+        };
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| server.run(&control));
+            let stop = Stop(&control);
+            wait(|| ready.load(Ordering::Acquire));
+            let account = format!("a{}", "aa".repeat(16));
+            let get = format!("GET /jmap/download/{account}/b{}/a?type=text%2Fplain HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: Basic {authorization}\r\n\r\n", "11".repeat(16), address.port());
+            let api = format!("POST /jmap/api HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: Basic {authorization}\r\nContent-Type: application/json\r\nContent-Length: 0\r\n\r\n", address.port());
+            let mut first = client(address, &lease, clock.clone());
+            send(&mut first, get.as_bytes());
+            wait(|| backend.entered.load(Ordering::Acquire) == 1);
+            backend.fail_next.store(true, Ordering::Release);
+            let mut failed = client(address, &lease, clock.clone());
+            send(&mut failed, api.as_bytes());
+            assert_eq!(full_reply(&mut failed).0, 503);
+            let mut scratch = [0; 1024];
+            wait(|| matches!(failed.read(&mut scratch), Ok(IoProgress::Closed) | Err(_)));
+            let mut second = client(address, &lease, clock.clone());
+            send(&mut second, api.as_bytes());
+            wait(|| backend.entered.load(Ordering::Acquire) == 2);
+            let mut full = client(address, &lease, clock.clone());
+            send(&mut full, get.as_bytes());
+            assert_eq!(full_reply(&mut full).0, 429);
+            full.abort();
+            backend.release.store(true, Ordering::Release);
+            assert_eq!(full_reply(&mut first).0, 200);
+            assert_eq!(full_reply(&mut second).0, 200);
+            for connection in [&mut first, &mut second] {
+                wait(|| matches!(connection.read(&mut scratch), Ok(IoProgress::Closed) | Err(_)));
+            }
+            let mut again = client(address, &lease, clock.clone());
+            send(&mut again, get.as_bytes());
+            assert_eq!(full_reply(&mut again).0, 200);
+            assert_eq!(backend.entered.load(Ordering::Acquire), 3);
+            wait(|| matches!(again.read(&mut scratch), Ok(IoProgress::Closed) | Err(_)));
             drop(stop);
             worker.join().unwrap().unwrap();
         });

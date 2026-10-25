@@ -94,7 +94,7 @@ struct Client {
     principal: Option<http_auth::Principal>,
     credentials: Option<http_auth::BasicCredentials>,
     authentication: Option<Result<Option<http_auth::Principal>, Error>>,
-    body_slot: bool,
+    body_slot: Option<BodyPermit>,
     events: Option<EventState>,
     stop_after_response: bool,
     absolute: Deadline,
@@ -114,6 +114,80 @@ impl Drop for Client {
         std::hint::black_box(&mut self.input);
     }
 }
+struct BodyPool {
+    active: Arc<AtomicU8>,
+    uploading: Arc<AtomicBool>,
+    maximum: u8,
+}
+impl BodyPool {
+    fn admit(&self, slot: &mut Option<BodyPermit>, upload: bool) -> bool {
+        if slot.is_some() {
+            return false;
+        }
+        let upload = if upload {
+            if self
+                .uploading
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return false;
+            }
+            Some(UploadPermit(self.uploading.clone()))
+        } else {
+            None
+        };
+        let mut active = self.active.load(Ordering::Acquire);
+        for _ in 0..3 {
+            if active >= self.maximum {
+                return false;
+            }
+            match self.active.compare_exchange(
+                active,
+                active + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    *slot = Some(BodyPermit {
+                        active: self.active.clone(),
+                        _upload: upload,
+                    });
+                    return true;
+                }
+                Err(current) => active = current,
+            }
+        }
+        false
+    }
+}
+struct UploadPermit(Arc<AtomicBool>);
+impl Drop for UploadPermit {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+struct BodyPermit {
+    active: Arc<AtomicU8>,
+    _upload: Option<UploadPermit>,
+}
+impl Drop for BodyPermit {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+struct BodyFinish<'a, 'scope> {
+    done: &'a AtomicBool,
+    workers: &'a [std::thread::ScopedJoinHandle<'scope, ()>],
+}
+impl Drop for BodyFinish<'_, '_> {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::Release);
+        for worker in self.workers {
+            worker.thread().unpark();
+        }
+    }
+}
+
 struct Finish<'a> {
     done: &'a AtomicBool,
     worker: &'a std::thread::Thread,
@@ -238,7 +312,7 @@ impl Https<'_> {
         }
         for session in self.backends.iter().filter_map(|backend| backend.session()) {
             if self.resources.limits().event_streams == 0
-                || session.concurrency().requests != 1
+                || session.concurrency().requests != self.resources.https_body_workers()
                 || session.concurrency().uploads != 1
             {
                 return Err(Error::Invalid);
@@ -253,8 +327,17 @@ impl Https<'_> {
             .map_err(|_| Error::Capacity)?;
         slots.extend((0..count).map(|_| Mutex::new(None)));
         let done = AtomicBool::new(false);
-        let body_active = AtomicU8::new(0);
-        let body_warm = AtomicBool::new(false);
+        let body_count =
+            u8::try_from(self.resources.https_body_workers()).map_err(|_| Error::Invalid)?;
+        if body_count == 0 {
+            return Err(Error::Capacity);
+        }
+        let body_active = BodyPool {
+            active: Arc::new(AtomicU8::new(0)),
+            uploading: Arc::new(AtomicBool::new(false)),
+            maximum: body_count,
+        };
+        let body_warm = AtomicU8::new(0);
         std::thread::scope(|scope| {
             let worker = std::thread::Builder::new()
                 .name("https-tls".into())
@@ -286,57 +369,31 @@ impl Https<'_> {
                 done: &done,
                 worker: worker.thread(),
             };
-            let uploader = match std::thread::Builder::new()
-                .name("https-body".into())
-                .spawn_scoped(scope, || {
-                    if td_crypto::SystemEntropy::try_new().is_err() {
-                        control.fail();
-                        return;
-                    }
-                    body_warm.store(true, Ordering::Release);
-                    while !done.load(Ordering::Acquire) {
-                        for cell in &slots {
-                            let mut slot = match cell.try_lock() {
-                                Ok(slot) => slot,
-                                Err(TryLockError::WouldBlock) => continue,
-                                Err(_) => {
-                                    control.fail();
-                                    return;
-                                }
-                            };
-                            let Some(client) = slot.as_mut().filter(|c| {
-                                matches!(c.phase, Phase::Upload | Phase::Download | Phase::Api)
-                            }) else {
-                                continue;
-                            };
-                            let result = if client.phase == Phase::Download {
-                                self.download(client, control)
-                            } else if client.phase == Phase::Api {
-                                self.api(client, control)
-                            } else {
-                                self.upload(client, control)
-                            };
-                            if result.is_err() {
-                                if client.stop_after_response {
-                                    control.fail();
-                                }
-                                *slot = None;
-                                body_active.store(0, Ordering::Release);
-                            }
+            let mut uploaders: Vec<std::thread::ScopedJoinHandle<'_, ()>> = Vec::new();
+            uploaders
+                .try_reserve_exact(usize::from(body_count))
+                .map_err(|_| Error::Capacity)?;
+            for index in 0..body_count {
+                match std::thread::Builder::new()
+                    .name(format!("https-body-{index}"))
+                    .spawn_scoped(scope, || {
+                        self.body_worker(&slots, &done, &body_warm, control)
+                    }) {
+                    Ok(worker) => uploaders.push(worker),
+                    Err(error) => {
+                        drop(finish);
+                        for uploader in uploaders {
+                            uploader.thread().unpark();
+                            let _ = uploader.join();
                         }
-                        std::thread::park_timeout(SCAN);
+                        let _ = worker.join();
+                        return Err(error.into());
                     }
-                }) {
-                Ok(worker) => worker,
-                Err(error) => {
-                    drop(finish);
-                    let _ = worker.join();
-                    return Err(error.into());
                 }
-            };
-            let upload_finish = Finish {
+            }
+            let upload_finish = BodyFinish {
                 done: &done,
-                worker: uploader.thread(),
+                workers: &uploaders,
             };
             let verifier = match std::thread::Builder::new()
                 .name("https-auth".into())
@@ -383,7 +440,9 @@ impl Https<'_> {
                 Err(error) => {
                     drop(upload_finish);
                     drop(finish);
-                    let _ = uploader.join();
+                    for uploader in uploaders {
+                        let _ = uploader.join();
+                    }
                     let _ = worker.join();
                     return Err(error.into());
                 }
@@ -392,16 +451,23 @@ impl Https<'_> {
                 done: &done,
                 worker: verifier.thread(),
             };
-            while !body_warm.load(Ordering::Acquire)
-                && !uploader.is_finished()
+            while body_warm.load(Ordering::Acquire) < body_count
+                && uploaders.iter().all(|worker| !worker.is_finished())
                 && !control.stop_requested()
             {
                 std::thread::park_timeout(SCAN);
             }
             let result = if control.stop_requested() {
                 Ok(())
-            } else if body_warm.load(Ordering::Acquire) {
-                self.network(&slots, &worker, &uploader, &verifier, &body_active, control)
+            } else if body_warm.load(Ordering::Acquire) == body_count {
+                self.network(
+                    &slots,
+                    &worker,
+                    &uploaders,
+                    &verifier,
+                    &body_active,
+                    control,
+                )
             } else {
                 Err(Error::WriterStopped)
             };
@@ -415,9 +481,11 @@ impl Https<'_> {
                 control.fail();
                 return Err(Error::WriterStopped);
             }
-            if uploader.join().is_err() {
-                control.fail();
-                return Err(Error::WriterStopped);
+            for uploader in uploaders {
+                if uploader.join().is_err() {
+                    control.fail();
+                    return Err(Error::WriterStopped);
+                }
             }
             if worker.join().is_err() {
                 control.fail();
@@ -435,6 +503,52 @@ impl Https<'_> {
             }
             result
         })
+    }
+    fn body_worker(
+        &self,
+        slots: &[Mutex<Option<Client>>],
+        done: &AtomicBool,
+        warm: &AtomicU8,
+        control: &Control,
+    ) {
+        if td_crypto::SystemEntropy::try_new().is_err() {
+            control.fail();
+            return;
+        }
+        warm.fetch_add(1, Ordering::Release);
+        while !done.load(Ordering::Acquire) {
+            for cell in slots {
+                let mut slot = match cell.try_lock() {
+                    Ok(slot) => slot,
+                    Err(TryLockError::WouldBlock) => continue,
+                    Err(_) => {
+                        control.fail();
+                        return;
+                    }
+                };
+                let Some(client) = slot.as_mut().filter(|client| {
+                    matches!(client.phase, Phase::Upload | Phase::Download | Phase::Api)
+                }) else {
+                    continue;
+                };
+                let result = if client.body_slot.is_none() {
+                    Err(Error::Invalid)
+                } else if client.phase == Phase::Download {
+                    self.download(client, control)
+                } else if client.phase == Phase::Api {
+                    self.api(client, control)
+                } else {
+                    self.upload(client, control)
+                };
+                if result.is_err() {
+                    if client.stop_after_response {
+                        control.fail();
+                    }
+                    *slot = None;
+                }
+            }
+            std::thread::park_timeout(SCAN);
+        }
     }
     fn authenticate(&self, client: &mut Client) -> Result<(), Error> {
         let mut timing = crate::performance::Timer::start(crate::performance::Phase::HttpAuth);
@@ -559,9 +673,9 @@ impl Https<'_> {
         &self,
         slots: &[Mutex<Option<Client>>],
         worker: &std::thread::ScopedJoinHandle<'_, ()>,
-        uploader: &std::thread::ScopedJoinHandle<'_, ()>,
+        uploaders: &[std::thread::ScopedJoinHandle<'_, ()>],
         verifier: &std::thread::ScopedJoinHandle<'_, ()>,
-        body_active: &AtomicU8,
+        body_active: &BodyPool,
         control: &Control,
     ) -> Result<(), Error> {
         for listener in self.listeners {
@@ -578,7 +692,10 @@ impl Https<'_> {
         let mut accept_after = Tick(0);
         let mut event_count = 0usize;
         while !control.stop_requested() {
-            if worker.is_finished() || uploader.is_finished() || verifier.is_finished() {
+            if worker.is_finished()
+                || uploaders.iter().any(|worker| worker.is_finished())
+                || verifier.is_finished()
+            {
                 control.fail();
                 return Err(Error::WriterStopped);
             }
@@ -628,20 +745,16 @@ impl Https<'_> {
                             event_count = event_count.checked_sub(1).ok_or(Error::Invalid)?;
                         }
                         if client.phase == Phase::Close
-                            && client.body_slot
+                            && client.body_slot.is_some()
                             && !client.stop_after_response
                         {
-                            client.body_slot = false;
-                            body_active.store(0, Ordering::Release);
+                            client.body_slot.take();
                         }
                     }
                     Err(Error::WriterStopped) => return Err(Error::WriterStopped),
                     Ok(false) | Err(_) => {
                         if client.stop_after_response {
                             return Err(Error::WriterStopped);
-                        }
-                        if client.body_slot {
-                            body_active.store(0, Ordering::Release);
                         }
                         if client.events.take().is_some() {
                             event_count = event_count.checked_sub(1).ok_or(Error::Invalid)?;
@@ -651,7 +764,9 @@ impl Https<'_> {
                 }
                 drop(slot);
                 if wake_body {
-                    uploader.thread().unpark();
+                    for uploader in uploaders {
+                        uploader.thread().unpark();
+                    }
                 }
                 if wake_auth {
                     verifier.thread().unpark();
@@ -754,7 +869,7 @@ impl Https<'_> {
                     principal: None,
                     credentials: None,
                     authentication: None,
-                    body_slot: false,
+                    body_slot: None,
                     events: None,
                     stop_after_response: false,
                     absolute,
@@ -774,7 +889,7 @@ impl Https<'_> {
         &self,
         client: &mut Client,
         attempts: &mut Attempts,
-        body_active: &AtomicU8,
+        body_active: &BodyPool,
         event_count: &mut usize,
         control: &Control,
     ) -> Result<bool, Error> {
@@ -862,13 +977,9 @@ impl Https<'_> {
                                         != Some(backend.account())
                                     {
                                         404
-                                    } else if body_active
-                                        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-                                        .is_err()
-                                    {
+                                    } else if !body_active.admit(&mut client.body_slot, true) {
                                         body_busy()
                                     } else {
-                                        client.body_slot = true;
                                         client.principal = Some(principal);
                                         client.phase = Phase::Upload;
                                         return Ok(true);
@@ -880,13 +991,9 @@ impl Https<'_> {
                                         || head.expect_continue
                                     {
                                         400
-                                    } else if body_active
-                                        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-                                        .is_err()
-                                    {
+                                    } else if !body_active.admit(&mut client.body_slot, false) {
                                         body_busy()
                                     } else {
-                                        client.body_slot = true;
                                         client.principal = Some(principal);
                                         client.phase = Phase::Download;
                                         return Ok(true);
@@ -900,10 +1007,7 @@ impl Https<'_> {
                                         })
                                     }) {
                                         415
-                                    } else if body_active
-                                        .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
-                                        .is_err()
-                                    {
+                                    } else if !body_active.admit(&mut client.body_slot, false) {
                                         let status = body_busy();
                                         control.log(
                                             crate::observability::Kind::AdmissionRefused {
@@ -915,7 +1019,6 @@ impl Https<'_> {
                                         return self.respond_body(client, status, time.utc_ms,
                                             br#"{"type":"urn:ietf:params:jmap:error:limit","status":429,"limit":"maxConcurrentRequests"}"#).map(|()| true);
                                     } else {
-                                        client.body_slot = true;
                                         client.principal = Some(principal);
                                         client.phase = Phase::Api;
                                         return Ok(true);

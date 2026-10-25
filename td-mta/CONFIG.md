@@ -254,9 +254,13 @@ remain enforced. A plan exceeding the configured budget is refused.
 For example, `memory_budget_bytes=268435456` permits a 256-MiB planning
 budget when increasing independently bounded concurrency. This is an example,
 not a measured default recommendation or an OS-enforced RSS limit. The
-current default plan is 107726080 bytes (about 102.74 MiB), including the
+current default plan is 112780544 bytes (about 107.56 MiB), including the
 4-MiB index cache. Four SMTP DATA jobs added 6 MiB of fanout metadata to the
-older one-job plan. Operators with a tightly sized explicit budget must
+older one-job plan. Two HTTPS body workers add two read views, one planned
+worker stack and one additional established-TLS processing allowance, about
+4.82 MiB. The default `storage_views` is four; explicit values of two or
+three retain one HTTPS body worker. `body_jobs=1` also retains one worker.
+Operators with a tightly sized explicit budget must
 revalidate it against the complete plan after upgrading. Keep the current
 default until representative concurrency measurements justify a change.
 
@@ -1818,9 +1822,11 @@ The authenticated download route is
 accessible raw blob or transfer-decoded direct MIME attachment; other methods
 receive 405 with Allow: GET. GET bodies
 and Expect are rejected. The name and media type are template values, not
-stored blob metadata. Downloads, uploads and API requests share one body
-worker. The independent advertised maxima are upper bounds; cross-kind
-contention receives 503. Same-kind contention receives 429.
+stored blob metadata. Downloads, uploads and API requests share the bounded
+body-worker pool (at most two workers). API concurrency advertises its
+configured count; uploads retain a separate one-exchange ceiling. These
+maxima are not additive reservations. Full-pool or upload-capacity
+contention receives 429 with Retry-After regardless of request kind.
 Raw downloads form part of the advertised Core capability.
 
 Authenticated POST `/jmap/api` now executes Core/echo, PushSubscription/get,
