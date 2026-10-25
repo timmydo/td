@@ -384,9 +384,9 @@ severity filter, global ingestion limit, retention ring and physical-pressure
 stop apply. There is no synchronous journal fallback and no per-request event
 flood. These info records require `minimum_severity = info`. Additional summaries
 can shorten history under the existing ring; 30 days remains an age ceiling,
-not a guaranteed retention interval. At the current 20-phase ceiling, four
-profiles add at most 1,920 hourly summary rows per day (plus initial snapshots).
-The 65,536-row ring can hold about 34 days of those rows alone; other events,
+not a guaranteed retention interval. At the current 21-phase ceiling, four
+profiles add at most 2,016 hourly summary rows per day (plus initial snapshots).
+The 65,536-row ring can hold about 32 days of those rows alone; other events,
 frequent restarts and physical pressure can shorten that interval.
 
 Each sample is a cumulative process observation: `calls` counts finished spans,
@@ -426,6 +426,7 @@ It is not exposed over public HTTP and supplies no mutation operation.
 | --- | --- |
 | `http_session`, `http_api`, `http_download`, `http_upload` | Complete parsed head through final response flush, including authentication queue/lookup and worker waiting; excludes TCP/TLS and header arrival |
 | `http_other` | Other parsed endpoints; event streams measure preparation only, not stream lifetime |
+| `http_tls` | First observed TCP input through TLS handshake completion, including handshake admission waiting; excludes silent accepted sockets and TCP establishment. Retirement before completion counts as failure |
 | `http_auth` | One authentication worker attempt, including credential parsing and database authorization |
 | `db_resolve` | The owned resolver helper and its complete reply |
 | `db_connect` | One attempted PostgreSQL connection, including local TLS setup, TCP and startup; excludes DNS and runtime qualification |

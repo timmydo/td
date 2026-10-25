@@ -265,10 +265,15 @@ fn https_enforces_auth_origin_framing_revocation_and_idle_deadlines() {
                     std::thread::sleep(Duration::from_millis(150));
                     drop((first, second));
                 });
+                let tls_before = crate::performance::snapshot(crate::performance::Phase::HttpTls).unwrap();
                 let mut queued = client(address, &lease, clock.clone());
                 queued.abort();
                 release.join().unwrap();
                 std::thread::sleep(Duration::from_millis(50));
+                let tls_after = crate::performance::snapshot(crate::performance::Phase::HttpTls).unwrap();
+                assert!(tls_after.calls > tls_before.calls);
+                assert!(tls_after.total_us > tls_before.total_us);
+                assert_eq!(tls_after.failures, tls_before.failures);
                 {
                     let mut plain = TcpStream::connect(address).unwrap();
                     plain
@@ -298,6 +303,8 @@ fn https_enforces_auth_origin_framing_revocation_and_idle_deadlines() {
                         Err(error) => error.kind() != io::ErrorKind::WouldBlock,
                     });
                 }
+                wait(|| crate::performance::snapshot(crate::performance::Phase::HttpTls)
+                    .is_some_and(|sample| sample.failures > tls_after.failures));
                 let host = format!("localhost:{}", address.port());
                 // Refuse misdirected traffic even while credential publication holds the lock.
                 let registry = devices.lock().unwrap();

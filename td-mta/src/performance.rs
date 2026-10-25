@@ -28,6 +28,7 @@ pub enum Phase {
     SmtpAdmission,
     SmtpCommit,
     DbClose,
+    HttpTls,
 }
 impl Phase {
     pub const ALL: &'static [Self] = &[
@@ -51,6 +52,7 @@ impl Phase {
         Self::SmtpAdmission,
         Self::SmtpCommit,
         Self::DbClose,
+        Self::HttpTls,
     ];
     pub const fn code(self) -> &'static str {
         match self {
@@ -74,6 +76,7 @@ impl Phase {
             Self::SmtpAdmission => "smtp_admission",
             Self::SmtpCommit => "smtp_commit",
             Self::DbClose => "db_close",
+            Self::HttpTls => "http_tls",
         }
     }
 }

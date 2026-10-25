@@ -501,6 +501,11 @@ impl Https<'_> {
                 }
                 Err(error) => return Err(error.into()),
             }
+            if client.timing.is_none() {
+                client.timing = Some(crate::performance::Timer::start(
+                    crate::performance::Phase::HttpTls,
+                ));
+            }
             let (input, output) = client.wire.take().ok_or(Error::Invalid)?;
             let prepared = match TlsPolicies::reserve_session(
                 self.policies.clone(),
@@ -539,6 +544,9 @@ impl Https<'_> {
         let now = self.clock.sample()?.monotonic;
         client.tls_at = Tick(now.0.checked_add(10).ok_or(Error::Invalid)?);
         if matches!(result, Handshake::Complete(_)) {
+            if let Some(timing) = client.timing.take() {
+                timing.finish(crate::performance::Outcome::Success);
+            }
             client.phase = Phase::Head;
             client.phase_deadline =
                 deadline(now, self.timeouts.limits().header_seconds)?.min(client.absolute);
