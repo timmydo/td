@@ -88,6 +88,14 @@ impl AuthenticationSession {
     pub(crate) fn reusable(&self, deadline: Instant) -> bool {
         !self.retired && self.worker.failed.is_none() && self.bounds.reusable(deadline)
     }
+    // Poll only an acknowledged idle session before queuing any job SQL.
+    pub(crate) fn check_idle(&mut self, deadline: Instant) -> Result<(), ports::Error> {
+        if !self.clean_idle || !self.reusable(deadline) {
+            return Err(ports::Error::Invalid);
+        }
+        self.worker.deadline = deadline;
+        self.worker.check().map_err(connection)
+    }
     pub(crate) fn needs_retirement(&self, now: Instant) -> bool {
         self.bounds.needs_retirement(now)
     }
@@ -107,8 +115,8 @@ impl AuthenticationSession {
         deadline: Instant,
     ) -> Result<Principal, ports::Error> {
         let result = self.turn(binding, presented, deadline);
-        if result.is_err() {
-            // Application refusals retire authority without poisoning a healthy
+        if result.is_err() && !(result == Err(ports::Error::Forbidden) && self.clean_idle) {
+            // Application failures retire authority without poisoning a healthy
             // protocol driver: its bounded Drop must still send Terminate.
             self.retired = true;
         }
@@ -148,11 +156,11 @@ impl AuthenticationSession {
                     super::qualify_runtime(client).await.map_err(connection)?;
                     client.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL idle_in_transaction_session_timeout=10000")
                         .await.map_err(|_| ports::Error::Invalid)?;
-                    postgres_snapshot::observe(client, &binding, presented)
-                        .await.map_err(|error| match error {
-                            postgres_snapshot::Error::Unauthenticated => ports::Error::Forbidden,
-                            _ => ports::Error::Invalid,
-                        })?;
+                    let authenticated = match postgres_snapshot::observe(client, &binding, presented).await {
+                        Ok(_) => true,
+                        Err(postgres_snapshot::Error::Unauthenticated) => false,
+                        Err(_) => return Err(ports::Error::Invalid),
+                    };
                     client.batch_execute("ROLLBACK").await.map_err(|_| ports::Error::Invalid)?;
                     let unlocked: bool = client.query_typed_one(
                         "SELECT pg_catalog.pg_advisory_unlock_shared($1)",
@@ -162,14 +170,14 @@ impl AuthenticationSession {
                     if !unlocked {
                         return Err(ports::Error::Invalid);
                     }
-                    Ok(Principal { account: binding.account(), device })
+                    Ok(authenticated.then_some(Principal { account: binding.account(), device }))
                 })
             })
             .map_err(connection)??;
         self.worker.check_deadline().map_err(connection)?;
         self.worker.finish_validation_turn().map_err(connection)?;
         self.clean_idle = true;
-        Ok(principal)
+        principal.ok_or(ports::Error::Forbidden)
     }
 }
 impl Drop for AuthenticationSession {

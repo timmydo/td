@@ -53,8 +53,8 @@ pub(super) fn exercise(
     body_checks::closed(fixture, &pid);
     assert_ne!(body_checks::backend(fixture), pid);
 
-    // A credential refusal retires the session but closes its open read
-    // transaction gracefully, rather than flooding PostgreSQL's failure log.
+    // A credential refusal rolls back and releases its locks before the
+    // same connection can authenticate the next presented credential.
     let failures = || {
         std::fs::read_to_string(fixture.root.join("server.log"))
             .unwrap()
@@ -103,14 +103,25 @@ pub(super) fn exercise(
     let index = wrong.len() - 5;
     wrong[index] = if wrong[index] == b'0' { b'1' } else { b'0' };
     assert_eq!(auth.authenticate("reader", &wrong, until(10_000)), Ok(None));
-    body_checks::closed(fixture, &pid);
+    assert_eq!(body_checks::backend(fixture), pid);
+    assert_eq!(sql(fixture, &format!("SELECT state||'|'||(xact_start IS NULL)::text FROM pg_catalog.pg_stat_activity WHERE pid={pid}")), "idle|true");
+    assert_eq!(
+        sql(
+            fixture,
+            &format!(
+                "SELECT pg_catalog.pg_try_advisory_xact_lock({})",
+                td_mta::postgres_schema::MIGRATION_KEY
+            )
+        ),
+        "t"
+    );
     assert_eq!(
         failures(),
         before,
-        "credential refusal must close gracefully"
+        "credential refusal must clean up gracefully"
     );
     assert_eq!(authenticate(), Ok(Some(principal)));
-    assert_ne!(body_checks::backend(fixture), pid);
+    assert_eq!(body_checks::backend(fixture), pid);
 
     let generation = sql(
         fixture,
@@ -158,11 +169,13 @@ pub(super) fn exercise(
         assert_ne!(body_checks::backend(fixture), pid);
     }
     let pid = body_checks::backend(fixture);
-    sql(
-        fixture,
-        &format!("SELECT pg_catalog.pg_terminate_backend({pid})"),
+    assert_eq!(
+        sql(
+            fixture,
+            &format!("SELECT pg_catalog.pg_terminate_backend({pid}, 5000)")
+        ),
+        "t",
     );
-    assert_eq!(authenticate(), Err(Error::Invalid));
     body_checks::closed(fixture, &pid);
     assert_eq!(authenticate(), Ok(Some(principal)));
     assert_ne!(body_checks::backend(fixture), pid);

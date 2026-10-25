@@ -6565,9 +6565,15 @@ session lock before BEGIN prevents a snapshot from retaining a pre-migration
 ledger after acquiring the barrier. This path calls no nested session-lock
 helper. Success requires acknowledged ROLLBACK, an acknowledged true result
 from the single matching advisory unlock, and a final deadline check. No
-transaction or migration/account lock survives between jobs. SQL/credential refusals, failed
-cleanup, expired jobs, framing failures and disconnected sessions retire the
-connection. A failure never silently retries the admitted job.
+transaction or migration/account lock survives between jobs. A wrong credential
+also requires acknowledged rollback, unlock and final checks before returning
+unauthenticated; that clean refusal retains the session without caching an
+authentication result. SQL failures, failed cleanup, expired jobs and framing
+failures retire the connection. Before submitting a later job, the adapter
+polls the clean idle driver without queuing SQL. An already-observable idle
+connection failure permits one fresh connection under the original deadline.
+A failure after job submission never silently retries the admitted job; a
+connection lost after the idle check can therefore still fail that request.
 
 A session admits at most 64 jobs within sixty seconds of creation. Each job
 keeps its own original deadline, capped at ten seconds including initial DNS,

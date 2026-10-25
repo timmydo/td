@@ -115,6 +115,13 @@ impl Authenticator for Authentication<'_> {
                 session.retire(deadline);
             }
         }
+        // An idle transport failure precedes this job: replacing it cannot
+        // replay SQL. Once authenticate starts, no failure retries the job.
+        if let Some(session) = state.session.as_mut() {
+            if session.check_idle(deadline).is_err() {
+                drop(state.session.take());
+            }
+        }
         let reused = state.session.is_some();
         if state.session.is_none() {
             state.session = Some(self.connect(deadline)?);
@@ -141,7 +148,13 @@ impl Authenticator for Authentication<'_> {
                 },
             );
         }
-        if result.is_err() {
+        if result.is_err()
+            && !(result == Err(Error::Forbidden)
+                && state
+                    .session
+                    .as_ref()
+                    .is_some_and(|session| session.reusable(deadline)))
+        {
             drop(state.session.take());
         }
         match result {
