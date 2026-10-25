@@ -64,6 +64,7 @@ pub mod td_install_qemu_protocol;
 #[path = "../../td-update/src/upstream.rs"]
 pub mod release_upstream;
 pub mod source_pins;
+pub mod source_watches;
 #[path = "../../td-profiler/src/contract.rs"]
 pub mod td_profiler_contract;
 pub mod types;

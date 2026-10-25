@@ -12,6 +12,8 @@ needs them:
 
 - Before changing files, read `DEVELOPMENT.md` completely. It carries the
   worktree, commit, review, ready, and submission workflow.
+- To find or bump outdated pins (sources, the Rust toolchain, the Debian
+  build root, Cargo locks), read `UPDATING.md`.
 - For application packaging or confinement, read `APPLICATIONS.md`.
 - Before changing or adding `unsafe`, read `UNSAFE.md` and the touched crate's
   normative document.

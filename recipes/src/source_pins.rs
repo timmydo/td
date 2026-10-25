@@ -11,6 +11,14 @@ struct PinDef {
     url: &'static str,
     sha256: &'static str,
     file: &'static str,
+    /// The upstream release this pin is, as its watch spells versions
+    /// (`source_watches.rs`).
+    version: &'static str,
+}
+
+/// Each pin's key and upstream release, in table order.
+pub fn versions() -> Vec<(&'static str, &'static str)> {
+    PINS.iter().map(|pin| (pin.key, pin.version)).collect()
 }
 
 const PINS: &[PinDef] = &[
@@ -23,6 +31,7 @@ const PINS: &[PinDef] = &[
         url: "https://curl.se/ca/cacert-2026-08-13.pem",
         sha256: "f66dff1bdf8f96060b8177976f8b7d9254bc89bc4db933d769f7384d28480bc9",
         file: "cacert-2026-08-13.pem",
+        version: "2026-08-13",
     },
     PinDef {
         key: "cryptsetup-x86-64-source",
@@ -32,6 +41,7 @@ const PINS: &[PinDef] = &[
         url: "https://www.kernel.org/pub/linux/utils/cryptsetup/v2.8/cryptsetup-2.8.8.tar.xz",
         sha256: "3acfa685f2dd7fcc832e0b77bc7093aa7da554a51ce8dafbb4138eaa854eee35",
         file: "cryptsetup-2.8.8.tar.xz",
+        version: "2.8.8",
     },
     PinDef {
         key: "curl-x86-64-source",
@@ -42,6 +52,7 @@ const PINS: &[PinDef] = &[
         url: "https://curl.se/download/curl-8.21.0.tar.xz",
         sha256: "aa1b66a70eace83dc624508745646c08ae561de512ab403adffb93ac87fc72e6",
         file: "curl-8.21.0.tar.xz",
+        version: "8.21.0",
     },
     PinDef {
         key: "fd-source",
@@ -49,6 +60,7 @@ const PINS: &[PinDef] = &[
         url: "https://static.crates.io/crates/fd-find/fd-find-10.2.0.crate",
         sha256: "de08defa195af894cc295a43bfc65ba28903e492fd5f32f7a24bf75eafd9bf34",
         file: "fd-find-10.2.0.crate",
+        version: "10.2.0",
     },
     PinDef {
         key: "git-x86-64-source",
@@ -60,6 +72,7 @@ const PINS: &[PinDef] = &[
         url: "https://www.kernel.org/pub/software/scm/git/git-2.55.0.tar.xz",
         sha256: "457fdb04dc8728e007d4688695e6912e6f680727920f2a40bf11eacc17505357",
         file: "git-2.55.0.tar.xz",
+        version: "2.55.0",
     },
     PinDef {
         key: "jetbrains-mono-nerd-font-source",
@@ -69,6 +82,7 @@ const PINS: &[PinDef] = &[
         url: "https://github.com/ryanoasis/nerd-fonts/releases/download/v3.5.1/JetBrainsMono.tar.xz",
         sha256: "04d5e8f903693f9dd13e16f867e994834e681eb3c72c0d337a770dcda09010cf",
         file: "jetbrains-mono-nerd-font-3.5.1.tar.xz",
+        version: "3.5.1",
     },
     PinDef {
         key: "nerd-fonts-nerd-fonts-license-source",
@@ -79,6 +93,7 @@ const PINS: &[PinDef] = &[
         url: "https://raw.githubusercontent.com/ryanoasis/nerd-fonts/v3.5.1/LICENSE",
         sha256: "1f6ad4edae6479aaace3112ede5279a23284ae54b2a34db66357aef5f64df160",
         file: "nerd-fonts-3.5.1-nerd-fonts-LICENSE",
+        version: "3.5.1",
     },
     PinDef {
         key: "nerd-fonts-codicons-license-source",
@@ -86,6 +101,7 @@ const PINS: &[PinDef] = &[
         url: "https://raw.githubusercontent.com/ryanoasis/nerd-fonts/v3.5.1/src/glyphs/codicons/LICENSE.txt",
         sha256: "d6239afa918961b465b07bf7411cbe34ff6685854f58553db7966f4881a0211f",
         file: "nerd-fonts-3.5.1-codicons-LICENSE.txt",
+        version: "3.5.1",
     },
     PinDef {
         key: "nerd-fonts-font-awesome-license-source",
@@ -93,6 +109,7 @@ const PINS: &[PinDef] = &[
         url: "https://raw.githubusercontent.com/ryanoasis/nerd-fonts/v3.5.1/src/glyphs/font-awesome/LICENSE.txt",
         sha256: "de784a808496d49f5f80dd9d1d6e9a51cff712cfbc339e7c25155631ae3cdb5d",
         file: "nerd-fonts-3.5.1-font-awesome-LICENSE.txt",
+        version: "3.5.1",
     },
     PinDef {
         key: "nerd-fonts-materialdesign-license-source",
@@ -100,6 +117,7 @@ const PINS: &[PinDef] = &[
         url: "https://raw.githubusercontent.com/ryanoasis/nerd-fonts/v3.5.1/src/glyphs/materialdesign/LICENSE",
         sha256: "3bae6305bcaa6d10219b999f65c342034c2d40b1c0e8567fa08605e73ccba829",
         file: "nerd-fonts-3.5.1-materialdesign-LICENSE",
+        version: "3.5.1",
     },
     PinDef {
         key: "nerd-fonts-octicons-license-source",
@@ -107,6 +125,7 @@ const PINS: &[PinDef] = &[
         url: "https://raw.githubusercontent.com/ryanoasis/nerd-fonts/v3.5.1/src/glyphs/octicons/LICENSE",
         sha256: "4f886642f9e8d99eeadd484acdac011c3fde8a338faf52f5ca1408c13b9a9b63",
         file: "nerd-fonts-3.5.1-octicons-LICENSE",
+        version: "3.5.1",
     },
     PinDef {
         key: "nerd-fonts-pomicons-license-source",
@@ -114,6 +133,7 @@ const PINS: &[PinDef] = &[
         url: "https://raw.githubusercontent.com/ryanoasis/nerd-fonts/v3.5.1/src/glyphs/pomicons/LICENSE",
         sha256: "cb4797a9745683f287c28833db596e9d68ec43082d59359b3a49c504f0f610ce",
         file: "nerd-fonts-3.5.1-pomicons-LICENSE",
+        version: "3.5.1",
     },
     PinDef {
         key: "nerd-fonts-powerline-extra-license-source",
@@ -121,6 +141,7 @@ const PINS: &[PinDef] = &[
         url: "https://raw.githubusercontent.com/ryanoasis/nerd-fonts/v3.5.1/src/glyphs/powerline-extra/LICENSE",
         sha256: "544307a58e6826c24145b2af1c3578b53e2e21ae0e6c67ab4c6abd544304d26a",
         file: "nerd-fonts-3.5.1-powerline-extra-LICENSE",
+        version: "3.5.1",
     },
     PinDef {
         key: "nerd-fonts-powerline-symbols-license-source",
@@ -128,6 +149,7 @@ const PINS: &[PinDef] = &[
         url: "https://raw.githubusercontent.com/ryanoasis/nerd-fonts/v3.5.1/src/glyphs/powerline-symbols/LICENSE.txt",
         sha256: "46d5355e4734468135d8e4a30d0916292cc4df2b3ec30aa68c866f82497933be",
         file: "nerd-fonts-3.5.1-powerline-symbols-LICENSE.txt",
+        version: "3.5.1",
     },
     PinDef {
         key: "nerd-fonts-weather-icons-license-source",
@@ -135,6 +157,7 @@ const PINS: &[PinDef] = &[
         url: "https://raw.githubusercontent.com/ryanoasis/nerd-fonts/v3.5.1/src/glyphs/weather-icons/OFL.txt",
         sha256: "69cdedc8a4f57a30d68e4f045af8b9cce0ec3b1a6e7eec1ad41737c894f26790",
         file: "nerd-fonts-3.5.1-weather-icons-OFL.txt",
+        version: "3.5.1",
     },
     PinDef {
         key: "json-c-x86-64-source",
@@ -145,6 +168,7 @@ const PINS: &[PinDef] = &[
         url: "https://s3.amazonaws.com/json-c_releases/releases/json-c-0.18.tar.gz",
         sha256: "876ab046479166b869afc6896d288183bbc0e5843f141200c677b3e8dfb11724",
         file: "json-c-0.18.tar.gz",
+        version: "0.18",
     },
     PinDef {
         key: "libdevmapper-x86-64-source",
@@ -154,6 +178,7 @@ const PINS: &[PinDef] = &[
         url: "https://sourceware.org/pub/lvm2/LVM2.2.03.43.tgz",
         sha256: "d87ec0dac9061f1fa58ebced5c6b1360c87d4c5cd7b455dc0ebe1d3f036920d7",
         file: "LVM2.2.03.43.tgz",
+        version: "2.03.43",
     },
     PinDef {
         key: "libressl-x86-64-source",
@@ -165,6 +190,7 @@ const PINS: &[PinDef] = &[
         url: "https://ftp.openbsd.org/pub/OpenBSD/LibreSSL/libressl-4.3.2.tar.gz",
         sha256: "edf01aee24c65d69e6a9efcb9d44bcda682ff9d4f3bbbd95e794e1dfa90847b5",
         file: "libressl-4.3.2.tar.gz",
+        version: "4.3.2",
     },
     PinDef {
         key: "linux-source",
@@ -176,6 +202,7 @@ const PINS: &[PinDef] = &[
         url: "https://cdn.kernel.org/pub/linux/kernel/v4.x/linux-4.14.67.tar.xz",
         sha256: "3f4b056dc27233a78f7a4a35ed6fdcfd0a9680ec40b611a898bb6c8b905070ba",
         file: "linux-4.14.67.tar.xz",
+        version: "4.14.67",
     },
     PinDef {
         key: "linux-kernel-source",
@@ -191,6 +218,7 @@ const PINS: &[PinDef] = &[
         url: "https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.1.4.tar.xz",
         sha256: "1c63922a119675d38e3ae0f8f6ee07f15c41a786ab9ed66563749bb8c9a08e2e",
         file: "linux-7.1.4.tar.xz",
+        version: "7.1.4",
     },
     PinDef {
         key: "openssh-x86-64-source",
@@ -201,6 +229,7 @@ const PINS: &[PinDef] = &[
         url: "https://cdn.openbsd.org/pub/OpenBSD/OpenSSH/portable/openssh-10.5p1.tar.gz",
         sha256: "d44d28a839ea9daf969cc69150fde59910b2b39361dad81a3bd6cbd19218db11",
         file: "openssh-10.5p1.tar.gz",
+        version: "10.5p1",
     },
     PinDef {
         key: "popt-x86-64-source",
@@ -210,6 +239,7 @@ const PINS: &[PinDef] = &[
         url: "http://ftp.rpm.org/popt/releases/popt-1.x/popt-1.19.tar.gz",
         sha256: "c25a4838fc8e4c1c8aacb8bd620edb3084a3d63bf8987fdad3ca2758c63240f9",
         file: "popt-1.19.tar.gz",
+        version: "1.19",
     },
     PinDef {
         key: "ripgrep-seed-source",
@@ -219,6 +249,7 @@ const PINS: &[PinDef] = &[
         url: "https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-x86_64-unknown-linux-musl.tar.gz",
         sha256: "33e15bcf1624b25cdd2a55813a47a2f95dbe126268203e76aa6a585d1e7b149c",
         file: "ripgrep-15.2.0-x86_64-unknown-linux-musl.tar.gz",
+        version: "15.2.0",
     },
     PinDef {
         key: "ripgrep-source",
@@ -226,6 +257,7 @@ const PINS: &[PinDef] = &[
         url: "https://static.crates.io/crates/ripgrep/ripgrep-14.1.1.crate",
         sha256: "f77b8032dc584527975f34aa5a897d0ef5a785573fda778771a614ff9da501d9",
         file: "ripgrep-14.1.1.crate",
+        version: "14.1.1",
     },
     PinDef {
         key: "rust-rustc-dist",
@@ -235,6 +267,7 @@ const PINS: &[PinDef] = &[
         url: "https://static.rust-lang.org/dist/2026-05-28/rustc-1.96.0-x86_64-unknown-linux-gnu.tar.xz",
         sha256: "7d7fa1d0cfb0fab71a956bb78f41107202c17f30ab56c45288e869a37fd9633d",
         file: "rustc-1.96.0-x86_64-unknown-linux-gnu.tar.xz",
+        version: "1.96.0",
     },
     PinDef {
         key: "rust-std-dist",
@@ -242,6 +275,7 @@ const PINS: &[PinDef] = &[
         url: "https://static.rust-lang.org/dist/2026-05-28/rust-std-1.96.0-x86_64-unknown-linux-gnu.tar.xz",
         sha256: "c09c7c646248f14f473f5f7a029af15ee57c3a9f9bc93dfa72d9621938586b82",
         file: "rust-std-1.96.0-x86_64-unknown-linux-gnu.tar.xz",
+        version: "1.96.0",
     },
     PinDef {
         key: "rust-cargo-dist",
@@ -249,6 +283,7 @@ const PINS: &[PinDef] = &[
         url: "https://static.rust-lang.org/dist/2026-05-28/cargo-1.96.0-x86_64-unknown-linux-gnu.tar.xz",
         sha256: "dee75c3c8f9f600ad75bc0c93249e767d3047845a4dd668327ce43ab039ba266",
         file: "cargo-1.96.0-x86_64-unknown-linux-gnu.tar.xz",
+        version: "1.96.0",
     },
     PinDef {
         key: "rust-clippy-dist",
@@ -256,6 +291,7 @@ const PINS: &[PinDef] = &[
         url: "https://static.rust-lang.org/dist/2026-05-28/clippy-1.96.0-x86_64-unknown-linux-gnu.tar.xz",
         sha256: "9b0b89c67d5ce8195e1c8733587a63e326353fdda65f62455a64fa03e25659f2",
         file: "clippy-1.96.0-x86_64-unknown-linux-gnu.tar.xz",
+        version: "1.96.0",
     },
     PinDef {
         key: "tzdata-source",
@@ -264,6 +300,7 @@ const PINS: &[PinDef] = &[
         url: "https://data.iana.org/time-zones/releases/tzdata2026d.tar.gz",
         sha256: "0cb2aa8e333c3dc049badc42a0c61f21987b8cd44e107fa900bad764aacc7767",
         file: "tzdata2026d.tar.gz",
+        version: "2026d",
     },
     PinDef {
         key: "util-linux-libs-x86-64-source",
@@ -273,6 +310,7 @@ const PINS: &[PinDef] = &[
         url: "https://www.kernel.org/pub/linux/utils/util-linux/v2.42/util-linux-2.42.2.tar.xz",
         sha256: "03a05d3adf9602ef128f2da05b84b3205ce60c351e5737c0370f74000679ce8a",
         file: "util-linux-2.42.2.tar.xz",
+        version: "2.42.2",
     },
     PinDef {
         key: "uutils-source",
@@ -283,6 +321,7 @@ const PINS: &[PinDef] = &[
         url: "https://static.crates.io/crates/coreutils/coreutils-0.9.0.crate",
         sha256: "b92df9b821533650f3797aadae46e547f72db281c1f8a27f381f36d54284d34b",
         file: "coreutils-0.9.0.crate",
+        version: "0.9.0",
     },
     PinDef {
         key: "zlib-x86-64-source",
@@ -290,6 +329,7 @@ const PINS: &[PinDef] = &[
         url: "https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz",
         sha256: "9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23",
         file: "zlib-1.3.1.tar.gz",
+        version: "1.3.1",
     },
 ];
 
@@ -474,6 +514,7 @@ mod tests {
             url: "u",
             sha256: "s",
             file: "f",
+            version: "1",
         }];
         assert!(unresolved(&["app"], &pins).is_empty());
         assert_eq!(unresolved(&["typo"], &pins), vec!["typo".to_string()]);
@@ -507,6 +548,7 @@ mod tests {
             url: "u",
             sha256: "s",
             file: "f",
+            version: "1",
         };
         assert!(materialize_with(&pin, "app", &["app"]).foreign());
         assert!(

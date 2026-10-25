@@ -20,12 +20,17 @@
 //                      Re-resolve the Debian build root's lock (feed/debian.rs);
 //                      `td-feed warm build-root` then caches its pins.
 //
+//   td-feed outdated [--transitive] [pins|build-root|cargo]...
+//                      Say which pins upstream has released past (feed/outdated.rs,
+//                      UPDATING.md); changes nothing.
+//
 //   td-feed selftest   Self-contained LOOPBACK round-trip (offline): an ORIGIN server on
 //                      127.0.0.1, `warm` a one-entry index from it, `serve` the store on a
 //                      2nd port, fetch the artifact back THROUGH the feed and verify it.
 //                      Also asserts both gates are load-bearing: a wrong pinned hash reds
 //                      warm, a corrupted store byte reds serve (sidecar mismatch).
 mod debian;
+mod outdated;
 mod vendor;
 
 use sha2::{Digest, Sha256};
@@ -1634,6 +1639,19 @@ struct LockedRegistryPackage {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct LockedCargoSources {
     registry: Vec<LockedRegistryPackage>,
+    /// What the lock's own (path) packages depend on: a name, and the version
+    /// too where Cargo had to write one because the lock holds the name twice.
+    direct: std::collections::BTreeSet<(String, Option<String>)>,
+}
+
+/// A `dependencies` entry: `"name"`, `"name version"` or
+/// `"name version (source)"`.
+fn lock_dependency(entry: &str) -> Option<(String, Option<String>)> {
+    let entry = entry.trim().trim_end_matches(',').trim();
+    let entry = entry.strip_prefix('"')?.strip_suffix('"')?;
+    let mut words = entry.split_whitespace();
+    let name = words.next()?.to_string();
+    Some((name, words.next().map(str::to_string)))
 }
 
 /// Parse only Cargo.lock's generated package records. Path/workspace packages
@@ -1644,7 +1662,8 @@ fn parse_locked_cargo_sources(text: &str) -> Result<LockedCargoSources, String> 
     let mut seen_registry = std::collections::BTreeSet::new();
     let (mut name, mut version, mut source, mut checksum) =
         (String::new(), String::new(), None, None);
-    let mut in_package = false;
+    let mut deps = Vec::new();
+    let (mut in_package, mut in_deps) = (false, false);
     let mut packages = 0usize;
     for line in text.lines() {
         let trimmed = line.trim();
@@ -1655,6 +1674,7 @@ fn parse_locked_cargo_sources(text: &str) -> Result<LockedCargoSources, String> 
                     &version,
                     source.as_deref(),
                     checksum.as_deref(),
+                    std::mem::take(&mut deps),
                     &mut result,
                     &mut seen_registry,
                 )?;
@@ -1667,7 +1687,7 @@ fn parse_locked_cargo_sources(text: &str) -> Result<LockedCargoSources, String> 
                     "Cargo.lock contains more than {MAX_CARGO_LOCK_PACKAGES} packages"
                 ));
             }
-            in_package = true;
+            (in_package, in_deps) = (true, false);
             name.clear();
             version.clear();
             source = None;
@@ -1679,20 +1699,41 @@ fn parse_locked_cargo_sources(text: &str) -> Result<LockedCargoSources, String> 
                     &version,
                     source.as_deref(),
                     checksum.as_deref(),
+                    std::mem::take(&mut deps),
                     &mut result,
                     &mut seen_registry,
                 )?;
-                in_package = false;
+                (in_package, in_deps) = (false, false);
             }
+        } else if in_package && in_deps {
+            // `]` closes the list, alone or after the last entry.
+            let entry = trimmed.trim_end_matches(']');
+            deps.extend(lock_dependency(entry));
+            in_deps = entry.len() == trimmed.len();
         } else if in_package {
             let Some((key, value)) = trimmed.split_once('=') else {
                 continue;
             };
             let key = key.trim();
+            let value = value.trim();
+            if key == "dependencies" {
+                match value.strip_prefix('[') {
+                    Some("") => in_deps = true,
+                    Some(inline) => deps.extend(
+                        inline
+                            .trim_end_matches(']')
+                            .split(',')
+                            .filter_map(lock_dependency),
+                    ),
+                    None => {
+                        return Err("Cargo.lock package field `dependencies' is not a list".into())
+                    }
+                }
+                continue;
+            }
             if !matches!(key, "name" | "version" | "source" | "checksum") {
                 continue;
             }
-            let value = value.trim();
             let value = value
                 .strip_prefix('"')
                 .and_then(|value| value.strip_suffix('"'))
@@ -1712,6 +1753,7 @@ fn parse_locked_cargo_sources(text: &str) -> Result<LockedCargoSources, String> 
             &version,
             source.as_deref(),
             checksum.as_deref(),
+            deps,
             &mut result,
             &mut seen_registry,
         )?;
@@ -1724,10 +1766,12 @@ fn account_locked_cargo_source(
     version: &str,
     source: Option<&str>,
     checksum: Option<&str>,
+    deps: Vec<(String, Option<String>)>,
     result: &mut LockedCargoSources,
     seen_registry: &mut std::collections::BTreeSet<(String, String)>,
 ) -> Result<(), String> {
     let Some(source) = source else {
+        result.direct.extend(deps);
         return Ok(());
     };
     if name.is_empty() || version.is_empty() {
@@ -2404,6 +2448,11 @@ fn recipe_pins_result(root: &Path, verb: &str) -> Result<Vec<SourcePin>, String>
             root.display()
         ));
     }
+    parse_source_pins(&recipe_eval_stdout(root, verb)?)
+}
+
+/// What `td-recipe-eval VERB` prints, run from the checkout's own evaluator.
+fn recipe_eval_stdout(root: &Path, verb: &str) -> Result<String, String> {
     let eval = recipe_eval_tool(root)?;
     let out = Command::new(&eval)
         .arg(verb)
@@ -2417,9 +2466,7 @@ fn recipe_pins_result(root: &Path, verb: &str) -> Result<Vec<SourcePin>, String>
             String::from_utf8_lossy(&out.stderr)
         ));
     }
-    let text =
-        String::from_utf8(out.stdout).map_err(|e| format!("{verb} output not UTF-8: {e}"))?;
-    parse_source_pins(&text)
+    String::from_utf8(out.stdout).map_err(|e| format!("{verb} output not UTF-8: {e}"))
 }
 
 /// `https://h/p` / `http://h/p` -> `h/p` (the feed serves a URL-path mirror at `GET /<h>/<p>`).
@@ -3467,6 +3514,10 @@ pub fn run(a: &[String]) {
                 die(format!("debian-root: {error}"));
             }
         }
+        Some("outdated") => match outdated::run(&repo_root(), a.get(2..).unwrap_or_default()) {
+            Ok(code) => std::process::exit(code),
+            Err(error) => die(format!("outdated: {error}")),
+        },
         Some("warm-selftest") if a.len() == 2 => warm_selftest(),
         Some("serve") if a.len() == 4 => {
             let (store, addr) = (PathBuf::from(&a[2]), &a[3]);
@@ -3502,6 +3553,7 @@ pub fn run(a: &[String]) {
                  td-feed warm crate CRATE VERSION [DEST]\n  td-feed warm crate-local SRCDIR DEST\n  \
                  td-feed warm sources\n  td-feed warm build-root\n  td-feed warm kernel-headers ARCH\n  \
                  td-feed debian-root resolve LOCK\n  \
+                 td-feed outdated [--transitive] [pins|build-root|cargo]...\n  \
                  td-feed serve STORE ADDR\n  \
                  td-feed export sources  (publish existing host archives; no downloads)\n  td-feed consume sources  (TD_FEED_BASE or VM endpoint; no upstream fallback)\n  td-feed export cargo LOCK ARCHIVES\n  td-feed consume cargo LOCK ARCHIVES\n  td-feed export vendors [TARGET]\n  td-feed consume vendors [TARGET]\n  td-feed export flathub  (declared Flathub refs, verified, for td-app; HOME cache)\n  td-feed ensure-serve\n  td-feed cargo-proxy STORE ADDR\n  td-feed selftest\n  \
                  td-feed cargo-proxy-selftest\n  td-feed warm-selftest"

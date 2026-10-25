@@ -994,6 +994,57 @@ fn resolve_lock(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// The live archives `td-feed outdated` compares a lock with, where
+/// resolution reads the lock's own snapshot.
+const LIVE: &str = "https://deb.debian.org";
+
+/// The lock's `archive` lines.
+pub(super) fn lock_archives(lock: &str) -> Result<Vec<(String, String)>, String> {
+    Ok(parse_spec(lock)?.archives)
+}
+
+/// The newest amd64-or-all version of every binary package the live
+/// archives list today, from each suite's Packages index checked against
+/// its InRelease SHA256 list, as resolution reads them (the signature is
+/// not checked; see the module header).
+pub(super) fn live_versions(
+    archives: &[(String, String)],
+) -> Result<BTreeMap<String, String>, String> {
+    let mut newest: BTreeMap<String, String> = BTreeMap::new();
+    for (archive, suite) in archives {
+        let dists = format!("{LIVE}/{archive}/dists/{suite}");
+        let inrelease = crate::http::get_body(&format!("{dists}/InRelease"))?;
+        let inrelease = std::str::from_utf8(&inrelease)
+            .map_err(|_| format!("{dists}/InRelease is not UTF-8"))?;
+        let (hex, size) = inrelease_entry(inrelease, INDEX_PATH)
+            .ok_or_else(|| format!("{dists}/InRelease lists no {INDEX_PATH}"))?;
+        let compressed = fetch_verified(&format!("{dists}/{INDEX_PATH}"), &hex, size)?;
+        let mut packages = Vec::new();
+        td_engine::xz::decompress_reader_to(&mut compressed.as_slice(), &mut packages)?;
+        let text =
+            std::str::from_utf8(&packages).map_err(|_| format!("{dists} index is not UTF-8"))?;
+        for stanza in stanzas(text) {
+            let architecture = stanza.get("Architecture").copied().unwrap_or_default();
+            let (Some(name), Some(version)) = (stanza.get("Package"), stanza.get("Version")) else {
+                continue;
+            };
+            if ARCHITECTURES.contains(&architecture)
+                && newest
+                    .get(*name)
+                    .is_none_or(|old| compare_versions(version, old) == Ordering::Greater)
+            {
+                newest.insert((*name).to_string(), (*version).to_string());
+            }
+        }
+    }
+    Ok(newest)
+}
+
+/// Whether dpkg orders `candidate` after `locked`.
+pub(super) fn is_newer(candidate: &str, locked: &str) -> bool {
+    compare_versions(candidate, locked) == Ordering::Greater
+}
+
 pub(super) fn run(args: &[String]) -> Result<(), String> {
     match args {
         [verb, lock] if verb == "resolve" => resolve_lock(Path::new(lock)),

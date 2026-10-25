@@ -1217,7 +1217,9 @@ stylistic: a tree somebody assembled locally has no URL anyone else can
 fetch, so pinning one would require td to host it, which §Z refuses.
 
 1. **Pin what upstream publishes** as a plain file at a stable URL, in
-   `recipes/src/source_pins.rs` — a URL, a `sha256`, a filename. The
+   `recipes/src/source_pins.rs` — a URL, a `sha256`, a filename and the
+   upstream `version`, with its release watch in
+   `recipes/src/source_watches.rs` (`UPDATING.md`). The
    mechanism the kernel tarball and Rust release components already use,
    fetched by `td-net`, verified the same way. The pin carries the
    `foreign` taint (§B.8).

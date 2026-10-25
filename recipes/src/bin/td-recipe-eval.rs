@@ -69,6 +69,11 @@
 //!                         argv per line (the recipe stem last)
 //!   source-pins           print recipe-owned fixed-output source pins as:
 //!                         <key>\t<url>\t<sha256>\t<file>
+//!   source-watches        print where upstream announces each pin's
+//!                         releases, for `td-feed outdated`, as:
+//!                         <key>\t<version>\tindex\t<index>\t<pattern>
+//!                         (`points` for a stable-releases-only index)
+//!                         or <key>\t<version>\theld\t<reason>
 //!   build-root-pins       print the Debian build root's layer and .deb pins
 //!                         (recipes/src/debian-root.lock) in the same form
 //!   build-root-seed       place the build root in the seed store from its
@@ -208,6 +213,23 @@ fn recipe_checks(r: &td_recipe::types::Recipe) -> Vec<&td_recipe::types::RecipeC
 fn print_source_pins() {
     for pin in td_recipe::source_pins::all() {
         println!("{}\t{}\t{}\t{}", pin.key, pin.url, pin.sha256, pin.file);
+    }
+}
+
+fn print_source_watches() {
+    use td_recipe::source_watches::Watch;
+    let watches = td_recipe::source_watches::all().unwrap_or_else(|e| die(&e));
+    for pin in watches {
+        let (key, version) = (pin.key, pin.version);
+        match pin.watch {
+            Watch::Index { index, pattern } => {
+                println!("{key}\t{version}\tindex\t{index}\t{pattern}")
+            }
+            Watch::PointReleases { index, pattern } => {
+                println!("{key}\t{version}\tpoints\t{index}\t{pattern}")
+            }
+            Watch::Held(reason) => println!("{key}\t{version}\theld\t{reason}"),
+        }
     }
 }
 
@@ -551,6 +573,12 @@ fn main() {
             }
             print_source_pins();
         }
+        Some("source-watches") => {
+            if args.get(2).is_some() {
+                die("usage: source-watches");
+            }
+            print_source_watches();
+        }
         Some("build-root-pins") => {
             if args.get(2).is_some() {
                 die("usage: build-root-pins");
@@ -605,7 +633,7 @@ fn main() {
                 die(&e);
             }
         }
-        _ => die("usage: td-recipe-eval list|emit|check-list|check-count|check-script|check-run|build-run|check-history|clear-store|gc-store|qemu-secret|qemu-secret-system|qemu-login-system|qemu-boot|qemu-boot-uefi|qemu-boot-media|qemu-install|qemu-install-system|qemu-install-encrypted|qemu-boot-encrypted|qemu-boot-live|compose-iso|build-iso|server-image|test-iso|qemu-boot-erofs|qemu-boot-system|qemu-deploy-rollback|qemu-update|qemu-boot-net|qemu-boot-kexec|run|bundle|warm|verify-store|payload-closure|application-closure|vendor-warm-args|source-pins|build-root-pins|build-root-seed|source-pin|seed-digests|local-source-roster"),
+        _ => die("usage: td-recipe-eval list|emit|check-list|check-count|check-script|check-run|build-run|check-history|clear-store|gc-store|qemu-secret|qemu-secret-system|qemu-login-system|qemu-boot|qemu-boot-uefi|qemu-boot-media|qemu-install|qemu-install-system|qemu-install-encrypted|qemu-boot-encrypted|qemu-boot-live|compose-iso|build-iso|server-image|test-iso|qemu-boot-erofs|qemu-boot-system|qemu-deploy-rollback|qemu-update|qemu-boot-net|qemu-boot-kexec|run|bundle|warm|verify-store|payload-closure|application-closure|vendor-warm-args|source-pins|source-watches|build-root-pins|build-root-seed|source-pin|seed-digests|local-source-roster"),
     }
 }
 

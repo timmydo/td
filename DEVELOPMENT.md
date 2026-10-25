@@ -334,10 +334,14 @@ empty it in turn. `gc-store` leaves it and `clear-store` drops it.
 
 Fetched and host-generated seeds are pinned by the seed digest table the
 evaluator compiles in (`seed/seed-digests.txt`); regenerate it after a pin
-change and commit it with the change:
+change and commit it with the change. The generator reads the warm source
+cache, so warm it first, and write the table aside: a redirect straight into
+it would leave it empty if the generator fails.
 
 ```text
-td-recipe-eval seed-digests > seed/seed-digests.txt
+td-feed warm sources
+td-recipe-eval seed-digests > seed/seed-digests.txt.new
+mv seed/seed-digests.txt.new seed/seed-digests.txt
 ```
 
 A recipe built from the checkout's own trees (a `local_source`, with any
