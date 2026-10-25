@@ -164,18 +164,20 @@ and the help sheet's rows are held to Unifont having every character they
 spell, since Unifont draws whatever the outline face lacks.
 
 The strip's first cell is the LAUNCHER'S BUTTON: a square as wide as the band
-is tall, marked with three bars drawn as fills rather than a glyph, so it needs
-nothing from the font. A free left press on it opens the launcher, which makes
-it the pointer's `Super+Enter`, and the button is inverted while the overlay is
-up, as the active workspace is. The press is taken where a press on a cell is
-— after the ownership check, so a press a client was given is never spent,
-and before the bands — and like a cell press it spends a wheel notch in the
-same report. The runtime only NOTES it, and the input adapter opens the
+is tall, marked with three bars drawn as fills rather than a glyph, so it
+needs nothing from the font. A free left press on it opens the launcher, which
+makes it the pointer's `Super+Enter`, and the button is inverted while the
+overlay is up, as the active workspace is. The press is taken where a press on
+a cell is — after the ownership check, so a press a client was given is never
+spent, and before the bands — and like a cell press it spends a wheel notch in
+the same report. The runtime only NOTES it, and the input adapter opens the
 overlay through the launcher's one door, the call a key takes, so the
 overlay's keyboard capture follows it whichever device opened it and any
-launch stays outside the scene lock. The adapter asks only after a report in
-which that device itself pressed a button. The button names no workspace: a
-drop on it is a cancelled drag.
+launch stays outside the scene lock except the application card's start
+request, a nonblocking queue send made under the lock so that no window can
+map between the card finding none and the request. The adapter asks only after
+a report in which that device itself pressed a button. The button names no
+workspace: a drop on it is a cancelled drag.
 
 After the button the strip names the WORKSPACES, which is the one
 thing on it that is not a reading. A workspace switch is otherwise invisible:
@@ -195,6 +197,32 @@ a workspace costs the fields beside it sixteen pixels and not a reserved strip.
 Each face centres a glyph's advance across its text cell, and the bar's test
 holds Unifont's digits centred in theirs, so equal padding centres the number,
 which the block of ink around an active cell would show if it did not.
+
+After the workspaces, while the configured application's card has asked for a
+start that has no window yet, the strip shows that LAUNCH in a cell of its
+own, inverted as the active workspace is, before the status line: the
+uppercase name, a phase and the time since the request, as `FIREFOX STARTING
+0:04` or `FIREFOX LOADING 2:05`, then `FIREFOX FAILED TO START`, `FIREFOX
+EXITED` or `FIREFOX NOT STARTED`. The phase is only what root's `0f` answer
+says of the unit (td-authd/DESIGN.md): `STARTING` until the request is sent
+and root reads the unit up, `04` unknown included, `LOADING` once td-svc holds
+a live leader, which is where a first launch spends its download, `FAILED TO
+START` when root refused the request or reads the unit failed, `EXITED` when
+it reads it stopped or exited without one, and `NOT STARTED` when the request
+was never sent: the worker's one-request queue held another, or, in the direct
+profile, there is no authority to ask. The compositor learns nothing of what
+the application does inside its run, so it never claims a download or its
+progress; that belongs to the program that installs. A failure stays thirty
+seconds, unless a later read sees the unit up again, as a supervised restart
+does; the cell goes when a matching window maps, which the paint that shows
+the window also clears, and after thirty minutes without one. The authority
+worker asks `0f` on each turn of its loop only while a launch is shown. A card
+activation while one is under way asks nothing, so a second press cannot send
+a second start; one after a failure asks again. The cell ends on the
+observer's candidates, toplevels whose own app id matches, so a client
+claiming that id can end it early, as it can already be what the card
+activates; no client can make the cell claim a phase, which only root's answer
+sets. Screenshots omit the cell with the other moment's furniture.
 
 The workspaces are painted from the LAYOUT on every frame rather than folded
 into the status line, and that is what makes the mark follow a switch at once:
@@ -393,22 +421,22 @@ anything but `?` — a permanent question mark is worse than an absent stanza.
 Temperature is out for the same reason until a target has a thermal zone.
 
 The fields are otherwise ordered as the i3status config they are modelled on
-has them, which puts the clock last. The line begins after the workspaces and
-is clipped to what they leave, so a line long enough to reach one loses its
-own end rather than being drawn over the cell that says where the operator is.
-The CLOCK is therefore what clips first on a narrow output — the field the bar
-most exists for. The network field made that a live concern rather than a
-theoretical one: without it the line is 752 pixels, with `NET eth0 10.0.2.15`
-it is 992, and a longer name and address (`NET enp0s3 192.168.100.42`) reaches
-1076. 1024x768 is an ordinary virtio-gpu mode, so this now clips on a target
-td plausibly runs on, where the previous claim that no such output exists was
-true and is not any more. The workspaces moved that line further: one costs 20
-pixels and the strip shows as many as are in use, so the long case reaches
-1096 with one workspace and 1256 with nine. It is a real cost of following the
-model rather than an oversight, and nothing is lost but pixels —
-`draw_text_clipped` clips. The fix, when it matters, is dropping whole FIELDS
-rather than clipping a glyph, which is also what would keep the clock while
-the workspaces grow.
+has them, which puts the clock last. The line begins after the workspaces, and
+after a pending launch's cell when one is shown, and is clipped to what they
+leave, so a line long enough to reach one loses its own end rather than being
+drawn over the cell that says where the operator is. The CLOCK is therefore
+what clips first on a narrow output — the field the bar most exists for. The
+network field made that a live concern rather than a theoretical one: without
+it the line is 752 pixels, with `NET eth0 10.0.2.15` it is 992, and a longer
+name and address (`NET enp0s3 192.168.100.42`) reaches 1076. 1024x768 is an
+ordinary virtio-gpu mode, so this now clips on a target td plausibly runs on,
+where the previous claim that no such output exists was true and is not any
+more. The workspaces moved that line further: one costs 20 pixels and the
+strip shows as many as are in use, so the long case reaches 1096 with one
+workspace and 1256 with nine. It is a real cost of following the model rather
+than an oversight, and nothing is lost but pixels — `draw_text_clipped` clips.
+The fix, when it matters, is dropping whole FIELDS rather than clipping a
+glyph, which is also what would keep the clock while the workspaces grow.
 
 The clock reads the optional persistent `/etc/timezone` setting once when
 its worker starts, before taking the runtime lock. Absence selects UTC.
@@ -1207,7 +1235,9 @@ the trusted profile includes accumulation and cutoff filtering in the lock.
 Each adapter operation
 reacquires the scene runtime lock, so a Wayland commit may interleave between
 command, launcher, key, modifier, and pointer operations from one report. This
-keeps process launch outside the scene lock without changing evdev ordering.
+keeps process launch outside the scene lock without changing evdev ordering;
+the application card's start request is the one nonblocking queue send made
+under it.
 An input parse, runtime-delivery, or framebuffer-repaint error closes that
 device's reader after releasing its seat contribution. The first fixed-device
 QEMU profile deliberately fails stopped instead of retrying a potentially
@@ -2831,8 +2861,10 @@ the application card activates a retained matching mapped surface,
 switching workspaces and leaving an unrelated fullscreen view if necessary. It
 never starts another process: with no mapped surface it asks the authority
 (request 0d) to have root start the application's supervised unit, which
-td-svc answers as already running if it is, and reports a refusal. The
-image has no `/bin/<application>` route (APPLICATIONS.md §A.0), though no
+td-svc answers as already running if it is, and reports a refusal. The bar
+shows that launch until the window maps or the start fails (the strip's
+LAUNCH cell above), and the card asks once per launch. The image has no
+`/bin/<application>` route (APPLICATIONS.md §A.0), though no
 single-instance lock has landed. Direct `td-ui-demo` and `td-term` requests
 select their program and take the same two run flags. The compositor derives a
 unique readiness-socket name beside the socket and passes both paths as literal
@@ -5631,9 +5663,11 @@ surface and never invokes a program. When it finds no surface it asks the
 authority, with the name-free request `0d`, to have root start the
 application's supervised unit, and an "UPDATE NAME" row shown beside it in
 authority mode asks with `0e` for the unit that checks the application's
-Flathub cache (APPLICATIONS.md §W.9); each is answered at once and leaves
-no handle. The image selects this client through
-the paired service at UID 993.
+Flathub cache (APPLICATIONS.md §W.9); each is answered at once and leaves no
+handle. While the bar shows a launch from the card, the worker asks `0f` for
+the unit's state on each turn of its loop, at most every 250 ms, and root
+starts at most one status read a second whatever the rate. The image selects
+this client through the paired service at UID 993.
 The direct launcher remains available for host development.
 
 Before opening the framebuffer or starting any worker, the client verifies one

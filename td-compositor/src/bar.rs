@@ -21,6 +21,8 @@ pub(crate) const INK: [u8; 4] = [0xd0, 0xc8, 0xe0, 0];
 /// rather than a fixed column — which matters, since the two share one strip
 /// and the clock is what gives way when they do not both fit.
 const DESK_PAD: usize = 4;
+/// Air either side of a pending launch's state inside its inverted cell.
+const LAUNCH_PAD: usize = 6;
 /// The launcher's button, the strip's FIRST cell: a press on it opens the
 /// launcher, which is the pointer's `Super+Enter`. As wide as the band is
 /// tall, so the mark sits in a square of its own and the workspaces start
@@ -489,11 +491,11 @@ fn label_inset(cell_width: usize, label: &str) -> usize {
 /// the text, so this never reads a clock, a file, or a layout — the same
 /// split the launcher and the sheet have.
 ///
-/// The launcher's button is LEFTMOST, the workspaces follow it and the
-/// status line follows them, which is where an operator looks for them and
-/// is also the order that survives a narrow output: the strip is clipped
-/// from the right, so what gives way first is the end of the status line
-/// rather than where the operator is.
+/// The launcher's button is LEFTMOST, the workspaces follow it, a pending
+/// launch's cell follows them and the status line follows that, which is
+/// where an operator looks for them and is also the order that survives a
+/// narrow output: the strip is clipped from the right, so what gives way
+/// first is the end of the status line rather than where the operator is.
 #[allow(clippy::too_many_arguments)]
 pub fn paint(
     frame: &mut [u8],
@@ -504,6 +506,7 @@ pub fn paint(
     desks: &[u8],
     active: u8,
     launcher_open: bool,
+    launch: Option<&str>,
     text: &str,
 ) {
     // Not clamped to `height`: both primitives clip against it, and a second
@@ -548,6 +551,26 @@ pub fn paint(
             cell,
         );
         left = at.saturating_add(cell.2);
+    }
+    // A pending launch's state, in inverse video after the workspaces: it
+    // is the one thing on the strip waiting on the operator's request, and
+    // the status line, which gives way from the right, follows it.
+    if let Some(launch) = launch {
+        let cell_width = Text::width(launch).saturating_add(LAUNCH_PAD.saturating_mul(2));
+        let at = left.saturating_add(TEXT_LEFT);
+        let cell = (at, 0, cell_width, BAR_HEIGHT);
+        ui::fill(frame, width, height, stride, cell, INK);
+        face.draw(
+            frame,
+            width,
+            height,
+            stride,
+            (at.saturating_add(LAUNCH_PAD), TEXT_TOP),
+            launch,
+            (BACKGROUND, INK),
+            cell,
+        );
+        left = at.saturating_add(cell_width);
     }
     // What keeps the status line off the cells TODAY is where it starts: a
     // line is drawn rightwards from there and cannot reach back. The clip
@@ -1226,6 +1249,7 @@ Local:
                 &[1, 2],
                 active,
                 false,
+                None,
                 "",
             );
             let (mut ink, mut background) = (0usize, 0usize);
@@ -1276,6 +1300,7 @@ Local:
                 desks,
                 0,
                 false,
+                None,
                 text,
             );
             // `position`, not the iterator method whose name is also a shell
@@ -1324,6 +1349,7 @@ Local:
             &[7],
             0,
             false,
+            None,
             "",
         );
         let inked: Vec<usize> = (0..desk_width(7))
@@ -1362,6 +1388,7 @@ Local:
                 &[1],
                 active,
                 false,
+                None,
                 text,
             );
             let mut pixels = Vec::new();
@@ -1616,6 +1643,62 @@ Local:
     }
 
     #[test]
+    fn a_pending_launch_is_an_inverted_cell_before_the_status_line() {
+        let launch = "FIREFOX STARTING 0:01";
+        let at = LAUNCHER_WIDTH + desk_width(1) + TEXT_LEFT;
+        let cell_width = Text::width(launch) + LAUNCH_PAD * 2;
+        let render = |width: usize| {
+            let stride = width * 4;
+            let mut frame = vec![0u8; stride * BAR_HEIGHT];
+            paint(
+                &mut frame,
+                width,
+                BAR_HEIGHT,
+                stride,
+                &Text::default(),
+                &[1],
+                0,
+                false,
+                Some(launch),
+                "LOAD 0.42",
+            );
+            frame
+        };
+        let width = 640usize;
+        let frame = render(width);
+        let pixel = |frame: &[u8], width: usize, x: usize, y: usize| {
+            frame
+                .get(y * width * 4 + x * 4..y * width * 4 + x * 4 + 4)
+                .map(<[u8]>::to_vec)
+        };
+        // Its top row is the cell's own ink, with the strip's ground either
+        // side.
+        for x in at..at + cell_width {
+            assert_eq!(pixel(&frame, width, x, 0), Some(INK.to_vec()), "{x}");
+        }
+        assert_eq!(pixel(&frame, width, at - 1, 0), Some(BACKGROUND.to_vec()));
+        assert_eq!(
+            pixel(&frame, width, at + cell_width, 0),
+            Some(BACKGROUND.to_vec())
+        );
+        // The status line starts after it, as it starts after the cells.
+        let font = crate::font::pinned().unwrap();
+        let index = font.index('L');
+        let bearing = (0..CELL_WIDTH)
+            .position(|x| (0..CELL_HEIGHT).any(|y| font.pixel(index, x, y)))
+            .unwrap();
+        let after = at + cell_width;
+        let first = (after..width)
+            .position(|x| (0..BAR_HEIGHT).any(|y| pixel(&frame, width, x, y) == Some(INK.to_vec())))
+            .map(|x| x + after);
+        assert_eq!(first, Some(after + TEXT_LEFT + bearing));
+        // An output too narrow for it clips it at the edge.
+        let narrow = at + 10;
+        let clipped = render(narrow);
+        assert_eq!(pixel(&clipped, narrow, narrow - 1, 0), Some(INK.to_vec()));
+    }
+
+    #[test]
     fn the_strip_paints_only_its_own_rows() {
         let (width, height) = (400usize, 200usize);
         let stride = width * 4;
@@ -1629,6 +1712,7 @@ Local:
             &[1, 2],
             1,
             false,
+            None,
             "LOAD 0.42",
         );
         for y in 0..height {
@@ -1706,6 +1790,7 @@ Local:
             &[1],
             1,
             false,
+            None,
             "LOAD 0.42  MEM 2.7G/7.7G",
         );
         assert!(frame
@@ -1759,6 +1844,7 @@ Local:
                 &[1],
                 0,
                 open,
+                None,
                 "",
             );
             let mut pixels = Vec::new();

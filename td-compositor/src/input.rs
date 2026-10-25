@@ -2613,19 +2613,15 @@ impl LiveInputTarget {
     /// follow every other scene mutation and propagate to the input reader.
     fn spawn(&mut self, request: LaunchRequest) -> Result<(), String> {
         if request == LaunchRequest::UiDemo && self.launches.activates_application() {
-            let activated = self
+            let mut runtime = self
                 .runtime
                 .lock()
-                .map_err(|_| "runtime lock poisoned".to_string())?
-                .activate_application()?;
-            if !activated {
-                // Root starts its supervised unit; its window maps when it
-                // is up, and the card activates it then.
-                if let Err(error) = self.launches.start_application() {
-                    eprintln!(
-                        "td-compositor: configured application has no mapped window: {error}"
-                    );
-                }
+                .map_err(|_| "runtime lock poisoned".to_string())?;
+            if !runtime.activate_application()? {
+                // Root starts its supervised unit; the bar shows the launch
+                // until its window maps, and the card activates it then.
+                let launches = &self.launches;
+                runtime.launch_application(|| launches.start_application())?;
             }
             return Ok(());
         }

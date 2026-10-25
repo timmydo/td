@@ -891,6 +891,9 @@ pub struct Scene {
     /// A screenshot's outcome, which the bar shows in place of `status`
     /// until the runtime clears it.
     notice: Option<String>,
+    /// The configured application's pending launch, which the bar shows
+    /// beside the workspaces until its window maps.
+    launch: Option<String>,
     text: crate::text::Text,
 }
 
@@ -939,6 +942,7 @@ impl Scene {
             attention_unlocked: false,
             status: String::new(),
             notice: None,
+            launch: None,
             text: crate::text::Text::default(),
         }
     }
@@ -2320,6 +2324,19 @@ impl Scene {
     pub(crate) fn set_notice(&mut self, notice: Option<String>) -> bool {
         let changed = self.notice != notice;
         self.notice = notice;
+        changed
+    }
+
+    #[cfg(test)]
+    pub(crate) fn launch(&self) -> Option<&str> {
+        self.launch.as_deref()
+    }
+
+    /// Show a pending launch's state on the bar, or none; whether that
+    /// changed.
+    pub(crate) fn set_launch(&mut self, launch: Option<String>) -> bool {
+        let changed = self.launch != launch;
+        self.launch = launch;
         changed
     }
 
@@ -3724,6 +3741,11 @@ impl Scene {
             &desks,
             active,
             self.launcher.visible() && furniture == Furniture::Drawn,
+            // A launch's cell is the moment's furniture too.
+            match furniture {
+                Furniture::Drawn => self.launch.as_deref(),
+                Furniture::Omitted => None,
+            },
             // A notice is the moment's furniture too: a second shot taken
             // within it shows the line, not the last one's outcome.
             match furniture {

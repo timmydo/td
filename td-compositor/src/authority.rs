@@ -67,11 +67,131 @@ pub(crate) enum Supervised {
     Update,
 }
 
+/// `0f`'s answer (td-authd/DESIGN.md, "Fixed program launch
+/// prerequisite"): the application unit's state as root last read it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UnitState {
+    Idle,
+    Starting,
+    Running,
+    Failed,
+    Unknown,
+}
+
+impl UnitState {
+    /// Exactly `85` and a state, or `ff 03` on a live boot, which runs no
+    /// application and reads as failed; anything else ends the paired
+    /// generation.
+    fn decode(answer: &[u8]) -> Result<Self, String> {
+        match answer {
+            [0x85, 0] => Ok(Self::Idle),
+            [0x85, 1] => Ok(Self::Starting),
+            [0x85, 2] => Ok(Self::Running),
+            [0x85, 3] | [0xff, 3] => Ok(Self::Failed),
+            [0x85, 4] => Ok(Self::Unknown),
+            _ => Err("invalid application unit state answer".into()),
+        }
+    }
+}
+
+/// What became of the start requests the worker sent: how many it sent,
+/// whether root refused the last, and the unit state read since.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct StartOutcome {
+    pub(crate) sent: u64,
+    pub(crate) refused: bool,
+    pub(crate) state: Option<UnitState>,
+}
+
+#[derive(Default)]
+struct ApplicationShared {
+    /// Whether the worker asks `0f` on each turn of its loop.
+    watching: bool,
+    outcome: StartOutcome,
+}
+
+/// The configured application's start outcome, shared: the runtime says
+/// whether to follow it and reads it, the authority worker writes it.
+#[derive(Clone, Default)]
+pub(crate) struct Application(Arc<Mutex<ApplicationShared>>);
+
+impl Application {
+    pub(crate) fn watch(&self, watching: bool) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .watching = watching;
+    }
+
+    pub(crate) fn outcome(&self) -> StartOutcome {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .outcome
+    }
+
+    fn watching(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .watching
+    }
+
+    /// A `0d` was answered: a new start, with nothing read about it yet.
+    fn started(&self, refused: bool) {
+        let mut shared = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        shared.outcome = StartOutcome {
+            sent: shared.outcome.sent.wrapping_add(1),
+            refused,
+            state: None,
+        };
+    }
+
+    fn read(&self, state: UnitState) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .outcome
+            .state = Some(state);
+    }
+
+    /// Asks root's `0f` while watched and keeps the answer.
+    fn follow(&self, wire: &mut impl Exchange) -> Result<(), String> {
+        if self.watching() {
+            self.read(UnitState::decode(&wire.exchange(&[0x0f])?)?);
+        }
+        Ok(())
+    }
+
+    /// Takes a start and its outcome as the worker would.
+    #[cfg(test)]
+    pub(crate) fn answer(&self, refused: bool, state: Option<&[u8]>) -> Result<(), String> {
+        self.started(refused);
+        if let Some(state) = state {
+            self.read(UnitState::decode(state)?);
+        }
+        Ok(())
+    }
+
+    /// A unit state read for the start already taken.
+    #[cfg(test)]
+    pub(crate) fn answer_state(&self, state: &[u8]) -> Result<(), String> {
+        self.read(UnitState::decode(state)?);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn watched(&self) -> bool {
+        self.watching()
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct Launcher {
     send: SyncSender<Work>,
     login: Login,
     hostnames: Hostnames,
+    application: Application,
     /// Root's answer at connect, which the generation's start locks on:
     /// never a later poll's.
     connected: Option<Answer>,
@@ -468,11 +588,13 @@ impl Launcher {
         let (poll, connected) = open_session(&mut wire, &login)?;
         let hostnames = Hostnames::default();
         let followed = hostnames.clone();
+        let application = Application::default();
+        let started = application.clone();
         let (send, receive) = mpsc::sync_channel(QUEUE_CAPACITY);
         std::thread::Builder::new()
             .name("terminal-authority".into())
             .spawn(move || {
-                if let Err(error) = worker(wire, receive, poll, followed) {
+                if let Err(error) = worker(wire, receive, poll, followed, started) {
                     let _ = writeln!(
                         std::io::stderr().lock(),
                         "td-compositor: program authority: {error}"
@@ -486,8 +608,15 @@ impl Launcher {
             send,
             login,
             hostnames,
+            application,
             connected: Some(connected),
         })
+    }
+
+    /// What became of the application's start requests, which the worker
+    /// keeps current while it is watched.
+    pub(crate) fn application(&self) -> Application {
+        self.application.clone()
     }
 
     /// The login state root last answered, which the worker keeps current.
@@ -556,6 +685,7 @@ impl Queued {
                 send,
                 login,
                 hostnames: Hostnames::default(),
+                application: Application::default(),
                 connected: None,
             },
             Self(receive),
@@ -792,23 +922,32 @@ impl Processes {
     }
 }
 
-/// One supervised request: root starts the unit and answers at once, so
-/// nothing is retained or polled.
+/// One supervised request: root starts the unit and answers at once; a
+/// start's outcome is followed with `0f` while the runtime watches it.
 fn supervise(
     wire: &mut impl Exchange,
     request: Supervised,
+    application: &Application,
 ) -> Result<Option<&'static str>, String> {
     let byte = match request {
         Supervised::Start => 0x0d,
         Supervised::Update => 0x0e,
     };
-    match wire.exchange(&[byte])?.as_slice() {
-        [0x84] => Ok(None),
-        [0xff, 1] => Ok(Some("the application's supervisor is already being asked")),
-        [0xff, 2] => Ok(Some("program authority could not ask the supervisor")),
-        [0xff, 3] => Ok(Some("a live session starts only the installer")),
-        _ => Err("invalid supervised request response".into()),
+    let (refused, error) = match wire.exchange(&[byte])?.as_slice() {
+        [0x84] => (false, None),
+        // An earlier start is still being asked, which this one joins.
+        [0xff, 1] => (
+            false,
+            Some("the application's supervisor is already being asked"),
+        ),
+        [0xff, 2] => (true, Some("program authority could not ask the supervisor")),
+        [0xff, 3] => (true, Some("a live session starts only the installer")),
+        _ => return Err("invalid supervised request response".into()),
+    };
+    if request == Supervised::Start {
+        application.started(refused);
     }
+    Ok(error)
 }
 
 fn worker(
@@ -816,6 +955,7 @@ fn worker(
     receive: Receiver<Work>,
     mut login: LoginPoll,
     hostnames: Hostnames,
+    application: Application,
 ) -> Result<(), String> {
     let mut processes = Processes::new();
     let mut secrets = crate::secret_client::Client::default();
@@ -825,7 +965,7 @@ fn worker(
         match work {
             Ok(Work::Secret(attempt)) => secrets.start(&mut wire, attempt)?,
             Ok(Work::Supervised(request)) => {
-                if let Some(error) = supervise(&mut wire, request)? {
+                if let Some(error) = supervise(&mut wire, request, &application)? {
                     let _ = writeln!(std::io::stderr().lock(), "td-compositor: {error}");
                 }
             }
@@ -843,6 +983,7 @@ fn worker(
         secrets.tick(&mut wire)?;
         login.follow(&mut wire, &mut secrets)?;
         hostnames.follow(&mut wire)?;
+        application.follow(&mut wire)?;
     }
 }
 
@@ -1455,18 +1596,129 @@ mod tests {
 
     #[test]
     fn supervised_requests_are_one_byte_and_one_answer() {
+        let application = Application::default();
         let mut started = wire(vec![vec![0x84], vec![0x84]]);
-        assert_eq!(supervise(&mut started, Supervised::Start), Ok(None));
-        assert_eq!(supervise(&mut started, Supervised::Update), Ok(None));
+        assert_eq!(
+            supervise(&mut started, Supervised::Start, &application),
+            Ok(None)
+        );
+        assert_eq!(
+            supervise(&mut started, Supervised::Update, &application),
+            Ok(None)
+        );
         assert_eq!(started.requests, [vec![0x0d], vec![0x0e]]);
-        for answer in [vec![0xff, 1], vec![0xff, 2], vec![0xff, 3]] {
-            assert!(supervise(&mut wire(vec![answer]), Supervised::Start)
-                .unwrap()
-                .is_some());
+        // Only the start counts, and only a refusal marks it refused.
+        assert_eq!(
+            application.outcome(),
+            StartOutcome {
+                sent: 1,
+                refused: false,
+                state: None
+            }
+        );
+        for (answer, refused) in [
+            (vec![0xff, 1], false),
+            (vec![0xff, 2], true),
+            (vec![0xff, 3], true),
+        ] {
+            assert!(
+                supervise(&mut wire(vec![answer]), Supervised::Start, &application)
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(application.outcome().refused, refused);
         }
+        assert_eq!(application.outcome().sent, 4);
         for answer in [vec![], vec![0x84, 0], vec![0x81], vec![0xff, 4]] {
-            assert!(supervise(&mut wire(vec![answer]), Supervised::Update).is_err());
+            assert!(supervise(&mut wire(vec![answer]), Supervised::Update, &application).is_err());
         }
+        assert_eq!(application.outcome().sent, 4);
+    }
+
+    /// A watched launch's turn: the start, the heartbeat, the hostname
+    /// intake, then `0f`, whose answer is kept for the start just sent.
+    #[test]
+    fn a_watched_worker_asks_the_unit_state_after_its_start() {
+        struct Shared(std::rc::Rc<std::cell::RefCell<Wire>>);
+        impl Exchange for Shared {
+            fn send(&mut self, request: &[u8]) -> Result<(), String> {
+                self.0.borrow_mut().send(request)
+            }
+            fn receive(&mut self) -> Result<Vec<u8>, String> {
+                self.0.borrow_mut().receive()
+            }
+        }
+        let script = std::rc::Rc::new(std::cell::RefCell::new(wire(vec![
+            vec![0x84],
+            vec![0x83],
+            vec![0x9f, 0, 0],
+            vec![0x85, 2],
+        ])));
+        let application = Application::default();
+        application.watch(true);
+        let (send, receive) = mpsc::sync_channel(QUEUE_CAPACITY);
+        assert!(send.try_send(Work::Supervised(Supervised::Start)).is_ok());
+        drop(send);
+        assert!(worker(
+            Shared(script.clone()),
+            receive,
+            LoginPoll::new(Login::default()),
+            Hostnames::default(),
+            application.clone(),
+        )
+        .is_err());
+        assert_eq!(
+            script.borrow().requests,
+            [vec![0x0d], vec![3], vec![0x1f], vec![0x0f]]
+        );
+        assert_eq!(
+            application.outcome(),
+            StartOutcome {
+                sent: 1,
+                refused: false,
+                state: Some(UnitState::Running)
+            }
+        );
+    }
+
+    #[test]
+    fn the_unit_state_is_asked_only_while_watched_and_has_one_shape() {
+        let application = Application::default();
+        let mut idle = wire(vec![]);
+        application.follow(&mut idle).unwrap();
+        assert!(idle.requests.is_empty());
+        application.watch(true);
+        for (answer, state) in [
+            (vec![0x85, 0], UnitState::Idle),
+            (vec![0x85, 1], UnitState::Starting),
+            (vec![0x85, 2], UnitState::Running),
+            (vec![0x85, 3], UnitState::Failed),
+            (vec![0x85, 4], UnitState::Unknown),
+            (vec![0xff, 3], UnitState::Failed),
+        ] {
+            let mut asked = wire(vec![answer]);
+            application.follow(&mut asked).unwrap();
+            assert_eq!(asked.requests, [vec![0x0f]]);
+            assert_eq!(application.outcome().state, Some(state));
+        }
+        // A new start forgets what was read about the last.
+        application.started(false);
+        assert_eq!(application.outcome().state, None);
+        for answer in [
+            vec![],
+            vec![0x85],
+            vec![0x85, 5],
+            vec![0x85, 2, 0],
+            vec![0x84],
+            vec![0xff, 1],
+            vec![0xff, 2],
+        ] {
+            assert!(application.follow(&mut wire(vec![answer])).is_err());
+        }
+        application.watch(false);
+        let mut unwatched = wire(vec![]);
+        application.follow(&mut unwatched).unwrap();
+        assert!(unwatched.requests.is_empty());
     }
 
     #[test]
@@ -1491,6 +1743,7 @@ mod tests {
             receive,
             LoginPoll::new(Login::default()),
             Hostnames::default(),
+            Application::default(),
         )
         .is_err());
         assert_eq!(calls.get(), 1);
@@ -1546,6 +1799,7 @@ mod tests {
             send,
             login: Login::default(),
             hostnames: Hostnames::default(),
+            application: Application::default(),
             connected: None,
         };
         assert!(launcher.launch().is_ok());

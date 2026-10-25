@@ -11172,7 +11172,12 @@ both names, keeps at most one of each in flight, and answers at once
 (`84`). On a live boot both are refused, since that session runs only
 the installer. The launcher sends `0d` when the application's card finds no
 window, and `0e` from an "UPDATE FIREFOX" row beside the card, shown
-only with the authority, which is the forced check. `firefox-update` is
+only with the authority, which is the forced check. A third, `0f`, has
+root read the `firefox` unit's td-svc state, so the bar shows the launch
+from the card's press until a window maps or the unit fails
+(td-compositor/DESIGN.md, the strip's LAUNCH cell); it is td-svc's
+state, not the download's, and a first launch's download reads as the
+unit running with no window yet. `firefox-update` is
 a oneshot that runs `td-app update firefox --force` as `tda65536`, with
 `unless-exists=/` so that only a `start` ever runs it, and an hour's
 timeout. Starting the application's unit grants the human nothing it

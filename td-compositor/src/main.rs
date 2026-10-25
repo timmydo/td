@@ -528,6 +528,7 @@ fn run_compositor(options: RunOptions) -> Result<(), String> {
     runtime.set_launcher_authority(options.terminal_authority);
     if let launcher::LaunchBackend::Authority(authority) = &launches {
         runtime.set_hostnames(authority.hostnames());
+        runtime.set_application_outcome(authority.application());
     }
     if let Some((((path, app_id), content_rgb_a), content_rgb_b)) = options
         .application_ready_socket
@@ -1178,7 +1179,7 @@ mod confinement {
     const SYS: &str = include_str!("sys.rs");
     const SCM: &str = include_str!("../../td-secret/src/scm.rs");
     const DRM: &str = include_str!("drm.rs");
-    const AUTHORITY_FINGERPRINT: u64 = 0x94c1cc51dd24f8e0;
+    const AUTHORITY_FINGERPRINT: u64 = 0x08b83a7a836cf1c2;
     const AUTH_SYS_FINGERPRINT: u64 = 0x42363c39df98214d;
     const AUTH_CHANNEL_FINGERPRINT: u64 = 0xdf20e4130b2d96e2;
     const AUTHORITY: &str = include_str!("authority.rs");

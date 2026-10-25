@@ -4,6 +4,7 @@ use crate::{filter, socket};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
+use std::time::{Duration, Instant};
 
 const CARD_WIDTH: usize = 480;
 const CARD_HEIGHT: usize = 504;
@@ -810,6 +811,229 @@ pub(crate) fn launch_command(
         published_ready.as_os_str().to_os_string(),
     ];
     Ok((program, arguments, tracked_ready))
+}
+
+/// How long a failed launch's state stays on the bar.
+const LAUNCH_FAILED_TIME: Duration = Duration::from_secs(30);
+/// How long a launch may stay pending before the bar stops waiting on it:
+/// far past any start, so only a window that never matches reaches it.
+const LAUNCH_LIMIT: Duration = Duration::from_secs(30 * 60);
+
+/// The configured application's launch from its card, from the request
+/// until its window maps or the start fails (DESIGN.md, the launcher).
+/// It shows what root last read of the application's unit and how long
+/// the launch has taken, and never claims more: what the unit is doing
+/// inside its run is not on the wire.
+pub(crate) struct PendingLaunch {
+    label: String,
+    /// The worker's start count before this request: an outcome counts
+    /// only once the count moved past it.
+    base: u64,
+    sent: bool,
+    since: Instant,
+    /// When the shown state became a failure; cleared if the unit is seen
+    /// going up again, as a supervised restart does.
+    ended: Option<Instant>,
+}
+
+impl PendingLaunch {
+    /// `sent` says the request reached the worker's queue.
+    pub(crate) fn begin(label: &str, base: u64, sent: bool, now: Instant) -> Self {
+        Self {
+            label: label.to_string(),
+            base,
+            sent,
+            since: now,
+            ended: None,
+        }
+    }
+
+    /// Whether another activation must not ask again: the launch is under
+    /// way and has not failed.
+    pub(crate) fn blocks_start(&self) -> bool {
+        self.ended.is_none()
+    }
+
+    /// The bar's text at `now` for `outcome`, or `None` once the launch
+    /// is over without a window: a failure shown its time, or the limit.
+    pub(crate) fn text(
+        &mut self,
+        outcome: crate::authority::StartOutcome,
+        now: Instant,
+    ) -> Option<String> {
+        use crate::authority::UnitState;
+        let elapsed = now.saturating_duration_since(self.since);
+        if elapsed >= LAUNCH_LIMIT {
+            return None;
+        }
+        let answered = outcome.sent != self.base;
+        let phase = match (self.sent, answered, outcome.refused, outcome.state) {
+            // The worker's queue held another request, or there is no
+            // authority: nothing was asked, so nothing failed.
+            (false, _, _, _) => Err("NOT STARTED"),
+            (true, true, true, _) => Err("FAILED TO START"),
+            (true, true, false, Some(UnitState::Failed)) => Err("FAILED TO START"),
+            (true, true, false, Some(UnitState::Idle)) => Err("EXITED"),
+            (true, true, false, Some(UnitState::Running)) => Ok("LOADING"),
+            (true, false, _, _)
+            | (true, true, false, None | Some(UnitState::Starting | UnitState::Unknown)) => {
+                Ok("STARTING")
+            }
+        };
+        match phase {
+            Ok(phase) => {
+                self.ended = None;
+                let seconds = elapsed.as_secs();
+                Some(format!(
+                    "{} {phase} {}:{:02}",
+                    self.label,
+                    seconds / 60,
+                    seconds % 60
+                ))
+            }
+            Err(ending) => {
+                let at = *self.ended.get_or_insert(now);
+                (now.saturating_duration_since(at) < LAUNCH_FAILED_TIME)
+                    .then(|| format!("{} {ending}", self.label))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod pending_launch_tests {
+    use super::*;
+    use crate::authority::{StartOutcome, UnitState};
+
+    fn outcome(sent: u64, refused: bool, state: Option<UnitState>) -> StartOutcome {
+        StartOutcome {
+            sent,
+            refused,
+            state,
+        }
+    }
+
+    #[test]
+    fn a_launch_names_its_phase_and_how_long_it_has_taken() {
+        let start = Instant::now();
+        let mut launch = PendingLaunch::begin("FIREFOX", 3, true, start);
+        // Before the worker sent it, and before root read anything.
+        assert_eq!(
+            launch.text(outcome(3, false, Some(UnitState::Running)), start),
+            Some("FIREFOX STARTING 0:00".into())
+        );
+        let later = start + Duration::from_secs(7);
+        assert_eq!(
+            launch.text(outcome(4, false, None), later),
+            Some("FIREFOX STARTING 0:07".into())
+        );
+        for state in [UnitState::Starting, UnitState::Unknown] {
+            assert_eq!(
+                launch.text(outcome(4, false, Some(state)), later),
+                Some("FIREFOX STARTING 0:07".into())
+            );
+        }
+        let minutes = start + Duration::from_secs(125);
+        assert_eq!(
+            launch.text(outcome(4, false, Some(UnitState::Running)), minutes),
+            Some("FIREFOX LOADING 2:05".into())
+        );
+        assert!(launch.blocks_start());
+        assert_eq!(
+            launch.text(
+                outcome(4, false, Some(UnitState::Running)),
+                start + LAUNCH_LIMIT
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_failure_shows_for_its_time_unless_the_unit_comes_back() {
+        let start = Instant::now();
+        let mut launch = PendingLaunch::begin("FIREFOX", 0, true, start);
+        let failed = start + Duration::from_secs(5);
+        assert_eq!(
+            launch.text(outcome(1, false, Some(UnitState::Failed)), failed),
+            Some("FIREFOX FAILED TO START".into())
+        );
+        assert!(!launch.blocks_start());
+        // A supervised restart takes it back up.
+        let back = failed + Duration::from_secs(2);
+        assert_eq!(
+            launch.text(outcome(1, false, Some(UnitState::Running)), back),
+            Some("FIREFOX LOADING 0:07".into())
+        );
+        assert!(launch.blocks_start());
+        let exited = back + Duration::from_secs(1);
+        assert_eq!(
+            launch.text(outcome(1, false, Some(UnitState::Idle)), exited),
+            Some("FIREFOX EXITED".into())
+        );
+        let shown = exited + LAUNCH_FAILED_TIME - Duration::from_millis(1);
+        assert_eq!(
+            launch.text(outcome(1, false, Some(UnitState::Idle)), shown),
+            Some("FIREFOX EXITED".into())
+        );
+        assert_eq!(
+            launch.text(
+                outcome(1, false, Some(UnitState::Idle)),
+                exited + LAUNCH_FAILED_TIME
+            ),
+            None
+        );
+    }
+
+    /// The bar draws every name the image grammar admits, uppercased, and
+    /// every phase, with Unifont behind the outline face.
+    #[test]
+    fn every_character_a_launch_can_spell_is_in_the_font() {
+        let start = Instant::now();
+        let name = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-";
+        let states = [
+            outcome(1, false, None),
+            outcome(1, false, Some(UnitState::Running)),
+            outcome(1, false, Some(UnitState::Idle)),
+            outcome(1, true, None),
+        ];
+        for (sent, state) in states
+            .into_iter()
+            .map(|state| (true, state))
+            .chain([(false, outcome(0, false, None))])
+        {
+            let mut launch = PendingLaunch::begin(name, 0, sent, start);
+            let text = launch
+                .text(state, start + Duration::from_secs(599))
+                .unwrap();
+            for character in text.chars() {
+                assert!(
+                    crate::text::covered(character),
+                    "{character:?} in {text:?} has no glyph"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_request_never_sent_or_refused_fails_at_once() {
+        let start = Instant::now();
+        let mut unsent = PendingLaunch::begin("FIREFOX", 0, false, start);
+        assert_eq!(
+            unsent.text(outcome(0, false, None), start),
+            Some("FIREFOX NOT STARTED".into())
+        );
+        let mut refused = PendingLaunch::begin("FIREFOX", 0, true, start);
+        assert_eq!(
+            refused.text(outcome(1, true, Some(UnitState::Running)), start),
+            Some("FIREFOX FAILED TO START".into())
+        );
+        // Nothing read for an earlier start answers for this one.
+        let mut fresh = PendingLaunch::begin("FIREFOX", 1, true, start);
+        assert_eq!(
+            fresh.text(outcome(1, true, Some(UnitState::Failed)), start),
+            Some("FIREFOX STARTING 0:00".into())
+        );
+    }
 }
 
 #[cfg(test)]

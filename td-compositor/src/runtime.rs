@@ -662,6 +662,13 @@ pub struct Runtime {
     screenshots: Option<(SyncSender<crate::screenshot::Job>, bool)>,
     /// When the bar's screenshot notice gives way to the status line.
     notice_until: Option<std::time::Instant>,
+    /// The configured application's start outcome, which the authority
+    /// worker keeps current; none in the direct profile.
+    application_outcome: Option<crate::authority::Application>,
+    /// The configured application's name as its card shows it.
+    application_label: Option<String>,
+    /// A launch from the card waiting for its window.
+    launch: Option<crate::launcher::PendingLaunch>,
     backlight: Option<td_backlight::Panel>,
     /// xdg-foreign handles are compositor-wide bearer capabilities. The
     /// object maps stay on their owning client threads; this registry carries
@@ -886,6 +893,9 @@ impl Runtime {
             clipboard_writer: None,
             screenshots: None,
             notice_until: None,
+            application_outcome: None,
+            application_label: None,
+            launch: None,
             backlight: None,
             foreign_exports: BTreeMap::new(),
             foreign_imports: BTreeMap::new(),
@@ -996,7 +1006,14 @@ impl Runtime {
     }
 
     pub(crate) fn set_launcher_application(&mut self, application: Option<&str>) {
+        self.application_label = application.map(str::to_ascii_uppercase);
         self.scene.set_launcher_application(application);
+    }
+
+    /// The handle a launch from the card reads its outcome from, which the
+    /// authority worker keeps current while a launch is pending.
+    pub(crate) fn set_application_outcome(&mut self, outcome: crate::authority::Application) {
+        self.application_outcome = Some(outcome);
     }
 
     pub(crate) fn set_text(&mut self, text: crate::text::Text) {
@@ -1377,6 +1394,11 @@ impl Runtime {
     /// pixels are on glass is `last_submission`'s to answer, and against a
     /// KMS backend the answer would be "not yet".
     pub fn repaint(&mut self) -> Result<(), String> {
+        // A window that maps repaints, and ends the launch waiting for it
+        // in the same paint.
+        if self.launch.is_some() && self.application_mapped() {
+            self.refresh_launch();
+        }
         self.last_submission = None;
         if let Some(compound) = self.compound_settle.as_mut() {
             compound.paint = true;
@@ -3372,6 +3394,82 @@ impl Runtime {
         Ok(request)
     }
 
+    /// The card found no window: ask for the application's start with
+    /// `send` and show the launch on the bar until its window maps or the
+    /// start fails. A launch already under way is not asked again.
+    pub(crate) fn launch_application(
+        &mut self,
+        send: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.refresh_launch();
+        if self
+            .launch
+            .as_ref()
+            .is_some_and(crate::launcher::PendingLaunch::blocks_start)
+        {
+            return Ok(());
+        }
+        let base = self
+            .application_outcome
+            .as_ref()
+            .map_or(0, |outcome| outcome.outcome().sent);
+        let sent = send();
+        if let Err(error) = &sent {
+            eprintln!("td-compositor: configured application has no mapped window: {error}");
+        }
+        let label = self.application_label.as_deref().unwrap_or("APPLICATION");
+        self.launch = Some(crate::launcher::PendingLaunch::begin(
+            label,
+            base,
+            sent.is_ok(),
+            Instant::now(),
+        ));
+        // A replaced launch's watch ends too; only a sent request is
+        // followed.
+        if let Some(outcome) = &self.application_outcome {
+            outcome.watch(sent.is_ok());
+        }
+        if self.refresh_launch() {
+            self.repaint()?;
+        }
+        Ok(())
+    }
+
+    /// Whether a mapped window matches the configured application.
+    fn application_mapped(&self) -> bool {
+        self.application_ready.as_ref().is_some_and(|ready| {
+            ready
+                .candidates
+                .iter()
+                .any(|candidate| self.scene.is_mapped(*candidate))
+        })
+    }
+
+    /// Brings the pending launch's bar text up to date, ending it once its
+    /// window maps or it is over; whether the bar's text changed.
+    fn refresh_launch(&mut self) -> bool {
+        if self.launch.is_none() {
+            return false;
+        }
+        let mapped = self.application_mapped();
+        let outcome = self
+            .application_outcome
+            .as_ref()
+            .map(crate::authority::Application::outcome)
+            .unwrap_or_default();
+        let text = match self.launch.as_mut() {
+            Some(launch) if !mapped => launch.text(outcome, Instant::now()),
+            _ => None,
+        };
+        if text.is_none() {
+            self.launch = None;
+            if let Some(outcome) = &self.application_outcome {
+                outcome.watch(false);
+            }
+        }
+        self.scene.set_launch(text)
+    }
+
     /// Activate the mapped toplevel observed for the configured application.
     /// The compositor never owns the application process; a missing surface is
     /// therefore reported to the caller rather than replaced by another launch.
@@ -3441,8 +3539,11 @@ impl Runtime {
             self.notice_until = None;
         }
         let cleared = expired && self.scene.set_notice(None);
+        // The sampler's tick is also what moves a pending launch's state
+        // and time on.
+        let launch = self.refresh_launch();
         let previous = self.scene.set_status(status);
-        if previous.is_none() && !cleared {
+        if previous.is_none() && !cleared && !launch {
             return Ok(());
         }
         if let Err(error) = self.repaint() {
@@ -14290,6 +14391,108 @@ mod tests {
         assert_eq!(runtime.focused_toplevel(), Some(application));
         assert_eq!(runtime.scene.layout().workspace_of(application), Some(2));
         assert!(runtime.scene.layout().check_invariants().is_ok());
+    }
+
+    #[test]
+    fn a_card_launch_shows_on_the_bar_until_its_window_maps() {
+        let dir = crate::temp_dir::TempDir::new("td-runtime-application-launch").unwrap();
+        let framebuffer =
+            Framebuffer::test_file(&dir.path().join("fb"), 800, 600, 800 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let (wake, ready) = mpsc::sync_channel(1);
+        runtime
+            .watch_application(
+                "org.mozilla.firefox".to_string(),
+                APPLICATION_CONTENT_RGBS,
+                wake,
+            )
+            .unwrap();
+        runtime.set_launcher_application(Some("firefox"));
+        let outcome = crate::authority::Application::default();
+        runtime.set_application_outcome(outcome.clone());
+
+        let mut asked = 0;
+        runtime
+            .launch_application(|| {
+                asked += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(asked, 1);
+        assert!(outcome.watched());
+        let shown = runtime.scene.launch().unwrap().to_string();
+        assert!(shown.starts_with("FIREFOX STARTING 0:0"), "{shown}");
+        // A second activation while it is under way asks nothing.
+        runtime
+            .launch_application(|| {
+                asked += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(asked, 1);
+
+        // The worker sent it and root reads the unit running.
+        outcome.answer(false, Some(&[0x85, 2])).unwrap();
+        runtime.set_status("tick".into()).unwrap();
+        let shown = runtime.scene.launch().unwrap().to_string();
+        assert!(shown.starts_with("FIREFOX LOADING 0:0"), "{shown}");
+
+        // Its window maps: the launch is over and no longer watched.
+        let application = SurfaceKey {
+            client: 7,
+            object: 11,
+        };
+        runtime
+            .set_application_id(application, "org.mozilla.firefox")
+            .unwrap();
+        lend_application_resources(&mut runtime, application.client);
+        runtime
+            .apply_commit(application, Some(application_content_surface()), None, None)
+            .unwrap();
+        assert!(ready.try_recv().is_ok());
+        assert_eq!(runtime.scene.launch(), None);
+        assert!(!outcome.watched());
+        dir.cleanup().unwrap();
+    }
+
+    #[test]
+    fn a_failed_card_launch_says_so_and_may_be_asked_again() {
+        let dir = crate::temp_dir::TempDir::new("td-runtime-application-failed").unwrap();
+        let framebuffer =
+            Framebuffer::test_file(&dir.path().join("fb"), 800, 600, 800 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        runtime.set_launcher_application(Some("firefox"));
+        let outcome = crate::authority::Application::default();
+        runtime.set_application_outcome(outcome.clone());
+        runtime.launch_application(|| Ok(())).unwrap();
+        outcome.answer(false, Some(&[0x85, 3])).unwrap();
+        runtime.set_status("tick".into()).unwrap();
+        assert_eq!(runtime.scene.launch(), Some("FIREFOX FAILED TO START"));
+        // A failed launch is asked again.
+        let mut asked = 0;
+        runtime
+            .launch_application(|| {
+                asked += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(asked, 1);
+        let shown = runtime.scene.launch().unwrap().to_string();
+        assert!(shown.starts_with("FIREFOX STARTING"), "{shown}");
+        // A read for the earlier start does not answer for this one.
+        outcome.answer_state(&[0x85, 3]).unwrap();
+        runtime.set_status("tock".into()).unwrap();
+        let shown = runtime.scene.launch().unwrap().to_string();
+        assert!(shown.starts_with("FIREFOX STARTING"), "{shown}");
+        // Root refused it; then a request the queue refused fails at once.
+        outcome.answer(true, None).unwrap();
+        runtime.set_status("tick".into()).unwrap();
+        assert_eq!(runtime.scene.launch(), Some("FIREFOX FAILED TO START"));
+        runtime
+            .launch_application(|| Err("authority request already pending".into()))
+            .unwrap();
+        assert_eq!(runtime.scene.launch(), Some("FIREFOX NOT STARTED"));
+        dir.cleanup().unwrap();
     }
 
     #[test]
