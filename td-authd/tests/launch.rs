@@ -138,7 +138,6 @@ fn malformed_primary_configuration_never_reads_the_account_database() {
 fn the_caller_can_only_start_poll_or_keep_the_channel_alive() {
     assert_eq!(request(&[1]).unwrap(), Request::Start(Program::Home));
     assert_eq!(request(&[4]).unwrap(), Request::Start(Program::Task));
-    assert_eq!(request(&[6]).unwrap(), Request::Start(Program::Claude));
     assert_eq!(request(&[7]).unwrap(), Request::Start(Program::TaskManager));
     assert_eq!(request(&[8]).unwrap(), Request::Start(Program::Editor));
     assert_eq!(request(&[9]).unwrap(), Request::Start(Program::Photo));
@@ -165,6 +164,7 @@ fn the_caller_can_only_start_poll_or_keep_the_channel_alive() {
         vec![4, 0],
         vec![5],
         vec![5, 0],
+        vec![6],
         vec![6, 0],
         vec![7, 0],
         vec![8, 0],
@@ -251,35 +251,6 @@ fn fixed_commands_select_the_account_and_all_terminal_arguments() {
             "/run/td-compositor/1000/wayland-0",
             "--ready-socket",
             "/run/user/1000/td-auth-terminal-000102030405060708090a0b0c0d0e0f-17.ready",
-        ]
-    );
-}
-
-#[test]
-fn the_task_agent_uses_its_fixed_human_entry_point_and_a_controlling_terminal() {
-    let helper = config().terminal("000102030405060708090a0b0c0d0e0f", 1, Program::Claude);
-    assert_eq!(
-        helper.get_args().last(),
-        Some(std::ffi::OsStr::new("claude"))
-    );
-    let command = terminal_command(
-        1000,
-        "000102030405060708090a0b0c0d0e0f",
-        1,
-        Program::Claude,
-        || Ok(primary("tester")),
-    )
-    .unwrap();
-    assert_eq!(command.get_program(), "/bin/td-term");
-    assert_eq!(
-        command.get_args().skip(5).collect::<Vec<_>>(),
-        [
-            "--working-directory",
-            "/home/tester/src/td-vm/work",
-            "--command",
-            "/bin/cttyhack",
-            "--stdin",
-            "/bin/claude",
         ]
     );
 }
@@ -609,7 +580,6 @@ fn task_manager_has_fixed_unprivileged_exec_and_display_only() {
 fn every_selection_literal_names_its_program_back() {
     for program in [
         Program::Task,
-        Program::Claude,
         Program::TaskManager,
         Program::Editor,
         Program::Photo,
@@ -625,6 +595,7 @@ fn every_selection_literal_names_its_program_back() {
         "",
         "home",
         "codex",
+        "claude",
         "Review",
         "/bin/td-review",
         "review ",
@@ -688,26 +659,27 @@ fn desktop_programs_exec_fixed_binaries_from_the_validated_home() {
 }
 
 #[test]
-fn task_and_agent_directories_follow_the_validated_primary_account() {
+fn the_task_directory_follows_the_validated_primary_account() {
     for name in ["alice", "bob"] {
-        for program in [Program::Task, Program::Claude] {
-            let command =
-                terminal_command(1000, "000102030405060708090a0b0c0d0e0f", 1, program, || {
-                    Ok(primary(name))
-                })
-                .unwrap();
-            let expected = format!("/home/{name}/src/td-vm/work");
-            assert!(command
-                .get_args()
-                .collect::<Vec<_>>()
-                .windows(2)
-                .any(|pair| {
-                    pair == [
-                        std::ffi::OsStr::new("--working-directory"),
-                        std::ffi::OsStr::new(&expected),
-                    ]
-                }));
-        }
+        let command = terminal_command(
+            1000,
+            "000102030405060708090a0b0c0d0e0f",
+            1,
+            Program::Task,
+            || Ok(primary(name)),
+        )
+        .unwrap();
+        let expected = format!("/home/{name}/src/td-vm/work");
+        assert!(command
+            .get_args()
+            .collect::<Vec<_>>()
+            .windows(2)
+            .any(|pair| {
+                pair == [
+                    std::ffi::OsStr::new("--working-directory"),
+                    std::ffi::OsStr::new(&expected),
+                ]
+            }));
     }
 }
 
@@ -717,7 +689,6 @@ fn only_launches_placed_in_the_account_require_the_primary_account() {
         Program::Home,
         Program::TaskManager,
         Program::Task,
-        Program::Claude,
         Program::Editor,
         Program::Photo,
         Program::Review,

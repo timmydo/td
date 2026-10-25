@@ -1147,8 +1147,8 @@ profile (the desktop's every child leads, §7), leads NO session: the slave
 is its stdio, and it starts in td-term's session with no controlling
 terminal. The session exists for a shell, which expects a
 controlling terminal it does not create; a program that wants one names
-`/bin/cttyhack --stdin` itself, as td-authd's launch does, and a td-jail
-terminal application must not, because the jail's terminal grant
+`/bin/cttyhack --stdin` itself, and a td-jail terminal application must
+not, because the jail's terminal grant
 (`devices=tty`, its own increment in APPLICATIONS.md §C) acquires the
 terminal inside stage 1's detached session, and the kernel refuses
 `TIOCSCTTY` for a terminal another session already holds. The consequence

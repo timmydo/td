@@ -9,7 +9,7 @@ and the development/Git workflow. It is not a prerequisite for creating or
 booting a VM.
 
 The eventual acceptance criterion remains creating an instance and working in
-td with the selected agent and linked host identity, without repeating image
+td with td-agent and linked host identity, without repeating image
 setup or login. Capability status distinguishes that eventual workflow from
 an ordinary running desktop.
 
@@ -88,8 +88,9 @@ The stock desktop supports per-instance Git keys, enrollment and explicit
 clone provisioning and orderly poweroff through the guest helpers below.
 Open automatically enrolls and prepares a saved workspace in the background.
 It then prepares private writable build state and queues a terminal in the
-selected task worktree. Explicit agent launch is available; automatic agent
-selection and account linking remain pending. The
+selected task worktree. No guest agent is launched by td-vm: the image's
+coding agent is td-agent, which the desktop's Coding Agent card starts;
+account linking remains pending. The
 td-owned clipboard, feed and workspace bridges require a matching updated
 system image. `stop NAME` or TUI S queues orderly guest poweroff;
 `stop NAME --force` or TUI X explicitly cuts power. Disk deletion requires `--yes` or
@@ -123,7 +124,7 @@ Escape sequences in names, guest messages, and logs are rendered as text.
 
 | Action | Behavior |
 | --- | --- |
-| New | Choose name and Claude or a development shell; use the configured repository, template, and resource defaults. |
+| New | Choose name; use the configured repository, template, and resource defaults. |
 | Open / Enter | Boot a stopped instance in its own QEMU graphics window. For a running instance, identify its existing window and focus it where the host permits; never launch a second QEMU on its disk. |
 | Stop | Request an orderly guest shutdown and report completion. |
 | Restart | Request an orderly guest reboot within the same QEMU process. |
@@ -142,7 +143,7 @@ flowchart LR
     Supervisor --> QEMU[QEMU graphics window]
     QEMU --> Compositor[td-compositor]
     Compositor --> Terminal[td-term]
-    Terminal --> Agent[Claude / shell]
+    Terminal --> Agent[shell / td-agent]
     Host[Host settings and account adapter] --> Bridge[Private VM bridge]
     Bridge --> Guest[td guest provisioning helper]
     Guest --> Agent
@@ -244,11 +245,10 @@ for the initial stock-desktop lifecycle increment. The image producer owns:
   session. The provisioner creates state through its fixed service operation;
   root has no login, SSH included, so no step can need one
   (APPLICATIONS.md §L.1, L7).
-- The reviewed Claude application payload and runtime, with its working
-  directories, configuration, credentials, and child tools reachable through
-  its proper launch path. Claude is the only guest agent until td-agent
-  lands. Host CLI executables and host plugin binaries are not copied into the
-  image.
+- td-agent, the image's own coding agent, with its working directories,
+  configuration and credentials reachable through its launch path. No
+  foreign agent payload ships. Host CLI executables and host plugin
+  binaries are not copied into the image.
 - The tools required by DEVELOPMENT.md's review roster as well as its build
   gate. The Codex CLI cross-model reviewer is not among them now that the
   guest carries no Codex payload, so a guest agent cannot fill that slot.
@@ -258,8 +258,8 @@ for the initial stock-desktop lifecycle increment. The image producer owns:
 
 First boot creates a unique identity, provisions the private Git clone and
 task worktree described below, installs the mapped settings, establishes the
-selected account adapter, and opens the chosen agent in a fresh td-term window
-at that worktree. Provisioning is idempotent and journaled by generation:
+selected account adapter, and queues a fresh td-term window at that
+worktree. Provisioning is idempotent and journaled by generation:
 retries do not erase work, rerun a clone over a modified checkout, or reset CLI state.
 Subsequent boots reuse that state and report any required migration.
 
@@ -612,7 +612,7 @@ sharing mutable build databases or compiling everything anew for every VM.
 Link each selected host CLI profile once. Honor its configured home/location
 and credential backend rather than assuming every installation uses defaults.
 Settings transfer is an explicit schema/version adapter, not a recursive mount
-of `~/.claude` or the host home.
+of a CLI's home or the host home.
 
 Copy portable preferences, instructions, skills, and supported source-based
 extensions into an instance-local configuration generation. Map the chosen host
@@ -634,46 +634,6 @@ private. New instances receive the selected settings generation automatically.
 Synchronize settings explicitly for an existing instance, showing conflicts
 with guest edits. Boot does not overwrite its changed settings, and guest
 changes are not silently written back to the host profile.
-
-### Implemented host settings source profile
-
-The manager now stores one operator-selected source profile under its private
-state root. Configure it with `td-vm settings-profile set FILE`, inspect it with
-`td-vm settings-profile show`, and revalidate it with
-`td-vm settings-profile check`. This is the settings equivalent of the host Git
-profile: it establishes exactly which host material a later schema adapter may
-read; it does not yet translate or send that material to a guest.
-
-The canonical `TDVM-SETTINGS-PROFILE-2` input has exactly these fields:
-`workspace`, `path`, `claude-home`, `claude`, `claude-sha256`,
-`claude-version`, and `claude-settings-sha256`. Paths are bounded
-canonical-shaped absolute paths. The version is a bounded single line;
-settings fingerprints are lowercase SHA-256. The private stored copy is mode
-0600 and replaced by a synced rename under a stable profile lock.
-
-Claude is the only profiled agent, so there is no `default-agent` selector.
-A version-1 input or stored profile, which carried that selector and Codex
-fields, is refused with an error naming the removed agent; the operator sets a
-version-2 profile. A later agent such as td-agent adds its fields and any
-selector in a new profile version.
-
-`check` resolves and validates the workspace, the Claude home, every configured
-`PATH` entry, their ancestors, and the executable under caller-or-root
-ownership without group/other writes. It opens `settings.json` and the
-executable entry file without following their final links, compares their
-exact fingerprints, bounds the settings file at 64 KiB, and runs the exact
-executable's `--version` with a cleared environment plus scoped `HOME`,
-`CLAUDE_CONFIG_DIR`, and the configured PATH.
-A settings or executable change requires an explicit reviewed profile
-replacement instead of silently changing later guests.
-
-The profile deliberately has no field for Claude `.credentials.json`,
-keyring contents, session databases, caches, transcripts, or project trust
-databases. A settings fingerprint is public configuration
-identity, not a credential. The next increment owns schema classification,
-host-path remapping, an instance-local generation and explicit conflict-aware
-guest synchronization. Until then `check` says those capabilities and login
-reuse remain pending; a matching hash/version is not an agent-ready claim.
 
 ## Login reuse and refresh ownership
 
@@ -701,16 +661,8 @@ Provider integration has separate obligations:
 
 | Provider/mode | Design and required proof |
 | --- | --- |
-| Claude subscription | Prefer a reusable host-managed credential that the pinned CLI officially accepts. A `claude setup-token` credential is a candidate for one-time host linking; an ordinary cached access token is not equivalent to it. Prove expiry, restart/resume, account restrictions, and the guest launch interface. |
 | Existing API-key profile | Deliver the selected existing key through the provider adapter, retaining the configured endpoint and billing mode. Never select this mode just because subscription forwarding is unfinished. |
 | OS keyring or external helper | Use a reviewed host adapter for that backend. Never copy the keyring database, request all stored secrets, or assume a nonexportable credential can be extracted. |
-
-Claude documents Linux credentials in its configured `.credentials.json` and
-a separately generated setup token. Its environment-token mode retains the
-token for the running session and requires replacement/restart on expiry;
-rewriting a file cannot be assumed to update that process. See
-[Claude authentication](https://code.claude.com/docs/en/authentication) and
-[environment variables](https://code.claude.com/docs/en/env-vars).
 
 This provider-compatibility spike follows the VM, clipboard, artifact, and
 development workflow increments below. Its output
@@ -856,7 +808,7 @@ recursively change repository ownership. Check that files written through
 SSH as `test` remain accessible to the integrator under the existing group/ACL
 and umask policy. `timmy`'s local manager permissions and a VM's SSH permission
 to act as `test` are different grants.
-Claude settings and login reuse still come from `timmy`'s selected host
+Agent settings and login reuse would come from `timmy`'s selected host
 profile. Selecting `test` for Git does not select `test`'s AI accounts.
 
 `test`'s existing authorized-key files, normally
@@ -1405,30 +1357,21 @@ retain their existing workflow semantics.
 The host integrator may keep its local-path origin. Another development or
 review machine can use an SSH URL reaching the same bare repository, with its
 own enrolled key and role. An integrator using SSH needs a separately authorized
-integrator key; a VM-restricted key cannot publish main. Claude account
+integrator key; a VM-restricted key cannot publish main. Agent account
 credentials remain separate from these Git SSH keys.
 
 ## Working through td-term and td-compositor
 
-`td-vm workspace agent NAME claude` (TUI `a`) explicitly queues Claude in
-the prepared task worktree. The CLI keeps the literal agent argument as a
-closed selection so a later agent joins without a new command shape; the TUI
-has no choice to make. Like `workspace terminal`, it requires the exact
-retained clone plan and guest-ready record. It uses typed private bridge
-operations and the paired authority's fixed human-session launch commands.
-Claude enters its existing application-UID shell launcher and jail. Queue
-admission is not successful exec or authentication. Open still queues a shell;
-automatic agent selection, settings delivery and login reuse remain pending.
+`td-vm workspace terminal NAME` (TUI `T`) queues a terminal in the
+prepared task worktree, through typed private bridge operations and the
+paired authority's fixed human-session launch commands. td-vm launches no
+agent and keeps no agent settings profile; td-agent, the guest's coding
+agent, is started from the desktop. Queue admission is not successful exec
+or authentication. Settings delivery and login reuse remain pending.
 
-Use the compositor's supported launcher/control path to open the agent in a
-fresh td-term PTY. Claude retains its foreign-application marking and
-confinement; make the development checkout, declared build tools, and selected
-credentials available through that policy. Do not launch it outside td-jail to
-make the first demo work. Claude's foreign runtime, including its shell, must
-not become a tool or execution input to a source-built recipe. Prove that
-development commands enter the td-built control plane and its declared build
-sandbox with the correct tools; exposing the checkout alone does not establish
-that boundary.
+Prove that development commands enter the td-built control plane and its
+declared build sandbox with the correct tools; exposing the checkout alone
+does not establish that boundary.
 
 This directly exercises the terminal's native rendering, input, resize,
 scrollback, terminfo, and compositor focus behavior. Fix missing terminal
@@ -1454,8 +1397,8 @@ implementation landings; this proposal does not relax them.
    fixed guest provisioner/power bridge. Enroll per-VM Git keys for host `test`,
    clone automatically, build/check in both guests, push distinct branches over
    SSH, review/land with host td-review, and fetch the resulting main back.
-   Bring the agent launch path through its proper application confinement;
-   authentication can remain explicitly unconfigured at this stage.
+   td-agent starts from the desktop, not from td-vm; authentication can
+   remain explicitly unconfigured at this stage.
 4. **Add settings and login reuse.** Prove the account adapters with real pinned
    CLIs, including concurrent subscription use and refresh ownership. Record
    supported modes and one-time host authorization. Then enable the complete

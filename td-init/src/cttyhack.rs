@@ -15,7 +15,7 @@
 //! stdio. cttyhack must never be the reason the shell it was asked for fails
 //! to start.
 //!
-//! `--stdin` is the exception, and it is td-authd's terminal launch's: the caller
+//! `--stdin` is the exception, for a `td-term --command` child: the caller
 //! has already put a PTY slave on descriptor zero and needs the child to LEAD a
 //! session on it.
 //! That mode always makes a new session — even when an outer terminal was

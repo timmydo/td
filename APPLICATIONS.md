@@ -3098,13 +3098,6 @@ workspace grant. Shell cwd beneath the human's `src` is translated into
 that grant; file ownership on the human's view remains unchanged. The boot
 oracle also requires a human-UID shell launch of `claude --version`.
 
-The VM's explicit task-agent launch uses this same human entry point in
-the primary account's `src/td-vm/work` directory (stock VM:
-`/home/tester/src/td-vm/work`). Its outer td-term slave may be a human
-controlling terminal; only the application service's separate fresh slave
-enters the jail. This adds no grant, build tool, credential import or
-foreign-runtime execution channel into source-built recipes.
-
 **`devices=tty` — the fresh-terminal grant.** The containment bootstrap
 prevents accidental access; this grant defines deliberate acquisition, and
 what is acquired is a fresh terminal, never the operator's. Stage 1, which

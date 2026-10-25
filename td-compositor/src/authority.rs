@@ -581,7 +581,6 @@ impl Queued {
 pub(crate) enum Program {
     Home,
     Task,
-    Claude,
     TaskManager,
     Editor,
     Photo,
@@ -743,7 +742,6 @@ impl Processes {
         let request = match terminal {
             Program::Home => [1],
             Program::Task => [4],
-            Program::Claude => [6],
             Program::TaskManager => [7],
             Program::Editor => [8],
             Program::Photo => [9],
@@ -1387,7 +1385,6 @@ mod tests {
     #[test]
     fn selected_programs_send_only_their_fixed_authority_request() {
         for (terminal, expected) in [
-            (Program::Claude, 6),
             (Program::TaskManager, 7),
             (Program::Editor, 8),
             (Program::Photo, 9),

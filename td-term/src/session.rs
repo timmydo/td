@@ -134,10 +134,10 @@ pub fn environment(
 /// neither; td-ui's `spawn` makes it so as it starts the child. An explicit
 /// command does NOT: it is exec'd as given, with the slave on its stdio and no
 /// session or controlling terminal of its own. A program that wants one says
-/// so, as td-authd's launch does through `/bin/cttyhack --stdin`; td-jail's
-/// terminal grant (`devices=tty` in APPLICATIONS.md) instead acquires the
-/// terminal inside its own detached session, which the kernel refuses for a
-/// terminal another session already holds. Both paths must be absolute: a
+/// so through `/bin/cttyhack --stdin`; td-jail's terminal grant (`devices=tty`
+/// in APPLICATIONS.md) instead acquires the terminal inside its own detached
+/// session, which the kernel refuses for a terminal another session already
+/// holds. Both paths must be absolute: a
 /// relative program would be resolved against an ambient PATH this adapter
 /// deliberately does not have.
 pub fn child_command(shell: &Path, command: &[OsString]) -> Result<ChildCommand, String> {

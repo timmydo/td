@@ -178,7 +178,7 @@ impl Session {
                 )
                 .map(|data| (0, data))
             }
-            wire::WORKSPACE_TERMINAL | wire::WORKSPACE_CLAUDE if request.revision == 0 => {
+            wire::WORKSPACE_TERMINAL if request.revision == 0 => {
                 self.lease = None;
                 let plan = wire::workspace::Plan::parse(&request.data)?;
                 let uid = fs::metadata("/proc/self").map_err(|e| e.to_string())?.uid();
@@ -221,7 +221,6 @@ fn launch_task_terminal(
     wire::workspace::parse_ready(status, plan)?;
     let terminal = match verb {
         wire::WORKSPACE_TERMINAL => crate::authority::Program::Task,
-        wire::WORKSPACE_CLAUDE => crate::authority::Program::Claude,
         _ => return Err("invalid task launch selection".into()),
     };
     task_launch(terminal)
@@ -668,13 +667,13 @@ mod tests {
     }
 
     #[test]
-    fn ready_agent_launch_selects_the_exact_authority_kind() {
+    fn ready_task_launch_selects_the_exact_authority_kind() {
         let plan = wire::workspace::example();
-        let verb = wire::WORKSPACE_CLAUDE;
+        let verb = wire::WORKSPACE_TERMINAL;
         let mut selections = Vec::new();
         let mut launch = |terminal| {
             selections.push(match terminal {
-                crate::authority::Program::Claude => wire::WORKSPACE_CLAUDE,
+                crate::authority::Program::Task => wire::WORKSPACE_TERMINAL,
                 _ => "wrong terminal",
             });
             Ok(())
@@ -697,7 +696,7 @@ mod tests {
             ))
             .is_err()
         );
-        for unknown in ["unknown", "workspace-codex"] {
+        for unknown in ["unknown", "workspace-codex", "workspace-claude"] {
             assert!(launch_task_terminal(
                 &wire::workspace::ready(&plan),
                 &plan,
@@ -709,13 +708,13 @@ mod tests {
     }
 
     #[test]
-    fn agent_requests_refuse_bad_plans_and_revisions_before_launching() {
+    fn task_requests_refuse_bad_plans_and_revisions_before_launching() {
         let fixture = Fixture::new();
         let mut session = Session::default();
         for (revision, data) in [(1, wire::workspace::example().encode()), (0, vec![])] {
             let mut launched = false;
             let reply = session.handle(
-                wire::Message::new(1, wire::WORKSPACE_CLAUDE, revision, data),
+                wire::Message::new(1, wire::WORKSPACE_TERMINAL, revision, data),
                 &fixture.runtime,
                 &fixture.dir.join("feed"),
                 &mut |_| {

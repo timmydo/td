@@ -7383,14 +7383,10 @@ does not retry an unconfirmed launch. Clipboard sharing and focus do not gate
 the operation.
 
 
-The revision-zero `workspace-claude` operation applies the identical
-complete-plan readiness gate and queue acknowledgement. It selects only fixed
-authority request `06`. The authority chooses the executable and worktree; no
-host argument vector crosses the bridge. This explicit launch does not
-establish settings or login readiness. An older image refuses the unknown
-operation rather than falling back to a shell. The former `workspace-codex`
-operation and its authority request `05` are retired: the codec refuses the
-verb and neither is reassigned.
+The former `workspace-codex` and `workspace-claude` agent operations and
+their authority requests `05` and `06` are retired: the codec refuses both
+verbs and none is reassigned. The task terminal is the bridge's only
+launch.
 
 The empty revision-zero `poweroff` carrier operation cancels clipboard leases
 and atomically replaces `vm-poweroff` with the fixed `TDVM-POWEROFF-1\n`

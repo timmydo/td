@@ -586,7 +586,7 @@ Subsequent payloads are exact byte records:
 | `03` | `83` heartbeat |
 | `04` | `81` plus a process handle for a terminal in the fixed task worktree |
 | `05` | retired (formerly the Codex agent); refused like any unknown request and never reassigned |
-| `06` | `81` plus a process handle for Claude in the fixed task worktree |
+| `06` | retired (formerly Claude Code in the fixed task worktree); refused like any unknown request and never reassigned |
 | `07` | `81` plus a process handle for the human task manager |
 | `08` | `81` plus a process handle for the human text editor |
 | `09` | `81` plus a process handle for the human photo tool |
@@ -636,9 +636,9 @@ request or heartbeat within each five-second receive deadline.
 
 The authority runs `/bin/td-login exec-as USER -- /bin/td-authd
 terminal-exec UID GENERATION HANDLE
-[task|claude|taskmgr|editor|photo|review|dua|agent]` in a new process
-group. The optional literal selects requests `04` and `06` through `0c`; it is not a
-pathname.
+[task|taskmgr|editor|photo|review|dua|agent]` in a new process
+group. The optional literal selects requests `04` and `07` through `0c`;
+it is not a pathname.
 td-login checks
 the human account policy and drops and verifies credentials. Its exact
 environment is `HOME`, `SHELL`, `USER`, `LOGNAME` from the account and
@@ -756,12 +756,6 @@ authorization. Opening one's ordinary terminal is session behavior and opens
 an ordinary shell with the human account's existing authority; it grants
 neither store access nor an elevated shell.
 
-The agent variant enters the same fixed task directory and appends exactly
-`--command /bin/cttyhack --stdin /bin/claude`. The wrapper claims the human
-terminal so interactive signals work. Claude's human entry point invokes the
-application client described below: that service creates a separate fresh
-slave for the private-UID jail. The human terminal is never passed into the
-jail, and the wrapper does not bypass confinement.
 Launch is not authentication, settings synchronization, or build readiness.
 
 The compositor-owned runtime directory permits human traversal and socket

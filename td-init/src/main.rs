@@ -453,10 +453,9 @@ mod confinement {
     /// and the applet would fail every time with a plausible errno.
     ///
     /// The live claim needs a PTY slave on descriptor zero, which this crate
-    /// cannot create — it has no `TIOCGPTPEER`. Its remaining caller is
-    /// td-authd's terminal launch of its CLIs, and no system test runs that
-    /// launch yet, so this ordering check is what holds for the positive
-    /// path. (td-term's own shell now claims its session through td-ui.)
+    /// cannot create — it has no `TIOCGPTPEER`. No shipped launch names the
+    /// mode now (td-term's own shell claims its session through td-ui), so
+    /// this ordering check is what holds for the positive path.
     #[test]
     fn the_stdin_session_is_claimed_in_the_only_order_that_works() {
         let cttyhack = sources()

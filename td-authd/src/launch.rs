@@ -266,9 +266,6 @@ fn terminal_command(
             .arg(account()?.home().join("src/td-vm/work"));
     }
     match terminal {
-        Program::Claude => {
-            command.args(["--command", "/bin/cttyhack", "--stdin", "/bin/claude"]);
-        }
         Program::Home | Program::Task => {}
         // Desktop programs returned above; listed so a new kind is a decision.
         Program::TaskManager
@@ -284,7 +281,7 @@ fn terminal_command(
 /// Runs only after td-login dropped credentials, before any terminal code.
 pub(crate) fn terminal_exec(arguments: &[String]) -> Result<(), String> {
     const USAGE: &str = "terminal-exec requires UID GENERATION HANDLE \
-                         [task|claude|taskmgr|editor|photo|review|dua|agent]";
+                         [task|taskmgr|editor|photo|review|dua|agent]";
     let (uid, generation, handle, terminal) = match arguments {
         [uid, generation, handle] => (uid, generation, handle, Some(Program::Home)),
         [uid, generation, handle, literal] => {
@@ -416,7 +413,6 @@ impl Supervised {
 enum Program {
     Home,
     Task,
-    Claude,
     TaskManager,
     Editor,
     Photo,
@@ -430,7 +426,6 @@ impl Program {
         match self {
             Self::Home => None,
             Self::Task => Some("task"),
-            Self::Claude => Some("claude"),
             Self::TaskManager => Some("taskmgr"),
             Self::Editor => Some("editor"),
             Self::Photo => Some("photo"),
@@ -445,7 +440,6 @@ impl Program {
     fn from_selection(literal: &str) -> Option<Self> {
         Some(match literal {
             "task" => Self::Task,
-            "claude" => Self::Claude,
             "taskmgr" => Self::TaskManager,
             "editor" => Self::Editor,
             "photo" => Self::Photo,
@@ -466,7 +460,7 @@ impl Program {
             Self::Review => Some("/bin/td-review"),
             Self::Dua => Some("/bin/td-dua"),
             Self::Agent => Some("/bin/td-agent"),
-            Self::Home | Self::Task | Self::Claude => None,
+            Self::Home | Self::Task => None,
         }
     }
 
@@ -477,7 +471,6 @@ impl Program {
             Self::Review => &["--choose-repo"],
             Self::Home
             | Self::Task
-            | Self::Claude
             | Self::TaskManager
             | Self::Editor
             | Self::Photo
@@ -499,7 +492,6 @@ impl Program {
             ],
             Self::Home
             | Self::Task
-            | Self::Claude
             | Self::TaskManager
             | Self::Editor
             | Self::Photo
@@ -514,7 +506,7 @@ impl Program {
     fn starts_in_account_home(self) -> bool {
         match self {
             Self::Editor | Self::Photo | Self::Review | Self::Dua | Self::Agent => true,
-            Self::Home | Self::Task | Self::Claude | Self::TaskManager => false,
+            Self::Home | Self::Task | Self::TaskManager => false,
         }
     }
 }
@@ -523,8 +515,8 @@ fn request(bytes: &[u8]) -> Result<Request, String> {
     match bytes {
         [1] => Ok(Request::Start(Program::Home)),
         [4] => Ok(Request::Start(Program::Task)),
-        // 5 started the retired Codex agent; it stays unassigned.
-        [6] => Ok(Request::Start(Program::Claude)),
+        // 5 started the retired Codex agent and 6 the retired Claude Code;
+        // both stay unassigned.
         [7] => Ok(Request::Start(Program::TaskManager)),
         [8] => Ok(Request::Start(Program::Editor)),
         [9] => Ok(Request::Start(Program::Photo)),
