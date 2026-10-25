@@ -233,7 +233,7 @@ fn the_disclosure_prose_renders_below_the_rule() {
     // The first body row begins the first paragraph.
     assert!(rows
         .get(&72)
-        .is_some_and(|line| line.starts_with("This installs td")));
+        .is_some_and(|line| line.starts_with("Press R to reinstall td")));
 }
 
 #[test]
@@ -264,21 +264,15 @@ fn the_footer_names_the_step_on_the_bottom_row() {
 
 #[test]
 fn new_refuses_a_surface_too_small_and_accepts_at_the_exact_boundary() {
-    // The binding narrow-end limit is the block's row budget: at scale 1,
-    // 51 columns (width 424) wrap the prose to exactly the block's rows and
-    // end exactly where the footer begins (height 336).
-    assert!(Welcome::new(surface(424, 336, 1)).is_some());
-    // One column narrower wraps a row past the budget.
-    assert!(Welcome::new(surface(423, 336, 1)).is_none());
-    // One pixel shorter overlaps the footer.
-    assert!(Welcome::new(surface(424, 335, 1)).is_none());
-    // Grossly too narrow is refused.
+    // Both installer modes and every disclosure fit the minimum wizard tile.
+    assert!(Welcome::new(surface(752, 508, 1)).is_some());
     assert!(Welcome::new(surface(200, 600, 1)).is_none());
-    // The height boundary at width 800: the prose is 9 rows, ending at
-    // 72 + 9 * 16 = 216, so the footer needs the row from height - 24, i.e.
-    // height 240 accepts and 239 overlaps.
-    assert!(Welcome::new(surface(800, 240, 1)).is_some());
-    assert!(Welcome::new(surface(800, 239, 1)).is_none());
+    // The exact vertical boundary follows the wrapped prose, at two widths.
+    for width in [752, 800] {
+        let height = 72 + welcome::wrap(BODY, (width - 16) / 8).len() * 16 + 24;
+        assert!(Welcome::new(surface(width, height, 1)).is_some());
+        assert!(Welcome::new(surface(width, height - 1, 1)).is_none());
+    }
     // Degenerate: narrower than the two insets, refused without underflow.
     assert!(Welcome::new(surface(8, 600, 1)).is_none());
     // An invalid literal surface (axis past the ceiling) is refused, not

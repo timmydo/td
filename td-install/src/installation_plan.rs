@@ -1,9 +1,9 @@
 //! Immutable review data, not a device claim, authenticated source or consent.
 
 /// Input admission ceiling, checked before parsing or allocating fields.
-/// The largest current valid encoding is 1193 bytes.
+/// The largest current valid encoding is 1194 bytes.
 pub const MAX_BYTES: usize = 2048;
-const MAGIC: &[u8; 8] = b"TDPLAN03";
+const MAGIC: &[u8; 8] = b"TDPLAN04";
 const CANDIDATES_MAGIC: &[u8; 8] = b"TDCAND01";
 const ZONES_MAGIC: &[u8; 8] = b"TDZONE01";
 pub const MAX_CANDIDATES: usize = 64;
@@ -20,6 +20,7 @@ const ENCODED_BYTES: usize = 8
     + 32
     + 32
     + 16
+    + 1
     + DESTINATION_BYTES
     + 2
     + 4 * 2
@@ -388,7 +389,31 @@ impl Basis {
     }
 }
 
-/// One proposed whole-disk, automatic-login installation, with the basis
+/// Whether execution may replace the disk layout or must retain it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Mode {
+    Erase,
+    Preserve,
+}
+
+impl Mode {
+    fn code(self) -> u8 {
+        match self {
+            Self::Erase => 0,
+            Self::Preserve => 1,
+        }
+    }
+
+    fn from_code(code: u8) -> Result<Self, String> {
+        match code {
+            0 => Ok(Self::Erase),
+            1 => Ok(Self::Preserve),
+            _ => Err("invalid installation mode".into()),
+        }
+    }
+}
+
+/// One proposed installation, with the basis
 /// the service's probes found and the storage it names. A fresh nonce
 /// distinguishes otherwise equal proposals. Equality binds all fields;
 /// cloning copies a proposal and never creates another authorization.
@@ -400,6 +425,7 @@ impl Basis {
 /// ```
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Plan {
+    mode: Mode,
     nonce: [u8; 32],
     destination: Destination,
     deployment: [u8; 32],
@@ -426,6 +452,7 @@ impl Plan {
             return Err("installation plan requires a nonce and version-4 volume UUID".into());
         }
         Ok(Self {
+            mode: Mode::Erase,
             nonce,
             destination,
             deployment,
@@ -436,6 +463,16 @@ impl Plan {
     }
     pub fn nonce(&self) -> &[u8; 32] {
         &self.nonce
+    }
+    /// The authority supplies the existing volume identity and saved settings.
+    /// This changes review data only and grants no permission to write.
+    pub fn preserving(mut self) -> Self {
+        self.mode = Mode::Preserve;
+        self
+    }
+
+    pub fn mode(&self) -> Mode {
+        self.mode
     }
     pub fn destination(&self) -> &Destination {
         &self.destination
@@ -486,6 +523,7 @@ impl Plan {
         out.extend_from_slice(&self.nonce);
         out.extend_from_slice(&self.deployment);
         out.extend_from_slice(&self.volume_uuid);
+        out.push(self.mode.code());
         // The storage and basis bytes follow the destination's removable
         // flag.
         put_destination_with(
@@ -508,6 +546,8 @@ impl Plan {
         let nonce = r.array()?;
         let deployment = r.array()?;
         let uuid = r.array()?;
+        let [mode] = r.array()?;
+        let mode = Mode::from_code(mode)?;
         let (destination, basis) = read_destination_with(&mut r, |r| {
             let [storage, basis] = r.array()?;
             let basis = Basis::from_code(basis)?;
@@ -520,7 +560,9 @@ impl Plan {
         })?;
         let settings = read_settings(&mut r)?;
         r.finish()?;
-        Self::new(nonce, destination, deployment, uuid, basis, settings)
+        let mut plan = Self::new(nonce, destination, deployment, uuid, basis, settings)?;
+        plan.mode = mode;
+        Ok(plan)
     }
 }
 

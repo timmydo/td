@@ -18,7 +18,12 @@ const WARNING_TOP: usize = BODY_TOP + BODY_ROWS * CELL_HEIGHT + ROW;
 /// own probes, which the plan's basis records; no request chooses it, so
 /// the page says what the review carries (td-install/INSTALLER.md
 /// "Storage choice").
-const LOSS: &str = "All data on the selected disk will be lost after trusted consent.";
+const LOSS: &str = "All data on the selected disk will be lost when you confirm this review.";
+const PRESERVE: &[&str] = &[
+    "Personal files, account and saved settings will be kept.",
+    "The system and boot files will be replaced. Storage stays unencrypted.",
+    "If interrupted, boot this USB and run reinstall again.",
+];
 const AUTOMATIC: &str = "The account signs in automatically without a password or PIN.";
 /// Device-bound storage protects a disk read away from this computer, not
 /// a lost one (td-install/ENCRYPTION.md "Device-bound default").
@@ -207,14 +212,25 @@ impl ReviewPage {
                 "| Time zone: ",
             ),
             (storage_line(plan.basis()), "| Storage: "),
-            (basis_line(plan.basis()), "| Probes: "),
+            (
+                if plan.mode() == td_install::installation_plan::Mode::Preserve {
+                    "Mode: reinstall system, keep personal files".into()
+                } else {
+                    basis_line(plan.basis())
+                },
+                "| Probes: ",
+            ),
         ] {
             push_lines_with(&mut lines, &line, columns, continuation);
         }
-        let paragraphs = match plan.storage() {
-            Storage::DeviceBound => DEVICE_BOUND_DETAILS,
-            Storage::Unencrypted if !plan.basis().keyboard_console() => &[KEYBOARD_CONSOLE][..],
-            Storage::Unencrypted => &[],
+        let paragraphs = if plan.mode() == td_install::installation_plan::Mode::Preserve {
+            &[][..]
+        } else {
+            match plan.storage() {
+                Storage::DeviceBound => DEVICE_BOUND_DETAILS,
+                Storage::Unencrypted if !plan.basis().keyboard_console() => &[KEYBOARD_CONSOLE][..],
+                Storage::Unencrypted => &[],
+            }
         };
         for paragraph in paragraphs {
             push_paragraph(&mut lines, paragraph, columns);
@@ -240,7 +256,11 @@ impl ReviewPage {
             status,
             footer,
             notice: None,
-            warnings: warnings(plan.basis()),
+            warnings: if plan.mode() == td_install::installation_plan::Mode::Preserve {
+                PRESERVE
+            } else {
+                warnings(plan.basis())
+            },
         })
     }
 

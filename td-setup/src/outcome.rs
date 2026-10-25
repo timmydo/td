@@ -9,24 +9,19 @@ use td_ui::raster::{
 use td_ui::{CELL_HEIGHT, CELL_WIDTH};
 
 const INSET: usize = CELL_WIDTH;
-const CONSENT_FOOTER: &str = "Consent \u{b7} step 5 of 6 \u{b7} Escape withdraws the review";
+const CONSENT_FOOTER: &str = "Starting \u{b7} step 5 of 6 \u{b7} Escape withdraws the review";
 const PROGRESS_FOOTER: &str = "Installation progress \u{b7} step 5 of 6";
 const FAILED_FOOTER: &str = "Installation stopped \u{b7} step 5 of 6";
 const UNKNOWN_FOOTER: &str = "Outcome unknown \u{b7} step 5 of 6";
 const UNCONFIRMED_FOOTER: &str = "Installation not finished \u{b7} step 6 of 6";
 const COMPLETE_FOOTER: &str = "Complete \u{b7} step 6 of 6";
-/// How the person reaches the secure prompt: the paired compositor's
-/// attention chord and its menu's installation row. Nothing pushes the
-/// prompt, so the page must say how to open it.
-const OPEN_SECURE_PROMPT: &[&str] = &[
-    "Press Ctrl+Alt+Escape, then I, to open the secure prompt.",
-    "There, Enter confirms the installation and Escape declines it.",
+const STARTING: &[&str] = &[
+    "Your review is confirmed. The installation service is starting.",
+    "Keep the computer powered on while installation is running.",
 ];
-/// What a device-bound consent page adds: the secure screen closes by
-/// itself after confirmation, and the key follows here.
-const RETURN_AFTER_CONSENT: &[&str] = &[
-    "After you confirm, the secure screen closes by itself and you",
-    "return here to write down your recovery key.",
+const RECOVERY_FOLLOWS: &[&str] = &[
+    "Your recovery key will appear here next.",
+    "Write it down before continuing.",
 ];
 
 /// A bounded operation label supplied by the installation service.
@@ -149,26 +144,26 @@ impl Composition for ProgressPage {
         fill(self.surface, damage, sink);
         let footer = match self.progress {
             Progress::Consent => {
-                row(self.surface, 1, "Waiting for consent", damage, sink);
-                for (index, text) in OPEN_SECURE_PROMPT.iter().enumerate() {
+                row(self.surface, 1, "Starting installation", damage, sink);
+                for (index, text) in STARTING.iter().enumerate() {
                     row(self.surface, 3 + index, text, damage, sink);
                 }
                 row(
                     self.surface,
                     6,
-                    "Nothing is written to the disk before consent is given there.",
+                    "The selected disk and installation mode are from your review.",
                     damage,
                     sink,
                 );
                 row(
                     self.surface,
                     8,
-                    "This window cannot give consent.",
+                    "Installation will continue here.",
                     damage,
                     sink,
                 );
                 if self.recovery_key {
-                    for (index, text) in RETURN_AFTER_CONSENT.iter().enumerate() {
+                    for (index, text) in RECOVERY_FOLLOWS.iter().enumerate() {
                         row(self.surface, 10 + index, text, damage, sink);
                     }
                 }
@@ -537,8 +532,8 @@ mod tests {
         assert!(!painted.contains("was withdrawn"));
         let consent = ProgressPage::new(screen, Progress::Consent).unwrap();
         let painted = glyphs(&consent, screen);
-        assert!(painted.contains("secure prompt") && painted.contains(CONSENT_FOOTER));
-        for text in OPEN_SECURE_PROMPT {
+        assert!(painted.contains("Starting installation") && painted.contains(CONSENT_FOOTER));
+        for text in STARTING {
             assert!(painted.contains(text), "{text}");
         }
         assert!(!painted.contains("recovery key"));
@@ -546,7 +541,7 @@ mod tests {
             .unwrap()
             .with_recovery_key(true);
         let painted = glyphs(&bound, screen);
-        for text in RETURN_AFTER_CONSENT {
+        for text in RECOVERY_FOLLOWS {
             assert!(painted.contains(text), "{text}");
         }
         assert!(painted.contains(CONSENT_FOOTER));
@@ -555,7 +550,7 @@ mod tests {
             .unwrap()
             .with_recovery_key(true);
         let painted = glyphs(&running, screen);
-        for text in RETURN_AFTER_CONSENT {
+        for text in RECOVERY_FOLLOWS {
             assert!(!painted.contains(text), "{text}");
         }
         let unknown = ProgressPage::new(screen, Progress::Unknown).unwrap();

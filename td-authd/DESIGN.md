@@ -1049,7 +1049,8 @@ unrecoverable request refuses either recovery-token step. Unlock (2) adds
 role 1 primary or 2 recovery. Credential write (4) adds role 1 primary or 2
 recovery, then big-endian u32 application and requester UIDs, then a
 one-byte length and ASCII bytes for each application and credential name.
-Whole-disk installation (6) adds a big-endian u32 requester and u64 capacity
+The reserved whole-disk description (6; preserve form 38), no longer
+issued by td-authd, adds a big-endian u32 requester and u64 capacity
 in bytes, then one-byte-length fields for the disk's kernel name (1 to 31
 ASCII alphanumerics, hyphen or underscore), its model and serial labels, the
 hostname (1 to 63 bytes) and the username (1 to 32), then the first eight
@@ -1795,40 +1796,25 @@ started one fails, its outcome unknown), and nonblocking polls reap the
 retired child; a hung one keeps the intake busy until teardown. A
 finished-complete report marks the generation complete and its intake starts
 no further service. A later generation's intake starts afresh: each
-installation still needs its own review and physical consent.
+installation still needs its own review and wizard confirmation.
 
-Only private request 19 selects the open review, once; with none, or a busy
-operation slot, it answers 99 00. Selection makes the review's consent
-summary, the disk installation description of "Immutable consent description
-prerequisite", with the review's nonce, the session owner as requester, the
-escaped model and serial, the deployment digest's first eight bytes and
-the review's storage. A review it cannot show (a name consent refuses),
-or whose operation cannot start, is declined as unavailable at once and
-answers 99 00. Otherwise it
-answers 92 DESCRIPTION and holds the slot. Presentation (13), then one
-commit (14), within 120 seconds, as for an update, but after a fresh
-physical Enter: tag 6 carries no approval key, and no principal table
-is consulted, since the live medium has no installed principal
-(APPLICATIONS.md §L.1). Commit sends consent naming the review; Escape
-before commit sends declined, and expiry sends expired. If the service
-ended the review first
-(the installer withdrew or left, or the service stopped), Enter consents to
-nothing: presentation changes nothing, and commit of the same description
-answers 94 without sending and the operation fails. After commit only the
-service's reports end the operation: finished-complete completes it, and an
-ended or finished-failed report, or the service retiring, fails it; without
-commit nothing completes it. Closing the screen after commit revokes
-nothing. A device-bound review's completion follows its recovery key typed
-back in td-setup, so the compositor closes the screen by itself after
-commit (td-compositor/DESIGN.md "Physical installation confirmation");
-td-authd still holds the operation until the service reports.
+The trusted live wizard owns the final human confirmation, for both erase
+and preserve modes. Its exact Execute request causes the fixed root service
+to send Review over its private channel; td-authd acknowledges that nonce
+immediately. This acknowledgement admits execution and supervises lifecycle;
+it is not a second human consent or evidence of secure physical input. Root
+retains source authentication, plan equality, disk exclusion and its exclusive
+disk claim. The trust boundary includes the live wizard and its ordinary input.
+Installed-session clients cannot use this intake. On a live boot private
+request 19 always answers 99 00; no disk installation occupies the attention
+operation slot. A later generation requires a new review and confirmation.
 
 On failed-generation teardown td-authd kills the service and any retired one
 and waits for each, before secret-session cleanup, and removes its socket;
 unlike an update helper's, a wait error goes unreported. A service stopped
 while writing leaves the disk incomplete; td-install's failure semantics and
 td-svc's authority cgroup containment apply as for an update. td-install
-opens the channel, so a review a live boot's installer holds is selectable.
+opens the channel only for a validated execution from the live wizard.
 
 The host-only launch VM fixture also accepts `--run-taskmgr-vm`, followed
 by the ordinary kernel/authd/firstboot/login/td-init inputs, compositor,

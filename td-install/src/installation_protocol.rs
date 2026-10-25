@@ -10,7 +10,7 @@ use crate::installation_plan::{
 
 /// Sent and required by both ends before the first frame. A change to any
 /// message or its bytes changes the greeting; there is no negotiation.
-pub const GREETING: &[u8; 8] = b"TDINS06\n";
+pub const GREETING: &[u8; 8] = b"TDINS07\n";
 /// Root admits only this much from the unprivileged side.
 pub const MAX_REQUEST_BYTES: usize = 1 + MAX_BYTES;
 pub const MAX_REPLY_BYTES: usize = 1 + if MAX_CANDIDATE_BYTES > MAX_ZONE_BYTES {
@@ -29,6 +29,7 @@ const RESTART: u8 = 0x07;
 const POWER_OFF: u8 = 0x08;
 const RECOVERY_KEY: u8 = 0x09;
 const CONFIRM_RECOVERY: u8 = 0x0a;
+const REINSTALL: u8 = 0x0b;
 // Replies set the high bit, so a reflected frame never decodes.
 const DESTINATIONS_REPLY: u8 = 0x81;
 const REVIEWED: u8 = 0x82;
@@ -392,6 +393,8 @@ impl Refusal {
 /// consent.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Request {
+    /// Read existing settings and propose replacement without formatting.
+    Reinstall(Destination),
     /// Eligible whole disks, as the service observes them.
     Destinations,
     /// Review one destination with these settings. The service chooses the
@@ -436,6 +439,10 @@ impl Request {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         match self {
+            Self::Reinstall(destination) => {
+                out.push(REINSTALL);
+                put_destination(&mut out, destination);
+            }
             Self::Destinations => out.push(DESTINATIONS),
             Self::Propose {
                 destination,
@@ -484,6 +491,7 @@ impl Request {
         let (&tag, body) = bytes.split_first().ok_or("empty installation request")?;
         let mut reader = Reader::new(body, "request");
         let request = match tag {
+            REINSTALL => Self::Reinstall(read_destination(&mut reader)?),
             DESTINATIONS => Self::Destinations,
             PROPOSE => Self::Propose {
                 destination: read_destination(&mut reader)?,
@@ -631,6 +639,7 @@ impl Reply {
     /// compares the review nonce and the proposed or echoed fields.
     pub fn answers(&self, request: &Request) -> bool {
         match request {
+            Request::Reinstall(_) => matches!(self, Self::Reviewed(_) | Self::Refused(_)),
             Request::Destinations => matches!(self, Self::Destinations(_) | Self::Refused(_)),
             Request::Propose { .. } => matches!(self, Self::Reviewed(_) | Self::Refused(_)),
             Request::Execute(_)

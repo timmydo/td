@@ -1,6 +1,8 @@
 #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 use super::*;
+use crate::test_temp::TempDir;
 use std::os::unix::net::UnixStream;
+use std::time::{Duration, Instant};
 
 /// Stands in for `td-install serve`: idles until killed.
 #[test]
@@ -38,15 +40,9 @@ pub(crate) fn review(nonce: u8, disk: &str) -> wire::Review {
 
 /// A service over a socketpair, with its intake's directory; the returned
 /// end plays the real service.
-fn served_in() -> (Intake, UnixStream, std::path::PathBuf) {
-    let directory = std::env::temp_dir().join(format!(
-        "td-authd-setup-{}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    let _ = fs::remove_dir_all(&directory);
-    fs::create_dir(&directory).unwrap();
-    let listener = UnixListener::bind(directory.join("setup")).unwrap();
+fn served_in() -> (Intake, UnixStream, TempDir) {
+    let directory = TempDir::new("td-authd-setup").unwrap();
+    let listener = UnixListener::bind(directory.path().join("setup")).unwrap();
     listener.set_nonblocking(true).unwrap();
     let (ours, theirs) = UnixStream::pair().unwrap();
     theirs
@@ -54,7 +50,6 @@ fn served_in() -> (Intake, UnixStream, std::path::PathBuf) {
         .unwrap();
     let intake = Intake {
         listener,
-        owner: 1000,
         installer: INSTALLER_UID,
         identity: (0, 0),
         service: Some(Service::over(idle_child(), ours).unwrap()),
@@ -66,7 +61,7 @@ fn served_in() -> (Intake, UnixStream, std::path::PathBuf) {
 
 pub(crate) fn served() -> (Intake, UnixStream) {
     let (intake, service, directory) = served_in();
-    let _ = fs::remove_dir_all(&directory);
+    directory.cleanup().unwrap();
     (intake, service)
 }
 
@@ -127,17 +122,6 @@ fn fates(intake: &mut Intake, want: usize) -> Vec<([u8; 32], Fate)> {
     seen
 }
 
-fn selected(intake: &mut Intake) -> Request {
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
-        match intake.select() {
-            Ok(request) => return request,
-            Err(why) => assert!(Instant::now() < deadline, "{why}"),
-        }
-        std::thread::yield_now();
-    }
-}
-
 #[test]
 fn only_one_td_live_1_token_marks_a_live_boot() {
     for (cmdline, live) in [
@@ -158,166 +142,43 @@ fn only_one_td_live_1_token_marks_a_live_boot() {
 }
 
 #[test]
-fn a_review_is_shown_once_as_its_escaped_summary() {
+fn the_live_wizards_execution_is_acknowledged_without_attention() {
     let (mut intake, mut service) = served();
     greet(&mut intake, &mut service);
-    assert!(intake.select().is_err());
     report(&mut service, Report::Review(Box::new(review(7, "vda"))));
-    let request = selected(&mut intake);
-    assert_eq!(request.nonce(), &[7; 32]);
-    let Operation::InstallDisk {
-        requester,
-        disk,
-        capacity,
-        model,
-        serial,
-        hostname,
-        username,
-        deployment,
-        storage,
-    } = request.operation()
-    else {
-        panic!("{request:?}")
-    };
-    assert_eq!(*requester, 1000);
-    assert_eq!(disk, "vda");
-    assert_eq!(*capacity, 8 << 30);
-    assert_eq!(model, &Some(Label::model(b"QEMU HARDDISK")));
-    assert_eq!(serial, &Some(Label::serial("se rial\u{e9}".as_bytes())));
-    assert_eq!(hostname, "td-laptop");
-    assert_eq!(username, "alice");
-    assert_eq!(deployment, &[0xab; 8]);
-    assert_eq!(*storage, Storage::Unencrypted);
-    // Selected once; a second selection would show it twice.
-    assert!(intake.select().is_err());
-}
-
-/// A device-bound review is shown as one, its storage row in place of
-/// the unencrypted one.
-#[test]
-fn a_device_bound_review_shows_its_storage() {
-    let (mut intake, mut service) = served();
-    greet(&mut intake, &mut service);
-    let bound = wire::Review::new(wire::ReviewFields {
-        nonce: [9; 32],
-        disk: "vda",
-        capacity: 8 << 30,
-        model: None,
-        serial: None,
-        hostname: "td-laptop",
-        username: "alice",
-        deployment: [0xab; 32],
-        storage: wire::Storage::DeviceBound,
-    })
-    .unwrap();
-    report(&mut service, Report::Review(Box::new(bound)));
-    let request = selected(&mut intake);
-    assert_eq!(request.nonce(), &[9; 32]);
-    assert!(matches!(
-        request.operation(),
-        Operation::InstallDisk {
-            storage: Storage::DeviceBound,
-            ..
-        }
-    ));
-    assert!(request
-        .lines()
-        .contains(&"ENCRYPTED TO THIS COMPUTER, AUTOMATIC LOGIN".to_string()));
-    assert!(!request
-        .lines()
-        .iter()
-        .any(|line| line.starts_with("UNENCRYPTED")));
-}
-
-#[test]
-fn a_review_consent_cannot_show_is_declined_as_unavailable() {
-    let (mut intake, mut service) = served();
-    greet(&mut intake, &mut service);
-    // Within the channel's grammar, but not a name consent shows.
-    let unshowable = wire::Review::new(wire::ReviewFields {
-        nonce: [8; 32],
-        disk: "vda",
-        capacity: 1,
-        model: None,
-        serial: None,
-        hostname: "td laptop",
-        username: "alice",
-        deployment: [0; 32],
-        storage: wire::Storage::Unencrypted,
-    })
-    .unwrap();
-    report(&mut service, Report::Review(Box::new(unshowable)));
     reviewed(&mut intake);
-    assert!(intake.select().is_err());
-    assert!(
-        intake
-            .service
-            .as_ref()
-            .unwrap()
-            .open
-            .as_ref()
-            .unwrap()
-            .selected
-    );
+    assert_eq!(answer(&mut service), Answer::Consent([7; 32]));
+    report(&mut service, Report::Started([7; 32]));
+    report(&mut service, Report::Finished([7; 32], Outcome::Complete));
     assert_eq!(
-        answer(&mut service),
-        Answer::Declined([8; 32], NoConsent::Unavailable)
+        fates(&mut intake, 2),
+        vec![
+            ([7; 32], Fate::Started),
+            ([7; 32], Fate::Finished(Outcome::Complete))
+        ]
     );
+    assert!(intake.complete);
 }
 
 #[test]
 fn reports_out_of_order_break_the_channel_and_kill_the_service() {
     use wire::Ended::Withdrawn;
     let opened = || Report::Review(Box::new(review(1, "vda")));
-    // Each case: reports before an answer, the answer, reports after.
-    for (before, consent, after) in [
-        (vec![Report::Started([1; 32])], None, vec![]),
-        (vec![opened(), opened()], None, vec![]),
-        (
-            vec![opened(), Report::Ended([2; 32], Withdrawn)],
-            None,
-            vec![],
-        ),
-        // Started or finished without consent.
-        (vec![opened(), Report::Started([1; 32])], None, vec![]),
-        (
-            vec![opened(), Report::Finished([1; 32], Outcome::Complete)],
-            None,
-            vec![],
-        ),
-        (
-            vec![opened()],
-            Some(Answer::Declined([1; 32], NoConsent::Declined)),
-            vec![Report::Started([1; 32])],
-        ),
-        // Finished before started, started twice, ended after started.
-        (
-            vec![opened()],
-            Some(Answer::Consent([1; 32])),
-            vec![Report::Finished([1; 32], Outcome::Complete)],
-        ),
-        (
-            vec![opened()],
-            Some(Answer::Consent([1; 32])),
-            vec![Report::Started([1; 32]), Report::Started([1; 32])],
-        ),
-        (
-            vec![opened()],
-            Some(Answer::Consent([1; 32])),
-            vec![Report::Started([1; 32]), Report::Ended([1; 32], Withdrawn)],
-        ),
+    for reports in [
+        vec![Report::Started([1; 32])],
+        vec![opened(), opened()],
+        vec![opened(), Report::Ended([2; 32], Withdrawn)],
+        vec![opened(), Report::Finished([1; 32], Outcome::Complete)],
+        vec![opened(), Report::Started([1; 32]), Report::Started([1; 32])],
+        vec![
+            opened(),
+            Report::Started([1; 32]),
+            Report::Ended([1; 32], Withdrawn),
+        ],
     ] {
         let (mut intake, mut service) = served();
         greet(&mut intake, &mut service);
-        for each in before {
-            report(&mut service, each);
-        }
-        if let Some(sent) = consent {
-            reviewed(&mut intake);
-            intake.answer(sent).unwrap();
-            assert_eq!(answer(&mut service), sent);
-        }
-        for each in after {
+        for each in reports {
             report(&mut service, each);
         }
         let seen = retired(&mut intake);
@@ -345,7 +206,7 @@ fn a_lost_service_ends_its_open_review() {
     let (mut intake, mut service) = served();
     greet(&mut intake, &mut service);
     report(&mut service, Report::Review(Box::new(review(3, "vda"))));
-    selected(&mut intake);
+    reviewed(&mut intake);
     drop(service);
     assert_eq!(retired(&mut intake), [([3; 32], Fate::Ended)]);
     // Closing the channel is not a violation: the child is left to exit,
@@ -363,7 +224,6 @@ fn a_finished_report_survives_the_service_closing_or_exiting() {
         greet(&mut intake, &mut service);
         report(&mut service, Report::Review(Box::new(review(2, "vda"))));
         reviewed(&mut intake);
-        intake.answer(Answer::Consent([2; 32])).unwrap();
         if end != "reset" {
             assert_eq!(answer(&mut service), Answer::Consent([2; 32]));
         }
@@ -400,7 +260,7 @@ fn a_finished_report_survives_the_service_closing_or_exiting() {
 #[test]
 fn only_the_installer_identity_is_served() {
     let (mut intake, _service, directory) = served_in();
-    let _ = fs::remove_dir_all(&directory);
+    directory.cleanup().unwrap();
     let uid = fs::metadata("/proc/self").unwrap().uid();
     let (peer, _) = UnixStream::pair().unwrap();
     // Busy.
@@ -408,7 +268,6 @@ fn only_the_installer_identity_is_served() {
     assert!(!intake.admits(&peer));
     intake.service = None;
     assert!(intake.admits(&peer));
-    intake.owner = uid;
     intake.installer = uid.wrapping_add(1);
     assert!(!intake.admits(&peer));
     assert_eq!(INSTALLER_UID, 990);
@@ -419,7 +278,7 @@ fn another_installer_is_refused_while_one_is_served_or_after_completion() {
     let (mut intake, _service, directory) = served_in();
     intake.installer = fs::metadata("/proc/self").unwrap().uid();
     let refused = |intake: &mut Intake| {
-        let mut installer = UnixStream::connect(directory.join("setup")).unwrap();
+        let mut installer = UnixStream::connect(directory.path().join("setup")).unwrap();
         intake.tick();
         installer
             .set_read_timeout(Some(Duration::from_secs(20)))
@@ -438,106 +297,5 @@ fn another_installer_is_refused_while_one_is_served_or_after_completion() {
     intake.complete = true;
     refused(&mut intake);
     assert!(intake.service.is_none());
-    let _ = fs::remove_dir_all(&directory);
-}
-
-#[test]
-fn consent_flows_to_the_service_and_its_reports_to_the_operation() {
-    let (mut intake, mut service) = served();
-    greet(&mut intake, &mut service);
-    report(&mut service, Report::Review(Box::new(review(4, "vda"))));
-    let request = selected(&mut intake);
-    let mut operation = Installation::start(request.clone()).unwrap();
-    assert_eq!(operation.poll().unwrap(), Event::Present(request.clone()));
-    // Enter before presentation does not consent.
-    assert!(operation.commit(&request).is_err());
-    operation.presented(&request).unwrap();
-    assert!(operation.presented(&request).is_err());
-    assert_eq!(operation.poll().unwrap(), Event::Commit(request.clone()));
-    operation.commit(&request).unwrap();
-    assert!(operation.commit(&request).is_err());
-    intake.answer(operation.take_answer().unwrap()).unwrap();
-    assert!(operation.take_answer().is_none());
-    intake.tick();
-    assert_eq!(answer(&mut service), Answer::Consent([4; 32]));
-    // Escape after commit revokes nothing.
-    operation.cancel("physical attention cancelled").unwrap();
-    assert!(operation.take_answer().is_none());
-    assert_eq!(operation.poll().unwrap(), Event::Waiting);
-    report(&mut service, Report::Started([4; 32]));
-    report(&mut service, Report::Finished([4; 32], Outcome::Complete));
-    for (nonce, fate) in fates(&mut intake, 2) {
-        operation.fate(&nonce, fate);
-    }
-    assert_eq!(operation.poll().unwrap(), Event::Complete);
-    // The generation installs once: no new service is started.
-    assert!(intake.complete);
-}
-
-#[test]
-fn escape_or_expiry_before_commit_declines() {
-    let request = Request::new([5; 32], 1000, {
-        let review = review(5, "vda");
-        summary(&review, 1000).unwrap().operation().clone()
-    })
-    .unwrap();
-    let mut operation = Installation::start(request.clone()).unwrap();
-    operation.presented(&request).unwrap();
-    operation.cancel("physical attention cancelled").unwrap();
-    assert_eq!(
-        operation.take_answer(),
-        Some(Answer::Declined([5; 32], NoConsent::Declined))
-    );
-    assert!(matches!(operation.poll().unwrap(), Event::Failed(_)));
-    assert!(operation.ended());
-
-    let mut operation = Installation::start(request.clone()).unwrap();
-    operation.deadline = Instant::now();
-    assert!(matches!(operation.poll().unwrap(), Event::Failed(_)));
-    assert_eq!(
-        operation.take_answer(),
-        Some(Answer::Declined([5; 32], NoConsent::Expired))
-    );
-    // A late presentation changes nothing, and Enter consents to nothing.
-    operation.presented(&request).unwrap();
-    assert!(operation.commit(&request).is_err());
-    assert!(operation.take_answer().is_none());
-}
-
-#[test]
-fn only_its_own_review_ends_the_operation() {
-    let request = summary(&review(6, "vda"), 1000).unwrap();
-    let mut operation = Installation::start(request.clone()).unwrap();
-    operation.fate(&[9; 32], Fate::Ended);
-    operation.fate(&[6; 32], Fate::Started);
-    assert!(!operation.ended());
-    operation.fate(&[6; 32], Fate::Ended);
-    assert!(operation.ended());
-    assert!(matches!(operation.poll().unwrap(), Event::Failed(_)));
-    // No answer is owed to a review the service already ended.
-    assert!(operation.take_answer().is_none());
-    let mut failed = Installation::start(request.clone()).unwrap();
-    failed.fate(&[6; 32], Fate::Finished(Outcome::Failed));
-    assert!(matches!(failed.poll().unwrap(), Event::Failed(_)));
-    // Only committed consent completes.
-    let mut uncommitted = Installation::start(request.clone()).unwrap();
-    uncommitted.fate(&[6; 32], Fate::Finished(Outcome::Complete));
-    assert!(matches!(uncommitted.poll().unwrap(), Event::Failed(_)));
-    // Presenting a review the service already ended does nothing; poll
-    // reports the failure.
-    let mut ended = Installation::start(request.clone()).unwrap();
-    ended.fate(&[6; 32], Fate::Ended);
-    ended.presented(&request).unwrap();
-    assert!(ended.commit(&request).is_err());
-    assert!(matches!(ended.poll().unwrap(), Event::Failed(_)));
-    // Only a whole-disk summary is an installation of this kind.
-    let unlock = Request::new(
-        [1; 32],
-        1000,
-        Operation::Unlock {
-            role: crate::consent::Role::Primary,
-        },
-    )
-    .unwrap();
-    assert!(Installation::start(unlock).is_err());
+    directory.cleanup().unwrap();
 }

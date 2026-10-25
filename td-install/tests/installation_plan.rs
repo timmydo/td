@@ -260,10 +260,11 @@ fn deployment_id_requires_exact_lowercase_manifest_digest() {
 #[test]
 fn wire_order_is_independently_specified_and_lossless() {
     let p = plan();
-    let mut bytes = b"TDPLAN03".to_vec();
+    let mut bytes = b"TDPLAN04".to_vec();
     bytes.extend([1; 32]);
     bytes.extend([2; 32]);
     bytes.extend(uuid());
+    bytes.push(0);
     bytes.extend([0, 0, 1, 3, 0, 0, 0, 3]);
     bytes.extend([0, 0, 0, 0, 0, 0, 0, 27]);
     bytes.extend([0, 0, 0, 1, 128, 0, 0, 0]);
@@ -312,7 +313,7 @@ fn every_truncation_and_extension_refuses() {
         Plan::decode(&oversized).unwrap_err(),
         "installation plan exceeds wire bound"
     );
-    for version in [b'2', b'4'] {
+    for version in [b'3', b'5'] {
         let mut wrong_version = bytes.clone();
         wrong_version[7] = version;
         assert_eq!(
@@ -358,7 +359,7 @@ fn storage_is_one_byte_after_the_removable_flag() {
     assert_eq!(bound.storage(), Storage::DeviceBound);
     assert_ne!(bound, unencrypted);
     // Magic, nonce, digest, UUID, then the fixed destination fields.
-    let at = 8 + 32 + 32 + 16 + 4 + 4 + 8 + 8 + 4 + 1;
+    let at = 8 + 32 + 32 + 16 + 1 + 4 + 4 + 8 + 8 + 4 + 1;
     let bytes = bound.encode();
     assert_eq!(bytes[at], 1);
     assert_eq!(unencrypted.encode()[at], 0);
@@ -395,7 +396,7 @@ fn storage_is_one_byte_after_the_removable_flag() {
 /// 1 the keyboard-console probe, every other bit refused.
 #[test]
 fn the_basis_is_one_byte_after_the_storage_byte() {
-    let at = 8 + 32 + 32 + 16 + 4 + 4 + 8 + 8 + 4 + 1 + 1;
+    let at = 8 + 32 + 32 + 16 + 1 + 4 + 4 + 8 + 8 + 4 + 1 + 1;
     for (tpm, console, code) in [
         (false, false, 0),
         (true, false, 1),
@@ -427,7 +428,7 @@ fn the_basis_is_one_byte_after_the_storage_byte() {
 
 #[test]
 fn the_records_before_the_basis_are_refused() {
-    let removable = 8 + 32 + 32 + 16 + 4 + 4 + 8 + 8 + 4;
+    let removable = 8 + 32 + 32 + 16 + 1 + 4 + 4 + 8 + 8 + 4;
     // A TDPLAN02 record: the same fields with no basis byte.
     let mut old = plan().encode();
     old.remove(removable + 2);
@@ -510,7 +511,7 @@ fn boundaries_and_missing_labels_remain_distinct() {
     )
     .unwrap();
     let p = Plan::new([255; 32], d, [0; 32], uuid(), Basis::new(true, true), s).unwrap();
-    assert_eq!(p.encode().len(), 1193);
+    assert_eq!(p.encode().len(), 1194);
     assert!(p.encode().len() <= MAX_BYTES);
     assert_eq!(Plan::decode(&p.encode()).unwrap(), p);
     for model in [
@@ -641,4 +642,19 @@ fn generated_uuid_text_maps_to_the_plan_network_byte_order() {
     .unwrap();
     assert_eq!(p.volume_uuid(), &uuid);
     assert_eq!(Plan::decode(&p.encode()).unwrap(), p);
+}
+
+#[test]
+fn preserving_is_bound_to_the_review_and_cannot_decode_as_erasure() {
+    use td_install::installation_plan::Mode;
+    let erase = plan();
+    let keep = erase.clone().preserving();
+    assert_ne!(erase, keep);
+    assert_eq!(keep.mode(), Mode::Preserve);
+    assert_eq!(keep.volume_uuid(), erase.volume_uuid());
+    assert_eq!(keep.settings(), erase.settings());
+    assert_eq!(Plan::decode(&keep.encode()).unwrap(), keep);
+    let mut unknown = keep.encode();
+    unknown[88] = 2;
+    assert!(Plan::decode(&unknown).is_err());
 }

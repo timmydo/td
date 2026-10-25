@@ -222,6 +222,14 @@ pub fn recipe() -> Recipe {
     steps.push(Step::MkDir {
         path: "{out}/bin".into(),
     });
+    steps.push(Step::MkDir {
+        path: "{src}/td-fs/src".into(),
+    });
+    steps.push(Step::WriteFile {
+        path: "{src}/td-fs/src/temp_dir.rs".into(),
+        content: include_str!("../../../td-fs/src/temp_dir.rs").into(),
+        exec: false,
+    });
     for directory in ["{src}/td-authd/src", "{src}/td-authd/tests"] {
         steps.push(Step::MkDir {
             path: directory.into(),

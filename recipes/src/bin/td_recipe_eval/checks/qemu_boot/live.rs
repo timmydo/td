@@ -49,9 +49,7 @@ use super::install::{
     Firmware, Installed, TargetDisk,
 };
 use super::recovery_screen::KeyGlyphs;
-use super::setup_input::{
-    disk_prompt_rows, typed, Act, KeyCell, SetupStep, INSTALL_TIMEOUT, STEP_TIMEOUT,
-};
+use super::setup_input::{typed, Act, KeyCell, SetupStep, INSTALL_TIMEOUT, STEP_TIMEOUT};
 use super::*;
 use std::rc::Rc;
 
@@ -90,15 +88,22 @@ pub(super) struct Wizard<'a> {
 pub(super) enum WizardStorage {
     /// No TPM, the display and the PS/2 keyboard attached.
     Unencrypted,
+    Reinstall,
     /// The TPM, the display and the PS/2 keyboard: the key the completion
     /// page shows is read with `glyphs` into `key` and typed back.
-    DeviceBound { glyphs: Rc<KeyGlyphs>, key: KeyCell },
+    DeviceBound {
+        glyphs: Rc<KeyGlyphs>,
+        key: KeyCell,
+    },
 }
 
 impl WizardStorage {
     /// The review's storage fields in td-setup's evidence.
     fn review_fields(&self) -> &'static str {
         match self {
+            Self::Reinstall => {
+                "storage=unencrypted tpm=missing console=missing disclosure=no-tpm-no-console"
+            }
             Self::Unencrypted => "storage=unencrypted tpm=missing console=found disclosure=no-tpm",
             Self::DeviceBound { .. } => {
                 "storage=device-bound tpm=found console=found disclosure=device-bound"
@@ -116,8 +121,6 @@ pub(super) struct LiveRun<'a> {
     pub(super) vars: &'a Path,
     pub(super) iso: &'a Path,
     pub(super) target: &'a TargetDisk,
-    pub(super) capacity: u64,
-    pub(super) id: &'a str,
     pub(super) wizard: &'a Wizard<'a>,
     pub(super) tpm_socket: Option<&'a Path>,
     pub(super) keep_console: Option<&'a Path>,
@@ -129,19 +132,7 @@ pub(super) struct LiveRun<'a> {
 /// to have carried the wizard to its restart.
 pub(super) fn drive_wizard(run: &LiveRun<'_>) -> Result<BootResult, String> {
     let wizard = run.wizard;
-    let encrypted = matches!(wizard.storage, WizardStorage::DeviceBound { .. });
-    let script = script(
-        &disk_prompt_rows(
-            TARGET_KERNEL_NAME,
-            run.capacity,
-            super::setup_input::TARGET_SERIAL,
-            wizard.hostname,
-            wizard.username,
-            run.id,
-            encrypted,
-        )?,
-        wizard,
-    )?;
+    let script = script(wizard)?;
     let timeout = boot_timeout();
     let tokens = format!(
         "{AUTOTEST_CMDLINE_TOKEN} {} {}",
@@ -248,8 +239,6 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         vars: &vars,
         iso: &iso,
         target: &target,
-        capacity,
-        id: &id,
         wizard: &LIVE_WIZARD,
         tpm_socket: None,
         keep_console: None,
@@ -261,7 +250,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     // through firmware, as the account and host it was given.
     let uuid = image_volume_identity(&scratch.dir.join(target_name))?;
     let zone_on_bar = |pixels: &[u8]| zone_text.ends(pixels);
-    cold_boots(
+    let before_reinstall = cold_boots(
         &qemu,
         &Firmware {
             code: &code,
@@ -290,24 +279,56 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
             session: true,
         },
     )?;
+    let reinstall_wizard = Wizard {
+        storage: WizardStorage::Reinstall,
+        ..LIVE_WIZARD
+    };
+    drive_wizard(&LiveRun {
+        qemu: &qemu,
+        code: &code,
+        vars: &vars,
+        iso: &iso,
+        target: &target,
+        wizard: &reinstall_wizard,
+        tpm_socket: None,
+        keep_console: None,
+        scratch: &scratch.dir,
+        label: "qemu-reinstall-live",
+    })?;
+    if image_volume_identity(&scratch.dir.join(target_name))? != uuid {
+        return Err("reinstall changed the existing volume UUID".into());
+    }
+    super::install::cold_boots_existing(
+        &qemu,
+        &Firmware {
+            code: &code,
+            vars: &vars,
+        },
+        &target,
+        &Installed {
+            uuid: &uuid,
+            id: &id,
+            username: USERNAME,
+            hostname: HOSTNAME,
+            zone: Some(ZONE),
+        },
+        &ColdBoots {
+            scratch: &scratch.dir,
+            name: "reinstalled",
+            timeout: installation_timeout(
+                env::var("TD_QEMU_BOOT_TIMEOUT_SECS").ok().as_deref(),
+                900,
+            ),
+            label: "qemu-reinstall-live",
+            screen: None,
+            session: true,
+        },
+        &before_reinstall,
+    )?;
     println!(
-        "PASS: the live medium, booted through firmware as USB mass storage, \
-         booted its signed deployment into the graphical \
-         session; the installer wizard, focused with td-authd's setup intake \
-         bound, took physical keys through the destination and settings pages \
-         to the service's review of {TARGET_KERNEL_NAME} for {USERNAME}@{HOSTNAME} \
-         in {ZONE}, released it untouched and reviewed again; consent went \
-         through the compositor's secure attention prompt showing exactly that \
-         disk, its size and serial, host, account and deployment prefix, \
-         td-setup said the installation completed, Return on its \
-         completion page restarted the guest through the supervisor's \
-         orderly teardown, and the target holds the installer's GPT layout; with the medium detached, the installed disk \
-         cold-booted through firmware twice, alone and renamed behind a decoy, \
-         as a healthy {USERNAME}@{HOSTNAME} with its volume {uuid} bound, a \
-         fresh machine identity and /var/home/{USERNAME} created then found, \
-         its login shell reading back on the second boot the file it wrote \
-         into that same home on the first, and compositor page flips, its \
-         clock naming {ZONE} and its status bar ending{ZONE_ON_BAR}"
+        "PASS: USB firmware boot, wizard confirmation, installation and two cold boots; \
+         preserving reinstall and two more cold boots retained volume {uuid}, \
+         {USERNAME}@{HOSTNAME}, timezone {ZONE} and the personal file's bytes and inode"
     );
     Ok(())
 }
@@ -389,7 +410,7 @@ fn require_partitioned(path: &Path, capacity: u64) -> Result<(), String> {
 /// it showing `rows`, a device-bound installation's recovery key read from
 /// the display and typed back, and the completed installation. Every act
 /// waits on its own state.
-fn script(rows: &[String], wizard: &Wizard<'_>) -> Result<Vec<SetupStep>, String> {
+fn script(wizard: &Wizard<'_>) -> Result<Vec<SetupStep>, String> {
     let Wizard {
         username,
         hostname,
@@ -408,6 +429,27 @@ fn script(rows: &[String], wizard: &Wizard<'_>) -> Result<Vec<SetupStep>, String
         format!("page=settings field={field} username={username} hostname={hostname}")
     };
     let mut steps = Vec::new();
+    if matches!(storage, WizardStorage::Reinstall) {
+        press(&mut steps, "page=welcome".into(), "r");
+        press(
+            &mut steps,
+            "page=destinations disks=1 selected=-".into(),
+            "down",
+        );
+        press(
+            &mut steps,
+            format!("page=destinations disks=1 selected={TARGET_KERNEL_NAME}"),
+            "ret",
+        );
+        press(&mut steps, format!("page=review disk={TARGET_KERNEL_NAME} username={username} hostname={hostname} zone={zone} {}", storage.review_fields()), "ret");
+        steps.push(SetupStep {
+            shown: "page=complete choice=restart end=offered".into(),
+            act: Act::Keys(vec!["ret"]),
+            untouched: false,
+            within: INSTALL_TIMEOUT,
+        });
+        return Ok(steps);
+    }
     press(&mut steps, "page=welcome".into(), "ret");
     press(
         &mut steps,
@@ -466,44 +508,13 @@ fn script(rows: &[String], wizard: &Wizard<'_>) -> Result<Vec<SetupStep>, String
             "ret",
         )
     });
-    press(&mut steps, review.clone(), "ret");
+    steps.push(SetupStep {
+        untouched: true,
+        ..SetupStep::press(review.clone(), "ret")
+    });
     match storage {
-        WizardStorage::Unencrypted => steps.push(SetupStep {
-            shown: "page=consent".into(),
-            act: Act::Consent(rows.to_vec()),
-            untouched: true,
-            within: STEP_TIMEOUT,
-        }),
-        // Escape on the prompt first declines with the target untouched,
-        // and the wizard is back at its settings to review again. Then
-        // consent: the compositor says it returns to setup and closes the
-        // screen by itself; the installation runs to its recovery-key
-        // phase, the key the page shows is read from the display, Return
-        // asks to type it back, and it is typed back.
+        WizardStorage::Unencrypted | WizardStorage::Reinstall => {}
         WizardStorage::DeviceBound { glyphs, key } => {
-            steps.push(SetupStep {
-                shown: "page=consent".into(),
-                act: Act::Decline(rows.to_vec()),
-                untouched: true,
-                within: STEP_TIMEOUT,
-            });
-            steps.push(SetupStep {
-                untouched: true,
-                ..SetupStep::press(
-                    format!(
-                        "{} zone={zone} withdrawal=none",
-                        settings(3, username, hostname)
-                    ),
-                    "ret",
-                )
-            });
-            press(&mut steps, review.clone(), "ret");
-            steps.push(SetupStep {
-                shown: "page=consent".into(),
-                act: Act::ConsentThenReturn(rows.to_vec()),
-                untouched: true,
-                within: STEP_TIMEOUT,
-            });
             steps.push(SetupStep {
                 shown: "page=recovery step=shown".into(),
                 act: Act::ReadKey(Rc::clone(glyphs), Rc::clone(key)),
@@ -593,14 +604,13 @@ mod tests {
 
     #[test]
     fn the_script_types_only_its_closed_keys_and_waits_on_distinct_states() {
-        let rows = vec!["ROW".to_string()];
-        let script = script(&rows, &LIVE_WIZARD).unwrap();
+        let script = script(&LIVE_WIZARD).unwrap();
         let typed_keys = USERNAME.len() + HOSTNAME.len() + ZONE_SEEK.len();
         // The three tabs and Enter; Escape; Enter from the release and from
         // the second review; consent; and the completion's restart.
-        assert_eq!(script.len(), 3 + typed_keys + 4 + 1 + 2 + 1 + 1);
-        let (consent, last) = (&script[script.len() - 2], &script[script.len() - 1]);
-        for step in &script[..script.len() - 2] {
+        assert_eq!(script.len(), 3 + typed_keys + 4 + 1 + 2 + 1);
+        let last = &script[script.len() - 1];
+        for step in &script[..script.len() - 1] {
             assert!(step.shown.starts_with("page="), "{}", step.shown);
             let Act::Keys(keys) = &step.act else {
                 panic!("{} does not press", step.shown);
@@ -617,8 +627,7 @@ mod tests {
             .collect();
         assert_eq!(untouched.len(), 2);
         assert!(untouched[0].ends_with(" withdrawal=none"));
-        assert_eq!(untouched[1], "page=consent");
-        assert!(matches!(&consent.act, Act::Consent(shown) if *shown == rows));
+        assert!(untouched[1].starts_with("page=review "));
         // Return on the completion page restarts the computer.
         assert_eq!(last.shown, "page=complete choice=restart end=offered");
         assert!(matches!(&last.act, Act::Keys(keys) if keys == &["ret"]));
@@ -636,7 +645,7 @@ mod tests {
             .collect();
         assert_eq!(reviews.len(), 2);
         assert_eq!(script[reviews[0]].shown, script[reviews[1]].shown);
-        assert_eq!(reviews[1] + 1, script.len() - 2);
+        assert_eq!(reviews[1] + 1, script.len() - 1);
         // The installed target must carry exactly the installer's layout.
         let dir = std::env::temp_dir().join(format!("td-live-gpt-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();

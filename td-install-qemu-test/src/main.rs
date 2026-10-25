@@ -515,20 +515,24 @@ fn observed_destination(device: &str) -> Result<Vec<u8>, String> {
 /// Independently frame the QEMU device observations, so the guest checks the
 /// shipped decoder against bytes that its own codec did not produce.
 fn observed_plan(device: &str, deployment: [u8; 32]) -> Result<Vec<u8>, String> {
-    let destination = observed_destination(device)?;
+    frame_observed_plan(&observed_destination(device)?, deployment)
+}
+
+fn frame_observed_plan(destination: &[u8], deployment: [u8; 32]) -> Result<Vec<u8>, String> {
     // The plan's storage byte, unencrypted, and its basis byte, no probe
     // passed, follow the removable flag.
     let (fixed, names) = destination
         .split_at_checked(4 + 4 + 8 + 8 + 4 + 1)
         .ok_or("observed destination is truncated")?;
     let mut bytes = Vec::with_capacity(256);
-    bytes.extend_from_slice(b"TDPLAN03");
+    bytes.extend_from_slice(b"TDPLAN04");
     bytes.extend_from_slice(&[1; 32]);
     bytes.extend_from_slice(&deployment);
     let mut uuid = [0; 16];
     *uuid.get_mut(6).ok_or("fixture UUID has no version byte")? = 0x40;
     *uuid.get_mut(8).ok_or("fixture UUID has no variant byte")? = 0x80;
     bytes.extend_from_slice(&uuid);
+    bytes.push(0); // Erase mode.
     bytes.extend_from_slice(fixed);
     bytes.extend_from_slice(&[0, 0]);
     bytes.extend_from_slice(names);
@@ -642,7 +646,7 @@ fn check_plan_observation(device: &str) -> Result<(), String> {
         .ok_or("fixture disk sequence overflow")?;
     let mut stale = plan;
     stale
-        .get_mut(96..104)
+        .get_mut(97..105)
         .ok_or("fixture plan lacks disk sequence")?
         .copy_from_slice(&changed.to_be_bytes());
     let response = plan_observation(&["observe-plan"], &stale)?;
@@ -2097,6 +2101,33 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn independently_framed_observations_decode_as_the_current_erase_plan() {
+        let mut destination = Vec::new();
+        destination.extend_from_slice(&8u32.to_be_bytes());
+        destination.extend_from_slice(&0u32.to_be_bytes());
+        destination.extend_from_slice(&17u64.to_be_bytes());
+        destination.extend_from_slice(&(8u64 << 30).to_be_bytes());
+        destination.extend_from_slice(&512u32.to_be_bytes());
+        destination.push(0);
+        put_plan_text(&mut destination, "vda").unwrap();
+        for _ in 0..3 {
+            put_plan_optional(&mut destination, None).unwrap();
+        }
+        let mut bytes = frame_observed_plan(&destination, [9; 32]).unwrap();
+        let plan = installation_plan::Plan::decode(&bytes).unwrap();
+        assert_eq!(plan.mode(), installation_plan::Mode::Erase);
+        assert_eq!(plan.destination().sequence(), 17);
+        assert_eq!(plan.deployment(), &[9; 32]);
+        bytes
+            .get_mut(97..105)
+            .unwrap()
+            .copy_from_slice(&18u64.to_be_bytes());
+        let changed = installation_plan::Plan::decode(&bytes).unwrap();
+        assert_eq!(changed.destination().sequence(), 18);
+        assert_eq!(changed.deployment(), plan.deployment());
     }
 
     #[test]

@@ -68,6 +68,9 @@ mod installation_protocol;
 #[path = "installation_service.rs"]
 mod installation_service;
 
+#[path = "reinstall.rs"]
+mod reinstall;
+
 // The service speaks one direction; td-authd's half is unused here.
 #[path = "installation_consent.rs"]
 #[allow(dead_code)]
@@ -1174,12 +1177,29 @@ impl installation_service::Host for LiveHost {
             .map_err(|error| refuse(installation_protocol::Refusal::SourceUnavailable, error))
     }
 
+    fn existing(
+        &mut self,
+        claim: &mut File,
+    ) -> Result<([u8; 16], installation_plan::Settings), installation_protocol::Refusal> {
+        let fail = |error| refuse(installation_protocol::Refusal::SourceUnavailable, error);
+        let (nonce, _) = self.entropy().map_err(fail)?;
+        let workspace = Workspace::create(Path::new("/run"), &nonce).map_err(fail)?;
+        let result = reinstall::inspect(claim, &self.root, &workspace);
+        let removed = workspace.remove();
+        let result = result.map_err(fail)?;
+        removed.map_err(fail)?;
+        Ok(result)
+    }
+
     fn check_fit(
         &mut self,
         plan: &installation_plan::Plan,
     ) -> Result<(), installation_protocol::Refusal> {
         use installation_protocol::Refusal;
         let unavailable = |error: io::Error| refuse(Refusal::SourceUnavailable, error);
+        if plan.mode() == installation_plan::Mode::Preserve {
+            return Ok(());
+        }
         let (kernel, payloads) = deployment_bytes(&self.source).map_err(unavailable)?;
         // The execution's own bound on what it copies to the ESP.
         if kernel == 0 || kernel > MAX_BOOT_FILE {
@@ -2104,7 +2124,13 @@ impl installation_service::Execute<File> for LiveExecution {
         // or a name an earlier execution left.
         let workspace = Workspace::create(&self.run, plan.nonce())
             .map_err(|error| report((installation_protocol::Failure::InsufficientSpace, error)))?;
-        let outcome = self.install(plan, claim, &workspace, progress);
+        let outcome = if plan.mode() == installation_plan::Mode::Preserve {
+            reinstall::execute(self, plan, claim, &workspace, progress)
+                .map(|()| None)
+                .map_err(|error| (installation_protocol::Failure::WriteFailed, error))
+        } else {
+            self.install(plan, claim, &workspace, progress)
+        };
         // Before any type-back: nothing after verifying boot needs it.
         if let Err(error) = workspace.remove() {
             let _ = writeln!(io::stderr(), "td-install serve: workspace: {error}");
@@ -2307,6 +2333,8 @@ impl Workspace {
         [
             paths::remove_file_if_present(&self.kernel),
             paths::remove_file_if_present(&self.selector),
+            paths::remove_file_if_present(&self.dir.join("trusted.pub")),
+            paths::remove_dir_if_present(&self.dir.join("publish")),
             paths::remove_dir_all_if_present(&self.scratch),
             paths::remove_dir_if_present(&self.mountpoint),
             paths::remove_dir_if_present(&self.dir),
@@ -5172,6 +5200,7 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::installation_service::Host;
     // The shipped half reaches the filesystem only through `mod paths` now, so
     // this is the test half's own — a test opening a fixture is not a path the
     // installer takes from an operator, and the scan reads only the half above.
@@ -5661,7 +5690,6 @@ mod tests {
     #[test]
     fn live_settings_refuse_with_the_failed_choice() {
         use installation_protocol::Refusal;
-        use installation_service::Host;
         let directory = scratch::path("serve-settings");
         std::fs::create_dir(&directory).unwrap();
         let _cleanup = ScratchDirectory(directory.clone());
@@ -8572,6 +8600,7 @@ mod tests {
             include_str!("../../td-boot/src/protocol.rs"),
             [].as_slice(),
         ),
+        ("reinstall.rs", include_str!("reinstall.rs"), [].as_slice()),
         ("scratch.rs", include_str!("scratch.rs"), [].as_slice()),
         ("inventory.rs", include_str!("inventory.rs"), [].as_slice()),
         (
@@ -12198,7 +12227,6 @@ mod tests {
     #[test]
     fn a_review_fits_its_deployment_to_its_disk() {
         use installation_protocol::Refusal;
-        use installation_service::Host;
         let fixture = ExecutionFixture::new(b"kernel", b"kernel");
         let source = fixture.execution.source.clone();
         let sized = |path: &Path, bytes: u64| File::create(path).unwrap().set_len(bytes).unwrap();
@@ -12405,7 +12433,6 @@ mod tests {
     #[test]
     fn a_source_is_admitted_only_as_the_booted_deployment() {
         use installation_protocol::Refusal;
-        use installation_service::Host;
         let fixture = ExecutionFixture::new(b"kernel", b"kernel");
         let execution = &fixture.execution;
         let id = sha256::to_base16(fixture.plan.deployment());
@@ -12437,7 +12464,6 @@ mod tests {
     #[test]
     fn an_unresolvable_source_refuses_discovery() {
         use installation_protocol::Refusal;
-        use installation_service::Host;
         let fixture = ExecutionFixture::new(b"kernel", b"kernel");
         let execution = &fixture.execution;
         let mut host = LiveHost {

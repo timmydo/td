@@ -118,7 +118,6 @@ impl Start {
 enum Active {
     Secret(Box<Unlock>),
     Install(Box<crate::deployment::Installation>),
-    DiskInstall(Box<crate::disk_install::Installation>),
     /// A login-key worker shares the one operation slot.
     Login(Box<Login>),
     /// So does a login operation a disk proof authorizes, with its two
@@ -135,7 +134,6 @@ impl Active {
         match self {
             Self::Secret(op) => Some(op.request()),
             Self::Install(op) => Some(op.request()),
-            Self::DiskInstall(op) => Some(op.request()),
             Self::Login(op) => op.request(),
             Self::Proof(op) => op.request(),
             Self::Storage(op) => op.request(),
@@ -147,7 +145,6 @@ impl Active {
         match self {
             Self::Secret(op) => op.request().nonce(),
             Self::Install(op) => op.request().nonce(),
-            Self::DiskInstall(op) => op.request().nonce(),
             Self::Login(op) => op.nonce(),
             Self::Proof(op) => op.nonce(),
             Self::Storage(op) => op.nonce(),
@@ -159,7 +156,6 @@ impl Active {
         match self {
             Self::Secret(op) => op.presented(request),
             Self::Install(op) => op.presented(request),
-            Self::DiskInstall(op) => op.presented(request),
             Self::Login(op) => op.presented(request),
             Self::Proof(op) => op.presented(request),
             Self::Storage(op) => op.presented(request),
@@ -171,7 +167,6 @@ impl Active {
         match self {
             Self::Secret(op) => op.commit(request),
             Self::Install(op) => op.commit(request),
-            Self::DiskInstall(op) => op.commit(request),
             Self::Login(op) => op.commit(request),
             Self::Proof(op) => op.commit(request),
             Self::Storage(op) => op.commit(request),
@@ -183,7 +178,6 @@ impl Active {
         match self {
             Self::Secret(op) => op.cancel(reason),
             Self::Install(op) => op.cancel(reason),
-            Self::DiskInstall(op) => op.cancel(reason),
             // Every login cancellation is the person's: kill, reap, no relock.
             Self::Login(op) => op.cancel(),
             Self::Proof(op) => op.cancel(),
@@ -196,7 +190,6 @@ impl Active {
         match self {
             Self::Secret(op) => op.poll(),
             Self::Install(op) => op.poll(),
-            Self::DiskInstall(op) => op.poll(),
             Self::Login(op) => op.poll(),
             Self::Proof(op) => op.poll(),
             Self::Storage(op) => op.poll(),
@@ -209,7 +202,6 @@ impl Active {
             Self::Secret(op) => op.reap_for_teardown(),
             Self::Install(op) => op.reap_for_teardown(),
             // The setup intake owns the service and stops it at teardown.
-            Self::DiskInstall(_) => Ok(()),
             Self::Login(op) => op.reap_for_teardown(),
             Self::Proof(op) => op.reap_for_teardown(),
             Self::Storage(op) => op.reap_for_teardown(),
@@ -368,7 +360,6 @@ impl Session {
             }
         }
         let answer = self.answer_with(request, cleanup_command, Start::begin);
-        self.send_disk_answer();
         answer
     }
 
@@ -378,19 +369,6 @@ impl Session {
         let outcome = crate::handoff::consume(paths, self.owner);
         crate::handoff::log(&outcome);
         self.admitted = outcome.admitted();
-    }
-
-    /// Forwards the disk installation's answer to its service.
-    fn send_disk_answer(&mut self) {
-        if let (Some(Active::DiskInstall(operation)), Some(setup)) =
-            (&mut self.operation, &mut self.setup)
-        {
-            if let Some(answer) = operation.take_answer() {
-                if setup.answer(answer).is_err() {
-                    operation.fate(answer.nonce(), crate::disk_install::Fate::Ended);
-                }
-            }
-        }
     }
 
     fn answer_with(
@@ -490,23 +468,6 @@ impl Session {
                 Ok(vec![0x93])
             }
             Request::Commit(description) => {
-                if let Some(Active::DiskInstall(operation)) = &mut self.operation {
-                    // The installer may have left, or the service ended the
-                    // review, while the prompt waited for Enter: commit
-                    // consents to nothing. A duplicate commit still refuses.
-                    if let Some(setup) = &mut self.setup {
-                        for (nonce, fate) in setup.tick() {
-                            operation.fate(&nonce, fate);
-                        }
-                    }
-                    if operation.ended() {
-                        if operation.request() != &description {
-                            return Err("stale installation consent".into());
-                        }
-                        self.event = Some(operation.poll()?);
-                        return Ok(vec![0x94]);
-                    }
-                }
                 if self.installing {
                     let intake = self
                         .installations
@@ -605,26 +566,8 @@ impl Session {
         {
             return Ok(vec![0x99, 0]);
         }
-        if let Some(setup) = &mut self.setup {
-            let Ok(request) = setup.select() else {
-                return Ok(vec![0x99, 0]);
-            };
-            let nonce = *request.nonce();
-            let operation = match crate::disk_install::Installation::start(request) {
-                Ok(operation) => operation,
-                Err(_) => {
-                    let _ = setup.answer(crate::installation_consent::Answer::Declined(
-                        nonce,
-                        crate::installation_consent::NoConsent::Unavailable,
-                    ));
-                    return Ok(vec![0x99, 0]);
-                }
-            };
-            let mut answer = vec![0x92];
-            answer.extend_from_slice(&operation.request().encode());
-            self.operation = Some(Active::DiskInstall(Box::new(operation)));
-            self.event = Some(Event::Waiting);
-            return Ok(answer);
+        if self.setup.is_some() {
+            return Ok(vec![0x99, 0]);
         }
         // The requester is the owner: the intake admits no other UID.
         if !table().is_ok_and(|table| table.grants(self.owner, DeployPublish)) {
@@ -881,11 +824,7 @@ impl Session {
             intake.tick();
         }
         if let Some(setup) = &mut self.setup {
-            for (nonce, fate) in setup.tick() {
-                if let Some(Active::DiskInstall(operation)) = &mut self.operation {
-                    operation.fate(&nonce, fate);
-                }
-            }
+            setup.tick();
         }
         if self.installing
             && !self
@@ -926,7 +865,6 @@ impl Session {
         if let Some(operation) = &mut self.operation {
             self.event = Some(operation.poll()?);
         }
-        self.send_disk_answer();
         if let Some(inspection) = &mut self.inspection {
             self.inspection_event = Some(inspection.poll()?);
         }

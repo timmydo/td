@@ -199,3 +199,7 @@ fn main() -> ExitCode {
 #[cfg(test)]
 #[path = "../tests/confinement.rs"]
 mod confinement;
+
+#[cfg(test)]
+#[path = "../../td-fs/src/temp_dir.rs"]
+mod test_temp;

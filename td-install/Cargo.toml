@@ -32,6 +32,9 @@ td-fido = { path = "../td-fido" }
 td-protector = { path = "../td-protector" }
 td-tpm = { path = "../td-tpm" }
 
+[dev-dependencies]
+td-fs = { path = "../td-fs" }
+
 [lints.rust]
 unsafe_code = "deny"
 

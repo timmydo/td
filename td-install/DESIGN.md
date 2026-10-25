@@ -439,6 +439,26 @@ an EFI boot stub, provide disk encryption, or authorize successor activation.
 The named, consent-bound update operation below authorizes successor activation.
 
 
+### Offline reinstall
+
+`INSTALLER.md` "Reinstall while keeping personal files" defines the live
+preserve mode. It is separate from formatting and preserves the existing GPT,
+filesystem UUID and writable state. Its first increment refuses encryption.
+It can provision missing installation signing state and replace both boot
+selections and the matching ESP trust. It requires explicit physical consent
+to reinstall and does not grant an installed updater permission to rotate keys.
+An interrupted reset may require another USB boot; keeping personal files is
+not a claim of atomic activation across Btrfs and FAT.
+
+`td-boot reinstall DEVICE MOUNTPOINT SOURCE TRUSTED-KEY` is its root mechanism.
+It requires an explicit key, verifies the complete source before a writable
+mount and takes the normal transaction locks. It uses the one bundle writer,
+replacing a same-ID destination through the existing installation temporary
+namespace, then selects the verified replacement in both slots and clears its
+attempt budget. Ordinary install retains its existing predecessor checks.
+Only the live installer binds this mechanism to physical consent and repairs
+the selector trust; the command alone is not a complete reinstall interface.
+
 ### Privileged local installation mechanism
 
 `td-update apply-operation DEPLOYMENT-ID` is an internal root-only
@@ -1141,6 +1161,12 @@ insufficient space where this process meets it, and as write failed where
 mkfs.btrfs reports only its status, with the disk untouched either way.
 
 ### Executing a consented installation
+
+On trusted live media the wizard's final review provides the human
+confirmation, for erase and preserve alike. Root acknowledges its exact
+Execute through the private lifecycle channel; no secure attention prompt
+is involved. This does not change installed-system update authorization.
+
 
 `td-install serve`'s execution installs onto the disk the service holds,
 on the service's own thread, once consent arrives and the held disk has

@@ -840,6 +840,7 @@ mod tests {
             [1; 32],
             1000,
             Operation::InstallDisk {
+                preserve: false,
                 requester: 1000,
                 disk: "d".repeat(DISK_NAME_BYTES),
                 capacity: u64::MAX,
@@ -863,6 +864,7 @@ mod tests {
             [1; 32],
             1000,
             Operation::InstallDisk {
+                preserve: false,
                 requester: 1000,
                 disk: "nvme0n1".into(),
                 capacity: 512_110_190_592,

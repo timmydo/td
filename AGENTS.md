@@ -348,6 +348,12 @@ paragraph is a target contract rather than a whole-image completeness claim.
    this ships. Other secrets require a second recovery token or an explicit
    unrecoverability decision.
 
+Trusted live-media installation is the explicit exception to the secure
+attention requirement: its isolated installer wizard confirms the exact
+reviewed disk and erase/preserve mode directly. The live wizard and its
+ordinary input are trusted for installation; this is not installed-session
+elevation or authentication. See `td-install/INSTALLER.md`.
+
 Principle 7 is a target, not a current claim. The stock VM writes an
 empty shadow field for `tester` and auto-logs in. Root is locked (`!`)
 and there is no `su`; no console or SSH login reaches root.

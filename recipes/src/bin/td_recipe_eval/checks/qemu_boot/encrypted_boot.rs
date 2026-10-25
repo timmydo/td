@@ -1191,8 +1191,6 @@ fn wizard(runner: &RecipeCheckRunner, bench: &Bench, tpm: &Path) -> Result<Strin
         vars: &vars,
         iso: &iso,
         target: &disk,
-        capacity: bench.capacity,
-        id: &medium.id,
         wizard: &wizard,
         tpm_socket: Some(emulator.socket.as_path()),
         keep_console: Some(&console),

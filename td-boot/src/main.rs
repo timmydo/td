@@ -199,6 +199,12 @@ enum Mode {
     /// happens before the filesystem does. D1 is unharmed: this is not a second
     /// implementation but the same `install_deployment`, reached without the
     /// mount.
+    Reinstall {
+        device: PathBuf,
+        mountpoint: PathBuf,
+        source: PathBuf,
+        trusted_key: PathBuf,
+    },
     Publish {
         root: PathBuf,
         source: PathBuf,
@@ -353,7 +359,7 @@ fn invalid(message: impl Into<String>) -> io::Error {
 fn usage_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "usage: td-boot initramfs /init\n       td-boot on-volume <boot|install|update|rollback|success|mount-root|mount-var> <arguments without device>\n       td-boot volume [UUID]\n       td-boot verify <volume-root>\n       td-boot root-loop <volume-root> <deployment-id> <loop-device>\n       td-boot boot <device> <mountpoint> <cmdline>\n       td-boot install <device> <mountpoint> <deployment-directory> [trusted-key]\n       td-boot update <device> <mountpoint> <volume> <channel> <trusted-key>\n       td-boot publish <volume-root> <deployment-directory> [trusted-key]\n       td-boot rollback <device> <mountpoint> <current-id> <previous-id>\n       td-boot success <device> <mountpoint> <deployment-id>\n       td-boot authenticate <deployment-directory> [trusted-key]\n       td-boot validate-source <deployment-directory> <trusted-key>\n       td-boot live-boot <mountpoint> <cmdline>\n       td-boot live-root <mountpoint> <deployment-id> <loop-device>\n       td-boot live-seed <mountpoint> <deployment-id> <seed-directory>\n       td-boot admit <run>\n       td-boot fido-worker <index> <inode> <rdev>",
+        "usage: td-boot initramfs /init\n       td-boot on-volume <boot|install|update|rollback|success|mount-root|mount-var> <arguments without device>\n       td-boot volume [UUID]\n       td-boot verify <volume-root>\n       td-boot root-loop <volume-root> <deployment-id> <loop-device>\n       td-boot boot <device> <mountpoint> <cmdline>\n       td-boot install <device> <mountpoint> <deployment-directory> [trusted-key]\n       td-boot update <device> <mountpoint> <volume> <channel> <trusted-key>\n       td-boot reinstall <device> <mountpoint> <deployment-directory> <trusted-key>\n       td-boot publish <volume-root> <deployment-directory> [trusted-key]\n       td-boot rollback <device> <mountpoint> <current-id> <previous-id>\n       td-boot success <device> <mountpoint> <deployment-id>\n       td-boot authenticate <deployment-directory> [trusted-key]\n       td-boot validate-source <deployment-directory> <trusted-key>\n       td-boot live-boot <mountpoint> <cmdline>\n       td-boot live-root <mountpoint> <deployment-id> <loop-device>\n       td-boot live-seed <mountpoint> <deployment-id> <seed-directory>\n       td-boot admit <run>\n       td-boot fido-worker <index> <inode> <rdev>",
     )
 }
 
@@ -547,6 +553,21 @@ fn parse_args<I: Iterator<Item = OsString>>(mut args: I) -> io::Result<Mode> {
                 device: PathBuf::from(device),
                 mountpoint: PathBuf::from(mountpoint),
                 cmdline,
+            })
+        }
+        Some(mode) if mode == OsStr::new("reinstall") => {
+            let device = args.next().ok_or_else(usage_error)?;
+            let mountpoint = args.next().ok_or_else(usage_error)?;
+            let source = args.next().ok_or_else(usage_error)?;
+            let trusted_key = args.next().ok_or_else(usage_error)?;
+            if args.next().is_some() {
+                return Err(usage_error());
+            }
+            Ok(Mode::Reinstall {
+                device: device.into(),
+                mountpoint: mountpoint.into(),
+                source: source.into(),
+                trusted_key: trusted_key.into(),
             })
         }
         Some(mode) if mode == OsStr::new("install") => {
@@ -1847,6 +1868,18 @@ fn install_trust_root(explicit: Option<&Path>, rootfs: &Path) -> io::Result<Opti
 }
 
 fn install_deployment(root: &Path, source: &Path, trust: Option<&TrustRoot>) -> io::Result<String> {
+    install_deployment_mode(root, source, trust, false)
+}
+
+fn install_deployment_mode(
+    root: &Path,
+    source: &Path,
+    trust: Option<&TrustRoot>,
+    reset: bool,
+) -> io::Result<String> {
+    if reset && trust.is_none() {
+        return Err(invalid("reinstallation requires an explicit trust root"));
+    }
     require_absolute(root, "volume root")?;
     require_absolute(source, "deployment source")?;
     require_real_directory(root, "volume root")?;
@@ -1866,16 +1899,55 @@ fn install_deployment(root: &Path, source: &Path, trust: Option<&TrustRoot>) -> 
     // manifest exactly ONCE.
     let bundle = open_bundle(source, trust, Names::Source)?;
     let candidate = bundle.id.clone();
-    let selection = match select_deployment(root) {
-        Ok(selection) => Some(selection),
-        Err(_) if selectors_are_absent(root)? => None,
-        Err(error) => {
-            return Err(invalid(format!(
-                "refusing activation without a verified existing deployment: {error}"
-            )));
+    let selection = if reset {
+        None
+    } else {
+        match select_deployment(root) {
+            Ok(selection) => Some(selection),
+            Err(_) if selectors_are_absent(root)? => None,
+            Err(error) => {
+                return Err(invalid(format!(
+                    "refusing activation without a verified existing deployment: {error}"
+                )));
+            }
         }
     };
+    // A recovery must replace even a damaged copy with this same manifest ID.
+    // Keep removal in the publisher's existing temporary-directory namespace;
+    // a crash is reclaimed on the next transaction, never by walking @var.
+    let _replaced = if reset {
+        let deployments = root.join(protocol::DEPLOYMENTS_DIR);
+        let destination = deployments.join(&candidate);
+        match fs::symlink_metadata(&destination) {
+            Ok(_) => {
+                require_real_directory(&destination, "replaced deployment")?;
+                let temporary = create_install_directory(&deployments, &candidate)?;
+                let cleanup = RemoveDirectory {
+                    path: Some(temporary.clone()),
+                };
+                fs::rename(&destination, &temporary)?;
+                sync_directory(&deployments)?;
+                Some(cleanup)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        }
+    } else {
+        None
+    };
     let installed = publish_bundle(root, bundle, trust.is_some())?;
+    if reset {
+        // Recovery replaces even malformed retry bookkeeping for this ID.
+        if let Some(directory) = attempts_directory(root, false)? {
+            match fs::remove_file(directory.join(&installed)) {
+                Ok(()) => sync_directory(&directory)?,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        activate_install(root, &installed, &installed)?;
+        return Ok(installed);
+    }
     if selection
         .as_ref()
         .is_some_and(|selected| selected.slot == "current" && selected.deployment.id == installed)
@@ -4474,6 +4546,21 @@ fn dispatch(mode: Mode) -> io::Result<()> {
             source,
             trusted_key,
         } => run_install(&device, &mountpoint, &source, trusted_key.as_deref()),
+        Mode::Reinstall {
+            device,
+            mountpoint,
+            source,
+            trusted_key,
+        } => {
+            let trust = read_trusted_key(&trusted_key)?;
+            // Admit the complete replacement before mounting writable. Recovery
+            // replaces both boot selections; it never formats or resets @var.
+            let _ = open_bundle(&source, Some(&trust), Names::Source)?;
+            let id = run_on_writable_volume(&device, &mountpoint, |root| {
+                install_deployment_mode(root, &source, Some(&trust), true)
+            })?;
+            writeln!(io::stdout(), "{id}")
+        }
         Mode::Publish {
             root,
             source,
@@ -5086,6 +5173,67 @@ mod tests {
     /// would report.
     fn fixture_path() -> &'static Path {
         Path::new("/td/fixtures/compiled-in")
+    }
+
+    #[test]
+    fn reinstall_repairs_same_id_payloads_and_preserves_home_and_settings() {
+        use std::os::unix::fs::MetadataExt;
+        let temp = test_temp::TempDir::new("td-reinstall").unwrap();
+        let fixture = Fixture {
+            root: temp.path().to_path_buf(),
+        };
+        fs::create_dir_all(fixture.root.join("td/boot")).unwrap();
+        fs::create_dir_all(fixture.root.join("td/deployments")).unwrap();
+        fs::create_dir_all(fixture.root.join("@var/home/alice")).unwrap();
+        fs::create_dir_all(fixture.root.join("@var/lib/td")).unwrap();
+        let home = fixture.root.join("@var/home/alice/keep");
+        let settings = fixture.root.join("@var/lib/td/username");
+        fs::write(&home, b"irreplaceable personal bytes").unwrap();
+        fs::write(&settings, b"alice\n").unwrap();
+        let inode = fs::metadata(&home).unwrap().ino();
+        let id = fixture.valid_deployment();
+        fixture.selector("current", &id);
+        fixture.selector("previous", &id);
+        let (source, same_id) = fixture.source_bundle("replacement", "");
+        assert_eq!(id, same_id);
+        let payload = fixture
+            .root
+            .join(protocol::DEPLOYMENTS_DIR)
+            .join(&id)
+            .join("root.erofs");
+        fs::write(&payload, b"damaged system").unwrap();
+        // Ordinary updates refuse damaged predecessors; recovery is explicit.
+        assert!(install_deployment(&fixture.root, &source, Some(&fixture.key())).is_err());
+        assert!(install_deployment_mode(&fixture.root, &source, None, true).is_err());
+        assert!(
+            install_deployment_mode(&fixture.root, &source, Some(&fixture.wrong_key()), true)
+                .is_err()
+        );
+        assert_eq!(fs::read(&payload).unwrap(), b"damaged system");
+        let attempts = attempts_directory(&fixture.root, true).unwrap().unwrap();
+        fs::write(attempts.join(&id), b"damaged attempt state").unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                install_deployment_mode(&fixture.root, &source, Some(&fixture.key()), true)
+                    .unwrap(),
+                id
+            );
+            assert_eq!(
+                authenticated_slot(&fixture.root, "current", &fixture.key())
+                    .unwrap()
+                    .id,
+                id
+            );
+            assert_eq!(
+                authenticated_slot(&fixture.root, "previous", &fixture.key())
+                    .unwrap()
+                    .id,
+                id
+            );
+            assert_eq!(fs::metadata(&home).unwrap().ino(), inode);
+            assert_eq!(fs::read(&home).unwrap(), b"irreplaceable personal bytes");
+            assert_eq!(fs::read(&settings).unwrap(), b"alice\n");
+        }
     }
 
     struct Fixture {

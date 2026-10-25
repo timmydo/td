@@ -167,6 +167,10 @@ impl Service {
 
     /// Proposes installing to `destination` with `settings`; the service
     /// reviews it against its own observation, or refuses.
+    pub fn reinstall(&mut self, destination: Destination) -> Result<(), String> {
+        self.send(Request::Reinstall(destination))
+    }
+
     pub fn propose(&mut self, destination: Destination, settings: Settings) -> Result<(), String> {
         self.send(Request::Propose {
             destination,
@@ -376,6 +380,14 @@ fn exchange(
     // that does not answer what was sent ends the connection, and with it
     // any review the service holds.
     match (request, reply) {
+        (Request::Reinstall(destination), Reply::Reviewed(plan)) => {
+            if plan.destination() != destination
+                || plan.mode() != td_install::installation_plan::Mode::Preserve
+            {
+                return Err("installer service changed the reinstall request".into());
+            }
+            Ok(Answer::Reviewed(plan))
+        }
         (Request::Withdraw(nonce), Reply::Status(State::Abandoned(ended, Abandon::Withdrawn)))
             if ended == *nonce =>
         {
@@ -399,7 +411,10 @@ fn exchange(
         ) => {
             // The storage is the service's own operand's, which no
             // request chooses; the review page says which it is.
-            if plan.destination() != destination || plan.settings() != settings {
+            if plan.destination() != destination
+                || plan.settings() != settings
+                || plan.mode() != td_install::installation_plan::Mode::Erase
+            {
                 return Err("installer service review does not match the proposal".into());
             }
             Ok(Answer::Reviewed(plan))
@@ -523,9 +538,9 @@ const DEVICE_BOUND: &str =
 fn abandon_text(abandon: Abandon) -> &'static str {
     match abandon {
         Abandon::Withdrawn => "the review was withdrawn",
-        Abandon::ConsentDeclined => "the installation was declined at the secure prompt",
-        Abandon::ConsentExpired => "the secure prompt expired without consent",
-        Abandon::ConsentUnavailable => "the secure prompt was unavailable",
+        Abandon::ConsentDeclined => "the installation service declined execution",
+        Abandon::ConsentExpired => "execution approval expired",
+        Abandon::ConsentUnavailable => "the installation authority was unavailable",
         Abandon::DestinationChanged => "the selected disk changed",
     }
 }
@@ -687,6 +702,13 @@ pub(crate) mod tests {
     /// every proposal.
     pub(crate) fn listing(request: &Request) -> Option<Vec<u8>> {
         match request {
+            Request::Reinstall(destination) => framed(&Reply::Reviewed(Box::new(
+                plan(
+                    destination,
+                    &Settings::new("alice", "tdhost", "us", "Etc/UTC").unwrap(),
+                )
+                .preserving(),
+            ))),
             Request::Destinations => {
                 framed(&Reply::Destinations(Candidates::new(vec![disk()]).unwrap()))
             }
@@ -1320,7 +1342,7 @@ pub(crate) mod tests {
             ),
             (
                 State::Abandoned(nonce, Abandon::ConsentDeclined),
-                Stage::Abandoned("the installation was declined at the secure prompt"),
+                Stage::Abandoned("the installation service declined execution"),
             ),
         ] {
             assert_eq!(

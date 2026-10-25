@@ -1489,6 +1489,7 @@ fn returns_for_recovery_key(request: &Request) -> bool {
     matches!(
         request.operation(),
         Operation::InstallDisk {
+            preserve: false,
             storage: crate::authority::consent::Storage::DeviceBound,
             ..
         }
@@ -2783,11 +2784,12 @@ mod tests {
 
     #[test]
     fn install_also_admits_a_whole_disk_installation_for_the_session_owner() {
-        let disk = |owner: u32| {
+        let disk = |owner: u32, preserve: bool| {
             Request::new(
                 [42; 32],
                 owner,
                 Operation::InstallDisk {
+                    preserve,
                     requester: owner,
                     disk: "vda".into(),
                     capacity: 8 << 30,
@@ -2801,20 +2803,25 @@ mod tests {
             )
             .unwrap()
         };
-        let mut screen = Screen::new();
-        Arc::get_mut(&mut screen.attempt).unwrap().selection = Selection::Install;
-        let mut client = Client::default();
-        let reply = [&[0x92][..], disk(1000).encode().as_slice()].concat();
-        client
-            .start(&mut wire(vec![reply]), Arc::clone(&screen.attempt))
-            .unwrap();
-        assert_eq!(client.pending.as_ref().unwrap().request, disk(1000));
-        let mut screen = Screen::new();
-        Arc::get_mut(&mut screen.attempt).unwrap().selection = Selection::Install;
-        let reply = [&[0x92][..], disk(1001).encode().as_slice()].concat();
-        assert!(Client::default()
-            .start(&mut wire(vec![reply]), Arc::clone(&screen.attempt))
-            .is_err());
+        for preserve in [false, true] {
+            let mut screen = Screen::new();
+            Arc::get_mut(&mut screen.attempt).unwrap().selection = Selection::Install;
+            let mut client = Client::default();
+            let reply = [&[0x92][..], disk(1000, preserve).encode().as_slice()].concat();
+            client
+                .start(&mut wire(vec![reply]), Arc::clone(&screen.attempt))
+                .unwrap();
+            assert_eq!(
+                client.pending.as_ref().unwrap().request,
+                disk(1000, preserve)
+            );
+            let mut screen = Screen::new();
+            Arc::get_mut(&mut screen.attempt).unwrap().selection = Selection::Install;
+            let reply = [&[0x92][..], disk(1001, preserve).encode().as_slice()].concat();
+            assert!(Client::default()
+                .start(&mut wire(vec![reply]), Arc::clone(&screen.attempt))
+                .is_err());
+        }
     }
 
     /// Root's description of a queued update for the owner, carrying
@@ -2922,72 +2929,80 @@ mod tests {
     /// complete presentation, and no digit confirms or ends it.
     #[test]
     fn a_disk_installation_waits_for_fresh_enter_and_takes_no_digit() {
-        let mut screen = Screen::new();
-        Arc::get_mut(&mut screen.attempt).unwrap().selection = Selection::Install;
-        let request = disk(crate::authority::consent::Storage::Unencrypted);
-        let tagged = |tag: &[u8]| [tag, request.encode().as_slice()].concat();
-        let mut wire = wire(vec![
-            tagged(&[0x92]),
-            tagged(&[0x91, 4]),
-            vec![0x93],
-            tagged(&[0x91, 5]),
-            tagged(&[0x91, 5]),
-            vec![0x94],
-            tagged(&[0x91, 6]),
-        ]);
-        let mut client = Client::default();
-        client
-            .start(&mut wire, Arc::clone(&screen.attempt))
-            .unwrap();
-        screen
-            .attempt
-            .confirm_install(&crate::input::test_origin(), u128::MAX)
-            .unwrap();
-        assert!(!screen.attempt.confirmed.load(Ordering::SeqCst));
-        client.tick(&mut wire).unwrap();
-        let completed = screen
-            .attempt
-            .presentation
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .after;
-        for digit in *b"23456789" {
-            assert!(!press(&screen, digit, completed + 1));
+        for preserve in [false, true] {
+            let mut screen = Screen::new();
+            Arc::get_mut(&mut screen.attempt).unwrap().selection = Selection::Install;
+            let request =
+                disk_preserving(crate::authority::consent::Storage::Unencrypted, preserve);
+            let tagged = |tag: &[u8]| [tag, request.encode().as_slice()].concat();
+            let mut wire = wire(vec![
+                tagged(&[0x92]),
+                tagged(&[0x91, 4]),
+                vec![0x93],
+                tagged(&[0x91, 5]),
+                tagged(&[0x91, 5]),
+                vec![0x94],
+                tagged(&[0x91, 6]),
+            ]);
+            let mut client = Client::default();
+            client
+                .start(&mut wire, Arc::clone(&screen.attempt))
+                .unwrap();
+            screen
+                .attempt
+                .confirm_install(&crate::input::test_origin(), u128::MAX)
+                .unwrap();
+            assert!(!screen.attempt.confirmed.load(Ordering::SeqCst));
+            client.tick(&mut wire).unwrap();
+            let completed = screen
+                .attempt
+                .presentation
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .after;
+            for digit in *b"23456789" {
+                assert!(!press(&screen, digit, completed + 1));
+            }
+            assert!(!confirmed(&screen) && screen.attempt.active());
+            screen
+                .attempt
+                .confirm_install(&crate::input::test_origin(), completed)
+                .unwrap();
+            client.tick(&mut wire).unwrap();
+            assert!(!wire.calls.iter().any(|call| call.first() == Some(&0x14)));
+            screen
+                .attempt
+                .confirm_install(&crate::input::test_origin(), completed + 1)
+                .unwrap();
+            client.tick(&mut wire).unwrap();
+            screen
+                .attempt
+                .confirm_install(&crate::input::test_origin(), completed + 2)
+                .unwrap();
+            client.tick(&mut wire).unwrap();
+            assert!(client.pending.is_none());
+            assert_eq!(
+                wire.calls
+                    .iter()
+                    .filter(|call| call.first() == Some(&0x14))
+                    .count(),
+                1
+            );
         }
-        assert!(!confirmed(&screen) && screen.attempt.active());
-        screen
-            .attempt
-            .confirm_install(&crate::input::test_origin(), completed)
-            .unwrap();
-        client.tick(&mut wire).unwrap();
-        assert!(!wire.calls.iter().any(|call| call.first() == Some(&0x14)));
-        screen
-            .attempt
-            .confirm_install(&crate::input::test_origin(), completed + 1)
-            .unwrap();
-        client.tick(&mut wire).unwrap();
-        screen
-            .attempt
-            .confirm_install(&crate::input::test_origin(), completed + 2)
-            .unwrap();
-        client.tick(&mut wire).unwrap();
-        assert!(client.pending.is_none());
-        assert_eq!(
-            wire.calls
-                .iter()
-                .filter(|call| call.first() == Some(&0x14))
-                .count(),
-            1
-        );
     }
 
     fn disk(storage: crate::authority::consent::Storage) -> Request {
+        disk_preserving(storage, false)
+    }
+
+    fn disk_preserving(storage: crate::authority::consent::Storage, preserve: bool) -> Request {
         Request::new(
             [42; 32],
             1000,
             Operation::InstallDisk {
+                preserve,
                 requester: 1000,
                 disk: "vda".into(),
                 capacity: 8 << 30,

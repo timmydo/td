@@ -57,10 +57,11 @@ fn plan() -> Plan {
     .unwrap()
 }
 fn plan_bytes() -> Vec<u8> {
-    let mut bytes = b"TDPLAN03".to_vec();
+    let mut bytes = b"TDPLAN04".to_vec();
     bytes.extend([1; 32]);
     bytes.extend([2; 32]);
     bytes.extend(uuid());
+    bytes.push(0);
     // The storage and basis bytes follow the destination's removable flag:
     // unencrypted, with a usable TPM and no keyboard console.
     let (fixed, names) = DESTINATION.split_at(29);
@@ -127,7 +128,7 @@ fn replies() -> Vec<Reply> {
 
 #[test]
 fn wire_bytes_are_independently_specified() {
-    assert_eq!(GREETING, b"TDINS06\n");
+    assert_eq!(GREETING, b"TDINS07\n");
     let mut propose = vec![0x02];
     propose.extend(DESTINATION);
     propose.extend(SETTINGS);
@@ -353,11 +354,11 @@ fn maximal_messages_fit_their_direction_bounds() {
     )
     .unwrap();
     let execute = Request::Execute(plan.clone());
-    assert_eq!(execute.encode().len(), 1194);
+    assert_eq!(execute.encode().len(), 1195);
     assert!(execute.encode().len() <= MAX_REQUEST_BYTES);
     assert_eq!(Request::decode(&execute.encode()).unwrap(), execute);
     let reviewed = Reply::Reviewed(Box::new(plan));
-    assert_eq!(reviewed.encode().len(), 1194);
+    assert_eq!(reviewed.encode().len(), 1195);
     assert_eq!(Reply::decode(&reviewed.encode()).unwrap(), reviewed);
     let status = Reply::Status(State::Running(nonce(), Phase::VerifyingBoot));
     assert_eq!(status.encode().len(), 35);
@@ -456,7 +457,7 @@ fn every_truncation_and_extension_refuses() {
 #[test]
 fn unknown_tags_codes_and_zero_nonces_refuse() {
     for tag in 0..=255u8 {
-        let known_request = (0x01..=0x0a).contains(&tag);
+        let known_request = (0x01..=0x0b).contains(&tag);
         let known_reply = (0x81..=0x86).contains(&tag);
         if !known_request {
             assert_eq!(
@@ -546,7 +547,7 @@ fn directions_are_disjoint() {
 
 #[test]
 fn only_this_version_is_admitted() {
-    assert!(check_greeting(b"TDINS06\n").is_ok());
+    assert!(check_greeting(b"TDINS07\n").is_ok());
     for other in [
         b"TDINS05\n",
         b"TDINS04\n",
@@ -554,7 +555,7 @@ fn only_this_version_is_admitted() {
         b"TDINS02\n",
         b"TDAT001\n",
         b"TDUPD01\n",
-        b"TDINS06\0",
+        b"TDINS07\0",
     ] {
         assert_eq!(
             check_greeting(other).unwrap_err(),
@@ -693,4 +694,17 @@ fn replies_pair_only_with_their_requests() {
             );
         }
     }
+}
+
+#[test]
+fn reinstall_carries_only_the_disk_not_replacement_account_settings() {
+    let request = Request::Reinstall(destination());
+    let bytes = request.encode();
+    assert_eq!(bytes[0], 0x0b);
+    assert_eq!(&bytes[1..], DESTINATION);
+    assert_eq!(Request::decode(&bytes).unwrap(), request);
+    assert!(Reply::Reviewed(Box::new(plan().preserving())).answers(&request));
+    let mut excess = bytes;
+    excess.extend(SETTINGS);
+    assert!(Request::decode(&excess).is_err());
 }

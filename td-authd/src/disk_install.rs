@@ -1,29 +1,23 @@
 //! The live installer's setup intake, the installation service it starts
-//! for each installer, and the one physically confirmed whole-disk
-//! installation (td-authd/DESIGN.md "Whole-disk installation intake").
+//! for each installer. The live wizard confirms its final review; the
+//! broker acknowledges that exact execution and supervises its lifetime (td-authd/DESIGN.md "Whole-disk installation intake").
 
-use crate::consent::{Label, Operation, Request, Storage};
-use crate::installation_consent::{self as wire, Answer, NoConsent, Outcome, Report};
+use crate::installation_consent::{self as wire, Answer, Outcome, Report};
 use crate::secret_sys as sys;
-use crate::unlock::Event;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
 
 const SOCKET: &str = "/run/td-authd/1000/setup";
 /// The live wizard's service identity (td-install/INSTALLER.md), owner of
-/// the socket and the only peer admitted; a review's consent still names
-/// the session owner.
+/// the socket and the only peer admitted.
 const INSTALLER_UID: u32 = 990;
 const CMDLINE: &str = "/proc/cmdline";
 /// The key the live selector handed to the live system (td-install/MEDIA.md).
 const TRUSTED_KEY: &str = "/run/td-volume/td/trusted.pub";
-/// Prompt lifetime, as for an update installation.
-const CONSENT_TIME: Duration = Duration::from_secs(120);
 /// A frame and its header.
 const FRAME_BYTES: usize = 4 + wire::MAX_MESSAGE_BYTES;
 /// Nonblocking reads, and writes, per heartbeat: a service cannot hold the
@@ -66,7 +60,7 @@ pub(crate) fn live_boot() -> Result<bool, String> {
     Ok(true)
 }
 
-/// How a review the operation shows ended, as the service reported it.
+/// How an execution ended, as the service reported it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Fate {
     /// Ended before any write.
@@ -78,7 +72,6 @@ pub(crate) enum Fate {
 /// The review a service has open, and how far it has come.
 struct Open {
     review: Box<wire::Review>,
-    selected: bool,
     /// The answer sent: consent or not.
     answered: Option<bool>,
     started: bool,
@@ -234,12 +227,15 @@ impl Service {
             .filter(|open| open.review.nonce() == report.nonce());
         let fate = match (report, open) {
             (Report::Review(review), None) if idle => {
+                let nonce = *review.nonce();
                 self.open = Some(Open {
                     review,
-                    selected: false,
                     answered: None,
                     started: false,
                 });
+                // Only the fixed root service can send this report, after
+                // validating the live wizard's exact final Execute request.
+                self.answer(Answer::Consent(nonce))?;
                 return Ok(());
             }
             (Report::Ended(nonce, _), Some(open)) if !open.started => (nonce, Fate::Ended),
@@ -290,37 +286,9 @@ impl Drop for Service {
     }
 }
 
-/// The consent summary of a review, for `owner`.
-fn summary(review: &wire::Review, owner: u32) -> Result<Request, String> {
-    let deployment = review
-        .deployment()
-        .first_chunk::<8>()
-        .copied()
-        .ok_or("short deployment digest")?;
-    Request::new(
-        *review.nonce(),
-        owner,
-        Operation::InstallDisk {
-            requester: owner,
-            disk: review.disk().into(),
-            capacity: review.capacity(),
-            model: review.model().map(|raw| Label::model(raw.as_bytes())),
-            serial: review.serial().map(|raw| Label::serial(raw.as_bytes())),
-            hostname: review.hostname().into(),
-            username: review.username().into(),
-            deployment,
-            storage: match review.storage() {
-                wire::Storage::Unencrypted => Storage::Unencrypted,
-                wire::Storage::DeviceBound => Storage::DeviceBound,
-            },
-        },
-    )
-}
-
 /// The setup intake and the service it runs for the current installer.
 pub(crate) struct Intake {
     listener: UnixListener,
-    owner: u32,
     installer: u32,
     identity: (u64, u64),
     service: Option<Service>,
@@ -339,7 +307,6 @@ impl Intake {
         let (listener, identity) = crate::deployment::bind_intake(SOCKET, INSTALLER_UID)?;
         Ok(Self {
             listener,
-            owner,
             installer: INSTALLER_UID,
             identity,
             service: None,
@@ -411,145 +378,11 @@ impl Intake {
         }
         fates
     }
-
-    /// The open review, once, as a consent request. A review consent cannot
-    /// show is declined as unavailable.
-    pub fn select(&mut self) -> Result<Request, String> {
-        self.tick();
-        let service = self.service.as_mut().ok_or("no installation service")?;
-        let open = service.open.as_mut().ok_or("no installation review")?;
-        if open.selected {
-            return Err("installation review already selected".into());
-        }
-        open.selected = true;
-        match summary(&open.review, self.owner) {
-            Ok(request) => Ok(request),
-            Err(why) => {
-                let nonce = *open.review.nonce();
-                service.answer(Answer::Declined(nonce, NoConsent::Unavailable))?;
-                Err(why)
-            }
-        }
-    }
-
-    pub fn answer(&mut self, answer: Answer) -> Result<(), String> {
-        self.service
-            .as_mut()
-            .ok_or("no installation service")?
-            .answer(answer)
-    }
 }
 
 impl Drop for Intake {
     fn drop(&mut self) {
         crate::deployment::unlink_intake(SOCKET, self.identity);
-    }
-}
-
-/// One whole-disk installation the person confirms on the trusted path.
-pub(crate) struct Installation {
-    request: Request,
-    presented: bool,
-    committed: bool,
-    deadline: Instant,
-    result: Option<bool>,
-    answer: Option<Answer>,
-}
-
-impl Installation {
-    pub fn start(request: Request) -> Result<Self, String> {
-        if !matches!(request.operation(), Operation::InstallDisk { .. }) {
-            return Err("not a whole-disk installation".into());
-        }
-        Ok(Self {
-            request,
-            presented: false,
-            committed: false,
-            deadline: Instant::now()
-                .checked_add(CONSENT_TIME)
-                .ok_or("installation deadline overflow")?,
-            result: None,
-            answer: None,
-        })
-    }
-    pub fn request(&self) -> &Request {
-        &self.request
-    }
-    fn admit(&self, request: &Request) -> Result<(), String> {
-        if request != &self.request
-            || self.result.is_some()
-            || self.committed
-            || Instant::now() >= self.deadline
-        {
-            return Err("stale installation consent".into());
-        }
-        Ok(())
-    }
-    pub fn presented(&mut self, request: &Request) -> Result<(), String> {
-        // The review ended unconsented (the service ended it, or Escape or
-        // expiry); poll reports it.
-        if self.ended() && request == &self.request {
-            return Ok(());
-        }
-        self.admit(request)?;
-        if self.presented {
-            return Err("duplicate installation presentation".into());
-        }
-        self.presented = true;
-        Ok(())
-    }
-    pub fn commit(&mut self, request: &Request) -> Result<(), String> {
-        self.admit(request)?;
-        if !self.presented {
-            return Err("installation was not presented".into());
-        }
-        self.committed = true;
-        self.answer = Some(Answer::Consent(*self.request.nonce()));
-        Ok(())
-    }
-    fn decline(&mut self, why: NoConsent) {
-        if !self.committed && self.result.is_none() {
-            self.result = Some(false);
-            self.answer = Some(Answer::Declined(*self.request.nonce(), why));
-        }
-    }
-    /// Consent is one answer, not a renewable approval: after commit only
-    /// the service's reports end the operation.
-    pub fn cancel(&mut self, _reason: &str) -> Result<(), String> {
-        self.decline(NoConsent::Declined);
-        Ok(())
-    }
-    /// The service's report on this review.
-    pub fn fate(&mut self, nonce: &[u8; 32], fate: Fate) {
-        if nonce != self.request.nonce() || self.result.is_some() {
-            return;
-        }
-        self.result = match fate {
-            Fate::Started => return,
-            Fate::Ended => Some(false),
-            // Only committed consent completes.
-            Fate::Finished(outcome) => Some(self.committed && outcome == Outcome::Complete),
-        };
-    }
-    /// Whether this review ended before commit.
-    pub fn ended(&self) -> bool {
-        self.result.is_some() && !self.committed
-    }
-    /// The answer owed to the service, once.
-    pub fn take_answer(&mut self) -> Option<Answer> {
-        self.answer.take()
-    }
-    pub fn poll(&mut self) -> Result<Event, String> {
-        if !self.committed && Instant::now() >= self.deadline {
-            self.decline(NoConsent::Expired);
-        }
-        Ok(match self.result {
-            Some(true) => Event::Complete,
-            Some(false) => Event::Failed("disk installation failed or was cancelled".into()),
-            None if self.committed => Event::Waiting,
-            None if self.presented => Event::Commit(self.request.clone()),
-            None => Event::Present(self.request.clone()),
-        })
     }
 }
 

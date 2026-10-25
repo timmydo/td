@@ -31,6 +31,10 @@ pub(crate) trait Host {
     fn timezones(&mut self) -> Result<Zones, Refusal>;
     fn check_settings(&mut self, settings: &Settings) -> Result<(), Refusal>;
     fn claim(&mut self, destination: &Destination) -> Result<Self::Claim, Refusal>;
+    /// Inspect under the claim without changing the installed filesystem.
+    fn existing(&mut self, _claim: &mut Self::Claim) -> Result<([u8; 16], Settings), Refusal> {
+        Err(Refusal::SourceUnavailable)
+    }
     /// The authenticated deployment manifest digest.
     fn authenticate_source(&mut self) -> Result<[u8; 32], Refusal>;
     /// Whether the plan's disk holds what installing its source writes.
@@ -179,6 +183,10 @@ impl<H: Host, E: Execute<H::Claim>> Service<H, E> {
     /// One reply per request. An error ends the service and its claim.
     pub(crate) fn answer(&mut self, request: Request) -> io::Result<Reply> {
         Ok(match request {
+            Request::Reinstall(destination) => match self.propose(destination, None)? {
+                Ok(plan) => Reply::Reviewed(Box::new(plan)),
+                Err(refusal) => Reply::Refused(refusal),
+            },
             Request::Status => Reply::Status(self.state()),
             Request::Destinations => match self.host.candidates() {
                 Ok(candidates) => Reply::Destinations(candidates),
@@ -187,7 +195,7 @@ impl<H: Host, E: Execute<H::Claim>> Service<H, E> {
             Request::Propose {
                 destination,
                 settings,
-            } => match self.propose(destination, settings)? {
+            } => match self.propose(destination, Some(settings))? {
                 Ok(plan) => Reply::Reviewed(Box::new(plan)),
                 Err(refusal) => Reply::Refused(refusal),
             },
@@ -306,7 +314,7 @@ impl<H: Host, E: Execute<H::Claim>> Service<H, E> {
     fn propose(
         &mut self,
         destination: Destination,
-        settings: Settings,
+        settings: Option<Settings>,
     ) -> io::Result<Result<Plan, Refusal>> {
         match &self.held {
             // One boot installs once.
@@ -317,8 +325,10 @@ impl<H: Host, E: Execute<H::Claim>> Service<H, E> {
             | Held::Complete(_) => return Ok(Err(Refusal::Busy)),
             Held::Idle | Held::Failed(..) | Held::Abandoned(..) => {}
         }
-        if let Err(refusal) = self.host.check_settings(&settings) {
-            return Ok(Err(refusal));
+        if let Some(settings) = &settings {
+            if let Err(refusal) = self.host.check_settings(settings) {
+                return Ok(Err(refusal));
+            }
         }
         // The installer's destination only selects: it must equal the
         // service's own observation, labels included, and that observation
@@ -339,15 +349,24 @@ impl<H: Host, E: Execute<H::Claim>> Service<H, E> {
             Err(refusal) => return Ok(Err(refusal)),
         };
         let (nonce, uuid) = self.host.entropy()?;
-        let plan = Plan::new(
-            nonce,
-            destination,
-            deployment,
-            uuid,
-            self.host.basis(),
-            settings,
-        )
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let preserve = settings.is_none();
+        let (uuid, settings, basis) = match settings {
+            Some(settings) => (uuid, settings, self.host.basis()),
+            None => match self.host.existing(&mut claim) {
+                Ok((uuid, settings)) => {
+                    if let Err(refusal) = self.host.check_settings(&settings) {
+                        return Ok(Err(refusal));
+                    }
+                    (uuid, settings, Basis::default())
+                }
+                Err(refusal) => return Ok(Err(refusal)),
+            },
+        };
+        let mut plan = Plan::new(nonce, destination, deployment, uuid, basis, settings)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if preserve {
+            plan = plan.preserving();
+        }
         // A review is only presented for a disk it fits, with the plan's own
         // volume identity sizing the selector.
         if let Err(refusal) = self.host.check_fit(&plan) {
@@ -569,6 +588,7 @@ fn consent_review(plan: &Plan) -> Result<consent::Review, String> {
             Storage::DeviceBound => consent::Storage::DeviceBound,
         },
     })
+    .map(|review| review.preserving(plan.mode() == crate::installation_plan::Mode::Preserve))
 }
 
 /// What reaches the serving thread.
@@ -1023,6 +1043,14 @@ mod tests {
             self.log.lock().unwrap().live += 1;
             Ok(Claim(Arc::clone(&self.log)))
         }
+        fn existing(&mut self, _: &mut Claim) -> Result<([u8; 16], Settings), Refusal> {
+            self.call("existing");
+            assert_eq!(self.log.lock().unwrap().live, 1);
+            let mut uuid = [0x22; 16];
+            uuid[6] = 0x42;
+            uuid[8] = 0x82;
+            Ok((uuid, settings()))
+        }
         fn authenticate_source(&mut self) -> Result<[u8; 32], Refusal> {
             self.call("source");
             // The source is authenticated while the disk is held.
@@ -1087,6 +1115,35 @@ mod tests {
 
     fn live<E: Execute<Claim>>(service: &Service<Fake, E>) -> usize {
         service.host.log.lock().unwrap().live
+    }
+
+    #[test]
+    fn reinstall_reads_saved_settings_under_claim_and_binds_the_mode() {
+        let mut service = Service::new(Fake::new());
+        let Reply::Reviewed(plan) = service
+            .answer(Request::Reinstall(disk("vda", 1, Some("Disk"))))
+            .unwrap()
+        else {
+            panic!("reinstall was not reviewed");
+        };
+        assert_eq!(plan.mode(), crate::installation_plan::Mode::Preserve);
+        assert_eq!(plan.settings(), &settings());
+        assert_eq!(plan.volume_uuid()[0], 0x22);
+        assert!(consent_review(&plan).unwrap().preserve());
+        let erase = Plan::new(
+            *plan.nonce(),
+            plan.destination().clone(),
+            *plan.deployment(),
+            *plan.volume_uuid(),
+            plan.basis(),
+            plan.settings().clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            service.answer(Request::Execute(erase)).unwrap(),
+            Reply::Refused(Refusal::StaleReview)
+        );
+        assert_eq!(live(&service), 1);
     }
 
     #[test]

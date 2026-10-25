@@ -3,7 +3,7 @@
 //! for eligible disks and lists them, or says why it cannot; a chosen disk
 //! leads to the settings form, whose time zones the service supplies, and
 //! the completed form to the service's review of it; from the review it asks
-//! the service to seek trusted consent and follows the installation's
+//! the service to execute the confirmed review and follows the installation's
 //! progress to its outcome. A device-bound installation's outcome waits
 //! on its recovery key: the window shows it once and has it typed back
 //! before the service makes the disk bootable. It owns no Wayland objects
@@ -84,6 +84,7 @@ struct Window {
     /// the turn-loop time that page was first shown. Buttons are hit only
     /// as shown, and not before `SETTLE` has passed.
     shown: Option<(Page, Steps, u64)>,
+    shown_review: Option<[u8; 32]>,
     /// The wheel's motion within the pointer's current frame.
     wheel: pointer::Wheel,
 }
@@ -181,8 +182,10 @@ enum Action {
 
 /// The keys `Wizard::key` takes on each page, for the window's key list;
 /// the settings form's own are `settings`'.
-const WELCOME_KEYS: &[(&str, &str)] =
-    &[("Return", "ask the installer service for the eligible disks")];
+const WELCOME_KEYS: &[(&str, &str)] = &[
+    ("Return", "new installation: erase the selected disk"),
+    ("r", "reinstall an existing system and keep personal files"),
+];
 const DISK_KEYS: &[(&str, &str)] = &[
     ("Up/Down", "select the disk above or below"),
     ("click", "select the disk under the pointer"),
@@ -203,22 +206,10 @@ const TIME_ZONE_KEYS: &[(&str, &str)] = &[
 ];
 const REVIEW_KEYS: &[(&str, &str)] = &[
     ("PageUp/PageDown", "page through the review's details"),
-    (
-        "Return",
-        "ask the installer service to seek consent at the secure prompt",
-    ),
+    ("Return", "confirm this review and start installation"),
     ("Escape", "withdraw the review and go back to the settings"),
 ];
-/// The secure prompt's keys are the compositor's, so they are prose,
-/// spelled as its screen and td-authd's requesters spell them.
-const CONSENT_KEYS: &[(&str, &str)] = &[
-    (
-        "",
-        "Ctrl+Alt+Escape, then I, opens the compositor's secure prompt, where \
-         Enter confirms and Escape declines; those keys are the compositor's, not this window's",
-    ),
-    ("Escape", "withdraw the review and go back to the settings"),
-];
+const CONSENT_KEYS: &[(&str, &str)] = &[("Escape", "request cancellation before writing starts")];
 const RECOVERY_KEYS: &[(&str, &str)] = &[("Return", "type the key back once it is written down")];
 /// The type-back's own keys; the field's are `recovery`'s.
 const TYPE_BACK_KEYS: &[(&str, &str)] = &[
@@ -275,7 +266,7 @@ const POWER_UNAVAILABLE: &str =
 /// Shown on settings while a proposal is with the service.
 const REVIEWING: &str = "Asking the installer service for a review\u{2026}";
 /// Shown on review while execute is with the service.
-const SEEKING: &str = "Asking the installer service to seek consent\u{2026}";
+const SEEKING: &str = "Starting the confirmed installation\u{2026}";
 /// Shown on the type-back while the key typed is with the service.
 const CONFIRMING: &str = "Asking the installer service to confirm the key\u{2026}";
 /// Shown on the type-back once the service found the key typed different.
@@ -290,6 +281,8 @@ const POLL: u64 = 500;
 /// review.
 #[derive(Debug)]
 struct Wizard {
+    preserve: bool,
+    reinstall: Option<Destination>,
     page: Page,
     disks: Vec<Destination>,
     selected: Option<usize>,
@@ -350,6 +343,8 @@ struct Wizard {
 impl Wizard {
     fn new() -> Self {
         Self {
+            preserve: false,
+            reinstall: None,
             page: Page::Welcome,
             disks: Vec::new(),
             selected: None,
@@ -384,7 +379,14 @@ impl Wizard {
 
     fn key(&mut self, chord: &str) -> Action {
         match (&self.page, chord) {
-            (Page::Welcome, "Return") => self.page = Page::Waiting,
+            (Page::Welcome, "Return") => {
+                self.preserve = false;
+                self.page = Page::Waiting;
+            }
+            (Page::Welcome, "r") => {
+                self.preserve = true;
+                self.page = Page::Waiting;
+            }
             (Page::Welcome, _) => {}
             (Page::Waiting, "Escape") => {
                 // The connection goes, and with it any review it held. If an
@@ -427,7 +429,11 @@ impl Wizard {
                 self.execute = None;
                 self.review_notice = None;
                 self.review_page = 0;
-                self.page = Page::Settings;
+                self.page = if self.preserve {
+                    Page::Destinations
+                } else {
+                    Page::Settings
+                };
             }
             (Page::Review, "Return") => {
                 if self.execute.is_none() && self.executing.is_none() {
@@ -435,13 +441,17 @@ impl Wizard {
                     self.review_notice = Some(SEEKING);
                 }
             }
-            // Leaving the secure prompt withdraws the review; until that is
+            // Leaving the starting page withdraws the review; until that is
             // confirmed the outcome stays the execute's.
             (Page::Progress(Progress::Consent), "Escape") => {
                 self.withdraw = self.executing;
                 self.plan = None;
                 self.review_page = 0;
-                self.page = Page::Settings;
+                self.page = if self.preserve {
+                    Page::Destinations
+                } else {
+                    Page::Settings
+                };
             }
             // The key, once written down, is typed back; Escape shows it
             // again. Nothing here leaves the installation.
@@ -479,8 +489,20 @@ impl Wizard {
             (Page::Review, "PageUp") => self.review_page = self.review_page.saturating_sub(1),
             (Page::Review, _) => {}
             (_, "Escape") => self.page = Page::Welcome,
+            (Page::Destinations, "Return") if self.preserve && self.selected.is_some() => {
+                if !self.reviewing() {
+                    self.reinstall = self
+                        .selected
+                        .and_then(|index| self.disks.get(index))
+                        .cloned();
+                }
+            }
             (Page::Destinations, "Return") if self.selected.is_some() => {
-                self.page = Page::Settings;
+                self.page = if self.preserve {
+                    Page::Destinations
+                } else {
+                    Page::Settings
+                };
                 if matches!(self.catalog, Catalog::Refused(_)) {
                     self.catalog = Catalog::Unasked;
                 }
@@ -623,7 +645,7 @@ impl Wizard {
 
     /// Whether a proposal is queued or its review still wanted.
     fn reviewing(&self) -> bool {
-        self.proposal.is_some() || self.awaited
+        self.proposal.is_some() || self.reinstall.is_some() || self.awaited
     }
 
     /// Whether a key typed back is queued or with the service.
@@ -695,6 +717,7 @@ impl Wizard {
             return Some(Asked::Withdraw);
         }
         match (&self.page, self.catalog) {
+            (Page::Destinations, _) if self.reinstall.is_some() => Some(Asked::Review),
             (Page::Waiting, _) => Some(Asked::Disks),
             (Page::Settings, Catalog::Unasked) => Some(Asked::Zones),
             (Page::Settings, _) if self.proposal.is_some() => Some(Asked::Review),
@@ -733,7 +756,10 @@ impl Wizard {
                 self.catalog = Catalog::Refused(reason);
             }
             (Some(Asked::Review), Ok(Answer::Reviewed(plan))) => {
-                if std::mem::take(&mut self.awaited) && self.page == Page::Settings {
+                if std::mem::take(&mut self.awaited)
+                    && (self.page == Page::Settings
+                        || (self.page == Page::Destinations && self.preserve))
+                {
                     self.notice = None;
                     self.plan = Some(plan);
                     self.review_page = 0;
@@ -745,6 +771,9 @@ impl Wizard {
             (Some(Asked::Review), Ok(Answer::Refused(reason))) if self.awaited => {
                 self.awaited = false;
                 self.notice = Some(reason);
+                if self.preserve {
+                    self.page = Page::Refused(reason);
+                }
             }
             // An execute answered after the review was left is the
             // release's to settle.
@@ -852,7 +881,11 @@ impl Wizard {
         self.review_notice = None;
         if matches!(self.page, Page::Review | Page::Settings) {
             self.notice = Some(reason);
-            self.page = Page::Settings;
+            self.page = if self.preserve {
+                Page::Destinations
+            } else {
+                Page::Settings
+            };
         }
     }
 
@@ -896,7 +929,11 @@ impl Wizard {
             // review may be proposed.
             Stage::Abandoned(reason) => {
                 self.notice = Some(reason);
-                Page::Settings
+                if self.preserve {
+                    Page::Destinations
+                } else {
+                    Page::Settings
+                }
             }
             Stage::Reviewed => Page::Progress(Progress::Unknown),
             // The service stays in the phase after the key typed back is
@@ -1172,6 +1209,12 @@ impl Front {
         let sent = match asked {
             Asked::Disks => service.destinations(),
             Asked::Zones => service.timezones(),
+            Asked::Review if self.wizard.reinstall.is_some() => {
+                match self.wizard.reinstall.take() {
+                    Some(disk) => service.reinstall(disk),
+                    None => return,
+                }
+            }
             Asked::Review => match self.wizard.proposal.take() {
                 Some((disk, settings)) => service.propose(disk, settings),
                 None => return,
@@ -1287,6 +1330,7 @@ impl Window {
             pointer: (0, 0),
             pressed: None,
             shown: None,
+            shown_review: None,
             wheel: pointer::Wheel::default(),
         })
     }
@@ -1476,7 +1520,11 @@ impl Window {
         // once its page has been shown long enough to be seen: a double
         // click's second press lands on the page the first one opened.
         let (page, steps, since) = self.shown.as_ref()?;
-        if *page != wizard.page || *steps != wizard.steps() || self.clock < since + SETTLE {
+        if (wizard.page == Page::Review && !self.review_confirmable())
+            || *page != wizard.page
+            || *steps != wizard.steps()
+            || self.clock < since + SETTLE
+        {
             return None;
         }
         if wizard.page == Page::Complete {
@@ -1496,11 +1544,28 @@ impl Window {
     /// time it was first shown.
     fn presented(&mut self, page: bool) {
         let wizard = &self.front.wizard;
+        let review = wizard
+            .plan
+            .as_ref()
+            .filter(|_| wizard.page == Page::Review)
+            .map(|plan| *plan.nonce());
         let since = match &self.shown {
-            Some((shown, _, since)) if *shown == wizard.page => *since,
+            Some((shown, _, since)) if *shown == wizard.page && review == self.shown_review => {
+                *since
+            }
             _ => self.clock,
         };
         self.shown = page.then(|| (wizard.page.clone(), wizard.steps(), since));
+        self.shown_review = if page { review } else { None };
+    }
+
+    fn review_confirmable(&self) -> bool {
+        let nonce = self.front.wizard.plan.as_ref().map(|plan| *plan.nonce());
+        nonce.is_some()
+            && nonce == self.shown_review
+            && self.shown.as_ref().is_some_and(|(page, _, since)| {
+                *page == Page::Review && self.clock.saturating_sub(*since) >= SETTLE
+            })
     }
 
     /// A button's action: a step button's as its key's, an ending chosen
@@ -1593,6 +1658,12 @@ impl Window {
             self.key_list
                 .open(self.front.wizard.key_sections(), surface);
         } else {
+            if chord == "Return"
+                && self.front.wizard.page == Page::Review
+                && !self.review_confirmable()
+            {
+                return Ok(false);
+            }
             repeat = repeats(&chord);
             self.front.key(&chord, Path::new(SOCKET));
         }
@@ -1918,6 +1989,31 @@ mod tests {
             front.receive();
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    #[test]
+    fn reinstall_skips_editable_settings_and_back_never_switches_to_erasure() {
+        let mut wizard = Wizard::new();
+        wizard.key("r");
+        wizard.sent(Asked::Disks);
+        wizard.answered(Ok(Answer::Destinations(vec![disk("vda")])));
+        wizard.key("Down");
+        wizard.key("Return");
+        assert_eq!(wizard.wanted(), Some(Asked::Review));
+        assert!(wizard.proposal.is_none());
+        let destination = wizard.reinstall.take().unwrap();
+        let settings = Settings::new("alice", "tdhost", "us", "Etc/UTC").unwrap();
+        let plan = crate::service::tests::plan(&destination, &settings).preserving();
+        wizard.sent(Asked::Review);
+        wizard.answered(Ok(Answer::Reviewed(Box::new(plan.clone()))));
+        assert_eq!(wizard.page, Page::Review);
+        wizard.key("Return");
+        assert_eq!(wizard.execute.as_deref(), Some(&plan));
+        wizard.key("Escape");
+        assert_eq!(wizard.page, Page::Destinations);
+        assert!(wizard.preserve);
+        assert!(wizard.execute.is_none());
+        assert!(wizard.proposal.is_none());
     }
 
     #[test]
@@ -3022,10 +3118,10 @@ mod tests {
         let sections = wizard.key_sections();
         assert_eq!(
             sections[0].rows,
-            [keys::row((
-                "Return",
-                "ask the installer service for the eligible disks"
-            ))]
+            [
+                keys::row(("Return", "new installation: erase the selected disk")),
+                keys::row(("r", "reinstall an existing system and keep personal files"))
+            ]
         );
         // The form's rows are the drafts' own tables, after the wizard's.
         let settings = &sections[2];
@@ -3827,6 +3923,31 @@ mod tests {
             wizard.page = page;
             assert_eq!(wizard.steps(), Steps::default());
         }
+    }
+
+    #[test]
+    fn review_confirmation_requires_the_same_plan_painted_and_settled() {
+        let (mut window, _peer) = window();
+        let mut wizard = filled();
+        wizard.key("Return");
+        let plan = reviewed(&wizard);
+        wizard.sent(Asked::Review);
+        wizard.answered(Ok(Answer::Reviewed(plan)));
+        window.front.wizard = wizard;
+        assert!(!window.review_confirmable());
+        window.chord("Return".into()).unwrap();
+        assert!(window.front.wizard.execute.is_none());
+        window.presented(true);
+        window.clock += SETTLE - 1;
+        assert!(!window.review_confirmable());
+        window.clock += 1;
+        assert!(window.review_confirmable());
+        window.shown_review = Some([0xff; 32]);
+        assert!(!window.review_confirmable());
+        window.presented(true);
+        assert!(!window.review_confirmable());
+        window.clock += SETTLE;
+        assert!(window.review_confirmable());
     }
 
     /// Notes the shown page as a presented frame would, and lets it be

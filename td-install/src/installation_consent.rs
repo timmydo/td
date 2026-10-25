@@ -8,7 +8,7 @@
 
 /// Sent and required by both ends before the first frame. A change to any
 /// message or its bytes changes the greeting; there is no negotiation.
-pub const GREETING: &[u8; 8] = b"TDINA02\n";
+pub const GREETING: &[u8; 8] = b"TDINA03\n";
 pub const MAX_MESSAGE_BYTES: usize = 1024;
 
 const NONCE_BYTES: usize = 32;
@@ -26,7 +26,7 @@ const REVIEW_BYTES: usize = 1
     + (1 + HOSTNAME_BYTES)
     + (1 + USERNAME_BYTES)
     + 32
-    + 1;
+    + 2;
 const _: () = assert!(REVIEW_BYTES <= MAX_MESSAGE_BYTES);
 
 const REVIEW: u8 = 0x01;
@@ -99,6 +99,7 @@ impl Storage {
 /// what it cannot show.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Review {
+    preserve: bool,
     nonce: [u8; NONCE_BYTES],
     disk: String,
     capacity: u64,
@@ -163,6 +164,7 @@ impl Review {
             return Err("invalid installation consent username".into());
         }
         Ok(Self {
+            preserve: false,
             nonce,
             disk: disk.into(),
             capacity,
@@ -198,6 +200,15 @@ impl Review {
     pub fn deployment(&self) -> &[u8; 32] {
         &self.deployment
     }
+    pub fn preserving(mut self, preserve: bool) -> Self {
+        self.preserve = preserve;
+        self
+    }
+
+    pub fn preserve(&self) -> bool {
+        self.preserve
+    }
+
     pub fn storage(&self) -> Storage {
         self.storage
     }
@@ -346,6 +357,7 @@ impl Report {
                 put_text(&mut out, &review.username);
                 out.extend_from_slice(&review.deployment);
                 out.push(review.storage.code());
+                out.push(u8::from(review.preserve));
             }
             Self::Ended(nonce, why) => {
                 out.push(ENDED);
@@ -378,17 +390,25 @@ impl Report {
                 let username = reader.text()?;
                 let deployment = reader.array()?;
                 let storage = Storage::from_code(reader.byte()?)?;
-                Self::Review(Box::new(Review::new(ReviewFields {
-                    nonce,
-                    disk,
-                    capacity,
-                    model,
-                    serial,
-                    hostname,
-                    username,
-                    deployment,
-                    storage,
-                })?))
+                let preserve = match reader.byte()? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err("invalid reinstall mode".into()),
+                };
+                Self::Review(Box::new(
+                    Review::new(ReviewFields {
+                        nonce,
+                        disk,
+                        capacity,
+                        model,
+                        serial,
+                        hostname,
+                        username,
+                        deployment,
+                        storage,
+                    })?
+                    .preserving(preserve),
+                ))
             }
             ENDED => {
                 let nonce = reader.nonce()?;
@@ -603,7 +623,7 @@ mod tests {
             );
         }
         assert_eq!(widest_bytes, REVIEW_BYTES);
-        assert_eq!(REVIEW_BYTES, 721);
+        assert_eq!(REVIEW_BYTES, 722);
         for answer in answers() {
             let bytes = answer.encode();
             assert_eq!(Answer::decode(&bytes).unwrap(), answer);
@@ -694,7 +714,7 @@ mod tests {
                     &[5],
                     b"alice",
                     &[0xab; 32],
-                    &[1],
+                    &[1, 0],
                 ]),
             ),
             (
@@ -713,7 +733,7 @@ mod tests {
                     &[5],
                     b"alice",
                     &[0xab; 32],
-                    &[0],
+                    &[0, 0],
                 ]),
             ),
             (

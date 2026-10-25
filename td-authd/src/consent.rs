@@ -920,6 +920,7 @@ pub enum Operation {
     /// Erase one whole disk and install the live medium's deployment on it.
     /// A fixed summary of the plan; the plan itself is bound elsewhere.
     InstallDisk {
+        preserve: bool,
         requester: u32,
         disk: String,
         capacity: u64,
@@ -1605,6 +1606,7 @@ impl Request {
                 username,
                 deployment: _,
                 storage: _,
+                preserve: _,
             } if *requester != owner
                 || !disk_name(disk)
                 || *capacity == 0
@@ -2300,8 +2302,9 @@ impl Request {
                 username,
                 deployment,
                 storage,
+                preserve,
             } => {
-                bytes.push(6);
+                bytes.push(if *preserve { 38 } else { 6 });
                 bytes.extend_from_slice(&requester.to_be_bytes());
                 bytes.extend_from_slice(&capacity.to_be_bytes());
                 // Construction bounds every string below 128 bytes.
@@ -2527,16 +2530,18 @@ impl Request {
             .try_into()
             .map_err(|_| "invalid consent nonce")?;
         let owner = input.number()?;
-        let operation = match input.byte()? {
+        let operation_tag = input.byte()?;
+        let operation = match operation_tag {
             5 => Operation::Install {
                 key: input.approval_key()?,
                 requester: input.number()?,
                 deployment: input.deployment()?,
             },
-            6 => {
+            6 | 38 => {
                 let requester = input.number()?;
                 let capacity = input.wide()?;
                 Operation::InstallDisk {
+                    preserve: operation_tag == 38,
                     requester,
                     capacity,
                     disk: input.text()?,
@@ -2853,8 +2858,16 @@ impl Request {
                 username,
                 deployment,
                 storage,
+                preserve,
             } => {
-                lines.push("ERASE DISK AND INSTALL TD".into());
+                lines.push(
+                    if *preserve {
+                        "REINSTALL TD AND KEEP PERSONAL FILES"
+                    } else {
+                        "ERASE DISK AND INSTALL TD"
+                    }
+                    .into(),
+                );
                 lines.push(format!("DISK: {disk}"));
                 lines.push(format!(
                     "SIZE: {}.{} GB, {capacity} BYTES",
@@ -2863,19 +2876,37 @@ impl Request {
                 ));
                 lines.push(label_line("MODEL", model.as_ref()));
                 lines.push(label_line("SERIAL", serial.as_ref()));
-                lines.push("ALL DATA ON THIS DISK WILL BE LOST".into());
+                lines.push(
+                    if *preserve {
+                        "HOME, ACCOUNT AND SETTINGS WILL BE KEPT"
+                    } else {
+                        "ALL DATA ON THIS DISK WILL BE LOST"
+                    }
+                    .into(),
+                );
                 lines.push(format!("HOSTNAME: {hostname}"));
                 lines.push(format!("USER: {username}"));
                 let prefix = hex(deployment);
                 lines.push(format!("DEPLOYMENT: {prefix}..."));
                 lines.push(
-                    match storage {
-                        Storage::Unencrypted => "UNENCRYPTED STORAGE, AUTOMATIC LOGIN",
-                        Storage::DeviceBound => "ENCRYPTED TO THIS COMPUTER, AUTOMATIC LOGIN",
+                    if *preserve {
+                        "EXISTING STORAGE AND LOGIN SETTINGS KEPT"
+                    } else {
+                        match storage {
+                            Storage::Unencrypted => "UNENCRYPTED STORAGE, AUTOMATIC LOGIN",
+                            Storage::DeviceBound => "ENCRYPTED TO THIS COMPUTER, AUTOMATIC LOGIN",
+                        }
                     }
                     .into(),
                 );
-                lines.push("ENTER: ERASE AND INSTALL   ESC: CANCEL".into());
+                lines.push(
+                    if *preserve {
+                        "ENTER: REINSTALL   ESC: CANCEL"
+                    } else {
+                        "ENTER: ERASE AND INSTALL   ESC: CANCEL"
+                    }
+                    .into(),
+                );
             }
             Operation::Enroll {
                 platform,
@@ -4608,8 +4639,29 @@ mod tests {
         }
     }
 
+    #[test]
+    fn reinstall_description_binds_preservation_and_never_promises_erasure() {
+        let erase = Request::new([1; 32], 1000, disk(None, None)).unwrap();
+        let mut operation = disk(None, None);
+        if let Operation::InstallDisk { preserve, .. } = &mut operation {
+            *preserve = true;
+        }
+        let keep = Request::new([1; 32], 1000, operation).unwrap();
+        assert_ne!(keep.encode(), erase.encode());
+        assert_eq!(Request::decode(&keep.encode()).unwrap(), keep);
+        assert!(keep
+            .lines()
+            .iter()
+            .any(|line| line == "ENTER: REINSTALL   ESC: CANCEL"));
+        assert!(!keep
+            .lines()
+            .iter()
+            .any(|line| line.contains("ERASE") || line.contains("AUTOMATIC LOGIN")));
+    }
+
     fn disk(model: Option<Label>, serial: Option<Label>) -> Operation {
         Operation::InstallDisk {
+            preserve: false,
             requester: 1000,
             disk: "nvme0n1".into(),
             capacity: 512_110_190_592,
@@ -4625,6 +4677,7 @@ mod tests {
     /// Every field at its bound: the largest request this profile encodes.
     fn widest_disk() -> Operation {
         Operation::InstallDisk {
+            preserve: false,
             requester: 1000,
             disk: "d".repeat(DISK_NAME_BYTES),
             capacity: u64::MAX,

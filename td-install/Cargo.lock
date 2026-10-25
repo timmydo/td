@@ -11,11 +11,16 @@ name = "td-fido"
 version = "0.1.0"
 
 [[package]]
+name = "td-fs"
+version = "0.1.0"
+
+[[package]]
 name = "td-install"
 version = "0.1.0"
 dependencies = [
  "td-fat",
  "td-fido",
+ "td-fs",
  "td-protector",
  "td-tpm",
 ]

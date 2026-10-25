@@ -38,9 +38,9 @@ from its sysfs properties and moves the pointer by one finger's travel, as
 a mouse does; its button presses click, and tapping and scrolling are not
 yet read. The TrackPoint moves it relatively. Its Intel Wi-Fi needs vendor
 firmware, a class of foreign data AGENTS.md does not admit, so the wired
-port is its network until that is decided. Legacy BIOS, partition
-preservation, resizing, dual boot, RAID, and installation into an existing
-filesystem are outside v1. One selected whole disk is reformatted, not
+port is its network until that is decided. Legacy BIOS, resizing, dual boot and RAID are outside v1. Preserving an
+existing td installation is limited to the explicit reinstall mode below.
+For a new installation, one selected whole disk is reformatted, not
 wiped (ENCRYPTION.md "Device-bound formatting"), and receives GPT, a FAT32
 ESP and the td Btrfs volume.
 
@@ -62,13 +62,80 @@ the installer collects no key and its disclosures describe the installed
 default.
 Networking can be configured after booting the installed system.
 
+## Reinstall while keeping personal files
+
+On welcome, `r` chooses reinstall; Return chooses the existing whole-disk
+installation. Reinstall lists eligible disks through the same media exclusion
+and exclusive-claim checks. Return on the chosen disk asks root to inspect
+its existing installation. It skips editable account settings. The review
+names the saved account, hostname, timezone and unchanged filesystem UUID,
+and says personal files and settings will be kept. The installer review
+explicitly says reinstall, never erase. Enter confirms that exact
+mode and review; Escape cancels. A request for one mode cannot execute a
+review for the other.
+
+This increment supports existing unencrypted, single-device td Btrfs volumes.
+A LUKS header is refused before mounting or writing, with an explicit service
+log; encrypted recovery is not implemented. Neither mode falls back to the
+other. Reinstall requires readable saved username, hostname and timezone,
+trusted directory ancestors and a real UID-1000 home. Missing or malformed
+saved account state is refused; it is not guessed or reset.
+
+Inspection mounts the claimed volume read-only with `rescue=nologreplay`, `nodev`,
+`nosuid`, `noexec` and `subvolid=5`. The kernel-mounted filesystem must name
+the observed UUID, the td label and only the loop device backed by the
+exclusive disk claim. Execution re-inspects and compares the saved settings
+and UUID with the consented plan before a writable mount. It checks the
+existing ESP's capacity before changing persistent state.
+
+Reinstall never runs a formatter, writes GPT, deletes `@var`, recreates a
+home or applies new account settings. It preserves all of `@var` except its
+root-private deployment-signing state and temporary replacement payloads.
+`td-deploy identity` retains a valid signing key or provisions the missing
+one; malformed retained keys refuse. A fixed root-private `reinstall` staging
+directory is reclaimed on retry before copying; unknown entries, links and
+subdirectories refuse cleanup before any staged file is removed. Source payloads are copied beneath that
+state, signed and fully verified before the boot publisher is invoked.
+The publisher replaces both system selections, including damaged payloads
+with the same deployment ID, using its existing verified bundle writer.
+Old system rollback is not retained by a reset. The volume public key is
+synced, the filesystem unmounted, and the existing ESP receives the kernel
+and selector with the matching public key and unchanged UUID through td-fat.
+No partition, encryption header, user file or saved login credential is reset.
+
+Interruption can leave the system unbootable until reinstall is retried from
+the USB. The retained signing key survives retry, personal files remain in
+place, and the same mode can replace incomplete boot state. This is not an
+atomic boot-chain rotation or a backup. Scratch cleanup never recursively
+walks a mountpoint. Failed unmounts are reported and leave their mounts held.
+
+Protocol request `0x0b` carries a destination observation only. Root supplies
+the saved settings and UUID. Preserve plans have the unencrypted storage and
+zero basis; these are existing-storage facts, not a new TPM probe decision.
+The private consent review appends a boolean preserve byte after storage,
+and its greeting is `TDINA03\n`. The ordinary service greeting is
+`TDINS07\n`. The mode is part of the reviewed plan and exact Execute bytes.
+
+Before re-signing, the private staged manifest must hash to the deployment
+ID bound by the reviewed plan. Full staged payload verification follows under
+the installation key, so changing removable media cannot substitute another
+manifest or payload bundle between initial authentication and copying.
+
+The live QEMU oracle installs, writes a personal file through the installed
+account, boots the same disk from USB into reinstall, and boots it again.
+Its post-reinstall checks require the same filesystem UUID, host identity,
+home inode, personal-file contents and saved account settings. Host tests
+also cover a damaged same-ID payload, repeated reset, and invalid-signature
+refusal before replacement.
+
 ## User flow and authority
 
 The sequence is welcome, destination disk, account and regional settings,
 review, installation progress, and completion. Back preserves valid input.
 Errors remain visible and explain the failed operation. The review includes
 the exact disk identity and capacity, the selected settings, and an explicit
-confirmation that all data on that disk will be lost. Success offers an
+confirmation that all data on that disk will be lost for a new installation;
+reinstall instead skips editable settings and confirms personal-file preservation. Success offers an
 orderly reboot or power-off with an instruction to remove the installation
 media.
 
@@ -86,10 +153,13 @@ reaches this service: it runs as its own service identity, `tdi1000`
 (UID/GID 990), and td-authd's setup intake admits that kernel peer UID
 alone (td-authd/DESIGN.md "Whole-disk installation intake"). This authority
 does not depend on `su`, empty passwords, or a reusable elevation grant.
-Compositor-owned trusted consent must bind destructive execution to the
-exact reviewed request under the existing elevation contract; ordinary
-client pixels or synthetic input are not authorization evidence. The typed
-operations are specified in "Installation service protocol".
+On trusted live media the wizard's final review is the human confirmation.
+Return or the confirmation button starts the exact reviewed plan; no separate
+secure attention screen is used. The review must have been painted for at
+least 500 ms, with the same plan nonce, before keyboard or pointer confirmation.
+Return does not repeat. This prevents accidental early input, but does not
+claim a secure-input boundary: the trusted wizard and its ordinary input are
+part of the installer authority. Installed-system elevation is unchanged.
 
 The `td-setup` front end has a source-built static target recipe and
 `td-setup-test` realized-output check. The recipe stages its own tree with
@@ -182,12 +252,8 @@ step.
 The list's rows are spelled as td-ui's keymap spells chords
 (`Return`, `PageUp`, `S-Tab`), and `keys::check` holds every page's
 sections to that spelling; `--help` and this document name the keys
-the same way. The secure prompt's keys are the compositor's, not the
-window's: the consent view, its key list's prose row and `--help` name
-them as the compositor's screen and td-authd's requesters do
-(Ctrl+Alt+Escape, Enter). It is painted last over the live frame, never
-in a headless render, and the boot evidence still says the page under
-it, a frame repainted for the list saying nothing new. A native
+the same way. The review's Return confirms installation; Escape goes back.
+A native
 compositor case presses F1 on the seat and finds welcome around the
 panel and its title bar in the selection's
 colour, Return reaching no page while it is open, and Escape painting
@@ -218,7 +284,7 @@ page's Restart and Power off act the same way while an ending may be
 asked for. Progress, a recovery key still being asked for and an
 outcome have no step buttons. A button is a view of its key: it asks
 the service nothing the key would not, and consent is still given only
-at the compositor's secure prompt. `--preview`, and the native
+on the wizard's final review. `--preview`, and the native
 compositor case that compares welcome and the unavailable notice pixel
 for pixel, paint the same buttons, and `--render-check` refuses a page
 whose footer text would run under the slots.
@@ -299,18 +365,10 @@ state the act is for: welcome, the one listed destination, a username,
 hostname and time zone typed a key at a time, the service's review of
 exactly those, naming unencrypted storage for want of a TPM with the
 keyboard console found, back from the review until td-setup says the
-service released it, and the same review again. Enter on it asks for
-consent, which the drive
-gives as a person does: the secure attention chord, the menu's `I`, and
-Enter only once a capture of the compositor's prompt shows, pixel for pixel
-above its countdown, exactly td-authd's rows for that disk, its size and
-serial, the host, the account and the deployment's prefix, and nothing else;
-Enter again while that prompt stays and nothing is written, since the
-compositor drops an Enter stamped before its prompt's receipt; then Escape
-once the menu's notice says the system is installed. QEMU's own count of
-changes to the target, writes, discards and zone appends alike, must be zero
-when the review is released, when consent is asked and at every Enter on the
-prompt, and must not be by the installed notice. Once td-setup says the
+service released it, and the same review again. Return on the settled review confirms the installation directly.
+QEMU's count of changes to the target, writes, discards and zone appends
+alike, must be zero both after withdrawing and before the final confirmation.
+Once td-setup says the
 installation completed, with Restart selected, the drive presses Return;
 the live phase ends only when the guest's orderly reboot has printed
 `TD-SHUTDOWN-OK` and then the kernel's `reboot: Restarting system`, which a
@@ -461,7 +519,7 @@ and that a recovery key follows. A device-bound review's detail pages
 carry the tier's full disclosures ("Storage choice"). It cannot
 authenticate the
 source, establish a disk claim or authorize execution; the service and
-compositor-owned trusted consent remain mandatory. In the live window it
+the wizard's final confirmation remain mandatory. In the live window it
 shows the service's review, never the drafts: PageUp and PageDown move
 between its detail pages, Return sends execute with the review exactly as
 the service returned it, once, and Escape returns to settings and sends
@@ -504,21 +562,11 @@ it before the acceptance reaches the window, the view says the computer may
 be restarting or powering off and, if it does not, to do so by other means.
 The caller may show the view only after the service reports durable
 filesystem and deployment publication, verified boot artifacts, and settings
-publication. In the live window, execute answered awaiting consent shows a
-consent view: confirm or decline at the secure prompt, since this window
-cannot give consent. Nothing pushes that prompt, so the view says how to
-open it, as td-authd's other requesters do: Ctrl+Alt+Escape, then I for
-the attention menu's installation row, where Enter confirms and Escape
-declines; the window's key list says so in a prose row, the chord
-being the secure screen's, not its own. For a device-bound review the
-view adds that after confirmation the secure screen closes by itself
-and the person returns here to write down the recovery key: the
-compositor, not this window, shows its
-returning notice and closes the screen once consent is committed
-(td-compositor/DESIGN.md "Physical installation confirmation"), and the
-recovery-key pages follow. An unencrypted installation's screen keeps its
-prompt until the compositor says the system is installed. While consent is
-sought or the installation runs, the window asks for status over the same connection, at most every half second
+publication. In the live window, execute answered awaiting consent shows a starting
+view while root acknowledges execution; no secure attention prompt opens.
+A device-bound installation shows its recovery key in the same wizard.
+While starting or installing, the window asks for status over the same
+connection at most every half second
 from each ask, and follows only the review it executed: awaiting consent, a
 running phase, failure and completion are shown as reported; a review
 abandoned before any write (declined, expired, unavailable or the disk
@@ -692,7 +740,8 @@ representations and trailing bytes. The complete framing is checked
 before allocating field strings. No native-endian numbers, JSON numeric
 rounding or path resolution enters the codec. The field order is:
 
-- Eight bytes `TDPLAN03`, nonce (32), deployment digest (32), UUID (16).
+- Eight bytes `TDPLAN04`, nonce (32), deployment digest (32), UUID (16),
+  mode (one byte: 0 erase, 1 preserve).
 - Big-endian major/minor (u32 each), sequence/capacity (u64 each), sector
   size (u32), removable (one byte, exactly zero or one), storage (one
   byte, 0 unencrypted or 1 device-bound) and basis (one byte, bit 0 the
@@ -704,7 +753,7 @@ rounding or path resolution enters the codec. The field order is:
 
 Every string has a big-endian u16 byte count followed by exactly its
 bytes (UTF-8 for labels, ASCII for names and choices). The current
-maximal admitted record is 1193 bytes. The storage and basis bytes sit
+maximal admitted record is 1194 bytes. The storage and basis bytes sit
 inside the destination's fixed fields, so a candidates record and a
 propose request, which carry the destination alone, have neither. UUID bytes are in
 textual/network order, with version 4 and the RFC variant bits checked;
@@ -724,13 +773,12 @@ authenticates it under its claim, requires it to be the deployment the
 running root was authenticated as, so that the choices it checks against
 that root and its time zone catalog are checked against the source, refuses
 a disk that cannot hold its payloads and retains the value. td-authd starts
-it on a live boot and answers its consent channel. Execution requires fresh
-trusted consent bound to that whole value and revalidates the selected disk
-under a retained exclusive claim. Neither matching plan bytes nor possession
-of the nonce grants consent. No public request, reconnect or service restart
+it on a live boot and answers its consent channel. Execution requires the wizard's final
+confirmation bound to that whole value and revalidates the selected disk
+under a retained exclusive claim. Only the authenticated live wizard connection can send that Execute. No public request, reconnect or service restart
 may silently retry erasure. A live boot starts the wizard ("Live startup"),
 and td-authd admits only the wizard's identity as its installer; erasure
-still needs the person's physical consent.
+still needs confirmation on the wizard review.
 
 ## Installation service protocol
 
@@ -747,7 +795,7 @@ mismatch, and an ending complete, for its nonce; any other answer ends its
 connection, and with it, until an installation starts, the review and
 claim.
 
-Both ends first send and require the eight bytes `TDINS06\n`. Any change to
+Both ends first send and require the eight bytes `TDINS07\n`. Any change to
 a message or its bytes changes this greeting; there is no negotiation. Each
 message then travels in one frame: a big-endian u32 length and that many
 payload bytes. `payload_len` admits a nonzero length within the direction's
@@ -768,7 +816,7 @@ Requests carry no path, executable, mount option, source or consent:
   plan carries the service's observation, never UI-supplied values. The
   service chooses the nonce and volume UUID, authenticates the source,
   claims the disk and checks that the disk holds the deployment.
-- `0x03` execute: the complete `TDPLAN03` record the installer reviewed. It
+- `0x03` execute: the complete `TDPLAN04` record the installer reviewed. It
   asks the service to seek consent for the review it retains, and is
   refused unless the record equals that review. Equality is a
   precondition, never consent: consent reaches root only from the
@@ -789,7 +837,7 @@ Requests carry no path, executable, mount option, source or consent:
 Replies set the high bit, so no request decodes as a reply or the reverse:
 
 - `0x81` destinations: a `TDCAND01` record.
-- `0x82` reviewed: the service's `TDPLAN03` record, made while it holds
+- `0x82` reviewed: the service's `TDPLAN04` record, made while it holds
   the destination claim. Its nonce names the review.
 - `0x83` status: a state byte, then for every state but idle the nonzero
   review nonce, then for running, failed and abandoned one detail code.
@@ -811,7 +859,7 @@ refused it, before the first write). Refusals are 1 busy, 2 source
 unavailable, 3 discovery failed, 4 destination changed, 5 destination busy,
 6 insufficient space, 7 invalid username, 8 invalid hostname, 9 unsupported
 keyboard, 10 unsupported timezone, 11 stale review, 12 no review, 13 consent
-unavailable (no seat, compositor or trusted consent path can present the
+unavailable (no seat, compositor or installer confirmation path can present the
 review, or the consent channel cannot carry it), 14 time zones
 unavailable (the catalog could not be read), 15 power unavailable (the
 supervisor did not accept the reboot or power-off), 16 recovery key sent
@@ -871,12 +919,12 @@ retries a destructive operation after a reconnect or restart.
 
 These records carry device-bound storage. They landed at once, in
 ENCRYPTION.md increment 5, as the greeting `TDINS05\n`, the consent
-channel's `TDINA02\n` and the plan's magic `TDPLAN02`; the earlier
+channel's `TDINA03\n` and the plan's magic `TDPLAN02`; the earlier
 versions are refused, not negotiated. `TDINS05` is `TDINS04` (power off,
 request `0x08`, included) with the additions below, so the recovery
 requests take the next free tags. Increment 7's probe commit then made
-them `TDINS06` and `TDPLAN03` with the plan's basis byte ("Storage
-choice"); `TDINA02` is unchanged.
+them `TDINS07` and `TDPLAN04` with the plan's basis byte ("Storage
+choice"); `TDINA03` is unchanged.
 
 - The plan gains one storage byte after the removable flag: 0 unencrypted
   or 1 device-bound, any other value refused. It is the storage the
@@ -950,11 +998,11 @@ chooses storage from its own probes.
 The plan carries one byte after the storage byte, the storage basis: bit
 0 set when the service's TPM probe passed and bit 1 when its
 keyboard-console probe passed (ENCRYPTION.md "Activation" defines both),
-any other bit refused. The plan's magic is `TDPLAN03`, its maximal
-record 1193 bytes, and the greeting `TDINS06`, the earlier versions
+any other bit refused. The plan's magic is `TDPLAN04`, its maximal
+record 1194 bytes, and the greeting `TDINS07`, the earlier versions
 refused rather than negotiated; a propose request carries no basis, as
 it carries no storage. The consent channel's review report keeps its
-storage byte alone and its `TDINA02`. `serve` runs both probes at every
+storage byte alone and its `TDINA03`. `serve` runs both probes at every
 start, once each, after admission and before its greeting, writes the
 cause of each that fails to standard error, and records them in every
 plan. The TPM's read has a 3-second deadline (`TPM_PROBE_DEADLINE`) so
@@ -975,7 +1023,7 @@ bits, and unencrypted storage otherwise (`Basis::storage`); nothing
 refuses for a missing TPM or keyboard console. The plan's storage byte
 is that storage, so it adds nothing to the basis and a plan whose
 storage byte the basis does not name is refused; the encoding and
-`TDPLAN03` are unchanged. td-authd starts the service with no storage
+`TDPLAN04` are unchanged. td-authd starts the service with no storage
 operand, for there is none, and its consent summary shows the plan's
 storage ("ENCRYPTED TO THIS COMPUTER, AUTOMATIC LOGIN" or "UNENCRYPTED
 STORAGE, AUTOMATIC LOGIN"; td-authd/DESIGN.md "Immutable consent
@@ -1143,8 +1191,8 @@ remains required before execution.
 ## Installation consent channel
 
 `installation_consent.rs` defines the private channel by which td-authd,
-which starts the service, learns what to put before the person and answers
-with their decision. td-authd compiles the same file. It is data and codec
+which starts the service, admits a wizard-confirmed execution and tracks
+its lifecycle. The channel name is internal; it supplies no second human prompt. td-authd compiles the same file. It is data and codec
 only. Both ends are root and td-authd creates the channel, so decoding
 authenticates nothing; it refuses only bytes outside the grammar. The
 service core speaks it, and td-authd opens it for the service it starts on a
@@ -1152,7 +1200,7 @@ live boot (td-authd/DESIGN.md "Whole-disk installation intake") as one end
 of a socketpair on the service's standard output, where the service opens
 it.
 
-Both ends first send and require `TDINA02\n`, which changes with any message
+Both ends first send and require `TDINA03\n`, which changes with any message
 or its bytes. Each message then travels in one frame: a big-endian u32
 length, nonzero and at most 1024, then that many payload bytes. A payload
 is a tag byte and its body, with trailing bytes refused. Every nonce is a
@@ -1167,11 +1215,10 @@ The service reports:
   UTF-8 bytes, possibly none), the hostname (at most 63 bytes) and username
   (at most 32), each nonempty UTF-8 behind a one-byte length, the
   32-byte deployment manifest digest and the plan's storage byte (0
-  unencrypted, 1 device-bound). It is at most 721 bytes. These are
-  the display facts of the held review, which asks for consent to it. The
-  requester is not on the channel: td-authd knows whom it started the
-  service for. td-authd escapes and narrows the facts for the prompt, and
-  declines as unavailable what it cannot show.
+  unencrypted, 1 device-bound). It is at most 722 bytes. These are
+  the facts of the held review after its exact Execute request. The
+  requester is not on the channel: td-authd admits only the live wizard.
+  It acknowledges this nonce immediately without opening secure attention.
 - `0x02` ended: a nonce and a code, 1 withdrawn, 2 destination changed
   (including a recheck of the held disk that failed after consent), 3
   installer lost or 4 not consented. No destructive write started.
@@ -1181,10 +1228,10 @@ The service reports:
   which the disk may be incomplete.
 
 td-authd answers with a high-bit tag, so a reflected frame never decodes:
-`0x81` consent, meaning the person confirmed that review on the trusted
-path, or `0x82` declined with a code, 1 declined, 2 expired or 3
-unavailable (no trusted path could show the prompt, td-authd cannot show
-its facts, or the prompt was lost while shown). Unassigned codes and tags
+`0x81` consent, meaning root admitted that wizard-confirmed execution,
+or `0x82` declined with a code, 1 declined, 2 expired or 3 unavailable.
+The current live broker sends `0x81`; the service still fails closed on
+a refusal, a missing acknowledgement, or loss of the private channel. Unassigned codes and tags
 refuse, and a duplicated code does not compile.
 
 Order: one review is open at a time, from its review report until the
@@ -1281,7 +1328,7 @@ destination UUID. The host validates one canonical identity report against
 the primary Btrfs fsid in its private disk image and rejects reuse across
 successful installs and interrupted reinstalls. Detached boots must bind
 that exact UUID across every existing bus/media case. Immutable plans and
-trusted consent remain separate work.
+installer confirmation remain separate work.
 
 ## Media, boot and persistence
 
@@ -1720,7 +1767,7 @@ not discover `/etc/zoneinfo` automatically.
    the compositor's presentation are proven end to end in increment 6.
 6. Add the native wizard, target recipe and live startup integration. Use
    native compositor tests for navigation, rendering, input, errors and
-   progress; fixtures cannot grant ordinary clients trusted consent. A live
+   progress; fixtures cannot grant ordinary clients installer confirmation. A live
    boot starts the wizard ("Live startup"), and `qemu-boot-live` drives it
    with physical keys through the service's review and the compositor's
    consent to an installed disposable disk, which then cold-boots through
@@ -1758,7 +1805,7 @@ read-only disks and stacked devices. It is not the eligible destination
 list specified above and is not connected to the wizard or write path.
 No field grants permission to install. Source/mount/swap backing-device
 resolution, unsupported-topology filtering, exclusive admission, immutable
-plans and trusted consent remain required before destination selection can
+plans and installer confirmation remain required before destination selection can
 activate writes. In particular, `holders` and `slaves` alone do not account
 for loop backing files, mounted filesystems or every Btrfs member.
 
@@ -1906,7 +1953,7 @@ No write call is made. Success prints one JSON object with version 1, scope
 `plan-observation-only` and the destination name; failure prints no success
 document. The claim closes after output, so this diagnostic grants no later
 write authority, does not authenticate the deployment or settings, and is
-not a replacement for the service's retained claim and trusted consent.
+not a replacement for the service's retained claim and installer confirmation.
 An unmounted installation medium can pass the candidate filter; the
 service retains and excludes source backing storage itself.
 The disposable optical/USB QEMU installer constructs a canonical plan from
@@ -1972,7 +2019,7 @@ This is a geometry preview, not an immutable installation plan or a
 destination eligibility decision. It describes the numbers supplied by its
 caller and does not bind a device identity. It does not establish source
 authenticity, boot-file fit, payload capacity, scratch availability,
-settings validity, exclusive admission or trusted destructive consent.
+settings validity, exclusive admission or installer confirmation.
 Those checks remain required before installation.
 
 The QEMU installation diagnostics also invoke this command on actual

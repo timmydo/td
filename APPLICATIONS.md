@@ -8951,6 +8951,13 @@ queued request, to its requester, refuses with a named diagnostic
 today's update installation, from L5. A machine with other rows builds
 them into its own image; no user's home or setting adds one.
 
+**Live installation.** Trusted boot media uses the isolated installer's
+final review to confirm erase or preserve mode. It does not open secure
+attention. Root still authenticates the source, admits only the wizard's
+UID 990 and retains the exact plan and exclusive disk claim; the wizard
+and ordinary input are trusted here. This exception grants no installed
+application an elevation path (`td-install/INSTALLER.md`).
+
 **Recovery.** When consent is unavailable (no seat, a compositor that
 cannot reach the secure path, a refusing table) the operations refuse;
 nothing falls back. No running td system grants root: no login reaches

@@ -140,7 +140,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     }
     assert_eq!(
         fingerprint(include_str!("../src/consent.rs")),
-        0x3acc7bb4fc81b499,
+        0x1b23a08d426e8f1b,
         "shared consent changed: reconcile td-secret/src/lib.rs, compositor confinement and this pin"
     );
     assert_eq!(
@@ -496,9 +496,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     let begin = session.split("    fn begin_install(").nth(1).unwrap();
     let begin = begin.split("\n    }\n").next().unwrap();
     assert!(
-        begin
-            .find("if let Some(setup) = &mut self.setup {")
-            .unwrap()
+        begin.find("if self.setup.is_some() {").unwrap()
             < begin.find("if !table().is_ok_and(").unwrap()
     );
     assert!(
@@ -1179,8 +1177,8 @@ const SHARED_LOGIN_STATE_FINGERPRINT: u64 = 0x36b736e5dda17cc6;
 const SHARED_HOSTNAME_FINGERPRINT: u64 = 0x49026f28c1db76ec;
 
 const LAUNCH_FINGERPRINT: u64 = 0xc671407f5365e81d;
-const MAIN_FINGERPRINT: u64 = 0xd03c9fa382ca5d9a;
-const SESSION_FINGERPRINT: u64 = 0x595c2dcc5491ebac;
+const MAIN_FINGERPRINT: u64 = 0x274300ec9b0f3682;
+const SESSION_FINGERPRINT: u64 = 0x7fe467e679358f5e;
 
 const INTAKE_RAW_FINGERPRINT: u64 = 0x320c8b6ddbfe29af;
 const INTAKE_FINGERPRINT: u64 = 0xe2f50441f71b4c76;
@@ -1195,5 +1193,5 @@ const BACKOFF_FINGERPRINT: u64 = 0x2749dbb039baaa3a;
 const SHARED_SAVED_FINGERPRINT: u64 = 0x181983faf45559fa;
 const REVOCATION_FINGERPRINT: u64 = 0x6ebf36645809c24d;
 const SHARED_CUTOVER_FINGERPRINT: u64 = 0x358939aac41ef40a;
-const DISK_INSTALL_FINGERPRINT: u64 = 0x4dffa721ec6b8471;
-const CONSENT_CODEC_FINGERPRINT: u64 = 0x19d3fcff02c2bb2a;
+const DISK_INSTALL_FINGERPRINT: u64 = 0x7089e614566ed61a;
+const CONSENT_CODEC_FINGERPRINT: u64 = 0x282490be2a44c4e5;

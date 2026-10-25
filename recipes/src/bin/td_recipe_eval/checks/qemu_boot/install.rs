@@ -2144,6 +2144,28 @@ pub(super) fn cold_boots(
     installed: &Installed<'_>,
     run: &ColdBoots<'_>,
 ) -> Result<BootResult, String> {
+    cold_boots_inner(qemu, firmware, target, installed, run, None)
+}
+
+pub(super) fn cold_boots_existing(
+    qemu: &str,
+    firmware: &Firmware<'_>,
+    target: &TargetDisk,
+    installed: &Installed<'_>,
+    run: &ColdBoots<'_>,
+    previous: &BootResult,
+) -> Result<BootResult, String> {
+    cold_boots_inner(qemu, firmware, target, installed, run, Some(previous))
+}
+
+fn cold_boots_inner(
+    qemu: &str,
+    firmware: &Firmware<'_>,
+    target: &TargetDisk,
+    installed: &Installed<'_>,
+    run: &ColdBoots<'_>,
+    previous: Option<&BootResult>,
+) -> Result<BootResult, String> {
     let ColdBoots {
         scratch,
         name,
@@ -2156,7 +2178,9 @@ pub(super) fn cold_boots(
     // The volume's identity is new for every run, so no earlier file could
     // already say it.
     let nonce = installed.uuid.replace('-', "");
-    let mut kept: Option<String> = None;
+    let mut kept = previous
+        .map(|boot| reported_home_inode(&boot.console, &nonce))
+        .transpose()?;
     for count in 1..=2 {
         let decoy = if count == 2 {
             let mut decoy = TargetDisk::create(scratch, &format!("{name}-decoy.img"))?;
@@ -2204,7 +2228,15 @@ pub(super) fn cold_boots(
             "   [{label}] {name} cold boot {count} console tail: {} bytes",
             result.console.len()
         );
-        validate_installed_as(&result, &device, installed, count == 1)?;
+        validate_installed_as(
+            &result,
+            &device,
+            installed,
+            count == 1 && previous.is_none(),
+        )?;
+        if let Some(previous) = previous {
+            require_same_identity(previous, &result, "before reinstall", "after reinstall")?;
+        }
         if session && count == 1 {
             kept = Some(reported_home_inode(&result.console, &nonce)?);
         }

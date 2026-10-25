@@ -441,7 +441,7 @@ impl Composition for DestinationPage {
         };
         text_run(
             scale,
-            "The selected whole disk will be erased after review and consent.".chars(),
+            "Nothing is changed until you approve the installation review.".chars(),
             (warning.x, warning.y),
             warning,
             GlyphStyle::medium(INK, CHROME),

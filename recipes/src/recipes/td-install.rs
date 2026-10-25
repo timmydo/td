@@ -25,6 +25,7 @@ const MEMORY_RS: &str = include_str!("../../../td-secret/src/memory.rs");
 const FAT_LIB_RS: &str = include_str!("../../../td-fat/src/lib.rs");
 const TIMEZONES_RS: &str = include_str!("../../../td-install/src/timezones.rs");
 const INVENTORY_RS: &str = include_str!("../../../td-install/src/inventory.rs");
+const REINSTALL_RS: &str = include_str!("../../../td-install/src/reinstall.rs");
 const INSTALLATION_PLAN_RS: &str = include_str!("../../../td-install/src/installation_plan.rs");
 const INSTALLATION_PROTOCOL_RS: &str =
     include_str!("../../../td-install/src/installation_protocol.rs");
@@ -378,6 +379,11 @@ pub fn recipe() -> Recipe {
         Step::WriteFile {
             path: "{src}/td-install/src/inventory.rs".into(),
             content: INVENTORY_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-install/src/reinstall.rs".into(),
+            content: REINSTALL_RS.into(),
             exec: false,
         },
         Step::WriteFile {

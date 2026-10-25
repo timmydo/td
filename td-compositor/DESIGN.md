@@ -6011,59 +6011,13 @@ they never claim secure attention or use the trusted timestamp cutoff.
 
 ### Physical installation confirmation
 
-I selects the root installation request: on an installed system the update
-queued by `./update`, on a live boot the installation service's open
-whole-disk review. The returned description must be Install or InstallDisk
-for requester and session owner 1000. No ready request displays NO
-INSTALLATION IS READY TO REVIEW; root's `99 01` shows UPDATE CANNOT READ
-LOGIN KEYS and its `99 02`, the principal table refusing
-`deploy-publish`, REFUSED BY THE ELEVATION TABLE, each presenting
-nothing; another `99` byte ends the paired generation. An update's
-complete prompt names the full deployment ID, retention of the previous
-system and the need to restart, then its approval key's rows; since L5
-it is confirmed by that key alone, as an elevation is ("Elevation
-consent" below), and Enter never confirms it. A disk installation's is
-its fixed summary, with Enter to install and Escape to cancel. The
-public requester cannot open this screen.
-
-The rest of this section is the disk installation's Enter. A completed
-presentation also carries a CLOCK_MONOTONIC sample taken after
-successful full-frame submission. Only the evdev adapter can offer a fresh
-Enter press to the selected Attempt, and only a presented InstallDisk
-description takes it. Its timestamp must be strictly later
-than that sample, the exact request must still be visible outside drain,
-and the 120-second attention lifetime must remain active. Repeats, held
-logical keys, queued earlier events, Enter before presentation, ordinary
-control/input APIs and a replaced or hidden prompt cannot confirm. Failed
-clock sampling returns no presentation receipt. Runtime retains the sole
-monotonic syscall caller role; secret_client consumes the returned sample.
-
-The existing atomic cancellation/commit transition consumes that
-confirmation, or an update's typed key, before sending the exact private
-commit. Repeated status invitations without it only wait. What follows
-commit depends on the description's storage.
-An update or an unencrypted disk installation keeps its prompt until the
-operation ends; success then displays SYSTEM INSTALLED and a restart
-instruction. A device-bound disk installation completes only after its
-recovery key is typed back in td-setup, which the screen hides, so on the
-first status after commit the compositor replaces the prompt with its own
-fixed notice, `INSTALLING - RETURNING TO SETUP FOR THE RECOVERY KEY`, and
-four seconds later closes the screen itself: the secret worker asks the
-physical seat that opened this attempt (`input::Seat::release`, the seat
-a login unlock leaves the lock surface through, with its weak references
-and its lock order) to drain and close it exactly as Escape does,
-checking that attention is open and the attempt is still the screen's,
-so a held key or button still keeps capture until released, and focus
-returns to td-setup. The notice and the close are compositor-owned:
-nothing td-setup or a client sends selects, words or times them, and
-while the screen drains it keeps the notice rather than saying CANCELLING
-REQUEST, since nothing is being cancelled. That installation shows no
-SYSTEM INSTALLED; td-setup's completion page says it. Before commit Escape
-declines exactly as before. After commit, Escape can close the screen but
-cannot promise to undo an installation; the root controller retains the
-transaction until completion. This confirmation does not authorize any
-secret-store operation or enroll or rotate a signing key. The installation
-protocol is in td-authd/DESIGN.md.
+I selects the update queued by `./update` on an installed system, under
+"Elevation consent" below. A live boot answers no installation ready:
+the trusted ISO wizard now confirms erase or preserving reinstall directly
+on its final review (`td-install/INSTALLER.md`). It does not occupy the
+attention operation slot or hide the recovery-key page. The disk summary
+codec and renderer remain reserved internal values; td-authd no longer
+issues them. They grant no live-media execution authority.
 
 ### Elevation consent
 
