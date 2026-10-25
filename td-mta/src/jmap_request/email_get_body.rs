@@ -26,7 +26,7 @@ pub(super) fn buffer<T: Default + Clone>(count: usize) -> Result<Vec<T>, Error> 
     Ok(result)
 }
 pub(super) fn now(clock: &dyn Clock) -> Result<Tick, Error> {
-    clock.sample().map(|v| v.monotonic).map_err(storage)
+    clock.monotonic().map_err(storage)
 }
 trait MimeError {
     fn dispatch(self) -> Error;

@@ -153,9 +153,9 @@ impl<'p, 'v, 'c, 'b, 'r, 'o, 'w> Cursor<'p, 'v, 'c, 'b, 'r, 'o, 'w> {
             return Err(error);
         }
         let result = (|| {
-            self.check(clock.sample().map_err(Error::Policy)?.monotonic)?;
+            self.check(clock.monotonic().map_err(Error::Policy)?)?;
             for _ in 0..64 {
-                let now = clock.sample().map_err(Error::Policy)?.monotonic;
+                let now = clock.monotonic().map_err(Error::Policy)?;
                 self.check_work(now)?;
                 if self.advance(now)? == Status::Complete {
                     return Ok(Status::Complete);

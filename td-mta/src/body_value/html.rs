@@ -128,7 +128,7 @@ impl<'w, 'c> Cursor<'w, 'c> {
         self.record(after.and(result))
     }
     fn admit(&mut self, records: u64) -> Result<Tick, Error> {
-        let now = self.clock.sample().map_err(Error::Policy)?.monotonic;
+        let now = self.clock.monotonic().map_err(Error::Policy)?;
         self.work
             .charge(
                 now,

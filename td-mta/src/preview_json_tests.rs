@@ -412,3 +412,48 @@ fn html_failures_and_constructor_clock_refusals_stay_terminal() {
         assert_eq!(cursor.finish().err(), Some(error));
     }
 }
+
+#[test]
+fn monotonic_only_preview_clock_preserves_output_diagnostics_and_charges() {
+    struct MonotonicOnly;
+    impl Clock for MonotonicOnly {
+        fn sample(&self) -> Result<Time, PolicyError> {
+            Err(PolicyError::Busy)
+        }
+        fn monotonic(&self) -> Result<Tick, PolicyError> {
+            Ok(Tick(1))
+        }
+    }
+    fn render(clock: &dyn Clock, format: Format) -> (Vec<u8>, Diagnostics, Charge) {
+        let mut source = Bytes {
+            bytes: b"<b>caf\xc3\xa9</b>\r\n\xfftail",
+            reads: 0,
+            fail_at: None,
+        };
+        let mut work = work(100000);
+        let mut buffer = [0; 3];
+        let mut checkpoints = Checkpoints::default();
+        let selected = input(
+            &mut source,
+            TransferEncoding::Identity,
+            Plan::from_label(Some(b"utf-8")),
+        );
+        let mut cursor = Cursor::new(
+            selected,
+            &mut buffer,
+            &mut checkpoints,
+            format,
+            &mut work,
+            clock,
+            Tick(0),
+        )
+        .unwrap();
+        let output = drain(&mut cursor, 3).unwrap();
+        let diagnostics = cursor.finish().unwrap().diagnostics;
+        (output, diagnostics, work.remaining())
+    }
+    let baseline = Timer(AtomicU64::new(1));
+    for format in [Format::Plain, Format::Html] {
+        assert_eq!(render(&baseline, format), render(&MonotonicOnly, format));
+    }
+}

@@ -98,7 +98,7 @@ impl<S: BlobReader + ?Sized> Source for Text<'_, '_, '_, '_, S> {
     type Context = ();
     type Error = Error;
     fn charge_output(&mut self, (): (), bytes: u64) -> Result<(), Error> {
-        let now = self.clock.sample().map_err(Error::Policy)?.monotonic;
+        let now = self.clock.monotonic().map_err(Error::Policy)?;
         self.work
             .charge(
                 now,

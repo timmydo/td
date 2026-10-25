@@ -55,7 +55,7 @@ impl<'w, 'c> Cursor<'w, 'c> {
         Ok(cursor)
     }
     fn charge(&mut self, records: u64, output_bytes: u64) -> Result<(), Error> {
-        let now = self.clock.sample().map_err(Error::Policy)?.monotonic;
+        let now = self.clock.monotonic().map_err(Error::Policy)?;
         self.work
             .charge(
                 now,
@@ -121,7 +121,7 @@ pub(crate) fn poll_shared(
     clock: &CheckedClock<'_>,
 ) -> Result<Progress, Error> {
     // A gap poll can flush a pending reference scalar, so every turn is funded.
-    let now = clock.sample().map_err(Error::Policy)?.monotonic;
+    let now = clock.monotonic().map_err(Error::Policy)?;
     work.charge(
         now,
         Charge {
@@ -132,7 +132,7 @@ pub(crate) fn poll_shared(
     .map_err(Error::Work)?;
     let result = core.poll(input, last).map_err(|_| Error::State)?;
     if let Some(value) = result.scalar {
-        let now = clock.sample().map_err(Error::Policy)?.monotonic;
+        let now = clock.monotonic().map_err(Error::Policy)?;
         let bytes = u64::try_from(value.len_utf8()).map_err(|_| Error::State)?;
         work.charge(
             now,

@@ -273,7 +273,7 @@ impl<'r, 'b, S: BlobReader + ?Sized> Reader<'r, 'b, S> {
         self.failure
     }
     fn sample(&mut self, clock: &dyn Clock, meter: &mut Meter) -> Result<Tick, Error> {
-        let now = clock.sample().map_err(Error::Policy)?.monotonic;
+        let now = clock.monotonic().map_err(Error::Policy)?;
         if now < self.last {
             return Err(Error::Policy(PolicyError::Invalid));
         }

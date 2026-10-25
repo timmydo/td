@@ -82,15 +82,22 @@ impl<'a> CheckedClock<'a> {
     pub(crate) fn last(&self) -> Tick {
         Tick(self.last.load(Ordering::Relaxed))
     }
+    fn observe(&self, now: Tick) -> Result<Tick, PolicyError> {
+        let prior = self.last.fetch_max(now.0, Ordering::Relaxed);
+        if now.0 < prior {
+            return Err(PolicyError::Invalid);
+        }
+        Ok(now)
+    }
 }
 impl Clock for CheckedClock<'_> {
     fn sample(&self) -> Result<Time, PolicyError> {
         let now = self.source.sample()?;
-        let prior = self.last.fetch_max(now.monotonic.0, Ordering::Relaxed);
-        if now.monotonic.0 < prior {
-            return Err(PolicyError::Invalid);
-        }
+        self.observe(now.monotonic)?;
         Ok(now)
+    }
+    fn monotonic(&self) -> Result<Tick, PolicyError> {
+        self.observe(self.source.monotonic()?)
     }
 }
 impl<'r, 'b> Reader<'r, 'b> {
@@ -178,7 +185,7 @@ impl<'r, 'b, S: BlobReader + ?Sized> Reader<'r, 'b, S> {
         }
         let clock = CheckedClock::new(source_clock, self.last);
         let result = (|| {
-            let now = clock.sample().map_err(Error::Policy)?.monotonic;
+            let now = clock.monotonic().map_err(Error::Policy)?;
             meter.charge(now, Charge::default()).map_err(Error::Work)?;
             let result = (|| {
                 if !self.replayable || self.phase != Phase::Complete {
@@ -195,7 +202,7 @@ impl<'r, 'b, S: BlobReader + ?Sized> Reader<'r, 'b, S> {
                 self.phase = Phase::Decode;
                 Ok(())
             })();
-            let after = clock.sample().map_err(Error::Policy)?.monotonic;
+            let after = clock.monotonic().map_err(Error::Policy)?;
             meter
                 .charge(after, Charge::default())
                 .map_err(Error::Work)?;
@@ -233,10 +240,10 @@ impl<'r, 'b, S: BlobReader + ?Sized> Reader<'r, 'b, S> {
         }
         let clock = CheckedClock::new(source_clock, self.last);
         let result = (|| {
-            let now = clock.sample().map_err(Error::Policy)?.monotonic;
+            let now = clock.monotonic().map_err(Error::Policy)?;
             meter.charge(now, Charge::default()).map_err(Error::Work)?;
             let result = self.advance(&clock, now, meter);
-            let after = clock.sample().map_err(Error::Policy)?.monotonic;
+            let after = clock.monotonic().map_err(Error::Policy)?;
             meter
                 .charge(after, Charge::default())
                 .map_err(Error::Work)?;
@@ -749,3 +756,88 @@ mod tests {
 #[cfg(test)]
 #[path = "mime_text/replay_tests.rs"]
 mod replay_tests;
+
+#[cfg(test)]
+mod clock_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    struct Split {
+        tick: AtomicU64,
+        samples: AtomicU64,
+        ticks: AtomicU64,
+        fail: AtomicBool,
+    }
+    impl Split {
+        fn new() -> Self {
+            Self {
+                tick: AtomicU64::new(10),
+                samples: AtomicU64::new(0),
+                ticks: AtomicU64::new(0),
+                fail: AtomicBool::new(false),
+            }
+        }
+        fn now(&self) -> Result<Tick, PolicyError> {
+            if self.fail.load(Ordering::Relaxed) {
+                return Err(PolicyError::Busy);
+            }
+            Ok(Tick(self.tick.load(Ordering::Relaxed)))
+        }
+    }
+    impl Clock for Split {
+        fn sample(&self) -> Result<Time, PolicyError> {
+            self.samples.fetch_add(1, Ordering::Relaxed);
+            Ok(Time {
+                monotonic: self.now()?,
+                utc_ms: 1234,
+            })
+        }
+        fn monotonic(&self) -> Result<Tick, PolicyError> {
+            self.ticks.fetch_add(1, Ordering::Relaxed);
+            self.now()
+        }
+    }
+    #[test]
+    fn mixed_clock_methods_share_the_watermark_and_preserve_utc() {
+        for full_first in [false, true] {
+            let source = Split::new();
+            let clock = CheckedClock::new(&source, Tick(0));
+            if full_first {
+                assert_eq!(clock.sample().unwrap().utc_ms, 1234);
+            } else {
+                assert_eq!(clock.monotonic().unwrap(), Tick(10));
+            }
+            source.tick.store(11, Ordering::Relaxed);
+            if full_first {
+                assert_eq!(clock.monotonic().unwrap(), Tick(11));
+            } else {
+                assert_eq!(clock.sample().unwrap().monotonic, Tick(11));
+            }
+            assert_eq!(clock.sample().unwrap().monotonic, Tick(11));
+            assert_eq!(clock.monotonic().unwrap(), Tick(11));
+            source.tick.store(10, Ordering::Relaxed);
+            assert_eq!(clock.sample(), Err(PolicyError::Invalid));
+            assert_eq!(clock.monotonic(), Err(PolicyError::Invalid));
+            assert_eq!(clock.last(), Tick(11));
+        }
+    }
+    #[test]
+    fn nested_monotonic_delegation_avoids_full_samples_and_keeps_errors() {
+        let source = Split::new();
+        let inner = CheckedClock::new(&source, Tick(0));
+        let outer = CheckedClock::new(&inner, Tick(0));
+        assert_eq!(outer.monotonic().unwrap(), Tick(10));
+        assert_eq!(source.samples.load(Ordering::Relaxed), 0);
+        assert_eq!(source.ticks.load(Ordering::Relaxed), 1);
+        source.tick.store(20, Ordering::Relaxed);
+        source.fail.store(true, Ordering::Relaxed);
+        assert_eq!(outer.monotonic(), Err(PolicyError::Busy));
+        assert_eq!(outer.sample(), Err(PolicyError::Busy));
+        assert_eq!(outer.last(), Tick(10));
+        assert_eq!(inner.last(), Tick(10));
+        source.fail.store(false, Ordering::Relaxed);
+        source.tick.store(9, Ordering::Relaxed);
+        assert_eq!(outer.sample(), Err(PolicyError::Invalid));
+        assert_eq!(outer.monotonic(), Err(PolicyError::Invalid));
+    }
+}

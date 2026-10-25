@@ -225,7 +225,7 @@ fn charge(
     records: u64,
     output_bytes: u64,
 ) -> Result<(), Error> {
-    let now = clock.sample().map_err(Error::Policy)?.monotonic;
+    let now = clock.monotonic().map_err(Error::Policy)?;
     work.charge(
         now,
         Charge {

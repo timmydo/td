@@ -992,6 +992,10 @@ it from a combined sample so injected errors and ticks remain observable.
 RuntimeClock reads Instant directly for this operation. SMTP transport and
 DATA accounting retain their existing check frequency and regression checks;
 certificate validity and received timestamps still use combined samples.
+MIME transfer, text, body-value and preview adapters likewise use fresh
+monotonic-only samples at their existing checkpoints. Nested CheckedClock
+wrappers share one regression watermark between full and monotonic methods;
+no parser charge, checkpoint, final fence or source-error ordering is removed.
 Network workers cannot
 bypass the store's commit API. TLS framing/cryptographic verification belongs
 to td-crypto; mail STARTTLS transitions, deadline/lease accounting and gateway
