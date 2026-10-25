@@ -1894,13 +1894,15 @@ its original work meter on every turn. Header collection and source reads
 retain their own native checks. Completion and errors receive a native
 postcheck; a failed batch retires the cursor. Single-turn interfaces remain
 unchanged. This avoids polling PostgreSQL for each scalar or parser turn.
-JMAP interpretation of verified PostgreSQL body pins further groups at most 64 resident-cursor
-checks between connection-health polls. Each check still enforces the
-original native deadline and sticky failures. Body reads, verification,
-and final callback completion poll connection health unconditionally;
-no response can complete on a disconnected snapshot. Relay admission and
-raw-download pins retain unconditional checks on every call. This amortizes
-nonblocking TLS/socket probes without extending snapshot authority.
+JMAP interpretation of verified PostgreSQL body pins shares a budget of at
+most 64 checkpoints across resident-cursor checks and cached body reads
+between connection-health polls. Each checkpoint still enforces the original
+native deadline and sticky failures. Cache misses, verification and final
+callback completion poll connection health unconditionally; cached bytes
+remain provisional until that final check succeeds. No response can complete
+on a disconnected snapshot. Relay admission and raw-download pins retain
+unconditional checks on every call. This amortizes nonblocking TLS/socket
+probes without extending snapshot authority.
 
 ## 10. HTTP and JMAP
 

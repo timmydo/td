@@ -7597,25 +7597,34 @@ fn exercise_read(
         Ok(())
     });
     assert_eq!(invalid, Err(read::Error::Invalid));
-    let expires = Instant::now() + Duration::from_secs(3);
-    let expired_pin = read::with_snapshot(request, trust, expires, binding, password, |view| {
-        view.with_pinned_body(second.email, |_, pin| {
-            thread::sleep(expires.saturating_duration_since(Instant::now()));
-            assert_eq!(pin.check_deadline(), Err(td_mta::ports::Error::Deadline));
-            assert!(pin.is_failed());
-            assert_eq!(
-                pin.read_at(0, &mut [0; 1]),
-                Err(td_mta::ports::Error::Deadline)
-            );
-            Ok(())
-        })
-    });
-    assert_eq!(
-        expired_pin,
-        Err(read::Error::Body(postgres_body::Error::Read(
-            td_mta::ports::Error::Deadline
-        )))
-    );
+    for interpreted in [false, true] {
+        let expires = Instant::now() + Duration::from_secs(3);
+        let expired_pin = read::with_snapshot(request, trust, expires, binding, password, |view| {
+            let read_pin =
+                |_: postgres_body::Metadata, pin: &mut td_mta::store_fs::PinnedBlob<'_, '_>| {
+                    pin.check_deadline()?;
+                    thread::sleep(expires.saturating_duration_since(Instant::now()));
+                    assert_eq!(
+                        pin.read_at(0, &mut [0; 1]),
+                        Err(td_mta::ports::Error::Deadline)
+                    );
+                    assert!(pin.is_failed());
+                    assert_eq!(pin.check_deadline(), Err(td_mta::ports::Error::Deadline));
+                    Ok(())
+                };
+            if interpreted {
+                view.with_interpreted_body(second.email, read_pin)
+            } else {
+                view.with_pinned_body(second.email, read_pin)
+            }
+        });
+        assert_eq!(
+            expired_pin,
+            Err(read::Error::Body(postgres_body::Error::Read(
+                td_mta::ports::Error::Deadline
+            )))
+        );
+    }
     let disconnected_pin = read::with_snapshot(
         request,
         trust,
@@ -7627,7 +7636,13 @@ fn exercise_read(
             pin.check_deadline()?;
             sql(fixture,"SELECT pg_terminate_backend(pid) FROM pg_catalog.pg_stat_activity WHERE application_name='td-mta-postgres' AND pid<>pg_backend_pid()");
             thread::sleep(Duration::from_millis(100));
-            let failure = (0..64).find_map(|_| pin.check_deadline().err());
+            let mut provisional_reads = 0;
+            let failure = (0..16).find_map(|_| match pin.read_at(0, &mut [0; 1]) {
+                Ok(1) => { provisional_reads += 1; None },
+                Ok(_) => panic!("cached byte missing"),
+                Err(error) => Some(error),
+            });
+            assert!(provisional_reads > 0, "cached reads still poll the disconnected socket immediately");
             assert!(failure.is_some(), "resident pin hid a disconnected snapshot beyond its bounded checks");
             assert!(pin.is_failed());
             assert_eq!(pin.check_deadline().err(), failure);

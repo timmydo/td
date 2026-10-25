@@ -1269,6 +1269,17 @@ callback attempts to swallow the error. The original deadline covers setup,
 verification, callback work and final return. As with the current verified
 blob callback, callers must bound their own CPU and I/O by that deadline.
 
+Only `with_interpreted_body`, whose callback builds provisional output and
+cannot publish or admit new work, groups connection-health polling across
+resident pin checks and cached body reads. They share one counter: a full
+driver check occurs at least every 64 checkpoints. Every checkpoint still
+checks sticky failure and the original body/worker deadlines immediately.
+Cache misses check connection health before and after SQL; verification and
+callback completion retain unconditional checks. An unknown disconnect may
+therefore permit bounded provisional work, but never successful publication.
+Ordinary verified pins, downloads and relay sources retain unconditional
+connection checks on every read.
+
 A private connection worker can drive successive closed queries synchronously;
 it never replenishes deadlines or transport budgets between queries. Existing
 probe/material/configuration/schema/mailbox operations retain their original

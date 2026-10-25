@@ -531,7 +531,8 @@ impl Snapshot<'_> {
     }
     /// Interpret into provisional response storage, grouping resident checks.
     /// The callback must not publish bytes or cross a fresh admission boundary.
-    /// Body reads and completion retain unconditional connection-health checks.
+    /// Cached reads share the bounded check interval; misses and completion
+    /// retain unconditional connection-health checks. Deadlines never defer.
     pub fn with_interpreted_body<T>(
         &mut self,
         email: EmailId,

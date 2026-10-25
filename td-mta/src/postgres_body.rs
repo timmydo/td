@@ -483,6 +483,30 @@ struct Body<'a> {
     checks_left: Option<u8>,
 }
 impl Body<'_> {
+    fn check_cached(&mut self) -> Result<(), ports::Error> {
+        if let Some(error) = self.failed {
+            return Err(error);
+        }
+        let result = match self.checks_left {
+            None => self.check(),
+            Some(0) => {
+                self.checks_left = Some(63);
+                self.check()
+            }
+            Some(left) => {
+                self.checks_left = Some(left - 1);
+                if Instant::now() >= self.deadline {
+                    Err(ports::Error::Deadline)
+                } else {
+                    self.worker.check_deadline().map_err(connection)
+                }
+            }
+        };
+        if let Err(error) = result {
+            self.failed = Some(error);
+        }
+        result
+    }
     fn check(&mut self) -> Result<(), ports::Error> {
         if let Some(error) = self.failed {
             return Err(error);
@@ -550,7 +574,7 @@ impl Body<'_> {
     }
 
     fn read(&mut self, offset: u64, output: &mut [u8]) -> Result<usize, ports::Error> {
-        self.check()?;
+        self.check_cached()?;
         if offset > self.len() {
             return Err(ports::Error::Invalid);
         }
@@ -582,7 +606,7 @@ impl Body<'_> {
                 break;
             }
         }
-        self.check()?;
+        self.check_cached()?;
         Ok(written)
     }
 }
@@ -601,23 +625,6 @@ impl BlobReader for Body<'_> {
 
 impl crate::store_fs::VerifiedSource for Body<'_> {
     fn check(&mut self) -> Result<(), ports::Error> {
-        if let Some(error) = self.failed {
-            return Err(error);
-        }
-        let result = match self.checks_left {
-            None => Body::check(self),
-            Some(0) => {
-                self.checks_left = Some(63);
-                Body::check(self)
-            }
-            Some(left) => {
-                self.checks_left = Some(left - 1);
-                self.worker.check_deadline().map_err(connection)
-            }
-        };
-        if let Err(error) = result {
-            self.failed = Some(error);
-        }
-        result
+        self.check_cached()
     }
 }
