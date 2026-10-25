@@ -114,6 +114,7 @@ struct Link {
 struct Peer {
     link: Arc<Mutex<Link>>,
     side: usize,
+    read_limit: usize,
 }
 fn peers() -> (Peer, Peer, Arc<Mutex<Link>>) {
     let link = Arc::new(Mutex::new(Link {
@@ -127,10 +128,12 @@ fn peers() -> (Peer, Peer, Arc<Mutex<Link>>) {
         Peer {
             link: link.clone(),
             side: 0,
+            read_limit: 1,
         },
         Peer {
             link: link.clone(),
             side: 1,
+            read_limit: 1,
         },
         link,
     )
@@ -146,9 +149,15 @@ impl Transport for Peer {
             return Err(Error::Invalid);
         }
         let peer = 1 - self.side;
-        if let Some(byte) = link.data[self.side].pop_front() {
-            output[0] = byte;
-            Ok(IoProgress::Bytes(1))
+        if !link.data[self.side].is_empty() {
+            let count = output
+                .len()
+                .min(self.read_limit)
+                .min(link.data[self.side].len());
+            for byte in &mut output[..count] {
+                *byte = link.data[self.side].pop_front().unwrap();
+            }
+            Ok(IoProgress::Bytes(count))
         } else if link.closed[peer] {
             Ok(IoProgress::Closed)
         } else {
@@ -1006,4 +1015,57 @@ fn owned_worker_handoff() {
     .unwrap();
     assert_eq!(buffers.each_ref().map(|buffer| buffer.as_ptr()), addresses);
     assert_eq!(link.lock().unwrap().aborted, [true, true]);
+}
+
+#[test]
+fn available_record_payload_progresses_with_its_header_without_reading_ahead() {
+    let clock = TestClock::new();
+    let (client_config, server_config) = configs(&clock);
+    let mut client = TlsSession::client(client_config, "localhost").unwrap();
+    let mut hello = [0; TLS_WIRE_BYTES];
+    let count = client.drain_ciphertext(&mut hello).unwrap();
+    assert!(count > 5);
+    assert_eq!(record_length(&hello).unwrap(), count);
+    for header_only in [false, true] {
+        let (mut peer, _, link) = peers();
+        peer.read_limit = TLS_WIRE_BYTES;
+        let initial = if header_only { 5 } else { count };
+        link.lock().unwrap().data[0].extend(&hello[..initial]);
+        if !header_only {
+            link.lock().unwrap().data[0].extend(&hello[..count]);
+        }
+        let mut input = [0; TLS_WIRE_BYTES];
+        let mut output = [0; TLS_WIRE_BYTES];
+        let mut server = TlsIo::new(
+            peer,
+            TlsSession::server(server_config.clone()).unwrap(),
+            clock.clone(),
+            deadline(),
+            deadline(),
+            &mut input,
+            &mut output,
+        )
+        .unwrap();
+        assert!(server.handshake().unwrap().is_none());
+        let reads = link.lock().unwrap().reads[0];
+        assert_eq!(reads, 2);
+        if header_only {
+            assert_eq!(server.input_used, 5);
+            assert_eq!(server.input_target, count);
+            link.lock().unwrap().data[0].extend(&hello[5..count]);
+            assert!(server.handshake().unwrap().is_none());
+            let (reads, remaining) = {
+                let link = link.lock().unwrap();
+                (link.reads[0], link.data[0].len())
+            };
+            assert_eq!(reads, 3);
+            assert_eq!(remaining, 0);
+        } else {
+            let remaining = link.lock().unwrap().data[0].len();
+            assert_eq!(remaining, count);
+        }
+        assert_eq!(server.input_used, 0);
+        assert_eq!(server.input_target, 5);
+        assert!(server.session.status().ciphertext_pending > 0);
+    }
 }

@@ -267,7 +267,12 @@ impl<T: Transport, B: TlsWireStorage> TlsIo<T, B> {
         if self.network_eof || self.session.status().plaintext_pending != 0 {
             return Ok(());
         }
-        if self.input_used < self.input_target {
+        // One record per turn; a complete header may immediately admit its
+        // payload read without waiting for another scheduler tick.
+        for _ in 0..2 {
+            if self.input_used == self.input_target {
+                break;
+            }
             let remaining = self
                 .input
                 .as_deref_mut()
@@ -294,10 +299,10 @@ impl<T: Transport, B: TlsWireStorage> TlsIo<T, B> {
             }
             if self.input_target == 5 {
                 self.input_target = record_length(self.input.as_deref().ok_or(Error::Invalid)?)?;
-                if self.input_used < self.input_target {
-                    return Ok(());
-                }
             }
+        }
+        if self.input_used < self.input_target {
+            return Ok(());
         }
         let wire = self
             .input

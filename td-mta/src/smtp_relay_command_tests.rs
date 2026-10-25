@@ -468,11 +468,8 @@ fn complete_reply_survives_post_read_expiry_without_session() {
             std::thread::yield_now();
         }
         assert!(flushed);
-        // TlsIo receives the five-byte record header before its payload.
-        exchange = match exchange.advance().ok().unwrap() {
-            Progress::Pending(next) => next,
-            Progress::Ready(_) => panic!("plaintext arrived before record payload"),
-        };
+        // Arm before the queued reply: its header and payload may arrive in
+        // one turn, but expiry after parsing must still retain a complete reply.
         clock.0.store(2, std::sync::atomic::Ordering::Relaxed);
         let failure = exchange.advance().err().unwrap();
         assert_eq!(failure.reply(), expected);

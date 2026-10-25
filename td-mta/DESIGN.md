@@ -1970,8 +1970,11 @@ worker. Native session construction and pending handshakes stay on that
 worker; idle sockets retain connection slots without taking handshake permits.
 The worker peeks nonblocking for initial TLS bytes before reserving a shared
 permit, and retries a busy pool within the original handshake deadline.
-All socket operations
-are nonblocking. Request-head parsing uses at most 16 KiB per turn. The current
+All socket operations are nonblocking. TLS wire progress admits at most one
+input record per turn, using at most two reads so an available payload can
+follow its completed five-byte header immediately. Partial reads or pending
+input yield; no additional record is consumed. Original deadlines still
+bracket the turn. Request-head parsing uses at most 16 KiB per turn. The current
 profile permits one request per connection and sends Connection: close with
 all responses. Authenticated upload POSTs use the shared bounded body worker
 specified in ADMISSION.md, with quota admission before 100 Continue and
