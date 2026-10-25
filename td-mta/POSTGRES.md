@@ -6558,11 +6558,21 @@ A session admits at most 64 jobs within sixty seconds of creation. Each job
 keeps its own original deadline, capped at ten seconds including initial DNS,
 TCP, TLS and SCRAM. Before starting a later job whose complete allowance would
 outlive the session, the adapter closes the old connection and performs fresh
-DNS/TLS/SCRAM admission. Idle expiration is checked on the next request, not by
-a new task: an inert expired socket may remain until that request or service
-shutdown. Its TLS lifetime and every operation deadline still prevent use
-beyond the original session cap. Shutdown drops the retained connection after
-joining the fixed worker, without polling its driver from another thread.
+DNS/TLS/SCRAM admission. The existing fixed authentication worker checks local
+idle state once per second, outside client-slot locks, and retires a session
+when fewer than ten seconds of its original lifetime remain or its job count
+is exhausted. This maintenance performs no authorization query, driver health
+poll or new task. A shutdown guard closes retained resources on that same
+worker before it exits, including early failure paths.
+
+Only a clean idle session whose job completed with acknowledged rollback,
+unlock and final checks may use a separate termination allowance. Consuming
+retirement bounds that allowance by the caller deadline, original session
+expiry and the existing 100-ms driver cleanup ceiling. It cannot perform
+another job, renew TLS or replenish byte/frame windows. Failed or unfinished
+jobs retain their original deadline and sticky failure behavior. Cleanup is
+best effort if the peer fails or scheduling crosses the immutable TLS expiry;
+no cleanup outcome changes an already completed authentication result.
 
 Authentication and the first job share the initial one-MiB input, 1088-frame
 and 64-KiB output window. A completed job admits another such window while the

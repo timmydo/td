@@ -74,6 +74,15 @@ pub struct Principal {
 /// Call only after the actual TLS handshake and configured-origin checks.
 /// This observation is not a mutation guard or permanent connection authority.
 pub trait Authenticator: Sync {
+    /// Called periodically on the fixed authentication worker, outside slots.
+    /// Retire local idle resources without issuing authorization queries.
+    fn maintain(&self) -> Result<(), Error> {
+        Ok(())
+    }
+    /// Release retained resources on their owning thread before it exits.
+    fn close(&self) -> Result<(), Error> {
+        Ok(())
+    }
     fn authenticate(
         &self,
         username: &str,

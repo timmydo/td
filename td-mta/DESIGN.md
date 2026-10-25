@@ -2703,6 +2703,11 @@ repeats qualification and device authentication in a fresh transaction and
 acknowledges rollback before returning; idle sessions retain no migration lock
 or account authority. POSTGRES.md owns its lifetime, cumulative protocol
 allowances, thread ownership, retirement and reconnect rules.
+The same authentication worker runs throttled local idle maintenance outside
+client-slot locks and closes retained resources before thread exit, including
+early failure paths. Neither hook performs authentication queries or starts a
+new task. Clean completed sessions have a separate bounded termination
+allowance; request deadlines, TLS lifetime and failed-job bounds are unchanged.
 
 ## Native ACME deployment profile
 

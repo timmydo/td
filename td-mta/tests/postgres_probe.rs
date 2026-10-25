@@ -6153,7 +6153,9 @@ fn exercise_http_auth(
     let auth =
         td_mta::postgres_http_auth::Authentication::new(&connection, executable, &accounts, &clock)
             .unwrap();
-    authentication_reuse::exercise(fixture, &auth, password, principal, until);
+    authentication_reuse::exercise(fixture, &auth, password, principal, |ms| {
+        Deadline::after(clock.sample().unwrap().monotonic, ms).unwrap()
+    });
 }
 
 fn exercise_read_dispatch(

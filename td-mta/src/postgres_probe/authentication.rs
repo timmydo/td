@@ -26,6 +26,9 @@ impl Bounds {
             left: TURNS,
         })
     }
+    fn needs_retirement(&self, now: Instant) -> bool {
+        self.left == 0 || self.expires.saturating_duration_since(now) <= MAX_DURATION
+    }
     fn reusable(&self, deadline: Instant) -> bool {
         self.left != 0 && deadline <= self.expires && self.owner == thread::current().id()
     }
@@ -50,6 +53,7 @@ pub(crate) struct AuthenticationSession {
     worker: Worker,
     bounds: Bounds,
     retired: bool,
+    clean_idle: bool,
 }
 impl AuthenticationSession {
     pub(crate) fn open(
@@ -78,13 +82,23 @@ impl AuthenticationSession {
             worker,
             bounds,
             retired: false,
+            clean_idle: false,
         })
     }
     pub(crate) fn reusable(&self, deadline: Instant) -> bool {
         !self.retired && self.worker.failed.is_none() && self.bounds.reusable(deadline)
     }
+    pub(crate) fn needs_retirement(&self, now: Instant) -> bool {
+        self.bounds.needs_retirement(now)
+    }
     pub(crate) fn retire(mut self, deadline: Instant) {
-        self.worker.deadline = self.worker.deadline.min(deadline);
+        if self.clean_idle && !self.retired && self.worker.failed.is_none() {
+            // This consumed session can only terminate. The acknowledged job
+            // is over; its old deadline must not prevent bounded idle cleanup.
+            self.worker.deadline = deadline.min(self.bounds.expires);
+        } else {
+            self.worker.deadline = self.worker.deadline.min(deadline);
+        }
     }
     pub(crate) fn authenticate(
         &mut self,
@@ -109,6 +123,7 @@ impl AuthenticationSession {
         if self.retired {
             return Err(ports::Error::Invalid);
         }
+        self.clean_idle = false;
         self.bounds
             .admit(Instant::now(), deadline)
             .map_err(connection)?;
@@ -153,6 +168,7 @@ impl AuthenticationSession {
             .map_err(connection)??;
         self.worker.check_deadline().map_err(connection)?;
         self.worker.finish_validation_turn().map_err(connection)?;
+        self.clean_idle = true;
         Ok(principal)
     }
 }
@@ -200,6 +216,20 @@ mod tests {
             bounds.admit(expiry, expiry + Duration::from_nanos(1)),
             Err(Error::Deadline)
         );
+    }
+
+    #[test]
+    fn idle_retirement_reserves_cleanup_headroom_without_moving_expiry() {
+        let now = Instant::now();
+        let mut bounds = Bounds::new(now).unwrap();
+        let expires = bounds.expires;
+        assert!(!bounds.needs_retirement(now));
+        assert!(!bounds.needs_retirement(expires - MAX_DURATION - Duration::from_nanos(1)));
+        assert!(bounds.needs_retirement(expires - MAX_DURATION));
+        assert!(bounds.needs_retirement(expires + Duration::from_secs(1)));
+        bounds.left = 0;
+        assert!(bounds.needs_retirement(now));
+        assert_eq!(bounds.expires, expires);
     }
 
     #[test]

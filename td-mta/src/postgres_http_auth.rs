@@ -71,6 +71,12 @@ impl<'a> Authentication<'a> {
     }
 }
 impl Authenticator for Authentication<'_> {
+    fn maintain(&self) -> Result<(), Error> {
+        self.retire_idle(false)
+    }
+    fn close(&self) -> Result<(), Error> {
+        self.retire_idle(true)
+    }
     fn authenticate(
         &self,
         username: &str,
@@ -146,6 +152,32 @@ impl Authenticator for Authentication<'_> {
     }
 }
 impl Authentication<'_> {
+    fn retire_idle(&self, closing: bool) -> Result<(), Error> {
+        let mut state = self.state.try_lock().map_err(|error| match error {
+            TryLockError::WouldBlock => Error::Busy,
+            TryLockError::Poisoned(_) => Error::Invalid,
+        })?;
+        if state
+            .owner
+            .is_some_and(|owner| owner != thread::current().id())
+        {
+            return Err(Error::Invalid);
+        }
+        let now = Instant::now();
+        if state
+            .session
+            .as_ref()
+            .is_some_and(|session| closing || session.needs_retirement(now))
+        {
+            let deadline = now
+                .checked_add(Duration::from_millis(100))
+                .ok_or(Error::Invalid)?;
+            if let Some(session) = state.session.take() {
+                session.retire(deadline);
+            }
+        }
+        Ok(())
+    }
     fn connect(&self, deadline: Instant) -> Result<AuthenticationSession, Error> {
         let dns_deadline = deadline.min(
             Instant::now()

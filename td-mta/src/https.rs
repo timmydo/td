@@ -26,7 +26,7 @@ use std::{
         atomic::{AtomicBool, AtomicU8, Ordering},
         Arc, Mutex, TryLockError,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 type Wire = Box<[u8; TLS_WIRE_BYTES]>;
@@ -122,6 +122,18 @@ impl Drop for Finish<'_> {
     fn drop(&mut self) {
         self.done.store(true, Ordering::Release);
         self.worker.unpark();
+    }
+}
+
+struct AuthenticationFinish<'a> {
+    authentication: &'a dyn http_auth::Authenticator,
+    control: &'a Control,
+}
+impl Drop for AuthenticationFinish<'_> {
+    fn drop(&mut self) {
+        if self.authentication.close().is_err() {
+            self.control.fail();
+        }
     }
 }
 
@@ -329,7 +341,19 @@ impl Https<'_> {
             let verifier = match std::thread::Builder::new()
                 .name("https-auth".into())
                 .spawn_scoped(scope, || {
+                    let _finish = AuthenticationFinish {
+                        authentication: self.authentication,
+                        control,
+                    };
+                    let mut maintained = Instant::now();
                     while !done.load(Ordering::Acquire) {
+                        if maintained.elapsed() >= Duration::from_secs(1) {
+                            if self.authentication.maintain().is_err() {
+                                control.fail();
+                                return;
+                            }
+                            maintained = Instant::now();
+                        }
                         for cell in &slots {
                             let mut slot = match cell.try_lock() {
                                 Ok(slot) => slot,

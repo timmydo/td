@@ -1,5 +1,8 @@
 use super::{body_checks, sql, Fixture};
-use std::{thread, time::Instant};
+use std::{
+    thread,
+    time::{Duration, Instant},
+};
 use td_mta::{
     http_auth::{Authenticator, Principal},
     ports::{Deadline, Error},
@@ -11,10 +14,10 @@ pub(super) fn exercise(
     auth: &Authentication<'_>,
     password: &[u8],
     principal: Principal,
-    until: impl Fn() -> Deadline + Sync,
+    until: impl Fn(u64) -> Deadline + Sync,
 ) {
     body_checks::quiet(fixture);
-    let authenticate = || auth.authenticate("reader", password, until());
+    let authenticate = || auth.authenticate("reader", password, until(10_000));
     let start = Instant::now();
     assert_eq!(authenticate(), Ok(Some(principal)));
     let cold = start.elapsed();
@@ -64,10 +67,42 @@ pub(super) fn exercise(
     };
     let before = failures();
     let pid = body_checks::backend(fixture);
+    assert_eq!(auth.maintain(), Ok(()));
+    assert_eq!(body_checks::backend(fixture), pid);
+    thread::scope(|scope| {
+        assert_eq!(
+            scope.spawn(|| auth.close()).join().unwrap(),
+            Err(Error::Invalid)
+        );
+        assert_eq!(
+            scope.spawn(|| auth.maintain()).join().unwrap(),
+            Err(Error::Invalid)
+        );
+    });
+    assert_eq!(body_checks::backend(fixture), pid);
+    // This job ends long before its two-second deadline. Closing the clean
+    // idle session afterward must still drive Terminate within its TLS life.
+    let short = until(2_000);
+    assert_eq!(
+        auth.authenticate("reader", password, short),
+        Ok(Some(principal))
+    );
+    thread::sleep(Duration::from_millis(2_100));
+    assert_eq!(auth.close(), Ok(()));
+    body_checks::closed(fixture, &pid);
+    assert_eq!(
+        failures(),
+        before,
+        "completed job deadline must not suppress idle Terminate"
+    );
+    assert_eq!(authenticate(), Ok(Some(principal)));
+
+    let before = failures();
+    let pid = body_checks::backend(fixture);
     let mut wrong = password.to_vec();
     let index = wrong.len() - 5;
     wrong[index] = if wrong[index] == b'0' { b'1' } else { b'0' };
-    assert_eq!(auth.authenticate("reader", &wrong, until()), Ok(None));
+    assert_eq!(auth.authenticate("reader", &wrong, until(10_000)), Ok(None));
     body_checks::closed(fixture, &pid);
     assert_eq!(
         failures(),

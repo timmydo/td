@@ -141,8 +141,20 @@ fn https_enforces_auth_origin_framing_revocation_and_idle_deadlines() {
         armed: AtomicBool,
         entered: AtomicBool,
         released: AtomicBool,
+        maintained: AtomicBool,
+        closed: AtomicBool,
     }
     impl http_auth::Authenticator for Delayed<'_> {
+        fn maintain(&self) -> Result<(), Error> {
+            assert_eq!(std::thread::current().name(), Some("https-auth"));
+            self.maintained.store(true, Ordering::Release);
+            Ok(())
+        }
+        fn close(&self) -> Result<(), Error> {
+            assert_eq!(std::thread::current().name(), Some("https-auth"));
+            self.closed.store(true, Ordering::Release);
+            Ok(())
+        }
         fn authenticate(
             &self,
             username: &str,
@@ -168,6 +180,8 @@ fn https_enforces_auth_origin_framing_revocation_and_idle_deadlines() {
         armed: AtomicBool::new(false),
         entered: AtomicBool::new(false),
         released: AtomicBool::new(false),
+        maintained: AtomicBool::new(false),
+        closed: AtomicBool::new(false),
     };
     let material = Material::new();
     let socket = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -226,6 +240,7 @@ fn https_enforces_auth_origin_framing_revocation_and_idle_deadlines() {
                     );
                     ready.load(Ordering::Acquire)
                 });
+                wait(|| authentication.maintained.load(Ordering::Acquire));
                 // Idle TCP peers consume connection capacity but no handshake permit.
                 let idle: Vec<_> = (0..16).map(|_| TcpStream::connect(address).unwrap()).collect();
                 std::thread::sleep(Duration::from_millis(50));
@@ -439,6 +454,7 @@ fn https_enforces_auth_origin_framing_revocation_and_idle_deadlines() {
                 wait(|| matches!(idle.read(&mut scratch), Err(_) | Ok(IoProgress::Closed)));
                 drop(stop);
                 assert!(worker.join().unwrap().is_ok());
+                assert!(authentication.closed.load(Ordering::Acquire));
                 assert_eq!(handshakes.available(), handshakes.capacity());
             });
         })
