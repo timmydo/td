@@ -148,7 +148,7 @@ limits! {
         sort_disk_bytes: 64 * MIB, 1, 256 * MIB;
         log_file_bytes: 8 * MIB, 1, 64 * MIB;
         retained_logs: 4, 1, 16;
-        memory_budget_bytes: 128 * MIB, 1, usize::MAX;
+        memory_budget_bytes: 512 * MIB, 1, usize::MAX;
     }
     fixed {
         outbound_deliveries: 1;
@@ -177,7 +177,7 @@ impl Reservation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResourcePlan {
     limits: Limits,
-    reservations: [Reservation; 20],
+    reservations: [Reservation; 23],
     total_bytes: usize,
     log_disk_bytes: usize,
 }
@@ -386,6 +386,21 @@ impl Limits {
                 bytes_each: SMTP_FANOUT_METADATA_BYTES,
             },
             Reservation {
+                name: "SMTP resident DATA",
+                count: SMTP_DATA_JOBS,
+                bytes_each: self.message_bytes,
+            },
+            Reservation {
+                name: "SMTP prepared body",
+                count: 1,
+                bytes_each: self.message_bytes,
+            },
+            Reservation {
+                name: "upload ingress and retained body",
+                count: 2,
+                bytes_each: self.message_bytes,
+            },
+            Reservation {
                 name: "account metadata",
                 count: 1,
                 bytes_each: ACCOUNT_METADATA_BYTES,
@@ -430,7 +445,7 @@ mod tests {
     #[test]
     fn default_ledger_pins_documented_budget() -> Result<(), ResourceError> {
         let plan = Limits::default().plan()?;
-        assert_eq!(plan.total_bytes(), 120_243_456);
+        assert_eq!(plan.total_bytes(), 355_124_480);
         const { assert!(crate::format::MAX_VALUE_BYTES + crate::format::MAX_KEY_BYTES + 48 <= 68 * KIB) };
         assert_eq!(
             READ_VIEW_SCRATCH_BYTES,
@@ -441,7 +456,7 @@ mod tests {
                 + 128 * KIB
                 + CHANGE_SLOT_BYTES * crate::format::MAX_TRANSACTION_OPERATIONS
         );
-        assert_eq!(plan.limits().memory_budget_bytes, 128 * MIB);
+        assert_eq!(plan.limits().memory_budget_bytes, 512 * MIB);
         assert!(plan.total_bytes() < plan.limits().memory_budget_bytes);
         assert_eq!(plan.log_disk_bytes(), 40 * MIB);
         Ok(())
@@ -547,7 +562,7 @@ mod tests {
         let larger_inbound = Limits {
             smtp_recipients: 1000,
             index_cache_bytes: 2 * MIB,
-            memory_budget_bytes: 128 * MIB,
+            memory_budget_bytes: 512 * MIB,
             ..Limits::default()
         }
         .plan()?;
@@ -572,11 +587,11 @@ mod tests {
     ) -> Result<(), ResourceError> {
         let expanded = Limits {
             https_connections: 32,
-            memory_budget_bytes: 256 * MIB,
+            memory_budget_bytes: 512 * MIB,
             ..Limits::default()
         };
         let plan = expanded.plan()?;
-        assert!(plan.total_bytes() > 128 * MIB);
+        assert!(plan.total_bytes() > Limits::default().plan()?.total_bytes());
         assert!(plan.total_bytes() < expanded.memory_budget_bytes);
         assert!(matches!(
             Limits {
@@ -614,7 +629,7 @@ mod tests {
     fn larger_memory_budget_does_not_enable_parallel_relay_attempts() {
         let limits = Limits {
             outbound_deliveries: 2,
-            memory_budget_bytes: 256 * MIB,
+            memory_budget_bytes: 512 * MIB,
             ..Limits::default()
         };
         assert_eq!(
@@ -734,17 +749,44 @@ mod tests {
     }
 
     #[test]
-    fn streamed_body_and_disk_quotas_do_not_allocate_message_sized_slots(
-    ) -> Result<(), ResourceError> {
+    fn resident_bodies_follow_message_size_but_disk_quotas_do_not() -> Result<(), ResourceError> {
         let original = Limits::default().plan()?;
-        let changed = Limits {
-            message_bytes: 16 * MIB,
+        let disk_only = Limits {
             upload_disk_bytes: 256 * MIB,
             queue_submissions: 2000,
             ..Limits::default()
         }
         .plan()?;
-        assert_eq!(original.total_bytes(), changed.total_bytes());
+        assert_eq!(original.total_bytes(), disk_only.total_bytes());
+        let smaller = Limits {
+            message_bytes: 16 * MIB,
+            ..Limits::default()
+        }
+        .plan()?;
+        assert_eq!(original.total_bytes() - smaller.total_bytes(), 7 * 16 * MIB);
+        for (name, count) in [
+            ("SMTP resident DATA", SMTP_DATA_JOBS),
+            ("SMTP prepared body", 1),
+            ("upload ingress and retained body", 2),
+        ] {
+            let row = smaller
+                .reservations()
+                .iter()
+                .find(|row| row.name == name)
+                .ok_or(ResourceError::Inconsistent(
+                    "missing resident body reservation",
+                ))?;
+            assert_eq!(row.count, count);
+            assert_eq!(row.bytes_each, 16 * MIB);
+        }
+        assert!(matches!(
+            Limits {
+                memory_budget_bytes: 128 * MIB,
+                ..Limits::default()
+            }
+            .plan(),
+            Err(ResourceError::MemoryBudget { .. })
+        ));
         Ok(())
     }
 
@@ -760,13 +802,14 @@ mod tests {
             Err(ResourceError::MemoryBudget { .. })
         ));
         let plan = Limits {
-            memory_budget_bytes: 128 * MIB,
+            memory_budget_bytes: 512 * MIB,
             ..limits
         }
         .plan()?;
         assert!(plan.total_bytes() > Limits::default().plan()?.total_bytes());
         let maximum_pool = Limits {
             https_connections: 32,
+            memory_budget_bytes: Limits::default().plan()?.total_bytes() + 16 * MIB,
             ..Limits::default()
         };
         assert!(matches!(

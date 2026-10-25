@@ -419,14 +419,14 @@ mod tests {
         assert_eq!(actual.admission().work().request_seconds, 600);
         assert_eq!(actual.timeouts().execution_seconds(), 600);
         assert_eq!(actual.timeouts().limits().minimum_rate, 32768);
-        assert_eq!(actual.resources().total_bytes(), 120_243_456);
+        assert_eq!(actual.resources().total_bytes(), 237_683_968);
     }
     #[test]
     fn operator_memory_budget_accepts_a_larger_bounded_configuration() {
         let mut builder = Builder::default();
         builder.begin(Section::Limits, location(1)).unwrap();
         for (field, value) in [
-            ("memory_budget_bytes", 268435456),
+            ("memory_budget_bytes", 536870912),
             ("https_connections", 32),
         ] {
             builder
@@ -436,9 +436,9 @@ mod tests {
         let actual = builder
             .finish(admission::ViewMode::OnlineBackground)
             .unwrap();
-        assert_eq!(actual.resources().limits().memory_budget_bytes, 268435456);
+        assert_eq!(actual.resources().limits().memory_budget_bytes, 536870912);
         assert_eq!(actual.resources().limits().https_connections, 32);
-        assert!(actual.resources().total_bytes() > 134217728);
+        assert!(actual.resources().total_bytes() > 355124480);
     }
 
     #[test]

@@ -1240,8 +1240,10 @@ or a prerequisite silently downloaded by the test suite.
 
 Resource policy separates enforceable limits from performance goals. Bound
 untrusted message/request sizes, parser depth, operation counts, concurrency,
-queues, caches and retained generations. Streaming bodies and disk-backed
-indexes must avoid retaining the mailbox or full messages in RAM. Check
+queues, caches and retained generations. Disk-backed indexes must avoid
+retaining the mailbox in RAM. Downloads stream; current SMTP DATA and upload
+ingress retain bounded full-message buffers accounted for in the resource
+ledger. Reducing this resident ingress is a performance goal. Check
 lengths and capacity before growth; use fallible reservation where available
 and defined refusal at enforced limits. Durability, authorization and bounded
 work remain correctness requirements regardless of memory performance.
@@ -1249,8 +1251,9 @@ work remain correctness requirements regardless of memory performance.
 The initial performance goals are RSS below 64 MiB idle and below 128 MiB
 under the section 15 workload. They are provisional tuning goals, not a
 byte-exact architectural budget or a prerequisite for implementing adapters.
-Measure the integrated service before choosing a release memory claim or
-changing these goals. Record RSS and cgroup memory separately, including
+Concurrent near-32-MiB ingress exceeds the initial 128-MiB workload goal;
+RESOURCES.md records the measurement and provisional 512-MiB planning default.
+That configurable planning budget is not an RSS limit or release memory claim. Record RSS and cgroup memory separately, including
 page-cache effects, workload, concurrency and sampling limitations. A ledger
 sum or isolated allocation probe establishes neither result.
 
@@ -1282,9 +1285,9 @@ current proposal and implemented limits. Its byte partitions and TLS
 allowances are planning estimates, not mandatory per-component ceilings.
 Limits::plan checks the ledger against an operator-configurable positive
 memory budget while retaining individual connection, queue, message and
-allocation bounds. The provisional 128-MiB default is a planning limit, not
-a measured RSS guarantee; recommend a revised default only after concurrent
-peak measurements. PostgreSQL owns server
+allocation bounds. The provisional 512-MiB default incorporates the resident
+ingress ledger and concurrent measurements recorded in RESOURCES.md; it is
+a planning limit, not a measured RSS guarantee. PostgreSQL owns server
 heap, WAL and page resources; the process ledger does not bound that server. Maintenance must share bounded capacity with
 live work and preserve foreground progress.
 
@@ -1318,7 +1321,7 @@ Initial default ceilings (validated together at startup):
 | Event-source connections within the HTTPS pool | 2 |
 | Concurrent smart-host deliveries | 1 |
 | Concurrent body/search jobs | 3 |
-| Incoming message or uploaded blob | 32 MiB hard maximum, streamed |
+| Incoming message or uploaded blob | 32 MiB hard maximum, bounded resident ingress |
 | Owner-imported legacy message and stored-body reads | 64 MiB hard maximum |
 | Aggregate header bytes / MIME nesting / MIME parts | 256 KiB / 32 / 1024 |
 | SMTP recipients per transaction | 100 |

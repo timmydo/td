@@ -108,7 +108,7 @@ mod tests {
                 json_bytes: 1024,
                 json_tokens: 64,
                 index_cache_bytes: 1024,
-                memory_budget_bytes: 128 * 1024 * 1024,
+                memory_budget_bytes: 512 * 1024 * 1024,
                 ..Default::default()
             };
             assert_eq!(HandshakePool::new(capacity).is_ok(), limits.plan().is_ok());

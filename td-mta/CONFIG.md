@@ -248,8 +248,8 @@ refuses; it does not allocate an extra message buffer.
 `sort_disk_bytes`, `log_file_bytes`, `retained_logs`, `memory_budget_bytes`.
 
 `memory_budget_bytes` is the operator's positive process-planning limit in
-bytes, up to the platform's `usize` range. The provisional default remains
-134217728 (128 MiB); it is not a compiled maximum. Choose a budget after
+bytes, up to the platform's `usize` range. The provisional default is
+536870912 (512 MiB); it is not a compiled maximum. Choose a budget after
 measuring peak RSS and cgroup memory under the intended concurrent workload,
 including large SMTP messages and body downloads. PostgreSQL server memory,
 WAL, page cache and other services need their own headroom. A larger budget
@@ -257,10 +257,9 @@ alone allocates no memory and changes no connection, queue, message or
 individual allocation limit. Those bounds and checked ledger arithmetic
 remain enforced. A plan exceeding the configured budget is refused.
 
-For example, `memory_budget_bytes=268435456` permits a 256-MiB planning
-budget when increasing independently bounded concurrency. This is an example,
-not a measured default recommendation or an OS-enforced RSS limit. The
-current default plan is 120243456 bytes (about 114.67 MiB), including the
+For example, `memory_budget_bytes=536870912` explicitly selects the default
+512-MiB planning budget. This is not an OS-enforced RSS limit. The current
+default plan is 355124480 bytes (about 338.67 MiB), including the
 4-MiB index cache. Bounded folder/keyword prefix prefetch adds 128 KiB per read
 view (768 KiB at the default six views); tightly sized budgets must allow
 this additional scratch reservation. It does not raise protocol limits.
@@ -279,8 +278,16 @@ values still bound the pool: its count is the minimum of three,
 has no separate API reservation; two workers allow one transfer plus API
 work, and three allow two transfers plus API work. Uploads remain capped
 at one within transfer capacity. Operators with a tightly sized explicit
-budget must revalidate it against the complete plan after upgrading. Keep the current
-default until representative concurrency measurements justify a change.
+budget must revalidate it against the complete plan after upgrading.
+
+The plan now includes four resident SMTP DATA buffers, one prepared SMTP
+body and two upload buffers, each bounded by `message_bytes`. These add
+224 MiB at the default 32-MiB message ceiling; an explicit old 128-MiB or
+256-MiB budget will refuse the default plan. The ledger includes both SMTP
+and HTTPS allowances even for a process serving only one role. It neither
+preallocates those buffers nor proves a worst-case RSS bound. Concurrent
+large-message measurements and the provisional 512-MiB recommendation are
+recorded in RESOURCES.md; retain separate operating-system headroom.
 
 ### `[disk]`
 

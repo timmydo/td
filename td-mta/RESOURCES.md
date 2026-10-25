@@ -52,14 +52,17 @@ changing that validator requires an explicit atomic implementation update.
 | Cold reload overlap | 1 | 2097152 | 2097152 |
 | Process and allocator allowance | 1 | 8388608 | 8388608 |
 | SMTP fanout metadata | 4 | 2097152 | 8388608 |
-| **Total** | | | **120243456** |
+| SMTP resident DATA | 4 | 33554432 | 134217728 |
+| SMTP prepared body | 1 | 33554432 | 33554432 |
+| Upload ingress and retained body | 2 | 33554432 | 67108864 |
+| **Total** | | | **355124480** |
 
-The total is approximately 114.67 MiB against a 128 MiB configured budget;
-the remaining 13974272 bytes are unassigned headroom, not another cache.
+The total is approximately 338.67 MiB against a 512 MiB configured budget;
+the remaining 181746432 bytes are unassigned headroom, not another cache.
 The default process ledger excludes database-server memory and WAL mappings.
 The two default TLS handshakes remain configurable within the process budget.
-The 64 MiB idle and 128 MiB workload RSS figures are provisional goals under
-DESIGN section 5. TLS entries estimate demand, not additional arenas to
+The earlier 128 MiB workload RSS goal is exceeded by the concurrent
+large-message measurement below; the 64 MiB idle goal remains provisional. TLS entries estimate demand, not additional arenas to
 allocate and touch at startup. The ledger sum establishes no RSS bound.
 Provider counters observe requested bytes in overlapping domains; allocator
 overhead and realloc transients require care when interpreting measurements.
@@ -260,9 +263,10 @@ encoded-header adapters or combined service RSS.
   PostgreSQL snapshot. Database-client bounds are specified in POSTGRES.md;
   the process planning entry is not a database-server heap reservation.
 
-Message size, upload/queue quotas, queue length and log file limits are disk or
-admission bounds. Growing them does not reserve whole bodies or a whole queue in
-RAM. The default log disk reservation is five 8 MiB files (active plus four
+Message size bounds resident SMTP and upload buffers as well as admission.
+The ledger scales seven body-sized buffers with `message_bytes`: four DATA
+jobs, one prepared SMTP body and upload ingress plus retained body. Upload/queue
+disk quotas, queue length and log file limits do not reserve whole queues in RAM. The default log disk reservation is five 8 MiB files (active plus four
 retained). ADMISSION.md freezes logical byte/file quotas, logical completion
 reserves and maintenance work/deadlines, enforced by M05/M08 before mail can
 be accepted.
@@ -3152,7 +3156,7 @@ parses the complete bundle. No peer handshake or successful authentication is
 claimed by this configuration-only fixture.
 
 The fixture explicitly declares fifteen SMTP slots, a 512 KiB disposable
-index cache and a 128 MiB planner budget so the fifteen one-slot gateway
+index cache and a 512 MiB planner budget so the fifteen one-slot gateway
 listeners are admitted. It supplies an
 external MX for every domain, with no direct SMTP listener. These settings
 belong to the fixture. Assertions check the decoded profile/listener/gateway
@@ -3766,8 +3770,8 @@ The same method meter survives all messages and transformations. Decoding,
 preview extraction and JSON stages retain their original cumulative charges;
 a small requested preview can still hit the work ceiling while validating a
 large source. The response spool cap independently limits emitted bytes.
-Default planned total is 120243456 bytes under the unchanged 128 MiB budget;
-capacity-growth fixtures rebalance disposable cache within that budget.
+The default planned total and configurable budget are listed above;
+capacity-growth fixtures exercise explicit budgets and cache rebalancing.
 These are bounded implementation allocations and planner figures, not a new
 whole-service RSS or large-mailbox qualification claim.
 
@@ -3779,16 +3783,14 @@ have their separate 512-byte allowance; retained lists do not borrow the old
 96 KiB partition. Header backing additionally reserves one lookahead byte per
 part and two final bytes within that allowance and scratch.
 
-Non-default concurrency and part-count combinations can exceed the default
-128-MiB budget even when each scalar is within its own allowed range. The
-operator may raise the positive `memory_budget_bytes` planning limit, up to
-the platform's `usize` range, or rebalance cache, concurrency and object
-limits. Raising the budget does not raise any individual bound or allocate
-an arena of that size. The provisional default remains 128 MiB pending
-representative concurrent peak measurements. The capacity-growth fixture
-also retains a 32-HTTPS-connection configuration with `json_bytes=262144`
-and `json_tokens=4096`, keeping the default index cache. Its plan requires
-132777216 bytes; it is one way to fit within the default, not a requirement.
+Non-default concurrency and part-count combinations can exceed a configured
+budget even when each scalar is within its own allowed range. The operator may
+raise the positive `memory_budget_bytes` planning limit, up to the platform's
+`usize` range, or rebalance cache, concurrency and object limits. Raising the
+budget does not raise any individual bound or allocate an arena of that size.
+The provisional default is 512 MiB. The capacity-growth fixture also exercises
+32 HTTPS connections with reduced JSON bytes and token counts against a tighter
+explicit budget, keeping the default index cache.
 CONFIG.md's resource validation uses this same combined plan; independent
 scalar maxima do not establish admission. Selection additionally retains up
 to 64 names (264 bytes each) and their parsed header properties, bounded by
@@ -4563,9 +4565,9 @@ incoming capacities total at most 128 MiB and filtered payload at most another
 32 MiB. Preparation requests one exact reservation for the received length plus
 the bounded trace allowance, including the possible header/body separator.
 Filtered output stays within that reservation without amortized buffer growth;
-allocator overhead and native database/protocol allocations remain additional. These body allocations
-are additional to the planning ledger above, as are the active attachment and
-relay reservations. The four-job bound prevents connection-count amplification
+allocator overhead and native database/protocol allocations remain additional.
+These five body buffers are included in the planning ledger above. Active
+attachment and relay allocations still require integrated qualification. The four-job bound prevents connection-count amplification
 but does not qualify the provisional 128-MiB workload RSS goal. Saturation waits
 before 354 within the original admission deadline; it allocates no fifth body
 or third same-peer body. Four peer labels are retained beside the atomic
@@ -4603,3 +4605,31 @@ capacity remains two permits per download, and idle retention remains one per
 worker. No thread, message-sized buffer or peer registry is added. The 30-second
 body allowance is unchanged; POSTGRES specifies the check session's finite
 wire windows, ten-second transactions and output-time retirement.
+
+## Concurrent large-message memory measurement
+
+An isolated release glibc fixture on Linux 7.0.14 used two service processes,
+four SMTP DATA jobs across IPv4 and IPv6 peers, messages just below 32 MiB,
+two download readers, API queries and one near-32-MiB upload held for 15 seconds
+before its final byte. Sampling `/proc` RSS every 20 ms observed receive peak
+177280 KiB, frontend peak 84640 KiB, and simultaneous combined peak 261920 KiB.
+After draining, RSS was 45428 KiB and 19732 KiB respectively. The fixture used
+a 1-GiB data limit and completed in 127.81 seconds. PostgreSQL and page cache
+are excluded; these samples are not cgroup peaks or a worst-case proof.
+
+All SMTP publications completed without deferral, duplicate or ambiguous
+commit. Eighty downloads and 105 API queries completed; downloads encountered
+39 temporary 429 capacity responses, API queries none, and no HTTP 503 occurred.
+The upload completed in 24.87 seconds including its deliberate hold. One of
+240 frontend database-close observations failed; there were no abandoned
+sessions. These measurements do not establish a latency target or error-free
+phase counters. Concurrent host checks may affect timings.
+
+The corrected ledger adds 224 MiB of previously omitted resident buffers.
+Its approximately 338.67-MiB total plus unassigned headroom motivates a
+provisional 512-MiB planning default. The plan includes both roles even for a
+split process and does not preallocate its entries. Before choosing a hard OS
+memory limit or a smaller role-specific default, measure cgroup current/peak,
+page cache, combined-role operation, repeated saturation, slow clients, TLS
+reload and uncertain-publication retention. Other feature allocations and
+allocator transients still require integrated measurement.
