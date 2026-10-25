@@ -5809,6 +5809,21 @@ client directory. A bare readiness filename without a directory is refused.
 
 ## Physical secure attention
 
+The menu also offers `F: RESTART` and `P: POWER OFF`. Each opens a named
+confirmation with an unsaved-work notice; only fresh Enter timestamped after
+that prompt reached the display selects the lifetime's operation. A per-prompt
+completion receipt retains that cutoff across later paints, so buffered
+pre-presentation input cannot confirm. Escape drains and cancels as
+usual. Held/repeat input, excluded token keyboards, and synthetic input
+cannot confirm. The private client sends the fixed console-power request to
+td-authd (its DESIGN.md, "Physical console power") and reports acceptance,
+busy, or failure. It does not run a power applet or expose the supervisor's
+control socket. These choices work without token enrollment on installed
+systems and live media. They do not authorize another privileged operation.
+The power row follows the storage row. The menu keeps existing row positions
+on 1280x800; on 800x600 its top moves to 153 to fit all thirteen rows, and
+on 320x200 the rows use a 16-pixel pitch.
+
 The trusted input boundary includes every evdev device admitted at startup,
 including USB HID keyboards and pointers. USB provenance is not device
 attestation. A composite token's separate OTP keyboard interface is an input

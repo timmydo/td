@@ -29,7 +29,7 @@ use crate::server::TransferEndpoint;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 pub(crate) const MAX_PENDING_KEYBOARD_DELIVERIES: usize = 64;
@@ -94,8 +94,15 @@ struct InFlight {
 /// first paint made after X" is a number that can be named before it exists.
 #[derive(Default)]
 pub(crate) struct PresentationClock {
-    presented: Mutex<u64>,
+    presented: Mutex<PresentationState>,
     changed: Condvar,
+}
+
+#[derive(Default)]
+struct PresentationState {
+    epoch: u64,
+    completed: Option<u128>,
+    notices: Vec<(u64, Weak<Mutex<Option<u128>>>)>,
 }
 
 impl PresentationClock {
@@ -103,9 +110,50 @@ impl PresentationClock {
     /// older paint cannot move the clock back. A poisoned clock is left as it
     /// is, since every waiter refuses one.
     fn publish(&self, epoch: u64) {
+        self.publish_at(epoch, presentation_completed().ok());
+    }
+
+    fn publish_at(&self, epoch: u64, completed: Option<u128>) {
         if let Ok(mut presented) = self.presented.lock() {
-            *presented = (*presented).max(epoch);
+            if epoch >= presented.epoch {
+                presented.epoch = epoch;
+                presented.completed = completed;
+                presented.notices.retain(|(due, receipt)| {
+                    let Some(receipt) = receipt.upgrade() else {
+                        return false;
+                    };
+                    if *due <= epoch {
+                        if let Ok(mut after) = receipt.lock() {
+                            *after = completed;
+                        }
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
             self.changed.notify_all();
+        }
+    }
+
+    fn notice(self: &Arc<Self>, epoch: u64) -> NoticePresentation {
+        let after = Arc::new(Mutex::new(None));
+        if let Ok(mut presented) = self.presented.lock() {
+            if presented.epoch >= epoch {
+                if let Ok(mut value) = after.lock() {
+                    *value = presented.completed;
+                }
+            } else {
+                presented
+                    .notices
+                    .retain(|(_, receipt)| receipt.strong_count() != 0);
+                presented.notices.push((epoch, Arc::downgrade(&after)));
+            }
+        }
+        NoticePresentation {
+            epoch,
+            clock: Arc::clone(self),
+            after,
         }
     }
 
@@ -113,12 +161,12 @@ impl PresentationClock {
     fn reached(&self, epoch: u64) -> bool {
         self.presented
             .lock()
-            .is_ok_and(|presented| *presented >= epoch)
+            .is_ok_and(|presented| presented.epoch >= epoch)
     }
 
     #[cfg(test)]
     pub(crate) fn publish_for_test(&self, epoch: u64) {
-        self.publish(epoch);
+        self.publish_at(epoch, Some(0));
     }
 
     /// Block until paint `epoch` is on glass, or `deadline` passes.
@@ -127,7 +175,7 @@ impl PresentationClock {
             .presented
             .lock()
             .map_err(|_| "presentation clock poisoned".to_string())?;
-        while *presented < epoch {
+        while presented.epoch < epoch {
             let left = deadline
                 .checked_duration_since(Instant::now())
                 .filter(|left| !left.is_zero())
@@ -177,9 +225,19 @@ fn presentation_completed() -> Result<u128, String> {
 pub(crate) struct NoticePresentation {
     epoch: u64,
     clock: Arc<PresentationClock>,
+    after: Arc<Mutex<Option<u128>>>,
 }
 
 impl NoticePresentation {
+    /// Physical confirmation must be generated after this screen completed.
+    pub fn answers(&self, timestamp: u128) -> bool {
+        self.on_glass()
+            && self
+                .after
+                .lock()
+                .is_ok_and(|after| after.is_some_and(|after| timestamp > after))
+    }
+
     pub fn on_glass(&self) -> bool {
         self.clock.reached(self.epoch)
     }
@@ -191,10 +249,12 @@ impl NoticePresentation {
 
     #[cfg(test)]
     pub(crate) fn for_test(clock: &Arc<PresentationClock>, epoch: u64) -> Self {
-        Self {
-            epoch,
-            clock: Arc::clone(clock),
-        }
+        clock.notice(epoch)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn completed_for_test(&self, timestamp: u128) {
+        *self.after.lock().unwrap() = Some(timestamp);
     }
 }
 
@@ -3012,10 +3072,7 @@ impl Runtime {
         }
         let epoch = self.paints.checked_add(1).ok_or("paint epochs exhausted")?;
         self.paint_attention_field(field)?;
-        Ok(NoticePresentation {
-            epoch,
-            clock: Arc::clone(&self.presented),
-        })
+        Ok(self.presented.notice(epoch))
     }
 
     fn paint_attention_field(&mut self, field: crate::attention::Field) -> Result<(), String> {
@@ -3065,10 +3122,7 @@ impl Runtime {
         self.scene.set_attention_notice(notice);
         self.owed_damage = Damage::Whole;
         self.repaint()?;
-        Ok(NoticePresentation {
-            epoch,
-            clock: Arc::clone(&self.presented),
-        })
+        Ok(self.presented.notice(epoch))
     }
 
     /// Whether the lock surface is up (td-login/TOKEN-LOGIN.md, "Session
@@ -3169,10 +3223,7 @@ impl Runtime {
         suspended?;
         focused?;
         painted?;
-        Ok(NoticePresentation {
-            epoch: epoch?,
-            clock: Arc::clone(&self.presented),
-        })
+        Ok(self.presented.notice(epoch?))
     }
 
     /// Leaves the lock surface, once root reported a login unlock's success
@@ -7896,6 +7947,27 @@ mod tests {
 
     /// An attention screen set while a flip is in flight is owed, and on
     /// glass only once its own paint completes, not the earlier flip.
+    #[test]
+    fn notice_confirmations_keep_their_own_completion_cutoff() {
+        let clock = Arc::new(PresentationClock::default());
+        let deferred = clock.notice(2);
+        clock.publish_at(1, Some(10));
+        assert!(!deferred.answers(30));
+        clock.publish_at(2, Some(20));
+        assert!(!deferred.answers(19));
+        assert!(!deferred.answers(20));
+        assert!(deferred.answers(21));
+        let synchronous = clock.notice(2);
+        assert!(!synchronous.answers(20));
+        assert!(synchronous.answers(21));
+        clock.publish_at(3, Some(40));
+        assert!(deferred.answers(21));
+        assert!(synchronous.answers(21));
+        let unreadable = clock.notice(4);
+        clock.publish_at(4, None);
+        assert!(!unreadable.answers(u128::MAX));
+    }
+
     #[test]
     fn an_attention_screen_is_on_glass_only_with_its_own_frame() {
         let (chain, _log) = crate::drm::testing::chain(800, 600);

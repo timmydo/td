@@ -341,6 +341,7 @@ struct KeyBindings {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 enum LoginScreen {
+    Power(crate::authority::consent::Power),
     #[default]
     Closed,
     Menu,
@@ -491,7 +492,7 @@ impl KeyBindings {
                 && !attention_held
                 && event.value == KEY_PRESS
             {
-                self.select(event.code, &mut decision);
+                self.select(event.code, event.timestamp, &mut decision);
                 self.secret_selected |= decision.secret.is_some();
             }
             if self.attention == AttentionState::Open
@@ -741,7 +742,7 @@ impl KeyBindings {
     /// A fresh physical press on the open attention screen, from a device it
     /// reads, before the lifetime's one operation: a menu selection, `K`'s
     /// key-management screen, or a choice on that screen.
-    fn select(&mut self, code: u16, decision: &mut KeyDecision) {
+    fn select(&mut self, code: u16, timestamp: u128, decision: &mut KeyDecision) {
         use crate::attention::Notice;
         use crate::authority::consent::{Recovery, Role};
         use crate::secret_client::{Elevation, LoginSelection, Removal, Selection};
@@ -752,6 +753,17 @@ impl KeyBindings {
                 .as_ref()
                 .is_some_and(crate::runtime::NoticePresentation::on_glass)
         {
+            return;
+        }
+        if let LoginScreen::Power(choice) = self.login_screen {
+            if code == KEY_ENTER
+                && self
+                    .login_shown
+                    .as_ref()
+                    .is_some_and(|shown| shown.answers(timestamp))
+            {
+                decision.secret = Some(Selection::Power(choice));
+            }
             return;
         }
         if let LoginScreen::Authorize(chosen) = &self.login_screen {
@@ -903,6 +915,16 @@ impl KeyBindings {
             return;
         }
         decision.secret = match code {
+            KEY_F | KEY_P => {
+                let choice = if code == KEY_F {
+                    crate::authority::consent::Power::Restart
+                } else {
+                    crate::authority::consent::Power::Off
+                };
+                self.login_screen = LoginScreen::Power(choice);
+                decision.notice = Some(Notice::PowerConfirm(choice));
+                None
+            }
             KEY_W => Some(Selection::Write),
             KEY_I => Some(Selection::Install),
             KEY_U => Some(Selection::Unlock(Role::Primary)),
@@ -10658,6 +10680,42 @@ mod tests {
         let login = crate::authority::Login::default();
         login.answer(&answer).unwrap();
         login
+    }
+
+    #[test]
+    fn power_choices_require_a_presented_prompt_and_fresh_enter() {
+        use crate::attention::Notice;
+        use crate::authority::consent::Power;
+        use crate::secret_client::Selection;
+        for (code, choice) in [(KEY_F, Power::Restart), (KEY_P, Power::Off)] {
+            let target = Mutex::new(RecordingTarget::default());
+            let bindings = attention_bindings(None);
+            read_reports(&target, &bindings, 0, &chord_reports(10));
+            read_reports(&target, &bindings, 0, &presses(&[code], 20));
+            assert_eq!(
+                target.lock().unwrap().notices.last(),
+                Some(&Notice::PowerConfirm(choice))
+            );
+            assert!(target.lock().unwrap().secret_roles.is_empty());
+            let shown = bindings.lock().unwrap().login_shown.take();
+            read_reports(&target, &bindings, 0, &presses(&[KEY_ENTER], 30));
+            assert!(target.lock().unwrap().secret_roles.is_empty());
+            shown.as_ref().unwrap().completed_for_test(32_000_000);
+            bindings.lock().unwrap().login_shown = shown;
+            // Already queued before painting, though processed after completion.
+            read_reports(&target, &bindings, 0, &presses(&[KEY_ENTER], 31));
+            assert!(target.lock().unwrap().secret_roles.is_empty());
+            bindings.lock().unwrap().attention_excluded.insert(1);
+            read_reports(&target, &bindings, 1, &presses(&[KEY_ENTER], 35));
+            assert!(target.lock().unwrap().secret_roles.is_empty());
+            read_reports(&target, &bindings, 0, &presses(&[KEY_ENTER], 40));
+            assert_eq!(
+                target.lock().unwrap().secret_roles,
+                vec![Selection::Power(choice)]
+            );
+            read_reports(&target, &bindings, 0, &presses(&[KEY_ENTER, code], 50));
+            assert_eq!(target.lock().unwrap().secret_roles.len(), 1);
+        }
     }
 
     const ENROLLED: [[u8; 4]; 3] = [[0xa1; 4], [0xa2; 4], [0xa3; 4]];

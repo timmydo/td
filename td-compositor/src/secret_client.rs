@@ -363,6 +363,7 @@ pub(crate) enum Selection {
     Install,
     Login(LoginSelection),
     Elevation(Elevation),
+    Power(crate::authority::consent::Power),
 }
 impl From<Role> for Selection {
     fn from(role: Role) -> Self {
@@ -372,7 +373,9 @@ impl From<Role> for Selection {
 impl Selection {
     fn operation(&self) -> Option<Operation> {
         Some(match self {
-            Self::Write | Self::Install | Self::Login(_) | Self::Elevation(_) => return None,
+            Self::Write | Self::Install | Self::Login(_) | Self::Elevation(_) | Self::Power(_) => {
+                return None
+            }
             Self::Unlock(role) => Operation::Unlock { role: *role },
             Self::Enroll(recovery) => Operation::Enroll {
                 platform: Platform::TpmPcr7,
@@ -383,6 +386,7 @@ impl Selection {
     }
     fn request(&self) -> Result<Vec<u8>, String> {
         Ok(match self {
+            Self::Power(choice) => vec![0x21, choice.byte()],
             Self::Write => vec![0x18],
             Self::Install => vec![0x19],
             Self::Unlock(Role::Primary) => vec![0x12, 1],
@@ -1838,7 +1842,18 @@ impl Client {
         if let Some(shown) = self.restarting(&attempt) {
             return shown;
         }
+        if matches!(attempt.selection, Selection::Power(_)) && !attempt.commit() {
+            return Ok(());
+        }
         let response = wire.exchange(&attempt.selection.request()?)?;
+        if let Selection::Power(choice) = attempt.selection {
+            return match response.as_slice() {
+                [0xa1, 0] => attempt.notice(Notice::PowerAccepted(choice)),
+                [0xa1, 1] => attempt.notice(Notice::Busy),
+                [0xa1, 2] => attempt.notice(Notice::PowerFailed),
+                _ => Err("invalid power response".into()),
+            };
+        }
         if attempt.selection == Selection::Write && response == [0x98, 0] {
             return attempt.notice(crate::attention::Notice::NoWrite);
         }
@@ -3159,6 +3174,74 @@ mod tests {
             },
         };
         Request::new([42; 32], 1000, operation).unwrap()
+    }
+
+    #[test]
+    fn power_uses_only_its_fixed_request_and_rejects_other_replies() {
+        use crate::authority::consent::Power;
+        for choice in [Power::Restart, Power::Off] {
+            for reply in [
+                vec![0xa1, 0],
+                vec![0xa1, 1],
+                vec![0xa1, 2],
+                vec![0xa1, 3],
+                vec![0x99, 0],
+            ] {
+                let mut screen = Screen::new();
+                Arc::get_mut(&mut screen.attempt).unwrap().selection = Selection::Power(choice);
+                let accepted = matches!(reply.as_slice(), [0xa1, 0..=2]);
+                let mut wire = Wire {
+                    replies: VecDeque::from([reply]),
+                    calls: vec![],
+                    typist: None,
+                };
+                let mut client = Client::default();
+                assert_eq!(
+                    client.start(&mut wire, Arc::clone(&screen.attempt)).is_ok(),
+                    accepted
+                );
+                assert_eq!(wire.calls, vec![vec![0x21, choice.byte()]]);
+                client.tick(&mut wire).unwrap();
+                assert_eq!(wire.calls.len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn power_submission_claims_commit_and_never_sends_a_cancelled_attempt() {
+        use crate::authority::consent::Power;
+        for cancel in [true, false] {
+            let mut screen = Screen::new();
+            Arc::get_mut(&mut screen.attempt).unwrap().selection = Selection::Power(Power::Restart);
+            if cancel {
+                screen.attempt.cancel();
+            }
+            struct PowerWire {
+                attempt: Arc<Attempt>,
+                sent: bool,
+            }
+            impl Exchange for PowerWire {
+                fn send(&mut self, bytes: &[u8]) -> Result<(), String> {
+                    assert_eq!(self.attempt.state.load(Ordering::SeqCst), COMMITTED);
+                    assert_eq!(bytes, [0x21, 0]);
+                    self.sent = true;
+                    // Cancellation after the execution decision cannot retract it.
+                    self.attempt.cancel();
+                    Ok(())
+                }
+                fn receive(&mut self) -> Result<Vec<u8>, String> {
+                    Ok(vec![0xa1, 0])
+                }
+            }
+            let mut wire = PowerWire {
+                attempt: Arc::clone(&screen.attempt),
+                sent: false,
+            };
+            Client::default()
+                .start(&mut wire, Arc::clone(&screen.attempt))
+                .unwrap();
+            assert_eq!(wire.sent, !cancel);
+        }
     }
 
     fn elevation_screen(elevation: Elevation) -> Screen {

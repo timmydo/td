@@ -717,7 +717,7 @@ fn request(bytes: &[u8]) -> Result<Request, String> {
             Ok(Request::Poll(handle))
         }
         [3] => Ok(Request::Heartbeat),
-        [0x10..=0x20, ..] => Ok(Request::Secret(crate::session::Request::decode(bytes)?)),
+        [0x10..=0x21, ..] => Ok(Request::Secret(crate::session::Request::decode(bytes)?)),
         _ => Err("invalid terminal authority request".into()),
     }
 }
@@ -938,6 +938,13 @@ fn enrollment_dispatch_reaches_the_secret_decoder() -> Result<(), String> {
         Request::Secret(crate::session::Request::LoginState)
     );
     assert!(request(&[0x1a, 0]).is_err());
+    for choice in [crate::consent::Power::Restart, crate::consent::Power::Off] {
+        assert_eq!(
+            request(&[0x21, choice.byte()])?,
+            Request::Secret(crate::session::Request::Power(choice))
+        );
+    }
+    assert!(request(&[0x21, 2]).is_err());
     assert_eq!(
         request(&[0x1d])?,
         Request::Secret(crate::session::Request::Rollback)

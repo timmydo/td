@@ -1203,6 +1203,26 @@ must invalidate authority before committing any write or release. The
 renderer and its private session client are specified in
 `td-compositor/DESIGN.md`.
 
+## Physical console power
+
+The admitted compositor's private session request `21 00` asks for restart;
+`21 01` asks for power off. Other lengths or values refuse. The compositor
+requires a fresh physical choice on secure attention, then a visible named
+confirmation and fresh Enter timestamped after its frame completed; Escape cancels before the request. No public
+socket, application request, account password or token enrollment is involved.
+This authorizes only physical console power, never a credential operation.
+
+Root requires a prepared, idle session and refuses while revocation is
+restarting. It runs only `/bin/td-svc reboot` or `/bin/td-svc poweroff`, with
+empty environment, `/` cwd and no inherited channel. The existing bounded
+inspection helper caps stdout at 128 bytes and the exchange at two seconds,
+then reaps within 50 ms. Only successful exit and the exact supervisor
+acceptance for the chosen verb count as success. Reply `a1 00` means accepted,
+`a1 01` busy/unprepared, and `a1 02` failed or uncertain. The client claims the same atomic execution decision as other commits before
+sending; cancellation that wins first sends nothing. There is no automatic
+retry: a lost reply may follow acceptance. The ordinary supervisor performs
+ordered service teardown, sync and unmount before the power applet.
+
 ## Private token child supervision
 
 `unlock.rs` owns one root-private `td-secret unlock-operation --uid

@@ -12,6 +12,15 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+fn power_request(choice: crate::consent::Power) -> Option<Vec<u8>> {
+    let mut command = Command::new("/bin/td-svc");
+    command.arg(choice.verb());
+    let mut helper = Inspection::printing(command, 128, Duration::from_secs(2)).ok()?;
+    let reply = helper.wait();
+    helper.reap_within(Duration::from_millis(50));
+    reply
+}
+
 const CLEANUP_TIME: Duration = Duration::from_secs(2);
 
 #[derive(Debug, PartialEq, Eq)]
@@ -38,6 +47,7 @@ pub(crate) enum Request {
     Hostname,
     /// `1f`: whether a hostname change waits, and the intake's backoff.
     HostnameState,
+    Power(crate::consent::Power),
     /// `20`: a storage operation (amendment 10).
     Storage(crate::storage::Selection),
 }
@@ -57,6 +67,7 @@ impl Request {
                 | Self::Rollback
                 | Self::Hostname
                 | Self::Storage(_)
+                | Self::Power(_)
         )
     }
 
@@ -71,6 +82,7 @@ impl Request {
             [0x1d] => Ok(Self::Rollback),
             [0x1e] => Ok(Self::Hostname),
             [0x1f] => Ok(Self::HostnameState),
+            [0x21, choice] => Ok(Self::Power(crate::consent::Power::decode(*choice)?)),
             [0x12, 1] => Ok(Self::Begin(Role::Primary)),
             [0x12, 2] => Ok(Self::Begin(Role::Recovery)),
             [0x16, 0] => Ok(Self::Enroll(Recovery::Unrecoverable)),
@@ -407,6 +419,7 @@ impl Session {
                 Path::new(crate::login_tier::VOLUME),
             ),
             Request::Hostname => self.begin_hostname(crate::elevation::Table::load),
+            Request::Power(choice) => self.power(choice, power_request),
             // Beside any operation: the menu's row reads it.
             Request::HostnameState => {
                 self.tick()?;
@@ -548,6 +561,27 @@ impl Session {
                 }
             }
         }
+    }
+
+    fn power(
+        &mut self,
+        choice: crate::consent::Power,
+        run: impl FnOnce(crate::consent::Power) -> Option<Vec<u8>>,
+    ) -> Result<Vec<u8>, String> {
+        if !self.prepared
+            || self.cleanup.is_some()
+            || self.operation.is_some()
+            || self.inspection.is_some()
+        {
+            return Ok(vec![0xa1, 1]);
+        }
+        let verb = choice.verb();
+        let reply = run(choice);
+        let accepted = reply.is_some_and(|bytes| {
+            bytes == format!("{verb} requested\n").as_bytes()
+                || bytes == format!("shutdown already in progress ({verb})\n").as_bytes()
+        });
+        Ok(vec![0xa1, if accepted { 0 } else { 2 }])
     }
 
     /// Request 19: on a live boot the open disk review, which no principal

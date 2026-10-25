@@ -8,6 +8,9 @@ pub(crate) enum Notice {
     /// screen opened.
     Menu(HostnameIntake),
     Pending,
+    PowerConfirm(crate::authority::consent::Power),
+    PowerAccepted(crate::authority::consent::Power),
+    PowerFailed,
     Unlocked,
     Stored,
     NoWrite,
@@ -661,6 +664,11 @@ fn notice_rows(notice: Notice) -> Vec<String> {
     let first = match notice {
         Notice::Menu(_) => "U: UNLOCK  R: RECOVERY TOKEN",
         Notice::Pending => "PREPARING REQUEST",
+        Notice::PowerConfirm(crate::authority::consent::Power::Restart) => "RESTART THE COMPUTER?",
+        Notice::PowerConfirm(crate::authority::consent::Power::Off) => "POWER OFF THE COMPUTER?",
+        Notice::PowerAccepted(crate::authority::consent::Power::Restart) => "RESTART REQUESTED",
+        Notice::PowerAccepted(crate::authority::consent::Power::Off) => "POWER OFF REQUESTED",
+        Notice::PowerFailed => "POWER REQUEST FAILED - REOPEN TO TRY AGAIN",
         Notice::NoInstall => "NO INSTALLATION IS READY TO REVIEW",
         Notice::UpdateRefused => "UPDATE CANNOT READ LOGIN KEYS",
         Notice::Installed => "SYSTEM INSTALLED - RESTART TO BOOT IT",
@@ -713,6 +721,7 @@ fn notice_rows(notice: Notice) -> Vec<String> {
         }
     };
     let rest: &[&str] = match notice {
+        Notice::PowerConfirm(_) => &["ENTER TO CONFIRM", "UNSAVED WORK MAY BE LOST"],
         Notice::Menu(_) => &[
             "E: ENROLL TWO TOKENS (HAVE BOTH READY)",
             "X: ENROLL WITHOUT RECOVERY - LOSS IS FINAL",
@@ -785,6 +794,7 @@ fn notice_rows(notice: Notice) -> Vec<String> {
     if let Notice::Menu(intake) = notice {
         rows.push(hostname_row(intake));
         rows.push("S: DISK ENCRYPTION".into());
+        rows.push("F: RESTART  P: POWER OFF".into());
     }
     rows
 }
@@ -1123,11 +1133,10 @@ mod tests {
     /// 1280x800 output, as before `L`: the title at 276, the selections
     /// from 312 and `I` at 456, 36 apart; `K` below `I`, `L` below `K` at
     /// 528, `B` below `L` at 564, `H` below `B` at 600, `S` below `H` at
-    /// 636, and the last row, which every other screen keeps at 528, four
-    /// lower at 672. On 800x600 the twelve rows start at 176, and on
-    /// 320x200, at single scale, the fit rule moves them up to 0.
+    /// 636, power at 672 and Escape at 708. On 800x600 the thirteen
+    /// rows start at 153; on 320x200 they close to a 16-pixel pitch.
     #[test]
-    fn the_menu_keeps_its_rows_and_adds_k_l_b_h_and_s_below_i() {
+    fn the_menu_keeps_its_large_output_rows_and_fits_power_choices() {
         const MENU: &[&str] = &[
             "TD SECURE ATTENTION",
             "U: UNLOCK  R: RECOVERY TOKEN",
@@ -1140,12 +1149,13 @@ mod tests {
             "B: ROLL BACK TO THE PREVIOUS SYSTEM",
             "H: NO HOSTNAME CHANGE WAITING",
             "S: DISK ENCRYPTION",
+            "F: RESTART  P: POWER OFF",
             "ESC TO RETURN",
         ];
         for (width, height, top, scale, pitch) in [
             (1280, 800, 276, 2, 36),
-            (800, 600, 176, 2, 36),
-            (320, 200, 0, 1, 17),
+            (800, 600, 153, 2, 36),
+            (320, 200, 0, 1, 16),
         ] {
             let stride = width * 4;
             let mut painted = vec![0; stride * height];
@@ -1221,7 +1231,7 @@ mod tests {
                 notice_rows(Notice::Menu(HostnameIntake::decode(answer).unwrap()))
                     .iter()
                     .rev()
-                    .nth(1)
+                    .nth(2)
                     .map(String::as_str),
                 Some(text)
             );
@@ -1308,6 +1318,10 @@ mod tests {
                     // Newer than HEAD's painter, which clipped it where it
                     // is now wrapped; where it fits one row it is the same.
                     if *notice == Notice::Returning && width < 24 + RETURNING_NOTICE.len() * 16 {
+                        continue;
+                    }
+                    // The additional power row moves only the 800x600 menu up.
+                    if !draining && matches!(notice, Notice::Menu(_)) && height == 600 {
                         continue;
                     }
                     let stride = width * 4;
@@ -1655,6 +1669,11 @@ mod tests {
     #[test]
     fn login_screens_and_ends_fit_and_draw_every_glyph() {
         let notices = [
+            Notice::PowerConfirm(crate::authority::consent::Power::Restart),
+            Notice::PowerConfirm(crate::authority::consent::Power::Off),
+            Notice::PowerAccepted(crate::authority::consent::Power::Restart),
+            Notice::PowerAccepted(crate::authority::consent::Power::Off),
+            Notice::PowerFailed,
             Notice::LoginKeys,
             Notice::StateUnknown,
             Notice::Removing {
@@ -1841,8 +1860,8 @@ mod tests {
                 .enumerate()
                 .collect();
             assert_eq!(rows[5], (5, "I: REVIEW PENDING SYSTEM INSTALLATION".into()));
-            rows.push((11, text.into()));
-            rows.push((12, "ESC TO RETURN".into()));
+            rows.push((12, text.into()));
+            rows.push((13, "ESC TO RETURN".into()));
             let rows: Vec<(usize, &str)> =
                 rows.iter().map(|(at, row)| (*at, row.as_str())).collect();
             assert!(painted == expected(&rows), "menu {text}");

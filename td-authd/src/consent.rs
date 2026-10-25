@@ -17,6 +17,37 @@ pub const USERNAME_BYTES: usize = 32;
 const ABSENT_LABEL: u8 = 0xff;
 const TRUNCATED_LABEL: u8 = 0x80;
 
+/// Fixed physical console power choices; never an arbitrary supervisor verb.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Power {
+    Restart,
+    Off,
+}
+
+impl Power {
+    pub fn byte(self) -> u8 {
+        match self {
+            Self::Restart => 0,
+            Self::Off => 1,
+        }
+    }
+
+    pub fn decode(byte: u8) -> Result<Self, String> {
+        match byte {
+            0 => Ok(Self::Restart),
+            1 => Ok(Self::Off),
+            _ => Err("invalid power choice".into()),
+        }
+    }
+
+    pub fn verb(self) -> &'static str {
+        match self {
+            Self::Restart => "reboot",
+            Self::Off => "poweroff",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Role {
     Primary,

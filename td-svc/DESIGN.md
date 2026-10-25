@@ -1251,6 +1251,11 @@ also requests only `poweroff` through this existing control socket, after
 validating the compositor-owned fixed VM request. It runs after and requires
 seat setup, uses ordinary process-group supervision, and has no authority
 channel exposed to the human UID. See [td-vm-guest](../td-vm-guest/DESIGN.md#fixed-root-power-worker).
+The paired root td-authd also accepts fixed restart/power-off requests from
+the compositor after its physical secure-attention confirmation. It invokes
+only this supervisor client, with bounded output and exact acceptance checks
+(td-authd/DESIGN.md, "Physical console power"). It grants the human UID no
+access to this control socket.
 The root installation service (`td-install serve`) runs `/bin/td-svc reboot`
 or `/bin/td-svc poweroff` likewise, only for the restart or power-off the
 live installer asks for while an installation is complete

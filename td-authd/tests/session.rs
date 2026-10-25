@@ -2420,3 +2420,56 @@ fn production_refuses_every_storage_operation_before_any_worker_starts() {
     );
     assert_eq!(login_end(&mut session)[..4], [0x91, 0x0d, 0x80, 0]);
 }
+
+#[test]
+fn power_is_a_fixed_prepared_idle_session_request_with_exact_replies() {
+    use crate::consent::Power;
+    for choice in [Power::Restart, Power::Off] {
+        assert_eq!(
+            Request::decode(&[0x21, choice.byte()]).unwrap(),
+            Request::Power(choice)
+        );
+        let mut session = quiet();
+        assert_eq!(
+            session
+                .power(choice, |_| panic!("unprepared power request"))
+                .unwrap(),
+            [0xa1, 1]
+        );
+        prepare(&mut session);
+        for reply in [
+            format!("{} requested\n", choice.verb()),
+            format!("shutdown already in progress ({})\n", choice.verb()),
+        ] {
+            assert_eq!(
+                session
+                    .power(choice, |received| {
+                        assert_eq!(received, choice);
+                        Some(reply.into_bytes())
+                    })
+                    .unwrap(),
+                [0xa1, 0]
+            );
+        }
+        for reply in [
+            None,
+            Some(b"success\n".to_vec()),
+            Some(b"halt requested\n".to_vec()),
+        ] {
+            assert_eq!(session.power(choice, |_| reply).unwrap(), [0xa1, 2]);
+        }
+        session.inspection = Some(
+            Inspection::printing(fixture("cleanup_child"), 128, Duration::from_secs(2)).unwrap(),
+        );
+        assert_eq!(
+            session
+                .power(choice, |_| panic!("busy power request"))
+                .unwrap(),
+            [0xa1, 1]
+        );
+        session.close_with(|_| fixture("cleanup_child")).unwrap();
+    }
+    for bytes in [&[0x21][..], &[0x21, 2], &[0x21, 0, 0]] {
+        assert!(Request::decode(bytes).is_err());
+    }
+}
