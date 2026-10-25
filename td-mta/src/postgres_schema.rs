@@ -220,9 +220,9 @@ pub(crate) async fn lock_and_inspect(client: &Client) -> Result<Receipt, Error> 
     let mut timing = crate::performance::Timer::start(crate::performance::Phase::DbSchema);
     version(client).await?;
     let locked: bool = client
-        .query_one(
+        .query_typed_one(
             "SELECT pg_catalog.pg_try_advisory_lock_shared($1)",
-            &[&MIGRATION_KEY],
+            &[(&MIGRATION_KEY, tokio_postgres::types::Type::INT8)],
         )
         .await
         .map_err(|_| Error::Database)?

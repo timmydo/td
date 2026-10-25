@@ -13,7 +13,7 @@ use std::{
     time::Instant,
 };
 use td_crypto::{Crypto, Digest, Entropy, Provider, SystemEntropy, TrustStore};
-use tokio_postgres::Client;
+use tokio_postgres::{types::Type, Client};
 
 #[path = "postgres_device_list.rs"]
 mod listing;
@@ -375,8 +375,8 @@ pub(crate) async fn authenticate(
     account: AccountId,
     presented: Presented,
 ) -> Result<Option<DeviceId>, Error> {
-    let rows = client.query("SELECT salt,verifier,revoked_at FROM td_mta.devices WHERE account=$1 AND id=$2 LIMIT 2",
-                &[&account.as_bytes().as_slice(), &presented.id().as_bytes().as_slice()])
+    let rows = client.query_typed("SELECT salt,verifier,revoked_at FROM td_mta.devices WHERE account=$1 AND id=$2 LIMIT 2",
+                &[(&account.as_bytes().as_slice(), Type::BYTEA), (&presented.id().as_bytes().as_slice(), Type::BYTEA)])
                 .await.map_err(|_| Error::Database)?;
     if rows.len() > 1 {
         return Err(Error::Invalid);

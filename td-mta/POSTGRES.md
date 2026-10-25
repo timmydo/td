@@ -5113,7 +5113,11 @@ The schema, role, policy, owner, health, receipt and recipient reads use
 explicit PostgreSQL parameter types so the driver can send each query in
 one round trip without separately preparing and closing a statement. SQL
 ordering, lock lifetimes and fresh observations are unchanged; no result
-is cached between validation turns.
+is cached between validation turns. The same single-round-trip calls cover
+primary read snapshot selection and account state, device-token reads, body
+reauthorization, Email/query pagination/counts and thread membership windows.
+Their nullable parameters retain explicit bytea or bigint types; predicates,
+ordering, result-cardinality checks and authorization boundaries are unchanged.
 
 Native fixtures verify two checks on one backend, idle state after rollback,
 and an independent connection acquiring exclusive migration and conflicting

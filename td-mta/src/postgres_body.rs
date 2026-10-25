@@ -413,9 +413,9 @@ async fn reauthorize_blob(
     client.batch_execute("BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL idle_in_transaction_session_timeout=10000").await.map_err(|_|Error::Database)?;
     check_selection(client, &binding, true).await?;
     client
-        .query_one(
+        .query_typed_one(
             "SELECT id FROM td_mta.accounts WHERE id=$1 FOR SHARE",
-            &[&binding.account().as_bytes().as_slice()],
+            &[(&binding.account().as_bytes().as_slice(), Type::BYTEA)],
         )
         .await
         .map_err(|_| Error::Database)?;
@@ -424,7 +424,7 @@ async fn reauthorize_blob(
         .map_err(Error::Credential)?
         .ok_or(Error::Unauthenticated)?;
     let now: i64 = client
-        .query_one(
+        .query_typed_one(
             "SELECT (extract(epoch FROM clock_timestamp())*1000)::bigint",
             &[],
         )
@@ -449,7 +449,7 @@ async fn check_selection(
         "SELECT generation,version_id FROM td_mta.config_selection WHERE singleton=true"
     };
     let row = client
-        .query_one(query, &[])
+        .query_typed_one(query, &[])
         .await
         .map_err(|_| Error::Database)?;
     let version: Option<&[u8]> = row.try_get(1).map_err(|_| Error::Integrity)?;

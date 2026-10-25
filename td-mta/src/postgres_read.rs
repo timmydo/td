@@ -719,7 +719,7 @@ impl Snapshot<'_> {
             let account = identity.account.as_bytes().as_slice();
             let mailbox = mailbox.as_ref().map(|id|id.as_slice());
             if query.calculate_total {
-                let row=client.query_one("SELECT count(*) FROM td_mta.emails e WHERE e.account=$1 AND ($2::bytea IS NULL OR EXISTS (SELECT 1 FROM td_mta.memberships m WHERE m.account=e.account AND m.email_id=e.id AND m.mailbox_id=$2)) AND ($3::bigint IS NULL OR e.received_at >= $3) AND ($4::bigint IS NULL OR e.received_at < $4)", &[&account,&mailbox,&query.after,&query.before]).await.map_err(|_|Error::Database)?;
+                let row=client.query_typed_one("SELECT count(*) FROM td_mta.emails e WHERE e.account=$1 AND ($2::bytea IS NULL OR EXISTS (SELECT 1 FROM td_mta.memberships m WHERE m.account=e.account AND m.email_id=e.id AND m.mailbox_id=$2)) AND ($3::bigint IS NULL OR e.received_at >= $3) AND ($4::bigint IS NULL OR e.received_at < $4)", &[(&account,Type::BYTEA),(&mailbox,Type::BYTEA),(&query.after,Type::INT8),(&query.before,Type::INT8)]).await.map_err(|_|Error::Database)?;
                 let total:i64=row.try_get(0).map_err(|_|Error::Integrity)?;
                 page.total=Some(u64::try_from(total).map_err(|_|Error::Integrity)?);
             }
@@ -730,7 +730,7 @@ impl Snapshot<'_> {
             } else {
                 "SELECT e.id,e.received_at,e.changed,m.changed FROM td_mta.emails e LEFT JOIN td_mta.memberships m ON m.account=e.account AND m.email_id=e.id AND m.mailbox_id=$2 WHERE e.account=$1 AND ($2::bytea IS NULL OR m.email_id IS NOT NULL) AND ($5::bigint IS NULL OR e.received_at >= $5) AND ($6::bigint IS NULL OR e.received_at < $6) ORDER BY e.received_at DESC,e.id ASC LIMIT $3 OFFSET $4"
             };
-            let rows=client.query(sql,&[&account,&mailbox,&limit,&position,&query.after,&query.before]).await.map_err(|_|Error::Database)?;
+            let rows=client.query_typed(sql,&[(&account,Type::BYTEA),(&mailbox,Type::BYTEA),(&limit,Type::INT8),(&position,Type::INT8),(&query.after,Type::INT8),(&query.before,Type::INT8)]).await.map_err(|_|Error::Database)?;
             page.ids.try_reserve_exact(query.limit).map_err(|_|Error::Capacity)?;
             page.has_more=rows.len()>query.limit;
             let mut previous:Option<(i64,[u8;16])>=None;
@@ -778,13 +778,13 @@ impl Snapshot<'_> {
         let result=self.worker.run(|client|Box::pin(async move {
             let account=identity.account.as_bytes().as_slice();
             let thread_bytes=thread.as_bytes().as_slice();
-            let row=client.query_opt("SELECT changed FROM td_mta.threads WHERE account=$1 AND id=$2", &[&account,&thread_bytes]).await.map_err(|_|Error::Database)?;
+            let row=client.query_typed_opt("SELECT changed FROM td_mta.threads WHERE account=$1 AND id=$2", &[(&account,Type::BYTEA),(&thread_bytes,Type::BYTEA)]).await.map_err(|_|Error::Database)?;
             let Some(row)=row else { return Ok(None); };
             check_changed(row.try_get(0).map_err(|_|Error::Integrity)?,identity)?;
             let date=after.map(|entry|entry.received_at);
             let id=after.map(|entry|*entry.email.as_bytes());
             let id=id.as_ref().map(|id|id.as_slice());
-            let rows=client.query("SELECT id,received_at,changed FROM td_mta.emails WHERE account=$1 AND thread_id=$2 AND ($3::bigint IS NULL OR (received_at,id)>($3,$4::bytea)) ORDER BY received_at ASC,id ASC LIMIT $5", &[&account,&thread_bytes,&date,&id,&limit]).await.map_err(|_|Error::Database)?;
+            let rows=client.query_typed("SELECT id,received_at,changed FROM td_mta.emails WHERE account=$1 AND thread_id=$2 AND ($3::bigint IS NULL OR (received_at,id)>($3,$4::bytea)) ORDER BY received_at ASC,id ASC LIMIT $5", &[(&account,Type::BYTEA),(&thread_bytes,Type::BYTEA),(&date,Type::INT8),(&id,Type::BYTEA),(&limit,Type::INT8)]).await.map_err(|_|Error::Database)?;
             let has_more=rows.len()>maximum;
             let mut emails=Vec::new();
             emails.try_reserve_exact(maximum).map_err(|_|Error::Capacity)?;

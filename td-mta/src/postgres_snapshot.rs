@@ -3,7 +3,7 @@ use crate::{
     device_credentials::Presented, format::Sequence, ports::ViewIdentity, postgres_devices,
     postgres_runtime_profile::Binding, postgres_schema,
 };
-use tokio_postgres::Client;
+use tokio_postgres::{types::Type, Client};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Error {
@@ -43,7 +43,7 @@ pub(crate) async fn observe(
         return Err(Error::Policy);
     }
     let selected = client
-        .query_one(
+        .query_typed_one(
             "SELECT generation,version_id FROM td_mta.config_selection WHERE singleton=true",
             &[],
         )
@@ -61,9 +61,9 @@ pub(crate) async fn observe(
         .map_err(Error::Credential)?
         .ok_or(Error::Unauthenticated)?;
     let row = client
-        .query_one(
+        .query_typed_one(
             "SELECT sequence,floor FROM td_mta.accounts WHERE id=$1",
-            &[&binding.account().as_bytes().as_slice()],
+            &[(&binding.account().as_bytes().as_slice(), Type::BYTEA)],
         )
         .await
         .map_err(|_| Error::Database)?;
