@@ -76,6 +76,7 @@ pub struct Principal {
 pub trait Authenticator: Sync {
     /// Called periodically on the fixed authentication worker, outside slots.
     /// Retire local idle resources without issuing authorization queries.
+    /// Busy defers cleanup to the next maintenance turn; other errors stop serving.
     fn maintain(&self) -> Result<(), Error> {
         Ok(())
     }

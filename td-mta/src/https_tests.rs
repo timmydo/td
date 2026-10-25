@@ -141,12 +141,16 @@ fn https_enforces_auth_origin_framing_revocation_and_idle_deadlines() {
         armed: AtomicBool,
         entered: AtomicBool,
         released: AtomicBool,
+        maintenance_busy: AtomicBool,
         maintained: AtomicBool,
         closed: AtomicBool,
     }
     impl http_auth::Authenticator for Delayed<'_> {
         fn maintain(&self) -> Result<(), Error> {
             assert_eq!(std::thread::current().name(), Some("https-auth"));
+            if self.maintenance_busy.swap(false, Ordering::AcqRel) {
+                return Err(Error::Busy);
+            }
             self.maintained.store(true, Ordering::Release);
             Ok(())
         }
@@ -180,6 +184,7 @@ fn https_enforces_auth_origin_framing_revocation_and_idle_deadlines() {
         armed: AtomicBool::new(false),
         entered: AtomicBool::new(false),
         released: AtomicBool::new(false),
+        maintenance_busy: AtomicBool::new(true),
         maintained: AtomicBool::new(false),
         closed: AtomicBool::new(false),
     };

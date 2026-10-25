@@ -427,9 +427,12 @@ impl Https<'_> {
                     let mut maintained = Instant::now();
                     while !done.load(Ordering::Acquire) {
                         if maintained.elapsed() >= Duration::from_secs(1) {
-                            if self.authentication.maintain().is_err() {
-                                control.fail();
-                                return;
+                            match self.authentication.maintain() {
+                                Ok(()) | Err(Error::Busy) => (),
+                                Err(_) => {
+                                    control.fail();
+                                    return;
+                                }
                             }
                             maintained = Instant::now();
                         }

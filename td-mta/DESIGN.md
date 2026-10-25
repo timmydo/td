@@ -2736,7 +2736,9 @@ protocol allowances, thread ownership, retirement and pre-submission recovery.
 The same authentication worker runs throttled local idle maintenance outside
 client-slot locks and closes retained resources before thread exit, including
 early failure paths. Neither hook performs authentication queries or starts a
-new task. Clean completed sessions have a separate bounded termination
+new task. Maintenance Busy defers cleanup to the next throttled turn without
+stopping HTTPS; other maintenance errors still stop serving. Clean completed
+sessions have a separate bounded termination
 allowance; request deadlines, TLS lifetime and failed-job bounds are unchanged.
 
 ## Native ACME deployment profile
