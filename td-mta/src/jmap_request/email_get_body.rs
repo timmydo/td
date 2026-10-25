@@ -12,6 +12,7 @@ use crate::{
     mime_response::{locators::Candidate, part_json::End, root_header_json},
     mime_structure::{self, Part},
     nfc::{HeaderBudget, Scratch},
+    performance::{Outcome, Phase, Timer},
     ports::{BlobReader, Clock, Tick},
     store_fs::PinnedBlob,
 };
@@ -231,6 +232,7 @@ fn write_verified_inner(
         return Err(Error::StorageCapacity);
     }
     let (selected, options) = selection;
+    let header_timing = Timer::start(Phase::JmapHeaders);
     let mut buffered = Buffered {
         inner: output,
         bytes: [0; 4096],
@@ -260,11 +262,13 @@ fn write_verified_inner(
             scratch: &mut scratch,
         },
     )?;
+    header_timing.finish(Outcome::Success);
     if !selected.body() {
         pin.check_deadline().map_err(storage)?;
         worker.flush()?;
         return pin.check_deadline().map_err(storage);
     }
+    let structure_timing = Timer::start(Phase::JmapStructure);
     let parse_limits = mime_structure::Limits {
         header_bytes: limits.header_bytes,
         mime_depth: limits.mime_depth,
@@ -392,9 +396,11 @@ fn write_verified_inner(
         }
         worker.append(b"]")?;
     }
+    structure_timing.finish(Outcome::Success);
     let mut decode_input = buffer(crate::mime_input::INPUT_BYTES)?;
     let mut checkpoints = crate::mime_input::Checkpoints::default();
     if selected.preview {
+        let timing = Timer::start(Phase::JmapPreview);
         let original = crate::blob_body_lists::Retained {
             structure: reborrow(&mut original.structure),
             nodes: original.nodes,
@@ -429,8 +435,10 @@ fn write_verified_inner(
             }
         }
         preview.finish(now(clock)?).map_err(mime)?;
+        timing.finish(Outcome::Success);
     }
     if selected.values {
+        let timing = Timer::start(Phase::JmapBodyValues);
         let original = crate::blob_body_lists::Retained {
             structure: reborrow(&mut original.structure),
             nodes: original.nodes,
@@ -486,6 +494,7 @@ fn write_verified_inner(
             }
         }
         values.finish(now(clock)?).map_err(mime)?;
+        timing.finish(Outcome::Success);
     }
     original
         .structure

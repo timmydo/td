@@ -42,6 +42,10 @@ pub enum Phase {
     JmapWorkDeadline,
     JmapWorkOther,
     HeaderReuse,
+    JmapHeaders,
+    JmapStructure,
+    JmapPreview,
+    JmapBodyValues,
 }
 impl Phase {
     pub const ALL: &'static [Self] = &[
@@ -79,6 +83,10 @@ impl Phase {
         Self::JmapWorkDeadline,
         Self::JmapWorkOther,
         Self::HeaderReuse,
+        Self::JmapHeaders,
+        Self::JmapStructure,
+        Self::JmapPreview,
+        Self::JmapBodyValues,
     ];
     pub const fn code(self) -> &'static str {
         match self {
@@ -116,6 +124,10 @@ impl Phase {
             Self::JmapWorkDeadline => "jmap_work_deadline",
             Self::JmapWorkOther => "jmap_work_other",
             Self::HeaderReuse => "header_reuse",
+            Self::JmapHeaders => "jmap_headers",
+            Self::JmapStructure => "jmap_structure",
+            Self::JmapPreview => "jmap_preview",
+            Self::JmapBodyValues => "jmap_body_values",
         }
     }
 }
@@ -221,7 +233,7 @@ impl Drop for Timer {
     }
 }
 
-pub const MAX_STATUS_BYTES: usize = 8192;
+pub const MAX_STATUS_BYTES: usize = 16 * 1024;
 
 pub(crate) fn encode_status(
     output: &mut crate::bounded::TextBuffer<'_>,

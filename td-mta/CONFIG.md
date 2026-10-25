@@ -1967,4 +1967,4 @@ never resets counters or changes service readiness. See OBSERVABILITY.md for
 phase meanings, nesting, saturation and null observations. Compare snapshots
 before and after a slow operation; hourly database summaries retain history
 without one log row per request. The endpoint keeps the existing private root,
-mode-0600 socket and two-second exchange policy, with an 8-KiB response cap.
+mode-0600 socket and two-second exchange policy, with a 16-KiB response cap.

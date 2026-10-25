@@ -377,18 +377,28 @@ can create gaps. Returned JSON remains data, never executable instructions.
 ## Performance summaries
 
 The service records fixed process-local counters at operation boundaries, never
-per byte or poll. The counter table is bounded to 4 KiB (2,448 bytes on the
-current x86-64 host); status encoding remains bounded to 8 KiB. After one initial minute, then hourly, the diagnostic writer
+per byte or poll. The counter table is bounded to 4 KiB (2,736 bytes on the
+current x86-64 host); status encoding remains bounded to 16 KiB. After one initial minute, then hourly, the diagnostic writer
 submits one `performance` event for each changed phase. Each phase has its own fixed rate bucket; neither
 addresses, account IDs, object IDs, URLs nor SQL can create labels. The same queue,
 severity filter, global ingestion limit, retention ring and physical-pressure
 stop apply. There is no synchronous journal fallback and no per-request event
 flood. These info records require `minimum_severity = info`. Additional summaries
 can shorten history under the existing ring; 30 days remains an age ceiling,
-not a guaranteed retention interval. At the current 34-phase ceiling, four
-profiles add at most 3,264 hourly summary rows per day (plus initial snapshots).
-The 65,536-row ring can hold about 20 days of those rows alone; other events,
+not a guaranteed retention interval. At the current 38-phase ceiling, four
+profiles add at most 3,648 hourly summary rows per day (plus initial snapshots).
+The 65,536-row ring can hold about 18 days of those rows alone; other events,
 frequent restarts and physical pressure can shorten that interval.
+
+The four JMAP interpretation spans are sequential subspans of Email/get, not
+additional time to add to that enclosing span. Each includes work-budget and
+snapshot checks and any response-buffer flush occurring during it. Shared
+setup and final flush/checks can fall outside these subspans. A completed
+subspan can be counted successful even if a later phase or final publication
+fails. Cache hits increment header_reuse and skip interpretation spans.
+Timers start once per selected phase per message, never per scalar or parser
+turn. They retain no account, message, subject or body data. Process-wide
+samples still cannot attribute overlapping requests to a particular click.
 
 Each sample is a cumulative process observation: `calls` counts finished spans,
 `total_us` sums their monotonic elapsed microseconds and `max_us` is their largest
@@ -419,7 +429,7 @@ cost without waiting for historical persistence. It returns schema-1 JSON with
 `command`, `status`, `boot_id`, `config_generation`, nullable `utc_ms` and a
 `phases` object keyed by the closed names below. Every value is the same numeric
 sample as an event; a contended/poisoned cell is null, never a fabricated zero.
-The response is at most 8 KiB including LF, with unchanged two-second control
+The response is at most 16 KiB including LF, with unchanged two-second control
 exchange limits. A service lacking a logging owner returns `unavailable`.
 It is not exposed over public HTTP and supplies no mutation operation.
 
@@ -447,6 +457,10 @@ It is not exposed over public HTTP and supplies no mutation operation.
 | `smtp_data` | Successful DATA admission through recognition of its terminating dot, including the 354 reply, peer arrival and network scheduling; retirement or refusal before completion counts as failure |
 | `smtp_commit_wait` | Completed DATA queued through the first storage-worker publication attempt; expiry or retirement before service counts as failure; excludes later busy retry delays |
 | `jmap_email_get` | Email/get projection time after argument validation through retained result publication; failed JMAP methods count even when the enclosing HTTP response is 200 |
+| `jmap_headers` | Per-message header scratch preparation and root-header decoding/serialization on a cache miss. Excludes prior body verification. |
+| `jmap_structure` | MIME traversal, part metadata, locators, body-list classification and selected part JSON, before body values or preview. |
+| `jmap_preview` | Preview selection, decoding, text extraction and JSON output for one message requesting a preview. |
+| `jmap_body_values` | Body-value selection, decoding and JSON output for one message requesting bodyValues; includes all selected parts. |
 | `header_reuse` | Completed copies of previously verified header projections into provisional response storage; zero-duration count, not body verification or final request success. |
 | `jmap_work_io`, `jmap_work_records`, `jmap_work_output`, `jmap_work_deadline`, `jmap_work_other` | Email/get projections whose shared MIME work meter stopped, split by its sticky reason; duration is the whole projection. Other storage capacity failures do not increment these counters. No message IDs or content are retained. |
 | `smtp_prepare` | Resident SMTP input validation, header preparation and digests for the complete account fanout; excludes DNS and database publication |
