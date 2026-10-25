@@ -32,6 +32,7 @@ use std::{
 
 type Wire = Box<[u8; TLS_WIRE_BYTES]>;
 const SCAN: Duration = Duration::from_millis(5);
+const NETWORK_TURNS: usize = 16;
 
 fn later(clock: &dyn Clock, millis: u64) -> Result<Tick, Error> {
     Ok(Tick(
@@ -533,6 +534,8 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                         stopping = Some(after(now, 5)?);
                     }
                     let mut progress = false;
+                    let mut wake_storage = false;
+                    let mut wake_tls = false;
                     for offset in 0..total {
                         let index = (cursor + offset) % total;
                         let Some(cell) = slots.get(index) else {
@@ -573,7 +576,13 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                                 progress = true;
                             }
                         }
-                        if matches!(slot.phase, Phase::Network) {
+                        for _ in 0..NETWORK_TURNS {
+                            if matches!(slot.phase, Phase::Done) {
+                                slot.phase = Phase::Network;
+                            }
+                            if !matches!(slot.phase, Phase::Network) {
+                                break;
+                            }
                             if stopping.is_some_and(|deadline| deadline.expired(now))
                                 && !final_reply
                             {
@@ -589,7 +598,7 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                                     connection.advance(self.clock.as_ref())
                                 })();
                                 match turn {
-                                    Ok(Progress::Pending) => (),
+                                    Ok(Progress::Pending) => break,
                                     Ok(Progress::Advanced) => progress = true,
                                     Ok(Progress::Closed) | Err(_) => {
                                         slot.phase = Phase::Retire;
@@ -605,10 +614,21 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                                 }
                             }
                         }
+                        match slot.phase {
+                            Phase::Queued {
+                                work: Work::Tls, ..
+                            } => wake_tls = true,
+                            Phase::Queued { .. } | Phase::Retire => wake_storage = true,
+                            _ => (),
+                        }
                     }
                     cursor = (cursor + 1) % total;
-                    storage.thread().unpark();
-                    tls.thread().unpark();
+                    if wake_storage {
+                        storage.thread().unpark();
+                    }
+                    if wake_tls {
+                        tls.thread().unpark();
+                    }
                     if stopping.is_some() && occupied.iter().all(Option::is_none) {
                         break if certificate_failed {
                             Err(Error::Tls)

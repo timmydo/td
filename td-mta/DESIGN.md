@@ -1725,12 +1725,17 @@ existing final replies retain their bounded allowance. The runtime reports
 a TLS failure. This gate also applies to
 plaintext SMTP, which would otherwise never construct a TLS session.
 
-One network loop visits bounded connection slots in rotating order. One
+One network loop visits bounded connection slots in rotating order, with
+at most 16 nonblocking protocol turns per visit. A would-block result or
+queued worker operation ends the visit; each turn retains its deadline
+checks. One
 fixed storage worker performs admission and publication; one fixed TLS
 worker constructs sessions and advances handshakes. The network loop copies
 one decoded DATA line of at most 1000 bytes per connection turn into its
 admitted resident buffer. That copy performs no database, filesystem or peer
-I/O and cannot queue behind another connection's publication. Idle
+I/O and cannot queue behind another connection's publication. Workers are
+woken only for their queued work or retirement, not for inline DATA copies.
+Idle
 connections and pending handshakes retain slots but do not occupy a worker.
 Each slot retains its own queued operation and completion, so dispatch
 reserves result capacity before effects without a separate completion
