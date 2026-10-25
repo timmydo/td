@@ -16,7 +16,6 @@ const REPLY: &str = "TD-LAUNCH-APPLICATION-CHECK-OK\t";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Presentation {
     Direct,
-    Terminal,
     Shell,
 }
 
@@ -43,9 +42,7 @@ fn decimal(text: &str, range: std::ops::RangeInclusive<u32>) -> Result<u32, Stri
 impl Request {
     fn parse(arguments: &[String]) -> Result<Self, String> {
         let [owner, name, mode, separator, rest @ ..] = arguments else {
-            return Err(
-                "application launch requires OWNER APP direct|terminal|shell -- ARG...".into(),
-            );
+            return Err("application launch requires OWNER APP direct|shell -- ARG...".into());
         };
         let owner = decimal(owner, 1000..=1000)?;
         if separator != "--"
@@ -61,12 +58,15 @@ impl Request {
         {
             return Err("invalid application launch arguments".into());
         }
-        let presentation = match mode.as_str() {
-            "direct" => Presentation::Direct,
-            "terminal" => Presentation::Terminal,
-            "shell" if name == "claude" && rest.is_empty() => Presentation::Shell,
-            _ => return Err("application launch presentation must be direct, terminal, or argument-free Claude shell".into()),
-        };
+        let presentation =
+            match mode.as_str() {
+                "direct" => Presentation::Direct,
+                "shell" if name == "claude" && rest.is_empty() => Presentation::Shell,
+                _ => return Err(
+                    "application launch presentation must be direct or argument-free Claude shell"
+                        .into(),
+                ),
+            };
         Ok(Self {
             owner,
             name: name.clone(),
@@ -97,30 +97,16 @@ impl Request {
     fn mode(&self) -> &'static str {
         match self.presentation {
             Presentation::Direct => "direct",
-            Presentation::Terminal => "terminal",
             Presentation::Shell => "shell",
         }
     }
 
+    /// td-jail selects the application by its argv[0], so the launch needs
+    /// no `/bin/APP` link.
     fn application(&self, uid: u32) -> Command {
-        let executable = format!("/bin/{}", self.name);
-        let mut command = match self.presentation {
-            Presentation::Direct | Presentation::Shell => Command::new(executable),
-            Presentation::Terminal => {
-                let mut command = Command::new("/bin/td-term");
-                command.args([
-                    "run",
-                    "--socket",
-                    &format!("/run/td-compositor/{}/wayland-0", self.owner),
-                    "--ready-socket",
-                    &format!("/run/user/{uid}/td-app-{}.ready", self.name),
-                    "--command",
-                    &executable,
-                ]);
-                command
-            }
-        };
+        let mut command = Command::new("/bin/td-jail");
         command
+            .arg0(&self.name)
             .args(&self.arguments)
             .env_clear()
             .current_dir("/")
@@ -324,7 +310,7 @@ mod tests {
     use super::*;
 
     fn request() -> Vec<String> {
-        ["1000", "mail", "terminal", "--", "literal;argument"]
+        ["1000", "mail", "direct", "--", "literal;argument"]
             .map(str::to_string)
             .to_vec()
     }
@@ -425,14 +411,23 @@ mod tests {
                 "65537",
                 "1000",
                 "mail",
-                "terminal",
+                "direct",
                 "--",
                 "literal;argument"
             ]
         );
         let command = request.application(65537);
-        assert_eq!(command.get_program(), "/bin/td-term");
-        assert_eq!(command.get_args().last().unwrap(), "literal;argument");
+        assert_eq!(command.get_program(), "/bin/td-jail");
+        assert_eq!(
+            command
+                .get_args()
+                .map(|s| s.to_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["literal;argument"]
+        );
+        // std exposes no argv[0] getter; its Debug output, not a stable
+        // format, shows a replaced one as `[PROGRAM] "ARGV0"`.
+        assert!(format!("{command:?}").ends_with(r#"["/bin/td-jail"] "mail" "literal;argument""#));
         assert!(command
             .get_envs()
             .all(|(key, _)| key != "TD_CONTROL_SOCKET"));
@@ -447,6 +442,7 @@ mod tests {
             (1, "Mail"),
             (1, ""),
             (2, "shell"),
+            (2, "terminal"),
             (3, "arguments"),
         ] {
             let mut wrong = request();

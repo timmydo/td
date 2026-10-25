@@ -397,18 +397,35 @@ work that would have justified one is either gone or happens earlier.
 
 ### A.0 The launcher
 
-**`/bin/firefox` is a symlink to `td-jail`, which reads its own `argv[0]`
-and looks the name up in the immutable build-time application registry.**
-`/etc/td-applications.tsv` maps the validated name to the exact
-content-addressed package path; `td-init`,
+**td-authd's supervised launch execs `/bin/td-jail` with the application's
+name as `argv[0]`, and td-jail looks that name up in the immutable
+build-time application registry.** `/etc/td-applications.tsv` maps the
+validated name to the exact content-addressed package path; `td-init`,
 `td-util`, `td-login` and `td-sh` are all multicalls keyed on `argv[0]`;
 this is a fifth.
 
+**An application runs only as its own account, so the image gives it no
+`/bin` name.** td-authd starts it after dropping to the UID the deployment
+assigned it (`application-start`, td-authd/DESIGN.md), which is the identity
+its private home, account cache, cgroup and bus registration belong to. A
+shell has none of them, so before any session, cgroup or cache exists
+td-jail refuses a by-name launch whose effective UID is not the one the
+immutable bus policy (`/etc/td-bus-applications.tsv`) assigns that name, in
+one line: `td-jail: firefox runs only as its own application account, not
+uid 1000; td starts it from the desktop, not from a shell`. Stage 1 checks
+the same rule again as it resolves the launch and as it selects the
+session's display. A `/bin/firefox` would only reach that refusal, so the
+image ships none for Firefox, mail or news; their units, and for Firefox
+the compositor's card, start them through td-authd. Claude alone keeps
+`/bin/claude`: as the human, td-jail hands that invocation to Claude's own
+shell server (td-authd/DESIGN.md, "Claude shell launch"), which runs the
+jail under Claude's account.
+
 **`argv[0]` selects, it does not authenticate.** A caller controls
-`argv[0]`, so the only thing it can do is name a *different shipped
-application* — which that caller could have launched directly anyway. The
-security property comes from the table being in the read-only image and
-from the entry point resolving the spec itself.
+`argv[0]`, but a name the immutable policy does not assign to the caller's
+own UID is refused, so the only launch it can select is its own
+application's. The security property comes from the tables being in the
+read-only image and from the entry point resolving the spec itself.
 
 **But this `argv[0]` is an OPEN key, unlike the four multicalls above**,
 and the difference is the whole of the resolver's obligation. `td-init`,
@@ -420,17 +437,18 @@ it is used to build a path. The identity was validated once at build
 (§A); that is the wrong place to rely on, because the string arriving
 here did not come from there.
 
-**The `/bin/<name>` symlinks are a seventh applet farm and are now
-registered as one.** `bin_farms()` enumerates the six closed farms plus this
-open one, and
-`applet_farms_are_disjoint_and_boot_names_stay_static` exists because a
-name in two farms packs two conflicting symlinks for one applet.
-Application names are a new, open-ended, recipe-authored class in the
-same directory — authored by whoever packages an application — so they
-are emitted through `real_root_steps` and added to `bin_farms()`, or the
-collision guard goes stale for exactly the class of name a non-td author
-picks. "A collision is a merge conflict rather than a security event"
-(§A) was written about the application namespace alone and is not true of
+**Application names are a seventh applet farm and are registered as
+one.** `bin_farms()` enumerates the six closed farms plus this open one,
+and `applet_farms_are_disjoint_and_boot_names_stay_static` exists because
+a name in two farms packs two conflicting symlinks for one applet. Only
+`/bin/claude` is linked now, and the image check refuses any `/bin` entry
+for the others; the whole roster stays in the farm, so an applet can
+neither take an application's name nor collide with one that regains a
+link. Application names are a new, open-ended, recipe-authored class in
+the same directory — authored by whoever packages an application — so
+the guard covers them whether or not they are linked, or it goes stale
+for exactly the class of name a non-td author picks. "A collision is a
+merge conflict rather than a security event" (§A) was written about the application namespace alone and is not true of
 its union with the applet farms.
 
 **There is therefore no public `--spec <path>`.** Accepting a spec
@@ -629,8 +647,12 @@ binary exists, and the runtime path is unprivileged end to end.
 ### Process tree
 
 ```
-td-term ─ /bin/sh                          uid 1000, host pid ns
-└─ /bin/firefox -> td-jail                 waits in the caller's session;
+td-svc
+└─ td-authd application-start              root, then one exec chain through
+   = td-jail, argv[0] firefox              td-login exec-service-as to
+                                           uid 65536, host pid ns; leads
+                                           the unit's process group and
+                                           waits there;
    └─ td-jail [stage 1]                    parent-death bound; detached from
       │                                    an ambient terminal, or kept in a
       │                                    proved no-terminal supervisor group,
@@ -642,7 +664,7 @@ td-term ─ /bin/sh                          uid 1000, host pid ns
       │                                    unshare(NEWUSER|NEWNS|NEWPID|
       │                                    NEWUTS[|NEWIPC][|NEWNET]);
       │                                    setgroups=deny, then uid_map
-      │                                    and gid_map "1000 1000 1";
+      │                                    and gid_map "1000 65536 1";
       │                                    prepare root + loopback; carry
       │                                    only ambient CAP_SYS_ADMIN;
       │                                    drop/read bounding set
@@ -657,7 +679,7 @@ td-term ─ /bin/sh                          uid 1000, host pid ns
 
 **The launch parent closes the inherited-terminal boundary without escaping an
 existing supervisor boundary.** `setsid(2)` fails for a process-group leader,
-so the process selected by `/bin/<name>` cannot safely issue it itself. It
+so the process selected by its `argv[0]` cannot safely issue it itself. It
 spawns a child that cannot yet be that leader, passes its own pid, and waits.
 The child first sets `PR_SET_PDEATHSIG=SIGKILL`, proves that exact parent through
 procfs, then reads its containment before it resolves authority or creates
@@ -841,13 +863,14 @@ immutable files:
 Each table admits at most 256 applications and 1 MiB. Keeping the path out of
 the presentation table gives each reader only its own input and closes the
 previous design gap where a three-column row gave `td-jail` no way to locate a
-content-addressed package. The image now selects Firefox into both tables. A
-direct user request remains the literal `/bin/<name>` td-jail route. The
+content-addressed package. The image now selects Firefox into both tables.
+Every launch is td-authd's supervised start, which execs td-jail under the
+application's name (§A.0); there is no direct `/bin/<name>` route. The
 current compositor receives the selected Firefox name as an explicit image
 argument and uses the launcher row only as builder-authenticated metadata; its
-application card activates an already mapped observed surface and does not
-execute `/bin/<name>`. Fully table-driven compositor discovery remains later
-work.
+application card activates an already mapped observed surface or asks root to
+start the service, and never executes td-jail itself. Fully table-driven
+compositor discovery remains later work.
 
 An image selection names the authenticated application identity plus its
 package catalog key and runtime catalog key. The latter two are data inputs.
@@ -1630,8 +1653,8 @@ Firefox bytes as a recipe tool.
 
 The independent target acceptance test is a headless QEMU boot of the built
 system image. The image selects Firefox's declaration; the guest fetches
-the app and runtime from the host's feed (§W.9), launches `/bin/firefox`
-through the immutable application registry,
+the app and runtime from the host's feed (§W.9), launches Firefox
+through td-authd's supervised start and the immutable application registry,
 and, only under the QEMU oracle's exact `td.autotest=1` kernel token, passes it
 a fixed HTTPS document whose full-viewport background has equal solid panels
 of exact RGB `#ff00ff` on the left and `#00ff00` on the right. A trusted root
@@ -2558,7 +2581,7 @@ that user, not because confinement failed. td loses nothing it had; what
 it does not get is a guarantee that the bytes cannot run except behind
 §C, and no sentence anywhere may assume one. The `PT_INTERP` property is
 still worth asserting, demoted to what it actually is: **a check that the
-ordinary path is the jail** — `/bin/firefox` reaches §C or fails, rather
+ordinary path is the jail** — the supervised launch reaches §C or fails, rather
 than half-working outside it and leaving an operator to wonder which
 happened.
 
@@ -2805,9 +2828,10 @@ owns the one instance, started on request or under the oracle's token
 (§W.9); the compositor retains only matching mapped surface keys after
 readiness, and activating the Firefox card switches to and focuses one of
 those surfaces. If none is mapped, the card asks root to start the
-service (`0d`) and never starts a jail itself. A direct `/bin/firefox`
-request can still start
-another instance, and no single-instance admission lock has landed.
+service (`0d`) and never starts a jail itself. There is no direct
+`/bin/firefox` (§A.0), but nothing yet stops a second launch under
+Firefox's own account from starting another instance: no single-instance
+admission lock has landed.
 
 Probe mode alone overlays one read-only executable bind at
 `/tmp/td-jail-reaper-probe` after mounting `/tmp` noexec. It is the current
@@ -6021,7 +6045,8 @@ APPLICATIONS; the exposures are about PEERS.
   tripwire cannot grade.
 - **One application can already be several peers.** Nothing takes a
   single-instance lock. The compositor entry now activates the supervised
-  instance instead of launching, but a direct `/bin/firefox` request can start
+  instance instead of launching, and the image has no `/bin/firefox`
+  (§A.0), but a second launch under Firefox's own account can still start
   another jail with the same policy and persistent profile.
 
 The per-caller filter and per-instance admission key are now landed, so the
@@ -7166,9 +7191,9 @@ packaged selftest, boot oracle — with **network never in the gate**.
    `td-compositor` store output. The image selects Firefox's declaration,
    whose account fetches the app and runtime (§W.9; until that cutover it
    carried the exact Firefox 154.0 and Freedesktop 25.08 packages), exposes
-   `/bin/firefox` through td-jail, and under the oracle's token starts it
-   under supervision on a fixed document served by the guest-local HTTPS
-   fixture.
+   it through td-authd's argv[0] launch of td-jail, and under the oracle's
+   token starts it under supervision on a fixed document served by the
+   guest-local HTTPS fixture.
    An exact QEMU kernel token selects a fresh `/run`-backed automation profile
    and the document; ordinary boots retain Firefox's own profile and first-run
    flow. `td-compositor` publishes its private observation
@@ -7705,7 +7730,7 @@ Each row is one landing or a small family, leaving the tree green.
 | 12f | **typed shared-network policy — LANDED**: the authenticated `shared=network` permission selects the compiled namespace set without `CLONE_NEWNET`; stage 1 requires the network namespace inode to remain unchanged and skips the isolated-loopback ioctl. Omitted policy retains `CLONE_NEWNET`, exact changed-inode readback and the up-loopback oracle. The host fixture launches both its isolated defaults and a derived shared-network variant; the shipped Firefox policy selects shared networking. `/etc/resolv.conf` is supplied by selective immutable `/etc`; mediated network policy remains later work | a declared application can use td's network stack without weakening the default isolated path |
 | 12g | **selective immutable `/etc` — LANDED**: a bounded tmpfs admits only the closed runtime configuration allowlist, synthesized passwd/group/host/NSS identity, one persisted per-application machine id, the pinned curl-rendered Mozilla CA bundle, and a read-only resolver bind only for declared shared networking. Stage 1 source-identity-checks every external file and recursively hardens selected runtime directories; stage 2 derives the exact tree from `/usr/etc`, checks synthesized contents, mount flags, nested mounts, PEM shape and write refusal. Host mode names fixture-owned CA and resolver inputs rather than borrowing ambient `/etc` | applications get libc/toolkit identity and trust data without seeing the host configuration |
 | 12h | **dynamic Firefox jail runtime — LANDED**: the exact Firefox/Freedesktop 25.08 pair is the sole target policy allowed to carry `LD_LIBRARY_PATH=/app/lib:/app/lib/firefox`; token-gated stage 2 revalidates the value after privileged stage 1 installs the four immutable `/usr` aliases, then reads those aliases back. Every application receives and stage 2 requires writable mode-0700 `$XDG_CACHE_HOME/tmp`. In this pre-image increment, a source-built surrogate ran under Firefox's real compiled spec through the complete host jail and broker path while imported Firefox bytes remained inert | the Firefox package has an automated confinement/runtime preflight without a manual desktop session |
-| 12i | **Firefox selected into the system image — LANDED**: the immutable application registry and `/bin/firefox` pair the exact Firefox 154.0 package with Freedesktop 25.08 (since §W.9's cutover, Firefox's declaration with its Flathub refs). The supervised service owns the one instance, started on request or under the oracle's token since §W.9's cutover; the compositor menu activates its observed mapped surface and never starts another jail. Direct `/bin/firefox` remains supported and no global single-instance lock has landed. Headless QEMU accepts an exact marker only after a surface asserting `org.mozilla.firefox` commits a buffer successfully painted to the framebuffer and an independent probe sees a live Firefox jail with its cgroup limits. Mutable Firefox state remains independent of deployment-health authority | **first real Firefox frame without manual testing** |
+| 12i | **Firefox selected into the system image — LANDED**: the immutable application registry and a `/bin/firefox` launcher (since dropped, §A.0) pair the exact Firefox 154.0 package with Freedesktop 25.08 (since §W.9's cutover, Firefox's declaration with its Flathub refs). The supervised service owns the one instance, started on request or under the oracle's token since §W.9's cutover; the compositor menu activates its observed mapped surface and never starts another jail. td-authd now execs td-jail under the name, and a by-name launch from any other account is refused (§A.0). No global single-instance lock has landed. Headless QEMU accepts an exact marker only after a surface asserting `org.mozilla.firefox` commits a buffer successfully painted to the framebuffer and an independent probe sees a live Firefox jail with its cgroup limits. Mutable Firefox state remains independent of deployment-health authority | **first real Firefox frame without manual testing** |
 | 12j | **application timezone in the mount plan — LANDED**: the launch reads a bounded IANA zone name from the system's `/etc/timezone`, resolves the runtime's own compiled zone for it under `usr/share/zoneinfo`, pins it by identity, and read-only binds it at `/etc/localtime`, which glibc reads whenever `TZ` is unset. Resolution follows symlinks because a zoneinfo tree is made of them, and bounds where one may land: the canonical target and the zoneinfo root both stay inside the runtime. `TZif` magic is checked before the bind and again by stage 2 on the bound file, together with containment and the bound inode being the runtime's own file for the named zone. Unset is not a zone: with nothing named the runtime is never asked and nothing is bound, so a minimal runtime is unaffected; a named zone must be answerable and `UTC` is not special about it, and a malformed name refuses outright. Host mode reads no zone, its inputs being fixture-owned. Installation may seed the name as described in rung 12k; an unconfigured image keeps the unset path | a jailed application reads the operator's zone |
 | 12k | **installer zone writer — LANDED**: optional `td-install volume --timezone` seeds `/var/lib/td/timezone`, exposed through the reviewed optional `MUTABLE_ETC` link at `/etc/timezone`. First boot leaves the choice or absence intact. Static mail and news use a data-only runtime carrying source-built timezone files. A named operation to change the zone after installation remains pending | the operator can choose a zone, and it survives a deployment |
 | 13 | `td-busd` codec, auth, surface #10 | none |
@@ -7739,7 +7764,7 @@ Each row is one landing or a small family, leaving the tree green.
 | 28 | **Firefox proof closure — LANDED**; §H's every-boot kill-reaps leg now creates a dedicated application cgroup through the production detached watcher, proves stage 2 and its descendant occupy it before killing only stage 1, and accepts only after PID-namespace teardown empties the leaf and the watcher removes it. The previously deferred real target-kernel `mount(2)` refusal is supplied by the landed 17-call outer-filter audit. `AGENTS.md` names the source graph, host control plane, and marked foreign payload as three distinct trust zones. The complete shipped source and confinement regressions were reconciled against application-path `UNSAFE.md` surfaces #9 (`td-jail`), #10 (`td-busd`), #12 (`td-portal`), and #13 (`td-audio`); their syscall, operation, flag, ancillary-data, pointer-provenance, and scoped-allow rosters remain exact and require no roster amendment | **Firefox portals, isolation, soak and sound are all proved without manual testing** |
 | 29 | **native clock in local time — LANDED**: the bar snapshots rung 12k's saved name and source-built TZif v2/v3 data, including future DST recurrence. Absence stays UTC; invalid or unsupported data displays `CLOCK ?`. `td-compositor/DESIGN.md` owns bounds, session lifetime and tests | the bar shows local civil time with the actual UTC offset |
 | 30 | **fresh-terminal grant — LANDED** in the jail; `devices=tty` parses and is honoured. Stage 1 requires one pseudo-terminal slave on its own stdio, issues a single non-stealing `TIOCSCTTY` from the session the bootstrap proved, and reads the terminal back from procfs before any registration, namespace or cgroup; stage 2 re-proves the same device on its stdout before mounting, binds `/dev/tty`, and gives the entry three clones; `TERM` forwards under a closed grammar beside `TERMINFO`, with the one matching description bound; td-term `--command` is the producer of such terminals. Unit tests and confinement pins cover the grammar, the wire format, the procfs decoding, the devpts identity and the order; rung 31's boot oracle proves the acquisition end to end | a terminal application runs in the jail with a terminal of its own, and never the operator's |
-| 31 | **terminal applications — LANDED**: `mail` (td-mail) and `news` (td-news) are source-built static packages on the data-only `static-runtime`, `/bin/mail` and `/bin/news` launchers, and two td-svc units that run each as td-term's `--command` in a window of its own after the first terminal, on the second workspace, which the control channel makes active before they start and leaves for the shell's once both are decided, so that the first workspace stays the shell's and Firefox's, never restarted by the supervisor; a user-level relaunch is §W.7. td-firstboot provisions each a first configuration once under the login user's jail state. Each package carries its binary's debug companion and, at the root of that debug tree, the assembly marker, so the profiler's object index finds under this source-built root what it requires. Under the autotest token the evidence units, which require their window, print `TD-MAIL-RUNNING` and `TD-NEWS-RUNNING` only after td-jail finds the client itself, by the program its entry runs as, still in the instance five seconds past the window's readiness, and `TD-APPLICATIONS-PLACED` once the compositor's report shows the first workspace active, no workspace occupied but the first and the applications', and the shell's window alone on the first; the boot oracle requires all three. Neither holds a bus name; §D names the residual | the machine boots to mail and news beside the shell, each in a jail on a terminal td-term made for it |
+| 31 | **terminal applications — LANDED**: `mail` (td-mail) and `news` (td-news) are source-built static packages on the data-only `static-runtime`, `/bin/mail` and `/bin/news` launchers (since dropped: td-authd starts each by name, §A.0), and two td-svc units that ran each as td-term's `--command` (until rung 36 moved both into td-ui windows) in a window of its own after the first terminal, on the second workspace, which the control channel makes active before they start and leaves for the shell's once both are decided, so that the first workspace stays the shell's and Firefox's, never restarted by the supervisor; a user-level relaunch is §W.7. td-firstboot provisions each a first configuration once under the login user's jail state. Each package carries its binary's debug companion and, at the root of that debug tree, the assembly marker, so the profiler's object index finds under this source-built root what it requires. Under the autotest token the evidence units, which require their window, print `TD-MAIL-RUNNING` and `TD-NEWS-RUNNING` only after td-jail finds the client itself, by the program its entry runs as, still in the instance five seconds past the window's readiness, and `TD-APPLICATIONS-PLACED` once the compositor's report shows the first workspace active, no workspace occupied but the first and the applications', and the shell's window alone on the first; the boot oracle requires all three. Neither holds a bus name; §D names the residual | the machine boots to mail and news beside the shell, each in a jail on a terminal td-term made for it |
 | 32 | **a second bus-holding application's peer attribution — LANDED** in the broker, in two halves. A jailed or unproved caller is told no host pid, about itself or the broker: `GetConnectionUnixProcessID` answers `UnixProcessIdUnknown` and `GetConnectionCredentials` carries the uid without `ProcessID`, and only a caller the lineage walk proved unconfined gets one. Queued descriptors are charged to the admission key HOLDING them beside the bus's ceiling, in two counts per key with a quarter of it each: the sender's freight count until every recipient is charged, each recipient's queued count once a frame is queued to it, apart so a stall on one of a key's connections does not refuse its siblings. A recipient key at its queued share costs the sender a `LimitsExceeded` reply and nobody a connection; a sender key at its freight share is refused; only the ceiling, which one key's two counts cannot reach, relieves a holder. Both halves have tests that drive them through the broker. The roster tripwire stays at one bus-holding application until the entry that lifts it brings the first two-application boot oracle | a second bus-holding application shares the broker without reading a host pid through it, and without starving the first of descriptors |
 | 33 | **Claude Code ships — LANDED** as the fourth shipped application and the first foreign-payload terminal program: a marked payload on Firefox's runtime, run behind the same jail as the source-built mail and news, with the `devices=tty` grant in its policy and its own boot oracle unit, `claude-evidence`. Once every Firefox oracle has published, so no second window shares a frame those measure, the unit launches it twice as its application user: with no terminal of its own, which the grant refuses before anything runs, and inside a pseudo-terminal from `td-term --command`, where `claude --version` runs to exit status 0 through td-jail's registration on the live broker beside Firefox's instance; td-term's own line for its child's status, matched whole wherever the capture holds it, is the proof, so a failed acquisition, registration, jail or payload is a failed launch; Firefox's process token and bus identity are read before and after and must match, so the instance it ran beside is the live one; a failed launch's captured output goes to a file, never the console. The oracle found the jail keying the `/usr` aliases on Firefox's reviewed package library path rather than on the runtime, so a dynamic application with no package libraries had no interpreter; the aliases now follow the runtime, and stage 1 tells stage 2 so in a word of its own. The payload then died with SIGILL: the oracle's default `qemu64` CPU has no SSE4.2 or POPCNT, the x86-64-v2 baseline the payload assumes and Firefox's conservative build does not, so the boot now emulates `Nehalem`, the lowest stock model that supplies it. It then ran `--version` to exit 0, but the jail's post-exit read of the cgroup leaf's diagnostics found it already reaped, since the application is short-lived, and reported that as a failure; that read is observability the launch discards on success, so a leaf already gone is now `None`, not a failed launch, matching the rest of the module. The host oracle latches `TD-CLAUDE-TERMINAL-OK` and fails without it, and the roster tripwire now requires an evidence unit per shipped application. Not yet: a launcher card that opens it, and the executable state subtree its updater needs; the caller's working directory is rung 34 | a foreign-payload terminal application is proved to run in a terminal of its own, beside the browser, on one live bus |
 | 34 | **the admitted caller's working directory**: stage 1 maps its own directory through a declared filesystem grant and passes the bounded canonical result to stage 2, which starts there or falls back to `/` if it cannot enter it. The private-UID cutover makes the stock root authority the supported launcher; it starts from `/` and does not forward an operator's working directory. Direct human-UID application launch is refused. A later typed launch request must carry an admitted working directory to restore that operator flow. The jail's existing grant mapping and argv/refusal tests remain applicable to admitted callers | an admitted caller's directory is retained only inside its declared grant; stock launches currently start at `/` |
@@ -9958,7 +9983,7 @@ the work that is deferred:**
 | applied by | `td-boot publish` + reboot | `td-boot publish` + **reboot** | a pointer flip, no reboot |
 | verified by | signed manifest, ed25519 | the same signed manifest | a content hash against the recipe graph |
 | rollback | `previous` selector, attempt counter | `previous` — so an application rollback is a **system** rollback, and can undo an unrelated security fix | repoint; state in `$HOME` untouched |
-| covered by the attempt counter | yes | **not application execution** — `bootsuccess` requires the terminal but not Firefox. Firefox has a separate readiness-gated evidence unit for QEMU, so broken application code or mutable per-app state cannot drive the counter down. `/bin/firefox` resolves through the immutable application registry; the compositor receives the exact selected name as a service argument. The builder-authenticated launcher table is emitted but remains future table-driven discovery work | n/a |
+| covered by the attempt counter | yes | **not application execution** — `bootsuccess` requires the terminal but not Firefox. Firefox has a separate readiness-gated evidence unit for QEMU, so broken application code or mutable per-app state cannot drive the counter down. Firefox's name resolves through the immutable application registry; the compositor receives the exact selected name as a service argument. The builder-authenticated launcher table is emitted but remains future table-driven discovery work | n/a |
 | frequency | td's cadence | td's cadence | upstream's, which for a browser is far higher |
 
 A browser is the fastest-moving thing on the machine and it now moves at
@@ -10275,8 +10300,8 @@ into its window, §W.5 "Reworked"). Before the plan below, none of
 those existed inside the jail: the `mail` and `news` packages are
 static binaries on the data-only `static-runtime`, so
 `PATH=/app/bin:/usr/bin` held only the packaged programs, there is no
-`sh`, no `xdg-open`, `$BROWSER` was unset, and `/bin/firefox` is a
-host path the jail does not see. Outside the jail the image has no
+`sh`, no `xdg-open`, `$BROWSER` was unset, and the host's Firefox
+launcher was a path the jail does not see. Outside the jail the image has no
 `xdg-open` either, so the unjailed behaviour was already "no browser
 opener available". The portal is the designed answer (§E, row 4):
 `.OpenURI` hands `http` and `https` to the browser and refuses `file`.
@@ -10289,7 +10314,7 @@ remain.
 `org.freedesktop.portal.OpenURI.OpenURI` for `http` and `https` as §E's
 row 4 now specifies. The plan first said to launch the browser through
 its `/bin` entry and have that second Firefox hand the URL to the
-running one; the uid-991 portal cannot run `/bin/firefox` (only
+running one; the uid-991 portal cannot launch Firefox (only
 Firefox's assigned UID can, through root's `td-authd
 application-start`), and a second jail per click would only forward
 the URL anyway. The portal therefore calls the running Firefox's
@@ -10350,7 +10375,8 @@ pty is already the shell's controlling terminal.
 **Plan.** (1) The compositor's launcher already builds `td-term run`
 for a new terminal window on a key chord; it gains a request that
 starts a shipped application through td-authd's `application-start`,
-`direct` for a window application and `terminal` for Claude, so a chord
+`direct` for a window application (Claude's terminal launch is its
+own shell server, td-authd/DESIGN.md), so a chord
 opens a fresh `mail` or `news` window, and the running td-svc window is
 not involved. The launcher, not the shell, chooses the program, so the
 set of programs a chord can start is the launcher table's and nothing

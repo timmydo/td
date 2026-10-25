@@ -4036,6 +4036,27 @@ fn application_names(sys: &SystemDef) -> Vec<&'static str> {
         .collect()
 }
 
+/// The applications with a `/bin/NAME` link to td-jail. An application is
+/// started only by td-authd's supervised launch, which execs /bin/td-jail
+/// with its name as argv[0]; a /bin name a shell could run would only reach
+/// td-jail's refusal. Claude alone keeps one: td-jail sends the human's
+/// invocation to Claude's own shell server (APPLICATIONS.md §A.0).
+fn application_bin_links(sys: &SystemDef) -> Vec<&'static str> {
+    application_names(sys)
+        .into_iter()
+        .filter(|name| *name == CLAUDE_NAME)
+        .collect()
+}
+
+/// The applications that must have no `/bin` entry at all.
+fn unlinked_application_names(sys: &SystemDef) -> Vec<&'static str> {
+    let links = application_bin_links(sys);
+    application_names(sys)
+        .into_iter()
+        .filter(|name| !links.contains(name))
+        .collect()
+}
+
 fn application_payload_inputs(sys: &SystemDef) -> Vec<&'static str> {
     let mut inputs: Vec<&str> = sys
         .applications
@@ -4895,10 +4916,10 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
             link: format!("{{root}}/real-root/bin/{name}"),
         });
     }
-    for application in sys.applications {
+    for name in application_bin_links(sys) {
         steps.push(Step::Symlink {
             target: "/bin/td-jail".into(),
-            link: format!("{{root}}/real-root/bin/{}", application.name),
+            link: format!("{{root}}/real-root/bin/{name}"),
         });
     }
     // /init is PID 1 on the real root, and it is td-init. switch_root execs it under the
@@ -5383,8 +5404,11 @@ fn shape_check() -> String {
      tdfetchd=\"{root}/real-root{in:td-net}/bin/td-net\"; { [ -f \"$tdfetchd\" ] && [ -x \"$tdfetchd\" ]; } || { echo 'root tree: td-net is not packed/executable at real-root{in:td-net}/bin/td-net - the /bin/td-fetchd symlink would dangle and the fetchd unit would exec nothing' >&2; exit 1; }; \
      [ \"$(readlink \"$root/bin/td-portal\" 2>/dev/null)\" = \"{in:td-portal}/bin/td-portal\" ] || { echo 'root tree: /bin/td-portal is not a symlink to the staged Settings portal' >&2; exit 1; }; \
      tdportal=\"{root}/real-root{in:td-portal}/bin/td-portal\"; { [ -f \"$tdportal\" ] && [ -x \"$tdportal\" ]; } || { echo 'root tree: td-portal is not packed/executable at real-root{in:td-portal}/bin/td-portal - the portal supervisor, child, and live probe would all fail' >&2; exit 1; }; \
-     for a in @APPLICATIONS@; do \
+     for a in @APPLICATION_LINKS@; do \
          [ \"$(readlink \"$root/bin/$a\" 2>/dev/null)\" = /bin/td-jail ] || { echo \"root tree: /bin/$a is not an application launcher pointing to /bin/td-jail - another packed /bin provider replaced it\" >&2; exit 1; }; \
+     done; \
+     for a in @UNLINKED_APPLICATIONS@; do \
+         if [ -e \"$root/bin/$a\" ] || [ -L \"$root/bin/$a\" ]; then echo \"root tree: /bin/$a is packed, but td-authd starts $a by argv[0] and a shell launch would only be refused\" >&2; exit 1; fi; \
      done; \
      [ -f \"@TERMINFO_ENTRY@\" ] || { echo 'root tree: the td-term terminfo entry is not packed, so /etc/terminfo resolves to a tree without it' >&2; exit 1; }; \
      [ \"$(ls -ld \"@TERMINFO_ENTRY@\" | cut -c1-10)\" = -r--r--r-- ] || { echo 'root tree: the td-term terminfo entry is not read-only (0444), the mode td-jail admits it at, so every terminal launch would be refused' >&2; exit 1; }; \
@@ -5476,7 +5500,14 @@ fn shape_check() -> String {
         .replace("@TD_SH_APPLETS@", &TD_SH_APPLETS.join(" "))
         .replace("@TD_INIT_APPLETS@", &td_init_applets().join(" "))
         .replace("@TD_LOGIN_APPLETS@", &TD_LOGIN_APPLETS.join(" "))
-        .replace("@APPLICATIONS@", &application_names(&SYSTEM).join(" "))
+        .replace(
+            "@APPLICATION_LINKS@",
+            &application_bin_links(&SYSTEM).join(" "),
+        )
+        .replace(
+            "@UNLINKED_APPLICATIONS@",
+            &unlinked_application_names(&SYSTEM).join(" "),
+        )
         .replace("@TD_SVC_UNITS@", &TD_SVC_UNITS.join(" "))
         .replace("@TD_SVC_CONF@", TD_SVC_CONF)
         .replace("@TERMINFO_ENTRY@", TERMINFO_ENTRY)
@@ -7654,9 +7685,7 @@ mod tests {
             format!("/run/td-compositor/{UI_UID}/td-control")
         );
         let jail = include_str!("../../../td-jail/src/authority.rs");
-        assert!(jail.contains(&format!(
-            "if policy.owner() != {UI_UID}\n        || !policy"
-        )));
+        assert!(jail.contains(&format!("if policy.owner() == {UI_UID}\n        && policy")));
         let account = crate::primary_account::parse(&build_passwd(&SYSTEM)).unwrap();
         assert_eq!(crate::primary_account::UID, UI_UID);
         assert_eq!(account.name(), UI_USER);
@@ -8690,8 +8719,9 @@ mod tests {
     /// Which is NOT what this counts, and the gap is stated here rather than
     /// left for a reader to assume away. A package count does not bound peers:
     /// `td-portal` speaks D-Bus and is not a `ShippedApplication`, and a
-    /// direct `/bin/firefox` request can add another peer without changing the
-    /// package count. The compositor card itself is activation-only.
+    /// second launch under Firefox's own account, which nothing locks out,
+    /// can add another peer without changing the package count. The
+    /// compositor card itself is activation-only.
     ///
     /// So this is a tripwire on the likeliest next step, put where adding the
     /// entry breaks the build rather than promised in prose a future change
@@ -10086,12 +10116,26 @@ mod tests {
                     && registry == "{root}/real-root/etc/td-applications.tsv"
                     && launcher == "{root}/real-root/etc/td-launcher.tsv"
         )));
-        assert!(steps.iter().any(|step| matches!(
+        // No /bin name: the supervised launch selects it by argv[0].
+        assert!(!steps.iter().any(|step| matches!(
             step,
             Step::Symlink { target, link }
                 if target == "/bin/td-jail"
-                    && link == "{root}/real-root/bin/fixture"
+                    || link == "{root}/real-root/bin/fixture"
         )));
+        let shipped_links: Vec<_> = real_root_steps(&SYSTEM)
+            .unwrap()
+            .into_iter()
+            .filter_map(|step| match step {
+                Step::Symlink { target, link } if target == "/bin/td-jail" => Some(link),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            shipped_links,
+            vec![format!("{{root}}/real-root/bin/{CLAUDE_NAME}")],
+            "only Claude, whose human invocation td-jail redirects, has a /bin name"
+        );
 
         assert_eq!(SYSTEM.applications.len(), 4);
         let shipped: Vec<_> = SYSTEM
@@ -10757,11 +10801,17 @@ mod tests {
         };
         assert_eq!(application_name_collisions(&fixture), vec!["rg", "td-netd"]);
         let shape = shape_check();
-        assert!(shape.contains(&format!(
-            "for a in {}; do",
-            application_names(&SYSTEM).join(" ")
-        )));
+        assert_eq!(application_bin_links(&SYSTEM), vec![CLAUDE_NAME]);
+        assert_eq!(
+            unlinked_application_names(&SYSTEM),
+            vec![FIREFOX_NAME, TD_MAIL_NAME, TD_NEWS_NAME]
+        );
+        assert!(shape.contains(&format!("for a in {CLAUDE_NAME}; do")));
         assert!(shape.contains("[ \"$(readlink \"$root/bin/$a\" 2>/dev/null)\" = /bin/td-jail ]"));
+        assert!(shape.contains(&format!(
+            "for a in {FIREFOX_NAME} {TD_MAIL_NAME} {TD_NEWS_NAME}; do \
+             if [ -e \"$root/bin/$a\" ] || [ -L \"$root/bin/$a\" ]; then"
+        )));
     }
 
     /// The mirror of the busybox-multiplexer ban, for the form this commit actually

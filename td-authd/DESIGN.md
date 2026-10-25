@@ -840,14 +840,15 @@ cutover. No root authority operation accepts either path from a requester.
 
 ## Fixed application launch prerequisite
 
-The root startup operation `application-start OWNER APP direct|terminal --
+The root startup operation `application-start OWNER APP direct --
 ARG...` consumes an installed application assignment. OWNER is currently
 1000, the image's single graphical session; APP has the canonical registry
 name grammar. The presentation and at most 128 literal arguments (32 KiB
-including terminators) come from root-owned unit configuration. Direct and terminal presentation have no
-request listener, caller-selected executable, credential change in td-authd,
-or human elevation. Stock application units use this operation after
-firstboot and, where needed, mapped-grant preparation succeed.
+including terminators) come from root-owned unit configuration. Direct
+presentation has no request listener, caller-selected executable,
+credential change in td-authd, or human elevation. Stock application
+units use this operation after firstboot and, where needed, mapped-grant
+preparation succeed.
 
 Startup requires the same root credentials, single thread, absent controlling
 terminal and exclusive standard descriptors as the terminal authority.
@@ -881,19 +882,18 @@ an alternative application-identity authority: an app UID invoking it directly
 still has only that UID. Broker and jail activation must independently bind
 that identity to its installed application.
 
-The wrapper constructs only `/bin/APP` or `/bin/td-term run` with that fixed
-application command. Terminal presentation selects the human session's public
-Wayland socket and an app-private readiness socket. It supplies the canonical
-private HOME and runtime, service USER/LOGNAME, `/bin/false` SHELL and `/bin`
-PATH to its immediate child. td-term separately constructs the command's
-environment from its service account: its existing PTY contract uses that
-account's HOME as cwd, `/bin/sh` as SHELL, and its selected WAYLAND_DISPLAY.
-This does not execute a shell for an explicit application command or change
-its service-only account class. Direct presentation uses the immutable
-`/bin/APP` td-jail link, whose product resolver fixes the display endpoint.
-It passes literal application arguments without a shell and sets no
-compositor control endpoint. The bounding capability set is not a held
-privilege and is not required empty. No new syscall or unsafe surface is
+The wrapper constructs only `/bin/td-jail` with APP as its argv[0], which is
+how td-jail selects the application (APPLICATIONS.md §A.0), so the launch
+needs no `/bin/APP` link; td-jail refuses a by-name launch under any UID
+other than the one the deployment assigned APP. It supplies the canonical
+private HOME and runtime, service USER/LOGNAME, `/bin/false` SHELL and
+`/bin` PATH, passes literal application arguments without a shell and sets
+no compositor control endpoint; td-jail's product resolver fixes the
+display endpoint. There is no terminal presentation: td-term's `--command`
+cannot set its program's argv[0], so it could not name an unlinked
+application, and Claude's terminal launch is its shell server below.
+The bounding capability set is not a held privilege and is not required
+empty. No new syscall or unsafe surface is
 introduced; confinement pins the complete application controller and startup.
 
 ## Claude shell launch

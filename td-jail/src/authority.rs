@@ -358,10 +358,41 @@ pub(crate) fn application_name(argv0: &OsStr) -> io::Result<&str> {
     Ok(name)
 }
 
+/// A product launch runs only as the account the deployment assigned to
+/// `name`, which td-authd's supervised start drops to before it execs
+/// td-jail (APPLICATIONS.md §A.0). Any other caller, the human's shell
+/// included, is refused here rather than failing later on a home, cache or
+/// bus registration that is not its own.
+pub(crate) fn require_application_account(name: &str) -> io::Result<()> {
+    let (uid, _) = effective_identity()?;
+    let policy = crate::app_policy::load()
+        .map_err(|error| invalid(format!("{name}: application policy: {error}")))?;
+    application_account(uid, name, &policy)
+}
+
+/// The one rule every product-launch check applies: the human session's
+/// policy assigns `uid` to `name`.
+fn application_account(uid: u32, name: &str, policy: &crate::app_policy::Policy) -> io::Result<()> {
+    if policy.owner() == 1000
+        && policy
+            .for_uid(uid)
+            .is_some_and(|rule| rule.application == name)
+    {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!(
+            "{name} runs only as its own application account, not uid {uid}; td starts it from the desktop, not from a shell"
+        ),
+    ))
+}
+
 pub(crate) fn resolve<I>(name: &str, arguments: I) -> io::Result<LaunchPlan>
 where
     I: Iterator<Item = OsString>,
 {
+    require_application_account(name)?;
     let identity = effective_identity()?;
     let mut config = target_config()?;
     config.real_home = Some(PathBuf::from(format!(
@@ -797,13 +828,7 @@ fn application_session(
     name: &str,
     policy: &crate::app_policy::Policy,
 ) -> io::Result<(&'static Path, u32, PathBuf)> {
-    if policy.owner() != 1000
-        || !policy
-            .for_uid(owner)
-            .is_some_and(|rule| rule.application == name)
-    {
-        return Err(invalid("kernel UID does not own the installed application"));
-    }
+    application_account(owner, name, policy)?;
     Ok((
         Path::new(crate::permissions::TD_WAYLAND_SOCKET_PATH),
         crate::permissions::TD_COMPOSITOR_UID,
@@ -3824,6 +3849,32 @@ mod tests {
             assert!(application_session(owner, "firefox", &policy).is_err());
         }
         assert!(application_session(65536, "mail", &policy).is_err());
+    }
+
+    #[test]
+    fn a_product_launch_admits_only_the_application_account_assigned_its_name() {
+        let policy = crate::app_policy::Policy::parse(
+            "td-bus-applications-v1\t1000\n65536\tfirefox\torg.mozilla.firefox\n65537\tmail\t\n",
+        )
+        .unwrap();
+        application_account(65536, "firefox", &policy).unwrap();
+        application_account(65537, "mail", &policy).unwrap();
+        for (uid, name) in [
+            (1000, "firefox"),
+            (0, "firefox"),
+            (65537, "firefox"),
+            (65536, "mail"),
+            (65538, "news"),
+        ] {
+            let error = application_account(uid, name, &policy).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "{name} runs only as its own application account, not uid {uid}; td starts it from the desktop, not from a shell"
+                )
+            );
+        }
     }
 
     #[test]

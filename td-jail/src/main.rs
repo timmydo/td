@@ -72,6 +72,11 @@ fn run() -> std::io::Result<()> {
             .exec());
     }
     if let Some(kind) = application_launch_kind(name, arguments.peek()) {
+        if kind == ApplicationLaunchKind::Product {
+            // Before any session, cgroup or cache exists: a shell's launch
+            // under the wrong account is refused in one line.
+            authority::require_application_account(name)?;
+        }
         if kind == ApplicationLaunchKind::Workspace {
             // `--workspace LAUNCHER-PID SPEC [ARG...]`
             let arguments: Vec<std::ffi::OsString> = arguments.collect();
@@ -280,6 +285,36 @@ mod confinement {
         assert!(AUTHORITY.contains(
             "host mode is unavailable when the product application configuration is installed"
         ));
+    }
+
+    /// A by-name launch is refused under any account but the one assigned
+    /// its name before the outer launcher spawns the session, and again
+    /// before stage 1 reads the configuration.
+    #[test]
+    fn the_application_account_is_required_before_any_session_or_config() {
+        let shipped_main = strip_comments(MAIN.split_once("#[cfg(test)]").unwrap().0);
+        let run = shipped_main
+            .split_once("fn run() -> std::io::Result<()> {")
+            .and_then(|(_, rest)| rest.split_once("\n}\n"))
+            .map(|(body, _)| body)
+            .unwrap();
+        let product = run
+            .find("if kind == ApplicationLaunchKind::Product {")
+            .unwrap();
+        let check = run
+            .find("authority::require_application_account(name)?;")
+            .unwrap();
+        assert!(product < check && check < run.find("spawn_application_session").unwrap());
+        assert_eq!(run.matches("require_application_account").count(), 1);
+        let authority = strip_comments(AUTHORITY.split_once("#[cfg(test)]").unwrap().0);
+        let resolve = authority
+            .split_once("pub(crate) fn resolve<I>(")
+            .and_then(|(_, rest)| rest.split_once("\n}\n"))
+            .map(|(body, _)| body)
+            .unwrap();
+        let check = resolve.find("require_application_account(name)?;").unwrap();
+        assert!(check < resolve.find("target_config()").unwrap());
+        assert!(authority.contains("    application_account(owner, name, policy)?;\n"));
     }
 
     /// The workspace kind (APPLICATIONS.md §C) is selected only by the exact

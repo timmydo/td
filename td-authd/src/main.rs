@@ -84,8 +84,8 @@ const USAGE: &str = "usage: td-authd channel-check --peer-uid UID | \
     td-authd release-portal-files | td-authd prepare-portal-handoff | \
     td-authd release-portal-handoff | td-authd prepare-application-files APP | \
     td-authd release-application-files APP | \
-    td-authd application-start OWNER APP direct|terminal|shell -- ARG... | \
-     td-authd application-exec UID OWNER APP direct|terminal|shell -- ARG... | \
+    td-authd application-start OWNER APP direct|shell -- ARG... | \
+     td-authd application-exec UID OWNER APP direct|shell -- ARG... | \
      td-authd application-client ARG... | td-authd application-probe | \
      td-authd request-update SOURCE DEPLOYMENT-ID | td-authd request-hostname NAME";
 

@@ -2831,8 +2831,8 @@ the application card activates a retained matching mapped surface,
 switching workspaces and leaving an unrelated fullscreen view if necessary. It
 never starts another process: with no mapped surface it asks the authority
 (request 0d) to have root start the application's supervised unit, which
-td-svc answers as already running if it is, and reports a refusal. A direct
-`/bin/<application>` request remains a separate supported route and no
+td-svc answers as already running if it is, and reports a refusal. The
+image has no `/bin/<application>` route (APPLICATIONS.md §A.0), though no
 single-instance lock has landed. Direct `td-ui-demo` and `td-term` requests
 select their program and take the same two run flags. The compositor derives a
 unique readiness-socket name beside the socket and passes both paths as literal

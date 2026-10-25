@@ -928,7 +928,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
         .unwrap();
     assert_eq!(
         fingerprint(application),
-        0x3868affab8b1a69c,
+        0x48fb17e87f2d579b,
         "application launch controller changed"
     );
     for forbidden in [
@@ -1177,7 +1177,7 @@ const SHARED_LOGIN_STATE_FINGERPRINT: u64 = 0x36b736e5dda17cc6;
 const SHARED_HOSTNAME_FINGERPRINT: u64 = 0x49026f28c1db76ec;
 
 const LAUNCH_FINGERPRINT: u64 = 0xc671407f5365e81d;
-const MAIN_FINGERPRINT: u64 = 0x274300ec9b0f3682;
+const MAIN_FINGERPRINT: u64 = 0x5e5a07537b6e38c6;
 const SESSION_FINGERPRINT: u64 = 0x7fe467e679358f5e;
 
 const INTAKE_RAW_FINGERPRINT: u64 = 0x320c8b6ddbfe29af;
