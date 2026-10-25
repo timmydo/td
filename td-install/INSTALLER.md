@@ -2113,3 +2113,20 @@ the deployment on the physical secure-attention screen, and reboot.
 image whose networking runs only at boot, connect Ethernet before rebooting
 to fetch the update. Updates build locally and need network access for missing
 pinned sources and toolchain inputs.
+
+
+## Choosing a system at startup
+
+The installed selector shows current and previous versions for 15 seconds.
+Press any ordinary key to stop the countdown, use Up/Down or 1/2 to choose,
+and press Enter to boot. Entries show commit date, short hash and build
+date in UTC. Older versions without this metadata say unknown and show a
+short deployment ID. Selecting a version makes it the default current
+system; the other authenticated version remains available as previous.
+Without input, the existing automatic rollback after failed boots remains.
+
+Adding this menu to an older installation requires refreshing its firmware
+selector. The USB installer's Reinstall option does this while preserving
+home and settings. A normal `./update` updates the deployment, not that
+older selector. The live USB installer itself has no version menu: it boots
+the single system carried by the medium.

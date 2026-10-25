@@ -523,6 +523,21 @@ surface a signal sent from elsewhere that kills the applet while echo is
 off leaves its lines silent until something sets them again, in the
 selector at most until `kexec` or reset.
 
+The selector-only `boot-menu` applet reuses these termios requests through
+`term.rs`; it adds no syscall or request. It saves both fixed console names
+before changing either. `term::menu` starts with the secret-line patch,
+clears `ICANON` and software flow control (`IXON`, `IXANY`, `IXOFF`), and
+sets `VMIN=1`, `VTIME=0`. It preserves baud and all unnamed bytes, applies
+and reads back the full kernel buffer, then flushes old input. Failure
+attempts restore and flush. All exits restore and flush every changed line.
+Its safe std nonblocking I/O loop sleeps 20 milliseconds between turns;
+`poll` remains secret-line's alone. A stopped output retains at most the
+current partial frame and one latest complete frame. The applet accepts
+only a fixed default index and one or two bounded printable ASCII labels,
+never a terminal path or escape sequence. Its stdout reports only automatic
+selection or one index. The crate scan now includes `bootmenu.rs`; confinement
+continues to restrict every termios/flush call to `term.rs`.
+
 `TCGETS`/`TCSETS` arrived with the `getty` applet, which is what took the
 LAST busybox name off the image — the tty setup half of the login chain,
 where `login` and `su` had already moved to td-login and `sh` to td-sh. What

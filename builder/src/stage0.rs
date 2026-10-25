@@ -1268,6 +1268,7 @@ const BUILDER_FP_ROOTS: &[&str] = &[
     "builder/build.rs",
     "builder/Cargo.toml",
     "td-review/src/reviewer.rs",
+    "td-civil/src/tzif.rs",
     "engine/src",
     "engine/Cargo.toml",
     "Cargo.toml",
@@ -2209,6 +2210,14 @@ mod tests {
         let d = builder_fp_fixture("builder-reviewer-fingerprint");
         let before = builder_source_fingerprint(&d).unwrap();
         std::fs::write(d.join("td-review/src/reviewer.rs"), "new rules").unwrap();
+        assert_ne!(before, builder_source_fingerprint(&d).unwrap());
+    }
+
+    #[test]
+    fn shared_calendar_source_invalidates_builder_placement() {
+        let d = builder_fp_fixture("builder-calendar-fingerprint");
+        let before = builder_source_fingerprint(&d).unwrap();
+        std::fs::write(d.join("td-civil/src/tzif.rs"), "new calendar").unwrap();
         assert_ne!(before, builder_source_fingerprint(&d).unwrap());
     }
 

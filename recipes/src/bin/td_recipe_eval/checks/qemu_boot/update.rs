@@ -575,7 +575,8 @@ impl Guest {
                     Ok(menu_row_matches(pixels, 276, "TD SECURE ATTENTION")?
                         && menu_row_matches(pixels, 564, "B: ROLL BACK TO THE PREVIOUS SYSTEM")?
                         && menu_row_matches(pixels, HOSTNAME_ROW + 36, "S: DISK ENCRYPTION")?
-                        && menu_row_matches(pixels, HOSTNAME_ROW + 72, "ESC TO RETURN")?)
+                        && menu_row_matches(pixels, HOSTNAME_ROW + 72, "F: RESTART  P: POWER OFF")?
+                        && menu_row_matches(pixels, HOSTNAME_ROW + 108, "ESC TO RETURN")?)
                 },
             )?;
             if shown {
@@ -2545,9 +2546,10 @@ mod tests {
     /// A notice row drawn from the compositor's own chrome glyphs, hyphen
     /// and plus included, matches only where and as it is drawn.
     #[test]
-    fn menu_notice_rows_match_the_chrome_font_with_its_hyphen() {
+    fn menu_notice_rows_match_the_chrome_font_with_its_punctuation() {
         for text in [
             "SYSTEM INSTALLED - RESTART TO BOOT IT",
+            "F: RESTART  P: POWER OFF",
             "PRESS CTRL+ALT+ESC TO UNLOCK",
             ROLLED_BACK_NOTICE,
             &hostname_row(HOSTNAME_EMPTY, 1),
@@ -2843,7 +2845,7 @@ mod tests {
         }
         assert!(menu_row_matches(&pixels, top, text).unwrap());
         assert!(!menu_row_matches(&pixels, top + 36, text).unwrap());
-        let blanked = text.replace(['-', '+'], " ");
+        let blanked = text.replace(['-', '+', ':'], " ");
         assert!(!menu_row_matches(&pixels, top, &blanked).unwrap());
         assert!(menu_row_matches(&pixels, top, "a").is_err());
     }

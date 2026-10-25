@@ -163,6 +163,18 @@ the fetch helper), and image construction. It names the deployment when
 requesting installation. These messages report phase entry, not completion
 or an estimate; the child process output and exit status remain authoritative.
 
+Before requesting installation, the updater assembles a private deployment
+under `.td-build-cache/update-deployments/`. Its signed build labels and
+initramfs appendix follow `td-install/DESIGN.md`, "Installed startup menu".
+It checks the recipe deployment against its manifest, copies its payloads,
+adds the metadata appendix, and writes the replacement manifest. The
+retained build result is also what `build` returns. Assemblies are named
+by deployment ID and fully verified before reuse: repeated builds with the
+same metadata reuse one copy without replacing a pending installation
+source. Different deployment identities remain distinct retained outputs. The installed updater
+owns this step; an older updater can still produce a legacy deployment
+whose menu label has unknown dates. Source and build dates are UTC.
+
 The default command and explicit `install` take that output's deployment,
 hash its bounded regular manifest and invoke only installed
 `/bin/td-authd request-update SOURCE ID`. The root intake independently pins

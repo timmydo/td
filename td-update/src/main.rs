@@ -7,6 +7,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
 mod apply;
+#[path = "../../engine/src/boot_info.rs"]
+#[allow(dead_code, reason = "the updater writes deployment metadata")]
+mod boot_info;
+#[path = "../../engine/src/boot_info_source.rs"]
+mod boot_info_source;
+#[path = "../../engine/src/cpio.rs"]
+#[allow(dead_code, reason = "the updater writes a data appendix")]
+mod cpio;
 #[path = "../../td-boot/src/protocol.rs"]
 #[allow(dead_code, reason = "shared boot deployment contract")]
 mod protocol;
@@ -331,12 +339,20 @@ fn success(command: &mut Command, action: &str) -> Result<()> {
 }
 
 fn build(root: &Path, home: &Path) -> Result<PathBuf> {
-    build_with_tools(
+    let source = boot_info_source::capture(root)?;
+    let deployment = build_with_tools(
         root,
         home,
         Path::new("/bin/cargo"),
         Path::new("/bin/td-feed"),
-    )
+    )?;
+    let info = boot_info_source::finish(root, &source)?;
+    let parent = root.join(".td-build-cache/update-deployments");
+    td_fs::private_dir(&parent).map_err(|e| format!("deployment assembly directory: {e}"))?;
+    eprintln!("td-update: assembling {}", info.label()?);
+    let output = boot_info_source::cached(&deployment, &parent, &info)?;
+    eprintln!("td-update: built deployment {}", output.display());
+    Ok(output)
 }
 
 fn build_with_tools(root: &Path, home: &Path, cargo: &Path, feed: &Path) -> Result<PathBuf> {

@@ -335,7 +335,8 @@ pub fn recipe() -> Recipe {
         )
         .env("SOURCE_DATE_EPOCH", "1"),
         Step::run("{root}", &["{root}/session-tests", "authority::"]),
-        Step::run("{root}", &["{root}/session-tests", "secret_client::"]),
+        Step::run("{root}", &["{root}/session-tests", "secret_client::"])
+            .env("RUST_TEST_NOCAPTURE", "1"),
         Step::run("{root}", &["{root}/session-tests", "physical_attention_"]),
         Step::run("{root}", &["{root}/session-tests", "timezone::"]),
         Step::run("{root}", &["{root}/session-tests", "clock::"]),

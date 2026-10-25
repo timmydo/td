@@ -139,6 +139,7 @@ fn engine_source_fingerprint(manifest_dir: &Path) -> Result<String, Box<dyn Erro
         "builder/build.rs",
         "builder/Cargo.toml",
         "engine/Cargo.toml",
+        "td-civil/src/tzif.rs",
         "Cargo.toml",
         "Cargo.lock",
         "seed/seed-digests.txt",

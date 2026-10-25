@@ -386,6 +386,29 @@ pub fn save(line: &mut impl Termios) -> Result<Saved, String> {
     Ok(Saved(before))
 }
 
+/// Noncanonical input for the physical boot countdown, preserving baud and
+/// every unnamed kernel setting. Read back before discarding old typeahead.
+pub fn menu(line: &mut impl Termios, saved: &Saved) -> Result<(), String> {
+    let mut want = secret_patched(&saved.0);
+    let flags = read_u32(&want, LFLAG_AT) & !ICANON;
+    write_u32(&mut want, LFLAG_AT, flags);
+    // Linux input flow control: every byte must reach the countdown.
+    const FLOW: u32 = 0x400 | 0x800 | 0x1000;
+    let flags = read_u32(&want, IFLAG_AT) & !FLOW;
+    write_u32(&mut want, IFLAG_AT, flags);
+    set_cc(&mut want, VMIN, 1);
+    set_cc(&mut want, VTIME, 0);
+    match apply(line, &want).and_then(|()| flush(line)) {
+        Ok(()) => Ok(()),
+        Err(error) => match put_back(line, saved) {
+            Ok(()) => Err(error),
+            Err(restore) => Err(format!(
+                "{error}; restoring the console also failed: {restore}"
+            )),
+        },
+    }
+}
+
 /// Turn echo off and prove it took, then discard pending input.
 ///
 /// The change is applied with `TCSETS` and read back, then `TCFLSH` with
@@ -1030,5 +1053,41 @@ mod tests {
         write_u32(&mut buf, sys::TERMIOS_LEN, 0xffff_ffff);
         set_cc(&mut buf, sys::TERMIOS_LEN, 0xff);
         assert_eq!(read_u32(&buf, sys::TERMIOS_LEN), 0);
+    }
+    #[test]
+    fn boot_menu_raw_mode_preserves_baud_and_restores_every_byte() {
+        let mut line = Script::new();
+        write_u32(&mut line.current, CFLAG_AT, CS8 | CREAD | 0x1002);
+        write_u32(&mut line.current, IFLAG_AT, 0x400 | 0x800 | 0x1000 | ICRNL);
+        let original = line.current;
+        let saved = save(&mut line).unwrap();
+        menu(&mut line, &saved).unwrap();
+        assert_eq!(
+            read_u32(&line.current, LFLAG_AT) & (ICANON | ECHO | ISIG | IEXTEN | EXTPROC),
+            0
+        );
+        assert_eq!(
+            read_u32(&line.current, IFLAG_AT) & (0x400 | 0x800 | 0x1000),
+            0
+        );
+        assert_eq!(
+            read_u32(&line.current, CFLAG_AT),
+            read_u32(&original, CFLAG_AT)
+        );
+        assert_eq!(
+            (line.current[CC_AT + VMIN], line.current[CC_AT + VTIME]),
+            (1, 0)
+        );
+        assert_eq!(line.flushes, 1);
+        put_back(&mut line, &saved).unwrap();
+        assert_eq!(line.current, original);
+        assert_eq!(line.flushes, 2);
+        let mut line = Script::new();
+        let original = line.current;
+        let saved = save(&mut line).unwrap();
+        line.fail_flush = Some(1);
+        assert!(menu(&mut line, &saved).is_err());
+        assert_eq!(line.current, original);
+        assert_eq!(line.flushes, 2);
     }
 }

@@ -22,9 +22,14 @@ mod authenticode;
 #[path = "cap.rs"]
 mod cap;
 // engine's newc writer, for the selector appendix below.
+#[path = "../../engine/src/boot_info.rs"]
+#[allow(dead_code, reason = "the selector reads deployment metadata")]
+mod boot_info;
 #[path = "../../engine/src/cpio.rs"]
 #[allow(dead_code, reason = "the appendix uses its writer alone")]
 mod cpio;
+#[path = "menu.rs"]
+mod menu;
 // engine's GPT reader and its CRC-32, through which the staged update
 // finds the ESP as td-install does (`gpt::locate`).
 #[path = "../../engine/src/crc32.rs"]
@@ -3307,6 +3312,41 @@ fn run_boot(
         &mut mount_command(device, mountpoint),
         "read-only Btrfs mount",
     )?;
+    let choice = match menu::choose(mountpoint, &key) {
+        Ok(choice) => choice,
+        Err(error) => {
+            best_effort_unmount(mountpoint);
+            return Err(error);
+        }
+    };
+    if let Some(id) = choice {
+        if let Some((decision, deployment)) = read_selector(mountpoint, "current")
+            .ok()
+            .filter(|current| current == &id)
+            .and_then(|_| read_only_current(mountpoint, &key))
+        {
+            if decision.deployment_id == id {
+                before_kexec(&mut commit, mountpoint);
+                let result =
+                    kexec_boot_decision(deployment, &decision, base_cmdline, measured, handoff);
+                best_effort_unmount(mountpoint);
+                return result;
+            }
+        }
+        let result = run_manual_boot(
+            device,
+            mountpoint,
+            device_id,
+            &key,
+            &id,
+            base_cmdline,
+            measured,
+            handoff,
+            &mut commit,
+        );
+        best_effort_unmount(mountpoint);
+        return result;
+    }
     if let Some((decision, deployment)) = read_only_current(mountpoint, &key) {
         before_kexec(&mut commit, mountpoint);
         let result = kexec_boot_decision(deployment, &decision, base_cmdline, measured, handoff);
@@ -3392,6 +3432,59 @@ fn run_boot(
     })();
     best_effort_unmount(mountpoint);
     result
+}
+
+/// Manual selection refuses transaction failure instead of silently booting
+/// a different version from the one the operator chose.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the boot transaction's existing context"
+)]
+fn run_manual_boot(
+    device: &Path,
+    mountpoint: &Path,
+    device_id: u64,
+    key: &TrustRoot,
+    id: &str,
+    base_cmdline: &OsStr,
+    measured: bool,
+    handoff: Option<Handoff<'_>>,
+    commit: &mut Option<&mut dyn FnMut(&Path)>,
+) -> io::Result<()> {
+    run_command(
+        &mut unmount_command(mountpoint),
+        "boot menu read-only unmount",
+    )?;
+    let (decision, mounted) =
+        match run_on_prelocked_writable_volume(device, mountpoint, device_id, |root| {
+            menu::select(root, key, id)
+        }) {
+            Ok(decision) => (decision, false),
+            Err(WritableVolumeFailure::Committed {
+                value,
+                unmount_error,
+            }) => {
+                writeln!(
+                    mirror::stderr(),
+                    "td-boot: manual choice committed; unmount failed ({unmount_error})"
+                )?;
+                (value, true)
+            }
+            Err(error) => return Err(error.into_io()),
+        };
+    if decision.deployment_id != id {
+        return Err(invalid("manual boot selected a different deployment"));
+    }
+    if !mounted {
+        prepare_update_mountpoint(mountpoint, device, device_id)?;
+        run_command(
+            &mut mount_command(device, mountpoint),
+            "boot menu read-only mount",
+        )?;
+    }
+    let deployment = authenticated_deployment(mountpoint, id, key)?;
+    before_kexec(commit, mountpoint);
+    kexec_boot_decision(deployment, &decision, base_cmdline, measured, handoff)
 }
 
 /// A staged selector update's commit (td-install/ENCRYPTION.md "Selector
@@ -4891,7 +4984,6 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -5259,8 +5351,6 @@ mod tests {
         );
     }
 
-    static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
-
     use crate::fixture;
 
     /// The one public key every fixture deployment is signed under.
@@ -5321,6 +5411,7 @@ mod tests {
         let temp = test_temp::TempDir::new("td-reinstall").unwrap();
         let fixture = Fixture {
             root: temp.path().to_path_buf(),
+            _guard: temp,
         };
         fs::create_dir_all(fixture.root.join("td/boot")).unwrap();
         fs::create_dir_all(fixture.root.join("td/deployments")).unwrap();
@@ -5378,16 +5469,19 @@ mod tests {
 
     struct Fixture {
         root: PathBuf,
+        _guard: test_temp::TempDir,
     }
 
     impl Fixture {
         fn new() -> Self {
-            let sequence = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
-            let root = std::env::temp_dir()
-                .join(format!("td-boot-test-{}-{sequence}", std::process::id()));
+            let guard = test_temp::TempDir::new("td-boot-test").unwrap();
+            let root = guard.path().to_path_buf();
             fs::create_dir_all(root.join("td/boot")).unwrap();
             fs::create_dir_all(root.join("td/deployments")).unwrap();
-            Fixture { root }
+            Fixture {
+                root,
+                _guard: guard,
+            }
         }
 
         fn valid_deployment(&self) -> String {
@@ -5501,12 +5595,6 @@ mod tests {
                 self.root.join("td/boot").join(slot),
             )
             .unwrap();
-        }
-    }
-
-    impl Drop for Fixture {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.root);
         }
     }
 
@@ -7068,6 +7156,71 @@ mod tests {
         assert_eq!(read_selector(&fixture.root, "current").unwrap(), initial);
         assert_eq!(read_selector(&fixture.root, "previous").unwrap(), initial);
         assert!(!fixture.root.join("td/deployments").join(candidate).exists());
+    }
+
+    #[test]
+    fn boot_menu_promotes_previous_and_can_retry_the_displaced_pending_version() {
+        let fixture = Fixture::new();
+        let initial = fixture.valid_deployment();
+        fixture.selector("current", &initial);
+        fixture.selector("previous", &initial);
+        let (source, candidate) = fixture.source_bundle("candidate", "next");
+        install_deployment(&fixture.root, &source, None).unwrap();
+        let decision = menu::select(&fixture.root, &fixture.key(), &initial).unwrap();
+        assert_eq!(decision.deployment_id, initial);
+        assert_eq!(read_selector(&fixture.root, "current").unwrap(), initial);
+        assert_eq!(read_selector(&fixture.root, "previous").unwrap(), candidate);
+        assert_eq!(
+            current_attempt_state(&fixture.root, &initial).unwrap(),
+            None
+        );
+        let decision = menu::select(&fixture.root, &fixture.key(), &candidate).unwrap();
+        assert_eq!(decision.deployment_id, candidate);
+        assert_eq!(read_selector(&fixture.root, "previous").unwrap(), initial);
+        assert_eq!(
+            read_attempt_state(&fixture.root, &candidate).unwrap(),
+            Some(2)
+        );
+        write_attempt_state(&fixture.root, &candidate, 0).unwrap();
+        assert_eq!(
+            menu::select(&fixture.root, &fixture.key(), &candidate)
+                .unwrap()
+                .deployment_id,
+            candidate
+        );
+        assert_eq!(
+            read_attempt_state(&fixture.root, &candidate).unwrap(),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn boot_menu_refuses_unretained_and_unauthenticated_choices_without_writes() {
+        let fixture = Fixture::new();
+        let initial = fixture.valid_deployment();
+        fixture.selector("current", &initial);
+        fixture.selector("previous", &initial);
+        assert!(menu::select(&fixture.root, &fixture.key(), &"a".repeat(64)).is_err());
+        assert!(menu::select(&fixture.root, &fixture.wrong_key(), &initial).is_err());
+        assert_eq!(read_selector(&fixture.root, "current").unwrap(), initial);
+        assert_eq!(read_selector(&fixture.root, "previous").unwrap(), initial);
+        fs::write(
+            fixture
+                .root
+                .join("td/deployments")
+                .join(&initial)
+                .join("root.erofs"),
+            b"damaged",
+        )
+        .unwrap();
+        let error = menu::select(&fixture.root, &fixture.key(), &initial)
+            .err()
+            .unwrap();
+        assert!(
+            error.to_string().contains("root.erofs hash mismatch"),
+            "{error}"
+        );
+        assert_eq!(read_selector(&fixture.root, "current").unwrap(), initial);
     }
 
     #[test]

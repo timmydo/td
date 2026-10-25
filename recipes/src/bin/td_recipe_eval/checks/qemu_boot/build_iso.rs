@@ -7,8 +7,8 @@
 //! boots from the medium. Like `bundle`, it signs with a key made for this run
 //! and discarded; the ISO carries only the public half.
 //!
-//! The payloads are streamed from the verified store deployment; only the
-//! manifest is copied, so its signature can be written beside it.
+//! Assembly copies the verified store deployment and appends public build
+//! identity data to its initramfs before hashing and signing the manifest.
 
 use std::fs;
 use std::io::Read;
@@ -245,11 +245,17 @@ pub(crate) fn run(
         "   [build-iso] building the td distro (system-x86-64). An unchanged tree is\n            \
          reused whole; a cold tree builds every recipe.\n"
     );
+    let source = td_engine::boot_info_source::capture(runner.repo_root())?;
     let (kernel, selector, deployment) = build_system(runner)?;
+    let info = td_engine::boot_info_source::finish(runner.repo_root(), &source)?;
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let scratch = Scratch {
         dir: create_scratch_dir(runner.scratch_dir(), &SEQ)?,
     };
+    let assembled = scratch.dir.join("deployment");
+    td_engine::boot_info_source::assemble(&deployment, &assembled, &info)?;
+    println!("   [build-iso] {}", info.label()?);
+    let deployment = assembled;
     let trust = RunTrust::generate()?;
     let LiveMedium {
         id,

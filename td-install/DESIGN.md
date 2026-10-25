@@ -578,6 +578,62 @@ owned by guest root, and the image is never an installation target.
 
 ## 5. Firmware entry
 
+### Installed startup menu
+
+After unlocking and mounting the volume read-only, the installed selector
+shows the retained `current` and distinct `previous` deployments. Each
+entry requires a manifest authenticated under the selector's trust root
+and an initramfs matching that signed manifest. Full kernel and root
+verification remains mandatory on the selected boot path; showing a label
+is not a claim that those larger payloads have already been read.
+The writer locks remain held across the menu and activation.
+
+The default countdown is 15 seconds. A console input byte stops it;
+Up/Down or 1/2 chooses and Enter boots. With no input, normal attempt
+consumption and automatic rollback remain authoritative. Exhausted current
+attempts make a successful previous the displayed default. A pending
+previous is offered only with a successful current fallback. An explicit
+retry resets the chosen pending deployment's three-attempt budget and
+consumes its first attempt before boot.
+
+An explicit previous choice becomes current, so older systems' success
+acknowledgements still refer to the running deployment. A successful choice
+is published as current before the displaced authenticated current is
+retained as previous. A pending choice instead preserves the successful
+current as previous before activation. These publication orders preserve the known-good
+fallback when one exists. Manual transaction errors refuse rather than silently
+boot a different entry. Authentication is repeated after the writable
+transaction before handing descriptor-bound payloads to kexec.
+
+`td-init boot-menu` owns the fixed keyboard and serial consoles through
+its existing termios boundary (UNSAFE.md section 3). The selector alone
+links `/bin/boot-menu`; neither the deployment initramfs nor root farm
+does. If neither console is usable before interaction, it reports automatic
+selection. Losing all input after stopping the countdown fails the menu.
+
+Labels show UTC commit date, 12-character Git hash and UTC build date,
+with `+dirty` for an uncommitted checkout. An older deployment without
+metadata explicitly shows unknown dates/hash and a short deployment ID.
+`engine/src/boot_info.rs` defines a canonical 512-byte final newc appendix
+containing public `td-build-info`. The reader accepts only the exact
+canonical archive, from the already hash-verified initramfs descriptor.
+No inode timestamp or current checkout supplies an old system's label.
+
+ISO and installed-update assembly add that data to a private copy of the
+recipe initramfs, regenerate the four-line manifest, and only then request
+signing. The recipe outputs and source-bootstrap graph stay unchanged.
+Build date means deployment assembly date; identical source assembled on
+different dates can have distinct deployment IDs. Git identity is captured
+before the build and checked again afterward; a changed HEAD or clean/dirty
+state refuses assembly. A dirty label does not identify uncommitted bytes
+by Git hash; payload hashes and the deployment signature still bind them.
+
+The menu lives in the firmware-loaded selector. Ordinary deployment updates
+retain the installed selector. Existing machines receive this menu through
+the preserving reinstall path, which refreshes the selector, or the
+separate authenticated selector-update protocol for protected machines.
+
+
 ### Read-only volume discovery primitive
 
 `td-boot volume [UUID]` prints one canonical lowercase filesystem UUID and

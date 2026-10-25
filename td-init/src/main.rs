@@ -34,6 +34,7 @@
 //! `/sbin/init` the kernel execs. An explicit `td-init <applet> [args]` form
 //! covers the un-symlinked case.
 
+mod bootmenu;
 mod console;
 mod cttyhack;
 mod devpts;
@@ -61,6 +62,7 @@ type Applet = fn(&[String]) -> Result<u8, String>;
 /// ONE table, so a name cannot exist without an arm or an arm without a name —
 /// `--list`, argv[0] dispatch, and the shipped /bin symlink farm all read it.
 const APPLETS: &[(&str, Applet)] = &[
+    ("boot-menu", bootmenu::run),
     ("cttyhack", cttyhack::run),
     ("devpts", devpts::run),
     ("getty", getty::run),
@@ -390,10 +392,11 @@ mod tests {
     /// The roster is the shipped /bin symlink farm, so a rename is a visible
     /// change to the image, not an internal one.
     #[test]
-    fn the_roster_is_the_amended_sixteen() {
+    fn the_roster_is_the_amended_seventeen() {
         assert_eq!(
             names(),
             vec![
+                "boot-menu",
                 "cttyhack",
                 "devpts",
                 "getty",
@@ -557,8 +560,8 @@ mod confinement {
         }
         assert_eq!(
             declared.len(),
-            17,
-            "expected seventeen modules beside the crate root"
+            18,
+            "expected eighteen modules beside the crate root"
         );
         // ...and nothing scanned is orphaned: a file present but declared by no
         // `mod` line is either dead or reached a way this scan does not model,
@@ -586,12 +589,13 @@ mod confinement {
     /// skipping them: `src/sys.inc` is invisible to a `.rs`-only scan and
     /// compiles perfectly well through the constructs refused below.
     #[test]
-    fn src_holds_exactly_the_eighteen_scanned_modules() {
+    fn src_holds_exactly_the_nineteen_scanned_modules() {
         let scan::Tree { rs, other } = walk();
         let paths: Vec<&str> = rs.iter().map(|(p, _)| p.as_str()).collect();
         assert_eq!(
             paths,
             [
+                "bootmenu.rs",
                 "console.rs",
                 "cttyhack.rs",
                 "devpts.rs",
@@ -1381,6 +1385,22 @@ mod confinement {
             "letbefore=fs::symlink_metadata(path)?;if!before.file_type().is_block_device()"
         ));
         assert!(applet.contains("letopened=file.metadata()?;if!opened.file_type().is_block_device()||(before.dev(),before.ino(),before.rdev())!=(opened.dev(),opened.ino(),opened.rdev())"));
+    }
+
+    #[test]
+    fn boot_menu_has_only_the_fixed_console_and_existing_termios_boundary() {
+        let applet = squeeze(&code_only(&source("bootmenu.rs")));
+        assert!(!applet.contains("sys::"));
+        assert!(applet.contains("constCONSOLE:&str=\"/dev/console\";"));
+        assert!(applet.contains("constVT:&str=\"/dev/tty1\";"));
+        assert!(applet.contains("constTIMEOUT:Duration=Duration::from_secs(15);"));
+        assert!(applet.contains("constO_NOCTTY:i32=0o400;"));
+        assert!(applet.contains("constO_NONBLOCK:i32=0o4000;"));
+        assert_eq!(applet.matches("OpenOptions::new()").count(), 1);
+        assert!(applet.contains("OpenOptions::new().read(true).write(true).custom_flags(O_NOCTTY|O_NONBLOCK).open(path)"));
+        assert!(applet.contains("console::read(Path::new(console::ACTIVE)).vt_is_second()"));
+        assert!(applet.contains("term::menu("));
+        assert!(applet.contains("term::put_back("));
     }
 
     /// `secret-line` reaches its lines only through `term.rs`, whose

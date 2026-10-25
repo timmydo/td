@@ -16,6 +16,9 @@ use crate::types::{Recipe, Step};
 // each is compiled first as an rlib with the binary's profile and passed
 // by `--extern`, as td-install passes them. td-tpm and td-fido include the
 // same engine SHA-256 by `#[path]`.
+const BOOT_INFO_RS: &str = include_str!("../../../engine/src/boot_info.rs");
+const MENU_RS: &str = include_str!("../../../td-boot/src/menu.rs");
+const CALENDAR_RS: &str = include_str!("../../../td-civil/src/tzif.rs");
 const MAIN_RS: &str = include_str!("../../../td-boot/src/main.rs");
 const ADMISSION_RS: &str = include_str!("../../../td-boot/src/admission.rs");
 const ADMIT_RS: &str = include_str!("../../../td-boot/src/admit.rs");
@@ -287,6 +290,21 @@ pub fn recipe() -> Recipe {
         Step::WriteFile {
             path: "{src}/td-init/src/console.rs".into(),
             content: CONSOLE_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/engine/src/boot_info.rs".into(),
+            content: BOOT_INFO_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-boot/src/menu.rs".into(),
+            content: MENU_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-civil/src/tzif.rs".into(),
+            content: CALENDAR_RS.into(),
             exec: false,
         },
         Step::WriteFile {

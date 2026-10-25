@@ -7,6 +7,10 @@ const SHA256_RS: &str = include_str!("../../../engine/src/sha256.rs");
 const PROTOCOL_RS: &str = include_str!("../../../td-boot/src/protocol.rs");
 const PRIVATE_DIR_RS: &str = include_str!("../../../td-fs/src/private_dir.rs");
 
+const BOOT_INFO_RS: &str = include_str!("../../../engine/src/boot_info.rs");
+const BOOT_INFO_SOURCE_RS: &str = include_str!("../../../engine/src/boot_info_source.rs");
+const CPIO_RS: &str = include_str!("../../../engine/src/cpio.rs");
+const CALENDAR_RS: &str = include_str!("../../../td-civil/src/tzif.rs");
 const MAIN_RS: &str = include_str!("../../../td-update/src/main.rs");
 
 pub fn recipe() -> Recipe {
@@ -29,6 +33,26 @@ pub fn recipe() -> Recipe {
         Step::WriteFile {
             path: "{src}/td-update/src/upstream.rs".into(),
             content: UPSTREAM_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/engine/src/boot_info.rs".into(),
+            content: BOOT_INFO_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/engine/src/boot_info_source.rs".into(),
+            content: BOOT_INFO_SOURCE_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/engine/src/cpio.rs".into(),
+            content: CPIO_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-civil/src/tzif.rs".into(),
+            content: CALENDAR_RS.into(),
             exec: false,
         },
         Step::WriteFile {

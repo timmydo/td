@@ -4663,6 +4663,10 @@ fn build_initramfs_spec(init: &str, phase: Phase) -> String {
                 "slink /bin/{} {{in:td-init}}/bin/td-init 0777 0 0\n",
                 td_boot_protocol::SECRET_LINE_APPLET
             ));
+            s.push_str(&format!(
+                "slink /bin/{} {{in:td-init}}/bin/td-init 0777 0 0\n",
+                td_boot_protocol::BOOT_MENU_APPLET
+            ));
             // A staged selector update that `update` completes without a
             // predicted protector restarts the machine at once, so that its
             // owner is present for the warning boot (td-install/ENCRYPTION.md
@@ -5504,6 +5508,7 @@ fn shape_check(sys: &SystemDef) -> String {
      printf '%s\\n' \"$init_list\" | grep -q -x -F bin/losetup || { echo 'deployment initramfs: bin/losetup missing - td-boot root-loop could not bind the verified root and the boot would stop there' >&2; exit 1; }; \
      for a in \"$selector\" \"$init\"; do for p in losetup mknod; do \"$tu\" cpio -tv < \"$a\" 2>/dev/null | grep -q -x -F \"bin/$p -> {in:td-init}/bin/td-init\" || { echo \"initramfs $a: /bin/$p must link td-init - the deployment binds its verified root with it and a staged selector update's commit binds current's root.erofs\" >&2; exit 1; }; done; done; \
      \"$tu\" cpio -tv < \"$selector\" 2>/dev/null | grep -q -x -F 'bin/secret-line -> {in:td-init}/bin/td-init' || { echo 'selector initramfs: /bin/secret-line must link td-init - the recovery flow could not read the recovery key and an encrypted boot that reaches recovery would halt' >&2; exit 1; }; \
+     \"$tu\" cpio -tv < \"$selector\" 2>/dev/null | grep -q -x -F 'bin/boot-menu -> {in:td-init}/bin/td-init' || { echo 'selector initramfs: /bin/boot-menu must link td-init - the installed selector could not offer a version choice' >&2; exit 1; }; \
      if printf '%s\\n' \"$init_list\" | grep -q -x -F bin/secret-line; then echo 'deployment initramfs: secret-line must be selector-only - only the selector has a recovery flow' >&2; exit 1; fi; \
      \"$tu\" cpio -tv < \"$selector\" 2>/dev/null | grep -q -x -F 'bin/reboot -> {in:td-init}/bin/td-init' || { echo 'selector initramfs: /bin/reboot must link td-init - a selector update completed by update could not restart the machine' >&2; exit 1; }; \
      if printf '%s\\n' \"$init_list\" | grep -q -x -F bin/reboot; then echo 'deployment initramfs: reboot must be selector-only - its /init never restarts' >&2; exit 1; fi; \
@@ -16551,6 +16556,18 @@ mod principal_tests {
         assert_eq!(registry.application(UI_UID, "mail").unwrap().uid, 65537);
         assert_eq!(registry.application(UI_UID, "news").unwrap().uid, 65538);
         assert!(text.ends_with("application\t1000\tmail\t65537\napplication\t1000\tnews\t65538\n"));
+    }
+    #[test]
+    fn boot_menu_is_packed_only_in_the_selector() {
+        let selector = build_initramfs_spec("", Phase::Selector);
+        let deployment = build_initramfs_spec("", Phase::Deployment);
+        let link = format!(
+            "slink /bin/{} {{in:td-init}}/bin/td-init 0777 0 0",
+            td_boot_protocol::BOOT_MENU_APPLET
+        );
+        assert!(selector.contains(&link));
+        assert!(!deployment.contains(&link));
+        assert!(!td_init_applets().contains(&td_boot_protocol::BOOT_MENU_APPLET));
     }
 }
 

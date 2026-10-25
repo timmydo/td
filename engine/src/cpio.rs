@@ -54,10 +54,13 @@
 //! initramfs — the artifact firmware loads, whose rootfs runs the td-boot that
 //! verifies. Its modified hash is recorded nowhere: the selector's own manifest
 //! describes the recipe output and is checked BEFORE the append. It is
-//! emphatically NOT appended to a deployment's `initramfs.cpio`, which the
-//! deployment manifest hashes and whose digest is the deployment id — a key
-//! there would be inside the artifact being authenticated, and would make the
-//! id depend on the key.
+//! never appended as trust material to a deployment's `initramfs.cpio`: a
+//! trusted key there would be inside the artifact being authenticated.
+//!
+//! Public build labels use a separate appendix (`boot_info`), added to a
+//! private deployment copy before regenerating and signing its manifest.
+//! That data is authenticated by the selector's key, never used as a key.
+//! The recipe output stays unchanged; deployment assembly owns its date.
 //!
 //! ## Why the appendix works at all, and what it rests on
 //!
@@ -329,6 +332,7 @@ fn hex8(value: u32) -> [u8; 8] {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
     use super::*;
 
     fn field(archive: &[u8], header_at: usize, index: usize) -> u32 {

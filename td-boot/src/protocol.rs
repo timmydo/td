@@ -306,6 +306,8 @@ pub const REQUIRED_TD_INIT_APPLETS: &[&str] = &[MOUNT_APPLET, UMOUNT_APPLET, LOS
 // above: no root farm serves it. The image's shape check binds it into the
 // selector initramfs, and only there.
 pub const SECRET_LINE_APPLET: &str = "secret-line";
+#[allow(dead_code)]
+pub const BOOT_MENU_APPLET: &str = "boot-menu";
 // The td-init applet through which the installed selector restarts the
 // machine once `update` completed a staged selector update without a
 // predicted protector (td-install/ENCRYPTION.md "Selector update"). The

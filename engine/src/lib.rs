@@ -58,6 +58,8 @@
 // See td-install/DESIGN.md §§5–7 for the shared-source contract.
 pub mod application;
 pub mod application_spec;
+pub mod boot_info;
+pub mod boot_info_source;
 pub mod bzip2;
 pub mod cpio;
 pub mod crc32;
