@@ -80,7 +80,7 @@ compatibility and retain it until closure. Retained Body/Envelope validators
 (sections 180 and 187) instead take the same key's shared transaction-level
 lock on each turn, fully revalidate schema/epoch and Runtime access before
 application reads, and acknowledge rollback before returning. The fixed HTTPS
-authentication worker and foreground relay idle reader (below) acquire the
+authentication worker, HTTPS API read workers and foreground relay idle reader acquire the
 session lock at connection admission,
 qualifies the schema and runtime role once, and retains that lock until closure.
 Their jobs still check epoch, maintenance and selected configuration;
@@ -2457,24 +2457,46 @@ DNS queue is created, and all failed paths release their slot after closing
 owned work. Health and settlement retain independent admission capacity at
 runtime integration. This entry prepares HTTP workers; it activates no role.
 
-## 73. Prepared HTTP read backend
+## 73. HTTP read backend
 
 `postgres_http_api::Service` connects the fixed HTTPS body-worker interface
-to the shared bounded HTTP framing and PostgreSQL read dispatcher. It remains
-inert until the runtime integration. Its prepared Session, profile binding and
+to the shared bounded HTTP framing and PostgreSQL read dispatcher. Its Session, profile binding and
 resource plan must agree; HTTPS, response retention and dispatch share one
-RuntimeClock. It implements Core/echo, Mailbox/get, Email/query and Email/get;
-uploads, mutations and EventSource remain unsupported here.
+RuntimeClock. Read dispatch includes Core, mailbox, email, thread and change
+methods. Uploads and mutations use the separate publication adapters below;
+their write connections are not retained by the read cache.
 
 Original credentials stay borrowed through body preparation and fresh primary
 snapshot authentication. The observed device ID must match their syntax, but
-only the fresh snapshot grants read authority. One reserved read slot covers
-fresh DNS, runtime-role qualification and the whole batch under the original
-execution deadline. Final snapshot validation precedes response output; the
-connection and read slot drop before headers, while temporary response quota
-remains charged through output and cleanup. No database work runs on the
+only the fresh snapshot grants read authority. Each fixed HTTPS body worker
+retains at most one read connection for its last account and configured origin, holding one existing
+read permit. Connection admission performs DNS, schema and runtime-role
+qualification and retains the shared migration lock. Each job begins a fresh
+read-only repeatable-read transaction, checks epoch, maintenance, selected
+configuration and the complete presented credential, and acknowledges ROLLBACK
+before output. Only the clean connection and its permit survive; no snapshot,
+body pin or authority does. The standalone backend entry still closes its
+connection after the job.
+
+API read sessions admit at most eight jobs within sixty seconds, each under
+the original ten-second execution deadline. Per-job wire allowances remain
+256 MiB input, 512 KiB output and 8192 frames; finite connection totals are
+eight times those limits, with no parser/authentication reset. These are wire
+budgets, not resident allocations. Owning-thread maintenance retires exhausted
+or near-expiry sessions between jobs and during bounded HTTP input/output
+turns. Slow progressing peers cannot retain an expired idle database session.
+The local hook issues no SQL; active database jobs keep their original finite
+deadline and release their transaction before response output. Account or origin changes, uploads,
+downloads and mutations discard the retained reader before acquiring other
+storage capacity. Observable idle disconnects reconnect before job submission;
+failures after submission retire the connection without replaying the job.
+Worker exit closes retained resources on the same thread before releasing
+their read permits. Account count does not multiply retained sessions.
+
+Final snapshot validation and rollback precede response output; temporary
+response quota remains charged through output and cleanup. No database work runs on the
 network reactor, no success escapes a failed snapshot, and uncertain response
-cleanup stops admission. No new listener or production command activates it.
+cleanup stops admission.
 
 Shared HTTP framing keeps the execution deadline strictly before the outer
 response deadline, including short original request allowances. It caps

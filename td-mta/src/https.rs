@@ -90,7 +90,7 @@ struct Client {
     drain_left: usize,
     response: Vec<u8>,
     sent: usize,
-    attempt_admitted: bool,
+    attempt: Option<http_auth::Attempt>,
     principal: Option<http_auth::Principal>,
     credentials: Option<http_auth::BasicCredentials>,
     authentication: Option<Result<Option<http_auth::Principal>, Error>>,
@@ -107,6 +107,11 @@ struct EventState {
     headers: bool,
     pending: bool,
     last: Tick,
+}
+struct ApiWorker<'a> {
+    account: crate::ids::AccountId,
+    origin: usize,
+    worker: Option<Box<dyn crate::https_api::Worker + 'a>>,
 }
 impl Drop for Client {
     fn drop(&mut self) {
@@ -541,7 +546,17 @@ impl Https<'_> {
             return;
         }
         warm.fetch_add(1, Ordering::Release);
+        let mut api_worker: Option<ApiWorker<'_>> = None;
+        let mut maintained = Instant::now();
         while !done.load(Ordering::Acquire) {
+            if maintained.elapsed() >= Duration::from_secs(1) {
+                if let Some(worker) = api_worker.as_mut().and_then(|slot| slot.worker.as_mut()) {
+                    if worker.maintain().is_err() {
+                        api_worker = None;
+                    }
+                }
+                maintained = Instant::now();
+            }
             for cell in slots {
                 let mut slot = match cell.try_lock() {
                     Ok(slot) => slot,
@@ -559,10 +574,12 @@ impl Https<'_> {
                 let result = if client.body_slot.is_none() {
                     Err(Error::Invalid)
                 } else if client.phase == Phase::Download {
+                    api_worker = None;
                     self.download(client, control)
                 } else if client.phase == Phase::Api {
-                    self.api(client, control)
+                    self.api(client, control, &mut api_worker)
                 } else {
+                    api_worker = None;
                     self.upload(client, control)
                 };
                 if result.is_err() {
@@ -890,7 +907,7 @@ impl Https<'_> {
                     drain_left: DRAIN_BYTES,
                     response,
                     sent: 0,
-                    attempt_admitted: false,
+                    attempt: None,
                     principal: None,
                     credentials: None,
                     authentication: None,
@@ -978,19 +995,23 @@ impl Https<'_> {
                 if let Ok(index) = selection {
                     client.origin = index;
                 }
+                if selection.is_ok() && client.attempt.is_none() {
+                    client.attempt = attempts.reserve(client.peer, time.monotonic.0);
+                }
                 let status = if let Err(status) = selection {
                     status
-                } else if !client.attempt_admitted && !attempts.admit(client.peer, time.monotonic.0)
-                {
+                } else if client.attempt.is_none() {
                     429
                 } else {
-                    client.attempt_admitted = true;
                     let Some(authentication) = client.authentication.take() else {
                         client.phase = Phase::Authenticate;
                         return Ok(true);
                     };
                     match authentication {
                         Ok(Some(principal)) => {
+                            if let Some(attempt) = client.attempt.take() {
+                                attempts.authenticated(attempt);
+                            }
                             let device = principal.device;
                             if let Some(backend) = self.backend(principal.account, client.origin) {
                                 if let Some(account) = head.target.strip_prefix("/jmap/upload/") {
@@ -1262,7 +1283,12 @@ impl Https<'_> {
             }
         }
     }
-    fn api(&self, client: &mut Client, control: &Control) -> Result<(), Error> {
+    fn api<'a>(
+        &'a self,
+        client: &mut Client,
+        control: &Control,
+        worker: &mut Option<ApiWorker<'a>>,
+    ) -> Result<(), Error> {
         use crate::https_download::Failure;
         let principal = client.principal.ok_or(Error::Invalid)?;
         let backend = self
@@ -1272,21 +1298,33 @@ impl Https<'_> {
         let framing = head.framing;
         let expect_continue = head.expect_continue;
         client.head = HeadReader::new(Vec::new().into_boxed_slice());
-        let result = backend.api(
-            crate::https_api::Request {
-                device: principal.device,
-                credentials: client.credentials.as_ref().ok_or(Error::Invalid)?,
-                framing,
-                expect_continue,
-                prefix: client
-                    .input
-                    .get(..client.input_used)
-                    .ok_or(Error::Invalid)?,
-                deadline: client.absolute,
-            },
-            client.connection.as_mut().ok_or(Error::Invalid)?,
-            control,
-        );
+        if worker
+            .as_ref()
+            .is_none_or(|slot| slot.account != principal.account || slot.origin != client.origin)
+        {
+            *worker = None;
+            *worker = Some(ApiWorker {
+                account: principal.account,
+                origin: client.origin,
+                worker: backend.api_worker(),
+            });
+        }
+        let request = crate::https_api::Request {
+            device: principal.device,
+            credentials: client.credentials.as_ref().ok_or(Error::Invalid)?,
+            framing,
+            expect_continue,
+            prefix: client
+                .input
+                .get(..client.input_used)
+                .ok_or(Error::Invalid)?,
+            deadline: client.absolute,
+        };
+        let transport = client.connection.as_mut().ok_or(Error::Invalid)?;
+        let result = match worker.as_mut().and_then(|slot| slot.worker.as_mut()) {
+            Some(worker) => worker.api(request, transport, control),
+            None => backend.api(request, transport, control),
+        };
         client.credentials = None;
         client.input.fill(0);
         client.input_used = 0;

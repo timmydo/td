@@ -8,6 +8,7 @@ const FRAMES: usize = 1088;
 #[derive(Clone)]
 pub(super) struct Windows(Arc<Mutex<State>>);
 struct State {
+    limits: (usize, usize, usize),
     bytes: usize,
     output: usize,
     frames: usize,
@@ -23,10 +24,17 @@ enum Phase {
 }
 impl Windows {
     pub(super) fn new(turns: usize) -> Self {
+        Self::bounded(turns, INPUT, OUTPUT, FRAMES)
+    }
+    pub(super) fn body(turns: usize) -> Self {
+        Self::bounded(turns, 256 * 1024 * 1024, 512 * 1024, 8192)
+    }
+    fn bounded(turns: usize, input: usize, output: usize, frames: usize) -> Self {
         Self(Arc::new(Mutex::new(State {
-            bytes: INPUT,
-            output: OUTPUT,
-            frames: FRAMES,
+            limits: (input, output, frames),
+            bytes: input,
+            output,
+            frames,
             left: turns,
             phase: Phase::First,
             failed: false,
@@ -48,9 +56,9 @@ impl Windows {
             }
             state.left = state.left.checked_sub(1).ok_or(())?;
             if state.phase == Phase::Closed {
-                state.bytes = INPUT;
-                state.output = OUTPUT;
-                state.frames = FRAMES;
+                state.bytes = state.limits.0;
+                state.output = state.limits.1;
+                state.frames = state.limits.2;
             }
             state.phase = Phase::Active;
             Ok(())
@@ -101,6 +109,36 @@ impl Windows {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn body_turns_keep_the_original_per_job_allowances_and_finite_count() {
+        let window = Windows::body(2);
+        for _ in 0..2 {
+            window.begin().unwrap();
+            window.input(256 * 1024 * 1024).unwrap();
+            window.output(512 * 1024).unwrap();
+            for _ in 0..8192 {
+                window.frame().unwrap();
+            }
+            window.finish().unwrap();
+        }
+        assert!(window.begin().is_err());
+        for (input, output, frames) in [
+            (256 * 1024 * 1024 + 1, 0, 0),
+            (0, 512 * 1024 + 1, 0),
+            (0, 0, 8193),
+        ] {
+            let window = Windows::body(2);
+            window.begin().unwrap();
+            let accepted = window
+                .input(input)
+                .and_then(|()| window.output(output))
+                .and_then(|()| (0..frames).try_for_each(|_| window.frame()));
+            assert!(accepted.is_err());
+            assert!(window.finish().is_err());
+            assert!(window.begin().is_err());
+        }
+    }
 
     #[test]
     fn authentication_and_first_turn_share_the_initial_window() {

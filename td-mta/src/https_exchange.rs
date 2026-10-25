@@ -15,6 +15,7 @@ pub(crate) struct Sender<'a> {
     pub(crate) idle: Deadline,
     pub(crate) last: Tick,
     pub(crate) started: bool,
+    pub(crate) maintenance: Option<&'a dyn Fn()>,
 }
 impl<'a> Sender<'a> {
     pub(crate) fn new(
@@ -35,9 +36,13 @@ impl<'a> Sender<'a> {
             idle,
             last,
             started: false,
+            maintenance: None,
         })
     }
     pub(crate) fn check(&mut self) -> Result<(), Error> {
+        if let Some(maintain) = self.maintenance {
+            maintain();
+        }
         let now = self.clock.sample()?.monotonic;
         if now < self.last {
             return Err(Error::WriterStopped);

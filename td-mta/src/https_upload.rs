@@ -92,6 +92,10 @@ impl Response {
 /// parsing and the initial device observation confer no later store authority.
 pub trait Backend: Sync {
     fn account(&self) -> AccountId;
+    /// Construct state only on its owning body worker; never on the reactor.
+    fn api_worker(&self) -> Option<Box<dyn crate::https_api::Worker + '_>> {
+        None
+    }
     fn session(&self) -> Option<&crate::jmap_session::Session> {
         None
     }

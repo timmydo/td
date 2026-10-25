@@ -18,7 +18,52 @@ use crate::{
     smtp_receiving::Control,
     store_fs::ResponseCoordinator,
 };
+use std::cell::RefCell;
 use std::path::Path;
+use std::time::Instant;
+
+struct CachedRead<'a> {
+    session: Option<crate::postgres_probe::ReadSession>,
+    _permit: crate::postgres_read::ReadPermit<'a>,
+}
+impl Drop for CachedRead<'_> {
+    fn drop(&mut self) {
+        if let Some(session) = self.session.take() {
+            session.retire(Instant::now() + std::time::Duration::from_millis(100));
+        }
+    }
+}
+struct ApiWorker<'w, 's, 'sr, 'a> {
+    service: &'w Service<'s, 'sr, 'a>,
+    cached: RefCell<Option<CachedRead<'s>>>,
+}
+fn retire_cached(cache: &RefCell<Option<CachedRead<'_>>>) {
+    let Ok(mut cache) = cache.try_borrow_mut() else {
+        return;
+    };
+    if cache
+        .as_ref()
+        .and_then(|cached| cached.session.as_ref())
+        .is_some_and(|session| session.needs_retirement(Instant::now()))
+    {
+        *cache = None;
+    }
+}
+impl https_api::Worker for ApiWorker<'_, '_, '_, '_> {
+    fn maintain(&mut self) -> Result<(), Error> {
+        retire_cached(&self.cached);
+        Ok(())
+    }
+    fn api(
+        &mut self,
+        request: Request<'_>,
+        transport: &mut dyn Transport,
+        control: &Control,
+    ) -> Result<(), Failure> {
+        self.service
+            .serve_api(request, transport, control, Some(&self.cached))
+    }
+}
 
 /// The prepared session must belong
 /// to this binding. HTTPS and response retention must share this exact clock.
@@ -41,6 +86,12 @@ pub struct Service<'s, 'sr, 'a> {
 impl https_upload::Backend for Service<'_, '_, '_> {
     fn account(&self) -> AccountId {
         self.binding.account()
+    }
+    fn api_worker(&self) -> Option<Box<dyn https_api::Worker + '_>> {
+        Some(Box::new(ApiWorker {
+            service: self,
+            cached: RefCell::new(None),
+        }))
     }
     fn session(&self) -> Option<&Session> {
         Some(self.session)
@@ -67,6 +118,127 @@ impl https_upload::Backend for Service<'_, '_, '_> {
         transport: &mut dyn Transport,
         control: &Control,
     ) -> Result<(), Failure> {
+        self.serve_api(request, transport, control, None)
+    }
+}
+impl<'s, 'sr, 'a> Service<'s, 'sr, 'a> {
+    fn read_cached<T>(
+        &self,
+        cache: &RefCell<Option<CachedRead<'s>>>,
+        deadline: Instant,
+        password: &[u8],
+        read: impl FnOnce(&mut Snapshot<'_>) -> Result<T, ApiError>,
+    ) -> Result<T, ApiError> {
+        use crate::postgres_probe::{self, ReadIsolation, ReadSession};
+        if !self.executable.is_absolute()
+            || self.loaded.bootstrap.profile() != self.binding.profile()
+            || !self.binding.roles().jmap()
+        {
+            return Err(Error::Forbidden.into());
+        }
+        let presented = Presented::parse(password).ok_or(Error::Forbidden)?;
+        let device = presented.id();
+        let mut cache = cache.try_borrow_mut().map_err(|_| Error::Busy)?;
+        let probe_error = |error| ApiError::Io(read_error(postgres_read::Error::Connection(error)));
+        if let Some(session) = cache.as_mut().and_then(|cached| cached.session.as_mut()) {
+            if !session.reusable(deadline) || session.check_idle(deadline).is_err() {
+                *cache = None;
+            }
+        }
+        let reused = cache.is_some();
+        if cache.is_none() {
+            let permit = self
+                .slots
+                .acquire()
+                .map_err(|error| ApiError::Io(read_error(error)))?;
+            let dns_deadline = deadline.min(Instant::now() + std::time::Duration::from_secs(5));
+            let addresses = crate::postgres_resolver::resolve(
+                self.executable,
+                &self.loaded.bootstrap,
+                dns_deadline,
+            )
+            .map_err(|error| ApiError::Io(read_error(postgres_read::Error::Resolution(error))))?;
+            let mut opened = None;
+            for address in addresses {
+                let mut request = self.loaded.bootstrap.request(address);
+                request.mode = postgres_probe::Mode::Runtime;
+                match ReadSession::open_body(&request, &self.loaded.trust, deadline) {
+                    Ok(session) => {
+                        opened = Some(session);
+                        break;
+                    }
+                    Err(postgres_probe::Error::Transport) => (),
+                    Err(error) => return Err(probe_error(error)),
+                }
+            }
+            let session = opened.ok_or_else(|| probe_error(postgres_probe::Error::Transport))?;
+            *cache = Some(CachedRead {
+                session: Some(session),
+                _permit: permit,
+            });
+        }
+        let session = cache
+            .as_mut()
+            .and_then(|cached| cached.session.as_mut())
+            .ok_or(Error::Invalid)?;
+        let result = session
+            .read_worker(
+                self.binding.epoch(),
+                ReadIsolation::RepeatableReadOnly,
+                deadline,
+                |worker| {
+                    let binding = self.binding.clone();
+                    let identity = worker.run(|client| {
+                        Box::pin(async move {
+                            crate::postgres_snapshot::observe(client, &binding, presented).await
+                        })
+                    })?;
+                    let identity = match identity {
+                        Ok(identity) => identity,
+                        Err(error) => {
+                            return Ok(Err(ApiError::Io(read_error(
+                                postgres_read::snapshot_error(error),
+                            ))))
+                        }
+                    };
+                    Ok((|| {
+                        let mut snapshot =
+                            Snapshot::borrowed(worker, identity, deadline, self.binding, device)
+                                .map_err(|error| ApiError::Io(read_error(error)))?;
+                        read(&mut snapshot)
+                    })())
+                },
+            )
+            .map_err(probe_error)
+            .and_then(|result| result);
+        if reused {
+            crate::performance::record(
+                crate::performance::Phase::DbReuse,
+                std::time::Duration::ZERO,
+                if result.is_ok() {
+                    crate::performance::Outcome::Success
+                } else {
+                    crate::performance::Outcome::Failed
+                },
+            );
+        }
+        if result.is_err() {
+            *cache = None;
+        }
+        result
+    }
+    fn serve_api(
+        &self,
+        request: Request<'_>,
+        transport: &mut dyn Transport,
+        control: &Control,
+        cache: Option<&RefCell<Option<CachedRead<'s>>>>,
+    ) -> Result<(), Failure> {
+        let maintenance = || {
+            if let Some(cache) = cache {
+                retire_cached(cache);
+            }
+        };
         let mut sender = Sender::new(
             transport,
             control,
@@ -75,7 +247,8 @@ impl https_upload::Backend for Service<'_, '_, '_> {
             request.deadline,
         )
         .map_err(Failure::Before)?;
-        let result = self.execute(&request, &mut sender);
+        sender.maintenance = Some(&maintenance);
+        let result = self.execute(&request, &mut sender, cache);
         let result = if self.responses.admission_stopped() {
             Err(Error::WriterStopped)
         } else {
@@ -93,8 +266,6 @@ impl https_upload::Backend for Service<'_, '_, '_> {
             }
         })
     }
-}
-impl Service<'_, '_, '_> {
     fn send_download(
         &self,
         request: crate::https_download::Request<'_>,
@@ -225,7 +396,12 @@ impl Service<'_, '_, '_> {
         }
         Err(Error::Invalid)
     }
-    fn execute(&self, request: &Request<'_>, sender: &mut Sender<'_>) -> Result<(), ApiError> {
+    fn execute(
+        &self,
+        request: &Request<'_>,
+        sender: &mut Sender<'_>,
+        cache: Option<&RefCell<Option<CachedRead<'s>>>>,
+    ) -> Result<(), ApiError> {
         let presented = Presented::parse(request.credentials.password()).ok_or(Error::Forbidden)?;
         if presented.id() != request.device {
             return Err(Error::Forbidden.into());
@@ -265,6 +441,26 @@ impl Service<'_, '_, '_> {
                 (None, false)
             }
         };
+        if let Some(cache) = cache {
+            if !matches!(
+                mutation,
+                Some(b"Email/set" | b"Mailbox/set" | b"EmailSubmission/set")
+            ) {
+                let complete = self.read_cached(
+                    cache,
+                    self.clock.deadline_instant(execution)?,
+                    request.credentials.password(),
+                    |snapshot| {
+                        dispatch::run_with_postgres_read(
+                            plan, retention, execution, snapshot, self.clock, true,
+                        )
+                        .map_err(dispatch_error)
+                    },
+                )?;
+                return https_api::send_response(complete, sender);
+            }
+            *cache.try_borrow_mut().map_err(|_| Error::Busy)? = None;
+        }
         let mut snapshot = Snapshot::open_resolved(
             self.slots,
             self.loaded,
@@ -390,17 +586,18 @@ impl Service<'_, '_, '_> {
             drop(snapshot);
             result
         }
-        .map_err(|error| {
-            ApiError::Io(match error {
-                dispatch::Error::Storage(error) => error,
-                dispatch::Error::ExecutionDeadline => Error::Deadline,
-                dispatch::Error::StorageBusy => Error::Busy,
-                dispatch::Error::Forbidden => Error::Forbidden,
-                _ => Error::Capacity,
-            })
-        })?;
+        .map_err(dispatch_error)?;
         https_api::send_response(complete, sender)
     }
+}
+fn dispatch_error(error: dispatch::Error) -> ApiError {
+    ApiError::Io(match error {
+        dispatch::Error::Storage(error) => error,
+        dispatch::Error::ExecutionDeadline => Error::Deadline,
+        dispatch::Error::StorageBusy => Error::Busy,
+        dispatch::Error::Forbidden => Error::Forbidden,
+        _ => Error::Capacity,
+    })
 }
 fn read_error(error: postgres_read::Error) -> Error {
     match error {

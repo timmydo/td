@@ -68,7 +68,7 @@ fn client(
     wait(|| matches!(client.handshake(cap).unwrap(), Handshake::Complete(_)));
     client
 }
-fn send(client: &mut impl Transport, request: &[u8]) {
+fn send(client: &mut (impl Transport + ?Sized), request: &[u8]) {
     let mut sent = 0;
     wait(|| {
         if sent < request.len() {
@@ -954,6 +954,37 @@ fn account_and_allowed_origin_select_private_session_and_backend() {
         account: AccountId,
         session: crate::jmap_session::Session,
         calls: AtomicU64,
+        api_calls: AtomicU64,
+    }
+    struct Api<'a>(&'a Backend);
+    impl crate::https_api::Worker for Api<'_> {
+        fn api(
+            &mut self,
+            request: crate::https_api::Request<'_>,
+            transport: &mut dyn Transport,
+            _: &Control,
+        ) -> Result<(), crate::https_download::Failure> {
+            assert_eq!(
+                request.credentials.username(),
+                if self.0.account == AccountId::from_bytes([0xaa; 16]) {
+                    "first"
+                } else {
+                    "second"
+                }
+            );
+            let state = self.0.session.state().unwrap();
+            let body = format!("{{\"sessionState\":\"{state}\"}}");
+            send(
+                transport,
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+            self.0.api_calls.fetch_add(1, Ordering::Release);
+            Ok(())
+        }
     }
     impl crate::https_upload::Backend for Backend {
         fn account(&self) -> AccountId {
@@ -961,6 +992,9 @@ fn account_and_allowed_origin_select_private_session_and_backend() {
         }
         fn session(&self) -> Option<&crate::jmap_session::Session> {
             Some(&self.session)
+        }
+        fn api_worker(&self) -> Option<Box<dyn crate::https_api::Worker + '_>> {
+            Some(Box::new(Api(self)))
         }
         fn receive(
             &self,
@@ -1007,7 +1041,12 @@ fn account_and_allowed_origin_select_private_session_and_backend() {
         "[relay]\nhost = \"alias.test\"",
     ));
     let resolved = resolved(&source);
-    let resource = Limits::default().plan().unwrap();
+    let resource = Limits {
+        body_jobs: 1,
+        ..Limits::default()
+    }
+    .plan()
+    .unwrap();
     let admission = DiskLimits::default()
         .plan(&resource, WorkLimits::default(), ViewMode::OnlineBackground)
         .unwrap();
@@ -1033,6 +1072,7 @@ fn account_and_allowed_origin_select_private_session_and_backend() {
         )
         .unwrap(),
         calls: AtomicU64::new(0),
+        api_calls: AtomicU64::new(0),
     };
     let first = make(AccountId::from_bytes([0xaa; 16]), "first", &origin_text);
     let first_alias = make(AccountId::from_bytes([0xaa; 16]), "first", &alias_text);
@@ -1049,6 +1089,23 @@ fn account_and_allowed_origin_select_private_session_and_backend() {
             let worker = scope.spawn(|| server.run(&control));
             let stop = Stop(&control);
             wait(|| ready.load(Ordering::Acquire));
+            for (username, password, host, client_lease, expected) in [
+                ("first", "first-password", "localhost", &lease, &first),
+                ("first", "first-password", "alias.test", &alias_lease, &first_alias),
+                ("first", "first-password", "localhost", &lease, &first),
+                ("second", "second-password", "alias.test", &alias_lease, &second_alias),
+                ("first", "first-password", "alias.test", &alias_lease, &first_alias),
+            ] {
+                let before = expected.api_calls.load(Ordering::Acquire);
+                let authorization = base64(format!("{username}:{password}").as_bytes());
+                let mut peer = client(address, client_lease, clock.clone());
+                send(&mut peer, format!("POST /jmap/api HTTP/1.1\r\nHost: {host}:{}\r\nAuthorization: Basic {authorization}\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{{}}", address.port()).as_bytes());
+                let (status, _, body) = full_reply(&mut peer);
+                assert_eq!(status, 200);
+                let value = td_json::parse(&body).unwrap();
+                assert_eq!(value["sessionState"].as_str(), Some(expected.session.state().unwrap()));
+                wait(|| expected.api_calls.load(Ordering::Acquire) == before + 1);
+            }
             for (origin, host, client_lease, offset) in [(&origin_text, "localhost", &lease, 0), (&alias_text, "alias.test", &alias_lease, 1)] {
             for (username, password, own, other) in [
                 ("first", "first-password", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "abbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),

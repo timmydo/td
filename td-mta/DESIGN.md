@@ -2039,8 +2039,11 @@ are admitted. Per-IP connection refusals emit the bounded, rate-limited
 admission-refused event before closing the unauthenticated socket. No peer
 address or credential is retained in that event. Authentication uses fixed
 one-second monotonic windows: 64
-attempts globally and eight per IP, with a 64-entry peer table that never
-evicts an unexpired entry. Invalid credential syntax consumes an attempt too;
+attempts globally and eight failed or still-pending attempts per IP, with a
+64-entry peer table that never evicts an unexpired entry. A successful fresh
+authentication releases only its own per-IP charge, never the global work
+charge or a prior failure. Completion from an older window cannot refund a
+new window. Invalid credential syntax consumes an attempt too;
 wrong authority or cross-origin requests are refused before verification.
 Exhaustion receives 429 with Retry-After: 1. This permits boundary bursts,
 not a rolling-window rate guarantee. Header total/idle, TLS, response idle
@@ -2740,6 +2743,16 @@ new task. Maintenance Busy defers cleanup to the next throttled turn without
 stopping HTTPS; other maintenance errors still stop serving. Clean completed
 sessions have a separate bounded termination
 allowance; request deadlines, TLS lifetime and failed-job bounds are unchanged.
+
+Each bounded HTTPS body worker may retain one worker-local API read context
+for its last account and origin. Changing either or handling a transfer discards that
+context on the owning thread. It never lives on the network reactor or in an
+account-sized cache. The native PostgreSQL context owns one existing read
+permit, establishes fresh authority in a new transaction for every job, and
+rolls back before response output. Bounded HTTP input/output turns also retire
+expired idle sessions locally, without SQL or a background task. POSTGRES.md section 73 owns its finite
+session, protocol and cleanup bounds. Mutations retain their existing separate
+publication and uncertain-COMMIT paths.
 
 ## Native ACME deployment profile
 

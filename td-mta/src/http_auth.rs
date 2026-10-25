@@ -157,6 +157,12 @@ struct Peer {
     address: IpAddr,
     attempts: u16,
 }
+/// One charged attempt; only a successful authentication returns its peer charge.
+/// Not Clone or Copy: completion cannot refund the same reservation twice.
+pub(crate) struct Attempt {
+    address: IpAddr,
+    second: u64,
+}
 /// Fixed one-second windows. Never evict an unexpired peer to admit a new one.
 pub struct Attempts {
     second: u64,
@@ -173,6 +179,25 @@ impl Default for Attempts {
     }
 }
 impl Attempts {
+    pub(crate) fn reserve(&mut self, address: IpAddr, monotonic_ms: u64) -> Option<Attempt> {
+        self.admit(address, monotonic_ms).then_some(Attempt {
+            address,
+            second: monotonic_ms / 1000,
+        })
+    }
+    pub(crate) fn authenticated(&mut self, attempt: Attempt) {
+        if attempt.second != self.second {
+            return;
+        }
+        if let Some(peer) = self
+            .peers
+            .iter_mut()
+            .flatten()
+            .find(|peer| peer.address == attempt.address)
+        {
+            peer.attempts = peer.attempts.saturating_sub(1);
+        }
+    }
     pub fn admit(&mut self, address: IpAddr, monotonic_ms: u64) -> bool {
         let admitted = self.try_admit(address, monotonic_ms);
         if !admitted {
@@ -299,5 +324,39 @@ mod tests {
         assert!(after.calls >= before.calls + 3);
         assert_eq!(after.busy - before.busy, after.calls - before.calls);
         assert_eq!(after.total_us, 0);
+    }
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn successful_authentication_releases_only_its_peer_charge() {
+        let ip = IpAddr::from([127, 0, 0, 1]);
+        let mut attempts = Attempts::default();
+        for _ in 0..GLOBAL_ATTEMPTS {
+            let admitted = attempts.reserve(ip, 1).unwrap();
+            attempts.authenticated(admitted);
+        }
+        assert!(attempts.reserve(ip, 1).is_none());
+        let mut attempts = Attempts::default();
+        for _ in 0..PEER_ATTEMPTS - 1 {
+            assert!(attempts.reserve(ip, 1).is_some());
+        }
+        let admitted = attempts.reserve(ip, 1).unwrap();
+        assert!(attempts.reserve(ip, 1).is_none());
+        attempts.authenticated(admitted);
+        assert!(attempts.reserve(ip, 1).is_some());
+        assert!(attempts.reserve(ip, 1).is_none());
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn late_success_cannot_refund_a_new_window() {
+        let ip = IpAddr::from([127, 0, 0, 1]);
+        let mut attempts = Attempts::default();
+        let old = attempts.reserve(ip, 999).unwrap();
+        for _ in 0..PEER_ATTEMPTS {
+            assert!(attempts.reserve(ip, 1000).is_some());
+        }
+        attempts.authenticated(old);
+        assert!(attempts.reserve(ip, 1000).is_none());
+        assert!(attempts.reserve(ip, 999).is_none());
     }
 }

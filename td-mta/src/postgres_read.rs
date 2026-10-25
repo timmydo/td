@@ -127,7 +127,7 @@ const _: () = assert!(
 /// Worker-local: its poll waker is bound to the thread that opened it.
 /// The connection drops before its reserved slot becomes available again.
 pub struct Snapshot<'a> {
-    worker: Worker,
+    worker: SnapshotWorker<'a>,
     identity: ViewIdentity,
     binding: Binding,
     device: DeviceId,
@@ -136,7 +136,29 @@ pub struct Snapshot<'a> {
     metadata: Option<Metadata>,
     metadata_window: MetadataWindow,
     _worker_thread: std::marker::PhantomData<std::rc::Rc<()>>,
-    _permit: ReadPermit<'a>,
+    _permit: Option<ReadPermit<'a>>,
+}
+
+enum SnapshotWorker<'a> {
+    Owned(Worker),
+    Borrowed(&'a mut Worker),
+}
+impl std::ops::Deref for SnapshotWorker<'_> {
+    type Target = Worker;
+    fn deref(&self) -> &Worker {
+        match self {
+            Self::Owned(worker) => worker,
+            Self::Borrowed(worker) => worker,
+        }
+    }
+}
+impl std::ops::DerefMut for SnapshotWorker<'_> {
+    fn deref_mut(&mut self) -> &mut Worker {
+        match self {
+            Self::Owned(worker) => worker,
+            Self::Borrowed(worker) => worker,
+        }
+    }
 }
 
 impl crate::email_response::Source for Snapshot<'_> {
@@ -275,6 +297,39 @@ impl<'a> Snapshot<'a> {
         binding: &Binding,
         device: DeviceId,
     ) -> Result<Self, Error> {
+        Self::from_lease(
+            Some(permit),
+            SnapshotWorker::Owned(worker),
+            identity,
+            deadline,
+            binding,
+            device,
+        )
+    }
+    pub(crate) fn borrowed(
+        worker: &'a mut Worker,
+        identity: ViewIdentity,
+        deadline: Instant,
+        binding: &Binding,
+        device: DeviceId,
+    ) -> Result<Self, Error> {
+        Self::from_lease(
+            None,
+            SnapshotWorker::Borrowed(worker),
+            identity,
+            deadline,
+            binding,
+            device,
+        )
+    }
+    fn from_lease(
+        permit: Option<ReadPermit<'a>>,
+        worker: SnapshotWorker<'a>,
+        identity: ViewIdentity,
+        deadline: Instant,
+        binding: &Binding,
+        device: DeviceId,
+    ) -> Result<Self, Error> {
         let mut view = Self {
             worker,
             identity,
@@ -334,6 +389,7 @@ impl<'a> Snapshot<'a> {
             _permit: permit,
             ..
         } = self;
+        let permit = permit.ok_or(Error::Invalid)?;
         drop(worker);
         Ok(BetweenMethods {
             permit,
@@ -829,7 +885,7 @@ fn check_changed(bytes: &[u8], identity: ViewIdentity) -> Result<(), Error> {
     }
     Ok(())
 }
-fn snapshot_error(error: postgres_snapshot::Error) -> Error {
+pub(crate) fn snapshot_error(error: postgres_snapshot::Error) -> Error {
     match error {
         postgres_snapshot::Error::Schema(value) => Error::Schema(value),
         postgres_snapshot::Error::Credential(value) => Error::Credential(value),

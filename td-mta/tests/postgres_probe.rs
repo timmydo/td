@@ -6507,6 +6507,28 @@ mod http_fixture {
         pub(super) output: Vec<u8>,
         pub(super) fail_write: bool,
     }
+    pub(super) struct Observed<'a> {
+        pub(super) wire: Wire,
+        pub(super) before_write: &'a (dyn Fn() + Sync),
+    }
+    impl Transport for Observed<'_> {
+        fn read(&mut self, bytes: &mut [u8]) -> Result<IoProgress, Error> {
+            self.wire.read(bytes)
+        }
+        fn write(&mut self, bytes: &[u8]) -> Result<IoProgress, Error> {
+            (self.before_write)();
+            self.wire.write(bytes)
+        }
+        fn flush(&mut self) -> Result<FlushProgress, Error> {
+            self.wire.flush()
+        }
+        fn close(&mut self) -> Result<FlushProgress, Error> {
+            self.wire.close()
+        }
+        fn abort(&mut self) {
+            self.wire.abort();
+        }
+    }
     impl Transport for Wire {
         fn read(&mut self, bytes: &mut [u8]) -> Result<IoProgress, Error> {
             let count = bytes.len().min(17).min(self.input.len() - self.position);
@@ -6655,6 +6677,8 @@ fn exercise_http_read(
     );
     td_json::parse(&body).unwrap();
     let control = td_mta::smtp_receiving::Control::default();
+    let api_worker = std::cell::RefCell::new(service.api_worker());
+    let inspect_retirement = std::sync::atomic::AtomicBool::new(false);
     let call = |body: &str, password: &[u8], device, chunked, fail_write, expired| {
         let credentials = credentials(password);
         let input = if chunked {
@@ -6662,39 +6686,180 @@ fn exercise_http_read(
         } else {
             body.as_bytes().to_vec()
         };
-        let mut wire = Wire {
+        let wire = Wire {
             input,
             position: 0,
             output: Vec::new(),
             fail_write,
         };
-        let result = service.api(
-            td_mta::https_api::Request {
-                device,
-                credentials: &credentials,
-                framing: if chunked {
-                    Framing::Chunked
-                } else {
-                    Framing::Length(body.len() as u64)
-                },
-                prefix: &[],
-                expect_continue: chunked,
-                deadline: if expired {
-                    Deadline::after(td_mta::ports::Tick(0), 0).unwrap()
-                } else {
-                    until()
-                },
+        let inspect =
+            || {
+                if inspect_retirement.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                    let until = Instant::now() + Duration::from_secs(2);
+                    while sql(
+                        fixture,
+                        "SELECT count(*) FROM pg_stat_activity WHERE usename='mail_runtime'",
+                    ) != "0"
+                    {
+                        assert!(Instant::now() < until,
+                        "exhausted reader must close during HTTP output, not after the exchange");
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    let open = || {
+                        td_mta::postgres_read::Snapshot::open_resolved(
+                            &slots,
+                            &loaded,
+                            service.executable,
+                            deadline(),
+                            binding,
+                            password,
+                        )
+                        .unwrap()
+                    };
+                    let first = open();
+                    let second = open();
+                    drop((first, second));
+                }
+            };
+        let mut wire = http_fixture::Observed {
+            wire,
+            before_write: &inspect,
+        };
+        let request = td_mta::https_api::Request {
+            device,
+            credentials: &credentials,
+            framing: if chunked {
+                Framing::Chunked
+            } else {
+                Framing::Length(body.len() as u64)
             },
-            &mut wire,
-            &control,
-        );
+            prefix: &[],
+            expect_continue: chunked,
+            deadline: if expired {
+                Deadline::after(td_mta::ports::Tick(0), 0).unwrap()
+            } else {
+                until()
+            },
+        };
+        let mut worker = api_worker.borrow_mut();
+        if worker.is_none() {
+            *worker = service.api_worker();
+        }
+        let result = match worker.as_mut() {
+            Some(worker) => worker.api(request, &mut wire, &control),
+            None => service.api(request, &mut wire, &control),
+        };
         assert_eq!(responses.used().unwrap(), 0);
         assert!(!responses.admission_stopped());
-        (result, String::from_utf8(wire.output).unwrap())
+        (result, String::from_utf8(wire.wire.output).unwrap())
     };
     let rights_body = td_json::json!({"using":["urn:ietf:params:jmap:mail"], "methodCalls":[["Mailbox/get",{"accountId":account,"properties":["myRights"]},"rights"]]}).to_string();
     let (result, wire) = call(&rights_body, password, device, false, false, false);
     result.unwrap();
+    let retained_pid = || {
+        sql(
+            fixture,
+            "SELECT pid FROM pg_stat_activity WHERE usename='mail_runtime' AND state='idle'",
+        )
+        .parse::<u32>()
+        .unwrap()
+    };
+    let first_pid = retained_pid();
+    call(&rights_body, password, device, false, false, false)
+        .0
+        .unwrap();
+    assert_eq!(
+        retained_pid(),
+        first_pid,
+        "read job must reuse a clean idle connection"
+    );
+    assert_eq!(
+        sql(
+            fixture,
+            &format!("SELECT pg_terminate_backend({first_pid},1000)")
+        ),
+        "t"
+    );
+    call(&rights_body, password, device, false, false, false)
+        .0
+        .unwrap();
+    assert_ne!(
+        retained_pid(),
+        first_pid,
+        "idle disconnect must reconnect before submitting a job"
+    );
+    let second_pid = retained_pid();
+    for _ in 1..7 {
+        call(&rights_body, password, device, false, false, false)
+            .0
+            .unwrap();
+        assert_eq!(retained_pid(), second_pid);
+    }
+    inspect_retirement.store(true, std::sync::atomic::Ordering::Release);
+    call(&rights_body, password, device, false, false, false)
+        .0
+        .unwrap();
+    assert!(
+        !inspect_retirement.load(std::sync::atomic::Ordering::Acquire),
+        "response output must inspect cleanup while the API worker is occupied"
+    );
+    call(&rights_body, password, device, false, false, false)
+        .0
+        .unwrap();
+    assert_ne!(
+        retained_pid(),
+        second_pid,
+        "eight jobs must exhaust the retained read session"
+    );
+    let fresh = td_mta::postgres_devices::prepare_creation(
+        binding.epoch(),
+        binding.account(),
+        "cached read revocation",
+        1,
+    )
+    .unwrap();
+    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
+    td_mta::postgres_devices::publish_creation(&fixture.request(), &trust, deadline(), &fresh)
+        .unwrap();
+    call(
+        &rights_body,
+        fresh.password(),
+        fresh.device_id(),
+        false,
+        false,
+        false,
+    )
+    .0
+    .unwrap();
+    let revocation = td_mta::postgres_devices::prepare_revocation(
+        binding.epoch(),
+        binding.account(),
+        fresh.device_id(),
+        2,
+    )
+    .unwrap();
+    td_mta::postgres_devices::publish_revocation(
+        &fixture.request(),
+        &trust,
+        deadline(),
+        &revocation,
+    )
+    .unwrap();
+    assert!(matches!(
+        call(
+            &rights_body,
+            fresh.password(),
+            fresh.device_id(),
+            false,
+            false,
+            false
+        )
+        .0,
+        Err(td_mta::https_download::Failure::Before(Error::Forbidden))
+    ));
+    call(&rights_body, password, device, false, false, false)
+        .0
+        .unwrap();
     let rights = td_json::parse(wire.split_once("\r\n\r\n").unwrap().1).unwrap();
     let rights = &rights["methodResponses"][0][1]["list"][0]["myRights"];
     assert!(rights["maySetSeen"].is_true());
@@ -6847,6 +7012,7 @@ fn exercise_http_read(
     let raw = email["blobId"].as_str().unwrap();
     let part = email["textBody"][0]["blobId"].as_str().unwrap();
     let download = |blob: &str, secret: &[u8], fail_write| {
+        api_worker.borrow_mut().take();
         let target = td_mta::https_download::Target::parse(&format!(
             "/jmap/download/{account}/{blob}/snapshot.txt?type=text%2Fplain"
         ))
@@ -7036,6 +7202,7 @@ fn exercise_http_read(
             before + 2
         );
         let upload = |body: &[u8], framing, expect_continue, secret: &[u8]| {
+            api_worker.borrow_mut().take();
             let credentials = credentials(secret);
             let mut wire = Wire {
                 input: body.to_vec(),

@@ -11,6 +11,7 @@ use td_crypto::TrustStore;
 use tokio_postgres::Client;
 
 pub(super) const TURNS: usize = 64;
+pub(super) const BODY_TURNS: usize = 8;
 const LIFETIME: Duration = Duration::from_secs(60);
 
 struct Bounds {
@@ -66,17 +67,43 @@ impl ReadSession {
         trust: &TrustStore,
         deadline: Instant,
     ) -> Result<Self, Error> {
+        Self::open_kind(request, trust, deadline, false)
+    }
+    pub(crate) fn open_body(
+        request: &Request<'_>,
+        trust: &TrustStore,
+        deadline: Instant,
+    ) -> Result<Self, Error> {
+        Self::open_kind(request, trust, deadline, true)
+    }
+    fn open_kind(
+        request: &Request<'_>,
+        trust: &TrustStore,
+        deadline: Instant,
+        body: bool,
+    ) -> Result<Self, Error> {
         if request.mode != Mode::Runtime || super::remaining(deadline)? > MAX_DURATION {
             return Err(Error::Invalid);
         }
-        let bounds = Bounds::new(Instant::now())?;
+        let mut bounds = Bounds::new(Instant::now())?;
+        if body {
+            bounds.left = BODY_TURNS;
+        }
         let mut worker = connect_authenticated_until(
             request,
             trust,
             bounds.expires,
             deadline,
-            TURNS * 64 * 1024,
-            Input::retained(),
+            if body {
+                BODY_TURNS * 512 * 1024
+            } else {
+                TURNS * 64 * 1024
+            },
+            if body {
+                Input::retained_body()
+            } else {
+                Input::retained()
+            },
             LIFETIME,
         )?;
         worker.deadline = deadline;
@@ -127,6 +154,15 @@ impl ReadSession {
         operation: impl for<'a> FnOnce(&'a Client) -> Pin<Box<dyn Future<Output = Result<T, E>> + 'a>>
             + 'static,
     ) -> Result<Result<T, E>, Error> {
+        self.read_worker(epoch, isolation, deadline, |worker| worker.run(operation))
+    }
+    pub(crate) fn read_worker<T, E>(
+        &mut self,
+        epoch: StoreEpoch,
+        isolation: ReadIsolation,
+        deadline: Instant,
+        operation: impl FnOnce(&mut Worker) -> Result<Result<T, E>, Error>,
+    ) -> Result<Result<T, E>, Error> {
         let result = self.turn(epoch, isolation, deadline, operation);
         if !matches!(&result, Ok(Ok(_))) {
             self.retired = true;
@@ -138,8 +174,7 @@ impl ReadSession {
         epoch: StoreEpoch,
         isolation: ReadIsolation,
         deadline: Instant,
-        operation: impl for<'a> FnOnce(&'a Client) -> Pin<Box<dyn Future<Output = Result<T, E>> + 'a>>
-            + 'static,
+        operation: impl FnOnce(&mut Worker) -> Result<Result<T, E>, Error>,
     ) -> Result<Result<T, E>, Error> {
         if self.retired || epoch != self.epoch {
             return Err(Error::RuntimeSchema);
@@ -149,7 +184,7 @@ impl ReadSession {
         self.worker.deadline = deadline;
         self.worker.check()?;
         self.worker.begin_validation_turn()?;
-        let result = self.worker.run(move |client| Box::pin(async move {
+        self.worker.run(move |client| Box::pin(async move {
             let begin = match isolation {
                 ReadIsolation::RepeatableReadOnly => "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL idle_in_transaction_session_timeout=10000",
                 ReadIsolation::ReadCommitted => "BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL idle_in_transaction_session_timeout=10000",
@@ -162,10 +197,17 @@ impl ReadSession {
             let blocked: bool = row.try_get(1).map_err(|_| Error::RuntimeMaintenance)?;
             if observed != epoch.as_bytes().as_slice() { return Err(Error::RuntimeSchema); }
             if blocked { return Err(Error::RuntimeMaintenance); }
-            let result = operation(client).await;
-            client.batch_execute("ROLLBACK").await.map_err(|_| Error::Database)?;
-            Ok(result)
+            Ok(())
         }))??;
+        let result = operation(&mut self.worker)?;
+        self.worker.run(|client| {
+            Box::pin(async move {
+                client
+                    .batch_execute("ROLLBACK")
+                    .await
+                    .map_err(|_| Error::Database)
+            })
+        })??;
         self.worker.check_deadline()?;
         self.worker.finish_validation_turn()?;
         self.clean_idle = true;

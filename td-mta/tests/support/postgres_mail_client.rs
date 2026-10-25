@@ -233,7 +233,7 @@ pub(super) fn exercise(
         trust: TrustStore::from_pem(&fixture.ca).unwrap(),
     };
     let executable = std::path::Path::new(env!("CARGO_BIN_EXE_td-mta"));
-    let slots = td_mta::postgres_read::ReadSlots::new(2).unwrap();
+    let slots = td_mta::postgres_read::ReadSlots::new(resources.limits().storage_views).unwrap();
     let authentication_accounts = [("user", binding)];
     let authentication = td_mta::postgres_http_auth::Authentication::new(
         &loaded,
@@ -1181,6 +1181,13 @@ fn exercise_queries(
     );
     let deleted = client.ask(json!({"command":"destroy", "id":wire}));
     assert!(deleted["results"][0]["ok"].is_true(), "{deleted}");
+    // Queue acceptance alone does not prove that the remote deletion committed.
+    check(
+        client.ask(json!({"command":"query_emails", "mailbox_id":inbox,
+        "search":"nested content"})),
+        0,
+        &[],
+    );
 }
 
 fn exercise_send(

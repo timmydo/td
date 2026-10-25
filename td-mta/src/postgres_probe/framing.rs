@@ -164,6 +164,16 @@ impl Input {
             ..Self::new()
         }
     }
+    pub(super) fn retained_body() -> Self {
+        let single = Self::body();
+        let turns = super::retained::BODY_TURNS;
+        Self {
+            window: Some(Windows::body(turns)),
+            bytes: single.bytes * turns,
+            frames: single.frames * turns,
+            ..single
+        }
+    }
 
     pub(super) fn configuration() -> Self {
         Self {

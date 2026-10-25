@@ -23,6 +23,20 @@ pub struct Request<'a> {
     pub deadline: Deadline,
 }
 
+/// State created, maintained and dropped by one bounded HTTPS body worker.
+/// It must establish fresh request authority before each operation.
+pub trait Worker {
+    fn maintain(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
+    fn api(
+        &mut self,
+        request: Request<'_>,
+        transport: &mut dyn crate::ports::Transport,
+        control: &crate::smtp_receiving::Control,
+    ) -> Result<(), crate::https_download::Failure>;
+}
+
 #[derive(Debug)]
 pub(crate) enum ApiError {
     Request(jmap_request::Error),
