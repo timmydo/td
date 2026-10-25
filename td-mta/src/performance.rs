@@ -41,6 +41,7 @@ pub enum Phase {
     JmapWorkOutput,
     JmapWorkDeadline,
     JmapWorkOther,
+    HeaderReuse,
 }
 impl Phase {
     pub const ALL: &'static [Self] = &[
@@ -77,6 +78,7 @@ impl Phase {
         Self::JmapWorkOutput,
         Self::JmapWorkDeadline,
         Self::JmapWorkOther,
+        Self::HeaderReuse,
     ];
     pub const fn code(self) -> &'static str {
         match self {
@@ -113,6 +115,7 @@ impl Phase {
             Self::JmapWorkOutput => "jmap_work_output",
             Self::JmapWorkDeadline => "jmap_work_deadline",
             Self::JmapWorkOther => "jmap_work_other",
+            Self::HeaderReuse => "header_reuse",
         }
     }
 }

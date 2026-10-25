@@ -565,25 +565,145 @@ impl MailRead for crate::postgres_read::Snapshot<'_> {
         projection: email_get::BodyProjection<'_>,
         output: &mut dyn EmailOutput,
     ) -> Result<(), Error> {
-        let mut result = Err(Error::State);
-        self.with_interpreted_body(email, |metadata, pin| {
-            if metadata.blob != projection.metadata.blob
-                || metadata.body.length != projection.metadata.size
-            {
-                return Err(ports::Error::Corrupt);
+        let metadata = self
+            .email(email)
+            .map_err(postgres_read_error)?
+            .ok_or(Error::State)?;
+        let expected = crate::email_response::EmailMetadata {
+            identity: metadata.identity,
+            email: metadata.email,
+            blob: metadata.blob,
+            thread: metadata.thread,
+            size: metadata.body.length,
+            received_at: metadata.received_at,
+        };
+        if expected != projection.metadata {
+            return Err(Error::State);
+        }
+        let mut cache = self.header_cache.take();
+        let result = (|| {
+            if projection.selection.headers_only() && cache.is_some() {
+                output.admit()?;
+                projection
+                    .work
+                    .charge(
+                        projection.clock.monotonic().map_err(Error::Storage)?,
+                        crate::admission::work::Charge {
+                            records: 256,
+                            ..Default::default()
+                        },
+                    )
+                    .map_err(projection_stop)?;
+                if let Some(bytes) = cache
+                    .as_deref()
+                    .and_then(|cache| cache.get(metadata, projection.selection.header_names()))
+                {
+                    for chunk in bytes.chunks(4096) {
+                        self.check().map_err(postgres_read_error)?;
+                        output.admit()?;
+                        projection
+                            .work
+                            .charge(
+                                projection.clock.monotonic().map_err(Error::Storage)?,
+                                crate::admission::work::Charge {
+                                    records: 1,
+                                    output_bytes: chunk.len() as u64,
+                                    ..Default::default()
+                                },
+                            )
+                            .map_err(projection_stop)?;
+                        output.append(chunk)?;
+                    }
+                    self.check().map_err(postgres_read_error)?;
+                    output.check()?;
+                    crate::performance::record(
+                        crate::performance::Phase::HeaderReuse,
+                        std::time::Duration::ZERO,
+                        crate::performance::Outcome::Success,
+                    );
+                    return Ok(());
+                }
             }
-            result = write_verified_email(
-                output,
-                pin,
-                projection.limits,
-                (projection.selection, projection.options),
-                projection.clock,
-                projection.work,
-            );
+            if metadata.body.length > crate::postgres_body::MAX_BODY_BYTES {
+                return Err(Error::StorageCapacity);
+            }
+            let turns = metadata.body.length.div_ceil(4096);
+            for _ in 0..turns {
+                output.admit()?;
+            }
+            projection
+                .work
+                .charge(
+                    projection.clock.monotonic().map_err(Error::Storage)?,
+                    crate::admission::work::Charge {
+                        io_bytes: turns.checked_mul(4096).ok_or(Error::StorageCapacity)?,
+                        records: turns,
+                        ..Default::default()
+                    },
+                )
+                .map_err(projection_stop)?;
+            let mut capture = if projection.selection.headers_only() {
+                cache
+                    .as_deref_mut()
+                    .and_then(|cache| cache.begin(metadata, projection.selection.header_names()))
+            } else {
+                None
+            };
+            let mut result = Err(Error::State);
+            self.with_interpreted_body(email, |verified, pin| {
+                if verified != metadata {
+                    return Err(ports::Error::Corrupt);
+                }
+                let mut tee = HeaderCapture {
+                    output,
+                    cache: cache.as_deref_mut(),
+                    capture: &mut capture,
+                };
+                result = write_verified_email(
+                    &mut tee,
+                    pin,
+                    projection.limits,
+                    (projection.selection, projection.options),
+                    projection.clock,
+                    projection.work,
+                );
+                Ok(())
+            })
+            .map_err(postgres_read_error)?;
+            result?;
+            if let Some(cache) = cache.as_deref_mut() {
+                cache.stage(capture);
+            }
             Ok(())
-        })
-        .map_err(postgres_read_error)?;
+        })();
+        self.header_cache = cache;
         result
+    }
+}
+fn projection_stop(stop: crate::admission::work::Stop) -> Error {
+    match stop {
+        crate::admission::work::Stop::Deadline => Error::ExecutionDeadline,
+        _ => Error::StorageCapacity,
+    }
+}
+struct HeaderCapture<'a, 'b> {
+    output: &'a mut dyn EmailOutput,
+    cache: Option<&'a mut crate::postgres_header_cache::Cache>,
+    capture: &'b mut Option<crate::postgres_header_cache::Capture>,
+}
+impl EmailOutput for HeaderCapture<'_, '_> {
+    fn check(&mut self) -> Result<(), Error> {
+        self.output.check()
+    }
+    fn admit(&mut self) -> Result<(), Error> {
+        self.output.admit()
+    }
+    fn append(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        self.output.append(bytes)?;
+        if let Some(cache) = self.cache.as_deref_mut() {
+            cache.append(self.capture, bytes);
+        }
+        Ok(())
     }
 }
 fn postgres_read_error(error: crate::postgres_read::Error) -> Error {

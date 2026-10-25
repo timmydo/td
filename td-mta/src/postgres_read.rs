@@ -130,6 +130,7 @@ const _: () = assert!(
 /// Worker-local: its poll waker is bound to the thread that opened it.
 /// The connection drops before its reserved slot becomes available again.
 pub struct Snapshot<'a> {
+    pub(crate) header_cache: Option<&'a mut crate::postgres_header_cache::Cache>,
     worker: SnapshotWorker<'a>,
     identity: ViewIdentity,
     binding: Binding,
@@ -335,6 +336,7 @@ impl<'a> Snapshot<'a> {
         device: DeviceId,
     ) -> Result<Self, Error> {
         let mut view = Self {
+            header_cache: None,
             worker,
             identity,
             binding: binding.clone(),

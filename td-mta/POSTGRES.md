@@ -2517,6 +2517,46 @@ response deadline, including short original request allowances. It caps
 execution one clock tick before the outer limit without extending either
 budget. This preserves response retention's phase-ordering contract; the
 one-tick separation does not promise transmission time after expiry.
+### Worker-local verified header projections
+
+Each fixed HTTPS body worker may retain serialized root-header members for
+header-only Email/get selections, separately from its finite database session.
+The cache survives connection rotation, API mutations and API/download switches;
+account/origin replacement, uploads and worker teardown drop it. Its immutable
+Service binding fixes profile, configuration and interpretation limits.
+
+Every lookup follows fresh transaction authentication and current Email and
+blob metadata validation. The key contains account, epoch, blob ID, length,
+full SHA-256 digest and the exact ordered header property spellings, including
+modifiers and case. Email IDs, thread IDs, flags, memberships, dates and other
+stored fields are never served from this cache. Removed Email objects remain
+notFound; cached headers grant neither account access nor body-pin authority.
+
+A hit reuses historical interpretation of the same immutable blob. It does not
+re-read chunks or detect subsequent corruption of an unrequested tail. Full
+body projections, previews, searches, raw downloads and attachment downloads
+still verify current body bytes. Cache misses preserve the existing whole-body
+precharge and verification. Hits charge bounded lookup and copy/output work
+and check the original snapshot, retention and method deadlines. Cache output
+remains provisional until normal final snapshot validation and response
+publication.
+
+Only a successful projection whose outer pin verification also completes may
+stage an entry. Staged entries are invisible to lookups until the enclosing
+read transaction completes acknowledged rollback and final checks. Failure
+or unwinding discards pending entries. No transaction, credential, snapshot or
+body pin is retained. Earlier independently verified projections can survive
+an ordinary later per-method JMAP refusal if the enclosing read job succeeds.
+
+The configured index_cache_bytes budget is divided across the actual bounded
+HTTPS body-worker count. Each share includes entry-vector capacity, exact
+property signatures, resident and staged fragments, active capture, and old
+plus replacement allocation during capture growth. At most 256 entries and
+64 KiB per fragment are retained. FIFO eviction, allocation failure, oversized
+fragments or a tiny configured budget merely bypass caching. The existing
+memory reservation is unchanged; this is a bounded optional optimization,
+not a persistent database index or a latency guarantee.
+
 ## 74. Prepared HTTP downloads
 
 The prepared HTTP backend serves raw blobs and direct MIME-part locators

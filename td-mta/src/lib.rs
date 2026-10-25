@@ -134,6 +134,7 @@ pub mod postgres_bootstrap;
 pub mod postgres_dispatch;
 pub mod postgres_failure_notice;
 mod postgres_final_capacity;
+mod postgres_header_cache;
 pub mod postgres_http_api;
 pub mod postgres_http_auth;
 pub mod postgres_http_cancellations;

@@ -574,10 +574,16 @@ fn write_part(
 /// Trusted response owner: checks original admission/deadline and retains
 /// bounded provisional bytes. Implementations must not publish partial output.
 pub trait Output {
+    fn admit(&mut self) -> Result<(), Error> {
+        self.check()
+    }
     fn check(&mut self) -> Result<(), Error>;
     fn append(&mut self, bytes: &[u8]) -> Result<(), Error>;
 }
 impl Output for Worker<'_, '_, '_, '_, '_> {
+    fn admit(&mut self) -> Result<(), Error> {
+        Worker::check(self)
+    }
     fn check(&mut self) -> Result<(), Error> {
         if self
             .retention

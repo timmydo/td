@@ -36,6 +36,7 @@ impl Drop for CachedRead<'_> {
 struct ApiWorker<'w, 's, 'sr, 'a> {
     service: &'w Service<'s, 'sr, 'a>,
     cached: WorkerCache<'s>,
+    headers: crate::postgres_header_cache::Cache,
 }
 enum WorkerCache<'s> {
     Api(RefCell<Option<CachedRead<'s>>>),
@@ -73,8 +74,13 @@ impl https_api::Worker for ApiWorker<'_, '_, '_, '_> {
         let WorkerCache::Api(cache) = &self.cached else {
             return Err(Failure::Before(Error::Invalid));
         };
-        self.service
-            .serve_api(request, transport, control, Some(cache))
+        self.service.serve_api(
+            request,
+            transport,
+            control,
+            Some(cache),
+            Some(&mut self.headers),
+        )
     }
     fn download(
         &mut self,
@@ -121,6 +127,10 @@ impl https_upload::Backend for Service<'_, '_, '_> {
         Some(Box::new(ApiWorker {
             service: self,
             cached: WorkerCache::Api(RefCell::new(None)),
+            headers: crate::postgres_header_cache::Cache::new(
+                self.resources.limits().index_cache_bytes
+                    / self.resources.https_body_workers().max(1),
+            ),
         }))
     }
     fn session(&self) -> Option<&Session> {
@@ -148,7 +158,7 @@ impl https_upload::Backend for Service<'_, '_, '_> {
         transport: &mut dyn Transport,
         control: &Control,
     ) -> Result<https_api::Completion, Failure> {
-        self.serve_api(request, transport, control, None)
+        self.serve_api(request, transport, control, None, None)
     }
 }
 impl<'s, 'sr, 'a> Service<'s, 'sr, 'a> {
@@ -157,9 +167,11 @@ impl<'s, 'sr, 'a> Service<'s, 'sr, 'a> {
         cache: &RefCell<Option<CachedRead<'s>>>,
         deadline: Instant,
         password: &[u8],
+        headers: Option<&mut crate::postgres_header_cache::Cache>,
         read: impl FnOnce(&mut Snapshot<'_>) -> Result<T, ApiError>,
     ) -> Result<T, ApiError> {
         use crate::postgres_probe::{self, ReadIsolation, ReadSession};
+        let mut headers = headers.map(|cache| cache.transaction());
         if !self.executable.is_absolute()
             || self.loaded.bootstrap.profile() != self.binding.profile()
             || !self.binding.roles().jmap()
@@ -235,6 +247,8 @@ impl<'s, 'sr, 'a> Service<'s, 'sr, 'a> {
                         let mut snapshot =
                             Snapshot::borrowed(worker, identity, deadline, self.binding, device)
                                 .map_err(|error| ApiError::Io(read_error(error)))?;
+                        snapshot.header_cache =
+                            headers.as_mut().map(|transaction| &mut *transaction.cache);
                         read(&mut snapshot)
                     })())
                 },
@@ -255,6 +269,11 @@ impl<'s, 'sr, 'a> Service<'s, 'sr, 'a> {
         if result.is_err() {
             *cache = None;
         }
+        if result.is_ok() {
+            if let Some(headers) = headers {
+                headers.commit();
+            }
+        }
         result
     }
     fn serve_api(
@@ -263,6 +282,7 @@ impl<'s, 'sr, 'a> Service<'s, 'sr, 'a> {
         transport: &mut dyn Transport,
         control: &Control,
         cache: Option<&RefCell<Option<CachedRead<'s>>>>,
+        headers: Option<&mut crate::postgres_header_cache::Cache>,
     ) -> Result<https_api::Completion, Failure> {
         let maintenance = || {
             if let Some(cache) = cache {
@@ -278,7 +298,7 @@ impl<'s, 'sr, 'a> Service<'s, 'sr, 'a> {
         )
         .map_err(Failure::Before)?;
         sender.maintenance = Some(&maintenance);
-        let result = self.execute(&request, &mut sender, cache);
+        let result = self.execute(&request, &mut sender, cache, headers);
         let result = if self.responses.admission_stopped() {
             Err(Error::WriterStopped)
         } else {
@@ -456,6 +476,7 @@ impl<'s, 'sr, 'a> Service<'s, 'sr, 'a> {
         request: &Request<'_>,
         sender: &mut Sender<'_>,
         cache: Option<&RefCell<Option<CachedRead<'s>>>>,
+        headers: Option<&mut crate::postgres_header_cache::Cache>,
     ) -> Result<(), ApiError> {
         let presented = Presented::parse(request.credentials.password()).ok_or(Error::Forbidden)?;
         if presented.id() != request.device {
@@ -505,6 +526,7 @@ impl<'s, 'sr, 'a> Service<'s, 'sr, 'a> {
                     cache,
                     self.clock.deadline_instant(execution)?,
                     request.credentials.password(),
+                    headers,
                     |snapshot| {
                         dispatch::run_with_postgres_read(
                             plan, retention, execution, snapshot, self.clock, true,

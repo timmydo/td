@@ -6848,6 +6848,47 @@ fn exercise_http_read(
         second_pid,
         "eight jobs must exhaust the retained read session"
     );
+    let header_body = format!(
+        r##"{{"using":["urn:ietf:params:jmap:mail"],"methodCalls":[["Email/query",{{"accountId":"{account}"}},"q"],["Email/get",{{"accountId":"{account}","#ids":{{"resultOf":"q","name":"Email/query","path":"/ids"}},"properties":["id","subject","keywords","mailboxIds"]}},"g"]}}"##
+    );
+    let (result, first_headers) = call(&header_body, password, device, false, false, false);
+    result.unwrap();
+    assert_eq!(first_headers.matches("\"subject\":\"Snapshot\"").count(), 2);
+    sql(fixture, "ALTER SYSTEM SET log_statement='all'");
+    sql(fixture, "SELECT pg_reload_conf()");
+    while sql(fixture, "SHOW log_statement") != "all" {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let log_offset = fs::metadata(fixture.root.join("server.log")).unwrap().len() as usize;
+    // Cross the eight-job connection lifetime: header evidence belongs to the worker.
+    for _ in 0..10 {
+        let (result, headers) = call(&header_body, password, device, false, false, false);
+        result.unwrap();
+        assert_eq!(headers, first_headers);
+    }
+    let log = fs::read_to_string(fixture.root.join("server.log")).unwrap();
+    assert!(
+        !log[log_offset..].contains("SELECT ordinal,bytes FROM td_mta.blob_chunks"),
+        "warm header projection must not fetch any message chunks"
+    );
+    sql(fixture, "ALTER SYSTEM RESET log_statement");
+    sql(fixture, "SELECT pg_reload_conf()");
+    // Historical header evidence does not authorize current body bytes.
+    sql(fixture, "UPDATE td_mta.blob_chunks SET bytes=set_byte(bytes,0,get_byte(bytes,0)#1) WHERE octet_length(bytes)>0");
+    let (result, headers) = call(&header_body, password, device, false, false, false);
+    result.unwrap();
+    assert_eq!(headers, first_headers);
+    let (result, broken_body) = call(&body, password, device, false, false, false);
+    assert!(result.is_err() || !broken_body.contains("snapshot text"));
+    sql(fixture, "UPDATE td_mta.blob_chunks SET bytes=set_byte(bytes,0,get_byte(bytes,0)#1) WHERE octet_length(bytes)>0");
+    sql(fixture, "INSERT INTO td_mta.keywords(account,email_id,keyword,changed) SELECT account,id,'cache-fresh',changed FROM td_mta.emails");
+    let (result, headers) = call(&header_body, password, device, false, false, false);
+    result.unwrap();
+    assert_eq!(headers.matches("\"cache-fresh\":true").count(), 2);
+    sql(
+        fixture,
+        "DELETE FROM td_mta.keywords WHERE keyword='cache-fresh'",
+    );
     let fresh = td_mta::postgres_devices::prepare_creation(
         binding.epoch(),
         binding.account(),
@@ -6859,7 +6900,7 @@ fn exercise_http_read(
     td_mta::postgres_devices::publish_creation(&fixture.request(), &trust, deadline(), &fresh)
         .unwrap();
     call(
-        &rights_body,
+        &header_body,
         fresh.password(),
         fresh.device_id(),
         false,
@@ -6884,7 +6925,7 @@ fn exercise_http_read(
     .unwrap();
     assert!(matches!(
         call(
-            &rights_body,
+            &header_body,
             fresh.password(),
             fresh.device_id(),
             false,
@@ -6894,7 +6935,7 @@ fn exercise_http_read(
         .0,
         Err(td_mta::https_download::Failure::Before(Error::Forbidden))
     ));
-    call(&rights_body, password, device, false, false, false)
+    call(&header_body, password, device, false, false, false)
         .0
         .unwrap();
     let rights = td_json::parse(wire.split_once("\r\n\r\n").unwrap().1).unwrap();

@@ -119,6 +119,12 @@ impl Selection {
         }
         Ok(())
     }
+    pub(super) fn header_names(&self) -> impl Iterator<Item = &[u8]> + Clone {
+        self.headers.iter().map(|name| name.bytes())
+    }
+    pub(super) fn headers_only(&self) -> bool {
+        !self.body() && !self.headers.is_empty()
+    }
     fn body(&self) -> bool {
         self.text || self.html || self.attachments || self.preview || self.values
     }
@@ -314,43 +320,18 @@ impl Worker<'_, '_, '_, '_, '_> {
                     }
                     if selected.body() || !selected.headers.is_empty() {
                         let result = match &mut view {
-                            View::Postgres(view) => {
-                                if metadata.size > crate::postgres_body::MAX_BODY_BYTES {
-                                    return Err(Error::StorageCapacity);
-                                }
-                                let turns = metadata.size.div_ceil(4096);
-                                for _ in 0..turns {
-                                    self.check()?;
-                                }
-                                work.charge(
-                                    body::now(clock.as_ref())?,
-                                    crate::admission::work::Charge {
-                                        io_bytes: turns
-                                            .checked_mul(4096)
-                                            .ok_or(Error::StorageCapacity)?,
-                                        records: turns,
-                                        ..Default::default()
-                                    },
-                                )
-                                .map_err(|stop| match stop {
-                                    crate::admission::work::Stop::Deadline => {
-                                        Error::ExecutionDeadline
-                                    }
-                                    _ => Error::StorageCapacity,
-                                })?;
-                                view.email_body(
-                                    id,
-                                    BodyProjection {
-                                        metadata,
-                                        limits,
-                                        selection: &selected,
-                                        options,
-                                        clock: clock.as_ref(),
-                                        work: &mut work,
-                                    },
-                                    self,
-                                )
-                            }
+                            View::Postgres(view) => view.email_body(
+                                id,
+                                BodyProjection {
+                                    metadata,
+                                    limits,
+                                    selection: &selected,
+                                    options,
+                                    clock: clock.as_ref(),
+                                    work: &mut work,
+                                },
+                                self,
+                            ),
                         };
                         self.check()?;
                         if let Some(stop) = work.stopped() {
