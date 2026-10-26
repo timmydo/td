@@ -597,8 +597,9 @@ Subsequent payloads are exact byte records:
 | `0d` | `84` once root has started `/bin/td-svc start firefox` |
 | `0e` | `84` once root has started `/bin/td-svc start firefox-update` |
 | `0f` | `85` and the `firefox` unit's state as root last read it: `00` idle, `01` starting, `02` running, `03` failed, `04` unknown |
-| `24` plus a verb byte and an application name | an application cache request ("Application requests"): `86` once an operation started, or for status `87` and the last record |
 | `22` | `81` plus a process handle for the human application manager, td-software |
+| `23` | `88` and which of the registry's Flathub declarations are installed ("Application requests") |
+| `24` plus a verb byte and an application name | an application cache request ("Application requests"): `86` once an operation started, or for status `87` and the last record |
 
 `0d` and `0e` create no handle. Root runs the fixed td-svc client itself,
 with the same cleared environment, `/` and null standard descriptors,
@@ -778,14 +779,14 @@ reach root only as the compositor's `24` ("Application requests"),
 which any program of the human's on that socket can make as well: the
 card adds a way to start, not a new reach.
 
-An authority older than one of requests `07` through `0f`, `22` or
-`24` closes the entire launch channel on it; its paired compositor then
-restarts. The image ships both peers atomically. Requests `07` through
-`0b` were additive within TDLA002, without negotiation or mixed-version
-compatibility. The login requests `1b` and `1c` came with the bump to
-TDLA003, because `1c` carries a PIN; `0c` through `0f`, `22` and `24`
-were added within it later. Both peers again ship together, without
-negotiation.
+An authority older than one of requests `07` through `0f` or `22`
+through `24` closes the entire launch channel on it; its paired
+compositor then restarts. The image ships both peers atomically.
+Requests `07` through `0b` were additive within TDLA002, without
+negotiation or mixed-version compatibility. The login requests `1b` and
+`1c` came with the bump to TDLA003, because `1c` carries a PIN; `0c`
+through `0f` and `22` through `24` were added within it later. Both
+peers again ship together, without negotiation.
 
 For terminal requests it execs `/bin/td-term run --socket
 /run/td-compositor/UID/wayland-0 --ready-socket
@@ -1067,21 +1068,59 @@ none begun in the last two seconds, or an operation has ended since the
 last began: each read walks the generations' deploys, so a peer polling
 faster is answered from the last read and costs no more walks.
 
-The serving loop's work per request is bounded: it reads at most 16 KiB
-from each running child, keeps a status record only up to the record's
-4 KiB bound and an operation's diagnostics only as their last 512
-bytes, and blocks only to reap a child it has just killed. Its rate is
-not: a peer can keep 16 names' operations and reads starting, each a
-root `application-cache` process, as fast as the control socket
-serves it, which costs the human's machine no more than any program
-the human runs. A paired
-generation's end, by either peer's exit, ends what root ran for it with
-the pair's cgroup, as a kill would: td-app, in its account's session
-cgroup, finishes its run under its lock, and td-app's lock and leases
-make the run safe to repeat. The next generation knows nothing of it
-but what td-app's status shows. None of this is elevation, for the
-operation's reason above; a human program reaching the control socket
-can run these operations, which td-software/DESIGN.md §3 accepts.
+Request `23`, with no operand, is the installed set the compositor's
+launcher follows (td-software/DESIGN.md §5). Root answers at once from
+the same entries as `24`'s status; it writes no file and reads only the
+registry:
+
+```text
+88 COUNT (STATE LENGTH NAME)*
+```
+
+one row for each of the registry's Flathub declarations, in its order,
+`NAME` its `LENGTH` (1 to 64) bytes. The registry is
+`/etc/td-applications.tsv`, the image's immutable table, read once per
+generation in the builder's bounds (1 MiB, 256 lines, no name twice);
+a registry root cannot read answers `ff 02` and is read again by the
+next request. Root keeps only the names in the registry grammar, the
+grammar every request names an application in: the builder's identity
+grammar is wider (APPLICATIONS.md §A), and a name outside it is one no
+request can name. A declaration is one `flathub_app::FLATHUB_SOURCES`
+names, compiled into root; a test holds them to 8, half the 16 names
+root follows, so the set never fills what root follows for td-software
+and the answer fits a frame. A registry with more answers `ff 02`
+rather than leave one out, since leaving one out would say the image
+ships it. A registry name the answer leaves out is one the
+image ships, always installed. `STATE`'s bit `01` says the last read of
+that name's status found a `current` generation, which is what
+installed means; bit `02` says that may change soon: no read has
+finished, an operation runs on it, or the last read, whether it was
+read or failed, began before the last operation ended. A failed read
+begun after it is settled and not installed. Each
+row follows its name as a status request would, starting a read when
+one is due and never more often, so asking costs no more reads than
+`24`'s status; with no room among the names root follows, a row is
+`02` and starts nothing. On a live boot `23` answers `ff 03`. Each row
+due starts its own read, so a `23` asked every interval runs up to one
+`td-app status` per declaration each interval, as many as td-software
+polling each would.
+
+The serving loop's work per request is bounded: it reads the registry
+(at most 1 MiB) once per generation, or again on each request while it
+cannot, at most 16 KiB from each running child, keeps a status record
+only up to the record's 4 KiB bound and an operation's diagnostics only
+as their last 512 bytes, and blocks only to reap a child it has just
+killed. Its rate is not: a peer can keep 16 names' operations and reads
+starting, each a root `application-cache` process, as fast as the
+control socket serves it, which costs the human's machine no more than
+any program the human runs. A paired generation's end, by either peer's
+exit, ends what root ran for it with the pair's cgroup, as a kill would:
+td-app, in its account's session cgroup, finishes its run under its
+lock, and td-app's lock and leases make the run safe to repeat. The next
+generation knows nothing of it but what td-app's status shows. None of
+this is elevation, for the operation's reason above; a human program
+reaching the control socket can run these operations, which
+td-software/DESIGN.md §3 accepts.
 
 ## Application filesystem grants
 

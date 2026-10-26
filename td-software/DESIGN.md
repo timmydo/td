@@ -245,7 +245,8 @@ row's name, display name and search terms. It would ask root which of
 those names are installed. That answer contains only names from that
 table, and root derives it from each account's cache, never from
 anything td-software says. Root computes it with `status` at session
-start and again after every install, update or remove it performs. A
+start and again after every install, update or remove it performs (as
+built, on demand from its status records: §6, increment 3). A
 name outside the table, or a malformed answer, fails the generation, as
 any malformed private-channel response does today. No mutable file
 holds the selection: the caches are the record, so nothing can disagree
@@ -263,7 +264,8 @@ the launcher opens, which costs one bounded exchange.
 app id matches. Today the image passes that id as
 `--application-app-id` for Firefox alone. Matching by table needs the
 manifest's alias (§A, "Application identity") as a fourth launcher-table
-column, or a second immutable table built by the same compiler. Each
+column, or a second immutable table built by the same compiler (as
+built, the fourth column: §6, increment 3). Each
 entry's start request then carries its name instead of being the
 name-free `0d`.
 
@@ -355,6 +357,23 @@ can be installed at every commit.
    asks for the installed set and uses the scrolling window from §5.
    Starts carry a validated name. The image stops passing
    `--launcher-application`.
+
+   *As built (the table and the installed set):* the launcher table's
+   fourth column is the app id an application's windows announce: the
+   manifest's alias, or for an application without one its entry's file
+   name, which a td-ui program gives its window (APPLICATIONS.md §A.0).
+   No second table was needed. Root answers the installed set as request
+   `23` (td-authd/DESIGN.md, "Application requests"): a row for each of
+   the registry's Flathub declarations, with whether its last status read
+   found `current` and whether that may change soon, followed through
+   `24`'s own per-name entries rather than a request of their own. So
+   the set costs no more reads than a status, an operation on a name
+   and the set never wait on each other, and the 16 names root follows
+   bound it: td-software names only Flathub declarations too, and a
+   test holds them to 8, so the two never fill what root follows; a
+   registry with more answers no set. A name the answer leaves out is
+   one the image ships, which is always installed, so an answer bounded
+   by the compiled-in declarations still covers a table of 256.
 4. **Cutover, in one landing.**
    - td-jail stops fetching on `absent` and stops starting the check
      beside a launch (`check_beside`). td-app's 24-hour throttle and

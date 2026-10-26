@@ -4009,8 +4009,21 @@ fn compile_application_tables_in(
                 launcher.name()
             ));
         }
+        // A Flathub application's window announces its app ref's id, which
+        // only its alias can say; the entry's file name would not match.
+        if let Some(source) = td_engine::flathub_app::flathub_source(expected_name) {
+            let id = source.application.split('/').nth(1);
+            if manifest.alias().is_none() || manifest.alias() != id {
+                return Err(format!(
+                    "compileApplicationTables: Flathub package {package} must alias its windows to its app ref's id {id:?}"
+                ));
+            }
+        }
         registry_entries.push((manifest.name().to_string(), package.clone()));
-        launcher_entries.push(launcher);
+        launcher_entries.push(
+            td_engine::launcher::LauncherRow::for_manifest(launcher, &manifest)
+                .map_err(|error| format!("compileApplicationTables: package {package}: {error}"))?,
+        );
     }
     let registry = td_engine::launcher::ApplicationRegistry::new(registry_entries)
         .map_err(|error| format!("compileApplicationTables: {error}"))?;
@@ -4790,6 +4803,9 @@ pub fn run_mesboot() -> Result<(), String> {
             stage_runtime_closure(&ctx.inputs, &ctx.payloads, &roots, Path::new(&dest))
                 .map_err(err)?;
         } else if let Some(o) = step.get("compileApplicationTables") {
+            if field(o, "format")? != td_engine::launcher::TABLES_FORMAT {
+                return Err(err("unsupported application table format".into()));
+            }
             let names = string_array(o, "names").map_err(err)?;
             let packages = ctx
                 .expand_data_all(&string_array(o, "packages").map_err(err)?)
@@ -6182,6 +6198,7 @@ mod tests {
             "freedesktop-platform-25-08",
             "/app/bin/firefox",
         )
+        .and_then(|declaration| declaration.with_alias("org.mozilla.firefox"))
         .unwrap()
         .manifest(
             "firefox",
@@ -6205,19 +6222,25 @@ mod tests {
         let package = package.to_string_lossy().into_owned();
         let payloads = vec![("firefox".to_string(), package.clone())];
         let registry = _directory_cleanup.join("image/etc/td-applications.tsv");
+        let table = _directory_cleanup.join("image/etc/td-launcher.tsv");
         compile_application_tables_in(
             &["firefox".into()],
             std::slice::from_ref(&package),
             &[REF.into()],
             &payloads,
             &registry,
-            &_directory_cleanup.join("image/etc/td-launcher.tsv"),
+            &table,
             &store.to_string_lossy(),
         )
         .unwrap();
         assert_eq!(
             fs::read_to_string(&registry).unwrap(),
             format!("firefox\t{package}\n")
+        );
+        // The alias is the id its windows announce.
+        assert_eq!(
+            fs::read_to_string(&table).unwrap(),
+            "firefox\tFirefox\tbrowser\torg.mozilla.firefox\n"
         );
 
         let error = compile_application_tables_in(
@@ -6231,6 +6254,71 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("is not a declared payload"), "{error}");
+
+        // Without an alias its windows would match no row.
+        let bare = td_engine::application::ApplicationDeclaration::new(
+            "freedesktop-platform-25-08",
+            "/app/bin/firefox",
+        )
+        .unwrap()
+        .manifest(
+            "firefox",
+            "154.0",
+            td_engine::application::ApplicationProvenance::Foreign,
+        )
+        .unwrap();
+        let bare_spec = td_engine::application_spec::ApplicationSpec::compile(
+            &bare,
+            REF,
+            td_engine::permissions::PermissionPolicy::new(),
+        )
+        .unwrap();
+        fs::write(Path::new(&package).join("manifest"), bare.to_keyfile()).unwrap();
+        fs::write(Path::new(&package).join("spec"), bare_spec.to_keyfile()).unwrap();
+        let error = compile_application_tables_in(
+            &["firefox".into()],
+            std::slice::from_ref(&package),
+            &[REF.into()],
+            &payloads,
+            &_directory_cleanup.join("bare/registry.tsv"),
+            &_directory_cleanup.join("bare/launcher.tsv"),
+            &store.to_string_lossy(),
+        )
+        .unwrap_err();
+        assert!(error.contains("must alias its windows"), "{error}");
+
+        // Nor would an alias other than its app ref's id.
+        let other = td_engine::application::ApplicationDeclaration::new(
+            "freedesktop-platform-25-08",
+            "/app/bin/firefox",
+        )
+        .and_then(|declaration| declaration.with_alias("org.example.Other"))
+        .unwrap()
+        .manifest(
+            "firefox",
+            "154.0",
+            td_engine::application::ApplicationProvenance::Foreign,
+        )
+        .unwrap();
+        let other_spec = td_engine::application_spec::ApplicationSpec::compile(
+            &other,
+            REF,
+            td_engine::permissions::PermissionPolicy::new(),
+        )
+        .unwrap();
+        fs::write(Path::new(&package).join("manifest"), other.to_keyfile()).unwrap();
+        fs::write(Path::new(&package).join("spec"), other_spec.to_keyfile()).unwrap();
+        let error = compile_application_tables_in(
+            &["firefox".into()],
+            std::slice::from_ref(&package),
+            &[REF.into()],
+            &payloads,
+            &_directory_cleanup.join("other-alias/registry.tsv"),
+            &_directory_cleanup.join("other-alias/launcher.tsv"),
+            &store.to_string_lossy(),
+        )
+        .unwrap_err();
+        assert!(error.contains("must alias its windows"), "{error}");
     }
 
     #[test]
@@ -6291,9 +6379,10 @@ mod tests {
             fs::read_to_string(&registry).unwrap(),
             format!("ripgrep-seed\t{}\n", package.display())
         );
+        // No alias: the window app id is the entry's file name.
         assert_eq!(
             fs::read_to_string(&table).unwrap(),
-            "ripgrep-seed\tRipgrep\tripgrep rg search\n"
+            "ripgrep-seed\tRipgrep\tripgrep rg search\trg\n"
         );
         assert_eq!(
             fs::metadata(&registry).unwrap().permissions().mode() & 0o777,

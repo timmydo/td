@@ -160,7 +160,7 @@ fn install(name: &str) -> Request {
 /// Gives `name` a recent read that shows no writer, as a status would.
 fn fresh(requests: &mut Requests, name: &str) {
     let entry = requests.entry(name).unwrap();
-    entry.record = Record::Read(RECORD.to_vec(), Instant::now(), false);
+    entry.record = Record::Read(RECORD.to_vec(), Instant::now(), Found::default());
     entry.finished = Some(Instant::now());
 }
 
@@ -340,7 +340,14 @@ fn an_operation_starts_only_on_a_recent_read_that_shows_no_writer() {
     answer_after(&mut requests, &status("firefox"), &[0x87, 0, 0, 0, 0, 0]);
     let entry = requests.entries.get_mut("firefox").unwrap();
     // A writer root did not start, `0e`'s check or td-jail's.
-    entry.record = Record::Read(RECORD.to_vec(), Instant::now(), true);
+    entry.record = Record::Read(
+        RECORD.to_vec(),
+        Instant::now(),
+        Found {
+            writer: true,
+            installed: false,
+        },
+    );
     entry.finished = Some(Instant::now());
     assert_eq!(requests.answer(1000, install("firefox")), [0xff, 1]);
     // Root's own operation, ended since that read, was the writer.
@@ -355,7 +362,11 @@ fn an_operation_starts_only_on_a_recent_read_that_shows_no_writer() {
     let mut requests = Requests::with_starter(fixture);
     fresh(&mut requests, "firefox");
     let entry = requests.entry("firefox").unwrap();
-    entry.record = Record::Read(RECORD.to_vec(), Instant::now() - 2 * FRESH, false);
+    entry.record = Record::Read(
+        RECORD.to_vec(),
+        Instant::now() - 2 * FRESH,
+        Found::default(),
+    );
     entry.finished = Some(Instant::now() - FRESH);
     assert_eq!(requests.answer(1000, install("firefox")), [0xff, 5]);
     stop(&mut requests);
@@ -363,7 +374,11 @@ fn an_operation_starts_only_on_a_recent_read_that_shows_no_writer() {
     let mut requests = Requests::with_starter(fixture);
     fresh(&mut requests, "firefox");
     let entry = requests.entry("firefox").unwrap();
-    entry.record = Record::Read(RECORD.to_vec(), Instant::now() - 2 * FRESH, false);
+    entry.record = Record::Read(
+        RECORD.to_vec(),
+        Instant::now() - 2 * FRESH,
+        Found::default(),
+    );
     assert_eq!(requests.answer(1000, install("firefox")), [0x86]);
     stop(&mut requests);
 }
@@ -374,7 +389,10 @@ fn a_recent_failed_read_admits_an_operation_so_remove_can_repair() {
     // The broken fixture's status fails: refused until that read ends.
     assert_eq!(requests.answer(1000, install("broken")), [0xff, 5]);
     settle(&mut requests, "broken");
-    assert!(matches!(requests.entries["broken"].record, Record::Failed));
+    assert!(matches!(
+        requests.entries["broken"].record,
+        Record::Failed(_)
+    ));
     let remove = Request {
         verb: Verb::Remove,
         name: "broken".into(),
@@ -457,4 +475,234 @@ fn a_status_reads_stdout_and_an_operation_stderr() {
     assert!(!out.windows(9).any(|w| w == b"on stderr"));
     let (err, _) = ended(Verb::Remove);
     assert_eq!(err, b"td-authd: on stderr\n");
+}
+
+#[test]
+fn the_registry_is_read_exactly_as_the_builder_writes_it() {
+    assert_eq!(
+        registry_names("firefox\t/td/store/a-firefox\nmail\t/td/store/b-mail\n").unwrap(),
+        ["firefox", "mail"]
+    );
+    assert!(registry_names("").unwrap().is_empty());
+    // The builder's wider identity grammar: kept out, as no request can
+    // name it, while its line still counts.
+    assert_eq!(
+        registry_names("7zip\t/p\nFoo\t/q\nmail\t/r\n").unwrap(),
+        ["mail"]
+    );
+    let many: String = (0..REGISTRY_NAMES)
+        .map(|n| format!("app{n}\t/p\n"))
+        .collect();
+    assert_eq!(registry_names(&many).unwrap().len(), REGISTRY_NAMES);
+    for bad in [
+        "firefox\t/td/store/a",
+        "firefox\n",
+        "firefox\t\n",
+        "\t/p\n",
+        "firefox\t/p\r\n",
+        "firefox\t/p\n\n",
+        "Foo\t/p\nFoo\t/q\n",
+        "firefox\t/p\tx\n",
+        "firefox\t/p\nfirefox\t/q\n",
+        &format!("{many}one\t/p\n"),
+    ] {
+        assert!(registry_names(bad).is_err(), "{bad:?}");
+    }
+}
+
+/// An installed record: `current` holds a generation.
+fn installed_record(name: &str) -> Vec<u8> {
+    let commit = "a".repeat(64);
+    let deploy = |exact_ref: &str| flathub_app::DeployStatus {
+        row: flathub_app::Admitted {
+            exact_ref: exact_ref.into(),
+            commit: commit.clone(),
+            timestamp: 20,
+        },
+        bytes: Some(300),
+    };
+    Status {
+        name: name.into(),
+        cache: Some(flathub_app::CacheStatus {
+            current: Some(flathub_app::GenerationStatus {
+                generation: 3,
+                serves: true,
+                application: deploy("app/org.mozilla.firefox/x86_64/stable"),
+                runtime: deploy("runtime/org.freedesktop.Platform/x86_64/25.08"),
+            }),
+            previous: None,
+            checked: Some(1_800_000_000),
+            refused: None,
+            progress: None,
+        }),
+    }
+    .render()
+    .into_bytes()
+}
+
+#[test]
+fn a_read_finds_whether_the_application_is_installed() {
+    let (_, found) = checked("firefox", RECORD).unwrap();
+    assert_eq!(
+        found,
+        Found {
+            writer: false,
+            installed: false
+        }
+    );
+    let (_, found) = checked("firefox", &installed_record("firefox")).unwrap();
+    assert!(found.installed && !found.writer);
+    let (_, found) = checked("firefox", b"format=1\nname=firefox\nkind=image\n").unwrap();
+    assert!(!found.installed);
+}
+
+fn registry() -> Result<Vec<String>, String> {
+    Ok(vec!["firefox".into(), "mail".into(), "quick".into()])
+}
+
+/// Mail is the image's; the rest are Flathub declarations.
+fn declared(name: &str) -> bool {
+    name != "mail"
+}
+
+#[test]
+fn the_installed_set_names_each_flathub_declaration_with_its_state() {
+    let mut requests = Requests::with(fixture, registry, declared);
+    // Nothing read: both pending, and their reads start.
+    assert_eq!(
+        requests.installed(1000),
+        [
+            &[0x88, 2, PENDING, 7][..],
+            b"firefox",
+            &[PENDING, 5],
+            b"quick"
+        ]
+        .concat()
+    );
+    assert!(requests.entries["firefox"].reading.is_some());
+    assert!(!requests.entries.contains_key("mail"));
+    settle(&mut requests, "firefox");
+    settle(&mut requests, "quick");
+    // Firefox's record has no `current`; the quiet fixture's read failed:
+    // both settled, neither installed.
+    assert_eq!(
+        requests.installed(1000),
+        [&[0x88, 2, 0, 7][..], b"firefox", &[0, 5], b"quick"].concat()
+    );
+    // Within the interval the set starts no read, as a status would not.
+    assert!(requests.entries["firefox"].reading.is_none());
+    let entry = requests.entries.get_mut("firefox").unwrap();
+    entry.record = Record::Read(
+        installed_record("firefox"),
+        Instant::now(),
+        Found {
+            writer: false,
+            installed: true,
+        },
+    );
+    let answer = requests.installed(1000);
+    assert_eq!(answer.get(2), Some(&INSTALLED));
+    // An operation running, or one that ended after the read began, is
+    // pending until a read after it ends.
+    let entry = requests.entries.get_mut("firefox").unwrap();
+    entry.finished = Some(Instant::now());
+    assert_eq!(requests.answer(1000, install("firefox")), [0x86]);
+    assert_eq!(
+        requests.installed(1000).get(2),
+        Some(&(INSTALLED | PENDING))
+    );
+    stop(&mut requests);
+    let entry = requests.entries.get_mut("firefox").unwrap();
+    entry.operation = None;
+    entry.reading = None;
+    entry.ended = Some(Instant::now());
+    entry.began = Some(Instant::now());
+    entry.record = Record::Read(
+        installed_record("firefox"),
+        Instant::now() - Duration::from_secs(1),
+        Found {
+            writer: false,
+            installed: true,
+        },
+    );
+    let answer = requests.installed(1000);
+    assert_eq!(answer.get(2), Some(&(INSTALLED | PENDING)));
+    stop(&mut requests);
+}
+
+#[test]
+fn the_installed_set_reads_the_registry_once_and_fails_without_it() {
+    let mut requests = Requests::with(fixture, || Err("no registry".into()), declared);
+    assert_eq!(requests.installed(1000), [0xff, 2]);
+    assert!(requests.entries.is_empty());
+    let mut requests = Requests::with(fixture, registry, declared);
+    requests.installed(1000);
+    // Replaced by one that would fail, the names already read stand.
+    requests.load = || Err("unread".into());
+    assert_eq!(requests.installed(1000).get(..2), Some(&[0x88, 2][..]));
+    stop(&mut requests);
+}
+
+#[test]
+fn a_declaration_root_has_no_room_to_follow_is_pending() {
+    let mut requests = Requests::with(fixture, registry, declared);
+    for n in 0..NAMES {
+        let name = format!("busy{n}");
+        fresh(&mut requests, &name);
+        assert_eq!(requests.answer(1000, install(&name)), [0x86]);
+    }
+    assert_eq!(
+        requests.installed(1000),
+        [
+            &[0x88, 2, PENDING, 7][..],
+            b"firefox",
+            &[PENDING, 5],
+            b"quick"
+        ]
+        .concat()
+    );
+    stop(&mut requests);
+}
+
+/// Every Flathub declaration fits the names root follows, so the set never
+/// leaves one out, and the answer fits a frame however long their names.
+#[test]
+fn the_flathub_declarations_fit_the_set_and_a_frame() {
+    const { assert!(2 + NAMES * (2 + 64) <= FRAME_BYTES) };
+    // Half, so the set never fills what root follows for td-software.
+    assert!(flathub_app::FLATHUB_SOURCES.len() <= NAMES / 2);
+}
+
+#[test]
+fn a_failed_read_before_an_operation_ended_is_pending() {
+    let mut requests = Requests::with(fixture, registry, declared);
+    requests.installed(1000);
+    settle(&mut requests, "firefox");
+    settle(&mut requests, "quick");
+    // The quiet fixture's read failed: settled, not installed.
+    let quick = |requests: &mut Requests| {
+        let answer = requests.installed(1000);
+        answer.get(answer.len() - 7).copied()
+    };
+    assert_eq!(quick(&mut requests), Some(0));
+    // A read that began before an operation ended and failed after it:
+    // what the next read says is still to come.
+    let entry = requests.entries.get_mut("quick").unwrap();
+    entry.record = Record::Failed(Instant::now() - Duration::from_secs(2));
+    entry.ended = Some(Instant::now() - Duration::from_secs(1));
+    entry.finished = Some(Instant::now());
+    entry.began = Some(Instant::now());
+    assert_eq!(quick(&mut requests), Some(PENDING));
+    stop(&mut requests);
+}
+
+#[test]
+fn more_declarations_than_root_follows_answers_no_set() {
+    let mut requests = Requests::with(
+        fixture,
+        || Ok((0..=NAMES).map(|n| format!("app{n}")).collect()),
+        |_| true,
+    );
+    assert_eq!(requests.installed(1000), [0xff, 2]);
+    assert!(requests.entries.is_empty());
 }

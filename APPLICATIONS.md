@@ -857,7 +857,15 @@ runtime paired with that package; a Flathub application's runtime is instead
 its declared runtime ref (§W.9), which no build stages. It then emits two sorted, duplicate-free
 immutable files:
 
-- `/etc/td-launcher.tsv` keeps the three columns above for the compositor;
+- `/etc/td-launcher.tsv` keeps the three columns above for the compositor
+  and adds a fourth, the app id the application's windows announce
+  (`xdg_toplevel.set_app_id`), one to 128 ASCII letters, digits, `.`, `_`
+  and `-`: the manifest's alias, the foreign id §A keeps for matching a
+  toplevel, or for an application with none its entry's file name, which
+  a td-ui program gives its window (`td-mail`, `td-news`). No two rows
+  share an app id, an alias longer than 128 bytes or outside that
+  alphabet is refused here, and a Flathub declaration's alias must be
+  its app ref's id, which its windows announce;
 - `/etc/td-applications.tsv` carries `name<TAB>exact-package-store-path` for
   `td-jail`'s resolver.
 

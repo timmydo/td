@@ -1,6 +1,8 @@
 //! Canonical application launcher metadata and the two image tables derived from it.
 
-use crate::application::{validate_application_identity, RESERVED_APPLICATION_NAMES};
+use crate::application::{
+    validate_application_identity, ApplicationManifest, RESERVED_APPLICATION_NAMES,
+};
 use crate::json::Json;
 use std::collections::BTreeSet;
 
@@ -11,6 +13,13 @@ pub const MAX_LAUNCHER_EXPORT_BYTES: usize = 4096;
 pub const MAX_APPLICATION_TABLE_BYTES: usize = 1024 * 1024;
 pub const MAX_APPLICATIONS: usize = 256;
 pub const MAX_PACKAGE_PATH_BYTES: usize = 4096;
+/// The longest window app id a table row carries: the compositor's bound
+/// on an `xdg_toplevel.set_app_id` it matches.
+pub const MAX_APP_ID_BYTES: usize = 128;
+/// What `compileApplicationTables` writes, carried in its step so a change
+/// to the tables re-keys the image that holds them (builder/src/store.rs,
+/// `BUILDER_ABI`): the launcher table with its app id column.
+pub const TABLES_FORMAT: &str = "launcher-app-id-v1";
 pub const RESERVED_LAUNCHER_NAMES: &[&str] = RESERVED_APPLICATION_NAMES;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -187,21 +196,90 @@ impl LauncherExport {
     }
 }
 
+/// One `/etc/td-launcher.tsv` row: the package's export and the app id its
+/// windows announce, which the compositor matches a toplevel by.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LauncherRow {
+    export: LauncherExport,
+    app_id: String,
+}
+
+impl LauncherRow {
+    pub fn new(export: LauncherExport, app_id: &str) -> Result<Self, String> {
+        validate_app_id(app_id)?;
+        Ok(Self {
+            export,
+            app_id: app_id.to_string(),
+        })
+    }
+
+    /// The row for a package's export and manifest, whose identities the
+    /// caller has matched: the app id is the alias, the foreign id §A keeps
+    /// for matching a toplevel, or for a td-built application without one
+    /// its entry's file name, which a td-ui program gives its window.
+    pub fn for_manifest(
+        export: LauncherExport,
+        manifest: &ApplicationManifest,
+    ) -> Result<Self, String> {
+        let entry = manifest.entry();
+        let app_id = manifest
+            .alias()
+            .unwrap_or_else(|| entry.rsplit('/').next().unwrap_or(entry));
+        Self::new(export, app_id)
+    }
+
+    fn parse(line: &str) -> Result<Self, String> {
+        let (export, app_id) = line
+            .rsplit_once('\t')
+            .ok_or("launcher table row has no app id")?;
+        Self::new(LauncherExport::parse(&format!("{export}\n"))?, app_id)
+    }
+
+    pub fn to_tsv(&self) -> String {
+        let export = self.export.to_tsv();
+        format!(
+            "{}\t{}\n",
+            export.strip_suffix('\n').unwrap_or(&export),
+            self.app_id
+        )
+    }
+
+    pub fn export(&self) -> &LauncherExport {
+        &self.export
+    }
+
+    pub fn name(&self) -> &str {
+        self.export.name()
+    }
+
+    pub fn app_id(&self) -> &str {
+        &self.app_id
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LauncherTable {
-    entries: Vec<LauncherExport>,
+    entries: Vec<LauncherRow>,
 }
 
 impl LauncherTable {
-    pub fn new(mut entries: Vec<LauncherExport>) -> Result<Self, String> {
+    pub fn new(mut entries: Vec<LauncherRow>) -> Result<Self, String> {
         if entries.len() > MAX_APPLICATIONS {
             return Err(format!(
                 "launcher table has {} applications; the limit is {MAX_APPLICATIONS}",
                 entries.len()
             ));
         }
-        entries.sort_by(|left, right| left.name.cmp(&right.name));
-        refuse_duplicate_names(entries.iter().map(LauncherExport::name), "launcher table")?;
+        entries.sort_by(|left, right| left.name().cmp(right.name()));
+        refuse_duplicate_names(entries.iter().map(LauncherRow::name), "launcher table")?;
+        // One window app id names one row, or a window would match two.
+        let mut app_ids = BTreeSet::new();
+        if let Some(row) = entries.iter().find(|row| !app_ids.insert(row.app_id())) {
+            return Err(format!(
+                "launcher table gives app id {:?} to two applications",
+                row.app_id()
+            ));
+        }
         let table = Self { entries };
         ensure_size(
             "launcher table",
@@ -215,9 +293,8 @@ impl LauncherTable {
         ensure_text("launcher table", text, MAX_APPLICATION_TABLE_BYTES)?;
         let mut entries = Vec::new();
         for (index, line) in text.lines().enumerate() {
-            let row = format!("{line}\n");
             entries.push(
-                LauncherExport::parse(&row)
+                LauncherRow::parse(line)
                     .map_err(|error| format!("launcher table row {}: {error}", index + 1))?,
             );
         }
@@ -229,10 +306,10 @@ impl LauncherTable {
     }
 
     pub fn to_tsv(&self) -> String {
-        self.entries.iter().map(LauncherExport::to_tsv).collect()
+        self.entries.iter().map(LauncherRow::to_tsv).collect()
     }
 
-    pub fn entries(&self) -> impl Iterator<Item = &LauncherExport> {
+    pub fn entries(&self) -> impl Iterator<Item = &LauncherRow> {
         self.entries.iter()
     }
 }
@@ -342,6 +419,26 @@ fn validate_search_terms<'a>(terms: impl Iterator<Item = &'a str>) -> Result<(),
                 "duplicate application launcher search term {term:?}"
             ));
         }
+    }
+    Ok(())
+}
+
+/// A window app id as the compositor matches one: one to 128 ASCII
+/// letters, digits, `.`, `_` and `-`.
+fn validate_app_id(app_id: &str) -> Result<(), String> {
+    if app_id.is_empty() || app_id.len() > MAX_APP_ID_BYTES {
+        return Err(format!(
+            "launcher app id is {} bytes; it must be 1 to {MAX_APP_ID_BYTES}",
+            app_id.len()
+        ));
+    }
+    if !app_id
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(format!(
+            "launcher app id {app_id:?} uses a byte outside ASCII letters, digits, `.`, `_` and `-`"
+        ));
     }
     Ok(())
 }
@@ -466,11 +563,44 @@ mod tests {
             .unwrap()
             .bind("editor")
             .unwrap();
-        let table = LauncherTable::new(vec![ripgrep.clone(), editor]).unwrap();
+        let row = |export: &LauncherExport, app_id: &str| {
+            LauncherRow::new(export.clone(), app_id).unwrap()
+        };
+        let table = LauncherTable::new(vec![
+            row(&ripgrep, "org.td.ripgrep"),
+            row(&editor, "td-editor"),
+        ])
+        .unwrap();
         let text = table.to_tsv();
-        assert!(text.starts_with("editor\t"), "{text}");
+        assert_eq!(
+            text,
+            "editor\tEditor\tedit text\ttd-editor\n\
+             ripgrep-seed\tRipgrep\tripgrep rg search text\torg.td.ripgrep\n"
+        );
         assert_eq!(LauncherTable::parse(&text).unwrap(), table);
-        assert!(LauncherTable::new(vec![ripgrep.clone(), ripgrep]).is_err());
+        let rows: Vec<_> = table
+            .entries()
+            .map(|row| (row.name(), row.app_id(), row.export().display_name()))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("editor", "td-editor", "Editor"),
+                ("ripgrep-seed", "org.td.ripgrep", "Ripgrep")
+            ]
+        );
+        assert!(LauncherTable::new(vec![row(&ripgrep, "a"), row(&ripgrep, "b")]).is_err());
+        let error =
+            LauncherTable::new(vec![row(&ripgrep, "same"), row(&editor, "same")]).unwrap_err();
+        assert!(error.contains("two applications"), "{error}");
+        // A row with no search terms keeps its empty column.
+        let bare = LauncherDeclaration::new("Bare", &[])
+            .unwrap()
+            .bind("bare")
+            .unwrap();
+        let bare = LauncherTable::new(vec![row(&bare, "bare")]).unwrap();
+        assert_eq!(bare.to_tsv(), "bare\tBare\t\tbare\n");
+        assert_eq!(LauncherTable::parse("bare\tBare\t\tbare\n").unwrap(), bare);
 
         let registry = ApplicationRegistry::new(vec![
             (
@@ -502,6 +632,21 @@ mod tests {
         ] {
             assert!(LauncherExport::parse(text).is_err(), "accepted {text:?}");
         }
+        // The table's fourth column is the window app id, in its own grammar.
+        for text in [
+            "ripgrep-seed\tRipgrep\trg\n",
+            "ripgrep-seed\tRipgrep\trg\t\n",
+            "ripgrep-seed\tRipgrep\trg\torg.td.rg\textra\n",
+            "ripgrep-seed\tRipgrep\trg\torg td rg\n",
+            "ripgrep-seed\tRipgrep\trg\torg/td/rg\n",
+            "ripgrep-seed\tRipgrep\trg\tkéy\n",
+            "b\tB\t\tb\na\tA\t\ta\n",
+        ] {
+            assert!(LauncherTable::parse(text).is_err(), "accepted {text:?}");
+        }
+        let export = declaration().bind("ripgrep-seed").unwrap();
+        assert!(LauncherRow::new(export.clone(), &"x".repeat(MAX_APP_ID_BYTES)).is_ok());
+        assert!(LauncherRow::new(export, &"x".repeat(MAX_APP_ID_BYTES + 1)).is_err());
         for text in [
             "app\trelative\n",
             "app\t/td/store/item/\n",
@@ -539,10 +684,11 @@ mod tests {
         assert!(LauncherDeclaration::new("App", &many).is_err());
         let entries = (0..=MAX_APPLICATIONS)
             .map(|index| {
-                LauncherDeclaration::new("App", &[])
+                let export = LauncherDeclaration::new("App", &[])
                     .unwrap()
                     .bind(&format!("app-{index}"))
-                    .unwrap()
+                    .unwrap();
+                LauncherRow::new(export, "app").unwrap()
             })
             .collect();
         assert!(LauncherTable::new(entries).is_err());

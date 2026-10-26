@@ -41,6 +41,18 @@ const TAIL_BYTES: usize = 512;
 const READ_BUDGET: usize = 16 * 1024;
 /// A frame's payload bound (td-authd/DESIGN.md, "Private channel").
 const FRAME_BYTES: usize = crate::channel::MAX_MESSAGE;
+/// The image's application registry (APPLICATIONS.md §A.0), immutable:
+/// the names the installed set follows.
+pub(crate) const REGISTRY: &str = "/etc/td-applications.tsv";
+/// The registry's bounds, the builder's own (engine/src/launcher.rs).
+const REGISTRY_BYTES: usize = 1024 * 1024;
+const REGISTRY_NAMES: usize = 256;
+/// One byte past the bound, so a longer registry reads as too long.
+const REGISTRY_READ: u64 = REGISTRY_BYTES as u64 + 1;
+/// `88`'s state bits for one Flathub declaration: its last read showed a
+/// `current` generation, and a later answer may say otherwise.
+const INSTALLED: u8 = 0x01;
+const PENDING: u8 = 0x02;
 
 /// One request: a verb and a name in the registry's grammar, which the
 /// operation's own admission checks against the deployment.
@@ -230,13 +242,22 @@ impl Run {
     }
 }
 
+/// What one read of a name's status found besides its record.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct Found {
+    /// A writer at work in the cache.
+    writer: bool,
+    /// A `current` generation: the application is installed.
+    installed: bool,
+}
+
 /// What the last read of a name's status found.
 enum Record {
     Unread,
-    /// The canonical record, when its read began, and whether it showed
-    /// a writer at work in the cache.
-    Read(Vec<u8>, Instant, bool),
-    Failed,
+    /// The canonical record, when its read began, and what it showed.
+    Read(Vec<u8>, Instant, Found),
+    /// A read that failed, and when it began.
+    Failed(Instant),
 }
 
 struct Entry {
@@ -303,10 +324,10 @@ impl Entry {
         self.record = match run.advance() {
             Ended::Running => return,
             Ended::Exited(bytes, true) => match checked(name, &bytes) {
-                Some((record, writer)) => Record::Read(record, began, writer),
-                None => Record::Failed,
+                Some((record, found)) => Record::Read(record, began, found),
+                None => Record::Failed(began),
             },
-            Ended::Exited(_, false) | Ended::Lost => Record::Failed,
+            Ended::Exited(_, false) | Ended::Lost => Record::Failed(began),
         };
         self.reading = None;
         self.finished = Some(Instant::now());
@@ -326,12 +347,13 @@ impl Entry {
         if !due {
             return;
         }
-        self.began = Some(Instant::now());
+        let began = Instant::now();
+        self.began = Some(began);
         match start(owner, name, Verb::Status) {
             Ok(run) => self.reading = Some(run),
             Err(why) => {
                 let _ = writeln!(io::stderr().lock(), "td-authd: {why}");
-                self.record = Record::Failed;
+                self.record = Record::Failed(began);
                 self.finished = Some(Instant::now());
             }
         }
@@ -352,14 +374,32 @@ impl Entry {
             .finished
             .is_some_and(|finished| finished.elapsed() < FRESH);
         match &self.record {
-            Record::Read(_, began, writer) if fresh => {
+            Record::Read(_, began, found) if fresh => {
                 // Root's own operation that ended since was that writer.
                 let since = self.ended.is_some_and(|ended| ended >= *began);
-                (*writer && !since).then_some(1)
+                (found.writer && !since).then_some(1)
             }
-            Record::Failed if fresh => None,
+            Record::Failed(_) if fresh => None,
             _ => Some(5),
         }
+    }
+
+    /// `88`'s state for this name: whether the last read found it
+    /// installed, and whether that may change soon: nothing read yet, an
+    /// operation running, or the last read, whether it succeeded or
+    /// failed, begun before the last operation ended. A failed read begun
+    /// after it is settled and not installed.
+    fn installed(&self) -> u8 {
+        let (installed, older) = match &self.record {
+            Record::Unread => (false, true),
+            Record::Failed(began) => (false, self.ended.is_some_and(|ended| ended > *began)),
+            Record::Read(_, began, found) => (
+                found.installed,
+                self.ended.is_some_and(|ended| ended > *began),
+            ),
+        };
+        let pending = older || self.operation.is_some();
+        (if installed { INSTALLED } else { 0 }) | (if pending { PENDING } else { 0 })
     }
 
     /// `87`'s answer: the operation running, the last one's outcome, and
@@ -386,7 +426,7 @@ impl Entry {
         }
         match &self.record {
             Record::Unread => answer.push(0),
-            Record::Failed => answer.push(3),
+            Record::Failed(_) => answer.push(3),
             Record::Read(record, began, _) => {
                 let older = self.ended.is_some_and(|ended| ended > *began);
                 answer.push(if older { 2 } else { 1 });
@@ -399,17 +439,69 @@ impl Entry {
 
 /// A record root relays: exactly the canonical status of the requested
 /// application, and small enough for a frame beside `87`'s header; and
-/// whether it shows a writer at work.
-fn checked(name: &str, bytes: &[u8]) -> Option<(Vec<u8>, bool)> {
+/// whether it shows a writer at work and a `current` generation.
+fn checked(name: &str, bytes: &[u8]) -> Option<(Vec<u8>, Found)> {
     let text = std::str::from_utf8(bytes).ok()?;
     let status = Status::parse(text).ok()?;
     let header = 6 + REASON_BYTES;
-    let writer = status
-        .cache
-        .as_ref()
-        .is_some_and(|cache| cache.progress.is_some());
+    let found = Found {
+        writer: status
+            .cache
+            .as_ref()
+            .is_some_and(|cache| cache.progress.is_some()),
+        installed: status
+            .cache
+            .as_ref()
+            .is_some_and(|cache| cache.current.is_some()),
+    };
     (status.name == name && bytes.len() <= FRAME_BYTES.saturating_sub(header))
-        .then(|| (bytes.to_vec(), writer))
+        .then(|| (bytes.to_vec(), found))
+}
+
+/// The names of the registry's text, in the builder's bounds: one
+/// `NAME<TAB>PATH` line each, ended by a newline, at most 256 and none
+/// twice. Only names in the registry grammar are kept: that is the
+/// grammar every request names an application in, and the builder's
+/// identity grammar is wider (APPLICATIONS.md §A), so a name outside it
+/// is one no request can name.
+pub(crate) fn registry_names(text: &str) -> Result<Vec<String>, String> {
+    let invalid = || "the application registry is malformed".to_string();
+    if text.len() > REGISTRY_BYTES || !(text.is_empty() || text.ends_with('\n')) {
+        return Err(invalid());
+    }
+    let mut names: Vec<String> = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for line in text.split_terminator('\n') {
+        let (name, path) = line.split_once('\t').ok_or_else(invalid)?;
+        if name.is_empty()
+            || path.is_empty()
+            || line.contains(['\r', '\0'])
+            || path.contains('\t')
+            || seen.len() >= REGISTRY_NAMES
+            || !seen.insert(name)
+        {
+            return Err(invalid());
+        }
+        if crate::consent::application_name(name) {
+            names.push(name.to_string());
+        }
+    }
+    Ok(names)
+}
+
+/// Reads the image's registry, bounded.
+pub(crate) fn load_registry() -> Result<Vec<String>, String> {
+    let mut text = String::new();
+    std::fs::File::open(REGISTRY)
+        .and_then(|file| file.take(REGISTRY_READ).read_to_string(&mut text))
+        .map_err(|e| format!("read {REGISTRY}: {e}"))?;
+    registry_names(&text)
+}
+
+/// Whether a registry name is a Flathub declaration td-app keeps a cache
+/// for; the image ships every other one.
+fn flathub(name: &str) -> bool {
+    flathub_app::flathub_source(name).is_some()
 }
 
 /// The operation's last diagnostic line as printable ASCII, without the
@@ -430,6 +522,7 @@ fn reason(tail: &[u8]) -> String {
 }
 
 type Starter = fn(u32, &str, Verb) -> Result<Run, String>;
+type Registry = fn() -> Result<Vec<String>, String>;
 
 fn start(owner: u32, name: &str, verb: Verb) -> Result<Run, String> {
     Run::start(operation(owner, name, verb), verb)
@@ -439,18 +532,40 @@ fn start(owner: u32, name: &str, verb: Verb) -> Result<Run, String> {
 pub(crate) struct Requests {
     entries: BTreeMap<String, Entry>,
     start: Starter,
+    /// The registry's names, read once a generation: the image is
+    /// immutable while it runs.
+    registry: Option<Vec<String>>,
+    load: Registry,
+    flathub: fn(&str) -> bool,
 }
 
 impl Requests {
     pub(crate) fn new() -> Self {
-        Self::with_starter(start)
+        Self::with(start, load_registry, flathub)
     }
 
+    #[cfg(test)]
     fn with_starter(start: Starter) -> Self {
+        Self::with(start, || Ok(Vec::new()), flathub)
+    }
+
+    fn with(start: Starter, load: Registry, flathub: fn(&str) -> bool) -> Self {
         Self {
             entries: BTreeMap::new(),
             start,
+            registry: None,
+            load,
+            flathub,
         }
+    }
+
+    /// The registry's names, read on first use; a failed read is tried
+    /// again by the next request.
+    pub(crate) fn registry(&mut self) -> Result<&[String], String> {
+        if self.registry.is_none() {
+            self.registry = Some((self.load)()?);
+        }
+        Ok(self.registry.as_deref().unwrap_or_default())
     }
 
     /// Reaps what ended; every request and heartbeat calls it, so no
@@ -479,6 +594,48 @@ impl Requests {
         let entry = self.entries.get_mut(name)?;
         entry.used = Instant::now();
         Some(entry)
+    }
+
+    /// `23`'s answer, at once: `88`, a count and, for each of the
+    /// registry's Flathub declarations, its state and its name. A name the
+    /// answer leaves out the image ships, which is always installed. Each
+    /// is followed through its entry, as a status request would be, so a
+    /// read starts no more often than a status's.
+    pub(crate) fn installed(&mut self, owner: u32) -> Vec<u8> {
+        if std::fs::symlink_metadata(crate::launch::LIVE_MEDIUM).is_ok() {
+            return vec![0xff, 3];
+        }
+        let flathub = self.flathub;
+        let names: Vec<String> = match self.registry() {
+            Ok(names) => names.iter().filter(|name| flathub(name)).cloned().collect(),
+            Err(why) => {
+                let _ = writeln!(io::stderr().lock(), "td-authd: {why}");
+                return vec![0xff, 2];
+            }
+        };
+        // Leaving one out would say the image ships it; a test holds the
+        // declarations to half of what root follows.
+        if names.len() > NAMES {
+            let _ = writeln!(
+                io::stderr().lock(),
+                "td-authd: the registry holds more Flathub declarations than root follows"
+            );
+            return vec![0xff, 2];
+        }
+        let start = self.start;
+        let mut answer = vec![0x88, u8::try_from(names.len()).unwrap_or(0)];
+        for name in &names {
+            // With no room to follow it, root cannot say yet.
+            let state = self.entry(name).map_or(PENDING, |entry| {
+                entry.advance(name);
+                entry.read(owner, name, &start);
+                entry.installed()
+            });
+            answer.push(state);
+            answer.push(u8::try_from(name.len()).unwrap_or(0));
+            answer.extend_from_slice(name.as_bytes());
+        }
+        answer
     }
 
     /// The configured owner's request, answered at once.

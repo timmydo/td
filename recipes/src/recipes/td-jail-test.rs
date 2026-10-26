@@ -4,7 +4,7 @@ use crate::shared::{
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 use td_engine::application::ApplicationProvenance;
 use td_engine::application_spec::ApplicationSpec;
-use td_engine::launcher::{ApplicationRegistry, LauncherTable};
+use td_engine::launcher::{ApplicationRegistry, LauncherRow, LauncherTable};
 
 const HOST_PACKAGE: &str = "/td/store/00000000000000000000000000000000-td-jail-fixture-0.1";
 const HOST_RUNTIME: &str = "/td/store/00000000000000000000000000000000-empty-runtime-1";
@@ -87,8 +87,8 @@ fn host_fixture() -> Result<HostFixture, String> {
     ])?
     .to_tsv();
     let launcher = LauncherTable::new(vec![
-        firefox_launcher.bind(&firefox_name)?,
-        fixture_launcher,
+        LauncherRow::for_manifest(firefox_launcher.bind(&firefox_name)?, &firefox_manifest)?,
+        LauncherRow::for_manifest(fixture_launcher, &manifest)?,
     ])?
     .to_tsv();
     Ok(HostFixture {

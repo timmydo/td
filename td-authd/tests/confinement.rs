@@ -1057,16 +1057,28 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert_eq!(software.matches(".spawn()").count(), 1);
     assert_eq!(software.matches(".env_clear()").count(), 1);
     assert_eq!(software.matches(".stdin(Stdio::null())").count(), 1);
+    // The peer's name, and each registry name, in the registry grammar.
     assert_eq!(
         software
             .matches("crate::consent::application_name(name)")
             .count(),
-        1
+        2
     );
     // A running operation is killed only past its own bound and root's
     // backstop beyond it, never because the peer asked again.
     assert_eq!(software.matches(".kill()").count(), 2);
     assert!(software.contains(".and_then(|end| end.checked_add(BACKSTOP));"));
+    // The one file it reads is the image's immutable registry, bounded,
+    // for the names `23` follows.
+    assert!(software.contains("pub(crate) const REGISTRY: &str = \"/etc/td-applications.tsv\";"));
+    assert_eq!(software.matches("File::open(").count(), 1);
+    assert_eq!(software.matches("std::fs::File::open(REGISTRY)").count(), 1);
+    assert!(software.contains("file.take(REGISTRY_READ).read_to_string(&mut text)"));
+    assert!(software.contains("const REGISTRY_READ: u64 = REGISTRY_BYTES as u64 + 1;"));
+    assert!(software.contains("const REGISTRY_BYTES: usize = 1024 * 1024;"));
+    for forbidden in ["fs::read", "fs::write", "OpenOptions", "remove_"] {
+        assert!(!software.contains(forbidden), "software.rs: {forbidden}");
+    }
     let launch = include_str!("../src/launch.rs");
     for forbidden in [
         "thread::spawn",
@@ -1260,8 +1272,8 @@ const SHARED_LOGIN_STATE_FINGERPRINT: u64 = 0x36b736e5dda17cc6;
 const SHARED_HOSTNAME_FINGERPRINT: u64 = 0x49026f28c1db76ec;
 
 const CACHE_FINGERPRINT: u64 = 0x842accbdae0b3daf;
-const SOFTWARE_FINGERPRINT: u64 = 0x3971e2184320b15b;
-const LAUNCH_FINGERPRINT: u64 = 0x18111dd1fb382ac6;
+const SOFTWARE_FINGERPRINT: u64 = 0x19cb169265fa785d;
+const LAUNCH_FINGERPRINT: u64 = 0x12667bdfc6f333da;
 const MAIN_FINGERPRINT: u64 = 0x9d8b70595b652b5f;
 const SESSION_FINGERPRINT: u64 = 0x6c78640f078fe395;
 

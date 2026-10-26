@@ -471,6 +471,10 @@ impl Step {
             } => Json::Obj(vec![(
                 "compileApplicationTables".into(),
                 Json::Obj(vec![
+                    (
+                        "format".into(),
+                        Json::Str(td_engine::launcher::TABLES_FORMAT.into()),
+                    ),
                     ("names".into(), arr(names)),
                     ("packages".into(), arr(packages)),
                     ("runtimes".into(), arr(runtimes)),
@@ -1794,6 +1798,18 @@ mod tests {
         assert_eq!(
             pack.to_json().to_canonical(),
             r#"{"packErofs":{"format":"zstd-shared-extents-v2","output":"{out}/deployment/root.erofs","root":"{root}/real-root"}}"#
+        );
+
+        let tables = Step::CompileApplicationTables {
+            names: vec!["firefox".into()],
+            packages: vec!["{in:firefox}".into()],
+            runtimes: vec!["{in:runtime}".into()],
+            registry: "{root}/etc/td-applications.tsv".into(),
+            launcher: "{root}/etc/td-launcher.tsv".into(),
+        };
+        assert_eq!(
+            tables.to_json().to_canonical(),
+            r#"{"compileApplicationTables":{"format":"launcher-app-id-v1","launcher":"{root}/etc/td-launcher.tsv","names":["firefox"],"packages":["{in:firefox}"],"registry":"{root}/etc/td-applications.tsv","runtimes":["{in:runtime}"]}}"#
         );
 
         let manifest = Step::Sha256Manifest {

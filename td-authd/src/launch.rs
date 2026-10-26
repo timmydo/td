@@ -432,6 +432,8 @@ enum Request {
     UnitState,
     /// `24`: an application cache request for a validated name.
     Software(crate::software::Request),
+    /// `23`: which of the registry's Flathub declarations are installed.
+    Installed,
     Secret(crate::session::Request),
 }
 
@@ -761,6 +763,7 @@ fn request(bytes: &[u8]) -> Result<Request, String> {
             operands,
         )?)),
         [0x22] => Ok(Request::Start(Program::Software)),
+        [0x23] => Ok(Request::Installed),
         _ => Err("invalid terminal authority request".into()),
     }
 }
@@ -831,6 +834,7 @@ impl Launches {
         self.software.advance();
         match request {
             Request::Software(request) => Ok(self.software.answer(config.owner, request)),
+            Request::Installed => Ok(self.software.installed(config.owner)),
             Request::Secret(_) => Err("secret request reached terminal dispatcher".into()),
             Request::Supervised(unit) => {
                 // The live table skips the application; td-svc's `start`
@@ -1068,8 +1072,8 @@ fn enrollment_dispatch_reaches_the_secret_decoder() -> Result<(), String> {
         }
     }
     // None of these takes an operand, `20` takes exactly one but for an
-    // upgrade's two, `21` exactly one, `22` none, and `24` a verb and a
-    // name.
+    // upgrade's two, `21` exactly one, `22` and `23` none, and `24` a
+    // verb and a name.
     assert!(request(&[0x1d, 0]).is_err());
     assert!(request(&[0x1e, 0]).is_err());
     assert!(request(&[0x1f, 0]).is_err());
@@ -1084,12 +1088,13 @@ fn enrollment_dispatch_reaches_the_secret_decoder() -> Result<(), String> {
         &[0x21],
         &[0x21, 0, 0],
         &[0x22, 0],
-        &[0x23],
+        &[0x23, 0],
         &[0x24],
         &[0x24, 0],
     ] {
         assert!(request(bad).is_err(), "{bad:?}");
     }
     assert!(request(&[0x16, 2]).is_err());
+    assert_eq!(request(&[0x23])?, Request::Installed);
     Ok(())
 }
