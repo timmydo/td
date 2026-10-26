@@ -5,6 +5,8 @@
     clippy::panic
 )]
 use super::*;
+use crate::revocation::tests::WAIT;
+use crate::test_temp::TempDir;
 use std::io::Write;
 use std::os::fd::AsFd;
 use std::thread;
@@ -329,9 +331,14 @@ fn scripted_worker() {
         }
         proof if proof.starts_with("proof-") => proof_script(w, proof),
         protector if protector.starts_with("protector-") => protector_script(w, protector),
-        // Holds the channel it inherited, then ends.
-        "linger" => thread::sleep(Duration::from_millis(300)),
-        "linger-long" => thread::sleep(Duration::from_millis(1500)),
+        // Holds the channel it inherited from `held` appearing until
+        // released, then removes `held` as it exits.
+        hold if hold.starts_with("hold-until:") => {
+            let directory = Path::new(hold.trim_start_matches("hold-until:"));
+            std::fs::write(directory.join("held"), b"").unwrap();
+            let _released = appeared(&directory.join("release"));
+            std::fs::remove_file(directory.join("held")).unwrap();
+        }
         upgrade if upgrade.starts_with("upgrade-") || upgrade.starts_with("cancel") => {
             upgrade_script(w, upgrade)
         }
@@ -369,30 +376,23 @@ fn upgrade_script(w: &mut Worker, script: &str) {
                 w.send(&[0x15, 0x28]);
             }
             // Its read finds the header changed: definite, before any
-            // presentation, though a process it leaves holds its channel
-            // a moment past its exit.
+            // presentation.
             "-changed-view" => w.send(&[0x15, 0x28]),
-            "-changed-held" | "-changed-held-long" => {
+            // The same, its channel left with a descendant that holds it
+            // past this worker's exit until the test releases it; the
+            // worker exits once the holder has written `held`, which the
+            // holder removes as it exits.
+            held if held.starts_with("-changed-held:") => {
+                let directory = Path::new(held.trim_start_matches("-changed-held:"));
                 w.send(&[0x15, 0x28]);
                 #[allow(
                     clippy::zombie_processes,
                     reason = "left holding the channel past this worker's exit"
                 )]
-                Command::new(std::env::current_exe().unwrap())
-                    .args(["--exact", "storage::tests::scripted_worker", "--ignored"])
-                    .env_clear()
-                    .env(
-                        SCRIPT,
-                        if rest == "-changed-held" {
-                            "linger"
-                        } else {
-                            "linger-long"
-                        },
-                    )
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
+                fixture(&format!("hold-until:{}", directory.display()))
                     .spawn()
                     .unwrap();
+                assert!(appeared(&directory.join("held")));
             }
             // A selector update's kind, which no cancellation sends.
             "-esp" => {
@@ -559,10 +559,40 @@ fn upgrade_script(w: &mut Worker, script: &str) {
     }
 }
 
+/// Whether `path` appears, looked for every millisecond, within `WAIT`.
+fn appeared(path: &Path) -> bool {
+    let until = Instant::now() + WAIT;
+    while !path.exists() {
+        if Instant::now() >= until {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    true
+}
+
+/// A `hold-until:` holder's directory. Dropped, it releases the holder
+/// and waits for it to remove `held`: the holder, the directory's one
+/// other writer, is done with it before the directory goes.
+struct Holder {
+    directory: TempDir,
+}
+
+impl Drop for Holder {
+    fn drop(&mut self) {
+        let _ = std::fs::write(self.directory.path().join("release"), b"");
+        let held = self.directory.path().join("held");
+        let until = Instant::now() + WAIT;
+        while held.exists() && Instant::now() < until {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
 /// Polls `storage`, acknowledging the presentation and the commit, until it
 /// ends: its end and what it presented.
 fn drive(storage: &mut Storage) -> (Event, Vec<Request>) {
-    let until = Instant::now() + Duration::from_secs(10);
+    let until = Instant::now() + WAIT;
     let mut presented = Vec::new();
     loop {
         match storage.poll().unwrap() {
@@ -932,9 +962,6 @@ fn a_cancellation_takes_an_upgrading_volume_and_one_presentation() {
         ("cancel-past-u0", ended(false, STATE)),
         ("cancel-changed", ended(false, CHANGED)),
         ("cancel-changed-view", ended(false, CHANGED)),
-        ("cancel-changed-held", ended(false, CHANGED)),
-        // Past root's grace the open channel is an unclean end.
-        ("cancel-changed-held-long", ended(false, INTERNAL)),
         ("cancel-esp", ended(false, INTERNAL)),
         ("cancel-baseline:0", ended(false, VOLUME)),
         ("cancel-baseline:5", ended(false, VOLUME)),
@@ -948,6 +975,51 @@ fn a_cancellation_takes_an_upgrading_volume_and_one_presentation() {
             assert_eq!(presented, [cancellation()]);
         }
         assert!(storage.child.is_none(), "{script}");
+    }
+    // A descendant holds the channel past the worker's exit, and root
+    // waits for its end a second from seeing the exit: an end within the
+    // grace is the definite 28, and a channel still open at its end is an
+    // unclean end. It holds until released, and the released one's grace
+    // is extended past any loaded host's release once its length is
+    // checked, so neither outcome rests on how soon a process starts or
+    // ends.
+    for (released, end) in [
+        (true, ended(false, CHANGED)),
+        (false, ended(false, INTERNAL)),
+    ] {
+        let holder = Holder {
+            directory: TempDir::new("td-authd-held").unwrap(),
+        };
+        let script = format!("cancel-changed-held:{}", holder.directory.path().display());
+        let mut storage = Storage::scripted_as(Selection::UpgradeCancel, true, &script).unwrap();
+        let until = Instant::now() + WAIT;
+        let (before, after) = loop {
+            let before = Instant::now();
+            assert_eq!(storage.poll(), Ok(Event::Waiting), "{released}");
+            if storage.status.is_some() {
+                break (before, Instant::now());
+            }
+            assert!(Instant::now() < until, "{released}");
+            thread::sleep(Duration::from_millis(1));
+        };
+        // The worker has exited, seen within that poll; the channel is
+        // still held.
+        let Some((_, grace)) = &mut storage.status else {
+            panic!("no exit");
+        };
+        // DESIGN.md's one second, `GRACE`, from that poll.
+        let second = Duration::from_secs(1);
+        assert!(before + second <= *grace && *grace <= after + second);
+        let ends = *grace;
+        if released {
+            *grace = Instant::now() + WAIT;
+            std::fs::write(holder.directory.path().join("release"), b"").unwrap();
+        }
+        assert_eq!(drive(&mut storage).0, end, "{released}");
+        if !released {
+            assert!(Instant::now() >= ends);
+        }
+        assert!(storage.child.is_none(), "{released}");
     }
 }
 
