@@ -2287,17 +2287,39 @@ supplies an immutable model of its item IDs, availability, checks and
 shortcuts, with the active tab/revision and key profile as the model
 revision. When the controller switches headers, the adapter refreshes
 application availability, including clipboard transfers completed while
-the menu was open. Stale header input cancels the old menu; reopening is
-a fresh press. Admission rechecks them and the popup geometry before
-executing an item; a stale menu dismisses visibly without issuing the
-command. File completion dismisses an open menu before showing its
-result or switching tabs. Configure, keyboard map replacement and
-keyboard-focus loss dismiss menus; pointer leave also dismisses without
-altering keyboard focus. The first press outside a popup only dismisses
-it; it cannot click through to text or tabs. Disabled entries do nothing
-and stay open. Pointer motion highlights only enabled rows; wheel events
-are consumed. Selecting another header switches menus, and selecting the
-current header closes it.
+the menu was open. A change of the clipboard selection, an offer
+arriving, replaced or withdrawn, refreshes it in place through the
+controller's same-shape refresh, keeping the open group and its
+highlighted row, so Paste follows the selection; a highlighted Paste
+the selection's removal disables loses its highlight, and the menu
+stays. That includes the compositor's echo of the editor's own Copy,
+which can arrive after a menu opened just after the copy. A pending
+Paste is still cancelled, under the data-device contract below. A menu
+already stale for its tab, revision or key profile is not refreshed:
+its next input dismisses it visibly. Stale header input
+cancels the old menu; reopening is a fresh press. Admission rechecks
+them and the popup geometry before executing an item; a stale menu
+dismisses visibly without issuing the command. File completion
+dismisses an open menu before showing its result or switching tabs.
+Configure, keyboard map replacement and keyboard-focus loss dismiss
+menus; pointer leave also dismisses without altering keyboard focus.
+The first press outside a popup only dismisses it; it cannot click
+through to text or tabs. Disabled entries do nothing and stay open.
+Pointer motion highlights only enabled rows; wheel events are consumed.
+Selecting another header switches menus, and selecting the current
+header closes it.
+
+The complete set of dismissals: F10, Escape or C-g; an activated item;
+a press outside the popup or on its own header; input to a stale menu,
+which says so; a refusal (no room, or a controller error), which says
+so; Configure; keyboard map replacement; keyboard-focus, keyboard or
+seat loss; pointer leave; file completion and a completed paste; the
+window's close; any request that opens a prompt, dialog or confirmation
+or starts a spelling check or a directory change, from a menu, a key or
+the control socket; and the release of the data device with its global
+or seat. Nothing else closes an open menu: not a clipboard selection
+change, a clipboard transfer finishing, a notice, wheel input or a press
+on a disabled entry.
 
 Activation uses a separate press on an item after opening the header;
 press-drag-release menu selection is not implemented. Release cannot
@@ -2322,7 +2344,9 @@ Pure tests pin panel bounds and row hits at scales 1-4, disabled navigation,
 shortcut widths and header mapping. Controller tests pin prefix/mark/drag
 cancellation with selection retained. Fake-compositor tests drive physical
 F10, mouse menus, disabled/outside/repeated input, profile/format changes,
-Save and dirty-close flows, stale targets, resize and late file completion.
+Save and dirty-close flows, stale targets, resize, late file completion
+and selection changes, the own copy's echo among them, refreshing an
+open Edit menu without closing it.
 Menus do not imply a remote-control socket, GPU or jail milestone.
 
 ### Implemented key list

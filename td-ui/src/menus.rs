@@ -221,7 +221,8 @@ struct Level {
 
 /// An immutable model plus its open path. An event's current revision must
 /// equal the model's; stale input closes every panel without an activation.
-/// Replacing the model means constructing a new, closed controller.
+/// Replacing the model means constructing a new, closed controller, unless
+/// `refresh` swaps in one of the same shape.
 #[derive(Clone, Debug)]
 pub struct Controller<'a, A, R> {
     model: Model<'a, A, R>,
@@ -286,6 +287,85 @@ impl<'a, A: Copy, R: Copy + Eq> Controller<'a, A, R> {
     pub fn dismiss(&mut self) {
         self.levels.clear();
         self.group = None;
+    }
+    /// Replaces the model with one of the same shape, keeping the open
+    /// path, selections and scrolling, so availability, checks, shortcuts
+    /// and the revision can change under an open menu without closing it.
+    /// Same shape is the same kind, parents, labels and items, which fix
+    /// every panel's geometry. A submenu now disabled closes from its own
+    /// panel down, and a selected row now disabled loses its selection; a
+    /// complete root with no enabled row highlights its first, as `open_bar`
+    /// would. The outcome is `Dismissed` when that closed every panel,
+    /// `Changed` while open, and `Ignored` for a closed menu. A different
+    /// shape is refused and leaves the controller unchanged. The new
+    /// revision is taken as given: keeping a stale menu stale is the
+    /// consumer's, by not refreshing it.
+    pub fn refresh(&mut self, model: Model<'a, A, R>) -> Result<Outcome<A>, Error>
+    where
+        A: PartialEq,
+    {
+        let same = |old: &Node<'a, A>, new: &Node<'a, A>| {
+            old.parent == new.parent
+                && old.row.label == new.row.label
+                && match (old.item, new.item) {
+                    (Item::Action(a), Item::Action(b)) => a == b,
+                    (Item::Submenu, Item::Submenu) => true,
+                    _ => false,
+                }
+        };
+        if model.kind != self.model.kind
+            || model.nodes.len() != self.model.nodes.len()
+            || !self
+                .model
+                .nodes
+                .iter()
+                .zip(&model.nodes)
+                .all(|(old, new)| same(old, new))
+        {
+            return Err(Error::InvalidModel);
+        }
+        self.model = model;
+        let open = self.is_open();
+        let enabled = |model: &Model<'a, A, R>, index: usize| {
+            model.node(index).is_some_and(|n| n.row.enabled)
+        };
+        if let Some(depth) = self
+            .levels
+            .iter()
+            .position(|level| level.parent.is_some_and(|p| !enabled(&self.model, p)))
+        {
+            self.levels.truncate(depth);
+        }
+        if self.levels.is_empty() {
+            self.group = None;
+        }
+        let fit = self.fit;
+        for (depth, level) in self.levels.iter_mut().enumerate() {
+            // `layout`'s highlight of a complete root with no enabled row.
+            if fit == Fit::Complete
+                && depth == 0
+                && !self
+                    .model
+                    .children(level.parent)
+                    .any(|(_, n)| n.row.enabled)
+            {
+                if let Some((first, _)) = self.model.children(level.parent).next() {
+                    level.selected = Selection::Node(first);
+                    level.first = 0;
+                }
+                continue;
+            }
+            if let Selection::Node(index) = level.selected {
+                if !enabled(&self.model, index) {
+                    level.selected = Selection::None;
+                }
+            }
+        }
+        Ok(match (open, self.is_open()) {
+            (_, true) => Outcome::Changed,
+            (true, false) => Outcome::Dismissed,
+            (false, false) => Outcome::Ignored,
+        })
     }
     pub fn open_bar(&mut self, group: usize) -> Result<(), Error> {
         if self.model.kind != Kind::Bar {

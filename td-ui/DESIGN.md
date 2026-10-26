@@ -2611,9 +2611,22 @@ presses and zero wheel deltas do nothing. Pointer movement into a child
 retains its ancestors. An action closes the menu before emitting its ID;
 release and key repeat cannot activate it again. Outside presses dismiss
 and are consumed. Focus loss or resize closes all panels. A mismatched
-or absent revision invalidates the menu without an action; replacing
-data requires a new controller. Opening a closed menu is an explicit
-consumer action, except for a press on an enabled bar header.
+or absent revision invalidates the menu without an action. Replacing
+data otherwise requires a new controller, except that `refresh` takes a
+model of the same shape (kind, parents, labels and items, which fix the
+geometry) under an open menu, so availability, checks, shortcuts and
+the revision change without closing it: the open path, selections and
+scrolling stay, a submenu now disabled closes from its own panel down,
+and a selected row now disabled loses its selection, while a complete
+root with no enabled row highlights its first as opening does. It
+answers `Dismissed` when that closed every panel. Another shape is
+refused and changes nothing. `refresh` takes the new revision as given,
+so keeping a stale menu stale is the consumer's, by not refreshing it.
+Nothing outside these events dismisses a menu; the controller hears
+nothing of the clipboard, and td-ui's window, which owns no menu,
+cancels only a pending paste when the selection changes.
+Opening a closed menu is an explicit consumer action, except for a
+press on an enabled bar header.
 
 An open or switched panel that cannot fit returns `NoRoom`; the consumer
 can show an enlargement notice. `Other` consumes unhandled input without
@@ -2636,20 +2649,22 @@ but cannot activate. Submenus still adapt, including wheel scrolling.
 `panel` and `row_rect` expose only visible levels. Bars remain part of
 the consumer's chrome; the controller emits semantic panel draws.
 
-The editor uses this controller for its complete menus. Its immutable
-data captures application availability, checks, shortcuts and
-tab/revision/key profile. Its adapter owns document cancellation policy
-and executes typed items through existing commands; it has no private
-menu navigation state. td-mail's mailbox list opens a context menu of
+The editor uses this controller for its complete menus. Its data
+captures application availability, checks, shortcuts and
+tab/revision/key profile, recaptured in place through `refresh` when the
+clipboard selection changes (td-editor/DESIGN.md). Its adapter owns
+document cancellation policy and executes typed items through existing
+commands; it has no private menu navigation state. td-mail's mailbox list opens a context menu of
 its folder actions under its action bar's Folder label through the same
 controller, in adaptive fit, the session routing keys and the pointer
 to it while it is open, painting it after its frame, and closing it
 when the view it was opened for goes under it.
 `tests/menus.rs` covers tree and text bounds, disabled navigation,
 nested pointer paths, left/replacement placement, Back, scroll/reveal,
-revision invalidation, focus/resize, repeated input and complete-mode
-compatibility. Draw-stream and pixel oracles preserve
-the editor's existing panel output at scales one through four; its scene
+revision invalidation, same-shape refresh and its refusals,
+focus/resize, repeated input and complete-mode compatibility.
+Draw-stream and pixel oracles preserve the editor's existing panel
+output at scales one through four; its scene
 and native input regressions remain.
 
 ## Shared confirmation dialog

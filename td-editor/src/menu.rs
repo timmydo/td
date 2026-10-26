@@ -373,6 +373,26 @@ impl std::ops::Deref for Menu {
 
 impl Menu {
     pub(crate) fn new(data: Data, group: Group, geometry: Geometry) -> Result<Self, menus::Error> {
+        let model = Self::model(&data)?;
+        let mut controller =
+            menus::Controller::new(model, geometry.surface(), menus::Fit::Complete)?;
+        controller.open_bar(group.index())?;
+        Ok(Self { data, controller })
+    }
+    /// Availability captured afresh for the same target and key profile,
+    /// keeping the open group, its highlighted row (unless that row is now
+    /// disabled) and the menu's stamp; answers whether the menu is still
+    /// open. Data for another stamp is not taken: a stale menu stays
+    /// stale, to be dismissed visibly by its next input.
+    pub(crate) fn refresh(&mut self, data: Data) -> Result<bool, menus::Error> {
+        if data.stamp() != self.data.stamp() {
+            return Ok(true);
+        }
+        let outcome = self.controller.refresh(Self::model(&data)?)?;
+        self.data = data;
+        Ok(outcome == menus::Outcome::Changed)
+    }
+    fn model(data: &Data) -> Result<menus::Model<'static, Item, Stamp>, menus::Error> {
         let count = Group::ALL.iter().map(|g| g.items().len() + 1).sum();
         let mut nodes = Vec::new();
         nodes
@@ -406,11 +426,7 @@ impl Menu {
                 });
             }
         }
-        let model = menus::Model::new(menus::Kind::Bar, data.stamp(), &nodes)?;
-        let mut controller =
-            menus::Controller::new(model, geometry.surface(), menus::Fit::Complete)?;
-        controller.open_bar(group.index())?;
-        Ok(Self { data, controller })
+        menus::Model::new(menus::Kind::Bar, data.stamp(), &nodes)
     }
     pub(crate) fn valid(&self, stamp: Option<Stamp>, geometry: Geometry) -> bool {
         self.controller.valid(stamp, geometry.surface())

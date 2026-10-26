@@ -458,7 +458,7 @@ impl Window {
                 if self.clipboard.incoming.take().is_some() {
                     self.notify("Paste cancelled: clipboard offer changed.");
                 }
-                self.menu = None;
+                self.refresh_menu();
                 self.frames.invalidate(true);
             }
             ClipboardEvent::Send(right) => {
@@ -3139,8 +3139,38 @@ impl Window {
         if self.pointer_modal() {
             return Ok(());
         }
-        let Some(tab) = self.ui.editor().active() else {
+        let Some(data) = self.menu_data()? else {
             return Ok(());
+        };
+        let menu = match crate::menu::Menu::new(data, group, self.ui.geometry()) {
+            Ok(menu) => menu,
+            Err(td_ui::menus::Error::NoRoom) => {
+                self.menu = None;
+                self.notify("Enlarge the window to show the complete menu. Keyboard commands remain available.");
+                return Ok(());
+            }
+            Err(e) => {
+                self.menu = None;
+                self.notify(format!("Menu refused: {e}"));
+                return Ok(());
+            }
+        };
+        if let Err(e) = self.ui.dispatch(Event::CancelInput) {
+            self.notify(format!("Menu refused: {e}"));
+            return Ok(());
+        }
+        self.stop_pointer();
+        self.client.cancel_repeat();
+        self.menu = Some(menu);
+        self.frames.invalidate(true);
+        Ok(())
+    }
+
+    /// The application availability a menu captures, for the active tab;
+    /// none without one.
+    fn menu_data(&self) -> Result<Option<crate::menu::Data>> {
+        let Some(tab) = self.ui.editor().active() else {
+            return Ok(None);
         };
         let doc = self.ui.editor().document(tab).map_err(error)?;
         let (undo, redo) = doc.history_depth();
@@ -3148,7 +3178,7 @@ impl Window {
             && self.client.clipboard()
             && self.clipboard.outgoing.is_none()
             && td_ui::editor_clipboard::capture_range(doc).is_ok_and(|range| !range.is_empty());
-        let data = crate::menu::Data {
+        Ok(Some(crate::menu::Data {
             target: Target {
                 tab,
                 revision: doc.revision(),
@@ -3185,29 +3215,32 @@ impl Window {
                 && self.client.clipboard()
                 && self.clipboard.incoming.is_none()
                 && self.client.selection_mime().is_some(),
-        };
-        let menu = match crate::menu::Menu::new(data, group, self.ui.geometry()) {
-            Ok(menu) => menu,
-            Err(td_ui::menus::Error::NoRoom) => {
-                self.menu = None;
-                self.notify("Enlarge the window to show the complete menu. Keyboard commands remain available.");
-                return Ok(());
-            }
+        }))
+    }
+
+    /// A selection change, the echo of the editor's own copy included,
+    /// does not dismiss an open menu: it recaptures the menu's
+    /// availability in place, so Paste follows the selection. A menu
+    /// already stale for its document or key profile is left to dismiss
+    /// visibly on its next input.
+    fn refresh_menu(&mut self) {
+        if self.menu.is_none() {
+            return;
+        }
+        let refreshed = self
+            .menu_data()
+            .and_then(|data| match (data, &mut self.menu) {
+                (Some(data), Some(menu)) => menu.refresh(data).map_err(error),
+                _ => Ok(true),
+            });
+        match refreshed {
+            Ok(true) => {}
+            Ok(false) => self.menu = None,
             Err(e) => {
                 self.menu = None;
-                self.notify(format!("Menu refused: {e}"));
-                return Ok(());
+                self.notify(format!("Menu cancelled: {e}"));
             }
-        };
-        if let Err(e) = self.ui.dispatch(Event::CancelInput) {
-            self.notify(format!("Menu refused: {e}"));
-            return Ok(());
         }
-        self.stop_pointer();
-        self.client.cancel_repeat();
-        self.menu = Some(menu);
-        self.frames.invalidate(true);
-        Ok(())
     }
 
     fn menu_stamp(&self) -> Option<crate::menu::Stamp> {
@@ -13468,6 +13501,85 @@ mod tests {
             }
             assert!(w.menu.as_ref().unwrap().enabled(Item::Copy));
         }
+    }
+
+    #[test]
+    fn selection_changes_refresh_an_open_menu_without_dismissing_it() {
+        use crate::menu::{Group, Item};
+        let (mut w, peer, keyboard, device) = clipboard_fixture();
+        configure(&mut w, 800, 600);
+        pointer_enter(&mut w);
+        // Ctrl+C offers the selection; the compositor has not echoed it yet.
+        w.event(message(keyboard, 4, &[0, 4, 0, 0, 0])).unwrap();
+        key(&mut w, keyboard, 46);
+        w.event(message(keyboard, 4, &[0, 0, 0, 0, 0])).unwrap();
+        assert!(w.client.source().is_some());
+        drain(&peer);
+        let header = w.ui.geometry().menu(Group::Edit.index()).unwrap();
+        pointer_move(&mut w, header.x, header.y);
+        pointer_button(&mut w, true);
+        pointer_button(&mut w, false);
+        w.menu.as_mut().unwrap().select(3); // Copy
+        assert!(!w.menu.as_ref().unwrap().enabled(Item::Paste));
+        w.notice = None;
+
+        // The echo of the editor's own copy arrives under the open menu.
+        selection_offer(&mut w, device, 0xff00_0010, &[UTF8]);
+        let menu = w.menu.as_ref().unwrap();
+        assert_eq!((menu.group(), menu.selected()), (Group::Edit, 3));
+        assert!(menu.enabled(Item::Paste) && menu.enabled(Item::Copy));
+        assert!(w.notice.is_none());
+        // Paste is chosen from the menu the echo left open.
+        let paste = menu.row(4).unwrap();
+        pointer_move(&mut w, paste.x + 4, paste.y + 4);
+        pointer_button(&mut w, true);
+        pointer_button(&mut w, false);
+        assert!(w.menu.is_none() && w.clipboard.incoming.is_some());
+        let (requests, files) = drain(&peer);
+        assert!(requests.contains(&text_event(0xff00_0010, 1, UTF8)));
+        drop(files);
+        w.chord("Escape", false).unwrap();
+        assert!(w.clipboard.incoming.is_none());
+
+        // Another selection's arrival and the selection's removal refresh
+        // it too, keeping the highlighted row.
+        w.open_menu(Group::Edit).unwrap();
+        w.menu.as_mut().unwrap().select(3);
+        w.event(message(device, 5, &[0])).unwrap();
+        let menu = w.menu.as_ref().unwrap();
+        assert_eq!(menu.selected(), 3);
+        assert!(!menu.enabled(Item::Paste));
+        // A highlighted Paste the removal disables loses its highlight
+        // only; Down starts again at the first enabled row.
+        selection_offer(&mut w, device, 0xff00_0012, &[UTF8]);
+        w.menu.as_mut().unwrap().select(4);
+        w.event(message(device, 5, &[0])).unwrap();
+        assert!(w.menu.is_some());
+        w.chord("Down", false).unwrap();
+        let menu = w.menu.as_ref().unwrap();
+        assert_eq!(menu.group().items()[menu.selected()], Item::Cut);
+        w.menu.as_mut().unwrap().select(3);
+        selection_offer(&mut w, device, 0xff00_0011, &[PLAIN]);
+        let menu = w.menu.as_ref().unwrap();
+        assert_eq!(menu.selected(), 3);
+        assert!(menu.enabled(Item::Paste));
+
+        // A menu already stale for its document is not revived: it stays
+        // stale and its next input dismisses it visibly.
+        w.ui.dispatch(Event::Edit {
+            tab: 1,
+            revision: 0,
+            command: td_ui::editor_model::Command::Insert("x".into()),
+        })
+        .unwrap();
+        w.event(message(device, 5, &[0])).unwrap();
+        assert!(w.menu.as_ref().unwrap().enabled(Item::Paste));
+        w.chord("Down", false).unwrap();
+        assert!(w.menu.is_none());
+        assert_eq!(
+            w.notice.as_deref(),
+            Some("Menu cancelled: document changed. Open the menu again.")
+        );
     }
 
     #[test]

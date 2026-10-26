@@ -525,6 +525,173 @@ fn complete_roots_consume_wheel_but_their_adaptive_children_scroll() {
     );
 }
 
+/// `nodes()` with each listed node's availability flipped.
+fn flipped(nodes: &[usize]) -> Vec<Node<'static, u32>> {
+    let mut all = self::nodes();
+    for &index in nodes {
+        all[index].row.enabled = !all[index].row.enabled;
+    }
+    all
+}
+
+#[test]
+fn refresh_keeps_the_open_path_while_availability_and_revision_change() {
+    let surface = surface(1000, 600, 1);
+    let mut menu = menu(surface);
+    key(&mut menu, Key::Right);
+    key(&mut menu, Key::Down);
+    assert_eq!((menu.depth(), menu.selection()), (2, Selection::Node(4)));
+    let before = (menu.panel(0), menu.panel(1));
+    // Disabled becomes available and Suspend unavailable, at a new revision.
+    assert_eq!(
+        menu.refresh(Model::new(Kind::Bar, 10, &flipped(&[1, 3])).unwrap())
+            .unwrap(),
+        Outcome::Changed
+    );
+    assert_eq!((menu.depth(), menu.selection()), (2, Selection::Node(4)));
+    assert_eq!((menu.panel(0), menu.panel(1)), before);
+    assert_eq!(menu.group(), Some(0));
+    assert!(menu.valid(Some(10), surface) && !menu.valid(Some(9), surface));
+    assert!(menu.model().node(1).unwrap().row.enabled);
+    // Suspend is skipped now: Up wraps back to More.
+    assert_eq!(
+        menu.event(
+            Some(10),
+            Event::Key {
+                key: Key::Up,
+                repeated: false
+            }
+        )
+        .unwrap(),
+        Outcome::Changed
+    );
+    assert_eq!(menu.selection(), Selection::Node(4));
+    let mut left = menu.clone();
+    assert_eq!(
+        left.event(
+            Some(10),
+            Event::Key {
+                key: Key::Left,
+                repeated: false
+            }
+        )
+        .unwrap(),
+        Outcome::Changed
+    );
+    assert_eq!(left.selection(), Selection::Node(2));
+
+    // The selected row going unavailable clears the selection, not the panel.
+    menu.refresh(Model::new(Kind::Bar, 10, &flipped(&[1, 3, 4])).unwrap())
+        .unwrap();
+    assert_eq!((menu.depth(), menu.selection()), (2, Selection::None));
+    assert_eq!(
+        menu.event(
+            Some(10),
+            Event::Key {
+                key: Key::Activate,
+                repeated: false
+            }
+        )
+        .unwrap(),
+        Outcome::Consumed
+    );
+    assert!(menu.is_open());
+}
+
+#[test]
+fn refresh_closes_unavailable_branches_and_refuses_another_shape() {
+    let mut menu = menu(surface(1000, 600, 1));
+    key(&mut menu, Key::Right);
+    key(&mut menu, Key::Down);
+    key(&mut menu, Key::Activate);
+    assert_eq!(menu.depth(), 3);
+    // Send signal goes unavailable: its panel and the one below it close.
+    assert_eq!(
+        menu.refresh(Model::new(Kind::Bar, 9, &flipped(&[2])).unwrap())
+            .unwrap(),
+        Outcome::Changed
+    );
+    assert_eq!((menu.depth(), menu.selection()), (1, Selection::None));
+    assert_eq!(menu.group(), Some(0));
+    // An unavailable open header closes the whole menu; a closed one has
+    // nothing to close.
+    assert_eq!(
+        menu.refresh(Model::new(Kind::Bar, 9, &flipped(&[0])).unwrap())
+            .unwrap(),
+        Outcome::Dismissed
+    );
+    assert!(!menu.is_open());
+    assert_eq!(menu.group(), None);
+    assert_eq!(
+        menu.refresh(Model::new(Kind::Bar, 9, &nodes()).unwrap())
+            .unwrap(),
+        Outcome::Ignored
+    );
+    assert!(!menu.is_open());
+
+    let mut menu = self::menu(surface(1000, 600, 1));
+    key(&mut menu, Key::Right);
+    let before = (menu.depth(), menu.selection(), menu.panel(1));
+    let mut renamed = nodes();
+    renamed[3].row.label = "Stop";
+    let mut moved = nodes();
+    moved[6].parent = Some(2);
+    let mut retyped = nodes();
+    retyped[8].item = Item::Action(6);
+    let shorter = &nodes()[..7];
+    for model in [
+        Model::new(Kind::Bar, 10, &renamed).unwrap(),
+        Model::new(Kind::Bar, 10, &moved).unwrap(),
+        Model::new(Kind::Bar, 10, &retyped).unwrap(),
+        Model::new(Kind::Bar, 10, shorter).unwrap(),
+        Model::new(Kind::Context, 10, &nodes()).unwrap(),
+    ] {
+        assert_eq!(menu.refresh(model).unwrap_err(), Error::InvalidModel);
+        assert_eq!((menu.depth(), menu.selection(), menu.panel(1)), before);
+        assert!(menu.valid(Some(9), surface(1000, 600, 1)));
+    }
+    // A changed shortcut keeps the shape.
+    let mut shortcut = nodes();
+    shortcut[3].row.shortcut = "Ctrl+Z";
+    menu.refresh(Model::new(Kind::Bar, 9, &shortcut).unwrap())
+        .unwrap();
+    assert_eq!((menu.depth(), menu.selection(), menu.panel(1)), before);
+}
+
+#[test]
+fn refresh_keeps_a_complete_roots_legacy_highlight() {
+    let available = [
+        branch(None, "Actions"),
+        action(Some(0), "First", 1, true),
+        action(Some(0), "Second", 2, true),
+    ];
+    let surface = surface(400, 120, 1);
+    let model = |first: bool, second: bool| {
+        let mut nodes = available;
+        nodes[1].row.enabled = first;
+        nodes[2].row.enabled = second;
+        Model::new(Kind::Bar, 9, &nodes).unwrap()
+    };
+    let mut menu = Controller::new(model(true, true), surface, Fit::Complete).unwrap();
+    menu.open_bar(0).unwrap();
+    assert_eq!(menu.selection(), Selection::Node(1));
+    menu.refresh(model(false, true)).unwrap();
+    assert_eq!(menu.selection(), Selection::None);
+    // No enabled row: the first takes the highlight `open_bar` would give,
+    // wherever the selection was.
+    for second in [false, true] {
+        let mut menu = Controller::new(model(true, true), surface, Fit::Complete).unwrap();
+        menu.open_bar(0).unwrap();
+        if second {
+            key(&mut menu, Key::Down);
+            assert_eq!(menu.selection(), Selection::Node(2));
+        }
+        menu.refresh(model(false, false)).unwrap();
+        assert_eq!(menu.selection(), Selection::Node(1));
+        assert_eq!(key(&mut menu, Key::Activate), Outcome::Consumed);
+    }
+}
+
 #[test]
 fn fully_disabled_complete_panel_keeps_legacy_highlight_without_activation() {
     let nodes = [

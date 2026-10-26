@@ -554,15 +554,16 @@ fn native_directory_details_sort_and_copy_selected_entry() {
             "source-bytes",
             &expected_path.len().to_string(),
         );
-        // The compositor's selection event for the copy closes an open menu,
-        // and may arrive after a later input: it must arrive first.
-        editor.wait_field("clipboard-state", "selection", "utf8");
+        // The compositor's selection event for the copy may arrive after
+        // the menu below opens; it refreshes the menu, never closes it.
         compositor.click(270, 32); // Directory menu
         editor.wait_field("state", "modal", "0,0,0,0,1,0,0,0,0");
         compositor.click(270, 132); // Sort by Modified
         wait_directory_rows(&mut editor, 1, 2, &["child/", "z", "a"]);
         editor.wait_field("state", "directory-sort", "1,modified,0");
         editor.wait_field("state", "directory-entry", &selected);
+        // The compositor took the copy as the selection.
+        editor.wait_field("clipboard-state", "selection", "utf8");
         compositor.chord(&[KEY_LEFT_SHIFT], 31); // S: reverse
         wait_directory_rows(&mut editor, 1, 3, &["child/", "a", "z"]);
         editor.wait_field("state", "directory-sort", "1,modified,1");
