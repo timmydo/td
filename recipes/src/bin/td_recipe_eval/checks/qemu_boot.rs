@@ -285,6 +285,10 @@ const TD_TERM_RUNTIME_MARKER: &str = td_recipe::shared::TD_TERM_RUNTIME_MARKER;
 // and did not exit on it.
 const TD_MAIL_BOOT_MARKER: &str = td_recipe::shared::TD_MAIL_BOOT_MARKER;
 const TD_FETCH_BOOT_MARKER: &str = td_recipe::shared::TD_FETCH_BOOT_MARKER;
+// td-software's request path: the control socket's install and status,
+// through the compositor's private request and root's application-cache
+// operation (td-software/DESIGN.md §6.4).
+const TD_SOFTWARE_INSTALL_MARKER: &str = td_recipe::shared::TD_SOFTWARE_INSTALL_MARKER;
 const TD_NEWS_BOOT_MARKER: &str = td_recipe::shared::TD_NEWS_BOOT_MARKER;
 const TD_APPLICATIONS_PLACED_MARKER: &str = td_recipe::shared::TD_APPLICATIONS_PLACED_MARKER;
 
@@ -614,6 +618,7 @@ struct ConsoleEvidence {
     td_pointer_absolute: bool,
     td_term_runtime: bool,
     td_fetch_ok: bool,
+    td_software_install: bool,
     td_mail_running: bool,
     td_news_running: bool,
     td_applications_placed: bool,
@@ -2376,6 +2381,17 @@ fn validate_system_boot(
         return Err(format!(
             "the {ordinal} boot did not emit the deployment-success marker \
              {SYSTEM_BOOT_SUCCESS_MARKER:?}. Last serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    if !result.evidence.td_software_install {
+        return Err(format!(
+            "the compositor became ready, but td-software's request-path marker \
+             ({TD_SOFTWARE_INSTALL_MARKER:?}) was absent — the control socket's install or \
+             status, the compositor's forwarding of private request 24, root's \
+             application-cache operation as Firefox's account, or td-app's check against the \
+             host's feed failed, or the install before it left no current generation \
+             (td-software/DESIGN.md §6.4). Last serial output:\n{}",
             tail(&result.console, 80)
         ));
     }
@@ -6800,6 +6816,7 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
         TD_POINTER_ABSOLUTE_MARKER.len(),
         TD_TERM_RUNTIME_MARKER.len(),
         exact_line_window(TD_FETCH_BOOT_MARKER),
+        exact_line_window(TD_SOFTWARE_INSTALL_MARKER),
         exact_line_window(TD_MAIL_BOOT_MARKER),
         exact_line_window(TD_NEWS_BOOT_MARKER),
         exact_line_window(TD_APPLICATIONS_PLACED_MARKER),
@@ -7331,6 +7348,12 @@ fn latch_console_evidence_from(
         &mut evidence.td_fetch_ok,
         buf,
         TD_FETCH_BOOT_MARKER.as_bytes(),
+        starts_at_stream_boundary,
+    );
+    latch_line_marker(
+        &mut evidence.td_software_install,
+        buf,
+        TD_SOFTWARE_INSTALL_MARKER.as_bytes(),
         starts_at_stream_boundary,
     );
     latch_line_marker(
@@ -11812,6 +11835,7 @@ mod tests {
         evidence.td_sandbox_kernel = true;
         evidence.td_term_runtime = true;
         evidence.td_fetch_ok = true;
+        evidence.td_software_install = true;
         evidence.td_mail_running = true;
         evidence.td_news_running = true;
         evidence.td_applications_placed = true;
@@ -12349,6 +12373,15 @@ mod tests {
             "the rejection must name the fetch marker: {complaint}"
         );
 
+        let mut without_software = healthy_evidence();
+        without_software.td_software_install = false;
+        let complaint = validate(&boot(without_software))
+            .expect_err("a boot missing td-software's install marker must be rejected");
+        assert!(
+            complaint.contains(&format!("({TD_SOFTWARE_INSTALL_MARKER:?})")),
+            "the rejection must name the install marker: {complaint}"
+        );
+
         let mut without_mail = healthy_evidence();
         without_mail.td_mail_running = false;
         let complaint = validate(&boot(without_mail))
@@ -12388,6 +12421,7 @@ mod tests {
                 evidence.td_mail_running,
                 evidence.td_news_running,
                 evidence.td_applications_placed,
+                evidence.td_software_install,
             ]
         };
         for (index, marker) in [
@@ -12395,6 +12429,7 @@ mod tests {
             TD_MAIL_BOOT_MARKER,
             TD_NEWS_BOOT_MARKER,
             TD_APPLICATIONS_PLACED_MARKER,
+            TD_SOFTWARE_INSTALL_MARKER,
         ]
         .into_iter()
         .enumerate()
@@ -12407,7 +12442,7 @@ mod tests {
                 format!("\n..{marker}\n"),
             ] {
                 latch_console_evidence(&mut evidence, noise.as_bytes(), b"target");
-                assert_eq!(latched(&evidence), [false; 4], "accepted {noise:?}");
+                assert_eq!(latched(&evidence), [false; 5], "accepted {noise:?}");
             }
             // Both line endings the console can carry.
             let terminator = if index == 1 { "\n" } else { "\r\n" };
@@ -12416,7 +12451,7 @@ mod tests {
                 format!("\n{marker}{terminator}").as_bytes(),
                 b"target",
             );
-            let mut expected = [false; 4];
+            let mut expected = [false; 5];
             if let Some(slot) = expected.get_mut(index) {
                 *slot = true;
             }

@@ -1,26 +1,27 @@
 # td-software
 
-**Status: being built in §6's increments.** Each *As built* note
-describes code that exists and is normative, like any routed design
-document (`AGENTS.md` routes here now that the image ships the
-component). The rest is a proposal for the repository user's review,
-not yet implemented or normative: where it and `AGENTS.md`,
-`APPLICATIONS.md` or `td-authd/DESIGN.md` differ, they describe the
-code and it describes a possible change.
+**Status: implemented.** §6's four increments have landed, the
+cutover last, and this document is normative like any routed design
+document (`AGENTS.md` routes here). Each *As built* note records how
+the code realises the section it follows, and where a note and the text
+before it differ, the note describes the code. Sections that still say
+*proposal* or *would* describe the design as it was reviewed; the notes
+beside them are what was built. Two items stay outside it: the
+`/bin/<app>` links (§6, last paragraphs) and §B.5's hide list (§7).
 
-td-software is a td-ui program and is to be the only place a session
-owner installs, updates and removes applications. The repository user
+td-software is a td-ui program and the only place a session owner
+installs, updates and removes applications. The repository user
 decided that install-on-demand goes away: starting an application that
-is not installed never fetches it. The compositor's launcher would show
-what td-software installed, gaining an entry after an install and
-losing it after a removal.
+is not installed never fetches it. The compositor's launcher shows what
+td-software installed, gaining an entry after an install and losing it
+after a removal.
 
 Three problems prompted it:
 
 - Firefox's first launch spent minutes downloading from Flathub with
-  nothing on screen. Per §W.9, td-jail waits for `td-app update` when no
-  generation serves the declaration, and the card's request `0d` is
-  answered at once (`84`).
+  nothing on screen. Per §W.9 as it then stood, td-jail waited for
+  `td-app update` when no generation served the declaration, and the
+  card's request `0d` is answered at once (`84`).
 - Claude Code is being removed from td entirely, in a separate change,
   so td-software offers it in no form.
 - A jailed application that cannot be started from a terminal should not
@@ -86,10 +87,10 @@ td-dua. Fixed private request `22`, beside `07` to `0c`, starts it
 root credentials, no capability and no authority channel (§L).
 
 **Who writes the cache.** The cache is still written only by td-app,
-running as the application's account. Root starts it the way it starts
-`firefox-update` today: a oneshot that runs `td-app update NAME --force`
-as `tda65536` (§W.9). Proposal: replace the per-application units with
-one fixed root operation, modelled on `application-start`:
+running as the application's account. Root started it the way it
+started `firefox-update`: a oneshot that ran `td-app update NAME
+--force` as `tda65536` (§W.9). The design replaced the per-application
+units with one fixed root operation, modelled on `application-start`:
 
 ```text
 application-cache OWNER APP install|update|remove|delete-data|status
@@ -118,7 +119,8 @@ over its pinned private channel. Root validates the name against the
 image's registry.
 
 This keeps §L's "no public launch listener". It also generalizes `0d`
-and `0e` from one fixed name to a validated one.
+from one fixed name to a validated one; `0e`, the update unit's, is
+retired with it (§6, increment 4).
 
 *As built (increment 2, the request path):* td-compositor/DESIGN.md §15,
 "Application requests", and td-authd/DESIGN.md, "Application requests".
@@ -132,8 +134,8 @@ seconds, that shows no other writer or failed, and answers at once:
 the last one's outcome and refusal, and the last record root read, read
 again at most every two seconds or once an operation ends. `launch`
 stays the compositor's: it does what the card's application entry does,
-for the configured application alone, until the third increment carries
-a name in the start.
+for a launcher table application by name since the third increment, and
+since the cutover never starts one root says is not installed.
 
 **Consent.** None of these requests is elevation. §W.9's argument still
 holds: running the application's own account to write its own cache
@@ -201,14 +203,34 @@ the deploy trees already present and fetches nothing, and launches if
 that passes. If it fails, the launch sends the person to td-software,
 whose update fetches as before.
 
+*As built (the cutover):* `td-jail/src/flathub.rs`. "Installed" is the
+cache's `current` link, which td-jail reads itself (`installed`), as
+td-software's status does. On `ready`'s `absent` with no `current`,
+td-jail refuses with exactly `NAME is not installed; install it in
+td-software`. With one, it runs `/bin/td-app revalidate NAME` as the
+account, with only `HOME`, and holds the generation that answers; when
+it answers `absent` too, td-jail refuses with exactly `NAME did not
+revalidate offline after a system update; update it in td-software`
+(or the not-installed refusal, should `current` have gone meanwhile).
+It never runs `td-app update`: the check beside a launch is gone. The
+refusal is td-jail's failed exit, so the unit fails, td-svc's backoff
+holds a repeat, and the bar's launch reads `FAILED TO START`; the card
+lists only installed applications and the control socket's `launch`
+refuses one root says is not installed with the same first text
+(td-compositor/DESIGN.md §15), so a person meets the refusal there
+first. `revalidate` takes the cache lock, so a launch during a running
+check waits for it, as a stale generation must.
+
 ### 4.2 Install, update and remove
 
 - **Install** runs `td-app update APP --force` on an account with no
   `current`. Every admission rule of §W.9 applies unchanged, including
   the feed transport under the autotest token.
 - **Update** is the same command on an installed account, and the only
-  way an installed application updates. It replaces the launcher's
-  per-application UPDATE row and the daily check beside a launch.
+  way an installed application updates. It replaced the launcher's
+  per-application UPDATE row and the daily check beside a launch, and
+  with them td-app's 24-hour throttle and its unforced form: `td-app
+  update NAME --force` is the one update form, and every one asks.
   td-software offers "Check now" per application and shows `checked`;
   it schedules nothing in the background.
 - **Remove** is a new td-app verb. It clears `current` and `previous`,
@@ -279,7 +301,7 @@ The proposal:
 - The card shows a window of rows that scrolls with the selection.
 - The existing filter narrows the list. The keyboard already walks
   matches the card did not draw.
-- The UPDATE row goes away.
+- The UPDATE row goes away (as built: §6, increment 4).
 - The test becomes "the window fits, and every entry is reachable by
   filter and selection", with a stated maximum row count.
 - A search that matches only an application that is not installed shows
@@ -351,9 +373,9 @@ can be installed at every commit.
    and the card's SOFTWARE entry, in authority mode, sends td-authd's
    request `22`, which starts it as the human from `/` with only
    `WAYLAND_DISPLAY` and `TD_CONTROL_SOCKET` added to td-login's
-   environment (td-authd/DESIGN.md). The card's UPDATE row stays until
-   the cutover (step 4) removes it with `0e`, so the card grows by one
-   row.
+   environment (td-authd/DESIGN.md). The card's UPDATE row stayed
+   until the cutover (step 4) removed it with `0e`, so the card grew by
+   one row.
 3. **A table-driven card.** The compositor reads the immutable table,
    asks for the installed set and uses the scrolling window from §5.
    Starts carry a validated name. The image stops passing
@@ -389,7 +411,7 @@ can be installed at every commit.
    that name only when its registry holds it (`ff 04` otherwise), with
    at most one start per unit and 16 in all in flight; the image names
    every application's unit after it, which a recipe test holds. `0e`
-   stays name-free, Firefox's update unit, until the cutover removes
+   stayed name-free, Firefox's update unit, until the cutover removed
    it, so §3's generalization covers `0d` alone.
 
    *As built (the card):* the compositor reads `/etc/td-launcher.tsv`
@@ -407,15 +429,12 @@ can be installed at every commit.
    application, a launch of another taking its cell. A query matching
    nothing else but an application root says is not installed shows
    one row, `INSTALL` and its uppercase display name, which sends `22
-   NAME`; the UPDATE row shows only while its application is installed,
-   so a query for an uninstalled Firefox finds its Install row. Control
-   `launch NAME` takes any table name, installed or not; until the
-   cutover a launch of one not installed still installs on demand. The
-   image passes `--update-application firefox` in place of
-   `--launcher-application`, keeping the UPDATE row beside an installed
-   Firefox until step 4; the Firefox oracle's readiness observer flags stand
-   apart from the card. Before root's first answer the card shows no
-   table application.
+   NAME`. The image stopped passing `--launcher-application`; the
+   UPDATE row and `--update-application`, kept beside an installed
+   Firefox until step 4, went in the cutover, as did control `launch`'s
+   start of an application not installed. The Firefox oracle's
+   readiness observer flags stand apart from the card. Before root's
+   first answer the card shows no table application.
 4. **Cutover, in one landing.**
    - td-jail stops fetching on `absent` and stops starting the check
      beside a launch (`check_beside`). td-app's 24-hour throttle and
@@ -429,6 +448,37 @@ can be installed at every commit.
    - One oracle installs through td-software's request path.
    - §W.9 and the matching sections of td-authd/DESIGN.md and
      td-compositor/DESIGN.md are amended in the same landing.
+
+   *As built (the cutover):* one commit. td-jail's launch is §4.1's
+   note. `td-app update` has no throttle and one form, `update NAME
+   --force`; `Outcome::Throttled` is gone, and `checked` is written by
+   every check that completes. The compositor's update row,
+   `LaunchRequest::UpdateApplication`, `Supervised::Update` and
+   `--update-application` are deleted; control `launch` refuses an
+   application root says is not installed (`error NAME is not
+   installed; install it in td-software`) and, before root's first
+   answer or while root's row for it is settling uninstalled, is an
+   `unavailable`; both ask root's installed set again. Request `0e` is retired in td-authd's
+   decoder, refused like any unknown request and never reassigned, as
+   `05` and `06` are; the `firefox-update` unit and its timeout are
+   gone, and a recipe test holds that no unit has that name. Under the
+   autotest token `firefox-fetch` runs `/bin/td-authd application-cache
+   1000 firefox install` as a root oneshot, still bounded at 900
+   seconds and naming `/run/td-applications-on-demand`. The oracle
+   stage is `software-evidence`, after `firefox-fetch` and before
+   Firefox, bounded at 120 seconds: as the human it sends the control
+   socket's `install firefox`, the verb td-software's Install and Check
+   now send, which the compositor forwards as `24` and root runs as
+   `application-cache`, then polls `status firefox` until root reports
+   `last=install ok` with a record read after it that names a `current`
+   generation, and prints `TD-SOFTWARE-INSTALL-OK`, which every system
+   boot oracle requires. It drives the control-socket verbs, not
+   td-software's window: a GUI-driven install would need the screen
+   oracles' input path for a second program, and the request it would
+   make is exactly this one. Because Firefox is installed by then, the
+   install is a check that finds both refs where they are; the oracles'
+   first install, through the same operation, is `firefox-fetch`'s.
+   `DEFAULT_BOOT_TIMEOUT_SECS` grows by the stage's 120 seconds.
 
 **Existing machines.** The cutover changes no cache format. A machine
 whose Firefox account already has `current` therefore reads as having

@@ -1070,15 +1070,9 @@ impl Runtime {
         self.scene.set_hostnames(hostnames);
     }
 
-    /// The launcher table, and the application whose update row the card
-    /// shows beside it.
-    pub(crate) fn set_launcher_table(
-        &mut self,
-        rows: Vec<crate::launcher_table::Row>,
-        update: Option<&str>,
-    ) {
+    /// The launcher table the card shows.
+    pub(crate) fn set_launcher_table(&mut self, rows: Vec<crate::launcher_table::Row>) {
         self.scene.set_launcher_table(&rows);
-        self.scene.set_update_application(update);
         self.launcher_rows = rows;
     }
 
@@ -1092,6 +1086,21 @@ impl Runtime {
                 .collect(),
         );
         self.installed = Some((installed, None));
+    }
+
+    /// Whether root's last installed set lets a launch start `name`:
+    /// `None` before its first answer or while its row settles uninstalled,
+    /// `Some(None)` on a live boot, which runs no application.
+    pub(crate) fn application_installed(&self, name: &str) -> Option<Option<bool>> {
+        let (installed, _) = self.installed.as_ref()?;
+        let (_, set) = installed.snapshot();
+        let answer = set.and_then(|set| set.launchable(name));
+        // A refusal asks root again, so a set made stale by an install the
+        // card did not start is not held against the next launch.
+        if !matches!(answer, Some(Some(true) | None)) {
+            installed.ask();
+        }
+        answer
     }
 
     /// Takes a new installed set into the card; whether the card, being up,
@@ -14513,7 +14522,7 @@ mod tests {
 
         // Raised by its table row's app id.
         assert!(!runtime.activate_application("firefox").unwrap());
-        runtime.set_launcher_table(crate::launcher_table::tests::image(), None);
+        runtime.set_launcher_table(crate::launcher_table::tests::image());
         assert!(!runtime.activate_application("mail").unwrap());
         assert!(runtime.activate_application("firefox").unwrap());
         assert_eq!(runtime.focused_toplevel(), Some(application));
@@ -14535,7 +14544,7 @@ mod tests {
                 wake,
             )
             .unwrap();
-        runtime.set_launcher_table(crate::launcher_table::tests::image(), None);
+        runtime.set_launcher_table(crate::launcher_table::tests::image());
         let outcome = crate::authority::Application::default();
         runtime.set_application_outcome(outcome.clone());
 
@@ -14593,7 +14602,7 @@ mod tests {
             Framebuffer::test_file(&dir.path().join("fb"), 800, 600, 800 * 4).unwrap();
         let mut runtime = Runtime::new(framebuffer);
         runtime.set_launcher_authority(true);
-        runtime.set_launcher_table(crate::launcher_table::tests::image(), Some("firefox"));
+        runtime.set_launcher_table(crate::launcher_table::tests::image());
         let installed = crate::authority::Installed::default();
         runtime.set_installed(installed.clone());
         runtime.launcher(LauncherAction::Open).unwrap();
@@ -14667,7 +14676,7 @@ mod tests {
         let framebuffer =
             Framebuffer::test_file(&dir.path().join("fb"), 800, 600, 800 * 4).unwrap();
         let mut runtime = Runtime::new(framebuffer);
-        runtime.set_launcher_table(crate::launcher_table::tests::image(), None);
+        runtime.set_launcher_table(crate::launcher_table::tests::image());
         let outcome = crate::authority::Application::default();
         runtime.set_application_outcome(outcome.clone());
         runtime.launch_application("firefox", || Ok(())).unwrap();

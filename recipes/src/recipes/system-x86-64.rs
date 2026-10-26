@@ -32,7 +32,8 @@ use crate::shared::{
     TD_MAIL_NAME, TD_NEWS_BOOT_MARKER, TD_NEWS_ENTRY, TD_NEWS_NAME,
     TD_PORTAL_REQUEST_RUNTIME_MARKER, TD_PORTAL_RUNTIME_MARKER,
     TD_PORTAL_UNAVAILABLE_RUNTIME_MARKER, TD_SANDBOX_KERNEL_MARKER, TD_SETUP_LIVE_MARKER,
-    TD_TXT_RUNTIME_MARKER, TD_UTIL_RUNTIME_MARKER, UUTILS_RUNTIME_MARKER,
+    TD_SOFTWARE_INSTALL_MARKER, TD_TXT_RUNTIME_MARKER, TD_UTIL_RUNTIME_MARKER,
+    UUTILS_RUNTIME_MARKER,
 };
 use crate::types::{Recipe, Step};
 
@@ -369,9 +370,15 @@ const SETUP_READY_TIMEOUT_SECS: u16 = 120;
 const FIREFOX_INPUT_EVIDENCE_WAIT_ITERATIONS: u16 = FIREFOX_EVIDENCE_WAIT_ITERATIONS
     + FIREFOX_SUPPORT_TIMEOUT_SECS * FIREFOX_SUPPORT_ATTEMPTS
     + FIREFOX_NETWORK_TIMEOUT_SECS;
-// An oracle's Firefox starts once its fetch from the host's feed has
-// finished (APPLICATIONS.md §W.9), bounded by the fetch unit's timeout.
-const FIREFOX_FETCH_WAIT_SECS: u16 = svc_timeouts::APPLICATION_FETCH as u16;
+// An oracle's Firefox starts once its install from the host's feed and
+// td-software's request-path evidence have finished (APPLICATIONS.md §W.9),
+// bounded by those two units' timeouts.
+const FIREFOX_FETCH_WAIT_SECS: u16 =
+    (svc_timeouts::APPLICATION_FETCH + svc_timeouts::SOFTWARE_EVIDENCE) as u16;
+/// software-evidence polls until this many seconds of uptime have passed,
+/// leaving the last poll (a control-socket answer is bounded at 5 seconds)
+/// and its report inside the unit's bound.
+const SOFTWARE_EVIDENCE_WAIT_SECS: u32 = svc_timeouts::SOFTWARE_EVIDENCE - 30;
 // The greeter may observe deployment health before Firefox's fetch and
 // first ready timeout start the evidence unit. Its allowance includes that
 // offset and each separately bounded Firefox support and staged-input
@@ -1422,7 +1429,7 @@ const TD_SVC_UNITS: &[&str] = &[
     "firefox-autotest",
     "firefox",
     "firefox-fetch",
-    "firefox-update",
+    "software-evidence",
     "firefox-evidence",
     "terminal-authority-evidence",
     "firefox-input",
@@ -1487,10 +1494,10 @@ mod svc_timeouts {
     pub const APPLICATION_EVIDENCE: u32 = 60;
     /// One control-channel request: a line in, and a line or a short report out.
     pub const APPLICATION_PLACE: u32 = 30;
-    /// A forced Flathub check: resolving two refs and, when either moved,
-    /// downloading and materializing a runtime or application of about a
-    /// gigabyte on a slow link, then the dynamic validator over both.
-    pub const APPLICATION_UPDATE: u32 = 3600;
+    /// td-software's install of an installed Firefox, through the control
+    /// socket and root: a check against the host's feed that finds both
+    /// refs where they are, polled a second at a time.
+    pub const SOFTWARE_EVIDENCE: u32 = 120;
     /// An oracle's first fetch of an application or runtime from the host's
     /// feed: about a gigabyte over QEMU's user network, materialized and
     /// validated in the VM.
@@ -1975,7 +1982,7 @@ fn build_desktop_td_svc_conf() -> String {
          type=daemon\n\
          cgroup=service\n\
          exec=/bin/td-authd terminal-serve --primary --peer-uid {compositor_uid}\n\
-         pair-exec=/bin/td-login exec-service-as {compositor_user} -- /bin/td-compositor run --card /dev/dri/card0 --framebuffer /dev/fb0 --input /dev/input --socket {wayland_socket} --portal-socket {portal_wayland_socket} --control-socket {control_socket} --update-application {firefox_name} --terminal-authority stdin --application-ready-socket {firefox_window_ready_socket} --application-app-id {firefox_app_id} --application-content-rgb-a {firefox_content_rgb_a} --application-content-rgb-b {firefox_content_rgb_b}\n\
+         pair-exec=/bin/td-login exec-service-as {compositor_user} -- /bin/td-compositor run --card /dev/dri/card0 --framebuffer /dev/fb0 --input /dev/input --socket {wayland_socket} --portal-socket {portal_wayland_socket} --control-socket {control_socket} --terminal-authority stdin --application-ready-socket {firefox_window_ready_socket} --application-app-id {firefox_app_id} --application-content-rgb-a {firefox_content_rgb_a} --application-content-rgb-b {firefox_content_rgb_b}\n\
          after=seat\n\
          requires=seat\n\
          ready=/bin/td-login exec-primary -- /bin/td-compositor probe {wayland_socket}\n\
@@ -2202,40 +2209,49 @@ fn build_desktop_td_svc_conf() -> String {
          cgroup=session\n\
          unless-exists={applications_on_demand}\n\
          exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) exec /bin/td-authd application-start {ui_uid} {firefox_name} direct -- --marionette --remote-allow-system-access --profile {firefox_autotest_profile} {firefox_tls_url};; *) exec /bin/td-authd application-start {ui_uid} {firefox_name} direct --;; esac'\n\
-         after=audio,busd,portal,wayland,firefox-files,firefox-handoff,firefox-autotest,firefox-tls-origin,placement-evidence,firefox-fetch\n\
+         after=audio,busd,portal,wayland,firefox-files,firefox-handoff,firefox-autotest,firefox-tls-origin,placement-evidence,firefox-fetch,software-evidence\n\
          requires=wayland,firefox-autotest,firefox-tls-origin,firefox-files,td-firstboot\n\
          ready=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) exec /bin/td-login exec-primary -- /bin/td-compositor probe-application {firefox_window_ready_socket} {firefox_app_id} {firefox_content_rgb_a} {firefox_content_rgb_b} --quiet;; *) exit 0;; esac'\n\
          ready-timeout={firefox_ready_timeout}\n\
          restart=on-failure\n\
          \n\
-         # An oracle's Firefox fetches before it starts, so its readiness\n\
-         # deadline measures a launch, not a download (APPLICATIONS.md §W.9):\n\
-         # the boot's feed, then Flathub. It runs exactly when Firefox\n\
-         # autostarts; anywhere else the first launch fetches. Its output is\n\
-         # copied to the console whole lines at a time, so a fallback or\n\
-         # failure line cannot split another unit's marker.\n\
+         # An oracle installs Firefox before it starts, so its readiness\n\
+         # deadline measures a launch, not a download (APPLICATIONS.md §W.9),\n\
+         # through root's application-cache operation, the path td-software's\n\
+         # Install takes: the boot's feed, then Flathub. It runs exactly when\n\
+         # Firefox autostarts; anywhere else nothing installs until the owner\n\
+         # asks in td-software. Its output, the operation's diagnostic and\n\
+         # td-app's last line on a failure, is copied to the console whole\n\
+         # lines at a time, so it cannot split another unit's marker. That is\n\
+         # all it shows: td-app's progress stays root's, and a run td-svc\n\
+         # kills at its bound shows only td-svc's timeout.\n\
          [firefox-fetch]\n\
          type=oneshot\n\
-         cgroup=session\n\
          unless-exists={applications_on_demand}\n\
-         exec=/bin/td-login exec-service-as tda65536 -- /bin/td-app update {firefox_name}\n\
+         exec=/bin/td-authd application-cache {ui_uid} {firefox_name} install\n\
          after=td-firstboot,netup\n\
          requires=td-firstboot\n\
          timeout={application_fetch}\n\
          log=/var/log/svc/firefox-fetch.log\n\
          console=yes\n\
          \n\
-         # A check of Firefox's Flathub cache now (APPLICATIONS.md §W.9), as\n\
-         # its account: the launcher's update row asks td-authd, which asks\n\
-         # td-svc to start it. The root always exists, so it never runs at boot.\n\
-         [firefox-update]\n\
+         # td-software's request path, end to end, before Firefox starts so\n\
+         # the marker precedes the greeter (td-software/DESIGN.md §6.4): as\n\
+         # the human, the control socket's `install` (an update of the Firefox\n\
+         # just installed, against the feed), then `status` until root reports\n\
+         # that install's success and a later record naming `current`. An\n\
+         # `unavailable` (root reading the status first) is asked again until\n\
+         # a deadline on /proc/uptime. A failed install, or the deadline\n\
+         # passing, prints td-ctl's last answer. It\n\
+         # writes the console directly, so it follows firefox-tls-setup as\n\
+         # the other exact-line evidence does.\n\
+         [software-evidence]\n\
          type=oneshot\n\
-         cgroup=session\n\
-         unless-exists=/\n\
-         exec=/bin/td-login exec-service-as tda65536 -- /bin/td-app update {firefox_name} --force\n\
-         after=td-firstboot\n\
-         requires=td-firstboot\n\
-         timeout={application_update}\n\
+         unless-exists={applications_on_demand}\n\
+         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) :;; *) exit 0;; esac; read up rest </proc/uptime; end=$((${{up%%.*}}+{software_evidence_wait})); n=0; asked=; last=; while read up rest </proc/uptime && [ \"${{up%%.*}}\" -lt \"$end\" ]; do if [ -z \"$asked\" ]; then last=$(/bin/td-login exec-primary -- /bin/td-ctl --socket {control_socket} install {firefox_name} 2>&1) && asked=1; elif last=$(/bin/td-login exec-primary -- /bin/td-ctl --socket {control_socket} status {firefox_name} 2>&1); then case \"$last\" in *\"last=install\"?\"failed\"*) /bin/td-util printf \"software-evidence: the install failed: %s\\n\" \"$last\"; exit 1;; *\"operation=none\"*\"last=install\"?\"ok\"*\"record=current\"*\"current=\"[0-9]*) /bin/echo {software_marker}; exit 0;; esac; fi; n=$((n+1)); /bin/td-util sleep 1; done; /bin/td-util printf \"software-evidence: no install record after %s polls: %s\\n\" \"$n\" \"$last\"; exit 1'\n\
+         after=firefox-fetch,wayland,firefox-tls-setup\n\
+         requires=wayland\n\
+         timeout={software_evidence}\n\
          \n\
          # This application is test evidence, not deployment health. The exact\n\
          # compositor, live-cgroup and Firefox support probes must succeed before\n\
@@ -2420,7 +2436,9 @@ fn build_desktop_td_svc_conf() -> String {
         application_workspace = TERMINAL_APPLICATION_WORKSPACE,
         application_evidence = svc_timeouts::APPLICATION_EVIDENCE,
         application_place = svc_timeouts::APPLICATION_PLACE,
-        application_update = svc_timeouts::APPLICATION_UPDATE,
+        software_evidence = svc_timeouts::SOFTWARE_EVIDENCE,
+        software_evidence_wait = SOFTWARE_EVIDENCE_WAIT_SECS,
+        software_marker = TD_SOFTWARE_INSTALL_MARKER,
         placed_marker = TD_APPLICATIONS_PLACED_MARKER,
         firefox_content_marker = TD_FIREFOX_CONTENT_MARKER,
         firefox_support_marker = TD_FIREFOX_SUPPORT_MARKER,
@@ -6550,18 +6568,18 @@ mod tests {
         );
     }
 
-    /// td-authd starts the configured application's units by name for the
-    /// compositor (APPLICATIONS.md §W.9): both exist, the update runs td-app
-    /// as Firefox's account, and neither the update nor anything else
-    /// runs it at boot.
+    /// td-authd starts an application's unit by name for the compositor
+    /// (APPLICATIONS.md §W.9), and only the unit of a name its registry
+    /// holds. No unit updates an application: the retired `0e`'s
+    /// `firefox-update` is gone, and an application updates only through
+    /// td-software's requests (td-software/DESIGN.md §7).
     #[test]
     fn the_supervised_requests_name_real_units() {
         const LAUNCH: &str = include_str!("../../../td-authd/src/launch.rs");
-        // `0d NAME` starts the unit named after the application; `0e` the
-        // fixed update unit.
-        assert!(LAUNCH.contains(
-            "Self::Start(name) => name,\n            Self::Update => \"firefox-update\","
-        ));
+        // `0d NAME` starts the unit named after the application.
+        assert!(LAUNCH.contains("let Self::Start(name) = self;\n        name"));
+        assert!(!LAUNCH.contains("firefox-update"));
+        assert!(unit_key("firefox-update", "exec").is_none());
         // Every shipped application, the names root's registry holds, has
         // a unit of its name that starts that application.
         for application in SYSTEM.applications {
@@ -6580,28 +6598,8 @@ mod tests {
             unit_key("firefox", "unless-exists").as_deref(),
             Some(APPLICATIONS_ON_DEMAND)
         );
-        assert_eq!(
-            unit_key("firefox-update", "type").as_deref(),
-            Some("oneshot")
-        );
-        assert_eq!(
-            unit_key("firefox-update", "unless-exists").as_deref(),
-            Some("/")
-        );
-        assert_eq!(
-            unit_key("firefox-update", "exec").as_deref(),
-            Some("/bin/td-login exec-service-as tda65536 -- /bin/td-app update firefox --force")
-        );
         assert!(unit_key("firefox", "exec")
             .is_some_and(|exec| exec.contains("application-start 1000 firefox ")));
-        assert_eq!(
-            unit_key("firefox-update", "requires").as_deref(),
-            Some("td-firstboot")
-        );
-        assert_eq!(
-            unit_key("firefox-update", "timeout"),
-            Some(svc_timeouts::APPLICATION_UPDATE.to_string())
-        );
     }
 
     /// td-secret's login worker relies on td-svc to serialize it across
@@ -7420,7 +7418,7 @@ mod tests {
         );
         assert_eq!(
             u32::from(FIREFOX_FETCH_WAIT_SECS),
-            svc_timeouts::APPLICATION_FETCH
+            svc_timeouts::APPLICATION_FETCH + svc_timeouts::SOFTWARE_EVIDENCE
         );
         assert_eq!(
             FIREFOX_INPUT_PRE_SOAK_WAIT_ITERATIONS,
@@ -8327,8 +8325,8 @@ mod tests {
         }
     }
 
-    /// The card is the launcher table's; the update row is Firefox's until
-    /// td-software/DESIGN.md §6's cutover.
+    /// The card is the launcher table's, with no update row: an application
+    /// updates only from td-software (td-software/DESIGN.md §7).
     #[test]
     fn wayland_service_uses_the_launcher_table_and_a_native_terminal() {
         // The peer uses a literal service credential switch and fixed socket
@@ -8339,7 +8337,6 @@ mod tests {
              --socket {WAYLAND_SOCKET} \
              --portal-socket {PORTAL_WAYLAND_SOCKET} \
              --control-socket {CONTROL_SOCKET} \
-             --update-application {FIREFOX_NAME} \
              --terminal-authority stdin \
              --application-ready-socket {FIREFOX_WINDOW_READY_SOCKET} \
              --application-app-id {FIREFOX_APP_ID} \
@@ -8792,14 +8789,14 @@ mod tests {
                     .collect();
                 match paths.as_slice() {
                     [] => None,
-                    // An on-demand unit (APPLICATIONS.md §W.9): the root
-                    // always exists, so only td-svc's `start` runs it.
-                    [path] if path.as_str() == "/" && name == "firefox-update" => None,
                     // Started at boot only where the oracles ask; the init
                     // creates this path on a live boot too.
                     [path]
                         if path.as_str() == APPLICATIONS_ON_DEMAND
-                            && matches!(name.as_str(), "firefox" | "firefox-fetch") =>
+                            && matches!(
+                                name.as_str(),
+                                "firefox" | "firefox-fetch" | "software-evidence"
+                            ) =>
                     {
                         Some(name)
                     }
@@ -8823,6 +8820,7 @@ mod tests {
             "news-evidence",
             "placement-evidence",
             "shell-workspace",
+            "software-evidence",
             "terminal",
         ];
         expected.sort();
@@ -9119,9 +9117,14 @@ mod tests {
                     "firefox-tls-origin",
                     "placement-evidence",
                     "firefox-fetch",
+                    "software-evidence",
                 ],
             ),
             ("firefox-fetch", vec!["td-firstboot", "netup"]),
+            (
+                "software-evidence",
+                vec!["firefox-fetch", "wayland", "firefox-tls-setup"],
+            ),
             ("firefox-evidence", vec!["firefox", "netup"]),
             (
                 "terminal-authority-evidence",
@@ -12382,11 +12385,13 @@ mod tests {
         assert_eq!(init.matches(BOOT_FEED).count(), 2);
     }
 
-    /// An ordinary boot starts no Flathub application and fetches nothing:
+    /// An ordinary boot starts no Flathub application and installs nothing:
     /// the init marks every boot without the autotest token, and every live
-    /// one, as on demand, and Firefox and the oracles' fetches name that
-    /// mark. An oracle's boot fetches as each application's account, then
-    /// starts Firefox (APPLICATIONS.md §W.9).
+    /// one, as on demand, and Firefox and the oracles' installs name that
+    /// mark. An oracle's boot installs through root's application-cache
+    /// operation, the path td-software's Install takes, then drives that
+    /// path from the control socket, then starts Firefox (APPLICATIONS.md
+    /// §W.9, td-software/DESIGN.md §6.4).
     #[test]
     fn ordinary_boots_start_the_applications_on_demand() {
         let init = build_deployment_init(&SYSTEM);
@@ -12400,11 +12405,11 @@ mod tests {
         assert!(init.contains(&format!(
             "/bin/td-util chmod 0644 /sysroot{APPLICATIONS_ON_DEMAND}\n"
         )));
-        for (unit, account, name) in [("firefox-fetch", "tda65536", FIREFOX_NAME)] {
+        for (unit, name) in [("firefox-fetch", FIREFOX_NAME)] {
             assert_eq!(
                 unit_key(unit, "exec"),
                 Some(format!(
-                    "/bin/td-login exec-service-as {account} -- /bin/td-app update {name}"
+                    "/bin/td-authd application-cache {UI_UID} {name} install"
                 ))
             );
             assert_eq!(unit_key(unit, "console").as_deref(), Some("yes"));
@@ -12427,6 +12432,42 @@ mod tests {
             Some(APPLICATIONS_ON_DEMAND)
         );
         assert!(unit_after("firefox").contains(&"firefox-fetch".to_string()));
+        // td-software's request path runs after the install and before
+        // Firefox, under the autotest token alone, as the human through the
+        // control socket, and prints its marker only on root's report of
+        // that install's success.
+        let software = unit_key("software-evidence", "exec").unwrap_or_default();
+        assert!(software.contains(&format!(
+            "*\" {AUTOTEST_CMDLINE_TOKEN} \"*) :;; *) exit 0;;"
+        )));
+        for request in ["install", "status"] {
+            assert!(software.contains(&format!(
+                "/bin/td-login exec-primary -- /bin/td-ctl --socket {CONTROL_SOCKET} {request} {FIREFOX_NAME}"
+            )));
+        }
+        assert!(software.contains(&format!(
+            "*\"operation=none\"*\"last=install\"?\"ok\"*\"record=current\"*\"current=\"[0-9]*) /bin/echo {TD_SOFTWARE_INSTALL_MARKER}; exit 0;;"
+        )));
+        assert_eq!(
+            unit_key("software-evidence", "unless-exists").as_deref(),
+            Some(APPLICATIONS_ON_DEMAND)
+        );
+        assert_eq!(
+            unit_key("software-evidence", "timeout"),
+            Some(svc_timeouts::SOFTWARE_EVIDENCE.to_string())
+        );
+        assert!(unit_after("software-evidence").contains(&"firefox-fetch".to_string()));
+        assert!(unit_after("firefox").contains(&"software-evidence".to_string()));
+        // Every way out but the token's absence says why on the console.
+        assert!(software.contains("software-evidence: the install failed: %s\\n"));
+        assert!(software.ends_with(
+            "/bin/td-util printf \"software-evidence: no install record after %s polls: %s\\n\" \"$n\" \"$last\"; exit 1'"
+        ));
+        assert!(!software.contains("/dev/null"));
+        // Its polls stop at a deadline on uptime, inside the unit's bound.
+        assert!(software.contains(&format!(
+            "read up rest </proc/uptime; end=$((${{up%%.*}}+{SOFTWARE_EVIDENCE_WAIT_SECS}));"
+        )));
     }
 
     /// The first pass must select through td-boot. The selected pass must bind
@@ -16765,6 +16806,7 @@ mod server_tests {
             "td-photo",
             "td-pass",
             "td-dua",
+            "td-software",
             "td-editor",
             "td-fetchd",
             "td-app",

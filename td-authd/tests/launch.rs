@@ -148,10 +148,9 @@ fn the_caller_can_only_start_poll_or_keep_the_channel_alive() {
         request(b"\x0dfirefox").unwrap(),
         Request::Supervised(Supervised::Start("firefox".into()))
     );
-    assert_eq!(
-        request(&[0x0e]).unwrap(),
-        Request::Supervised(Supervised::Update)
-    );
+    // `0e` started the retired Firefox update unit: refused like any
+    // unknown request, never reassigned.
+    assert!(request(&[0x0e]).is_err());
     assert_eq!(
         request(b"\x0ffirefox").unwrap(),
         Request::UnitState("firefox".into())
@@ -200,7 +199,7 @@ fn the_caller_can_only_start_poll_or_keep_the_channel_alive() {
         b"\x22Firefox".to_vec(),
         vec![0x23, 0],
         b"\x23firefox".to_vec(),
-        vec![0x24],
+        vec![0x25],
         vec![2],
         vec![2, 0],
         vec![2; 10],
@@ -968,7 +967,7 @@ fn only_td_svcs_exact_status_line_for_the_unit_names_a_state() {
         "firefox ready pid=17 failures=0",
         "firefox ready pid=17 failures=0\n\n",
         "firefox ready pid=17 failures=0\nfirefox ready pid=17 failures=0\n",
-        "firefox-update ready pid=17 failures=0\n",
+        "firefox-other ready pid=17 failures=0\n",
         "mail ready pid=17 failures=0\n",
         "firefox  ready pid=17 failures=0\n",
         "firefox ready pid= failures=0\n",
@@ -1156,7 +1155,7 @@ fn reap_all(launches: &mut Launches) {
 }
 
 #[test]
-fn a_start_request_that_failed_reads_failed_and_an_update_does_not() {
+fn a_start_request_that_failed_reads_failed() {
     let generation = "000102030405060708090a0b0c0d0e0f".to_string();
     let mut launches = Launches::with_status(generation.clone(), idle);
     launches.unit.restart("firefox");
@@ -1174,22 +1173,9 @@ fn a_start_request_that_failed_reads_failed_and_an_update_does_not() {
             .unwrap(),
         [0x85, 3]
     );
-    let mut updated = Launches::with_status(generation, idle);
-    updated.supervised.insert(
-        Supervised::Update,
-        (
-            supervised_child("launch::tests::failing_supervised_probe"),
-            Instant::now(),
-        ),
-    );
-    reap_all(&mut updated);
-    assert!(!updated.unit.start_failed);
-    assert_eq!(
-        updated
-            .answer(&config(), Request::UnitState("firefox".into()))
-            .unwrap(),
-        [0x85, 4]
-    );
+    // A fresh generation records no failed start.
+    let fresh = Launches::with_status(generation, idle);
+    assert!(!fresh.unit.start_failed);
 }
 
 #[test]
@@ -1410,7 +1396,8 @@ fn a_second_start_of_a_unit_in_flight_joins_it() {
     let again = Request::Supervised(Supervised::Start("firefox".into()));
     assert_eq!(launches.answer(&config(), again).unwrap(), [0xff, 1]);
     assert_eq!(launches.supervised.len(), 1);
-    // The update unit is not an application's to start.
+    // A name the registry lacks starts nothing, the retired update
+    // unit's included.
     let update = Request::Supervised(Supervised::Start("firefox-update".into()));
     assert_eq!(launches.answer(&config(), update).unwrap(), [0xff, 4]);
     for (_, (mut child, _)) in std::mem::take(&mut launches.supervised) {

@@ -1,8 +1,9 @@
 //! A spec whose halves come from the account's Flathub cache
-//! (APPLICATIONS.md §W.9). td-app, run as this same account, fetched and
-//! admitted the trees; td-jail asks it which generation serves the
-//! declaration, holds that generation against collection for the life of
-//! the launch, and names its trees.
+//! (APPLICATIONS.md §W.9). td-app, run as this same account when the owner
+//! asked td-software to install or update it, fetched and admitted the
+//! trees; td-jail asks it which generation serves the declaration, holds
+//! that generation against collection for the life of the launch, and
+//! names its trees. A launch fetches nothing.
 
 use std::fs::{self, File};
 use std::io::{self, Read};
@@ -11,8 +12,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::flathub_app::{
-    self, FlathubSource, Selection, CACHE_DIR, DEPLOY, FILES, GENERATIONS, MAX_STATE_BYTES,
-    SELECTION,
+    self, FlathubSource, Selection, CACHE_DIR, CURRENT, DEPLOY, FILES, GENERATIONS,
+    MAX_STATE_BYTES, SELECTION,
 };
 
 /// td-net's applet, linked beside td-jail in the image.
@@ -60,38 +61,87 @@ impl Generation {
     }
 }
 
-/// The generation to launch, held. With none serving the declaration the
-/// launch waits for td-app to fetch one; otherwise td-app's daily check runs
-/// beside the launch and what it selects is used from the next one.
+/// The generation to launch, held. A launch never fetches
+/// (td-software/DESIGN.md §4.1): with no generation serving the declaration
+/// it revalidates `current` offline, which a system update that changed
+/// the policy needs, and with no `current` it refuses. Either refusal sends
+/// the owner to td-software, the one place an application installs or
+/// updates.
 pub(crate) fn hold_generation(
     source: FlathubSource,
     home: &Path,
     uid: u32,
 ) -> io::Result<Generation> {
-    let mut fetched = false;
+    hold_with(source.name, home, uid, |ask| answer(ask, source.name, home))
+}
+
+/// What td-jail asks td-app; both answer a generation or `absent`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Ask {
+    /// `ready`: the generation that serves now, taking no lock.
+    Ready,
+    /// `revalidate`: rule 5 again over `current`'s deploys, offline.
+    Revalidate,
+}
+
+impl Ask {
+    fn verb(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Revalidate => "revalidate",
+        }
+    }
+}
+
+/// The refusal for an account whose cache has no `current`.
+fn not_installed(name: &str) -> io::Error {
+    refused(format!(
+        "{name} is not installed; install it in td-software"
+    ))
+}
+
+fn hold_with(
+    name: &str,
+    home: &Path,
+    uid: u32,
+    mut ask: impl FnMut(Ask) -> io::Result<Option<u64>>,
+) -> io::Result<Generation> {
     for _ in 0..ATTEMPTS {
-        let Some(generation) = ready(source.name, home)? else {
-            if fetched {
-                return Err(refused(format!(
-                    "td-app update left no generation that serves {}",
-                    source.name
-                )));
-            }
-            update(source.name, home)?;
-            fetched = true;
-            continue;
+        let generation = match ask(Ask::Ready)? {
+            Some(generation) => generation,
+            None if !installed(home)? => return Err(not_installed(name)),
+            None => match ask(Ask::Revalidate)? {
+                Some(generation) => generation,
+                None if !installed(home)? => return Err(not_installed(name)),
+                None => {
+                    return Err(refused(format!(
+                        "{name} did not revalidate offline after a system update; \
+                         update it in td-software"
+                    )))
+                }
+            },
         };
         if let Some(held) = hold(home, generation, uid)? {
-            if !fetched {
-                check_beside(source.name, home);
-            }
             return Ok(held);
         }
     }
     Err(refused(format!(
-        "{}'s generation was collected each time td-jail tried to hold one",
-        source.name
+        "{name}'s generation was collected each time td-jail tried to hold one"
     )))
+}
+
+/// Whether the account's cache has a `current` generation, which is what
+/// installed means; the link itself, not what it names.
+fn installed(home: &Path) -> io::Result<bool> {
+    let current = home.join(CACHE_DIR).join(CURRENT);
+    match fs::symlink_metadata(&current) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(io::Error::new(
+            error.kind(),
+            format!("stat {}: {error}", current.display()),
+        )),
+    }
 }
 
 /// td-app with only the account's home: it needs nothing else from td-jail.
@@ -105,15 +155,16 @@ fn td_app(home: &Path) -> Command {
     command
 }
 
-fn ready(name: &str, home: &Path) -> io::Result<Option<u64>> {
+fn answer(ask: Ask, name: &str, home: &Path) -> io::Result<Option<u64>> {
+    let verb = ask.verb();
     let output = td_app(home)
-        .args(["ready", name])
+        .args([verb, name])
         .stderr(Stdio::inherit())
         .output()
-        .map_err(|error| io::Error::other(format!("run {TD_APP} ready {name}: {error}")))?;
+        .map_err(|error| io::Error::other(format!("run {TD_APP} {verb} {name}: {error}")))?;
     if !output.status.success() {
         return Err(io::Error::other(format!(
-            "{TD_APP} ready {name}: {}",
+            "{TD_APP} {verb} {name}: {}",
             output.status
         )));
     }
@@ -125,37 +176,8 @@ fn ready(name: &str, home: &Path) -> io::Result<Option<u64>> {
         Some("absent") => Ok(None),
         Some(generation) => flathub_app::generation_number(generation)
             .map(Some)
-            .ok_or_else(|| refused(format!("{TD_APP} ready {name} answered {generation:?}"))),
-        None => Err(refused(format!("{TD_APP} ready {name} answered no line"))),
-    }
-}
-
-fn update(name: &str, home: &Path) -> io::Result<()> {
-    let status = td_app(home)
-        .args(["update", name])
-        .stdout(Stdio::null())
-        .status()
-        .map_err(|error| io::Error::other(format!("run {TD_APP} update {name}: {error}")))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(io::Error::other(format!(
-            "{TD_APP} update {name} fetched nothing to launch: {status}"
-        )))
-    }
-}
-
-/// Best effort and not waited for: it ends on its own or with the unit,
-/// stays a zombie of stage 1 until the application exits, and a check cut
-/// short or never started is retried by the next launch.
-fn check_beside(name: &str, home: &Path) {
-    let started = td_app(home)
-        .args(["update", name])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
-    if let Err(error) = started {
-        eprintln!("td-jail: {TD_APP} update {name} did not start: {error}");
+            .ok_or_else(|| refused(format!("{TD_APP} {verb} {name} answered {generation:?}"))),
+        None => Err(refused(format!("{TD_APP} {verb} {name} answered no line"))),
     }
 }
 
@@ -320,6 +342,73 @@ mod tests {
         fs::remove_file(&selection).unwrap();
         drop(collector);
         assert!(hold(&home, 1, uid()).unwrap().is_none());
+    }
+
+    /// A launch never fetches (td-software/DESIGN.md §4.1, §6): it asks
+    /// `ready`, then, only for an installed account, `revalidate`; never
+    /// `update`, and nothing beside the launch.
+    fn launch(home: &Path, answers: &[Option<u64>]) -> (io::Result<Generation>, Vec<Ask>) {
+        let mut asked = Vec::new();
+        let mut answers = answers.iter();
+        let held = hold_with("fixture", home, uid(), |ask| {
+            asked.push(ask);
+            Ok(answers.next().copied().flatten())
+        });
+        (held, asked)
+    }
+
+    #[test]
+    fn an_account_without_current_is_not_installed_and_fetches_nothing() {
+        let root = crate::test_temp::TempDir::new("td-jail-flathub-absent").unwrap();
+        let home = root.path().join("home");
+        let (held, asked) = launch(&home, &[None]);
+        assert_eq!(
+            held.err().unwrap().to_string(),
+            "fixture is not installed; install it in td-software"
+        );
+        assert_eq!(asked, [Ask::Ready]);
+        // A generation left behind without `current` is not installed
+        // either: a removal clears `current` first.
+        generation(&home, 1);
+        let (held, asked) = launch(&home, &[None]);
+        assert!(held.is_err());
+        assert_eq!(asked, [Ask::Ready]);
+    }
+
+    /// A machine whose account already had `current` before the cutover
+    /// reads as installed and launches it with no other question.
+    #[test]
+    fn an_existing_current_launches_without_a_fetch() {
+        let root = crate::test_temp::TempDir::new("td-jail-flathub-existing").unwrap();
+        let home = root.path().join("home");
+        generation(&home, 1);
+        std::os::unix::fs::symlink("generations/1", home.join(CACHE_DIR).join(CURRENT)).unwrap();
+        let (held, asked) = launch(&home, &[Some(1)]);
+        assert_eq!(held.unwrap().selection.runtime.commit, COMMIT);
+        assert_eq!(asked, [Ask::Ready]);
+    }
+
+    /// After a system update changed the policy, `current` no longer
+    /// serves: the launch revalidates it offline and launches what that
+    /// publishes, or refuses and sends the owner to td-software.
+    #[test]
+    fn a_stale_current_is_revalidated_offline_or_refused() {
+        let root = crate::test_temp::TempDir::new("td-jail-flathub-stale").unwrap();
+        let home = root.path().join("home");
+        generation(&home, 1);
+        generation(&home, 2);
+        std::os::unix::fs::symlink("generations/1", home.join(CACHE_DIR).join(CURRENT)).unwrap();
+        let (held, asked) = launch(&home, &[None, Some(2)]);
+        assert!(held.is_ok());
+        assert_eq!(asked, [Ask::Ready, Ask::Revalidate]);
+        let (held, asked) = launch(&home, &[None, None]);
+        assert_eq!(
+            held.err().unwrap().to_string(),
+            "fixture did not revalidate offline after a system update; update it in td-software"
+        );
+        assert_eq!(asked, [Ask::Ready, Ask::Revalidate]);
+        assert_eq!(Ask::Ready.verb(), "ready");
+        assert_eq!(Ask::Revalidate.verb(), "revalidate");
     }
 
     #[test]

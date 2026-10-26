@@ -206,8 +206,9 @@ display name, a phase and the time since the request, as `FIREFOX STARTING
 EXITED` or `FIREFOX NOT STARTED`. The phase is only what root's `0f` answer
 says of the unit (td-authd/DESIGN.md): `STARTING` until the request is sent
 and root reads the unit up, `04` unknown included, `LOADING` once td-svc holds
-a live leader, which is where a first launch spends its download, `FAILED TO
-START` when root refused the request or reads the unit failed, `EXITED` when
+a live leader, which is where a launch spends its start before a window maps,
+`FAILED TO START` when root refused the request or reads the unit failed, as it
+does when td-jail refuses an application not installed, `EXITED` when
 it reads it stopped or exited without one, and `NOT STARTED` when the request
 was never sent: the worker's one-request queue held another, or, in the direct
 profile, there is no authority to ask. The compositor learns nothing of what
@@ -2817,20 +2818,16 @@ Coding Agent issue fixed private requests 22, 07, 08, 09, 0a, 0b and 0c, and
 run with the human credentials described in td-authd/DESIGN.md (the task
 manager with its system PID view). No request carries a path; Code Review's
 fixed `--choose-repo`, added by the authority, has td-review ask which
-repository, for the reason td-authd/DESIGN.md gives. Until
-td-software/DESIGN.md §6's cutover removes it and `0e`, an update entry
-labelled `UPDATE` and the display name follows the application the image
-names with `--update-application` once it is installed, and issues private
-request 0e, which has root start the unit that checks that application's
-Flathub cache (APPLICATIONS.md §W.9). A filter that matches no other entry but
+repository, for the reason td-authd/DESIGN.md gives. The card has no update
+entry: an application updates only from td-software (td-software/DESIGN.md
+§7), and `--update-application` and private request `0e` are retired with the
+row. A filter that matches no other entry but
 an application root says is not installed shows one row, `INSTALL` and its
 uppercase display name, the first such by display name, its search text the
 application's with `install`, which asks root for td-software opened at that
-application (`22` and its registry name); the update entry shows only while
-its application is installed, so before it is that application's Install row
-answers its name. The compositor reports a refused Install request only on
-its standard error. Direct development mode shows a
-terminal entry, an input-monitor entry that starts `td-ui-demo`, and close; it
+application (`22` and its registry name). The compositor reports a
+refused Install request only on its standard error. Direct development mode
+shows a terminal entry, an input-monitor entry that starts `td-ui-demo`, and close; it
 hides the table and the desktop programs and refuses their requests, and
 there the programs run directly on the user's Wayland session. The terminal is
 FIRST, so it is what an unfiltered Enter opens. The card shows a window of at
@@ -2880,8 +2877,9 @@ start, as a malformed bus application policy does, and a row whose name is
 outside the registry grammar every request names applications in is left off
 the card, since no request could start it. Root's installed set
 (td-authd/DESIGN.md, request `23`) is asked when the authority connects, each
-time the card opens and when an application operation has started, and again
-each second while root says a row may change or could not read its registry;
+time the card opens, when an application operation has started and when a
+control `launch` is refused or finds no settled answer, and again each second
+while root says a row may change or could not read its registry;
 the sampler's one-second tick brings a new answer to the card. Before the
 first answer no table application is shown; a live boot's answer shows none
 and offers no Install row.
@@ -5687,19 +5685,26 @@ letter:
 - `status NAME`: root's last read of the application's status and what
   root is running on it;
 - `install NAME` and `update NAME`: have root run the application's
-  forced check, which install and update both are;
+  check, which install and update both are, and the only way an
+  application is installed or updated;
 - `remove NAME` and `delete-data NAME`: have root remove its payload,
   keeping its data, or delete the data of a removed application;
-- `launch NAME`: what the card's application entry does, for any
-  application of the launcher table, installed or not: raise its mapped
-  window, or ask root with `0d NAME` to start its unit and show the
-  launch on the bar. A name outside the table is refused as having no
-  launcher entry. Until td-software/DESIGN.md §6's cutover, an
-  application not installed still installs on demand when its unit
-  starts. Behind the lock surface, where the card cannot be pressed,
-  it is an `error`. Its `ok` is the press handled: a window raised, `0d`
-  queued for the worker, or a launch already pending joined; an `0d`
-  the worker's queue could not take is an `unavailable`.
+- `launch NAME`: what the card's application entry does, for an
+  application of the launcher table: raise its mapped window, or, when
+  root's installed set says it is installed, ask root with `0d NAME` to
+  start its unit and show the launch on the bar. A launch never
+  installs (td-software/DESIGN.md §4.1): with no window, one root says
+  is not installed is an `error`, `NAME is not installed; install it in
+  td-software`, and before root's first answer, when the card shows no
+  application either, or while root's row for it says not installed but
+  may change, as just after an install, an `unavailable` to ask again
+  shortly; either asks root's installed set again. On a live boot it
+  goes to root, which refuses it. A name outside the table is
+  refused as having no launcher entry. Behind the lock surface, where
+  the card cannot be pressed, it is an `error`. Its `ok` is the press
+  handled: a window raised, `0d` queued for the worker, or a launch
+  already pending joined; an `0d` the worker's queue could not take is
+  an `unavailable`.
 
 The compositor validates the name and names nothing else; root, not the
 compositor, holds the account, the program and the deployment check. An
@@ -5773,9 +5778,9 @@ of `--terminal-client PATH`. Exactly one is required. Authority mode's card is
 the launcher table's; an application's entry activates its existing Wayland
 surface and never invokes a program. When it finds no surface it asks the
 authority, with request `0d` and the application's name, to have root start
-the application's supervised unit, named after it, and the "UPDATE NAME" row
-asks with `0e` for the unit that checks Firefox's Flathub cache
-(APPLICATIONS.md §W.9); each is answered at once and leaves no handle. The
+the application's supervised unit, named after it (APPLICATIONS.md §W.9),
+answered at once and leaving no handle; the compositor never sends the retired
+`0e`. The
 card's Install row asks with `22` and the name for td-software opened at that
 application, and `23` for root's installed set. While the bar shows a launch
 from the card, the worker asks `0f` with the name the launch started for the
@@ -5794,7 +5799,7 @@ delegate an endpoint. The application protocol then completes its version and
 session-admission handshake before graphical startup proceeds.
 
 One worker owns the channel and every process handle. Input submits ordinary
-terminal launches and the application's two supervised requests, the
+terminal launches and an application's supervised start, the
 private VM bridge may submit a fixed task-terminal launch, and physical
 input submits secret attempts through a capacity-one nonblocking queue; an
 already-pending request is a reported refusal, never an input-thread wait.

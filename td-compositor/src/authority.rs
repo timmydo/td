@@ -231,12 +231,12 @@ impl CacheAnswer {
 }
 
 /// What root may be asked of the applications' units (APPLICATIONS.md
-/// §W.9): start an application's, which root checks against its
-/// registry, or check Firefox's Flathub cache now, which names nothing.
+/// §W.9): start an application's, which root checks against its registry.
+/// An application updates only through td-software's requests; `0e`, the
+/// retired update unit's request, is never sent.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Supervised {
     Start(String),
-    Update,
 }
 
 /// `0f`'s answer (td-authd/DESIGN.md, "Fixed program launch
@@ -397,6 +397,18 @@ impl InstalledSet {
         })
     }
 
+    /// What a control `launch` may do with `name`: start it on
+    /// `Some(Some(true))`, leave it to root on a live boot's `Some(None)`,
+    /// refuse it on `Some(Some(false))`, and on `None` ask again, its row
+    /// settling with root's state not yet installed, as after an install.
+    pub(crate) fn launchable(&self, name: &str) -> Option<Option<bool>> {
+        let settling = self
+            .rows
+            .iter()
+            .any(|(row, state)| row == name && state & 0x03 == 0x02);
+        (self.live || !settling).then(|| self.installed(name))
+    }
+
     fn pending(&self) -> bool {
         self.rows.iter().any(|(_, state)| state & 0x02 != 0)
     }
@@ -498,6 +510,12 @@ impl Installed {
         let table = shared.table.clone()?;
         shared.due = false;
         Some(table)
+    }
+
+    /// Whether an ask is due, taking it as the worker would.
+    #[cfg(test)]
+    pub(crate) fn take_due(&self) -> bool {
+        std::mem::take(&mut self.0.lock().unwrap_or_else(PoisonError::into_inner).due)
     }
 
     /// Takes `answer` as the worker would have.
@@ -1369,10 +1387,8 @@ fn supervise(
     request: Supervised,
     application: &Application,
 ) -> Result<Option<&'static str>, String> {
-    let bytes = match &request {
-        Supervised::Start(name) => [&[0x0d][..], name.as_bytes()].concat(),
-        Supervised::Update => vec![0x0e],
-    };
+    let Supervised::Start(name) = &request;
+    let bytes = [&[0x0d][..], name.as_bytes()].concat();
     let (refused, error) = match wire.exchange(&bytes)?.as_slice() {
         [0x84] => (false, None),
         // An earlier start is still being asked, which this one joins.
@@ -1382,15 +1398,11 @@ fn supervise(
         ),
         [0xff, 2] => (true, Some("program authority could not ask the supervisor")),
         [0xff, 3] => (true, Some("a live session starts only the installer")),
-        [0xff, 4] if matches!(request, Supervised::Start(_)) => {
-            (true, Some("the image declares no such application"))
-        }
+        [0xff, 4] => (true, Some("the image declares no such application")),
         [0xff, 5] => (true, Some("root has as many starts in flight as it allows")),
         _ => return Err("invalid supervised request response".into()),
     };
-    if let Supervised::Start(name) = &request {
-        application.started(name, refused);
-    }
+    application.started(name, refused);
     Ok(error)
 }
 
@@ -2070,17 +2082,14 @@ mod tests {
     #[test]
     fn supervised_requests_are_one_byte_and_one_answer() {
         let application = Application::default();
-        let mut started = wire(vec![vec![0x84], vec![0x84]]);
+        let mut started = wire(vec![vec![0x84]]);
         assert_eq!(
             supervise(&mut started, Supervised::Start("mail".into()), &application),
             Ok(None)
         );
-        assert_eq!(
-            supervise(&mut started, Supervised::Update, &application),
-            Ok(None)
-        );
-        assert_eq!(started.requests, [b"\x0dmail".to_vec(), vec![0x0e]]);
-        // Only the start counts, and only a refusal marks it refused.
+        // `0e`, the retired update unit's request, is never sent.
+        assert_eq!(started.requests, [b"\x0dmail".to_vec()]);
+        // Only a refusal marks the start refused.
         assert_eq!(
             application.outcome(),
             StartOutcome {
@@ -2106,8 +2115,13 @@ mod tests {
             assert_eq!(application.outcome().refused, refused);
         }
         assert_eq!(application.outcome().sent, 6);
-        for answer in [vec![], vec![0x84, 0], vec![0x81], vec![0xff, 4]] {
-            assert!(supervise(&mut wire(vec![answer]), Supervised::Update, &application).is_err());
+        for answer in [vec![], vec![0x84, 0], vec![0x81], vec![0xff, 6]] {
+            assert!(supervise(
+                &mut wire(vec![answer]),
+                Supervised::Start("firefox".into()),
+                &application
+            )
+            .is_err());
         }
         assert_eq!(application.outcome().sent, 6);
     }
@@ -2313,8 +2327,20 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(set.installed("firefox") == Some(false) && set.pending());
+        // Settling uninstalled, a launch asks again rather than refusing.
+        assert_eq!(set.launchable("firefox"), None);
+        assert_eq!(set.launchable("mail"), Some(Some(true)));
+        let set = InstalledSet::decode(b"\x88\x01\x03\x07firefox", &table())
+            .unwrap()
+            .unwrap();
+        assert_eq!(set.launchable("firefox"), Some(Some(true)));
+        let set = InstalledSet::decode(b"\x88\x01\x00\x07firefox", &table())
+            .unwrap()
+            .unwrap();
+        assert_eq!(set.launchable("firefox"), Some(Some(false)));
         let live = InstalledSet::decode(&[0xff, 3], &table()).unwrap().unwrap();
         assert_eq!(live.installed("mail"), None);
+        assert_eq!(live.launchable("firefox"), Some(None));
         assert_eq!(InstalledSet::decode(&[0xff, 2], &table()), Ok(None));
         assert!(InstalledSet::decode(b"\x88\x00", &table())
             .unwrap()
@@ -2408,7 +2434,9 @@ mod tests {
         assert!(control
             .try_send((CacheVerb::Install, "firefox".into(), reply))
             .is_ok());
-        assert!(send.try_send(Work::Supervised(Supervised::Update)).is_ok());
+        assert!(send
+            .try_send(Work::Supervised(Supervised::Start("mail".into())))
+            .is_ok());
         drop(send);
         let mut script = wire(vec![
             vec![0x84],
@@ -2629,7 +2657,9 @@ checked=never\nrefused=none\nprogress=none\n";
             .try_send((CacheVerb::Install, "firefox".into(), reply))
             .is_ok());
         // The physical queue's request goes to root first.
-        assert!(send.try_send(Work::Supervised(Supervised::Update)).is_ok());
+        assert!(send
+            .try_send(Work::Supervised(Supervised::Start("mail".into())))
+            .is_ok());
         drop(send);
         let mut script = wire(vec![vec![0x84], vec![0x86], vec![0x83], vec![0x9f, 0, 0]]);
         assert!(worker(
@@ -2647,7 +2677,12 @@ checked=never\nrefused=none\nprogress=none\n";
         assert_eq!(answer.try_recv(), Ok(CacheAnswer::Started));
         assert_eq!(
             script.requests,
-            [vec![0x0e], b"\x24\x01firefox".to_vec(), vec![3], vec![0x1f]]
+            [
+                b"\x0dmail".to_vec(),
+                b"\x24\x01firefox".to_vec(),
+                vec![3],
+                vec![0x1f]
+            ]
         );
         // A malformed answer ends the generation.
         let (send, receive) = mpsc::sync_channel::<Work>(QUEUE_CAPACITY);

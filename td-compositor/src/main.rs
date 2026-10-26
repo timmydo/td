@@ -132,7 +132,7 @@ fn usage() -> String {
      --input DIR --socket PATH \
      --portal-socket PATH [--control-socket PATH] \
      (--launcher-client PATH --terminal-client PATH | \
-     --terminal-authority stdin [--update-application NAME]) \
+     --terminal-authority stdin) \
      [--application-ready-socket PATH --application-app-id ID \
      --application-content-rgb-a RGB --application-content-rgb-b RGB] | \
      td-compositor headless --session-dir NEW_ABSOLUTE_PATH --width N --height N \
@@ -257,8 +257,6 @@ struct RunOptions {
     socket: PathBuf,
     portal_socket: PathBuf,
     launcher_client: Option<PathBuf>,
-    /// The table application whose update row the authority's card shows.
-    update_application: Option<String>,
     terminal_client: Option<PathBuf>,
     terminal_authority: bool,
     /// Absent by DEFAULT, and absent means there is no control socket to
@@ -278,7 +276,6 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
     let mut socket = None;
     let mut portal_socket = None;
     let mut launcher_client = None;
-    let mut update_application = None;
     let mut terminal_client = None;
     let mut terminal_authority = false;
     let mut control_socket = None;
@@ -304,9 +301,6 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
             }
             "--launcher-client" if launcher_client.is_none() => {
                 launcher_client = Some(PathBuf::from(value))
-            }
-            "--update-application" if update_application.is_none() => {
-                update_application = Some(value.clone())
             }
             "--terminal-client" if terminal_client.is_none() => {
                 terminal_client = Some(PathBuf::from(value))
@@ -338,7 +332,6 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
             | "--socket"
             | "--portal-socket"
             | "--launcher-client"
-            | "--update-application"
             | "--terminal-client"
             | "--terminal-authority"
             | "--control-socket"
@@ -365,15 +358,6 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
             "--launcher-client is the direct launcher's; the authority's card reads the launcher table"
                 .into(),
         );
-    }
-    if update_application.is_some() && !terminal_authority {
-        return Err("--update-application requires --terminal-authority".into());
-    }
-    if update_application
-        .as_deref()
-        .is_some_and(|name| !authority::consent::application_name(name))
-    {
-        return Err("--update-application is outside the registry grammar".into());
     }
     if application_ready_socket.is_some() != application_app_id.is_some()
         || application_ready_socket.is_some() != application_content_rgb_a.is_some()
@@ -433,7 +417,6 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
         socket,
         portal_socket,
         launcher_client,
-        update_application,
         terminal_client,
         terminal_authority,
         control_socket,
@@ -475,15 +458,7 @@ fn run_compositor(options: RunOptions) -> Result<(), String> {
     // bus policy: one that is missing or malformed ends the start before
     // root is asked anything or a device is opened.
     let launcher_rows = if options.terminal_authority {
-        let rows = launcher_table::load()?;
-        if let Some(update) = options.update_application.as_deref() {
-            if !rows.iter().any(|row| row.name == update) {
-                return Err(format!(
-                    "--update-application {update} has no launcher entry"
-                ));
-            }
-        }
-        rows
+        launcher_table::load()?
     } else {
         Vec::new()
     };
@@ -547,7 +522,7 @@ fn run_compositor(options: RunOptions) -> Result<(), String> {
     ));
     runtime.set_launcher_authority(options.terminal_authority);
     if let launcher::LaunchBackend::Authority(authority) = &launches {
-        runtime.set_launcher_table(launcher_rows, options.update_application.as_deref());
+        runtime.set_launcher_table(launcher_rows);
         runtime.set_hostnames(authority.hostnames());
         runtime.set_application_outcome(authority.application());
         runtime.set_installed(authority.installed());
@@ -1205,7 +1180,7 @@ mod confinement {
     const SYS: &str = include_str!("sys.rs");
     const SCM: &str = include_str!("../../td-secret/src/scm.rs");
     const DRM: &str = include_str!("drm.rs");
-    const AUTHORITY_FINGERPRINT: u64 = 0x02fb0fca419ca7fa;
+    const AUTHORITY_FINGERPRINT: u64 = 0x827d095c779a9c0d;
     const AUTH_SYS_FINGERPRINT: u64 = 0x42363c39df98214d;
     const AUTH_CHANNEL_FINGERPRINT: u64 = 0xdf20e4130b2d96e2;
     const AUTHORITY: &str = include_str!("authority.rs");
@@ -2819,26 +2794,14 @@ pub struct MappedRegion {
         assert!(remote.terminal_authority);
         assert!(remote.terminal_client.is_none());
         assert!(remote.launcher_client.is_none());
-        assert_eq!(remote.update_application, None);
+        // The card has no update row: an application updates only from
+        // td-software (td-software/DESIGN.md §7).
         let mut update = authority.clone();
         update.extend(["--update-application".into(), "firefox".into()]);
         assert_eq!(
-            super::parse_run(&update)
-                .unwrap()
-                .update_application
-                .as_deref(),
-            Some("firefox")
+            super::parse_run(&update).err().as_deref(),
+            Some("unrecognised argument '--update-application'")
         );
-        // Its name goes to root's registry grammar, and only the authority
-        // has the row.
-        for name in ["Firefox", "-x", "fire fox"] {
-            let mut invalid = authority.clone();
-            invalid.extend(["--update-application".into(), name.into()]);
-            assert!(super::parse_run(&invalid).is_err(), "{name}");
-        }
-        let mut direct_update = valid(&wayland, &portal, &ready);
-        direct_update.extend(["--update-application".into(), "firefox".into()]);
-        assert!(super::parse_run(&direct_update).is_err());
         for value in ["0", "/run/authority", "stdout", ""] {
             let mut invalid = authority.clone();
             invalid[at + 1] = value.into();

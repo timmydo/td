@@ -143,7 +143,9 @@ Flathub applications and runtimes are the second class (`APPLICATIONS.md`
 §W.9). Their bytes are neither pinned nor in
 `/td/store` or the image: what is reviewed is the application's declaration
 (repository, exact app and runtime refs and td's own policy) and Flathub's
-signing key compiled into td-net. The payload is fetched on demand into the
+signing key compiled into td-net. The payload is fetched, only when the
+session owner installs or updates it in td-software (or an autotest
+oracle boot installs it through the same root operation), into the
 application account's private cache and admitted only under that signature,
 exact ref bindings, a monotonic commit time and §B.3.1's bounds and
 validators. It is never an input to any recipe, is outside every closure

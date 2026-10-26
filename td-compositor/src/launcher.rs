@@ -52,8 +52,6 @@ pub enum LaunchRequest {
     Dua,
     Agent,
     Software,
-    /// Check the update row's application's Flathub cache now.
-    UpdateApplication,
     /// The launcher table's application at this position in the card's
     /// order (`Launcher::application`): raise its window or start it.
     Application(usize),
@@ -73,11 +71,7 @@ impl LaunchRequest {
             Self::Dua => Some(crate::authority::Program::Dua),
             Self::Agent => Some(crate::authority::Program::Agent),
             Self::Software => Some(crate::authority::Program::Software),
-            Self::UiDemo
-            | Self::Terminal
-            | Self::UpdateApplication
-            | Self::Application(_)
-            | Self::Install(_) => None,
+            Self::UiDemo | Self::Terminal | Self::Application(_) | Self::Install(_) => None,
         }
     }
 }
@@ -194,22 +188,12 @@ struct Application {
     installed: Option<bool>,
 }
 
-/// The update row (APPLICATIONS.md §W.9), beside its application until
-/// td-software/DESIGN.md §6's cutover removes it.
-#[derive(Clone)]
-struct Update {
-    application: usize,
-    label: String,
-    search: String,
-}
-
-/// A row the filter left: a fixed entry, a table application, its update
-/// row, or the one Install row.
+/// A row the filter left: a fixed entry, a table application, or the one
+/// Install row.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Item {
     Fixed(usize),
     Application(usize),
-    Update,
     Install(usize),
 }
 
@@ -273,7 +257,6 @@ pub struct Launcher {
     matches: Vec<Item>,
     /// The launcher table's applications, by display name.
     applications: Vec<Application>,
-    update: Option<Update>,
     authority: bool,
 }
 
@@ -357,10 +340,6 @@ impl LaunchBackend {
     pub fn launch(&mut self, request: LaunchRequest) -> Result<Vec<String>, String> {
         match self {
             Self::Direct(processes) => processes.launch(request),
-            Self::Authority(authority) if request == LaunchRequest::UpdateApplication => {
-                authority.supervise(crate::authority::Supervised::Update)?;
-                Ok(Vec::new())
-            }
             Self::Authority(authority) if request == LaunchRequest::Terminal => {
                 authority.launch()?;
                 Ok(Vec::new())
@@ -405,7 +384,6 @@ impl Launcher {
             query: String::with_capacity(filter::MAX_QUERY_BYTES),
             matches: Vec::new(),
             applications: Vec::new(),
-            update: None,
             authority: false,
         };
         launcher.refresh_matches();
@@ -445,21 +423,6 @@ impl Launcher {
                 .then_with(|| one.name.cmp(&other.name))
         });
         self.applications = applications;
-        self.update = None;
-        self.refresh_matches();
-    }
-
-    /// The update row for `name`, a table application, beside it.
-    pub(crate) fn set_update(&mut self, name: Option<&str>) {
-        self.update = name.and_then(|name| {
-            let application = self.applications.iter().position(|a| a.name == name)?;
-            let label = self.applications.get(application)?.label.clone();
-            Some(Update {
-                application,
-                search: format!("update check {}", label.to_lowercase()),
-                label: format!("UPDATE {label}"),
-            })
-        });
         self.refresh_matches();
     }
 
@@ -549,11 +512,6 @@ impl Launcher {
                 search: &a.search,
                 request: Some(LaunchRequest::Application(index)),
             }),
-            Item::Update => self.update.as_ref().map(|update| Entry {
-                label: &update.label,
-                search: &update.search,
-                request: Some(LaunchRequest::UpdateApplication),
-            }),
             Item::Install(index) => self.applications.get(index).map(|a| Entry {
                 label: &a.install_label,
                 search: &a.install_search,
@@ -562,11 +520,10 @@ impl Launcher {
         }
     }
 
-    /// The fixed entries, then each installed application and its update
-    /// row, that the query matches. A query matching nothing else but an
-    /// application root says is not installed shows one row, the first
-    /// such: install it in td-software. An application's update row shows
-    /// only once it is installed: before, its row is the Install row.
+    /// The fixed entries, then each installed application, that the query
+    /// matches. A query matching nothing else but an application root says
+    /// is not installed shows one row, the first such: install it in
+    /// td-software. An application updates only from td-software.
     fn refresh_matches(&mut self) {
         self.matches.clear();
         let query = self.query.as_str();
@@ -583,11 +540,6 @@ impl Launcher {
                 }
                 if filter::matches(&application.search, query) {
                     self.matches.push(Item::Application(index));
-                }
-                if self.update.as_ref().is_some_and(|update| {
-                    update.application == index && filter::matches(&update.search, query)
-                }) {
-                    self.matches.push(Item::Update);
                 }
             }
             if self.matches.is_empty() && !query.is_empty() {
@@ -918,9 +870,7 @@ pub(crate) fn launch_command(
         | LaunchRequest::Software => {
             return Err("desktop programs are not configured for this development launcher".into());
         }
-        LaunchRequest::UpdateApplication
-        | LaunchRequest::Application(_)
-        | LaunchRequest::Install(_) => {
+        LaunchRequest::Application(_) | LaunchRequest::Install(_) => {
             return Err("applications require the paired authority".into());
         }
         LaunchRequest::UiDemo => options.client.clone(),
@@ -1495,11 +1445,7 @@ mod tests {
         );
         assert_eq!(direct_ready.parent(), Some(Path::new("/run/user/1000")));
         // Table applications are the authority's alone.
-        for request in [
-            LaunchRequest::UpdateApplication,
-            LaunchRequest::Application(0),
-            LaunchRequest::Install(0),
-        ] {
+        for request in [LaunchRequest::Application(0), LaunchRequest::Install(0)] {
             assert!(launch_command(&direct, request, 1).is_err(), "{request:?}");
         }
 
@@ -1856,28 +1802,24 @@ mod authority_entry_tests {
         assert!(unknown.matched_labels().is_empty());
     }
 
-    /// The update row (APPLICATIONS.md §W.9) follows its application,
-    /// installed or not, until the cutover removes it.
+    /// An application updates only from td-software (td-software/DESIGN.md
+    /// §7): the card offers no update row, and a search for one finds
+    /// nothing; an application not installed is offered to install.
     #[test]
-    fn the_update_row_follows_its_application() {
+    fn the_card_offers_no_update_and_follows_the_installed_set() {
         let mut launcher = authority_card(&["firefox", "mail"]);
-        launcher.set_update(Some("firefox"));
         launcher.apply(LauncherAction::Open);
         assert_eq!(
             launcher.matched_labels().get(FIXED.len()..),
-            Some(&["FIREFOX", "UPDATE FIREFOX", "MAIL"][..])
+            Some(&["FIREFOX", "MAIL"][..])
         );
-        for character in "update".chars() {
-            launcher.apply(LauncherAction::Insert(character));
+        for query in ["update", "check"] {
+            launcher.apply(LauncherAction::Open);
+            for character in query.chars() {
+                launcher.apply(LauncherAction::Insert(character));
+            }
+            assert!(launcher.matched_labels().is_empty(), "{query}");
         }
-        assert_eq!(launcher.matched_labels(), ["UPDATE FIREFOX"]);
-        assert_eq!(
-            launcher.apply(LauncherAction::Activate),
-            Some(LaunchRequest::UpdateApplication)
-        );
-        assert!(LaunchRequest::UpdateApplication
-            .authority_program()
-            .is_none());
         launcher.set_installed(|name| Some(name == "mail"));
         launcher.apply(LauncherAction::Open);
         assert_eq!(
@@ -1903,17 +1845,10 @@ mod authority_entry_tests {
             launcher.apply(LauncherAction::Insert(character));
         }
         assert!(launcher.matched_labels().is_empty());
-        launcher.set_installed(|_| Some(true));
-        launcher.set_update(None);
-        launcher.apply(LauncherAction::Open);
-        assert!(!launcher
-            .matched_labels()
-            .iter()
-            .any(|label| label.starts_with("UPDATE")));
     }
 
-    /// The card's start, the update row and the install row each queue one
-    /// request for the worker.
+    /// The card's start and the install row each queue one request for
+    /// the worker.
     #[test]
     fn the_backend_asks_root_for_the_applications_units() {
         let (authority, queued) = crate::authority::Queued::launcher();
@@ -1922,14 +1857,6 @@ mod authority_entry_tests {
         assert_eq!(
             queued.supervised(),
             Some(crate::authority::Supervised::Start("mail".into()))
-        );
-        assert_eq!(
-            backend.launch(LaunchRequest::UpdateApplication),
-            Ok(Vec::new())
-        );
-        assert_eq!(
-            queued.supervised(),
-            Some(crate::authority::Supervised::Update)
         );
         backend.install_application("firefox").unwrap();
         assert_eq!(queued.software_at().as_deref(), Some("firefox"));

@@ -93,8 +93,8 @@ impl Config {
     }
 
     /// Root asks its own supervisor to start an application's unit, which
-    /// the image names after the application, or Firefox's update unit:
-    /// td-svc runs either as the application's account.
+    /// the image names after the application: td-svc runs it as the
+    /// application's account.
     fn supervised(unit: &Supervised) -> Command {
         let mut command = Command::new("/bin/td-svc");
         command.args(["start", unit.name()]);
@@ -508,22 +508,19 @@ impl Launch {
     }
 }
 
-/// What `0d` and `0e` start (APPLICATIONS.md §W.9): an application's unit,
-/// named after the application, a registry name the peer chose and root
-/// checks against the registry; or the oneshot that checks Firefox's
-/// Flathub cache now, which the peer does not name.
+/// What `0d` starts (APPLICATIONS.md §W.9): an application's unit, named
+/// after the application, a registry name the peer chose and root checks
+/// against the registry. `0e`, which started Firefox's update unit, is
+/// retired: an application updates only through td-software's requests.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Supervised {
     Start(String),
-    Update,
 }
 
 impl Supervised {
     fn name(&self) -> &str {
-        match self {
-            Self::Start(name) => name,
-            Self::Update => "firefox-update",
-        }
+        let Self::Start(name) = self;
+        name
     }
 }
 
@@ -547,7 +544,7 @@ enum UnitState {
     /// A start is being asked, or td-svc has the unit on its way up.
     Starting,
     /// td-svc holds a live leader for it, which need not have a window
-    /// yet: a first launch's download runs inside it.
+    /// yet.
     Running,
     /// It failed, which td-svc may yet retry, or is held in backoff, or
     /// root's start request failed.
@@ -850,7 +847,7 @@ fn request(bytes: &[u8]) -> Result<Request, String> {
         [0x0d, name @ ..] if !name.is_empty() => {
             Ok(Request::Supervised(Supervised::Start(application(name)?)))
         }
-        [0x0e] => Ok(Request::Supervised(Supervised::Update)),
+        // 0e started the retired Firefox update unit; it stays unassigned.
         [0x0f, name @ ..] if !name.is_empty() => Ok(Request::UnitState(application(name)?)),
         [2, rest @ ..] if rest.len() == 8 => {
             let handle =
@@ -981,16 +978,10 @@ impl Launches {
                 if std::fs::symlink_metadata(LIVE_MEDIUM).is_ok() {
                     return Ok(vec![0xff, 3]);
                 }
-                if let Supervised::Start(name) = &unit {
-                    // The update unit is `0e`'s, never an application's.
-                    if name == Supervised::Update.name() {
-                        return Ok(vec![0xff, 4]);
-                    }
-                    match self.registered(name) {
-                        Some(true) => {}
-                        Some(false) => return Ok(vec![0xff, 4]),
-                        None => return Ok(vec![0xff, 2]),
-                    }
+                match self.registered(unit.name()) {
+                    Some(true) => {}
+                    Some(false) => return Ok(vec![0xff, 4]),
+                    None => return Ok(vec![0xff, 2]),
                 }
                 if self.supervised.contains_key(&unit) {
                     return Ok(vec![0xff, 1]);
@@ -998,9 +989,7 @@ impl Launches {
                 if self.supervised.len() >= SUPERVISED_LIMIT {
                     return Ok(vec![0xff, 5]);
                 }
-                if let Supervised::Start(name) = &unit {
-                    self.unit.restart(name);
-                }
+                self.unit.restart(unit.name());
                 match spawn(&mut Config::supervised(&unit)) {
                     Ok(child) => {
                         self.supervised.insert(unit, (child, Instant::now()));
@@ -1008,9 +997,7 @@ impl Launches {
                     }
                     Err(why) => {
                         let _ = writeln!(std::io::stderr().lock(), "td-authd: {why}");
-                        if matches!(unit, Supervised::Start(_)) {
-                            self.unit.start_failed = true;
-                        }
+                        self.unit.start_failed = true;
                         Ok(vec![0xff, 2])
                     }
                 }
@@ -1241,8 +1228,8 @@ fn enrollment_dispatch_reaches_the_secret_decoder() -> Result<(), String> {
         }
     }
     // None of these takes an operand, `20` takes exactly one but for an
-    // upgrade's two, `21` exactly one, `22` and `23` none, and `24` a
-    // verb and a name.
+    // upgrade's two, `21` exactly one, `22` none or a name, `23` none,
+    // `24` a verb and a name, and nothing above `24` is a request.
     assert!(request(&[0x1d, 0]).is_err());
     assert!(request(&[0x1e, 0]).is_err());
     assert!(request(&[0x1f, 0]).is_err());
@@ -1260,6 +1247,7 @@ fn enrollment_dispatch_reaches_the_secret_decoder() -> Result<(), String> {
         &[0x23, 0],
         &[0x24],
         &[0x24, 0],
+        &[0x25],
     ] {
         assert!(request(bad).is_err(), "{bad:?}");
     }

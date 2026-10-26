@@ -1124,8 +1124,10 @@ fn the_production_source_and_raw_boundary_are_closed() {
         assert_eq!(launch.matches(bound).count(), 1, "{bound}");
     }
     assert_eq!(launch.matches("Inspection::printing(").count(), 1);
-    assert!(launch
-        .contains("Self::Start(name) => name,\n            Self::Update => \"firefox-update\","));
+    // `0d` starts only the unit a registry name names; the retired update
+    // unit, `0e`'s, is named nowhere.
+    assert!(launch.contains("let Self::Start(name) = self;\n        name"));
+    assert!(!launch.contains("firefox-update"));
     assert_eq!(launch.matches(".stdin(Stdio::null())").count(), 1);
     assert_eq!(launch.matches(".stdout(Stdio::null())").count(), 1);
     assert_eq!(launch.matches(".stderr(Stdio::null())").count(), 1);
@@ -1300,9 +1302,9 @@ const LOGIN_STATE_FINGERPRINT: u64 = 0x10b1af1d87d02b94;
 const SHARED_LOGIN_STATE_FINGERPRINT: u64 = 0x36b736e5dda17cc6;
 const SHARED_HOSTNAME_FINGERPRINT: u64 = 0x49026f28c1db76ec;
 
-const CACHE_FINGERPRINT: u64 = 0x842accbdae0b3daf;
-const SOFTWARE_FINGERPRINT: u64 = 0x19cb169265fa785d;
-const LAUNCH_FINGERPRINT: u64 = 0xc81e60bae4ecae1a;
+const CACHE_FINGERPRINT: u64 = 0xca9ca5668a3cec8c;
+const SOFTWARE_FINGERPRINT: u64 = 0xedb33f4ba9468adf;
+const LAUNCH_FINGERPRINT: u64 = 0xb4e2df40a26dc1d9;
 const MAIN_FINGERPRINT: u64 = 0x97ab356136dd2efb;
 const SESSION_FINGERPRINT: u64 = 0x6c78640f078fe395;
 

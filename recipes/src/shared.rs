@@ -926,9 +926,11 @@ pub const SYSTEM_PERSIST_READ_MARKER: &str = "TD-PERSIST-READ-OK";
 /// (APPLICATIONS.md §W.9): an oracle's Firefox fetches from the host's
 /// feed before it starts, bounded by the 900-second `APPLICATION_FETCH`
 /// service, and the greeter's horizon starts before that fetch. Only a
-/// fresh volume's first boot spends it; a reused one's check finds its
-/// generation current and returns.
-pub const DEFAULT_BOOT_TIMEOUT_SECS: u64 = 3694;
+/// fresh volume's first boot spends it; a reused one's install finds its
+/// generation current and returns. `software-evidence`, td-software's
+/// request path (td-software/DESIGN.md §6.4), runs between that install and
+/// Firefox's start, bounded at 120 seconds.
+pub const DEFAULT_BOOT_TIMEOUT_SECS: u64 = 3814;
 pub const QEMU_GUEST_WAIT_MARGIN_SECS: u64 = 30;
 
 /// Printed after the running system installs and activates a verified candidate
@@ -1332,6 +1334,16 @@ pub const TD_NEWS_BOOT_MARKER: &str = "TD-NEWS-RUNNING";
 // markers above: their jails carry `sockets=fetch`, and stage 2 refuses to
 // launch without the socket bound.
 pub const TD_FETCH_BOOT_MARKER: &str = "TD-FETCH-OK";
+
+// td-software's request path ran end to end (td-software/DESIGN.md §6.4):
+// as the human, `td-ctl install firefox` on the compositor's control socket,
+// which the compositor forwards as private request `24`, had root run its
+// `application-cache` operation as Firefox's account, and `td-ctl status
+// firefox` then read that install's success with a record taken after it
+// that names a `current` generation. The oracle installs Firefox first as
+// root (`firefox-fetch`), so this install is the owner's check of an
+// installed application against the host's feed.
+pub const TD_SOFTWARE_INSTALL_MARKER: &str = "TD-SOFTWARE-INSTALL-OK";
 // Printed by the `placement-evidence` unit under the autotest token once the
 // view is back on the first workspace and the compositor's own report shows
 // it active, the applications' workspace occupied, and one window on the

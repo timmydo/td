@@ -1,10 +1,12 @@
 //! td-app: fetch, admit and select one account's Flathub application
 //! (APPLICATIONS.md §W.9).
 //!
-//! `td-app update NAME [--force]` runs as the application's account and owns
-//! `$HOME/.td/flathub`. It follows the declared refs as hints, admits a
-//! candidate only under rules 1–5, and publishes a generation by replacing
-//! `current` with one rename. A refusal or failure leaves `current` as it was.
+//! `td-app update NAME --force` runs as the application's account and owns
+//! `$HOME/.td/flathub`. Every update asks: there is no throttle, since only
+//! the owner's request in td-software runs one (td-software/DESIGN.md §7).
+//! It follows the declared refs as hints, admits a candidate only under
+//! rules 1–5, and publishes a generation by replacing `current` with one
+//! rename. A refusal or failure leaves `current` as it was.
 //! `td-app ready NAME` names the generation td-jail may launch.
 //!
 //! A provisioned feed (td-vm/DESIGN.md) is tried first for every ref and
@@ -41,7 +43,6 @@ use td_engine::ostree::{self, Checksum, Commit, ObjectKey, ObjectKind};
 
 use crate::ostree::AcquireSpec;
 
-const CHECK_INTERVAL_SECS: u64 = 24 * 60 * 60;
 const RESOLVE_TIME: Duration = Duration::from_secs(10 * 60);
 /// A ref file is 64 hex digits and a newline.
 const MAX_REF_BYTES: u64 = 65;
@@ -84,7 +85,6 @@ enum Outcome {
     Removed,
     /// Whether there was state to delete.
     Deleted(bool),
-    Throttled,
     Unchanged,
     Selected(u64),
 }
@@ -908,12 +908,11 @@ fn update(
     admission: &Admission<'_>,
     cache: &Path,
     source: FlathubSource,
-    force: bool,
     now: u64,
 ) -> Result<Outcome, String> {
     prepare_cache(cache)?;
     let _lock = lock(cache)?;
-    let outcome = locked_update(admission, cache, source, force, now);
+    let outcome = locked_update(admission, cache, source, now);
     if let Err(error) = &outcome {
         record_refusal(cache, now, error);
     }
@@ -925,22 +924,11 @@ fn locked_update(
     admission: &Admission<'_>,
     cache: &Path,
     source: FlathubSource,
-    force: bool,
     now: u64,
 ) -> Result<Outcome, String> {
     let expected = expect(source)?;
     let current = read_pointer(cache, CURRENT)?;
     let previous = read_pointer(cache, PREVIOUS)?;
-    if !force {
-        if let Some((_, selection)) = &current {
-            let checked = read_checked(cache)?;
-            if checked.is_some_and(|checked| checked <= now && now - checked < CHECK_INTERVAL_SECS)
-                && serves(cache, selection, source, &expected)
-            {
-                return Ok(Outcome::Throttled);
-            }
-        }
-    }
     let work = fresh_work(cache)?;
     let tracker = Tracker::new(&work, Stage::Resolve);
     let outcome = tracker.run(|| {
@@ -1621,14 +1609,14 @@ pub(crate) fn export_to(store: &Path) -> Result<Vec<String>, String> {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: td-app update NAME [--force] | td-app ready NAME | td-app status NAME | \
+        "usage: td-app update NAME --force | td-app ready NAME | td-app status NAME | \
          td-app remove NAME | td-app delete-data NAME | td-app revalidate NAME"
     );
     std::process::exit(2);
 }
 
 enum Verb {
-    Update { force: bool },
+    Update,
     Ready,
     Status,
     Remove,
@@ -1638,10 +1626,9 @@ enum Verb {
 
 pub fn run(args: &[String]) {
     let (name, verb) = match args.get(1..) {
-        Some([verb, name]) if verb == "update" => (name, Verb::Update { force: false }),
-        Some([verb, name, flag]) if verb == "update" && flag == "--force" => {
-            (name, Verb::Update { force: true })
-        }
+        // Every update is the owner's forced check; the unforced, throttled
+        // form is gone with the check beside a launch.
+        Some([verb, name, flag]) if verb == "update" && flag == "--force" => (name, Verb::Update),
         Some([verb, name]) => match verb.as_str() {
             "ready" => (name, Verb::Ready),
             "status" => (name, Verb::Status),
@@ -1665,7 +1652,7 @@ pub fn run(args: &[String]) {
         require_account(home)?;
         // Only an update fetches; nothing else asks for a feed.
         let feed = match verb {
-            Verb::Update { .. } => crate::feed::provisioned_feed_base()?,
+            Verb::Update => crate::feed::provisioned_feed_base()?,
             _ => None,
         };
         let admission = Admission {
@@ -1676,7 +1663,7 @@ pub fn run(args: &[String]) {
         };
         let cache = home.join(CACHE_DIR);
         match verb {
-            Verb::Update { force } => update(&admission, &cache, source, force, unix_now()?),
+            Verb::Update => update(&admission, &cache, source, unix_now()?),
             Verb::Ready => ready(&cache, source).map(Outcome::Ready),
             Verb::Status => status(&cache, source).map(|status| Outcome::Status(Box::new(status))),
             Verb::Remove => remove(&cache),
@@ -1695,7 +1682,6 @@ pub fn run(args: &[String]) {
         Ok(Outcome::Removed) => println!("td-app: {name} is removed"),
         Ok(Outcome::Deleted(true)) => println!("td-app: {name}'s data is deleted"),
         Ok(Outcome::Deleted(false)) => println!("td-app: {name} has no data to delete"),
-        Ok(Outcome::Throttled) => println!("td-app: {name} was checked within a day"),
         Ok(Outcome::Unchanged) => println!("td-app: {name} is current"),
         Ok(Outcome::Selected(generation)) => {
             println!("td-app: {name} selected generation {generation}")
@@ -1877,14 +1863,14 @@ mod tests {
             self.home.join(CACHE_DIR)
         }
 
-        fn update(&self, source: FlathubSource, force: bool, now: u64) -> Result<Outcome, String> {
+        fn update(&self, source: FlathubSource, now: u64) -> Result<Outcome, String> {
             let admission = Admission {
                 repository: &self.url,
                 feed: self.feed.as_deref(),
                 verify: verify_fixture,
                 validate: validate_fixture,
             };
-            update(&admission, &self.cache(), source, force, now)
+            update(&admission, &self.cache(), source, now)
         }
 
         fn current(&self) -> Option<(u64, Selection)> {
@@ -1920,10 +1906,7 @@ mod tests {
         );
 
         VALIDATED.with(|seen| seen.borrow_mut().clear());
-        assert_eq!(
-            fixture.update(source(), false, NOW),
-            Ok(Outcome::Selected(1))
-        );
+        assert_eq!(fixture.update(source(), NOW), Ok(Outcome::Selected(1)));
 
         let (generation, selection) = fixture.current().unwrap();
         assert_eq!(generation, 1);
@@ -2005,10 +1988,7 @@ mod tests {
         fixture.repository.lock().unwrap().clear();
         let feed = crate::feed::tests::ConsumerServer::start(store.clone(), None);
         fixture.feed = Some(feed.base.clone());
-        assert_eq!(
-            fixture.update(source(), false, NOW),
-            Ok(Outcome::Selected(1))
-        );
+        assert_eq!(fixture.update(source(), NOW), Ok(Outcome::Selected(1)));
         let (_, selection) = fixture.current().unwrap();
         assert_eq!(selection.runtime.commit, runtime);
         assert_eq!(selection.application.commit, app);
@@ -2081,7 +2061,7 @@ mod tests {
         fixture.feed = Some(feed.base.clone());
 
         rewrite_feed_file(&commitmeta, Some(b"forged"));
-        let error = fixture.update(source(), false, NOW).unwrap_err();
+        let error = fixture.update(source(), NOW).unwrap_err();
         assert!(error.contains("does not verify"), "{error}");
         assert!(fixture.current().is_none());
         rewrite_feed_file(&commitmeta, Some(b"signed"));
@@ -2095,13 +2075,10 @@ mod tests {
             .unwrap();
         let lost = fs::read(&object).unwrap();
         rewrite_feed_file(&object, None);
-        assert!(fixture.update(source(), false, NOW).is_err());
+        assert!(fixture.update(source(), NOW).is_err());
         assert!(fixture.current().is_none());
         rewrite_feed_file(&object, Some(&lost));
-        assert_eq!(
-            fixture.update(source(), false, NOW),
-            Ok(Outcome::Selected(1))
-        );
+        assert_eq!(fixture.update(source(), NOW), Ok(Outcome::Selected(1)));
 
         // An older signed commit than the account admitted.
         let older = Fixture::new("feed-older");
@@ -2118,7 +2095,7 @@ mod tests {
         older.export(&stale).unwrap();
         let stale_feed = crate::feed::tests::ConsumerServer::start(stale.join("store"), None);
         fixture.feed = Some(stale_feed.base.clone());
-        let error = fixture.update(source(), true, NOW).unwrap_err();
+        let error = fixture.update(source(), NOW).unwrap_err();
         assert!(error.contains("does not supersede"), "{error}");
         assert_eq!(fixture.current().unwrap().0, 1);
     }
@@ -2141,10 +2118,7 @@ mod tests {
         fs::create_dir(&store).unwrap();
         let feed = crate::feed::tests::ConsumerServer::start(store, None);
         fixture.feed = Some(feed.base.clone());
-        assert_eq!(
-            fixture.update(source(), false, NOW),
-            Ok(Outcome::Selected(1))
-        );
+        assert_eq!(fixture.update(source(), NOW), Ok(Outcome::Selected(1)));
         // It was asked for both refs first.
         assert_eq!(feed.count(), 2);
     }
@@ -2282,8 +2256,8 @@ mod tests {
     }
 
     #[test]
-    fn a_daily_check_is_throttled_and_force_rechecks_without_a_new_generation() {
-        let fixture = Fixture::new("throttle");
+    fn every_update_asks_and_an_unchanged_one_publishes_nothing() {
+        let fixture = Fixture::new("asks");
         publish_commit(&fixture.repository, RUNTIME, b"usr", 10, None, b"signed");
         publish_commit(
             &fixture.repository,
@@ -2293,19 +2267,18 @@ mod tests {
             Some(APP_METADATA),
             b"signed",
         );
-        fixture.update(source(), false, NOW).unwrap();
+        fixture.update(source(), NOW).unwrap();
 
-        // An empty repository shows that the throttled check asks nothing.
+        // An empty repository shows that a check a second later still
+        // asks: there is no throttle, and its failure keeps `current` and
+        // `checked`.
         fixture.repository.lock().unwrap().clear();
-        assert_eq!(
-            fixture.update(source(), false, NOW + CHECK_INTERVAL_SECS - 1),
-            Ok(Outcome::Throttled)
-        );
-        assert!(fixture
-            .update(source(), false, NOW + CHECK_INTERVAL_SECS)
-            .is_err());
-        assert!(fixture.update(source(), true, NOW + 1).is_err());
+        assert!(fixture.update(source(), NOW + 1).is_err());
         assert_eq!(fixture.current().unwrap().0, 1);
+        assert_eq!(
+            fs::read_to_string(fixture.cache().join(CHECKED)).unwrap(),
+            format!("{NOW}\n")
+        );
 
         publish_commit(&fixture.repository, RUNTIME, b"usr", 10, None, b"signed");
         publish_commit(
@@ -2316,16 +2289,13 @@ mod tests {
             Some(APP_METADATA),
             b"signed",
         );
-        assert_eq!(
-            fixture.update(source(), true, NOW + 2),
-            Ok(Outcome::Unchanged)
-        );
+        assert_eq!(fixture.update(source(), NOW + 2), Ok(Outcome::Unchanged));
         assert_eq!(
             fs::read_to_string(fixture.cache().join(CHECKED)).unwrap(),
             format!("{}\n", NOW + 2)
         );
-        // A clock that went backwards does not suppress the check.
-        assert_eq!(fixture.update(source(), false, NOW), Ok(Outcome::Unchanged));
+        // A clock that went backwards asks too.
+        assert_eq!(fixture.update(source(), NOW), Ok(Outcome::Unchanged));
     }
 
     #[test]
@@ -2340,7 +2310,7 @@ mod tests {
             Some(APP_METADATA),
             b"signed",
         );
-        fixture.update(source(), true, NOW).unwrap();
+        fixture.update(source(), NOW).unwrap();
         let second = publish_commit(
             &fixture.repository,
             APP,
@@ -2349,10 +2319,7 @@ mod tests {
             Some(APP_METADATA),
             b"signed",
         );
-        assert_eq!(
-            fixture.update(source(), true, NOW),
-            Ok(Outcome::Selected(2))
-        );
+        assert_eq!(fixture.update(source(), NOW), Ok(Outcome::Selected(2)));
         assert_eq!(
             read_pointer(&fixture.cache(), PREVIOUS).unwrap().unwrap().0,
             1
@@ -2370,10 +2337,7 @@ mod tests {
             Some(APP_METADATA),
             b"signed",
         );
-        assert_eq!(
-            fixture.update(source(), true, NOW),
-            Ok(Outcome::Selected(3))
-        );
+        assert_eq!(fixture.update(source(), NOW), Ok(Outcome::Selected(3)));
         assert_eq!(fixture.names(GENERATIONS), vec!["2", "3"]);
         let kept = sorted(vec![second, third, runtime]);
         assert_eq!(fixture.names(DEPLOY), kept);
@@ -2392,10 +2356,10 @@ mod tests {
             Some(APP_METADATA),
             b"signed",
         );
-        fixture.update(source(), true, NOW).unwrap();
+        fixture.update(source(), NOW).unwrap();
 
         let refused = |expected: &str| {
-            let error = fixture.update(source(), true, NOW).unwrap_err();
+            let error = fixture.update(source(), NOW).unwrap_err();
             assert!(error.contains(expected), "{error}");
             let (generation, selection) = fixture.current().unwrap();
             assert_eq!(generation, 1);
@@ -2435,10 +2399,7 @@ mod tests {
         refused("fixture validator refuses");
         REFUSE.with(|refuse| *refuse.borrow_mut() = false);
         // The same candidate is admitted once it validates.
-        assert_eq!(
-            fixture.update(source(), true, NOW),
-            Ok(Outcome::Selected(2))
-        );
+        assert_eq!(fixture.update(source(), NOW), Ok(Outcome::Selected(2)));
     }
 
     #[test]
@@ -2475,11 +2436,11 @@ mod tests {
         let fixture = Fixture::new("before-trees");
         let runtime = publish_commit(&fixture.repository, RUNTIME, b"usr", 10, None, b"signed");
         app_commit(&fixture, b"app", 20);
-        fixture.update(source(), true, NOW).unwrap();
+        fixture.update(source(), NOW).unwrap();
         let objects = fixture.names(OBJECTS);
         let deploys = fixture.names(DEPLOY);
         let refuse = |expected: &str| {
-            let error = fixture.update(source(), true, NOW).unwrap_err();
+            let error = fixture.update(source(), NOW).unwrap_err();
             assert!(error.contains(expected), "{error}");
             assert_eq!(fixture.names(OBJECTS), objects);
             assert_eq!(fixture.names(DEPLOY), deploys);
@@ -2519,27 +2480,27 @@ mod tests {
         let fixture = Fixture::new("floor");
         publish_commit(&fixture.repository, RUNTIME, b"usr", 10, None, b"signed");
         app_commit(&fixture, b"one", 20);
-        fixture.update(source(), true, NOW).unwrap();
+        fixture.update(source(), NOW).unwrap();
         app_commit(&fixture, b"two", 30);
-        fixture.update(source(), true, NOW).unwrap();
+        fixture.update(source(), NOW).unwrap();
         fs::remove_file(fixture.cache().join(ADMITTED)).unwrap();
         // Generation 1's commit, still validly signed, served again.
         app_commit(&fixture, b"one", 20);
-        let error = fixture.update(source(), true, NOW).unwrap_err();
+        let error = fixture.update(source(), NOW).unwrap_err();
         assert!(error.contains("does not supersede"), "{error}");
         // An unchanged check rewrites the floor it lost.
         app_commit(&fixture, b"two", 30);
-        assert_eq!(fixture.update(source(), true, NOW), Ok(Outcome::Unchanged));
+        assert_eq!(fixture.update(source(), NOW), Ok(Outcome::Unchanged));
         let admitted = fs::read_to_string(fixture.cache().join(ADMITTED)).unwrap();
         assert_eq!(flathub_app::parse_admitted(&admitted).unwrap().len(), 2);
     }
 
     #[test]
-    fn a_changed_declaration_or_a_missing_deploy_is_never_throttled() {
+    fn a_changed_declaration_or_a_missing_deploy_is_checked_again() {
         let fixture = Fixture::new("declaration");
         let runtime = publish_commit(&fixture.repository, RUNTIME, b"usr", 10, None, b"signed");
         app_commit(&fixture, b"app", 20);
-        fixture.update(source(), false, NOW).unwrap();
+        fixture.update(source(), NOW).unwrap();
 
         // Another entry is another rule-5 input: the same commits are
         // validated again and selected as a new generation.
@@ -2547,24 +2508,15 @@ mod tests {
             entry: "/app/bin/firefox-bin",
             ..source()
         };
-        assert_eq!(
-            fixture.update(moved, false, NOW + 1),
-            Ok(Outcome::Selected(2))
-        );
+        assert_eq!(fixture.update(moved, NOW + 1), Ok(Outcome::Selected(2)));
         let previous = read_pointer(&fixture.cache(), PREVIOUS).unwrap().unwrap();
         assert_ne!(fixture.current().unwrap().1.checks, previous.1.checks);
-        assert_eq!(
-            fixture.update(moved, false, NOW + 2),
-            Ok(Outcome::Throttled)
-        );
+        assert_eq!(fixture.update(moved, NOW + 2), Ok(Outcome::Unchanged));
 
         // A deploy current names has gone: the check runs and restores it
         // in place, keeping generation 1 as the rollback.
         remove_tree(&fixture.cache().join(DEPLOY).join(&runtime)).unwrap();
-        assert_eq!(
-            fixture.update(moved, false, NOW + 3),
-            Ok(Outcome::Unchanged)
-        );
+        assert_eq!(fixture.update(moved, NOW + 3), Ok(Outcome::Unchanged));
         assert!(deployed(&fixture.cache(), &runtime));
         assert_eq!(fixture.current().unwrap().0, 2);
         assert_eq!(
@@ -2591,10 +2543,7 @@ mod tests {
         fs::write(cache.join(".admitted.1.tmp"), b"x").unwrap();
         std::os::unix::fs::symlink("generations/9", cache.join("current.new")).unwrap();
 
-        assert_eq!(
-            fixture.update(source(), false, NOW),
-            Ok(Outcome::Selected(10))
-        );
+        assert_eq!(fixture.update(source(), NOW), Ok(Outcome::Selected(10)));
         assert!(!partial.exists());
         assert_eq!(
             fs::read(cache.join(DEPLOY).join(&app).join("files/payload")).unwrap(),
@@ -2626,13 +2575,13 @@ mod tests {
         let fixture = Fixture::new("refused-collection");
         publish_commit(&fixture.repository, RUNTIME, b"usr", 10, None, b"signed");
         let admitted = app_commit(&fixture, b"app", 20);
-        fixture.update(source(), true, NOW).unwrap();
+        fixture.update(source(), NOW).unwrap();
         REFUSE.with(|refuse| *refuse.borrow_mut() = true);
         let first = app_commit(&fixture, b"first", 30);
-        assert!(fixture.update(source(), true, NOW + 1).is_err());
+        assert!(fixture.update(source(), NOW + 1).is_err());
         assert!(deployed(&fixture.cache(), &first));
         let second = app_commit(&fixture, b"second", 40);
-        assert!(fixture.update(source(), true, NOW + 2).is_err());
+        assert!(fixture.update(source(), NOW + 2).is_err());
         REFUSE.with(|refuse| *refuse.borrow_mut() = false);
         assert!(!deployed(&fixture.cache(), &first));
         assert!(!fixture.names(OBJECTS).contains(&first));
@@ -2653,11 +2602,11 @@ mod tests {
         let cache = fixture.cache();
         prepare_cache(&cache).unwrap();
         fs::create_dir(cache.join(ADMITTED)).unwrap();
-        let error = fixture.update(source(), true, NOW).unwrap_err();
+        let error = fixture.update(source(), NOW).unwrap_err();
         assert!(error.contains("not a regular file"), "{error}");
         fs::remove_dir(cache.join(ADMITTED)).unwrap();
         fs::set_permissions(&cache, fs::Permissions::from_mode(0o755)).unwrap();
-        fixture.update(source(), true, NOW).unwrap();
+        fixture.update(source(), NOW).unwrap();
         assert_eq!(
             fs::metadata(&cache).unwrap().permissions().mode() & 0o777,
             0o700
@@ -2677,7 +2626,7 @@ mod tests {
         assert_eq!(fixture.ready(source()), Ok(None));
         let runtime = publish_commit(&fixture.repository, RUNTIME, b"usr", 10, None, b"signed");
         app_commit(&fixture, b"app", 20);
-        fixture.update(source(), false, NOW).unwrap();
+        fixture.update(source(), NOW).unwrap();
         assert_eq!(fixture.ready(source()), Ok(Some(1)));
         // Another entry is another declaration the generation was not
         // validated for.
@@ -2700,20 +2649,20 @@ mod tests {
         let fixture = Fixture::new("held");
         publish_commit(&fixture.repository, RUNTIME, b"usr", 10, None, b"signed");
         let first = app_commit(&fixture, b"one", 20);
-        fixture.update(source(), true, NOW).unwrap();
+        fixture.update(source(), NOW).unwrap();
         let selection = fixture.cache().join(GENERATIONS).join("1").join(SELECTION);
         let launch = File::open(&selection).unwrap();
         launch.lock_shared().unwrap();
         app_commit(&fixture, b"two", 30);
-        fixture.update(source(), true, NOW).unwrap();
+        fixture.update(source(), NOW).unwrap();
         app_commit(&fixture, b"three", 40);
-        fixture.update(source(), true, NOW).unwrap();
+        fixture.update(source(), NOW).unwrap();
         // Neither current nor previous, and still running.
         assert_eq!(fixture.names(GENERATIONS), vec!["1", "2", "3"]);
         assert!(deployed(&fixture.cache(), &first));
         drop(launch);
         app_commit(&fixture, b"four", 50);
-        fixture.update(source(), true, NOW).unwrap();
+        fixture.update(source(), NOW).unwrap();
         assert_eq!(fixture.names(GENERATIONS), vec!["3", "4"]);
         assert!(!deployed(&fixture.cache(), &first));
         // A launch that opened generation 1 before it went finds it unlinked.
@@ -2728,13 +2677,13 @@ mod tests {
         let fixture = Fixture::new("unproved");
         publish_commit(&fixture.repository, RUNTIME, b"usr", 10, None, b"signed");
         let first = app_commit(&fixture, b"one", 20);
-        fixture.update(source(), true, NOW).unwrap();
+        fixture.update(source(), NOW).unwrap();
         app_commit(&fixture, b"two", 30);
-        fixture.update(source(), true, NOW).unwrap();
+        fixture.update(source(), NOW).unwrap();
         let selection = fixture.cache().join(GENERATIONS).join("1").join(SELECTION);
         fs::set_permissions(&selection, fs::Permissions::from_mode(0o000)).unwrap();
         app_commit(&fixture, b"three", 40);
-        let error = fixture.update(source(), true, NOW).unwrap_err();
+        let error = fixture.update(source(), NOW).unwrap_err();
         assert!(error.contains("open"), "{error}");
         assert!(deployed(&fixture.cache(), &first));
         fs::set_permissions(&selection, fs::Permissions::from_mode(0o644)).unwrap();
@@ -2744,7 +2693,7 @@ mod tests {
             .join(DEPLOY)
             .join(format!("{REMOVING}{first}"));
         fs::create_dir_all(stale.join(FILES)).unwrap();
-        fixture.update(source(), true, NOW).unwrap();
+        fixture.update(source(), NOW).unwrap();
         assert!(!stale.exists());
         assert!(!deployed(&fixture.cache(), &first));
         assert!(!fixture
@@ -2806,7 +2755,7 @@ mod tests {
 
         let runtime = publish_commit(&fixture.repository, RUNTIME, b"usr!", 10, None, b"signed");
         let app = app_commit(&fixture, b"app", 20);
-        fixture.update(source(), true, NOW).unwrap();
+        fixture.update(source(), NOW).unwrap();
         let installed = fixture.status(source());
         let current = installed.current.unwrap();
         assert_eq!(current.generation, 1);
@@ -2822,12 +2771,12 @@ mod tests {
 
         // A check that does not complete is the last refusal until one does.
         app_commit(&fixture, b"older", 19);
-        assert!(fixture.update(source(), true, NOW + 5).is_err());
+        assert!(fixture.update(source(), NOW + 5).is_err());
         let refused = fixture.status(source()).refused.unwrap();
         assert_eq!(refused.time, NOW + 5);
         assert!(refused.reason.contains("does not supersede"), "{refused:?}");
         app_commit(&fixture, b"app", 20);
-        fixture.update(source(), true, NOW + 6).unwrap();
+        fixture.update(source(), NOW + 6).unwrap();
         assert_eq!(fixture.status(source()).refused, None);
 
         // A changed declaration reads as installed but stale, and a missing
@@ -2921,9 +2870,9 @@ mod tests {
         assert!(!fixture.cache().exists());
         publish_commit(&fixture.repository, RUNTIME, b"usr", 10, None, b"signed");
         let first = app_commit(&fixture, b"one", 20);
-        fixture.update(source(), true, NOW).unwrap();
+        fixture.update(source(), NOW).unwrap();
         let second = app_commit(&fixture, b"two", 30);
-        fixture.update(source(), true, NOW).unwrap();
+        fixture.update(source(), NOW).unwrap();
         fs::create_dir_all(fixture.state()).unwrap();
         let launch = fixture.hold(2);
 
@@ -2946,14 +2895,11 @@ mod tests {
 
         // A reinstall admits nothing older than what was admitted.
         app_commit(&fixture, b"one", 20);
-        let error = fixture.update(source(), true, NOW).unwrap_err();
+        let error = fixture.update(source(), NOW).unwrap_err();
         assert!(error.contains("does not supersede"), "{error}");
         // Numbering starts again in an empty generations directory.
         app_commit(&fixture, b"three", 40);
-        assert_eq!(
-            fixture.update(source(), true, NOW),
-            Ok(Outcome::Selected(1))
-        );
+        assert_eq!(fixture.update(source(), NOW), Ok(Outcome::Selected(1)));
     }
 
     #[test]
@@ -2966,7 +2912,7 @@ mod tests {
         assert!(!fixture.cache().exists());
         publish_commit(&fixture.repository, RUNTIME, b"usr", 10, None, b"signed");
         app_commit(&fixture, b"app", 20);
-        fixture.update(source(), true, NOW).unwrap();
+        fixture.update(source(), NOW).unwrap();
         let profile = fixture.state().join("data/profile");
         fs::create_dir_all(&profile).unwrap();
         fs::write(profile.join("prefs.js"), b"x").unwrap();
@@ -3016,9 +2962,9 @@ mod tests {
         );
         let runtime = publish_commit(&fixture.repository, RUNTIME, b"usr", 10, None, b"signed");
         let old = app_commit(&fixture, b"old", 15);
-        fixture.update(source(), true, NOW).unwrap();
+        fixture.update(source(), NOW).unwrap();
         let app = app_commit(&fixture, b"app", 20);
-        fixture.update(source(), true, NOW).unwrap();
+        fixture.update(source(), NOW).unwrap();
         assert_eq!(
             revalidate(&admission, &fixture.cache(), source(), NOW),
             Ok(Some(2))

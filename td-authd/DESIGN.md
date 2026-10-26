@@ -529,8 +529,8 @@ closes the file before the audit and retains no descriptor or child.
 The image compositor runs at its reserved identity and uses this channel
 for human terminals and the task manager. The configured application card
 activates a supervised window; when there is none it asks root to start
-the application's unit, and an update row beside it asks for the unit
-that checks the application's Flathub cache (APPLICATIONS.md §W.9).
+the application's unit (APPLICATIONS.md §W.9). No card entry updates an
+application: that is td-software's, through request `24`.
 Direct compositor spawning remains a host-development mode.
 
 Startup requires all four root uid/gid columns, one thread, and only fd
@@ -596,7 +596,7 @@ Subsequent payloads are exact byte records:
 | `0b` | `81` plus a process handle for the human disk usage analyzer |
 | `0c` | `81` plus a process handle for the human coding agent |
 | `0d` plus an application name | `84` once root has started `/bin/td-svc start NAME` |
-| `0e` | `84` once root has started `/bin/td-svc start firefox-update` |
+| `0e` | retired (formerly Firefox's forced update check); refused like any unknown request and never reassigned |
 | `0f` plus an application name | `85` and the `NAME` unit's state as root last read it: `00` idle, `01` starting, `02` running, `03` failed, `04` unknown |
 | `22`, optionally with an application name | `81` plus a process handle for the human application manager, td-software, opened at that application |
 | `23` | `88` and which of the registry's Flathub declarations are installed ("Application requests") |
@@ -606,27 +606,25 @@ Subsequent payloads are exact byte records:
 bytes in the registry grammar (anything else is malformed and ends the
 generation). Root answers `ff 04` for a name its registry,
 `/etc/td-applications.tsv` read as for `23` ("Application requests"),
-does not hold, or for `firefox-update`, which is `0e`'s, and `ff 02`
-while it cannot read the registry. The image names each application's
-unit after it, which a recipe test holds: every shipped application has
-a unit of its name that starts it. `0d` and `0e` create no handle. Root
+does not hold, and `ff 02` while it cannot read the registry. The image
+names each application's unit after it, which a recipe test holds:
+every shipped application has a unit of its name that starts it, and no
+other unit is one a peer can name. `0d` creates no handle. Root
 runs the fixed td-svc client itself, with the same cleared environment,
 `/` and null standard descriptors, holds at most one per unit in flight,
 which another start of that unit joins (`ff 01`), and 16 in all (`ff 05`
 for a start beyond them, which is refused), answers `ff 02` if it cannot
 start one, reaps each at a later request, logs a client that failed, and
 kills one still running after 12 seconds, as revocation bounds its own.
-On a live boot, while `/run/td-media` exists, both answer `ff 03`: the
+On a live boot, while `/run/td-media` exists, it answers `ff 03`: the
 live table skips the application, and td-svc's `start` would run a
 skipped unit. There is no rate limit beyond one in flight: `0d` restarts
-a unit td-svc holds in backoff, and `0e` runs the forced check, which
-ignores td-app's daily throttle, each time the last one finished. The
-compositor already owns the session's input, so neither gives it more
-than repeating a click. The peer names an application root's immutable
-registry declares, never a unit outside it, and `0e`'s unit is root's:
-no unit grants the human anything a launch does not, since the
-application runs as its own account and the update is td-app's forced
-check as that account.
+a unit td-svc holds in backoff each time the last start finished. The
+compositor already owns the session's input, so it gains no more than
+repeating a click. The peer names an application root's immutable
+registry declares, never a unit outside it: no unit grants the human
+anything a launch does not, since the application runs as its own
+account, and a launch fetches nothing (td-software/DESIGN.md §4.1).
 
 `0f` lets the compositor say what became of a `0d`: it reads
 `/bin/td-svc status NAME`, the fixed client with the same cleared
@@ -650,9 +648,10 @@ followed, no `0d` and nothing read yet. A busy, failed or late client
 leaves the last read standing. A client that began before a `0d`, or
 before a `0f` for another application, is reaped and discarded, so it
 cannot answer for what came after it. The states are td-svc's, not the
-application's: `02` says td-svc holds a live leader, which a first
-launch spends its download in before any window maps, `03` includes a
-crash td-svc's `restart=on-failure` will retry after its backoff, and a
+application's: `02` says td-svc holds a live leader, which a launch
+holds before any window maps, `03` includes a crash, or td-jail's
+refusal of an application not installed, that td-svc's
+`restart=on-failure` will retry after its backoff, and a
 `0d` client killed at its bound reads `03` until a read sees the unit it
 may still have started. A `0f` for another application than the one
 followed starts over on it as a `0d` would, with nothing read and no
@@ -994,7 +993,7 @@ for both `install` and `update` (they differ only in whether a `current`
 exists, which td-software shows) and the verb's own name otherwise. The
 environment is cleared, the working directory is `/` and stdin is null;
 td-login supplies the account's home, its other identity variables and
-its session cgroup, as for the per-application update unit. For `status`
+its session cgroup, as for an application's launch. For `status`
 td-app's stdout is a private socket and its stderr null; root reads at
 most 4 KiB, requires EOF and a successful exit, parses the record with
 `flathub_app::Status`, requires it to name APP with `kind=flathub`, and
@@ -1006,8 +1005,9 @@ failed exit reports the last line as printable ASCII in its own
 diagnostic. A failed `status` reports only td-app's exit. Either failure
 exits 1; success of a verb other than `status` prints nothing.
 
-Each run is bounded: an hour for `install` and `update`, matching the
-forced-check unit's timeout, ten minutes for `remove` and
+Each run is bounded: an hour for `install` and `update`, a download of
+about a gigabyte on a slow link and the validator over it, ten minutes
+for `remove` and
 `delete-data`, and 60 seconds for `status`, whose deploy-size walk runs
 on every poll. At the bound root kills and reaps td-app; td-app's cache
 lock and generation leases make a killed run safe to repeat. The bound
@@ -1026,7 +1026,8 @@ authority must run it as its own process rather than in its loop.
 
 None of these is elevation (td-software/DESIGN.md §3): each runs the
 application's own account on its own cache or state, which a first
-launch and the forced check already did. The confinement test pins the
+launch and the forced check did before td-software's cutover
+(td-software/DESIGN.md §6.4). The confinement test pins the
 one program, its argument shape, the order of parse, startup audit,
 admission and spawn, and no environment beyond the cleared one.
 
@@ -1056,8 +1057,9 @@ so it sends one request per application at a time as the operation
 requires. It starts an operation only on its own last read of the
 name's status, ended in the last 30 seconds: a second operation while
 one runs, or one whose read shows a writer root did not start since
-(`0e`'s check, td-jail's on-demand check or a previous generation's
-operation, whose lock the new one would wait on), is refused with `ff
+(an oracle's install, td-jail's offline revalidation at a launch or a
+previous generation's operation, whose lock the new one would wait on),
+is refused with `ff
 01`; with no such read it is refused with `ff 05`. Either refusal
 starts a read, so the next request finds one; td-software asks a status
 far more often than that. A recent read that failed admits the
@@ -2933,7 +2935,7 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
     checked, so such a `20` never ends the generation. The private
     channel routes `20` to the paired session beside `10` to `1f`, and
     routes `21`, the console power choice ("Physical console power"),
-    there too, and no request from `22` up: `24` is the program
+    there too, and no request from `22` up: `22` to `24` are the program
     authority's ("Application requests"). Polls `11`, cancellation `15`,
     presentation `13`, commit `14` and the secret request `1c` are a
     login operation's, with the same answers (`91 0b` while root waits

@@ -10,8 +10,9 @@ use std::os::unix::net::UnixStream;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-/// An install or update's bound, matching the forced-check unit's timeout
-/// (svc_timeouts::APPLICATION_UPDATE) until the cutover retires the unit.
+/// An install or update's bound: resolving two refs and, when either moved,
+/// downloading and materializing a runtime or application of about a
+/// gigabyte on a slow link, then the dynamic validator over both.
 const CHECK_TIME: Duration = Duration::from_secs(3600);
 /// Removing generations or an application's state.
 const REMOVE_TIME: Duration = Duration::from_secs(600);

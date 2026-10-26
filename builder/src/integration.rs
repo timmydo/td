@@ -31,7 +31,9 @@ const STEPS: &[Step] = &[
     Step {
         name: "qemu-boot-system",
         argv: &["qemu-boot-system"],
-        proves: "the system image boots to its services and session",
+        proves: "the system image boots to its services and session, installs Firefox \
+                 through root's application-cache operation, and serves td-software's \
+                 install and status requests from its control socket",
     },
     Step {
         name: "qemu-boot-server",

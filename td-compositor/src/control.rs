@@ -283,7 +283,7 @@ pub const USAGE: &[(&str, &str)] = &[
     ),
     (
         "launch <application>",
-        "raise that application's window, or have root start it",
+        "raise that application's window, or have root start it if installed",
     ),
 ];
 
@@ -1352,8 +1352,8 @@ fn application_answer(
 }
 
 /// A table application's card activation, asked by name: raise its window,
-/// or have root start its unit and show the launch on the bar, installed
-/// or not, as the card's row would.
+/// or, once root says it is installed, have root start its unit and show
+/// the launch on the bar, as the card's row would.
 fn launch_answer(
     runtime: &Mutex<Runtime>,
     authority: &crate::authority::Launcher,
@@ -1372,10 +1372,23 @@ fn launch_answer(
     let mut sent = Ok(());
     let outcome = match runtime.activate_application(name) {
         Ok(true) => Ok(()),
-        Ok(false) => runtime.launch_application(name, || {
-            sent = authority.supervise(crate::authority::Supervised::Start(name.to_string()));
-            sent.clone()
-        }),
+        // A launch never installs (td-software/DESIGN.md §4.1), and the
+        // card shows no application before root's first answer.
+        Ok(false) => match runtime.application_installed(name) {
+            Some(Some(false)) => {
+                return format!("error {name} is not installed; install it in td-software\n")
+            }
+            // Root has not answered, or its row is settling.
+            None => {
+                return format!(
+                    "unavailable root has not said whether {name} is installed; ask again shortly\n"
+                )
+            }
+            Some(_) => runtime.launch_application(name, || {
+                sent = authority.supervise(crate::authority::Supervised::Start(name.to_string()));
+                sent.clone()
+            }),
+        },
         Err(error) => Err(error),
     };
     // `ok` is the card's press handled: a window raised, `0d` queued, or
@@ -5164,10 +5177,13 @@ mod tests {
             object: 3,
         });
         let (launcher, _queued) = crate::authority::Queued::launcher();
-        runtime
-            .lock()
-            .unwrap()
-            .set_launcher_table(crate::launcher_table::tests::image(), None);
+        let installed = crate::authority::Installed::default();
+        {
+            let mut runtime = runtime.lock().unwrap();
+            runtime.set_launcher_table(crate::launcher_table::tests::image());
+            runtime.set_installed(installed.clone());
+        }
+        installed.answer(b"\x88\x01\x01\x07firefox").unwrap();
         // A terminal launch holds the worker's one slot.
         assert!(launcher.launch().is_ok());
         let launch = Request::parse("launch firefox").unwrap();
@@ -5189,23 +5205,61 @@ mod tests {
             "error firefox has no launcher entry\n"
         );
         assert_eq!(queued.supervised(), None);
-        runtime
-            .lock()
-            .unwrap()
-            .set_launcher_table(crate::launcher_table::tests::image(), None);
-        // Any table name, installed or not: root's unit installs on demand
-        // until the cutover.
-        for name in ["firefox", "mail"] {
-            let launch = Request::parse(&format!("launch {name}")).unwrap();
-            assert_eq!(
-                application_answer(&runtime, &launcher, launch, deadline),
-                "ok\n"
-            );
-            assert_eq!(
-                queued.supervised(),
-                Some(crate::authority::Supervised::Start(name.into()))
-            );
+        let installed = crate::authority::Installed::default();
+        {
+            let mut runtime = runtime.lock().unwrap();
+            runtime.set_launcher_table(crate::launcher_table::tests::image());
+            runtime.set_installed(installed.clone());
         }
+        // Before root's first answer the card shows no application.
+        let launch = Request::parse("launch mail").unwrap();
+        assert_eq!(
+            application_answer(&runtime, &launcher, launch, deadline),
+            "unavailable root has not said whether mail is installed; ask again shortly\n"
+        );
+        assert_eq!(queued.supervised(), None);
+        // A launch never installs: Firefox, not installed, is refused and
+        // nothing is asked of root; mail, which the image ships, starts.
+        installed.answer(b"\x88\x01\x00\x07firefox").unwrap();
+        installed.take_due();
+        let launch = Request::parse("launch firefox").unwrap();
+        assert_eq!(
+            application_answer(&runtime, &launcher, launch, deadline),
+            "error firefox is not installed; install it in td-software\n"
+        );
+        assert_eq!(queued.supervised(), None);
+        // A refusal asks root again, in case the set is stale.
+        assert!(installed.take_due());
+        let launch = Request::parse("launch mail").unwrap();
+        assert_eq!(
+            application_answer(&runtime, &launcher, launch, deadline),
+            "ok\n"
+        );
+        assert_eq!(
+            queued.supervised(),
+            Some(crate::authority::Supervised::Start("mail".into()))
+        );
+        // Settling right after an install, its row is not yet a refusal.
+        installed.answer(b"\x88\x01\x02\x07firefox").unwrap();
+        let launch = Request::parse("launch firefox").unwrap();
+        assert_eq!(
+            application_answer(&runtime, &launcher, launch, deadline),
+            "unavailable root has not said whether firefox is installed; ask again shortly\n"
+        );
+        assert_eq!(queued.supervised(), None);
+        assert!(installed.take_due());
+        // Installed, Firefox starts as the card's entry does, asking nothing.
+        installed.answer(b"\x88\x01\x01\x07firefox").unwrap();
+        let launch = Request::parse("launch firefox").unwrap();
+        assert_eq!(
+            application_answer(&runtime, &launcher, launch, deadline),
+            "ok\n"
+        );
+        assert!(!installed.take_due());
+        assert_eq!(
+            queued.supervised(),
+            Some(crate::authority::Supervised::Start("firefox".into()))
+        );
         let other = Request::parse("launch other").unwrap();
         assert_eq!(
             application_answer(&runtime, &launcher, other, deadline),

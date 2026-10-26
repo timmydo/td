@@ -241,8 +241,10 @@ is handed off when it IS `td-login`, and equally when a shell leader
 keeps its leaf.
 
 There is a third case the model does not carry: a unit whose leader stays but
-whose real work moves on. `firefox-evidence`, `firefox-input` and `greeter`
-are that case — their shell leaders stay in the unit's leaf while the work
+whose real work moves on. `firefox-evidence`, `firefox-input`, `greeter`,
+`software-evidence` and `firefox-fetch` (whose leader, root's
+`application-cache` operation, waits while td-login runs td-app) are that
+case — their leaders stay in the unit's leaf while the work
 they drive runs as td-login children elsewhere — so they are accounted for
 what they supervise, not for what they launched, and declare no limits rather
 than a misleading one. Modelling it properly means teaching td-svc about jail
@@ -323,7 +325,7 @@ table uses it for a live boot, whose initramfs alone mounts the install
 medium at `/run/td-media`: the stock session's window units name that path,
 so the live session opens only the installer (td-install/INSTALLER.md "Live
 startup") while boot health, which requires the terminal, still runs.
-Firefox and the oracles' first fetches name
+Firefox and the oracles' install and request-path evidence name
 `/run/td-applications-on-demand` instead, which the init creates on every
 boot without the autotest token and on every live one, so they run at boot
 only on an oracle's (APPLICATIONS.md §W.9).

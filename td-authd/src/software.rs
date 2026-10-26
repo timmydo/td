@@ -360,9 +360,10 @@ impl Entry {
     }
 
     /// Why an operation may not start now: `ff 01` while one runs or the
-    /// last read showed a writer root did not start (`0e`'s check, td-jail's
-    /// or a previous generation's), whose lock the operation would wait on
-    /// until its bound; `ff 05` until a read that ended recently says
+    /// last read showed a writer root did not start (an oracle's install,
+    /// td-jail's offline revalidation or a previous generation's operation),
+    /// whose lock the operation would wait on until its bound; `ff 05` until
+    /// a read that ended recently says
     /// neither. A recent read that failed admits one: td-app cannot say
     /// what a damaged cache holds, `remove` is what clears one, and the
     /// operation's own bound covers a wait on a lock it did not see.

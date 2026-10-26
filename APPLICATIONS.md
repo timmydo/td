@@ -43,9 +43,16 @@ installed at all.
 Settled by the maintainer; these are premises, not conclusions.
 
 1. **Packages ship in `/td/store` with the image**; only writable state
-   lives in `~/.td/app`. There is no install step and no privileged
-   installer — choosing which shipped application to run needs no
-   authority beyond a user's own launcher table.
+   lives in `~/.td/app`. A source-built application has no install
+   step. A Flathub application the image declares (§W.9) is installed
+   only when the session owner asks td-software: td-software asks root's
+   fixed `application-cache` operation to fetch that reviewed,
+   image-declared application into its own account's cache, admitted
+   under §W.9's rules, and that operation is the one installer. There
+   is still no package repository, no mutable registry and no install
+   of anything the image does not declare. Choosing which installed
+   application to run needs no authority beyond the user's own
+   launcher.
 2. **The first application-capable `td-jail` carries seccomp**, as part
    of the same `UNSAFE.md` surface. The preceding skeleton and mount
    rungs launch no application; their public entry point fails closed.
@@ -11055,7 +11062,7 @@ behavior, so neither depends on td-editor any more: each names td-ui
 alone, its lock lists the crate and the toolkit, and its recipe stages
 no editor tree. The td-pass notebook window embeds the same pane.
 
-### W.9 Flathub applications on demand
+### W.9 Flathub applications, installed from td-software
 
 **Status: decided by the repository user; landed.** No Flathub byte is
 in the image: §B.3.1's pinned path is retired, and where this section and
@@ -11163,18 +11170,18 @@ account rather than root, directories 0755 and files 0755/0644 from the
 executable bit.
 
 **Who fetches: `td-app`, a td-net applet.** `td-app update NAME
-[--force]` runs as the application's account, resolves the ref through
+--force` runs as the application's account, resolves the ref through
 `refs/heads/<ref>` (a mutable hint, never authority), and performs 1–5.
-It refuses to run as root or with a `HOME` another uid owns. Without
-`--force` it does nothing if `checked` is less than 24 hours old (and
-not in the future) and `current` still serves the declaration: the same
-name, refs and `checks`, with every deploy it names complete. A changed
-declaration or policy, or a missing deploy, is therefore never
-throttled. `checked` is written only by a check that completed:
-a fetch failure or a refused candidate leaves it, so the next launch
-asks again. Before any tree is fetched it reads the ref, the commit and
-its commitmeta and applies 1–4. Rule 3's floor is the newest row for
-the ref in `admitted`, `current` or `previous`, so a lost or stale
+It refuses to run as root or with a `HOME` another uid owns. Every
+update asks: the form without `--force`, which skipped a check made in
+the last 24 hours, went with the check beside a launch
+(td-software/DESIGN.md §6.4), so `td-app update NAME` alone is refused
+as a usage error. `checked` is written only by a check that completed:
+a fetch failure or a refused candidate leaves it, so td-software shows
+when the application was last checked successfully. Before any tree
+is fetched it reads the ref, the commit and its commitmeta and applies
+1–4. Rule 3's floor is the newest row for the ref in `admitted`,
+`current` or `previous`, so a lost or stale
 `admitted` never admits a commit older than one already selected. It
 then acquires and materializes each new commit (an existing
 `deploy/<commit>/files` is complete, since it appears by one rename; a
@@ -11221,17 +11228,16 @@ foreign `HOME` as `update` does:
   generation goes at a later collection once its launch ends. It keeps
   `admitted`, so a reinstall cannot admit a commit older than one already
   admitted, and `checked`, clears `refused`, and keeps the jail state.
-  An emptied `generations/` numbers again from 1. A check a launch
-  already started (below) can still publish after it until td-jail stops
-  fetching on demand (td-software/DESIGN.md §6.4), and with no
-  `current` the next launch waits for one.
+  An emptied `generations/` numbers again from 1. With no `current` the
+  next launch refuses: the application is not installed until the owner
+  installs it again in td-software.
 - `td-app delete-data NAME` deletes the jail state,
   `~/.td/app/NAME`, and refuses unless `current` and `previous` are gone
   and, after a collection under the lock, no generation is left: every
   running launch holds its generation's selection (below), so a
   generation that survives is a running instance. A launch that starts
-  meanwhile finds no `current` and waits for this lock before it can
-  fetch one, so it starts on the state as the deletion left it. The
+  meanwhile finds no `current` and refuses, so no instance starts on the
+  state as the deletion leaves it. The
   state is renamed aside (`.removing-NAME`, finished by the next
   deletion) and then removed without following a link; it refuses,
   before the state is renamed or a mode changes, when a directory it
@@ -11244,31 +11250,40 @@ foreign `HOME` as `update` does:
   digest. The stale copy is no rollback: `previous` stays what it was,
   and the stale generation is collected. It answers as `ready` does;
   when the refs changed, a deploy is missing or the validator refuses,
-  it answers `absent` and records the reason in `refused`. It leaves `checked`, since it asked no one.
-  td-jail does not run it yet (td-software/DESIGN.md §4.1).
+  it answers `absent` and records the reason in `refused`. It leaves
+  `checked`, since it asked no one. td-jail runs it at a launch that
+  finds `current` no longer serving (below).
 
 td-authd's `application-cache` operation is the root path to `update
 --force`, `remove`, `delete-data` and `status`, selecting the account
 itself (td-authd/DESIGN.md, "Application cache operation"). td-software's
 requests reach it from the compositor's control socket as private request
 `24`, which root runs as a process of its own, one operation per
-application at a time (td-authd/DESIGN.md, "Application requests"); until
-the cutover td-jail's on-demand check and the forced-check unit still run
-td-app directly.
+application at a time (td-authd/DESIGN.md, "Application requests"). That
+is the only way an application is installed or updated: nothing runs
+`td-app update` beside a launch, at boot or on a timer, and the oracles'
+install below takes the same operation.
 
-**When it fetches.** td-jail, launching an application whose spec names
-Flathub refs, first runs `/bin/td-app ready NAME` as the account, with
-only `HOME` in its environment. That takes no lock and answers with the
-generation `current` names while it still serves the declaration (the
-`serves` test above, `checks` included), or `absent`. With no serving
-generation td-jail waits for `td-app update NAME` and asks again: the
-first launch is a download, and an application whose declaration or
-policy changed under a system update, or whose deploy is damaged, does not
-start until a check has validated it again. Otherwise the daily check
-runs beside the launch, unwaited, and what it selects is used from the
-next launch, so a network failure never stops a working application.
-The forced check is the same command with `--force`, requested as
-below. Host mode refuses such a spec.
+**When it fetches: only when the owner asks.** The repository user
+decided that td-software is the only install path (td-software/DESIGN.md
+§7): nothing is installed or fetched by default, at installation or at
+boot, and an application updates only when the owner presses Check now
+in td-software, with no background timer. A launch fetches nothing.
+td-jail, launching an application whose spec names Flathub refs, first
+runs `/bin/td-app ready NAME` as the account, with only `HOME` in its
+environment. That takes no lock and answers with the generation
+`current` names while it still serves the declaration (the `serves`
+test above, `checks` included), or `absent`. On `absent` with no
+`current` link in the cache, td-jail refuses: `NAME is not installed;
+install it in td-software`. On `absent` with one, the declaration or
+policy changed under a system update, or a deploy is damaged: td-jail
+runs `/bin/td-app revalidate NAME` the same way, which fetches nothing,
+and launches the generation it answers; if it answers `absent` too,
+td-jail refuses: `NAME did not revalidate offline after a system
+update; update it in td-software`, whose check fetches and admits again.
+A machine whose account had `current` before this cutover therefore
+launches its application with no fetch, and one that never installed it
+shows it as not installed. Host mode refuses such a spec.
 
 **What a launch holds.** td-jail takes a shared `flock` on the
 generation's `selection` and keeps the descriptor in stage 1 for the
@@ -11291,42 +11306,51 @@ it), and td-jail reserves it at launch as it reserves the state.
 channel to root td-authd (td-authd/DESIGN.md, "Fixed program launch
 prerequisite"), which already pins the compositor's credentials and
 process. `0d NAME` asks root to run `td-svc start NAME`, for an
-application its registry holds, whose unit the image names after it;
-`0e`, naming nothing, `td-svc start firefox-update`. Root keeps at most
-one start of each unit in flight and 16 in all, and answers at once
-(`84`). On a live boot both are refused, since that session runs only
-the installer. The launcher sends `0d` when the application's card finds
-no window, and `0e` from an "UPDATE FIREFOX" row beside the card, shown
-only with the authority, which is the forced check. A third, `0f NAME`,
-has root read that unit's td-svc state, so the bar shows the launch from
-the card's press until a window maps or the unit fails
-(td-compositor/DESIGN.md, the strip's LAUNCH cell); it is td-svc's
-state, not the download's, and a first launch's download reads as the
-unit running with no window yet. `firefox-update` is a oneshot that runs
-`td-app update firefox --force` as `tda65536`, with `unless-exists=/` so
-that only a `start` ever runs it, and an hour's timeout. Starting the
-application's unit grants the human nothing it could not do by asking
-for a terminal, and the update runs as the application's account, so
-neither is an elevation (principle 7). A polled root worker reading a
+application its registry holds, whose unit the image names after it.
+Root keeps at most one start of each unit in flight and 16 in all, and
+answers at once (`84`). On a live boot it is refused, since that session
+runs only the installer. The launcher sends `0d` when an installed
+application's card entry finds no window; the card lists only what
+root's installed set says is installed (td-compositor/DESIGN.md, the
+launcher), and the control socket's `launch` refuses one root says is
+not. `0e`, which started the retired `firefox-update` unit from an
+update row beside the card, is retired: refused like any unknown
+request and never reassigned. A third, `0f NAME`, has root read that
+unit's td-svc state, so the bar shows the launch from the card's press
+until a window maps or the unit fails (td-compositor/DESIGN.md, the
+strip's LAUNCH cell); it is td-svc's state, and a launch that td-jail
+refuses reads as the unit failing. Starting the application's unit
+grants the human nothing it could not do by asking for a terminal, so it
+is not an elevation (principle 7). A polled root worker reading a
 FIFO, considered first, would have needed a second authenticated path;
 the compositor runs as its own uid, not the human's, so the request is
 the compositor's either way.
 
-**Nothing starts or fetches at boot.** A link from mail or news (§E row
-4) therefore opens only once the human has opened Firefox; letting the
-portal ask for the start would need an authority path of its own and is
-later work. The deployment init creates
+**Nothing starts, installs or fetches at boot.** A link from mail or
+news (§E row 4) therefore opens only once the human has opened
+Firefox; letting the portal ask for the start would need an authority
+path of its own and is later work. The deployment init creates
 `/run/td-applications-on-demand` on every boot that does not carry the
 autotest token, and on every live one. Firefox's unit names it in
 `unless-exists=`, so an ordinary boot skips Firefox and only a launch
 request starts it, and an oracle boot starts it. Its `restart=on-failure`
 retries a launch that failed, as one racing the session bus does, while a
-window the human closed stays closed. Under the token the oracle's
-applications fetch before they start, so their readiness deadlines
-measure a launch rather than a download: `firefox-fetch` runs `td-app
-update` as `tda65536`, bounded at 900 seconds, names the same path, and
-orders Firefox's evidence after it. Anywhere else the first launch
-fetches.
+window the human closed stays closed; a launch td-jail refuses as not
+installed fails the same way each time, and td-svc's backoff holds it.
+Under the token the oracle's applications are installed before they
+start, so their readiness deadlines measure a launch rather than a
+download: `firefox-fetch` runs root's `td-authd application-cache 1000
+firefox install`, the operation td-software's Install reaches, bounded
+at 900 seconds, names the same path, and orders Firefox after it. Then
+`software-evidence`, under the same token and path and bounded at 120
+seconds, drives td-software's request path as the human: `td-ctl install
+firefox` on the control socket, which the compositor forwards as `24`,
+then `td-ctl status firefox` until root reports that install's success
+and a later record naming `current`, and prints
+`TD-SOFTWARE-INSTALL-OK`, which every system boot oracle requires; it
+drives the control-socket verbs td-software sends rather than
+td-software's window. Anywhere else nothing installs until the owner
+asks.
 
 **The image no longer carries the payload.** The Firefox recipe is a
 declaration alone: no source, no payload, no steps, and the version
@@ -11372,8 +11396,8 @@ spec runs a `/td/store` application tree on a fetched runtime.
 
 **The QEMU oracles keep Firefox.** Most proofs of the jail, portals,
 audio, input, seccomp and network run through the autostarted Firefox
-(§H). Under the autotest token Firefox still starts at boot, and its
-first-run fetch uses a host feed as transport, named to the guest by a
+(§H). Under the autotest token Firefox still starts at boot, and the
+install before it uses a host feed as transport, named to the guest by a
 `td.feed=` token beside the autotest one (an oracle runs no VM bridge
 to name it): the integration
 tier's warm, `td-recipe-eval warm system-x86-64 --flathub`, runs
@@ -11433,7 +11457,12 @@ ninth); the oracles' own wiring lands with the cutover, which is the
 first thing that needs it. (10) Cutover: the declaration-only Firefox
 package, autostart and fetch only under the autotest token, the
 oracles' feed, and deletion of the pins, payloads
-and graph transfer (landed tenth).
+and graph transfer (landed tenth). (11) td-software's cutover
+(td-software/DESIGN.md §6.4): a launch fetches nothing and revalidates
+offline; the daily check beside a launch, td-app's throttle and unforced
+form, the launcher's update row, `0e` and `firefox-update` are gone; the
+oracles install through `application-cache` and drive td-software's
+request path.
 
 ## X. Host mode — development only
 

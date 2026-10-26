@@ -964,10 +964,6 @@ impl Scene {
         self.launcher.set_table(rows);
     }
 
-    pub(crate) fn set_update_application(&mut self, name: Option<&str>) {
-        self.launcher.set_update(name);
-    }
-
     pub(crate) fn set_installed(&mut self, installed: impl Fn(&str) -> Option<bool>) {
         self.launcher.set_installed(installed);
     }

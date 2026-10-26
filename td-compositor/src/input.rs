@@ -6857,7 +6857,6 @@ mod tests {
                 Bound::Launch(LaunchRequest::Dua) => "DISK USAGE",
                 Bound::Launch(LaunchRequest::Agent) => "CODING AGENT",
                 Bound::Launch(LaunchRequest::Software) => "SOFTWARE",
-                Bound::Launch(LaunchRequest::UpdateApplication) => "UPDATE",
                 Bound::Launch(LaunchRequest::Application(_)) => "APPLICATION",
                 Bound::Launch(LaunchRequest::Install(_)) => "INSTALL",
                 Bound::Launcher(_) | Bound::Pointer(_, Pointing::Launcher) => "OPEN LAUNCHER",

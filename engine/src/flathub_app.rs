@@ -1,4 +1,4 @@
-//! Flathub applications fetched on demand (APPLICATIONS.md §W.9): the
+//! Flathub applications, installed from td-software (APPLICATIONS.md §W.9): the
 //! reviewed declarations, the per-account cache layout, and the pure halves
 //! of admission.
 //!
