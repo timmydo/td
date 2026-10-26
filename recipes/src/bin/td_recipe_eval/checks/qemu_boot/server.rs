@@ -59,9 +59,19 @@ const HEALTH_STEADY_MARKER: &str = td_recipe::shared::SERVER_HEALTH_STEADY_MARKE
 /// The provisioned primary's name: not the image's default, so the boot
 /// shows the saved name was taken.
 const ACCOUNT: &str = "ada";
-/// The composed image's own account, so its boot shows the image's saved
-/// name was taken rather than an earlier volume's.
+/// Each published form's own account, so its boot shows the name it
+/// carries was taken rather than an earlier volume's.
 const IMAGE_ACCOUNT: &str = "grace";
+const ISO_ACCOUNT: &str = "hedy";
+/// A live boot's volume is half of RAM, as `qemu-boot-live` gives it.
+const LIVE_MEMORY_MIB: &str = "4096";
+
+/// The two forms `server-image` publishes.
+#[derive(Clone, Copy, PartialEq)]
+enum Published {
+    Disk,
+    Iso,
+}
 
 /// No display: nothing on a server draws. The direct-boot PC machine keeps
 /// its built-in i8042 keyboard controller, which only q35 can leave out.
@@ -338,7 +348,8 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         mkfs,
         btrfs,
     };
-    image_boot(runner, &qemu, &firmware, &inputs)?;
+    image_boot(runner, &qemu, &firmware, &inputs, Published::Disk)?;
+    image_boot(runner, &qemu, &firmware, &inputs, Published::Iso)?;
 
     println!(
         "PASS: server-x86-64 boots headless under qemu - an installed candidate boots pending, \
@@ -348,9 +359,9 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
          its provisioned key, on the host key the console reported, and is refused as root \
          and with another key; one whose every attempt fails health is rebooted by healthwatch \
          ({HEALTH_REBOOT_MARKER}, {SYSTEM_SHUTDOWN_MARKER}) until td-boot falls back to the \
-         previous deployment unattended; and the disk image server-image composes for its \
-         own account {IMAGE_ACCOUNT:?} cold-boots under UEFI firmware to the same steady \
-         state and logins. Every healthy boot reports the read-only root and \
+         previous deployment unattended; and the disk image and live medium server-image \
+         composes, each for its own account ({IMAGE_ACCOUNT:?}, {ISO_ACCOUNT:?}), cold-boot \
+         under UEFI firmware to the same steady state and logins. Every healthy boot reports the read-only root and \
          /etc, writable state, OpenSSH loopback ({SSHD_MARKER}) and root's refusal \
          ({ROOT_SSH_REFUSED_MARKER}), the userland and confinement probes, and no greeter, \
          compositor, session bus or application"
@@ -358,16 +369,35 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     Ok(())
 }
 
-/// Compose the published image for a provisioned account of its own and
-/// cold-boot it under firmware: the ESP's EFI-stub kernel and selector find
-/// the volume by the identity the image bound, with no command line from
-/// the host, and the account logs in over SSH.
+/// Compose a published form for a provisioned account of its own and
+/// cold-boot it under firmware, with no command line from the host. A disk's
+/// ESP kernel and selector find the volume by the identity the image bound;
+/// a live medium's selector authenticates the medium and its seed stages the
+/// signed provision into the RAM volume. Either way the account logs in over
+/// SSH.
 fn image_boot(
     runner: &RecipeCheckRunner,
     qemu: &str,
     (code, vars_template): &(PathBuf, PathBuf),
     inputs: &ImageInputs,
+    form: Published,
 ) -> Result<(), String> {
+    let (account, name, label, attachment, mem) = match form {
+        Published::Disk => (
+            IMAGE_ACCOUNT,
+            "server.img",
+            "image firmware boot",
+            FirmwareAttachment::Virtio,
+            SYSTEM_GUEST_MEMORY_MIB,
+        ),
+        Published::Iso => (
+            ISO_ACCOUNT,
+            "server.iso",
+            "live medium firmware boot",
+            FirmwareAttachment::Optical,
+            LIVE_MEMORY_MIB,
+        ),
+    };
     let dir = runner.scratch_dir().join("server-image");
     match fs::remove_dir_all(&dir) {
         Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
@@ -377,36 +407,45 @@ fn image_boot(
     }
     fs::create_dir(&dir).map_err(|error| format!("create {}: {error}", dir.display()))?;
     let client = dir.join("ssh-client");
-    let login = HostLogin::prepare(&client, STEM, IMAGE_ACCOUNT)?;
+    let login = HostLogin::prepare(&client, STEM, account)?;
     let trust = server_image::root_owned_trust(runner)?;
-    let disk = dir.join("server.img");
-    let id = server_image::compose(
-        inputs,
-        &trust,
-        login.account(),
-        server_image::DEFAULT_DISK_GIB * 1024 * 1024 * 1024,
-        Format::Raw,
-        &dir,
-        &disk,
-    )?;
+    let disk = dir.join(name);
+    let id = match form {
+        Published::Disk => server_image::compose(
+            inputs,
+            &trust,
+            login.account(),
+            server_image::DEFAULT_DISK_GIB * 1024 * 1024 * 1024,
+            Format::Raw,
+            &dir,
+            &disk,
+        )?,
+        Published::Iso => server_image::compose_iso(inputs, &trust, login.account(), &dir, &disk)?,
+    };
     let vars = dir.join("vars.fd");
     efi::copy_input(vars_template, &vars)?;
     println!(
-        "   [qemu-boot-server] firmware cold-boots the composed image {} (deployment {id})",
+        "   [qemu-boot-server] firmware cold-boots the composed {} {} (deployment {id})",
+        if form == Published::Iso {
+            "live medium"
+        } else {
+            "image"
+        },
         disk.display()
     );
-    let label = "image firmware boot";
     let result = boot_source(
         qemu,
         BootSource::Firmware {
             code,
             vars: &vars,
-            attachment: FirmwareAttachment::Virtio,
+            attachment,
             installation_target: None,
         },
         BootPlan {
-            disk: Some(BootDisk::new(&disk, false)),
-            mem: SYSTEM_GUEST_MEMORY_MIB,
+            // The live medium is read-only optical media and its boot writes
+            // to RAM; the disk image takes its own boot's writes.
+            disk: Some(BootDisk::new(&disk, form == Published::Iso)),
+            mem,
             target_marker: HEALTH_STEADY_MARKER,
             kill_on_marker: true,
             extra_append: "",
@@ -432,13 +471,33 @@ fn image_boot(
         "   [qemu-boot-server] {label} elapsed: {:.2}s",
         result.elapsed.as_secs_f64()
     );
-    validate_primary_selection(&result, label)?;
-    require_selected_deployment(
-        &result,
-        td_boot_protocol::SELECTED_CURRENT_MARKER,
-        &id,
-        label,
-    )?;
+    match form {
+        Published::Disk => {
+            validate_primary_selection(&result, label)?;
+            require_selected_deployment(
+                &result,
+                td_boot_protocol::SELECTED_CURRENT_MARKER,
+                &id,
+                label,
+            )?;
+        }
+        // A live selector selects no slot: it boots the medium's deployment
+        // onto a volume it formats in RAM, which the boot then finds.
+        Published::Iso => {
+            let on_ram = result.console.lines().any(|line| {
+                line.starts_with("TD-BOOT-VOLUME ") && line.trim_end().ends_with(" /dev/ram0")
+            });
+            let named = format!("{}{id} ", super::encrypted_boot::LIVE_DEPLOYMENT_PREFIX);
+            let booted = result.console.lines().any(|line| line.starts_with(&named));
+            if !on_ram || !booted {
+                return Err(format!(
+                    "the {label} did not boot deployment {id} from its RAM volume. Last \
+                     serial output:\n{}",
+                    tail(&result.console, 80)
+                ));
+            }
+        }
+    }
     let evidence = &result.evidence;
     let rebooted = result
         .console

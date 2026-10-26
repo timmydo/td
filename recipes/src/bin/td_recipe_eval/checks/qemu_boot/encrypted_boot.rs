@@ -74,7 +74,7 @@ const RESEAL_COMPLETE_PREFIX: &str = "td-boot: reseal complete: keyslot ";
 const REFUSED_ENTRY: &[u8] = b"12345";
 /// The live selector's cap and its handoff (MEDIA.md "Live boot").
 const LIVE_CAPPING: &str = "td-boot: capping PCR 12";
-const LIVE_DEPLOYMENT_PREFIX: &str = "td-boot: live deployment ";
+pub(super) const LIVE_DEPLOYMENT_PREFIX: &str = "td-boot: live deployment ";
 /// A load option the changed-load-option leg adds through a firmware boot
 /// entry; the EFI stub measures it into PCR 9.
 const LOAD_OPTION: &str = "td.oracle-load-option=1";

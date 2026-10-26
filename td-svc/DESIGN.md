@@ -1665,18 +1665,19 @@ could have written (td-login/TOKEN-LOGIN.md, "SSH"). The account has
 no password and no console login, and administration stays what
 APPLICATIONS.md §L.1 describes.
 
-td-recipe-eval's persistent-volume layout is the only writer of the
-pair; no installer or bundle stages it. It refuses
-any name the guest would refuse, which would leave the volume
-unreachable. That means one outside the guest's grammar, a reserved
-session or application form, or the name of another account or group
-in the image's tables. It also refuses any key line that is not one
-`ssh-ed25519` key without options. `qemu-boot-server` stages the
-account "ada" with a key made for the run. It logs in from the host
-over a loopback-only forward as that account with that key, and holds
-the host key the client accepted to the one the console reported. The
-same key must be refused as root, and a key the server was never given
-must be refused.
+td-recipe-eval's persistent-volume layout writes the pair, and
+td-boot's live seed stages it from a server medium's signed provision
+(td-install/MEDIA.md "Live boot"); no installer or bundle stages it.
+td-recipe-eval refuses any name the guest would refuse, which would
+leave the volume unreachable. That means one outside the guest's
+grammar, a reserved session or application form, or the name of
+another account or group in the image's tables. It also refuses any
+key line that is not one `ssh-ed25519` key without options.
+`qemu-boot-server` stages the account "ada" with a key made for the
+run. It logs in from the host over a loopback-only forward as that
+account with that key, and holds the host key the client accepted to
+the one the console reported. The same key must be refused as root,
+and a key the server was never given must be refused.
 
 `server-image` (`./build-server-image`) writes that volume into a disk
 image firmware boots, for one account: `--user` (default `$USER`) and
@@ -1699,9 +1700,17 @@ field. The kernel carries virtio and NVMe storage and virtio and e1000
 networking but not Hyper-V's or ENA's drivers, so no Azure or AWS
 instance boots the image yet. An existing output file is refused, and
 a finished image is published under its name only once complete.
-`qemu-boot-server` ends by composing an image for another account and
-a fresh key, cold-booting it under UEFI firmware with no command line
-from the host, and holding it to the steady state and the same logins.
+`--iso` writes the same server as a live medium instead: build-iso's
+medium of the server deployment, signed by the run key and carrying
+the account as a provision signed by that key too, which the live seed
+stages. It boots from optical or USB media with its volume in RAM, so
+a live server's host key and every write are lost at power-off. The
+volume is half of RAM: td-boot refuses a machine with less than 1 GiB,
+and the oracle boots it with 4 GiB. `qemu-boot-server` ends by
+composing an image and a live medium, each for another account and a
+fresh key, cold-booting each under UEFI firmware with no command line
+from the host, and holding both to the steady state and the same
+logins.
 
 ## 11. Evicting a previous supervisor's services
 

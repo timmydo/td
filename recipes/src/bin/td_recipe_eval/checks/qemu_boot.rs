@@ -3922,35 +3922,51 @@ impl RunTrust {
     /// candidates would leave the ordinary boot path unsigned — and the moment
     /// verification is fail-closed, refused.
     fn sign_deployment(&self, directory: &Path) -> Result<(), String> {
-        let manifest_path = directory.join(td_boot_protocol::MANIFEST_NAME);
-        let manifest = fs::read(&manifest_path)
-            .map_err(|e| format!("read manifest {}: {e}", manifest_path.display()))?;
-        let path = directory.join(td_boot_protocol::MANIFEST_SIG_NAME);
+        self.sign_file(
+            &directory.join(td_boot_protocol::MANIFEST_NAME),
+            &directory.join(td_boot_protocol::MANIFEST_SIG_NAME),
+        )
+    }
+
+    /// Write `input`'s detached signature to `path` as a hex line. A run key
+    /// signs any bytes; its callers sign only files whose first line names
+    /// their format, as a manifest and a provision do, and td-boot's format
+    /// checks keep one signature from standing for another kind of file. An
+    /// installation key signs manifests only, as its signer does.
+    pub(crate) fn sign_file(&self, input: &Path, path: &Path) -> Result<(), String> {
+        let bytes =
+            fs::read(input).map_err(|e| format!("read {} to sign: {e}", input.display()))?;
         match &self.signing {
             SigningIdentity::Throwaway(seed) => {
-                let signature = td_engine::ed25519_sign::sign(seed, &manifest)
-                    .ok_or_else(|| format!("sign manifest {}", manifest_path.display()))?;
-                fs::write(&path, hex_line(&signature))
+                let signature = td_engine::ed25519_sign::sign(seed, &bytes)
+                    .ok_or_else(|| format!("sign {}", input.display()))?;
+                fs::write(path, hex_line(&signature))
                     .map_err(|e| format!("write signature {}: {e}", path.display()))?;
             }
             SigningIdentity::Installation { signer, key, .. } => {
+                if !bytes.starts_with(td_boot_protocol::MANIFEST_HEADER) {
+                    return Err(format!(
+                        "{}: an installation key signs deployment manifests only",
+                        input.display()
+                    ));
+                }
                 let status = Command::new(signer)
                     .env_clear()
                     .args(["deploy", "sign"])
-                    .arg(&manifest_path)
+                    .arg(input)
                     .arg(key)
-                    .arg(&path)
+                    .arg(path)
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::null())
                     .status()
-                    .map_err(|e| format!("sign installation deployment: {e}"))?;
+                    .map_err(|e| format!("sign with the installation key: {e}"))?;
                 if !status.success() {
                     return Err(format!("installation signing failed ({status})"));
                 }
                 let signature = canonical_hex::<64>(
-                    &fs::read(&path).map_err(|e| format!("read installation signature: {e}"))?,
+                    &fs::read(path).map_err(|e| format!("read installation signature: {e}"))?,
                 )?;
-                if !td_engine::ed25519::verify(&self.public, &manifest, &signature) {
+                if !td_engine::ed25519::verify(&self.public, &bytes, &signature) {
                     return Err("installation signature does not match its selector key".into());
                 }
             }

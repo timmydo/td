@@ -25,9 +25,10 @@ mod primary_account;
 use encoding::from_base64;
 
 /// Seed-relative; the guest's `prepare-primary-profile` reads the first and
-/// its sshd policy names the second.
-const USERNAME: &str = "@var/lib/td/username";
-const AUTHORIZED_KEYS: &str = "@var/lib/td/authorized-keys";
+/// its sshd policy names the second. A live medium's seed takes the same pair
+/// from its provision.
+const USERNAME: &str = td_recipe::td_boot_protocol::PROVISIONED_NAME_PATH;
+const AUTHORIZED_KEYS: &str = td_recipe::td_boot_protocol::PROVISIONED_KEYS_PATH;
 pub(crate) const KEY_TYPE: &str = "ssh-ed25519";
 const MAX_KEYS: usize = 64;
 const MAX_COMMENT: usize = 256;
@@ -81,6 +82,23 @@ impl ProvisionedAccount {
 
     pub(crate) fn key_count(&self) -> usize {
         self.keys.len()
+    }
+
+    /// The account as a server medium carries it for td-boot's live seed
+    /// (td-install/MEDIA.md "Live boot"): the format line, `user NAME`, then
+    /// one line per key.
+    pub(crate) fn provision(&self) -> String {
+        let mut text = format!(
+            "{}{}{}\n",
+            td_recipe::td_boot_protocol::PROVISION_FORMAT,
+            td_recipe::td_boot_protocol::PROVISION_USER_PREFIX,
+            self.name
+        );
+        for key in &self.keys {
+            text.push_str(key);
+            text.push('\n');
+        }
+        text
     }
 
     /// Writes both files under `seed`, mode 0644 in directories of mode

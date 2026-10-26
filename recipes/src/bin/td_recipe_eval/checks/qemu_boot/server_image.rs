@@ -17,10 +17,10 @@ use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 
-use super::build_iso::{publish, refuse_stale, staged_path, Admitted};
+use super::build_iso::{live_medium, publish, refuse_stale, staged_path, Admitted, LiveMedium};
 use super::{
     build_btrfs_tools, build_system_stem, create_persistent_volume_layout, create_scratch_dir,
-    provision_selector, RunTrust, Scratch, VerifiedSelector, VolumeLayout, VolumePurpose,
+    media, provision_selector, RunTrust, Scratch, VerifiedSelector, VolumeLayout, VolumePurpose,
 };
 use crate::check_runner::RecipeCheckRunner;
 use crate::checks::provisioned_account::{check_keys, ProvisionedAccount, KEY_TYPE};
@@ -30,6 +30,7 @@ use td_recipe::td_boot_protocol as protocol;
 pub(crate) const STEM: &str = super::server::STEM;
 pub(crate) const DEFAULT_RAW_OUT: &str = "dist/td-server-x86-64.img";
 pub(crate) const DEFAULT_VHD_OUT: &str = "dist/td-server-x86-64.vhd";
+pub(crate) const DEFAULT_ISO_OUT: &str = "dist/td-server-x86-64.iso";
 const GIB: u64 = 1024 * 1024 * 1024;
 pub(crate) const DEFAULT_DISK_GIB: u64 = 8;
 const MAX_DISK_GIB: u64 = 2048;
@@ -52,24 +53,27 @@ pub(crate) struct ServerImageOptions {
     pub(crate) user: Option<String>,
     /// Public key files; the Ed25519 `~/.ssh/*.pub` when none are given.
     pub(crate) keys: Vec<PathBuf>,
+    /// The disk's size; an ISO has none of its own.
     pub(crate) disk_gib: u64,
-    pub(crate) vhd: bool,
+    pub(crate) format: Format,
 }
 
 pub(crate) fn usage() -> String {
     format!(
         "usage: server-image [--out FILE] [--user NAME] [--authorized-keys FILE]... \
-         [--size GIB] [--vhd]\n       \
+         [--size GIB] [--vhd | --iso]\n       \
          --out FILE              where to write the image (default {DEFAULT_RAW_OUT},\n       \
-         \x20                       or {DEFAULT_VHD_OUT} with --vhd); an existing file is\n       \
-         \x20                       refused\n       \
+         \x20                       {DEFAULT_VHD_OUT} with --vhd or {DEFAULT_ISO_OUT}\n       \
+         \x20                       with --iso); an existing file is refused\n       \
          --user NAME             the account SSH admits (default $USER)\n       \
          --authorized-keys FILE  OpenSSH {KEY_TYPE} public keys it admits; repeatable\n       \
          \x20                       (default every ~/.ssh/*.pub holding only {KEY_TYPE}\n       \
          \x20                       keys)\n       \
          --size GIB              the disk's size (default {DEFAULT_DISK_GIB})\n       \
          --vhd                   append a fixed-VHD footer, the disk format Azure\n       \
-         \x20                       takes and AWS imports (at most {MAX_VHD_GIB} GiB)"
+         \x20                       takes and AWS imports (at most {MAX_VHD_GIB} GiB)\n       \
+         --iso                   write a live medium instead, which boots the server\n       \
+         \x20                       from optical or USB media with its state in RAM"
     )
 }
 
@@ -78,7 +82,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<ServerImageOptions, String> 
     let mut user = None;
     let mut keys = Vec::new();
     let mut disk_gib = None;
-    let mut vhd = false;
+    let mut format = None;
     let mut rest = args.iter();
     while let Some(argument) = rest.next() {
         let mut value = |what: &str| {
@@ -88,7 +92,19 @@ pub(crate) fn parse_args(args: &[String]) -> Result<ServerImageOptions, String> 
         };
         let twice = || format!("{argument} given twice\n{}", usage());
         match argument.as_str() {
-            "--vhd" => vhd = true,
+            "--vhd" | "--iso" => {
+                let chosen = if argument == "--vhd" {
+                    Format::Vhd
+                } else {
+                    Format::Iso
+                };
+                if format.replace(chosen).is_some() {
+                    return Err(format!(
+                        "--vhd and --iso are given once, alone\n{}",
+                        usage()
+                    ));
+                }
+            }
             "--out" => {
                 if out.replace(PathBuf::from(value("a file")?)).is_some() {
                     return Err(twice());
@@ -116,23 +132,27 @@ pub(crate) fn parse_args(args: &[String]) -> Result<ServerImageOptions, String> 
             other => return Err(format!("unknown argument '{other}'\n{}", usage())),
         }
     }
+    let format = format.unwrap_or(Format::Raw);
+    if format == Format::Iso && disk_gib.is_some() {
+        return Err("--size sizes a disk; an ISO is sized by what it carries".into());
+    }
     let disk_gib = disk_gib.unwrap_or(DEFAULT_DISK_GIB);
-    if vhd && disk_gib > MAX_VHD_GIB {
+    if format == Format::Vhd && disk_gib > MAX_VHD_GIB {
         return Err(format!(
             "a fixed VHD describes at most {MAX_VHD_GIB} GiB, not {disk_gib}"
         ));
     }
-    let default_out = if vhd {
-        DEFAULT_VHD_OUT
-    } else {
-        DEFAULT_RAW_OUT
+    let default_out = match format {
+        Format::Raw => DEFAULT_RAW_OUT,
+        Format::Vhd => DEFAULT_VHD_OUT,
+        Format::Iso => DEFAULT_ISO_OUT,
     };
     Ok(ServerImageOptions {
         out: out.unwrap_or_else(|| PathBuf::from(default_out)),
         user,
         keys,
         disk_gib,
-        vhd,
+        format,
     })
 }
 
@@ -299,27 +319,35 @@ pub(crate) fn run(
         .disk_gib
         .checked_mul(GIB)
         .ok_or("the disk size overflows")?;
-    let format = if options.vhd {
-        Format::Vhd
-    } else {
-        Format::Raw
+    let id = match options.format {
+        Format::Iso => compose_iso(&inputs, &trust, account, &scratch.dir, &staged)?,
+        format => compose(
+            &inputs,
+            &trust,
+            account,
+            disk_bytes,
+            format,
+            &scratch.dir,
+            &staged,
+        )?,
     };
-    let id = compose(
-        &inputs,
-        &trust,
-        account,
-        disk_bytes,
-        format,
-        &scratch.dir,
-        &staged,
-    )?;
     drop(lock);
     publish(&staged, &options.out, Admitted::Absent)?;
+    let (what, boot) = match options.format {
+        Format::Iso => (
+            "a live medium".to_string(),
+            "Boot it under UEFI firmware from optical or USB media, with 4 GiB of RAM;\n            \
+             its state is lost at power-off.",
+        ),
+        _ => (
+            format!("{} GiB", options.disk_gib),
+            "Boot it under UEFI firmware with virtio or NVMe storage.",
+        ),
+    };
     println!(
-        "   [server-image] wrote {} (deployment {id}): {} GiB, account {:?} with {} SSH key(s).\n            \
-         Boot it under UEFI firmware with virtio or NVMe storage.",
+        "   [server-image] wrote {} (deployment {id}): {what}, account {:?} with {} SSH key(s).\n            \
+         {boot}",
         options.out.display(),
-        options.disk_gib,
         account.name(),
         account.key_count()
     );
@@ -358,6 +386,48 @@ pub(crate) fn root_owned_trust(runner: &RecipeCheckRunner) -> Result<RunTrust, S
 pub(crate) enum Format {
     Raw,
     Vhd,
+    /// A live medium (td-install/MEDIA.md "Live boot"), not a disk.
+    Iso,
+}
+
+/// Write the live medium to `out`, which must not exist, returning the
+/// deployment id: build-iso's medium of the server deployment, carrying the
+/// account as a provision signed under the run key, which td-boot's live
+/// seed stages into the RAM volume's `@var`.
+pub(crate) fn compose_iso(
+    inputs: &ImageInputs,
+    trust: &RunTrust,
+    account: &ProvisionedAccount,
+    scratch: &Path,
+    out: &Path,
+) -> Result<String, String> {
+    let LiveMedium {
+        id,
+        selector,
+        mut payloads,
+    } = live_medium(&inputs.selector, &inputs.deployment, scratch, trust)?;
+    let provision = scratch.join("provision");
+    fs::write(&provision, account.provision())
+        .map_err(|error| format!("write {}: {error}", provision.display()))?;
+    let signature = scratch.join("provision.sig");
+    trust.sign_file(&provision, &signature)?;
+    payloads.push((protocol::MEDIA_PROVISION_NAME, provision));
+    payloads.push((protocol::MEDIA_PROVISION_SIG_NAME, signature));
+    // The writer refuses an existing name; settled here, a failure after
+    // this can only be one the writer reached by creating `out` itself.
+    match fs::symlink_metadata(out) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("inspect {}: {error}", out.display())),
+        Ok(_) => return Err(format!("{} already exists", out.display())),
+    }
+    if let Err(error) = media::write_image_with_payloads(out, &inputs.kernel, &selector, &payloads)
+    {
+        // Nothing was there, so this removes only the writer's own
+        // publication, which its final sync can follow.
+        let _ = fs::remove_file(out);
+        return Err(error);
+    }
+    Ok(id)
 }
 
 /// Write the image to `out`, which must not exist, returning the
@@ -371,6 +441,9 @@ pub(crate) fn compose(
     scratch: &Path,
     out: &Path,
 ) -> Result<String, String> {
+    if format == Format::Iso {
+        return Err("a live medium is composed by compose_iso, not as a disk".into());
+    }
     let plan = DiskPlan::new(disk_bytes)?;
     let volume = scratch.join("server-image-volume.btrfs");
     let partition_bytes = plan.volume_bytes()?;
@@ -777,7 +850,7 @@ mod tests {
                 user: None,
                 keys: Vec::new(),
                 disk_gib: DEFAULT_DISK_GIB,
-                vhd: false,
+                format: Format::Raw,
             }
         );
         assert_eq!(
@@ -798,8 +871,12 @@ mod tests {
                 user: Some("ada".into()),
                 keys: vec![PathBuf::from("a.pub"), PathBuf::from("b.pub")],
                 disk_gib: 16,
-                vhd: true,
+                format: Format::Vhd,
             }
+        );
+        assert_eq!(
+            parse_args(&args(&["--iso"])).unwrap().out,
+            PathBuf::from(DEFAULT_ISO_OUT)
         );
         for bad in [
             vec!["--out"],
@@ -810,6 +887,9 @@ mod tests {
             vec!["--size", "8", "--size", "9"],
             vec!["--size", "1.5"],
             vec!["--size", "2041", "--vhd"],
+            vec!["--vhd", "--iso"],
+            vec!["--iso", "--iso"],
+            vec!["--iso", "--size", "8"],
             vec!["x.img"],
         ] {
             assert!(parse_args(&args(&bad)).is_err(), "{bad:?}");

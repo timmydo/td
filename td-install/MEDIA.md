@@ -422,21 +422,39 @@ deployment, its `manifest` and `manifest.sig`, `td/trusted.pub` holding the
 handed-off key as an installed volume holds its key, an empty `td/incoming`
 and `@var`, with directories 0755 and files 0644. A medium without a
 signature, or a handoff naming a key the deployment was not signed under, is
-refused before anything is staged. `mkfs.btrfs` formats `/dev/ram0` from
-that tree with the handed-off UUID, the `td-system` label and a writable
-`@var` subvolume, as td-install formats an installed volume. From `on-volume
-mount-root` on, the boot is the installed one: the volume is found by UUID,
-the root loop is already bound, `@var` is mounted, and the medium is moved
-to `/run/td-media` so it stays mounted under the loop. The live volume's
-`td/trusted.pub` is the key the running deployment was authenticated under,
-both before kexec and in `live-seed`, so a live installer can authenticate
-its source under the key that booted it. A live session has no bundled
-`td/source`, and everything it writes is lost at power-off. Its graphical
-session differs from an installed one in its windows: it opens the
-installer wizard and no other (INSTALLER.md "Live startup"), which
-`qemu-boot-live` proves on this medium, and td-authd binds its setup intake
-in place of the deployment intake. The live session is also what the
-installer's keyboard-console probe observes (ENCRYPTION.md
+refused before anything is staged.
+
+A server medium (td-svc/DESIGN.md §10, "Profiles") also carries
+`PROVISION` and its detached signature `PROVISION.SIG`, both or neither:
+the account the server admits. The file is the line `td-provision-v1`,
+then `user NAME`, then one or more `ssh-ed25519` key lines of printable
+ASCII, every line newline-terminated, at most 64 KiB. Its signature must
+verify under the handed-off key, and the name must be 1-32 lowercase
+letters, digits, `_` or `-`, starting with a letter, which is td-authd's
+grammar; td-firstboot also refuses a reserved or taken name at boot.
+Each key line is `ssh-ed25519`, a base64 blob and an optional comment.
+`live-seed` then stages the name in `@var/lib/td/username` and the key
+lines in `@var/lib/td/authorized-keys`, as an image's volume carries
+them, mode 0644 in directories of mode 0755 and, being formatted by PID
+1's initramfs, owned by root. The format line differs from a manifest's,
+so a provision signature cannot stand for a deployment's or the other
+way round. A provision that fails any check, or one of the pair alone,
+stages nothing and stops the live boot, as any `live-seed` refusal does.
+`mkfs.btrfs` formats `/dev/ram0` from that tree with the handed-off
+UUID, the `td-system` label and a writable `@var` subvolume, as
+td-install formats an installed volume. From `on-volume mount-root` on,
+the boot is the installed one: the volume is found by UUID, the root
+loop is already bound, `@var` is mounted, and the medium is moved to
+`/run/td-media` so it stays mounted under the loop. The live volume's
+`td/trusted.pub` is the key the running deployment was authenticated
+under, both before kexec and in `live-seed`, so a live installer can
+authenticate its source under the key that booted it. A live session has
+no bundled `td/source`, and everything it writes is lost at power-off.
+Its graphical session differs from an installed one in its windows: it
+opens the installer wizard and no other (INSTALLER.md "Live startup"),
+which `qemu-boot-live` proves on this medium, and td-authd binds its
+setup intake in place of the deployment intake. The live session is also
+what the installer's keyboard-console probe observes (ENCRYPTION.md
 "Activation"), which every plan records and which, with the TPM probe,
 chooses storage: it runs the kernel an installed selector runs, on the
 machine being installed.

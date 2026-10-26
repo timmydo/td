@@ -149,6 +149,26 @@ pub const MEDIA_DEPLOYMENT_FILES: [(&str, &str); 5] = [
     ("MANIFEST", "manifest"),
     ("MANIFEST.SIG", "manifest.sig"),
 ];
+// A server medium's provisioned primary account (td-svc/DESIGN.md §10,
+// "Profiles"), beside the deployment it boots and signed under the same key.
+// The file's first line names its format, as a manifest's does, so neither
+// signature can stand for the other. Lowercased when mounted.
+#[allow(dead_code)]
+pub const MEDIA_PROVISION_NAME: &str = "PROVISION";
+#[allow(dead_code)]
+pub const MEDIA_PROVISION_SIG_NAME: &str = "PROVISION.SIG";
+#[allow(dead_code)]
+pub const PROVISION_FORMAT: &str = "td-provision-v1\n";
+#[allow(dead_code)]
+pub const PROVISION_USER_PREFIX: &str = "user ";
+#[allow(dead_code)]
+pub const MAX_PROVISION_BYTES: u64 = 64 * 1024;
+// Where a volume seed holds the account: the name the primary takes and the
+// root-owned keys only a server's SSH policy names.
+#[allow(dead_code)]
+pub const PROVISIONED_NAME_PATH: &str = "@var/lib/td/username";
+#[allow(dead_code)]
+pub const PROVISIONED_KEYS_PATH: &str = "@var/lib/td/authorized-keys";
 
 // The DISK layout, stated here for D1's reason: `td-install` writes it and
 // td-boot reads what sits inside it, and a layout stated twice is a layout that

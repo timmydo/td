@@ -4088,6 +4088,9 @@ fn run_live_root(mountpoint: &Path, deployment_id: &str, loop_device: &Path) -> 
 /// refused. Everything is read and checked before anything is created, and
 /// `/init` has no retry, so a failed write leaving part of a tree is not a
 /// case to recover from.
+///
+/// A server medium's provisioned account, authenticated under the same key,
+/// is staged too, as an image's volume carries it.
 fn live_seed(medium: &Path, deployment_id: &str, seed: &Path, key: &TrustRoot) -> io::Result<()> {
     require_absolute(seed, "live seed")?;
     require_real_directory(medium, "install medium")?;
@@ -4102,6 +4105,7 @@ fn live_seed(medium: &Path, deployment_id: &str, seed: &Path, key: &TrustRoot) -
         .ok_or_else(|| invalid("install medium carries no deployment signature"))?;
     authenticate_manifest(&manifest, &signature, key)?;
     let signature = signature.into_bytes();
+    let provision = media_provision(medium, key)?;
     let deployment = format!("{}/{id}", protocol::DEPLOYMENTS_DIR);
     // `seed` first and alone may not exist yet: a stale tree would otherwise
     // become the volume's contents.
@@ -4128,18 +4132,154 @@ fn live_seed(medium: &Path, deployment_id: &str, seed: &Path, key: &TrustRoot) -
         ),
         (seed.join(protocol::VOLUME_TRUSTED_KEY), trusted.as_bytes()),
     ] {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)?;
-        file.write_all(bytes)?;
-        file.set_permissions(fs::Permissions::from_mode(0o644))?;
+        write_seed_file(&path, bytes)?;
+    }
+    if let Some(provision) = provision {
+        let name = seed.join(protocol::PROVISIONED_NAME_PATH);
+        let td = name
+            .parent()
+            .ok_or_else(|| invalid("the provisioned name has no directory"))?;
+        let lib = td
+            .parent()
+            .ok_or_else(|| invalid("the provisioned name has no directory"))?;
+        for directory in [lib, td] {
+            fs::create_dir(directory)?;
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o755))?;
+        }
+        write_seed_file(&name, format!("{}\n", provision.name).as_bytes())?;
+        write_seed_file(&seed.join(protocol::PROVISIONED_KEYS_PATH), &provision.keys)?;
+        writeln!(
+            mirror::stderr(),
+            "td-boot: live provision for {} ({} key(s))",
+            provision.name,
+            provision.keys.iter().filter(|byte| **byte == b'\n').count()
+        )?;
     }
     symlink(
         format!("{}{id}", protocol::SELECTOR_PREFIX),
         seed.join(protocol::BOOT_DIR).join(protocol::CURRENT_SLOT),
     )
+}
+
+fn write_seed_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(bytes)?;
+    file.set_permissions(fs::Permissions::from_mode(0o644))
+}
+
+/// A provisioned primary account: the name it takes and its key lines.
+#[derive(Debug, PartialEq)]
+struct Provision {
+    name: String,
+    keys: Vec<u8>,
+}
+
+/// The medium's provision, if it carries one, verified under `key`. A
+/// provision without its signature, or a signature without its provision,
+/// is refused rather than ignored.
+fn media_provision(medium: &Path, key: &TrustRoot) -> io::Result<Option<Provision>> {
+    let path = medium.join(protocol::MEDIA_PROVISION_NAME.to_ascii_lowercase());
+    let signature_path = medium.join(protocol::MEDIA_PROVISION_SIG_NAME.to_ascii_lowercase());
+    let present = |path: &Path| match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(io::Error::new(
+            error.kind(),
+            format!("{}: {error}", path.display()),
+        )),
+    };
+    match (present(&path)?, present(&signature_path)?) {
+        (false, false) => return Ok(None),
+        (true, true) => {}
+        _ => {
+            return Err(invalid(
+                "install medium carries only one of a provision and its signature",
+            ))
+        }
+    }
+    let bytes = read_bounded_real_file(
+        &path,
+        "install medium provision",
+        protocol::MAX_PROVISION_BYTES,
+    )?;
+    let signature = read_bounded_real_file(
+        &signature_path,
+        "provision signature",
+        protocol::MAX_SIGNATURE_BYTES,
+    )?;
+    let signature = decode_hex::<{ ed25519::SIGNATURE_LEN }>(
+        &signature,
+        "provision signature",
+        &signature_path,
+    )?;
+    if !ed25519::verify(key, &bytes, &signature) {
+        return Err(invalid(format!(
+            "{}: the provision, its signature and the trusted key do not agree",
+            path.display()
+        )));
+    }
+    parse_provision(&bytes).map(Some)
+}
+
+/// `td-provision-v1`, then `user NAME`, then one or more `ssh-ed25519` key
+/// lines, every line ending in a newline. The name is held to td-authd's
+/// grammar here, so a bad one stops the boot before anything is formatted;
+/// td-firstboot also refuses reserved and taken names at boot.
+fn parse_provision(bytes: &[u8]) -> io::Result<Provision> {
+    let body = std::str::from_utf8(bytes)
+        .ok()
+        .and_then(|text| text.strip_prefix(protocol::PROVISION_FORMAT))
+        .ok_or_else(|| invalid("a provision opens with its format line"))?;
+    let mut lines = body
+        .strip_suffix('\n')
+        .ok_or_else(|| invalid("a provision ends with a newline"))?
+        .split('\n');
+    let name = lines
+        .next()
+        .and_then(|line| line.strip_prefix(protocol::PROVISION_USER_PREFIX))
+        .filter(|name| {
+            (1..=32).contains(&name.len())
+                && name
+                    .bytes()
+                    .next()
+                    .is_some_and(|byte| byte.is_ascii_lowercase())
+                && name.bytes().all(|byte| {
+                    byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || matches!(byte, b'_' | b'-')
+                })
+        })
+        .ok_or_else(|| invalid("a provision's second line is `user NAME`"))?;
+    let mut keys = Vec::new();
+    for line in lines {
+        let blob = line
+            .strip_prefix("ssh-ed25519 ")
+            .and_then(|rest| rest.split(' ').next())
+            .filter(|blob| {
+                !blob.is_empty()
+                    && blob
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"+/=".contains(&byte))
+            });
+        if blob.is_none() || !line.bytes().all(|byte| (0x20..0x7f).contains(&byte)) {
+            return Err(invalid(
+                "a provision's key lines are printable ssh-ed25519 keys",
+            ));
+        }
+        keys.extend_from_slice(line.as_bytes());
+        keys.push(b'\n');
+    }
+    if keys.is_empty() {
+        return Err(invalid("a provision names at least one key"));
+    }
+    Ok(Provision {
+        name: name.to_owned(),
+        keys,
+    })
 }
 
 fn run_live_seed(mountpoint: &Path, deployment_id: &str, seed: &Path) -> io::Result<()> {
@@ -9681,6 +9821,187 @@ mod tests {
             "{error}"
         );
         assert!(!other.exists());
+    }
+
+    /// A third key, from a throwaway `td_engine::ed25519_sign` seed whose
+    /// private half was discarded, for the reason `FIXTURE_PUBLIC_KEY` is a
+    /// vector. It signs the default fixture manifest and `PROVISION_FIXTURE`,
+    /// so a provisioned medium authenticates end to end under one key.
+    /// Regenerate the three together if `fixture::manifest("")` changes.
+    const PROVISION_PUBLIC_KEY: &str =
+        "6ac7648991e5a7c2d9c86da5646870c6c77924eb67cc79ea0c9027440fbb6823";
+    const PROVISION_MANIFEST_SIGNATURE: &str =
+        "02ae15fbfcc1bbc4e74abcb612d497d2fa53c0ecb99dd967495c5f38252f86a6\
+         4112efdb42dab1470a22f5ab89823b5fca0b247e834a157640bc2bc318cd2d0b";
+    const PROVISION_SIGNATURE: &str =
+        "830f8704b8b330ac38d566aa9d7a1cd858bbd85fca07dc9faf74b42499337bbd\
+         ba91bd5a06266ae81bc172a768cdcf5f232dc0a5819d181b2d2b3f708721fa09";
+    const PROVISION_KEY_LINE: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl fixture";
+    const PROVISION_FIXTURE: &str = "td-provision-v1\nuser ada\nssh-ed25519 \
+        AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl fixture\n";
+
+    fn provision_key() -> TrustRoot {
+        decode_hex(
+            PROVISION_PUBLIC_KEY.as_bytes(),
+            "provision fixture key",
+            fixture_path(),
+        )
+        .unwrap()
+    }
+
+    /// The default medium, signed under the provision key and carrying a
+    /// provision signed under it too.
+    fn provisioned_medium(fixture: &Fixture) -> (PathBuf, String) {
+        let (medium, id) = media_bundle(fixture);
+        fs::write(
+            medium.join("manifest.sig"),
+            format!("{PROVISION_MANIFEST_SIGNATURE}\n"),
+        )
+        .unwrap();
+        fs::write(medium.join("provision"), PROVISION_FIXTURE).unwrap();
+        fs::write(
+            medium.join("provision.sig"),
+            format!("{PROVISION_SIGNATURE}\n"),
+        )
+        .unwrap();
+        (medium, id)
+    }
+
+    #[test]
+    fn a_live_seed_stages_a_provision_signed_under_its_key() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = Fixture::new();
+        let (medium, id) = provisioned_medium(&fixture);
+        let seed = fixture.root.join("seed");
+        live_seed(&medium, &id, &seed, &provision_key()).unwrap();
+        let mode = |relative: &str| {
+            fs::symlink_metadata(seed.join(relative))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777
+        };
+        assert_eq!(mode("@var/lib"), 0o755);
+        assert_eq!(mode("@var/lib/td"), 0o755);
+        for path in [
+            protocol::PROVISIONED_NAME_PATH,
+            protocol::PROVISIONED_KEYS_PATH,
+        ] {
+            assert_eq!(mode(path), 0o644, "{path}");
+        }
+        assert_eq!(
+            fs::read_to_string(seed.join(protocol::PROVISIONED_NAME_PATH)).unwrap(),
+            "ada\n"
+        );
+        assert_eq!(
+            fs::read_to_string(seed.join(protocol::PROVISIONED_KEYS_PATH)).unwrap(),
+            format!("{PROVISION_KEY_LINE}\n")
+        );
+
+        // A provision the key did not sign is refused before anything is
+        // staged, as a lone signature or a lone provision is.
+        let other = fixture.root.join("other-seed");
+        let provision = medium.join("provision");
+        fs::write(
+            &provision,
+            PROVISION_FIXTURE.replace("user ada", "user eve"),
+        )
+        .unwrap();
+        let error = live_seed(&medium, &id, &other, &provision_key())
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("do not agree"), "{error}");
+        assert!(!other.exists());
+        fs::remove_file(&provision).unwrap();
+        let error = live_seed(&medium, &id, &other, &provision_key())
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("only one of"), "{error}");
+        fs::write(&provision, PROVISION_FIXTURE).unwrap();
+        fs::remove_file(medium.join("provision.sig")).unwrap();
+        let error = live_seed(&medium, &id, &other, &provision_key())
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("only one of"), "{error}");
+        assert!(!other.exists());
+
+        // A deployment's manifest and signature verify under the key but
+        // are not a provision: the format line separates the two.
+        fs::copy(medium.join("manifest"), &provision).unwrap();
+        fs::copy(medium.join("manifest.sig"), medium.join("provision.sig")).unwrap();
+        let error = live_seed(&medium, &id, &other, &provision_key())
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("format line"), "{error}");
+        assert!(!other.exists());
+        // A provision that is not a regular file is refused, not followed.
+        fs::remove_file(&provision).unwrap();
+        fs::write(medium.join("elsewhere"), PROVISION_FIXTURE).unwrap();
+        std::os::unix::fs::symlink("elsewhere", &provision).unwrap();
+        fs::write(
+            medium.join("provision.sig"),
+            format!("{PROVISION_SIGNATURE}\n"),
+        )
+        .unwrap();
+        assert!(live_seed(&medium, &id, &other, &provision_key()).is_err());
+        assert!(!other.exists());
+    }
+
+    #[test]
+    fn a_provision_is_named_on_the_medium_as_the_writer_names_it() {
+        // Linux mounts ISO-9660 with `map=normal`, which lowercases names.
+        assert_eq!(
+            protocol::MEDIA_PROVISION_NAME.to_ascii_lowercase(),
+            "provision"
+        );
+        assert_eq!(
+            protocol::MEDIA_PROVISION_SIG_NAME.to_ascii_lowercase(),
+            "provision.sig"
+        );
+    }
+
+    #[test]
+    fn a_provision_parses_only_its_own_format() {
+        assert_eq!(
+            parse_provision(PROVISION_FIXTURE.as_bytes()).unwrap(),
+            Provision {
+                name: "ada".into(),
+                keys: format!("{PROVISION_KEY_LINE}\n").into_bytes(),
+            }
+        );
+        let two =
+            format!("td-provision-v1\nuser a_b-9\n{PROVISION_KEY_LINE}\n{PROVISION_KEY_LINE}\n");
+        assert_eq!(
+            parse_provision(two.as_bytes()).unwrap().keys.len(),
+            2 * (PROVISION_KEY_LINE.len() + 1)
+        );
+        let long = "a".repeat(33);
+        for bad in [
+            String::new(),
+            format!("td-deployment-v1\nuser ada\n{PROVISION_KEY_LINE}\n"),
+            format!("td-provision-v1\nuser ada\n{PROVISION_KEY_LINE}"),
+            format!("td-provision-v1\nuser ada\r\n{PROVISION_KEY_LINE}\n"),
+            format!("td-provision-v1\nuser ada\n{PROVISION_KEY_LINE}\r\n"),
+            format!("td-provision-v1\nuser Ada\n{PROVISION_KEY_LINE}\n"),
+            format!("td-provision-v1\nuser a/b\n{PROVISION_KEY_LINE}\n"),
+            format!("td-provision-v1\nuser \n{PROVISION_KEY_LINE}\n"),
+            format!("td-provision-v1\nuser {long}\n{PROVISION_KEY_LINE}\n"),
+            format!("td-provision-v1\nname ada\n{PROVISION_KEY_LINE}\n"),
+            "td-provision-v1\nuser ada\n".to_string(),
+            "td-provision-v1\nuser ada\nssh-rsa AAAA x\n".to_string(),
+            format!("td-provision-v1\nuser ada\n\n{PROVISION_KEY_LINE}\n"),
+            format!("td-provision-v1\nuser ada\n{PROVISION_KEY_LINE}\u{7}\n"),
+            format!("td-provision-v1\nuser ada\0\n{PROVISION_KEY_LINE}\n"),
+            format!("td-provision-v1\nuser 9ops\n{PROVISION_KEY_LINE}\n"),
+            format!("td-provision-v1\nuser -x\n{PROVISION_KEY_LINE}\n"),
+            format!("td-provision-v1\nuser _\n{PROVISION_KEY_LINE}\n"),
+            "td-provision-v1\nuser ada\nssh-ed25519 \n".to_string(),
+            "td-provision-v1\nuser ada\nssh-ed25519 not*base64 c\n".to_string(),
+        ] {
+            assert!(parse_provision(bad.as_bytes()).is_err(), "{bad:?}");
+        }
+        assert!(parse_provision(b"td-provision-v1\nuser ada\n\xff\n").is_err());
     }
 
     #[test]

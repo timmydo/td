@@ -38,8 +38,9 @@
 //!                         no build, signing, device access or live-profile creation
 //!   test-iso ISO [--usb]  interactively boot an ISO and disposable install disk
 //!   build-iso [--out FILE] [--force]  write a bootable td installation ISO
-//!   server-image [--out FILE] [--user NAME] [--authorized-keys FILE]... [--size GIB] [--vhd]
-//!                         write server-x86-64 to a UEFI disk image that admits
+//!   server-image [--out FILE] [--user NAME] [--authorized-keys FILE]... [--size GIB] [--vhd | --iso]
+//!                         write server-x86-64 to a UEFI disk image, or with
+//!                         --iso a live medium, that admits
 //!                         NAME (default $USER) over SSH with the given keys
 //!                         (default the Ed25519 ~/.ssh/*.pub)
 //!   bundle [--out DIR] [--raw] [--zlib] [--force]

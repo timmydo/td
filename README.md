@@ -266,6 +266,7 @@ firmware boots, reachable over SSH as one account:
                                      # admitting each ~/.ssh/*.pub of ssh-ed25519 keys
 ./build-server-image --vhd --user ada --authorized-keys ada.pub --size 16
                                      # a fixed VHD, the disk format Azure and AWS take
+./build-server-image --iso           # a live medium: the same server, state in RAM
 ```
 
 The image runs system services under td-svc and starts nothing graphical.
