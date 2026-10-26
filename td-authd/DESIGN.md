@@ -596,6 +596,7 @@ Subsequent payloads are exact byte records:
 | `0d` | `84` once root has started `/bin/td-svc start firefox` |
 | `0e` | `84` once root has started `/bin/td-svc start firefox-update` |
 | `0f` | `85` and the `firefox` unit's state as root last read it: `00` idle, `01` starting, `02` running, `03` failed, `04` unknown |
+| `24` plus a verb byte and an application name | an application cache request ("Application requests"): `86` once an operation started, or for status `87` and the last record |
 
 `0d` and `0e` create no handle. Root runs the fixed td-svc client itself,
 with the same cleared environment, `/` and null standard descriptors,
@@ -766,12 +767,12 @@ no passphrase prompt, since td-pinentry runs only on a host. A terminal
 start of td-agent with those variables has the same reach; the card
 adds a way to start.
 
-An authority older than one of requests `07` through `0f` closes the
-entire launch channel on it; its paired compositor then restarts. The image ships
+An authority older than one of requests `07` through `0f` or `24` closes
+the entire launch channel on it; its paired compositor then restarts. The image ships
 both peers atomically. Requests `07` through `0b` were additive within TDLA002,
 without negotiation or mixed-version compatibility. The login requests `1b` and
 `1c` came with the bump to TDLA003, because `1c` carries a PIN; `0c` through
-`0f` were added within it later. Both peers again ship together, without
+`0f` and `24` were added within it later. Both peers again ship together, without
 negotiation.
 
 For terminal requests it execs `/bin/td-term run --socket
@@ -929,8 +930,8 @@ one Flathub application's cache as that application's account
 (td-software/DESIGN.md §3, APPLICATIONS.md §W.9). OWNER is 1000; APP has
 the registry name grammar; VERB is exactly `install`, `update`,
 `remove`, `delete-data` or `status`. No caller supplies an executable,
-UID, path, ref or flag. Nothing invokes it yet: td-software's requests
-reach it through the compositor's private channel in a later increment.
+UID, path, ref or flag. td-software's requests reach it through the
+compositor's private channel ("Application requests" below).
 
 Startup requires root credentials, one thread, no controlling terminal
 and only the three standard descriptors. Unlike the launch authority's,
@@ -967,21 +968,108 @@ on every poll. At the bound root kills and reaps td-app; td-app's cache
 lock and generation leases make a killed run safe to repeat. The bound
 holds only while the operation lives: root carries no lifetime into
 td-app, so a caller that kills the operation early leaves td-app to
-finish its run under its own lock, and the caller must not. td-app's
+finish its run under its own lock, and the caller must not, except as
+a paired generation's end does ("Application requests"). td-app's
 lock blocks rather than refuses, so a second request for the same
 application waits behind a running check: a `remove` or `delete-data`
 issued during an hour's install can reach its ten minutes first and
-fail without changing anything. The forwarding increment therefore
-sends one request per application at a time and reads `status`
-progress first. The operation reaps td-app with a blocking wait, as
-`application-start`'s admission child does; a serving authority must
-run it as its own process rather than in its loop.
+fail without changing anything. Request `24` therefore runs one
+operation per application at a time and starts one only on a recent
+`status` that shows no writer. The operation reaps td-app with a
+blocking wait, as `application-start`'s admission child does; a serving
+authority must run it as its own process rather than in its loop.
 
 None of these is elevation (td-software/DESIGN.md §3): each runs the
 application's own account on its own cache or state, which a first
 launch and the forced check already did. The confinement test pins the
 one program, its argument shape, the order of parse, startup audit,
 admission and spawn, and no environment beyond the cleared one.
+
+## Application requests
+
+Request `24` is how td-software's requests, which it makes on the
+compositor's control socket (td-compositor/DESIGN.md §15, "Application
+requests"), reach the operation above. Its operands are one verb byte,
+`00` status, `01` install, `02` update, `03` remove or `04` delete-data,
+and the application name, the rest of the frame: one to 64 bytes in the
+registry grammar. Anything else, an empty name included, is a malformed
+request and ends the channel generation, as every other one does. The
+peer names nothing else: root runs `/bin/td-authd application-cache
+OWNER APP VERB`, with OWNER the configured human, through the same
+cleared spawn as every authority child (null stdin, `/`, no
+environment), and that operation's own admission is what checks the
+name against the immutable deployment and selects the account. A name
+the deployment does not hold fails there, and the failure is reported
+like any other.
+
+Root runs it as a process of its own and never waits on it in the
+serving loop, which is the operation's obligation above: the answer
+comes at once, and every later launch request or heartbeat reaps what
+has ended. For each name root holds at most one operation (install,
+update, remove or delete-data) at a time and at most one status read,
+so it sends one request per application at a time as the operation
+requires. It starts an operation only on its own last read of the
+name's status, ended in the last 30 seconds: a second operation while
+one runs, or one whose read shows a writer root did not start since
+(`0e`'s check, td-jail's on-demand check or a previous generation's
+operation, whose lock the new one would wait on), is refused with `ff
+01`; with no such read it is refused with `ff 05`. Either refusal
+starts a read, so the next request finds one; td-software asks a status
+far more often than that. A recent read that failed admits the
+operation: td-app cannot read a damaged cache's status, `remove` is
+what clears one, and the operation's own bound covers a wait on a lock
+the read could not show. It never kills an operation early: an
+operation is stopped only once it has outlived its own bound by a
+further minute, which the operation, killing td-app at its bound, never
+does, and an unreadable output ends only the reading. One that exits
+with its output held open by a process it left is taken as ended two
+seconds later, its output then possibly cut: a status is then no
+record, and another operation is reported as failed with the tail it
+had. A generation keeps at most 16 names, forgetting the least recently
+named one with nothing running and no request for two seconds to make
+room, and refuses with `ff 04` when none is: so a peer cycling names
+starts no more reads than 16 kept names allow. `ff 02` says root could
+not start the operation, and on a live boot, while `/run/td-media`
+exists, every `24` answers `ff 03`, as `0d` does.
+
+An operation answers `86` once started. A status answers
+
+```text
+87 OP LAST RESULT LENGTH REASON STATE [RECORD]
+```
+
+`OP` is the operation running now and `LAST` the last one that ended,
+each its verb byte (`00` is none, a status never being one); `RESULT` is
+`00` when it succeeded or none ended and `01` when it failed, when
+`LENGTH` (1 to 200) printable ASCII bytes of `REASON` follow: the
+operation's last diagnostic line without its `td-authd: ` prefix, as
+`reason_text` makes it printable. `STATE` is `00` while no read has
+finished, `01` and the record when the last read began no earlier
+than the last operation ended, `02` and the record when it began before
+(a new read is then under way), and `03` when the last read failed. The
+record is exactly what the operation printed, which root parses again
+with `flathub_app::Status`, requiring it to name the requested
+application and to fit the frame beside the header; one that does not
+reads as `03`. A status read starts when a status request finds none running and
+none begun in the last two seconds, or an operation has ended since the
+last began: each read walks the generations' deploys, so a peer polling
+faster is answered from the last read and costs no more walks.
+
+The serving loop's work per request is bounded: it reads at most 16 KiB
+from each running child, keeps a status record only up to the record's
+4 KiB bound and an operation's diagnostics only as their last 512
+bytes, and blocks only to reap a child it has just killed. Its rate is
+not: a peer can keep 16 names' operations and reads starting, each a
+root `application-cache` process, as fast as the control socket
+serves it, which costs the human's machine no more than any program
+the human runs. A paired
+generation's end, by either peer's exit, ends what root ran for it with
+the pair's cgroup, as a kill would: td-app, in its account's session
+cgroup, finishes its run under its lock, and td-app's lock and leases
+make the run safe to repeat. The next generation knows nothing of it
+but what td-app's status shows. None of this is elevation, for the
+operation's reason above; a human program reaching the control socket
+can run these operations, which td-software/DESIGN.md §3 accepts.
 
 ## Application filesystem grants
 
@@ -2761,7 +2849,9 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
     build, is answered `a0 00` before preparation or the slot is
     checked, so such a `20` never ends the generation. The private
     channel routes `20` to the paired session beside `10` to `1f`, and
-    still refuses `21` and above. Polls `11`, cancellation `15`,
+    routes `21`, the console power choice ("Physical console power"),
+    there too, and no request from `22` up: `24` is the program
+    authority's ("Application requests"). Polls `11`, cancellation `15`,
     presentation `13`, commit `14` and the secret request `1c` are a
     login operation's, with the same answers (`91 0b` while root waits
     for the worker's baseline, `91 03` to `91 06`, `91 0c`, `91 0d` and

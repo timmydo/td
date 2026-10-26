@@ -586,7 +586,12 @@ fn run_compositor(options: RunOptions) -> Result<(), String> {
     // answered on it. A caller was then told, with authority, whatever the
     // incumbent said.
     if let Some(path) = options.control_socket.as_deref() {
-        control::serve(path, Arc::clone(&runtime), socket_policy)?;
+        control::serve(
+            path,
+            Arc::clone(&runtime),
+            socket_policy,
+            task_launcher.clone(),
+        )?;
     }
     // The writer every compositor-owned selection is served through, the VM
     // bridge's imported text and Print's picture. Reported, never fatal: a
@@ -1179,7 +1184,7 @@ mod confinement {
     const SYS: &str = include_str!("sys.rs");
     const SCM: &str = include_str!("../../td-secret/src/scm.rs");
     const DRM: &str = include_str!("drm.rs");
-    const AUTHORITY_FINGERPRINT: u64 = 0x08b83a7a836cf1c2;
+    const AUTHORITY_FINGERPRINT: u64 = 0x3711319d01544dc9;
     const AUTH_SYS_FINGERPRINT: u64 = 0x42363c39df98214d;
     const AUTH_CHANNEL_FINGERPRINT: u64 = 0xdf20e4130b2d96e2;
     const AUTHORITY: &str = include_str!("authority.rs");
@@ -2445,7 +2450,9 @@ pub struct MappedRegion {
         // feature dead in the image with every test green. Pinned in the
         // source, as this crate pins what the compiler cannot see.
         assert!(
-            production(MAIN).contains("control::serve(path, Arc::clone(&runtime), socket_policy)?"),
+            production(MAIN).contains(
+                "control::serve(\n            path,\n            Arc::clone(&runtime),\n            socket_policy,\n            task_launcher.clone(),\n        )?;"
+            ),
             "run_compositor no longer starts the control listener"
         );
         assert_eq!(

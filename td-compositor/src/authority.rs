@@ -58,6 +58,176 @@ enum Work {
     Secret(std::sync::Arc<crate::secret_client::Attempt>),
 }
 
+/// A control-socket application request and where its answer goes. It
+/// waits in a queue of its own, which the worker takes from after the
+/// physical queue, so a program on the control socket never holds the
+/// slot physical input's requests need.
+type CacheWork = (CacheVerb, String, SyncSender<CacheAnswer>);
+
+/// What td-software asks root of one application's cache, as request
+/// `24` (td-authd/DESIGN.md, "Application requests"): its status, or one
+/// of the four operations td-app runs as the application's account.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CacheVerb {
+    Status,
+    Install,
+    Update,
+    Remove,
+    DeleteData,
+}
+
+/// Each verb with its control-socket word and its byte in `24`.
+const CACHE_VERBS: &[(CacheVerb, &str, u8)] = &[
+    (CacheVerb::Status, "status", 0),
+    (CacheVerb::Install, "install", 1),
+    (CacheVerb::Update, "update", 2),
+    (CacheVerb::Remove, "remove", 3),
+    (CacheVerb::DeleteData, "delete-data", 4),
+];
+
+impl CacheVerb {
+    pub(crate) fn word(self) -> &'static str {
+        CACHE_VERBS
+            .iter()
+            .find(|(verb, _, _)| *verb == self)
+            .map_or("status", |(_, word, _)| word)
+    }
+
+    pub(crate) fn from_word(word: &str) -> Option<Self> {
+        CACHE_VERBS
+            .iter()
+            .find(|(_, known, _)| *known == word)
+            .map(|(verb, _, _)| *verb)
+    }
+
+    fn byte(self) -> u8 {
+        CACHE_VERBS
+            .iter()
+            .find(|(verb, _, _)| *verb == self)
+            .map_or(0, |(_, _, byte)| *byte)
+    }
+
+    /// An operation's byte in `87`: `00` is none, and status is never one.
+    fn operation(byte: u8) -> Result<Option<Self>, String> {
+        match CACHE_VERBS.iter().find(|(_, _, known)| *known == byte) {
+            Some((CacheVerb::Status, _, _)) => Ok(None),
+            Some((verb, _, _)) => Ok(Some(*verb)),
+            None => Err("invalid application request answer".into()),
+        }
+    }
+}
+
+/// The most refusal bytes `87` carries.
+const CACHE_REASON_BYTES: usize = 200;
+
+/// What root last read of an application's status, as `87` says.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CacheRecord {
+    /// No read has finished yet.
+    Unread,
+    /// td-app's canonical record, read after the last operation ended.
+    Current(String),
+    /// The same, read before the last operation ended; a read is under way.
+    Older(String),
+    /// The last read failed.
+    Failed,
+}
+
+/// `87`'s answer: the operation running, the last one's outcome and its
+/// refusal, and the record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CacheStatus {
+    pub(crate) operation: Option<CacheVerb>,
+    pub(crate) last: Option<(CacheVerb, Option<String>)>,
+    pub(crate) record: CacheRecord,
+}
+
+/// Root's answer to `24`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CacheAnswer {
+    /// `86`: the operation started.
+    Started,
+    /// `ff 01`: an operation on the application runs already, root's or
+    /// one root's last read of its status shows.
+    Busy,
+    /// `ff 02`: root could not start it.
+    Unstarted,
+    /// `ff 03`: a live session runs only the installer.
+    Live,
+    /// `ff 04`: root follows as many applications as it keeps, all of
+    /// them in use.
+    Full,
+    /// `ff 05`: root has no recent read of the application's status to
+    /// start an operation on, and has begun one.
+    Unread,
+    Status(CacheStatus),
+}
+
+impl CacheAnswer {
+    /// Exactly `87`'s shape for a status, `86` for an operation, or a
+    /// refusal; anything else ends the paired generation.
+    fn decode(verb: CacheVerb, answer: &[u8]) -> Result<Self, String> {
+        let invalid = || "invalid application request answer".to_string();
+        match (verb, answer) {
+            (_, [0xff, 1]) => return Ok(Self::Busy),
+            (_, [0xff, 2]) => return Ok(Self::Unstarted),
+            (_, [0xff, 3]) => return Ok(Self::Live),
+            (_, [0xff, 4]) => return Ok(Self::Full),
+            (_, [0xff, 5]) => return Ok(Self::Unread),
+            (CacheVerb::Status, _) => {}
+            (_, [0x86]) => return Ok(Self::Started),
+            _ => return Err(invalid()),
+        }
+        let [0x87, operation, last, result, length, rest @ ..] = answer else {
+            return Err(invalid());
+        };
+        let operation = CacheVerb::operation(*operation)?;
+        let last = CacheVerb::operation(*last)?;
+        let (reason, rest) = rest
+            .split_at_checked(usize::from(*length))
+            .ok_or_else(invalid)?;
+        let printable = |bytes: &[u8]| bytes.iter().all(|b| (b' '..=b'~').contains(b));
+        let last = match (last, *result, reason) {
+            (None, 0, []) => None,
+            (Some(verb), 0, []) => Some((verb, None)),
+            (Some(verb), 1, reason)
+                if !reason.is_empty()
+                    && reason.len() <= CACHE_REASON_BYTES
+                    && printable(reason) =>
+            {
+                let reason = std::str::from_utf8(reason).map_err(|_| invalid())?;
+                Some((verb, Some(reason.to_string())))
+            }
+            _ => return Err(invalid()),
+        };
+        let [state, record @ ..] = rest else {
+            return Err(invalid());
+        };
+        let text = || -> Result<String, String> {
+            let lines = record.ends_with(b"\n")
+                && record
+                    .iter()
+                    .all(|b| *b == b'\n' || *b == b'\t' || (b' '..=b'~').contains(b));
+            if !lines {
+                return Err(invalid());
+            }
+            String::from_utf8(record.to_vec()).map_err(|_| invalid())
+        };
+        let record = match (*state, record) {
+            (0, []) => CacheRecord::Unread,
+            (1, _) => CacheRecord::Current(text()?),
+            (2, _) => CacheRecord::Older(text()?),
+            (3, []) => CacheRecord::Failed,
+            _ => return Err(invalid()),
+        };
+        Ok(Self::Status(CacheStatus {
+            operation,
+            last,
+            record,
+        }))
+    }
+}
+
 /// What root may be asked of the configured application's units
 /// (APPLICATIONS.md §W.9): start it, or check its Flathub cache now. The
 /// request names no unit; root holds both names.
@@ -189,6 +359,8 @@ impl Application {
 #[derive(Clone)]
 pub(crate) struct Launcher {
     send: SyncSender<Work>,
+    /// The control socket's application requests, apart from `send`.
+    control: SyncSender<CacheWork>,
     login: Login,
     hostnames: Hostnames,
     application: Application,
@@ -591,10 +763,11 @@ impl Launcher {
         let application = Application::default();
         let started = application.clone();
         let (send, receive) = mpsc::sync_channel(QUEUE_CAPACITY);
+        let (control, requests) = mpsc::sync_channel(QUEUE_CAPACITY);
         std::thread::Builder::new()
             .name("terminal-authority".into())
             .spawn(move || {
-                if let Err(error) = worker(wire, receive, poll, followed, started) {
+                if let Err(error) = worker(wire, receive, requests, poll, followed, started) {
                     let _ = writeln!(
                         std::io::stderr().lock(),
                         "td-compositor: program authority: {error}"
@@ -606,6 +779,7 @@ impl Launcher {
             .map_err(|e| format!("start program authority worker: {e}"))?;
         Ok(Self {
             send,
+            control,
             login,
             hostnames,
             application,
@@ -653,6 +827,24 @@ impl Launcher {
         }
     }
 
+    /// Queues an application request for `name`, already in the
+    /// registry's grammar; root's answer arrives on the receiver.
+    pub(crate) fn cache(
+        &self,
+        verb: CacheVerb,
+        name: &str,
+    ) -> Result<Receiver<CacheAnswer>, String> {
+        if !consent::application_name(name) {
+            return Err("invalid application name".into());
+        }
+        let (reply, answer) = mpsc::sync_channel(1);
+        match self.control.try_send((verb, name.to_string(), reply)) {
+            Ok(()) => Ok(answer),
+            Err(TrySendError::Full(_)) => Err("an application request is already pending".into()),
+            Err(TrySendError::Disconnected(_)) => Err("program authority is unavailable".into()),
+        }
+    }
+
     pub fn supervise(&self, request: Supervised) -> Result<(), String> {
         match self.send.try_send(Work::Supervised(request)) {
             Ok(()) => Ok(()),
@@ -673,22 +865,24 @@ impl Launcher {
 /// A launcher whose secret attempts wait in a queue a test takes them
 /// from, playing the worker itself.
 #[cfg(test)]
-pub(crate) struct Queued(Receiver<Work>);
+pub(crate) struct Queued(Receiver<Work>, Receiver<CacheWork>);
 
 #[cfg(test)]
 impl Queued {
     pub(crate) fn launcher() -> (Launcher, Self) {
         let (send, receive) = mpsc::sync_channel(QUEUE_CAPACITY);
+        let (control, requests) = mpsc::sync_channel(QUEUE_CAPACITY);
         let login = Login::default();
         (
             Launcher {
                 send,
+                control,
                 login,
                 hostnames: Hostnames::default(),
                 application: Application::default(),
                 connected: None,
             },
-            Self(receive),
+            Self(receive, requests),
         )
     }
 
@@ -697,6 +891,12 @@ impl Queued {
             Ok(Work::Supervised(request)) => Some(request),
             _ => None,
         }
+    }
+
+    /// An application request, waiting up to `wait`, with where its
+    /// answer goes.
+    pub(crate) fn cache(&self, wait: Duration) -> Option<CacheWork> {
+        self.1.recv_timeout(wait).ok()
     }
 
     pub(crate) fn attempt(&self) -> Option<std::sync::Arc<crate::secret_client::Attempt>> {
@@ -950,9 +1150,18 @@ fn supervise(
     Ok(error)
 }
 
+/// One application request: root answers at once, an operation running on
+/// as root's own process.
+fn cache(wire: &mut impl Exchange, verb: CacheVerb, name: &str) -> Result<CacheAnswer, String> {
+    let mut request = vec![0x24, verb.byte()];
+    request.extend_from_slice(name.as_bytes());
+    CacheAnswer::decode(verb, &wire.exchange(&request)?)
+}
+
 fn worker(
     mut wire: impl Exchange,
     receive: Receiver<Work>,
+    requests: Receiver<CacheWork>,
     mut login: LoginPoll,
     hostnames: Hostnames,
     application: Application,
@@ -976,6 +1185,11 @@ fn worker(
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return Err("launcher disconnected".into()),
+        }
+        // At most one control-socket request a turn, after physical work.
+        if let Ok((verb, name, reply)) = requests.try_recv() {
+            // A caller that stopped waiting is no failure of the channel.
+            let _ = reply.try_send(cache(&mut wire, verb, &name)?);
         }
         if let Some(error) = processes.poll(&mut wire)? {
             let _ = writeln!(std::io::stderr().lock(), "td-compositor: {error}");
@@ -1010,6 +1224,10 @@ mod tests {
             requests: Vec::new(),
             answers: answers.into(),
         }
+    }
+    /// A control queue nothing will ever send on.
+    fn idle() -> Receiver<CacheWork> {
+        mpsc::sync_channel(QUEUE_CAPACITY).1
     }
     fn handle(number: u64) -> Vec<u8> {
         let mut bytes = vec![0x81];
@@ -1662,6 +1880,7 @@ mod tests {
         assert!(worker(
             Shared(script.clone()),
             receive,
+            idle(),
             LoginPoll::new(Login::default()),
             Hostnames::default(),
             application.clone(),
@@ -1741,6 +1960,7 @@ mod tests {
         assert!(worker(
             Broken(calls.clone()),
             receive,
+            idle(),
             LoginPoll::new(Login::default()),
             Hostnames::default(),
             Application::default(),
@@ -1795,8 +2015,10 @@ mod tests {
     #[test]
     fn launcher_queue_never_blocks_input_or_retries_a_delivered_request() {
         let (send, receive) = mpsc::sync_channel(QUEUE_CAPACITY);
+        let (control, requests) = mpsc::sync_channel(QUEUE_CAPACITY);
         let launcher = Launcher {
             send,
+            control,
             login: Login::default(),
             hostnames: Hostnames::default(),
             application: Application::default(),
@@ -1814,7 +2036,189 @@ mod tests {
             Ok(Work::Program(Program::Task))
         ));
         assert!(receive.try_recv().is_err());
+        // A control-socket request waits apart: a full control queue
+        // leaves the physical one free, and the other way about.
+        assert!(launcher.cache(CacheVerb::Status, "firefox").is_ok());
+        assert!(launcher.cache(CacheVerb::Status, "firefox").is_err());
+        assert!(launcher.launch().is_ok());
+        assert!(launcher.cache(CacheVerb::Install, "firefox").is_err());
+        assert!(requests.try_recv().is_ok());
+        assert!(launcher.cache(CacheVerb::Install, "firefox").is_ok());
+        assert!(launcher.cache(CacheVerb::Install, "Firefox").is_err());
         drop(receive);
         assert!(launcher.launch().is_err());
+    }
+
+    /// A wire the test keeps, lent to a worker that takes its exchange by
+    /// value.
+    impl<T: Exchange> Exchange for &mut T {
+        fn send(&mut self, request: &[u8]) -> Result<(), String> {
+            (**self).send(request)
+        }
+        fn receive(&mut self) -> Result<Vec<u8>, String> {
+            (**self).receive()
+        }
+    }
+
+    const RECORD: &[u8] = b"format=1\nname=firefox\nkind=flathub\ncurrent=none\nprevious=none\n\
+checked=never\nrefused=none\nprogress=none\n";
+
+    #[test]
+    fn an_application_request_names_its_verb_byte_and_the_name() {
+        for (verb, word, byte) in CACHE_VERBS {
+            assert_eq!(CacheVerb::from_word(word), Some(*verb));
+            assert_eq!(verb.word(), *word);
+            assert_eq!(verb.byte(), *byte);
+        }
+        assert_eq!(CacheVerb::from_word("ready"), None);
+        let mut asked = wire(vec![vec![0x86]]);
+        assert_eq!(
+            cache(&mut asked, CacheVerb::DeleteData, "firefox").unwrap(),
+            CacheAnswer::Started
+        );
+        assert_eq!(asked.requests, [b"\x24\x04firefox".to_vec()]);
+        let (launcher, _queued) = Queued::launcher();
+        for bad in ["", "Firefox", "../firefox", "fire fox", &"a".repeat(65)] {
+            assert!(launcher.cache(CacheVerb::Status, bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn roots_application_answer_has_exactly_one_shape() {
+        let status = |head: &[u8], record: &[u8]| [head, record].concat();
+        let decode = |verb, bytes: &[u8]| CacheAnswer::decode(verb, bytes);
+        for verb in [
+            CacheVerb::Install,
+            CacheVerb::Update,
+            CacheVerb::Remove,
+            CacheVerb::DeleteData,
+        ] {
+            assert_eq!(decode(verb, &[0x86]), Ok(CacheAnswer::Started));
+            assert!(decode(verb, &[0x87, 0, 0, 0, 0, 0]).is_err());
+            assert!(decode(verb, &[0x86, 0]).is_err());
+        }
+        for verb in [CacheVerb::Status, CacheVerb::Install] {
+            assert_eq!(decode(verb, &[0xff, 1]), Ok(CacheAnswer::Busy));
+            assert_eq!(decode(verb, &[0xff, 2]), Ok(CacheAnswer::Unstarted));
+            assert_eq!(decode(verb, &[0xff, 3]), Ok(CacheAnswer::Live));
+            assert_eq!(decode(verb, &[0xff, 4]), Ok(CacheAnswer::Full));
+            assert_eq!(decode(verb, &[0xff, 5]), Ok(CacheAnswer::Unread));
+            assert!(decode(verb, &[0xff, 6]).is_err());
+        }
+        let text = String::from_utf8(RECORD.to_vec()).unwrap();
+        for (bytes, operation, last, record) in [
+            (
+                status(&[0x87, 0, 0, 0, 0, 0], b""),
+                None,
+                None,
+                CacheRecord::Unread,
+            ),
+            (
+                status(&[0x87, 1, 0, 0, 0, 1], RECORD),
+                Some(CacheVerb::Install),
+                None,
+                CacheRecord::Current(text.clone()),
+            ),
+            (
+                status(&[0x87, 0, 2, 0, 0, 2], RECORD),
+                None,
+                Some((CacheVerb::Update, None)),
+                CacheRecord::Older(text.clone()),
+            ),
+            (
+                status(&[0x87, 4, 3, 1, 4], b"lost\x03"),
+                Some(CacheVerb::DeleteData),
+                Some((CacheVerb::Remove, Some("lost".to_string()))),
+                CacheRecord::Failed,
+            ),
+        ] {
+            assert_eq!(
+                decode(CacheVerb::Status, &bytes),
+                Ok(CacheAnswer::Status(CacheStatus {
+                    operation,
+                    last,
+                    record
+                })),
+                "{bytes:02x?}"
+            );
+        }
+        let long = [&[0x87, 0, 1, 1, 201][..], &[b'x'; 201], &[0]].concat();
+        for bad in [
+            vec![],
+            vec![0x87],
+            vec![0x86],
+            vec![0x87, 0, 0, 0, 0],
+            // An operation or a last verb outside the four, a status as one.
+            vec![0x87, 5, 0, 0, 0, 0],
+            vec![0x87, 0, 9, 0, 0, 0],
+            // A refusal without a reason, a reason without one, a result
+            // with no verb, a result past `01`.
+            vec![0x87, 0, 1, 1, 0, 0],
+            status(&[0x87, 0, 1, 0, 1], b"x\x00"),
+            status(&[0x87, 0, 0, 1, 1], b"x\x00"),
+            vec![0x87, 0, 1, 2, 0, 0],
+            // A reason with a tab or a control, cut short, or too long.
+            status(&[0x87, 0, 1, 1, 2], b"a\t\x00"),
+            status(&[0x87, 0, 1, 1, 2], b"a\x1b\x00"),
+            status(&[0x87, 0, 1, 1, 9], b"short"),
+            long,
+            // A state past `03`, a record where none belongs, none where
+            // one does, one without its newline or with a control.
+            vec![0x87, 0, 0, 0, 0, 4],
+            status(&[0x87, 0, 0, 0, 0, 0], RECORD),
+            status(&[0x87, 0, 0, 0, 0, 3], RECORD),
+            vec![0x87, 0, 0, 0, 0, 1],
+            status(&[0x87, 0, 0, 0, 0, 1], b"format=1"),
+            status(&[0x87, 0, 0, 0, 0, 1], b"format=1\x1b\n"),
+            status(&[0x87, 0, 0, 0, 0, 2], b"\xc3\xa9\n"),
+        ] {
+            assert!(decode(CacheVerb::Status, &bad).is_err(), "{bad:02x?}");
+        }
+    }
+
+    #[test]
+    fn the_worker_answers_an_application_request_once_and_carries_on() {
+        let (send, receive) = mpsc::sync_channel(QUEUE_CAPACITY);
+        let (control, requests) = mpsc::sync_channel(QUEUE_CAPACITY);
+        let (reply, answer) = mpsc::sync_channel(1);
+        assert!(control
+            .try_send((CacheVerb::Install, "firefox".into(), reply))
+            .is_ok());
+        // The physical queue's request goes to root first.
+        assert!(send.try_send(Work::Supervised(Supervised::Update)).is_ok());
+        drop(send);
+        let mut script = wire(vec![vec![0x84], vec![0x86], vec![0x83], vec![0x9f, 0, 0]]);
+        assert!(worker(
+            &mut script,
+            receive,
+            requests,
+            LoginPoll::new(Login::default()),
+            Hostnames::default(),
+            Application::default(),
+        )
+        .is_err());
+        assert_eq!(answer.try_recv(), Ok(CacheAnswer::Started));
+        assert_eq!(
+            script.requests,
+            [vec![0x0e], b"\x24\x01firefox".to_vec(), vec![3], vec![0x1f]]
+        );
+        // A malformed answer ends the generation.
+        let (send, receive) = mpsc::sync_channel::<Work>(QUEUE_CAPACITY);
+        let (control, requests) = mpsc::sync_channel(QUEUE_CAPACITY);
+        let (reply, _answer) = mpsc::sync_channel(1);
+        assert!(control
+            .try_send((CacheVerb::Status, "firefox".into(), reply))
+            .is_ok());
+        let error = worker(
+            wire(vec![vec![0x86]]),
+            receive,
+            requests,
+            LoginPoll::new(Login::default()),
+            Hostnames::default(),
+            Application::default(),
+        )
+        .unwrap_err();
+        assert!(error.contains("application request answer"), "{error}");
+        drop(send);
     }
 }

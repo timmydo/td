@@ -5192,7 +5192,9 @@ is how a PROGRAM does. `td-ctl` is a third name for the compositor artifact,
 selected by argv[0] beside `td-ui-demo`, and what it does is
 write one line to a Unix socket and print what comes back.
 
-The normal deployment channel remains layout-only. Disposable `headless`
+The normal deployment channel orders the layout and, with the paired
+authority, carries td-software's application requests ("Application
+requests" below). Disposable `headless`
 sessions also offer separately enabled input and public capture, specified in
 [AUTOMATION.md](AUTOMATION.md). Neither grant can be enabled by a request or
 reach physical-origin trusted attention.
@@ -5643,14 +5645,88 @@ ordinary session, so retaining below it would have stored an app id only on
 the boot-observer path and left the report empty exactly where a caller uses
 it.
 
+### Application requests
+
+td-software (td-software/DESIGN.md) asks for an application's cache and
+operations here, and the compositor forwards each over its private channel
+to root td-authd as request `24` (td-authd/DESIGN.md, "Application
+requests"). The six requests each name one application in the registry
+grammar, one to 64 lowercase letters, digits, `.`, `_` and `-`, first a
+letter:
+
+- `status NAME`: root's last read of the application's status and what
+  root is running on it;
+- `install NAME` and `update NAME`: have root run the application's
+  forced check, which install and update both are;
+- `remove NAME` and `delete-data NAME`: have root remove its payload,
+  keeping its data, or delete the data of a removed application;
+- `launch NAME`: what the card's application entry does, for the
+  application the image configured with `--launcher-application` alone:
+  raise its mapped window, or ask root with `0d` to start its unit and
+  show the launch on the bar. Any other name is refused as having no
+  launcher entry; starts by name are td-software/DESIGN.md §6's third
+  increment. Behind the lock surface, where the card cannot be pressed,
+  it is an `error`. Its `ok` is the press handled: a window raised, `0d`
+  queued for the worker, or a launch already pending joined; an `0d`
+  the worker's queue could not take is an `unavailable`.
+
+The compositor validates the name and names nothing else; root, not the
+compositor, holds the account, the program and the deployment check. An
+operation is answered `ok` once root has started it: it runs on as root's
+own process, so the answer says nothing of how it ends, and a caller asks
+`status` to learn. A second operation on a name while one runs, or while
+root's last read of its status shows another writer at work, is an
+`error`, as is a live session's request; root's want of a recent read to
+start one on, or of room among the names it follows, is an
+`unavailable` to ask again shortly. A status answers `ok` and a body
+of three lines and then td-app's record as root relayed it:
+
+```text
+operation=none|install|update|remove|delete-data
+last=none|VERB<TAB>ok|VERB<TAB>failed<TAB>REASON
+record=unread|current|older|failed
+```
+
+`operation` is what root runs on the name now, `last` the last operation
+that ended and its refusal, and `record` whether a record follows and
+whether it was read after that operation ended (`current`) or before
+(`older`, while a new read runs). The compositor checks root's answer's
+shape, the record only as newline-ended printable lines; td-software
+parses the record itself. A malformed answer ends the paired generation,
+as every malformed private-channel answer does. `td-ctl status NAME`
+prints that body, read to at most 8 KiB.
+
+The control thread does not hold the runtime lock while it waits. It
+hands the request to the authority worker through a capacity-one queue
+of its own, so a full queue is an `unavailable`; the worker takes one
+such request a turn, after the physical queue's, so a program on the
+control socket cannot hold the slot that secret attempts and keyboard
+launches need. It waits for the worker's answer for at most three
+seconds, inside the conversation's five, less half a second to write
+it. A request the wait gave up on may still have reached root,
+which is why an operation's outcome is read from `status` and never
+inferred from the conversation. `launch` takes the runtime lock as the
+card's press does. Without the paired authority, as in a direct
+development session, every application request is an `error`.
+
+The control socket admits only the human's kernel credentials, so any
+program running as the human can make these requests, and the
+repository user accepted that in exchange for no secure prompt
+(td-software/DESIGN.md §3, §7): such a program can start a download,
+remove an application's payload or delete an application's data, never
+reach the human's files, a system location or another account. td-ui's
+confirmation dialog in td-software guards against a slip, not against
+that program.
+
 ### What it deliberately is not
 
 It does not subscribe, so there is no event stream to keep in sync and no
 second consumer of layout changes to keep the first honest about; a caller
-that wants to know when something changed asks again. It does not create,
-close or kill windows: a control channel that could remove a client's window
-would be an authority over other programs rather than over the arrangement of
-them.
+that wants to know when something changed asks again. It does not close or
+kill windows: a control channel that could remove a client's window would be
+an authority over other programs rather than over the arrangement of them.
+The one way it starts a program is `launch`, above, which is the card's own
+activation of the configured application.
 
 It does not let a caller name a window by anything the CALLER chose. The two
 names it accepts are the compositor's own handle and, for matching, the id the
@@ -5689,6 +5765,12 @@ terminal launches and the application's two supervised requests, the
 private VM bridge may submit a fixed task-terminal launch, and physical
 input submits secret attempts through a capacity-one nonblocking queue; an
 already-pending request is a reported refusal, never an input-thread wait.
+The control socket's thread submits td-software's application requests
+(`24`, §15 "Application requests") through a second capacity-one queue,
+which the worker takes from once a turn after the first, so control work
+never fills the slot physical input needs. An application request
+carries a one-slot reply the worker answers once, without waiting,
+whether or not the control thread still listens.
 The worker serializes starts and polls one retained handle per loop iteration.
 It waits at most 250 ms for a new request before polling; sustained launches
 can poll sooner, and each wire exchange spends its bounded deadline. It sends

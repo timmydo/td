@@ -727,6 +727,9 @@ pub struct Runtime {
     application_outcome: Option<crate::authority::Application>,
     /// The configured application's name as its card shows it.
     application_label: Option<String>,
+    /// The configured application's registry name, which a control
+    /// `launch` names.
+    application_name: Option<String>,
     /// A launch from the card waiting for its window.
     launch: Option<crate::launcher::PendingLaunch>,
     backlight: Option<td_backlight::Panel>,
@@ -955,6 +958,7 @@ impl Runtime {
             notice_until: None,
             application_outcome: None,
             application_label: None,
+            application_name: None,
             launch: None,
             backlight: None,
             foreign_exports: BTreeMap::new(),
@@ -1066,6 +1070,7 @@ impl Runtime {
     }
 
     pub(crate) fn set_launcher_application(&mut self, application: Option<&str>) {
+        self.application_name = application.map(str::to_string);
         self.application_label = application.map(str::to_ascii_uppercase);
         self.scene.set_launcher_application(application);
     }
@@ -3484,6 +3489,11 @@ impl Runtime {
             self.repaint()?;
         }
         Ok(())
+    }
+
+    /// The configured application's name, when the card has one.
+    pub(crate) fn launcher_application(&self) -> Option<&str> {
+        self.application_name.as_deref()
     }
 
     /// Whether a mapped window matches the configured application.

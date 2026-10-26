@@ -153,6 +153,13 @@ fn the_caller_can_only_start_poll_or_keep_the_channel_alive() {
         Request::Supervised(Supervised::Update)
     );
     assert_eq!(request(&[0x0f]).unwrap(), Request::UnitState);
+    assert_eq!(
+        request(b"\x24\x01firefox").unwrap(),
+        Request::Software(crate::software::Request {
+            verb: crate::application_cache::Verb::Install,
+            name: "firefox".into(),
+        })
+    );
     assert_eq!(request(&[3]).unwrap(), Request::Heartbeat);
     let mut poll = vec![2];
     poll.extend_from_slice(&17u64.to_be_bytes());
@@ -176,6 +183,10 @@ fn the_caller_can_only_start_poll_or_keep_the_channel_alive() {
         vec![0x0d, 0],
         vec![0x0e, 0],
         vec![0x0f, 0],
+        vec![0x24],
+        vec![0x24, 1],
+        b"\x24\x05firefox".to_vec(),
+        b"\x24\x01/bin/sh".to_vec(),
         vec![2],
         vec![2, 0],
         vec![2; 10],

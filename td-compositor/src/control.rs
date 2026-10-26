@@ -27,6 +27,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::authority::{CacheAnswer, CacheRecord, CacheVerb};
 use crate::layout::{Command, Direction, Presentation, Rect, FINAL_WORKSPACE, INITIAL_WORKSPACE};
 use crate::reportable::reportable;
 use crate::runtime::{Runtime, Sent};
@@ -135,6 +136,47 @@ pub enum Request {
         hold: u64,
         action: ClipboardAction,
     },
+    /// td-software's: an application cache request root runs for a name
+    /// in the registry's grammar, which root admits against the
+    /// deployment (td-software/DESIGN.md §3).
+    Application {
+        verb: CacheVerb,
+        name: ApplicationName,
+    },
+    /// Raise the named application's window, or ask root to start it, as
+    /// its card entry does.
+    Launch(ApplicationName),
+}
+
+/// An application name as a request carries it: the registry's grammar,
+/// at most 64 bytes, held by value so a request stays `Copy`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ApplicationName {
+    bytes: [u8; 64],
+    length: u8,
+}
+
+impl ApplicationName {
+    fn parse(word: Option<&str>, verb: &str) -> Result<Self, String> {
+        let word = word.ok_or_else(|| format!("'{verb}' needs an application name"))?;
+        if !crate::authority::consent::application_name(word) {
+            return Err(format!("'{word}' is not an application name"));
+        }
+        let mut bytes = [0; 64];
+        bytes
+            .get_mut(..word.len())
+            .ok_or("application name is too long")?
+            .copy_from_slice(word.as_bytes());
+        let length = u8::try_from(word.len()).map_err(|_| "application name is too long")?;
+        Ok(Self { bytes, length })
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.bytes
+            .get(..usize::from(self.length))
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .unwrap_or_default()
+    }
 }
 
 /// The vocabulary, as one list, so the parser and the help text cannot drift:
@@ -219,6 +261,30 @@ pub const USAGE: &[(&str, &str)] = &[
         "clipboard-drop <session> <hold>",
         "discard an armed or held clipboard transfer",
     ),
+    (
+        "status <application>",
+        "report that application's cache and the operation root runs on it",
+    ),
+    (
+        "install <application>",
+        "have root install that Flathub application, answering at once",
+    ),
+    (
+        "update <application>",
+        "have root check that application's Flathub cache now",
+    ),
+    (
+        "remove <application>",
+        "have root remove that application, keeping its data",
+    ),
+    (
+        "delete-data <application>",
+        "have root delete a removed application's data",
+    ),
+    (
+        "launch <application>",
+        "raise that application's window, or have root start it",
+    ),
 ];
 
 impl Request {
@@ -283,6 +349,11 @@ impl Request {
                     ClipboardAction::Drop
                 },
             },
+            "status" | "install" | "update" | "remove" | "delete-data" => Request::Application {
+                verb: CacheVerb::from_word(verb).ok_or("no such application request")?,
+                name: ApplicationName::parse(words.next(), verb)?,
+            },
+            "launch" => Request::Launch(ApplicationName::parse(words.next(), verb)?),
             other => return Err(format!("no such request '{other}'; try 'help'")),
         };
         // Refused rather than ignored: a caller spelling an argument this verb
@@ -349,6 +420,8 @@ impl Request {
             Request::MoveWindow(handle, direction) => {
                 format!("move {} {}", handle_word(handle), direction_word(direction))
             }
+            Request::Application { verb, name } => format!("{} {}", verb.word(), name.as_str()),
+            Request::Launch(name) => format!("launch {}", name.as_str()),
         }
     }
 }
@@ -853,6 +926,10 @@ pub fn apply(runtime: &mut Runtime, request: Request) -> Result<Answer, String> 
         | Request::ReleaseKeys { .. }
         | Request::Pointer { .. }
         | Request::ReleaseInput { .. } => return Ok(Answer::InputDisabled),
+        // Answered beside the authority, which this path does not have.
+        Request::Application { .. } | Request::Launch(_) => {
+            return Ok(Answer::ApplicationsDisabled)
+        }
         Request::Workspace(number) => Command::SwitchWorkspace(number),
         Request::Send(number) => Command::MoveToWorkspace(number),
         Request::Focus(direction) => Command::Focus(direction),
@@ -913,6 +990,9 @@ pub fn apply(runtime: &mut Runtime, request: Request) -> Result<Answer, String> 
 pub enum Answer {
     Ok,
     InputDisabled,
+    /// An application request reached a compositor without the paired
+    /// authority, which alone can ask root.
+    ApplicationsDisabled,
     InputRefused(String),
     CaptureDisabled,
     Report(String),
@@ -1026,6 +1106,9 @@ fn answer_with_input(
         Ok(Answer::Ok) => "ok\n".to_string(),
         Ok(Answer::InputDisabled) => "error input automation is disabled\n".into(),
         Ok(Answer::CaptureDisabled) => "error capture automation is disabled\n".into(),
+        Ok(Answer::ApplicationsDisabled) => {
+            "error application requests need the paired authority\n".into()
+        }
         Ok(Answer::InputRefused(error)) => format!("error {error}\n"),
         Ok(Answer::Report(report)) => format!("ok\n{report}"),
         Ok(Answer::NoSuchWindow(handle)) => {
@@ -1063,6 +1146,7 @@ pub fn serve(
     path: &Path,
     runtime: Arc<Mutex<Runtime>>,
     policy: SocketPolicy,
+    authority: Option<crate::authority::Launcher>,
 ) -> Result<(), String> {
     socket::remove_stale(path, "control")?;
     let listener = UnixListener::bind(path)
@@ -1073,7 +1157,16 @@ pub fn serve(
     // refuses a thread, and this crate does not panic.
     thread::Builder::new()
         .name("td-control".to_string())
-        .spawn(move || accept(listener.incoming(), &runtime, policy))
+        .spawn(move || {
+            accept_with_input(
+                listener.incoming(),
+                &runtime,
+                policy,
+                None,
+                false,
+                authority.as_ref(),
+            )
+        })
         .map(|_| ())
         .map_err(|error| format!("start control listener {}: {error}", path.display()))
 }
@@ -1097,6 +1190,7 @@ pub(crate) fn serve_headless(
                 SocketPolicy::Private,
                 input_control.then(crate::input::AutomationSeat::default),
                 capture_control,
+                None,
             );
             completion.report(Err("headless control listener retired".into()));
         })
@@ -1107,20 +1201,13 @@ pub(crate) fn serve_headless(
 /// Takes the connections rather than the listener, for `socket::serve`'s
 /// reason: a bound on a run of failed accepts that no test can reach is a
 /// bound nobody can trust.
-fn accept(
-    connections: impl Iterator<Item = io::Result<UnixStream>>,
-    runtime: &Mutex<Runtime>,
-    policy: SocketPolicy,
-) {
-    accept_with_input(connections, runtime, policy, None, false);
-}
-
 fn accept_with_input(
     connections: impl Iterator<Item = io::Result<UnixStream>>,
     runtime: &Mutex<Runtime>,
     policy: SocketPolicy,
     mut seat: Option<crate::input::AutomationSeat>,
     capture: bool,
+    authority: Option<&crate::authority::Launcher>,
 ) {
     let mut consecutive = 0;
     for connection in connections {
@@ -1140,7 +1227,7 @@ fn accept_with_input(
         // answer, every wait it can do is bounded, and the alternative is a
         // thread per caller whose only purpose would be to let two callers
         // reorder each other's orders.
-        if let Err(error) = converse(stream, runtime, seat.as_mut(), capture) {
+        if let Err(error) = converse(stream, runtime, seat.as_mut(), capture, authority) {
             eprintln!("td-compositor: control: {error}");
         }
     }
@@ -1151,6 +1238,7 @@ fn converse(
     runtime: &Mutex<Runtime>,
     seat: Option<&mut crate::input::AutomationSeat>,
     capture: bool,
+    authority: Option<&crate::authority::Launcher>,
 ) -> Result<(), String> {
     // One deadline for the whole exchange. The socket timeouts stay, because
     // they are what unblocks a single stalled syscall; the deadline is what
@@ -1209,11 +1297,133 @@ fn converse(
             ),
         };
     }
+    // An application request is answered beside the authority, never
+    // under the runtime lock while it waits; without one, `apply` refuses.
+    if let (Ok(request @ (Request::Application { .. } | Request::Launch(_))), Some(authority)) =
+        (request, authority)
+    {
+        let reply = application_answer(runtime, authority, request, deadline);
+        return write_answer(&mut stream, reply.as_bytes(), deadline);
+    }
     let reply = match seat {
         Some(seat) => answer_with_input(runtime, &line, Some(seat)),
         None => answer(runtime, &line),
     };
     write_answer(&mut stream, reply.as_bytes(), deadline)
+}
+
+/// How long an application request waits for the authority worker's
+/// answer at most. Root answers at once and the worker takes the request
+/// within a turn of its loop; the conversation's deadline still bounds it,
+/// less a margin for writing the answer.
+const AUTHORITY_WAIT: Duration = Duration::from_secs(3);
+const ANSWER_MARGIN: Duration = Duration::from_millis(500);
+
+fn application_answer(
+    runtime: &Mutex<Runtime>,
+    authority: &crate::authority::Launcher,
+    request: Request,
+    deadline: Instant,
+) -> String {
+    match request {
+        Request::Launch(name) => launch_answer(runtime, authority, name.as_str()),
+        Request::Application { verb, name } => {
+            let wait = deadline
+                .saturating_duration_since(Instant::now())
+                .saturating_sub(ANSWER_MARGIN)
+                .min(AUTHORITY_WAIT);
+            let answer = match authority.cache(verb, name.as_str()) {
+                Ok(answer) => answer.recv_timeout(wait),
+                Err(error) => return format!("unavailable {error}\n"),
+            };
+            match answer {
+                Ok(answer) => cache_answer(name.as_str(), answer),
+                // Sent or not, root may have started it: its status says.
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    "unavailable the program authority did not answer in time\n".into()
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    "unavailable the program authority is unavailable\n".into()
+                }
+            }
+        }
+        _ => "unavailable not an application request\n".into(),
+    }
+}
+
+/// The configured application's card activation, asked by name: raise its
+/// window, or have root start its unit and show the launch on the bar.
+fn launch_answer(
+    runtime: &Mutex<Runtime>,
+    authority: &crate::authority::Launcher,
+    name: &str,
+) -> String {
+    let Ok(mut runtime) = runtime.lock() else {
+        return "unavailable compositor runtime is poisoned\n".into();
+    };
+    if runtime.launcher_application() != Some(name) {
+        return format!("error {name} has no launcher entry\n");
+    }
+    // The card cannot be pressed behind the lock surface either.
+    if runtime.session_locked() {
+        return "error the session is locked\n".into();
+    }
+    let mut sent = Ok(());
+    let outcome = match runtime.activate_application() {
+        Ok(true) => Ok(()),
+        Ok(false) => runtime.launch_application(|| {
+            sent = authority.supervise(crate::authority::Supervised::Start);
+            sent.clone()
+        }),
+        Err(error) => Err(error),
+    };
+    // `ok` is the card's press handled: a window raised, `0d` queued, or
+    // a pending launch joined.
+    match outcome.and(sent) {
+        Ok(()) => "ok\n".into(),
+        Err(error) => format!("unavailable {error}\n"),
+    }
+}
+
+/// Root's answer as the control socket gives it: `ok` for a started
+/// operation, or a status's body, `operation=`, `last=` and `record=`
+/// lines and then td-app's record as root relayed it.
+pub(crate) fn cache_answer(name: &str, answer: CacheAnswer) -> String {
+    let status = match answer {
+        CacheAnswer::Started => return "ok\n".into(),
+        CacheAnswer::Busy => return format!("error an operation on {name} is already running\n"),
+        CacheAnswer::Unstarted => return "unavailable root could not start the operation\n".into(),
+        CacheAnswer::Live => return "error a live session installs no applications\n".into(),
+        CacheAnswer::Full => {
+            return "unavailable root is following too many applications; ask again shortly\n"
+                .into()
+        }
+        CacheAnswer::Unread => {
+            return format!(
+                "unavailable root is reading {name}'s status first; ask again shortly\n"
+            )
+        }
+        CacheAnswer::Status(status) => status,
+    };
+    let mut body = format!(
+        "ok\noperation={}\n",
+        status.operation.map_or("none", CacheVerb::word)
+    );
+    match &status.last {
+        None => body.push_str("last=none\n"),
+        Some((verb, None)) => body.push_str(&format!("last={}\tok\n", verb.word())),
+        Some((verb, Some(reason))) => {
+            body.push_str(&format!("last={}\tfailed\t{reason}\n", verb.word()));
+        }
+    }
+    let (state, record) = match &status.record {
+        CacheRecord::Unread => ("unread", ""),
+        CacheRecord::Current(record) => ("current", record.as_str()),
+        CacheRecord::Older(record) => ("older", record.as_str()),
+        CacheRecord::Failed => ("failed", ""),
+    };
+    body.push_str(&format!("record={state}\n{record}"));
+    body
 }
 
 /// Read one line, bounded in BYTES by `REQUEST_LIMIT` and in TIME by
@@ -1304,6 +1514,15 @@ pub fn ask(path: &Path, request: Request) -> Result<String, ControlFailure> {
     if request.input_session().is_some() {
         return ask_input(path, request);
     }
+    if let Request::Application {
+        verb: CacheVerb::Status,
+        ..
+    } = request
+    {
+        let line = format!("{}\n", request.render());
+        let answer = ask_bounded(path, line.as_bytes(), APPLICATION_STATUS_LIMIT)?;
+        return decode_application_status(&answer);
+    }
     let mut stream = UnixStream::connect(path).map_err(|error| {
         ControlFailure::Unreachable(format!(
             "connect control socket {}: {error}",
@@ -1323,6 +1542,23 @@ pub fn ask(path: &Path, request: Request) -> Result<String, ControlFailure> {
     let answer = String::from_utf8(answer)
         .map_err(|_| ControlFailure::Unreachable("control answer is not UTF-8".to_string()))?;
     split_answer(&answer, matches!(request, Request::Layout))
+}
+
+/// A status answer's bound: its three lines and td-app's record, with
+/// room.
+const APPLICATION_STATUS_LIMIT: usize = 8192;
+
+/// A status answer's body: the `operation=` line onward, newline-ended.
+fn decode_application_status(answer: &[u8]) -> Result<String, ControlFailure> {
+    let bad = || ControlFailure::Unreachable("malformed application status".into());
+    let text = std::str::from_utf8(answer).map_err(|_| bad())?;
+    let Some(body) = text.strip_prefix("ok\n") else {
+        return split_answer(text, false).and_then(|_| Err(bad()));
+    };
+    if !body.starts_with("operation=") || !body.ends_with('\n') {
+        return Err(bad());
+    }
+    Ok(body.to_string())
 }
 
 fn ask_input(path: &Path, request: Request) -> Result<String, ControlFailure> {
@@ -1868,6 +2104,16 @@ pub fn help() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The stock listener's loop without the authority or the headless
+    /// grants.
+    fn accept(
+        connections: impl Iterator<Item = io::Result<UnixStream>>,
+        runtime: &Mutex<Runtime>,
+        policy: SocketPolicy,
+    ) {
+        accept_with_input(connections, runtime, policy, None, false, None);
+    }
     use std::collections::BTreeSet;
 
     fn input_line(line: &str, session: u128) -> String {
@@ -2207,6 +2453,19 @@ mod tests {
                 },
             },
         ];
+        let name = ApplicationName::parse(Some("delete-data.v2_x"), "status").unwrap();
+        let every = every.into_iter().chain(
+            [
+                CacheVerb::Status,
+                CacheVerb::Install,
+                CacheVerb::Update,
+                CacheVerb::Remove,
+                CacheVerb::DeleteData,
+            ]
+            .map(|verb| Request::Application { verb, name })
+            .into_iter()
+            .chain([Request::Launch(name)]),
+        );
         for request in every {
             let line = request.render();
             assert_eq!(
@@ -2234,6 +2493,7 @@ mod tests {
             "1-247" => "30".to_string(),
             "x" | "y" | "buttons" | "vertical" | "horizontal" => "0".to_string(),
             "@id" => "@12".to_string(),
+            "application" => "firefox".to_string(),
             alternation => alternation
                 .split('|')
                 .next()
@@ -2894,7 +3154,7 @@ mod tests {
         };
         let (runtime, _frame) = session_of(&[first, second]);
         let socket = temporary("control-sock");
-        serve(&socket.0, Arc::clone(&runtime), SocketPolicy::Private).expect("serve");
+        serve(&socket.0, Arc::clone(&runtime), SocketPolicy::Private, None).expect("serve");
 
         // The LAST committed window is the focused one, so `first` is
         // deliberately not it: an order that quietly acted on the focused
@@ -2938,7 +3198,7 @@ mod tests {
         };
         let (runtime, _frame) = session_of(&[first, second]);
         let socket = temporary("control-sock");
-        serve(&socket.0, Arc::clone(&runtime), SocketPolicy::Private).expect("serve");
+        serve(&socket.0, Arc::clone(&runtime), SocketPolicy::Private, None).expect("serve");
 
         let listed = ask(&socket.0, Request::Layout).expect("layout");
         let named = handle_of(&listed, first);
@@ -4022,7 +4282,7 @@ mod tests {
         };
         let (runtime, _frame) = session(window);
         let socket = temporary("control-sock");
-        serve(&socket.0, Arc::clone(&runtime), SocketPolicy::Private).expect("serve");
+        serve(&socket.0, Arc::clone(&runtime), SocketPolicy::Private, None).expect("serve");
 
         // THE QUESTION. One window, on workspace 1, which is where a session
         // starts and what the strip would be showing.
@@ -4129,7 +4389,7 @@ mod tests {
         };
         let (runtime, _frame) = session(window);
         let socket = temporary("control-mode");
-        serve(&socket.0, runtime, SocketPolicy::Private).expect("serve");
+        serve(&socket.0, runtime, SocketPolicy::Private, None).expect("serve");
         let mode = std::fs::metadata(&socket.0)
             .expect("stat control socket")
             .permissions()
@@ -4150,7 +4410,7 @@ mod tests {
             object: 1,
         });
         let socket = temporary("human-control-mode");
-        serve(&socket.0, runtime, SocketPolicy::HumanSession).unwrap();
+        serve(&socket.0, runtime, SocketPolicy::HumanSession, None).unwrap();
         assert_eq!(
             std::fs::metadata(&socket.0).unwrap().permissions().mode() & 0o777,
             0o666
@@ -4168,7 +4428,7 @@ mod tests {
         };
         let (runtime, _frame) = session(window);
         let socket = temporary("control-refuse");
-        serve(&socket.0, Arc::clone(&runtime), SocketPolicy::Private).expect("serve");
+        serve(&socket.0, Arc::clone(&runtime), SocketPolicy::Private, None).expect("serve");
         // Straight onto the wire, since `Request` cannot spell a bad request:
         // this is the shape another program writing the protocol would send.
         let mut stream = UnixStream::connect(&socket.0).expect("connect");
@@ -4213,7 +4473,7 @@ mod tests {
         };
         let (runtime, _frame) = session(window);
         let socket = temporary("control-flood");
-        serve(&socket.0, runtime, SocketPolicy::Private).expect("serve");
+        serve(&socket.0, runtime, SocketPolicy::Private, None).expect("serve");
         let mut stream = UnixStream::connect(&socket.0).expect("connect");
         // No newline, so nothing bounds this but the limit itself.
         let flood = vec![b'x'; REQUEST_LIMIT * 4];
@@ -4742,5 +5002,218 @@ mod tests {
             split_answer("", false),
             Err(ControlFailure::Unreachable(_))
         ));
+    }
+
+    #[test]
+    fn an_application_request_names_one_application_in_the_registry_grammar() {
+        assert_eq!(
+            Request::parse("install firefox"),
+            Ok(Request::Application {
+                verb: CacheVerb::Install,
+                name: ApplicationName::parse(Some("firefox"), "install").unwrap(),
+            })
+        );
+        assert_eq!(
+            Request::parse("launch firefox").unwrap().render(),
+            "launch firefox"
+        );
+        let long = format!("status {}", "a".repeat(64));
+        assert_eq!(Request::parse(&long).unwrap().render(), long);
+        for (line, expected) in [
+            ("install", "'install' needs an application name"),
+            ("launch", "'launch' needs an application name"),
+            ("remove Firefox", "'Firefox' is not an application name"),
+            ("status ../firefox", "is not an application name"),
+            ("delete-data -firefox", "is not an application name"),
+            ("update firefox now", "'update' takes no argument 'now'"),
+        ] {
+            let error = Request::parse(line).unwrap_err();
+            assert!(error.contains(expected), "'{line}': {error}");
+        }
+        assert!(Request::parse(&format!("status {}", "a".repeat(65))).is_err());
+    }
+
+    #[test]
+    fn without_the_authority_an_application_request_is_refused() {
+        let (runtime, _cleanup) = session(SurfaceKey {
+            client: 1,
+            object: 3,
+        });
+        for line in ["status firefox", "install firefox", "launch firefox"] {
+            assert_eq!(
+                answer(&runtime, line),
+                "error application requests need the paired authority\n"
+            );
+        }
+    }
+
+    #[test]
+    fn roots_answer_reads_as_a_status_line_and_its_record() {
+        use crate::authority::CacheStatus;
+        let record = "format=1\nname=firefox\nkind=image\n".to_string();
+        assert_eq!(cache_answer("firefox", CacheAnswer::Started), "ok\n");
+        assert_eq!(
+            cache_answer("firefox", CacheAnswer::Busy),
+            "error an operation on firefox is already running\n"
+        );
+        assert!(cache_answer("firefox", CacheAnswer::Unstarted).starts_with("unavailable "));
+        assert!(cache_answer("firefox", CacheAnswer::Live).starts_with("error "));
+        assert!(cache_answer("firefox", CacheAnswer::Full).starts_with("unavailable "));
+        assert!(cache_answer("firefox", CacheAnswer::Unread).starts_with("unavailable "));
+        for (status, body) in [
+            (
+                CacheStatus {
+                    operation: None,
+                    last: None,
+                    record: CacheRecord::Unread,
+                },
+                "ok\noperation=none\nlast=none\nrecord=unread\n".to_string(),
+            ),
+            (
+                CacheStatus {
+                    operation: Some(CacheVerb::Install),
+                    last: Some((CacheVerb::Remove, None)),
+                    record: CacheRecord::Current(record.clone()),
+                },
+                format!("ok\noperation=install\nlast=remove\tok\nrecord=current\n{record}"),
+            ),
+            (
+                CacheStatus {
+                    operation: None,
+                    last: Some((CacheVerb::Update, Some("no route".into()))),
+                    record: CacheRecord::Older(record.clone()),
+                },
+                format!(
+                    "ok\noperation=none\nlast=update\tfailed\tno route\nrecord=older\n{record}"
+                ),
+            ),
+            (
+                CacheStatus {
+                    operation: None,
+                    last: None,
+                    record: CacheRecord::Failed,
+                },
+                "ok\noperation=none\nlast=none\nrecord=failed\n".to_string(),
+            ),
+        ] {
+            assert_eq!(cache_answer("firefox", CacheAnswer::Status(status)), body);
+        }
+    }
+
+    #[test]
+    fn an_application_request_reaches_root_through_the_authority_worker() {
+        let (runtime, _cleanup) = session(SurfaceKey {
+            client: 1,
+            object: 3,
+        });
+        let (launcher, queued) = crate::authority::Queued::launcher();
+        let worker = thread::spawn(move || {
+            let (verb, name, reply) = queued.cache(Duration::from_secs(5)).unwrap();
+            assert_eq!((verb, name.as_str()), (CacheVerb::Remove, "firefox"));
+            reply.send(CacheAnswer::Started).unwrap();
+            queued
+        });
+        let deadline = Instant::now() + IO_TIMEOUT;
+        let request = Request::parse("remove firefox").unwrap();
+        assert_eq!(
+            application_answer(&runtime, &launcher, request, deadline),
+            "ok\n"
+        );
+        let queued = worker.join().unwrap();
+        // Unanswered, it times out within the conversation's bound.
+        let begin = Instant::now();
+        let request = Request::parse("status firefox").unwrap();
+        let soon = Instant::now() + Duration::from_millis(700);
+        assert_eq!(
+            application_answer(&runtime, &launcher, request, soon),
+            "unavailable the program authority did not answer in time\n"
+        );
+        assert!(begin.elapsed() < Duration::from_secs(2));
+        drop(queued);
+    }
+
+    #[test]
+    fn a_client_reads_a_status_body_and_nothing_else() {
+        let body = "operation=none\nlast=none\nrecord=unread\n";
+        assert_eq!(
+            decode_application_status(format!("ok\n{body}").as_bytes()).unwrap(),
+            body
+        );
+        assert!(matches!(
+            decode_application_status(b"error an operation on firefox is already running\n"),
+            Err(ControlFailure::Refused(_))
+        ));
+        for bad in [
+            &b"ok\n"[..],
+            b"ok\noperation=none",
+            b"ok\nworkspace 1\n",
+            b"ok\noperation=\xff\n",
+        ] {
+            assert!(matches!(
+                decode_application_status(bad),
+                Err(ControlFailure::Unreachable(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn a_launch_the_worker_cannot_take_is_unavailable() {
+        let (runtime, _cleanup) = session(SurfaceKey {
+            client: 1,
+            object: 3,
+        });
+        let (launcher, _queued) = crate::authority::Queued::launcher();
+        runtime
+            .lock()
+            .unwrap()
+            .set_launcher_application(Some("firefox"));
+        // A terminal launch holds the worker's one slot.
+        assert!(launcher.launch().is_ok());
+        let launch = Request::parse("launch firefox").unwrap();
+        let answer = application_answer(&runtime, &launcher, launch, Instant::now() + IO_TIMEOUT);
+        assert!(answer.starts_with("unavailable "), "{answer}");
+    }
+
+    #[test]
+    fn launch_raises_or_starts_only_the_configured_application() {
+        let (runtime, _cleanup) = session(SurfaceKey {
+            client: 1,
+            object: 3,
+        });
+        let (launcher, queued) = crate::authority::Queued::launcher();
+        let deadline = Instant::now() + IO_TIMEOUT;
+        let launch = Request::parse("launch firefox").unwrap();
+        assert_eq!(
+            application_answer(&runtime, &launcher, launch, deadline),
+            "error firefox has no launcher entry\n"
+        );
+        assert_eq!(queued.supervised(), None);
+        runtime
+            .lock()
+            .unwrap()
+            .set_launcher_application(Some("firefox"));
+        assert_eq!(
+            application_answer(&runtime, &launcher, launch, deadline),
+            "ok\n"
+        );
+        assert_eq!(
+            queued.supervised(),
+            Some(crate::authority::Supervised::Start)
+        );
+        let other = Request::parse("launch mail").unwrap();
+        assert_eq!(
+            application_answer(&runtime, &launcher, other, deadline),
+            "error mail has no launcher entry\n"
+        );
+        {
+            let mut runtime = runtime.lock().unwrap();
+            runtime.enable_attention(true);
+            runtime.lock_session(&crate::input::test_origin()).unwrap();
+        }
+        assert_eq!(
+            application_answer(&runtime, &launcher, launch, deadline),
+            "error the session is locked\n"
+        );
+        assert_eq!(queued.supervised(), None);
     }
 }

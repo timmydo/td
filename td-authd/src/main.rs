@@ -74,6 +74,7 @@ mod set_hostname;
 #[allow(dead_code, reason = "shared dependency-free SHA-256 implementation")]
 #[path = "../../engine/src/sha256.rs"]
 mod sha256;
+mod software;
 mod storage;
 mod sys;
 mod unlock;

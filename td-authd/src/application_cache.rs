@@ -23,7 +23,7 @@ const DIAGNOSTIC_TAIL: usize = 512;
 const WAIT_STEP: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Verb {
+pub(crate) enum Verb {
     Install,
     Update,
     Remove,
@@ -43,7 +43,7 @@ impl Verb {
         })
     }
 
-    fn word(self) -> &'static str {
+    pub(crate) fn word(self) -> &'static str {
         match self {
             Self::Install => "install",
             Self::Update => "update",
@@ -64,7 +64,7 @@ impl Verb {
         }
     }
 
-    fn lifetime(self) -> Duration {
+    pub(crate) fn lifetime(self) -> Duration {
         match self {
             Self::Install | Self::Update => CHECK_TIME,
             Self::Remove | Self::DeleteData => REMOVE_TIME,

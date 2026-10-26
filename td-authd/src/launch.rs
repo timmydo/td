@@ -16,7 +16,7 @@ const CHECK_TIMEOUT: Duration = Duration::from_secs(2);
 const VERSION: &[u8] = b"TDLA003\n";
 /// Where a live boot mounts its install medium (td-install/MEDIA.md): that
 /// session runs only the installer, whose table skips the application.
-const LIVE_MEDIUM: &str = "/run/td-media";
+pub(crate) const LIVE_MEDIUM: &str = "/run/td-media";
 /// How long a `td-svc start` client may take, as revocation bounds its own.
 const SUPERVISED_TIME: Duration = Duration::from_secs(12);
 /// `0f`'s bounds: at most one `td-svc status` client in flight, started at
@@ -429,6 +429,8 @@ enum Request {
     Supervised(Supervised),
     /// `0f`: the application unit's state, as root last read it.
     UnitState,
+    /// `24`: an application cache request for a validated name.
+    Software(crate::software::Request),
     Secret(crate::session::Request),
 }
 
@@ -743,6 +745,9 @@ fn request(bytes: &[u8]) -> Result<Request, String> {
         }
         [3] => Ok(Request::Heartbeat),
         [0x10..=0x21, ..] => Ok(Request::Secret(crate::session::Request::decode(bytes)?)),
+        [0x24, operands @ ..] => Ok(Request::Software(crate::software::Request::decode(
+            operands,
+        )?)),
         _ => Err("invalid terminal authority request".into()),
     }
 }
@@ -756,6 +761,7 @@ struct Launches {
     /// SUPERVISED_TIME.
     supervised: BTreeMap<Supervised, (Child, Instant)>,
     unit: UnitProbe,
+    software: crate::software::Requests,
 }
 
 impl Launches {
@@ -799,6 +805,7 @@ impl Launches {
             generation,
             supervised: BTreeMap::new(),
             unit: UnitProbe::new(status),
+            software: crate::software::Requests::new(),
         }
     }
 
@@ -806,9 +813,11 @@ impl Launches {
         self.reap_supervised();
         // Every launch request and heartbeat reaps a finished status
         // client, so one the peer stopped asking about is not left a
-        // zombie.
+        // zombie, and a finished application request.
         self.unit.advance();
+        self.software.advance();
         match request {
+            Request::Software(request) => Ok(self.software.answer(config.owner, request)),
             Request::Secret(_) => Err("secret request reached terminal dispatcher".into()),
             Request::Supervised(unit) => {
                 // The live table skips the application; td-svc's `start`
@@ -1046,7 +1055,7 @@ fn enrollment_dispatch_reaches_the_secret_decoder() -> Result<(), String> {
         }
     }
     // None of these takes an operand, `20` takes exactly one but for an
-    // upgrade's two, and nothing above `20` is a request.
+    // upgrade's two, `21` exactly one, and `24` a verb and a name.
     assert!(request(&[0x1d, 0]).is_err());
     assert!(request(&[0x1e, 0]).is_err());
     assert!(request(&[0x1f, 0]).is_err());
@@ -1059,6 +1068,9 @@ fn enrollment_dispatch_reaches_the_secret_decoder() -> Result<(), String> {
         &[0x20, 2, 2, 0],
         &[0x20, 3, 0],
         &[0x21],
+        &[0x21, 0, 0],
+        &[0x24],
+        &[0x24, 0],
     ] {
         assert!(request(bad).is_err(), "{bad:?}");
     }

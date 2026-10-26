@@ -163,6 +163,14 @@ const SOURCES: &[(&str, &str)] = &[
         include_str!("../../../td-authd/src/application_cache.rs"),
     ),
     (
+        "src/software.rs",
+        include_str!("../../../td-authd/src/software.rs"),
+    ),
+    (
+        "tests/software.rs",
+        include_str!("../../../td-authd/tests/software.rs"),
+    ),
+    (
         "src/mount_sys.rs",
         include_str!("../../../td-authd/src/mount_sys.rs"),
     ),

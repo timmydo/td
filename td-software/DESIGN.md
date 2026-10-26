@@ -118,6 +118,21 @@ image's registry.
 This keeps §L's "no public launch listener". It also generalizes `0d`
 and `0e` from one fixed name to a validated one.
 
+*As built (increment 2, the request path):* td-compositor/DESIGN.md §15,
+"Application requests", and td-authd/DESIGN.md, "Application requests".
+The control socket takes the six verbs above; the compositor forwards
+`status`, `install`, `update`, `remove` and `delete-data` as private
+request `24`, a verb byte and the name, and root runs `application-cache`
+for it as a process of its own, at most one operation per name and
+only on its own read of the name's status, ended in the last 30
+seconds, that shows no other writer or failed, and answers at once:
+`86` for a started operation, or for a status the operation running,
+the last one's outcome and refusal, and the last record root read, read
+again at most every two seconds or once an operation ends. `launch`
+stays the compositor's: it does what the card's application entry does,
+for the configured application alone, until the third increment carries
+a name in the start.
+
 **Consent.** None of these requests is elevation. §W.9's argument still
 holds: running the application's own account to write its own cache
 grants the human nothing new. Install and update do exactly what a first

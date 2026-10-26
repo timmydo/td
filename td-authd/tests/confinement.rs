@@ -53,6 +53,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
             "secret_sys.rs",
             "session.rs",
             "set_hostname.rs",
+            "software.rs",
             "storage.rs",
             "sys.rs",
             "unlock.rs"
@@ -71,6 +72,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
         ("handoff.rs", 0),
         ("rollback.rs", 0),
         ("set_hostname.rs", 0),
+        ("software.rs", 0),
         ("backoff.rs", 0),
         ("sys.rs", 4),
         ("launch.rs", 0),
@@ -114,6 +116,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
                     | "launch.rs"
                     | "application.rs"
                     | "application_cache.rs"
+                    | "software.rs"
                     | "unlock.rs"
                     | "login.rs"
                     | "storage.rs"
@@ -1020,6 +1023,50 @@ fn the_production_source_and_raw_boundary_are_closed() {
     ]
     .map(|call| cache.find(call).unwrap());
     assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{order:?}");
+    // Request `24` runs that operation for a name root validated, as a
+    // process of its own: one fixed program, null stdin, no environment,
+    // and only the peer's verb byte and name among its arguments.
+    let software = include_str!("../src/software.rs")
+        .split("#[cfg(test)]")
+        .next()
+        .unwrap();
+    assert_eq!(
+        fingerprint(software),
+        SOFTWARE_FINGERPRINT,
+        "application requests changed"
+    );
+    for forbidden in [
+        "thread::",
+        "pre_exec",
+        ".uid(",
+        ".gid(",
+        ".groups(",
+        ".exec()",
+        ".env(",
+        ".envs(",
+        ".arg(",
+        "process_group",
+        "unsafe",
+    ] {
+        assert!(!software.contains(forbidden), "software.rs: {forbidden}");
+    }
+    assert_eq!(software.matches("Command::new(").count(), 1);
+    assert!(software.contains(
+        "Command::new(\"/bin/td-authd\");\n    command.args([\"application-cache\", &owner.to_string(), name, verb.word()]);"
+    ));
+    assert_eq!(software.matches(".spawn()").count(), 1);
+    assert_eq!(software.matches(".env_clear()").count(), 1);
+    assert_eq!(software.matches(".stdin(Stdio::null())").count(), 1);
+    assert_eq!(
+        software
+            .matches("crate::consent::application_name(name)")
+            .count(),
+        1
+    );
+    // A running operation is killed only past its own bound and root's
+    // backstop beyond it, never because the peer asked again.
+    assert_eq!(software.matches(".kill()").count(), 2);
+    assert!(software.contains(".and_then(|end| end.checked_add(BACKSTOP));"));
     let launch = include_str!("../src/launch.rs");
     for forbidden in [
         "thread::spawn",
@@ -1212,9 +1259,10 @@ const LOGIN_STATE_FINGERPRINT: u64 = 0x10b1af1d87d02b94;
 const SHARED_LOGIN_STATE_FINGERPRINT: u64 = 0x36b736e5dda17cc6;
 const SHARED_HOSTNAME_FINGERPRINT: u64 = 0x49026f28c1db76ec;
 
-const CACHE_FINGERPRINT: u64 = 0xee78b1e97f48854e;
-const LAUNCH_FINGERPRINT: u64 = 0x646f383f01e6c652;
-const MAIN_FINGERPRINT: u64 = 0x0fa6ba78742933eb;
+const CACHE_FINGERPRINT: u64 = 0x842accbdae0b3daf;
+const SOFTWARE_FINGERPRINT: u64 = 0x3971e2184320b15b;
+const LAUNCH_FINGERPRINT: u64 = 0x01b8e74749af60f8;
+const MAIN_FINGERPRINT: u64 = 0x9d8b70595b652b5f;
 const SESSION_FINGERPRINT: u64 = 0x6c78640f078fe395;
 
 const INTAKE_RAW_FINGERPRINT: u64 = 0x320c8b6ddbfe29af;

@@ -11232,8 +11232,11 @@ foreign `HOME` as `update` does:
 
 td-authd's `application-cache` operation is the root path to `update
 --force`, `remove`, `delete-data` and `status`, selecting the account
-itself (td-authd/DESIGN.md, "Application cache operation"); until the
-cutover td-jail's on-demand check and the forced-check unit still run
+itself (td-authd/DESIGN.md, "Application cache operation"). td-software's
+requests reach it from the compositor's control socket as private request
+`24`, which root runs as a process of its own, one operation per
+application at a time (td-authd/DESIGN.md, "Application requests"); until
+the cutover td-jail's on-demand check and the forced-check unit still run
 td-app directly.
 
 **When it fetches.** td-jail, launching an application whose spec names
