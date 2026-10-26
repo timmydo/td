@@ -422,8 +422,10 @@ pub(crate) mod tests {
     use std::os::unix::fs::{symlink, FileTypeExt};
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    /// The budget the tests read within when not testing it.
-    const BUDGET: Duration = Duration::from_secs(10);
+    /// The budget the tests read within when not testing it: far past a
+    /// loaded host's debug scan of the largest fixture, so no passing case
+    /// waits on it. A case proving the budget sets its own.
+    const BUDGET: Duration = Duration::from_secs(600);
 
     /// One newc member to pack.
     #[derive(Clone, Copy)]
@@ -862,13 +864,12 @@ pub(crate) mod tests {
             (result, started.elapsed())
         };
         let late = refused("gave up reading the archive");
-        let ample = Duration::from_secs(10);
         let short = Duration::from_millis(100);
         // Each stall alone is harmless inside the budget. The interrupted
         // probe goes first, while its 50 ms of interruptions still last.
         let interrupted = Stall::Interrupted(Instant::now() + Duration::from_millis(50));
         for stall in [interrupted, Stall::LastRead, Stall::Probe] {
-            assert_eq!(run(stall, ample).0, Ok(vec![1]));
+            assert_eq!(run(stall, BUDGET).0, Ok(vec![1]));
         }
         // The last bytes, or the end, arrive after the budget.
         assert_eq!(run(Stall::LastRead, short).0, late);
