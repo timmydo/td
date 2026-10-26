@@ -1651,7 +1651,7 @@ fn build_server_td_svc_conf() -> String {
          \n\
          [network]\n\
          type=daemon\n\
-         exec=/bin/td-netd watch\n\
+         exec=/bin/td-netd watch --wifi-owner {ui_uid}\n\
          after=netup\n\
          restart=always\n\
          log=/var/log/svc/network.log\n\
@@ -1696,6 +1696,7 @@ fn build_server_td_svc_conf() -> String {
         profiler_attribution_evidence_timeout_secs = PROFILER_ATTRIBUTION_EVIDENCE_TIMEOUT_SECS,
         profiler_evidence_service_timeout_secs = PROFILER_EVIDENCE_SERVICE_TIMEOUT_SECS,
         profiler_attribution_cmdline_token = AUTOTEST_CMDLINE_TOKEN,
+        ui_uid = UI_UID,
     )
 }
 
@@ -1816,7 +1817,7 @@ fn build_desktop_td_svc_conf() -> String {
          \n\
          [network]\n\
          type=daemon\n\
-         exec=/bin/td-netd watch\n\
+         exec=/bin/td-netd watch --wifi-owner {ui_uid}\n\
          after=netup\n\
          restart=always\n\
          log=/var/log/svc/network.log\n\
@@ -9005,7 +9006,7 @@ mod tests {
     fn ethernet_watch_survives_boot_dhcp_failure_without_gating_the_desktop() {
         assert_eq!(
             unit_key("network", "exec").as_deref(),
-            Some("/bin/td-netd watch")
+            Some(format!("/bin/td-netd watch --wifi-owner {UI_UID}").as_str())
         );
         assert_eq!(unit_key("network", "type").as_deref(), Some("daemon"));
         assert_eq!(unit_key("network", "after").as_deref(), Some("netup"));

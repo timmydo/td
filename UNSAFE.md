@@ -178,7 +178,7 @@ one.
 | # | crate | syscalls |
 |---|-------|----------|
 | 1 | `td-kexec` | `kexec_file_load(2)`, `reboot(2)`, `memfd_create(2)` with pinned flags including `MFD_NOEXEC_SEAL`, `fcntl(2)` pinned to `F_ADD_SEALS` and one seal set (plus a test-only `F_SETLEASE` probe) — see [§1](#1-td-kexec--the-guest-kexec-helper) |
-| 2 | `td-netd` | `ioctl(2)` |
+| 2 | `td-netd` | `ioctl(2)` with seven interface-config requests and `TCGETS`/`TCSETS` on standard input, `socket(2)`, `setsockopt(2)`, `sendto(2)`, `recvfrom(2)` and `close(2)` for one owned `NETLINK_GENERIC` socket, `poll(2)` over at most two descriptors — see [§2](#2-td-netd--the-network-bring-up-daemon) |
 | 3 | `td-init` | eleven — see [§3](#3-td-init--the-boot-glue-multicall); `ioctl` has six pinned requests, `poll(2)` at most two lines |
 | 4 | `td-login` | `setgroups(2)`, `setgid(2)`, `setuid(2)` |
 | 5 | `td-svc` | `kill(2)` |
@@ -326,10 +326,47 @@ tests scan only production code for the four requests above.
 
 ## 2. `td-netd` — the network bring-up daemon
 
-The `td-netd` network bring-up daemon is confined to a single `ioctl(2)`
-wrapper (`syscall3`) through which its interface-config ioctls
-(SIOCSIFFLAGS/ADDR/NETMASK, SIOCGIFHWADDR, SIOCADDRT) go — all its socket
-I/O rides `std`, so DHCP needs no AF_PACKET raw socket.
+The `td-netd` network bring-up daemon is confined to one raw entry
+point, `syscall6` in `td-netd/src/sys.rs`, carrying exactly seven
+syscalls. Its confinement tests (`src/confinement.rs`, through
+`td-source-scan`) pin each x86_64 number, every call site whole, every
+named value a call site passes, and the asm block register for
+register:
+
+- `ioctl(2)` (16). Through `sys::ioctl`, the interface-config requests
+  SIOCGIFFLAGS, SIOCSIFFLAGS, SIOCSIFADDR, SIOCSIFNETMASK, SIOCGIFHWADDR,
+  SIOCADDRT and SIOCDELRT on an AF_INET datagram socket (SIOCDELRT
+  takes only the limited-broadcast host route, so DHCP's broadcasts
+  leave by the interface acquiring); that wrapper takes its request
+  from the caller, so the tests pin its seven call sites, the one
+  SIOCDELRT site's route whole, and the
+  two requests `set_addr` may forward. And TCGETS/TCSETS, fixed to
+  descriptor 0 over the kernel's 36-byte `struct termios` (§3's
+  length), for `td-netd wifi join`'s passphrase prompt, which turns
+  echo off and back on; ENOTTY leaves a piped standard input as it is.
+- `socket(2)` (41) fixed to AF_NETLINK, SOCK_RAW|SOCK_CLOEXEC and
+  NETLINK_GENERIC; `setsockopt(2)` (54) fixed to
+  SOL_NETLINK/NETLINK_ADD_MEMBERSHIP with a four-byte group;
+  `sendto(2)` (44) with no address, so to the kernel; `recvfrom(2)` (45)
+  with MSG_DONTWAIT|MSG_TRUNC, refusing a datagram longer than its
+  buffer and discarding one whose 12-byte `sockaddr_nl` is not the
+  kernel's (port 0); and `close(2)` (3) of that socket on drop.
+  `sys.rs`'s `GenlSocket` owns the descriptor and alone closes it; it
+  derives nothing, so no copy can close it twice, and `fd()` lends the
+  number only for `poll2`. nl80211 rides it:
+  the watcher scans, connects, installs keys and authorizes the
+  station, and EAPOL travels over nl80211's control port, so Wi-Fi
+  needs no AF_PACKET socket either.
+- `poll(2)` (7) over a fixed two-entry array: that socket and the
+  owner's control listener.
+
+DHCP and DNS still ride `std`'s `UdpSocket`/`TcpStream`: bringing the
+link up and an explicit limited-broadcast host route make the DHCP
+broadcasts egress the chosen interface, so DHCP needs no AF_PACKET
+socket. The owner's control socket is `std`'s `UnixListener`. td-fido's
+`fido_aes.rs`, compiled in by `#[path]` for the WPA2 group-key unwrap,
+forbids `unsafe` in its own crate; the confinement tests hold the
+compiled copy to no `unsafe` and admit that one `#[path]` alone.
 
 ## 3. `td-init` — the boot-glue multicall
 

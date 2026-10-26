@@ -12,24 +12,27 @@
 //! * `td-netd up [IFACE]` — autodetect a link (or use IFACE), bring it up,
 //!   DHCP-configure it, and write resolv.conf. No usable interface is a clean
 //!   no-op (exit 2), so boot can distinguish it from a configured link.
-//! * `td-netd watch` — supervise physical Ethernet carrier, DHCP and leases.
+//! * `td-netd watch [--wifi-owner UID]` — supervise physical Ethernet carrier,
+//!   the Wi-Fi association (`wifi.rs`), DHCP and leases; UID may choose the
+//!   Wi-Fi network through `/run/td-netd/wifi`.
+//! * `td-netd wifi scan | join [--open] [--] NAME | forget` — the owner's client.
 //! * `td-netd status` — print the latest connection state and address.
 //! * `td-netd diagnose` — report link speed, errors and TCP configuration/counters.
 //! * `td-netd resolve NAME` — DNS A-query NAME via the configured nameserver and
 //!   print the first address.
 //! * `td-netd reach HOST PORT` — resolve HOST (if a name) and TCP-connect it.
 //!
-//! UNSAFE CONFINEMENT (a recorded UNSAFE.md amendment — the SECOND target-side
-//! unsafe surface after td-kexec): the crate `#![deny(unsafe_code)]`s and only
-//! `syscall3` carries a scoped `#[allow]`. That single raw `ioctl(2)` wrapper is
-//! the whole unsafe surface; the interface-config ioctls (SIOCSIFFLAGS/ADDR/
-//! NETMASK, SIOCGIFHWADDR, SIOCADDRT) go through it. All socket I/O rides std's
-//! `UdpSocket`/`TcpStream`, so DHCP needs no AF_PACKET raw socket: bringing the
-//! link up and adding an explicit limited-broadcast host route makes the DHCP
-//! DISCOVER/REQUEST broadcasts egress the chosen interface deterministically,
-//! with a source of 0.0.0.0, exactly as a pre-address DHCP client needs — without
-//! widening the unsafe surface beyond that one ioctl. (CONFIG_PACKET is enabled in
-//! the kernel for raw-socket-capable tooling generally; td-netd does not need it.)
+//! UNSAFE CONFINEMENT (UNSAFE.md §2): the crate `#![deny(unsafe_code)]`s and
+//! only `sys::syscall6` carries a scoped `#[allow]`. Through it go the
+//! interface-config ioctls (SIOCSIFFLAGS/ADDR/NETMASK, SIOCGIFHWADDR,
+//! SIOCADDRT/SIOCDELRT), the passphrase prompt's TCGETS/TCSETS on standard
+//! input, and one owned NETLINK_GENERIC socket for nl80211 (socket, one
+//! multicast membership option, send to the kernel, receive from the
+//! kernel, poll, close). DHCP and DNS ride std's `UdpSocket`/`TcpStream`, so
+//! no AF_PACKET socket is needed: bringing the link up and making an
+//! explicit limited-broadcast host route the chosen interface's alone makes
+//! the DHCP DISCOVER/REQUEST broadcasts egress it with a source of 0.0.0.0,
+//! and Wi-Fi's EAPOL frames travel over nl80211's control port.
 //!
 //! NSS-free by construction so the fully-static (`+crt-static`) glibc build works:
 //! every name lookup is td-netd's own DNS client and every socket target is a
@@ -49,54 +52,22 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-#[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
-compile_error!("td-netd is x86_64-linux only (raw syscall ABI)");
+mod genl;
+mod sha1;
+mod sys;
+mod wifi;
+mod wpa;
 
-// ── The confined raw-syscall surface ────────────────────────────────────────
+#[cfg(test)]
+mod confinement;
 
-const SYS_IOCTL: usize = 16;
+/// td-fido's AES, shared by path (td-fido/DESIGN.md, "Consumers"): td-netd
+/// uses only its key unwrap, for WPA2 group keys.
+#[path = "../../td-fido/src/fido_aes.rs"]
+#[allow(dead_code, reason = "td-netd uses only the key unwrap")]
+mod fido_aes;
 
-/// The single raw-syscall entry point (x86_64 SysV syscall ABI), copied from
-/// `builder/src/sys.rs`/`td-kexec`. This function's body is the ONLY `unsafe` in
-/// the crate; the scoped `#[allow]` (under the crate `#![deny(unsafe_code)]`) is
-/// the compiler-enforced confinement — an `unsafe` anywhere else fails the build.
-#[inline]
-#[allow(unsafe_code)]
-fn syscall3(n: usize, a1: usize, a2: usize, a3: usize) -> isize {
-    let ret: isize;
-    // SAFETY: the `syscall` instruction clobbers rcx/r11 and returns in rax; the
-    // args are plain integers or a pointer-as-usize whose pointee (an ioctl
-    // request buffer) the caller keeps live across the call. No memory is aliased
-    // beyond the kernel's read/write of that one buffer.
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            inlateout("rax") n as isize => ret,
-            in("rdi") a1,
-            in("rsi") a2,
-            in("rdx") a3,
-            out("rcx") _,
-            out("r11") _,
-            options(nostack),
-        );
-    }
-    ret
-}
-
-/// Turn a raw syscall return into a `Result`, mirroring `sys.rs::check`.
-fn check(ret: isize) -> io::Result<isize> {
-    if ret < 0 {
-        Err(io::Error::from_raw_os_error(-ret as i32))
-    } else {
-        Ok(ret)
-    }
-}
-
-/// `ioctl(fd, request, argp)` over the confined syscall. `argp` points at a
-/// caller-owned buffer kept live across the call.
-fn ioctl(fd: RawFd, request: usize, argp: *mut u8) -> io::Result<()> {
-    check(syscall3(SYS_IOCTL, fd as usize, request, argp as usize)).map(|_| ())
-}
+use sys::ioctl;
 
 // ── Kernel ABI constants ────────────────────────────────────────────────────
 
@@ -109,6 +80,10 @@ const SIOCSIFADDR: usize = 0x8916;
 const SIOCSIFNETMASK: usize = 0x891c;
 const SIOCGIFHWADDR: usize = 0x8927;
 const SIOCADDRT: usize = 0x890b;
+const SIOCDELRT: usize = 0x890c;
+const ESRCH: i32 = 3;
+/// More limited-broadcast routes than td-netd's interfaces could leave.
+const MAX_BROADCAST_ROUTES: usize = 16;
 
 // Interface flags (linux/if.h).
 const IFF_UP: i16 = 0x1;
@@ -278,6 +253,23 @@ fn build_rtentry(
 fn add_broadcast_route(fd: RawFd, ifname: &str) -> io::Result<()> {
     let dev = CString::new(ifname.as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "interface name has a NUL"))?;
+    // The newest such route wins and an attempt that failed leaves its own,
+    // so first take every one from the main table: a deletion naming no
+    // device removes whichever it finds.
+    for _ in 0..MAX_BROADCAST_ROUTES {
+        let mut rt = build_rtentry(
+            [255, 255, 255, 255],
+            [255, 255, 255, 255],
+            [0, 0, 0, 0],
+            RTF_UP | RTF_HOST,
+            None,
+        );
+        match ioctl(fd, SIOCDELRT, rt.as_mut_ptr()) {
+            Ok(()) => {}
+            Err(e) if e.raw_os_error() == Some(ESRCH) => break,
+            Err(e) => return Err(e),
+        }
+    }
     let mut rt = build_rtentry(
         [255, 255, 255, 255],
         [255, 255, 255, 255],
@@ -739,7 +731,8 @@ fn first_nameserver(body: &str) -> Option<[u8; 4]> {
 
 // ── Interface autodetect ────────────────────────────────────────────────────
 
-/// Pick a network interface from `/sys/class/net`, skipping loopback. Prefers a
+/// Pick a network interface from `/sys/class/net`, skipping loopback and
+/// wireless interfaces (`watch` associates those before DHCP). Prefers a
 /// name starting with `e` (eth*/en*), else the first non-loopback entry. `None`
 /// when only loopback exists — a NIC-less boot, handled as a clean no-op.
 fn autodetect_iface() -> Option<String> {
@@ -748,6 +741,12 @@ fn autodetect_iface() -> Option<String> {
         .filter_map(|e| e.ok())
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .filter(|n| n != "lo")
+        .filter(|n| {
+            !Path::new("/sys/class/net")
+                .join(n)
+                .join("wireless")
+                .exists()
+        })
         .collect();
     names.sort();
     // Prefer an ethernet-style name (eth*/en*); a plain loop (not the iterator search
@@ -895,12 +894,12 @@ fn report(message: &str) -> io::Result<()> {
 
 fn ethernet_interfaces() -> io::Result<Vec<String>> {
     let mut names = Vec::new();
-    for entry in fs::read_dir("/sys/class/net")? {
-        let entry = entry?;
+    // An interface that vanishes while it is read is not one.
+    for entry in fs::read_dir("/sys/class/net")?.flatten() {
         let path = entry.path();
         if path.join("device").exists()
             && !path.join("wireless").exists()
-            && fs::read_to_string(path.join("type"))?.trim() == "1"
+            && fs::read_to_string(path.join("type")).is_ok_and(|t| t.trim() == "1")
         {
             if let Some(name) = entry.file_name().to_str() {
                 names.push(name.to_owned());
@@ -925,6 +924,36 @@ fn clear_interface(fd: RawFd, name: &str) -> io::Result<()> {
         set_addr(fd, name, SIOCSIFADDR, [0; 4])?;
         set_link_up(fd, name)?;
     }
+    forget_lease()
+}
+
+/// Drop `name`'s lease, keeping its link up when `keep_link`: taking a
+/// radio's down would end the association. Deleting the last address
+/// flushes the device's routes as the link going down does; with no
+/// address held there are none to flush but `acquire`'s limited-broadcast
+/// route, which the next `acquire` replaces.
+fn clear_lease(fd: RawFd, name: &str, keep_link: bool) -> io::Result<()> {
+    if !keep_link {
+        return clear_interface(fd, name);
+    }
+    if Path::new("/sys/class/net").join(name).exists() {
+        set_addr(fd, name, SIOCSIFADDR, [0; 4])?;
+    }
+    forget_lease()
+}
+
+/// Whether a wired interface not in `failed` has carrier, raising each
+/// link to see. One that vanishes meanwhile just has none.
+fn wired_carrier(fd: RawFd, failed: &[String]) -> io::Result<bool> {
+    for name in ethernet_interfaces()? {
+        if !failed.contains(&name) && set_link_up(fd, &name).is_ok() && carrier(&name) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn forget_lease() -> io::Result<()> {
     match fs::remove_file(HANDOFF_PATH) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -1093,7 +1122,17 @@ fn renewal_retry(remaining: Duration) -> Duration {
     (remaining / 2).min(Duration::from_secs(15))
 }
 
-fn cmd_watch() -> io::Result<ExitCode> {
+/// A status line for the shared file when the reporter's link is the one in
+/// question, else the log alone.
+fn note(shared: bool, message: &str) {
+    if shared {
+        let _ = report(message);
+    } else {
+        let _ = writeln!(io::stderr(), "td-netd: {message}");
+    }
+}
+
+fn cmd_watch(wifi_owner: Option<u32>) -> io::Result<ExitCode> {
     let _lock = network_lock()?;
     let ctl = prepare_loopback()?;
     let fd = ctl.as_raw_fd();
@@ -1103,28 +1142,47 @@ fn cmd_watch() -> io::Result<ExitCode> {
     // Keep boot's working lease: network consumers are already eligible to run.
     // A missing/invalid record means no configuration has a known lifetime.
     let names = ethernet_interfaces()?;
+    let mut stale = None;
     if active
         .as_ref()
         .is_some_and(|(name, _, acquired)| !names.contains(name) || *acquired > retry)
     {
-        active = None;
+        // A radio's lease died with the association a previous watch owned.
+        stale = active.take().map(|(name, _, _)| name);
     }
     if let Some((name, lease, _)) = &active {
         report(&lease_status(name, lease))?;
     } else {
-        for name in names {
+        for name in names.into_iter().chain(stale) {
             clear_interface(fd, &name)?;
         }
     }
+    let mut wifi = wifi::Wifi::new(wifi_owner, &mut |m| note(false, m));
+    // Cables whose DHCP failed: they give way to an associated radio until
+    // unplugged, so a port with no DHCP server cannot starve Wi-Fi.
+    let mut failed_wired: Vec<String> = Vec::new();
     loop {
         let now = uptime()?;
         let mut rejected = false;
+        failed_wired.retain(|name| carrier(name));
         if let Some((name, lease, acquired)) = &active {
-            if !carrier(name) || now.saturating_sub(*acquired) >= lease_duration(lease) {
+            let radio = wifi.interface() == Some(name.as_str());
+            let linked = if radio { wifi.ready() } else { carrier(name) };
+            if radio && wired_carrier(fd, &failed_wired)? {
+                // Ethernet takes precedence: give up the radio's lease (its
+                // association stays) and let selection pick the cable.
+                report(&format!(
+                    "{name}: Ethernet connected; clearing the Wi-Fi lease"
+                ))?;
+                clear_lease(fd, name, true)?;
+                active = None;
+                retry = now;
+                last_status.clear();
+            } else if !linked || now.saturating_sub(*acquired) >= lease_duration(lease) {
                 report(&format!(
                     "{name}: link lost or lease expired; clearing address and routes"
                 ))?;
-                clear_interface(fd, name)?;
+                clear_lease(fd, name, radio)?;
                 active = None;
                 retry = now;
                 last_status.clear();
@@ -1142,7 +1200,7 @@ fn cmd_watch() -> io::Result<ExitCode> {
                             || next.subnet != lease.subnet
                             || next.routers != lease.routers
                         {
-                            clear_interface(fd, name)?;
+                            clear_lease(fd, name, wifi.interface() == Some(name.as_str()))?;
                             add_broadcast_route(fd, name)?;
                         }
                         apply_lease(fd, name, &next)?;
@@ -1163,14 +1221,26 @@ fn cmd_watch() -> io::Result<ExitCode> {
                     );
             }
         } else if now >= retry {
+            let mut gave_way = false;
             let mut selected = None;
+            let mut failed = None;
             for name in ethernet_interfaces()? {
-                set_link_up(fd, &name)?;
-                if carrier(&name) {
+                if set_link_up(fd, &name).is_err() || !carrier(&name) {
+                    continue;
+                }
+                if failed_wired.contains(&name) {
+                    failed.get_or_insert(name);
+                } else {
                     selected = Some(name);
                     break;
                 }
             }
+            // Wired carrier first; an authorized radio otherwise; a cable
+            // whose DHCP failed last.
+            if selected.is_none() && wifi.ready() {
+                selected = wifi.interface().map(str::to_owned);
+            }
+            let selected = selected.or(failed);
             if let Some(name) = selected {
                 report(&format!("{name}: carrier detected; requesting DHCP lease"))?;
                 match acquire(fd, &name).and_then(|lease| {
@@ -1179,22 +1249,39 @@ fn cmd_watch() -> io::Result<ExitCode> {
                 }) {
                     Ok(lease) => {
                         report(&lease_status(&name, &lease))?;
+                        failed_wired.retain(|failed| *failed != name);
                         let acquired = live_lease_start(&lease, uptime()?)?;
                         active = Some((name, lease, acquired));
                     }
                     Err(e) => {
-                        clear_interface(fd, &name)?;
-                        report(&format!("{name}: DHCP failed: {e}; retrying in 15 seconds"))?;
+                        // The link stays up: a radio keeps its association,
+                        // DHCP failing saying nothing about it, and a cable
+                        // keeps the carrier that tells when it is unplugged.
+                        clear_lease(fd, &name, true)?;
+                        let cable = wifi.interface() != Some(name.as_str());
+                        // A failed cable gives way at once to a radio that
+                        // is ready, and waits for a replug.
+                        gave_way = cable && wifi.ready();
+                        if gave_way {
+                            report(&format!(
+                                "{name}: DHCP failed: {e}; giving way to Wi-Fi until the cable is replugged"
+                            ))?;
+                        } else {
+                            report(&format!("{name}: DHCP failed: {e}; retrying in 15 seconds"))?;
+                        }
+                        if cable && !failed_wired.contains(&name) {
+                            failed_wired.push(name);
+                        }
                     }
                 }
                 retry = uptime()?
-                    + if active.is_some() {
+                    + if active.is_some() || gave_way {
                         Duration::ZERO
                     } else {
                         Duration::from_secs(15)
                     };
                 last_status.clear();
-            } else {
+            } else if wifi.interface().is_none() {
                 let waiting = "disconnected: plug in an Ethernet cable (DHCP)";
                 if last_status != waiting {
                     report(waiting)?;
@@ -1204,7 +1291,7 @@ fn cmd_watch() -> io::Result<ExitCode> {
         }
         if rejected {
             if let Some((name, _, _)) = active.take() {
-                clear_interface(fd, &name)?;
+                clear_lease(fd, &name, wifi.interface() == Some(name.as_str()))?;
                 report(&format!(
                     "{name}: rejected lease cleared; acquiring a new address"
                 ))?;
@@ -1212,7 +1299,12 @@ fn cmd_watch() -> io::Result<ExitCode> {
                 last_status.clear();
             }
         }
-        std::thread::sleep(Duration::from_millis(250));
+        // The radio speaks for the status file unless a wired lease holds it.
+        let wired = active
+            .as_ref()
+            .is_some_and(|(name, _, _)| wifi.interface() != Some(name.as_str()));
+        wifi.drive(fd, wired, &mut |m| note(!wired, m));
+        wifi.wait(Duration::from_millis(250), &mut |m| note(!wired, m));
     }
 }
 
@@ -1305,7 +1397,7 @@ fn cmd_reach(host: &str, port: u16) -> io::Result<()> {
 fn usage() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "usage: td-netd loopback | up [IFACE] | watch | status | diagnose | resolve NAME | reach HOST PORT",
+        "usage: td-netd loopback | up [IFACE] | watch [--wifi-owner UID] | wifi scan | wifi join [--open] NAME | wifi forget | status | diagnose | resolve NAME | reach HOST PORT",
     )
 }
 
@@ -1314,7 +1406,15 @@ fn run() -> io::Result<ExitCode> {
     let cmd = args.next().ok_or_else(usage)?;
     let rest: Vec<String> = args.map(|a| a.to_string_lossy().into_owned()).collect();
     match cmd.as_bytes() {
-        b"watch" if rest.is_empty() => cmd_watch(),
+        b"watch" => match rest.as_slice() {
+            [] => cmd_watch(None),
+            [flag, uid] if flag == "--wifi-owner" => {
+                let uid = uid.parse().map_err(|_| usage())?;
+                cmd_watch(Some(uid))
+            }
+            _ => Err(usage()),
+        },
+        b"wifi" => wifi::client(&rest),
         b"diagnose" if rest.is_empty() => cmd_diagnose(),
         b"status" if rest.is_empty() => {
             let status = fs::read_to_string(STATUS_PATH).map_err(|e| {

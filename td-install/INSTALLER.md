@@ -2083,8 +2083,8 @@ the console retained by the runner, not a complete boot transcript guarantee.
 The boot-time `netup` attempt is followed by the supervised `network` service
 running `td-netd watch`. It polls physical Ethernet interfaces four times a second,
 raises their links, and configures the first connected one in lexical order
-with IPv4 DHCP. Wi-Fi association and static addressing are outside this
-service. Plugging in a cable after boot needs no administrative action.
+with IPv4 DHCP. Static addressing is outside this service; Wi-Fi is below.
+Plugging in a cable after boot needs no administrative action.
 Unplugging it clears the address, default route and DNS settings; reconnecting
 or attaching a USB Ethernet adapter obtains a fresh lease. Failed DHCP attempts
 retry after 15 seconds. Boot and desktop health do not require a DHCP server.
@@ -2104,8 +2104,49 @@ It broadcasts
 DHCPREQUEST at half the lease lifetime, retries failures, and clears an
 expired or explicitly rejected lease before acquiring another. Servers omitting a lifetime receive
 a five-minute revalidation window. A DHCP exchange has a bounded deadline
-even when unrelated packets arrive. The daemon owns one Ethernet connection
-at a time and changes neither loopback nor Wi-Fi on disconnect.
+even when unrelated packets arrive. The daemon owns one connection at a
+time and changes neither loopback nor the other link on disconnect.
+
+The same watcher is td's Wi-Fi station wherever the kernel drives a
+wireless interface. It joins one WPA2-Personal or open network that the
+session owner names:
+
+```text
+td-netd wifi scan
+td-netd wifi join NAME
+td-netd wifi join --open NAME
+td-netd wifi forget
+```
+
+A `--` before NAME admits a name that begins with `--`. `join` asks for
+the passphrase without echo (8 to 63 characters, or a 64-digit hex key),
+derives the PMK, hands only that to the watcher over `/run/td-netd/wifi`,
+and follows the wireless interface's status until an address arrives or
+the join fails. While Ethernet holds the connection it saves the network
+and returns; Wi-Fi joins when the cable is unplugged. That socket is the
+owner's alone (mode 0600, in a root directory that is root's alone until
+the socket is the owner's), the owner being the account the `network`
+unit names with `--wifi-owner`. The watcher keeps the network root-only in
+`/var/lib/td-netd/wifi` and rejoins it at every boot. It is its own
+supplicant over nl80211: the four-way and group-key handshakes run in
+td-netd, and EAPOL travels over nl80211's control port, so there is no
+wpa_supplicant and no raw socket. Ethernet keeps precedence: the radio
+starts an association only while no wired lease is held, and a cable
+gaining carrier takes the connection from a Wi-Fi lease. A cable whose
+DHCP fails gives way to Wi-Fi until it is unplugged. An authorized
+association is a link with carrier for the same DHCP, renewal and expiry;
+a failed or rejected lease is retried without leaving the network. A lost
+association clears the address and rejoins after 2 to 60 seconds. An
+access point that drops the station after the handshake's second message
+is reported as a likely wrong passphrase.
+
+WPA3-only, enterprise (802.1X), WPA1, non-CCMP (including mixed WPA/WPA2
+networks whose group cipher is TKIP) and management-frame-
+protection-required networks are refused with the reason in
+`td-netd status`. It keeps one network rather than a list and roams only
+by reassociating to the strongest access point after a loss. The
+passphrase is never stored; the stored PMK joins the network for whoever
+reads it, which only root can.
 
 For SSH, while no hardware login key is enrolled, put the other computer's
 Ed25519 **public** key in `~/.ssh/authorized_keys` on td:

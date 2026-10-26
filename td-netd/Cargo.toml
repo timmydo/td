@@ -2,7 +2,7 @@
 name = "td-netd"
 version = "0.1.0"
 edition = "2021"
-description = "td's minimal static network bring-up daemon: link-up + DHCP + resolv.conf, a confined single-ioctl surface"
+description = "td's minimal static network bring-up daemon: link-up + DHCP + resolv.conf, a nl80211 WPA2-Personal station, a confined syscall surface"
 license = "MIT"
 
 # Own workspace root. The engine root manifest carries no `exclude` list, and
@@ -20,6 +20,12 @@ license = "MIT"
 name = "td-netd"
 path = "src/main.rs"
 
+# The confinement tests read src/ through td-source-scan's shared scans.
+# Dev-only: the recipe compiles src/main.rs with a direct rustc and no
+# `--test`, so the shipped binary never sees it.
+[dev-dependencies]
+td-source-scan = { path = "../td-source-scan" }
+
 # td-netd is a TARGET-built userland program, NOT part of the control-plane engine.
 # Like td-kexec it is a standalone crate OUTSIDE the builder/recipes engine
 # workspace, so the one-self-entry Cargo.lock gate on those crates (which loops
@@ -28,7 +34,7 @@ path = "src/main.rs"
 # so the same source is an independently `cargo clippy`/`cargo test`-able crate.
 
 # unsafe is confined in SOURCE, not here: src/main.rs `#![deny(unsafe_code)]`s the
-# whole crate and scopes a `#[allow]` to `syscall3` — the raw ioctl wrapper. This
+# whole crate and scopes a `#[allow]` to src/sys.rs's `syscall6` (UNSAFE.md §2). This
 # is the SECOND target-side unsafe surface after td-kexec (a recorded AGENTS.md
 # amendment). Compiler-enforced, so an `unsafe` added anywhere else reds the build;
 # no crate-wide allow to override it.

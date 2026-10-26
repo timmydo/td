@@ -4,9 +4,10 @@ use crate::types::{Recipe, Step};
 // td-netd — target-built static network bring-up daemon (link-up + DHCP +
 // resolv.conf; resolve/reach).
 //
-// This recipe compiles the td-netd CRATE's `src/main.rs` (a standalone crate,
-// linted and unit-tested there) into a statically-linked target ELF, exactly like
-// td-kexec. The crate source is embedded via `include_str!` so the lintable/
+// This recipe compiles the td-netd CRATE's `src/main.rs` with its modules and
+// td-fido's AES (shared by path; td-fido/DESIGN.md) into a statically-linked
+// target ELF, exactly like td-kexec. The crate source is embedded via
+// `include_str!` so the lintable/
 // testable crate and the shipped binary are ONE source of truth and cannot drift;
 // the path escapes the `recipes/src/recipes/*.rs` catalog glob, so it is not
 // itself a recipe module.
@@ -32,20 +33,51 @@ use crate::types::{Recipe, Step};
 // identifier is free; what must not appear is a bare `find`/`xargs` in a LITERAL,
 // which reads exactly as a command name would. That guard's roster exempts named
 // reviewed bodies from even that, and none of td-netd's is on it.
-const MAIN_RS: &str = include_str!("../../../td-netd/src/main.rs");
+const SOURCES: &[(&str, &str)] = &[
+    (
+        "{src}/td-netd/src/main.rs",
+        include_str!("../../../td-netd/src/main.rs"),
+    ),
+    (
+        "{src}/td-netd/src/genl.rs",
+        include_str!("../../../td-netd/src/genl.rs"),
+    ),
+    (
+        "{src}/td-netd/src/sha1.rs",
+        include_str!("../../../td-netd/src/sha1.rs"),
+    ),
+    (
+        "{src}/td-netd/src/sys.rs",
+        include_str!("../../../td-netd/src/sys.rs"),
+    ),
+    (
+        "{src}/td-netd/src/wifi.rs",
+        include_str!("../../../td-netd/src/wifi.rs"),
+    ),
+    (
+        "{src}/td-netd/src/wpa.rs",
+        include_str!("../../../td-netd/src/wpa.rs"),
+    ),
+    (
+        "{src}/td-fido/src/fido_aes.rs",
+        include_str!("../../../td-fido/src/fido_aes.rs"),
+    ),
+];
 
 pub fn recipe() -> Recipe {
     let rustc = "{in:rust-toolchain}/bin/rustc";
 
     let mut steps = Vec::new();
-    steps.push(Step::MkDir {
-        path: "{out}/bin".into(),
-    });
-    steps.push(Step::WriteFile {
-        path: "{src}/main.rs".into(),
-        content: MAIN_RS.into(),
-        exec: false,
-    });
+    for dir in ["{out}/bin", "{src}/td-netd/src", "{src}/td-fido/src"] {
+        steps.push(Step::MkDir { path: dir.into() });
+    }
+    for (path, content) in SOURCES {
+        steps.push(Step::WriteFile {
+            path: (*path).into(),
+            content: (*content).into(),
+            exec: false,
+        });
+    }
     steps.push(
         target_rustc(
             "{src}",
@@ -69,7 +101,7 @@ pub fn recipe() -> Recipe {
                 "panic=abort",
                 "-o",
                 "{out}/bin/td-netd",
-                "{src}/main.rs",
+                "{src}/td-netd/src/main.rs",
             ],
         )
         .env("SOURCE_DATE_EPOCH", "1"),

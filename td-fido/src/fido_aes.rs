@@ -1,9 +1,15 @@
-//! Bounded AES-256-CBC primitive for CTAP, and AES-128-CFB for td-tpm's
-//! session parameter encryption. No padding or authentication here.
+//! Bounded AES-256-CBC primitive for CTAP, AES-128-CFB for td-tpm's
+//! session parameter encryption, and AES-128 key unwrap for td-netd's
+//! WPA2 group keys. No padding or other authentication here.
 
 const MAX_BYTES: usize = 128;
 /// td-tpm's MAX_PACKET: no TPM parameter is longer.
 const MAX_CFB_BYTES: usize = 4096;
+/// Key unwrap's longest plaintext: an EAPOL-Key frame's whole key data
+/// field fits a 16-bit length, and no WPA2 key data comes near this.
+const MAX_UNWRAP_BYTES: usize = 1024;
+/// RFC 3394's default initial value, the unwrap's integrity check.
+const WRAP_IV: [u8; 8] = [0xa6; 8];
 
 pub fn encrypt(key: &[u8; 32], iv: &[u8; 16], bytes: &mut [u8]) -> Result<(), &'static str> {
     validate_length(bytes.len())?;
@@ -58,6 +64,55 @@ fn cfb(key: &[u8; 16], iv: &[u8; 16], bytes: &mut [u8], encrypt: bool) -> Result
         }
         pad.fill(0);
         std::hint::black_box(&mut pad);
+    }
+    Ok(())
+}
+
+/// RFC 3394 AES key unwrap under a 128-bit key-encryption key, as WPA2's
+/// EAPOL-Key key data uses it (IEEE 802.11-2020 12.7.2): `wrapped` is
+/// `out.len() + 8` bytes, `out` at least two and at most 128 whole 64-bit
+/// blocks. An integrity failure zeroes `out` and is refused.
+pub fn key_unwrap_128(kek: &[u8; 16], wrapped: &[u8], out: &mut [u8]) -> Result<(), &'static str> {
+    if out.len() < 16
+        || out.len() > MAX_UNWRAP_BYTES
+        || !out.len().is_multiple_of(8)
+        || wrapped.len() != out.len() + 8
+    {
+        return Err("AES key unwrap needs 2 to 128 whole blocks and one more of check");
+    }
+    let (initial, rest) = wrapped.split_at(8);
+    out.copy_from_slice(rest);
+    let mut check = [0u8; 8];
+    check.copy_from_slice(initial);
+    let aes = Aes128::new(kek);
+    let blocks = out.len() / 8;
+    let mut state = [0u8; 16];
+    for round in (0..6u64).rev() {
+        for (index, block) in out.as_chunks_mut::<8>().0.iter_mut().enumerate().rev() {
+            // t = n*j + i, RFC 3394 2.2.2 with i counting from one.
+            let t = (blocks as u64) * round + index as u64 + 1;
+            for (byte, step) in check.iter_mut().zip(t.to_be_bytes()) {
+                *byte ^= step;
+            }
+            let (high, low) = state.split_at_mut(8);
+            high.copy_from_slice(&check);
+            low.copy_from_slice(block);
+            aes.decrypt_block(&mut state);
+            let (high, low) = state.split_at(8);
+            check.copy_from_slice(high);
+            block.copy_from_slice(low);
+        }
+    }
+    state.fill(0);
+    std::hint::black_box(&mut state);
+    let difference = check
+        .iter()
+        .zip(WRAP_IV)
+        .fold(0u8, |difference, (a, b)| difference | (a ^ b));
+    if std::hint::black_box(difference) != 0 {
+        out.fill(0);
+        std::hint::black_box(&mut *out);
+        return Err("AES key unwrap integrity check failed");
     }
     Ok(())
 }
@@ -127,6 +182,11 @@ impl Aes128 {
         let [first, middle @ .., last] = &*self.rounds;
         encrypt_rounds(first, middle, last, state);
     }
+
+    fn decrypt_block(&self, state: &mut [u8; 16]) {
+        let [first, middle @ .., last] = &*self.rounds;
+        decrypt_rounds(first, middle, last, state);
+    }
 }
 
 impl Aes256 {
@@ -182,17 +242,21 @@ impl Aes256 {
 
     fn decrypt_block(&self, state: &mut [u8; 16]) {
         let [first, middle @ .., last] = &*self.rounds;
-        xor(state, last);
-        for key in middle.iter().rev() {
-            inverse_shift_rows(state);
-            substitute(state, inverse_sbox);
-            xor(state, key);
-            inverse_mix_columns(state);
-        }
+        decrypt_rounds(first, middle, last, state);
+    }
+}
+
+fn decrypt_rounds(first: &[u8; 16], middle: &[[u8; 16]], last: &[u8; 16], state: &mut [u8; 16]) {
+    xor(state, last);
+    for key in middle.iter().rev() {
         inverse_shift_rows(state);
         substitute(state, inverse_sbox);
-        xor(state, first);
+        xor(state, key);
+        inverse_mix_columns(state);
     }
+    inverse_shift_rows(state);
+    substitute(state, inverse_sbox);
+    xor(state, first);
 }
 
 fn encrypt_rounds(first: &[u8; 16], middle: &[[u8; 16]], last: &[u8; 16], state: &mut [u8; 16]) {
@@ -334,6 +398,8 @@ mod tests {
         let mut block = hex("00112233445566778899aabbccddeeff");
         aes.encrypt_block(&mut block);
         assert_eq!(block, hex("69c4e0d86a7b0430d8cdb78070b4c55a"));
+        aes.decrypt_block(&mut block);
+        assert_eq!(block, hex("00112233445566778899aabbccddeeff"));
         // FIPS 197 A.1's last round key.
         assert_eq!(
             Aes128::new(&hex("2b7e151628aed2a6abf7158809cf4f3c")).rounds[10],
@@ -480,5 +546,94 @@ mod tests {
             lengths.into_iter().collect::<Vec<_>>(),
             (1..=8).map(|n| n * 16).collect::<Vec<_>>()
         );
+    }
+
+    /// RFC 3394 2.2.1's wrap, the reference the unwrap must invert.
+    fn wrap(kek: &[u8; 16], plain: &[u8]) -> Vec<u8> {
+        let aes = Aes128::new(kek);
+        let mut check = WRAP_IV;
+        let mut blocks: Vec<[u8; 8]> = plain.as_chunks::<8>().0.iter().copied().collect();
+        let n = blocks.len() as u64;
+        for round in 0..6u64 {
+            for (index, block) in blocks.iter_mut().enumerate() {
+                let mut state = [0u8; 16];
+                state[..8].copy_from_slice(&check);
+                state[8..].copy_from_slice(block);
+                aes.encrypt_block(&mut state);
+                let t = n * round + index as u64 + 1;
+                for (out, (byte, step)) in
+                    check.iter_mut().zip(state[..8].iter().zip(t.to_be_bytes()))
+                {
+                    *out = byte ^ step;
+                }
+                block.copy_from_slice(&state[8..]);
+            }
+        }
+        let mut out = check.to_vec();
+        for block in blocks {
+            out.extend_from_slice(&block);
+        }
+        out
+    }
+
+    #[test]
+    fn rfc3394_unwraps_its_128_bit_vector() {
+        let kek = hex("000102030405060708090a0b0c0d0e0f");
+        let wrapped = hex::<24>("1fa68b0a8112b447aef34bd8fb5a7b829d3e862371d2cfe5");
+        let mut out = [0u8; 16];
+        key_unwrap_128(&kek, &wrapped, &mut out).unwrap();
+        assert_eq!(out, hex("00112233445566778899aabbccddeeff"));
+        assert_eq!(wrap(&kek, &out), wrapped.to_vec());
+    }
+
+    /// A WPA2 group key's key data, a KDE with padding, round trips at
+    /// every admitted length; any flipped bit is refused with `out`
+    /// zeroed.
+    #[test]
+    fn unwrap_inverts_wrap_and_refuses_any_change() {
+        let kek = hex("2b7e151628aed2a6abf7158809cf4f3c");
+        for blocks in 2..=128usize {
+            let plain: Vec<u8> = (0..blocks * 8).map(|i| (i * 7 + blocks) as u8).collect();
+            let wrapped = wrap(&kek, &plain);
+            let mut out = vec![0u8; plain.len()];
+            key_unwrap_128(&kek, &wrapped, &mut out).unwrap();
+            assert_eq!(out, plain, "{blocks}");
+        }
+        let plain: Vec<u8> = (0..40).collect();
+        let wrapped = wrap(&kek, &plain);
+        // Python `cryptography`'s aes_key_wrap over the same key and bytes.
+        assert_eq!(
+            wrapped,
+            hex::<48>("278305838c7c6e299d87212e3a681c4c1a6590d9f6fdf70dc5945d8245a7c1b4bc3ecdd85f892a1ea7c0468d09de001e").to_vec()
+        );
+        for bit in 0..wrapped.len() * 8 {
+            let mut changed = wrapped.clone();
+            changed[bit / 8] ^= 1 << (bit % 8);
+            let mut out = vec![0x55u8; plain.len()];
+            assert!(key_unwrap_128(&kek, &changed, &mut out).is_err(), "{bit}");
+            assert!(out.iter().all(|byte| *byte == 0), "{bit}");
+        }
+        let mut out = vec![0u8; plain.len()];
+        assert!(
+            key_unwrap_128(&hex("000102030405060708090a0b0c0d0e0f"), &wrapped, &mut out).is_err()
+        );
+    }
+
+    #[test]
+    fn unwrap_refuses_lengths_outside_its_bounds() {
+        let kek = [0u8; 16];
+        for (wrapped, out) in [
+            (16, 8),
+            (24, 15),
+            (23, 16),
+            (25, 16),
+            (32, 16),
+            (1040, 1032),
+            (8, 0),
+        ] {
+            let mut buffer = vec![0x33u8; out];
+            assert!(key_unwrap_128(&kek, &vec![0; wrapped], &mut buffer).is_err());
+            assert!(buffer.iter().all(|byte| *byte == 0x33));
+        }
     }
 }

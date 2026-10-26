@@ -6441,7 +6441,10 @@ mod tests {
         // consumer's confinement tests.
         assert_eq!(
             readers_of("td-source-scan"),
-            ["td-busd", "td-init", "td-jail", "td-login", "td-sh", "td-svc", "td-util"]
+            [
+                "td-busd", "td-init", "td-jail", "td-login", "td-netd", "td-sh", "td-svc",
+                "td-util"
+            ]
         );
         // td-authd compiles td-install's consent codec by `#[path]`, and the
         // installation fixture its three protocol codecs.

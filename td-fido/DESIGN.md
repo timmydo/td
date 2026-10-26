@@ -70,7 +70,10 @@ prerequisites" onward):
   `SecretScalar::agree` public for td-tpm's session salt; `fido_aes`:
   AES-256-CBC for the PIN protocols, and AES-128 in CFB mode, over the
   same round function, for td-tpm's parameter encryption, pinned to
-  FIPS 197 and SP 800-38A.
+  FIPS 197 and SP 800-38A; and AES-128 key unwrap (RFC 3394) over the
+  inverse cipher, for td-netd's WPA2 group keys, pinned to RFC 3394's
+  vectors, bounded to 16 to 1024 bytes and zeroing its output when the
+  integrity check fails.
 - `fido_device`: root and desktop hidraw admission, the operation lock
   under `/run/td-fido` (or the desktop runtime directory), the Session
   that drives a token through a HID worker, and that worker.
@@ -116,9 +119,10 @@ dependent is an amendment here and to `FIDO_DEPENDENTS` in
 that reach it only through td-secret or td-tpm, as td-pass does, are
 not dependents.
 
-Four crates compile some of its files as shared source instead:
+Five crates compile some of its files as shared source instead:
 td-protector compiles `hmac.rs` for its PIN's authValue and its lockout
-token's HKDF (below); as
+token's HKDF (below); td-netd compiles `fido_aes.rs` for the key unwrap,
+its recipe staging the file beside its own sources; as
 they compiled td-secret's, td-firstboot and td-portal read td-secret's
 token-protected store through `fido_cbor`, `fido_ctap`, `fido_enroll`,
 `fido_hid`, and `hmac.rs` and `root.rs` through td-secret's store
