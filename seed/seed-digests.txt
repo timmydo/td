@@ -10,7 +10,7 @@
 # moving it into place. Hand-editing a row
 # is self-defeating: the runner
 # re-derives from the pins every run and reds on disagreement.
-ca-certificates-source 1nh4w1q566ga153y3h427ai268h934nx-ca-certificates-source
+ca-certificates-source gwd0r7fyqs45rzrnwwbzl2p5c76zrfad-ca-certificates-source
 cryptsetup-x86-64-source v3g69yip0g4zybh9yw2hlp3zzcfy98fc-cryptsetup-x86-64-source
 curl-x86-64-source 985mgjp6q4y958wwzqs984nkh399jnac-curl-x86-64-source
 fd-source rsp3qagl8x7gh5hqpzy93adwfv5pv2ay-fd-source

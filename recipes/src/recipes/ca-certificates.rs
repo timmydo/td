@@ -18,7 +18,7 @@ pub fn recipe() -> Recipe {
         },
     ];
 
-    Recipe::mesboot("ca-certificates", "2026-08-13")
+    Recipe::mesboot("ca-certificates", "2026-10-20")
         .source_input("ca-certificates-source")
         .steps(steps)
 }
