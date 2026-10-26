@@ -152,6 +152,7 @@ fn bucket(kind: Kind) -> usize {
     match kind {
         Kind::Performance { phase, .. } => 27 + phase as usize,
         Kind::DeliveryNoticeDeferred { .. } => 25,
+        Kind::RelayPollDeferred => 26,
         Kind::BootStarted => 0,
         Kind::ConfigActivated => 1,
         Kind::ListenerReady {

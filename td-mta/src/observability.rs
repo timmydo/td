@@ -135,6 +135,8 @@ impl Delivery {
 /// Fixed relay phases; never copied from server text.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RelayStep {
+    IdlePoll,
+    LeaseRenewal,
     Mail,
     Rcpt,
     Data,
@@ -145,6 +147,8 @@ pub enum RelayStep {
 impl RelayStep {
     pub const fn code(self) -> &'static str {
         match self {
+            Self::IdlePoll => "idle_poll",
+            Self::LeaseRenewal => "lease_renewal",
             Self::Mail => "mail",
             Self::Rcpt => "rcpt",
             Self::Data => "data",
@@ -206,6 +210,7 @@ fn notice_error(error: crate::postgres_failure_notice::Error) -> &'static str {
 /// No free-form strings, addresses, credentials or message fields are accepted.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Kind {
+    RelayPollDeferred,
     Performance {
         phase: crate::performance::Phase,
         sample: crate::performance::Sample,
@@ -267,6 +272,7 @@ pub enum Kind {
 impl Kind {
     pub const fn code(self) -> &'static str {
         match self {
+            Self::RelayPollDeferred => "relay_poll_deferred",
             Self::Performance { .. } => "performance",
             Self::DeliveryNoticeDeferred { .. } => "delivery_notice_deferred",
             Self::RelayConnectionFailed { .. } => "relay_connection_failed",
@@ -305,7 +311,8 @@ impl Kind {
                 outcome: Delivery::Retry | Delivery::PermanentFailure | Delivery::Unknown,
             } => Severity::Warning,
             Self::LogWriteFailed { .. } | Self::ServiceStopped { failed: true } => Severity::Error,
-            Self::Performance { .. }
+            Self::RelayPollDeferred
+            | Self::Performance { .. }
             | Self::ServiceStopped { failed: false }
             | Self::BootStarted
             | Self::ConfigActivated
@@ -335,7 +342,8 @@ impl Kind {
             } => Some("inspect_submission"),
             Self::CertificateRenewalFailed => Some("inspect_certificate"),
             Self::LogSuppressed { .. } | Self::LogWriteFailed { .. } => Some("inspect_logging"),
-            Self::Performance { .. }
+            Self::RelayPollDeferred
+            | Self::Performance { .. }
             | Self::BootStarted
             | Self::ConfigActivated
             | Self::ListenerReady { .. }
@@ -382,6 +390,7 @@ impl fmt::Display for EventJson<'_> {
             e.kind.severity().code()
         )?;
         match e.kind {
+            Kind::RelayPollDeferred => f.write_str(",\"reason\":\"storage_busy\"")?,
             Kind::Performance { phase, sample } => write!(f,
                 ",\"phase\":\"{}\",\"calls\":{},\"failures\":{},\"busy\":{},\"unavailable\":{},\"total_us\":{},\"max_us\":{},\"lost\":{}",
                 phase.code(), sample.calls, sample.failures, sample.busy, sample.unavailable,
@@ -630,6 +639,13 @@ mod tests {
             },
             Kind::ServiceStopped { failed: false },
             Kind::ServiceStopped { failed: true },
+            Kind::RelayPollDeferred,
+            Kind::RelayStepFailed {
+                stage: RelayStep::IdlePoll,
+            },
+            Kind::RelayStepFailed {
+                stage: RelayStep::LeaseRenewal,
+            },
             Kind::RelayConnectionFailed {
                 stage: crate::postgres_relay_connect::Stage::Auth,
                 error: Some(crate::ports::Error::Invalid),
@@ -825,6 +841,7 @@ mod tests {
     // Independent v1 contract oracle; a new variant requires an explicit policy.
     fn policy(kind: Kind) -> (&'static str, &'static str, &'static str) {
         match kind {
+            Kind::RelayPollDeferred => ("relay_poll_deferred", "info", "[]"),
             Kind::Performance { .. } => ("performance", "info", "[]"),
             Kind::DeliveryNoticeDeferred { .. } => {
                 ("delivery_notice_deferred", "warning", "[\"inspect_relay\"]")

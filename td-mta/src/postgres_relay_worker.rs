@@ -147,7 +147,7 @@ impl Worker<'_, '_> {
         state: &mut multi::AccountState,
         idle_reader: &mut crate::postgres_queue_candidates::IdleReader<'_, '_>,
         dns_cache: &mut crate::dns_owner::Cache,
-        expiry_turn: Option<&mut multi::ExpiryTurn>,
+        mut expiry_turn: Option<&mut multi::ExpiryTurn>,
         mut buffers: Buffers,
     ) -> Result<Buffers, Error> {
         state.active = database(worker.pending.identity())?.is_some();
@@ -156,12 +156,25 @@ impl Worker<'_, '_> {
         }
         settle(worker, settlement, control)?;
         if !state.active && self.queue.repair_request().is_none() {
-            let observed = {
-                database(idle_reader.observe(
-                    Instant::now() + Duration::from_secs(10),
-                    claim,
-                    generation,
-                ))?
+            let observed = match multi::idle_poll_result(
+                idle_reader.observe(Instant::now() + Duration::from_secs(10), claim, generation),
+                expiry_turn.as_deref_mut(),
+            ) {
+                Ok(multi::IdlePoll::Observed(observed)) => observed,
+                Ok(multi::IdlePoll::Deferred) => {
+                    control.log(crate::observability::Kind::RelayPollDeferred, None, None);
+                    return Ok(buffers);
+                }
+                Err(_) => {
+                    control.log(
+                        crate::observability::Kind::RelayStepFailed {
+                            stage: crate::observability::RelayStep::IdlePoll,
+                        },
+                        None,
+                        None,
+                    );
+                    return Err(Error::Database);
+                }
             };
             if let Some(observed_at) = observed {
                 self.observe_queue_clock(worker, observed_at)?;

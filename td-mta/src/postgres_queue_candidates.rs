@@ -187,7 +187,11 @@ impl<'a, 'r> IdleReader<'a, 'r> {
                 },
             )
             .map_err(Error::Connection)
-            .and_then(|result| result);
+            .and_then(|result| result)
+            .map_err(|error| match error {
+                Error::Owner(owners::Error::Busy) => Error::Busy,
+                other => other,
+            });
         if reused {
             crate::performance::record(
                 crate::performance::Phase::DbReuse,

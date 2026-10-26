@@ -146,7 +146,7 @@ pub(crate) async fn lock_account_policy(
     write: bool,
 ) -> Result<bool, Error> {
     let current_policy = if policy {
-        let row = client.query_typed_one("SELECT generation,version_id FROM td_mta.config_selection WHERE singleton=true FOR SHARE", &[]).await.map_err(|_|Error::Database)?;
+        let row = client.query_typed_one("SELECT generation,version_id FROM td_mta.config_selection WHERE singleton=true FOR SHARE", &[]).await.map_err(lock_error)?;
         let version: Option<&[u8]> = row.try_get(1).map_err(|_| Error::Integrity)?;
         claim.binding.roles().relay()
             && number(row.try_get(0).map_err(|_| Error::Integrity)?)?
@@ -169,8 +169,15 @@ pub(crate) async fn lock_account_policy(
             )],
         )
         .await
-        .map_err(|_| Error::Database)?;
+        .map_err(lock_error)?;
     Ok(current_policy)
+}
+fn lock_error(error: tokio_postgres::Error) -> Error {
+    if error.code() == Some(&tokio_postgres::error::SqlState::LOCK_NOT_AVAILABLE) {
+        Error::Busy
+    } else {
+        Error::Database
+    }
 }
 async fn now(client: &Client) -> Result<i64, Error> {
     client

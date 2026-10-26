@@ -653,6 +653,7 @@ fn retained_idle(
     );
     assert!(other.observe(deadline(), claim, generation).is_ok());
     other.close();
+    idle_account_contention(fixture, request, trust, claim, generation);
 }
 
 fn retained_renewal(
@@ -773,4 +774,63 @@ fn retained_renewal(
         "t"
     );
     owners::observe(request, trust, deadline(), claim, generation).unwrap();
+}
+
+fn idle_account_contention(
+    fixture: &Fixture,
+    request: &td_mta::postgres_probe::Request<'_>,
+    trust: &TrustStore,
+    claim: &td_mta::postgres_route_owners::Claim,
+    generation: u64,
+) {
+    use std::{
+        io::Write,
+        process::Stdio,
+        time::{Duration, Instant},
+    };
+    use td_mta::{postgres_queue_candidates as hints, postgres_read::ReadSlots};
+    td_mta::postgres_route_owners::renew(request, trust, deadline(), claim, generation).unwrap();
+    let slots = ReadSlots::new(1).unwrap();
+    let mut reader = hints::IdleReader::new(&slots, request, trust);
+    let expected = reader
+        .observe(deadline(), claim, generation)
+        .unwrap()
+        .is_some();
+    let pid = super::body_checks::backend(fixture);
+    let mut blocker = super::ProbeChild(
+        super::sql_command(fixture)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let mut input = blocker.0.stdin.take().unwrap();
+    writeln!(
+        input,
+        "BEGIN; SELECT id FROM td_mta.accounts FOR UPDATE /* idle_poll_barrier */;"
+    )
+    .unwrap();
+    let stop = deadline();
+    while sql(fixture, "SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE application_name='td-mta-schema-fixture' AND state='idle in transaction' AND query LIKE '%idle_poll_barrier%'") != "1" {
+        assert!(Instant::now() < stop, "idle poll barrier was not acquired");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // The blocker remains held until the real operation returns. No timed
+    // release or elapsed-time assertion decides whether contention occurred.
+    let result = reader.observe(deadline(), claim, generation);
+    writeln!(input, "ROLLBACK;\n\\q").unwrap();
+    drop(input);
+    super::wait_command(&mut blocker);
+    assert_eq!(result, Err(hints::Error::Busy));
+    super::body_checks::closed(fixture, &pid);
+    assert_eq!(
+        reader
+            .observe(deadline(), claim, generation)
+            .unwrap()
+            .is_some(),
+        expected
+    );
+    assert_ne!(super::body_checks::backend(fixture), pid);
+    reader.close();
 }

@@ -6835,6 +6835,15 @@ No account lock, transaction or absence observation survives the job. Idle
 checks retain no authority to send. Failure retires the session; an observable
 idle disconnect can reconnect before a job, never replay an admitted one.
 
+A lock timeout on the idle job's configuration/account lock is a Busy
+observation, not evidence of work or permission to send. The failed read
+retires its session and releases its permit. The foreground worker defers
+that account until a later bounded scheduling round and yields any owned
+expiry turn so other accounts can progress, with the same empty-round backoff; it records `relay_poll_deferred` with `storage_busy`. Other idle
+failures still stop the worker and record `relay_step_failed` at `idle_poll`.
+Lease-renewal errors remain fail-stop and are recorded at `lease_renewal`;
+no renewal, publication or uncertain COMMIT is replayed by this policy.
+
 The worker closes this reader before pending settlement, explicit repair,
 positive-hint processing, delivery custody and final lease release. Rotation,
 shutdown and error cleanup close the connection before releasing its permit;

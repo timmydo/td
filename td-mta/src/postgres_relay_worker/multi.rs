@@ -38,6 +38,26 @@ impl ExpiryTurn {
         self.cursor = (self.cursor + 1) % self.count;
     }
 }
+#[derive(Debug, Eq, PartialEq)]
+pub(super) enum IdlePoll {
+    Observed(Option<i64>),
+    Deferred,
+}
+pub(super) fn idle_poll_result(
+    result: Result<Option<i64>, crate::postgres_queue_candidates::Error>,
+    expiry_turn: Option<&mut ExpiryTurn>,
+) -> Result<IdlePoll, crate::postgres_queue_candidates::Error> {
+    match result {
+        Ok(observed) => Ok(IdlePoll::Observed(observed)),
+        Err(crate::postgres_queue_candidates::Error::Busy) => {
+            if let Some(turn) = expiry_turn {
+                turn.advance();
+            }
+            Ok(IdlePoll::Deferred)
+        }
+        Err(error) => Err(error),
+    }
+}
 struct Slot {
     claim: owners::Claim,
     grant: Option<owners::Grant>,
@@ -189,6 +209,13 @@ impl Registry {
                 break;
             }
             if let Err(error) = self.renew(worker, Some(&mut renewer)) {
+                control.log(
+                    crate::observability::Kind::RelayStepFailed {
+                        stage: crate::observability::RelayStep::LeaseRenewal,
+                    },
+                    None,
+                    None,
+                );
                 control.stop();
                 return Err(error);
             }
@@ -389,6 +416,55 @@ mod tests {
         assert_eq!(idle.after_round(false), Duration::from_millis(500));
         assert_eq!(idle.after_round(false), Duration::from_secs(1));
         assert_eq!(idle.after_round(false), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn busy_idle_account_yields_expiry_to_the_next_account() {
+        use crate::postgres_queue_candidates::Error as PollError;
+        let sample = |ms| Time {
+            utc_ms: ms as i64,
+            monotonic: Tick(ms),
+        };
+        let mut guard = Guard::new(sample(0)).unwrap();
+        guard.confirm(sample(300_000)).unwrap();
+        let mut turn = ExpiryTurn {
+            cursor: 0,
+            count: 2,
+        };
+        let mut expired = Vec::new();
+        for cycle in 0..6 {
+            for account in 0..2 {
+                let owns_expiry = turn.current(account);
+                let result = if account == 0 {
+                    Err(PollError::Busy)
+                } else {
+                    Ok(None)
+                };
+                let observed = idle_poll_result(result, owns_expiry.then_some(&mut turn)).unwrap();
+                if account == 0 {
+                    assert_eq!(observed, IdlePoll::Deferred);
+                } else {
+                    assert_eq!(observed, IdlePoll::Observed(None));
+                    if owns_expiry {
+                        guard.admit_expiry(sample(300_000 + cycle * 1000)).unwrap();
+                        expired.push(account);
+                        turn.advance();
+                    }
+                }
+            }
+        }
+        assert_eq!(expired, vec![1; 6]);
+        let prior = turn.cursor;
+        assert_eq!(
+            idle_poll_result(Err(PollError::Policy), Some(&mut turn)),
+            Err(PollError::Policy)
+        );
+        assert_eq!(turn.cursor, prior);
+        assert_eq!(
+            idle_poll_result(Err(PollError::Busy), None),
+            Ok(IdlePoll::Deferred)
+        );
+        assert_eq!(turn.cursor, prior);
     }
 
     #[test]
