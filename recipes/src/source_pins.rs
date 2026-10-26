@@ -307,10 +307,10 @@ const PINS: &[PinDef] = &[
         aliases: &[],
         // cryptsetup requires libuuid and libblkid. The recipe builds only
         // those two static libraries; no util-linux programs are shipped.
-        url: "https://www.kernel.org/pub/linux/utils/util-linux/v2.42/util-linux-2.42.2.tar.xz",
-        sha256: "03a05d3adf9602ef128f2da05b84b3205ce60c351e5737c0370f74000679ce8a",
-        file: "util-linux-2.42.2.tar.xz",
-        version: "2.42.2",
+        url: "https://www.kernel.org/pub/linux/utils/util-linux/v2.42/util-linux-2.42.4.tar.xz",
+        sha256: "fbd62a100ab7bb8746ba0661255c3c48185b1e9021507c624da01fbc696330ec",
+        file: "util-linux-2.42.4.tar.xz",
+        version: "2.42.4",
     },
     PinDef {
         key: "uutils-source",
@@ -466,7 +466,7 @@ mod tests {
         // Clippy release components +
         // coreutils-0.9.0, ripgrep 14.1.1, and fd 10.2.0 (the Rust userland
         // `.crate` sources) +
-        // util-linux 2.42.2 (cryptsetup's minimal libuuid/libblkid build
+        // util-linux 2.42.4 (cryptsetup's minimal libuuid/libblkid build
         // closure) + the first reviewed
         // foreign application seed, upstream ripgrep 15.2.0, LibreSSL 4.4.0,
         // curl 8.23.0 (the static HTTPS foundation for Git), Git 2.56.0,

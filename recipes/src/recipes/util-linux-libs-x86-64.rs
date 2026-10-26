@@ -26,7 +26,7 @@ pub fn recipe() -> Recipe {
                 "./configure",
                 "--build=x86_64-pc-linux-gnu",
                 "--host=x86_64-pc-linux-gnu",
-                "--prefix=/td/store/util-linux-libs-2.42.2-x86_64",
+                "--prefix=/td/store/util-linux-libs-2.42.4-x86_64",
                 "--disable-shared",
                 "--enable-static",
                 "--disable-all-programs",
@@ -137,7 +137,7 @@ pub fn recipe() -> Recipe {
         .env("PATH", &path),
     );
 
-    Recipe::mesboot("util-linux-libs-x86-64", "2.42.2")
+    Recipe::mesboot("util-linux-libs-x86-64", "2.42.4")
         .source_input("util-linux-libs-x86-64-source")
         .build_root()
         .native_inputs(&["glibc-x86-64", "gcc-runtime"])

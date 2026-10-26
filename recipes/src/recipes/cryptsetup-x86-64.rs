@@ -52,8 +52,8 @@ pub fn recipe() -> Recipe {
              \tesac\n\
              done\n\
              case \"$mod\" in\n\
-             \tblkid) inc='-I{ul}/include'; link='-L{ul}/lib -lblkid'; ver=2.42.2;;\n\
-             \tuuid) inc='-I{ul}/include'; link='-L{ul}/lib -luuid'; ver=2.42.2;;\n\
+             \tblkid) inc='-I{ul}/include'; link='-L{ul}/lib -lblkid'; ver=2.42.4;;\n\
+             \tuuid) inc='-I{ul}/include'; link='-L{ul}/lib -luuid'; ver=2.42.4;;\n\
              \tjson-c) inc='-I{jc}/include -I{jc}/include/json-c'; link='-L{jc}/lib -ljson-c -lm'; ver=0.18;;\n\
              \tdevmapper) inc='-I{dm}/include'; link='-L{dm}/lib -ldevmapper -lpthread -lm'; ver=1.02.217;;\n\
              \t*) exit 1;;\n\
