@@ -173,7 +173,7 @@ pub fn recipe() -> Recipe {
     }
     steps.push(Step::WriteFile {
         path: "{out}/result".into(),
-        content: "PASS: upstream Rust 1.96.0 runs on td glibc, gcc-runtime and zlib, links through td-link and rust-lld, builds with Cargo offline and lints with Clippy; ripgrep, fd and uutils name td glibc's loader and carry Build-ID-matched debug companions\n".into(),
+        content: "PASS: upstream Rust 1.99.1 runs on td glibc, gcc-runtime and zlib, links through td-link and rust-lld, builds with Cargo offline and lints with Clippy; ripgrep, fd and uutils name td glibc's loader and carry Build-ID-matched debug companions\n".into(),
         exec: false,
     });
     steps.push(Step::Require {
@@ -187,7 +187,7 @@ pub fn recipe() -> Recipe {
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
-echo ">> recipe-check rust-toolchain-test: in the Debian build root, upstream Rust 1.96.0's relinked executables, lib links and gcc-ld are td's, rustc links through td-link and rust-lld, Cargo builds offline, Clippy denies unwrap(), and ripgrep, fd and uutils carry td glibc's loader and Build-ID-matched debug companions"
+echo ">> recipe-check rust-toolchain-test: in the Debian build root, upstream Rust 1.99.1's relinked executables, lib links and gcc-ld are td's, rustc links through td-link and rust-lld, Cargo builds offline, Clippy denies unwrap(), and ripgrep, fd and uutils carry td glibc's loader and Build-ID-matched debug companions"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run rust-toolchain-test 1
 "#,

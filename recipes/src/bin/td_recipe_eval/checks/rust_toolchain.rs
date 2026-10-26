@@ -41,7 +41,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         tools.push(script_tool(runner, stem)?);
     }
     println!(
-        "   [toolchain] x86_64 upstream Rust 1.96.0 via build-plan --auto, retargeted onto td glibc/libgcc/zlib ({})",
+        "   [toolchain] x86_64 upstream Rust 1.99.1 via build-plan --auto, retargeted onto td glibc/libgcc/zlib ({})",
         rust_tree.display()
     );
 
@@ -50,12 +50,12 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     let link_base = path_basename(&link_tree)?;
     let rust_path = format!("{TD_STORE_DIR}/{rust_base}");
 
-    for (binary, version) in [("rustc", "rustc 1.96.0"), ("cargo", "cargo 1.96.0")] {
+    for (binary, version) in [("rustc", "rustc 1.99.1"), ("cargo", "cargo 1.99.1")] {
         let out =
             runner.store_ns_output(&[&format!("{rust_path}/bin/{binary}"), "--version"], None)?;
         if !out.starts_with(version) {
             return Err(format!(
-                "{binary} version did not match the pinned 1.96.0 release: {}",
+                "{binary} version did not match the pinned 1.99.1 release: {}",
                 out.trim()
             ));
         }
@@ -70,7 +70,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         glibc_base,
     )?;
     println!(
-        "PASS: rust-toolchain: upstream Rust 1.96.0 rustc and Cargo run on td glibc under own-root /td/store, and td shell builds (or reuses from its cache) and runs ripgrep/fd/uutils there with /gnu/store absent"
+        "PASS: rust-toolchain: upstream Rust 1.99.1 rustc and Cargo run on td glibc under own-root /td/store, and td shell builds (or reuses from its cache) and runs ripgrep/fd/uutils there with /gnu/store absent"
     );
     Ok(())
 }

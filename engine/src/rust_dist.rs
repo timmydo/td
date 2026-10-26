@@ -505,7 +505,7 @@ mod tests {
     #[test]
     fn unpack_rust_component_strips_top_and_guards_layout() {
         let d = tmp("td-rust-unpack");
-        let top = "rustc-1.96.0-x86_64-unknown-linux-gnu";
+        let top = "rustc-1.99.1-x86_64-unknown-linux-gnu";
         let good = d.join("good.tar");
         fs::write(
             &good,
@@ -576,9 +576,9 @@ mod tests {
         let d = tmp("td-rust-needed");
         let bin = d.join("lib/rustlib/x86_64-unknown-linux-gnu/bin");
         fs::create_dir_all(&bin).unwrap();
-        fs::write(d.join("lib/libLLVM.so.22.1"), b"").unwrap();
+        fs::write(d.join("lib/libLLVM.so.23.1"), b"").unwrap();
         fs::write(d.join("lib/libc.so.6"), b"").unwrap();
-        let needed: Vec<String> = ["libLLVM.so.22.1", "libc.so.6", "ld-linux-x86-64.so.2"]
+        let needed: Vec<String> = ["libLLVM.so.23.1", "libc.so.6", "ld-linux-x86-64.so.2"]
             .iter()
             .map(|name| name.to_string())
             .collect();
@@ -608,17 +608,17 @@ mod tests {
     fn shared_libraries_are_the_real_objects_and_required() {
         let d = tmp("td-rust-shared");
         fs::create_dir_all(d.join("lib")).unwrap();
-        fs::write(d.join("lib/libLLVM-22-rust-1.96.0-stable.so"), b"INPUT(x)").unwrap();
+        fs::write(d.join("lib/libLLVM-23-rust-1.99.1-stable.so"), b"INPUT(x)").unwrap();
         fs::write(d.join("lib/librustc_driver-4d71126a08f22b4a.so"), b"").unwrap();
         let err = rust_shared_libs(&d).unwrap_err();
         assert!(err.contains("libLLVM.so."), "{err}");
-        fs::write(d.join("lib/libLLVM.so.22.1-rust-1.96.0-stable"), b"").unwrap();
+        fs::write(d.join("lib/libLLVM.so.23.1-rust-1.99.1-stable"), b"").unwrap();
         let libs = rust_shared_libs(&d).unwrap();
         assert_eq!(
             libs,
             [
                 d.join("lib/librustc_driver-4d71126a08f22b4a.so"),
-                d.join("lib/libLLVM.so.22.1-rust-1.96.0-stable"),
+                d.join("lib/libLLVM.so.23.1-rust-1.99.1-stable"),
             ]
         );
         let _ = fs::remove_dir_all(&d);

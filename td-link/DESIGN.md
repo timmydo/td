@@ -38,7 +38,7 @@ with the build directory.
 
 ## What it accepts
 
-The driver accepts the arguments rustc 1.96's GNU-cc linker flavor
+The driver accepts the arguments rustc 1.99's GNU-cc linker flavor
 writes for `x86_64-unknown-linux-gnu` and refuses everything else, so a
 compile request, an unexpected option or a host library fails in the
 driver rather than inside a link:

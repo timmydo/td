@@ -84,7 +84,7 @@ pub const ASSEMBLY_EXCEPTIONS: &[(&str, &str)] = &[
     // are incomplete, and its compiler-runtime assembly.
     (
         "rust-toolchain",
-        "upstream Rust 1.96.0 prebuilt standard library and compiler-runtime",
+        "upstream Rust 1.99.1 prebuilt standard library and compiler-runtime",
     ),
     // The target-built td-net multicall, the fetch service's tier, links
     // rustls through `ring`, whose pregenerated x86_64 assembly is compiled
@@ -290,7 +290,7 @@ mod tests {
                 ("gcc-runtime", "Debian prebuilt libgcc and startup objects; frame pointers and symbols not guaranteed"),
                 (
                     "rust-toolchain",
-                    "upstream Rust 1.96.0 prebuilt standard library and compiler-runtime"
+                    "upstream Rust 1.99.1 prebuilt standard library and compiler-runtime"
                 ),
                 ("td-net", "ring 0.17.14 x86_64 assembly"),
             ]
@@ -311,7 +311,7 @@ mod tests {
                 ("gcc-runtime", "Debian prebuilt libgcc and startup objects; frame pointers and symbols not guaranteed"),
                 (
                     "rust-toolchain",
-                    "upstream Rust 1.96.0 prebuilt standard library and compiler-runtime"
+                    "upstream Rust 1.99.1 prebuilt standard library and compiler-runtime"
                 ),
             ]
         );
@@ -322,7 +322,7 @@ mod tests {
                 ("gcc-runtime", "Debian prebuilt libgcc and startup objects; frame pointers and symbols not guaranteed"),
                 (
                     "rust-toolchain",
-                    "upstream Rust 1.96.0 prebuilt standard library and compiler-runtime"
+                    "upstream Rust 1.99.1 prebuilt standard library and compiler-runtime"
                 ),
                 ("td-net", "ring 0.17.14 x86_64 assembly"),
             ]
@@ -337,7 +337,7 @@ mod tests {
                     ("gcc-runtime", "Debian prebuilt libgcc and startup objects; frame pointers and symbols not guaranteed"),
                     (
                         "rust-toolchain",
-                        "upstream Rust 1.96.0 prebuilt standard library and compiler-runtime"
+                        "upstream Rust 1.99.1 prebuilt standard library and compiler-runtime"
                     ),
                 ],
                 "{application}"
@@ -361,7 +361,7 @@ mod tests {
                 ("gcc-runtime", "Debian prebuilt libgcc and startup objects; frame pointers and symbols not guaranteed"),
                 (
                     "rust-toolchain",
-                    "upstream Rust 1.96.0 prebuilt standard library and compiler-runtime"
+                    "upstream Rust 1.99.1 prebuilt standard library and compiler-runtime"
                 ),
             ]
         );

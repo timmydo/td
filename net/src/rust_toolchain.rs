@@ -416,7 +416,10 @@ mod tests {
             "r/rustc/lib/librustc_driver-test.so".into(),
             library.clone(),
         ));
-        rustc.push(("r/rustc/lib/libLLVM.so.22".into(), library));
+        rustc.push((
+            "r/rustc/lib/libLLVM.so.23.1-rust-1.99.1-stable".into(),
+            library,
+        ));
         let rustc_refs: Vec<_> = rustc
             .iter()
             .map(|(name, bytes)| (name.as_str(), bytes.clone()))
@@ -457,7 +460,7 @@ mod tests {
         }
         let config = Config {
             identity: "a".repeat(64),
-            version: "1.96.0".into(),
+            version: "1.99.1".into(),
             libgcc: glibc.join("lib/libgcc_s.so.1"),
             libz: glibc.join("lib/libz.so.1"),
             glibc,
@@ -475,7 +478,7 @@ mod tests {
 
     #[test]
     fn configuration_binds_version_pins_and_runtime_paths() {
-        let mut text = String::from("td-rust-v1\n1.96.0\n/td/store/glibc/libc\n/td/store/gcc/libgcc_s.so.1\n/td/store/zlib/libz.so.1\n");
+        let mut text = String::from("td-rust-v1\n1.99.1\n/td/store/glibc/libc\n/td/store/gcc/libgcc_s.so.1\n/td/store/zlib/libz.so.1\n");
         for (name, _) in COMPONENTS {
             text.push_str(&format!(
                 "{name}\thttps://static.rust-lang.org/dist/{name}.tar.xz\t{}\n",
@@ -483,7 +486,7 @@ mod tests {
             ));
         }
         let parsed = Config::parse(text.as_bytes()).unwrap();
-        assert_eq!(parsed.version, "1.96.0");
+        assert_eq!(parsed.version, "1.99.1");
         assert_eq!(parsed.identity, sha256::hex_digest(text.as_bytes()));
         for broken in [
             text.replace("td-rust-v1", "td-rust-v2"),
@@ -497,7 +500,7 @@ mod tests {
         ] {
             assert!(Config::parse(broken.as_bytes()).is_err(), "{broken}");
         }
-        let changed = text.replace("1.96.0", "1.97.0");
+        let changed = text.replace("1.99.1", "1.100.0");
         assert_ne!(
             parsed.identity,
             Config::parse(changed.as_bytes()).unwrap().identity

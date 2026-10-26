@@ -315,36 +315,36 @@ const PINS: &[PinDef] = &[
     PinDef {
         key: "rust-rustc-dist",
         aliases: &[],
-        // The upstream Rust 1.96.0 release (channel-rust-1.96.0.toml, dated
-        // 2026-05-28), retargeted onto td's runtime by `rust-toolchain`.
-        url: "https://static.rust-lang.org/dist/2026-05-28/rustc-1.96.0-x86_64-unknown-linux-gnu.tar.xz",
-        sha256: "7d7fa1d0cfb0fab71a956bb78f41107202c17f30ab56c45288e869a37fd9633d",
-        file: "rustc-1.96.0-x86_64-unknown-linux-gnu.tar.xz",
-        version: "1.96.0",
+        // The upstream Rust 1.99.1 release (channel-rust-1.99.1.toml, dated
+        // 2026-10-15), retargeted onto td's runtime by `rust-toolchain`.
+        url: "https://static.rust-lang.org/dist/2026-10-15/rustc-1.99.1-x86_64-unknown-linux-gnu.tar.xz",
+        sha256: "2ff05ff9c08a90861e7f6e4065b40a8b87463b4576186fd613871c3e37f2091f",
+        file: "rustc-1.99.1-x86_64-unknown-linux-gnu.tar.xz",
+        version: "1.99.1",
     },
     PinDef {
         key: "rust-std-dist",
         aliases: &[],
-        url: "https://static.rust-lang.org/dist/2026-05-28/rust-std-1.96.0-x86_64-unknown-linux-gnu.tar.xz",
-        sha256: "c09c7c646248f14f473f5f7a029af15ee57c3a9f9bc93dfa72d9621938586b82",
-        file: "rust-std-1.96.0-x86_64-unknown-linux-gnu.tar.xz",
-        version: "1.96.0",
+        url: "https://static.rust-lang.org/dist/2026-10-15/rust-std-1.99.1-x86_64-unknown-linux-gnu.tar.xz",
+        sha256: "109b074225bf5b9ea3820890876bfdf4ed161adbfaf94b2b4b5984c85ee5d958",
+        file: "rust-std-1.99.1-x86_64-unknown-linux-gnu.tar.xz",
+        version: "1.99.1",
     },
     PinDef {
         key: "rust-cargo-dist",
         aliases: &[],
-        url: "https://static.rust-lang.org/dist/2026-05-28/cargo-1.96.0-x86_64-unknown-linux-gnu.tar.xz",
-        sha256: "dee75c3c8f9f600ad75bc0c93249e767d3047845a4dd668327ce43ab039ba266",
-        file: "cargo-1.96.0-x86_64-unknown-linux-gnu.tar.xz",
-        version: "1.96.0",
+        url: "https://static.rust-lang.org/dist/2026-10-15/cargo-1.99.1-x86_64-unknown-linux-gnu.tar.xz",
+        sha256: "53f3521949404d595efb06a55c12c5658d4ed1c75566f33d3d514eaebe70bd8a",
+        file: "cargo-1.99.1-x86_64-unknown-linux-gnu.tar.xz",
+        version: "1.99.1",
     },
     PinDef {
         key: "rust-clippy-dist",
         aliases: &[],
-        url: "https://static.rust-lang.org/dist/2026-05-28/clippy-1.96.0-x86_64-unknown-linux-gnu.tar.xz",
-        sha256: "9b0b89c67d5ce8195e1c8733587a63e326353fdda65f62455a64fa03e25659f2",
-        file: "clippy-1.96.0-x86_64-unknown-linux-gnu.tar.xz",
-        version: "1.96.0",
+        url: "https://static.rust-lang.org/dist/2026-10-15/clippy-1.99.1-x86_64-unknown-linux-gnu.tar.xz",
+        sha256: "458339712a058e52cc4522ff9ef8b59cd1ea1340312216cd94194c464a3f6dc5",
+        file: "clippy-1.99.1-x86_64-unknown-linux-gnu.tar.xz",
+        version: "1.99.1",
     },
     PinDef {
         key: "tzdata-source",
@@ -527,7 +527,7 @@ mod tests {
     fn catalog_carries_all_legacy_source_locks() {
         // The Linux 4.14 UAPI-header source + the
         // linux-x86-64 kernel source (separate from the 4.14 UAPI-header
-        // pin, re #529) + the upstream Rust 1.96.0 rustc, rust-std, Cargo and
+        // pin, re #529) + the upstream Rust 1.99.1 rustc, rust-std, Cargo and
         // Clippy release components +
         // coreutils-0.9.0, ripgrep 14.1.1, and fd 10.2.0 (the Rust userland
         // `.crate` sources) +

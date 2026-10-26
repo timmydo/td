@@ -4291,7 +4291,7 @@ that stops reading its socket for longer than the deadline is disconnected.
 ## 4. Unsafe confinement
 
 Wayland carries wl_shm and wl_keyboard keymap descriptors as SCM_RIGHTS
-ancillary data on its Unix stream. Stable Rust 1.96 exposes no stable
+ancillary data on its Unix stream. Stable Rust 1.99 exposes no stable
 ancillary-data API. The user approved one new target-side exception for this
 transport.
 

@@ -532,7 +532,7 @@ mod tests {
         let cold = survey(&root, &sources, &["system-x86-64"]).unwrap();
         let files: Vec<&str> = cold.sources.iter().map(|p| p.file.as_str()).collect();
         assert!(
-            files.iter().any(|f| f.starts_with("rustc-1.96.0-")),
+            files.iter().any(|f| f.starts_with("rustc-1.99.1-")),
             "the Rust toolchain must be reported cold: {files:?}"
         );
         assert!(

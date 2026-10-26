@@ -176,13 +176,28 @@ grep for both. The places include:
 - the engine's and builder's toolchain code (`builder/src/stage0.rs`,
   `builder/src/host_bin.rs`, `engine/src/target_profile.rs`),
   `td-link/src/plan.rs` and the rust-toolchain test;
-- `builder/src/crypto_portable.rs`, which pins its own dist date and the
-  musl and aarch64-musl rust-std hashes, and `td-crypto/PORTABLE.md`;
 - `engine/src/rust_dist.rs`, which names the libLLVM files a new LLVM
   renames.
 
+Some restatements carry facts about the release, not just its number;
+check each against the new release rather than renaming it. td-link
+accepts the linker options rustc's GNU-cc flavor writes plus td's own
+(diff `compiler/rustc_codegen_ssa/src/back/link.rs` and `linker.rs`
+between the two release tags), and design documents cite which std
+APIs are still unstable. Historical records, such as an audit naming
+the store path it ran against, stay as written.
+
 New Clippy lints can red the `-D warnings` and `-D unused` legs, so fix
 those in the same commit.
+
+td-crypto's portable kit (`builder/src/crypto_portable.rs`,
+`td-crypto/PORTABLE.md`) pins its own dist date, its own copies of the
+host component hashes and the musl and aarch64-musl rust-std hashes. Move
+it in a commit of its own: the kit's reconstructed NAR digests
+(`builder/src/crypto_isolated.rs` and PORTABLE.md) are rebuilt with
+`td-builder gate-crates crypto-portable-prepare` for each architecture,
+and its rustdoc API diagnostic (`builder/src/crypto_api.rs`) pins
+rustdoc's JSON `format_version`, which a new release usually advances.
 
 ## Holds
 

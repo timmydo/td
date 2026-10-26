@@ -23,7 +23,7 @@
 //!     2. rustc+cargo / the system cc already on PATH — the primary guix-free
 //!        resolution (rustup's default, a distro package, or a guix-home
 //!        profile): whatever the host provides, no /gnu/store pin.
-//!     3. rustup (`TD_RUST_VERSION`, default 1.96.0) — installs the pinned
+//!     3. rustup (`TD_RUST_VERSION`, default 1.99.1) — installs the pinned
 //!        toolchain AND `rustup target add x86_64-unknown-linux-musl`.
 //!
 //!   The resolved rust MUST ship the [`MUSL_TARGET`] self-contained static std
@@ -78,7 +78,7 @@ impl ProvisionEnv {
         ProvisionEnv {
             rust_home: nonempty("TD_RUST_HOME"),
             cc_home: nonempty("TD_CC_HOME"),
-            rust_version: nonempty("TD_RUST_VERSION").unwrap_or_else(|| "1.96.0".to_string()),
+            rust_version: nonempty("TD_RUST_VERSION").unwrap_or_else(|| "1.99.1".to_string()),
             search_path: std::env::var("PATH").unwrap_or_default(),
             native_td: std::fs::read_to_string("/etc/os-release")
                 .is_ok_and(|text| is_td_system(&text)),
@@ -1560,7 +1560,7 @@ mod tests {
         ProvisionEnv {
             rust_home: None,
             cc_home: None,
-            rust_version: "1.96.0".to_string(),
+            rust_version: "1.99.1".to_string(),
             search_path: String::new(),
             native_td: false,
         }

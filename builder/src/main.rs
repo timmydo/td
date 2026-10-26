@@ -18338,7 +18338,7 @@ daemon build START (2/2 active)
             format!(
                 "ripgrep-source /gnu/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-ripgrep-14.1.1.tar.gz source\n\
                  glibc-x86-64 {glibc} td-recipe-output\n\
-                 /td/store/cccccccccccccccccccccccccccccccc-rust-1.96.0-x86_64-store-native /td/store/cccccccccccccccccccccccccccccccc-rust-1.96.0-x86_64-store-native\n"
+                 /td/store/cccccccccccccccccccccccccccccccc-rust-1.99.1-x86_64-store-native /td/store/cccccccccccccccccccccccccccccccc-rust-1.99.1-x86_64-store-native\n"
             ),
         )
         .unwrap();

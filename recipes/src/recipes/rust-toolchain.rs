@@ -1,6 +1,6 @@
 use crate::types::{CheckRunner, Recipe, RecipeCheck};
 
-// rust-toolchain is the recipe build input for Rust 1.96.0 toolchain: upstream's prebuilt
+// rust-toolchain is the recipe build input for Rust 1.99.1 toolchain: upstream's prebuilt
 // x86_64-unknown-linux-gnu rustc, rust-std, Cargo and Clippy release
 // components, pinned by their channel-manifest SHA-256. It is a declared
 // build-tool trust root (AGENTS.md "Rust toolchain"), not a source build.
@@ -18,13 +18,13 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck};
 // `-fuse-ld=lld`. Dropped: the debugger scripts, the rust-analyzer server,
 // the other linker flavors, wasm-component-ld and rust-objcopy.
 pub fn recipe() -> Recipe {
-    Recipe::rust_dist("rust-toolchain", "1.96.0")
+    Recipe::rust_dist("rust-toolchain", "1.99.1")
         .source_input("rust-rustc-dist")
         .inputs(&["rust-std-dist", "rust-cargo-dist", "rust-clippy-dist"])
         .native_inputs(&["glibc-x86-64", "gcc-runtime", "zlib-x86-64"])
         .checks(vec![RecipeCheck::new(
             r#"
-echo ">> recipe-check rust-toolchain: retarget upstream Rust 1.96.0 onto td glibc/libgcc/zlib, run it under own-root /td/store, and build and run the td shell userland there (rust-toolchain-test grades its ELF, links and smokes)"
+echo ">> recipe-check rust-toolchain: retarget upstream Rust 1.99.1 onto td glibc/libgcc/zlib, run it under own-root /td/store, and build and run the td shell userland there (rust-toolchain-test grades its ELF, links and smokes)"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run rust-toolchain 1
 "#,

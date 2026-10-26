@@ -61,7 +61,7 @@ const HEADER: &[&str] = &[
 /// Options that ask for compilation or preprocessing rather than a link.
 const COMPILE_OPTIONS: &[&[u8]] = &[b"-c", b"-S", b"-E", b"-x", b"-M", b"-MM", b"-MD", b"-MMD"];
 
-/// The linker options rustc 1.96's GNU-cc flavor writes for
+/// The linker options rustc 1.99's GNU-cc flavor writes for
 /// x86_64-unknown-linux-gnu (its GccLinker and target spec), with td's
 /// `--build-id=sha1` and td-link-test's `--no-as-needed`. Any other `-Wl,`
 /// or `-Xlinker` piece is refused.
@@ -529,7 +529,7 @@ mod tests {
         plan(os(args), &TC).unwrap_err()
     }
 
-    /// The tail every rustc line shares, as rustc 1.96.0 writes it.
+    /// The tail every rustc line shares, as rustc 1.99.1 writes it.
     const RUSTC_TAIL: &[&str] = &[
         "-L",
         "/tmp/rustcX/raw-dylibs",

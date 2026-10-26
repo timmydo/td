@@ -505,7 +505,7 @@ mod deployed_applet_tests {
         let mut penv = crate::stage0::ProvisionEnv {
             rust_home: None,
             cc_home: None,
-            rust_version: "1.96.0".to_string(),
+            rust_version: "1.99.1".to_string(),
             search_path: bin.to_string_lossy().into_owned(),
             native_td: true,
         };

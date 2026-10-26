@@ -249,7 +249,7 @@ Changing the root's packages is a reviewed lock change.
 
 ## Rust toolchain and dependencies
 
-td uses upstream's prebuilt Rust 1.96.0 for `x86_64-unknown-linux-gnu`: the
+td uses upstream's prebuilt Rust 1.99.1 for `x86_64-unknown-linux-gnu`: the
 rustc, rust-std, Cargo and Clippy release components, each a source pin with
 an upstream URL and its channel-manifest SHA-256. The `rust-toolchain`
 recipe's `rust-dist` transform assembles them, links td glibc,
