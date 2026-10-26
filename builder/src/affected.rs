@@ -311,6 +311,10 @@ const TARGET_INCLUDED_ENGINE_SOURCES: &[(&str, &str)] = &[
         "td-builder, td-recipe-eval, target-static td-boot, td-update and td-install (its live installation's ESP kernel check), td-authd, td-secret and the td-tpm client it, td-firstboot, td-boot and td-install link, the td-firstboot recipe, host td-vm, the td-compositor and td-ui terminal corpus verifiers/importers, and td-crypto's test-only ES256 oracle",
     ),
     (
+        "engine/src/flathub_app.rs",
+        "target-static td-authd's application-cache relay, td-jail's Flathub admission and td-app's status writer, and td-software's status reader",
+    ),
+    (
         "engine/src/crc32.rs",
         "the shared xz decoder (td-builder and td-feed), the shared gzip decoder, target-static td-install and target-static td-boot (each through gpt.rs), target-static td-util's gzip applets, and td-png's chunk CRCs",
     ),
@@ -1535,10 +1539,12 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         return;
     }
 
-    // The application manager is host-tested only until its recipe and
-    // image wiring land: no target output carries it yet.
+    // The application manager the same way: td-software-test runs the
+    // static binary's text modes.
     if p.starts_with("td-software/") && !p.contains("..") {
         sel.add_preflight("cargo-test");
+        sel.add_target("check");
+        sel.add_target("recipe-checks");
         return;
     }
 
@@ -2444,6 +2450,7 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_contains!("engine/src/ed25519.rs", "target-static td-boot");
     assert_contains!("engine/src/sha512.rs", "target-static td-boot");
     assert_contains!("engine/src/ed25519_sign.rs", "never td-boot");
+    assert_contains!("engine/src/flathub_app.rs", "td-software's status reader");
     // The other half. Without it a table that matched EVERY engine source would
     // satisfy every line above, and the note would claim a target consumer for
     // control-plane-only code.
@@ -2456,6 +2463,7 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     let expected_target_included = [
         "engine/src/principals.rs",
         "engine/src/sha256.rs",
+        "engine/src/flathub_app.rs",
         "engine/src/crc32.rs",
         "engine/src/gzip.rs",
         "engine/src/gpt.rs",
@@ -3025,10 +3033,11 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("td-pass/src/app/mod.rs", "recipe-checks");
     assert_preflight!("td-pass/src/backend.rs", "cargo-test");
     assert_target!("td-pass/Cargo.lock", "recipe-checks");
-    // The application manager: its host suite alone, as yet.
+    // The application manager as well: td-software-test runs its text
+    // modes.
     assert_preflight!("td-software/src/app.rs", "cargo-test");
-    assert_no_target!("td-software/src/worker.rs", "check");
-    assert_no_target!("td-software/Cargo.lock", "recipe-checks");
+    assert_target!("td-software/src/worker.rs", "check");
+    assert_target!("td-software/Cargo.lock", "recipe-checks");
     // The disk usage analyzer as well: td-dua-test runs its headless modes.
     assert_target!("td-dua/src/window.rs", "check");
     assert_target!("td-dua/src/treemap.rs", "recipe-checks");

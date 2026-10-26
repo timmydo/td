@@ -160,6 +160,7 @@ fn the_caller_can_only_start_poll_or_keep_the_channel_alive() {
             name: "firefox".into(),
         })
     );
+    assert_eq!(request(&[0x22]).unwrap(), Request::Start(Program::Software));
     assert_eq!(request(&[3]).unwrap(), Request::Heartbeat);
     let mut poll = vec![2];
     poll.extend_from_slice(&17u64.to_be_bytes());
@@ -187,6 +188,9 @@ fn the_caller_can_only_start_poll_or_keep_the_channel_alive() {
         vec![0x24, 1],
         b"\x24\x05firefox".to_vec(),
         b"\x24\x01/bin/sh".to_vec(),
+        vec![0x22, 0],
+        b"\x22firefox".to_vec(),
+        vec![0x23],
         vec![2],
         vec![2, 0],
         vec![2; 10],
@@ -613,6 +617,40 @@ fn task_manager_has_fixed_unprivileged_exec_and_display_only() {
     );
 }
 
+/// td-software starts outside the home, as the task manager does, and is
+/// told only where the compositor's control socket is.
+#[test]
+fn software_has_a_fixed_exec_the_display_and_the_control_socket() {
+    let wrapper = config().terminal("000102030405060708090a0b0c0d0e0f", 17, Program::Software);
+    assert_eq!(wrapper.get_program(), "/bin/td-login");
+    assert_eq!(wrapper.get_args().last().unwrap(), "software");
+    let command = terminal_command(
+        1000,
+        "000102030405060708090a0b0c0d0e0f",
+        17,
+        Program::Software,
+        || Err(std::io::Error::other("no account read")),
+    )
+    .unwrap();
+    assert_eq!(command.get_program(), "/bin/td-software");
+    assert_eq!(command.get_args().count(), 0);
+    assert_eq!(command.get_current_dir(), None);
+    let os = std::ffi::OsStr::new;
+    assert_eq!(
+        command.get_envs().collect::<Vec<_>>(),
+        vec![
+            (
+                os("TD_CONTROL_SOCKET"),
+                Some(os("/run/td-compositor/1000/td-control"))
+            ),
+            (
+                os("WAYLAND_DISPLAY"),
+                Some(os("/run/td-compositor/1000/wayland-0"))
+            ),
+        ]
+    );
+}
+
 #[test]
 fn every_selection_literal_names_its_program_back() {
     for program in [
@@ -623,6 +661,7 @@ fn every_selection_literal_names_its_program_back() {
         Program::Review,
         Program::Dua,
         Program::Agent,
+        Program::Software,
     ] {
         let literal = program.selection().unwrap();
         assert_eq!(Program::from_selection(literal), Some(program), "{literal}");
@@ -638,6 +677,7 @@ fn every_selection_literal_names_its_program_back() {
         "review ",
         "td-dua",
         "td-agent",
+        "td-software",
     ] {
         assert_eq!(Program::from_selection(literal), None, "{literal:?}");
     }
@@ -731,13 +771,17 @@ fn only_launches_placed_in_the_account_require_the_primary_account() {
         Program::Review,
         Program::Dua,
         Program::Agent,
+        Program::Software,
     ] {
         let mut loaded = false;
         let result = terminal_command(1000, "000102030405060708090a0b0c0d0e0f", 1, program, || {
             loaded = true;
             Err(std::io::Error::other("invalid primary account"))
         });
-        let requires_account = !matches!(program, Program::Home | Program::TaskManager);
+        let requires_account = !matches!(
+            program,
+            Program::Home | Program::TaskManager | Program::Software
+        );
         assert_eq!(loaded, requires_account);
         assert_eq!(result.is_err(), requires_account);
     }

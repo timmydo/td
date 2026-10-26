@@ -2803,14 +2803,14 @@ The launcher is a compositor-owned overlay, so opening it never depends on an
 already-running client. Its registry has a terminal entry that starts a
 `td-term`, one application entry for the admitted application the image names
 with `--launcher-application` (otherwise an input-monitor entry that starts
-`td-ui-demo`), in authority mode that application's update entry and six
+`td-ui-demo`), in authority mode that application's update entry and seven
 desktop-program entries, and an explicit close entry. The update entry,
 labelled `UPDATE` and the name, issues private request 0e, which has root
 start the unit that checks the application's Flathub cache
 (APPLICATIONS.md §W.9). The desktop programs are system tools the image
 ships beside the terminal: Task Manager, Text Editor, Photos, Code
-Review, Disk Usage and Coding Agent issue fixed private requests 07, 08,
-09, 0a, 0b and 0c, and
+Review, Disk Usage, Coding Agent and Software issue fixed private
+requests 07, 08, 09, 0a, 0b, 0c and 22, and
 run with the human credentials described in td-authd/DESIGN.md (the task
 manager with its system PID view). No request carries a path; Code
 Review's fixed `--choose-repo`, added by the authority, has td-review ask
@@ -2823,7 +2823,9 @@ defers, and it grows the card. The application entry's uppercase label and
 lowercase search term are derived from the exact bounded application name; the
 compositor does not carry a fixture- or Firefox-specific card. The terminal is
 FIRST, so it is what an unfiltered Enter opens. The card reserves space
-for ten entries; direct mode shows three.
+for eleven entries; direct mode shows three. The update entry stays
+beside Software until td-software/DESIGN.md §6's cutover removes it and
+`0e`.
 `registry_entries_are_searchable_and_fit_the_card` refuses overflow. Each entry
 owns a label, lowercase search terms, and a typed launch request. The pure
 launcher model stores a bounded 64-byte ASCII filter, requires every

@@ -1,19 +1,19 @@
 # td-software
 
-**Status: proposal, being built in §6's increments.** Each *As built*
-note describes code that exists; the rest is not yet implemented or
-normative. It is written for the repository user's review.
-`AGENTS.md`, `APPLICATIONS.md` and `td-authd/DESIGN.md` remain the
-authority; where this text and they differ, they describe the code and
-this describes a possible change.
-`AGENTS.md` gains a routing line only when the component exists.
+**Status: being built in §6's increments.** Each *As built* note
+describes code that exists and is normative, like any routed design
+document (`AGENTS.md` routes here now that the image ships the
+component). The rest is a proposal for the repository user's review,
+not yet implemented or normative: where it and `AGENTS.md`,
+`APPLICATIONS.md` or `td-authd/DESIGN.md` differ, they describe the
+code and it describes a possible change.
 
-td-software would be a td-ui program and the only place a session owner
-installs, updates and removes applications. The repository user decided
-that install-on-demand goes away: starting an application that is not
-installed never fetches it. The compositor's launcher would show what
-td-software installed, gaining an entry after an install and losing it
-after a removal.
+td-software is a td-ui program and is to be the only place a session
+owner installs, updates and removes applications. The repository user
+decided that install-on-demand goes away: starting an application that
+is not installed never fetches it. The compositor's launcher would show
+what td-software installed, gaining an entry after an install and
+losing it after a removal.
 
 Three problems prompted it:
 
@@ -81,7 +81,7 @@ These stay out because principle 5, §B.6 and §Z refuse them:
 ## 3. Trust boundaries
 
 **Process.** td-software runs as the human, UID 1000, like td-taskmgr or
-td-dua. A new fixed private request beside `07` to `0c` starts it
+td-dua. Fixed private request `22`, beside `07` to `0c`, starts it
 (td-authd/DESIGN.md, "Fixed program launch prerequisite"). It gets no
 root credentials, no capability and no authority channel (§L).
 
@@ -341,8 +341,16 @@ can be installed at every commit.
    after the request was sent, may have reached root, so the next
    status decides whether the operation ran, ended or never started,
    and how each operation ended is reported from `last=`. Root's
-   refusals (§3) reach the status row as text. The image does not ship
-   it yet; the card entry is the next landing.
+   refusals (§3) reach the status row as text.
+
+   *As built (the card entry):* the image ships the static binary at
+   `/bin/td-software` (recipes `td-software` and `td-software-test`),
+   and the card's SOFTWARE entry, in authority mode, sends td-authd's
+   request `22`, which starts it as the human from `/` with only
+   `WAYLAND_DISPLAY` and `TD_CONTROL_SOCKET` added to td-login's
+   environment (td-authd/DESIGN.md). The card's UPDATE row stays until
+   the cutover (step 4) removes it with `0e`, so the card grows by one
+   row.
 3. **A table-driven card.** The compositor reads the immutable table,
    asks for the installed set and uses the scrolling window from §5.
    Starts carry a validated name. The image stops passing

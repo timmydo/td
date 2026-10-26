@@ -135,6 +135,7 @@ pub const RUST_PROFILED_RECIPES: &[&str] = &[
     "td-secret-vm-test",
     "td-setup",
     "td-sh",
+    "td-software",
     "td-svc",
     "td-taskmgr",
     "td-term",

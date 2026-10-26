@@ -312,7 +312,8 @@ fn terminal_command(
         | Program::Photo
         | Program::Review
         | Program::Dua
-        | Program::Agent => {}
+        | Program::Agent
+        | Program::Software => {}
     }
     Ok(command)
 }
@@ -320,7 +321,7 @@ fn terminal_command(
 /// Runs only after td-login dropped credentials, before any terminal code.
 pub(crate) fn terminal_exec(arguments: &[String]) -> Result<(), String> {
     const USAGE: &str = "terminal-exec requires UID GENERATION HANDLE \
-                         [task|taskmgr|editor|photo|review|dua|agent]";
+                         [task|taskmgr|editor|photo|review|dua|agent|software]";
     let (uid, generation, handle, terminal) = match arguments {
         [uid, generation, handle] => (uid, generation, handle, Some(Program::Home)),
         [uid, generation, handle, literal] => {
@@ -628,6 +629,7 @@ enum Program {
     Review,
     Dua,
     Agent,
+    Software,
 }
 
 impl Program {
@@ -641,6 +643,7 @@ impl Program {
             Self::Review => Some("review"),
             Self::Dua => Some("dua"),
             Self::Agent => Some("agent"),
+            Self::Software => Some("software"),
         }
     }
 
@@ -655,6 +658,7 @@ impl Program {
             "review" => Self::Review,
             "dua" => Self::Dua,
             "agent" => Self::Agent,
+            "software" => Self::Software,
             _ => return None,
         })
     }
@@ -669,6 +673,7 @@ impl Program {
             Self::Review => Some("/bin/td-review"),
             Self::Dua => Some("/bin/td-dua"),
             Self::Agent => Some("/bin/td-agent"),
+            Self::Software => Some("/bin/td-software"),
             Self::Home | Self::Task => None,
         }
     }
@@ -684,14 +689,16 @@ impl Program {
             | Self::Editor
             | Self::Photo
             | Self::Dua
-            | Self::Agent => &[],
+            | Self::Agent
+            | Self::Software => &[],
         }
     }
 
     /// The fixed variables a desktop program is started with beside
     /// `WAYLAND_DISPLAY`: none, but td-agent's runtime directory, where the
     /// fetch service's and egress relay's sockets are, and the image's
-    /// td-jail and td-txt, which its tools run through.
+    /// td-jail and td-txt, which its tools run through; and td-software's
+    /// compositor control socket, which its requests go to.
     fn desktop_environment(self, uid: u32) -> Vec<(&'static str, String)> {
         match self {
             Self::Agent => vec![
@@ -699,6 +706,10 @@ impl Program {
                 ("TD_AGENT_JAIL", "/bin/td-jail".into()),
                 ("TD_AGENT_TXT", "/bin/td-txt".into()),
             ],
+            Self::Software => vec![(
+                "TD_CONTROL_SOCKET",
+                format!("/run/td-compositor/{uid}/td-control"),
+            )],
             Self::Home
             | Self::Task
             | Self::TaskManager
@@ -711,11 +722,12 @@ impl Program {
 
     /// Whether a desktop program starts in the account home, where its file
     /// dialogs begin, the disk usage analyzer scans and td-agent's state
-    /// and configuration are found. The task manager has no files to open.
+    /// and configuration are found. The task manager and td-software have
+    /// no files to open.
     fn starts_in_account_home(self) -> bool {
         match self {
             Self::Editor | Self::Photo | Self::Review | Self::Dua | Self::Agent => true,
-            Self::Home | Self::Task | Self::TaskManager => false,
+            Self::Home | Self::Task | Self::TaskManager | Self::Software => false,
         }
     }
 }
@@ -748,6 +760,7 @@ fn request(bytes: &[u8]) -> Result<Request, String> {
         [0x24, operands @ ..] => Ok(Request::Software(crate::software::Request::decode(
             operands,
         )?)),
+        [0x22] => Ok(Request::Start(Program::Software)),
         _ => Err("invalid terminal authority request".into()),
     }
 }
@@ -1055,7 +1068,8 @@ fn enrollment_dispatch_reaches_the_secret_decoder() -> Result<(), String> {
         }
     }
     // None of these takes an operand, `20` takes exactly one but for an
-    // upgrade's two, `21` exactly one, and `24` a verb and a name.
+    // upgrade's two, `21` exactly one, `22` none, and `24` a verb and a
+    // name.
     assert!(request(&[0x1d, 0]).is_err());
     assert!(request(&[0x1e, 0]).is_err());
     assert!(request(&[0x1f, 0]).is_err());
@@ -1069,6 +1083,8 @@ fn enrollment_dispatch_reaches_the_secret_decoder() -> Result<(), String> {
         &[0x20, 3, 0],
         &[0x21],
         &[0x21, 0, 0],
+        &[0x22, 0],
+        &[0x23],
         &[0x24],
         &[0x24, 0],
     ] {

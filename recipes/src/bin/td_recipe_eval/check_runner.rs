@@ -8544,6 +8544,7 @@ mod tests {
                 "td-secret",
                 "td-setup",
                 "td-sh",
+                "td-software",
                 "td-svc",
                 "td-taskmgr",
                 "td-term",

@@ -4905,6 +4905,16 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
             target: "{in:td-dua}/bin/td-dua".into(),
             link: "{root}/real-root/bin/td-dua".into(),
         });
+        // td-software, the application manager, a static system-tree program
+        // the launcher card starts (td-software/DESIGN.md).
+        steps.push(Step::CopyTree {
+            from: "{in:td-software}".into(),
+            dest: "{root}/real-root{in:td-software}".into(),
+        });
+        steps.push(Step::Symlink {
+            target: "{in:td-software}/bin/td-software".into(),
+            link: "{root}/real-root/bin/td-software".into(),
+        });
         // td-editor, the text editor, a static system-tree program run from the
         // terminal (td-editor/DESIGN.md).
         steps.push(Step::CopyTree {
@@ -6012,6 +6022,7 @@ const DESKTOP_INPUTS: &[&str] = &[
     "td-editor",
     "td-pass",
     "td-dua",
+    "td-software",
     "td-seatd",
     "td-vm-guest",
     "td-update",
@@ -6325,6 +6336,7 @@ fn system_recipe(sys: &SystemDef) -> Recipe {
                 "td-editor",
                 "td-pass",
                 "td-dua",
+                "td-software",
                 "td-jail",
                 "td-seatd",
                 "td-vm-guest",
@@ -8293,6 +8305,7 @@ mod tests {
             ("td-editor", "td-editor"),
             ("td-pass", "td-pass"),
             ("td-dua", "td-dua"),
+            ("td-software", "td-software"),
         ] {
             assert!(steps.iter().any(|step| matches!(step,
                 Step::Symlink { link, target }
@@ -16385,10 +16398,10 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
     }
 
     #[test]
-    fn td_photo_td_editor_td_pass_and_td_dua_are_packed_and_not_merely_symlinked() {
+    fn the_static_desktop_programs_are_packed_and_not_merely_symlinked() {
         let steps = real_root_steps(&SYSTEM).unwrap();
         let native_inputs = recipe().native_inputs.expect("system native inputs");
-        for name in ["td-photo", "td-editor", "td-pass", "td-dua"] {
+        for name in ["td-photo", "td-editor", "td-pass", "td-dua", "td-software"] {
             assert!(
                 steps.iter().any(|step| matches!(
                     step,

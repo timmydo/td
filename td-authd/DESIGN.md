@@ -563,8 +563,9 @@ executable, environment, directory path, account, uid or argument vector. A
 typed program kind selects a fixed executable and, for terminals, either
 the account home or td's fixed task worktree; the editor, photo tool,
 review window, disk usage analyzer and coding agent start in the account
-home, and the review window's one argument and the coding agent's three
-variables are fixed by the authority. All
+home, and the review window's one argument, the coding agent's three
+variables and td-software's control-socket variable are fixed by the
+authority. All
 authority-spawned credential-helper children replace stdin, stdout and stderr
 with `/dev/null`, clear the environment, and start from `/`. The task variant's
 eventual td-term child enters only the fixed worktree described below. Replacing
@@ -597,6 +598,7 @@ Subsequent payloads are exact byte records:
 | `0e` | `84` once root has started `/bin/td-svc start firefox-update` |
 | `0f` | `85` and the `firefox` unit's state as root last read it: `00` idle, `01` starting, `02` running, `03` failed, `04` unknown |
 | `24` plus a verb byte and an application name | an application cache request ("Application requests"): `86` once an operation started, or for status `87` and the last record |
+| `22` | `81` plus a process handle for the human application manager, td-software |
 
 `0d` and `0e` create no handle. Root runs the fixed td-svc client itself,
 with the same cleared environment, `/` and null standard descriptors,
@@ -667,9 +669,9 @@ request or heartbeat within each five-second receive deadline.
 
 The authority runs `/bin/td-login exec-as USER -- /bin/td-authd
 terminal-exec UID GENERATION HANDLE
-[task|taskmgr|editor|photo|review|dua|agent]` in a new process
-group. The optional literal selects requests `04` and `07` through `0c`;
-it is not a pathname.
+[task|taskmgr|editor|photo|review|dua|agent|software]` in a new
+process group. The optional literal selects requests `04`, `07` through
+`0c` and `22`; it is not a pathname.
 td-login checks
 the human account policy and drops and verifies credentials. Its exact
 environment is `HOME`, `SHELL`, `USER`, `LOGNAME` from the account and
@@ -767,12 +769,22 @@ no passphrase prompt, since td-pinentry runs only on a host. A terminal
 start of td-agent with those variables has the same reach; the card
 adds a way to start.
 
-An authority older than one of requests `07` through `0f` or `24` closes
-the entire launch channel on it; its paired compositor then restarts. The image ships
-both peers atomically. Requests `07` through `0b` were additive within TDLA002,
-without negotiation or mixed-version compatibility. The login requests `1b` and
-`1c` came with the bump to TDLA003, because `1c` carries a PIN; `0c` through
-`0f` and `24` were added within it later. Both peers again ship together, without
+Request `22` is the same shape for td-software, the application manager
+(td-software/DESIGN.md): it execs `/bin/td-software` with no arguments,
+from `/` as the task manager does, since it has no file dialog, with
+`WAYLAND_DISPLAY` and `TD_CONTROL_SOCKET=/run/td-compositor/UID/td-control`,
+the compositor's control socket, fixed by the authority. Its requests
+reach root only as the compositor's `24` ("Application requests"),
+which any program of the human's on that socket can make as well: the
+card adds a way to start, not a new reach.
+
+An authority older than one of requests `07` through `0f`, `22` or
+`24` closes the entire launch channel on it; its paired compositor then
+restarts. The image ships both peers atomically. Requests `07` through
+`0b` were additive within TDLA002, without negotiation or mixed-version
+compatibility. The login requests `1b` and `1c` came with the bump to
+TDLA003, because `1c` carries a PIN; `0c` through `0f`, `22` and `24`
+were added within it later. Both peers again ship together, without
 negotiation.
 
 For terminal requests it execs `/bin/td-term run --socket

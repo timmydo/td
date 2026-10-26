@@ -33,7 +33,7 @@ Permissive terms, which ask that the notice travel with the code.
 
 The programs that embed the Unifont data print its notices with
 `--font-license` where they offer that flag (td-dua, td-editor, td-setup,
-td-taskmgr); td-compositor embeds it and does not yet.
+td-software, td-taskmgr); td-compositor embeds it and does not yet.
 
 ## Test corpora and fixtures
 

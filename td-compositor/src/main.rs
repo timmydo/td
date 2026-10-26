@@ -1184,7 +1184,7 @@ mod confinement {
     const SYS: &str = include_str!("sys.rs");
     const SCM: &str = include_str!("../../td-secret/src/scm.rs");
     const DRM: &str = include_str!("drm.rs");
-    const AUTHORITY_FINGERPRINT: u64 = 0x3711319d01544dc9;
+    const AUTHORITY_FINGERPRINT: u64 = 0xb1b8cc31963ca2ca;
     const AUTH_SYS_FINGERPRINT: u64 = 0x42363c39df98214d;
     const AUTH_CHANNEL_FINGERPRINT: u64 = 0xdf20e4130b2d96e2;
     const AUTHORITY: &str = include_str!("authority.rs");

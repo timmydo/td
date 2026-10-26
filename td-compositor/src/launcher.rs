@@ -7,7 +7,7 @@ use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 const CARD_WIDTH: usize = 480;
-const CARD_HEIGHT: usize = 504;
+const CARD_HEIGHT: usize = 546;
 const CARD: [u8; 4] = [0x20, 0x18, 0x28, 0];
 const HIGHLIGHT: [u8; 4] = [0x58, 0x30, 0x70, 0];
 const CARD_PADDING: usize = 24;
@@ -58,6 +58,7 @@ pub enum LaunchRequest {
     Review,
     Dua,
     Agent,
+    Software,
     /// Check the configured application's Flathub cache now.
     UpdateApplication,
 }
@@ -73,6 +74,7 @@ impl LaunchRequest {
             Self::Review => Some(crate::authority::Program::Review),
             Self::Dua => Some(crate::authority::Program::Dua),
             Self::Agent => Some(crate::authority::Program::Agent),
+            Self::Software => Some(crate::authority::Program::Software),
             Self::UiDemo | Self::Terminal | Self::UpdateApplication => None,
         }
     }
@@ -131,6 +133,11 @@ const AUTHORITY_ENTRIES: &[Entry] = &[
         label: "CODING AGENT",
         search: "coding agent ai assistant model llm openrouter",
         request: Some(LaunchRequest::Agent),
+    },
+    Entry {
+        label: "SOFTWARE",
+        search: "software install remove applications apps flathub",
+        request: Some(LaunchRequest::Software),
     },
 ];
 
@@ -782,7 +789,8 @@ pub(crate) fn launch_command(
             | LaunchRequest::Photo
             | LaunchRequest::Review
             | LaunchRequest::Dua
-            | LaunchRequest::Agent,
+            | LaunchRequest::Agent
+            | LaunchRequest::Software,
             _,
         ) => {
             return Err("desktop programs are not configured for this development launcher".into());
@@ -1765,6 +1773,7 @@ mod authority_entry_tests {
                 "CODE REVIEW",
                 "DISK USAGE",
                 "CODING AGENT",
+                "SOFTWARE",
                 "CLOSE LAUNCHER",
             ]
         );
@@ -1775,6 +1784,7 @@ mod authority_entry_tests {
             ("git", "CODE REVIEW", LaunchRequest::Review),
             ("storage", "DISK USAGE", LaunchRequest::Dua),
             ("coding", "CODING AGENT", LaunchRequest::Agent),
+            ("flathub", "SOFTWARE", LaunchRequest::Software),
         ] {
             launcher.apply(LauncherAction::Open);
             for character in word.chars() {
@@ -1807,6 +1817,7 @@ mod authority_entry_tests {
             LaunchRequest::Review,
             LaunchRequest::Dua,
             LaunchRequest::Agent,
+            LaunchRequest::Software,
         ] {
             assert!(launch_command(&options, request, 1).is_err(), "{request:?}");
         }

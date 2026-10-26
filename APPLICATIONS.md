@@ -390,10 +390,14 @@ failed every boot; it was caught in review rather than in QEMU.
 | `td-audio` | `/bin/td-audio` | none | surface **#13** | the PulseAudio-protocol sound server (§K), running as its own `audio` uid |
 | `td-login` | new `exec-as` subcommand (§A's Supervision — NOT an applet, so no `/bin/exec-as`) | none | no new syscalls | launch a literal argv as another uid without a shell |
 
-There is **no application-manager binary**. With packages in the image
-there is no install, no uid allocation in v1, and no immutable package input to
-generate at run time — the builder compiles the spec at build time — so the
-work that would have justified one is either gone or happens earlier.
+There is no application-manager binary for the packages in the image.
+With them there is no install, no uid allocation in v1, and no immutable
+package input to generate at run time — the builder compiles the spec at
+build time — so the work that would have justified one is either gone or
+happens earlier. `/bin/td-software` manages only the Flathub caches of
+§W.9 (td-software/DESIGN.md): it installs, checks, removes and deletes
+the data of a declared Flathub application through root's
+`application-cache` operation.
 
 ### A.0 The launcher
 
@@ -2027,10 +2031,11 @@ cgroups, grants and socket authorization (§L).
 
 ### B.5 Activation and state — there is no install
 
-There is no install step and no installer binary. The packages are in the
-image; nothing is fetched, materialized or verified at install time
-because there is no install time. What the earlier per-user tier needed
-an installer for now happens in two other places:
+There is no install step and no installer binary for the packages in
+the image (a Flathub application's cache is §W.9's and td-software's):
+they are in the image; nothing is fetched, materialized or verified at
+install time because there is no install time. What the earlier
+per-user tier needed an installer for now happens in two other places:
 
 | job | where it happens now |
 |---|---|
@@ -8607,7 +8612,10 @@ its fixed `--choose-repo` so the human picks the repository (see
 td-authd/DESIGN.md); td-dua by request 0b, the same way, scanning the
 account home; td-agent by request 0c, the same way, with its runtime
 directory and the image's td-jail and td-txt named in its environment,
-running its tools through the workspace kind (§C).
+running its tools through the workspace kind (§C); and td-software by
+request 22, under the same checks but from `/` as the task manager is,
+with the compositor's control socket named in its environment
+(td-software/DESIGN.md).
 
 ### L.1 Elevation — consent without a secret
 
