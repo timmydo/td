@@ -62,7 +62,7 @@ pub fn recipe() -> Recipe {
         content: format!(
             "#!{SH}\n\
              case \"$1\" in\n\
-             --vernum) printf '%s\\n' '081500';;\n\
+             --vernum) printf '%s\\n' '081700';;\n\
              *) exit 1;;\n\
              esac\n"
         ),

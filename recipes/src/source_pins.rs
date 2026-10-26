@@ -46,13 +46,13 @@ const PINS: &[PinDef] = &[
     PinDef {
         key: "curl-x86-64-source",
         aliases: &[],
-        // curl 8.21.0 supplies Git's source-built HTTP/HTTPS transport. The
+        // curl 8.23.0 supplies Git's source-built HTTP/HTTPS transport. The
         // recipe keeps only static libcurl and disables every protocol and
         // optional dependency outside the reviewed HTTP(S) closure.
-        url: "https://curl.se/download/curl-8.21.0.tar.xz",
-        sha256: "aa1b66a70eace83dc624508745646c08ae561de512ab403adffb93ac87fc72e6",
-        file: "curl-8.21.0.tar.xz",
-        version: "8.21.0",
+        url: "https://curl.se/download/curl-8.23.0.tar.xz",
+        sha256: "8dadd7d2536a314f982ad05a651b713f426bf7d02cc2c76cffb9796f2218e6c5",
+        file: "curl-8.23.0.tar.xz",
+        version: "8.23.0",
     },
     PinDef {
         key: "fd-source",
@@ -469,7 +469,7 @@ mod tests {
         // util-linux 2.42.2 (cryptsetup's minimal libuuid/libblkid build
         // closure) + the first reviewed
         // foreign application seed, upstream ripgrep 15.2.0, LibreSSL 4.4.0,
-        // curl 8.21.0 (the static HTTPS foundation for Git), Git 2.55.0,
+        // curl 8.23.0 (the static HTTPS foundation for Git), Git 2.55.0,
         // curl's dated Mozilla CA extract and OpenSSH Portable 10.5p1. The
         // td-ui applications are td's own trees (APPLICATIONS.md §W.8) and
         // pin nothing here.

@@ -43,7 +43,6 @@ pub fn recipe() -> Recipe {
                 "--disable-tftp",
                 "--disable-pop3",
                 "--disable-imap",
-                "--disable-smb",
                 "--disable-smtp",
                 "--disable-gopher",
                 "--disable-mqtt",
@@ -60,11 +59,11 @@ pub fn recipe() -> Recipe {
                 "--disable-negotiate-auth",
                 "--disable-aws",
                 "--disable-ntlm",
-                "--disable-tls-srp",
                 "--disable-doh",
                 "--disable-alt-svc",
                 "--disable-hsts",
                 "--disable-websockets",
+                "--disable-httpsig",
                 &format!("--with-openssl={tls}"),
                 &format!("--with-zlib={zlib}"),
                 "--with-ca-bundle=/etc/ssl/certs/ca-certificates.crt",
@@ -159,7 +158,7 @@ pub fn recipe() -> Recipe {
         exec: false,
     });
 
-    Recipe::mesboot("curl-x86-64", "8.21.0")
+    Recipe::mesboot("curl-x86-64", "8.23.0")
         .source_input("curl-x86-64-source")
         .build_root()
         .native_inputs(&[

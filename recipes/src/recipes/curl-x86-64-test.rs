@@ -316,8 +316,8 @@ int main(void) {
         return 1;
     }
     curl_version_info_data *version = curl_version_info(CURLVERSION_NOW);
-    if (version == NULL || strcmp(version->version, "8.21.0") != 0)
-        return fail_text("curl version", "8.21.0",
+    if (version == NULL || strcmp(version->version, "8.23.0") != 0)
+        return fail_text("curl version", "8.23.0",
             version == NULL ? NULL : version->version, 2);
     const int expected_features = CURL_VERSION_IPV6 | CURL_VERSION_SSL |
         CURL_VERSION_LIBZ | CURL_VERSION_ASYNCHDNS | CURL_VERSION_LARGEFILE |
@@ -443,7 +443,7 @@ int main(void) {
     EVP_PKEY_free(server_key);
     EVP_PKEY_free(unrelated_key);
     curl_global_cleanup();
-    puts("curl 8.21.0 verified HTTPS and rejected hostname/trust failures");
+    puts("curl 8.23.0 verified HTTPS and rejected hostname/trust failures");
     return 0;
 }
 "#
@@ -501,7 +501,7 @@ int main(void) {
                 "-c",
                 "actual=$('{root}/curl-test'); status=$?; \
                  if test \"$status\" -ne 0; then echo \"curl HTTPS probe failed with status $status\" >&2; exit \"$status\"; fi; \
-                 test \"$actual\" = 'curl 8.21.0 verified HTTPS and rejected hostname/trust failures' || { echo \"unexpected curl result: $actual\" >&2; exit 1; }",
+                 test \"$actual\" = 'curl 8.23.0 verified HTTPS and rejected hostname/trust failures' || { echo \"unexpected curl result: $actual\" >&2; exit 1; }",
             ],
         )
         .env("PATH", PATH),
@@ -511,7 +511,7 @@ int main(void) {
     });
     steps.push(Step::WriteFile {
         path: "{out}/result".into(),
-        content: "PASS: curl 8.21.0 performs verified local-socket HTTPS and rejects hostname and trust failures\n".into(),
+        content: "PASS: curl 8.23.0 performs verified local-socket HTTPS and rejects hostname and trust failures\n".into(),
         exec: false,
     });
     steps.push(Step::Require {
