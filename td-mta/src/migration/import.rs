@@ -41,7 +41,7 @@ pub(super) fn run(
         let outcome = database::publish_email(
             &request,
             &loaded.trust,
-            deadline(),
+            email_deadline(value),
             &authority,
             value,
             &bytes,
@@ -84,6 +84,9 @@ pub(super) fn connect(
 }
 pub(super) fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(10)
+}
+pub(super) fn email_deadline(value: &snapshot::Email) -> Instant {
+    Instant::now() + crate::postgres_probe::import_duration(value.length)
 }
 pub(super) fn code(error: database::Error) -> &'static str {
     use database::Error as E;

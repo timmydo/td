@@ -318,11 +318,60 @@ pub fn exercise(
         },
     )
     .unwrap();
+    // The allowance scales with the body; an ordinary one keeps ten seconds.
+    let allowance = td_mta::postgres_probe::import_duration(large.len() as u64);
+    assert_eq!(allowance, std::time::Duration::from_secs(30));
+    let small = email("over-allowance", body, &[]);
+    // Refused before any connection: an unreachable server would be Transport.
+    let unreachable = Request {
+        address: std::net::SocketAddr::from(([127, 0, 0, 1], 1)),
+        server_name: request.server_name,
+        user: request.user,
+        database: request.database,
+        password: request.password,
+        mode: request.mode,
+    };
+    assert_eq!(
+        db::publish_email(
+            &unreachable,
+            trust,
+            std::time::Instant::now() + std::time::Duration::from_secs(25),
+            &authority,
+            &small,
+            body
+        ),
+        Err(db::Error::Connection(
+            td_mta::postgres_probe::Error::Invalid
+        ))
+    );
+    assert_eq!(
+        db::publish_email(
+            request,
+            trust,
+            std::time::Instant::now() + std::time::Duration::from_secs(25),
+            &authority,
+            &small,
+            body
+        ),
+        Err(db::Error::Connection(
+            td_mta::postgres_probe::Error::Invalid
+        ))
+    );
+    assert!(db::inspect(
+        request,
+        trust,
+        deadline(),
+        &authority,
+        &key("over-allowance", SourceKind::Email),
+        small.digest()
+    )
+    .unwrap()
+    .is_none());
     assert!(
         db::publish_email(
             request,
             trust,
-            std::time::Instant::now() + std::time::Duration::from_secs(10),
+            std::time::Instant::now() + allowance,
             &authority,
             &largest,
             &large

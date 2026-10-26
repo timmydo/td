@@ -217,9 +217,16 @@ one local mapping. Names must satisfy the normal NFC and control-character
 rules. Local limits are 256 folders, 256 memberships and 256 keywords per
 message; the archive can represent more than this importer can publish.
 Unrepresentable objects fail explicitly. Partial progress remains resumable.
-One import connection has a ten-second deadline, 72 MiB outbound budget,
-1 MiB inbound budget and 4,096 protocol-frame budget. Body writes and the
-full supported membership/keyword sets share those finite allowances.
+One import connection has a 72 MiB outbound budget, 1 MiB inbound budget and
+4,096 protocol-frame budget. Body writes and the full supported
+membership/keyword sets share those finite allowances. An Email publication's
+deadline is ten seconds plus up to twenty more in proportion to its body's
+share of the 64 MiB stored-body ceiling, so a maximum-size body has the
+stored-body readers' thirty seconds and an ordinary one about ten. Its
+receipt inspection, connection establishment, mapping inspection and
+mailbox publication keep ten seconds; checks made on the Email's own write
+connection share its allowance. A longer caller deadline is refused before
+any connection opens. The allowance is a ceiling, never renewed by progress.
 
 Each object publishes in one durable account transaction. Email publication
 includes its exact raw bytes, imported origin, received timestamp, complete
@@ -377,15 +384,15 @@ Missing, renamed, reparented or ambiguously mapped dependencies refuse the
 new object. Unrelated changed folders may be skipped. Ordinary import keeps
 its existing historical replay semantics.
 
-Each guarded Email publication keeps the 10-second operation deadline and
-72 MiB outbound allowance, with a 4 MiB inbound and 4,096-frame allowance for
-full dependency metadata. Guarded mailbox publication has 2 MiB outbound,
-4 MiB inbound and 2,048 frames. At most 256 required folder definitions and
-ancestors are admitted. Publication otherwise shares ordinary import's
-owner, epoch, selection, maintenance, quota and uncertain-commit handling.
-Earlier creations remain committed if a later object fails; keep the same
-archive after uncertainty. Reports retain `cutoverReady: false`. Skips and
-source omissions never authorize deletion or a domain switch.
+Each guarded Email publication keeps ordinary import's body-scaled operation
+deadline and 72 MiB outbound allowance, with a 4 MiB inbound and 4,096-frame
+allowance for full dependency metadata. Guarded mailbox publication has 2 MiB
+outbound, 4 MiB inbound and 2,048 frames. At most 256 required folder
+definitions and ancestors are admitted. Publication otherwise shares ordinary
+import's owner, epoch, selection, maintenance, quota and uncertain-commit
+handling. Earlier creations remain committed if a later object fails; keep the
+same archive after uncertainty. Reports retain `cutoverReady: false`. Skips
+and source omissions never authorize deletion or a domain switch.
 
 # Reconciling existing folders
 
@@ -416,7 +423,8 @@ A successful update emits one Mailbox update and advances the source receipt
 and account sequence together. Receipt replay acknowledges the current source
 digest without resetting later local edits; a missing folder stays absent.
 The existing uncertainty/retry rules apply. Folder operations use the same
-10-second deadline and bounded reconciliation transport as Email operations.
+10-second deadline and bounded reconciliation transport as Email metadata
+reconciliation.
 
 Plan observations distinguish `role-source-change`, `folder-conflict`,
 `local-conflict`, `historical-object-absent`, `unmapped`, and matches from

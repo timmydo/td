@@ -117,7 +117,7 @@ pub(super) fn run(
             let outcome = database::publish_unmapped_email(
                 &request,
                 &loaded.trust,
-                import::deadline(),
+                import::email_deadline(value),
                 &authority,
                 value,
                 &bytes,

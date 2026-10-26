@@ -69,6 +69,19 @@ const QUERY: &str = "SELECT pg_catalog.current_setting('server_version_num'), \
     pg_catalog.current_setting('fsync'), pg_catalog.current_setting('full_page_writes')";
 pub(crate) const MAX_DURATION: Duration = Duration::from_secs(10);
 pub(crate) const MAX_BODY_DURATION: Duration = Duration::from_secs(30);
+
+/// The longest deadline one owner Email import of `length` body bytes admits:
+/// the ordinary ten seconds, plus up to twenty more in proportion to the body's
+/// share of the stored-body ceiling, so a 64 MiB body has the stored-body
+/// readers' thirty. Connection setup keeps its ten-second cap.
+pub fn import_duration(length: u64) -> Duration {
+    let ceiling = crate::postgres_body::MAX_BODY_BYTES;
+    let extra = MAX_BODY_DURATION.saturating_sub(MAX_DURATION).as_nanos();
+    let scaled = extra.saturating_mul(u128::from(length.min(ceiling))) / u128::from(ceiling);
+    MAX_DURATION.saturating_add(Duration::from_nanos(
+        u64::try_from(scaled).unwrap_or(u64::MAX),
+    ))
+}
 /// Maximum caller-selected duration for historical owner audits only.
 pub const MAX_AUDIT_DURATION: Duration = Duration::from_secs(3600);
 #[cfg(test)]
@@ -275,17 +288,19 @@ pub(crate) fn with_import_client<T>(
     request: &Request<'_>,
     trust: &TrustStore,
     deadline: Instant,
+    body_length: u64,
     guarded: bool,
     operation: impl for<'a> FnOnce(&'a tokio_postgres::Client) -> Pin<Box<dyn Future<Output = T> + 'a>>,
 ) -> Result<T, Error> {
-    with_output_limit(
+    let mut worker = connect_worker_bounded(
         request,
         trust,
         deadline,
         72 * 1024 * 1024,
         Input::imports(guarded),
-        operation,
-    )
+        import_duration(body_length),
+    )?;
+    worker.run(operation)
 }
 
 // New-only mailbox creation also checks bounded parent/ancestor metadata.
@@ -1156,6 +1171,21 @@ mod tests {
             assert!(rounded - exact < Duration::from_millis(1));
         }
         assert_eq!(transport_milliseconds(Duration::MAX), Err(Error::Invalid));
+    }
+    #[test]
+    fn email_import_allowance_scales_with_body_to_the_body_ceiling() {
+        let ceiling = crate::postgres_body::MAX_BODY_BYTES;
+        assert_eq!(import_duration(0), MAX_DURATION);
+        assert_eq!(import_duration(ceiling / 2), Duration::from_secs(20));
+        assert_eq!(import_duration(ceiling), MAX_BODY_DURATION);
+        assert_eq!(import_duration(ceiling + 1), MAX_BODY_DURATION);
+        assert_eq!(import_duration(u64::MAX), MAX_BODY_DURATION);
+        let mut previous = MAX_DURATION;
+        for length in (0..=ceiling).step_by(1 << 20) {
+            let allowance = import_duration(length);
+            assert!(allowance >= previous && allowance <= MAX_BODY_DURATION);
+            previous = allowance;
+        }
     }
     #[test]
     fn socket_activity_distinguishes_progress_from_idle_polling() {

@@ -351,7 +351,8 @@ send and actual foreground-service fixtures to pass.
 The three fixtures compile the MTA test harness and executable with the host
 release profile, retaining debug information, as the installed native build
 does. Ordinary unit and documentation tests still run in the test profile.
-Operation deadlines remain unchanged, including the maximum-size import.
+Operation deadlines remain production's, including the maximum-size
+import's body-scaled thirty seconds (MIGRATION.md).
 
 PostgreSQL 17's `initdb`, `postgres`, `pg_ctl` and `psql` must be on `PATH` in one
 directory, the first `initdb`'s; the wrapper refuses before any test runs

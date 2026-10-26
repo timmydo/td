@@ -45,10 +45,17 @@ fn publish_policy(
     bytes: &[u8],
     definitions: Option<&[crate::import_snapshot::Mailbox]>,
 ) -> Result<Outcome, Error> {
+    // Refuse more than the body's allowance before any work; only the write
+    // connection receives more than the ordinary ten seconds.
+    if deadline.saturating_duration_since(Instant::now())
+        > postgres_probe::import_duration(value.length)
+    {
+        return Err(Error::Connection(postgres_probe::Error::Invalid));
+    }
     if let Some(outcome) = inspect_policy(
         request,
         trust,
-        deadline,
+        deadline.min(Instant::now() + postgres_probe::MAX_DURATION),
         authority,
         &value.key,
         if definitions.is_some() {
@@ -82,6 +89,7 @@ fn publish_policy(
         request,
         trust,
         deadline,
+        value.length,
         guarded,
         move |client| {
             Box::pin(async move {

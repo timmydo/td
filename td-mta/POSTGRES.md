@@ -7022,6 +7022,14 @@ reauthorization retain their ten-second caps, shortened by the original body
 deadline. Ordinary JMAP snapshot methods retain their existing ten-second cap.
 Progress never renews an admitted operation's deadline.
 
+An owner Email import's write connection admits ten seconds plus up to twenty
+more in proportion to the body's share of the 64 MiB ceiling
+(`postgres_probe::import_duration`), reaching the same thirty seconds at the
+ceiling. The 64 MiB publication took about two seconds on an idle host and
+exceeded the former ten-second cap under heavy load. Receipt inspection,
+connection establishment and mailbox publication keep ten seconds, and a
+caller deadline above the scaled allowance is refused before any work.
+
 
 ## Per-account submission routes
 
