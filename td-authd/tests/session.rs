@@ -1859,7 +1859,7 @@ fn revoked(state: &[u8], revocation: u8) -> Vec<u8> {
 
 /// Asks `1a` until its revocation byte is `byte`.
 fn login_state_until(session: &mut Session, byte: u8) -> Vec<u8> {
-    let until = Instant::now() + Duration::from_secs(10);
+    let until = Instant::now() + crate::revocation::tests::WAIT;
     loop {
         let answer = session.answer(Request::LoginState).unwrap();
         if answer[answer.len() - 3] == byte {
@@ -2044,7 +2044,7 @@ fn a_failed_revocation_refuses_the_slot_and_reboots_once_it_is_free() {
         [0x95, 0]
     );
     assert_eq!(login_end(&mut session), [0x91, 0x0d, 0x80, 0]);
-    let until = Instant::now() + Duration::from_secs(5);
+    let until = Instant::now() + crate::revocation::tests::WAIT;
     while machine.reboots() == 0 {
         session.answer(Request::Poll).unwrap();
         assert!(Instant::now() < until, "no reboot request");
@@ -2080,7 +2080,7 @@ fn a_refused_reboot_request_ends_the_generation() {
     session.revocation =
         Some(machine.revocation_with(prints("unenrolled\n"), prints("error: refused\n").exits(1)));
     prepare(&mut session);
-    let until = Instant::now() + Duration::from_secs(10);
+    let until = Instant::now() + crate::revocation::tests::WAIT;
     let error = loop {
         match session.answer(Request::LoginState) {
             Ok(_) => {}

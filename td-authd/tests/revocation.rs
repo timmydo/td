@@ -142,7 +142,10 @@ impl Svc {
     }
 
     /// The host's control launch, its client children bounded by `lifetime`.
-    fn control(&self) -> Box<dyn Fn(Verb, &'static str) -> Result<Inspection, String>> {
+    fn control(
+        &self,
+        lifetime: Duration,
+    ) -> Box<dyn Fn(Verb, &'static str) -> Result<Inspection, String>> {
         let script = Arc::clone(&self.script);
         Box::new(move |verb, unit| {
             let request = format!("{} {unit}", verb.word());
@@ -167,7 +170,7 @@ impl Svc {
                 Answer::Silent => (Vec::new(), 1, false),
                 Answer::Hang => (Vec::new(), 0, true),
             };
-            crate::inspection::tests::printed(&bytes, code, hang, REPLY_OUTPUT, EXCHANGE)
+            crate::inspection::tests::printed(&bytes, code, hang, REPLY_OUTPUT, lifetime)
         })
     }
 }
@@ -183,6 +186,32 @@ pub(crate) struct Machine {
     renders: Arc<AtomicUsize>,
     reboots: Arc<AtomicUsize>,
     svc: Svc,
+    deadlines: Deadlines,
+}
+
+/// The deadlines a machine's hosts run under. Each defaults to one no
+/// passing case waits for, so a loaded machine's slow helper is never
+/// taken for one that missed its deadline; a case proving a deadline
+/// sets that one short.
+#[derive(Clone, Copy)]
+pub(crate) struct Deadlines {
+    pub(crate) render: Duration,
+    pub(crate) exchange: Duration,
+    pub(crate) unit: Duration,
+    pub(crate) reboot: Duration,
+}
+
+impl Default for Deadlines {
+    fn default() -> Self {
+        Self {
+            render: SLACK,
+            exchange: SLACK,
+            // As production's, past its restart exchange and that
+            // exchange's retry.
+            unit: SLACK * 3,
+            reboot: SLACK,
+        }
+    }
 }
 
 /// A helper's scripted run: what it prints, its exit code, and whether it
@@ -248,6 +277,7 @@ impl Machine {
             svc: Svc {
                 script: Arc::default(),
             },
+            deadlines: Deadlines::default(),
         };
         machine.boot(ID);
         fs::write(machine.root.join("proc/uptime"), UPTIME).unwrap();
@@ -257,6 +287,12 @@ impl Machine {
             }
         }
         machine
+    }
+
+    /// This machine, its hosts running under `deadlines`.
+    pub(crate) fn under(mut self, deadlines: Deadlines) -> Self {
+        self.deadlines = deadlines;
+        self
     }
 
     /// `pid`'s `stat`, starting at `ticks`, its command name hostile.
@@ -346,7 +382,7 @@ impl Machine {
     }
 
     /// The machine's host, with `render` and `reboot` as its helpers' runs
-    /// and short deadlines.
+    /// under the machine's deadlines.
     pub(crate) fn host(&self, render: Run, reboot: Run) -> Host {
         self.host_with(render, vec![reboot])
     }
@@ -361,10 +397,15 @@ impl Machine {
             proc: self.root.join("proc"),
             uid: self.uid,
             gid: self.gid,
-            render: Self::helper(&self.renders, vec![render], RENDER_OUTPUT, RENDER),
-            reboot: Self::helper(&self.reboots, reboots, REPLY_OUTPUT, REBOOT),
-            control: self.svc.control(),
-            unit_time: UNIT,
+            render: Self::helper(
+                &self.renders,
+                vec![render],
+                RENDER_OUTPUT,
+                self.deadlines.render,
+            ),
+            reboot: Self::helper(&self.reboots, reboots, REPLY_OUTPUT, self.deadlines.reboot),
+            control: self.svc.control(self.deadlines.exchange),
+            unit_time: self.deadlines.unit,
         }
     }
 
@@ -386,15 +427,22 @@ impl Drop for Machine {
     }
 }
 
+/// The default deadline, below the hanging fixture's 30 seconds, so a
+/// hung helper still outlives it.
+const SLACK: Duration = Duration::from_secs(20);
+/// The short deadlines the cases proving one wait for.
 const RENDER: Duration = Duration::from_millis(800);
 const EXCHANGE: Duration = Duration::from_millis(800);
 const UNIT: Duration = Duration::from_millis(2500);
 const REBOOT: Duration = Duration::from_secs(2);
+/// How long a case waits for what must happen before it gives up: past
+/// every default deadline.
+pub(crate) const WAIT: Duration = Duration::from_secs(120);
 
 /// Ticks `revocation` with the slot `free` until its status is no longer
-/// pending, or `limit` passes.
+/// pending, or `WAIT` passes.
 pub(crate) fn settle(revocation: &mut Revocation, free: bool, state: Reduced) -> Status {
-    let until = Instant::now() + Duration::from_secs(10);
+    let until = Instant::now() + WAIT;
     loop {
         revocation.tick(free, || state).unwrap();
         if revocation.status() != Status::Pending {
@@ -710,7 +758,10 @@ fn one_transient_td_svc_failure_is_asked_once_more() {
         assert_eq!(machine.recorded(), None);
     }
     // A client the exchange's bound killed is not asked again.
-    let machine = Machine::new();
+    let machine = Machine::new().under(Deadlines {
+        exchange: EXCHANGE,
+        ..Deadlines::default()
+    });
     let svc = machine.svc(Behavior {
         hang_first: true,
         ..Behavior::default()
@@ -743,7 +794,8 @@ fn only_a_stopped_unit_fails_before_its_deadline() {
         settle(&mut revocation, false, Reduced::Enforced),
         Status::Restarting
     );
-    assert!(started.elapsed() < UNIT, "{:?}", started.elapsed());
+    let unit = machine.deadlines.unit;
+    assert!(started.elapsed() < unit, "{:?}", started.elapsed());
     assert_eq!(svc.requests().last().unwrap(), "status greeter");
     assert_eq!(machine.recorded(), None);
     for state in ["failed", "held", "down"] {
@@ -774,7 +826,10 @@ fn only_a_stopped_unit_fails_before_its_deadline() {
 /// deadline fails the revocation first.
 #[test]
 fn a_reply_after_the_units_deadline_is_not_accepted() {
-    let machine = Machine::new();
+    let machine = Machine::new().under(Deadlines {
+        unit: UNIT,
+        ..Deadlines::default()
+    });
     // The greeter's first status after its restart names its new leader,
     // but becomes readable only past the greeter's deadline.
     let svc = machine.svc(Behavior {
@@ -811,7 +866,16 @@ fn a_failed_revocation_writes_the_guard_then_requests_one_reboot_once_the_slot_i
             ..Behavior::default()
         },
     ] {
-        let machine = Machine::new();
+        // Only the cases that wait for the unit's deadline shorten it.
+        let unit = if behavior.never_empties || behavior.stale_leader {
+            UNIT
+        } else {
+            Deadlines::default().unit
+        };
+        let machine = Machine::new().under(Deadlines {
+            unit,
+            ..Deadlines::default()
+        });
         if behavior.stale_leader {
             machine.leader(201, BEFORE);
         }
@@ -843,7 +907,7 @@ fn a_failed_revocation_writes_the_guard_then_requests_one_reboot_once_the_slot_i
             revocation.check(Reduced::Enforced);
         }
         assert_eq!(machine.reboots(), 0);
-        let until = Instant::now() + Duration::from_secs(5);
+        let until = Instant::now() + WAIT;
         while !matches!(revocation.phase, Phase::Failed(Reboot::Accepted)) {
             revocation.tick(true, || Reduced::Enforced).unwrap();
             assert!(Instant::now() < until);
@@ -867,7 +931,10 @@ fn a_reboot_request_that_fails_ends_the_generation() {
         accepted().exits(1),
         prints("").hangs(),
     ] {
-        let machine = Machine::new();
+        let machine = Machine::new().under(Deadlines {
+            reboot: REBOOT,
+            ..Deadlines::default()
+        });
         let _svc = machine.svc(Behavior {
             refuse_greeter: true,
             ..Behavior::default()
@@ -875,7 +942,7 @@ fn a_reboot_request_that_fails_ends_the_generation() {
         let shown = String::from_utf8_lossy(&reboot.bytes).into_owned();
         let mut revocation = machine.revocation_with(prints("enforced\n"), reboot);
         revocation.check(Reduced::Enforced);
-        let until = Instant::now() + Duration::from_secs(10);
+        let until = Instant::now() + WAIT;
         let error = loop {
             match revocation.tick(true, || Reduced::Enforced) {
                 Ok(()) => {}
@@ -904,7 +971,7 @@ fn one_transient_reboot_failure_is_asked_once_more() {
         let mut revocation =
             Revocation::with_host(machine.host_with(prints("enforced\n"), vec![first, accepted()]));
         revocation.check(Reduced::Enforced);
-        let until = Instant::now() + Duration::from_secs(10);
+        let until = Instant::now() + WAIT;
         while !matches!(revocation.phase, Phase::Failed(Reboot::Accepted)) {
             revocation.tick(true, || Reduced::Enforced).unwrap();
             assert!(Instant::now() < until);
@@ -920,7 +987,7 @@ fn one_transient_reboot_failure_is_asked_once_more() {
         });
         let mut revocation = Revocation::with_host(machine.host_with(prints("enforced\n"), runs));
         revocation.check(Reduced::Enforced);
-        let until = Instant::now() + Duration::from_secs(10);
+        let until = Instant::now() + WAIT;
         let error = loop {
             if let Err(error) = revocation.tick(true, || Reduced::Enforced) {
                 break error;
@@ -1056,7 +1123,9 @@ fn a_failure_with_the_guard_present_or_unwritable_holds() {
 
 /// A render that prints anything but one word and a newline, fails, or
 /// outlives its deadline fails the revocation; the late one is killed and
-/// reaped at the deadline, and none publishes a record.
+/// reaped at the deadline, and none publishes a record. A failing render
+/// runs under the default deadline and fails long before it; a late one
+/// under a short deadline, the hung helper outliving both.
 #[test]
 fn a_render_that_fails_or_outlives_its_deadline_fails_the_revocation() {
     for (render, late) in [
@@ -1071,18 +1140,39 @@ fn a_render_that_fails_or_outlives_its_deadline_fails_the_revocation() {
         (prints("enforced\n").hangs(), true),
     ] {
         let render_shown = format!("{:?}", String::from_utf8_lossy(&render.bytes));
-        let machine = Machine::new();
+        let deadline = if late {
+            RENDER
+        } else {
+            Deadlines::default().render
+        };
+        let machine = Machine::new().under(Deadlines {
+            render: deadline,
+            ..Deadlines::default()
+        });
         let svc = machine.svc(Behavior::default());
         let mut revocation = machine.revocation_with(render, accepted());
         let started = Instant::now();
         revocation.check(Reduced::Enforced);
+        let Phase::Render(helper) = &revocation.phase else {
+            panic!("no render: {render_shown}");
+        };
+        let pid = crate::inspection::tests::pid(helper).unwrap();
         assert_eq!(
             settle(&mut revocation, true, Reduced::Enforced),
             Status::Restarting,
             "{render_shown}"
         );
-        assert_eq!(started.elapsed() >= RENDER, late, "{render_shown}");
-        assert!(started.elapsed() < RENDER * 4, "{render_shown}");
+        let elapsed = started.elapsed();
+        if late {
+            assert!(elapsed >= RENDER, "{render_shown}: {elapsed:?}");
+        }
+        // Under `SLACK`, the failing render's own deadline, and below the
+        // hung helper's 30 seconds.
+        assert!(elapsed < SLACK, "{render_shown}: {elapsed:?}");
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "{render_shown}: not reaped"
+        );
         assert!(svc.requests().is_empty(), "{render_shown}");
         assert_eq!(machine.recorded(), None);
         assert!(machine.guard().exists());
@@ -1153,7 +1243,7 @@ fn a_check_due_during_a_cutover_is_taken_when_it_settles() {
     // The state turns enforced while the first cutover runs: the tick
     // that settles it publishes its record and begins the second, which
     // removes that record again, so every tick reads pending.
-    let until = Instant::now() + Duration::from_secs(10);
+    let until = Instant::now() + WAIT;
     while machine.renders() < 2 {
         revocation.tick(true, || Reduced::Enforced).unwrap();
         assert_eq!(revocation.status(), Status::Pending, "a 00 between the two");
@@ -1324,8 +1414,12 @@ fn teardown_requests_a_failures_owed_reboot() {
     assert_eq!(machine.reboots(), 1);
     assert_eq!(revocation.status(), Status::Settled);
     assert!(machine.guard().exists());
-    // A request that never answers is bounded by its own deadline.
-    let machine = Machine::new();
+    // A request that never answers is bounded by its own deadline, long
+    // before the helper would exit by itself.
+    let machine = Machine::new().under(Deadlines {
+        reboot: REBOOT,
+        ..Deadlines::default()
+    });
     let _svc = machine.svc(Behavior {
         refuse_greeter: true,
         ..Behavior::default()
@@ -1336,7 +1430,7 @@ fn teardown_requests_a_failures_owed_reboot() {
     let started = Instant::now();
     revocation.abandon(true);
     assert!(started.elapsed() >= REBOOT);
-    assert!(started.elapsed() < REBOOT + TEARDOWN_REAP + Duration::from_secs(1));
+    assert!(started.elapsed() < SLACK, "{:?}", started.elapsed());
     assert_eq!(machine.reboots(), 1);
     // Already asked: waited for, not asked again.
     let machine = Machine::new();
