@@ -7393,10 +7393,10 @@ and image commits — showing:
    content and chrome listeners. Its socket lives in a short, exclusively
    created mode-0700 directory under the host-selected temporary directory,
    refuses a path above the Unix-socket limit, is removed on every host exit,
-   and every staged exchange shares one five-second wall-clock deadline across
-   all bytes and replies. It moves the existing virtio tablet into the
-   Firefox tile, types `x`, scrolls, and right-clicks in separate acknowledged
-   input frames. Tablet and PS/2 acknowledgements do not order their separate
+   and every staged exchange shares one thirty-second wall-clock deadline,
+   sized for a loaded host's screendumps, across all bytes and replies. It
+   moves the existing virtio tablet into the Firefox tile, types `x`,
+   scrolls, and right-clicks in separate acknowledged input frames. Tablet and PS/2 acknowledgements do not order their separate
    guest devices. The host therefore sends the first tablet position, waits
    for Firefox's compositor-observed cursor, sends the second in-window
    position, then waits for a bounded content probe to require a trusted

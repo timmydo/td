@@ -1,6 +1,6 @@
 //! Host-only release update oracle over a disposable overlay of an installation,
 //! and `qemu-deploy-rollback`, which drives request `1d` on the system image.
-use super::{find_qemu, find_qemu_tool, qmp_json_path, Qmp};
+use super::{find_qemu, find_qemu_tool, qmp_deadline, qmp_json_path, Qmp, QMP_IO_TIMEOUT};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -198,7 +198,7 @@ impl Guest {
         })?;
         guest.qmp = Some(Qmp::connect_until(
             &options.work.join(format!("qmp-{pass}.sock")),
-            deadline.min(Instant::now() + Duration::from_secs(10)),
+            deadline.min(qmp_deadline(QMP_IO_TIMEOUT)?),
         )?);
         println!("[qemu-update] boot {pass} healthy");
         Ok(guest)
@@ -457,8 +457,16 @@ impl Guest {
             .ok_or_else(|| "VM monitor is not connected".into())
     }
 
+    /// One QMP exchange's bound, within the boot's deadline. A window a
+    /// screen is awaited in is checked between captures, so a capture
+    /// begun inside it that a loaded host slows is judged rather than
+    /// taken for a hang.
+    fn exchange_deadline(&self) -> Result<Instant> {
+        Ok(self.deadline.min(qmp_deadline(QMP_IO_TIMEOUT)?))
+    }
+
     fn key(&mut self, keys: &[&str]) -> Result<()> {
-        let end = self.deadline.min(Instant::now() + Duration::from_secs(10));
+        let end = self.exchange_deadline()?;
         self.qmp()?.key_chord_until(keys, end)
     }
 
@@ -496,12 +504,13 @@ impl Guest {
         let end = self.deadline.min(Instant::now() + budget);
         let filename = qmp_json_path(path)?;
         loop {
+            let exchange = self.exchange_deadline()?;
             self.qmp()?
                 .exchange_until(
                     &format!(
                         "{{\"execute\":\"screendump\",\"arguments\":{{\"filename\":{filename}}}}}"
                     ),
-                    end,
+                    exchange,
                 )
                 .map_err(|error| format!("capture {what}: {error}"))?;
             let bytes = read_capture(path)?;
@@ -522,7 +531,7 @@ impl Guest {
     fn rollback_prompt(&mut self, path: &Path, current: &str, previous: &str) -> Result<[u8; 2]> {
         for _ in 0..20 {
             self.key(&["ctrl", "alt", "esc"])?;
-            let end = self.deadline.min(Instant::now() + Duration::from_secs(20));
+            let end = self.exchange_deadline()?;
             self.qmp()?.move_absolute_until(0, 0, end)?;
             self.screen_until(
                 path,
@@ -563,7 +572,7 @@ impl Guest {
                 },
             )?;
             self.key(&["ctrl", "alt", "esc"])?;
-            let end = self.deadline.min(Instant::now() + Duration::from_secs(20));
+            let end = self.exchange_deadline()?;
             self.qmp()?.move_absolute_until(0, 0, end)?;
             let mut shown = false;
             self.screen_until(
@@ -728,15 +737,17 @@ impl Guest {
     fn prompt(&mut self, id: &str, path: &Path) -> Result<[u8; 2]> {
         self.key(&["ctrl", "alt", "esc"])?;
         let end = self.deadline.min(Instant::now() + Duration::from_secs(20));
-        self.qmp()?.move_absolute_until(0, 0, end)?;
+        let exchange = self.exchange_deadline()?;
+        self.qmp()?.move_absolute_until(0, 0, exchange)?;
         let filename = qmp_json_path(path)?;
         loop {
+            let exchange = self.exchange_deadline()?;
             self.qmp()?
                 .exchange_until(
                     &format!(
                         "{{\"execute\":\"screendump\",\"arguments\":{{\"filename\":{filename}}}}}"
                     ),
-                    end,
+                    exchange,
                 )
                 .map_err(|error| format!("capture secure-attention menu: {error}"))?;
             let bytes = read_capture(path)?;

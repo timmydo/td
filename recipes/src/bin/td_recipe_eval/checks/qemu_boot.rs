@@ -367,7 +367,11 @@ const POLL: Duration = Duration::from_millis(200);
 /// A power-cut boot's poll: the kill should land as close after its
 /// marker as the host allows, since the guest keeps committing meanwhile.
 const CUT_POLL: Duration = Duration::from_millis(5);
-const QMP_IO_TIMEOUT: Duration = Duration::from_secs(5);
+/// One QMP exchange's bound, which only a hung QEMU should reach. QEMU
+/// answers its monitor from the main loop that also scans the display out,
+/// so on a loaded host a full-frame screendump, or an input event queued
+/// behind one, can take several seconds.
+const QMP_IO_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_QMP_LINE_BYTES: usize = 64 * 1024;
 const MAX_QMP_RESPONSE_LINES: usize = 32;
 const QMP_ABSOLUTE_EXTENT: u32 = 32_768;
