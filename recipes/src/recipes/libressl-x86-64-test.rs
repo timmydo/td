@@ -305,7 +305,7 @@ int main(void) {
                 SH,
                 "-c",
                 "actual=$('{root}/tls-test') || { echo 'LibreSSL verified-handshake probe failed' >&2; exit 1; }; \
-                 [ \"$actual\" = 'LibreSSL 4.3.2 verified TLS handshake OK' ] || { echo \"unexpected LibreSSL result: $actual\" >&2; exit 1; }",
+                 [ \"$actual\" = 'LibreSSL 4.4.0 verified TLS handshake OK' ] || { echo \"unexpected LibreSSL result: $actual\" >&2; exit 1; }",
             ],
         )
         .env("PATH", PATH),
@@ -315,7 +315,7 @@ int main(void) {
     });
     steps.push(Step::WriteFile {
         path: "{out}/result".into(),
-        content: "PASS: LibreSSL 4.3.2 performs an in-memory TLS handshake, verifies localhost, and rejects a hostname mismatch\n".into(),
+        content: "PASS: LibreSSL 4.4.0 performs an in-memory TLS handshake, verifies localhost, and rejects a hostname mismatch\n".into(),
         exec: false,
     });
     steps.push(Step::Require {

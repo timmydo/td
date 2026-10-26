@@ -350,8 +350,8 @@ int main(void) {
         }
     }
     if (version->ssl_version == NULL ||
-        strstr(version->ssl_version, "LibreSSL/4.3.2") == NULL)
-        return fail_text("curl TLS backend", "a LibreSSL/4.3.2 value",
+        strstr(version->ssl_version, "LibreSSL/4.4.0") == NULL)
+        return fail_text("curl TLS backend", "a LibreSSL/4.4.0 value",
             version->ssl_version, 5);
     if (version->libz_version == NULL ||
         strcmp(version->libz_version, "1.3.1") != 0)

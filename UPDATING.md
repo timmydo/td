@@ -133,10 +133,11 @@ and its licences), per commit.
    git grep -nF OLD-VERSION
    ```
 
-   Recipes name their version (`Recipe::mesboot("curl-x86-64", "8.21.0")`),
-   and their tests, design documents and other crates' fixtures often repeat
-   it. Hits that only happen to match stay unchanged (td-mta's `421 4.3.2`
-   SMTP replies are not LibreSSL 4.3.2).
+   Recipes name their version
+   (`Recipe::mesboot("curl-x86-64", "NEW-VERSION")`), and their tests,
+   design documents and other crates' fixtures often repeat it. Hits that
+   only happen to match stay unchanged (td-mta's `421 4.3.2` SMTP replies
+   are enhanced status codes, not a LibreSSL version).
 
 4. Fetch and verify the new source and regenerate the seed digest table,
    as `DEVELOPMENT.md` gives it (rebuild the evaluator, warm the cache, then
@@ -237,8 +238,9 @@ sign-off.
 - td-net: `cargo update --manifest-path net/Cargo.toml` takes the
   semver-compatible releases its dependents allow. Check each new
   release's `rust-version` against the pinned toolchain. A major moves by
-  editing `net/Cargo.toml` and adapting the code. The host preparation warms the vendored closure from
-  the committed lock, and `net-test` runs td-net's suite.
+  editing `net/Cargo.toml` and adapting the code. The host preparation
+  warms the vendored closure from the committed lock, and `net-test` runs
+  td-net's suite.
 - td-crypto and td-mta pin their direct dependencies exactly (`=1.18.1`)
   in their manifests and in `crypto_policy::DEPENDENCIES` (td-crypto's)
   and `POSTGRES_DEPENDENCIES` (td-mta's), so `cargo update` alone moves

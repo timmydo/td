@@ -1,7 +1,7 @@
 use crate::shared::{build_root_static_cc, unpack_into, BUILD_ROOT_PATH, BUILD_ROOT_SH as SH};
 use crate::types::{Recipe, Step, TextEdit};
 
-// LibreSSL 4.3.2 provides the OpenSSL-compatible TLS surface curl and Git will
+// LibreSSL 4.4.0 provides the OpenSSL-compatible TLS surface curl and Git will
 // consume. It exports static libssl.a + libcrypto.a and the public headers,
 // and no program: the libraries are absorbed into downstream runtime ELFs,
 // which carry td's debug-companion policy at their own final link boundary.
@@ -143,7 +143,7 @@ pub fn recipe() -> Recipe {
         exec: false,
     });
 
-    Recipe::mesboot("libressl-x86-64", "4.3.2")
+    Recipe::mesboot("libressl-x86-64", "4.4.0")
         .source_input("libressl-x86-64-source")
         .build_root()
         .native_inputs(&["glibc-x86-64", "gcc-runtime"])

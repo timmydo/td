@@ -183,14 +183,14 @@ const PINS: &[PinDef] = &[
     PinDef {
         key: "libressl-x86-64-source",
         aliases: &[],
-        // LibreSSL 4.3.2 supplies the OpenSSL-compatible TLS implementation
+        // LibreSSL 4.4.0 supplies the OpenSSL-compatible TLS implementation
         // for curl and Git. The recipe builds only static archives and disables
         // upstream assembly so every eventual shipped instruction remains on
         // td's checked frame-pointer path.
-        url: "https://ftp.openbsd.org/pub/OpenBSD/LibreSSL/libressl-4.3.2.tar.gz",
-        sha256: "edf01aee24c65d69e6a9efcb9d44bcda682ff9d4f3bbbd95e794e1dfa90847b5",
-        file: "libressl-4.3.2.tar.gz",
-        version: "4.3.2",
+        url: "https://ftp.openbsd.org/pub/OpenBSD/LibreSSL/libressl-4.4.0.tar.gz",
+        sha256: "7d02522ad5070b9adb32eb253ecabce181184a3750cf65abac0675ee908687c1",
+        file: "libressl-4.4.0.tar.gz",
+        version: "4.4.0",
     },
     PinDef {
         key: "linux-source",
@@ -468,7 +468,7 @@ mod tests {
         // `.crate` sources) +
         // util-linux 2.42.2 (cryptsetup's minimal libuuid/libblkid build
         // closure) + the first reviewed
-        // foreign application seed, upstream ripgrep 15.2.0, LibreSSL 4.3.2,
+        // foreign application seed, upstream ripgrep 15.2.0, LibreSSL 4.4.0,
         // curl 8.21.0 (the static HTTPS foundation for Git), Git 2.55.0,
         // curl's dated Mozilla CA extract and OpenSSH Portable 10.5p1. The
         // td-ui applications are td's own trees (APPLICATIONS.md §W.8) and
