@@ -569,6 +569,13 @@ holds a kernel.
 The Btrfs partition takes the remainder and carries `@var` plus
 `/td/deployments`. It is the only partition that grows.
 
+td-recipe-eval's `server-image` writes this layout into an image file
+on the build host, at a 512-byte sector, with the same partition
+names, ESP size, alignment and EFI paths from `td-boot/src/protocol.rs`
+(td-svc/DESIGN.md §10, "Profiles"). It does not run `td-install`: the
+host composes the volume as its other persistent volumes are composed,
+owned by guest root, and the image is never an installation target.
+
 ## 5. Firmware entry
 
 ### Read-only volume discovery primitive

@@ -1665,8 +1665,8 @@ could have written (td-login/TOKEN-LOGIN.md, "SSH"). The account has
 no password and no console login, and administration stays what
 APPLICATIONS.md §L.1 describes.
 
-td-recipe-eval's persistent-volume layout is today's only writer of
-the pair; no installer, bundle or image path stages it yet. It refuses
+td-recipe-eval's persistent-volume layout is the only writer of the
+pair; no installer or bundle stages it. It refuses
 any name the guest would refuse, which would leave the volume
 unreachable. That means one outside the guest's grammar, a reserved
 session or application form, or the name of another account or group
@@ -1677,6 +1677,31 @@ over a loopback-only forward as that account with that key, and holds
 the host key the client accepted to the one the console reported. The
 same key must be refused as root, and a key the server was never given
 must be refused.
+
+`server-image` (`./build-server-image`) writes that volume into a disk
+image firmware boots, for one account: `--user` (default `$USER`) and
+the keys of every `--authorized-keys` file. With no file named, it
+takes every `~/.ssh/*.pub` holding only keys the account admits and
+names each file it skipped and why; a named file with no key or any
+other line is refused. Key comments are kept. The image is
+td-install/DESIGN.md §4's layout at a 512-byte sector, sized by
+`--size` (8 GiB by default). The ESP holds the deployment's EFI-stub
+kernel as the removable-media loader and a selector carrying the run's
+key and the volume's UUID. The volume carries the deployment signed by
+that key as `current`, its trust root, and the provisioned pair, all
+owned by guest root. It carries no test scaffolding. The key is made
+for the run and discarded. The image is immutable: no shipped path
+delivers it a candidate, and a newer image replaces the machine.
+`--vhd` appends a fixed-disk VHD footer, the disk format Azure takes
+and AWS imports, at most 2040 GiB. Its size field is the disk and its
+CHS geometry the largest, which every reader takes to mean the size
+field. The kernel carries virtio and NVMe storage and virtio and e1000
+networking but not Hyper-V's or ENA's drivers, so no Azure or AWS
+instance boots the image yet. An existing output file is refused, and
+a finished image is published under its name only once complete.
+`qemu-boot-server` ends by composing an image for another account and
+a fresh key, cold-booting it under UEFI firmware with no command line
+from the host, and holding it to the steady state and the same logins.
 
 ## 11. Evicting a previous supervisor's services
 

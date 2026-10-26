@@ -43,6 +43,7 @@ pub(crate) mod recovery_screen;
 pub(crate) mod secret;
 pub(crate) mod serial_shell;
 pub(crate) mod server;
+pub(crate) mod server_image;
 pub(crate) mod setup_input;
 pub(crate) mod test_iso;
 pub(crate) mod update;
@@ -3372,11 +3373,14 @@ pub(crate) fn build_btrfs_tools(runner: &RecipeCheckRunner) -> Result<(PathBuf, 
 /// carries no scaffolding and leaks nothing about the machine that built it.
 /// An `Installation` retains its own private key and gives a local build graph
 /// two TiB of sparse virtual capacity; it is never a redistributable template.
+/// An `Image` is a `Published` volume sized to fill a disk image's volume
+/// partition (`server_image`), whose geometry the caller fixed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum VolumePurpose {
     Fixture,
     Published,
     Installation,
+    Image { bytes: u64 },
 }
 
 impl VolumePurpose {
@@ -3385,6 +3389,7 @@ impl VolumePurpose {
             Self::Fixture => PERSISTENT_VOLUME_BYTES,
             Self::Published => PUBLISHED_VOLUME_BYTES,
             Self::Installation => INSTALLATION_VOLUME_BYTES,
+            Self::Image { bytes } => bytes,
         }
     }
 }

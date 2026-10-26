@@ -569,14 +569,14 @@ mod tests {
     fn explicit_warm_callers_skip_the_terminal_gate() {
         let runner = include_str!("check_runner.rs");
         let wiring = "crate::warm::preflight(&runner, &targets)?;";
-        // Two call sites, and both are commands whose operator asked for the
-        // fetch: `warm` itself, and `bundle`, which is built to run unattended
-        // and so cannot lean on the terminal-gated automatic warm — a
-        // backgrounded bundle on a cold checkout climbed the whole ladder
-        // before dying on an unvendored crate directory. Any further fatal
-        // caller should be a deliberate decision, which is what this count
-        // keeps it.
-        assert_eq!(runner.matches(wiring).count(), 2);
+        // Three call sites, and all are commands whose operator asked for the
+        // fetch: `warm` itself, and `bundle` and `server-image`, which are
+        // built to run unattended and so cannot lean on the terminal-gated
+        // automatic warm — a backgrounded bundle on a cold checkout climbed
+        // the whole ladder before dying on an unvendored crate directory. Any
+        // further fatal caller should be a deliberate decision, which is what
+        // this count keeps it.
+        assert_eq!(runner.matches(wiring).count(), 3);
     }
 
     // …and the converse, which is what keeps a warm tree free of both the fetch

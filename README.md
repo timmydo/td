@@ -258,6 +258,25 @@ real hardware is the next milestone. [The installer
 contract](td-install/INSTALLER.md) says what version 1 does and what of it
 remains.
 
+To build the headless server (`server-x86-64`) as a disk image that UEFI
+firmware boots, reachable over SSH as one account:
+
+```sh
+./build-server-image                 # writes dist/td-server-x86-64.img as $USER,
+                                     # admitting each ~/.ssh/*.pub of ssh-ed25519 keys
+./build-server-image --vhd --user ada --authorized-keys ada.pub --size 16
+                                     # a fixed VHD, the disk format Azure and AWS take
+```
+
+The image runs system services under td-svc and starts nothing graphical.
+Its account has no password and no console login; the serial console
+shows boot and health only. The image carries the account name and the
+public keys with their comments. It is immutable: to update, replace the
+machine with a newer image ([td-svc design](td-svc/DESIGN.md) §10,
+"Profiles"). Its kernel carries virtio and NVMe storage and virtio and e1000
+networking, not Hyper-V's or ENA's drivers, so Azure and AWS instances do
+not boot it yet.
+
 To compose a retained optical/USB ISO from other prepared boot files and
 payloads, use `td-recipe-eval compose-iso OUTPUT KERNEL INITRAMFS
 [ISO-NAME=FILE ...]`. See the media contract for its input and publication

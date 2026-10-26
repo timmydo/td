@@ -28,7 +28,7 @@ use encoding::from_base64;
 /// its sshd policy names the second.
 const USERNAME: &str = "@var/lib/td/username";
 const AUTHORIZED_KEYS: &str = "@var/lib/td/authorized-keys";
-const KEY_TYPE: &str = "ssh-ed25519";
+pub(crate) const KEY_TYPE: &str = "ssh-ed25519";
 const MAX_KEYS: usize = 64;
 const MAX_COMMENT: usize = 256;
 /// The account forms td-firstboot reserves for sessions and applications:
@@ -79,6 +79,10 @@ impl ProvisionedAccount {
         &self.name
     }
 
+    pub(crate) fn key_count(&self) -> usize {
+        self.keys.len()
+    }
+
     /// Writes both files under `seed`, mode 0644 in directories of mode
     /// 0755: `mkfs.btrfs --rootdir` copies modes verbatim, and the guest
     /// requires exactly these.
@@ -109,6 +113,18 @@ impl ProvisionedAccount {
         }
         Ok(())
     }
+}
+
+/// That every key line of one file is one `new` admits, so an error can
+/// name the file before files are joined.
+pub(crate) fn check_keys(text: &str) -> Result<(), String> {
+    for (number, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if !line.is_empty() && !line.starts_with('#') {
+            parse_key(line).map_err(|error| format!("line {}: {error}", number + 1))?;
+        }
+    }
+    Ok(())
 }
 
 /// The rule td-firstboot's `check-primary-name` holds a saved name to: the

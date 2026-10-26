@@ -1334,6 +1334,28 @@ pub fn build_iso_cli(args: &[String]) -> Result<(), String> {
     crate::checks::qemu_boot::build_iso::run(&runner, lock, &options, admitted)
 }
 
+/// `server-image`: the server deployment on a UEFI disk image that admits
+/// one account over SSH (td-svc/DESIGN.md §10, "Profiles").
+pub fn server_image_cli(args: &[String]) -> Result<(), String> {
+    use crate::checks::qemu_boot::server_image;
+    let options = server_image::parse_args(args)?;
+    // The account is settled first: a refused name or key costs nothing yet.
+    let account = server_image::account(&options)?;
+    let targets = [server_image::STEM, "td-btrfs"];
+    ensure_targets_provenance(&targets)?;
+    let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
+    let scratch_name = scratch_name("server-image", &[server_image::STEM]);
+    let runner = RecipeCheckRunner::new(root, &scratch_name)?.with_streamed_progress();
+    // Before `check_out` creates the parent directory, and again after, when
+    // a `..` beneath a new directory resolves, as `build_iso_cli` does.
+    crate::checks::bundle::check_outside_ladder(&options.out, runner.ladder_work_dir())?;
+    server_image::check_out(&options.out)?;
+    crate::checks::bundle::check_outside_ladder(&options.out, runner.ladder_work_dir())?;
+    crate::warm::preflight(&runner, &targets)?;
+    let lock = lock_ladder_for_run(&runner)?;
+    server_image::run(&runner, lock, &options, &account)
+}
+
 fn bundle_usage() -> String {
     format!(
         "usage: bundle [--out DIR] [--raw] [--zlib] [--force] [--installation] [--source-origin URL] [--source-branch BRANCH]\n       \
@@ -10108,6 +10130,7 @@ chmod 755 '{}'
             "qemu_boot_net_cli",
             "qemu_boot_kexec_cli",
             "run_cli",
+            "server_image_cli",
             "bundle_cli",
         ] {
             assert!(
@@ -11552,6 +11575,7 @@ chmod 755 '{}'
             "qemu_secret_system_cli",
             "qemu_login_system_cli",
             "run_cli",
+            "server_image_cli",
             // The integration tier's memo, which keeps a pass a host without
             // KVM will not boot.
             "oracle_memo_cli",

@@ -38,6 +38,10 @@
 //!                         no build, signing, device access or live-profile creation
 //!   test-iso ISO [--usb]  interactively boot an ISO and disposable install disk
 //!   build-iso [--out FILE] [--force]  write a bootable td installation ISO
+//!   server-image [--out FILE] [--user NAME] [--authorized-keys FILE]... [--size GIB] [--vhd]
+//!                         write server-x86-64 to a UEFI disk image that admits
+//!                         NAME (default $USER) over SSH with the given keys
+//!                         (default the Ed25519 ~/.ssh/*.pub)
 //!   bundle [--out DIR] [--raw] [--zlib] [--force]
 //!                         build system-x86-64 and write a redistributable demo
 //!                         VM — the boot payloads plus a POSIX-sh `start`
@@ -403,6 +407,11 @@ fn main() {
                 die_runner(&error);
             }
         }
+        Some("server-image") => {
+            if let Err(error) = check_runner::server_image_cli(args.get(2..).unwrap_or(&[])) {
+                die_runner(&error);
+            }
+        }
         Some("test-iso") => {
             if let Err(error) = checks::qemu_boot::test_iso::cli(args.get(2..).unwrap_or(&[])) {
                 die(&error);
@@ -595,7 +604,7 @@ fn main() {
                 die(&e);
             }
         }
-        _ => die("usage: td-recipe-eval list|emit|check-list|check-count|check-script|check-run|build-run|check-history|clear-store|gc-store|qemu-secret|qemu-secret-system|qemu-login-system|qemu-boot|qemu-boot-uefi|qemu-boot-media|qemu-install|qemu-install-system|qemu-install-encrypted|qemu-boot-encrypted|qemu-boot-live|compose-iso|build-iso|test-iso|qemu-boot-erofs|qemu-boot-system|qemu-deploy-rollback|qemu-update|qemu-boot-net|qemu-boot-kexec|run|bundle|warm|verify-store|payload-closure|application-closure|vendor-warm-args|source-pins|build-root-pins|build-root-seed|source-pin|seed-digests|local-source-roster"),
+        _ => die("usage: td-recipe-eval list|emit|check-list|check-count|check-script|check-run|build-run|check-history|clear-store|gc-store|qemu-secret|qemu-secret-system|qemu-login-system|qemu-boot|qemu-boot-uefi|qemu-boot-media|qemu-install|qemu-install-system|qemu-install-encrypted|qemu-boot-encrypted|qemu-boot-live|compose-iso|build-iso|server-image|test-iso|qemu-boot-erofs|qemu-boot-system|qemu-deploy-rollback|qemu-update|qemu-boot-net|qemu-boot-kexec|run|bundle|warm|verify-store|payload-closure|application-closure|vendor-warm-args|source-pins|build-root-pins|build-root-seed|source-pin|seed-digests|local-source-roster"),
     }
 }
 

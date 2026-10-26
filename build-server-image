@@ -1,0 +1,38 @@
+#!/bin/sh
+set -eu
+
+case "$0" in
+    */*) start_dir=${0%/*} ;;
+    *) start_dir=. ;;
+esac
+case "${1-}" in
+    -h|--help)
+        echo 'usage: ./build-server-image [--out FILE] [--user NAME] [--authorized-keys FILE]... [--size GIB] [--vhd]'
+        exit 0
+        ;;
+esac
+# File operands name files relative to the caller, not to the checkout this
+# enters.
+caller=$(pwd -P)
+count=$#
+path_next=
+for arg do
+    if [ -n "$path_next" ]; then
+        case "$arg" in
+            /*) ;;
+            *) arg="$caller/$arg" ;;
+        esac
+        path_next=
+    else
+        case "$arg" in
+            --out|--authorized-keys) path_next=1 ;;
+        esac
+    fi
+    set -- "$@" "$arg"
+done
+shift "$count"
+cd "$start_dir"
+
+. ./host-preflight.sh
+
+exec cargo run --release --manifest-path recipes/Cargo.toml --bin td-recipe-eval -- server-image "$@"

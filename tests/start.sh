@@ -3,7 +3,8 @@
 # can ask that runner to execute td-recipe-eval.
 #
 # `start` boots the system, `build-qcow` bundles it, `build-iso` writes it to an
-# ISO and `test-iso` runs QEMU — and they share one sourced `host-preflight.sh`
+# ISO, `build-server-image` writes the server to a disk image and `test-iso`
+# runs QEMU — and they share one sourced `host-preflight.sh`
 # precisely so the bootstrap and the Rust floor cannot differ between them. The
 # legs below run all of them through
 # the same fixtures: a preflight that only `start` enforces is the bug this
@@ -55,6 +56,7 @@ make_fixture() {
     cp "$root/start" "$1/start"
     cp "$root/build-qcow" "$1/build-qcow"
     cp "$root/build-iso" "$1/build-iso"
+    cp "$root/build-server-image" "$1/build-server-image"
     cp "$root/test-iso" "$1/test-iso"
     cp "$root/host-preflight.sh" "$1/host-preflight.sh"
     cp "$root/.cargo/config.toml" "$1/.cargo/config.toml"
@@ -105,7 +107,7 @@ assert_isolated_runner_build() {
 # runner bootstrap and before Cargo starts building the system — from EITHER
 # entry point. `build-qcow` runs a far longer build than `start`, so an
 # unenforced floor there is the more expensive one to discover.
-for script in start build-qcow build-iso test-iso; do
+for script in start build-qcow build-iso build-server-image test-iso; do
     old_rust=$work/old-rust-$script
     make_fixture "$old_rust"
     old_rust_log=$work/old-rust-$script.log
@@ -139,7 +141,7 @@ done
 
 # A successful Cargo exit without the promised artifact must not reach the
 # system build through an old or dangling runner.
-for script in start build-qcow build-iso test-iso; do
+for script in start build-qcow build-iso build-server-image test-iso; do
     missing=$work/missing-$script
     make_fixture "$missing"
     missing_log=$work/missing-$script.log
@@ -241,6 +243,29 @@ test -z "$build_iso_third" || {
     exit 1
 }
 
+# `build-server-image` bootstraps identically and execs the image build,
+# with every file operand relative to the caller made absolute and every
+# other argument kept as given.
+server_image_log=$work/build-server-image.log
+: > "$server_image_log"
+(
+    cd "$work"
+    run_entry_point "$fixture" "$server_image_log" build-server-image --user ada \
+        --authorized-keys keys/a.pub --out out/td.vhd --authorized-keys /k.pub --vhd
+)
+server_image_first=$(sed -n '1p' "$server_image_log")
+server_image_second=$(sed -n '2p' "$server_image_log")
+server_image_third=$(sed -n '3p' "$server_image_log")
+assert_isolated_runner_build "$server_image_first" "$fixture" build-server-image
+test "$server_image_second" = "$ambient_target|wrong-target|$ambient_home|$fixture|run --release --manifest-path recipes/Cargo.toml --bin td-recipe-eval -- server-image --user ada --authorized-keys $work/keys/a.pub --out $work/out/td.vhd --authorized-keys /k.pub --vhd" || {
+    echo "FAIL: build-server-image lost a caller's path or skipped bootstrapping: $server_image_second" >&2
+    exit 1
+}
+test -z "$server_image_third" || {
+    echo "FAIL: build-server-image issued an unexpected third Cargo command: $server_image_third" >&2
+    exit 1
+}
+
 # A path relative to the caller stays relative to that caller when the
 # wrapper enters its checkout for the host preflight.
 iso_log=$work/iso.log
@@ -282,4 +307,4 @@ test -x "$fixture/$runner_path" || {
     exit 1
 }
 
-echo "PASS: start, build-qcow, build-iso and test-iso require Rust 1.95 and bootstrap their Cargo runner"
+echo "PASS: start, build-qcow, build-iso, build-server-image and test-iso require Rust 1.95 and bootstrap their Cargo runner"

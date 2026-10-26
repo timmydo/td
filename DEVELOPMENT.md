@@ -97,8 +97,9 @@ Nonempty selections still run through that host. This uses the affected-path
 mapping, not a blanket Markdown exemption: documentation that selects a check
 still runs it. `ready` remains required for documentation updates.
 
-The repository-root entry scripts are `./start`, `./build-qcow` and
-`./build-iso`, which build the system through the Cargo runner, `./test-iso`,
+The repository-root entry scripts are `./start`, `./build-qcow`,
+`./build-iso` and `./build-server-image`, which build the system through
+the Cargo runner, `./test-iso`,
 which boots a retained ISO with a private QEMU disk, `./install-fonts`,
 which installs the pinned outline face for td programs run on this host
 (`td-builder install-fonts`), and `./install-apps`, which builds the desktop

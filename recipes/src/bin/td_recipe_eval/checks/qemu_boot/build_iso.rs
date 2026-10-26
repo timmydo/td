@@ -152,12 +152,12 @@ pub(crate) fn check_out(options: &BuildIsoOptions) -> Result<Admitted, String> {
 
 /// Refuse a staged image this run did not write, so no failure removes it.
 /// A refused publication leaves one, and a later run may reuse the pid.
-fn refuse_stale(staged: &Path) -> Result<(), String> {
+pub(super) fn refuse_stale(staged: &Path) -> Result<(), String> {
     match fs::symlink_metadata(staged) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(format!("inspect {}: {error}", staged.display())),
         Ok(_) => Err(format!(
-            "{} is left from an earlier build-iso; move or remove it",
+            "{} is left from an earlier build; move or remove it",
             staged.display()
         )),
     }
@@ -172,7 +172,7 @@ fn refuse_stale(staged: &Path) -> Result<(), String> {
 /// is gone, the image is linked as for an absent one. A refused publication
 /// keeps the image and names it. The directory is synced so a reported
 /// publication survives a crash.
-fn publish(staged: &Path, out: &Path, admitted: Admitted) -> Result<(), String> {
+pub(super) fn publish(staged: &Path, out: &Path, admitted: Admitted) -> Result<(), String> {
     let parent = out
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -329,7 +329,7 @@ pub(crate) fn live_medium(
 }
 
 /// A sibling of `out`, so publishing is a link in one directory.
-fn staged_path(out: &Path) -> Result<PathBuf, String> {
+pub(super) fn staged_path(out: &Path) -> Result<PathBuf, String> {
     let name = out
         .file_name()
         .ok_or_else(|| format!("{} names no file", out.display()))?;
@@ -480,7 +480,7 @@ mod tests {
 
         // A refused image left staged refuses the next run before its build.
         let error = check_out(&options).unwrap_err();
-        assert!(error.contains("left from an earlier build-iso"), "{error}");
+        assert!(error.contains("left from an earlier build"), "{error}");
         assert_eq!(fs::read(&staged).unwrap(), td_iso(5));
         fs::remove_file(&staged).unwrap();
 

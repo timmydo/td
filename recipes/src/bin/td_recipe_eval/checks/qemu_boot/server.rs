@@ -14,6 +14,11 @@
 //! the recorded success and left the machine up, so a record the two
 //! disagree on fails here rather than reboot-looping a healthy server.
 //!
+//! Then the published form: the deployment composed by `server-image` into
+//! a disk image for a provisioned account, cold-booted by UEFI firmware from
+//! its ESP with no command line injected, to the steady state and the
+//! host's SSH logins.
+//!
 //! The failing boots exercise one of healthwatch's inputs, a health
 //! transaction that ended without a record (the fail-target token). A
 //! recorded failure, a timeout and a skip over an unmet requirement reach it
@@ -23,12 +28,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::host_login::HostLogin;
+use super::server_image::{self, Format, ImageInputs};
 use super::{
-    autotest_wait_token, boot_headless, boot_timeout, build_btrfs_tools, build_system_stem,
-    build_td_jail_seccomp_probe, check_persistent_volume, create_persistent_volume_layout,
-    find_qemu, provision_selector, require_action_marker, require_distinct_identity,
-    require_same_identity, require_selected_deployment, tail, validate_primary_selection, BootDisk,
-    BootPlan, BootResult, Devices, RunTrust, VolumeLayout, VolumePurpose, AUTOTEST_CMDLINE_TOKEN,
+    autotest_wait_token, boot_headless, boot_source, boot_timeout, build_btrfs_tools,
+    build_system_stem, build_td_jail_seccomp_probe, check_persistent_volume,
+    create_persistent_volume_layout, efi, find_qemu, provision_selector, require_action_marker,
+    require_distinct_identity, require_same_identity, require_selected_deployment, tail,
+    validate_primary_selection, BootDisk, BootPlan, BootResult, BootSource, Devices,
+    FirmwareAttachment, RunTrust, VolumeLayout, VolumePurpose, AUTOTEST_CMDLINE_TOKEN,
     BOOT_FAIL_TARGET_CMDLINE_TOKEN, DEPLOY_INSTALL_CMDLINE_TOKEN, GIT_RUNTIME_MARKER,
     GREETER_MARKER, RIPGREP_FD_RUNTIME_MARKER, ROOT_SSH_REFUSED_MARKER, SSHD_MARKER,
     SU_ABSENT_MARKER, SYSTEM_BOOT_SUCCESS_MARKER, SYSTEM_DEPLOY_INSTALL_MARKER,
@@ -52,6 +59,9 @@ const HEALTH_STEADY_MARKER: &str = td_recipe::shared::SERVER_HEALTH_STEADY_MARKE
 /// The provisioned primary's name: not the image's default, so the boot
 /// shows the saved name was taken.
 const ACCOUNT: &str = "ada";
+/// The composed image's own account, so its boot shows the image's saved
+/// name was taken rather than an earlier volume's.
+const IMAGE_ACCOUNT: &str = "grace";
 
 /// No display: nothing on a server draws. The direct-boot PC machine keeps
 /// its built-in i8042 keyboard controller, which only q35 can leave out.
@@ -150,6 +160,8 @@ impl Boot<'_> {
 
 pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     let qemu = find_qemu()?;
+    // Resolved first: the image boot that needs it runs last.
+    let firmware = efi::firmware(&qemu)?;
     let (bzimage, selector, deployment) = build_system_stem(runner, STEM)?;
     let (mkfs, btrfs) = build_btrfs_tools(runner)?;
     let seccomp_probe = build_td_jail_seccomp_probe(runner)?;
@@ -319,6 +331,15 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     require_same_identity(&failure_install, &rollback, "failure install", "rollback")?;
     check_persistent_volume(&btrfs, &volume)?;
 
+    let inputs = ImageInputs {
+        kernel: bzimage,
+        selector,
+        deployment,
+        mkfs,
+        btrfs,
+    };
+    image_boot(runner, &qemu, &firmware, &inputs)?;
+
     println!(
         "PASS: server-x86-64 boots headless under qemu - an installed candidate boots pending, \
          records health ({SYSTEM_BOOT_SUCCESS_MARKER}, then {HEALTH_STEADY_MARKER}) with the \
@@ -327,12 +348,123 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
          its provisioned key, on the host key the console reported, and is refused as root \
          and with another key; one whose every attempt fails health is rebooted by healthwatch \
          ({HEALTH_REBOOT_MARKER}, {SYSTEM_SHUTDOWN_MARKER}) until td-boot falls back to the \
-         previous deployment unattended. Every healthy boot reports the read-only root and \
+         previous deployment unattended; and the disk image server-image composes for its \
+         own account {IMAGE_ACCOUNT:?} cold-boots under UEFI firmware to the same steady \
+         state and logins. Every healthy boot reports the read-only root and \
          /etc, writable state, OpenSSH loopback ({SSHD_MARKER}) and root's refusal \
          ({ROOT_SSH_REFUSED_MARKER}), the userland and confinement probes, and no greeter, \
          compositor, session bus or application"
     );
     Ok(())
+}
+
+/// Compose the published image for a provisioned account of its own and
+/// cold-boot it under firmware: the ESP's EFI-stub kernel and selector find
+/// the volume by the identity the image bound, with no command line from
+/// the host, and the account logs in over SSH.
+fn image_boot(
+    runner: &RecipeCheckRunner,
+    qemu: &str,
+    (code, vars_template): &(PathBuf, PathBuf),
+    inputs: &ImageInputs,
+) -> Result<(), String> {
+    let dir = runner.scratch_dir().join("server-image");
+    match fs::remove_dir_all(&dir) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            return Err(format!("remove stale {}: {error}", dir.display()));
+        }
+        _ => {}
+    }
+    fs::create_dir(&dir).map_err(|error| format!("create {}: {error}", dir.display()))?;
+    let client = dir.join("ssh-client");
+    let login = HostLogin::prepare(&client, STEM, IMAGE_ACCOUNT)?;
+    let trust = server_image::root_owned_trust(runner)?;
+    let disk = dir.join("server.img");
+    let id = server_image::compose(
+        inputs,
+        &trust,
+        login.account(),
+        server_image::DEFAULT_DISK_GIB * 1024 * 1024 * 1024,
+        Format::Raw,
+        &dir,
+        &disk,
+    )?;
+    let vars = dir.join("vars.fd");
+    efi::copy_input(vars_template, &vars)?;
+    println!(
+        "   [qemu-boot-server] firmware cold-boots the composed image {} (deployment {id})",
+        disk.display()
+    );
+    let label = "image firmware boot";
+    let result = boot_source(
+        qemu,
+        BootSource::Firmware {
+            code,
+            vars: &vars,
+            attachment: FirmwareAttachment::Virtio,
+            installation_target: None,
+        },
+        BootPlan {
+            disk: Some(BootDisk::new(&disk, false)),
+            mem: SYSTEM_GUEST_MEMORY_MIB,
+            target_marker: HEALTH_STEADY_MARKER,
+            kill_on_marker: true,
+            extra_append: "",
+            user_net: true,
+            audio: false,
+            physical_input: false,
+            capture_firefox_audio: false,
+            tpm_socket: None,
+            side_channel: None,
+            answers: None,
+            cut: false,
+            keep_console: None,
+            screens: None,
+            devices: HEADLESS,
+            screen: None,
+            shell: None,
+            host_login: Some(&login),
+        },
+        &dir,
+        boot_timeout(),
+    )?;
+    println!(
+        "   [qemu-boot-server] {label} elapsed: {:.2}s",
+        result.elapsed.as_secs_f64()
+    );
+    validate_primary_selection(&result, label)?;
+    require_selected_deployment(
+        &result,
+        td_boot_protocol::SELECTED_CURRENT_MARKER,
+        &id,
+        label,
+    )?;
+    let evidence = &result.evidence;
+    let rebooted = result
+        .console
+        .lines()
+        .any(|line| line.trim_end() == HEALTH_REBOOT_MARKER);
+    if evidence.kernel_panic
+        || !evidence.boot_success
+        || !evidence.target
+        || !result.marker_killed
+        || rebooted
+        || !evidence.firstboot_new
+        || !evidence.sshd
+        || evidence.host_key.is_none()
+    {
+        return Err(format!(
+            "the {label} did not mint a new identity, start OpenSSH, record health \
+             {SYSTEM_BOOT_SUCCESS_MARKER:?} and reach {HEALTH_STEADY_MARKER:?} - {}. \
+             Last serial output:\n{}",
+            result.reason,
+            tail(&result.console, 80)
+        ));
+    }
+    no_attempt_state(&result, label)?;
+    no_desktop(&result, label)?;
+    login.verdict(evidence.host_key.as_deref())?;
+    fs::remove_dir_all(&dir).map_err(|error| format!("remove {}: {error}", dir.display()))
 }
 
 /// A boot that installed the channel's candidate and rolled the trial
