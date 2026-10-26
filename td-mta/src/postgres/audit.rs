@@ -164,14 +164,17 @@ mod tests {
             arguments(base.iter().map(OsString::from)).map(|options| options.timeout),
             Some(Duration::from_secs(10))
         );
-        for seconds in ["1", "60", "3600"] {
-            assert!(arguments(
-                base.iter()
-                    .copied()
-                    .chain(["--timeout-seconds", seconds])
-                    .map(OsString::from)
-            )
-            .is_some());
+        for (seconds, expected) in [("1", 1), ("60", 60), ("3600", 3600)] {
+            assert_eq!(
+                arguments(
+                    base.iter()
+                        .copied()
+                        .chain(["--timeout-seconds", seconds])
+                        .map(OsString::from)
+                )
+                .map(|options| options.timeout),
+                Some(Duration::from_secs(expected))
+            );
         }
         for seconds in ["0", "3601", "18446744073709551615", "+1", "-1", "１"] {
             assert!(arguments(

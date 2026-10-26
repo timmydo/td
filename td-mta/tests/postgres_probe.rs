@@ -505,10 +505,12 @@ fn command_probe(fixture: &Fixture, expected: bool) -> String {
     )
 }
 
+#[track_caller]
 fn command_output(arguments: &[&str], root: &std::path::Path, expected: i32) -> String {
     command_output_with_timeout(arguments, root, expected, Duration::from_secs(15))
 }
 
+#[track_caller]
 fn command_output_with_timeout(
     arguments: &[&str],
     root: &std::path::Path,

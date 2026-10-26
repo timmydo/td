@@ -190,9 +190,18 @@ pub(super) fn exercise() {
         command_output_with_timeout(&base, fixture.root.path(), 0, Duration::from_secs(65));
     assert!(output.contains("\"verified_bytes\":167772160"));
     assert!(!output.contains(std::str::from_utf8(PASSWORD).unwrap()));
-    let mut short = base;
-    short[17] = "1";
-    assert!(command_output(&short, fixture.root.path(), 1).contains("deadline"));
+    assert_eq!(
+        audit::inspect(
+            &fixture.request(),
+            &trust,
+            Instant::now(),
+            epoch,
+            account,
+            0,
+            limits,
+        ),
+        Err(audit::Error::Connection(postgres_probe::Error::Deadline))
+    );
     let mut bad = base;
     bad[17] = "3601";
     assert!(command_output(&bad, fixture.root.path(), 2).contains("invalid-arguments"));
