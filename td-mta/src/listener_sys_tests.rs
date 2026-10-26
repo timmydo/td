@@ -9,10 +9,8 @@ use std::{
 #[test]
 #[allow(deprecated)]
 fn wildcard_ipv6_is_separate_from_ipv4_and_rebinds_after_use() {
-    let v6 = bind("[::]:0".parse().unwrap()).unwrap();
-    assert!(v6.only_v6().unwrap());
+    let (v6, v4) = listeners().unwrap();
     let port = v6.local_addr().unwrap().port();
-    let v4 = bind(SocketAddr::from(([0, 0, 0, 0], port))).unwrap();
     for (listener, address, family) in [
         (&v6, SocketAddr::new(Ipv6Addr::LOCALHOST.into(), port), true),
         (&v4, SocketAddr::from(([127, 0, 0, 1], port)), false),
@@ -38,6 +36,22 @@ fn wildcard_ipv6_is_separate_from_ipv4_and_rebinds_after_use() {
     drop(v6);
     let replacement = bind(SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), port)).unwrap();
     assert!(replacement.only_v6().unwrap());
+}
+
+#[allow(deprecated)]
+fn listeners() -> io::Result<(TcpListener, TcpListener)> {
+    // The two families allocate ephemeral ports independently.
+    for _ in 0..128 {
+        let v6 = bind("[::]:0".parse().unwrap())?;
+        assert!(v6.only_v6()?);
+        let port = v6.local_addr()?.port();
+        match bind(SocketAddr::from(([0, 0, 0, 0], port))) {
+            Ok(v4) => return Ok((v6, v4)),
+            Err(error) if error.kind() == io::ErrorKind::AddrInUse => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::ErrorKind::AddrInUse.into())
 }
 
 #[test]
