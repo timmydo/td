@@ -1861,8 +1861,10 @@ td-term [--socket PATH] [--working-directory PATH] [--font-size POINTS]
         [-e|--command PROGRAM [ARG...]]
 ```
 
-`run` stays td's session program, unchanged; the two differ only where a
-desktop's terminal must:
+`run` stays td's session program, unchanged: the session's `[terminal]`
+unit and every terminal td-authd launches for the compositor, `Super+t`
+and the task terminal among them, run it, never this profile. The two
+differ only where a desktop's terminal must:
 
 - a flag may also be spelled `--flag=VALUE`, and `--` ends the flags as `-e`
   does;

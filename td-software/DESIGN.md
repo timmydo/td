@@ -6,8 +6,9 @@ document (`AGENTS.md` routes here). Each *As built* note records how
 the code realises the section it follows, and where a note and the text
 before it differ, the note describes the code. Sections that still say
 *proposal* or *would* describe the design as it was reviewed; the notes
-beside them are what was built. Two items stay outside it: the
-`/bin/<app>` links (§6, last paragraphs) and §B.5's hide list (§7).
+beside them are what was built. One item stays outside it: §B.5's hide
+list (§7). The other it left out, removing the `/bin/<app>` links, has
+landed separately (§6, last paragraphs).
 
 td-software is a td-ui program and the only place a session owner
 installs, updates and removes applications. The repository user
@@ -25,7 +26,7 @@ Three problems prompted it:
 - Claude Code is being removed from td entirely, in a separate change,
   so td-software offers it in no form.
 - A jailed application that cannot be started from a terminal should not
-  have a `/bin/<app>` entry.
+  have a `/bin/<app>` entry. None has one now (§6).
 
 ## 1. What "installed" means
 
@@ -496,13 +497,17 @@ a separate change, and td-software offers it neither as built-in nor as
 installable. A terminal application td-software installs later uses the
 terminal presentation §W.7 plans.
 
-**`/bin/<app>` for window applications.** Removing those links is a
-separate change, but td-software's launches rely on it. The
-application-exec wrapper builds `/bin/APP` for direct presentation
+**`/bin/<app>` for window applications.** The image has none; a
+separate change removed them. td-software's launches go through
+td-authd's direct presentation, whose application-exec wrapper execs
+`/bin/td-jail` with the application's name as its `argv[0]`
 (td-authd/DESIGN.md, "Fixed application launch prerequisite"), and §A.0
-resolves the application from td-jail's `argv[0]`. Dropping the link
-needs a fixed td-jail entry outside `PATH`, and the open farm in
-`bin_farms()` has to move with it.
+resolves the application from that `argv[0]`. td-jail refuses a by-name
+launch under any UID but the application's own account, so a shell
+cannot start one. The application names stay a farm in the system
+recipe's tests (`bin_farms()`), whose disjointness guard keeps any
+applet from taking one, and the image's shape check refuses a `/bin`
+entry under any of them.
 
 ## 7. Decisions
 
