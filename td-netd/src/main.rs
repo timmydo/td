@@ -280,8 +280,45 @@ fn add_broadcast_route(fd: RawFd, ifname: &str) -> io::Result<()> {
     ioctl(fd, SIOCADDRT, rt.as_mut_ptr())
 }
 
+/// Whether `gateway`, a unicast address other than `address`, lies outside the
+/// subnet `address` and `mask` describe, as a /32 lease's (GCE's) router does.
+/// A zero, multicast or broadcast router gets no route of its own.
+fn off_link(address: [u8; 4], mask: [u8; 4], gateway: [u8; 4]) -> bool {
+    let [first, ..] = gateway;
+    let unicast = (1..224).contains(&first);
+    unicast
+        && gateway != address
+        && address
+            .iter()
+            .zip(mask)
+            .zip(gateway)
+            .any(|((address, mask), gateway)| address & mask != gateway & mask)
+}
+
+/// A host route to `gateway` out `dev`. The kernel gives a device route with no
+/// gateway link scope, so a default route through `gateway` then resolves.
+fn router_rtentry(gateway: [u8; 4], dev: &CString) -> [u8; RTENTRY_LEN] {
+    build_rtentry(
+        gateway,
+        [255, 255, 255, 255],
+        [0, 0, 0, 0],
+        RTF_UP | RTF_HOST,
+        Some(dev),
+    )
+}
+
+/// Make a router outside the leased subnet reachable on `ifname`'s link, as
+/// `add_default_route` needs it to be.
+fn add_router_route(fd: RawFd, ifname: &str, gateway: [u8; 4]) -> io::Result<()> {
+    let dev = CString::new(ifname.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "interface name has a NUL"))?;
+    let mut rt = router_rtentry(gateway, &dev);
+    ioctl(fd, SIOCADDRT, rt.as_mut_ptr())
+}
+
 /// Add the default route (0.0.0.0/0) via `gateway`. The gateway is on-link once the
-/// interface address+netmask are set, so no rt_dev is needed.
+/// interface address+netmask are set, or through `add_router_route` when it lies
+/// outside them, so no rt_dev is needed.
 fn add_default_route(fd: RawFd, gateway: [u8; 4]) -> io::Result<()> {
     let mut rt = build_rtentry(
         [0, 0, 0, 0],
@@ -846,6 +883,16 @@ fn apply_lease(fd: RawFd, name: &str, lease: &Lease) -> io::Result<()> {
         set_addr(fd, name, SIOCSIFNETMASK, mask)?;
     }
     if let Some(gw) = lease.routers.first().copied() {
+        if lease
+            .subnet
+            .is_some_and(|mask| off_link(lease.yiaddr, mask, gw))
+        {
+            if let Err(e) = add_router_route(fd, name, gw) {
+                if e.raw_os_error() != Some(17) {
+                    return Err(e);
+                }
+            }
+        }
         if let Err(e) = add_default_route(fd, gw) {
             if e.raw_os_error() != Some(17) {
                 return Err(e);
@@ -1532,6 +1579,56 @@ mod tests {
         assert_ne!(
             usize::from_ne_bytes(rt[RT_DEV..RT_DEV + 8].try_into().unwrap()),
             0
+        );
+    }
+
+    #[test]
+    fn a_router_outside_the_leased_subnet_is_off_link() {
+        // GCE leases a /32 whose router is the subnet's first address.
+        assert!(off_link(
+            [10, 128, 0, 5],
+            [255, 255, 255, 255],
+            [10, 128, 0, 1]
+        ));
+        // An ordinary lease's router (QEMU, Azure, EC2) is on the subnet.
+        assert!(!off_link([10, 0, 2, 15], [255, 255, 255, 0], [10, 0, 2, 2]));
+        assert!(!off_link(
+            [172, 31, 20, 9],
+            [255, 255, 240, 0],
+            [172, 31, 16, 1]
+        ));
+        assert!(off_link(
+            [172, 31, 20, 9],
+            [255, 255, 240, 0],
+            [172, 31, 32, 1]
+        ));
+        // No route for a router that is no unicast neighbour.
+        let host = [255, 255, 255, 255];
+        for router in [
+            [0, 0, 0, 0],
+            [224, 0, 0, 1],
+            [255, 255, 255, 255],
+            [10, 128, 0, 5],
+        ] {
+            assert!(!off_link([10, 128, 0, 5], host, router), "{router:?}");
+        }
+    }
+
+    #[test]
+    fn a_router_route_is_a_device_host_route_with_no_gateway() {
+        let dev = CString::new("eth0").unwrap();
+        let rt = router_rtentry([10, 128, 0, 1], &dev);
+        assert_eq!(&rt[RT_DST..RT_DST + 2], &[2, 0]);
+        assert_eq!(&rt[RT_DST + 4..RT_DST + 8], &[10, 128, 0, 1]);
+        assert_eq!(&rt[RT_GENMASK + 4..RT_GENMASK + 8], &[255, 255, 255, 255]);
+        assert_eq!(&rt[RT_GATEWAY + 4..RT_GATEWAY + 8], &[0, 0, 0, 0]);
+        assert_eq!(
+            u16::from_ne_bytes([rt[RT_FLAGS], rt[RT_FLAGS + 1]]),
+            RTF_UP | RTF_HOST
+        );
+        assert_eq!(
+            usize::from_ne_bytes(rt[RT_DEV..RT_DEV + 8].try_into().unwrap()),
+            dev.as_ptr() as usize
         );
     }
 

@@ -368,7 +368,23 @@ fn the_ioctl_requests_are_the_interface_config_set() {
             );
         }
     }
-    assert_eq!(calls, 7, "the interface-config ioctl call sites changed");
+    assert_eq!(calls, 8, "the interface-config ioctl call sites changed");
+    // The router route is one device host route to the lease's router, with
+    // no gateway of its own.
+    assert_eq!(
+        main.matches("letmutrt=router_rtentry(gateway,&dev);ioctl(fd,SIOCADDRT,rt.as_mut_ptr())")
+            .count(),
+        1,
+        "SIOCADDRT's router route goes through router_rtentry"
+    );
+    assert_eq!(
+        main.matches(
+            "build_rtentry(gateway,[255,255,255,255],[0,0,0,0],RTF_UP|RTF_HOST,Some(dev),)"
+        )
+        .count(),
+        1,
+        "router_rtentry is a device host route with no gateway"
+    );
     // SIOCDELRT deletes whatever route it describes; it describes only the
     // limited-broadcast host route, on no device in particular.
     assert_eq!(

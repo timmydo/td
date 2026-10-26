@@ -1741,17 +1741,16 @@ and `--ena-support`, for Nitro instance types. GCE: pack the raw image
 as `disk.raw` with `tar --format=oldgnu -Sczf`, upload it and create
 an image with the `UEFI_COMPATIBLE` and `GVNIC` guest OS features.
 
-Not yet: td-netd adds its default route through the lease's router
-without an on-link route to it. GCE leases a /32, so that route fails,
-the watcher clears the address and asks again every 15 seconds, and a
-GCE instance never holds an address; Azure and EC2 routers are on the
-leased subnet. td-netd also applies no MTU (option 26) or classless
-static routes (option 121), which Azure and EC2 do not need. Nothing
-handles the ACPI power button, so a cloud's stop waits out its grace
-period and then cuts power, and Hyper-V's integration services
-(shutdown, heartbeat, KVP and time sync, which need CONNECTOR) are not
-built. Nothing reads instance metadata: the account and keys are the
-image's own.
+A router outside the leased subnet, as on GCE, whose leases are /32s,
+is first given an on-link host route on the leased interface, so the
+default route through it resolves. Not yet: td-netd applies no MTU
+(option 26), so the interface keeps 1500 bytes where a GCE VPC
+defaults to 1460, and no classless static routes (option 121), which
+none of the three needs for a default route. Nothing handles the ACPI
+power button, so a cloud's stop waits out its grace period and then
+cuts power, and Hyper-V's integration services (shutdown, heartbeat,
+KVP and time sync, which need CONNECTOR) are not built. Nothing reads
+instance metadata: the account and keys are the image's own.
 
 ## 11. Evicting a previous supervisor's services
 

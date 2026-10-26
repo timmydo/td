@@ -334,16 +334,18 @@ named value a call site passes, and the asm block register for
 register:
 
 - `ioctl(2)` (16). Through `sys::ioctl`, the interface-config requests
-  SIOCGIFFLAGS, SIOCSIFFLAGS, SIOCSIFADDR, SIOCSIFNETMASK, SIOCGIFHWADDR,
-  SIOCADDRT and SIOCDELRT on an AF_INET datagram socket (SIOCDELRT
-  takes only the limited-broadcast host route, so DHCP's broadcasts
-  leave by the interface acquiring); that wrapper takes its request
-  from the caller, so the tests pin its seven call sites, the one
-  SIOCDELRT site's route whole, and the
-  two requests `set_addr` may forward. And TCGETS/TCSETS, fixed to
-  descriptor 0 over the kernel's 36-byte `struct termios` (§3's
-  length), for `td-netd wifi join`'s passphrase prompt, which turns
-  echo off and back on; ENOTTY leaves a piped standard input as it is.
+  SIOCGIFFLAGS, SIOCSIFFLAGS, SIOCSIFADDR, SIOCSIFNETMASK,
+  SIOCGIFHWADDR, SIOCADDRT and SIOCDELRT on an AF_INET datagram socket
+  (SIOCDELRT takes only the limited-broadcast host route, so DHCP's
+  broadcasts leave by the interface acquiring, and SIOCADDRT adds that
+  route, the default route and, for a router outside the leased subnet
+  as GCE's /32 leases have, a host route to it on the leased interface);
+  that wrapper takes its request from the caller, so the tests pin its
+  eight call sites, the one SIOCDELRT site's route and the router route
+  whole, and the two requests `set_addr` may forward. And TCGETS/TCSETS,
+  fixed to descriptor 0 over the kernel's 36-byte `struct termios` (§3's
+  length), for `td-netd wifi join`'s passphrase prompt, which turns echo
+  off and back on; ENOTTY leaves a piped standard input as it is.
 - `socket(2)` (41) fixed to AF_NETLINK, SOCK_RAW|SOCK_CLOEXEC and
   NETLINK_GENERIC; `setsockopt(2)` (54) fixed to
   SOL_NETLINK/NETLINK_ADD_MEMBERSHIP with a four-byte group;
