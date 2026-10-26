@@ -1658,8 +1658,9 @@ pub fn seed_digests_cli() -> Result<(), String> {
          # seed/local-source-roster.txt, which pins their declarations instead of a\n\
          # content hash. Compiled into td-recipe-eval (enforced after every seed\n\
          # derivation) and td-builder (enforced at build-plan lock synthesis).\n\
-         # Regenerate with `td-recipe-eval seed-digests > seed/seed-digests.txt`\n\
-         # (warm source cache required) when a pin changes. Hand-editing a row\n\
+         # Regenerate when a pin changes as DEVELOPMENT.md gives it: rebuild\n\
+         # td-recipe-eval, warm the source cache, and write the table aside before\n\
+         # moving it into place. Hand-editing a row\n\
          # is self-defeating: the runner\n\
          # re-derives from the pins every run and reds on disagreement."
     );
@@ -8708,8 +8709,8 @@ chmod 755 '{}'
     // derivation, and an orphan row pins nothing. Local sources are excluded here
     // — they are covered by `local_source_roster_covers_the_catalog_local_source_universe`
     // below instead, against `seed/local-source-roster.txt`. Cold-safe: walks the
-    // compiled catalog + pins only, no warm sources. On mismatch, regenerate with
-    // `td-recipe-eval seed-digests > seed/seed-digests.txt`.
+    // compiled catalog + pins only, no warm sources. On mismatch, regenerate as
+    // DEVELOPMENT.md gives it.
     #[test]
     fn seed_digest_table_covers_the_catalog_seed_universe() {
         let universe: std::collections::BTreeSet<String> = catalog_seed_universe()
@@ -8726,7 +8727,7 @@ chmod 755 '{}'
         assert_eq!(
             universe, table,
             "seed/seed-digests.txt must pin exactly the catalog's NON-local pinned-seed \
-             universe — regenerate with `td-recipe-eval seed-digests > seed/seed-digests.txt`"
+             universe — regenerate it as DEVELOPMENT.md gives it"
         );
     }
 

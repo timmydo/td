@@ -1721,7 +1721,7 @@ settings or unsupported data show `CLOCK ?`; an absent setting stays UTC.
 See `td-compositor/DESIGN.md` for reader bounds and DST proof. Post-install
 account, keyboard and timezone setters remain separate increments.
 
-The `tzdata` recipe compiles the approved IANA 2026d data-only source
+The `tzdata` recipe compiles the approved IANA 2026e data-only source
 with td's imported Debian glibc `zic`. Its output contains fat
 TZif files at `share/zoneinfo`, including backward-compatible aliases,
 geographic tables, and the upstream version and license. It uses
@@ -1729,7 +1729,7 @@ ordinary POSIX time without leap-second corrections. Fat output is
 required by the pinned glibc compiler: its older `zic` miscompiles the
 2026 Canadian transitions in slim mode, dropping the correct
 daylight-saving flags and abbreviations. The native check covers those
-transitions in all six affected zone names. The upstream `Factory`
+transitions in all nine affected zone names. The upstream `Factory`
 placeholder for an unspecified timezone is intentionally omitted; it is
 not a selectable civil timezone. The upstream default source set omits
 `backzone`; merged locations share their canonical zone's pre-1970

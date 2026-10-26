@@ -28,9 +28,10 @@
 //! asked about one, so a routing mistake reds loudly instead of silently
 //! comparing against the wrong table.
 //!
-//! Regenerate with `td-recipe-eval seed-digests > seed/seed-digests.txt`
-//! (warm source cache required) whenever a pin changes; the coverage test
-//! and the first build both red until the committed table agrees.
+//! Regenerate whenever a pin changes, as DEVELOPMENT.md gives it (rebuild
+//! td-recipe-eval, warm the source cache, write the table aside); the
+//! coverage test and the first build both red until the committed table
+//! agrees.
 
 const TABLE: &str = include_str!("../../../../seed/seed-digests.txt");
 

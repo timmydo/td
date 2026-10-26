@@ -39,7 +39,7 @@ pub(super) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         )?;
         verify_report(&report, &zone, rows)?;
     }
-    println!("PASS: tzdata 2026d: {zones} TZif files; td glibc reads UTC, DST transitions, fixed offsets and six Canadian zones through the 2026 transition; the native clock reads all installer choices and exact winter/summer offsets in 2100");
+    println!("PASS: tzdata 2026e: {zones} TZif files; td glibc reads UTC, DST transitions, fixed offsets and nine Canadian zones through the 2026 transition; the native clock reads all installer choices and exact winter/summer offsets in 2100");
     Ok(())
 }
 
@@ -58,6 +58,7 @@ const CLOCK_OFFSETS: &[(&str, i32, i32)] = &[
     ("Pacific/Auckland", 46_800, 43_200),
     ("America/Inuvik", -21_600, -21_600),
     ("America/Vancouver", -25_200, -25_200),
+    ("America/Winnipeg", -18_000, -18_000),
 ];
 
 fn verify_clock_catalog(root: &Path) -> Result<(), String> {
@@ -97,11 +98,14 @@ fn verify_clock_offsets(name: &str, bytes: &[u8], winter: i32, summer: i32) -> R
     Ok(())
 }
 
-// Exact civil-time expectations for this pin, including 2026d's Inuvik change.
+// Exact civil-time expectations for this pin, including 2026d's Inuvik and
+// 2026e's Manitoba changes.
 const CANADA_MOUNTAIN_2026: &str =
     "-\t-\t-07\tMST\n2026-03-08\t03\t-06\tMDT\t1\n2026-11-01\t02\t-06\tCST\n";
 const CANADA_PACIFIC_2026: &str =
     "-\t-\t-08\tPST\n2026-03-08\t03\t-07\tPDT\t1\n2026-11-01\t02\t-07\tMST\n";
+const CANADA_CENTRAL_2026: &str =
+    "-\t-\t-06\tCST\n2026-03-08\t03\t-05\tCDT\t1\n2026-11-01\t02\t-05\tEST\n";
 const EXPECTED: &[(&str, &str, &str)] = &[
     ("Etc/UTC", "2027,2028", "-\t-\t+00\tUTC\n"),
     (
@@ -122,6 +126,10 @@ const EXPECTED: &[(&str, &str, &str)] = &[
     ("Canada/Mountain", "2026,2027", CANADA_MOUNTAIN_2026),
     ("America/Vancouver", "2026,2027", CANADA_PACIFIC_2026),
     ("Canada/Pacific", "2026,2027", CANADA_PACIFIC_2026),
+    ("America/Winnipeg", "2026,2027", CANADA_CENTRAL_2026),
+    ("Canada/Central", "2026,2027", CANADA_CENTRAL_2026),
+    ("America/Rainy_River", "2026,2027", CANADA_CENTRAL_2026),
+    ("America/Winnipeg", "2027,2028", "-\t-\t-05\tEST\n"),
 ];
 
 fn verify_report(report: &str, zone: &str, rows: &str) -> Result<(), String> {
@@ -154,7 +162,7 @@ fn read_regular(path: &Path) -> Result<Vec<u8>, String> {
 fn verify_tree(output: &Path) -> Result<usize, String> {
     let version = output.join("share/doc/tzdata/version");
     let license = output.join("share/doc/tzdata/LICENSE");
-    if read_regular(&version)? != b"2026d\n" {
+    if read_regular(&version)? != b"2026e\n" {
         return Err("tzdata: unexpected release version".into());
     }
     if read_regular(&license)?.is_empty() {
@@ -391,7 +399,7 @@ mod tests {
         ] {
             fs::create_dir_all(path).unwrap();
         }
-        fs::write(docs.join("version"), b"2026d\n").unwrap();
+        fs::write(docs.join("version"), b"2026e\n").unwrap();
         fs::write(docs.join("LICENSE"), b"fixture license").unwrap();
         let mut header = vec![0u8; 44];
         header.get_mut(..5).unwrap().copy_from_slice(b"TZif2");

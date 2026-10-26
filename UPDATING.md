@@ -139,7 +139,8 @@ and its licences), per commit.
    SMTP replies are not LibreSSL 4.3.2).
 
 4. Fetch and verify the new source and regenerate the seed digest table,
-   as `DEVELOPMENT.md` gives it (warm first, then write the table aside).
+   as `DEVELOPMENT.md` gives it (rebuild the evaluator, warm the cache, then
+   write the table aside).
 
 5. Run the checks it reaches:
 

@@ -334,13 +334,17 @@ empty it in turn. `gc-store` leaves it and `clear-store` drops it.
 
 Fetched and host-generated seeds are pinned by the seed digest table the
 evaluator compiles in (`seed/seed-digests.txt`); regenerate it after a pin
-change and commit it with the change. The generator reads the warm source
-cache, so warm it first, and write the table aside: a redirect straight into
-it would leave it empty if the generator fails.
+change and commit it with the change. The generator compiles the pins in, so
+rebuild it after editing them: building the builder does not rebuild it, and
+a stale one reprints the old rows unchanged. It reads the warm source cache,
+so warm that first, and write the table aside: a redirect straight into it
+would leave it empty if the generator fails.
 
 ```text
-td-feed warm sources
-td-recipe-eval seed-digests > seed/seed-digests.txt.new
+cargo build --release --locked --manifest-path recipes/Cargo.toml --bin td-recipe-eval
+cargo build --release --locked --manifest-path net/Cargo.toml
+net/target/release/td-net feed warm sources
+target/release/td-recipe-eval seed-digests > seed/seed-digests.txt.new
 mv seed/seed-digests.txt.new seed/seed-digests.txt
 ```
 

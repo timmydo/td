@@ -532,8 +532,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the explicitly supplied realized IANA 2026d output"]
-    fn realized_iana_2026d_catalog() {
+    #[ignore = "requires the explicitly supplied realized IANA 2026e output"]
+    fn realized_iana_2026e_catalog() {
         let root = std::env::var_os("TD_TEST_ZONEINFO_ROOT")
             .expect("set TD_TEST_ZONEINFO_ROOT to the realized share/zoneinfo directory");
         let root = Path::new(&root);

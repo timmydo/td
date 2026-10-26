@@ -19,7 +19,7 @@ pub fn recipe() -> Recipe {
                 &format!("{glibc}/lib"),
                 &format!("{glibc}/sbin/zic"),
                 "-b",
-                // glibc zic 2024a needs fat output for 2026d's Canada rules.
+                // glibc zic 2024a needs fat output for 2026's Canada rules.
                 "fat",
                 "-d",
                 "{out}/share/zoneinfo",
@@ -62,7 +62,7 @@ pub fn recipe() -> Recipe {
         .collect(),
         exec: false,
     });
-    Recipe::mesboot("tzdata", "2026d")
+    Recipe::mesboot("tzdata", "2026e")
         .source_input("tzdata-source")
         .native_inputs(&["glibc-x86-64"])
         .steps(steps)

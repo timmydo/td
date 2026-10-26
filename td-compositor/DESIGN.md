@@ -491,7 +491,7 @@ calendar walks through leap and non-leap centuries, exact DST boundaries,
 future recurrence, cross-year rules, malformed binary/text input, trusted
 root symlinks, refused descendant aliases and the setting's session
 snapshot. The tzdata recipe check runs this same parser over every
-installer choice and verifies twelve winter/summer offset pairs in 2100.
+installer choice and verifies thirteen winter/summer offset pairs in 2100.
 
 Nothing else in the compositor wakes without input, so the bar is the one
 thing in the process with a timer: a thread samples every second and hands

@@ -297,10 +297,10 @@ const PINS: &[PinDef] = &[
         key: "tzdata-source",
         aliases: &[],
         // Approved IANA data-only input; compile with the existing td glibc zic.
-        url: "https://data.iana.org/time-zones/releases/tzdata2026d.tar.gz",
-        sha256: "0cb2aa8e333c3dc049badc42a0c61f21987b8cd44e107fa900bad764aacc7767",
-        file: "tzdata2026d.tar.gz",
-        version: "2026d",
+        url: "https://data.iana.org/time-zones/releases/tzdata2026e.tar.gz",
+        sha256: "b26882805f26aac59d5b222978e6580484b834ccdc98be89df2f05a6dc53a652",
+        file: "tzdata2026e.tar.gz",
+        version: "2026e",
     },
     PinDef {
         key: "util-linux-libs-x86-64-source",
@@ -473,7 +473,7 @@ mod tests {
         // curl's dated Mozilla CA extract and OpenSSH Portable 10.5p1. The
         // td-ui applications are td's own trees (APPLICATIONS.md §W.8) and
         // pin nothing here.
-        // IANA timezone data 2026d adds one source-data pin, and the Nerd
+        // IANA timezone data 2026e adds one source-data pin, and the Nerd
         // Fonts v3.5.1 JetBrains Mono release ten pinned upstream data pins:
         // the archive and nine licence notices. cryptsetup 2.8.8 with json-c
         // 0.18, popt 1.19 and LVM2 2.03.43 add the LUKS2 userspace closure.
