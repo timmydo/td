@@ -8405,11 +8405,12 @@ mod tests {
         assert_eq!(payload_closure_of(&good, |_| false).unwrap().members, 1);
     }
 
-    /// The shipped deployment's exact containment answer. Both applications
-    /// must be listed as foreign declarations while the image stays unmarked.
-    /// Their application bytes are fetched on demand, so neither has a pin.
+    /// The shipped deployment's exact containment answer. Its one foreign
+    /// application, Firefox, must be listed as a foreign declaration while
+    /// the image stays unmarked. Its bytes are fetched on demand, so it has
+    /// no pin.
     #[test]
-    fn the_shipped_deployment_reports_only_its_two_foreign_payloads() {
+    fn the_shipped_deployment_reports_only_its_one_foreign_payload() {
         let answer = payload_closure(&[PAYLOAD_CLOSURE_DEFAULT]).unwrap();
         // Both counts tied to the WALK rather than to a floor: `> 50` is
         // satisfied by the whole catalog as easily as by the deployment's
@@ -8419,11 +8420,8 @@ mod tests {
         assert_eq!(answer.members, nodes.len());
         assert_eq!(answer.seeds, classify_graph_inputs(&nodes).unwrap().len());
         assert!(answer.seeds > 20, "{} seeds", answer.seeds);
-        assert_eq!(answer.unmarked(), answer.members - 2);
-        assert_eq!(
-            answer.foreign_members,
-            ["claude".to_string(), "firefox".to_string()]
-        );
+        assert_eq!(answer.unmarked(), answer.members - 1);
+        assert_eq!(answer.foreign_members, ["firefox".to_string()]);
         assert!(answer.pins.is_empty());
         // Members built in or imported from Debian: the kernel, glibc and
         // libgcc, the upstream toolchain's runtime,

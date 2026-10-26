@@ -655,9 +655,8 @@ where
     // comes from the list below, match rules, admission keyed on the
     // registered instance, no host pid for a jailed caller, and a descriptor
     // budget charged per admission key. Applications ship beside Firefox —
-    // the terminal mail, news and Claude (APPLICATIONS.md rungs 31-33); what
-    // no oracle yet drives is a message routed between two applications'
-    // peers, and §D says so.
+    // mail and news (APPLICATIONS.md rung 31); what no oracle yet drives is
+    // a message routed between two applications' peers, and §D says so.
     let state = prepare_state(
         name,
         outside_identity,
@@ -1904,7 +1903,6 @@ fn human_projection(mountinfo: &str, home: &Path) -> io::Result<Option<(PathBuf,
     let policy = crate::app_policy::load().map_err(invalid)?;
     let component = match policy.for_uid(uid).map(|rule| rule.application.as_str()) {
         Some("firefox" | "mail") => "Downloads",
-        Some("claude") => "src",
         _ => return Ok(None),
     };
     let view = home.join(component);
@@ -4621,11 +4619,7 @@ mod tests {
             Some(FIREFOX_LIBRARY_PATH)
         );
         assert!(spec.runtime_aliases);
-        let claude = "format=1\nname=claude\nsource=app/com.anthropic.ClaudeCode/x86_64/latest\nruntime=runtime/org.freedesktop.Platform/x86_64/25.08\nentry=/app/bin/claude\n\n[Environment]\nDISABLE_UPDATES=1\nHOME=/home/td\nWAYLAND_DISPLAY=wayland-0\nXDG_RUNTIME_DIR=/run/user/1000\n\n[Context]\nshared=network\nsockets=wayland\n";
-        assert_eq!(
-            parse_spec(claude).unwrap().flathub,
-            flathub_app::flathub_source("claude")
-        );
+        let undeclared = "format=1\nname=mail\nsource=app/org.mozilla.firefox/x86_64/stable\nruntime=runtime/org.freedesktop.Platform/x86_64/25.08\nentry=/app/bin/mail\n\n[Environment]\nHOME=/home/td\nWAYLAND_DISPLAY=wayland-0\nXDG_RUNTIME_DIR=/run/user/1000\n\n[Context]\nshared=network\nsockets=wayland\n";
         for altered in [
             // Firefox's declaration names its app ref, so its spec must.
             firefox.replace("source=app/org.mozilla.firefox/x86_64/stable\n", ""),
@@ -4635,9 +4629,12 @@ mod tests {
             firefox.replace(refs, &format!("source=app/org.mozilla.firefox/x86_64/stable\n{store}")),
             // Another runtime ref, or an undeclared application source.
             firefox.replace("x86_64/25.08", "x86_64/24.08"),
-            claude.replace("app/com.anthropic.ClaudeCode/x86_64/latest", "app/org.mozilla.firefox/x86_64/stable"),
+            firefox.replace(
+                "app/org.mozilla.firefox/x86_64/stable",
+                "app/org.example.Other/x86_64/stable",
+            ),
             // An application with no declaration.
-            claude.replace("name=claude\n", "name=mail\n").replace("DISABLE_UPDATES=1\n", ""),
+            undeclared.to_string(),
             // An entry td-app never validated.
             firefox.replace("entry=/app/bin/firefox\n", "entry=/app/bin/other\n"),
         ] {
@@ -4647,8 +4644,8 @@ mod tests {
 
     /// The aliases follow the runtime, not the package library path: the
     /// dynamic platform's loader is what every entry on it needs, and an
-    /// empty runtime has none to alias. Claude Code's boot oracle found
-    /// stage 2 keying them on Firefox's library path instead.
+    /// empty runtime has none to alias. A boot oracle once found stage 2
+    /// keying them on Firefox's library path instead.
     #[test]
     fn runtime_aliases_follow_the_runtime() {
         const DIGEST: &str = "0123456789abcdfghijklmnpqrsvwxyz";
@@ -4674,7 +4671,7 @@ mod tests {
     /// `LD_LIBRARY_PATH=` is refused here exactly as a borrowed one is.
     #[test]
     fn an_application_without_a_reviewed_loader_path_carries_none() {
-        let text = "format=1\nname=claude\nruntime=/td/store/0123456789abcdfghijklmnpqrsvwxyz-freedesktop-platform-25-08-25.08\nentry=/app/bin/claude\n\n[Environment]\nDISABLE_UPDATES=1\nHOME=/home/td\nWAYLAND_DISPLAY=wayland-0\nXDG_RUNTIME_DIR=/run/user/1000\n\n[Context]\nshared=network\nsockets=wayland\n\n[Filesystem]\n~/src=rw:create\n";
+        let text = "format=1\nname=fixture\nruntime=/td/store/0123456789abcdfghijklmnpqrsvwxyz-freedesktop-platform-25-08-25.08\nentry=/app/bin/fixture\n\n[Environment]\nDISABLE_UPDATES=1\nHOME=/home/td\nWAYLAND_DISPLAY=wayland-0\nXDG_RUNTIME_DIR=/run/user/1000\n\n[Context]\nshared=network\nsockets=wayland\n\n[Filesystem]\n~/src=rw:create\n";
         let spec = parse_spec(text).unwrap();
         assert_eq!(spec.loader_library_path, None);
         assert!(spec.runtime_aliases, "a dynamic runtime aliases its loader");

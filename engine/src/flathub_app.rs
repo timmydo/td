@@ -12,8 +12,7 @@
 pub struct FlathubSource {
     /// The td application name: its registry row and launcher name.
     pub name: &'static str,
-    /// The app selector (an OSTree ref or CLAUDE_RELEASE_REF), or `None`
-    /// when only the runtime is fetched and the
+    /// The app ref, or `None` when only the runtime is fetched and the
     /// application tree stays in its `/td/store` package.
     pub application: Option<&'static str>,
     /// The one runtime ref the application accepts.
@@ -26,27 +25,15 @@ pub struct FlathubSource {
 
 pub const REPOSITORY: &str = "https://dl.flathub.org/repo";
 
-/// Logical application selector for Anthropic's release source; never an OSTree ref.
-pub const CLAUDE_RELEASE_REF: &str = "app/com.anthropic.ClaudeCode/x86_64/latest";
-
 const PLATFORM_25_08: &str = "runtime/org.freedesktop.Platform/x86_64/25.08";
 
-pub const FLATHUB_SOURCES: &[FlathubSource] = &[
-    FlathubSource {
-        name: "claude",
-        application: Some(CLAUDE_RELEASE_REF),
-        runtime: PLATFORM_25_08,
-        entry: "/app/bin/claude",
-        policy_runtime: "freedesktop-platform-25-08",
-    },
-    FlathubSource {
-        name: "firefox",
-        application: Some("app/org.mozilla.firefox/x86_64/stable"),
-        runtime: PLATFORM_25_08,
-        entry: "/app/bin/firefox",
-        policy_runtime: "freedesktop-platform-25-08",
-    },
-];
+pub const FLATHUB_SOURCES: &[FlathubSource] = &[FlathubSource {
+    name: "firefox",
+    application: Some("app/org.mozilla.firefox/x86_64/stable"),
+    runtime: PLATFORM_25_08,
+    entry: "/app/bin/firefox",
+    policy_runtime: "freedesktop-platform-25-08",
+}];
 
 pub fn flathub_source(name: &str) -> Option<FlathubSource> {
     FLATHUB_SOURCES
@@ -118,12 +105,11 @@ const PACKAGE_ROOT: &str = "/td/store/";
 const MAX_REF_BYTES: usize = 255;
 const MAX_NAME_BYTES: usize = 64;
 
-/// One admitted content identity of one source selector.
+/// One admitted commit of one ref.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Admitted {
     pub exact_ref: String,
     pub commit: String,
-    /// Flathub commit time, or the ordered numeric Claude release version.
     pub timestamp: u64,
 }
 
@@ -443,7 +429,7 @@ mod tests {
     const COMMIT: &str = "7985364b35b83cfe5aa17a00932df1c2d1dae69e5c592aa637a53ff1d53fdabc";
     const RUNTIME_COMMIT: &str = "bd44a62300000000000000000000000000000000000000000000000000000000";
     const CHECKS: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
-    const PACKAGE: &str = "/td/store/0123456789abcdefghijklmnopqrstuv-claude-1";
+    const PACKAGE: &str = "/td/store/0123456789abcdefghijklmnopqrstuv-fixture-1";
 
     fn admitted(exact_ref: &str, commit: &str, timestamp: u64) -> Admitted {
         Admitted {
@@ -485,7 +471,7 @@ mod tests {
             runtime: runtime.clone(),
         };
         let stored = Selection {
-            name: "claude".into(),
+            name: "fixture".into(),
             checks: CHECKS.into(),
             application: None,
             package: Some(PACKAGE.into()),
@@ -539,21 +525,16 @@ mod tests {
             spec_source("firefox", firefox.application, firefox.runtime),
             Ok(Some(firefox))
         );
-        let claude = flathub_source("claude").unwrap();
-        assert_eq!(
-            spec_source("claude", claude.application, claude.runtime),
-            Ok(Some(claude))
-        );
         for (name, source, runtime) in [
             ("firefox", firefox.application, store),
             ("firefox", None, firefox.runtime),
-            ("claude", firefox.application, claude.runtime),
+            ("other", firefox.application, firefox.runtime),
             (
                 "firefox",
                 firefox.application,
                 "runtime/org.example.Other/x86_64/1",
             ),
-            ("mail", None, claude.runtime),
+            ("mail", None, firefox.runtime),
         ] {
             assert!(
                 spec_source(name, source, runtime).is_err(),

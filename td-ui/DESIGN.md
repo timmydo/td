@@ -3861,8 +3861,8 @@ td-term/DESIGN.md §2 already excludes them from the terminal profile.
 Some single-cell scalars that TUIs print as status marks and spinner
 frames are missing from the pinned Unifont. Unifont draws them 16 pixels
 wide, and the single-width import drops those glyphs. JetBrains Mono
-Nerd Font lacks them too. Claude Code's `⏵⏵` mode line, its `⏺` and
-`⏸`, and its `✢ ✳ ✶ ✻ ✽` spinner are examples.
+Nerd Font lacks them too. A coding agent's `⏵⏵` mode line, `⏺` and
+`⏸` marks and `✢ ✳ ✶ ✻ ✽` spinner are examples.
 
 `font::stand_in` maps each such scalar to a glyph of like shape, for
 example `⏵` to `▸`, `⏺` to `●`, `⏸` to `‖` and `✔` to `✓`. The spinner

@@ -2082,7 +2082,7 @@ mod tests {
     fn deployment_audio_admits_only_the_assigned_browser_and_fails_closed() {
         let installed = || {
             crate::app_policy::Policy::parse(
-            "td-bus-applications-v1\t1000\n65539\tclaude\t\n65536\tfirefox\torg.mozilla.firefox\n65537\tmail\t\n65538\tnews\t\n"
+            "td-bus-applications-v1\t1000\n65536\tfirefox\torg.mozilla.firefox\n65537\tmail\t\n65538\tnews\t\n"
         ).map_err(io::Error::other)
         };
         let policy = Policy::deployment_policy(994, Ok(()), installed).unwrap();

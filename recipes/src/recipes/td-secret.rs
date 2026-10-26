@@ -302,8 +302,8 @@ pub fn recipe() -> Recipe {
             include_str!("../../../td-secret/src/portable_store.rs"),
         ),
         (
-            "{src}/td-authd/src/terminal_sys.rs",
-            include_str!("../../../td-authd/src/terminal_sys.rs"),
+            "{src}/td-secret/src/pty_fixture_sys.rs",
+            include_str!("../../../td-secret/src/pty_fixture_sys.rs"),
         ),
         (
             "{src}/td-authd/src/primary_account.rs",

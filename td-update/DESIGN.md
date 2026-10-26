@@ -43,7 +43,7 @@ without these settings needs a reachable origin configured before pulling.
 Source remains the unsigned companion described by `td-install/DESIGN.md`, never
 a boot trust root or evidence authorizing an installation.
 
-A newly created `~/src` has mode 0700, matching the human workspace grant.
+A newly created `~/src` has mode 0700, private to the human.
 An existing parent keeps its permissions. Any existing destination, including
 a symlink, is preserved. An initialized checkout belongs to the human, whose edits, branches, remote settings and
 untracked files are never reset on boot. The private `~/.td-update/source.lock`

@@ -6041,8 +6041,8 @@ fn mapped_caller_directory(caller: &Path, grants: &[FilesystemGrant]) -> Option<
             // A caller standing at the grant's own root has nothing to
             // append, and joining an empty path appends a SEPARATOR rather
             // than nothing — a trailing slash stage 2 refuses as
-            // uncanonical, which would have made `cd ~/src && claude` a
-            // failed launch. Path equality normalizes that away, so only a
+            // uncanonical, which would have made a launch from the grant's
+            // own root fail. Path equality normalizes that away, so only a
             // byte-exact test sees it.
             let directory = if relative.as_os_str().is_empty() {
                 grant.target.clone()

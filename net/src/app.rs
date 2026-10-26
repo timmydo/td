@@ -1,4 +1,4 @@
-//! td-app: fetch, admit and select one account's application and Flathub runtime
+//! td-app: fetch, admit and select one account's Flathub application
 //! (APPLICATIONS.md §W.9).
 //!
 //! `td-app update NAME [--force]` runs as the application's account and owns
@@ -63,12 +63,8 @@ type Verify = fn(&str, Checksum, &[u8], &[u8], u64) -> Result<Commit, String>;
 /// The dynamic validator over an application and runtime tree (rule 5).
 type Validate = fn(&Path, &str, &Path, &[String], &[String], usize) -> Result<(), String>;
 
-type VerifyRelease = fn(&[u8], &[u8], &str, u64) -> Result<crate::claude_release::Release, String>;
-
 struct Admission<'a> {
     repository: &'a str,
-    release_repository: &'a str,
-    verify_release: VerifyRelease,
     /// A td-feed base serving refs under FEED_REFS and graphs under
     /// `ostree/COMMIT/`.
     feed: Option<&'a str>,
@@ -101,7 +97,6 @@ struct Expected {
 }
 
 struct Candidate {
-    release: Option<crate::claude_release::Release>,
     admitted: Admitted,
     content: Checksum,
     metadata: Option<String>,
@@ -303,9 +298,6 @@ fn resolve(
     now: u64,
     deadline: Instant,
 ) -> Result<Candidate, String> {
-    if exact_ref == flathub_app::CLAUDE_RELEASE_REF {
-        return resolve_release(admission, work, known, now, deadline);
-    }
     let from_feed = match admission.feed {
         Some(base) => fetch_small(
             &format!("{base}/{FEED_REFS}/{exact_ref}"),
@@ -361,7 +353,6 @@ fn resolve(
         parsed.timestamp,
     )?;
     Ok(Candidate {
-        release: None,
         admitted: Admitted {
             exact_ref: exact_ref.to_string(),
             commit: commit_hex,
@@ -372,119 +363,6 @@ fn resolve(
         commitmeta,
         from_feed,
     })
-}
-
-fn resolve_release(
-    admission: &Admission<'_>,
-    work: &Path,
-    known: &[&Admitted],
-    now: u64,
-    deadline: Instant,
-) -> Result<Candidate, String> {
-    let latest = fetch_small(
-        &format!("{}/latest", admission.release_repository),
-        &work.join("latest"),
-        64,
-        deadline,
-    )?;
-    let version = std::str::from_utf8(&latest).map_err(|_| "release hint is not UTF-8")?;
-    let version = version.strip_suffix('\n').unwrap_or(version);
-    crate::claude_release::version_order(version)?;
-    let base = format!("{}/{version}", admission.release_repository);
-    let manifest = fetch_small(
-        &format!("{base}/manifest.json"),
-        &work.join("manifest"),
-        crate::claude_release::MAX_MANIFEST,
-        deadline,
-    )?;
-    let signature = fetch_small(
-        &format!("{base}/manifest.json.sig"),
-        &work.join("signature"),
-        crate::claude_release::MAX_SIGNATURE,
-        deadline,
-    )?;
-    let release = (admission.verify_release)(&manifest, &signature, version, now)?;
-    let commit = crate::feed::hex_sha256(&manifest);
-    flathub_app::admits_after(
-        flathub_app::floor(known.iter().copied(), flathub_app::CLAUDE_RELEASE_REF),
-        &commit,
-        release.order,
-    )?;
-    Ok(Candidate {
-        admitted: Admitted {
-            exact_ref: flathub_app::CLAUDE_RELEASE_REF.into(),
-            commit: commit.clone(),
-            timestamp: release.order,
-        },
-        content: Checksum::from_hex(&commit)?,
-        metadata: None,
-        commitmeta: signature,
-        from_feed: false,
-        release: Some(release),
-    })
-}
-
-fn deploy_release(
-    admission: &Admission<'_>,
-    out: &Path,
-    release: &crate::claude_release::Release,
-) -> Result<PathBuf, String> {
-    private_dir(out)?;
-    fs::set_permissions(out, fs::Permissions::from_mode(0o755))
-        .map_err(|e| format!("chmod {}: {e}", out.display()))?;
-    let staged = out.join("files.partial");
-    let bin = staged.join("bin");
-    fs::create_dir_all(&bin).map_err(|e| format!("mkdir {}: {e}", bin.display()))?;
-    for directory in [&staged, &bin] {
-        fs::set_permissions(directory, fs::Permissions::from_mode(0o755))
-            .map_err(|e| format!("chmod {}: {e}", directory.display()))?;
-    }
-    let binary = bin.join("claude");
-    let budget = AtomicU64::new(0);
-    let deadline = Instant::now()
-        .checked_add(RESOLVE_TIME)
-        .ok_or("release deadline overflows")?;
-    let size = crate::http::get_to_file_accounted_no_redirects_before(
-        &format!(
-            "{}/{}/linux-x64/claude",
-            admission.release_repository, release.version
-        ),
-        &binary,
-        release.size,
-        &budget,
-        release.size,
-        deadline,
-    )?;
-    if size != release.size {
-        return Err("Claude binary size does not match signed manifest".into());
-    }
-    let mut file = File::open(&binary).map_err(|e| format!("open {}: {e}", binary.display()))?;
-    let mut hasher = td_engine::sha256::Sha256::new();
-    let mut buffer = [0u8; 64 * 1024];
-    loop {
-        if Instant::now() >= deadline {
-            return Err("Claude binary verification timed out".into());
-        }
-        let count = file
-            .read(&mut buffer)
-            .map_err(|e| format!("read Claude binary: {e}"))?;
-        if count == 0 {
-            break;
-        }
-        hasher.update(buffer.get(..count).ok_or("invalid binary read length")?);
-    }
-    if td_engine::sha256::to_base16(&hasher.finalize()) != release.digest {
-        return Err("Claude binary checksum does not match signed manifest".into());
-    }
-    fs::set_permissions(&binary, fs::Permissions::from_mode(0o755))
-        .map_err(|e| format!("chmod Claude binary: {e}"))?;
-    file.sync_all()
-        .map_err(|e| format!("sync Claude binary: {e}"))?;
-    sync_dir(&bin)?;
-    sync_dir(&staged)?;
-    fs::rename(&staged, out.join(FILES)).map_err(|e| format!("publish Claude tree: {e}"))?;
-    sync_dir(out)?;
-    Ok(out.to_path_buf())
 }
 
 /// The cache lock is held, so an absent destination stays absent.
@@ -522,9 +400,6 @@ fn deploy(
     }
     if fs::symlink_metadata(&out).is_ok() {
         remove_tree(&out)?;
-    }
-    if let Some(release) = &candidate.release {
-        return deploy_release(admission, &out, release);
     }
     let objects = cache.join(OBJECTS).join(hex);
     let spec = AcquireSpec::parse(
@@ -922,13 +797,11 @@ fn update(
     let application = match source.application {
         Some(exact_ref) => {
             let candidate = resolve(admission, &work, exact_ref, &known, now, deadline)?;
-            if candidate.release.is_none() {
-                let metadata = candidate
-                    .metadata
-                    .as_deref()
-                    .ok_or_else(|| format!("{exact_ref} commit carries no xa.metadata"))?;
-                flathub_app::require_runtime(metadata, source.runtime)?;
-            }
+            let metadata = candidate
+                .metadata
+                .as_deref()
+                .ok_or_else(|| format!("{exact_ref} commit carries no xa.metadata"))?;
+            flathub_app::require_runtime(metadata, source.runtime)?;
             Some(candidate)
         }
         None => None,
@@ -1230,8 +1103,6 @@ pub(crate) fn export_to(store: &Path) -> Result<Vec<String>, String> {
     let home = std::env::var_os("HOME").ok_or("HOME is not set")?;
     let admission = Admission {
         repository: flathub_app::REPOSITORY,
-        release_repository: crate::claude_release::REPOSITORY,
-        verify_release: crate::claude_release::verify,
         feed: None,
         verify: verify_flathub,
         validate: validate_dynamic,
@@ -1240,7 +1111,6 @@ pub(crate) fn export_to(store: &Path) -> Result<Vec<String>, String> {
     let mut refs: Vec<&str> = flathub_app::FLATHUB_SOURCES
         .iter()
         .flat_map(|source| source.application.into_iter().chain([source.runtime]))
-        .filter(|exact_ref| *exact_ref != flathub_app::CLAUDE_RELEASE_REF)
         .collect();
     refs.sort_unstable();
     refs.dedup();
@@ -1290,8 +1160,6 @@ pub fn run(args: &[String]) {
         };
         let admission = Admission {
             repository: flathub_app::REPOSITORY,
-            release_repository: crate::claude_release::REPOSITORY,
-            verify_release: crate::claude_release::verify,
             feed: feed.as_deref(),
             verify: verify_flathub,
             validate: validate_dynamic,
@@ -1369,152 +1237,6 @@ mod tests {
             return Err("fixture signature does not verify".into());
         }
         Ok(parsed)
-    }
-
-    #[test]
-    #[ignore = "downloads the current signed Claude binary and Flathub runtime"]
-    fn current_upstream_claude_is_admitted_against_its_runtime() {
-        let root = crate::test_temp::TempDir::new("td-app-live-claude").unwrap();
-        let admission = Admission {
-            repository: flathub_app::REPOSITORY,
-            release_repository: crate::claude_release::REPOSITORY,
-            verify_release: crate::claude_release::verify,
-            feed: None,
-            verify: verify_flathub,
-            validate: validate_dynamic,
-            registry: &root.join("unused-registry"),
-        };
-        let source = flathub_app::flathub_source("claude").unwrap();
-        let cache = root.join("cache");
-        assert_eq!(
-            update(&admission, &cache, source, true, unix_now().unwrap()).unwrap(),
-            Outcome::Selected(1)
-        );
-        let selection = read_pointer(&cache, CURRENT).unwrap().unwrap().1;
-        eprintln!(
-            "Claude admitted: {:?}; runtime {}",
-            selection.application, selection.runtime.commit
-        );
-        let expected = expect(&admission, source).unwrap();
-        assert!(serves(&cache, &selection, source, &expected).unwrap());
-    }
-
-    fn verify_release_fixture(
-        manifest: &[u8],
-        signature: &[u8],
-        version: &str,
-        _now: u64,
-    ) -> Result<crate::claude_release::Release, String> {
-        if signature != b"signed" {
-            return Err("fixture signature refused".into());
-        }
-        let text = std::str::from_utf8(manifest).map_err(|_| "fixture manifest")?;
-        let parts: Vec<_> = text.split('|').collect();
-        let [declared, digest, size] = parts.as_slice() else {
-            return Err("fixture manifest fields".into());
-        };
-        if *declared != version {
-            return Err("fixture version mismatch".into());
-        }
-        Ok(crate::claude_release::Release {
-            version: version.into(),
-            order: crate::claude_release::version_order(version)?,
-            digest: digest.to_string(),
-            size: size.parse().map_err(|_| "fixture size")?,
-        })
-    }
-
-    fn publish_release(fixture: &Fixture, version: &str, bytes: &[u8], signature: &[u8]) {
-        let mut repository = fixture.repository.lock().unwrap();
-        repository.insert("/latest".into(), version.as_bytes().to_vec());
-        repository.insert(
-            format!("/{version}/manifest.json"),
-            format!(
-                "{version}|{}|{}",
-                crate::feed::hex_sha256(bytes),
-                bytes.len()
-            )
-            .into_bytes(),
-        );
-        repository.insert(format!("/{version}/manifest.json.sig"), signature.to_vec());
-        repository.insert(format!("/{version}/linux-x64/claude"), bytes.to_vec());
-    }
-
-    fn release_source() -> FlathubSource {
-        FlathubSource {
-            name: "claude",
-            application: Some(flathub_app::CLAUDE_RELEASE_REF),
-            runtime: RUNTIME,
-            entry: "/app/bin/claude",
-            policy_runtime: "freedesktop-platform-25-08",
-        }
-    }
-
-    #[test]
-    fn signed_release_fetches_both_trees_and_refuses_rollback_and_replacement() {
-        let fixture = Fixture::new("release-updates");
-        publish_commit(&fixture.repository, RUNTIME, b"usr", 10, None, b"signed");
-        publish_release(&fixture, "2.1.99", b"first", b"signed");
-        assert_eq!(
-            fixture.update(release_source(), true, NOW).unwrap(),
-            Outcome::Selected(1)
-        );
-        let first = fixture.current().unwrap().1;
-        let app = first.application.as_ref().unwrap();
-        assert_eq!(
-            fs::read(deploy_path(&fixture.cache(), &app.commit).join("files/bin/claude")).unwrap(),
-            b"first"
-        );
-        assert!(first.package.is_none());
-        publish_release(&fixture, "2.1.100", b"second", b"signed");
-        assert_eq!(
-            fixture.update(release_source(), true, NOW + 1).unwrap(),
-            Outcome::Selected(2)
-        );
-        let selected = fixture.current();
-        // Both selected generations remain a floor even if the floor file is lost.
-        fs::remove_file(fixture.cache().join(ADMITTED)).unwrap();
-        publish_release(&fixture, "2.1.99", b"first", b"signed");
-        assert!(fixture.update(release_source(), true, NOW + 2).is_err());
-        publish_release(&fixture, "2.1.100", b"substitution", b"signed");
-        assert!(fixture.update(release_source(), true, NOW + 2).is_err());
-        assert_eq!(fixture.current(), selected);
-    }
-
-    #[test]
-    fn release_signature_size_and_checksum_failures_keep_current() {
-        let fixture = Fixture::new("release-refusals");
-        publish_commit(&fixture.repository, RUNTIME, b"usr", 10, None, b"signed");
-        publish_release(&fixture, "2.0.0", b"first", b"signed");
-        fixture.update(release_source(), true, NOW).unwrap();
-        let selected = fixture.current();
-        publish_release(&fixture, "2.0.1", b"second", b"wrong");
-        assert!(fixture.update(release_source(), true, NOW + 1).is_err());
-        publish_release(&fixture, "2.0.1", b"second", b"signed");
-        fixture
-            .repository
-            .lock()
-            .unwrap()
-            .insert("/2.0.1/linux-x64/claude".into(), b"broken".to_vec());
-        assert!(fixture
-            .update(release_source(), true, NOW + 1)
-            .unwrap_err()
-            .contains("checksum"));
-        fixture
-            .repository
-            .lock()
-            .unwrap()
-            .insert("/2.0.1/linux-x64/claude".into(), b"short".to_vec());
-        assert!(fixture
-            .update(release_source(), true, NOW + 1)
-            .unwrap_err()
-            .contains("size"));
-        assert_eq!(fixture.current(), selected);
-        publish_release(&fixture, "2.0.1", b"second", b"signed");
-        assert_eq!(
-            fixture.update(release_source(), true, NOW + 2).unwrap(),
-            Outcome::Selected(2)
-        );
     }
 
     fn validate_fixture(
@@ -1643,8 +1365,6 @@ mod tests {
         fn update(&self, source: FlathubSource, force: bool, now: u64) -> Result<Outcome, String> {
             let admission = Admission {
                 repository: &self.url,
-                release_repository: &self.url,
-                verify_release: verify_release_fixture,
                 feed: self.feed.as_deref(),
                 verify: verify_fixture,
                 validate: validate_fixture,
@@ -1729,8 +1449,6 @@ mod tests {
         fn export(&self, host: &Path) -> Result<Vec<String>, String> {
             let admission = Admission {
                 repository: &self.url,
-                release_repository: &self.url,
-                verify_release: verify_release_fixture,
                 feed: None,
                 verify: verify_fixture,
                 validate: validate_fixture,
@@ -2019,8 +1737,6 @@ mod tests {
         // An export that fails part way has recorded the graph it published.
         let admission = Admission {
             repository: &fixture.url,
-            release_repository: &fixture.url,
-            verify_release: verify_release_fixture,
             feed: None,
             verify: verify_fixture,
             validate: validate_fixture,
@@ -2255,7 +1971,7 @@ mod tests {
                 "{row:?}"
             );
         }
-        fs::write(&fixture.registry, "claude\t/td/store/x-claude\n").unwrap();
+        fs::write(&fixture.registry, "mail\t/td/store/x-mail\n").unwrap();
         assert!(registry_package(&fixture.registry, "firefox")
             .unwrap_err()
             .contains("has no firefox"));
@@ -2492,8 +2208,6 @@ mod tests {
         fn ready(&self, source: FlathubSource) -> Result<Option<u64>, String> {
             let admission = Admission {
                 repository: &self.url,
-                release_repository: &self.url,
-                verify_release: verify_release_fixture,
                 feed: self.feed.as_deref(),
                 verify: verify_fixture,
                 validate: validate_fixture,

@@ -1732,7 +1732,7 @@ mod tests {
                 continue;
             }
             // A Flathub application with no source of its own (§W.9).
-            if matches!(stem, "firefox" | "claude") {
+            if stem == "firefox" {
                 assert!(recipe.flathub_runtime().is_some());
                 assert!(recipe.to_json().get("foreign").is_some());
                 assert!(recipe.to_json().get("foreignSource").is_none());

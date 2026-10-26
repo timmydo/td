@@ -203,7 +203,7 @@ mod tests {
             .custom_flags(0x100 | 0x800)
             .open("/dev/ptmx")
             .unwrap();
-        let slave = crate::terminal_fixture_sys::relay_pty_peer(master.as_fd()).unwrap();
+        let slave = crate::pty_fixture_sys::open_pty_peer(master.as_fd()).unwrap();
         let path = std::fs::read_link(format!("/proc/self/fd/{}", slave.as_raw_fd())).unwrap();
         let slave = OpenOptions::new()
             .read(true)

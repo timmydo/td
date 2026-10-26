@@ -422,15 +422,14 @@ ordering alone does not establish either result.
 
 Application units require successful firstboot and invoke the root typed
 launcher, with `cgroup=session` because the leader moves into its own
-`td-app-UID/session` leaf. Firefox also requires `firefox-files`;
-Claude's fixed root evidence unit requires `claude-files`. Mail requires
-`mail-files`, and mail and news require their separate application-UID
-fetch services. The root grant oneshots finish before their applications
-start. Mail's preparation follows Firefox's settled preparation so the
-shared Downloads source has one initializer at a time. It does not
-require Firefox preparation to succeed. Shutdown releases all three
-views after services stop and before releasing the portal view and
-`/var`.
+`td-app-UID/session` leaf. Firefox also requires `firefox-files`. Mail
+requires `mail-files`, and mail and news require their separate
+application-UID fetch services. The root grant oneshots finish before
+their applications start. Mail's preparation follows Firefox's settled
+preparation so the shared Downloads source has one initializer at a
+time. It does not require Firefox preparation to succeed. Shutdown
+releases both views after services stop and before releasing the portal
+view and `/var`.
 
 Application audio uses both edges deliberately. `audio requires=seat`
 because its private identity and runtime directory do not exist before seat

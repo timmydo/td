@@ -5641,8 +5641,8 @@ mod tests {
     fn a_launched_program_is_named_by_its_bounded_final_component() {
         assert_eq!(launched_program_name(&[]), None);
         assert_eq!(
-            launched_program_name(&["/bin/claude".into(), "--version".into()]).as_deref(),
-            Some("claude")
+            launched_program_name(&["/bin/tool".into(), "--version".into()]).as_deref(),
+            Some("tool")
         );
         let long = format!("/bin/{}", "x".repeat(40));
         assert_eq!(launched_program_name(&[long.into()]).unwrap().len(), 32);
@@ -5658,12 +5658,12 @@ mod tests {
         let mut terminal = Terminal::new(4, 20).unwrap();
         terminal.feed("error: no\r\n\r\nbye\u{202e}".as_bytes());
         let failed = ExitStatus::from_raw(1 << 8);
-        let report = last_screen_report(Some("claude"), failed, Some(&terminal)).unwrap();
+        let report = last_screen_report(Some("tool"), failed, Some(&terminal)).unwrap();
         assert_eq!(
             report,
-            "\ntd-term: last screen (claude): error: no\n\
-             td-term: last screen (claude): \n\
-             td-term: last screen (claude): bye\n"
+            "\ntd-term: last screen (tool): error: no\n\
+             td-term: last screen (tool): \n\
+             td-term: last screen (tool): bye\n"
         );
         assert!(last_screen_report(None, failed, Some(&terminal)).is_none());
         assert!(last_screen_report(Some("x"), ExitStatus::from_raw(0), Some(&terminal)).is_none());

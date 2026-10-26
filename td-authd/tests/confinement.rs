@@ -29,7 +29,6 @@ fn the_production_source_and_raw_boundary_are_closed() {
         [
             "application.rs",
             "application_files.rs",
-            "application_shell.rs",
             "backoff.rs",
             "channel.rs",
             "consent.rs",
@@ -53,21 +52,14 @@ fn the_production_source_and_raw_boundary_are_closed() {
             "secret_sys.rs",
             "session.rs",
             "set_hostname.rs",
-            "shell_channel.rs",
             "storage.rs",
             "sys.rs",
-            "terminal.rs",
-            "terminal_sys.rs",
             "unlock.rs"
         ]
     );
     for (name, count) in [
         ("application.rs", 0),
         ("application_files.rs", 0),
-        ("application_shell.rs", 0),
-        ("shell_channel.rs", 0),
-        ("terminal.rs", 0),
-        ("terminal_sys.rs", 4),
         ("main.rs", 1),
         ("channel.rs", 0),
         ("consent.rs", 0),
@@ -126,9 +118,6 @@ fn the_production_source_and_raw_boundary_are_closed() {
                     | "session.rs"
                     | "revocation.rs"
                     | "inspection.rs"
-                    | "application_shell.rs"
-                    | "shell_channel.rs"
-                    | "terminal.rs"
             ) && ["::Command", "::thread", ".spawn(", ".exec("]
                 .contains(&forbidden);
             let mapping_child_api = matches!(name, "portal_files.rs" | "application_files.rs")
@@ -928,7 +917,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
         .unwrap();
     assert_eq!(
         fingerprint(application),
-        0x48fb17e87f2d579b,
+        0x0b78b4bfef189288,
         "application launch controller changed"
     );
     for forbidden in [
@@ -947,8 +936,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     }
     assert_eq!(application.matches(".spawn(").count(), 1);
     assert_eq!(application.matches(".exec()").count(), 2);
-    assert_eq!(application.matches(".stdin(Stdio::null())").count(), 1);
-    assert_eq!(application.matches(".stdin(input)").count(), 1);
+    assert_eq!(application.matches(".stdin(Stdio::null())").count(), 2);
     assert_eq!(application.matches(".stderr(Stdio::null())").count(), 2);
     assert_eq!(application.matches(".stdout(Stdio::null())").count(), 1);
     let launch = include_str!("../src/launch.rs");
@@ -1064,7 +1052,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert_eq!(files.matches("admitted_uid(\"firefox\")").count(), 1);
     assert_eq!(files.matches("mount_sys::publish(").count(), 2);
     let application_files = include_str!("../src/application_files.rs");
-    assert_eq!(fingerprint(application_files), 0x7e525df007db68ab);
+    assert_eq!(fingerprint(application_files), 0x6187f5c8cee99126);
     assert_eq!(
         application_files
             .matches("mount_sys::clone_directory(")
@@ -1090,53 +1078,6 @@ fn the_production_source_and_raw_boundary_are_closed() {
             .count(),
         1
     );
-    assert_eq!(
-        fingerprint(
-            include_str!("../src/application_shell.rs")
-                .split("#[cfg(test)]")
-                .next()
-                .unwrap()
-        ),
-        0x71973ab92448b6e4,
-        "application_shell.rs: production boundary changed"
-    );
-    assert_eq!(
-        fingerprint(
-            include_str!("../src/shell_channel.rs")
-                .split("#[cfg(test)]")
-                .next()
-                .unwrap()
-        ),
-        0x8cf83d4d6ed3f6a7,
-        "shell_channel.rs: production boundary changed"
-    );
-    assert_eq!(
-        fingerprint(
-            include_str!("../src/terminal.rs")
-                .split("#[cfg(test)]")
-                .next()
-                .unwrap()
-        ),
-        0x06cfa9e717caa1e0,
-        "terminal.rs: production boundary changed"
-    );
-    assert_eq!(
-        fingerprint(
-            include_str!("../src/terminal_sys.rs")
-                .split("#[cfg(test)]")
-                .next()
-                .unwrap()
-        ),
-        0xdbf1730949a19a6b,
-        "terminal_sys.rs: production boundary changed"
-    );
-    let terminal_raw = include_str!("../src/terminal_sys.rs");
-    assert_eq!(terminal_raw.matches("#[allow(unsafe_code)]").count(), 2);
-    assert_eq!(terminal_raw.matches("core::arch::asm!").count(), 1);
-    assert_eq!(terminal_raw.matches("File::from_raw_fd").count(), 1);
-    assert_eq!(terminal_raw.matches("const SYS_").count(), 2);
-    assert_eq!(terminal_raw.matches("const TIOC").count(), 4);
-    assert_eq!(terminal_raw.matches("const TC").count(), 2);
     let channel = include_str!("../src/channel.rs");
     assert_eq!(channel.matches("sys::prepare(").count(), 1);
     assert_eq!(channel.matches("sys::receive(").count(), 1);
@@ -1177,7 +1118,7 @@ const SHARED_LOGIN_STATE_FINGERPRINT: u64 = 0x36b736e5dda17cc6;
 const SHARED_HOSTNAME_FINGERPRINT: u64 = 0x49026f28c1db76ec;
 
 const LAUNCH_FINGERPRINT: u64 = 0xa3d30e165f4955e6;
-const MAIN_FINGERPRINT: u64 = 0x5e5a07537b6e38c6;
+const MAIN_FINGERPRINT: u64 = 0xe3ccbc9cef47cdd6;
 const SESSION_FINGERPRINT: u64 = 0x7fe467e679358f5e;
 
 const INTAKE_RAW_FINGERPRINT: u64 = 0x320c8b6ddbfe29af;

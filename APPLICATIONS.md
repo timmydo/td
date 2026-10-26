@@ -415,11 +415,8 @@ one line: `td-jail: firefox runs only as its own application account, not
 uid 1000; td starts it from the desktop, not from a shell`. Stage 1 checks
 the same rule again as it resolves the launch and as it selects the
 session's display. A `/bin/firefox` would only reach that refusal, so the
-image ships none for Firefox, mail or news; their units, and for Firefox
-the compositor's card, start them through td-authd. Claude alone keeps
-`/bin/claude`: as the human, td-jail hands that invocation to Claude's own
-shell server (td-authd/DESIGN.md, "Claude shell launch"), which runs the
-jail under Claude's account.
+image ships no `/bin` name for any application; their units, and for
+Firefox the compositor's card, start them through td-authd.
 
 **`argv[0]` selects, it does not authenticate.** A caller controls
 `argv[0]`, but a name the immutable policy does not assign to the caller's
@@ -440,9 +437,9 @@ here did not come from there.
 **Application names are a seventh applet farm and are registered as
 one.** `bin_farms()` enumerates the six closed farms plus this open one,
 and `applet_farms_are_disjoint_and_boot_names_stay_static` exists because
-a name in two farms packs two conflicting symlinks for one applet. Only
-`/bin/claude` is linked now, and the image check refuses any `/bin` entry
-for the others; the whole roster stays in the farm, so an applet can
+a name in two farms packs two conflicting symlinks for one applet. No
+application is linked, and the image check refuses a `/bin` entry for
+any of them; the whole roster stays in the farm, so an applet can
 neither take an application's name nor collide with one that regains a
 link. Application names are a new, open-ended, recipe-authored class in
 the same directory — authored by whoever packages an application — so
@@ -1911,8 +1908,8 @@ on missing broker substrate: the filter, names, match rules, admission, pid
 answers, descriptor budget and portal routing are all per-caller now. A second
 application with a bus name still needs reviewed service decisions and exact
 grants from the remaining bullets; it must not weaken the assertion merely
-because the broker mechanisms exist. The other applications — mail, news
-and Claude — hold no name and did not (§D).
+because the broker mechanisms exist. The other applications — mail and
+news — hold no name and did not (§D).
 
 For `td-compositor`, the minimum useful Firefox target is Software WebRender
 over `wl_shm`; dmabuf must remain unadvertised until it works. The platform
@@ -3089,15 +3086,6 @@ already-selected signal, and the parent-death/cleanup path handles it.
 `CommandExt`'s stable `process_group` is only `setpgid` and would not provide
 the terminal boundary.
 
-The human shell's `claude` entry uses the fixed application-UID launcher
-specified in `td-authd/DESIGN.md` under Claude shell launch. Its listener
-is bound by root and served only after the service credential drop. A
-fresh slave reaches this same jail transition; the human retains only its
-master. Claude keeps UID 65539, private state and the existing idmapped
-workspace grant. Shell cwd beneath the human's `src` is translated into
-that grant; file ownership on the human's view remains unchanged. The boot
-oracle also requires a human-UID shell launch of `claude --version`.
-
 **`devices=tty` — the fresh-terminal grant.** The containment bootstrap
 prevents accidental access; this grant defines deliberate acquisition, and
 what is acquired is a fresh terminal, never the operator's. Stage 1, which
@@ -3111,9 +3099,10 @@ that its session and process group are unchanged and its
 controlling-terminal field decodes to that device. What the kernel enforces
 for the zero argument is exact: a terminal *some session owns* is refused,
 and stage 1 never steals. A shell's terminal is owned because td-term's
-default shell leads a session on it; so `claude` typed at a td-term
-prompt fails with a diagnostic naming td-term's `--command`, the path that
-produces a session-less pty for exactly this purpose
+default shell leads a session on it; so a terminal application whose
+stdio is a td-term shell's terminal fails with a diagnostic naming
+td-term's `--command`, the path that produces a session-less pty for
+exactly this purpose
 (`td-term/DESIGN.md` §4). "Never the operator's" therefore rests on
 that session: a shell started with `--command /bin/sh` leads no session, its
 pty is unowned, and an application launched from it would acquire and share
@@ -6007,15 +5996,12 @@ its own included, by either credentials method (rung 32).
 Every one of those was a problem between PEERS, and each now has a test that
 drives it through the broker. Firefox is the one selected application that
 holds a bus name; the first-window oracle drives one peer, not two
-applications' traffic on one live bus. `mail`, `news` and `claude` ship
-beside it with NO bus policy: mail and news are static td-owned programs
-and Claude a foreign payload, none with a D-Bus client. Claude is the one
-terminal application, started by td-term under the `devices=tty` grant;
-mail and news draw in td-ui windows of their own and are started direct,
-as Firefox is (§W.8, "Reworked").
-Claude's oracle proves a launch, a fresh terminal and a registration on the
-live broker beside Firefox's instance, not a message between two peers. Step
-12 still binds the socket into their jails, so a compromised one could
+applications' traffic on one live bus. `mail` and `news` ship beside it
+with NO bus policy: they are static td-owned programs with no D-Bus
+client, drawing in td-ui windows of their own and started direct, as
+Firefox is (§W.8, "Reworked"). No shipped application holds the
+`devices=tty` grant. Step 12 still binds the socket into their jails,
+so a compromised one could
 connect, and the broker would admit it as a peer that sees and addresses only
 the portal and itself — but the two surfaces it could once reach, the shared
 descriptor budget and its own init-namespace pid, are the closed gaps above.
@@ -7750,7 +7736,7 @@ Each row is one landing or a small family, leaving the tree green.
 | 27e | **Firefox download image proof — LANDED**; the authenticated local HTTPS page carries one fixed fixture link. After the clipboard proof, Firefox content focuses and validates that link before admitting a real emulated Enter key. A td-owned probe outside the jail accepts completion only after the exact 23-byte regular file is stable at the uid-1000 source of Firefox's `/home/td/Downloads` grant, with bounded mode, link, identity and duplicate/partial checks. The same trusted input-stage record follows the download and FileChooser markers, so neither a synthetic DOM click nor a stale file can pass; rung 27j owns final greeter completion | Firefox writes a verified HTTPS download through its declared persistent grant without manual testing |
 | 27f | **Firefox FileChooser image proof — LANDED**; after the independent download validation, Firefox content exposes a full-viewport focus control and a trusted physical click focuses the browser. A fresh bounded read-only probe validates that persistent click record and current focus, then the host sends physical `Control+O` to invoke Firefox's native Open File command without a DOM picker call or synthetic assignment. The host accepts one exact portal presentation record, validates the centred 960x562 chooser palette and selected row in a bounded 1280x800 PPM, and recomputes the announced client-buffer checksum from those displayed pixels before injecting Enter to select the file. Firefox must then load the exact granted `file:` URL as plain text with the fixture's exact contents before the private input-stage record. Ordinary boots expose none of the Marionette, QMP or fixture-page machinery | Firefox's broker-authenticated portal request, modal presentation, physical selection and directed result complete without manual testing |
 | 27g | **Firefox public-network image proof — LANDED**; the interactive runner replaces its explicit NIC absence with an explicit QEMU user-mode NIC and no host-to-guest forwarding. Guest-initiated SLIRP traffic can reach the operator host, LAN and public network. The operator-run network oracle retains td-netd DHCP/DNS/TCP and Git HTTPS evidence, then requires the jailed Firefox to navigate to the same public host, complete a verified HTTPS 200 document load and validate the final content origin/body inside one 60-second bounded Marionette session. The trusted evidence unit checks and prints one exact marker before its atomic completion, and the host accepts only that line. The system oracle's boots carry the same NIC since §W.9's cutover, to fetch the applications from the host's feed; public reachability is still not evidence there and is deliberately not a build gate | ordinary interactive Firefox can browse, and the same path has a repeatable non-manual public HTTPS check |
-| 27h | **Firefox Web Audio image proof — LANDED**; the deterministic audit-off physical-input boot uses its first trusted key to start one 440 Hz oscillator in Firefox, schedules 1.2 seconds at quarter gain plus a 500 ms 0.001-gain tail on the same audio clock, then closes the context after the oscillator ends and a bounded downstream-drain interval. The QEMU runs exposed cubeb's real 48 kHz stereo FLOAT32 stream, its 50 ms working target against a larger HDA ring, the built-in test loopback taking card 0 ahead of HDA, and TCG audio-clock progress that can outrun the frames cubeb delivers to HDA. `td-audio` now converts that one same-rate/channel shape into its fixed S16 mixer with saturating samples, negotiated-byte grants/indexes, one wire-frame-bounded scratch per connection and partial-frame refusal; default selection excludes the exact `snd-aloop` PCM while preserving explicit card/device access to it. The negotiated working target is raised to at least the selected device ring plus one transfer period, retaining bounded software refill headroom behind the initially primed ring. Pulse-compatible prebuffering, idle-output suppression and whole-period ALSA-ring priming keep continuous client frames contiguous instead of starting HDA on an empty period; moving the last private-queue frame into a live device ring is not an underflow; each stream rearms only if the shared playhead reaches its exhausted accepted endpoint before a refill extends it. `TRIGGER`, `DRAIN`, bounded shutdown, an initial completed prebuffer gate, a below-period target watermark, or an explicit zero prebuffer may release a complete shorter tail. The scheduled sub-oracle-floor tail and delayed close keep cubeb alive past the bounded downstream queues; that guest schedule is not evidence, and the host WAV duration and waveform checks remain authoritative. The selected HDA device writes through a private 48 kHz stereo S16 QEMU WAV backend. The proof-only codec disables QEMU's emulated gain/mute mixer because `td-audio` deliberately owns no ALSA control node, but retains the HDA PCM transport under test. QEMU writes silence for the whole bounded boot, so the host derives a live file ceiling from the selected timeout plus margin within an absolute 768 MiB bound, raised from 512 MiB to 640 MiB when Claude Code's terminal oracle lengthened the timeout and to 768 MiB when the applications' fetch did, and refuses a larger timeout before launch. The post-exit oracle streams that file through a fixed buffer, retains only the bounded active span, validates the canonical header, 900–1300 ms duration, peak and per-channel AC energy, no internal below-floor run over 64 frames, the median of each channel's overlapping 100 ms-window zero-crossing estimates inside 435–445 Hz, and both channels' mean correlation of at least 0.85 with one shared-frequency sine over those windows. No channel may have more than seven sub-0.9 windows or two contiguous transient runs. Window-local phase therefore tolerates the measured bounded HDA startup and recovery regions; half-window overlap makes repeated boundary-aligned phase resets cross too many measured windows or runs, so the combined checks reject silence, noise, an intermittent signal or an unrelated tone. The authoritative rung-27h landing run measured 1,174 ms active at fitted 440.00 Hz, 440.08/440.08 Hz median zero-crossing estimates, 5,792.4/5,792.4 AC RMS, 0.9990/0.9990 mean correlation, and no sub-0.9 transient window or run in either channel. Diagnostic failures report the exact active span, count above the sample floor and longest internal quiet run. Unit regressions reject malformed input, silence, DC with a negligible tone, a missing channel, a long quiet interval, repeated phase resets, a short tone, an overlong tone and low or high off-band frequencies, accept bounded phase-reset and clock-stretch fixtures, pin the exact float conversion, accounting, refill-before-endpoint continuity, device-ring-plus-period target floor, prebuffer/start continuity, mixed HDA/loopback selection and audio-clock tail, and pin the exact QEMU argv including comma-safe capture paths. The dedicated seccomp-audit variant repeats the real input/soak workload against a host-silent backend; other system boots and the interactive runner remain host-silent | Firefox Web Audio crosses cubeb, the jail's Pulse alias, `td-audio`, ALSA and emulated HDA into a machine-checked waveform without manual listening |
+| 27h | **Firefox Web Audio image proof — LANDED**; the deterministic audit-off physical-input boot uses its first trusted key to start one 440 Hz oscillator in Firefox, schedules 1.2 seconds at quarter gain plus a 500 ms 0.001-gain tail on the same audio clock, then closes the context after the oscillator ends and a bounded downstream-drain interval. The QEMU runs exposed cubeb's real 48 kHz stereo FLOAT32 stream, its 50 ms working target against a larger HDA ring, the built-in test loopback taking card 0 ahead of HDA, and TCG audio-clock progress that can outrun the frames cubeb delivers to HDA. `td-audio` now converts that one same-rate/channel shape into its fixed S16 mixer with saturating samples, negotiated-byte grants/indexes, one wire-frame-bounded scratch per connection and partial-frame refusal; default selection excludes the exact `snd-aloop` PCM while preserving explicit card/device access to it. The negotiated working target is raised to at least the selected device ring plus one transfer period, retaining bounded software refill headroom behind the initially primed ring. Pulse-compatible prebuffering, idle-output suppression and whole-period ALSA-ring priming keep continuous client frames contiguous instead of starting HDA on an empty period; moving the last private-queue frame into a live device ring is not an underflow; each stream rearms only if the shared playhead reaches its exhausted accepted endpoint before a refill extends it. `TRIGGER`, `DRAIN`, bounded shutdown, an initial completed prebuffer gate, a below-period target watermark, or an explicit zero prebuffer may release a complete shorter tail. The scheduled sub-oracle-floor tail and delayed close keep cubeb alive past the bounded downstream queues; that guest schedule is not evidence, and the host WAV duration and waveform checks remain authoritative. The selected HDA device writes through a private 48 kHz stereo S16 QEMU WAV backend. The proof-only codec disables QEMU's emulated gain/mute mixer because `td-audio` deliberately owns no ALSA control node, but retains the HDA PCM transport under test. QEMU writes silence for the whole bounded boot, so the host derives a live file ceiling from the selected timeout plus margin within an absolute 768 MiB bound, raised from 512 MiB to 640 MiB when the since-removed Claude Code terminal oracle lengthened the timeout and to 768 MiB when the applications' fetch did, and refuses a larger timeout before launch. The post-exit oracle streams that file through a fixed buffer, retains only the bounded active span, validates the canonical header, 900–1300 ms duration, peak and per-channel AC energy, no internal below-floor run over 64 frames, the median of each channel's overlapping 100 ms-window zero-crossing estimates inside 435–445 Hz, and both channels' mean correlation of at least 0.85 with one shared-frequency sine over those windows. No channel may have more than seven sub-0.9 windows or two contiguous transient runs. Window-local phase therefore tolerates the measured bounded HDA startup and recovery regions; half-window overlap makes repeated boundary-aligned phase resets cross too many measured windows or runs, so the combined checks reject silence, noise, an intermittent signal or an unrelated tone. The authoritative rung-27h landing run measured 1,174 ms active at fitted 440.00 Hz, 440.08/440.08 Hz median zero-crossing estimates, 5,792.4/5,792.4 AC RMS, 0.9990/0.9990 mean correlation, and no sub-0.9 transient window or run in either channel. Diagnostic failures report the exact active span, count above the sample floor and longest internal quiet run. Unit regressions reject malformed input, silence, DC with a negligible tone, a missing channel, a long quiet interval, repeated phase resets, a short tone, an overlong tone and low or high off-band frequencies, accept bounded phase-reset and clock-stretch fixtures, pin the exact float conversion, accounting, refill-before-endpoint continuity, device-ring-plus-period target floor, prebuffer/start continuity, mixed HDA/loopback selection and audio-clock tail, and pin the exact QEMU argv including comma-safe capture paths. The dedicated seccomp-audit variant repeats the real input/soak workload against a host-silent backend; other system boots and the interactive runner remain host-silent | Firefox Web Audio crosses cubeb, the jail's Pulse alias, `td-audio`, ALSA and emulated HDA into a machine-checked waveform without manual listening |
 | 27i | **unsupported portal discovery proof — LANDED**; the live uid-1000 portal client asks the version property and `GetAll` for `ScreenCast`, `RemoteDesktop`, `Camera`, `Secret`, and `Print`, calls one real entry member on each, and accepts only complete exact error replies from the activated service's unique sender. Live introspection must omit every interface, and QEMU requires a distinct trusted service-prefixed marker after the whole sequence | unsupported capture, remote-control, camera, secret, and print capabilities fail closed rather than appearing to succeed |
 | 27j | **Firefox five-minute connection soak — LANDED**; one Marionette session alternates 31 exact guest-local HTTPS navigations at ten-second boundaries through at least 300 seconds. Before/after equality pins Firefox's application instance, pid and procfs start time; the bus GUID plus its exact broker-authenticated Firefox connection/pid set; and the compositor generation. Its live-latched readiness answer separately proves the publishing Wayland client did not depart. Only the final unit can publish the greeter's completion, and QEMU requires its exact soak line | browser, bus and compositor connections survive a bounded real navigation workload without manual observation |
 | 27k | **Firefox outer-seccomp denial audit — LANDED**; a dedicated physical-input variant alone enables the target kernel audit path and asks the standard outer filter to log non-allow decisions without changing their actions. A root-owned, executable-only bind of the existing non-shipped helper makes all 17 blocked calls under that installed filter, then replaces itself with Firefox in the same pid. After the full input workload and five-minute soak, a bounded root parser requires every helper denial, rejects loss, suppression, malformed ABI/uid/action data and any unrostered denial, and emits one exact host-required result. The variant retains all real input, browser, bus and compositor continuity evidence but uses the host-silent audio backend because kernel audit work measurably perturbs the separate TCG HDA waveform oracle | the shipped Firefox path proves its outer deny filter blocks the rostered probes while completing its real workload without an unrostered denial |
@@ -7759,10 +7745,10 @@ Each row is one landing or a small family, leaving the tree green.
 | 30 | **fresh-terminal grant — LANDED** in the jail; `devices=tty` parses and is honoured. Stage 1 requires one pseudo-terminal slave on its own stdio, issues a single non-stealing `TIOCSCTTY` from the session the bootstrap proved, and reads the terminal back from procfs before any registration, namespace or cgroup; stage 2 re-proves the same device on its stdout before mounting, binds `/dev/tty`, and gives the entry three clones; `TERM` forwards under a closed grammar beside `TERMINFO`, with the one matching description bound; td-term `--command` is the producer of such terminals. Unit tests and confinement pins cover the grammar, the wire format, the procfs decoding, the devpts identity and the order; rung 31's boot oracle proves the acquisition end to end | a terminal application runs in the jail with a terminal of its own, and never the operator's |
 | 31 | **terminal applications — LANDED**: `mail` (td-mail) and `news` (td-news) are source-built static packages on the data-only `static-runtime`, `/bin/mail` and `/bin/news` launchers (since dropped: td-authd starts each by name, §A.0), and two td-svc units that ran each as td-term's `--command` (until rung 36 moved both into td-ui windows) in a window of its own after the first terminal, on the second workspace, which the control channel makes active before they start and leaves for the shell's once both are decided, so that the first workspace stays the shell's and Firefox's, never restarted by the supervisor; a user-level relaunch is §W.7. td-firstboot provisions each a first configuration once under the login user's jail state. Each package carries its binary's debug companion and, at the root of that debug tree, the assembly marker, so the profiler's object index finds under this source-built root what it requires. Under the autotest token the evidence units, which require their window, print `TD-MAIL-RUNNING` and `TD-NEWS-RUNNING` only after td-jail finds the client itself, by the program its entry runs as, still in the instance five seconds past the window's readiness, and `TD-APPLICATIONS-PLACED` once the compositor's report shows the first workspace active, no workspace occupied but the first and the applications', and the shell's window alone on the first; the boot oracle requires all three. Neither holds a bus name; §D names the residual | the machine boots to mail and news beside the shell, each in a jail on a terminal td-term made for it |
 | 32 | **a second bus-holding application's peer attribution — LANDED** in the broker, in two halves. A jailed or unproved caller is told no host pid, about itself or the broker: `GetConnectionUnixProcessID` answers `UnixProcessIdUnknown` and `GetConnectionCredentials` carries the uid without `ProcessID`, and only a caller the lineage walk proved unconfined gets one. Queued descriptors are charged to the admission key HOLDING them beside the bus's ceiling, in two counts per key with a quarter of it each: the sender's freight count until every recipient is charged, each recipient's queued count once a frame is queued to it, apart so a stall on one of a key's connections does not refuse its siblings. A recipient key at its queued share costs the sender a `LimitsExceeded` reply and nobody a connection; a sender key at its freight share is refused; only the ceiling, which one key's two counts cannot reach, relieves a holder. Both halves have tests that drive them through the broker. The roster tripwire stays at one bus-holding application until the entry that lifts it brings the first two-application boot oracle | a second bus-holding application shares the broker without reading a host pid through it, and without starving the first of descriptors |
-| 33 | **Claude Code ships — LANDED** as the fourth shipped application and the first foreign-payload terminal program: a marked payload on Firefox's runtime, run behind the same jail as the source-built mail and news, with the `devices=tty` grant in its policy and its own boot oracle unit, `claude-evidence`. Once every Firefox oracle has published, so no second window shares a frame those measure, the unit launches it twice as its application user: with no terminal of its own, which the grant refuses before anything runs, and inside a pseudo-terminal from `td-term --command`, where `claude --version` runs to exit status 0 through td-jail's registration on the live broker beside Firefox's instance; td-term's own line for its child's status, matched whole wherever the capture holds it, is the proof, so a failed acquisition, registration, jail or payload is a failed launch; Firefox's process token and bus identity are read before and after and must match, so the instance it ran beside is the live one; a failed launch's captured output goes to a file, never the console. The oracle found the jail keying the `/usr` aliases on Firefox's reviewed package library path rather than on the runtime, so a dynamic application with no package libraries had no interpreter; the aliases now follow the runtime, and stage 1 tells stage 2 so in a word of its own. The payload then died with SIGILL: the oracle's default `qemu64` CPU has no SSE4.2 or POPCNT, the x86-64-v2 baseline the payload assumes and Firefox's conservative build does not, so the boot now emulates `Nehalem`, the lowest stock model that supplies it. It then ran `--version` to exit 0, but the jail's post-exit read of the cgroup leaf's diagnostics found it already reaped, since the application is short-lived, and reported that as a failure; that read is observability the launch discards on success, so a leaf already gone is now `None`, not a failed launch, matching the rest of the module. The host oracle latches `TD-CLAUDE-TERMINAL-OK` and fails without it, and the roster tripwire now requires an evidence unit per shipped application. Not yet: a launcher card that opens it, and the executable state subtree its updater needs; the caller's working directory is rung 34 | a foreign-payload terminal application is proved to run in a terminal of its own, beside the browser, on one live bus |
+| 33 | **Claude Code — shipped, then removed.** It was the fourth shipped application and the first foreign-payload terminal program, UID 65539, on Firefox's runtime under the `devices=tty` grant, with its own boot oracle; it has left td by the user's decision, with its recipe, release stream, shell launch and oracle. Its oracle's findings stay: the jail keys the `/usr` aliases on the runtime rather than on Firefox's package library path; the boot emulates `Nehalem` because `qemu64` lacks the x86-64-v2 baseline a modern payload assumes; and the jail's post-exit read of an already-reaped cgroup leaf is `None`, not a failed launch. An install enrolled while it shipped keeps its 65539 reservation (§W.9, "Removed: Claude Code") | no shipped application holds the `devices=tty` grant; the grant and its stage-1 acquisition remain, unit-tested, for the next terminal application |
 | 34 | **the admitted caller's working directory**: stage 1 maps its own directory through a declared filesystem grant and passes the bounded canonical result to stage 2, which starts there or falls back to `/` if it cannot enter it. The private-UID cutover makes the stock root authority the supported launcher; it starts from `/` and does not forward an operator's working directory. Direct human-UID application launch is refused. A later typed launch request must carry an admitted working directory to restore that operator flow. The jail's existing grant mapping and argv/refusal tests remain applicable to admitted callers | an admitted caller's directory is retained only inside its declared grant; stock launches currently start at `/` |
 | 35 | **news in a td-ui window — LANDED** (§W.8, "Reworked"): td-ui gains the cell screen, a grid of styled cells presented as a plain toplevel that polls the program's handler each turn, and td-news's views draw on it whole; its terminal layer and UNSAFE.md §18 surface are gone, the crate forbids `unsafe`, the recipe is a static PIE Cargo build over the toolkit, the `news` package drops `devices=tty`, and the `[news]` unit launches it direct and is ready when the compositor's layout names its toplevel. Mail follows in its own increment. Reworked again (§W.8, "Reworked again"): for news the toolkit's lists and td-editor's read-only document pane in the widget window replace the cell screen, since deleted (`td-ui/DESIGN.md`, increment 13), and the recipe stages `td-editor` beside `td-ui` | one of the two source-built applications no longer needs a terminal, a pty grant or td-term to exist |
-| 36 | **mail in a td-ui window — LANDED** (§W.8, "Reworked"): td-mail's views keep their cursor-and-attribute writer over the window's cell screen, so they move untouched; its terminal layer and UNSAFE.md §17 are gone and the crate forbids `unsafe`; the recipe is a static PIE Cargo build over the toolkit, the `mail` package drops `devices=tty`, and the `[mail]` unit launches it direct with the anchored layout probe. The direct-rustc local-source ladder keeps one user, td-install-qemu-test. Reworked again (§W.8, "Reworked again"): for mail too the toolkit's lists and td-editor's read-only document pane in the widget window replace the cell screen, since deleted, and the recipe stages `td-editor` beside `td-ui`; composing is in an editable pane in the same window (§W.8, "Composing in place"), so the package ships no editor | neither source-built application needs a terminal, a pty grant or td-term to exist; Claude is the terminal set, and §W.7's relaunch is a window request |
+| 36 | **mail in a td-ui window — LANDED** (§W.8, "Reworked"): td-mail's views keep their cursor-and-attribute writer over the window's cell screen, so they move untouched; its terminal layer and UNSAFE.md §17 are gone and the crate forbids `unsafe`; the recipe is a static PIE Cargo build over the toolkit, the `mail` package drops `devices=tty`, and the `[mail]` unit launches it direct with the anchored layout probe. The direct-rustc local-source ladder keeps one user, td-install-qemu-test. Reworked again (§W.8, "Reworked again"): for mail too the toolkit's lists and td-editor's read-only document pane in the widget window replace the cell screen, since deleted, and the recipe stages `td-editor` beside `td-ui`; composing is in an editable pane in the same window (§W.8, "Composing in place"), so the package ships no editor | neither source-built application needs a terminal, a pty grant or td-term to exist; no shipped application holds the terminal grant, and §W.7's relaunch is a window request |
 
 **Of the two reversals this ladder used to omit entirely, timezone now
 has a rung and accessibility still does not.** §O made timezone support
@@ -8513,14 +8499,15 @@ the credential store and has a read-only mapped Downloads grant, with no
 access to the remaining private human home.
 
 Applications run under distinct external service UIDs: Firefox 65536,
-mail 65537, news 65538 and Claude 65539. The immutable identity registry
-and retained ledger bind those assignments to the human session; retired
-UIDs are never reassigned. Root-configured units invoke `td-authd
-application-start`, which selects the enrolled account, uses td-login's
-checked credential drop, and verifies the application cgroup before exec.
-No caller may choose an executable or UID through that operation. The
-fixed root boot oracle also invokes service accounts directly to capture
-its terminal and refusal evidence. There is no public launch listener.
+mail 65537 and news 65538. The immutable identity registry and retained
+ledger bind those assignments to the human session; retired UIDs are
+never reassigned, so Claude Code's 65539 stays reserved on every install
+that enrolled it (§W.9, "Removed: Claude Code"). Root-configured units
+invoke `td-authd application-start`, which selects the enrolled account,
+uses td-login's checked credential drop, and verifies the application
+cgroup before exec.
+No caller may choose an executable or UID through that operation. There
+is no public launch listener.
 
 The jail maps each external UID to 1000 inside its private namespace.
 The broker checks AUTH EXTERNAL against that kernel mapping and permits
@@ -8533,8 +8520,8 @@ the human account or another application's assigned identity.
 Firstboot migrates legacy application state into mode-0700
 `/var/lib/td/applications/APP_UID`, creates the corresponding service
 runtime and cgroup, and removes the old application directory. The root
-filesystem helper publishes only Firefox and mail Downloads and Claude's src
-views of the human's corresponding directories. These writable idmapped
+filesystem helper publishes only Firefox and mail Downloads views of the
+human's corresponding directory. These writable idmapped
 mounts preserve mode-0600 files and map new writes back to human ownership.
 They are nosuid,nodev,noexec; they grant no other human directory. Jail
 resolution verifies their exact source mount identity and rejects nested
@@ -10359,17 +10346,13 @@ operator starts it again. Today the one way to do that is a reboot:
 one, because root has no login. Both programs now draw in td-ui windows
 of their own (§W.8, "Reworked"), so the pty the terminal grant insisted
 on is no longer in the way; what is missing is a user-level request
-that starts the program in a fresh window. Claude remains the terminal
-case: running it from a shell in the terminal window does not work,
-since td-jail's `devices=tty` grant makes the entry a session leader on
-a fresh pty and acquires that pty with `TIOCSCTTY`, which fails when the
-pty is already the shell's controlling terminal.
+that starts the program in a fresh window. No shipped application is a
+terminal case now.
 
 **Plan.** (1) The compositor's launcher already builds `td-term run`
 for a new terminal window on a key chord; it gains a request that
 starts a shipped application through td-authd's `application-start`,
-`direct` for a window application (Claude's terminal launch is its
-own shell server, td-authd/DESIGN.md), so a chord
+`direct`, the only presentation, so a chord
 opens a fresh `mail` or `news` window, and the running td-svc window is
 not involved. The launcher, not the shell, chooses the program, so the
 set of programs a chord can start is the launcher table's and nothing
@@ -10837,7 +10820,7 @@ text selection goes with it. Its terminal layer and UNSAFE.md §17 are
 retired, the `mail` package drops `devices=tty`, and the `[mail]` unit
 launches it `direct` with the same anchored layout probe. With both
 moved, §W.7's relaunch problem is a launcher request for a window rather
-than a pty, and §D's terminal set is Claude alone.
+than a pty, and no shipped application needs the terminal grant.
 
 **Reworked again: td-news shows its lists and reads an article in
 td-editor's document view.** The cell screen kept the terminal's shape,
@@ -11020,8 +11003,8 @@ no editor tree. The td-pass notebook window embeds the same pane.
 
 **Status: decided by the repository user; landed.** No Flathub byte is
 in the image: §B.3.1's pinned path is retired, and where this section and
-an earlier one disagree about Firefox or Claude Code's runtime, this one
-describes the code.
+an earlier one disagree about Firefox's runtime, this one describes the
+code.
 
 **Why.** An exact-commit pin assumes its URL is permanent, and Flathub's
 is not: it prunes superseded commits within weeks. The Firefox 154 pin
@@ -11210,10 +11193,10 @@ request starts it, and an oracle boot starts it. Its `restart=on-failure`
 retries a launch that failed, as one racing the session bus does, while a
 window the human closed stays closed. Under the token the oracle's
 applications fetch before they start, so their readiness deadlines
-measure a launch rather than a download: `firefox-fetch` and
-`claude-fetch` run `td-app update` as each account, bounded at 900
-seconds, name the same path, and order Firefox and Claude Code's evidence
-after them. Anywhere else the first launch fetches.
+measure a launch rather than a download: `firefox-fetch` runs `td-app
+update` as `tda65536`, bounded at 900 seconds, names the same path, and
+orders Firefox's evidence after it. Anywhere else the first launch
+fetches.
 
 **The image no longer carries the payload.** The Firefox recipe is a
 declaration alone: no source, no payload, no steps, and the version
@@ -11229,59 +11212,30 @@ the Freedesktop 25.08 recipe, the graph cache's warm in `./update`,
 ostree-materialize` were deleted in the same landing, and roughly 1 GB
 left every image and §B.1's ×3 capacity accounting.
 
-**Claude Code follows Anthropic's signed native releases on demand.** Its
-recipe now carries only its declaration, permission policy and launcher;
-there is no Claude binary or source pin in the image. td-app fetches
-`https://downloads.claude.ai/claude-code-releases/latest` as a bounded,
-untrusted version hint, then that version's `manifest.json` and
-`manifest.json.sig`. The exact manifest bytes must verify with the
-compiled RSA-4096 key whose fingerprint is
-`31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE`, from Anthropic's published
-`https://downloads.claude.ai/keys/claude-code.asc`. The bounded OpenPGP
-verifier used for Flathub also verifies this detached signature; the
-manifest's version must equal the requested canonical `major.minor.patch`.
-Only `platforms["linux-x64"]` is selected, its binary must be `claude`,
-and its signed size and SHA-256 must match the downloaded
-`{version}/linux-x64/claude`. Manifests are at most 64 KiB, armored
-signatures 16 KiB, binaries 512 MiB. Downloads refuse redirects and have
-byte and time bounds. The dynamic validator then checks the binary
-against the declared Flathub runtime before publishing a generation.
-
-`app/com.anthropic.ClaudeCode/x86_64/latest` is this declaration's logical
-source selector, not an OSTree ref and never requested from Flathub. It
-uses the existing `app=` selection row: the content identity is SHA-256
-of the signed manifest, and the row's sequence field packs the three
-numeric version components into 21 bits each. Versions with leading
-zeroes, suffixes, extra components or components outside that range are
-refused. The floor is the highest sequence in `admitted`, `current` or
-`previous`; a lower version or a different manifest at the same version
-is refused. This prevents rollback after a successful admission, not a
-freeze or an old first install. Signing-key changes are reviewed code
-changes; online key revocation is not consulted.
-
-The binary is materialized as `deploy/<manifest-sha256>/files/bin/claude`
-through a complete private staging tree and rename. The application and
-runtime use the same generation selection, validation, current/previous
-retention and launch leases as Firefox. A failed signature, download,
-size/hash check or dynamic validation leaves current selected. The
-application's own updater remains disabled: only td-app writes executable
-generations outside the jail. Its runtime is still the exact accepted
-Freedesktop branch under Flathub's rules 1–3 and 5. Its account,
-`tda65539`, owns both trees. Accounts do not share a cache.
-
-The feed's Flathub export warms only OSTree refs; Claude's release always
-comes directly from Anthropic, including on autotest boots. The existing
-`claude-fetch` unit now fetches both binary and runtime before the
-terminal launch oracle, within its existing timeout. Thus those boots
-also need upstream release availability. Ordinary boots fetch neither;
-first launch and daily/forced checks use the same td-app commands.
+**Removed: Claude Code.** Claude Code was this section's second
+declaration, following Anthropic's signed native release stream as
+`tda65539`, UID 65539. It has left td by the repository user's decision,
+with that release stream (the third class of foreign output AGENTS.md
+named), its recipe, verifier and key, its shell launch and its oracle.
+A machine enrolled while it shipped keeps what a deployment cannot reach, by
+design: td-firstboot's ledger, `/var/lib/td/principals.tsv`, retains the
+`claude` assignment, since a retired UID is never reassigned, and the
+boot verifies only the accounts a deployment still names, so it admits
+that row with no `tda65539` account in the image, while still refusing
+any account that claims the reserved UID or name. Its home,
+`/var/lib/td/applications/65539`, with the release binaries and runtime
+its cache held, stays as inert data: firstboot prepares only the
+applications the deployment names, and no unit, launcher, grant or jail
+opens it. Root may delete that directory; the ledger row stays.
 
 **Each half of a spec resolves on its own.** A spec's application tree
 comes either from its `/td/store` package (`files/`) or, when the spec
 carries `source=`, from the account's held generation; its runtime comes
 either from a `/td/store` runtime path or, when `runtime=` names a
 Flathub ref, from the same generation. Firefox takes both from the
-cache, as does Claude Code; mail and news use neither.
+cache; mail and news use neither. No declaration takes the runtime-only
+form now, a `/td/store` application tree on a fetched runtime; the rule
+keeps it for one.
 `flathub_app::spec_source` is the one rule the spec compiler and td-jail
 both apply: a `/td/store` runtime carries no `source=`; any other
 `runtime=` is the declaration's runtime ref, with `source=` exactly when
@@ -11351,8 +11305,8 @@ autotest boot the deployment init writes a `td.feed=` token to
 `/run/td-feed`, which td-app reads when no VM bridge gave one (landed
 ninth); the oracles' own wiring lands with the cutover, which is the
 first thing that needs it. (10) Cutover: the declaration-only Firefox
-package, Claude Code's runtime ref, autostart and fetch only under the
-autotest token, the oracles' feed, and deletion of the pins, payloads
+package, autostart and fetch only under the autotest token, the
+oracles' feed, and deletion of the pins, payloads
 and graph transfer (landed tenth).
 
 ## X. Host mode — development only

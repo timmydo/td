@@ -32,7 +32,6 @@
 // `td-net subst`. Invoking a bare
 // `td-net` with no applet selector is a usage error (exit 2) by design.
 mod app;
-mod claude_release;
 mod deploy;
 mod egress;
 mod feed;

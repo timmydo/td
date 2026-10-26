@@ -75,8 +75,9 @@ no VM binaries or services.
 
 The test-only allocation probes in `td-mta` have the separately recorded T1
 and T2 surfaces below; T3 sends termination signals to retained test
-children. They are absent from shipped binaries and libraries
-and do not add a target syscall exception to the numbered roster.
+children; T4 is td-secret's PTY fixture for its PIN-terminal tests. They
+are absent from shipped binaries and libraries and do not add a target
+syscall exception to the numbered roster.
 
 Do not add `unsafe` anywhere else; a new `unsafe` surface is a reviewed
 amendment recorded HERE. A new syscall in an existing surface, a new
@@ -191,7 +192,7 @@ one.
 | 13 | `td-audio` | `ioctl(2)` with eleven value-pinned PCM requests, `poll(2)`, `getsockopt(2)` pinned to `SOL_SOCKET`/`SO_PEERCRED` |
 | 14 | `td-editor` | `flistxattr(2)` pinned to a size-only query, `renameat2(2)` pinned to two borrowed parents and `RENAME_NOREPLACE`; no descriptor adoption. The clipboard destination's `fcntl(2)` status commands moved to td-ui (§19) |
 | 15 | `td-secret` | shared `recvmsg(2)`, `sendmsg(2)`, `close(2)` transport and scoped adoption for bounded credential replies and the portable vault's logind sleep-delay inhibitor; the named credential intake module of §16; plus the manual PIN terminal's two-request `ioctl(2)`, single-descriptor `poll(2)`, and fixed dumpability `prctl(2)` below |
-| 16 | `td-authd` | `recvmsg(2)`, `setsockopt(2)` with fixed `SO_PASSCRED`/`SO_PASSPIDFD`, `getsockopt(2)` with fixed `SO_PEERCRED`, and `poll(2)` on the peer pidfd; one scoped descriptor adoption; a separate mount instruction/adoption for `unshare(2)`, `open_tree(2)`, `mount_setattr(2)`, and `move_mount(2)` with the fixed portal file-grant values below; plus the separate named credential intake and six-request terminal ioctl/poll modules below |
+| 16 | `td-authd` | `recvmsg(2)`, `setsockopt(2)` with fixed `SO_PASSCRED`/`SO_PASSPIDFD`, `getsockopt(2)` with fixed `SO_PEERCRED`, and `poll(2)` on the peer pidfd; one scoped descriptor adoption; a separate mount instruction/adoption for `unshare(2)`, `open_tree(2)`, `mount_setattr(2)`, and `move_mount(2)` with the fixed portal file-grant values below; plus the separate named credential intake module below |
 | 17 | `td-mail` | retired: `term_sys.rs`, td-sh's terminal half, went with the terminal; the crate forbids `unsafe` and draws through td-ui (§19) — see [§17](#17-td-mail--retired) |
 | 18 | `td-news` | retired: the copy of `term_sys.rs` went with the terminal; the crate forbids `unsafe` and draws through td-ui (§19) — see [§18](#18-td-news--retired) |
 | 19 | `td-ui` | `recvmsg(2)`, `sendmsg(2)`, `fcntl(2)` pinned to `F_DUPFD_CLOEXEC` for the shared Wayland client transport and to `F_GETFL` and `F_SETFL` for the clipboard destination owner, `poll(2)` over exactly the connection's stream and its waker, `ioctl(2)` with five value-pinned PTY requests for the terminal's device, `setsid(2)` for a PTY child; plus one scoped descriptor adoption and one scoped pre-exec hook — see [§19](#19-td-ui--the-shared-wayland-client-transport) |
@@ -2701,10 +2702,7 @@ Only `pin_terminal.rs` calls the terminal wrappers; only `token_check.rs`
 and `portable_host.rs` call process protection. No descriptor adoption,
 mapping, signal handler or general request interface is added. Tests pin
 the raw surface and use real PTYs for echo, cancellation, timeout and
-restoration. The existing `td-authd/src/terminal_sys.rs` PTY allocator is
-compiled only into those tests, with its already recorded
-instruction/adoption allowances; it is absent from the production
-td-secret binary.
+restoration. Those real PTYs come from the test-only fixture T4 records.
 
 td-secret is a library with a binary that only calls its `run`. The
 library's one other public module, `pass`, the notebook API td-pass
@@ -2977,33 +2975,6 @@ Confinement tests pin the source, the shared file, every argv, path and
 deadline, and the counts of each write and process API. No instruction,
 syscall, option or allowance is added.
 
-### Claude shell terminal boundary
-
-The Claude shell launcher is another unprivileged consumer of the unchanged
-`secret_sys.rs` credentials/pidfd transport. It refuses incoming rights on
-requests and ordinary replies. Its one descriptor reply transfers only the
-fresh PTY master created by the application-UID server. The human client
-requires the authenticated live application sender and a character device
-with devpts master device 5:2. Credential intake still requires its sealed
-regular-file descriptor; no secret API admits terminals.
-
-The separate `td-authd/src/terminal_sys.rs` has one scoped x86-64 syscall
-instruction and one scoped adoption of the freshly returned PTY slave.
-It adds ioctl(16) with exactly six requests: TIOCSPTLCK(0x40045431), argument
-pointer to i32 zero; TIOCGPTPEER(0x5441), flags RDWR|NOCTTY|CLOEXEC(0x80102);
-TIOCGWINSZ(0x5413)/TIOCSWINSZ(0x5414), four u16 words; and
-TCGETS(0x5401)/TCSETS(0x5402), the 36-byte x86-64 kernel termios layout.
-A closed private enum selects requests. No arbitrary ioctl is exposed.
-Poll(7) has exactly two eight-byte descriptors, stdin (or -1) and the owned
-master, POLLIN and optionally POLLOUT, with a 100 ms timeout. Invalid
-FD events refuse; EINTR retries through the relay loop. Safe std owns PTY
-open, I/O and close. The raw-mode guard restores the saved termios on normal
-return and ordinary errors. Abrupt process death can bypass restoration.
-Neither the client nor server calls a credential-changing syscall here.
-The compositor's shared private-channel sys module remains unchanged.
-Confinement pins this complete module, request values and its safe callers;
-real-PTY tests cover descriptor identity, I/O, window size and restoration.
-
 ### Portal file-grant mount boundary
 
 `td-authd/src/mount_sys.rs` is separate from the channel module shared with
@@ -3026,8 +2997,8 @@ and propagation fields. It does not clear an inherited read-only attribute;
 a resulting read-only view fails the required writable-view check. The two
 public wrappers select these fixed values; no caller supplies a flags word.
 The shared namespace helper may map human UID/GID 1000 to the immutable,
-actively enrolled Firefox, mail or Claude application UID for its fixed Downloads
-or workspace grant. It may also map that Firefox UID/GID to portal UID/GID 991
+actively enrolled Firefox or mail application UID for its fixed Downloads
+grant. It may also map that Firefox UID/GID to portal UID/GID 991
 for the portal's writable handoff view of Firefox's private `Opened`
 directory, the one use of the writable profile with a portal destination.
 Application mapping startup and shutdown are root-only. The same instruction
@@ -3037,8 +3008,8 @@ The wrappers accept neither paths nor flags. Safe std owns all descriptors
 and closes the detached mount on failure. No descriptor from this boundary
 is received over D-Bus or the attention channel. The production consumer
 selects the fixed human Downloads source and read-only portal destination;
-the application consumer selects only Firefox/mail Downloads or Claude src
-beneath that assigned application's private home; the handoff consumer
+the application consumer selects only Firefox/mail Downloads beneath that
+assigned application's private home; the handoff consumer
 selects only Firefox's `Opened` directory and the fixed portal destination.
 No consumer provides a general mount operation or accepts a path from an
 application.
@@ -3689,3 +3660,20 @@ FFI, pointer, descriptor adoption or signal handler. Tests call it only on
 a serving child that reported readiness, before reaping it; the guard kills/reaps that
 same child on failure. The exact source and sole inclusion are pinned by
 confinement tests. It is absent from every production binary and library.
+
+## T4. td-secret — test-only PTY fixture
+
+`td-secret/src/pty_fixture_sys.rs` is declared only as `#[cfg(test)] mod
+pty_fixture_sys;` in td-secret's library, and only `pin_terminal.rs`'s
+tests call it, to open real PTYs for the PIN terminal (§15). It has one
+function-scoped x86-64 syscall instruction, ioctl(16) with exactly two
+requests, TIOCSPTLCK(0x40045431) with a pointer to i32 zero and
+TIOCGPTPEER(0x5441) with flags RDWR|NOCTTY|CLOEXEC(0x80102), and one
+function-scoped adoption of the peer descriptor TIOCGPTPEER returns. It is
+td-authd's former test-and-relay PTY allocator, which td-secret's tests
+compiled by path, cut to those two requests when the relay left td-authd;
+td-ui's same two requests (§19) are not used because td-secret's
+direct-rustc recipe would then stage and build all of td-ui for its tests.
+td-secret's confinement test pins the instruction, both requests, the
+flags, the adoption, both scopes and the test-only declaration. It is
+absent from the production binary.

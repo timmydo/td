@@ -668,13 +668,14 @@ at `/`. No request carries a path, file or argument.
 Request `0a` is the same shape for td-review, the one desktop program
 with a fixed argument: it execs `/bin/td-review --choose-repo` from the
 verified account home. Every repository td-review could open lies under
-the human's `src`, which Claude's application view can write
-(§Application filesystem grants), and git honours a repository's own
-configuration (hooks, fsmonitor, ssh command). This document earlier
-gave td-review no request until a repository no application can write,
-or a git invocation that ignores repository-configured commands,
-existed. Neither does; that condition is withdrawn for another: the
-human chooses the repository each time, and nothing else does. The
+the human's `src`, and git honours a repository's own configuration
+(hooks, fsmonitor, ssh command). This document earlier gave td-review no
+request until a repository no application can write, or a git invocation
+that ignores repository-configured commands, existed. Claude Code's
+`src` view was then the application that could write one; it has left
+td, and no shipped application's grant reaches `src` now. The condition
+was withdrawn for another, which still holds: the human chooses the
+repository each time, and nothing else does. The
 request names none, since a fixed one would be opened on every press.
 `--choose-repo` opens a chooser over the repositories td-review's window
 opened before, kept in `~/.config/td-review/repositories`, outside every
@@ -697,7 +698,7 @@ usage analyzer: it execs `/bin/td-dua` with no arguments from the
 verified account home, which is therefore the directory it scans. It
 reads the home and deletes as the human, on the human's keys in its
 window, `D` without a question (td-dua/DESIGN.md, "Keys"). The home
-holds trees an application view can write, such as `~/src`, and
+holds trees an application view can write, such as `~/Downloads`, and
 td-dua's deletion checks are path-based: a directory an application
 swaps for a link between a check and its listing is listed through the
 link, so the entries deleted can lie outside the tree the human chose
@@ -725,11 +726,11 @@ files through the directories a workspace grants, which the person
 decides, and through td-agent's git worker, which runs outside any jail
 as the human. That worker pushes to a local repository the person admitted
 as a remote, running that repository's receive hooks as the human
-(td-agent/DESIGN.md §7, "Local repositories"), and every repository
-under `~/src` is one Claude's application view can write: an
-application that plants or swaps such a hook has it run as the human at
-the next push there, the class the `0a` paragraph names for git's
-repository configuration. Its environment is the card's alone, as `0a`'s
+(td-agent/DESIGN.md §7, "Local repositories"): an application whose
+grant reached such a repository could plant or swap a hook that runs as
+the human at the next push there, the class the `0a` paragraph names for
+git's repository configuration. No shipped application's grant reaches
+`~/src` now. Its environment is the card's alone, as `0a`'s
 is: no ssh agent, so a remote that needs one fails from the card, and
 no passphrase prompt, since td-pinentry runs only on a host. A terminal
 start of td-agent with those variables has the same reach; the card
@@ -885,89 +886,18 @@ private HOME and runtime, service USER/LOGNAME, `/bin/false` SHELL and
 no compositor control endpoint; td-jail's product resolver fixes the
 display endpoint. There is no terminal presentation: td-term's `--command`
 cannot set its program's argv[0], so it could not name an unlinked
-application, and Claude's terminal launch is its shell server below.
+application. `direct` is the only presentation word.
 The bounding capability set is not a held privilege and is not required
 empty. No new syscall or unsafe surface is
 introduced; confinement pins the complete application controller and startup.
 
-## Claude shell launch
-
-`application-start 1000 claude shell --` performs the same fixed deployment
-admission, requiring Claude's installed UID 65539 and no startup arguments.
-Root binds only `/run/td-claude-launch` below the root-owned non-writable
-`/run`, then makes the socket mode 0600, owned by UID/GID 1000. It refuses
-an active or unexpected existing inode; a refused connection to a stale
-socket of the expected type and ownership permits replacing it. Root does
-not accept or parse requests. The listener replaces stdin through the
-existing service credential helper; stdout/stderr become null. After the
-same complete credential and cgroup checks, application-exec serves under
-UID 65539. This is the sole exception to the null-stdin startup handoff.
-
-The human's `/bin/claude` invocation execs `td-authd application-client`
-with literal OS-string arguments. The service-UID by-name path still enters
-td-jail directly. A two-sided greeting orders installation of credential
-receipt: the client's initial ready byte is only synchronization. The client
-requires a root connection creator, then pins the actual UID/GID 65539
-message sender. The server requires UID/GID 1000. Each side retains and
-checks the live sender pidfd and its device/inode on every received fragment.
-Only the server's one-byte terminal reply carries a descriptor; all other
-messages refuse rights. No client-supplied descriptor reaches an application.
-
-The length-prefixed request is at most 40 KiB, with at most 128 literal
-arguments totaling 32 KiB including terminators, a 4096-byte absolute cwd,
-a 64-byte ASCII terminal name and four u16 window dimensions. Each frame
-has one two-second read/write deadline. The server maps cwd beneath
-`/home/NAME/src` or `/var/home/NAME/src` to its existing private idmapped
-`src` grant, rejecting parent traversal; other directories select `/`.
-Both the client preflight and server decode derive NAME from the same
-primary-account reader used by grant creation and jail admission. A caller
-cannot map another account's workspace into this grant by supplying its path.
-The jail independently resolves and validates that directory through its
-ordinary grant policy. No grant or file ownership changes. No other ambient
-environment, executable selection, UID selection or root command is accepted.
-
-The application-UID server opens a fresh PTY and starts exactly
-`/bin/td-jail --internal-application-session SERVER_PID /bin/claude ARG...`
-with three clones of its slave, fixed private HOME/runtime and an empty
-ambient environment. The jail becomes a session leader for terminal stdin,
-then retains its existing fresh-terminal, installed-identity, registration,
-cgroup, namespace and seccomp checks. The listener and all other descriptors
-are closed on child exec or replaced with the slave. The server drops all
-slave copies and transfers the master to the authenticated human client.
-The client accepts only a PTY master character device and relays its terminal
-with a bounded 64 KiB input queue, initial/window-change propagation and raw
-input, restoring the outer mode when it returns. Interactive control bytes
-reach the new terminal's line discipline. Redirected EOF sends Ctrl-D;
-this is terminal behavior, not pipe half-close or separate stderr semantics.
-External fatal signals can bypass raw-mode restoration.
-
-One unprivileged server permits at most 16 workers, including pending
-handshakes. The accept loop sleeps in the kernel when idle and retries
-aborted connections or transient resource exhaustion without ending active
-sessions. Threads start only after the credential and cgroup checks.
-Each worker performs one bounded admission and then owns its child and
-polls completion and client liveness independently. A stalled handshake
-cannot delay another invocation's exit status. Each spawning worker stays
-alive through its child's kill/reap: Linux parent-death notification follows
-that parent thread. Malformed or disconnected clients cannot terminate
-other sessions. Client disconnection kills and
-reaps its child. Server death triggers the jail's existing parent-death and
-namespace cleanup path. Completed children return their exit code, or
-128 plus signal, to the client after terminal output drains. No persistent
-root request loop, authorization prompt or privilege acquisition is added.
-The unit's `application-probe` exercises the authenticated greeting and a
-bounded ping without starting Claude. The boot oracle additionally runs
-human-UID `claude --version` while retaining the private-UID terminal-grant
-refusal and Firefox identity checks.
-
 ## Application filesystem grants
 
-Root startup prepares three writable idmapped views: Firefox and mail
-share human Downloads, and Claude receives human src, resolved through the
-same primary-account reader as portal preparation and jail admission,
-each below the assigned
+Root startup prepares two writable idmapped views: Firefox and mail
+share human Downloads, resolved through the same primary-account reader as
+portal preparation and jail admission, each below the assigned
 application's private home. `prepare-application-files APP` and the matching
-shutdown operation accept only those three installed names. Active-account and
+shutdown operation accept only those two installed names. Active-account and
 durable-ledger admission select the UID; no caller supplies a path or map.
 The existing root namespace helper maps filesystem human UID/GID 1000 to
 that application identity. Mount attributes require nosuid, nodev and noexec;
@@ -1001,14 +931,13 @@ readiness remain human-only, and the private portal channel remains UID 991.
 Mail and news fetch daemons use their own service accounts and mode-0700
 runtime directories. Credential-bearing fetch requests therefore remain
 inside the application's UID domain. The human fetch service is separate.
-The fixed root Claude boot oracle uses its service account directly to
-capture the no-terminal refusal and real PTY child-exit proof; production
-application units use the typed root launcher with null application stdio.
+Production application units use the typed root launcher with null
+application stdio.
 Bus evidence connects as the human observer and independently checks the
 subject application UID against the immutable policy. An unjailed service
 UID retains launcher filtering and is not an unrestricted bus observer.
 
-The grant preparer may create the two declared missing human directories,
+The grant preparer may create the declared missing human directory,
 initially root-owned mode 0700 and then transferred to the human UID/GID.
 A pinned empty root-owned directory with only owner permissions is the
 restartable creation intermediate; nonempty or nonprivate remnants refuse.

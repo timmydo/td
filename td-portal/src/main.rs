@@ -3875,7 +3875,7 @@ mod tests {
     pub(super) fn service_state() -> ServiceState {
         ServiceState {
             application_policy: Some(app_policy::Policy::parse(
-                "td-bus-applications-v1\t1000\n65539\tclaude\t\n65536\tfirefox\torg.mozilla.firefox\n65537\tmail\t\n65538\tnews\t\n"
+                "td-bus-applications-v1\t1000\n65536\tfirefox\torg.mozilla.firefox\n65537\tmail\t\n65538\tnews\t\n"
             ).unwrap()),
             ..ServiceState::default()
         }

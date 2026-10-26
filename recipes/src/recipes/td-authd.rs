@@ -155,22 +155,6 @@ const SOURCES: &[(&str, &str)] = &[
         include_str!("../../../td-authd/src/application_files.rs"),
     ),
     (
-        "src/application_shell.rs",
-        include_str!("../../../td-authd/src/application_shell.rs"),
-    ),
-    (
-        "src/shell_channel.rs",
-        include_str!("../../../td-authd/src/shell_channel.rs"),
-    ),
-    (
-        "src/terminal.rs",
-        include_str!("../../../td-authd/src/terminal.rs"),
-    ),
-    (
-        "src/terminal_sys.rs",
-        include_str!("../../../td-authd/src/terminal_sys.rs"),
-    ),
-    (
         "src/application.rs",
         include_str!("../../../td-authd/src/application.rs"),
     ),

@@ -668,7 +668,6 @@ mod tests {
         assert!(pins
             .iter()
             .any(|pin| pin.key == "jetbrains-mono-nerd-font-source"));
-        assert!(pins.iter().all(|pin| pin.key != "claude-code-source"));
         for key in [
             "rust-rustc-dist",
             "rust-std-dist",

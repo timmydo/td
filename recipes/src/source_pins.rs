@@ -430,10 +430,9 @@ mod tests {
         // closure) + the first reviewed
         // foreign application seed, upstream ripgrep 15.2.0, LibreSSL 4.3.2,
         // curl 8.21.0 (the static HTTPS foundation for Git), Git 2.55.0,
-        // curl's dated Mozilla CA extract, OpenSSH Portable 10.5p1, and
-        // the second reviewed foreign application seed, the Claude Code
-        // 2.1.260 native release. The terminal applications are td's own
-        // trees (APPLICATIONS.md §W.8) and pin nothing here.
+        // curl's dated Mozilla CA extract and OpenSSH Portable 10.5p1. The
+        // td-ui applications are td's own trees (APPLICATIONS.md §W.8) and
+        // pin nothing here.
         // IANA timezone data 2026d adds one source-data pin, and the Nerd
         // Fonts v3.5.1 JetBrains Mono release ten pinned upstream data pins:
         // the archive and nine licence notices. cryptsetup 2.8.8 with json-c

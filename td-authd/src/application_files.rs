@@ -11,7 +11,6 @@ use std::process::{Command, Stdio};
 enum Grant {
     FirefoxDownloads,
     MailDownloads,
-    Workspace,
 }
 
 impl Grant {
@@ -19,8 +18,7 @@ impl Grant {
         match arguments {
             [name] if name == "firefox" => Ok(Self::FirefoxDownloads),
             [name] if name == "mail" => Ok(Self::MailDownloads),
-            [name] if name == "claude" => Ok(Self::Workspace),
-            _ => Err("application files require exactly firefox, mail or claude".into()),
+            _ => Err("application files require exactly firefox or mail".into()),
         }
     }
 
@@ -28,14 +26,12 @@ impl Grant {
         match self {
             Self::FirefoxDownloads => "firefox",
             Self::MailDownloads => "mail",
-            Self::Workspace => "claude",
         }
     }
 
     fn component(self) -> &'static str {
         match self {
             Self::FirefoxDownloads | Self::MailDownloads => "Downloads",
-            Self::Workspace => "src",
         }
     }
 
@@ -209,13 +205,14 @@ mod tests {
         assert!(result.is_ok());
     }
     #[test]
-    fn grants_accept_only_the_three_fixed_installed_names() {
-        for name in ["firefox", "mail", "claude"] {
+    fn grants_accept_only_the_two_fixed_installed_names() {
+        for name in ["firefox", "mail"] {
             assert!(super::Grant::parse(&[name.into()]).is_ok());
         }
         for arguments in [
             vec![],
             vec!["news".into()],
+            vec!["claude".into()],
             vec!["../firefox".into()],
             vec!["firefox".into(), "/tmp".into()],
         ] {

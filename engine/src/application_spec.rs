@@ -44,29 +44,15 @@ impl DynamicApplicationPolicy {
 /// The closed table of reviewed `(application, runtime)` loader policies.
 /// Enumerable so a test can hold td-jail's own copy of the loader-path
 /// answer to it: td-jail is a standalone crate and cannot read this table.
-pub const DYNAMIC_APPLICATION_POLICIES: &[(&str, &str, DynamicApplicationPolicy)] = &[
-    (
-        "firefox",
-        "freedesktop-platform-25-08",
-        DynamicApplicationPolicy {
-            library_paths: FIREFOX_LIBRARY_PATHS,
-            optional_targets: FIREFOX_OPTIONAL_TARGETS,
-            optional_links: FIREFOX_OPTIONAL_LINKS,
-        },
-    ),
-    // One glibc-dynamic ELF whose every needed library is the runtime's: no
-    // package library root, no omitted extension links, and so no loader
-    // variable in its spec.
-    (
-        "claude",
-        "freedesktop-platform-25-08",
-        DynamicApplicationPolicy {
-            library_paths: &[],
-            optional_targets: &[],
-            optional_links: 0,
-        },
-    ),
-];
+pub const DYNAMIC_APPLICATION_POLICIES: &[(&str, &str, DynamicApplicationPolicy)] = &[(
+    "firefox",
+    "freedesktop-platform-25-08",
+    DynamicApplicationPolicy {
+        library_paths: FIREFOX_LIBRARY_PATHS,
+        optional_targets: FIREFOX_OPTIONAL_TARGETS,
+        optional_links: FIREFOX_OPTIONAL_LINKS,
+    },
+)];
 
 pub fn dynamic_application_policy(name: &str, runtime: &str) -> Option<DynamicApplicationPolicy> {
     DYNAMIC_APPLICATION_POLICIES
@@ -914,44 +900,37 @@ mod tests {
         let other = text.replace("x86_64/25.08", "x86_64/24.08");
         assert!(ApplicationSpec::parse(&other).is_err());
 
-        let claude = flathub_source("claude").unwrap();
-        let manifest = ApplicationDeclaration::new("freedesktop-platform-25-08", claude.entry)
-            .unwrap()
-            .manifest("claude", "2.1.0", ApplicationProvenance::Foreign)
-            .unwrap();
-        let spec =
-            ApplicationSpec::compile(&manifest, claude.runtime, PermissionPolicy::new()).unwrap();
-        assert_eq!(spec.source(), claude.application);
-        assert_eq!(ApplicationSpec::parse(&spec.to_keyfile()).unwrap(), spec);
+        let firefox = flathub_source("firefox").unwrap();
         // Only the declared runtime's policy may run on its ref.
-        let manifest = ApplicationDeclaration::new("static-runtime", claude.entry)
+        let manifest = ApplicationDeclaration::new("static-runtime", firefox.entry)
             .unwrap()
-            .manifest("claude", "2.1.0", ApplicationProvenance::Foreign)
+            .manifest("firefox", "1", ApplicationProvenance::Foreign)
             .unwrap();
-        let error = ApplicationSpec::compile(&manifest, claude.runtime, PermissionPolicy::new())
+        let error = ApplicationSpec::compile(&manifest, firefox.runtime, PermissionPolicy::new())
             .unwrap_err();
         assert!(error.contains("not its Flathub runtime"), "{error}");
         // td-app validates the declared entry, so a ref launches no other.
         let manifest = ApplicationDeclaration::new("freedesktop-platform-25-08", "/app/bin/other")
             .unwrap()
-            .manifest("claude", "2.1.0", ApplicationProvenance::Foreign)
+            .manifest("firefox", "1", ApplicationProvenance::Foreign)
             .unwrap();
-        let error = ApplicationSpec::compile(&manifest, claude.runtime, PermissionPolicy::new())
+        let error = ApplicationSpec::compile(&manifest, firefox.runtime, PermissionPolicy::new())
             .unwrap_err();
         assert!(error.contains("not its Flathub declaration's"), "{error}");
     }
 
-    /// A reviewed policy without a package library root compiles to NO loader
+    /// An application without a package library root compiles to NO loader
     /// variable, which is what td-jail holds every non-Firefox application to;
     /// an empty `LD_LIBRARY_PATH=` would compile and be refused at launch.
     #[test]
     fn a_policy_without_library_roots_carries_no_loader_path() {
-        let manifest = ApplicationDeclaration::new("freedesktop-platform-25-08", "/app/bin/claude")
-            .unwrap()
-            .with_environment("DISABLE_UPDATES", "1")
-            .unwrap()
-            .manifest("claude", "2.1.260", ApplicationProvenance::Foreign)
-            .unwrap();
+        let manifest =
+            ApplicationDeclaration::new("freedesktop-platform-25-08", "/app/bin/fixture")
+                .unwrap()
+                .with_environment("DISABLE_UPDATES", "1")
+                .unwrap()
+                .manifest("fixture", "1", ApplicationProvenance::Foreign)
+                .unwrap();
         let runtime = "/td/store/0123456789abcdfghijklmnpqrsvwxyz-freedesktop-platform-25-08-25.08";
         let spec = ApplicationSpec::compile(&manifest, runtime, PermissionPolicy::new()).unwrap();
         let environment = spec.environment().collect::<BTreeMap<_, _>>();
@@ -1131,10 +1110,6 @@ mod tests {
             assert!(dynamic_application_policy(source.name, source.policy_runtime).is_some());
         }
         assert_eq!(flathub_source("firefox").unwrap().entry, "/app/bin/firefox");
-        assert_eq!(
-            flathub_source("claude").unwrap().application,
-            Some(crate::flathub_app::CLAUDE_RELEASE_REF)
-        );
         assert!(flathub_source("mail").is_none());
     }
 }

@@ -24,12 +24,12 @@ use crate::shared::{
     SYSTEM_NET_UP_MARKER, SYSTEM_PERSIST_READ_MARKER, SYSTEM_PERSIST_WRITE_MARKER,
     SYSTEM_ROOT_RO_MARKER, SYSTEM_SHUTDOWN_MARKER, SYSTEM_STATE_OWNER_MARKER,
     SYSTEM_STATE_WRITABLE_MARKER, TD_APPLICATIONS_PLACED_MARKER, TD_BUSD_RUNTIME_MARKER,
-    TD_CLAUDE_TERMINAL_MARKER, TD_FETCH_BOOT_MARKER, TD_FIREFOX_BOOT_MARKER,
-    TD_FIREFOX_CONTENT_MARKER, TD_FIREFOX_INPUT_FAILED_MARKER, TD_FIREFOX_SECCOMP_AUDIT_MARKER,
-    TD_FIREFOX_SOAK_MARKER, TD_FIREFOX_SUPPORT_MARKER, TD_INIT_RUNTIME_MARKER,
-    TD_JAIL_KILL_REAPS_MARKER, TD_JAIL_SECCOMP_PROBE_MARKER, TD_JAIL_TRANSITION_MARKER,
-    TD_LOGIN_RUNTIME_MARKER, TD_MAIL_BOOT_MARKER, TD_MAIL_ENTRY, TD_MAIL_NAME, TD_NEWS_BOOT_MARKER,
-    TD_NEWS_ENTRY, TD_NEWS_NAME, TD_PORTAL_REQUEST_RUNTIME_MARKER, TD_PORTAL_RUNTIME_MARKER,
+    TD_FETCH_BOOT_MARKER, TD_FIREFOX_BOOT_MARKER, TD_FIREFOX_CONTENT_MARKER,
+    TD_FIREFOX_INPUT_FAILED_MARKER, TD_FIREFOX_SECCOMP_AUDIT_MARKER, TD_FIREFOX_SOAK_MARKER,
+    TD_FIREFOX_SUPPORT_MARKER, TD_INIT_RUNTIME_MARKER, TD_JAIL_KILL_REAPS_MARKER,
+    TD_JAIL_SECCOMP_PROBE_MARKER, TD_JAIL_TRANSITION_MARKER, TD_LOGIN_RUNTIME_MARKER,
+    TD_MAIL_BOOT_MARKER, TD_MAIL_ENTRY, TD_MAIL_NAME, TD_NEWS_BOOT_MARKER, TD_NEWS_ENTRY,
+    TD_NEWS_NAME, TD_PORTAL_REQUEST_RUNTIME_MARKER, TD_PORTAL_RUNTIME_MARKER,
     TD_PORTAL_UNAVAILABLE_RUNTIME_MARKER, TD_SANDBOX_KERNEL_MARKER, TD_SETUP_LIVE_MARKER,
     TD_TXT_RUNTIME_MARKER, TD_UTIL_RUNTIME_MARKER, UUTILS_RUNTIME_MARKER,
 };
@@ -374,31 +374,8 @@ const FIREFOX_ORACLES_WAIT_ITERATIONS: u16 = FIREFOX_INPUT_PRE_SOAK_WAIT_ITERATI
     + FIREFOX_SOAK_TIMEOUT_SECS
     + FIREFOX_SOAK_BRACKET_MARGIN_SECS
     + FIREFOX_SECCOMP_AUDIT_WAIT_ITERATIONS;
-const CLAUDE_NAME: &str = "claude";
-const CLAUDE_COMPLETION_PATH: &str = "/run/td-claude-evidence-complete";
-const CLAUDE_COMPLETION_TMP_PATH: &str = "/run/.td-claude-evidence-complete.tmp";
-const CLAUDE_COMPLETION: &str = "td-claude-evidence-v1";
-// Where a failed launch's captured output goes: a file, never the console,
-// since the payload's bytes are its own and a marker among them would be an
-// exact line to the host oracle.
-const CLAUDE_ERROR_PATH: &str = "/run/td-claude-evidence.err";
-// td-jail's whole answer to a launch with a pipe on its stdout: stage 1's
-// stdio test, reached only once TERM let the terminal grant resolve, and
-// the one line the by-name launcher passes through unchanged.
-const CLAUDE_REFUSED_LINE: &str =
-    "td-jail: terminal grant: launcher stdout: not a character device";
-// The terminal oracle starts once every Firefox oracle has published, so no
-// second window shares a frame the compositor probes measure; it polls for
-// that itself, since `after=` releases it when the soak unit starts.
-const CLAUDE_PRE_RUN_WAIT_ITERATIONS: u16 = FIREFOX_ORACLES_WAIT_ITERATIONS;
-// The greeter's allowance past the Firefox horizon for two launches, each a
-// td-jail stage 1 and a payload start under emulation, the second under a
-// td-term of its own, bracketed by four bounded identity probes; Firefox's
-// one ready attempt gets this long. The launches carry no deadline of their
-// own, so a hung payload reds the boot at the greeter's cap, not sooner.
-const CLAUDE_EVIDENCE_BUDGET_SECS: u16 = 180;
-const APPLICATION_GREETER_WAIT_ITERATIONS: u16 =
-    CLAUDE_PRE_RUN_WAIT_ITERATIONS + CLAUDE_EVIDENCE_BUDGET_SECS;
+// The greeter's allowance: every application oracle is Firefox's.
+const APPLICATION_GREETER_WAIT_ITERATIONS: u16 = FIREFOX_ORACLES_WAIT_ITERATIONS;
 
 /// Seconds a terminal application's window must stay up after td-term
 /// reported it ready before the evidence unit reads its jail instance: long
@@ -438,19 +415,6 @@ const SHIPPED_APPLICATIONS: &[ShippedApplication] = &[
         external_uid: 65538,
         runtime: "static-runtime",
         runtime_recipe: Some(super::static_runtime::recipe),
-    },
-    // Claude Code: a marked foreign payload on the Flathub freedesktop
-    // runtime its account fetches, run as a terminal application with no bus
-    // name — the foreign-payload terminal program, beside Firefox's foreign
-    // non-terminal one and the source-built td-ui window applications mail
-    // and news.
-    ShippedApplication {
-        name: CLAUDE_NAME,
-        package: CLAUDE_NAME,
-        package_recipe: super::claude::recipe,
-        external_uid: 65539,
-        runtime: "freedesktop-platform-25-08",
-        runtime_recipe: None,
     },
 ];
 
@@ -1390,9 +1354,6 @@ const TD_SVC_UNITS: &[&str] = &[
     "news-fetch",
     "firefox-files",
     "mail-files",
-    "claude-files",
-    "claude-fetch",
-    "claude-launch",
     "fetch-evidence",
     "portal-files",
     "firefox-handoff",
@@ -1420,7 +1381,6 @@ const TD_SVC_UNITS: &[&str] = &[
     "terminal-authority-evidence",
     "firefox-input",
     "firefox-soak",
-    "claude-evidence",
     "bootsuccess",
     "bootfail",
     "sshd",
@@ -1743,36 +1703,6 @@ fn build_td_svc_conf() -> String {
          after=td-firstboot,firefox-files\n\
          requires=td-firstboot\n\
          timeout=30\n\
-         \n\
-         [claude-files]\n\
-         type=oneshot\n\
-         exec=/bin/td-authd prepare-application-files claude\n\
-         after=td-firstboot\n\
-         requires=td-firstboot\n\
-         timeout=30\n\
-         \n\
-         # Claude Code and its runtime, fetched before the evidence below launches\n\
-         # it, as Firefox's is.\n\
-         [claude-fetch]\n\
-         type=oneshot\n\
-         cgroup=session\n\
-         unless-exists={applications_on_demand}\n\
-         exec=/bin/td-login exec-service-as tda65539 -- /bin/td-app update {claude_name}\n\
-         after=td-firstboot,netup\n\
-         requires=td-firstboot\n\
-         timeout={application_fetch}\n\
-         log=/var/log/svc/claude-fetch.log\n\
-         console=yes\n\
-         \n\
-         [claude-launch]\n\
-         type=daemon\n\
-         cgroup=session\n\
-         exec=/bin/td-authd application-start {ui_uid} {claude_name} shell --\n\
-         after=claude-files,busd\n\
-         requires=td-firstboot,claude-files,busd\n\
-         ready=/bin/td-login exec-primary -- /bin/td-authd application-probe\n\
-         ready-timeout=30\n\
-         restart=on-failure\n\
          \n\
          # Boot evidence under the autotest token only: the probe, as the UI\n\
          # user, asks the service for a loopback URL and gets the policy's exact\n\
@@ -2171,31 +2101,6 @@ fn build_td_svc_conf() -> String {
          after=firefox-input\n\
          restart=never\n\
          \n\
-         # Claude Code is a foreign-payload terminal program, and this is\n\
-         # its boot oracle. It runs once every Firefox oracle has published,\n\
-         # so no second window shares a frame those measure, and launches\n\
-         # twice as its application user: once with no terminal of its own, which the\n\
-         # fresh-terminal grant must refuse before anything runs, and once\n\
-         # inside a pseudo-terminal from td-term --command, which runs the\n\
-         # payload's own --version to exit status 0. td-term reports its\n\
-         # child's status on one line of its own, matched whole wherever it\n\
-         # lies in the capture, since td-term's ready diagnostic has followed\n\
-         # it there; td-jail's status is 0 or 1, so a failed terminal\n\
-         # acquisition, broker registration, jail or payload is a failed\n\
-         # launch. Firefox's process token and bus identity are read before\n\
-         # and after, so the launches ran beside the same live instance. A\n\
-         # failed launch's captured output goes to a file, never the console,\n\
-         # and trusted unit code prints only fixed lines, the marker among\n\
-         # them, before publishing the atomic completion the greeter waits\n\
-         # for.\n\
-         [claude-evidence]\n\
-         type=daemon\n\
-         unless-exists={live_medium}\n\
-         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) :;; *) exit 0;; esac; n=0; while [ \"$n\" -lt {claude_pre_run_wait} ]; do firefox=$(/bin/td-util cat {firefox_completion_path} 2>/dev/null); if [ \"$firefox\" = {firefox_completion} ]; then case \" $(/bin/cat /proc/cmdline) \" in *\" {firefox_input_cmdline_token} \"*) input=$(/bin/td-util cat {firefox_input_completion_path} 2>/dev/null); [ \"$input\" = {firefox_input_final_completion} ] && break;; *) break;; esac; fi; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {claude_pre_run_wait} ] || exit 1; /bin/rm -f {claude_error_path} {claude_completion_tmp_path} || exit 1; process_before=$(/bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-process-token {firefox_name} --marionette) || exit 1; bus_before=$(/bin/td-login exec-primary -- /bin/td-busd application {bus_socket} {firefox_name}) || exit 1; if refused=$(/bin/td-login exec-service-as tda65539 -- /bin/env TERM=td-term /bin/{claude_name} --version 2>&1 </dev/null); then /bin/echo \"td-claude-evidence: a launch with no terminal of its own ran\"; exit 1; fi; if [ \"$refused\" = \"{claude_refused_line}\" ]; then :; else /bin/td-util printf \"%s\\n\" \"$refused\" > {claude_error_path}; /bin/echo \"td-claude-evidence: the launch with no terminal was refused for another reason, kept in {claude_error_path}\"; exit 1; fi; ran=$(/bin/td-login exec-service-as tda65539 -- /bin/td-term run --socket {wayland_socket} --ready-socket /run/user/65539/td-claude-evidence-ready --command /bin/{claude_name} --version 2>&1 </dev/null); if /bin/td-util printf \"%s\\n\" \"$ran\" | /bin/rg --quiet --line-regexp \"td-term: the terminal.s child exited with status 0\"; then :; else /bin/td-util printf \"%s\\n\" \"$ran\" > {claude_error_path}; /bin/echo \"td-claude-evidence: the launch inside a terminal did not report its child at status 0, kept in {claude_error_path}\"; exit 1; fi; if shell_ran=$(/bin/td-login exec-primary -- /bin/env TERM=td-term /bin/{claude_name} --version 2>&1 </dev/null); then :; else /bin/td-util printf \"%s\\n\" \"$shell_ran\" > {claude_error_path}; /bin/echo \"td-claude-evidence: human shell launch failed, kept in {claude_error_path}\"; exit 1; fi; process_after=$(/bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-process-token {firefox_name} --marionette) || exit 1; [ \"$process_after\" = \"$process_before\" ] || exit 1; bus_after=$(/bin/td-login exec-primary -- /bin/td-busd application {bus_socket} {firefox_name}) || exit 1; [ \"$bus_after\" = \"$bus_before\" ] || exit 1; /bin/echo \"{claude_marker}\" && /bin/td-util printf \"%s\\n\" {claude_completion} > {claude_completion_tmp_path} && /bin/td-util chmod 0644 {claude_completion_tmp_path} && /bin/mv {claude_completion_tmp_path} {claude_completion_path} && exit 0; exit 1'\n\
-         after=firefox-soak,claude-files,claude-launch,claude-fetch\n\
-         requires=td-firstboot,claude-files,claude-launch\n\
-         restart=never\n\
-         \n\
          [bootsuccess]\n\
          type=oneshot\n\
          exec=/etc/bootsuccess\n\
@@ -2351,14 +2256,6 @@ fn build_td_svc_conf() -> String {
         firefox_seccomp_audit_wait = FIREFOX_SECCOMP_AUDIT_WAIT_ITERATIONS,
         seccomp_probe = FIREFOX_SECCOMP_PROBE_PATH,
         bus_socket = SESSION_BUS_SOCKET,
-        claude_name = CLAUDE_NAME,
-        claude_pre_run_wait = CLAUDE_PRE_RUN_WAIT_ITERATIONS,
-        claude_error_path = CLAUDE_ERROR_PATH,
-        claude_refused_line = CLAUDE_REFUSED_LINE,
-        claude_marker = TD_CLAUDE_TERMINAL_MARKER,
-        claude_completion = CLAUDE_COMPLETION,
-        claude_completion_path = CLAUDE_COMPLETION_PATH,
-        claude_completion_tmp_path = CLAUDE_COMPLETION_TMP_PATH,
     )
 }
 
@@ -2623,7 +2520,6 @@ fn build_shutdown() -> String {
          /bin/td-init sync || {{ echo 'td-shutdown: sync failed' >&2; ok=0; }}\n\
          /bin/td-authd release-application-files firefox || {{ echo 'td-shutdown: Firefox file release failed' >&2; ok=0; }}\n\
          /bin/td-authd release-application-files mail || {{ echo 'td-shutdown: Mail file release failed' >&2; ok=0; }}\n\
-         /bin/td-authd release-application-files claude || {{ echo 'td-shutdown: Claude file release failed' >&2; ok=0; }}\n\
          /bin/td-authd release-portal-files || {{ echo 'td-shutdown: portal file release failed' >&2; ok=0; }}\n\
          /bin/td-authd release-portal-handoff || {{ echo 'td-shutdown: portal handoff release failed' >&2; ok=0; }}\n\
          if /bin/td-util test -e {FIREFOX_XDG_MOUNT_MARKER}; then\n\
@@ -3708,13 +3604,11 @@ fn build_profile(sys: &SystemDef) -> String {
          status=$(/bin/td-util cat /run/td-boot-success-ok 2>/dev/null); \
          firefox=$(/bin/td-util cat {firefox_evidence_path} 2>/dev/null); \
          firefox_complete=$(/bin/td-util cat {firefox_completion_path} 2>/dev/null); \
-         claude_complete=$(/bin/td-util cat {claude_completion_path} 2>/dev/null); \
          input_ok=1; if [ \"$input_required\" = 1 ]; then input_ok=0; \
          input=$(/bin/td-util cat {firefox_input_completion_path} 2>/dev/null); \
          [ \"$input\" = {firefox_input_completion} ] && input_ok=1; fi; \
          [ \"$status\" = td-boot-success-v1 ] && [ \"$firefox\" = {firefox_evidence} ] && \
-         [ \"$firefox_complete\" = {firefox_completion} ] && [ \"$input_ok\" = 1 ] && \
-         [ \"$claude_complete\" = {claude_completion} ] && break; \
+         [ \"$firefox_complete\" = {firefox_completion} ] && [ \"$input_ok\" = 1 ] && break; \
          if [ \"$status\" = td-boot-success-v1 ]; then \
          firefox_wait=$((firefox_wait+1)); \
          [ \"$firefox_wait\" -ge {firefox_greeter_wait} ] && break; fi; \
@@ -3729,8 +3623,6 @@ fn build_profile(sys: &SystemDef) -> String {
         firefox_input_completion = FIREFOX_INPUT_COMPLETION,
         firefox_input_completion_path = FIREFOX_INPUT_COMPLETION_PATH,
         firefox_greeter_wait = APPLICATION_GREETER_WAIT_ITERATIONS,
-        claude_completion = CLAUDE_COMPLETION,
-        claude_completion_path = CLAUDE_COMPLETION_PATH,
     ));
     s
 }
@@ -4032,27 +3924,6 @@ fn application_names(sys: &SystemDef) -> Vec<&'static str> {
     sys.applications
         .iter()
         .map(|application| application.name)
-        .collect()
-}
-
-/// The applications with a `/bin/NAME` link to td-jail. An application is
-/// started only by td-authd's supervised launch, which execs /bin/td-jail
-/// with its name as argv[0]; a /bin name a shell could run would only reach
-/// td-jail's refusal. Claude alone keeps one: td-jail sends the human's
-/// invocation to Claude's own shell server (APPLICATIONS.md §A.0).
-fn application_bin_links(sys: &SystemDef) -> Vec<&'static str> {
-    application_names(sys)
-        .into_iter()
-        .filter(|name| *name == CLAUDE_NAME)
-        .collect()
-}
-
-/// The applications that must have no `/bin` entry at all.
-fn unlinked_application_names(sys: &SystemDef) -> Vec<&'static str> {
-    let links = application_bin_links(sys);
-    application_names(sys)
-        .into_iter()
-        .filter(|name| !links.contains(name))
         .collect()
 }
 
@@ -4915,12 +4786,10 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
             link: format!("{{root}}/real-root/bin/{name}"),
         });
     }
-    for name in application_bin_links(sys) {
-        steps.push(Step::Symlink {
-            target: "/bin/td-jail".into(),
-            link: format!("{{root}}/real-root/bin/{name}"),
-        });
-    }
+    // No application has a /bin name: td-authd's supervised launch execs
+    // /bin/td-jail with the application's name as argv[0], and a name a
+    // shell could run would only reach td-jail's refusal (APPLICATIONS.md
+    // §A.0).
     // /init is PID 1 on the real root, and it is td-init. switch_root execs it under the
     // OPERAND's name (`/init`), so argv[0]'s basename is `init` and the multicall dispatches
     // to the init applet exactly as a /bin/<applet> symlink would — the symlink's TARGET
@@ -5403,10 +5272,7 @@ fn shape_check() -> String {
      tdfetchd=\"{root}/real-root{in:td-net}/bin/td-net\"; { [ -f \"$tdfetchd\" ] && [ -x \"$tdfetchd\" ]; } || { echo 'root tree: td-net is not packed/executable at real-root{in:td-net}/bin/td-net - the /bin/td-fetchd symlink would dangle and the fetchd unit would exec nothing' >&2; exit 1; }; \
      [ \"$(readlink \"$root/bin/td-portal\" 2>/dev/null)\" = \"{in:td-portal}/bin/td-portal\" ] || { echo 'root tree: /bin/td-portal is not a symlink to the staged Settings portal' >&2; exit 1; }; \
      tdportal=\"{root}/real-root{in:td-portal}/bin/td-portal\"; { [ -f \"$tdportal\" ] && [ -x \"$tdportal\" ]; } || { echo 'root tree: td-portal is not packed/executable at real-root{in:td-portal}/bin/td-portal - the portal supervisor, child, and live probe would all fail' >&2; exit 1; }; \
-     for a in @APPLICATION_LINKS@; do \
-         [ \"$(readlink \"$root/bin/$a\" 2>/dev/null)\" = /bin/td-jail ] || { echo \"root tree: /bin/$a is not an application launcher pointing to /bin/td-jail - another packed /bin provider replaced it\" >&2; exit 1; }; \
-     done; \
-     for a in @UNLINKED_APPLICATIONS@; do \
+     for a in @APPLICATIONS@; do \
          if [ -e \"$root/bin/$a\" ] || [ -L \"$root/bin/$a\" ]; then echo \"root tree: /bin/$a is packed, but td-authd starts $a by argv[0] and a shell launch would only be refused\" >&2; exit 1; fi; \
      done; \
      [ -f \"@TERMINFO_ENTRY@\" ] || { echo 'root tree: the td-term terminfo entry is not packed, so /etc/terminfo resolves to a tree without it' >&2; exit 1; }; \
@@ -5499,14 +5365,7 @@ fn shape_check() -> String {
         .replace("@TD_SH_APPLETS@", &TD_SH_APPLETS.join(" "))
         .replace("@TD_INIT_APPLETS@", &td_init_applets().join(" "))
         .replace("@TD_LOGIN_APPLETS@", &TD_LOGIN_APPLETS.join(" "))
-        .replace(
-            "@APPLICATION_LINKS@",
-            &application_bin_links(&SYSTEM).join(" "),
-        )
-        .replace(
-            "@UNLINKED_APPLICATIONS@",
-            &unlinked_application_names(&SYSTEM).join(" "),
-        )
+        .replace("@APPLICATIONS@", &application_names(&SYSTEM).join(" "))
         .replace("@TD_SVC_UNITS@", &TD_SVC_UNITS.join(" "))
         .replace("@TD_SVC_CONF@", TD_SVC_CONF)
         .replace("@TERMINFO_ENTRY@", TERMINFO_ENTRY)
@@ -6479,7 +6338,6 @@ mod tests {
             Step::WriteFile { path, content, exec: false }
                 if path == "{root}/real-root/etc/td-profiler-application-roots.tsv"
                     && content == "td-profiler-application-roots-v1\n\
-        claude\tclaude-latest\tforeign\truntime/org.freedesktop.Platform/x86_64/25.08\tforeign\n\
         firefox\tfirefox-stable\tforeign\truntime/org.freedesktop.Platform/x86_64/25.08\tforeign\n\
         mail\tmail-0.1\tsource\tstatic-runtime-1\tsource\n\
         news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
@@ -6964,12 +6822,8 @@ mod tests {
                 + FIREFOX_SECCOMP_AUDIT_WAIT_ITERATIONS
         );
         assert_eq!(
-            CLAUDE_PRE_RUN_WAIT_ITERATIONS,
-            FIREFOX_ORACLES_WAIT_ITERATIONS
-        );
-        assert_eq!(
             APPLICATION_GREETER_WAIT_ITERATIONS,
-            CLAUDE_PRE_RUN_WAIT_ITERATIONS + CLAUDE_EVIDENCE_BUDGET_SECS
+            FIREFOX_ORACLES_WAIT_ITERATIONS
         );
         assert_eq!(
             FIREFOX_INPUT_EVIDENCE_WAIT_ITERATIONS,
@@ -7627,7 +7481,6 @@ mod tests {
         for (app, variant, location, consumer) in [
             ("firefox", "FirefoxDownloads", "xdg-download", "firefox"),
             ("mail", "MailDownloads", "xdg-download", "mail"),
-            ("claude", "Workspace", "~/src", "claude-evidence"),
         ] {
             let recipe = crate::catalog::lookup(app).unwrap();
             let permissions = recipe.application_permissions.as_ref().unwrap();
@@ -7652,9 +7505,8 @@ mod tests {
                 .any(|unit| unit == format!("{app}-files")));
             assert!(shutdown.contains(&format!("/bin/td-authd release-application-files {app} ||")));
         }
-        assert_eq!(helper.matches("=> Ok(Self::").count(), 3);
+        assert_eq!(helper.matches("=> Ok(Self::").count(), 2);
         assert!(helper.contains("Self::FirefoxDownloads | Self::MailDownloads => \"Downloads\""));
-        assert!(helper.contains("Self::Workspace => \"src\""));
         let projection = jail
             .split("let component = match ")
             .nth(1)
@@ -7663,8 +7515,7 @@ mod tests {
             .next()
             .unwrap();
         assert!(projection.contains("Some(\"firefox\" | \"mail\") => \"Downloads\""));
-        assert!(projection.contains("Some(\"claude\") => \"src\""));
-        assert_eq!(projection.matches("Some(").count(), 2);
+        assert_eq!(projection.matches("Some(").count(), 1);
         assert!(unit_after("mail-files").contains(&"firefox-files".to_string()));
     }
 
@@ -8324,10 +8175,7 @@ mod tests {
                     // creates this path on a live boot too.
                     [path]
                         if path.as_str() == APPLICATIONS_ON_DEMAND
-                            && matches!(
-                                name.as_str(),
-                                "firefox" | "firefox-fetch" | "claude-fetch"
-                            ) =>
+                            && matches!(name.as_str(), "firefox" | "firefox-fetch") =>
                     {
                         Some(name)
                     }
@@ -8342,8 +8190,6 @@ mod tests {
         skipped.sort();
         let mut expected = vec![
             "applications-workspace",
-            "claude-evidence",
-            "claude-fetch",
             "firefox",
             "firefox-fetch",
             "firefox-evidence",
@@ -8606,8 +8452,6 @@ mod tests {
             ("news-fetch", vec!["td-firstboot", "netup"]),
             ("firefox-files", vec!["td-firstboot"]),
             ("mail-files", vec!["td-firstboot", "firefox-files"]),
-            ("claude-files", vec!["td-firstboot"]),
-            ("claude-launch", vec!["claude-files", "busd"]),
             ("fetch-evidence", vec!["fetchd", "firefox-tls-setup"]),
             ("portal-files", vec!["td-firstboot"]),
             ("firefox-handoff", vec!["td-firstboot"]),
@@ -8654,7 +8498,6 @@ mod tests {
                 ],
             ),
             ("firefox-fetch", vec!["td-firstboot", "netup"]),
-            ("claude-fetch", vec!["td-firstboot", "netup"]),
             ("firefox-evidence", vec!["firefox", "netup"]),
             (
                 "terminal-authority-evidence",
@@ -8662,15 +8505,6 @@ mod tests {
             ),
             ("firefox-input", vec!["terminal-authority-evidence"]),
             ("firefox-soak", vec!["firefox-input"]),
-            (
-                "claude-evidence",
-                vec![
-                    "firefox-soak",
-                    "claude-files",
-                    "claude-launch",
-                    "claude-fetch",
-                ],
-            ),
             (
                 "bootsuccess",
                 sysinit
@@ -8710,10 +8544,10 @@ mod tests {
     /// remains is that no boot oracle drives two applications' traffic on one
     /// live bus: the entry that lifts this count brings that oracle. The
     /// other applications ship with no bus policy at all: mail and news are
-    /// static td-owned programs, Claude is a foreign payload, none with a
-    /// D-Bus client, which the broker would admit as a peer that sees and
-    /// addresses only the portal and itself, and the two surfaces it could
-    /// once reach are now the closed gaps §D names.
+    /// static td-owned programs with no D-Bus client, which the broker would
+    /// admit as a peer that sees and addresses only the portal and itself,
+    /// and the two surfaces it could once reach are now the closed gaps §D
+    /// names.
     ///
     /// Which is NOT what this counts, and the gap is stated here rather than
     /// left for a reader to assume away. A package count does not bound peers:
@@ -8749,10 +8583,7 @@ mod tests {
         // Every other shipped application holds no bus name; the broker
         // would admit it as a peer that sees and addresses only the portal
         // and itself. mail and news are td-owned source builds on the
-        // data-only static runtime, each in a td-ui window of its own;
-        // Claude is the reviewed foreign payload on Firefox's
-        // runtime, the first foreign-payload terminal application, so the
-        // runtime is one of those two reviewed families.
+        // data-only static runtime, each in a td-ui window of its own.
         for application in SHIPPED_APPLICATIONS
             .iter()
             .filter(|application| application.name != FIREFOX_NAME)
@@ -8764,19 +8595,15 @@ mod tests {
                 .expect("a shipped application declares its permissions");
             assert_eq!(permissions.session_bus().count(), 0, "{}", application.name);
             // mail and news draw in td-ui windows of their own and hold no
-            // terminal; Claude is the one terminal application.
-            assert_eq!(
-                permissions.terminal(),
-                application.name == CLAUDE_NAME,
+            // terminal.
+            assert!(
+                !permissions.terminal(),
                 "{} terminal grant",
                 application.name
             );
-            let foreign_terminal = application.name == CLAUDE_NAME
-                && application.runtime == "freedesktop-platform-25-08";
-            assert!(
-                application.runtime == "static-runtime" || foreign_terminal,
-                "{} is neither a source-built static-runtime app nor the \
-                 reviewed foreign-payload terminal app Claude",
+            assert_eq!(
+                application.runtime, "static-runtime",
+                "{} is not a source-built static-runtime app",
                 application.name
             );
         }
@@ -8789,7 +8616,7 @@ mod tests {
     fn every_shipped_application_has_a_boot_oracle_unit() {
         assert_eq!(
             SHIPPED_APPLICATIONS.len(),
-            4,
+            3,
             "the roster changed: another application brings its own boot \
              oracle unit, named below, and APPLICATIONS.md §D says what a \
              package count cannot cover"
@@ -8803,8 +8630,8 @@ mod tests {
             );
             // The unit is a real td-svc entry that runs once per boot: the
             // source-built mail/news oracles are oneshots that require their
-            // app, the foreign firefox/claude oracles are daemons that never
-            // restart. Either way it is a defined unit, not just a name.
+            // app, the foreign Firefox oracle is a daemon that never
+            // restarts. Either way it is a defined unit, not just a name.
             assert!(
                 matches!(
                     unit_key(&unit, "type").as_deref(),
@@ -8813,108 +8640,6 @@ mod tests {
                 "{unit} is not a defined oracle unit"
             );
         }
-    }
-
-    /// Claude Code's boot oracle: gated on the autotest token,
-    /// run after every Firefox oracle has published, a launch with no
-    /// terminal refused by the grant's stdio test before a launch inside
-    /// td-term's is proved by the child's status, both bracketed by
-    /// Firefox's process token and bus identity, the payload's captured
-    /// bytes kept off the console, and the marker and completion only after
-    /// all of it, in that order.
-    #[test]
-    fn claude_evidence_refuses_without_a_terminal_and_runs_inside_one() {
-        let exec = unit_key("claude-evidence", "exec").unwrap_or_default();
-        assert_eq!(
-            unit_after("claude-evidence"),
-            vec![
-                "firefox-soak",
-                "claude-files",
-                "claude-launch",
-                "claude-fetch"
-            ]
-        );
-        assert_eq!(
-            unit_key("claude-evidence", "requires").as_deref(),
-            Some("td-firstboot,claude-files,claude-launch")
-        );
-        assert!(unit_key("claude-evidence", "timeout").is_none());
-        for needle in [
-            format!("*\" {AUTOTEST_CMDLINE_TOKEN} \"*) :;; *) exit 0;; esac"),
-            format!("while [ \"$n\" -lt {CLAUDE_PRE_RUN_WAIT_ITERATIONS} ]"),
-            format!("firefox=$(/bin/td-util cat {FIREFOX_COMPLETION_PATH} 2>/dev/null)"),
-            format!("if [ \"$firefox\" = {FIREFOX_COMPLETION} ]; then"),
-            format!(
-                "*\" {FIREFOX_INPUT_CMDLINE_TOKEN} \"*) input=$(/bin/td-util cat \
-                 {FIREFOX_INPUT_COMPLETION_PATH} 2>/dev/null); [ \"$input\" = \
-                 {FIREFOX_INPUT_COMPLETION} ] && break;; *) break;; esac"
-            ),
-            format!("[ \"$n\" -lt {CLAUDE_PRE_RUN_WAIT_ITERATIONS} ] || exit 1"),
-            format!("/bin/rm -f {CLAUDE_ERROR_PATH} {CLAUDE_COMPLETION_TMP_PATH} || exit 1"),
-            format!(
-                "process_before=$(/bin/td-login exec-service-as tda65536 -- /bin/td-jail \
-                 --probe-process-token {FIREFOX_NAME} --marionette) || exit 1"
-            ),
-            format!(
-                "bus_before=$(/bin/td-login exec-primary -- /bin/td-busd application \
-                 {SESSION_BUS_SOCKET} {FIREFOX_NAME}) || exit 1"
-            ),
-            format!(
-                "if refused=$(/bin/td-login exec-service-as tda65539 -- /bin/env TERM=td-term \
-                 /bin/{CLAUDE_NAME} --version 2>&1 </dev/null); then /bin/echo \
-                 \"td-claude-evidence: a launch with no terminal of its own ran\"; exit 1; fi"
-            ),
-            format!(
-                "if [ \"$refused\" = \"{CLAUDE_REFUSED_LINE}\" ]; then :; else /bin/td-util \
-                 printf \"%s\\n\" \"$refused\" > {CLAUDE_ERROR_PATH};"
-            ),
-            format!(
-                "ran=$(/bin/td-login exec-service-as tda65539 -- /bin/td-term run --socket \
-                 {WAYLAND_SOCKET} --ready-socket /run/user/65539/td-claude-evidence-ready \
-                 --command /bin/{CLAUDE_NAME} --version 2>&1 </dev/null)"
-            ),
-            format!(
-                "if /bin/td-util printf \"%s\\n\" \"$ran\" | /bin/rg --quiet --line-regexp \
-                 \"td-term: the terminal.s child exited with status 0\"; then :; else \
-                 /bin/td-util printf \"%s\\n\" \"$ran\" > {CLAUDE_ERROR_PATH};"
-            ),
-            "[ \"$process_after\" = \"$process_before\" ] || exit 1".to_string(),
-            "[ \"$bus_after\" = \"$bus_before\" ] || exit 1".to_string(),
-            format!("/bin/echo \"{TD_CLAUDE_TERMINAL_MARKER}\""),
-            format!("{CLAUDE_COMPLETION} > {CLAUDE_COMPLETION_TMP_PATH}"),
-            format!("/bin/mv {CLAUDE_COMPLETION_TMP_PATH} {CLAUDE_COMPLETION_PATH} && exit 0"),
-        ] {
-            assert!(
-                exec.contains(needle.as_str()),
-                "claude-evidence lacks {needle:?}"
-            );
-        }
-        // The payload's captured bytes never reach the console: each capture
-        // is read once by the check and once by the write to the file.
-        assert!(!exec.contains("\"$refused\" >&2") && !exec.contains("\"$ran\" >&2"));
-        assert_eq!(exec.matches("\"$refused\"").count(), 2);
-        assert_eq!(exec.matches("\"$ran\"").count(), 2);
-        let before = exec.find("process_before=$(").unwrap();
-        let refused = exec.find("if refused=").unwrap();
-        let ran = exec.find("ran=$(").unwrap();
-        let after = exec.find("process_after=$(").unwrap();
-        let marker = exec.find(TD_CLAUDE_TERMINAL_MARKER).unwrap();
-        let published = exec.find(CLAUDE_COMPLETION).unwrap();
-        assert!(before < refused && refused < ran && ran < after);
-        assert!(after < marker && marker < published);
-        assert_eq!(exec.matches("--command").count(), 1);
-        assert_eq!(exec.matches("--version").count(), 3);
-        assert!(exec.contains("if shell_ran=$(/bin/td-login exec-primary -- /bin/env TERM=td-term /bin/claude --version"));
-        assert_eq!(exec.matches("--probe-process-token").count(), 2);
-        assert_eq!(exec.matches("/bin/td-busd application").count(), 2);
-        // Nothing but this unit publishes the completion, and the greeter
-        // waits for it beside Firefox's.
-        let services = build_td_svc_conf();
-        assert_eq!(services.matches(CLAUDE_COMPLETION_TMP_PATH).count(), 4);
-        let profile = build_profile(&SYSTEM);
-        assert!(profile.contains(&format!(
-            "claude_complete=$(/bin/td-util cat {CLAUDE_COMPLETION_PATH} 2>/dev/null)"
-        )));
     }
 
     /// The broker runs as a service identity in its protected runtime. Its
@@ -9394,7 +9119,6 @@ mod tests {
             "{in:gcc-runtime}".to_string(),
             "{in:zlib-x86-64}".to_string(),
             "{in:td-link-runtime}".to_string(),
-            format!("{{payload:{CLAUDE_NAME}}}"),
             format!("{{payload:{FIREFOX_NAME}}}"),
             format!("{{payload:{TD_MAIL_NAME}}}"),
             format!("{{payload:{TD_NEWS_NAME}}}"),
@@ -10122,21 +9846,18 @@ mod tests {
                 if target == "/bin/td-jail"
                     || link == "{root}/real-root/bin/fixture"
         )));
-        let shipped_links: Vec<_> = real_root_steps(&SYSTEM)
-            .unwrap()
-            .into_iter()
-            .filter_map(|step| match step {
-                Step::Symlink { target, link } if target == "/bin/td-jail" => Some(link),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            shipped_links,
-            vec![format!("{{root}}/real-root/bin/{CLAUDE_NAME}")],
-            "only Claude, whose human invocation td-jail redirects, has a /bin name"
+        assert!(
+            !real_root_steps(&SYSTEM)
+                .unwrap()
+                .iter()
+                .any(|step| matches!(
+                    step,
+                    Step::Symlink { target, .. } if target == "/bin/td-jail"
+                )),
+            "no shipped application has a /bin name"
         );
 
-        assert_eq!(SYSTEM.applications.len(), 4);
+        assert_eq!(SYSTEM.applications.len(), 3);
         let shipped: Vec<_> = SYSTEM
             .applications
             .iter()
@@ -10148,16 +9869,14 @@ mod tests {
                 (FIREFOX_NAME, FIREFOX_NAME, "freedesktop-platform-25-08"),
                 (TD_MAIL_NAME, TD_MAIL_NAME, "static-runtime"),
                 (TD_NEWS_NAME, TD_NEWS_NAME, "static-runtime"),
-                (CLAUDE_NAME, CLAUDE_NAME, "freedesktop-platform-25-08"),
             ],
             "the system image pairs each reviewed package with its runtime: \
-             Firefox, the source-built mail and news, then the Claude payload"
+             Firefox, then the source-built mail and news"
         );
         let system_recipe = recipe();
         assert_eq!(
             system_recipe.payload_inputs,
             Some(vec![
-                CLAUDE_NAME.into(),
                 FIREFOX_NAME.into(),
                 TD_MAIL_NAME.into(),
                 TD_NEWS_NAME.into(),
@@ -10800,13 +10519,7 @@ mod tests {
         };
         assert_eq!(application_name_collisions(&fixture), vec!["rg", "td-netd"]);
         let shape = shape_check();
-        assert_eq!(application_bin_links(&SYSTEM), vec![CLAUDE_NAME]);
-        assert_eq!(
-            unlinked_application_names(&SYSTEM),
-            vec![FIREFOX_NAME, TD_MAIL_NAME, TD_NEWS_NAME]
-        );
-        assert!(shape.contains(&format!("for a in {CLAUDE_NAME}; do")));
-        assert!(shape.contains("[ \"$(readlink \"$root/bin/$a\" 2>/dev/null)\" = /bin/td-jail ]"));
+        assert!(!shape.contains("= /bin/td-jail ]"));
         assert!(shape.contains(&format!(
             "for a in {FIREFOX_NAME} {TD_MAIL_NAME} {TD_NEWS_NAME}; do \
              if [ -e \"$root/bin/$a\" ] || [ -L \"$root/bin/$a\" ]; then"
@@ -12057,10 +11770,7 @@ mod tests {
         assert!(init.contains(&format!(
             "/bin/td-util chmod 0644 /sysroot{APPLICATIONS_ON_DEMAND}\n"
         )));
-        for (unit, account, name) in [
-            ("firefox-fetch", "tda65536", FIREFOX_NAME),
-            ("claude-fetch", "tda65539", CLAUDE_NAME),
-        ] {
+        for (unit, account, name) in [("firefox-fetch", "tda65536", FIREFOX_NAME)] {
             assert_eq!(
                 unit_key(unit, "exec"),
                 Some(format!(
@@ -13407,7 +13117,7 @@ mod tests {
                     "[ \"$input\" = {FIREFOX_INPUT_COMPLETION} ] && input_ok=1"
                 ))
                 && profile.contains(&format!(
-                    "[ \"$status\" = td-boot-success-v1 ] && [ \"$firefox\" = {FIREFOX_EVIDENCE} ] && [ \"$firefox_complete\" = {FIREFOX_COMPLETION} ] && [ \"$input_ok\" = 1 ] && [ \"$claude_complete\" = {CLAUDE_COMPLETION} ] && break"
+                    "[ \"$status\" = td-boot-success-v1 ] && [ \"$firefox\" = {FIREFOX_EVIDENCE} ] && [ \"$firefox_complete\" = {FIREFOX_COMPLETION} ] && [ \"$input_ok\" = 1 ] && break"
                 )),
             "Firefox evidence must be exact without controlling deployment health"
         );
@@ -16170,12 +15880,7 @@ mod principal_tests {
             (session.compositor, session.broker, session.portal),
             (993, 992, 991)
         );
-        for (name, uid) in [
-            ("firefox", 65536),
-            ("mail", 65537),
-            ("news", 65538),
-            ("claude", 65539),
-        ] {
+        for (name, uid) in [("firefox", 65536), ("mail", 65537), ("news", 65538)] {
             assert_eq!(registry.application(UI_UID, name).unwrap().uid, uid);
             assert!(build_passwd(&SYSTEM).contains(&format!(
                 "tda{uid}:x:{uid}:{uid}:td application:/var/lib/td/applications/{uid}:/bin/false\n"
@@ -16184,6 +15889,26 @@ mod principal_tests {
             assert!(build_shadow(&SYSTEM)
                 .contains(&format!("tda{uid}:!td-service:19000:0:99999:7:::\n")));
         }
+        // Claude Code shipped as 65539 until it left td. An install enrolled
+        // then keeps that reservation in its ledger: the union still enrolls
+        // and verifies against accounts that no longer name it, so the boot
+        // admits it and no later deployment can reuse the UID.
+        assert!(registry.application(UI_UID, "claude").is_none());
+        assert!(!build_passwd(&SYSTEM).contains("tda65539"));
+        let prior = principal_schema::Registry::parse(&build_principals(&SYSTEM).replace(
+            "application\t1000\tfirefox\t65536\n",
+            "application\t1000\tclaude\t65539\napplication\t1000\tfirefox\t65536\n",
+        ))
+        .unwrap();
+        let retained = prior.enroll(&registry).unwrap();
+        assert_eq!(retained.application(UI_UID, "claude").unwrap().uid, 65539);
+        retained
+            .verify_accounts(
+                &build_passwd(&SYSTEM),
+                &build_group(&SYSTEM),
+                &build_shadow(&SYSTEM),
+            )
+            .unwrap();
         assert!(build_td_svc_conf().contains("--application-primary --enroll-principals\n"));
         assert!(etc_files(&SYSTEM)
             .unwrap()

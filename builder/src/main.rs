@@ -17651,22 +17651,9 @@ daemon build START (2/2 active)
         let dir = _dir_cleanup.join("fixture");
         std::fs::create_dir_all(&dir).unwrap();
         let mes = "mes /gnu/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-mes-0.24 td-recipe-output\n";
-        let firefox_lock = dir.join("firefox.lock");
-        std::fs::write(&firefox_lock, mes).unwrap();
-        let claude_lock = dir.join("claude.lock");
-        std::fs::write(
-            &claude_lock,
-            format!(
-                "claude-source /gnu/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-claude source\n{mes}"
-            ),
-        )
-        .unwrap();
+        let lock = dir.join("firefox.lock");
+        std::fs::write(&lock, mes).unwrap();
         let spec_of = |recipe: &str| {
-            let lock = if recipe.contains(r#""name":"claude""#) {
-                &claude_lock
-            } else {
-                &firefox_lock
-            };
             let (_path, _file, drv, _source) =
                 assemble_recipe_drv(recipe, lock.to_str().unwrap(), &dir, None)?;
             let value = |key: &str| {
@@ -17694,25 +17681,14 @@ daemon build START (2/2 active)
         );
         assert_eq!(spec.source(), Some("app/org.mozilla.firefox/x86_64/stable"));
 
-        let claude = r#"{"name":"claude","version":"2","buildSystem":"mesboot","sourceInput":"claude-source","foreign":true,"foreignSource":true,"application":{"runtime":"freedesktop-platform-25-08","entry":"/app/bin/claude"},"applicationLauncher":{"displayName":"Claude","searchTerms":[]},"applicationPermissions":"format=1\n","steps":[{"copyFile":{"file":"{payload:claude-source}","to":"{out}/files/bin/claude","exec":true}}]}"#;
-        let (_, spec) = spec_of(claude).unwrap();
-        assert_eq!(
-            spec.runtime(),
-            "runtime/org.freedesktop.Platform/x86_64/25.08"
-        );
-        assert_eq!(
-            spec.source(),
-            Some(td_engine::flathub_app::CLAUDE_RELEASE_REF)
-        );
-
         // No validator, and nothing but native copies: nothing else stands
         // between the build and the foreign bytes.
         for step in [
-            r#"{"validateDynamicApplication":{"entry":"/app/bin/claude","runtime":"freedesktop-platform-25-08","libraryPaths":[],"optionalTargets":[],"optionalLinks":0}}"#,
-            r#"{"run":{"argv":["{out}/files/bin/claude"],"dir":"{out}","env":[]}}"#,
+            r#"{"validateDynamicApplication":{"entry":"/app/bin/firefox","runtime":"freedesktop-platform-25-08","libraryPaths":[],"optionalTargets":[],"optionalLinks":0}}"#,
+            r#"{"run":{"argv":["{out}/files/bin/firefox"],"dir":"{out}","env":[]}}"#,
             r#"{"mkDir":"{out}/files/lib"}"#,
         ] {
-            let extended = claude.replace(r#"}}]}"#, &format!("}}}},{step}]}}"));
+            let extended = firefox.replace(r#""steps":[]"#, &format!(r#""steps":[{step}]"#));
             let error = spec_of(&extended).unwrap_err();
             assert!(
                 error.contains("only native copyTree and copyFile"),
@@ -17727,8 +17703,8 @@ daemon build START (2/2 active)
             .replace(r#","steps":[]"#, "");
         let error = spec_of(&gnu).unwrap_err();
         assert!(error.contains("must be a mesboot recipe"), "{error}");
-        let error = spec_of(&claude.replace(
-            r#""entry":"/app/bin/claude""#,
+        let error = spec_of(&firefox.replace(
+            r#""entry":"/app/bin/firefox""#,
             r#""entry":"/app/bin/other""#,
         ))
         .unwrap_err();

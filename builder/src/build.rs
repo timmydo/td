@@ -5241,7 +5241,7 @@ mod tests {
         // `{out}` exists before a build's first step; the step never creates it.
         let out = base.join("out");
         fs::create_dir(&out).unwrap();
-        let payload = base.join("store/abc-claude-code-source");
+        let payload = base.join("store/abc-fixture-source");
         fs::write(&payload, b"\x7fELF-bytes").unwrap();
         fs::set_permissions(&payload, fs::Permissions::from_mode(0o444)).unwrap();
 
@@ -5251,7 +5251,7 @@ mod tests {
         assert!(unbounded.contains("mkdir"), "{unbounded}");
         assert!(!absent.exists());
 
-        let entry = out.join("files/bin/claude");
+        let entry = out.join("files/bin/fixture");
         copy_single_file(&out, &payload, &entry, true).unwrap();
         assert_eq!(fs::read(&entry).unwrap(), b"\x7fELF-bytes");
         assert_eq!(

@@ -201,9 +201,7 @@ fn parse_uid(value: &str) -> Result<u32, String> {
 }
 
 #[cfg(test)]
-#[path = "../../td-authd/src/terminal_sys.rs"]
-#[allow(dead_code, reason = "PTY allocation for PIN terminal fixtures only")]
-mod terminal_fixture_sys;
+mod pty_fixture_sys;
 
 // The cutover record stage 1 leaves (td-authd/DESIGN.md amendment 7),
 // which the paired desktop guests provision before each generation.
@@ -621,6 +619,7 @@ mod confinement {
             ),
             ("pin_sys.rs", include_str!("pin_sys.rs")),
             ("pin_terminal.rs", include_str!("pin_terminal.rs")),
+            ("pty_fixture_sys.rs", include_str!("pty_fixture_sys.rs")),
             ("token_check.rs", include_str!("token_check.rs")),
             ("store.rs", include_str!("store.rs")),
             ("scm.rs", include_str!("scm.rs")),
@@ -643,6 +642,11 @@ mod confinement {
                     );
                 }
             }
+            // UNSAFE.md T4: the PTY fixture's one caller. The needle is
+            // built so that this file does not match itself.
+            if source.contains(&format!("pty_fixture_sys{}", "::")) {
+                assert_eq!(name, "pin_terminal.rs", "unexpected PTY fixture caller");
+            }
             // UNSAFE.md §15: the two descriptor receivers, beside the
             // transport itself (sys.rs's safe child scm.rs).
             if !matches!(name, "sys.rs" | "scm.rs")
@@ -656,8 +660,10 @@ mod confinement {
             let keyword = format!("un{}", "safe");
             let lint = format!("{keyword}_code");
             let raw = production.matches(&keyword).count() - production.matches(&lint).count();
-            let scopes = 2 * usize::from(matches!(name, "sys.rs" | "secret_sys.rs"))
-                + usize::from(name == "pin_sys.rs");
+            let scopes = 2 * usize::from(matches!(
+                name,
+                "sys.rs" | "secret_sys.rs" | "pty_fixture_sys.rs"
+            )) + usize::from(name == "pin_sys.rs");
             assert_eq!(raw, scopes, "{name}");
             assert_eq!(
                 production.matches(&format!("#[allow({lint})]")).count(),
@@ -698,6 +704,27 @@ mod confinement {
             ),
             0xf402e082e7175844,
             "credential client changed"
+        );
+        // UNSAFE.md T4: the test-only PTY fixture issues one instruction,
+        // ioctl with exactly TIOCSPTLCK and TIOCGPTPEER, and one adoption.
+        let pty = include_str!("pty_fixture_sys.rs");
+        assert_eq!(pty.matches("core::arch::asm!").count(), 1);
+        assert_eq!(pty.matches("const SYS_").count(), 1);
+        assert!(pty.contains("const SYS_IOCTL: usize = 16;"));
+        assert_eq!(pty.matches("const TIOC").count(), 2);
+        // The wrapper and its two calls, each naming its request constant.
+        assert_eq!(pty.matches("ioctl(").count(), 3);
+        assert_eq!(pty.matches("TIOCSPTLCK,").count(), 1);
+        assert_eq!(pty.matches("TIOCGPTPEER, PEER_FLAGS").count(), 1);
+        assert!(pty.contains("const TIOCSPTLCK: usize = 0x4004_5431;"));
+        assert!(pty.contains("const TIOCGPTPEER: usize = 0x5441;"));
+        assert!(pty.contains("const PEER_FLAGS: usize = 0x80102;"));
+        assert_eq!(pty.matches("File::from_raw_fd(").count(), 1);
+        assert_eq!(
+            include_str!("lib.rs")
+                .matches("#[cfg(test)]\nmod pty_fixture_sys;")
+                .count(),
+            1
         );
         let sys = include_str!("sys.rs");
         // scm.rs reaches its parent only through these five names: a child
@@ -789,6 +816,7 @@ pub fn take_received(fd: RawFd) -> Result<File, String> {
                 "portable_notebook.rs",
                 "portable_pass.rs",
                 "portable_store.rs",
+                "pty_fixture_sys.rs",
                 "scm.rs",
                 "set_client.rs",
                 "store.rs",

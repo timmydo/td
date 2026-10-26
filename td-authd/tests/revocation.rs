@@ -2,7 +2,7 @@
 use super::*;
 use std::fs;
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, OpenOptionsExt};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -410,14 +410,32 @@ fn record_bytes(boot: &str, state: &str) -> String {
 }
 
 /// A pseudo-terminal's peer node, the test's own: a character device to
-/// hand back.
+/// hand back. The master's fdinfo names the peer's index, so no ioctl is
+/// needed to find it.
 fn pty() -> (fs::File, PathBuf) {
-    let (master, slave) = crate::terminal::terminal_pair().unwrap();
-    let path = fs::read_link(format!("/proc/self/fd/{}", slave.as_raw_fd())).unwrap();
+    let master = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(O_NOCTTY)
+        .open("/dev/ptmx")
+        .unwrap();
+    let info = fs::read_to_string(format!("/proc/self/fdinfo/{}", master.as_raw_fd())).unwrap();
+    let index = info
+        .lines()
+        .find_map(|line| line.strip_prefix("tty-index:"))
+        .unwrap()
+        .trim();
+    let path = PathBuf::from(format!("/dev/pts/{index}"));
+    assert!(fs::symlink_metadata(&path)
+        .unwrap()
+        .file_type()
+        .is_char_device());
     fs::set_permissions(&path, fs::Permissions::from_mode(0o620)).unwrap();
-    drop(slave);
     (master, path)
 }
+
+/// x86-64's `O_NOCTTY`, so opening the master never claims it.
+const O_NOCTTY: i32 = 0o400;
 
 #[test]
 fn production_reads_the_fixed_paths_and_deadlines() {

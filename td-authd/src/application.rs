@@ -13,16 +13,9 @@ const DEADLINE: Duration = Duration::from_secs(2);
 const APPLICATION_UIDS: std::ops::RangeInclusive<u32> = 65536..=2147483647;
 const REPLY: &str = "TD-LAUNCH-APPLICATION-CHECK-OK\t";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Presentation {
-    Direct,
-    Shell,
-}
-
 struct Request {
     owner: u32,
     name: String,
-    presentation: Presentation,
     arguments: Vec<String>,
 }
 
@@ -42,10 +35,11 @@ fn decimal(text: &str, range: std::ops::RangeInclusive<u32>) -> Result<u32, Stri
 impl Request {
     fn parse(arguments: &[String]) -> Result<Self, String> {
         let [owner, name, mode, separator, rest @ ..] = arguments else {
-            return Err("application launch requires OWNER APP direct|shell -- ARG...".into());
+            return Err("application launch requires OWNER APP direct -- ARG...".into());
         };
         let owner = decimal(owner, 1000..=1000)?;
-        if separator != "--"
+        if mode != "direct"
+            || separator != "--"
             || !crate::consent::application_name(name)
             || rest.len() > 128
             || rest.iter().any(|arg| arg.contains('\0'))
@@ -58,19 +52,9 @@ impl Request {
         {
             return Err("invalid application launch arguments".into());
         }
-        let presentation =
-            match mode.as_str() {
-                "direct" => Presentation::Direct,
-                "shell" if name == "claude" && rest.is_empty() => Presentation::Shell,
-                _ => return Err(
-                    "application launch presentation must be direct or argument-free Claude shell"
-                        .into(),
-                ),
-            };
         Ok(Self {
             owner,
             name: name.clone(),
-            presentation,
             arguments: rest.to_vec(),
         })
     }
@@ -87,18 +71,11 @@ impl Request {
                 &uid.to_string(),
                 &self.owner.to_string(),
                 &self.name,
-                self.mode(),
+                "direct",
                 "--",
             ])
             .args(&self.arguments);
         command
-    }
-
-    fn mode(&self) -> &'static str {
-        match self.presentation {
-            Presentation::Direct => "direct",
-            Presentation::Shell => "shell",
-        }
     }
 
     /// td-jail selects the application by its argv[0], so the launch needs
@@ -213,21 +190,13 @@ pub(crate) fn start(arguments: &[String]) -> Result<(), String> {
     let request = Request::parse(arguments)?;
     launch::require_launch_startup().map_err(|e| format!("application startup: {e}"))?;
     let uid = admit(request.owner, &request.name)?;
-    let input = if request.presentation == Presentation::Shell {
-        if uid != crate::application_shell::UID {
-            return Err("unexpected Claude assignment".into());
-        }
-        crate::application_shell::bind().map_err(|e| e.to_string())?
-    } else {
-        Stdio::null()
-    };
-    // Only the newly bound shell listener can cross this handoff; no root
-    // log or ambient descriptor reaches the credential helper.
+    // No root log or inherited descriptor reaches the credential helper or
+    // application.
     let error = request
         .helper(uid)
         .env_clear()
         .current_dir("/")
-        .stdin(input)
+        .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .exec();
@@ -292,12 +261,6 @@ pub(crate) fn exec(arguments: &[String]) -> Result<(), String> {
         &bounded("/proc/self/status")?,
         &bounded("/proc/self/cgroup")?,
     )?;
-    if request.presentation == Presentation::Shell {
-        if uid != crate::application_shell::UID {
-            return Err("unexpected Claude assignment".into());
-        }
-        return crate::application_shell::serve().map_err(|e| e.to_string());
-    }
     Err(format!(
         "exec application: {}",
         request.application(uid).exec()

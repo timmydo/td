@@ -2269,10 +2269,6 @@ fn require_installed_applications(result: &BootResult) -> Result<(), String> {
         (TD_MAIL_BOOT_MARKER, result.evidence.td_mail_running),
         (TD_NEWS_BOOT_MARKER, result.evidence.td_news_running),
         (TD_FIREFOX_BOOT_MARKER, result.evidence.td_firefox),
-        (
-            TD_CLAUDE_TERMINAL_MARKER,
-            result.evidence.td_claude_terminal,
-        ),
     ] {
         if !present {
             return Err(format!(
@@ -3413,7 +3409,6 @@ mod tests {
             result.evidence.td_mail_running = true;
             result.evidence.td_news_running = true;
             result.evidence.td_firefox = true;
-            result.evidence.td_claude_terminal = true;
             result.exited_clean = true;
             result.marker_killed = false;
             result
@@ -3429,7 +3424,6 @@ mod tests {
             |e: &mut ConsoleEvidence| e.td_mail_running = false,
             |e: &mut ConsoleEvidence| e.td_news_running = false,
             |e: &mut ConsoleEvidence| e.td_firefox = false,
-            |e: &mut ConsoleEvidence| e.td_claude_terminal = false,
         ] {
             let mut missing = healthy();
             remove(&mut missing.evidence);

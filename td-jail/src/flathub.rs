@@ -237,10 +237,10 @@ mod tests {
 
     fn generation(home: &Path, number: u64) -> PathBuf {
         let selection = Selection {
-            name: "claude".into(),
+            name: "fixture".into(),
             checks: "0".repeat(64),
             application: None,
-            package: Some("/td/store/0123456789abcdfghijklmnpqrsvwxyz-claude-1".into()),
+            package: Some("/td/store/0123456789abcdfghijklmnpqrsvwxyz-fixture-1".into()),
             runtime: flathub_app::Admitted {
                 exact_ref: RUNTIME.into(),
                 commit: COMMIT.into(),

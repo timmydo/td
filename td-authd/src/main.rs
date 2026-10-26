@@ -8,7 +8,6 @@
 mod admission;
 mod application;
 mod application_files;
-mod application_shell;
 mod backoff;
 mod channel;
 #[allow(
@@ -67,11 +66,8 @@ mod set_hostname;
 #[allow(dead_code, reason = "shared dependency-free SHA-256 implementation")]
 #[path = "../../engine/src/sha256.rs"]
 mod sha256;
-mod shell_channel;
 mod storage;
 mod sys;
-mod terminal;
-mod terminal_sys;
 mod unlock;
 
 use std::io::Write;
@@ -84,9 +80,8 @@ const USAGE: &str = "usage: td-authd channel-check --peer-uid UID | \
     td-authd release-portal-files | td-authd prepare-portal-handoff | \
     td-authd release-portal-handoff | td-authd prepare-application-files APP | \
     td-authd release-application-files APP | \
-    td-authd application-start OWNER APP direct|shell -- ARG... | \
-     td-authd application-exec UID OWNER APP direct|shell -- ARG... | \
-     td-authd application-client ARG... | td-authd application-probe | \
+    td-authd application-start OWNER APP direct -- ARG... | \
+     td-authd application-exec UID OWNER APP direct -- ARG... | \
      td-authd request-update SOURCE DEPLOYMENT-ID | td-authd request-hostname NAME";
 
 fn run(arguments: &[String]) -> Result<(), String> {
@@ -170,25 +165,17 @@ fn run(arguments: &[String]) -> Result<(), String> {
     }
 }
 
-fn entry() -> Result<u8, String> {
-    let mut arguments = std::env::args_os().skip(1).peekable();
-    if arguments
-        .peek()
-        .is_some_and(|s| s == "application-client" || s == "application-probe")
-    {
-        let probe = arguments.next().is_some_and(|s| s == "application-probe");
-        return application_shell::client(arguments.collect(), probe).map_err(|e| e.to_string());
-    }
-    let arguments = arguments
+fn entry() -> Result<(), String> {
+    let arguments = std::env::args_os()
+        .skip(1)
         .map(|s| s.into_string().map_err(|_| "invalid argument encoding"))
         .collect::<Result<Vec<_>, _>>()?;
-    run(&arguments).map(|()| 0)
+    run(&arguments)
 }
 
 fn main() -> ExitCode {
-    let result = entry();
-    match result {
-        Ok(code) => ExitCode::from(code),
+    match entry() {
+        Ok(()) => ExitCode::SUCCESS,
         Err(why) => {
             let _ = writeln!(std::io::stderr().lock(), "td-authd: {why}");
             ExitCode::FAILURE

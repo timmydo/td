@@ -1371,8 +1371,8 @@ UID/GID allocation; user-selected names must not collide with system or
 application accounts. Account databases, home paths, application grants,
 service configuration and automatic login must agree before the session
 starts. No shipped program assumes the stock account's name or
-`/home/tester`: grant preparation, jail admission, authd's Claude workspace
-mapping and task directory, the jail's Firefox download probe and the
+`/home/tester`: grant preparation, jail admission, authd's task
+directory, the jail's Firefox download probe and the
 guest helper's workspace share one validated UID-1000 account lookup. The
 compositor sends typed launch requests without paths, and its direct
 development launcher offers no task terminal; a compositor source check
@@ -1640,7 +1640,7 @@ The deployment-owned optional persistent `/etc/timezone` link points to
 first boot does not overwrite it. The QEMU installation oracle selects
 `Europe/London` and verifies the file after formatting and on both cold
 boots with the installation media removed. The full-system oracle also
-requires mail, news, Firefox and Claude startup evidence and clean guest
+requires mail, news and Firefox startup evidence and clean guest
 shutdown in one additional direct selector boot of that installed disk.
 Only this additional boot supplies the existing autotest command-line
 token; the two firmware boots remain unchanged. The full-system
@@ -1713,8 +1713,8 @@ deployment default.
 
 The existing application launcher reads that name and binds each runtime's
 own zone file at its jailed `/etc/localtime`. Static mail and news carry
-the source-built data in `static-runtime`; Firefox and Claude use their
-reviewed Freedesktop runtime data. Missing runtime zones refuse launch.
+the source-built data in `static-runtime`; Firefox uses its reviewed
+Freedesktop runtime data. Missing runtime zones refuse launch.
 The compositor snapshots the saved name and source-built TZif rules at
 startup, rendering local civil time with its actual UTC offset. Invalid
 settings or unsupported data show `CLOCK ?`; an absent setting stays UTC.
@@ -2041,8 +2041,8 @@ emulates on purpose.
 The full system validator requires firstboot identity, immutable deployment
 configuration, owned writable state, component health, the compositor and
 terminal, application workspace placement and browser support. The check
-also requires Claude terminal admission, clean shutdown and an offline
-Btrfs check. It does not request the physical-input or audio-capture oracles.
+also requires clean shutdown and an offline Btrfs check. It does not
+request the physical-input or audio-capture oracles.
 Use `qemu-install-system` for the optical/USB installation matrix and
 `qemu-boot-system` for the longer install, update and recovery sequence.
 
