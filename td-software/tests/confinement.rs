@@ -196,3 +196,17 @@ fn only_the_window_reads_the_environment_and_only_these() {
         assert!(window.contains(read), "{read}");
     }
 }
+
+/// Its one argument besides the diagnostics is `--select APP`, which root
+/// passes for the launcher's Install row: a name in the registry grammar,
+/// checked here too, that only selects an entry the image declares.
+#[test]
+fn the_selected_application_is_checked_and_only_selects() {
+    let main = production("main.rs");
+    assert_eq!(main.matches("args_os()").count(), 1);
+    assert!(main.contains(".filter(|name| td_software::registry::valid_name(name))"));
+    assert!(main.contains("window::run(Some(&name))"));
+    let window = production("window.rs");
+    assert_eq!(window.matches("select_name(").count(), 1);
+    assert!(window.contains("session.app.select_name(name);"));
+}

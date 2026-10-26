@@ -7,11 +7,13 @@ mod window;
 use std::io::Write;
 use std::process::ExitCode;
 
-const USAGE: &str = "td-software
+const USAGE: &str = "td-software [--select APP]
   Open the application manager: the applications the image declares,
   the Flathub ones installable on request, each with its status, and
   Install, Check now, Remove and Delete data. Requests go to the
   compositor's control socket ($TD_CONTROL_SOCKET), which asks root.
+  --select opens it at APP, a registry name, when the image declares
+  one; the launcher's Install row passes it.
 td-software --preview WIDTHxHEIGHT
   Write the window's first frame as a PPM to standard output, without
   asking the compositor anything.
@@ -67,7 +69,18 @@ fn run() -> Result<(), String> {
                 .write_all(&ppm)
                 .map_err(|error| error.to_string())
         }
+        Some("--select") => {
+            let name = args
+                .next()
+                .and_then(|arg| arg.into_string().ok())
+                .filter(|name| td_software::registry::valid_name(name))
+                .ok_or("--select expects an application name")?;
+            if args.next().is_some() {
+                return Err(USAGE.to_owned());
+            }
+            window::run(Some(&name))
+        }
         Some(_) => Err(USAGE.to_owned()),
-        None => window::run(),
+        None => window::run(None),
     }
 }

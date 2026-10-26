@@ -2862,8 +2862,10 @@ fixed exec of /bin/td-editor, /bin/td-photo or /bin/td-dua with no
 arguments, request 0a of /bin/td-review with the one fixed argument
 --choose-repo, and request 0c of /bin/td-agent with no arguments and
 three fixed environment variables, each started in the verified account
-home. Request `22` is the same fixed exec of /bin/td-software with no
-arguments and one fixed environment variable, started at /. They add no
+home. Request `22` is the same fixed exec of /bin/td-software, started
+at / with one fixed environment variable and either no arguments or the
+one pair `--select NAME`, for an application name in the registry
+grammar that root checks and terminal-exec checks again. They add no
 raw syscall, descriptor or credential operation.
 Requests 0d and 0e start no human program: root itself runs the fixed
 /bin/td-svc client with `start firefox` or `start firefox-update`

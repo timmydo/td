@@ -127,8 +127,8 @@ fn surface(width: usize, height: usize) -> Result<Surface, String> {
 }
 
 /// Runs the manager on the compositor the environment names until its
-/// window closes.
-pub fn run() -> Result<(), String> {
+/// window closes, at `select` when the image declares it.
+pub fn run(select: Option<&str>) -> Result<(), String> {
     let endpoint = td_ui::wayland::endpoint(
         std::env::var_os("WAYLAND_SOCKET"),
         std::env::var_os("WAYLAND_DISPLAY"),
@@ -148,6 +148,9 @@ pub fn run() -> Result<(), String> {
         worker: Worker::start(socket)?,
         start: Instant::now(),
     };
+    if let Some(name) = select {
+        session.app.select_name(name);
+    }
     session.tick();
     session.flush();
     let typeface = td_ui::pinned_face::load_or_note(

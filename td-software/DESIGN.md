@@ -374,6 +374,14 @@ can be installed at every commit.
    registry with more answers no set. A name the answer leaves out is
    one the image ships, which is always installed, so an answer bounded
    by the compiled-in declarations still covers a table of 256.
+
+   *As built (opening at an entry):* td-software takes `--select APP`, a
+   name in the registry grammar, and opens with that application
+   selected when its registry lists it, or at the first entry when it
+   does not. The card's Install row is to ask for it as request `22`
+   with the name (td-authd/DESIGN.md, "Fixed program launch
+   prerequisite"), which root checks in the same grammar and passes on;
+   a name selects td-software's entry and grants nothing.
 4. **Cutover, in one landing.**
    - td-jail stops fetching on `absent` and stops starting the check
      beside a launch (`check_beside`). td-app's 24-hour throttle and

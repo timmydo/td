@@ -715,6 +715,21 @@ impl App {
         }
     }
 
+    /// Selects the application `name`, as the launcher's Install row
+    /// asks, and returns whether the image declares it; a name it does
+    /// not leaves the selection where it was.
+    pub fn select_name(&mut self, name: &str) -> bool {
+        let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.application.name == name)
+        else {
+            return false;
+        };
+        self.select(index);
+        true
+    }
+
     fn select(&mut self, index: usize) {
         let index = index.min(self.entries.len().saturating_sub(1));
         if index != self.selected {

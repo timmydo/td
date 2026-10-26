@@ -1120,6 +1120,26 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert_eq!(launch.matches(".stdin(Stdio::null())").count(), 1);
     assert_eq!(launch.matches(".stdout(Stdio::null())").count(), 1);
     assert_eq!(launch.matches(".stderr(Stdio::null())").count(), 1);
+    // The one peer-named program argument is td-software's selection, a
+    // registry name checked before the command is built.
+    assert_eq!(
+        launch
+            .matches("command.args([\"--select\", name]);")
+            .count(),
+        1
+    );
+    assert_eq!(launch.matches("fn valid_selection(").count(), 1);
+    // Root's helper argv carries it only for td-software's own variant.
+    assert_eq!(launch.matches("command.arg(name);").count(), 1);
+    assert!(launch
+        .contains("if let Launch::SoftwareAt(name) = launch {\n            command.arg(name);"));
+    assert!(launch.contains("Self::SoftwareAt(_) => Program::Software,"));
+    let gate = launch
+        .find(
+            "if select.is_some_and(|name| terminal != Program::Software || !valid_selection(name))",
+        )
+        .unwrap();
+    assert!(gate < launch.find("command.args([\"--select\", name]);").unwrap());
     // A PIN request lives on only in its clearing owner.
     assert_eq!(launch.matches("bytes.fill(0);").count(), 1);
     assert_eq!(fingerprint(launch), LAUNCH_FINGERPRINT);
@@ -1273,8 +1293,8 @@ const SHARED_HOSTNAME_FINGERPRINT: u64 = 0x49026f28c1db76ec;
 
 const CACHE_FINGERPRINT: u64 = 0x842accbdae0b3daf;
 const SOFTWARE_FINGERPRINT: u64 = 0x19cb169265fa785d;
-const LAUNCH_FINGERPRINT: u64 = 0x12667bdfc6f333da;
-const MAIN_FINGERPRINT: u64 = 0x9d8b70595b652b5f;
+const LAUNCH_FINGERPRINT: u64 = 0x43f8712771ad8d5e;
+const MAIN_FINGERPRINT: u64 = 0x97ab356136dd2efb;
 const SESSION_FINGERPRINT: u64 = 0x6c78640f078fe395;
 
 const INTAKE_RAW_FINGERPRINT: u64 = 0x320c8b6ddbfe29af;

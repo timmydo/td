@@ -71,7 +71,7 @@ fn primary_configuration_resolves_once_and_keeps_the_ledger_and_helper_checks() 
     );
     assert_eq!(
         config
-            .terminal("generation", 1, Program::Home)
+            .terminal("generation", 1, &Launch::Fixed(Program::Home))
             .get_args()
             .collect::<Vec<_>>(),
         [
@@ -189,7 +189,7 @@ fn the_caller_can_only_start_poll_or_keep_the_channel_alive() {
         b"\x24\x05firefox".to_vec(),
         b"\x24\x01/bin/sh".to_vec(),
         vec![0x22, 0],
-        b"\x22firefox".to_vec(),
+        b"\x22Firefox".to_vec(),
         vec![0x23, 0],
         b"\x23firefox".to_vec(),
         vec![0x24],
@@ -214,7 +214,11 @@ fn fixed_commands_select_the_account_and_all_terminal_arguments() {
         check.get_args().collect::<Vec<_>>(),
         ["check-launch-session", "tester", "1000", "993"]
     );
-    let terminal = config.terminal("000102030405060708090a0b0c0d0e0f", 17, Program::Home);
+    let terminal = config.terminal(
+        "000102030405060708090a0b0c0d0e0f",
+        17,
+        &Launch::Fixed(Program::Home),
+    );
     assert_eq!(terminal.get_program(), "/bin/td-login");
     assert_eq!(
         terminal.get_args().collect::<Vec<_>>(),
@@ -234,6 +238,7 @@ fn fixed_commands_select_the_account_and_all_terminal_arguments() {
         "000102030405060708090a0b0c0d0e0f",
         17,
         Program::Home,
+        None,
         || Ok(primary("tester")),
     )
     .unwrap();
@@ -245,13 +250,18 @@ fn fixed_commands_select_the_account_and_all_terminal_arguments() {
             Some(std::ffi::OsStr::new("/run/td-compositor/1000/td-control")),
         )]
     );
-    let task = config.terminal("000102030405060708090a0b0c0d0e0f", 18, Program::Task);
+    let task = config.terminal(
+        "000102030405060708090a0b0c0d0e0f",
+        18,
+        &Launch::Fixed(Program::Task),
+    );
     assert_eq!(task.get_args().last(), Some(std::ffi::OsStr::new("task")));
     let task = terminal_command(
         1000,
         "000102030405060708090a0b0c0d0e0f",
         18,
         Program::Task,
+        None,
         || Ok(primary("tester")),
     )
     .unwrap();
@@ -478,10 +488,14 @@ fn readiness_names_include_fresh_generations_and_fit_unix_socket_bounds() {
     assert_ne!(a, b);
     assert_eq!(a.len(), 32);
     assert_eq!(b.len(), 32);
-    let first =
-        terminal_command(1000, &a, u64::MAX, Program::Home, || Ok(primary("tester"))).unwrap();
-    let second =
-        terminal_command(1000, &b, u64::MAX, Program::Home, || Ok(primary("tester"))).unwrap();
+    let first = terminal_command(1000, &a, u64::MAX, Program::Home, None, || {
+        Ok(primary("tester"))
+    })
+    .unwrap();
+    let second = terminal_command(1000, &b, u64::MAX, Program::Home, None, || {
+        Ok(primary("tester"))
+    })
+    .unwrap();
     assert_ne!(first.get_args().last(), second.get_args().last());
     assert!(first.get_args().last().unwrap().len() < 108);
 }
@@ -597,7 +611,11 @@ fn log_descriptors_must_not_alias_the_private_channel() {
 
 #[test]
 fn task_manager_has_fixed_unprivileged_exec_and_display_only() {
-    let wrapper = config().terminal("000102030405060708090a0b0c0d0e0f", 17, Program::TaskManager);
+    let wrapper = config().terminal(
+        "000102030405060708090a0b0c0d0e0f",
+        17,
+        &Launch::Fixed(Program::TaskManager),
+    );
     assert_eq!(wrapper.get_program(), "/bin/td-login");
     assert_eq!(wrapper.get_args().last().unwrap(), "taskmgr");
     let command = terminal_command(
@@ -605,6 +623,7 @@ fn task_manager_has_fixed_unprivileged_exec_and_display_only() {
         "000102030405060708090a0b0c0d0e0f",
         17,
         Program::TaskManager,
+        None,
         || Ok(primary("tester")),
     )
     .unwrap();
@@ -619,11 +638,125 @@ fn task_manager_has_fixed_unprivileged_exec_and_display_only() {
     );
 }
 
+/// `22` with a name opens td-software at that application: the name rides
+/// the credential helper's argv after `software` and becomes td-software's
+/// one `--select`, checked in the registry grammar at both ends; no other
+/// program takes one.
+#[test]
+fn software_opens_at_an_application_named_in_the_registry_grammar() {
+    assert_eq!(
+        request(b"\x22firefox").unwrap(),
+        Request::SoftwareAt("firefox".into())
+    );
+    assert_eq!(request(&[0x22]).unwrap(), Request::Start(Program::Software));
+    for bad in [
+        &b"\x22Firefox"[..],
+        b"\x22../firefox",
+        b"\x22fire fox",
+        b"\x22-x",
+        b"\x22\xff",
+        &[0x22, 0],
+    ] {
+        assert!(request(bad).is_err(), "{bad:?}");
+    }
+    let long = [&[0x22][..], "a".repeat(65).as_bytes()].concat();
+    assert!(request(&long).is_err());
+    let wrapper = config().terminal(
+        "000102030405060708090a0b0c0d0e0f",
+        17,
+        &Launch::SoftwareAt("firefox".into()),
+    );
+    let args: Vec<_> = wrapper.get_args().map(|a| a.to_str().unwrap()).collect();
+    assert_eq!(
+        args.get(args.len().saturating_sub(2)..),
+        Some(&["software", "firefox"][..])
+    );
+    let longest = [&[0x22][..], "a".repeat(64).as_bytes()].concat();
+    assert_eq!(
+        request(&longest).unwrap(),
+        Request::SoftwareAt("a".repeat(64))
+    );
+    let command = terminal_command(
+        1000,
+        "000102030405060708090a0b0c0d0e0f",
+        17,
+        Program::Software,
+        Some("firefox"),
+        || Err(std::io::Error::other("no account read")),
+    )
+    .unwrap();
+    assert_eq!(command.get_program(), "/bin/td-software");
+    assert_eq!(
+        command.get_args().collect::<Vec<_>>(),
+        ["--select", "firefox"]
+    );
+    for (program, name) in [
+        (Program::Editor, "firefox"),
+        (Program::Home, "firefox"),
+        (Program::Software, "Firefox"),
+        (Program::Software, "--help"),
+    ] {
+        assert!(
+            terminal_command(
+                1000,
+                "000102030405060708090a0b0c0d0e0f",
+                17,
+                program,
+                Some(name),
+                || Err(std::io::Error::other("no account read")),
+            )
+            .is_err(),
+            "{program:?} {name}"
+        );
+    }
+}
+
+/// terminal-exec takes an application after `software` alone, in the
+/// registry grammar. Only its arguments are read here: a good form would
+/// go on to exec in a test process that passes the session check.
+#[test]
+fn terminal_exec_takes_an_application_only_for_td_software() {
+    let generation = "000102030405060708090a0b0c0d0e0f";
+    let arguments = |tail: &[&str]| {
+        let mut arguments = vec!["1000".to_string(), generation.into(), "1".into()];
+        arguments.extend(tail.iter().map(|word| word.to_string()));
+        arguments
+    };
+    for bad in [
+        &["editor", "firefox"][..],
+        &["software", "Firefox"],
+        &["software", "firefox", "mail"],
+        &["software", ""],
+    ] {
+        let arguments = arguments(bad);
+        assert!(terminal_arguments(&arguments)
+            .unwrap_err()
+            .contains("terminal-exec requires"));
+        assert!(terminal_exec(&arguments)
+            .unwrap_err()
+            .contains("terminal-exec requires"));
+    }
+    let selected = arguments(&["software", "firefox"]);
+    assert_eq!(
+        terminal_arguments(&selected).unwrap(),
+        (1000, generation, 1, Program::Software, Some("firefox"))
+    );
+    let plain = arguments(&["software"]);
+    assert_eq!(
+        terminal_arguments(&plain).unwrap(),
+        (1000, generation, 1, Program::Software, None)
+    );
+}
+
 /// td-software starts outside the home, as the task manager does, and is
 /// told only where the compositor's control socket is.
 #[test]
 fn software_has_a_fixed_exec_the_display_and_the_control_socket() {
-    let wrapper = config().terminal("000102030405060708090a0b0c0d0e0f", 17, Program::Software);
+    let wrapper = config().terminal(
+        "000102030405060708090a0b0c0d0e0f",
+        17,
+        &Launch::Fixed(Program::Software),
+    );
     assert_eq!(wrapper.get_program(), "/bin/td-login");
     assert_eq!(wrapper.get_args().last().unwrap(), "software");
     let command = terminal_command(
@@ -631,6 +764,7 @@ fn software_has_a_fixed_exec_the_display_and_the_control_socket() {
         "000102030405060708090a0b0c0d0e0f",
         17,
         Program::Software,
+        None,
         || Err(std::io::Error::other("no account read")),
     )
     .unwrap();
@@ -700,7 +834,11 @@ fn desktop_programs_exec_fixed_binaries_from_the_validated_home() {
         (Program::Dua, "dua", "/bin/td-dua", none),
         (Program::Agent, "agent", "/bin/td-agent", none),
     ] {
-        let wrapper = config().terminal("000102030405060708090a0b0c0d0e0f", 17, program);
+        let wrapper = config().terminal(
+            "000102030405060708090a0b0c0d0e0f",
+            17,
+            &Launch::Fixed(program),
+        );
         assert_eq!(wrapper.get_program(), "/bin/td-login");
         assert_eq!(wrapper.get_args().last().unwrap(), selection);
         for name in ["alice", "bob"] {
@@ -709,6 +847,7 @@ fn desktop_programs_exec_fixed_binaries_from_the_validated_home() {
                 "000102030405060708090a0b0c0d0e0f",
                 17,
                 program,
+                None,
                 || Ok(primary(name)),
             )
             .unwrap();
@@ -745,6 +884,7 @@ fn the_task_directory_follows_the_validated_primary_account() {
             "000102030405060708090a0b0c0d0e0f",
             1,
             Program::Task,
+            None,
             || Ok(primary(name)),
         )
         .unwrap();
@@ -776,10 +916,17 @@ fn only_launches_placed_in_the_account_require_the_primary_account() {
         Program::Software,
     ] {
         let mut loaded = false;
-        let result = terminal_command(1000, "000102030405060708090a0b0c0d0e0f", 1, program, || {
-            loaded = true;
-            Err(std::io::Error::other("invalid primary account"))
-        });
+        let result = terminal_command(
+            1000,
+            "000102030405060708090a0b0c0d0e0f",
+            1,
+            program,
+            None,
+            || {
+                loaded = true;
+                Err(std::io::Error::other("invalid primary account"))
+            },
+        );
         let requires_account = !matches!(
             program,
             Program::Home | Program::TaskManager | Program::Software

@@ -15,7 +15,8 @@ use td_ui::window::{Input, PointerPhase};
 const COMMIT: &str = "7985364b35b83cfe5aa17a00932df1c2d1dae69e5c592aa637a53ff1d53fdabc";
 const RUNTIME_COMMIT: &str = "bd44a62300000000000000000000000000000000000000000000000000000000";
 const REGISTRY: &str = "mail\t/td/store/x-mail/app.spec\nfirefox\t/td/store/x-firefox/app.spec\n";
-const LAUNCHER: &str = "firefox\tFirefox\tweb browser\nmail\tMail\temail\n";
+const LAUNCHER: &str =
+    "firefox\tFirefox\tweb browser\torg.mozilla.firefox\nmail\tMail\temail\ttd-mail\n";
 
 fn applications() -> Vec<Application> {
     registry::applications(REGISTRY, Some(LAUNCHER)).unwrap()
@@ -901,4 +902,18 @@ fn an_uncertain_start_is_not_credited_with_an_earlier_outcome() {
         ),
     );
     assert_eq!(app.message(), "The install of Firefox did not start");
+}
+
+/// The launcher's Install row opens the window at an application: one the
+/// image declares is selected, any other name leaves the first.
+#[test]
+fn a_selected_name_opens_the_window_at_its_entry() {
+    let mut app = app();
+    assert_eq!(app.selected(), Some("firefox"));
+    assert!(app.select_name("mail"));
+    assert_eq!(app.selected(), Some("mail"));
+    assert!(!app.select_name("news"));
+    assert_eq!(app.selected(), Some("mail"));
+    assert!(app.select_name("firefox"));
+    assert_eq!(app.selected(), Some("firefox"));
 }

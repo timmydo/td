@@ -105,7 +105,10 @@ impl Config {
         Inspection::printing(command, STATE_REPLY, STATE_TIME)
     }
 
-    fn terminal(&self, generation: &str, handle: u64, terminal: Program) -> Command {
+    /// The credential helper's command for a human program, or for
+    /// td-software opened at an application, which terminal-exec checks
+    /// again.
+    fn terminal(&self, generation: &str, handle: u64, launch: &Launch) -> Command {
         let mut command = Command::new("/bin/td-login");
         command.args([
             "exec-as",
@@ -117,8 +120,11 @@ impl Config {
             generation,
             &handle.to_string(),
         ]);
-        if let Some(selection) = terminal.selection() {
+        if let Some(selection) = launch.program().selection() {
             command.arg(selection);
+        }
+        if let Launch::SoftwareAt(name) = launch {
+            command.arg(name);
         }
         command.process_group(0);
         command
@@ -267,16 +273,27 @@ fn require_session_process(uid: u32, status: &str, cgroup: &str) -> Result<(), S
     Ok(())
 }
 
+/// The program terminal-exec runs; `select` opens td-software, and only
+/// it, at an application, a name in the registry grammar.
 fn terminal_command(
     uid: u32,
     generation: &str,
     handle: u64,
     terminal: Program,
+    select: Option<&str>,
     account: impl FnOnce() -> std::io::Result<crate::primary_account::PrimaryAccount>,
 ) -> std::io::Result<Command> {
+    if select.is_some_and(|name| terminal != Program::Software || !valid_selection(name)) {
+        return Err(std::io::Error::other(
+            "only td-software opens at an application, named in the registry grammar",
+        ));
+    }
     if let Some(program) = terminal.desktop_program() {
         let mut command = Command::new(program);
         command.args(terminal.desktop_arguments());
+        if let Some(name) = select {
+            command.args(["--select", name]);
+        }
         command.env(
             "WAYLAND_DISPLAY",
             format!("/run/td-compositor/{uid}/wayland-0"),
@@ -318,14 +335,58 @@ fn terminal_command(
     Ok(command)
 }
 
+/// An application td-software opens at: a name in the registry grammar,
+/// which selects nothing but td-software's own view.
+fn valid_selection(name: &str) -> bool {
+    crate::consent::application_name(name)
+}
+
 /// Runs only after td-login dropped credentials, before any terminal code.
 pub(crate) fn terminal_exec(arguments: &[String]) -> Result<(), String> {
+    let (uid, generation, handle, terminal, select) = terminal_arguments(arguments)?;
+    require_session_process(
+        uid,
+        &bounded_file("/proc/self/status")?,
+        &bounded_file("/proc/self/cgroup")?,
+    )?;
+    let mut command = terminal_command(
+        uid,
+        generation,
+        handle,
+        terminal,
+        select,
+        crate::primary_account::load,
+    )
+    .map_err(|error| error.to_string())?;
+    Err(format!("exec session program: {}", command.exec()))
+}
+
+/// terminal-exec's arguments: the human's UID, the generation, the
+/// handle, the program and td-software's selection.
+fn terminal_arguments(
+    arguments: &[String],
+) -> Result<(u32, &str, u64, Program, Option<&str>), String> {
     const USAGE: &str = "terminal-exec requires UID GENERATION HANDLE \
-                         [task|taskmgr|editor|photo|review|dua|agent|software]";
-    let (uid, generation, handle, terminal) = match arguments {
-        [uid, generation, handle] => (uid, generation, handle, Some(Program::Home)),
-        [uid, generation, handle, literal] => {
-            (uid, generation, handle, Program::from_selection(literal))
+                         [task|taskmgr|editor|photo|review|dua|agent|software [APP]]";
+    let (uid, generation, handle, terminal, select) = match arguments {
+        [uid, generation, handle] => (uid, generation, handle, Some(Program::Home), None),
+        [uid, generation, handle, literal] => (
+            uid,
+            generation,
+            handle,
+            Program::from_selection(literal),
+            None,
+        ),
+        [uid, generation, handle, literal, name]
+            if literal == "software" && valid_selection(name) =>
+        {
+            (
+                uid,
+                generation,
+                handle,
+                Some(Program::Software),
+                Some(name.as_str()),
+            )
         }
         _ => return Err(USAGE.into()),
     };
@@ -346,20 +407,7 @@ pub(crate) fn terminal_exec(arguments: &[String]) -> Result<(), String> {
     if value == 0 || value.to_string() != *handle {
         return Err("noncanonical terminal handle".into());
     }
-    require_session_process(
-        uid,
-        &bounded_file("/proc/self/status")?,
-        &bounded_file("/proc/self/cgroup")?,
-    )?;
-    let mut command = terminal_command(
-        uid,
-        generation,
-        value,
-        terminal,
-        crate::primary_account::load,
-    )
-    .map_err(|error| error.to_string())?;
-    Err(format!("exec session program: {}", command.exec()))
+    Ok((uid, generation.as_str(), value, terminal, select))
 }
 
 fn generation() -> Result<String, String> {
@@ -434,7 +482,26 @@ enum Request {
     Software(crate::software::Request),
     /// `23`: which of the registry's Flathub declarations are installed.
     Installed,
+    /// `22` and a name: td-software, opened at that application.
+    SoftwareAt(String),
     Secret(crate::session::Request),
+}
+
+/// What a start runs: a fixed program, or td-software opened at an
+/// application, so only td-software can carry a selection.
+#[derive(Debug, PartialEq, Eq)]
+enum Launch {
+    Fixed(Program),
+    SoftwareAt(String),
+}
+
+impl Launch {
+    fn program(&self) -> Program {
+        match self {
+            Self::Fixed(program) => *program,
+            Self::SoftwareAt(_) => Program::Software,
+        }
+    }
 }
 
 /// The configured application's units (APPLICATIONS.md §W.9): the
@@ -763,6 +830,13 @@ fn request(bytes: &[u8]) -> Result<Request, String> {
             operands,
         )?)),
         [0x22] => Ok(Request::Start(Program::Software)),
+        [0x22, name @ ..] => {
+            let name = std::str::from_utf8(name).map_err(|_| "invalid software selection")?;
+            if !valid_selection(name) {
+                return Err("invalid software selection".into());
+            }
+            Ok(Request::SoftwareAt(name.to_string()))
+        }
         [0x23] => Ok(Request::Installed),
         _ => Err("invalid terminal authority request".into()),
     }
@@ -870,27 +944,8 @@ impl Launches {
                 Ok(vec![0x85, self.unit.answer(asking).byte()])
             }
             Request::Heartbeat => Ok(vec![0x83]),
-            Request::Start(terminal) => {
-                if self.children.len() >= LIMIT {
-                    return Ok(vec![0xff, 1]);
-                }
-                let handle = self.next;
-                self.next = self
-                    .next
-                    .checked_add(1)
-                    .ok_or("terminal handle space exhausted")?;
-                let child = match spawn(&mut config.terminal(&self.generation, handle, terminal)) {
-                    Ok(child) => child,
-                    Err(why) => {
-                        let _ = writeln!(std::io::stderr().lock(), "td-authd: {why}");
-                        return Ok(vec![0xff, 2]);
-                    }
-                };
-                self.children.insert(handle, child);
-                let mut response = vec![0x81];
-                response.extend_from_slice(&handle.to_be_bytes());
-                Ok(response)
-            }
+            Request::Start(terminal) => self.start(config, &Launch::Fixed(terminal)),
+            Request::SoftwareAt(name) => self.start(config, &Launch::SoftwareAt(name)),
             Request::Poll(handle) => {
                 let child = self
                     .children
@@ -910,6 +965,34 @@ impl Launches {
                 Ok(vec![0x82, code])
             }
         }
+    }
+}
+
+impl Launches {
+    /// A human program, td-software perhaps opened at an application:
+    /// `81` and its new handle, `ff 01` with the table full, `ff 02` if
+    /// it could not be spawned.
+    fn start(&mut self, config: &Config, launch: &Launch) -> Result<Vec<u8>, String> {
+        if self.children.len() >= LIMIT {
+            return Ok(vec![0xff, 1]);
+        }
+        let handle = self.next;
+        self.next = self
+            .next
+            .checked_add(1)
+            .ok_or("terminal handle space exhausted")?;
+        let mut command = config.terminal(&self.generation, handle, launch);
+        let child = match spawn(&mut command) {
+            Ok(child) => child,
+            Err(why) => {
+                let _ = writeln!(std::io::stderr().lock(), "td-authd: {why}");
+                return Ok(vec![0xff, 2]);
+            }
+        };
+        self.children.insert(handle, child);
+        let mut response = vec![0x81];
+        response.extend_from_slice(&handle.to_be_bytes());
+        Ok(response)
     }
 }
 

@@ -559,7 +559,8 @@ launch; startup validation does not pin later account edits.
 The validator has a two-second observed completion deadline, measured before
 spawn and shorter than the channel frame deadline. Failure kills and reaps
 the trusted validator and closes the channel. There is no caller-provided
-executable, environment, directory path, account, uid or argument vector. A
+executable, environment, directory path, account, uid or argument vector,
+beyond `22`'s application name, checked in the registry grammar. A
 typed program kind selects a fixed executable and, for terminals, either
 the account home or td's fixed task worktree; the editor, photo tool,
 review window, disk usage analyzer and coding agent start in the account
@@ -597,7 +598,7 @@ Subsequent payloads are exact byte records:
 | `0d` | `84` once root has started `/bin/td-svc start firefox` |
 | `0e` | `84` once root has started `/bin/td-svc start firefox-update` |
 | `0f` | `85` and the `firefox` unit's state as root last read it: `00` idle, `01` starting, `02` running, `03` failed, `04` unknown |
-| `22` | `81` plus a process handle for the human application manager, td-software |
+| `22`, optionally with an application name | `81` plus a process handle for the human application manager, td-software, opened at that application |
 | `23` | `88` and which of the registry's Flathub declarations are installed ("Application requests") |
 | `24` plus a verb byte and an application name | an application cache request ("Application requests"): `86` once an operation started, or for status `87` and the last record |
 
@@ -670,9 +671,10 @@ request or heartbeat within each five-second receive deadline.
 
 The authority runs `/bin/td-login exec-as USER -- /bin/td-authd
 terminal-exec UID GENERATION HANDLE
-[task|taskmgr|editor|photo|review|dua|agent|software]` in a new
+[task|taskmgr|editor|photo|review|dua|agent|software [APP]]` in a new
 process group. The optional literal selects requests `04`, `07` through
-`0c` and `22`; it is not a pathname.
+`0c` and `22`; it is not a pathname. `APP` follows `software` alone,
+for a `22` that names one.
 td-login checks
 the human account policy and drops and verifies credentials. Its exact
 environment is `HOME`, `SHELL`, `USER`, `LOGNAME` from the account and
@@ -772,21 +774,32 @@ adds a way to start.
 
 Request `22` is the same shape for td-software, the application manager
 (td-software/DESIGN.md): it execs `/bin/td-software` with no arguments,
-from `/` as the task manager does, since it has no file dialog, with
+or with the one pair `--select NAME` below, from `/` as the task manager
+does, since it has no file dialog, with
 `WAYLAND_DISPLAY` and `TD_CONTROL_SOCKET=/run/td-compositor/UID/td-control`,
 the compositor's control socket, fixed by the authority. Its requests
 reach root only as the compositor's `24` ("Application requests"),
 which any program of the human's on that socket can make as well: the
-card adds a way to start, not a new reach.
+card adds a way to start, not a new reach. A `22` may carry an
+application name, the rest of the frame, one to 64 bytes in the
+registry grammar (anything else is malformed and ends the generation):
+the launcher's Install row opens td-software at that application
+(td-software/DESIGN.md §5). Root passes it after the `software`
+literal; terminal-exec checks the grammar again, takes a name after
+`software` alone, and execs `/bin/td-software --select NAME`. The name
+selects td-software's own entry and nothing else: it names no program,
+path or file, and td-software leaves its selection where it was for a
+name its registry lacks, so root does not look it up.
 
 An authority older than one of requests `07` through `0f` or `22`
-through `24` closes the entire launch channel on it; its paired
+through `24`, or than `22`'s name form, closes the entire launch channel
+on it; its paired
 compositor then restarts. The image ships both peers atomically.
 Requests `07` through `0b` were additive within TDLA002, without
 negotiation or mixed-version compatibility. The login requests `1b` and
 `1c` came with the bump to TDLA003, because `1c` carries a PIN; `0c`
-through `0f` and `22` through `24` were added within it later. Both
-peers again ship together, without negotiation.
+through `0f`, `22` through `24` and `22`'s name were added within it
+later. Both peers again ship together, without negotiation.
 
 For terminal requests it execs `/bin/td-term run --socket
 /run/td-compositor/UID/wayland-0 --ready-socket
