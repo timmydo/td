@@ -78,9 +78,9 @@ Read a `-> NEW` as "upstream has released NEW", then decide:
 
 - LibreSSL's directory carries development releases beside stable ones. Take
   the release libressl.org names as the latest stable.
-- A Git-tag watch (cryptsetup, util-linux, json-c, zlib, Nerd Fonts, the
-  ripgrep seed) can see a tag before its release tarball exists. Fetch the
-  tarball before trusting the tag.
+- A Git-tag watch (cryptsetup, util-linux, zlib, Nerd Fonts, the ripgrep
+  seed) can see a tag before its release tarball exists. Fetch the tarball
+  before trusting the tag.
 
 Each watch is a row in `recipes/src/source_watches.rs`: an index URL and a
 pattern in which `{}` stands for the version. A `PointReleases` watch (the
@@ -191,6 +191,22 @@ prints why. `linux-source` holds Linux 4.14's UAPI headers, which the
 build-root C packages compile against. Moving them re-keys every package
 above them and changes the kernel interface those packages target, so it is
 a decision of its own, not routine upkeep.
+
+`json-c-x86-64-source` holds json-c at 0.18. 0.19's non-recursive
+`json_object_put` calls its final free inside `assert()`, and td builds
+json-c as a CMake Release, with `NDEBUG`, so every non-empty object or
+array leaks; cryptsetup frees and deep-copies LUKS2 header trees on each
+header read and write. Upstream fixed it after 0.19 in f291fa8. A hold
+stops `outdated` from fetching the pin's index, so while it stands,
+check <https://github.com/json-c/json-c/releases> by hand on each run.
+When a release after 0.19 appears, confirm it frees outside `assert()`
+and also carries the later fixes to the same rewrite (69be99e,
+`json_object_put`'s return value, which cryptsetup's `hdr_json_free`
+reads, and issue #934's), restore the watch (index
+`https://github.com/json-c/json-c.git/info/refs?service=git-upload-pack`,
+pattern `refs/tags/json-c-{}-`), pin each libc probe the release's
+sources branch on in the recipe's probe list (0.19 adds
+`HAVE_DUPLOCALE`), and bump.
 
 ## Unreleased fixes
 

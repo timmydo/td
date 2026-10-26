@@ -31,7 +31,6 @@ const GIT_CRYPTSETUP: &str =
     "https://gitlab.com/cryptsetup/cryptsetup.git/info/refs?service=git-upload-pack";
 const GIT_LINUX_FIRMWARE: &str =
     "https://gitlab.com/kernel-firmware/linux-firmware.git/info/refs?service=git-upload-pack";
-const GIT_JSON_C: &str = "https://github.com/json-c/json-c.git/info/refs?service=git-upload-pack";
 const GIT_NERD_FONTS: &str =
     "https://github.com/ryanoasis/nerd-fonts.git/info/refs?service=git-upload-pack";
 const GIT_RIPGREP: &str =
@@ -97,10 +96,9 @@ const WATCHES: &[(&str, Watch)] = &[
     ("nerd-fonts-weather-icons-license-source", NERD_FONTS),
     (
         "json-c-x86-64-source",
-        Watch::Index {
-            index: GIT_JSON_C,
-            pattern: "refs/tags/json-c-{}-",
-        },
+        Watch::Held(
+            "0.19 frees containers inside assert(), so td's NDEBUG build leaks every non-empty object or array; check json-c's releases by hand until one carries upstream's f291fa8 (UPDATING.md)",
+        ),
     ),
     (
         "libdevmapper-x86-64-source",
