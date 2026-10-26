@@ -1,9 +1,11 @@
 # td-software
 
-**Status: proposal — nothing here is implemented or normative yet.** It is
-written for the repository user's review. `AGENTS.md`, `APPLICATIONS.md`
-and `td-authd/DESIGN.md` remain the authority; where this text and they
-differ, they describe the code and this describes a possible change.
+**Status: proposal, being built in §6's increments.** Each *As built*
+note describes code that exists; the rest is not yet implemented or
+normative. It is written for the repository user's review.
+`AGENTS.md`, `APPLICATIONS.md` and `td-authd/DESIGN.md` remain the
+authority; where this text and they differ, they describe the code and
+this describes a possible change.
 `AGENTS.md` gains a routing line only when the component exists.
 
 td-software would be a td-ui program and the only place a session owner
@@ -296,6 +298,51 @@ can be installed at every commit.
    remove, delete data and launch through the control socket. It runs beside
    on-demand: both paths go through the same td-app admission into the
    same cache, so they cannot disagree.
+
+   *As built (the program):* `td-software/` is a td-ui window, std plus
+   td-civil, td-fs and td-ui, with td-app's status record compiled in
+   from `engine/src/flathub_app.rs`. It reads the image's registry and
+   launcher table (bounded to the builder's 1 MiB each) and lists every
+   application: the Flathub declarations first, then those the image
+   ships, which show as built in with no action and whose status it
+   never asks. For a Flathub one it shows the standing (reading, not
+   installed, installed, or installed but needing a check after a
+   system update); first what is changing (a status it cannot read now,
+   a writer's progress, root's operation and the last one's outcome),
+   then the current version's commits, dates and sizes, the previous
+   version kept, when it was last checked and the last refusal.
+   Progress is the stage, then objects done of those found so far and
+   of their bound and bytes of the transfer bound, saying that Flathub
+   names no total in advance.
+
+   Its buttons are Install for one not installed, with Delete data once
+   a check has run or been refused and no previous version is kept (a
+   removed application), and Launch, Check now and Remove for an
+   installed one; when every read root made in this window failed,
+   which a damaged download can cause, Remove alone. A failed read
+   keeps the last record root read and its buttons, but not a writer's
+   progress: a writer killed mid-download can be what left the cache
+   unreadable, and Remove must not wait on it.
+   While something writes the cache, or root's record predates the
+   operation that just ended, only Launch stays on, and not during a
+   removal. Remove and Delete data ask first in td-ui's confirmation
+   dialog, which a change to the application's state closes at once,
+   unanswered; nothing else asks. Return launches or installs, and every
+   button has a key (F1 lists them).
+
+   Each request is one control-socket conversation
+   (`$TD_CONTROL_SOCKET`) on a worker thread, its answer bounded to
+   seven seconds and 8 KiB once connected. It asks a status every second
+   while something writes, an operation is asked for, or root's record
+   is unread, older or failed; every 15 seconds otherwise (60 if root
+   says the image ships it after all); and five seconds after a
+   failure, which the list and details then show. An `error` says root
+   did not act on a request; an `unavailable`, or a conversation cut
+   after the request was sent, may have reached root, so the next
+   status decides whether the operation ran, ended or never started,
+   and how each operation ended is reported from `last=`. Root's
+   refusals (§3) reach the status row as text. The image does not ship
+   it yet; the card entry is the next landing.
 3. **A table-driven card.** The compositor reads the immutable table,
    asks for the installed set and uses the scrolling window from §5.
    Starts carry a validated name. The image stops passing

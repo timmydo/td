@@ -1,0 +1,30 @@
+[package]
+name = "td-software"
+version = "0.1.0"
+edition = "2021"
+description = "td's application manager: installs, updates and removes the image's Flathub applications through the compositor; dependency-free Rust over td's shared UI toolkit"
+license = "MIT"
+
+# Own workspace root, so cargo behaves the same from the main checkout as from
+# a worktree nested under it (see the root Cargo.toml). Its dependencies are
+# td's civil calendar, file helpers and toolkit, sibling paths in the one
+# spelling the lock guard admits (AGENTS.md 'Rust code'); td-app's status
+# record is engine/src/flathub_app.rs, compiled in as shared source.
+[workspace]
+
+[dependencies]
+td-civil = { path = "../td-civil" }
+td-fs = { path = "../td-fs" }
+td-ui = { path = "../td-ui" }
+
+[package.metadata.td-gate]
+clippy-all-targets = true
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"

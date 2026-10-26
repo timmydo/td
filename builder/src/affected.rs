@@ -1535,6 +1535,13 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         return;
     }
 
+    // The application manager is host-tested only until its recipe and
+    // image wiring land: no target output carries it yet.
+    if p.starts_with("td-software/") && !p.contains("..") {
+        sel.add_preflight("cargo-test");
+        return;
+    }
+
     // The disk usage analyzer the same way: td-dua-test runs the static
     // binary's headless modes, a scanned preview frame among them.
     if p.starts_with("td-dua/") && !p.contains("..") {
@@ -3018,6 +3025,10 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("td-pass/src/app/mod.rs", "recipe-checks");
     assert_preflight!("td-pass/src/backend.rs", "cargo-test");
     assert_target!("td-pass/Cargo.lock", "recipe-checks");
+    // The application manager: its host suite alone, as yet.
+    assert_preflight!("td-software/src/app.rs", "cargo-test");
+    assert_no_target!("td-software/src/worker.rs", "check");
+    assert_no_target!("td-software/Cargo.lock", "recipe-checks");
     // The disk usage analyzer as well: td-dua-test runs its headless modes.
     assert_target!("td-dua/src/window.rs", "check");
     assert_target!("td-dua/src/treemap.rs", "recipe-checks");
@@ -9142,6 +9153,7 @@ mod tests {
                 "td-seatd",
                 "td-secret",
                 "td-setup",
+                "td-software",
                 "td-taskmgr",
                 "td-term",
                 "td-ui",
@@ -9152,8 +9164,8 @@ mod tests {
         );
         // td-agent's, td-photo's, td-mail's, td-pass's and td-pinentry's
         // native cases make their commands three, as td-setup's are; td-dua,
-        // td-news, td-review and td-term, toolkit consumers with no native
-        // case, add two each.
+        // td-news, td-review, td-software and td-term, toolkit consumers
+        // with no native case, add two each.
         // td-crypto's test-only P-256 oracle is td-fido's, which reads no
         // compositor source, so td-crypto is not a reader here. The native mail read
         // fixture makes td-mta a reader through td-mail.
@@ -9164,7 +9176,7 @@ mod tests {
         // td-boot, which includes td-init's console identity by `#[path]`,
         // and td-kexec and td-update, which read td-boot, add two each.
         // The format check rides with the workspace.
-        assert_eq!(comp.len(), 74, "{comp:?}");
+        assert_eq!(comp.len(), 76, "{comp:?}");
         // Runtime td-vm/ spellings conservatively connect the same reader set.
         assert_eq!(vm, comp);
         assert_eq!(
@@ -9197,6 +9209,7 @@ mod tests {
                 "td-seatd",
                 "td-secret",
                 "td-setup",
+                "td-software",
                 "td-taskmgr",
                 "td-term",
                 "td-ui",
@@ -9236,6 +9249,7 @@ mod tests {
                 "td-seatd",
                 "td-secret",
                 "td-setup",
+                "td-software",
                 "td-taskmgr",
                 "td-term",
                 "td-ui",
