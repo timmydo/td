@@ -6557,10 +6557,22 @@ mod tests {
     #[test]
     fn the_supervised_requests_name_real_units() {
         const LAUNCH: &str = include_str!("../../../td-authd/src/launch.rs");
+        // `0d NAME` starts the unit named after the application; `0e` the
+        // fixed update unit.
         assert!(LAUNCH.contains(
-            "Self::Start => \"firefox\",\n            Self::Update => \"firefox-update\","
+            "Self::Start(name) => name,\n            Self::Update => \"firefox-update\","
         ));
-        assert!(unit_key("firefox", "exec").is_some());
+        // Every shipped application, the names root's registry holds, has
+        // a unit of its name that starts that application.
+        for application in SYSTEM.applications {
+            let name = application.name;
+            assert!(
+                unit_key(name, "exec").is_some_and(
+                    |exec| exec.contains(&format!("application-start {UI_UID} {name} direct"))
+                ),
+                "{name}"
+            );
+        }
         // Root refuses both on a live boot by the path that gates the units.
         assert!(LAUNCH.contains(&format!("const LIVE_MEDIUM: &str = \"{LIVE_MEDIUM}\";")));
         // At boot it starts only where the oracles ask for it.

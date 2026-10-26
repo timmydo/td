@@ -2643,7 +2643,11 @@ impl LiveInputTarget {
                 // Root starts its supervised unit; the bar shows the launch
                 // until its window maps, and the card activates it then.
                 let launches = &self.launches;
-                runtime.launch_application(|| launches.start_application())?;
+                let name = runtime.launcher_application().map(str::to_string);
+                runtime.launch_application(|| match &name {
+                    Some(name) => launches.start_application(name),
+                    None => Err("the card names no application".into()),
+                })?;
             }
             return Ok(());
         }

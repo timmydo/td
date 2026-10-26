@@ -11289,26 +11289,27 @@ it), and td-jail reserves it at launch as it reserves the state.
 **How a launch is requested.** Over the compositor's existing private
 channel to root td-authd (td-authd/DESIGN.md, "Fixed program launch
 prerequisite"), which already pins the compositor's credentials and
-process: two one-byte requests that name nothing. `0d` asks root to run
-`td-svc start firefox`, `0e` `td-svc start firefox-update`; root holds
-both names, keeps at most one of each in flight, and answers at once
+process. `0d NAME` asks root to run `td-svc start NAME`, for an
+application its registry holds, whose unit the image names after it;
+`0e`, naming nothing, `td-svc start firefox-update`. Root keeps at most
+one start of each unit in flight and 16 in all, and answers at once
 (`84`). On a live boot both are refused, since that session runs only
-the installer. The launcher sends `0d` when the application's card finds no
-window, and `0e` from an "UPDATE FIREFOX" row beside the card, shown
-only with the authority, which is the forced check. A third, `0f`, has
-root read the `firefox` unit's td-svc state, so the bar shows the launch
-from the card's press until a window maps or the unit fails
+the installer. The launcher sends `0d` when the application's card finds
+no window, and `0e` from an "UPDATE FIREFOX" row beside the card, shown
+only with the authority, which is the forced check. A third, `0f NAME`,
+has root read that unit's td-svc state, so the bar shows the launch from
+the card's press until a window maps or the unit fails
 (td-compositor/DESIGN.md, the strip's LAUNCH cell); it is td-svc's
 state, not the download's, and a first launch's download reads as the
-unit running with no window yet. `firefox-update` is
-a oneshot that runs `td-app update firefox --force` as `tda65536`, with
-`unless-exists=/` so that only a `start` ever runs it, and an hour's
-timeout. Starting the application's unit grants the human nothing it
-could not do by asking for a terminal, and the update runs as the
-application's account, so neither is an elevation (principle 7). A
-polled root worker reading a FIFO, considered first, would have needed
-a second authenticated path; the compositor runs as its own uid, not the
-human's, so the request is the compositor's either way.
+unit running with no window yet. `firefox-update` is a oneshot that runs
+`td-app update firefox --force` as `tda65536`, with `unless-exists=/` so
+that only a `start` ever runs it, and an hour's timeout. Starting the
+application's unit grants the human nothing it could not do by asking
+for a terminal, and the update runs as the application's account, so
+neither is an elevation (principle 7). A polled root worker reading a
+FIFO, considered first, would have needed a second authenticated path;
+the compositor runs as its own uid, not the human's, so the request is
+the compositor's either way.
 
 **Nothing starts or fetches at boot.** A link from mail or news (§E row
 4) therefore opens only once the human has opened Firefox; letting the

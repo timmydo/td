@@ -318,11 +318,13 @@ impl LaunchBackend {
         }
     }
 
-    /// The configured application has no window: ask root to start its
-    /// unit, which does nothing if it is already running.
-    pub fn start_application(&self) -> Result<(), String> {
+    /// The application `name` has no window: ask root to start its unit,
+    /// which does nothing if it is already running.
+    pub fn start_application(&self, name: &str) -> Result<(), String> {
         match self {
-            Self::Authority(authority) => authority.supervise(crate::authority::Supervised::Start),
+            Self::Authority(authority) => {
+                authority.supervise(crate::authority::Supervised::Start(name.to_string()))
+            }
             Self::Direct(_) => Err("starting the application requires the paired authority".into()),
         }
     }
@@ -1737,10 +1739,10 @@ mod authority_entry_tests {
     fn the_backend_asks_root_for_the_applications_units() {
         let (authority, queued) = crate::authority::Queued::launcher();
         let mut backend = LaunchBackend::Authority(authority);
-        backend.start_application().unwrap();
+        backend.start_application("mail").unwrap();
         assert_eq!(
             queued.supervised(),
-            Some(crate::authority::Supervised::Start)
+            Some(crate::authority::Supervised::Start("mail".into()))
         );
         assert_eq!(
             backend.launch(LaunchRequest::UpdateApplication),

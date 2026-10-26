@@ -1097,26 +1097,35 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert_eq!(launch.matches(".process_group(0)").count(), 1);
     assert_eq!(launch.matches("Command::new(").count(), 6);
     // The root commands a peer can cause beside the credential helper:
-    // its supervisor starting one of two fixed units, and reading the
-    // application unit's status line.
+    // its supervisor starting an application's unit or the fixed update
+    // unit, and reading an application unit's status line. The name is
+    // the peer's, in the registry grammar and in the registry.
     assert!(launch.contains(
         "Command::new(\"/bin/td-svc\");\n        command.args([\"start\", unit.name()]);"
     ));
-    assert!(launch.contains(
-        "Command::new(\"/bin/td-svc\");\n        command.args([\"status\", Supervised::Start.name()]);"
-    ));
+    assert!(launch
+        .contains("Command::new(\"/bin/td-svc\");\n        command.args([\"status\", name]);"));
+    assert!(launch.contains(".filter(|name| crate::consent::application_name(name))"));
+    assert_eq!(launch.matches("match self.registered(").count(), 2);
+    assert_eq!(
+        launch
+            .matches("Some(false) => return Ok(vec![0xff, 4]),")
+            .count(),
+        2
+    );
     // `0f`'s bounds come only from its constants.
     for bound in [
         "const STATE_INTERVAL: Duration = Duration::from_secs(1);",
         "const STATE_TIME: Duration = Duration::from_secs(5);",
         "const STATE_REPLY: usize = 256;",
+        "const SUPERVISED_LIMIT: usize = 16;",
         "Inspection::printing(command, STATE_REPLY, STATE_TIME)",
     ] {
         assert_eq!(launch.matches(bound).count(), 1, "{bound}");
     }
     assert_eq!(launch.matches("Inspection::printing(").count(), 1);
     assert!(launch
-        .contains("Self::Start => \"firefox\",\n            Self::Update => \"firefox-update\","));
+        .contains("Self::Start(name) => name,\n            Self::Update => \"firefox-update\","));
     assert_eq!(launch.matches(".stdin(Stdio::null())").count(), 1);
     assert_eq!(launch.matches(".stdout(Stdio::null())").count(), 1);
     assert_eq!(launch.matches(".stderr(Stdio::null())").count(), 1);
@@ -1293,7 +1302,7 @@ const SHARED_HOSTNAME_FINGERPRINT: u64 = 0x49026f28c1db76ec;
 
 const CACHE_FINGERPRINT: u64 = 0x842accbdae0b3daf;
 const SOFTWARE_FINGERPRINT: u64 = 0x19cb169265fa785d;
-const LAUNCH_FINGERPRINT: u64 = 0x43f8712771ad8d5e;
+const LAUNCH_FINGERPRINT: u64 = 0xc5c403703a9991c1;
 const MAIN_FINGERPRINT: u64 = 0x97ab356136dd2efb;
 const SESSION_FINGERPRINT: u64 = 0x6c78640f078fe395;
 

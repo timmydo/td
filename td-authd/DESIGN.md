@@ -595,79 +595,96 @@ Subsequent payloads are exact byte records:
 | `0a` | `81` plus a process handle for the human code review window |
 | `0b` | `81` plus a process handle for the human disk usage analyzer |
 | `0c` | `81` plus a process handle for the human coding agent |
-| `0d` | `84` once root has started `/bin/td-svc start firefox` |
+| `0d` plus an application name | `84` once root has started `/bin/td-svc start NAME` |
 | `0e` | `84` once root has started `/bin/td-svc start firefox-update` |
-| `0f` | `85` and the `firefox` unit's state as root last read it: `00` idle, `01` starting, `02` running, `03` failed, `04` unknown |
+| `0f` plus an application name | `85` and the `NAME` unit's state as root last read it: `00` idle, `01` starting, `02` running, `03` failed, `04` unknown |
 | `22`, optionally with an application name | `81` plus a process handle for the human application manager, td-software, opened at that application |
 | `23` | `88` and which of the registry's Flathub declarations are installed ("Application requests") |
 | `24` plus a verb byte and an application name | an application cache request ("Application requests"): `86` once an operation started, or for status `87` and the last record |
 
-`0d` and `0e` create no handle. Root runs the fixed td-svc client itself,
-with the same cleared environment, `/` and null standard descriptors,
-holds at most one of each kind in flight (`ff 01` while one runs, `ff
-02` if it cannot start), reaps each at a later request, logs a client
-that failed, and kills one still running after 12 seconds, as
-revocation bounds its own. On a live boot, while `/run/td-media`
-exists, both answer `ff 03`: the live table skips the application, and
-td-svc's `start` would run a skipped unit. There is no rate limit
-beyond one in flight: `0d` restarts a unit td-svc holds in backoff,
-and `0e` runs the forced check, which ignores td-app's daily
-throttle, each time the last one finished. The compositor already
-owns the session's input, so neither gives it more than repeating a
-click. The peer names no unit: both names are root's, and
-neither unit grants the human anything a launch does not, since the
+`0d` and `0f` name an application: the rest of the frame, one to 64
+bytes in the registry grammar (anything else is malformed and ends the
+generation). Root answers `ff 04` for a name its registry,
+`/etc/td-applications.tsv` read as for `23` ("Application requests"),
+does not hold, or for `firefox-update`, which is `0e`'s, and `ff 02`
+while it cannot read the registry. The image names each application's
+unit after it, which a recipe test holds: every shipped application has
+a unit of its name that starts it. `0d` and `0e` create no handle. Root
+runs the fixed td-svc client itself, with the same cleared environment,
+`/` and null standard descriptors, holds at most one per unit in flight,
+which another start of that unit joins (`ff 01`), and 16 in all (`ff 05`
+for a start beyond them, which is refused), answers `ff 02` if it cannot
+start one, reaps each at a later request, logs a client that failed, and
+kills one still running after 12 seconds, as revocation bounds its own.
+On a live boot, while `/run/td-media` exists, both answer `ff 03`: the
+live table skips the application, and td-svc's `start` would run a
+skipped unit. There is no rate limit beyond one in flight: `0d` restarts
+a unit td-svc holds in backoff, and `0e` runs the forced check, which
+ignores td-app's daily throttle, each time the last one finished. The
+compositor already owns the session's input, so neither gives it more
+than repeating a click. The peer names an application root's immutable
+registry declares, never a unit outside it, and `0e`'s unit is root's:
+no unit grants the human anything a launch does not, since the
 application runs as its own account and the update is td-app's forced
 check as that account.
 
 `0f` lets the compositor say what became of a `0d`: it reads
-`/bin/td-svc status firefox`, the fixed client with the same cleared
-environment, `/` and null stdin and stderr, its standard output a
-socket read without blocking, at most 256 bytes within five seconds.
-At most one such client is in flight, a `0f` starts one at most once a
-second, a `0d` included, and only while no `0d` client runs, and every
-later launch request or heartbeat reaps a finished one, so a peer
-asking faster gets the last read again and no more root work. The
-answer is `01` while a `0d` client runs; `03` once one failed, timed
-out or could not start, until a read sees the unit starting or
-running; otherwise the last read since the last `0d`, or `01` until
-the first read after one: `02` for `ready` with a live pid, `00` for
-`ready` without one, `skipped` or `stopped`, `01` for `down`,
-`starting` or `stopping`, and `03` for `failed` or `held`, each only
-from exactly td-svc's status line for `firefox` (td-svc/DESIGN.md §8),
-` leaf=unproven` only after `stopping`. `04` is any other line, or no
-`0d` yet and nothing read. A busy, failed or late client leaves the
-last read standing. A client that began before a `0d` is reaped and
-discarded, so it cannot answer for the start after it. The states are
-td-svc's, not the application's: `02` says td-svc holds a live leader,
-which a first launch spends its download in before any window maps,
-`03` includes a crash td-svc's `restart=on-failure` will retry after
-its backoff, and a `0d` client killed at its bound reads `03` until a
-read sees the unit it may still have started. On a live boot `0f`
-answers `ff 03` as `0d` does. It names no unit and reveals only the
-supervisor's state word for the one unit the compositor may already
-start, never the application's output, account or files; it is
-generic launch feedback, not a download channel.
+`/bin/td-svc status NAME`, the fixed client with the same cleared
+environment, `/` and null stdin and stderr, its standard output a socket
+read without blocking, at most 256 bytes within five seconds. Root
+follows one application at a time, the last a `0d` or `0f` named, and
+what follows is of that application. At most one such client is in
+flight, a `0f` starts one at most once a second, a `0d` included, and
+only while no `0d` client for the application runs, and every later
+launch request or heartbeat reaps a finished one, so a peer asking
+faster gets the last read again and no more root work. The answer is
+`01` while a `0d` client for it runs; `03` once one failed, timed out or
+could not start, until a read sees the unit starting or running;
+otherwise the last read since the last `0d`, or `01` until the first
+read after one: `02` for `ready` with a live pid, `00` for `ready`
+without one, `skipped` or `stopped`, `01` for `down`, `starting` or
+`stopping`, and `03` for `failed` or `held`, each only from exactly
+td-svc's status line for `NAME` (td-svc/DESIGN.md §8), ` leaf=unproven`
+only after `stopping`. `04` is any other line, or, for the application
+followed, no `0d` and nothing read yet. A busy, failed or late client
+leaves the last read standing. A client that began before a `0d`, or
+before a `0f` for another application, is reaped and discarded, so it
+cannot answer for what came after it. The states are td-svc's, not the
+application's: `02` says td-svc holds a live leader, which a first
+launch spends its download in before any window maps, `03` includes a
+crash td-svc's `restart=on-failure` will retry after its backoff, and a
+`0d` client killed at its bound reads `03` until a read sees the unit it
+may still have started. A `0f` for another application than the one
+followed starts over on it as a `0d` would, with nothing read and no
+start asked, so the compositor asks about the launch it shows; a failed
+start counts as `03` only for the application followed. On a live boot
+`0f` answers `ff 03` as `0d` does. It reveals only the supervisor's
+state word for a unit the compositor may already start, never the
+application's output, account or files; it is generic launch feedback,
+not a download channel.
 
-For a launch, a full table returns `ff 01`; a spawn failure returns
-`ff 02`. Every other request, trailing byte, unknown handle, wait error
-on a launched terminal (a supervised client's is logged), timeout or transport
-failure ends this channel generation, including ordinary peer EOF. td-svc
-already counts either peer's exit, even zero, as pair failure and applies
-its failure backoff. A malformed request therefore ends the graphical
-session when this pair is enabled. There is no retry authorization after
-a transport error. Successful terminal creation means the fixed credential
-helper was spawned; polling distinguishes a later credential or exec
-failure. A fresh 128-bit kernel-random generation nonce avoids PID reuse
-collisions between terminals that outlive their authority. It is a
-readiness-name identifier, not a secret or authorization token. These
-dynamically launched terminals own their readiness sockets for human-session
+For a launch, a full table returns `ff 01`; a spawn failure returns `ff
+02`. Every other request, trailing byte beyond a request's operand,
+unknown handle, wait error on a launched terminal (a supervised client's
+is logged), timeout or transport failure ends this channel generation,
+including ordinary peer EOF. td-svc already counts either peer's exit,
+even zero, as pair failure and applies its failure backoff. A malformed
+request therefore ends the graphical session when this pair is enabled.
+There is no retry authorization after a transport error. Successful
+terminal creation means the fixed credential helper was spawned; polling
+distinguishes a later credential or exec failure. A fresh 128-bit
+kernel-random generation nonce avoids PID reuse collisions between
+terminals that outlive their authority. It is a readiness-name
+identifier, not a secret or authorization token. These dynamically
+launched terminals own their readiness sockets for human-session
 diagnostics; the compositor observes Wayland surfaces and does not probe
 those sockets. The nonce therefore stays private to the launcher and
-terminal, and no reverse traversal grant into the human runtime is required.
-Each generation holds at most sixteen records, including completions the
-peer has not polled. A completion response retires its handle. Handles
-increase without reuse; exhaustion fails before spawn. The peer must send a
-request or heartbeat within each five-second receive deadline.
+terminal, and no reverse traversal grant into the human runtime is
+required. Each generation holds at most sixteen records, including
+completions the peer has not polled. A completion response retires its
+handle. Handles increase without reuse; exhaustion fails before spawn.
+The peer must send a request or heartbeat within each five-second
+receive deadline.
 
 The authority runs `/bin/td-login exec-as USER -- /bin/td-authd
 terminal-exec UID GENERATION HANDLE
@@ -792,14 +809,16 @@ path or file, and td-software leaves its selection where it was for a
 name its registry lacks, so root does not look it up.
 
 An authority older than one of requests `07` through `0f` or `22`
-through `24`, or than `22`'s name form, closes the entire launch channel
-on it; its paired
-compositor then restarts. The image ships both peers atomically.
-Requests `07` through `0b` were additive within TDLA002, without
-negotiation or mixed-version compatibility. The login requests `1b` and
-`1c` came with the bump to TDLA003, because `1c` carries a PIN; `0c`
-through `0f`, `22` through `24` and `22`'s name were added within it
-later. Both peers again ship together, without negotiation.
+through `24`, or than `22`'s name form or the named `0d` and `0f`,
+closes the entire launch channel on it, as an authority newer than the
+compositor closes it on a bare `0d` or `0f`; its paired compositor then
+restarts. The image ships both peers atomically. Requests `07` through
+`0b` were additive within TDLA002, without negotiation or mixed-version
+compatibility. The login requests `1b` and `1c` came with the bump to
+TDLA003, because `1c` carries a PIN; `0c` through `0f`, `22` through
+`24` and `22`'s name were added within it later, and `0d` and `0f` took
+their names within it. Both peers again ship together, without
+negotiation.
 
 For terminal requests it execs `/bin/td-term run --socket
 /run/td-compositor/UID/wayland-0 --ready-socket

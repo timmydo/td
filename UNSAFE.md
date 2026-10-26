@@ -2868,9 +2868,11 @@ one pair `--select NAME`, for an application name in the registry
 grammar that root checks and terminal-exec checks again. They add no
 raw syscall, descriptor or credential operation.
 Requests 0d and 0e start no human program: root itself runs the fixed
-/bin/td-svc client with `start firefox` or `start firefox-update`
-through the same cleared spawn, and nothing else; they add no raw
-syscall, descriptor or credential operation either.
+/bin/td-svc client with `start NAME`, for an application name in the
+registry grammar that root's immutable registry holds, or `start
+firefox-update`, through the same cleared spawn, and nothing else; 0f
+runs it with `status NAME` for such a name. They add no raw syscall,
+descriptor or credential operation either.
 Request 24 starts no human program either: root runs its own fixed
 /bin/td-authd application-cache with the human's UID, a validated
 application name and one of five fixed verbs through the same cleared

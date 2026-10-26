@@ -228,12 +228,12 @@ impl CacheAnswer {
     }
 }
 
-/// What root may be asked of the configured application's units
-/// (APPLICATIONS.md §W.9): start it, or check its Flathub cache now. The
-/// request names no unit; root holds both names.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// What root may be asked of the applications' units (APPLICATIONS.md
+/// §W.9): start an application's, which root checks against its
+/// registry, or check Firefox's Flathub cache now, which names nothing.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Supervised {
-    Start,
+    Start(String),
     Update,
 }
 
@@ -250,14 +250,15 @@ pub(crate) enum UnitState {
 
 impl UnitState {
     /// Exactly `85` and a state, or `ff 03` on a live boot, which runs no
-    /// application and reads as failed; anything else ends the paired
-    /// generation.
+    /// application, `ff 04` for a name root's registry lacks or `ff 02`
+    /// when root cannot read it, each read as failed; anything else ends
+    /// the paired generation.
     fn decode(answer: &[u8]) -> Result<Self, String> {
         match answer {
             [0x85, 0] => Ok(Self::Idle),
             [0x85, 1] => Ok(Self::Starting),
             [0x85, 2] => Ok(Self::Running),
-            [0x85, 3] | [0xff, 3] => Ok(Self::Failed),
+            [0x85, 3] | [0xff, 2..=4] => Ok(Self::Failed),
             [0x85, 4] => Ok(Self::Unknown),
             _ => Err("invalid application unit state answer".into()),
         }
@@ -277,6 +278,8 @@ pub(crate) struct StartOutcome {
 struct ApplicationShared {
     /// Whether the worker asks `0f` on each turn of its loop.
     watching: bool,
+    /// The application the last start named, which `0f` asks about.
+    name: Option<String>,
     outcome: StartOutcome,
 }
 
@@ -300,16 +303,17 @@ impl Application {
             .outcome
     }
 
-    fn watching(&self) -> bool {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .watching
+    /// The application to ask `0f` about, while watched.
+    fn followed(&self) -> Option<String> {
+        let shared = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        shared.name.clone().filter(|_| shared.watching)
     }
 
-    /// A `0d` was answered: a new start, with nothing read about it yet.
-    fn started(&self, refused: bool) {
+    /// A `0d` for `name` was answered: a new start, with nothing read
+    /// about it yet.
+    fn started(&self, name: &str, refused: bool) {
         let mut shared = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        shared.name = Some(name.to_string());
         shared.outcome = StartOutcome {
             sent: shared.outcome.sent.wrapping_add(1),
             refused,
@@ -325,10 +329,13 @@ impl Application {
             .state = Some(state);
     }
 
-    /// Asks root's `0f` while watched and keeps the answer.
+    /// Asks root's `0f` about the started application while watched and
+    /// keeps the answer.
     fn follow(&self, wire: &mut impl Exchange) -> Result<(), String> {
-        if self.watching() {
-            self.read(UnitState::decode(&wire.exchange(&[0x0f])?)?);
+        if let Some(name) = self.followed() {
+            let mut request = vec![0x0f];
+            request.extend_from_slice(name.as_bytes());
+            self.read(UnitState::decode(&wire.exchange(&request)?)?);
         }
         Ok(())
     }
@@ -336,7 +343,7 @@ impl Application {
     /// Takes a start and its outcome as the worker would.
     #[cfg(test)]
     pub(crate) fn answer(&self, refused: bool, state: Option<&[u8]>) -> Result<(), String> {
-        self.started(refused);
+        self.started("firefox", refused);
         if let Some(state) = state {
             self.read(UnitState::decode(state)?);
         }
@@ -352,7 +359,10 @@ impl Application {
 
     #[cfg(test)]
     pub(crate) fn watched(&self) -> bool {
-        self.watching()
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .watching
     }
 }
 
@@ -846,6 +856,10 @@ impl Launcher {
     }
 
     pub fn supervise(&self, request: Supervised) -> Result<(), String> {
+        // Root ends the generation on a malformed name; refused here.
+        if matches!(&request, Supervised::Start(name) if !consent::application_name(name)) {
+            return Err("invalid application name".into());
+        }
         match self.send.try_send(Work::Supervised(request)) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(_)) => Err("authority request already pending".into()),
@@ -1131,11 +1145,11 @@ fn supervise(
     request: Supervised,
     application: &Application,
 ) -> Result<Option<&'static str>, String> {
-    let byte = match request {
-        Supervised::Start => 0x0d,
-        Supervised::Update => 0x0e,
+    let bytes = match &request {
+        Supervised::Start(name) => [&[0x0d][..], name.as_bytes()].concat(),
+        Supervised::Update => vec![0x0e],
     };
-    let (refused, error) = match wire.exchange(&[byte])?.as_slice() {
+    let (refused, error) = match wire.exchange(&bytes)?.as_slice() {
         [0x84] => (false, None),
         // An earlier start is still being asked, which this one joins.
         [0xff, 1] => (
@@ -1144,10 +1158,14 @@ fn supervise(
         ),
         [0xff, 2] => (true, Some("program authority could not ask the supervisor")),
         [0xff, 3] => (true, Some("a live session starts only the installer")),
+        [0xff, 4] if matches!(request, Supervised::Start(_)) => {
+            (true, Some("the image declares no such application"))
+        }
+        [0xff, 5] => (true, Some("root has as many starts in flight as it allows")),
         _ => return Err("invalid supervised request response".into()),
     };
-    if request == Supervised::Start {
-        application.started(refused);
+    if let Supervised::Start(name) = &request {
+        application.started(name, refused);
     }
     Ok(error)
 }
@@ -1820,14 +1838,14 @@ mod tests {
         let application = Application::default();
         let mut started = wire(vec![vec![0x84], vec![0x84]]);
         assert_eq!(
-            supervise(&mut started, Supervised::Start, &application),
+            supervise(&mut started, Supervised::Start("mail".into()), &application),
             Ok(None)
         );
         assert_eq!(
             supervise(&mut started, Supervised::Update, &application),
             Ok(None)
         );
-        assert_eq!(started.requests, [vec![0x0d], vec![0x0e]]);
+        assert_eq!(started.requests, [b"\x0dmail".to_vec(), vec![0x0e]]);
         // Only the start counts, and only a refusal marks it refused.
         assert_eq!(
             application.outcome(),
@@ -1841,19 +1859,23 @@ mod tests {
             (vec![0xff, 1], false),
             (vec![0xff, 2], true),
             (vec![0xff, 3], true),
+            (vec![0xff, 4], true),
+            (vec![0xff, 5], true),
         ] {
-            assert!(
-                supervise(&mut wire(vec![answer]), Supervised::Start, &application)
-                    .unwrap()
-                    .is_some()
-            );
+            assert!(supervise(
+                &mut wire(vec![answer]),
+                Supervised::Start("firefox".into()),
+                &application
+            )
+            .unwrap()
+            .is_some());
             assert_eq!(application.outcome().refused, refused);
         }
-        assert_eq!(application.outcome().sent, 4);
+        assert_eq!(application.outcome().sent, 6);
         for answer in [vec![], vec![0x84, 0], vec![0x81], vec![0xff, 4]] {
             assert!(supervise(&mut wire(vec![answer]), Supervised::Update, &application).is_err());
         }
-        assert_eq!(application.outcome().sent, 4);
+        assert_eq!(application.outcome().sent, 6);
     }
 
     /// A watched launch's turn: the start, the heartbeat, the hostname
@@ -1878,7 +1900,9 @@ mod tests {
         let application = Application::default();
         application.watch(true);
         let (send, receive) = mpsc::sync_channel(QUEUE_CAPACITY);
-        assert!(send.try_send(Work::Supervised(Supervised::Start)).is_ok());
+        assert!(send
+            .try_send(Work::Supervised(Supervised::Start("firefox".into())))
+            .is_ok());
         drop(send);
         assert!(worker(
             Shared(script.clone()),
@@ -1891,7 +1915,12 @@ mod tests {
         .is_err());
         assert_eq!(
             script.borrow().requests,
-            [vec![0x0d], vec![3], vec![0x1f], vec![0x0f]]
+            [
+                b"\x0dfirefox".to_vec(),
+                vec![3],
+                vec![0x1f],
+                b"\x0ffirefox".to_vec()
+            ]
         );
         assert_eq!(
             application.outcome(),
@@ -1910,22 +1939,31 @@ mod tests {
         application.follow(&mut idle).unwrap();
         assert!(idle.requests.is_empty());
         application.watch(true);
+        // Watched, but nothing started: nothing named to ask about.
+        application.follow(&mut idle).unwrap();
+        assert!(idle.requests.is_empty());
+        application.started("mail", false);
         for (answer, state) in [
             (vec![0x85, 0], UnitState::Idle),
             (vec![0x85, 1], UnitState::Starting),
             (vec![0x85, 2], UnitState::Running),
             (vec![0x85, 3], UnitState::Failed),
             (vec![0x85, 4], UnitState::Unknown),
+            (vec![0xff, 2], UnitState::Failed),
             (vec![0xff, 3], UnitState::Failed),
+            (vec![0xff, 4], UnitState::Failed),
         ] {
             let mut asked = wire(vec![answer]);
             application.follow(&mut asked).unwrap();
-            assert_eq!(asked.requests, [vec![0x0f]]);
+            assert_eq!(asked.requests, [b"\x0fmail".to_vec()]);
             assert_eq!(application.outcome().state, Some(state));
         }
         // A new start forgets what was read about the last.
-        application.started(false);
+        application.started("firefox", false);
         assert_eq!(application.outcome().state, None);
+        let mut asked = wire(vec![vec![0x85, 2]]);
+        application.follow(&mut asked).unwrap();
+        assert_eq!(asked.requests, [b"\x0ffirefox".to_vec()]);
         for answer in [
             vec![],
             vec![0x85],
@@ -1933,7 +1971,7 @@ mod tests {
             vec![0x85, 2, 0],
             vec![0x84],
             vec![0xff, 1],
-            vec![0xff, 2],
+            vec![0xff, 5],
         ] {
             assert!(application.follow(&mut wire(vec![answer])).is_err());
         }
@@ -2013,6 +2051,20 @@ mod tests {
             ),
             (Queue::Empty, 0)
         );
+    }
+
+    /// A start names an application in the registry grammar, or nothing
+    /// is queued: root would end the generation on it.
+    #[test]
+    fn a_start_outside_the_registry_grammar_is_refused_before_root() {
+        let (launcher, queued) = Queued::launcher();
+        for name in ["Firefox", "", "-x", &"a".repeat(65)] {
+            assert!(launcher.supervise(Supervised::Start(name.into())).is_err());
+            assert_eq!(queued.supervised(), None);
+        }
+        assert!(launcher
+            .supervise(Supervised::Start("firefox".into()))
+            .is_ok());
     }
 
     #[test]

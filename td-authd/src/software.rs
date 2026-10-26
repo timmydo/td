@@ -549,6 +549,12 @@ impl Requests {
         Self::with(start, || Ok(Vec::new()), flathub)
     }
 
+    /// With a stand-in registry, for the launch dispatcher's tests.
+    #[cfg(test)]
+    pub(crate) fn with_registry(load: Registry) -> Self {
+        Self::with(start, load, flathub)
+    }
+
     fn with(start: Starter, load: Registry, flathub: fn(&str) -> bool) -> Self {
         Self {
             entries: BTreeMap::new(),

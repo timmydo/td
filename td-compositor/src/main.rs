@@ -374,6 +374,12 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
                 .into(),
         );
     }
+    if launcher_application
+        .as_deref()
+        .is_some_and(|name| !authority::consent::application_name(name))
+    {
+        return Err("--launcher-application is outside the registry grammar".into());
+    }
     if application_ready_socket.is_some() != launcher_application.is_some() {
         return Err(
             "launcher applications require application-window readiness and vice versa".into(),
@@ -1184,7 +1190,7 @@ mod confinement {
     const SYS: &str = include_str!("sys.rs");
     const SCM: &str = include_str!("../../td-secret/src/scm.rs");
     const DRM: &str = include_str!("drm.rs");
-    const AUTHORITY_FINGERPRINT: u64 = 0xb1b8cc31963ca2ca;
+    const AUTHORITY_FINGERPRINT: u64 = 0x68ef47fe34413043;
     const AUTH_SYS_FINGERPRINT: u64 = 0x42363c39df98214d;
     const AUTH_CHANNEL_FINGERPRINT: u64 = 0xdf20e4130b2d96e2;
     const AUTHORITY: &str = include_str!("authority.rs");
@@ -2789,6 +2795,17 @@ pub struct MappedRegion {
         let remote = super::parse_run(&authority).unwrap();
         assert!(remote.terminal_authority);
         assert!(remote.terminal_client.is_none());
+        // The card's name goes to root in `0d`, so it is in the registry
+        // grammar or the compositor does not start.
+        let named = authority
+            .iter()
+            .position(|word| word == "--launcher-application")
+            .unwrap();
+        for name in ["Firefox", "-x", "fire fox"] {
+            let mut invalid = authority.clone();
+            invalid[named + 1] = name.into();
+            assert!(super::parse_run(&invalid).is_err(), "{name}");
+        }
         for value in ["0", "/run/authority", "stdout", ""] {
             let mut invalid = authority.clone();
             invalid[at + 1] = value.into();

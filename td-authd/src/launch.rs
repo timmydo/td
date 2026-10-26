@@ -19,6 +19,8 @@ const VERSION: &[u8] = b"TDLA003\n";
 pub(crate) const LIVE_MEDIUM: &str = "/run/td-media";
 /// How long a `td-svc start` client may take, as revocation bounds its own.
 const SUPERVISED_TIME: Duration = Duration::from_secs(12);
+/// The most `td-svc start` clients in flight at once, over every unit.
+const SUPERVISED_LIMIT: usize = 16;
 /// `0f`'s bounds: at most one `td-svc status` client in flight, started at
 /// most this often, each with this long to answer in at most this many
 /// bytes, a status line being under 200.
@@ -90,18 +92,19 @@ impl Config {
         command
     }
 
-    /// Root asks its own supervisor to start the configured application's
-    /// fixed unit: td-svc runs it as the application's account.
-    fn supervised(unit: Supervised) -> Command {
+    /// Root asks its own supervisor to start an application's unit, which
+    /// the image names after the application, or Firefox's update unit:
+    /// td-svc runs either as the application's account.
+    fn supervised(unit: &Supervised) -> Command {
         let mut command = Command::new("/bin/td-svc");
         command.args(["start", unit.name()]);
         command
     }
 
-    /// `0f`'s client: td-svc's status line for the application's unit.
-    fn unit_status() -> Result<Inspection, String> {
+    /// `0f`'s client: td-svc's status line for an application's unit.
+    fn unit_status(name: &str) -> Result<Inspection, String> {
         let mut command = Command::new("/bin/td-svc");
-        command.args(["status", Supervised::Start.name()]);
+        command.args(["status", name]);
         Inspection::printing(command, STATE_REPLY, STATE_TIME)
     }
 
@@ -476,8 +479,9 @@ enum Request {
     Poll(u64),
     Heartbeat,
     Supervised(Supervised),
-    /// `0f`: the application unit's state, as root last read it.
-    UnitState,
+    /// `0f` and a name: that application unit's state, as root last read
+    /// it.
+    UnitState(String),
     /// `24`: an application cache request for a validated name.
     Software(crate::software::Request),
     /// `23`: which of the registry's Flathub declarations are installed.
@@ -504,22 +508,33 @@ impl Launch {
     }
 }
 
-/// The configured application's units (APPLICATIONS.md §W.9): the
-/// application itself, and the oneshot that checks its Flathub cache now.
-/// The peer names neither; it selects one of these two.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+/// What `0d` and `0e` start (APPLICATIONS.md §W.9): an application's unit,
+/// named after the application, a registry name the peer chose and root
+/// checks against the registry; or the oneshot that checks Firefox's
+/// Flathub cache now, which the peer does not name.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Supervised {
-    Start,
+    Start(String),
     Update,
 }
 
 impl Supervised {
-    fn name(self) -> &'static str {
+    fn name(&self) -> &str {
         match self {
-            Self::Start => "firefox",
+            Self::Start(name) => name,
             Self::Update => "firefox-update",
         }
     }
+}
+
+/// An application `0d` and `0f` name: the rest of the frame, in the
+/// registry grammar.
+fn application(name: &[u8]) -> Result<String, String> {
+    std::str::from_utf8(name)
+        .ok()
+        .filter(|name| crate::consent::application_name(name))
+        .map(str::to_string)
+        .ok_or_else(|| "invalid application name".into())
 }
 
 /// `0f`'s answer byte: what root last read of the application's unit, so
@@ -596,7 +611,9 @@ fn unit_state(reply: &str, name: &str) -> Option<UnitState> {
 /// later ones. A start request opens a new epoch, so a client that began
 /// before it cannot answer for the unit after it.
 struct UnitProbe {
-    status: fn() -> Result<Inspection, String>,
+    status: fn(&str) -> Result<Inspection, String>,
+    /// The application it follows: the last a start or a read named.
+    name: Option<String>,
     client: Option<(Inspection, u64)>,
     began: Option<Instant>,
     epoch: u64,
@@ -610,9 +627,10 @@ struct UnitProbe {
 }
 
 impl UnitProbe {
-    fn new(status: fn() -> Result<Inspection, String>) -> Self {
+    fn new(status: fn(&str) -> Result<Inspection, String>) -> Self {
         Self {
             status,
+            name: None,
             client: None,
             began: None,
             epoch: 0,
@@ -622,13 +640,24 @@ impl UnitProbe {
         }
     }
 
-    /// A start request is about to be made: nothing read before it holds.
-    /// `began` stands, so a start never lets a status client start sooner.
-    fn restart(&mut self) {
+    /// A start request for `name` is about to be made: nothing read
+    /// before it holds. `began` stands, so a start never lets a status
+    /// client start sooner.
+    fn restart(&mut self, name: &str) {
         self.epoch = self.epoch.wrapping_add(1);
+        self.name = Some(name.to_string());
         self.asked = true;
         self.last = None;
         self.start_failed = false;
+    }
+
+    /// A read asked of `name`: one for another application than the probe
+    /// follows starts over on it, as a start does, but with nothing asked.
+    fn follow(&mut self, name: &str) {
+        if self.name.as_deref() != Some(name) {
+            self.restart(name);
+            self.asked = false;
+        }
     }
 
     fn advance(&mut self) {
@@ -646,24 +675,26 @@ impl UnitProbe {
         let Some(bytes) = reply.filter(|_| current) else {
             return;
         };
+        let name = self.name.as_deref().unwrap_or_default();
         let state = std::str::from_utf8(&bytes)
             .ok()
-            .and_then(|text| unit_state(text, Supervised::Start.name()));
+            .and_then(|text| unit_state(text, name));
         if matches!(state, Some(UnitState::Starting | UnitState::Running)) {
             self.start_failed = false;
         }
         self.last = Some(state.unwrap_or(UnitState::Unknown));
     }
 
-    /// The answer, after starting a client if one is due. `asking` says a
-    /// start request's client is still in flight.
-    fn answer(&mut self, asking: bool) -> UnitState {
+    /// The answer for `name`, after starting a client if one is due.
+    /// `asking` says a start request's client for it is still in flight.
+    fn answer(&mut self, name: &str, asking: bool) -> UnitState {
+        self.follow(name);
         self.advance();
         let due = self
             .began
             .is_none_or(|began| began.elapsed() >= STATE_INTERVAL);
         if !asking && self.client.is_none() && due {
-            match (self.status)() {
+            match (self.status)(name) {
                 Ok(client) => {
                     self.client = Some((client, self.epoch));
                     self.began = Some(Instant::now());
@@ -813,9 +844,11 @@ fn request(bytes: &[u8]) -> Result<Request, String> {
         [0x0a] => Ok(Request::Start(Program::Review)),
         [0x0b] => Ok(Request::Start(Program::Dua)),
         [0x0c] => Ok(Request::Start(Program::Agent)),
-        [0x0d] => Ok(Request::Supervised(Supervised::Start)),
+        [0x0d, name @ ..] if !name.is_empty() => {
+            Ok(Request::Supervised(Supervised::Start(application(name)?)))
+        }
         [0x0e] => Ok(Request::Supervised(Supervised::Update)),
-        [0x0f] => Ok(Request::UnitState),
+        [0x0f, name @ ..] if !name.is_empty() => Ok(Request::UnitState(application(name)?)),
         [2, rest @ ..] if rest.len() == 8 => {
             let handle =
                 u64::from_be_bytes(rest.try_into().map_err(|_| "invalid terminal handle")?);
@@ -846,9 +879,9 @@ struct Launches {
     children: BTreeMap<u64, Child>,
     next: u64,
     generation: String,
-    /// At most one `td-svc start` per unit in flight, reaped by a later
-    /// request (heartbeats arrive every quarter second) and killed past
-    /// SUPERVISED_TIME.
+    /// At most one `td-svc start` per unit in flight, and at most
+    /// SUPERVISED_LIMIT in all, reaped by a later request (heartbeats arrive every quarter
+    /// second) and killed past SUPERVISED_TIME.
     supervised: BTreeMap<Supervised, (Child, Instant)>,
     unit: UnitProbe,
     software: crate::software::Requests,
@@ -872,7 +905,7 @@ impl Launches {
                 Err(error) => Err(error),
             };
             let detail = ended.unwrap_or_else(|error| format!("wait: {error}"));
-            if *unit == Supervised::Start {
+            if matches!(unit, Supervised::Start(name) if probe.name.as_ref() == Some(name)) {
                 probe.start_failed = true;
             }
             let _ = writeln!(
@@ -885,17 +918,46 @@ impl Launches {
     }
 
     fn new(generation: String) -> Self {
-        Self::with_status(generation, Config::unit_status)
+        Self::with(
+            generation,
+            Config::unit_status,
+            crate::software::Requests::new(),
+        )
     }
 
-    fn with_status(generation: String, status: fn() -> Result<Inspection, String>) -> Self {
+    /// With a stand-in `td-svc status` and a registry of Firefox and mail.
+    #[cfg(test)]
+    fn with_status(generation: String, status: fn(&str) -> Result<Inspection, String>) -> Self {
+        Self::with(
+            generation,
+            status,
+            crate::software::Requests::with_registry(|| Ok(vec!["firefox".into(), "mail".into()])),
+        )
+    }
+
+    fn with(
+        generation: String,
+        status: fn(&str) -> Result<Inspection, String>,
+        software: crate::software::Requests,
+    ) -> Self {
         Self {
             children: BTreeMap::new(),
             next: 1,
             generation,
             supervised: BTreeMap::new(),
             unit: UnitProbe::new(status),
-            software: crate::software::Requests::new(),
+            software,
+        }
+    }
+
+    /// Whether the registry holds `name`; `None` when root cannot read it.
+    fn registered(&mut self, name: &str) -> Option<bool> {
+        match self.software.registry() {
+            Ok(names) => Some(names.iter().any(|known| known == name)),
+            Err(why) => {
+                let _ = writeln!(std::io::stderr().lock(), "td-authd: {why}");
+                None
+            }
         }
     }
 
@@ -916,32 +978,53 @@ impl Launches {
                 if std::fs::symlink_metadata(LIVE_MEDIUM).is_ok() {
                     return Ok(vec![0xff, 3]);
                 }
+                if let Supervised::Start(name) = &unit {
+                    // The update unit is `0e`'s, never an application's.
+                    if name == Supervised::Update.name() {
+                        return Ok(vec![0xff, 4]);
+                    }
+                    match self.registered(name) {
+                        Some(true) => {}
+                        Some(false) => return Ok(vec![0xff, 4]),
+                        None => return Ok(vec![0xff, 2]),
+                    }
+                }
                 if self.supervised.contains_key(&unit) {
                     return Ok(vec![0xff, 1]);
                 }
-                if unit == Supervised::Start {
-                    self.unit.restart();
+                if self.supervised.len() >= SUPERVISED_LIMIT {
+                    return Ok(vec![0xff, 5]);
                 }
-                match spawn(&mut Config::supervised(unit)) {
+                if let Supervised::Start(name) = &unit {
+                    self.unit.restart(name);
+                }
+                match spawn(&mut Config::supervised(&unit)) {
                     Ok(child) => {
                         self.supervised.insert(unit, (child, Instant::now()));
                         Ok(vec![0x84])
                     }
                     Err(why) => {
                         let _ = writeln!(std::io::stderr().lock(), "td-authd: {why}");
-                        if unit == Supervised::Start {
+                        if matches!(unit, Supervised::Start(_)) {
                             self.unit.start_failed = true;
                         }
                         Ok(vec![0xff, 2])
                     }
                 }
             }
-            Request::UnitState => {
+            Request::UnitState(name) => {
                 if std::fs::symlink_metadata(LIVE_MEDIUM).is_ok() {
                     return Ok(vec![0xff, 3]);
                 }
-                let asking = self.supervised.contains_key(&Supervised::Start);
-                Ok(vec![0x85, self.unit.answer(asking).byte()])
+                match self.registered(&name) {
+                    Some(true) => {}
+                    Some(false) => return Ok(vec![0xff, 4]),
+                    None => return Ok(vec![0xff, 2]),
+                }
+                let asking = self
+                    .supervised
+                    .contains_key(&Supervised::Start(name.clone()));
+                Ok(vec![0x85, self.unit.answer(&name, asking).byte()])
             }
             Request::Heartbeat => Ok(vec![0x83]),
             Request::Start(terminal) => self.start(config, &Launch::Fixed(terminal)),

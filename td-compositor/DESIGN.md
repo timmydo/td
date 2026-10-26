@@ -5664,8 +5664,8 @@ letter:
   keeping its data, or delete the data of a removed application;
 - `launch NAME`: what the card's application entry does, for the
   application the image configured with `--launcher-application` alone:
-  raise its mapped window, or ask root with `0d` to start its unit and
-  show the launch on the bar. Any other name is refused as having no
+  raise its mapped window, or ask root with `0d NAME` to start its unit
+  and show the launch on the bar. Any other name is refused as having no
   launcher entry; starts by name are td-software/DESIGN.md §6's third
   increment. Behind the lock surface, where the card cannot be pressed,
   it is an `error`. Its `ok` is the press handled: a window raised, `0d`
@@ -5743,15 +5743,16 @@ in the report answers today.
 of `--terminal-client PATH`. Exactly one is required. Authority mode requires
 the supervised application card; that card activates its existing Wayland
 surface and never invokes a program. When it finds no surface it asks the
-authority, with the name-free request `0d`, to have root start the
-application's supervised unit, and an "UPDATE NAME" row shown beside it in
-authority mode asks with `0e` for the unit that checks the application's
-Flathub cache (APPLICATIONS.md §W.9); each is answered at once and leaves no
-handle. While the bar shows a launch from the card, the worker asks `0f` for
-the unit's state on each turn of its loop, at most every 250 ms, and root
-starts at most one status read a second whatever the rate. The image selects
-this client through the paired service at UID 993.
-The direct launcher remains available for host development.
+authority, with request `0d` and the application's name, to have root start
+the application's supervised unit, named after it, and an "UPDATE NAME" row
+shown beside it in authority mode asks with `0e` for the unit that checks the
+application's Flathub cache (APPLICATIONS.md §W.9); each is answered at once
+and leaves no handle. While the bar shows a launch from the card, the worker
+asks `0f` with the name the launch started for the unit's state on each turn
+of its loop, at most every 250 ms, and root starts at most one status read a
+second whatever the rate. The image selects this client through the paired
+service at UID 993. The direct launcher remains available for host
+development.
 
 Before opening the framebuffer or starting any worker, the client verifies one
 thread, identical service uid/gid columns in 1..=999, and only inherited fd

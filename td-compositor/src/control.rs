@@ -1372,7 +1372,7 @@ fn launch_answer(
     let outcome = match runtime.activate_application() {
         Ok(true) => Ok(()),
         Ok(false) => runtime.launch_application(|| {
-            sent = authority.supervise(crate::authority::Supervised::Start);
+            sent = authority.supervise(crate::authority::Supervised::Start(name.to_string()));
             sent.clone()
         }),
         Err(error) => Err(error),
@@ -5198,7 +5198,7 @@ mod tests {
         );
         assert_eq!(
             queued.supervised(),
-            Some(crate::authority::Supervised::Start)
+            Some(crate::authority::Supervised::Start("firefox".into()))
         );
         let other = Request::parse("launch mail").unwrap();
         assert_eq!(

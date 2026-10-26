@@ -267,7 +267,7 @@ manifest's alias (§A, "Application identity") as a fourth launcher-table
 column, or a second immutable table built by the same compiler (as
 built, the fourth column: §6, increment 3). Each
 entry's start request then carries its name instead of being the
-name-free `0d`.
+name-free `0d` (as built: §6, increment 3).
 
 **The slot limit.** The launcher table admits up to 256 applications.
 The proposal:
@@ -382,6 +382,15 @@ can be installed at every commit.
    with the name (td-authd/DESIGN.md, "Fixed program launch
    prerequisite"), which root checks in the same grammar and passes on;
    a name selects td-software's entry and grants nothing.
+
+   *As built (starts by name):* `0d` and `0f` carry the application's
+   name, in the registry grammar, and root starts or reads the unit of
+   that name only when its registry holds it (`ff 04` otherwise), with
+   at most one start per unit and 16 in all in flight; the image names
+   every application's unit after it, which a recipe test holds. `0e`
+   stays name-free, Firefox's update unit, until the cutover removes
+   it, so §3's generalization covers `0d` alone. The card still starts
+   only its configured application, now by name.
 4. **Cutover, in one landing.**
    - td-jail stops fetching on `absent` and stops starting the check
      beside a launch (`check_beside`). td-app's 24-hour throttle and
