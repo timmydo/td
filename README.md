@@ -274,9 +274,9 @@ Its account has no password and no console login; the serial console
 shows boot and health only. The image carries the account name and the
 public keys with their comments. It is immutable: to update, replace the
 machine with a newer image ([td-svc design](td-svc/DESIGN.md) §10,
-"Profiles"). Its kernel carries virtio and NVMe storage and virtio and e1000
-networking, not Hyper-V's or ENA's drivers, so Azure and AWS instances do
-not boot it yet.
+"Profiles"). Its kernel carries Azure's, EC2 Nitro's and GCE's disk and
+NIC drivers; "Cloud images" there says how each cloud imports it and what
+does not work yet. No cloud boot is tested.
 
 To compose a retained optical/USB ISO from other prepared boot files and
 payloads, use `td-recipe-eval compose-iso OUTPUT KERNEL INITRAMFS

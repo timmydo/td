@@ -387,7 +387,9 @@ fn image_boot(
             IMAGE_ACCOUNT,
             "server.img",
             "image firmware boot",
-            FirmwareAttachment::Virtio,
+            // As EC2 Nitro presents an EBS root volume; the installed
+            // candidate's boots above use virtio.
+            FirmwareAttachment::Nvme,
             SYSTEM_GUEST_MEMORY_MIB,
         ),
         Published::Iso => (
@@ -473,6 +475,17 @@ fn image_boot(
     );
     match form {
         Published::Disk => {
+            // The volume partition of the NVMe namespace, not a virtio disk.
+            let on_nvme = result.console.lines().any(|line| {
+                line.starts_with("TD-BOOT-VOLUME ") && line.trim_end().ends_with(" /dev/nvme0n1p2")
+            });
+            if !on_nvme {
+                return Err(format!(
+                    "the {label} did not find its volume on the NVMe disk. Last serial \
+                     output:\n{}",
+                    tail(&result.console, 80)
+                ));
+            }
             validate_primary_selection(&result, label)?;
             require_selected_deployment(
                 &result,

@@ -1703,21 +1703,55 @@ delivers it a candidate, and a newer image replaces the machine.
 `--vhd` appends a fixed-disk VHD footer, the disk format Azure takes
 and AWS imports, at most 2040 GiB. Its size field is the disk and its
 CHS geometry the largest, which every reader takes to mean the size
-field. The kernel carries virtio and NVMe storage and virtio and e1000
-networking but not Hyper-V's or ENA's drivers, so no Azure or AWS
-instance boots the image yet. An existing output file is refused, and
-a finished image is published under its name only once complete.
-`--iso` writes the same server as a live medium instead: build-iso's
-medium of the server deployment, signed by the run key and carrying
-the account as a provision signed by that key too, which the live seed
-stages. It boots from optical or USB media with its volume in RAM, so
-a live server's host key and every write are lost at power-off. The
-volume is half of RAM: td-boot refuses a machine with less than 1 GiB,
-and the oracle boots it with 4 GiB. `qemu-boot-server` ends by
-composing an image and a live medium, each for another account and a
-fresh key, cold-booting each under UEFI firmware with no command line
-from the host, and holding both to the steady state and the same
-logins.
+field. "Cloud images" below says what each cloud needs. An existing
+output file is refused, and a finished image is published under its
+name only once complete. `--iso` writes the same server as a live
+medium instead: build-iso's medium of the server deployment, signed by
+the run key and carrying the account as a provision signed by that key
+too, which the live seed stages. It boots from optical or USB media
+with its volume in RAM, so a live server's host key and every write
+are lost at power-off. The volume is half of RAM: td-boot refuses a
+machine with less than 1 GiB, and the oracle boots it with 4 GiB.
+`qemu-boot-server` ends by composing an image and a live medium, each
+for another account and a fresh key, cold-booting each under UEFI
+firmware with no command line from the host, and holding both to the
+steady state and the same logins.
+
+### Cloud images
+
+The kernel carries each cloud's disk and NIC drivers (linux-x86-64's
+"CLOUD GUESTS"): Hyper-V's VMBus with storvsc, netvsc and the vPCI
+frontend for Azure, NVMe and ENA for EC2 Nitro, and virtio-scsi,
+virtio-net, NVMe and gVNIC for GCE, with KVM guest support. td-boot
+finds the volume on any of their disks (`sd*`, `nvme*`, `vd*`), and
+td-netd's watcher leases an address on any Ethernet interface backed
+by a device and renews it at half its lifetime. The console is `ttyS0`
+at 115200 baud, the serial port all three expose. `qemu-boot-server`
+boots the image from an NVMe disk, as Nitro attaches an EBS root
+volume; no cloud boot is tested.
+
+Each cloud takes the image as a UEFI disk with Secure Boot off, since
+the EFI-stub kernel is unsigned. Azure: upload the `--vhd` image as a
+page blob, make a managed disk of Hyper-V generation V2 from it (V1,
+the default, boots BIOS) and create a VM of the Standard security type
+(Trusted Launch turns Secure Boot on) with it as a specialized OS
+disk, for which Azure expects no provisioning report. EC2: import the
+raw or VHD image as a snapshot and register it with `--boot-mode uefi`
+and `--ena-support`, for Nitro instance types. GCE: pack the raw image
+as `disk.raw` with `tar --format=oldgnu -Sczf`, upload it and create
+an image with the `UEFI_COMPATIBLE` and `GVNIC` guest OS features.
+
+Not yet: td-netd adds its default route through the lease's router
+without an on-link route to it. GCE leases a /32, so that route fails,
+the watcher clears the address and asks again every 15 seconds, and a
+GCE instance never holds an address; Azure and EC2 routers are on the
+leased subnet. td-netd also applies no MTU (option 26) or classless
+static routes (option 121), which Azure and EC2 do not need. Nothing
+handles the ACPI power button, so a cloud's stop waits out its grace
+period and then cuts power, and Hyper-V's integration services
+(shutdown, heartbeat, KVP and time sync, which need CONNECTOR) are not
+built. Nothing reads instance metadata: the account and keys are the
+image's own.
 
 ## 11. Evicting a previous supervisor's services
 

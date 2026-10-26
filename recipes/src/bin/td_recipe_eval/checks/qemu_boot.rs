@@ -4918,6 +4918,9 @@ fn boot_headless(
 #[derive(Clone, Copy)]
 enum FirmwareAttachment {
     Virtio,
+    /// The disk alone on an NVMe controller, as an EC2 Nitro instance's EBS
+    /// root volume is presented.
+    Nvme,
     /// The ordinary disk carries the native installer fixture serial.
     InstalledFixture,
     /// A private decoy precedes the installed disk on the same bus.
@@ -4927,6 +4930,10 @@ enum FirmwareAttachment {
     /// Only an owned regular image in the installer medium-claim oracle.
     WritableUsbFixture,
 }
+
+/// The serial of `FirmwareAttachment::Nvme`'s namespace, within NVMe
+/// Identify's 20 bytes.
+const NVME_ROOT_SERIAL: &str = "td-root-volume";
 
 /// Firmware reads its kernel/initrd from the disk carried by BootPlan.
 #[derive(Clone, Copy)]
@@ -5040,7 +5047,9 @@ fn boot_source(
         source,
         BootSource::Firmware {
             installation_target: Some(_),
-            attachment: FirmwareAttachment::Virtio | FirmwareAttachment::InstalledFixture,
+            attachment: FirmwareAttachment::Virtio
+                | FirmwareAttachment::Nvme
+                | FirmwareAttachment::InstalledFixture,
             ..
         }
     ) {
@@ -5463,6 +5472,20 @@ fn boot_source(
                         &mut cmd,
                         crate::checks::vm_profile::DRIVE_ID,
                         install::protocol::TARGET_SERIAL,
+                        Some(1),
+                        disk.sector_size,
+                    )?;
+                } else if matches!(
+                    source,
+                    BootSource::Firmware {
+                        attachment: FirmwareAttachment::Nvme,
+                        ..
+                    }
+                ) {
+                    DiskBus::Nvme.attach(
+                        &mut cmd,
+                        crate::checks::vm_profile::DRIVE_ID,
+                        NVME_ROOT_SERIAL,
                         Some(1),
                         disk.sector_size,
                     )?;

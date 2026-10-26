@@ -420,8 +420,8 @@ pub fn recipe() -> Recipe {
     //    the kernel would switch such a handover back to xAPIC. AMD_IOMMU is
     //    written so remapping actually runs, keeping x2APIC, and so devices
     //    are DMA-isolated by the upstream lazy-flush default. Neither QEMU
-    //    machine td boots (pc, q35) has an AMD IOMMU, and without
-    //    HYPERVISOR_GUEST a guest keeps xAPIC, so those boots are unchanged.
+    //    machine td boots (pc, q35) has an AMD IOMMU; KVM guests take
+    //    x2APIC from KVM_GUEST (CLOUD GUESTS below), not from this.
     //
     //    Unasked: X86_AMD_PLATFORM_DEVICE selects COMMON_CLK (with HAVE_CLK
     //    and PM_CLK's def_bool behind it) and PINCTRL; PINCTRL_AMD selects
@@ -454,6 +454,40 @@ pub fn recipe() -> Recipe {
     //    off here; guarded with the keyring.
     //    Unasked: WLAN defaults in every vendor's menu (none of their
     //    drivers), and QRTR adds the AF_QIPCRTR socket family.
+    //
+    //    CLOUD GUESTS (td-svc/DESIGN.md §10, "Cloud images"): the drivers a
+    //    server image needs to find its disk and network on Azure, EC2 Nitro
+    //    and GCE. Azure's synthetic devices are on VMBus: storvsc presents the
+    //    OS disk as SCSI (sd*), and netvsc is its NIC; its NVMe-only sizes
+    //    present the disk controller over Hyper-V vPCI (PCI_HYPERV), as they
+    //    do accelerated-networking VFs, whose mlx5 and MANA drivers are not
+    //    built, so netvsc's synthetic path carries the traffic. Nitro
+    //    presents EBS as NVMe, already built in, and its NIC as ENA. GCE uses
+    //    virtio-net, virtio-scsi or NVMe, and gVNIC on the machine series that
+    //    require it. HYPERVISOR_GUEST is the one prompted parent allnoconfig
+    //    forces off; SCSI_LOWLEVEL and the NIC vendor menus are invisible
+    //    there (SCSI and NET are off), so olddefconfig already gave them
+    //    their default y, and their pins are defensive. HYPERV selects
+    //    PARAVIRT, and KVM_GUEST, which defaults on once PARAVIRT is, is
+    //    pinned on purpose: Nitro and GCE are KVM. X86_X2APIC is the T14s's,
+    //    above. HYPERV_IOMMU, Hyper-V's interrupt remapping for a large
+    //    Azure VM's x2APIC, defaults on from HYPERV under the T14s's
+    //    IOMMU_SUPPORT and is written, like I2C_HID, so losing that default
+    //    cannot drop it unnoticed. HYPERV_TIMER has no prompt and is guarded
+    //    only.
+    //    Unasked: KVM_GUEST selects PARAVIRT_CLOCK, ARCH_CPUIDLE_HALTPOLL and
+    //    X86_HV_CALLBACK_VECTOR and defaults in HALTPOLL_CPUIDLE (CPU_IDLE is
+    //    on) with CPU_IDLE_GOV_HALTPOLL, inert without KVM_HINTS_REALTIME,
+    //    and PTP_1588_CLOCK_KVM with PTP_1588_CLOCK_VMCLOCK (PTP_1588_CLOCK
+    //    already defaults on from ETHERNET); HYPERV selects IRQ_MSI_LIB, and
+    //    HYPERV_VMBUS defaults in HYPERV_KEYBOARD and selects the already
+    //    enabled SYSFB; PCI_HYPERV selects PCI_HYPERV_INTERFACE; HYPERV_NET
+    //    selects NLS and UCS2_STRING; ENA selects DIMLIB and NET_DEVLINK; GVE
+    //    selects PAGE_POOL. Every other SCSI_LOWLEVEL driver defaults off. So
+    //    QEMU's KVM guests now take kvmclock, x2APIC and paravirtual EOI, and
+    //    register /dev/ptp0; TCG guests and the laptops keep their clocks,
+    //    and each driver binds only its hypervisor's devices, so no other
+    //    device set changes.
     //
     //    COMPAT_32BIT_TIME has a visible prompt, so allnoconfig turns it off.
     //    It and IA32_EMULATION stay on because td-jail's development syscall
@@ -572,6 +606,21 @@ pub fn recipe() -> Recipe {
                   /^#? *CONFIG_ETHERNET[ =]/d; \
                   /^#? *CONFIG_NET_VENDOR_INTEL[ =]/d; \
                   /^#? *CONFIG_E1000[ =]/d; \
+                  /^#? *CONFIG_HYPERVISOR_GUEST[ =]/d; \
+                  /^#? *CONFIG_PARAVIRT[ =]/d; \
+                  /^#? *CONFIG_KVM_GUEST[ =]/d; \
+                  /^#? *CONFIG_HYPERV[ =]/d; \
+                  /^#? *CONFIG_HYPERV_VMBUS[ =]/d; \
+                  /^#? *CONFIG_SCSI_LOWLEVEL[ =]/d; \
+                  /^#? *CONFIG_HYPERV_STORAGE[ =]/d; \
+                  /^#? *CONFIG_HYPERV_NET[ =]/d; \
+                  /^#? *CONFIG_PCI_HYPERV[ =]/d; \
+                  /^#? *CONFIG_HYPERV_IOMMU[ =]/d; \
+                  /^#? *CONFIG_NET_VENDOR_AMAZON[ =]/d; \
+                  /^#? *CONFIG_ENA_ETHERNET[ =]/d; \
+                  /^#? *CONFIG_SCSI_VIRTIO[ =]/d; \
+                  /^#? *CONFIG_NET_VENDOR_GOOGLE[ =]/d; \
+                  /^#? *CONFIG_GVE[ =]/d; \
                   /^#? *CONFIG_INPUT[ =]/d; \
                   /^#? *CONFIG_INPUT_EVDEV[ =]/d; \
                   /^#? *CONFIG_INPUT_KEYBOARD[ =]/d; \
@@ -790,6 +839,21 @@ pub fn recipe() -> Recipe {
                    'CONFIG_ETHERNET=y' \
                    'CONFIG_NET_VENDOR_INTEL=y' \
                    'CONFIG_E1000=y' \
+                   'CONFIG_HYPERVISOR_GUEST=y' \
+                   'CONFIG_PARAVIRT=y' \
+                   'CONFIG_KVM_GUEST=y' \
+                   'CONFIG_HYPERV=y' \
+                   'CONFIG_HYPERV_VMBUS=y' \
+                   'CONFIG_SCSI_LOWLEVEL=y' \
+                   'CONFIG_HYPERV_STORAGE=y' \
+                   'CONFIG_HYPERV_NET=y' \
+                   'CONFIG_PCI_HYPERV=y' \
+                   'CONFIG_HYPERV_IOMMU=y' \
+                   'CONFIG_NET_VENDOR_AMAZON=y' \
+                   'CONFIG_ENA_ETHERNET=y' \
+                   'CONFIG_SCSI_VIRTIO=y' \
+                   'CONFIG_NET_VENDOR_GOOGLE=y' \
+                   'CONFIG_GVE=y' \
                    'CONFIG_INPUT=y' \
                    'CONFIG_INPUT_EVDEV=y' \
                    'CONFIG_INPUT_KEYBOARD=y' \
@@ -1171,6 +1235,22 @@ pub fn recipe() -> Recipe {
                  grep -qx 'CONFIG_EXTRA_FIRMWARE_DIR=\"td-firmware\"' .config || { echo 'EXTRA_FIRMWARE_DIR is not the build-tree firmware directory' >&2; exit 1; }; \
                  if grep -q '^CONFIG_CFG80211_REQUIRE_SIGNED_REGDB=y' .config; then echo 'CFG80211_REQUIRE_SIGNED_REGDB on — it selects the trusted keyring and its openssl-linked certs/ tool' >&2; exit 1; fi; \
                  if grep -q '^CONFIG_SYSTEM_TRUSTED_KEYRING=y' .config; then echo 'SYSTEM_TRUSTED_KEYRING on — a select overrode its pin, and certs/ would need openssl' >&2; exit 1; fi; \
+                 grep -q '^CONFIG_HYPERVISOR_GUEST=y' .config || { echo 'HYPERVISOR_GUEST off — guest support stays hidden, so no hypervisor drivers can be chosen' >&2; exit 1; }; \
+                 grep -q '^CONFIG_PARAVIRT=y' .config || { echo 'PARAVIRT off — Hyper-V and KVM guest support need the paravirt layer' >&2; exit 1; }; \
+                 grep -q '^CONFIG_KVM_GUEST=y' .config || { echo 'KVM_GUEST off — a KVM cloud guest (EC2 Nitro, GCE) has no kvmclock or paravirt EOI' >&2; exit 1; }; \
+                 grep -q '^CONFIG_HYPERV=y' .config || { echo 'HYPERV off — Hyper-V (Azure) guest support is off' >&2; exit 1; }; \
+                 grep -q '^CONFIG_HYPERV_VMBUS=y' .config || { echo 'HYPERV_VMBUS off — the synthetic devices of Azure are on VMBus, so neither its disk nor its NIC appears' >&2; exit 1; }; \
+                 grep -q '^CONFIG_SCSI_LOWLEVEL=y' .config || { echo 'SCSI_LOWLEVEL off — SCSI host drivers stay hidden, so storvsc and virtio-scsi cannot be chosen' >&2; exit 1; }; \
+                 grep -q '^CONFIG_HYPERV_STORAGE=y' .config || { echo 'HYPERV_STORAGE off — the OS disk of an Azure VM (storvsc) is invisible' >&2; exit 1; }; \
+                 grep -q '^CONFIG_HYPERV_NET=y' .config || { echo 'HYPERV_NET off — the synthetic NIC of an Azure VM (netvsc) has no driver' >&2; exit 1; }; \
+                 grep -q '^CONFIG_PCI_HYPERV=y' .config || { echo 'PCI_HYPERV off — an Azure size with an NVMe disk controller presents it over Hyper-V vPCI, so its OS disk is invisible' >&2; exit 1; }; \
+                 grep -q '^CONFIG_NET_VENDOR_AMAZON=y' .config || { echo 'NET_VENDOR_AMAZON off — the Amazon NIC drivers stay hidden' >&2; exit 1; }; \
+                 grep -q '^CONFIG_ENA_ETHERNET=y' .config || { echo 'ENA_ETHERNET off — the ENA NIC of an EC2 Nitro instance has no driver' >&2; exit 1; }; \
+                 grep -q '^CONFIG_SCSI_VIRTIO=y' .config || { echo 'SCSI_VIRTIO off — a GCE persistent disk on virtio-scsi is invisible' >&2; exit 1; }; \
+                 grep -q '^CONFIG_NET_VENDOR_GOOGLE=y' .config || { echo 'NET_VENDOR_GOOGLE off — the Google NIC drivers stay hidden' >&2; exit 1; }; \
+                 grep -q '^CONFIG_GVE=y' .config || { echo 'GVE off — a GCE machine series that requires gVNIC has no network' >&2; exit 1; }; \
+                 grep -q '^CONFIG_HYPERV_TIMER=y' .config || { echo 'HYPERV_TIMER off — an Azure VM has no Hyper-V clocksource. It is unprompted (def_bool HYPERV && X86), so something took HYPERV away' >&2; exit 1; }; \
+                 grep -q '^CONFIG_HYPERV_IOMMU=y' .config || { echo 'HYPERV_IOMMU off — Hyper-V interrupt remapping, which a large Azure VM needs for x2APIC, is missing' >&2; exit 1; }; \
                  if grep -q '^CONFIG_IPC_NS=y' .config; then echo 'IPC_NS on — it is default y behind SYSVIPC||POSIX_MQUEUE, so pinning either brings it along unasked; td-jail omits CLONE_NEWIPC and APPLICATIONS.md §0 defers it deliberately' >&2; exit 1; fi".replace("@EFI_CMDLINE@", &format!("{:?}", crate::shared::efi_default_cmdline())),
             ],
         )
@@ -1665,6 +1745,67 @@ mod tests {
                     pin.key
                 );
             }
+        }
+    }
+
+    /// td-svc/DESIGN.md §10 "Cloud images": the disk and NIC drivers of
+    /// Azure, EC2 Nitro and GCE are built in and survive config resolution.
+    #[test]
+    fn cloud_guest_drivers_are_builtin_after_config_resolution() {
+        let text = recipe()
+            .steps
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|step| match step {
+                Step::Run { argv, .. } => Some(argv.join("\n")),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        for symbol in [
+            "HYPERVISOR_GUEST",
+            "PARAVIRT",
+            "KVM_GUEST",
+            "HYPERV",
+            "HYPERV_VMBUS",
+            "SCSI_LOWLEVEL",
+            "HYPERV_STORAGE",
+            "HYPERV_NET",
+            "PCI_HYPERV",
+            "HYPERV_IOMMU",
+            "NET_VENDOR_AMAZON",
+            "ENA_ETHERNET",
+            "SCSI_VIRTIO",
+            "NET_VENDOR_GOOGLE",
+            "GVE",
+        ] {
+            let pin = format!("'CONFIG_{symbol}=y'");
+            let stale = format!("/^#? *CONFIG_{symbol}[ =]/d;");
+            assert_eq!(text.matches(&stale).count(), 1, "{symbol}");
+            assert_eq!(text.matches(&pin).count(), 1, "{symbol}");
+            assert!(
+                text.contains(&format!("grep -q '^CONFIG_{symbol}=y' .config")),
+                "{symbol}"
+            );
+        }
+        // No prompt: guarded only.
+        assert!(!text.contains("CONFIG_HYPERV_TIMER[ =]/d"));
+        assert!(!text.contains("'CONFIG_HYPERV_TIMER=y'"));
+        assert!(text.contains("grep -q '^CONFIG_HYPERV_TIMER=y' .config"));
+        // EC2 presents EBS as NVMe; x2APIC is pinned for the T14s.
+        assert!(text.contains("'CONFIG_BLK_DEV_NVME=y'"));
+        assert!(text.contains("grep -q '^CONFIG_X86_X2APIC=y' .config"));
+        // Each guard message is a single-quoted shell word. The guard script
+        // is one line, so every message in it is split out.
+        let messages = text
+            .split("{ echo '")
+            .skip(1)
+            .chain(text.split("then echo '").skip(1))
+            .collect::<Vec<_>>();
+        assert!(messages.len() > 100);
+        for rest in messages {
+            let message = rest.split("' >&2").next().unwrap_or_default();
+            assert!(!message.contains('\''), "{message}");
         }
     }
 
