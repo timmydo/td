@@ -416,6 +416,7 @@ dependencies = [
  "sha2",
  "td-engine",
  "ureq",
+ "webpki-roots 1.0.8",
 ]
 
 [[package]]

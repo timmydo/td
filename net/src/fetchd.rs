@@ -55,6 +55,9 @@
 // Authentication is the socket's: `/run/user/<uid>` is mode 0700 and the
 // socket 0600, so only that uid connects. This crate forbids `unsafe`, so
 // peer credentials are not read; the mode is the whole of it.
+mod fetch_deadline;
+mod fetch_pool;
+
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
@@ -671,7 +674,8 @@ fn handle(
             }
             return;
         }
-        read => read.and_then(|request| perform(request, policy, limits.origin)),
+        read => read
+            .and_then(|request| perform_with_pool(request, policy, limits.origin, &origins.pool)),
     };
     let mut writer = Bounded::new(writer, limits.client);
     let written = match outcome {
@@ -935,9 +939,22 @@ enum Timing {
 }
 
 /// A buffered exchange: the origin's whole body, under the request's limit.
+#[cfg(test)]
 fn perform(request: Request, policy: Policy, origin: Duration) -> Result<Reply, Fault> {
+    perform_with_pool(request, policy, origin, &fetch_pool::Pool::default())
+}
+fn perform_with_pool(
+    request: Request,
+    policy: Policy,
+    origin: Duration,
+    pool: &fetch_pool::Pool,
+) -> Result<Reply, Fault> {
     let limit = request.limit;
-    let ((status, headers), response) = open(request, policy, Timing::Whole(origin))?;
+    check_scheme(&request.url)?;
+    let lease = pool.acquire(&request, policy, origin, Instant::now(), || {
+        build_agent(&request, policy, Timing::Whole(origin))
+    })?;
+    let ((status, headers), response) = send_origin(request, lease.agent())?;
     let mut body = Vec::new();
     response
         .into_reader()
@@ -947,11 +964,25 @@ fn perform(request: Request, policy: Policy, origin: Duration) -> Result<Reply, 
     if body.len() as u64 > limit {
         return Err(Fault::Refused(format!("response over {limit} bytes")));
     }
+    pool.completed(lease, Instant::now());
     Ok(Reply {
         status,
         headers,
         body,
     })
+}
+
+fn public_tls() -> Result<ureq::rustls::ClientConfig, Fault> {
+    let roots = ureq::rustls::RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    };
+    Ok(ureq::rustls::ClientConfig::builder_with_provider(
+        ureq::rustls::crypto::ring::default_provider().into(),
+    )
+    .with_protocol_versions(&[&ureq::rustls::version::TLS12, &ureq::rustls::version::TLS13])
+    .map_err(|e| Fault::Transport(format!("TLS configuration: {e}")))?
+    .with_root_certificates(roots)
+    .with_no_client_auth())
 }
 
 fn custom_tls(pem: &[u8]) -> Result<ureq::rustls::ClientConfig, Fault> {
@@ -983,6 +1014,14 @@ fn open(
     policy: Policy,
     timing: Timing,
 ) -> Result<(OriginHead, ureq::Response), Fault> {
+    let agent = build_agent(&request, policy, timing)?;
+    send_origin(request, &agent)
+}
+fn build_agent(
+    request: &Request,
+    policy: Policy,
+    timing: Timing,
+) -> Result<fetch_pool::Agent, Fault> {
     check_scheme(&request.url)?;
     let public = if request.public {
         Some(crate::egress::Local::read().map_err(|e| {
@@ -1006,12 +1045,11 @@ fn open(
             Method::Post => 0,
         }))
         .user_agent("td-fetchd/1");
+    #[cfg(not(test))]
+    let mut config = None;
     #[cfg(test)]
-    let builder = match tests::MAIL_TLS.get() {
-        Some(config) => builder.tls_config(Arc::clone(config)),
-        None => builder,
-    };
-    let builder = if let Some(pem) = request.tls_ca.as_deref() {
+    let mut config = tests::MAIL_TLS.get().map(Arc::clone);
+    if let Some(pem) = request.tls_ca.as_deref() {
         if !request
             .url
             .split_once("://")
@@ -1019,9 +1057,34 @@ fn open(
         {
             return Err(Fault::Refused("custom TLS roots require HTTPS".into()));
         }
-        builder.tls_config(Arc::new(custom_tls(pem)?))
-    } else {
-        builder
+        config = Some(Arc::new(custom_tls(pem)?));
+    }
+    let budget = match timing {
+        Timing::Whole(value) | Timing::Idle(value) => value,
+    };
+    let deadline = fetch_deadline::Deadline::new(
+        Instant::now()
+            .checked_add(budget)
+            .ok_or_else(|| Fault::Transport("HTTPS deadline overflow".into()))?,
+    );
+    let builder = match timing {
+        Timing::Whole(_) => {
+            let config = match config {
+                Some(config) => config,
+                None => Arc::new(public_tls()?),
+            };
+            builder
+                .tls_connector(Arc::new(fetch_deadline::Connector {
+                    config,
+                    deadline: deadline.clone(),
+                }))
+                .max_idle_connections(usize::from(fetch_pool::can_reuse(request)))
+                .max_idle_connections_per_host(1)
+        }
+        Timing::Idle(_) => match config {
+            Some(config) => builder.tls_config(config),
+            None => builder,
+        },
     };
     let agent = match timing {
         // One deadline for the exchange: ureq applies it in place of its
@@ -1038,6 +1101,18 @@ fn open(
             .max_idle_connections(0),
     }
     .build();
+    Ok(fetch_pool::Agent {
+        agent,
+        resolver,
+        deadline,
+    })
+}
+fn send_origin(
+    request: Request,
+    owner: &fetch_pool::Agent,
+) -> Result<(OriginHead, ureq::Response), Fault> {
+    let agent = &owner.agent;
+    let resolver = &owner.resolver;
     let Request {
         tls_ca: _,
         method,
@@ -1134,6 +1209,7 @@ const EXIT_PATIENCE: Duration = Duration::from_secs(1);
 struct Origins {
     open: Mutex<usize>,
     most: usize,
+    pool: fetch_pool::Pool,
 }
 
 impl Origins {
@@ -1141,6 +1217,7 @@ impl Origins {
         Arc::new(Origins {
             open: Mutex::new(0),
             most,
+            pool: fetch_pool::Pool::default(),
         })
     }
 
@@ -1950,7 +2027,12 @@ mod tests {
         }
     }
 
-    fn account_tls_exchange(ca: Option<&[u8]>, host: &str, expired: bool) -> bool {
+    fn account_tls_exchange(
+        ca: Option<&[u8]>,
+        host: &str,
+        expired: bool,
+        pool: &fetch_pool::Pool,
+    ) -> bool {
         use ureq::rustls::{
             pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer},
             ServerConfig, ServerConnection, StreamOwned,
@@ -1976,43 +2058,78 @@ mod tests {
         let server = std::thread::spawn(move || {
             let (socket, _) = listener.accept().unwrap();
             socket
-                .set_read_timeout(Some(Duration::from_secs(5)))
+                .set_read_timeout(Some(Duration::from_secs(60)))
                 .unwrap();
             socket
-                .set_write_timeout(Some(Duration::from_secs(5)))
+                .set_write_timeout(Some(Duration::from_secs(60)))
                 .unwrap();
             let mut stream = StreamOwned::new(ServerConnection::new(config).unwrap(), socket);
-            let mut reader = BufReader::new(&mut stream);
-            loop {
-                let mut line = String::new();
-                match reader.read_line(&mut line) {
-                    Ok(0) | Err(_) => return,
-                    Ok(_) if line == "\r\n" => break,
-                    Ok(_) => {}
+            // One accepted socket must carry both successful requests.
+            for _ in 0..2 {
+                let mut reader = BufReader::new(&mut stream);
+                loop {
+                    let mut line = String::new();
+                    match reader.read_line(&mut line) {
+                        Ok(0) | Err(_) => return,
+                        Ok(_) if line == "\r\n" => break,
+                        Ok(_) => {}
+                    }
+                }
+                if stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok",
+                    )
+                    .is_err()
+                {
+                    return;
+                }
+                if stream.flush().is_err() {
+                    return;
                 }
             }
-            let _ = stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
-            let _ = stream.flush();
         });
-        let mut request = account_request(
-            &format!("method GET\nurl HTTPS://{host}:{port}/\nredirects 0\n"),
-            b"",
-        )
-        .unwrap();
-        request.tls_ca = ca.map(Vec::from);
-        let result = perform(request, LENIENT, Duration::from_secs(5));
+        let mut success = true;
+        for _ in 0..2 {
+            let mut request = account_request(
+                &format!("method GET\nurl HTTPS://{host}:{port}/\nredirects 0\n"),
+                b"",
+            )
+            .unwrap();
+            request.tls_ca = ca.map(Vec::from);
+            let result = perform_with_pool(request, LENIENT, Duration::from_secs(60), pool);
+            if !result.is_ok_and(|reply| reply.status == 200 && reply.body == b"ok") {
+                success = false;
+                break;
+            }
+        }
         server.join().unwrap();
-        result.is_ok_and(|reply| reply.status == 200 && reply.body == b"ok")
+        success
     }
 
     #[test]
     fn account_ca_preserves_verification_and_does_not_leak() {
-        assert!(!account_tls_exchange(None, "localhost", false));
-        assert!(account_tls_exchange(Some(ACCOUNT_CA), "localhost", false));
-        assert!(!account_tls_exchange(Some(ACCOUNT_CA), "127.0.0.1", false));
-        assert!(!account_tls_exchange(Some(ACCOUNT_CA), "localhost", true));
-        assert!(!account_tls_exchange(None, "localhost", false));
+        let pool = fetch_pool::Pool::default();
+        assert!(!account_tls_exchange(None, "localhost", false, &pool));
+        assert!(account_tls_exchange(
+            Some(ACCOUNT_CA),
+            "localhost",
+            false,
+            &pool
+        ));
+        assert!(!account_tls_exchange(None, "localhost", false, &pool));
+        assert!(!account_tls_exchange(
+            Some(ACCOUNT_CA),
+            "127.0.0.1",
+            false,
+            &pool
+        ));
+        assert!(!account_tls_exchange(
+            Some(ACCOUNT_CA),
+            "localhost",
+            true,
+            &pool
+        ));
+        assert!(!account_tls_exchange(None, "localhost", false, &pool));
     }
 
     fn account_request(head: &str, body: &[u8]) -> Result<Request, String> {

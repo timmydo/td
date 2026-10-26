@@ -10453,7 +10453,7 @@ webpki-roots, and no decoder. So:
    `/etc/ssl/certs`, where a jail without the network has nothing to
    verify with it; unbinding it from such jails is a td-jail change for
    a later landing. Firefox keeps `shared=network`; it has its own TLS.
-3. One request per connection, a text header block and then the body.
+3. One request per Unix connection, a text header block and then the body.
    The client writes `td-fetch 1`, `method GET` or `POST`, `url …`, zero
    or more `header name: value` lines with the name in lower case,
    `limit N` for the most response bytes it will take, `redirects N`
@@ -10495,13 +10495,37 @@ webpki-roots, and no decoder. So:
    expiration and hostname verification. Empty, invalid or oversized
    bundles fail; HTTP, streaming, public-policy and automatic-redirect
    combinations are refused. The service never reads a caller-named
-   certificate path, changes global roots or pools connections between
-   requests. An older service refuses the unknown field, without fallback.
+   certificate path or changes global roots. Reused HTTPS agents are scoped
+   to the exact CA bytes (or the public-root choice), address policy, redirect
+   limit and whole-exchange budget. An older service refuses the unknown
+   field, without fallback.
    td-mail's optional per-account `tls_ca_file` is an absolute path read
    at account connection, bounded to the same size. It supplies these
    bytes only for the origin of the configured `well_known_url`; other
    origins use public roots. The file must be visible to the application
    in its jail. This changes TLS trust, never the destination policy.
+
+   Counted, non-public HTTPS requests can reuse a connection when GET
+   explicitly requests zero redirects, or POST carries a nonempty body.
+   Every exchange supplies fresh headers and credentials. Each agent is
+   exclusively checked out until its bounded response is fully consumed;
+   errors or incomplete bodies discard it. A service retains at most four
+   idle agents, each with one idle connection, beside at most four active
+   workers. Checkout and return retire agents after four idle seconds,
+   sixty seconds of lifetime or sixteen completed exchanges; there is no
+   background idle reaper. ureq still keys sockets by origin and applies
+   address policy when connecting. HTTP, automatic redirects, empty POST,
+   public-policy and streamed requests do not reuse pooled connections.
+   This avoids ureq's pooled-header retry for a complete empty mutation;
+   a nonempty POST is not replayed after its body is sent.
+
+   ureq clears pooled socket timeouts. A wrapper below HTTPS TLS restores
+   the remaining exchange deadline before every raw read, write and flush,
+   including writes on reused connections. The service directly uses the
+   already-locked webpki-roots package to construct the same public root
+   configuration as ureq, with the existing ring provider and TLS 1.2/1.3.
+   Custom roots replace public roots. Streaming retains its separate process
+   and idle-deadline policy below. Blocking DNS remains the recorded gap.
 
    A request may carry a `stream` line, with no value; without it the
    above is the whole protocol, unchanged. With it, the reply head ends
