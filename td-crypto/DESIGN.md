@@ -119,7 +119,8 @@ provider configuration types or error chains; a public function returning a
 Rustls type would breach the boundary even without a direct consumer dependency.
 Concrete backend state lives in private fields/modules. There is one selected
 implementation per operation in source, with no feature, environment or runtime
-backend selector.
+backend selector. The allocation-free `Sha256` and worker-oriented `BulkSha256`
+are distinct resource contracts with fixed implementations, described below.
 
 `Entropy::fill` returning success fills the entire caller slice. On a returned
 error, discard the whole output, including bytes written before the error.
@@ -220,8 +221,9 @@ or compiler/caller copies.
 words, one 64-byte partial block, a checked byte counter and terminal-state
 flag. Construction, updates and consuming finish use no heap, native provider,
 locks or OS calls. The fallible public API remains unchanged. The concrete
-`Crypto` factory delegates to this constructor. Only this direct streaming
-operation uses the owned primitive; Rustls and ES256 signing still use AWS-LC.
+`Crypto` factory delegates to this constructor. This direct streaming operation
+uses the owned primitive; bulk worker hashing, Rustls and ES256 signing use
+AWS-LC.
 
 The implementation adapts the FIPS 180-4 constants and compression algorithm
 already present in engine/src/sha256.rs. It owns its checked streaming and
@@ -261,6 +263,27 @@ qualify the no-allocation and content-independent control/address claims for
 the recorded compiler/flags/target. Repeat artifact review when those change.
 This does not complete whole-service stack/RSS qualification or qualify other
 primitives, targets or microarchitectural leakage outside that review scope.
+
+### Bulk worker SHA-256
+
+`BulkSha256` is an opaque streaming digest for bulk I/O workers, implemented
+with the already admitted AWS-LC SHA-256 context and CPU dispatch. It implements
+`Digest` but does not replace `Sha256` or the `Crypto::sha256` factory. This
+separate API permits native allocation; it makes no allocation-free, constant
+stack/RSS, or portable secure-erasure claim. The caller bounds simultaneous
+contexts, input chunks and total input, and checks deadlines between chunks.
+No backend context, algorithm choice, clone or reset crosses the API.
+
+Construction and consuming finish catch Rust unwinds and return only Crypto.
+Each update removes the native context before checking the cumulative
+`u64::MAX / 8` byte limit and before entering the unwind boundary. Only success
+restores it. Length refusal, returned error or unwind permanently retires the
+operation, including after a partial native update. Native cleanup releases
+context storage; compiler copies and abort/kill paths retain the ordinary
+backend limitations. Native abort, OOM, panic hooks and blocking are not
+contained. Tests compare padding and chunk boundaries with the independently
+qualified owned digest and inject update errors/unwinds; no test asserts a
+wall-clock performance threshold.
 
 ### Crypto factory and P-256 signing keys
 
@@ -1061,8 +1084,9 @@ and API confinement but reports runtime untested; successful compilation
 is not x86-64 runtime or resource qualification.
 Reuse compatible reviewed pins without inheriting td-net's dependency set.
 Rustls and aws-lc-rs are direct dependencies only of td-crypto, resolving one
-AWS-LC version pair for entropy, comparison, P-256 signing and TLS. The owned
-SHA-256 implementation serves direct streaming digests only. Disable unused
+AWS-LC version pair for bulk digests, entropy, comparison, P-256 signing and TLS.
+The owned SHA-256 implementation serves allocation-free streaming digests.
+Disable unused
 features and all undeclared build fallbacks.
 The portable musl artifact follows td-mta/DESIGN.md section 3; it does not
 inherit the provenance of td's separate target image graph.
@@ -1155,8 +1179,9 @@ independent cryptographic and exact-artifact side-channel review, including
 compiler/flags/target, nonce generation and entropy/optimization-barrier choices.
 Passing functional tests alone is insufficient. The direct streaming SHA-256
 operation is an independently qualified early
-cutover from F04: its native Context adapter is removed atomically, while
-AWS-LC remains required for entropy, comparison, P-256 and Rustls. Further
+cutover from F04: its native Context adapter was removed atomically. Bulk
+workers now have the separate allocating digest contract above; AWS-LC also
+remains required for entropy, comparison, P-256 and Rustls. Further
 candidates stay test-only until their qualified cutover; remove each obsolete
 adapter and remove native dependencies/build inputs when their final user
 is replaced. Do not prebuild unused primitive interfaces.

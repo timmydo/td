@@ -789,7 +789,7 @@ impl Body<'_> {
 
     fn verify(&mut self) -> Result<(), ports::Error> {
         let mut timing = crate::performance::Timer::start(crate::performance::Phase::BodyVerify);
-        let mut digest = Provider.sha256()?;
+        let mut digest = td_crypto::BulkSha256::try_new()?;
         let chunks = self.len().div_ceil(CHUNK);
         let mut start = 0;
         while start < chunks {

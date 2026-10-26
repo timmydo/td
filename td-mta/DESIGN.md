@@ -2879,3 +2879,11 @@ fresh snapshot, while a retained connection performs fresh authorization in a
 separate transaction after verification and before response bytes. POSTGRES
 owns its authority and retirement rules; RESOURCES owns its unchanged active
 connection count.
+
+PostgreSQL body verification uses td-crypto's opaque `BulkSha256` operation
+to accelerate complete-body hashing on the storage worker. It retains one
+native digest context per active verification and updates it with each existing
+64 KiB chunk. Full length, ordinal and digest checks still precede publication
+of a verified pin; no header-only prefix substitutes for body verification.
+The allocation-free digest factory remains available to other operations.
+POSTGRES.md owns the snapshot and deadline contract.

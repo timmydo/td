@@ -7122,3 +7122,18 @@ the fresh authorization turn is capped at ten seconds and the original body
 deadline. Cache borrows end before output. Sender maintenance can retire the
 idle checker during slow response writes, and fixed-worker maintenance retires
 it while no request is active. A worker retains at most one idle permit.
+
+## Bulk body verification
+
+The verified body reader hashes all chunks with td-crypto's opaque
+`BulkSha256`, backed by the existing admitted AWS-LC SHA-256 implementation.
+It retains one digest context only for the verification pass, feeding the
+existing 64 KiB chunks from batches of at most eight. The account, immutable
+snapshot, ordinal/extent checks, final constant-time digest comparison and
+original deadline remain unchanged. Error or unwind retires the digest and
+refuses the verified pin. Empty bodies still require the SHA-256 empty digest.
+The worker checks its original deadline around each bounded chunk batch;
+native hashing is not independently cancellable. Native context allocation
+belongs to the existing process/provider allowance, bounded by active workers.
+This path is not an allocation-free primitive. Other digest callers retain
+the existing owned implementation and storage bytes are unchanged.

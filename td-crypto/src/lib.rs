@@ -16,6 +16,8 @@ compile_error!("td-crypto requires panic=unwind for its provider error boundary"
 
 mod sha256;
 pub use sha256::Sha256;
+mod bulk_sha256;
+pub use bulk_sha256::BulkSha256;
 mod entropy;
 pub use entropy::SystemEntropy;
 mod pem;
