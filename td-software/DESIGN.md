@@ -90,7 +90,7 @@ as `tda65536` (§W.9). Proposal: replace the per-application units with
 one fixed root operation, modelled on `application-start`:
 
 ```text
-application-cache OWNER APP install|update|remove|status
+application-cache OWNER APP install|update|remove|delete-data|status
 ```
 
 Root selects the account from the immutable registry and the ledger, as
@@ -99,7 +99,8 @@ the same credential drop. No caller supplies an executable, UID, path or
 ref.
 
 **How a request arrives.** td-software sends `install NAME`, `update
-NAME`, `remove NAME`, `status NAME` and `launch NAME` on the compositor
+NAME`, `remove NAME`, `delete-data NAME`, `status NAME` and `launch NAME`
+on the compositor
 control socket. That socket admits only exact human kernel credentials
 (td-compositor/DESIGN.md §15, "Access control"), and §W.7 (2) already
 plans to expose launches there. The compositor forwards each request
@@ -114,15 +115,19 @@ holds: running the application's own account to write its own cache
 grants the human nothing new. Install and update do exactly what a first
 launch and the forced check did before. Remove deletes only what a
 reinstall can fetch again, and keeps `/var/lib/td/applications/APP_UID`
-state (§4.2).
+state (§4.2). Delete data deletes only state the application's own
+account wrote under its own home. No td-software operation takes the
+secure path: each changes only what one application account owns, never
+the human's files, a system location or another application.
 
 The cost is that any human-UID program can reach the control socket. Such
-a program could remove Firefox's payload or start a large download. It
-could not reach the application's state, an admission rule or a system
-location. td-software asks for removal with td-ui's confirmation dialog,
-which is not secure-path consent and needs none, since a reinstall
-undoes it. "Delete data" (§4.2) cannot be undone, so it alone takes the
-secure path; that keeps the secure prompt rare.
+a program could remove Firefox's payload, start a large download, or
+delete an application's state, which cannot be undone. It could not
+reach the human's files, an admission rule, a system location or
+another account. td-software asks for Remove and Delete data with td-ui's
+confirmation dialog; that dialog protects against a slip, not against a
+hostile program running as the human, which the repository user accepted
+in exchange for no secure prompt.
 
 **Status.** The human cannot read the cache: each application home is
 mode 0700 and owned by its account, and so is the cache (§W.9). A new
@@ -183,8 +188,10 @@ whose update fetches as before.
   `/var/lib/td/applications/APP_UID/.td/app/NAME`, so a reinstall
   finds the profile again.
 - **Delete data** is a separate action on a removed application that
-  deletes that jail state. It cannot be undone, so it takes the secure
-  path (§3).
+  deletes that jail state, run as the application's account. It cannot
+  be undone; td-software confirms it with td-ui's dialog and it takes no
+  secure path (§3). It refuses while an instance of the application
+  runs.
 
 ## 5. A launcher that follows installs
 
@@ -247,12 +254,12 @@ own, and install-on-demand is deleted only in the last one, so Firefox
 can be installed at every commit.
 
 1. **td-app.** Add the `status` verb, the progress record, the `remove`
-   verb and offline revalidation. Add the root `application-cache`
+   and `delete-data` verbs and offline revalidation. Add the root `application-cache`
    operation. Nothing that users see changes, and on-demand still
    works.
 2. **td-software.** The program, its launch request and its card entry.
    It lists applications and their status, and can install, update,
-   remove and launch through the control socket. It runs beside
+   remove, delete data and launch through the control socket. It runs beside
    on-demand: both paths go through the same td-app admission into the
    same cache, so they cannot disagree.
 3. **A table-driven card.** The compositor reads the immutable table,
@@ -307,9 +314,8 @@ The repository user settled the open questions:
    asked for and can watch.
 2. **Removal and state.** Remove keeps the jail state by default; a
    separate "Delete data" action deletes it (§4.2).
-3. **Confirming removal.** td-ui's confirmation dialog suffices for
-   Remove, which a reinstall undoes. "Delete data" takes the secure path
-   (§3).
+3. **Confirmation.** No td-software operation takes the secure path.
+   td-ui's confirmation dialog guards Remove and Delete data (§3).
 4. **Updates.** Only from td-software. The unwaited daily check beside a
    launch goes (§4.1, §6); no background timer replaces it.
 5. **Stale after a system update.** Offline revalidation at launch, as
