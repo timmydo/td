@@ -198,6 +198,15 @@ it in a commit of its own: the kit's reconstructed NAR digests
 `td-builder gate-crates crypto-portable-prepare` for each architecture,
 and its rustdoc API diagnostic (`builder/src/crypto_api.rs`) pins
 rustdoc's JSON `format_version`, which a new release usually advances.
+Before moving that number, diff `src/rustdoc-json-types/lib.rs` and
+`src/librustdoc/json/conversions.rs` between the release tags: the
+diagnostic tolerates added fields, but not a renamed or removed field
+it reads, a field whose meaning changes (such as the source of
+`target_features[].globally_enabled`), or a new field inside an item
+body carrying an `id` key, which its walker follows. Then grep
+PORTABLE.md and `crypto_api.rs` for the old number, which they
+restate. Prove the kit with `crypto-portable-build` and
+`crypto-portable-cross-build` over the same archive directory.
 
 ## Holds
 

@@ -13,7 +13,7 @@ as a target recipe input.
 
 ## x86-64 and aarch64 musl headers
 
-The header source is musl 1.2.5, matching the version named by Rust 1.96.0's
+The header source is musl 1.2.5, matching the version named by Rust 1.99.1's
 `src/ci/docker/scripts/musl-toolchain.sh`. Rust's target standard library owns
 the linked libc and its upstream patches. This command generates headers;
 it does not build or replace libc, and does not claim that an unpatched musl
@@ -85,7 +85,7 @@ producing an executable requires the matching target kit and compiler below.
 
 ## Rust host kit and target standard library
 
-The portable path uses the upstream Rust 1.96.0 GNU host compiler, Cargo,
+The portable path uses the upstream Rust 1.99.1 GNU host compiler, Cargo,
 GNU host standard library and musl target standard library. The compiler and
 its target library must be the matching upstream build: td's source-built
 Rust identifies itself differently and rejects the upstream target library
@@ -93,17 +93,17 @@ with E0514. This host-only exception does not admit any downloaded Rust
 component into td's source-built distribution. No rustup state is changed.
 
 Each build selects four archives under the upstream prefix
-`https://static.rust-lang.org/dist/2026-05-28/`:
+`https://static.rust-lang.org/dist/2026-10-15/`:
 
 | Archive (`.tar.xz`) | Bytes | SHA-256 |
 | --- | ---: | --- |
-| `rustc-1.96.0-x86_64-unknown-linux-gnu` | 80188348 | `7d7fa1d0cfb0fab71a956bb78f41107202c17f30ab56c45288e869a37fd9633d` |
-| `cargo-1.96.0-x86_64-unknown-linux-gnu` | 11154668 | `dee75c3c8f9f600ad75bc0c93249e767d3047845a4dd668327ce43ab039ba266` |
-| `rust-std-1.96.0-x86_64-unknown-linux-gnu` | 29740704 | `c09c7c646248f14f473f5f7a029af15ee57c3a9f9bc93dfa72d9621938586b82` |
-| `rust-std-1.96.0-x86_64-unknown-linux-musl` | 38833276 | `4db24564076c243b377585bec0b938388638301ea5003d6245c4cbf9d86b11d0` |
-| `rust-std-1.96.0-aarch64-unknown-linux-musl` | 27278268 | `e7d89a29abcc2cf2f31cfe3d898c1713fb12f395e788809d3b01b23fdd5813b4` |
+| `rustc-1.99.1-x86_64-unknown-linux-gnu` | 84098960 | `2ff05ff9c08a90861e7f6e4065b40a8b87463b4576186fd613871c3e37f2091f` |
+| `cargo-1.99.1-x86_64-unknown-linux-gnu` | 10954816 | `53f3521949404d595efb06a55c12c5658d4ed1c75566f33d3d514eaebe70bd8a` |
+| `rust-std-1.99.1-x86_64-unknown-linux-gnu` | 31563228 | `109b074225bf5b9ea3820890876bfdf4ed161adbfaf94b2b4b5984c85ee5d958` |
+| `rust-std-1.99.1-x86_64-unknown-linux-musl` | 41325128 | `1dd241eaeb19ff3b5180461c77bdee93d6cafc669eda9de834e7c06b0ec3ca95` |
+| `rust-std-1.99.1-aarch64-unknown-linux-musl` | 31162764 | `2f3eb0d0610e2b7f6b2121d106e2490ac648decfa0c09b30873bdfc60de6c1ab` |
 
-These hashes are from the Rust 1.96.0 upstream distribution manifest. Select
+These hashes are from the Rust 1.99.1 upstream distribution manifest. Select
 the first three host archives and one target musl standard library. Prepare
 those four files and the musl header archive in one directory, then run:
 
@@ -121,11 +121,11 @@ bits, upstream installed notices and separate root notices for each package, inc
 `LICENSE-THIRD-PARTY`. Neither `install.sh` nor other upstream install logic
 runs. `PORTABLE-INPUTS` inside the kit records URLs, lengths and hashes.
 
-The kit is published under `.td-build-cache/crypto-rust-1.96.0-<NAR-sha256>`.
+The kit is published under `.td-build-cache/crypto-rust-1.99.1-<NAR-sha256>`.
 The x86-64 build additionally requires NAR SHA-256
-`dce3040c995d6572fd47df15fded5d5e3ea6c87455b5daef82f4dea2503942b1`;
+`7a54a59363f8c6168c6a7dad8be14ea357ce45e51e8d569a69e36737fd9ad962`;
 the aarch64 kit requires
-`b2ae2e0c6027aba063b7f280b7b2cd48710498553eb88b89ad64dbf0b8ede90e`.
+`984aaf7e17b2d9a4b2a5043e090c76e63abdda088d6b5ed2deec0a837af71210`.
 This pins the reconstructed layout and notices as well as archive bytes.
 Update this build pin only with a reviewed reconstruction/input change and
 repeat the isolated artifact qualification.
@@ -685,16 +685,17 @@ requalifying the guard. Mutation tests exercise the pin refusals.
 A second compiler pass marks all three direct backend dependencies private
 using `--extern priv:NAME` and forbids `exported_private_dependencies`. This
 also catches transitive foreign types and methods/associated types involving
-`dyn` local traits that pinned Rust 1.96 rustdoc omits from its JSON. The compiler
-pass is mandatory; the graph alone is insufficient. Both the privacy pass and
-rustdoc use crate-scoped `RUSTC_BOOTSTRAP=td_crypto` for diagnostic options only.
+`dyn` local traits that pinned Rust 1.99.1 rustdoc omits from its JSON. The
+compiler pass is mandatory; the graph alone is insufficient. Both the
+privacy pass and rustdoc use crate-scoped `RUSTC_BOOTSTRAP=td_crypto` for
+diagnostic options only.
 The shipping binaries have already been compiled and copied; their build uses
 no unstable options. No nightly toolchain, Rust parser dependency or source-text
 re-expansion is used. Cargo supplies the crate environment and dependency
 resolution. Actual commands/environment and graph/fixture counts enter
 BUILD-INPUTS.
 
-Pinned rustdoc produces schema-57 JSON including private and hidden items. The
+Pinned rustdoc produces schema-61 JSON including private and hidden items. The
 std-only walker follows public modules/re-exports, aliases, fields, variants,
 functions, methods, generic bounds, traits and associated types. It follows
 trait implementations attached to reachable local types, including private
@@ -704,7 +705,7 @@ belong to td-crypto or std/core/alloc. Missing IDs, unknown public item kinds,
 exported macros, changed schema or incomplete output fail.
 
 The JSON target triple and enabled CPU features must match baseline x86-64
-musl. Schema 57 omits `crt-static` from its CPU-feature list, so a generated
+musl. Schema 61 omits `crt-static` from its CPU-feature list, so a generated
 Cargo fixture using the same command constructor proves static musl/non-test
 conditional exports survive. Two more Cargo probes prove the actual compiler
 invocation enforces the cfg guard and private-dependency rule; the latter

@@ -191,10 +191,10 @@ pub(crate) fn inspect(document: &Json) -> Result<usize> {
 }
 
 fn inspect_architecture(document: &Json, architecture: Architecture) -> Result<usize> {
-    if number(field(document, "format_version")?)? != "57"
+    if number(field(document, "format_version")?)? != "61"
         || *field(document, "includes_private")? != Json::Bool(true)
     {
-        return Err("API diagnostic requires Rust 1.96 schema 57 with private items".into());
+        return Err("API diagnostic requires Rust 1.99 schema 61 with private items".into());
     }
     let target = field(document, "target")?;
     if text(field(target, "triple")?)? != architecture.triple() {
@@ -421,7 +421,7 @@ pub(crate) fn qualify(receipt: &mut String, c: &crate::crypto_isolated::CFlags) 
     fixtures(root, architecture)?;
     cargo_fixtures(root, receipt, c)?;
     receipt.push_str(&format!(
-        "api-schema 57\napi-target {triple}\napi-cpu-features {}\napi-reachable-items {count}\napi-fixtures {}\n",
+        "api-schema 61\napi-target {triple}\napi-cpu-features {}\napi-reachable-items {count}\napi-fixtures {}\n",
         cpu_features(architecture).join(","), FIXTURES.len()
     ));
     Ok(())
@@ -778,7 +778,7 @@ fn fixtures(root: &Path, architecture: Architecture) -> Result<()> {
                 ));
             }
         }
-        // Schema 57 omits these impls; rustc's privacy pass above is decisive.
+        // Schema 61 omits these impls; rustc's privacy pass above is decisive.
         if matches!(*name, "dyn_inherent" | "dyn_trait_arg" | "dyn_transitive") {
             continue;
         }
@@ -809,7 +809,7 @@ mod tests {
 
     fn graph(export: &str, external: &str) -> Json {
         parse(&format!(
-            r#"{{"format_version":57,"includes_private":true,"root":0,
+            r#"{{"format_version":61,"includes_private":true,"root":0,
             "target":{{"triple":"x86_64-unknown-linux-musl","target_features":[
                 {{"name":"fxsr","globally_enabled":true}},{{"name":"sse","globally_enabled":true}},
                 {{"name":"sse2","globally_enabled":true}},{{"name":"x87","globally_enabled":true}}]}},
@@ -877,7 +877,7 @@ mod tests {
     fn refuses_changed_schema_missing_private_items_and_duplicate_ids() {
         let base = graph(r#"{"use":{"id":2}}"#, "std").to_canonical();
         for altered in [
-            base.replace("\"format_version\":57", "\"format_version\":58"),
+            base.replace("\"format_version\":61", "\"format_version\":62"),
             base.replace("\"includes_private\":true", "\"includes_private\":false"),
             base.replace("\"root\":0", "\"root\":99"),
             base.replace("x86_64-unknown-linux-musl", "x86_64-unknown-linux-gnu"),

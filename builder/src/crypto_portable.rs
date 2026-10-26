@@ -10,7 +10,7 @@ use std::process::Command;
 type Result<T> = std::result::Result<T, String>;
 
 const HOST: &str = "x86_64-unknown-linux-gnu";
-const DIST: &str = "https://static.rust-lang.org/dist/2026-05-28";
+const DIST: &str = "https://static.rust-lang.org/dist/2026-10-15";
 
 struct Archive {
     name: &'static str,
@@ -21,36 +21,36 @@ struct Archive {
 
 const RUST: &[Archive] = &[
     Archive {
-        name: "rustc-1.96.0-x86_64-unknown-linux-gnu",
+        name: "rustc-1.99.1-x86_64-unknown-linux-gnu",
         component: "rustc",
-        bytes: 80_188_348,
-        sha256: "7d7fa1d0cfb0fab71a956bb78f41107202c17f30ab56c45288e869a37fd9633d",
+        bytes: 84_098_960,
+        sha256: "2ff05ff9c08a90861e7f6e4065b40a8b87463b4576186fd613871c3e37f2091f",
     },
     Archive {
-        name: "cargo-1.96.0-x86_64-unknown-linux-gnu",
+        name: "cargo-1.99.1-x86_64-unknown-linux-gnu",
         component: "cargo",
-        bytes: 11_154_668,
-        sha256: "dee75c3c8f9f600ad75bc0c93249e767d3047845a4dd668327ce43ab039ba266",
+        bytes: 10_954_816,
+        sha256: "53f3521949404d595efb06a55c12c5658d4ed1c75566f33d3d514eaebe70bd8a",
     },
     Archive {
-        name: "rust-std-1.96.0-x86_64-unknown-linux-gnu",
+        name: "rust-std-1.99.1-x86_64-unknown-linux-gnu",
         component: "rust-std-x86_64-unknown-linux-gnu",
-        bytes: 29_740_704,
-        sha256: "c09c7c646248f14f473f5f7a029af15ee57c3a9f9bc93dfa72d9621938586b82",
+        bytes: 31_563_228,
+        sha256: "109b074225bf5b9ea3820890876bfdf4ed161adbfaf94b2b4b5984c85ee5d958",
     },
     Archive {
-        name: "rust-std-1.96.0-x86_64-unknown-linux-musl",
+        name: "rust-std-1.99.1-x86_64-unknown-linux-musl",
         component: "rust-std-x86_64-unknown-linux-musl",
-        bytes: 38_833_276,
-        sha256: "4db24564076c243b377585bec0b938388638301ea5003d6245c4cbf9d86b11d0",
+        bytes: 41_325_128,
+        sha256: "1dd241eaeb19ff3b5180461c77bdee93d6cafc669eda9de834e7c06b0ec3ca95",
     },
 ];
 
 const ARM_RUST: &[Archive] = &[Archive {
-    name: "rust-std-1.96.0-aarch64-unknown-linux-musl",
+    name: "rust-std-1.99.1-aarch64-unknown-linux-musl",
     component: "rust-std-aarch64-unknown-linux-musl",
-    bytes: 27_278_268,
-    sha256: "e7d89a29abcc2cf2f31cfe3d898c1713fb12f395e788809d3b01b23fdd5813b4",
+    bytes: 31_162_764,
+    sha256: "2f3eb0d0610e2b7f6b2121d106e2490ac648decfa0c09b30873bdfc60de6c1ab",
 }];
 
 fn rust_archives(architecture: Architecture) -> impl Iterator<Item = &'static Archive> {
@@ -410,7 +410,7 @@ fn prepare_rust(root: &Path, archives: &Path, architecture: Architecture) -> Res
     fs::write(kit.join("PORTABLE-INPUTS"), rust_receipt(architecture))
         .map_err(|e| format!("write portable Rust receipt: {e}"))?;
     let expected = tree_hash(&kit)?;
-    publish_tree(&kit, &parent, "rust-1.96.0", &expected)
+    publish_tree(&kit, &parent, "rust-1.99.1", &expected)
 }
 
 pub(crate) struct Inputs {
@@ -479,7 +479,7 @@ mod tests {
             assert!(receipt.contains(&format!("target {}\n", architecture.triple())));
         }
         assert!(!rust_receipt(Architecture::Aarch64)
-            .contains("rust-std-1.96.0-x86_64-unknown-linux-musl"));
+            .contains("rust-std-1.99.1-x86_64-unknown-linux-musl"));
         assert!(!rust_receipt(Architecture::X86_64).contains("aarch64"));
     }
 

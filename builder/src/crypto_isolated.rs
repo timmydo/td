@@ -2152,10 +2152,10 @@ fn build_architecture(
         .map_err(|e| format!("hash portable Rust: {e}"))?;
     let expected_kit = match architecture {
         Architecture::X86_64 => {
-            "sha256:dce3040c995d6572fd47df15fded5d5e3ea6c87455b5daef82f4dea2503942b1"
+            "sha256:7a54a59363f8c6168c6a7dad8be14ea357ce45e51e8d569a69e36737fd9ad962"
         }
         Architecture::Aarch64 => {
-            "sha256:b2ae2e0c6027aba063b7f280b7b2cd48710498553eb88b89ad64dbf0b8ede90e"
+            "sha256:984aaf7e17b2d9a4b2a5043e090c76e63abdda088d6b5ed2deec0a837af71210"
         }
     };
     if kit_digest != expected_kit {
