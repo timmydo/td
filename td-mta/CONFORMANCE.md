@@ -374,6 +374,18 @@ and nothing in it is a threshold: its assertions check only that the
 measured work happened, so a regression shows in the report, not as a
 failure.
 
+The harness also prints `server_phases` snapshots immediately before and
+after SMTP intake and before, between and after the sequential and concurrent
+JMAP workloads. Each carries the profile, scenario boundary and the complete
+`performance-status` response, including boot identity, cumulative calls,
+time, failures, contention and lost-sample counters. Differences between
+snapshots from the same boot separate DATA receipt, commit queue wait,
+preparation and publication from client-observed acceptance time. Phases
+may nest; their durations are not additive. Snapshots occur outside the
+timed workload and add no timing assertion. The SMTP streams share one
+loopback peer, so the per-peer DATA limit can bind before the global limit;
+this workload does not establish peak memory at full global occupancy.
+
 What it measures is the host-native release test build (glibc on x86-64
 Linux, not the static-musl artifact) inside the test runner's private
 root and network namespace, under the runner's `RLIMIT_DATA` ceiling,

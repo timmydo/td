@@ -223,6 +223,7 @@ fn report(scenario: &str, fields: &str) {
 struct Service {
     child: ProbeChild,
     name: &'static str,
+    runtime: std::path::PathBuf,
 }
 
 impl Service {
@@ -261,13 +262,39 @@ impl Service {
             thread::sleep(Duration::from_millis(5));
         }
         let ready = started.elapsed().as_secs_f64() * 1000.0;
-        let service = Self { child, name };
+        let service = Self {
+            child,
+            name,
+            runtime,
+        };
         let (rss, hwm) = memory(service.pid());
         report(
             "startup",
             &format!("\"profile\":\"{name}\",\"ready_ms\":{ready:.1},\"rss_kib\":{rss},\"hwm_kib\":{hwm}"),
         );
         service
+    }
+
+    fn report_phases(&self, after: &str) {
+        let output = Command::new(env!("CARGO_BIN_EXE_td-mta"))
+            .args(["performance-status", "--runtime"])
+            .arg(&self.runtime)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "performance-status failed: {:?}",
+            output.status
+        );
+        let snapshot = td_json::parse_slice(&output.stdout).unwrap();
+        assert_eq!(snapshot["status"].as_str(), Some("ok"));
+        report(
+            "server_phases",
+            &format!(
+                "\"after\":\"{after}\",\"profile\":\"{}\",\"snapshot\":{snapshot}",
+                self.name
+            ),
+        );
     }
 
     fn pid(&self) -> u32 {
@@ -1039,13 +1066,18 @@ pub(super) fn exercise(
         &[&desktop, &cloud],
         knobs.idle_seconds,
     );
+    cloud.report_phases("before_intake");
     intake(fixture, smtp_address, &cloud, &knobs);
+    cloud.report_phases("smtp_intake");
     let jmap = Arc::new(Jmap::new(fixture, https_address));
     let stored = sql(fixture, "SELECT count(*) FROM td_mta.emails")
         .parse::<u64>()
         .unwrap();
+    desktop.report_phases("before_fetch");
     let mailbox = Arc::new(fetch(fixture, &jmap, &desktop, stored));
+    desktop.report_phases("jmap_fetch");
     fetch_concurrently(fixture, &jmap, &mailbox, &desktop, knobs.readers);
+    desktop.report_phases("jmap_concurrent");
     idle(
         fixture,
         "idle_after_intake",
