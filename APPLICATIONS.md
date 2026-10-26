@@ -11230,6 +11230,12 @@ foreign `HOME` as `update` does:
   it answers `absent` and records the reason in `refused`. It leaves `checked`, since it asked no one.
   td-jail does not run it yet (td-software/DESIGN.md §4.1).
 
+td-authd's `application-cache` operation is the root path to `update
+--force`, `remove`, `delete-data` and `status`, selecting the account
+itself (td-authd/DESIGN.md, "Application cache operation"); until the
+cutover td-jail's on-demand check and the forced-check unit still run
+td-app directly.
+
 **When it fetches.** td-jail, launching an application whose spec names
 Flathub refs, first runs `/bin/td-app ready NAME` as the account, with
 only `HOME` in its environment. That takes no lock and answers with the

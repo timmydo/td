@@ -139,29 +139,50 @@ fn number(text: &str, range: std::ops::RangeInclusive<u32>) -> Result<u32, Strin
 pub(crate) fn require_launch_startup() -> Result<(), String> {
     require_root_status(&bounded_file("/proc/self/status")?)?;
     require_no_terminal(&bounded_file("/proc/self/stat")?)?;
-    audit_descriptors(
-        |fd| {
-            std::fs::metadata(format!("/proc/self/fd/{fd}"))
-                .map(|metadata| (metadata.dev(), metadata.ino()))
-                .map_err(|e| format!("missing standard descriptor {fd}: {e}"))
-        },
-        || {
-            let mut descriptors = Vec::new();
-            for entry in std::fs::read_dir("/proc/self/fd").map_err(|e| e.to_string())? {
-                let name = entry.map_err(|e| e.to_string())?.file_name();
-                descriptors.push(
-                    name.to_str()
-                        .ok_or("invalid inherited descriptor name")?
-                        .parse::<u32>()
-                        .map_err(|_| "invalid inherited descriptor")?,
-                );
-                if descriptors.len() > 4 {
-                    return Err("terminal authority inherited extra descriptors".into());
-                }
-            }
-            Ok(descriptors)
-        },
-    )
+    audit_descriptors(standard_descriptor, inherited_descriptors)
+}
+
+/// A root operation whose standard input is no channel (the application
+/// cache operation): the same root thread, absent terminal and standard
+/// descriptors alone, any of which may be one file such as `/dev/null`.
+pub(crate) fn require_operation_startup() -> Result<(), String> {
+    require_root_status(&bounded_file("/proc/self/status")?)?;
+    require_no_terminal(&bounded_file("/proc/self/stat")?)?;
+    audit_operation_descriptors(standard_descriptor, inherited_descriptors)
+}
+
+fn audit_operation_descriptors(
+    mut standard: impl FnMut(u32) -> Result<(u64, u64), String>,
+    enumerate: impl FnOnce() -> Result<Vec<u32>, String>,
+) -> Result<(), String> {
+    // As audit_descriptors: each standard fd exists before read_dir runs.
+    for fd in [0, 1, 2] {
+        standard(fd)?;
+    }
+    require_only_standard(enumerate()?)
+}
+
+fn standard_descriptor(fd: u32) -> Result<(u64, u64), String> {
+    std::fs::metadata(format!("/proc/self/fd/{fd}"))
+        .map(|metadata| (metadata.dev(), metadata.ino()))
+        .map_err(|e| format!("missing standard descriptor {fd}: {e}"))
+}
+
+fn inherited_descriptors() -> Result<Vec<u32>, String> {
+    let mut descriptors = Vec::new();
+    for entry in std::fs::read_dir("/proc/self/fd").map_err(|e| e.to_string())? {
+        let name = entry.map_err(|e| e.to_string())?.file_name();
+        descriptors.push(
+            name.to_str()
+                .ok_or("invalid inherited descriptor name")?
+                .parse::<u32>()
+                .map_err(|_| "invalid inherited descriptor")?,
+        );
+        if descriptors.len() > 4 {
+            return Err("root operation inherited extra descriptors".into());
+        }
+    }
+    Ok(descriptors)
 }
 
 fn require_no_terminal(stat: &str) -> Result<(), String> {
@@ -170,7 +191,7 @@ fn require_no_terminal(stat: &str) -> Result<(), String> {
         .and_then(|(_, fields)| fields.split_whitespace().nth(4))
         != Some("0")
     {
-        return Err("terminal authority must have no controlling terminal".into());
+        return Err("root operation must have no controlling terminal".into());
     }
     Ok(())
 }
@@ -188,7 +209,7 @@ fn require_root_status(status: &str) -> Result<(), String> {
                 .is_some_and(|v| v.trim() == "1")
         })
     {
-        return Err("terminal authority requires one root thread".into());
+        return Err("root operation requires one root thread".into());
     }
     Ok(())
 }
@@ -205,10 +226,14 @@ fn audit_descriptors(
             return Err("terminal authority log aliases its private channel".into());
         }
     }
-    let mut descriptors = enumerate()?;
+    require_only_standard(enumerate()?)
+}
+
+/// The listing's own descriptor is the fourth.
+fn require_only_standard(mut descriptors: Vec<u32>) -> Result<(), String> {
     descriptors.sort_unstable();
     if descriptors != [0, 1, 2, 3] {
-        return Err("terminal authority requires only standard descriptors".into());
+        return Err("root operation requires only standard descriptors".into());
     }
     Ok(())
 }

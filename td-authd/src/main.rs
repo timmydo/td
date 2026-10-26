@@ -7,6 +7,7 @@
 #[allow(dead_code, reason = "the record's writer is td-boot's")]
 mod admission;
 mod application;
+mod application_cache;
 mod application_files;
 mod backoff;
 mod channel;
@@ -22,6 +23,13 @@ mod cutover;
 mod deployment;
 mod disk_install;
 mod elevation;
+// The application cache's status record and declarations, td-app's.
+#[path = "../../engine/src/flathub_app.rs"]
+#[allow(
+    dead_code,
+    reason = "td-app's and td-jail's halves of the cache contract"
+)]
+mod flathub_app;
 mod handoff;
 // Request 1a's kernel name and consent's hostname descriptions.
 #[path = "../../td-firstboot/src/hostname.rs"]
@@ -82,6 +90,7 @@ const USAGE: &str = "usage: td-authd channel-check --peer-uid UID | \
     td-authd release-application-files APP | \
     td-authd application-start OWNER APP direct -- ARG... | \
      td-authd application-exec UID OWNER APP direct -- ARG... | \
+     td-authd application-cache OWNER APP install|update|remove|delete-data|status | \
      td-authd request-update SOURCE DEPLOYMENT-ID | td-authd request-hostname NAME";
 
 fn run(arguments: &[String]) -> Result<(), String> {
@@ -122,6 +131,14 @@ fn run(arguments: &[String]) -> Result<(), String> {
         }
         if verb == "application-exec" {
             return application::exec(rest);
+        }
+        if verb == "application-cache" {
+            let output = application_cache::run(rest)?;
+            let mut stdout = std::io::stdout().lock();
+            return stdout
+                .write_all(&output)
+                .and_then(|()| stdout.flush())
+                .map_err(|e| format!("write application cache answer: {e}"));
         }
         if verb == "terminal-exec" {
             return launch::terminal_exec(rest);

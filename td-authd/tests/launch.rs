@@ -538,6 +538,31 @@ fn a_private_stdin_does_not_excuse_an_inherited_controlling_terminal() {
 }
 
 #[test]
+fn an_operation_audit_admits_aliases_and_only_standard_descriptors() {
+    for missing in [0, 1, 2] {
+        let enumerated = std::cell::Cell::new(false);
+        let result = audit_operation_descriptors(
+            |fd| {
+                if fd == missing {
+                    Err("closed standard descriptor".into())
+                } else {
+                    Ok((1, 0))
+                }
+            },
+            || {
+                enumerated.set(true);
+                Ok(vec![0, 1, 2, 3])
+            },
+        );
+        assert!(result.is_err());
+        assert!(!enumerated.get(), "the iterator could reuse it");
+    }
+    // One file such as /dev/null on all three is admitted.
+    assert!(audit_operation_descriptors(|_| Ok((1, 0)), || Ok(vec![0, 1, 2, 3])).is_ok());
+    assert!(audit_operation_descriptors(|_| Ok((1, 0)), || Ok(vec![0, 1, 2, 3, 4])).is_err());
+}
+
+#[test]
 fn log_descriptors_must_not_alias_the_private_channel() {
     for alias in [1, 2] {
         assert!(audit_descriptors(

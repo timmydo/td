@@ -28,6 +28,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
         files,
         [
             "application.rs",
+            "application_cache.rs",
             "application_files.rs",
             "backoff.rs",
             "channel.rs",
@@ -59,6 +60,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     );
     for (name, count) in [
         ("application.rs", 0),
+        ("application_cache.rs", 0),
         ("application_files.rs", 0),
         ("main.rs", 1),
         ("channel.rs", 0),
@@ -111,6 +113,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
                     | "disk_install.rs"
                     | "launch.rs"
                     | "application.rs"
+                    | "application_cache.rs"
                     | "unlock.rs"
                     | "login.rs"
                     | "storage.rs"
@@ -939,6 +942,84 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert_eq!(application.matches(".stdin(Stdio::null())").count(), 2);
     assert_eq!(application.matches(".stderr(Stdio::null())").count(), 2);
     assert_eq!(application.matches(".stdout(Stdio::null())").count(), 1);
+    // The cache operation runs one fixed program, the credential drop into
+    // the admitted account, and td-app's verb and the name after it.
+    let cache = include_str!("../src/application_cache.rs")
+        .split("#[cfg(test)]")
+        .next()
+        .unwrap();
+    assert_eq!(
+        fingerprint(cache),
+        CACHE_FINGERPRINT,
+        "application cache operation changed"
+    );
+    for forbidden in [
+        "thread::spawn",
+        "thread::Builder",
+        "thread::scope",
+        "pre_exec",
+        ".uid(",
+        ".gid(",
+        ".groups(",
+        ".exec()",
+        ".env(",
+        ".envs(",
+        ".env_remove(",
+        ".arg(",
+    ] {
+        assert!(
+            !cache.contains(forbidden),
+            "application_cache.rs: {forbidden}"
+        );
+    }
+    assert_eq!(cache.matches("Command::new(").count(), 1);
+    assert!(cache.contains(
+        "Command::new(\"/bin/td-login\");\n        command\n            .args([\n                \"exec-service-as\",\n                &format!(\"tda{uid}\"),\n                \"--\",\n                \"/bin/td-app\",\n                verb,\n                &self.name,\n            ])\n            .args(flags);"
+    ));
+    assert_eq!(cache.matches(".spawn(").count(), 1);
+    assert_eq!(cache.matches(".env_clear()").count(), 1);
+    assert_eq!(cache.matches(".stdin(Stdio::null())").count(), 1);
+    assert_eq!(
+        cache
+            .matches("crate::launch::require_operation_startup()")
+            .count(),
+        1
+    );
+    assert_eq!(
+        cache
+            .matches("crate::application::admitted_uid(&request.name)?")
+            .count(),
+        1
+    );
+    // td-app's record grammar, compiled into root: it performs no I/O, so
+    // its owners' edits need no pin here.
+    let record = include_str!("../../engine/src/flathub_app.rs");
+    for forbidden in [
+        "unsafe",
+        "std::fs",
+        "std::process",
+        "std::net",
+        "std::os",
+        "std::io",
+        "File",
+        "print!",
+        "println!",
+        "eprint",
+        "#[path =",
+        "include!",
+    ] {
+        assert!(!record.contains(forbidden), "flathub_app.rs: {forbidden}");
+    }
+    // Parse, then the startup audit, then admission, then td-app: nothing
+    // inherited reaches td-firstboot's child or td-app.
+    let order = [
+        "Request::parse(arguments)?",
+        "crate::launch::require_operation_startup()",
+        "crate::application::admitted_uid(&request.name)?",
+        ".spawn()",
+    ]
+    .map(|call| cache.find(call).unwrap());
+    assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{order:?}");
     let launch = include_str!("../src/launch.rs");
     for forbidden in [
         "thread::spawn",
@@ -1131,8 +1212,9 @@ const LOGIN_STATE_FINGERPRINT: u64 = 0x10b1af1d87d02b94;
 const SHARED_LOGIN_STATE_FINGERPRINT: u64 = 0x36b736e5dda17cc6;
 const SHARED_HOSTNAME_FINGERPRINT: u64 = 0x49026f28c1db76ec;
 
-const LAUNCH_FINGERPRINT: u64 = 0xbc8a1afbb692e115;
-const MAIN_FINGERPRINT: u64 = 0xe3ccbc9cef47cdd6;
+const CACHE_FINGERPRINT: u64 = 0xee78b1e97f48854e;
+const LAUNCH_FINGERPRINT: u64 = 0x646f383f01e6c652;
+const MAIN_FINGERPRINT: u64 = 0x0fa6ba78742933eb;
 const SESSION_FINGERPRINT: u64 = 0x6c78640f078fe395;
 
 const INTAKE_RAW_FINGERPRINT: u64 = 0x320c8b6ddbfe29af;

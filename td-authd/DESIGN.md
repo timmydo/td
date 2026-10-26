@@ -922,6 +922,67 @@ The bounding capability set is not a held privilege and is not required
 empty. No new syscall or unsafe surface is
 introduced; confinement pins the complete application controller and startup.
 
+## Application cache operation
+
+The root operation `application-cache OWNER APP VERB` changes or reads
+one Flathub application's cache as that application's account
+(td-software/DESIGN.md §3, APPLICATIONS.md §W.9). OWNER is 1000; APP has
+the registry name grammar; VERB is exactly `install`, `update`,
+`remove`, `delete-data` or `status`. No caller supplies an executable,
+UID, path, ref or flag. Nothing invokes it yet: td-software's requests
+reach it through the compositor's private channel in a later increment.
+
+Startup requires root credentials, one thread, no controlling terminal
+and only the three standard descriptors. Unlike the launch authority's,
+any of them may be the same file, since this operation's stdin is no
+channel. Root then runs the fixed `check-launch-application OWNER APP`
+admission, which selects the active application account from the
+immutable deployment and the durable ledger, as `application-start`
+does. An application the image ships has no cache: `status` answers
+`format=1`, `name=`, `kind=image`, written by root without td-app, and
+every other verb refuses.
+
+For a Flathub declaration root runs `/bin/td-login exec-service-as
+tdaUID -- /bin/td-app VERB APP`, with td-app's verb `update APP --force`
+for both `install` and `update` (they differ only in whether a `current`
+exists, which td-software shows) and the verb's own name otherwise. The
+environment is cleared, the working directory is `/` and stdin is null;
+td-login supplies the account's home, its other identity variables and
+its session cgroup, as for the per-application update unit. For `status`
+td-app's stdout is a private socket and its stderr null; root reads at
+most 4 KiB, requires EOF and a successful exit, parses the record with
+`flathub_app::Status`, requires it to name APP with `kind=flathub`, and
+prints its canonical rendering, which is exactly what it parsed. A
+record's name has the registry grammar, so root's own `kind=image`
+record exists for every registry name. For the other verbs stdout is
+null and stderr the socket; root keeps only its last 512 bytes, and on a
+failed exit reports the last line as printable ASCII in its own
+diagnostic. A failed `status` reports only td-app's exit. Either failure
+exits 1; success of a verb other than `status` prints nothing.
+
+Each run is bounded: an hour for `install` and `update`, matching the
+forced-check unit's timeout, ten minutes for `remove` and
+`delete-data`, and 60 seconds for `status`, whose deploy-size walk runs
+on every poll. At the bound root kills and reaps td-app; td-app's cache
+lock and generation leases make a killed run safe to repeat. The bound
+holds only while the operation lives: root carries no lifetime into
+td-app, so a caller that kills the operation early leaves td-app to
+finish its run under its own lock, and the caller must not. td-app's
+lock blocks rather than refuses, so a second request for the same
+application waits behind a running check: a `remove` or `delete-data`
+issued during an hour's install can reach its ten minutes first and
+fail without changing anything. The forwarding increment therefore
+sends one request per application at a time and reads `status`
+progress first. The operation reaps td-app with a blocking wait, as
+`application-start`'s admission child does; a serving authority must
+run it as its own process rather than in its loop.
+
+None of these is elevation (td-software/DESIGN.md §3): each runs the
+application's own account on its own cache or state, which a first
+launch and the forced check already did. The confinement test pins the
+one program, its argument shape, the order of parse, startup audit,
+admission and spawn, and no environment beyond the cleared one.
+
 ## Application filesystem grants
 
 Root startup prepares two writable idmapped views: Firefox and mail

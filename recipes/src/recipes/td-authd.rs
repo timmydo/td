@@ -159,6 +159,10 @@ const SOURCES: &[(&str, &str)] = &[
         include_str!("../../../td-authd/src/application.rs"),
     ),
     (
+        "src/application_cache.rs",
+        include_str!("../../../td-authd/src/application_cache.rs"),
+    ),
+    (
         "src/mount_sys.rs",
         include_str!("../../../td-authd/src/mount_sys.rs"),
     ),
@@ -286,6 +290,11 @@ pub fn recipe() -> Recipe {
         (
             "{src}/engine/src/principals.rs",
             include_str!("../../../engine/src/principals.rs"),
+        ),
+        // The application cache's status record, td-app's.
+        (
+            "{src}/engine/src/flathub_app.rs",
+            include_str!("../../../engine/src/flathub_app.rs"),
         ),
         // The consent channel's codec, shared with the service it supervises.
         (

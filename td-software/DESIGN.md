@@ -98,6 +98,14 @@ Root selects the account from the immutable registry and the ledger, as
 the same credential drop. No caller supplies an executable, UID, path or
 ref.
 
+*As built (increment 1):* td-authd/DESIGN.md, "Application cache
+operation". `install` and `update` both run `td-app update APP
+--force`; root answers `status` for mail and news itself, as
+`kind=image`, and refuses the other verbs for them. A request waits
+behind a running check of the same application and is bounded only
+while the operation lives, so the forwarding increment sends one
+request per application at a time and never kills one early.
+
 **How a request arrives.** td-software sends `install NAME`, `update
 NAME`, `remove NAME`, `delete-data NAME`, `status NAME` and `launch NAME`
 on the compositor

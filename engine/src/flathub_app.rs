@@ -261,6 +261,20 @@ pub fn valid_hex64(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+/// A status record's name: the application registry's grammar, wider than
+/// a Flathub declaration's, since root writes an image application's
+/// record too.
+fn valid_record_name(name: &str) -> bool {
+    name.len() <= MAX_NAME_BYTES
+        && name
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_lowercase())
+        && name.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"-_.".contains(&byte)
+        })
+}
+
 fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= MAX_NAME_BYTES
@@ -730,7 +744,7 @@ impl Status {
             return Err("status has no format=1 header".into());
         }
         let name = status_field(lines.next(), "name")?;
-        if !valid_name(name) {
+        if !valid_record_name(name) {
             return Err(format!("status name {name:?} is malformed"));
         }
         let cache = match status_field(lines.next(), "kind")? {
@@ -987,6 +1001,14 @@ mod tests {
         };
         assert_eq!(image.render(), "format=1\nname=mail\nkind=image\n");
         assert_eq!(Status::parse(&image.render()).unwrap(), image);
+        // A record's name is the registry's grammar, a declaration's
+        // narrower one.
+        let wide = "format=1\nname=mail_box.v2\nkind=image\n";
+        assert_eq!(Status::parse(wide).unwrap().render(), wide);
+        for bad in ["Mail", "1mail", "", "mail/box"] {
+            let text = format!("format=1\nname={bad}\nkind=image\n");
+            assert!(Status::parse(&text).is_err(), "{bad}");
+        }
         let generation = |generation, serves| GenerationStatus {
             generation,
             serves,
