@@ -192,6 +192,20 @@ build-root C packages compile against. Moving them re-keys every package
 above them and changes the kernel interface those packages target, so it is
 a decision of its own, not routine upkeep.
 
+## Unreleased fixes
+
+When an advisory affects upstream's newest release and upstream has fixed
+it only on its development branch, the recipe may carry the fix as
+`Step::substitute_text` edits right after unpacking, each `TextEdit`
+expecting exactly one match. Carry upstream's lines verbatim rather than
+writing td's own fix, and take every upstream commit to the file after
+the release up to and including the fixing commit, so the edited file
+matches upstream's at that commit; check that byte for byte. Later
+commits that fix no advisory wait for a release. Name the advisories and the upstream commits in
+a comment beside the edits and in the commit message. A release that
+contains the fix no longer matches, so the bump past it fails until the
+edits are deleted: they cannot outlive their need.
+
 ## Adding a pin
 
 A new `PinDef` names its `version`. Give it exactly one row in

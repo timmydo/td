@@ -2,9 +2,9 @@ use crate::shared::{
     build_root_glibc_cc, build_root_link_map_check, unpack_into, LinkedLibc,
     BUILD_ROOT_GLIBC as GLIBC, BUILD_ROOT_PATH as PATH, BUILD_ROOT_SH as SH,
 };
-use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
+use crate::types::{CheckRunner, Recipe, RecipeCheck, Step, TextEdit};
 
-// zlib 1.3.1 for x86_64: the shared libz.so.1 the upstream Rust toolchain's
+// zlib 1.3.2 for x86_64: the shared libz.so.1 the upstream Rust toolchain's
 // libLLVM and rust-lld need at run time (rust-toolchain links it into its
 // lib/), and the static libz.a curl, Git and td-util-test's
 // minigzip link. Built in the Debian build root: Debian's gcc compiles
@@ -77,7 +77,7 @@ static int output_chunk(void *opaque, unsigned char *buffer, unsigned int length
 int main(void) {
     static const unsigned char input[] = "td zlib round trip";
     if (strcmp(zlibVersion(), ZLIB_VERSION) != 0 ||
-        strcmp(ZLIB_VERSION, "1.3.1") != 0)
+        strcmp(ZLIB_VERSION, "1.3.2") != 0)
         return fail("zlib version/header mismatch", 1);
     unsigned char compressed[128];
     unsigned char output[128];
@@ -134,6 +134,7 @@ int main(void) {
 
 pub fn recipe() -> Recipe {
     let mut steps = unpack_into("zlib-x86-64-source", "{src}");
+    steps.push(gzwrite_fixes());
     steps.extend(build_root_glibc_cc());
     // The library link: the objects zlib's Makefile passes, between td
     // glibc's and gcc-runtime's start files, against td glibc's libc.
@@ -173,7 +174,7 @@ pub fn recipe() -> Recipe {
         .env("PATH", PATH),
     );
     steps.push(
-        Step::run("{src}", &["make", "-j{jobs}", "libz.a", "libz.so.1.3.1"])
+        Step::run("{src}", &["make", "-j{jobs}", "libz.a", "libz.so.1.3.2"])
             .env("PATH", PATH)
             .env("SOURCE_DATE_EPOCH", "1"),
     );
@@ -184,7 +185,7 @@ pub fn recipe() -> Recipe {
         path: "{out}/include".into(),
     });
     steps.push(Step::CopyFiles {
-        files: vec!["{src}/libz.a".into(), "{src}/libz.so.1.3.1".into()],
+        files: vec!["{src}/libz.a".into(), "{src}/libz.so.1.3.2".into()],
         dest: "{out}/lib".into(),
     });
     steps.push(Step::CopyFiles {
@@ -193,7 +194,7 @@ pub fn recipe() -> Recipe {
     });
     for link in ["libz.so.1", "libz.so"] {
         steps.push(Step::Symlink {
-            target: "libz.so.1.3.1".into(),
+            target: "libz.so.1.3.2".into(),
             link: format!("{{out}}/lib/{link}"),
         });
     }
@@ -201,14 +202,14 @@ pub fn recipe() -> Recipe {
     steps.extend(archive_checks());
     steps.push(Step::split_debug_tree("{out}", "/usr/bin/objcopy"));
 
-    Recipe::mesboot("zlib-x86-64", "1.3.1")
+    Recipe::mesboot("zlib-x86-64", "1.3.2")
         .source_input("zlib-x86-64-source")
         .build_root()
         .native_inputs(&["glibc-x86-64", "gcc-runtime"])
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
-echo ">> recipe-check zlib-x86-64: build zlib 1.3.1 in the Debian build root against td glibc and gcc-runtime alone"
+echo ">> recipe-check zlib-x86-64: build zlib 1.3.2 in the Debian build root against td glibc and gcc-runtime alone"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run zlib-x86-64 1
 "#,
@@ -273,6 +274,57 @@ fn archive_checks() -> Vec<Step> {
     ]
 }
 
+/// CVE-2026-76844 and CVE-2026-85091: after a failed write(), gz_write
+/// leaves next_in on the caller's buffer, and a later gzwrite or gzprintf
+/// writes past the input buffer. Upstream's gzwrite.c commits after 1.3.2
+/// up to the CVE fix df84af25 (madler/zlib e3dc0a85, bbc2ccf3, df84af25),
+/// verbatim, make the file match upstream at df84af25; later development
+/// commits fix no advisory and wait for a release. No release carries
+/// these yet; a release that does no longer matches, so the bump past it
+/// fails until these edits are deleted (UPDATING.md, "Unreleased fixes").
+fn gzwrite_fixes() -> Step {
+    // gzvprintf's stall path; the pre-C89 gzprintf's copy is not compiled.
+    let stall = "       state->size bytes available after the current contents */\n\
+                 \x20   ret = gz_vacate(state);\n\
+                 \x20   if (state->err) {\n\
+                 \x20       if (ret && state->again) {\n\
+                 \x20           /* There was a non-blocking stall on write, resulting in the part\n\
+                 \x20              of the second half of the output buffer being occupied.  Return\n\
+                 \x20              a Z_BUF_ERROR to let the application know that this gzprintf()\n\
+                 \x20              needs to be retried. */\n\
+                 \x20           gz_error(state, Z_BUF_ERROR, \"stalled write on gzprintf\");\n";
+    Step::substitute_text(
+        "{src}/gzwrite.c",
+        vec![
+            // e3dc0a85: no pointer arithmetic on a NULL next_in.
+            TextEdit::new(
+                "    if (strm->next_in + strm->avail_in <= state->in + state->size)\n",
+                "    if (strm->next_in == NULL ||\n\
+                 \x20       strm->next_in + strm->avail_in <= state->in + state->size)\n",
+                1,
+            ),
+            // bbc2ccf3: a stalled gzprintf returns instead of printing on.
+            TextEdit::new(
+                &format!("{stall}        }}\n"),
+                &format!("{stall}            return state->err;\n        }}\n"),
+                1,
+            ),
+            // df84af25: a failed write leaves no pointer into the caller's
+            // buffer.
+            TextEdit::new(
+                "            if (ret == -1)\n\
+                 \x20               return state->again ? put - len : 0;\n",
+                "            if (ret == -1) {\n\
+                 \x20               state->strm.avail_in = 0;\n\
+                 \x20               state->strm.next_in = state->in;\n\
+                 \x20               return state->again ? put - len : 0;\n\
+                 \x20           }\n",
+                1,
+            ),
+        ],
+    )
+}
+
 /// Link a program against the built library from td glibc and gcc-runtime
 /// alone, run it, and check the library's shape.
 fn probe() -> Vec<Step> {
@@ -285,13 +337,13 @@ fn probe() -> Vec<Step> {
          $r/crtendS.o $g/crtn.o"
     );
     let verify = "set -e; out=$(./probe); \
-                  [ \"$out\" = '1.3.1 1' ] || { echo \"probe: $out\" >&2; exit 1; }; \
-                  d=$(readelf -d '{out}/lib/libz.so.1.3.1'); \
+                  [ \"$out\" = '1.3.2 1' ] || { echo \"probe: $out\" >&2; exit 1; }; \
+                  d=$(readelf -d '{out}/lib/libz.so.1.3.2'); \
                   n=$(printf '%s\\n' \"$d\" | grep NEEDED | sed 's/.*\\[\\(.*\\)\\]/\\1/' | tr '\\n' ' '); \
                   [ \"$n\" = 'libc.so.6 ' ] || { echo \"libz.so.1 needs: $n\" >&2; exit 1; }; \
                   printf '%s\\n' \"$d\" | grep -q 'SONAME.*\\[libz.so.1\\]' || { echo 'libz soname is not libz.so.1' >&2; exit 1; }; \
                   case $d in *RPATH*|*RUNPATH*) echo 'libz.so.1 has a search path' >&2; exit 1;; esac; \
-                  id=$(readelf -n '{out}/lib/libz.so.1.3.1' | sed -n 's/.*Build ID: //p'); \
+                  id=$(readelf -n '{out}/lib/libz.so.1.3.2' | sed -n 's/.*Build ID: //p'); \
                   [ ${#id} = 40 ] || { echo \"libz.so.1 build ID is not SHA-1: $id\" >&2; exit 1; }";
     vec![
         Step::MkDir {
@@ -313,6 +365,29 @@ mod tests {
     use crate::types::Step;
 
     #[test]
+    fn the_gzwrite_fixes_are_applied_before_configure() {
+        let steps = recipe().steps.unwrap_or_default();
+        let fixed = steps
+            .iter()
+            .position(|step| {
+                matches!(step, Step::SubstituteText { file, edits }
+                    if file == "{src}/gzwrite.c"
+                        && edits.len() == 3
+                        && edits.iter().all(|edit| edit.expect == 1)
+                        && edits[2].to.contains("state->strm.next_in = state->in;\n"))
+            })
+            .expect("gzwrite.c carries the upstream fixes");
+        let configured = steps
+            .iter()
+            .position(|step| {
+                matches!(step, Step::Run { argv, .. }
+                    if argv.iter().any(|arg| arg == "./configure"))
+            })
+            .expect("configure runs");
+        assert!(fixed < configured);
+    }
+
+    #[test]
     fn the_archive_is_built_installed_and_checked_before_the_split() {
         let steps = recipe().steps.unwrap_or_default();
         let made = steps
@@ -320,7 +395,7 @@ mod tests {
             .position(|step| {
                 matches!(step, Step::Run { argv, .. }
                     if argv.iter().any(|arg| arg == "libz.a")
-                        && argv.iter().any(|arg| arg == "libz.so.1.3.1"))
+                        && argv.iter().any(|arg| arg == "libz.so.1.3.2"))
             })
             .expect("make builds both libraries");
         let installed = steps

@@ -326,10 +326,10 @@ const PINS: &[PinDef] = &[
     PinDef {
         key: "zlib-x86-64-source",
         aliases: &[],
-        url: "https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz",
-        sha256: "9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23",
-        file: "zlib-1.3.1.tar.gz",
-        version: "1.3.1",
+        url: "https://github.com/madler/zlib/releases/download/v1.3.2/zlib-1.3.2.tar.gz",
+        sha256: "bb329a0a2cd0274d05519d61c667c062e06990d72e125ee2dfa8de64f0119d16",
+        file: "zlib-1.3.2.tar.gz",
+        version: "1.3.2",
     },
 ];
 
