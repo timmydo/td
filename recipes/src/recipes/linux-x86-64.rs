@@ -332,6 +332,50 @@ pub fn recipe() -> Recipe {
     //    freeze and mem, which nothing in td writes. QEMU binds none of the
     //    laptop's devices, so /dev/fb0 there stays virtio-gpu's.
     //
+    //    ThinkPad T14s Gen 4 AMD (Ryzen 7040) drivers arrive the same way
+    //    (td-install/INSTALLER.md). It shares thinkpad_acpi, the ACPI
+    //    platform set, NVMe, xHCI and the PS/2 keyboard and TrackPoint
+    //    above; on top of them come amd-pstate, the AMD ACPI platform
+    //    devices with their GPIO controller and DesignWare I2C, HID over
+    //    I2C with hid-multitouch for its touchpad (td-compositor/DESIGN.md
+    //    reads it as a touchpad from INPUT_PROP_POINTER and the finger tool),
+    //    the Realtek codec on the same HDA controller driver, and x2APIC.
+    //    X86_AMD_PSTATE was already on, selected by SCHED_MC_PRIO (default y
+    //    once SMP is pinned), and I2C_HID by its default once I2C is
+    //    visible; both are written so losing that select or default cannot
+    //    drop the scaling driver or the touchpad transport unnoticed.
+    //    Guarded, not written: I2C_HID_CORE (no prompt, selected by
+    //    I2C_HID_ACPI), GPIO_ACPI (no prompt; the touchpad's interrupt and
+    //    the platform's GPIO-signalled ACPI events, _AEI), SND_HDA_CODEC_ALC269
+    //    (prompting only under EXPERT) and
+    //    ACPI_PROCESSOR (the AMD idle states), which the pinned
+    //    X86_AMD_PSTATE and X86_INTEL_PSTATE both select.
+    //
+    //    x2APIC: AMD firmware commonly hands the CPU over in x2APIC mode
+    //    with its IOMMU on, and a kernel without X86_X2APIC then turns the
+    //    local APIC off entirely (one CPU, no MSI). X86_X2APIC depends on
+    //    IRQ_REMAP, which needs only IOMMU_SUPPORT; with no remapping driver
+    //    the kernel would switch such a handover back to xAPIC. AMD_IOMMU is
+    //    written so remapping actually runs, keeping x2APIC, and so devices
+    //    are DMA-isolated by the upstream lazy-flush default. Neither QEMU
+    //    machine td boots (pc, q35) has an AMD IOMMU, and without
+    //    HYPERVISOR_GUEST a guest keeps xAPIC, so those boots are unchanged.
+    //
+    //    Unasked: X86_AMD_PLATFORM_DEVICE selects COMMON_CLK (with HAVE_CLK
+    //    and PM_CLK's def_bool behind it) and PINCTRL; PINCTRL_AMD selects
+    //    GPIOLIB, which brings GPIO_ACPI and GPIO_CDEV (prompting only under
+    //    EXPERT: a root-only /dev/gpiochipN), and SERIAL_8250 then selects
+    //    SERIAL_MCTRL_GPIO; the Realtek menu defaults in every Realtek codec
+    //    family, whose library selects the side-codec component; AMD_IOMMU
+    //    selects the IOMMU API, IOVA, SVA, page fault and PCI ATS/PRI/PASID
+    //    support. Its Radeon is not driven: amdgpu needs vendor firmware
+    //    this recipe does not carry, so its display is simpledrm's GOP
+    //    framebuffer, as on any UEFI machine. AMD_PMC, which s2idle needs to
+    //    reach its deepest state, is left out with RTC_CLASS behind it,
+    //    since nothing in td enters s2idle. Its internal microphones sit on
+    //    the ACP 6.3 PDM controller, whose SND_SOC_AMD_PS driver and SND_SOC
+    //    are not built.
+    //
     //    COMPAT_32BIT_TIME has a visible prompt, so allnoconfig turns it off.
     //    It and IA32_EMULATION stay on because td-jail's development syscall
     //    policy admits ordinary i386 code beside x86-64 (APPLICATIONS.md §C),
@@ -569,6 +613,19 @@ pub fn recipe() -> Recipe {
                   /^#? *CONFIG_MMC_RICOH_MMC[ =]/d; \
                   /^#? *CONFIG_SND_HDA_CODEC_CONEXANT[ =]/d; \
                   /^#? *CONFIG_SND_HDA_CODEC_HDMI[ =]/d; \
+                  /^#? *CONFIG_X86_AMD_PSTATE[ =]/d; \
+                  /^#? *CONFIG_X86_AMD_PLATFORM_DEVICE[ =]/d; \
+                  /^#? *CONFIG_PINCTRL_AMD[ =]/d; \
+                  /^#? *CONFIG_I2C_DESIGNWARE_CORE[ =]/d; \
+                  /^#? *CONFIG_I2C_DESIGNWARE_PLATFORM[ =]/d; \
+                  /^#? *CONFIG_I2C_HID[ =]/d; \
+                  /^#? *CONFIG_I2C_HID_ACPI[ =]/d; \
+                  /^#? *CONFIG_HID_MULTITOUCH[ =]/d; \
+                  /^#? *CONFIG_SND_HDA_CODEC_REALTEK[ =]/d; \
+                  /^#? *CONFIG_IOMMU_SUPPORT[ =]/d; \
+                  /^#? *CONFIG_AMD_IOMMU[ =]/d; \
+                  /^#? *CONFIG_IRQ_REMAP[ =]/d; \
+                  /^#? *CONFIG_X86_X2APIC[ =]/d; \
                   /^#? *CONFIG_SND_ALOOP[ =]/d' .config && \
                  printf '%s\\n' \
                    'CONFIG_UNWINDER_FRAME_POINTER=y' \
@@ -765,7 +822,20 @@ pub fn recipe() -> Recipe {
                    'CONFIG_MMC_SDHCI_PCI=y' \
                    'CONFIG_MMC_RICOH_MMC=y' \
                    'CONFIG_SND_HDA_CODEC_CONEXANT=y' \
-                   'CONFIG_SND_HDA_CODEC_HDMI=y' >> .config"
+                   'CONFIG_SND_HDA_CODEC_HDMI=y' \
+                   'CONFIG_X86_AMD_PSTATE=y' \
+                   'CONFIG_X86_AMD_PLATFORM_DEVICE=y' \
+                   'CONFIG_PINCTRL_AMD=y' \
+                   'CONFIG_I2C_DESIGNWARE_CORE=y' \
+                   'CONFIG_I2C_DESIGNWARE_PLATFORM=y' \
+                   'CONFIG_I2C_HID=y' \
+                   'CONFIG_I2C_HID_ACPI=y' \
+                   'CONFIG_HID_MULTITOUCH=y' \
+                   'CONFIG_SND_HDA_CODEC_REALTEK=y' \
+                   'CONFIG_IOMMU_SUPPORT=y' \
+                   'CONFIG_AMD_IOMMU=y' \
+                   'CONFIG_IRQ_REMAP=y' \
+                   'CONFIG_X86_X2APIC=y' >> .config"
                     .replace(
                         "@EFI_CMDLINE@",
                         &format!("{:?}", crate::shared::efi_default_cmdline()),
@@ -971,6 +1041,23 @@ pub fn recipe() -> Recipe {
                  grep -q '^CONFIG_SND_HDA_CODEC_CONEXANT=y' .config || { echo 'SND_HDA_CODEC_CONEXANT off — the T430s Conexant codec falls back to the generic parser' >&2; exit 1; }; \
                  grep -q '^CONFIG_SND_HDA_CODEC_HDMI=y' .config || { echo 'SND_HDA_CODEC_HDMI off — HDMI and DisplayPort audio codecs stay hidden' >&2; exit 1; }; \
                  grep -q '^CONFIG_SND_HDA_CODEC_HDMI_INTEL=y' .config || { echo 'SND_HDA_CODEC_HDMI_INTEL off — Intel HDMI and DisplayPort audio has no codec driver' >&2; exit 1; }; \
+                 grep -q '^CONFIG_X86_AMD_PSTATE=y' .config || { echo 'X86_AMD_PSTATE off — AMD CPUs get no P-state scaling driver' >&2; exit 1; }; \
+                 grep -q '^CONFIG_ACPI_PROCESSOR=y' .config || { echo 'ACPI_PROCESSOR off — AMD CPUs get no ACPI idle states and amd-pstate has no CPPC' >&2; exit 1; }; \
+                 grep -q '^CONFIG_X86_AMD_PLATFORM_DEVICE=y' .config || { echo 'X86_AMD_PLATFORM_DEVICE off — the AMD I2C and GPIO controllers are never created from ACPI' >&2; exit 1; }; \
+                 grep -q '^CONFIG_PINCTRL_AMD=y' .config || { echo 'PINCTRL_AMD off — the T14s touchpad interrupt line has no GPIO controller' >&2; exit 1; }; \
+                 grep -q '^CONFIG_I2C_DESIGNWARE_CORE=y' .config || { echo 'I2C_DESIGNWARE_CORE off — the AMD I2C controller behind the T14s touchpad has no driver' >&2; exit 1; }; \
+                 grep -q '^CONFIG_I2C_DESIGNWARE_PLATFORM=y' .config || { echo 'I2C_DESIGNWARE_PLATFORM off — the ACPI-enumerated DesignWare I2C controller binds no driver' >&2; exit 1; }; \
+                 grep -q '^CONFIG_I2C_HID=y' .config || { echo 'I2C_HID off — the HID-over-I2C menu stays hidden, so the T14s touchpad has no transport' >&2; exit 1; }; \
+                 grep -q '^CONFIG_I2C_HID_ACPI=y' .config || { echo 'I2C_HID_ACPI off — the ACPI-enumerated I2C touchpad binds no driver' >&2; exit 1; }; \
+                 grep -q '^CONFIG_I2C_HID_CORE=y' .config || { echo 'I2C_HID_CORE off — HID over I2C has no core' >&2; exit 1; }; \
+                 grep -q '^CONFIG_HID_MULTITOUCH=y' .config || { echo 'HID_MULTITOUCH off — the T14s precision touchpad stays a relative mouse with no finger tool' >&2; exit 1; }; \
+                 grep -q '^CONFIG_SND_HDA_CODEC_REALTEK=y' .config || { echo 'SND_HDA_CODEC_REALTEK off — the T14s Realtek codec falls back to the generic parser' >&2; exit 1; }; \
+                 grep -q '^CONFIG_SND_HDA_CODEC_ALC269=y' .config || { echo 'SND_HDA_CODEC_ALC269 off — the ALC257 family on the T14s has no Realtek fixups' >&2; exit 1; }; \
+                 grep -q '^CONFIG_GPIO_ACPI=y' .config || { echo 'GPIO_ACPI off — the I2C touchpad gets no interrupt and GPIO-signalled ACPI events (_AEI) are lost' >&2; exit 1; }; \
+                 grep -q '^CONFIG_IOMMU_SUPPORT=y' .config || { echo 'IOMMU_SUPPORT off — IRQ_REMAP and the IOMMU drivers stay hidden, so X86_X2APIC cannot be built' >&2; exit 1; }; \
+                 grep -q '^CONFIG_AMD_IOMMU=y' .config || { echo 'AMD_IOMMU off — the AMD IOMMU goes unused: no interrupt remapping (an x2APIC handover falls back to xAPIC) and no DMA isolation' >&2; exit 1; }; \
+                 grep -q '^CONFIG_IRQ_REMAP=y' .config || { echo 'IRQ_REMAP off — X86_X2APIC depends on it' >&2; exit 1; }; \
+                 grep -q '^CONFIG_X86_X2APIC=y' .config || { echo 'X86_X2APIC off — firmware that hands over in x2APIC mode leaves the kernel with its APIC disabled' >&2; exit 1; }; \
                  if grep -q '^CONFIG_IPC_NS=y' .config; then echo 'IPC_NS on — it is default y behind SYSVIPC||POSIX_MQUEUE, so pinning either brings it along unasked; td-jail omits CLONE_NEWIPC and APPLICATIONS.md §0 defers it deliberately' >&2; exit 1; fi".replace("@EFI_CMDLINE@", &format!("{:?}", crate::shared::efi_default_cmdline())),
             ],
         )
@@ -1252,6 +1339,65 @@ mod tests {
             "MOUSE_PS2_TRACKPOINT",
             "USB_EHCI_PCI",
             "SND_HDA_CODEC_HDMI_INTEL",
+        ] {
+            assert!(
+                !text.contains(&format!("CONFIG_{symbol}[ =]/d")),
+                "{symbol}"
+            );
+            assert!(!text.contains(&format!("'CONFIG_{symbol}=y'")), "{symbol}");
+            assert!(
+                text.contains(&format!("grep -q '^CONFIG_{symbol}=y' .config")),
+                "{symbol}"
+            );
+        }
+    }
+
+    /// The T14s Gen 4 AMD's own drivers beside the shared laptop set:
+    /// amd-pstate, the AMD I2C/GPIO platform, the I2C touchpad, the
+    /// Realtek codec and x2APIC with the interrupt remapping it needs.
+    #[test]
+    fn t14s_gen4_amd_drivers_are_builtin_after_config_resolution() {
+        let text = recipe()
+            .steps
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|step| match step {
+                Step::Run { argv, .. } => Some(argv.join("\n")),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        for symbol in [
+            "X86_AMD_PSTATE",
+            "X86_AMD_PLATFORM_DEVICE",
+            "PINCTRL_AMD",
+            "I2C_DESIGNWARE_CORE",
+            "I2C_DESIGNWARE_PLATFORM",
+            "I2C_HID",
+            "I2C_HID_ACPI",
+            "HID_MULTITOUCH",
+            "SND_HDA_CODEC_REALTEK",
+            "IOMMU_SUPPORT",
+            "AMD_IOMMU",
+            "IRQ_REMAP",
+            "X86_X2APIC",
+        ] {
+            let pin = format!("'CONFIG_{symbol}=y'");
+            let stale = format!("/^#? *CONFIG_{symbol}[ =]/d;");
+            assert_eq!(text.matches(&stale).count(), 1, "{symbol}");
+            assert_eq!(text.matches(&pin).count(), 1, "{symbol}");
+            assert!(
+                text.contains(&format!("grep -q '^CONFIG_{symbol}=y' .config")),
+                "{symbol}"
+            );
+        }
+        // Selected by a pinned symbol, or without a visible prompt: guarded
+        // only.
+        for symbol in [
+            "ACPI_PROCESSOR",
+            "I2C_HID_CORE",
+            "GPIO_ACPI",
+            "SND_HDA_CODEC_ALC269",
         ] {
             assert!(
                 !text.contains(&format!("CONFIG_{symbol}[ =]/d")),

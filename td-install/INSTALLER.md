@@ -38,7 +38,25 @@ from its sysfs properties and moves the pointer by one finger's travel, as
 a mouse does; its button presses click, and tapping and scrolling are not
 yet read. The TrackPoint moves it relatively. Its Intel Wi-Fi needs vendor
 firmware, a class of foreign data AGENTS.md does not admit, so the wired
-port is its network until that is decided. Legacy BIOS, resizing, dual boot and RAID are outside v1. Preserving an
+port is its network until that is decided.
+
+The ThinkPad T14s Gen 4 AMD is a second hardware target on the same terms:
+its drivers are built in and checked after config resolution ahead of
+validation on the machine. Beside the T430s's thinkpad_acpi and ACPI
+platform set, PS/2 keyboard and TrackPoint, and the NVMe and xHCI every
+installation medium needs, it has amd-pstate, the AMD ACPI platform devices
+with their GPIO controller and DesignWare I2C, the HID-over-I2C touchpad
+through hid-multitouch, the Realtek codec, x2APIC, which firmware that hands
+over in x2APIC mode needs, and the AMD IOMMU, for interrupt remapping and
+DMA isolation.
+Its Radeon has no driver, since amdgpu needs vendor firmware, so its
+display is the UEFI GOP framebuffer through simpledrm, at the resolution
+firmware set, with no brightness control or external display; its internal
+microphones are on the ACP, whose audio drivers are not built. It has no wired port, and its
+Qualcomm Wi-Fi needs vendor firmware as well, so it has no network until
+that is decided.
+
+Legacy BIOS, resizing, dual boot and RAID are outside v1. Preserving an
 existing td installation is limited to the explicit reinstall mode below.
 For a new installation, one selected whole disk is reformatted, not
 wiped (ENCRYPTION.md "Device-bound formatting"), and receives GPT, a FAT32
