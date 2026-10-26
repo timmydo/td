@@ -27,13 +27,15 @@ use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use td_engine::application_spec::dynamic_application_policy;
 use td_engine::flathub_app::{
-    self, Admitted, FlathubSource, Selection, ADMITTED, CACHE_DIR, CACHE_ENTRIES, CHECKED, CURRENT,
-    DEPLOY, FILES, GENERATIONS, LOCK, OBJECTS, PREVIOUS, SELECTION, WORK,
+    self, Admitted, CacheStatus, DeployStatus, FlathubSource, GenerationStatus, Part, Progress,
+    Refusal, Selection, Stage, Status, ADMITTED, CACHE_DIR, CACHE_ENTRIES, CHECKED, CURRENT,
+    DEPLOY, FILES, GENERATIONS, LOCK, OBJECTS, PREVIOUS, PROGRESS, REFUSED, SELECTION, WORK,
 };
 use td_engine::ostree::{self, Checksum, Commit, ObjectKey, ObjectKind};
 
@@ -78,6 +80,10 @@ const EXPORTED: &str = "exported";
 #[derive(Debug, Eq, PartialEq)]
 enum Outcome {
     Ready(Option<u64>),
+    Status(Box<Status>),
+    Removed,
+    /// Whether there was state to delete.
+    Deleted(bool),
     Throttled,
     Unchanged,
     Selected(u64),
@@ -205,6 +211,10 @@ fn lock(cache: &Path) -> Result<File, String> {
     .ok_or_else(|| format!("{} vanished", path.display()))?;
     file.lock()
         .map_err(|error| format!("lock {}: {error}", path.display()))?;
+    // A record a killed writer left would read as this writer's until it
+    // writes its own. Best effort: debris here must not block the run
+    // that clears `.work`.
+    let _ = remove_entry(&cache.join(WORK).join(PROGRESS));
     Ok(file)
 }
 
@@ -387,6 +397,8 @@ fn deploy(
     admission: &Admission<'_>,
     cache: &Path,
     candidate: &Candidate,
+    part: Part,
+    tracker: &Tracker,
 ) -> Result<PathBuf, String> {
     let hex = &candidate.admitted.commit;
     let out = deploy_path(cache, hex);
@@ -403,14 +415,20 @@ fn deploy(
         hex,
         &candidate.content.to_hex(),
     )?;
+    // A graph already complete is never fetched, so its counters stay at
+    // nothing rather than the last graph's.
+    tracker.graph.reset();
+    tracker.set(Stage::Fetch, Some(part));
+    let progress = Some(&tracker.graph);
     match admission.feed {
         Some(base) if candidate.from_feed => {
-            crate::ostree::acquire_from_feed(&spec, &objects, base, |_| Ok(()))?;
+            crate::ostree::acquire_from_feed(&spec, &objects, base, |_| Ok(()), progress)?;
         }
         _ => {
-            crate::ostree::acquire(&spec, &objects)?;
+            crate::ostree::acquire(&spec, &objects, progress)?;
         }
     }
+    tracker.set(Stage::Materialize, Some(part));
     private_dir(&out)?;
     fs::set_permissions(&out, fs::Permissions::from_mode(0o755))
         .map_err(|error| format!("chmod {}: {error}", out.display()))?;
@@ -504,7 +522,9 @@ fn list(directory: &Path) -> Result<Vec<(String, PathBuf)>, String> {
 /// Write the generation completely, then make it `current`; the generation
 /// it replaces becomes `previous`. A crash between the two renames leaves
 /// both naming the old generation, which costs only the older rollback.
-fn publish(cache: &Path, selection: &Selection, current: Option<u64>) -> Result<u64, String> {
+/// `previous` becomes the `previous` pointer: an update passes the
+/// generation it replaces, a revalidation the rollback it keeps.
+fn publish(cache: &Path, selection: &Selection, previous: Option<u64>) -> Result<u64, String> {
     let next = list(&cache.join(GENERATIONS))?
         .iter()
         .filter_map(|(name, _)| flathub_app::generation_number(name))
@@ -530,8 +550,8 @@ fn publish(cache: &Path, selection: &Selection, current: Option<u64>) -> Result<
     for area in [GENERATIONS, DEPLOY, OBJECTS] {
         sync_dir(&cache.join(area))?;
     }
-    if let Some(current) = current {
-        point(cache, PREVIOUS, current)?;
+    if let Some(previous) = previous {
+        point(cache, PREVIOUS, previous)?;
     }
     point(cache, CURRENT, next)?;
     sync_dir(cache)?;
@@ -540,11 +560,53 @@ fn publish(cache: &Path, selection: &Selection, current: Option<u64>) -> Result<
 
 /// Remove a tree the account owns, opening any directory a reader sealed.
 fn remove_tree(path: &Path) -> Result<(), String> {
+    remove_tree_on(path, None)
+}
+
+/// `remove_tree`, refusing before it removes anything when a directory in
+/// the tree is on another filesystem than `device`.
+fn remove_tree_on(path: &Path, device: Option<u64>) -> Result<(), String> {
+    if open_tree(path, device)? {
+        fs::remove_dir_all(path).map_err(|error| format!("remove {}: {error}", path.display()))
+    } else {
+        fs::remove_file(path).map_err(|error| format!("remove {}: {error}", path.display()))
+    }
+}
+
+/// Refuse a tree holding a directory on another filesystem than `device`,
+/// changing nothing; a directory it cannot read is passed over.
+fn foreign_directory(path: &Path, device: u64) -> Result<(), String> {
+    let mut pending = vec![path.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(metadata) = fs::symlink_metadata(entry.path()) else {
+                continue;
+            };
+            if metadata.file_type().is_dir() {
+                if metadata.dev() != device {
+                    return Err(format!(
+                        "{} is another filesystem's; nothing was removed",
+                        entry.path().display()
+                    ));
+                }
+                pending.push(entry.path());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Open every directory of a tree to its owner, refusing a directory on
+/// another filesystem than `device` before anything is removed; whether
+/// `path` is a directory.
+fn open_tree(path: &Path, device: Option<u64>) -> Result<bool, String> {
     let metadata =
         fs::symlink_metadata(path).map_err(|error| format!("stat {}: {error}", path.display()))?;
     if !metadata.file_type().is_dir() {
-        return fs::remove_file(path)
-            .map_err(|error| format!("remove {}: {error}", path.display()));
+        return Ok(false);
     }
     let mut pending = vec![path.to_path_buf()];
     while let Some(directory) = pending.pop() {
@@ -559,11 +621,22 @@ fn remove_tree(path: &Path) -> Result<(), String> {
                 .map_err(|error| format!("stat {}: {error}", entry.path().display()))?
                 .is_dir()
             {
+                if let Some(device) = device {
+                    let found = fs::symlink_metadata(entry.path())
+                        .map_err(|error| format!("stat {}: {error}", entry.path().display()))?
+                        .dev();
+                    if found != device {
+                        return Err(format!(
+                            "{} is another filesystem's; nothing was removed",
+                            entry.path().display()
+                        ));
+                    }
+                }
                 pending.push(entry.path());
             }
         }
     }
-    fs::remove_dir_all(path).map_err(|error| format!("remove {}: {error}", path.display()))
+    Ok(true)
 }
 
 enum Hold {
@@ -677,6 +750,160 @@ fn collect(cache: &Path, also: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn read_checked(cache: &Path) -> Result<Option<u64>, String> {
+    Ok(read_text(&cache.join(CHECKED))?.and_then(|text| {
+        text.strip_suffix('\n')
+            .and_then(|text| text.parse::<u64>().ok())
+    }))
+}
+
+/// `.work` afresh, under the lock: nothing a reader trusts is left in it.
+fn fresh_work(cache: &Path) -> Result<PathBuf, String> {
+    let work = cache.join(WORK);
+    if fs::symlink_metadata(&work).is_ok() {
+        remove_tree(&work)?;
+    }
+    private_dir(&work)?;
+    Ok(work)
+}
+
+/// What a check that did not complete reports through `status` until one
+/// does. A failure to record it is reported, never in place of the cause.
+fn record_refusal(cache: &Path, now: u64, error: &str) {
+    let mut reason = flathub_app::reason_text(error);
+    if reason.is_empty() {
+        reason.push_str("unknown");
+    }
+    let refusal = Refusal { time: now, reason };
+    if let Err(failure) = write_state(&cache.join(REFUSED), &format!("{}\n", refusal.render())) {
+        eprintln!("td-app: {failure}");
+    }
+}
+
+fn clear_refusal(cache: &Path) -> Result<(), String> {
+    let path = cache.join(REFUSED);
+    if fs::symlink_metadata(&path).is_ok() {
+        remove_tree(&path)?;
+    }
+    Ok(())
+}
+
+/// How often a running check refreshes its progress record.
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(500);
+const PROGRESS_TICK: Duration = Duration::from_millis(50);
+
+/// What the writer holding the lock is doing, published as one line in
+/// `.work/progress` for `status`, which takes no lock.
+struct Tracker {
+    path: PathBuf,
+    staged: PathBuf,
+    stage: Mutex<(Stage, Option<Part>)>,
+    /// Serializes the ticker's writes with `set`'s.
+    writing: Mutex<()>,
+    graph: crate::ostree::Progress,
+    done: AtomicBool,
+}
+
+/// Ends the ticker however `run`'s body ends, a panic included, so the
+/// scope that joins it always finishes.
+struct Finish<'a>(&'a AtomicBool);
+impl Drop for Finish<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+impl Tracker {
+    fn new(work: &Path, stage: Stage) -> Tracker {
+        let tracker = Tracker {
+            path: work.join(PROGRESS),
+            staged: work.join(".progress.new"),
+            stage: Mutex::new((stage, None)),
+            writing: Mutex::new(()),
+            graph: crate::ostree::Progress::default(),
+            done: AtomicBool::new(false),
+        };
+        tracker.write();
+        tracker
+    }
+
+    fn set(&self, stage: Stage, part: Option<Part>) {
+        if let Ok(mut current) = self.stage.lock() {
+            *current = (stage, part);
+        }
+        self.write();
+    }
+
+    fn record(&self) -> Progress {
+        let (stage, part) = self
+            .stage
+            .lock()
+            .map(|current| *current)
+            .unwrap_or((Stage::Busy, None));
+        let mut progress = Progress::idle(stage);
+        progress.part = part;
+        if stage == Stage::Fetch {
+            let (objects_bound, bytes_bound) = crate::ostree::Progress::bounds();
+            // Done before known: a batch is known before any of it is done.
+            let objects = self.graph.objects.load(Ordering::Acquire);
+            let known = self.graph.known.load(Ordering::Acquire).min(objects_bound);
+            progress.objects = objects.min(known);
+            progress.objects_known = known;
+            progress.objects_bound = objects_bound;
+            progress.bytes = self.graph.bytes.load(Ordering::Acquire).min(bytes_bound);
+            progress.bytes_bound = bytes_bound;
+        }
+        progress
+    }
+
+    /// Best effort and not durable: one rename publishes the line whole,
+    /// and nothing needs it after a crash, since `status` reads it only
+    /// while the lock's holder lives. A record that cannot be written
+    /// leaves `status` saying only that a writer holds the lock.
+    fn write(&self) {
+        let Ok(_writing) = self.writing.lock() else {
+            return;
+        };
+        let line = format!("{}\n", self.record().render());
+        if fs::write(&self.staged, line).is_ok() {
+            let _ = fs::rename(&self.staged, &self.path);
+        }
+    }
+
+    /// Run `body`, refreshing the record beside it until it returns. A
+    /// ticker that cannot start leaves the records `set` writes.
+    fn run<T>(&self, body: impl FnOnce() -> T) -> T {
+        self.done.store(false, Ordering::Release);
+        std::thread::scope(|scope| {
+            let finish = Finish(&self.done);
+            let ticker = std::thread::Builder::new().spawn_scoped(scope, || {
+                let mut last = Instant::now();
+                while !self.done.load(Ordering::Acquire) {
+                    std::thread::sleep(PROGRESS_TICK);
+                    if last.elapsed() >= PROGRESS_INTERVAL {
+                        last = Instant::now();
+                        self.write();
+                    }
+                }
+            });
+            if let Err(error) = ticker {
+                eprintln!("td-app: progress is written at each stage only: {error}");
+            }
+            let result = body();
+            drop(finish);
+            result
+        })
+    }
+}
+
+/// `.work` goes once a run that holds the lock is over. Failing to remove
+/// it does not undo what the run did, and the next run clears it.
+fn clear_work(work: &Path) {
+    if let Err(error) = remove_tree(work) {
+        eprintln!("td-app: {error}");
+    }
+}
+
 fn update(
     admission: &Admission<'_>,
     cache: &Path,
@@ -686,15 +913,27 @@ fn update(
 ) -> Result<Outcome, String> {
     prepare_cache(cache)?;
     let _lock = lock(cache)?;
+    let outcome = locked_update(admission, cache, source, force, now);
+    if let Err(error) = &outcome {
+        record_refusal(cache, now, error);
+    }
+    outcome
+}
+
+/// `update` under the lock: whatever fails here is the last refusal.
+fn locked_update(
+    admission: &Admission<'_>,
+    cache: &Path,
+    source: FlathubSource,
+    force: bool,
+    now: u64,
+) -> Result<Outcome, String> {
     let expected = expect(source)?;
     let current = read_pointer(cache, CURRENT)?;
     let previous = read_pointer(cache, PREVIOUS)?;
     if !force {
         if let Some((_, selection)) = &current {
-            let checked = read_text(&cache.join(CHECKED))?.and_then(|text| {
-                text.strip_suffix('\n')
-                    .and_then(|text| text.parse::<u64>().ok())
-            });
+            let checked = read_checked(cache)?;
             if checked.is_some_and(|checked| checked <= now && now - checked < CHECK_INTERVAL_SECS)
                 && serves(cache, selection, source, &expected)
             {
@@ -702,6 +941,39 @@ fn update(
             }
         }
     }
+    let work = fresh_work(cache)?;
+    let tracker = Tracker::new(&work, Stage::Resolve);
+    let outcome = tracker.run(|| {
+        check(
+            admission,
+            cache,
+            source,
+            &expected,
+            (current, previous),
+            now,
+            &tracker,
+        )
+    });
+    clear_work(&work);
+    let outcome = outcome?;
+    write_state(&cache.join(CHECKED), &format!("{now}\n"))?;
+    clear_refusal(cache)?;
+    Ok(outcome)
+}
+
+type Pointers = (Option<(u64, Selection)>, Option<(u64, Selection)>);
+
+/// Rules 1–5 for what the declaration's refs name now, then publication
+/// and collection, under the lock and beside `tracker`'s record.
+fn check(
+    admission: &Admission<'_>,
+    cache: &Path,
+    source: FlathubSource,
+    expected: &Expected,
+    (current, previous): Pointers,
+    now: u64,
+    tracker: &Tracker,
+) -> Result<Outcome, String> {
     // Rows for refs no longer declared are dropped, which bounds the file.
     let mut admitted: Vec<Admitted> = match read_text(&cache.join(ADMITTED))? {
         Some(text) => flathub_app::parse_admitted(&text)?,
@@ -715,21 +987,18 @@ fn update(
         .collect();
 
     let work = cache.join(WORK);
-    if fs::symlink_metadata(&work).is_ok() {
-        remove_tree(&work)?;
-    }
-    private_dir(&work)?;
     let deadline = Instant::now()
         .checked_add(RESOLVE_TIME)
         .ok_or("resolve deadline overflows")?;
+    tracker.set(Stage::Resolve, Some(Part::Runtime));
     let runtime = resolve(admission, &work, source.runtime, &known, now, deadline)?;
+    tracker.set(Stage::Resolve, Some(Part::Application));
     let application = resolve(admission, &work, source.application, &known, now, deadline)?;
     let metadata = application
         .metadata
         .as_deref()
         .ok_or_else(|| format!("{} commit carries no xa.metadata", source.application))?;
     flathub_app::require_runtime(metadata, source.runtime)?;
-    remove_tree(&work)?;
     drop(known);
 
     let selection = Selection {
@@ -749,13 +1018,14 @@ fn update(
         let same = current
             .as_ref()
             .is_some_and(|(_, selected)| *selected == selection);
-        if same && serves(cache, &selection, source, &expected) {
+        if same && serves(cache, &selection, source, expected) {
             // Heals an `admitted` that an interrupted run left behind.
             write_state(&cache.join(ADMITTED), &admitted_text)?;
             return Ok(Outcome::Unchanged);
         }
-        let runtime_out = deploy(admission, cache, &runtime)?;
-        let application_out = deploy(admission, cache, &application)?;
+        let runtime_out = deploy(admission, cache, &runtime, Part::Runtime, tracker)?;
+        let application_out = deploy(admission, cache, &application, Part::Application, tracker)?;
+        tracker.set(Stage::Validate, None);
         (admission.validate)(
             &application_out,
             source.entry,
@@ -771,6 +1041,7 @@ fn update(
             // would only push the real rollback out.
             return Ok(Outcome::Unchanged);
         }
+        tracker.set(Stage::Publish, None);
         let generation = publish(
             cache,
             &selection,
@@ -783,19 +1054,16 @@ fn update(
         .iter()
         .map(|candidate| candidate.admitted.commit.clone())
         .collect();
+    tracker.set(Stage::Collect, None);
     let collected = collect(cache, &attempted);
-    let outcome = match (outcome, collected) {
-        (Ok(outcome), Ok(())) => outcome,
-        (Ok(_), Err(error)) => return Err(error),
-        (Err(error), Ok(())) => return Err(error),
-        (Err(error), Err(collection)) => {
-            return Err(format!(
-                "{error}; collecting the cache also failed: {collection}"
-            ))
-        }
-    };
-    write_state(&cache.join(CHECKED), &format!("{now}\n"))?;
-    Ok(outcome)
+    match (outcome, collected) {
+        (Ok(outcome), Ok(())) => Ok(outcome),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(collection)) => Err(format!(
+            "{error}; collecting the cache also failed: {collection}"
+        )),
+    }
 }
 
 /// The generation td-jail may launch: `current`, while it still serves the
@@ -809,6 +1077,328 @@ fn ready(cache: &Path, source: FlathubSource) -> Result<Option<u64>, String> {
         }
         _ => None,
     })
+}
+
+/// The regular-file bytes below a deploy's `files/`, walked without
+/// following links; an entry that goes during the walk is not counted.
+fn deploy_bytes(files: &Path) -> Result<u64, String> {
+    let bound = u64::try_from(ostree::MAX_GRAPH_PATHS).unwrap_or(u64::MAX);
+    let mut entries = 0u64;
+    let mut bytes = 0u64;
+    let mut pending = vec![files.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let listing = match fs::read_dir(&directory) {
+            Ok(listing) => listing,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("read {}: {error}", directory.display())),
+        };
+        for entry in listing {
+            let entry = entry.map_err(|error| format!("read {}: {error}", directory.display()))?;
+            entries += 1;
+            if entries > bound {
+                return Err(format!("{} has more than {bound} entries", files.display()));
+            }
+            let metadata = match fs::symlink_metadata(entry.path()) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(format!("stat {}: {error}", entry.path().display())),
+            };
+            if metadata.is_dir() {
+                pending.push(entry.path());
+            } else if metadata.is_file() {
+                bytes = bytes.saturating_add(metadata.len());
+            }
+        }
+    }
+    Ok(bytes)
+}
+
+/// A pointer as `status` reads it without the lock: a check can move it
+/// and collect the generation it named between the link and the
+/// selection, so a missing selection is read again from the link.
+fn read_pointer_settled(cache: &Path, pointer: &str) -> Result<Option<(u64, Selection)>, String> {
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        match read_pointer(cache, pointer) {
+            Err(_) if attempts < POINTER_ATTEMPTS => {}
+            settled => return settled,
+        }
+    }
+}
+
+const POINTER_ATTEMPTS: usize = 3;
+
+fn deploy_status(cache: &Path, row: &Admitted) -> DeployStatus {
+    // Deployed before and after the walk: a tree collected meanwhile has
+    // no size rather than a partial one.
+    let bytes = deployed(cache, &row.commit)
+        .then(|| deploy_bytes(&deploy_path(cache, &row.commit).join(FILES)).ok())
+        .flatten()
+        .filter(|_| deployed(cache, &row.commit));
+    DeployStatus {
+        row: row.clone(),
+        bytes,
+    }
+}
+
+/// What the writer holding the cache's lock is doing, or `None` when none
+/// does. It never waits for or keeps the lock: a shared try-lock answers
+/// whether a writer holds it and is released at once, so a record a killed
+/// check left behind never reads as running.
+fn writer_progress(cache: &Path) -> Result<Option<Progress>, String> {
+    let path = cache.join(LOCK);
+    let Some(file) = open_regular(&path, OpenOptions::new().read(true))? else {
+        return Ok(None);
+    };
+    match file.try_lock_shared() {
+        Ok(()) => Ok(None),
+        Err(TryLockError::WouldBlock) => {
+            let record = read_text(&cache.join(WORK).join(PROGRESS))
+                .ok()
+                .flatten()
+                .and_then(|text| {
+                    text.strip_suffix('\n')
+                        .and_then(|line| Progress::parse(line).ok())
+                });
+            Ok(Some(record.unwrap_or(Progress::idle(Stage::Busy))))
+        }
+        Err(TryLockError::Error(error)) => Err(format!("lock {}: {error}", path.display())),
+    }
+}
+
+/// `td-app status`: the cache as it reads now, taking no lock, as `ready`
+/// takes none. It writes nothing, and a cache that does not exist reads as
+/// one with nothing installed.
+fn status(cache: &Path, source: FlathubSource) -> Result<Status, String> {
+    let expected = expect(source)?;
+    let generation = |pointer| -> Result<Option<GenerationStatus>, String> {
+        Ok(
+            read_pointer_settled(cache, pointer)?.map(|(generation, selection)| GenerationStatus {
+                generation,
+                serves: serves(cache, &selection, source, &expected),
+                application: deploy_status(cache, &selection.application),
+                runtime: deploy_status(cache, &selection.runtime),
+            }),
+        )
+    };
+    let current = generation(CURRENT)?;
+    let previous = generation(PREVIOUS)?;
+    // A damaged refusal record is no refusal; it is rewritten or cleared by
+    // the next check.
+    let refused = read_text(&cache.join(REFUSED))
+        .ok()
+        .flatten()
+        .and_then(|text| {
+            text.strip_suffix('\n')
+                .and_then(|line| Refusal::parse(line).ok())
+        });
+    Ok(Status {
+        name: source.name.to_string(),
+        cache: Some(CacheStatus {
+            current,
+            previous,
+            checked: read_checked(cache)?,
+            refused,
+            progress: writer_progress(cache)?,
+        }),
+    })
+}
+
+fn remove_entry(path: &Path) -> Result<(), String> {
+    if fs::symlink_metadata(path).is_ok() {
+        remove_tree(path)?;
+    }
+    Ok(())
+}
+
+/// `td-app remove`: clear `previous`, then `current`, and collect every
+/// generation, deploy and object graph no launch holds. A held generation
+/// stays until a later collection finds it free. `admitted` stays, so a
+/// reinstall admits no commit older than one already admitted, and so does
+/// the jail state, which only `delete-data` removes.
+fn remove(cache: &Path) -> Result<Outcome, String> {
+    if fs::symlink_metadata(cache).is_err() {
+        return Ok(Outcome::Removed);
+    }
+    prepare_cache(cache)?;
+    let _lock = lock(cache)?;
+    let work = fresh_work(cache)?;
+    let _tracker = Tracker::new(&work, Stage::Remove);
+    // Previous first: an interrupted removal leaves `current` alone, still
+    // installed, rather than a `previous` no `current` stands before.
+    let removed = (|| {
+        for pointer in [PREVIOUS, CURRENT] {
+            remove_entry(&cache.join(pointer))?;
+        }
+        sync_dir(cache)?;
+        remove_entry(&cache.join(REFUSED))?;
+        collect(cache, &[])
+    })();
+    clear_work(&work);
+    removed?;
+    Ok(Outcome::Removed)
+}
+
+/// Where td-jail keeps an application's state, relative to its account's
+/// home (td-jail's compiled `state-root`).
+const STATE_ROOT: &str = ".td/app";
+
+/// A directory of the account's own, reached without a link.
+fn own_directory(path: &Path, uid: u32) -> Result<Option<fs::Metadata>, String> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("stat {}: {error}", path.display())),
+    };
+    if !metadata.is_dir() || metadata.uid() != uid {
+        return Err(format!(
+            "{} is not a directory of this account's",
+            path.display()
+        ));
+    }
+    Ok(Some(metadata))
+}
+
+/// `td-app delete-data`: the application's jail state, as its account,
+/// only once it is removed and no instance runs. Every running launch holds
+/// a generation's selection (§W.9's lease), so a generation left after
+/// collection under the lock is a running instance. A launch that starts
+/// meanwhile finds no `current` and waits for this lock before it fetches,
+/// so it starts on the state as this leaves it.
+fn delete_data(home: &Path, cache: &Path, source: FlathubSource) -> Result<Outcome, String> {
+    // Never installed and no state: nothing to lock against.
+    if fs::symlink_metadata(cache).is_err()
+        && fs::symlink_metadata(home.join(STATE_ROOT).join(source.name)).is_err()
+    {
+        return Ok(Outcome::Deleted(false));
+    }
+    prepare_cache(cache)?;
+    let _lock = lock(cache)?;
+    let work = fresh_work(cache)?;
+    let _tracker = Tracker::new(&work, Stage::DeleteData);
+    let deleted = (|| {
+        for pointer in [CURRENT, PREVIOUS] {
+            if fs::symlink_metadata(cache.join(pointer)).is_ok() {
+                return Err(format!(
+                    "{} is installed; remove it before deleting its data",
+                    source.name
+                ));
+            }
+        }
+        collect(cache, &[])?;
+        if !list(&cache.join(GENERATIONS))?.is_empty() {
+            return Err(format!(
+                "{} is running; its data stays until every instance exits",
+                source.name
+            ));
+        }
+        delete_state(home, source.name)
+    })();
+    clear_work(&work);
+    Ok(Outcome::Deleted(deleted?))
+}
+
+/// Rename the state aside, then remove it, so an interrupted deletion
+/// never leaves half a profile for td-jail to launch on; the next one
+/// finishes it. Nothing outside the state's own filesystem is touched.
+fn delete_state(home: &Path, name: &str) -> Result<bool, String> {
+    let uid = fs::metadata(home)
+        .map_err(|error| format!("stat {}: {error}", home.display()))?
+        .uid();
+    let td = home.join(".td");
+    let applications = home.join(STATE_ROOT);
+    if own_directory(&td, uid)?.is_none() || own_directory(&applications, uid)?.is_none() {
+        return Ok(false);
+    }
+    let doomed = applications.join(format!("{REMOVING}{name}"));
+    if let Some(metadata) = own_directory(&doomed, uid)? {
+        remove_tree_on(&doomed, Some(metadata.dev()))?;
+    }
+    let state = applications.join(name);
+    let Some(metadata) = own_directory(&state, uid)? else {
+        return Ok(false);
+    };
+    // Refuse before the state moves or a mode changes; a directory too
+    // sealed to read here is checked again once it is aside.
+    foreign_directory(&state, metadata.dev())?;
+    fs::rename(&state, &doomed)
+        .map_err(|error| format!("rename {} for removal: {error}", state.display()))?;
+    sync_dir(&applications)?;
+    remove_tree_on(&doomed, Some(metadata.dev()))?;
+    Ok(true)
+}
+
+/// `td-app revalidate`: rule 5 again over the deploys `current` already
+/// has, fetching nothing, when only what no commit carries changed (a
+/// system update's entry or loader policy, `checks=`). It answers as
+/// `ready` does: the generation that serves now, or `absent` with the
+/// reason recorded as the last refusal.
+fn revalidate(
+    admission: &Admission<'_>,
+    cache: &Path,
+    source: FlathubSource,
+    now: u64,
+) -> Result<Option<u64>, String> {
+    if fs::symlink_metadata(cache).is_err() {
+        return Ok(None);
+    }
+    prepare_cache(cache)?;
+    let _lock = lock(cache)?;
+    let expected = expect(source)?;
+    let Some((number, selection)) = read_pointer(cache, CURRENT)? else {
+        return Ok(None);
+    };
+    if serves(cache, &selection, source, &expected) {
+        return Ok(Some(number));
+    }
+    let work = fresh_work(cache)?;
+    let _tracker = Tracker::new(&work, Stage::Revalidate);
+    let revalidated = (|| {
+        if selection.name != source.name
+            || selection.application.exact_ref != source.application
+            || selection.runtime.exact_ref != source.runtime
+        {
+            return Err(format!(
+                "{}'s declaration names other refs; it needs an update",
+                source.name
+            ));
+        }
+        if !selection.commits().all(|commit| deployed(cache, commit)) {
+            return Err(format!(
+                "a deploy of {}'s current generation is missing; it needs an update",
+                source.name
+            ));
+        }
+        (admission.validate)(
+            &deploy_path(cache, &selection.application.commit),
+            source.entry,
+            &deploy_path(cache, &selection.runtime.commit),
+            &expected.library_paths,
+            &expected.optional_targets,
+            expected.optional_links,
+        )?;
+        let next = Selection {
+            checks: expected.checks.clone(),
+            ..selection.clone()
+        };
+        // The stale copy is no rollback: `previous` stays what it was.
+        let previous = read_pointer(cache, PREVIOUS)?.map(|(generation, _)| generation);
+        let generation = publish(cache, &next, previous)?;
+        collect(cache, &[])?;
+        Ok(generation)
+    })();
+    clear_work(&work);
+    match revalidated {
+        Ok(generation) => {
+            clear_refusal(cache)?;
+            Ok(Some(generation))
+        }
+        Err(error) => {
+            record_refusal(cache, now, &format!("offline revalidation: {error}"));
+            Ok(None)
+        }
+    }
 }
 
 /// The cache must belong to the account td-app runs as: as root it would
@@ -888,7 +1478,7 @@ fn export(
             &candidate.content.to_hex(),
         )?;
         let objects = cache.join(OBJECTS).join(&candidate.admitted.commit);
-        crate::ostree::acquire(&spec, &objects)?;
+        crate::ostree::acquire(&spec, &objects, None)?;
         // Recorded before any of it is published, so no failure leaks it.
         if fs::symlink_metadata(store_graph(commit)).is_err()
             && owned.insert(candidate.admitted.commit.clone())
@@ -1030,13 +1620,20 @@ pub(crate) fn export_to(store: &Path) -> Result<Vec<String>, String> {
 }
 
 fn usage() -> ! {
-    eprintln!("usage: td-app update NAME [--force] | td-app ready NAME");
+    eprintln!(
+        "usage: td-app update NAME [--force] | td-app ready NAME | td-app status NAME | \
+         td-app remove NAME | td-app delete-data NAME | td-app revalidate NAME"
+    );
     std::process::exit(2);
 }
 
 enum Verb {
     Update { force: bool },
     Ready,
+    Status,
+    Remove,
+    DeleteData,
+    Revalidate,
 }
 
 pub fn run(args: &[String]) {
@@ -1045,7 +1642,14 @@ pub fn run(args: &[String]) {
         Some([verb, name, flag]) if verb == "update" && flag == "--force" => {
             (name, Verb::Update { force: true })
         }
-        Some([verb, name]) if verb == "ready" => (name, Verb::Ready),
+        Some([verb, name]) => match verb.as_str() {
+            "ready" => (name, Verb::Ready),
+            "status" => (name, Verb::Status),
+            "remove" => (name, Verb::Remove),
+            "delete-data" => (name, Verb::DeleteData),
+            "revalidate" => (name, Verb::Revalidate),
+            _ => usage(),
+        },
         _ => usage(),
     };
     let Some(source) = flathub_app::flathub_source(name) else {
@@ -1059,10 +1663,10 @@ pub fn run(args: &[String]) {
             return Err(format!("HOME {} is not absolute", home.display()));
         }
         require_account(home)?;
-        // Only an update fetches; `ready` answers td-jail without it.
+        // Only an update fetches; nothing else asks for a feed.
         let feed = match verb {
             Verb::Update { .. } => crate::feed::provisioned_feed_base()?,
-            Verb::Ready => None,
+            _ => None,
         };
         let admission = Admission {
             repository: flathub_app::REPOSITORY,
@@ -1074,12 +1678,23 @@ pub fn run(args: &[String]) {
         match verb {
             Verb::Update { force } => update(&admission, &cache, source, force, unix_now()?),
             Verb::Ready => ready(&cache, source).map(Outcome::Ready),
+            Verb::Status => status(&cache, source).map(|status| Outcome::Status(Box::new(status))),
+            Verb::Remove => remove(&cache),
+            Verb::DeleteData => delete_data(home, &cache, source),
+            Verb::Revalidate => {
+                revalidate(&admission, &cache, source, unix_now()?).map(Outcome::Ready)
+            }
         }
     })();
     match result {
         // td-jail's answer: one line, a generation or `absent`.
         Ok(Outcome::Ready(Some(generation))) => println!("{generation}"),
         Ok(Outcome::Ready(None)) => println!("absent"),
+        // The status record, which the root operation relays.
+        Ok(Outcome::Status(status)) => print!("{}", status.render()),
+        Ok(Outcome::Removed) => println!("td-app: {name} is removed"),
+        Ok(Outcome::Deleted(true)) => println!("td-app: {name}'s data is deleted"),
+        Ok(Outcome::Deleted(false)) => println!("td-app: {name} has no data to delete"),
         Ok(Outcome::Throttled) => println!("td-app: {name} was checked within a day"),
         Ok(Outcome::Unchanged) => println!("td-app: {name} is current"),
         Ok(Outcome::Selected(generation)) => {
@@ -2136,5 +2751,349 @@ mod tests {
             .names(DEPLOY)
             .iter()
             .any(|name| name.starts_with(REMOVING)));
+    }
+
+    impl Fixture {
+        fn admission(&self) -> Admission<'_> {
+            Admission {
+                repository: &self.url,
+                feed: self.feed.as_deref(),
+                verify: verify_fixture,
+                validate: validate_fixture,
+            }
+        }
+
+        fn status(&self, source: FlathubSource) -> CacheStatus {
+            let status = status(&self.cache(), source).unwrap();
+            assert_eq!(status.name, "firefox");
+            // What root relays is the canonical rendering.
+            assert_eq!(Status::parse(&status.render()).unwrap(), status);
+            status.cache.unwrap()
+        }
+
+        fn state(&self) -> PathBuf {
+            self.home.join(STATE_ROOT).join("firefox")
+        }
+
+        fn hold(&self, generation: u64) -> File {
+            let launch = File::open(
+                self.cache()
+                    .join(GENERATIONS)
+                    .join(generation.to_string())
+                    .join(SELECTION),
+            )
+            .unwrap();
+            launch.lock_shared().unwrap();
+            launch
+        }
+    }
+
+    #[test]
+    fn status_reads_the_cache_without_writing_or_locking_it() {
+        let fixture = Fixture::new("status");
+        let empty = fixture.status(source());
+        assert_eq!(
+            empty,
+            CacheStatus {
+                current: None,
+                previous: None,
+                checked: None,
+                refused: None,
+                progress: None,
+            }
+        );
+        assert!(!fixture.cache().exists());
+
+        let runtime = publish_commit(&fixture.repository, RUNTIME, b"usr!", 10, None, b"signed");
+        let app = app_commit(&fixture, b"app", 20);
+        fixture.update(source(), true, NOW).unwrap();
+        let installed = fixture.status(source());
+        let current = installed.current.unwrap();
+        assert_eq!(current.generation, 1);
+        assert!(current.serves);
+        assert_eq!(current.application.row.commit, app);
+        assert_eq!(current.application.bytes, Some(3));
+        assert_eq!(current.runtime.row.commit, runtime);
+        assert_eq!(current.runtime.bytes, Some(4));
+        assert_eq!(installed.previous, None);
+        assert_eq!(installed.checked, Some(NOW));
+        assert_eq!(installed.refused, None);
+        assert_eq!(installed.progress, None);
+
+        // A check that does not complete is the last refusal until one does.
+        app_commit(&fixture, b"older", 19);
+        assert!(fixture.update(source(), true, NOW + 5).is_err());
+        let refused = fixture.status(source()).refused.unwrap();
+        assert_eq!(refused.time, NOW + 5);
+        assert!(refused.reason.contains("does not supersede"), "{refused:?}");
+        app_commit(&fixture, b"app", 20);
+        fixture.update(source(), true, NOW + 6).unwrap();
+        assert_eq!(fixture.status(source()).refused, None);
+
+        // A changed declaration reads as installed but stale, and a missing
+        // deploy has no size.
+        let moved = FlathubSource {
+            entry: "/app/bin/firefox-bin",
+            ..source()
+        };
+        assert!(!fixture.status(moved).current.unwrap().serves);
+        remove_tree(&fixture.cache().join(DEPLOY).join(&runtime)).unwrap();
+        let damaged = fixture.status(source()).current.unwrap();
+        assert!(!damaged.serves);
+        assert_eq!(damaged.runtime.bytes, None);
+        assert_eq!(damaged.application.bytes, Some(3));
+    }
+
+    /// Progress is what the lock's holder last recorded, and only while it
+    /// holds the lock: a record a killed check left is no progress.
+    #[test]
+    fn progress_is_read_only_while_a_writer_holds_the_lock() {
+        let fixture = Fixture::new("progress");
+        prepare_cache(&fixture.cache()).unwrap();
+        let writer = lock(&fixture.cache()).unwrap();
+        assert_eq!(
+            fixture.status(source()).progress,
+            Some(Progress::idle(Stage::Busy))
+        );
+        let work = fresh_work(&fixture.cache()).unwrap();
+        let tracker = Tracker::new(&work, Stage::Resolve);
+        tracker.set(Stage::Fetch, Some(Part::Runtime));
+        tracker.graph.known.store(7, Ordering::Release);
+        tracker.graph.objects.store(3, Ordering::Release);
+        tracker.graph.bytes.store(1024, Ordering::Release);
+        tracker.write();
+        let progress = fixture.status(source()).progress.unwrap();
+        let (objects_bound, bytes_bound) = crate::ostree::Progress::bounds();
+        assert_eq!(
+            progress,
+            Progress {
+                stage: Stage::Fetch,
+                part: Some(Part::Runtime),
+                objects: 3,
+                objects_known: 7,
+                objects_bound,
+                bytes: 1024,
+                bytes_bound,
+            }
+        );
+        // The ticker refreshes the record while the body runs; only the
+        // ticker writes the new count, however long it takes to.
+        let refreshed = tracker.run(|| {
+            tracker.graph.objects.store(6, Ordering::Release);
+            let started = Instant::now();
+            while started.elapsed() < Duration::from_secs(60) {
+                let seen = fixture.status(source()).progress.map(|seen| seen.objects);
+                if seen == Some(6) {
+                    return seen;
+                }
+                std::thread::sleep(PROGRESS_TICK);
+            }
+            None
+        });
+        assert_eq!(refreshed, Some(6));
+        // A body that panics still ends the ticker, so `run` returns.
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tracker.run(|| panic!("body"));
+        }));
+        assert!(panicked.is_err());
+        fs::write(work.join(PROGRESS), "garbage\n").unwrap();
+        assert_eq!(
+            fixture.status(source()).progress,
+            Some(Progress::idle(Stage::Busy))
+        );
+        drop(writer);
+        assert!(work.join(PROGRESS).exists());
+        assert_eq!(fixture.status(source()).progress, None);
+        // The next writer does not inherit the dead one's record.
+        let writer = lock(&fixture.cache()).unwrap();
+        assert!(!work.join(PROGRESS).exists());
+        assert_eq!(
+            fixture.status(source()).progress,
+            Some(Progress::idle(Stage::Busy))
+        );
+        drop(writer);
+    }
+
+    #[test]
+    fn remove_clears_the_pointers_keeps_the_floor_and_spares_a_held_generation() {
+        let fixture = Fixture::new("remove");
+        assert_eq!(remove(&fixture.cache()), Ok(Outcome::Removed));
+        assert!(!fixture.cache().exists());
+        publish_commit(&fixture.repository, RUNTIME, b"usr", 10, None, b"signed");
+        let first = app_commit(&fixture, b"one", 20);
+        fixture.update(source(), true, NOW).unwrap();
+        let second = app_commit(&fixture, b"two", 30);
+        fixture.update(source(), true, NOW).unwrap();
+        fs::create_dir_all(fixture.state()).unwrap();
+        let launch = fixture.hold(2);
+
+        assert_eq!(remove(&fixture.cache()), Ok(Outcome::Removed));
+        assert_eq!(fixture.ready(source()), Ok(None));
+        let removed = fixture.status(source());
+        assert_eq!((removed.current, removed.previous), (None, None));
+        // The running launch keeps its generation and trees; generation 1
+        // and its own commit go.
+        assert_eq!(fixture.names(GENERATIONS), vec!["2"]);
+        assert!(deployed(&fixture.cache(), &second));
+        assert!(!deployed(&fixture.cache(), &first));
+        assert!(fixture.cache().join(ADMITTED).exists());
+        assert!(fixture.state().exists());
+        drop(launch);
+        remove(&fixture.cache()).unwrap();
+        assert!(fixture.names(GENERATIONS).is_empty());
+        assert!(fixture.names(DEPLOY).is_empty());
+        assert!(fixture.names(OBJECTS).is_empty());
+
+        // A reinstall admits nothing older than what was admitted.
+        app_commit(&fixture, b"one", 20);
+        let error = fixture.update(source(), true, NOW).unwrap_err();
+        assert!(error.contains("does not supersede"), "{error}");
+        // Numbering starts again in an empty generations directory.
+        app_commit(&fixture, b"three", 40);
+        assert_eq!(
+            fixture.update(source(), true, NOW),
+            Ok(Outcome::Selected(1))
+        );
+    }
+
+    #[test]
+    fn delete_data_waits_for_remove_and_for_every_instance() {
+        let fixture = Fixture::new("delete-data");
+        assert_eq!(
+            delete_data(&fixture.home, &fixture.cache(), source()),
+            Ok(Outcome::Deleted(false))
+        );
+        assert!(!fixture.cache().exists());
+        publish_commit(&fixture.repository, RUNTIME, b"usr", 10, None, b"signed");
+        app_commit(&fixture, b"app", 20);
+        fixture.update(source(), true, NOW).unwrap();
+        let profile = fixture.state().join("data/profile");
+        fs::create_dir_all(&profile).unwrap();
+        fs::write(profile.join("prefs.js"), b"x").unwrap();
+        fs::set_permissions(&profile, fs::Permissions::from_mode(0o500)).unwrap();
+
+        let error = delete_data(&fixture.home, &fixture.cache(), source()).unwrap_err();
+        assert!(error.contains("remove it before"), "{error}");
+        let launch = fixture.hold(1);
+        remove(&fixture.cache()).unwrap();
+        let error = delete_data(&fixture.home, &fixture.cache(), source()).unwrap_err();
+        assert!(error.contains("is running"), "{error}");
+        assert!(profile.join("prefs.js").exists());
+        drop(launch);
+        assert_eq!(
+            delete_data(&fixture.home, &fixture.cache(), source()),
+            Ok(Outcome::Deleted(true))
+        );
+        assert!(!fixture.state().exists());
+        assert!(fixture.names(GENERATIONS).is_empty());
+        let applications = fixture.home.join(STATE_ROOT);
+        assert_eq!(fs::read_dir(&applications).unwrap().count(), 0);
+
+        // An interrupted deletion is finished by the next one.
+        let doomed = applications.join(format!("{REMOVING}firefox"));
+        fs::create_dir_all(doomed.join("half")).unwrap();
+        assert_eq!(
+            delete_data(&fixture.home, &fixture.cache(), source()),
+            Ok(Outcome::Deleted(false))
+        );
+        assert!(!doomed.exists());
+
+        // State reached through a link is nothing td-jail made.
+        let elsewhere = fixture.home.join("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, fixture.state()).unwrap();
+        assert!(delete_data(&fixture.home, &fixture.cache(), source()).is_err());
+        assert!(elsewhere.exists());
+    }
+
+    #[test]
+    fn revalidation_reruns_rule_five_offline_over_current_deploys() {
+        let fixture = Fixture::new("revalidate");
+        let admission = fixture.admission();
+        assert_eq!(
+            revalidate(&admission, &fixture.cache(), source(), NOW),
+            Ok(None)
+        );
+        let runtime = publish_commit(&fixture.repository, RUNTIME, b"usr", 10, None, b"signed");
+        let old = app_commit(&fixture, b"old", 15);
+        fixture.update(source(), true, NOW).unwrap();
+        let app = app_commit(&fixture, b"app", 20);
+        fixture.update(source(), true, NOW).unwrap();
+        assert_eq!(
+            revalidate(&admission, &fixture.cache(), source(), NOW),
+            Ok(Some(2))
+        );
+        let (_, stale) = fixture.current().unwrap();
+        // Nothing upstream answers from here on.
+        fixture.repository.lock().unwrap().clear();
+        let moved = FlathubSource {
+            entry: "/app/bin/firefox-bin",
+            ..source()
+        };
+        assert_eq!(fixture.ready(moved), Ok(None));
+
+        REFUSE.with(|refuse| *refuse.borrow_mut() = true);
+        assert_eq!(
+            revalidate(&admission, &fixture.cache(), moved, NOW + 1),
+            Ok(None)
+        );
+        REFUSE.with(|refuse| *refuse.borrow_mut() = false);
+        let refused = fixture.status(moved).refused.unwrap();
+        assert!(refused
+            .reason
+            .starts_with("offline revalidation: fixture validator"));
+
+        VALIDATED.with(|seen| seen.borrow_mut().clear());
+        assert_eq!(
+            revalidate(&admission, &fixture.cache(), moved, NOW + 2),
+            Ok(Some(3))
+        );
+        let deploy = fixture.cache().join(DEPLOY);
+        VALIDATED.with(|seen| {
+            assert_eq!(
+                *seen.borrow(),
+                vec![(deploy.join(&app), deploy.join(&runtime))]
+            );
+        });
+        assert_eq!(fixture.ready(moved), Ok(Some(3)));
+        let (_, current) = fixture.current().unwrap();
+        assert_eq!(current.application, stale.application);
+        assert_eq!(current.runtime, stale.runtime);
+        assert_ne!(current.checks, stale.checks);
+        // The stale copy is collected and the real rollback kept.
+        let (number, previous) = read_pointer(&fixture.cache(), PREVIOUS).unwrap().unwrap();
+        assert_eq!((number, previous.application.commit), (1, old));
+        assert_eq!(fixture.names(GENERATIONS), ["1", "3"]);
+        assert_eq!(fixture.status(moved).refused, None);
+        // `checked` says when upstream was last asked, which this did not.
+        assert_eq!(fixture.status(moved).checked, Some(NOW));
+
+        // A missing deploy or other refs need a fetch.
+        remove_tree(&deploy.join(&runtime)).unwrap();
+        let back = source();
+        assert_eq!(
+            revalidate(&admission, &fixture.cache(), back, NOW + 3),
+            Ok(None)
+        );
+        assert!(fixture
+            .status(back)
+            .refused
+            .unwrap()
+            .reason
+            .contains("missing"));
+        let other = FlathubSource {
+            runtime: "runtime/org.example.Platform/x86_64/2",
+            ..source()
+        };
+        assert_eq!(
+            revalidate(&admission, &fixture.cache(), other, NOW + 4),
+            Ok(None)
+        );
+        assert!(fixture
+            .status(other)
+            .refused
+            .unwrap()
+            .reason
+            .contains("other refs"));
     }
 }

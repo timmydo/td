@@ -126,6 +126,48 @@ struct FetchPolicy<'a> {
     mode: FetchMode,
     limits: GraphLimits,
     deadline: Option<Instant>,
+    progress: Option<&'a Progress>,
+}
+
+/// One graph acquisition's progress, for a reader on another thread: the
+/// objects fetched out of those known so far, and the bytes transferred,
+/// which is the graph's own transfer account.
+#[derive(Default)]
+pub(crate) struct Progress {
+    pub(crate) objects: AtomicU64,
+    pub(crate) known: AtomicU64,
+    pub(crate) bytes: AtomicU64,
+}
+
+impl Progress {
+    /// Every graph starts from nothing: the byte count is its budget.
+    pub(crate) fn reset(&self) {
+        for counter in [&self.objects, &self.known, &self.bytes] {
+            counter.store(0, Ordering::Release);
+        }
+    }
+
+    /// The object and transfer bounds every acquired graph is held to.
+    pub(crate) fn bounds() -> (u64, u64) {
+        (
+            u64::try_from(GRAPH_LIMITS.objects).unwrap_or(u64::MAX),
+            GRAPH_LIMITS.transfer_bytes,
+        )
+    }
+
+    fn fetched(progress: Option<&Progress>) {
+        if let Some(progress) = progress {
+            progress.objects.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    fn known(progress: Option<&Progress>, count: usize) {
+        if let Some(progress) = progress {
+            progress
+                .known
+                .fetch_add(u64::try_from(count).unwrap_or(u64::MAX), Ordering::AcqRel);
+        }
+    }
 }
 
 struct WorkDirectory {
@@ -532,7 +574,10 @@ fn fetch_objects(
                 };
                 match fetch_object(spec, root, key, transfer_budget, policy) {
                     Ok(record) => match results.lock() {
-                        Ok(mut records) => records.push(record),
+                        Ok(mut records) => {
+                            records.push(record);
+                            Progress::fetched(policy.progress);
+                        }
                         Err(_) => {
                             stop.store(true, Ordering::Release);
                             record_worker_error(
@@ -603,7 +648,10 @@ fn fetch_file_objects(
                 };
                 match prepare_object(spec, root, key, transfer_budget, policy) {
                     Ok(transfer_bytes) => match prepared.lock() {
-                        Ok(mut records) => records.push((key, transfer_bytes)),
+                        Ok(mut records) => {
+                            records.push((key, transfer_bytes));
+                            Progress::fetched(policy.progress);
+                        }
                         Err(_) => {
                             stop.store(true, Ordering::Release);
                             record_worker_error(
@@ -690,6 +738,7 @@ fn add_new_objects(
         .ok_or_else(|| "OSTree graph object count overflow".to_string())?;
     admit_object_count(total, policy.limits)?;
     let keys: Vec<ObjectKey> = wanted.into_iter().collect();
+    Progress::known(policy.progress, keys.len());
     if keys.iter().any(|key| key.kind == ObjectKind::File) {
         return Err("OSTree metadata object set contains a file object".into());
     }
@@ -722,6 +771,7 @@ fn add_file_objects(
         .checked_add(keys.len())
         .ok_or_else(|| "OSTree graph object count overflow".to_string())?;
     admit_object_count(total, policy.limits)?;
+    Progress::known(policy.progress, keys.len());
     let fetched = fetch_file_objects(
         spec,
         root,
@@ -941,7 +991,7 @@ fn build_graph_with_limits(
     mode: FetchMode,
     limits: GraphLimits,
 ) -> Result<(GraphStats, String), String> {
-    build_graph_from(spec, root, mode, limits, None)
+    build_graph_from(spec, root, mode, limits, None, None)
 }
 
 fn build_graph_from(
@@ -950,6 +1000,7 @@ fn build_graph_from(
     mode: FetchMode,
     limits: GraphLimits,
     feed: Option<&str>,
+    progress: Option<&Progress>,
 ) -> Result<(GraphStats, String), String> {
     let deadline = match mode {
         FetchMode::FetchMissing => Some(
@@ -964,15 +1015,23 @@ fn build_graph_from(
         mode,
         limits,
         deadline,
+        progress,
     };
-    let transfer_budget = AtomicU64::new(0);
+    let own_budget = AtomicU64::new(0);
+    let transfer_budget = match progress {
+        Some(progress) => {
+            progress.reset();
+            &progress.bytes
+        }
+        None => &own_budget,
+    };
     let mut objects = BTreeMap::new();
     add_new_objects(
         spec,
         root,
         [ObjectKey::new(ObjectKind::Commit, spec.commit)],
         &mut objects,
-        &transfer_budget,
+        transfer_budget,
         policy,
     )?;
     let commit = parse_cached_commit(root, spec.commit)?;
@@ -988,7 +1047,7 @@ fn build_graph_from(
             ObjectKey::new(ObjectKind::Dirmeta, commit.root_meta),
         ],
         &mut objects,
-        &transfer_budget,
+        transfer_budget,
         policy,
     )?;
     let root_tree = parse_cached_dirtree(root, commit.root_tree)?;
@@ -1008,7 +1067,7 @@ fn build_graph_from(
                 ObjectKey::new(ObjectKind::Dirmeta, task.meta),
             ]
         });
-        add_new_objects(spec, root, wanted, &mut objects, &transfer_budget, policy)?;
+        add_new_objects(spec, root, wanted, &mut objects, transfer_budget, policy)?;
         for task in &frontier {
             if let std::collections::btree_map::Entry::Vacant(entry) = parsed_trees.entry(task.tree)
             {
@@ -1038,7 +1097,7 @@ fn build_graph_from(
         root,
         &file_references,
         &mut objects,
-        &transfer_budget,
+        transfer_budget,
         &mut decoded_bytes,
         policy,
     )?;
@@ -1839,8 +1898,9 @@ pub(crate) fn export_feed(
 pub(crate) fn acquire(
     spec: &AcquireSpec,
     destination: &Path,
+    progress: Option<&Progress>,
 ) -> Result<(GraphStats, bool), String> {
-    acquire_from(spec, destination, None, |_| Ok(()))
+    acquire_from(spec, destination, None, |_| Ok(()), progress)
 }
 
 /// The endpoint selects transport only; graph ownership retains its upstream pin.
@@ -1849,9 +1909,10 @@ pub(crate) fn acquire_from_feed(
     destination: &Path,
     base: &str,
     validate: impl Fn(GraphStats) -> Result<(), String>,
+    progress: Option<&Progress>,
 ) -> Result<(GraphStats, bool), String> {
     let base = crate::feed::consumer_feed_base(base)?;
-    acquire_from(spec, destination, Some(base), validate)
+    acquire_from(spec, destination, Some(base), validate, progress)
 }
 
 fn acquire_from(
@@ -1859,6 +1920,7 @@ fn acquire_from(
     destination: &Path,
     feed: Option<&str>,
     validate: impl Fn(GraphStats) -> Result<(), String>,
+    progress: Option<&Progress>,
 ) -> Result<(GraphStats, bool), String> {
     let _lock = if feed.is_some() {
         cache_lock(destination)?
@@ -1891,6 +1953,7 @@ fn acquire_from(
         FetchMode::FetchMissing,
         GRAPH_LIMITS,
         feed,
+        progress,
     )?;
     validate(stats)?;
     sync_object_directories(work.path()?)?;
@@ -1973,7 +2036,7 @@ pub(crate) mod tests {
         }
 
         fn consume(&self, guest: &str, base: &str) -> Result<(GraphStats, bool), String> {
-            acquire_from_feed(&self.spec, &self.root.join(guest), base, |_| Ok(()))
+            acquire_from_feed(&self.spec, &self.root.join(guest), base, |_| Ok(()), None)
         }
     }
 
@@ -2009,7 +2072,7 @@ pub(crate) mod tests {
         let spec = fixture.spec.clone();
         let (sender, receiver) = std::sync::mpsc::channel();
         let waiter = std::thread::spawn(move || {
-            let result = acquire(&spec, &destination);
+            let result = acquire(&spec, &destination, None);
             sender.send(result).unwrap();
         });
         assert!(receiver.recv_timeout(Duration::from_millis(20)).is_err());
@@ -2125,11 +2188,15 @@ pub(crate) mod tests {
         fixture.export();
         let feed = ConsumerServer::start(fixture.root.join("store"), None);
         let destination = fixture.root.join("guest");
-        assert!(acquire_from_feed(&fixture.spec, &destination, &feed.base, rejected).is_err());
+        assert!(
+            acquire_from_feed(&fixture.spec, &destination, &feed.base, rejected, None).is_err()
+        );
         assert!(!destination.join(MANIFEST_NAME).exists());
         fixture.consume("guest", &feed.base).unwrap();
         let requests = feed.count();
-        assert!(acquire_from_feed(&fixture.spec, &destination, &feed.base, rejected).is_err());
+        assert!(
+            acquire_from_feed(&fixture.spec, &destination, &feed.base, rejected, None).is_err()
+        );
         assert_eq!(feed.count(), requests);
         let key = ObjectKey::new(ObjectKind::Commit, fixture.spec.commit);
         let source = object_path(&fixture.root.join("host"), key).unwrap();
@@ -2557,7 +2624,7 @@ pub(crate) mod tests {
         fixture.export();
         let feed = ConsumerServer::start(fixture.root.join("store"), None);
         assert!(fixture.consume("guest", &feed.base).unwrap().1);
-        let (_, fetched) = acquire(&fixture.spec, &fixture.root.join("guest")).unwrap();
+        let (_, fetched) = acquire(&fixture.spec, &fixture.root.join("guest"), None).unwrap();
         assert!(!fetched);
         assert_eq!(fixture.upstream.count(), 0);
     }
@@ -2732,15 +2799,21 @@ pub(crate) mod tests {
         let destination =
             std::env::temp_dir().join(format!("td-ostree-acquire-{}-{nonce}", std::process::id()));
 
-        let (stats, fetched) = acquire(&spec, &destination).unwrap();
+        // A reader on another thread sees every object and byte counted.
+        let progress = Progress::default();
+        let (stats, fetched) = acquire(&spec, &destination, Some(&progress)).unwrap();
         assert!(fetched);
+        assert_eq!(progress.objects.load(Ordering::Acquire), 5);
+        assert_eq!(progress.known.load(Ordering::Acquire), 5);
+        assert_eq!(progress.bytes.load(Ordering::Acquire), stats.transfer_bytes);
+        assert!(stats.transfer_bytes > 0);
         assert_eq!(stats.objects, 5);
         assert_eq!(stats.paths, 1);
         assert_eq!(stats.directories, 0);
         assert_eq!(stats.regular_files, 1);
         assert_eq!(stats.symlinks, 0);
         assert_eq!(stats.decoded_bytes, 5);
-        let (again, fetched) = acquire(&spec, &destination).unwrap();
+        let (again, fetched) = acquire(&spec, &destination, None).unwrap();
         assert!(
             !fetched,
             "a complete graph must not contact the dead server"
@@ -2760,7 +2833,7 @@ pub(crate) mod tests {
         *first ^= 0xff;
         fs::write(&file_path, corrupted).unwrap();
 
-        let (repaired, fetched) = acquire(&spec, &destination).unwrap();
+        let (repaired, fetched) = acquire(&spec, &destination, None).unwrap();
         assert!(
             fetched,
             "same-size cache corruption must force a fresh graph"
@@ -2768,7 +2841,7 @@ pub(crate) mod tests {
         assert_eq!(repaired, stats);
 
         fs::remove_file(&file_path).unwrap();
-        let (restored, fetched) = acquire(&spec, &destination).unwrap();
+        let (restored, fetched) = acquire(&spec, &destination, None).unwrap();
         assert!(fetched, "a missing cache object must force a fresh graph");
         assert_eq!(restored, stats);
 
@@ -2777,13 +2850,13 @@ pub(crate) mod tests {
         malformed_manifest.push_str("unknown=field\n");
         fs::set_permissions(&manifest_path, fs::Permissions::from_mode(0o600)).unwrap();
         fs::write(&manifest_path, malformed_manifest).unwrap();
-        let (remade, fetched) = acquire(&spec, &destination).unwrap();
+        let (remade, fetched) = acquire(&spec, &destination, None).unwrap();
         assert!(fetched, "a malformed manifest must force a fresh graph");
         assert_eq!(remade, stats);
         server.join().unwrap();
 
         fs::set_permissions(&file_path, fs::Permissions::from_mode(0o444)).unwrap();
-        let (final_hit, fetched) = acquire(&spec, &destination).unwrap();
+        let (final_hit, fetched) = acquire(&spec, &destination, None).unwrap();
         assert!(!fetched, "the repaired graph must be an offline cache hit");
         assert_eq!(final_hit, stats);
         assert_eq!(
@@ -2810,7 +2883,7 @@ pub(crate) mod tests {
         let sentinel = destination.join("keep");
         fs::write(&sentinel, b"mine").unwrap();
 
-        let error = acquire(&spec, &destination).unwrap_err();
+        let error = acquire(&spec, &destination, None).unwrap_err();
 
         assert!(error.contains("unowned destination"));
         assert_eq!(fs::read(&sentinel).unwrap(), b"mine");
@@ -2835,7 +2908,7 @@ pub(crate) mod tests {
         fs::create_dir(&destination).unwrap();
         write_owner_marker(&owner, &destination).unwrap();
 
-        let error = acquire(&other, &destination).unwrap_err();
+        let error = acquire(&other, &destination, None).unwrap_err();
 
         assert!(error.contains("owned by another OSTree graph"), "{error}");
         require_owned_destination(&owner, &destination).unwrap();
@@ -2914,6 +2987,7 @@ pub(crate) mod tests {
                 mode: FetchMode::CacheOnly,
                 limits: GRAPH_LIMITS,
                 deadline: None,
+                progress: None,
             },
         )
         .unwrap_err();

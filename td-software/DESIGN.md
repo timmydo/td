@@ -147,6 +147,14 @@ write a bounded progress record under the cache's `.work/`, and `status`
 would read it. td-software polls status while an install runs, and
 treats whatever comes back as untrusted, bounded data.
 
+*As built (increment 1):* `status` never waits for or holds the lock; it
+reports progress only while a shared try-lock, released at once, finds a
+writer holding it, so a record a killed check left never reads as
+running. "Out of their bounds" is the graph's objects done out of those
+known so far and of the object bound, and its bytes out of the transfer
+bound: OSTree names no total before the trees are read. The record's
+exact shape is §W.9's.
+
 ## 4. Behaviour
 
 ### 4.1 Launch without a fetch
@@ -191,7 +199,10 @@ whose update fetches as before.
   deletes that jail state, run as the application's account. It cannot
   be undone; td-software confirms it with td-ui's dialog and it takes no
   secure path (§3). It refuses while an instance of the application
-  runs.
+  runs. *As built:* td-app knows that from §W.9's lease: every launch
+  holds its generation's selection, so once `remove` has run and a
+  collection under the cache lock leaves a generation, an instance runs.
+  It also refuses while `current` or `previous` exists.
 
 ## 5. A launcher that follows installs
 

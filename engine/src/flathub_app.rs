@@ -84,7 +84,11 @@ pub const CURRENT: &str = "current";
 pub const PREVIOUS: &str = "previous";
 pub const ADMITTED: &str = "admitted";
 pub const CHECKED: &str = "checked";
+/// The last check or revalidation that did not complete, until one does.
+pub const REFUSED: &str = "refused";
 pub const WORK: &str = ".work";
+/// Below [`WORK`]: what the writer holding the lock is doing.
+pub const PROGRESS: &str = "progress";
 /// Every name td-app keeps in the cache root; anything else is debris.
 pub const CACHE_ENTRIES: &[&str] = &[
     LOCK,
@@ -95,6 +99,7 @@ pub const CACHE_ENTRIES: &[&str] = &[
     PREVIOUS,
     ADMITTED,
     CHECKED,
+    REFUSED,
     WORK,
 ];
 /// A deploy's tree, below `deploy/<commit>/`.
@@ -388,6 +393,387 @@ pub fn require_runtime(metadata: &str, runtime_ref: &str) -> Result<(), String> 
     Ok(())
 }
 
+/// `td-app status`'s answer and the root operation's relay of it
+/// (td-software/DESIGN.md §3): one bounded, canonical record.
+pub const MAX_STATUS_BYTES: usize = 4096;
+/// The longest refusal reason a status carries; td-app cuts a longer one.
+pub const MAX_REASON_BYTES: usize = 512;
+const STATUS_FORMAT: &str = "format=1";
+
+/// What a status answers for one registry application.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Status {
+    pub name: String,
+    /// `None` for an application the image ships, whose bytes are the
+    /// deployment's and which has no cache.
+    pub cache: Option<CacheStatus>,
+}
+
+/// A Flathub application's cache, as td-app read it without its lock.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CacheStatus {
+    pub current: Option<GenerationStatus>,
+    pub previous: Option<GenerationStatus>,
+    /// The last completed check.
+    pub checked: Option<u64>,
+    /// The last check or revalidation that did not complete, since the
+    /// last one that did.
+    pub refused: Option<Refusal>,
+    /// What the writer holding the cache's lock is doing, if one is.
+    pub progress: Option<Progress>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GenerationStatus {
+    pub generation: u64,
+    /// Whether it still serves the declaration (`td-app ready`'s test).
+    pub serves: bool,
+    pub application: DeployStatus,
+    pub runtime: DeployStatus,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeployStatus {
+    pub row: Admitted,
+    /// The regular-file bytes of its deploy, or `None` when the deploy is
+    /// incomplete or could not be measured.
+    pub bytes: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Refusal {
+    pub time: u64,
+    /// Printable ASCII without tabs, at most [`MAX_REASON_BYTES`].
+    pub reason: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Stage {
+    /// A writer holds the lock and has published no record yet.
+    Busy,
+    Resolve,
+    Fetch,
+    Materialize,
+    Validate,
+    Publish,
+    Collect,
+    Revalidate,
+    Remove,
+    DeleteData,
+}
+
+const STAGES: &[(Stage, &str)] = &[
+    (Stage::Busy, "busy"),
+    (Stage::Resolve, "resolve"),
+    (Stage::Fetch, "fetch"),
+    (Stage::Materialize, "materialize"),
+    (Stage::Validate, "validate"),
+    (Stage::Publish, "publish"),
+    (Stage::Collect, "collect"),
+    (Stage::Revalidate, "revalidate"),
+    (Stage::Remove, "remove"),
+    (Stage::DeleteData, "delete-data"),
+];
+
+impl Stage {
+    pub fn word(self) -> &'static str {
+        STAGES
+            .iter()
+            .find(|(stage, _)| *stage == self)
+            .map_or("busy", |(_, word)| word)
+    }
+
+    fn parse(word: &str) -> Option<Stage> {
+        STAGES
+            .iter()
+            .find(|(_, known)| *known == word)
+            .map(|(stage, _)| *stage)
+    }
+}
+
+/// Which of the declaration's refs a stage works on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Part {
+    Application,
+    Runtime,
+}
+
+/// A running writer's progress: the stage, and the graph it is fetching,
+/// objects and bytes done out of what is known and of their bounds.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Progress {
+    pub stage: Stage,
+    pub part: Option<Part>,
+    pub objects: u64,
+    /// The objects known so far; it grows as the graph's trees are read.
+    pub objects_known: u64,
+    pub objects_bound: u64,
+    pub bytes: u64,
+    pub bytes_bound: u64,
+}
+
+impl Progress {
+    pub fn idle(stage: Stage) -> Progress {
+        Progress {
+            stage,
+            part: None,
+            objects: 0,
+            objects_known: 0,
+            objects_bound: 0,
+            bytes: 0,
+            bytes_bound: 0,
+        }
+    }
+
+    /// The record's one line, without its key: what `.work/progress` holds.
+    pub fn render(&self) -> String {
+        let part = match self.part {
+            None => "-",
+            Some(Part::Application) => "app",
+            Some(Part::Runtime) => "runtime",
+        };
+        format!(
+            "{}\t{part}\t{}\t{}\t{}\t{}\t{}",
+            self.stage.word(),
+            self.objects,
+            self.objects_known,
+            self.objects_bound,
+            self.bytes,
+            self.bytes_bound
+        )
+    }
+
+    pub fn parse(line: &str) -> Result<Progress, String> {
+        let fields: Vec<&str> = line.split('\t').collect();
+        let [stage, part, objects, known, objects_bound, bytes, bytes_bound] = fields.as_slice()
+        else {
+            return Err(format!("progress {line:?} has the wrong fields"));
+        };
+        let stage = Stage::parse(stage).ok_or_else(|| format!("progress stage {stage:?}"))?;
+        let part = match *part {
+            "-" => None,
+            "app" => Some(Part::Application),
+            "runtime" => Some(Part::Runtime),
+            other => return Err(format!("progress part {other:?}")),
+        };
+        let progress = Progress {
+            stage,
+            part,
+            objects: decimal(objects)?,
+            objects_known: decimal(known)?,
+            objects_bound: decimal(objects_bound)?,
+            bytes: decimal(bytes)?,
+            bytes_bound: decimal(bytes_bound)?,
+        };
+        if progress.objects > progress.objects_known
+            || progress.objects_known > progress.objects_bound
+            || progress.bytes > progress.bytes_bound
+        {
+            return Err(format!("progress {line:?} exceeds its bounds"));
+        }
+        Ok(progress)
+    }
+}
+
+/// Canonical unsigned decimal: no sign, no leading zero.
+fn decimal(text: &str) -> Result<u64, String> {
+    if text.is_empty()
+        || (text.len() > 1 && text.starts_with('0'))
+        || !text.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(format!("{text:?} is not a canonical decimal"));
+    }
+    text.parse()
+        .map_err(|_| format!("{text:?} is out of range"))
+}
+
+/// A refusal reason as a status carries it: printable ASCII, tabs and
+/// everything else replaced, cut at [`MAX_REASON_BYTES`].
+pub fn reason_text(message: &str) -> String {
+    message
+        .chars()
+        .map(|c| if (' '..='~').contains(&c) { c } else { '?' })
+        .take(MAX_REASON_BYTES)
+        .collect()
+}
+
+fn valid_reason(reason: &str) -> bool {
+    !reason.is_empty()
+        && reason.len() <= MAX_REASON_BYTES
+        && reason.bytes().all(|byte| (b' '..=b'~').contains(&byte))
+}
+
+impl Refusal {
+    /// `refused`'s content in the cache: `TIME<TAB>REASON` and a newline.
+    pub fn render(&self) -> String {
+        format!("{}\t{}", self.time, self.reason)
+    }
+
+    pub fn parse(line: &str) -> Result<Refusal, String> {
+        let (time, reason) = line
+            .split_once('\t')
+            .ok_or_else(|| "refusal has no reason".to_string())?;
+        if !valid_reason(reason) {
+            return Err("refusal reason is not bounded printable text".into());
+        }
+        Ok(Refusal {
+            time: decimal(time)?,
+            reason: reason.to_string(),
+        })
+    }
+}
+
+fn render_generation(text: &mut String, key: &str, generation: Option<&GenerationStatus>) {
+    let Some(generation) = generation else {
+        text.push_str(&format!("{key}=none\n"));
+        return;
+    };
+    let serves = if generation.serves { "serves" } else { "stale" };
+    text.push_str(&format!("{key}={}\t{serves}\n", generation.generation));
+    for (part, deploy) in [
+        ("app", &generation.application),
+        ("runtime", &generation.runtime),
+    ] {
+        let bytes = deploy
+            .bytes
+            .map_or_else(|| "-".to_string(), |bytes| bytes.to_string());
+        text.push_str(&format!(
+            "{key}.{part}={}\t{}\t{}\t{bytes}\n",
+            deploy.row.exact_ref, deploy.row.commit, deploy.row.timestamp
+        ));
+    }
+}
+
+fn parse_generation<'a>(
+    lines: &mut impl Iterator<Item = &'a str>,
+    key: &str,
+) -> Result<Option<GenerationStatus>, String> {
+    let head = status_field(lines.next(), key)?;
+    if head == "none" {
+        return Ok(None);
+    }
+    let (number, serves) = head
+        .split_once('\t')
+        .ok_or_else(|| format!("status {key} has no state"))?;
+    let generation =
+        generation_number(number).ok_or_else(|| format!("status {key} is no generation"))?;
+    let serves = match serves {
+        "serves" => true,
+        "stale" => false,
+        other => return Err(format!("status {key} state {other:?}")),
+    };
+    let mut deploy = |part: &str| -> Result<DeployStatus, String> {
+        let row = status_field(lines.next(), &format!("{key}.{part}"))?;
+        let (row, bytes) = row
+            .rsplit_once('\t')
+            .ok_or_else(|| format!("status {key}.{part} has no size"))?;
+        let row = parse_row(row)?;
+        require_kind(&row, part)?;
+        let bytes = match bytes {
+            "-" => None,
+            bytes => Some(decimal(bytes)?),
+        };
+        Ok(DeployStatus { row, bytes })
+    };
+    let application = deploy("app")?;
+    let runtime = deploy("runtime")?;
+    Ok(Some(GenerationStatus {
+        generation,
+        serves,
+        application,
+        runtime,
+    }))
+}
+
+fn status_field<'a>(line: Option<&'a str>, key: &str) -> Result<&'a str, String> {
+    line.and_then(|line| line.strip_prefix(key))
+        .and_then(|rest| rest.strip_prefix('='))
+        .ok_or_else(|| format!("status lacks its {key}= line"))
+}
+
+impl Status {
+    pub fn render(&self) -> String {
+        let mut text = format!("{STATUS_FORMAT}\nname={}\n", self.name);
+        let Some(cache) = &self.cache else {
+            text.push_str("kind=image\n");
+            return text;
+        };
+        text.push_str("kind=flathub\n");
+        render_generation(&mut text, "current", cache.current.as_ref());
+        render_generation(&mut text, "previous", cache.previous.as_ref());
+        match cache.checked {
+            Some(time) => text.push_str(&format!("checked={time}\n")),
+            None => text.push_str("checked=never\n"),
+        }
+        match &cache.refused {
+            Some(refusal) => text.push_str(&format!("refused={}\n", refusal.render())),
+            None => text.push_str("refused=none\n"),
+        }
+        match &cache.progress {
+            Some(progress) => text.push_str(&format!("progress={}\n", progress.render())),
+            None => text.push_str("progress=none\n"),
+        }
+        text
+    }
+
+    /// Only the canonical rendering parses: a relay that re-renders what it
+    /// parsed forwards exactly the bytes it checked.
+    pub fn parse(text: &str) -> Result<Status, String> {
+        if text.len() > MAX_STATUS_BYTES {
+            return Err(format!("status exceeds {MAX_STATUS_BYTES} bytes"));
+        }
+        if !text.ends_with('\n') {
+            return Err("status does not end in a newline".into());
+        }
+        let mut lines = text.split_terminator('\n');
+        if lines.next() != Some(STATUS_FORMAT) {
+            return Err("status has no format=1 header".into());
+        }
+        let name = status_field(lines.next(), "name")?;
+        if !valid_name(name) {
+            return Err(format!("status name {name:?} is malformed"));
+        }
+        let cache = match status_field(lines.next(), "kind")? {
+            "image" => None,
+            "flathub" => {
+                let current = parse_generation(&mut lines, "current")?;
+                let previous = parse_generation(&mut lines, "previous")?;
+                let checked = match status_field(lines.next(), "checked")? {
+                    "never" => None,
+                    time => Some(decimal(time)?),
+                };
+                let refused = match status_field(lines.next(), "refused")? {
+                    "none" => None,
+                    line => Some(Refusal::parse(line)?),
+                };
+                let progress = match status_field(lines.next(), "progress")? {
+                    "none" => None,
+                    line => Some(Progress::parse(line)?),
+                };
+                Some(CacheStatus {
+                    current,
+                    previous,
+                    checked,
+                    refused,
+                    progress,
+                })
+            }
+            other => return Err(format!("status kind {other:?}")),
+        };
+        if let Some(line) = lines.next() {
+            return Err(format!("status line {line:?} is out of place"));
+        }
+        let status = Status {
+            name: name.to_string(),
+            cache,
+        };
+        if status.render() != text {
+            return Err("status is not canonical".into());
+        }
+        Ok(status)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::indexing_slicing, clippy::unwrap_used)]
@@ -584,5 +970,113 @@ mod tests {
         assert_eq!(floor(&rows, "app/a/x86_64/stable").unwrap().timestamp, 30);
         assert_eq!(floor(&rows, "runtime/a/x86_64/1").unwrap().timestamp, 40);
         assert!(floor(&rows, "app/b/x86_64/stable").is_none());
+    }
+
+    fn deploy(exact_ref: &str, commit: &str, timestamp: u64, bytes: Option<u64>) -> DeployStatus {
+        DeployStatus {
+            row: admitted(exact_ref, commit, timestamp),
+            bytes,
+        }
+    }
+
+    #[test]
+    fn statuses_round_trip_and_refuse_every_other_shape() {
+        let image = Status {
+            name: "mail".into(),
+            cache: None,
+        };
+        assert_eq!(image.render(), "format=1\nname=mail\nkind=image\n");
+        assert_eq!(Status::parse(&image.render()).unwrap(), image);
+        let generation = |generation, serves| GenerationStatus {
+            generation,
+            serves,
+            application: deploy(
+                "app/org.mozilla.firefox/x86_64/stable",
+                COMMIT,
+                20,
+                Some(300),
+            ),
+            runtime: deploy(
+                "runtime/org.freedesktop.Platform/x86_64/25.08",
+                RUNTIME_COMMIT,
+                10,
+                None,
+            ),
+        };
+        let full = Status {
+            name: "firefox".into(),
+            cache: Some(CacheStatus {
+                current: Some(generation(3, true)),
+                previous: Some(generation(2, false)),
+                checked: Some(1_800_000_000),
+                refused: Some(Refusal {
+                    time: 1_800_000_100,
+                    reason: reason_text("rule 3:\tolder\ncommit é"),
+                }),
+                progress: Some(Progress {
+                    stage: Stage::Fetch,
+                    part: Some(Part::Runtime),
+                    objects: 5,
+                    objects_known: 9,
+                    objects_bound: 300_000,
+                    bytes: 4096,
+                    bytes_bound: 1 << 31,
+                }),
+            }),
+        };
+        let text = full.render();
+        assert!(
+            text.contains("\nrefused=1800000100\trule 3:?older?commit ?\n"),
+            "{text}"
+        );
+        assert!(text.contains("\ncurrent.runtime=runtime/org.freedesktop.Platform/x86_64/25.08\t"));
+        assert!(text.contains("\t10\t-\n"));
+        assert_eq!(Status::parse(&text).unwrap(), full);
+        let empty = Status {
+            name: "firefox".into(),
+            cache: Some(CacheStatus {
+                current: None,
+                previous: None,
+                checked: None,
+                refused: None,
+                progress: None,
+            }),
+        };
+        assert_eq!(
+            empty.render(),
+            "format=1\nname=firefox\nkind=flathub\ncurrent=none\nprevious=none\n\
+             checked=never\nrefused=none\nprogress=none\n"
+        );
+        assert_eq!(Status::parse(&empty.render()).unwrap(), empty);
+        for stage in STAGES {
+            let progress = Progress::idle(stage.0);
+            assert_eq!(Progress::parse(&progress.render()).unwrap(), progress);
+        }
+        for bad in [
+            text.replacen("kind=flathub", "kind=other", 1),
+            text.replacen("current=3\tserves", "current=3\tfresh", 1),
+            text.replacen("current=3", "current=03", 1),
+            text.replacen("\t300\n", "\t0300\n", 1),
+            text.replacen("\t300\n", "\t\n", 1),
+            text.replacen("checked=1800000000", "checked=soon", 1),
+            text.replacen("progress=fetch", "progress=dance", 1),
+            text.replacen("\truntime\t5\t9", "\truntime\t10\t9", 1),
+            text.replacen("\truntime\t5", "\tboth\t5", 1),
+            text.replacen("\t4096\t", "\t4096\textra\t", 1),
+            text.replacen("rule 3:", "", 1)
+                .replacen("1800000100\t", "1800000100\t\t", 1),
+            text.replacen("current.app=app/", "current.app=runtime/", 1),
+            format!("{text}extra=1\n"),
+            text.trim_end().to_string(),
+            "x".repeat(MAX_STATUS_BYTES + 1),
+            image.render().replacen("name=mail", "name=Mail", 1),
+            format!("{}progress=none\n", image.render()),
+        ] {
+            assert!(Status::parse(&bad).is_err(), "{bad:?}");
+        }
+        let long = reason_text(&"x".repeat(MAX_REASON_BYTES * 2));
+        assert_eq!(long.len(), MAX_REASON_BYTES);
+        assert!(Refusal::parse(&format!("1\t{long}x")).is_err());
+        assert!(Refusal::parse("1\t").is_err());
     }
 }

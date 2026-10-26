@@ -18,8 +18,9 @@ use crate::flathub_app::{
 /// td-net's applet, linked beside td-jail in the image.
 const TD_APP: &str = "/bin/td-app";
 const MAX_READY_BYTES: usize = 32;
-/// A generation td-app named can go before td-jail holds it only if two
-/// newer ones were published meanwhile; asking again settles it.
+/// A generation td-app named can go before td-jail holds it when two
+/// newer ones were published meanwhile, or a removal collected it; asking
+/// again settles it or answers `absent`.
 const ATTEMPTS: usize = 3;
 const O_NOFOLLOW: i32 = 0o400_000;
 const O_NONBLOCK: i32 = 0o4000;

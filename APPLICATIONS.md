@@ -11114,7 +11114,9 @@ holds for these payloads. Layout:
   previous -> generations/<m> the generation before it
   admitted                    newest admitted timestamp per ref (rule 3)
   checked                     time of the last completed check
+  refused                     the last check that did not complete, and why
   .work/                      the ref, commit and commitmeta being checked
+  .work/progress              what the writer holding `lock` is doing
 ```
 
 `selection` is `format=1`, `name=` the declaration, `checks=` a SHA-256
@@ -11167,6 +11169,66 @@ td-engine, where td-app runs the implementation the image build ran; td-net
 stays free of `unsafe`, so publication uses the account-private lock and
 an absence check and plain `rename(2)` under that lock instead of a
 no-replace rename.
+
+**What td-app answers and removes (td-software/DESIGN.md §6, increment
+1).** Four more verbs run as the account, each refusing root and a
+foreign `HOME` as `update` does:
+
+- `td-app status NAME` prints one canonical record, parsed and rendered
+  by `flathub_app::Status` (at most 4 KiB): `format=1`, `name=`,
+  `kind=flathub`, then `current=` and `previous=` (`none`, or the
+  generation and `serves` or `stale`, by `ready`'s test, each followed by
+  its `.app=` and `.runtime=` rows: ref, commit, timestamp, and the
+  deploy's regular-file bytes or `-` when it is incomplete), `checked=`
+  (`never` or the time), `refused=` (`none`, or the time and a printable
+  reason of at most 512 bytes) and `progress=`. Like `ready` it takes no
+  lock and writes nothing: `progress=` is `none` unless a shared
+  try-lock of `lock`, released at once, finds a writer holding it, and
+  then the stage, the ref it works on (`app`, `runtime` or `-`), the
+  graph's objects done, known so far and bounded, and its bytes done and
+  bounded, as the writer last wrote them to `.work/progress` (`busy` and
+  zeros before it has). A record a killed check left is never read as
+  running, and the next writer unlinks it once it holds the lock. The
+  record is written by rename and not synced, since nothing reads it
+  after a crash. A check refreshes it twice a second while it runs and
+  at each stage: `resolve`, `fetch`, `materialize`, `validate`,
+  `publish`, `collect`, and `revalidate`, `remove` or `delete-data` for
+  the verbs below. A pointer that a concurrent check moves between its
+  link and its selection is read again, and a deploy collected during
+  the size walk reports `-`. A check that fails once it holds the lock
+  writes `refused`; one that completes clears it. td-app answers only for
+  a Flathub name; root synthesizes an image application's record, the
+  three lines through `kind=image` (td-authd/DESIGN.md).
+- `td-app remove NAME` clears `previous`, then `current`, and collects
+  every generation, deploy and object graph no launch holds; a held
+  generation goes at a later collection once its launch ends. It keeps
+  `admitted`, so a reinstall cannot admit a commit older than one already
+  admitted, and `checked`, clears `refused`, and keeps the jail state.
+  An emptied `generations/` numbers again from 1. A check a launch
+  already started (below) can still publish after it until td-jail stops
+  fetching on demand (td-software/DESIGN.md §6.4), and with no
+  `current` the next launch waits for one.
+- `td-app delete-data NAME` deletes the jail state,
+  `~/.td/app/NAME`, and refuses unless `current` and `previous` are gone
+  and, after a collection under the lock, no generation is left: every
+  running launch holds its generation's selection (below), so a
+  generation that survives is a running instance. A launch that starts
+  meanwhile finds no `current` and waits for this lock before it can
+  fetch one, so it starts on the state as the deletion left it. The
+  state is renamed aside (`.removing-NAME`, finished by the next
+  deletion) and then removed without following a link; it refuses,
+  before the state is renamed or a mode changes, when a directory it
+  can read below is another filesystem's, and checks a sealed one again
+  once it is aside. With neither a cache nor state it answers that nothing
+  was deleted and creates neither.
+- `td-app revalidate NAME` reruns rule 5 over `current`'s deploys,
+  fetching nothing, when only what no commit carries changed (`checks=`
+  after a system update), and publishes the same rows under the new
+  digest. The stale copy is no rollback: `previous` stays what it was,
+  and the stale generation is collected. It answers as `ready` does;
+  when the refs changed, a deploy is missing or the validator refuses,
+  it answers `absent` and records the reason in `refused`. It leaves `checked`, since it asked no one.
+  td-jail does not run it yet (td-software/DESIGN.md §4.1).
 
 **When it fetches.** td-jail, launching an application whose spec names
 Flathub refs, first runs `/bin/td-app ready NAME` as the account, with
