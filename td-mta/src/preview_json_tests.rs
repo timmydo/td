@@ -457,3 +457,47 @@ fn monotonic_only_preview_clock_preserves_output_diagnostics_and_charges() {
         assert_eq!(render(&baseline, format), render(&MonotonicOnly, format));
     }
 }
+
+#[test]
+fn batched_json_rejects_expiry_during_source_read_before_returning_output() {
+    struct Expiring<'a>(&'a Timer);
+    impl BlobReader for Expiring<'_> {
+        fn len(&self) -> u64 {
+            1
+        }
+        fn read_at(&mut self, offset: u64, output: &mut [u8]) -> Result<usize, PolicyError> {
+            assert_eq!(offset, 0);
+            self.0 .0.store(100, Ordering::Relaxed);
+            output[0] = b'x';
+            Ok(1)
+        }
+    }
+    let timer = Timer(AtomicU64::new(1));
+    let mut source = Expiring(&timer);
+    let mut work = work(10000);
+    let mut buffer = [0; 3];
+    let mut checkpoints = Checkpoints::default();
+    let mut cursor = Cursor::new(
+        InputSource {
+            source: &mut source,
+            offset: 0,
+            length: 1,
+            encoding: TransferEncoding::Identity,
+            charset: Plan::from_label(Some(b"utf-8")),
+        },
+        &mut buffer,
+        &mut checkpoints,
+        Format::Plain,
+        &mut work,
+        &timer,
+        Tick(1),
+    )
+    .unwrap();
+    let mut output = [0xa5; 512];
+    let expected = Error::Work(Stop::Deadline);
+    assert_eq!(cursor.poll_batch(&mut output), Err(expected));
+    assert!(output.iter().any(|byte| *byte != 0xa5));
+    assert!(cursor.value().is_none());
+    assert_eq!(cursor.poll_batch(&mut output), Err(expected));
+    assert_eq!(cursor.finish().err(), Some(expected));
+}

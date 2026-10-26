@@ -71,13 +71,25 @@ pub struct Reader<'r, 'b, S: BlobReader + ?Sized = dyn BlobReader + 'r> {
 pub(crate) struct CheckedClock<'a> {
     source: &'a dyn Clock,
     last: AtomicU64,
+    batch: Option<Tick>,
 }
 impl<'a> CheckedClock<'a> {
     pub(crate) fn new(source: &'a dyn Clock, last: Tick) -> Self {
         Self {
             source,
             last: AtomicU64::new(last.0),
+            batch: None,
         }
+    }
+    pub(crate) fn begin_batch(&mut self) -> Result<(), PolicyError> {
+        if self.batch.is_some() {
+            return Err(PolicyError::Invalid);
+        }
+        self.batch = Some(self.monotonic()?);
+        Ok(())
+    }
+    pub(crate) fn end_batch(&mut self) {
+        self.batch = None;
     }
     pub(crate) fn last(&self) -> Tick {
         Tick(self.last.load(Ordering::Relaxed))
@@ -97,7 +109,10 @@ impl Clock for CheckedClock<'_> {
         Ok(now)
     }
     fn monotonic(&self) -> Result<Tick, PolicyError> {
-        self.observe(self.source.monotonic()?)
+        self.observe(match self.batch {
+            Some(now) => now,
+            None => self.source.monotonic()?,
+        })
     }
 }
 impl<'r, 'b> Reader<'r, 'b> {
@@ -796,6 +811,29 @@ mod clock_tests {
             self.ticks.fetch_add(1, Ordering::Relaxed);
             self.now()
         }
+    }
+    #[test]
+    fn bounded_batch_reuses_ticks_and_resumes_fresh_failure_checks() {
+        let source = Split::new();
+        let mut clock = CheckedClock::new(&source, Tick(0));
+        clock.begin_batch().unwrap();
+        assert_eq!(clock.begin_batch(), Err(PolicyError::Invalid));
+        source.tick.store(20, Ordering::Relaxed);
+        for _ in 0..128 {
+            assert_eq!(clock.monotonic(), Ok(Tick(10)));
+        }
+        assert_eq!(source.ticks.load(Ordering::Relaxed), 1);
+        clock.end_batch();
+        assert_eq!(clock.monotonic(), Ok(Tick(20)));
+        clock.begin_batch().unwrap();
+        source.fail.store(true, Ordering::Relaxed);
+        assert_eq!(clock.monotonic(), Ok(Tick(20)));
+        clock.end_batch();
+        assert_eq!(clock.monotonic(), Err(PolicyError::Busy));
+        source.fail.store(false, Ordering::Relaxed);
+        source.tick.store(19, Ordering::Relaxed);
+        assert_eq!(clock.begin_batch(), Err(PolicyError::Invalid));
+        assert_eq!(clock.monotonic(), Err(PolicyError::Invalid));
     }
     #[test]
     fn mixed_clock_methods_share_the_watermark_and_preserve_utc() {

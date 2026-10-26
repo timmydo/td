@@ -442,20 +442,15 @@ fn batched_decoding_preserves_bytes_and_diagnostics_with_fewer_snapshot_checks()
     source.push(0xff);
     let run = |batch: bool| {
         let timer = Timer::new();
+        let job = Timer::new();
         let mut result = None;
         exercise_part(1, &source, &timer, |original| {
             let mut buffer = [0; 128];
             let mut checkpoints = Checkpoints::default();
-            let mut cursor = Cursor::new(
-                original,
-                &mut buffer,
-                &mut checkpoints,
-                0,
-                &GoodClock,
-                Tick(1),
-            )
-            .unwrap();
+            let mut cursor =
+                Cursor::new(original, &mut buffer, &mut checkpoints, 0, &job, Tick(1)).unwrap();
             let before = timer.samples();
+            let job_before = job.samples();
             let mut bytes = Vec::new();
             let mut output = [0; 512];
             for _ in 0..100_000 {
@@ -467,8 +462,14 @@ fn batched_decoding_preserves_bytes_and_diagnostics_with_fewer_snapshot_checks()
                 .unwrap();
                 bytes.extend_from_slice(&output[..progress.written]);
                 if progress.status == Status::Complete {
-                    let diagnostics = cursor.finish().unwrap().diagnostics;
-                    result = Some((bytes, diagnostics, timer.samples() - before));
+                    let retained = cursor.finish().unwrap();
+                    result = Some((
+                        bytes,
+                        retained.diagnostics,
+                        timer.samples() - before,
+                        job.samples() - job_before,
+                        retained.original.structure.work.remaining(),
+                    ));
                     return;
                 }
             }
@@ -476,10 +477,15 @@ fn batched_decoding_preserves_bytes_and_diagnostics_with_fewer_snapshot_checks()
         });
         result.unwrap()
     };
-    let (single, diagnostics, single_checks) = run(false);
-    let (batch, batch_diagnostics, batch_checks) = run(true);
+    let (single, diagnostics, single_checks, single_ticks, single_work) = run(false);
+    let (batch, batch_diagnostics, batch_checks, batch_ticks, batch_work) = run(true);
     assert_eq!(batch, single);
     assert_eq!(batch_diagnostics, diagnostics);
+    assert_eq!(batch_work, single_work);
+    assert!(
+        batch_ticks * 8 < single_ticks,
+        "{batch_ticks} vs {single_ticks}"
+    );
     assert!(batch_diagnostics.is_encoding_problem);
     assert!(
         batch_checks * 8 < single_checks,
@@ -501,7 +507,15 @@ fn batched_decoding_retires_provisional_bytes_when_its_clock_expires() {
             Cursor::new(original, &mut buffer, &mut checkpoints, 0, &timer, Tick(1)).unwrap();
         timer.after(30);
         let mut output = [0; 512];
-        let error = cursor.poll_batch(&mut output).unwrap_err();
+        let error = (0..64)
+            .find_map(|_| match cursor.poll_batch(&mut output) {
+                Ok(progress) => {
+                    assert_ne!(progress.status, Status::Complete);
+                    None
+                }
+                Err(error) => Some(error),
+            })
+            .unwrap();
         assert!(cursor.value().is_none());
         assert_eq!(cursor.poll_batch(&mut output).unwrap_err(), error);
         assert!(cursor.finish().is_err());

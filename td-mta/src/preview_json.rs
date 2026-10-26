@@ -248,6 +248,17 @@ impl<'r, 'b, 'w, 'c, S: BlobReader + ?Sized> Cursor<'r, 'b, 'w, 'c, S> {
         self.complete = progress.status == Status::Complete;
         Ok(progress)
     }
+    pub(crate) fn poll_batch(&mut self, output: &mut [u8]) -> Result<Progress, Error> {
+        self.check()?;
+        let admitted = self.source.clock.begin_batch().map_err(Error::Policy);
+        self.outcome(admitted)?;
+        let result = crate::mime_response::framing::poll_json_batch(output, Error::State, |tail| {
+            self.poll(tail)
+        });
+        self.source.clock.end_batch();
+        let after = self.source.charge_output((), 0);
+        self.outcome(after.and(result))
+    }
     pub fn finish(mut self) -> Result<Retained<'r, 'b, 'w, S>, Error> {
         self.check()?;
         self.finish_retained()

@@ -158,14 +158,10 @@ impl<'p, 'v, 'c, 'b, 'o, 'w, 'i, 't> Cursor<'p, 'v, 'c, 'b, 'o, 'w, 'i, 't> {
         self.outcome(result)
     }
     /// Advance at most 64 decoder turns under one native snapshot fence.
-    /// The decoder samples its job clock and charges work on every turn.
+    /// Job-clock checks bracket the batch; each turn retains its work charges.
     pub fn poll_batch(&mut self, output: &mut [u8]) -> Result<Progress, Error> {
         self.check()?;
-        let result = crate::mime_response::framing::poll_json_batch(
-            output,
-            Error::Json(json::Error::State),
-            |tail| self.child.poll(tail).map_err(Error::Json),
-        );
+        let result = self.child.poll_batch(output).map_err(Error::Json);
         let result = self
             .child
             .source_mut()

@@ -1956,10 +1956,14 @@ retained. HTML truncation, response serialization and JMAP integration remain
 separate.
 
 JMAP preview, body-value serialization and text search may group at most 64
-existing scalar decoder turns between native snapshot checks. Every child turn still
-uses its original work meter and freshly sampled job clock; no deadline or
-budget is renewed. A fresh native check brackets each batch, including
-failure and completion, and all copied bytes remain provisional. Metadata
+existing scalar decoder turns between native snapshot checks. Every child turn
+still uses its original work meter; no deadline or budget is renewed. Preview
+and body-value JSON batches reuse their entry job-clock tick within those
+bounded turns and freshly check the original clock and meter before returning,
+including on error and completion. Single-turn APIs and text search retain
+their per-turn clock sampling. Native source I/O keeps its own fresh checks.
+A fresh native check also brackets each batch, including failure and
+completion, and all copied bytes remain provisional. Metadata
 preparation retains its original work and input bounds. Native MIME structure
 traversal for JMAP reads, search and part downloads similarly groups at most
 64 parser turns per native snapshot fence, sampling its job clock and checking
