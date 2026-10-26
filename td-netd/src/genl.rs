@@ -1,5 +1,5 @@
 //! Generic netlink framing and the slice of nl80211 td-netd speaks: pure
-//! encoding and bounded parsing, no I/O. Numbers are Linux 7.1.4's UAPI
+//! encoding and bounded parsing, no I/O. Numbers are Linux 7.2.12's UAPI
 //! (`linux/netlink.h`, `linux/genetlink.h`, `linux/nl80211.h`).
 
 pub const NLMSG_HDR: usize = 16;

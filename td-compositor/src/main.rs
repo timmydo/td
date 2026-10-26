@@ -1941,7 +1941,7 @@ unsafe impl Send for MappedRegion {}"#;
     ///
     /// The restore is a `SETCRTC`, which is the ONE teardown step that
     /// carries `DRM_MASTER` in the kernel's ioctl table -- `GETCRTC`, `ADDFB2`
-    /// and `RMFB` carry no flag (`drm_ioctl.c:674`, `675`, `691`, `692`). So
+    /// and `RMFB` carry no flag (`drm_ioctl.c:686`, `687`, `703`, `704`). So
     /// mastership has to outlive the restore, and is released after it.
     ///
     /// `RMFB` on a framebuffer still being scanned out is not refused:

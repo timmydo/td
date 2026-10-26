@@ -1544,7 +1544,7 @@ optimisation, not a prerequisite.
 `BOOTX64.EFI` is an **EFI-stub kernel**: `CONFIG_EFI` + `CONFIG_EFI_STUB`, so
 the kernel image is itself a PE executable the firmware can load, and no
 third-party bootloader exists on the path. `linux-x86-64.rs` enables both,
-with their ACPI prerequisite confirmed in Linux 7.1.4's `arch/x86/Kconfig`.
+with their ACPI prerequisite confirmed in Linux 7.2.12's `arch/x86/Kconfig`.
 The deprecated handover entry points and mixed 32-bit firmware mode are
 explicitly disabled, as is the EFI variable filesystem. EFI runtime-map
 support follows KEXEC_CORE; other symbols under the EFI menu retain
@@ -2222,7 +2222,7 @@ defence either way today (§9: no Secure Boot, no TPM, no encryption), so
 The mechanism that makes a per-run key workable is verified: Linux accepts
 **concatenated cpio archives** for initramfs, so a harness can append a
 one-file archive carrying that run's public key without any recipe being
-parameterized. Checked against the pinned tree, `linux-7.1.4`,
+parameterized. Checked against the pinned tree, `linux-7.2.12`,
 `init/initramfs.c` — `unpack_to_rootfs`'s driver loop restarts the state
 machine at `Start` on each `070701` magic and skips NUL padding between
 archives, and the compressed path does the same in `flush_buffer`. Two
@@ -2245,7 +2245,7 @@ one this appendix rides — is an
 image is not initramfs ... looks like an initrd" line and a copy of the whole
 initrd written into rootfs as `/initrd.image`. The base archive's `/init`
 still exists, so `prepare_namespace` and its legacy initrd loader never run
-(`init/main.c:1715-1722`) and **the boot continues**, base archive
+(`init/main.c:1675-1682`) and **the boot continues**, base archive
 extracted and the key absent. Without `CONFIG_BLK_DEV_RAM` the same arm is a
 `KERN_EMERG` "Initramfs unpacking failed" line, with the same outcome. That
 is precisely the "a missing key becomes a runtime branch" hazard named three
@@ -2291,7 +2291,7 @@ Two things the appendix must carry that are easy to omit, both because the
 kernel declines in silence rather than complaining. It emits its own `etc` and
 `etc/td` directory entries — derived from `TRUSTED_KEY_PATH` rather than
 written beside it — since a missing parent is `filp_open` returning 0
-(`init/initramfs.c:385-387`), and a parent that exists but is not a directory
+(`init/initramfs.c:393-395`), and a parent that exists but is not a directory
 is ENOTDIR through the same path. And it is padded to a 4-byte boundary at the
 join, which per the correction above nothing downstream would report.
 

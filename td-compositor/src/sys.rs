@@ -41,7 +41,7 @@ const EVIOCGABS_X: usize = 0x8018_4540;
 const EVIOCGABS_Y: usize = 0x8018_4541;
 const EVIOCSCLOCKID: usize = 0x4004_45a0;
 
-/// The DRM/KMS requests this crate may issue, from Linux 7.1.4's
+/// The DRM/KMS requests this crate may issue, from Linux 7.2.12's
 /// `include/uapi/drm/drm.h`. `_IOC` packs the argument's SIZE into bits 16..30,
 /// so each number states the layout of the struct it is used with — the
 /// `EVIOCGABS` lesson one driver over, and `the_drm_requests_encode_the_structs_they_carry`
@@ -61,18 +61,19 @@ const DRM_IOCTL_VERSION: usize = 0xc040_6400;
 /// What that costs is narrower than an earlier revision of this comment said,
 /// and the correction is worth carrying because the wrong version is the
 /// plausible one. Holding mastership does NOT stop the framebuffer console
-/// painting: `drm_fb_helper_fb_dirty` asks
-/// `drm_client_modeset_wait_for_vblank` for a vblank, that call answers
-/// `-EBUSY` while a foreign master exists (`drm_client_modeset.c:1320`), and
-/// the helper DISCARDS the result (`drm_fb_helper.c:237`) and commits the
-/// damage anyway (`:249`). The console loses its vblank rate-limit and nothing
-/// else.
+/// painting: `drm_fb_helper_fb_dirty` waits for a vblank only on a CRTC that
+/// shows the fbdev framebuffer (`drm_fb_helper.c:325-327`), so not at all
+/// while another master's framebuffer is up; where it does wait,
+/// `drm_client_modeset_wait_for_vblank` answers `-EBUSY` while a foreign
+/// master exists (`drm_client_modeset.c:1320`), and the helper DISCARDS the
+/// result (`drm_fb_helper.c:327`) and commits the damage anyway (`:339`). The
+/// console loses its vblank rate-limit and nothing else.
 ///
 /// The real costs are two. Another process's `SET_MASTER` is refused outright
 /// — `if (dev->master) return -EBUSY;` (`drm_auth.c:260`) — so a genuine DRM
 /// compositor cannot take the card while this descriptor holds it. And two
-/// fbdev ioctls, `drm_fb_helper_setcmap` (`:863`) and
-/// `drm_fb_helper_pan_display` (`:1247`), fail for as long as it is held.
+/// fbdev ioctls, `drm_fb_helper_setcmap` (`drm_fb_helper.c:953`) and
+/// `drm_fb_helper_pan_display` (`:1337`), fail for as long as it is held.
 ///
 /// `open_card` drops it immediately, so the one place mastership is TAKEN is
 /// the backend's explicit `SET_MASTER`; the backend's teardown drops it again
@@ -91,7 +92,7 @@ const DRM_IOCTL_MODE_GETCONNECTOR: usize = 0xc050_64a7;
 /// mapping of its descriptor, and refusing that forever is the one way td could
 /// paint itself out of hardware rendering.
 ///
-/// Sizes are the kernel's own structs at the 7.1.4 pin — `drm_mode_create_dumb`
+/// Sizes are the kernel's own structs at the 7.2.12 pin — `drm_mode_create_dumb`
 /// is 32 bytes (six `__u32` then a `__u64`), `drm_mode_map_dumb` 16 and
 /// `drm_mode_destroy_dumb` 4 — and `the_drm_requests_encode_the_structs_they_carry`
 /// checks each number against the Rust type actually passed to it, which is
@@ -1097,7 +1098,7 @@ struct DrmModeFbCmd2 {
 /// Become the DRM master of this card.
 ///
 /// The authority to modeset, and the reason it is separate from opening:
-/// `drm_ioctl.c` flags `MODE_SETCRTC` `DRM_MASTER` (`:675`), so without this
+/// `drm_ioctl.c` flags `MODE_SETCRTC` `DRM_MASTER` (`:687`), so without this
 /// the modeset is refused. A caller takes it for a bounded window and gives it
 /// back.
 ///
@@ -1256,7 +1257,7 @@ fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
 /// The CRTC must already be scanning out a framebuffer: `drm_mode_page_flip_ioctl`
 /// answers `-EBUSY` when the primary plane has none (`drm_plane.c:1473`), so a
 /// flip is a thing done to an established modeset rather than a way to
-/// establish one. It also needs mastership — `drm_ioctl.c:694` flags it
+/// establish one. It also needs mastership — `drm_ioctl.c:706` flags it
 /// `DRM_MASTER` — and the new framebuffer must cover the plane's source
 /// rectangle.
 pub fn drm_page_flip(
@@ -1986,7 +1987,7 @@ mod tests {
         assert_eq!(argument_size(DRM_IOCTL_SET_MASTER), 0);
     }
 
-    /// The kernel's own byte counts for Linux 7.1.4 on x86-64, written out
+    /// The kernel's own byte counts for Linux 7.2.12 on x86-64, written out
     /// rather than derived from the request numbers.
     ///
     /// Deriving them would make the test above tautological: both sides would

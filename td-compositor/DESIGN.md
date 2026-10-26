@@ -901,7 +901,7 @@ when its properties include `INPUT_PROP_POINTER` and exclude
 `INPUT_PROP_DIRECT`, and its keys include `BTN_TOOL_FINGER` and exclude
 `BTN_TOOL_PEN`, udev's `finger_but_no_pen`.
 
-That is what Linux 7.1.4's touchpad drivers set and what neither QEMU tablet
+That is what Linux 7.2.12's touchpad drivers set and what neither QEMU tablet
 does. Synaptics, elantech, byd and synaptics_usb set POINTER and the finger
 tool outright. `input_mt_init_slots` with `INPUT_MT_POINTER` sets both, and
 alps (its multitouch protocols), focaltech, bcm5974, the Magic Trackpad
@@ -4483,7 +4483,7 @@ compositor exists, so this loss never reaches it.
 
 The backend unwinds in one order, for a narrower reason than it first appears.
 `SETCRTC` is the only teardown step the kernel flags `DRM_MASTER`
-(`drm_ioctl.c:675`); `GETCRTC`, `ADDFB2` and `RMFB` need no master at all. The
+(`drm_ioctl.c:687`); `GETCRTC`, `ADDFB2` and `RMFB` need no master at all. The
 restore is a `SETCRTC`, so mastership is released after it. Unregistering the
 framebuffer first would not fail — `drm_framebuffer_remove` disables the CRTCs
 using it, as the DRM ABI requires — it would blank the CRTC and leave the

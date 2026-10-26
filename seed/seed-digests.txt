@@ -26,7 +26,7 @@ linux-firmware-ath11k-wcn6855-notice-source 408zncrpy9bx106rkgjg1np9xxzgrzdb-lin
 linux-firmware-ath11k-wcn6855-regdb-source vf2wajzx7j1xg371lwsvdshzyxspwyj2-linux-firmware-ath11k-wcn6855-regdb-source
 linux-firmware-qualcomm-atheros-license-source r04z3gvrpns65smawdy3s7cijnv6y8j0-linux-firmware-qualcomm-atheros-license-source
 linux-headers-x86-64 r4mg86l36d6x7c08wqj8v2fdkx23sxjv-linux-headers-x86-64
-linux-kernel-source m7dscgpgid10mwpbj97yxhi0civ8k3av-linux-kernel-source
+linux-kernel-source g4wjmqhfk25jfdy7lglw138mv26xa651-linux-kernel-source
 nerd-fonts-codicons-license-source ma6jj9n0qgmk2p4nr8r9x2axnbf2wkip-nerd-fonts-codicons-license-source
 nerd-fonts-font-awesome-license-source 933m2kl6wlld9mma2bwcxvqyjd4wfqbh-nerd-fonts-font-awesome-license-source
 nerd-fonts-materialdesign-license-source 49m2lxkz674w3g0f5lx8zfhyskn7jm9a-nerd-fonts-materialdesign-license-source

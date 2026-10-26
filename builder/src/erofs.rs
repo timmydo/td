@@ -1,6 +1,6 @@
 //! Deterministic EROFS image writer for the control-plane packer.
 //!
-//! Linux 7.1.4 format: 4096-byte blocks, compact 32-byte inodes, metadata at
+//! Linux 7.2.12 format: 4096-byte blocks, compact 32-byte inodes, metadata at
 //! block 1. Directories and symlinks use FLAT_PLAIN. Nonempty regular files
 //! use COMPRESSED_FULL with the extent-map advice and 16-byte extent records.
 //! Each logical 128-KiB extent is an independent zstd frame, or raw bytes if

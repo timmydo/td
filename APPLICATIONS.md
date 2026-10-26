@@ -138,7 +138,7 @@ this table got an answer wrong:
    `default`, which may be `y`.**
 
 So a symbol's final value is not "whatever allnoconfig said". Checked
-against the pinned `linux-7.1.4` source and against the resolved config:
+against the pinned `linux-7.2.12` source and against the resolved config:
 
 | symbol | Kconfig shape | before this rung |
 |---|---|---|
@@ -184,7 +184,7 @@ recorded here so the next reader does not have to repeat it.** The
 objection was that `SECCOMP`'s prompt is `EXPERT`-gated like
 `NAMESPACES`', which would leave it `y` under `EXPERT=n` and make
 milestone 1 unnecessary for seccomp. It is not gated. In the pinned
-`linux-7.1.4`, `arch/Kconfig:643`:
+`linux-7.2.12`, `arch/Kconfig:647`:
 
 ```
 config SECCOMP
@@ -198,7 +198,7 @@ The `prompt` carries no `if`, so `allnoconfig` answers it `n` — unlike
 The difference between those two symbols is one `if` clause, and it is
 the whole of why one needs a pin and the other does not; a reader who
 checks only one of them will draw the wrong conclusion about the other.
-`SECCOMP_FILTER` (`arch/Kconfig:660`) is `def_bool y` with **no** prompt,
+`SECCOMP_FILTER` (`arch/Kconfig:664`) is `def_bool y` with **no** prompt,
 so it cannot be pinned directly at all — it follows from `SECCOMP && NET
 && HAVE_ARCH_SECCOMP_FILTER`, which is step 3 doing exactly what this
 section is about. The pin list must therefore name `SECCOMP`, not
@@ -261,11 +261,13 @@ CONFIG_INOTIFY_USER=y
 # audio (§K), landing with td-audio rather than with the jail:
 CONFIG_SOUND=y  CONFIG_SND=y  CONFIG_SND_PCM=y
 CONFIG_SND_PCI=y  CONFIG_SND_HDA_INTEL=y  CONFIG_SND_HDA_GENERIC=y
+#   SND_HDA_INTEL depends on PCI itself since 7.2, not on the SND_PCI
+#   menu; SND_PCI stays pinned as that menu, not as the codec path's gate
 #   NOT CONFIG_SND_HDA: SND_HDA_INTEL selects it and it has no prompt of
 #   its own, so olddefconfig drops a line naming it and writing one would
 #   read as a pin without being one
 CONFIG_SND_ALOOP=y                 # explicit-only in-guest audio test oracle
-# CONFIG_SND_PCM_OSS stays OFF — present in 7.1.4, deliberately refused (§K.3)
+# CONFIG_SND_PCM_OSS stays OFF — present in 7.2.12, deliberately refused (§K.3)
 # resource caps (§P) — NOT deferred after all, see below:
 CONFIG_CGROUPS=y  CONFIG_MEMCG=y  CONFIG_CGROUP_PIDS=y
 CONFIG_CGROUP_SCHED=y  CONFIG_FAIR_GROUP_SCHED=y  CONFIG_CFS_BANDWIDTH=y
@@ -346,7 +348,7 @@ up and is corrected. `SECCOMP_FILTER` has no prompt at all, so kconfig
 computes it from `SECCOMP && NET` and `olddefconfig` DROPS a line naming
 it — leaving a pin list that reads like a guarantee nothing made. It is
 guarded instead, which is the only place a derived symbol can be
-observed. Resolving the pinned `linux-7.1.4` end to end confirms it:
+observed. Resolving the pinned `linux-7.2.12` end to end confirms it:
 with `SECCOMP` pinned and `SECCOMP_FILTER` absent from the list, the
 resolved config carries `CONFIG_SECCOMP_FILTER=y`.
 
@@ -3383,7 +3385,7 @@ Everything else is allowed, including `seccomp(2)` and
 content process, and filter stacking under `NO_NEW_PRIVS` is exactly what
 the kernel provides. A nested filter can only narrow.
 
-Linux 7.1's `uretprobe`=335 and `uprobe`=336 entries are not ordinary
+Linux 7.2's `uretprobe`=335 and `uprobe`=336 entries are not ordinary
 application syscalls and are not claimed as filter rules. The pinned kernel
 unconditionally treats both as seccomp exceptions before running cBPF so an
 external tracer can inject its kernel-owned trampoline; a direct `uretprobe`
@@ -8211,7 +8213,7 @@ what confirms the node just opened is the playback device that file named,
 and a daemon that skips it is trusting a path string on a real machine.
 The struct discipline is td-compositor's `EVIOCGABS` argument arriving at
 a bigger struct: `snd_pcm_hw_params` is **608 bytes** (verified against
-the pinned `linux-7.1.4` `include/uapi/sound/asound.h`: 4 + 8×32-byte
+the pinned `linux-7.2.12` `include/uapi/sound/asound.h`: 4 + 8×32-byte
 masks + 21×12-byte intervals + 24 + an 8-byte `fifo_size` naturally
 aligned at offset 536 + 16 + 48, no padding), and the kernel copies all
 608 in *and* out with no length negotiation.
@@ -8247,7 +8249,7 @@ level-writable, before reporting timeout and dropping it. Every admitted ring
 therefore fits inside the drain deadline with explicit scheduler margin.
 
 **Every constant in the two paragraphs above is an x86-64 fact, not
-merely a Linux 7.1.4 fact, and premise 8 makes that worth flagging
+merely a Linux 7.2.12 fact, and premise 8 makes that worth flagging
 here rather than discovering on the first port.** `snd_pcm_uframes_t` and
 `snd_pcm_sframes_t` are pointer-width, so the 608-byte `snd_pcm_hw_params`
 layout, the `0xC2604111` request number that encodes it, the
@@ -8297,7 +8299,7 @@ card and device explicitly, while a loopback-only machine has no implicit
 audible sink.
 
 **OSS emulation is refused, and the reason matters.** It survives in
-`linux-7.1.4` (`CONFIG_SND_PCM_OSS`, `sound/core/oss/pcm_oss.c`,
+`linux-7.2.12` (`CONFIG_SND_PCM_OSS`, `sound/core/oss/pcm_oss.c`,
 including `SNDCTL_DSP_GETODELAY`) and would be genuinely smaller — plain
 `write(2)` plus six int-argument ioctls. But it buys that size by
 enabling a deprecated in-kernel emulation layer, including
@@ -9510,7 +9512,7 @@ boundary. The jail will also need read-only `/sys/class/drm` and
 list a data table now so adding them is a row.
 
 Kernel: `DRM`, `DRM_VIRTIO_GPU`, `DRM_VIRTIO_GPU_KMS` and
-`DRM_FBDEV_EMULATION` are already pinned, the 7.1.4 virtio-gpu driver
+`DRM_FBDEV_EMULATION` are already pinned, the 7.2.12 virtio-gpu driver
 advertises `DRIVER_RENDER`/`MODESET`/`ATOMIC`, and there is no separate
 `CONFIG_VIRGL` symbol — the capability is dormant only because QEMU runs
 without VirGL. **Step 1 needs zero new kernel symbols.**

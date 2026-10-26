@@ -835,11 +835,13 @@ master whenever `dev->master` is NULL, and an in-kernel client — fbcon, fbdev
 emulation — never sets it, so on a td image the plain `open` of
 `/dev/dri/card0` IS the acquisition. What holding it costs was stated too
 strongly here for two landings and is now stated exactly: the framebuffer
-console keeps painting, because `drm_fb_helper_fb_dirty` discards the `-EBUSY`
-its vblank wait returns and commits the damage regardless
-(`drm_fb_helper.c:237`, `:249`); what a foreign master actually blocks is any
-OTHER process becoming master (`drm_auth.c:260`) plus the `setcmap` and
-`pan_display` fbdev ioctls (`:863`, `:1247`).
+console keeps painting, because `drm_fb_helper_fb_dirty` commits the damage
+whatever its vblank wait does: it waits only on a CRTC showing the fbdev
+framebuffer, none while another master's framebuffer is up, and ignores the
+`-EBUSY` that wait returns under a foreign master (`drm_fb_helper.c:325-327`,
+`:339`); what a foreign master actually blocks is any OTHER process becoming
+master (`drm_auth.c:260`) plus the `setcmap` and `pan_display` fbdev ioctls
+(`drm_fb_helper.c:953`, `:1337`).
 An earlier revision of this section reasoned from the absence of
 `SET_MASTER` and concluded discovery took no mastership; that was exactly
 backwards, and two reviewers caught it. `open_card`, the one path that opens
@@ -927,7 +929,7 @@ states the layout of the struct it is issued with: a Rust `#[repr(C)]` that
 drifts from its request is an out-of-bounds kernel write through code the
 compiler reads as safe. A test extracts that size field from each of the four
 and compares it to `size_of` of the struct, and a second test writes out the
-kernel's own byte counts — 64, 64, 80 and 20 for Linux 7.1.4 on x86-64 —
+kernel's own byte counts — 64, 64, 80 and 20 for Linux 7.2.12 on x86-64 —
 rather than deriving them from the request numbers, because deriving them
 would let both sides move together. `DrmModeInfo` is pinned at 68 bytes in
 that second test for a reason no request number can express: it is never an

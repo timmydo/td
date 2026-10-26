@@ -4,7 +4,7 @@
 //! It cannot be learned from a descriptor: `fstat` on any open of
 //! `/dev/console` reports the console device, 5:1, never the terminal behind
 //! it. The kernel lists its enabled consoles in `ACTIVE`, `/dev/console`'s
-//! last (Linux 7.1.4's `show_cons_active`), so the last entry names it. No
+//! last (Linux 7.2.12's `show_cons_active`), so the last entry names it. No
 //! ioctl is needed for this, and none is used.
 //!
 //! secret-line reads this to choose its lines, and td-boot, which includes

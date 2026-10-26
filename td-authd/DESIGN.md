@@ -222,11 +222,11 @@ paired lifecycle. It requires a root-created, unnamed socketpair on stdin;
 there is no shipped bypass for a different creator. Tests exercise other
 creator uids only through a private constructor.
 
-The Linux 7.1.4 source pins the relevant kernel behavior in `net/core/scm.c`
+The Linux 7.2.12 source pins the relevant kernel behavior in `net/core/scm.c`
 (`scm_pidfd_recv`) and `fs/pidfs.c` (`pidfs_init_inode`): the received
 descriptor identifies the sending task and each pid owns its inode identity.
 Polling the retained descriptor rejects death before any numeric PID could
-be reused. The supported runtime is td's configured Linux 7.1.4 or newer,
+be reused. The supported runtime is td's configured Linux 7.2.12 or newer,
 with pidfs, not every kernel that happens to accept SO_PASSPIDFD. Tests
 compare pidfd inodes for distinct processes independently of credential
 equality, so anon-inode pidfds on older hosts fail rather than silently

@@ -15180,7 +15180,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
     /// — so a line naming it in the pin list would be silently dropped by olddefconfig
     /// and would read, to anyone auditing the list, as a guarantee that was never made.
     ///
-    /// Verified against the pinned linux-7.1.4 by resolving the config: with SECCOMP
+    /// Verified against the pinned linux-7.2.12 by resolving the config: with SECCOMP
     /// pinned and SECCOMP_FILTER absent from the pin list, the resolved `.config`
     /// carries `CONFIG_SECCOMP_FILTER=y`.
     #[test]

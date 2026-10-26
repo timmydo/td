@@ -2905,7 +2905,7 @@ a crash. The controls rest on two premises:
   order is what makes them harmless: a sync before the change can only
   make earlier state durable;
 - the kernel's rename and unlink do not sync the Btrfs log tree. On the
-  pinned 7.1 kernel a rename of an inode already logged in the running
+  pinned 7.2 kernel a rename of an inode already logged in the running
   transaction, as the synced temporary is, only updates the log tree in
   memory (`btrfs_log_new_name`), and an unlink of an inode not logged is
   memory-only. Some kernels from about 4.20 to 5.11 synced the log on
@@ -3076,7 +3076,7 @@ desktop it opens the menu), and the compositor and authority are the
 ones from before the suspend: the session was locked when the first
 post-wake input was routed, in the same generation. Escape then ends
 the worker. The lock surface itself cannot be seen: the wake resets the
-virtio-gpu card and Linux 7.1.4's driver has no freeze or restore, so
+virtio-gpu card and Linux 7.2.12's driver has no freeze or restore, so
 the card stays dead and QEMU shows its inactive output, which the host
 requires. The suspend is the boot's last step, since the display does
 not return.

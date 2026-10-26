@@ -600,7 +600,7 @@ pub trait ScanoutCrtc {
 ///
 /// Its `Drop` restores the saved state and then gives mastership back, in that
 /// order because the restore is a `SETCRTC`, the one step the kernel flags
-/// `DRM_MASTER` (`drm_ioctl.c:675`). It is declared FIRST in
+/// `DRM_MASTER` (`drm_ioctl.c:687`). It is declared FIRST in
 /// `SwapChain`, so it runs before any buffer is unregistered -- unregistering
 /// a framebuffer the CRTC still scans out blanks the CRTC, which the restore
 /// would then have to light again.
@@ -975,7 +975,7 @@ pub struct FlipEvents {
     pending: Vec<u8>,
     /// A page, because the kernel's documentation recommends one: `drm_read`
     /// never splits an event, and puts back one that does not fit and answers
-    /// zero (`drm_file.c:581`), so a smaller buffer takes on a
+    /// zero (`drm_file.c:582`), so a smaller buffer takes on a
     /// forward-progress contract this reader has no reason to accept.
     chunk: Vec<u8>,
 }

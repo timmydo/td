@@ -4126,13 +4126,13 @@ fn provision_selector_as(
 /// archive carries `/init`, that error only logs (`KERN_INFO`, with a copy of
 /// the initrd left in rootfs as `/initrd.image`, since `CONFIG_BLK_DEV_RAM` is
 /// on) and the boot CONTINUES with the key absent
-/// (`init/initramfs.c:726-733`, `init/main.c:1715-1722`). Nothing
+/// (`init/initramfs.c:734-741`, `init/main.c:1675-1682`). Nothing
 /// downstream reports it, so the padding here is the only thing between a run
 /// and a machine that boots without its trust root.
 ///
 /// The directory entries are emitted rather than assumed: neither phase of
 /// `build_initramfs_spec` creates `/etc`, and a missing parent is silent too —
-/// `filp_open` failing is `return 0` (`init/initramfs.c:385-387`).
+/// `filp_open` failing is `return 0` (`init/initramfs.c:393-395`).
 fn append_selector_identity(
     initramfs: &Path,
     key: &[u8],

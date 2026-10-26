@@ -14,7 +14,7 @@
 //!
 //! ## The format, as the pinned kernel's own producer writes it
 //!
-//! Checked against `linux-7.1.4` — `usr/gen_init_cpio.c`, which is the program
+//! Checked against `linux-7.2.12` — `usr/gen_init_cpio.c`, which is the program
 //! the recipes actually run, and `init/initramfs.c`, which is what parses the
 //! result. A header is 110 bytes: the six-byte magic, then THIRTEEN fields of
 //! exactly eight uppercase hex digits each, in this order
@@ -36,7 +36,7 @@
 //! multiple (`:112`), and this pads to 4. That padding exists to leave a
 //! standalone archive on a block boundary for whatever follows it; an appendix
 //! has nothing following it, and the kernel eats trailing NULs either way
-//! (`do_reset`, `init/initramfs.c:324-331`). Four hundred wasted bytes in every
+//! (`do_reset`, `init/initramfs.c:332-339`). Four hundred wasted bytes in every
 //! initramfs is a poor trade for matching a number that means nothing here.
 //!
 //! ## Determinism
@@ -67,21 +67,21 @@
 //! Three properties of `init/initramfs.c`, each read rather than assumed:
 //!
 //! - A trailer does NOT stop the parse. `do_name` frees the hardlink table and
-//!   returns, and the driver loop keeps going (`:367-377`), which is what lets a
+//!   returns, and the driver loop keeps going (`:375-385`), which is what lets a
 //!   second archive follow a complete first one.
 //! - The magic of the next archive must sit at a 4-ALIGNED offset: the restart
-//!   branch is guarded by `!(this_header & 3)` (`:532-546`). NUL bytes between
+//!   branch is guarded by `!(this_header & 3)` (`:540-554`). NUL bytes between
 //!   archives are skipped one at a time, so padding is free — but it must be
 //!   NUL, and it must land the magic on 4. What a MISALIGNED appendix costs is
 //!   worth spelling out, because it is not the loud failure it looks like:
 //!   `do_reset` eats the NUL run and then errors `broken padding` if the offset
-//!   it stopped at is unaligned (`:324-331`), which sets `message` — and the
+//!   it stopped at is unaligned (`:332-339`), which sets `message` — and the
 //!   driver loop is `while (!message && len)`, so `decompress_method` and its
 //!   `invalid magic` are never reached. Where that error then goes depends on
 //!   which archive it came from, and td's SELECTOR initramfs — the one this
 //!   appendix rides, and the one firmware loads — is an INITRD
 //!   (`CONFIG_INITRAMFS_SOURCE=""`, qemu `-initrd`) rather than the built-in
-//!   one: it takes `:726-733`, not the `panic_show_mem` at `:714-716`. The
+//!   one: it takes `:734-741`, not the `panic_show_mem` at `:722-724`. The
 //!   recipe builds in `CONFIG_BLK_DEV_RAM` for the live volume, so that arm
 //!   is `populate_initrd_image`: a `KERN_INFO` "looks like an initrd" line and
 //!   a copy of the whole initrd written to rootfs as `/initrd.image`. The base
@@ -92,9 +92,9 @@
 //!   catch a mistake here; it is the only thing between a misaligned appendix
 //!   and a machine that boots without its trust root.
 //! - A later regular file REPLACES an earlier one: `clean_path` then
-//!   `filp_open(..., O_TRUNC)` (`:378-395`). `O_TRUNC` is applied whenever
+//!   `filp_open(..., O_TRUNC)` (`:386-403`). `O_TRUNC` is applied whenever
 //!   `maybe_link` did not report an existing link, and `maybe_link` engages only
-//!   at `nlink >= 2` (`:346-348`) — so with the `nlink = 1` written here, an
+//!   at `nlink >= 2` (`:354-356`) — so with the `nlink = 1` written here, an
 //!   inode number colliding with one in the base archive cannot silently turn
 //!   this file into a hardlink to that one. (The trailer frees the table anyway.)
 //!
@@ -117,7 +117,7 @@
 //! is read — a symlinked `etc` already extracted from the base archive would
 //! redirect a `.`-free, relative, perfectly well-formed name. Nor does a
 //! missing parent announce itself: `filp_open` failing is `return 0`
-//! (`init/initramfs.c:386-387`), the same silent absence an over-long name
+//! (`init/initramfs.c:394-395`), the same silent absence an over-long name
 //! gets. So an appendix carries its own directory entries rather than relying
 //! on the base archive's.
 
@@ -141,7 +141,7 @@ const PERMISSION_BITS: u32 = 0o7777;
 ///
 /// This is a refusal rather than a formatting detail, because of how the kernel
 /// declines: `do_header` has already set `state = SkipIt` when it tests
-/// `name_len <= 0 || name_len > PATH_MAX` (`init/initramfs.c:293-297`), so an
+/// `name_len <= 0 || name_len > PATH_MAX` (`init/initramfs.c:301-305`), so an
 /// over-long name is skipped in SILENCE — no diagnostic, boot continues, and
 /// the file simply is not there. For a writer whose job is installing a trust
 /// root that is the worst available failure: everything reports success and the
@@ -355,8 +355,8 @@ mod tests {
     /// however wrong `MTIME` is, and a review sweep found six constants pinned
     /// only that way. Two of the six were sharp — `070702` turns the last field
     /// into a checksum the kernel verifies against the 0 written there
-    /// (`init/initramfs.c:283-284`, `:422`), and a type nibble of `0o120000`
-    /// makes `do_header` take the `S_ISLNK` branch (`:298`) so the key's BYTES
+    /// (`init/initramfs.c:290-291`, `:430`), and a type nibble of `0o120000`
+    /// makes `do_header` take the `S_ISLNK` branch (`:306`) so the key's BYTES
     /// become a symlink target.
     #[test]
     fn header_fields_sit_at_their_spec_offsets() {
@@ -426,7 +426,7 @@ mod tests {
 
     /// Every header must start 4-aligned AND every padding byte must be NUL —
     /// the kernel's restart branch is `*buf == '0' && !(this_header & 3)`
-    /// (`init/initramfs.c:533`), and what carries it across a gap is the
+    /// (`init/initramfs.c:542`), and what carries it across a gap is the
     /// one-byte-at-a-time NUL skip below it. A 0xFF pad is neither, so it stops
     /// the walk exactly as a misaligned header does.
     ///

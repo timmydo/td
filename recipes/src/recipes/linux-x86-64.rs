@@ -31,7 +31,7 @@ pub const FIRMWARE: &[(&str, &str)] = &[
     ),
 ];
 
-// linux-x86-64 (Linux 7.1.4): the latest STABLE mainline kernel (not a
+// linux-x86-64 (Linux 7.2.12): the latest STABLE mainline kernel (not a
 // longterm/LTS line), built in the Debian build root (AGENTS.md "Debian build
 // root"): Debian's gcc 14.2 as CC and HOSTCC, its binutils, make, flex, bison,
 // bc, perl, libelf and gzip, all at /usr/bin. Nothing of the root ships: vmlinux
@@ -240,10 +240,10 @@ pub fn recipe() -> Recipe {
     //    bzImage+initramfs. Only CONFIG_KEXEC_FILE (the file-based syscall) + the
     //    KEXEC_CORE it selects are used; CONFIG_KEXEC — the legacy segment-based
     //    kexec_load(2) — is pinned OFF and guarded, since nothing here uses it and it
-    //    would only widen the syscall surface (in 7.1.4 KEXEC and KEXEC_FILE are
+    //    would only widen the syscall surface (in 7.2.12 KEXEC and KEXEC_FILE are
     //    independent siblings — KEXEC_FILE does NOT depend on KEXEC — so dropping
     //    KEXEC leaves KEXEC_FILE intact, and reboot(LINUX_REBOOT_CMD_KEXEC) runs off
-    //    KEXEC_CORE). In 7.1.4 KEXEC_FILE `select`s CRYPTO_LIB_SHA256 + KEXEC_CORE on
+    //    KEXEC_CORE). In 7.2.12 KEXEC_FILE `select`s CRYPTO_LIB_SHA256 + KEXEC_CORE on
     //    its own (verified against kernel/Kconfig.kexec), so NO CRYPTO menuconfig is
     //    needed for kexec itself; dm-crypt below selects CRYPTO separately.
     //    CONFIG_RELOCATABLE=y is REQUIRED: the x86
@@ -261,7 +261,7 @@ pub fn recipe() -> Recipe {
     //    mount an EROFS file out of the btrfs. CONFIG_BTRFS_FS=y self-selects its whole
     //    dependency set (CRC32, CRYPTO_LIB_SHA256/BLAKE2B, ZLIB/LZO/ZSTD, RAID6_PQ,
     //    XOR_BLOCKS, XXHASH, FS_IOMAP — verified against fs/btrfs/Kconfig), so do NOT
-    //    pin those individually; note CONFIG_LIBCRC32C does NOT exist in 7.1.4 (btrfs
+    //    pin those individually; note CONFIG_LIBCRC32C does NOT exist in 7.2.12 (btrfs
     //    uses the CRC32 lib, not CRYPTO_CRC32C) — a guard on it would red the build
     //    permanently. BTRFS_FS sits under `if BLOCK` (BLOCK already =y) and
     //    BLK_DEV_LOOP under `menuconfig BLK_DEV` (already =y), so no new menuconfig
@@ -332,8 +332,8 @@ pub fn recipe() -> Recipe {
     //    are off today despite defaulting on.
     //
     //    SECCOMP is pinned; SECCOMP_FILTER is NOT, and must not be. SECCOMP carries an
-    //    explicit `prompt` line above `def_bool y` (arch/Kconfig:643), so allnoconfig
-    //    can answer it and a pin is what turns it back on. SECCOMP_FILTER (:660) has
+    //    explicit `prompt` line above `def_bool y` (arch/Kconfig:647), so allnoconfig
+    //    can answer it and a pin is what turns it back on. SECCOMP_FILTER (:664) has
     //    NO prompt at all — it is `def_bool y` on `HAVE_ARCH_SECCOMP_FILTER && SECCOMP
     //    && NET`, so kconfig computes it and a line naming it in this list would be
     //    dropped by olddefconfig rather than honoured. It is guarded below instead:
@@ -364,8 +364,10 @@ pub fn recipe() -> Recipe {
     //    the moment somebody pins SYSVIPC for an unrelated reason. td-jail omits
     //    CLONE_NEWIPC until that is a decision rather than a side effect.
     //    Audio arrives here with td-audio (§K.4). SOUND/SND/SND_PCM are the core;
-    //    SND_PCI plus SND_HDA_INTEL and SND_HDA_GENERIC are the codec path that
-    //    covers both QEMU's `-device intel-hda` and ordinary desktop hardware, and
+    //    SND_HDA_INTEL and SND_HDA_GENERIC are the codec path that covers both
+    //    QEMU's `-device intel-hda` and ordinary desktop hardware (since 7.2
+    //    SND_HDA_INTEL depends on PCI itself, not on the SND_PCI menu, which stays
+    //    pinned as the menu the other PCI sound drivers sit under), and
     //    SND_ALOOP is the loopback device that lets a test capture what was played
     //    without a speaker. SND_HDA itself is NOT pinned: SND_HDA_INTEL selects it
     //    and it has no prompt of its own, so olddefconfig drops a line naming it
@@ -470,11 +472,11 @@ pub fn recipe() -> Recipe {
     //    their default y, and their pins are defensive. HYPERV selects
     //    PARAVIRT, and KVM_GUEST, which defaults on once PARAVIRT is, is
     //    pinned on purpose: Nitro and GCE are KVM. X86_X2APIC is the T14s's,
-    //    above. HYPERV_IOMMU, Hyper-V's interrupt remapping for a large
-    //    Azure VM's x2APIC, defaults on from HYPERV under the T14s's
-    //    IOMMU_SUPPORT and is written, like I2C_HID, so losing that default
-    //    cannot drop it unnoticed. HYPERV_TIMER has no prompt and is guarded
-    //    only.
+    //    above. Hyper-V's interrupt remapping, which a large Azure VM's
+    //    x2APIC needs, has had no symbol of its own since 7.2: HYPERV
+    //    builds drivers/iommu/hyperv/ and the pinned IRQ_REMAP its
+    //    hv-irq-remap-x86.o, so the HYPERV and IRQ_REMAP guards hold it.
+    //    HYPERV_TIMER has no prompt and is guarded only.
     //    Unasked: KVM_GUEST selects PARAVIRT_CLOCK, ARCH_CPUIDLE_HALTPOLL and
     //    X86_HV_CALLBACK_VECTOR and defaults in HALTPOLL_CPUIDLE (CPU_IDLE is
     //    on) with CPU_IDLE_GOV_HALTPOLL, inert without KVM_HINTS_REALTIME,
@@ -503,7 +505,7 @@ pub fn recipe() -> Recipe {
     //    SECURITYFS and SECURITY (both pinned ON) exist only so securityfs
     //    registers: the selector's prediction reads the firmware's TPM event
     //    log from it (td-install/ENCRYPTION.md "Prediction"). TCG_TPM only
-    //    implies SECURITYFS, and Linux 7.1 registers securityfs from the LSM
+    //    implies SECURITYFS, and Linux 7.2 registers securityfs from the LSM
     //    framework's initcall alone, so SECURITYFS without SECURITY builds a
     //    filesystem nothing registers. No security module is built or active:
     //    every LSM and the hook sets are pinned OFF, INTEGRITY (default y
@@ -615,7 +617,6 @@ pub fn recipe() -> Recipe {
                   /^#? *CONFIG_HYPERV_STORAGE[ =]/d; \
                   /^#? *CONFIG_HYPERV_NET[ =]/d; \
                   /^#? *CONFIG_PCI_HYPERV[ =]/d; \
-                  /^#? *CONFIG_HYPERV_IOMMU[ =]/d; \
                   /^#? *CONFIG_NET_VENDOR_AMAZON[ =]/d; \
                   /^#? *CONFIG_ENA_ETHERNET[ =]/d; \
                   /^#? *CONFIG_SCSI_VIRTIO[ =]/d; \
@@ -848,7 +849,6 @@ pub fn recipe() -> Recipe {
                    'CONFIG_HYPERV_STORAGE=y' \
                    'CONFIG_HYPERV_NET=y' \
                    'CONFIG_PCI_HYPERV=y' \
-                   'CONFIG_HYPERV_IOMMU=y' \
                    'CONFIG_NET_VENDOR_AMAZON=y' \
                    'CONFIG_ENA_ETHERNET=y' \
                    'CONFIG_SCSI_VIRTIO=y' \
@@ -1122,7 +1122,7 @@ pub fn recipe() -> Recipe {
                  grep -q '^CONFIG_USB_XHCI_PCI=y' .config || { echo 'USB_XHCI_PCI off - FIDO USB transport requires built-in xHCI and hidraw' >&2; exit 1; }; \
                  grep -q '^CONFIG_TCG_TPM=y' .config || { echo 'TCG_TPM off - TPM enrollment requires ACPI discovery and TPM2 device support' >&2; exit 1; }; \
                  grep -q '^CONFIG_SECURITYFS=y$' .config || { echo 'SECURITYFS off - the selector reads the TPM event log through securityfs' >&2; exit 1; }; \
-                 grep -q '^CONFIG_SECURITY=y$' .config || { echo 'SECURITY off - Linux 7.1 registers securityfs only from the LSM framework' >&2; exit 1; }; \
+                 grep -q '^CONFIG_SECURITY=y$' .config || { echo 'SECURITY off - Linux 7.2 registers securityfs only from the LSM framework' >&2; exit 1; }; \
                  grep -Fxq 'CONFIG_LSM=\"\"' .config || { echo 'CONFIG_LSM not empty - no security module may be ordered' >&2; exit 1; }; \
                  if grep -q '^CONFIG_SECURITY_NETWORK=' .config; then echo 'SECURITY_NETWORK on - the LSM framework is built for securityfs alone, with no security module' >&2; exit 1; fi; \
                  if grep -q '^CONFIG_SECURITY_PATH=' .config; then echo 'SECURITY_PATH on - the LSM framework is built for securityfs alone, with no security module' >&2; exit 1; fi; \
@@ -1250,7 +1250,6 @@ pub fn recipe() -> Recipe {
                  grep -q '^CONFIG_NET_VENDOR_GOOGLE=y' .config || { echo 'NET_VENDOR_GOOGLE off — the Google NIC drivers stay hidden' >&2; exit 1; }; \
                  grep -q '^CONFIG_GVE=y' .config || { echo 'GVE off — a GCE machine series that requires gVNIC has no network' >&2; exit 1; }; \
                  grep -q '^CONFIG_HYPERV_TIMER=y' .config || { echo 'HYPERV_TIMER off — an Azure VM has no Hyper-V clocksource. It is unprompted (def_bool HYPERV && X86), so something took HYPERV away' >&2; exit 1; }; \
-                 grep -q '^CONFIG_HYPERV_IOMMU=y' .config || { echo 'HYPERV_IOMMU off — Hyper-V interrupt remapping, which a large Azure VM needs for x2APIC, is missing' >&2; exit 1; }; \
                  if grep -q '^CONFIG_IPC_NS=y' .config; then echo 'IPC_NS on — it is default y behind SYSVIPC||POSIX_MQUEUE, so pinning either brings it along unasked; td-jail omits CLONE_NEWIPC and APPLICATIONS.md §0 defers it deliberately' >&2; exit 1; fi".replace("@EFI_CMDLINE@", &format!("{:?}", crate::shared::efi_default_cmdline())),
             ],
         )
@@ -1449,7 +1448,7 @@ pub fn recipe() -> Recipe {
     steps.push(Step::run("{out}", &[SH, "-c", &initramfs_check]).env("PATH", PATH));
 
     // td-sh, td-init and td-util are initramfs contents; td-util also packs it.
-    Recipe::mesboot("linux-x86-64", "7.1.4")
+    Recipe::mesboot("linux-x86-64", "7.2.12")
         .source_input("linux-kernel-source")
         .build_root()
         .native_inputs(&["td-sh", "td-init", "td-util"])
@@ -1772,7 +1771,6 @@ mod tests {
             "HYPERV_STORAGE",
             "HYPERV_NET",
             "PCI_HYPERV",
-            "HYPERV_IOMMU",
             "NET_VENDOR_AMAZON",
             "ENA_ETHERNET",
             "SCSI_VIRTIO",

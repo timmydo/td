@@ -62,7 +62,7 @@ fn identification_from(reader: impl Read, path: &Path) -> io::Result<Option<Stri
     let mut bytes = Vec::new();
     match reader.take(MAX_TEXT as u64 + 1).read_to_end(&mut bytes) {
         Ok(_) => {}
-        // Linux 7.1.4 scsi_vpd_lun_{serial,id}: no VPD page is ENXIO.
+        // Linux 7.2.12 scsi_vpd_lun_{serial,id}: no VPD page is ENXIO.
         Err(error) if error.raw_os_error() == Some(6) => return Ok(None),
         Err(error) => {
             return Err(io::Error::new(
