@@ -235,5 +235,8 @@ reserved prefix through the scalar path within the current turn; short
 budgets, fragments and output windows retain scalar admission. Both paths
 preserve per-turn progress, byte charges, malformed-input diagnostics and
 partial output on refusal. Output windows of at most three bytes select the
-scalar implementation once per poll, without repeated quartet probes. Decoder state size and source-custody requirements
-are unchanged; no decoded content is cached or newly trusted.
+scalar implementation once per poll, without repeated quartet probes. Alphabet
+classification uses a fixed 256-entry lookup table; padding and whitespace
+still pass through the decoder state machine. Decoder state size and
+source-custody requirements are unchanged; no decoded content is cached or
+newly trusted.
