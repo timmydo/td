@@ -260,7 +260,7 @@ const PINS: &[PinDef] = &[
     PinDef {
         key: "linux-kernel-source",
         aliases: &[],
-        // Linux 7.2.12 — the latest STABLE mainline kernel (not a longterm/LTS
+        // Linux 7.2.13 — the latest STABLE mainline kernel (not a longterm/LTS
         // line) the `linux-x86-64` recipe builds into a bootable x86_64
         // `vmlinux` in the Debian build root (re #529). DISTINCT from the
         // `linux-source` pin above: this is the full kernel tree to compile, kept
@@ -268,10 +268,10 @@ const PINS: &[PinDef] = &[
         // Keeping them separate confines a kernel bump to this one recipe
         // instead of glibc and everything above it. A reviewed update bumps
         // version + sha256 + the seed-digests.txt row together.
-        url: "https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.2.12.tar.xz",
-        sha256: "bb18468a8dc8978aa00caa6446e753f7b6da3fee56b6b7f38b16f9430ba02d4f",
-        file: "linux-7.2.12.tar.xz",
-        version: "7.2.12",
+        url: "https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.2.13.tar.xz",
+        sha256: "08e7b0c4f2dd1971f972da274b5e589a98989390ac56acd7a1a5af922363ea6c",
+        file: "linux-7.2.13.tar.xz",
+        version: "7.2.13",
     },
     PinDef {
         key: "openssh-x86-64-source",

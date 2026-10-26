@@ -929,7 +929,7 @@ states the layout of the struct it is issued with: a Rust `#[repr(C)]` that
 drifts from its request is an out-of-bounds kernel write through code the
 compiler reads as safe. A test extracts that size field from each of the four
 and compares it to `size_of` of the struct, and a second test writes out the
-kernel's own byte counts — 64, 64, 80 and 20 for Linux 7.2.12 on x86-64 —
+kernel's own byte counts — 64, 64, 80 and 20 for Linux 7.2.13 on x86-64 —
 rather than deriving them from the request numbers, because deriving them
 would let both sides move together. `DrmModeInfo` is pinned at 68 bytes in
 that second test for a reason no request number can express: it is never an

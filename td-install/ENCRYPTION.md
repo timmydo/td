@@ -572,12 +572,12 @@ describe as a `simple-framebuffer` device, and `CONFIG_DRM_SIMPLEDRM`
 drives it with DRM's fbdev emulation, so fbcon draws the VT on any such
 display before, or without, a native driver. Both are pinned and guarded
 over the resolved configuration as the other console and display symbols
-are (the linux-x86-64 recipe); Linux 7.2.12's `DRM_EFIDRM` and
+are (the linux-x86-64 recipe); Linux 7.2.13's `DRM_EFIDRM` and
 `DRM_VESADRM` require `SYSFB_SIMPLEFB` off, so neither is built, and
 the legacy `FB_EFI` and `FB_VESA`, which would take a mode
 simple-framebuffer cannot describe, stay off; the recipe refuses any of
 the four set. A native
-driver takes the display over. In Linux 7.2.12 `sysfb_init` is a device
+driver takes the display over. In Linux 7.2.13 `sysfb_init` is a device
 initcall in `drivers/firmware`, linked after the GPU drivers, and
 virtio-gpu (as virtio-vga) and i915 remove a conflicting firmware
 framebuffer and disable sysfb when they probe its device; so on a
@@ -615,7 +615,7 @@ Which terminal `/dev/console` is cannot be learned from its descriptor:
 never the terminal behind it, and `/dev/tty1` is 4:1. Both td-boot and
 secret-line therefore read `/sys/class/tty/console/active`, up to 4096
 bytes, one sysfs page, whose last space-separated entry names the
-terminal `/dev/console` is (Linux 7.2.12's `show_cons_active` lists the
+terminal `/dev/console` is (Linux 7.2.13's `show_cons_active` lists the
 enabled consoles with `/dev/console`'s last). An entry `tty1`, or
 `tty0`, which names the foreground VT and so tty1 here, means the VT is
 `/dev/console`; any other name means it is not. Both initramfs mount
@@ -736,7 +736,7 @@ on it is still read.
 The applet waits in that one `poll(2)` loop, with no timeout, asking
 `POLLIN` of every line and `POLLOUT` of every line with queued bytes. A
 canonical line is readable only once a whole record is queued or it hung
-up (Linux 7.2.12's n_tty reports input only up to its canonical head), so
+up (Linux 7.2.13's n_tty reports input only up to its canonical head), so
 the wait ends at the first line that completes a record, by newline or
 `^D`; a `POLLHUP` is read, so a hang-up is end of input as today rather
 than a dropped line. When both lines are readable at once, the serial
@@ -803,13 +803,13 @@ outcomes in every plan (INSTALLER.md "Storage choice"):
 - the keyboard-console probe of the running live system, through sysfs:
   some `/sys/class/vtconsole/vtcon*` whose `name` reads exactly
   `(M) frame buffer device` and a newline and whose `bind` reads `1` and
-  a newline (fbcon is bound to the VT; Linux 7.2.12's `vt.c` prints `(M)`
+  a newline (fbcon is bound to the VT; Linux 7.2.13's `vt.c` prints `(M)`
   for every driver `do_register_con_driver` registers, fbcon built in
   included, and `(S)` only for the boot console, such as `(S) dummy
   device`), and some
   `/sys/class/input/input*` whose `capabilities/key` bitmap sets
   `KEY_ENTER` (28) and `KEY_1` to `KEY_0` (2 to 11), the keys an entry
-  needs. That bitmap is Linux 7.2.12's `input_print_bitmap` on a 64-bit
+  needs. That bitmap is Linux 7.2.13's `input_print_bitmap` on a 64-bit
   kernel: one to twelve words (`KEY_MAX` is 767), each 1 to 16 lowercase
   hexadecimal digits without `0x` and, as `%lx` writes them, without a
   leading zero digit, separated by single spaces and ended by one
@@ -1005,7 +1005,7 @@ between the archive's header and trailer, zeroes that buffer, and adds
 the four seals before `kexec_file_load` takes the memfd and the
 unchanged command line. It writes the memfd through a second open of it,
 closed before the seals, because `kexec_file_load` refuses an initramfs
-open for writing (Linux 7.2.12 `kernel_read_file`'s `deny_write_access`),
+open for writing (Linux 7.2.13 `kernel_read_file`'s `deny_write_access`),
 which memfd_create's own descriptor does not count as; a test-only read
 lease, which the kernel refuses on the same write count, shows no writer
 left. The initramfs, and the copy with the archive, are bounded by
@@ -2606,7 +2606,7 @@ TPM-primary shape.
   selector initramfs built in (`INITRAMFS_SOURCE`) and a built-in
   command line that firmware cannot change (`CMDLINE_OVERRIDE`) and
   that names `noinitrd`. `CMDLINE_OVERRIDE` alone is not enough: in
-  Linux 7.2.12 `efi_load_initrd` (`efi-stub-helper.c` in
+  Linux 7.2.13 `efi_load_initrd` (`efi-stub-helper.c` in
   `drivers/firmware/efi/libstub`) loads an initrd offered through the
   `LINUX_EFI_INITRD_MEDIA_GUID` LoadFile2 device path whatever the
   command line says, and the kernel unpacks an external initramfs over

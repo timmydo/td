@@ -367,8 +367,8 @@ check and applies to the diagnostic fixture's phases; full-system
 installed boots retain their ordinary logging policy.
 
 This quiets routine kernel console output while retaining the kernel log
-buffer. The pinned Linux 7.2.12
-[printk sysctl](https://raw.githubusercontent.com/gregkh/linux/v7.2.12/kernel/printk/sysctl.c)
+buffer. The pinned Linux 7.2.13
+[printk sysctl](https://raw.githubusercontent.com/gregkh/linux/v7.2.13/kernel/printk/sysctl.c)
 accepts the first-field update; console priority filtering is described in
 the [kernel documentation](https://docs.kernel.org/admin-guide/sysctl/kernel.html#printk).
 A clocksource message had split an inventory JSON record despite its
@@ -377,7 +377,7 @@ routine writer; it does not grant atomic serial writes or repair damaged
 reports. Kernel faults or forced console output can still interrupt a
 report and fail the oracle. Level one retains emergency messages and
 allows the pinned kernel
-[console_verbose implementation](https://raw.githubusercontent.com/gregkh/linux/v7.2.12/kernel/printk/printk.c)
+[console_verbose implementation](https://raw.githubusercontent.com/gregkh/linux/v7.2.13/kernel/printk/printk.c)
 to raise verbosity on faults; level zero would suppress that recovery.
 Tool stdout/stderr and explicit fixture errors continue to reach the
 captured console.

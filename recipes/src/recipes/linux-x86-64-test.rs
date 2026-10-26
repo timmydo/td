@@ -10,7 +10,7 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 //      x86-64, type EXEC) — the EXEC assertion proves it was linked, so a stray
 //      relocatable `.o` (which would still be ELF64/x86-64 and carry the banner
 //      via init/version.o) cannot satisfy the check,
-//   2. vmlinux carries the `Linux version 7.2.12` banner (init/version.o's
+//   2. vmlinux carries the `Linux version 7.2.13` banner (init/version.o's
 //      linux_banner[], always obj-y) — proof the kernel actually compiled and
 //      linked, not just that some ELF exists,
 //   3. vmlinux embeds no `/gnu/store` bytes — the no-guix host-free leg (a
@@ -69,7 +69,7 @@ pub fn recipe() -> Recipe {
                 SH,
                 "-c",
                 &format!(
-                    "grep -q -a 'Linux version 7.2.12' '{vmlinux}' || {{ echo 'vmlinux is missing the Linux 7.2.12 banner' >&2; exit 1; }}"
+                    "grep -q -a 'Linux version 7.2.13' '{vmlinux}' || {{ echo 'vmlinux is missing the Linux 7.2.13 banner' >&2; exit 1; }}"
                 ),
             ],
         )
@@ -135,7 +135,7 @@ pub fn recipe() -> Recipe {
     });
     steps.push(Step::WriteFile {
         path: "{out}/result".into(),
-        content: "PASS: Linux 7.2.12, source-built in the Debian build root — vmlinux is a well-formed ELF64 x86-64 image carrying the Linux banner and built-in dm-crypt with generic/accelerated AES-XTS and the AF_ALG hash/skcipher interfaces, bzImage carries the x86 boot-setup header (0xAA55 + HdrS) and x86-64 PE headers, and initramfs.cpio is a newc cpio carrying the static td-sh, td-init and td-util userland\n".into(),
+        content: "PASS: Linux 7.2.13, source-built in the Debian build root — vmlinux is a well-formed ELF64 x86-64 image carrying the Linux banner and built-in dm-crypt with generic/accelerated AES-XTS and the AF_ALG hash/skcipher interfaces, bzImage carries the x86 boot-setup header (0xAA55 + HdrS) and x86-64 PE headers, and initramfs.cpio is a newc cpio carrying the static td-sh, td-init and td-util userland\n".into(),
         exec: false,
     });
     steps.push(Step::Require {
@@ -149,7 +149,7 @@ pub fn recipe() -> Recipe {
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
-echo ">> recipe-check linux-x86-64-test: build-plan --auto builds linux-x86-64 (Linux 7.2.12 vmlinux + bzImage + td-sh initramfs, source-built in the Debian build root) and asserts a well-formed ELF64 x86-64 vmlinux with the Linux banner and built-in dm-crypt with generic/accelerated AES-XTS and the AF_ALG hash/skcipher interfaces, a bzImage carrying x86 boot-setup and EFI application headers, and a newc initramfs.cpio carrying the static td-sh, td-init and td-util userland"
+echo ">> recipe-check linux-x86-64-test: build-plan --auto builds linux-x86-64 (Linux 7.2.13 vmlinux + bzImage + td-sh initramfs, source-built in the Debian build root) and asserts a well-formed ELF64 x86-64 vmlinux with the Linux banner and built-in dm-crypt with generic/accelerated AES-XTS and the AF_ALG hash/skcipher interfaces, a bzImage carrying x86 boot-setup and EFI application headers, and a newc initramfs.cpio carrying the static td-sh, td-init and td-util userland"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run linux-x86-64-test 1
 "#,

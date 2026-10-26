@@ -901,7 +901,7 @@ when its properties include `INPUT_PROP_POINTER` and exclude
 `INPUT_PROP_DIRECT`, and its keys include `BTN_TOOL_FINGER` and exclude
 `BTN_TOOL_PEN`, udev's `finger_but_no_pen`.
 
-That is what Linux 7.2.12's touchpad drivers set and what neither QEMU tablet
+That is what Linux 7.2.13's touchpad drivers set and what neither QEMU tablet
 does. Synaptics, elantech, byd and synaptics_usb set POINTER and the finger
 tool outright. `input_mt_init_slots` with `INPUT_MT_POINTER` sets both, and
 alps (its multitouch protocols), focaltech, bcm5974, the Magic Trackpad

@@ -14,7 +14,7 @@
 //!
 //! ## The format, as the pinned kernel's own producer writes it
 //!
-//! Checked against `linux-7.2.12` — `usr/gen_init_cpio.c`, which is the program
+//! Checked against `linux-7.2.13` — `usr/gen_init_cpio.c`, which is the program
 //! the recipes actually run, and `init/initramfs.c`, which is what parses the
 //! result. A header is 110 bytes: the six-byte magic, then THIRTEEN fields of
 //! exactly eight uppercase hex digits each, in this order

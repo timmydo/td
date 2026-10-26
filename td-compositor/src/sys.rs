@@ -41,7 +41,7 @@ const EVIOCGABS_X: usize = 0x8018_4540;
 const EVIOCGABS_Y: usize = 0x8018_4541;
 const EVIOCSCLOCKID: usize = 0x4004_45a0;
 
-/// The DRM/KMS requests this crate may issue, from Linux 7.2.12's
+/// The DRM/KMS requests this crate may issue, from Linux 7.2.13's
 /// `include/uapi/drm/drm.h`. `_IOC` packs the argument's SIZE into bits 16..30,
 /// so each number states the layout of the struct it is used with — the
 /// `EVIOCGABS` lesson one driver over, and `the_drm_requests_encode_the_structs_they_carry`
@@ -92,7 +92,7 @@ const DRM_IOCTL_MODE_GETCONNECTOR: usize = 0xc050_64a7;
 /// mapping of its descriptor, and refusing that forever is the one way td could
 /// paint itself out of hardware rendering.
 ///
-/// Sizes are the kernel's own structs at the 7.2.12 pin — `drm_mode_create_dumb`
+/// Sizes are the kernel's own structs at the 7.2.13 pin — `drm_mode_create_dumb`
 /// is 32 bytes (six `__u32` then a `__u64`), `drm_mode_map_dumb` 16 and
 /// `drm_mode_destroy_dumb` 4 — and `the_drm_requests_encode_the_structs_they_carry`
 /// checks each number against the Rust type actually passed to it, which is
@@ -1987,7 +1987,7 @@ mod tests {
         assert_eq!(argument_size(DRM_IOCTL_SET_MASTER), 0);
     }
 
-    /// The kernel's own byte counts for Linux 7.2.12 on x86-64, written out
+    /// The kernel's own byte counts for Linux 7.2.13 on x86-64, written out
     /// rather than derived from the request numbers.
     ///
     /// Deriving them would make the test above tautological: both sides would

@@ -3076,7 +3076,7 @@ desktop it opens the menu), and the compositor and authority are the
 ones from before the suspend: the session was locked when the first
 post-wake input was routed, in the same generation. Escape then ends
 the worker. The lock surface itself cannot be seen: the wake resets the
-virtio-gpu card and Linux 7.2.12's driver has no freeze or restore, so
+virtio-gpu card and Linux 7.2.13's driver has no freeze or restore, so
 the card stays dead and QEMU shows its inactive output, which the host
 requires. The suspend is the boot's last step, since the display does
 not return.

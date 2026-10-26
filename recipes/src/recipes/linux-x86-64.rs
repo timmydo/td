@@ -31,7 +31,7 @@ pub const FIRMWARE: &[(&str, &str)] = &[
     ),
 ];
 
-// linux-x86-64 (Linux 7.2.12): the latest STABLE mainline kernel (not a
+// linux-x86-64 (Linux 7.2.13): the latest STABLE mainline kernel (not a
 // longterm/LTS line), built in the Debian build root (AGENTS.md "Debian build
 // root"): Debian's gcc 14.2 as CC and HOSTCC, its binutils, make, flex, bison,
 // bc, perl, libelf and gzip, all at /usr/bin. Nothing of the root ships: vmlinux
@@ -240,10 +240,10 @@ pub fn recipe() -> Recipe {
     //    bzImage+initramfs. Only CONFIG_KEXEC_FILE (the file-based syscall) + the
     //    KEXEC_CORE it selects are used; CONFIG_KEXEC — the legacy segment-based
     //    kexec_load(2) — is pinned OFF and guarded, since nothing here uses it and it
-    //    would only widen the syscall surface (in 7.2.12 KEXEC and KEXEC_FILE are
+    //    would only widen the syscall surface (in 7.2.13 KEXEC and KEXEC_FILE are
     //    independent siblings — KEXEC_FILE does NOT depend on KEXEC — so dropping
     //    KEXEC leaves KEXEC_FILE intact, and reboot(LINUX_REBOOT_CMD_KEXEC) runs off
-    //    KEXEC_CORE). In 7.2.12 KEXEC_FILE `select`s CRYPTO_LIB_SHA256 + KEXEC_CORE on
+    //    KEXEC_CORE). In 7.2.13 KEXEC_FILE `select`s CRYPTO_LIB_SHA256 + KEXEC_CORE on
     //    its own (verified against kernel/Kconfig.kexec), so NO CRYPTO menuconfig is
     //    needed for kexec itself; dm-crypt below selects CRYPTO separately.
     //    CONFIG_RELOCATABLE=y is REQUIRED: the x86
@@ -261,7 +261,7 @@ pub fn recipe() -> Recipe {
     //    mount an EROFS file out of the btrfs. CONFIG_BTRFS_FS=y self-selects its whole
     //    dependency set (CRC32, CRYPTO_LIB_SHA256/BLAKE2B, ZLIB/LZO/ZSTD, RAID6_PQ,
     //    XOR_BLOCKS, XXHASH, FS_IOMAP — verified against fs/btrfs/Kconfig), so do NOT
-    //    pin those individually; note CONFIG_LIBCRC32C does NOT exist in 7.2.12 (btrfs
+    //    pin those individually; note CONFIG_LIBCRC32C does NOT exist in 7.2.13 (btrfs
     //    uses the CRC32 lib, not CRYPTO_CRC32C) — a guard on it would red the build
     //    permanently. BTRFS_FS sits under `if BLOCK` (BLOCK already =y) and
     //    BLK_DEV_LOOP under `menuconfig BLK_DEV` (already =y), so no new menuconfig
@@ -1456,7 +1456,7 @@ pub fn recipe() -> Recipe {
     steps.push(Step::run("{out}", &[SH, "-c", &initramfs_check]).env("PATH", PATH));
 
     // td-sh, td-init and td-util are initramfs contents; td-util also packs it.
-    Recipe::mesboot("linux-x86-64", "7.2.12")
+    Recipe::mesboot("linux-x86-64", "7.2.13")
         .source_input("linux-kernel-source")
         .build_root()
         .native_inputs(&["td-sh", "td-init", "td-util"])

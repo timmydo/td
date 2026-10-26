@@ -1752,7 +1752,7 @@ and the oracle that shows it.
      the chord does only on a locked session: the session was locked
      when the first post-wake input was routed, in the same generation.
      After the display's first change following the wake it shows only
-     lock pixels or QEMU's inactive output, which it must show: Linux 7.2.12's virtio-gpu has no freeze or restore, so
+     lock pixels or QEMU's inactive output, which it must show: Linux 7.2.13's virtio-gpu has no freeze or restore, so
      the card the wake resets stays dead and the lock surface itself is
      not seen; the unavailable state, with
      its screen text and the enforced SSH form, for a wrong-mode,

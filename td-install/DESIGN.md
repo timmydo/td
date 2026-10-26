@@ -1579,7 +1579,7 @@ optimisation, not a prerequisite.
 `BOOTX64.EFI` is an **EFI-stub kernel**: `CONFIG_EFI` + `CONFIG_EFI_STUB`, so
 the kernel image is itself a PE executable the firmware can load, and no
 third-party bootloader exists on the path. `linux-x86-64.rs` enables both,
-with their ACPI prerequisite confirmed in Linux 7.2.12's `arch/x86/Kconfig`.
+with their ACPI prerequisite confirmed in Linux 7.2.13's `arch/x86/Kconfig`.
 The deprecated handover entry points and mixed 32-bit firmware mode are
 explicitly disabled, as is the EFI variable filesystem. EFI runtime-map
 support follows KEXEC_CORE; other symbols under the EFI menu retain
@@ -2257,7 +2257,7 @@ defence either way today (§9: no Secure Boot, no TPM, no encryption), so
 The mechanism that makes a per-run key workable is verified: Linux accepts
 **concatenated cpio archives** for initramfs, so a harness can append a
 one-file archive carrying that run's public key without any recipe being
-parameterized. Checked against the pinned tree, `linux-7.2.12`,
+parameterized. Checked against the pinned tree, `linux-7.2.13`,
 `init/initramfs.c` — `unpack_to_rootfs`'s driver loop restarts the state
 machine at `Start` on each `070701` magic and skips NUL padding between
 archives, and the compressed path does the same in `flush_buffer`. Two

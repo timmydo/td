@@ -1324,7 +1324,7 @@ mod keyboard_console {
     /// 16); a class over its bound fails the probe.
     const MAX_VTCONSOLES: usize = 64;
     const MAX_INPUT_ENTRIES: usize = 4096;
-    /// fbcon's `name`, as Linux 7.2.12's `vt.c` prints it. `(M)` marks a
+    /// fbcon's `name`, as Linux 7.2.13's `vt.c` prints it. `(M)` marks a
     /// driver registered through `do_register_con_driver`, as fbcon always
     /// is, built in or not; only the boot console prints `(S)`.
     const FRAMEBUFFER: &[u8] = b"(M) frame buffer device\n";
@@ -1375,7 +1375,7 @@ mod keyboard_console {
             && attribute(&console.join("bind")).is_some_and(|bind| bind == BOUND)
     }
 
-    /// The word holding bits 0 to 63 of a bitmap as Linux 7.2.12's
+    /// The word holding bits 0 to 63 of a bitmap as Linux 7.2.13's
     /// `input_print_bitmap` writes it on a 64-bit kernel, or nothing when
     /// `text` is not exactly that: one to twelve `%lx` words, most
     /// significant first and leading zero words omitted, separated by

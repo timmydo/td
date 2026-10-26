@@ -1910,7 +1910,7 @@ remain empty strings. Serial prefers the disk's own `serial`, then
 `device/serial`; WWID likewise prefers `wwid` then `device/wwid`, and model
 reads `device/model`. Serial and WWID remain distinct even when a driver
 provides only one. For identification reads only, ENXIO means absent VPD
-data under the pinned Linux 7.2.12 SCSI interface and produces null (or the
+data under the pinned Linux 7.2.13 SCSI interface and produces null (or the
 fallback attribute). Other read errors still refuse the observation. These
 descriptions and the
 kernel identifiers do not authenticate hardware or survive every reboot.

@@ -1,5 +1,5 @@
 //! `gen_init_cpio`: the kernel's initramfs packer (`usr/gen_init_cpio.c` in
-//! the pinned linux-7.2.12), so recipes pack an initramfs with a td-built
+//! the pinned linux-7.2.13), so recipes pack an initramfs with a td-built
 //! program instead of one the kernel build compiles and exports. It reads the
 //! same spec lines and writes the same newc bytes: inodes count from 721, a
 //! file's hard links share one inode and only the last carries the data,
@@ -479,7 +479,7 @@ mod tests {
         assert!(run(&["-a".into(), "4".into(), "x".into()]).is_err());
     }
 
-    /// `usr/gen_init_cpio -t 1 [-c]` of linux-7.2.12, compiled from the pinned
+    /// `usr/gen_init_cpio -t 1 [-c]` of linux-7.2.13, compiled from the pinned
     /// source, on the spec below; hex, with the zero block padding after the
     /// trailer trimmed.
     const GOLDEN_PLAIN: &[&str] = &[
