@@ -198,10 +198,10 @@ Each face centres a glyph's advance across its text cell, and the bar's test
 holds Unifont's digits centred in theirs, so equal padding centres the number,
 which the block of ink around an active cell would show if it did not.
 
-After the workspaces, while the configured application's card has asked for a
-start that has no window yet, the strip shows that LAUNCH in a cell of its
-own, inverted as the active workspace is, before the status line: the
-uppercase name, a phase and the time since the request, as `FIREFOX STARTING
+After the workspaces, while an application's card entry has asked for a start
+that has no window yet, the strip shows that LAUNCH in a cell of its own,
+inverted as the active workspace is, before the status line: the uppercase
+display name, a phase and the time since the request, as `FIREFOX STARTING
 0:04` or `FIREFOX LOADING 2:05`, then `FIREFOX FAILED TO START`, `FIREFOX
 EXITED` or `FIREFOX NOT STARTED`. The phase is only what root's `0f` answer
 says of the unit (td-authd/DESIGN.md): `STARTING` until the request is sent
@@ -216,13 +216,17 @@ progress; that belongs to the program that installs. A failure stays thirty
 seconds, unless a later read sees the unit up again, as a supervised restart
 does; the cell goes when a matching window maps, which the paint that shows
 the window also clears, and after thirty minutes without one. The authority
-worker asks `0f` on each turn of its loop only while a launch is shown. A card
-activation while one is under way asks nothing, so a second press cannot send
-a second start; one after a failure asks again. The cell ends on the
-observer's candidates, toplevels whose own app id matches, so a client
-claiming that id can end it early, as it can already be what the card
-activates; no client can make the cell claim a phase, which only root's answer
-sets. Screenshots omit the cell with the other moment's furniture.
+worker asks `0f` on each turn of its loop only while a launch is shown. An
+activation of that application while its launch is under way asks nothing, so
+a second press cannot send a second start; one after a failure asks again; one
+of another application starts that one's launch, which takes the cell, even
+while the queue still holds the first's start: the second then shows `NOT
+STARTED` and the first, which root may still start, is no longer watched. The
+cell ends on a mapped toplevel whose own app id is the launched application's
+launcher table row's, so a client claiming that id can end it early, as it can
+already be what the card activates; no client can make the cell claim a phase,
+which only root's answer sets. Screenshots omit the cell with the other
+moment's furniture.
 
 The workspaces are painted from the LAYOUT on every frame rather than folded
 into the status line, and that is what makes the mark follow a switch at once:
@@ -2800,78 +2804,102 @@ shorter than the supervisor's 30-second readiness deadline, so a stalled
 compositor makes the client exit and permits `restart=always` to retry.
 
 The launcher is a compositor-owned overlay, so opening it never depends on an
-already-running client. Its registry has a terminal entry that starts a
-`td-term`, one application entry for the admitted application the image names
-with `--launcher-application` (otherwise an input-monitor entry that starts
-`td-ui-demo`), in authority mode that application's update entry and seven
-desktop-program entries, and an explicit close entry. The update entry,
-labelled `UPDATE` and the name, issues private request 0e, which has root
-start the unit that checks the application's Flathub cache
-(APPLICATIONS.md §W.9). The desktop programs are system tools the image
-ships beside the terminal: Task Manager, Text Editor, Photos, Code
-Review, Disk Usage, Coding Agent and Software issue fixed private
-requests 07, 08, 09, 0a, 0b, 0c and 22, and
+already-running client. In authority mode its entries are table-driven
+(td-software/DESIGN.md §5): fixed entries first, a terminal entry that starts a
+`td-term`, Software, the desktop programs and an explicit close entry, and
+after them each application of the image's launcher table,
+`/etc/td-launcher.tsv` (APPLICATIONS.md §A.0), that root's installed set says
+is installed, sorted by display name and labelled with it uppercased, its
+search text the display name, the row's terms and the registry name. The
+desktop programs are system tools the image ships beside the terminal:
+Software, Task Manager, Text Editor, Photos, Code Review, Disk Usage and
+Coding Agent issue fixed private requests 22, 07, 08, 09, 0a, 0b and 0c, and
 run with the human credentials described in td-authd/DESIGN.md (the task
-manager with its system PID view). No request carries a path; Code
-Review's fixed `--choose-repo`, added by the authority, has td-review ask
-which repository, for the reason td-authd/DESIGN.md gives. Direct
-development mode hides those entries and refuses their requests; there the
-programs run directly on the user's Wayland session. Mail and news carry
-launcher declarations of their own, but the image names Firefox alone, so the
-card does not show them; showing them is the relaunch work APPLICATIONS.md §W.7
-defers, and it grows the card. The application entry's uppercase label and
-lowercase search term are derived from the exact bounded application name; the
-compositor does not carry a fixture- or Firefox-specific card. The terminal is
-FIRST, so it is what an unfiltered Enter opens. The card reserves space
-for eleven entries; direct mode shows three. The update entry stays
-beside Software until td-software/DESIGN.md §6's cutover removes it and
-`0e`.
-`registry_entries_are_searchable_and_fit_the_card` refuses overflow. Each entry
-owns a label, lowercase search terms, and a typed launch request. The pure
-launcher model stores a bounded 64-byte ASCII filter, requires every
-whitespace-separated term to occur in an entry's search text, and resets
-selection to the first match after an edit. An empty result is explicit and
-Enter leaves it open; Backspace can recover it. Opening clears the previous
-filter. The pointer reaches the same model: while the overlay is up the
-adapter withholds every press from the runtime's report, as it always has,
-and asks the runtime what a LEFT one meant on the card; other buttons ask
-nothing. The press is the device's own transition in that report, never the
-seat's, since a withheld press never reaches the forwarded set and another
-device's release could otherwise read as one. A press in a row's highlight
-area is `Choose(row)`, a position in the FILTERED list that selects and
-activates it exactly as Enter would; a press off the card is Close; the title,
-the filter line and the air between rows ask nothing. The paint and the hit
-test share one card and row geometry, so a click lands on the row it was drawn
-over. A row is on the card only when its whole label fits, so on a short
-output a row the card cut off is not drawn and the pointer cannot choose it,
-even where a sliver of its highlight area would remain; the keyboard's
-selection still walks every match. While the overlay is open, all
-non-modifier keys are consumed by the compositor, and modified keys that are
-not launcher commands do not become text. Activation with a match closes the
-overlay before native process creation or application surface activation;
-activation with no matches keeps both the overlay and input capture
-active. The input adapter updates its capture state
-from the model's post-action visibility instead of guessing which action opened
-or closed it. It never enables capture before a successful open. An overlay
-action is transactional with its framebuffer paint: a failed paint restores the
-complete prior launcher model, so another input device cannot observe model
-state with stale capture. The compositor requires an explicit absolute
-`--terminal-client` and exactly one UI mode. A standalone compositor supplies
-an absolute `--launcher-client` for direct `td-ui-demo`; the image instead
-supplies a `--launcher-application` with its paired app-id observer and no
-launcher client or application-runtime path. An application name must use the
-image grammar. The supervised service owns the application instance,
-started on request or under the oracle's token (APPLICATIONS.md §W.9):
-the application card activates a retained matching mapped surface,
-switching workspaces and leaving an unrelated fullscreen view if necessary. It
-never starts another process: with no mapped surface it asks the authority
-(request 0d) to have root start the application's supervised unit, which
+manager with its system PID view). No request carries a path; Code Review's
+fixed `--choose-repo`, added by the authority, has td-review ask which
+repository, for the reason td-authd/DESIGN.md gives. Until
+td-software/DESIGN.md §6's cutover removes it and `0e`, an update entry
+labelled `UPDATE` and the display name follows the application the image
+names with `--update-application` once it is installed, and issues private
+request 0e, which has root start the unit that checks that application's
+Flathub cache (APPLICATIONS.md §W.9). A filter that matches no other entry but
+an application root says is not installed shows one row, `INSTALL` and its
+uppercase display name, the first such by display name, its search text the
+application's with `install`, which asks root for td-software opened at that
+application (`22` and its registry name); the update entry shows only while
+its application is installed, so before it is that application's Install row
+answers its name. The compositor reports a refused Install request only on
+its standard error. Direct development mode shows a
+terminal entry, an input-monitor entry that starts `td-ui-demo`, and close; it
+hides the table and the desktop programs and refuses their requests, and
+there the programs run directly on the user's Wayland session. The terminal is
+FIRST, so it is what an unfiltered Enter opens. The card shows a window of at
+most eleven rows, which a full card holds and
+`the_window_fits_and_every_entry_is_reachable` states, over every match: the
+window follows the selection, so the keyboard reaches every entry, as the
+filter does; the same test holds a table of 256 applications reachable by
+selection, by a press where its row is shown, and by its name. Each entry
+owns a label, lowercase search terms, and a typed launch request; a table
+application's request names its position in the card's order, which the
+runtime turns back into its registry name. The pure launcher model stores a
+bounded 64-byte ASCII filter, requires every whitespace-separated term to
+occur in an entry's search text, and resets selection to the first match
+after an edit. An empty result is explicit and Enter leaves it open;
+Backspace can recover it. Opening clears the previous filter. The pointer
+reaches the same model: while the overlay is up the adapter withholds every
+press from the runtime's report, as it always has, and asks the runtime what a
+LEFT one meant on the card; other buttons ask nothing. The press is the
+device's own transition in that report, never the seat's, since a withheld
+press never reaches the forwarded set and another device's release could
+otherwise read as one. A press in a row's highlight area is `Choose(row)`, a
+position in the window of the FILTERED list that selects and activates it
+exactly as Enter would; a press off the card is Close; the title, the filter
+line and the air between rows ask nothing. The paint and the hit test share
+one card and row geometry and one window, so a click lands on the row it was
+drawn over. A row is on the card only when its whole label fits, so on a
+short output a row the card cut off is not drawn and the pointer cannot choose
+it, even where a sliver of its highlight area would remain; the window moves
+so the selection is always a row that is drawn. While the overlay is open,
+all non-modifier keys are consumed by the compositor, and modified keys that
+are not launcher commands do not become text. Activation with a match closes
+the overlay before native process creation or application surface
+activation; activation with no matches keeps both the overlay and input
+capture active. The input adapter updates its capture state from the model's
+post-action visibility instead of guessing which action opened or closed it.
+It never enables capture before a successful open. An overlay action is
+transactional with its framebuffer paint: a failed paint restores the complete
+prior launcher model, so another input device cannot observe model state with
+stale capture. In direct mode the compositor requires an explicit absolute
+`--terminal-client` and an absolute `--launcher-client` for `td-ui-demo`; the
+authority's card takes no client and reads the launcher table instead. The
+table is the builder's and immutable, read once at startup in the builder's
+bounds (1 MiB, 256 rows of four fields, display names of at most 128 bytes, at
+most 32 terms of 64 bytes, app ids of 1 to 128 ASCII letters, digits, `.`,
+`_` and `-`, no name or app id twice); a missing or malformed table ends the
+start, as a malformed bus application policy does, and a row whose name is
+outside the registry grammar every request names applications in is left off
+the card, since no request could start it. Root's installed set
+(td-authd/DESIGN.md, request `23`) is asked when the authority connects, each
+time the card opens and when an application operation has started, and again
+each second while root says a row may change or could not read its registry;
+the sampler's one-second tick brings a new answer to the card. Before the
+first answer no table application is shown; a live boot's answer shows none
+and offers no Install row.
+An answer naming anything outside the table ends the generation. The
+supervised service owns the application instance, started on request or under
+the oracle's token (APPLICATIONS.md §W.9): an application's entry activates a
+mapped toplevel whose own app id is its table row's, switching workspaces and
+leaving an unrelated fullscreen view if necessary. Any client may claim an app
+id, so this is a window to raise, not a proof of who drew it. It never starts
+another process: with no mapped surface it asks the authority (request `0d`
+and the name) to have root start the application's supervised unit, which
 td-svc answers as already running if it is, and reports a refusal. The bar
-shows that launch until the window maps or the start fails (the strip's
-LAUNCH cell above), and the card asks once per launch. The image has no
-`/bin/<application>` route (APPLICATIONS.md §A.0), though no
-single-instance lock has landed. Direct `td-ui-demo` and `td-term` requests
-select their program and take the same two run flags. The compositor derives a
+shows that launch until a window with its app id maps or the start fails (the
+strip's LAUNCH cell above), and the card asks once per launch of an
+application; a launch of another application takes the cell. The image has no
+`/bin/<application>` route (APPLICATIONS.md §A.0), though no single-instance
+lock has landed. Direct `td-ui-demo` and `td-term` requests select their
+program and take the same two run flags. The compositor derives a
 unique readiness-socket name beside the socket and passes both paths as literal
 argv values without a shell. It reaps exited native children before each launch
 and retains at most 16 live launched clients. A native launch or reap failure
@@ -2887,8 +2915,8 @@ compositor exits while a launched child is still live, its readiness socket may
 remain until logout clears the runtime-directory tmpfs. Names carry the
 compositor pid, so that residual path cannot block a later compositor.
 
-The application-window observer and configured launcher application require
-each other. The observer is configured by the paired
+The application-window observer is an oracle's readiness check, apart from the
+card: it is optional in either mode, and configured by the paired
 `--application-ready-socket`, `--application-app-id`, and
 `--application-content-rgb-a`/`--application-content-rgb-b` arguments. Its
 socket path must be an absolute
@@ -5662,12 +5690,13 @@ letter:
   forced check, which install and update both are;
 - `remove NAME` and `delete-data NAME`: have root remove its payload,
   keeping its data, or delete the data of a removed application;
-- `launch NAME`: what the card's application entry does, for the
-  application the image configured with `--launcher-application` alone:
-  raise its mapped window, or ask root with `0d NAME` to start its unit
-  and show the launch on the bar. Any other name is refused as having no
-  launcher entry; starts by name are td-software/DESIGN.md §6's third
-  increment. Behind the lock surface, where the card cannot be pressed,
+- `launch NAME`: what the card's application entry does, for any
+  application of the launcher table, installed or not: raise its mapped
+  window, or ask root with `0d NAME` to start its unit and show the
+  launch on the bar. A name outside the table is refused as having no
+  launcher entry. Until td-software/DESIGN.md §6's cutover, an
+  application not installed still installs on demand when its unit
+  starts. Behind the lock surface, where the card cannot be pressed,
   it is an `error`. Its `ok` is the press handled: a window raised, `0d`
   queued for the worker, or a launch already pending joined; an `0d`
   the worker's queue could not take is an `unavailable`.
@@ -5728,7 +5757,7 @@ that wants to know when something changed asks again. It does not close or
 kill windows: a control channel that could remove a client's window would be
 an authority over other programs rather than over the arrangement of them.
 The one way it starts a program is `launch`, above, which is the card's own
-activation of the configured application.
+activation of a launcher table application.
 
 It does not let a caller name a window by anything the CALLER chose. The two
 names it accepts are the compositor's own handle and, for matching, the id the
@@ -5740,19 +5769,20 @@ in the report answers today.
 ## Private terminal authority client prerequisite
 
 `--terminal-authority stdin` selects the root-created private channel in place
-of `--terminal-client PATH`. Exactly one is required. Authority mode requires
-the supervised application card; that card activates its existing Wayland
+of `--terminal-client PATH`. Exactly one is required. Authority mode's card is
+the launcher table's; an application's entry activates its existing Wayland
 surface and never invokes a program. When it finds no surface it asks the
 authority, with request `0d` and the application's name, to have root start
-the application's supervised unit, named after it, and an "UPDATE NAME" row
-shown beside it in authority mode asks with `0e` for the unit that checks the
-application's Flathub cache (APPLICATIONS.md §W.9); each is answered at once
-and leaves no handle. While the bar shows a launch from the card, the worker
-asks `0f` with the name the launch started for the unit's state on each turn
-of its loop, at most every 250 ms, and root starts at most one status read a
-second whatever the rate. The image selects this client through the paired
-service at UID 993. The direct launcher remains available for host
-development.
+the application's supervised unit, named after it, and the "UPDATE NAME" row
+asks with `0e` for the unit that checks Firefox's Flathub cache
+(APPLICATIONS.md §W.9); each is answered at once and leaves no handle. The
+card's Install row asks with `22` and the name for td-software opened at that
+application, and `23` for root's installed set. While the bar shows a launch
+from the card, the worker asks `0f` with the name the launch started for the
+unit's state on each turn of its loop, at most every 250 ms, and root starts
+at most one status read a second whatever the rate. The image selects this
+client through the paired service at UID 993. The direct launcher remains
+available for host development.
 
 Before opening the framebuffer or starting any worker, the client verifies one
 thread, identical service uid/gid columns in 1..=999, and only inherited fd
@@ -5809,9 +5839,10 @@ channel to another thread retains the pinned process; a forked child remains
 a different sender and is refused. This is tested, not inferred from numeric
 PID equality.
 
-The application name is consumed by Runtime::set_launcher_application for the
-scene card. LiveInputTarget handles that card's activation before calling the
-terminal backend; the backend's non-terminal refusal guards accidental use.
+The launcher table is consumed by Runtime::set_launcher_table for the scene
+card. LiveInputTarget handles a table application's activation before calling
+the terminal backend; the backend's non-terminal refusal guards accidental
+use.
 Direct backend construction only validates options and allocates empty state.
 
 The target-recipe feature selects paths generated only in the target build

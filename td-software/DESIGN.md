@@ -231,7 +231,8 @@ whose update fetches as before.
 
 ## 5. A launcher that follows installs
 
-**Today.** The card has a terminal entry, one image-named application
+**Before this design** (as built since, §6 increment 3). The card had
+a terminal entry, one image-named application
 (`--launcher-application`), that application's UPDATE row, six
 desktop-program entries and close. That is exactly the ten entries the
 card reserves, and `registry_entries_are_searchable_and_fit_the_card`
@@ -389,8 +390,32 @@ can be installed at every commit.
    at most one start per unit and 16 in all in flight; the image names
    every application's unit after it, which a recipe test holds. `0e`
    stays name-free, Firefox's update unit, until the cutover removes
-   it, so §3's generalization covers `0d` alone. The card still starts
-   only its configured application, now by name.
+   it, so §3's generalization covers `0d` alone.
+
+   *As built (the card):* the compositor reads `/etc/td-launcher.tsv`
+   at startup, before it connects to root or opens a device, a missing
+   or malformed table ending the start, and asks
+   `23` when it connects, each time the card opens and when an
+   operation has started, then each second while a row may change
+   (td-compositor/DESIGN.md, the launcher). The card's fixed entries
+   come first in this section's order; installed applications follow
+   by display name, a window of at most eleven rows scrolling with the
+   selection over all of them, held for a table of 256 by
+   `the_window_fits_and_every_entry_is_reachable`. A table
+   application's entry raises a mapped toplevel with its row's app id
+   or starts its unit with `0d NAME`; the bar's launch is per
+   application, a launch of another taking its cell. A query matching
+   nothing else but an application root says is not installed shows
+   one row, `INSTALL` and its uppercase display name, which sends `22
+   NAME`; the UPDATE row shows only while its application is installed,
+   so a query for an uninstalled Firefox finds its Install row. Control
+   `launch NAME` takes any table name, installed or not; until the
+   cutover a launch of one not installed still installs on demand. The
+   image passes `--update-application firefox` in place of
+   `--launcher-application`, keeping the UPDATE row beside an installed
+   Firefox until step 4; the Firefox oracle's readiness observer flags stand
+   apart from the card. Before root's first answer the card shows no
+   table application.
 4. **Cutover, in one landing.**
    - td-jail stops fetching on `absent` and stops starting the check
      beside a launch (`check_beside`). td-app's 24-hour throttle and

@@ -1418,3 +1418,18 @@ fn a_second_start_of_a_unit_in_flight_joins_it() {
         child.wait().unwrap();
     }
 }
+
+/// Switching back to an application whose start is still in flight keeps
+/// it asked: once that client ends, it reads starting, not unknown, until
+/// the first read.
+#[test]
+fn a_start_in_flight_stays_asked_across_a_switch() {
+    let mut probe = UnitProbe::new(running);
+    probe.restart("firefox");
+    probe.answer("mail", false);
+    assert!(!probe.asked);
+    probe.began = Some(Instant::now());
+    assert_eq!(probe.answer("firefox", true), UnitState::Starting);
+    assert!(probe.asked);
+    assert_eq!(probe.answer("firefox", false), UnitState::Starting);
+}

@@ -85,6 +85,7 @@ mod help;
 mod input;
 mod keyboard;
 mod launcher;
+mod launcher_table;
 mod layout;
 mod output;
 mod pointer;
@@ -130,17 +131,17 @@ fn usage() -> String {
     "usage: td-compositor run (--card PATH [--framebuffer PATH] | --framebuffer PATH) \
      --input DIR --socket PATH \
      --portal-socket PATH [--control-socket PATH] \
-     (--launcher-client PATH | --launcher-application NAME \
-     --application-ready-socket PATH --application-app-id ID \
-     --application-content-rgb-a RGB --application-content-rgb-b RGB) \
-     (--terminal-client PATH | --terminal-authority stdin) | \
+     (--launcher-client PATH --terminal-client PATH | \
+     --terminal-authority stdin [--update-application NAME]) \
+     [--application-ready-socket PATH --application-app-id ID \
+     --application-content-rgb-a RGB --application-content-rgb-b RGB] | \
      td-compositor headless --session-dir NEW_ABSOLUTE_PATH --width N --height N \
      [--input-control enabled] [--capture-control enabled] [--clipboard-control enabled] | \
      td-compositor probe-terminal-authority | \
      td-compositor probe SOCKET | \
      td-compositor probe-application SOCKET ID RGB_A RGB_B [--quiet] | \
      td-compositor selftest\n\
-     --terminal-authority requires --launcher-application. \
+     --terminal-authority's card reads the image's launcher table. \
      --framebuffer beside --card is driven only when the card does not exist."
         .into()
 }
@@ -256,7 +257,8 @@ struct RunOptions {
     socket: PathBuf,
     portal_socket: PathBuf,
     launcher_client: Option<PathBuf>,
-    launcher_application: Option<String>,
+    /// The table application whose update row the authority's card shows.
+    update_application: Option<String>,
     terminal_client: Option<PathBuf>,
     terminal_authority: bool,
     /// Absent by DEFAULT, and absent means there is no control socket to
@@ -276,7 +278,7 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
     let mut socket = None;
     let mut portal_socket = None;
     let mut launcher_client = None;
-    let mut launcher_application = None;
+    let mut update_application = None;
     let mut terminal_client = None;
     let mut terminal_authority = false;
     let mut control_socket = None;
@@ -303,8 +305,8 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
             "--launcher-client" if launcher_client.is_none() => {
                 launcher_client = Some(PathBuf::from(value))
             }
-            "--launcher-application" if launcher_application.is_none() => {
-                launcher_application = Some(value.clone())
+            "--update-application" if update_application.is_none() => {
+                update_application = Some(value.clone())
             }
             "--terminal-client" if terminal_client.is_none() => {
                 terminal_client = Some(PathBuf::from(value))
@@ -336,7 +338,7 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
             | "--socket"
             | "--portal-socket"
             | "--launcher-client"
-            | "--launcher-application"
+            | "--update-application"
             | "--terminal-client"
             | "--terminal-authority"
             | "--control-socket"
@@ -358,11 +360,20 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
     if terminal_client.is_some() == terminal_authority {
         return Err("exactly one --terminal-client or --terminal-authority is required".into());
     }
-    if terminal_authority && launcher_application.is_none() {
-        return Err("the authority launcher requires a supervised application card".into());
+    if launcher_client.is_some() == terminal_authority {
+        return Err(
+            "--launcher-client is the direct launcher's; the authority's card reads the launcher table"
+                .into(),
+        );
     }
-    if launcher_client.is_some() == launcher_application.is_some() {
-        return Err("exactly one --launcher-client or --launcher-application is required".into());
+    if update_application.is_some() && !terminal_authority {
+        return Err("--update-application requires --terminal-authority".into());
+    }
+    if update_application
+        .as_deref()
+        .is_some_and(|name| !authority::consent::application_name(name))
+    {
+        return Err("--update-application is outside the registry grammar".into());
     }
     if application_ready_socket.is_some() != application_app_id.is_some()
         || application_ready_socket.is_some() != application_content_rgb_a.is_some()
@@ -372,17 +383,6 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
             "--application-ready-socket, --application-app-id, and both \
              --application-content-rgb arguments must be supplied together"
                 .into(),
-        );
-    }
-    if launcher_application
-        .as_deref()
-        .is_some_and(|name| !authority::consent::application_name(name))
-    {
-        return Err("--launcher-application is outside the registry grammar".into());
-    }
-    if application_ready_socket.is_some() != launcher_application.is_some() {
-        return Err(
-            "launcher applications require application-window readiness and vice versa".into(),
         );
     }
     let socket = resolve_socket_endpoint(
@@ -433,7 +433,7 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
         socket,
         portal_socket,
         launcher_client,
-        launcher_application,
+        update_application,
         terminal_client,
         terminal_authority,
         control_socket,
@@ -471,21 +471,36 @@ fn run_compositor(options: RunOptions) -> Result<(), String> {
     } else {
         session::SocketPolicy::Private
     };
+    // The image's table, immutable and builder-checked, read beside the
+    // bus policy: one that is missing or malformed ends the start before
+    // root is asked anything or a device is opened.
+    let launcher_rows = if options.terminal_authority {
+        let rows = launcher_table::load()?;
+        if let Some(update) = options.update_application.as_deref() {
+            if !rows.iter().any(|row| row.name == update) {
+                return Err(format!(
+                    "--update-application {update} has no launcher entry"
+                ));
+            }
+        }
+        rows
+    } else {
+        Vec::new()
+    };
     // Pin the root sender before framebuffer, listener, or input workers exist.
     let launches = if options.terminal_authority {
         launcher::LaunchBackend::Authority(authority::Launcher::connect()?)
     } else {
         launcher::LaunchBackend::Direct(launcher::LaunchProcesses::new(launcher::LaunchOptions {
             socket: options.socket.clone(),
-            client: options.launcher_client.clone(),
+            client: options
+                .launcher_client
+                .clone()
+                .ok_or("missing direct launcher client")?,
             terminal: options
                 .terminal_client
                 .clone()
                 .ok_or("missing direct terminal client")?,
-            application: options
-                .launcher_application
-                .clone()
-                .map(|name| launcher::ApplicationLaunch { name }),
         })?)
     };
     // Root's login state: the answer at connect, which the first frame
@@ -530,11 +545,12 @@ fn run_compositor(options: RunOptions) -> Result<(), String> {
         env::var_os(face_file::SETTING).as_deref(),
         options.terminal_authority,
     ));
-    runtime.set_launcher_application(options.launcher_application.as_deref());
     runtime.set_launcher_authority(options.terminal_authority);
     if let launcher::LaunchBackend::Authority(authority) = &launches {
+        runtime.set_launcher_table(launcher_rows, options.update_application.as_deref());
         runtime.set_hostnames(authority.hostnames());
         runtime.set_application_outcome(authority.application());
+        runtime.set_installed(authority.installed());
     }
     if let Some((((path, app_id), content_rgb_a), content_rgb_b)) = options
         .application_ready_socket
@@ -1133,9 +1149,8 @@ mod tests {
     fn native_launcher_commands_round_trip_through_the_client_parser() {
         let launch = launcher::LaunchOptions {
             socket: PathBuf::from("/run/user/1000/wayland-0"),
-            client: Some(PathBuf::from("/bin/td-ui-demo")),
+            client: PathBuf::from("/bin/td-ui-demo"),
             terminal: PathBuf::from("/bin/td-term"),
-            application: None,
         };
         let (program, arguments, ready_socket) =
             launcher::launch_command(&launch, launcher::LaunchRequest::UiDemo, 7).unwrap();
@@ -1143,7 +1158,7 @@ mod tests {
             .into_iter()
             .map(|argument| argument.into_string().unwrap())
             .collect();
-        assert_eq!(Some(program), launch.client);
+        assert_eq!(program, launch.client);
         assert_eq!(arguments.first().map(String::as_str), Some("run"));
         let parsed = parse_client_run(arguments.get(1..).unwrap()).unwrap();
         assert_eq!(parsed.socket, launch.socket);
@@ -1190,7 +1205,7 @@ mod confinement {
     const SYS: &str = include_str!("sys.rs");
     const SCM: &str = include_str!("../../td-secret/src/scm.rs");
     const DRM: &str = include_str!("drm.rs");
-    const AUTHORITY_FINGERPRINT: u64 = 0x68ef47fe34413043;
+    const AUTHORITY_FINGERPRINT: u64 = 0x02fb0fca419ca7fa;
     const AUTH_SYS_FINGERPRINT: u64 = 0x42363c39df98214d;
     const AUTH_CHANNEL_FINGERPRINT: u64 = 0xdf20e4130b2d96e2;
     const AUTHORITY: &str = include_str!("authority.rs");
@@ -1246,6 +1261,7 @@ mod confinement {
         ("input.rs", include_str!("input.rs")),
         ("keyboard.rs", include_str!("keyboard.rs")),
         ("launcher.rs", include_str!("launcher.rs")),
+        ("launcher_table.rs", include_str!("launcher_table.rs")),
         ("layout.rs", include_str!("layout.rs")),
         ("output.rs", include_str!("output.rs")),
         ("png_encode.rs", include_str!("../../td-png/src/encode.rs")),
@@ -2688,8 +2704,8 @@ pub struct MappedRegion {
                 portal.to_string_lossy().into_owned(),
                 "--control-socket".into(),
                 control.to_string_lossy().into_owned(),
-                "--launcher-application".into(),
-                "td-jail-fixture".into(),
+                "--launcher-client".into(),
+                "/bin/td-ui-demo".into(),
                 "--terminal-client".into(),
                 "/bin/td-term".into(),
                 "--application-ready-socket".into(),
@@ -2770,8 +2786,8 @@ pub struct MappedRegion {
                 socket.to_string_lossy().into_owned(),
                 "--portal-socket".into(),
                 portal.to_string_lossy().into_owned(),
-                "--launcher-application".into(),
-                "td-jail-fixture".into(),
+                "--launcher-client".into(),
+                "/bin/td-ui-demo".into(),
                 "--terminal-client".into(),
                 "/bin/td-term".into(),
                 "--application-ready-socket".into(),
@@ -2785,7 +2801,14 @@ pub struct MappedRegion {
             ]
         };
         let options = super::parse_run(&valid(&wayland, &portal, &ready)).unwrap();
+        // The authority's card reads the table: no launcher client.
         let mut authority = valid(&wayland, &portal, &ready);
+        let client = authority
+            .iter()
+            .position(|word| word == "--launcher-client")
+            .unwrap();
+        let mut demo = authority.clone();
+        authority.drain(client..client + 2);
         let at = authority
             .iter()
             .position(|word| word == "--terminal-client")
@@ -2795,17 +2818,27 @@ pub struct MappedRegion {
         let remote = super::parse_run(&authority).unwrap();
         assert!(remote.terminal_authority);
         assert!(remote.terminal_client.is_none());
-        // The card's name goes to root in `0d`, so it is in the registry
-        // grammar or the compositor does not start.
-        let named = authority
-            .iter()
-            .position(|word| word == "--launcher-application")
-            .unwrap();
+        assert!(remote.launcher_client.is_none());
+        assert_eq!(remote.update_application, None);
+        let mut update = authority.clone();
+        update.extend(["--update-application".into(), "firefox".into()]);
+        assert_eq!(
+            super::parse_run(&update)
+                .unwrap()
+                .update_application
+                .as_deref(),
+            Some("firefox")
+        );
+        // Its name goes to root's registry grammar, and only the authority
+        // has the row.
         for name in ["Firefox", "-x", "fire fox"] {
             let mut invalid = authority.clone();
-            invalid[named + 1] = name.into();
+            invalid.extend(["--update-application".into(), name.into()]);
             assert!(super::parse_run(&invalid).is_err(), "{name}");
         }
+        let mut direct_update = valid(&wayland, &portal, &ready);
+        direct_update.extend(["--update-application".into(), "firefox".into()]);
+        assert!(super::parse_run(&direct_update).is_err());
         for value in ["0", "/run/authority", "stdout", ""] {
             let mut invalid = authority.clone();
             invalid[at + 1] = value.into();
@@ -2817,13 +2850,13 @@ pub struct MappedRegion {
         let mut duplicated = authority.clone();
         duplicated.extend(["--terminal-authority".into(), "stdin".into()]);
         assert!(super::parse_run(&duplicated).is_err());
-        let mut demo = authority;
-        let app = demo
+        // A launcher client beside the authority is refused.
+        let at = demo
             .iter()
-            .position(|word| word == "--launcher-application")
+            .position(|word| word == "--terminal-client")
             .unwrap();
-        demo[app] = "--launcher-client".into();
-        demo[app + 1] = "/bin/td-ui-demo".into();
+        demo[at] = "--terminal-authority".into();
+        demo[at + 1] = "stdin".into();
         assert!(super::parse_run(&demo).is_err());
 
         let resolved_parent = std::fs::canonicalize(&actual).unwrap();
@@ -2865,10 +2898,9 @@ pub struct MappedRegion {
         assert!(super::parse_run(&neither)
             .err()
             .is_some_and(|error| error.contains("--card or --framebuffer is required")));
-        assert_eq!(options.launcher_client, None);
         assert_eq!(
-            options.launcher_application.as_deref(),
-            Some("td-jail-fixture")
+            options.launcher_client,
+            Some(std::path::PathBuf::from("/bin/td-ui-demo"))
         );
         assert_eq!(
             options.terminal_client,
@@ -2885,9 +2917,10 @@ pub struct MappedRegion {
         );
         assert_eq!(options.application_content_rgb_a.as_deref(), Some("ff00ff"));
         assert_eq!(options.application_content_rgb_b.as_deref(), Some("00ff00"));
-        let mut activation_without_observer = valid(&wayland, &portal, &ready);
-        activation_without_observer.truncate(activation_without_observer.len() - 8);
-        assert!(super::parse_run(&activation_without_observer).is_err());
+        // The readiness observer is optional, but whole.
+        let mut without_observer = valid(&wayland, &portal, &ready);
+        without_observer.truncate(without_observer.len() - 8);
+        assert!(super::parse_run(&without_observer).is_ok());
         let mut one_content_color = valid(&wayland, &portal, &ready);
         one_content_color.truncate(one_content_color.len() - 2);
         assert!(super::parse_run(&one_content_color).is_err());
@@ -2917,23 +2950,7 @@ pub struct MappedRegion {
         assert!(super::parse_run(&valid(&wayland, &portal, &alias.join("wayland-0"))).is_err());
         assert!(super::parse_run(&valid(&wayland, &wayland, &ready)).is_err());
         assert!(super::parse_run(&valid(&wayland, &ready, &ready)).is_err());
-        // The observer is meaningful only as one exact argument set around a
-        // configured application launch.
-        assert!(super::parse_run(&[
-            "--framebuffer".into(),
-            "/dev/fb0".into(),
-            "--input".into(),
-            "/dev/input".into(),
-            "--socket".into(),
-            "/run/user/1000/wayland-0".into(),
-            "--launcher-application".into(),
-            "td-jail-fixture".into(),
-            "--terminal-client".into(),
-            "/bin/td-term".into(),
-            "--application-ready-socket".into(),
-            "/run/user/1000/application-ready".into(),
-        ])
-        .is_err());
+        // The observer is meaningful only as one exact argument set.
         assert!(super::parse_run(&[
             "--framebuffer".into(),
             "/dev/fb0".into(),
@@ -2951,21 +2968,7 @@ pub struct MappedRegion {
             "org.td.demo".into(),
         ])
         .is_err());
-        assert!(super::parse_run(&[
-            "--framebuffer".into(),
-            "/dev/fb0".into(),
-            "--input".into(),
-            "/dev/input".into(),
-            "--socket".into(),
-            "/run/user/1000/wayland-0".into(),
-            "--launcher-application".into(),
-            "td-jail-fixture".into(),
-            "--terminal-client".into(),
-            "/bin/td-term".into(),
-        ])
-        .is_err());
-        // The activation-only application mode cannot also retain a dead
-        // direct launcher client.
+        // A launcher client named twice is refused.
         let mut both_modes = valid(&wayland, &portal, &ready);
         both_modes.extend(["--launcher-client".into(), "/bin/td-ui-demo".into()]);
         assert!(super::parse_run(&both_modes).is_err());

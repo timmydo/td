@@ -1351,8 +1351,9 @@ fn application_answer(
     }
 }
 
-/// The configured application's card activation, asked by name: raise its
-/// window, or have root start its unit and show the launch on the bar.
+/// A table application's card activation, asked by name: raise its window,
+/// or have root start its unit and show the launch on the bar, installed
+/// or not, as the card's row would.
 fn launch_answer(
     runtime: &Mutex<Runtime>,
     authority: &crate::authority::Launcher,
@@ -1361,7 +1362,7 @@ fn launch_answer(
     let Ok(mut runtime) = runtime.lock() else {
         return "unavailable compositor runtime is poisoned\n".into();
     };
-    if runtime.launcher_application() != Some(name) {
+    if runtime.launcher_row(name).is_none() {
         return format!("error {name} has no launcher entry\n");
     }
     // The card cannot be pressed behind the lock surface either.
@@ -1369,9 +1370,9 @@ fn launch_answer(
         return "error the session is locked\n".into();
     }
     let mut sent = Ok(());
-    let outcome = match runtime.activate_application() {
+    let outcome = match runtime.activate_application(name) {
         Ok(true) => Ok(()),
-        Ok(false) => runtime.launch_application(|| {
+        Ok(false) => runtime.launch_application(name, || {
             sent = authority.supervise(crate::authority::Supervised::Start(name.to_string()));
             sent.clone()
         }),
@@ -5166,7 +5167,7 @@ mod tests {
         runtime
             .lock()
             .unwrap()
-            .set_launcher_application(Some("firefox"));
+            .set_launcher_table(crate::launcher_table::tests::image(), None);
         // A terminal launch holds the worker's one slot.
         assert!(launcher.launch().is_ok());
         let launch = Request::parse("launch firefox").unwrap();
@@ -5175,7 +5176,7 @@ mod tests {
     }
 
     #[test]
-    fn launch_raises_or_starts_only_the_configured_application() {
+    fn launch_raises_or_starts_a_table_application_by_name() {
         let (runtime, _cleanup) = session(SurfaceKey {
             client: 1,
             object: 3,
@@ -5191,19 +5192,24 @@ mod tests {
         runtime
             .lock()
             .unwrap()
-            .set_launcher_application(Some("firefox"));
-        assert_eq!(
-            application_answer(&runtime, &launcher, launch, deadline),
-            "ok\n"
-        );
-        assert_eq!(
-            queued.supervised(),
-            Some(crate::authority::Supervised::Start("firefox".into()))
-        );
-        let other = Request::parse("launch mail").unwrap();
+            .set_launcher_table(crate::launcher_table::tests::image(), None);
+        // Any table name, installed or not: root's unit installs on demand
+        // until the cutover.
+        for name in ["firefox", "mail"] {
+            let launch = Request::parse(&format!("launch {name}")).unwrap();
+            assert_eq!(
+                application_answer(&runtime, &launcher, launch, deadline),
+                "ok\n"
+            );
+            assert_eq!(
+                queued.supervised(),
+                Some(crate::authority::Supervised::Start(name.into()))
+            );
+        }
+        let other = Request::parse("launch other").unwrap();
         assert_eq!(
             application_answer(&runtime, &launcher, other, deadline),
-            "error mail has no launcher entry\n"
+            "error other has no launcher entry\n"
         );
         {
             let mut runtime = runtime.lock().unwrap();

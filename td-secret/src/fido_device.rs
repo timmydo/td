@@ -1166,6 +1166,12 @@ pub(crate) mod vm_tests {
                 "td-bus-applications-v1\t1000\n65537\tmail\t\n65538\tnews\t\n",
             )
             .unwrap();
+            // The launcher table the paired compositor's card reads.
+            fs::write(
+                "/etc/td-launcher.tsv",
+                "mail\tMail\temail\ttd-mail\nnews\tNews\t\ttd-news\n",
+            )
+            .unwrap();
             // Mount the real hierarchy and delegate each app's sibling leaves.
             fs::create_dir_all("/sys/fs/cgroup").unwrap();
             assert!(Command::new("/bin/td-init")
@@ -1579,8 +1585,6 @@ pub(crate) mod vm_tests {
                         "/run/td-compositor/1000/portal-wayland",
                         "--control-socket",
                         "/run/td-compositor/1000/td-control",
-                        "--launcher-application",
-                        "mail",
                         "--application-ready-socket",
                         "/run/td-compositor/1000/application-ready",
                         "--application-app-id",
@@ -1656,6 +1660,8 @@ pub(crate) mod vm_tests {
                 fs::Permissions::from_mode(0o444),
             )
             .unwrap();
+            // The launcher table the paired compositor's card reads.
+            fs::write("/etc/td-launcher.tsv", "mail\tMail\temail\ttd-mail\n").unwrap();
             for (name, text) in [
                 (
                     "passwd",

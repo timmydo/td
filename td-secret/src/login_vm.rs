@@ -1344,6 +1344,9 @@ fn accounts() {
         ("td-principals.tsv", session, 0o444),
         // The session's applications: none.
         ("td-bus-applications.tsv", "td-bus-applications-v1\t1000\n", 0o444),
+        ("td-launcher.tsv", "", 0o444),
+        // Root's registry, as empty, so the installed set answers at once.
+        ("td-applications.tsv", "", 0o444),
         (
             "passwd",
             "tester:x:1000:1000::/home/tester:/bin/false\ntdc1000:x:993:993::/run/td-compositor/1000:/bin/false\ntdb1000:x:992:992::/var/empty:/bin/false\ntdp1000:x:991:991::/var/empty:/bin/false\n",

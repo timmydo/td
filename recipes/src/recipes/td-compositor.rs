@@ -85,6 +85,10 @@ const MODULES: &[(&str, &str)] = &[
         include_str!("../../../td-compositor/src/launcher.rs"),
     ),
     (
+        "launcher_table",
+        include_str!("../../../td-compositor/src/launcher_table.rs"),
+    ),
+    (
         "layout",
         include_str!("../../../td-compositor/src/layout.rs"),
     ),
@@ -634,37 +638,54 @@ mod tests {
             .iter()
             .find_map(|(name, source)| (*name == "launcher").then_some(*source))
             .expect("launcher source");
-        assert!(launcher.contains(&format!(
-            "const MAX_APPLICATION_NAME_BYTES: usize = {};",
-            td_engine::application::MAX_APPLICATION_NAME_BYTES
-        )));
-        assert!(launcher.contains(&format!(
-            "const RESERVED_APPLICATION_NAMES: &[&str] = &{:?};",
-            td_engine::application::RESERVED_APPLICATION_NAMES
-        )));
-        assert!(launcher.contains("pub client: Option<PathBuf>"));
+        // The development launcher names its own client; the authority's
+        // card takes applications from the image's launcher table, whose
+        // reader keeps only names root's requests can carry.
+        assert!(launcher.contains("pub client: PathBuf"));
         assert!(
-            launcher.contains("exactly one launcher client or launcher application is required")
+            launcher.contains("return Err(\"applications require the paired authority\".into());")
         );
-        for fragment in [
-            "application.name.starts_with('-')",
-            "application.name == \".\"",
-            "application.name.contains(\"..\")",
-            "byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')",
+        let table = MODULES
+            .iter()
+            .find_map(|(name, source)| (*name == "launcher_table").then_some(*source))
+            .expect("launcher table source");
+        assert!(table.contains("pub(crate) const PATH: &str = \"/etc/td-launcher.tsv\";"));
+        assert!(table.contains(&format!(
+            "pub(crate) const MAX_ROWS: usize = {};",
+            td_engine::launcher::MAX_APPLICATIONS
+        )));
+        // The reader's bounds are the table compiler's, so no table the
+        // builder writes is one the card refuses.
+        assert!(table.contains("const MAX_BYTES: usize = 1024 * 1024;"));
+        assert_eq!(
+            td_engine::launcher::MAX_APPLICATION_TABLE_BYTES,
+            1024 * 1024
+        );
+        for (name, bound) in [
+            (
+                "MAX_DISPLAY_BYTES",
+                td_engine::launcher::MAX_DISPLAY_NAME_BYTES,
+            ),
+            ("MAX_TERMS", td_engine::launcher::MAX_SEARCH_TERMS),
+            ("MAX_TERM_BYTES", td_engine::launcher::MAX_SEARCH_TERM_BYTES),
+            ("MAX_APP_ID_BYTES", td_engine::launcher::MAX_APP_ID_BYTES),
         ] {
-            assert!(launcher.contains(fragment));
+            assert!(
+                table.contains(&format!("const {name}: usize = {bound};")),
+                "{name}"
+            );
         }
-        assert!(launcher.contains("label: name.to_ascii_uppercase()"));
-        assert!(launcher.contains("search: name.to_ascii_lowercase()"));
-        assert!(launcher.contains("(LaunchRequest::UiDemo, Some(_))"));
-        assert!(launcher.contains("configured launcher application is activation-only"));
+        assert!(table.contains(
+            "rows.retain(|row| crate::authority::consent::application_name(&row.name));"
+        ));
         let input = MODULES
             .iter()
             .find_map(|(name, source)| (*name == "input").then_some(*source))
             .expect("input source");
-        assert!(input
-            .contains("request == LaunchRequest::UiDemo && self.launches.activates_application()"));
-        assert!(input.contains(".activate_application()?"));
+        assert!(input.contains(
+            "if let LaunchRequest::Application(index) | LaunchRequest::Install(index) = request {"
+        ));
+        assert!(input.contains("runtime.activate_application(&name)?"));
         let server = MODULES
             .iter()
             .find_map(|(name, source)| (*name == "server").then_some(*source))

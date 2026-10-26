@@ -54,6 +54,8 @@ const UNREADABLE: u8 = 0x0c;
 
 enum Work {
     Program(Program),
+    /// `22` and a name: td-software, opened at that application.
+    SoftwareAt(String),
     Supervised(Supervised),
     Secret(std::sync::Arc<crate::secret_client::Attempt>),
 }
@@ -366,6 +368,178 @@ impl Application {
     }
 }
 
+/// How often the worker asks `23` again while root says a row may change
+/// soon or could not read its registry.
+const INSTALLED_POLL: Duration = Duration::from_secs(1);
+/// The most rows `88` carries: the names root follows.
+const INSTALLED_ROWS: usize = 16;
+
+/// Root's `23` answer (td-authd/DESIGN.md, "Application requests"): which
+/// of the registry's Flathub declarations are installed. A table name the
+/// answer leaves out is one the image ships, always installed.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct InstalledSet {
+    /// Each declaration and its state: `01` installed, `02` may change.
+    rows: Vec<(String, u8)>,
+    /// A live boot, which runs no application.
+    live: bool,
+}
+
+impl InstalledSet {
+    /// Whether `name`, a launcher table name, is installed; `None` on a
+    /// live boot, where nothing runs and nothing installs.
+    pub(crate) fn installed(&self, name: &str) -> Option<bool> {
+        (!self.live).then(|| {
+            self.rows
+                .iter()
+                .find(|(row, _)| row == name)
+                .is_none_or(|(_, state)| state & 0x01 != 0)
+        })
+    }
+
+    fn pending(&self) -> bool {
+        self.rows.iter().any(|(_, state)| state & 0x02 != 0)
+    }
+
+    /// Exactly `88` and its rows, each a name of `table` once, or `ff 03`
+    /// on a live boot; `ff 02`, root unable to read its registry, is no
+    /// answer yet. Anything else ends the paired generation.
+    fn decode(answer: &[u8], table: &[String]) -> Result<Option<Self>, String> {
+        let invalid = || "invalid installed set answer".to_string();
+        let (count, mut rest) = match answer {
+            [0xff, 2] => return Ok(None),
+            [0xff, 3] => {
+                return Ok(Some(Self {
+                    rows: Vec::new(),
+                    live: true,
+                }))
+            }
+            [0x88, count, rest @ ..] => (usize::from(*count), rest),
+            _ => return Err(invalid()),
+        };
+        if count > INSTALLED_ROWS {
+            return Err(invalid());
+        }
+        let mut rows: Vec<(String, u8)> = Vec::with_capacity(count);
+        for _ in 0..count {
+            let [state, length, tail @ ..] = rest else {
+                return Err(invalid());
+            };
+            let name = tail
+                .get(..usize::from(*length))
+                .and_then(|name| std::str::from_utf8(name).ok())
+                .filter(|name| consent::application_name(name))
+                .filter(|name| table.iter().any(|known| known == name))
+                .filter(|name| rows.iter().all(|(row, _)| row != name))
+                .ok_or_else(invalid)?;
+            if state & !0x03 != 0 {
+                return Err(invalid());
+            }
+            rows.push((name.to_string(), *state));
+            rest = tail.get(usize::from(*length)..).ok_or_else(invalid)?;
+        }
+        if !rest.is_empty() {
+            return Err(invalid());
+        }
+        Ok(Some(Self { rows, live: false }))
+    }
+}
+
+#[derive(Default)]
+struct InstalledShared {
+    /// The launcher table's names, which an answer may name; nothing is
+    /// asked before the runtime gives them.
+    table: Option<Vec<String>>,
+    due: bool,
+    asked: Option<Instant>,
+    /// The last answer, and whether root could not read its registry since.
+    set: Option<InstalledSet>,
+    retry: bool,
+    /// Bumped when the set changes, so the runtime redraws only then.
+    changes: u64,
+}
+
+/// Root's installed set, shared: the runtime says when it is due and reads
+/// it, the authority worker asks root and keeps the answer.
+#[derive(Clone, Default)]
+pub(crate) struct Installed(Arc<Mutex<InstalledShared>>);
+
+impl Installed {
+    /// The launcher table's names, and a first ask.
+    pub(crate) fn follow_table(&self, names: Vec<String>) {
+        let mut shared = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        shared.table = Some(names);
+        shared.due = true;
+    }
+
+    /// Asks again on the worker's next turn: the launcher opened, or an
+    /// operation started.
+    pub(crate) fn ask(&self) {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner).due = true;
+    }
+
+    /// The last answer and how many changes came before it.
+    pub(crate) fn snapshot(&self) -> (u64, Option<InstalledSet>) {
+        let shared = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        (shared.changes, shared.set.clone())
+    }
+
+    /// The table to check an answer against, when one is due at `now`. An
+    /// ask is taken here, so one made while the question is out asks again.
+    fn wanted(&self, now: Instant) -> Option<Vec<String>> {
+        let mut shared = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let again = (shared.retry || shared.set.as_ref().is_some_and(InstalledSet::pending))
+            && shared
+                .asked
+                .is_none_or(|asked| now.saturating_duration_since(asked) >= INSTALLED_POLL);
+        if !(shared.due || again) {
+            return None;
+        }
+        let table = shared.table.clone()?;
+        shared.due = false;
+        Some(table)
+    }
+
+    /// Takes `answer` as the worker would have.
+    #[cfg(test)]
+    pub(crate) fn answer(&self, answer: &[u8]) -> Result<(), String> {
+        let table = self
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .table
+            .clone()
+            .unwrap_or_default();
+        if let Some(set) = InstalledSet::decode(answer, &table)? {
+            let mut shared = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            shared.set = Some(set);
+            shared.changes = shared.changes.wrapping_add(1);
+        }
+        Ok(())
+    }
+
+    /// Asks root's `23` when due and keeps the answer.
+    fn follow(&self, wire: &mut impl Exchange, now: Instant) -> Result<(), String> {
+        let Some(table) = self.wanted(now) else {
+            return Ok(());
+        };
+        let answer = InstalledSet::decode(&wire.exchange(&[0x23])?, &table)?;
+        let mut shared = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        shared.asked = Some(now);
+        match answer {
+            Some(set) => {
+                shared.retry = false;
+                if shared.set.as_ref() != Some(&set) {
+                    shared.set = Some(set);
+                    shared.changes = shared.changes.wrapping_add(1);
+                }
+            }
+            None => shared.retry = true,
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct Launcher {
     send: SyncSender<Work>,
@@ -374,6 +548,7 @@ pub(crate) struct Launcher {
     login: Login,
     hostnames: Hostnames,
     application: Application,
+    installed: Installed,
     /// Root's answer at connect, which the generation's start locks on:
     /// never a later poll's.
     connected: Option<Answer>,
@@ -772,12 +947,15 @@ impl Launcher {
         let followed = hostnames.clone();
         let application = Application::default();
         let started = application.clone();
+        let installed = Installed::default();
+        let asked = installed.clone();
         let (send, receive) = mpsc::sync_channel(QUEUE_CAPACITY);
         let (control, requests) = mpsc::sync_channel(QUEUE_CAPACITY);
         std::thread::Builder::new()
             .name("terminal-authority".into())
             .spawn(move || {
-                if let Err(error) = worker(wire, receive, requests, poll, followed, started) {
+                let shared = (followed, started, asked);
+                if let Err(error) = worker(wire, receive, requests, poll, shared) {
                     let _ = writeln!(
                         std::io::stderr().lock(),
                         "td-compositor: program authority: {error}"
@@ -793,8 +971,15 @@ impl Launcher {
             login,
             hostnames,
             application,
+            installed,
             connected: Some(connected),
         })
+    }
+
+    /// Root's installed set, which the worker asks for when the runtime
+    /// says it is due.
+    pub(crate) fn installed(&self) -> Installed {
+        self.installed.clone()
     }
 
     /// What became of the application's start requests, which the worker
@@ -874,6 +1059,19 @@ impl Launcher {
             Err(TrySendError::Disconnected(_)) => Err("program authority is unavailable".into()),
         }
     }
+
+    /// Queues td-software, opened at `name`, already in the registry's
+    /// grammar.
+    pub(crate) fn launch_software_at(&self, name: &str) -> Result<(), String> {
+        if !consent::application_name(name) {
+            return Err("invalid application name".into());
+        }
+        match self.send.try_send(Work::SoftwareAt(name.to_string())) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err("program launch is already pending".into()),
+            Err(TrySendError::Disconnected(_)) => Err("program authority is unavailable".into()),
+        }
+    }
 }
 
 /// A launcher whose secret attempts wait in a queue a test takes them
@@ -894,6 +1092,7 @@ impl Queued {
                 login,
                 hostnames: Hostnames::default(),
                 application: Application::default(),
+                installed: Installed::default(),
                 connected: None,
             },
             Self(receive, requests),
@@ -903,6 +1102,14 @@ impl Queued {
     pub(crate) fn supervised(&self) -> Option<Supervised> {
         match self.0.try_recv() {
             Ok(Work::Supervised(request)) => Some(request),
+            _ => None,
+        }
+    }
+
+    /// The td-software selection the queue holds, if that is what it holds.
+    pub(crate) fn software_at(&self) -> Option<String> {
+        match self.0.try_recv() {
+            Ok(Work::SoftwareAt(name)) => Some(name),
             _ => None,
         }
     }
@@ -1081,21 +1288,38 @@ impl Processes {
         wire: &mut impl Exchange,
         terminal: Program,
     ) -> Result<Option<&'static str>, String> {
+        let request = match terminal {
+            Program::Home => 1,
+            Program::Task => 4,
+            Program::TaskManager => 7,
+            Program::Editor => 8,
+            Program::Photo => 9,
+            Program::Review => 0x0a,
+            Program::Dua => 0x0b,
+            Program::Agent => 0x0c,
+            Program::Software => 0x22,
+        };
+        self.request(wire, &[request])
+    }
+
+    /// td-software, opened at `name`: `22` and the name.
+    fn start_software_at(
+        &mut self,
+        wire: &mut impl Exchange,
+        name: &str,
+    ) -> Result<Option<&'static str>, String> {
+        self.request(wire, &[&[0x22][..], name.as_bytes()].concat())
+    }
+
+    fn request(
+        &mut self,
+        wire: &mut impl Exchange,
+        request: &[u8],
+    ) -> Result<Option<&'static str>, String> {
         if self.handles.len() >= CAPACITY {
             return Ok(Some("program launch limit reached"));
         }
-        let request = match terminal {
-            Program::Home => [1],
-            Program::Task => [4],
-            Program::TaskManager => [7],
-            Program::Editor => [8],
-            Program::Photo => [9],
-            Program::Review => [0x0a],
-            Program::Dua => [0x0b],
-            Program::Agent => [0x0c],
-            Program::Software => [0x22],
-        };
-        match wire.exchange(&request)?.as_slice() {
+        match wire.exchange(request)?.as_slice() {
             [0xff, 1] => Ok(Some("program authority process table is full")),
             [0xff, 2] => Ok(Some("program authority could not start the helper")),
             [0x81, handle @ ..] if handle.len() == 8 => {
@@ -1183,8 +1407,7 @@ fn worker(
     receive: Receiver<Work>,
     requests: Receiver<CacheWork>,
     mut login: LoginPoll,
-    hostnames: Hostnames,
-    application: Application,
+    (hostnames, application, installed): (Hostnames, Application, Installed),
 ) -> Result<(), String> {
     let mut processes = Processes::new();
     let mut secrets = crate::secret_client::Client::default();
@@ -1203,13 +1426,23 @@ fn worker(
                     let _ = writeln!(std::io::stderr().lock(), "td-compositor: {error}");
                 }
             }
+            Ok(Work::SoftwareAt(name)) => {
+                if let Some(error) = processes.start_software_at(&mut wire, &name)? {
+                    let _ = writeln!(std::io::stderr().lock(), "td-compositor: {error}");
+                }
+            }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return Err("launcher disconnected".into()),
         }
         // At most one control-socket request a turn, after physical work.
         if let Ok((verb, name, reply)) = requests.try_recv() {
+            let answer = cache(&mut wire, verb, &name)?;
+            // An operation that started changes what is installed.
+            if answer == CacheAnswer::Started {
+                installed.ask();
+            }
             // A caller that stopped waiting is no failure of the channel.
-            let _ = reply.try_send(cache(&mut wire, verb, &name)?);
+            let _ = reply.try_send(answer);
         }
         if let Some(error) = processes.poll(&mut wire)? {
             let _ = writeln!(std::io::stderr().lock(), "td-compositor: {error}");
@@ -1218,6 +1451,7 @@ fn worker(
         login.follow(&mut wire, &mut secrets)?;
         hostnames.follow(&mut wire)?;
         application.follow(&mut wire)?;
+        installed.follow(&mut wire, Instant::now())?;
     }
 }
 
@@ -1909,8 +2143,11 @@ mod tests {
             receive,
             idle(),
             LoginPoll::new(Login::default()),
-            Hostnames::default(),
-            application.clone(),
+            (
+                Hostnames::default(),
+                application.clone(),
+                Installed::default()
+            ),
         )
         .is_err());
         assert_eq!(
@@ -2003,8 +2240,11 @@ mod tests {
             receive,
             idle(),
             LoginPoll::new(Login::default()),
-            Hostnames::default(),
-            Application::default(),
+            (
+                Hostnames::default(),
+                Application::default(),
+                Installed::default()
+            ),
         )
         .is_err());
         assert_eq!(calls.get(), 1);
@@ -2053,6 +2293,154 @@ mod tests {
         );
     }
 
+    fn table() -> Vec<String> {
+        vec!["firefox".into(), "mail".into()]
+    }
+
+    /// `88`'s rows: each a table name once, its state two bits, the frame
+    /// exactly as long as its rows; `ff 03` is a live boot, `ff 02` no
+    /// answer yet.
+    #[test]
+    fn the_installed_set_has_one_shape() {
+        let set = InstalledSet::decode(b"\x88\x01\x01\x07firefox", &table())
+            .unwrap()
+            .unwrap();
+        assert_eq!(set.installed("firefox"), Some(true));
+        // A name the answer leaves out is one the image ships.
+        assert_eq!(set.installed("mail"), Some(true));
+        assert!(!set.pending());
+        let set = InstalledSet::decode(b"\x88\x01\x02\x07firefox", &table())
+            .unwrap()
+            .unwrap();
+        assert!(set.installed("firefox") == Some(false) && set.pending());
+        let live = InstalledSet::decode(&[0xff, 3], &table()).unwrap().unwrap();
+        assert_eq!(live.installed("mail"), None);
+        assert_eq!(InstalledSet::decode(&[0xff, 2], &table()), Ok(None));
+        assert!(InstalledSet::decode(b"\x88\x00", &table())
+            .unwrap()
+            .is_some_and(|set| set.rows.is_empty()));
+        for bad in [
+            &b""[..],
+            b"\x88",
+            b"\x88\x01",
+            b"\x88\x01\x01\x07firefo",
+            b"\x88\x01\x01\x07firefoxx",
+            b"\x88\x01\x04\x07firefox",
+            b"\x88\x01\x01\x04news",
+            b"\x88\x01\x01\x07Firefox",
+            b"\x88\x01\x01\x00",
+            b"\x88\x02\x01\x07firefox\x01\x07firefox",
+            b"\x88\x11",
+            b"\x87",
+            b"\xff\x01",
+        ] {
+            assert!(InstalledSet::decode(bad, &table()).is_err(), "{bad:?}");
+        }
+    }
+
+    /// Asked once the table is known and when the runtime says, and again
+    /// each second while a row may change or root could not read its
+    /// registry; otherwise not at all.
+    #[test]
+    fn the_installed_set_is_asked_when_due_and_while_pending() {
+        let installed = Installed::default();
+        let start = Instant::now();
+        let mut quiet = wire(vec![]);
+        installed.ask();
+        installed.follow(&mut quiet, start).unwrap();
+        assert!(quiet.requests.is_empty(), "asked before the table");
+        installed.follow_table(table());
+        let mut asked = wire(vec![b"\x88\x01\x03\x07firefox".to_vec()]);
+        installed.follow(&mut asked, start).unwrap();
+        assert_eq!(asked.requests, [vec![0x23]]);
+        let (changes, set) = installed.snapshot();
+        assert!(set.is_some_and(|set| set.installed("firefox") == Some(true)));
+        // Pending: not again within the second, then again.
+        installed.follow(&mut quiet, start).unwrap();
+        assert!(quiet.requests.is_empty());
+        let later = start + INSTALLED_POLL;
+        let mut settled = wire(vec![b"\x88\x01\x01\x07firefox".to_vec()]);
+        installed.follow(&mut settled, later).unwrap();
+        assert_eq!(settled.requests.len(), 1);
+        assert_eq!(installed.snapshot().0, changes.wrapping_add(1));
+        // Settled: nothing more until asked.
+        installed
+            .follow(&mut quiet, later + INSTALLED_POLL)
+            .unwrap();
+        assert!(quiet.requests.is_empty());
+        // An answer root could not give keeps the last and retries.
+        installed.ask();
+        let mut unread = wire(vec![vec![0xff, 2], b"\x88\x00".to_vec()]);
+        let after = later + INSTALLED_POLL * 2;
+        installed.follow(&mut unread, after).unwrap();
+        assert!(installed
+            .snapshot()
+            .1
+            .is_some_and(|set| set.rows.len() == 1));
+        installed
+            .follow(&mut unread, after + INSTALLED_POLL)
+            .unwrap();
+        assert_eq!(unread.requests.len(), 2);
+        assert!(installed
+            .snapshot()
+            .1
+            .is_some_and(|set| set.rows.is_empty()));
+        // A malformed answer ends the generation.
+        installed.ask();
+        assert!(installed
+            .follow(&mut wire(vec![vec![0x88]]), after + INSTALLED_POLL * 2)
+            .is_err());
+    }
+
+    /// An operation that started asks for the set again; td-software opened
+    /// at an application sends `22` and its name.
+    #[test]
+    fn a_started_operation_asks_again_and_software_opens_at_a_name() {
+        let installed = Installed::default();
+        installed.follow_table(table());
+        let start = Instant::now();
+        installed
+            .follow(&mut wire(vec![b"\x88\x00".to_vec()]), start)
+            .unwrap();
+        let (send, receive) = mpsc::sync_channel(QUEUE_CAPACITY);
+        let (control, requests) = mpsc::sync_channel(QUEUE_CAPACITY);
+        let (reply, answer) = mpsc::sync_channel(1);
+        assert!(control
+            .try_send((CacheVerb::Install, "firefox".into(), reply))
+            .is_ok());
+        assert!(send.try_send(Work::Supervised(Supervised::Update)).is_ok());
+        drop(send);
+        let mut script = wire(vec![
+            vec![0x84],
+            vec![0x86],
+            vec![0x83],
+            vec![0x9f, 0, 0],
+            b"\x88\x00".to_vec(),
+        ]);
+        assert!(worker(
+            &mut script,
+            receive,
+            requests,
+            LoginPoll::new(Login::default()),
+            (
+                Hostnames::default(),
+                Application::default(),
+                installed.clone()
+            ),
+        )
+        .is_err());
+        assert_eq!(answer.try_recv(), Ok(CacheAnswer::Started));
+        assert_eq!(script.requests.last(), Some(&vec![0x23]));
+        drop(control);
+        let mut processes = Processes::new();
+        let mut opened = wire(vec![handle(1)]);
+        assert_eq!(
+            processes.start_software_at(&mut opened, "firefox"),
+            Ok(None)
+        );
+        assert_eq!(opened.requests, [b"\x22firefox".to_vec()]);
+    }
+
     /// A start names an application in the registry grammar, or nothing
     /// is queued: root would end the generation on it.
     #[test]
@@ -2077,6 +2465,7 @@ mod tests {
             login: Login::default(),
             hostnames: Hostnames::default(),
             application: Application::default(),
+            installed: Installed::default(),
             connected: None,
         };
         assert!(launcher.launch().is_ok());
@@ -2248,8 +2637,11 @@ checked=never\nrefused=none\nprogress=none\n";
             receive,
             requests,
             LoginPoll::new(Login::default()),
-            Hostnames::default(),
-            Application::default(),
+            (
+                Hostnames::default(),
+                Application::default(),
+                Installed::default()
+            ),
         )
         .is_err());
         assert_eq!(answer.try_recv(), Ok(CacheAnswer::Started));
@@ -2269,8 +2661,11 @@ checked=never\nrefused=none\nprogress=none\n";
             receive,
             requests,
             LoginPoll::new(Login::default()),
-            Hostnames::default(),
-            Application::default(),
+            (
+                Hostnames::default(),
+                Application::default(),
+                Installed::default(),
+            ),
         )
         .unwrap_err();
         assert!(error.contains("application request answer"), "{error}");

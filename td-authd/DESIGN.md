@@ -656,12 +656,12 @@ crash td-svc's `restart=on-failure` will retry after its backoff, and a
 `0d` client killed at its bound reads `03` until a read sees the unit it
 may still have started. A `0f` for another application than the one
 followed starts over on it as a `0d` would, with nothing read and no
-start asked, so the compositor asks about the launch it shows; a failed
-start counts as `03` only for the application followed. On a live boot
-`0f` answers `ff 03` as `0d` does. It reveals only the supervisor's
-state word for a unit the compositor may already start, never the
-application's output, account or files; it is generic launch feedback,
-not a download channel.
+start asked but one of that application still in flight, so the
+compositor asks about the launch it shows; a failed start counts as `03`
+only for the application followed. On a live boot `0f` answers `ff 03`
+as `0d` does. It reveals only the supervisor's state word for a unit the
+compositor may already start, never the application's output, account or
+files; it is generic launch feedback, not a download channel.
 
 For a launch, a full table returns `ff 01`; a spawn failure returns `ff
 02`. Every other request, trailing byte beyond a request's operand,

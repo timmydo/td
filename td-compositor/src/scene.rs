@@ -960,8 +960,21 @@ impl Scene {
         self.hostnames = hostnames;
     }
 
-    pub(crate) fn set_launcher_application(&mut self, application: Option<&str>) {
-        self.launcher.set_application(application);
+    pub(crate) fn set_launcher_table(&mut self, rows: &[crate::launcher_table::Row]) {
+        self.launcher.set_table(rows);
+    }
+
+    pub(crate) fn set_update_application(&mut self, name: Option<&str>) {
+        self.launcher.set_update(name);
+    }
+
+    pub(crate) fn set_installed(&mut self, installed: impl Fn(&str) -> Option<bool>) {
+        self.launcher.set_installed(installed);
+    }
+
+    /// The launcher table application a card request names.
+    pub(crate) fn launcher_application(&self, index: usize) -> Option<&str> {
+        self.launcher.application(index)
     }
 
     /// A client named what its pointer should look like: which surface to
@@ -2064,6 +2077,16 @@ impl Scene {
 
     pub fn app_id(&self, key: SurfaceKey) -> Option<&str> {
         self.app_ids.get(&key).map(String::as_str)
+    }
+
+    /// A mapped toplevel whose own app id is `app_id`, the first by key:
+    /// what the launcher activates for a table application. Any client
+    /// may claim an app id, so this is a window to raise, not a proof.
+    pub fn mapped_with_app_id(&self, app_id: &str) -> Option<SurfaceKey> {
+        self.app_ids
+            .iter()
+            .find(|(key, id)| id.as_str() == app_id && self.is_mapped(**key))
+            .map(|(key, _)| *key)
     }
 
     /// Test-only, for `title`'s reason: what a geometry DOES is read inside

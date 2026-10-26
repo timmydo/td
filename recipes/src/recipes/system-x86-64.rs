@@ -1975,7 +1975,7 @@ fn build_desktop_td_svc_conf() -> String {
          type=daemon\n\
          cgroup=service\n\
          exec=/bin/td-authd terminal-serve --primary --peer-uid {compositor_uid}\n\
-         pair-exec=/bin/td-login exec-service-as {compositor_user} -- /bin/td-compositor run --card /dev/dri/card0 --framebuffer /dev/fb0 --input /dev/input --socket {wayland_socket} --portal-socket {portal_wayland_socket} --control-socket {control_socket} --launcher-application {firefox_name} --terminal-authority stdin --application-ready-socket {firefox_window_ready_socket} --application-app-id {firefox_app_id} --application-content-rgb-a {firefox_content_rgb_a} --application-content-rgb-b {firefox_content_rgb_b}\n\
+         pair-exec=/bin/td-login exec-service-as {compositor_user} -- /bin/td-compositor run --card /dev/dri/card0 --framebuffer /dev/fb0 --input /dev/input --socket {wayland_socket} --portal-socket {portal_wayland_socket} --control-socket {control_socket} --update-application {firefox_name} --terminal-authority stdin --application-ready-socket {firefox_window_ready_socket} --application-app-id {firefox_app_id} --application-content-rgb-a {firefox_content_rgb_a} --application-content-rgb-b {firefox_content_rgb_b}\n\
          after=seat\n\
          requires=seat\n\
          ready=/bin/td-login exec-primary -- /bin/td-compositor probe {wayland_socket}\n\
@@ -8327,8 +8327,10 @@ mod tests {
         }
     }
 
+    /// The card is the launcher table's; the update row is Firefox's until
+    /// td-software/DESIGN.md §6's cutover.
     #[test]
-    fn wayland_service_uses_activation_only_firefox_and_a_native_terminal() {
+    fn wayland_service_uses_the_launcher_table_and_a_native_terminal() {
         // The peer uses a literal service credential switch and fixed socket
         // paths, with no shell interpreting authority arguments.
         let expected = format!(
@@ -8337,7 +8339,7 @@ mod tests {
              --socket {WAYLAND_SOCKET} \
              --portal-socket {PORTAL_WAYLAND_SOCKET} \
              --control-socket {CONTROL_SOCKET} \
-             --launcher-application {FIREFOX_NAME} \
+             --update-application {FIREFOX_NAME} \
              --terminal-authority stdin \
              --application-ready-socket {FIREFOX_WINDOW_READY_SOCKET} \
              --application-app-id {FIREFOX_APP_ID} \

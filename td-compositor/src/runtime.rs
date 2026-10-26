@@ -722,16 +722,17 @@ pub struct Runtime {
     screenshots: Option<(SyncSender<crate::screenshot::Job>, bool)>,
     /// When the bar's screenshot notice gives way to the status line.
     notice_until: Option<std::time::Instant>,
-    /// The configured application's start outcome, which the authority
-    /// worker keeps current; none in the direct profile.
+    /// The last started application's outcome, which the authority worker
+    /// keeps current; none in the direct profile.
     application_outcome: Option<crate::authority::Application>,
-    /// The configured application's name as its card shows it.
-    application_label: Option<String>,
-    /// The configured application's registry name, which a control
-    /// `launch` names.
-    application_name: Option<String>,
-    /// A launch from the card waiting for its window.
-    launch: Option<crate::launcher::PendingLaunch>,
+    /// The image's launcher table, which the card and a control `launch`
+    /// name applications from; empty in the direct profile.
+    launcher_rows: Vec<crate::launcher_table::Row>,
+    /// Root's installed set, and the change of it the card last took.
+    installed: Option<(crate::authority::Installed, Option<u64>)>,
+    /// A launch from the card waiting for its window: which application,
+    /// and its state.
+    launch: Option<(crate::launcher_table::Row, crate::launcher::PendingLaunch)>,
     backlight: Option<td_backlight::Panel>,
     /// xdg-foreign handles are compositor-wide bearer capabilities. The
     /// object maps stay on their owning client threads; this registry carries
@@ -957,8 +958,8 @@ impl Runtime {
             screenshots: None,
             notice_until: None,
             application_outcome: None,
-            application_label: None,
-            application_name: None,
+            launcher_rows: Vec::new(),
+            installed: None,
             launch: None,
             backlight: None,
             foreign_exports: BTreeMap::new(),
@@ -1069,10 +1070,43 @@ impl Runtime {
         self.scene.set_hostnames(hostnames);
     }
 
-    pub(crate) fn set_launcher_application(&mut self, application: Option<&str>) {
-        self.application_name = application.map(str::to_string);
-        self.application_label = application.map(str::to_ascii_uppercase);
-        self.scene.set_launcher_application(application);
+    /// The launcher table, and the application whose update row the card
+    /// shows beside it.
+    pub(crate) fn set_launcher_table(
+        &mut self,
+        rows: Vec<crate::launcher_table::Row>,
+        update: Option<&str>,
+    ) {
+        self.scene.set_launcher_table(&rows);
+        self.scene.set_update_application(update);
+        self.launcher_rows = rows;
+    }
+
+    /// Root's installed set, which the card follows: asked now, on each
+    /// opening of the card, and again while root says it may change.
+    pub(crate) fn set_installed(&mut self, installed: crate::authority::Installed) {
+        installed.follow_table(
+            self.launcher_rows
+                .iter()
+                .map(|row| row.name.clone())
+                .collect(),
+        );
+        self.installed = Some((installed, None));
+    }
+
+    /// Takes a new installed set into the card; whether the card, being up,
+    /// changed.
+    fn refresh_installed(&mut self) -> bool {
+        let Some((installed, seen)) = self.installed.as_mut() else {
+            return false;
+        };
+        let (changes, set) = installed.snapshot();
+        let Some(set) = set.filter(|_| *seen != Some(changes)) else {
+            return false;
+        };
+        *seen = Some(changes);
+        self.scene.set_installed(|name| set.installed(name));
+        self.scene.launcher_visible()
     }
 
     /// The handle a launch from the card reads its outcome from, which the
@@ -1461,7 +1495,7 @@ impl Runtime {
     pub fn repaint(&mut self) -> Result<(), String> {
         // A window that maps repaints, and ends the launch waiting for it
         // in the same paint.
-        if self.launch.is_some() && self.application_mapped() {
+        if self.launch.is_some() && self.launch_mapped() {
             self.refresh_launch();
         }
         self.last_submission = None;
@@ -3427,6 +3461,11 @@ impl Runtime {
     }
 
     pub fn launcher(&mut self, action: LauncherAction) -> Result<Option<LaunchRequest>, String> {
+        if action == LauncherAction::Open {
+            if let Some((installed, _)) = &self.installed {
+                installed.ask();
+            }
+        }
         let checkpoint = self.scene.launcher_checkpoint();
         let request = self.scene.launcher(action);
         // Published BEFORE the paint that can fail. The arrangement a drag
@@ -3450,18 +3489,24 @@ impl Runtime {
         Ok(request)
     }
 
-    /// The card found no window: ask for the application's start with
-    /// `send` and show the launch on the bar until its window maps or the
-    /// start fails. A launch already under way is not asked again.
+    /// The card found no window for `name`: ask for its start with `send`
+    /// and show the launch on the bar until its window maps or the start
+    /// fails. A launch of it already under way is not asked again; a
+    /// launch of another application takes the bar's cell.
     pub(crate) fn launch_application(
         &mut self,
+        name: &str,
         send: impl FnOnce() -> Result<(), String>,
     ) -> Result<(), String> {
+        let row = self
+            .launcher_row(name)
+            .cloned()
+            .ok_or_else(|| format!("{name} has no launcher entry"))?;
         self.refresh_launch();
         if self
             .launch
             .as_ref()
-            .is_some_and(crate::launcher::PendingLaunch::blocks_start)
+            .is_some_and(|(launched, launch)| launched.name == name && launch.blocks_start())
         {
             return Ok(());
         }
@@ -3471,14 +3516,12 @@ impl Runtime {
             .map_or(0, |outcome| outcome.outcome().sent);
         let sent = send();
         if let Err(error) = &sent {
-            eprintln!("td-compositor: configured application has no mapped window: {error}");
+            eprintln!("td-compositor: {name} has no mapped window: {error}");
         }
-        let label = self.application_label.as_deref().unwrap_or("APPLICATION");
-        self.launch = Some(crate::launcher::PendingLaunch::begin(
-            label,
-            base,
-            sent.is_ok(),
-            Instant::now(),
+        let label = row.display.to_uppercase();
+        self.launch = Some((
+            row,
+            crate::launcher::PendingLaunch::begin(&label, base, sent.is_ok(), Instant::now()),
         ));
         // A replaced launch's watch ends too; only a sent request is
         // followed.
@@ -3491,19 +3534,21 @@ impl Runtime {
         Ok(())
     }
 
-    /// The configured application's name, when the card has one.
-    pub(crate) fn launcher_application(&self) -> Option<&str> {
-        self.application_name.as_deref()
+    /// The launcher table's row for `name`.
+    pub(crate) fn launcher_row(&self, name: &str) -> Option<&crate::launcher_table::Row> {
+        self.launcher_rows.iter().find(|row| row.name == name)
     }
 
-    /// Whether a mapped window matches the configured application.
-    fn application_mapped(&self) -> bool {
-        self.application_ready.as_ref().is_some_and(|ready| {
-            ready
-                .candidates
-                .iter()
-                .any(|candidate| self.scene.is_mapped(*candidate))
-        })
+    /// The table application a card request names, by its position.
+    pub(crate) fn launcher_application(&self, index: usize) -> Option<String> {
+        self.scene.launcher_application(index).map(str::to_string)
+    }
+
+    /// Whether a mapped window has the pending launch's app id.
+    fn launch_mapped(&self) -> bool {
+        self.launch
+            .as_ref()
+            .is_some_and(|(row, _)| self.scene.mapped_with_app_id(&row.app_id).is_some())
     }
 
     /// Brings the pending launch's bar text up to date, ending it once its
@@ -3512,14 +3557,14 @@ impl Runtime {
         if self.launch.is_none() {
             return false;
         }
-        let mapped = self.application_mapped();
+        let mapped = self.launch_mapped();
         let outcome = self
             .application_outcome
             .as_ref()
             .map(crate::authority::Application::outcome)
             .unwrap_or_default();
         let text = match self.launch.as_mut() {
-            Some(launch) if !mapped => launch.text(outcome, Instant::now()),
+            Some((_, launch)) if !mapped => launch.text(outcome, Instant::now()),
             _ => None,
         };
         if text.is_none() {
@@ -3531,17 +3576,14 @@ impl Runtime {
         self.scene.set_launch(text)
     }
 
-    /// Activate the mapped toplevel observed for the configured application.
-    /// The compositor never owns the application process; a missing surface is
-    /// therefore reported to the caller rather than replaced by another launch.
-    pub fn activate_application(&mut self) -> Result<bool, String> {
-        let key = self.application_ready.as_ref().and_then(|ready| {
-            ready
-                .candidates
-                .iter()
-                .copied()
-                .find(|candidate| self.scene.is_mapped(*candidate))
-        });
+    /// Activate a mapped toplevel of the table application `name`, by the
+    /// app id its row gives. The compositor never owns the application
+    /// process; a missing surface is reported to the caller rather than
+    /// replaced by another launch.
+    pub fn activate_application(&mut self, name: &str) -> Result<bool, String> {
+        let key = self
+            .launcher_row(name)
+            .and_then(|row| self.scene.mapped_with_app_id(&row.app_id));
         let Some(key) = key else {
             return Ok(false);
         };
@@ -3601,8 +3643,8 @@ impl Runtime {
         }
         let cleared = expired && self.scene.set_notice(None);
         // The sampler's tick is also what moves a pending launch's state
-        // and time on.
-        let launch = self.refresh_launch();
+        // and time on, and brings root's installed set to the card.
+        let launch = self.refresh_launch() | self.refresh_installed();
         let previous = self.scene.set_status(status);
         if previous.is_none() && !cleared && !launch {
             return Ok(());
@@ -14469,7 +14511,11 @@ mod tests {
             .unwrap();
         assert_eq!(runtime.focused_toplevel(), Some(other));
 
-        assert!(runtime.activate_application().unwrap());
+        // Raised by its table row's app id.
+        assert!(!runtime.activate_application("firefox").unwrap());
+        runtime.set_launcher_table(crate::launcher_table::tests::image(), None);
+        assert!(!runtime.activate_application("mail").unwrap());
+        assert!(runtime.activate_application("firefox").unwrap());
         assert_eq!(runtime.focused_toplevel(), Some(application));
         assert_eq!(runtime.scene.layout().workspace_of(application), Some(2));
         assert!(runtime.scene.layout().check_invariants().is_ok());
@@ -14489,13 +14535,13 @@ mod tests {
                 wake,
             )
             .unwrap();
-        runtime.set_launcher_application(Some("firefox"));
+        runtime.set_launcher_table(crate::launcher_table::tests::image(), None);
         let outcome = crate::authority::Application::default();
         runtime.set_application_outcome(outcome.clone());
 
         let mut asked = 0;
         runtime
-            .launch_application(|| {
+            .launch_application("firefox", || {
                 asked += 1;
                 Ok(())
             })
@@ -14506,7 +14552,7 @@ mod tests {
         assert!(shown.starts_with("FIREFOX STARTING 0:0"), "{shown}");
         // A second activation while it is under way asks nothing.
         runtime
-            .launch_application(|| {
+            .launch_application("firefox", || {
                 asked += 1;
                 Ok(())
             })
@@ -14537,23 +14583,101 @@ mod tests {
         dir.cleanup().unwrap();
     }
 
+    /// Root's installed set reaches the card on the sampler's tick, and a
+    /// card launch is per application: another takes the bar's cell, the
+    /// same is not asked twice, and its own window by app id ends it.
+    #[test]
+    fn the_card_follows_the_installed_set_and_launches_by_name() {
+        let dir = crate::temp_dir::TempDir::new("td-runtime-table-launch").unwrap();
+        let framebuffer =
+            Framebuffer::test_file(&dir.path().join("fb"), 800, 600, 800 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        runtime.set_launcher_authority(true);
+        runtime.set_launcher_table(crate::launcher_table::tests::image(), Some("firefox"));
+        let installed = crate::authority::Installed::default();
+        runtime.set_installed(installed.clone());
+        runtime.launcher(LauncherAction::Open).unwrap();
+        // Nothing of the table before root answers; firefox absent, the
+        // image's own applications shown, on the next tick.
+        installed.answer(b"\x88\x01\x00\x07firefox").unwrap();
+        runtime.set_status("tick".into()).unwrap();
+        for character in "mail".chars() {
+            runtime.launcher(LauncherAction::Insert(character)).unwrap();
+        }
+        let request = runtime.launcher(LauncherAction::Activate).unwrap();
+        let Some(LaunchRequest::Application(index)) = request else {
+            panic!("mail is not on the card: {request:?}");
+        };
+        assert_eq!(runtime.launcher_application(index).as_deref(), Some("mail"));
+
+        let outcome = crate::authority::Application::default();
+        runtime.set_application_outcome(outcome.clone());
+        let mut asked = Vec::new();
+        runtime
+            .launch_application("firefox", || {
+                asked.push("firefox");
+                Ok(())
+            })
+            .unwrap();
+        runtime
+            .launch_application("mail", || {
+                asked.push("mail");
+                Ok(())
+            })
+            .unwrap();
+        runtime
+            .launch_application("mail", || {
+                asked.push("mail again");
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(asked, ["firefox", "mail"]);
+        let shown = runtime.scene.launch().unwrap().to_string();
+        assert!(shown.starts_with("MAIL STARTING"), "{shown}");
+        assert!(runtime.launch_application("other", || Ok(())).is_err());
+        // Firefox's window does not end mail's launch; mail's does.
+        let firefox = SurfaceKey {
+            client: 7,
+            object: 11,
+        };
+        runtime
+            .set_application_id(firefox, "org.mozilla.firefox")
+            .unwrap();
+        runtime
+            .apply_commit(firefox, Some(surface([1, 2, 3, 0])), None, None)
+            .unwrap();
+        assert!(runtime.scene.launch().is_some());
+        let mail = SurfaceKey {
+            client: 8,
+            object: 12,
+        };
+        runtime.set_application_id(mail, "td-mail").unwrap();
+        runtime
+            .apply_commit(mail, Some(surface([4, 5, 6, 0])), None, None)
+            .unwrap();
+        assert_eq!(runtime.scene.launch(), None);
+        assert!(runtime.activate_application("mail").unwrap());
+        assert_eq!(runtime.focused_toplevel(), Some(mail));
+        dir.cleanup().unwrap();
+    }
+
     #[test]
     fn a_failed_card_launch_says_so_and_may_be_asked_again() {
         let dir = crate::temp_dir::TempDir::new("td-runtime-application-failed").unwrap();
         let framebuffer =
             Framebuffer::test_file(&dir.path().join("fb"), 800, 600, 800 * 4).unwrap();
         let mut runtime = Runtime::new(framebuffer);
-        runtime.set_launcher_application(Some("firefox"));
+        runtime.set_launcher_table(crate::launcher_table::tests::image(), None);
         let outcome = crate::authority::Application::default();
         runtime.set_application_outcome(outcome.clone());
-        runtime.launch_application(|| Ok(())).unwrap();
+        runtime.launch_application("firefox", || Ok(())).unwrap();
         outcome.answer(false, Some(&[0x85, 3])).unwrap();
         runtime.set_status("tick".into()).unwrap();
         assert_eq!(runtime.scene.launch(), Some("FIREFOX FAILED TO START"));
         // A failed launch is asked again.
         let mut asked = 0;
         runtime
-            .launch_application(|| {
+            .launch_application("firefox", || {
                 asked += 1;
                 Ok(())
             })
@@ -14571,7 +14695,10 @@ mod tests {
         runtime.set_status("tick".into()).unwrap();
         assert_eq!(runtime.scene.launch(), Some("FIREFOX FAILED TO START"));
         runtime
-            .launch_application(|| Err("authority request already pending".into()))
+            .launch_application(
+                "firefox",
+                || Err("authority request already pending".into()),
+            )
             .unwrap();
         assert_eq!(runtime.scene.launch(), Some("FIREFOX NOT STARTED"));
         dir.cleanup().unwrap();

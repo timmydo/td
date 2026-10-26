@@ -2634,20 +2634,24 @@ impl LiveInputTarget {
     /// Application activation mutates the scene, so its paint/focus failures
     /// follow every other scene mutation and propagate to the input reader.
     fn spawn(&mut self, request: LaunchRequest) -> Result<(), String> {
-        if request == LaunchRequest::UiDemo && self.launches.activates_application() {
+        if let LaunchRequest::Application(index) | LaunchRequest::Install(index) = request {
             let mut runtime = self
                 .runtime
                 .lock()
                 .map_err(|_| "runtime lock poisoned".to_string())?;
-            if !runtime.activate_application()? {
+            let Some(name) = runtime.launcher_application(index) else {
+                return Ok(());
+            };
+            if request == LaunchRequest::Install(index) {
+                // td-software, opened at it; its failure is a launch's.
+                if let Err(error) = self.launches.install_application(&name) {
+                    eprintln!("td-compositor: {error}");
+                }
+            } else if !runtime.activate_application(&name)? {
                 // Root starts its supervised unit; the bar shows the launch
                 // until its window maps, and the card activates it then.
                 let launches = &self.launches;
-                let name = runtime.launcher_application().map(str::to_string);
-                runtime.launch_application(|| match &name {
-                    Some(name) => launches.start_application(name),
-                    None => Err("the card names no application".into()),
-                })?;
+                runtime.launch_application(&name, || launches.start_application(&name))?;
             }
             return Ok(());
         }
@@ -6854,6 +6858,8 @@ mod tests {
                 Bound::Launch(LaunchRequest::Agent) => "CODING AGENT",
                 Bound::Launch(LaunchRequest::Software) => "SOFTWARE",
                 Bound::Launch(LaunchRequest::UpdateApplication) => "UPDATE",
+                Bound::Launch(LaunchRequest::Application(_)) => "APPLICATION",
+                Bound::Launch(LaunchRequest::Install(_)) => "INSTALL",
                 Bound::Launcher(_) | Bound::Pointer(_, Pointing::Launcher) => "OPEN LAUNCHER",
                 Bound::Help(_) => "THIS HELP",
                 Bound::Screenshot(_) => "SCREENSHOT",
@@ -8512,9 +8518,8 @@ mod tests {
         runtime.lock().unwrap().repaint().unwrap();
         let launches = LaunchProcesses::new(LaunchOptions {
             socket: PathBuf::from("/run/user/1000/wayland-0"),
-            client: Some(PathBuf::from("/bin/td-ui-demo")),
+            client: PathBuf::from("/bin/td-ui-demo"),
             terminal: PathBuf::from("/bin/td-term"),
-            application: None,
         })
         .unwrap();
         let target = Mutex::new(LiveInputTarget {
@@ -8562,9 +8567,8 @@ mod tests {
         runtime.lock().unwrap().repaint().unwrap();
         let launches = LaunchProcesses::new(LaunchOptions {
             socket: PathBuf::from("/run/user/1000/wayland-0"),
-            client: Some(PathBuf::from("/bin/td-ui-demo")),
+            client: PathBuf::from("/bin/td-ui-demo"),
             terminal: PathBuf::from("/bin/td-term"),
-            application: None,
         })
         .unwrap();
         let target = Mutex::new(LiveInputTarget {
@@ -8647,9 +8651,8 @@ mod tests {
         runtime.lock().unwrap().repaint().unwrap();
         let launches = LaunchProcesses::new(LaunchOptions {
             socket: PathBuf::from("/run/user/1000/wayland-0"),
-            client: Some(PathBuf::from("/bin/td-ui-demo")),
+            client: PathBuf::from("/bin/td-ui-demo"),
             terminal: PathBuf::from("/bin/td-term"),
-            application: None,
         })
         .unwrap();
         let target = Mutex::new(LiveInputTarget {
@@ -9334,9 +9337,8 @@ mod tests {
         runtime.lock().unwrap().enable_attention(true);
         let launches = LaunchProcesses::new(LaunchOptions {
             socket: PathBuf::from("/run/user/1000/wayland-0"),
-            client: Some(PathBuf::from("/bin/td-ui-demo")),
+            client: PathBuf::from("/bin/td-ui-demo"),
             terminal: PathBuf::from("/bin/td-term"),
-            application: None,
         })
         .unwrap();
         let mut target = LiveInputTarget {
@@ -9393,9 +9395,8 @@ mod tests {
         runtime.lock().unwrap().enable_attention(true);
         let launches = LaunchProcesses::new(LaunchOptions {
             socket: PathBuf::from("/run/user/1000/wayland-0"),
-            client: Some(PathBuf::from("/bin/td-ui-demo")),
+            client: PathBuf::from("/bin/td-ui-demo"),
             terminal: PathBuf::from("/bin/td-term"),
-            application: None,
         })
         .unwrap();
         let bindings = Arc::new(Mutex::new(KeyBindings {

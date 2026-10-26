@@ -689,6 +689,9 @@ impl UnitProbe {
     /// `asking` says a start request's client for it is still in flight.
     fn answer(&mut self, name: &str, asking: bool) -> UnitState {
         self.follow(name);
+        // A start of it still in flight is a start asked, whichever
+        // application the probe followed when it was made.
+        self.asked |= asking;
         self.advance();
         let due = self
             .began

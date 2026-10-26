@@ -875,11 +875,12 @@ previous design gap where a three-column row gave `td-jail` no way to locate a
 content-addressed package. The image now selects Firefox into both tables.
 Every launch is td-authd's supervised start, which execs td-jail under the
 application's name (§A.0); there is no direct `/bin/<name>` route. The
-current compositor receives the selected Firefox name as an explicit image
-argument and uses the launcher row only as builder-authenticated metadata; its
-application card activates an already mapped observed surface or asks root to
-start the service, and never executes td-jail itself. Fully table-driven
-compositor discovery remains later work.
+compositor's card is table-driven (td-compositor/DESIGN.md, the launcher): it
+reads `/etc/td-launcher.tsv` once at startup, shows each application root's
+installed set says is installed (td-authd/DESIGN.md, request `23`), activates
+a mapped toplevel whose own app id is the row's fourth column or asks root to
+start the application's unit by name (`0d NAME`), and never executes td-jail
+itself.
 
 An image selection names the authenticated application identity plus its
 package catalog key and runtime catalog key. The latter two are data inputs.

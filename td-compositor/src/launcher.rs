@@ -12,16 +12,6 @@ const CARD: [u8; 4] = [0x20, 0x18, 0x28, 0];
 const HIGHLIGHT: [u8; 4] = [0x58, 0x30, 0x70, 0];
 const CARD_PADDING: usize = 24;
 const MAX_LAUNCHED_CLIENTS: usize = 16;
-const MAX_APPLICATION_NAME_BYTES: usize = 32;
-const RESERVED_APPLICATION_NAMES: &[&str] = &["td-jail", "td-jail-reaper-probe"];
-const UI_ENTRY_INDEX: usize = 1;
-/// The configured application's update row, shown only with the authority.
-const UPDATE_ENTRY_INDEX: usize = UI_ENTRY_INDEX + 1;
-/// The rows before the authority's desktop programs: terminal, then the
-/// application or monitor, then the application's update.
-const LEADING_ENTRIES: usize = UPDATE_ENTRY_INDEX + 1;
-/// The leading rows, the desktop programs, and close, which is always last.
-const ENTRY_COUNT: usize = LEADING_ENTRIES + AUTHORITY_ENTRIES.len() + 1;
 /// Where the first row's text starts below the card's top, how far apart
 /// rows are, and the highlight drawn behind the selected one. One set of
 /// numbers for the paint and the pointer, so a click lands on the row it
@@ -33,6 +23,9 @@ const ROW_RISE: usize = 8;
 const ROW_HEIGHT: usize = 32;
 /// A row's label is one row of text cells, so this tall.
 const LABEL_HEIGHT: usize = CELL_HEIGHT;
+/// The most rows a full-size card shows at once; the window of rows
+/// scrolls with the selection over every match.
+const CARD_ROWS: usize = (CARD_HEIGHT - FIRST_ROW_TOP - LABEL_HEIGHT) / ROW_STEP + 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LauncherAction {
@@ -42,7 +35,7 @@ pub enum LauncherAction {
     Close,
     Activate,
     /// The pointer's Activate: the `n`th row SHOWN, which is a position in
-    /// the filtered list rather than in the registry.
+    /// the window of the filtered list rather than in the table.
     Choose(usize),
     Insert(char),
     Backspace,
@@ -59,8 +52,13 @@ pub enum LaunchRequest {
     Dua,
     Agent,
     Software,
-    /// Check the configured application's Flathub cache now.
+    /// Check the update row's application's Flathub cache now.
     UpdateApplication,
+    /// The launcher table's application at this position in the card's
+    /// order (`Launcher::application`): raise its window or start it.
+    Application(usize),
+    /// Open td-software at that application, which is not installed.
+    Install(usize),
 }
 
 impl LaunchRequest {
@@ -75,7 +73,11 @@ impl LaunchRequest {
             Self::Dua => Some(crate::authority::Program::Dua),
             Self::Agent => Some(crate::authority::Program::Agent),
             Self::Software => Some(crate::authority::Program::Software),
-            Self::UiDemo | Self::Terminal | Self::UpdateApplication => None,
+            Self::UiDemo
+            | Self::Terminal
+            | Self::UpdateApplication
+            | Self::Application(_)
+            | Self::Install(_) => None,
         }
     }
 }
@@ -99,6 +101,12 @@ const CLOSE_ENTRY: Entry = Entry {
     label: "CLOSE LAUNCHER",
     search: "close launcher",
     request: None,
+};
+
+const SOFTWARE_ENTRY: Entry = Entry {
+    label: "SOFTWARE",
+    search: "software install remove applications apps flathub",
+    request: Some(LaunchRequest::Software),
 };
 
 // The image's desktop programs, each a fixed authority request: shown only
@@ -134,11 +142,6 @@ const AUTHORITY_ENTRIES: &[Entry] = &[
         search: "coding agent ai assistant model llm openrouter",
         request: Some(LaunchRequest::Agent),
     },
-    Entry {
-        label: "SOFTWARE",
-        search: "software install remove applications apps flathub",
-        request: Some(LaunchRequest::Software),
-    },
 ];
 
 const DIRECT_UI_ENTRY: Entry = Entry {
@@ -147,44 +150,67 @@ const DIRECT_UI_ENTRY: Entry = Entry {
     request: Some(LaunchRequest::UiDemo),
 };
 
-#[derive(Clone)]
-struct ApplicationEntry {
-    label: String,
-    search: String,
-    update_label: String,
-    update_search: String,
+/// The card's fixed rows, in its order: with the authority the terminal,
+/// td-software, the desktop programs and close (td-software/DESIGN.md
+/// §5); without it, the development launcher's terminal, monitor and
+/// close.
+fn fixed_entry(authority: bool, index: usize) -> Option<Entry<'static>> {
+    if authority {
+        match index {
+            0 => Some(TERMINAL_ENTRY),
+            1 => Some(SOFTWARE_ENTRY),
+            index if index == AUTHORITY_ENTRIES.len() + 2 => Some(CLOSE_ENTRY),
+            index => index
+                .checked_sub(2)
+                .and_then(|at| AUTHORITY_ENTRIES.get(at))
+                .copied(),
+        }
+    } else {
+        [TERMINAL_ENTRY, DIRECT_UI_ENTRY, CLOSE_ENTRY]
+            .get(index)
+            .copied()
+    }
 }
 
-fn entry_at(
-    application: Option<&ApplicationEntry>,
-    index: usize,
-    authority: bool,
-) -> Option<Entry<'_>> {
-    match index {
-        0 => Some(TERMINAL_ENTRY),
-        UI_ENTRY_INDEX => match application {
-            Some(application) => Some(Entry {
-                label: &application.label,
-                search: &application.search,
-                request: Some(LaunchRequest::UiDemo),
-            }),
-            None => Some(DIRECT_UI_ENTRY),
-        },
-        UPDATE_ENTRY_INDEX => match application {
-            Some(application) if authority => Some(Entry {
-                label: &application.update_label,
-                search: &application.update_search,
-                request: Some(LaunchRequest::UpdateApplication),
-            }),
-            _ => None,
-        },
-        index if index == ENTRY_COUNT - 1 => Some(CLOSE_ENTRY),
-        index if authority => index
-            .checked_sub(LEADING_ENTRIES)
-            .and_then(|at| AUTHORITY_ENTRIES.get(at))
-            .copied(),
-        _ => None,
+fn fixed_count(authority: bool) -> usize {
+    if authority {
+        AUTHORITY_ENTRIES.len() + 3
+    } else {
+        3
     }
+}
+
+/// A launcher table application, as the card shows it.
+#[derive(Clone)]
+struct Application {
+    name: String,
+    label: String,
+    search: String,
+    install_label: String,
+    /// The search text with `install`, so a query naming the row's verb
+    /// finds it too.
+    install_search: String,
+    /// Root's last word on it, `None` until the first.
+    installed: Option<bool>,
+}
+
+/// The update row (APPLICATIONS.md §W.9), beside its application until
+/// td-software/DESIGN.md §6's cutover removes it.
+#[derive(Clone)]
+struct Update {
+    application: usize,
+    label: String,
+    search: String,
+}
+
+/// A row the filter left: a fixed entry, a table application, its update
+/// row, or the one Install row.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Item {
+    Fixed(usize),
+    Application(usize),
+    Update,
+    Install(usize),
 }
 
 /// The card, centred and shrunk to fit an output smaller than it.
@@ -240,23 +266,21 @@ fn contains(rect: (usize, usize, usize, usize), x: usize, y: usize) -> bool {
 #[derive(Clone)]
 pub struct Launcher {
     visible: bool,
+    /// The selected match, and the first match the window of rows shows.
     selected: usize,
+    scroll: usize,
     query: String,
-    matches: Vec<usize>,
-    application: Option<ApplicationEntry>,
+    matches: Vec<Item>,
+    /// The launcher table's applications, by display name.
+    applications: Vec<Application>,
+    update: Option<Update>,
     authority: bool,
 }
 
 pub struct LaunchOptions {
     pub socket: PathBuf,
-    pub client: Option<PathBuf>,
+    pub client: PathBuf,
     pub terminal: PathBuf,
-    pub application: Option<ApplicationLaunch>,
-}
-
-#[derive(Clone)]
-pub struct ApplicationLaunch {
-    pub name: String,
 }
 
 pub(crate) trait ChildProcess {
@@ -311,13 +335,6 @@ impl LaunchBackend {
         }
     }
 
-    pub fn activates_application(&self) -> bool {
-        match self {
-            Self::Direct(processes) => processes.activates_application(),
-            Self::Authority(_) => true,
-        }
-    }
-
     /// The application `name` has no window: ask root to start its unit,
     /// which does nothing if it is already running.
     pub fn start_application(&self, name: &str) -> Result<(), String> {
@@ -326,6 +343,14 @@ impl LaunchBackend {
                 authority.supervise(crate::authority::Supervised::Start(name.to_string()))
             }
             Self::Direct(_) => Err("starting the application requires the paired authority".into()),
+        }
+    }
+
+    /// The application `name` is not installed: open td-software at it.
+    pub fn install_application(&self, name: &str) -> Result<(), String> {
+        match self {
+            Self::Authority(authority) => authority.launch_software_at(name),
+            Self::Direct(_) => Err("installing requires the paired authority".into()),
         }
     }
 
@@ -345,10 +370,6 @@ impl LaunchBackend {
                     authority.launch_selected(program)?;
                     Ok(Vec::new())
                 }
-                // LiveInputTarget activates the configured scene before calling us.
-                None if request == LaunchRequest::UiDemo => {
-                    Err("configured application is activation-only".into())
-                }
                 None => Err(format!("{request:?} has no authority program")),
             },
         }
@@ -362,45 +383,13 @@ struct LaunchedChild<C> {
 
 impl LaunchOptions {
     fn validate(&self) -> Result<(), String> {
-        if !self.socket.is_absolute() {
-            return Err(format!(
-                "Wayland socket {} is not absolute",
-                self.socket.display()
-            ));
-        }
-        if !self.terminal.is_absolute() {
-            return Err(format!(
-                "launcher terminal {} is not absolute",
-                self.terminal.display()
-            ));
-        }
-        match (&self.client, &self.application) {
-            (Some(client), None) if !client.is_absolute() => {
-                return Err(format!(
-                    "launcher client {} is not absolute",
-                    client.display()
-                ));
-            }
-            (Some(_), Some(_)) | (None, None) => {
-                return Err(
-                    "exactly one launcher client or launcher application is required".into(),
-                );
-            }
-            _ => {}
-        }
-        if let Some(application) = &self.application {
-            if application.name.is_empty()
-                || application.name.len() > MAX_APPLICATION_NAME_BYTES
-                || application.name.starts_with('-')
-                || application.name == "."
-                || application.name.contains("..")
-                || RESERVED_APPLICATION_NAMES.contains(&application.name.as_str())
-                || !application
-                    .name
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-            {
-                return Err("launcher application name is outside the image grammar".into());
+        for (what, path) in [
+            ("Wayland socket", &self.socket),
+            ("launcher terminal", &self.terminal),
+            ("launcher client", &self.client),
+        ] {
+            if !path.is_absolute() {
+                return Err(format!("{what} {} is not absolute", path.display()));
             }
         }
         Ok(())
@@ -409,14 +398,18 @@ impl LaunchOptions {
 
 impl Launcher {
     pub fn new() -> Launcher {
-        Launcher {
+        let mut launcher = Launcher {
             visible: false,
             selected: 0,
+            scroll: 0,
             query: String::with_capacity(filter::MAX_QUERY_BYTES),
-            matches: vec![0, UI_ENTRY_INDEX, ENTRY_COUNT - 1],
-            application: None,
+            matches: Vec::new(),
+            applications: Vec::new(),
+            update: None,
             authority: false,
-        }
+        };
+        launcher.refresh_matches();
+        launcher
     }
 
     pub(crate) fn set_authority(&mut self, available: bool) {
@@ -424,26 +417,84 @@ impl Launcher {
         self.refresh_matches();
     }
 
-    pub(crate) fn set_application(&mut self, application: Option<&str>) {
-        self.application = application.map(|name| ApplicationEntry {
-            label: name.to_ascii_uppercase(),
-            search: name.to_ascii_lowercase(),
-            update_label: format!("UPDATE {}", name.to_ascii_uppercase()),
-            update_search: format!("update check {}", name.to_ascii_lowercase()),
+    /// The launcher table's applications, which the card orders by display
+    /// name; none is shown until root says it is installed.
+    pub(crate) fn set_table(&mut self, rows: &[crate::launcher_table::Row]) {
+        let mut applications: Vec<Application> = rows
+            .iter()
+            .map(|row| {
+                let label = row.display.to_uppercase();
+                let mut search = row.display.to_lowercase();
+                for word in row.terms.iter().chain(std::iter::once(&row.name)) {
+                    search.push(' ');
+                    search.push_str(&word.to_lowercase());
+                }
+                Application {
+                    name: row.name.clone(),
+                    install_label: format!("INSTALL {label}"),
+                    install_search: format!("install {search}"),
+                    label,
+                    search,
+                    installed: None,
+                }
+            })
+            .collect();
+        applications.sort_by(|one, other| {
+            one.label
+                .cmp(&other.label)
+                .then_with(|| one.name.cmp(&other.name))
+        });
+        self.applications = applications;
+        self.update = None;
+        self.refresh_matches();
+    }
+
+    /// The update row for `name`, a table application, beside it.
+    pub(crate) fn set_update(&mut self, name: Option<&str>) {
+        self.update = name.and_then(|name| {
+            let application = self.applications.iter().position(|a| a.name == name)?;
+            let label = self.applications.get(application)?.label.clone();
+            Some(Update {
+                application,
+                search: format!("update check {}", label.to_lowercase()),
+                label: format!("UPDATE {label}"),
+            })
         });
         self.refresh_matches();
+    }
+
+    /// Root's installed set: which table applications the card shows.
+    pub(crate) fn set_installed(&mut self, installed: impl Fn(&str) -> Option<bool>) {
+        for application in &mut self.applications {
+            application.installed = installed(&application.name);
+        }
+        let selected = self.matches.get(self.selected).copied();
+        let scroll = self.scroll;
+        self.refresh_matches();
+        // A set that arrives while the card is up keeps the selection and,
+        // as far as the shorter list allows, the window.
+        if let Some(at) = selected.and_then(|item| self.matches.iter().position(|m| *m == item)) {
+            self.selected = at;
+            self.scroll = scroll.min(self.matches.len().saturating_sub(CARD_ROWS));
+            self.scroll_to_selection();
+        }
+    }
+
+    /// The table application a request names, by its position.
+    pub(crate) fn application(&self, index: usize) -> Option<&str> {
+        self.applications.get(index).map(|a| a.name.as_str())
     }
 
     pub fn apply(&mut self, action: LauncherAction) -> Option<LaunchRequest> {
         match action {
             LauncherAction::Open => {
                 self.visible = true;
-                self.selected = 0;
                 self.query.clear();
                 self.refresh_matches();
             }
             LauncherAction::Next if self.visible && !self.matches.is_empty() => {
                 self.selected = self.selected.saturating_add(1) % self.matches.len();
+                self.scroll_to_selection();
             }
             LauncherAction::Previous if self.visible && !self.matches.is_empty() => {
                 self.selected = if self.selected == 0 {
@@ -451,17 +502,21 @@ impl Launcher {
                 } else {
                     self.selected.saturating_sub(1)
                 };
+                self.scroll_to_selection();
             }
             LauncherAction::Close => self.visible = false,
-            LauncherAction::Choose(row) if self.visible && row < self.matches.len() => {
-                self.selected = row;
-                return self.apply(LauncherAction::Activate);
+            LauncherAction::Choose(row) if self.visible => {
+                let at = self.scroll.saturating_add(row);
+                if row < CARD_ROWS && at < self.matches.len() {
+                    self.selected = at;
+                    return self.apply(LauncherAction::Activate);
+                }
             }
             LauncherAction::Activate if self.visible => {
                 let request = self
                     .matches
                     .get(self.selected)
-                    .and_then(|index| entry_at(self.application.as_ref(), *index, self.authority))
+                    .and_then(|item| self.entry(*item))
                     .map(|entry| entry.request);
                 let request = request?;
                 self.visible = false;
@@ -486,17 +541,91 @@ impl Launcher {
         None
     }
 
+    fn entry(&self, item: Item) -> Option<Entry<'_>> {
+        match item {
+            Item::Fixed(index) => fixed_entry(self.authority, index),
+            Item::Application(index) => self.applications.get(index).map(|a| Entry {
+                label: &a.label,
+                search: &a.search,
+                request: Some(LaunchRequest::Application(index)),
+            }),
+            Item::Update => self.update.as_ref().map(|update| Entry {
+                label: &update.label,
+                search: &update.search,
+                request: Some(LaunchRequest::UpdateApplication),
+            }),
+            Item::Install(index) => self.applications.get(index).map(|a| Entry {
+                label: &a.install_label,
+                search: &a.install_search,
+                request: Some(LaunchRequest::Install(index)),
+            }),
+        }
+    }
+
+    /// The fixed entries, then each installed application and its update
+    /// row, that the query matches. A query matching nothing else but an
+    /// application root says is not installed shows one row, the first
+    /// such: install it in td-software. An application's update row shows
+    /// only once it is installed: before, its row is the Install row.
     fn refresh_matches(&mut self) {
         self.matches.clear();
-        for index in 0..ENTRY_COUNT {
-            let Some(entry) = entry_at(self.application.as_ref(), index, self.authority) else {
-                continue;
-            };
-            if filter::matches(entry.search, &self.query) {
-                self.matches.push(index);
+        let query = self.query.as_str();
+        for index in 0..fixed_count(self.authority) {
+            if fixed_entry(self.authority, index).is_some_and(|e| filter::matches(e.search, query))
+            {
+                self.matches.push(Item::Fixed(index));
+            }
+        }
+        if self.authority {
+            for (index, application) in self.applications.iter().enumerate() {
+                if application.installed != Some(true) {
+                    continue;
+                }
+                if filter::matches(&application.search, query) {
+                    self.matches.push(Item::Application(index));
+                }
+                if self.update.as_ref().is_some_and(|update| {
+                    update.application == index && filter::matches(&update.search, query)
+                }) {
+                    self.matches.push(Item::Update);
+                }
+            }
+            if self.matches.is_empty() && !query.is_empty() {
+                if let Some(index) = self.applications.iter().position(|application| {
+                    application.installed == Some(false)
+                        && filter::matches(&application.install_search, query)
+                }) {
+                    self.matches.push(Item::Install(index));
+                }
             }
         }
         self.selected = 0;
+        self.scroll = 0;
+    }
+
+    /// Moves the window of rows so the selection is in it.
+    fn scroll_to_selection(&mut self) {
+        if self.selected < self.scroll {
+            self.scroll = self.selected;
+        } else if self.selected >= self.scroll.saturating_add(CARD_ROWS) {
+            self.scroll = self.selected.saturating_add(1).saturating_sub(CARD_ROWS);
+        }
+    }
+
+    /// The first match a card of this size shows: the stored window, moved
+    /// further when a card shrunk below its full size holds fewer rows.
+    fn first_shown(&self, card: (usize, usize, usize, usize)) -> usize {
+        let rows = (0..CARD_ROWS)
+            .take_while(|row| row_shown(card, *row))
+            .count();
+        if rows == 0 {
+            return self.scroll;
+        }
+        if self.selected >= self.scroll.saturating_add(rows) {
+            self.selected.saturating_add(1).saturating_sub(rows)
+        } else {
+            self.scroll
+        }
     }
 
     fn visible_query(&self, columns: usize) -> &str {
@@ -521,9 +650,13 @@ impl Launcher {
         if !contains(card, x, y) {
             return Some(LauncherAction::Close);
         }
-        (0..self.matches.len())
+        let first = self.first_shown(card);
+        let shown = self.matches.len().saturating_sub(first).min(CARD_ROWS);
+        (0..shown)
             .position(|row| row_shown(card, row) && contains(row_area(card, row), x, y))
-            .map(LauncherAction::Choose)
+            .map(|row| {
+                LauncherAction::Choose(row.saturating_add(first).saturating_sub(self.scroll))
+            })
     }
 
     pub fn paint(&self, frame: &mut [u8], width: usize, height: usize, stride: usize, text: &Text) {
@@ -578,17 +711,17 @@ impl Launcher {
                 card,
             );
         }
-        for (match_index, entry_index) in self.matches.iter().enumerate() {
-            let Some(entry) = entry_at(self.application.as_ref(), *entry_index, self.authority)
-            else {
+        let first = self.first_shown(card);
+        for (row, item) in self.matches.iter().skip(first).take(CARD_ROWS).enumerate() {
+            let Some(entry) = self.entry(*item) else {
                 continue;
             };
-            if !row_shown(card, match_index) {
+            if !row_shown(card, row) {
                 break;
             }
-            let row_top = row_text_top(top, match_index);
-            if match_index == self.selected {
-                let highlight = row_area(card, match_index);
+            let selected = first.saturating_add(row) == self.selected;
+            if selected {
+                let highlight = row_area(card, row);
                 fill(frame, width, height, stride, highlight, HIGHLIGHT);
             }
             text.draw(
@@ -596,9 +729,9 @@ impl Launcher {
                 width,
                 height,
                 stride,
-                (left.saturating_add(24), row_top),
+                (left.saturating_add(24), row_text_top(top, row)),
                 entry.label,
-                if match_index == self.selected {
+                if selected {
                     ([0xff, 0xff, 0xff, 0], HIGHLIGHT)
                 } else {
                     ([0xa8, 0xa0, 0xb0, 0], CARD)
@@ -626,9 +759,7 @@ impl Launcher {
     fn matched_labels(&self) -> Vec<&str> {
         self.matches
             .iter()
-            .filter_map(|index| {
-                entry_at(self.application.as_ref(), *index, self.authority).map(|entry| entry.label)
-            })
+            .filter_map(|item| self.entry(*item).map(|entry| entry.label))
             .collect()
     }
 }
@@ -670,10 +801,6 @@ impl<S> LaunchProcesses<S>
 where
     S: ProcessSpawner,
 {
-    pub fn activates_application(&self) -> bool {
-        self.options.application.is_some()
-    }
-
     #[cfg(test)]
     fn with_spawner(options: LaunchOptions, spawner: S) -> Self {
         Self {
@@ -781,46 +908,32 @@ pub(crate) fn launch_command(
         "td-launcher-{}-{sequence}.ready",
         std::process::id()
     ));
-    // A configured application is owned by its supervised service. The card
-    // activates the observed surface through Runtime and must never create a
-    // second process over the same persistent profile.
-    let (program, published_ready, tracked_ready) = match (request, &options.application) {
-        (
-            LaunchRequest::TaskManager
-            | LaunchRequest::Editor
-            | LaunchRequest::Photo
-            | LaunchRequest::Review
-            | LaunchRequest::Dua
-            | LaunchRequest::Agent
-            | LaunchRequest::Software,
-            _,
-        ) => {
+    let program = match request {
+        LaunchRequest::TaskManager
+        | LaunchRequest::Editor
+        | LaunchRequest::Photo
+        | LaunchRequest::Review
+        | LaunchRequest::Dua
+        | LaunchRequest::Agent
+        | LaunchRequest::Software => {
             return Err("desktop programs are not configured for this development launcher".into());
         }
-        (LaunchRequest::UiDemo, Some(_)) => {
-            return Err("configured launcher application is activation-only".to_string());
+        LaunchRequest::UpdateApplication
+        | LaunchRequest::Application(_)
+        | LaunchRequest::Install(_) => {
+            return Err("applications require the paired authority".into());
         }
-        (LaunchRequest::UpdateApplication, _) => {
-            return Err("application updates require the paired authority".into());
-        }
-        (LaunchRequest::UiDemo, None) => (
-            options
-                .client
-                .clone()
-                .ok_or_else(|| "launcher client is not configured".to_string())?,
-            ready.clone(),
-            ready,
-        ),
-        (LaunchRequest::Terminal, _) => (options.terminal.clone(), ready.clone(), ready),
+        LaunchRequest::UiDemo => options.client.clone(),
+        LaunchRequest::Terminal => options.terminal.clone(),
     };
     let arguments = vec![
         OsString::from("run"),
         OsString::from("--socket"),
         options.socket.as_os_str().to_os_string(),
         OsString::from("--ready-socket"),
-        published_ready.as_os_str().to_os_string(),
+        ready.as_os_str().to_os_string(),
     ];
-    Ok((program, arguments, tracked_ready))
+    Ok((program, arguments, ready))
 }
 
 /// How long a failed launch's state stays on the bar.
@@ -994,12 +1107,15 @@ mod pending_launch_tests {
         );
     }
 
-    /// The bar draws every name the image grammar admits, uppercased, and
-    /// every phase, with Unifont behind the outline face.
+    /// The bar draws every name the registry grammar admits, uppercased,
+    /// the image's display names and every phase, with Unifont behind the
+    /// outline face. A table display name is any text without control
+    /// characters; one with a character neither face has draws that
+    /// character as the text renderer draws any it lacks.
     #[test]
     fn every_character_a_launch_can_spell_is_in_the_font() {
         let start = Instant::now();
-        let name = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-";
+        let name = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._- FIREFOX MAIL NEWS";
         let states = [
             outcome(1, false, None),
             outcome(1, false, Some(UnitState::Running)),
@@ -1049,7 +1165,6 @@ mod pending_launch_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::text::CELL_HEIGHT;
     use std::collections::VecDeque;
     use std::fs;
     use std::os::unix::net::UnixListener;
@@ -1093,9 +1208,8 @@ mod tests {
             socket: std::env::temp_dir()
                 .join(format!("td-launcher-fake-{}-missing", std::process::id()))
                 .join("wayland-0"),
-            client: Some(PathBuf::from("/bin/td-ui-demo")),
+            client: PathBuf::from("/bin/td-ui-demo"),
             terminal: PathBuf::from("/bin/td-term"),
-            application: None,
         }
     }
 
@@ -1243,39 +1357,18 @@ mod tests {
     }
 
     #[test]
-    fn application_configuration_names_only_the_ui_entry() {
-        assert_eq!(
-            entry_at(None, UI_ENTRY_INDEX, false).map(|entry| entry.label),
-            Some("NEW INPUT MONITOR")
-        );
-        let mut launcher = Launcher::new();
-        launcher.apply(LauncherAction::Open);
-        assert_eq!(
-            launcher.matched_labels(),
-            ["NEW TERMINAL", "NEW INPUT MONITOR", "CLOSE LAUNCHER"]
-        );
-        launcher.set_application(Some("firefox"));
-        assert_eq!(
-            launcher.matched_labels(),
-            ["NEW TERMINAL", "FIREFOX", "CLOSE LAUNCHER"]
-        );
-    }
-
-    #[test]
     fn filtering_is_ascii_bounded_and_matches_all_terms() {
         let mut launcher = Launcher::new();
-        launcher.set_application(Some("firefox"));
         launcher.apply(LauncherAction::Open);
-        for character in "FiReFoX".chars() {
+        for character in "NeW TeRm".chars() {
             launcher.apply(LauncherAction::Insert(character));
         }
-        assert_eq!(launcher.query(), "firefox");
-        assert_eq!(launcher.matched_labels(), ["FIREFOX"]);
+        assert_eq!(launcher.query(), "new term");
+        assert_eq!(launcher.matched_labels(), ["NEW TERMINAL"]);
         assert_eq!(
             launcher.apply(LauncherAction::Activate),
-            Some(LaunchRequest::UiDemo)
+            Some(LaunchRequest::Terminal)
         );
-
         launcher.apply(LauncherAction::Open);
         launcher.apply(LauncherAction::Insert('é'));
         launcher.apply(LauncherAction::Insert('\n'));
@@ -1370,13 +1463,8 @@ mod tests {
     }
 
     #[test]
-    fn registry_entries_are_searchable_and_fit_the_card() {
-        let glyph_height = CELL_HEIGHT;
-        let final_row = FIRST_ROW_TOP
-            .saturating_add(ENTRY_COUNT.saturating_sub(1).saturating_mul(ROW_STEP))
-            .saturating_add(glyph_height);
-        assert!(final_row <= CARD_HEIGHT);
-        for entry in [TERMINAL_ENTRY, CLOSE_ENTRY, DIRECT_UI_ENTRY]
+    fn fixed_entries_are_searchable_by_their_labels() {
+        for entry in [TERMINAL_ENTRY, CLOSE_ENTRY, DIRECT_UI_ENTRY, SOFTWARE_ENTRY]
             .into_iter()
             .chain(AUTHORITY_ENTRIES.iter().copied())
         {
@@ -1390,26 +1478,15 @@ mod tests {
 
     #[test]
     fn native_launch_commands_are_explicit_unique_and_socket_local() {
-        let options = LaunchOptions {
+        let direct = LaunchOptions {
             socket: PathBuf::from("/run/user/1000/wayland-0"),
-            client: None,
+            client: PathBuf::from("/bin/td-ui-demo"),
             terminal: PathBuf::from("/bin/td-term"),
-            application: Some(ApplicationLaunch {
-                name: "td-jail-fixture".into(),
-            }),
         };
-        assert!(launch_command(&options, LaunchRequest::UiDemo, 7).is_err());
         let (terminal, terminal_arguments, _) =
-            launch_command(&options, LaunchRequest::Terminal, 9).unwrap();
+            launch_command(&direct, LaunchRequest::Terminal, 9).unwrap();
         assert_eq!(terminal, PathBuf::from("/bin/td-term"));
         assert_eq!(terminal_arguments.first(), Some(&OsString::from("run")));
-
-        let direct = LaunchOptions {
-            socket: options.socket.clone(),
-            client: Some(PathBuf::from("/bin/td-ui-demo")),
-            terminal: options.terminal.clone(),
-            application: None,
-        };
         let (_, direct_arguments, direct_ready) =
             launch_command(&direct, LaunchRequest::UiDemo, 10).unwrap();
         assert_eq!(
@@ -1417,61 +1494,34 @@ mod tests {
             Some(direct_ready.as_os_str())
         );
         assert_eq!(direct_ready.parent(), Some(Path::new("/run/user/1000")));
+        // Table applications are the authority's alone.
+        for request in [
+            LaunchRequest::UpdateApplication,
+            LaunchRequest::Application(0),
+            LaunchRequest::Install(0),
+        ] {
+            assert!(launch_command(&direct, request, 1).is_err(), "{request:?}");
+        }
 
         let relative = LaunchOptions {
             socket: PathBuf::from("wayland-0"),
-            client: Some(PathBuf::from("/bin/td-ui-demo")),
+            client: PathBuf::from("/bin/td-ui-demo"),
             terminal: PathBuf::from("/bin/td-term"),
-            application: None,
         };
         assert!(launch_command(&relative, LaunchRequest::UiDemo, 0).is_err());
         let relative = LaunchOptions {
             socket: PathBuf::from("/run/user/1000/wayland-0"),
-            client: Some(PathBuf::from("td-ui-demo")),
+            client: PathBuf::from("td-ui-demo"),
             terminal: PathBuf::from("/bin/td-term"),
-            application: None,
         };
         assert!(launch_command(&relative, LaunchRequest::UiDemo, 0).is_err());
         assert!(LaunchProcesses::new(relative).is_err());
-        let ambiguous = LaunchOptions {
-            socket: PathBuf::from("/run/user/1000/wayland-0"),
-            client: Some(PathBuf::from("/bin/td-jail-fixture")),
-            terminal: PathBuf::from("/bin/td-term"),
-            application: Some(ApplicationLaunch {
-                name: "td-jail-fixture".into(),
-            }),
-        };
-        assert!(launch_command(&ambiguous, LaunchRequest::UiDemo, 0).is_err());
-        assert!(LaunchProcesses::new(ambiguous).is_err());
-        for name in RESERVED_APPLICATION_NAMES {
-            let reserved = LaunchOptions {
-                socket: PathBuf::from("/run/user/1000/wayland-0"),
-                client: None,
-                terminal: PathBuf::from("/bin/td-term"),
-                application: Some(ApplicationLaunch {
-                    name: (*name).into(),
-                }),
-            };
-            assert!(launch_command(&reserved, LaunchRequest::UiDemo, 0).is_err());
-            assert!(LaunchProcesses::new(reserved).is_err());
-        }
-        let other_application = LaunchOptions {
-            socket: PathBuf::from("/run/user/1000/wayland-0"),
-            client: None,
-            terminal: PathBuf::from("/bin/td-term"),
-            application: Some(ApplicationLaunch {
-                name: "other-application".into(),
-            }),
-        };
-        assert!(launch_command(&other_application, LaunchRequest::UiDemo, 0).is_err());
-        assert!(LaunchProcesses::new(other_application).is_ok());
         // Both paths are refused, whichever request asks: the terminal is
         // spawned by the same `Command::new` the demo is.
         let relative = LaunchOptions {
             socket: PathBuf::from("/run/user/1000/wayland-0"),
-            client: Some(PathBuf::from("/bin/td-ui-demo")),
+            client: PathBuf::from("/bin/td-ui-demo"),
             terminal: PathBuf::from("td-term"),
-            application: None,
         };
         assert!(launch_command(&relative, LaunchRequest::Terminal, 0).is_err());
         assert!(launch_command(&relative, LaunchRequest::UiDemo, 0).is_err());
@@ -1577,9 +1627,8 @@ mod tests {
         fs::create_dir(&directory).unwrap();
         let options = LaunchOptions {
             socket: directory.join("wayland-0"),
-            client: Some(PathBuf::from("/bin/td-ui-demo")),
+            client: PathBuf::from("/bin/td-ui-demo"),
             terminal: PathBuf::from("/bin/td-term"),
-            application: None,
         };
         let mut states = VecDeque::new();
         states.push_back(Ok(ChildState::Failed("signal: 9".to_string())));
@@ -1608,9 +1657,8 @@ mod tests {
         fs::create_dir(&directory).unwrap();
         let options = LaunchOptions {
             socket: directory.join("wayland-0"),
-            client: Some(PathBuf::from("/bin/td-ui-demo")),
+            client: PathBuf::from("/bin/td-ui-demo"),
             terminal: PathBuf::from("/bin/td-term"),
-            application: None,
         };
         let mut states = VecDeque::new();
         states.push_back(Ok(ChildState::Exited));
@@ -1689,31 +1737,136 @@ mod tests {
 #[cfg(test)]
 mod authority_entry_tests {
     use super::*;
+    use crate::launcher_table::Row;
 
-    /// The configured application's update row (APPLICATIONS.md §W.9): only
-    /// beside its card and only when root can be asked, and opening the card
-    /// still comes first for its name.
-    #[test]
-    fn the_update_row_follows_the_application_and_the_authority() {
+    fn row(name: &str, display: &str, terms: &[&str], app_id: &str) -> Row {
+        Row {
+            name: name.into(),
+            display: display.into(),
+            terms: terms.iter().map(|term| term.to_string()).collect(),
+            app_id: app_id.into(),
+        }
+    }
+
+    fn image() -> Vec<Row> {
+        vec![
+            row("news", "News", &["feeds"], "td-news"),
+            row("firefox", "Firefox", &["browser"], "org.mozilla.firefox"),
+            row("mail", "Mail", &["email"], "td-mail"),
+        ]
+    }
+
+    fn authority_card(installed: &[&str]) -> Launcher {
         let mut launcher = Launcher::new();
-        launcher.set_application(Some("firefox"));
-        launcher.apply(LauncherAction::Open);
-        assert!(!launcher.matched_labels().contains(&"UPDATE FIREFOX"));
         launcher.set_authority(true);
+        launcher.set_table(&image());
+        launcher.set_installed(|name| Some(installed.contains(&name)));
+        launcher
+    }
+
+    const FIXED: &[&str] = &[
+        "NEW TERMINAL",
+        "SOFTWARE",
+        "TASK MANAGER",
+        "TEXT EDITOR",
+        "PHOTOS",
+        "CODE REVIEW",
+        "DISK USAGE",
+        "CODING AGENT",
+        "CLOSE LAUNCHER",
+    ];
+
+    /// td-software/DESIGN.md §5's order: the fixed entries, then the
+    /// installed applications by display name; nothing of the table
+    /// before root has answered.
+    #[test]
+    fn installed_applications_follow_the_fixed_entries_by_display_name() {
+        let mut launcher = Launcher::new();
+        launcher.set_authority(true);
+        launcher.set_table(&image());
+        launcher.apply(LauncherAction::Open);
+        assert_eq!(launcher.matched_labels(), FIXED);
+        launcher.set_installed(|name| Some(name != "firefox"));
+        let labels = launcher.matched_labels();
+        assert_eq!(labels.get(..FIXED.len()), Some(FIXED));
+        assert_eq!(labels.get(FIXED.len()..), Some(&["MAIL", "NEWS"][..]));
+        launcher.set_installed(|_| Some(true));
+        assert_eq!(
+            launcher.matched_labels().get(FIXED.len()..),
+            Some(&["FIREFOX", "MAIL", "NEWS"][..])
+        );
+        // A row asks for its application by position, which names it.
+        for (term, name) in [("browser", "firefox"), ("email", "mail"), ("news", "news")] {
+            launcher.apply(LauncherAction::Open);
+            for character in term.chars() {
+                launcher.apply(LauncherAction::Insert(character));
+            }
+            let Some(LaunchRequest::Application(index)) = launcher.apply(LauncherAction::Activate)
+            else {
+                panic!("{term} asked no application");
+            };
+            assert_eq!(launcher.application(index), Some(name));
+        }
+        // Without the authority the table is not on the card.
+        launcher.set_authority(false);
         launcher.apply(LauncherAction::Open);
         assert_eq!(
-            launcher.matched_labels().get(..3),
-            Some(&["NEW TERMINAL", "FIREFOX", "UPDATE FIREFOX"][..])
+            launcher.matched_labels(),
+            ["NEW TERMINAL", "NEW INPUT MONITOR", "CLOSE LAUNCHER"]
         );
-        for character in "firefox".chars() {
+    }
+
+    /// A search matching nothing but an application root says is not
+    /// installed shows one row, which opens td-software at it.
+    #[test]
+    fn a_search_for_only_an_uninstalled_application_offers_to_install_it() {
+        let mut launcher = authority_card(&["mail", "news"]);
+        launcher.apply(LauncherAction::Open);
+        for character in "fire".chars() {
             launcher.apply(LauncherAction::Insert(character));
         }
-        assert_eq!(launcher.matched_labels(), ["FIREFOX", "UPDATE FIREFOX"]);
-        assert_eq!(
-            launcher.apply(LauncherAction::Activate),
-            Some(LaunchRequest::UiDemo)
-        );
+        assert_eq!(launcher.matched_labels(), ["INSTALL FIREFOX"]);
+        let Some(LaunchRequest::Install(index)) = launcher.apply(LauncherAction::Activate) else {
+            panic!("no install row");
+        };
+        assert_eq!(launcher.application(index), Some("firefox"));
+        // Installed, the row is the application's own.
+        launcher.set_installed(|_| Some(true));
         launcher.apply(LauncherAction::Open);
+        for character in "fire".chars() {
+            launcher.apply(LauncherAction::Insert(character));
+        }
+        assert_eq!(launcher.matched_labels(), ["FIREFOX"]);
+        // A query that matches a fixed entry too offers no install.
+        let mut launcher = authority_card(&[]);
+        launcher.apply(LauncherAction::Open);
+        launcher.apply(LauncherAction::Insert('e'));
+        assert!(!launcher
+            .matched_labels()
+            .iter()
+            .any(|label| label.starts_with("INSTALL")));
+        // Before root has answered nothing is offered.
+        let mut unknown = Launcher::new();
+        unknown.set_authority(true);
+        unknown.set_table(&image());
+        unknown.apply(LauncherAction::Open);
+        for character in "fire".chars() {
+            unknown.apply(LauncherAction::Insert(character));
+        }
+        assert!(unknown.matched_labels().is_empty());
+    }
+
+    /// The update row (APPLICATIONS.md §W.9) follows its application,
+    /// installed or not, until the cutover removes it.
+    #[test]
+    fn the_update_row_follows_its_application() {
+        let mut launcher = authority_card(&["firefox", "mail"]);
+        launcher.set_update(Some("firefox"));
+        launcher.apply(LauncherAction::Open);
+        assert_eq!(
+            launcher.matched_labels().get(FIXED.len()..),
+            Some(&["FIREFOX", "UPDATE FIREFOX", "MAIL"][..])
+        );
         for character in "update".chars() {
             launcher.apply(LauncherAction::Insert(character));
         }
@@ -1725,7 +1878,33 @@ mod authority_entry_tests {
         assert!(LaunchRequest::UpdateApplication
             .authority_program()
             .is_none());
-        launcher.set_application(None);
+        launcher.set_installed(|name| Some(name == "mail"));
+        launcher.apply(LauncherAction::Open);
+        assert_eq!(
+            launcher.matched_labels().get(FIXED.len()..),
+            Some(&["MAIL"][..])
+        );
+        for (query, expected) in [
+            ("firefox", &["INSTALL FIREFOX"][..]),
+            ("install fire", &["INSTALL FIREFOX"][..]),
+            ("install", &["SOFTWARE"][..]),
+            ("update", &[][..]),
+        ] {
+            launcher.apply(LauncherAction::Open);
+            for character in query.chars() {
+                launcher.apply(LauncherAction::Insert(character));
+            }
+            assert_eq!(launcher.matched_labels(), expected, "{query}");
+        }
+        // A live boot installs nothing, so it offers no Install row either.
+        launcher.set_installed(|_| None);
+        launcher.apply(LauncherAction::Open);
+        for character in "firefox".chars() {
+            launcher.apply(LauncherAction::Insert(character));
+        }
+        assert!(launcher.matched_labels().is_empty());
+        launcher.set_installed(|_| Some(true));
+        launcher.set_update(None);
         launcher.apply(LauncherAction::Open);
         assert!(!launcher
             .matched_labels()
@@ -1733,7 +1912,7 @@ mod authority_entry_tests {
             .any(|label| label.starts_with("UPDATE")));
     }
 
-    /// The card's start and the update row each queue one name-free
+    /// The card's start, the update row and the install row each queue one
     /// request for the worker.
     #[test]
     fn the_backend_asks_root_for_the_applications_units() {
@@ -1752,6 +1931,12 @@ mod authority_entry_tests {
             queued.supervised(),
             Some(crate::authority::Supervised::Update)
         );
+        backend.install_application("firefox").unwrap();
+        assert_eq!(queued.software_at().as_deref(), Some("firefox"));
+        assert!(backend.install_application("Firefox").is_err());
+        for request in [LaunchRequest::Application(0), LaunchRequest::Install(0)] {
+            assert!(backend.launch(request).is_err());
+        }
     }
 
     #[test]
@@ -1764,21 +1949,7 @@ mod authority_entry_tests {
         );
         launcher.set_authority(true);
         launcher.apply(LauncherAction::Open);
-        assert_eq!(
-            launcher.matched_labels(),
-            [
-                "NEW TERMINAL",
-                "NEW INPUT MONITOR",
-                "TASK MANAGER",
-                "TEXT EDITOR",
-                "PHOTOS",
-                "CODE REVIEW",
-                "DISK USAGE",
-                "CODING AGENT",
-                "SOFTWARE",
-                "CLOSE LAUNCHER",
-            ]
-        );
+        assert_eq!(launcher.matched_labels(), FIXED);
         for (word, label, request) in [
             ("process", "TASK MANAGER", LaunchRequest::TaskManager),
             ("editor", "TEXT EDITOR", LaunchRequest::Editor),
@@ -1804,13 +1975,79 @@ mod authority_entry_tests {
         }
     }
 
+    /// The card shows at most CARD_ROWS rows, which a full card holds;
+    /// with the table's 256 applications installed every entry is reached
+    /// by the selection, shown when selected and pressable where shown,
+    /// and by a filter on its name.
+    #[test]
+    fn the_window_fits_and_every_entry_is_reachable() {
+        assert_eq!(CARD_ROWS, 11);
+        const {
+            assert!(
+                FIRST_ROW_TOP + (CARD_ROWS - 1) * ROW_STEP + LABEL_HEIGHT <= CARD_HEIGHT
+                    && FIRST_ROW_TOP + CARD_ROWS * ROW_STEP + LABEL_HEIGHT > CARD_HEIGHT
+            )
+        };
+        let rows: Vec<Row> = (0..crate::launcher_table::MAX_ROWS)
+            .map(|n| {
+                row(
+                    &format!("app{n:03}"),
+                    &format!("App {n:03}"),
+                    &[],
+                    &format!("id{n}"),
+                )
+            })
+            .collect();
+        let mut launcher = Launcher::new();
+        launcher.set_authority(true);
+        launcher.set_table(&rows);
+        launcher.set_installed(|_| Some(true));
+        launcher.apply(LauncherAction::Open);
+        let total = FIXED.len() + rows.len();
+        assert_eq!(launcher.matches.len(), total);
+        let (width, height) = (1024usize, 768usize);
+        let full = card(width, height);
+        let short = card(width, 300);
+        for at in 0..total {
+            assert_eq!(launcher.selected(), at);
+            for shape in [full, short] {
+                let first = launcher.first_shown(shape);
+                let shown = (0..CARD_ROWS).take_while(|r| row_shown(shape, *r)).count();
+                assert!(first <= at && at < first + shown, "{at} not shown");
+            }
+            // The selected row's press chooses it.
+            let first = launcher.first_shown(full);
+            let (x, y) = row_centre(width, height, at - first);
+            let Some(LauncherAction::Choose(row)) = launcher.press_at(x, y, width, height) else {
+                panic!("no row under {at}");
+            };
+            let mut pressed = launcher.clone();
+            let request = pressed.apply(LauncherAction::Choose(row));
+            let expected = launcher
+                .matches
+                .get(at)
+                .and_then(|item| launcher.entry(*item));
+            assert_eq!(request, expected.and_then(|entry| entry.request));
+            launcher.apply(LauncherAction::Next);
+        }
+        assert_eq!(launcher.selected(), 0, "wraps");
+        launcher.apply(LauncherAction::Previous);
+        assert_eq!(launcher.selected(), total - 1);
+        for n in [0usize, 117, 255] {
+            launcher.apply(LauncherAction::Open);
+            for character in format!("app{n:03}").chars() {
+                launcher.apply(LauncherAction::Insert(character));
+            }
+            assert_eq!(launcher.matched_labels(), [format!("APP {n:03}")]);
+        }
+    }
+
     #[test]
     fn the_development_launcher_refuses_every_desktop_program() {
         let options = LaunchOptions {
             socket: PathBuf::from("/run/user/1000/wayland-0"),
-            client: Some(PathBuf::from("/bin/td-ui-demo")),
+            client: PathBuf::from("/bin/td-ui-demo"),
             terminal: PathBuf::from("/bin/td-term"),
-            application: None,
         };
         for request in [
             LaunchRequest::TaskManager,
