@@ -6,15 +6,15 @@
 //! none and uses no other module, so td-jail can `#[path]`-include it to
 //! read the same `selection` and pointers td-app writes.
 
-/// One declared application with a Flathub runtime. The bytes are not reviewed;
-/// these names, Flathub's signing key and the admission rules are.
+/// One declared Flathub application: its app ref and the one runtime ref it
+/// accepts, both fetched. The bytes are not reviewed; these names, Flathub's
+/// signing key and the admission rules are.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FlathubSource {
     /// The td application name: its registry row and launcher name.
     pub name: &'static str,
-    /// The app ref, or `None` when only the runtime is fetched and the
-    /// application tree stays in its `/td/store` package.
-    pub application: Option<&'static str>,
+    /// The app ref.
+    pub application: &'static str,
     /// The one runtime ref the application accepts.
     pub runtime: &'static str,
     /// The application's entry inside its namespace.
@@ -29,7 +29,7 @@ const PLATFORM_25_08: &str = "runtime/org.freedesktop.Platform/x86_64/25.08";
 
 pub const FLATHUB_SOURCES: &[FlathubSource] = &[FlathubSource {
     name: "firefox",
-    application: Some("app/org.mozilla.firefox/x86_64/stable"),
+    application: "app/org.mozilla.firefox/x86_64/stable",
     runtime: PLATFORM_25_08,
     entry: "/app/bin/firefox",
     policy_runtime: "freedesktop-platform-25-08",
@@ -42,10 +42,11 @@ pub fn flathub_source(name: &str) -> Option<FlathubSource> {
         .copied()
 }
 
-/// Where a spec's halves come from. A `/td/store` runtime path takes both
+/// Where a spec's trees come from. A `/td/store` runtime path takes both
 /// from the store and carries no `source=`; any other `runtime=` must be the
-/// declaration's runtime ref, with `source=` exactly when it names an app
-/// ref. The spec compiler and td-jail both hold specs to this.
+/// declaration's runtime ref beside `source=` its app ref, and both trees
+/// come from the account's cache. The spec compiler and td-jail both hold
+/// specs to this.
 pub fn spec_source(
     name: &str,
     source: Option<&str>,
@@ -59,7 +60,7 @@ pub fn spec_source(
     }
     let declared =
         flathub_source(name).ok_or_else(|| format!("{name} declares no Flathub runtime ref"))?;
-    if runtime != declared.runtime || source != declared.application {
+    if runtime != declared.runtime || source != Some(declared.application) {
         return Err(format!(
             "{name}'s spec does not name its declared Flathub refs"
         ));
@@ -101,7 +102,6 @@ pub const FILES: &str = "files";
 
 pub const MAX_STATE_BYTES: usize = 4096;
 const SELECTION_FORMAT: &str = "format=1";
-const PACKAGE_ROOT: &str = "/td/store/";
 const MAX_REF_BYTES: usize = 255;
 const MAX_NAME_BYTES: usize = 64;
 
@@ -118,30 +118,22 @@ pub struct Admitted {
 pub struct Selection {
     /// The declaration it was admitted for.
     pub name: String,
-    /// A digest of the rule-5 inputs no commit carries: the entry, the
-    /// store package and the dynamic-library policy. td-app computes it.
+    /// A digest of the rule-5 inputs no commit carries: the entry and the
+    /// dynamic-library policy. td-app computes it.
     pub checks: String,
-    /// The application commit, or `None` with `package` naming the
-    /// `/td/store` package that supplies the application tree.
-    pub application: Option<Admitted>,
-    pub package: Option<String>,
+    pub application: Admitted,
     pub runtime: Admitted,
 }
 
 impl Selection {
     pub fn render(&self) -> String {
-        let mut text = format!(
-            "{SELECTION_FORMAT}\nname={}\nchecks={}\n",
-            self.name, self.checks
-        );
-        if let Some(application) = &self.application {
-            text.push_str(&render_row("app", application));
-        }
-        if let Some(package) = &self.package {
-            text.push_str(&format!("package={package}\n"));
-        }
-        text.push_str(&render_row("runtime", &self.runtime));
-        text
+        format!(
+            "{SELECTION_FORMAT}\nname={}\nchecks={}\n{}{}",
+            self.name,
+            self.checks,
+            render_row("app", &self.application),
+            render_row("runtime", &self.runtime)
+        )
     }
 
     pub fn parse(text: &str) -> Result<Selection, String> {
@@ -163,18 +155,8 @@ impl Selection {
         if !valid_hex64(checks) {
             return Err("selection checks is not a SHA-256".into());
         }
-        let tree = lines.next().ok_or("selection names no application tree")?;
-        let (application, package) = if let Some(row) = tree.strip_prefix("app=") {
-            let admitted = parse_row(row)?;
-            require_kind(&admitted, "app")?;
-            (Some(admitted), None)
-        } else {
-            let package = field(Some(tree), "package")?;
-            if !valid_package(package) {
-                return Err(format!("selection package {package:?} is not a store path"));
-            }
-            (None, Some(package.to_string()))
-        };
+        let application = parse_row(field(lines.next(), "app")?)?;
+        require_kind(&application, "app")?;
         let runtime = parse_row(field(lines.next(), "runtime")?)?;
         require_kind(&runtime, "runtime")?;
         if let Some(line) = lines.next() {
@@ -184,7 +166,6 @@ impl Selection {
             name: name.to_string(),
             checks: checks.to_string(),
             application,
-            package,
             runtime,
         })
     }
@@ -195,9 +176,7 @@ impl Selection {
     }
 
     pub fn rows(&self) -> impl Iterator<Item = &Admitted> {
-        self.application
-            .iter()
-            .chain(std::iter::once(&self.runtime))
+        [&self.application, &self.runtime].into_iter()
     }
 }
 
@@ -283,17 +262,6 @@ fn valid_name(name: &str) -> bool {
         && name
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-}
-
-/// A direct child of `/td/store`.
-pub fn valid_package(path: &str) -> bool {
-    path.strip_prefix(PACKAGE_ROOT).is_some_and(|child| {
-        !child.is_empty()
-            && !child.starts_with('.')
-            && child
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || b"._+-".contains(&byte))
-    })
 }
 
 /// A generation directory's name: decimal, nonzero, no leading zero.
@@ -429,7 +397,6 @@ mod tests {
     const COMMIT: &str = "7985364b35b83cfe5aa17a00932df1c2d1dae69e5c592aa637a53ff1d53fdabc";
     const RUNTIME_COMMIT: &str = "bd44a62300000000000000000000000000000000000000000000000000000000";
     const CHECKS: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
-    const PACKAGE: &str = "/td/store/0123456789abcdefghijklmnopqrstuv-fixture-1";
 
     fn admitted(exact_ref: &str, commit: &str, timestamp: u64) -> Admitted {
         Admitted {
@@ -466,28 +433,16 @@ mod tests {
         let fetched = Selection {
             name: "firefox".into(),
             checks: CHECKS.into(),
-            application: Some(app),
-            package: None,
-            runtime: runtime.clone(),
-        };
-        let stored = Selection {
-            name: "fixture".into(),
-            checks: CHECKS.into(),
-            application: None,
-            package: Some(PACKAGE.into()),
+            application: app,
             runtime,
         };
-        for selection in [&fetched, &stored] {
-            assert_eq!(Selection::parse(&selection.render()).unwrap(), *selection);
-        }
+        assert_eq!(Selection::parse(&fetched.render()).unwrap(), fetched);
         assert_eq!(
             fetched.commits().collect::<Vec<_>>(),
             vec![COMMIT, RUNTIME_COMMIT]
         );
-        assert_eq!(stored.commits().collect::<Vec<_>>(), vec![RUNTIME_COMMIT]);
         let text = fetched.render();
         let lines: Vec<&str> = text.lines().collect();
-        let package_text = stored.render();
         let refused = [
             text.trim_end().to_string(),
             text.replacen("format=1", "format=2", 1),
@@ -506,8 +461,13 @@ mod tests {
             text.replacen("runtime=runtime/", "runtime=app/", 1),
             text.replacen("x86_64/stable", "x86_64/../stable", 1),
             text.replacen("\t20", "\t20\textra", 1),
-            package_text.replacen(PACKAGE, "/td/store/a/b", 1),
-            package_text.replacen(PACKAGE, "/var/lib/x", 1),
+            // The retired runtime-only form: a store package in place of
+            // the app row.
+            text.replacen(
+                lines[3],
+                "package=/td/store/0123456789abcdefghijklmnopqrstuv-fixture-1",
+                1,
+            ),
             "x".repeat(MAX_STATE_BYTES + 1),
         ];
         for bad in refused {
@@ -521,19 +481,17 @@ mod tests {
         assert_eq!(spec_source("firefox", None, store), Ok(None));
         assert_eq!(spec_source("mail", None, store), Ok(None));
         let firefox = flathub_source("firefox").unwrap();
+        let app = Some(firefox.application);
         assert_eq!(
-            spec_source("firefox", firefox.application, firefox.runtime),
+            spec_source("firefox", app, firefox.runtime),
             Ok(Some(firefox))
         );
         for (name, source, runtime) in [
-            ("firefox", firefox.application, store),
+            ("firefox", app, store),
+            // A runtime ref alone names no application tree.
             ("firefox", None, firefox.runtime),
-            ("other", firefox.application, firefox.runtime),
-            (
-                "firefox",
-                firefox.application,
-                "runtime/org.example.Other/x86_64/1",
-            ),
+            ("other", app, firefox.runtime),
+            ("firefox", app, "runtime/org.example.Other/x86_64/1"),
             ("mail", None, firefox.runtime),
         ] {
             assert!(
@@ -564,7 +522,7 @@ mod tests {
     }
 
     #[test]
-    fn refs_and_packages_have_one_narrow_shape() {
+    fn refs_have_one_narrow_shape() {
         assert!(valid_ref("app/org.mozilla.firefox/x86_64/stable"));
         for bad in [
             "app/a/b",
@@ -575,15 +533,6 @@ mod tests {
             "app/a b/c/d",
         ] {
             assert!(!valid_ref(bad), "{bad}");
-        }
-        assert!(valid_package(PACKAGE));
-        for bad in [
-            "/td/store/",
-            "/td/store/.x",
-            "/td/store/a/b",
-            "/td/storex/a",
-        ] {
-            assert!(!valid_package(bad), "{bad}");
         }
     }
 

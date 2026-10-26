@@ -1019,7 +1019,7 @@ image recipe, but it cannot make the contained application's own manifest claim
 `source`. This provenance is deliberately an answer about the recipe's direct
 staging, not its transitive runtime closure; the landed store-level closure
 query answers that separate question. A package whose runtime is its declared
-Flathub ref (§W.9) is foreign as well: its application or runtime bytes come
+Flathub ref (§W.9) is foreign as well: its application and runtime bytes come
 from Flathub though no payload edge says so.
 
 `Recipe::application_launcher` separately carries the typed display name and
@@ -1247,12 +1247,11 @@ Every foreign-source application requires exactly one check whose entry and
 runtime are bound to the builder-authenticated manifest. Assembly admits only
 native unpack/mkdir/copy steps before that terminal validation, so package code
 cannot race or mutate the approved tree. The exception is an application whose
-runtime is its declared Flathub ref (§W.9): no build stages that runtime, so
-it carries no validator, must be a mesboot recipe whose every step is a native
-`copyTree` or `copyFile`, and must declare the table's entry; td-app runs the
-same dynamic validator against the fetched runtime before any launch. Its
-copied bytes therefore reach the store and the image unvalidated, read there
-only as data (image packing, the profiler's walk) and never executed. The native archive reader and copy step
+runtime is its declared Flathub ref (§W.9): td-app fetches both its trees, so
+it carries no validator, must be a mesboot recipe with no source and no steps,
+and must declare the table's entry; td-app runs the same dynamic validator over
+the fetched trees before any launch, and the package holds only the metadata
+the builder writes. The native archive reader and copy step
 do not materialize device entries or xattrs, and the copy step refuses a symlink
 in any source-path component or any special-file source rather than
 dereferencing it; final validation rejects
@@ -11119,10 +11118,9 @@ holds for these payloads. Layout:
 ```
 
 `selection` is `format=1`, `name=` the declaration, `checks=` a SHA-256
-over rule 5's inputs that no commit carries (the entry, the store
-package and the dynamic-library policy), then either
-`app=REF<TAB>COMMIT<TAB>TIME` or `package=` the `/td/store` package that
-supplies the application tree, then `runtime=` in the row form. A pointer
+over rule 5's inputs that no commit carries (the entry and the
+dynamic-library policy), then `app=REF<TAB>COMMIT<TAB>TIME` and
+`runtime=` in the same row form. A pointer
 names exactly `generations/<n>` with no leading zero. Both are parsed by
 `engine/src/flathub_app.rs`, which uses no other module so that td-jail
 can include it.
@@ -11152,8 +11150,8 @@ It refuses to run as root or with a `HOME` another uid owns. Without
 `--force` it does nothing if `checked` is less than 24 hours old (and
 not in the future) and `current` still serves the declaration: the same
 name, refs and `checks`, with every deploy it names complete. A changed
-declaration, store package or policy, or a missing deploy, is therefore
-never throttled. `checked` is written only by a check that completed:
+declaration or policy, or a missing deploy, is therefore never
+throttled. `checked` is written only by a check that completed:
 a fetch failure or a refused candidate leaves it, so the next launch
 asks again. Before any tree is fetched it reads the ref, the commit and
 its commitmeta and applies 1–4. Rule 3's floor is the newest row for
@@ -11161,10 +11159,8 @@ the ref in `admitted`, `current` or `previous`, so a lost or stale
 `admitted` never admits a commit older than one already selected. It
 then acquires and materializes each new commit (an existing
 `deploy/<commit>/files` is complete, since it appears by one rename; a
-deploy without one is cleared first), validates under rule 5 (for a
-runtime-only source, against the application's `/td/store` package,
-read from `/etc/td-applications.tsv` under td-jail's rules before
-anything is fetched), writes `admitted`, and only then publishes. An
+deploy without one is cleared first), validates under rule 5, writes
+`admitted`, and only then publishes. An
 unchanged check rewrites `admitted` too.
 The materializer and the dynamic validator move from the builder into
 td-engine, where td-app runs the implementation the image build ran; td-net
@@ -11178,8 +11174,8 @@ only `HOME` in its environment. That takes no lock and answers with the
 generation `current` names while it still serves the declaration (the
 `serves` test above, `checks` included), or `absent`. With no serving
 generation td-jail waits for `td-app update NAME` and asks again: the
-first launch is a download, and an application whose package or policy
-changed under a system update, or whose deploy is damaged, does not
+first launch is a download, and an application whose declaration or
+policy changed under a system update, or whose deploy is damaged, does not
 start until a check has validated it again. Otherwise the daily check
 runs beside the launch, unwaited, and what it selects is used from the
 next launch, so a network failure never stops a working application.
@@ -11273,21 +11269,17 @@ its cache held, stays as inert data: firstboot prepares only the
 applications the deployment names, and no unit, launcher, grant or jail
 opens it. Root may delete that directory; the ledger row stays.
 
-**Each half of a spec resolves on its own.** A spec's application tree
-comes either from its `/td/store` package (`files/`) or, when the spec
-carries `source=`, from the account's held generation; its runtime comes
-either from a `/td/store` runtime path or, when `runtime=` names a
-Flathub ref, from the same generation. Firefox takes both from the
-cache; mail and news use neither. No declaration takes the runtime-only
-form now, a `/td/store` application tree on a fetched runtime; the rule
-keeps it for one.
-`flathub_app::spec_source` is the one rule the spec compiler and td-jail
-both apply: a `/td/store` runtime carries no `source=`; any other
-`runtime=` is the declaration's runtime ref, with `source=` exactly when
-the declaration names an app ref, and the loader policy is the one the
-declaration names. A runtime-only generation serves only the package it
-was validated with: td-jail refuses it when the registry's package
-differs from the selection's `package=`.
+**A spec's trees come from one place.** Either both come from
+`/td/store`, the application tree from its package (`files/`) and the
+runtime from a store path, or both come from the account's held
+generation, when `runtime=` names the declaration's Flathub runtime ref
+and `source=` its app ref. Firefox takes both from the cache; mail and
+news take both from the store. `flathub_app::spec_source` is the one rule
+the spec compiler and td-jail both apply: a `/td/store` runtime carries no
+`source=`; any other `runtime=` is the declaration's runtime ref beside
+`source=` the declaration's app ref, and the loader policy is the one the
+declaration names. A runtime ref without an app ref is refused: no
+spec runs a `/td/store` application tree on a fetched runtime.
 
 **The QEMU oracles keep Firefox.** Most proofs of the jail, portals,
 audio, input, seccomp and network run through the autostarted Firefox
@@ -11329,9 +11321,9 @@ these applications; it is a hint whose answer must pass 1–5.
 (§B.3.1, landed first). (2) This design and its AGENTS.md amendment.
 (3) Move the materializer and the dynamic validator into td-engine,
 unchanged (landed third). (4) `td-app update`: cache, admission,
-generations, daily and forced checks, for an application or a runtime
-alone, as a command nothing launches yet (landed fourth). (5) The
-spec's Flathub form, `td-app ready`, td-jail resolving each half from
+generations, daily and forced checks, as a command nothing launches yet
+(landed fourth). (5) The
+spec's Flathub form, `td-app ready`, td-jail resolving a spec's trees from
 the store or a held generation, collection sparing held generations,
 and `/bin/td-app` in the image, with no shipped spec yet in that form
 (landed fifth). td-app reaches Flathub from outside any jail as the

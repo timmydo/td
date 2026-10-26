@@ -749,8 +749,8 @@ where
     })
 }
 
-/// The application and runtime trees, each from `/td/store` or, for a spec
-/// naming Flathub refs, from the account's cache (APPLICATIONS.md §W.9).
+/// The application and runtime trees: both from `/td/store`, or, for a spec
+/// naming Flathub refs, both from the account's cache (APPLICATIONS.md §W.9).
 fn resolve_trees(
     name: &str,
     package: &Path,
@@ -780,38 +780,13 @@ fn resolve_trees(
     let selection = &generation.selection;
     if selection.name != name
         || selection.runtime.exact_ref != source.runtime
-        || selection
-            .application
-            .as_ref()
-            .map(|row| row.exact_ref.as_str())
-            != source.application
+        || selection.application.exact_ref != source.application
     {
         return Err(invalid(format!(
             "the cache's selection does not serve {name}'s declaration"
         )));
     }
-    let package_files = match &selection.application {
-        Some(application) => generation.tree(&application.commit, uid)?,
-        None => {
-            // td-app validated the runtime against one package; any other
-            // has not been.
-            let validated = selection
-                .package
-                .as_deref()
-                .ok_or_else(|| invalid("the cache's selection names no package"))?;
-            if physical_store_directory(
-                &config.package_root,
-                Path::new(validated),
-                "validated application package",
-            )? != package
-            {
-                return Err(invalid(format!(
-                    "the cache's runtime was validated against another {name} package"
-                )));
-            }
-            canonical_child_directory(package, "files", "application files")?
-        }
-    };
+    let package_files = generation.tree(&selection.application.commit, uid)?;
     let runtime_files = generation.tree(&selection.runtime.commit, uid)?;
     Ok((package_files, runtime_files, Some(generation.hold)))
 }

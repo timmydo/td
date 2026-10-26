@@ -72,10 +72,7 @@ mod tests {
         let recipe = recipe();
         let source = td_engine::flathub_app::flathub_source("firefox").expect("declared");
         assert_eq!(recipe.flathub_runtime(), Some(source.runtime));
-        assert_eq!(
-            source.application,
-            Some("app/org.mozilla.firefox/x86_64/stable")
-        );
+        assert_eq!(source.application, "app/org.mozilla.firefox/x86_64/stable");
         assert_eq!(source.policy_runtime, RUNTIME);
         assert!(recipe.is_foreign());
         assert!(!recipe.is_foreign_source());

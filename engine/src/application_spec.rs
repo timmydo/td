@@ -231,9 +231,7 @@ impl ApplicationSpec {
         }
         let spec = ApplicationSpec {
             name: manifest.name().to_string(),
-            source: flathub
-                .and_then(|declared| declared.application)
-                .map(str::to_string),
+            source: flathub.map(|declared| declared.application.to_string()),
             runtime: runtime_path.to_string(),
             entry: manifest.entry().to_string(),
             environment,
@@ -874,7 +872,7 @@ mod tests {
                 .unwrap();
         let spec =
             ApplicationSpec::compile(&manifest, firefox.runtime, PermissionPolicy::new()).unwrap();
-        assert_eq!(spec.source(), firefox.application);
+        assert_eq!(spec.source(), Some(firefox.application));
         assert_eq!(spec.runtime(), firefox.runtime);
         let text = spec.to_keyfile();
         assert!(text.starts_with(
@@ -1102,10 +1100,8 @@ mod tests {
         for source in FLATHUB_SOURCES {
             crate::ostree::validate_exact_ref(source.runtime).unwrap();
             assert!(valid_ref(source.runtime) && source.runtime.starts_with("runtime/"));
-            if let Some(application) = source.application {
-                crate::ostree::validate_exact_ref(application).unwrap();
-                assert!(valid_ref(application) && application.starts_with("app/"));
-            }
+            crate::ostree::validate_exact_ref(source.application).unwrap();
+            assert!(valid_ref(source.application) && source.application.starts_with("app/"));
             assert!(source.entry.starts_with("/app/"));
             assert!(dynamic_application_policy(source.name, source.policy_runtime).is_some());
         }

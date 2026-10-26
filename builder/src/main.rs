@@ -5892,10 +5892,10 @@ fn parse_application_permissions(
 }
 
 /// The declared Flathub runtime ref of an application whose recipe stages no
-/// runtime payload (APPLICATIONS.md §W.9). td-app fetches that runtime into
-/// the account's cache and validates the package against it at admission, so
-/// nothing in the build reads it. A recipe that stages the runtime keeps the
-/// store form.
+/// runtime payload (APPLICATIONS.md §W.9). td-app fetches the application and
+/// that runtime into the account's cache and validates both trees at
+/// admission, so nothing in the build reads either. A recipe that stages the
+/// runtime keeps the store form.
 fn flathub_application_runtime(
     name: &str,
     declaration: &td_engine::application::ApplicationDeclaration,
@@ -5929,20 +5929,27 @@ fn flathub_application_runtime(
     Ok(Some(source.runtime))
 }
 
-/// A Flathub-runtime application has no build-time validator, so nothing
-/// after its materialization would stop package code from running: it is a
-/// mesboot recipe of native copies alone, and td-app validates it at
-/// admission.
+/// A Flathub application is a declaration alone: td-app fetches both its
+/// trees into the account's cache and validates them at admission, so its
+/// package carries nothing but the metadata the builder writes. It is a
+/// mesboot recipe with no source and no steps.
 fn validate_flathub_application_steps(
     name: &str,
     build_system: &str,
     runtime: &str,
+    foreign_source: bool,
     alist: &json::Json,
 ) -> Result<(), String> {
     if build_system != "mesboot" {
         return Err(format!(
             "recipe `{name}': an application on the Flathub ref {runtime} must be a \
-             mesboot recipe of native copies"
+             mesboot recipe with no steps"
+        ));
+    }
+    if foreign_source || alist.get("sourceInput").is_some() {
+        return Err(format!(
+            "recipe `{name}': an application on the Flathub ref {runtime} takes both trees \
+             from td-app's cache, so it has no source"
         ));
     }
     let steps = match alist.get("steps") {
@@ -5951,15 +5958,11 @@ fn validate_flathub_application_steps(
             .as_arr()
             .ok_or_else(|| format!("recipe `{name}': `steps' must be an array"))?,
     };
-    for step in steps {
-        let operation = sole_object_field(step).map(|(operation, _)| operation);
-        if !matches!(operation, Some("copyTree" | "copyFile")) {
-            return Err(format!(
-                "recipe `{name}': its runtime is the Flathub ref {runtime}, which no build \
-                 stages, so td-app validates the package at admission; until then only \
-                 native copyTree and copyFile steps may touch it"
-            ));
-        }
+    if !steps.is_empty() {
+        return Err(format!(
+            "recipe `{name}': an application on the Flathub ref {runtime} takes both trees \
+             from td-app's cache, so it has no steps"
+        ));
     }
     Ok(())
 }
@@ -6184,13 +6187,13 @@ fn assemble_recipe_drv(
         None => None,
     };
     if let Some(runtime) = flathub_runtime {
-        validate_flathub_application_steps(name, build_system, runtime, &alist)?;
+        validate_flathub_application_steps(name, build_system, runtime, foreign_source, &alist)?;
     }
     validate_application_step_contract(
         name,
         &alist,
         application_declaration.as_ref(),
-        foreign_source && flathub_runtime.is_none(),
+        foreign_source,
     )?;
     let application_manifest = match application_declaration.as_ref() {
         Some(declaration) => {
@@ -17681,20 +17684,24 @@ daemon build START (2/2 active)
         );
         assert_eq!(spec.source(), Some("app/org.mozilla.firefox/x86_64/stable"));
 
-        // No validator, and nothing but native copies: nothing else stands
-        // between the build and the foreign bytes.
+        // Both trees come from td-app's cache: no step and no source, so
+        // the package holds no application bytes at all.
         for step in [
             r#"{"validateDynamicApplication":{"entry":"/app/bin/firefox","runtime":"freedesktop-platform-25-08","libraryPaths":[],"optionalTargets":[],"optionalLinks":0}}"#,
             r#"{"run":{"argv":["{out}/files/bin/firefox"],"dir":"{out}","env":[]}}"#,
             r#"{"mkDir":"{out}/files/lib"}"#,
+            r#"{"copyTree":{"from":"{in:source}","to":"{out}/files"}}"#,
         ] {
             let extended = firefox.replace(r#""steps":[]"#, &format!(r#""steps":[{step}]"#));
             let error = spec_of(&extended).unwrap_err();
-            assert!(
-                error.contains("only native copyTree and copyFile"),
-                "{error}"
-            );
+            assert!(error.contains("so it has no steps"), "{error}");
         }
+        let sourced = firefox.replace(
+            r#""buildSystem""#,
+            r#""sourceInput":"firefox-source","buildSystem""#,
+        );
+        let error = spec_of(&sourced).unwrap_err();
+        assert!(error.contains("so it has no source"), "{error}");
         let error =
             spec_of(&firefox.replace(r#""steps":[]"#, r#""steps":{"run":{}}"#)).unwrap_err();
         assert!(error.contains("`steps' must be an array"), "{error}");

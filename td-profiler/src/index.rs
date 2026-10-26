@@ -689,6 +689,10 @@ fn application_runtime(text: &str, expected_name: &str) -> Result<SpecRuntime, S
                 "application spec runtime is neither a store root nor a Flathub ref".into(),
             );
         }
+        // Both trees come from the cache: a runtime ref names an app ref.
+        if !fields.contains_key("source") {
+            return Err("application spec names a Flathub runtime without a source".into());
+        }
         return Ok(SpecRuntime::Flathub(runtime.to_string()));
     }
     if fields.contains_key("source") {
@@ -1016,6 +1020,7 @@ mod tests {
             spec.replace(REF, "app/org.mozilla.firefox/x86_64/stable"),
             spec.replace(REF, "/td/store/hash-runtime-1"),
             spec.replace("source=", "origin="),
+            spec.replace("source=app/org.mozilla.firefox/x86_64/stable\n", ""),
         ] {
             assert!(
                 application_runtime(&invalid, "firefox").is_err(),

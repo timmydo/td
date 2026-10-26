@@ -228,6 +228,8 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    const APP: &str = "app/org.example.Fixture/x86_64/stable";
+    const APP_COMMIT: &str = "bd44a62300000000000000000000000000000000000000000000000000000000";
     const RUNTIME: &str = "runtime/org.freedesktop.Platform/x86_64/25.08";
     const COMMIT: &str = "7985364b35b83cfe5aa17a00932df1c2d1dae69e5c592aa637a53ff1d53fdabc";
 
@@ -239,8 +241,11 @@ mod tests {
         let selection = Selection {
             name: "fixture".into(),
             checks: "0".repeat(64),
-            application: None,
-            package: Some("/td/store/0123456789abcdfghijklmnpqrsvwxyz-fixture-1".into()),
+            application: flathub_app::Admitted {
+                exact_ref: APP.into(),
+                commit: APP_COMMIT.into(),
+                timestamp: 20,
+            },
             runtime: flathub_app::Admitted {
                 exact_ref: RUNTIME.into(),
                 commit: COMMIT.into(),
@@ -268,6 +273,8 @@ mod tests {
         let held = hold(&home, 1, uid()).unwrap().unwrap();
         assert_eq!(held.selection.runtime.commit, COMMIT);
         assert_eq!(held.tree(COMMIT, uid()).unwrap(), files);
+        // A deploy the selection names but the cache lacks.
+        assert!(held.tree(APP_COMMIT, uid()).is_err());
         assert!(held.tree(COMMIT, uid().wrapping_add(1)).is_err());
         fs::set_permissions(&files, fs::Permissions::from_mode(0o775)).unwrap();
         assert!(held.tree(COMMIT, uid()).is_err());

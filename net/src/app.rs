@@ -43,9 +43,6 @@ const CHECK_INTERVAL_SECS: u64 = 24 * 60 * 60;
 const RESOLVE_TIME: Duration = Duration::from_secs(10 * 60);
 /// A ref file is 64 hex digits and a newline.
 const MAX_REF_BYTES: u64 = 65;
-const REGISTRY: &str = "/etc/td-applications.tsv";
-const MAX_REGISTRY_BYTES: u64 = 64 * 1024;
-const MAX_REGISTRY_ROWS: usize = 256;
 /// Part of every checks digest: raise it when rule 5's validator changes
 /// what it admits, so selections it never saw are validated again.
 const CHECKS_VERSION: &str = "td-app-checks-1";
@@ -70,7 +67,6 @@ struct Admission<'a> {
     feed: Option<&'a str>,
     verify: Verify,
     validate: Validate,
-    registry: &'a Path,
 }
 
 /// Where a feed names the commit it holds for a ref.
@@ -89,7 +85,6 @@ enum Outcome {
 
 /// What the declaration asks for before anything is fetched.
 struct Expected {
-    package: Option<PathBuf>,
     checks: String,
     library_paths: Vec<String>,
     optional_targets: Vec<String>,
@@ -433,49 +428,11 @@ fn deploy(
     Ok(out)
 }
 
-/// The application tree of a runtime-only source: its `/td/store` package,
-/// read under td-jail's registry rules.
-fn registry_package(registry: &Path, name: &str) -> Result<PathBuf, String> {
-    let bytes = read_bounded(registry, MAX_REGISTRY_BYTES)?
-        .ok_or_else(|| format!("{} is missing", registry.display()))?;
-    let text =
-        std::str::from_utf8(&bytes).map_err(|_| format!("{} is not UTF-8", registry.display()))?;
-    let mut previous: Option<&str> = None;
-    let mut found = None;
-    for (index, line) in text.lines().enumerate() {
-        if index >= MAX_REGISTRY_ROWS {
-            return Err(format!("{} has too many rows", registry.display()));
-        }
-        let mut fields = line.split('\t');
-        let (Some(row), Some(path), None) = (fields.next(), fields.next(), fields.next()) else {
-            return Err(format!("{} row {line:?} is malformed", registry.display()));
-        };
-        if previous.is_some_and(|prior| prior >= row) {
-            return Err(format!("{} is not strictly sorted", registry.display()));
-        }
-        previous = Some(row);
-        if !flathub_app::valid_package(path) {
-            return Err(format!(
-                "{} row {line:?} names no store package",
-                registry.display()
-            ));
-        }
-        if row == name {
-            found = Some(PathBuf::from(path));
-        }
-    }
-    found.ok_or_else(|| format!("{} has no {name}", registry.display()))
-}
-
 /// The rule-5 inputs no commit carries, and their digest, recorded in the
 /// selection so a change to any of them forces a fresh validation.
-fn expect(admission: &Admission<'_>, source: FlathubSource) -> Result<Expected, String> {
+fn expect(source: FlathubSource) -> Result<Expected, String> {
     let policy = dynamic_application_policy(source.name, source.policy_runtime)
         .ok_or_else(|| format!("{} has no dynamic-library policy", source.name))?;
-    let package = match source.application {
-        Some(_) => None,
-        None => Some(registry_package(admission.registry, source.name)?),
-    };
     let mut hasher = td_engine::sha256::Sha256::new();
     let mut record = |key: &str, value: &[u8]| {
         hasher.update(key.as_bytes());
@@ -484,12 +441,9 @@ fn expect(admission: &Admission<'_>, source: FlathubSource) -> Result<Expected, 
     };
     record("version", CHECKS_VERSION.as_bytes());
     record("entry", source.entry.as_bytes());
-    record(
-        "package",
-        package
-            .as_deref()
-            .map_or(&[][..], |path| path.as_os_str().as_bytes()),
-    );
+    // The retired runtime-only form's store package; always empty now, so
+    // every selection's digest is what it was.
+    record("package", &[]);
     for path in policy.library_paths() {
         record("library", path.as_bytes());
     }
@@ -499,7 +453,6 @@ fn expect(admission: &Admission<'_>, source: FlathubSource) -> Result<Expected, 
     record("links", &policy.optional_links().to_be_bytes());
     let strings = |values: &[&str]| values.iter().map(|value| value.to_string()).collect();
     Ok(Expected {
-        package,
         checks: td_engine::sha256::to_base16(&hasher.finalize()),
         library_paths: strings(policy.library_paths()),
         optional_targets: strings(policy.optional_targets()),
@@ -507,36 +460,14 @@ fn expect(admission: &Admission<'_>, source: FlathubSource) -> Result<Expected, 
     })
 }
 
-fn package_text(expected: &Expected) -> Result<Option<String>, String> {
-    expected
-        .package
-        .as_deref()
-        .map(|path| {
-            path.to_str()
-                .map(str::to_string)
-                .ok_or_else(|| format!("{} is not UTF-8", path.display()))
-        })
-        .transpose()
-}
-
 /// A selection still serves the declaration: its name, refs and recorded
 /// checks match, and every deploy it names is complete.
-fn serves(
-    cache: &Path,
-    selection: &Selection,
-    source: FlathubSource,
-    expected: &Expected,
-) -> Result<bool, String> {
-    Ok(selection.name == source.name
+fn serves(cache: &Path, selection: &Selection, source: FlathubSource, expected: &Expected) -> bool {
+    selection.name == source.name
         && selection.checks == expected.checks
-        && selection.package == package_text(expected)?
-        && selection
-            .application
-            .as_ref()
-            .map(|row| row.exact_ref.as_str())
-            == source.application
+        && selection.application.exact_ref == source.application
         && selection.runtime.exact_ref == source.runtime
-        && selection.commits().all(|commit| deployed(cache, commit)))
+        && selection.commits().all(|commit| deployed(cache, commit))
 }
 
 fn sync_dir(path: &Path) -> Result<(), String> {
@@ -755,7 +686,7 @@ fn update(
 ) -> Result<Outcome, String> {
     prepare_cache(cache)?;
     let _lock = lock(cache)?;
-    let expected = expect(admission, source)?;
+    let expected = expect(source)?;
     let current = read_pointer(cache, CURRENT)?;
     let previous = read_pointer(cache, PREVIOUS)?;
     if !force {
@@ -765,7 +696,7 @@ fn update(
                     .and_then(|text| text.parse::<u64>().ok())
             });
             if checked.is_some_and(|checked| checked <= now && now - checked < CHECK_INTERVAL_SECS)
-                && serves(cache, selection, source, &expected)?
+                && serves(cache, selection, source, &expected)
             {
                 return Ok(Outcome::Throttled);
             }
@@ -776,9 +707,7 @@ fn update(
         Some(text) => flathub_app::parse_admitted(&text)?,
         None => Vec::new(),
     };
-    admitted.retain(|row| {
-        row.exact_ref == source.runtime || Some(row.exact_ref.as_str()) == source.application
-    });
+    admitted.retain(|row| row.exact_ref == source.runtime || row.exact_ref == source.application);
     let known: Vec<&Admitted> = admitted
         .iter()
         .chain(current.iter().flat_map(|(_, selection)| selection.rows()))
@@ -794,34 +723,22 @@ fn update(
         .checked_add(RESOLVE_TIME)
         .ok_or("resolve deadline overflows")?;
     let runtime = resolve(admission, &work, source.runtime, &known, now, deadline)?;
-    let application = match source.application {
-        Some(exact_ref) => {
-            let candidate = resolve(admission, &work, exact_ref, &known, now, deadline)?;
-            let metadata = candidate
-                .metadata
-                .as_deref()
-                .ok_or_else(|| format!("{exact_ref} commit carries no xa.metadata"))?;
-            flathub_app::require_runtime(metadata, source.runtime)?;
-            Some(candidate)
-        }
-        None => None,
-    };
+    let application = resolve(admission, &work, source.application, &known, now, deadline)?;
+    let metadata = application
+        .metadata
+        .as_deref()
+        .ok_or_else(|| format!("{} commit carries no xa.metadata", source.application))?;
+    flathub_app::require_runtime(metadata, source.runtime)?;
     remove_tree(&work)?;
     drop(known);
 
     let selection = Selection {
         name: source.name.to_string(),
         checks: expected.checks.clone(),
-        application: application
-            .as_ref()
-            .map(|candidate| candidate.admitted.clone()),
-        package: package_text(&expected)?,
+        application: application.admitted.clone(),
         runtime: runtime.admitted.clone(),
     };
-    let candidates: Vec<&Candidate> = application
-        .iter()
-        .chain(std::iter::once(&runtime))
-        .collect();
+    let candidates = [&application, &runtime];
     for candidate in &candidates {
         admitted.retain(|row| row.exact_ref != candidate.admitted.exact_ref);
         admitted.push(candidate.admitted.clone());
@@ -832,19 +749,13 @@ fn update(
         let same = current
             .as_ref()
             .is_some_and(|(_, selected)| *selected == selection);
-        if same && serves(cache, &selection, source, &expected)? {
+        if same && serves(cache, &selection, source, &expected) {
             // Heals an `admitted` that an interrupted run left behind.
             write_state(&cache.join(ADMITTED), &admitted_text)?;
             return Ok(Outcome::Unchanged);
         }
         let runtime_out = deploy(admission, cache, &runtime)?;
-        let application_out = match &application {
-            Some(candidate) => deploy(admission, cache, candidate)?,
-            None => expected
-                .package
-                .clone()
-                .ok_or("a runtime-only source has no package")?,
-        };
+        let application_out = deploy(admission, cache, &application)?;
         (admission.validate)(
             &application_out,
             source.entry,
@@ -890,14 +801,10 @@ fn update(
 /// The generation td-jail may launch: `current`, while it still serves the
 /// declaration. It takes no lock, so a launch never waits behind a fetch;
 /// collection never removes what `current` names.
-fn ready(
-    admission: &Admission<'_>,
-    cache: &Path,
-    source: FlathubSource,
-) -> Result<Option<u64>, String> {
-    let expected = expect(admission, source)?;
+fn ready(cache: &Path, source: FlathubSource) -> Result<Option<u64>, String> {
+    let expected = expect(source)?;
     Ok(match read_pointer(cache, CURRENT)? {
-        Some((generation, selection)) if serves(cache, &selection, source, &expected)? => {
+        Some((generation, selection)) if serves(cache, &selection, source, &expected) => {
             Some(generation)
         }
         _ => None,
@@ -1106,11 +1013,10 @@ pub(crate) fn export_to(store: &Path) -> Result<Vec<String>, String> {
         feed: None,
         verify: verify_flathub,
         validate: validate_dynamic,
-        registry: Path::new(REGISTRY),
     };
     let mut refs: Vec<&str> = flathub_app::FLATHUB_SOURCES
         .iter()
-        .flat_map(|source| source.application.into_iter().chain([source.runtime]))
+        .flat_map(|source| [source.application, source.runtime])
         .collect();
     refs.sort_unstable();
     refs.dedup();
@@ -1163,12 +1069,11 @@ pub fn run(args: &[String]) {
             feed: feed.as_deref(),
             verify: verify_flathub,
             validate: validate_dynamic,
-            registry: Path::new(REGISTRY),
         };
         let cache = home.join(CACHE_DIR);
         match verb {
             Verb::Update { force } => update(&admission, &cache, source, force, unix_now()?),
-            Verb::Ready => ready(&admission, &cache, source).map(Outcome::Ready),
+            Verb::Ready => ready(&cache, source).map(Outcome::Ready),
         }
     })();
     match result {
@@ -1203,7 +1108,6 @@ mod tests {
     const APP_METADATA: &str =
         "[Application]\nname=org.example.App\nruntime=org.example.Platform/x86_64/1\n";
     const NOW: u64 = 1_800_000_000;
-    const PACKAGE: &str = "/td/store/0123456789abcdefghijklmnopqrstuv-firefox-1";
 
     type Repository = Arc<Mutex<BTreeMap<String, Vec<u8>>>>;
 
@@ -1212,10 +1116,10 @@ mod tests {
         static REFUSE: RefCell<bool> = const { RefCell::new(false) };
     }
 
-    fn source(application: Option<&'static str>) -> FlathubSource {
+    fn source() -> FlathubSource {
         FlathubSource {
             name: "firefox",
-            application,
+            application: APP,
             runtime: RUNTIME,
             entry: "/app/bin/firefox",
             policy_runtime: "freedesktop-platform-25-08",
@@ -1333,7 +1237,6 @@ mod tests {
     struct Fixture {
         _root: crate::test_temp::TempDir,
         home: PathBuf,
-        registry: PathBuf,
         repository: Repository,
         url: String,
         feed: Option<String>,
@@ -1344,14 +1247,11 @@ mod tests {
             let root = crate::test_temp::TempDir::new(&format!("td-app-{label}")).unwrap();
             let home = root.join("home");
             fs::create_dir(&home).unwrap();
-            let registry = root.join("td-applications.tsv");
-            fs::write(&registry, format!("firefox\t{PACKAGE}\n")).unwrap();
             let repository = Repository::default();
             let url = serve(repository.clone());
             Fixture {
                 _root: root,
                 home,
-                registry,
                 repository,
                 url,
                 feed: None,
@@ -1368,7 +1268,6 @@ mod tests {
                 feed: self.feed.as_deref(),
                 verify: verify_fixture,
                 validate: validate_fixture,
-                registry: &self.registry,
             };
             update(&admission, &self.cache(), source, force, now)
         }
@@ -1407,7 +1306,7 @@ mod tests {
 
         VALIDATED.with(|seen| seen.borrow_mut().clear());
         assert_eq!(
-            fixture.update(source(Some(APP)), false, NOW),
+            fixture.update(source(), false, NOW),
             Ok(Outcome::Selected(1))
         );
 
@@ -1415,7 +1314,7 @@ mod tests {
         assert_eq!(generation, 1);
         assert_eq!(selection.runtime.commit, runtime);
         assert_eq!(selection.runtime.timestamp, 10);
-        assert_eq!(selection.application.as_ref().unwrap().commit, app);
+        assert_eq!(selection.application.commit, app);
         assert!(read_pointer(&fixture.cache(), PREVIOUS).unwrap().is_none());
         let deploy = fixture.cache().join(DEPLOY);
         assert_eq!(
@@ -1452,7 +1351,6 @@ mod tests {
                 feed: None,
                 verify: verify_fixture,
                 validate: validate_fixture,
-                registry: &self.registry,
             };
             export(
                 &admission,
@@ -1493,12 +1391,12 @@ mod tests {
         let feed = crate::feed::tests::ConsumerServer::start(store.clone(), None);
         fixture.feed = Some(feed.base.clone());
         assert_eq!(
-            fixture.update(source(Some(APP)), false, NOW),
+            fixture.update(source(), false, NOW),
             Ok(Outcome::Selected(1))
         );
         let (_, selection) = fixture.current().unwrap();
         assert_eq!(selection.runtime.commit, runtime);
-        assert_eq!(selection.application.unwrap().commit, app);
+        assert_eq!(selection.application.commit, app);
         assert_eq!(
             fs::read(
                 fixture
@@ -1568,7 +1466,7 @@ mod tests {
         fixture.feed = Some(feed.base.clone());
 
         rewrite_feed_file(&commitmeta, Some(b"forged"));
-        let error = fixture.update(source(Some(APP)), false, NOW).unwrap_err();
+        let error = fixture.update(source(), false, NOW).unwrap_err();
         assert!(error.contains("does not verify"), "{error}");
         assert!(fixture.current().is_none());
         rewrite_feed_file(&commitmeta, Some(b"signed"));
@@ -1582,11 +1480,11 @@ mod tests {
             .unwrap();
         let lost = fs::read(&object).unwrap();
         rewrite_feed_file(&object, None);
-        assert!(fixture.update(source(Some(APP)), false, NOW).is_err());
+        assert!(fixture.update(source(), false, NOW).is_err());
         assert!(fixture.current().is_none());
         rewrite_feed_file(&object, Some(&lost));
         assert_eq!(
-            fixture.update(source(Some(APP)), false, NOW),
+            fixture.update(source(), false, NOW),
             Ok(Outcome::Selected(1))
         );
 
@@ -1605,7 +1503,7 @@ mod tests {
         older.export(&stale).unwrap();
         let stale_feed = crate::feed::tests::ConsumerServer::start(stale.join("store"), None);
         fixture.feed = Some(stale_feed.base.clone());
-        let error = fixture.update(source(Some(APP)), true, NOW).unwrap_err();
+        let error = fixture.update(source(), true, NOW).unwrap_err();
         assert!(error.contains("does not supersede"), "{error}");
         assert_eq!(fixture.current().unwrap().0, 1);
     }
@@ -1629,7 +1527,7 @@ mod tests {
         let feed = crate::feed::tests::ConsumerServer::start(store, None);
         fixture.feed = Some(feed.base.clone());
         assert_eq!(
-            fixture.update(source(Some(APP)), false, NOW),
+            fixture.update(source(), false, NOW),
             Ok(Outcome::Selected(1))
         );
         // It was asked for both refs first.
@@ -1740,7 +1638,6 @@ mod tests {
             feed: None,
             verify: verify_fixture,
             validate: validate_fixture,
-            registry: &fixture.registry,
         };
         let moved = publish_commit(
             &fixture.repository,
@@ -1781,18 +1678,18 @@ mod tests {
             Some(APP_METADATA),
             b"signed",
         );
-        fixture.update(source(Some(APP)), false, NOW).unwrap();
+        fixture.update(source(), false, NOW).unwrap();
 
         // An empty repository shows that the throttled check asks nothing.
         fixture.repository.lock().unwrap().clear();
         assert_eq!(
-            fixture.update(source(Some(APP)), false, NOW + CHECK_INTERVAL_SECS - 1),
+            fixture.update(source(), false, NOW + CHECK_INTERVAL_SECS - 1),
             Ok(Outcome::Throttled)
         );
         assert!(fixture
-            .update(source(Some(APP)), false, NOW + CHECK_INTERVAL_SECS)
+            .update(source(), false, NOW + CHECK_INTERVAL_SECS)
             .is_err());
-        assert!(fixture.update(source(Some(APP)), true, NOW + 1).is_err());
+        assert!(fixture.update(source(), true, NOW + 1).is_err());
         assert_eq!(fixture.current().unwrap().0, 1);
 
         publish_commit(&fixture.repository, RUNTIME, b"usr", 10, None, b"signed");
@@ -1805,7 +1702,7 @@ mod tests {
             b"signed",
         );
         assert_eq!(
-            fixture.update(source(Some(APP)), true, NOW + 2),
+            fixture.update(source(), true, NOW + 2),
             Ok(Outcome::Unchanged)
         );
         assert_eq!(
@@ -1813,10 +1710,7 @@ mod tests {
             format!("{}\n", NOW + 2)
         );
         // A clock that went backwards does not suppress the check.
-        assert_eq!(
-            fixture.update(source(Some(APP)), false, NOW),
-            Ok(Outcome::Unchanged)
-        );
+        assert_eq!(fixture.update(source(), false, NOW), Ok(Outcome::Unchanged));
     }
 
     #[test]
@@ -1831,7 +1725,7 @@ mod tests {
             Some(APP_METADATA),
             b"signed",
         );
-        fixture.update(source(Some(APP)), true, NOW).unwrap();
+        fixture.update(source(), true, NOW).unwrap();
         let second = publish_commit(
             &fixture.repository,
             APP,
@@ -1841,7 +1735,7 @@ mod tests {
             b"signed",
         );
         assert_eq!(
-            fixture.update(source(Some(APP)), true, NOW),
+            fixture.update(source(), true, NOW),
             Ok(Outcome::Selected(2))
         );
         assert_eq!(
@@ -1862,7 +1756,7 @@ mod tests {
             b"signed",
         );
         assert_eq!(
-            fixture.update(source(Some(APP)), true, NOW),
+            fixture.update(source(), true, NOW),
             Ok(Outcome::Selected(3))
         );
         assert_eq!(fixture.names(GENERATIONS), vec!["2", "3"]);
@@ -1883,14 +1777,14 @@ mod tests {
             Some(APP_METADATA),
             b"signed",
         );
-        fixture.update(source(Some(APP)), true, NOW).unwrap();
+        fixture.update(source(), true, NOW).unwrap();
 
         let refused = |expected: &str| {
-            let error = fixture.update(source(Some(APP)), true, NOW).unwrap_err();
+            let error = fixture.update(source(), true, NOW).unwrap_err();
             assert!(error.contains(expected), "{error}");
             let (generation, selection) = fixture.current().unwrap();
             assert_eq!(generation, 1);
-            assert_eq!(selection.application.unwrap().commit, admitted);
+            assert_eq!(selection.application.commit, admitted);
         };
         let candidate = |contents: &[u8], timestamp, metadata, signature: &[u8]| {
             publish_commit(
@@ -1927,54 +1821,9 @@ mod tests {
         REFUSE.with(|refuse| *refuse.borrow_mut() = false);
         // The same candidate is admitted once it validates.
         assert_eq!(
-            fixture.update(source(Some(APP)), true, NOW),
+            fixture.update(source(), true, NOW),
             Ok(Outcome::Selected(2))
         );
-    }
-
-    #[test]
-    fn a_runtime_only_source_validates_against_its_store_package() {
-        let fixture = Fixture::new("runtime-only");
-        let runtime = publish_commit(&fixture.repository, RUNTIME, b"usr", 10, None, b"signed");
-        VALIDATED.with(|seen| seen.borrow_mut().clear());
-        assert_eq!(
-            fixture.update(source(None), false, NOW),
-            Ok(Outcome::Selected(1))
-        );
-        assert!(fixture.current().unwrap().1.application.is_none());
-        VALIDATED.with(|seen| {
-            assert_eq!(
-                *seen.borrow(),
-                vec![(
-                    PathBuf::from(PACKAGE),
-                    fixture.cache().join(DEPLOY).join(&runtime),
-                )]
-            );
-        });
-    }
-
-    #[test]
-    fn registry_rows_name_only_direct_store_children() {
-        let fixture = Fixture::new("registry");
-        for row in [
-            "firefox\t/td/store/../etc\n",
-            "firefox\t/td/store/a/b\n",
-            "firefox\t/var/lib/x\n",
-            "firefox\t/td/store/\n",
-            "firefox /td/store/x\n",
-            "firefox\t/td/store/x\textra\n",
-            "zeta\t/td/store/z\nfirefox\t/td/store/x\n",
-        ] {
-            fs::write(&fixture.registry, row).unwrap();
-            assert!(
-                registry_package(&fixture.registry, "firefox").is_err(),
-                "{row:?}"
-            );
-        }
-        fs::write(&fixture.registry, "mail\t/td/store/x-mail\n").unwrap();
-        assert!(registry_package(&fixture.registry, "firefox")
-            .unwrap_err()
-            .contains("has no firefox"));
     }
 
     #[test]
@@ -2011,11 +1860,11 @@ mod tests {
         let fixture = Fixture::new("before-trees");
         let runtime = publish_commit(&fixture.repository, RUNTIME, b"usr", 10, None, b"signed");
         app_commit(&fixture, b"app", 20);
-        fixture.update(source(Some(APP)), true, NOW).unwrap();
+        fixture.update(source(), true, NOW).unwrap();
         let objects = fixture.names(OBJECTS);
         let deploys = fixture.names(DEPLOY);
         let refuse = |expected: &str| {
-            let error = fixture.update(source(Some(APP)), true, NOW).unwrap_err();
+            let error = fixture.update(source(), true, NOW).unwrap_err();
             assert!(error.contains(expected), "{error}");
             assert_eq!(fixture.names(OBJECTS), objects);
             assert_eq!(fixture.names(DEPLOY), deploys);
@@ -2055,20 +1904,17 @@ mod tests {
         let fixture = Fixture::new("floor");
         publish_commit(&fixture.repository, RUNTIME, b"usr", 10, None, b"signed");
         app_commit(&fixture, b"one", 20);
-        fixture.update(source(Some(APP)), true, NOW).unwrap();
+        fixture.update(source(), true, NOW).unwrap();
         app_commit(&fixture, b"two", 30);
-        fixture.update(source(Some(APP)), true, NOW).unwrap();
+        fixture.update(source(), true, NOW).unwrap();
         fs::remove_file(fixture.cache().join(ADMITTED)).unwrap();
         // Generation 1's commit, still validly signed, served again.
         app_commit(&fixture, b"one", 20);
-        let error = fixture.update(source(Some(APP)), true, NOW).unwrap_err();
+        let error = fixture.update(source(), true, NOW).unwrap_err();
         assert!(error.contains("does not supersede"), "{error}");
         // An unchanged check rewrites the floor it lost.
         app_commit(&fixture, b"two", 30);
-        assert_eq!(
-            fixture.update(source(Some(APP)), true, NOW),
-            Ok(Outcome::Unchanged)
-        );
+        assert_eq!(fixture.update(source(), true, NOW), Ok(Outcome::Unchanged));
         let admitted = fs::read_to_string(fixture.cache().join(ADMITTED)).unwrap();
         assert_eq!(flathub_app::parse_admitted(&admitted).unwrap().len(), 2);
     }
@@ -2078,13 +1924,13 @@ mod tests {
         let fixture = Fixture::new("declaration");
         let runtime = publish_commit(&fixture.repository, RUNTIME, b"usr", 10, None, b"signed");
         app_commit(&fixture, b"app", 20);
-        fixture.update(source(Some(APP)), false, NOW).unwrap();
+        fixture.update(source(), false, NOW).unwrap();
 
         // Another entry is another rule-5 input: the same commits are
         // validated again and selected as a new generation.
         let moved = FlathubSource {
             entry: "/app/bin/firefox-bin",
-            ..source(Some(APP))
+            ..source()
         };
         assert_eq!(
             fixture.update(moved, false, NOW + 1),
@@ -2131,7 +1977,7 @@ mod tests {
         std::os::unix::fs::symlink("generations/9", cache.join("current.new")).unwrap();
 
         assert_eq!(
-            fixture.update(source(Some(APP)), false, NOW),
+            fixture.update(source(), false, NOW),
             Ok(Outcome::Selected(10))
         );
         assert!(!partial.exists());
@@ -2165,13 +2011,13 @@ mod tests {
         let fixture = Fixture::new("refused-collection");
         publish_commit(&fixture.repository, RUNTIME, b"usr", 10, None, b"signed");
         let admitted = app_commit(&fixture, b"app", 20);
-        fixture.update(source(Some(APP)), true, NOW).unwrap();
+        fixture.update(source(), true, NOW).unwrap();
         REFUSE.with(|refuse| *refuse.borrow_mut() = true);
         let first = app_commit(&fixture, b"first", 30);
-        assert!(fixture.update(source(Some(APP)), true, NOW + 1).is_err());
+        assert!(fixture.update(source(), true, NOW + 1).is_err());
         assert!(deployed(&fixture.cache(), &first));
         let second = app_commit(&fixture, b"second", 40);
-        assert!(fixture.update(source(Some(APP)), true, NOW + 2).is_err());
+        assert!(fixture.update(source(), true, NOW + 2).is_err());
         REFUSE.with(|refuse| *refuse.borrow_mut() = false);
         assert!(!deployed(&fixture.cache(), &first));
         assert!(!fixture.names(OBJECTS).contains(&first));
@@ -2192,11 +2038,11 @@ mod tests {
         let cache = fixture.cache();
         prepare_cache(&cache).unwrap();
         fs::create_dir(cache.join(ADMITTED)).unwrap();
-        let error = fixture.update(source(Some(APP)), true, NOW).unwrap_err();
+        let error = fixture.update(source(), true, NOW).unwrap_err();
         assert!(error.contains("not a regular file"), "{error}");
         fs::remove_dir(cache.join(ADMITTED)).unwrap();
         fs::set_permissions(&cache, fs::Permissions::from_mode(0o755)).unwrap();
-        fixture.update(source(Some(APP)), true, NOW).unwrap();
+        fixture.update(source(), true, NOW).unwrap();
         assert_eq!(
             fs::metadata(&cache).unwrap().permissions().mode() & 0o777,
             0o700
@@ -2206,38 +2052,31 @@ mod tests {
 
     impl Fixture {
         fn ready(&self, source: FlathubSource) -> Result<Option<u64>, String> {
-            let admission = Admission {
-                repository: &self.url,
-                feed: self.feed.as_deref(),
-                verify: verify_fixture,
-                validate: validate_fixture,
-                registry: &self.registry,
-            };
-            ready(&admission, &self.cache(), source)
+            ready(&self.cache(), source)
         }
     }
 
     #[test]
     fn ready_names_current_only_while_it_serves_the_declaration() {
         let fixture = Fixture::new("ready");
-        assert_eq!(fixture.ready(source(Some(APP))), Ok(None));
+        assert_eq!(fixture.ready(source()), Ok(None));
         let runtime = publish_commit(&fixture.repository, RUNTIME, b"usr", 10, None, b"signed");
         app_commit(&fixture, b"app", 20);
-        fixture.update(source(Some(APP)), false, NOW).unwrap();
-        assert_eq!(fixture.ready(source(Some(APP))), Ok(Some(1)));
+        fixture.update(source(), false, NOW).unwrap();
+        assert_eq!(fixture.ready(source()), Ok(Some(1)));
         // Another entry is another declaration the generation was not
         // validated for.
         let moved = FlathubSource {
             entry: "/app/bin/firefox-bin",
-            ..source(Some(APP))
+            ..source()
         };
         assert_eq!(fixture.ready(moved), Ok(None));
         remove_tree(&fixture.cache().join(DEPLOY).join(&runtime)).unwrap();
-        assert_eq!(fixture.ready(source(Some(APP))), Ok(None));
+        assert_eq!(fixture.ready(source()), Ok(None));
         // It reads and writes nothing it does not need: no lock file appears
         // in a cache that has none.
         let empty = Fixture::new("ready-empty");
-        assert_eq!(empty.ready(source(Some(APP))), Ok(None));
+        assert_eq!(empty.ready(source()), Ok(None));
         assert!(!empty.cache().exists());
     }
 
@@ -2246,20 +2085,20 @@ mod tests {
         let fixture = Fixture::new("held");
         publish_commit(&fixture.repository, RUNTIME, b"usr", 10, None, b"signed");
         let first = app_commit(&fixture, b"one", 20);
-        fixture.update(source(Some(APP)), true, NOW).unwrap();
+        fixture.update(source(), true, NOW).unwrap();
         let selection = fixture.cache().join(GENERATIONS).join("1").join(SELECTION);
         let launch = File::open(&selection).unwrap();
         launch.lock_shared().unwrap();
         app_commit(&fixture, b"two", 30);
-        fixture.update(source(Some(APP)), true, NOW).unwrap();
+        fixture.update(source(), true, NOW).unwrap();
         app_commit(&fixture, b"three", 40);
-        fixture.update(source(Some(APP)), true, NOW).unwrap();
+        fixture.update(source(), true, NOW).unwrap();
         // Neither current nor previous, and still running.
         assert_eq!(fixture.names(GENERATIONS), vec!["1", "2", "3"]);
         assert!(deployed(&fixture.cache(), &first));
         drop(launch);
         app_commit(&fixture, b"four", 50);
-        fixture.update(source(Some(APP)), true, NOW).unwrap();
+        fixture.update(source(), true, NOW).unwrap();
         assert_eq!(fixture.names(GENERATIONS), vec!["3", "4"]);
         assert!(!deployed(&fixture.cache(), &first));
         // A launch that opened generation 1 before it went finds it unlinked.
@@ -2274,13 +2113,13 @@ mod tests {
         let fixture = Fixture::new("unproved");
         publish_commit(&fixture.repository, RUNTIME, b"usr", 10, None, b"signed");
         let first = app_commit(&fixture, b"one", 20);
-        fixture.update(source(Some(APP)), true, NOW).unwrap();
+        fixture.update(source(), true, NOW).unwrap();
         app_commit(&fixture, b"two", 30);
-        fixture.update(source(Some(APP)), true, NOW).unwrap();
+        fixture.update(source(), true, NOW).unwrap();
         let selection = fixture.cache().join(GENERATIONS).join("1").join(SELECTION);
         fs::set_permissions(&selection, fs::Permissions::from_mode(0o000)).unwrap();
         app_commit(&fixture, b"three", 40);
-        let error = fixture.update(source(Some(APP)), true, NOW).unwrap_err();
+        let error = fixture.update(source(), true, NOW).unwrap_err();
         assert!(error.contains("open"), "{error}");
         assert!(deployed(&fixture.cache(), &first));
         fs::set_permissions(&selection, fs::Permissions::from_mode(0o644)).unwrap();
@@ -2290,7 +2129,7 @@ mod tests {
             .join(DEPLOY)
             .join(format!("{REMOVING}{first}"));
         fs::create_dir_all(stale.join(FILES)).unwrap();
-        fixture.update(source(Some(APP)), true, NOW).unwrap();
+        fixture.update(source(), true, NOW).unwrap();
         assert!(!stale.exists());
         assert!(!deployed(&fixture.cache(), &first));
         assert!(!fixture

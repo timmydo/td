@@ -160,8 +160,8 @@ application updates only when the owner asks in td-software (§4.2),
 which shows when each was last checked.
 
 There is a case to design. After a system update, `ready` also answers
-`absent` for a generation that no longer serves because the declaration,
-store package or policy changed (`checks=`, §W.9). That application is
+`absent` for a generation that no longer serves because the declaration
+or policy changed (`checks=`, §W.9). That application is
 still installed. Proposal: `status` reports it as installed but stale.
 The launch then runs an offline revalidation, which reruns rule 5 over
 the deploy trees already present and fetches nothing, and launches if
