@@ -17,6 +17,7 @@
 //! on one bounded channel; each producer wakes the turn loop after it sends,
 //! so output reaches the screen without the loop polling for it.
 
+use crate::job;
 use crate::ready;
 use crate::session;
 use std::ffi::OsString;
@@ -134,6 +135,16 @@ const ZOOM_RESET_CHORD: &str = "C-0";
 /// child; only their Shift forms are taken.
 const PROMPT_OLDER_CHORD: &str = "C-S-z";
 const PROMPT_NEWER_CHORD: &str = "C-S-x";
+/// The close prompt's one answer that closes (td-term/DESIGN.md §4);
+/// every other key keeps the terminal, as a dialog's focus starts on
+/// Cancel.
+const CLOSE_CONFIRM_KEYS: &[char] = &['y', 'Y'];
+const CLOSE_PREFIX: &str = "close: ";
+/// How long the prompt must have been on screen, with no key struck since,
+/// before a key answers it: one struck sooner is typing that had not read
+/// it, and answers nothing.
+const CLOSE_ARM_MS: u64 = 500;
+const CLOSE_KEYS: &str = "; y closes, any other key keeps it";
 /// Pixels per em in a point, at the 96 dots per inch foot sizes its font
 /// by at scale one, so `--font-size 9` is foot's `size=9`.
 const PIXELS_PER_POINT: f32 = 4.0 / 3.0;
@@ -391,12 +402,37 @@ struct Frame {
     /// press there follows nothing, since what is under it is hidden.
     covered: Option<usize>,
     before: Option<usize>,
+    /// The close prompt this frame shows, by its number.
+    asks: Option<u64>,
+}
+
+/// A close the compositor asked for while a job runs (td-term/DESIGN.md
+/// §4): the line that asks, its number, and since when a frame showing it
+/// has been on the screen with no key struck. Before that frame a key is
+/// the child's typeahead; after it, until `CLOSE_ARM_MS` of quiet, a key
+/// is typing that had not read the question, taken by nobody.
+struct Closing {
+    line: String,
+    id: u64,
+    quiet_since: Option<u64>,
+}
+
+impl Closing {
+    fn answers(&self, now: u64) -> bool {
+        self.quiet_since
+            .is_some_and(|since| now >= since.saturating_add(CLOSE_ARM_MS))
+    }
 }
 
 /// The child, from the loop's side. The terminal ends when its output has
 /// run out AND its child has been waited for: the two race, and ending on
 /// either alone drops the parting output or names no status.
 struct Child {
+    /// Its pid, which is where `/proc` says what it is running.
+    pid: u32,
+    /// The kernel's name for the shell td-term started, or `None` for a
+    /// program its invocation named (`job::busy`).
+    shell: Option<String>,
     drained: bool,
     status: Option<ExitStatus>,
     /// The name a `--command` program's last screen is reported under, and
@@ -592,6 +628,12 @@ pub struct Window {
     /// The browser command a link opens with; none, as in production, is
     /// `BROWSER` then `xdg-open` (td-ui's opener).
     browser: Option<String>,
+    /// The close prompt, while one asks.
+    closing: Option<Closing>,
+    /// How many close prompts have opened, which numbers each.
+    asked: u64,
+    /// The process table a close reads (`job::PROC`).
+    procfs: PathBuf,
     /// The desktop profile's exit status, once the loop is closed.
     exit: u8,
 }
@@ -662,6 +704,9 @@ impl Window {
             outline: None,
             painted: render::Drawn::new(),
             browser: None,
+            closing: None,
+            asked: 0,
+            procfs: PathBuf::from(job::PROC),
             exit: 0,
         })
     }
@@ -765,6 +810,19 @@ impl Window {
     fn key(&mut self, serial: u32, key: u32, stroke: &Stroke) -> Result<()> {
         self.clipboard_serial = Some(serial);
         let chord = stroke.chord.as_str();
+        if let Some(closing) = self.closing.as_mut() {
+            if closing.answers(self.clock) {
+                return self.answer_close(stroke);
+            }
+            // On screen but not yet quiet: typing that had not read it,
+            // taken by nobody, a y meant for the child's own question
+            // included, and the quiet starts again. Before the screen
+            // shows it a key is the child's typeahead.
+            if closing.quiet_since.is_some() {
+                closing.quiet_since = Some(self.clock);
+                return Ok(());
+            }
+        }
         if self.search.is_some() {
             return self.search_key(serial, key, stroke);
         }
@@ -1065,6 +1123,13 @@ impl Window {
         Some((format!("{label}: {}", search.query), edge))
     }
 
+    /// The close prompt's line, over the view's last row, ahead of a
+    /// search's or a link's.
+    fn close_status(&self) -> Option<(String, render::Edge)> {
+        let closing = self.closing.as_ref()?;
+        Some((closing.line.clone(), render::Edge::Bottom))
+    }
+
     /// What the frame shows as selected: the search's match while one is
     /// open, else td-term's selection.
     fn shown_selection(&self) -> Option<render::Selection> {
@@ -1272,6 +1337,7 @@ impl Window {
         // A press ends a search, leaving the view where it is, so the press
         // acts on what it was made over.
         if matches!(event, pointer::Event::Button { pressed: true, .. }) {
+            self.keep_open();
             if let Some(search) = self.search.take() {
                 self.selection = search.selection;
                 self.stale = true;
@@ -2105,6 +2171,12 @@ impl Window {
             .map_err(|e| format!("duplicate the terminal device for its writer: {e}"))?;
         let slave = self.pty.peer()?;
         let child = pty::spawn(&command, &environment, &directory, slave)?;
+        let pid = child.id();
+        let shell = if self.options.command.is_empty() {
+            job::kernel_name(&command.program)
+        } else {
+            None
+        };
         // The waiter first: it takes the child back and reaps it if its own
         // spawn fails, where a reader spawned first would leave it unwatched.
         let waker = self.waker.clone();
@@ -2122,6 +2194,8 @@ impl Window {
         };
         let announce = published.is_some();
         self.child = Some(Child {
+            pid,
+            shell,
             drained: false,
             status: None,
             program,
@@ -2189,6 +2263,81 @@ impl Window {
             terminfo.as_deref(),
         );
         Ok((command, directory, environment))
+    }
+
+    /// The compositor asked the window to close (td-term/DESIGN.md §4):
+    /// at once when nothing but the shell would end, else once the person
+    /// says so. A request while the prompt asks is not an answer: a
+    /// compositor may repeat a held binding, as sway's do, and that would
+    /// answer a question nobody read.
+    fn close_requested(&mut self) -> Result<()> {
+        if self.closing.is_some() {
+            return Ok(());
+        }
+        let line = match self.running_job() {
+            job::Busy::Idle => return self.close(),
+            job::Busy::Job(Some(name)) => format!("{name} is running"),
+            job::Busy::Job(None) => "a job is running".to_owned(),
+            job::Busy::Stopped(Some(name)) => format!("{name} is stopped"),
+            job::Busy::Stopped(None) => "a job is stopped".to_owned(),
+            job::Busy::Unknown => "a job may be running".to_owned(),
+        };
+        self.asked = self.asked.wrapping_add(1);
+        self.closing = Some(Closing {
+            line: format!("{CLOSE_PREFIX}{line}{CLOSE_KEYS}"),
+            id: self.asked,
+            quiet_since: None,
+        });
+        // A held key's repeats would go on reaching the child under it.
+        self.client.cancel_repeat();
+        self.stale = true;
+        Ok(())
+    }
+
+    /// What a close would end: nothing before the child starts or once
+    /// it has exited, else what `/proc` says it is running.
+    fn running_job(&self) -> job::Busy {
+        match self.child.as_ref() {
+            Some(child) if child.status.is_none() => {
+                job::busy(&self.procfs, child.pid, child.shell.as_deref())
+            }
+            _ => job::Busy::Idle,
+        }
+    }
+
+    /// The close itself: a desktop's ends with status zero, its child
+    /// hearing the hangup as the master closes; td's is the error its
+    /// supervisor reads.
+    fn close(&mut self) -> Result<()> {
+        if self.options.profile != Profile::Desktop {
+            return Err("compositor requested that the terminal close".into());
+        }
+        self.client.close();
+        Ok(())
+    }
+
+    /// A key while the prompt shows, which takes it: `y` closes, any other
+    /// key keeps the terminal, and none reaches the child.
+    fn answer_close(&mut self, stroke: &Stroke) -> Result<()> {
+        self.closing = None;
+        self.stale = true;
+        let plain = !stroke.chord.starts_with("C-") && !stroke.chord.starts_with("M-");
+        if plain
+            && stroke
+                .text
+                .is_some_and(|text| CLOSE_CONFIRM_KEYS.contains(&text))
+        {
+            return self.close();
+        }
+        Ok(())
+    }
+
+    /// The prompt goes and the terminal stays: a pointer press, focus or
+    /// the keyboard lost.
+    fn keep_open(&mut self) {
+        if self.closing.take().is_some() {
+            self.stale = true;
+        }
     }
 
     /// The child is gone and its output has run out: report, and end. td's
@@ -2358,17 +2507,16 @@ impl App for Window {
                 self.client.acknowledge(serial)?;
                 self.needs_commit = true;
             }
-            Handled::CloseRequested => {
-                if self.options.profile != Profile::Desktop {
-                    return Err("compositor requested that the terminal close".into());
-                }
-                // The child hears the hangup as the terminal's master closes.
-                self.client.close();
-            }
+            Handled::CloseRequested => self.close_requested()?,
             Handled::FrameDone => {
                 if let Some(frame) = self.frame.as_mut() {
                     frame.presented = true;
                     frame.shows_model = true;
+                    if let Some(closing) = self.closing.as_mut() {
+                        if closing.quiet_since.is_none() && frame.asks == Some(closing.id) {
+                            closing.quiet_since = Some(self.clock);
+                        }
+                    }
                 }
             }
             Handled::Keyboard(event) => match event {
@@ -2388,6 +2536,7 @@ impl App for Window {
                     stroke,
                 } => self.key(serial, key, &stroke)?,
                 KeyboardEvent::Focus(false) => {
+                    self.keep_open();
                     self.clipboard_serial = None;
                     self.pending_clipboard = None;
                     self.board.incoming = None;
@@ -2402,6 +2551,7 @@ impl App for Window {
             Handled::Primary(event) => self.selection_event(data::Board::Primary, event),
             Handled::Capabilities { keyboard, pointer } => {
                 if !keyboard {
+                    self.keep_open();
                     self.clipboard_serial = None;
                     self.pending_clipboard = None;
                     self.keymap_ready = false;
@@ -2446,7 +2596,10 @@ impl App for Window {
         if self.client.closed() {
             return Ok(());
         }
-        if idle {
+        if idle && self.closing.is_some() {
+            // No key repeats while the prompt asks: it takes presses only.
+            self.client.cancel_repeat();
+        } else if idle {
             if let Some(stroke) = self.client.repeat(now)? {
                 // Rerouted per repetition: the mode and the view it asks
                 // about may have changed since the press. A search takes
@@ -2518,7 +2671,8 @@ impl App for Window {
                 .ok_or("the terminal has no model to draw")?;
             let viewport = self.viewport.offset(terminal.scrollback());
             let status = self
-                .search_status()
+                .close_status()
+                .or_else(|| self.search_status())
                 .or_else(|| self.link_status(wanted.link));
             let snapshot = render::Snapshot::new(terminal, wanted.activated, ringing)
                 .scrolled_back(viewport)
@@ -2569,6 +2723,7 @@ impl App for Window {
                     shows_model,
                     covered,
                     before,
+                    asks: self.closing.as_ref().map(|closing| closing.id),
                 });
                 return Ok(());
             }
@@ -3196,6 +3351,8 @@ mod tests {
     fn ended_child(window: &mut Window, raw: i32) {
         use std::os::unix::process::ExitStatusExt;
         window.child = Some(Child {
+            pid: 0,
+            shell: None,
             drained: false,
             status: Some(ExitStatus::from_raw(raw)),
             program: None,
@@ -3245,6 +3402,256 @@ mod tests {
         assert_eq!(window.exit, 0);
         let (mut window, _peer) = fixture();
         assert!(window.event(message(TOPLEVEL, 1, &[])).is_err());
+    }
+
+    /// A process table holding `lines`, each a `/proc/PID/stat` line.
+    fn procfs(lines: &[&str]) -> td_fs::TempDir {
+        let proc = td_fs::TempDir::new("td-term-close").unwrap();
+        for line in lines {
+            let pid = line.split_once(' ').unwrap().0;
+            std::fs::create_dir(proc.path().join(pid)).unwrap();
+            std::fs::write(proc.path().join(pid).join("stat"), format!("{line}\n")).unwrap();
+        }
+        proc
+    }
+
+    const IDLE_SHELL: &str = "100 (sh) S 1 100 100 34816 100 0";
+    const SHELL_WITH_VIM: &[&str] = &[
+        "100 (sh) S 1 100 100 34816 100 0",
+        "140 (vim) S 100 100 100 34816 100 0",
+    ];
+
+    /// A presented, focused window of `profile` whose child, pid 100, runs
+    /// over the process table `proc`.
+    fn running(profile: Profile, proc: &td_fs::TempDir) -> (Window, UnixStream) {
+        let (mut window, peer) = fixture_for(profile);
+        configure(&mut window, 640, 320, true);
+        window.draw().unwrap();
+        complete(&mut window);
+        keymap(&mut window);
+        focus(&mut window, 5);
+        window.procfs = proc.path().to_path_buf();
+        window.child = Some(Child {
+            pid: 100,
+            shell: Some("sh".into()),
+            drained: false,
+            status: None,
+            program: None,
+            _threads: Vec::new(),
+            _ready: None,
+        });
+        (window, peer)
+    }
+
+    fn close_request(window: &mut Window) -> Result<()> {
+        window.event(message(TOPLEVEL, 1, &[]))
+    }
+
+    fn close_line(window: &Window) -> Option<String> {
+        window.close_status().map(|(text, _)| text)
+    }
+
+    /// The prompt's frame reaches the screen, and stays there quiet long
+    /// enough to be answered.
+    fn ask(window: &mut Window) {
+        window.draw().unwrap();
+        complete(window);
+        let at = window.closing.as_ref().unwrap().quiet_since.unwrap();
+        window.tick(at + CLOSE_ARM_MS).unwrap();
+        assert!(window.closing.as_ref().unwrap().answers(window.clock));
+    }
+
+    /// An idle shell closes at once; one running a job asks on the view's
+    /// last row, naming it. A key before the prompt is on screen is the
+    /// child's typeahead; a second request is no answer; any key but `y`
+    /// keeps the terminal and reaches nothing; `y` closes it with status
+    /// zero.
+    #[test]
+    fn a_close_asks_first_only_while_a_job_runs() {
+        let idle = procfs(&[IDLE_SHELL]);
+        let (mut window, _peer) = running(Profile::Desktop, &idle);
+        close_request(&mut window).unwrap();
+        assert!(window.client.closed());
+        assert_eq!(window.exit, 0);
+
+        let busy = procfs(SHELL_WITH_VIM);
+        let (mut window, _peer) = running(Profile::Desktop, &busy);
+        close_request(&mut window).unwrap();
+        assert!(!window.client.closed());
+        assert_eq!(
+            close_line(&window).as_deref(),
+            Some("close: vim is running; y closes, any other key keeps it")
+        );
+        assert!(window.stale, "the prompt is drawn");
+        press(&mut window, 21);
+        assert_eq!(window.input.take_for_test(), b"y", "typeahead");
+        assert!(!window.client.closed());
+        ask(&mut window);
+        let covered = window.frame.as_ref().and_then(|frame| frame.covered);
+        assert_eq!(covered, Some(window.cells.unwrap().0 as usize - 1));
+        close_request(&mut window).unwrap();
+        assert!(!window.client.closed(), "a second request is no answer");
+        assert!(window.closing.is_some());
+        press(&mut window, 49);
+        assert!(window.closing.is_none());
+        assert!(window.input.take_for_test().is_empty());
+        assert!(!window.client.closed());
+        for key in [1, 28] {
+            close_request(&mut window).unwrap();
+            ask(&mut window);
+            press(&mut window, key);
+            assert!(window.closing.is_none(), "Escape and Return keep it");
+            assert!(!window.client.closed());
+        }
+        // Control-y is not the answer either.
+        close_request(&mut window).unwrap();
+        ask(&mut window);
+        chord(&mut window, CONTROL, 21);
+        assert!(!window.client.closed());
+        assert!(window.input.take_for_test().is_empty());
+        close_request(&mut window).unwrap();
+        ask(&mut window);
+        chord(&mut window, SHIFT, 21);
+        assert!(window.client.closed(), "Y closes");
+        assert_eq!(window.exit, 0);
+    }
+
+    /// A key struck while the prompt has been on screen less than
+    /// `CLOSE_ARM_MS` since it showed, or since the last such key, answers
+    /// nothing and reaches nobody: someone still typing has not read it.
+    #[test]
+    fn the_prompt_answers_only_after_a_quiet_interval() {
+        let busy = procfs(SHELL_WITH_VIM);
+        let (mut window, _peer) = running(Profile::Desktop, &busy);
+        close_request(&mut window).unwrap();
+        window.draw().unwrap();
+        complete(&mut window);
+        let shown = window.closing.as_ref().unwrap().quiet_since.unwrap();
+        window.tick(shown + CLOSE_ARM_MS - 1).unwrap();
+        press(&mut window, 21);
+        assert!(window.input.take_for_test().is_empty(), "taken by nobody");
+        window.tick(shown + CLOSE_ARM_MS + 1).unwrap();
+        press(&mut window, 21);
+        assert!(
+            window.input.take_for_test().is_empty(),
+            "the quiet began again"
+        );
+        assert!(!window.client.closed());
+        window.tick(shown + 2 * CLOSE_ARM_MS + 1).unwrap();
+        press(&mut window, 21);
+        assert!(window.input.take_for_test().is_empty());
+        assert!(window.client.closed());
+    }
+
+    /// A job a Control-z stopped asks, said to be stopped.
+    #[test]
+    fn a_stopped_job_asks_as_stopped() {
+        let stopped = procfs(&[
+            "100 (sh) S 1 100 100 34816 100 0",
+            "300 (vim) T 100 300 100 34816 100 0",
+        ]);
+        let (mut window, _peer) = running(Profile::Desktop, &stopped);
+        close_request(&mut window).unwrap();
+        assert_eq!(
+            close_line(&window).as_deref(),
+            Some("close: vim is stopped; y closes, any other key keeps it")
+        );
+    }
+
+    /// td's terminal ends in the error its supervisor reads, at once when
+    /// idle or once the prompt is answered; a child already exited, or
+    /// none yet, has nothing to ask about.
+    #[test]
+    fn tds_terminal_asks_first_and_then_ends_in_its_error() {
+        let ready_socket =
+            std::env::temp_dir().join(format!("td-term-unused-close-ready-{}", std::process::id()));
+        let profile = Profile::Td { ready_socket };
+        let idle = procfs(&[IDLE_SHELL]);
+        let (mut window, _peer) = running(profile.clone(), &idle);
+        assert!(close_request(&mut window).is_err());
+        let busy = procfs(SHELL_WITH_VIM);
+        let (mut window, _peer) = running(profile.clone(), &busy);
+        close_request(&mut window).unwrap();
+        ask(&mut window);
+        let refused = window.event(message(KEYBOARD, 3, &[9, 0, 21, 1]));
+        assert_eq!(
+            refused.unwrap_err(),
+            "compositor requested that the terminal close"
+        );
+        let (mut window, _peer) = running(profile, &busy);
+        if let Some(child) = window.child.as_mut() {
+            use std::os::unix::process::ExitStatusExt;
+            child.status = Some(ExitStatus::from_raw(0));
+        }
+        assert!(close_request(&mut window).is_err(), "exited: no prompt");
+        let (mut window, _peer) = fixture();
+        window.procfs = busy.path().to_path_buf();
+        assert!(close_request(&mut window).is_err(), "not started");
+    }
+
+    /// A program the invocation named is the job while it runs, though it
+    /// holds the foreground alone; a table that cannot be read asks too.
+    #[test]
+    fn a_named_program_or_an_unreadable_table_asks() {
+        let alone = procfs(&["100 (top) S 1 100 100 34816 100 0"]);
+        let (mut window, _peer) = running(Profile::Desktop, &alone);
+        if let Some(child) = window.child.as_mut() {
+            child.shell = None;
+        }
+        close_request(&mut window).unwrap();
+        assert_eq!(
+            close_line(&window).as_deref(),
+            Some("close: top is running; y closes, any other key keeps it")
+        );
+        let unreadable = procfs(&["100 garbage"]);
+        let (mut window, _peer) = running(Profile::Desktop, &unreadable);
+        close_request(&mut window).unwrap();
+        assert_eq!(
+            close_line(&window).as_deref(),
+            Some("close: a job may be running; y closes, any other key keeps it")
+        );
+    }
+
+    /// A pointer press, focus loss or the keyboard's going keeps the
+    /// terminal; the prompt's line is the one shown over a search's; a
+    /// held key stops repeating under it.
+    #[test]
+    fn the_prompt_goes_on_a_press_or_lost_focus_and_takes_no_repeat() {
+        let busy = procfs(SHELL_WITH_VIM);
+        let (mut window, _peer) = running(Profile::Desktop, &busy);
+        window.client.input_mut().timing(25, 600, 0).unwrap();
+        // Typeahead held into the prompt: its repeats stop with it.
+        window.event(message(KEYBOARD, 3, &[9, 0, 30, 1])).unwrap();
+        assert_eq!(window.input.take_for_test(), b"a");
+        close_request(&mut window).unwrap();
+        let now = window.clock;
+        window.end_turn(now + 700, true).unwrap();
+        assert!(window.input.take_for_test().is_empty(), "no repeat");
+        window.event(message(KEYBOARD, 3, &[10, 0, 30, 0])).unwrap();
+        ask(&mut window);
+        hover(&mut window, 2, 2);
+        button(&mut window, LEFT_BUTTON, true);
+        assert!(window.closing.is_none());
+        button(&mut window, LEFT_BUTTON, false);
+        close_request(&mut window).unwrap();
+        window.event(message(KEYBOARD, 2, &[11, SURFACE])).unwrap();
+        assert!(window.closing.is_none(), "focus lost");
+        assert!(!window.client.closed());
+        focus(&mut window, 12);
+        chord(&mut window, CONTROL | SHIFT, 19);
+        close_request(&mut window).unwrap();
+        assert_eq!(
+            window.close_status().map(|(_, edge)| edge),
+            Some(render::Edge::Bottom)
+        );
+        assert!(close_line(&window).unwrap().starts_with("close: "));
+        ask(&mut window);
+        press(&mut window, 1);
+        assert!(window.search.is_some(), "the prompt took the key");
+        close_request(&mut window).unwrap();
+        window.event(message(SEAT, 0, &[1])).unwrap();
+        assert!(window.closing.is_none(), "the keyboard went");
+        assert!(window.input.take_for_test().is_empty());
     }
 
     #[test]

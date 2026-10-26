@@ -24,7 +24,7 @@ fn names(dir: &str) -> BTreeSet<String> {
         .collect()
 }
 
-const SOURCES: [&str; 4] = ["app.rs", "main.rs", "ready.rs", "session.rs"];
+const SOURCES: &[&str] = &["app.rs", "job.rs", "main.rs", "ready.rs", "session.rs"];
 
 /// A file's production text: everything before its test module.
 fn production(name: &str) -> String {
@@ -47,7 +47,7 @@ fn source_inventory_is_closed() {
 #[test]
 fn the_crate_forbids_unsafe_and_reaches_no_raw_layer() {
     assert!(read("src/main.rs").contains("\n#![forbid(unsafe_code)]\n"));
-    for name in SOURCES {
+    for &name in SOURCES {
         let text = read(&format!("src/{name}")).replace("#![forbid(unsafe_code)]", "");
         assert!(!text.contains("unsafe"), "{name} names unsafe");
         assert!(!text.contains("cfg_attr"), "{name} uses cfg_attr");
@@ -75,6 +75,13 @@ fn the_crate_forbids_unsafe_and_reaches_no_raw_layer() {
         !session.contains("cttyhack\";"),
         "the shell leads its session itself"
     );
+    // A close reads what the terminal runs from the process table, with
+    // file reads alone: no signal, no process, no ioctl of its own.
+    let job = production("job.rs");
+    assert!(job.contains("pub const PROC: &str = \"/proc\";"));
+    for forbidden in ["Command", "kill", "signal", "ioctl", "td_ui::pty"] {
+        assert!(!job.contains(forbidden), "job.rs names {forbidden}");
+    }
 }
 
 #[test]

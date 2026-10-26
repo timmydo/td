@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 mod app;
+mod job;
 mod ready;
 mod session;
 
@@ -178,6 +179,7 @@ fn selftest(out: &mut impl Write) -> Result<(), String> {
     terminfo::selftest()?;
     td_ui::pty::selftest()?;
     session::selftest()?;
+    job::selftest()?;
     ready::selftest()?;
     app::selftest()?;
     writeln!(out, "TD-TERM-SELFTEST-OK").map_err(|e| format!("write selftest marker: {e}"))

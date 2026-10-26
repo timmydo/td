@@ -3092,9 +3092,11 @@ or while a resume withholds input.
 The compositor never signals a process, and a client that does not answer
 keeps its window: what a close means is the client's. td-ui hands it to its
 handler as `Input::Close` (td-ui/DESIGN.md), so each td program decides,
-and may ask about unsaved work; td-term in the desktop profile ends with
-status zero and its child hears the hangup, while the session's own
-terminal unit exits and its supervisor restarts it. The headless input
+and may ask about unsaved work; td-term closes at once while its shell is
+idle and asks first while a job runs (td-term/DESIGN.md §4), and once
+closed the desktop profile ends with status zero and its child hears the
+hangup, while the session's own terminal unit exits and its supervisor
+restarts it. The headless input
 grant may send the chord, since asking is no more than typing into the
 window, which that grant already can. The control channel has no request
 for it: its vocabulary is the layout's (section 15), and a close is not.

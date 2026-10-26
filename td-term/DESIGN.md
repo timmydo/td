@@ -58,7 +58,8 @@ keyboard encoder with its scrollback viewport and bounded input queue
 are `td_ui::pty` (the device, the child, and the reader, writer and waiter
 threads), `td_ui::client` (the Wayland client and its turn loop), and
 td-term's own `app.rs` (the window), `session.rs` (account, environment and
-child command), and `ready.rs` (the readiness socket and its probe).
+child command), `job.rs` (what a close would end), and `ready.rs` (the
+readiness socket and its probe).
 
 The parser, terminal model, renderer, keyboard encoder, and terminfo compiler
 read no descriptors, sockets, clocks, environment, or global process state;
@@ -1215,6 +1216,89 @@ principle 7's target trust model a screen copied to a shared console is a
 disclosure, so this is scoped to the current model rather than a permanent
 grant.
 
+A close request -- `xdg_toplevel.close`, which td's compositor sends for
+`Super+q` -- asks first while a job runs, and only then. What a close
+would end is read from the process table, the `/proc` of td-term's own pid
+namespace, with bounded std file reads (`job.rs`), so asking adds no
+syscall: the kernel keeps the terminal's foreground process group, and the
+default shell, leading its session on the slave, reports it as `tpgid` in
+its `/proc/PID/stat`. Another group in the foreground is a job, which is
+how a shell with job control runs one. td's own shell has no job control
+-- td-sh runs every command in its own group -- so the shell's group
+holding any process but the shell is a job too. So is a process of the
+shell's session that a Control-z stopped (state `T` or `t`): it is in no
+foreground, but the hangup ends it with whatever it holds, and the prompt
+says it is stopped (under td-sh, whose jobs share its group, a stopped one
+is said to be running). One scan of the table's `stat` lines finds them,
+at most 65,536 entries of at most 4 KiB each, and runs only when a close
+is asked for, never per turn; an entry that vanishes between the listing
+and its read (`ENOENT`, or `ESRCH` from the read, a plain std read keeping
+the OS code that td-fs's path-naming errors would drop) is a process gone.
+A job a job-control shell runs in the background and has not stopped does
+not ask; one td-sh runs is in its group and does.
+
+The child is the shell only while the kernel still names it as the program
+td-term started (`/proc/PID/stat`'s name is the exec'd path's last
+component, cut to 15 bytes): a shell that has exec'd another program,
+`exec vim` or an rc file's `exec tmux`, is that program, as is a `$SHELL`
+that is a wrapper exec'ing another shell, which therefore asks at every
+close. A child td-term started for an explicit program (`--command`, or
+the desktop's `-e` or `--`), or such an exec'd one, is the job itself for
+as long as it runs, alone in the foreground or not: td-term cannot tell
+what a program it was told to run holds, and a person who named a shell
+there answers with one key. It is named by itself, or by the foreground
+group's leader when it leads its session on the slave and another group
+holds the foreground; a program that leads no session (td's `--command`)
+is named by itself, since the terminal its line describes is not
+td-term's. Nothing is asked before the child starts or once it has exited,
+a child whose line says it exited included. A table td-term cannot read --
+the child's line refused, a shell holding no terminal or leading no
+session, a scan cut short that found no job -- asks rather than taking the
+terminal for idle, since the worse mistake is the lost work. The prompt
+names the program: the foreground group's leader, else a child of the
+shell, else any foreground member, else a stopped process, the lowest pid
+first within each, by the kernel's name from the same `stat` line (the
+name `/proc/PID/comm` holds), each character the shared report-text
+predicate (`td_ui::reportable`) would not print a space, cut at 32
+characters; with no name it says a job is running or stopped, or, when the
+table could not be read, may be running.
+
+The prompt is a status line as the search's is (§3): over the view's last
+row in inverse video, ahead of a search's or a link's, `close: vim is
+running; y closes, any other key keeps it`. `y` (`Y` too, by Shift or Caps
+Lock, but with no Control or Alt) closes. Any other key keeps the terminal
+and ends the prompt, and no key the prompt takes reaches the child: as a
+td-ui confirmation's focus starts on Cancel (td-ui/DESIGN.md, "Shared
+confirmation dialog"), Return keeps it too. The prompt takes a key only
+once a frame showing it has reached the screen, its callback fired, and
+has stayed there 500 ms with no key struck. A key before that frame is
+typeahead, the child's as ever, since nobody has seen the question. One
+struck after it but within the 500 ms is typing that had not read it: it
+answers nothing, reaches nobody -- a `y` meant for td-term must not answer
+the child's own question, `rm -i`'s or apt's -- and starts the 500 ms
+again, so someone still typing (`yy` in an editor) answers nothing until
+they stop and loses only what they typed under a prompt on the screen. A
+compositor that withholds the callback from a window it is not showing
+leaves the prompt waiting for one, keys meanwhile the child's, as a window
+nobody sees is one nobody answers. No key repeats while it asks: a held
+key's repeat is cancelled when it opens and on every turn after. A pointer
+press ends it, the terminal kept, and then acts as it would have, as a
+press that ends a search does; focus loss and the seat's keyboard going
+end it too. A second close request while it asks is ignored, not taken for
+the answer: a compositor may repeat a held binding -- sway's repeat unless
+bound `--no-repeat` -- and the repeat would answer by itself. Output goes
+on under it, and its line is not revised if the job ends meanwhile; the
+answer still decides. A child that exits while it asks ends the terminal
+as it would have.
+
+Confirmed, or with nothing to ask, the close is what it always was: a
+desktop terminal ends with status zero, its child hearing the hangup as the
+master closes (§7), and td's profile ends in the error its supervisor
+reads. The session's `[terminal]` unit is `restart=always`, so closing it
+replaces it with a fresh shell: an idle one is replaced at once, and a
+running job is ended only once the person says so. A terminal td-authd
+launched for the compositor ends.
+
 The PTY reader thread (`pty-output`) owns a master descriptor and parks in
 `read` whenever the child is idle, and safe `std` cannot interrupt that:
 there is no poll, no read timeout, and closing a descriptor another thread is
@@ -1664,9 +1748,34 @@ terminal, and td-term's prove the program:
   lays and hit-tests its grid on its cell, adopting a new one as a resize
   and keeping the scrolling margins when the grid is unchanged; bounds its
   fallback grid to the raster's ceilings; does nothing for a font chord
-  with no outline face, keeping the selection; and feeds output
+  with no outline face, keeping the selection; closes at once on a
+  request while the shell is idle and asks first while a job runs or is
+  stopped, naming it on the last row, taking keys only once its frame is
+  on the screen and quiet for 500 ms, typing before the frame the
+  child's and typing after it taken by nobody,
+  closing on `y` or `Y` alone, kept by any other key, Control-y among
+  them, by a press, by focus or the keyboard going, answering no second
+  request and taking no repeat, asking for a named program alone in the
+  foreground and for a table it cannot read, and in td's profile ending
+  in its error once answered and asking nothing of a child not started or
+  exited; and feeds output
   to the model with its replies to the child (`app.rs`); its flags take a
   font size in points within the face's bounds (`main.rs`);
+- what a close would end is read from a process table: a `stat` line past
+  a name holding parentheses, malformed ones refused; another group in the
+  foreground, or the shell's own group holding another process, is a job,
+  named by its leader, then a child of the shell, then any member, a
+  zombie or a running background group not counted; a stopped process of
+  the shell's session is a stopped job, and one of another session is not;
+  a named program, or a shell that exec'd one, is the job while it runs,
+  named by itself unless it leads its session and another group holds the
+  foreground; the kernel's name for a program is its last component's
+  first 15 bytes; a process gone mid-read, by `ENOENT` or `ESRCH`, is
+  skipped and an over-long line refused; an exited child is idle and what
+  cannot be read is asked about; a shown name is printable and bounded;
+  and through a real PTY a session leader running a command in its group
+  is busy, named as the command, and idle once alone and once reaped
+  (`job.rs`);
 - the account, environment, and child command are the specified ones,
   constructed rather than inherited, the default child is the shell leading
   a session and an explicit command is literal argv leading none
@@ -1678,16 +1787,18 @@ terminal, and td-term's prove the program:
   within its deadline (`ready.rs`);
 - td-term's confinement tests pin its closed source inventory, that it
   forbids `unsafe` and reaches no raw layer, that its manifest declares
-  td-fs and td-ui alone and joins the gate, and, by value, the words td's
-  units and boot oracle read: the fallback title, the app id the authority probe reads,
-  the proof token, every marker, the last-screen prefix and the exit
-  report;
+  td-fs and td-ui alone and joins the gate, that what a close would end
+  is read from `/proc` with no process, signal or ioctl of td-term's
+  own, and, by value, the words td's units and boot oracle read: the
+  fallback title, the app id the authority probe reads, the proof token,
+  every marker, the last-screen prefix and the exit report;
 - the shipped artifact is static, and its target selftest runs without host
   paths or libraries: `td-term selftest` exercises the model, encoder,
   renderer, terminfo compiler, PTY grid arithmetic, session policy,
-  readiness codec and fallback grid, and prints `TD-TERM-SELFTEST-OK` only
-  once all ran; the `td-term-test` recipe requires the binary, asserts it
-  static, runs the selftest, and requires the `td-term-terminfo` entry;
+  process-table reader, readiness codec and fallback grid, and prints
+  `TD-TERM-SELFTEST-OK` only once all ran; the `td-term-test` recipe
+  requires the binary, asserts it static, runs the selftest, and requires
+  the `td-term-terminfo` entry;
 - the image creates the devpts mountpoint after devtmpfs, replaces its
   `/dev/ptmx` node with the specified symlink, mounts devpts with the
   specified options, links `/bin/td-term` into the staged `td-term` output,
@@ -1781,7 +1892,8 @@ desktop's terminal must:
   not wait for the output to drain, so a background job still holding the
   terminal keeps no window open. A close request from the compositor ends
   td-term with status zero, whatever the child does in the same turn, and
-  the child hears the hangup as the master closes. td-term's own failure is
+  the child hears the hangup as the master closes; while a job runs it
+  asks first (§4). td-term's own failure is
   a `td-term:` line on stderr and status 1, which a child's status 1 also
   is.
 
