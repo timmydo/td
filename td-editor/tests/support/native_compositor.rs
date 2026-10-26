@@ -554,6 +554,9 @@ fn native_directory_details_sort_and_copy_selected_entry() {
             "source-bytes",
             &expected_path.len().to_string(),
         );
+        // The compositor's selection event for the copy closes an open menu,
+        // and may arrive after a later input: it must arrive first.
+        editor.wait_field("clipboard-state", "selection", "utf8");
         compositor.click(270, 32); // Directory menu
         editor.wait_field("state", "modal", "0,0,0,0,1,0,0,0,0");
         compositor.click(270, 132); // Sort by Modified
@@ -575,6 +578,11 @@ fn native_directory_details_sort_and_copy_selected_entry() {
         editor.wait_field("state", "modal", "0,0,0,0,1,0,0,0,0");
         compositor.click(270, 60); // Copy Entry Full Path
         editor.wait_field("state", "modal", "0,0,0,0,0,0,0,0,0");
+        // A selection already exists, so the copy's announcement shows in no
+        // field. The frame closing the menu is committed after the copy's
+        // set_selection, and the compositor sends the announcement before
+        // that commit's frame completes.
+        editor.rendered_at(800, 576);
         compositor.chord(&[], KEY_G);
         wait_directory_rows(&mut editor, 1, 4, &["child/", "a", "z"]);
         editor.wait_field("state", "directory-sort", "1,modified,1");
@@ -806,6 +814,9 @@ fn native_directory_tabs_reuse_shift_open_refresh_and_copy_path() {
             "source-bytes",
             &root.as_os_str().as_encoded_bytes().len().to_string(),
         );
+        // The paste takes the selection the compositor announced, which
+        // may arrive after a later input: it must arrive first.
+        editor.wait_field("clipboard-state", "selection", "utf8");
         editor.ok("select-tab\t2\t0");
         compositor.chord(
             &[KEY_LEFT_CTRL],
