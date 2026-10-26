@@ -30,7 +30,7 @@ nerd-fonts-pomicons-license-source 070xshvd1kg9i2nbhf7f5ca4pjjb4dxb-nerd-fonts-p
 nerd-fonts-powerline-extra-license-source rqafa2h34k4pcd02p46256hcm2bg9l9m-nerd-fonts-powerline-extra-license-source
 nerd-fonts-powerline-symbols-license-source l6byrv5ddn1xvnysn7lrpjmr53pfzlna-nerd-fonts-powerline-symbols-license-source
 nerd-fonts-weather-icons-license-source jsmpd2zdj5zkna7diqcrzyirzngh7rdm-nerd-fonts-weather-icons-license-source
-openssh-x86-64-source 3dvyp8vnz1xmmn740czhzz0db92jhwr5-openssh-x86-64-source
+openssh-x86-64-source 7q2m5kisis6k0rbkjwnvj5n2fvba581p-openssh-x86-64-source
 popt-x86-64-source i2hswa2a3s6kzvqrzl9hz4gvgavsx4yh-popt-x86-64-source
 ripgrep-seed-source vg4gdaxl18mqlbhybnn2pq7lpwm3wm2q-ripgrep-seed-source
 ripgrep-source ma4kmnnyn1hlimj2rw6hq7p07h8g2p3x-ripgrep-source

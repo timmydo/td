@@ -103,6 +103,9 @@ pub fn recipe() -> Recipe {
         .env("NM", "/usr/bin/nm")
         .env("OBJCOPY", "/usr/bin/objcopy")
         .env("CFLAGS", "-O2")
+        // configure added this itself until 10.6; openssh-x86-64-test
+        // requires the fortified imports it produces.
+        .env("CPPFLAGS", "-D_FORTIFY_SOURCE=2")
         .env("LDFLAGS", "-Wl,--build-id=sha1")
         // td glibc has no crypt(3); the probe would find the root's libcrypt.
         .env("ac_cv_lib_crypt_crypt", "no")
@@ -177,7 +180,7 @@ pub fn recipe() -> Recipe {
     });
     steps.push(Step::split_debug_tree("{out}", "/usr/bin/objcopy"));
 
-    Recipe::mesboot("openssh-x86-64", "10.5p1")
+    Recipe::mesboot("openssh-x86-64", "10.6p1")
         .source_input("openssh-x86-64-source")
         .build_root()
         .native_inputs(&["glibc-x86-64", "gcc-runtime"])
@@ -230,6 +233,13 @@ mod tests {
             build_id,
             "configure's LDFLAGS must carry the SHA-1 build id"
         );
+        let fortified = steps.iter().any(|step| {
+            matches!(step, Step::Run { argv, env, .. }
+                if argv.iter().any(|arg| arg.ends_with("/configure"))
+                    && env.iter().any(|(key, value)| key == "CPPFLAGS"
+                        && value == "-D_FORTIFY_SOURCE=2"))
+        });
+        assert!(fortified, "configure's CPPFLAGS must set _FORTIFY_SOURCE");
         let libraries_pinned = steps.iter().any(|step| {
             matches!(step, Step::Run { argv, .. }
                 if argv.iter().any(|arg| arg.contains("for v in LIBS CHANNELLIBS")

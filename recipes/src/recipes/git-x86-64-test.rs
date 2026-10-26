@@ -56,7 +56,7 @@ pub fn recipe() -> Recipe {
                 &format!(
                     "grep -Fq 'PASS: curl 8.23.0 performs verified local-socket HTTPS' '{curl_test}/result' || \
                          {{ echo 'Git transport prerequisite did not pass its verified TLS oracle' >&2; exit 1; }}; \
-                     grep -Fq 'PASS: OpenSSH Portable 10.5p1 provides the bounded ssh/sshd/ssh-keygen profile' '{openssh_test}/result' || \
+                     grep -Fq 'PASS: OpenSSH Portable 10.6p1 provides the bounded ssh/sshd/ssh-keygen profile' '{openssh_test}/result' || \
                          {{ echo 'Git SSH prerequisite did not pass the OpenSSH package oracle' >&2; exit 1; }}; \
                      for binary in '{git}/bin/git' '{git}/libexec/git-core/git-remote-http' '{git}/libexec/git-core/git-sh-i18n--envsubst'; do \
                          header=$('{readelf}' -h \"$binary\") || exit 1; \

@@ -86,6 +86,11 @@ pub fn recipe() -> Recipe {
                          if printf '%s\\n' \"$dynamic\" | grep -Fq '(RPATH)'; then \
                              echo \"OpenSSH carries legacy RPATH: $binary\" >&2; exit 1; \
                          fi; \
+                         symbols=$('{readelf}' --dyn-syms -W \"$binary\") || exit 1; \
+                         for fortified in __memcpy_chk __snprintf_chk; do \
+                             printf '%s\\n' \"$symbols\" | grep -Fq \"$fortified@\" || \
+                                 {{ echo \"OpenSSH lacks _FORTIFY_SOURCE ($fortified): $binary\" >&2; exit 1; }}; \
+                         done; \
                          for forbidden in libcrypto.so libssl.so libz.so libcrypt.so '/gnu/store' '/td-input/'; do \
                              if grep -a -Fq \"$forbidden\" \"$binary\"; then \
                                  echo \"OpenSSH retains forbidden runtime input $forbidden: $binary\" >&2; exit 1; \
@@ -106,7 +111,7 @@ pub fn recipe() -> Recipe {
                 "-c",
                 &format!(
                     "v=$('{openssh}/bin/ssh' -V 2>&1) || exit 1; \
-                     case \"$v\" in OpenSSH_10.5p1*) :;; *) echo \"unexpected ssh version: $v\" >&2; exit 1;; esac; \
+                     case \"$v\" in OpenSSH_10.6p1*) :;; *) echo \"unexpected ssh version: $v\" >&2; exit 1;; esac; \
                      kex=$('{openssh}/bin/ssh' -Q kex) || exit 1; \
                      for algorithm in mlkem768x25519-sha256 sntrup761x25519-sha512 curve25519-sha256; do \
                          printf '%s\\n' \"$kex\" | grep -q -x -F \"$algorithm\" || \
@@ -172,7 +177,7 @@ pub fn recipe() -> Recipe {
     });
     steps.push(Step::WriteFile {
         path: "{out}/result".into(),
-        content: "PASS: OpenSSH Portable 10.5p1 provides the bounded ssh/sshd/ssh-keygen profile configured for seccomp_filter, with Ed25519, ML-KEM/SNTRUP/Curve25519 KEX, and ChaCha20-Poly1305; the built daemon checks the shared primary-account configuration, in its ordinary and enforced forms and their server variants, with an ephemeral test host key, ordinary-only owner-managed remote keys, the server's root-owned provisioned keys in both its forms, distinct primary/persistent authorization paths for loopback and remote addresses, and each form's effective PermitRootLogin (no, in both forms) and AllowUsers lines for each user (sshd -T reports the configuration; it attempts no login); every shipped ELF uses only td glibc and has a debug companion; libcrypto, libcrypt, zlib, and agent/PKCS#11/FIDO/SCP/SFTP-server binaries are absent\n".into(),
+        content: "PASS: OpenSSH Portable 10.6p1 provides the bounded ssh/sshd/ssh-keygen profile configured for seccomp_filter, with Ed25519, ML-KEM/SNTRUP/Curve25519 KEX, and ChaCha20-Poly1305; the built daemon checks the shared primary-account configuration, in its ordinary and enforced forms and their server variants, with an ephemeral test host key, ordinary-only owner-managed remote keys, the server's root-owned provisioned keys in both its forms, distinct primary/persistent authorization paths for loopback and remote addresses, and each form's effective PermitRootLogin (no, in both forms) and AllowUsers lines for each user (sshd -T reports the configuration; it attempts no login); every shipped ELF uses only td glibc, is built with _FORTIFY_SOURCE and has a debug companion; libcrypto, libcrypt, zlib, and agent/PKCS#11/FIDO/SCP/SFTP-server binaries are absent\n".into(),
         exec: false,
     });
     steps.push(Step::Require {

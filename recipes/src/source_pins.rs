@@ -223,13 +223,13 @@ const PINS: &[PinDef] = &[
     PinDef {
         key: "openssh-x86-64-source",
         aliases: &[],
-        // OpenSSH Portable 10.5p1 supplies both halves of td's minimal SSH
+        // OpenSSH Portable 10.6p1 supplies both halves of td's minimal SSH
         // surface. The recipe builds only ssh, ssh-keygen, sshd and the two
         // mandatory privilege-separation helpers, without libcrypto or zlib.
-        url: "https://cdn.openbsd.org/pub/OpenBSD/OpenSSH/portable/openssh-10.5p1.tar.gz",
-        sha256: "d44d28a839ea9daf969cc69150fde59910b2b39361dad81a3bd6cbd19218db11",
-        file: "openssh-10.5p1.tar.gz",
-        version: "10.5p1",
+        url: "https://cdn.openbsd.org/pub/OpenBSD/OpenSSH/portable/openssh-10.6p1.tar.gz",
+        sha256: "a9dc9565dffe8640f64d863cd29a32bc4a3dbdec0566a7fc44c5d6ee767d5f39",
+        file: "openssh-10.6p1.tar.gz",
+        version: "10.6p1",
     },
     PinDef {
         key: "popt-x86-64-source",
@@ -470,7 +470,7 @@ mod tests {
         // closure) + the first reviewed
         // foreign application seed, upstream ripgrep 15.2.0, LibreSSL 4.4.0,
         // curl 8.23.0 (the static HTTPS foundation for Git), Git 2.55.0,
-        // curl's dated Mozilla CA extract and OpenSSH Portable 10.5p1. The
+        // curl's dated Mozilla CA extract and OpenSSH Portable 10.6p1. The
         // td-ui applications are td's own trees (APPLICATIONS.md §W.8) and
         // pin nothing here.
         // IANA timezone data 2026e adds one source-data pin, and the Nerd
