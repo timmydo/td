@@ -5016,6 +5016,12 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
             dest: "{root}/real-root{in:jetbrains-mono-nerd-font}".into(),
         });
     }
+    // So are the notices of the firmware the kernel embeds, which its
+    // licence asks a distribution to carry; every profile boots that kernel.
+    steps.push(Step::CopyTree {
+        from: "{in:linux-firmware-notices}".into(),
+        dest: "{root}/real-root{in:linux-firmware-notices}".into(),
+    });
     // Timezone data is an immutable package with no ELF runtime closure.
     steps.push(Step::CopyTree {
         from: "{in:tzdata}".into(),
@@ -6244,6 +6250,8 @@ fn system_recipe(sys: &SystemDef) -> Recipe {
         // tzdata: immutable compiled zones and geographic tables at /etc/zoneinfo.
         // jetbrains-mono-nerd-font: the pinned outline face at
         //   /etc/fonts/jetbrains-mono-nerd.
+        // linux-firmware-notices: the embedded Wi-Fi firmware's notice and
+        //   licence, in the store beside the face.
         // OpenSSH: the source-built client, key generator, daemon, and mandatory split
         //   helpers. Its deliberately libcrypto-free closure is reached by
         //   StageRuntimeClosure.
@@ -6296,6 +6304,7 @@ fn system_recipe(sys: &SystemDef) -> Recipe {
                 "ca-certificates",
                 "tzdata",
                 "jetbrains-mono-nerd-font",
+                "linux-firmware-notices",
                 "glibc-x86-64",
                 "openssh-x86-64",
                 "td-netd",
@@ -16678,6 +16687,7 @@ mod server_tests {
                 "gcc-runtime",
                 "git-x86-64",
                 "glibc-x86-64",
+                "linux-firmware-notices",
                 "linux-x86-64",
                 "openssh-x86-64",
                 "ripgrep",

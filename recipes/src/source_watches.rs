@@ -29,6 +29,8 @@ pub enum Watch {
 
 const GIT_CRYPTSETUP: &str =
     "https://gitlab.com/cryptsetup/cryptsetup.git/info/refs?service=git-upload-pack";
+const GIT_LINUX_FIRMWARE: &str =
+    "https://gitlab.com/kernel-firmware/linux-firmware.git/info/refs?service=git-upload-pack";
 const GIT_JSON_C: &str = "https://github.com/json-c/json-c.git/info/refs?service=git-upload-pack";
 const GIT_NERD_FONTS: &str =
     "https://github.com/ryanoasis/nerd-fonts.git/info/refs?service=git-upload-pack";
@@ -38,6 +40,10 @@ const GIT_UTIL_LINUX: &str =
     "https://github.com/util-linux/util-linux.git/info/refs?service=git-upload-pack";
 const GIT_ZLIB: &str = "https://github.com/madler/zlib.git/info/refs?service=git-upload-pack";
 const RUST_STABLE: &str = "https://static.rust-lang.org/dist/channel-rust-stable.toml";
+const LINUX_FIRMWARE: Watch = Watch::Index {
+    index: GIT_LINUX_FIRMWARE,
+    pattern: "refs/tags/{}",
+};
 const NERD_FONTS: Watch = Watch::Index {
     index: GIT_NERD_FONTS,
     pattern: "refs/tags/v{}",
@@ -110,6 +116,12 @@ const WATCHES: &[(&str, Watch)] = &[
             pattern: "libressl-{}.tar.gz",
         },
     ),
+    ("linux-firmware-ath11k-wcn6855-amss-source", LINUX_FIRMWARE),
+    ("linux-firmware-ath11k-wcn6855-board-2-source", LINUX_FIRMWARE),
+    ("linux-firmware-ath11k-wcn6855-m3-source", LINUX_FIRMWARE),
+    ("linux-firmware-ath11k-wcn6855-notice-source", LINUX_FIRMWARE),
+    ("linux-firmware-ath11k-wcn6855-regdb-source", LINUX_FIRMWARE),
+    ("linux-firmware-qualcomm-atheros-license-source", LINUX_FIRMWARE),
     (
         "linux-source",
         Watch::Held(

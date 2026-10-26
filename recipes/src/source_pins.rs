@@ -205,6 +205,59 @@ const PINS: &[PinDef] = &[
         version: "4.14.67",
     },
     PinDef {
+        key: "linux-firmware-ath11k-wcn6855-amss-source",
+        aliases: &[],
+        // Device firmware (AGENTS.md "Device firmware"): linux-firmware's
+        // files for the Qualcomm WCN6855 Wi-Fi at its 20260916 tag, which the
+        // kernel embeds unmodified for ath11k to hand to the device.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20260916/ath11k/WCN6855/hw2.0/amss.bin",
+        sha256: "e12b23ddc4b8d2d2a10a651a5d6fdcd00f60fcae884d2cf5dad17627211fcdfd",
+        file: "linux-firmware-20260916-ath11k-WCN6855-hw2.0-amss.bin",
+        version: "20260916",
+    },
+    PinDef {
+        key: "linux-firmware-ath11k-wcn6855-board-2-source",
+        aliases: &[],
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20260916/ath11k/WCN6855/hw2.0/board-2.bin",
+        sha256: "9287fa8d14d915892666b03e9403135875d08371fd1438d2c6d9fe96ae71cf68",
+        file: "linux-firmware-20260916-ath11k-WCN6855-hw2.0-board-2.bin",
+        version: "20260916",
+    },
+    PinDef {
+        key: "linux-firmware-ath11k-wcn6855-m3-source",
+        aliases: &[],
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20260916/ath11k/WCN6855/hw2.0/m3.bin",
+        sha256: "0c590881870d0e6e98fc7d393ce05690e09287933b1b535e935bf5d98b77713f",
+        file: "linux-firmware-20260916-ath11k-WCN6855-hw2.0-m3.bin",
+        version: "20260916",
+    },
+    PinDef {
+        key: "linux-firmware-ath11k-wcn6855-notice-source",
+        aliases: &[],
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20260916/ath11k/WCN6855/hw2.0/Notice.txt",
+        sha256: "770720d03de70ff503c6d9bb6f6932fc7833d078647fe8352c6d5d49d44bbc5f",
+        file: "linux-firmware-20260916-ath11k-WCN6855-hw2.0-Notice.txt",
+        version: "20260916",
+    },
+    PinDef {
+        key: "linux-firmware-ath11k-wcn6855-regdb-source",
+        aliases: &[],
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20260916/ath11k/WCN6855/hw2.0/regdb.bin",
+        sha256: "e1b774b1feda4cab01f5a26089124059539fc31544ac34129dce45c8ff26d645",
+        file: "linux-firmware-20260916-ath11k-WCN6855-hw2.0-regdb.bin",
+        version: "20260916",
+    },
+    PinDef {
+        key: "linux-firmware-qualcomm-atheros-license-source",
+        aliases: &[],
+        // The licence WHENCE names for those files, which the image ships
+        // through `linux-firmware-notices`.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20260916/LICENSES/LICENSE.QualcommAtheros_ath10k",
+        sha256: "337a55102138d7baa143ee4a4c6c91693e0113fece35d380b2a12109e8c23b3f",
+        file: "linux-firmware-20260916-LICENSE.QualcommAtheros_ath10k",
+        version: "20260916",
+    },
+    PinDef {
         key: "linux-kernel-source",
         aliases: &[],
         // Linux 7.1.4 — the latest STABLE mainline kernel (not a longterm/LTS
@@ -348,6 +401,18 @@ const PINS: &[PinDef] = &[
 /// AGENTS.md amendment.
 const FOREIGN: &[&str] = &["ripgrep-seed-source"];
 
+/// The pins AGENTS.md "Device firmware" admits: linux-firmware files a
+/// peripheral runs or reads, which the kernel embeds unmodified and the host
+/// never executes. Unmarked, so no channel refuses them; the closure query
+/// names each. Adding an entry is a reviewed pin; firmware the host CPU runs
+/// belongs to no class.
+pub const DEVICE_FIRMWARE: &[&str] = &[
+    "linux-firmware-ath11k-wcn6855-amss-source",
+    "linux-firmware-ath11k-wcn6855-board-2-source",
+    "linux-firmware-ath11k-wcn6855-m3-source",
+    "linux-firmware-ath11k-wcn6855-regdb-source",
+];
+
 pub fn all() -> Vec<SourcePin> {
     all_with(FOREIGN)
 }
@@ -484,7 +549,9 @@ mod tests {
         // source-built toolchain, and the stage0 ladder's 36 pins with the
         // ladder. GCC, glibc, GMP, MPFR and MPC left when Debian runtime
         // imports replaced the remaining source bootstrap.
-        assert_eq!(all().len(), 32);
+        // linux-firmware's WCN6855 files and their licence add six pins,
+        // four of them device firmware (AGENTS.md).
+        assert_eq!(all().len(), 38);
     }
 
     /// A roster keyed by NAME can name nothing, and this workstream has twice
@@ -502,6 +569,25 @@ mod tests {
             .filter(|name| !pins.iter().any(|pin| pin.key == **name))
             .map(|name| (*name).to_string())
             .collect()
+    }
+
+    /// Device firmware is a pin key from linux-firmware's reviewed tag,
+    /// never an alias and never marked: no recipe executes it, and the mark
+    /// would refuse the kernel's ordinary input channel.
+    #[test]
+    fn device_firmware_names_unmarked_pins_from_the_reviewed_tag() {
+        assert!(unresolved(DEVICE_FIRMWARE, PINS).is_empty());
+        for key in DEVICE_FIRMWARE {
+            let pin = by_key(key).unwrap_or_else(|| unreachable!("{key}"));
+            assert!(!pin.foreign(), "{key} is marked");
+            assert!(
+                pin.url.starts_with(
+                    "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20260916/"
+                ),
+                "{key}"
+            );
+            assert!(PINS.iter().all(|def| !def.aliases.contains(key)));
+        }
     }
 
     #[test]

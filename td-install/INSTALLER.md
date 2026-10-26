@@ -36,9 +36,9 @@ T430s itself can show those work. A card in the built-in reader is readable
 but never an installation target. The compositor recognizes the touchpad
 from its sysfs properties and moves the pointer by one finger's travel, as
 a mouse does; its button presses click, and tapping and scrolling are not
-yet read. The TrackPoint moves it relatively. Its Intel Wi-Fi needs vendor
-firmware, a class of foreign data AGENTS.md does not admit, so the wired
-port is its network until that is decided.
+yet read. The TrackPoint moves it relatively. Its Intel Wi-Fi needs
+firmware no reviewed pin carries yet (AGENTS.md, "Device firmware"), so
+the wired port is its network.
 
 The ThinkPad T14s Gen 4 AMD is a second hardware target on the same terms:
 its drivers are built in and checked after config resolution ahead of
@@ -49,12 +49,20 @@ with their GPIO controller and DesignWare I2C, the HID-over-I2C touchpad
 through hid-multitouch, the Realtek codec, x2APIC, which firmware that hands
 over in x2APIC mode needs, and the AMD IOMMU, for interrupt remapping and
 DMA isolation.
-Its Radeon has no driver, since amdgpu needs vendor firmware, so its
+Its Radeon has no driver, since amdgpu needs device firmware no reviewed
+pin carries yet, so its
 display is the UEFI GOP framebuffer through simpledrm, at the resolution
 firmware set, with no brightness control or external display; its internal
-microphones are on the ACP, whose audio drivers are not built. It has no wired port, and its
-Qualcomm Wi-Fi needs vendor firmware as well, so it has no network until
-that is decided.
+microphones are on the ACP, whose audio drivers are not built. It has
+no wired port. Its Qualcomm WCN6855 Wi-Fi is its network: ath11k is
+built in with linux-firmware's pinned files embedded in the kernel
+(AGENTS.md, "Device firmware"), and `td-netd wifi join` names the network
+("Installed Ethernet and remote access"). Only WCN6855 silicon is carried
+(QCA2066 and QCA6698AQ share its PCI ID), and its board data is chosen
+by the card's PCI subsystem ID from `board-2.bin`, which holds Lenovo's
+17aa:9309 and has no generic fallback; a card it lacks logs "failed to
+fetch board data" and brings up no interface. This has not yet been
+tried on the hardware.
 
 Legacy BIOS, resizing, dual boot and RAID are outside v1. Preserving an
 existing td installation is limited to the explicit reinstall mode below.

@@ -4,6 +4,33 @@ use crate::shared::{
 };
 use crate::types::{Recipe, Step, TextEdit};
 
+/// The build-tree directory EXTRA_FIRMWARE_DIR names, relative to the
+/// kernel source tree, so the image names no store path.
+const FIRMWARE_DIR: &str = "td-firmware";
+/// The build root's cp, which may write into the build tree.
+const CP: &str = "/usr/bin/cp";
+
+/// linux-firmware's WCN6855 files ath11k requests at probe (AGENTS.md
+/// "Device firmware"), each by its pin and the name the driver asks for.
+pub const FIRMWARE: &[(&str, &str)] = &[
+    (
+        "linux-firmware-ath11k-wcn6855-amss-source",
+        "ath11k/WCN6855/hw2.0/amss.bin",
+    ),
+    (
+        "linux-firmware-ath11k-wcn6855-m3-source",
+        "ath11k/WCN6855/hw2.0/m3.bin",
+    ),
+    (
+        "linux-firmware-ath11k-wcn6855-board-2-source",
+        "ath11k/WCN6855/hw2.0/board-2.bin",
+    ),
+    (
+        "linux-firmware-ath11k-wcn6855-regdb-source",
+        "ath11k/WCN6855/hw2.0/regdb.bin",
+    ),
+];
+
 // linux-x86-64 (Linux 7.1.4): the latest STABLE mainline kernel (not a
 // longterm/LTS line), built in the Debian build root (AGENTS.md "Debian build
 // root"): Debian's gcc 14.2 as CC and HOSTCC, its binutils, make, flex, bison,
@@ -117,6 +144,41 @@ pub fn recipe() -> Recipe {
         vec![TextEdit::new(
             "timestamp=\"$(date -d\"$1\" +%s || :)\"",
             "timestamp=1",
+            1,
+        )],
+    ));
+
+    // Device firmware, unmodified, where EXTRA_FIRMWARE_DIR finds it. The
+    // engine's copyFile writes only into the output, so the build root's cp
+    // places it in the build tree.
+    steps.push(Step::MkDir {
+        path: format!("{{src}}/{FIRMWARE_DIR}/ath11k/WCN6855/hw2.0"),
+    });
+    for (pin, name) in FIRMWARE {
+        let from = format!("{{in:{pin}}}");
+        let to = format!("{{src}}/{FIRMWARE_DIR}/{name}");
+        steps.push(Step::run("{src}", &[CP, "--", &from, &to]));
+    }
+    // The chip's hw2.1 revision requests linux-firmware's hw2.1 names, which
+    // are links to hw2.0's files; reading hw2.0's embeds each file once.
+    steps.push(Step::substitute_text(
+        "{src}/drivers/net/wireless/ath/ath11k/core.c",
+        vec![TextEdit::new(
+            "\t\t\t.dir = \"WCN6855/hw2.1\",",
+            "\t\t\t.dir = \"WCN6855/hw2.0\",",
+            1,
+        )],
+    ));
+    // cfg80211 defaults to demanding a signed regulatory.db, and that
+    // selects the trusted keyring, whose certs/ tool links openssl, which
+    // the build root lacks. No regulatory.db is carried, so the signature
+    // would guard nothing; the prompt is reachable only under EXPERT, so
+    // the default is flipped here instead.
+    steps.push(Step::substitute_text(
+        "{src}/net/wireless/Kconfig",
+        vec![TextEdit::new(
+            "\tbool \"require regdb signature\" if CFG80211_CERTIFICATION_ONUS\n\tdefault y\n",
+            "\tbool \"require regdb signature\" if CFG80211_CERTIFICATION_ONUS\n\tdefault n\n",
             1,
         )],
     ));
@@ -368,13 +430,30 @@ pub fn recipe() -> Recipe {
     //    SERIAL_MCTRL_GPIO; the Realtek menu defaults in every Realtek codec
     //    family, whose library selects the side-codec component; AMD_IOMMU
     //    selects the IOMMU API, IOVA, SVA, page fault and PCI ATS/PRI/PASID
-    //    support. Its Radeon is not driven: amdgpu needs vendor firmware
-    //    this recipe does not carry, so its display is simpledrm's GOP
+    //    support. Its Radeon is not driven: amdgpu needs device firmware
+    //    no reviewed pin carries yet, so its display is simpledrm's GOP
     //    framebuffer, as on any UEFI machine. AMD_PMC, which s2idle needs to
     //    reach its deepest state, is left out with RTC_CLASS behind it,
     //    since nothing in td enters s2idle. Its internal microphones sit on
     //    the ACP 6.3 PDM controller, whose SND_SOC_AMD_PS driver and SND_SOC
     //    are not built.
+    //
+    //    Wi-Fi: the T14s's Qualcomm WCN6855 (QCNFA765) on ath11k over PCI,
+    //    with cfg80211 and mac80211 under it, all written. ATH11K_PCI
+    //    selects MHI_BUS, QRTR and QRTR_MHI, ATH11K selects
+    //    QCOM_QMI_HELPERS, and FW_LOADER prompts only under EXPERT, so those
+    //    are guarded. Built in, ath11k probes before any root is mounted,
+    //    so linux-firmware's files are embedded with EXTRA_FIRMWARE from a
+    //    build-tree directory (AGENTS.md "Device firmware"), and the chip's
+    //    hw2.1 revision is pointed at hw2.0's files, which linux-firmware
+    //    links it to, so each is embedded once. RFKILL stays off. No
+    //    regulatory.db is carried: cfg80211 starts from the world domain
+    //    and ath11k applies the regulatory domain its firmware reports.
+    //    CFG80211_REQUIRE_SIGNED_REGDB's default is flipped off in its
+    //    Kconfig (above), since it would select the trusted keyring pinned
+    //    off here; guarded with the keyring.
+    //    Unasked: WLAN defaults in every vendor's menu (none of their
+    //    drivers), and QRTR adds the AF_QIPCRTR socket family.
     //
     //    COMPAT_32BIT_TIME has a visible prompt, so allnoconfig turns it off.
     //    It and IA32_EMULATION stay on because td-jail's development syscall
@@ -626,6 +705,15 @@ pub fn recipe() -> Recipe {
                   /^#? *CONFIG_AMD_IOMMU[ =]/d; \
                   /^#? *CONFIG_IRQ_REMAP[ =]/d; \
                   /^#? *CONFIG_X86_X2APIC[ =]/d; \
+                  /^#? *CONFIG_WIRELESS[ =]/d; \
+                  /^#? *CONFIG_CFG80211[ =]/d; \
+                  /^#? *CONFIG_MAC80211[ =]/d; \
+                  /^#? *CONFIG_WLAN[ =]/d; \
+                  /^#? *CONFIG_WLAN_VENDOR_ATH[ =]/d; \
+                  /^#? *CONFIG_ATH11K[ =]/d; \
+                  /^#? *CONFIG_ATH11K_PCI[ =]/d; \
+                  /^#? *CONFIG_EXTRA_FIRMWARE[ =]/d; \
+                  /^#? *CONFIG_EXTRA_FIRMWARE_DIR[ =]/d; \
                   /^#? *CONFIG_SND_ALOOP[ =]/d' .config && \
                  printf '%s\\n' \
                    'CONFIG_UNWINDER_FRAME_POINTER=y' \
@@ -835,7 +923,16 @@ pub fn recipe() -> Recipe {
                    'CONFIG_IOMMU_SUPPORT=y' \
                    'CONFIG_AMD_IOMMU=y' \
                    'CONFIG_IRQ_REMAP=y' \
-                   'CONFIG_X86_X2APIC=y' >> .config"
+                   'CONFIG_X86_X2APIC=y' \
+                   'CONFIG_WIRELESS=y' \
+                   'CONFIG_CFG80211=y' \
+                   'CONFIG_MAC80211=y' \
+                   'CONFIG_WLAN=y' \
+                   'CONFIG_WLAN_VENDOR_ATH=y' \
+                   'CONFIG_ATH11K=y' \
+                   'CONFIG_ATH11K_PCI=y' \
+                   'CONFIG_EXTRA_FIRMWARE=\"ath11k/WCN6855/hw2.0/amss.bin ath11k/WCN6855/hw2.0/m3.bin ath11k/WCN6855/hw2.0/board-2.bin ath11k/WCN6855/hw2.0/regdb.bin\"' \
+                   'CONFIG_EXTRA_FIRMWARE_DIR=\"td-firmware\"' >> .config"
                     .replace(
                         "@EFI_CMDLINE@",
                         &format!("{:?}", crate::shared::efi_default_cmdline()),
@@ -1058,6 +1155,22 @@ pub fn recipe() -> Recipe {
                  grep -q '^CONFIG_AMD_IOMMU=y' .config || { echo 'AMD_IOMMU off — the AMD IOMMU goes unused: no interrupt remapping (an x2APIC handover falls back to xAPIC) and no DMA isolation' >&2; exit 1; }; \
                  grep -q '^CONFIG_IRQ_REMAP=y' .config || { echo 'IRQ_REMAP off — X86_X2APIC depends on it' >&2; exit 1; }; \
                  grep -q '^CONFIG_X86_X2APIC=y' .config || { echo 'X86_X2APIC off — firmware that hands over in x2APIC mode leaves the kernel with its APIC disabled' >&2; exit 1; }; \
+                 grep -q '^CONFIG_WIRELESS=y' .config || { echo 'WIRELESS off — no wireless stack' >&2; exit 1; }; \
+                 grep -q '^CONFIG_CFG80211=y' .config || { echo 'CFG80211 off — no nl80211, so td-netd cannot drive a radio' >&2; exit 1; }; \
+                 grep -q '^CONFIG_MAC80211=y' .config || { echo 'MAC80211 off — ath11k needs the soft-MAC stack' >&2; exit 1; }; \
+                 grep -q '^CONFIG_WLAN=y' .config || { echo 'WLAN off — the wireless driver menu hides ath11k' >&2; exit 1; }; \
+                 grep -q '^CONFIG_WLAN_VENDOR_ATH=y' .config || { echo 'WLAN_VENDOR_ATH off — the Atheros/Qualcomm menu hides ath11k' >&2; exit 1; }; \
+                 grep -q '^CONFIG_ATH11K=y' .config || { echo 'ATH11K off — the T14s WCN6855 Wi-Fi has no driver' >&2; exit 1; }; \
+                 grep -q '^CONFIG_ATH11K_PCI=y' .config || { echo 'ATH11K_PCI off — the WCN6855 is a PCI device' >&2; exit 1; }; \
+                 grep -q '^CONFIG_FW_LOADER=y' .config || { echo 'FW_LOADER off — no firmware reaches ath11k' >&2; exit 1; }; \
+                 grep -q '^CONFIG_MHI_BUS=y' .config || { echo 'MHI_BUS off — ath11k_pci boots the WCN6855 over MHI' >&2; exit 1; }; \
+                 grep -q '^CONFIG_QRTR=y' .config || { echo 'QRTR off — ath11k talks QMI to the WCN6855 over QRTR' >&2; exit 1; }; \
+                 grep -q '^CONFIG_QRTR_MHI=y' .config || { echo 'QRTR_MHI off — QRTR has no transport to the WCN6855' >&2; exit 1; }; \
+                 grep -q '^CONFIG_QCOM_QMI_HELPERS=y' .config || { echo 'QCOM_QMI_HELPERS off — ath11k has no QMI client' >&2; exit 1; }; \
+                 grep -qx 'CONFIG_EXTRA_FIRMWARE=\"ath11k/WCN6855/hw2.0/amss.bin ath11k/WCN6855/hw2.0/m3.bin ath11k/WCN6855/hw2.0/board-2.bin ath11k/WCN6855/hw2.0/regdb.bin\"' .config || { echo 'EXTRA_FIRMWARE is not the WCN6855 set — ath11k probes before any root and finds no firmware' >&2; exit 1; }; \
+                 grep -qx 'CONFIG_EXTRA_FIRMWARE_DIR=\"td-firmware\"' .config || { echo 'EXTRA_FIRMWARE_DIR is not the build-tree firmware directory' >&2; exit 1; }; \
+                 if grep -q '^CONFIG_CFG80211_REQUIRE_SIGNED_REGDB=y' .config; then echo 'CFG80211_REQUIRE_SIGNED_REGDB on — it selects the trusted keyring and its openssl-linked certs/ tool' >&2; exit 1; fi; \
+                 if grep -q '^CONFIG_SYSTEM_TRUSTED_KEYRING=y' .config; then echo 'SYSTEM_TRUSTED_KEYRING on — a select overrode its pin, and certs/ would need openssl' >&2; exit 1; fi; \
                  if grep -q '^CONFIG_IPC_NS=y' .config; then echo 'IPC_NS on — it is default y behind SYSVIPC||POSIX_MQUEUE, so pinning either brings it along unasked; td-jail omits CLONE_NEWIPC and APPLICATIONS.md §0 defers it deliberately' >&2; exit 1; fi".replace("@EFI_CMDLINE@", &format!("{:?}", crate::shared::efi_default_cmdline())),
             ],
         )
@@ -1260,6 +1373,7 @@ pub fn recipe() -> Recipe {
         .source_input("linux-kernel-source")
         .build_root()
         .native_inputs(&["td-sh", "td-init", "td-util"])
+        .inputs(&firmware_pins())
         .steps(steps)
     // No behavioural boot check is registered here: a qemu boot needs HOST qemu,
     // which the gate's host-free `pivot_root` sandbox deliberately hides (the
@@ -1272,6 +1386,12 @@ pub fn recipe() -> Recipe {
     // operator or developer. Automated in-sandbox coverage is the shape checks
     // above (producer rung) and the linux-x86-64-test BuildOnly check, which
     // build the bzImage + initramfs and assert they are well-formed.
+}
+
+/// Every pin the kernel stages: the firmware it embeds. Its notices ship
+/// in the image from `linux-firmware-notices`.
+fn firmware_pins() -> Vec<&'static str> {
+    FIRMWARE.iter().map(|(pin, _)| *pin).collect()
 }
 
 #[cfg(test)]
@@ -1408,6 +1528,143 @@ mod tests {
                 text.contains(&format!("grep -q '^CONFIG_{symbol}=y' .config")),
                 "{symbol}"
             );
+        }
+    }
+
+    /// The T14s's Wi-Fi: ath11k built in, with linux-firmware's files
+    /// staged from their pins and named by EXTRA_FIRMWARE.
+    #[test]
+    fn wcn6855_wifi_is_builtin_with_its_firmware_embedded() {
+        let recipe = recipe();
+        let pins: Vec<String> = firmware_pins().into_iter().map(String::from).collect();
+        assert_eq!(recipe.inputs, Some(pins));
+        let firmware: Vec<&str> = FIRMWARE.iter().map(|(pin, _)| *pin).collect();
+        let mut roster = crate::source_pins::DEVICE_FIRMWARE.to_vec();
+        let mut staged = firmware.clone();
+        roster.sort_unstable();
+        staged.sort_unstable();
+        assert_eq!(
+            staged, roster,
+            "the kernel stages exactly the firmware roster"
+        );
+        let steps = recipe.steps.unwrap_or_default();
+        for (pin, name) in FIRMWARE {
+            assert!(steps.iter().any(|step| matches!(
+                step,
+                Step::Run { argv, .. }
+                    if *argv == [
+                        CP.to_string(),
+                        "--".into(),
+                        format!("{{in:{pin}}}"),
+                        format!("{{src}}/td-firmware/{name}"),
+                    ]
+            )));
+        }
+        let text = steps
+            .iter()
+            .filter_map(|step| match step {
+                Step::Run { argv, .. } => Some(argv.join("\n")),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let names = FIRMWARE
+            .iter()
+            .map(|(_, name)| *name)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let extra = format!("'CONFIG_EXTRA_FIRMWARE=\"{names}\"'");
+        assert_eq!(text.matches(&extra).count(), 2, "pinned and guarded");
+        assert_eq!(
+            text.matches("'CONFIG_EXTRA_FIRMWARE_DIR=\"td-firmware\"'")
+                .count(),
+            2
+        );
+        for symbol in [
+            "WIRELESS",
+            "CFG80211",
+            "MAC80211",
+            "WLAN",
+            "WLAN_VENDOR_ATH",
+            "ATH11K",
+            "ATH11K_PCI",
+        ] {
+            let stale = format!("/^#? *CONFIG_{symbol}[ =]/d;");
+            assert_eq!(text.matches(&stale).count(), 1, "{symbol}");
+            assert_eq!(text.matches(&format!("'CONFIG_{symbol}=y'")).count(), 1);
+            assert!(text.contains(&format!("grep -q '^CONFIG_{symbol}=y' .config")));
+        }
+        assert!(text.contains("if grep -q '^CONFIG_CFG80211_REQUIRE_SIGNED_REGDB=y' .config; then"));
+        // Neither source patch fails the build when absent: hw2.1 silicon
+        // would ask for files nothing embeds, and the keyring would return.
+        // A linux-firmware tag bump must re-check that WHENCE still links
+        // hw2.1's files to hw2.0's.
+        for (file, from, to) in [
+            (
+                "{src}/drivers/net/wireless/ath/ath11k/core.c",
+                "\t\t\t.dir = \"WCN6855/hw2.1\",",
+                "\t\t\t.dir = \"WCN6855/hw2.0\",",
+            ),
+            (
+                "{src}/net/wireless/Kconfig",
+                "\tbool \"require regdb signature\" if CFG80211_CERTIFICATION_ONUS\n\tdefault y\n",
+                "\tbool \"require regdb signature\" if CFG80211_CERTIFICATION_ONUS\n\tdefault n\n",
+            ),
+        ] {
+            assert!(
+                steps.iter().any(|step| matches!(
+                    step,
+                    Step::SubstituteText { file: f, edits }
+                        if f == file
+                            && edits.len() == 1
+                            && edits.iter().all(|e| e.from == from && e.to == to && e.expect == 1)
+                )),
+                "{file}"
+            );
+        }
+        assert!(text.contains("if grep -q '^CONFIG_SYSTEM_TRUSTED_KEYRING=y' .config; then"));
+        for symbol in [
+            "FW_LOADER",
+            "MHI_BUS",
+            "QRTR",
+            "QRTR_MHI",
+            "QCOM_QMI_HELPERS",
+        ] {
+            assert!(!text.contains(&format!("'CONFIG_{symbol}=y'")), "{symbol}");
+            assert!(text.contains(&format!("grep -q '^CONFIG_{symbol}=y' .config")));
+        }
+    }
+
+    /// The roster reaches the graph only through the kernel, on any input
+    /// channel, so the closure query's `device-firmware` lines, which read
+    /// the kernel's inputs, cannot miss a copy; and every linux-firmware
+    /// pin is the roster or a notice the image ships.
+    #[test]
+    fn only_the_kernel_names_device_firmware() {
+        for (stem, recipe) in crate::catalog::all() {
+            let named = recipe
+                .inputs
+                .iter()
+                .chain(recipe.native_inputs.iter())
+                .chain(recipe.payload_inputs.iter())
+                .flatten()
+                .chain(recipe.source_input.iter());
+            for key in named {
+                if crate::source_pins::DEVICE_FIRMWARE.contains(&key.as_str()) {
+                    assert_eq!(stem, "linux-x86-64", "{stem} names {key}");
+                }
+            }
+        }
+        let notices = super::super::linux_firmware_notices::NOTICES;
+        for pin in crate::source_pins::all() {
+            if pin.url.contains("/kernel-firmware/linux-firmware/") {
+                assert!(
+                    crate::source_pins::DEVICE_FIRMWARE.contains(&pin.key.as_str())
+                        || notices.iter().any(|(key, _)| *key == pin.key),
+                    "{} is neither firmware nor a shipped notice",
+                    pin.key
+                );
+            }
         }
     }
 

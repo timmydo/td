@@ -123,8 +123,9 @@ dependency.
 ## Foreign application payloads
 
 td's target graph contains no foreign binary other than the Debian build
-root's tools and reviewed runtime exports, the upstream Rust toolchain and
-the non-executable pinned upstream data below. A third-party application is a marked foreign prebuilt
+root's tools and reviewed runtime exports, the upstream Rust toolchain,
+the non-executable pinned upstream data below and the device firmware
+after it. A third-party application is a marked foreign prebuilt
 payload in `/td/store`, not a build-tool trust root. The mark is load-bearing:
 
 - ordinary input channels refuse it; only `payload_inputs` may carry it as
@@ -173,6 +174,33 @@ is data inside the target graph, not source-built; the closure query
 counts it among the audited seeds rather than naming it. Adding a pin of
 this class is a reviewed pin; data a td program would execute or load as
 code belongs to no class here and needs an amendment to this file.
+
+## Device firmware
+
+Some hardware runs code td cannot build: the ThinkPad T14s Gen 4 AMD's
+Qualcomm WCN6855 Wi-Fi loads its firmware from the host when its driver
+probes. td takes such firmware as upstream bytes from linux-firmware's
+tagged tree, each file a pin with a reviewed URL and SHA-256, listed in
+`DEVICE_FIRMWARE` (`recipes/src/source_pins.rs`). Only the peripheral
+it is written for runs it. The kernel recipe copies the pinned files
+unmodified into its build tree and embeds them with
+`CONFIG_EXTRA_FIRMWARE`; the kernel's firmware loader hands them to the
+device's driver; no recipe step executes, links or loads them as host
+code, and the image carries them only inside the kernel, with their
+notices as data beside it. Only the kernel recipe names a roster pin,
+which a catalog test holds. They stay
+unmarked, like the data above, because nothing in zone one runs them,
+and the closure query counts them among the audited seeds. Being code,
+they are also named: one `device-firmware` line per pin, beside the
+trust roots, for every closure holding the kernel that embeds them.
+What td does not establish is anything about that code: a device with
+firmware can reach host memory by DMA, which an IOMMU, where the kernel
+drives one, bounds (with lazy unmapping), and the WCN6855 answers QMI
+over the QRTR socket family, which td-jail's filter keeps from
+applications (not from unjailed session processes). Adding firmware
+for a device is a reviewed pin in that roster; code the host CPU
+executes, CPU microcode included, belongs to no class here and needs
+its own amendment.
 
 ## Debian build root
 

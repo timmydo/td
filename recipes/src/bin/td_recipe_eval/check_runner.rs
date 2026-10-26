@@ -6009,6 +6009,10 @@ pub(crate) struct PayloadClosure {
     pub(crate) upstream_rust_members: Vec<String>,
     /// Members imported from Debian by a reviewed typed runtime transform.
     pub(crate) debian_runtime_members: Vec<String>,
+    /// Device firmware pins (AGENTS.md "Device firmware") a member stages,
+    /// sorted: unmarked and counted among the seeds, but code a peripheral
+    /// runs, so named.
+    pub(crate) device_firmware: Vec<String>,
 }
 
 impl PayloadClosure {
@@ -6043,7 +6047,8 @@ impl PayloadClosure {
     }
 
     /// One `build-root	debian	<stem>` line per member built in the root,
-    /// then the upstream Rust and Debian runtime members.
+    /// then the upstream Rust and Debian runtime members, then each device
+    /// firmware pin.
     pub(crate) fn trust_root_lines(&self) -> String {
         let root = self
             .build_root_members
@@ -6057,7 +6062,11 @@ impl PayloadClosure {
             .debian_runtime_members
             .iter()
             .map(|stem| format!("upstream-runtime\tdebian\t{stem}\n"));
-        root.chain(rust).chain(runtime).collect()
+        let firmware = self
+            .device_firmware
+            .iter()
+            .map(|key| format!("device-firmware\tlinux-firmware\t{key}\n"));
+        root.chain(rust).chain(runtime).chain(firmware).collect()
     }
 }
 
@@ -6320,7 +6329,13 @@ fn contains_payloads(
     let mut build_root_members = Vec::new();
     let mut upstream_rust_members = Vec::new();
     let mut debian_runtime_members = Vec::new();
+    let mut device_firmware = Vec::new();
     for node in nodes {
+        for key in node.recipe.inputs.iter().flatten() {
+            if td_recipe::source_pins::DEVICE_FIRMWARE.contains(&key.as_str()) {
+                device_firmware.push(key.clone());
+            }
+        }
         if node
             .recipe
             .steps
@@ -6367,6 +6382,8 @@ fn contains_payloads(
     debian_runtime_members.dedup();
     upstream_rust_members.sort();
     upstream_rust_members.dedup();
+    device_firmware.sort();
+    device_firmware.dedup();
     PayloadClosure {
         // The DISTINCT stems rather than `nodes.len()`: a repeated node would
         // otherwise inflate the number the claim divides while the sets it is
@@ -6379,6 +6396,7 @@ fn contains_payloads(
         build_root_members,
         upstream_rust_members,
         debian_runtime_members,
+        device_firmware,
     }
 }
 
@@ -8543,8 +8561,21 @@ mod tests {
             answer.debian_runtime_members,
             ["gcc-runtime", "glibc-x86-64"]
         );
+        assert_eq!(
+            answer.device_firmware,
+            [
+                "linux-firmware-ath11k-wcn6855-amss-source",
+                "linux-firmware-ath11k-wcn6855-board-2-source",
+                "linux-firmware-ath11k-wcn6855-m3-source",
+                "linux-firmware-ath11k-wcn6855-regdb-source",
+            ]
+        );
         assert!(answer.trust_root_lines().ends_with(
-            "upstream-runtime\tdebian\tgcc-runtime\nupstream-runtime\tdebian\tglibc-x86-64\n"
+            "upstream-runtime\tdebian\tgcc-runtime\nupstream-runtime\tdebian\tglibc-x86-64\n\
+             device-firmware\tlinux-firmware\tlinux-firmware-ath11k-wcn6855-amss-source\n\
+             device-firmware\tlinux-firmware\tlinux-firmware-ath11k-wcn6855-board-2-source\n\
+             device-firmware\tlinux-firmware\tlinux-firmware-ath11k-wcn6855-m3-source\n\
+             device-firmware\tlinux-firmware\tlinux-firmware-ath11k-wcn6855-regdb-source\n"
         ));
     }
 

@@ -415,10 +415,13 @@ naming an interface nothing configured. Non-UTF-8 names are kept lossily for
 that reason too — dropping one would be the two crates sorting different
 lists.
 
-There is no WIRELESS field. td's kernel forces `CONFIG_VIRTIO_NET` and
-`CONFIG_E1000` on and no wireless driver at all, so the field could never be
-anything but `?` — a permanent question mark is worse than an absent stanza.
-Temperature is out for the same reason until a target has a thermal zone.
+There is no WIRELESS field. The kernel drives one wireless device, the
+ThinkPad T14s's, and td-netd owns its association; while the radio holds
+the lease the NETWORK field names its interface like any other, and
+`td-netd status` names the network. A signal or network-name field would
+read td-netd's status rather than a second nl80211 client, and is
+deferred. Temperature is out until a target has a thermal zone, since a
+field that can only read `?` is worse than an absent stanza.
 
 The fields are otherwise ordered as the i3status config they are modelled on
 has them, which puts the clock last. The line begins after the workspaces, and

@@ -2295,8 +2295,9 @@ prebuilt or built by prebuilt tools: `rust-toolchain` is the upstream Rust
 release, the Debian build root compiles the source-built C members, and
 `glibc-x86-64` and `gcc-runtime` import Debian runtime bytes. Both are td's
 declared trust roots, which AGENTS.md's claim names as its own exceptions —
-"no foreign binary other than the Debian build root's tools and runtime exports, the upstream
-Rust toolchain" — and §B.8's mark is about APPLICATION payloads
+"no foreign binary other than the Debian build root's tools and reviewed runtime exports, the
+upstream Rust toolchain, the non-executable pinned upstream data below
+and the device firmware after it" — and §B.8's mark is about APPLICATION payloads
 and says nothing about them. A line spelled
 `source-bootstrapped 66` would therefore deny something td declares, and
 a reader parsing it as "nothing prebuilt is in here" would be wrong. So
@@ -2320,6 +2321,13 @@ The two imported Debian runtime members additionally report
 `upstream-runtime\tdebian\t<stem>`. They remain unmarked, like the
 upstream Rust toolchain, but are not source-built. Static consumers inherit
 their prebuilt code; a closure's runtime lines make that dependency visible.
+
+Device firmware (AGENTS.md, "Device firmware") a member stages is named
+last, one `device-firmware\tlinux-firmware\t<pin>` line per pin; only
+the kernel, which embeds it, may stage it. It is
+unmarked and counted among the audited seeds, like pinned data, but it
+is code a peripheral runs, so the answer says so rather than leaving it
+inside the count.
 
 A marked pin is reported BESIDE the output built from it rather than
 instead of it: the archive's bytes are a store path of their own, so the
