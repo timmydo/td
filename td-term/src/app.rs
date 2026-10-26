@@ -634,8 +634,11 @@ pub struct Window {
     asked: u64,
     /// The process table a close reads (`job::PROC`).
     procfs: PathBuf,
-    /// The desktop profile's exit status, once the loop is closed.
+    /// The terminal's exit status, once the loop is closed.
     exit: u8,
+    /// Whether a key or a paste reached the child: what tells a logout,
+    /// whatever its status, from a shell that died before anyone typed.
+    typed: bool,
 }
 
 impl Window {
@@ -708,6 +711,7 @@ impl Window {
             asked: 0,
             procfs: PathBuf::from(job::PROC),
             exit: 0,
+            typed: false,
         })
     }
 
@@ -794,6 +798,7 @@ impl Window {
         match action {
             keys::Action::Bytes(sequence) => {
                 self.send(sequence.as_slice())?;
+                self.typed = true;
                 // Ordinary input returns to the live bottom, so typing never
                 // echoes where nobody can see it.
                 self.scroll(&action);
@@ -1813,6 +1818,7 @@ impl Window {
             Ok(bytes) if bytes.is_empty() => {}
             Ok(bytes) => {
                 if self.input.push(&bytes)? {
+                    self.typed = true;
                     self.viewport = keys::Viewport::new();
                     self.clear_selection();
                     self.stale = true;
@@ -2305,12 +2311,16 @@ impl Window {
         }
     }
 
-    /// The close itself: a desktop's ends with status zero, its child
-    /// hearing the hangup as the master closes; td's is the error its
-    /// supervisor reads.
+    /// The close itself ends the terminal with status zero, its child
+    /// hearing the hangup as the master closes: the person asked for it.
+    /// td's profile also says so in its log, which a shell's ending and a
+    /// lost compositor would otherwise share.
     fn close(&mut self) -> Result<()> {
         if self.options.profile != Profile::Desktop {
-            return Err("compositor requested that the terminal close".into());
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "td-term: compositor requested that the terminal close"
+            );
         }
         self.client.close();
         Ok(())
@@ -2340,9 +2350,10 @@ impl Window {
         }
     }
 
-    /// The child is gone and its output has run out: report, and end. td's
-    /// profile ends in error, which its supervisor reads; the desktop
-    /// closes, answering the child's status as its own.
+    /// The child is gone and its output has run out: report, and end. The
+    /// desktop closes, answering the child's status as its own; td's
+    /// profile names the ending in its log and answers `session_exit`'s
+    /// status, so a logout is no failure to its supervisor or launcher.
     fn finished(&mut self) -> Result<()> {
         let Some(child) = self.child.as_ref() else {
             return Ok(());
@@ -2364,7 +2375,10 @@ impl Window {
         {
             let _ = std::io::stderr().lock().write_all(report.as_bytes());
         }
-        Err(ended(status))
+        let _ = writeln!(std::io::stderr().lock(), "td-term: {}", ended(status));
+        self.exit = session_exit(child.program.as_deref(), status, self.typed);
+        self.client.close();
+        Ok(())
     }
 
     fn markers(&mut self) -> Result<()> {
@@ -2816,6 +2830,21 @@ fn exit_code(status: ExitStatus) -> u8 {
     }
 }
 
+/// td's terminal's own status for its child's ending. The default shell
+/// exits with its last command's status, and a logout after a failed
+/// command is not news, so its exit is success once the person has typed
+/// into it; a shell that exits non-zero before any key or paste reached it
+/// failed to start, and says so. A `--command` child answers its status as
+/// the desktop's does. A signal is a failure either way: no logout ends a
+/// shell so.
+fn session_exit(command: Option<&str>, status: ExitStatus, typed: bool) -> u8 {
+    if command.is_some() || status.code().is_none() || !typed {
+        exit_code(status)
+    } else {
+        0
+    }
+}
+
 /// A child ending ends td's terminal; the words say which ending it was.
 fn ended(status: ExitStatus) -> String {
     match status.code() {
@@ -2948,8 +2977,9 @@ fn child_display(endpoint: &Endpoint) -> Result<String> {
         .ok_or_else(|| "Wayland socket path is not UTF-8".into())
 }
 
-/// Runs the terminal; answers the desktop profile's exit status. td's
-/// profile ends only in error.
+/// Runs the terminal; answers its exit status: the desktop child's, or
+/// td's profile's `session_exit`, and zero after a close. A terminal fault
+/// is the error.
 pub fn run(options: Options) -> Result<u8> {
     let proof = clipboard_proof_enabled(Path::new(PROC_CMDLINE))?;
     let endpoint = match &options.socket {
@@ -3071,16 +3101,21 @@ mod tests {
     /// clipboard and a primary selection, both devices created:
     /// `(window, peer)`.
     fn fixture() -> (Window, UnixStream) {
-        // A path of its own: tests run in parallel, and a readiness socket
-        // another fixture still holds is refused, not replaced.
+        fixture_for(fixture_profile())
+    }
+
+    /// td's profile with a readiness path of its own: tests run in
+    /// parallel, and a readiness socket another fixture still holds is
+    /// refused, not replaced.
+    fn fixture_profile() -> Profile {
         static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        fixture_for(Profile::Td {
+        Profile::Td {
             ready_socket: std::env::temp_dir().join(format!(
                 "td-term-unused-ready-{}-{serial}",
                 std::process::id()
             )),
-        })
+        }
     }
 
     fn fixture_for(profile: Profile) -> (Window, UnixStream) {
@@ -3363,10 +3398,13 @@ mod tests {
 
     /// The desktop closes with its child's status, a shell's convention for
     /// a signal, without waiting for a background job to let go of the
-    /// terminal (the output undrained); td's profile ends in the error its
-    /// supervisor reads, once drained.
+    /// terminal (the output undrained). td's profile closes once drained:
+    /// the default shell's exit is success once someone typed into it,
+    /// since a logout after a failed command is no failure, and its status
+    /// before that; a `--command` child answers its status; a signal is a
+    /// failure for both.
     #[test]
-    fn a_desktop_terminal_ends_with_its_childs_status() {
+    fn a_terminal_ends_with_its_childs_status_or_its_sessions() {
         for (raw, code) in [(0, 0), (3 << 8, 3), (9, 137)] {
             let (mut window, _peer) = fixture_for(Profile::Desktop);
             ended_child(&mut window, raw);
@@ -3374,34 +3412,64 @@ mod tests {
             assert!(window.client.closed());
             assert_eq!(window.exit, code);
         }
-        let (mut window, _peer) = fixture();
-        ended_child(&mut window, 3 << 8);
-        window.end_turn(0, true).unwrap();
-        assert!(!window.client.closed(), "td's waits for the output");
-        if let Some(child) = window.child.as_mut() {
-            child.drained = true;
+        for (command, typed, raw, code) in [
+            (false, true, 0, 0),
+            (false, true, 3 << 8, 0),
+            (false, false, 0, 0),
+            (false, false, 3 << 8, 3),
+            (false, true, 9, 137),
+            (true, true, 0, 0),
+            (true, true, 3 << 8, 3),
+            (true, true, 9, 137),
+        ] {
+            let (mut window, _peer) = fixture();
+            ended_child(&mut window, raw);
+            window.typed = typed;
+            if let Some(child) = window.child.as_mut() {
+                child.program = command.then(|| "mail".into());
+            }
+            window.end_turn(0, true).unwrap();
+            assert!(!window.client.closed(), "td's waits for the output");
+            if let Some(child) = window.child.as_mut() {
+                child.drained = true;
+            }
+            window.end_turn(0, true).unwrap();
+            let case = (command, typed, raw);
+            assert!(window.client.closed(), "{case:?}");
+            assert_eq!(window.exit, code, "{case:?}");
         }
-        assert_eq!(
-            window.end_turn(0, true).unwrap_err(),
-            "the terminal's child exited with status 3"
-        );
-        assert!(!window.client.closed());
     }
 
-    /// Closing the window ends a desktop terminal, its child hung up as the
-    /// master closes; td's terminal treats it as an error.
+    /// A key or a paste the child is given is what makes its later exit a
+    /// logout; a terminal's own reply is not.
     #[test]
-    fn a_close_request_closes_a_desktop_terminal() {
-        let (mut window, _peer) = fixture_for(Profile::Desktop);
-        window.event(message(TOPLEVEL, 1, &[])).unwrap();
-        assert!(window.client.closed());
-        // The child's own ending, arriving in the same turn, is not the
-        // status the close said.
-        ended_child(&mut window, 3 << 8);
-        window.end_turn(0, true).unwrap();
-        assert_eq!(window.exit, 0);
+    fn keys_and_pastes_mark_the_terminal_typed_into() {
         let (mut window, _peer) = fixture();
-        assert!(window.event(message(TOPLEVEL, 1, &[])).is_err());
+        assert!(!window.typed);
+        window.pasted("ls".into()).unwrap();
+        assert!(window.typed);
+        let (mut window, _peer) = fixture();
+        window.route("a", Some('a')).unwrap();
+        assert!(window.typed);
+    }
+
+    /// Closing the window ends either terminal with status zero, its child
+    /// hung up as the master closes.
+    #[test]
+    fn a_close_request_closes_the_terminal_with_success() {
+        for profile in [Profile::Desktop, fixture_profile()] {
+            let (mut window, _peer) = fixture_for(profile);
+            window.event(message(TOPLEVEL, 1, &[])).unwrap();
+            assert!(window.client.closed());
+            // The child's own ending, arriving in the same turn, is not the
+            // status the close said.
+            ended_child(&mut window, 3 << 8);
+            if let Some(child) = window.child.as_mut() {
+                child.drained = true;
+            }
+            window.end_turn(0, true).unwrap();
+            assert_eq!(window.exit, 0);
+        }
     }
 
     /// A process table holding `lines`, each a `/proc/PID/stat` line.
@@ -3558,35 +3626,37 @@ mod tests {
         );
     }
 
-    /// td's terminal ends in the error its supervisor reads, at once when
-    /// idle or once the prompt is answered; a child already exited, or
-    /// none yet, has nothing to ask about.
+    /// td's terminal closes with success, at once when idle or once the
+    /// prompt is answered; a child already exited, or none yet, has
+    /// nothing to ask about.
     #[test]
-    fn tds_terminal_asks_first_and_then_ends_in_its_error() {
-        let ready_socket =
-            std::env::temp_dir().join(format!("td-term-unused-close-ready-{}", std::process::id()));
-        let profile = Profile::Td { ready_socket };
+    fn tds_terminal_asks_first_and_then_closes() {
+        let profile = fixture_profile();
         let idle = procfs(&[IDLE_SHELL]);
         let (mut window, _peer) = running(profile.clone(), &idle);
-        assert!(close_request(&mut window).is_err());
+        close_request(&mut window).unwrap();
+        assert!(window.client.closed() && window.exit == 0);
         let busy = procfs(SHELL_WITH_VIM);
         let (mut window, _peer) = running(profile.clone(), &busy);
         close_request(&mut window).unwrap();
         ask(&mut window);
-        let refused = window.event(message(KEYBOARD, 3, &[9, 0, 21, 1]));
-        assert_eq!(
-            refused.unwrap_err(),
-            "compositor requested that the terminal close"
-        );
+        assert!(!window.client.closed());
+        window.event(message(KEYBOARD, 3, &[9, 0, 21, 1])).unwrap();
+        assert!(window.client.closed() && window.exit == 0);
         let (mut window, _peer) = running(profile, &busy);
         if let Some(child) = window.child.as_mut() {
             use std::os::unix::process::ExitStatusExt;
             child.status = Some(ExitStatus::from_raw(0));
         }
-        assert!(close_request(&mut window).is_err(), "exited: no prompt");
+        close_request(&mut window).unwrap();
+        assert!(
+            window.client.closed() && window.exit == 0,
+            "exited: no prompt"
+        );
         let (mut window, _peer) = fixture();
         window.procfs = busy.path().to_path_buf();
-        assert!(close_request(&mut window).is_err(), "not started");
+        close_request(&mut window).unwrap();
+        assert!(window.client.closed() && window.exit == 0, "not started");
     }
 
     /// A program the invocation named is the job while it runs, though it

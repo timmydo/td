@@ -1185,7 +1185,34 @@ The terminal ends when the child's output has run out AND the child has been
 waited for, since the two race and ending on either alone drops the parting
 output or names no status. td-term then prints
 `td-term: the terminal's child exited with status N` (or that a signal
-killed it) and exits. A `--command` child that ends badly, by a non-zero
+killed it), so the log tells a shell's ending from a lost compositor or a
+terminal fault, and exits with the session's status. The default shell's
+exit is success, status zero, once a key or a paste has reached it: a
+shell exits with its last command's status, and `exit` or Control-d after
+a failed command is a logout, not a failure. A shell that exits non-zero
+before anyone typed into it did not start properly, and its status is
+td-term's, so a broken startup still backs off and is reported. A
+`--command` child's status is td-term's, its code or 128 and the signal,
+as on the desktop (§7). A child killed by a signal is a failure either
+way, since no logout ends a shell so. td-term's own failure, a dropped
+compositor among them, is a `td-term:` line and status 1, which a
+`--command` child's status 1 also is.
+
+Three readers depend on that status. td-authd answers the compositor's
+poll of a terminal it launched (`Super+t`, the task terminal) as a
+successful or a failed exit, and the compositor logs `td-compositor:
+launched program failed` for the second (td-authd/DESIGN.md); the direct
+development launcher logs a failed `td-term run` as `launched UI client
+exited with` its status. Neither reads a logout as a failure. td-svc counts
+the session's `[terminal]` unit's consecutive failures and backs its
+`restart=always` off exponentially until a run lasts a second and ends
+cleanly (td-svc/DESIGN.md §6): a logout from a terminal that lasted
+resets that count and is restarted at the base delay, while a crash
+still backs off. td-svc still logs `exited unexpectedly; restarting in
+100ms` for each, as it does for any `restart=always` exit that resets
+its count.
+
+A `--command` child that ends badly, by a non-zero
 status or a signal, first leaves its last screen in the log: the rows of the
 active screen at exit -- whichever screen that is, and however far back the
 reader had scrolled, because the program's last words are there and not in
@@ -1291,13 +1318,14 @@ on under it, and its line is not revised if the job ends meanwhile; the
 answer still decides. A child that exits while it asks ends the terminal
 as it would have.
 
-Confirmed, or with nothing to ask, the close is what it always was: a
-desktop terminal ends with status zero, its child hearing the hangup as the
-master closes (§7), and td's profile ends in the error its supervisor
-reads. The session's `[terminal]` unit is `restart=always`, so closing it
-replaces it with a fresh shell: an idle one is replaced at once, and a
-running job is ended only once the person says so. A terminal td-authd
-launched for the compositor ends.
+Confirmed, or with nothing to ask, the close ends the terminal with status
+zero in both profiles, its child hearing the hangup as the master closes
+(§7): the person asked for it, so it is no failure to td-svc or to the
+compositor. td's profile also prints `td-term: compositor requested that
+the terminal close`. The session's `[terminal]` unit is `restart=always`,
+so closing it replaces it with a fresh shell: an idle one is replaced at
+once, and a running job is ended only once the person says so. A terminal
+td-authd launched for the compositor ends.
 
 The PTY reader thread (`pty-output`) owns a master descriptor and parks in
 `read` whenever the child is idle, and safe `std` cannot interrupt that:

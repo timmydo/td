@@ -198,8 +198,8 @@ fn install_terminfo(path: &str) -> Result<(), String> {
     std::fs::write(path, bytes).map_err(|error| format!("write {path}: {error}"))
 }
 
-/// Runs what was asked; answers the status to exit with, which is the
-/// desktop terminal's child's.
+/// Runs what was asked; answers the status to exit with, which for the
+/// terminal is `app::run`'s.
 fn dispatch(args: &[OsString]) -> Result<u8, String> {
     match request(args)? {
         Request::Terminal(options) => app::run(options),

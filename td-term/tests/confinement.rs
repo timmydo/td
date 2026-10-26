@@ -98,6 +98,7 @@ fn the_words_units_and_the_boot_oracle_read_are_pinned() {
         "\"TD-TERM-CLIPBOARD-SENT bytes={}\\n\"",
         "const LAST_SCREEN_PREFIX: &str = \"td-term: last screen\";",
         "format!(\"the terminal's child exited with status {code}\")",
+        "\"td-term: compositor requested that the terminal close\"",
     ] {
         assert!(app.contains(pin), "{pin}");
     }

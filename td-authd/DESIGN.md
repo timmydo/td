@@ -833,6 +833,14 @@ authorization. Opening one's ordinary terminal is session behavior and opens
 an ordinary shell with the human account's existing authority; it grants
 neither store access nor an elevated shell.
 
+A poll's `82 01` and `82 02` are the launched program's own exit status,
+zero or not, uninterpreted; the compositor logs `launched program failed`
+on its standard error for the second. What a status means is the
+program's: td-term answers zero when its shell logs out, whatever the last
+command's status, or when a close is asked for, and fails for a signal, a
+shell that exits non-zero before anyone typed, a `--command` child's
+failure or its own fault (td-term/DESIGN.md §4).
+
 Launch is not authentication, settings synchronization, or build readiness.
 
 The compositor-owned runtime directory permits human traversal and socket
