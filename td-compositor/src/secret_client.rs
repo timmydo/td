@@ -4227,6 +4227,34 @@ mod tests {
             });
             (screen, deadline)
         }
+        /// A login attempt whose lifetime ends `after` from now, `setup`
+        /// run on it with at least half that lifetime to spare, so what the
+        /// case does next still runs before the deadline, and a prompt the
+        /// setup presents shows at least a second left. A host too loaded
+        /// for that discards the attempt, its result or panic alike, and
+        /// runs `setup` again with twice the lifetime, up to 64 seconds,
+        /// so a case proves what its deadline does without assuming a
+        /// speed. At that ceiling a panic is resumed.
+        fn expiring_after<T>(
+            selection: LoginSelection,
+            mut after: Duration,
+            setup: impl Fn(&Self) -> T,
+        ) -> (Self, Instant, T) {
+            assert!(after >= Duration::from_secs(2));
+            loop {
+                let (screen, deadline) = Self::expiring(selection.clone(), after);
+                let set = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| setup(&screen)));
+                let spare = Instant::now() + after / 2 <= deadline;
+                if spare || after >= Duration::from_secs(64) {
+                    match set {
+                        Ok(value) if spare => return (screen, deadline, value),
+                        Ok(_) => panic!("setup never finished in half its lifetime"),
+                        Err(panic) => std::panic::resume_unwind(panic),
+                    }
+                }
+                after *= 2;
+            }
+        }
     }
 
     fn login(operation: Operation) -> Request {
@@ -6925,11 +6953,14 @@ mod tests {
         let unlock = LoginSelection::Unlock;
         let steps = steps(&unlock);
         let end = [&ended(0x0d, 0x80, 0)[..], &steps[0].encode()].concat();
-        let (screen, deadline) = Screen::expiring(unlock.clone(), Duration::from_millis(1500));
-        let (mut client, _, result) = drive(&screen, presented(&unlock, 1).0);
-        assert_eq!(result, Ok(()));
-        // The prompt is up.
-        assert_eq!(screen.shown(), None);
+        let (screen, deadline, mut client) =
+            Screen::expiring_after(unlock.clone(), Duration::from_millis(2000), |screen| {
+                let (client, _, result) = drive(screen, presented(&unlock, 1).0);
+                assert_eq!(result, Ok(()));
+                // The prompt is up.
+                assert_eq!(screen.shown(), None);
+                client
+            });
         while Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -6998,11 +7029,14 @@ mod tests {
             (LoginSelection::Enroll(2), 360),
             (LoginSelection::Add, 240),
         ] {
+            // Bracketed by the clock on both sides, however long the
+            // attempt took to make.
             let before = Instant::now();
             let screen = Screen::login(selection.clone());
-            let lifetime = screen.attempt.deadline.unwrap().duration_since(before);
-            assert!(lifetime >= Duration::from_secs(seconds));
-            assert!(lifetime < Duration::from_secs(seconds + 1));
+            let after = Instant::now();
+            let deadline = screen.attempt.deadline.unwrap();
+            assert!(deadline >= before + Duration::from_secs(seconds));
+            assert!(deadline <= after + Duration::from_secs(seconds));
             assert_eq!(
                 steps(&selection)[0].login_ceiling(),
                 Some(Duration::from_secs(seconds))
@@ -7132,9 +7166,11 @@ mod tests {
         client
             .start(&mut wire, Arc::clone(&screen.attempt))
             .unwrap();
-        while !wire.replies.is_empty() {
+        // An ended operation takes no more replies.
+        while client.login.is_some() && !wire.replies.is_empty() {
             client.tick(&mut wire).unwrap();
         }
+        assert!(wire.replies.is_empty(), "the operation ended early");
         wire.replies.extend(then);
         (client, wire)
     }
@@ -7396,11 +7432,16 @@ mod tests {
     fn a_deadline_while_typing_zeroes_the_field_and_times_out() {
         for tick in [true, false] {
             let last = unlock_pin_step();
-            let (screen, deadline) =
-                Screen::expiring(LoginSelection::Unlock, Duration::from_millis(2000));
-            let (mut client, _) = at_pin(&screen, vec![]);
-            type_bytes(&screen, b"12");
-            assert_ne!(screen.attempt.field_raw(), [0; PIN_CAPACITY]);
+            let (screen, deadline, mut client) = Screen::expiring_after(
+                LoginSelection::Unlock,
+                Duration::from_millis(2000),
+                |screen| {
+                    let (client, _) = at_pin(screen, vec![]);
+                    type_bytes(screen, b"12");
+                    assert_ne!(screen.attempt.field_raw(), [0; PIN_CAPACITY]);
+                    client
+                },
+            );
             while Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(20));
             }
@@ -7486,17 +7527,25 @@ mod tests {
     #[test]
     fn a_deadline_between_the_take_and_the_write_sends_no_pin() {
         let last = unlock_pin_step();
-        let (screen, deadline) =
-            Screen::expiring(LoginSelection::Unlock, Duration::from_millis(2000));
-        let (mut client, mut wire) = submitted(&screen, b"4321");
+        let (screen, deadline, (mut client, mut wire)) = Screen::expiring_after(
+            LoginSelection::Unlock,
+            Duration::from_millis(2000),
+            |screen| submitted(screen, b"4321"),
+        );
+        let waited = Arc::new(AtomicBool::new(false));
         TAKEN.with(|taken| {
+            let waited = Arc::clone(&waited);
             *taken.borrow_mut() = Some(Box::new(move || {
                 while Instant::now() < deadline {
                     std::thread::sleep(Duration::from_millis(20));
                 }
+                waited.store(true, Ordering::SeqCst);
             }))
         });
         client.tick(&mut wire).unwrap();
+        // The PIN was taken before the deadline, which passed before its
+        // write.
+        assert!(waited.load(Ordering::SeqCst));
         assert_eq!(sent(&wire, 0x1c), 0);
         let end = [&ended(0x0d, 0x80, 0)[..], &last.encode()].concat();
         wire.replies.extend([vec![0x95, 0], end]);
@@ -7907,15 +7956,29 @@ mod tests {
 
     #[test]
     fn the_field_paints_a_count_never_a_character() {
+        // One prompt for every PIN, each typed into the emptied field: the
+        // prompt's time left, painted once when shown, is the same for all.
+        let screen = Screen::login(LoginSelection::Unlock);
+        let _open = at_pin(&screen, vec![]);
         let painted = |pin: &[u8]| {
-            let screen = Screen::login(LoginSelection::Unlock);
-            let _open = at_pin(&screen, vec![]);
             type_bytes(&screen, pin);
             assert_eq!(
                 screen.field(),
                 Some(Field::Pin(u8::try_from(pin.len()).unwrap()))
             );
-            std::fs::read(&screen.path).unwrap()
+            let pixels = std::fs::read(&screen.path).unwrap();
+            for _ in pin {
+                screen
+                    .attempt
+                    .field_key(
+                        &crate::input::test_origin(),
+                        FieldKey::Erase,
+                        pressed(&screen.attempt),
+                    )
+                    .unwrap();
+            }
+            assert_eq!(screen.field(), Some(Field::Pin(0)));
+            pixels
         };
         let first = painted(b"ab3#");
         assert_eq!(first, painted(b"ZZ9 "));
