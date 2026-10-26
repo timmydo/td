@@ -14,7 +14,7 @@ ca-certificates-source gwd0r7fyqs45rzrnwwbzl2p5c76zrfad-ca-certificates-source
 cryptsetup-x86-64-source v3g69yip0g4zybh9yw2hlp3zzcfy98fc-cryptsetup-x86-64-source
 curl-x86-64-source s38hackr0p194d351xs9pc71gjknclls-curl-x86-64-source
 fd-source rsp3qagl8x7gh5hqpzy93adwfv5pv2ay-fd-source
-git-x86-64-source q7x6s60i03qm90sldhz5fz1812n1qk3h-git-x86-64-source
+git-x86-64-source dsg8dzp8rizb8x2jfjzs50wqmlq29x44-git-x86-64-source
 jetbrains-mono-nerd-font-source 632myin1d84lnr23d9ma4f4iwgs13bk2-jetbrains-mono-nerd-font-source
 json-c-x86-64-source csb78c2cixywmxii4vxp4ab11q5273p5-json-c-x86-64-source
 libdevmapper-x86-64-source 14i35fjwswmcjr5jp6p00vhh8b2m99d4-libdevmapper-x86-64-source

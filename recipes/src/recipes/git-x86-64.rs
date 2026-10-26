@@ -250,7 +250,7 @@ pub fn recipe() -> Recipe {
     });
     steps.push(Step::split_debug_tree("{out}", "/usr/bin/objcopy"));
 
-    Recipe::mesboot("git-x86-64", "2.55.0")
+    Recipe::mesboot("git-x86-64", "2.56.0")
         .source_input("git-x86-64-source")
         .build_root()
         .native_inputs(&[

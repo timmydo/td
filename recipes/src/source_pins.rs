@@ -65,14 +65,14 @@ const PINS: &[PinDef] = &[
     PinDef {
         key: "git-x86-64-source",
         aliases: &[],
-        // Git 2.55.0 is the source-built daily-driver client. Its td configuration
+        // Git 2.56.0 is the source-built daily-driver client. Its td configuration
         // keeps local repositories and HTTP(S) remotes and dispatches SSH remotes
         // through the separate OpenSSH package, while omitting language runtimes,
         // WebDAV, and direct OpenSSL use.
-        url: "https://www.kernel.org/pub/software/scm/git/git-2.55.0.tar.xz",
-        sha256: "457fdb04dc8728e007d4688695e6912e6f680727920f2a40bf11eacc17505357",
-        file: "git-2.55.0.tar.xz",
-        version: "2.55.0",
+        url: "https://www.kernel.org/pub/software/scm/git/git-2.56.0.tar.xz",
+        sha256: "26c56c296b38c0695b26fa95f475f1d01704d2d38e73465ca30b0b2f5dc789d3",
+        file: "git-2.56.0.tar.xz",
+        version: "2.56.0",
     },
     PinDef {
         key: "jetbrains-mono-nerd-font-source",
@@ -469,7 +469,7 @@ mod tests {
         // util-linux 2.42.2 (cryptsetup's minimal libuuid/libblkid build
         // closure) + the first reviewed
         // foreign application seed, upstream ripgrep 15.2.0, LibreSSL 4.4.0,
-        // curl 8.23.0 (the static HTTPS foundation for Git), Git 2.55.0,
+        // curl 8.23.0 (the static HTTPS foundation for Git), Git 2.56.0,
         // curl's dated Mozilla CA extract and OpenSSH Portable 10.6p1. The
         // td-ui applications are td's own trees (APPLICATIONS.md §W.8) and
         // pin nothing here.

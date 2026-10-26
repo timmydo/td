@@ -162,7 +162,7 @@ pub fn recipe() -> Recipe {
                  test \"$(cat '{root}/ssh-status')\" = '0 255 ' || { echo \"OpenSSH did not check its variant and then fail its connection: statuses $(cat '{root}/ssh-status')\" >&2; cat ssh-helper.log >&2; exit 1; }; \
                  cd repo || exit 1; \
                  build=$(git version --build-options) || exit 1; \
-                 printf '%s\\n' \"$build\" | grep -Fq 'git version 2.55.0' || exit 1; \
+                 printf '%s\\n' \"$build\" | grep -Fq 'git version 2.56.0' || exit 1; \
                  printf '%s\\n' \"$build\" | grep -Fq 'shell-path: /bin/sh' || exit 1; \
                  test \"$(git --exec-path)\" = '{in:git-x86-64}/libexec/git-core' || exit 1",
             ],
@@ -177,7 +177,7 @@ pub fn recipe() -> Recipe {
     });
     steps.push(Step::WriteFile {
         path: "{out}/result".into(),
-        content: "PASS: Git 2.55.0 local and service workflows, HTTPS helper dispatch with verified curl TLS, and SSH dispatch through verified OpenSSH; the system boot oracle completes clone/push/reclone over a real loopback sshd\n".into(),
+        content: "PASS: Git 2.56.0 local and service workflows, HTTPS helper dispatch with verified curl TLS, and SSH dispatch through verified OpenSSH; the system boot oracle completes clone/push/reclone over a real loopback sshd\n".into(),
         exec: false,
     });
     steps.push(Step::Require {
