@@ -611,3 +611,18 @@ Ordinary attachment octets use base64. Aggregate decoded input and encoded
 message each obey the selected message-size ceiling, capped at 32 MiB.
 MIME-part locators must first be downloaded/uploaded, as td-mail does; they
 are not local upload IDs. HTML draft composition remains outside this flow.
+
+
+### Persistent summary reads
+
+The native HTTPS read fixture verifies that normal draft publication stores
+common-header summaries, deletes those derived rows to model pre-upgrade mail,
+and rebuilds them in one-blob pages using the administrative resume cursor.
+It recreates the API worker before each summary read and inspects private
+PostgreSQL statement logs to prove no body-chunk fetch occurs. The fixture
+compares exact header responses, exercises incompatible versions and malformed
+JSON fallback, and retains the existing fresh-keyword, revocation, missing
+Email and corrupted-body checks. This proves historical header reuse never
+becomes permission to read corrupt body bytes. Unit fixtures exercise shared
+Unicode/header decoding, body-size independence and expired-deadline omission.
+These are correctness checks; no elapsed-time performance threshold is gated.

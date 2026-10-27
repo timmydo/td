@@ -35,7 +35,7 @@ changing that validator requires an explicit atomic implementation update.
 | SMTP slots | 8 | 376064 | 3008512 |
 | HTTPS slots | 8 | 1703936 | 13631488 |
 | Body/search jobs | 3 | 1327104 | 3981312 |
-| Storage read views | 6 | 430080 | 2580480 |
+| Storage read views | 6 | 1609728 | 9658368 |
 | Resident index cache | 1 | 4194304 | 4194304 |
 | Outbound slots | 1 | 572672 | 572672 |
 | Sort runs and merge buffers | 1 | 1048576 | 1048576 |
@@ -55,10 +55,10 @@ changing that validator requires an explicit atomic implementation update.
 | SMTP resident DATA | 4 | 33554432 | 134217728 |
 | SMTP prepared body | 1 | 33554432 | 33554432 |
 | Upload ingress and retained body | 2 | 33554432 | 67108864 |
-| **Total** | | | **355124480** |
+| **Total** | | | **362202368** |
 
-The total is approximately 338.67 MiB against a 512 MiB configured budget;
-the remaining 181746432 bytes are unassigned headroom, not another cache.
+The total is approximately 345.42 MiB against a 512 MiB configured budget;
+the remaining 174668544 bytes are unassigned headroom, not another cache.
 The default process ledger excludes database-server memory and WAL mappings.
 The two default TLS handshakes remain configurable within the process budget.
 The earlier 128 MiB workload RSS goal is exceeded by the concurrent
@@ -4643,10 +4643,25 @@ sessions. These measurements do not establish a latency target or error-free
 phase counters. Concurrent host checks may affect timings.
 
 The corrected ledger adds 224 MiB of previously omitted resident buffers.
-Its approximately 338.67-MiB total plus unassigned headroom motivates a
+Its approximately 345.42-MiB total plus unassigned headroom motivates a
 provisional 512-MiB planning default. The plan includes both roles even for a
 split process and does not preallocate its entries. Before choosing a hard OS
 memory limit or a smaller role-specific default, measure cgroup current/peak,
 page cache, combined-role operation, repeated saturation, slow clients, TLS
 reload and uncertain-publication retention. Other feature allocations and
 allocator transients still require integrated measurement.
+
+
+### Persistent summary scratch
+
+A read view reserves an additional 1152 KiB for at most sixteen 64-KiB
+summary payloads, row descriptors and one decoded four-field result. Windows
+are released before replacement and no account-sized collection is retained.
+Publication temporarily retains at most four 16-KiB values plus the existing
+shared parser scratch; it borrows the original message prefix. The owner
+backfill additionally retains at most 256 KiB plus two bytes of header input
+and the ordinary eight-chunk verification cache, one message at a time.
+Derived disk payload is at most 64 KiB per live blob, bounded in count by the
+account blob quota, and is not counted as original body bytes. PostgreSQL row,
+index and WAL overhead remains database capacity planning. These are planning
+estimates, not an allocation or measured RSS guarantee.

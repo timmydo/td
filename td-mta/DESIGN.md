@@ -1648,13 +1648,15 @@ commit uncertainty, recovery and database administration. Immutable bodies and
 metadata are published together. Full length and digest verification grants
 body custody only within the original live snapshot. Passive historical audit
 reports grant neither current freshness nor body-read authority.
-Worker-local header projections are the narrow exception: a previously fully
+Persisted common-header summaries and worker-local header projections are
+the narrow exception: a previously fully
 verified immutable blob may supply cached serialized headers after fresh
 snapshot authentication and exact account/epoch/blob/length/digest matching.
 Mutable Email fields always come from the new snapshot. This historical
 header evidence does not detect later corruption in an unrequested body tail
 and grants no body pin. Full body, preview, search and download paths retain
-current verification. POSTGRES.md section 73 owns cache admission and lifetime.
+current verification. POSTGRES.md section 73 owns cache admission and lifetime; its persistent
+summary section owns digest/version binding, publication and rebuilding.
 
 
 [STORAGE.md](STORAGE.md) owns process-local locks and disposable response

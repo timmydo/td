@@ -582,6 +582,50 @@ impl MailRead for crate::postgres_read::Snapshot<'_> {
         }
         let mut cache = self.header_cache.take();
         let result = (|| {
+            if projection.selection.headers_only()
+                && projection
+                    .selection
+                    .header_names()
+                    .all(|name| crate::postgres_summaries::field_index(name).is_some())
+            {
+                if let Some(fields) = self
+                    .summary(metadata, projection.limits.header_bytes)
+                    .map_err(postgres_read_error)?
+                {
+                    for name in projection.selection.header_names() {
+                        let index =
+                            crate::postgres_summaries::field_index(name).ok_or(Error::State)?;
+                        let bytes = fields.get(index).ok_or(Error::State)?;
+                        for piece in [b",\"".as_slice(), name, b"\":".as_slice(), bytes.as_slice()]
+                        {
+                            for chunk in piece.chunks(4096) {
+                                self.check().map_err(postgres_read_error)?;
+                                output.admit()?;
+                                projection
+                                    .work
+                                    .charge(
+                                        projection.clock.monotonic().map_err(Error::Storage)?,
+                                        crate::admission::work::Charge {
+                                            records: 1,
+                                            output_bytes: chunk.len() as u64,
+                                            ..Default::default()
+                                        },
+                                    )
+                                    .map_err(projection_stop)?;
+                                output.append(chunk)?;
+                            }
+                        }
+                    }
+                    self.check().map_err(postgres_read_error)?;
+                    output.check()?;
+                    crate::performance::record(
+                        crate::performance::Phase::SummaryReuse,
+                        std::time::Duration::ZERO,
+                        crate::performance::Outcome::Success,
+                    );
+                    return Ok(());
+                }
+            }
             if projection.selection.headers_only() && cache.is_some() {
                 output.admit()?;
                 projection

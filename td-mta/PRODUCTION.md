@@ -304,3 +304,34 @@ and inactive checkouts; never delete database, backup or migration directories
 as build cleanup. Maintenance helper upgrades are separate from the MTA binary:
 regenerating operations definitions may refuse operator-edited units, which
 must be compared before replacement. Do not silently overwrite those units.
+
+
+## Persistent header summary upgrade and backfill
+
+Schema 33 adds `blob_summaries`. This is a schema update, so the binary-only
+activation procedure above is insufficient. Follow POSTGRES.md's explicit
+owner migration procedure: verify a backup, stop all five MTA processes and
+other database maintenance jobs, retain and revoke runtime schema/table/column
+grants, upgrade with the candidate binary and owner connection, then restore
+runtime grants including SELECT/INSERT/UPDATE/DELETE on `blob_summaries`.
+Run candidate `schema-inspect`, `runtime-check` and `config-check` before
+starting the candidate. Keep the schema-32 backup and old binary together as
+pre-upgrade recovery evidence; restoring that backup after new mail arrives
+would lose that mail unless it is separately preserved and reconciled.
+
+After readiness, fill historical summaries using the normal owner command:
+
+```text
+sudo -u td-mta /opt/td-mta/bin/td-mta postgres summary-backfill --connection-file /var/lib/td-mta/mail/owner-connection --epoch CURRENT_EPOCH --account ACCOUNT_ID --limit 16
+```
+
+Keep each successful JSON report privately. If `done` is false, pass its
+`after` value as `--after BLOB_ID` on the next invocation. Run one page at a
+time; reduce `--limit` if a page exhausts its finite work allowance. On failure,
+do not advance the cursor. This command rebuilds existing rows as well as
+filling absent ones, so replay is safe and restarting without a cursor is an
+explicit full rebuild. `skipped` identifies unrenderable summaries by count;
+those messages retain verified-parser fallback and their original raw bytes.
+Repeat for each account. New messages get summaries during publication and do
+not require a scheduled backfill. Compare `summary_reuse` and `body_verify`
+performance-counter deltas around cold client reads after the backfill.

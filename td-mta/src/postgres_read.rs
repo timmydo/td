@@ -139,6 +139,7 @@ pub struct Snapshot<'a> {
     failed: Option<Error>,
     metadata: Option<Metadata>,
     metadata_window: MetadataWindow,
+    summary_window: Option<Vec<tokio_postgres::Row>>,
     value_window: value_reads::Window,
     _worker_thread: std::marker::PhantomData<std::rc::Rc<()>>,
     _permit: Option<ReadPermit<'a>>,
@@ -345,6 +346,7 @@ impl<'a> Snapshot<'a> {
             failed: None,
             metadata: None,
             metadata_window: [None; postgres_body::MAX_METADATA_IDS],
+            summary_window: None,
             value_window: value_reads::Window::default(),
             _worker_thread: std::marker::PhantomData,
             _permit: permit,
@@ -594,9 +596,68 @@ impl Snapshot<'_> {
         })();
         let window = self.retain(result)?;
         self.metadata_window = window;
+        self.summary_window = None;
         self.value_window = value_reads::Window::default();
         self.metadata = None;
         Ok(())
+    }
+    /// Passive derived values never authorize a body read or replace current
+    /// Email membership, device authorization, or mutable metadata.
+    pub(crate) fn summary(
+        &mut self,
+        metadata: Metadata,
+        header_limit: usize,
+    ) -> Result<Option<Vec<Vec<u8>>>, Error> {
+        self.check()?;
+        if header_limit != crate::postgres_summaries::HEADER_LIMIT {
+            return Ok(None);
+        }
+        if self.summary_window.is_none() {
+            let mut blobs = Vec::new();
+            blobs
+                .try_reserve_exact(postgres_body::MAX_METADATA_IDS)
+                .map_err(|_| Error::Capacity)?;
+            for (_, value) in self.metadata_window.iter().flatten() {
+                if let Some(value) = value {
+                    if !blobs.contains(&value.blob) {
+                        blobs.push(value.blob);
+                    }
+                }
+            }
+            if blobs.is_empty() {
+                blobs.push(metadata.blob);
+            }
+            let account = self.identity.account;
+            let result = self.worker.run(|client| Box::pin(async move {
+                let mut ids = Vec::new();
+                ids.try_reserve_exact(blobs.len()).map_err(|_| Error::Capacity)?;
+                ids.extend(blobs.iter().map(|blob| blob.as_bytes().as_slice()));
+                client.query_typed("SELECT blob_id,body_length,body_digest,fields FROM td_mta.blob_summaries WHERE account=$1 AND blob_id=ANY($2) AND version=$3 ORDER BY blob_id LIMIT 16", &[(&account.as_bytes().as_slice(), Type::BYTEA), (&ids, Type::BYTEA_ARRAY), (&crate::postgres_summaries::VERSION, Type::INT4)]).await.map_err(|_| Error::Database)
+            })).map_err(Error::Connection).and_then(|rows| rows);
+            self.summary_window = Some(self.retain(result)?);
+        }
+        let result = (|| {
+            for row in self.summary_window.as_deref().unwrap_or_default() {
+                let id: &[u8] = row.try_get(0).map_err(|_| Error::Integrity)?;
+                if id != metadata.blob.as_bytes() {
+                    continue;
+                }
+                let length: i64 = row.try_get(1).map_err(|_| Error::Integrity)?;
+                let digest: &[u8] = row.try_get(2).map_err(|_| Error::Integrity)?;
+                if u64::try_from(length).ok() != Some(metadata.body.length)
+                    || digest != metadata.body.digest
+                {
+                    return Ok(None);
+                }
+                let fields: Vec<Vec<u8>> = row.try_get(3).map_err(|_| Error::Integrity)?;
+                if !crate::postgres_summaries::valid(&fields) {
+                    return Ok(None);
+                }
+                return Ok(Some(fields));
+            }
+            Ok(None)
+        })();
+        self.retain(result)
     }
     /// Prefetch bounded value prefixes; pagination continues after their tail.
     pub fn prefetch_values(

@@ -7154,3 +7154,65 @@ native hashing is not independently cancellable. Native context allocation
 belongs to the existing process/provider allowance, bounded by active workers.
 This path is not an allocation-free primitive. Other digest callers retain
 the existing owned implementation and storage bytes are unchanged.
+
+
+## Persistent common-header summaries (schema 33)
+
+`blob_summaries` holds rebuildable From, To, Cc and Subject JSON values, in
+that fixed order, independently of mutable Email metadata or request property
+order. Each account/blob has at most one row, bound to body length, complete
+body digest and interpretation version 1. Version 1 uses the existing shared
+header parser with a 256-KiB header ceiling, its aggregate interpretation
+limits, four fields of at most 16 KiB each, and finite preparation work.
+Changing these interpretation semantics requires a version bump. Different
+configured header ceilings, unsupported properties, absent rows, incompatible
+versions, digest/length mismatches or malformed JSON use verified parsing.
+
+The shared blob publication boundary derives these values from its already
+owned immutable bytes and stores them in the same transaction as the blob.
+SMTP, drafts, imports and local notices therefore retain the original durable
+publication boundary. Parsing examines only the bounded header prefix; it does
+not decode attachments or compute previews. An unrenderable/oversized summary
+is optional and is omitted, leaving the original message available through
+existing behavior. Publication deadlines still apply to this additional work;
+summary SQL failure cannot leave a partially committed delivery.
+
+An authenticated read fetches at most sixteen summary rows for the current
+metadata window, under the original snapshot, account and deadline. Only
+header-only selections of these four properties use them. All Email existence,
+flags, thread IDs, dates and memberships still come from that snapshot. JSON
+values pass bounded framing and root-kind validation before output; final
+snapshot validation and response publication remain unchanged. `summary_reuse`
+counts successful persisted summary uses in the existing performance report.
+No body chunks are read or body I/O precharged for a summary hit.
+
+These rows are historical interpretation evidence, like the existing memory
+cache, not current body integrity evidence. They neither create a body pin nor
+detect subsequent corruption of an unrequested attachment. Full body, preview,
+search and download paths retain current verification. Account/blob foreign
+keys and cascading deletion remove summaries when the authoritative blob is
+removed. There is no external cache service, credential cache or shared mutable
+response object.
+
+`postgres summary-backfill --connection-file OWNER --epoch E --account A`
+rebuilds one finite page of Email-referenced blobs, including replacing
+existing summaries. It can repair malformed derived rows as well as fill gaps. `--limit N`
+selects 1..16 blobs (default 16); `--after BLOB` resumes after the previously
+reported cursor. One page verifies at most 64 MiB of full bodies, retains one
+bounded header prefix at a time, and writes at most 256 KiB of derived values
+within the ordinary ten-second owner job. Reports contain `scanned`, `written`,
+`skipped`, `verified_bytes`, `after` and `done`, never header contents. Skipped
+unrenderable messages advance the cursor without fabricating a summary. Only
+known COMMIT returns success and an advanceable cursor; failures preserve the
+caller's previous cursor, and an unknown COMMIT is reported explicitly. Replaying
+the same page is safe because these are replaceable derived rows, not mail
+publication or outbound effects. Run pages serially, retaining each successful
+cursor, until `done`; a later version rebuild starts again without `--after`.
+New delivery does not wait for this administrative backfill.
+
+Schema upgrade remains explicit: stop serving instances, use the owner schema
+upgrade workflow, grant the runtime role the new table's ordinary mail access,
+and restart the upgraded binary. Existing messages remain readable before
+backfill. Backups include derived rows, but the original messages remain the
+source for rebuilding them. A rollback binary must understand schema 33; do
+not restart a schema-32 binary against the upgraded ledger.

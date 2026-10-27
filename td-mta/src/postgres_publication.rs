@@ -126,6 +126,14 @@ pub(crate) async fn write_blob(
         let ordinal = i64::try_from(index * 8).map_err(|_| Error::Capacity)?;
         if client.execute_typed("INSERT INTO td_mta.blob_chunks SELECT $1,$2,$3+ordinality-1,bytes FROM unnest($4::bytea[]) WITH ORDINALITY chunks(bytes,ordinality)", &[(&account, Type::BYTEA),(&blob, Type::BYTEA),(&ordinal, Type::INT8),(&batch, Type::BYTEA_ARRAY)]).await.map_err(|_|Error::Database)?!=batch.len() as u64 { return Err(Error::Integrity); }
     }
+    if let Some(fields) = crate::postgres_summaries::derive(value.bytes, true, deadline) {
+        if client.execute_typed("INSERT INTO td_mta.blob_summaries(account,blob_id,version,body_length,body_digest,fields) VALUES($1,$2,$3,$4,$5,$6)", &[(&account, Type::BYTEA), (&blob, Type::BYTEA), (&crate::postgres_summaries::VERSION, Type::INT4), (&length, Type::INT8), (&value.digest.as_slice(), Type::BYTEA), (&fields, Type::BYTEA_ARRAY)]).await.map_err(|_| Error::Database)? != 1 {
+            return Err(Error::Integrity);
+        }
+    }
+    if Instant::now() >= deadline {
+        return Err(Error::Deadline);
+    }
     Ok(())
 }
 

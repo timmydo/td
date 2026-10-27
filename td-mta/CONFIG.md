@@ -259,7 +259,7 @@ remain enforced. A plan exceeding the configured budget is refused.
 
 For example, `memory_budget_bytes=536870912` explicitly selects the default
 512-MiB planning budget. This is not an OS-enforced RSS limit. The current
-default plan is 355124480 bytes (about 338.67 MiB), including the
+default plan is 362202368 bytes (about 345.42 MiB), including the
 4-MiB index cache. Bounded folder/keyword prefix prefetch adds 128 KiB per read
 view (768 KiB at the default six views); tightly sized budgets must allow
 this additional scratch reservation. It does not raise protocol limits.
@@ -1968,3 +1968,9 @@ phase meanings, nesting, saturation and null observations. Compare snapshots
 before and after a slow operation; hourly database summaries retain history
 without one log row per request. The endpoint keeps the existing private root,
 mode-0600 socket and two-second exchange policy, with a 16-KiB response cap.
+
+
+Persistent common-header summaries add 1152 KiB of planned scratch per storage
+read view (6912 KiB at the default six views). Configurations with tightly sized
+`memory_budget_bytes` must allow this increase. The default remains 512 MiB;
+connection, message and allocation ceilings do not increase.

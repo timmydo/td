@@ -404,7 +404,7 @@ fn real_postgres_schema_initialization_is_atomic_and_locked() {
     );
     wait_command(&mut shared);
     let receipt = initialize(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 32);
+    assert_eq!(receipt.version, 33);
     assert_eq!(
         inspect(&fixture.request(), &trust, deadline()).unwrap(),
         receipt
@@ -617,7 +617,7 @@ fn real_postgres_schema_commands_prepare_and_inspect_one_epoch() {
     };
     assert!(invoke("schema-inspect", 1).contains("schema-operation-failed"));
     let initialized = invoke("schema-init", 0);
-    assert!(initialized.contains("\"schema_version\":32"));
+    assert!(initialized.contains("\"schema_version\":33"));
     assert!(initialized.contains(
         "\"ledger_checked\":true,\"serving_schema_checked\":false,\"profile_checked\":false"
     ));
@@ -862,7 +862,7 @@ fn real_postgres_runtime_credentials_separate_mail_writes_from_owner_authority()
     }
     sql(
         &fixture,
-        "UPDATE td_mta.schema_migrations SET version=99 WHERE version=32",
+        "UPDATE td_mta.schema_migrations SET version=99 WHERE version=33",
     );
     assert_eq!(
         probe(&serving, &trust, deadline()),
@@ -870,7 +870,7 @@ fn real_postgres_runtime_credentials_separate_mail_writes_from_owner_authority()
     );
     sql(
         &fixture,
-        "UPDATE td_mta.schema_migrations SET version=32 WHERE version=99",
+        "UPDATE td_mta.schema_migrations SET version=33 WHERE version=99",
     );
     assert_eq!(
         schema::inspect(&serving, &trust, deadline()).unwrap(),
@@ -1052,7 +1052,7 @@ fn real_postgres_material_schema_upgrade_preserves_epoch_and_rolls_back() {
     );
     wait_command(&mut held);
     let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 32);
+    assert_eq!(receipt.version, 33);
     assert_eq!(receipt.store_epoch.as_bytes(), &[1; 16]);
     assert_eq!(
         upgrade(&fixture.request(), &trust, deadline()).unwrap(),
@@ -1761,7 +1761,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
     use td_mta::postgres_schema::{inspect, upgrade, Error as SchemaError};
     for previous_version in [
         2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-        27, 28, 31,
+        27, 28, 31, 32,
     ] {
         let fixture = Fixture::new();
         let trust = TrustStore::from_pem(&fixture.ca).unwrap();
@@ -1797,6 +1797,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             include_str!("../src/postgres_logs.sql"),
             include_str!("../src/postgres_acme.sql"),
             include_str!("../src/postgres_recovery.sql"),
+            include_str!("../src/postgres_legacy_bodies.sql"),
         ]
         .iter()
         .take(previous_version)
@@ -1847,6 +1848,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             26 => "attempt_final_reservations",
             27 => "runtime_barrier",
             28 => "application_log_state",
+            32 => "blob_summaries",
             _ => "flag_receipts",
         };
         if previous_version == 8 {
@@ -1904,7 +1906,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             sql(&fixture,"UPDATE td_mta.recipients SET state=7,uncertain=1,phase=4,reason=9,next_attempt_at=1");
         }
         let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
-        assert_eq!(receipt.version, 32);
+        assert_eq!(receipt.version, 33);
         assert_eq!(
             sql(
                 &fixture,
@@ -6851,11 +6853,61 @@ fn exercise_http_read(
         "eight jobs must exhaust the retained read session"
     );
     let header_body = format!(
-        r##"{{"using":["urn:ietf:params:jmap:mail"],"methodCalls":[["Email/query",{{"accountId":"{account}"}},"q"],["Email/get",{{"accountId":"{account}","#ids":{{"resultOf":"q","name":"Email/query","path":"/ids"}},"properties":["id","subject","keywords","mailboxIds"]}},"g"]}}"##
+        r##"{{"using":["urn:ietf:params:jmap:mail"],"methodCalls":[["Email/query",{{"accountId":"{account}"}},"q"],["Email/get",{{"accountId":"{account}","#ids":{{"resultOf":"q","name":"Email/query","path":"/ids"}},"properties":["id","subject","keywords","mailboxIds"]}},"g"]]}}"##
     );
+    td_json::parse(&header_body).unwrap();
+    let summary_trust = TrustStore::from_pem(&fixture.ca).unwrap();
+    let mut summary_runtime = fixture.request();
+    summary_runtime.user = "mail_runtime";
+    assert_eq!(
+        td_mta::postgres_summary_backfill::run(
+            &summary_runtime,
+            &summary_trust,
+            deadline(),
+            binding.epoch(),
+            binding.account(),
+            None,
+            1,
+        ),
+        Err(td_mta::postgres_summary_backfill::Error::Owner),
+        "preparation mode alone must not grant owner authority"
+    );
+    assert_eq!(
+        sql(fixture, "SELECT count(*) FROM td_mta.blob_summaries"),
+        "2",
+        "draft publication must include derived summaries"
+    );
+    sql(fixture, "DELETE FROM td_mta.blob_summaries");
+    let mut after = None;
+    let mut rebuilt = 0;
+    loop {
+        let page = td_mta::postgres_summary_backfill::run(
+            &fixture.request(),
+            &summary_trust,
+            deadline(),
+            binding.epoch(),
+            binding.account(),
+            after,
+            1,
+        )
+        .unwrap();
+        rebuilt += page.written;
+        assert_eq!(page.skipped, 0);
+        if page.done {
+            break;
+        }
+        assert_ne!(page.after, after);
+        after = page.after;
+        assert!(rebuilt <= 2);
+    }
+    assert_eq!(rebuilt, 2);
     let (result, first_headers) = call(&header_body, password, device, false, false, false);
     result.unwrap();
-    assert_eq!(first_headers.matches("\"subject\":\"Snapshot\"").count(), 2);
+    assert_eq!(
+        first_headers.matches("\"subject\":\"Snapshot\"").count(),
+        2,
+        "{first_headers}"
+    );
     sql(fixture, "ALTER SYSTEM SET log_statement='all'");
     sql(fixture, "SELECT pg_reload_conf()");
     while sql(fixture, "SHOW log_statement") != "all" {
@@ -6864,6 +6916,9 @@ fn exercise_http_read(
     let log_offset = fs::metadata(fixture.root.join("server.log")).unwrap().len() as usize;
     // Cross the eight-job connection lifetime: header evidence belongs to the worker.
     for _ in 0..10 {
+        // A fresh worker has neither an in-memory projection nor a DB session.
+        // Persisted summaries must still avoid loading body chunks.
+        *api_worker.borrow_mut() = None;
         let (result, headers) = call(&header_body, password, device, false, false, false);
         result.unwrap();
         assert_eq!(headers, first_headers);
@@ -6875,6 +6930,29 @@ fn exercise_http_read(
     );
     sql(fixture, "ALTER SYSTEM RESET log_statement");
     sql(fixture, "SELECT pg_reload_conf()");
+    // Incompatible and malformed derived records fall back to verified parsing.
+    for damage in [
+        "UPDATE td_mta.blob_summaries SET version=2",
+        "UPDATE td_mta.blob_summaries SET version=1,fields[4]=convert_to('not-json','UTF8')",
+    ] {
+        sql(fixture, damage);
+        *api_worker.borrow_mut() = None;
+        let (result, headers) = call(&header_body, password, device, false, false, false);
+        result.unwrap();
+        assert_eq!(headers, first_headers);
+    }
+    sql(fixture, "UPDATE td_mta.blob_summaries SET version=2");
+    td_mta::postgres_summary_backfill::run(
+        &fixture.request(),
+        &summary_trust,
+        deadline(),
+        binding.epoch(),
+        binding.account(),
+        None,
+        16,
+    )
+    .unwrap();
+    *api_worker.borrow_mut() = None;
     // Historical header evidence does not authorize current body bytes.
     sql(fixture, "UPDATE td_mta.blob_chunks SET bytes=set_byte(bytes,0,get_byte(bytes,0)#1) WHERE octet_length(bytes)>0");
     let (result, headers) = call(&header_body, password, device, false, false, false);

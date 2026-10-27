@@ -175,6 +175,8 @@ mod postgres_sequence;
 mod postgres_snapshot;
 pub mod postgres_submission_input;
 pub mod postgres_submissions;
+mod postgres_summaries;
+pub mod postgres_summary_backfill;
 pub mod preview_json;
 pub mod property_selection;
 pub mod recipient_sweep;

@@ -21,6 +21,7 @@ mod material;
 mod metadata_audit;
 mod recovery;
 mod selection;
+mod summary_backfill;
 mod usage;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -85,6 +86,9 @@ fn arguments(operation: Operation, mut args: impl Iterator<Item = OsString>) -> 
 
 pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<ExitCode> {
     let command = args.next();
+    if command.as_deref() == Some(OsStr::new("summary-backfill")) {
+        return summary_backfill::run(args);
+    }
     if let Some(command) = command.as_deref().and_then(account_admin::Command::parse) {
         return account_admin::run(command, args);
     }

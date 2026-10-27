@@ -315,7 +315,7 @@ impl Limits {
             Reservation {
                 name: "read views",
                 count: self.storage_views,
-                bytes_each: sum("read view", &[READ_VIEW_SCRATCH_BYTES])?,
+                bytes_each: sum("read view", &[READ_VIEW_SCRATCH_BYTES, 1152 * KIB])?,
             },
             Reservation {
                 name: "index cache",
@@ -445,7 +445,7 @@ mod tests {
     #[test]
     fn default_ledger_pins_documented_budget() -> Result<(), ResourceError> {
         let plan = Limits::default().plan()?;
-        assert_eq!(plan.total_bytes(), 355_124_480);
+        assert_eq!(plan.total_bytes(), 362_202_368);
         const { assert!(crate::format::MAX_VALUE_BYTES + crate::format::MAX_KEY_BYTES + 48 <= 68 * KIB) };
         assert_eq!(
             READ_VIEW_SCRATCH_BYTES,
