@@ -143,6 +143,9 @@ impl Drop for Fixture {
 pub(crate) fn queued(fixture: &Fixture) -> (Intake, UnixStream) {
     let (server, mut client) = UnixStream::pair().unwrap();
     let mut pending = Pending::new(server, fixture.owner).unwrap();
+    // Admission's five seconds span its synced backoff write; no case
+    // that queues an update is about them, so they last `WAIT` here.
+    pending.deadline = Some(Instant::now() + crate::revocation::tests::WAIT);
     let backoff = fixture.backoff();
     let admission = || {
         let backoff = backoff.clone();
