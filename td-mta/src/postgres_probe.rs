@@ -691,6 +691,7 @@ fn connect_authenticated_until(
         socket,
         validation_window,
         audit_windows: false,
+        relay_wake: false,
     })
 }
 
@@ -704,6 +705,12 @@ pub(crate) struct Worker {
     socket: Arc<Mutex<DriverSocket>>,
     validation_window: Option<windows::Windows>,
     audit_windows: bool,
+    relay_wake: bool,
+}
+
+fn relay_notification(message: &tokio_postgres::AsyncMessage) -> bool {
+    matches!(message, tokio_postgres::AsyncMessage::Notification(value)
+        if value.channel() == "td_mta_relay" && value.payload().is_empty())
 }
 impl Worker {
     pub(crate) fn begin_validation_turn(&mut self) -> Result<(), Error> {
@@ -750,7 +757,9 @@ impl Worker {
             match self.connection.as_mut().poll_message(&mut context) {
                 Poll::Pending if !self.activity.load(Ordering::Relaxed) => return Ok(()),
                 Poll::Pending => {}
-                Poll::Ready(Some(Ok(_))) => {}
+                Poll::Ready(Some(Ok(message))) => {
+                    self.relay_wake |= relay_notification(&message);
+                }
                 Poll::Ready(Some(Err(_))) | Poll::Ready(None) => {
                     self.failed = Some(Error::Database);
                     return Err(Error::Database);
@@ -794,7 +803,10 @@ impl Worker {
                 return Ok(result);
             }
             match self.connection.as_mut().poll_message(&mut context) {
-                Poll::Ready(Some(Ok(_))) => continue,
+                Poll::Ready(Some(Ok(message))) => {
+                    self.relay_wake |= relay_notification(&message);
+                    continue;
+                }
                 Poll::Pending => {}
                 Poll::Ready(Some(Err(_))) | Poll::Ready(None) => {
                     self.failed = Some(Error::Database);

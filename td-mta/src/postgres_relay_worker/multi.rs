@@ -5,6 +5,7 @@ use std::sync::Condvar;
 pub(super) struct AccountState {
     pub retry: bool,
     pub active: bool,
+    pub empty: bool,
     pub notice_at: Instant,
     pub repaired: bool,
 }
@@ -14,7 +15,10 @@ impl IdlePause {
     fn new() -> Self {
         Self(Duration::from_millis(250))
     }
-    fn after_round(&mut self, active: bool) -> Duration {
+    fn wake(&mut self) {
+        *self = Self::new();
+    }
+    fn after_round(&mut self, active: bool, empty: bool) -> Duration {
         if active {
             self.0 = Duration::from_millis(250);
         }
@@ -22,7 +26,11 @@ impl IdlePause {
         if !active {
             self.0 = self.0.saturating_mul(2).min(Duration::from_secs(2));
         }
-        pause
+        if empty {
+            Duration::from_secs(30)
+        } else {
+            pause
+        }
     }
 }
 // Hold the next account's place across a shared expiry rate-limit refusal.
@@ -255,6 +263,7 @@ pub(super) fn run(
         states.push(AccountState {
             retry: false,
             active: false,
+            empty: false,
             notice_at: Instant::now(),
             repaired: false,
         });
@@ -304,6 +313,8 @@ pub(super) fn run(
     let mut idle_reader =
         crate::postgres_queue_candidates::IdleReader::new(&slots, worker.request, worker.trust);
     let mut active_round = false;
+    let mut empty_round = false;
+    let mut round_subscription = idle_reader.subscription();
     let mut expiry_turn = ExpiryTurn { cursor: 0, count };
     let result = std::thread::scope(|scope| {
         let renew = std::thread::Builder::new()
@@ -341,19 +352,49 @@ pub(super) fn run(
                         buffers,
                     )?;
                     active_round |= state.active;
+                    empty_round &= state.empty;
                     if let Some(request) =
                         repairing.filter(|_| states.iter().all(|state| state.repaired))
                     {
                         worker.queue.finish_repair(request, true);
                     }
-                } else if expiry_turn.current(cursor) {
-                    expiry_turn.advance();
+                } else {
+                    empty_round = false;
+                    if expiry_turn.current(cursor) {
+                        expiry_turn.advance();
+                    }
                 }
+                // A reconnect after an earlier account's scan loses hints
+                // from the gap. Require a full pass on one subscription.
+                empty_round &= round_subscription == idle_reader.subscription();
                 cursor = (cursor + 1) % count;
                 // One bounded foreground turn per account, including Busy.
                 if cursor == 0 {
-                    pause(control, idle.after_round(active_round));
+                    let duration = idle.after_round(active_round, empty_round);
+                    if empty_round {
+                        let mut timing = crate::performance::Timer::start(
+                            crate::performance::Phase::RelayIdleWait,
+                        );
+                        let end = Instant::now() + duration;
+                        while !control.stop_requested()
+                            && worker.queue.repair_request().is_none()
+                            && !worker.queue.confirm.load(Ordering::Acquire)
+                            && Instant::now() < end
+                        {
+                            if idle_reader
+                                .wake((Instant::now() + Duration::from_millis(50)).min(end))
+                            {
+                                idle.wake();
+                                break;
+                            }
+                        }
+                        timing.succeeded();
+                    } else {
+                        pause(control, duration);
+                    }
                     active_round = false;
+                    empty_round = true;
+                    round_subscription = idle_reader.subscription();
                 }
             }
             Ok(())
@@ -399,7 +440,7 @@ mod tests {
         let mut elapsed = Duration::ZERO;
         let mut scans = 0;
         while elapsed < Duration::from_secs(60) {
-            let pause = idle.after_round(false);
+            let pause = idle.after_round(false, false);
             assert!(pause <= Duration::from_secs(2));
             elapsed += pause;
             scans += 1;
@@ -410,12 +451,22 @@ mod tests {
         );
         // Activity in any account restores the ordinary whole-pass wait.
         for _ in 0..10 {
-            assert_eq!(idle.after_round(true), Duration::from_millis(250));
+            assert_eq!(idle.after_round(true, false), Duration::from_millis(250));
         }
-        assert_eq!(idle.after_round(false), Duration::from_millis(250));
-        assert_eq!(idle.after_round(false), Duration::from_millis(500));
-        assert_eq!(idle.after_round(false), Duration::from_secs(1));
-        assert_eq!(idle.after_round(false), Duration::from_secs(2));
+        assert_eq!(idle.after_round(false, false), Duration::from_millis(250));
+        assert_eq!(idle.after_round(false, false), Duration::from_millis(500));
+        assert_eq!(idle.after_round(false, false), Duration::from_secs(1));
+        assert_eq!(idle.after_round(false, false), Duration::from_secs(2));
+        // Only proven absence for every account admits the longer hint wait.
+        assert_eq!(idle.after_round(false, true), Duration::from_secs(30));
+        idle.wake();
+        // A fresh arrival during a retry turn keeps fairness, but waits only
+        // the reset interval before the following fresh turn.
+        assert_eq!(idle.after_round(false, false), Duration::from_millis(250));
+        assert_eq!(idle.after_round(false, false), Duration::from_millis(500));
+        assert_eq!(idle.after_round(false, true), Duration::from_secs(30));
+        assert_eq!(idle.after_round(false, false), Duration::from_secs(2));
+        assert_eq!(idle.after_round(true, false), Duration::from_millis(250));
     }
 
     #[test]

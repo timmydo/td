@@ -150,6 +150,7 @@ impl Worker<'_, '_> {
         mut expiry_turn: Option<&mut multi::ExpiryTurn>,
         mut buffers: Buffers,
     ) -> Result<Buffers, Error> {
+        state.empty = false;
         state.active = database(worker.pending.identity())?.is_some();
         if state.active || self.queue.repair_request().is_some() {
             idle_reader.close();
@@ -177,6 +178,7 @@ impl Worker<'_, '_> {
                 }
             };
             if let Some(observed_at) = observed {
+                state.empty = true;
                 self.observe_queue_clock(worker, observed_at)?;
                 if let Some(turn) = expiry_turn {
                     turn.advance();

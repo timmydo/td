@@ -49,6 +49,8 @@ pub enum Phase {
     SummaryReuse,
     StructureReuse,
     ChunkVerify,
+    RelayIdleWait,
+    RelayWake,
 }
 impl Phase {
     pub const ALL: &'static [Self] = &[
@@ -93,6 +95,8 @@ impl Phase {
         Self::SummaryReuse,
         Self::StructureReuse,
         Self::ChunkVerify,
+        Self::RelayIdleWait,
+        Self::RelayWake,
     ];
     pub const fn code(self) -> &'static str {
         match self {
@@ -137,6 +141,8 @@ impl Phase {
             Self::SummaryReuse => "summary_reuse",
             Self::StructureReuse => "structure_reuse",
             Self::ChunkVerify => "chunk_verify",
+            Self::RelayIdleWait => "relay_idle_wait",
+            Self::RelayWake => "relay_wake",
         }
     }
 }

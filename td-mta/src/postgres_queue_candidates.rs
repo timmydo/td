@@ -100,6 +100,7 @@ pub struct IdleReader<'a, 'r> {
     slots: &'a crate::postgres_read::ReadSlots,
     request: &'a Request<'r>,
     trust: &'a TrustStore,
+    subscription: u64,
     session: Option<(
         postgres_probe::ReadSession,
         crate::postgres_read::ReadPermit<'a>,
@@ -115,6 +116,7 @@ impl<'a, 'r> IdleReader<'a, 'r> {
             slots,
             request,
             trust,
+            subscription: 0,
             session: None,
         }
     }
@@ -127,6 +129,9 @@ impl<'a, 'r> IdleReader<'a, 'r> {
             self.close();
         }
     }
+    pub(crate) fn subscription(&self) -> u64 {
+        self.subscription
+    }
     pub fn close(&mut self) {
         if let Some((session, permit)) = self.session.take() {
             let now = Instant::now();
@@ -136,6 +141,45 @@ impl<'a, 'r> IdleReader<'a, 'r> {
             );
             drop(permit);
         }
+    }
+    /// A missing or broken subscription requests a fresh scan, never absence.
+    pub fn wake(&mut self, deadline: Instant) -> bool {
+        use crate::performance::{record, Outcome, Phase};
+        self.maintain();
+        let Some((session, _)) = self.session.as_mut() else {
+            record(
+                Phase::RelayWake,
+                std::time::Duration::ZERO,
+                Outcome::Unavailable,
+            );
+            return true;
+        };
+        match session.relay_wake(deadline) {
+            Ok(wake) => {
+                if wake {
+                    record(
+                        Phase::RelayWake,
+                        std::time::Duration::ZERO,
+                        Outcome::Success,
+                    );
+                }
+                wake
+            }
+            Err(_) => {
+                record(Phase::RelayWake, std::time::Duration::ZERO, Outcome::Failed);
+                self.close();
+                true
+            }
+        }
+    }
+    /// Drain already available hints without waiting or issuing SQL.
+    pub fn notified(&mut self, deadline: Instant) -> Result<bool, Error> {
+        self.session
+            .as_mut()
+            .ok_or(Error::Integrity)?
+            .0
+            .relay_notified(deadline)
+            .map_err(Error::Connection)
     }
     pub fn observe(
         &mut self,
@@ -160,8 +204,10 @@ impl<'a, 'r> IdleReader<'a, 'r> {
         let reused = self.session.is_some();
         if self.session.is_none() {
             let permit = self.slots.acquire().map_err(|_| Error::Busy)?;
-            let session = postgres_probe::ReadSession::open(self.request, self.trust, deadline)
+            let mut session = postgres_probe::ReadSession::open(self.request, self.trust, deadline)
                 .map_err(Error::Connection)?;
+            session.listen_relay(deadline).map_err(Error::Connection)?;
+            self.subscription = self.subscription.checked_add(1).ok_or(Error::Capacity)?;
             self.session = Some((session, permit));
         }
         let claim = claim.clone();

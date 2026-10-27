@@ -521,6 +521,12 @@ pub fn publish(
             {
                 return Err(Error::Integrity);
             }
+            // PostgreSQL delivers this coalesced hint only if COMMIT succeeds.
+            // It carries no account, recipient or delivery authority.
+            client
+                .batch_execute("NOTIFY td_mta_relay")
+                .await
+                .map_err(|_| Error::Database)?;
             marker.store(true, Ordering::Relaxed);
             client
                 .batch_execute("COMMIT")

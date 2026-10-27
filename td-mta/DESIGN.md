@@ -2389,6 +2389,13 @@ hourly events, after one initial minute snapshot. A private local
 PostgreSQL. Recording never waits or performs I/O; nested phase timings are not
 additive. The same retention and loss limits apply.
 
+Relay notifications are scheduling hints only. A fully empty account rotation
+may wait up to thirty seconds for a committed submission notification; socket
+disconnect, session retirement and local control requests interrupt the wait.
+Nonempty queues retain periodic retry/expiry scheduling, and lease renewal
+remains independent. Every wake rechecks current database authority. POSTGRES.md
+specifies subscription ordering, bounded coalescing and lost-hint recovery.
+
 Expose counters for accepted/refused mail, TLS/plain sessions, active slots,
 limit refusals, queue age/depth, unknown outcomes, logical disk usage/quotas, dropped logs,
 index lag, authentication failures and certificate expiry/renewal. `status`

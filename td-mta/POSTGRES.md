@@ -6830,6 +6830,41 @@ and does not itself mark the round active: delayed or paused work must not pin
 polling at its shortest interval. Notice scheduling is unchanged until an actual
 notice check occurs. New work committed after the hint waits for another turn.
 
+When every configured account has a renewed owner lease and its absence read
+finds no unfinished submissions, attempts or pending notices, the next pause
+uses a thirty-second fallback instead of the ordinary two-second cap. The
+retained reader autocommits `LISTEN td_mta_relay` before its first absence read.
+Submission publication executes `NOTIFY td_mta_relay` inside the same transaction
+as its rows and receipt, before the existing COMMIT outcome marker. PostgreSQL
+delivers the hint only on commit. A notification failure never permits an
+acknowledgement without durable publication, and uncertain COMMIT retains the
+existing settlement rules. No schema migration or new privileges are required.
+
+The channel has an empty payload: every subscribed relay profile may wake,
+then uses its own bounded account rotation and current authorization. Driver
+polls coalesce matching notifications into one boolean, including those read
+during SQL. Unrelated channels and nonempty payloads are ignored. Existing
+finite input frame/byte budgets still apply; no notification queue is allocated.
+An idle pause blocks on the existing socket in at most fifty-millisecond slices
+and issues no SQL. Stop, repair and queue-clock confirmation requests interrupt
+it. A disconnect, missing subscription or finite session retirement also ends
+the pause; replacement subscribes before scanning again. Only a complete
+rotation on one subscription admits the extended pause, so a reconnect between
+account scans cannot hide work from an earlier account behind that pause. A complete lost hint
+is recovered by the thirty-second fallback, even without another submission.
+The database scan remains authoritative and no hint authorizes delivery.
+An observed notification or subscription-recovery wake resets the ordinary
+backoff to 250 ms without changing fresh/retry alternation. A fresh arrival
+during a retry turn therefore avoids retaining a two-second empty-queue delay
+before the next fresh turn. Empty socket slices do not reset the backoff.
+
+Any delayed retry, paused or unfinished submission, active attempt, pending
+notice, Busy read or account without a renewed lease keeps the original
+250-ms-to-two-second polling schedule. Thus notifications do not postpone
+scheduled retry/expiry work or owner acquisition. Lease renewal remains on its
+independent five-second schedule. A notification storm can cause extra scans,
+but each round retains its bounded account work and protocol input limits.
+
 The process retains one claim operation, boot identity and owner generation per
 account instead of acquiring and releasing on each turn. Historical acquisition
 receipts require fresh owner observation and successful renewal before dispatch.

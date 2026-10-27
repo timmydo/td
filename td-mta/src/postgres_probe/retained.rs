@@ -130,6 +130,46 @@ impl ReadSession {
     pub(crate) fn reusable(&self, deadline: Instant) -> bool {
         !self.retired && self.worker.failed.is_none() && self.bounds.reusable(deadline)
     }
+    pub(crate) fn listen_relay(&mut self, deadline: Instant) -> Result<(), Error> {
+        if !self.reusable(deadline) {
+            return Err(Error::Invalid);
+        }
+        self.worker.deadline = deadline;
+        // Autocommit the subscription before the first absence snapshot.
+        self.worker.run(|client| {
+            Box::pin(async move {
+                client
+                    .batch_execute("LISTEN td_mta_relay")
+                    .await
+                    .map_err(|_| Error::Database)
+            })
+        })??;
+        self.clean_idle = true;
+        Ok(())
+    }
+    pub(crate) fn relay_notified(&mut self, deadline: Instant) -> Result<bool, Error> {
+        self.check_idle(deadline)?;
+        Ok(std::mem::take(&mut self.worker.relay_wake))
+    }
+    pub(crate) fn relay_wake(&mut self, deadline: Instant) -> Result<bool, Error> {
+        if self.relay_notified(deadline)? {
+            return Ok(true);
+        }
+        // A timeout means no hint, not a failed SQL operation. The caller
+        // bounds each wait so control requests and retirement stay responsive.
+        let readable = self
+            .worker
+            .socket
+            .lock()
+            .map_err(|_| Error::Transport)?
+            .transport
+            .wait_readable_slice(deadline)
+            .map_err(|_| Error::Transport)?;
+        match readable {
+            true => self.relay_notified(Instant::now() + Duration::from_millis(50)),
+            false => Ok(false),
+        }
+    }
     pub(crate) fn check_idle(&mut self, deadline: Instant) -> Result<(), Error> {
         if !self.clean_idle || !self.reusable(deadline) {
             return Err(Error::Invalid);

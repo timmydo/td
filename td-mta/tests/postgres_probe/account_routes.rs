@@ -654,6 +654,51 @@ fn retained_idle(
     assert!(other.observe(deadline(), claim, generation).is_ok());
     other.close();
     idle_account_contention(fixture, request, trust, claim, generation);
+    relay_notifications(fixture, request, trust, claim, generation);
+}
+
+fn relay_notifications(
+    fixture: &Fixture,
+    request: &td_mta::postgres_probe::Request<'_>,
+    trust: &TrustStore,
+    claim: &td_mta::postgres_route_owners::Claim,
+    generation: u64,
+) {
+    use td_mta::{postgres_queue_candidates::IdleReader, postgres_read::ReadSlots};
+    td_mta::postgres_route_owners::renew(request, trust, deadline(), claim, generation).unwrap();
+    let slots = ReadSlots::new(1).unwrap();
+    let mut reader = IdleReader::new(&slots, request, trust);
+    reader.observe(deadline(), claim, generation).unwrap();
+    // A round trip on the subscribed backend drains preceding asynchronous
+    // messages. Assertions concern transaction semantics, not elapsed time.
+    sql(
+        fixture,
+        "BEGIN; NOTIFY td_mta_relay; ROLLBACK; NOTIFY unrelated; NOTIFY td_mta_relay, 'invalid'",
+    );
+    reader.observe(deadline(), claim, generation).unwrap();
+    assert!(!reader.notified(deadline()).unwrap());
+    sql(
+        fixture,
+        "BEGIN; NOTIFY td_mta_relay; NOTIFY td_mta_relay; COMMIT",
+    );
+    reader.observe(deadline(), claim, generation).unwrap();
+    assert!(reader.notified(deadline()).unwrap());
+    assert!(!reader.notified(deadline()).unwrap());
+    let pid = super::body_checks::backend(fixture);
+    sql(
+        fixture,
+        &format!("SELECT pg_catalog.pg_terminate_backend({pid})"),
+    );
+    assert!(reader.wake(deadline()), "disconnect requires a scan");
+    reader.observe(deadline(), claim, generation).unwrap();
+    assert_ne!(super::body_checks::backend(fixture), pid);
+    sql(fixture, "NOTIFY td_mta_relay");
+    assert!(reader.wake(deadline()), "replacement re-subscribes");
+    reader.close();
+    assert!(
+        reader.wake(deadline()),
+        "missing subscription requires a scan"
+    );
 }
 
 fn retained_renewal(

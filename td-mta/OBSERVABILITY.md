@@ -451,6 +451,8 @@ It is not exposed over public HTTP and supplies no mutation operation.
 | `db_work` | One driver-run operation, possibly containing multiple SQL statements and qualification; success means the driver returned its operation result, not that an inner SQL/application result succeeded |
 | `db_close` | Worker cleanup, including bounded Terminate/close progress; failure includes already-failed or deadline-retired sessions |
 | `db_reuse` | Zero-duration retained authentication, relay idle-read, HTTPS API-read, download authorization and SMTP attempts, including failed turns |
+| `relay_idle_wait` | Fully empty queue waits, including socket waits, fallback expiry and control interruptions; not database work |
+| `relay_wake` | Zero-duration wake hints: success means a matching notification, unavailable means missing/retired subscription, failure means subscription transport/driver failure; each triggers a fresh scan |
 | `body_verify` | Complete body chunk reads and digest verification |
 | `chunk_verify` | Qualified Email/get batch SQL, length/ordinal and SHA-256 verification before bytes become readable; resident cache hits do not repeat it. |
 | `body_replay` | Verified download callback, including chunk replay and socket output |
