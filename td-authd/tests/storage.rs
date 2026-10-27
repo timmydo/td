@@ -124,9 +124,7 @@ struct Worker {
 impl Worker {
     fn new() -> Self {
         let stream = UnixStream::from(std::io::stdin().as_fd().try_clone_to_owned().unwrap());
-        stream
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .unwrap();
+        stream.set_read_timeout(Some(WAIT)).unwrap();
         Self { stream, round: 0 }
     }
 
@@ -176,9 +174,10 @@ impl Worker {
         self.invite(0x12, &description);
     }
 
-    /// Left for root to kill.
+    /// Left for root to kill: it holds for `WAIT`, as long as any one of
+    /// a case's waits, rather than ending within a loaded case's run.
     fn hold(&mut self) {
-        thread::sleep(Duration::from_secs(30));
+        thread::sleep(WAIT);
     }
 }
 
@@ -675,9 +674,14 @@ fn the_baseline_refuses_before_any_description() {
         let (event, presented) = drive(&mut storage);
         assert_eq!(event, ended(false, kind), "{script}");
         assert!(presented.is_empty() && storage.request.is_none());
-        // The worker holds for thirty seconds: root killed and reaped it.
+        // The worker holds for `WAIT`: root killed and reaped it, rather
+        // than waiting it out.
         assert!(storage.child.is_none());
-        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(
+            started.elapsed() < WAIT / 2,
+            "{script}: {:?}",
+            started.elapsed()
+        );
     }
 }
 
@@ -701,7 +705,7 @@ fn after_the_commit_only_a_changed_disk_with_a_clean_exit_is_definite() {
     // Root's deadline and a cancellation after the acknowledgement.
     for cancel in [false, true] {
         let mut storage = scripted("stall-after-commit");
-        let until = Instant::now() + Duration::from_secs(10);
+        let until = Instant::now() + WAIT;
         while storage.phase != Phase::Completion {
             match storage.poll().unwrap() {
                 Event::Present(request) => storage.presented(&request).unwrap(),
@@ -746,7 +750,7 @@ fn before_the_commit_ends_are_definite_and_out_of_order_frames_fail() {
 #[test]
 fn a_late_receipt_ends_the_operation_and_a_stale_one_is_dropped() {
     let mut storage = scripted("presented");
-    let until = Instant::now() + Duration::from_secs(10);
+    let until = Instant::now() + WAIT;
     let description = loop {
         match storage.poll().unwrap() {
             Event::Present(request) => break request,
@@ -944,7 +948,7 @@ fn an_upgrade_refuses_at_each_point_before_its_commit() {
     // A secret for a step that asks none ends the operation.
     let mut storage = upgrading(UpgradeShape::Fido2, 1, "upgrade-fido2-1-hold-connect");
     let connect = upgrade_at(UpgradeShape::Fido2, 1, ceremony_steps(1)[0]);
-    let until = Instant::now() + Duration::from_secs(10);
+    let until = Instant::now() + WAIT;
     while storage.request() != Some(&connect) || storage.phase != Phase::Running {
         match storage.poll().unwrap() {
             Event::Present(request) => storage.presented(&request).unwrap(),
@@ -1579,7 +1583,7 @@ fn managing(managed: Managed, script: &str) -> Storage {
 
 /// Polls until root presents its first step, unacknowledged.
 fn first_presented(storage: &mut Storage) -> Request {
-    let until = Instant::now() + Duration::from_secs(10);
+    let until = Instant::now() + WAIT;
     loop {
         match storage.poll().unwrap() {
             Event::Present(request) => return request,
@@ -1877,7 +1881,7 @@ fn a_secret_outside_its_steps_profile_ends_the_operation() {
 fn a_storage_pin_step_takes_no_short_secret() {
     let mut storage = managing(REMOVE, "protector-remove-authorize-hold");
     let authorize = &removal()[2];
-    let until = Instant::now() + Duration::from_secs(10);
+    let until = Instant::now() + WAIT;
     loop {
         match storage.poll().unwrap() {
             Event::Present(request) => storage.presented(&request).unwrap(),
@@ -1917,7 +1921,7 @@ fn a_commit_before_the_steps_secret_ends_the_operation() {
     let mut storage = managing(PIN_CHANGE, "protector-request-pin-keyless-commit");
     let step = first_presented(&mut storage);
     storage.presented(&step).unwrap();
-    let until = Instant::now() + Duration::from_secs(10);
+    let until = Instant::now() + WAIT;
     let event = loop {
         match storage.poll().unwrap() {
             Event::Pin(_) | Event::Waiting => thread::sleep(Duration::from_millis(1)),

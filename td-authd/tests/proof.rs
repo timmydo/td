@@ -6,6 +6,7 @@
 )]
 use super::*;
 use crate::consent::{LoginStep, Operation, Proof, Slot};
+use crate::revocation::tests::WAIT;
 use std::thread;
 use std::time::Duration;
 
@@ -91,7 +92,7 @@ fn start(
 /// acknowledged, a recovery-key step given `RECOVERY` and every other
 /// secret step `1234`, every commit sent.
 fn drive(proving: &mut Proving) -> (Event, Vec<Request>) {
-    let until = Instant::now() + Duration::from_secs(10);
+    let until = Instant::now() + WAIT;
     let mut presented = Vec::new();
     loop {
         match proving.poll().unwrap() {
@@ -199,7 +200,13 @@ fn the_volume_refuses_a_proof_it_cannot_offer() {
         let (event, presented) = drive(&mut proving);
         assert_eq!(event, ended(kind, 0), "{storage}");
         assert!(presented.is_empty() && proving.request().is_none());
-        assert!(started.elapsed() < Duration::from_secs(10));
+        // Both workers hold for `WAIT`: root killed and reaped them,
+        // rather than waiting them out.
+        assert!(
+            started.elapsed() < WAIT / 2,
+            "{storage}: {:?}",
+            started.elapsed()
+        );
     }
 }
 
@@ -280,7 +287,7 @@ fn a_recovery_key_secret_must_be_48_digits() {
     ] {
         let add = Selection::Proven(Proof::RecoveryKey, Box::new(Selection::Add));
         let mut proving = start(add, true, "proven-hold", "proof-recovery");
-        let until = Instant::now() + Duration::from_secs(10);
+        let until = Instant::now() + WAIT;
         let request = loop {
             match proving.poll().unwrap() {
                 Event::Present(request) => proving.presented(&request).unwrap(),
@@ -310,7 +317,7 @@ fn a_cancelled_proof_closes_the_storage_channel_before_any_kill() {
     for (storage, closes) in [(script, true), ("proof-ignore", false)] {
         let add = Selection::Proven(Proof::RecoveryKey, Box::new(Selection::Add));
         let mut proving = start(add, true, "proven-hold", storage);
-        let until = Instant::now() + Duration::from_secs(10);
+        let until = Instant::now() + WAIT;
         loop {
             match proving.poll().unwrap() {
                 Event::Present(request) => proving.presented(&request).unwrap(),
@@ -345,7 +352,7 @@ fn teardown_closes_the_storage_channel_first() {
         Box::leak(format!("proof-close-witness:{}", witness.display()).into_boxed_str());
     let add = Selection::Proven(Proof::RecoveryKey, Box::new(Selection::Add));
     let mut proving = start(add, true, "proven-hold", script);
-    let until = Instant::now() + Duration::from_secs(10);
+    let until = Instant::now() + WAIT;
     while !matches!(proving.poll().unwrap(), Event::Present(_)) {
         thread::sleep(Duration::from_millis(1));
         assert!(Instant::now() < until);

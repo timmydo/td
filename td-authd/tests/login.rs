@@ -115,9 +115,7 @@ struct Worker {
 impl Worker {
     fn new() -> Self {
         let stream = UnixStream::from(std::io::stdin().as_fd().try_clone_to_owned().unwrap());
-        stream
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .unwrap();
+        stream.set_read_timeout(Some(WAIT)).unwrap();
         Self { stream, round: 0 }
     }
 
@@ -362,9 +360,6 @@ fn scripted_worker() {
         // A one-key enrollment's disclosure, acknowledged whenever root
         // does, then its create step, held there.
         "enroll-disclosure" => {
-            w.stream
-                .set_read_timeout(Some(Duration::from_secs(30)))
-                .unwrap();
             w.send(&[0x18, 0]);
             w.description(enrolling(1, 1, LoginStep::Connect));
             w.present(enrolling(1, 1, LoginStep::Connect));
@@ -669,7 +664,7 @@ fn after_a_writes_commit_acknowledgement_every_other_end_is_uncertain() {
     // Root's own deadline, and a cancellation, after the acknowledgement.
     for cancel in [false, true] {
         let mut login = scripted(Selection::Add, "add-stall");
-        let until = Instant::now() + Duration::from_secs(10);
+        let until = Instant::now() + WAIT;
         while login.phase != Phase::Completion {
             match login.poll().unwrap() {
                 Event::Present(request) => login.presented(&request).unwrap(),
@@ -713,13 +708,18 @@ fn refusals_from_the_baseline_send_the_worker_no_step() {
         let (event, presented) = drive(&mut login);
         assert_eq!(event, ended(false, kind, 0), "{script}");
         assert!(presented.is_empty() && login.request.is_none());
-        // The worker holds for `WAIT`: root killed and reaped it.
+        // A holding script's worker holds for `WAIT`: root killed and
+        // reaped it, rather than waiting it out.
         assert!(login.child.is_none());
-        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(
+            started.elapsed() < WAIT / 2,
+            "{script}: {:?}",
+            started.elapsed()
+        );
     }
     // An addition below eight keys gets its first step.
     let mut login = scripted(Selection::Add, "baseline-three");
-    let until = Instant::now() + Duration::from_secs(10);
+    let until = Instant::now() + WAIT;
     while login.request.is_none() {
         assert_eq!(login.poll(), Ok(Event::Waiting));
         assert!(Instant::now() < until);
@@ -770,7 +770,7 @@ fn a_protected_machine_refuses_enrollment_and_the_last_key_removal() {
         ),
     ] {
         let mut login = Login::scripted_protected(selection, "baseline-three").unwrap();
-        let until = Instant::now() + Duration::from_secs(10);
+        let until = Instant::now() + WAIT;
         while login.request.is_none() {
             assert_eq!(login.poll(), Ok(Event::Waiting));
             assert!(Instant::now() < until);
@@ -833,12 +833,17 @@ fn malformed_or_out_of_order_worker_frames_end_the_operation() {
         let mut login = scripted(selection, script);
         assert_eq!(drive(&mut login).0, ended(false, INTERNAL, 0), "{script}");
         assert!(login.child.is_none());
-        assert!(started.elapsed() < Duration::from_secs(10), "{script}");
+        // Each script's worker holds for `WAIT`: root killed it.
+        assert!(
+            started.elapsed() < WAIT / 2,
+            "{script}: {:?}",
+            started.elapsed()
+        );
     }
     // The next step, admissible in itself, while root still waits for the
     // compositor to present the step before it.
     let mut login = scripted(Selection::Unlock, "unacknowledged");
-    let until = Instant::now() + Duration::from_secs(10);
+    let until = Instant::now() + WAIT;
     let end = loop {
         match login.poll().unwrap() {
             Event::Present(_) | Event::Waiting => thread::sleep(Duration::from_millis(1)),
@@ -853,7 +858,7 @@ fn malformed_or_out_of_order_worker_frames_end_the_operation() {
 fn a_cancel_kills_and_reaps_the_worker_and_relocks_nothing() {
     let started = Instant::now();
     let mut login = scripted(Selection::Unlock, "stall-pin");
-    let until = Instant::now() + Duration::from_secs(10);
+    let until = Instant::now() + WAIT;
     let pin = loop {
         match login.poll().unwrap() {
             Event::Present(request) => login.presented(&request).unwrap(),
@@ -866,7 +871,8 @@ fn a_cancel_kills_and_reaps_the_worker_and_relocks_nothing() {
     login.cancel().unwrap();
     assert_eq!(drive(&mut login).0, ended(false, CANCELLED, 0));
     assert!(login.child.is_none() && login.wire.is_none());
-    assert!(started.elapsed() < Duration::from_secs(10));
+    // Killed, not waited out: the stalled worker would hold for `WAIT`.
+    assert!(started.elapsed() < WAIT / 2, "{:?}", started.elapsed());
     // A PIN for the ended operation is dropped, not an error.
     assert_eq!(login.pin(&pin, Pin::new(b"1234").unwrap()), Ok(false));
     // Cancelling again changes nothing.
@@ -877,7 +883,7 @@ fn a_cancel_kills_and_reaps_the_worker_and_relocks_nothing() {
 #[test]
 fn acknowledgements_and_pins_must_name_the_current_step_in_time() {
     let presenting = |login: &mut Login| {
-        let until = Instant::now() + Duration::from_secs(10);
+        let until = Instant::now() + WAIT;
         loop {
             match login.poll().unwrap() {
                 Event::Present(request) => break request,
@@ -1061,7 +1067,7 @@ fn at_the_deadline_only_a_success_already_in_the_socket_counts() {
     until_phase(&mut login, Phase::Completion);
     login.wire.as_mut().unwrap().flush().unwrap();
     let pid = login.fixture_pid().unwrap();
-    let until = Instant::now() + Duration::from_secs(10);
+    let until = Instant::now() + WAIT;
     while std::fs::read_to_string(format!("/proc/{pid}/stat"))
         .is_ok_and(|stat| !stat.contains(") Z "))
     {
@@ -1202,7 +1208,7 @@ fn a_frame_before_the_pin_is_written_or_after_success_is_refused() {
 #[test]
 fn a_pin_still_queued_at_the_deadline_is_never_written() {
     let wait = |path: &std::path::Path| {
-        let until = Instant::now() + Duration::from_secs(10);
+        let until = Instant::now() + WAIT;
         while !path.exists() {
             assert!(Instant::now() < until, "no {}", path.display());
             thread::sleep(Duration::from_millis(1));
@@ -1249,7 +1255,7 @@ fn a_pin_still_queued_at_the_deadline_is_never_written() {
 
 /// Polls until root presents a step: its description.
 fn presenting(login: &mut Login) -> Request {
-    let until = Instant::now() + Duration::from_secs(10);
+    let until = Instant::now() + WAIT;
     loop {
         match login.poll().unwrap() {
             Event::Present(request) => return request,
