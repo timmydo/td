@@ -3050,6 +3050,14 @@ impl Client {
             else {
                 return Err(format!("selection references non-data-source {source}"));
             };
+            // GTK 3 sets a source again after offering it SAVE_TARGETS. Core
+            // says reuse MAY raise used_source; a source already given as a
+            // selection is still the selection, or was sent or queued
+            // `cancelled` when it was replaced, cleared or refused, so the
+            // repeat changes nothing.
+            if *used == DataSourceUse::Selection {
+                return Ok(());
+            }
             if *used != DataSourceUse::Fresh {
                 return self.fail_protocol(
                     WL_DATA_DEVICE_ERROR_USED_SOURCE,
@@ -13087,6 +13095,14 @@ mod tests {
         );
         assert!(client.start_cancelled_drag(8, 20, 0).is_err());
         assert_eq!(client.protocol_error_code, WL_DATA_DEVICE_ERROR_USED_SOURCE);
+        // A drag source never becomes a selection, however late. used_source
+        // and invalid_source are both 1, so the object tells them apart: the
+        // device's error names no source.
+        client.protocol_error_code = 0;
+        client.protocol_error_object = None;
+        assert!(client.set_data_device_selection(8).is_err());
+        assert_eq!(client.protocol_error_code, WL_DATA_DEVICE_ERROR_USED_SOURCE);
+        assert_eq!(client.protocol_error_object, None);
 
         client.create_data_source(9, 3).unwrap();
         client
@@ -13101,8 +13117,14 @@ mod tests {
             panic!("data source disappeared")
         };
         assert_eq!(mime_types.as_slice(), &["text/plain".to_string()]);
-        assert!(client.set_data_device_selection(9).is_err());
+        // GTK 3's repeat after a late SAVE_TARGETS offer: admitted, and
+        // nothing is sent; the next messages read below are the clear's.
+        client.set_data_device_selection(9).unwrap();
+        client.protocol_error_code = 0;
+        client.protocol_error_object = None;
+        assert!(client.start_cancelled_drag(9, 20, 0).is_err());
         assert_eq!(client.protocol_error_code, WL_DATA_DEVICE_ERROR_USED_SOURCE);
+        assert_eq!(client.protocol_error_object, None);
 
         client.create_data_source(10, 3).unwrap();
         client.set_data_source_actions(10, 1).unwrap();
@@ -13155,6 +13177,37 @@ mod tests {
         assert_eq!(payload.u32().unwrap(), 0);
         payload.finish().unwrap();
 
+        // A source replaced and then set again stays replaced: the repeat
+        // neither reinstates it nor sends anything, so the next message read
+        // below is the device's release.
+        client.create_data_source(14, 3).unwrap();
+        client
+            .offer_data_source(14, "text/plain".to_string())
+            .unwrap();
+        client.set_data_device_selection(14).unwrap();
+        advertised_selection(&receive_messages(&mut peer, 3), 7, "text/plain");
+        client.create_data_source(15, 3).unwrap();
+        client
+            .offer_data_source(15, "text/plain".to_string())
+            .unwrap();
+        client.set_data_device_selection(15).unwrap();
+        let replaced = receive_messages(&mut peer, 4);
+        assert_eq!(
+            (
+                replaced.first().unwrap().object,
+                replaced.first().unwrap().opcode
+            ),
+            (14, WL_DATA_SOURCE_CANCELLED)
+        );
+        advertised_selection(replaced.get(1..).unwrap(), 7, "text/plain");
+        client.set_data_device_selection(14).unwrap();
+        let current = match client.objects.get(&15) {
+            Some(Object::DataSource { identity, .. }) => *identity,
+            _ => panic!("data source disappeared"),
+        };
+        let (_, _, selection) = client.runtime.lock().unwrap().selection_for_client(88);
+        assert_eq!(selection.map(|selection| selection.identity), Some(current));
+
         client.remove_data_device(7).unwrap();
         assert!(!client.data_device_active.load(Ordering::Acquire));
         let released = receive_messages(&mut peer, 1);
@@ -13195,8 +13248,13 @@ mod tests {
             ),
             (8, WL_DATA_SOURCE_CANCELLED)
         );
-        assert!(client.set_data_device_selection(8).is_err());
-        assert_eq!(client.protocol_error_code, WL_DATA_DEVICE_ERROR_USED_SOURCE);
+        // Set again, the refused source stays refused, and its client hears
+        // nothing more: it was already sent `cancelled`.
+        client.set_data_device_selection(8).unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let mut received = [0u8; 16];
+        let quiet = peer.read(&mut received).unwrap_err();
+        assert_eq!(quiet.kind(), std::io::ErrorKind::WouldBlock);
 
         fs::remove_file(framebuffer_path).unwrap();
     }

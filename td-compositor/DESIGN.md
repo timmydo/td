@@ -1648,12 +1648,25 @@ regions.
 bind it. Each manager creates version-matched sources and devices for
 `td-seat0`. A source advertises at most 64 distinct MIME strings, no one string
 is longer than 256 bytes, and all live source strings of one client retain at
-most 16 KiB. A source becomes single-use when passed to `set_selection` or
-`start_drag`; setting drag actions twice, using unknown action bits, turning a
-drag-marked source into a selection, and reusing any source raise the interface
-errors the core protocol assigns them. Core assigns no used-state error to
-`offer`, so a bounded late offer is accepted and ignored rather than retained
-where no already-announced target could learn it.
+most 16 KiB. A source becomes used when passed to `set_selection` or
+`start_drag`, and cannot then serve the other request; setting drag actions
+twice, using unknown action bits, turning a drag-marked source into a
+selection, passing a used source to `start_drag`, and passing a drag-used
+source to `set_selection` raise the interface errors the core protocol assigns
+them. Core assigns no used-state error to `offer`, so a
+bounded late offer is accepted and ignored rather than retained where no
+already-announced target could learn it.
+
+A source already passed to `set_selection` may be passed to it again, and the
+repeat changes nothing. Core says reuse MAY raise `used_source`, and GTK 3, as
+Firefox's Flathub runtime ships it, offers `SAVE_TARGETS` on the source it has
+just set and sets it again with the same serial; refusing that disconnected
+Firefox at every copy. The source is then either still the selection, its
+late offer ignored as above, or it was sent `cancelled` when it was replaced,
+cleared or refused as a background request (another client's or the
+compositor's replacement queues that event on the source client's bounded seat
+queue), so the repeat
+neither reinstates it nor sends anything.
 
 The runtime holds one selection for the logical seat. Only the Wayland client that
 currently owns keyboard focus may replace or clear it through the public
