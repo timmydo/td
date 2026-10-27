@@ -4,8 +4,8 @@ use crate::types::Recipe;
 /// pure installer plan, the disk protector, whose recovery-key codec checks
 /// the completion page's key, and the toolkit are Cargo siblings. The
 /// toolkit's font, notices and Wayland codec reach the compositor tree by
-/// relative source paths. The protector's own dependencies, the TPM client
-/// and td-json, are in its lock with the TPM client's td-fido, and the TPM
+/// relative source paths. The protector's own dependencies, the TPM client,
+/// td-luks and td-json, are in its lock with their td-fido, and the TPM
 /// client and td-fido include the engine's SHA-256 by relative path, as
 /// the protector does with td-fido's HMAC-SHA256, so those trees are
 /// staged too, with td-fat, the installer's own ESP writer.
@@ -19,6 +19,7 @@ pub fn recipe() -> Recipe {
             "td-ui",
             "td-compositor",
             "td-protector",
+            "td-luks",
             "td-tpm",
             "td-fido",
             "td-json",
@@ -50,6 +51,7 @@ mod tests {
                 "td-ui".into(),
                 "td-compositor".into(),
                 "td-protector".into(),
+                "td-luks".into(),
                 "td-tpm".into(),
                 "td-fido".into(),
                 "td-json".into(),

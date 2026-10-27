@@ -96,6 +96,8 @@ prerequisites" onward):
 - `fido_device`: root and desktop hidraw admission, the operation lock
   under `/run/td-fido` (or the desktop runtime directory), the Session
   that drives a token through a HID worker, and that worker.
+- `digest(bytes)`: the engine's SHA-256, exported for td-luks's header
+  checksums.
 - `hmac_sha256(key, parts)`: HMAC-SHA256 (RFC 2104) under `key` over
   the concatenation of `parts`, pinned to RFC 4231's vectors, and
   `hkdf_expand(ikm, salt, info_parts, okm)`: HKDF-SHA256 (RFC 5869)
@@ -138,9 +140,9 @@ any other
 dependent is an amendment here and to `FIDO_DEPENDENTS` in
 `builder/src/affected.rs`, whose lock preflight refuses the rest. Crates
 that reach it only through td-secret or td-tpm, as td-pass does, are
-not dependents. td-luks is planned as one, for `pbkdf2_sha256` and
-`fido_aes`'s XTS (td-luks/DESIGN.md): the commit that adds its crate
-makes that amendment.
+not dependents. td-luks is one: its header reader takes `digest`, and
+its keyslots are to take `pbkdf2_sha256` and `fido_aes`'s XTS
+(td-luks/DESIGN.md "Cryptography").
 
 Five crates compile some of its files as shared source instead:
 td-protector compiles `hmac.rs` for its PIN's authValue and its lockout

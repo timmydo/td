@@ -12,6 +12,7 @@ clippy-all-targets = true
 
 [dependencies]
 td-json = { path = "../td-json" }
+td-luks = { path = "../td-luks" }
 td-tpm = { path = "../td-tpm" }
 
 [dev-dependencies]

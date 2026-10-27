@@ -10,7 +10,8 @@ use crate::types::{Recipe, Step};
 // sessions use td-fido's P-256 and AES (td-fido/DESIGN.md), and its
 // volume discovery, the live selector's PCR 12 release cap and the installed
 // selector's release and the deployment initramfs's unlock over
-// td-protector, which reaches td-json, and its FIDO2 client over td-fido
+// td-protector, which reaches td-json and td-luks's LUKS2 header reader,
+// and its FIDO2 client over td-fido
 // (`fido.rs`, whose `fido-worker` verb nothing runs yet), and a staged
 // selector update's ESP over td-fat, found through engine's GPT reader;
 // each is compiled first as an rlib with the binary's profile and passed
@@ -145,6 +146,8 @@ const JSON_RETAIN_RS: &str = include_str!("../../../td-json/src/retain.rs");
 const JSON_SCAN_RS: &str = include_str!("../../../td-json/src/scan.rs");
 const JSON_STRING_RS: &str = include_str!("../../../td-json/src/string.rs");
 const JSON_STRING_ARRAY_RS: &str = include_str!("../../../td-json/src/string_array.rs");
+const LUKS_RS: &str = include_str!("../../../td-luks/src/lib.rs");
+const LUKS_HEADER_RS: &str = include_str!("../../../td-luks/src/header.rs");
 const PROTECTOR_RS: &str = include_str!("../../../td-protector/src/lib.rs");
 const PROTECTOR_CRYPTSETUP_RS: &str = include_str!("../../../td-protector/src/cryptsetup.rs");
 const PROTECTOR_LOCKOUT_RS: &str = include_str!("../../../td-protector/src/lockout.rs");
@@ -195,6 +198,9 @@ pub fn recipe() -> Recipe {
         },
         Step::MkDir {
             path: "{src}/td-protector/src".into(),
+        },
+        Step::MkDir {
+            path: "{src}/td-luks/src".into(),
         },
         Step::MkDir {
             path: "{src}/td-fido/src".into(),
@@ -370,6 +376,16 @@ pub fn recipe() -> Recipe {
         Step::WriteFile {
             path: "{src}/td-json/src/string_array.rs".into(),
             content: JSON_STRING_ARRAY_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-luks/src/lib.rs".into(),
+            content: LUKS_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-luks/src/header.rs".into(),
+            content: LUKS_HEADER_RS.into(),
             exec: false,
         },
         Step::WriteFile {
@@ -574,11 +590,12 @@ pub fn recipe() -> Recipe {
         steps.push(library(root, "td_fat", "td-fat", &[]));
         steps.push(library(root, "td_tpm", "td-tpm", &["td_fido"]));
         steps.push(library(root, "td_json", "td-json", &[]));
+        steps.push(library(root, "td_luks", "td-luks", &["td_fido", "td_json"]));
         steps.push(library(
             root,
             "td_protector",
             "td-protector",
-            &["td_json", "td_tpm"],
+            &["td_json", "td_luks", "td_tpm"],
         ));
         steps.push(compile(root));
     }
@@ -619,7 +636,14 @@ mod tests {
     fn every_sibling_crate_source_is_staged() {
         crate::shared::assert_sibling_sources_staged(
             super::recipe(),
-            &["td-tpm", "td-fido", "td-json", "td-protector", "td-fat"],
+            &[
+                "td-tpm",
+                "td-fido",
+                "td-json",
+                "td-luks",
+                "td-protector",
+                "td-fat",
+            ],
         );
     }
 }

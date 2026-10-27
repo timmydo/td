@@ -22,7 +22,7 @@ td-pass-source td-pass td-secret,td-ui,td-compositor,td-authd,td-busd,td-firstbo
 td-photo-source td-photo td-civil,td-fs,td-jpeg,td-ui,td-compositor,td-test-compositor
 td-portal-source td-portal td-secret,td-busd,td-compositor,engine,td-ui,td-tpm,td-fido,td-test-compositor
 td-review-source td-review td-fs,td-ui,td-compositor
-td-setup-source td-setup td-install,td-ui,td-compositor,td-protector,td-tpm,td-fido,td-json,td-fat,engine,td-test-compositor
+td-setup-source td-setup td-install,td-ui,td-compositor,td-protector,td-luks,td-tpm,td-fido,td-json,td-fat,engine,td-test-compositor
 td-software-source td-software td-civil,td-fs,td-ui,td-compositor,engine
 td-taskmgr-source td-taskmgr td-ui,td-compositor,td-fs,td-test-compositor
 td-term-source td-term td-fs,td-ui,td-compositor

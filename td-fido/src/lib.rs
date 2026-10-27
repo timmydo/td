@@ -16,7 +16,7 @@
 mod crypto;
 mod root;
 pub use crypto::{
-    hkdf_expand, hmac_sha256, pbkdf2_sha256, same, HKDF_MAX_OKM, PBKDF2_MAX_ITERATIONS,
+    digest, hkdf_expand, hmac_sha256, pbkdf2_sha256, same, HKDF_MAX_OKM, PBKDF2_MAX_ITERATIONS,
     PBKDF2_MAX_OUTPUT,
 };
 pub mod fido_aes;

@@ -2,12 +2,12 @@
 //! tokens"): exactly `type`, `keyslots`, `role`, `public` and `private`.
 
 use td_json::Json;
+pub(crate) use td_luks::header::slot_number;
+pub use td_luks::header::MAX_SLOT;
 use td_tpm::SealedObject;
 
 /// The LUKS2 token type td's tokens carry.
 pub const TOKEN_TYPE: &str = "td-protector";
-/// The highest LUKS2 keyslot or token number (LUKS2 has 32 of each).
-pub const MAX_SLOT: u8 = 31;
 /// Bounds on the sealed object's TPM2B_PUBLIC and TPM2B_PRIVATE contents.
 pub const MAX_PUBLIC_BYTES: usize = 256;
 pub const MAX_PRIVATE_BYTES: usize = 512;
@@ -41,18 +41,6 @@ impl Role {
             _ => None,
         }
     }
-}
-
-/// A LUKS2 keyslot or token number as LUKS2 writes it: decimal, 0 to 31,
-/// with no sign, space or leading zero.
-pub(crate) fn slot_number(text: &str) -> Option<u8> {
-    if text.is_empty() || text.len() > 2 || (text.len() > 1 && text.starts_with('0')) {
-        return None;
-    }
-    if !text.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    text.parse::<u8>().ok().filter(|slot| *slot <= MAX_SLOT)
 }
 
 pub(crate) fn hex(bytes: &[u8]) -> String {
@@ -342,15 +330,5 @@ mod tests {
             private: vec![1],
         };
         assert!(Token::new(1, Role::FirstBoot, empty).is_err());
-    }
-
-    #[test]
-    fn slot_numbers_are_canonical_decimal_up_to_31() {
-        for slot in 0..=31u8 {
-            assert_eq!(slot_number(&slot.to_string()), Some(slot));
-        }
-        for text in ["", "32", "00", "01", "-0", "a", "1.0", "255", "٣"] {
-            assert_eq!(slot_number(text), None, "{text:?}");
-        }
     }
 }

@@ -399,11 +399,12 @@ mod tests {
                 );
             }
             if stem == "td-boot" {
-                // Its td-fido, td-fat, td-tpm, td-json and td-protector
-                // rlibs, then the binary, under each of two roots.
+                // Its td-fido, td-fat, td-tpm, td-json, td-luks and
+                // td-protector rlibs, then the binary, under each of two
+                // roots.
                 assert_eq!(
                     remap_sources.len(),
-                    12,
+                    14,
                     "td-boot must build its libraries and binary at two roots"
                 );
                 let mut roots = remap_sources.clone();
@@ -413,7 +414,7 @@ mod tests {
                 for root in &roots {
                     assert_eq!(
                         remap_sources.iter().filter(|seen| *seen == root).count(),
-                        6,
+                        7,
                         "td-boot must build its libraries and binary under each root"
                     );
                 }
@@ -651,6 +652,7 @@ mod tests {
                 "td-jpeg",
                 "td-json",
                 "td-kv",
+                "td-luks",
                 "td-mail",
                 "td-markdown",
                 "td-news",

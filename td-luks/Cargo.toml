@@ -1,0 +1,32 @@
+[package]
+name = "td-luks"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "td's LUKS2 volume tool: the bounded reader of the one LUKS2 profile td formats, growing into td's cryptsetup replacement"
+
+[package.metadata.td-gate]
+clippy-all-targets = true
+
+[workspace]
+
+[dependencies]
+td-fido = { path = "../td-fido" }
+td-json = { path = "../td-json" }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"
+
+[profile.release]
+opt-level = 3
+panic = "abort"
+strip = true

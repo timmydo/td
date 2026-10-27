@@ -90,23 +90,23 @@ need to be, but one is worth naming because it looks like it would need one
 and does not: `td-boot` verifies a signature and kexecs through a helper.
 Its PCR 11 measurement, the live selector's PCR 12 cap and the installed
 selector's release run over td-tpm (with td-fido) and td-protector (with
-td-json), each forbidding unsafe code, the TPM being td-tpm's safe file
-I/O on `/dev/tpmrm0`; a refused cap or release halts by parking the thread
-through std. The release's cryptsetup children, and the pipe that hands
-the volume key to td-kexec, are std's, through td-protector's runner and
-its `KeyFile`; its recovery flow's secret-line child and the pipe it
-reads the entry from are std's too, the termios, flush and poll requests
-being td-init's own (§3); its console lines' mirror to the VT is a std
-non-blocking open and write of `/dev/tty1`, and which terminal
-`/dev/console` is comes from sysfs through td-init's std-only
-`console.rs`. The deployment initramfs's unlock adds none: its post-cap
-unseal is td-protector's over the same client, its key member is read
-with std file I/O, and its one cryptsetup child, with the key on a pipe,
-is td-protector's runner's std process and pipe. `td-install` was the
-second until it had to publish onto a disk it holds (§21). Its partition tables and filesystems are still bytes at offsets, a
-device's size is a `seek`, and its sector size is a file under `/sys`;
-`td-install/DESIGN.md`'s D8 keeps it that way except for that one recorded
-surface.
+td-json and td-luks, its LUKS2 header reader), each forbidding unsafe code,
+the TPM being td-tpm's safe file I/O on `/dev/tpmrm0`; a refused cap or
+release halts by parking the thread through std. The release's cryptsetup
+children, and the pipe that hands the volume key to td-kexec, are std's,
+through td-protector's runner and its `KeyFile`; its recovery flow's
+secret-line child and the pipe it reads the entry from are std's too, the
+termios, flush and poll requests being td-init's own (§3); its console
+lines' mirror to the VT is a std non-blocking open and write of `/dev/tty1`,
+and which terminal `/dev/console` is comes from sysfs through td-init's
+std-only `console.rs`. The deployment initramfs's unlock adds none: its
+post-cap unseal is td-protector's over the same client, its key member is
+read with std file I/O, and its one cryptsetup child, with the key on a
+pipe, is td-protector's runner's std process and pipe. `td-install` was the
+second until it had to publish onto a disk it holds (§21). Its partition
+tables and filesystems are still bytes at offsets, a device's size is a
+`seek`, and its sector size is a file under `/sys`; `td-install/DESIGN.md`'s
+D8 keeps it that way except for that one recorded surface.
 
 `td-fido` (td-fido/DESIGN.md), the FIDO2 client td-secret and td-tpm
 depend on by path, forbids `unsafe` crate-wide and is not on the roster.
@@ -3431,10 +3431,11 @@ read-write open or `LOOP_CONFIGURE` fail with EBUSY, and binding is tried
 at most four times, each with a fresh index.
 
 The crate root denies unsafe code and the library root forbids it. The
-binary also links td-protector, td-tpm and td-json for the device-bound
-service's TPM probe and formatting; each forbids unsafe code and adds no
-syscall, the TPM being td-tpm's safe file I/O on `/dev/tpmrm0` and the
-recovery key and protector secret td-protector's read of `/dev/random`.
+binary also links td-protector, td-luks, td-tpm and td-json for the
+device-bound service's TPM probe and formatting; each forbids unsafe
+code and adds no syscall, the TPM being td-tpm's safe file I/O on
+`/dev/tpmrm0` and the recovery key and protector secret td-protector's
+read of `/dev/random`.
 Device-bound formatting hands key material to cryptsetup through
 td-protector's runner, whose std pipes and child processes add no
 syscall surface either. The

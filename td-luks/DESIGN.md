@@ -58,8 +58,9 @@ td-luks formats exactly the profile ENCRYPTION.md fixes:
   the reencryption digest. 1000 is cryptsetup's own count under
   `--pbkdf-force-iterations`, since that option skips the digest
   benchmark. On read, td-luks accepts any count up to its reader's
-  bound, 4,000,000 (today td-protector's `MAX_DIGEST_ITERATIONS`),
-  because stock cryptsetup may have written the header.
+  bound, 4,000,000 (`header::MAX_DIGEST_ITERATIONS`, which
+  td-protector re-exports), because stock cryptsetup may have written
+  the header.
 - **Layout:** each header copy is 16 KiB, with a SHA-256 checksum. The
   keyslots area is 16744448 bytes. The data segment starts at 16 MiB and
   its size is `dynamic`.
@@ -447,15 +448,20 @@ detached form, and it writes nothing.
 
 Each increment is one landable commit, or a short series:
 
-- **A.** This design. Status: drafted.
+- **A.** This design. Status: landed.
 - **B.** Libraries and the verbs that need no device mapper:
   - the library: the reader moved from td-protector, with td-protector
-    switched onto it, and the writer;
-  - in td-fido: PBKDF2 and XTS;
+    switched onto it (landed: `src/header.rs`), and the writer;
+  - in td-fido: PBKDF2 and XTS (landed);
   - the AF splitter;
   - the verbs `format`, `add-key`, `kill-slot`, `kill-unbound`,
     `token-*`, `metadata`, `volume-key` and `test`;
-  - unit tests and the cryptsetup fixtures.
+  - unit tests and the cryptsetup fixtures. The reader's format-only
+    refusal tests, still in td-protector's `luks2` module, move here
+    with the writer: the copy-field fallback matrix, the
+    `HEADER_SIZES` scan, the checksum-algorithm refusal, NUL padding,
+    the `metadata_json` bound, the PBKDF2 ceilings, the keyslots-area
+    bounds and requirements parsing.
 - **C.** The device-mapper surface: `open`, `open-volume-key`, `close`
   and `status` for headers without the reencryption requirement, with
   UNSAFE.md's section and the interop oracle for activation.

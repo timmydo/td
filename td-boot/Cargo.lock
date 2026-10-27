@@ -25,10 +25,19 @@ name = "td-json"
 version = "0.1.0"
 
 [[package]]
+name = "td-luks"
+version = "0.1.0"
+dependencies = [
+ "td-fido",
+ "td-json",
+]
+
+[[package]]
 name = "td-protector"
 version = "0.1.0"
 dependencies = [
  "td-json",
+ "td-luks",
  "td-tpm",
 ]
 

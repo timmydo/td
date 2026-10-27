@@ -378,6 +378,8 @@ const TARGET_STATIC_RECIPES: &[(&str, &str)] = &[
     ("td-install/src", "recipes/src/recipes/td-install.rs"),
     ("td-json/src", "recipes/src/recipes/td-install.rs"),
     ("td-json/src", "recipes/src/recipes/td-boot.rs"),
+    ("td-luks/src", "recipes/src/recipes/td-install.rs"),
+    ("td-luks/src", "recipes/src/recipes/td-boot.rs"),
     ("td-protector/src", "recipes/src/recipes/td-install.rs"),
     ("td-protector/src", "recipes/src/recipes/td-boot.rs"),
     (
@@ -2033,7 +2035,8 @@ fn compute_selection(root: &Path, changed: &[String]) -> Selection {
 /// service supervisor, first boot, the installer with its test driver and
 /// the formatter it and a live boot run (td-btrfs), and the libraries
 /// td-boot links for volume discovery, its PCR 11 measurement and the live
-/// selector's PCR 12 cap: td-protector, td-tpm and td-json.
+/// selector's PCR 12 cap: td-protector with its td-luks header reader,
+/// td-tpm and td-json.
 /// td-fs, which td-boot and the installer compile in, is left out by
 /// decision: its changes run the gates on a branch and the oracles on main.
 /// A change to one's code, manifest, lock or build script, or to its recipe
@@ -2051,6 +2054,7 @@ const BOOT_CRATES: &[&str] = &[
     "td-json",
     "td-kexec",
     "td-login",
+    "td-luks",
     "td-protector",
     "td-sh",
     "td-svc",
@@ -4381,6 +4385,7 @@ const FIDO_DEPENDENTS: &[&str] = &[
     "td-protector",
     "td-boot",
     "td-install",
+    "td-luks",
 ];
 
 /// Refuses a direct td-fido dependency from any other roster crate: a new
@@ -6520,6 +6525,7 @@ mod tests {
             "td-install-qemu-test/src/main.rs",
             "td-firstboot/src/main.rs",
             "td-protector/src/luks2.rs",
+            "td-luks/src/header.rs",
             "td-tpm/src/lib.rs",
             "td-json/Cargo.toml",
             "recipes/src/recipes/td-init.rs",

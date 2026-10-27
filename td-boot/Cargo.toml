@@ -32,7 +32,7 @@ td-tpm = { path = "../td-tpm" }
 # linking the sibling td-tpm client and td-protector, whose bounded LUKS2
 # reader volume discovery uses and whose release cap the live selector runs,
 # td-fido, whose disk flows and root HID worker its FIDO2 client runs,
-# with td-protector's td-json, each compiled first as an rlib.
+# with td-protector's td-json and td-luks, each compiled first as an rlib.
 
 [lints.rust]
 unsafe_code = "forbid"

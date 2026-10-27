@@ -281,6 +281,12 @@ metadata agrees with it ("Transitions").
 `token::Token` carries one td token: `encode` writes the compact JSON
 `cryptsetup token import` takes, keys in the order above, `decode` and
 `from_json` admit it, and `orphan_from_json` admits an orphan.
+The format-level reader is td-luks's library (td-luks/DESIGN.md
+"Crates"): choosing and verifying a copy, the JSON area, numbered
+sections, `binary_claim`, `identity`, `segment_digest`, the upgrade's
+`Volume` and the keyslot costs. `luks2` re-exports those under the
+names below and adds td's token rules, so td-luks depends on neither
+td-protector nor td-tpm.
 `luks2::read` takes any `Read + Seek` whose offset zero is the volume's
 first byte, such as a window onto the installer's claim or the
 selector's opened partition, and returns the used copy's sequence
@@ -314,8 +320,10 @@ and `config.keyslots_size`, the latter at most `MAX_KEYSLOTS_SIZE`
 the keyslot's PBKDF2-SHA256 iterations, at most
 `MAX_KEYSLOT_ITERATIONS` (100000; td forces 1000 on every keyslot it
 adds), and those of the one digest naming it, at most
-`MAX_DIGEST_ITERATIONS` (4000000; cryptsetup benchmarks a digest's
-count for about an eighth of a second at formatting). Any other KDF,
+`MAX_DIGEST_ITERATIONS` (4000000, td-fido's PBKDF2 bound, so td-luks
+can verify every digest it admits; cryptsetup benchmarks a digest's
+count for about an eighth of a second at formatting unless told the
+count, as td tells it 1000). Any other KDF,
 Argon2 among them, whose memory and time td does not run, or a count
 over its ceiling, or no single digest, has no cost, and the test is
 refused before cryptsetup starts. `TestArea::all_costed` holds when
