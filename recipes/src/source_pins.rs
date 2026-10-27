@@ -208,54 +208,54 @@ const PINS: &[PinDef] = &[
         key: "linux-firmware-ath11k-wcn6855-amss-source",
         aliases: &[],
         // Device firmware (AGENTS.md "Device firmware"): linux-firmware's
-        // files for the Qualcomm WCN6855 Wi-Fi at its 20260916 tag, which the
+        // files for the Qualcomm WCN6855 Wi-Fi at its 20261019 tag, which the
         // kernel embeds unmodified for ath11k to hand to the device.
-        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20260916/ath11k/WCN6855/hw2.0/amss.bin",
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/ath11k/WCN6855/hw2.0/amss.bin",
         sha256: "e12b23ddc4b8d2d2a10a651a5d6fdcd00f60fcae884d2cf5dad17627211fcdfd",
-        file: "linux-firmware-20260916-ath11k-WCN6855-hw2.0-amss.bin",
-        version: "20260916",
+        file: "linux-firmware-20261019-ath11k-WCN6855-hw2.0-amss.bin",
+        version: "20261019",
     },
     PinDef {
         key: "linux-firmware-ath11k-wcn6855-board-2-source",
         aliases: &[],
-        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20260916/ath11k/WCN6855/hw2.0/board-2.bin",
-        sha256: "9287fa8d14d915892666b03e9403135875d08371fd1438d2c6d9fe96ae71cf68",
-        file: "linux-firmware-20260916-ath11k-WCN6855-hw2.0-board-2.bin",
-        version: "20260916",
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/ath11k/WCN6855/hw2.0/board-2.bin",
+        sha256: "3a92de58509ee13d417241a6b17be446fa3b0fa938c4cbd8492b1be25ae0f4a7",
+        file: "linux-firmware-20261019-ath11k-WCN6855-hw2.0-board-2.bin",
+        version: "20261019",
     },
     PinDef {
         key: "linux-firmware-ath11k-wcn6855-m3-source",
         aliases: &[],
-        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20260916/ath11k/WCN6855/hw2.0/m3.bin",
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/ath11k/WCN6855/hw2.0/m3.bin",
         sha256: "0c590881870d0e6e98fc7d393ce05690e09287933b1b535e935bf5d98b77713f",
-        file: "linux-firmware-20260916-ath11k-WCN6855-hw2.0-m3.bin",
-        version: "20260916",
+        file: "linux-firmware-20261019-ath11k-WCN6855-hw2.0-m3.bin",
+        version: "20261019",
     },
     PinDef {
         key: "linux-firmware-ath11k-wcn6855-notice-source",
         aliases: &[],
-        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20260916/ath11k/WCN6855/hw2.0/Notice.txt",
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/ath11k/WCN6855/hw2.0/Notice.txt",
         sha256: "770720d03de70ff503c6d9bb6f6932fc7833d078647fe8352c6d5d49d44bbc5f",
-        file: "linux-firmware-20260916-ath11k-WCN6855-hw2.0-Notice.txt",
-        version: "20260916",
+        file: "linux-firmware-20261019-ath11k-WCN6855-hw2.0-Notice.txt",
+        version: "20261019",
     },
     PinDef {
         key: "linux-firmware-ath11k-wcn6855-regdb-source",
         aliases: &[],
-        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20260916/ath11k/WCN6855/hw2.0/regdb.bin",
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/ath11k/WCN6855/hw2.0/regdb.bin",
         sha256: "e1b774b1feda4cab01f5a26089124059539fc31544ac34129dce45c8ff26d645",
-        file: "linux-firmware-20260916-ath11k-WCN6855-hw2.0-regdb.bin",
-        version: "20260916",
+        file: "linux-firmware-20261019-ath11k-WCN6855-hw2.0-regdb.bin",
+        version: "20261019",
     },
     PinDef {
         key: "linux-firmware-qualcomm-atheros-license-source",
         aliases: &[],
         // The licence WHENCE names for those files, which the image ships
         // through `linux-firmware-notices`.
-        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20260916/LICENSES/LICENSE.QualcommAtheros_ath10k",
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/LICENSES/LICENSE.QualcommAtheros_ath10k",
         sha256: "337a55102138d7baa143ee4a4c6c91693e0113fece35d380b2a12109e8c23b3f",
-        file: "linux-firmware-20260916-LICENSE.QualcommAtheros_ath10k",
-        version: "20260916",
+        file: "linux-firmware-20261019-LICENSE.QualcommAtheros_ath10k",
+        version: "20261019",
     },
     PinDef {
         key: "linux-kernel-source",
@@ -582,7 +582,7 @@ mod tests {
             assert!(!pin.foreign(), "{key} is marked");
             assert!(
                 pin.url.starts_with(
-                    "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20260916/"
+                    "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/"
                 ),
                 "{key}"
             );

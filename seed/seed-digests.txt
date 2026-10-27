@@ -20,7 +20,7 @@ json-c-x86-64-source csb78c2cixywmxii4vxp4ab11q5273p5-json-c-x86-64-source
 libdevmapper-x86-64-source 14i35fjwswmcjr5jp6p00vhh8b2m99d4-libdevmapper-x86-64-source
 libressl-x86-64-source iad2rcbcs4301jyahxbd8cxv41y1r97h-libressl-x86-64-source
 linux-firmware-ath11k-wcn6855-amss-source xc66mipij5j5xjj6y532spkdwzznzbwy-linux-firmware-ath11k-wcn6855-amss-source
-linux-firmware-ath11k-wcn6855-board-2-source 9r7i2idvfgz1yd7s0x2dq4f324b70ail-linux-firmware-ath11k-wcn6855-board-2-source
+linux-firmware-ath11k-wcn6855-board-2-source 5k0ksxxzkl7k66m862y971lp33pr7rd2-linux-firmware-ath11k-wcn6855-board-2-source
 linux-firmware-ath11k-wcn6855-m3-source ykcwq4kcp109fzh2mndzd43i4c32bycw-linux-firmware-ath11k-wcn6855-m3-source
 linux-firmware-ath11k-wcn6855-notice-source 408zncrpy9bx106rkgjg1np9xxzgrzdb-linux-firmware-ath11k-wcn6855-notice-source
 linux-firmware-ath11k-wcn6855-regdb-source vf2wajzx7j1xg371lwsvdshzyxspwyj2-linux-firmware-ath11k-wcn6855-regdb-source

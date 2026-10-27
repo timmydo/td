@@ -35,7 +35,7 @@ pub fn recipe() -> Recipe {
         exec: false,
     });
     let pins: Vec<&str> = NOTICES.iter().map(|(pin, _)| *pin).collect();
-    Recipe::mesboot("linux-firmware-notices", "20260916")
+    Recipe::mesboot("linux-firmware-notices", "20261019")
         .inputs(&pins)
         .steps(steps)
 }
@@ -59,7 +59,7 @@ mod tests {
             assert!(!pin.foreign(), "{key}");
             assert!(
                 pin.url.starts_with(
-                    "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20260916/"
+                    "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/"
                 ),
                 "{key}"
             );
