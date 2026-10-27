@@ -12,10 +12,10 @@ td-json, td-mime and td-nfc. They add no registry source or private backend inpu
 manifests, locks and source staging are admitted alongside td-crypto and
 td-mta.
 
-Direct inputs are Rustls 0.23.45 (std, TLS 1.2, AWS-LC), aws-lc-rs 1.18.1
-(alloc, non-FIPS), and webpki-roots 1.0.8 (compiled Mozilla root data).
+Direct inputs are Rustls 0.23.46 (std, TLS 1.2, AWS-LC), aws-lc-rs 1.18.2
+(alloc, non-FIPS), and webpki-roots 1.0.11 (compiled Mozilla root data).
 Rustls owns TLS, webpki validates certificates, pki-types represents their
-private backend forms; aws-lc-rs/sys supplies native crypto (AWS-LC 5.7.0).
+private backend forms; aws-lc-rs/sys supplies native crypto (AWS-LC 5.11.0).
 The remaining active packages are their build tools or small internal support
 libraries. Mail additionally selects the private PostgreSQL closure below.
 No async runtime is selected.
@@ -47,30 +47,30 @@ artifact packaging must retain all applicable notices, including root data.
 
 | Package | Version | Selected graph | Upstream license expression |
 | --- | --- | --- | --- |
-| aws-lc-rs | 1.18.1 | active | ISC AND (Apache-2.0 OR ISC) |
-| aws-lc-sys | 0.45.0 | active | ISC AND (Apache-2.0 OR ISC) AND Apache-2.0 AND MIT AND BSD-3-Clause AND (Apache-2.0 OR ISC OR MIT) AND (Apache-2.0 OR ISC OR MIT-0) |
-| cc | 1.5.1 | active | MIT OR Apache-2.0 |
+| aws-lc-rs | 1.18.2 | active | ISC AND (Apache-2.0 OR ISC) |
+| aws-lc-sys | 0.46.0 | active | ISC AND (Apache-2.0 OR ISC) AND Apache-2.0 AND MIT AND BSD-3-Clause AND (Apache-2.0 OR ISC OR MIT) AND (Apache-2.0 OR ISC OR MIT-0) |
+| cc | 1.10.0 | active | MIT OR Apache-2.0 |
 | cfg-if | 1.0.5 | inactive | MIT OR Apache-2.0 |
 | cmake | 0.1.58 | active | MIT OR Apache-2.0 |
 | dunce | 1.0.5 | active | CC0-1.0 OR MIT-0 OR Apache-2.0 |
-| find-msvc-tools | 0.1.14 | active | MIT OR Apache-2.0 |
+| find-msvc-tools | 0.1.15 | active | MIT OR Apache-2.0 |
 | fs_extra | 1.3.0 | active | MIT |
 | getrandom | 0.2.17 | inactive | MIT OR Apache-2.0 |
 | getrandom | 0.4.3 | inactive | MIT OR Apache-2.0 |
 | jobserver | 0.1.35 | active | MIT OR Apache-2.0 |
-| libc | 0.2.189 | active | MIT OR Apache-2.0 |
+| libc | 0.2.191 | active | MIT OR Apache-2.0 |
 | once_cell | 1.21.4 | active | MIT OR Apache-2.0 |
 | pkg-config | 0.3.34 | active | MIT OR Apache-2.0 |
 | r-efi | 6.0.0 | inactive | MIT OR Apache-2.0 OR LGPL-2.1-or-later |
 | ring | 0.17.14 | inactive | Apache-2.0 AND ISC |
-| rustls | 0.23.45 | active | Apache-2.0 OR ISC OR MIT |
+| rustls | 0.23.46 | active | Apache-2.0 OR ISC OR MIT |
 | rustls-pki-types | 1.15.1 | active | MIT OR Apache-2.0 |
-| rustls-webpki | 0.103.15 | active | ISC |
+| rustls-webpki | 0.103.16 | active | ISC |
 | shlex | 2.0.1 | active | MIT OR Apache-2.0 |
 | subtle | 2.6.1 | active | BSD-3-Clause |
 | untrusted | 0.9.0 | active | ISC |
 | wasi | 0.11.1+wasi-snapshot-preview1 | inactive | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |
-| webpki-roots | 1.0.8 | active | CDLA-Permissive-2.0 |
+| webpki-roots | 1.0.11 | active | CDLA-Permissive-2.0 |
 | windows-sys | 0.52.0 | inactive | MIT OR Apache-2.0 |
 | windows-targets | 0.52.6 | inactive | MIT OR Apache-2.0 |
 | windows_aarch64_gnullvm | 0.52.6 | inactive | MIT OR Apache-2.0 |
@@ -81,13 +81,13 @@ artifact packaging must retain all applicable notices, including root data.
 | windows_x86_64_gnu | 0.52.6 | inactive | MIT OR Apache-2.0 |
 | windows_x86_64_gnullvm | 0.52.6 | inactive | MIT OR Apache-2.0 |
 | windows_x86_64_msvc | 0.52.6 | inactive | MIT OR Apache-2.0 |
-| zeroize | 1.9.0 | active | Apache-2.0 OR MIT |
+| zeroize | 1.9.1 | active | Apache-2.0 OR MIT |
 
 ## PostgreSQL backend
 
 The user approved tokio-postgres plus its transitive dependencies. The driver
 pin is 0.7.18 with default features disabled and no optional integrations.
-Tokio 1.53.3 is also directly pinned with only io-util, for the
+Tokio 1.54.1 is also directly pinned with only io-util, for the
 private stream adapter; it adds no feature beyond the driver's closure.
 The mail lock adds 76 registry packages; 53 newly locked packages are active
 on x86-64 Linux. Previously locked cfg-if 1.0.5 and getrandom 0.4.3 also become
@@ -132,7 +132,7 @@ manifest, lock and selected features are pinned by crypto_policy.rs.
 | const-oid | 0.10.2 | active | Apache-2.0 OR MIT |
 | cpufeatures | 0.3.1 | active | MIT OR Apache-2.0 |
 | crypto-common | 0.2.2 | active | MIT OR Apache-2.0 |
-| ctutils | 0.4.3 | active | Apache-2.0 OR MIT |
+| ctutils | 0.4.6 | active | Apache-2.0 OR MIT |
 | digest | 0.11.3 | active | MIT OR Apache-2.0 |
 | fallible-iterator | 0.2.0 | active | MIT/Apache-2.0 |
 | futures-channel | 0.3.34 | active | MIT OR Apache-2.0 |
@@ -171,18 +171,18 @@ manifest, lock and selected features are pinned by crypto_policy.rs.
 | sha2 | 0.11.1 | active | MIT OR Apache-2.0 |
 | siphasher | 1.0.4 | active | MIT OR Apache-2.0 |
 | slab | 0.4.12 | inactive | MIT |
-| smallvec | 1.16.2 | active | MIT OR Apache-2.0 |
+| smallvec | 1.16.4 | active | MIT OR Apache-2.0 |
 | socket2 | 0.6.5 | active | MIT OR Apache-2.0 |
 | stringprep | 0.1.5 | active | MIT/Apache-2.0 |
 | syn | 3.0.9 | active | MIT OR Apache-2.0 |
 | tinyvec | 1.13.3 | active | Zlib OR Apache-2.0 OR MIT |
-| tokio | 1.53.3 | active | MIT |
+| tokio | 1.54.1 | active | MIT |
 | tokio-postgres | 0.7.18 | active | MIT OR Apache-2.0 |
 | tokio-util | 0.7.20 | active | MIT |
 | typenum | 1.20.1 | active | MIT OR Apache-2.0 |
 | unicode-bidi | 0.3.18 | active | MIT OR Apache-2.0 |
 | unicode-ident | 1.0.27 | active | (MIT OR Apache-2.0) AND Unicode-3.0 |
-| unicode-normalization | 0.1.25 | active | MIT OR Apache-2.0 |
+| unicode-normalization | 0.1.26 | active | (MIT OR Apache-2.0) AND Unicode-3.0 |
 | unicode-properties | 0.1.4 | active | MIT/Apache-2.0 |
 | wasi | 0.14.7+wasi-0.2.4 | inactive | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |
 | wasip2 | 1.0.4+wasi-0.2.12 | inactive | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |

@@ -17,9 +17,9 @@ pub(crate) const LOCAL_SOURCES: &[&str] = &[
 ];
 
 pub(crate) const DEPENDENCIES: &[&str] = &[
-    "aws-lc-rs = { version = \"=1.18.1\", default-features = false, features = [\"alloc\", \"non-fips\"] }",
-    "rustls = { version = \"=0.23.45\", default-features = false, features = [\"std\", \"tls12\", \"aws_lc_rs\"] }",
-    "webpki-roots = \"=1.0.8\"",
+    "aws-lc-rs = { version = \"=1.18.2\", default-features = false, features = [\"alloc\", \"non-fips\"] }",
+    "rustls = { version = \"=0.23.46\", default-features = false, features = [\"std\", \"tls12\", \"aws_lc_rs\"] }",
+    "webpki-roots = \"=1.0.11\"",
 ];
 
 pub(crate) fn admitted(name: &str) -> bool {
@@ -29,8 +29,8 @@ pub(crate) fn admitted(name: &str) -> bool {
 pub(crate) fn manifest_pin(name: &str, text: &str) -> Result<(), String> {
     let expected = match name {
         "td-civil" => "434e8c6ab3f8d304ce8c090478324e4e1398e39561395b0c7a59bf4cdc20b1ca",
-        "td-crypto" => "7ca2d70176ddb80083ff07de51465e8194fd01e4e4d435201444f11ed997c308",
-        "td-mta" => "6bed948bad62c65afc0b87e6ea9cd2e69f95caceeaf3f77b5074c2914c21e915",
+        "td-crypto" => "bde5f0081479e0e868de9776fdc9c43d20527213e334f864f8ba1f2ff926108f",
+        "td-mta" => "b5352257e11d365d3e775f6ac5752b2f69394b2aa489caad25be68e4da8c2e62",
         "td-fs" => "1ac91f7a8baf01070f9f51fbf6f625b637e96894174dda1dc4c1ce0e9b6ef401",
         "td-header" => "4e8dd9a6be096e9ffa65cbb26e71a8f3ec8a9c32c9d83211a1c490a43508aac9",
         "td-html" => "e4c924efdc7deab65fcc5cfa64bd5349935d5f3094e4310125ddb173af0b1c14",
@@ -49,8 +49,8 @@ pub(crate) fn manifest_pin(name: &str, text: &str) -> Result<(), String> {
 pub(crate) fn lock_pin(name: &str, text: &str) -> Result<(), String> {
     let expected = match name {
         "td-civil" => "d05684e2af245c0a796e154148ced1bc85ea08d9f31799d65a4fe1a62b7fc66a",
-        "td-crypto" => "499bfd9b6780ca6cc7df5c928a16d7397c43b61bbde1d164d532c494c530514b",
-        "td-mta" => "cba1a048acec452a57c7088cb1c114a860c235fcf77abbefaad52fea66bfe831",
+        "td-crypto" => "91c8c0e24691c1966a3f3f0b365cca4018fde10e553aafdbf76cfc5618f52b93",
+        "td-mta" => "0a92943f38fc284ac2c3c66d5b1dd80c03b6f36c7a6a225ae5753f286f3da11c",
         "td-fs" => "d907e7d97198344c058b8403d2a07c08174081bcd8af0f4d9e276c0131766fe2",
         "td-header" => "2862fd9186d5cdef3d645af0b43dee9f77ba51beee5d98219e5aae30db11eabc",
         "td-html" => "5bc92c6117fc17c612004a1b025a6ad42171c3d185d9af7eb47dd13a9168e8e3",
@@ -142,25 +142,25 @@ pub(crate) fn no_build_script(root: &Path, name: &str) -> Result<(), String> {
 
 // Cargo metadata can include inactive optional edges. Cargo tree's selected
 // normal/build graph is checked separately from the complete locked sources.
-const ACTIVE: &str = "aws-lc-rs v1.18.1|alloc,aws-lc-sys,non-fips,prebuilt-nasm
-aws-lc-sys v0.45.0|prebuilt-nasm
-cc v1.5.1|parallel
+const ACTIVE: &str = "aws-lc-rs v1.18.2|alloc,aws-lc-sys,non-fips,prebuilt-nasm
+aws-lc-sys v0.46.0|prebuilt-nasm
+cc v1.10.0|parallel
 cmake v0.1.58|
 dunce v1.0.5|
-find-msvc-tools v0.1.14|
+find-msvc-tools v0.1.15|
 fs_extra v1.3.0|
 jobserver v0.1.35|
-libc v0.2.189|default,std
+libc v0.2.191|default,std
 once_cell v1.21.4|alloc,race,std
 pkg-config v0.3.34|
-rustls v0.23.45|aws-lc-rs,aws_lc_rs,std,tls12
+rustls v0.23.46|aws-lc-rs,aws_lc_rs,std,tls12
 rustls-pki-types v1.15.1|alloc,default,std
-rustls-webpki v0.103.15|alloc,aws-lc-rs,std
+rustls-webpki v0.103.16|alloc,aws-lc-rs,std
 shlex v2.0.1|default,std
 subtle v2.6.1|
 untrusted v0.9.0|
-webpki-roots v1.0.8|
-zeroize v1.9.0|alloc,default
+webpki-roots v1.0.11|
+zeroize v1.9.1|alloc,default
 ";
 
 const POSTGRES_ACTIVE: &str = "async-trait v0.1.92 (proc-macro)|
@@ -174,7 +174,7 @@ cmov v0.5.4|
 const-oid v0.10.2|
 cpufeatures v0.3.1|
 crypto-common v0.2.2|
-ctutils v0.4.3|
+ctutils v0.4.6|
 digest v0.11.3|alloc,block-api,default,mac,oid
 fallible-iterator v0.2.0|default,std
 futures-channel v0.3.34|alloc,default,futures-sink,sink,std
@@ -204,18 +204,18 @@ rand_core v0.10.1|
 scopeguard v1.2.0|
 sha2 v0.11.1|alloc,default,oid
 siphasher v1.0.4|default,std
-smallvec v1.16.2|
+smallvec v1.16.4|
 socket2 v0.6.5|all
 stringprep v0.1.5|
 syn v3.0.9|clone-impls,full,parsing,printing,proc-macro,visit-mut
 tinyvec v1.13.3|alloc,default
-tokio v1.53.3|bytes,default,io-util,sync
+tokio v1.54.1|bytes,default,io-util,sync
 tokio-postgres v0.7.18|
 tokio-util v0.7.20|codec,default,libc
 typenum v1.20.1|const-generics
 unicode-bidi v0.3.18|default,hardcoded-data,std
 unicode-ident v1.0.27|
-unicode-normalization v0.1.25|default,std
+unicode-normalization v0.1.26|default,std
 unicode-properties v0.1.4|default,emoji,general-category
 whoami v2.1.3|default,std,wasi-wasite,wasm-web
 ";
@@ -275,7 +275,7 @@ pub(crate) fn active_graph(root: &Path, name: &str, output: &str) -> Result<(), 
 
 pub(crate) const POSTGRES_DEPENDENCIES: &[&str] = &[
     "tokio-postgres = { version = \"=0.7.18\", default-features = false }",
-    "tokio = { version = \"=1.53.3\", default-features = false, features = [\"io-util\"] }",
+    "tokio = { version = \"=1.54.1\", default-features = false, features = [\"io-util\"] }",
 ];
 
 #[cfg(test)]
@@ -307,7 +307,7 @@ mod tests {
             "[env]\nAWS_LC_SYS_NO_ASM = \"1\"\n",
             "[env]\nAWS_LC_SYS_USE_SYSTEM_x86_64_unknown_linux_gnu = \"1\"\n",
             "[env]\nCC = { value = \"/unapproved/cc\", force = true }\n",
-            "[target.x86_64-unknown-linux-gnu.aws_lc_0_45_0]\nrustc-link-lib = [\"crypto\"]\n",
+            "[target.x86_64-unknown-linux-gnu.aws_lc_0_46_0]\nrustc-link-lib = [\"crypto\"]\n",
         ] {
             std::fs::write(&path, format!("{config}\n{extra}")).unwrap();
             assert!(cargo_config(&checkout).is_err());
@@ -442,7 +442,7 @@ mod tests {
                 assert!(manifest_pin(name, &bad).is_err());
             }
             for bad in [
-                lock.replace("version = \"0.45.0\"", "version = \"0.44.0\""),
+                lock.replace("version = \"0.46.0\"", "version = \"0.45.0\""),
                 lock.replace("checksum = \"", "checksum = \"0"),
                 format!("{lock}\n[[package]]\nname = \"unapproved\"\nversion = \"1.0.0\"\n"),
             ] {
@@ -460,7 +460,7 @@ mod tests {
             dirs.len(),
             ACTIVE.lines().count() + POSTGRES_ACTIVE.lines().count()
         );
-        assert!(dirs.contains("aws-lc-rs-1.18.1"));
+        assert!(dirs.contains("aws-lc-rs-1.18.2"));
         assert!(dirs.contains("async-trait-0.1.92"));
         assert!(dirs.contains("whoami-2.1.3"));
         assert!(!dirs.contains("objc2-core-foundation-0.3.2"));
@@ -492,12 +492,12 @@ mod tests {
         assert!(active_graph(&root, "td-crypto", &graph).is_ok());
         for bad in [
             format!("{graph}ring v0.17.14|alloc\n"),
-            graph.replace("aws-lc-sys v0.45.0", "aws-lc-sys v0.44.0"),
+            graph.replace("aws-lc-sys v0.46.0", "aws-lc-sys v0.45.0"),
             graph.replace(
                 "|aws-lc-rs,aws_lc_rs,std,tls12",
                 "|aws-lc-rs,aws_lc_rs,ring,std,tls12",
             ),
-            graph.replace("webpki-roots v1.0.8|\n", ""),
+            graph.replace("webpki-roots v1.0.11|\n", ""),
             graph.replace(&crypto.display().to_string(), "/wrong/source"),
         ] {
             assert!(active_graph(&root, "td-crypto", &bad).is_err());
@@ -529,15 +529,15 @@ mod tests {
         assert!(active_graph(&root, "td-crypto", &format!("{graph}{POSTGRES_ACTIVE}")).is_err());
         assert!(active_graph(&root, "td-other", &mailgraph).is_err());
         for bad in [
-            mailgraph.replace("smallvec v1.16.2|\n", ""),
+            mailgraph.replace("smallvec v1.16.4|\n", ""),
             mailgraph.replace("tokio-postgres v0.7.18|\n", ""),
             mailgraph.replace(
                 "tokio-postgres v0.7.18|",
                 "tokio-postgres v0.7.18|default,runtime",
             ),
             mailgraph.replace(
-                "tokio v1.53.3|bytes,default,io-util,sync",
-                "tokio v1.53.3|bytes,default,io-util,net,rt,sync,time",
+                "tokio v1.54.1|bytes,default,io-util,sync",
+                "tokio v1.54.1|bytes,default,io-util,net,rt,sync,time",
             ),
             mailgraph.replace(
                 "postgres-protocol v0.6.12|default",

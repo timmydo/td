@@ -295,7 +295,7 @@ sign-off.
   editing `net/Cargo.toml` and adapting the code. The host preparation
   warms the vendored closure from the committed lock, and `net-test` runs
   td-net's suite.
-- td-crypto and td-mta pin their direct dependencies exactly (`=1.18.1`)
+- td-crypto and td-mta pin their direct dependencies exactly (`=1.18.2`)
   in their manifests and in `crypto_policy::DEPENDENCIES` (td-crypto's)
   and `POSTGRES_DEPENDENCIES` (td-mta's), so `cargo update` alone moves
   only what those exact pins leave free. Edit each manifest and its list

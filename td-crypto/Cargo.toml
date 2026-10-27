@@ -11,9 +11,9 @@ description = "td-owned cryptography and TLS boundary"
 clippy-all-targets = true
 
 [dependencies]
-aws-lc-rs = { version = "=1.18.1", default-features = false, features = ["alloc", "non-fips"] }
-rustls = { version = "=0.23.45", default-features = false, features = ["std", "tls12", "aws_lc_rs"] }
-webpki-roots = "=1.0.8"
+aws-lc-rs = { version = "=1.18.2", default-features = false, features = ["alloc", "non-fips"] }
+rustls = { version = "=0.23.46", default-features = false, features = ["std", "tls12", "aws_lc_rs"] }
+webpki-roots = "=1.0.11"
 
 [lints.clippy]
 unwrap_used = "deny"
