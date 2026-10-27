@@ -5,6 +5,8 @@
     clippy::panic
 )]
 use super::*;
+use crate::revocation::tests::WAIT;
+use crate::storage::tests::{appeared, Holder};
 use std::io::Write;
 use std::os::fd::AsFd;
 use std::thread;
@@ -257,9 +259,36 @@ fn scripted_worker() {
             w.present(unlocking(2, LoginStep::Unlock { key: A, retries: 8 }));
             w.hold();
         }
+        // Success, then an exit that leaves the channel with a descendant
+        // holding it until the test releases it, which writes `held` and
+        // removes it as it exits. The worker exits once `held` exists and
+        // the test has written `exit`, so root has seen the 14 first;
+        // `add-held-fails:` exits unsuccessfully.
+        held if held.starts_with("add-held:") || held.starts_with("add-held-fails:") => {
+            let (fails, directory) = match held.strip_prefix("add-held-fails:") {
+                Some(directory) => (true, Path::new(directory)),
+                None => (false, Path::new(held.strip_prefix("add-held:").unwrap())),
+            };
+            addition_through_probe(w);
+            w.invite(0x12, &probe);
+            w.send(&[0x14]);
+            let mut holder = fixture(&format!("hold-until:{}", directory.display()));
+            holder.stdin(Stdio::from(std::os::fd::OwnedFd::from(
+                w.stream.try_clone().unwrap(),
+            )));
+            #[allow(
+                clippy::zombie_processes,
+                reason = "the worker exits first, leaving its descendant the channel"
+            )]
+            let _holder = holder.spawn().unwrap();
+            assert!(appeared(&directory.join("held")));
+            assert!(appeared(&directory.join("exit")));
+            if fails {
+                std::process::exit(1);
+            }
+        }
         "add" | "add-uncertain" | "add-lost" | "add-exit" | "add-stall" | "add-linger"
-        | "add-trailing" | "add-trailing-hold" | "add-inherited" | "add-held"
-        | "add-held-fails" => {
+        | "add-trailing" | "add-trailing-hold" => {
             addition_through_probe(w);
             w.invite(0x12, &probe);
             match script.as_str() {
@@ -279,28 +308,6 @@ fn scripted_worker() {
                 "add-trailing" => {
                     w.send(&[0x14]);
                     w.send(&[0x15, 0x0f]);
-                }
-                // Success, then an exit that leaves the channel open in a
-                // descendant: within root's grace, or past it, or past it
-                // after a failed exit.
-                "add-inherited" | "add-held" | "add-held-fails" => {
-                    w.send(&[0x14]);
-                    let mut holder = fixture(if script == "add-held" {
-                        "glimpse"
-                    } else {
-                        "brief"
-                    });
-                    holder.stdin(Stdio::from(std::os::fd::OwnedFd::from(
-                        w.stream.try_clone().unwrap(),
-                    )));
-                    #[allow(
-                        clippy::zombie_processes,
-                        reason = "the worker exits first, leaving its descendant the channel"
-                    )]
-                    let _holder = holder.spawn().unwrap();
-                    if script == "add-held-fails" {
-                        std::process::exit(1);
-                    }
                 }
                 // Success, a stray byte, and no exit.
                 "add-trailing-hold" => {
@@ -483,8 +490,14 @@ fn scripted_worker() {
             w.hold();
         }
         "silent" => w.hold(),
-        "brief" => thread::sleep(Duration::from_secs(2)),
-        "glimpse" => thread::sleep(Duration::from_millis(300)),
+        // Holds the channel it inherited from `held` appearing until
+        // released, then removes `held` as it exits.
+        hold if hold.starts_with("hold-until:") => {
+            let directory = Path::new(hold.trim_start_matches("hold-until:"));
+            std::fs::write(directory.join("held"), b"").unwrap();
+            let _released = appeared(&directory.join("release"));
+            std::fs::remove_file(directory.join("held")).unwrap();
+        }
         // A login operation a disk proof authorized: the worker's first
         // frame is the proof's last step (crate::proof::tests).
         "proven-add" => {
@@ -537,7 +550,7 @@ fn scripted_worker() {
 /// Polls `login`, acknowledging every presentation and commit and relaying
 /// the PIN, until it ends: its end and every step it presented.
 fn drive(login: &mut Login) -> (Event, Vec<Request>) {
-    let until = Instant::now() + Duration::from_secs(10);
+    let until = Instant::now() + WAIT;
     let mut presented = Vec::new();
     loop {
         match login.poll().unwrap() {
@@ -1002,7 +1015,7 @@ fn selections_and_pins_have_one_exact_encoding() {
 
 /// Polls, acknowledging and relaying, until `phase`.
 fn until_phase(login: &mut Login, phase: Phase) {
-    let until = Instant::now() + Duration::from_secs(10);
+    let until = Instant::now() + WAIT;
     while login.phase != phase {
         match login.poll().unwrap() {
             Event::Present(request) => login.presented(&request).unwrap(),
@@ -1068,48 +1081,91 @@ fn at_the_deadline_only_a_success_already_in_the_socket_counts() {
     assert_eq!(drive(&mut login).0, ended(true, TIMEOUT, 0));
 }
 
-/// A channel a descendant holds a moment past the worker's successful
-/// exit ends within root's grace: success. A deadline crossed during the
-/// grace is TIMEOUT, as at any waiting exit; a failed exit is not waited
-/// for.
+/// A channel a descendant holds past the worker's successful exit: root
+/// waits for its end a second, `GRACE`, from seeing the exit. An end
+/// within the grace is success; a deadline crossed during the grace is
+/// TIMEOUT, as at any waiting exit; a channel still open as the grace ends
+/// is an uncertain INTERNAL; and a failed exit is not waited for. The
+/// worker exits only once the test has seen root reach its exit phase,
+/// each holder holds until the test releases it, and a grace whose
+/// length is checked is extended past any loaded host's next step unless
+/// its end is the case, so no outcome rests on how soon a process starts
+/// or ends, or how soon the test polls.
 #[test]
-fn a_channel_held_briefly_past_the_exit_completes() {
-    let mut login = scripted(Selection::Add, "add-held");
-    assert_eq!(drive(&mut login).0, Event::Complete);
-    assert!(login.child.is_none());
-    let mut login = scripted(Selection::Add, "add-held");
-    until_phase(&mut login, Phase::Exit);
-    let until = Instant::now() + Duration::from_secs(10);
-    while login.status.is_none() {
-        assert_eq!(login.poll(), Ok(Event::Waiting));
-        assert!(Instant::now() < until);
-        thread::sleep(Duration::from_millis(1));
+fn a_channel_held_past_the_exit_waits_one_grace() {
+    for (case, end) in [
+        ("released", Event::Complete),
+        ("expired", ended(true, TIMEOUT, 0)),
+        ("past the grace", ended(true, INTERNAL, 0)),
+    ] {
+        let holder = Holder::new();
+        let mut login = scripted(
+            Selection::Add,
+            &format!("add-held:{}", holder.directory.path().display()),
+        );
+        until_phase(&mut login, Phase::Exit);
+        std::fs::write(holder.directory.path().join("exit"), b"").unwrap();
+        let until = Instant::now() + WAIT;
+        let (before, after) = loop {
+            let before = Instant::now();
+            assert_eq!(login.poll(), Ok(Event::Waiting), "{case}");
+            if login.status.is_some() {
+                break (before, Instant::now());
+            }
+            assert!(Instant::now() < until, "{case}");
+            thread::sleep(Duration::from_millis(1));
+        };
+        // The worker has exited, seen within that poll; the channel is
+        // still held.
+        let Some((_, grace)) = &mut login.status else {
+            panic!("no exit");
+        };
+        // DESIGN.md's one second, `GRACE`, from that poll.
+        let second = Duration::from_secs(1);
+        assert!(
+            before + second <= *grace && *grace <= after + second,
+            "{case}"
+        );
+        let ends = *grace;
+        match case {
+            "released" => {
+                *grace = Instant::now() + WAIT;
+                std::fs::write(holder.directory.path().join("release"), b"").unwrap();
+            }
+            "expired" => {
+                *grace = Instant::now() + WAIT;
+                login.expire();
+            }
+            _ => {}
+        }
+        assert_eq!(drive(&mut login).0, end, "{case}");
+        if case == "past the grace" {
+            assert!(Instant::now() >= ends);
+        }
+        assert!(login.child.is_none(), "{case}");
     }
-    login.expire();
-    assert_eq!(drive(&mut login).0, ended(true, TIMEOUT, 0));
-    // Timed from root's commit acknowledgement, after which the worker
-    // sends `14` and exits; a grace waited would take at least `GRACE`.
-    let mut login = scripted(Selection::Add, "add-held-fails");
-    let until = Instant::now() + Duration::from_secs(10);
-    let mut committed = None;
+    // A failed exit ends the operation in the poll that sees it, with the
+    // channel still held: no grace is waited.
+    let holder = Holder::new();
+    let mut login = scripted(
+        Selection::Add,
+        &format!("add-held-fails:{}", holder.directory.path().display()),
+    );
+    until_phase(&mut login, Phase::Exit);
+    std::fs::write(holder.directory.path().join("exit"), b"").unwrap();
+    let until = Instant::now() + WAIT;
     let end = loop {
         match login.poll().unwrap() {
-            Event::Present(request) => login.presented(&request).unwrap(),
-            Event::Pin(request) => {
-                assert!(login.pin(&request, Pin::new(b"1234").unwrap()).unwrap())
+            Event::Waiting => {
+                assert!(login.status.is_none(), "a grace waited");
+                assert!(Instant::now() < until);
+                thread::sleep(Duration::from_millis(1));
             }
-            Event::Commit(request) => {
-                login.commit(&request).unwrap();
-                committed = Some(Instant::now());
-            }
-            Event::Waiting => thread::sleep(Duration::from_millis(1)),
             event => break event,
         }
-        assert!(Instant::now() < until);
     };
     assert_eq!(end, ended(true, INTERNAL, 0));
-    let waited = committed.unwrap().elapsed();
-    assert!(waited < GRACE, "{waited:?}");
+    assert!(holder.directory.path().join("held").exists());
 }
 
 #[test]
@@ -1125,12 +1181,12 @@ fn a_frame_before_the_pin_is_written_or_after_success_is_refused() {
     // Refused before the PIN was queued.
     assert!(login.pin.is_none() && login.wire.is_none());
     assert_eq!(drive(&mut login).0, ended(false, INTERNAL, 0));
-    // Anything after 14, even a clean exit, is no success; nor is a channel
-    // held open past root's grace (`add-inherited`).
+    // Anything after 14, even a clean exit, is no success, as a channel
+    // held open past root's grace is not
+    // (`a_channel_held_past_the_exit_waits_one_grace`).
     for (selection, script, uncertain) in [
         (Selection::Add, "add-trailing", true),
         (Selection::Add, "add-trailing-hold", true),
-        (Selection::Add, "add-inherited", true),
         (Selection::Unlock, "unlock-trailing", false),
     ] {
         let mut login = scripted(selection, script);

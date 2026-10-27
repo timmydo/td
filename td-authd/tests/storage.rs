@@ -560,7 +560,7 @@ fn upgrade_script(w: &mut Worker, script: &str) {
 }
 
 /// Whether `path` appears, looked for every millisecond, within `WAIT`.
-fn appeared(path: &Path) -> bool {
+pub(crate) fn appeared(path: &Path) -> bool {
     let until = Instant::now() + WAIT;
     while !path.exists() {
         if Instant::now() >= until {
@@ -573,9 +573,18 @@ fn appeared(path: &Path) -> bool {
 
 /// A `hold-until:` holder's directory. Dropped, it releases the holder
 /// and waits for it to remove `held`: the holder, the directory's one
-/// other writer, is done with it before the directory goes.
-struct Holder {
-    directory: TempDir,
+/// other writer, is done with it before the directory goes. The login
+/// fixture's holder keeps the same protocol.
+pub(crate) struct Holder {
+    pub(crate) directory: TempDir,
+}
+
+impl Holder {
+    pub(crate) fn new() -> Self {
+        Self {
+            directory: TempDir::new("td-authd-held").unwrap(),
+        }
+    }
 }
 
 impl Drop for Holder {
@@ -987,9 +996,7 @@ fn a_cancellation_takes_an_upgrading_volume_and_one_presentation() {
         (true, ended(false, CHANGED)),
         (false, ended(false, INTERNAL)),
     ] {
-        let holder = Holder {
-            directory: TempDir::new("td-authd-held").unwrap(),
-        };
+        let holder = Holder::new();
         let script = format!("cancel-changed-held:{}", holder.directory.path().display());
         let mut storage = Storage::scripted_as(Selection::UpgradeCancel, true, &script).unwrap();
         let until = Instant::now() + WAIT;
