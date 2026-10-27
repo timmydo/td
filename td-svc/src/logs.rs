@@ -90,6 +90,48 @@ const FILE_MODE: u32 = 0o600;
 /// Same reasoning for the directory `log=` names: one td-svc creates is not a
 /// place anyone else may put a file for it to append to.
 const DIR_MODE: u32 = 0o700;
+/// The one directory whose logs the observer group may read, when the image
+/// defines that group (DESIGN.md §8, "Observation"): readable, never
+/// writable, by it.
+pub const SHARED_ROOT: &str = "/var/log/svc";
+const SHARED_FILE_MODE: u32 = 0o640;
+const SHARED_DIR_MODE: u32 = 0o750;
+
+/// The observer group's gid, set once before any service starts.
+static OBSERVER: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+
+/// Share every log directly in `SHARED_ROOT` with `gid`.
+pub fn share_with(gid: u32) {
+    let _ = OBSERVER.set(gid);
+}
+
+/// The group a log at `path` is shared with: a file directly in `root`,
+/// when there is an observer group.
+fn shared_group(root: &str, path: &str, gid: Option<u32>) -> Option<u32> {
+    let path = std::path::Path::new(path);
+    path.file_name()?;
+    (path.parent()? == std::path::Path::new(root))
+        .then_some(gid)
+        .flatten()
+}
+
+/// Give a directory td-svc owns `gid` and the shared mode, whatever an older
+/// image left it at.
+fn share_dir(dir: &std::path::Path, gid: u32) -> io::Result<()> {
+    crate::control::share_dir(dir, SHARED_DIR_MODE, gid)
+}
+
+/// The same for an open log file, through its descriptor.
+fn share_file(file: &fs::File, gid: u32) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    if file.metadata()?.uid() != crate::control::nix_getuid() {
+        return Err(io::Error::other(
+            "not a file this supervisor owns; left alone",
+        ));
+    }
+    std::os::unix::fs::fchown(file, None, Some(gid))?;
+    file.set_permissions(fs::Permissions::from_mode(SHARED_FILE_MODE))
+}
 
 /// `O_NOFOLLOW` — the log path's final component must be a real file, not a
 /// symlink somebody else planted.
@@ -200,6 +242,8 @@ pub struct Sink {
     name: String,
     /// Set once the sink has said it cannot write. See `complain`.
     complained: bool,
+    /// The observer group this log is shared with, if any.
+    group: Option<u32>,
 }
 
 impl Sink {
@@ -213,6 +257,7 @@ impl Sink {
             console,
             name: name.to_string(),
             complained: false,
+            group: shared_group(SHARED_ROOT, path, OBSERVER.get().copied()),
         }
     }
 
@@ -230,22 +275,45 @@ impl Sink {
                 // world-writable log directory lets anyone replace the file
                 // this then appends to. Only components it CREATES take this
                 // mode, so an existing /var/log keeps its own.
-                match fs::DirBuilder::new()
-                    .recursive(true)
-                    .mode(DIR_MODE)
-                    .create(dir)
-                {
+                let mode = if self.group.is_some() {
+                    SHARED_DIR_MODE
+                } else {
+                    DIR_MODE
+                };
+                match fs::DirBuilder::new().recursive(true).mode(mode).create(dir) {
                     Ok(()) => {}
                     Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
                     Err(e) => return Err(e),
+                }
+                // Sharing failing costs the observer the log, not the log.
+                if let Some(gid) = self.group {
+                    if let Err(e) = share_dir(dir, gid) {
+                        crate::supervise::log(&format!(
+                            "{}: cannot share {}: {e}",
+                            self.name,
+                            dir.display()
+                        ));
+                    }
                 }
             }
             let file = fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .mode(FILE_MODE)
+                .mode(if self.group.is_some() {
+                    SHARED_FILE_MODE
+                } else {
+                    FILE_MODE
+                })
                 .custom_flags(O_NOFOLLOW)
                 .open(&self.path)?;
+            if let Some(gid) = self.group {
+                if let Err(e) = share_file(&file, gid) {
+                    crate::supervise::log(&format!(
+                        "{}: cannot share {}: {e}",
+                        self.name, self.path
+                    ));
+                }
+            }
             self.size = file.metadata().map(|m| m.len()).unwrap_or(0);
             self.file = Some(file);
         }
@@ -510,6 +578,58 @@ mod tests {
 
     fn read(path: &str) -> String {
         fs::read_to_string(path).unwrap_or_default()
+    }
+
+    #[test]
+    fn only_a_file_directly_in_the_shared_root_is_shared() {
+        let root = "/var/log/svc";
+        assert_eq!(
+            shared_group(root, "/var/log/svc/sshd.log", Some(9)),
+            Some(9)
+        );
+        assert_eq!(shared_group(root, "/var/log/svc/sshd.log", None), None);
+        for path in [
+            "/var/log/svc",
+            "/var/log/svc/",
+            "/var/log/svc/sub/a.log",
+            "/var/log/svc/../a.log",
+            "/var/log/a.log",
+            "/var/log/svcx/a.log",
+        ] {
+            assert_eq!(shared_group(root, path, Some(9)), None, "{path}");
+        }
+    }
+
+    /// A shared log and its directory take the group and the shared modes,
+    /// and one an older image left private is brought to them.
+    #[test]
+    fn a_shared_log_is_readable_by_its_group_alone() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let root = td_fs::TempDir::new("td-svc-shared-log").unwrap();
+        let dir = root.path().join("svc");
+        fs::create_dir(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.join("a.log");
+        fs::write(&path, "old\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let gid = own_gid();
+        let path = path.to_str().unwrap();
+        let mut sink = Sink::new("a", path, None);
+        sink.group = shared_group(dir.to_str().unwrap(), path, Some(gid));
+        assert_eq!(sink.group, Some(gid));
+        sink.write_line("new");
+        sink.close();
+        let file = fs::metadata(path).unwrap();
+        assert_eq!((file.mode() & 0o7777, file.gid()), (0o640, gid));
+        let dir = fs::metadata(&dir).unwrap();
+        assert_eq!((dir.mode() & 0o7777, dir.gid()), (0o750, gid));
+        assert_eq!(read(path), "old\nnew\n");
+    }
+
+    fn own_gid() -> u32 {
+        let status = fs::read_to_string("/proc/self/status").unwrap();
+        let line = status.lines().find(|l| l.starts_with("Gid:")).unwrap();
+        line.split_whitespace().nth(2).unwrap().parse().unwrap()
     }
 
     /// Lines reach the file, in order.

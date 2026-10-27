@@ -900,7 +900,8 @@ main loop over an mpsc channel.**
 - One probe thread per daemon that declares `ready=`, for as long as it is
   probing.
 - Two drain threads per captured service, and one control thread in
-  `UnixListener::accept`, when those land.
+  `UnixListener::accept`, when those land, with a second for the status
+  socket on an image with an observer group (§8, "Observation").
 
 The main loop is the sole owner of all supervision state, so there is no
 state mutex and nothing to hold across a blocking call: threads block, then
@@ -1000,7 +1001,10 @@ Invalid bytes are replaced and lines longer than 8 KiB are split. The file is
 opened 0600 and a directory `log=` names is created 0700, for the reason the
 control socket and the eviction record already state: td-svc inherits PID 1's
 umask, which PID 1 never sets, so `create_dir_all`'s `0777 & ~umask` would
-leave anyone able to replace the file td-svc then appends to.
+leave anyone able to replace the file td-svc then appends to. The one
+exception is a log directly in `/var/log/svc` on an image with an observer
+group (§8, "Observation"): it is 0640 and its directory 0750, both of that
+group, readable and never writable by it.
 
 **No writer means no pipe.** The pipes are wired only once the capture exists,
 which is why the capture is created BEFORE the spawn rather than after it. A
@@ -1302,6 +1306,53 @@ reboot — and stopping the greeter is one of the steps that request triggers.
 td-svc must not read that exit as a crash: `stopping` short-circuits the
 restart policy before it is consulted, or a `restart=always` greeter would
 come back mid-teardown, forever, and the walk would never reach the handoff.
+
+### Observation
+
+An image whose `/etc/group` defines `svc-log` with a gid other than
+root's names that group the observer: its members may read service
+status and logs, and nothing else. The server's primary account is its
+one member; the desktop defines no such group and gets neither path.
+td-svc reads the gid once, before any service starts.
+
+- **Status.** `/run/td-svc-status/socket`, inside a directory created
+  0750, then given the observer group, so the group's members may
+  connect and no one else may. Here the socket's own mode matters too:
+  connect(2) needs write permission on its inode, which `bind` creates
+  root's at `0777 & ~umask`, so it is then given the group and 0660. It
+  is served like the control socket, on a thread of its own with the
+  same read, write and length bounds, but a request that is not
+  `status` or `status NAME` is refused with `error: this socket answers
+  status only` before it reaches the main loop, and nothing a client of
+  it causes is logged, since its clients are not root and the console is
+  PID 1's. `td-svc status` asks the control socket and, refused it for
+  want of permission, the status socket, so an observer types the same
+  command root does; one who is no observer either is told the control
+  socket's refusal. Every other verb still needs the control socket.
+- **Logs.** A `log=` directly in `/var/log/svc` is created 0640 and its
+  directory 0750, and both are given the observer group. A file or that
+  directory an older image left private is brought to those modes when
+  the log is next opened, each through a descriptor opened without
+  following a link, and only when td-svc owns it; a log anywhere else
+  keeps 0600 and 0700. A member may hardlink a log it can read into its
+  own home on the same volume, pinning a generation rotation would have
+  freed: that costs the machine's one administrator its own space and
+  grants nothing. Sharing that fails is logged and the log is still
+  written. Rotated generations keep the mode they were written with.
+
+Reading a log is reading whatever a service printed, which on a server
+includes sshd's record of every login; the observer is the machine's
+one administrator, so that is the point. The group cannot write a log
+or a directory, cannot connect to the control socket, and gains no
+other file: a log outside `/var/log/svc` is not shared.
+
+`qemu-boot-server`'s logins include one as the provisioned account
+that runs `td-svc status sshd`, reads `/var/log/svc/sshd.log` and
+asks `td-svc stop sshd`: the status line and the read must succeed and
+the stop must be refused at the control socket's permission. The
+health probe that reads the primary's supplementary groups back
+through td-login derives them from the shipped `/etc/group`, so it
+also checks the account holds the group.
 
 ## 9. Ctrl-Alt-Del
 
@@ -1619,21 +1670,23 @@ and waits for cloud-metadata, which may change the hostname it checks
 ("Cloud metadata").
 
 The server has no greeter. No unit holds `tty=`, no console logs anyone
-in, and ttyS0 carries only boot output. Without a greeter there is no
-failed-candidate park, so bootfail is absent and healthwatch takes its
-place. It is ordered `after=bootsuccess` with no strict edge, so it
-runs once bootsuccess has decided: it succeeded, failed, timed out, or
-was skipped because sshd or the hostname failed. If the health record
-(`/run/td-boot-success-ok`) reads success, healthwatch prints
-`TD-SERVER-HEALTH-STEADY` and the machine stays up. Otherwise it prints
-`TD-SERVER-HEALTH-REBOOT` and asks td-svc to reboot. A candidate
-therefore spends its attempts unattended and td-boot's countdown falls
-back to the previous deployment (td-boot owns that contract). A
-machine with no console would otherwise hold an unreachable candidate
-until someone power-cycled it. No shipped path delivers a candidate to
-a server yet: it carries no updater, and an operator replaces the
-machine instead. The countdown governs the first such path to land,
-and today the oracle's installed fixture.
+in, and ttyS0 carries only boot output. The primary account observes the
+services instead: it is the one member of `svc-log`, which reads
+td-svc's status socket and `/var/log/svc` and nothing else (§8,
+"Observation"). Without a greeter there is no failed-candidate park, so
+bootfail is absent and healthwatch takes its place. It is ordered
+`after=bootsuccess` with no strict edge, so it runs once bootsuccess has
+decided: it succeeded, failed, timed out, or was skipped because sshd or
+the hostname failed. If the health record (`/run/td-boot-success-ok`)
+reads success, healthwatch prints `TD-SERVER-HEALTH-STEADY` and the
+machine stays up. Otherwise it prints `TD-SERVER-HEALTH-REBOOT` and asks
+td-svc to reboot. A candidate therefore spends its attempts unattended
+and td-boot's countdown falls back to the previous deployment (td-boot
+owns that contract). A machine with no console would otherwise hold an
+unreachable candidate until someone power-cycled it. No shipped path
+delivers a candidate to a server yet: it carries no updater, and an
+operator replaces the machine instead. The countdown governs the first
+such path to land, and today the oracle's installed fixture.
 
 An acknowledged deployment that fails health reboots too, so a fault
 that persists across boots repeats as a reboot loop, unbounded; a

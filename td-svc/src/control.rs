@@ -8,6 +8,11 @@
 //! Connections are served ONE AT A TIME on that thread. Control traffic is an
 //! operator typing, not a hot path, and serialising it means a slow client
 //! cannot interleave with another mid-reply.
+//!
+//! An image that defines the observer group also gets the status socket,
+//! `/run/td-svc-status/socket`, served the same way on a thread of its own,
+//! which answers `status` and nothing else to that group's members
+//! (DESIGN.md §8, "Observation").
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
@@ -20,6 +25,21 @@ use crate::supervise::{log, Event};
 
 pub const DIR: &str = "/run/td-svc";
 pub const PATH: &str = "/run/td-svc/control";
+pub const STATUS_DIR: &str = "/run/td-svc-status";
+pub const STATUS_PATH: &str = "/run/td-svc-status/socket";
+/// The group whose members may read service status and logs. An image that
+/// defines none gets neither.
+pub const OBSERVER_GROUP: &str = "svc-log";
+/// Traversable by the observer group, so its members may connect; the socket
+/// itself answers only `status`.
+const STATUS_DIR_MODE: u32 = 0o750;
+/// connect(2) needs write permission on the socket inode, which `bind`
+/// creates at `0777 & ~umask` as root's: the group needs it stated.
+const STATUS_SOCKET_MODE: u32 = 0o660;
+/// `O_DIRECTORY | O_NOFOLLOW`: a directory shared by descriptor is the one
+/// checked, never what a link at its path names.
+const O_DIRECTORY_NOFOLLOW: i32 = 0o200000 | 0o400000;
+const MAX_GROUP_FILE: u64 = 1 << 20;
 
 /// The directory is `0700` BEFORE the socket exists inside it.
 ///
@@ -135,7 +155,14 @@ pub fn bind(dir: &str, path: &str) -> std::io::Result<UnixListener> {
 /// created the directory itself with `create_dir_all` the 0700 reasoning above
 /// would be defeated by the one caller that runs first.
 pub fn ensure_dir(dir: &str) -> std::io::Result<()> {
-    match std::fs::DirBuilder::new().mode(DIR_MODE).create(dir) {
+    ensure_dir_for(dir, DIR_MODE, None)
+}
+
+/// `ensure_dir` at `mode`, and with `group` as its group when one is named.
+/// A directory created here is the root group's until the `chown`, which no
+/// other account belongs to.
+fn ensure_dir_for(dir: &str, mode: u32, group: Option<u32>) -> std::io::Result<()> {
+    match std::fs::DirBuilder::new().mode(mode).create(dir) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             // Pre-existing: it was not created here, so its mode and owner are
@@ -155,11 +182,61 @@ pub fn ensure_dir(dir: &str) -> std::io::Result<()> {
                     format!("{dir} is owned by uid {}, not by this process", meta.uid()),
                 ));
             }
-            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(DIR_MODE))?;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode))?;
         }
         Err(e) => return Err(e),
     }
+    if let Some(gid) = group {
+        share_dir(Path::new(dir), mode, gid)?;
+    }
     Ok(())
+}
+
+/// Give a directory this process owns `gid` and `mode`, through a
+/// descriptor opened without following a link.
+pub(crate) fn share_dir(dir: &Path, mode: u32, gid: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let handle = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(O_DIRECTORY_NOFOLLOW)
+        .open(dir)?;
+    let meta = handle.metadata()?;
+    if !meta.is_dir() || meta.uid() != nix_getuid() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("{} is not a directory this process owns", dir.display()),
+        ));
+    }
+    std::os::unix::fs::fchown(&handle, None, Some(gid))?;
+    handle.set_permissions(std::fs::Permissions::from_mode(mode))
+}
+
+/// The gid of `OBSERVER_GROUP` in `/etc/group`, if the image defines one
+/// other than root's.
+pub fn observer_group() -> Option<u32> {
+    let mut text = String::new();
+    std::fs::File::open("/etc/group")
+        .ok()?
+        .take(MAX_GROUP_FILE)
+        .read_to_string(&mut text)
+        .ok()?;
+    group_gid(&text, OBSERVER_GROUP)
+}
+
+fn group_gid(text: &str, name: &str) -> Option<u32> {
+    text.lines().find_map(|line| {
+        let mut fields = line.split(':');
+        if fields.next()? != name {
+            return None;
+        }
+        fields.nth(1)?.parse().ok().filter(|gid| *gid != 0)
+    })
+}
+
+/// Whether the status socket answers `request`: `status`, or `status NAME`.
+fn status_only(request: &str) -> bool {
+    let mut words = request.split_whitespace();
+    words.next() == Some("status") && words.nth(1).is_none()
 }
 
 /// Is this directory a place a root process may take instructions from?
@@ -183,7 +260,7 @@ pub fn dir_is_trusted(dir: &str) -> bool {
 /// This process's effective uid, without `libc`. `/proc/self/status` carries
 /// it, and td-svc already depends on `/proc` for everything else it knows
 /// about processes (I3).
-fn nix_getuid() -> u32 {
+pub(crate) fn nix_getuid() -> u32 {
     let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
         // Unreadable /proc: assume nothing matches, so a pre-existing directory
         // is refused rather than adopted.
@@ -200,10 +277,20 @@ fn nix_getuid() -> u32 {
 }
 
 /// Serve one connection: read a line, ask the main loop, write the reply.
+/// On the status socket (`status_socket`) any other verb is refused before
+/// it reaches the loop.
 ///
 /// A read or write error ends this connection and nothing else. The supervisor
 /// must not fail because a client hung up mid-request.
-fn serve(stream: UnixStream, tx: &Sender<Event>) {
+fn serve(stream: UnixStream, tx: &Sender<Event>, status_socket: bool) {
+    // What a client causes is not logged on the status socket: its clients
+    // are not root, and the console is PID 1's.
+    let quiet = status_socket;
+    let note = |message: &str| {
+        if !quiet {
+            log(message);
+        }
+    };
     let Ok(write_half) = stream.try_clone() else {
         log("control: cannot duplicate a client connection");
         return;
@@ -218,8 +305,8 @@ fn serve(stream: UnixStream, tx: &Sender<Event>) {
         Ok(0) => return,
         Ok(_) => {}
         Err(e) => {
-            log(&format!("control: reading a request: {e}"));
-            respond(write_half, "error: could not read the request\n");
+            note(&format!("control: reading a request: {e}"));
+            respond(write_half, "error: could not read the request\n", quiet);
             return;
         }
     }
@@ -227,11 +314,19 @@ fn serve(stream: UnixStream, tx: &Sender<Event>) {
         // The cap was hit, or the client half-closed mid-line. Either way this
         // is not a request, and truncating it into one could run a DIFFERENT
         // verb than the client sent.
-        respond(write_half, "error: request too long or incomplete\n");
+        respond(write_half, "error: request too long or incomplete\n", quiet);
         return;
     }
     let (reply_tx, reply_rx): (Sender<String>, Receiver<String>) = std::sync::mpsc::channel();
     let request = line.trim().to_string();
+    if status_socket && !status_only(&request) {
+        respond(
+            write_half,
+            "error: this socket answers status only\n",
+            quiet,
+        );
+        return;
+    }
     if tx
         .send(Event::Control {
             request,
@@ -241,16 +336,24 @@ fn serve(stream: UnixStream, tx: &Sender<Event>) {
     {
         // The main loop is gone. Nothing can answer, and saying so beats
         // leaving the client on a socket that will never speak.
-        respond(write_half, "error: supervisor is not accepting requests\n");
+        respond(
+            write_half,
+            "error: supervisor is not accepting requests\n",
+            quiet,
+        );
         return;
     }
     match reply_rx.recv_timeout(REPLY_TIMEOUT) {
-        Ok(reply) => respond(write_half, &reply),
-        Err(_) => respond(write_half, "error: supervisor did not answer in time\n"),
+        Ok(reply) => respond(write_half, &reply, quiet),
+        Err(_) => respond(
+            write_half,
+            "error: supervisor did not answer in time\n",
+            quiet,
+        ),
     }
 }
 
-fn respond(mut stream: UnixStream, reply: &str) {
+fn respond(mut stream: UnixStream, reply: &str, quiet: bool) {
     // The last unbounded wait on the accept thread. A client that sends a
     // request and then never reads blocks `write_all` once the reply outgrows
     // the socket buffer, and connections are served one at a time — so this is
@@ -260,22 +363,54 @@ fn respond(mut stream: UnixStream, reply: &str) {
         return;
     }
     if let Err(e) = stream.write_all(reply.as_bytes()) {
-        log(&format!("control: writing a reply: {e}"));
+        if !quiet {
+            log(&format!("control: writing a reply: {e}"));
+        }
     }
 }
 
-/// The client side: connect, send one request, read the whole reply.
+/// The client side: ask the control socket, or, for a `status` the caller
+/// may not ask there, the status socket, so an observer types the same
+/// `td-svc status`. A failed connect names the supervisor, since the
+/// overwhelmingly likely cause is that none is running, and an operator
+/// reading a bare ENOENT would go looking for a missing file.
+pub fn ask_any(request: &str) -> Result<String, String> {
+    match UnixStream::connect(PATH) {
+        Ok(stream) => exchange(stream, PATH, request),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied && status_only(request) => {
+            // One who is no observer either is told about the control socket.
+            match UnixStream::connect(STATUS_PATH) {
+                Ok(stream) => exchange(stream, STATUS_PATH, request),
+                Err(status)
+                    if matches!(
+                        status.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+                    ) =>
+                {
+                    Err(format!("{PATH}: {e}; is td-svc running?"))
+                }
+                Err(status) => Err(format!("{STATUS_PATH}: {status}; is td-svc running?")),
+            }
+        }
+        Err(e) => Err(format!("{PATH}: {e}; is td-svc running?")),
+    }
+}
+
+/// One request to the socket at `path`, for the tests here and in main.rs.
+#[cfg(test)]
+pub(crate) fn ask(path: &str, request: &str) -> Result<String, String> {
+    let stream =
+        UnixStream::connect(path).map_err(|e| format!("{path}: {e}; is td-svc running?"))?;
+    exchange(stream, path, request)
+}
+
+/// Send one request, read the whole reply.
 ///
 /// Shutting down the write half is what ends the request — the server reads a
 /// LINE, so a client that holds the connection open would be answered anyway,
 /// but half-closing means the read below cannot block on a peer that has
 /// nothing more to say.
-pub fn ask(path: &str, request: &str) -> Result<String, String> {
-    let mut stream = UnixStream::connect(path).map_err(|e| {
-        // The overwhelmingly likely cause is "no supervisor is running", and an
-        // operator reading a bare ENOENT would go looking for a missing file.
-        format!("{path}: {e}; is td-svc running?")
-    })?;
+fn exchange(mut stream: UnixStream, path: &str, request: &str) -> Result<String, String> {
     stream
         .write_all(format!("{request}\n").as_bytes())
         .map_err(|e| format!("{path}: sending the request: {e}"))?;
@@ -300,10 +435,10 @@ pub fn ask(path: &str, request: &str) -> Result<String, String> {
 /// drive the real loop on a scratch socket — the shipped path is under `/run`,
 /// which only root can create in, so a `spawn` that binds it internally is a
 /// loop nothing can exercise.
-fn serve_forever(listener: UnixListener, tx: &Sender<Event>) {
+fn serve_forever(listener: UnixListener, tx: &Sender<Event>, status_socket: bool) {
     for stream in listener.incoming() {
         match stream {
-            Ok(stream) => serve(stream, tx),
+            Ok(stream) => serve(stream, tx, status_socket),
             // One refused connection is not a reason to stop accepting.
             Err(e) => log(&format!("control: accept: {e}")),
         }
@@ -314,10 +449,42 @@ fn serve_forever(listener: UnixListener, tx: &Sender<Event>) {
 /// supervisor with no control socket still supervises, and the console is worth
 /// more than the socket.
 pub fn spawn(tx: Sender<Event>) {
-    let listener = match bind(DIR, PATH) {
+    start(bind(DIR, PATH), PATH, "td-svc-control", tx, false);
+}
+
+/// Start the status socket for `group`'s members, with the same bounds.
+pub fn spawn_status(tx: Sender<Event>, group: u32) {
+    start(
+        bind_status(STATUS_DIR, STATUS_PATH, group),
+        STATUS_PATH,
+        "td-svc-status",
+        tx,
+        true,
+    );
+}
+
+/// The status socket's directory, then the socket, each given `group`.
+/// Until the socket's own `chown` it is root's, which no observer is.
+fn bind_status(dir: &str, path: &str, group: u32) -> std::io::Result<UnixListener> {
+    ensure_dir_for(dir, STATUS_DIR_MODE, Some(group))?;
+    clear_stale(Path::new(path))?;
+    let listener = UnixListener::bind(path)?;
+    std::os::unix::fs::lchown(path, None, Some(group))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(STATUS_SOCKET_MODE))?;
+    Ok(listener)
+}
+
+fn start(
+    listener: std::io::Result<UnixListener>,
+    path: &str,
+    thread: &str,
+    tx: Sender<Event>,
+    status_socket: bool,
+) {
+    let listener = match listener {
         Ok(listener) => listener,
         Err(e) => {
-            log(&format!("control: {PATH}: {e}; running without it"));
+            log(&format!("control: {path}: {e}; running without it"));
             return;
         }
     };
@@ -325,11 +492,13 @@ pub fn spawn(tx: Sender<Event>) {
     // release profile is `panic=abort` — so a resource limit would take the
     // supervisor down rather than cost it a socket.
     if std::thread::Builder::new()
-        .name("td-svc-control".into())
-        .spawn(move || serve_forever(listener, &tx))
+        .name(thread.into())
+        .spawn(move || serve_forever(listener, &tx, status_socket))
         .is_err()
     {
-        log("control: cannot start the accept thread; running without the socket");
+        log(&format!(
+            "control: cannot start the accept thread; running without {path}"
+        ));
     }
 }
 
@@ -339,6 +508,109 @@ mod tests {
     use super::*;
     use std::io::Read;
     use std::sync::mpsc::channel;
+
+    #[test]
+    fn the_observer_group_is_read_by_name_and_never_root() {
+        let group = "root:x:0:\nwheel:x:10:ada\nsvc-log:x:994:ada\n";
+        assert_eq!(group_gid(group, "svc-log"), Some(994));
+        assert_eq!(group_gid(group, "svc"), None);
+        assert_eq!(group_gid("svc-log:x:0:\n", "svc-log"), None);
+        assert_eq!(group_gid("svc-log:x:no:\n", "svc-log"), None);
+        assert_eq!(group_gid("svc-log\n", "svc-log"), None);
+    }
+
+    #[test]
+    fn the_status_socket_answers_status_alone() {
+        for request in ["status", "status sshd", " status  sshd "] {
+            assert!(status_only(request), "{request}");
+        }
+        for request in [
+            "",
+            "stop sshd",
+            "statusx",
+            "status a b",
+            "reboot",
+            "start status",
+        ] {
+            assert!(!status_only(request), "{request}");
+        }
+    }
+
+    /// Over a real socket: `status` crosses to the loop, `stop` never does.
+    #[test]
+    fn the_status_socket_refuses_every_other_verb_before_the_loop() {
+        let dir = td_fs::TempDir::new("td-svc-status").unwrap();
+        let path = dir.path().join("socket");
+        let listener = UnixListener::bind(&path).unwrap();
+        let (tx, rx) = channel();
+        std::thread::spawn(move || serve_forever(listener, &tx, true));
+        let socket = path.to_str().unwrap().to_owned();
+        let asker = {
+            let socket = socket.clone();
+            std::thread::spawn(move || ask(&socket, "status sshd").unwrap())
+        };
+        match rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+            Event::Control { request, reply } => {
+                assert_eq!(request, "status sshd");
+                reply
+                    .send("sshd running pid=1 failures=0\n".into())
+                    .unwrap();
+            }
+            _ => unreachable!("the status request did not reach the loop"),
+        }
+        assert_eq!(asker.join().unwrap(), "sshd running pid=1 failures=0\n");
+        assert_eq!(
+            ask(&socket, "stop sshd").unwrap(),
+            "error: this socket answers status only\n"
+        );
+        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+    }
+
+    #[test]
+    fn the_status_socket_and_its_directory_are_the_groups() {
+        let root = td_fs::TempDir::new("td-svc-status-bind").unwrap();
+        let dir = root.path().join("status");
+        let path = dir.join("socket");
+        let gid = own_gid();
+        let _listener = bind_status(dir.to_str().unwrap(), path.to_str().unwrap(), gid).unwrap();
+        let socket = std::fs::symlink_metadata(&path).unwrap();
+        assert_eq!((socket.mode() & 0o7777, socket.gid()), (0o660, gid));
+        let dir = std::fs::metadata(&dir).unwrap();
+        assert_eq!((dir.mode() & 0o7777, dir.gid()), (0o750, gid));
+    }
+
+    #[test]
+    fn a_directory_is_shared_only_through_a_descriptor_it_owns() {
+        let root = td_fs::TempDir::new("td-svc-share-link").unwrap();
+        let target = root.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(share_dir(&link, 0o750, own_gid()).is_err());
+        assert_eq!(std::fs::metadata(&target).unwrap().mode() & 0o7777, 0o700);
+    }
+
+    #[test]
+    fn a_shared_directory_takes_its_group_and_mode() {
+        let dir = td_fs::TempDir::new("td-svc-status-dir").unwrap();
+        let shared = dir.path().join("status");
+        let shared = shared.to_str().unwrap();
+        let gid = own_gid();
+        ensure_dir_for(shared, STATUS_DIR_MODE, Some(gid)).unwrap();
+        let meta = std::fs::metadata(shared).unwrap();
+        assert_eq!((meta.mode() & 0o7777, meta.gid()), (0o750, gid));
+        // An existing one at another mode is brought to it.
+        std::fs::set_permissions(shared, std::fs::Permissions::from_mode(0o700)).unwrap();
+        ensure_dir_for(shared, STATUS_DIR_MODE, Some(gid)).unwrap();
+        assert_eq!(std::fs::metadata(shared).unwrap().mode() & 0o7777, 0o750);
+    }
+
+    fn own_gid() -> u32 {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let line = status.lines().find(|l| l.starts_with("Gid:")).unwrap();
+        line.split_whitespace().nth(2).unwrap().parse().unwrap()
+    }
 
     fn scratch(name: &str) -> (String, String) {
         let dir = format!(
@@ -433,7 +705,7 @@ mod tests {
         let (tx, rx) = channel();
         std::thread::spawn(move || {
             if let Some(Ok(stream)) = listener.incoming().next() {
-                serve(stream, &tx);
+                serve(stream, &tx, false);
             }
         });
 
@@ -502,7 +774,7 @@ mod tests {
         let (done_tx, done_rx) = channel();
         std::thread::spawn(move || {
             if let Some(Ok(stream)) = listener.incoming().next() {
-                serve(stream, &tx);
+                serve(stream, &tx, false);
             }
             let _ = done_tx.send(());
         });
@@ -532,7 +804,7 @@ mod tests {
         let (tx, rx) = channel();
         std::thread::spawn(move || {
             if let Some(Ok(stream)) = listener.incoming().next() {
-                serve(stream, &tx);
+                serve(stream, &tx, false);
             }
         });
 
@@ -585,7 +857,7 @@ mod tests {
         let (tx, rx) = channel();
         std::thread::spawn(move || {
             if let Some(Ok(stream)) = listener.incoming().next() {
-                serve(stream, &tx);
+                serve(stream, &tx, false);
             }
         });
 
@@ -619,7 +891,7 @@ mod tests {
         drop(rx);
         std::thread::spawn(move || {
             if let Some(Ok(stream)) = listener.incoming().next() {
-                serve(stream, &tx);
+                serve(stream, &tx, false);
             }
         });
 
@@ -655,7 +927,7 @@ mod tests {
         assert!(complaints.is_empty(), "{complaints:?}");
 
         let tx = rt.events();
-        std::thread::spawn(move || serve_forever(listener, &tx));
+        std::thread::spawn(move || serve_forever(listener, &tx, false));
 
         let ask = |request: &str| {
             let mut client = UnixStream::connect(&path).unwrap();

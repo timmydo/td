@@ -267,7 +267,7 @@ fn main() -> ExitCode {
             emit_err(&format!("td-svc: {why}\n"));
             ExitCode::FAILURE
         }
-        Route::Ctl { request } => match control::ask(control::PATH, &request) {
+        Route::Ctl { request } => match control::ask_any(&request) {
             Ok(reply) => {
                 if let Err(e) = emit(&reply) {
                     emit_err(&format!("td-svc: {e}\n"));
@@ -305,8 +305,16 @@ fn main() -> ExitCode {
             for problem in &problems {
                 emit_err(&format!("td-svc: {problem}\n"));
             }
+            // Before any service starts, so every shared log is created shared.
+            let observer = control::observer_group();
+            if let Some(gid) = observer {
+                logs::share_with(gid);
+            }
             let (mut runtime, complaints) = supervise::Runtime::new(units, &path);
             control::spawn(runtime.events());
+            if let Some(gid) = observer {
+                control::spawn_status(runtime.events(), gid);
+            }
             for complaint in &complaints {
                 emit_err(&format!("td-svc: {complaint}\n"));
             }

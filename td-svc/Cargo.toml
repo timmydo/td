@@ -18,6 +18,7 @@ path = "src/main.rs"
 # `--test`, so the shipped binary never sees it.
 [dev-dependencies]
 td-source-scan = { path = "../td-source-scan" }
+td-fs = { path = "../td-fs" }
 
 # The engine root carries no `exclude` list and never needed one: an `exclude`
 # stops cargo only at THAT manifest.

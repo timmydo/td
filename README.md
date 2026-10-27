@@ -270,14 +270,17 @@ firmware boots, reachable over SSH as one account:
 ./build-server-image --iso           # a live medium: the same server, state in RAM
 ```
 
-The image runs system services under td-svc and starts nothing graphical.
-Its account has no password and no console login; the serial console
-shows boot and health only. The image carries the account name and the
-public keys with their comments. It is immutable: to update, replace the
-machine with a newer image ([td-svc design](td-svc/DESIGN.md) §10,
-"Profiles"). Its kernel carries Azure's, EC2 Nitro's and GCE's disk and
-NIC drivers; "Cloud images" there says how each cloud imports it and what
-does not work yet. No cloud boot is tested. An attached NoCloud seed
+The image runs system services under td-svc and starts nothing
+graphical. Its account has no password and no console login; the serial
+console shows boot and health only. Logged in, the account can run
+`td-svc status` and read the services' logs in `/var/log/svc`, but not
+start or stop anything ([td-svc design](td-svc/DESIGN.md) §8,
+"Observation"). The image carries the account name and the public keys
+with their comments. It is immutable: to update, replace the machine
+with a newer image ([td-svc design](td-svc/DESIGN.md) §10, "Profiles").
+Its kernel carries Azure's, EC2 Nitro's and GCE's disk and NIC drivers;
+"Cloud images" there says how each cloud imports it and what does not
+work yet. No cloud boot is tested. An attached NoCloud seed
 (`cloud-localds`'s `cidata` ISO) can name the host and add Ed25519 keys
 for the account, and on EC2 and Azure the instance's metadata service
 does the same from its key pair or SSH keys, and an Azure VM reports

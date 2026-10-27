@@ -23,12 +23,20 @@ const PROVISIONED_KEY: &str = "provisioned";
 const METADATA_KEY: &str = "metadata";
 const STRANGER_KEY: &str = "stranger";
 
+/// What the observe login runs: status through the status socket, a
+/// service log, and a stop the account may not ask for.
+const OBSERVE: &str = "/bin/td-svc status sshd && /bin/cat /var/log/svc/sshd.log >/dev/null \
+                       && echo log-readable; /bin/td-svc stop sshd; echo stop=$?";
+
 /// One login, in the order they run.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Attempt {
     /// The provisioned key as the provisioned account: the remote `id -un`
     /// prints its name.
     Provisioned,
+    /// The same login observing: `OBSERVE` reads sshd's status and log and
+    /// is refused a stop (td-svc/DESIGN.md §8, "Observation").
+    Observe,
     /// The seed's key as that account: admitted only on a seeded boot.
     Metadata,
     /// A key the server was never given, as that account: refused.
@@ -39,6 +47,7 @@ enum Attempt {
 
 const ATTEMPTS: &[Attempt] = &[
     Attempt::Provisioned,
+    Attempt::Observe,
     Attempt::Metadata,
     Attempt::Stranger,
     Attempt::Root,
@@ -47,7 +56,7 @@ const ATTEMPTS: &[Attempt] = &[
 impl Attempt {
     fn key(self) -> &'static str {
         match self {
-            Attempt::Provisioned | Attempt::Root => PROVISIONED_KEY,
+            Attempt::Provisioned | Attempt::Observe | Attempt::Root => PROVISIONED_KEY,
             Attempt::Metadata => METADATA_KEY,
             Attempt::Stranger => STRANGER_KEY,
         }
@@ -56,7 +65,7 @@ impl Attempt {
     /// Whether sshd must admit it, given whether the boot was seeded.
     fn admitted(self, seeded: bool) -> bool {
         match self {
-            Attempt::Provisioned => true,
+            Attempt::Provisioned | Attempt::Observe => true,
             Attempt::Metadata => seeded,
             Attempt::Stranger | Attempt::Root => false,
         }
@@ -66,6 +75,7 @@ impl Attempt {
     fn label(self) -> &'static str {
         match self {
             Attempt::Provisioned => "provisioned-login",
+            Attempt::Observe => "observe-login",
             Attempt::Metadata => "metadata-login",
             Attempt::Stranger => "stranger-login",
             Attempt::Root => "root-login",
@@ -74,7 +84,9 @@ impl Attempt {
 
     fn user(self, account: &str) -> &str {
         match self {
-            Attempt::Provisioned | Attempt::Metadata | Attempt::Stranger => account,
+            Attempt::Provisioned | Attempt::Observe | Attempt::Metadata | Attempt::Stranger => {
+                account
+            }
             Attempt::Root => "root",
         }
     }
@@ -223,7 +235,11 @@ impl HostLogin {
             .arg(self.home.join(attempt.key()))
             .args(["-p", &self.port()?.to_string()])
             .args(["-l", attempt.user(self.account.name())])
-            .args(["127.0.0.1", "--", "id", "-un"])
+            .args(["127.0.0.1", "--"])
+            .args(match attempt {
+                Attempt::Observe => &[OBSERVE][..],
+                _ => &["id", "-un"][..],
+            })
             .stdin(Stdio::null())
             .stdout(output("stdout")?)
             .stderr(output("stderr")?);
@@ -248,9 +264,11 @@ impl HostLogin {
     }
 }
 
-/// Admitted means exit 0 and the account's name alone on stdout; refused
-/// means ssh's own exit 255 with nothing on stdout and sshd's "Permission
-/// denied", which a connection or host-key failure does not print.
+/// Admitted means exit 0 and the account's name alone on stdout, or for the
+/// observe login sshd's status line, the log read and the stop refused for
+/// want of the control socket; refused means ssh's own exit 255 with nothing
+/// on stdout and sshd's "Permission denied", which a connection or host-key
+/// failure does not print.
 fn judge(
     attempt: Attempt,
     account: &str,
@@ -259,7 +277,15 @@ fn judge(
     stdout: &str,
     stderr: &str,
 ) -> Result<(), String> {
-    let passed = if admitted {
+    let passed = if attempt == Attempt::Observe {
+        let lines: Vec<&str> = stdout.lines().collect();
+        code == Some(0)
+            && matches!(lines.as_slice(), [status, "log-readable", "stop=1"]
+                if status.starts_with("sshd ")
+                    && status.contains(" pid=")
+                    && status.contains(" failures="))
+            && stderr.contains("/run/td-svc/control: Permission denied")
+    } else if admitted {
         code == Some(0) && stdout == format!("{account}\n")
     } else {
         code == Some(255) && stdout.is_empty() && stderr.contains("Permission denied")
@@ -273,7 +299,9 @@ fn judge(
          {stderr:?}",
         attempt.key(),
         attempt.user(account),
-        if admitted {
+        if attempt == Attempt::Observe {
+            "admitted, shown sshd's status and log, and refused a stop"
+        } else if admitted {
             "admitted and printed the account's name"
         } else {
             "refused"
@@ -439,6 +467,32 @@ mod tests {
                 assert!(judge(attempt, "ada", false, code, stdout, stderr).is_err());
             }
         }
+        let refused = "td-svc: /run/td-svc/control: Permission denied (os error 13); \
+                       is td-svc running?\n";
+        let observed = "sshd running pid=412 failures=0\nlog-readable\nstop=1\n";
+        assert!(judge(Attempt::Observe, "ada", true, Some(0), observed, refused).is_ok());
+        for (stdout, stderr) in [
+            // The status socket was not reached, or the log not read.
+            ("stop=1\n", refused),
+            ("sshd running pid=412 failures=0\nstop=1\n", refused),
+            // The stop went through, or failed for another reason.
+            (
+                "sshd running pid=412 failures=0\nlog-readable\nstop=0\n",
+                "",
+            ),
+            (
+                observed,
+                "td-svc: /run/td-svc/control: No such file or directory",
+            ),
+            (
+                "ada running pid=1 failures=0\nlog-readable\nstop=1\n",
+                refused,
+            ),
+        ] {
+            assert!(judge(Attempt::Observe, "ada", true, Some(0), stdout, stderr).is_err());
+        }
+        assert_eq!(Attempt::Observe.key(), PROVISIONED_KEY);
+        assert_eq!(Attempt::Observe.user("ada"), "ada");
         assert_eq!(Attempt::Root.user("ada"), "root");
         assert_eq!(Attempt::Root.key(), PROVISIONED_KEY);
         assert_eq!(Attempt::Stranger.key(), STRANGER_KEY);

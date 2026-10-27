@@ -253,6 +253,11 @@ const SSHD_PRIVSEP_USER: &str = "sshd";
 const SSHD_PRIVSEP_UID: u32 = 995;
 const SSHD_PRIVSEP_GID: u32 = 995;
 const SSHD_PRIVSEP_PATH: &str = "/run/sshd-empty";
+/// A server's observer group: its members read td-svc's status socket and
+/// `/var/log/svc` (td-svc/DESIGN.md §8, "Observation"). Only the primary
+/// account is one. Reserved: no principal may take 988 as its id.
+const SVC_LOG_GROUP: &str = "svc-log";
+const SVC_LOG_GID: u32 = 988;
 const AUDIO_USER: &str = "audio";
 const AUDIO_UID: u32 = td_engine::permissions::TD_AUDIO_UID;
 const AUDIO_GID: u32 = td_engine::permissions::TD_AUDIO_GID;
@@ -1231,6 +1236,18 @@ fn build_group(sys: &SystemDef) -> String {
     // enrolled by default; an analysis identity must be granted it explicitly.
     s.push_str(&format!("profiler-read:x:{PROFILER_READ_GID}:\n"));
     s.push_str("tty:x:5:\n");
+    if !sys.desktop() {
+        let primary: Vec<&str> = sys
+            .users
+            .iter()
+            .filter(|u| u.uid == UI_UID)
+            .map(|u| u.name)
+            .collect();
+        s.push_str(&format!(
+            "{SVC_LOG_GROUP}:x:{SVC_LOG_GID}:{}\n",
+            primary.join(",")
+        ));
+    }
     s
 }
 
@@ -10148,7 +10165,8 @@ mod tests {
                 u.name,
                 u.shell
             );
-            // build_group only materialises the `wheel` supplementary group today; any
+            // build_group materialises only `wheel` from a declared supplementary
+            // group (a server's svc-log follows the primary by uid instead); any
             // other declared group would be silently dropped from /etc/group (its
             // membership lost), so reject it until build_group learns to emit it.
             for g in u.groups {
@@ -15862,6 +15880,17 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         );
         // ...and the group set must be DERIVED from the generated /etc/group, not a constant
         // that quietly stops matching it. wheel is the membership the stock SYSTEM grants.
+        // A server's primary also observes its services; the desktop has no
+        // such group.
+        assert_eq!(supplementary_gids(&SERVER, "tester"), vec![10, SVC_LOG_GID]);
+        assert!(!build_group(&SYSTEM).contains(SVC_LOG_GROUP));
+        assert_eq!(
+            build_group(&SERVER)
+                .lines()
+                .filter(|line| line.starts_with("svc-log:"))
+                .collect::<Vec<_>>(),
+            ["svc-log:x:988:tester"]
+        );
         assert_eq!(
             supplementary_gids(&SYSTEM, "tester"),
             vec![10],
