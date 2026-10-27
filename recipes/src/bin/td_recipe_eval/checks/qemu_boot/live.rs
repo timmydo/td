@@ -150,6 +150,7 @@ pub(super) fn drive_wizard(run: &LiveRun<'_>) -> Result<BootResult, String> {
         BootPlan {
             disk: Some(BootDisk::new(run.iso, true)),
             seed: None,
+            cloud: None,
             mem: LIVE_MEMORY_MIB,
             target_marker: TD_SETUP_LIVE_MARKER,
             kill_on_marker: false,

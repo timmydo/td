@@ -17,6 +17,7 @@
 
 mod application_runtime;
 mod application_state;
+mod cloud;
 mod credentials;
 #[path = "../../td-secret/src/crypto.rs"]
 mod crypto;
@@ -55,6 +56,7 @@ mod fido_hid;
 )]
 mod fido_metadata;
 mod hostname;
+mod http;
 mod login_directory;
 #[path = "../../td-secret/src/login_state.rs"]
 #[allow(
@@ -294,6 +296,7 @@ fn usage() -> String {
          configuration under DIR/{APPLICATION_STATE_ROOT} or its validated private app home\n  \
          td-firstboot hostname prepares and activates the persistent hostname\n  \
          td-firstboot metadata applies an attached NoCloud seed's hostname and Ed25519 keys on a server\n  \
+         td-firstboot cloud-metadata applies the hostname and Ed25519 keys of the metadata service DMI names, once the network is up\n  \
          td-firstboot check-principals ROOT validates staged deployment identities without writing\n  \
          td-firstboot check-primary-name ROOT NAME checks a proposed human name without writing\n  \
          td-firstboot stage-primary-name ROOT NAME OUT prepares new account tables without activating them\n  \
@@ -352,6 +355,7 @@ fn run_with_primary(
         Invocation::Help => return emit(&usage()).map_err(Failure::Failed),
         Invocation::Hostname => return activate_hostname(),
         Invocation::Metadata => return apply_metadata(),
+        Invocation::CloudMetadata => return apply_cloud_metadata(),
         Invocation::CheckPrincipals(root) => {
             principals::check_deployment(&root).map_err(Failure::Failed)?;
             return emit("TD-PRINCIPALS-CHECK-OK\n").map_err(Failure::Failed);
@@ -510,6 +514,7 @@ enum Invocation {
     Help,
     Hostname,
     Metadata,
+    CloudMetadata,
     CheckPrincipals(PathBuf),
     CheckPrimaryName(PathBuf, String),
     StagePrimaryName(PathBuf, String, PathBuf),
@@ -615,6 +620,13 @@ fn parse(args: &[String]) -> Result<Invocation, Failure> {
             Ok(Invocation::Metadata)
         } else {
             Err(Failure::Usage("metadata takes no operands".into()))
+        };
+    }
+    if args.first().is_some_and(|arg| arg == "cloud-metadata") {
+        return if args.len() == 1 {
+            Ok(Invocation::CloudMetadata)
+        } else {
+            Err(Failure::Usage("cloud-metadata takes no operands".into()))
         };
     }
     if args
@@ -1172,6 +1184,12 @@ fn activate_hostname() -> Result<(), Failure> {
     make_dir(state, 0o755)?;
     sync_directories(state, Some(&boundary))?;
     let name = provision_hostname(&state.join(HOSTNAME), Path::new(HOSTNAME_DEFAULT), 0)?;
+    set_kernel_hostname(&name)?;
+    emit(&format!("TD-HOSTNAME-READY {}\n", name.name())).map_err(Failure::Failed)
+}
+
+/// `name` as the kernel's hostname, read back.
+fn set_kernel_hostname(name: &hostname::Hostname) -> Result<(), Failure> {
     let status = std::process::Command::new(HOSTNAME_PROGRAM)
         .arg(name.name())
         .status()
@@ -1180,12 +1198,61 @@ fn activate_hostname() -> Result<(), Failure> {
         return Err(Failure::Failed(format!("set installed hostname: {status}")));
     }
     let actual = read_hostname(Path::new("/proc/sys/kernel/hostname"), 0)?;
-    if actual.as_ref() != Some(&name) {
+    if actual.as_ref() != Some(name) {
         return Err(Failure::Failed(
             "kernel hostname differs from the saved choice".into(),
         ));
     }
-    emit(&format!("TD-HOSTNAME-READY {}\n", name.name())).map_err(Failure::Failed)
+    Ok(())
+}
+
+/// A server's cloud metadata (td-svc/DESIGN.md §10, "Cloud metadata"),
+/// once the network is up: the service the firmware's DMI names gives the
+/// hostname, saved and then set, which td-netd's daemon renders into
+/// `/etc/hosts`, and Ed25519 keys for the file a NoCloud seed would have
+/// written. An attached seed, or a machine no cloud's DMI names, changes
+/// nothing.
+fn apply_cloud_metadata() -> Result<(), Failure> {
+    if Path::new(metadata::NOCLOUD_MARKER).exists() {
+        return emit("TD-CLOUD-METADATA-SKIPPED nocloud\n").map_err(Failure::Failed);
+    }
+    let Some(cloud) = cloud::detect(Path::new(cloud::DMI)) else {
+        return emit("TD-CLOUD-METADATA-NONE\n").map_err(Failure::Failed);
+    };
+    let request = cloud::fetch(cloud, cloud::IMDS)
+        .map_err(|error| Failure::Failed(format!("{} metadata: {error}", cloud.name())))?;
+    for reason in &request.skipped {
+        emit(&format!("TD-CLOUD-METADATA-SKIPPED {reason}\n")).map_err(Failure::Failed)?;
+    }
+    if !request.keys.is_empty() {
+        saved::write_synced(
+            Path::new(ssh_policy::SSHD_METADATA_AUTHORIZED_KEYS),
+            &metadata::keys_file(&request.keys),
+            0o644,
+            Some((0, 0)),
+        )
+        .map_err(Failure::Failed)?;
+    }
+    if let Some(name) = &request.hostname {
+        let state = Path::new(DEFAULT_STATE_DIR);
+        let boundary = check_persistent(state)?;
+        make_dir(state, 0o755)?;
+        sync_directories(state, Some(&boundary))?;
+        saved::write_hostname(&state.join(HOSTNAME), name).map_err(Failure::Failed)?;
+        // Last: td-netd's daemon renders /etc/hosts when the kernel's name
+        // changes.
+        set_kernel_hostname(name)?;
+    }
+    emit(&format!(
+        "TD-CLOUD-METADATA-APPLIED {} hostname={} keys={}\n",
+        cloud.name(),
+        request
+            .hostname
+            .as_ref()
+            .map_or("-", hostname::Hostname::name),
+        request.keys.len()
+    ))
+    .map_err(Failure::Failed)
 }
 
 /// A server's instance metadata (td-svc/DESIGN.md §10, "Instance
@@ -1199,6 +1266,15 @@ fn apply_metadata() -> Result<(), Failure> {
     else {
         return emit("TD-METADATA-NONE\n").map_err(Failure::Failed);
     };
+    // Before the seed's files are parsed, so one whose content is refused
+    // still stands the cloud sources aside; a scan that fails does not.
+    saved::write_synced(
+        Path::new(metadata::NOCLOUD_MARKER),
+        format!("{device}\n").as_bytes(),
+        0o644,
+        Some((0, 0)),
+    )
+    .map_err(Failure::Failed)?;
     let request = metadata::seed_request(&meta, &user)
         .map_err(|error| Failure::Failed(format!("NoCloud seed {device}: {error}")))?;
     for reason in &request.skipped {
@@ -1723,6 +1799,11 @@ mod hostname_tests {
             Ok(Invocation::Metadata)
         ));
         assert!(parse(&["metadata".into(), "unexpected".into()]).is_err());
+        assert!(matches!(
+            parse(&["cloud-metadata".into()]),
+            Ok(Invocation::CloudMetadata)
+        ));
+        assert!(parse(&["cloud-metadata".into(), "unexpected".into()]).is_err());
     }
 }
 
@@ -1738,6 +1819,7 @@ mod tests {
             Invocation::Help
             | Invocation::Hostname
             | Invocation::Metadata
+            | Invocation::CloudMetadata
             | Invocation::CheckPrincipals(_)
             | Invocation::CheckPrimaryName(_, _)
             | Invocation::PreparePrimaryProfile(_)

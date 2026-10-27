@@ -10,8 +10,13 @@ version = "0.1.0"
 name = "td-firstboot"
 version = "0.1.0"
 dependencies = [
+ "td-fs",
  "td-tpm",
 ]
+
+[[package]]
+name = "td-fs"
+version = "0.1.0"
 
 [[package]]
 name = "td-tpm"

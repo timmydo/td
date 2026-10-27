@@ -769,9 +769,10 @@ StrictModes alone would also accept a file the account owned. The
 account therefore cannot change the file, and withdrawing
 owner-managed keys on enrollment does not reach it. The second file
 does not exist when the policy is rendered. The server's first unit,
-`td-firstboot metadata`, writes it later in the boot as root, mode
-0644 and through a rename, from instance metadata alone
-(td-svc/DESIGN.md §10, "Instance metadata"). It lives in volatile
+`td-firstboot metadata`, or `cloud-metadata` once the network is up,
+writes it later in the boot as root, mode 0644 and through a rename,
+from instance metadata alone (td-svc/DESIGN.md §10, "Instance
+metadata" and "Cloud metadata"). It lives in volatile
 `/run`, so a key in it admits the account only on a boot whose
 metadata offers it. A server ships no login-key enrollment, so it
 stays in the ordinary form unless its login state is unavailable. The

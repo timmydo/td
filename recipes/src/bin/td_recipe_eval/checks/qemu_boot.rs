@@ -30,6 +30,7 @@
 //! is absent the tool FAILS loudly rather than silently passing, so a green result
 //! always means a real boot happened.
 pub(crate) mod build_iso;
+pub(crate) mod cloud_mock;
 pub(crate) mod efi;
 pub(crate) mod encrypted;
 pub(crate) mod encrypted_boot;
@@ -724,6 +725,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         BootPlan {
             disk: None,
             seed: None,
+            cloud: None,
             mem: "256",
             target_marker: MARKER,
             kill_on_marker: true,
@@ -788,6 +790,7 @@ pub(crate) fn run_erofs(runner: &RecipeCheckRunner) -> Result<(), String> {
         BootPlan {
             disk: Some(BootDisk::new(&disk, true)),
             seed: None,
+            cloud: None,
             mem: "256",
             target_marker: EROFS_MARKER,
             kill_on_marker: true,
@@ -932,6 +935,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         BootPlan {
             disk: Some(BootDisk::new(&volume, true)),
             seed: None,
+            cloud: None,
             mem: SYSTEM_GUEST_MEMORY_MIB,
             target_marker: td_boot_protocol::SELECTED_PREVIOUS_MARKER,
             kill_on_marker: true,
@@ -1533,6 +1537,7 @@ fn boot_system_once(
         BootPlan {
             disk: Some(BootDisk::new(volume, false)),
             seed: None,
+            cloud: None,
             mem: SYSTEM_GUEST_MEMORY_MIB,
             target_marker: GREETER_MARKER,
             kill_on_marker: false,
@@ -1578,6 +1583,7 @@ fn boot_failed_target_once(
         BootPlan {
             disk: Some(BootDisk::new(volume, false)),
             seed: None,
+            cloud: None,
             mem: SYSTEM_GUEST_MEMORY_MIB,
             target_marker: SYSTEM_SHUTDOWN_MARKER,
             kill_on_marker: false,
@@ -2824,6 +2830,7 @@ pub(crate) fn run_session(runner: &RecipeCheckRunner) -> Result<(), String> {
         BootPlan {
             disk: Some(BootDisk::new(&disk, false)),
             seed: None,
+            cloud: None,
             mem: SYSTEM_GUEST_MEMORY_MIB,
             target_marker: GREETER_MARKER,
             kill_on_marker: false,
@@ -2917,6 +2924,7 @@ pub(crate) fn run_net(runner: &RecipeCheckRunner) -> Result<(), String> {
         BootPlan {
             disk: Some(BootDisk::new(&disk, false)),
             seed: None,
+            cloud: None,
             mem: SYSTEM_GUEST_MEMORY_MIB,
             target_marker: GREETER_MARKER,
             kill_on_marker: false,
@@ -3070,6 +3078,7 @@ pub(crate) fn run_kexec(runner: &RecipeCheckRunner) -> Result<(), String> {
         BootPlan {
             disk: None,
             seed: None,
+            cloud: None,
             mem: "512",
             target_marker: KEXEC_STAGE2_MARKER,
             kill_on_marker: true,
@@ -4691,6 +4700,9 @@ struct BootPlan<'a> {
     /// A NoCloud seed (`nocloud::write_seed`) on the q35 machine's AHCI
     /// optical drive beside the disk, as `cloud-localds` media is attached.
     seed: Option<&'a Path>,
+    /// A mock cloud metadata service on the user network, and the DMI
+    /// identity that sends the guest to it.
+    cloud: Option<&'a cloud_mock::CloudMock>,
     /// Guest RAM in MiB (qemu `-m`). Diskless/probe and standalone kexec boots use
     /// smaller fixed plans; system boots use `SYSTEM_GUEST_MEMORY_MIB` so repeated
     /// selector handoffs retain room after the deployment populates the page cache.
@@ -5270,6 +5282,13 @@ fn boot_source(
     } else {
         None
     };
+    if feed.is_some() && plan.cloud.is_some() {
+        return Err(
+            "the application feed's address is the default user network's, \
+                    which a mock metadata service moves"
+                .into(),
+        );
+    }
     let extra_append = match &feed {
         Some(server) => feed::append(plan.extra_append, server.endpoint()),
         None => plan.extra_append.to_string(),
@@ -5401,11 +5420,20 @@ fn boot_source(
     // listens. virtio-net-pci is the NIC the guest's VIRTIO_NET driver binds; the
     // guest autodetects it (eth0) and brings it up.
     // A host login adds its one loopback forward to the guest's sshd.
+    // A mock metadata service moves the user network to hold its address.
+    let cloud = plan
+        .cloud
+        .map(cloud_mock::CloudMock::netdev_options)
+        .unwrap_or_default();
+    if let Some(mock) = plan.cloud {
+        cmd.args(mock.smbios());
+    }
     if let Some(login) = plan.host_login {
-        cmd.arg("-netdev").arg(login.netdev()?);
+        cmd.arg("-netdev")
+            .arg(format!("{}{cloud}", login.netdev()?));
         cmd.args(["-device", QEMU_USER_NET_DEVICE]);
-    } else if plan.user_net || feed.is_some() {
-        cmd.args(["-netdev", QEMU_USER_NETDEV]);
+    } else if plan.user_net || feed.is_some() || plan.cloud.is_some() {
+        cmd.arg("-netdev").arg(format!("{QEMU_USER_NETDEV}{cloud}"));
         cmd.args(["-device", QEMU_USER_NET_DEVICE]);
     } else {
         // -nic none: offline; qemu's default is a user-mode NIC, so disable it.
@@ -13663,6 +13691,7 @@ mod tests {
         let plan = |append: &'static str, read_only: bool| BootPlan {
             disk: Some(BootDisk::new(&medium, read_only)),
             seed: None,
+            cloud: None,
             mem: "64",
             target_marker: "never",
             kill_on_marker: false,
@@ -13748,6 +13777,7 @@ mod tests {
             let plan = BootPlan {
                 disk: None,
                 seed: None,
+                cloud: None,
                 mem: "64",
                 target_marker: "never",
                 kill_on_marker: false,

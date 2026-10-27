@@ -11675,18 +11675,20 @@ chmod 755 '{}'
         assert!(seen >= 5, "the runner modules were not found ({seen})");
 
         // The evaluator's own dispatch reaches the harnesses only for the
-        // two host commands it routes to them directly.
+        // three host commands it routes to them directly, one of them the
+        // mock metadata service the host's QEMU runs.
         let main = fs::read_to_string(bin.join("td-recipe-eval.rs")).unwrap();
         let routed: Vec<String> = named_lines(&main)
             .into_iter()
             .filter(|(_, found)| !found.is_empty())
             .map(|(l, _)| l.trim().to_string())
             .collect();
-        assert_eq!(routed.len(), 2, "{routed:?}");
+        assert_eq!(routed.len(), 3, "{routed:?}");
         assert!(routed
             .iter()
             .all(|l| l.contains("checks::qemu_boot::test_iso::cli")
-                || l.contains("checks::qemu_boot::update::run_cli")));
+                || l.contains("checks::qemu_boot::update::run_cli")
+                || l.contains("checks::qemu_boot::cloud_mock::serve_cli")));
 
         let src = fs::read_to_string(eval.join("check_runner.rs")).unwrap();
         let (production, _) = src

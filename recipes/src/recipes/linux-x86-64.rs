@@ -476,7 +476,11 @@ pub fn recipe() -> Recipe {
     //    x2APIC needs, has had no symbol of its own since 7.2: HYPERV
     //    builds drivers/iommu/hyperv/ and the pinned IRQ_REMAP its
     //    hv-irq-remap-x86.o, so the HYPERV and IRQ_REMAP guards hold it.
-    //    HYPERV_TIMER has no prompt and is guarded only.
+    //    HYPERV_TIMER has no prompt and is guarded only. DMIID exports the
+    //    firmware's DMI identity in /sys/class/dmi/id, by which a server
+    //    tells which cloud's metadata service to ask (td-svc/DESIGN.md §10,
+    //    "Cloud metadata"); DMI itself prompts only under EXPERT, so it is
+    //    guarded.
     //    Unasked: KVM_GUEST selects PARAVIRT_CLOCK, ARCH_CPUIDLE_HALTPOLL and
     //    X86_HV_CALLBACK_VECTOR and defaults in HALTPOLL_CPUIDLE (CPU_IDLE is
     //    on) with CPU_IDLE_GOV_HALTPOLL, inert without KVM_HINTS_REALTIME,
@@ -622,6 +626,7 @@ pub fn recipe() -> Recipe {
                   /^#? *CONFIG_SCSI_VIRTIO[ =]/d; \
                   /^#? *CONFIG_NET_VENDOR_GOOGLE[ =]/d; \
                   /^#? *CONFIG_GVE[ =]/d; \
+                  /^#? *CONFIG_DMIID[ =]/d; \
                   /^#? *CONFIG_INPUT[ =]/d; \
                   /^#? *CONFIG_INPUT_EVDEV[ =]/d; \
                   /^#? *CONFIG_INPUT_KEYBOARD[ =]/d; \
@@ -854,6 +859,7 @@ pub fn recipe() -> Recipe {
                    'CONFIG_SCSI_VIRTIO=y' \
                    'CONFIG_NET_VENDOR_GOOGLE=y' \
                    'CONFIG_GVE=y' \
+                   'CONFIG_DMIID=y' \
                    'CONFIG_INPUT=y' \
                    'CONFIG_INPUT_EVDEV=y' \
                    'CONFIG_INPUT_KEYBOARD=y' \
@@ -1249,6 +1255,8 @@ pub fn recipe() -> Recipe {
                  grep -q '^CONFIG_SCSI_VIRTIO=y' .config || { echo 'SCSI_VIRTIO off — a GCE persistent disk on virtio-scsi is invisible' >&2; exit 1; }; \
                  grep -q '^CONFIG_NET_VENDOR_GOOGLE=y' .config || { echo 'NET_VENDOR_GOOGLE off — the Google NIC drivers stay hidden' >&2; exit 1; }; \
                  grep -q '^CONFIG_GVE=y' .config || { echo 'GVE off — a GCE machine series that requires gVNIC has no network' >&2; exit 1; }; \
+                 grep -q '^CONFIG_DMI=y' .config || { echo 'DMI off — the firmware tables that name a cloud are not scanned' >&2; exit 1; }; \
+                 grep -q '^CONFIG_DMIID=y' .config || { echo 'DMIID off — /sys/class/dmi/id is missing, so a server cannot tell which cloud it runs on' >&2; exit 1; }; \
                  grep -q '^CONFIG_HYPERV_TIMER=y' .config || { echo 'HYPERV_TIMER off — an Azure VM has no Hyper-V clocksource. It is unprompted (def_bool HYPERV && X86), so something took HYPERV away' >&2; exit 1; }; \
                  if grep -q '^CONFIG_IPC_NS=y' .config; then echo 'IPC_NS on — it is default y behind SYSVIPC||POSIX_MQUEUE, so pinning either brings it along unasked; td-jail omits CLONE_NEWIPC and APPLICATIONS.md §0 defers it deliberately' >&2; exit 1; fi".replace("@EFI_CMDLINE@", &format!("{:?}", crate::shared::efi_default_cmdline())),
             ],
@@ -1776,6 +1784,7 @@ mod tests {
             "SCSI_VIRTIO",
             "NET_VENDOR_GOOGLE",
             "GVE",
+            "DMIID",
         ] {
             let pin = format!("'CONFIG_{symbol}=y'");
             let stale = format!("/^#? *CONFIG_{symbol}[ =]/d;");
@@ -1790,6 +1799,8 @@ mod tests {
         assert!(!text.contains("CONFIG_HYPERV_TIMER[ =]/d"));
         assert!(!text.contains("'CONFIG_HYPERV_TIMER=y'"));
         assert!(text.contains("grep -q '^CONFIG_HYPERV_TIMER=y' .config"));
+        assert!(!text.contains("'CONFIG_DMI=y'"));
+        assert!(text.contains("grep -q '^CONFIG_DMI=y' .config"));
         // EC2 presents EBS as NVMe; x2APIC is pinned for the T14s.
         assert!(text.contains("'CONFIG_BLK_DEV_NVME=y'"));
         assert!(text.contains("grep -q '^CONFIG_X86_X2APIC=y' .config"));

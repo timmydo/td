@@ -15,6 +15,9 @@ const MOUNT_PROGRAM: &str = "/bin/mount";
 const UMOUNT_PROGRAM: &str = "/bin/umount";
 /// Where the seed is mounted read-only while its two files are read.
 const MOUNT_POINT: &str = "/run/td-metadata-seed";
+/// Written once a seed is found, so the cloud sources stand aside: the
+/// seed is the instance's metadata, as cloud-init's NoCloud is first.
+pub(crate) const NOCLOUD_MARKER: &str = "/run/td-metadata-nocloud";
 const META_DATA: &str = "meta-data";
 const USER_DATA: &str = "user-data";
 /// Each seed file, and the keys file written from them.
@@ -305,8 +308,22 @@ pub(crate) fn request(meta: Option<&str>, user: Option<&str>) -> Result<Request,
             }
         }
     }
-    // The first label, as cloud-init sets by default, of the first name
-    // offered that has a valid one; each one passed over is said.
+    Ok(admit(&names, offered, request.skipped))
+}
+
+/// What a source offered, held to the rules every source shares: the
+/// hostname is the first label, as cloud-init sets by default, of the
+/// first `(source, name)` with a valid one, each passed over said; keys
+/// are plain Ed25519 lines, one per blob and at most `MAX_KEYS`.
+pub(crate) fn admit(
+    names: &[(&str, String)],
+    offered: Vec<String>,
+    skipped: Vec<String>,
+) -> Request {
+    let mut request = Request {
+        skipped,
+        ..Request::default()
+    };
     for (source, name) in names.iter().filter(|(_, name)| !name.is_empty()) {
         let name = name.to_ascii_lowercase();
         match crate::hostname::Hostname::parse(name.split('.').next().unwrap_or_default()) {
@@ -338,7 +355,7 @@ pub(crate) fn request(meta: Option<&str>, user: Option<&str>) -> Result<Request,
             .skipped
             .push(format!("{surplus} key(s) past the first {MAX_KEYS}"));
     }
-    Ok(request)
+    request
 }
 
 /// A document whose first content is a flow mapping, as JSON is.

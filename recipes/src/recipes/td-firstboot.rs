@@ -118,6 +118,8 @@ const MODULES: &[(&str, &str)] = &[
         include_str!("../../../td-firstboot/src/metadata.rs"),
     ),
     ("encoding", include_str!("../../../td-encoding/src/lib.rs")),
+    ("http", include_str!("../../../td-firstboot/src/http.rs")),
+    ("cloud", include_str!("../../../td-firstboot/src/cloud.rs")),
     (
         "mounts",
         include_str!("../../../td-firstboot/src/mounts.rs"),

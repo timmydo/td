@@ -495,6 +495,13 @@ fn main() {
                 die_runner(&e);
             }
         }
+        // Run by QEMU's user network, once per guest connection.
+        Some("cloud-mock") => {
+            let rest = args.get(2..).unwrap_or(&[]);
+            if let Err(error) = checks::qemu_boot::cloud_mock::serve_cli(rest) {
+                die(&error);
+            }
+        }
         Some("qemu-boot-server") => {
             let rest = args.get(2..).unwrap_or(&[]);
             if let Err(e) = check_runner::qemu_boot_server_cli(rest) {

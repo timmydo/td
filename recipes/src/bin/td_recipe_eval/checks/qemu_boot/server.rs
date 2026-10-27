@@ -18,8 +18,9 @@
 //! a disk image for a provisioned account, cold-booted by UEFI firmware from
 //! its ESP with no command line injected, to the steady state and the
 //! host's SSH logins. That boot carries a NoCloud seed, whose hostname it
-//! takes and whose key admits the provisioned account; every other boot
-//! has none, and the seed's key is refused.
+//! takes and whose key admits the provisioned account. The acknowledged
+//! boot instead reads a mock EC2 IMDSv2 its DMI names, with the same
+//! effect. Every other boot has neither, and the metadata key is refused.
 //!
 //! The failing boots exercise one of healthwatch's inputs, a health
 //! transaction that ended without a record (the fail-target token). A
@@ -29,6 +30,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use super::cloud_mock::{self, CloudMock};
 use super::host_login::HostLogin;
 use super::nocloud;
 use super::server_image::{self, Format, ImageInputs};
@@ -69,6 +71,9 @@ const ISO_ACCOUNT: &str = "hedy";
 /// The hostname the disk image's seed names, not the image's default.
 const SEED_HOSTNAME: &str = "td-seeded";
 const METADATA_NONE_MARKER: &str = "TD-METADATA-NONE";
+const CLOUD_METADATA_NONE_MARKER: &str = "TD-CLOUD-METADATA-NONE";
+/// A boot with no seed and no cloud.
+const UNSEEDED: &[&str] = &[METADATA_NONE_MARKER, CLOUD_METADATA_NONE_MARKER];
 /// A live boot's volume is half of RAM, as `qemu-boot-live` gives it.
 const LIVE_MEMORY_MIB: &str = "4096";
 
@@ -106,23 +111,32 @@ impl Boot<'_> {
     /// One boot past the health acknowledgement to healthwatch's steady
     /// state, which ends it.
     fn healthy(&self, tokens: &str, label: &str) -> Result<BootResult, String> {
-        self.run(tokens, HEALTH_STEADY_MARKER, true, None, label)
+        self.run(tokens, HEALTH_STEADY_MARKER, true, None, None, label)
     }
 
-    /// `healthy`, then the host's SSH logins before the boot ends.
+    /// `healthy` on a cloud `mock`, then the host's SSH logins before the
+    /// boot ends.
     fn healthy_with_login(
         &self,
         tokens: &str,
         login: &HostLogin,
+        mock: &CloudMock,
         label: &str,
     ) -> Result<BootResult, String> {
-        self.run(tokens, HEALTH_STEADY_MARKER, true, Some(login), label)
+        self.run(
+            tokens,
+            HEALTH_STEADY_MARKER,
+            true,
+            Some(login),
+            Some(mock),
+            label,
+        )
     }
 
     /// One boot that must end itself: health fails, healthwatch reboots,
     /// and QEMU (`-no-reboot`) exits.
     fn failing(&self, tokens: &str, label: &str) -> Result<BootResult, String> {
-        self.run(tokens, HEALTH_REBOOT_MARKER, false, None, label)
+        self.run(tokens, HEALTH_REBOOT_MARKER, false, None, None, label)
     }
 
     fn run(
@@ -131,6 +145,7 @@ impl Boot<'_> {
         target: &str,
         kill_on_marker: bool,
         host_login: Option<&HostLogin>,
+        cloud: Option<&CloudMock>,
         label: &str,
     ) -> Result<BootResult, String> {
         let result = boot_headless(
@@ -140,6 +155,7 @@ impl Boot<'_> {
             BootPlan {
                 disk: Some(BootDisk::new(self.volume, false)),
                 seed: None,
+                cloud,
                 mem: SYSTEM_GUEST_MEMORY_MIB,
                 target_marker: target,
                 kill_on_marker,
@@ -238,12 +254,17 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     // The healthy sequence: install, then a pending candidate that records
     // health, then the same deployment acknowledged.
     let install = boot.healthy(&install_tokens, "install boot")?;
-    validate_healthy(&install, Identity::Fresh, "install boot")?;
+    validate_healthy(&install, Identity::Fresh, "install boot", UNSEEDED)?;
     validate_install(&install, &fixture.initial_id, "install boot")?;
     check_persistent_volume(&btrfs, &volume)?;
 
     let pending = boot.healthy(&healthy_tokens, "pending candidate boot")?;
-    validate_healthy(&pending, Identity::Reused, "pending candidate boot")?;
+    validate_healthy(
+        &pending,
+        Identity::Reused,
+        "pending candidate boot",
+        UNSEEDED,
+    )?;
     require_selected_deployment(
         &pending,
         td_boot_protocol::SELECTED_CURRENT_MARKER,
@@ -260,9 +281,37 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     check_persistent_volume(&btrfs, &volume)?;
 
     // The provisioned account is the primary, and the host logs in as it
-    // with the provisioned key and is refused with any other.
-    let acknowledged = boot.healthy_with_login(&healthy_tokens, &login, "acknowledged boot")?;
-    validate_healthy(&acknowledged, Identity::Reused, "acknowledged boot")?;
+    // with the provisioned key, and with the key EC2's metadata offers, and
+    // is refused with any other.
+    let imds = runner.scratch_dir().join("server-imds");
+    match fs::remove_dir_all(&imds) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            return Err(format!("remove stale {}: {error}", imds.display()));
+        }
+        _ => {}
+    }
+    let mock = CloudMock::ec2(&imds, &login.seed_key()?)?;
+    let acknowledged =
+        boot.healthy_with_login(&healthy_tokens, &login, &mock, "acknowledged boot")?;
+    let applied = format!(
+        "TD-CLOUD-METADATA-APPLIED ec2 hostname={} keys=1",
+        cloud_mock::HOSTNAME_LABEL
+    );
+    validate_healthy(
+        &acknowledged,
+        Identity::Reused,
+        "acknowledged boot",
+        &[METADATA_NONE_MARKER, &applied],
+    )?;
+    let requests = mock.requests()?;
+    if requests != cloud_mock::EXPECTED {
+        return Err(format!(
+            "the acknowledged boot should have asked the mock IMDS for a token and then \
+             {:?} with it, but asked {requests:?}",
+            cloud_mock::EXPECTED
+        ));
+    }
+    fs::remove_dir_all(&imds).map_err(|error| format!("remove {}: {error}", imds.display()))?;
     login.verdict(acknowledged.evidence.host_key.as_deref())?;
     // The run's private keys are kept only for a failure's diagnosis.
     fs::remove_dir_all(&client).map_err(|error| format!("remove {}: {error}", client.display()))?;
@@ -289,6 +338,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         &failure_install,
         Identity::Fresh,
         "failure-sequence install boot",
+        UNSEEDED,
     )?;
     validate_install(
         &failure_install,
@@ -363,12 +413,14 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
          records health ({SYSTEM_BOOT_SUCCESS_MARKER}, then {HEALTH_STEADY_MARKER}) with the \
          same host identity and is then \
          current, where the host logs in over SSH as the provisioned account {ACCOUNT:?} with \
-         its provisioned key, on the host key the console reported, and is refused as root \
+         its provisioned key and with the key a mock EC2 IMDSv2 offers, which also names \
+         the host, on the host key the console reported, and is refused as root \
          and with another key; one whose every attempt fails health is rebooted by healthwatch \
          ({HEALTH_REBOOT_MARKER}, {SYSTEM_SHUTDOWN_MARKER}) until td-boot falls back to the \
          previous deployment unattended; and the disk image and live medium server-image \
          composes, each for its own account ({IMAGE_ACCOUNT:?}, {ISO_ACCOUNT:?}), cold-boot \
-         under UEFI firmware to the same steady state and logins. Every healthy boot reports the read-only root and \
+         under UEFI firmware to the same steady state and logins, the disk image named and \
+         keyed by its NoCloud seed. Every healthy boot reports the read-only root and \
          /etc, writable state, OpenSSH loopback ({SSHD_MARKER}) and root's refusal \
          ({ROOT_SSH_REFUSED_MARKER}), the userland and confinement probes, and no greeter, \
          compositor, session bus or application"
@@ -479,6 +531,7 @@ fn image_boot(
             // to RAM; the disk image takes its own boot's writes.
             disk: Some(BootDisk::new(&disk, form == Published::Iso)),
             seed: seed.as_deref(),
+            cloud: None,
             mem,
             target_marker: HEALTH_STEADY_MARKER,
             kill_on_marker: true,
@@ -569,25 +622,31 @@ fn image_boot(
     no_desktop(&result, label)?;
     match form {
         Published::Disk => validate_seeded(&result, label)?,
-        Published::Iso => validate_unseeded(&result, label)?,
+        Published::Iso => validate_metadata(&result, label, UNSEEDED)?,
     }
     login.verdict(evidence.host_key.as_deref())?;
     fs::remove_dir_all(&dir).map_err(|error| format!("remove {}: {error}", dir.display()))
 }
 
 /// The seed, the only drive on q35's AHCI, was read once, its hostname
-/// taken and applied, one key written and the RSA key skipped.
+/// taken and applied, one key written and the RSA key skipped, and the
+/// cloud sources stood aside.
 fn validate_seeded(result: &BootResult, label: &str) -> Result<(), String> {
     let expected = [
         "TD-METADATA-SKIPPED 1 key(s) other than plain ssh-ed25519".to_string(),
         format!("TD-METADATA-APPLIED nocloud /dev/sr0 hostname={SEED_HOSTNAME} keys=1"),
         format!("TD-HOSTNAME-READY {SEED_HOSTNAME}"),
+        "TD-CLOUD-METADATA-SKIPPED nocloud".to_string(),
     ];
     let metadata: Vec<&str> = result
         .console
         .lines()
         .map(str::trim_end)
-        .filter(|line| line.starts_with("TD-METADATA-") || line.starts_with("TD-HOSTNAME-READY "))
+        .filter(|line| {
+            line.starts_with("TD-METADATA-")
+                || line.starts_with("TD-CLOUD-METADATA-")
+                || line.starts_with("TD-HOSTNAME-READY ")
+        })
         .collect();
     if metadata != expected {
         return Err(format!(
@@ -599,19 +658,18 @@ fn validate_seeded(result: &BootResult, label: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// No seed, so nothing applied: the metadata agent said so once.
-fn validate_unseeded(result: &BootResult, label: &str) -> Result<(), String> {
+/// What the two metadata units reported, in order: `expected`.
+fn validate_metadata(result: &BootResult, label: &str, expected: &[&str]) -> Result<(), String> {
     let metadata: Vec<&str> = result
         .console
         .lines()
         .map(str::trim_end)
-        .filter(|line| line.starts_with("TD-METADATA-"))
+        .filter(|line| line.starts_with("TD-METADATA-") || line.starts_with("TD-CLOUD-METADATA-"))
         .collect();
-    if metadata != [METADATA_NONE_MARKER] {
+    if metadata != expected {
         return Err(format!(
-            "the {label} attached no NoCloud seed, so should have reported \
-             {METADATA_NONE_MARKER:?} alone, but reported {metadata:?}. Last serial \
-             output:\n{}",
+            "the {label} should have reported {expected:?} from its metadata units, but \
+             reported {metadata:?}. Last serial output:\n{}",
             tail(&result.console, 80)
         ));
     }
@@ -652,11 +710,17 @@ fn no_attempt_state(result: &BootResult, label: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// `validate_health` for a boot that selected current unambiguously.
-fn validate_healthy(result: &BootResult, identity: Identity, label: &str) -> Result<(), String> {
+/// `validate_health` for a boot that selected current unambiguously, and
+/// reported `metadata`.
+fn validate_healthy(
+    result: &BootResult,
+    identity: Identity,
+    label: &str,
+    metadata: &[&str],
+) -> Result<(), String> {
     validate_primary_selection(result, label)?;
     validate_health(result, identity, label)?;
-    validate_unseeded(result, label)
+    validate_metadata(result, label, metadata)
 }
 
 /// What a healthy server boot printed, and what it must not have.

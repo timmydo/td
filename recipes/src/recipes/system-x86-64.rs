@@ -1450,6 +1450,7 @@ const SERVER_TD_SVC_UNITS: &[&str] = &[
     "profiler-evidence",
     "netup",
     "network",
+    "cloud-metadata",
     "bootsuccess",
     "healthwatch",
     "sshd",
@@ -1478,6 +1479,9 @@ mod svc_timeouts {
     /// A scan of the block devices, one read-only seed mount, two reads of
     /// at most 64 KiB and two small synced writes.
     pub const METADATA: u32 = 60;
+    /// One 150-second deadline over every request to a link-local
+    /// service, then two small synced writes.
+    pub const CLOUD_METADATA: u32 = 300;
     /// Mints the per-machine identity: ed25519 keygen, writes to /var, then sync.
     pub const FIRSTBOOT: u32 = 300;
     /// Dozens of greps over /proc/mounts, two `exec-primary` runs, and write probes.
@@ -1674,10 +1678,17 @@ fn build_server_td_svc_conf() -> String {
          log=/var/log/svc/network.log\n\
          console=yes\n\
          \n\
+         # Before bootsuccess, whose hostname check it may change.\n\
+         [cloud-metadata]\n\
+         type=oneshot\n\
+         exec=/bin/td-firstboot cloud-metadata\n\
+         after=netup\n\
+         timeout={cloud_metadata}\n\
+         \n\
          [bootsuccess]\n\
          type=oneshot\n\
          exec=/etc/bootsuccess\n\
-         after={sysinit},profiler-evidence,sshd\n\
+         after={sysinit},profiler-evidence,sshd,cloud-metadata\n\
          requires=sshd,hostname\n\
          timeout={bootsuccess}\n\
          \n\
@@ -1704,6 +1715,7 @@ fn build_server_td_svc_conf() -> String {
         firstboot = svc_timeouts::FIRSTBOOT,
         rootcheck = svc_timeouts::ROOTCHECK,
         netup = svc_timeouts::NETUP,
+        cloud_metadata = svc_timeouts::CLOUD_METADATA,
         bootsuccess = svc_timeouts::BOOTSUCCESS,
         healthwatch = svc_timeouts::HEALTHWATCH,
         profiler_uid = PROFILER_UID,
@@ -5729,7 +5741,8 @@ fn shape_check(sys: &SystemDef) -> String {
      hn=$(svcpos hostname); fb=$(svcpos td-firstboot); rc=$(svcpos rootcheck); pf=$(svcpos profiler); pe=$(svcpos profiler-evidence); st=$(svcpos seat); au=$(svcpos audio); nu=$(svcpos netup); wl=$(svcpos wayland); tm=$(svcpos terminal); ff=$(svcpos firefox); fe=$(svcpos firefox-evidence); bs=$(svcpos bootsuccess); sd=$(svcpos sshd); gr=$(svcpos greeter); bd=$(svcpos busd); po=$(svcpos portal); pv=$(svcpos portal-evidence); \
      @}DESKTOP@\
      @SERVER{@\
-     md=$(svcpos metadata); hn=$(svcpos hostname); fb=$(svcpos td-firstboot); rc=$(svcpos rootcheck); pf=$(svcpos profiler); pe=$(svcpos profiler-evidence); nu=$(svcpos netup); bs=$(svcpos bootsuccess); hw=$(svcpos healthwatch); sd=$(svcpos sshd); \
+     md=$(svcpos metadata); hn=$(svcpos hostname); fb=$(svcpos td-firstboot); rc=$(svcpos rootcheck); pf=$(svcpos profiler); pe=$(svcpos profiler-evidence); nu=$(svcpos netup); cm=$(svcpos cloud-metadata); bs=$(svcpos bootsuccess); hw=$(svcpos healthwatch); sd=$(svcpos sshd); \
+     [ \"$nu\" -lt \"$cm\" ] && [ \"$cm\" -lt \"$bs\" ] || { echo 'td-svc would not serialize netup -> cloud-metadata -> bootsuccess - the metadata service needs the lease, and health checks the hostname it may set' >&2; exit 1; }; \
      [ \"$md\" -lt \"$hn\" ] || { echo 'td-svc would start hostname before metadata - a seeded name must be saved before the hostname unit applies it' >&2; exit 1; }; \
      @}SERVER@\
      [ \"$hn\" -lt \"$fb\" ] || { echo 'td-svc would not serialize hostname before td-firstboot - init ran every sysinit line to completion before the next, and td-svc starts settled units in the same pass' >&2; exit 1; }; \
@@ -16699,6 +16712,17 @@ mod server_tests {
                 assert!(!desktop.iter().any(|(unit, _)| unit == name));
                 continue;
             }
+            if name == "cloud-metadata" {
+                assert_eq!(value(keys, "type"), Some("oneshot"));
+                assert_eq!(
+                    value(keys, "exec"),
+                    Some("/bin/td-firstboot cloud-metadata")
+                );
+                assert_eq!(value(keys, "after"), Some("netup"));
+                assert_eq!(value(keys, "requires"), None);
+                assert!(!desktop.iter().any(|(unit, _)| unit == name));
+                continue;
+            }
             if name == "healthwatch" {
                 assert_eq!(value(keys, "type"), Some("oneshot"));
                 assert_eq!(value(keys, "exec"), Some("/etc/healthwatch"));
@@ -16725,7 +16749,10 @@ mod server_tests {
                     assert_eq!(value(keys, "requires"), Some("sshd,hostname"));
                     assert_eq!(
                         value(keys, "after"),
-                        Some("hostname,td-firstboot,rootcheck,netup,profiler-evidence,sshd")
+                        Some(
+                            "hostname,td-firstboot,rootcheck,netup,profiler-evidence,sshd,\
+                             cloud-metadata"
+                        )
                     );
                     assert_eq!(
                         except(keys, &["after", "requires"]),

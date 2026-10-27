@@ -8948,8 +8948,9 @@ on a root intake. The client tells its caller, and the attention menu's
 row tells the person, that a hostname change waits; that notice grants
 nothing. The prompt shows the old name beside the new one. After consent
 `/etc/hostname`, a link to the written file, reads the new name at once.
-The kernel name, `/etc/hosts` (td-netd writes it only from its boot-time
-`loopback` and `up` runs) and every application jail (td-jail copies the
+The kernel name, `/etc/hosts` (td-netd writes it from its boot-time
+`loopback` and `up` runs, and its daemon again only when the kernel name
+changes) and every application jail (td-jail copies the
 kernel name) keep the old name until the next boot, whose `hostname`
 unit activates the new one and reports `TD-HOSTNAME-READY NAME`. Until
 that restart `/etc/hostname` and the kernel name disagree, and the

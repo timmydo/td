@@ -1607,14 +1607,16 @@ reserves the primary session's identities, which the account preflight
 requires; no account holds them. Its table is the desktop's units
 restricted to what a headless machine needs: hostname, td-firstboot,
 rootcheck, the profiler and its evidence, netup, network, sshd and
-bootsuccess, plus the server's own metadata and healthwatch. Each
-shared unit is the desktop's stanza key for key, which a recipe test
-holds, except three. hostname is ordered after metadata, which may
-save the name it applies ("Instance metadata" below). td-firstboot
-provisions the identity alone, with no application homes or session
-principals. bootsuccess requires sshd's readiness and the hostname
-instead of graphical readiness, so a candidate whose only way in does
-not listen is never acknowledged.
+bootsuccess, plus the server's own metadata, cloud-metadata and
+healthwatch. Each shared unit is the desktop's stanza key for key,
+which a recipe test holds, except three. hostname is ordered after
+metadata, which may save the name it applies ("Instance metadata"
+below). td-firstboot provisions the identity alone, with no
+application homes or session principals. bootsuccess requires sshd's
+readiness and the hostname instead of graphical readiness, so a
+candidate whose only way in does not listen is never acknowledged,
+and waits for cloud-metadata, which may change the hostname it checks
+("Cloud metadata").
 
 The server has no greeter. No unit holds `tty=`, no console logs anyone
 in, and ttyS0 carries only boot output. Without a greeter there is no
@@ -1653,7 +1655,8 @@ gets is rebooted by healthwatch, until the previous deployment is
 selected.
 
 The shape check asserts the server's start order — metadata before
-hostname, profiler evidence and sshd before bootsuccess, and
+hostname, cloud-metadata between netup and bootsuccess, profiler
+evidence and sshd before bootsuccess, and
 healthwatch after it, plus the sysinit edges both profiles share. It
 also sweeps `/bin` for every name the desktop links and the server
 does not, a list derived from both profiles' staging rather than
@@ -1752,9 +1755,9 @@ defaults to 1460, and no classless static routes (option 121), which
 none of the three needs for a default route. Nothing handles the ACPI
 power button, so a cloud's stop waits out its grace period and then
 cuts power, and Hyper-V's integration services (shutdown, heartbeat,
-KVP and time sync, which need CONNECTOR) are not built. Only a
-NoCloud seed's metadata is read ("Instance metadata"): EC2's and
-Azure's metadata services are not, so on those clouds the account,
+KVP and time sync, which need CONNECTOR) are not built. A NoCloud
+seed's and EC2's metadata are read ("Instance metadata", "Cloud
+metadata"); Azure's and GCE's services are not, so on those clouds the
 keys and hostname are the image's own.
 
 ### Instance metadata
@@ -1833,11 +1836,70 @@ td-seeded`, and the run's key must log in as the image's account.
 Every other boot attaches none and must report `TD-METADATA-NONE`, and
 each one that logs in must refuse that key.
 
-Not yet: EC2's IMDSv2, Azure's IMDS and the wireserver's ready report,
-seeds named by the kernel command line or fetched over the network,
-`vendor-data`, and every other cloud-config key, `fqdn` and
+Not yet: seeds named by the kernel command line or fetched over the
+network, `vendor-data`, and every other cloud-config key, `fqdn` and
 `preserve_hostname` among them: where cloud-init would take `fqdn`'s
 label or keep the name, td takes `local-hostname`'s.
+
+### Cloud metadata
+
+The `cloud-metadata` oneshot (`td-firstboot cloud-metadata`) runs
+after netup, and bootsuccess waits for it. It stands aside when a
+NoCloud seed was found (`/run/td-metadata-nocloud`), as cloud-init's
+NoCloud comes before its cloud sources, and reports
+`TD-CLOUD-METADATA-SKIPPED nocloud`. Otherwise the firmware's DMI
+names the cloud: `/sys/class/dmi/id`, which linux-x86-64 builds with
+DMIID. A machine no cloud's DMI names asks nothing and reports
+`TD-CLOUD-METADATA-NONE`, so a laptop or a QEMU guest never waits on a
+service that is not there.
+
+EC2 is a system vendor of `Amazon EC2`, which its Nitro instances
+carry. Its IMDSv2 at 169.254.169.254 issues a session token for a PUT
+to `/latest/api/token`, and every request after it carries the token.
+IMDSv1's tokenless requests are never made, so an instance that
+requires IMDSv2 works. A std-only HTTP/1.1 client retries each request
+whose connection fails, or that is answered 5xx or 429, until one
+deadline 150 seconds after the first: long enough for the network
+daemon to take the lease when netup's DHCP gave up. Each attempt
+connects, sends and reads to the response's end within two seconds,
+and each response is bounded at 256 KiB. `local-hostname` gives the
+hostname and each
+`public-keys/N/openssh-key` a key, both held to the seed's rules
+("Instance metadata"). EC2's key pairs are often RSA, which is
+skipped and counted. The keys go to the same
+`/run/td-metadata-authorized-keys`. The hostname is saved and then
+set, so health's comparison of `/etc/hostname` with the kernel's name
+holds, and the network daemon, `td-netd watch`, which alone writes
+`/etc/hosts` once netup has run, renders it for the kernel's new name
+at its next poll, normally within a quarter second, and retries a
+render that fails. Once a token is issued its GETs have at least 30
+seconds, however late it came.
+On the first boot the `hostname` unit has already applied the image's
+default, before the network was up. The console reports each skip as
+`TD-CLOUD-METADATA-SKIPPED` and then `TD-CLOUD-METADATA-APPLIED ec2
+hostname=NAME keys=N`. A service that does not answer fails the unit
+and changes nothing; health does not require it.
+
+Whoever controls the metadata service can admit a key: on EC2, the
+account that launched the instance with its key pair, which is fixed
+for the instance's life. A machine that is not EC2 but whose firmware
+claims to be, and whose network answers at 169.254.169.254, is one
+whose hypervisor or physical holder chose that
+(td-login/THREAT-MODEL.md §1).
+
+`qemu-boot-server`'s acknowledged boot carries EC2's system vendor.
+QEMU's user network, moved to 168.0.0.0/7 so that libslirp may
+forward 169.254.169.254, runs `td-recipe-eval cloud-mock` for each
+connection there. The mock answers as IMDSv2 does, refusing a GET
+without its token, with the full name `td-ec2-host.ec2.internal` and a
+key made for the run. The boot must report the name's first label
+and one key applied, the mock must have seen the token requested first
+and every later request carry it (a retried request counts once), and
+the run's key must log in as the provisioned account.
+
+Not yet: Azure's IMDS and the wireserver's ready report, GCE's
+metadata server, EC2's user-data, its IPv6 endpoint, and its Xen
+instance types, whose DMI names `Xen`.
 
 ## 11. Evicting a previous supervisor's services
 

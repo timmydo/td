@@ -10,7 +10,8 @@ pub const SSHD_USER_AUTHORIZED_KEYS: &str = ".ssh/authorized_keys";
 /// account; only a server's policy names them (td-login/TOKEN-LOGIN.md, "SSH").
 pub const SSHD_PROVISIONED_AUTHORIZED_KEYS: &str = "/var/lib/td/authorized-keys";
 /// Root-owned keys a server's instance metadata offered this boot, which
-/// `td-firstboot metadata` writes after this policy is rendered.
+/// `td-firstboot metadata` or `cloud-metadata` writes after this policy is
+/// rendered.
 pub const SSHD_METADATA_AUTHORIZED_KEYS: &str = "/run/td-metadata-authorized-keys";
 pub const OPENSSH_KEX_ALGORITHMS: &str =
     "mlkem768x25519-sha256,sntrup761x25519-sha512,curve25519-sha256";

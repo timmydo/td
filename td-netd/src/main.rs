@@ -803,15 +803,27 @@ fn autodetect_iface() -> Option<String> {
 fn prepare_loopback() -> io::Result<UdpSocket> {
     // The static table is valid without an external network, and makes the
     // loopback operation sufficient for callers that immediately use localhost.
-    let hpath = hosts_path();
-    fs::write(&hpath, render_hosts(&read_hostname()))
-        .map_err(|e| io::Error::new(e.kind(), format!("write {hpath}: {e}")))?;
+    write_hosts(&read_hostname())?;
 
     // An AF_INET datagram socket serves only as the ioctl handle for the
     // interface-config calls (no packet is ever sent on it).
     let ctl = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))?;
     set_loopback_up(ctl.as_raw_fd())?;
     Ok(ctl)
+}
+
+fn write_hosts(hostname: &str) -> io::Result<()> {
+    let hpath = hosts_path();
+    fs::write(&hpath, render_hosts(hostname))
+        .map_err(|e| io::Error::new(e.kind(), format!("write {hpath}: {e}")))
+}
+
+/// The kernel's name, which only the boot's hostname activation and a
+/// server's cloud metadata set.
+fn kernel_hostname() -> Option<String> {
+    fs::read_to_string("/proc/sys/kernel/hostname")
+        .ok()
+        .map(|name| name.trim().to_owned())
 }
 
 fn cmd_loopback() -> io::Result<ExitCode> {
@@ -1182,6 +1194,9 @@ fn note(shared: bool, message: &str) {
 
 fn cmd_watch(wifi_owner: Option<u32>) -> io::Result<ExitCode> {
     let _lock = network_lock()?;
+    // Read first: a name set after it is seen in the loop, and one set
+    // before it was saved to /etc/hostname, which the table renders.
+    let mut kernel_name = kernel_hostname();
     let ctl = prepare_loopback()?;
     let fd = ctl.as_raw_fd();
     let mut active = read_handoff()?;
@@ -1351,6 +1366,22 @@ fn cmd_watch(wifi_owner: Option<u32>) -> io::Result<ExitCode> {
         let wired = active
             .as_ref()
             .is_some_and(|(name, _, _)| wifi.interface() != Some(name.as_str()));
+        // A server's cloud metadata renames the host once the network is
+        // up; a consented rename (set-hostname) waits for the next boot.
+        let name = kernel_hostname();
+        // A failed render keeps the old name, so the next pass retries it.
+        if name != kernel_name {
+            match name.as_deref().filter(|name| !name.is_empty()) {
+                Some(hostname) => match write_hosts(hostname) {
+                    Ok(()) => {
+                        note(false, &format!("hosts table renamed {hostname}"));
+                        kernel_name = name;
+                    }
+                    Err(e) => note(false, &format!("hosts table not renamed: {e}")),
+                },
+                None => kernel_name = name,
+            }
+        }
         wifi.drive(fd, wired, &mut |m| note(!wired, m));
         wifi.wait(Duration::from_millis(250), &mut |m| note(!wired, m));
     }

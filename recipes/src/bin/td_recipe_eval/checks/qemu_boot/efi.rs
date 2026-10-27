@@ -40,6 +40,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
             BootPlan {
                 disk: Some(BootDisk::new(&disk, phase != "boot")),
                 seed: None,
+                cloud: None,
                 mem: "512",
                 target_marker: MARKER,
                 kill_on_marker: true,

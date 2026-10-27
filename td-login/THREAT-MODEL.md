@@ -121,7 +121,10 @@ therefore admit one: the instance's owner on a cloud, and physical access on
 hardware, which can already boot a medium of its own (the image's Secure Boot
 is off) and read a server's unencrypted volume. That holds for a live medium
 too, whose signed provision a seed's keys join unsigned. Removing the key from
-the seed, or the seed, revokes it at the next boot.
+the seed, or the seed, revokes it at the next boot. With no seed, a server whose
+firmware's DMI names EC2 takes them from the instance metadata service instead
+("Cloud metadata"): the account that launched the instance admits one with its
+key pair, fixed for the instance's life.
 The boot-health login uses a fresh volatile key for the unprivileged UI account,
 but its root-owned authorization line is constrained by OpenSSH `restrict` and
 `from="127.0.0.1"`; possession of that key cannot create a network-reachable

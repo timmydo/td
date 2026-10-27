@@ -3,8 +3,9 @@
 //! port to the guest's sshd, and the host's OpenSSH client logs in with
 //! keys made for this run: the provisioned one must be admitted as the
 //! provisioned account and refused as root, one the server was never
-//! given must be refused, and one only a NoCloud seed offers must be
-//! admitted as that account on the boot the seed is attached to alone.
+//! given must be refused, and one only instance metadata offers, from a
+//! NoCloud seed or a mock EC2 IMDS, must be admitted as that account on
+//! the boot that metadata reaches alone.
 
 use std::cell::{Cell, RefCell};
 use std::fs::{self, File};
