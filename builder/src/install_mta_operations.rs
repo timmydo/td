@@ -1,4 +1,5 @@
 //! Explicit host schedules for existing mail operations; no service activation.
+use super::install_mta_backup::Bounds;
 use super::{absolute, directory, profile_name, scheme, shell, systemd, text, write_new, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -11,7 +12,8 @@ const HELP: &str = "Usage: ./install-td-mta --operations-services --state-dir PA
   [--certificate-profile NAME ... --connection-file PATH]
   [--tls-certificate PATH ... --openssl-bin PATH]
   [--backup-service-file PATH --backup-service NAME --backup-destination PATH
-   --postgres-bin PATH [--tool-library-dir PATH]]
+   --postgres-bin PATH [--tool-library-dir PATH]
+   [--backup-max-archive-bytes N] [--backup-max-total-bytes N] [--backup-retain N]]
   [--postgres-tls-dir PATH --postgres-data-dir PATH --postgres-port N
    --postgres-bin PATH --openssl-bin PATH [--tool-library-dir PATH]]
 
@@ -19,8 +21,8 @@ Generates independent systemd timers and Shepherd timed services, without starti
 anything. Mail, certificate and backup freshness checks run every 15 minutes;
 backups and private PostgreSQL leaf renewal run daily at 03:15 in the supervisor's local timezone. Certificate checks
 require 30 days remaining; backups must be at most two days old. PostgreSQL 17
-and protected backup credentials must already be provisioned. Backup limits are
-1 GiB/archive, 8 GiB/directory and 30 archives. See td-mta/DEPLOYMENT.md.
+and protected backup credentials must already be provisioned. Backup defaults are
+1 GiB/archive, 8 GiB/directory and 30 archives; override with --backup-* bounds. See td-mta/DEPLOYMENT.md.
 ";
 
 struct Options {
@@ -44,6 +46,7 @@ struct Backup {
     destination: PathBuf,
     postgres_bin: PathBuf,
     library: Option<PathBuf>,
+    bounds: Option<Bounds>,
 }
 
 fn options(args: &[String], home: &str) -> Result<Options> {
@@ -80,6 +83,9 @@ fn options(args: &[String], home: &str) -> Result<Options> {
             | "--backup-service-file"
             | "--backup-service"
             | "--backup-destination"
+            | "--backup-max-archive-bytes"
+            | "--backup-max-total-bytes"
+            | "--backup-retain"
             | "--postgres-bin"
             | "--tool-library-dir"
             | "--postgres-tls-dir"
@@ -99,6 +105,9 @@ fn options(args: &[String], home: &str) -> Result<Options> {
         "--backup-service-file",
         "--backup-service",
         "--backup-destination",
+        "--backup-max-archive-bytes",
+        "--backup-max-total-bytes",
+        "--backup-retain",
     ];
     let backup = if backup_keys.iter().any(|k| values.contains_key(k)) {
         let service = values
@@ -121,12 +130,34 @@ fn options(args: &[String], home: &str) -> Result<Options> {
         {
             return Err("tool directories cannot contain PATH separators".into());
         }
+        let bounds = if [
+            "--backup-max-archive-bytes",
+            "--backup-max-total-bytes",
+            "--backup-retain",
+        ]
+        .iter()
+        .any(|key| values.contains_key(key))
+        {
+            let number = |key, default| -> Result<u64> {
+                values.get(key).map_or(Ok(default), |v| {
+                    v.parse().map_err(|_| format!("invalid {key}"))
+                })
+            };
+            Some(Bounds::new(
+                number("--backup-max-archive-bytes", Bounds::DEFAULT.archive_bytes)?,
+                number("--backup-max-total-bytes", Bounds::DEFAULT.total_bytes)?,
+                number("--backup-retain", Bounds::DEFAULT.retain as u64)?,
+            )?)
+        } else {
+            None
+        };
         Some(Backup {
             service_file: required("--backup-service-file")?,
             service: (*service).into(),
             destination: required("--backup-destination")?,
             postgres_bin,
             library,
+            bounds,
         })
     } else {
         None
@@ -291,22 +322,28 @@ fn jobs(opts: &Options) -> Result<Vec<Job>> {
         if let Some(library) = &backup.library {
             env.push(format!("LD_LIBRARY_PATH={}", text(library)?));
         }
-        add(
-            "backup".into(),
-            vec![
-                text(&helper)?.into(),
-                "install-td-mta".into(),
-                "--backup".into(),
-                "--service-file".into(),
-                text(&backup.service_file)?.into(),
-                "--service".into(),
-                backup.service.clone(),
-                "--destination".into(),
-                text(&backup.destination)?.into(),
-            ],
-            env,
-            true,
-        );
+        let mut argv = vec![
+            text(&helper)?.into(),
+            "install-td-mta".into(),
+            "--backup".into(),
+            "--service-file".into(),
+            text(&backup.service_file)?.into(),
+            "--service".into(),
+            backup.service.clone(),
+            "--destination".into(),
+            text(&backup.destination)?.into(),
+        ];
+        if let Some(bounds) = backup.bounds {
+            argv.extend([
+                "--max-archive-bytes".into(),
+                bounds.archive_bytes.to_string(),
+                "--max-total-bytes".into(),
+                bounds.total_bytes.to_string(),
+                "--retain".into(),
+                bounds.retain.to_string(),
+            ]);
+        }
+        add("backup".into(), argv, env, true);
         add(
             "backup-status".into(),
             vec![
@@ -548,7 +585,7 @@ mod tests {
             .contains("/a %u $x/quote\\\"/frontend/runtime"));
     }
     #[test]
-    fn backup_has_fixed_limits_and_explicit_tool_environment() {
+    fn backup_has_default_limits_and_explicit_tool_environment() {
         let opts = options(
             &args(&[
                 "--state-dir",
@@ -582,6 +619,78 @@ mod tests {
         assert!(backup[2].1.contains("#:hours '(3) #:minutes '(15)"));
         assert_eq!(jobs[1].argv.last().unwrap(), "172800");
         assert!(!jobs[0].argv.iter().any(|a| a == "--max-archive-bytes"));
+    }
+
+    #[test]
+    fn backup_overrides_share_runtime_validation_and_reach_both_supervisors() {
+        let base = args(&[
+            "--state-dir",
+            "/state",
+            "--backup-service-file",
+            "/private/service",
+            "--backup-service",
+            "mail",
+            "--backup-destination",
+            "/backup",
+            "--postgres-bin",
+            "/tools",
+        ]);
+        let mut custom = base.clone();
+        custom.extend(args(&[
+            "--backup-max-archive-bytes",
+            "1073741824",
+            "--backup-max-total-bytes",
+            "4294967296",
+            "--backup-retain",
+            "7",
+        ]));
+        let opts = options(&custom, "/home/a").unwrap();
+        let jobs = jobs(&opts).unwrap();
+        let backup = jobs.first().unwrap();
+        for (flag, value) in [
+            ("--max-archive-bytes", "1073741824"),
+            ("--max-total-bytes", "4294967296"),
+            ("--retain", "7"),
+        ] {
+            assert!(backup
+                .argv
+                .windows(2)
+                .any(|pair| pair.first().is_some_and(|v| v == flag)
+                    && pair.get(1).is_some_and(|v| v == value)));
+            let generated = files(backup, &opts.state).unwrap();
+            for index in [0, 2] {
+                let text = &generated.get(index).unwrap().1;
+                assert!(text.contains(&format!("\"{flag}\" \"{value}\"")), "{text}");
+            }
+        }
+        for (flag, value) in [
+            ("--backup-retain", "0"),
+            ("--backup-retain", "1001"),
+            ("--backup-retain", "-1"),
+            ("--backup-retain", "invalid"),
+            ("--backup-max-archive-bytes", "0"),
+            ("--backup-max-archive-bytes", "1099511627777"),
+            ("--backup-max-total-bytes", "2147483648"),
+        ] {
+            let mut invalid = base.clone();
+            invalid.extend(args(&[flag, value]));
+            assert!(options(&invalid, "/home/a").is_err());
+        }
+        let mut duplicate = custom;
+        duplicate.extend(args(&["--backup-retain", "7"]));
+        assert!(options(&duplicate, "/home/a").is_err());
+        assert!(options(
+            &args(&[
+                "--state-dir",
+                "/state",
+                "--mail-profile",
+                "front",
+                "--backup-retain",
+                "7"
+            ]),
+            "/home/a"
+        )
+        .is_err());
     }
 
     #[test]

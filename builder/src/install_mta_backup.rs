@@ -15,6 +15,34 @@ const MAX_ENTRIES: usize = 4096;
 const CHUNK: usize = 64 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(600);
 
+#[derive(Clone, Copy)]
+pub(super) struct Bounds {
+    pub archive_bytes: u64,
+    pub total_bytes: u64,
+    pub retain: usize,
+}
+impl Bounds {
+    pub const DEFAULT: Self = Self {
+        archive_bytes: GIB,
+        total_bytes: 8 * GIB,
+        retain: 30,
+    };
+    pub fn new(archive_bytes: u64, total_bytes: u64, retain: u64) -> Result<Self> {
+        if archive_bytes == 0
+            || archive_bytes > 1024 * GIB
+            || total_bytes < archive_bytes.saturating_mul(2) + 65536
+            || !(1..=1000).contains(&retain)
+        {
+            return Err("bounds require a nonzero archive ceiling up to 1024 GiB, space for two archives plus 64 KiB, and 1..1000 retained backups".into());
+        }
+        Ok(Self {
+            archive_bytes,
+            total_bytes,
+            retain: usize::try_from(retain).map_err(|_| "invalid retention")?,
+        })
+    }
+}
+
 struct Options {
     service_file: PathBuf,
     service: String,
@@ -67,21 +95,19 @@ fn options(args: &[String]) -> Result<Options> {
     {
         return Err("service must be a short ASCII libpq service name".into());
     }
+    let bounds = Bounds::new(
+        number("--max-archive-bytes", Bounds::DEFAULT.archive_bytes)?,
+        number("--max-total-bytes", Bounds::DEFAULT.total_bytes)?,
+        number("--retain", Bounds::DEFAULT.retain as u64)?,
+    )?;
     let out = Options {
         service_file: absolute(required("--service-file")?)?,
         service: service.into(),
         destination: absolute(required("--destination")?)?,
-        archive_bytes: number("--max-archive-bytes", GIB)?,
-        total_bytes: number("--max-total-bytes", 8 * GIB)?,
-        retain: usize::try_from(number("--retain", 30)?).map_err(|_| "invalid retention")?,
+        archive_bytes: bounds.archive_bytes,
+        total_bytes: bounds.total_bytes,
+        retain: bounds.retain,
     };
-    if out.archive_bytes == 0
-        || out.archive_bytes > 1024 * GIB
-        || out.total_bytes < out.archive_bytes.saturating_mul(2) + 65536
-        || !(1..=1000).contains(&out.retain)
-    {
-        return Err("bounds require a nonzero archive ceiling up to 1024 GiB, space for two archives plus 64 KiB, and 1..1000 retained backups".into());
-    }
     Ok(out)
 }
 

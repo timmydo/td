@@ -174,8 +174,18 @@ readiness, the managed certificate lease/failure state and thirty-day validity,
 private certificate thirty-day expiry, and two-day backup freshness. Each failure
 is independent. A recent archive does not prove the backup timer is enabled,
 a private certificate expiry check is not a chain/hostname check, and freshness
-is not archive integrity or a restore test. Backup bounds remain 1 GiB/archive,
-8 GiB/destination and thirty completed archives; the command's lock also refuses
+is not archive integrity or a restore test. Backup bounds default to 1 GiB/archive,
+8 GiB/destination and thirty completed archives. The schedule generator accepts
+`--backup-max-archive-bytes`, `--backup-max-total-bytes` and `--backup-retain`;
+omitted bounds keep their defaults. For example, `--backup-max-total-bytes
+4294967296 --backup-retain 7` limits a small host to 4 GiB and seven completed
+backups. The byte ceiling may retain fewer than seven; it must cover two maximum
+archives plus 64 KiB. These are directory limits, not filesystem free-space
+reservations. The same validation applies to direct backup runs and generated
+systemd/Shepherd jobs. Unknown, duplicate, invalid or unused backup settings
+refuse before generation. Retain existing definitions before regenerating a
+changed schedule, then explicitly replace/reload the installed unit.
+The command's lock also refuses
 overlapping manual invocations. Supervisors cap wall time, and the backup helper
 retains its own output and tool-time bounds. Configure host memory/process limits
 as appropriate. Off-host copies, free-space checks and failure notifications
