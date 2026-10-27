@@ -768,7 +768,7 @@ mod tests {
         assert_eq!(pins[0].key, "ripgrep-source");
         assert_eq!(
             pins[0].sha256,
-            "f77b8032dc584527975f34aa5a897d0ef5a785573fda778771a614ff9da501d9"
+            "a30750b6d0743bfdd2656ebbaf4555aa278c43144b84bc389bcbfa399485ec71"
         );
 
         let fd = catalog::lookup("fd").unwrap();

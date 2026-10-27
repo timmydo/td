@@ -39,7 +39,7 @@ nerd-fonts-weather-icons-license-source jsmpd2zdj5zkna7diqcrzyirzngh7rdm-nerd-fo
 openssh-x86-64-source 7q2m5kisis6k0rbkjwnvj5n2fvba581p-openssh-x86-64-source
 popt-x86-64-source i2hswa2a3s6kzvqrzl9hz4gvgavsx4yh-popt-x86-64-source
 ripgrep-seed-source vg4gdaxl18mqlbhybnn2pq7lpwm3wm2q-ripgrep-seed-source
-ripgrep-source ma4kmnnyn1hlimj2rw6hq7p07h8g2p3x-ripgrep-source
+ripgrep-source 5lqzfa2vx99vmcy2cd3g88wf06pgs3kl-ripgrep-source
 rust-cargo-dist vv9hjbvrx25p93ai791gkcci9xy5vfzj-rust-cargo-dist
 rust-clippy-dist jrj59nm73bkic24bg9hpwga99xcg79yk-rust-clippy-dist
 rust-rustc-dist 3390kbk5914rr9rgmf7f1br1l9v9zsmr-rust-rustc-dist

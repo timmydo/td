@@ -4,7 +4,7 @@ use crate::types::Recipe;
 // checksum-verified inputs. The declared native inputs make `td shell` and
 // `build-plan --auto` use the same toolchain, in the build root.
 pub fn recipe() -> Recipe {
-    Recipe::rust("ripgrep", "14.1.1")
+    Recipe::rust("ripgrep", "15.2.0")
         .source_input("ripgrep-source")
         .build_root()
         .native_inputs(&["rust-toolchain", "td-link", "glibc-x86-64"])

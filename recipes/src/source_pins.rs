@@ -307,10 +307,10 @@ const PINS: &[PinDef] = &[
     PinDef {
         key: "ripgrep-source",
         aliases: &[],
-        url: "https://static.crates.io/crates/ripgrep/ripgrep-14.1.1.crate",
-        sha256: "f77b8032dc584527975f34aa5a897d0ef5a785573fda778771a614ff9da501d9",
-        file: "ripgrep-14.1.1.crate",
-        version: "14.1.1",
+        url: "https://static.crates.io/crates/ripgrep/ripgrep-15.2.0.crate",
+        sha256: "a30750b6d0743bfdd2656ebbaf4555aa278c43144b84bc389bcbfa399485ec71",
+        file: "ripgrep-15.2.0.crate",
+        version: "15.2.0",
     },
     PinDef {
         key: "rust-rustc-dist",
@@ -529,7 +529,7 @@ mod tests {
         // linux-x86-64 kernel source (separate from the 4.14 UAPI-header
         // pin, re #529) + the upstream Rust 1.99.1 rustc, rust-std, Cargo and
         // Clippy release components +
-        // coreutils-0.9.0, ripgrep 14.1.1, and fd 10.5.0 (the Rust userland
+        // coreutils-0.9.0, ripgrep 15.2.0, and fd 10.5.0 (the Rust userland
         // `.crate` sources) +
         // util-linux 2.42.4 (cryptsetup's minimal libuuid/libblkid build
         // closure) + the first reviewed
