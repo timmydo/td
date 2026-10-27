@@ -89,6 +89,16 @@ const DEVICE_BOUND_DETAILS: &[&str] = &[
     "The account signs in automatically.",
 ];
 
+/// Every fresh installation carries the live session's saved Wi-Fi
+/// networks (td-install/DESIGN.md "Carried Wi-Fi networks"); the page says
+/// so whether or not any was joined, since the wizard never sees them.
+const WIFI_DEVICE_BOUND: &str = "Wi-Fi networks joined in this session are copied to the \
+     installed system with their keys, inside the encrypted storage. To leave one behind, run \
+     td-netd wifi forget NAME in a terminal before installing.";
+const WIFI_UNENCRYPTED: &str = "Wi-Fi networks joined in this session are copied to the \
+     installed system with their keys, which the unencrypted disk holds readably for whoever has \
+     it. To leave one behind, run td-netd wifi forget NAME in a terminal before installing.";
+
 /// What an unencrypted review's details say a keyboard console is.
 const KEYBOARD_CONSOLE: &str = "A keyboard console is a framebuffer console and a keyboard with \
      Enter and the top-row digits, which the startup recovery prompt needs.";
@@ -232,7 +242,12 @@ impl ReviewPage {
                 Storage::Unencrypted => &[],
             }
         };
-        for paragraph in paragraphs {
+        let wifi = match (plan.mode(), plan.storage()) {
+            (td_install::installation_plan::Mode::Preserve, _) => None,
+            (_, Storage::DeviceBound) => Some(WIFI_DEVICE_BOUND),
+            (_, Storage::Unencrypted) => Some(WIFI_UNENCRYPTED),
+        };
+        for paragraph in paragraphs.iter().chain(&wifi) {
             push_paragraph(&mut lines, paragraph, columns);
         }
         let pages = lines.len().div_ceil(BODY_ROWS);

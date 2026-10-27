@@ -1880,7 +1880,8 @@ impl LiveExecution {
         let deployment = sha256::to_base16(plan.deployment());
         // Everything taken from the root below — the account and catalog
         // checks, the selector template, mkfs.btrfs — is the planned
-        // deployment's only if the root is.
+        // deployment's only if the root is. The saved Wi-Fi networks are
+        // the live session's state under it, not the deployment's.
         booted_as(&self.booted, &deployment).map_err(&verification)?;
         // The review's volume fit, asked again of the source as it is now
         // and before anything is staged; the layout's own refusal of a disk
@@ -1925,11 +1926,21 @@ impl LiveExecution {
                 mountpoint: workspace.mountpoint.clone(),
             },
         );
+        // A convenience, so a file td-netd cannot have written stays behind
+        // rather than failing the installation.
+        let wifi = read_wifi_networks(&self.root, 0).unwrap_or_else(|error| {
+            let _ = writeln!(
+                io::stderr(),
+                "td-install serve: saved Wi-Fi networks not carried: {error}"
+            );
+            None
+        });
         let mkfs = self.root.join("bin").join(protocol::MKFS_BTRFS);
         let settings = VolumeSettings {
             timezone: Some(&timezone),
             hostname: Some(&hostname),
             username: Some(&username),
+            wifi: wifi.as_ref(),
         };
         let prepared = prepare_volume(
             settings,
@@ -3972,11 +3983,99 @@ fn seed_setting(subvol: &Path, relative: &str, value: &str) -> io::Result<()> {
         .map_err(|error| io::Error::new(error.kind(), format!("sync {}: {error}", path.display())))
 }
 
+/// td-netd's saved networks on the running system, relative to its root,
+/// and where the installed `@var` keeps them.
+const WIFI_LIVE_DIR: &str = "var/lib/td-netd";
+const WIFI_FILE: &str = "wifi";
+const WIFI_STATE_DIR_RELATIVE: &str = "lib/td-netd";
+/// td-netd's own bound on the file it reads.
+const WIFI_LIMIT: u64 = 4096;
+
+/// The Wi-Fi networks the live session joined, as td-netd stored them: a
+/// line per network, an SSID and a PMK in hex or `open`. td-netd parses
+/// them again on the installed system; this copy only refuses what td-netd
+/// cannot have written. Zeroed when dropped, since the PMKs join the
+/// networks.
+struct WifiNetworks(Vec<u8>);
+
+impl Drop for WifiNetworks {
+    fn drop(&mut self) {
+        self.0.fill(0);
+        std::hint::black_box(&mut self.0);
+    }
+}
+
+/// The live session's saved networks, or `None` when it saved none. Only
+/// a private file in a directory no one else writes, both `owner`'s (root
+/// for an execution), is carried: anything else is not td-netd's.
+fn read_wifi_networks(root: &Path, owner: u32) -> io::Result<Option<WifiNetworks>> {
+    use std::os::unix::fs::MetadataExt;
+    let directory = root.join(WIFI_LIVE_DIR);
+    let held = match paths::symlink_metadata(&directory) {
+        Ok(held) => held,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !held.is_dir() || held.uid() != owner || held.mode() & 0o022 != 0 {
+        return Err(invalid(format!(
+            "{} is not a directory only its owner writes",
+            directory.display()
+        )));
+    }
+    let path = directory.join(WIFI_FILE);
+    let (file, metadata) = match td_fs::open_real_file(&path, "saved Wi-Fi networks") {
+        Ok(opened) => opened,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if metadata.uid() != owner || metadata.mode() & 0o077 != 0 || metadata.len() > WIFI_LIMIT {
+        return Err(invalid(format!(
+            "{} is not a private file of at most {WIFI_LIMIT} bytes",
+            path.display()
+        )));
+    }
+    // One allocation, so no grown-out copy of the keys is freed unzeroed.
+    let mut networks = WifiNetworks(Vec::with_capacity(WIFI_LIMIT as usize + 1));
+    (&file)
+        .take(WIFI_LIMIT + 1)
+        .read_to_end(&mut networks.0)
+        .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", path.display())))?;
+    // Bytes, not lines: td-netd's own reader judges each line. Kept in step
+    // with td-netd's `encode_network`.
+    let written =
+        |byte: &u8| matches!(byte, b'0'..=b'9' | b'a'..=b'f' | b'o' | b'p' | b'n' | b' ' | b'\n');
+    if networks.0.len() as u64 > WIFI_LIMIT || !networks.0.iter().all(written) {
+        return Err(invalid(format!(
+            "{} is not td-netd's saved networks",
+            path.display()
+        )));
+    }
+    Ok((!networks.0.is_empty()).then_some(networks))
+}
+
+/// The saved networks onto `@var`, as td-netd keeps them: root's file at
+/// 0600 in root's 0700 directory, modes set since `--rootdir` copies them.
+fn seed_wifi(subvol: &Path, networks: &WifiNetworks) -> io::Result<()> {
+    let lib = subvol.join("lib");
+    paths::create_dir_all(&lib)?;
+    paths::set_mode(&lib, 0o755)?;
+    let directory = subvol.join(WIFI_STATE_DIR_RELATIVE);
+    paths::create_dir_with_mode(&directory, 0o700)?;
+    paths::set_mode(&directory, 0o700)?;
+    let path = directory.join(WIFI_FILE);
+    let mut file = paths::create_new_with_mode(&path, 0o600)?;
+    paths::set_mode(&path, 0o600)?;
+    file.write_all(&networks.0)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| io::Error::new(error.kind(), format!("write {}: {error}", path.display())))
+}
+
 #[derive(Default)]
 struct VolumeSettings<'a> {
     timezone: Option<&'a timezones::Selection>,
     hostname: Option<&'a hostname::Hostname>,
     username: Option<&'a PrimarySelection>,
+    wifi: Option<&'a WifiNetworks>,
 }
 
 fn run_volume(
@@ -4865,6 +4964,9 @@ fn stage_tree(
     if let Some(selection) = settings.username {
         seed_setting(&subvol, USERNAME_STATE_RELATIVE, &selection.name)?;
     }
+    if let Some(networks) = settings.wifi {
+        seed_wifi(&subvol, networks)?;
+    }
     // BEFORE the mkfs that bakes this tree into the image, which is the whole
     // of why the publish can happen without a mount: `--rootdir` is what puts
     // it in the filesystem.
@@ -5171,6 +5273,7 @@ fn main() -> ExitCode {
                     timezone: timezone.as_ref(),
                     hostname: hostname.as_ref(),
                     username: username.as_deref(),
+                    wifi: None,
                 };
                 if let Some(boot) = boot {
                     let prepared =
@@ -6626,6 +6729,112 @@ mod tests {
         assert_eq!(std::fs::read(file).unwrap(), b"alice\n");
         std::fs::remove_dir_all(validator).unwrap();
         std::fs::remove_dir_all(formatter).unwrap();
+    }
+
+    #[test]
+    fn saved_wifi_networks_are_carried_only_from_a_private_file_and_kept_private() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let fixture = ::td_fs::TempDir::new("td-install-wifi").unwrap();
+        let root = fixture.path().join("root");
+        let directory = root.join(WIFI_LIVE_DIR);
+        let file = directory.join(WIFI_FILE);
+        let networks = format!("686f6d65 {}\n63616665 open\n", "ab".repeat(32));
+        let set = |path: &Path, mode: u32| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        let write = |body: &[u8], file_mode: u32, dir_mode: u32| {
+            set(&directory, 0o700);
+            let _ = std::fs::remove_file(&file);
+            std::fs::write(&file, body).unwrap();
+            set(&file, file_mode);
+            set(&directory, dir_mode);
+        };
+        std::fs::create_dir_all(&root).unwrap();
+        // The test runs unprivileged: its own files stand in for root's.
+        let owner = std::fs::metadata(&root).unwrap().uid();
+        assert!(read_wifi_networks(&root, owner).unwrap().is_none());
+        std::fs::create_dir_all(&directory).unwrap();
+        assert!(read_wifi_networks(&root, owner).unwrap().is_none());
+        write(b"", 0o600, 0o700);
+        assert!(read_wifi_networks(&root, owner).unwrap().is_none());
+
+        write(networks.as_bytes(), 0o600, 0o700);
+        let carried = read_wifi_networks(&root, owner).unwrap().unwrap();
+        assert_eq!(carried.0, networks.as_bytes());
+        let scratch = fixture.path().join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+        let settings = VolumeSettings {
+            wifi: Some(&carried),
+            ..VolumeSettings::default()
+        };
+        let staging = stage_tree(settings, None, None, &scratch).unwrap();
+        let state = staging.join(protocol::VOLUME_SUBVOL);
+        let staged = state.join(WIFI_STATE_DIR_RELATIVE).join(WIFI_FILE);
+        assert_eq!(std::fs::read(&staged).unwrap(), networks.as_bytes());
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode(&staged), 0o600);
+        assert_eq!(mode(&state.join(WIFI_STATE_DIR_RELATIVE)), 0o700);
+        assert_eq!(mode(&state.join("lib")), 0o755);
+
+        // Stricter modes and the full bound are td-netd's too.
+        write(networks.as_bytes(), 0o400, 0o755);
+        assert!(read_wifi_networks(&root, owner).unwrap().is_some());
+        write(&vec![b'a'; WIFI_LIMIT as usize], 0o600, 0o700);
+        assert!(read_wifi_networks(&root, owner).unwrap().is_some());
+
+        // Anything td-netd cannot have written stays behind.
+        for (body, file_mode, dir_mode) in [
+            (networks.as_bytes().to_vec(), 0o644, 0o700),
+            (networks.as_bytes().to_vec(), 0o600, 0o777),
+            (b"686f6d65 OPEN\n".to_vec(), 0o600, 0o700),
+            (b"686f6d65 open\r\n".to_vec(), 0o600, 0o700),
+            (vec![b'a'; WIFI_LIMIT as usize + 1], 0o600, 0o700),
+        ] {
+            write(&body, file_mode, dir_mode);
+            assert!(
+                read_wifi_networks(&root, owner).is_err(),
+                "{file_mode:o} {dir_mode:o}"
+            );
+        }
+        write(networks.as_bytes(), 0o600, 0o700);
+        assert!(read_wifi_networks(&root, owner + 1).is_err());
+        // A symlink at the file or at its directory, and a FIFO.
+        let elsewhere = fixture.path().join("elsewhere");
+        std::fs::rename(&file, &elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &file).unwrap();
+        assert!(read_wifi_networks(&root, owner).is_err());
+        std::fs::remove_file(&file).unwrap();
+        let status = std::process::Command::new("mkfifo")
+            .arg(&file)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(read_wifi_networks(&root, owner).is_err());
+        std::fs::remove_file(&file).unwrap();
+        let real = fixture.path().join("real-td-netd");
+        std::fs::rename(&directory, &real).unwrap();
+        std::fs::write(real.join(WIFI_FILE), networks.as_bytes()).unwrap();
+        set(&real.join(WIFI_FILE), 0o600);
+        std::os::unix::fs::symlink(&real, &directory).unwrap();
+        assert!(read_wifi_networks(&root, owner).is_err());
+    }
+
+    #[test]
+    fn a_wifi_file_the_execution_refuses_leaves_the_installation_as_it_was() {
+        use installation_protocol::{Failure, Phase};
+        // Unprivileged, the fixture's file is never root's: the execution
+        // refuses it and goes on to the same outcome as without one.
+        let fixture = ExecutionFixture::new(b"kernel", b"kernel");
+        let directory = fixture.execution.root.join(WIFI_LIVE_DIR);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join(WIFI_FILE), b"686f6d65 open\n").unwrap();
+        let (outcome, phases) = fixture.run();
+        assert_eq!(outcome, Err(Failure::WriteFailed));
+        assert_eq!(
+            phases,
+            [Phase::WritingFilesystems, Phase::PublishingDeployment]
+        );
+        fixture.assert_workspace_gone();
     }
 
     #[test]

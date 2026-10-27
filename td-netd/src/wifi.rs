@@ -85,7 +85,9 @@ fn from_hex(text: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
-/// The request line, and the stored file, naming a network.
+/// The request line, and the stored file, naming a network. td-install
+/// carries the file onto an installed system only while its bytes stay in
+/// this alphabet: lowercase hex, `open`, spaces and newlines.
 pub fn encode_network(network: &Network) -> String {
     let secret = network
         .pmk

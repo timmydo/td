@@ -357,10 +357,11 @@ firmware does not boot. It still holds the ESP, with the kernel and the
 prepared selector, and the volume: its header with keyslot 0, opened by
 the unconfirmed recovery key, and keyslot 1 with token 0, whose protector
 only this TPM releases; inside, the published deployment and the staged
-settings, account and trusted key, none of them secret. A withdrawal also
-zeroes the volume's first 16 MiB, so neither keyslot opens; a crash leaves
-no withdrawal behind it, and a new installation over the disk replaces
-both.
+settings, account and trusted key, none of them secret, and any carried
+Wi-Fi networks (DESIGN.md "Carried Wi-Fi networks"), whose PMKs are
+secret. A withdrawal also zeroes the volume's first 16 MiB, so neither
+keyslot opens; a crash leaves no withdrawal behind it, and a new
+installation over the disk replaces both.
 
 After the confirmation the table goes down backup first, then the primary
 with the protective MBR, each synced. A crash between the two leaves the

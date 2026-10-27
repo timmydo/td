@@ -372,6 +372,36 @@ the same two wrappers: its listings of `/sys/class/vtconsole` and
 `/sys/class/input` and each attribute, one page at most, opened
 close-on-exec by std and closed when read.
 
+### Carried Wi-Fi networks
+
+A live execution (`serve`) also carries the Wi-Fi networks the live
+session joined, so the person does not type a passphrase again on the
+installed system. After the settings are admitted and before staging, it
+reads td-netd's `var/lib/td-netd/wifi` under the root it serves: a
+missing directory, a missing file or an empty one carries nothing. Only
+a real regular file (td-fs's `open_real_file`, no symlink followed) of
+mode 0600 or stricter and at most 4096 bytes, in a directory that is
+not a symlink and that no one but its owner writes, both owned by root,
+whose bytes are only td-netd's alphabet (lowercase hex, `open`, spaces
+and newlines), is carried. `var` and `var/lib` are resolved as the root
+has them, root's on the live system. The alphabet is a check on bytes,
+not a parse: td-netd parses the copy on the installed system as it
+parses its own file, dropping any line that does not decode. Anything
+else is left behind with a `td-install serve:` line on standard error
+and the installation continues, since Wi-Fi is a convenience the
+installed system can configure again; once read, a failure to stage the
+copy fails the installation as staging the settings does. The bytes are
+read into one allocation, held zeroed-on-drop and staged as
+`@var/lib/td-netd/wifi`, mode 0600, in `@var/lib/td-netd` at 0700, both
+root's, modes set because `--rootdir` copies them. A network joined
+after the execution read the file is not carried. The wizard never sees
+the networks and nothing about them crosses the installation protocol;
+the review's details say that networks joined in the session are
+copied, with their keys, and that on unencrypted storage the disk holds
+those keys readably. The `volume` and `format` commands carry none.
+Reinstall keeps the installed `@var`, and so its own saved networks, and
+carries none from the live session.
+
 ### Installation signing identity
 
 Each installation generates its own deployment signing key during
@@ -1059,7 +1089,9 @@ installation" says, except as follows. [ENCRYPTION.md](ENCRYPTION.md)
 
 No plaintext volume image exists. The settings, account and trusted key
 are staged as a directory tree in the workspace before the first write,
-as on the unencrypted path; they hold no secret. The scratch image and
+as on the unencrypted path. The only secret among them is the carried
+Wi-Fi networks' PMKs ("Carried Wi-Fi networks"), in the root-only
+workspace and then inside the encrypted volume. The scratch image and
 its admission ("Prepared volume image admission") remain only for the
 unencrypted path. The layout's writes stop short of the table: the old
 table is invalidated and the ESP written, each synced, as on the
@@ -1241,7 +1273,10 @@ running system's time zone catalog, re-read from the read-only root the
 settings were checked against. The root is `/` because td-authd binds the
 verified root there; the execution does not assert it. A live boot's
 init records the deployment its root was authenticated as in
-`/run/td-deployment`, and the execution reads it too.
+`/run/td-deployment`, and the execution reads it too. It also reads the
+live session's saved Wi-Fi networks under that root, which are the
+session's mutable state rather than the deployment's, under their own
+rules ("Carried Wi-Fi networks").
 
 Before the destination is touched it checks the source. The booted record
 must name the plan's deployment, since the account and catalog checks, the

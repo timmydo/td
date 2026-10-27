@@ -86,7 +86,11 @@ desktop, which turns automatic login off
 and not usable until the acceptance evidence its opening names);
 the installer collects no key and its disclosures describe the installed
 default.
-Networking can be configured after booting the installed system.
+Networking can be configured after booting the installed system, and
+the Wi-Fi networks joined in the live session before installing are
+normally already there: the installation carries td-netd's saved
+networks onto the installed `/var` when their file is as td-netd keeps
+it (DESIGN.md "Carried Wi-Fi networks").
 
 ## Reinstall while keeping personal files
 
@@ -1118,7 +1122,9 @@ but drops none:
 `td-install serve <td-boot> <deployment-directory> <trusted-key>
 <verified-root> <td-firstboot>` is the service core for one
 installer. Its five operands are absolute control-plane inputs bound by its
-caller, never by the installer, and must be present and of their kind:
+caller, never by the installer, and must be present and of their kind
+(an execution also reads the live session's saved Wi-Fi networks under
+the verified root, DESIGN.md "Carried Wi-Fi networks"):
 `td-boot` and `td-firstboot` executable files, the deployment directory and
 verified root directories, the key a file. It requires effective uid 0 (a
 sanity gate against a misplaced start, not proof of privilege), the
@@ -2139,10 +2145,13 @@ the socket is the owner's), the owner being the account the `network`
 unit names with `--wifi-owner`. The watcher keeps up to 16 networks
 root-only in `/var/lib/td-netd/wifi`, one line each, in the order `join`
 last named them, so a passphrase is typed once per network; joining a
-seventeenth drops the last. `list` names them, never their keys, and `forget`
-removes one, or all with `--all`. A `join` puts its network first in the
-list before the outcome is known and, when the radio is free, attempts it
-alone, so the outcome it reports is that network's. Every later
+seventeenth drops the last. An installation from the live medium copies the
+live session's file onto the installed `@var` (DESIGN.md "Carried Wi-Fi
+networks"), so a network joined before installing is joined again at the
+installed system's first boot. `list` names them, never their keys,
+and `forget` removes one, or all with `--all`. A `join` puts its network
+first in the list before the outcome is known and, when the radio is
+free, attempts it alone, so the outcome it reports is that network's. Every later
 association, at boot or after a loss, takes the first saved network, in
 the order `join` last named them, with an access point in range that fits
 it. A network whose attempt failed sits out the next scan and then its
