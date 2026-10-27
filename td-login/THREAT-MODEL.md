@@ -124,7 +124,8 @@ too, whose signed provision a seed's keys join unsigned. Removing the key from
 the seed, or the seed, revokes it at the next boot. With no seed, a server whose
 firmware's DMI names EC2 takes them from the instance metadata service instead
 ("Cloud metadata"): the account that launched the instance admits one with its
-key pair, fixed for the instance's life.
+key pair, fixed for the instance's life. On Azure, whose firmware's chassis
+asset tag names it, whoever set the SSH keys the VM was created with admits one.
 The boot-health login uses a fresh volatile key for the unprivileged UI account,
 but its root-owned authorization line is constrained by OpenSSH `restrict` and
 `from="127.0.0.1"`; possession of that key cannot create a network-reachable

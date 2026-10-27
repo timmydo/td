@@ -279,9 +279,9 @@ machine with a newer image ([td-svc design](td-svc/DESIGN.md) §10,
 NIC drivers; "Cloud images" there says how each cloud imports it and what
 does not work yet. No cloud boot is tested. An attached NoCloud seed
 (`cloud-localds`'s `cidata` ISO) can name the host and add Ed25519 keys
-for the account, and on EC2 the instance's metadata service does the
-same from its key pair; nothing else is read ("Instance metadata",
-"Cloud metadata").
+for the account, and on EC2 and Azure the instance's metadata service
+does the same from its key pair or SSH keys, and an Azure VM reports
+ready; nothing else is read ("Instance metadata", "Cloud metadata").
 
 To compose a retained optical/USB ISO from other prepared boot files and
 payloads, use `td-recipe-eval compose-iso OUTPUT KERNEL INITRAMFS

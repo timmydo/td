@@ -20,7 +20,9 @@
 //! host's SSH logins. That boot carries a NoCloud seed, whose hostname it
 //! takes and whose key admits the provisioned account. The acknowledged
 //! boot instead reads a mock EC2 IMDSv2 its DMI names, with the same
-//! effect. Every other boot has neither, and the metadata key is refused.
+//! effect, and the pending candidate's boot a mock Azure IMDS, then reports
+//! ready to a mock wireserver. Every other boot has none, and the metadata
+//! key is refused.
 //!
 //! The failing boots exercise one of healthwatch's inputs, a health
 //! transaction that ended without a record (the fail-target token). A
@@ -72,6 +74,9 @@ const ISO_ACCOUNT: &str = "hedy";
 const SEED_HOSTNAME: &str = "td-seeded";
 const METADATA_NONE_MARKER: &str = "TD-METADATA-NONE";
 const CLOUD_METADATA_NONE_MARKER: &str = "TD-CLOUD-METADATA-NONE";
+/// The one public key the mock Azure IMDS offers; no login uses it.
+const AZURE_KEY: &str =
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGmTjqOMdHoPzoqbE+wEE5Q4aNmEGC0tgJbQOkxqdgUi td-azure";
 /// A boot with no seed and no cloud.
 const UNSEEDED: &[&str] = &[METADATA_NONE_MARKER, CLOUD_METADATA_NONE_MARKER];
 /// A live boot's volume is half of RAM, as `qemu-boot-live` gives it.
@@ -112,6 +117,16 @@ impl Boot<'_> {
     /// state, which ends it.
     fn healthy(&self, tokens: &str, label: &str) -> Result<BootResult, String> {
         self.run(tokens, HEALTH_STEADY_MARKER, true, None, None, label)
+    }
+
+    /// `healthy` on a cloud `mock`.
+    fn healthy_on(
+        &self,
+        tokens: &str,
+        mock: &CloudMock,
+        label: &str,
+    ) -> Result<BootResult, String> {
+        self.run(tokens, HEALTH_STEADY_MARKER, true, None, Some(mock), label)
     }
 
     /// `healthy` on a cloud `mock`, then the host's SSH logins before the
@@ -258,13 +273,34 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     validate_install(&install, &fixture.initial_id, "install boot")?;
     check_persistent_volume(&btrfs, &volume)?;
 
-    let pending = boot.healthy(&healthy_tokens, "pending candidate boot")?;
+    // On Azure: named and keyed by its IMDS, and reported ready.
+    let azure_dir = fresh_dir(&runner.scratch_dir().join("server-azure"))?;
+    let azure = CloudMock::azure(&azure_dir, AZURE_KEY)?;
+    let pending = boot.healthy_on(&healthy_tokens, &azure, "pending candidate boot")?;
+    let applied = format!(
+        "TD-CLOUD-METADATA-APPLIED azure hostname={} keys=1",
+        cloud_mock::AZURE_HOSTNAME
+    );
+    let ready = format!(
+        "TD-CLOUD-METADATA-READY azure incarnation={}",
+        cloud_mock::AZURE_INCARNATION
+    );
     validate_healthy(
         &pending,
         Identity::Reused,
         "pending candidate boot",
-        UNSEEDED,
+        &[METADATA_NONE_MARKER, &applied, &ready],
     )?;
+    let requests = azure.requests()?;
+    if requests != cloud_mock::EXPECTED_AZURE {
+        return Err(format!(
+            "the pending candidate boot should have asked the mock Azure IMDS and \
+             wireserver {:?}, but asked {requests:?}",
+            cloud_mock::EXPECTED_AZURE
+        ));
+    }
+    fs::remove_dir_all(&azure_dir)
+        .map_err(|error| format!("remove {}: {error}", azure_dir.display()))?;
     require_selected_deployment(
         &pending,
         td_boot_protocol::SELECTED_CURRENT_MARKER,
@@ -283,13 +319,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     // The provisioned account is the primary, and the host logs in as it
     // with the provisioned key, and with the key EC2's metadata offers, and
     // is refused with any other.
-    let imds = runner.scratch_dir().join("server-imds");
-    match fs::remove_dir_all(&imds) {
-        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-            return Err(format!("remove stale {}: {error}", imds.display()));
-        }
-        _ => {}
-    }
+    let imds = fresh_dir(&runner.scratch_dir().join("server-imds"))?;
     let mock = CloudMock::ec2(&imds, &login.seed_key()?)?;
     let acknowledged =
         boot.healthy_with_login(&healthy_tokens, &login, &mock, "acknowledged boot")?;
@@ -414,7 +444,8 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
          same host identity and is then \
          current, where the host logs in over SSH as the provisioned account {ACCOUNT:?} with \
          its provisioned key and with the key a mock EC2 IMDSv2 offers, which also names \
-         the host, on the host key the console reported, and is refused as root \
+         the host, as a mock Azure IMDS did on the pending boot before it reported ready \
+         to a mock wireserver, on the host key the console reported, and is refused as root \
          and with another key; one whose every attempt fails health is rebooted by healthwatch \
          ({HEALTH_REBOOT_MARKER}, {SYSTEM_SHUTDOWN_MARKER}) until td-boot falls back to the \
          previous deployment unattended; and the disk image and live medium server-image \
@@ -656,6 +687,16 @@ fn validate_seeded(result: &BootResult, label: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// `path`, with no stale tree from an earlier run under it.
+fn fresh_dir(path: &Path) -> Result<PathBuf, String> {
+    match fs::remove_dir_all(path) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            Err(format!("remove stale {}: {error}", path.display()))
+        }
+        _ => Ok(path.to_owned()),
+    }
 }
 
 /// What the two metadata units reported, in order: `expected`.

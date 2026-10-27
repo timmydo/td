@@ -1741,7 +1741,10 @@ the EFI-stub kernel is unsigned. Azure: upload the `--vhd` image as a
 page blob, make a managed disk of Hyper-V generation V2 from it (V1,
 the default, boots BIOS) and create a VM of the Standard security type
 (Trusted Launch turns Secure Boot on) with it as a specialized OS
-disk, for which Azure expects no provisioning report. EC2: import the
+disk, or from a gallery image version marked generalized, whose
+provisioning the server's ready report ends ("Cloud metadata"). The
+admin user name Azure is given is ignored: the image's account wins.
+EC2: import the
 raw or VHD image as a snapshot and register it with `--boot-mode uefi`
 and `--ena-support`, for Nitro instance types. GCE: pack the raw image
 as `disk.raw` with `tar --format=oldgnu -Sczf`, upload it and create
@@ -1756,9 +1759,9 @@ none of the three needs for a default route. Nothing handles the ACPI
 power button, so a cloud's stop waits out its grace period and then
 cuts power, and Hyper-V's integration services (shutdown, heartbeat,
 KVP and time sync, which need CONNECTOR) are not built. A NoCloud
-seed's and EC2's metadata are read ("Instance metadata", "Cloud
-metadata"); Azure's and GCE's services are not, so on those clouds the
-keys and hostname are the image's own.
+seed's, EC2's and Azure's metadata are read ("Instance metadata",
+"Cloud metadata"); GCE's service is not, so there the keys and
+hostname are the image's own.
 
 ### Instance metadata
 
@@ -1858,7 +1861,7 @@ carry. Its IMDSv2 at 169.254.169.254 issues a session token for a PUT
 to `/latest/api/token`, and every request after it carries the token.
 IMDSv1's tokenless requests are never made, so an instance that
 requires IMDSv2 works. A std-only HTTP/1.1 client retries each request
-whose connection fails, or that is answered 5xx or 429, until one
+whose connection fails, or that is answered 5xx, 429 or 410, until one
 deadline 150 seconds after the first: long enough for the network
 daemon to take the lease when netup's DHCP gave up. Each attempt
 connects, sends and reads to the response's end within two seconds,
@@ -1880,12 +1883,44 @@ default, before the network was up. The console reports each skip as
 hostname=NAME keys=N`. A service that does not answer fails the unit
 and changes nothing; health does not require it.
 
+Azure is a chassis asset tag of `7783-7084-3265-9085-8269-3286-77`,
+which every Azure VM's firmware carries. Its IMDS, at the same address,
+answers only a request that says `Metadata: true`: the unit asks for
+`compute/osProfile/computerName` and then each
+`compute/publicKeys/N/keyData`, from 0 until one is absent (404), in
+API version 2021-02-01's text form, with the same retries and rules.
+The computer name, which every VM has, is also retried on 404 while
+the IMDS settles, as Azure's own agents retry it; once it is served, a
+key index's 404 ends the list, which Azure documents for an element
+that does not exist and no live VM has yet confirmed. The admin
+user name Azure was given is not asked for. Azure's tools make RSA
+keys unless told otherwise, so a VM given only those reports `keys=0`
+and a skip. Then, whatever the IMDS gave, the VM reports ready to the
+wireserver at 168.63.129.16, at the paths Azure's own agent uses: a
+GET of `/machine/?comp=goalstate` names the incarnation, container
+and role instance, and a POST of `/machine?comp=health` says that
+instance's state is `Ready`, which ends a generalized VM's
+provisioning; without it the platform marks the VM's creation timed
+out, though it runs. Both requests carry `x-ms-version: 2012-11-30`,
+each attempt has 15 seconds, either is asked again on a 404 as on a
+410, and the report has the fetch's deadline or at least
+60 seconds. Each echoed field is the goal state's own text, of at
+most 256 bytes, with no markup, control character or `&` that does
+not begin an entity, so the report carries only what it echoes. The
+console then reports `TD-CLOUD-METADATA-READY azure incarnation=N`; a
+report that fails fails the unit, with the fetch's failure beside it
+if there was one. A fetch that failed is still reported ready, since
+the VM booted and its image's account is reachable: Azure then shows
+the VM provisioned though its keys were not applied, which the
+console's failure says.
+
 Whoever controls the metadata service can admit a key: on EC2, the
 account that launched the instance with its key pair, which is fixed
-for the instance's life. A machine that is not EC2 but whose firmware
-claims to be, and whose network answers at 169.254.169.254, is one
-whose hypervisor or physical holder chose that
-(td-login/THREAT-MODEL.md §1).
+for the instance's life, and on Azure, whoever set the SSH keys the
+VM was created with, which Azure's access control governs. A machine that is not
+that cloud but whose firmware claims to be, and whose network answers
+at 169.254.169.254, is one whose hypervisor or physical holder chose
+that (td-login/THREAT-MODEL.md §1).
 
 `qemu-boot-server`'s acknowledged boot carries EC2's system vendor.
 QEMU's user network, moved to 168.0.0.0/7 so that libslirp may
@@ -1895,11 +1930,22 @@ without its token, with the full name `td-ec2-host.ec2.internal` and a
 key made for the run. The boot must report the name's first label
 and one key applied, the mock must have seen the token requested first
 and every later request carry it (a retried request counts once), and
-the run's key must log in as the provisioned account.
+the run's key must log in as the provisioned account. The pending
+candidate's boot carries Azure's system vendor and chassis asset tag,
+and the mock serves both of Azure's addresses: the IMDS refuses a
+request without `Metadata: true`, names the host `td-azure-host` and
+offers one key, and the wireserver refuses a request without its
+version, serves a goal state and accepts only a report that echoes it
+and says `Ready`. The boot must report that name and one key applied
+and the ready report's incarnation, and the mock must have seen the
+name, keys 0 and 1, the goal state and the report, in that order.
 
-Not yet: Azure's IMDS and the wireserver's ready report, GCE's
-metadata server, EC2's user-data, its IPv6 endpoint, and its Xen
-instance types, whose DMI names `Xen`.
+Not yet: GCE's metadata server, EC2's and Azure's user-data, EC2's
+IPv6 endpoint and Xen instance types, whose DMI names `Xen`, Azure's
+provisioning medium (`ovf-env.xml`), the wireserver's other reports
+(extension and failure states), and a goal state that changes between
+its GET and the report: a 410 then repeats the same report until the
+deadline, where Azure's agent would read the goal state again.
 
 ## 11. Evicting a previous supervisor's services
 

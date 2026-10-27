@@ -1480,7 +1480,8 @@ mod svc_timeouts {
     /// at most 64 KiB and two small synced writes.
     pub const METADATA: u32 = 60;
     /// One 150-second deadline over every request to a link-local
-    /// service, then two small synced writes.
+    /// service, and on Azure at least 60 more for the ready report, then
+    /// two small synced writes.
     pub const CLOUD_METADATA: u32 = 300;
     /// Mints the per-machine identity: ed25519 keygen, writes to /var, then sync.
     pub const FIRSTBOOT: u32 = 300;

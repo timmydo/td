@@ -1211,7 +1211,9 @@ fn set_kernel_hostname(name: &hostname::Hostname) -> Result<(), Failure> {
 /// hostname, saved and then set, which td-netd's daemon renders into
 /// `/etc/hosts`, and Ed25519 keys for the file a NoCloud seed would have
 /// written. An attached seed, or a machine no cloud's DMI names, changes
-/// nothing.
+/// nothing. On Azure the VM then reports ready, whatever its metadata
+/// gave, since it booted and has its image's way in; a failure of both is
+/// reported whole.
 fn apply_cloud_metadata() -> Result<(), Failure> {
     if Path::new(metadata::NOCLOUD_MARKER).exists() {
         return emit("TD-CLOUD-METADATA-SKIPPED nocloud\n").map_err(Failure::Failed);
@@ -1219,8 +1221,31 @@ fn apply_cloud_metadata() -> Result<(), Failure> {
     let Some(cloud) = cloud::detect(Path::new(cloud::DMI)) else {
         return emit("TD-CLOUD-METADATA-NONE\n").map_err(Failure::Failed);
     };
-    let request = cloud::fetch(cloud, cloud::IMDS)
-        .map_err(|error| Failure::Failed(format!("{} metadata: {error}", cloud.name())))?;
+    let deadline = std::time::Instant::now() + cloud::BUDGET;
+    let applied = cloud::fetch(cloud, cloud::IMDS, deadline)
+        .map_err(|error| Failure::Failed(format!("{} metadata: {error}", cloud.name())))
+        .and_then(|request| apply_cloud_request(cloud, &request));
+    if cloud == cloud::Cloud::Azure {
+        match cloud::report_ready(cloud::WIRESERVER, deadline) {
+            Ok(incarnation) => emit(&format!(
+                "TD-CLOUD-METADATA-READY azure incarnation={incarnation}\n"
+            ))
+            .map_err(Failure::Failed)?,
+            Err(error) => {
+                let report = format!("azure ready report: {error}");
+                return Err(Failure::Failed(match applied {
+                    Err(Failure::Failed(fetch) | Failure::Usage(fetch)) => {
+                        format!("{fetch}; {report}")
+                    }
+                    Ok(()) => report,
+                }));
+            }
+        }
+    }
+    applied
+}
+
+fn apply_cloud_request(cloud: cloud::Cloud, request: &metadata::Request) -> Result<(), Failure> {
     for reason in &request.skipped {
         emit(&format!("TD-CLOUD-METADATA-SKIPPED {reason}\n")).map_err(Failure::Failed)?;
     }
