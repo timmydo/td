@@ -716,6 +716,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
         "const EXCHANGE_TIME: Duration = Duration::from_secs(12);",
         "const UNIT_TIME: Duration = Duration::from_secs(30);",
         "unit_time: UNIT_TIME,",
+        "teardown_reap: TEARDOWN_REAP,",
         "record: Path::new(\"/\").join(cutover::RECORD),",
         "uid: 0,\n            gid: 0,",
     ] {
@@ -1319,7 +1320,7 @@ const ELEVATION_FINGERPRINT: u64 = 0x3a8baf08764bbaaf;
 const SET_HOSTNAME_FINGERPRINT: u64 = 0x739785d15e0c7fa8;
 const BACKOFF_FINGERPRINT: u64 = 0x2749dbb039baaa3a;
 const SHARED_SAVED_FINGERPRINT: u64 = 0x181983faf45559fa;
-const REVOCATION_FINGERPRINT: u64 = 0x6ebf36645809c24d;
+const REVOCATION_FINGERPRINT: u64 = 0xae6413da1bcf5b12;
 const SHARED_CUTOVER_FINGERPRINT: u64 = 0x358939aac41ef40a;
 const DISK_INSTALL_FINGERPRINT: u64 = 0x7089e614566ed61a;
 const CONSENT_CODEC_FINGERPRINT: u64 = 0x282490be2a44c4e5;

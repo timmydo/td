@@ -103,6 +103,8 @@ pub(crate) struct Host {
     /// Starts one control exchange about a unit, bounded likewise.
     control: Box<dyn Fn(Verb, &'static str) -> Result<Inspection, String>>,
     unit_time: Duration,
+    /// How long teardown waits for a killed child to be reaped.
+    teardown_reap: Duration,
 }
 
 impl Host {
@@ -131,6 +133,7 @@ impl Host {
                 Inspection::printing(command, REPLY_OUTPUT, EXCHANGE_TIME)
             }),
             unit_time: UNIT_TIME,
+            teardown_reap: TEARDOWN_REAP,
         }
     }
 
@@ -822,26 +825,27 @@ impl Revocation {
     }
 
     /// Generation teardown: a cutover in flight is abandoned without its
-    /// record, its render or td-svc child killed and reaped within
-    /// `TEARDOWN_REAP`, so the next generation's check repeats it. With
-    /// `reboot`, which says the slot is reaped, a failure whose reboot
-    /// td-svc has not accepted requests it now, or waits for the request
-    /// already made, no longer than its bound and one retry's; without it
-    /// no reboot is requested and the guard stands.
+    /// record, its render or td-svc child killed and reaped within the
+    /// host's teardown wait (production's `TEARDOWN_REAP`), so the next
+    /// generation's check repeats it. With `reboot`, which says the slot is
+    /// reaped, a failure whose reboot td-svc has not accepted requests it
+    /// now, or waits for the request already made, no longer than its
+    /// bound and one retry's; without it no reboot is requested and the
+    /// guard stands.
     pub fn abandon(&mut self, reboot: bool) {
         let request = match std::mem::replace(&mut self.phase, Phase::Idle(Status::Settled)) {
             Phase::Render(render) => {
-                render.reap_within(TEARDOWN_REAP);
+                render.reap_within(self.host.teardown_reap);
                 None
             }
             Phase::Restart(restart) => {
                 if let Some(exchange) = restart.exchange {
-                    exchange.child.reap_within(TEARDOWN_REAP);
+                    exchange.child.reap_within(self.host.teardown_reap);
                 }
                 None
             }
             Phase::Failed(Reboot::Asked(request, _)) if !reboot => {
-                request.reap_within(TEARDOWN_REAP);
+                request.reap_within(self.host.teardown_reap);
                 None
             }
             Phase::Failed(Reboot::Waiting | Reboot::Asked(..)) if !reboot => {
@@ -873,7 +877,7 @@ impl Revocation {
                 }
             }
         }
-        request.reap_within(TEARDOWN_REAP);
+        request.reap_within(self.host.teardown_reap);
     }
 }
 

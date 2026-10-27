@@ -175,9 +175,10 @@ impl Worker {
         assert_eq!(self.read(), b"\x161234");
     }
 
-    /// Left for root to kill.
+    /// Left for root to kill: it holds for `WAIT`, as long as any one of
+    /// a case's waits, rather than ending within a loaded case's run.
     fn hold(&mut self) {
-        thread::sleep(Duration::from_secs(30));
+        thread::sleep(WAIT);
     }
 }
 
@@ -712,7 +713,7 @@ fn refusals_from_the_baseline_send_the_worker_no_step() {
         let (event, presented) = drive(&mut login);
         assert_eq!(event, ended(false, kind, 0), "{script}");
         assert!(presented.is_empty() && login.request.is_none());
-        // The worker holds for thirty seconds: root killed and reaped it.
+        // The worker holds for `WAIT`: root killed and reaped it.
         assert!(login.child.is_none());
         assert!(started.elapsed() < Duration::from_secs(10));
     }

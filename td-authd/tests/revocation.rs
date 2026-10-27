@@ -199,6 +199,8 @@ pub(crate) struct Deadlines {
     pub(crate) exchange: Duration,
     pub(crate) unit: Duration,
     pub(crate) reboot: Duration,
+    /// Teardown's wait for a killed child to be reaped.
+    pub(crate) reap: Duration,
 }
 
 impl Default for Deadlines {
@@ -210,6 +212,7 @@ impl Default for Deadlines {
             // exchange's retry.
             unit: SLACK * 3,
             reboot: SLACK,
+            reap: SLACK,
         }
     }
 }
@@ -406,6 +409,7 @@ impl Machine {
             reboot: Self::helper(&self.reboots, reboots, REPLY_OUTPUT, self.deadlines.reboot),
             control: self.svc.control(self.deadlines.exchange),
             unit_time: self.deadlines.unit,
+            teardown_reap: self.deadlines.reap,
         }
     }
 
@@ -496,11 +500,12 @@ fn production_reads_the_fixed_paths_and_deadlines() {
     // The helpers' argv, bounds and deadlines are pinned in confinement,
     // since starting one here would run it.
     assert_eq!(
-        (EXCHANGE_TIME, host.unit_time, POLL_STEP),
+        (EXCHANGE_TIME, host.unit_time, POLL_STEP, host.teardown_reap),
         (
             Duration::from_secs(12),
             Duration::from_secs(30),
-            Duration::from_millis(250)
+            Duration::from_millis(250),
+            Duration::from_secs(1)
         )
     );
     // An exchange outlasts td-svc's own 10-second reply wait, and a unit's
@@ -1282,7 +1287,10 @@ fn teardown_abandons_a_cutover_without_its_record() {
     let pid = crate::inspection::tests::pid(render).unwrap();
     let started = Instant::now();
     revocation.abandon(true);
-    assert!(started.elapsed() < Duration::from_millis(500));
+    // Killed and reaped, not waited out: the render would outlive both
+    // its deadline and teardown's wait, each `SLACK`, and a teardown
+    // that waited out either would take nearly all of it.
+    assert!(started.elapsed() < SLACK / 2, "{:?}", started.elapsed());
     assert!(!Path::new(&format!("/proc/{pid}")).exists());
     assert_eq!(revocation.status(), Status::Settled);
     revocation.tick(true, || Reduced::Enforced).unwrap();
@@ -1487,7 +1495,10 @@ fn teardown_reaps_a_control_client_without_blocking() {
     };
     let started = Instant::now();
     revocation.abandon(true);
-    assert!(started.elapsed() < Duration::from_millis(500));
+    // Killed and reaped, not waited out: the client would outlive both
+    // its exchange's deadline and teardown's wait, each `SLACK`, and a
+    // teardown that waited out either would take nearly all of it.
+    assert!(started.elapsed() < SLACK / 2, "{:?}", started.elapsed());
     assert!(!Path::new(&format!("/proc/{pid}")).exists());
     assert_eq!(machine.recorded(), None);
 }
