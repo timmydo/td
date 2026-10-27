@@ -355,12 +355,13 @@ change moves it. The segment's size is dynamic, the rest of the
 partition, which the layout ends on whole 4 KiB sectors (DESIGN.md "Disk
 layout") so that stock cryptsetup opens the partition itself. Volume fit
 and the minimum volume size subtract those 16 MiB from the partition's
-length. The protected-tier upgrade re-encrypts online with checksum
-resilience, whose hotzone lives in the keyslots area, so the layout keeps
-no data-shift reserve. The LUKS2 UUID is the plan's volume UUID, which the
-Btrfs filesystem inside and the prepared selector also carry, and the
-label is `td-system`. The volume key is generated inside cryptsetup from
-`/dev/random` and never leaves it.
+length. The protected-tier upgrade re-encrypts online, keeping its
+resilience metadata in the keyslots area (checksums, or a journal of
+the hotzone), so the layout keeps no data-shift reserve. The LUKS2 UUID
+is the plan's volume UUID, which the Btrfs filesystem inside and the
+prepared selector also carry, and the label is `td-system`. The volume
+key is generated inside cryptsetup from `/dev/random` and never leaves
+it.
 
 Keyslot 0 holds the recovery key and keyslot 1 the first-boot protector,
 added with the same PBKDF parameters. Token 0 carries the sealed
@@ -2205,8 +2206,10 @@ operations' wire, steps and screens.
 | U4, inside the lockout take | the take's own crash rule ("Lockout") |
 | U5 | protected release; `td-upgrade` removed |
 
-Both resilience modes keep their hotzone in the keyslots area, so the
-upgrade needs no free space on the volume ("Device-bound formatting");
+Both resilience modes keep their metadata in the keyslots area
+(checksum resilience a SHA-256 of each 4096-byte block of the hotzone,
+journal resilience the hotzone's data), so the upgrade needs no free
+space on the volume ("Device-bound formatting");
 checksum resilience relies on whole atomic writes of the 4096-byte
 sector, which only a device stating such a unit provides, and journal
 resilience writes the data twice. The header's 12 KiB JSON area must
