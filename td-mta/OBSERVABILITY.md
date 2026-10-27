@@ -462,6 +462,8 @@ It is not exposed over public HTTP and supplies no mutation operation.
 | `jmap_preview` | Preview selection, decoding, text extraction and JSON output for one message requesting a preview. |
 | `jmap_body_values` | Body-value selection, decoding and JSON output for one message requesting bodyValues; includes all selected parts. |
 | `header_reuse` | Completed copies of previously verified header projections into provisional response storage; zero-duration count, not body verification or final request success. |
+| `summary_reuse` | Persisted common-header summaries copied into provisional response storage without body verification; zero-duration count. |
+| `structure_reuse` | Qualified persisted MIME tables reused after full body verification and entity-header rechecks; zero-duration count. Included work remains inside `jmap_structure`. |
 | `jmap_work_io`, `jmap_work_records`, `jmap_work_output`, `jmap_work_deadline`, `jmap_work_other` | Email/get projections whose shared MIME work meter stopped, split by its sticky reason; duration is the whole projection. Other storage capacity failures do not increment these counters. No message IDs or content are retained. |
 | `smtp_prepare` | Resident SMTP input validation, header preparation and digests for the complete account fanout; excludes DNS and database publication |
 | `smtp_publish` | SMTP receipt inspection and database publication; one-shot paths include connection setup and pre-effect address fallback, while retained SMTP session setup is measured by `db_connect` inside `smtp_commit`; an unknown COMMIT outcome counts as failure without changing settlement or replay policy |

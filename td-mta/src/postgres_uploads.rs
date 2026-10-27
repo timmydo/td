@@ -62,6 +62,7 @@ pub struct Upload {
     blob: BlobId,
     bytes: Arc<Vec<u8>>,
     body_digest: [u8; 32],
+    interpretation: Option<Arc<crate::postgres_mime_evidence::Prepared>>,
     request_digest: [u8; 32],
     ttl_ms: i64,
 }
@@ -201,6 +202,12 @@ pub fn prepare_with_meter(
         hash.update(part).map_err(|_| Error::Crypto)?;
     }
     charge(meter, clock, deadline, 0, 0)?;
+    let interpretation =
+        crate::postgres_mime_evidence::prepare_metered(bytes, &body_digest, deadline, meter, clock)
+            .map(Arc::new);
+    if Instant::now() >= deadline {
+        return Err(Error::Connection(postgres_probe::Error::Deadline));
+    }
     Ok(Upload {
         binding: binding.clone(),
         device,
@@ -208,6 +215,7 @@ pub fn prepare_with_meter(
         blob: BlobId::from_bytes(blob),
         bytes: Arc::new(owned),
         body_digest,
+        interpretation,
         request_digest: hash.finish().map_err(|_| Error::Crypto)?,
         ttl_ms,
     })
@@ -393,6 +401,7 @@ pub fn publish(
                     id: upload.blob,
                     bytes: &upload.bytes,
                     digest: &upload.body_digest,
+                    interpretation: upload.interpretation.as_deref(),
                     created_at,
                     changed: next,
                 },

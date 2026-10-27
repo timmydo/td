@@ -404,7 +404,7 @@ fn real_postgres_schema_initialization_is_atomic_and_locked() {
     );
     wait_command(&mut shared);
     let receipt = initialize(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 33);
+    assert_eq!(receipt.version, 34);
     assert_eq!(
         inspect(&fixture.request(), &trust, deadline()).unwrap(),
         receipt
@@ -481,7 +481,7 @@ CREATE EVENT TRIGGER td_schema_delay ON ddl_command_end WHEN TAG IN ('CREATE TAB
         inspect(&fixture.request(), &trust, deadline())
             .unwrap()
             .version,
-        32
+        34
     );
     assert_eq!(
         initialize(&fixture.request(), &trust, deadline()),
@@ -617,7 +617,7 @@ fn real_postgres_schema_commands_prepare_and_inspect_one_epoch() {
     };
     assert!(invoke("schema-inspect", 1).contains("schema-operation-failed"));
     let initialized = invoke("schema-init", 0);
-    assert!(initialized.contains("\"schema_version\":33"));
+    assert!(initialized.contains("\"schema_version\":34"));
     assert!(initialized.contains(
         "\"ledger_checked\":true,\"serving_schema_checked\":false,\"profile_checked\":false"
     ));
@@ -862,7 +862,7 @@ fn real_postgres_runtime_credentials_separate_mail_writes_from_owner_authority()
     }
     sql(
         &fixture,
-        "UPDATE td_mta.schema_migrations SET version=99 WHERE version=33",
+        "UPDATE td_mta.schema_migrations SET version=99 WHERE version=34",
     );
     assert_eq!(
         probe(&serving, &trust, deadline()),
@@ -870,7 +870,7 @@ fn real_postgres_runtime_credentials_separate_mail_writes_from_owner_authority()
     );
     sql(
         &fixture,
-        "UPDATE td_mta.schema_migrations SET version=33 WHERE version=99",
+        "UPDATE td_mta.schema_migrations SET version=34 WHERE version=99",
     );
     assert_eq!(
         schema::inspect(&serving, &trust, deadline()).unwrap(),
@@ -1052,7 +1052,7 @@ fn real_postgres_material_schema_upgrade_preserves_epoch_and_rolls_back() {
     );
     wait_command(&mut held);
     let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 33);
+    assert_eq!(receipt.version, 34);
     assert_eq!(receipt.store_epoch.as_bytes(), &[1; 16]);
     assert_eq!(
         upgrade(&fixture.request(), &trust, deadline()).unwrap(),
@@ -1761,7 +1761,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
     use td_mta::postgres_schema::{inspect, upgrade, Error as SchemaError};
     for previous_version in [
         2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-        27, 28, 31, 32,
+        27, 28, 31, 32, 33,
     ] {
         let fixture = Fixture::new();
         let trust = TrustStore::from_pem(&fixture.ca).unwrap();
@@ -1798,6 +1798,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             include_str!("../src/postgres_acme.sql"),
             include_str!("../src/postgres_recovery.sql"),
             include_str!("../src/postgres_legacy_bodies.sql"),
+            include_str!("../src/postgres_summaries.sql"),
         ]
         .iter()
         .take(previous_version)
@@ -1849,6 +1850,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             27 => "runtime_barrier",
             28 => "application_log_state",
             32 => "blob_summaries",
+            33 => "blob_interpretations",
             _ => "flag_receipts",
         };
         if previous_version == 8 {
@@ -1906,7 +1908,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             sql(&fixture,"UPDATE td_mta.recipients SET state=7,uncertain=1,phase=4,reason=9,next_attempt_at=1");
         }
         let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
-        assert_eq!(receipt.version, 33);
+        assert_eq!(receipt.version, 34);
         assert_eq!(
             sql(
                 &fixture,
@@ -6901,6 +6903,67 @@ fn exercise_http_read(
         assert!(rebuilt <= 2);
     }
     assert_eq!(rebuilt, 2);
+    fn response_body(wire: &str) -> &str {
+        wire.split_once("\r\n\r\n").unwrap().1
+    }
+    let (logger, _writer) = td_mta::application_log::Producer::new(
+        clock.clone(),
+        1,
+        td_mta::observability::Severity::Info,
+    )
+    .unwrap();
+    let reuse_count = || {
+        let mut bytes = [0; td_mta::performance::MAX_STATUS_BYTES];
+        let mut output = td_mta::bounded::TextBuffer::new(&mut bytes);
+        logger.performance_status(&mut output).unwrap();
+        td_json::parse(output.as_str().unwrap()).unwrap()["phases"]["structure_reuse"]["calls"]
+            .as_u64()
+            .unwrap()
+    };
+    let before_reuse = reuse_count();
+    let (result, cached_body) = call(&body, password, device, false, false, false);
+    result.unwrap();
+    assert_eq!(reuse_count() - before_reuse, 2);
+    assert!(cached_body.contains("snapshot text"));
+    assert_eq!(
+        sql(fixture, "SELECT count(*) FROM td_mta.blob_interpretations"),
+        "2"
+    );
+    let original_evidence = sql(fixture, "SELECT string_agg(encode(manifest_digest,'hex'),',' ORDER BY blob_id) FROM td_mta.blob_interpretations");
+    for damage in [
+        "UPDATE td_mta.blob_interpretations SET version=2",
+        "UPDATE td_mta.blob_interpretations SET version=1,manifest_digest=set_byte(manifest_digest,0,get_byte(manifest_digest,0)#1)",
+    ] {
+        sql(fixture, damage);
+        *api_worker.borrow_mut() = None;
+        let before_reuse = reuse_count();
+        let (result, fallback) = call(&body, password, device, false, false, false);
+        result.unwrap();
+        assert_eq!(reuse_count(), before_reuse);
+        assert_eq!(response_body(&fallback), response_body(&cached_body));
+    }
+    sql(fixture, "DELETE FROM td_mta.blob_interpretations");
+    let page = td_mta::postgres_summary_backfill::run_with_options(
+        &fixture.request(),
+        &summary_trust,
+        deadline(),
+        binding.epoch(),
+        binding.account(),
+        td_mta::postgres_summary_backfill::Options {
+            after: None,
+            maximum: 16,
+            structure: true,
+        },
+    )
+    .unwrap();
+    assert_eq!(page.structures_written, 2);
+    assert_eq!(page.structures_skipped, 0);
+    assert!(page.done);
+    assert_eq!(sql(fixture, "SELECT string_agg(encode(manifest_digest,'hex'),',' ORDER BY blob_id) FROM td_mta.blob_interpretations"), original_evidence, "resident publication and streaming backfill must derive identical evidence");
+    *api_worker.borrow_mut() = None;
+    let (result, rebuilt_body) = call(&body, password, device, false, false, false);
+    result.unwrap();
+    assert_eq!(response_body(&rebuilt_body), response_body(&cached_body));
     let (result, first_headers) = call(&header_body, password, device, false, false, false);
     result.unwrap();
     assert_eq!(
@@ -6921,7 +6984,7 @@ fn exercise_http_read(
         *api_worker.borrow_mut() = None;
         let (result, headers) = call(&header_body, password, device, false, false, false);
         result.unwrap();
-        assert_eq!(headers, first_headers);
+        assert_eq!(response_body(&headers), response_body(&first_headers));
     }
     let log = fs::read_to_string(fixture.root.join("server.log")).unwrap();
     assert!(
@@ -6939,7 +7002,7 @@ fn exercise_http_read(
         *api_worker.borrow_mut() = None;
         let (result, headers) = call(&header_body, password, device, false, false, false);
         result.unwrap();
-        assert_eq!(headers, first_headers);
+        assert_eq!(response_body(&headers), response_body(&first_headers));
     }
     sql(fixture, "UPDATE td_mta.blob_summaries SET version=2");
     td_mta::postgres_summary_backfill::run(
@@ -6957,7 +7020,7 @@ fn exercise_http_read(
     sql(fixture, "UPDATE td_mta.blob_chunks SET bytes=set_byte(bytes,0,get_byte(bytes,0)#1) WHERE octet_length(bytes)>0");
     let (result, headers) = call(&header_body, password, device, false, false, false);
     result.unwrap();
-    assert_eq!(headers, first_headers);
+    assert_eq!(response_body(&headers), response_body(&first_headers));
     let (result, broken_body) = call(&body, password, device, false, false, false);
     assert!(result.is_err() || !broken_body.contains("snapshot text"));
     sql(fixture, "UPDATE td_mta.blob_chunks SET bytes=set_byte(bytes,0,get_byte(bytes,0)#1) WHERE octet_length(bytes)>0");

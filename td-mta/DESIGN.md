@@ -2889,3 +2889,10 @@ native digest context per active verification and updates it with each existing
 of a verified pin; no header-only prefix substitutes for body verification.
 The allocation-free digest factory remains available to other operations.
 POSTGRES.md owns the snapshot and deadline contract.
+
+Persistent MIME interpretation reuses publication-derived tree descriptors,
+as specified in POSTGRES.md, after full current body verification and entity
+header rechecks. It does not create a weaker verified pin. Publication and
+owner backfill use the shared MIME parser under fixed versioned limits; absent
+or incompatible evidence retains the existing verified traversal. Original
+message bytes and mutable authorization remain authoritative.

@@ -47,6 +47,7 @@ pub enum Phase {
     JmapPreview,
     JmapBodyValues,
     SummaryReuse,
+    StructureReuse,
 }
 impl Phase {
     pub const ALL: &'static [Self] = &[
@@ -89,6 +90,7 @@ impl Phase {
         Self::JmapPreview,
         Self::JmapBodyValues,
         Self::SummaryReuse,
+        Self::StructureReuse,
     ];
     pub const fn code(self) -> &'static str {
         match self {
@@ -131,6 +133,7 @@ impl Phase {
             Self::JmapPreview => "jmap_preview",
             Self::JmapBodyValues => "jmap_body_values",
             Self::SummaryReuse => "summary_reuse",
+            Self::StructureReuse => "structure_reuse",
         }
     }
 }

@@ -31,6 +31,68 @@ pub struct Retained<'p, 'v, 'c, 'b, 'o, 'w> {
     pub remaining: &'b mut [u8],
     pub header_bytes: u64,
 }
+
+/// Recheck every entity header against a qualified stored table while retaining
+/// the current verified body. Cached offsets never supply source authority.
+pub(crate) fn from_evidence<'p, 'v, 'c, 'b, 'o, 'w>(
+    mut source: &'p mut PinnedBlob<'v, 'c>,
+    evidence: &crate::postgres_mime_evidence::Evidence,
+    buffers: Buffers<'b, '_, 'o>,
+    mut work: &'w mut Meter,
+    budget: &'w mut HeaderBudget,
+    clock: &dyn Clock,
+) -> Result<Retained<'p, 'v, 'c, 'b, 'o, 'w>, Error> {
+    let mut arena = buffers.header_bytes;
+    let parts = buffers
+        .parts
+        .get_mut(..evidence.parts.len())
+        .ok_or(Error::State)?;
+    parts.copy_from_slice(&evidence.parts);
+    let headers = buffers.headers.get_mut(..parts.len()).ok_or(Error::State)?;
+    let mut header_bytes = 0u64;
+    for (part, slot) in parts.iter().zip(headers.iter_mut()) {
+        source.check_deadline().map_err(Error::Policy)?;
+        let mut reader = root_headers::Cursor::new_extent(
+            source,
+            part.entity_start..part.entity_end,
+            evidence
+                .header_bytes
+                .checked_sub(header_bytes)
+                .ok_or(Error::State)?,
+            arena,
+            work,
+            clock.monotonic().map_err(Error::Policy)?,
+        )?;
+        while reader.poll(clock.monotonic().map_err(Error::Policy)?)?
+            != root_headers::Status::Complete
+        {}
+        let (next_source, next_work, view, remaining) =
+            reader.into_split_parts(clock.monotonic().map_err(Error::Policy)?)?;
+        if view.end.body_start != part.body_start {
+            return Err(Error::Policy(PolicyError::Corrupt));
+        }
+        header_bytes = header_bytes
+            .checked_add(view.end.header_bytes)
+            .ok_or(Error::State)?;
+        *slot = Some(view);
+        source = next_source;
+        work = next_work;
+        arena = remaining;
+    }
+    if header_bytes != evidence.header_bytes {
+        return Err(Error::Policy(PolicyError::Corrupt));
+    }
+    source.check_deadline().map_err(Error::Policy)?;
+    Ok(Retained {
+        source,
+        work,
+        budget,
+        parts,
+        headers,
+        remaining: arena,
+        header_bytes,
+    })
+}
 /// Native reads and shared parser turns keep the same pin and admission owners.
 /// Caller-backed headers remain immutable while body input can be overwritten.
 pub struct Cursor<'p, 'v, 'c, 'b, 'r, 'o, 'w> {

@@ -149,6 +149,7 @@ pub mod postgres_mailboxes;
 pub mod postgres_maintenance;
 pub mod postgres_materials;
 pub mod postgres_metadata_audit;
+mod postgres_mime_evidence;
 pub mod postgres_probe;
 pub mod postgres_profile_materials;
 pub mod postgres_read;

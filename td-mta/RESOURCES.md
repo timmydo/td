@@ -35,7 +35,7 @@ changing that validator requires an explicit atomic implementation update.
 | SMTP slots | 8 | 376064 | 3008512 |
 | HTTPS slots | 8 | 1703936 | 13631488 |
 | Body/search jobs | 3 | 1327104 | 3981312 |
-| Storage read views | 6 | 1609728 | 9658368 |
+| Storage read views | 6 | 1871872 | 11231232 |
 | Resident index cache | 1 | 4194304 | 4194304 |
 | Outbound slots | 1 | 572672 | 572672 |
 | Sort runs and merge buffers | 1 | 1048576 | 1048576 |
@@ -53,12 +53,12 @@ changing that validator requires an explicit atomic implementation update.
 | Process and allocator allowance | 1 | 8388608 | 8388608 |
 | SMTP fanout metadata | 4 | 2097152 | 8388608 |
 | SMTP resident DATA | 4 | 33554432 | 134217728 |
-| SMTP prepared body | 1 | 33554432 | 33554432 |
-| Upload ingress and retained body | 2 | 33554432 | 67108864 |
-| **Total** | | | **362202368** |
+| SMTP prepared body | 1 | 33816576 | 33816576 |
+| Upload ingress and retained body | 2 | 33816576 | 67633152 |
+| **Total** | | | **364561664** |
 
-The total is approximately 345.42 MiB against a 512 MiB configured budget;
-the remaining 174668544 bytes are unassigned headroom, not another cache.
+The total is approximately 347.67 MiB against a 512 MiB configured budget;
+the remaining 172309248 bytes are unassigned headroom, not another cache.
 The default process ledger excludes database-server memory and WAL mappings.
 The two default TLS handshakes remain configurable within the process budget.
 The earlier 128 MiB workload RSS goal is exceeded by the concurrent
@@ -4665,3 +4665,16 @@ Derived disk payload is at most 64 KiB per live blob, bounded in count by the
 account blob quota, and is not counted as original body bytes. PostgreSQL row,
 index and WAL overhead remains database capacity planning. These are planning
 estimates, not an allocation or measured RSS guarantee.
+
+### Persistent MIME evidence scratch
+
+Each read view adds 256 KiB for one encoded interpretation row, its decoded
+1024-part table and temporary checksum inputs. SMTP prepared-body and the two
+upload/retained-body reservations each add 256 KiB for the resident parser,
+encoded table and chunk digest vector. These additions total 2304 KiB at
+default counts. The stored table is at most 57344 bytes, chunk digests at most
+32768 bytes, plus a 32-byte manifest digest and fixed metadata per live blob;
+database row/index/WAL overhead is additional. Owner streaming backfill uses
+one 257-KiB header arena, 1024 parts and header views, a 64-KiB chunk buffer
+and the ordinary body verification cache. It is a separate administrative
+process, not another resident service pool. No whole-body copy is added.

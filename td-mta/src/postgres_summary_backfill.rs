@@ -31,6 +31,8 @@ pub struct Report {
     pub scanned: usize,
     pub written: usize,
     pub skipped: usize,
+    pub structures_written: usize,
+    pub structures_skipped: usize,
     pub verified_bytes: u64,
     pub after: Option<BlobId>,
     pub done: bool,
@@ -48,6 +50,41 @@ pub fn run(
     after: Option<BlobId>,
     maximum: usize,
 ) -> Result<Report, Error> {
+    run_with_options(
+        request,
+        trust,
+        deadline,
+        epoch,
+        account,
+        Options {
+            after,
+            maximum,
+            structure: false,
+        },
+    )
+}
+
+#[derive(Clone, Copy)]
+pub struct Options {
+    pub after: Option<BlobId>,
+    pub maximum: usize,
+    pub structure: bool,
+}
+
+pub fn run_with_options(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    epoch: StoreEpoch,
+    account: AccountId,
+    options: Options,
+) -> Result<Report, Error> {
+    use crate::ports::BlobReader;
+    let Options {
+        after,
+        maximum,
+        structure,
+    } = options;
     if request.mode != postgres_probe::Mode::Preparation {
         return Err(Error::Owner);
     }
@@ -70,6 +107,8 @@ pub fn run(
             scanned: 0,
             written: 0,
             skipped: 0,
+            structures_written: 0,
+            structures_skipped: 0,
             verified_bytes: 0,
             after,
             done: rows.len() <= maximum,
@@ -92,52 +131,76 @@ pub fn run(
                 report.done = false;
                 break;
             }
-            let fields = postgres_body::with_verified_body(worker, metadata, deadline, |body| {
-                let length = usize::try_from(
-                    body.len()
-                        .min((postgres_summaries::HEADER_LIMIT + 2) as u64),
-                )
-                .map_err(|_| crate::ports::Error::Invalid)?;
-                let mut prefix = Vec::new();
-                prefix
-                    .try_reserve_exact(length)
+            let (fields, interpretation) =
+                postgres_body::with_verified_pin(worker, metadata, deadline, |body| {
+                    let length = usize::try_from(
+                        body.len()
+                            .min((postgres_summaries::HEADER_LIMIT + 2) as u64),
+                    )
                     .map_err(|_| crate::ports::Error::Invalid)?;
-                prefix.resize(length, 0);
-                let mut read = 0;
-                while read < length {
-                    let count = body.read_at(
-                        read as u64,
-                        prefix.get_mut(read..).ok_or(crate::ports::Error::Invalid)?,
-                    )?;
-                    if count == 0 {
-                        return Err(crate::ports::Error::Corrupt);
+                    let mut prefix = Vec::new();
+                    prefix
+                        .try_reserve_exact(length)
+                        .map_err(|_| crate::ports::Error::Invalid)?;
+                    prefix.resize(length, 0);
+                    let mut read = 0;
+                    while read < length {
+                        let count = body.read_at(
+                            read as u64,
+                            prefix.get_mut(read..).ok_or(crate::ports::Error::Invalid)?,
+                        )?;
+                        if count == 0 {
+                            return Err(crate::ports::Error::Corrupt);
+                        }
+                        read = read
+                            .checked_add(count)
+                            .filter(|n| *n <= length)
+                            .ok_or(crate::ports::Error::Corrupt)?;
                     }
-                    read = read
-                        .checked_add(count)
-                        .filter(|n| *n <= length)
-                        .ok_or(crate::ports::Error::Corrupt)?;
-                }
-                Ok(postgres_summaries::derive(
-                    &prefix,
-                    prefix.len() as u64 == metadata.body.length,
-                    deadline,
-                ))
-            })
-            .map_err(Error::Body)?;
+                    let fields = postgres_summaries::derive(
+                        &prefix,
+                        prefix.len() as u64 == metadata.body.length,
+                        deadline,
+                    );
+                    let interpretation = if structure {
+                        crate::postgres_mime_evidence::prepare_verified(
+                            body,
+                            &metadata.body.digest,
+                            deadline,
+                        )?
+                    } else {
+                        None
+                    };
+                    Ok((fields, interpretation))
+                })
+                .map_err(Error::Body)?;
             report.verified_bytes += metadata.body.length;
+            let size = fields
+                .as_ref()
+                .map_or(0, |fields| fields.iter().map(Vec::len).sum::<usize>())
+                + interpretation
+                    .as_ref()
+                    .map_or(0, |value| value.table.len() + value.chunks.len() + 32);
+            if output_bytes + size > 256 * 1024 {
+                report.done = false;
+                break;
+            }
+            output_bytes += size;
             if let Some(fields) = fields {
-                let size = fields.iter().map(Vec::len).sum::<usize>();
-                if output_bytes + size > 256 * 1024 {
-                    report.done = false;
-                    break;
-                }
-                output_bytes += size;
                 worker.run(move |client| Box::pin(async move {
                     client.execute_typed("INSERT INTO td_mta.blob_summaries(account,blob_id,version,body_length,body_digest,fields) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(account,blob_id) DO UPDATE SET version=EXCLUDED.version,body_length=EXCLUDED.body_length,body_digest=EXCLUDED.body_digest,fields=EXCLUDED.fields", &[(&account.as_bytes().as_slice(), Type::BYTEA), (&blob.as_bytes().as_slice(), Type::BYTEA), (&postgres_summaries::VERSION, Type::INT4), (&(metadata.body.length as i64), Type::INT8), (&metadata.body.digest.as_slice(), Type::BYTEA), (&fields, Type::BYTEA_ARRAY)]).await
                 })).map_err(Error::Connection)?.map_err(|_| Error::Database)?;
                 report.written += 1;
             } else {
                 report.skipped += 1;
+            }
+            if let Some(value) = interpretation {
+                worker.run(move |client| Box::pin(async move {
+                    client.execute_typed("INSERT INTO td_mta.blob_interpretations(account,blob_id,version,body_length,body_digest,header_bytes,part_table,chunk_hashes,manifest_digest) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(account,blob_id) DO UPDATE SET version=EXCLUDED.version,body_length=EXCLUDED.body_length,body_digest=EXCLUDED.body_digest,header_bytes=EXCLUDED.header_bytes,part_table=EXCLUDED.part_table,chunk_hashes=EXCLUDED.chunk_hashes,manifest_digest=EXCLUDED.manifest_digest", &[(&account.as_bytes().as_slice(), Type::BYTEA), (&blob.as_bytes().as_slice(), Type::BYTEA), (&crate::postgres_mime_evidence::VERSION, Type::INT4), (&(metadata.body.length as i64), Type::INT8), (&metadata.body.digest.as_slice(), Type::BYTEA), (&(value.header_bytes as i64), Type::INT8), (&value.table, Type::BYTEA), (&value.chunks, Type::BYTEA), (&value.digest.as_slice(), Type::BYTEA)]).await
+                })).map_err(Error::Connection)?.map_err(|_| Error::Database)?;
+                report.structures_written += 1;
+            } else if structure {
+                report.structures_skipped += 1;
             }
             report.scanned += 1;
             report.after = Some(blob);

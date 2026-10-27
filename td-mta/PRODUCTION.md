@@ -335,3 +335,13 @@ those messages retain verified-parser fallback and their original raw bytes.
 Repeat for each account. New messages get summaries during publication and do
 not require a scheduled backfill. Compare `summary_reuse` and `body_verify`
 performance-counter deltas around cold client reads after the backfill.
+
+Schema 34 adds `blob_interpretations` using the same fenced owner upgrade
+procedure. Include that table in restored runtime mail grants and retain a
+schema-33 backup with its compatible binary. After restart, add `--structure`
+to the summary-backfill command to rebuild MIME evidence as well as headers.
+Track `structures_written` and `structures_skipped` in its reports; skipped
+messages retain verified parsing. Compare `structure_reuse` and
+`jmap_structure` counter deltas for individual message opens. Full-body
+verification remains enabled, so this upgrade does not eliminate attachment
+reads during a message open.

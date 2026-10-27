@@ -131,6 +131,7 @@ pub fn prepare_fanout(
             new_thread: prepared.new_thread,
             bytes: prepared.bytes.clone(),
             body_digest: prepared.body_digest,
+            interpretation: prepared.interpretation.clone(),
             request_digest: [0; 32],
             message_id: copy(&prepared.message_id)?,
             anchors: prepared.anchors.clone(),

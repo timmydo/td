@@ -87,6 +87,7 @@ pub struct Draft {
     new_thread: ThreadId,
     bytes: Arc<Vec<u8>>,
     body_digest: [u8; 32],
+    interpretation: Option<Arc<crate::postgres_mime_evidence::Prepared>>,
     request_digest: [u8; 32],
     message_id: String,
     anchors: Vec<String>,
@@ -343,6 +344,17 @@ pub fn prepare_with_attachments(
         return Err(Error::Connection(postgres_probe::Error::Deadline));
     }
     charge(&clock, meter, message.message_id.len())?;
+    let interpretation = crate::postgres_mime_evidence::prepare_metered(
+        &bytes,
+        &body_digest,
+        deadline,
+        meter,
+        &clock,
+    )
+    .map(Arc::new);
+    if Instant::now() >= deadline {
+        return Err(Error::Connection(postgres_probe::Error::Deadline));
+    }
     Ok(Draft {
         binding: binding.clone(),
         device: request.device,
@@ -354,6 +366,7 @@ pub fn prepare_with_attachments(
         new_thread: ThreadId::from_bytes(new_thread),
         bytes: Arc::new(bytes),
         body_digest,
+        interpretation,
         request_digest,
         message_id: copy(message.message_id)?,
         anchors,
@@ -584,6 +597,7 @@ pub fn publish(
                     id: draft.blob,
                     bytes: &draft.bytes,
                     digest: &draft.body_digest,
+                    interpretation: draft.interpretation.as_deref(),
                     created_at,
                     changed: next,
                 },

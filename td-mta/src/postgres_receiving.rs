@@ -63,6 +63,7 @@ pub struct Delivery {
     new_thread: ThreadId,
     bytes: Arc<Vec<u8>>,
     body_digest: [u8; 32],
+    interpretation: Option<Arc<crate::postgres_mime_evidence::Prepared>>,
     request_digest: [u8; 32],
     message_id: String,
     anchors: Arc<Vec<String>>,
@@ -212,6 +213,17 @@ pub fn prepare_with_meter(
     }
     let request_digest = hash.finish().map_err(|_| Error::Crypto)?;
     charge(&clock, meter, 0, 0)?;
+    let interpretation = crate::postgres_mime_evidence::prepare_metered(
+        &bytes,
+        &body_digest,
+        deadline,
+        meter,
+        &clock,
+    )
+    .map(Arc::new);
+    if Instant::now() >= deadline {
+        return Err(Error::Connection(postgres_probe::Error::Deadline));
+    }
     Ok(Delivery {
         binding: binding.clone(),
         operation: ReceivingOperationId::from_bytes(operation),
@@ -220,6 +232,7 @@ pub fn prepare_with_meter(
         new_thread,
         bytes: Arc::new(bytes),
         body_digest,
+        interpretation,
         request_digest,
         message_id,
         anchors: Arc::new(anchors),
@@ -500,6 +513,7 @@ async fn write_delivery(
             id: delivery.blob,
             bytes: &delivery.bytes,
             digest: &delivery.body_digest,
+            interpretation: delivery.interpretation.as_deref(),
             created_at,
             changed: next,
         },

@@ -419,7 +419,7 @@ mod tests {
         assert_eq!(actual.admission().work().request_seconds, 600);
         assert_eq!(actual.timeouts().execution_seconds(), 600);
         assert_eq!(actual.timeouts().limits().minimum_rate, 32768);
-        assert_eq!(actual.resources().total_bytes(), 244_761_856);
+        assert_eq!(actual.resources().total_bytes(), 247_121_152);
     }
     #[test]
     fn operator_memory_budget_accepts_a_larger_bounded_configuration() {
@@ -438,7 +438,7 @@ mod tests {
             .unwrap();
         assert_eq!(actual.resources().limits().memory_budget_bytes, 536870912);
         assert_eq!(actual.resources().limits().https_connections, 32);
-        assert!(actual.resources().total_bytes() > 362202368);
+        assert!(actual.resources().total_bytes() > 364561664);
     }
 
     #[test]

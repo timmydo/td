@@ -316,6 +316,7 @@ pub fn publish_next(
             let mut hash = Provider.sha256().map_err(|_| Error::Crypto)?;
             hash.update(&bytes).map_err(|_| Error::Crypto)?;
             let digest = hash.finish().map_err(|_| Error::Crypto)?;
+            let interpretation = crate::postgres_mime_evidence::prepare(&bytes, &digest, deadline);
             let usage = publication::charge(
                 client,
                 account_id,
@@ -335,6 +336,7 @@ pub fn publish_next(
                     id: blob,
                     bytes: &bytes,
                     digest: &digest,
+                    interpretation: interpretation.as_ref(),
                     created_at: now,
                     changed: next,
                 },

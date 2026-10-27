@@ -693,6 +693,12 @@ impl MailRead for crate::postgres_read::Snapshot<'_> {
             } else {
                 None
             };
+            let evidence = if projection.selection.body() {
+                self.mime_evidence(metadata, projection.limits)
+                    .map_err(postgres_read_error)?
+            } else {
+                None
+            };
             let mut result = Err(Error::State);
             self.with_interpreted_body(email, |verified, pin| {
                 if verified != metadata {
@@ -703,13 +709,14 @@ impl MailRead for crate::postgres_read::Snapshot<'_> {
                     cache: cache.as_deref_mut(),
                     capture: &mut capture,
                 };
-                result = write_verified_email(
+                result = email_get::write_with_evidence(
                     &mut tee,
                     pin,
                     projection.limits,
                     (projection.selection, projection.options),
                     projection.clock,
                     projection.work,
+                    evidence.as_ref(),
                 );
                 Ok(())
             })

@@ -259,7 +259,7 @@ remain enforced. A plan exceeding the configured budget is refused.
 
 For example, `memory_budget_bytes=536870912` explicitly selects the default
 512-MiB planning budget. This is not an OS-enforced RSS limit. The current
-default plan is 362202368 bytes (about 345.42 MiB), including the
+default plan is 364561664 bytes (about 347.67 MiB), including the
 4-MiB index cache. Bounded folder/keyword prefix prefetch adds 128 KiB per read
 view (768 KiB at the default six views); tightly sized budgets must allow
 this additional scratch reservation. It does not raise protocol limits.
@@ -1974,3 +1974,10 @@ Persistent common-header summaries add 1152 KiB of planned scratch per storage
 read view (6912 KiB at the default six views). Configurations with tightly sized
 `memory_budget_bytes` must allow this increase. The default remains 512 MiB;
 connection, message and allocation ceilings do not increase.
+
+Persistent MIME evidence adds another 256 KiB per storage read view and 256 KiB
+per prepared SMTP/upload body reservation: 2304 KiB at default counts. A
+tightly sized memory budget must allow this additional increase. The 512-MiB
+default and protocol concurrency limits remain the same. Configurations using
+different header, MIME-part or nesting limits use verified parsing rather than
+the fixed-version persisted interpretation.

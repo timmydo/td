@@ -626,3 +626,12 @@ Email and corrupted-body checks. This proves historical header reuse never
 becomes permission to read corrupt body bytes. Unit fixtures exercise shared
 Unicode/header decoding, body-size independence and expired-deadline omission.
 These are correctness checks; no elapsed-time performance threshold is gated.
+
+The same native fixture checks MIME evidence from draft publication, exact
+response equality with unsupported/corrupted evidence fallback, and streaming
+owner rebuild equality with the resident publication digest. Corrupt original
+body bytes still refuse body responses despite valid retained evidence.
+Unit fixtures prove exhausted publication credit cannot obtain fresh MIME
+admission and that a decoded attachment larger than 2 MiB yields identical
+resident and streamed evidence when funded. HTTP comparisons exclude the
+wall-clock Date header; these checks add no latency pass/fail thresholds.

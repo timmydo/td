@@ -137,7 +137,19 @@ pub fn write_verified(
     clock: &dyn Clock,
     work: &mut Meter,
 ) -> Result<(), Error> {
-    let result = write_verified_inner(output, pin, limits, selection, clock, work);
+    write_with_evidence(output, pin, limits, selection, clock, work, None)
+}
+
+pub(crate) fn write_with_evidence(
+    output: &mut (impl Output + ?Sized),
+    pin: &mut PinnedBlob<'_, '_>,
+    limits: &Limits,
+    selection: (&Selection, Options),
+    clock: &dyn Clock,
+    work: &mut Meter,
+    evidence: Option<&crate::postgres_mime_evidence::Evidence>,
+) -> Result<(), Error> {
+    let result = write_verified_inner(output, pin, limits, selection, clock, work, evidence);
     output.check()?;
     if let Some(stop) = work.stopped() {
         return Err(mime(stop));
@@ -225,6 +237,7 @@ fn write_verified_inner(
     selection: (&Selection, Options),
     clock: &dyn Clock,
     work: &mut Meter,
+    evidence: Option<&crate::postgres_mime_evidence::Evidence>,
 ) -> Result<(), Error> {
     output.check()?;
     pin.check_deadline().map_err(storage)?;
@@ -277,27 +290,40 @@ fn write_verified_inner(
     let mut parts: Vec<Part> = buffer(limits.mime_parts)?;
     let mut headers = buffer(limits.mime_parts)?;
     let length = pin.len();
-    let mut cursor = blob_structure::Cursor::new(
-        pin,
-        blob_structure::Settings {
-            extent: 0..length,
-            limits: parse_limits,
-        },
-        blob_structure::Buffers {
-            header_bytes: &mut arena,
-            body: &mut chunk,
-            parts: &mut parts,
-            headers: &mut headers,
-        },
-        work,
-        &mut budget,
-        now(clock)?,
-    )
-    .map_err(mime)?;
-    while cursor.poll_batch(clock).map_err(mime)? != mime_structure::Status::Complete {
-        worker.check()?;
-    }
-    let mut original = cursor.finish(now(clock)?).map_err(mime)?;
+    let buffers = blob_structure::Buffers {
+        header_bytes: &mut arena,
+        body: &mut chunk,
+        parts: &mut parts,
+        headers: &mut headers,
+    };
+    let mut original = if let Some(evidence) = evidence {
+        let retained =
+            blob_structure::from_evidence(pin, evidence, buffers, work, &mut budget, clock)
+                .map_err(mime)?;
+        crate::performance::record(
+            Phase::StructureReuse,
+            std::time::Duration::ZERO,
+            Outcome::Success,
+        );
+        retained
+    } else {
+        let mut cursor = blob_structure::Cursor::new(
+            pin,
+            blob_structure::Settings {
+                extent: 0..length,
+                limits: parse_limits,
+            },
+            buffers,
+            work,
+            &mut budget,
+            now(clock)?,
+        )
+        .map_err(mime)?;
+        while cursor.poll_batch(clock).map_err(mime)? != mime_structure::Status::Complete {
+            worker.check()?;
+        }
+        cursor.finish(now(clock)?).map_err(mime)?
+    };
     let count = original.parts.len();
     let metadata_limit = limits.header_bytes.min(16 * 1024);
     let mut metadata = Metadata::new(metadata_limit)?;

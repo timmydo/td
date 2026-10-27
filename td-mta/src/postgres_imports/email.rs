@@ -80,6 +80,8 @@ fn publish_policy(
         return Err(Error::Invalid);
     }
     let (anchors, own) = identifiers(bytes, deadline)?;
+    let interpretation =
+        crate::postgres_mime_evidence::prepare(bytes, &value.body_digest, deadline);
     let bytes = bytes.to_vec();
     let value = value.clone();
     let authority = authority.clone();
@@ -176,6 +178,7 @@ fn publish_policy(
                         id: blob,
                         bytes: &bytes,
                         digest: &value.body_digest,
+                        interpretation: interpretation.as_ref(),
                         created_at,
                         changed: next,
                     },

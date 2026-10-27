@@ -315,7 +315,7 @@ impl Limits {
             Reservation {
                 name: "read views",
                 count: self.storage_views,
-                bytes_each: sum("read view", &[READ_VIEW_SCRATCH_BYTES, 1152 * KIB])?,
+                bytes_each: sum("read view", &[READ_VIEW_SCRATCH_BYTES, 1408 * KIB])?,
             },
             Reservation {
                 name: "index cache",
@@ -393,12 +393,12 @@ impl Limits {
             Reservation {
                 name: "SMTP prepared body",
                 count: 1,
-                bytes_each: self.message_bytes,
+                bytes_each: sum("SMTP preparation", &[self.message_bytes, 256 * KIB])?,
             },
             Reservation {
                 name: "upload ingress and retained body",
                 count: 2,
-                bytes_each: self.message_bytes,
+                bytes_each: sum("upload preparation", &[self.message_bytes, 256 * KIB])?,
             },
             Reservation {
                 name: "account metadata",
@@ -445,7 +445,7 @@ mod tests {
     #[test]
     fn default_ledger_pins_documented_budget() -> Result<(), ResourceError> {
         let plan = Limits::default().plan()?;
-        assert_eq!(plan.total_bytes(), 362_202_368);
+        assert_eq!(plan.total_bytes(), 364_561_664);
         const { assert!(crate::format::MAX_VALUE_BYTES + crate::format::MAX_KEY_BYTES + 48 <= 68 * KIB) };
         assert_eq!(
             READ_VIEW_SCRATCH_BYTES,
@@ -764,10 +764,10 @@ mod tests {
         }
         .plan()?;
         assert_eq!(original.total_bytes() - smaller.total_bytes(), 7 * 16 * MIB);
-        for (name, count) in [
-            ("SMTP resident DATA", SMTP_DATA_JOBS),
-            ("SMTP prepared body", 1),
-            ("upload ingress and retained body", 2),
+        for (name, count, extra) in [
+            ("SMTP resident DATA", SMTP_DATA_JOBS, 0),
+            ("SMTP prepared body", 1, 256 * KIB),
+            ("upload ingress and retained body", 2, 256 * KIB),
         ] {
             let row = smaller
                 .reservations()
@@ -777,7 +777,7 @@ mod tests {
                     "missing resident body reservation",
                 ))?;
             assert_eq!(row.count, count);
-            assert_eq!(row.bytes_each, 16 * MIB);
+            assert_eq!(row.bytes_each, 16 * MIB + extra);
         }
         assert!(matches!(
             Limits {

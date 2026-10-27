@@ -64,6 +64,7 @@ pub struct Submission {
     id: SubmissionId,
     blob: BlobId,
     body_digest: [u8; 32],
+    interpretation: Option<Arc<crate::postgres_mime_evidence::Prepared>>,
     request_digest: [u8; 32],
 }
 impl Submission {
@@ -176,12 +177,24 @@ pub fn prepare_with_meter(
     }
     let request_digest = hash.finish().map_err(|_| Error::Crypto)?;
     charge(clock, meter, deadline, 0)?;
+    let interpretation = crate::postgres_mime_evidence::prepare_metered(
+        input.bytes(),
+        &body_digest,
+        deadline,
+        meter,
+        clock,
+    )
+    .map(Arc::new);
+    if Instant::now() >= deadline {
+        return Err(Error::Connection(postgres_probe::Error::Deadline));
+    }
     Ok(Submission {
         input,
         operation: SubmissionOperationId::from_bytes(operation),
         id: SubmissionId::from_bytes(id),
         blob: BlobId::from_bytes(blob),
         body_digest,
+        interpretation,
         request_digest,
     })
 }
@@ -432,6 +445,7 @@ pub fn publish(
                     id: value.blob,
                     bytes: input.bytes(),
                     digest: &value.body_digest,
+                    interpretation: value.interpretation.as_deref(),
                     created_at: send_at,
                     changed: next,
                 },

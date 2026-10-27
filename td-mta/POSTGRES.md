@@ -7216,3 +7216,60 @@ and restart the upgraded binary. Existing messages remain readable before
 backfill. Backups include derived rows, but the original messages remain the
 source for rebuilding them. A rollback binary must understand schema 33; do
 not restart a schema-32 binary against the upgraded ledger.
+
+## Persistent MIME interpretation (schema 34)
+
+`blob_interpretations` holds optional, rebuildable MIME evidence per account
+and blob. Version 1 fixes the parser limits at 256 KiB of aggregate headers,
+1024 parts and depth 32. Its explicit 56-byte part records preserve preorder,
+parent, entity/body/type extents, decoded size, media, encoding and diagnostics.
+A domain-separated SHA-256 binds the table, aggregate header count and one
+SHA-256 per 64-KiB body chunk to the whole-body digest and length. This is
+publication evidence, not a MAC or independent protection against a database
+writer replacing both data and evidence. Semantic parser changes require an
+interpretation version bump.
+
+Delivery, upload, draft, submission and import preparation derive evidence
+from their owned immutable bytes before the publication transaction. SMTP
+preparation remains serialized with publication. Locally composed failure
+notices derive their evidence within their existing bounded transaction.
+Evidence insertion shares the blob's durable transaction; optional parsing
+failure omits the row, while SQL failure refuses publication. The original job
+deadline still governs preparation. No extra background worker is started.
+
+Metered publication prepays a finite child allowance from the original job
+before parsing, hashing or encoding. Each dimension reserves at most half of
+the remaining credit, further capped by input-size bounds; unused or failed
+cache work is not refunded. This leaves credit for publication without giving
+the cache new admission. Insufficient credit omits optional evidence and
+preserves the verified-parser fallback. Standalone import, notice and owner
+backfill preparation has a finite 512-MiB I/O, 64-million-record and 128-MiB
+decoded-output allowance per message under its original deadline. Decoded-size
+work is distinct from the much smaller retained evidence and page-output caps.
+
+For a body-bearing Email/get, the original authenticated snapshot loads at
+most one interpretation row at a time. Matching version, limits, length and
+digest, bounded format, checksum and tree extents are checked before use.
+Missing or incompatible evidence falls back to the existing MIME traversal.
+A hit still verifies the COMPLETE original body before obtaining a pin, then
+rereads entity headers at stored extents and checks their endpoints and total
+header count. Current headers supply names, MIME labels and dispositions;
+cached descriptors skip only traversal of body bytes and encoded-size counting.
+Header inconsistency after qualification fails closed. Original work bounds,
+deadline, authorization and final response checks remain in force.
+`structure_reuse` counts successful qualified table reuse. Raw downloads,
+search and integrity auditing retain their existing full-body verification.
+The stored chunk hashes do not yet authorize partial verification.
+
+`summary-backfill --structure` additionally rebuilds MIME evidence under the
+same owner authority, snapshot, cursor and known-COMMIT rules as summary
+backfill. It streams one verified body through bounded header, part and chunk
+buffers; it does not allocate a whole-message buffer. The existing 64-MiB
+verification and 256-KiB derived-output page caps cover both kinds of evidence.
+Reports add `structures_written` and `structures_skipped`; a skipped MIME
+interpretation does not prevent rebuilding a valid header summary, or vice
+versa. Reduce the page limit if parsing reaches the original finite deadline.
+New messages require no scheduled backfill. Cascading blob deletion removes
+both kinds of evidence, and neither changes account sequence or Email history.
+Schema-33 binaries cannot serve schema 34; use the explicit fenced upgrade
+procedure and retain a consistent pre-upgrade backup for recovery.

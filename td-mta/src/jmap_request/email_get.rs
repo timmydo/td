@@ -125,7 +125,7 @@ impl Selection {
     pub(super) fn headers_only(&self) -> bool {
         !self.body() && !self.headers.is_empty()
     }
-    fn body(&self) -> bool {
+    pub(super) fn body(&self) -> bool {
         self.text || self.html || self.attachments || self.preview || self.values
     }
 }
@@ -135,6 +135,7 @@ impl Default for Selection {
     }
 }
 pub(super) use body::search_verified;
+pub(crate) use body::write_with_evidence;
 pub use body::{write_verified, Output};
 pub(super) struct BodyProjection<'a> {
     pub metadata: crate::email_response::EmailMetadata,

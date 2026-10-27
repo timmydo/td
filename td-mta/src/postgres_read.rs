@@ -659,6 +659,46 @@ impl Snapshot<'_> {
         })();
         self.retain(result)
     }
+    pub(crate) fn mime_evidence(
+        &mut self,
+        metadata: Metadata,
+        limits: &crate::limits::Limits,
+    ) -> Result<Option<crate::postgres_mime_evidence::Evidence>, Error> {
+        use crate::postgres_mime_evidence as mime;
+        self.check()?;
+        if limits.header_bytes != mime::HEADER_BYTES
+            || limits.mime_parts != mime::PARTS
+            || limits.mime_depth != mime::DEPTH
+        {
+            return Ok(None);
+        }
+        let account = self.identity.account;
+        let blob = metadata.blob;
+        let result = self.worker.run(|client| Box::pin(async move {
+            client.query_typed_opt("SELECT body_length,body_digest,header_bytes,part_table,chunk_hashes,manifest_digest FROM td_mta.blob_interpretations WHERE account=$1 AND blob_id=$2 AND version=$3", &[(&account.as_bytes().as_slice(), Type::BYTEA), (&blob.as_bytes().as_slice(), Type::BYTEA), (&mime::VERSION, Type::INT4)]).await.map_err(|_| Error::Database)
+        })).map_err(Error::Connection).and_then(|row| row);
+        let Some(row) = self.retain(result)? else {
+            return Ok(None);
+        };
+        let evidence = (|| {
+            let length: i64 = row.try_get(0).ok()?;
+            let digest: &[u8] = row.try_get(1).ok()?;
+            if u64::try_from(length).ok()? != metadata.body.length || digest != metadata.body.digest
+            {
+                return None;
+            }
+            let headers: i64 = row.try_get(2).ok()?;
+            let prepared = mime::Prepared {
+                header_bytes: u64::try_from(headers).ok()?,
+                table: row.try_get(3).ok()?,
+                chunks: row.try_get(4).ok()?,
+                digest: row.try_get::<_, &[u8]>(5).ok()?.try_into().ok()?,
+            };
+            mime::validate(metadata.body.length, &metadata.body.digest, &prepared)
+        })();
+        self.check()?;
+        Ok(evidence)
+    }
     /// Prefetch bounded value prefixes; pagination continues after their tail.
     pub fn prefetch_values(
         &mut self,

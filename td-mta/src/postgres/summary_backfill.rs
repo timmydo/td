@@ -18,11 +18,20 @@ struct Options {
     account: AccountId,
     after: Option<BlobId>,
     maximum: usize,
+    structure: bool,
 }
 fn arguments(mut args: impl Iterator<Item = OsString>) -> Option<Options> {
     let (mut connection, mut epoch, mut account, mut after, mut maximum) =
         (None, None, None, None, None);
+    let mut structure = false;
     while let Some(flag) = args.next() {
+        if flag == "--structure" {
+            if structure {
+                return None;
+            }
+            structure = true;
+            continue;
+        }
         let value = args.next()?.into_string().ok()?;
         match flag.to_str()? {
             "--connection-file" if connection.is_none() => connection = Some(value),
@@ -46,6 +55,7 @@ fn arguments(mut args: impl Iterator<Item = OsString>) -> Option<Options> {
         account: account?,
         after,
         maximum: maximum.unwrap_or(16),
+        structure,
     })
 }
 pub(super) fn run(args: impl Iterator<Item = OsString>) -> io::Result<ExitCode> {
@@ -61,14 +71,17 @@ pub(super) fn run(args: impl Iterator<Item = OsString>) -> io::Result<ExitCode> 
         }
     };
     let result = with_addresses(&loaded, |request, deadline| {
-        postgres_summary_backfill::run(
+        postgres_summary_backfill::run_with_options(
             request,
             &loaded.trust,
             deadline,
             options.epoch,
             options.account,
-            options.after,
-            options.maximum,
+            postgres_summary_backfill::Options {
+                after: options.after,
+                maximum: options.maximum,
+                structure: options.structure,
+            },
         )
         .map_err(|error| {
             use postgres_summary_backfill::Error;
@@ -91,7 +104,7 @@ pub(super) fn run(args: impl Iterator<Item = OsString>) -> io::Result<ExitCode> 
                 .after
                 .map(|id| format!("\"{id}\""))
                 .unwrap_or_else(|| "null".to_owned());
-            writeln!(io::stdout().lock(), "{{\"schema\":1,\"command\":\"{COMMAND}\",\"status\":\"ok\",\"scanned\":{},\"written\":{},\"skipped\":{},\"verified_bytes\":{},\"after\":{after},\"done\":{}}}", report.scanned, report.written, report.skipped, report.verified_bytes, report.done)?;
+            writeln!(io::stdout().lock(), "{{\"schema\":1,\"command\":\"{COMMAND}\",\"status\":\"ok\",\"scanned\":{},\"written\":{},\"skipped\":{},\"structures_written\":{},\"structures_skipped\":{},\"verified_bytes\":{},\"after\":{after},\"done\":{}}}", report.scanned, report.written, report.skipped, report.structures_written, report.structures_skipped, report.verified_bytes, report.done)?;
             Ok(ExitCode::SUCCESS)
         }
         Err((stage, code)) => {
