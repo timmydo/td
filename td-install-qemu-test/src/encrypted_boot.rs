@@ -11,7 +11,7 @@ use super::encrypted::{
 use super::*;
 use installation_protocol::{scrub, RecoveryDigits, RECOVERY_DIGITS};
 
-/// The private port the installation leg sends the key typed back over:
+/// The private port the installation leg sends the key shown over:
 /// the virtio serial port the host names `ORACLE_SIDE_PORT`, found by
 /// that name, since nothing here makes the `/dev/virtio-ports` links.
 pub(super) fn key_channel() -> Result<PathBuf, String> {

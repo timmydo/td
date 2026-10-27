@@ -639,11 +639,12 @@ the check. In the phase the fixture reads, without a claim, both GPT
 ranges (the protective MBR, primary header and entry array; the backup
 array and header) and requires them zero, then reports
 `TD-INSTALL-ENCRYPTED-NO-TABLE` with the plan's UUID. It asks for the
-recovery key once, requires a second ask refused as sent (16), types
-back the key with its last digit changed and requires the mismatch
-refusal (17) and status still in the phase, then types the key back and
-requires status still in the phase (`TD-INSTALL-RECOVERY-KEY-TYPED-BACK`)
-and, polling, completion and the finished-complete report. The service
+recovery key once, requires a second ask refused as sent (16), sends
+an acknowledgement naming another review and requires the stale-review
+refusal (11) and status still in the phase, then acknowledges the key,
+sending nothing of it, and requires status still in the phase
+(`TD-INSTALL-RECOVERY-KEY-ACKNOWLEDGED`) and, polling, completion and
+the finished-complete report. The service
 must exit successfully and leave no workspace or bound loop. No sampled
 line may hold the key's 48 digits or its groups joined by hyphens or by
 spaces; every

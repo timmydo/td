@@ -30,7 +30,7 @@ const AUTOMATIC: &str = "The account signs in automatically without a password o
 const DEVICE_BOUND: &[&str] = &[
     LOSS,
     "Storage is encrypted to this computer's TPM; this does not protect a lost computer.",
-    "The account signs in automatically. Write down the recovery key shown at the end.",
+    "The account signs in automatically. Keep the recovery key shown at the end.",
 ];
 const UNENCRYPTED_NO_TPM: &[&str] = &[
     LOSS,
@@ -62,10 +62,12 @@ const DEVICE_BOUND_DETAILS: &[&str] = &[
      removed drive or a copied image), not a lost or stolen computer.",
     "What the disk held before installation is not erased: blocks the new \
      system has not overwritten keep it, readable to whoever has the disk.",
-    "A recovery key follows. It is shown once, no copy is kept, and it must \
-     be typed back before the installation completes; until then the disk \
-     does not start. It is the only way to open the disk if this computer's \
-     TPM, firmware measurements or startup files change.",
+    "A recovery key follows, as digits and a code a phone can scan. It is \
+     shown once and no copy is kept; the installation completes once you say \
+     it is kept, and until then the disk does not start. Nothing asks you to \
+     type it now; it is typed only to recover the disk. It is the only way \
+     to open the disk if this computer's TPM, firmware measurements or \
+     startup files change.",
     "Until the installed system first starts, release is not bound to this \
      computer's startup chain: any other system that leaves PCR 12 at zero, \
      td's live medium excepted, can release it, and so can the administrator \
@@ -580,7 +582,8 @@ mod tests {
             "not authenticate a person",
             "not a lost or stolen computer",
             "is not erased",
-            "shown once, no copy is kept",
+            "shown once and no copy is kept",
+            "Nothing asks you to type it now; it is typed only to recover the disk.",
             "PCR 12 at zero",
             "boot-menu choice",
             "never shown, but a console server or BMC recorder",

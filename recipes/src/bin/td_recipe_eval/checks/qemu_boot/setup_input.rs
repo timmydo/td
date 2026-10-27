@@ -7,7 +7,7 @@
 
 use super::recovery_screen::{KeyGlyphs, DIGITS};
 use super::update::{ppm, read_capture};
-use super::{qmp_deadline, qmp_json_path, ConsoleEvidence, Qmp, QMP_IO_TIMEOUT, VT_KEY_PACE};
+use super::{qmp_deadline, qmp_json_path, ConsoleEvidence, Qmp, QMP_IO_TIMEOUT};
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -34,8 +34,8 @@ const KEY_SHOWN_INTERVAL: Duration = Duration::from_millis(500);
 pub(crate) const TARGET_SERIAL: &str = "td-setup-target";
 
 /// The recovery key as the oracle read it from the display, its digits
-/// zeroed on drop. Only `Act::ReadKey` fills it, and `Act::TypeKey` and
-/// the host's later legs use it.
+/// zeroed on drop. Only `Act::ReadKey` fills it, and the host's later
+/// legs use it: the wizard never has any of it typed.
 #[derive(Default)]
 pub(crate) struct ReadKey {
     digits: Option<Box<[u8; DIGITS]>>,
@@ -51,11 +51,6 @@ impl Drop for ReadKey {
 }
 
 impl ReadKey {
-    /// The 48 digits read, if they have been.
-    pub(crate) fn digits(&self) -> Option<&[u8; DIGITS]> {
-        self.digits.as_deref()
-    }
-
     /// The digits read, moved out.
     pub(crate) fn take(&mut self) -> Option<Box<[u8; DIGITS]>> {
         self.digits.take()
@@ -69,10 +64,8 @@ pub(crate) enum Act {
     /// Press each key alone, in turn.
     Keys(Vec<&'static str>),
     /// Read the recovery key from the display with these references into
-    /// the cell, then press Return to type it back.
+    /// the cell, then press Return to go on to say it is kept.
     ReadKey(Rc<KeyGlyphs>, KeyCell),
-    /// Type the key the cell holds on the keyboard, then Return.
-    TypeKey(KeyCell),
 }
 
 /// Once td-setup says it showed a state holding every space-separated
@@ -300,20 +293,6 @@ impl<'a> SetupInputController<'a> {
                     let digits = self.read_key(glyphs)?;
                     cell.borrow_mut().digits = Some(digits);
                     self.press("ret")?;
-                }
-                Act::TypeKey(cell) => {
-                    let keys = cell
-                        .borrow()
-                        .digits()
-                        .ok_or("no recovery key was read to type back")?
-                        .iter()
-                        .map(|digit| console_key(*digit))
-                        .collect::<Option<Vec<_>>>()
-                        .ok_or("the key read holds a byte that is not a digit")?;
-                    for key in keys.into_iter().chain(["ret"]) {
-                        self.press(key)?;
-                        std::thread::sleep(VT_KEY_PACE);
-                    }
                 }
             }
             self.step = self.step.saturating_add(1);

@@ -145,7 +145,7 @@ the saved settings and UUID. Preserve plans have the unencrypted storage and
 zero basis; these are existing-storage facts, not a new TPM probe decision.
 The private consent review appends a boolean preserve byte after storage,
 and its greeting is `TDINA03\n`. The ordinary service greeting is
-`TDINS07\n`. The mode is part of the reviewed plan and exact Execute bytes.
+`TDINS08\n`. The mode is part of the reviewed plan and exact Execute bytes.
 
 Before re-signing, the private staged manifest must hash to the deployment
 ID bound by the reviewed plan. Full staged payload verification follows under
@@ -294,16 +294,18 @@ Every step page shows step buttons at the right of its footer row,
 laid out by td-setup's `nav` over td-ui's `Button`: Back where Escape
 steps back and Next where Return steps on, each named for what it does
 there: Reinstall and Fresh install on welcome, Next on the disk list and
-the shown recovery key, Review on settings, Install on the review, Confirm on the type-back, and
-Withdraw alone on the consent view; the waiting, unavailable and refused
+the shown recovery key, Review on settings, Install on the review,
+Done once the recovery key is kept, and Withdraw alone on the consent
+view; the waiting, unavailable and refused
 notices have Back alone. The two are fixed slots fifteen cells wide, Next
 always rightmost and Back always left of it; on welcome these slots choose
 Fresh install and Reinstall respectively. A lone Back or Withdraw is
 kept in its slot, so a button never sits where the next page puts the other
 kind. Next is painted as the default step, in the selection's colour,
 and disabled while Return would do nothing: with no disk selected, while
-a proposal or an execute is outstanding, or while a typed key is with
-the service. A button acts on a left release over the one pressed, on
+a proposal or an execute is outstanding, or while the recovery key's
+acknowledgement is with the service, when Back is not offered either.
+A button acts on a left release over the one pressed, on
 the page it was pressed on, so a press dragged off it, a key between
 press and release, or the page changing under it does nothing, and
 leaving the window forgets the press. A button is hit only as the last
@@ -616,50 +618,58 @@ stands when the connection ends.
 A device-bound installation reaches completion through its recovery-key
 phase ("Device-bound records"). When status first reports the phase for
 the review it executed, the window asks for the key, once per execution,
-and shows its eight groups in td-protector's display form, saying that
-it is shown only now, that no copy is kept, and that it is the only way
-to open the disk if the TPM, firmware measurements or boot chain change.
-The phase has no deadline and changes only with what the window sends, so
-its state is not asked for while the key is shown or typed. Return asks
-for it back on a field that takes digits, spaces and hyphens and the
-caret keys; as each key is pressed the page says how many digits are
-typed or names the first group whose value or check digit fails
-(td-protector's `check_partial`), and Return names it, or a short count,
-before anything is sent. A key whose every group checks is sent as its 48
-digits and the field emptied; the service alone compares it. A mismatch
-is said and the key may be typed again, and Escape shows the key again;
-only an edit, not a caret move, clears what was said. A field whose
-buffer cannot be reserved says the key cannot be typed back there. The
-key's pages say that closing the window now withdraws the installation
-and the disk will not start. The window holds the key, in memory only
-and zeroed on drop, until the service confirms the type-back, and may
-show it again until then; no copy or paste reaches the key or the field,
-and no diagnostic names a digit. The field's buffer is td-ui's entry,
-reserved once and zeroed on every edit's leftover, when Return takes a
-key and on drop; the toolkit's chord for each key typed, the entry's own
-four-byte stack buffer that encodes each typed character (td-ui
-`entry_model`'s insert), and the frame's pixels are outside it and not
-zeroed. Once the type-back is confirmed the window shows the
-installation finishing, polling as for progress, while the service
-writes the table and the phase still reports; the completion page and
-its restart follow only the service's complete. The evidence line says
-the step (`page=recovery step=asking`, `shown`, `typeback`, then
-`page=finishing`), never a digit. Only the service's own report of
-failure 6 is shown as withdrawn. A connection lost during the phase
-before a key typed back is sent, the key's own request answered as
-refusal 16 or otherwise than with this review's key included, shows the
-installation not finished (`page=unconfirmed`): a service still running
-withdraws it, but one that stopped, a crash included, withdrew nothing,
-and the window cannot tell which. Either way the disk carries no
-partition table, so it does not start, and it may still hold the new
-ESP files and the volume's header, which the unconfirmed recovery key
-opens (ENCRYPTION.md "Device-bound formatting"). A connection lost once
-a key typed back was sent, or after the confirmation, shows the outcome
-as unknown, as any lost connection does, and so does a confirmation
-answered otherwise than with this review's match or mismatch, which
-ends the connection. A connection lost on a device-bound execution
-before the phase is reported is unknown too: an earlier write or
-verification failure may still be its outcome.
+and shows its eight groups in td-protector's display form beside a QR
+code of its 48 digits (td-setup's `qr`: ISO/IEC 18004 version 2, level Q,
+numeric mode, the one symbol that holds exactly 48 digits), saying that it
+is shown only now, that no copy is kept, and that it is the only way to
+open the disk if the TPM, firmware measurements or boot chain change. A
+phone that scans the code reads the 48 digits alone, what cryptsetup's
+passphrase prompt takes; the page advises keeping a scan in a password
+manager, not a camera app, which may send what it scans to its maker
+(ENCRYPTION.md "Device-bound default"). The code is drawn dark on light
+in literal colours no theme maps, with its four-module quiet zone, at the
+largest whole module of at least four pixels per scale unit that fits
+beside the text, and the page is not drawn where that does not fit; the
+rows beside it are cut to 56 columns. Nobody types any
+part of the key here or in any other routine flow (ENCRYPTION.md
+"Device-bound default"). The phase has no deadline and changes only with
+what the window sends, so its state is not asked for while the key is
+shown. Return goes on to a step of its own that says the key is not
+shown again and nothing on the computer keeps it; Escape there shows the
+key again, and Return says it was kept and sends the acknowledgement,
+which carries the review's nonce and nothing of the key. Return acts
+once a press, never repeating while held, so one press never passes the
+key unseen, and Return there acts only once that step has been painted
+for the same 500 ms a review must be, so a second press with the first,
+a double tap or a bouncing key cannot acknowledge a key whose step the
+person never saw. Once the acknowledgement is sent, the key is no longer
+offered from that step. The key's pages say that closing the window now
+withdraws the installation and the disk will not start. The window holds
+the key, in memory only and zeroed on drop, until the service takes the
+acknowledgement, and may show it again until then; no copy or paste
+reaches it, and no diagnostic names a digit. Its display form and its QR
+code's modules, and every buffer the encoder fills on the way, are
+zeroed on drop; the frame's pixels are outside that and not zeroed. Once
+the acknowledgement is taken the window shows the installation
+finishing, polling as for progress, while the service writes the table
+and the phase still reports; the completion page and its restart follow
+only the service's complete. The evidence line says the step
+(`page=recovery step=asking`, `shown`, `kept`, then `page=finishing`),
+never a digit. Only the service's own report of failure 6 is shown as
+withdrawn. A connection lost during the phase before the acknowledgement
+is sent, the key's own request answered as refusal 16 or otherwise than
+with this review's key included, shows the installation not finished
+(`page=unconfirmed`): a service still running withdraws it, but one that
+stopped, a crash included, withdrew nothing, and the window cannot tell
+which. Either way the disk carries no partition table, so it does not
+start, and it may still hold the new ESP files and the volume's header,
+which the unconfirmed recovery key opens (ENCRYPTION.md "Device-bound
+formatting"). A connection lost once the acknowledgement was sent, or
+after it was taken, shows the outcome as unknown, as any lost connection
+does, and so does an acknowledgement answered otherwise than with this
+review's phase, which ends the connection. A connection lost on a
+device-bound execution before the phase is reported is unknown too: an
+earlier write or verification failure may still be its outcome.
 
 Disk enumeration is read-only and bounded. Show model, serial when supplied
 by the device, capacity and a distinguishing device identifier. These are
@@ -819,15 +829,15 @@ unprivileged installer and the root installation service. It is data and
 codec only, and decoding a message grants no authority. The service core
 below implements it; td-authd's setup intake starts it for td-setup, which
 asks for destinations, time zones and status, proposes, executes, withdraws,
-asks for a device-bound installation's recovery key and confirms it typed
-back, and asks for an ending, and checks that a review carries exactly what
-it proposed and that a withdraw answers abandoned (withdrawn), the key
-request the key, a confirmation running in the recovery-key phase or a
-mismatch, and an ending complete, for its nonce; any other answer ends its
+asks for a device-bound installation's recovery key and acknowledges it,
+and asks for an ending, and checks that a review carries exactly what it
+proposed and that a withdraw answers abandoned (withdrawn), the key
+request the key, an acknowledgement running in the recovery-key phase,
+and an ending complete, for its nonce; any other answer ends its
 connection, and with it, until an installation starts, the review and
 claim.
 
-Both ends first send and require the eight bytes `TDINS07\n`. Any change to
+Both ends first send and require the eight bytes `TDINS08\n`. Any change to
 a message or its bytes changes this greeting; there is no negotiation. Each
 message then travels in one frame: a big-endian u32 length and that many
 payload bytes. `payload_len` admits a nonzero length within the direction's
@@ -894,9 +904,10 @@ keyboard, 10 unsupported timezone, 11 stale review, 12 no review, 13 consent
 unavailable (no seat, compositor or installer confirmation path can present the
 review, or the consent channel cannot carry it), 14 time zones
 unavailable (the catalog could not be read), 15 power unavailable (the
-supervisor did not accept the reboot or power-off), 16 recovery key sent
-and 17 recovery key mismatch. The recovery-key phase, its two requests
-(`0x09` and `0x0a`), its reply (`0x86`) and these last codes are
+supervisor did not accept the reboot or power-off) and 16 recovery key
+sent. 17 was a typed-back key that did not match; no key is typed back
+since `TDINS08`, and 17 is unassigned. The recovery-key phase, its two
+requests (`0x09` and `0x0a`), its reply (`0x86`) and code 16 are
 "Device-bound records". Unassigned codes refuse, and a duplicated code
 does not compile.
 
@@ -956,7 +967,8 @@ versions are refused, not negotiated. `TDINS05` is `TDINS04` (power off,
 request `0x08`, included) with the additions below, so the recovery
 requests take the next free tags. Increment 7's probe commit then made
 them `TDINS07` and `TDPLAN04` with the plan's basis byte ("Storage
-choice"); `TDINA03` is unchanged.
+choice"); `TDINA03` is unchanged. `TDINS08` replaced the type-back with
+an acknowledgement that carries no digit, and retired refusal 17.
 
 - The plan gains one storage byte after the removable flag: 0 unencrypted
   or 1 device-bound, any other value refused. It is the storage the
@@ -971,43 +983,46 @@ choice"); `TDINA03` is unchanged.
   phase for that nonce. Its first admission is answered by reply `0x86`
   recovery key: the nonce and the key's 48 ASCII digits. Every later ask
   is refused as 16 recovery key sent, so the service sends it once.
-- Request `0x0a` confirm recovery, a review nonce and the 48 digits typed
-  back, is admitted only in that phase after the key was sent. The service
-  compares the digits with the key it holds: equal, it zeroes the key and
+- Request `0x0a` acknowledge recovery, a review nonce alone, is admitted
+  only in that phase after the key was sent: the person has the key,
+  written down or scanned from its QR code. The service zeroes the key and
   answers status, still running in the phase, while the execution writes
-  the table; different, it is refused as 17 recovery key mismatch and the
-  phase continues.
+  the table. Nothing of the key travels back, so the service compares
+  nothing; one carrying more than the nonce is refused as a decode
+  failure.
 - Failure 6, recovery unconfirmed: the installer was lost before the key
-  was confirmed, during that phase or before it, and the installation was
-  withdrawn (DESIGN.md "Device-bound formatting").
+  was acknowledged, during that phase or before it, and the installation
+  was withdrawn (DESIGN.md "Device-bound formatting").
 
 The phase has no deadline: a person may take as long as writing the key
 down needs. Withdraw stays refused as busy while it runs.
 
-The key travels as exactly 48 ASCII digits in both directions: the codec
-admits nothing else and leaves the check digits to td-protector's
-recovery-key entry. Its value is zeroed on drop and never printed, and
+The key travels once, from the service to the installer, as exactly 48
+ASCII digits: the codec admits nothing else and leaves the check digits
+to td-protector's recovery-key codec, which td-setup applies before it
+shows the key. Its value is zeroed on drop and never printed, and
 equality reads all 48 bytes without an early exit. The encoded message
-holding it is its sender's to zero; each receiver (the service, td-setup
-and the QEMU oracle) zeroes every received payload with the codec's
-`scrub` after decoding it, successfully or not.
+holding it is its sender's to zero; each receiver (td-setup and the QEMU
+oracle) zeroes every received payload with the codec's `scrub` after
+decoding it, successfully or not, and the service zeroes every request
+it reads the same way.
 
 Only a device-bound execution reaches the phase, once its volume is
 written and verified (DESIGN.md "Device-bound formatting"): it hands the
 key to the service, which answers status as running in phase 6. Outside
 the phase both recovery requests are refused as busy while an
 installation runs and as no review otherwise; in it, a request naming
-another nonce is a stale review, and a type-back before the key was sent
-is busy. The service frames every reply it sends, the recovery key
-included, from buffers it zeroes once written or not, and a frame read
-short is zeroed too. A confirmed type-back releases the waiting
+another nonce is a stale review, and an acknowledgement before the key
+was sent is busy. The service frames every reply it sends, the recovery
+key included, from buffers it zeroes once written or not, and a frame
+read short is zeroed too. The acknowledgement releases the waiting
 execution, which only then writes the partition table, the write that
 makes the disk bootable, syncs it and reads it back. Its result completes
 the installation or fails it, as write failed or verification failed
 with the installation withdrawn, and only then reaches status and
 td-authd's finished report; until then status stays running in phase 6,
 and a request the phase admitted is refused as busy. An installer lost
-before the type-back, during the phase or before it, is answered on the
+before the acknowledgement, during the phase or before it, is answered on the
 execution's behalf: it withdraws the installation, which fails as
 recovery unconfirmed. One lost after it changes nothing: the execution
 finishes as it would have.
@@ -1016,11 +1031,11 @@ A service's plans are device-bound or unencrypted as its probes found
 ("Storage choice"). td-setup shows a review of either storage as the
 service made it, and follows the phase and failure 6 only for a review
 it executed as device-bound: the worker remembers the storage of the
-review execute last named, and the phase, failure 6, the key or a
-confirmation reported of any other review ends the connection. td-authd
-shows either storage on its consent summary, so the live wizard reaches
-the completion page's display and type-back on a machine with both
-probes, as `qemu-boot-encrypted`'s wizard leg proves.
+review execute last named, and the phase, failure 6, the key or an
+acknowledgement reported of any other review ends the connection.
+td-authd shows either storage on its consent summary, so the live wizard
+reaches the completion page's display and acknowledgement on a machine
+with both probes, as `qemu-boot-encrypted`'s wizard leg proves.
 
 ### Storage choice
 
@@ -1031,8 +1046,8 @@ The plan carries one byte after the storage byte, the storage basis: bit
 0 set when the service's TPM probe passed and bit 1 when its
 keyboard-console probe passed (ENCRYPTION.md "Activation" defines both),
 any other bit refused. The plan's magic is `TDPLAN04`, its maximal
-record 1194 bytes, and the greeting `TDINS07`, the earlier versions
-refused rather than negotiated; a propose request carries no basis, as
+record 1194 bytes, and the greeting then `TDINS07` (now `TDINS08`), the
+earlier versions refused rather than negotiated; a propose request carries no basis, as
 it carries no storage. The consent channel's review report keeps its
 storage byte alone and its `TDINA03`. `serve` runs both probes at every
 start, once each, after admission and before its greeting, writes the
@@ -1091,10 +1106,12 @@ but drops none:
 - What the disk held before installation is not erased: blocks the new
   system has not overwritten keep it, readable to whoever has the disk
   ("Device-bound formatting").
-- A recovery key follows. It is shown once, no copy is kept, and it must
-  be typed back before the installation completes; until then the disk
-  does not start. It is the only way to open the disk if this computer's
-  TPM, firmware measurements or startup files change.
+- A recovery key follows, as digits and a code a phone can scan. It is
+  shown once and no copy is kept; the installation completes once you say
+  it is kept, and until then the disk does not start. Nothing asks you to
+  type it now; it is typed only to recover the disk. It is the only way
+  to open the disk if this computer's TPM, firmware measurements or
+  startup files change.
 - Until the installed system first starts, release is not bound to this
   computer's startup chain: any other system that leaves PCR 12 at zero,
   td's live medium excepted, can release it, and so can the

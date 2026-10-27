@@ -5,9 +5,9 @@
 //! exchange, one request at a time, so the window's turn loop never waits on
 //! the service. The connection holds no authority: the service checks every
 //! request and erases nothing without trusted consent. A device-bound
-//! installation's recovery key crosses it twice, sent once and typed back;
-//! every buffer that held its digits is zeroed (INSTALLER.md "Device-bound
-//! records").
+//! installation's recovery key crosses it once, sent to be shown, and only
+//! an acknowledgement goes back; every buffer that held its digits is
+//! zeroed (INSTALLER.md "Device-bound records").
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::Shutdown;
@@ -19,8 +19,7 @@ use std::time::Duration;
 
 use td_install::installation_plan::{Destination, Plan, Settings, Storage};
 use td_install::installation_protocol::{
-    self as protocol, Abandon, Failure, Phase, RecoveryDigits, Refusal, Reply, Request,
-    ReviewNonce, State,
+    self as protocol, Abandon, Failure, Phase, Refusal, Reply, Request, ReviewNonce, State,
 };
 
 use crate::outcome;
@@ -85,11 +84,9 @@ pub enum Answer {
     Ending(Ending),
     /// The device-bound installation's recovery key, sent this once.
     RecoveryKey(Key),
-    /// The key typed back matched; the installation goes on to make the
-    /// disk bootable.
-    Confirmed,
-    /// The key typed back is not the one sent; it may be typed again.
-    Mismatched,
+    /// The service took the acknowledgement; the installation goes on to
+    /// make the disk bootable.
+    Acknowledged,
 }
 
 /// The service's state, as the installer shows it.
@@ -112,7 +109,7 @@ pub enum Stage {
     /// Ended before any write, with the reason in the installer's words.
     Abandoned(&'static str),
     /// A device-bound installation, written and verified, holds its
-    /// recovery key until it is typed back, and then until the partition
+    /// recovery key until it is acknowledged, and then until the partition
     /// table is written.
     Recovery,
 }
@@ -211,13 +208,10 @@ impl Service {
         self.send(Request::RecoveryKey(ReviewNonce::new(nonce)?))
     }
 
-    /// Sends `typed`, the key typed back, for the service to compare with
-    /// the one it sent. The digits go to the worker in a value zeroed when
-    /// dropped, sent or not.
-    pub fn confirm_recovery(&mut self, nonce: [u8; 32], typed: &Key) -> Result<(), String> {
-        let nonce = ReviewNonce::new(nonce)?;
-        let digits = typed.with_digits(RecoveryDigits::new)?;
-        self.send(Request::ConfirmRecovery(nonce, digits))
+    /// Tells the service the person has the key it sent, written down or
+    /// scanned; nothing of the key is sent back.
+    pub fn acknowledge_recovery(&mut self, nonce: [u8; 32]) -> Result<(), String> {
+        self.send(Request::AcknowledgeRecovery(ReviewNonce::new(nonce)?))
     }
 
     /// Whether a request awaits its answer.
@@ -352,8 +346,8 @@ fn exchange(
     if let Request::Execute(plan) = request {
         *executed = Some((ReviewNonce::from(plan), plan.storage()));
     }
-    // A request may carry typed-back recovery digits: the encoded message
-    // and its frame are both zeroed, sent or not.
+    // No request carries recovery digits; the encoded message and its
+    // frame are zeroed all the same, sent or not.
     let mut encoded = request.encode();
     let framed = protocol::frame(&encoded, protocol::MAX_REQUEST_BYTES);
     protocol::scrub(&mut encoded);
@@ -421,7 +415,7 @@ fn exchange(
         }
         // The key is sent once, for the device-bound installation this
         // connection executed; anything else, refusal 16 included, leaves
-        // no key to type back and ends the connection, which withdraws
+        // no key to show and ends the connection, which withdraws
         // the installation.
         (Request::RecoveryKey(nonce), Reply::RecoveryKey(sent, digits))
             if sent == *nonce && bound(*executed, *nonce) =>
@@ -435,24 +429,19 @@ fn exchange(
         (Request::RecoveryKey(_), _) => {
             Err("the installer service did not send the recovery key".into())
         }
-        // A match is answered with the phase still running: the table is
-        // written next. A mismatch keeps the phase for another try; any
-        // other answer leaves the outcome unknown.
+        // The acknowledgement is answered with the phase still running:
+        // the table is written next. Any other answer leaves the outcome
+        // unknown.
         (
-            Request::ConfirmRecovery(nonce, _),
+            Request::AcknowledgeRecovery(nonce),
             Reply::Status(State::Running(running, Phase::RecoveryKey)),
-        ) if running == *nonce && bound(*executed, *nonce) => Ok(Answer::Confirmed),
-        (Request::ConfirmRecovery(nonce, _), Reply::Refused(Refusal::RecoveryKeyMismatch))
-            if bound(*executed, *nonce) =>
-        {
-            Ok(Answer::Mismatched)
-        }
-        (Request::ConfirmRecovery(..), Reply::Refused(refusal)) => Err(format!(
-            "the installer service refused the typed-back recovery key: {}",
+        ) if running == *nonce && bound(*executed, *nonce) => Ok(Answer::Acknowledged),
+        (Request::AcknowledgeRecovery(_), Reply::Refused(refusal)) => Err(format!(
+            "the installer service refused the recovery key's acknowledgement: {}",
             refusal_text(refusal)
         )),
-        (Request::ConfirmRecovery(..), _) => {
-            Err("the installer service did not confirm the recovery key".into())
+        (Request::AcknowledgeRecovery(_), _) => {
+            Err("the installer service did not take the recovery key's acknowledgement".into())
         }
         (_, Reply::Destinations(candidates)) => {
             Ok(Answer::Destinations(candidates.as_slice().to_vec()))
@@ -564,7 +553,6 @@ fn refusal_text(refusal: Refusal) -> &'static str {
         Refusal::TimezonesUnavailable => "the time zones could not be read",
         Refusal::PowerUnavailable => "the computer could not be restarted or powered off",
         Refusal::RecoveryKeySent => "the recovery key was already shown",
-        Refusal::RecoveryKeyMismatch => "the recovery key does not match",
     }
 }
 
@@ -575,6 +563,7 @@ pub(crate) mod tests {
     use std::os::unix::net::UnixListener;
     use std::time::Instant;
     use td_install::installation_plan::{Basis, Candidates, DestinationObservation, Zones};
+    use td_install::installation_protocol::RecoveryDigits;
 
     pub(crate) fn disk() -> Destination {
         Destination::new(DestinationObservation {
@@ -630,8 +619,6 @@ pub(crate) mod tests {
     pub(crate) const KEY: &[u8; 48] = b"000013005150010290015439020571025716030859035998";
     /// Its display form.
     pub(crate) const SHOWN: &str = "000013-005150-010290-015439-020571-025716-030859-035998";
-    /// Another key whose every group checks.
-    pub(crate) const OTHER_KEY: &[u8; 48] = b"000000000000000000000000000000000000000000000000";
 
     pub(crate) fn key(digits: &[u8]) -> Key {
         Key::from_digits(digits).unwrap()
@@ -639,15 +626,14 @@ pub(crate) mod tests {
 
     /// As `listing`, but a device-bound service core's: its reviews are
     /// device-bound; executed, the first state asked is verifying boot,
-    /// then the recovery key's phase, whose key it sends once (16 after)
-    /// and compares with what is typed back (17 when it differs). Once a
-    /// key typed back matches it reports the phase once more, then
+    /// then the recovery key's phase, whose key it sends once (16 after).
+    /// Once the key is acknowledged it reports the phase once more, then
     /// complete.
     pub(crate) fn recovering() -> impl FnMut(&Request) -> Option<Vec<u8>> + Send + 'static {
         let nonce = ReviewNonce::new([7; 32]).unwrap();
         let mut asked = 0;
         let mut sent = false;
-        // Once confirmed: whether the phase was reported since.
+        // Once acknowledged: whether the phase was reported since.
         let mut finishing = None;
         move |request| match request {
             Request::Propose {
@@ -680,18 +666,14 @@ pub(crate) mod tests {
                     ))
                 }
             }
-            Request::ConfirmRecovery(named, digits)
+            Request::AcknowledgeRecovery(named)
                 if *named == nonce && sent && finishing.is_none() =>
             {
-                if *digits == RecoveryDigits::new(KEY).unwrap() {
-                    // The next state is the phase once more, then complete.
-                    finishing = Some(false);
-                    framed(&Reply::Status(State::Running(nonce, Phase::RecoveryKey)))
-                } else {
-                    framed(&Reply::Refused(Refusal::RecoveryKeyMismatch))
-                }
+                // The next state is the phase once more, then complete.
+                finishing = Some(false);
+                framed(&Reply::Status(State::Running(nonce, Phase::RecoveryKey)))
             }
-            Request::RecoveryKey(_) | Request::ConfirmRecovery(..) => {
+            Request::RecoveryKey(_) | Request::AcknowledgeRecovery(_) => {
                 framed(&Reply::Refused(Refusal::Busy))
             }
             _ => listing(request),
@@ -725,7 +707,7 @@ pub(crate) mod tests {
             ))),
             Request::Status => framed(&Reply::Status(State::Idle)),
             Request::End(_, nonce) => framed(&Reply::Status(State::Complete(*nonce))),
-            Request::RecoveryKey(_) | Request::ConfirmRecovery(..) => {
+            Request::RecoveryKey(_) | Request::AcknowledgeRecovery(_) => {
                 framed(&Reply::Refused(Refusal::NoReview))
             }
         }
@@ -1091,11 +1073,10 @@ pub(crate) mod tests {
         );
     }
 
-    /// The key is asked for once and arrives in its groups; a key typed
-    /// back that differs is a mismatch to try again, and the right one is
-    /// confirmed with the phase still running.
+    /// The key is asked for once and arrives in its groups; its
+    /// acknowledgement is taken with the phase still running.
     #[test]
-    fn the_recovery_key_is_sent_once_and_confirmed_when_typed_back() {
+    fn the_recovery_key_is_sent_once_and_acknowledged() {
         let settings = Settings::new("alice", "tdhost", "us", "Etc/UTC").unwrap();
         let socket = intake("recovery", usize::MAX, recovering());
         let mut service = Service::connect(&socket).unwrap();
@@ -1118,12 +1099,12 @@ pub(crate) mod tests {
         assert_eq!(sent, key(KEY));
         assert_eq!(sent.display().as_str(), SHOWN);
         assert_eq!(format!("{sent:?}"), "Key(..)");
-        service.confirm_recovery([7; 32], &key(OTHER_KEY)).unwrap();
-        assert_eq!(answer(&mut service), Ok(Answer::Mismatched));
+        // A zero nonce is not sent either.
+        assert!(service.acknowledge_recovery([0; 32]).is_err());
         service.status().unwrap();
         assert_eq!(answer(&mut service), recovering);
-        service.confirm_recovery([7; 32], &sent).unwrap();
-        assert_eq!(answer(&mut service), Ok(Answer::Confirmed));
+        service.acknowledge_recovery([7; 32]).unwrap();
+        assert_eq!(answer(&mut service), Ok(Answer::Acknowledged));
         // The phase stands until the table is written, then completes.
         service.status().unwrap();
         assert_eq!(answer(&mut service), recovering);
@@ -1138,8 +1119,8 @@ pub(crate) mod tests {
     }
 
     /// Anything but the key, sent once for this device-bound execution, or
-    /// anything but a match or a mismatch for the key typed back, ends the
-    /// connection: refusal 16 among them, since no key is left to show.
+    /// anything but the phase for its acknowledgement, ends the connection:
+    /// refusal 16 among them, since no key is left to show.
     #[test]
     fn a_recovery_answer_out_of_place_ends_the_connection() {
         let settings = Settings::new("alice", "tdhost", "us", "Etc/UTC").unwrap();
@@ -1150,7 +1131,7 @@ pub(crate) mod tests {
         }
         type Ask = fn(&mut Service) -> Result<(), String>;
         let ask_key: Ask = |service| service.recovery_key([7; 32]);
-        let confirm: Ask = |service| service.confirm_recovery([7; 32], &key(KEY));
+        let acknowledge: Ask = |service| service.acknowledge_recovery([7; 32]);
         let cases: Vec<(&str, Ask, Reply, &str)> = vec![
             (
                 "key-sent",
@@ -1186,43 +1167,43 @@ pub(crate) mod tests {
                 "does not answer its request",
             ),
             (
-                "confirm-busy",
-                confirm,
+                "acknowledge-busy",
+                acknowledge,
                 Reply::Refused(Refusal::Busy),
-                "refused the typed-back recovery key",
+                "refused the recovery key's acknowledgement",
             ),
             (
-                "confirm-stale",
-                confirm,
+                "acknowledge-stale",
+                acknowledge,
                 Reply::Refused(Refusal::StaleReview),
                 "the review is out of date",
             ),
             (
-                "confirm-phase",
-                confirm,
+                "acknowledge-phase",
+                acknowledge,
                 Reply::Status(State::Running(nonce, Phase::VerifyingBoot)),
-                "did not confirm",
+                "did not take the recovery key's acknowledgement",
             ),
             (
-                "confirm-complete",
-                confirm,
+                "acknowledge-complete",
+                acknowledge,
                 Reply::Status(State::Complete(nonce)),
-                "did not confirm",
+                "did not take the recovery key's acknowledgement",
             ),
             (
-                "confirm-other",
-                confirm,
+                "acknowledge-other",
+                acknowledge,
                 Reply::Status(State::Running(
                     ReviewNonce::new([8; 32]).unwrap(),
                     Phase::RecoveryKey,
                 )),
-                "did not confirm",
+                "did not take the recovery key's acknowledgement",
             ),
         ];
         for (name, ask, reply, said) in cases {
             let bytes = framed(&reply);
             let socket = intake(name, usize::MAX, move |request| match request {
-                Request::RecoveryKey(_) | Request::ConfirmRecovery(..) => bytes.clone(),
+                Request::RecoveryKey(_) | Request::AcknowledgeRecovery(_) => bytes.clone(),
                 _ => listing(request),
             });
             let mut service = Service::connect(&socket).unwrap();
@@ -1234,17 +1215,17 @@ pub(crate) mod tests {
             assert!(!ended.contains("000013"), "{name}: {ended}");
         }
         // The key of a review executed unencrypted is no key to show, and
-        // a key typed back for it is not confirmed.
+        // an acknowledgement for it is not taken.
         for (name, ask) in [
             ("key-unencrypted", ask_key),
-            ("confirm-unencrypted", confirm),
+            ("acknowledge-unencrypted", acknowledge),
         ] {
             let socket = intake(name, usize::MAX, move |request| match request {
                 Request::RecoveryKey(_) => framed(&Reply::RecoveryKey(
                     ReviewNonce::new([7; 32]).unwrap(),
                     RecoveryDigits::new(KEY).unwrap(),
                 )),
-                Request::ConfirmRecovery(..) => framed(&Reply::Status(State::Running(
+                Request::AcknowledgeRecovery(_) => framed(&Reply::Status(State::Running(
                     ReviewNonce::new([7; 32]).unwrap(),
                     Phase::RecoveryKey,
                 ))),
@@ -1255,36 +1236,6 @@ pub(crate) mod tests {
             assert!(answer(&mut service).is_ok());
             ask(&mut service).unwrap();
             assert!(answer(&mut service).is_err(), "{name}");
-        }
-        // A mismatch is one only for the device-bound review executed
-        // here: refused of an unencrypted execution, of another nonce or
-        // before any execution, it ends the connection.
-        type Before = fn(&mut Service, &Settings);
-        let unencrypted: Before = |service, settings| {
-            service.execute(plan(&disk(), settings)).unwrap();
-            assert!(answer(service).is_ok());
-        };
-        let device_bound: Before = |service, settings| {
-            service.execute(bound_plan(&disk(), settings)).unwrap();
-            assert!(answer(service).is_ok());
-        };
-        let nothing: Before = |_, _| {};
-        for (name, before, named) in [
-            ("mismatch-unencrypted", unencrypted, [7; 32]),
-            ("mismatch-other", device_bound, [8; 32]),
-            ("mismatch-unexecuted", nothing, [7; 32]),
-        ] {
-            let socket = intake(name, usize::MAX, |request| match request {
-                Request::ConfirmRecovery(..) => {
-                    framed(&Reply::Refused(Refusal::RecoveryKeyMismatch))
-                }
-                _ => listing(request),
-            });
-            let mut service = Service::connect(&socket).unwrap();
-            before(&mut service, &settings);
-            service.confirm_recovery(named, &key(KEY)).unwrap();
-            let ended = answer(&mut service).unwrap_err();
-            assert!(ended.contains("refused the typed-back"), "{name}: {ended}");
         }
     }
 

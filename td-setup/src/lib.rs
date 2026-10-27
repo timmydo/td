@@ -11,15 +11,17 @@
 //! settings form, whose time zones the service supplies, and the completed
 //! form to the service's review of it; from the review it asks for trusted
 //! consent and follows the installation to its outcome, through a
-//! device-bound installation's recovery key (`recovery`), shown once and
-//! typed back. The privileged disk writer stays in td-install; this front
-//! end holds no disk-writing authority (INSTALLER.md).
+//! device-bound installation's recovery key (`recovery`), shown once as
+//! digits and a QR code (`qr`) and acknowledged, never typed. The
+//! privileged disk writer stays in td-install; this front end holds no
+//! disk-writing authority (INSTALLER.md).
 
 pub mod destination;
 pub mod evidence;
 mod listbox;
 pub mod nav;
 pub mod outcome;
+pub mod qr;
 pub mod recovery;
 pub mod review;
 pub mod service;
@@ -231,18 +233,17 @@ fn render_check_surface(font: &td_ui::font::Font, surface: Surface) -> Result<()
     // supplied it and it opens nothing.
     let key = recovery::Key::from_digits(b"000013005150010290015439020571025716030859035998")?;
     let shown = key.display();
-    let mut entry = recovery::Entry::default();
-    for chord in ["0", "0", "0", "0", "1", "3", "-", "0", "0", "5"] {
-        entry.key(chord);
-    }
-    let feedback = entry.feedback();
+    let code = key
+        .code()
+        .ok_or("the recovery key's code could not be made")?;
     for step in [
         recovery::Step::Asking,
-        recovery::Step::Shown(shown.as_str()),
-        recovery::Step::TypeBack {
-            entry: &entry,
-            feedback: &feedback,
-            notice: Some("That is not the recovery key shown. Check it and type it again."),
+        recovery::Step::Shown {
+            key: shown.as_str(),
+            code: Some(&code),
+        },
+        recovery::Step::Kept {
+            notice: Some("Telling the installer service the key is kept\u{2026}"),
         },
     ] {
         paint(&recovery::RecoveryPage::new(surface, step).ok_or("recovery-key page did not fit")?)?;

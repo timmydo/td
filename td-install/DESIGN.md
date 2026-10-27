@@ -1096,7 +1096,7 @@ its admission ("Prepared volume image admission") remain only for the
 unencrypted path. The layout's writes stop short of the table: the old
 table is invalidated and the ESP written, each synced, as on the
 unencrypted path, but neither copy of the new table is written until the
-recovery key is confirmed (below). A refusal by the layout's recheck
+recovery key is acknowledged (below). A refusal by the layout's recheck
 before its first write leaves the disk untouched. The formatter then binds
 the loop over the layout's volume extent, which no table on the disk yet
 places, as "Publishing through a loop over the claim" does. The loop
@@ -1152,9 +1152,9 @@ zero. Nothing names a partition of the destination: cryptsetup,
 mkfs.btrfs and td-boot see only the loop and the mapping.
 
 The execution then removes its workspace and holds the claim while the
-service holds the recovery key for its installer's type-back
+service holds the recovery key for its installer to show and acknowledge
 (INSTALLER.md "Device-bound records"): it hands the key's 48 digits to
-the service, keeps no copy, and waits. Only a confirmed type-back makes
+the service, keeps no copy, and waits. Only the acknowledgement makes
 the disk bootable: the execution then writes the table, backup then
 primary, each synced, and reads both back as verifying boot does, and
 only then is the installation complete. Deferring the table rather than
@@ -1166,10 +1166,10 @@ verification failed, each withdrawing the installation. An installer
 lost first, before or during the phase, answers the execution lost: it
 withdraws the installation and fails as recovery unconfirmed.
 ENCRYPTION.md "Device-bound formatting" says what a crash before the
-confirmation leaves on the disk, no table, so nothing firmware boots, and
-what one between the backup and primary writes leaves: the backup GPT
-alone, without a protective MBR, which firmware may or may not boot, with
-the key already confirmed.
+acknowledgement leaves on the disk, no table, so nothing firmware boots,
+and what one between the backup and primary writes leaves: the backup
+GPT alone, without a protective MBR, which firmware may or may not boot,
+with the key already acknowledged.
 
 Every cryptsetup child runs through td-protector's runner, which
 the selector shares (td-protector/DESIGN.md "Cryptsetup runner"), and
@@ -1195,7 +1195,7 @@ children are std's and the device-mapper requests are cryptsetup's own.
 The cost of formatting in place is the refusal order. A failing mkfs,
 which the unencrypted path meets before the first write, is here a write
 failure after layout. On this path every failure after the first write,
-and the loss of the installer before its type-back, withdraws the
+and the loss of the installer before its acknowledgement, withdraws the
 installation: both of the table's ranges and the volume's first 16 MiB
 are zeroed through the claim, so no keyslot of an unfinished installation
 stays openable, then synced, each attempted whatever became of the
@@ -2757,7 +2757,7 @@ no LUKS2 header (ENCRYPTION.md "Activation"). The installed
 leg's and the cut leg's targets start with a valid GPT the host wrote
 into the two table ranges alone. The installed leg drives the
 device-bound service through the recovery-key phase as both of its
-peers, then opens the volume with the key typed back; the guest ends
+peers, then opens the volume with the key it sent; the guest ends
 each encrypted leg with a bare `TD-INSTALL-ENCRYPTED-END` line, on which
 the host stops, so the records before it are whole. The host then reads
 the image: the table through td-engine's GPT reader (both copies, CRCs

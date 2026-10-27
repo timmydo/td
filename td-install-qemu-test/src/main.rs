@@ -1394,8 +1394,8 @@ fn exchange(
     request: &installation_protocol::Request,
 ) -> Result<installation_protocol::Reply, String> {
     use installation_protocol as wire;
-    // A request may carry typed-back recovery digits: the encoded message
-    // and its frame are both zeroed, sent or not.
+    // No request carries recovery digits; the encoded message and its
+    // frame are zeroed all the same, sent or not.
     let mut encoded = request.encode();
     let framed = wire::frame(&encoded, wire::MAX_REQUEST_BYTES);
     wire::scrub(&mut encoded);

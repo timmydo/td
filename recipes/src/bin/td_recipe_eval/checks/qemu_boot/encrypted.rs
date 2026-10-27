@@ -181,7 +181,7 @@ impl Bench {
 /// The legs, each on a fresh disk from one ISO apiece: the service's
 /// unencrypted review without a TPM, withdrawn; unencrypted installations
 /// with the TPM and without a display device or a keyboard; the
-/// device-bound installation typed back and verified; and a power cut in
+/// device-bound installation acknowledged and verified; and a power cut in
 /// the recovery-key phase.
 pub(crate) fn run(runner: &RecipeCheckRunner, tpm: &Path) -> Result<(), String> {
     secret::verify_swtpm(tpm)?;
@@ -270,7 +270,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner, tpm: &Path) -> Result<(), String> 
         remove(&iso)?;
     }
 
-    // Installed, typed back and verified.
+    // Installed, acknowledged and verified.
     {
         let iso = medium("install-encrypted")?;
         let target = TargetDisk::with_capacity(&scratch.dir, "encrypted.img", capacity)?;
@@ -326,7 +326,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner, tpm: &Path) -> Result<(), String> 
             dir: create_qmp_scratch_dir(&env::temp_dir(), &SEQ)?,
         };
         let emulator = secret::Emulator::start(tpm, &tpm_scratch.dir, "cut")?;
-        println!("   [qemu-install-encrypted] power cut before the recovery key is typed back");
+        println!("   [qemu-install-encrypted] power cut before the recovery key is acknowledged");
         let result = host
             .boot(
                 &iso,
@@ -350,13 +350,13 @@ pub(crate) fn run(runner: &RecipeCheckRunner, tpm: &Path) -> Result<(), String> 
          volume with no LUKS2 header; with the swtpm, display and keyboard a device-bound \
          installation: LUKS2 formatted with the plan's \
          UUID, keyslots 0 and 1 and the first-boot token, verified in the guest by td's reader \
-         and the TPM; recovery key sent once, a second ask and a mistyped type-back refused, \
+         and the TPM; recovery key sent once, a second ask and a stale acknowledgement refused, \
          confirmed, then the table written over the seeded one's cleared ranges; the recovery \
          key opens the volume holding the published deployment and settings and a mistyped \
          one does not; no recovery key on the disk, in the opened volume, on the console or in \
          sampled command lines, every sampled cryptsetup line one of td-install's, luksFormat \
          and luksAddKey among them; no Btrfs or staged plaintext in a data segment that \
-         started zeroed (no erasure claim); a power cut before the type-back leaves the seeded \
+         started zeroed (no erasure claim); a power cut before the acknowledgement leaves the seeded \
          table's ranges zero. The installed system is not booted: selector release is \
          increment 6"
     );
@@ -659,7 +659,7 @@ fn validate_no_console(result: &BootResult) -> Result<String, String> {
     )?;
     if result
         .console
-        .contains(protocol::RECOVERY_TYPED_BACK_MARKER)
+        .contains(protocol::RECOVERY_ACKNOWLEDGED_MARKER)
     {
         return Err("an unencrypted installation reached the recovery key".into());
     }
@@ -719,7 +719,7 @@ pub(super) fn validate_installation(
             "{} {uuid} {TARGET_DEVICE}",
             protocol::ENCRYPTED_NO_TABLE_MARKER
         ),
-        protocol::RECOVERY_TYPED_BACK_MARKER.to_string(),
+        protocol::RECOVERY_ACKNOWLEDGED_MARKER.to_string(),
         format!("{} {uuid} {TARGET_DEVICE}", protocol::SERVED_MARKER),
         format!("{} {capacity}", protocol::ENCRYPTED_KEY_ABSENT_MARKER),
     ] {
@@ -800,7 +800,7 @@ fn validate_cut(result: &BootResult) -> Result<String, String> {
         "recovery-key phase",
     )?;
     for later in [
-        protocol::RECOVERY_TYPED_BACK_MARKER,
+        protocol::RECOVERY_ACKNOWLEDGED_MARKER,
         protocol::SERVED_MARKER,
         protocol::ENCRYPTED_MARKER,
     ] {
@@ -1006,7 +1006,7 @@ fn verify_no_table(file: &File, len: u64, sector: u64) -> Result<(), String> {
     ] {
         if read_at(file, offset, bytes)?.iter().any(|byte| *byte != 0) {
             return Err(format!(
-                "the {copy} table range is written although the key was never typed back"
+                "the {copy} table range is written although the key was never acknowledged"
             ));
         }
     }
@@ -1595,7 +1595,7 @@ mod tests {
             format!(
                 "{}{served}{}\n{ended}",
                 reviewed("unencrypted tpm=1 console=0"),
-                protocol::RECOVERY_TYPED_BACK_MARKER
+                protocol::RECOVERY_ACKNOWLEDGED_MARKER
             ),
         ] {
             assert!(

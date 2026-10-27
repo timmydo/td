@@ -1873,7 +1873,7 @@ impl LiveExecution {
         claim: File,
         workspace: &Workspace,
         progress: &mut dyn FnMut(installation_protocol::Phase),
-    ) -> Result<Option<TypeBack>, Stopped> {
+    ) -> Result<Option<AwaitingAcknowledgement>, Stopped> {
         use installation_protocol::{Failure, Phase};
         let verification = before_writing(Failure::VerificationFailed);
         let settings_failed = before_writing(Failure::SettingsFailed);
@@ -2024,7 +2024,7 @@ impl LiveExecution {
             luks,
         )
         .map_err(|error| (Failure::VerificationFailed, error))?;
-        Ok(recovery.map(|recovery| TypeBack {
+        Ok(recovery.map(|recovery| AwaitingAcknowledgement {
             file: destination.file,
             table: formatted.table,
             volume: formatted.volume,
@@ -2117,7 +2117,7 @@ fn canonical_uuid(bytes: &[u8; 16]) -> String {
     text
 }
 
-use installation_service::TypedBack;
+use installation_service::Acknowledgement;
 
 impl installation_service::Execute<File> for LiveExecution {
     fn execute(
@@ -2125,7 +2125,7 @@ impl installation_service::Execute<File> for LiveExecution {
         plan: &installation_plan::Plan,
         claim: File,
         progress: &mut dyn FnMut(installation_protocol::Phase),
-        recovery: &mut dyn FnMut(installation_protocol::RecoveryDigits) -> TypedBack,
+        recovery: &mut dyn FnMut(installation_protocol::RecoveryDigits) -> Acknowledgement,
     ) -> Result<(), installation_protocol::Failure> {
         let report = |(failure, error): Stopped| {
             let _ = writeln!(io::stderr(), "td-install serve: {failure:?}: {error}");
@@ -2142,7 +2142,7 @@ impl installation_service::Execute<File> for LiveExecution {
         } else {
             self.install(plan, claim, &workspace, progress)
         };
-        // Before any type-back: nothing after verifying boot needs it.
+        // Before the acknowledgement: nothing after verifying boot needs it.
         if let Err(error) = workspace.remove() {
             let _ = writeln!(io::stderr(), "td-install serve: workspace: {error}");
         }
@@ -2157,9 +2157,9 @@ impl installation_service::Execute<File> for LiveExecution {
 const MAPPER_DIR: &str = "/dev/mapper";
 
 /// A written and verified device-bound installation, still claimed and
-/// carrying no table, whose recovery key the installer must type back
+/// carrying no table, whose recovery key the installer must acknowledge
 /// before its table makes it bootable.
-struct TypeBack {
+struct AwaitingAcknowledgement {
     file: File,
     table: gpt::Image,
     /// The volume's `(offset, len)`: the table must place it there, and a
@@ -2168,14 +2168,14 @@ struct TypeBack {
     recovery: td_protector::recovery::RecoveryKey,
 }
 
-impl TypeBack {
-    /// Hands the key to the service and waits. A confirmed key commits the
+impl AwaitingAcknowledgement {
+    /// Hands the key to the service and waits. An acknowledged key commits the
     /// table, synced and read back, and only then is the installation
     /// complete; a failure of either, or an installer lost first, withdraws
     /// it.
     fn wait(
         self,
-        recovery: &mut dyn FnMut(installation_protocol::RecoveryDigits) -> TypedBack,
+        recovery: &mut dyn FnMut(installation_protocol::RecoveryDigits) -> Acknowledgement,
     ) -> Result<(), Stopped> {
         let Self {
             mut file,
@@ -2196,7 +2196,7 @@ impl TypeBack {
             }
         };
         match outcome {
-            TypedBack::Confirmed => {
+            Acknowledgement::Acknowledged => {
                 use installation_protocol::Failure;
                 // The write that makes the disk bootable.
                 commit_table(&mut file, &table)
@@ -2209,14 +2209,14 @@ impl TypeBack {
                         (failure, withdrawn(&mut file, &table, Some(luks), error))
                     })
             }
-            TypedBack::Lost => Err((
+            Acknowledgement::Lost => Err((
                 installation_protocol::Failure::RecoveryUnconfirmed,
                 withdrawn(
                     &mut file,
                     &table,
                     Some(luks),
                     invalid(
-                        "the installer was lost before it typed the recovery key back; \
+                        "the installer was lost before it acknowledged the recovery key; \
                          the installation is withdrawn"
                             .into(),
                     ),
@@ -4293,7 +4293,7 @@ fn verify_table(file: &mut File, table: &gpt::Image, volume: (u64, u64)) -> io::
 }
 
 /// Neither copy of the table is on the disk, both ranges still zeroed: a
-/// device-bound installation before its type-back, which firmware finds
+/// device-bound installation before its acknowledgement, which firmware finds
 /// nothing on to boot.
 fn verify_no_table(file: &mut File, table: &gpt::Image) -> io::Result<()> {
     for (copy, offset, len) in [
@@ -4305,7 +4305,7 @@ fn verify_no_table(file: &mut File, table: &gpt::Image) -> io::Result<()> {
             .any(|byte| *byte != 0)
         {
             return Err(invalid(format!(
-                "the {copy} table range is written before the recovery key is confirmed"
+                "the {copy} table range is written before the recovery key is acknowledged"
             )));
         }
     }
@@ -4449,10 +4449,10 @@ struct DeviceBound<'a> {
 /// settings tree is staged before the first write, then the ESP is written
 /// and on a loop over the volume cryptsetup formats it, mkfs.btrfs writes
 /// the filesystem inside and td-boot publishes into it, and the keyslots
-/// and header are checked. The table is left unwritten, for `TypeBack` to
-/// commit once the recovery key is confirmed. Every failure after the first
-/// write withdraws the installation; a refusal before it leaves the disk
-/// untouched.
+/// and header are checked. The table is left unwritten, for
+/// `AwaitingAcknowledgement` to commit once the recovery key is
+/// acknowledged. Every failure after the first write withdraws the
+/// installation; a refusal before it leaves the disk untouched.
 fn format_held_device_bound(
     prepared: PreparedVolume<'_>,
     destination: &mut FormatDestination,
@@ -11076,12 +11076,12 @@ mod tests {
     }
 
     /// A device-bound installation stays unbootable until its recovery key
-    /// is typed back: verifying boot requires its table absent, the key is
-    /// handed over with no table on the disk, and only a confirmation
+    /// is acknowledged: verifying boot requires its table absent, the key is
+    /// handed over with no table on the disk, and only an acknowledgement
     /// commits the table, read back before success. A lost installer, or a
     /// table that cannot be written, withdraws it instead.
     #[test]
-    fn a_device_bound_table_is_written_only_once_its_key_is_confirmed() {
+    fn a_device_bound_table_is_written_only_once_its_key_is_acknowledged() {
         use installation_protocol::Failure;
         let id = "ab".repeat(32);
         let header = device_bound::HEADER_BYTES;
@@ -11103,7 +11103,7 @@ mod tests {
             )
             .unwrap_err()
             .to_string()
-            .contains("before the recovery key is confirmed"));
+            .contains("before the recovery key is acknowledged"));
             write_at(&mut destination.file, offset, &vec![0xff; header as usize]).unwrap();
             invalidate_table(&mut destination.file, &formatted.table).unwrap();
             finish_installation(
@@ -11114,7 +11114,7 @@ mod tests {
                 Some(offset),
             )
             .unwrap();
-            let pending = TypeBack {
+            let pending = AwaitingAcknowledgement {
                 file: destination.file,
                 table: formatted.table.clone(),
                 volume: formatted.volume,
@@ -11132,7 +11132,7 @@ mod tests {
             .wait(&mut |_| {
                 asked += 1;
                 unbootable(&disk);
-                TypedBack::Confirmed
+                Acknowledgement::Acknowledged
             })
             .unwrap();
         assert_eq!(asked, 1);
@@ -11143,7 +11143,7 @@ mod tests {
             .unwrap()
             .iter()
             .all(|byte| *byte == 0xff));
-        // Lost, or a confirmed table that cannot be written: withdrawn.
+        // Lost, or an acknowledged table that cannot be written: withdrawn.
         for lost in [true, false] {
             let (disk, _dir, mut pending, formatted) = uncommitted();
             if !lost {
@@ -11153,9 +11153,9 @@ mod tests {
                 .wait(&mut |_| {
                     unbootable(&disk);
                     if lost {
-                        TypedBack::Lost
+                        Acknowledgement::Lost
                     } else {
-                        TypedBack::Confirmed
+                        Acknowledgement::Acknowledged
                     }
                 })
                 .unwrap_err();
@@ -12210,7 +12210,7 @@ mod tests {
                 .open(&self.disk.path)
                 .unwrap();
             let mut phases = Vec::new();
-            // No execution these tests reach gets as far as a type-back.
+            // No execution these tests reach gets as far as an acknowledgement.
             let outcome = self.execution.execute(
                 &self.plan,
                 claim,

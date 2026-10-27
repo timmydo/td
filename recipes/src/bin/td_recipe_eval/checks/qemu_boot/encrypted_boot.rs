@@ -186,10 +186,10 @@ impl Change {
 enum Leg {
     /// The default wizard on the production live medium, the TPM, display
     /// and keyboard attached: device-bound by the probes, its key read from
-    /// the completion page's pixels and typed back, then the installed disk
+    /// the completion page's pixels and said kept, then the installed disk
     /// booted twice with nothing typed. A machine of its own.
     Wizard,
-    /// The device-bound installation, the key typed back and sent to the
+    /// The device-bound installation, the key acknowledged and sent to the
     /// host over the private serial port.
     Install,
     /// The installed first boot: the first-boot protector releases, the
@@ -1095,7 +1095,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner, tpm: &Path) -> Result<(), String> 
                 let pristine = disk.copy_to(&bench.scratch.dir, "pristine.img")?;
                 installed = Some((disk, pristine));
                 machine = Some(made);
-                "installed device-bound, the key typed back".to_string()
+                "installed device-bound, the key said kept".to_string()
             }
             (Leg::Wizard, _, _) => wizard(runner, &bench, tpm)?,
             (Leg::FirstBoot, Some(machine), Some((disk, _))) => {
@@ -1141,7 +1141,7 @@ const ZONE_SEEK: &str = "europe/lon";
 /// swtpm, a display device and the PS/2 keyboard, its wizard driven with
 /// physical keys to a review naming device-bound storage and consent to
 /// the same; the recovery key read only from the completion page's pixels
-/// and typed back; then the installed disk's first and second boots with
+/// and said kept; then the installed disk's first and second boots with
 /// nothing typed, under the same TPM state.
 fn wizard(runner: &RecipeCheckRunner, bench: &Bench, tpm: &Path) -> Result<String, String> {
     runner.prepare_recipe_target(FACE_RECIPE)?;
@@ -1232,16 +1232,19 @@ fn wizard(runner: &RecipeCheckRunner, bench: &Bench, tpm: &Path) -> Result<Strin
     };
     let first = first_boot(runner, &mut machine, &disk, "wizard-first-boot")?;
     let second = second_boot(runner, &mut machine, &disk, "wizard-second-boot")?;
-    encrypted::remove(&disk.path)?;
+    // Nothing typed proves the key was read right: the inspection opens
+    // the volume with it, so a misread key fails here.
+    let opened = retire_copy(runner, &mut machine, &disk, "wizard")?;
     Ok(format!(
         "the wizard reviewed device-bound storage and consented to it, the key read from the \
-         page's pixels and typed back, LUKS2 volume {} with {} data bytes; {first}; {second}",
+         page's pixels and said kept, LUKS2 volume {} with {} data bytes; {first}; {second}; \
+         the key read opens it: {opened}",
         machine.uuid, image.data_bytes
     ))
 }
 
 /// The installation, as `qemu-install-encrypted`'s installed leg checks it,
-/// under the machine's TPM state, the key typed back then sent to the host
+/// under the machine's TPM state, the key acknowledged then sent to the host
 /// over the private serial port. Returns the disk and the machine.
 fn install_leg<'a>(
     runner: &RecipeCheckRunner,

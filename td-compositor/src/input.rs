@@ -1865,7 +1865,7 @@ const SELF_CLOSE_SETTLE: u128 = 100_000_000;
 /// Said on standard error, which reaches the console, when the seat closes
 /// a screen itself, by which close, and at the first report past its
 /// settle window: times and a count only, never which keys, since the next
-/// keys may be td-setup's typed-back recovery key or whatever the person
+/// keys may be td-setup's recovery-key acknowledgement or whatever the person
 /// types into the session they just unlocked.
 pub(crate) const SELF_CLOSE_MARKER: &str = "TD-ATTENTION-SELF-CLOSE";
 pub(crate) const UNLOCK_CLOSE_MARKER: &str = "TD-ATTENTION-UNLOCK-CLOSE";

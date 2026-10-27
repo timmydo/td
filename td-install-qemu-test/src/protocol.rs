@@ -21,12 +21,13 @@ pub const SERVED_MARKER: &str = "TD-INSTALL-SERVED";
 /// of the disk's partition table ranges, which held the host's seeded GPT
 /// before the service started, holds a byte yet.
 pub const ENCRYPTED_NO_TABLE_MARKER: &str = "TD-INSTALL-ENCRYPTED-NO-TABLE";
-/// The key was sent once, a second ask refused as sent (16), a mistyped
-/// type-back refused as a mismatch (17) with the phase continuing, and the
-/// key typed back confirmed.
-pub const RECOVERY_TYPED_BACK_MARKER: &str = "TD-INSTALL-RECOVERY-KEY-TYPED-BACK";
+/// The key was sent once, a second ask refused as sent (16), an
+/// acknowledgement naming another review refused as stale (11) with the
+/// phase continuing, and the key's own acknowledgement taken; nothing of
+/// the key went back to the service.
+pub const RECOVERY_ACKNOWLEDGED_MARKER: &str = "TD-INSTALL-RECOVERY-KEY-ACKNOWLEDGED";
 /// The power-cut leg's last record, in the recovery-key phase after the key
-/// was sent and before it is typed back: the host cuts power on it.
+/// was sent and before it is acknowledged: the host cuts power on it.
 pub const ENCRYPTED_CUT_MARKER: &str = "TD-INSTALL-ENCRYPTED-CUT";
 /// Distinct command lines sampled while the service ran, how many of them
 /// were cryptsetup's, and the comma-joined set of their invocations; none
@@ -52,7 +53,7 @@ pub const ENCRYPTED_END_MARKER: &str = "TD-INSTALL-ENCRYPTED-END";
 /// The installed leg's recovery key went to the host over the private
 /// second serial port, never the console.
 pub const ENCRYPTED_KEY_SENT_MARKER: &str = "TD-INSTALL-ENCRYPTED-KEY-SENT";
-/// The virtio serial port's name the key typed back travels over: firmware
+/// The virtio serial port's name the key shown travels over: firmware
 /// writes its console to every ISA serial port, never to a virtio one.
 pub const ORACLE_SIDE_PORT: &str = "td.oracle-side";
 /// Where the host places the recovery key in a leg's initramfs, and the

@@ -3,7 +3,7 @@
 //! reviews device-bound storage with the TPM and keyboard console its
 //! probes find, and is driven as both of its peers through the
 //! recovery-key phase, and the installed volume then opened with the key
-//! typed back; without either probe it reviews unencrypted. The key's digits
+//! it sent; without either probe it reviews unencrypted. The key's digits
 //! stay in this process and the service: no record, argv or environment
 //! carries them, and every copy here is zeroed when dropped.
 
@@ -39,8 +39,8 @@ const MAX_SAMPLES: usize = 4096;
 const MAX_SAMPLE_BYTES: u64 = 4096;
 
 /// The device-bound installation onto `device`. With `cut`, the leg stops
-/// in the recovery-key phase, the key sent and not typed back, for the
-/// host's power cut. With `channel`, the key typed back then goes to the
+/// in the recovery-key phase, the key sent and not acknowledged, for the
+/// host's power cut. With `channel`, the key acknowledged then goes to the
 /// host over that private serial port, never the console, for the
 /// installed system's oracle (`qemu-boot-encrypted`).
 pub(super) fn install(device: &str, cut: bool, channel: Option<&Path>) -> Result<(), String> {
@@ -131,9 +131,10 @@ pub(super) fn drop_page_cache() -> Result<(), String> {
 }
 
 /// One device-bound installation through the service's protocols: the
-/// recovery key fetched once, a second ask refused, a mistyped type-back
-/// refused with the phase continuing, the key typed back, and the finished
-/// report. Returns the plan's UUID and the key.
+/// recovery key fetched once, a second ask refused, an acknowledgement
+/// naming another review refused with the phase continuing, the key's own
+/// acknowledgement, and the finished report. Returns the plan's UUID and
+/// the key.
 fn drive(
     service: &mut Service,
     device: &str,
@@ -177,30 +178,37 @@ fn drive(
             std::thread::sleep(Duration::from_secs(1));
         }
     }
+    // Every byte flipped: another review. Only an all-ones nonce, drawn
+    // with chance 2^-256, would flip to the zero one, refused loudly here.
+    let stale = nonce.map(|byte| !byte);
     match exchange(
         installer,
-        &Request::ConfirmRecovery(review, mistyped(&key)?),
+        &Request::AcknowledgeRecovery(ReviewNonce::new(stale)?),
     )? {
-        Reply::Refused(Refusal::RecoveryKeyMismatch) => {}
+        Reply::Refused(Refusal::StaleReview) => {}
         other => {
             return Err(format!(
-                "a mistyped key was not refused as a mismatch: {other:?}"
+                "another review's acknowledgement was not refused as stale: {other:?}"
             ))
         }
     }
     match exchange(installer, &Request::Status)? {
         Reply::Status(State::Running(running, Phase::RecoveryKey))
             if *running.as_bytes() == nonce => {}
-        other => return Err(format!("a mistyped key ended the phase: {other:?}")),
+        other => {
+            return Err(format!(
+                "a stale acknowledgement ended the phase: {other:?}"
+            ))
+        }
     }
-    match exchange(installer, &Request::ConfirmRecovery(review, key.clone()))? {
+    match exchange(installer, &Request::AcknowledgeRecovery(review))? {
         Reply::Status(State::Running(running, Phase::RecoveryKey))
             if *running.as_bytes() == nonce => {}
-        other => return Err(format!("the key typed back was not confirmed: {other:?}")),
+        other => return Err(format!("the acknowledgement was not taken: {other:?}")),
     }
     report(
         std::io::stdout(),
-        format_args!("{RECOVERY_TYPED_BACK_MARKER}"),
+        format_args!("{RECOVERY_ACKNOWLEDGED_MARKER}"),
     )?;
     poll_installation(installer, nonce, &mut phases, None)?;
     require_phase_order(&phases, installation_plan::Storage::DeviceBound)?;
@@ -406,11 +414,11 @@ pub(super) fn cryptsetup(args: &[&str], input: &[u8]) -> Result<Option<i32>, Str
 }
 
 /// The installed volume, found among the disk's partitions in the kernel's
-/// block inventory: keyslot 0 opens with the key typed back and no keyslot
-/// with a mistyped one; opened, it holds the published deployment and the
-/// settings, and no byte of it holds the key. The mapping is closed, as
-/// device-mapper answers, whatever happened. Returns the volume partition
-/// and the mapping's bytes read.
+/// block inventory: keyslot 0 opens with the key the service sent and no
+/// keyslot with a mistyped one; opened, it holds the published deployment
+/// and the settings, and no byte of it holds the key. The mapping is
+/// closed, as device-mapper answers, whatever happened. Returns the volume
+/// partition and the mapping's bytes read.
 fn open_installed(
     device: &str,
     key: &RecoveryDigits,

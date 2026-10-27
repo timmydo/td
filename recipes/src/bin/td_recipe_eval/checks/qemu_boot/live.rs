@@ -90,7 +90,7 @@ pub(super) enum WizardStorage {
     Unencrypted,
     Reinstall,
     /// The TPM, the display and the PS/2 keyboard: the key the completion
-    /// page shows is read with `glyphs` into `key` and typed back.
+    /// page shows is read with `glyphs` into `key` and said kept.
     DeviceBound {
         glyphs: Rc<KeyGlyphs>,
         key: KeyCell,
@@ -409,7 +409,7 @@ fn require_partitioned(path: &Path, capacity: u64) -> Result<(), String> {
 /// review of exactly those naming the wizard's storage, back from it until
 /// the service has released the review, the same review again, consent to
 /// it showing `rows`, a device-bound installation's recovery key read from
-/// the display and typed back, and the completed installation. Every act
+/// the display and said kept, and the completed installation. Every act
 /// waits on its own state.
 fn script(wizard: &Wizard<'_>) -> Result<Vec<SetupStep>, String> {
     let Wizard {
@@ -523,8 +523,8 @@ fn script(wizard: &Wizard<'_>) -> Result<Vec<SetupStep>, String> {
                 within: INSTALL_TIMEOUT,
             });
             steps.push(SetupStep {
-                shown: "page=recovery step=typeback".into(),
-                act: Act::TypeKey(Rc::clone(key)),
+                shown: "page=recovery step=kept".into(),
+                act: Act::Keys(vec!["ret"]),
                 untouched: false,
                 within: STEP_TIMEOUT,
             });

@@ -38,6 +38,7 @@ fn source_inventory_and_toolkit_access_are_closed() {
         "main.rs",
         "nav.rs",
         "outcome.rs",
+        "qr.rs",
         "recovery.rs",
         "review.rs",
         "service.rs",
@@ -96,6 +97,7 @@ fn source_inventory_and_toolkit_access_are_closed() {
         "main.rs",
         "nav.rs",
         "outcome.rs",
+        "qr.rs",
         "recovery.rs",
         "review.rs",
         "service.rs",
@@ -145,6 +147,12 @@ fn source_inventory_and_toolkit_access_are_closed() {
     let recovery = std::fs::read_to_string(root.join("src/recovery.rs")).unwrap();
     assert!(recovery.contains("use td_protector::recovery::{"));
     assert!(!recovery.contains("generate"), "td-setup draws no key");
+    // The QR encoder is pure std arithmetic over the digits it is lent:
+    // it imports nothing, so it reaches no file, socket or log.
+    let qr = std::fs::read_to_string(root.join("src/qr.rs")).unwrap();
+    let qr = production(&qr).unwrap();
+    assert!(!qr.contains("use ") && !qr.contains("std::fs") && !qr.contains("td_"));
+    assert!(!qr.contains("print") && !qr.contains("std::io"));
     // The client boundary is real: `window` names both the transport and the
     // client, so removing either from it would be caught here, not silently.
     let window = std::fs::read_to_string(root.join("src/window.rs")).unwrap();

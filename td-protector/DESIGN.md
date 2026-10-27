@@ -202,17 +202,13 @@ through the same injectable reader as `Secret` and encodes the 16 bytes,
 zeroing them; `parse` scans at most 256 bytes and returns an `EntryError`
 naming the group, or the one-based byte offset of a refused byte, never
 the digits; a separator after a wrong number of digits names the group
-the run began in. `check_partial` judges an entry still being typed, for
-the installer's type-back feedback as each key is pressed: it refuses
-as `parse` does, checking each group once it is whole, counts more than
-48 digits as `Length`, and otherwise answers how many digits there are,
-so a short entry is incomplete rather than refused. It returns no
-digits. `passphrase` and `display` return a `RecoveryText`,
+the run began in. `passphrase` and `display` return a `RecoveryText`,
 one allocation at exactly its 48- or 55-byte length, for the keyslot
 operation or the completion screen; UI code draws it from the borrow and
 never copies it into an ordinary `String` or other buffer that is not
-zeroed. `matches` compares two keys over every digit, for the
-installer's type-back. Whoever holds the entered bytes zeroes them.
+zeroed; the installer also lends the 48 digits to its QR encoder, which
+zeroes what it builds. `matches` compares two keys over every digit.
+Whoever holds the entered bytes zeroes them.
 
 ## LUKS2 tokens
 

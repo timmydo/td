@@ -4,8 +4,9 @@
 //! channel". Execution runs on its own thread through an `Execute`;
 //! production's is `main.rs`'s `LiveExecution`. Without a consent channel
 //! execute is refused as consent unavailable once the held disk rechecks.
-//! A device-bound execution hands its recovery key to the service for the
-//! installer's type-back and waits for the outcome.
+//! A device-bound execution hands its recovery key to the service, which
+//! sends it once to the installer to show, and waits for the installer's
+//! acknowledgement.
 
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
@@ -53,9 +54,10 @@ pub(crate) trait Host {
 
 /// What became of a recovery key handed to the service.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum TypedBack {
-    /// The installer typed it back; the execution makes the disk bootable.
-    Confirmed,
+pub(crate) enum Acknowledgement {
+    /// The installer acknowledged it, shown; the execution makes the disk
+    /// bootable.
+    Acknowledged,
     /// The installer was lost first; the execution withdraws the
     /// installation.
     Lost,
@@ -65,15 +67,15 @@ pub(crate) enum TypedBack {
 pub(crate) trait Execute<C>: Send + Sync + 'static {
     /// `progress` is told each phase as it begins. A device-bound execution,
     /// written and verified, gives `recovery` its recovery key, which enters
-    /// the recovery-key phase and returns once the installer typed it back
-    /// or was lost. Only after `Confirmed` does it make the disk bootable;
+    /// the recovery-key phase and returns once the installer acknowledged it
+    /// or was lost. Only after `Acknowledged` does it make the disk bootable;
     /// its result then completes or fails the installation.
     fn execute(
         &self,
         plan: &Plan,
         claim: C,
         progress: &mut dyn FnMut(Phase),
-        recovery: &mut dyn FnMut(RecoveryDigits) -> TypedBack,
+        recovery: &mut dyn FnMut(RecoveryDigits) -> Acknowledgement,
     ) -> Result<(), Failure>;
 }
 
@@ -88,7 +90,7 @@ impl<C> Execute<C> for NoExecution {
         _: &Plan,
         _: C,
         _: &mut dyn FnMut(Phase),
-        _: &mut dyn FnMut(RecoveryDigits) -> TypedBack,
+        _: &mut dyn FnMut(RecoveryDigits) -> Acknowledgement,
     ) -> Result<(), Failure> {
         match *self {}
     }
@@ -99,7 +101,7 @@ impl<C> Execute<C> for NoExecution {
 struct Recovery {
     key: RecoveryDigits,
     sent: bool,
-    typed: mpsc::Sender<TypedBack>,
+    answer: mpsc::Sender<Acknowledgement>,
 }
 
 enum Held<C> {
@@ -116,7 +118,7 @@ enum Held<C> {
     /// The claim moved to the execution.
     Running(ReviewNonce, Phase),
     /// Written and verified: the execution waits on the installer's
-    /// type-back of the recovery key the service holds.
+    /// acknowledgement of the recovery key the service holds.
     Recovering(ReviewNonce, Box<Recovery>),
     Complete(ReviewNonce),
     Failed(ReviewNonce, Failure),
@@ -207,7 +209,7 @@ impl<H: Host, E: Execute<H::Claim>> Service<H, E> {
             },
             Request::End(ending, nonce) => self.end(ending, nonce),
             Request::RecoveryKey(nonce) => self.recovery_key(nonce),
-            Request::ConfirmRecovery(nonce, digits) => self.confirm_recovery(nonce, &digits),
+            Request::AcknowledgeRecovery(nonce) => self.acknowledge_recovery(nonce),
         })
     }
 
@@ -235,12 +237,11 @@ impl<H: Host, E: Execute<H::Claim>> Service<H, E> {
         }
     }
 
-    /// The type-back, admitted only after the key was sent. Equal digits
-    /// zero the key and release the execution to make the disk bootable,
-    /// still running in the phase until its result completes or fails it;
-    /// different digits are refused and the phase continues. Before the key
-    /// was sent the installation is still busy.
-    fn confirm_recovery(&mut self, nonce: ReviewNonce, digits: &RecoveryDigits) -> Reply {
+    /// The acknowledgement, admitted only after the key was sent: it zeroes
+    /// the key and releases the execution to make the disk bootable, still
+    /// running in the phase until its result completes or fails it. Before
+    /// the key was sent the installation is still busy.
+    fn acknowledge_recovery(&mut self, nonce: ReviewNonce) -> Reply {
         let recovery = match &self.held {
             Held::Recovering(held, recovery) => {
                 if *held != nonce {
@@ -259,14 +260,11 @@ impl<H: Host, E: Execute<H::Claim>> Service<H, E> {
         if !recovery.sent {
             return Reply::Refused(Refusal::Busy);
         }
-        if recovery.key != *digits {
-            return Reply::Refused(Refusal::RecoveryKeyMismatch);
-        }
         // Dropping the held recovery zeroes the key.
         if let Held::Recovering(_, recovery) =
             std::mem::replace(&mut self.held, Held::Running(nonce, Phase::RecoveryKey))
         {
-            let _ = recovery.typed.send(TypedBack::Confirmed);
+            let _ = recovery.answer.send(Acknowledgement::Acknowledged);
         }
         Reply::Status(self.state())
     }
@@ -274,7 +272,11 @@ impl<H: Host, E: Execute<H::Claim>> Service<H, E> {
     /// A device-bound execution, written and verified, hands over its
     /// recovery key and waits. Anything but a running installation answers
     /// it lost, so it withdraws.
-    pub(crate) fn recovering(&mut self, key: RecoveryDigits, typed: mpsc::Sender<TypedBack>) {
+    pub(crate) fn recovering(
+        &mut self,
+        key: RecoveryDigits,
+        answer: mpsc::Sender<Acknowledgement>,
+    ) {
         match self.held {
             Held::Running(nonce, _) => {
                 self.held = Held::Recovering(
@@ -282,12 +284,12 @@ impl<H: Host, E: Execute<H::Claim>> Service<H, E> {
                     Box::new(Recovery {
                         key,
                         sent: false,
-                        typed,
+                        answer,
                     }),
                 );
             }
             _ => {
-                let _ = typed.send(TypedBack::Lost);
+                let _ = answer.send(Acknowledgement::Lost);
             }
         }
     }
@@ -507,7 +509,7 @@ impl<H: Host, E: Execute<H::Claim>> Service<H, E> {
     }
 
     /// The installer is gone. Until started its review ends with it; a
-    /// recovery key it has not typed back is lost, and the execution
+    /// recovery key it has not acknowledged is lost, and the execution
     /// withdraws the installation. Returns whether an installation is still
     /// running.
     pub(crate) fn installer_lost(&mut self) -> bool {
@@ -518,7 +520,7 @@ impl<H: Host, E: Execute<H::Claim>> Service<H, E> {
                 if let Held::Recovering(_, recovery) =
                     std::mem::replace(&mut self.held, Held::Running(nonce, Phase::RecoveryKey))
                 {
-                    let _ = recovery.typed.send(TypedBack::Lost);
+                    let _ = recovery.answer.send(Acknowledgement::Lost);
                 }
                 return true;
             }
@@ -550,7 +552,7 @@ impl<H: Host, E: Execute<H::Claim>> Service<H, E> {
         }
     }
 
-    /// An execution's outcome, a device-bound one's after its type-back.
+    /// An execution's outcome, a device-bound one's after its acknowledgement.
     pub(crate) fn finished(&mut self, result: Result<(), Failure>) {
         let nonce = match &self.held {
             Held::Running(nonce, _) | Held::Recovering(nonce, _) => *nonce,
@@ -599,9 +601,9 @@ enum Event {
     Answer(Answer),
     ConsentClosed,
     Progress(Phase),
-    /// A device-bound execution's recovery key, and where its type-back's
+    /// A device-bound execution's recovery key, and where its acknowledgement's
     /// outcome goes.
-    Recovery(RecoveryDigits, mpsc::Sender<TypedBack>),
+    Recovery(RecoveryDigits, mpsc::Sender<Acknowledgement>),
     Done(Result<(), Failure>),
 }
 
@@ -733,12 +735,12 @@ where
             },
             Event::ConsentClosed => end_consent(&mut service, &mut channel),
             Event::Progress(phase) => service.progress(phase),
-            // An installer already lost cannot type the key back.
-            Event::Recovery(key, typed) => {
+            // An installer already lost cannot acknowledge the key.
+            Event::Recovery(key, answer) => {
                 if installer_result.is_some() {
-                    let _ = typed.send(TypedBack::Lost);
+                    let _ = answer.send(Acknowledgement::Lost);
                 } else {
-                    service.recovering(key, typed);
+                    service.recovering(key, answer);
                 }
             }
             Event::Done(outcome) => {
@@ -852,13 +854,13 @@ fn run<C, E: Execute<C>>(start: Start<C, E>, events: &mpsc::Sender<Event>) {
         claim,
         execution,
     } = start;
-    // A service that is gone cannot take the type-back: lost.
+    // A service that is gone cannot take the acknowledgement: lost.
     let mut recovery = |key| {
-        let (typed, outcome) = mpsc::channel();
-        if events.send(Event::Recovery(key, typed)).is_err() {
-            return TypedBack::Lost;
+        let (answer, outcome) = mpsc::channel();
+        if events.send(Event::Recovery(key, answer)).is_err() {
+            return Acknowledgement::Lost;
         }
-        outcome.recv().unwrap_or(TypedBack::Lost)
+        outcome.recv().unwrap_or(Acknowledgement::Lost)
     };
     let outcome = execution.execute(&plan, claim, &mut progress, &mut recovery);
     unfinished.finish(outcome);
@@ -892,7 +894,8 @@ fn read_request(stream: &mut UnixStream) -> io::Result<Option<Request>> {
     };
     let length = payload_len(header, MAX_REQUEST_BYTES).map_err(invalid)?;
     let mut payload = vec![0; length];
-    // A frame cut short may still hold some of a type-back's digits.
+    // No request carries recovery digits; a frame cut short is zeroed all
+    // the same, as every request is.
     let request = stream
         .read_exact(&mut payload)
         .and_then(|()| Request::decode(&payload).map(Some).map_err(invalid));
@@ -1547,7 +1550,7 @@ mod tests {
         ran: Arc<Mutex<Vec<[u8; 32]>>>,
         /// A device-bound execution's key, handed over once verified.
         recovery: Mutex<Option<RecoveryDigits>>,
-        typed: Arc<Mutex<Vec<TypedBack>>>,
+        answers: Arc<Mutex<Vec<Acknowledgement>>>,
     }
     impl FakeExecution {
         fn new(outcome: Result<(), Failure>) -> Self {
@@ -1556,7 +1559,7 @@ mod tests {
                 release: Mutex::new(None),
                 ran: Arc::default(),
                 recovery: Mutex::new(None),
-                typed: Arc::default(),
+                answers: Arc::default(),
             }
         }
     }
@@ -1566,7 +1569,7 @@ mod tests {
             plan: &Plan,
             claim: Claim,
             progress: &mut dyn FnMut(Phase),
-            recovery: &mut dyn FnMut(RecoveryDigits) -> TypedBack,
+            recovery: &mut dyn FnMut(RecoveryDigits) -> Acknowledgement,
         ) -> Result<(), Failure> {
             assert_eq!(claim.0.lock().unwrap().live, 1);
             progress(Phase::WritingFilesystems);
@@ -1576,9 +1579,9 @@ mod tests {
             progress(Phase::VerifyingBoot);
             self.ran.lock().unwrap().push(*plan.nonce());
             if let Some(key) = self.recovery.lock().unwrap().take() {
-                let typed = recovery(key);
-                self.typed.lock().unwrap().push(typed);
-                if typed == TypedBack::Lost {
+                let answer = recovery(key);
+                self.answers.lock().unwrap().push(answer);
+                if answer == Acknowledgement::Lost {
                     return Err(Failure::RecoveryUnconfirmed);
                 }
             }
@@ -1771,7 +1774,7 @@ mod tests {
         }
     }
 
-    /// Only the recovery-key phase admits the key or its type-back: every
+    /// Only the recovery-key phase admits the key or its acknowledgement: every
     /// other state refuses both, and asking changes nothing.
     #[test]
     fn no_other_state_admits_the_recovery_key() {
@@ -1808,13 +1811,12 @@ mod tests {
             service.held = held;
             services.push((refusal, service));
         }
-        let digits = crate::installation_protocol::RecoveryDigits::new(&[b'7'; 48]).unwrap();
         for (refusal, mut service) in services {
             let state = service.state();
             for named in [nonce(), ReviewNonce::from(&plan)] {
                 for request in [
                     Request::RecoveryKey(named),
-                    Request::ConfirmRecovery(named, digits.clone()),
+                    Request::AcknowledgeRecovery(named),
                 ] {
                     assert_eq!(
                         service.answer(request).unwrap(),
@@ -1836,31 +1838,28 @@ mod tests {
     fn recovering() -> (
         Service<Fake, FakeExecution>,
         ReviewNonce,
-        mpsc::Receiver<TypedBack>,
+        mpsc::Receiver<Acknowledgement>,
     ) {
         let (mut service, plan) = awaiting(Ok(()));
         let start = service.consented(Answer::Consent(*plan.nonce())).unwrap();
         drop(start);
         service.take_reports();
         let nonce = ReviewNonce::from(&plan);
-        let (typed, outcome) = mpsc::channel();
-        service.recovering(digits(b'4'), typed);
+        let (answer, outcome) = mpsc::channel();
+        service.recovering(digits(b'4'), answer);
         assert_eq!(service.state(), State::Running(nonce, Phase::RecoveryKey));
         (service, nonce, outcome)
     }
 
-    /// The key is sent once, for its nonce; the type-back is admitted only
-    /// after it, a wrong one refused while the phase goes on, and the right
-    /// one tells the waiting execution, whose result completes it; an
-    /// installer lost meanwhile changes nothing.
+    /// The key is sent once, for its nonce; the acknowledgement is admitted
+    /// only after it, for that nonce, and tells the waiting execution, whose
+    /// result completes it; an installer lost meanwhile changes nothing.
     #[test]
-    fn the_recovery_key_is_sent_once_and_typed_back_to_complete() {
+    fn the_recovery_key_is_sent_once_and_acknowledged_to_complete() {
         let (mut service, nonce, outcome) = recovering();
         let other = ReviewNonce::new([9; 32]).unwrap();
         assert_eq!(
-            service
-                .answer(Request::ConfirmRecovery(nonce, digits(b'4')))
-                .unwrap(),
+            service.answer(Request::AcknowledgeRecovery(nonce)).unwrap(),
             Reply::Refused(Refusal::Busy)
         );
         assert_eq!(
@@ -1889,37 +1888,22 @@ mod tests {
             );
         }
         assert_eq!(
-            service
-                .answer(Request::ConfirmRecovery(other, digits(b'4')))
-                .unwrap(),
+            service.answer(Request::AcknowledgeRecovery(other)).unwrap(),
             Reply::Refused(Refusal::StaleReview)
-        );
-        let mut near = [b'4'; 48];
-        near[47] = b'5';
-        assert_eq!(
-            service
-                .answer(Request::ConfirmRecovery(
-                    nonce,
-                    RecoveryDigits::new(&near).unwrap()
-                ))
-                .unwrap(),
-            Reply::Refused(Refusal::RecoveryKeyMismatch)
         );
         assert_eq!(service.state(), State::Running(nonce, Phase::RecoveryKey));
         assert!(outcome.try_recv().is_err());
-        // Confirmed, the execution makes the disk bootable; until it says
+        // Acknowledged, the execution makes the disk bootable; until it says
         // so the installation runs on, and nothing more is admitted.
         assert_eq!(
-            service
-                .answer(Request::ConfirmRecovery(nonce, digits(b'4')))
-                .unwrap(),
+            service.answer(Request::AcknowledgeRecovery(nonce)).unwrap(),
             Reply::Status(State::Running(nonce, Phase::RecoveryKey))
         );
-        assert_eq!(outcome.try_recv().unwrap(), TypedBack::Confirmed);
+        assert_eq!(outcome.try_recv().unwrap(), Acknowledgement::Acknowledged);
         assert!(service.take_reports().is_empty());
         for request in [
             Request::RecoveryKey(nonce),
-            Request::ConfirmRecovery(nonce, digits(b'4')),
+            Request::AcknowledgeRecovery(nonce),
             Request::End(Ending::Restart, nonce),
         ] {
             assert_eq!(
@@ -1942,7 +1926,7 @@ mod tests {
         );
     }
 
-    /// An installer lost before its type-back loses the key: the execution
+    /// An installer lost before its acknowledgement loses the key: the execution
     /// is told so, withdraws, and the installation fails unconfirmed. A key
     /// handed over with no installation running is lost at once.
     #[test]
@@ -1953,7 +1937,7 @@ mod tests {
             Reply::RecoveryKey(nonce, digits(b'4'))
         );
         assert!(service.installer_lost());
-        assert_eq!(outcome.try_recv().unwrap(), TypedBack::Lost);
+        assert_eq!(outcome.try_recv().unwrap(), Acknowledgement::Lost);
         assert_eq!(service.state(), State::Running(nonce, Phase::RecoveryKey));
         service.finished(Err(Failure::RecoveryUnconfirmed));
         assert_eq!(
@@ -1965,9 +1949,9 @@ mod tests {
             [Report::Finished(*nonce.as_bytes(), Outcome::Failed)]
         );
         let mut idle = Service::new(Fake::new());
-        let (typed, outcome) = mpsc::channel();
-        idle.recovering(digits(b'4'), typed);
-        assert_eq!(outcome.try_recv().unwrap(), TypedBack::Lost);
+        let (answer, outcome) = mpsc::channel();
+        idle.recovering(digits(b'4'), answer);
+        assert_eq!(outcome.try_recv().unwrap(), Acknowledgement::Lost);
         assert_eq!(idle.state(), State::Idle);
     }
 
@@ -1977,18 +1961,18 @@ mod tests {
         execution
     }
 
-    /// Over the stream: the installer reads the key once, types it back,
+    /// Over the stream: the installer reads the key once, acknowledges it,
     /// and only then does the execution's result complete or fail it.
     #[test]
-    fn a_device_bound_installation_completes_on_its_type_back() {
+    fn a_device_bound_installation_completes_on_its_acknowledgement() {
         for outcome in [Ok(()), Err(Failure::WriteFailed)] {
-            type_back(outcome);
+            acknowledged(outcome);
         }
     }
 
-    fn type_back(outcome: Result<(), Failure>) {
+    fn acknowledged(outcome: Result<(), Failure>) {
         let execution = device_bound(outcome);
-        let typed = Arc::clone(&execution.typed);
+        let answers = Arc::clone(&execution.answers);
         let (end, finished) = match outcome {
             Ok(()) => (
                 State::Complete as fn(ReviewNonce) -> State,
@@ -2009,13 +1993,9 @@ mod tests {
                 else {
                     panic!("no recovery key")
                 };
-                assert_eq!((named, key.clone()), (nonce, digits(b'8')));
+                assert_eq!((named, key), (nonce, digits(b'8')));
                 assert_eq!(
-                    exchange(stream, &Request::ConfirmRecovery(nonce, digits(b'7'))),
-                    Reply::Refused(Refusal::RecoveryKeyMismatch)
-                );
-                assert_eq!(
-                    exchange(stream, &Request::ConfirmRecovery(nonce, key)),
+                    exchange(stream, &Request::AcknowledgeRecovery(nonce)),
                     Reply::Status(State::Running(nonce, Phase::RecoveryKey))
                 );
                 status_until(stream, end(nonce));
@@ -2032,7 +2012,7 @@ mod tests {
         );
         result.unwrap();
         assert_eq!(ran, [[0x5a; 32]]);
-        assert_eq!(*typed.lock().unwrap(), [TypedBack::Confirmed]);
+        assert_eq!(*answers.lock().unwrap(), [Acknowledgement::Acknowledged]);
         // The service may end before the execution returns the claim.
         assert!(live <= 1);
     }
@@ -2040,11 +2020,11 @@ mod tests {
     /// An installer that closes in the phase, before or after reading the
     /// key, leaves it unconfirmed, and so does one lost before the phase.
     #[test]
-    fn a_device_bound_installation_lost_before_its_type_back_fails() {
+    fn a_device_bound_installation_lost_before_its_acknowledgement_fails() {
         for (read_key, before) in [(false, false), (true, false), (false, true)] {
             let (execution, release) = gated(Ok(()));
             *execution.recovery.lock().unwrap() = Some(digits(b'8'));
-            let typed = Arc::clone(&execution.typed);
+            let answers = Arc::clone(&execution.answers);
             let (gone, installer_gone) = mpsc::channel();
             let (result, live, _) = served_with_consent(
                 execution,
@@ -2084,7 +2064,7 @@ mod tests {
             );
             result.unwrap();
             assert_eq!(live, 0);
-            assert_eq!(*typed.lock().unwrap(), [TypedBack::Lost]);
+            assert_eq!(*answers.lock().unwrap(), [Acknowledgement::Lost]);
         }
     }
 
@@ -2617,7 +2597,7 @@ mod tests {
             _: &Plan,
             _: Claim,
             progress: &mut dyn FnMut(Phase),
-            _: &mut dyn FnMut(RecoveryDigits) -> TypedBack,
+            _: &mut dyn FnMut(RecoveryDigits) -> Acknowledgement,
         ) -> Result<(), Failure> {
             progress(Phase::WritingFilesystems);
             panic!("the execution failed by unwinding")

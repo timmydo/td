@@ -443,7 +443,7 @@ pub(crate) const RESTARTING_NOTICE: &str =
 pub(crate) const HELD_NOTICE: &str = "SESSION REVOCATION FAILED AFTER A RESTART";
 
 /// What a committed device-bound disk installation shows before attention
-/// closes by itself: its recovery key is shown and typed back in td-setup.
+/// closes by itself: its recovery key is shown, and said kept, in td-setup.
 pub(crate) const RETURNING_NOTICE: &str = "INSTALLING - RETURNING TO SETUP FOR THE RECOVERY KEY";
 
 /// Display-only pixels: ordinary scene rendering never calls this painter.

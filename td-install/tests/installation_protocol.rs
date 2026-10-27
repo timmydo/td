@@ -97,7 +97,7 @@ fn requests() -> Vec<Request> {
         Request::End(Ending::Restart, nonce()),
         Request::End(Ending::PowerOff, nonce()),
         Request::RecoveryKey(nonce()),
-        Request::ConfirmRecovery(nonce(), digits()),
+        Request::AcknowledgeRecovery(nonce()),
     ]
 }
 
@@ -128,7 +128,7 @@ fn replies() -> Vec<Reply> {
 
 #[test]
 fn wire_bytes_are_independently_specified() {
-    assert_eq!(GREETING, b"TDINS07\n");
+    assert_eq!(GREETING, b"TDINS08\n");
     let mut propose = vec![0x02];
     propose.extend(DESTINATION);
     propose.extend(SETTINGS);
@@ -142,9 +142,8 @@ fn wire_bytes_are_independently_specified() {
     power_off.extend([7; 32]);
     let mut recovery = vec![0x09];
     recovery.extend([7; 32]);
-    let mut confirm = vec![0x0a];
-    confirm.extend([7; 32]);
-    confirm.extend(KEY);
+    let mut acknowledge = vec![0x0a];
+    acknowledge.extend([7; 32]);
     let expected: [&[u8]; 10] = [
         &[0x01],
         &propose,
@@ -155,7 +154,7 @@ fn wire_bytes_are_independently_specified() {
         &restart,
         &power_off,
         &recovery,
-        &confirm,
+        &acknowledge,
     ];
     for (request, bytes) in requests().iter().zip(expected) {
         assert_eq!(request.encode(), bytes, "{request:?}");
@@ -230,7 +229,6 @@ fn wire_bytes_are_independently_specified() {
         ),
         (Reply::Refused(Refusal::PowerUnavailable), vec![0x84, 15]),
         (Reply::Refused(Refusal::RecoveryKeySent), vec![0x84, 16]),
-        (Reply::Refused(Refusal::RecoveryKeyMismatch), vec![0x84, 17]),
         (
             Reply::RecoveryKey(nonce(), digits()),
             [&[0x86], &[7; 32][..], KEY].concat(),
@@ -262,7 +260,7 @@ fn every_message_round_trips_and_codes_are_dense() {
     let expect = |count: u8| (1..=count).collect::<Vec<_>>();
     assert_eq!(
         codes(Refusal::ALL.iter().map(|&r| Reply::Refused(r)).collect()),
-        expect(17)
+        expect(16)
     );
     let status = |state| Reply::Status(state);
     assert_eq!(
@@ -364,8 +362,19 @@ fn maximal_messages_fit_their_direction_bounds() {
     assert_eq!(status.encode().len(), 35);
     let key = Reply::RecoveryKey(nonce(), digits());
     assert_eq!(key.encode().len(), 1 + 32 + 48);
-    let confirm = Request::ConfirmRecovery(nonce(), digits());
-    assert_eq!(confirm.encode().len(), 1 + 32 + 48);
+    let acknowledge = Request::AcknowledgeRecovery(nonce());
+    assert_eq!(acknowledge.encode().len(), 1 + 32);
+}
+
+#[test]
+fn nothing_of_the_key_travels_back() {
+    // The acknowledgement is the nonce alone: one still carrying the 48
+    // digits the old type-back sent is refused, and code 17, the old
+    // mismatch refusal, names nothing.
+    let mut typed_back = Request::AcknowledgeRecovery(nonce()).encode();
+    typed_back.extend(KEY);
+    assert!(Request::decode(&typed_back).is_err());
+    assert!(Reply::decode(&[0x84, 17]).is_err());
 }
 
 #[test]
@@ -387,13 +396,9 @@ fn recovery_digits_are_exactly_48_ascii_digits_and_never_printed() {
     let mut reply = Reply::RecoveryKey(nonce(), digits()).encode();
     *reply.last_mut().unwrap() = b'-';
     assert!(Reply::decode(&reply).is_err());
-    let mut confirm = Request::ConfirmRecovery(nonce(), digits()).encode();
-    confirm[40] = b' ';
-    assert!(Request::decode(&confirm).is_err());
     for printed in [
         format!("{:?}", digits()),
         format!("{:?}", Reply::RecoveryKey(nonce(), digits())),
-        format!("{:?}", Request::ConfirmRecovery(nonce(), digits())),
     ] {
         assert!(!printed.contains("0123"), "{printed}");
     }
@@ -407,7 +412,7 @@ fn recovery_digits_compare_every_byte_and_payloads_scrub() {
         other[index] = if other[index] == b'9' { b'0' } else { b'9' };
         assert_ne!(RecoveryDigits::new(&other).unwrap(), digits());
     }
-    let mut payload = Request::ConfirmRecovery(nonce(), digits()).encode();
+    let mut payload = Reply::RecoveryKey(nonce(), digits()).encode();
     scrub(&mut payload);
     assert_eq!(payload, vec![0; 1 + 32 + 48]);
 }
@@ -515,9 +520,8 @@ fn unknown_tags_codes_and_zero_nonces_refuse() {
     zero_power_off.extend([0; 32]);
     let mut zero_recovery = vec![0x09];
     zero_recovery.extend([0; 32]);
-    let mut zero_confirm = vec![0x0a];
-    zero_confirm.extend([0; 32]);
-    zero_confirm.extend(KEY);
+    let mut zero_acknowledge = vec![0x0a];
+    zero_acknowledge.extend([0; 32]);
     let mut zero_key = vec![0x86];
     zero_key.extend([0; 32]);
     zero_key.extend(KEY);
@@ -527,7 +531,7 @@ fn unknown_tags_codes_and_zero_nonces_refuse() {
         Request::decode(&zero_restart).unwrap_err(),
         Request::decode(&zero_power_off).unwrap_err(),
         Request::decode(&zero_recovery).unwrap_err(),
-        Request::decode(&zero_confirm).unwrap_err(),
+        Request::decode(&zero_acknowledge).unwrap_err(),
         Reply::decode(&zero_key).unwrap_err(),
     ] {
         assert_eq!(error, "installation review nonce cannot be zero");
@@ -547,15 +551,17 @@ fn directions_are_disjoint() {
 
 #[test]
 fn only_this_version_is_admitted() {
-    assert!(check_greeting(b"TDINS07\n").is_ok());
+    assert!(check_greeting(b"TDINS08\n").is_ok());
     for other in [
+        b"TDINS07\n",
+        b"TDINS06\n",
         b"TDINS05\n",
         b"TDINS04\n",
         b"TDINS03\n",
         b"TDINS02\n",
         b"TDAT001\n",
         b"TDUPD01\n",
-        b"TDINS07\0",
+        b"TDINS08\0",
     ] {
         assert_eq!(
             check_greeting(other).unwrap_err(),
@@ -678,7 +684,7 @@ fn replies_pair_only_with_their_requests() {
             Request::Execute(_)
             | Request::Withdraw(_)
             | Request::End(..)
-            | Request::ConfirmRecovery(..),
+            | Request::AcknowledgeRecovery(_),
             Reply::Status(_),
         ) => true,
         (Request::Timezones, Reply::Timezones(_)) => true,

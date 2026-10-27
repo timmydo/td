@@ -10,7 +10,7 @@ use crate::installation_plan::{
 
 /// Sent and required by both ends before the first frame. A change to any
 /// message or its bytes changes the greeting; there is no negotiation.
-pub const GREETING: &[u8; 8] = b"TDINS07\n";
+pub const GREETING: &[u8; 8] = b"TDINS08\n";
 /// Root admits only this much from the unprivileged side.
 pub const MAX_REQUEST_BYTES: usize = 1 + MAX_BYTES;
 pub const MAX_REPLY_BYTES: usize = 1 + if MAX_CANDIDATE_BYTES > MAX_ZONE_BYTES {
@@ -28,7 +28,7 @@ const TIMEZONES: u8 = 0x06;
 const RESTART: u8 = 0x07;
 const POWER_OFF: u8 = 0x08;
 const RECOVERY_KEY: u8 = 0x09;
-const CONFIRM_RECOVERY: u8 = 0x0a;
+const ACKNOWLEDGE_RECOVERY: u8 = 0x0a;
 const REINSTALL: u8 = 0x0b;
 // Replies set the high bit, so a reflected frame never decodes.
 const DESTINATIONS_REPLY: u8 = 0x81;
@@ -85,8 +85,8 @@ impl ReviewNonce {
     }
 }
 
-/// A recovery key's 48 ASCII digits as the wire carries them, shown once and
-/// typed back. The codec admits only digits; the check digits are
+/// A recovery key's 48 ASCII digits as the wire carries them, sent once to
+/// be shown. The codec admits only digits; the check digits are
 /// td-protector's to judge. Every copy is zeroed on drop and none is
 /// printed. An encoded message holding them is the encoder's to zero, and a
 /// received payload the receiver's ([`scrub`]).
@@ -107,8 +107,8 @@ impl RecoveryDigits {
     }
 }
 
-/// Reads all 48 bytes with no early exit, so comparing typed-back digits
-/// with the held key does not time how long a prefix matched.
+/// Reads all 48 bytes with no early exit, so a comparison of two keys does
+/// not time how long a prefix matched.
 impl PartialEq for RecoveryDigits {
     fn eq(&self, other: &Self) -> bool {
         let difference = self
@@ -158,7 +158,7 @@ pub enum Phase {
     ApplyingSettings,
     VerifyingBoot,
     /// A device-bound installation is written and verified; the service
-    /// holds its recovery key for the installer's type-back.
+    /// holds its recovery key until the installer acknowledges it.
     RecoveryKey,
 }
 
@@ -316,8 +316,6 @@ pub enum Refusal {
     PowerUnavailable,
     /// The recovery key was already sent; the service sends it once.
     RecoveryKeySent,
-    /// The digits typed back are not the recovery key.
-    RecoveryKeyMismatch,
 }
 
 impl Refusal {
@@ -338,7 +336,6 @@ impl Refusal {
         Self::TimezonesUnavailable,
         Self::PowerUnavailable,
         Self::RecoveryKeySent,
-        Self::RecoveryKeyMismatch,
     ];
 
     fn code(self) -> u8 {
@@ -359,7 +356,6 @@ impl Refusal {
             Self::TimezonesUnavailable => 14,
             Self::PowerUnavailable => 15,
             Self::RecoveryKeySent => 16,
-            Self::RecoveryKeyMismatch => 17,
         }
     }
 
@@ -383,7 +379,7 @@ impl Refusal {
             14 => Ok(Self::TimezonesUnavailable),
             15 => Ok(Self::PowerUnavailable),
             16 => Ok(Self::RecoveryKeySent),
-            17 => Ok(Self::RecoveryKeyMismatch),
+            // 17 was a typed-back key that did not match; there is no type-back.
             _ => Err("unknown installation refusal".into()),
         }
     }
@@ -417,9 +413,10 @@ pub enum Request {
     /// The recovery key of the device-bound installation the nonce names,
     /// in its recovery-key phase; sent once.
     RecoveryKey(ReviewNonce),
-    /// The recovery key typed back, after it was sent; equal digits
-    /// complete the installation.
-    ConfirmRecovery(ReviewNonce, RecoveryDigits),
+    /// The person has the recovery key the service sent: written down or
+    /// scanned from its QR code. It completes the installation; nothing of
+    /// the key is sent back.
+    AcknowledgeRecovery(ReviewNonce),
 }
 
 /// How a complete installation's live session ends.
@@ -473,12 +470,9 @@ impl Request {
                 out.push(RECOVERY_KEY);
                 out.extend_from_slice(nonce.as_bytes());
             }
-            Self::ConfirmRecovery(nonce, digits) => {
-                // One allocation, so no reallocation leaves a copy of the digits.
-                out.reserve_exact(1 + 32 + RECOVERY_DIGITS);
-                out.push(CONFIRM_RECOVERY);
+            Self::AcknowledgeRecovery(nonce) => {
+                out.push(ACKNOWLEDGE_RECOVERY);
                 out.extend_from_slice(nonce.as_bytes());
-                out.extend_from_slice(digits.as_bytes());
             }
         }
         out
@@ -505,10 +499,7 @@ impl Request {
             RESTART => Self::End(Ending::Restart, ReviewNonce::new(reader.array()?)?),
             POWER_OFF => Self::End(Ending::PowerOff, ReviewNonce::new(reader.array()?)?),
             RECOVERY_KEY => Self::RecoveryKey(ReviewNonce::new(reader.array()?)?),
-            CONFIRM_RECOVERY => {
-                let nonce = ReviewNonce::new(reader.array()?)?;
-                Self::ConfirmRecovery(nonce, read_digits(&mut reader)?)
-            }
+            ACKNOWLEDGE_RECOVERY => Self::AcknowledgeRecovery(ReviewNonce::new(reader.array()?)?),
             _ => return Err("unknown installation request".into()),
         };
         reader.finish()?;
@@ -645,7 +636,7 @@ impl Reply {
             Request::Execute(_)
             | Request::Withdraw(_)
             | Request::End(..)
-            | Request::ConfirmRecovery(..) => matches!(self, Self::Status(_) | Self::Refused(_)),
+            | Request::AcknowledgeRecovery(_) => matches!(self, Self::Status(_) | Self::Refused(_)),
             Request::Status => matches!(self, Self::Status(_)),
             Request::Timezones => matches!(self, Self::Timezones(_) | Self::Refused(_)),
             Request::RecoveryKey(_) => matches!(self, Self::RecoveryKey(..) | Self::Refused(_)),

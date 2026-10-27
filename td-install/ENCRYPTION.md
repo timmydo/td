@@ -229,12 +229,40 @@ depend on the keyboard layout ([td-protector](../td-protector/DESIGN.md)
 without separators, so stock cryptsetup opens the volume with it from any
 medium when given the 48 digits alone; only td's own entry tolerates
 separators between groups. The installer displays it once on its completion
-screen, requires it to be typed back, and stores no copy. Completion waits
-for the type-back, and so does the disk's partition table: until the key
-is confirmed the disk carries none, so firmware boots nothing from it. If
-the installer is lost before it, the installation is withdrawn like any
-failure after layout (DESIGN.md "Device-bound formatting"), because
-recovery cannot be declined in this tier.
+screen, as its groups and as a QR code of the 48 digits a phone can keep
+(INSTALLER.md "User flow and authority"), asks the person to say it was
+kept, and stores no copy. Completion waits for that acknowledgement, and
+so does the disk's partition table: until it the disk carries none, so
+firmware boots nothing from it. If the installer is lost before it, the
+installation is withdrawn like any failure after layout (DESIGN.md
+"Device-bound formatting"), because recovery cannot be declined in this
+tier. The acknowledgement is the person's word, not a proof: nothing
+checks that the key was written down or scanned correctly, and the
+review and the key's own page say plainly that it is the only way back.
+The type-back it replaced proved only a transcription, and never bound
+what the person saw, since the installer that showed the key also sent
+the digits back.
+
+Scanning the code hands the 48 digits to the phone: its scanner may keep
+a history, and the phone or its cloud backup may copy them, under
+custody td does not govern. Anyone who keeps the key can open the disk
+with this computer's TPM or without it, so whoever holds that phone or
+account holds what the key opens. A code on the screen is also readable
+by any camera in view, from farther than the digits beside it are; the
+page shows both only during the recovery-key phase. Writing the digits
+down keeps the key off networked devices.
+
+No routine flow asks for any part of the recovery key to be typed. It
+is typed only in recovery, when nothing else releases the volume: the
+installer shows it and takes an acknowledgement, and the device-bound
+and unencrypted tiers never ask for it otherwise. Where a protected-tier
+operation below still names the recovery key as its only proof (the TPM
+shape's management requests without a fido2-recovery token, and
+td-login/TOKEN-LOGIN.md's disk proof on such a machine), that is an open
+item against this rule, not a routine flow: the increment that offers
+such an operation as routine must give it a proof that is not typed, an
+enrolled security key's assertion among them, or present it where it is
+offered as a recovery operation. Neither is implemented yet.
 
 The installer seals the first-boot protector on the live medium under
 td-protector's first-boot policy. Sealing reads no PCR, and TPM2_Create
@@ -252,7 +280,8 @@ td-protector's `verify_first_boot_object` on it: the sealed object's
 public authPolicy equals the PCR-12-at-zero policy computed in a trial
 session, and the TPM loads the sealed object under the storage primary.
 The first-boot protector's first TPM release is therefore on the
-installed first boot, and the typed-back recovery key covers its failure.
+installed first boot, and the recovery key the person said was kept
+covers its failure.
 The review discloses that the recovery key is the only way back if the
 TPM, firmware measurements or boot chain change.
 
@@ -350,8 +379,8 @@ drive sanitize; erasing a disk's earlier contents is its owner's separate
 step before installing. The ESP and the partition table are plaintext on
 every tier.
 
-The table is written last and only after the recovery key is typed back
-(DESIGN.md "Device-bound formatting"). A crash, power cut or lost
+The table is written last and only after the recovery key is
+acknowledged (DESIGN.md "Device-bound formatting"). A crash, power cut or lost
 installer before then leaves a disk with no partition table, which
 firmware does not boot. It still holds the ESP, with the kernel and the
 prepared selector, and the volume: its header with keyslot 0, opened by
@@ -363,15 +392,15 @@ secret. A withdrawal also zeroes the volume's first 16 MiB, so neither
 keyslot opens; a crash leaves no withdrawal behind it, and a new
 installation over the disk replaces both.
 
-After the confirmation the table goes down backup first, then the primary
+After the acknowledgement the table goes down backup first, then the primary
 with the protective MBR, each synced. A crash between the two leaves the
 backup GPT alone, with LBA 0 zeroed and so no protective MBR. Whether
 firmware then boots is its own: one that falls back to a valid backup
 header may boot the installation, one that wants the protective MBR or a
 valid primary treats the disk as unpartitioned. Either way the recovery
-key was already typed back, so a boot that reaches recovery is one its
-owner can open; nothing completes the installation, which a new one
-over the disk replaces.
+key was already shown and said kept, so a boot that reaches recovery is
+one its owner can open if they kept it; nothing completes the
+installation, which a new one over the disk replaces.
 
 ## Selector release
 
@@ -2268,7 +2297,10 @@ proof: its holder already has equal power offline.
 
 Requests need a proof too, so no request rests on the running session
 alone. The cost: in the TPM shape without a fido2-recovery token, every
-request means typing the 48-digit recovery key.
+request means typing the 48-digit recovery key, which "Device-bound
+default" records as an open item against its rule that no routine flow
+types the key: such a request is a recovery operation until it takes a
+proof that is not typed.
 
 These commands, the requests' volume-key reads and the keyslot test of
 TOKEN-LOGIN.md's disk proof are the running system's only key-bearing
@@ -2742,7 +2774,8 @@ commit.
    and bounded LUKS2 header reader in td-protector; the plan and protocol
    records (INSTALLER.md); the TPM probe; formatting with D6's cryptsetup
    binding, whose image check names the binary and its debug companion;
-   the completion page's display and type-back; and the
+   the completion page's display and type-back, since replaced by the
+   display, its QR code and an acknowledgement; and the
    encrypted-installation oracle.
 6. Add selector release, the PCR 12 cap in the installed and live
    selectors (amending MEDIA.md), the first-boot transition, the
@@ -2970,8 +3003,8 @@ Its guest drives the service, with the swtpm, a display device and the
 PS/2 keyboard attached so that its plans are device-bound, onto a
 disposable disk whose two table ranges hold a valid GPT the host seeded,
 as both of its peers: it fetches the recovery key once, requires a
-second ask refused as sent and a mistyped type-back refused as a
-mismatch with the phase continuing, and types the key back. Reaching the
+second ask refused as sent and an acknowledgement naming another review
+refused as stale with the phase continuing, and acknowledges the key. Reaching the
 phase is the evidence of verifying boot's checks, the token read back
 from the header cryptsetup wrote through td's reader and the TPM's
 verification of the sealed object among them; in the phase both of the
@@ -3171,12 +3204,13 @@ zero words, over-long and malformed attributes).
   style and cell size the page draws the key in), as `qemu-boot-live`
   already draws the status bar's expected text (`update::BarText`); each
   digit cell must match exactly one of them, the row found by its seven
-  hyphen cells at either scale td-setup may draw. It types the key back
-  with physical keys. A misread fails closed: a cell matching no digit,
-  or more than one, fails the leg before anything is typed, and a wrong
-  digit is refused by td-setup's group check or by the service as 17,
-  recovery key mismatch, so the leg fails and the installation never
-  completes on a misread key. The installed disk then boots through
+  hyphen cells at either scale td-setup may draw; the QR code beside it
+  is black and white, never the key row's ink. It then says the key is
+  kept with physical keys, typing nothing of it. A misread fails closed:
+  a cell matching no digit, or more than one, fails the leg at once, and
+  a key read wrong but well formed fails the leg's last step, which
+  retires the disk through the inspection guest, opening the volume with
+  the key read. The installed disk then boots through
   firmware twice with nothing typed, as "First boot" and "Second boot"
   require.
 - **Storage choice without the operand.** `qemu-install-encrypted`'s

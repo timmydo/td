@@ -1,32 +1,43 @@
 //! A device-bound installation's recovery key on its way to completion
 //! (td-install/INSTALLER.md "User flow and authority" and "Device-bound
 //! records"): the key the service sends once, held in memory only and
-//! zeroed on drop; its display; and the field it is typed back in, whose
-//! groups td-protector's recovery-key codec checks as they are typed. This
-//! file alone names the disk protector's crate, and only that codec
-//! (tests/confinement.rs). Nothing here prints, logs or copies the digits
-//! anywhere but the page.
+//! zeroed on drop; its display, beside a QR code of its 48 digits a phone
+//! can keep; and the step that asks the person to say they kept it. Nobody
+//! types any part of it. This file alone names the disk protector's crate,
+//! and only that codec (tests/confinement.rs). Nothing here prints, logs or
+//! copies the digits anywhere but the page.
 
 use std::fmt;
 
-use td_protector::recovery::{
-    EntryError, RecoveryKey, RecoveryText, MAX_ENTRY_LEN, PASSPHRASE_LEN,
-};
-use td_ui::chrome::{Status, TextEntry, ROW};
-use td_ui::entry_model::{Action, EntryModel, Motion, Outcome};
+use td_protector::recovery::{RecoveryKey, RecoveryText, PASSPHRASE_LEN};
+use td_ui::chrome::{Status, ROW};
 use td_ui::raster::{
     text_run, Composition, Draw, GlyphStyle, Primitive, Rect, Surface, CHROME, INK,
 };
 use td_ui::{CELL_HEIGHT, CELL_WIDTH};
 
+use crate::qr::{self, Code};
+
 const INSET: usize = CELL_WIDTH;
 const ASKING_FOOTER: &str = "Recovery key \u{b7} step 6 of 6";
-const SHOWN_FOOTER: &str = "Recovery key \u{b7} step 6 of 6 \u{b7} Return to type it back";
-const TYPE_BACK_FOOTER: &str = "Recovery key \u{b7} step 6 of 6 \u{b7} Escape shows the key again";
-/// The type-back field's row, and the rows under it.
-const FIELD_ROW: usize = 5;
-const FEEDBACK_ROW: usize = 7;
-const NOTICE_ROW: usize = 8;
+const SHOWN_FOOTER: &str = "Recovery key \u{b7} step 6 of 6 \u{b7} Return once it is kept";
+const KEPT_FOOTER: &str = "Recovery key \u{b7} step 6 of 6 \u{b7} Escape shows the key again";
+/// The key's row.
+const KEY_ROW: usize = 6;
+/// The rows beside the code, from the first under the heading to the last
+/// above the rows that run the full width, are at most this many columns.
+const SIDE_COLUMNS: usize = 56;
+const CODE_TOP_ROW: usize = 3;
+const CODE_END_ROW: usize = 13;
+/// The smallest module side, in unscaled pixels, a phone reads at arm's
+/// length off a laptop panel.
+const MIN_MODULE: usize = 4;
+/// A QR code's own colours: a reader needs dark on light, so no theme
+/// maps them.
+const DARK: u32 = 0x00_0000;
+const LIGHT: u32 = 0xff_ffff;
+/// Where a scanned key belongs, said beside the code.
+const SCAN_ADVICE: &str = "Keep a scan in a password manager, not a camera app.";
 /// The row that says what closing the window now does, and the lowest
 /// row any step draws.
 const LAST_ROW: usize = 14;
@@ -35,22 +46,6 @@ const LAST_ROW: usize = 14;
 /// records").
 pub const CLOSING: &str =
     "Closing this window now withdraws the installation; the disk will not start.";
-/// Said in place of the field when its buffer could not be reserved.
-const UNUSABLE: &str = "The field for the key could not be made, so it cannot be typed back.";
-
-/// What the type-back field takes, for the window's key list.
-pub const TYPE_BACK_KEYS: &[(&str, &str)] = &[
-    ("Left/Right", "move the caret"),
-    ("Home/End", "the caret to the start or end of the key typed"),
-    (
-        "Backspace/Delete",
-        "delete the character before or at the caret",
-    ),
-    (
-        "a character",
-        "typed at the caret: digits, and spaces or hyphens between groups",
-    ),
-];
 
 /// A recovery key the installer service sent: its 48 digits, every group's
 /// value and check digit admitted, in one allocation zeroed on drop. It is
@@ -60,7 +55,7 @@ pub struct Key(RecoveryKey);
 impl Key {
     /// The 48 digits as the wire carries them, without separators. A group
     /// whose value or check digit fails refuses the whole key: a key that
-    /// cannot be typed back is not shown.
+    /// would not open the disk is not shown.
     pub fn from_digits(digits: &[u8]) -> Result<Self, String> {
         if digits.len() != PASSPHRASE_LEN {
             return Err("the installer service's recovery key is not 48 digits".into());
@@ -80,6 +75,12 @@ impl Key {
     /// The display form, eight groups joined by hyphens, zeroed on drop.
     pub fn display(&self) -> Shown {
         Shown(self.0.display())
+    }
+
+    /// The QR code of the 48 digits alone, what cryptsetup takes; zeroed
+    /// on drop.
+    pub fn code(&self) -> Option<Code> {
+        self.with_digits(qr::numeric)
     }
 }
 
@@ -107,162 +108,65 @@ impl Shown {
     }
 }
 
-/// The type-back field: digits, and spaces or hyphens, typed at a caret.
-/// Its buffer is reserved once at td-protector's entry bound, so no edit
-/// reallocates, and td-ui's entry zeroes what an edit leaves, a clear and
-/// the drop. `Debug` shows its length, never its text.
-#[derive(Debug)]
-pub struct Entry(Option<EntryModel>);
-
-impl Default for Entry {
-    /// An entry the allocator cannot reserve takes no key.
-    fn default() -> Self {
-        Self(EntryModel::new(MAX_ENTRY_LEN).ok())
-    }
-}
-
-impl Entry {
-    /// Applies one key chord; true when the text changed, not when only
-    /// the caret moved. Any other character than a digit, space or hyphen
-    /// is not taken.
-    pub fn key(&mut self, chord: &str) -> bool {
-        let Some(model) = self.0.as_mut() else {
-            return false;
-        };
-        let motion = |motion| Action::Move {
-            motion,
-            extend: false,
-        };
-        let action = match chord {
-            "Left" => motion(Motion::Left),
-            "Right" => motion(Motion::Right),
-            "Home" => motion(Motion::Home),
-            "End" => motion(Motion::End),
-            "Backspace" => Action::Backspace,
-            "Delete" => Action::Delete,
-            _ => {
-                let mut chars = chord.chars();
-                match (chars.next(), chars.next()) {
-                    (Some(typed @ ('0'..='9' | ' ' | '-')), None) => Action::Insert(typed),
-                    _ => return false,
-                }
-            }
-        };
-        model.act(action) == Ok(Outcome::Changed)
-    }
-
-    /// Forgets what was typed, zeroing it.
-    pub fn clear(&mut self) {
-        if let Some(model) = self.0.as_mut() {
-            model.clear();
-        }
-    }
-
-    fn text(&self) -> &str {
-        self.0.as_ref().map_or("", EntryModel::text)
-    }
-
-    /// What the field says of the key typed so far: how many digits, or
-    /// the first group whose value or check digit fails once it is whole.
-    pub fn feedback(&self) -> String {
-        if self.0.is_none() {
-            return UNUSABLE.into();
-        }
-        match RecoveryKey::check_partial(self.text().as_bytes()) {
-            Ok(0) => "Type the 48 digits; spaces or hyphens between groups are optional.".into(),
-            Ok(PASSPHRASE_LEN) => {
-                "All 48 digits are typed. Return asks the installer service to confirm them.".into()
-            }
-            Ok(digits) => format!("{digits} of 48 digits typed."),
-            Err(error) => refusal(&error),
-        }
-    }
-
-    /// The key typed, once it is 48 digits whose every group checks; else
-    /// what is wrong with it, a whole group that fails named before a
-    /// short count. The field keeps its text.
-    pub fn parse(&self) -> Result<Key, String> {
-        if self.0.is_none() {
-            return Err(UNUSABLE.into());
-        }
-        let typed = self.text().as_bytes();
-        RecoveryKey::check_partial(typed)
-            .and_then(|_| RecoveryKey::parse(typed))
-            .map(Key)
-            .map_err(|error| refusal(&error))
-    }
-}
-
-/// An entry refusal in the installer's words; it names a group, never a
-/// digit.
-fn refusal(error: &EntryError) -> String {
-    match error {
-        EntryError::TooLong => "The entry is longer than any recovery key.".into(),
-        EntryError::Character { .. } => "Type only digits, spaces and hyphens.".into(),
-        EntryError::GroupLength { group, digits } => {
-            format!("Group {group} has {digits} digits before a space or hyphen; groups have 6.")
-        }
-        EntryError::Length { digits } => format!("{digits} digits are typed; the key has 48."),
-        EntryError::Value { group } => {
-            format!("Group {group} is wrong: its first five digits are above 65535.")
-        }
-        EntryError::Check { group } => {
-            format!(
-                "Group {group} is wrong: its check digit does not agree. Compare it with the key."
-            )
-        }
-    }
-}
-
 /// Which recovery-key view to paint.
 pub enum Step<'a> {
     /// The key is asked for and not yet here.
     Asking,
-    /// The key, in its display form.
-    Shown(&'a str),
-    /// The type-back field, what it says of the key typed so far, and
-    /// what became of the last confirmation asked for.
-    TypeBack {
-        entry: &'a Entry,
-        feedback: &'a str,
-        notice: Option<&'a str>,
+    /// The key, in its display form, and its QR code.
+    Shown {
+        key: &'a str,
+        code: Option<&'a Code>,
     },
+    /// The key is not shown again: Return says it was kept, Escape shows
+    /// it again until then. `notice` says what became of the
+    /// acknowledgement once it was said.
+    Kept { notice: Option<&'a str> },
 }
 
-/// One recovery-key view: a pure rendering of the key the window holds or
-/// the field it is typed back in. It writes nothing anywhere.
+/// One recovery-key view: a pure rendering of the key the window holds,
+/// or of the question whether it was kept. It writes nothing anywhere.
 pub struct RecoveryPage<'a> {
     surface: Surface,
     step: Step<'a>,
-    field: TextEntry,
+    /// The code's square, quiet zone included, and its module's side.
+    code: (i64, i64, usize),
     footer: Status,
 }
 
 impl<'a> RecoveryPage<'a> {
     pub fn new(surface: Surface, step: Step<'a>) -> Option<Self> {
         crate::supported_page(surface)?;
-        let scale = surface.scale.value();
-        let width = surface.width.checked_sub(2 * INSET * scale)?;
-        let field = TextEntry::new(
-            surface,
-            Rect {
-                x: (INSET * scale) as i64,
-                y: (FIELD_ROW * ROW * scale) as i64,
-                width: width as u32,
-                height: (ROW * scale) as u32,
-            },
-        )?;
+        let code = code_place(surface)?;
         let footer = Status::new(surface);
+        let scale = surface.scale.value();
         if ((LAST_ROW * ROW + CELL_HEIGHT) * scale) as i64 > footer.rect().y {
             return None;
         }
         Some(Self {
             surface,
             step,
-            field,
+            code,
             footer,
         })
     }
+}
+
+/// Where the code goes: flush right, beside the side rows and above the
+/// full-width ones, at the largest whole module that fits, or `None` when
+/// that is smaller than a phone reads.
+fn code_place(surface: Surface) -> Option<(i64, i64, usize)> {
+    let scale = surface.scale.value();
+    let side = qr::SIZE + 2 * qr::QUIET_ZONE;
+    let left = (INSET + (SIDE_COLUMNS + 1) * CELL_WIDTH) * scale;
+    let right = surface.width.checked_sub(INSET * scale)?;
+    let top = CODE_TOP_ROW * ROW * scale;
+    let end = CODE_END_ROW * ROW * scale;
+    let module = (right.checked_sub(left)? / side).min(end.checked_sub(top)? / side);
+    if module < MIN_MODULE * scale {
+        return None;
+    }
+    let x = right.checked_sub(side * module)?;
+    Some((i64::try_from(x).ok()?, i64::try_from(top).ok()?, module))
 }
 
 impl Composition for RecoveryPage<'_> {
@@ -271,16 +175,7 @@ impl Composition for RecoveryPage<'_> {
     }
 
     fn emit(&self, damage: Rect, sink: &mut dyn FnMut(Draw)) {
-        let bounds = self.surface.bounds();
-        if let Some(clip) = bounds.intersection(damage) {
-            sink(Draw {
-                clip,
-                primitive: Primitive::Fill {
-                    rect: bounds,
-                    color: CHROME,
-                },
-            });
-        }
+        fill(self.surface.bounds(), CHROME, damage, sink);
         let surface = self.surface;
         let footer = match &self.step {
             Step::Asking => {
@@ -299,78 +194,148 @@ impl Composition for RecoveryPage<'_> {
                     damage,
                     sink,
                 );
-                row(surface, 7, "key is typed back.", damage, sink);
+                row(surface, 7, "key is shown and kept.", damage, sink);
                 row(surface, 9, CLOSING, damage, sink);
                 ASKING_FOOTER
             }
-            Step::Shown(key) => {
+            Step::Shown { key, code } => {
                 row(surface, 1, "Recovery key", damage, sink);
-                row(
-                    surface,
-                    3,
-                    "Write down this recovery key now:",
-                    damage,
-                    sink,
-                );
-                row(surface, FIELD_ROW, key, damage, sink);
+                let lead: &[&str] = match code {
+                    Some(code) => {
+                        emit_code(code, self.code, damage, sink);
+                        &[
+                            "Write down this recovery key, or scan the code with",
+                            "a phone: it reads as the same 48 digits.",
+                        ]
+                    }
+                    None => &["Write down this recovery key."],
+                };
+                for (index, text) in lead.iter().enumerate() {
+                    side_row(surface, CODE_TOP_ROW + index, text, damage, sink);
+                }
+                side_row(surface, KEY_ROW, key, damage, sink);
                 for (index, text) in [
-                    "It is shown only now, and the installer stores no copy of it.",
-                    "It is the only way to open this disk if the computer's TPM, its",
-                    "firmware measurements or its boot chain change. Keep it safe,",
-                    "away from the computer.",
+                    "It is shown only now; the installer keeps no copy.",
+                    "It is the only way to open this disk if the computer's",
+                    "TPM, its firmware measurements or its boot chain",
+                    "change. Keep it safe, away from the computer.",
                 ]
                 .iter()
                 .enumerate()
                 {
-                    row(surface, FEEDBACK_ROW + index, text, damage, sink);
+                    side_row(surface, KEY_ROW + 2 + index, text, damage, sink);
+                }
+                // A camera app may send what it scans to its maker.
+                if code.is_some() {
+                    side_row(surface, KEY_ROW + 6, SCAN_ADVICE, damage, sink);
                 }
                 row(
                     surface,
-                    LAST_ROW - 2,
-                    "Press Return to type it back. The installation completes once it is confirmed.",
+                    CODE_END_ROW,
+                    "Press Return once it is kept. The installation then completes.",
                     damage,
                     sink,
                 );
                 row(surface, LAST_ROW, CLOSING, damage, sink);
                 SHOWN_FOOTER
             }
-            Step::TypeBack {
-                entry,
-                feedback,
-                notice,
-            } => {
-                row(surface, 1, "Type the recovery key back", damage, sink);
+            Step::Kept { notice } => {
+                row(surface, 1, "Keep the recovery key", damage, sink);
+                for (index, text) in [
+                    "Once you go on, the recovery key is not shown again, and nothing on",
+                    "this computer keeps a copy of it.",
+                ]
+                .iter()
+                .enumerate()
+                {
+                    row(surface, 3 + index, text, damage, sink);
+                }
                 row(
                     surface,
-                    3,
-                    "Type the 48 digits as you wrote them down.",
+                    6,
+                    "Press Return if it is written down or scanned. The installation",
                     damage,
                     sink,
                 );
-                if let Some(model) = &entry.0 {
-                    let mut field = model.field("The recovery key's 48 digits", true, true);
-                    field.first =
-                        self.field
-                            .reveal(model.text().chars().count(), field.caret, field.first);
-                    self.field.emit(field, damage, sink);
-                }
-                row(surface, FEEDBACK_ROW, feedback, damage, sink);
+                row(surface, 7, "then completes.", damage, sink);
+                row(surface, 12, CLOSING, damage, sink);
+                // Once said kept, it is not shown again from here.
                 if let Some(notice) = notice {
-                    row(surface, NOTICE_ROW, notice, damage, sink);
+                    row(surface, 10, notice, damage, sink);
+                    ASKING_FOOTER
+                } else {
+                    row(
+                        surface,
+                        8,
+                        "Press Escape to see the key again.",
+                        damage,
+                        sink,
+                    );
+                    KEPT_FOOTER
                 }
-                row(
-                    surface,
-                    NOTICE_ROW + 2,
-                    "Escape shows the key again. The installation completes once it is confirmed.",
-                    damage,
-                    sink,
-                );
-                row(surface, NOTICE_ROW + 4, CLOSING, damage, sink);
-                TYPE_BACK_FOOTER
             }
         };
         self.footer.emit(footer.chars(), damage, sink);
     }
+}
+
+/// The code on its light square, a dark run of modules per fill.
+fn emit_code(
+    code: &Code,
+    (x, y, module): (i64, i64, usize),
+    damage: Rect,
+    sink: &mut dyn FnMut(Draw),
+) {
+    let side = (qr::SIZE + 2 * qr::QUIET_ZONE) * module;
+    let at = |offset: usize| i64::try_from(offset).unwrap_or(i64::MAX);
+    let square = Rect {
+        x,
+        y,
+        width: u32::try_from(side).unwrap_or(0),
+        height: u32::try_from(side).unwrap_or(0),
+    };
+    fill(square, LIGHT, damage, sink);
+    let origin = qr::QUIET_ZONE * module;
+    for line in 0..qr::SIZE {
+        let mut column = 0;
+        while column < qr::SIZE {
+            if !code.dark(column, line) {
+                column += 1;
+                continue;
+            }
+            let start = column;
+            while column < qr::SIZE && code.dark(column, line) {
+                column += 1;
+            }
+            let run = Rect {
+                x: x.saturating_add(at(origin + start * module)),
+                y: y.saturating_add(at(origin + line * module)),
+                width: u32::try_from((column - start) * module).unwrap_or(0),
+                height: u32::try_from(module).unwrap_or(0),
+            };
+            fill(run, DARK, damage, sink);
+        }
+    }
+}
+
+fn fill(rect: Rect, color: u32, damage: Rect, sink: &mut dyn FnMut(Draw)) {
+    if let Some(clip) = rect.intersection(damage) {
+        sink(Draw {
+            clip,
+            primitive: Primitive::Fill { rect, color },
+        });
+    }
+}
+
+/// One line of text on a row beside the code, cut to `SIDE_COLUMNS` so
+/// that no text ever runs under the symbol.
+fn side_row(surface: Surface, index: usize, text: &str, damage: Rect, sink: &mut dyn FnMut(Draw)) {
+    let cut = text
+        .char_indices()
+        .nth(SIDE_COLUMNS)
+        .and_then(|(end, _)| text.get(..end))
+        .unwrap_or(text);
+    row(surface, index, cut, damage, sink);
 }
 
 /// One line of text on row `index`, cut to the width.
@@ -419,14 +384,6 @@ mod tests {
         text
     }
 
-    fn typed(text: &str) -> Entry {
-        let mut entry = Entry::default();
-        for typed in text.chars() {
-            entry.key(&typed.to_string());
-        }
-        entry
-    }
-
     #[test]
     fn a_key_is_admitted_only_whole_with_every_group_checked() {
         let key = Key::from_digits(KEY).unwrap();
@@ -444,142 +401,174 @@ mod tests {
         assert!(!refused.contains("000013"), "{refused}");
     }
 
+    /// The code drawn is the digits' own, module for module, dark on a
+    /// light square with its quiet zone, in colours no theme changes, and
+    /// no text runs into it.
     #[test]
-    fn the_entry_takes_the_forms_the_codec_admits_and_shows_no_text_in_debug() {
-        let mut entry = typed(SHOWN);
-        assert_eq!(entry.parse().unwrap(), Key::from_digits(KEY).unwrap());
-        let debug = format!("{entry:?}");
-        assert!(!debug.contains("000013"), "{debug}");
-        // The caret moves and edits as the field binds them; only an edit
-        // is a change.
-        for (chord, changed) in [
-            ("Home", false),
-            ("Delete", true),
-            ("End", false),
-            ("Left", false),
-            ("Backspace", true),
-            ("Right", false),
+    fn the_shown_key_draws_its_code_beside_the_text() {
+        let key = Key::from_digits(KEY).unwrap();
+        let code = key.code().unwrap();
+        let expected = qr::numeric(KEY).unwrap();
+        for screen in [
+            surface(crate::MIN_PAGE_WIDTH, crate::MIN_PAGE_HEIGHT),
+            surface(1280, 800),
+            Surface::new(1504, 960, Scale::new(2).unwrap()).unwrap(),
         ] {
-            assert_eq!(entry.key(chord), changed, "{chord}");
+            let page = RecoveryPage::new(
+                screen,
+                Step::Shown {
+                    key: SHOWN,
+                    code: Some(&code),
+                },
+            )
+            .unwrap();
+            let (x, y, module) = page.code;
+            assert!(module >= MIN_MODULE * screen.scale.value());
+            let side = (qr::SIZE + 2 * qr::QUIET_ZONE) * module;
+            let side = i64::try_from(side).unwrap();
+            assert!(x + side <= i64::try_from(screen.width).unwrap());
+            let mut dark = vec![false; qr::SIZE * qr::SIZE];
+            let mut square = false;
+            page.emit(screen.bounds(), &mut |draw| match draw.primitive {
+                Primitive::Fill { rect, color } if color == LIGHT => {
+                    assert_eq!((rect.x, rect.y, i64::from(rect.width)), (x, y, side));
+                    square = true;
+                }
+                Primitive::Fill { rect, color } if color == DARK => {
+                    let module = i64::try_from(module).unwrap();
+                    let quiet = i64::try_from(qr::QUIET_ZONE).unwrap() * module;
+                    let column = (rect.x - x - quiet) / module;
+                    let line = (rect.y - y - quiet) / module;
+                    for offset in 0..i64::from(rect.width) / module {
+                        let at = usize::try_from(line).unwrap() * qr::SIZE
+                            + usize::try_from(column + offset).unwrap();
+                        *dark.get_mut(at).unwrap() = true;
+                    }
+                }
+                Primitive::Glyph {
+                    x: left, y: top, ..
+                } => {
+                    let beside = top >= y && top < y + side;
+                    assert!(!beside || left + 8 <= x, "a glyph at ({left}, {top})");
+                }
+                _ => {}
+            });
+            assert!(square);
+            for line in 0..qr::SIZE {
+                for column in 0..qr::SIZE {
+                    assert_eq!(
+                        *dark.get(line * qr::SIZE + column).unwrap(),
+                        expected.dark(column, line),
+                        "({column}, {line})"
+                    );
+                }
+            }
         }
-        assert!(entry.parse().is_err());
-        entry.clear();
-        assert_eq!(entry.text(), "");
-        assert!(!entry.key("Backspace"));
-        for spaced in [
-            "000013 005150 010290 015439 020571 025716 030859 035998",
-            " 000013005150010290015439020571025716030859035998 ",
-        ] {
-            assert_eq!(
-                typed(spaced).parse().unwrap(),
-                Key::from_digits(KEY).unwrap()
-            );
+        for theme in td_ui::theme::THEMES {
+            assert_eq!(theme.map(DARK), DARK);
+            assert_eq!(theme.map(LIGHT), LIGHT);
         }
-        // The buffer holds no more than the codec scans.
-        let mut long = Entry::default();
-        for _ in 0..MAX_ENTRY_LEN + 8 {
-            long.key("-");
-        }
-        assert_eq!(long.text().len(), MAX_ENTRY_LEN);
+        // Without a code the key is still shown, with no word of scanning.
+        let screen = surface(crate::MIN_PAGE_WIDTH, crate::MIN_PAGE_HEIGHT);
+        let plain = RecoveryPage::new(
+            screen,
+            Step::Shown {
+                key: SHOWN,
+                code: None,
+            },
+        )
+        .unwrap();
+        let text = glyphs(&plain, screen);
+        assert!(text.contains(SHOWN) && !text.contains("scan"));
+        plain.emit(screen.bounds(), &mut |draw| {
+            assert!(!matches!(
+                draw.primitive,
+                Primitive::Fill { color, .. } if color == DARK || color == LIGHT
+            ));
+        });
     }
 
     #[test]
     fn each_step_says_what_the_key_is_for_and_fits_the_tile() {
         let screen = surface(crate::MIN_PAGE_WIDTH, crate::MIN_PAGE_HEIGHT);
+        let key = Key::from_digits(KEY).unwrap();
+        let code = key.code().unwrap();
         let asking = glyphs(&RecoveryPage::new(screen, Step::Asking).unwrap(), screen);
         assert!(asking.contains("Asking the installer service for the recovery key"));
-        assert!(asking.contains(ASKING_FOOTER));
+        assert!(asking.contains(ASKING_FOOTER) && asking.contains(CLOSING));
         assert!(!asking.contains("Write down"));
         let shown = glyphs(
-            &RecoveryPage::new(screen, Step::Shown(SHOWN)).unwrap(),
-            screen,
-        );
-        for said in [
-            SHOWN,
-            "Write down this recovery key now:",
-            "shown only now",
-            "stores no copy",
-            "only way to open this disk",
-            "TPM",
-            "firmware measurements or its boot chain change",
-            "Press Return to type it back",
-            CLOSING,
-            SHOWN_FOOTER,
-        ] {
-            assert!(shown.contains(said), "{said}");
-        }
-        let entry = typed("000013-0051");
-        let feedback = entry.feedback();
-        assert_eq!(feedback, "10 of 48 digits typed.");
-        let page = RecoveryPage::new(
-            screen,
-            Step::TypeBack {
-                entry: &entry,
-                feedback: &feedback,
-                notice: Some("That is not the recovery key shown."),
-            },
-        )
-        .unwrap();
-        let typing = glyphs(&page, screen);
-        for said in [
-            "Type the recovery key back",
-            "000013-0051",
-            "10 of 48 digits typed.",
-            "That is not the recovery key shown.",
-            "Escape shows the key again",
-            CLOSING,
-            TYPE_BACK_FOOTER,
-        ] {
-            assert!(typing.contains(said), "{said}");
-        }
-        assert!(asking.contains(CLOSING));
-        // An entry whose buffer could not be reserved says so, and what
-        // closing does, rather than taking keys silently.
-        let mut unusable = Entry(None);
-        assert!(!unusable.key("0"));
-        assert_eq!(unusable.feedback(), UNUSABLE);
-        assert_eq!(unusable.parse().unwrap_err(), UNUSABLE);
-        let feedback = unusable.feedback();
-        let dead = glyphs(
             &RecoveryPage::new(
                 screen,
-                Step::TypeBack {
-                    entry: &unusable,
-                    feedback: &feedback,
-                    notice: None,
+                Step::Shown {
+                    key: SHOWN,
+                    code: Some(&code),
                 },
             )
             .unwrap(),
             screen,
         );
-        assert!(dead.contains(UNUSABLE) && dead.contains(CLOSING));
-        // The key itself is not on the type-back page.
-        assert!(!typing.contains(SHOWN));
-        for step in [Step::Asking, Step::Shown(SHOWN)] {
+        for said in [
+            SHOWN,
+            "Write down this recovery key, or scan the code",
+            "the same 48 digits",
+            SCAN_ADVICE,
+            "shown only now",
+            "keeps no copy",
+            "only way to open this disk",
+            "TPM",
+            "firmware measurements or its boot chain",
+            "Press Return once it is kept",
+            CLOSING,
+            SHOWN_FOOTER,
+        ] {
+            assert!(shown.contains(said), "{said}");
+        }
+        let kept = glyphs(
+            &RecoveryPage::new(screen, Step::Kept { notice: None }).unwrap(),
+            screen,
+        );
+        for said in [
+            "Keep the recovery key",
+            "not shown again",
+            "Press Return if it is written down or scanned",
+            "Press Escape to see the key again",
+            CLOSING,
+            KEPT_FOOTER,
+        ] {
+            assert!(kept.contains(said), "{said}");
+        }
+        // Once said kept, it is with the service and Escape is not offered.
+        let telling = glyphs(
+            &RecoveryPage::new(
+                screen,
+                Step::Kept {
+                    notice: Some("Telling the installer service"),
+                },
+            )
+            .unwrap(),
+            screen,
+        );
+        assert!(telling.contains("Telling the installer service") && telling.contains(CLOSING));
+        assert!(!telling.contains("Escape"));
+        // The key itself is shown only on its own step, and nothing asks
+        // for any of it to be typed.
+        assert!(!kept.contains(SHOWN) && !asking.contains(SHOWN));
+        for text in [&asking, &shown, &kept] {
+            assert!(!text.contains("type") && !text.contains("Type"), "{text}");
+        }
+        for step in [
+            Step::Asking,
+            Step::Shown {
+                key: SHOWN,
+                code: None,
+            },
+        ] {
             assert!(RecoveryPage::new(surface(751, 480), step).is_none());
         }
         assert!(RecoveryPage::new(surface(752, 479), Step::Asking).is_none());
         let scaled = Surface::new(1504, 960, Scale::new(2).unwrap()).unwrap();
-        assert!(RecoveryPage::new(scaled, Step::Shown(SHOWN)).is_some());
-        // Every refusal, at its widest, fits the narrowest tile whole.
-        let columns = (crate::MIN_PAGE_WIDTH - 2 * INSET) / CELL_WIDTH;
-        for error in [
-            EntryError::TooLong,
-            EntryError::Character { position: 256 },
-            EntryError::GroupLength {
-                group: 8,
-                digits: 256,
-            },
-            EntryError::Length { digits: 256 },
-            EntryError::Value { group: 8 },
-            EntryError::Check { group: 8 },
-        ] {
-            let said = refusal(&error);
-            assert!(said.chars().count() <= columns, "{said}");
-        }
-        assert!(CLOSING.chars().count() <= columns && UNUSABLE.chars().count() <= columns);
-        for feedback in [typed("").feedback(), typed(SHOWN).feedback()] {
-            assert!(feedback.chars().count() <= columns, "{feedback}");
-        }
+        assert!(RecoveryPage::new(scaled, Step::Kept { notice: None }).is_some());
+        assert!(CLOSING.chars().count() <= (crate::MIN_PAGE_WIDTH - 2 * INSET) / CELL_WIDTH);
     }
 }

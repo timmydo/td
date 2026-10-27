@@ -6182,7 +6182,7 @@ installation or `TD-ATTENTION-SUSPEND-CLOSE` for a lid or resume lock, with
 the cutoff and the window's end, and the first report taken past the window
 says `TD-ATTENTION-SETTLED` with that cutoff and the count of reports the
 window dropped: times and a count only, never a key, since the next keys
-may be td-setup's typed-back recovery key, the unlock chord, or whatever
+may be td-setup's recovery-key acknowledgement, the unlock chord, or whatever
 the person types into the session just unlocked. Later stale records are
 discarded through their report boundary; they cannot restore
 modifiers or pointer buttons. At each discarded report boundary, a tablet

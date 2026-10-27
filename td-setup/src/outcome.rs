@@ -20,8 +20,8 @@ const STARTING: &[&str] = &[
     "Keep the computer powered on while installation is running.",
 ];
 const RECOVERY_FOLLOWS: &[&str] = &[
-    "Your recovery key will appear here next.",
-    "Write it down before continuing.",
+    "Your recovery key will appear here next, with a code to scan.",
+    "Write it down or scan it before continuing.",
 ];
 
 /// A bounded operation label supplied by the installation service.
@@ -54,7 +54,7 @@ pub enum Failure {
     WriteFailed,
     VerificationFailed,
     SettingsFailed,
-    /// The installer was lost before the recovery key was typed back.
+    /// The installer was lost before the recovery key was said kept.
     RecoveryUnconfirmed,
 }
 
@@ -66,7 +66,7 @@ impl Failure {
             Self::WriteFailed => "Writing the destination disk",
             Self::VerificationFailed => "Verifying installed boot artifacts",
             Self::SettingsFailed => "Publishing account and regional settings",
-            Self::RecoveryUnconfirmed => "Confirming the recovery key",
+            Self::RecoveryUnconfirmed => "Keeping the recovery key",
         }
     }
 
@@ -78,7 +78,7 @@ impl Failure {
             Self::VerificationFailed => "The installed boot artifacts failed verification.",
             Self::SettingsFailed => "The account or regional settings could not be published.",
             Self::RecoveryUnconfirmed => {
-                "The recovery key was not typed back, so the installation was withdrawn."
+                "The recovery key was not confirmed as kept, so the installation was withdrawn."
             }
         }
     }
@@ -92,13 +92,13 @@ pub enum Progress {
     /// The service seeks compositor-owned consent; nothing is written.
     Consent,
     Running(Phase),
-    /// A device-bound installation's recovery key was typed back and
-    /// confirmed; the service is making the disk bootable.
+    /// A device-bound installation's recovery key was said kept and the
+    /// service took that; it is making the disk bootable.
     Finishing,
     Failed(Failure),
     Unknown,
     /// The connection ended in a device-bound installation's recovery-key
-    /// phase before a key typed back was sent: the service withdraws the
+    /// phase before the acknowledgement was sent: the service withdraws the
     /// installation if it still runs, which the installer cannot confirm.
     Unconfirmed,
 }
@@ -200,7 +200,7 @@ impl Composition for ProgressPage {
                 row(
                     self.surface,
                     4,
-                    "Recovery key confirmed. Finishing the installation\u{2026}",
+                    "Recovery key kept. Finishing the installation\u{2026}",
                     damage,
                     sink,
                 );
@@ -284,7 +284,7 @@ impl Composition for ProgressPage {
                     (1, "Installation not finished"),
                     (
                         4,
-                        "The connection to the installer service ended before the recovery key was confirmed.",
+                        "The connection to the installer service ended before the recovery key was kept.",
                     ),
                     (
                         5,
@@ -508,16 +508,16 @@ mod tests {
             &ProgressPage::new(screen, Progress::Failed(Failure::RecoveryUnconfirmed)).unwrap(),
             screen,
         );
-        assert!(unconfirmed.contains("Confirming the recovery key"));
+        assert!(unconfirmed.contains("Keeping the recovery key"));
         assert!(unconfirmed.contains("the installation was withdrawn"));
-        // Confirmed is not complete: the disk is still being made bootable.
+        // Kept is not complete: the disk is still being made bootable.
         let finishing = ProgressPage::new(screen, Progress::Finishing).unwrap();
         let painted = glyphs(&finishing, screen);
-        assert!(painted.contains("Recovery key confirmed. Finishing the installation\u{2026}"));
+        assert!(painted.contains("Recovery key kept. Finishing the installation\u{2026}"));
         assert!(painted.contains("making the selected disk bootable"));
         assert!(painted.contains(PROGRESS_FOOTER));
         assert!(!painted.contains("Installation complete"));
-        // A connection lost before a key typed back was sent claims no
+        // A connection lost before the acknowledgement was sent claims no
         // withdrawal: the service may have stopped before making one.
         let unconfirmed = ProgressPage::new(screen, Progress::Unconfirmed).unwrap();
         let painted = glyphs(&unconfirmed, screen);
