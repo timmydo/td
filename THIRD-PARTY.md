@@ -47,5 +47,6 @@ td-software, td-taskmgr); td-compositor embeds it and does not yet.
 | `td-ui/spec/vt/libvterm-0.3.3.*` | generated from the libvterm 0.3.3 test suite | libvterm, Paul Evans | MIT (`td-ui/spec/vt/LICENSE.libvterm`) |
 | `td-ui/tests/fixtures/us.xkb`, `us-keys.tsv`, `us-types.tsv` | compiled from xkeyboard-config 2.44, and xkbcommon's reading of it | xkeyboard-config | MIT/X11 and HPND-style notices (`td-ui/tests/fixtures/XKB-COPYING`) |
 | `td-fido/tests/p256_vectors.txt` (its NIST rows; the rest are OpenSSL output), and the SP 800-38A vectors in `td-fido/src/fido_aes.rs`'s tests | test vectors from NIST's CAVP corpora and SP 800-38A | NIST | public domain (a US government work) |
+| the IEEE 1619 XTS-AES vectors in `td-fido/src/fido_aes.rs`'s tests | test vectors from IEEE Std 1619-2007 Annex B, as Linux's `crypto/testmgr.h` also carries them | IEEE | factual test data, reproduced for interoperability testing |
 | `engine/tests/fixtures/flathub-*.hex` | OSTree objects captured from Flathub, the Firefox Flatpak's metadata among them | Flathub | each publisher's terms; small, mostly factual metadata |
 | `td-photo/tests/fixtures/nikon_ref.py` | test oracle, transcribed from dcraw 9.28's `nikon_load_raw` | dcraw, Copyright 1997-2018 by Dave Coffin | dcraw's terms (above) |

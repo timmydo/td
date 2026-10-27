@@ -1,6 +1,7 @@
 //! Bounded AES-256-CBC primitive for CTAP, AES-128-CFB for td-tpm's
-//! session parameter encryption, and AES-128 key unwrap for td-netd's
-//! WPA2 group keys. No padding or other authentication here.
+//! session parameter encryption, AES-128 key unwrap for td-netd's
+//! WPA2 group keys, and AES-256-XTS for td-luks's LUKS2 keyslot areas. No
+//! padding or other authentication here.
 
 const MAX_BYTES: usize = 128;
 /// td-tpm's MAX_PACKET: no TPM parameter is longer.
@@ -115,6 +116,153 @@ pub fn key_unwrap_128(kek: &[u8; 16], wrapped: &[u8], out: &mut [u8]) -> Result<
         return Err("AES key unwrap integrity check failed");
     }
     Ok(())
+}
+
+/// The most bytes one XTS call takes: the whole keyslots area of the LUKS2
+/// header td formats (td-luks/DESIGN.md "The profile") fits.
+pub const MAX_XTS_BYTES: usize = 16 * 1024 * 1024;
+/// The largest XTS data unit, dm-crypt's largest sector.
+const MAX_XTS_UNIT: usize = 4096;
+
+/// AES-256-XTS (IEEE 1619, SP 800-38E) encryption of `bytes` as
+/// consecutive data units of `unit` bytes, the first numbered `sector`,
+/// each unit's tweak its number little-endian, as dm-crypt's plain64 IV
+/// gives it. `key` is the data key, then the tweak key.
+///
+/// Refused, with `bytes` untouched: equal key halves, a unit that is not
+/// 1 to 256 whole blocks, an empty input, a length that is not whole
+/// units or exceeds `MAX_XTS_BYTES`, and unit numbers past `u64::MAX`.
+pub fn xts_encrypt(
+    key: &[u8; 64],
+    sector: u64,
+    unit: usize,
+    bytes: &mut [u8],
+) -> Result<(), &'static str> {
+    xts_256(key, sector, unit, bytes, true)
+}
+
+/// The inverse of `xts_encrypt`, under the same refusals.
+pub fn xts_decrypt(
+    key: &[u8; 64],
+    sector: u64,
+    unit: usize,
+    bytes: &mut [u8],
+) -> Result<(), &'static str> {
+    xts_256(key, sector, unit, bytes, false)
+}
+
+fn xts_256(
+    key: &[u8; 64],
+    sector: u64,
+    unit: usize,
+    bytes: &mut [u8],
+    encrypt: bool,
+) -> Result<(), &'static str> {
+    let ([data_key, tweak_key], []) = key.as_chunks::<32>() else {
+        return Err("AES-256-XTS takes two 32-byte keys");
+    };
+    // SP 800-38E: the two halves must differ. Compared whatever differs.
+    let difference = data_key
+        .iter()
+        .zip(tweak_key)
+        .fold(0u8, |difference, (a, b)| difference | (a ^ b));
+    if std::hint::black_box(difference) == 0 {
+        return Err("AES-XTS refuses a tweak key equal to its data key");
+    }
+    validate_xts(sector, unit, bytes.len())?;
+    let data = Aes256::new(data_key);
+    let tweak = Aes256::new(tweak_key);
+    xts(&data, &tweak, sector, unit, bytes, encrypt);
+    Ok(())
+}
+
+fn validate_xts(sector: u64, unit: usize, size: usize) -> Result<(), &'static str> {
+    if unit == 0 || unit > MAX_XTS_UNIT || !unit.is_multiple_of(16) {
+        return Err("an AES-XTS data unit is 1 to 256 whole blocks");
+    }
+    if size == 0 || size > MAX_XTS_BYTES || !size.is_multiple_of(unit) {
+        return Err("AES-XTS input must be 1 to 16 MiB of whole data units");
+    }
+    let last = u64::try_from(size / unit - 1).map_err(|_| "too many AES-XTS data units")?;
+    sector
+        .checked_add(last)
+        .ok_or("AES-XTS data unit numbers pass the largest sector")?;
+    Ok(())
+}
+
+/// The block cipher XTS runs over, so tests drive the mode with AES-128's
+/// vectors as well.
+trait BlockCipher {
+    fn encrypt(&self, state: &mut [u8; 16]);
+    fn decrypt(&self, state: &mut [u8; 16]);
+}
+
+impl BlockCipher for Aes256 {
+    fn encrypt(&self, state: &mut [u8; 16]) {
+        self.encrypt_block(state);
+    }
+    fn decrypt(&self, state: &mut [u8; 16]) {
+        self.decrypt_block(state);
+    }
+}
+
+#[cfg(test)]
+impl BlockCipher for Aes128 {
+    fn encrypt(&self, state: &mut [u8; 16]) {
+        self.encrypt_block(state);
+    }
+    fn decrypt(&self, state: &mut [u8; 16]) {
+        self.decrypt_block(state);
+    }
+}
+
+/// XTS over validated input: each unit's tweak is its number encrypted
+/// under the tweak key, multiplied by the primitive element per block.
+fn xts<C: BlockCipher>(
+    data: &C,
+    tweak: &C,
+    sector: u64,
+    unit: usize,
+    bytes: &mut [u8],
+    encrypt: bool,
+) {
+    let mut number = sector;
+    let mut mask = [0u8; 16];
+    for data_unit in bytes.chunks_exact_mut(unit) {
+        mask = [0; 16];
+        for (byte, value) in mask.iter_mut().zip(number.to_le_bytes()) {
+            *byte = value;
+        }
+        tweak.encrypt(&mut mask);
+        for block in data_unit.as_chunks_mut::<16>().0 {
+            xor(block, &mask);
+            if encrypt {
+                data.encrypt(block);
+            } else {
+                data.decrypt(block);
+            }
+            xor(block, &mask);
+            double(&mut mask);
+        }
+        // The last unit's number was checked; only its successor may wrap.
+        number = number.wrapping_add(1);
+    }
+    mask.fill(0);
+    std::hint::black_box(&mut mask);
+}
+
+/// Multiplication by x in GF(2^128) as XTS orders the bits, little-endian,
+/// reducing by x^128 + x^7 + x^2 + x + 1 without a branch on the tweak.
+fn double(mask: &mut [u8; 16]) {
+    let mut carry = 0u8;
+    for byte in mask.iter_mut() {
+        let next = *byte >> 7;
+        *byte = (*byte << 1) | carry;
+        carry = next;
+    }
+    if let Some(first) = mask.first_mut() {
+        *first ^= 0x87 & 0u8.wrapping_sub(carry);
+    }
 }
 
 fn validate_length(size: usize) -> Result<(), &'static str> {
@@ -635,5 +783,198 @@ mod tests {
             assert!(key_unwrap_128(&kek, &vec![0; wrapped], &mut buffer).is_err());
             assert!(buffer.iter().all(|byte| *byte == 0x33));
         }
+    }
+
+    /// IEEE 1619-2007 Annex B XTS-AES 10 (AES-256, data unit 0xff of 512
+    /// bytes), as Linux's crypto/testmgr.h and Go's x/crypto/xts carry it,
+    /// the two sources byte for byte the same.
+    const XTS_AES_10_KEY: &str = concat!(
+        "2718281828459045235360287471352662497757247093699959574966967627",
+        "3141592653589793238462643383279502884197169399375105820974944592",
+    );
+    const XTS_AES_10_SEALED: &str = concat!(
+        "1c3b3a102f770386e4836c99e370cf9bea00803f5e482357a4ae12d414a3e63b",
+        "5d31e276f8fe4a8d66b317f9ac683f44680a86ac35adfc3345befecb4bb188fd",
+        "5776926c49a3095eb108fd1098baec70aaa66999a72a82f27d848b21d4a741b0",
+        "c5cd4d5fff9dac89aeba122961d03a757123e9870f8acf1000020887891429ca",
+        "2a3e7a7d7df7b10355165c8b9a6d0a7de8b062c4500dc4cd120c0f7418dae3d0",
+        "b5781c34803fa75421c790dfe1de1834f280d7667b327f6c8cd7557e12ac3a0f",
+        "93ec05c52e0493ef31a12d3d9260f79a289d6a379bc70c50841473d1a8cc81ec",
+        "583e9645e07b8d9670655ba5bbcfecc6dc3966380ad8fecb17b6ba02469a020a",
+        "84e18e8f84252070c13e9f1f289be54fbc481457778f616015e1327a02b140f1",
+        "505eb309326d68378f8374595c849d84f4c333ec4423885143cb47bd71c5edae",
+        "9be69a2ffeceb1bec9de244fbe15992b11b77c040f12bd8f6a975a44a0f90c29",
+        "a9abc3d4d893927284c58754cce294529f8614dcd2aba991925fedc4ae74ffac",
+        "6e333b93eb4aff0479da9a410e4450e0dd7ae4c6e2910900575da401fc07059f",
+        "645e8b7e9bfdef33943054ff84011493c27b3429eaedb4ed5376441a77ed4385",
+        "1ad77f16f541dfd269d50d6a5f14fb0aab1cbb4c1550be97f7ab4066193c4caa",
+        "773dad38014bd2092fa755c824bb5e54c4f36ffda9fcea70b9c6e693e148c151",
+    );
+    /// XTS-AES 4's sealed unit 0, which XTS-AES 5 seals again as unit 1.
+    const XTS_AES_4_SEALED: &str = concat!(
+        "27a7479befa1d476489f308cd4cfa6e2a96e4bbe3208ff25287dd3819616e89c",
+        "c78cf7f5e543445f8333d8fa7f56000005279fa5d8b5e4ad40e736ddb4d35412",
+        "328063fd2aab53e5ea1e0a9f332500a5df9487d07a5c92cc512c8866c7e860ce",
+        "93fdf166a24912b422976146ae20ce846bb7dc9ba94a767aaef20c0d61ad0265",
+        "5ea92dc4c4e41a8952c651d33174be51a10c421110e6d81588ede82103a252d8",
+        "a750e8768defffed9122810aaeb99f9172af82b604dc4b8e51bcb08235a6f434",
+        "1332e4ca60482a4ba1a03b3e65008fc5da76b70bf1690db4eae29c5f1badd03c",
+        "5ccf2a55d705ddcd86d449511ceb7ec30bf12b1fa35b913f9f747a8afd1b130e",
+        "94bff94effd01a91735ca1726acd0b197c4e5b03393697e126826fb6bbde8ecc",
+        "1e08298516e2c9ed03ff3c1b7860f6de76d4cecd94c8119855ef5297ca67e9f3",
+        "e7ff72b1e99785ca0a7e7720c5b36dc6d72cac9574c8cbbc2f801e23e56fd344",
+        "b07f22154beba0f08ce8891e643ed995c94d9a69c9f1b5f499027a78572aeebd",
+        "74d20cc39881c213ee770b1010e4bea718846977ae119f7a023ab58cca0ad752",
+        "afe656bb3c17256a9f6e9bf19fdd5a38fc82bbe872c5539edb609ef4f79c203e",
+        "bb140f2e583cb2ad15b4aa5b655016a8449277dbd477ef2c8d6c017db738b18d",
+        "eb4a427d1923ce3ff262735779a418f20a282df920147beabe421ee5319d0568",
+    );
+    const XTS_AES_5_SEALED: &str = concat!(
+        "264d3ca8512194fec312c8c9891f279fefdd608d0c027b60483a3fa811d65ee5",
+        "9d52d9e40ec5672d81532b38b6b089ce951f0f9c35590b8b978d175213f329bb",
+        "1c2fd30f2f7f30492a61a532a79f51d36f5e31a7c9a12c286082ff7d2394d18f",
+        "783e1a8e72c722caaaa52d8f065657d2631fd25bfd8e5baad6e527d763517501",
+        "c68c5edc3cdd55435c532d7125c8614deed9adaa3acade5888b87bef641c4c99",
+        "4c8091b5bcd387f3963fb5bc37aa922fbfe3df4e5b915e6eb514717bdd2a7407",
+        "9a5073f5c4bfd46adf7d282e7a393a52579d11a028da4d9cd9c77124f9648ee3",
+        "83b1ac763930e7162a8d37f350b2f74b8472cf09902063c6b32e8c2d9290cefb",
+        "d7346d1c779a0df50edcde4531da07b099c638e83a755944df2aef1aa31752fd",
+        "323dcb710fb4bfbb9d22b925bc3577e1b8949e729a90bbafeacf7f7879e7b114",
+        "7e28ba0bae940db795a61b15ecf4df8db07b824bb062802cc98a9545bb2aaeed",
+        "77cb3fc6db15dcd7d80d7d5bc406c4970a3478ada8899b329198eb61c193fb62",
+        "75aa8ca340344a75a862aebe92eee1ce032fd950b47d7704a3876923b4ad6284",
+        "4bf4a09c4dbe8b4397184b7471360c9564880aedddb9baa4af2e75394b08cd32",
+        "ff479c57a07d3eab5d54de5f9738b8d27f27a9f0ab11799d7b7ffefb2704c95c",
+        "6ad12c39f1e867a4b7b1d7818a4b753dfd2a89ccb45e001a03a867b187f225dd",
+    );
+
+    fn counting() -> [u8; 512] {
+        std::array::from_fn(|index| index as u8)
+    }
+
+    /// XTS-AES 1 to 5 (AES-128): unit numbers 0, 1 and 0x3333333333, the
+    /// last placing five little-endian bytes in the tweak, and 512-byte
+    /// units chaining 32 tweak doublings.
+    #[test]
+    fn ieee1619_xts_aes128_vectors_drive_the_mode() {
+        let run = |key: &[u8; 32], sector: u64, bytes: &mut [u8], encrypt: bool| {
+            let [data, tweak] = key.as_chunks::<16>().0 else {
+                panic!("two halves")
+            };
+            let (data, tweak) = (Aes128::new(data), Aes128::new(tweak));
+            xts(&data, &tweak, sector, bytes.len(), bytes, encrypt);
+        };
+        let short: &[(&str, u64, &str, &str)] = &[
+            (
+                "0000000000000000000000000000000000000000000000000000000000000000",
+                0,
+                "0000000000000000000000000000000000000000000000000000000000000000",
+                "917cf69ebd68b2ec9b9fe9a3eadda692cd43d2f59598ed858c02c2652fbf922e",
+            ),
+            (
+                "1111111111111111111111111111111122222222222222222222222222222222",
+                0x3333333333,
+                "4444444444444444444444444444444444444444444444444444444444444444",
+                "c454185e6a16936e39334038acef838bfb186fff7480adc4289382ecd6d394f0",
+            ),
+            (
+                "fffefdfcfbfaf9f8f7f6f5f4f3f2f1f022222222222222222222222222222222",
+                0x3333333333,
+                "4444444444444444444444444444444444444444444444444444444444444444",
+                "af85336b597afc1a900b2eb21ec949d292df4c047e0b21532186a5971a227a89",
+            ),
+        ];
+        for (key, sector, plain, sealed) in short {
+            let key = hex::<32>(key);
+            let mut bytes = hex::<32>(plain);
+            run(&key, *sector, &mut bytes, true);
+            assert_eq!(bytes, hex::<32>(sealed));
+            run(&key, *sector, &mut bytes, false);
+            assert_eq!(bytes, hex::<32>(plain));
+        }
+        let key = hex::<32>("2718281828459045235360287471352631415926535897932384626433832795");
+        let mut bytes = counting();
+        run(&key, 0, &mut bytes, true);
+        assert_eq!(bytes, hex::<512>(XTS_AES_4_SEALED));
+        run(&key, 1, &mut bytes, true);
+        assert_eq!(bytes, hex::<512>(XTS_AES_5_SEALED));
+        run(&key, 1, &mut bytes, false);
+        run(&key, 0, &mut bytes, false);
+        assert_eq!(bytes, counting());
+    }
+
+    #[test]
+    fn ieee1619_xts_aes256_vector_both_directions() {
+        let key = hex::<64>(XTS_AES_10_KEY);
+        let mut bytes = counting();
+        xts_encrypt(&key, 0xff, 512, &mut bytes).unwrap();
+        assert_eq!(bytes, hex::<512>(XTS_AES_10_SEALED));
+        xts_decrypt(&key, 0xff, 512, &mut bytes).unwrap();
+        assert_eq!(bytes, counting());
+    }
+
+    /// One call over consecutive units numbers them from `sector`: XTS-AES
+    /// 10's unit sealed second of two from 0xfe, and each unit alone.
+    #[test]
+    fn xts_numbers_consecutive_units() {
+        let key = hex::<64>(XTS_AES_10_KEY);
+        let mut both = [[0x5a; 512], counting()].concat();
+        xts_encrypt(&key, 0xfe, 512, &mut both).unwrap();
+        assert_eq!(both[512..], hex::<512>(XTS_AES_10_SEALED));
+        let mut first = [0x5a; 512];
+        xts_encrypt(&key, 0xfe, 512, &mut first).unwrap();
+        assert_eq!(both[..512], first);
+        // Smaller units renumber: the same bytes seal differently.
+        let mut halves = counting();
+        xts_encrypt(&key, 0xff, 256, &mut halves).unwrap();
+        assert_ne!(halves, hex::<512>(XTS_AES_10_SEALED));
+        xts_decrypt(&key, 0xff, 256, &mut halves).unwrap();
+        assert_eq!(halves, counting());
+    }
+
+    #[test]
+    fn xts_refuses_and_leaves_input_untouched() {
+        let key = hex::<64>(XTS_AES_10_KEY);
+        let mut same = [7u8; 64];
+        let mut bytes = vec![0x33; 1024];
+        assert!(xts_encrypt(&same, 0, 512, &mut bytes).is_err());
+        assert!(xts_decrypt(&same, 0, 512, &mut bytes).is_err());
+        same[63] = 8;
+        xts_encrypt(&same, 0, 512, &mut bytes).unwrap();
+        xts_decrypt(&same, 0, 512, &mut bytes).unwrap();
+        for unit in [0, 8, 15, 17, 4096 + 16, 8192] {
+            assert!(xts_encrypt(&key, 0, unit, &mut bytes).is_err(), "{unit}");
+            assert!(xts_decrypt(&key, 0, unit, &mut bytes).is_err(), "{unit}");
+        }
+        assert!(xts_encrypt(&key, 0, 512, &mut []).is_err());
+        assert!(xts_encrypt(&key, 0, 512, &mut bytes[..1000]).is_err());
+        assert!(xts_encrypt(&key, u64::MAX, 512, &mut bytes).is_err());
+        assert!(bytes.iter().all(|byte| *byte == 0x33));
+        xts_encrypt(&key, u64::MAX - 1, 512, &mut bytes).unwrap();
+        xts_decrypt(&key, u64::MAX - 1, 512, &mut bytes).unwrap();
+        assert!(bytes.iter().all(|byte| *byte == 0x33));
+        let mut long = vec![0x33; MAX_XTS_BYTES + 4096];
+        assert!(xts_encrypt(&key, 0, 4096, &mut long).is_err());
+        assert!(long.iter().all(|byte| *byte == 0x33));
+        // The bound itself, without sealing 16 MiB in a test build.
+        assert!(validate_xts(0, 4096, MAX_XTS_BYTES).is_ok());
+        assert!(validate_xts(u64::MAX - 4095, 4096, MAX_XTS_BYTES).is_ok());
+        assert!(validate_xts(u64::MAX - 4094, 4096, MAX_XTS_BYTES).is_err());
+    }
+
+    /// The tweak doubling carries across every byte and reduces by 0x87.
+    #[test]
+    fn xts_doubling_carries_and_reduces() {
+        let mut mask = [0u8; 16];
+        mask[0] = 0x80;
+        double(&mut mask);
+        assert_eq!(mask, hex::<16>("00010000000000000000000000000000"));
+        let mut mask = [0u8; 16];
+        mask[15] = 0x80;
+        double(&mut mask);
+        assert_eq!(mask, hex::<16>("87000000000000000000000000000000"));
+        let mut mask = [0xff; 16];
+        double(&mut mask);
+        assert_eq!(mask, hex::<16>("79ffffffffffffffffffffffffffffff"));
     }
 }

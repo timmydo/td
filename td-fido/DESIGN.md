@@ -73,14 +73,35 @@ prerequisites" onward):
   FIPS 197 and SP 800-38A; and AES-128 key unwrap (RFC 3394) over the
   inverse cipher, for td-netd's WPA2 group keys, pinned to RFC 3394's
   vectors, bounded to 16 to 1024 bytes and zeroing its output when the
-  integrity check fails.
+  integrity check fails. Its AES-256-XTS (IEEE 1619, SP 800-38E), over
+  the same round function, is for td-luks's LUKS2 keyslot areas
+  (td-luks/DESIGN.md "Cryptography"):
+  - each data unit's tweak is its number little-endian, as dm-crypt's
+    plain64 IV gives it, and one call numbers consecutive units;
+  - a unit is 1 to 256 whole blocks and an input at most
+    `MAX_XTS_BYTES`, 16 MiB, the keyslots area td formats;
+  - it refuses equal key halves and unit numbers past `u64::MAX`, leaving
+    the input untouched;
+  - it is pinned to IEEE 1619 XTS-AES 10, which Linux's
+    `crypto/testmgr.h` and Go's `x/crypto/xts` carry byte for byte the
+    same, and XTS-AES 1 to 5 through a test-only AES-128 instance of the
+    same mode.
+
+  Its speed is the consumer's: a crate compiled by path or as a
+  dependency takes the consuming build's opt-level, not this crate's.
+  Decrypting one keyslot's 256000-byte split key takes about 290 ms at
+  `opt-level = "s"` and 185 ms at `opt-level = 3` on a Ryzen 7 5700G,
+  which is why td-luks builds at `opt-level = 3` (td-luks/DESIGN.md
+  "Cost").
 - `fido_device`: root and desktop hidraw admission, the operation lock
   under `/run/td-fido` (or the desktop runtime directory), the Session
   that drives a token through a HID worker, and that worker.
 - `hmac_sha256(key, parts)`: HMAC-SHA256 (RFC 2104) under `key` over
   the concatenation of `parts`, pinned to RFC 4231's vectors, and
   `hkdf_expand(ikm, salt, info_parts, okm)`: HKDF-SHA256 (RFC 5869)
-  filling up to `HKDF_MAX_OKM`, 8160 bytes.
+  filling up to `HKDF_MAX_OKM`, 8160 bytes, and
+  `pbkdf2_sha256(password, salt, iterations, out)`: PBKDF2-HMAC-SHA256
+  (RFC 8018), for td-luks.
 - `root.rs`: the root console's admission, every user ID 0, which
   `fido_device::require_root` re-exports. td-secret's store compiles
   the same file by path for its own admission, with its refusal text.
@@ -117,7 +138,9 @@ any other
 dependent is an amendment here and to `FIDO_DEPENDENTS` in
 `builder/src/affected.rs`, whose lock preflight refuses the rest. Crates
 that reach it only through td-secret or td-tpm, as td-pass does, are
-not dependents.
+not dependents. td-luks is planned as one, for `pbkdf2_sha256` and
+`fido_aes`'s XTS (td-luks/DESIGN.md): the commit that adds its crate
+makes that amendment.
 
 Five crates compile some of its files as shared source instead:
 td-protector compiles `hmac.rs` for its PIN's authValue and its lockout
@@ -161,9 +184,28 @@ at their whole lengths for `hkdf_expand` (the info split at every
 offset, one block agreeing with `hkdf`, and the length bound) and FIPS
 180's "abc".
 
+`pbkdf2_sha256` is td-luks's PBKDF2 for LUKS2 keyslots and digests
+(td-luks/DESIGN.md "Cryptography"). It takes 1 to
+`PBKDF2_MAX_ITERATIONS` iterations, 4,000,000 (td-luks's digest bound),
+and fills 1 to `PBKDF2_MAX_OUTPUT` bytes, 1024, refusing anything else
+with the output untouched. Each iteration is a whole HMAC under the
+password, since the engine's `Sha256` cannot clone a keyed midstate,
+so one iteration costs about 1.2 µs at `opt-level = "s"` and 0.9 µs
+at `opt-level = 3` on a Ryzen 7 5700G: about 1 ms at LUKS2's 1000
+iterations, 4 to 5 s at the bound. Its tests pin:
+- RFC 7914 §11's two vectors, of 1 and 80000 iterations;
+- three cases Python's `hashlib.pbkdf2_hmac` gives, which reproduces
+  both RFC vectors: td-luks's shape (1000 iterations, a 32-byte salt, a
+  64-byte key), a 100-byte password with a 33-byte output, and the
+  1024-byte longest output, pinned by its SHA-256.
+
+td-netd keeps its own PBKDF2-HMAC-SHA1 (`td-netd/src/sha1.rs`), since
+this file has no SHA-1.
+
 It zeroes the key-derived buffers it owns before returning: the
-normalized key, the hashed long key, each pad, the inner hash and HKDF's
-pseudorandom key and output blocks. The engine's `Sha256` keeps its chaining state and
+normalized key, the hashed long key, each pad, the inner hash, HKDF's
+pseudorandom key and output blocks, and PBKDF2's chain links and sums.
+The engine's `Sha256` keeps its chaining state and
 block buffer private and consumes itself in `finalize`, so the
 key-derived midstates inside it are not cleared. Zeroing is best effort
 in safe Rust, as td-tpm's `zero` is. td-tpm keeps its own SHA-256 for

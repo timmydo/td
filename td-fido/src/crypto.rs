@@ -13,7 +13,9 @@ mod sha256;
 mod sha256_hmac;
 
 pub(crate) use sha256_hmac::{digest, hkdf, hmac};
-pub use sha256_hmac::{hkdf_expand, hmac_sha256, HKDF_MAX_OKM};
+pub use sha256_hmac::{
+    hkdf_expand, hmac_sha256, pbkdf2_sha256, HKDF_MAX_OKM, PBKDF2_MAX_ITERATIONS, PBKDF2_MAX_OUTPUT,
+};
 
 /// Whether two secrets are equal, comparing every byte whatever differs.
 pub fn same(a: &[u8], b: &[u8]) -> bool {

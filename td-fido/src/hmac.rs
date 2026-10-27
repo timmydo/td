@@ -1,13 +1,15 @@
-//! SHA-256 digest, HMAC-SHA256 (RFC 2104) and HKDF (RFC 5869), one block
-//! (`hkdf`) or any length up to RFC 5869's bound (`hkdf_expand`),
+//! SHA-256 digest, HMAC-SHA256 (RFC 2104), HKDF (RFC 5869), one block
+//! (`hkdf`) or any length up to RFC 5869's bound (`hkdf_expand`), and
+//! PBKDF2-HMAC-SHA256 (RFC 8018) for td-luks's LUKS2 keyslots and digests,
 //! the one copy td's std-only crates share (td-fido/DESIGN.md, "Shared
 //! HMAC-SHA256"), over the engine's SHA-256 its includer mounts as
 //! `super::sha256`: td-fido's `crypto.rs`, and td-secret's store crypto,
 //! which compiles this file by path.
 //!
 //! The key-derived buffers this file owns are zeroed before return: the
-//! normalized key, the hashed long key, each pad, the inner hash and
-//! HKDF's pseudorandom key and output blocks. The
+//! normalized key, the hashed long key, each pad, the inner hash,
+//! HKDF's pseudorandom key and output blocks, and PBKDF2's chain links and
+//! sums. The
 //! engine's `Sha256` keeps its chaining state and block buffer private and
 //! consumes itself in `finalize`, so the key-derived midstates inside it
 //! are not cleared; zeroing is best effort in safe Rust either way.
@@ -108,6 +110,50 @@ pub fn hkdf_expand(
     }
     clear(&mut block);
     clear(&mut prk);
+    Ok(())
+}
+
+/// PBKDF2's most iterations, the bound td-luks reads LUKS2 digests under
+/// (td-luks/DESIGN.md "The profile").
+pub const PBKDF2_MAX_ITERATIONS: u32 = 4_000_000;
+/// PBKDF2's longest output here, 32 SHA-256 blocks.
+pub const PBKDF2_MAX_OUTPUT: usize = 1024;
+
+/// PBKDF2-HMAC-SHA256 (RFC 8018 5.2) of `password` and `salt` filling
+/// `out`, of 1 to `PBKDF2_MAX_OUTPUT` bytes, after 1 to
+/// `PBKDF2_MAX_ITERATIONS` iterations. Anything else is refused and `out`
+/// left untouched.
+pub fn pbkdf2_sha256(
+    password: &[u8],
+    salt: &[u8],
+    iterations: u32,
+    out: &mut [u8],
+) -> Result<(), &'static str> {
+    if iterations == 0 || iterations > PBKDF2_MAX_ITERATIONS {
+        return Err("PBKDF2 takes 1 to 4000000 iterations");
+    }
+    if out.is_empty() || out.len() > PBKDF2_MAX_OUTPUT {
+        return Err("PBKDF2 gives 1 to 1024 bytes here");
+    }
+    for (index, chunk) in out.chunks_mut(32).enumerate() {
+        // At most 32 chunks, so the block index is 1 to 32.
+        let block = u32::try_from(index + 1).unwrap_or(u32::MAX).to_be_bytes();
+        let mut link = hmac_sha256(password, &[salt, &block]);
+        let mut sum = link;
+        for _ in 1..iterations {
+            let mut next = hmac_sha256(password, &[&link]);
+            link = next;
+            clear(&mut next);
+            for (total, byte) in sum.iter_mut().zip(&link) {
+                *total ^= byte;
+            }
+        }
+        for (target, byte) in chunk.iter_mut().zip(&sum) {
+            *target = *byte;
+        }
+        clear(&mut link);
+        clear(&mut sum);
+    }
     Ok(())
 }
 
@@ -261,6 +307,80 @@ mod tests {
         assert!(over.iter().all(|byte| *byte == 7));
         let mut empty = [0u8; 0];
         hkdf_expand(b"k", b"", &[], &mut empty).unwrap();
+    }
+
+    /// RFC 7914 §11's two vectors, then three Python `hashlib.pbkdf2_hmac`
+    /// gives, which reproduces both: td-luks's shape (1000 iterations, a
+    /// 32-byte salt, a 64-byte key), a password longer than a block with a
+    /// length that ends inside a block, and the longest output, pinned by
+    /// its SHA-256.
+    #[test]
+    fn pbkdf2_sha256_matches_rfc_7914_and_hashlib() {
+        let cases: &[(&[u8], &[u8], u32, &str)] = &[
+            (
+                b"passwd",
+                b"salt",
+                1,
+                concat!(
+                    "55ac046e56e3089fec1691c22544b605f94185216dde0465e68b9d57c20dacbc",
+                    "49ca9cccf179b645991664b39d77ef317c71b845b1e30bd509112041d3a19783",
+                ),
+            ),
+            (
+                b"Password",
+                b"NaCl",
+                80000,
+                concat!(
+                    "4ddcd8f60b98be21830cee5ef22701f9641a4418d04c0414aeff08876b34ab56",
+                    "a1d425a1225833549adb841b51c9b3176a272bdebba1d078478f62b397f33c8d",
+                ),
+            ),
+            (
+                b"td-luks",
+                &[0; 32],
+                1000,
+                concat!(
+                    "872ddf56eff7f53476771f7d8045d8312a46e65b387d4841e6c7f3c74ae4df71",
+                    "660e84971bc0590de1d7c5249d8db507f738d69b8d05a5f080a6e00ef7d88821",
+                ),
+            ),
+            (
+                &[b'k'; 100],
+                b"salt",
+                3,
+                "219c68bb88f1010f4a763b7c8fd58639c2280baf6820814c6d404891fcd85c3d19",
+            ),
+        ];
+        for (password, salt, iterations, expected) in cases {
+            let expected = hex(expected);
+            let mut out = vec![0; expected.len()];
+            pbkdf2_sha256(password, salt, *iterations, &mut out).unwrap();
+            assert_eq!(out, expected);
+        }
+
+        let mut longest = vec![0; PBKDF2_MAX_OUTPUT];
+        pbkdf2_sha256(b"td-fido", b"maximum", 2, &mut longest).unwrap();
+        assert_eq!(
+            digest(&longest).to_vec(),
+            hex("9f0876cc7c12a879ccb317c0430edc65f1fd5db6b60f838cec9cb8e952edc782")
+        );
+    }
+
+    #[test]
+    fn pbkdf2_sha256_refuses_and_leaves_output_untouched() {
+        let mut out = [7u8; 32];
+        for iterations in [0, PBKDF2_MAX_ITERATIONS + 1] {
+            assert!(pbkdf2_sha256(b"p", b"s", iterations, &mut out).is_err());
+        }
+        assert!(pbkdf2_sha256(b"p", b"s", 1, &mut []).is_err());
+        let mut over = vec![7; PBKDF2_MAX_OUTPUT + 1];
+        assert!(pbkdf2_sha256(b"p", b"s", 1, &mut over).is_err());
+        assert!(out.iter().chain(&over).all(|byte| *byte == 7));
+        over.pop();
+        pbkdf2_sha256(b"p", b"s", 1, &mut over).unwrap();
+        // Each block is its own chain: the first equals a one-block call.
+        pbkdf2_sha256(b"p", b"s", 1, &mut out).unwrap();
+        assert_eq!(over[..32], out);
     }
 
     #[test]

@@ -259,14 +259,24 @@ crate for it (AGENTS.md "Avoid external dependencies"):
 ### Cost
 
 One unlock attempt decrypts a 256000-byte split key per keyslot it
-tries. td-fido's round function decrypts one such key in about 190 ms on
-one thread of a Ryzen 7 5700G, measured in review. PBKDF2 and the AF
-merge are negligible beside that.
+tries. On one thread of a Ryzen 7 5700G, td-fido's round function
+decrypts one such key in about 185 ms at `opt-level = 3` and 290 ms at
+`opt-level = "s"`; the consuming build's level is the one that counts.
+At td's 1000 iterations, PBKDF2 (about 1.2 ms) and the AF merge are
+negligible beside that.
 
 The ceiling is two seconds per `open` or `test`, whatever the number of
-keyslots tried. A protected header has up to about seven candidates.
-Increment B records the T14s figure here. A bitsliced round function in
-td-fido is the remedy if the T14s exceeds the ceiling.
+keyslots tried. A protected header has up to about seven candidates:
+about 1.3 s at `opt-level = 3` but 2.1 s at `"s"`. So td-luks builds
+at `opt-level = 3`, in its manifest and its recipe alike. Increment B
+records the T14s figure here. A bitsliced round function in td-fido is
+the remedy if the T14s exceeds the ceiling.
+
+The ceiling covers td's own profile. A header stock cryptsetup wrote may
+carry a digest benchmarked to millions of iterations. At the reader's
+4,000,000 bound one digest check takes 4 to 5 s, and an attempt checks
+the digest once per candidate keyslot. That is a rescue path, not a
+boot path, so it is accepted and not bounded by the ceiling.
 
 ## Device mapper
 
