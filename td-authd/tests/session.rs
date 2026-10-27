@@ -7,6 +7,12 @@ use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
 use std::thread;
 
+/// The bound of every wait in the stand-in cases that only catches a
+/// hang, and of every fixture deadline no passing case waits on: the
+/// stand-ins are this debug test binary re-executed, whose start grows
+/// with host load. The root fixtures keep production's helpers and waits.
+const WAIT: Duration = crate::revocation::tests::WAIT;
+
 fn fixture(name: &str) -> Command {
     let mut command = Command::new(std::env::current_exe().unwrap());
     command
@@ -35,11 +41,29 @@ fn unexpected_begin(_: u32, _: Start) -> Result<Unlock, String> {
 }
 
 /// A session whose revocation check never runs: the tests that are not
-/// about revocation (`revoking` below is).
+/// about revocation (`revoking` below is). Its generation cleanup has
+/// `WAIT`: no case that runs the stand-in is about production's two
+/// seconds, which `production_deadlines` pins, and the cases that prove
+/// the deadline force the started cleanup's deadline to now.
 fn quiet() -> Session {
     let mut session = Session::new(1000, "tester").unwrap();
     session.revocation = None;
+    session.cleanup_time = WAIT;
     session
+}
+
+/// `quiet` under production's cleanup deadline, for the root fixtures
+/// that run the production cleanup helper.
+fn production_quiet() -> Session {
+    let mut session = quiet();
+    session.cleanup_time = CLEANUP_TIME;
+    session
+}
+
+#[test]
+fn production_deadlines() {
+    let session = Session::new(1000, "tester").unwrap();
+    assert_eq!(session.cleanup_time, Duration::from_secs(2));
 }
 
 fn prepare(session: &mut Session) {
@@ -53,7 +77,7 @@ fn prepare(session: &mut Session) {
             .unwrap(),
         [0x90]
     );
-    let until = Instant::now() + Duration::from_secs(3);
+    let until = Instant::now() + WAIT;
     while session.answer(Request::Poll).unwrap() != [0x91, 2] {
         assert!(Instant::now() < until);
         thread::sleep(Duration::from_millis(1));
@@ -76,7 +100,7 @@ fn failing_cleanup_child() {
 #[test]
 #[ignore = "exec-only hung cleanup"]
 fn stalled_cleanup_child() {
-    thread::sleep(Duration::from_secs(30));
+    thread::sleep(WAIT);
 }
 
 fn read_frame(stream: &mut UnixStream) -> Vec<u8> {
@@ -98,9 +122,7 @@ fn send_frame(stream: &mut UnixStream, bytes: &[u8]) {
 #[ignore = "exec-only bound unlock protocol peer"]
 fn unlock_child() {
     let mut stream = UnixStream::from(std::io::stdin().as_fd().try_clone_to_owned().unwrap());
-    stream
-        .set_read_timeout(Some(Duration::from_secs(3)))
-        .unwrap();
+    stream.set_read_timeout(Some(WAIT)).unwrap();
     let request = read_frame(&mut stream);
     assert_eq!(request, description().encode());
     for tag in [0x10, 0x12] {
@@ -191,7 +213,7 @@ fn failed_or_stalled_cleanup_never_admits_an_operation() {
         if name == "stalled_cleanup_child" {
             session.cleanup.as_mut().unwrap().deadline = Instant::now();
         }
-        let until = Instant::now() + Duration::from_secs(3);
+        let until = Instant::now() + WAIT;
         loop {
             if session.tick().is_err() {
                 break;
@@ -211,7 +233,7 @@ fn failed_or_stalled_cleanup_never_admits_an_operation() {
 }
 
 fn poll_until(session: &mut Session, status: u8) -> Vec<u8> {
-    let until = Instant::now() + Duration::from_secs(3);
+    let until = Instant::now() + WAIT;
     loop {
         let response = session.answer(Request::Poll).unwrap();
         if response[1] == status {
@@ -501,8 +523,9 @@ fn a_hostname_change_is_admitted_by_the_table_then_described_then_saved_once() {
         .unwrap();
     drop(third);
     // Another test's child, between its fork and exec, can hold the
-    // socket a moment longer: wait for root to see the requester gone.
-    let until = Instant::now() + Duration::from_secs(5);
+    // socket a moment longer: wait for root to see the requester gone,
+    // within half the selection's 120 s, whose expiry would also end it.
+    let until = Instant::now() + WAIT / 2;
     loop {
         let intake = session.hostnames.as_mut().unwrap();
         intake.tick();
@@ -554,7 +577,7 @@ fn one_operation_retains_its_bound_description_until_terminal_delivery() {
     assert!(session.answer(Request::Presented(description())).is_err());
     session.answer(Request::Commit(description())).unwrap();
     // Terminal heartbeats can advance completion without retiring the record.
-    let until = Instant::now() + Duration::from_secs(3);
+    let until = Instant::now() + WAIT;
     while session.event != Some(Event::Complete) {
         session.tick().unwrap();
         assert!(session.operation.is_some());
@@ -626,7 +649,7 @@ fn root_session_preparation_failure_and_generation_exit_relock() {
         std::os::unix::fs::fchown(fs::File::open(key).unwrap(), Some(991), Some(991)).unwrap();
     };
     seed();
-    let mut session = quiet();
+    let mut session = production_quiet();
     session.answer(Request::Prepare).unwrap();
     let until = Instant::now() + Duration::from_secs(5);
     loop {
@@ -670,7 +693,7 @@ fn root_session_preparation_failure_and_generation_exit_relock() {
 fn silent_unlock_child() {
     let mut stream = UnixStream::from(std::io::stdin().as_fd().try_clone_to_owned().unwrap());
     assert_eq!(read_frame(&mut stream), description().encode());
-    thread::sleep(Duration::from_secs(30));
+    thread::sleep(WAIT);
 }
 
 #[test]
@@ -688,7 +711,7 @@ fn generation_cleanup_runs_after_an_internal_cleanup_error() {
     // The host has no production /bin/td-secret cleanup helper. The retained
     // fatal supervisor result must not suppress generation cleanup afterwards.
     assert!(!std::path::Path::new("/bin/td-secret").exists());
-    let until = Instant::now() + Duration::from_secs(3);
+    let until = Instant::now() + WAIT;
     loop {
         if session.tick().is_err() {
             break;
@@ -726,17 +749,18 @@ fn generation_exit_reaps_a_live_worker_before_cleanup() {
             fixture("cleanup_child")
         })
         .unwrap();
-    assert!(started.elapsed() < Duration::from_secs(2));
+    // Killed, not waited out: the worker would hold for `WAIT`.
+    assert!(started.elapsed() < WAIT / 2, "{:?}", started.elapsed());
     assert!(session.operation.is_none());
     assert!(!session.prepared);
 }
 
 #[test]
 fn cleanup_requires_timely_observation_and_preserves_its_failure() {
-    let mut cleanup = Cleanup::start(fixture("cleanup_child")).unwrap();
+    let mut cleanup = Cleanup::start(fixture("cleanup_child"), WAIT).unwrap();
     thread::sleep(Duration::from_millis(50));
     cleanup.deadline = Instant::now();
-    let until = Instant::now() + Duration::from_secs(3);
+    let until = Instant::now() + WAIT;
     let error = loop {
         match cleanup.poll() {
             Err(error) => break error,
@@ -761,7 +785,7 @@ fn generation_exit_cleans_an_unpolled_completion() {
     session.answer(Request::Presented(description())).unwrap();
     poll_until(&mut session, 5);
     session.answer(Request::Commit(description())).unwrap();
-    let until = Instant::now() + Duration::from_secs(3);
+    let until = Instant::now() + WAIT;
     while session.event != Some(Event::Complete) {
         session.tick().unwrap();
         assert!(Instant::now() < until);
@@ -796,9 +820,7 @@ fn enrollment_description(recovery: Recovery, step: crate::consent::Enrollment) 
 fn enrollment_child() {
     use crate::consent::Enrollment;
     let mut stream = UnixStream::from(std::io::stdin().as_fd().try_clone_to_owned().unwrap());
-    stream
-        .set_read_timeout(Some(Duration::from_secs(3)))
-        .unwrap();
+    stream.set_read_timeout(Some(WAIT)).unwrap();
     let initial = Description::decode(&read_frame(&mut stream)).unwrap();
     let recovery = match initial.operation() {
         Operation::Enroll { recovery, .. } => *recovery,
@@ -832,7 +854,7 @@ fn enrollment_child() {
 }
 
 fn secret_event(session: &mut Session) -> Vec<u8> {
-    let until = Instant::now() + Duration::from_secs(3);
+    let until = Instant::now() + WAIT;
     loop {
         let response = session.answer(Request::Poll).unwrap();
         if response.get(1) != Some(&3) {
@@ -961,7 +983,7 @@ fn inspection_requires_idle_preparation_and_retains_its_result_until_poll() {
             unexpected_begin
         )
         .is_err());
-    let until = Instant::now() + Duration::from_secs(4);
+    let until = Instant::now() + WAIT;
     while session.inspection_event == Some(InspectionEvent::Waiting) {
         session.tick().unwrap();
         assert!(Instant::now() < until);
@@ -973,7 +995,7 @@ fn inspection_requires_idle_preparation_and_retains_its_result_until_poll() {
     session
         .inspect_with(|_| Ok(crate::inspection::tests::fixture(7)))
         .unwrap();
-    let until = Instant::now() + Duration::from_secs(4);
+    let until = Instant::now() + WAIT;
     loop {
         let answer = session.answer(Request::Poll).unwrap();
         if answer != [0x91, 8] {
@@ -1037,7 +1059,7 @@ fn root_inspection_observes_file_state_without_publishing_or_repairing() {
         fs::set_permissions(path.join(name), fs::Permissions::from_mode(0o600)).unwrap();
         std::os::unix::fs::chown(path.join(name), Some(991), Some(991)).unwrap();
     }
-    let mut session = quiet();
+    let mut session = production_quiet();
     session.answer(Request::Prepare).unwrap();
     let until = Instant::now() + Duration::from_secs(5);
     while session.answer(Request::Poll).unwrap() != [0x91, 2] {
@@ -1115,7 +1137,7 @@ fn login_step(before: u8, step: crate::consent::LoginStep) -> Description {
 /// Polls past the statuses that need no answer: a login operation before
 /// its baseline, and a worker at work.
 fn login_event(session: &mut Session) -> Vec<u8> {
-    let until = Instant::now() + Duration::from_secs(10);
+    let until = Instant::now() + WAIT;
     loop {
         let reply = session.answer(Request::Poll).unwrap();
         if ![0x0b, 3].contains(&reply[1]) {
@@ -1543,9 +1565,7 @@ fn v1() -> Result<crate::elevation::Table, String> {
 /// What the queued update's requester reads once root is done with it: its
 /// completion byte, then the end.
 fn retired(requester: &mut UnixStream) -> Vec<u8> {
-    requester
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
+    requester.set_read_timeout(Some(WAIT)).unwrap();
     let mut rest = Vec::new();
     requester.read_to_end(&mut rest).unwrap();
     rest
@@ -1728,7 +1748,7 @@ fn root_login_supervision_meets_the_production_worker() {
         .is_some_and(|ids| ids.split_whitespace().collect::<Vec<_>>() == ["0"; 4]));
     let directory = Path::new("/var/lib/td/login");
     assert!(!directory.exists());
-    let mut session = quiet();
+    let mut session = production_quiet();
     session.answer(Request::Prepare).unwrap();
     let until = Instant::now() + Duration::from_secs(5);
     while session.answer(Request::Poll).unwrap() != [0x91, 2] {
@@ -1859,7 +1879,7 @@ fn revoked(state: &[u8], revocation: u8) -> Vec<u8> {
 
 /// Asks `1a` until its revocation byte is `byte`.
 fn login_state_until(session: &mut Session, byte: u8) -> Vec<u8> {
-    let until = Instant::now() + crate::revocation::tests::WAIT;
+    let until = Instant::now() + WAIT;
     loop {
         let answer = session.answer(Request::LoginState).unwrap();
         if answer[answer.len() - 3] == byte {
@@ -2044,7 +2064,7 @@ fn a_failed_revocation_refuses_the_slot_and_reboots_once_it_is_free() {
         [0x95, 0]
     );
     assert_eq!(login_end(&mut session), [0x91, 0x0d, 0x80, 0]);
-    let until = Instant::now() + crate::revocation::tests::WAIT;
+    let until = Instant::now() + WAIT;
     while machine.reboots() == 0 {
         session.answer(Request::Poll).unwrap();
         assert!(Instant::now() < until, "no reboot request");
@@ -2080,7 +2100,7 @@ fn a_refused_reboot_request_ends_the_generation() {
     session.revocation =
         Some(machine.revocation_with(prints("unenrolled\n"), prints("error: refused\n").exits(1)));
     prepare(&mut session);
-    let until = Instant::now() + crate::revocation::tests::WAIT;
+    let until = Instant::now() + WAIT;
     let error = loop {
         match session.answer(Request::LoginState) {
             Ok(_) => {}

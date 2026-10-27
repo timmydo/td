@@ -244,9 +244,10 @@ fn cleanup_command(owner: u32) -> Command {
 }
 
 impl Cleanup {
-    fn start(mut command: Command) -> Result<Self, String> {
+    /// Starts `command`, whose observed exit must come within `time`.
+    fn start(mut command: Command, time: Duration) -> Result<Self, String> {
         let deadline = Instant::now()
-            .checked_add(CLEANUP_TIME)
+            .checked_add(time)
             .ok_or("session cleanup deadline overflow")?;
         let child = command
             .spawn()
@@ -310,6 +311,8 @@ pub(crate) struct Session {
     activated: bool,
     prepared: bool,
     cleanup: Option<Cleanup>,
+    /// Generation cleanup's deadline: production's `CLEANUP_TIME`.
+    cleanup_time: Duration,
     operation: Option<Active>,
     event: Option<Event>,
     inspection: Option<Inspection>,
@@ -343,6 +346,7 @@ impl Session {
             activated: false,
             prepared: false,
             cleanup: None,
+            cleanup_time: CLEANUP_TIME,
             operation: None,
             event: None,
             inspection: None,
@@ -404,7 +408,7 @@ impl Session {
                 }
                 // Even a failed spawn leaves generation teardown responsible.
                 self.activated = true;
-                self.cleanup = Some(Cleanup::start(cleanup(self.owner))?);
+                self.cleanup = Some(Cleanup::start(cleanup(self.owner), self.cleanup_time)?);
                 Ok(vec![0x90])
             }
             Request::Poll => {
@@ -1045,7 +1049,7 @@ impl Session {
         // Dropping pending generation cleanup also reaps before replacement.
         self.cleanup = None;
         self.prepared = false;
-        let mut cleanup = Cleanup::start(command(self.owner))?;
+        let mut cleanup = Cleanup::start(command(self.owner), self.cleanup_time)?;
         while !cleanup.poll()? {
             std::thread::sleep(Duration::from_millis(10));
         }

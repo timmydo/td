@@ -208,6 +208,18 @@ fn the_production_source_and_raw_boundary_are_closed() {
         .unwrap();
     assert!(!session.contains("WRITES"));
     assert!(!session.contains("0x9b, 0]"));
+    // Generation cleanup's two seconds, from the constant alone.
+    for pin in [
+        "const CLEANUP_TIME: Duration = Duration::from_secs(2);",
+        "cleanup_time: CLEANUP_TIME,",
+    ] {
+        assert_eq!(session.matches(pin).count(), 1, "session.rs: {pin}");
+    }
+    assert_eq!(
+        session.matches("self.cleanup_time").count(),
+        2,
+        "session.rs: cleanup_time's uses"
+    );
     // Amendment 10: no storage worker starts in production until
     // td-install/ENCRYPTION.md's item 9, and the one worker is td-install's
     // fixed verb.
@@ -1307,7 +1319,7 @@ const CACHE_FINGERPRINT: u64 = 0xca9ca5668a3cec8c;
 const SOFTWARE_FINGERPRINT: u64 = 0xedb33f4ba9468adf;
 const LAUNCH_FINGERPRINT: u64 = 0xb4e2df40a26dc1d9;
 const MAIN_FINGERPRINT: u64 = 0x97ab356136dd2efb;
-const SESSION_FINGERPRINT: u64 = 0x6c78640f078fe395;
+const SESSION_FINGERPRINT: u64 = 0xe87ed71383a70385;
 
 const INTAKE_RAW_FINGERPRINT: u64 = 0x320c8b6ddbfe29af;
 const INTAKE_FINGERPRINT: u64 = 0xe2f50441f71b4c76;
